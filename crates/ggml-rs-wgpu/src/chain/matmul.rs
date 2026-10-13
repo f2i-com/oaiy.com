@@ -338,3 +338,98 @@ fn moe_fused() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OAIY_MOE_UNFUSED").is_none())
 }
+
+/// Whether a decode step's one row of `w`'s type takes the K-quants' int8 kernel on this device (its activations
+/// rounded to int8 once and multiplied with packed int8 dot products, llama.cpp's MMVQ arithmetic) rather than the
+/// f32 one. Neither is the faster everywhere. The f32 kernels were chosen on an RTX 5090, where the weights' reads
+/// decide (a 27B step's matmuls at 1,090 GB/s); on an NVIDIA A2 held to 45 W, ten SMs at their power cap's clocks, the
+/// work of unpacking each weight decides, and the int8 kernel made Qwen3.5 9B's replies 19.1 tokens a second where
+/// the f32 one made 12.5 (the same replies but where a near-tie went the other way, as a check's rows from int8 do).
+/// So it is timed, once a type on each device, at the first step's row of it: [`time_decode`]. The int8 kernel is
+/// taken where it is 5% faster or more; a tie keeps f32's exact sums. `OAIY_Q8_DECODE=1` or `0` decides without
+/// timing; `OAIY_NO_Q8` (no int8 kernels) and a device whose packed dot products are wrapped (`Gpu::int8_rows`) never
+/// get here.
+pub(crate) fn decode_in_int8(backend: &WgpuBackend, w: &QuantizedTensor) -> bool {
+    use ggml_quants::GgmlType;
+    let Some(dtype) = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).map(|q| q.dtype) else { return false };
+    if !matches!(dtype, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q4_0) {
+        return false;
+    }
+    let gpu = &backend.gpu;
+    if let Some(known) = gpu.decode_int8.lock().unwrap_or_else(|p| p.into_inner()).get(&dtype) {
+        return *known;
+    }
+    static ASKED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| match std::env::var("OAIY_Q8_DECODE").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    });
+    let timed = if asked.is_some() { None } else { time_decode(backend, dtype) };
+    let int8 = match (asked, timed) {
+        (Some(asked), _) => asked,
+        (None, Some((f32_s, int8_s))) => {
+            let int8 = int8_s < f32_s * 0.95;
+            eprintln!(
+                "{dtype:?}: a step's row in {:.0} us from int8 activations, {:.0} us in f32 (a 4096 x 4096 weight): {}",
+                int8_s * 1e6,
+                f32_s * 1e6,
+                if int8 { "int8" } else { "f32" }
+            );
+            int8
+        }
+        // (no room for the timing's weight on the device: the f32 kernel, as before)
+        (None, None) => false,
+    };
+    gpu.decode_int8.lock().unwrap_or_else(|p| p.into_inner()).insert(dtype, int8);
+    int8
+}
+
+/// What [`decode_in_int8`] decided for `dtype` on this device, once it has (false before): for a test's tolerance.
+#[cfg(test)]
+pub(crate) fn decoded_in_int8(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> bool {
+    backend.gpu.decode_int8.lock().unwrap_or_else(|p| p.into_inner()).get(&dtype).copied().unwrap_or(false)
+}
+
+/// A step's row of a 4096 x 4096 `dtype` weight on this device, in f32 and from int8 activations: the better of three
+/// chains of 16 matmuls each way, a matmul's time (the int8 one's quantizing of its row once a chain, as a step
+/// quantizes a row once for the matmuls that read it). None where the weight finds no room on the device.
+fn time_decode(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> Option<(f64, f64)> {
+    use ggml_quants::GgmlType;
+    let (n, k) = (4096usize, 4096usize);
+    let (block, bytes) = match dtype {
+        GgmlType::Q4_0 => (32, 18),
+        GgmlType::Q3_K => (256, 110),
+        GgmlType::Q4_K => (256, 144),
+        GgmlType::Q5_K => (256, 176),
+        GgmlType::Q6_K => (256, 210),
+        _ => return None,
+    };
+    // (any bytes will do for a time: the kernels do the same work whatever the weights are)
+    let raw: Vec<u8> = (0..n * (k / block) * bytes).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(13) as u8).collect();
+    let w = ggml_rs::Backend::to_device_quant(backend, QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+    w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?;
+    let (x, y) = (backend.vec(k), backend.vec(n));
+    DeviceChain::upload(backend, &x, &(0..k).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect::<Vec<_>>());
+    let time = |int8: bool| -> f64 {
+        let run = || {
+            let mut rec = Recorder::new(backend);
+            for _ in 0..16 {
+                if !(int8 && rec.matmul_rows_q8(&w, &x, &y, 1)) {
+                    rec.matmul_rows_f32(&w, &x, &y, 1);
+                }
+            }
+            rec.read_range(&y, 0, 1);
+            Box::new(rec).finish();
+        };
+        run();
+        (0..3)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                run();
+                t.elapsed().as_secs_f64() / 16.0
+            })
+            .fold(f64::MAX, f64::min)
+    };
+    Some((time(false), time(true)))
+}

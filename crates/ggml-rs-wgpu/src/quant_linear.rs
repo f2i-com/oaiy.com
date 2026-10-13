@@ -222,13 +222,13 @@ mod tests {
             let mut dense = vec![0f32; n * k];
             ggml_quants::dequantize(dtype, &raw, &mut dense).unwrap();
             let w = b.quant_linear(QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype)).unwrap();
-            check(&b, w, &dense, &format!("{dtype:?}"), &mut next);
+            check(&b, w, &dense, &format!("{dtype:?}"), Some(dtype), &mut next);
         }
         // a matrix of floats, as f16
         let dense: Vec<f32> = (0..n * k).map(|_| ((next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * 0.05).collect();
-        check(&b, b.half_linear(dense.clone(), n, k).unwrap(), &dense, "floats as f16", &mut next);
+        check(&b, b.half_linear(dense.clone(), n, k).unwrap(), &dense, "floats as f16", None, &mut next);
 
-        fn check(b: &WgpuBackend, w: Arc<dyn PackedLinear>, dense: &[f32], dtype: &str, next: &mut dyn FnMut() -> u64) {
+        fn check(b: &WgpuBackend, w: Arc<dyn PackedLinear>, dense: &[f32], dtype: &str, kind: Option<GgmlType>, next: &mut dyn FnMut() -> u64) {
             let (n, k) = (w.shape()[0], w.shape()[1]);
             assert!(DeviceChain::holds_exl3(b, w.as_ref()), "{dtype}: held where a chain reads it");
             for rows in [1usize, 3, 70] {
@@ -246,8 +246,11 @@ mod tests {
                     let worst = got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0f64, f64::max);
                     // (a prompt's rows on the tensor cores read the inputs as f16; a check's few rows as int8 where
                     // the type has that kernel, as llama.cpp's MMQ does: some 0.4% of the largest. A GPU with no
-                    // tensor cores, an Apple one among them, takes a prompt's rows through int8 too.)
-                    let int8 = (2..=8).contains(&rows) || (rows > 8 && !crate::exl3::coop_on(&b.gpu));
+                    // tensor cores, an Apple one among them, takes a prompt's rows through int8 too; and a step's one
+                    // row where the device decodes the type from int8 activations, `chain::matmul::decode_in_int8`.)
+                    let int8 = (2..=8).contains(&rows)
+                        || (rows > 8 && !crate::exl3::coop_on(&b.gpu))
+                        || (rows == 1 && kind.is_some_and(|t| crate::chain::matmul::decoded_in_int8(b, t)));
                     let allowed = if int8 { 1.5e-2 } else { 2e-3 };
                     eprintln!("{dtype}, {rows} rows by {what}: the worst error {:.1e} of the largest", worst / size);
                     assert!(worst <= size * allowed, "{dtype}, {rows} rows by {what}: {worst} of {size}");
@@ -317,7 +320,10 @@ mod tests {
                 assert!(chained[rows * n..].iter().all(|&v| v == 7.0), "{what}, {rows} rows: the sum went past its rows");
                 for (path, got) in [("the host's path", host.data()), ("a chain", &chained[..rows * n])] {
                     let worst = got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0f64, f64::max);
-                    let allowed = if (2..=8).contains(&rows) { 1.5e-2 } else { 3e-3 };
+                    // (a step's one row of the quantized base from int8 activations where the device decodes Q4_0
+                    // so, `chain::matmul::decode_in_int8`, as a check's few rows are)
+                    let int8 = (2..=8).contains(&rows) || (rows == 1 && what.starts_with("Q4_0") && crate::chain::matmul::decoded_in_int8(&b, GgmlType::Q4_0));
+                    let allowed = if int8 { 1.5e-2 } else { 3e-3 };
                     eprintln!("{what}, {rows} rows by {path}: the worst error {:.1e} of the largest", worst / size);
                     assert!(worst <= size * allowed, "{what}, {rows} rows by {path}: {worst} of {size}");
                 }

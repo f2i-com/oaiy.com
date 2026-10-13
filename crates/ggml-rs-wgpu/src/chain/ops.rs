@@ -16,7 +16,9 @@ impl ChainRecorder for Recorder<'_> {
         static IQ4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let iq4 = *IQ4.get_or_init(|| std::env::var_os("OAIY_NO_IQ4_FEW").is_none());
         // (a step's row too where the recording's rows are alike: [`ChainRecorder::rows_alike`])
-        let one = self.alike;
+        // (and a step's one row where it is the faster from int8 activations on this device: timed at the first,
+        // `decode_in_int8`)
+        let one = self.alike || (m == 1 && kq8 && super::matmul::decode_in_int8(self.backend, w));
         let done = (iq4 && q8 && (m >= 2 || one) && self.matmul_rows_iq4_xs_q8(w, x, y, m))
             || (iq4 && self.matmul_rows_iq4_xs(w, x, y, m))
             || (((2..=crate::shaders::MULTI_MAX).contains(&m) || (one && m == 1)) && kq8 && self.matmul_rows_q8(w, x, y, m))

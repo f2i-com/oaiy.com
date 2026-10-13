@@ -15,7 +15,7 @@ mod attention;
 mod conv;
 mod device;
 mod kernels;
-mod matmul;
+pub(crate) mod matmul;
 mod ops;
 mod packed;
 mod recurrent;
@@ -119,8 +119,8 @@ impl ggml_rs::DeviceStorage for Aliased {
 }
 
 impl<'a> Recorder<'a> {
-    /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly).
-    #[cfg(test)]
+    /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly: its
+    /// tests, and the timing of a step's row each way, `matmul::decode_in_int8`).
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
         Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, joined: Vec::new(), places: Vec::new(), flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None }
     }

@@ -384,6 +384,20 @@ than their one-row f32 one (62 tokens a second where 67.5), and the one-row int8
 sums in another order than a check's; so a drafted 27B reply can still leave the plain
 one at a near-tie.
 
+A step's one row of a K-quant (Q3_K to Q6_K, and Q4_0) takes the one-row int8 kernel
+wherever it is the faster on the device, and the f32 one elsewhere: neither is the
+faster everywhere, so each type is timed once on each device at its first step's row
+(`chain::matmul::decode_in_int8`: a 4096 x 4096 weight, 16 chained matmuls each way,
+int8 where it is 5% faster or more), and the choice is logged ("Q4_K: a step's row in
+89 us from int8 activations, 110 us in f32 ... : int8"). Where the weights' reads
+decide (the RTX 5090 the f32 kernels were chosen on; not timed this way yet), the two
+should tie and f32's exact sums are kept. On an NVIDIA A2 held to 45 W (2026-10-13;
+ten SMs at their power cap's clocks, PCIe through Thunderbolt) unpacking each weight
+decides: Q6_K 143 us where 269, Q5_K 101 where 163, Q4_K 89 where 110, and Qwen3.5 9B
+Q4_K_M replied at 18.7 to 19.1 tokens a second where 12.5, its replies the same but
+where a near-tie went the other way (the rounding a check's rows have). `OAIY_Q8_DECODE=1`
+or `0` decides without timing; `OAIY_NO_Q8` turns every int8 kernel off.
+
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
 second (Strata 4,270), the reply at 78 to 81 tokens a second plain and 108 to 120
