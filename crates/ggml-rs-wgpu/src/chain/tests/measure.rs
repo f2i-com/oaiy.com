@@ -1559,3 +1559,81 @@ fn measure_grouped_attention() {
     let worst = outs[1].iter().zip(&outs[0]).map(|(a, e)| ((a - e) as f64).abs()).fold(0.0, f64::max);
     eprintln!("{line}; grouped's within {:.1e} of the RMS", worst / rms);
 }
+
+/// A decode step's attention over a cache of halves each way (`--ignored --nocapture`): a thread a key
+/// ([`attention_part_group_halved`]) and a subgroup's lanes a key ([`attention_part_group_lanes`]), Qwen3.5 9B's heads
+/// (16 of 256 on 4; OAIY_ATT_NH, OAIY_ATT_NKV, OAIY_ATT_HD others) over OAIY_ATT_LEN positions (20,000), the parts and
+/// their join; the cache's bytes a second, and how far apart the two are.
+#[test]
+#[ignore = "a measurement"]
+fn measure_step_attention() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    if !b.gpu.subgroups32() {
+        return;
+    }
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (n_h, n_kv, hd) = (env("OAIY_ATT_NH", 16), env("OAIY_ATT_NKV", 4), env("OAIY_ATT_HD", 256));
+    let kv_len = env("OAIY_ATT_LEN", 20000);
+    let (g, row, cap) = (n_h / n_kv, 2 * n_kv * hd, kv_len + 8);
+    let mut next = rng(23);
+    let q: Vec<f32> = (0..n_h * hd).map(|_| next()).collect();
+    let halves: Vec<f32> = (0..cap * row / 2).map(|_| f32::from_bits(half::f16::from_f32(next()).to_bits() as u32 | (half::f16::from_f32(next()).to_bits() as u32) << 16)).collect();
+    let (qv, kv) = (b.vec(n_h * hd), b.vec(cap * row / 2));
+    DeviceChain::upload(&b, &qv, &q);
+    DeviceChain::upload(&b, &kv, &halves);
+    let runs = kv_len.div_ceil(SPLIT);
+    let out = b.vec(n_h * hd + n_h * runs * (hd + 2));
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut line = format!("{n_h} heads ({n_kv} kv) {hd} wide over {kv_len}:");
+    let mut outs: Vec<Vec<f32>> = Vec::new();
+    for (way, src) in [("a thread a key", attention_part_group_halved(g)), ("lanes a key", attention_part_group_lanes(g, hd)), ("a key a pass", attention_part_group_lanes_by(g, hd, 32, 1))] {
+        let name: &'static str = Box::leak(format!("bench-step-attention-{way}-{g}-{hd}").into_boxed_str());
+        let part = b.gpu.named_pipeline(name, || src.clone());
+        let record = |rec: &mut Recorder| {
+            let params = rec.uniform(&[n_h as u32, n_kv as u32, hd as u32, kv_len as u32, 0, runs as u32, scale.to_bits()]);
+            rec.dispatch(&part, buffer(&kv), buffer(&qv), buffer(&out), &params, (n_kv as u32, runs as u32, 1));
+            let join = rec.named("chain-attention-join", ATTENTION_JOIN);
+            rec.dispatch(&join, buffer(&kv), buffer(&qv), buffer(&out), &params, (n_h as u32, 1, 1));
+        };
+        let mut rec = Recorder::new(&b);
+        record(&mut rec);
+        rec.read_range(&out, 0, n_h * hd);
+        outs.push(Box::new(rec).finish().pop().expect("the output"));
+        let run = || {
+            let mut rec = Recorder::new(&b);
+            for _ in 0..16 {
+                record(&mut rec);
+            }
+            rec.read_range(&out, 0, 1);
+            Box::new(rec).finish();
+        };
+        run();
+        let t = std::time::Instant::now();
+        for _ in 0..3 {
+            run();
+        }
+        let s = t.elapsed().as_secs_f64() / 48.0;
+        line += &format!(" {way} {:.0} us ({:.0} GB/s)", s * 1e6, (kv_len * row * 2) as f64 / s / 1e9);
+    }
+    {
+        let run = || {
+            let mut rec = Recorder::new(&b);
+            for _ in 0..16 {
+                let params = rec.uniform(&[n_h as u32, n_kv as u32, hd as u32, kv_len as u32, 0, runs as u32, scale.to_bits()]);
+                let join = rec.named("chain-attention-join", ATTENTION_JOIN);
+                rec.dispatch(&join, buffer(&kv), buffer(&qv), buffer(&out), &params, (n_h as u32, 1, 1));
+            }
+            rec.read_range(&out, 0, 1);
+            Box::new(rec).finish();
+        };
+        run();
+        let t = std::time::Instant::now();
+        for _ in 0..3 {
+            run();
+        }
+        line += &format!(" join alone {:.0} us", t.elapsed().as_secs_f64() / 48.0 * 1e6);
+    }
+    let top = outs[0].iter().fold(0f32, |m, v| m.max(v.abs()));
+    let worst = outs[1].iter().zip(&outs[0]).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+    eprintln!("{line}; lanes' within {:.1e} of the largest", worst / top);
+}

@@ -181,7 +181,8 @@ impl Recorder<'_> {
         // kernel, a KV head's queries a workgroup, the cache's rows read once for all of them; OAIY_ATTENTION_GROUPED=0:
         // the kernels below)
         let g = n_h / n_kv;
-        let grouped = !full && kernel == 1 && matches!(g, 1 | 2 | 4) && grouped_on();
+        // (its workgroup's memory near 48 KB, 256 threads)
+        let grouped = !full && kernel == 1 && matches!(g, 1 | 2 | 4) && grouped_on() && self.gpu().limits.max_compute_workgroup_storage_size >= 48 << 10;
         if grouped && (!halves || halves_in_place()) {
             let rp = rows.div_ceil(64) * 64;
             // the cache's rows as they lie where they are halves with room to 128 positions past `kv_len`, else as an

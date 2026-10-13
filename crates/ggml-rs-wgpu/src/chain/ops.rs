@@ -949,8 +949,28 @@ impl ChainRecorder for Recorder<'_> {
         );
         let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, kv_len as u32, lo as u32, runs as u32, scale.to_bits()]);
         const NAMES: [&str; 9] = ["", "", "chain-attention-halves-2", "chain-attention-halves-3", "chain-attention-halves-4", "chain-attention-halves-5", "chain-attention-halves-6", "chain-attention-halves-7", "chain-attention-halves-8"];
+        // (a device whose subgroups are 32 lanes: a key's row read by a subgroup's lanes together,
+        // [`attention_part_group_lanes`]; OAIY_ATTENTION_LANES=0: a thread a key)
+        const LANES: [[&str; 3]; 9] = [
+            ["", "", ""],
+            ["", "", ""],
+            ["chain-attention-lanes-2-64", "chain-attention-lanes-2-128", "chain-attention-lanes-2-256"],
+            ["chain-attention-lanes-3-64", "chain-attention-lanes-3-128", "chain-attention-lanes-3-256"],
+            ["chain-attention-lanes-4-64", "chain-attention-lanes-4-128", "chain-attention-lanes-4-256"],
+            ["chain-attention-lanes-5-64", "chain-attention-lanes-5-128", "chain-attention-lanes-5-256"],
+            ["chain-attention-lanes-6-64", "chain-attention-lanes-6-128", "chain-attention-lanes-6-256"],
+            ["chain-attention-lanes-7-64", "chain-attention-lanes-7-128", "chain-attention-lanes-7-256"],
+            ["chain-attention-lanes-8-64", "chain-attention-lanes-8-128", "chain-attention-lanes-8-256"],
+        ];
+        static LANES_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let g = n_h / n_kv;
-        let part = self.gpu().named_pipeline(NAMES[g], || attention_part_group_halved(g));
+        let lanes = self.gpu().subgroups32() && *LANES_ON.get_or_init(|| std::env::var("OAIY_ATTENTION_LANES").map_or(true, |v| v != "0"));
+        let part = if lanes {
+            let at = match head_dim { 64 => 0, 128 => 1, _ => 2 };
+            self.gpu().named_pipeline(LANES[g][at], || attention_part_group_lanes(g, head_dim))
+        } else {
+            self.gpu().named_pipeline(NAMES[g], || attention_part_group_halved(g))
+        };
         self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
         let join = self.named("chain-attention-join", ATTENTION_JOIN);
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));

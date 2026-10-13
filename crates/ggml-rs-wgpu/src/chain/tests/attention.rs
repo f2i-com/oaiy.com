@@ -217,11 +217,12 @@ fn qsas_attention_by_groups_is_the_heads() {
 }
 
 /// A step's attention over its cache's f16 halves gives what the f32 cache gives, to f16's rounding: the halves
-/// made in two goes (rows added since the first), groups of 2, 3 and 6, heads 64, 128 and 256 wide.
+/// made in two goes (rows added since the first), groups of 2, 3, 4 (Qwen3.5 9B's) and 6, heads 64, 128 and 256 wide
+/// (where subgroups are 32 lanes, a key read by a subgroup's lanes together).
 #[test]
 fn a_steps_attention_over_halves_is_the_f32_caches() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111)] {
+    for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111), (16, 4, 256, 0, 5000), (8, 2, 128, 37, 300)] {
         if !b.attention_halves(n_h, n_kv, hd) {
             return;
         }

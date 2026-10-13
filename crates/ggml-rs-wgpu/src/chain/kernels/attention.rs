@@ -788,6 +788,98 @@ pub(in crate::chain) fn attention_part_group_halved(g: usize) -> String {
     format!("enable f16;\n{halved}")
 }
 
+/// [`attention_part_group_halved`] with each key read by the lanes of a subgroup together, for a device whose subgroups
+/// are 32 lanes (`Gpu::subgroups32`) and a head `hd` wide (64, 128 or 256): 32 lanes a key (16 for a head 64 wide), each
+/// lane two vec4s of it side by side with the others', the key's scores their sums (`subgroupShuffleXor`), 4 keys a
+/// lane at once, staged for the softmax; the run's largest and sum by subgroups; the values 4 rows loaded before their
+/// sums (each share's every key, those past the run weighing none). A thread a key read a key's row alone (a
+/// subgroup's loads 32 rows `2 n_kv hd` halves apart) and waited on each value row at its sum: Qwen3.5 9B's step over
+/// 20,000 positions (16 heads of 256 on 4) on an NVIDIA A2 at 1,200 MHz, its parts and their join, took 1,347 us a
+/// layer (61 GB/s of its cache) and now 673 (122); over 7,000, 501 and now 268; over 60,000, 3,819 and now 1,901
+/// (`measure_step_attention`). 16 lanes a key (fewer shuffles) and 8 ran slower: the shuffles were not what held it.
+pub(in crate::chain) fn attention_part_group_lanes(g: usize, hd: usize) -> String {
+    attention_part_group_lanes_by(g, hd, (hd / 4).min(32), 4)
+}
+
+/// [`attention_part_group_lanes`] with `lanes` lanes a key (each `hd / 4 / lanes` of its vec4s, the lanes' side by side),
+/// `unroll` keys a lane at a time.
+pub(in crate::chain) fn attention_part_group_lanes_by(g: usize, hd: usize, lanes: usize, unroll: usize) -> String {
+    assert!(matches!(hd, 64 | 128 | 256) && (2..=8).contains(&g) && matches!(lanes, 8 | 16 | 32) && hd / 4 >= lanes && matches!(unroll, 1 | 2 | 4), "the lanes' attention's heads");
+    let halved = attention_part_group_halved(g);
+    let from = halved.find("    let t = start + li;\n").expect("the scores' start");
+    let to = halved.find("    workgroupBarrier();\n    buf[2u * li] = s0;").expect("the scores' end");
+    let per = 32 / lanes;
+    let parts = hd / 4 / lanes;
+    let c = |i: usize| ["x", "y", "z", "w"][i % 4];
+    let mut scores = format!("    // the lane's part of a key ({lanes} lanes a key, its vec4s `sub`, `sub + {lanes}`, ...: a load's lanes side by side) and its\n    // key of the subgroup's {per}, and the queries' vec4s of that part\n    let lane = li % 32u;\n    let sub = lane % {lanes}u;\n    let kk = lane / {lanes}u;\n");
+    for i in 0..g {
+        for k in 0..parts {
+            scores += &format!("    let q{i}_{k} = buf[{i}u * hd4 + {}u + sub];\n", k * lanes);
+        }
+    }
+    // (the run's 256 keys: the 8 subgroups' `per` at a time, `unroll` such turns a pass)
+    scores += &format!("    for (var j = 0u; j < 256u; j += {}u) {{\n", 8 * per * unroll);
+    for u in 0..unroll {
+        scores += &format!("        let key{u} = j + {}u + (li / 32u) * {per}u + kk;\n        let tk{u} = start + key{u};\n        let kb{u} = min(tk{u}, max(end, start + 1u) - 1u) * row4 + kh * hd4 + sub;\n", u * 8 * per);
+        for k in 0..parts {
+            scores += &format!("        let k{u}_{k} = vec4<f32>(kv4[kb{u} + {}u]);\n", k * lanes);
+        }
+    }
+    let groups = g.div_ceil(4);
+    for u in 0..unroll {
+        for v in 0..groups {
+            let sums: Vec<String> = (0..4).map(|i| if 4 * v + i < g { (0..parts).map(|k| format!("dot(q{}_{k}, k{u}_{k})", 4 * v + i)).collect::<Vec<_>>().join(" + ") } else { "0.0".into() }).collect();
+            scores += &format!("        var r{u}_{v} = vec4<f32>({});\n", sums.join(", "));
+        }
+    }
+    let mut m = lanes / 2;
+    while m > 0 {
+        for u in 0..unroll {
+            for v in 0..groups {
+                scores += &format!("        r{u}_{v} += subgroupShuffleXor(r{u}_{v}, {m}u);\n");
+            }
+        }
+        m /= 2;
+    }
+    scores += "        if (sub == 0u) {\n";
+    for u in 0..unroll {
+        for v in 0..2 {
+            let parts: Vec<String> = (0..4).map(|i| if 4 * v + i < g { format!("r{u}_{}.{} * scale", v, c(i)) } else { "-3.4e38".into() }).collect();
+            scores += &format!("            sc[2u * key{u} + {v}u] = select(vec4<f32>(-3.4e38), vec4<f32>({}), tk{u} < end);\n", parts.join(", "));
+        }
+    }
+    scores += "        }\n    }\n    workgroupBarrier();\n    let t = start + li;\n    let live = t < end;\n    let s0 = sc[2u * li];\n    let s1 = sc[2u * li + 1u];\n";
+    let rest = &halved[to..];
+    // the run's largest and sum a head by subgroups (each subgroup's, then the 8 subgroups' in turn) where the
+    // workgroup's halving steps took a barrier each, 16 of them
+    let max_tree = "    workgroupBarrier();\n    buf[2u * li] = s0;\n    buf[2u * li + 1u] = s1;\n    workgroupBarrier();\n    for (var st = 128u; st > 0u; st /= 2u) {\n        if (li < st) {\n            buf[2u * li] = max(buf[2u * li], buf[2u * (li + st)]);\n            buf[2u * li + 1u] = max(buf[2u * li + 1u], buf[2u * (li + st) + 1u]);\n        }\n        workgroupBarrier();\n    }\n    let m0 = buf[0];\n    let m1 = buf[1];\n    workgroupBarrier();\n";
+    let max_lanes = "    let wm0 = subgroupMax(s0);\n    let wm1 = subgroupMax(s1);\n    if (li % 32u == 0u) {\n        buf[2u * (li / 32u)] = wm0;\n        buf[2u * (li / 32u) + 1u] = wm1;\n    }\n    workgroupBarrier();\n    var m0 = buf[0];\n    var m1 = buf[1];\n    for (var w = 1u; w < 8u; w++) {\n        m0 = max(m0, buf[2u * w]);\n        m1 = max(m1, buf[2u * w + 1u]);\n    }\n    workgroupBarrier();\n";
+    let sum_tree = "    buf[2u * li] = e0;\n    buf[2u * li + 1u] = e1;\n    workgroupBarrier();\n    for (var st = 128u; st > 0u; st /= 2u) {\n        if (li < st) {\n            buf[2u * li] += buf[2u * (li + st)];\n            buf[2u * li + 1u] += buf[2u * (li + st) + 1u];\n        }\n        workgroupBarrier();\n    }\n    let l0 = buf[0];\n    let l1 = buf[1];\n    workgroupBarrier();\n";
+    let sum_lanes = "    let wl0 = subgroupAdd(e0);\n    let wl1 = subgroupAdd(e1);\n    if (li % 32u == 0u) {\n        buf[2u * (li / 32u)] = wl0;\n        buf[2u * (li / 32u) + 1u] = wl1;\n    }\n    workgroupBarrier();\n    var l0 = buf[0];\n    var l1 = buf[1];\n    for (var w = 1u; w < 8u; w++) {\n        l0 += buf[2u * w];\n        l1 += buf[2u * w + 1u];\n    }\n    workgroupBarrier();\n";
+    assert!(rest.contains(max_tree) && rest.contains(sum_tree), "the part's reductions");
+    let rest = rest.replace(max_tree, max_lanes).replace(sum_tree, sum_lanes);
+    // the values: the share's every key (those past the run's end weigh none: their rows the run's last), 4 rows
+    // loaded before their sums, where a row's load was waited on at its sum
+    let values_from = rest.find("    let vb = start * row4 + kvd4 + kh * hd4 + d4;\n").expect("the values' start");
+    let values_to = rest.find("    if (share > 0u) {").expect("the values' end");
+    let mut values = String::from("    let vb = kvd4 + kh * hd4 + d4;\n    let lastp = max(end, start + 1u) - 1u;\n");
+    values += &(0..g).map(|i| format!("    var v{i} = vec4<f32>(0.0);\n")).collect::<String>();
+    values += "    for (var i = first; i < first + hd4; i += 4u) {\n";
+    for u in 0..4 {
+        values += &format!("        let vr{u} = vec4<f32>(kv4[min(start + i + {u}u, lastp) * row4 + vb]);\n");
+    }
+    for u in 0..4 {
+        values += &format!("        let w{u}a = sc[2u * (i + {u}u)];\n        let w{u}b = sc[2u * (i + {u}u) + 1u];\n");
+    }
+    for i in 0..g {
+        let (h, comp) = (["a", "b"][i / 4], c(i));
+        values += &format!("        v{i} += w0{h}.{comp} * vr0 + w1{h}.{comp} * vr1 + w2{h}.{comp} * vr2 + w3{h}.{comp} * vr3;\n");
+    }
+    values += "    }\n";
+    let rest = format!("{}{}{}", &rest[..values_from], values, &rest[values_to..]);
+    format!("{}{}{}", &halved[..from], scores, rest)
+}
+
 /// `p[0].y` pairs of `x2`'s values from pair `p[0].x` as f16, a pair a word of `q` at the same place: a cache's rows
 /// as the halves [`attention_part_group_halved`] reads.
 pub(in crate::chain) const HALVE: &str = r#"
