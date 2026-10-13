@@ -30,6 +30,7 @@ gui = [
     "dep:reqwest13",
     "dep:oaiy-studio",
     "dep:tauri-build",
+    "dep:webkit2gtk",
 ]
 # The browser login of `oaiy-server` (design 4.7): the Argon2id password, the strength estimate and
 # the console. Enabled for the headless server and left off for the desktop, so the GUI carries the
@@ -193,6 +194,12 @@ scrypt = { version = "0.11", default-features = false }
 # Already in the tree (crypto_box, ed25519-dalek). The passphrase of a backup is wiped from memory when the command that was given it is
 # done with it, and what holds a password of the web login (feature `web`) is wiped when it is dropped: one dependency, always built.
 zeroize = "1"
+
+# Linux-only, with the window: the webviews' WebKitGTK, whose settings the agent's page needs
+# turned on (embed.rs). Already in the tree (tauri, wry); named here because a crate cannot `use`
+# an undeclared transitive dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0", optional = true }
 
 # Windows-only: the job object that kills child processes when this process
 # dies, however it dies. Already in the tree transitively (tauri, tokio); named

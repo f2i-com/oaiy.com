@@ -149,7 +149,7 @@ three things, each of which needed a Mac to look at. All three are fixed:
   (an older OAIY still letting go of it as an update restarts it, or another program) opens
   the page on `oaiy://localhost`, so projects and chats made in one launch look gone in the
   next, until a launch has the port again; waiting for the port a few seconds before
-  falling back, and saying so on the page, would keep one origin. `MAC_AGENT_ORIGIN` stays in
+  falling back, and saying so on the page, would keep one origin. `AGENT_HTTP_ORIGIN` stays in
   the engines' allowed origins whether this desktop holds the port or not. Projects kept
   under `oaiy://localhost` before the move are not carried over: an export from the old
   origin and an import into the new (the project menu's .zip) is the way across for now.

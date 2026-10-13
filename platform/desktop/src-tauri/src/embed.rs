@@ -8,9 +8,11 @@
 //! memory), and a frame of the dashboard could not be. Each is served from a
 //! scheme of its own (`oaiy`, `oaiyflows`; `http://<scheme>.localhost` on
 //! Windows) with the headers that isolation takes, and starts knowing the
-//! desktop's address and a token for it, so neither has to pair. On a Mac the
-//! agent's comes from a port of its own instead ([`AGENT_PORT`]): WebKit gives a
-//! page on a scheme of its own no shared memory.
+//! desktop's address and a token for it, so neither has to pair. On a Mac and
+//! on Linux the agent's comes from a port of its own instead ([`AGENT_PORT`]):
+//! WebKit gives a page on a scheme of its own no shared memory, and WebKitGTK no
+//! cross-origin isolation. WebKitGTK also leaves off the storage the agent keeps
+//! its projects in, which each page's webview has turned on ([`webkit_features`]).
 //!
 //! All three follow the dashboard's light or dark (`set_theme`): each starts
 //! in it and is told when it changes.
@@ -25,31 +27,34 @@ use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, Url, Webv
 pub const AGENT_SCHEME: &str = "oaiy";
 pub const FLOWS_SCHEME: &str = "oaiyflows";
 
-/// The port a Mac serves the agent's page from, on this computer alone ([`serve_agent_over_http`]).
+/// The port a Mac and Linux serve the agent's page from, on this computer alone ([`serve_agent_over_http`]).
 ///
 /// The agent's code sandbox blocks on shared memory. WebKit calls a page on a scheme of its own, served with the
 /// headers that isolate a page, cross-origin isolated, and still gives it no `SharedArrayBuffer`; the same page from
-/// `http://127.0.0.1` has both (`tools/mac/webview-probe.swift` on the first Mac, macOS 27). The port is fixed because a
-/// page's storage is its origin's: another port would be an agent with none of its projects. The engines' gateway lets
-/// this origin in (`oaiy_studio::MAC_AGENT_ORIGIN`, which a test holds to this port).
+/// `http://127.0.0.1` has both (`tools/mac/webview-probe.swift` on the first Mac, macOS 27). WebKitGTK (2.52) does not
+/// call such a page isolated at all, and the page from `http://127.0.0.1` it does: with `SharedArrayBuffer` turned on
+/// ([`linux_shared_memory`]), the sandbox has what it needs. The port is fixed because a page's storage is its
+/// origin's: another port would be an agent with none of its projects. The engines' gateway lets this origin in
+/// (`oaiy_studio::AGENT_HTTP_ORIGIN`, which a test holds to this port).
 pub const AGENT_PORT: u16 = 17974;
 
 /// Whether this process holds [`AGENT_PORT`] and serves the agent's page there.
 static AGENT_PORT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The agent page's origin while this process serves it over http (a Mac, its port held), and only then: the desktop's
+/// The agent page's origin while this process serves it over http (a Mac, Linux; its port held), and only then: the desktop's
 /// API takes it for the agent's window ([`crate::http::is_embedded_origin`]). A program that had taken the port would
 /// serve its own pages from that origin to any browser here; while OAIY holds it, nothing else answers there.
 pub fn agent_http_origin() -> Option<&'static str> {
-    AGENT_PORT_HELD.load(std::sync::atomic::Ordering::Acquire).then_some(oaiy_studio::MAC_AGENT_ORIGIN)
+    AGENT_PORT_HELD.load(std::sync::atomic::Ordering::Acquire).then_some(oaiy_studio::AGENT_HTTP_ORIGIN)
 }
 
-/// On a Mac: hold [`AGENT_PORT`] and serve the agent's page from it, with the headers that isolate it ([`serve_path`]),
-/// so that its webview opens it there. Before the page is made. Where the port is taken (or this is not a Mac) the page
-/// stays on its own scheme, and its code sandbox says it is unavailable.
+/// On a Mac and Linux: hold [`AGENT_PORT`] and serve the agent's page from it, with the headers that isolate it
+/// ([`serve_path`]), so that its webview opens it there. Before the page is made. Where the port is taken (or this is
+/// Windows, whose WebView2 isolates the page on its scheme) the page stays on its own scheme, and its code sandbox says
+/// it is unavailable.
 pub fn serve_agent_over_http<R: Runtime>(app: &AppHandle<R>) {
     use std::sync::atomic::Ordering;
-    if !cfg!(target_os = "macos") {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return;
     }
     let Some(root) = dist(app, Page::Agent) else { return };
@@ -61,7 +66,7 @@ pub fn serve_agent_over_http<R: Runtime>(app: &AppHandle<R>) {
         }
     };
     AGENT_PORT_HELD.store(true, Ordering::Release);
-    log::info!("embed: the agent's page is served from {} (its code sandbox needs shared memory)", oaiy_studio::MAC_AGENT_ORIGIN);
+    log::info!("embed: the agent's page is served from {} (its code sandbox needs shared memory)", oaiy_studio::AGENT_HTTP_ORIGIN);
     tauri::async_runtime::spawn(async move {
         let served = async {
             let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -142,8 +147,8 @@ impl Page {
         }
     }
 
-    /// Its address in the webview: WebView2 (Windows) maps a custom scheme to `http://<scheme>.localhost`; a Mac
-    /// serves the agent's from a port of its own where it holds one ([`agent_http_origin`]).
+    /// Its address in the webview: WebView2 (Windows) maps a custom scheme to `http://<scheme>.localhost`; a Mac and
+    /// Linux serve the agent's from a port of its own where they hold one ([`agent_http_origin`]).
     fn url(self) -> Url {
         if self == Page::Engines {
             let base = crate::engines::ui_url().unwrap_or_else(|| "http://127.0.0.1:7860".into());
@@ -524,7 +529,10 @@ fn show_at<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page
             _ => "platform/ui/",
         }));
     }
-    window.add_child(builder(app, page), position, size).map_err(|e| e.to_string())?;
+    let webview = window.add_child(builder(app, page), position, size).map_err(|e| e.to_string())?;
+    if page == Page::Agent {
+        webkit_features(&webview, page);
+    }
     Ok(())
 }
 
@@ -542,10 +550,115 @@ pub fn preload<R: Runtime>(app: &AppHandle<R>) {
         match window.add_child(builder(&app, Page::Agent), LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0)) {
             Ok(webview) => {
                 let _ = webview.hide();
+                webkit_features(&webview, Page::Agent);
             }
             Err(e) => log::warn!("the agent's page was not made at startup: {e}"),
         }
     });
+}
+
+/// What WebKitGTK leaves off and the agent's page needs: `navigator.storage`, and the origin-private file system its
+/// projects and settings are kept in, with its files' writable streams and access handles. Without them the agent
+/// stopped as it started ("undefined is not an object (evaluating 'navigator.storage.getDirectory')", WebKitGTK 2.52).
+#[cfg(target_os = "linux")]
+const WEBKIT_FEATURES: [&str; 4] = ["StorageAPI", "FileSystem", "FileSystemWritableStream", "AccessHandle"];
+
+/// On Linux: [`WEBKIT_FEATURES`] turned on in a page's webview, and the page opened again to start with them (a page
+/// has them from the document made after them, and its webview was made with the page loading). WebKitGTK names its
+/// features from 2.42 and the bindings stop at 2.40, so the calls are found as OAIY runs ([`webkit::enable`]); with
+/// an older WebKitGTK the page stays as it was, and the log says why. Elsewhere, nothing.
+fn webkit_features<R: Runtime>(webview: &tauri::Webview<R>, page: Page) {
+    #[cfg(target_os = "linux")]
+    {
+        let url = page.url();
+        let made = webview.with_webview(move |w| {
+            use webkit2gtk::glib::prelude::ObjectType;
+            use webkit2gtk::WebViewExt;
+            let view = w.inner();
+            let Some(settings) = view.settings() else { return };
+            // SAFETY: a `WebKitSettings` of this webview, alive while `settings` is, on the main thread.
+            match unsafe { webkit::enable(settings.as_ptr().cast(), &WEBKIT_FEATURES) } {
+                Ok(on) => {
+                    log::info!("embed: {} has WebKitGTK's {} on", page.label(), on.join(", "));
+                    view.load_uri(url.as_str());
+                }
+                Err(e) => log::warn!("embed: {} keeps WebKitGTK's defaults ({e}): the agent cannot keep its projects", page.label()),
+            }
+        });
+        if let Err(e) = made {
+            log::warn!("embed: {}'s WebKitGTK settings were not reached: {e}", page.label());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (webview, page);
+}
+
+/// WebKitGTK's features by name (2.42 and later), its calls looked up in this process (it has WebKitGTK loaded).
+#[cfg(target_os = "linux")]
+mod webkit {
+    use std::ffi::{c_char, c_int, c_void, CStr};
+
+    extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    /// The function `name` among those this process has loaded (glibc's `RTLD_DEFAULT` is a null handle), as an `F`.
+    ///
+    /// # Safety
+    /// `F` must be the function's own type.
+    unsafe fn find<F: Copy>(name: &CStr) -> Option<F> {
+        let p = dlsym(std::ptr::null_mut(), name.as_ptr());
+        (!p.is_null()).then(|| std::mem::transmute_copy::<*mut c_void, F>(&p))
+    }
+
+    /// `wanted` (features' identifiers) turned on in `settings`: those it had, or why none could be.
+    ///
+    /// # Safety
+    /// `settings` must be a live `WebKitSettings*`, and this on the thread that owns it.
+    pub unsafe fn enable(settings: *mut c_void, wanted: &[&str]) -> Result<Vec<String>, String> {
+        type All = unsafe extern "C" fn() -> *mut c_void;
+        type Len = unsafe extern "C" fn(*mut c_void) -> usize;
+        type Get = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+        type Identifier = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+        type Set = unsafe extern "C" fn(*mut c_void, *mut c_void, c_int);
+        type Unref = unsafe extern "C" fn(*mut c_void);
+        let (Some(all), Some(len), Some(get), Some(identifier), Some(set), Some(unref)) = (
+            find::<All>(c"webkit_settings_get_all_features"),
+            find::<Len>(c"webkit_feature_list_get_length"),
+            find::<Get>(c"webkit_feature_list_get"),
+            find::<Identifier>(c"webkit_feature_get_identifier"),
+            find::<Set>(c"webkit_settings_set_feature_enabled"),
+            find::<Unref>(c"webkit_feature_list_unref"),
+        ) else {
+            return Err("this WebKitGTK is older than 2.42, which names its features".into());
+        };
+        let list = all();
+        let mut on = Vec::new();
+        for i in 0..len(list) {
+            let feature = get(list, i);
+            let id = CStr::from_ptr(identifier(feature)).to_string_lossy();
+            if wanted.contains(&id.as_ref()) {
+                set(settings, feature, 1);
+                on.push(id.into_owned());
+            }
+        }
+        unref(list);
+        if on.len() < wanted.len() {
+            return Err(format!("it has {} of {}", on.join(", "), wanted.join(", ")));
+        }
+        Ok(on)
+    }
+}
+
+/// On Linux, before the first webview is made: `SharedArrayBuffer` for the agent's page, which its code sandbox blocks
+/// on. WebKitGTK gives a page one only where its JavaScript engine is told to (`JSC_useSharedArrayBuffer`, read by
+/// each web process it starts), even a page it calls cross-origin isolated (the agent's from [`AGENT_PORT`]). Every
+/// page in the window has it then, all of them this computer's own. A value already set is left alone.
+pub fn linux_shared_memory() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("JSC_useSharedArrayBuffer").is_none() {
+        std::env::set_var("JSC_useSharedArrayBuffer", "1");
+    }
 }
 
 /// One page made or placed at a time: two quick resizes must not both make a webview.
@@ -564,7 +677,7 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
         url.query_pairs_mut().append_pair("in", "oaiy").append_pair("theme", first);
         WebviewBuilder::new(page.label(), WebviewUrl::External(url))
     } else if page == Page::Agent && agent_http_origin().is_some() {
-        // (a Mac's agent, from its own port: an address, not a scheme the window serves)
+        // (a Mac's or Linux's agent, from its own port: an address, not a scheme the window serves)
         WebviewBuilder::new(page.label(), WebviewUrl::External(page.url())).initialization_script(&desktop_script(first, page))
     } else {
         WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url())).initialization_script(&desktop_script(first, page))
@@ -622,13 +735,13 @@ mod tests {
     }
 
     #[test]
-    fn a_macs_agent_is_served_from_the_port_the_gateway_lets_in() {
+    fn the_agents_port_is_the_one_the_gateway_lets_in() {
         // The engines' gateway names the origin in its own crate (it lets the page in); it is this port's.
-        assert_eq!(oaiy_studio::MAC_AGENT_ORIGIN, format!("http://127.0.0.1:{AGENT_PORT}"));
+        assert_eq!(oaiy_studio::AGENT_HTTP_ORIGIN, format!("http://127.0.0.1:{AGENT_PORT}"));
         // Not held (nothing here served it), the page is at its scheme and the origin is nobody's.
         assert_eq!(agent_http_origin(), None);
-        assert!(!crate::http::is_embedded_origin(oaiy_studio::MAC_AGENT_ORIGIN));
-        assert!(!crate::backup::routes::is_agent_origin(oaiy_studio::MAC_AGENT_ORIGIN));
+        assert!(!crate::http::is_embedded_origin(oaiy_studio::AGENT_HTTP_ORIGIN));
+        assert!(!crate::backup::routes::is_agent_origin(oaiy_studio::AGENT_HTTP_ORIGIN));
     }
 
     #[test]

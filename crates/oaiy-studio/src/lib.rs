@@ -16,7 +16,7 @@
 
 mod admin;
 mod config;
-pub use config::MAC_AGENT_ORIGIN;
+pub use config::AGENT_HTTP_ORIGIN;
 mod detect;
 mod discovery;
 mod egpu;

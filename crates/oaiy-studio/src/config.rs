@@ -198,10 +198,21 @@ pub const COMPANION_ORIGINS: [&str; 7] = ["https://bot.computer", "http://localh
 /// The agent in OAIY's own window: offered once to files from before version 3.
 const OAIY_WINDOW_ORIGINS: [&str; 2] = ["http://oaiy.localhost", "oaiy://localhost"];
 
-/// The agent in OAIY's own window on a Mac, which serves it from a port of its own on this computer (WebKit gives a page
-/// on a scheme of its own no shared memory, which the agent's code sandbox blocks on: OAIY Desktop's `embed.rs`).
-/// Offered once, on a Mac, to files from before version 4.
-pub const MAC_AGENT_ORIGIN: &str = "http://127.0.0.1:17974";
+/// The agent in OAIY's own window on a Mac or Linux, which serves it from a port of its own on this computer (WebKit
+/// gives a page on a scheme of its own no shared memory, and WebKitGTK no cross-origin isolation, both of which the
+/// agent's code sandbox blocks on: OAIY Desktop's `embed.rs`). Offered once to files from before version 4 on a Mac,
+/// and before version 5 on Linux.
+pub const AGENT_HTTP_ORIGIN: &str = "http://127.0.0.1:17974";
+
+/// Whether OAIY's window serves the agent from [`AGENT_HTTP_ORIGIN`] on this system, and the `origins_version` from
+/// which a file has been offered it here.
+const AGENT_HTTP_ORIGIN_SINCE: Option<i64> = if cfg!(target_os = "macos") {
+    Some(4)
+} else if cfg!(target_os = "linux") {
+    Some(5)
+} else {
+    None
+};
 
 /// The desktop app's origins in the first `origins_version`: Tauri's shared
 /// ones, which every Tauri app has. Version 2 names bot.computer's own scheme.
@@ -211,10 +222,10 @@ const SHARED_TAURI_ORIGINS: [(&str, &str); 2] = [("http://tauri.localhost", "htt
 /// (`origins_version` records that they were offered once, so an origin the
 /// user removes stays removed). A file at version 1 has Tauri's shared origins
 /// swapped for the desktop app's own; one before version 3 gains OAIY's window,
-/// and one before version 4, on a Mac, OAIY's window there ([`MAC_AGENT_ORIGIN`]).
-/// Returns whether anything changed.
+/// and one before version 4 on a Mac, or 5 on Linux, OAIY's window there
+/// ([`AGENT_HTTP_ORIGIN`]). Returns whether anything changed.
 pub fn upgrade_origins(v: &mut Json) -> bool {
-    const VERSION: i64 = 4;
+    const VERSION: i64 = 5;
     let Json::Obj(top) = v else { return false };
     let Some((_, gateway)) = top.iter_mut().find(|(k, _)| k == "gateway") else { return false };
     let from = int_or(gateway, "origins_version", 0);
@@ -251,8 +262,8 @@ pub fn upgrade_origins(v: &mut Json) -> bool {
                     }
                 }
             }
-            if cfg!(target_os = "macos") && !has(origins, MAC_AGENT_ORIGIN) {
-                origins.push(Json::str(MAC_AGENT_ORIGIN));
+            if AGENT_HTTP_ORIGIN_SINCE.is_some_and(|since| from < since) && !has(origins, AGENT_HTTP_ORIGIN) {
+                origins.push(Json::str(AGENT_HTTP_ORIGIN));
             }
         }
     }
@@ -744,7 +755,7 @@ mod tests {
         assert!(upgrade_origins(&mut v));
         merge_defaults(&mut v, &default_json());
         let origins: Vec<&str> = v.get("gateway").unwrap().get("cors_origins").unwrap().as_array().unwrap().iter().filter_map(Json::as_str).collect();
-        assert_eq!(origins, [&["http://localhost:3000", "https://BOT.computer/", "http://localhost:5317", "http://127.0.0.1:5317", "http://botcomputer.localhost", "botcomputer://localhost", "http://oaiy.localhost", "oaiy://localhost"][..], mac()].concat());
+        assert_eq!(origins, [&["http://localhost:3000", "https://BOT.computer/", "http://localhost:5317", "http://127.0.0.1:5317", "http://botcomputer.localhost", "botcomputer://localhost", "http://oaiy.localhost", "oaiy://localhost"][..], agent_http()].concat());
         // Once offered, a removed origin stays removed.
         if let Json::Obj(top) = &mut v {
             if let Some((_, Json::Obj(g))) = top.iter_mut().find(|(k, _)| k == "gateway") {
@@ -766,29 +777,41 @@ mod tests {
         let mut v = Json::parse(br#"{"gateway":{"origins_version":2,"cors_origins":["https://bot.computer","http://botcomputer.localhost"]}}"#).unwrap();
         assert!(upgrade_origins(&mut v));
         let origins: Vec<&str> = v.get("gateway").unwrap().get("cors_origins").unwrap().as_array().unwrap().iter().filter_map(Json::as_str).collect();
-        assert_eq!(origins, [&["https://bot.computer", "http://botcomputer.localhost", "http://oaiy.localhost", "oaiy://localhost"][..], mac()].concat());
+        assert_eq!(origins, [&["https://bot.computer", "http://botcomputer.localhost", "http://oaiy.localhost", "oaiy://localhost"][..], agent_http()].concat());
         assert!(!upgrade_origins(&mut v));
     }
 
-    /// What an upgrade offers on a Mac after the others: OAIY's window there.
-    fn mac() -> &'static [&'static str] {
-        if cfg!(target_os = "macos") {
-            &[MAC_AGENT_ORIGIN]
+    /// What an upgrade offers after the others where OAIY's window serves the agent over http (a Mac, Linux): that origin.
+    fn agent_http() -> &'static [&'static str] {
+        if AGENT_HTTP_ORIGIN_SINCE.is_some() {
+            &[AGENT_HTTP_ORIGIN]
         } else {
             &[]
         }
     }
 
     #[test]
-    fn a_file_from_version_3_gains_oaiys_window_on_a_mac_once() {
+    fn a_file_from_version_3_gains_oaiys_window_over_http_once() {
         let mut v = Json::parse(br#"{"gateway":{"origins_version":3,"cors_origins":["oaiy://localhost"]}}"#).unwrap();
         assert!(upgrade_origins(&mut v));
         let origins: Vec<&str> = v.get("gateway").unwrap().get("cors_origins").unwrap().as_array().unwrap().iter().filter_map(Json::as_str).collect();
-        assert_eq!(origins, [&["oaiy://localhost"][..], mac()].concat());
-        assert_eq!(v.get("gateway").unwrap().get("origins_version").and_then(Json::as_i64), Some(4));
+        assert_eq!(origins, [&["oaiy://localhost"][..], agent_http()].concat());
+        assert_eq!(v.get("gateway").unwrap().get("origins_version").and_then(Json::as_i64), Some(5));
         // Removed by the user, it stays removed.
-        let mut w = Json::parse(br#"{"gateway":{"origins_version":4,"cors_origins":["oaiy://localhost"]}}"#).unwrap();
+        let mut w = Json::parse(br#"{"gateway":{"origins_version":5,"cors_origins":["oaiy://localhost"]}}"#).unwrap();
         assert!(!upgrade_origins(&mut w));
+        assert!(!upgrade_origins(&mut v), "once only");
+    }
+
+    #[test]
+    fn a_file_from_version_4_gains_oaiys_window_over_http_on_linux_alone() {
+        // Version 4 offered it on a Mac: a Mac's file from then without it had it removed by the user.
+        let mut v = Json::parse(br#"{"gateway":{"origins_version":4,"cors_origins":["oaiy://localhost"]}}"#).unwrap();
+        assert!(upgrade_origins(&mut v));
+        let origins: Vec<&str> = v.get("gateway").unwrap().get("cors_origins").unwrap().as_array().unwrap().iter().filter_map(Json::as_str).collect();
+        let linux: &[&str] = if cfg!(target_os = "linux") { &[AGENT_HTTP_ORIGIN] } else { &[] };
+        assert_eq!(origins, [&["oaiy://localhost"][..], linux].concat());
+        assert_eq!(v.get("gateway").unwrap().get("origins_version").and_then(Json::as_i64), Some(5));
         assert!(!upgrade_origins(&mut v), "once only");
     }
 
@@ -798,13 +821,13 @@ mod tests {
         // What version 1 wrote, less an origin the user removed and plus one they added.
         let mut v = Json::parse(br#"{"gateway":{"origins_version":1,"cors_origins":["https://bot.computer","http://127.0.0.1:5317","http://tauri.localhost","tauri://localhost","http://localhost:3000"]}}"#).unwrap();
         assert!(upgrade_origins(&mut v));
-        assert_eq!(origins(&v), [&["https://bot.computer", "http://127.0.0.1:5317", "http://botcomputer.localhost", "botcomputer://localhost", "http://localhost:3000", "http://oaiy.localhost", "oaiy://localhost"][..], mac()].concat());
-        assert_eq!(v.get("gateway").unwrap().get("origins_version").and_then(Json::as_i64), Some(4));
+        assert_eq!(origins(&v), [&["https://bot.computer", "http://127.0.0.1:5317", "http://botcomputer.localhost", "botcomputer://localhost", "http://localhost:3000", "http://oaiy.localhost", "oaiy://localhost"][..], agent_http()].concat());
+        assert_eq!(v.get("gateway").unwrap().get("origins_version").and_then(Json::as_i64), Some(5));
         assert!(!upgrade_origins(&mut v), "once only");
         // Version 1 without the shared origins (the user took them out): they are not added back (OAIY's window is new).
         let mut w = Json::parse(br#"{"gateway":{"origins_version":1,"cors_origins":["http://localhost:3000"]}}"#).unwrap();
         assert!(upgrade_origins(&mut w));
-        assert_eq!(origins(&w), [&["http://localhost:3000", "http://oaiy.localhost", "oaiy://localhost"][..], mac()].concat());
+        assert_eq!(origins(&w), [&["http://localhost:3000", "http://oaiy.localhost", "oaiy://localhost"][..], agent_http()].concat());
     }
 
     #[test]

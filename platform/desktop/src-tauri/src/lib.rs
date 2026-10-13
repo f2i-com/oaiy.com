@@ -1222,6 +1222,9 @@ fn set_hf_token(
 }
 
 pub fn run() {
+    // On Linux, shared memory for the agent's code sandbox: an environment variable WebKitGTK's web processes read,
+    // set while this process has no other thread to read the environment.
+    crate::embed::linux_shared_memory();
     // Parse and lock the opt-in root before Tauri, single-instance registration or
     // any normal AppData path is resolved. A malformed opt-in never launches normally.
     let prepared = crate::isolated::parse(std::env::args_os().skip(1))
@@ -1807,7 +1810,7 @@ pub fn run() {
 
             // The agent runs from the start, hidden until its page is shown:
             // texts and calls are answered whatever the window shows. (On a
-            // Mac its page is served from a port of its own, held first.)
+            // Mac and Linux its page is served from a port of its own, held first.)
             if !isolated {
                 crate::embed::serve_agent_over_http(app.handle());
                 crate::embed::preload(app.handle());

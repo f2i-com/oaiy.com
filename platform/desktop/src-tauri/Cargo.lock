@@ -3116,6 +3116,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "webkit2gtk",
  "windows-sys 0.61.2",
  "zeroize",
  "zip 2.4.2",
