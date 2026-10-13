@@ -68,6 +68,8 @@ export class TerminalPane {
     this.element.append(head, this.out, h('div.term-line', this.prompt, this.input));
     this.fold(remembered(), false);
     this.input.addEventListener('keydown', (e) => {
+      // Let the input method finish composing, including legacy IME events.
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Enter') void this.run(this.input.value);
       else if (e.key === 'ArrowUp' && this.history.length) {
         this.cursor = Math.max(0, this.cursor - 1);
