@@ -197,8 +197,8 @@ fn a_kernels_packed_dot_products_go_through_a_function_of_their_own_for_metal() 
     let calls = |text: &str, name: &str| text.matches(&format!("{name}(")).count();
     let mut seen = 0;
     for dtype in [GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0] {
-        for mr in [1u32, 2, 4] {
-            let Some(kernel) = crate::shaders::rb_kernel_q8(dtype, crate::shaders::rb_rows_q8(dtype, mr), mr) else { continue };
+        for (mr, subgroups) in [1u32, 2, 4].into_iter().flat_map(|mr| [(mr, false), (mr, true)]) {
+            let Some(kernel) = crate::shaders::rb_kernel_q8(dtype, crate::shaders::rb_rows_q8(dtype, mr), mr, subgroups) else { continue };
             let before = calls(&kernel, "dot4I8Packed");
             assert!(before > 0, "{dtype:?} for {mr} tokens has no packed dot product: the test looks at the wrong kernel");
             let wrapped = packed_dots_wrapped(kernel.clone());

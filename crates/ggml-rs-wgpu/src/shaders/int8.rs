@@ -61,8 +61,12 @@ pub fn q8_len(rows: usize, k: usize) -> (usize, usize) {
 /// [`rb_kernel`]'s matmul from rows of `x` as int8 ([`QUANT_Q8`]'s): a weight run's values packed as bytes and each 4 of
 /// them against 4 of a row's in one `dot4I8Packed`, a 32-block's scale and its halves' sums for the offsets and the
 /// minimums; the same lanes, runs and rows. For several rows of `x` (a check of drafts, a short prompt's chunk) it
-/// costs little more than for one, where the f32 kernel's multiply-adds a weight grow with them.
-pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
+/// costs little more than for one, where the f32 kernel's multiply-adds a weight grow with them. With `subgroups` (a
+/// device whose subgroups are 32 lanes, [`crate::Gpu::subgroups32`]) each subgroup's lanes' sums are added by
+/// `subgroupAdd`, not through the workgroup's memory and five barriers: on an NVIDIA A2 at 1,200 MHz a step's row of
+/// Qwen3.5 9B's Q4_K [12288, 4096] in 199 us where 222, its Q5_K [8192, 4096] in 160 where 179, its Q6_K output
+/// [248320, 4096] in 5.2 ms where 5.7.
+pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option<String> {
     let (vec4_weights, tasks, block) = match dtype {
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K => (true, 8u32, 256u32),
         // (Q6_K's tasks for one row of `x` 64 weights, a few rows' 16: below)
@@ -75,12 +79,16 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
         s.push_str(line);
         s.push('\n');
     };
+    // (no `enable subgroups;`: naga 30 has not that directive, and takes subgroups' operations where the device was
+    // given them)
     l("struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, xs_at: u32, _pad1: u32, }");
     l(if vec4_weights { "@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;" } else { "@group(0) @binding(0) var<storage, read> w: array<u32>;" });
     l("@group(0) @binding(1) var<storage, read> x8: array<vec4<u32>>;");
     l("@group(0) @binding(2) var<storage, read_write> y: array<f32>;");
     l("@group(0) @binding(3) var<uniform> p: Params;");
-    l(&format!("var<workgroup> partial: array<f32, {}>;", 128 * r * mr));
+    if !subgroups {
+        l(&format!("var<workgroup> partial: array<f32, {}>;", 128 * r * mr));
+    }
     l(RB_HELPERS);
     if !vec4_weights {
         l(RB_Q6K_HELPERS);
@@ -90,9 +98,15 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
     l("    return ((qw >> (2u * j)) & 0x03030303u) | (((hw >> (j + 4u * h)) & 0x01010101u) << 2u);");
     l("}");
     l("@compute @workgroup_size(128)");
-    l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {");
-    l("    let lane = li & 31u;");
-    l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + (li >> 5u) * {r}u;", 4 * r));
+    if subgroups {
+        // (a subgroup's lanes and which of the four it is as the device has them: its sums are its own lanes')
+        l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {");
+        l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + sgi * {r}u;", 4 * r));
+    } else {
+        l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {");
+        l("    let lane = li & 31u;");
+        l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + (li >> 5u) * {r}u;", 4 * r));
+    }
     l(&format!("    let m0 = wg.x * {mr}u;"));
     l(&format!("    let mn = min({mr}u, p.m - m0);"));
     l("    let k16 = p.k / 16u;");
@@ -290,6 +304,24 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
         }
     }
     l("    }");
+    if subgroups {
+        for i in 0..r {
+            for m in 0..mr {
+                l(&format!("    let t{i}_{m} = subgroupAdd(acc{i}_{m});"));
+            }
+        }
+        l("    if (lane == 0u) {");
+        for i in 0..r {
+            l(&format!("        if (rbase + {i}u < p.rows) {{"));
+            for m in 0..mr {
+                l(&format!("            if ({m}u < mn) {{ y[(m0 + {m}u) * p.n + p.row0 + rbase + {i}u] = t{i}_{m}; }}"));
+            }
+            l("        }");
+        }
+        l("    }");
+        l("}");
+        return Some(s);
+    }
     for i in 0..r {
         for m in 0..mr {
             l(&format!("    partial[{}u * 128u + li] = acc{i}_{m};", i * mr + m));

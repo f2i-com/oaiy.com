@@ -323,7 +323,8 @@ impl Recorder<'_> {
             (_, true) => "chain-q8-Q6_K-decode",
             (_, false) => "chain-q8-Q6_K-multi",
         };
-        let pipeline = self.gpu().named_pipeline(name, || crate::shaders::rb_kernel_q8(q.dtype, crate::shaders::rb_rows_q8(q.dtype, mr), mr).expect("a K-quant's int8 kernel"));
+        let subgroups = self.gpu().subgroups32();
+        let pipeline = self.gpu().named_pipeline(name, || crate::shaders::rb_kernel_q8(q.dtype, crate::shaders::rb_rows_q8(q.dtype, mr), mr, subgroups).expect("a K-quant's int8 kernel"));
         for (chunk, row0, rows) in &q.chunks {
             let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, xs_at as u32, 0];
             let groups = crate::shaders::grid_q8(q.dtype, m, mr, *rows);

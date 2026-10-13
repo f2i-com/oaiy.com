@@ -21,6 +21,12 @@ impl Gpu {
         self.coop_tile
     }
 
+    /// Whether the kernels may add across a subgroup (`subgroupAdd`), every subgroup 32 lanes: the device has
+    /// subgroups' operations and its adapter's subgroups are 32 lanes at least and at most.
+    pub(crate) fn subgroups32(&self) -> bool {
+        self.subgroups32
+    }
+
     /// The EXL3 projections' few-rows scratch ([`exl3::FewScratch`]), made by `b` when first asked for.
     pub(crate) fn few(&self, b: &WgpuBackend) -> &exl3::FewScratch {
         self.few.get_or_init(|| exl3::FewScratch::new(b))

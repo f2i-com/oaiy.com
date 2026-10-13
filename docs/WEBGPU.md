@@ -410,7 +410,12 @@ Q4_K's and Q5_K's 6-bit scales and minimums are made both ways and one chosen
 (`scale_min` in `shaders::few`): a subgroup's lanes are at sub-blocks of both halves of a
 block, and the branch took each way in turn. Their one-row kernels on the A2 then read
 129 to 140 GB/s where 111 to 117 (`measure_q8_rows_9b`), and the 9B replied at 21.5
-tokens a second.
+tokens a second. Where every subgroup of the device is 32 lanes (its adapter's least and
+most; `Gpu::subgroups32`, the `SUBGROUP` feature asked for, `OAIY_NO_SUBGROUPS` not), the
+int8 kernels add each subgroup's lanes' sums with `subgroupAdd` rather than through the
+workgroup's memory and five barriers: Q4_K's [12288, 4096] in 199 us where 222, the Q6_K
+output in 5.2 ms where 5.7, and the 9B's replies 23.0 tokens a second (the same but where
+a near-tie went the other way, the sums added in another order).
 
 A prompt's tensor-core matmuls (`shaders::coop_tiled`) load each step's tokens two steps
 ahead of their multiplies, and every K-quant's and Q8_0's weights a step ahead into

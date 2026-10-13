@@ -216,6 +216,8 @@ struct Gpu {
     decode_int8: Mutex<HashMap<GgmlType, bool>>,
     /// What a decode step's dense calls share ([`dense::Arena`]), made at the first.
     dense_arena: Mutex<Option<dense::Arena>>,
+    /// Whether the device was given subgroups' operations, its subgroups 32 lanes each ([`Gpu::subgroups32`]).
+    subgroups32: bool,
 }
 
 /// Which adapter the backend runs on, for logs.
@@ -457,9 +459,13 @@ impl WgpuBackend {
         // room for, read over the bus by the kernels themselves
         // (OAIY_NO_HOST_BUFFERS: not asked for)
         let mappable = if std::env::var_os("OAIY_NO_HOST_BUFFERS").is_some() { wgpu::Features::empty() } else { adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS };
+        // subgroups' operations where every subgroup is 32 lanes, whatever the kernel: the int8 kernels' sums of a
+        // step's rows added across them without the workgroup's memory (`Gpu::subgroups32`; OAIY_NO_SUBGROUPS: not
+        // asked for)
+        let subgroups = if std::env::var_os("OAIY_NO_SUBGROUPS").is_none() && info.subgroup_min_size == 32 && info.subgroup_max_size == 32 { adapter.features() & wgpu::Features::SUBGROUP } else { wgpu::Features::empty() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("oaiy"),
-            required_features: timestamps | coop | mappable,
+            required_features: timestamps | coop | mappable | subgroups,
             required_limits: limits.clone(),
             experimental_features: experimental,
             ..Default::default()
@@ -528,7 +534,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), int8_rows: std::sync::OnceLock::new(), decode_int8: Mutex::new(HashMap::new()), dense_arena: Mutex::new(None) }),
+            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), int8_rows: std::sync::OnceLock::new(), decode_int8: Mutex::new(HashMap::new()), dense_arena: Mutex::new(None), subgroups32: !subgroups.is_empty() }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             left: Arc::new(AtomicU64::new(0)),
