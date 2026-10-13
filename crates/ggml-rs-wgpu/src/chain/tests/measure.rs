@@ -1403,3 +1403,37 @@ fn measure_few_rows() {
         }
     }
 }
+
+/// What a step's one row costs through the K-quants' int8 kernels at Qwen3.5 9B Q4_K_M's shapes (`--ignored
+/// --nocapture`): its FFN's gate or up and down, its attention's and delta nets' squares, its delta nets' qkv, its
+/// output; each weight alone (an NVIDIA A2's L2 is 2 MB, which none of them fits).
+#[test]
+#[ignore = "a measurement"]
+fn measure_q8_rows_9b() {
+    let Ok(b) = WgpuBackend::new(Some(8 << 30)) else { return };
+    let mut line = String::new();
+    for (dtype, n, k, bytes) in [(GgmlType::Q4_K, 12288usize, 4096usize, 144usize), (GgmlType::Q4_K, 4096, 12288, 144), (GgmlType::Q4_K, 4096, 4096, 144), (GgmlType::Q5_K, 8192, 4096, 176), (GgmlType::Q5_K, 4096, 4096, 176), (GgmlType::Q6_K, 4096, 12288, 210), (GgmlType::Q6_K, 248320, 4096, 210)] {
+        let raw: Vec<u8> = (0..n * (k / 256) * bytes).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(13) as u8 & 0x3b).collect();
+        let nbytes = raw.len();
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+        let (x, y) = (b.vec(k), b.vec(n));
+        let reps = 16;
+        let run = || {
+            let mut rq = Recorder::new(&b);
+            for _ in 0..reps {
+                rq.q8.clear();
+                rq.matmul_rows_q8(&w, &x, &y, 1);
+            }
+            rq.read_range(&y, 0, 1);
+            Box::new(rq).finish();
+        };
+        run();
+        let t = std::time::Instant::now();
+        for _ in 0..4 {
+            run();
+        }
+        let s = t.elapsed().as_secs_f64() / 4.0 / reps as f64;
+        line += &format!("\n{dtype:?} [{n}, {k}]: {:.1} us, {:.0} GB/s", s * 1e6, nbytes as f64 / s / 1e9);
+    }
+    eprintln!("{line}");
+}

@@ -459,13 +459,14 @@ fn sbyte(h: vec4<u32>, b: u32) -> u32 {
     let wd = select(select(h.w, h.z, b < 8u), h.y, b < 4u);
     return (wd >> (8u * (b % 4u))) & 255u;
 }
-// Sub-block `j`'s 6-bit scale and minimum, as ggml's get_scale_min_k4.
+// Sub-block `j`'s 6-bit scale and minimum, as ggml's get_scale_min_k4 (both of its ways made and one chosen: a
+// subgroup's lanes are at sub-blocks of both halves, and a branch takes each way in turn).
 fn scale_min(h: vec4<u32>, j: u32) -> vec2<f32> {
-    if (j < 4u) {
-        return vec2<f32>(f32(sbyte(h, j) & 63u), f32(sbyte(h, j + 4u) & 63u));
-    }
-    let sc = (sbyte(h, j + 4u) & 15u) | ((sbyte(h, j - 4u) >> 6u) << 4u);
-    let mn = (sbyte(h, j + 4u) >> 4u) | ((sbyte(h, j) >> 6u) << 4u);
+    let bj = sbyte(h, j);
+    let b4 = sbyte(h, j + 4u);
+    let bl = sbyte(h, j % 4u);
+    let sc = select((b4 & 15u) | ((bl >> 6u) << 4u), bj & 63u, j < 4u);
+    let mn = select((b4 >> 4u) | ((bj >> 6u) << 4u), b4 & 63u, j < 4u);
     return vec2<f32>(f32(sc), f32(mn));
 }
 // Q3_K: four weights of run `j` (their 2 low bits at shift 2j, their high bit j + 4h), each plus 4.

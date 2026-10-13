@@ -406,6 +406,11 @@ ones' rows' values were too many registers, 2 to 4 rows in 477 to 498 us where 4
 410.) Its lanes take 4 weight rows each, as the other K-quants' do (`shaders::rb_rows_q8`;
 the f32 kernel's 1, as on the RTX 5090): the 9B's output [248320, 4096] in 5.7 ms where
 8.3, its FFN down [4096, 12288] in 295 us where 436, and its replies 19.1 tokens a second.
+Q4_K's and Q5_K's 6-bit scales and minimums are made both ways and one chosen
+(`scale_min` in `shaders::few`): a subgroup's lanes are at sub-blocks of both halves of a
+block, and the branch took each way in turn. Their one-row kernels on the A2 then read
+129 to 140 GB/s where 111 to 117 (`measure_q8_rows_9b`), and the 9B replied at 21.5
+tokens a second.
 
 A prompt's tensor-core matmuls (`shaders::coop_tiled`) load each step's tokens two steps
 ahead of their multiplies, and every K-quant's and Q8_0's weights a step ahead into
