@@ -65,7 +65,8 @@ pub fn q8_len(rows: usize, k: usize) -> (usize, usize) {
 pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
     let (vec4_weights, tasks, block) = match dtype {
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K => (true, 8u32, 256u32),
-        GgmlType::Q6_K => (false, 16u32, 256u32),
+        // (Q6_K's tasks for one row of `x` 64 weights, a few rows' 16: below)
+        GgmlType::Q6_K => (false, if mr == 1 { 4u32 } else { 16u32 }, 256u32),
         GgmlType::Q4_0 => (false, 1u32, 32u32),
         _ => return None,
     };
@@ -213,8 +214,10 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
                 }
             }
         }
-        _ => {
-            // Q6_K
+        GgmlType::Q6_K if mr > 1 => {
+            // Q6_K for a few rows of `x`: a task a 32-block's half, 16 weights (its low bits' 16 bytes and its high
+            // bits' 16, each read by the other tasks of the block that share them: the 64-weight tasks below took 2 to
+            // 4 rows of [5120, 6144] in 477 to 498 us where these take 404 to 410, their rows' values 4 times as many)
             l("        let blk = c / 16u;");
             l("        let sub = (c % 16u) / 2u;");
             l("        let hf = c % 2u;");
@@ -230,8 +233,10 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
                 l(&format!("        let bb{i} = rr{i} * p.row_bytes + blk * 210u;"));
                 l(&format!("        let ql{i} = bb{i} + h * 64u + (qd & 1u) * 32u + hf * 16u;"));
                 l(&format!("        let qh{i} = bb{i} + 128u + h * 32u + hf * 16u;"));
-                for wi in 0..4 {
-                    l(&format!("        let q{i}_{wi} = ((word_at(ql{i} + {o}u) >> lshift) & 0x0f0f0f0fu) | (((word_at(qh{i} + {o}u) >> hshift) & 0x03030303u) << 4u);", o = wi * 4));
+                l(&format!("        let lw{i} = words4_at(ql{i});"));
+                l(&format!("        let hw{i} = words4_at(qh{i});"));
+                for (wi, comp) in comps.iter().enumerate() {
+                    l(&format!("        let q{i}_{wi} = ((lw{i}.{comp} >> lshift) & 0x0f0f0f0fu) | (((hw{i}.{comp} >> hshift) & 0x03030303u) << 4u);"));
                 }
                 l(&format!("        let d{i} = unpack2x16float(byte(bb{i} + 208u) | (byte(bb{i} + 209u) << 8u)).x;"));
                 l(&format!("        let scb{i} = byte(bb{i} + 192u + h * 8u + 2u * qd + hf);"));
@@ -240,6 +245,46 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32) -> Option<String> {
                     let dq: Vec<String> = comps.iter().enumerate().map(|(wi, comp)| format!("dot4I8Packed(q{i}_{wi}, xa{m}.{comp})")).collect();
                     l(&format!("        let pq{i}_{m} = {};", dq.join(" + ")));
                     l(&format!("        acc{i}_{m} += d{i} * sc{i} * (sxa{m}.x * f32(pq{i}_{m}) - 32.0 * hxa{m});"));
+                }
+            }
+        }
+        _ => {
+            // Q6_K for one row of `x`: a task a block's half `h` (128 weights) and its 16-byte column `hf` of each run
+            // there, 64 weights: the low bits' two runs (each byte's low nibble one 32-block's, its high the one two
+            // on) and the high bits' one (each byte 2 bits of the four 32-blocks), every byte read once (a step's row
+            // of [5120, 6144] in 275 us where 16-weight tasks, which read each low byte twice and each high byte four
+            // times, took 327 on an NVIDIA A2 at 1,200 MHz)
+            l("        let blk = c / 4u;");
+            l("        let h = (c % 4u) / 2u;");
+            l("        let hf = c % 2u;");
+            l("        let bx = blk * 8u + h * 4u;");
+            for m in 0..mr {
+                for qd in 0..4 {
+                    x_half(&mut l, m, &format!("x{qd}_"), &format!("bx + {qd}u"), "hf");
+                }
+            }
+            for i in 0..r {
+                l(&format!("        let bb{i} = rr{i} * p.row_bytes + blk * 210u;"));
+                l(&format!("        let la{i} = words4_at(bb{i} + h * 64u + hf * 16u);"));
+                l(&format!("        let lb{i} = words4_at(bb{i} + h * 64u + 32u + hf * 16u);"));
+                l(&format!("        let hw{i} = words4_at(bb{i} + 128u + h * 32u + hf * 16u);"));
+                l(&format!("        let d{i} = unpack2x16float(byte(bb{i} + 208u) | (byte(bb{i} + 209u) << 8u)).x;"));
+                for qd in 0..4u32 {
+                    let (lw, lshift) = (if qd % 2 == 0 { "la" } else { "lb" }, if qd >= 2 { 4 } else { 0 });
+                    for (wi, comp) in comps.iter().enumerate() {
+                        l(&format!("        let q{i}_{qd}_{wi} = ((({lw}{i}.{comp} >> {lshift}u) & 0x0f0f0f0fu) | ((({hw}.{comp} >> {hs}u) & 0x03030303u) << 4u));", hw = format!("hw{i}"), hs = 2 * qd));
+                    }
+                    l(&format!("        let scb{i}_{qd} = byte(bb{i} + 192u + h * 8u + {}u + hf);", 2 * qd));
+                    l(&format!("        let sc{i}_{qd} = f32(i32(scb{i}_{qd}) - select(0, 256, scb{i}_{qd} >= 128u));"));
+                }
+                for m in 0..mr {
+                    let mut terms = Vec::new();
+                    for qd in 0..4u32 {
+                        let dq: Vec<String> = comps.iter().enumerate().map(|(wi, comp)| format!("dot4I8Packed(q{i}_{qd}_{wi}, x{qd}_{m}.{comp})")).collect();
+                        l(&format!("        let pq{i}_{qd}_{m} = {};", dq.join(" + ")));
+                        terms.push(format!("sc{i}_{qd} * (sx{qd}_{m}.x * f32(pq{i}_{qd}_{m}) - 32.0 * hx{qd}_{m})"));
+                    }
+                    l(&format!("        acc{i}_{m} += d{i} * ({});", terms.join(" + ")));
                 }
             }
         }

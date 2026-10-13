@@ -396,7 +396,14 @@ ten SMs at their power cap's clocks, PCIe through Thunderbolt) unpacking each we
 decides: Q6_K 143 us where 269, Q5_K 101 where 163, Q4_K 89 where 110, and Qwen3.5 9B
 Q4_K_M replied at 18.7 to 19.1 tokens a second where 12.5, its replies the same but
 where a near-tie went the other way (the rounding a check's rows have). `OAIY_Q8_DECODE=1`
-or `0` decides without timing; `OAIY_NO_Q8` turns every int8 kernel off.
+or `0` decides without timing; `OAIY_NO_Q8` turns every int8 kernel off. Q6_K's
+one-row int8 kernel takes a block's half and its 16-byte column of each run there (64
+weights) a task, every byte read once; tasks of 16 weights read each low-bits byte twice
+and each high-bits byte four times (2-byte aligned, the 210-byte blocks), and on the A2
+at 1,200 MHz a row of [5120, 6144] took 327 us where it takes 275, Qwen3.5 9B's replies
+15.8 tokens a second where 16.9. (A few rows keep the 16-weight tasks: the 64-weight
+ones' rows' values were too many registers, 2 to 4 rows in 477 to 498 us where 404 to
+410.)
 
 A prompt's tensor-core matmuls (`shaders::coop_tiled`) load each step's tokens two steps
 ahead of their multiplies, and every K-quant's and Q8_0's weights a step ahead into

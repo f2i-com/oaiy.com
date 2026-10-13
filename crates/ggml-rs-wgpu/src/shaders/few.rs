@@ -492,6 +492,14 @@ fn word_at(o: u32) -> u32 {
     if ((o & 3u) == 0u) { return w[i]; }
     return (w[i] >> 16u) | (w[i + 1u] << 16u);
 }
+// The 16 bytes at `o`, an even offset, as four words: five loads and no branch (a subgroup's lanes are in blocks of
+// both evennesses, 210 bytes each, and `word_at`'s two ways each lane's in turn).
+fn words4_at(o: u32) -> vec4<u32> {
+    let i = o >> 2u;
+    let a = vec4<u32>(w[i], w[i + 1u], w[i + 2u], w[i + 3u]);
+    let odd = vec4<u32>((a.x >> 16u) | (a.y << 16u), (a.y >> 16u) | (a.z << 16u), (a.z >> 16u) | (a.w << 16u), (a.w >> 16u) | (w[i + 4u] << 16u));
+    return select(a, odd, vec4<bool>((o & 2u) != 0u));
+}
 // Four 6-bit weights: low bits from `lo`'s bytes at `ls`, high bits from `hi`'s at `hs`.
 fn q6_four(lo: u32, hi: u32, ls: u32, hs: u32) -> vec4<f32> {
     let l = vec4<u32>(lo & 255u, (lo >> 8u) & 255u, (lo >> 16u) & 255u, lo >> 24u);
