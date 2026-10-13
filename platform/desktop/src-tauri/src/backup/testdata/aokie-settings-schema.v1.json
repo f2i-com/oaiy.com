@@ -76,6 +76,31 @@
       "appliesLive": true
     },
     {
+      "key": "allowedNumbers",
+      "type": "string",
+      "maxChars": 4000,
+      "appliesLive": true
+    },
+    {
+      "key": "callsAllowedOnly",
+      "type": "bool",
+      "appliesLive": true
+    },
+    {
+      "key": "otherCallers",
+      "type": "enum",
+      "options": [
+        "ring",
+        "reject"
+      ],
+      "appliesLive": true
+    },
+    {
+      "key": "textsAllowedOnly",
+      "type": "bool",
+      "appliesLive": true
+    },
+    {
       "key": "screenMessage",
       "type": "string",
       "maxChars": 500,

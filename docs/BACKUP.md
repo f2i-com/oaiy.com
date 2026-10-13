@@ -367,6 +367,9 @@ Aokie's settings file: a document with a `settings` bag and a few fields of its 
 | `settings.holdAndCallWaiting` | runs | Only with the tick "Plugin settings" | Call waiting: It changes how a second caller is treated. |
 | `settings.autoHoldQueue` | runs | Only with the tick "Plugin settings" | Automatic hold and queue: It puts callers on hold by itself. |
 | `settings.rejectPrivate` | runs | Only with the tick "Plugin settings" | Rejects callers who hide their number: It decides who is answered. |
+| `settings.callsAllowedOnly` | runs | Only with the tick "Plugin settings" | Answers only callers on the allowed list: It decides who is answered: it can only turn callers away. |
+| `settings.otherCallers` | runs | Only with the tick "Plugin settings" | What happens to callers not on the allowed list: It decides whether they are left ringing for you or rejected. |
+| `settings.textsAllowedOnly` | runs | Only with the tick "Plugin settings" | Answers only texts from the allowed list: It decides who is replied to: it can only turn people away. |
 | `settings.autoBlockAbuse` | runs | Only with the tick "Plugin settings" | Blocks abusive callers by itself: It adds numbers to the block list by itself. |
 | `settings.blockedNumbers` | runs | Only with the tick "Plugin settings"; joined to yours, none of yours is ever taken away | Numbers that are never answered: It can only turn callers away: the numbers in the backup are added to yours and none of yours is taken away. |
 | `settings.aiModel` | runs | Only with the tick "Plugin settings" | The model's name: It decides which model answers callers; the endpoint it is asked at is not restored. |
@@ -396,6 +399,7 @@ Aokie's settings file: a document with a `settings` bag and a few fields of its 
 | `settings.managerNumbers` | excluded | Never | Numbers that reach the manager line: It grants access: callers from these numbers are treated as the manager. To do again: Enter the manager's numbers again. |
 | `settings.managerPin` | excluded | Never | The manager's PIN: A PIN is never in a backup. To do again: Set the manager's PIN again. |
 | `settings.acceptPattern` | excluded | Never | Which callers are answered: It decides who gets through: it grants access. To do again: Set the pattern again. |
+| `settings.allowedNumbers` | excluded | Never | The allowed numbers: It decides who gets through: it grants access. To do again: Enter the allowed numbers again. |
 | `settings.legacyPairingPin` | excluded | Never | The older, weaker pairing PIN: It weakens how phones are paired. To do again: Turn it on again only if you need it. |
 | `settings.autoConnectPhone` | excluded | Never | Connect to the last phone at start: It belongs to this computer's Bluetooth. To do again: Choose it again. |
 | `settings.reenumerateHwid` | excluded | Never | The dongle's hardware id: It names this computer's hardware. |

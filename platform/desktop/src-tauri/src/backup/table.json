@@ -633,6 +633,9 @@
         { "path": "settings.holdAndCallWaiting", "class": "runs", "tick": "plugins", "type": "bool", "what": "Call waiting", "reason": "It changes how a second caller is treated." },
         { "path": "settings.autoHoldQueue", "class": "runs", "tick": "plugins", "type": "bool", "what": "Automatic hold and queue", "reason": "It puts callers on hold by itself." },
         { "path": "settings.rejectPrivate", "class": "runs", "tick": "plugins", "type": "bool", "what": "Rejects callers who hide their number", "reason": "It decides who is answered." },
+        { "path": "settings.callsAllowedOnly", "class": "runs", "tick": "plugins", "type": "bool", "what": "Answers only callers on the allowed list", "reason": "It decides who is answered: it can only turn callers away." },
+        { "path": "settings.otherCallers", "class": "runs", "tick": "plugins", "type": "enum", "options": ["ring", "reject"], "what": "What happens to callers not on the allowed list", "reason": "It decides whether they are left ringing for you or rejected." },
+        { "path": "settings.textsAllowedOnly", "class": "runs", "tick": "plugins", "type": "bool", "what": "Answers only texts from the allowed list", "reason": "It decides who is replied to: it can only turn people away." },
         { "path": "settings.autoBlockAbuse", "class": "runs", "tick": "plugins", "type": "bool", "what": "Blocks abusive callers by itself", "reason": "It adds numbers to the block list by itself." },
         { "path": "settings.blockedNumbers", "class": "runs", "tick": "plugins", "type": "string", "maxChars": 4000, "merge": "union-lines", "what": "Numbers that are never answered", "reason": "It can only turn callers away: the numbers in the backup are added to yours and none of yours is taken away." },
 
@@ -664,6 +667,7 @@
         { "path": "settings.managerNumbers", "class": "excluded", "what": "Numbers that reach the manager line", "reason": "It grants access: callers from these numbers are treated as the manager.", "redo": "Enter the manager's numbers again." },
         { "path": "settings.managerPin", "class": "excluded", "what": "The manager's PIN", "reason": "A PIN is never in a backup.", "redo": "Set the manager's PIN again." },
         { "path": "settings.acceptPattern", "class": "excluded", "what": "Which callers are answered", "reason": "It decides who gets through: it grants access.", "redo": "Set the pattern again." },
+        { "path": "settings.allowedNumbers", "class": "excluded", "what": "The allowed numbers", "reason": "It decides who gets through: it grants access.", "redo": "Enter the allowed numbers again." },
         { "path": "settings.legacyPairingPin", "class": "excluded", "what": "The older, weaker pairing PIN", "reason": "It weakens how phones are paired.", "redo": "Turn it on again only if you need it." },
         { "path": "settings.autoConnectPhone", "class": "excluded", "what": "Connect to the last phone at start", "reason": "It belongs to this computer's Bluetooth.", "redo": "Choose it again." },
         { "path": "settings.reenumerateHwid", "class": "excluded", "what": "The dongle's hardware id", "reason": "It names this computer's hardware." },

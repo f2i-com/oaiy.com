@@ -23,8 +23,8 @@ const AGENT_SETTINGS_EXPORT: &str = include_str!("testdata/agent-settings-export
 const AOKIE_SCHEMA: &str = include_str!("testdata/aokie-settings-schema.v1.json");
 
 /// Where Aokie's shared settings schema was copied from, and what it must still be.
-const AOKIE_SCHEMA_PROVENANCE: &str = "copied byte for byte from aokie.com docs/contracts/aokie-settings-schema.v1.json at commit cb298dd0618c652363776d1d87ea9909dd850263 (a copy also lives in that repository and its SETTING_SPECS table is test-locked to it)";
-const AOKIE_SCHEMA_SHA256_LF: &str = "329c872f8ad51200452deef52f7bacde2b1b73660841cea405cd01caf4738530";
+const AOKIE_SCHEMA_PROVENANCE: &str = "copied byte for byte from aokie.com docs/contracts/aokie-settings-schema.v1.json at commit 762a1a2690ee0dee2f20905f482f66a8e20f9768 (a copy also lives in that repository and its SETTING_SPECS table is test-locked to it)";
+const AOKIE_SCHEMA_SHA256_LF: &str = "39ec5e9abccdba90e66b09eb263c43861a33173fc0addf335087a7f466329066";
 
 fn lf(text: &str) -> String {
     text.replace("\r\n", "\n")
@@ -255,7 +255,7 @@ fn every_setting_in_aokies_schema_is_classified_and_typed_as_the_schema_says() {
         assert!(in_schema.contains(&row.path) || beyond.contains(row.path.as_str()), "{} is in the table and not in the schema: say why", row.path);
     }
     // Everything that reads callers' audio or words to somewhere else, or grants access, is excluded.
-    for key in ["aiEndpoint", "sttEndpoint", "ttsEndpoint", "audioTranscriptEndpoint", "realtimeVoiceEndpoint", "realtimeVoiceDestination", "consentMode", "outboundEnabled", "managerNumbers", "managerPin", "acceptPattern", "maxDailyDials", "legacyPairingPin"] {
+    for key in ["aiEndpoint", "sttEndpoint", "ttsEndpoint", "audioTranscriptEndpoint", "realtimeVoiceEndpoint", "realtimeVoiceDestination", "consentMode", "outboundEnabled", "managerNumbers", "managerPin", "acceptPattern", "allowedNumbers", "maxDailyDials", "legacyPairingPin"] {
         assert_eq!(keys.row(&format!("settings.{key}")).unwrap().class, Class::Excluded, "settings.{key}");
     }
     // What a model reads as instructions, or that is spoken to callers, needs a tick.
