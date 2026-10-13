@@ -476,6 +476,16 @@ a layer where the scan's thread a row took 91; not where a recording's rows are 
 The 9B's replies at 1,200 MHz: 23.1 tokens a second and now 25.7; after a 20,190-token
 prompt 18.1 and now 22.4 (20.5 with the attention alone).
 
+A prompt's delta-net scan (a thread a state's row, through the chunk's tokens in turn) is
+the largest of what is left past the matmuls: some 6% of the 9B's prompt, 6.5 ms a layer
+for 1,024 tokens on the A2 (`measure_delta_net_rows`, OAIY_DN_HEADS=32 OAIY_DN_ROWS=1024).
+Loading each token's gates and value a token ahead gained nothing; 4 lanes a row (4 times
+the subgroups, each row's sums by shuffles) took 13.4 ms, each token's barrier and shuffles
+more than the subgroups gained. What would change it is the chunked form of the gated delta
+rule (a chunk's tokens together on the tensor cores, as flash-linear-attention's kernels
+do). The 9B's prompt with a secret near its start and in its middle found both at 20,207
+tokens and at 61,027 (314 tokens a second), as the kernels before these did at 20,207.
+
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
 second (Strata 4,270), the reply at 78 to 81 tokens a second plain and 108 to 120

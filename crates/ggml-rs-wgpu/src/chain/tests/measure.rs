@@ -211,7 +211,10 @@ fn measure_prompt_attention() {
 #[ignore = "a measurement"]
 fn measure_delta_net_rows() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    let (nv, nk, dim, rows) = (48usize, 16usize, 128usize, 512usize);
+    // (OAIY_DN_HEADS=32: Qwen3.5 9B's 32 value heads; OAIY_DN_ROWS: a chunk that long)
+    let nv: usize = std::env::var("OAIY_DN_HEADS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+    let rows: usize = std::env::var("OAIY_DN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    let (nk, dim) = (16usize, 128usize);
     let ch = 2 * nk * dim + nv * dim;
     let mut next = rng(3);
     let mut up = |n: usize, s: f32| {
