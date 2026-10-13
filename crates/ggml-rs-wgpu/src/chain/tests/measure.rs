@@ -480,13 +480,13 @@ fn measure_coop_variants() {
     let base = crate::shaders::coop_tiled(GgmlType::Q3_K).expect("Q3_K's kernel");
     let marked = crate::shaders::coop_tiled_marked(GgmlType::Q3_K).expect("Q3_K's kernel");
     // the loop's barrier (the prologue's kept)
-    let step_end = "        xt[xa + 3u] = xr3;\n        workgroupBarrier();\n";
+    let step_end = "        xr3 = xn3;\n        workgroupBarrier();\n";
     let no_barrier = {
         let at = base.rfind(step_end).expect("the loop's barrier");
-        format!("{}        xt[xa + 3u] = xr3;\n{}", &base[..at], &base[at + step_end.len()..])
+        format!("{}        xr3 = xn3;\n{}", &base[..at], &base[at + step_end.len()..])
     };
-    // the loop's token loads (each step's from x16) as the first's
-    let loads = "        let xb = xo + b * xs;\n        xr0 = x16[xb];\n        xr1 = x16[xb + 1u];\n        xr2 = x16[xb + 2u];\n        xr3 = x16[xb + 3u];\n";
+    // the loop's token loads (each step's from x16, two ahead) as the first's
+    let loads = "        let xb = xo + b * xs;\n        xn0 = x16[xb];\n        xn1 = x16[xb + 1u];\n        xn2 = x16[xb + 2u];\n        xn3 = x16[xb + 3u];\n";
     let no_x = {
         let at = base.rfind(loads).expect("the loop's loads");
         format!("{}{}", &base[..at], &base[at + loads.len()..])

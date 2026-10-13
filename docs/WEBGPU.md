@@ -398,6 +398,16 @@ Q4_K_M replied at 18.7 to 19.1 tokens a second where 12.5, its replies the same 
 where a near-tie went the other way (the rounding a check's rows have). `OAIY_Q8_DECODE=1`
 or `0` decides without timing; `OAIY_NO_Q8` turns every int8 kernel off.
 
+A prompt's tensor-core matmuls (`shaders::coop_tiled`) load each step's tokens two steps
+ahead of their multiplies, and every K-quant's and Q8_0's weights a step ahead into
+registers. With the tokens loaded a step ahead and Q6_K's and Q8_0's weights read as they
+were decoded, a step's multiplies on the A2 (2026-10-14, its clocks held to 1,200 MHz)
+were too short to wait out the loads: 512 tokens through an FFN's Q4_K weights ran at 4.0
+TFLOPS and now 6.0, Q3_K 5 and now 6.2, Q6_K 3.3 and now 4.8, Q8_0 3.3 and now 4.6, by the
+same arithmetic (Q4_K's sums checked bit for bit); Qwen3.5 9B Q4_K_M's 6,933-token prompt
+at 251 tokens a second and now 321. (The step's barrier is what is left: without it, invalid
+as that is, Q4_K's would be 8.7.)
+
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
 second (Strata 4,270), the reply at 78 to 81 tokens a second plain and 108 to 120

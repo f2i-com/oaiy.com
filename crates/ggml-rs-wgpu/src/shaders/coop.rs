@@ -137,14 +137,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let s4i = 4u;
     let ident = coopLoad<coop_mat16x16<f16, B>>(&wt[i0], s4i);
     workgroupBarrier();
-    // the words of a step's weights and tokens this thread decodes and copies, loaded a step ahead
+    // the words of a step's weights this thread decodes, loaded a step ahead, and of the tokens it copies, two steps
+    // ahead (`xr` the next step's)
 DECODE_REGS
     var xr0 = vec4<f16>();
     var xr1 = vec4<f16>();
     var xr2 = vec4<f16>();
     var xr3 = vec4<f16>();
     // the first step's; then each step's next loaded before it multiplies (the loads in flight as it does) and stored
-    // after
+    // after, and the tokens of the step after that loading too
     {
         let b = s0;
         LOAD_BLOCK
@@ -161,6 +162,10 @@ X_LOAD
         xt[xa + 2u] = xr2;
         xt[xa + 3u] = xr3;
     }
+    {
+        let b = min(s0 + 1u, s1 - 1u);
+X_LOAD
+    }
     workgroupBarrier();
     // the steps in windows of FOLD, each window's f16 sums folded into the f32 ones after it (a loop in a loop: naga
     // wants a cooperative op's control flow uniform, and an `if` on the step is not to it)
@@ -175,7 +180,17 @@ X_LOAD
             LOAD_BLOCK
         }
         STEP_LOAD
-X_LOAD
+        // (the tokens of the step after next: loaded only a step ahead, a step's multiplies were too short to wait
+        // out their loads, and Q4_K's [12288, 4096] by 512 tokens ran at 4.3 TFLOPS on an NVIDIA A2 where they run
+        // at 5.9 so)
+        var xn0 = vec4<f16>();
+        var xn1 = vec4<f16>();
+        var xn2 = vec4<f16>();
+        var xn3 = vec4<f16>();
+        {
+            let b = min(b0 + 2u, s1 - 1u);
+X_NEXT
+        }
         let cur = (b0 % 2u) * BUF4;
         // (every index and stride a `let` of its own: naga's SPIR-V wants a cooperative load's and store's operands
         // emitted before them); k's two halves of 16 written out
@@ -233,6 +248,10 @@ X_LOAD
         xt[xa + 1u] = xr1;
         xt[xa + 2u] = xr2;
         xt[xa + 3u] = xr3;
+        xr0 = xn0;
+        xr1 = xn1;
+        xr2 = xn2;
+        xr3 = xn3;
         workgroupBarrier();
     }
     {
@@ -560,6 +579,58 @@ fn word_at(o: u32) -> u32 {
     return (w[i] >> 16u) | (w[i + 1u] << 16u);
 }
 "#;
+/// Q6_K's and Q8_0's decodes for [`coop_tiled`] with their words loaded a step ahead (`STEP_LOAD`, into registers) as
+/// the other K-quants' are: read as they were decoded, each step waited on its loads after its multiplies, and Q6_K's
+/// and Q8_0's [12288, 4096] by 512 tokens ran at 3.3 TFLOPS on an NVIDIA A2 where Q4_K's ran at 4.3 (now 4.8 and 4.6,
+/// with the tokens two steps ahead too). Metal's [`coop8_tiled`] reads them as it decodes, [`COOP_Q6K_STEP`] and
+/// [`COOP_Q8_0_STEP`].
+const COOP_AHEAD_HELPERS: &str = r#"fn byte(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 0xffu; }
+// The 16 bytes at `o`, an even offset, as four words (each a word, or the halves of two).
+fn words4_at(o: u32) -> vec4<u32> {
+    let i = o >> 2u;
+    let a = vec4<u32>(w[i], w[i + 1u], w[i + 2u], w[i + 3u]);
+    let odd = vec4<u32>((a.x >> 16u) | (a.y << 16u), (a.y >> 16u) | (a.z << 16u), (a.z >> 16u) | (a.w << 16u), (a.w >> 16u) | (w[i + 4u] << 16u));
+    return select(a, odd, vec4<bool>((o & 2u) != 0u));
+}
+"#;
+const COOP_Q6K_AHEAD_REGS: &str = r#"    var q6l = vec4<u32>();
+    var q6h = vec4<u32>();
+    var q6s = 0u;"#;
+const COOP_Q6K_AHEAD_LOAD: &str = r#"let l6 = rl * p.row_bytes + (b / 8u) * 210u;
+        let l6h = (b % 8u) / 4u;
+        let l6d = b % 4u;
+        q6l = words4_at(l6 + l6h * 64u + (l6d & 1u) * 32u + lh * 16u);
+        q6h = words4_at(l6 + 128u + l6h * 32u + lh * 16u);
+        q6s = byte(l6 + 208u) | (byte(l6 + 209u) << 8u) | (byte(l6 + 192u + l6h * 8u + 2u * l6d + lh) << 16u);"#;
+const COOP_Q6K_AHEAD_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let qd = b % 4u;
+            let lshift = select(0u, 4u, qd >= 2u);
+            let hshift = 2u * qd;
+            let scb = q6s >> 16u;
+            let sc = unpack2x16float(q6s & 0xffffu).x * f32(i32(scb) - select(0, 256, scb >= 128u));
+            wt[at4] = vec4<f16>(sc * byte_less(((q6l.x >> lshift) & 0x0f0f0f0fu) | (((q6h.x >> hshift) & 0x03030303u) << 4u), 32.0));
+            wt[at4 + 1u] = vec4<f16>(sc * byte_less(((q6l.y >> lshift) & 0x0f0f0f0fu) | (((q6h.y >> hshift) & 0x03030303u) << 4u), 32.0));
+            wt[at4 + 2u] = vec4<f16>(sc * byte_less(((q6l.z >> lshift) & 0x0f0f0f0fu) | (((q6h.z >> hshift) & 0x03030303u) << 4u), 32.0));
+            wt[at4 + 3u] = vec4<f16>(sc * byte_less(((q6l.w >> lshift) & 0x0f0f0f0fu) | (((q6h.w >> hshift) & 0x03030303u) << 4u), 32.0));
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
+const COOP_Q8_0_AHEAD_REGS: &str = r#"    var q8w = vec4<u32>();
+    var q8d = 0u;"#;
+const COOP_Q8_0_AHEAD_LOAD: &str = r#"let l8 = rl * p.row_bytes + b * 34u;
+        q8w = words4_at(l8 + 2u + lh * 16u);
+        q8d = byte(l8) | (byte(l8 + 1u) << 8u);"#;
+const COOP_Q8_0_AHEAD_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        if (rr < p.rows) {
+            let d = unpack2x16float(q8d).x;
+            wt[at4] = vec4<f16>(d * byte_less(q8w.x ^ 0x80808080u, 128.0));
+            wt[at4 + 1u] = vec4<f16>(d * byte_less(q8w.y ^ 0x80808080u, 128.0));
+            wt[at4 + 2u] = vec4<f16>(d * byte_less(q8w.z ^ 0x80808080u, 128.0));
+            wt[at4 + 3u] = vec4<f16>(d * byte_less(q8w.w ^ 0x80808080u, 128.0));
+        } else {
+            for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
+        }"#;
 const COOP_Q6K_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
             let sub = b % 8u;
@@ -827,11 +898,18 @@ pub fn coop_tiled_nvfp4() -> String {
 /// A prompt's matmul on the tensor cores (WGSL's cooperative matrices, f16 into f32): a workgroup a tile of
 /// [`COOP_TILE`] weight rows by as many tokens, `k` 32 at a time; each step the tile's weights decoded to f16 and its
 /// tokens' rows (as [`X_F16_TILED`] gives them, padded to the tile) copied into the workgroup's memory, the next step's
-/// loaded as this one's are multiplied, each of its 8 subgroups its 32 rows by 64 tokens as 2 by 4 fragments of 16x16
-/// (the tokens' fragments read from their rows in memory where they were the f16 rows in place: 141 TFLOPS without a
-/// decode, the loop 207 with both in the workgroup's); the sums stored straight into `y` (a tile at the edge through a
-/// fragment's staging). None for a type without one.
+/// weights loaded as this one's are multiplied (and the tokens of the step after), each of its 8 subgroups its 32 rows
+/// by 64 tokens as 2 by 4 fragments of 16x16 (the tokens' fragments read from their rows in memory where they were the
+/// f16 rows in place: 141 TFLOPS without a decode, the loop 207 with both in the workgroup's); the sums stored straight
+/// into `y` (a tile at the edge through a fragment's staging). None for a type without one.
 pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
+    // (Q6_K's and Q8_0's words loaded a step ahead, [`COOP_AHEAD_HELPERS`]; Metal's kernel reads them as it decodes)
+    let words = "@group(0) @binding(0) var<storage, read> w: array<u32>;";
+    match dtype {
+        GgmlType::Q6_K => return Some(coop_source(words, COOP_AHEAD_HELPERS, COOP_Q6K_AHEAD_REGS, "", COOP_Q6K_AHEAD_LOAD, COOP_Q6K_AHEAD_STEP, COOP_X_TILED)),
+        GgmlType::Q8_0 => return Some(coop_source(words, COOP_AHEAD_HELPERS, COOP_Q8_0_AHEAD_REGS, "", COOP_Q8_0_AHEAD_LOAD, COOP_Q8_0_AHEAD_STEP, COOP_X_TILED)),
+        _ => {}
+    }
     let (binding, helpers, regs, load, step) = coop_parts_of(dtype)?;
     Some(coop_source(binding, helpers, regs, load, "", step, COOP_X_TILED))
 }
@@ -993,6 +1071,7 @@ fn coop_source(binding: &str, helpers: &str, regs: &str, load: &str, step_load: 
         .replace("LOAD_BLOCK", load)
         .replace("STEP_LOAD", step_load)
         .replace("X_LOAD", x_load)
+        .replace("X_NEXT", &x_load.replace("xr", "xn"))
         .replace("DECODE_STEP", step)
         .replace("EDGE_STORES", &edges)
 }
@@ -1013,5 +1092,5 @@ pub(crate) fn coop_tiled_marked(dtype: GgmlType) -> Option<String> {
     // (the first is the prologue's, kept; the second the loop's, marked)
     let marked = marked.replacen("SECOND_STEP", "        DECODE_STEP\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
     let marked = marked.replacen("SECOND_STEP", "        // DECODE BEGIN\n        DECODE_STEP\n        // DECODE END\n        let xa = buf + lr * S4 + lh * 4u;\n        xt[xa] = xr0;", 1);
-    Some(marked.replace("FOLDu", &format!("{COOP_FOLD}u")).replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_REGS", regs).replace("LOAD_BLOCK", load).replace("STEP_LOAD", "").replace("X_LOAD", COOP_X_TILED).replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
+    Some(marked.replace("FOLDu", &format!("{COOP_FOLD}u")).replace("WEIGHTS_BINDING", binding).replace("DECODE_HELPERS", helpers).replace("DECODE_REGS", regs).replace("LOAD_BLOCK", load).replace("STEP_LOAD", "").replace("X_LOAD", COOP_X_TILED).replace("X_NEXT", &COOP_X_TILED.replace("xr", "xn")).replace("DECODE_STEP", step).replace("EDGE_STORES", &edges))
 }
