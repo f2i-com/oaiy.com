@@ -64,7 +64,12 @@ pub fn should_restart(attempts_so_far: u32) -> bool {
 ///
 /// Everything else is dropped. `PATH` is included because a plugin that shells
 /// out to a system tool cannot find it otherwise; the Windows entries are
-/// required by the loader and by `std::env::temp_dir`.
+/// required by the loader and by `std::env::temp_dir`. Elsewhere `XDG_RUNTIME_DIR`
+/// and `DBUS_SESSION_BUS_ADDRESS` find the user's session bus, where a Linux
+/// desktop's Secret Service is: a plugin that seals what it keeps (Aokie: its
+/// phone's link keys, texts and transcripts) keeps its key there, as on a Mac
+/// in the Keychain, and without them could reach none and stored nothing.
+/// Neither is a credential (the bus is the user's, behind its own permissions).
 #[cfg(windows)]
 const OS_ENV_ALLOW_LIST: &[&str] = &[
     "PATH",
@@ -80,13 +85,20 @@ const OS_ENV_ALLOW_LIST: &[&str] = &[
 ];
 
 #[cfg(not(windows))]
-const OS_ENV_ALLOW_LIST: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ"];
+const OS_ENV_ALLOW_LIST: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"];
 
 /// Variables forwarded to one plugin only, named by its id: an operator's opt-in that plugin documents, set on the
 /// machine before OAIY starts. Aokie's managed-beta build installs the dongle's driver from a catalog it signs itself
 /// only when the operator sets `AOKIE_ALLOW_SELF_SIGNED_DRIVER=1` (Aokie's README, "Managed-beta driver build"); its
-/// production build ignores the variable. No other plugin sees it.
-const PLUGIN_OPT_INS: &[(&str, &str)] = &[("aokie", "AOKIE_ALLOW_SELF_SIGNED_DRIVER")];
+/// production build ignores the variable. `AOKIE_INSTALL_UNKNOWN_DONGLE=YES_I_REBIND_AT_MY_OWN_RISK` lets Aokie take a
+/// dongle its catalog does not name (on Linux, where a computer's own Bluetooth is a USB controller too, it is left
+/// to the system without it), and `AOKIE_UDEV_PERMISSIVE=1` writes Aokie's Linux udev rule for every account where
+/// logind gives no console user the dongle. No other plugin sees them.
+const PLUGIN_OPT_INS: &[(&str, &str)] = &[
+    ("aokie", "AOKIE_ALLOW_SELF_SIGNED_DRIVER"),
+    ("aokie", "AOKIE_INSTALL_UNKNOWN_DONGLE"),
+    ("aokie", "AOKIE_UDEV_PERMISSIVE"),
+];
 
 /// Names that must never reach a plugin even if they appear on the allow-list.
 ///
@@ -491,6 +503,15 @@ mod tests {
         // Not set on the machine: nothing is invented.
         let unset = plugin_env(host_env(), "aokie", Path::new("/d"), "0.1.0", 1, false, true);
         assert!(!unset.contains_key("AOKIE_ALLOW_SELF_SIGNED_DRIVER"), "{unset:?}");
+        // Aokie's dongle opt-ins (an unknown dongle; the Linux rule for every account) the same way.
+        let mut host = host_env();
+        host.push(("AOKIE_INSTALL_UNKNOWN_DONGLE", "YES_I_REBIND_AT_MY_OWN_RISK"));
+        host.push(("AOKIE_UDEV_PERMISSIVE", "1"));
+        let aokie = plugin_env(host.clone(), "aokie", Path::new("/d"), "0.1.0", 1, false, true);
+        assert_eq!(aokie.get("AOKIE_INSTALL_UNKNOWN_DONGLE").map(String::as_str), Some("YES_I_REBIND_AT_MY_OWN_RISK"));
+        assert_eq!(aokie.get("AOKIE_UDEV_PERMISSIVE").map(String::as_str), Some("1"));
+        let other = plugin_env(host, "weather", Path::new("/d"), "0.1.0", 1, false, false);
+        assert!(!other.keys().any(|k| k.starts_with("AOKIE_")), "{other:?}");
     }
 
     #[test]
@@ -523,6 +544,17 @@ mod tests {
         // If this grows unexpectedly, something started inheriting again.
         let env = env_for_test();
         assert!(env.len() <= OS_ENV_ALLOW_LIST.len() + 5, "{env:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_session_bus_reaches_a_plugin_and_the_display_does_not() {
+        // (where a Linux desktop's Secret Service is, which a plugin keeps its sealing key in)
+        let host = [("XDG_RUNTIME_DIR", "/run/user/1000"), ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"), ("DISPLAY", ":0")];
+        let env = plugin_env(host, "p", Path::new("/tmp/p"), "0.1.0", 1, false, false);
+        assert_eq!(env.get("XDG_RUNTIME_DIR").map(String::as_str), Some("/run/user/1000"));
+        assert_eq!(env.get("DBUS_SESSION_BUS_ADDRESS").map(String::as_str), Some("unix:path=/run/user/1000/bus"));
+        assert!(!env.contains_key("DISPLAY"), "{env:?}");
     }
 
     // --- restart policy ---------------------------------------------------

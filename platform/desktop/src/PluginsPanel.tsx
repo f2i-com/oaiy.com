@@ -33,6 +33,9 @@ import { useToast } from './Toasts';
 import LogsViewer from './LogsViewer';
 import PackageTrustBadge from './PackageTrustBadge';
 
+/** An example of the path the install box takes, as this system writes one (it said C:\path\to\my-plugin on Linux too). */
+const PLUGIN_PATH_EXAMPLE = /Windows/.test(navigator.userAgent) ? 'C:\\path\\to\\my-plugin' : '/path/to/my-plugin';
+
 /**
  * Plugins panel — install, start/stop, and monitor Bridge-Protocol plugins.
  *
@@ -281,7 +284,7 @@ export default function PluginsPanel() {
             <span className="setup-folder-row">
               <input
                 type="text"
-                placeholder="C:\path\to\my-plugin"
+                placeholder={PLUGIN_PATH_EXAMPLE}
                 value={installSource}
                 onChange={(e) => setInstallSource(e.target.value)}
               />
