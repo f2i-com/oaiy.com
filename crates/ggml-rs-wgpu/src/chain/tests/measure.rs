@@ -1092,6 +1092,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
 {loads}
         i += {unroll}u * threads;
     }}
+    // (the rest a load at a time: the unrolled loop stops short of it, and every byte is counted)
+    for (; i < n4; i += threads) {{ acc += s4[i]; }}
     o[id.x % 1048576u] = acc.x + acc.y + acc.z + acc.w;
 }}
 "#,
@@ -1459,7 +1461,7 @@ fn measure_coop_kernels() {
         let mut it = nk.split('x').map(|v| v.parse().expect("NxK"));
         (it.next().expect("N"), it.next().expect("K"))
     };
-    let m = 512usize;
+    let m: usize = std::env::var("OAIY_COOP_M").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
     let padded = m.div_ceil(128) * 128;
     let x16 = b.vec(padded * k / 2);
     let mut next = rng(11);
