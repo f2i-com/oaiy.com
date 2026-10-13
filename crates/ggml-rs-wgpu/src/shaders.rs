@@ -291,6 +291,10 @@ pub(crate) fn rb_rows_q8(dtype: GgmlType, mr: u32) -> u32 {
     if dtype == GgmlType::Q6_K && mr == 1 {
         return 4;
     }
+    // (Q8_0's: a row a lane, its matrices a model's small ones, Qwen3.5 9B's delta nets' [64, 4096])
+    if dtype == GgmlType::Q8_0 {
+        return 1;
+    }
     rb_rows(dtype, mr)
 }
 

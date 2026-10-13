@@ -462,6 +462,20 @@ together, the next block's scores made as this one's values are, ran slower (4.3
 more registers live at once). The 9B's 6,933-token prompt is now 382 tokens a second (322
 before the two), a 20,973-token one 365 (292).
 
+A reply's step, where subgroups are 32 lanes: its attention parts read each key's row
+with a subgroup's lanes together (`attention_part_group_lanes`; a thread a key had a
+subgroup's loads 32 rows apart), 4 keys a lane at once, the run's largest and sum by
+subgroups, and the values 4 rows loaded before their sums: the 9B's step over 20,000
+positions 1,347 us a layer and now 673, over 7,000 501 and now 268
+(`measure_step_attention`; `OAIY_ATTENTION_LANES=0`: a thread a key). Its rows are
+quantized to int8 with 8 lanes a block (`QUANT_Q8_LANES`, the same words bit for bit; a
+thread a block had a row of 4,096 on one workgroup's 128 threads); Q8_0's step rows go
+through the int8 kernels too where timed faster (the delta nets' gates [64, 4096] in 13 us
+where 50); and a delta net's one token is a subgroup a state's row (`DELTA_NET_STEP`, 35 us
+a layer where the scan's thread a row took 91; not where a recording's rows are alike).
+The 9B's replies at 1,200 MHz: 23.1 tokens a second and now 25.7; after a 20,190-token
+prompt 18.1 and now 22.4 (20.5 with the attention alone).
+
 Against the request Strata's benchmark makes (a synthetic Python module up to 4,096
 prompt tokens, greedy, 256 tokens), the same two cards: the prompt at 3,600 tokens a
 second (Strata 4,270), the reply at 78 to 81 tokens a second plain and 108 to 120

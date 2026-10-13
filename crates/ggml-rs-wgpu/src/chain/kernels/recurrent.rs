@@ -442,6 +442,64 @@ pub(in crate::chain) fn delta_net_scan(dk: usize, r: usize) -> String {
         .replace("ROW_STORE\n", &store)
 }
 
+/// [`DELTA_NET_SCAN`] for one token (a step) where subgroups are 32 lanes (`Gpu::subgroups32`) and the heads 128 wide:
+/// a subgroup a state's row at a time, its 32 lanes the row's 32 vec4s (a load's lanes side by side), the row's sums by
+/// `subgroupAdd`, 4 rows at once; 8 subgroups a workgroup. [`DELTA_NET_SCAN`] holds a row a thread, as a prompt's tokens
+/// want: for one token its 32 threads a workgroup were a subgroup's loads 32 rows 512 bytes apart, and 128 subgroups
+/// for the whole of Qwen3.5 9B's 32 heads' states (2 MB read, 2 MB written): 91 us a layer on an NVIDIA A2 at 1,200 MHz
+/// (each timed in a pass of its own), and now 35 us; the 9B's replies 24.7 tokens a second where 25.7.
+pub(in crate::chain) const DELTA_NET_STEP: &str = r#"
+@group(0) @binding(0) var<storage, read> qk4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> cv: array<f32>;
+@group(0) @binding(2) var<storage, read> qk: array<f32>;
+@group(0) @binding(6) var<storage, read_write> st: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const DK: u32 = 128u;
+const DK4: u32 = 32u;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let nv = p[0].x;
+    let nk = p[0].y;
+    let lane = li % 32u;
+    // the subgroup's 4 rows (of every value head's DK, `h * DK + i`), in the same head
+    let g0 = (wg.x * 8u + li / 32u) * 4u;
+    let h = g0 / DK;
+    let hk = h % nk;
+    let bg0 = nk * 2u * DK;
+    let bt = qk[bg0 + h * 2u];
+    let g = qk[bg0 + h * 2u + 1u];
+    let qv = qk4[hk * 2u * DK4 + lane];
+    let kv4 = qk4[hk * 2u * DK4 + DK4 + lane];
+ROWS
+}
+"#;
+
+/// [`DELTA_NET_STEP`]'s 4 rows, each its own names (their loads first, then their sums and stores).
+pub(in crate::chain) fn delta_net_step() -> String {
+    let mut rows = String::new();
+    for r in 0..4 {
+        rows += &format!("    let s{r} = st[(g0 + {r}u) * DK4 + lane];\n");
+    }
+    for r in 0..4 {
+        rows += &format!("    let kv{r} = subgroupAdd(dot(s{r}, kv4)) * g;\n");
+    }
+    for r in 0..4 {
+        rows += &format!("    let d{r} = (cv[2u * nk * DK + g0 + {r}u] - kv{r}) * bt;\n    let n{r} = s{r} * g + d{r} * kv4;\n    st[(g0 + {r}u) * DK4 + lane] = n{r};\n");
+    }
+    for r in 0..4 {
+        rows += &format!("    let o{r} = subgroupAdd(dot(n{r}, qv));\n");
+    }
+    rows += "    if (lane == 0u) {\n";
+    for r in 0..4 {
+        rows += &format!("        out[g0 + {r}u] = o{r};\n");
+    }
+    rows += "    }\n";
+    DELTA_NET_STEP.replace("ROWS\n", &rows)
+}
+
 /// The third: each token's state read by q RMS-normed over its head and gated as [`DELTA_NET`]'s, a workgroup a
 /// (value head, token), in place.
 pub(in crate::chain) const DELTA_NET_NORM: &str = r#"

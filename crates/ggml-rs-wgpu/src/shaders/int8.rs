@@ -52,6 +52,54 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`QUANT_Q8`] for a device whose subgroups are 32 lanes (`Gpu::subgroups32`): 8 lanes a block, each 4 of its values
+/// (a vec4, the subgroup's loads side by side), the block's largest magnitude and its halves' sums by
+/// `subgroupShuffleXor`; the same words, bit for bit. A thread a block read its 32 values in turn, a step's row of 4,096
+/// one workgroup's 128 threads: Qwen3.5 9B's replies quantize 129 rows a token, and on an NVIDIA A2 at 1,200 MHz they ran
+/// at 23.2 tokens a second where 24.2 so (24.5 with no quantizing at all).
+pub const QUANT_Q8_LANES: &str = r#"
+@group(0) @binding(0) var<storage, read> unused: array<u32>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> q: array<u32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let k = p[0].x;
+    let rows = p[0].y;
+    let xs_at = p[0].z;
+    let blocks = rows * (k / 32u);
+    // the thread's block and its part of it (values 4 part..), a block's 8 lanes side by side in a subgroup
+    let t = id.x + id.y * 65535u * 256u;
+    let b = t / 8u;
+    let part = t % 8u;
+    let v = x4[min(b, blocks - 1u) * 8u + part];
+    var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    let d = amax / 127.0;
+    let inv = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(vec4<i32>(round(v * inv)), vec4<i32>(-127), vec4<i32>(127));
+    let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+    // the half's sum (its 4 lanes'), and the other half's
+    var s = qv.x + qv.y + qv.z + qv.w;
+    s += subgroupShuffleXor(s, 1u);
+    s += subgroupShuffleXor(s, 2u);
+    let other = subgroupShuffleXor(s, 4u);
+    if (b < blocks) {
+        q[b * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+        if (part == 0u) {
+            let at = (xs_at + b) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(s));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }
+    }
+}
+"#;
+
 /// Elements (4-byte) a buffer of [`QUANT_Q8`]'s output takes for `rows` rows of `k`: the packed rows, then the blocks'
 /// scales and sums; and where the scales start, in vec4s.
 pub fn q8_len(rows: usize, k: usize) -> (usize, usize) {
@@ -71,7 +119,7 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K => (true, 8u32, 256u32),
         // (Q6_K's tasks for one row of `x` 64 weights, a few rows' 16: below)
         GgmlType::Q6_K => (false, if mr == 1 { 4u32 } else { 16u32 }, 256u32),
-        GgmlType::Q4_0 => (false, 1u32, 32u32),
+        GgmlType::Q4_0 | GgmlType::Q8_0 => (false, 1u32, 32u32),
         _ => return None,
     };
     let mut s = String::new();
@@ -201,6 +249,28 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option
                     l(&format!("        let pl{i}_{m} = {};", dl.join(" + ")));
                     l(&format!("        let ph{i}_{m} = {};", dh.join(" + ")));
                     l(&format!("        acc{i}_{m} += dm{i}.x * s{i}a.x * sxa{m}.x * f32(pl{i}_{m}) - dm{i}.y * s{i}a.y * hxa{m} + dm{i}.x * s{i}b.x * sxb{m}.x * f32(ph{i}_{m}) - dm{i}.y * s{i}b.y * hxb{m};"));
+                }
+            }
+        }
+        GgmlType::Q8_0 => {
+            // a block of 32 a task (34 bytes: its scale, then its int8s, read as words two bytes off in every other),
+            // its int8s against the row's 32
+            l("        let blk = c;");
+            for m in 0..mr {
+                l(&format!("        let xlo{m} = x8[xr{m} * k16 + blk * 2u];"));
+                l(&format!("        let xhi{m} = x8[xr{m} * k16 + blk * 2u + 1u];"));
+                l(&format!("        let sx{m} = bitcast<vec4<f32>>(x8[p.xs_at + xr{m} * k32 + blk]);"));
+            }
+            for i in 0..r {
+                l(&format!("        let bb{i} = rr{i} * p.row_bytes + blk * 34u;"));
+                l(&format!("        let d{i} = unpack2x16float(byte(bb{i}) | (byte(bb{i} + 1u) << 8u)).x;"));
+                l(&format!("        let qa{i} = words4_at(bb{i} + 2u);"));
+                l(&format!("        let qb{i} = words4_at(bb{i} + 18u);"));
+                for m in 0..mr {
+                    let dl: Vec<String> = comps.iter().map(|comp| format!("dot4I8Packed(qa{i}.{comp}, xlo{m}.{comp})")).collect();
+                    let dh: Vec<String> = comps.iter().map(|comp| format!("dot4I8Packed(qb{i}.{comp}, xhi{m}.{comp})")).collect();
+                    l(&format!("        let pq{i}_{m} = {} + {};", dl.join(" + "), dh.join(" + ")));
+                    l(&format!("        acc{i}_{m} += d{i} * sx{m}.x * f32(pq{i}_{m});"));
                 }
             }
         }

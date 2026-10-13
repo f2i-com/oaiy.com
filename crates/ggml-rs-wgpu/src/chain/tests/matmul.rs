@@ -489,3 +489,83 @@ fn bf16_matmuls_are_the_f16_ones() {
         }
     }
 }
+
+/// Rows quantized to int8 by a subgroup's lanes together ([`crate::shaders::QUANT_Q8_LANES`], where subgroups are 32
+/// lanes) are a thread a block's ([`crate::shaders::QUANT_Q8`]) bit for bit: their words, scales and halves' sums, rows
+/// of 4,096 and 12,288 and a few of 96 (a last subgroup part full), a block of zeros and channels a hundred times the
+/// rest among them.
+#[test]
+fn rows_quantized_by_lanes_are_a_thread_a_blocks() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !b.gpu.subgroups32() {
+        return;
+    }
+    let mut next = rng(29);
+    for (m, k) in [(1usize, 4096usize), (1, 12288), (3, 96), (5, 4096)] {
+        let mut x: Vec<f32> = (0..m * k).map(|i| next() * if i % 997 == 3 { 100.0 } else { 1.0 }).collect();
+        x[32..64].fill(0.0);
+        let xv = b.vec(m * k);
+        DeviceChain::upload(&b, &xv, &x);
+        let (len, xs_at) = crate::shaders::q8_len(m, k);
+        let blocks = (m * k / 32) as u32;
+        let mut got = Vec::new();
+        for (name, src, groups) in [("test-q8-thread", crate::shaders::QUANT_Q8, blocks.div_ceil(256)), ("test-q8-lanes", crate::shaders::QUANT_Q8_LANES, (blocks * 8).div_ceil(256))] {
+            let out = b.vec(len);
+            DeviceChain::upload(&b, &out, &vec![f32::from_bits(0xdead_beef); len]);
+            let pipeline = b.gpu.named_pipeline(name, || src.to_string());
+            let mut rec = Recorder::new(&b);
+            let d = rec.gpu().dummy().clone();
+            rec.dispatch_kept(&pipeline, &d, buffer(&xv), buffer(&out), &[k as u32, m as u32, xs_at as u32], (groups, 1, 1));
+            rec.read(&out);
+            got.push(Box::new(rec).finish().pop().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<u32>>());
+        }
+        assert_eq!(got[1], got[0], "{m} rows of {k}: the lanes' words are the thread's");
+    }
+}
+
+/// Q8_0's one-row kernel from int8 activations (where a step's row takes it) gives the f32 one's sums within the
+/// rounding of the row's values to int8, and exactly against a row that is int8 already (every value a whole number up
+/// to 127: the sums then the f32 kernel's but for their order): Qwen3.5 9B's delta nets' [64, 4096], a matrix of rows
+/// off a workgroup's 4, and a row of one lane's turn.
+#[test]
+fn q8_0_from_an_int8_row_is_the_f32_kernels() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !b.gpu.int8_rows() {
+        return;
+    }
+    for (n, k) in [(64usize, 4096usize), (37, 2048), (5, 1024)] {
+        let mut next = rng(n as u32 + 7 * k as u32);
+        let mut raw = vec![0u8; n * (k / 32) * 34];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 127.9) as u8;
+        }
+        for blk in raw.chunks_exact_mut(34) {
+            let d = half::f16::from_f32(0.001 + (blk[9] as f32) * 1e-5).to_bits().to_le_bytes();
+            (blk[0], blk[1]) = (d[0], d[1]);
+        }
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q8_0));
+        for whole in [false, true] {
+            let (x, y, yq) = (b.vec(k), b.vec(n), b.vec(n));
+            let xs: Vec<f32> = (0..k).map(|i| if !whole { next() } else if i % 32 == 5 { if next() > 0.0 { 127.0 } else { -127.0 } } else { (next() * 127.0).round() }).collect();
+            DeviceChain::upload(&b, &x, &xs);
+            let mut rec = Recorder::new(&b);
+            rec.matmul_rows_f32(&w, &x, &y, 1);
+            rec.read(&y);
+            let want = Box::new(rec).finish().pop().unwrap();
+            let mut rec = Recorder::new(&b);
+            assert!(rec.matmul_rows_q8(&w, &x, &yq, 1), "Q8_0 [{n}, {k}] from int8");
+            rec.read(&yq);
+            let got = Box::new(rec).finish().pop().unwrap();
+            let dot: f64 = got.iter().zip(&want).map(|(a, e)| *a as f64 * *e as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (norm(&got) * norm(&want));
+            let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let worst = got.iter().zip(&want).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+            if whole {
+                assert!(scale > 0.0 && worst <= scale * 2e-5, "Q8_0 [{n}, {k}] of a whole row: {worst} off of a largest {scale}");
+            } else {
+                assert!(cos > 0.9999, "Q8_0 [{n}, {k}] from int8: cosine {cos}");
+            }
+        }
+    }
+}

@@ -107,9 +107,13 @@ impl Recorder<'_> {
             return (xq.clone(), xs_at);
         }
         let xq = self.scratch(len);
-        let quant = self.gpu().named_pipeline("chain-q8-quantize", || crate::shaders::QUANT_Q8.to_string());
         let blocks = (m * k / 32) as u32;
-        let groups = blocks.div_ceil(256);
+        // (a device whose subgroups are 32 lanes: 8 lanes a block, [`crate::shaders::QUANT_Q8_LANES`])
+        let (quant, groups) = if self.gpu().subgroups32() {
+            (self.gpu().named_pipeline("chain-q8-quantize-lanes", || crate::shaders::QUANT_Q8_LANES.to_string()), (blocks * 8).div_ceil(256))
+        } else {
+            (self.gpu().named_pipeline("chain-q8-quantize", || crate::shaders::QUANT_Q8.to_string()), blocks.div_ceil(256))
+        };
         let d = self.gpu().dummy().clone();
         self.dispatch_kept(&quant, &d, buffer(x), buffer(&xq), &[k as u32, m as u32, xs_at as u32], (groups.min(65535), groups.div_ceil(65535), 1));
         self.q8.push((xb, m, k, xq.clone()));
@@ -304,8 +308,12 @@ impl Recorder<'_> {
     pub(super) fn matmul_rows_q8(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) -> bool {
         let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
         let (n, k) = (w.shape()[0], w.shape()[1]);
-        let block = if q.dtype == ggml_quants::GgmlType::Q4_0 { 32 } else { 256 };
-        if !matches!(q.dtype, ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K | ggml_quants::GgmlType::Q6_K | ggml_quants::GgmlType::Q4_0) || k % block != 0 {
+        let block = if matches!(q.dtype, ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0) { 32 } else { 256 };
+        if !matches!(q.dtype, ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K | ggml_quants::GgmlType::Q6_K | ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0) || k % block != 0 {
+            return false;
+        }
+        // (Q8_0 a step's one row alone, where [`decode_in_int8`] timed it the faster: a few rows' kernel by f32 as before)
+        if q.dtype == ggml_quants::GgmlType::Q8_0 && (m > 1 || self.alike) {
             return false;
         }
         assert!(x.len >= m * k && y.len >= m * n, "chain: an int8 matmul [{n}, {k}] of {m} rows");
@@ -322,6 +330,7 @@ impl Recorder<'_> {
             (ggml_quants::GgmlType::Q5_K, false) => "chain-q8-Q5_K-multi",
             (ggml_quants::GgmlType::Q4_0, true) => "chain-q8-Q4_0-decode",
             (ggml_quants::GgmlType::Q4_0, false) => "chain-q8-Q4_0-multi",
+            (ggml_quants::GgmlType::Q8_0, _) => "chain-q8-Q8_0-decode",
             (_, true) => "chain-q8-Q6_K-decode",
             (_, false) => "chain-q8-Q6_K-multi",
         };
@@ -351,11 +360,12 @@ fn moe_fused() -> bool {
 /// So it is timed, once a type on each device, at the first step's row of it: [`time_decode`]. The int8 kernel is
 /// taken where it is 5% faster or more; a tie keeps f32's exact sums. `OAIY_Q8_DECODE=1` or `0` decides without
 /// timing; `OAIY_NO_Q8` (no int8 kernels) and a device whose packed dot products are wrapped (`Gpu::int8_rows`) never
-/// get here.
+/// get here. Q8_0 too, a step's one row alone (its weights int8 already; a few rows' by f32 as before): on the A2 its
+/// 4096 x 4096 in 116 us where the f32 kernel took 1,867, Qwen3.5 9B's delta nets' gates [64, 4096] in 13 where 50.
 pub(crate) fn decode_in_int8(backend: &WgpuBackend, w: &QuantizedTensor) -> bool {
     use ggml_quants::GgmlType;
     let Some(dtype) = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).map(|q| q.dtype) else { return false };
-    if !matches!(dtype, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q4_0) {
+    if !matches!(dtype, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q4_0 | GgmlType::Q8_0) {
         return false;
     }
     let gpu = &backend.gpu;
@@ -411,7 +421,8 @@ fn split_name(dtype: ggml_quants::GgmlType) -> Option<&'static str> {
 /// timing (as profiling wants: `OAIY_CHAIN_PROFILE`'s pass a dispatch slowed the split kernel's timing to a tie).
 pub(crate) fn coop_split_for(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> bool {
     let gpu = &backend.gpu;
-    if !gpu.subgroups32() || split_name(dtype).is_none() {
+    // (512 threads a workgroup)
+    if !gpu.subgroups32() || split_name(dtype).is_none() || gpu.limits.max_compute_invocations_per_workgroup < 512 || gpu.limits.max_compute_workgroup_size_x < 512 {
         return false;
     }
     if let Some(known) = gpu.coop_split.lock().unwrap_or_else(|p| p.into_inner()).get(&dtype) {
@@ -510,6 +521,7 @@ fn time_decode(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> Option<(f
     let (n, k) = (4096usize, 4096usize);
     let (block, bytes) = match dtype {
         GgmlType::Q4_0 => (32, 18),
+        GgmlType::Q8_0 => (32, 34),
         GgmlType::Q3_K => (256, 110),
         GgmlType::Q4_K => (256, 144),
         GgmlType::Q5_K => (256, 176),

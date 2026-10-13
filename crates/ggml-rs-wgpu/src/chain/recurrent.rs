@@ -22,8 +22,18 @@ impl Recorder<'_> {
         let size = |s: &str| s.replace("DK_VALUE", &dk.to_string());
         let rows = d.rows as u32;
         self.dispatch_wide(names[0], &size(DELTA_NET_PREP), [buffer(conv), &dd, buffer(beta_alpha), buffer(ssm_a), buffer(dt_bias), &dd, buffer(&qk), &drw], words, (d.k_heads as u32, rows, 1));
-        let groups = (d.v_heads * dk / r) as u32;
-        self.dispatch_wide(names[1], &delta_net_scan(dk, r), [buffer(&qk), buffer(conv), buffer(&qk), &dd, &dd, &dd, buffer(state), buffer(out)], words, (groups, 1, 1));
+        // (a step's one token where subgroups are 32 lanes and the heads 128 wide: a subgroup a row, [`DELTA_NET_STEP`];
+        // not where the recording's rows are alike, a check's rows a step's bit for bit, the scan's order of sums
+        // theirs; OAIY_DELTA_NET_STEP=0: the scan)
+        static STEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let step = d.rows == 1 && !self.alike && dk == 128 && (d.v_heads * dk) % 32 == 0 && self.gpu().subgroups32() && *STEP.get_or_init(|| std::env::var("OAIY_DELTA_NET_STEP").map_or(true, |v| v != "0"));
+        if step {
+            let source = self.gpu().named_source("chain-delta-net-step-128", delta_net_step);
+            self.dispatch_wide("chain-delta-net-step-128", source, [buffer(&qk), buffer(conv), buffer(&qk), &dd, &dd, &dd, buffer(state), buffer(out)], words, ((d.v_heads * dk / 32) as u32, 1, 1));
+        } else {
+            let groups = (d.v_heads * dk / r) as u32;
+            self.dispatch_wide(names[1], &delta_net_scan(dk, r), [buffer(&qk), buffer(conv), buffer(&qk), &dd, &dd, &dd, buffer(state), buffer(out)], words, (groups, 1, 1));
+        }
         self.dispatch_wide(names[2], &size(DELTA_NET_NORM), [&dd, buffer(z), &dd, &dd, &dd, buffer(norm), &drw, buffer(out)], words, (d.v_heads as u32, rows, 1));
         // (the scan was the scratch's last reader: the next layer's delta net takes it again. Each of Flash-Next's
         // 36 such layers held its own to the recording's end, 16 MB at 512 rows: half of what a chunk took)

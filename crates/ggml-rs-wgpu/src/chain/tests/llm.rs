@@ -42,7 +42,15 @@ fn a_chain_matches_the_cpus_ops() {
     let got = rec.finish();
     assert_eq!(got.len(), 2);
     close(&got[1], xn.data(), "rmsnorm");
-    close(&got[0], &want, "the chain");
+    // (a step's one row of Q8_0 from int8 activations where the device decodes it so, `matmul::decode_in_int8`: within
+    // the rounding of the row to int8, as the other int8 kernels are held to)
+    if crate::chain::matmul::decoded_in_int8(&b, GgmlType::Q8_0) {
+        let scale = want.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let worst = got[0].iter().zip(&want).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        assert!(worst <= 1.5e-2 * scale, "the chain from int8: {worst} off of a largest {scale}");
+    } else {
+        close(&got[0], &want, "the chain");
+    }
 }
 
 /// A gated delta net's conv and recurrence give the host's answer (`Backend::delta_net_step`, the CPU's): the
