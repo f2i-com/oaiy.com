@@ -510,6 +510,36 @@ impl Recorder<'_> {
         self.gpu().named_pipeline(name, || format!("{HEAD}{body}"))
     }
 
+    /// A row norm's pipeline for rows `n` long, and its grid for `rows` of them: [`rmsnorm_narrow4`]'s where a row is
+    /// at most 128 vec4s (256 / its lanes rows a workgroup), else [`RMSNORM_ROWS4`]'s, a workgroup a row (or
+    /// [`RMSNORM_ROWS`]'s for a row not a multiple of 4 long); with `silu` (a row a multiple of 4 long), the norm's
+    /// output through SiLU. OAIY_NARROW_NORMS=0: a workgroup a row whatever its length.
+    pub(crate) fn rmsnorm_pipeline(&self, n: usize, rows: usize, silu: bool) -> (Arc<wgpu::ComputePipeline>, (u32, u32, u32)) {
+        let with_silu = |body: String| -> String {
+            let at = "y4[at + i] = x4[at + i] * inv * w4[wat + i];";
+            assert_eq!(body.matches(at).count(), 1, "the norm's store");
+            body.replace(at, "let v = x4[at + i] * inv * w4[wat + i];\n        y4[at + i] = v / (vec4<f32>(1.0) + exp(-v));")
+        };
+        static NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if n % 4 == 0 && (1..=128).contains(&(n / 4)) && *NARROW.get_or_init(|| std::env::var("OAIY_NARROW_NORMS").map_or(true, |v| v != "0")) {
+            const NAMES: [[&str; 5]; 2] = [
+                ["chain-rmsnorm-narrow-8", "chain-rmsnorm-narrow-16", "chain-rmsnorm-narrow-32", "chain-rmsnorm-narrow-64", "chain-rmsnorm-narrow-128"],
+                ["chain-rmsnorm-silu-narrow-8", "chain-rmsnorm-silu-narrow-16", "chain-rmsnorm-silu-narrow-32", "chain-rmsnorm-silu-narrow-64", "chain-rmsnorm-silu-narrow-128"],
+            ];
+            let lanes = (n / 4).next_power_of_two().max(8);
+            let pipeline = self.gpu().named_pipeline(NAMES[usize::from(silu)][lanes.trailing_zeros() as usize - 3], || if silu { with_silu(rmsnorm_narrow4(lanes)) } else { rmsnorm_narrow4(lanes) });
+            let g = rows.div_ceil(256 / lanes) as u32;
+            return (pipeline, (g.min(65535), g.div_ceil(65535), 1));
+        }
+        let pipeline = match (n % 4 == 0, silu) {
+            (true, false) => self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()),
+            (true, true) => self.gpu().named_pipeline("chain-rmsnorm-silu-rows4", || with_silu(RMSNORM_ROWS4.to_string())),
+            (false, _) => self.named("chain-rmsnorm-rows", RMSNORM_ROWS),
+        };
+        let r = rows as u32;
+        (pipeline, (r.min(65535), r.div_ceil(65535), 1))
+    }
+
     /// A dispatch of an eight-buffer kernel (`Gpu::wide_layout`), its bind group kept as `dispatch_kept`'s.
     pub(crate) fn dispatch_wide(&mut self, name: &'static str, body: &str, bufs: [&wgpu::Buffer; 8], words: &[u32], groups: (u32, u32, u32)) {
         self.wrote(bufs[6]);

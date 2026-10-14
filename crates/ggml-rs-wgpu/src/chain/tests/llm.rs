@@ -559,3 +559,36 @@ fn a_large_write_is_its_bytes() {
         assert!(got[edge..edge + held].iter().zip(&words).all(|(g, w)| g.to_bits() == *w), "way {way}: the vector holds the bytes");
     }
 }
+
+/// A narrow rows' norm ([`rmsnorm_narrow4`], 256 / its lanes rows a workgroup) gives [`RMSNORM_ROWS4`]'s bits (a
+/// workgroup a row): rows of 1 to 128 vec4s (a head's 64, 128 and 256, a VAE's 144 channels, a row of 4 and of 36),
+/// the weight's rows in turn (heads) or one, plain and through SiLU, more rows than a grid's side takes once.
+#[test]
+fn a_narrow_rows_norm_is_the_rows_kernels_bits() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut r = rng(31);
+    let silu = |body: String| body.replace("y4[at + i] = x4[at + i] * inv * w4[wat + i];", "let v = x4[at + i] * inv * w4[wat + i];\n        y4[at + i] = v / (vec4<f32>(1.0) + exp(-v));");
+    for (n, rows, wrows) in [(128usize, 70_001usize, 32usize), (64, 1000, 1), (256, 333, 8), (144, 2049, 1), (4, 77, 1), (36, 300, 3), (512, 129, 1)] {
+        let x: Vec<f32> = (0..rows * n).map(|_| r() * 7.0).collect();
+        let w: Vec<f32> = (0..wrows * n).map(|_| r() + 1.0).collect();
+        let (xd, wd, want, got) = (b.vec(rows * n), b.vec(wrows * n), b.vec(rows * n), b.vec(rows * n));
+        DeviceChain::upload(&b, &xd, &x);
+        DeviceChain::upload(&b, &wd, &w);
+        let lanes = (n / 4).next_power_of_two().max(8);
+        for with in [false, true] {
+            let name = |s: &str| -> &'static str { Box::leak(format!("test-{s}-{n}-{with}").into_boxed_str()) };
+            let (wide, narrow) = if with { (silu(RMSNORM_ROWS4.to_string()), silu(rmsnorm_narrow4(lanes))) } else { (RMSNORM_ROWS4.to_string(), rmsnorm_narrow4(lanes)) };
+            let (wide, narrow) = (b.gpu.named_pipeline(name("rows4"), || wide.clone()), b.gpu.named_pipeline(name("narrow"), || narrow.clone()));
+            let words = [n as u32, 1e-6f32.to_bits(), wrows as u32, rows as u32];
+            let g = rows.div_ceil(256 / lanes) as u32;
+            let mut rec = Recorder::new(&b);
+            rec.dispatch_kept(&wide, buffer(&wd), buffer(&xd), buffer(&want), &words, ((rows as u32).min(65535), (rows as u32).div_ceil(65535), 1));
+            rec.dispatch_kept(&narrow, buffer(&wd), buffer(&xd), buffer(&got), &words, (g.min(65535), g.div_ceil(65535), 1));
+            rec.read(&want);
+            rec.read(&got);
+            let out = Box::new(rec).finish();
+            let differ = out[0].iter().zip(&out[1]).filter(|(a, e)| a.to_bits() != e.to_bits()).count();
+            assert_eq!(differ, 0, "rows of {n} ({rows}, weights {wrows} rows, SiLU {with}): {differ} values differ");
+        }
+    }
+}

@@ -98,6 +98,64 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// [`RMSNORM_ROWS4`] for rows of at most `lanes` vec4s (8 to 128, a power of two): 256 / `lanes` rows a workgroup, a
+/// thread a vec4, where RMSNORM_ROWS4's workgroup a row left all but a row's threads idle through its barriers (a
+/// head's norm, 32 vec4s a row: Qwen Image 2.1's queries' and keys', 132,000 rows a block, 8.3 ms where 1.1 on an
+/// NVIDIA A2). Its sums are RMSNORM_ROWS4's, in sixteens then theirs in turn: the same bits.
+pub(in crate::chain) fn rmsnorm_narrow4(lanes: usize) -> String {
+    assert!(lanes.is_power_of_two() && (8..=128).contains(&lanes), "a narrow norm's {lanes} lanes");
+    r#"@group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+// a row's lanes, the rows a workgroup, and a row's sixteens of lanes
+const L: u32 = LANES_Nu;
+const RPW: u32 = ROWS_Nu;
+const GROUPS: u32 = GROUPS_Nu;
+var<workgroup> part: array<f32, 256>;
+var<workgroup> invs: array<f32, ROWS_N>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n4 = p[0].x / 4u;
+    let r = li / L;
+    let i = li % L;
+    let row = (wg.x + wg.y * 65535u) * RPW + r;
+    let live = row < p[0].w && i < n4;
+    let at = row * n4;
+    var wrows = p[0].z;
+    if (wrows == 0u) { wrows = 1u; }
+    let wat = (row % wrows) * n4;
+    // (the square summed into a vector as RMSNORM_ROWS4 sums it, rounded before the vector's sum: a square fused into
+    // that sum's adds rounds otherwise)
+    var s = vec4<f32>(0.0);
+    if (live) {
+        let v = x4[at + i];
+        s += v * v;
+    }
+    part[li] = s.x + s.y + s.z + s.w;
+    workgroupBarrier();
+    if (i == 0u) {
+        var total = 0.0;
+        for (var g = 0u; g < GROUPS; g++) {
+            var t = 0.0;
+            for (var j = 0u; j < min(16u, L); j++) { t += part[r * L + g * 16u + j]; }
+            total += t;
+        }
+        invs[r] = 1.0 / sqrt(total / f32(p[0].x) + bitcast<f32>(p[0].y));
+    }
+    workgroupBarrier();
+    let inv = invs[r];
+    if (live) {
+        y4[at + i] = x4[at + i] * inv * w4[wat + i];
+    }
+}
+"#
+    .replace("LANES_N", &lanes.to_string())
+    .replace("ROWS_N", &(256 / lanes).to_string())
+    .replace("GROUPS_N", &lanes.div_ceil(16).to_string())
+}
+
 /// `x += y`, then each row of `x` RMS-normed into `out` with `w` (`[n]`, one for every row), rows a multiple of 4
 /// long: a residual's add and the next norm in one dispatch. `p[0]`: n, the bits of eps.
 pub(in crate::chain) const ADD_RMSNORM_ROWS4: &str = r#"

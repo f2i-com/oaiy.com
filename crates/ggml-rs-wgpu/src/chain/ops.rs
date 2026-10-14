@@ -39,9 +39,8 @@ impl ChainRecorder for Recorder<'_> {
         assert!(rows > 0 && x.len % rows == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: rmsnorm of {rows} rows of {}", x.len);
         let n = x.len / rows;
         // rows a multiple of 4 long (a model's width, a head's): vec4 loads
-        let pipeline = if n % 4 == 0 { self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()) } else { self.named("chain-rmsnorm-rows", RMSNORM_ROWS) };
-        let r = rows as u32;
-        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, r], (r.min(65535), r.div_ceil(65535), 1));
+        let (pipeline, groups) = self.rmsnorm_pipeline(n, rows, false);
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, rows as u32], groups);
     }
 
     fn rmsnorm_heads_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, heads: usize, eps: f32) {
@@ -49,23 +48,16 @@ impl ChainRecorder for Recorder<'_> {
         assert!(r > 0 && x.len % r == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: a multi-head rmsnorm of {rows} rows of {heads} heads ({})", x.len);
         let n = x.len / r;
         // (the norms' kernels take the weight's rows in turn: row r of x by w's row r % heads)
-        let pipeline = if n % 4 == 0 { self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()) } else { self.named("chain-rmsnorm-rows", RMSNORM_ROWS) };
-        let rr = r as u32;
-        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), heads as u32, rr], (rr.min(65535), rr.div_ceil(65535), 1));
+        let (pipeline, groups) = self.rmsnorm_pipeline(n, r, false);
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), heads as u32, r as u32], groups);
     }
 
     fn rmsnorm_silu_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
         assert!(rows > 0 && x.len % rows == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: rmsnorm and SiLU of {rows} rows of {}", x.len);
         let n = x.len / rows;
-        let silu = |body: &str| {
-            let at = "y4[at + i] = x4[at + i] * inv * w4[wat + i];";
-            assert_eq!(body.matches(at).count(), 1, "the norm's store");
-            body.replace(at, "let v = x4[at + i] * inv * w4[wat + i];\n        y4[at + i] = v / (vec4<f32>(1.0) + exp(-v));")
-        };
         assert!(n % 4 == 0, "chain: rmsnorm and SiLU of rows {n} long (a multiple of 4)");
-        let pipeline = self.gpu().named_pipeline("chain-rmsnorm-silu-rows4", || silu(RMSNORM_ROWS4));
-        let r = rows as u32;
-        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, r], (r.min(65535), r.div_ceil(65535), 1));
+        let (pipeline, groups) = self.rmsnorm_pipeline(n, rows, true);
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, rows as u32], groups);
     }
 
     fn add_rmsnorm_rows(&mut self, x: &DeviceVec, y: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
