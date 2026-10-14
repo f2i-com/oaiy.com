@@ -247,7 +247,7 @@ var<workgroup> kt: array<vec4<f32>, KT_LEN>;
 var<workgroup> pt: array<f32, PT_LEN>;
 var<workgroup> al: array<f32, TQ_u>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(THREADS)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let n_h = p[0].x;
     let n_kv = p[0].y;
@@ -318,22 +318,34 @@ STORE
 }
 "#;
 
-/// [`ATTENTION_TILED`] for a head `hd` wide (64, 128 or 256): its tiles (64 queries by 16 keys, 32 by 8 at 256), the
-/// per-thread parts unrolled (named, so registers: a thread's array indexed in a loop goes to memory).
+/// A tiled attention's tile for a head `hd` wide ([`ATTENTION_TILED`]): its queries, its keys and its threads (each
+/// thread a query's score or a few, and a few queries' sums of a vec4 of the head: 64 queries by 16 keys at 64 and 128,
+/// 32 by 8 at 256 and 512, 32 by 12 on 384 threads at 384, the single head of Qwen Image's VAE's attention).
+pub(in crate::chain) fn attention_tile(hd: usize) -> (usize, usize, usize) {
+    match hd {
+        256 | 512 => (32, 8, 256),
+        384 => (32, 12, 384),
+        _ => (64, 16, 256),
+    }
+}
+
+/// [`ATTENTION_TILED`] for a head `hd` wide (64, 128, 256, 384 or 512): its tile [`attention_tile`]'s, the per-thread
+/// parts unrolled (named, so registers: a thread's array indexed in a loop goes to memory).
 pub(in crate::chain) fn attention_tiled(hd: usize) -> String {
-    assert!(matches!(hd, 64 | 128 | 256), "a tiled attention's head {hd} wide");
+    assert!(matches!(hd, 64 | 128 | 256 | 384 | 512), "a tiled attention's head {hd} wide");
     let hd4 = hd / 4;
-    let (tq, tk) = if hd == 256 { (32usize, 8usize) } else { (64, 16) };
-    let qpt = tq * tk / 256;
-    let qo = tq * hd4 / 256;
-    let staged = tk * hd4 / 256;
+    let (tq, tk, threads) = attention_tile(hd);
+    let qpt = tq * tk / threads;
+    let qo = tq * hd4 / threads;
+    let staged = tk * hd4 / threads;
+    assert!(qpt * threads == tq * tk && qo * threads == tq * hd4 && staged * threads == tk * hd4 && qo % 4 == 0, "a tiled attention's tile at {hd}");
     let qb: String = (0..qpt).map(|i| format!("    let qb{i} = ((first + min(q0 + sg * {qpt}u + {i}u, rows - 1u)) * n_h + h) * HD4;\n")).collect();
     let oacc: String = (0..qo).map(|i| format!("    var o{i} = vec4<f32>();\n")).collect();
     let stage = |ofs: &str| -> String {
         (0..staged)
             .map(|e| {
                 format!(
-                    "        {{\n            let i = li + {e}u * 256u;\n            let t = kb * TK + i / HD4;\n            var v = vec4<f32>();\n            if (t < kv_len) {{ v = kv4[t * row4 + {ofs} + i % HD4]; }}\n            kt[(i / HD4) * KS + i % HD4] = v;\n        }}\n"
+                    "        {{\n            let i = li + {e}u * {threads}u;\n            let t = kb * TK + i / HD4;\n            var v = vec4<f32>();\n            if (t < kv_len) {{ v = kv4[t * row4 + {ofs} + i % HD4]; }}\n            kt[(i / HD4) * KS + i % HD4] = v;\n        }}\n"
                 )
             })
             .collect()
@@ -374,6 +386,7 @@ pub(in crate::chain) fn attention_tiled(hd: usize) -> String {
         .map(|i| format!("    {{\n        let r = q0 + vg * {qo}u + {i}u;\n        if (r < rows) {{ y4[((first + r) * n_h + h) * HD4 + vl] = o{i} * al[vg * {qo}u + {i}u]; }}\n    }}\n"))
         .collect();
     ATTENTION_TILED
+        .replace("THREADS", &threads.to_string())
         .replace("HD4_u", &format!("{hd4}u"))
         .replace("TQ_u", &format!("{tq}u"))
         .replace("TK_u", &format!("{tk}u"))
@@ -389,11 +402,11 @@ pub(in crate::chain) fn attention_tiled(hd: usize) -> String {
         .replace("STORE\n", &store)
 }
 
-/// Whether a prompt's attention of `rows` queries without tensor cores is tiled ([`ATTENTION_TILED`]): heads 64, 128 or
-/// 256 wide, two tiles of queries or more (fewer, a check of drafts' few rows over a long cache, would be a workgroup a
+/// Whether a prompt's attention of `rows` queries without tensor cores is tiled ([`ATTENTION_TILED`]): heads 64, 128,
+/// 256, 384 or 512 wide, two tiles of queries or more (fewer, a check of drafts' few rows over a long cache, would be a workgroup a
 /// head going through all of it alone: the runs' kernel spreads the positions over the GPU).
 pub(crate) fn attention_tiled_for(rows: usize, head_dim: usize) -> bool {
-    matches!(head_dim, 64 | 128 | 256) && rows >= 2 * if head_dim == 256 { 32 } else { 64 }
+    matches!(head_dim, 64 | 128 | 256 | 384 | 512) && rows >= 2 * attention_tile(head_dim).0
 }
 
 /// The out of [`Recorder::attention_rows_runs`]: the output `[rows, n_h, head_dim]`, then each (query, head, run)'s

@@ -1767,3 +1767,40 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) n
     }
     eprintln!("1 GiB copied on the GPU from staging in the host's memory: {:.2} GB/s", gb(len, t.elapsed().as_secs_f64()));
 }
+
+/// A wide single head's full attention without tensor cores (`--ignored --nocapture`): a VAE's mid-block attention,
+/// `OAIY_ATT_ROWS` (16,384: SDXL's 1024 by 1024 picture's latent) positions of one head `OAIY_ATT_HD` (512) wide, by
+/// the runs' kernel and by the tiled one.
+#[test]
+#[ignore = "a measurement"]
+fn measure_wide_head_attention() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (rows, hd) = (env("OAIY_ATT_ROWS", 16384), env("OAIY_ATT_HD", 512));
+    let mut next = rng(5);
+    let q: Vec<f32> = (0..rows * hd).map(|_| next()).collect();
+    let cache: Vec<f32> = (0..rows * 2 * hd).map(|_| next()).collect();
+    let (qv, kv) = (b.vec(rows * hd), b.vec(rows * 2 * hd));
+    DeviceChain::upload(&b, &qv, &q);
+    DeviceChain::upload(&b, &kv, &cache);
+    let out = b.vec(attention_runs_out_len(rows, 1, hd, rows));
+    let scale = 1.0 / (hd as f32).sqrt();
+    let flops = 4.0 * (rows * rows * hd) as f64;
+    for tiled in [false, true] {
+        let run = || {
+            let mut rec = Recorder::new(&b);
+            if tiled {
+                rec.attention_rows_tiled(&qv, &kv, &out, rows, 1, 1, hd, rows, None, scale, true, rows);
+            } else {
+                rec.attention_rows_runs(&qv, &kv, &out, rows, 1, 1, hd, rows, None, scale, true);
+            }
+            rec.read_range(&out, 0, 1);
+            Box::new(rec).finish();
+        };
+        run();
+        let t = std::time::Instant::now();
+        run();
+        let s = t.elapsed().as_secs_f64();
+        eprintln!("{rows} positions of a head {hd} wide, {}: {:.1} ms ({:.2} TFLOPS)", if tiled { "tiled" } else { "runs" }, s * 1e3, flops / s / 1e12);
+    }
+}

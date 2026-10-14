@@ -133,9 +133,10 @@ impl WgpuSdxlVae {
         let kv = self.vec(rows * 2 * c);
         r.store_rows(&k, &kv, rows, c, 0, 2 * c, 0);
         r.store_rows(&v, &kv, rows, c, 0, 2 * c, c);
-        // the queries a run at a time, each over every key: a head 512 wide is the f32 kernel's, whose scratch grows
-        // with its queries times its keys (a 1024x1024 picture's 16,384 pixels at once: 2.2 GB, past what one
-        // binding takes)
+        // the queries a run at a time where they need it, each over every key: a head 512 wide is the f32 kernels',
+        // the tiled one's (its out the output alone: a 1024x1024 picture's 16,384 pixels at once, five times as fast
+        // as the runs' kernel on an NVIDIA A2) or, where it is not, the runs' kernel's, whose scratch grows with its
+        // queries times its keys (those pixels at once: 2.2 GB, past what one binding takes)
         let scale = 1.0 / (c as f32).sqrt();
         let whole = self.gpu.attention_rows_full_out_len(rows, 1, c, rows);
         let run = if whole <= ATTENTION_FLOATS { rows } else { (rows * ATTENTION_FLOATS / whole / 32 * 32).max(32) };

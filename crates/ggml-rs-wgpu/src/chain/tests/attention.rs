@@ -308,6 +308,11 @@ fn a_tiled_attention_is_the_runs_kernels() {
         (4, 4, 64, 777, 100, None, true, 64),
         (4, 1, 256, 513, 70, None, true, 32),
         (6, 3, 128, 40, 300, Some(17), false, 1 << 20),
+        // (a VAE's single head: Qwen Image's 384 wide, SDXL's 512; full, and causal past a cache)
+        (1, 1, 384, 300, 300, None, true, 64),
+        (1, 1, 384, 100, 77, None, false, 1 << 20),
+        (2, 1, 512, 130, 130, None, true, 64),
+        (1, 1, 512, 40, 70, None, false, 32),
     ] {
         let kv_len = if full { past } else { past + rows };
         let (qd, row) = (n_h * hd, 2 * n_kv * hd);

@@ -15,7 +15,7 @@ impl Recorder<'_> {
     pub(crate) fn attention_rows_f32_masked(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32, full: bool) {
         if attention_tiled_for(rows, head_dim) {
             let per_row = 4.0 * (if full { past } else { past + rows }).max(1) as f64 * (n_h * head_dim) as f64;
-            let tq = if head_dim == 256 { 32 } else { 64 };
+            let tq = attention_tile(head_dim).0;
             let chunk = (((ATTENTION_DISPATCH_FLOPS / per_row) as usize) / tq * tq).max(tq);
             self.attention_rows_tiled(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale, full, chunk);
         } else {
@@ -36,9 +36,11 @@ impl Recorder<'_> {
         let name = match head_dim {
             64 => "chain-attention-tiled-64",
             128 => "chain-attention-tiled-128",
-            _ => "chain-attention-tiled-256",
+            256 => "chain-attention-tiled-256",
+            384 => "chain-attention-tiled-384",
+            _ => "chain-attention-tiled-512",
         };
-        let tq = if head_dim == 256 { 32 } else { 64 };
+        let tq = attention_tile(head_dim).0;
         let pipeline = self.gpu().named_pipeline(name, || attention_tiled(head_dim));
         let mask = full as u32 | (window.unwrap_or(0) as u32) << 1;
         let mut first = 0;
