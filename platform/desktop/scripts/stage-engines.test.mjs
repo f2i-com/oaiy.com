@@ -1,12 +1,13 @@
-// The portable language-model engine the installer carries (stage-engines-lib.mjs): staged where engines.rs looks,
-// refused when it was not built, and wired so that `tauri build` cannot make an installer without it.
+// OAIY's engines the installer carries (stage-engines-lib.mjs), the language-model engine and the media engine: staged
+// where engines.rs looks, refused when one was not built, and wired so that `tauri build` cannot make an installer
+// without them.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { BUILD_COMMAND, ENGINE, EngineStagingError, engineFile, stageEngine, stagedEnginesDir } from './stage-engines-lib.mjs';
+import { BUILD_COMMAND, ENGINE, ENGINES, EngineStagingError, engineFile, stageEngines, stagedEnginesDir } from './stage-engines-lib.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const desktop = path.resolve(here, '..');
@@ -24,40 +25,56 @@ beforeEach(() => {
 });
 afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
 
-const build = (platform, bytes = Buffer.from('MZ portable engine')) => {
+const build = (platform, name, bytes = Buffer.from(`MZ ${name}`)) => {
   const dir = path.join(repo, 'target', 'release');
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, engineFile(platform)), bytes);
+  fs.writeFileSync(path.join(dir, engineFile(name, platform)), bytes);
 };
+const buildAll = (platform) => ENGINES.forEach(({ name }) => build(platform, name));
 
-describe('the portable language-model engine', () => {
-  it('is staged alone where engines.rs looks, as the build made it', () => {
+describe("OAIY's engines", () => {
+  it('are the language-model engine and the media engine', () => {
+    expect(ENGINES.map((e) => e.name)).toEqual(['oaiy-llm-server-webgpu', 'oaiy-media']);
+    expect(ENGINE).toBe('oaiy-llm-server-webgpu');
+    expect(BUILD_COMMAND).toBe(ENGINES[0].build);
+  });
+
+  it('are staged alone where engines.rs looks, as the builds made them', () => {
     for (const platform of ['win32', 'linux']) {
-      build(platform);
+      buildAll(platform);
       const leftover = path.join(stagedEnginesDir(fakeDesktop), 'stale.exe');
       fs.mkdirSync(path.dirname(leftover), { recursive: true });
       fs.writeFileSync(leftover, 'old');
       const lines = [];
-      const { file, bytes } = stageEngine({ repo, desktop: fakeDesktop, platform, log: (l) => lines.push(l) });
-      expect(file).toBe(path.join(fakeDesktop, 'src-tauri', 'resources', 'engines', platform === 'win32' ? `${ENGINE}.exe` : ENGINE));
-      expect(fs.readFileSync(file, 'utf8')).toBe('MZ portable engine');
-      expect(bytes).toBe(18);
-      expect(fs.readdirSync(stagedEnginesDir(fakeDesktop))).toEqual([path.basename(file)]);
-      expect(lines.join('\n')).toContain('verified');
+      const staged = stageEngines({ repo, desktop: fakeDesktop, platform, log: (l) => lines.push(l) });
+      const names = ENGINES.map(({ name }) => (platform === 'win32' ? `${name}.exe` : name));
+      expect(staged.map((s) => s.file)).toEqual(names.map((n) => path.join(fakeDesktop, 'src-tauri', 'resources', 'engines', n)));
+      ENGINES.forEach(({ name }, i) => {
+        expect(fs.readFileSync(staged[i].file, 'utf8')).toBe(`MZ ${name}`);
+        expect(staged[i].bytes).toBe(`MZ ${name}`.length);
+      });
+      expect(fs.readdirSync(stagedEnginesDir(fakeDesktop)).sort()).toEqual([...names].sort());
+      expect(lines.join('\n').match(/verified/g)).toHaveLength(ENGINES.length);
     }
   });
 
-  it('is refused when it was not built, and the error says how to build it', () => {
-    expect(() => stageEngine({ repo, desktop: fakeDesktop, platform: 'win32' })).toThrow(EngineStagingError);
-    expect(() => stageEngine({ repo, desktop: fakeDesktop, platform: 'win32' })).toThrow(BUILD_COMMAND);
+  it('are refused when one was not built, nothing staged, and the error says how to build that one', () => {
+    for (const missing of ENGINES) {
+      fs.rmSync(path.join(repo, 'target'), { recursive: true, force: true });
+      ENGINES.filter((e) => e !== missing).forEach(({ name }) => build('win32', name));
+      expect(() => stageEngines({ repo, desktop: fakeDesktop, platform: 'win32' })).toThrow(EngineStagingError);
+      expect(() => stageEngines({ repo, desktop: fakeDesktop, platform: 'win32' })).toThrow(missing.build);
+      expect(fs.existsSync(path.join(stagedEnginesDir(fakeDesktop), engineFile(missing.name, 'win32')))).toBe(false);
+    }
   });
 
-  it('is refused when its build is empty', () => {
-    build('linux', Buffer.alloc(0));
-    expect(() => stageEngine({ repo, desktop: fakeDesktop, platform: 'linux' })).toThrow(/is empty/);
+  it('are refused when a build is empty', () => {
+    buildAll('linux');
+    build('linux', 'oaiy-media', Buffer.alloc(0));
+    expect(() => stageEngines({ repo, desktop: fakeDesktop, platform: 'linux' })).toThrow(/oaiy-media is empty/);
   });
 
-  it('is listed in bundle.resources, made for a build that stages nothing, and staged by Tauri before it builds', () => {
+  it('are listed in bundle.resources, made for a build that stages nothing, and staged by Tauri before it builds', () => {
     const config = JSON.parse(read('src-tauri', 'tauri.conf.json'));
     const manifest = JSON.parse(read('package.json'));
     expect(config.bundle.resources).toContain('resources/engines');
@@ -65,14 +82,20 @@ describe('the portable language-model engine', () => {
     expect(read('src-tauri', 'build.rs')).toContain('"resources/engines"');
     expect(manifest.scripts['stage-engines']).toBe('node scripts/stage-engines.mjs');
     expect(manifest.scripts['build:bundle']).toContain('npm run stage-engines');
-    // The build command the error names is the one the release workflow runs.
+    // The build commands the errors name are the ones the release workflow runs, and the Mac's builds each engine.
     const release = fs.readFileSync(path.join(repository, '.github', 'workflows', 'release.yml'), 'utf8');
-    expect(release).toContain(BUILD_COMMAND.replace('cargo build --release', 'cargo build --release --locked'));
+    const mac = fs.readFileSync(path.join(repository, '.github', 'workflows', 'mac-build.yml'), 'utf8');
+    for (const { build: command } of ENGINES) {
+      expect(release).toContain(command.replace('cargo build --release', 'cargo build --release --locked'));
+    }
+    expect(mac).toContain('cargo build --release --locked -p oaiy-media');
   });
 
   const git = spawnSync('git', ['--version']).status === 0;
-  it.skipIf(!git)('is git-ignored where it is staged', () => {
-    const staged = path.relative(repository, path.join(stagedEnginesDir(desktop), engineFile()));
-    expect(spawnSync('git', ['check-ignore', '-q', staged], { cwd: repository }).status, `${staged} is not ignored`).toBe(0);
+  it.skipIf(!git)('are git-ignored where they are staged', () => {
+    for (const { name } of ENGINES) {
+      const staged = path.relative(repository, path.join(stagedEnginesDir(desktop), engineFile(name)));
+      expect(spawnSync('git', ['check-ignore', '-q', staged], { cwd: repository }).status, `${staged} is not ignored`).toBe(0);
+    }
   });
 });

@@ -498,7 +498,11 @@ pub fn use_programs_from(config_path: &std::path::Path, dir: &std::path::Path) -
         } else {
             name.clone()
         };
-        if root.join(&file).is_file() || !dir.join(&file).is_file() {
+        // (the media worker the host carries is taken over a copy beside the configuration: that is where a person
+        // was told to put one of their own while no installer carried it, and left there it would outlive every
+        // update of the host's; a path named in the configuration is still theirs)
+        let carried_first = section == "media" && !name.contains(['/', '\\']);
+        if (root.join(&file).is_file() && !carried_first) || !dir.join(&file).is_file() {
             continue;
         }
         util::set(&mut part, key, Json::str(dir.join(&file).to_string_lossy()));
@@ -747,6 +751,25 @@ mod tests {
         // A program that is not in the folder (the WebGPU server) keeps its name; a second call changes nothing.
         assert_eq!(cfg.get("llm").and_then(|l| l.get("server_webgpu")).and_then(Json::as_str), Some("oaiy-llm-server-webgpu"));
         assert!(!use_programs_from(&path, &bin).unwrap());
+        // Copies beside the configuration (a person's own, from before installers carried the media worker): the
+        // language-model server's stays theirs, the media worker is the host's.
+        let own = base.join("own");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join(exe("oaiy-llm-server")), b"").unwrap();
+        std::fs::write(own.join(exe("oaiy-media")), b"").unwrap();
+        let own_path = own.join(config::FILE_NAME);
+        assert!(use_programs_from(&own_path, &bin).unwrap());
+        let cfg = config::load(&own_path).unwrap();
+        assert_eq!(cfg.get("llm").and_then(|l| l.get("server")).and_then(Json::as_str), Some("oaiy-llm-server"));
+        let worker = cfg.get("media").and_then(|m| m.get("worker")).and_then(Json::as_str).unwrap().to_string();
+        assert_eq!(std::path::Path::new(&worker), bin.join(exe("oaiy-media")));
+        // A worker the configuration names by its path stays, the host's or not.
+        let mut cfg = config::load(&own_path).unwrap();
+        let mut media = cfg.get("media").cloned().unwrap();
+        util::set(&mut media, "worker", Json::str(own.join(exe("oaiy-media")).to_string_lossy()));
+        util::set(&mut cfg, "media", media);
+        config::save(&own_path, &cfg).unwrap();
+        assert!(!use_programs_from(&own_path, &bin).unwrap());
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -57,8 +57,8 @@ Once is enough.
 Thunderbolt enclosure where the eGPU plugin gives it one: [below](#a-card-in-a-thunderbolt-enclosure-through-tinygrad)):
 add a model's `.gguf` under **Engines** and it runs. Flows run on Node, which the app installs under its own data
 folder the first time, at a press of **Install Node** on the Overview (from nodejs.org:
-that once, it needs the network). Pictures, video and speech are another program
-(`oaiy-media`), which no installer carries on any system. The app's data is in
+that once, it needs the network). Pictures, video, music and speech are another program
+(`oaiy-media`), which the app carries beside it. The app's data is in
 `~/Library/Application Support/com.oaiy.app`. It does not update itself on a Mac: a newer
 image is installed over it.
 
@@ -200,7 +200,7 @@ Two of those scripts print text worth sending on:
   and, of those that did not, which and why; the whole text goes to a file it names.
 
 `sh tools/mac/build.sh --media` also builds the worker for pictures, video and speech
-(`oaiy-media`). It has not been built on a Mac, and it sizes its memory from readings a Mac
+(`oaiy-media`, which the app carries: `mac-build.yml` builds it with the app). It sizes its memory from readings a Mac
 does not give (`nvidia-smi`, Vulkan's heap budget): expect work there. It needs a recent
 Rust: Rust 1.92 refuses the NEON half-float types its tensor library (Candle) uses on
 Apple silicon as unstable (`stdarch_neon_f16`), and the Rust of September 2026 accepts
@@ -440,9 +440,9 @@ whether it is.
    on the card": a sound effect 17 times as fast as on the M5 Pro's GPU, a picture 14, a song 8): a Qwen Image picture is made
    on the card, its language model paused meanwhile and loaded again after (Settings →
    eGPU → *Make pictures on it too*, on unless switched off; docs/TINYGPU.md). The worker
-   is `oaiy-media`, which the app does not carry: build it (`cargo build --release -p
-   oaiy-media`) and copy `target/release/oaiy-media` into the engines' folder
-   (`~/Library/Application Support/com.oaiy.app/engines`). A model on an external drive
+   is `oaiy-media`, which the app carries (a copy of one's own put in the engines' folder,
+   `~/Library/Application Support/com.oaiy.app/engines`, before it did is passed over for
+   the app's; `media.worker` set to a path names one's own build). A model on an external drive
    asks macOS for the app's access to removable volumes the first time it is read (and
    again for each new local build, which macOS takes for another app): until that is
    answered, the read waits.

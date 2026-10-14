@@ -241,6 +241,14 @@ jobs:
       - name: Build the portable language-model engine
         run: cargo build --release --locked -p oaiy-llm-server --no-default-features --features tinygpu --bin oaiy-llm-server-webgpu
 
+      # And the media engine the app carries beside it (pictures, video, music, sound effects and speech; on a Mac its
+      # WebGPU takes the TinyGPU adapter too, a card in a Thunderbolt enclosure where the eGPU plugin gives it one).
+      - name: Build the media engine
+        run: cargo build --release --locked -p oaiy-media
+
+      - name: Check the media engine starts
+        run: target/release/oaiy-media --help > /dev/null
+
       - name: Build OAIY Desktop
         working-directory: platform/desktop
         run: npm run tauri:build -- --bundles app,dmg

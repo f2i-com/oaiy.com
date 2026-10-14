@@ -393,8 +393,8 @@ up halves by rows.
 **Pictures in OAIY on the card.** With the eGPU's engine OAIY's own, a Qwen Image picture is made on the card
 (`llm.egpu.images`, on unless switched off: Settings → eGPU → *Make pictures on it too*). The card is not opened a
 second time (each open resets it): the launcher that holds it for the language model pauses that engine on a word from
-OAIY (its buffers freed as its connection goes), and the image worker (`oaiy-media`, which must be in the engines'
-folder or beside the app: no installer carries it) takes the card's socket as its WebGPU adapter. Chats with the model
+OAIY (its buffers freed as its connection goes), and the image worker (`oaiy-media`, which the installer carries)
+takes the card's socket as its WebGPU adapter. Chats with the model
 wait meanwhile; when the queue of pictures is empty the card is given back and the engine starts again, or, where the
 card was opened only for pictures, stays paused until a chat asks for its model (and is let go with the eGPU's idle
 stop). The worker is kept (`oaiy-media --serve`, a job a line in and its answer a line out) with the models it loaded:

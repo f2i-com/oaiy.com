@@ -36,7 +36,8 @@ safetensors option, and the saved manifest records the exact checkpoint path.
 
 ## Build and configuration
 
-On Windows:
+OAIY Desktop's installers carry both programs (`resources/engines`): nothing needs building to make pictures in
+the app. For a build of one's own, on Windows:
 
 ```powershell
 ./tools/qwen-image/build.ps1

@@ -23,6 +23,7 @@ describe('the desktop legs of the release', () => {
   const flows = at((step) => step.name === 'Install and build the flow editor');
   const tauri = at((step) => step.name === 'Build OAIY Desktop');
   const engine = at((step) => step.name === 'Build the portable language-model engine');
+  const media = at((step) => step.name === 'Build the media engine');
 
   it('build the Agent and the flow editor before tauri build stages them', () => {
     assert.ok(agent >= 0 && flows >= 0 && tauri >= 0, JSON.stringify({ agent, flows, tauri }));
@@ -42,6 +43,17 @@ describe('the desktop legs of the release', () => {
       desktop[engine].run.trim(),
       'cargo build --release --locked -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu',
     );
+  });
+
+  it('build the media engine before tauri build stages it, and check that it starts', () => {
+    // stage-engines.mjs copies target/release/oaiy-media beside the language-model engine, and stops when it is missing.
+    assert.ok(media >= 0 && media < tauri, JSON.stringify({ media, tauri }));
+    assert.equal(desktop[media].workingDirectory, undefined, 'the repository\'s workspace, at its root');
+    assert.equal(desktop[media].run.trim(), 'cargo build --release --locked -p oaiy-media');
+    const starts = at((step) => step.name === 'Check the media engine starts');
+    assert.ok(starts > media && starts < tauri, JSON.stringify({ starts, media, tauri }));
+    const step = document.jobs.desktop.steps.find((s) => s.name === 'Check the media engine starts');
+    assert.equal(step.shell, 'bash', 'the same command on Windows');
   });
 
   it('build the flow editor with the release’s ZIPP, and standalone', () => {

@@ -30,8 +30,13 @@ empty or incomplete (`platform/desktop/scripts/stage-pages.mjs`), so there is no
 that opens on "the page is not built". It also carries the language-model engine
 (`resources/engines/oaiy-llm-server-webgpu`: every model on any graphics card through
 WebGPU, else the CPU, about 15 MB), so the model the setup downloads runs with nothing else
-to install; building an installer stops if it is not built
-(`platform/desktop/scripts/stage-engines.mjs`). What OAIY needs at run time (language and
+to install, and the media engine (`resources/engines/oaiy-media`: pictures, video, music,
+sound effects, speech and 3D models through WebGPU, about 25 MB), so an image model it
+downloads makes pictures; building an installer stops if either is not built
+(`platform/desktop/scripts/stage-engines.mjs`; the release workflows build both, and check
+that the media engine starts). A media worker of one's own beside the configuration (where
+one had to be put before installers carried it) is passed over for the installer's;
+`media.worker` set to a path names one's own build. What OAIY needs at run time (language and
 other models, the portable Python and the Node runtime) is downloaded on first use, not
 shipped.
 
