@@ -783,8 +783,9 @@ jobs:
           against that release's \`SHA256SUMS\`; \`release-evidence-web.json\` records its digests.
 
           **OAIY Desktop** — the tray app that manages local model servers, downloads, Python and
-          the browser sidecar for the web app. It has the Agent and the flow editor inside; the
-          engines are not built here.
+          the browser sidecar for the web app. It has the Agent and the flow editor inside, and carries the
+          language-model engine and the media engine (pictures, video, music and speech), both on any
+          graphics card through WebGPU.
           - Windows: \`oaiy-desktop-$VERSION-windows-x64-setup.exe\` (installer) or the \`.msi\`
           - Linux: \`.AppImage\` (portable), \`.deb\` (Debian/Ubuntu) or \`.rpm\` (Fedora/RHEL)
           - OAIY Desktop looks here for a newer version (\`latest.json\`, with the \`.sig\` signatures of
