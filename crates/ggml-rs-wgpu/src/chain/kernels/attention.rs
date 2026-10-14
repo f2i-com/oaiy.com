@@ -981,6 +981,57 @@ pub(in crate::chain) fn attention_group_for(g: usize, head_dim: usize, workgroup
     matches!(head_dim, 64 | 128 | 256) && (2..=8).contains(&g) && g * (256 - head_dim / 4) <= 1152 && workgroup_bytes >= 26_624
 }
 
+/// [`SOFTMAX_ROWS_SUMS`] of a causal attention's scores ([`Recorder::attention_rows_wide`]'s with `causal`): row `r`
+/// (the query at `p[1].x + r`) over the positions to its own, the last `p[1].y` of them where that is not 0, the rest
+/// of its `n` weights 0. `p[0]`: `n`, the positions there are, the rows, the scale's bits.
+pub(in crate::chain) const SOFTMAX_ROWS_CAUSAL: &str = r#"
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(7) var<storage, read_write> sums: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let valid = p[0].y;
+    let rows = p[0].z;
+    let scale = bitcast<f32>(p[0].w);
+    let window = p[1].y;
+    let row = wg.x + wg.y * 65535u;
+    if (row >= rows) { return; }
+    // the row's query's position, and the positions it sees: to its own, the last `window` of them where it has one
+    let pos = p[1].x + row;
+    let hi = min(valid, pos + 1u);
+    var lo = 0u;
+    if (window > 0u && pos + 1u > window) { lo = pos + 1u - window; }
+    let at = row * n;
+    var m = -3.4e38;
+    for (var i = lo + li; i < hi; i += 256u) { m = max(m, x[at + i] * scale); }
+    part[li] = m;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) { part[li] = max(part[li], part[li + s]); }
+        workgroupBarrier();
+    }
+    let top = part[0];
+    workgroupBarrier();
+    var t = 0.0;
+    for (var i = li; i < n; i += 256u) {
+        var e = 0.0;
+        if (i >= lo && i < hi) { e = exp(x[at + i] * scale - top); }
+        x[at + i] = e;
+        t += e;
+    }
+    part[li] = t;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) { part[li] += part[li + s]; }
+        workgroupBarrier();
+    }
+    if (li == 0u) { sums[row] = part[0]; }
+}
+"#;
+
 /// [`Recorder::attention_rows_wide`]'s weights: each of `rows` rows of `n` scores (its first `valid` a key's, the rest
 /// padding) times `scale`, less the row's largest, through exp (the largest weight 1: f16's range, for the values'
 /// matmul), in place, padding's weights 0, and the row's sum into `sums`.

@@ -350,9 +350,23 @@ fn a_prompts_attention_on_the_tensor_cores_is_the_f32_kernels() {
         return;
     }
     // (each as it is, then with keys far past the rest planted; the grouped kernel's where a KV head has 1, 2 or 4
-    // query heads, Qwen3.5 9B's 16 of 256 on 4 among them, the one-pass kernel's where 6 or 8)
-    let shapes = [(8usize, 2usize, 64usize, 300usize, 37usize, 1.0f32), (16, 2, 128, 0, 100, 2.0), (24, 4, 256, 214, 64, 1.0), (24, 4, 256, 1000, 150, 3.0), (16, 4, 256, 1000, 150, 3.0), (8, 4, 128, 61, 300, 2.0), (4, 4, 64, 214, 70, 1.0)];
-    for (planted, (n_h, n_kv, hd, past, rows, spread)) in [false, true].into_iter().flat_map(|p| shapes.into_iter().map(move |s| (p, s))) {
+    // query heads, Qwen3.5 9B's 16 of 256 on 4 among them, or 8 as two of 4, the one-pass kernel's where 6; a window
+    // the grouped kernel's: Gemma 4's sliding layers' 8 heads of 256 on one within 512, Gemma 3's within 1,024, the
+    // window inside the rows and past them)
+    let shapes = [
+        (8usize, 2usize, 64usize, 300usize, 37usize, 1.0f32, None),
+        (16, 2, 128, 0, 100, 2.0, None),
+        (24, 4, 256, 214, 64, 1.0, None),
+        (24, 4, 256, 1000, 150, 3.0, None),
+        (16, 4, 256, 1000, 150, 3.0, None),
+        (8, 4, 128, 61, 300, 2.0, None),
+        (4, 4, 64, 214, 70, 1.0, None),
+        (8, 1, 256, 700, 200, 1.0, Some(512usize)),
+        (8, 1, 256, 0, 600, 1.0, Some(512)),
+        (8, 4, 256, 1200, 100, 1.0, Some(1024)),
+        (16, 2, 128, 40, 300, 2.0, Some(17)),
+    ];
+    for (planted, (n_h, n_kv, hd, past, rows, spread, window)) in [false, true].into_iter().flat_map(|p| shapes.into_iter().map(move |s| (p, s))) {
         let (qd, row, kv_len) = (n_h * hd, 2 * n_kv * hd, past + rows);
         let mut next = rng((qd + past) as u32);
         let q: Vec<f32> = (0..rows * qd).map(|_| next() * spread).collect();
@@ -374,8 +388,8 @@ fn a_prompts_attention_on_the_tensor_cores_is_the_f32_kernels() {
         let len = b.attention_rows_out_len(rows, n_h, hd, kv_len);
         let (want, got) = (b.vec(len), b.vec(len));
         let mut rec = Recorder::new(&b);
-        rec.attention_rows_f32(&qv, &kv, &want, rows, n_h, n_kv, hd, past, None, scale);
-        assert!(rec.attention_rows_coop(&qv, &kv, &got, rows, n_h, n_kv, hd, past, None, scale), "on the tensor cores");
+        rec.attention_rows_f32(&qv, &kv, &want, rows, n_h, n_kv, hd, past, window, scale);
+        assert!(rec.attention_rows_coop(&qv, &kv, &got, rows, n_h, n_kv, hd, past, window, scale), "on the tensor cores");
         rec.read_range(&want, 0, rows * qd);
         rec.read_range(&got, 0, rows * qd);
         let r = Box::new(rec).finish();
@@ -385,7 +399,7 @@ fn a_prompts_attention_on_the_tensor_cores_is_the_f32_kernels() {
         let cos = dot / (norm(got) * norm(want));
         let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-        eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past}{}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}", if planted { ", keys planted" } else { "" });
+        eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past}, window {window:?}{}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}", if planted { ", keys planted" } else { "" });
         let (least, most) = if planted { (0.9999, 3e-2) } else { (0.99999, 4e-3) };
         assert!(cos > least && worst <= most * top, "{n_h} heads {hd} wide, {rows} rows after {past}: cosine {cos}, worst {worst} of {top}");
     }
@@ -778,6 +792,49 @@ fn halves_alone_case(n_h: usize) {
     assert!(got[0].iter().any(|v| *v != 0.0), "values to compare");
     // (read where they lie, by the one pass's kernel over rows as they are: the f32 cache's tiled copy's sums, to the bit)
     assert_eq!(bits(&got[1]), bits(&got[0]), "a prompt's attention over the halves is the f32 cache's");
+}
+
+/// A causal attention of heads 384 and 512 wide (Gemma 4's global layers' 512, 8 query heads on one KV head) as
+/// matmuls on the tensor cores ([`Recorder::attention_rows_wide`] with its mask) gives the f32 runs' kernel's within
+/// f16's rounding: from the cache's start and past it, within a window and not, the window inside the rows.
+#[test]
+fn a_wide_heads_causal_attention_is_the_runs_kernels() {
+    let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+    if !b.gpu.coop16() {
+        return;
+    }
+    for (n_h, n_kv, hd, past, rows, window) in [
+        (8usize, 1usize, 512usize, 300usize, 200usize, None),
+        (8, 1, 512, 700, 100, Some(512usize)),
+        (8, 1, 512, 0, 600, Some(512)),
+        (2, 1, 384, 0, 64, None),
+        (4, 2, 512, 33, 17, Some(20)),
+    ] {
+        let kv_len = past + rows;
+        let (qd, row) = (n_h * hd, 2 * n_kv * hd);
+        let mut next = rng((qd + past + rows) as u32);
+        let q: Vec<f32> = (0..rows * qd).map(|_| next() * 0.5).collect();
+        let cache: Vec<f32> = (0..kv_len * row).map(|_| next() * 0.5).collect();
+        let (qv, kv) = (b.vec(rows * qd), b.vec(kv_len * row));
+        DeviceChain::upload(&b, &qv, &q);
+        DeviceChain::upload(&b, &kv, &cache);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let (want, got) = (b.vec(attention_runs_out_len(rows, n_h, hd, kv_len)), b.vec(b.attention_rows_out_len(rows, n_h, hd, kv_len)));
+        let mut rec = Recorder::new(&b);
+        rec.attention_rows_runs(&qv, &kv, &want, rows, n_h, n_kv, hd, past, window, scale, false);
+        ChainRecorder::attention_rows(&mut rec, &qv, &kv, &got, rows, n_h, n_kv, hd, past, window, scale);
+        rec.read_range(&want, 0, rows * qd);
+        rec.read_range(&got, 0, rows * qd);
+        let r = Box::new(rec).finish();
+        let (want, got) = (&r[0], &r[1]);
+        let dot: f64 = got.iter().zip(want).map(|(a, e)| *a as f64 * *e as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (norm(got) * norm(want));
+        let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows, past {past}, window {window:?}: cosine {cos:.7}, worst {worst:.2e} of {top:.3}");
+        assert!(cos > 0.99999 && worst <= 4e-3 * top, "{n_h} heads {hd} wide, {rows} rows, past {past}, window {window:?}: cosine {cos}, worst {worst} of {top}");
+    }
 }
 
 /// A full attention of heads wider than the tiled kernels take ([`Recorder::attention_rows_wide`], as matmuls on the

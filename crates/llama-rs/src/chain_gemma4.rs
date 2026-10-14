@@ -48,11 +48,21 @@ impl Held {
     /// `y[r] = W x[r]` for `rows` rows (`one`: a decode step's single row, by the matrix-vector kernels).
     fn rows(&self, w: &Weight, r: &mut dyn ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize, one: bool) {
         match (self, w) {
-            (Held::F16 { w, n, k }, _) => r.matmul_f16_rows_f32(w, *n, *k, x, y, rows),
-            (Held::F32 { w, n, k }, _) => r.matmul_f32_rows(w, *n, *k, x, y, rows),
             (Held::Packed, Weight::Quant(q)) if one => r.matmul(q, x, y),
             (Held::Packed, Weight::Quant(q)) => r.matmul_rows(q, x, y, rows),
-            _ => unreachable!("the chain state checked every weight"),
+            (Held::Packed, _) => unreachable!("the chain state checked every weight"),
+            _ => self.own_rows(r, x, y, rows),
+        }
+    }
+
+    /// [`Self::rows`] of a weight uploaded here: a prompt's rows on the tensor cores (its inputs scaled into f16's
+    /// range), a step's row exactly.
+    fn own_rows(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        match self {
+            Held::F16 { w, n, k } if rows > 1 => r.matmul_f16_rows_ranged(w, *n, *k, x, y, rows),
+            Held::F16 { w, n, k } => r.matmul_f16_rows_f32(w, *n, *k, x, y, rows),
+            Held::F32 { w, n, k } => r.matmul_f32_rows(w, *n, *k, x, y, rows),
+            Held::Packed => unreachable!("a packed weight is the model's"),
         }
     }
 }
@@ -108,8 +118,8 @@ struct Kv {
 
 struct State {
     layers: Vec<Layer>,
-    /// `per_layer_model_proj` over `sqrt(d)`, `[n_layers * pld, d]` (f32).
-    ple_proj: Option<(DeviceVec, usize, usize)>,
+    /// `per_layer_model_proj` over `sqrt(d)`, `[n_layers * pld, d]`.
+    ple_proj: Option<Held>,
     /// The PLE projection's norm over `sqrt(2)` (the inputs' scale folded in).
     ple_norm: DeviceVec,
     /// Ones, a V norm's weight.
@@ -198,7 +208,8 @@ impl State {
                 let s = 1.0 / (cfg.embedding_dim as f32).sqrt();
                 let w: Vec<f32> = w.iter().map(|v| v * s).collect();
                 let n: Vec<f32> = host(&g.per_layer_proj_norm).iter().map(|v| v * std::f32::consts::FRAC_1_SQRT_2).collect();
-                (Some((vector(chain, &w), cfg.n_layers * pld, cfg.embedding_dim)), vector(chain, &n))
+                let w = Weight::Dense(Tensor::from_vec(w, vec![cfg.n_layers * pld, cfg.embedding_dim]));
+                (Some(Held::of(chain, &w)?), vector(chain, &n))
             }
             _ => (None, vector(chain, &[0.0])),
         };
@@ -389,8 +400,8 @@ impl Gemma4Chain {
             rec.keep_groups(false);
         }
         let r = rec.as_mut();
-        if let (Some(pli), Some((pp, pn, ..)), Some((pw, n, k))) = (pli, ple_bufs, &st.ple_proj) {
-            r.matmul_f32_rows(pw, *n, *k, xs, pp, t);
+        if let (Some(pli), Some((pp, pn, ..)), Some(pm)) = (pli, ple_bufs, &st.ple_proj) {
+            pm.own_rows(r, xs, pp, t);
             r.rmsnorm_rows(pp, &st.ple_norm, pn, t * cfg.n_layers, cfg.rms_eps);
             r.add(pli, pn);
         }

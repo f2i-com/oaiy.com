@@ -700,7 +700,9 @@ pub(in crate::chain) fn attention_coop_one_masked(hd: usize) -> String {
 /// scaled down to it through the output).
 pub(in crate::chain) const ATTENTION_COOP_GROUPED: &str = r#"enable f16;
 enable wgpu_cooperative_matrix;
-struct Params { n_h: u32, n_kv: u32, past: u32, rows: u32, kv_len: u32, scale: u32, _pad0: u32, _pad1: u32, }
+// (`window`: the positions a query sees, the last so many to its own, 0 every one; `dup`: the virtual KV heads a
+// cache's KV head is, 8 query heads on one taken as two of 4, 0 or 1 none)
+struct Params { n_h: u32, n_kv: u32, past: u32, rows: u32, kv_len: u32, scale: u32, window: u32, dup: u32, }
 @group(0) @binding(0) var<storage, read> kv4: array<vec4<f16>>;
 @group(0) @binding(1) var<storage, read> q16: array<f16>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
@@ -732,9 +734,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let qs = p.n_h * HD;
     let scale = bitcast<f32>(p.scale);
     // a position's row of the cache in vec4s (its keys, then its values `kvd4` on), the KV head's keys in it
-    let row4 = p.n_kv * HD / 2u;
-    let kvd4 = p.n_kv * HD / 4u;
-    let kho4 = kh * HD / 4u;
+    let dup = max(p.dup, 1u);
+    let row4 = (p.n_kv / dup) * HD / 2u;
+    let kvd4 = (p.n_kv / dup) * HD / 4u;
+    let kho4 = (kh / dup) * HD / 4u;
     // the subgroup's rows: row group rg (a head's 16 positions), and its half of the block's keys and of the head
     let rg = sg / 2u;
     let half = sg % 2u;
@@ -746,6 +749,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let th = kh * G + (tr / 16u) / (P / 16u);
     let tpos = q0 + ((tr / 16u) % (P / 16u)) * 16u + tr % 16u;
     let qpos = p.past + tpos;
+    // the first position the thread's query sees (its window's), and the first block any of the workgroup's does
+    let qlo = select(0u, qpos + 1u - p.window, p.window > 0u && qpos + 1u > p.window);
+    let kb0 = select(0u, p.past + q0 + 1u - p.window, p.window > 0u && p.past + q0 + 1u > p.window) / 32u;
     let r4 = tr * 4u;
     let yb = tpos * qs + th * HD + tq * (HD / 4u);
     // the blocks the last position sees
@@ -762,14 +768,14 @@ DECLARE_STAGE
     var l = 0.0;
     // the first block staged
     {
-        let kb = 0u;
+        let kb = kb0;
 STAGE_LOAD_K
 STAGE_LOAD_V
 STAGE_STORE_K
 STAGE_STORE_V
     }
     workgroupBarrier();
-    for (var kb = 0u; kb < blocks; kb++) {
+    for (var kb = kb0; kb < blocks; kb++) {
         // the next block's loads (the last's own again past the end), in flight as this one is multiplied
         {
             let kb = min(kb + 1u, blocks - 1u);
@@ -804,8 +810,8 @@ STORES
 /// weights (f16) into `p_sh` and their sum into `l`.
 const ATTENTION_COOP_GROUPED_SOFTMAX: &str = r#"        let k0 = vec4<u32>(kb * 32u + tq * 8u) + vec4<u32>(0u, 1u, 2u, 3u);
         let k1 = k0 + vec4<u32>(4u);
-        let v0 = select(none, s_sh[tr * 9u + tq * 2u] * scale, (k0 <= vec4<u32>(qpos)) & (k0 < vec4<u32>(p.kv_len)));
-        let v1 = select(none, s_sh[tr * 9u + tq * 2u + 1u] * scale, (k1 <= vec4<u32>(qpos)) & (k1 < vec4<u32>(p.kv_len)));
+        let v0 = select(none, s_sh[tr * 9u + tq * 2u] * scale, (k0 <= vec4<u32>(qpos)) & (k0 < vec4<u32>(p.kv_len)) & (k0 >= vec4<u32>(qlo)));
+        let v1 = select(none, s_sh[tr * 9u + tq * 2u + 1u] * scale, (k1 <= vec4<u32>(qpos)) & (k1 < vec4<u32>(p.kv_len)) & (k1 >= vec4<u32>(qlo)));
         let bm = max(v0, v1);
         let tm = max(max(bm.x, bm.y), max(bm.z, bm.w));
         m_sh[li] = tm;

@@ -909,9 +909,17 @@ On an NVIDIA A2 (Vulkan, held at 1,200 MHz), Gemma 4 E2B Q4_K_M, greedy:
 |---|---:|---:|
 | Decode | 5.7 tok/s | 46-47 tok/s at 300 tokens of context, 37 at 3,000 |
 | A 21-token prompt | 3.6 s | 0.2-0.6 s |
-| A 2,733-token prompt | | 5.5 s |
+| A 3,000-token prompt | | 3.0 s (6.0 before its attention went on the tensor cores, below) |
 
-Both give the same greedy replies. A dense model's state is its attention cache, so a
+Both give the same greedy replies. A prompt's attention on the tensor cores takes
+Gemma 4's shapes too: its sliding layers' (a window, and 8 query heads on one KV head,
+run as two virtual KV heads of 4 in `attention_coop_grouped`, each query masked to its
+window and the blocks before the first query's window skipped) and its global layers'
+heads of 512 (as matmuls, `attention_rows_wide` with a causal mask,
+`SOFTMAX_ROWS_CAUSAL`): of a 3,000-token prompt's GPU time, 1.88 s on the f32 tiles
+for the global layers and 0.81 s for the sliding ones became some 0.25 s and 0.2 s.
+Gemma 3's local layers take the grouped kernel with their window the same way. The PLE
+matrices of a prompt's rows go on the tensor cores too (`matmul_f16_rows_ranged`). A dense model's state is its attention cache, so a
 prompt that diverges partway (a conversation's next turn, whose last reply the
 template writes back) keeps the shared part and reads only what follows.
 
