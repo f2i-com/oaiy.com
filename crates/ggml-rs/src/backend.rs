@@ -147,6 +147,12 @@ pub trait Backend: Send + Sync + Debug + 'static {
     fn name(&self) -> &str;
     /// Keep unfused mapped weights available for host/SSD streaming.
     fn streams_weights(&self) -> bool { false }
+    /// VENDORED-LOCAL: whether `w`, as this backend holds it, is sent to its device as it is used (past the device's
+    /// budget: WebGPU's weights in their file), not kept there.
+    fn weight_streamed(&self, w: &crate::QuantizedTensor) -> bool {
+        let _ = w;
+        false
+    }
 
     // VENDORED-LOCAL: MOE-01 — downcast support so model code can reach
     // backend-specific fast paths (the CUDA grouped-MoE kernels) without

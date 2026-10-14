@@ -974,6 +974,18 @@ A reply is the bus's: its bytes past the budget at some 2.2 GB a second (the CPU
 alone replied at 0.36 tokens a second with the 9B, so it is no help here). A card on
 PCIe 4 x16 takes them some ten times as fast.
 
+Qwen3.5's layers go to the device as each is read, its embeddings and head first (the
+head, used every token, within the budget), and a layer whose fused FFN gate and up
+would be streamed takes the two halves as the file maps them instead: the 27B's load
+peaked at 5.5-6.3 GB of the process's own (anonymous) memory, every layer's fused copy
+held at once, and now at 0.3 GB (0.5-0.9 GB once it has replied), the streamed weights
+in the system's page cache, which it can drop and read again. Held to 4 GB of system
+memory (a cgroup's `MemoryMax`, the file's pages evicted first; 5 and 6 GB had failed
+to load), the 27B loaded in 19 s with 3.5 of its 15.6 GB in memory and replied at
+2.9 s a token. A large write goes through the host's memory even where the feed
+holds pieces (they are submitted first), where it was handed to the feed through the
+queue's staging: the 27B's load 18.2 to 16.7 s.
+
 ## Qwen3.5 and Qwen3.8 27B on the GPU (2026-10-05)
 
 Qwen3.5's hybrid (Qwen3.5 4B, 9B and 27B, Qwen3.8 27B: `llama-rs`'s

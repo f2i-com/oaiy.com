@@ -276,9 +276,14 @@ impl Gpu {
             let s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
             s.gone < s.handed && s.failed.is_none()
         };
-        if holds {
+        // (a large write where the queue's staging memory is slow: the feed's pieces submitted first, then through the
+        // host's memory in turn. Handed to the feed, it went through the queue's staging, 0.21 GB/s on an NVIDIA A2
+        // over Thunderbolt 3, a copy of it held until then: a 27B model's load reached 5.5 GB of the host's memory)
+        let large = data.len() >= HOST_WRITE_MIN && self.host_staging();
+        if holds && !large {
             self.hand(Fare::Write(buffer.clone(), offset, data.to_vec()));
-        } else if data.len() >= HOST_WRITE_MIN && self.host_staging() {
+        } else if large {
+            self.settle();
             self.write_through_host(buffer, offset, data.len(), &|from, part| part.copy_from_slice(&data[from..from + part.len()]));
         } else if data.len() < WRITE_BY_PIECES || whole_writes() {
             write_bytes(self.queue(), buffer, offset, data);

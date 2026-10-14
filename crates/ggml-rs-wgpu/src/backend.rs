@@ -38,6 +38,9 @@ impl Backend for WgpuBackend {
     fn to_device_quant(&self, w: QuantizedTensor) -> QuantizedTensor {
         self.upload(w)
     }
+    fn weight_streamed(&self, w: &QuantizedTensor) -> bool {
+        w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).is_some_and(|q| q.file.is_some() || q.host)
+    }
     fn try_to_device_quant(&self, w: QuantizedTensor, _safety_margin_bytes: usize) -> QuantizedTensor {
         // The budget is the whole weight allowance; activations live on the host.
         self.upload(w)

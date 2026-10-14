@@ -368,7 +368,32 @@ impl Qwen35Model {
         };
         let output_norm = idx.take("output_norm.weight", &["norm.weight"])?;
 
+        // Move embeddings + LM head onto the backend (tied path shares Arc). VENDORED-LOCAL: before the layers, which
+        // go to it as each is read: the head, used for every token, within the device's budget
+        let (tok_embd, output) = if let Some(table) = tok_embd {
+            let (table, head) = upload_tok_embd_and_lm_head(&*backend, table, output);
+            (Some(table), head)
+        } else { (None, output) };
+        let output_norm = backend.to_device(output_norm);
+        let output      = output.to_device(&*backend);
+
         // ----- Per-layer block tensors ---------------------------------
+        // VENDORED-LOCAL: a layer's FFN gate and up fused into one weight, on the device; where that one is past the
+        // device's budget and sent to it as it is used, the two halves as the file maps them instead (the fused copy
+        // was the host's memory, held; the file's pages the system keeps or reads again from the drive)
+        let ffn_pair = |i: usize| -> Result<FfnPair> {
+            let take = |name: &str| idx.take_weight(&format!("blk.{i}.{name}.weight"), &[]);
+            if backend.streams_weights() {
+                return Ok(FfnPair::Split { gate: take("ffn_gate")?, up: take("ffn_up")? });
+            }
+            let fused = FfnPair::from_halves(take("ffn_gate")?, take("ffn_up")?).try_to_device(&*backend, VRAM_SAFETY_MARGIN_BYTES);
+            let streamed = matches!(&fused, FfnPair::Fused(Weight::Quant(q)) if backend.weight_streamed(q));
+            if !streamed {
+                return Ok(fused);
+            }
+            drop(fused);
+            Ok(FfnPair::Split { gate: take("ffn_gate")?, up: take("ffn_up")? }.try_to_device(&*backend, VRAM_SAFETY_MARGIN_BYTES))
+        };
         let mut blocks = Vec::with_capacity(config.n_layers);
         for (i, &is_attn) in attention_layers.iter().enumerate() {
             let blk = if is_attn {
@@ -381,11 +406,7 @@ impl Qwen35Model {
                     attn_v:      idx.take_weight(&format!("blk.{i}.attn_v.weight"), &[])?,
                     attn_output: idx.take_weight(&format!("blk.{i}.attn_output.weight"), &[])?,
                     post_norm:   idx.take(&format!("blk.{i}.post_attention_norm.weight"), &[])?,
-                    ffn_pair:    {
-                        let g = idx.take_weight(&format!("blk.{i}.ffn_gate.weight"), &[])?;
-                        let u = idx.take_weight(&format!("blk.{i}.ffn_up.weight"),   &[])?;
-                        if backend.streams_weights() { FfnPair::Split {gate:g, up:u} } else { FfnPair::from_halves(g, u) }
-                    },
+                    ffn_pair:    ffn_pair(i)?,
                     ffn_down:    idx.take_weight(&format!("blk.{i}.ffn_down.weight"), &[])?,
                 }
             } else {
@@ -403,25 +424,14 @@ impl Qwen35Model {
                     ssm_norm:    idx.take(&format!("blk.{i}.ssm_norm.weight"), &[])?,
                     ssm_out:     idx.take_weight(&format!("blk.{i}.ssm_out.weight"), &[])?,
                     post_norm:   idx.take(&format!("blk.{i}.post_attention_norm.weight"), &[])?,
-                    ffn_pair:    {
-                        let g = idx.take_weight(&format!("blk.{i}.ffn_gate.weight"), &[])?;
-                        let u = idx.take_weight(&format!("blk.{i}.ffn_up.weight"),   &[])?;
-                        if backend.streams_weights() { FfnPair::Split {gate:g, up:u} } else { FfnPair::from_halves(g, u) }
-                    },
+                    ffn_pair:    ffn_pair(i)?,
                     ffn_down:    idx.take_weight(&format!("blk.{i}.ffn_down.weight"), &[])?,
                 }
             };
-            blocks.push(blk);
+            // each layer to the device as it is read (all of them read first held every layer's fused FFN copy at once:
+            // 6.3 GB of the host's memory for a 27B's load)
+            blocks.push(upload_block(blk, &*backend));
         }
-
-        // Move embeddings + LM head onto the backend (tied path shares Arc).
-        let (tok_embd, output) = if let Some(table) = tok_embd {
-            let (table, head) = upload_tok_embd_and_lm_head(&*backend, table, output);
-            (Some(table), head)
-        } else { (None, output) };
-        let output_norm = backend.to_device(output_norm);
-        let output      = output.to_device(&*backend);
-        let blocks: Vec<Qwen35Block> = blocks.into_iter().map(|b| upload_block(b, &*backend)).collect();
 
         Ok(Self {
             config, ssm_cfg, attention_layers,
