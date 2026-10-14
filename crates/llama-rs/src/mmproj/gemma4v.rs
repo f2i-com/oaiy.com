@@ -192,9 +192,21 @@ impl Gemma4VMmProj {
                 "image shape {:?} is not [3, h, w] with each side a multiple of {side}", image.shape()
             )));
         }
-        crate::chain_gemma4v::forward(self, image).ok_or_else(|| LlamaError::Config(
-            "Gemma 4's vision tower runs on a GPU (WebGPU), and this backend has none for it".into(),
-        ))
+        crate::chain_gemma4v::forward(self, image).ok_or_else(|| LlamaError::Config(match self.quantized() {
+            // (the chain takes the projector's matrices as the checkpoint has them, f16 on the device: a quantized
+            // mmproj loads, and every picture would otherwise be refused for a GPU that is there)
+            Some(dtype) => format!("this Gemma 4 vision projector is quantized ({dtype:?}): its tower runs from an F16, BF16 or F32 mmproj"),
+            None => "Gemma 4's vision tower runs on a GPU (WebGPU), and this backend has none for it".into(),
+        }))
+    }
+
+    /// The type of the first of the tower's matrices that is quantized (an mmproj in Q8_0 or a K-quant), if any.
+    fn quantized(&self) -> Option<ggml_quants::GgmlType> {
+        let blocks = self.blocks.iter().flat_map(|b| [&b.attn_q, &b.attn_k, &b.attn_v, &b.attn_out, &b.ffn_gate, &b.ffn_up, &b.ffn_down]);
+        blocks.chain([&self.projector.input_projection]).find_map(|w| match w {
+            Weight::Quant(q) => Some(q.dtype()),
+            _ => None,
+        })
     }
 }
 
