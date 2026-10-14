@@ -272,6 +272,13 @@ impl Recorder<'_> {
             return false;
         }
         let x16 = self.x16_tiled(x, m, k);
+        self.matmul_f16_coop_x16(w, n, k, &x16, y, m, split);
+        true
+    }
+
+    /// [`Self::matmul_f16_coop`] of `x16`, `m` rows already as [`crate::shaders::X_F16_TILED`] gives them.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_f16_coop_x16(&mut self, w: &DeviceVec, n: usize, k: usize, x16: &DeviceVec, y: &DeviceVec, m: usize, split: Option<u32>) {
         let tile = crate::shaders::COOP_TILE;
         let pipeline = if split_f16_on(self.gpu()) {
             self.gpu().named_pipeline("chain-coop-split-f16", || crate::shaders::coop_split_f16(0))
@@ -281,8 +288,47 @@ impl Recorder<'_> {
         let tiles = (n as u32).div_ceil(tile) * (m as u32).div_ceil(tile);
         let (splits, out, parts) = self.coop_parts(tiles, k, m, n, y, split);
         let words = [k as u32, n as u32, m as u32, 0, n as u32, 0, splits, 0];
-        self.dispatch_kept(&pipeline, buffer(w), buffer(&x16), &out, &words, ((n as u32).div_ceil(tile), (m as u32).div_ceil(tile), splits));
+        self.dispatch_kept(&pipeline, buffer(w), buffer(x16), &out, &words, ((n as u32).div_ceil(tile), (m as u32).div_ceil(tile), splits));
         self.coop_sum(parts, m, n, y, splits);
+    }
+
+    /// [`ChainRecorder::matmul_f16_rows_ranged`] on the tensor cores: `x`'s largest found on the device, `x` as tiled f16
+    /// scaled by the power of two that keeps it within 16,384 (the copy and its scale kept for every matmul that reads
+    /// `x` until something writes it: a layer's q, k and v from one norm), [`Self::matmul_f16_coop`]'s kernel, its sums
+    /// scaled back. False where the device has no cooperative matrices.
+    pub(crate) fn matmul_f16_scaled(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, m: usize) -> bool {
+        if !self.gpu().coop16() || k % 4 != 0 || m.div_ceil(crate::shaders::COOP_TILE as usize) > 65535 {
+            return false;
+        }
+        // (kept with the plain copies, a width of its own: k with the top bit, and its scale beside it with the next)
+        let (key, scale_key) = (k | 1 << 31, k | 3 << 30);
+        let xb = buffer(x).clone();
+        let kept = |rec: &Self, key: usize| rec.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key).map(|(.., v)| v.clone());
+        let (x16, range) = match (kept(self, key), kept(self, scale_key)) {
+            (Some(x16), Some(range)) => (x16, range),
+            _ => {
+                let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+                let range = self.scratch(4);
+                let len = (m * k) as u32;
+                self.dispatch_wide("chain-f16-range-clear", F16_RANGE_CLEAR, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
+                self.dispatch_wide("chain-f16-range-max", F16_RANGE_MAX, [buffer(x), &d, &d, &d, &d, &d, buffer(&range), &drw], &[len], grid(len.div_ceil(256)));
+                self.dispatch_wide("chain-f16-range-set", F16_RANGE_SET, [&d, &d, &d, &d, &d, &d, buffer(&range), &drw], &[0], (1, 1, 1));
+                let tile = crate::shaders::COOP_TILE;
+                let padded = (m as u32).div_ceil(tile) * tile;
+                let words = crate::shaders::x_f16_tiled_words(m, k);
+                let x16 = self.scratch(words);
+                let conv = self.gpu().named_pipeline("chain-x-f16-tiled-scaled", crate::shaders::x_f16_tiled_scaled);
+                let groups = (words as u32).div_ceil(256);
+                self.dispatch_kept(&conv, buffer(&range), buffer(x), buffer(&x16), &[k as u32, m as u32, padded], (groups.min(65535), groups.div_ceil(65535), 1));
+                self.x16.push((xb.clone(), m, key, x16.clone()));
+                self.x16.push((xb, m, scale_key, range.clone()));
+                (x16, range)
+            }
+        };
+        self.matmul_f16_coop_x16(w, n, k, &x16, y, m, None);
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let len = (m * n) as u32;
+        self.dispatch_wide("chain-unscale-rows", UNSCALE_ROWS, [buffer(&range), &d, &d, &d, &d, &d, buffer(y), &drw], &[len], grid(len.div_ceil(256)));
         true
     }
 

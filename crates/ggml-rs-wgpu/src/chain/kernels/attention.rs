@@ -1026,38 +1026,35 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
-/// Rows `r0 ..` of `src` (`n` of them, `stride` apart), their columns `at .. at + width`: as f32 rows `width` long
-/// (`half` 0), or as f16 two a word (`half` 1), the rows past `n` to `padded` zeros. An f16 matmul's weights or its
-/// rows for [`Recorder::attention_rows_wide`].
+/// Rows `r0 ..` of `src` (`n` of them, `stride` apart), their columns `at .. at + width`, as rows `out` long (zeros
+/// past `width`): f32 (`half` 0), or f16 two a word (`half` 1, `out` even), the rows past `n` to `padded` zeros. An f16
+/// matmul's weights or its rows for [`Recorder::attention_rows_wide`] (a head padded to 16's).
 pub(in crate::chain) const SLICE_ROWS: &str = r#"
 @group(0) @binding(0) var<storage, read> src: array<f32>;
 @group(0) @binding(6) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
+// column `c` of row `r` (zero past the rows and the columns)
+fn at_rc(r: u32, c: u32) -> f32 {
+    if (r >= p[0].x || c >= p[0].w) { return 0.0; }
+    return src[(p[1].x + r) * p[0].y + p[0].z + c];
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
-    let n = p[0].x;
-    let stride = p[0].y;
-    let at = p[0].z;
-    let width = p[0].w;
-    let r0 = p[1].x;
     let half = p[1].y;
     let padded = p[1].z;
+    let out = p[1].w;
     let i = id.x + id.y * nw.x * 256u;
     if (half == 1u) {
-        let w2 = width / 2u;
+        let w2 = out / 2u;
         if (i >= padded * w2) { return; }
         let r = i / w2;
         let c = (i % w2) * 2u;
-        var v = vec2<f32>(0.0);
-        if (r < n) { v = vec2<f32>(src[(r0 + r) * stride + at + c], src[(r0 + r) * stride + at + c + 1u]); }
-        dst[i] = pack2x16float(v);
+        dst[i] = pack2x16float(vec2<f32>(at_rc(r, c), at_rc(r, c + 1u)));
     } else {
-        if (i >= padded * width) { return; }
-        let r = i / width;
-        var v = 0.0;
-        if (r < n) { v = src[(r0 + r) * stride + at + i % width]; }
-        dst[i] = bitcast<u32>(v);
+        if (i >= padded * out) { return; }
+        dst[i] = bitcast<u32>(at_rc(i / out, i % out));
     }
 }
 "#;

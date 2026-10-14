@@ -787,11 +787,12 @@ fn halves_alone_case(n_h: usize) {
 #[test]
 fn a_wide_heads_full_attention_is_the_hosts() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    if !super::super::attention::wide_attention_for(&b.gpu, 1152) {
+    if !super::super::attention::wide_attention_for(&b.gpu, 1152, 64) {
         return;
     }
     let mut r = rng(57);
-    for (n_h, n_kv, hd, rows, kv_len, planted) in [(1usize, 1usize, 1152usize, 300usize, 300usize, false), (2, 1, 768, 70, 93, false), (1, 1, 1152, 5, 40, false), (1, 1, 544, 200, 333, false), (1, 1, 1152, 130, 130, true)] {
+    // (and a vision tower's heads of 72, as 80 for the scores: Qwen3-VL's 16 of them over its patches)
+    for (n_h, n_kv, hd, rows, kv_len, planted) in [(1usize, 1usize, 1152usize, 300usize, 300usize, false), (2, 1, 768, 70, 93, false), (1, 1, 1152, 5, 40, false), (1, 1, 544, 200, 333, false), (1, 1, 1152, 130, 130, true), (16, 16, 72, 200, 200, false), (4, 4, 72, 100, 100, true)] {
         let (qs, row) = (n_h * hd, 2 * n_kv * hd);
         let q: Vec<f32> = (0..rows * qs).map(|_| r() * 0.2).collect();
         let mut kv: Vec<f32> = (0..kv_len * row).map(|_| r() * 0.2).collect();

@@ -276,6 +276,18 @@ impl ChainRecorder for Recorder<'_> {
         }
     }
 
+    fn matmul_f16_rows_ranged(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        // (OAIY_F16_EXACT=1: the f32 inputs' kernel for these too)
+        static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let exact = *EXACT.get_or_init(|| std::env::var("OAIY_F16_EXACT").is_ok_and(|v| v == "1"));
+        assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows.div_ceil(64) <= 65535, "chain: an f16 matmul [{n}, {k}] of {rows} rows");
+        if rows > 8 && !exact && self.matmul_f16_scaled(w, n, k, x, y, rows) {
+            self.weigh(2.0 * (rows * n) as f64 * k as f64);
+        } else {
+            self.matmul_f16_rows_f32(w, n, k, x, y, rows);
+        }
+    }
+
     fn matmul_bf16_rows_f32(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         assert!(k % 2 == 0 && w.len * 2 >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows.div_ceil(64) <= 65535, "chain: a BF16 matmul [{n}, {k}] of {rows} rows");
         if rows <= 8 && k % 4 == 0 {

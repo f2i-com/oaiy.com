@@ -502,6 +502,14 @@ pub trait ChainRecorder {
     fn matmul_f16_rows_f32(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         self.matmul_f16_rows(w, n, k, x, y, rows)
     }
+    /// [`Self::matmul_f16_rows_f32`] where `x`'s values may go to the matmul as f16 once scaled by a power of two into
+    /// f16's range (its largest at most 16,384), the sums scaled back: f16's precision for each value, the f32
+    /// kernel's range. A device with tensor cores multiplies so (a vision tower's linear layers on WebGPU: some seven
+    /// times as fast); this default is [`Self::matmul_f16_rows_f32`].
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_f16_rows_ranged(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        self.matmul_f16_rows_f32(w, n, k, x, y, rows)
+    }
     /// [`Self::matmul_f16_rows_f32`] of a matrix held as BF16, two values a word as a checkpoint's bytes lie (a
     /// device's vector of the file's bytes): a BF16 value is an f32's upper sixteen bits, so the kernel widens it by
     /// a shift, and the weights need no pass over them on the host.

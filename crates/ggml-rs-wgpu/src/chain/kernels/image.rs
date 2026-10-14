@@ -457,6 +457,20 @@ fn main() {
 }
 "#;
 
+/// `x[i] = x[i] * range[1]` for `i < p[0].x`: a scaled matmul's sums back to their range
+/// ([`Recorder::matmul_f16_scaled`]).
+pub(in crate::chain) const UNSCALE_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> range: array<f32>;
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i < p[0].x) { x[i] = x[i] * range[1]; }
+}
+"#;
+
 /// `x[i] = x[i] * range[1] + b[i % p[0].x]` for `i < p[0].x * p[0].y`: a scaled convolution's sums back to their
 /// range, and its bias.
 pub(in crate::chain) const UNSCALE_BIAS_ROWS: &str = r#"

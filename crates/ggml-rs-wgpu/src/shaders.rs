@@ -491,6 +491,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`X_F16_TILED`] with each value scaled by `range[0]` first (binding 0: [`crate::chain`]'s f16 range, a power of two
+/// that keeps the largest within f16's).
+pub fn x_f16_tiled_scaled() -> String {
+    let src = X_F16_TILED.replace("@group(0) @binding(0) var<storage, read> unused: array<u32>;", "@group(0) @binding(0) var<storage, read> range: array<f32>;");
+    let store = "    q[i] = pack2x16float(v);";
+    assert!(src.contains("range: array<f32>") && src.matches(store).count() == 1, "X_F16_TILED's binding and store");
+    src.replace(store, "    q[i] = pack2x16float(v * range[0]);")
+}
+
 /// The words [`X_F16_TILED`] makes of `rows` tokens of `k` (padded to [`COOP_TILE`] tokens and to a step of 32).
 pub fn x_f16_tiled_words(rows: usize, k: usize) -> usize {
     rows.div_ceil(COOP_TILE as usize) * COOP_TILE as usize * k.div_ceil(32) * 16

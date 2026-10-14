@@ -470,11 +470,18 @@ impl WgpuBackend {
         // step's rows added across them without the workgroup's memory (`Gpu::subgroups32`; OAIY_NO_SUBGROUPS: not
         // asked for)
         let subgroups = if std::env::var_os("OAIY_NO_SUBGROUPS").is_none() && info.subgroup_min_size == 32 && info.subgroup_max_size == 32 { adapter.features() & wgpu::Features::SUBGROUP } else { wgpu::Features::empty() };
+        // (memory in blocks of 8 to 64 MB, a buffer larger than that its own allocation, as large as it: wgpu's
+        // default, blocks of 128 to 256 MB, gave each buffer of 129 MB to 256 MB a 256 MB block of its own, half of it
+        // nobody's. Qwen Image 2.1's 32 blocks' keys and values for a 1024x1024 reference's 4,128 positions, 135 MB
+        // each, took 8.6 GB where they are 4.3, and an edit's prefix filled an NVIDIA A2's 15.6 GB. OAIY_MEMORY_HINTS=
+        // performance: wgpu's default)
+        let memory_hints = if std::env::var("OAIY_MEMORY_HINTS").is_ok_and(|v| v == "performance") { wgpu::MemoryHints::Performance } else { wgpu::MemoryHints::MemoryUsage };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("oaiy"),
             required_features: timestamps | coop | mappable | subgroups,
             required_limits: limits.clone(),
             experimental_features: experimental,
+            memory_hints,
             ..Default::default()
         }))
         .map_err(|e| format!("WebGPU device on {}: {e}", info.name))?;
