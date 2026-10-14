@@ -201,6 +201,9 @@ impl DeviceChain for WgpuBackend {
         // the tensor cores' kernels write their rows padded to 32 (the rows kernel's to 64) and keep nothing else there
         if rows >= 16 && matches!(head_dim, 64 | 128 | 256) && self.gpu.coop16() {
             rows.div_ceil(64) * 64 * n_h * head_dim
+        } else if super::attention::wide_attention_for(&self.gpu, head_dim) {
+            // (a head wider than the tiled kernels take, as matmuls: the output alone)
+            rows * n_h * head_dim
         } else {
             self.attention_rows_out_len(rows, n_h, head_dim, kv_len)
         }

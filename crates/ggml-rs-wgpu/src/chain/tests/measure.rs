@@ -1804,3 +1804,52 @@ fn measure_wide_head_attention() {
         eprintln!("{rows} positions of a head {hd} wide, {}: {:.1} ms ({:.2} TFLOPS)", if tiled { "tiled" } else { "runs" }, s * 1e3, flops / s / 1e12);
     }
 }
+
+/// A 3x3 convolution on the tensor cores at a VAE decoder's shapes (`--ignored --nocapture`; Qwen Image 2.1's at a
+/// 1024x1024 picture: 1,152 channels at 128x128, 256x256's 576, 512x512's 288), against the f16 matmul of the same work
+/// (its pixels the rows, nine taps' channels the inputs): what its implicit im2col costs. An NVIDIA A2 at 1,200 MHz:
+/// the convolutions 4.05, 3.77 and 3.21 TFLOPS; the f16 matmul 4.46 at the first (where the Q4_K split kernel gives 6.9).
+#[test]
+#[ignore = "a measurement"]
+fn measure_conv3x3() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    if !b.gpu.coop16() {
+        return;
+    }
+    let mut next = rng(3);
+    for (h, w, cin, cout) in [(128usize, 128usize, 1152usize, 1152usize), (256, 256, 576, 576), (512, 512, 288, 288)] {
+        let m = h * w;
+        let weights: Vec<f32> = (0..cout * cin * 9).map(|_| next() * 0.05).collect();
+        let wv = DeviceChain::conv_weights(&b, &weights, cout, cin, 3).expect("conv weights");
+        let bias = b.vec(cout);
+        let (x, y) = (b.vec(m * cin), b.vec(m * cout));
+        DeviceChain::upload(&b, &x, &(0..m * cin).map(|_| next()).collect::<Vec<f32>>());
+        let k = 9 * cin;
+        let w16 = DeviceChain::vec_f16_rounded(&b, &(0..cout * k).map(|_| next() * 0.05).collect::<Vec<f32>>()).unwrap();
+        // (the matmul's rows the im2col's: 5.4 GB at 1024x1024's 144 channels, past a buffer; its first 256 rows'
+        // worth of pixels timed and scaled there)
+        let mm_rows = m.min((1usize << 28) / k);
+        let x2 = b.vec(mm_rows * k);
+        let flops = 2.0 * (m * cout * k) as f64;
+        let time = |conv: bool| {
+            let run = || {
+                let mut rec = Recorder::new(&b);
+                if conv {
+                    rec.conv_rows(&wv, &bias, cout, cin, 3, &x, h, w, &y);
+                } else {
+                    rec.matmul_f16_rows(&w16, cout, k, &x2, &y, mm_rows);
+                }
+                rec.read_range(&y, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            t.elapsed().as_secs_f64() / 3.0
+        };
+        let (c, mm) = (time(true), time(false) * m as f64 / mm_rows as f64);
+        eprintln!("{h}x{w}, {cin} to {cout}: the convolution {:.1} ms ({:.2} TFLOPS), the matmul {:.1} ms ({:.2})", c * 1e3, flops / c / 1e12, mm * 1e3, flops / mm / 1e12);
+    }
+}

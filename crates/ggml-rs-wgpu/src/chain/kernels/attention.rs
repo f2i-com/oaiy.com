@@ -980,3 +980,130 @@ pub(in crate::chain) fn attention_group_of(per_kv: usize, head_dim: usize, workg
 pub(in crate::chain) fn attention_group_for(g: usize, head_dim: usize, workgroup_bytes: u32) -> bool {
     matches!(head_dim, 64 | 128 | 256) && (2..=8).contains(&g) && g * (256 - head_dim / 4) <= 1152 && workgroup_bytes >= 26_624
 }
+
+/// [`Recorder::attention_rows_wide`]'s weights: each of `rows` rows of `n` scores (its first `valid` a key's, the rest
+/// padding) times `scale`, less the row's largest, through exp (the largest weight 1: f16's range, for the values'
+/// matmul), in place, padding's weights 0, and the row's sum into `sums`.
+pub(in crate::chain) const SOFTMAX_ROWS_SUMS: &str = r#"
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(7) var<storage, read_write> sums: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let valid = p[0].y;
+    let rows = p[0].z;
+    let scale = bitcast<f32>(p[0].w);
+    let row = wg.x + wg.y * 65535u;
+    if (row >= rows) { return; }
+    let at = row * n;
+    var m = -3.4e38;
+    for (var i = li; i < valid; i += 256u) { m = max(m, x[at + i] * scale); }
+    part[li] = m;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) { part[li] = max(part[li], part[li + s]); }
+        workgroupBarrier();
+    }
+    let top = part[0];
+    workgroupBarrier();
+    var t = 0.0;
+    for (var i = li; i < n; i += 256u) {
+        var e = 0.0;
+        if (i < valid) { e = exp(x[at + i] * scale - top); }
+        x[at + i] = e;
+        t += e;
+    }
+    part[li] = t;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) { part[li] += part[li + s]; }
+        workgroupBarrier();
+    }
+    if (li == 0u) { sums[row] = part[0]; }
+}
+"#;
+
+/// Rows `r0 ..` of `src` (`n` of them, `stride` apart), their columns `at .. at + width`: as f32 rows `width` long
+/// (`half` 0), or as f16 two a word (`half` 1), the rows past `n` to `padded` zeros. An f16 matmul's weights or its
+/// rows for [`Recorder::attention_rows_wide`].
+pub(in crate::chain) const SLICE_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(6) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let n = p[0].x;
+    let stride = p[0].y;
+    let at = p[0].z;
+    let width = p[0].w;
+    let r0 = p[1].x;
+    let half = p[1].y;
+    let padded = p[1].z;
+    let i = id.x + id.y * nw.x * 256u;
+    if (half == 1u) {
+        let w2 = width / 2u;
+        if (i >= padded * w2) { return; }
+        let r = i / w2;
+        let c = (i % w2) * 2u;
+        var v = vec2<f32>(0.0);
+        if (r < n) { v = vec2<f32>(src[(r0 + r) * stride + at + c], src[(r0 + r) * stride + at + c + 1u]); }
+        dst[i] = pack2x16float(v);
+    } else {
+        if (i >= padded * width) { return; }
+        let r = i / width;
+        var v = 0.0;
+        if (r < n) { v = src[(r0 + r) * stride + at + i % width]; }
+        dst[i] = bitcast<u32>(v);
+    }
+}
+"#;
+
+/// `src`'s rows (`n` of them, `stride` apart), their columns `at .. at + width`, transposed into f16 rows `padded` long
+/// (two a word, the columns past `n` zeros): the values as an f16 matmul's weights for [`Recorder::attention_rows_wide`].
+pub(in crate::chain) const TRANSPOSE_F16: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(6) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let n = p[0].x;
+    let stride = p[0].y;
+    let at = p[0].z;
+    let width = p[0].w;
+    let half = p[1].x / 2u;
+    let i = id.x + id.y * nw.x * 256u;
+    if (i >= width * half) { return; }
+    let c = i / half;
+    let r = (i % half) * 2u;
+    var v = vec2<f32>(0.0);
+    if (r < n) { v.x = src[r * stride + at + c]; }
+    if (r + 1u < n) { v.y = src[(r + 1u) * stride + at + c]; }
+    dst[i] = pack2x16float(v);
+}
+"#;
+
+/// `o`'s rows (`rows` of `width`) over their sums, into `y`'s rows `r0 ..` (`stride` apart) at column `at`.
+pub(in crate::chain) const DIVIDE_ROWS_INTO: &str = r#"
+@group(0) @binding(0) var<storage, read> o: array<f32>;
+@group(0) @binding(1) var<storage, read> sums: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let rows = p[0].x;
+    let width = p[0].y;
+    let stride = p[0].z;
+    let at = p[0].w;
+    let r0 = p[1].x;
+    let i = id.x + id.y * nw.x * 256u;
+    if (i >= rows * width) { return; }
+    let r = i / width;
+    y[(r0 + r) * stride + at + i % width] = o[i] / sums[r];
+}
+"#;

@@ -13,6 +13,10 @@ impl Recorder<'_> {
     /// ([`ATTENTION_DISPATCH_FLOPS`]); else in runs joined ([`Self::attention_rows_runs`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_rows_f32_masked(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32, full: bool) {
+        if full && window.is_none() && wide_attention_for(self.gpu(), head_dim) && n_kv > 0 && n_h % n_kv == 0 {
+            self.attention_rows_wide(q, kv, out, rows, n_h, n_kv, head_dim, past, scale);
+            return;
+        }
         if attention_tiled_for(rows, head_dim) {
             let per_row = 4.0 * (if full { past } else { past + rows }).max(1) as f64 * (n_h * head_dim) as f64;
             let tq = attention_tile(head_dim).0;
@@ -20,6 +24,52 @@ impl Recorder<'_> {
             self.attention_rows_tiled(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale, full, chunk);
         } else {
             self.attention_rows_runs(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale, full);
+        }
+    }
+
+    /// A full attention of heads wider than the tiled kernels take ([`wide_attention_for`]: Qwen Image 2.1's VAE's
+    /// single head of 1,152) as matmuls on the tensor cores, a head at a time and its queries a run at a time: the run's
+    /// scores against every key (`Q Kᵀ`, the keys f16 as an f16 matmul's weights), each row's weights (exp, the row's
+    /// largest 1: f16's range) and their sum ([`SOFTMAX_ROWS_SUMS`]), their values (`P V`, the values transposed into the
+    /// weights, [`TRANSPOSE_F16`]), over the sum. The runs' kernel it stands in for read every key and value again for each
+    /// query, its scratch the queries times the runs times the head: a 1024x1024 picture's VAE attention 2.4 s on an
+    /// NVIDIA A2, a 2048x2048 one's scratch 4.9 GB, past the card's largest buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_rows_wide(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32) {
+        let (qs, row) = (n_h * head_dim, 2 * n_kv * head_dim);
+        // (the keys padded to 16: their scores' rows, the values' matmul's sums; padding's weights 0)
+        let kp = kv_len.div_ceil(16) * 16;
+        assert!(rows > 0 && kv_len > 0 && kp <= 65535 && kv.len >= kv_len * row && q.len >= rows * qs && out.len >= rows * qs, "chain: a wide attention's buffers");
+        // a run of queries: its scores at most 64M (256 MB)
+        let run = ((64usize << 20) / kp / 64 * 64).clamp(64, rows.div_ceil(64) * 64);
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let group = n_h / n_kv;
+        for kh in 0..n_kv {
+            let k16 = self.scratch(kp * head_dim / 2);
+            let vt16 = self.scratch(head_dim * kp / 2);
+            let words = [kv_len as u32, row as u32, (kh * head_dim) as u32, head_dim as u32, 0, 1, kp as u32, 0];
+            self.dispatch_wide("chain-slice-rows", SLICE_ROWS, [buffer(kv), &d, &d, &d, &d, &d, buffer(&k16), &drw], &words, grid(((kp * head_dim / 2) as u32).div_ceil(256)));
+            let words = [kv_len as u32, row as u32, ((n_kv + kh) * head_dim) as u32, head_dim as u32, kp as u32, 0, 0, 0];
+            self.dispatch_wide("chain-transpose-f16", TRANSPOSE_F16, [buffer(kv), &d, &d, &d, &d, &d, buffer(&vt16), &drw], &words, grid(((head_dim * kp / 2) as u32).div_ceil(256)));
+            for h in kh * group..(kh + 1) * group {
+                for r0 in (0..rows).step_by(run) {
+                    let m = run.min(rows - r0);
+                    let (qh, scores, sums, o) = (self.scratch(m * head_dim), self.scratch(m * kp), self.scratch(m), self.scratch(m * head_dim));
+                    let words = [m as u32, qs as u32, (h * head_dim) as u32, head_dim as u32, r0 as u32, 0, m as u32, 0];
+                    self.dispatch_wide("chain-slice-rows", SLICE_ROWS, [buffer(q), &d, &d, &d, &d, &d, buffer(&qh), &drw], &words, grid(((m * head_dim) as u32).div_ceil(256)));
+                    self.matmul_f16_rows(&k16, kp, head_dim, &qh, &scores, m);
+                    self.dispatch_wide("chain-softmax-rows-sums", SOFTMAX_ROWS_SUMS, [&d, &d, &d, &d, &d, &d, buffer(&scores), buffer(&sums)], &[kp as u32, kv_len as u32, m as u32, scale.to_bits()], grid(m as u32));
+                    self.matmul_f16_rows(&vt16, head_dim, kp, &scores, &o, m);
+                    let words = [m as u32, head_dim as u32, qs as u32, (h * head_dim) as u32, r0 as u32, 0, 0, 0];
+                    self.dispatch_wide("chain-divide-rows-into", DIVIDE_ROWS_INTO, [buffer(&o), buffer(&sums), &d, &d, &d, &d, buffer(out), &drw], &words, grid(((m * head_dim) as u32).div_ceil(256)));
+                    for v in [qh, scores, sums, o] {
+                        self.done_with(&v);
+                    }
+                }
+            }
+            self.done_with(&k16);
+            self.done_with(&vt16);
         }
     }
 
@@ -372,6 +422,13 @@ impl Recorder<'_> {
 fn halves_in_place() -> bool {
     static IN_PLACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IN_PLACE.get_or_init(|| std::env::var("OAIY_HALVES_TILED").map_or(true, |v| v != "1"))
+}
+
+/// Whether a full attention of heads `head_dim` wide is [`Recorder::attention_rows_wide`]'s: wider than the tiled kernels
+/// take (512), a multiple of 16, on the tensor cores (OAIY_WIDE_ATTENTION=0: the runs' kernel).
+pub(crate) fn wide_attention_for(gpu: &Gpu, head_dim: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    head_dim > 512 && head_dim % 16 == 0 && gpu.coop16() && *ON.get_or_init(|| std::env::var("OAIY_WIDE_ATTENTION").map_or(true, |v| v != "0"))
 }
 
 /// Whether an attention takes [`attention_coop_grouped`]'s kernel where it can (OAIY_ATTENTION_GROUPED=0: not).

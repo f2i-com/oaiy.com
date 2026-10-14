@@ -464,13 +464,13 @@ fn a_hyper_connections_fused_projections_are_their_two_ops() {
             let took = at.elapsed().as_secs_f64();
             println!("{streams} streams of {d}, {rows} rows: the fused projections in {:.1} ms (with their pipelines the first time)", took * 1e3);
             assert!(took < 5.0, "a hyper-connection's fused projections took {took:.1} s: stop and look");
-            // Bit for bit, but the mix under Metal: Apple's compiler joins the fused kernel's multiply and add where it
-            // keeps the two ops' apart (some dozen units in the last place of a small value, one in 1e6 of it), so
-            // there the mix is held to a part in 1e5 and the two before it, which it leaves alone, bit for bit still.
-            let metal = b.gpu.device.adapter_info().backend == wgpu::Backend::Metal;
+            // Bit for bit, but the mix: a shader compiler may join the fused kernel's multiply and add where it keeps
+            // the two ops' apart (Apple's under Metal, NVIDIA's under Vulkan: some dozen units in the last place of a
+            // small value, one in 1e6 of it; an A2's 30 of 64 values at 4 streams of 64), so the mix is held to a part in
+            // 1e5 and the two before it, which no compiler has touched, bit for bit still.
             for (what, (g, w), len) in [("the gated projection", (&got[0], &want[0]), rows * n), ("the write weights", (&got[1], &want[1]), rows * writes), ("the mix", (&got[2], &want[2]), rows * d)] {
                 assert!(w[..len].iter().any(|v| *v != 0.0), "{what}: values to compare");
-                if metal && what == "the mix" {
+                if what == "the mix" {
                     for (i, (g, w)) in g[..len].iter().zip(&w[..len]).enumerate() {
                         assert!((g - w).abs() <= 1e-5 * w.abs() + 1e-7, "{streams} streams of {d}, {rows} rows: {what} {i}: {g} against {w}");
                     }

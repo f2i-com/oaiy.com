@@ -779,3 +779,60 @@ fn halves_alone_case(n_h: usize) {
     // (read where they lie, by the one pass's kernel over rows as they are: the f32 cache's tiled copy's sums, to the bit)
     assert_eq!(bits(&got[1]), bits(&got[0]), "a prompt's attention over the halves is the f32 cache's");
 }
+
+/// A full attention of heads wider than the tiled kernels take ([`Recorder::attention_rows_wide`], as matmuls on the
+/// tensor cores) gives the host's (f64): a VAE's single head of 1,152 over its pixels, two heads of 768 over one KV
+/// head, a few rows (the f16 matmul's other kernels), positions not a multiple of 16, and keys made long (one weight
+/// far past the rest: f16's range at its edge).
+#[test]
+fn a_wide_heads_full_attention_is_the_hosts() {
+    let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+    if !super::super::attention::wide_attention_for(&b.gpu, 1152) {
+        return;
+    }
+    let mut r = rng(57);
+    for (n_h, n_kv, hd, rows, kv_len, planted) in [(1usize, 1usize, 1152usize, 300usize, 300usize, false), (2, 1, 768, 70, 93, false), (1, 1, 1152, 5, 40, false), (1, 1, 544, 200, 333, false), (1, 1, 1152, 130, 130, true)] {
+        let (qs, row) = (n_h * hd, 2 * n_kv * hd);
+        let q: Vec<f32> = (0..rows * qs).map(|_| r() * 0.2).collect();
+        let mut kv: Vec<f32> = (0..kv_len * row).map(|_| r() * 0.2).collect();
+        if planted {
+            for at in [kv_len / 2 + 7, kv_len - 9] {
+                for v in &mut kv[at * row..at * row + n_kv * hd] {
+                    *v *= 30.0;
+                }
+            }
+        }
+        let scale = 1.0 / (hd as f64).sqrt();
+        let mut want = vec![0f64; rows * qs];
+        for s in 0..rows {
+            for h in 0..n_h {
+                let kh = h / (n_h / n_kv);
+                let qv = &q[s * qs + h * hd..s * qs + (h + 1) * hd];
+                let scores: Vec<f64> = (0..kv_len).map(|t| (0..hd).map(|d| qv[d] as f64 * kv[t * row + kh * hd + d] as f64).sum::<f64>() * scale).collect();
+                let m = scores.iter().cloned().fold(f64::MIN, f64::max);
+                let e: Vec<f64> = scores.iter().map(|v| (v - m).exp()).collect();
+                let l: f64 = e.iter().sum();
+                for d in 0..hd {
+                    want[s * qs + h * hd + d] = (0..kv_len).map(|t| e[t] * kv[t * row + (n_kv + kh) * hd + d] as f64).sum::<f64>() / l;
+                }
+            }
+        }
+        let (qd, kvd) = (b.vec(q.len()), b.vec(kv.len()));
+        DeviceChain::upload(&b, &qd, &q);
+        DeviceChain::upload(&b, &kvd, &kv);
+        let out = b.vec(b.attention_rows_full_out_len(rows, n_h, hd, kv_len));
+        assert!(out.len < rows * qs * 2, "the output alone: {} for {}", out.len, rows * qs);
+        let mut rec = Recorder::new(&b);
+        rec.attention_rows_full(&qd, &kvd, &out, rows, n_h, n_kv, hd, kv_len, scale as f32);
+        rec.read_range(&out, 0, rows * qs);
+        let got = Box::new(rec).finish().pop().unwrap();
+        let dot: f64 = got.iter().zip(&want).map(|(a, e)| *a as f64 * e).sum();
+        let norm = |v: &mut dyn Iterator<Item = f64>| v.map(|a| a * a).sum::<f64>().sqrt();
+        let cos = dot / (norm(&mut got.iter().map(|&a| a as f64)) * norm(&mut want.iter().cloned()));
+        let top = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(&want).fold(0f64, |m, (a, e)| m.max((*a as f64 - e).abs()));
+        eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} queries over {kv_len}{}: cosine {cos:.7}, worst {worst:.2e} of {top:.3}", if planted { ", keys planted" } else { "" });
+        let (least, most) = if planted { (0.9999, 3e-2) } else { (0.99999, 4e-3) };
+        assert!(cos > least && worst <= most * top, "{n_h} heads {hd} wide, {rows} over {kv_len}: cosine {cos}, worst {worst} of {top}");
+    }
+}
