@@ -524,6 +524,9 @@ fn backfill(cfg: &mut Json, section: &str, new_name: &str) -> Vec<String> {
 /// the model that needs it (`target`: section and model name, when the UI says).
 pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str, &str)>) -> Result<(Added, Detected), String> {
     let d = detect::detect(path)?;
+    // (a Qwen3-VL GGUF added to a Qwen Image model is its text encoder, whatever the file is called)
+    let to_image = target.is_some_and(|(s, m)| s == "image" && get(cfg, &["media", "image", "models", m]).is_some_and(|e| str_or(e, "architecture", "qwen-image") == "qwen-image"));
+    let d = if to_image { detect::as_qwen_image_encoder(&d, path).unwrap_or(d) } else { d };
     let wanted = name.map(str::to_string).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| detect::model_name(path));
     let added = match &d.role {
         Role::Component { .. } => attach(cfg, &d, target, path)?,
@@ -831,6 +834,33 @@ mod tests {
         assert_eq!(again.name, "qwen3-8b-2");
         std::fs::write(d.join("notes.txt"), b"x").unwrap();
         assert!(add(&mut cfg, &d.join("notes.txt"), None, None).is_err());
+        config::validate(&cfg).unwrap();
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// A Qwen3-VL GGUF added to a Qwen Image model is its text encoder, whatever the file is called (Qwen's own
+    /// `Qwen3VL-8B-Instruct-Q4_K_M.gguf`, the encoder Qwen Image 2.1 ships, as a chat model names it); added to nothing,
+    /// or to another kind of model, it is a chat model as before.
+    #[test]
+    fn a_qwen3_vl_gguf_added_to_a_qwen_image_model_is_its_text_encoder() {
+        let d = tmp("encoder");
+        let mut cfg = config::default_json();
+        let turbo = d.join("Qwen-Image-2.1-Turbo-AD-Q4_K.gguf");
+        gguf(&turbo, "qwen_image21");
+        let (image, _) = add(&mut cfg, &turbo, None, None).unwrap();
+        assert_eq!(image.section, "image");
+        let encoder = d.join("Qwen3VL-8B-Instruct-Q4_K_M.gguf");
+        gguf(&encoder, "qwen3vl");
+        let (a, detected) = add(&mut cfg, &encoder, None, Some(("image", &image.name))).unwrap();
+        assert_eq!((a.section, a.name.as_str(), detected.kind()), ("image", image.name.as_str(), "text_encoder"));
+        let path = get(&cfg, &["media", "image", "models", &image.name, "text_encoder"]).and_then(Json::as_str).unwrap_or_default().to_string();
+        assert!(path.ends_with("Qwen3VL-8B-Instruct-Q4_K_M.gguf"), "{path}");
+        assert!(get(&cfg, &["llm", "models"]).is_none_or(|m| m.len() == 0), "no chat model was added");
+        // Without a Qwen Image model named: a chat model.
+        let (chat, _) = add(&mut cfg, &encoder, None, None).unwrap();
+        assert_eq!(chat.section, "llm");
+        let (chat2, _) = add(&mut cfg, &encoder, None, Some(("image", "no-such-model"))).unwrap();
+        assert_eq!(chat2.section, "llm");
         config::validate(&cfg).unwrap();
         std::fs::remove_dir_all(d).unwrap();
     }

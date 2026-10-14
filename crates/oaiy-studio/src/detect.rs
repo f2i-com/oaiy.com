@@ -97,6 +97,18 @@ fn detected(role: Role, format: &'static str, summary: String, fields: Vec<(&str
     Detected { role, format, summary, fields: fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), missing: Vec::new(), architecture: None, tensor_types: Vec::new(), experts: None }
 }
 
+/// `d`, a Qwen3-VL language model's GGUF (`qwen3vl`, `qwen2vl` or `qwen25vl`), as Qwen Image's text encoder: what the
+/// person asked for in adding it to a Qwen Image model. Qwen Image 2.1's encoder is Qwen3-VL 8B Instruct as Qwen
+/// released it (its tensors the same bytes), so a GGUF of that model named as a chat model's is the encoder too (Qwen's
+/// own `Qwen3VL-8B-Instruct-Q4_K_M.gguf`); a file not named for Qwen Image is otherwise a chat model. None for anything
+/// else.
+pub(crate) fn as_qwen_image_encoder(d: &Detected, path: &Path) -> Option<Detected> {
+    if d.role != Role::Llm || d.format != "gguf" || !matches!(d.architecture.as_deref(), Some("qwen3vl" | "qwen2vl" | "qwen25vl")) {
+        return None;
+    }
+    Some(detected(Role::Component { kind: "text_encoder" }, "gguf", format!("Qwen3-VL text encoder for Qwen Image, quantized GGUF ({})", stem(path)), vec![("text_encoder", path_json(path))]))
+}
+
 /// A path as configuration text. On Windows a path picked with `/` keeps `/`
 /// throughout, rather than gaining `\` where folders were joined onto it.
 pub(crate) fn path_json(p: &Path) -> Json {
@@ -285,7 +297,7 @@ fn gguf_file(path: &Path) -> Result<Detected, String> {
             fields.push(("distilled", Json::Bool(true)));
         }
         let mut d = detected(Role::Image { architecture: "qwen-image" }, "gguf",
-            format!("Qwen Image transformer{}, quantized GGUF ({arch})", if distilled { " (Turbo: 8 steps)" } else { "" }), fields);
+            format!("Qwen Image transformer{}, quantized GGUF{}", if distilled { " (Turbo: 8 steps)" } else { "" }, if arch.is_empty() { String::new() } else { format!(" ({arch})") }), fields);
         d.missing.push("base".into());
         return Ok(d);
     }
