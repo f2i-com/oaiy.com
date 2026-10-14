@@ -13,6 +13,23 @@ use std::path::Path;
 /// The norms' epsilon: Wan's divides by the channels' L2 norm clamped at 1e-12 (an RMS norm with none).
 const EPS: f32 = 1e-12;
 
+/// The rows of the picture a decoded band takes on either side of its own, at the size of the stage it starts at:
+/// past what the decoder's later stages reach (some 14).
+const BAND_HALO: usize = 16;
+
+/// The most bytes one vector of the decoder's later stages may hold before they go a band of rows at a time: the
+/// device's largest binding's nine tenths, at most 1.5 GB (a 1024x1024 picture's largest are 1.2 GB, its decode whole;
+/// a 2048x2048 one's 4.8 GB, past what a binding takes), and an eighth of the card's memory free (a residual block's
+/// vectors at once, its input, shortcut, norms, their f16 copies and its convolutions' outputs, some 4.7 times its
+/// largest: a band of 428 rows at the fourth up block's 512 columns 4.7 GB on an NVIDIA A2). OAIY_VAE_BAND_MB another.
+fn band_bytes(gpu: &ggml_rs_wgpu::WgpuBackend) -> u64 {
+    if let Some(mb) = std::env::var("OAIY_VAE_BAND_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return mb << 20;
+    }
+    let free = gpu.memory_budget().map_or(u64::MAX, |(budget, used)| budget.saturating_sub(used) / 8);
+    (gpu.max_binding() / 10 * 9).min(1536 << 20).min(free.max(64 << 20))
+}
+
 fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
@@ -35,6 +52,11 @@ pub struct WgpuVae {
 }
 
 impl WgpuVae {
+    /// The device it runs on (its memory's budget asked of it; its kept buffers let go).
+    pub fn backend(&self) -> &ggml_rs_wgpu::WgpuBackend {
+        &self.gpu
+    }
+
     /// The decoder of the VAE under `root` (`vae/`, its config's latents' mean and deviation) on GPU `device` (as
     /// CUDA counts them; OAIY_WEBGPU_ADAPTER naming one instead).
     pub fn load(root: &Path, device: usize) -> Result<Self> {
@@ -153,6 +175,12 @@ impl WgpuVae {
     /// The picture of `latent` (`[1, h w, 64]`, the transformer's tokens): `[1, 4, 16 h, 16 w]` (RGBA in -1..1) on the
     /// CPU.
     pub fn decode(&self, latent: &Tensor, h: usize, w: usize) -> Result<Tensor> {
+        self.decode_within(latent, h, w, band_bytes(&self.gpu))
+    }
+
+    /// [`Self::decode`], the decoder's later stages a band of rows at a time where one of their vectors would hold more
+    /// than `limit` bytes.
+    fn decode_within(&self, latent: &Tensor, h: usize, w: usize, limit: u64) -> Result<Tensor> {
         if latent.dims() != [1, h * w, 64] {
             candle_core::bail!("latent must be [1, {}, 64], not {:?}", h * w, latent.dims());
         }
@@ -174,34 +202,122 @@ impl WgpuVae {
         (x, c) = self.residual("decoder.mid_block.resnets.0", &x, h, w, c)?;
         x = self.attention("decoder.mid_block.attentions.0", &x, h, w, c)?;
         (x, c) = self.residual("decoder.mid_block.resnets.1", &x, h, w, c)?;
-        for i in 0..5 {
-            let (before, cin) = (x.clone(), c);
-            for j in 0..3 {
-                (x, c) = self.residual(&format!("decoder.up_blocks.{i}.resnets.{j}"), &x, h, w, c)?;
+        // the up blocks on the whole picture while their vectors fit, the rest a band of rows at a time
+        let mut i = 0;
+        while i < 6 && self.stage_bytes(i, 1, 1) * (h * w) as u64 <= limit {
+            if i == 5 {
+                let (pixels, co) = self.out(&x, h, w, c)?;
+                return Tensor::from_vec(pixels, (1, h, w, co), &Device::Cpu)?.permute((0, 3, 1, 2))?.contiguous();
             }
-            if i < 4 {
-                let mut rec = self.gpu.begin();
-                rec.keep_groups(false);
-                let r = rec.as_mut();
-                let up = self.vec(4 * h * w * c);
-                r.upsample2x_rows(&x, &up, h, w, c);
-                let (y, cout) = self.conv(r, &format!("decoder.up_blocks.{i}.upsampler.resample.1"), &up, 2 * h, 2 * w)?;
-                // Wan's shortcut: the block's input repeated and shuffled into the pixels (the first frame's slot)
-                r.shuffle_up_add_rows(&before, &y, h, w, cin, cout, if i < 3 { 2 } else { 1 });
-                rec.finish();
-                drop((up, before));
-                self.gpu.settle();
-                (x, c, h, w) = (y, cout, 2 * h, 2 * w);
+            (x, c, h, w) = self.up_block(i, &x, h, w, c)?;
+            // (what the block's work kept for the next let go: the vectors it held, freed, would otherwise share the
+            // card with the next block's, four times as many pixels)
+            self.gpu.release_cached();
+            self.say_memory(&format!("up block {i}"));
+            i += 1;
+        }
+        self.gpu.release_cached();
+        let (pixels, co, ph, pw) = self.bands(i, &x, h, w, c, limit)?;
+        Tensor::from_vec(pixels, (1, ph, pw, co), &Device::Cpu)?.permute((0, 3, 1, 2))?.contiguous()
+    }
+
+    /// OAIY_MEDIA_MEMORY: the card's memory this process uses after `stage` said.
+    fn say_memory(&self, stage: &str) {
+        if std::env::var_os("OAIY_MEDIA_MEMORY").is_some() {
+            if let Some((budget, used)) = self.gpu.memory_budget() {
+                eprintln!("decode's memory after {stage}: {:.2} GB used of {:.2}", used as f64 / 1e9, budget as f64 / 1e9);
             }
+        }
+    }
+
+    /// Up block `i` (its residual blocks, then its upsampling where it has one) of a picture `h` by `w` of `c` channels:
+    /// its output, channels and size.
+    fn up_block(&self, i: usize, x: &DeviceVec, h: usize, w: usize, c: usize) -> Result<(DeviceVec, usize, usize, usize)> {
+        let (before, cin) = (x.clone(), c);
+        let (mut x, mut c) = (x.clone(), c);
+        for j in 0..3 {
+            (x, c) = self.residual(&format!("decoder.up_blocks.{i}.resnets.{j}"), &x, h, w, c)?;
+        }
+        if i >= 4 {
+            return Ok((x, c, h, w));
         }
         let mut rec = self.gpu.begin();
         rec.keep_groups(false);
         let r = rec.as_mut();
-        let t = self.norm(r, "decoder.norm_out", &x, h * w, c, true)?;
+        let up = self.vec(4 * h * w * c);
+        r.upsample2x_rows(&x, &up, h, w, c);
+        let (y, cout) = self.conv(r, &format!("decoder.up_blocks.{i}.upsampler.resample.1"), &up, 2 * h, 2 * w)?;
+        // Wan's shortcut: the block's input repeated and shuffled into the pixels (the first frame's slot)
+        r.shuffle_up_add_rows(&before, &y, h, w, cin, cout, if i < 3 { 2 } else { 1 });
+        rec.finish();
+        drop((up, before, x));
+        self.gpu.settle();
+        Ok((y, cout, 2 * h, 2 * w))
+    }
+
+    /// The decoder's last norm and convolution on a picture `h` by `w` of `c` channels, read: its pixels' channels in
+    /// rows, and how many a pixel has.
+    fn out(&self, x: &DeviceVec, h: usize, w: usize, c: usize) -> Result<(Vec<f32>, usize)> {
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let r = rec.as_mut();
+        let t = self.norm(r, "decoder.norm_out", x, h * w, c, true)?;
         let (rgba, co) = self.conv(r, "decoder.conv_out", &t, h, w)?;
         r.read(&rgba);
         let pixels = rec.finish().pop().ok_or_else(|| err("the picture was not read"))?;
-        Tensor::from_vec(pixels, (1, h, w, co), &Device::Cpu)?.permute((0, 3, 1, 2))?.contiguous()
+        Ok((pixels, co))
+    }
+
+    /// The most bytes one vector of decoder stage `i` (up block `i`, 5 the last norm and convolution) holds for a picture
+    /// `h` by `w` (in its pixels as the stage takes them): its residual blocks' widest channels at its size, or its
+    /// upsampling's (four times the pixels, the channels its upsampler's convolution takes and gives).
+    fn stage_bytes(&self, i: usize, h: usize, w: usize) -> u64 {
+        let widest = |prefix: &str| self.convs.iter().filter(|(k, _)| k.starts_with(prefix)).map(|(_, v)| v.cout.max(v.cin)).max().unwrap_or(1);
+        let own = if i < 5 { widest(&format!("decoder.up_blocks.{i}.resnets.")) } else { widest("decoder.conv_out") };
+        let up = if i < 4 { 4 * widest(&format!("decoder.up_blocks.{i}.upsampler.")) } else { 0 };
+        (h * w * own.max(up) * 4) as u64
+    }
+
+    /// Decoder stages `i0 ..` (up blocks, then the last norm and convolution) of a picture `h` by `w` of `c` channels
+    /// (`x`) a band of rows at a time, each with [`BAND_HALO`] rows of the picture on either side (where it has them) and
+    /// cropped to its own: every stage past the middle block works on a pixel's neighbours alone (convolutions 3 wide,
+    /// upsampling, norms, the shuffled shortcut), some 14 rows at `i0`'s size between them. Each band's largest vector
+    /// at most `limit` bytes. Its pixels, their channels and its size.
+    fn bands(&self, i0: usize, x: &DeviceVec, h: usize, w: usize, c: usize, limit: u64) -> Result<(Vec<f32>, usize, usize, usize)> {
+        // a band row's bytes at its largest stage (stage j's rows and width 2^(j - i0) times i0's, to the 4 upsamplings)
+        let grown = |j: usize| 1usize << (j.min(4) - i0.min(4));
+        let per_row = (i0..6).map(|j| self.stage_bytes(j, grown(j), w * grown(j))).max().unwrap_or(1);
+        let band = ((limit / per_row.max(1)) as usize).saturating_sub(2 * BAND_HALO) / 4 * 4;
+        if band < 4 {
+            candle_core::bail!("a {}x{} picture's decode wants more of one buffer than the GPU has", w << (4 - i0.min(4)), h << (4 - i0.min(4)));
+        }
+        let s = grown(5);
+        if std::env::var_os("OAIY_MEDIA_MEMORY").is_some() {
+            eprintln!("decoding a {}x{} picture from up block {i0} in {} bands of {band} rows", w * s, h * s, h.div_ceil(band));
+        }
+        let (mut pixels, mut co) = (Vec::new(), 0);
+        for a in (0..h).step_by(band) {
+            let b = (a + band).min(h);
+            let (lo, hi) = (a.saturating_sub(BAND_HALO), (b + BAND_HALO).min(h));
+            let xb = self.vec((hi - lo) * w * c);
+            let mut rec = self.gpu.begin();
+            rec.as_mut().copy(x, lo * w * c, &xb, 0, (hi - lo) * w * c);
+            rec.finish();
+            let (mut y, mut cy, mut bh, mut bw) = (xb, c, hi - lo, w);
+            for j in i0..5 {
+                (y, cy, bh, bw) = self.up_block(j, &y, bh, bw, cy)?;
+                self.gpu.release_cached();
+            }
+            let (part, k) = self.out(&y, bh, bw, cy)?;
+            drop(y);
+            self.gpu.release_cached();
+            self.say_memory(&format!("the band from row {a}"));
+            co = k;
+            // its own rows: from (a - lo) at i0's size, (b - a) of them
+            let row = bw * co;
+            pixels.extend_from_slice(&part[(a - lo) * s * row..(b - lo) * s * row]);
+        }
+        Ok((pixels, co, h * s, w * s))
     }
 
     /// The latent of `pixels` (`[1, 4, 16 h, 16 w]`, RGBA in -1..1, as the decoder gives them) as the transformer takes
@@ -334,6 +450,29 @@ mod tests {
         Ok(())
     }
 
+    /// A picture decoded a band of rows at a time (its later stages' vectors held to 300 MB and 200 MB: bands of 92 rows
+    /// from the fourth up block, of 8 from the third) is the picture decoded whole: a 512 by 384 one from a random latent
+    /// (`OAIY_QWEN_IMAGE_BASE`), each convolution's input scaled into f16's range by its own band's largest value.
+    #[test]
+    #[ignore = "needs Qwen Image 2.1's VAE (OAIY_QWEN_IMAGE_BASE) and a WebGPU adapter"]
+    fn a_picture_decoded_in_bands_is_the_picture_decoded_whole() -> Result<()> {
+        let Some(base) = std::env::var_os("OAIY_QWEN_IMAGE_BASE").map(std::path::PathBuf::from) else { return Ok(()) };
+        let (h, w) = (24usize, 32usize);
+        let latent: Vec<f32> = (0..h * w * 64).map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32 * 3.4 - 1.7).collect();
+        let latent = Tensor::from_vec(latent, (1, h * w, 64), &Device::Cpu)?;
+        let gpu = WgpuVae::load(&base, 0)?;
+        let whole = gpu.decode_within(&latent, h, w, u64::MAX)?.flatten_all()?.to_vec1::<f32>()?;
+        for limit in [300u64 << 20, 200 << 20] {
+            let banded = gpu.decode_within(&latent, h, w, limit)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(banded.len(), whole.len());
+            let worst = banded.iter().zip(&whole).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let mean = banded.iter().zip(&whole).map(|(a, b)| (a - b).abs() as f64).sum::<f64>() / whole.len() as f64;
+            eprintln!("bands within {} MB: the worst difference {worst:.4}, the mean {mean:.6} (pixels in -1..1)", limit >> 20);
+            assert!(worst < 0.03 && mean < 2e-3, "bands within {} MB: worst {worst}, mean {mean}", limit >> 20);
+        }
+        Ok(())
+    }
+
     /// A picture's decode's time (`--ignored --nocapture`): a random latent of `QWEN_IMAGE_GRID` (64: a 1024 by 1024
     /// picture) a side, from the published VAE (`OAIY_QWEN_IMAGE_BASE`), twice; with OAIY_CHAIN_PROFILE its costliest
     /// kernels.
@@ -345,10 +484,16 @@ mod tests {
         let latent: Vec<f32> = (0..side * side * 64).map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32 * 3.4 - 1.7).collect();
         let latent = Tensor::from_vec(latent, (1, side * side, 64), &Device::Cpu)?;
         let gpu = WgpuVae::load(&base, 0)?;
+        // (OAIY_BALLAST_GB of the card taken first, as a kept worker's other models take it)
+        let ballast: Vec<DeviceVec> = (0..std::env::var("OAIY_BALLAST_GB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0)).map(|_| {
+            let v = gpu.gpu.vec(1 << 28);
+            gpu.gpu.upload(&v, &vec![1f32; 1 << 28]);
+            v
+        }).collect();
         for run in 0..2 {
             let t = std::time::Instant::now();
             gpu.decode(&latent, side, side)?;
-            eprintln!("decode {run}: {:.3} s", t.elapsed().as_secs_f64());
+            eprintln!("decode {run}: {:.3} s ({} GB of ballast)", t.elapsed().as_secs_f64(), ballast.len());
             if std::env::var_os("OAIY_CHAIN_PROFILE").is_some() {
                 for (name, ms, n) in ggml_rs_wgpu::profile::take_kernels().into_iter().take(16) {
                     eprintln!("    {name:36} {ms:9.2} ms {n:6}");

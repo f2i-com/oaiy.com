@@ -190,6 +190,31 @@ kernels. Use one batch for many images to amortize setup; warm per-image timing 
 not first-request latency. (The CUDA build kept a compiled-kernel cache,
 `.cuda-cache`, between jobs.)
 
+## The kept worker, memory and large pictures
+
+OAIY keeps one `oaiy-media --serve` worker between Qwen Image pictures (WebGPU) on this computer's GPU, as it does on
+a Mac's eGPU card: the next picture that names the same files skips loading its text encoder, transformer and VAE
+decoder, and the encoder keeps its layers on the card while it leaves 6 GB free there (otherwise they come from the
+host's memory for each prompt). The worker waits two minutes for another picture. It is let go at once where a
+language model on that GPU runs or waits to come back (a picture that paused it), whenever the language model starts
+(a chat, the page's Start, a changed configuration: `Llm::before_start`), and before any other media job. On an NVIDIA
+A2 in a Thunderbolt 3 enclosure a 1024x1024 Turbo picture took 114 s cold and 97.5 s warm (its prompt encoded in
+0.5 s, where 3.4 with the layers read again).
+
+The worker keeps its models only while they leave a picture room (Vulkan's budget less this process's use): before
+its steps the encoder's kept layers, then a kept VAE decoder, are let go where the card has less free than some
+0.64 MB a latent token; before its decode, the encoder's layers, then a kept transformer, where it has less than some
+1.5 KB a pixel. `OAIY_MEDIA_MEMORY=1` says the process's use at each stage.
+
+The VAE's decoder runs its later stages a band of rows at a time where one of their vectors would hold more than
+1.5 GB, 90% of the GPU's largest binding, or an eighth of the card's free memory (a residual block holds some 4.7
+times its largest vector at once): every stage after the middle block works on a pixel's neighbours alone, so each
+band takes 16 rows of the picture on either side and is cropped to its own, the same pixels as a decode whole. Each
+stage's kept scratch is let go before the next. A 2048x2048 picture's upsampled vectors are 4.8 GB, past what one
+buffer takes; it was made in 587 s (8 steps of 67 s, its decode in 10 bands). Its middle block's attention (one head
+of 1,152 channels over every latent pixel) runs as matmuls on the tensor cores, which also took a 1024x1024 picture's
+from 2.4 s to 16 ms (`OAIY_WIDE_ATTENTION=0`: the f32 kernel, whose scratch at 2048x2048 was 4.9 GB).
+
 ## LoRA adapters
 
 Besides the turbo adapter, a Qwen Image model takes any number of LoRAs, each

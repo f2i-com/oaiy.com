@@ -186,6 +186,8 @@ pub(super) fn condition_endpoints(
 }
 
 pub(super) fn command(path: &std::path::Path) -> Command {
+    // (changed on Windows alone)
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut c = Command::new(path);
     #[cfg(windows)]
     {

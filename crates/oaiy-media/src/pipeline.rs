@@ -254,6 +254,32 @@ impl Encoder {
             Encoder::Wgpu(_) => Json::obj([("device", Json::str("webgpu"))]),
         }
     }
+
+    #[cfg(feature = "webgpu")]
+    fn backend(&self) -> Option<&ggml_rs_wgpu::WgpuBackend> {
+        match self {
+            Encoder::Wgpu(e) => Some(e.backend()),
+            _ => None,
+        }
+    }
+
+    /// Whether WebGPU's encoder keeps its layers on the card between prompts (a kept worker's).
+    fn keep_layers(&mut self, keep: bool) {
+        #[cfg(feature = "webgpu")]
+        if let Encoder::Wgpu(e) = self {
+            e.keep_layers(keep);
+        }
+        let _ = keep;
+    }
+
+    /// The layers it keeps on the card let go: whether it had any.
+    fn let_go_layers(&mut self) -> bool {
+        match self {
+            #[cfg(feature = "webgpu")]
+            Encoder::Wgpu(e) => e.let_go_layers(),
+            _ => false,
+        }
+    }
 }
 
 /// The VAE's decoder on its device: Candle's or the WebGPU chain's.
@@ -270,6 +296,14 @@ impl Decoder {
             Decoder::Candle(v) => v.decode(latent, h, w),
             #[cfg(feature = "webgpu")]
             Decoder::Wgpu(v) => v.decode(latent, h, w),
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    fn backend(&self) -> Option<&ggml_rs_wgpu::WgpuBackend> {
+        match self {
+            Decoder::Wgpu(v) => Some(v.backend()),
+            _ => None,
         }
     }
 }
@@ -307,6 +341,14 @@ impl Model {
             Model::Candle(_) => {}
             #[cfg(feature = "webgpu")]
             Model::Wgpu(m) => m.release_scratch(),
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    fn backend(&self) -> Option<&ggml_rs_wgpu::WgpuBackend> {
+        match self {
+            Model::Wgpu(m) => Some(m.backend()),
+            _ => None,
         }
     }
 
@@ -383,6 +425,31 @@ impl Kept {
     pub fn holds(&self) -> Vec<&str> {
         [self.encoder.as_ref().map(|_| "text encoder"), self.model.as_ref().map(|_| "transformer"), self.decoder.as_ref().map(|_| "decoder")].into_iter().flatten().collect()
     }
+}
+
+/// OAIY_MEDIA_MEMORY: the card's memory this process uses at `stage` said (Vulkan's budget and use).
+#[cfg(feature = "webgpu")]
+fn say_memory(stage: &str, gpu: Option<&ggml_rs_wgpu::WgpuBackend>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("OAIY_MEDIA_MEMORY").is_some()) {
+        if let Some((budget, used)) = gpu.and_then(|g| g.memory_budget()) {
+            eprintln!("memory at {stage}: {:.2} GB used of {:.2}", used as f64 / 1e9, budget as f64 / 1e9);
+        }
+    }
+}
+
+/// What a picture's work takes of the card past the models a kept worker holds (on an NVIDIA A2, a 1024x1024
+/// picture's: its steps' vectors 2.1 GB; its VAE decode's 5.5 GB whole, which goes a band of rows at a time to fit what
+/// the card has free, so some quarter of it), by its latent's tokens and its pixels, with room to spare; what a kept
+/// worker holds that the job does not use then is let go where the card has less ([`generate_kept`]).
+const SAMPLING_BYTES_A_TOKEN: u64 = 640 << 10;
+const DECODE_BYTES_A_PIXEL: u64 = 1500;
+const ROOM_TO_SPARE: u64 = 768 << 20;
+
+/// The card's memory this process may still take (its budget less its use, Vulkan's): None where the API does not say.
+#[cfg(feature = "webgpu")]
+fn free_on(gpu: Option<&ggml_rs_wgpu::WgpuBackend>) -> Option<u64> {
+    gpu.and_then(|g| g.memory_budget()).map(|(budget, used)| budget.saturating_sub(used))
 }
 
 /// `r`'s pictures, each model loaded for it and let go as soon as it is done.
@@ -484,6 +551,7 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
         Some(e) => e,
         None => Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?),
     };
+    encoder.keep_layers(kept.is_some());
     dev.synchronize()?;
     let text_load_seconds = text_load_start.elapsed().as_secs_f64();
     let encoding_start = Instant::now();
@@ -501,8 +569,17 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
         ]));
     }
     let text_residency = encoder.residency();
+    #[cfg(feature = "webgpu")]
+    say_memory("encoded", encoder.backend());
     match kept.as_mut() {
-        Some(k) => k.encoder = Some((keys.0.clone(), encoder)),
+        Some(k) => {
+            // (its scratch let go: the transformer's steps want the room)
+            #[cfg(feature = "webgpu")]
+            if let Some(gpu) = encoder.backend() {
+                gpu.release_cached();
+            }
+            k.encoder = Some((keys.0.clone(), encoder));
+        }
         None => drop(encoder),
     }
     drop(features);
@@ -531,10 +608,27 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
     };
     dev.synchronize()?;
     let transformer_load_seconds = load_start.elapsed().as_secs_f64();
+    #[cfg(feature = "webgpu")]
+    say_memory("transformer loaded", model.backend());
     for note in model.lora_notes() {
         event(Json::obj([("stage", Json::str("lora_note")), ("note", Json::str(note))]));
     }
     let (h, w) = (r.height / 16, r.width / 16);
+    // (a kept VAE decoder let go where the steps want its room)
+    #[cfg(feature = "webgpu")]
+    if let Some(k) = kept.as_mut() {
+        let need = (h * w) as u64 * SAMPLING_BYTES_A_TOKEN + ROOM_TO_SPARE;
+        let short = |model: &Model| free_on(model.backend()).is_some_and(|free| free < need);
+        if short(&model) && k.encoder.as_mut().is_some_and(|(_, e)| e.let_go_layers()) {
+            eprintln!("the text encoder's kept layers let go: a {}x{} picture's steps want their room", r.width, r.height);
+            say_memory("the encoder's layers let go", model.backend());
+        }
+        if k.decoder.is_some() && short(&model) {
+            k.decoder = None;
+            eprintln!("the kept VAE decoder let go: a {}x{} picture's steps want its room", r.width, r.height);
+            say_memory("the decoder let go", model.backend());
+        }
+    }
     let sigmas = r.sigmas().map_err(candle_core::Error::Msg)?;
     let mut files = Vec::new();
     let mut prefix = None;
@@ -577,6 +671,10 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
                 }
                 latent = (latent.to_dtype(DType::F32)? + (velocity.to_dtype(DType::F32)? * (pair[1] - pair[0]))?)?.to_dtype(dtype)?;
                 dev.synchronize()?;
+                #[cfg(feature = "webgpu")]
+                if step == 0 {
+                    say_memory("a step", model.backend());
+                }
                 event(Json::obj([
                     ("stage", Json::str("sampling")),
                     ("image", Json::Int((i + 1) as i64)),
@@ -609,6 +707,23 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
         None => drop(model),
     }
     if !sampled.is_empty() {
+        // (the kept transformer let go where the decode wants its room, as a job that keeps nothing lets it go)
+        #[cfg(feature = "webgpu")]
+        if let Some(k) = kept.as_mut() {
+            let weights = if k.decoder.as_ref().is_some_and(|(key, _)| *key == keys.2) { 0 } else { 1 << 30 };
+            let need = (r.width * r.height) as u64 * DECODE_BYTES_A_PIXEL + weights + ROOM_TO_SPARE;
+            let short = |k: &Kept| {
+                let gpu = k.model.as_ref().and_then(|(_, m)| m.backend()).or_else(|| k.encoder.as_ref().and_then(|(_, e)| e.backend()));
+                free_on(gpu).is_some_and(|free| free < need)
+            };
+            if short(k) && k.encoder.as_mut().is_some_and(|(_, e)| e.let_go_layers()) {
+                eprintln!("the text encoder's kept layers let go: a {}x{} picture's decode wants their room", r.width, r.height);
+            }
+            if k.model.is_some() && short(k) {
+                k.model = None;
+                eprintln!("the kept transformer let go: a {}x{} picture's decode wants its room", r.width, r.height);
+            }
+        }
         event(Json::obj([("stage", Json::str("loading_vae"))]));
         let load_start = Instant::now();
         let had = kept.as_mut().and_then(|k| k.decoder.take()).filter(|(k, _)| *k == keys.2).map(|(_, d)| d);
@@ -625,10 +740,19 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
         };
         dev.synchronize()?;
         vae_load_seconds = load_start.elapsed().as_secs_f64();
+        #[cfg(feature = "webgpu")]
+        say_memory("decoder loaded", decoder.backend());
         for p in sampled {
             save_picture(r, &out, &mut manifest, &mut files, &mut event, &decoder, p, h, w)?;
         }
+        #[cfg(feature = "webgpu")]
+        say_memory("decoded", decoder.backend());
         if let Some(k) = kept.as_mut() {
+            // (its scratch let go: 2.4 GB after a 1024x1024 picture, the next picture's steps' room)
+            #[cfg(feature = "webgpu")]
+            if let Some(gpu) = decoder.backend() {
+                gpu.release_cached();
+            }
             k.decoder = Some((keys.2.clone(), decoder));
         }
     }

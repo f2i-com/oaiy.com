@@ -106,7 +106,15 @@ pub struct WgpuTextEncoder {
     w: Weights,
     prefix: String,
     tokenizer: tokenizers::Tokenizer,
+    /// Its layers kept on the card between prompts where it is kept ([`Self::keep_layers`]), each while the card has
+    /// room for it past [`KEEP_FLOOR`].
+    resident: Vec<Option<Layer>>,
+    keep: bool,
 }
+
+/// The card's memory a kept text encoder leaves free when it keeps a layer there: a picture's transformer and its steps'
+/// room (Qwen Image 2.1 Turbo's Q4_K transformer 4.2 GB, a 1024x1024 picture's steps 2.1).
+const KEEP_FLOOR: u64 = 6 << 30;
 
 /// A prompt's vectors through the layers.
 struct Prompt {
@@ -133,6 +141,11 @@ struct Prompt {
 }
 
 impl WgpuTextEncoder {
+    /// The device it runs on (its memory's budget asked of it; its kept buffers let go).
+    pub fn backend(&self) -> &ggml_rs_wgpu::WgpuBackend {
+        &self.gpu
+    }
+
     /// The text encoder under `root` (`text_encoder/`, or the `checkpoint` given; `processor/tokenizer.json`) on GPU
     /// `device` (as CUDA counts them; OAIY_WEBGPU_ADAPTER naming one instead).
     pub fn load(root: &Path, checkpoint: Option<&Path>, device: usize) -> Result<Self> {
@@ -150,7 +163,28 @@ impl WgpuTextEncoder {
         }
         let embedding = Embedding::load(&mut w, &format!("{prefix}.embed_tokens.weight"))?;
         let tokenizer = tokenizers::Tokenizer::from_file(root.join("processor/tokenizer.json")).map_err(err)?;
-        Ok(Self { gpu, embedding, w, prefix: prefix.to_owned(), tokenizer })
+        Ok(Self { gpu, embedding, w, prefix: prefix.to_owned(), tokenizer, resident: (0..LAYERS).map(|_| None).collect(), keep: false })
+    }
+
+    /// Whether its layers stay on the card between prompts (a worker that keeps it for the next picture): each one
+    /// encoded while the card keeps [`KEEP_FLOOR`] free past it, the others read again from the host's memory for each
+    /// prompt (some 3 s of Qwen3-VL 8B's Q4_K_M over a Thunderbolt 3 link at 2 GB/s). Not keeping lets go of those kept.
+    pub fn keep_layers(&mut self, keep: bool) {
+        self.keep = keep;
+        if !keep {
+            self.let_go_layers();
+        }
+    }
+
+    /// The layers it keeps on the card let go (a picture's steps want the room); it keeps them again from its next
+    /// prompt where it has room. Whether it had any.
+    pub fn let_go_layers(&mut self) -> bool {
+        let had = self.resident.iter().any(Option::is_some);
+        self.resident.iter_mut().for_each(|l| *l = None);
+        if had {
+            self.gpu.release_cached();
+        }
+        had
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
@@ -296,7 +330,10 @@ impl WgpuTextEncoder {
         }
         let row = 2 * KV_HEADS * HD;
         for i in 0..LAYERS {
-            let l = self.layer(i)?;
+            let l = match self.resident[i].take() {
+                Some(l) => l,
+                None => self.layer(i)?,
+            };
             // the images' deeper features for this layer's output (the first three's), zeros past their runs
             let deep_at = (i < 3 && !images.is_empty()).then_some(i);
             if let Some(layer) = deep_at {
@@ -345,7 +382,12 @@ impl WgpuTextEncoder {
                 }
             }
             rec.finish();
-            drop(l);
+            // (kept for the next prompt where the card has room past the floor)
+            if self.keep && self.gpu.memory_budget().is_some_and(|(budget, used)| budget.saturating_sub(used) >= KEEP_FLOOR) {
+                self.resident[i] = Some(l);
+            } else {
+                drop(l);
+            }
         }
         let mut rec = self.gpu.begin();
         rec.keep_groups(false);

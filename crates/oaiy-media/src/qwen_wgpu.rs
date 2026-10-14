@@ -236,6 +236,11 @@ pub(crate) fn host(t: &Tensor) -> Result<Vec<f32>> {
 }
 
 impl WgpuTransformer {
+    /// The device it runs on (its memory's budget asked of it; its kept buffers let go).
+    pub fn backend(&self) -> &ggml_rs_wgpu::WgpuBackend {
+        &self.gpu
+    }
+
     /// The transformer at `path` on GPU `device` (as CUDA counts them; OAIY_WEBGPU_ADAPTER naming one instead), with
     /// the turbo `adapter` and `loras` merged into its weights. `progress(block)` as each block loads.
     pub fn load(path: &Path, device: usize, adapter: Option<&Path>, loras: &[(PathBuf, f64)], mut progress: impl FnMut(usize)) -> Result<Self> {
