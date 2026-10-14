@@ -134,17 +134,7 @@ impl Gemma4MoeModel {
         let per_layer_dim = g.get_u64("gemma4.embedding_length_per_layer_input")
             .unwrap_or(0) as usize;
         let global = if per_layer_dim > 0 {
-            let ple_info = g.tensor_by_name("per_layer_token_embd.weight")
-                .ok_or_else(|| LlamaError::MissingTensor("per_layer_token_embd.weight".into()))?;
-            let n_elem = ple_info.numel() as usize;
-            let mut ple_host = vec![0.0f32; n_elem];
-            // VENDORED-LOCAL: byte-source seam (mmap'd and source-backed files).
-            ggml_quants::dequantize(ple_info.dtype, &g.tensor_bytes(ple_info)?, &mut ple_host)?;
-            let vocab = config.vocab_size;
-            let row_size = config.n_layers * per_layer_dim;
-            let per_layer_token_embd = backend.to_device(
-                Tensor::from_vec(ple_host, vec![vocab, row_size]),
-            );
+            let per_layer_token_embd = crate::gemma4::PleTable::load(g, config.vocab_size, config.n_layers * per_layer_dim)?;
             let per_layer_model_proj = backend.to_device(idx.take("per_layer_model_proj.weight", &[])?);
             let per_layer_proj_norm  = backend.to_device(idx.take("per_layer_proj_norm.weight",  &[])?);
             let rope_freq_factors = idx.take("rope_freqs.weight", &[]).ok().map(|t| {

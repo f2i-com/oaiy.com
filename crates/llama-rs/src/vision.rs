@@ -114,6 +114,49 @@ pub fn preprocess_image_letterboxed(bytes: &[u8], cfg: &VisionConfig) -> Result<
     preprocess_dynamic_image(image::DynamicImage::ImageRgb8(canvas),cfg)
 }
 
+/// VENDORED-LOCAL: the size Gemma 4's image processor gives a `width` x `height` picture (Transformers'
+/// `get_aspect_ratio_preserving_size`): its aspect kept, at most `max_soft_tokens * 9` patches of `patch`, each side
+/// a multiple of `3 patch` (the pooling's); `(width, height)`.
+pub fn gemma4_size(width: usize, height: usize, patch: usize, max_soft_tokens: usize) -> (usize, usize) {
+    let side = 3 * patch;
+    let max_patches = max_soft_tokens * 9;
+    let factor = ((max_patches * patch * patch) as f64 / (width.max(1) * height.max(1)) as f64).sqrt();
+    let mut w = (factor * width as f64 / side as f64).floor() as usize * side;
+    let mut h = (factor * height as f64 / side as f64).floor() as usize * side;
+    let longest = max_patches / 9 * side;
+    if h == 0 && w == 0 {
+        return (side, side);
+    }
+    if h == 0 {
+        h = side;
+        w = (width / height.max(1) * side).clamp(side, longest);
+    } else if w == 0 {
+        w = side;
+        h = (height / width.max(1) * side).clamp(side, longest);
+    }
+    (w, h)
+}
+
+/// VENDORED-LOCAL: a picture as Gemma 4's vision tower takes it: RGB (alpha dropped), resized by
+/// [`gemma4_size`] (bicubic, as Transformers' processor), `[3, h, w]` in `[0, 1]` (the tower makes them `[-1, 1]`).
+pub fn gemma4_image(bytes: &[u8], patch: usize, max_soft_tokens: usize) -> Result<Tensor> {
+    let img = image::load_from_memory(bytes).map_err(|e| LlamaError::Config(format!("failed to decode image: {e}")))?.to_rgb8();
+    let (w, h) = gemma4_size(img.width() as usize, img.height() as usize, patch, max_soft_tokens);
+    let resized = if (w, h) == (img.width() as usize, img.height() as usize) {
+        img
+    } else {
+        image::imageops::resize(&img, w as u32, h as u32, FilterType::CatmullRom)
+    };
+    let raw = resized.as_raw();
+    let mut data = vec![0f32; 3 * h * w];
+    for (i, px) in raw.chunks_exact(3).enumerate() {
+        for c in 0..3 {
+            data[c * h * w + i] = px[c] as f32 / 255.0;
+        }
+    }
+    Ok(Tensor::from_vec(data, vec![3, h, w]))
+}
+
 fn preprocess_dynamic_image(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Tensor> {
     let size = cfg.image_size as u32;
     // Bilinear resize to the target square. `Triangle` is the image crate's
@@ -148,6 +191,20 @@ fn preprocess_dynamic_image(img: image::DynamicImage, cfg: &VisionConfig) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gemma4_sizes_as_transformers_does() {
+        use super::gemma4_size;
+        // 280 soft tokens: 2,520 patches of 16 at most, sides a multiple of 48
+        assert_eq!(gemma4_size(1024, 1024, 16, 280), (768, 768));
+        assert_eq!(gemma4_size(512, 512, 16, 280), (768, 768));
+        let (w, h) = gemma4_size(1920, 1080, 16, 280);
+        assert!(w % 48 == 0 && h % 48 == 0 && (w / 16) * (h / 16) <= 2520 && w > h, "{w}x{h}");
+        assert_eq!((w, h), (1056, 576));
+        // a strip too thin for a whole block: one block high, as long as it may be
+        assert_eq!(gemma4_size(10000, 10, 16, 280), (48 * 280, 48));
+        assert_eq!(gemma4_size(4000, 10, 16, 70), (48 * 70, 48));
+    }
+
     use super::*;
 
     #[test]

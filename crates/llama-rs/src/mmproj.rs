@@ -45,10 +45,11 @@ pub enum ProjectorKind {
     /// One soft token per patch — 576 for CLIP-L/14.
     Mlp,
     /// Gemma 4 (`projector_type = "gemma4v"`): bespoke RMSNorm-everywhere
-    /// vision tower (no biases, SwiGLU FFN, sandwich norms, per-head Q/K-norm,
-    /// multi-tile position embedding) + single linear projector. **Loader
-    /// recognises but does not yet support this variant** — needs a separate
-    /// forward pipeline; tracked under task #45 Step 4.
+    /// vision tower (no biases, gated tanh-GELU FFN, sandwich norms, per-head
+    /// Q/K-norm, learned column and row positions plus a 2-D RoPE, clamped
+    /// linears), 3 x 3 average pooling, a weightless RMS norm and a single
+    /// linear projector. VENDORED-LOCAL: runs on a device chain
+    /// (`chain_gemma4v`); a picture's size is its own (`vision::gemma4_size`).
     Gemma4V,
     /// Qwen3-VL (`projector_type = "qwen3vl_merger"`): pre-LN ViT with FUSED
     /// `attn_qkv` projection (vs separate q/k/v in SigLIP), GeLU MLP with biases,
@@ -114,8 +115,9 @@ impl MmProjConfig {
 
     /// Number of soft tokens emitted to the LM after the projector.
     /// Gemma3 collapses 4×4 patch blocks via avg-pool, so 4096 → 256. Mlp
-    /// passes patches through 1:1. Gemma4V's pooling scheme isn't published;
-    /// returns the raw patch count as a placeholder until the loader lands.
+    /// passes patches through 1:1. Gemma4V's depends on the picture
+    /// (`vision::gemma4_size`: a soft token a 3 x 3 of patches); this is its
+    /// raw patch count at the nominal `image_size`.
     pub fn n_soft_tokens(&self) -> usize {
         match self.projector {
             ProjectorKind::Gemma3  => self.n_patches() / 16,

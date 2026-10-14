@@ -51,10 +51,23 @@ pub struct Config {
     /// The vision tower's config when it is loaded (else images are refused).
     pub vision: Option<VisionConfig>,
     pub qwen_vision: Option<llama_rs::MmProjConfig>,
+    /// Gemma 4's pictures, where its vision projector is loaded.
+    pub gemma_vision: Option<GemmaVision>,
     pub image_token_id: u32,
     /// Whether an image may name a file on this machine (a path or file://
     /// URL); off unless the server only listens on loopback.
     pub local_images: bool,
+}
+
+/// How Gemma 4 takes a picture: sized to at most `max_soft_tokens` (of `patch` pixels' patches, 3 x 3 a token), its
+/// soft tokens between `open` (`<|image>`) and `close` (`<image|>`) in place of its marker (`<|image|>`, which the
+/// soft tokens are too).
+#[derive(Clone, Copy, Debug)]
+pub struct GemmaVision {
+    pub patch: usize,
+    pub max_soft_tokens: usize,
+    pub open: u32,
+    pub close: u32,
 }
 
 pub struct Server {
@@ -386,6 +399,9 @@ impl Server {
         if let Some(vc) = &a.cfg.qwen_vision {
             return crate::qwen::prepare_images(records, prompt, a.cfg.image_token_id, vc, self.local_images, a.cfg.max_seq).map_err(bad);
         }
+        if let Some(gv) = &a.cfg.gemma_vision {
+            return gemma_images(records, prompt, a.cfg.image_token_id, gv, self.local_images, a.cfg.max_seq).map_err(bad);
+        }
         let Some(vc) = &a.cfg.vision else {
             // (worded for a client that looks for "image" or "vision" to go on in text, as OAIY's Agent does)
             return Err(bad(format!("{} has no vision here (no vision projector is set for it, or the server runs with --no-vision); images are not supported", a.cfg.model_name)));
@@ -422,6 +438,35 @@ impl Server {
     }
 }
 
+
+/// Gemma 4's pictures: each sized as its image processor sizes it, its marker in `prompt` (`image_id`) made `open`,
+/// a soft token a 3 x 3 of patches (`image_id` each), `close`.
+pub(crate) fn gemma_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv: &GemmaVision, local: bool, max_seq: usize) -> Result<(Vec<u32>, Vec<JobImage>), String> {
+    let count = prompt.iter().filter(|&&t| t == image_id).count();
+    if count != records.len() {
+        return Err("the pictures' markers in the prompt are not one a picture".into());
+    }
+    let (mut ids, mut images, mut records) = (Vec::with_capacity(prompt.len()), Vec::new(), records.iter());
+    for id in prompt {
+        if id != image_id {
+            ids.push(id);
+            continue;
+        }
+        let i = images.len() + 1;
+        let bytes = vision::image_bytes(records.next().expect("a record a marker"), local).map_err(|e| format!("image {i}: {e}"))?;
+        let pixels = llama_rs::vision::gemma4_image(&bytes, gv.patch, gv.max_soft_tokens).map_err(|e| format!("image {i}: {e}"))?;
+        let side = 3 * gv.patch;
+        let tokens = (pixels.dim(1) / side) * (pixels.dim(2) / side);
+        ids.push(gv.open);
+        images.push(JobImage { start: ids.len(), prep: crate::engine::ImagePrep::Gemma { pixels, tokens }, hash: crate::disk::fnv(&bytes, 0) });
+        ids.extend(std::iter::repeat_n(image_id, tokens));
+        ids.push(gv.close);
+    }
+    if ids.len() >= max_seq {
+        return Err(format!("the prompt with its pictures ({} tokens) is past the context ({max_seq})", ids.len()));
+    }
+    Ok((ids, images))
+}
 
 /// Whether a request asked to leave nothing behind: `"incognito": true` in its
 /// body, or an `X-OAIY-Incognito: 1` header.

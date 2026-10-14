@@ -107,7 +107,14 @@ pub struct GlmEngine {
     private_session: Option<String>,
     pub warn: bool,
     pub log: bool,
+    /// Gemma 4's vision tower, where its projector is loaded, and the soft tokens of the last pictures it read (by
+    /// their bytes' hash): a conversation sends its pictures again with each turn.
+    vision: Option<llama_rs::MmProj>,
+    soft: std::collections::VecDeque<(u64, Arc<Vec<f32>>)>,
 }
+
+/// Pictures' soft tokens kept for the turns after.
+const SOFT_KEPT: usize = 4;
 
 /// A snapshot of the expert tiers' cumulative counters, for reporting deltas.
 #[derive(Default, Clone, Copy)]
@@ -181,14 +188,28 @@ impl GlmEngine {
             private_session: None,
             warn: log,
             log,
+            vision: None,
+            soft: Default::default(),
         }
+    }
+
+    /// With Gemma 4's vision tower: a job's pictures are read by it.
+    pub fn with_vision(mut self, vision: Option<llama_rs::MmProj>) -> Self {
+        self.vision = vision;
+        self
+    }
+
+    /// A model whose state is its attention cache alone, which a prompt that diverges partway can keep the shared
+    /// part of (the dense families): GLM-5.3-Flash's MLA state and the MoE models' are not rewound.
+    fn rewinds(&self) -> bool {
+        matches!(self.model, Model::Llama(_) | Model::Qwen3(_) | Model::Gemma3(_) | Model::Gemma3n(_) | Model::Gemma4(_))
     }
 
     /// How many leading tokens of `prompt` the state already covers.
     ///
     /// Only a prefix counts: the state is a recurrence, so there is no way to
     /// rewind part of it. A prompt that diverges anywhere has to start over.
-    fn reusable(&self, prompt: &[u32]) -> usize {
+    fn reusable(&mut self, prompt: &[u32]) -> usize {
         let n = self
             .covered
             .iter()
@@ -198,6 +219,15 @@ impl GlmEngine {
         // Only if the whole covered run matches: a shorter match means the state
         // holds tokens this prompt does not have.
         if n == self.covered.len() && n < prompt.len() {
+            n
+        } else if self.rewinds() && n > 0 {
+            // VENDORED-LOCAL: a cache keeps its first rows as they are: the shared part (all but the prompt's last
+            // token, which the reply's logits come from), the rest dropped. A conversation's next turn re-reads only
+            // what is new since its last reply (the reply as the template writes it back may differ from as it came).
+            let n = n.min(prompt.len() - 1);
+            self.covered.truncate(n);
+            self.kv.len = n;
+            self.kv.dirty_from = self.kv.dirty_from.min(n);
             n
         } else {
             0
@@ -306,26 +336,66 @@ impl GlmEngine {
         self.covered.clear();
     }
 
-    fn generate(&mut self, job: &Job) -> Result<()> {
-        if !job.images.is_empty() {
-            return Err(oaiy_engine::Error::Arg(
-                "glm5next: this server does not take images yet; the vision tower is \
-                 implemented in llama-rs but not wired through the generic forward"
-                    .into(),
-            ));
+    /// The soft tokens of each of a job's pictures (`[n, d]` each), by Gemma 4's vision tower, or as kept from a
+    /// turn before.
+    fn pictures(&mut self, job: &Job) -> Result<Vec<Arc<Vec<f32>>>> {
+        let mut out = Vec::with_capacity(job.images.len());
+        for (i, image) in job.images.iter().enumerate() {
+            if let Some((_, t)) = self.soft.iter().find(|(h, _)| *h == image.hash) {
+                out.push(Arc::clone(t));
+                continue;
+            }
+            let (Some(llama_rs::MmProj::Gemma4V(mm)), crate::engine::ImagePrep::Gemma { pixels, tokens }) = (&self.vision, &image.prep) else {
+                return Err(oaiy_engine::Error::Arg("this model reads text only: no vision projector is loaded for it".into()));
+            };
+            let t = std::time::Instant::now();
+            let soft = mm.forward(pixels).map_err(|e| oaiy_engine::Error::Arg(format!("image {}: {e}", i + 1)))?;
+            let soft = if soft.is_device() { soft.to_host() } else { soft };
+            if soft.dim(0) != *tokens || soft.dim(1) != self.model.config().embedding_dim {
+                return Err(oaiy_engine::Error::Arg(format!("image {}: the vision tower gave {:?}, not {tokens} tokens", i + 1, soft.shape())));
+            }
+            if self.log {
+                eprintln!("  picture {} ({}x{}, {tokens} tokens) read in {:.2}s", i + 1, pixels.dim(2), pixels.dim(1), t.elapsed().as_secs_f64());
+            }
+            let soft = Arc::new(soft.data().to_vec());
+            self.soft.push_back((image.hash, Arc::clone(&soft)));
+            if self.soft.len() > SOFT_KEPT {
+                self.soft.pop_front();
+            }
+            out.push(soft);
         }
-        let prompt = &job.prompt;
-        if prompt.is_empty() {
+        Ok(out)
+    }
+
+    fn generate(&mut self, job: &Job) -> Result<()> {
+        if !job.images.is_empty() && self.vision.is_none() {
+            return Err(oaiy_engine::Error::Arg("this model reads text only: no vision projector is loaded for it".into()));
+        }
+        if job.prompt.is_empty() {
             return Err(oaiy_engine::Error::Arg("glm5next: empty prompt".into()));
         }
+        let pictures = self.pictures(job)?;
+        // The prompt as the state is kept by: each picture's soft tokens keyed by its bytes (a token past the
+        // vocabulary's ids each), so another picture in the same place is another prompt.
+        let keyed: Vec<u32> = {
+            let mut k = job.prompt.clone();
+            for image in &job.images {
+                for (offset, id) in k[image.start..image.start + image.prep.n_tokens()].iter_mut().enumerate() {
+                    *id = 0x8000_0000 | ((image.hash.rotate_left(17) ^ offset as u64) as u32 & 0x7fff_ffff);
+                }
+            }
+            k
+        };
+        let prompt = &keyed;
+        let tokens = &job.prompt;
 
         let started = std::time::Instant::now();
-        let mut start = self.reusable(prompt);
         let common = self.covered.iter().zip(prompt).take_while(|(a,b)| a == b).count();
+        let mut start = self.reusable(prompt);
         let mut source = if start > 0 { "memory" } else { "none" };
         // Disk may hold more of this prompt than the state does -- a fresh daemon's
         // state holds none of it, and the system prompt is the same every time.
-        if let Some(len) = self.restore_from_disk(prompt, start) {
+        if let Some(len) = job.images.is_empty().then(|| self.restore_from_disk(prompt, start)).flatten() {
             start = len;
             source = "disk";
         } else if start == 0 {
@@ -366,7 +436,7 @@ impl GlmEngine {
                 return Ok(());
             }
             let take = step.min(keep_at - pos);
-            self.forward_many(&prompt[pos..pos + take])?;
+            self.forward_chunk(tokens, pos, take, job, &pictures)?;
             self.covered.extend_from_slice(&prompt[pos..pos + take]);
             pos += take;
             let _ = job.events.send(Event::Progress {
@@ -376,7 +446,7 @@ impl GlmEngine {
         }
         // `base` marks a prompt read from nothing: the system prompt every later
         // request shares, and so the entry worth protecting from eviction.
-        if keep_at > start {
+        if keep_at > start && job.images.is_empty() {
             self.persist(keep_at, start == 0);
         }
         if job.cancel.load(Ordering::Relaxed) {
@@ -386,7 +456,7 @@ impl GlmEngine {
             });
             return Ok(());
         }
-        logits = self.forward_many(&prompt[keep_at..])?;
+        logits = self.forward_chunk(tokens, keep_at, prompt.len() - keep_at, job, &pictures)?;
         self.covered.extend_from_slice(&prompt[keep_at..]);
         let _ = job.events.send(Event::Progress { done: total, total });
         let prefill_s = started.elapsed().as_secs_f64();
@@ -448,6 +518,18 @@ impl GlmEngine {
                 .send(Event::Text(self.tok.decode(&pending).replace('\u{FFFD}', "")));
         }
         let decode_s = decode.elapsed().as_secs_f64();
+        #[cfg(feature = "webgpu")]
+        if self.log && ggml_rs_wgpu::profile::chain_on() {
+            let kernels = ggml_rs_wgpu::profile::take_kernels();
+            eprintln!("  kernels: the request's {:.1} ms of the GPU's in {} dispatches (each timed in a pass of its own)", kernels.iter().map(|k| k.1).sum::<f64>(), kernels.iter().map(|k| k.2).sum::<u64>());
+            for (name, ms, count) in kernels.iter().take(32) {
+                eprintln!("    {name:<34} {ms:>9.2} ms {count:>7}");
+            }
+        }
+        #[cfg(feature = "webgpu")]
+        if self.log && std::env::var_os("OAIY_DECODE_LOG").is_some() {
+            eprintln!("  {}", ggml_rs_wgpu::profile::take_line());
+        }
         if self.log {
             eprintln!(
                 "  {} prompt tokens ({start} reused) in {prefill_s:.1}s; {n} generated in \
@@ -510,6 +592,31 @@ impl GlmEngine {
             Model::Llama(_) | Model::Qwen3(_) | Model::Gemma3(_) | Model::Gemma3n(_) | Model::Gemma4(_) => DENSE_PREFILL_CHUNK,
             _ => llama_rs::glm5next::forward::prefill_chunk().max(1),
         }
+    }
+
+    /// `tokens[at..at + len]`, with the soft tokens of any of the job's `pictures` that fall in them in place of
+    /// their embeddings: the last one's logits.
+    fn forward_chunk(&mut self, tokens: &[u32], at: usize, len: usize, job: &Job, pictures: &[Arc<Vec<f32>>]) -> Result<Vec<f32>> {
+        let ids = &tokens[at..at + len];
+        let d = self.model.config().embedding_dim;
+        let soft: Vec<(usize, &[f32])> = job
+            .images
+            .iter()
+            .zip(pictures)
+            .filter_map(|(image, rows)| {
+                // the part of the picture's span within the chunk
+                let (lo, hi) = (image.start.max(at), (image.start + image.prep.n_tokens()).min(at + len));
+                (lo < hi).then(|| (lo - at, &rows[(lo - image.start) * d..(hi - image.start) * d]))
+            })
+            .collect();
+        if soft.is_empty() {
+            return self.forward_many(ids);
+        }
+        let t = self
+            .model
+            .forward_spliced(ids, &soft, &mut self.kv)
+            .ok_or_else(|| oaiy_engine::Error::Arg("this model takes no pictures".into()))?;
+        Ok(if t.device_storage().is_some() { t.to_host().data().to_vec() } else { t.data().to_vec() })
     }
 
     fn forward_many(&mut self, ids: &[u32]) -> Result<Vec<f32>> {

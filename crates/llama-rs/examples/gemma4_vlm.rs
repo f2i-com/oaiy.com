@@ -1,14 +1,11 @@
-//! Vision-language demo for Gemma 4 (E2B / E4B). **WORK IN PROGRESS** — the
-//! vision tower runs cleanly and produces correct-shape soft tokens; the
-//! splice + LM-side prefill hit an `ILLEGAL_ADDRESS` error on the CUDA backend
-//! that was (never resolved; the CPU backend is what runs it now). Mirrors `gemma_vlm.rs`
-//! (Gemma 3) but uses:
-//!   * Gemma 4's bespoke vision tower (RMSNorm + SwiGLU + sandwich norms)
-//!   * Gemma 4's chat template (`<|turn>user\n{prompt}<turn|>\n<|turn>model\n`)
-//!   * Single `<|image|>` placeholder token (id 258880) expanded to N=196
-//!     soft-token rows at runtime (vs Gemma 3's `<start_of_image>` ... `<end_of_image>`)
-//!   * `Gemma4Model::embed_with_vision_at_placeholder` + `forward_embeds`
-//!     (PLE-aware — placeholder positions get `<|image|>`'s PLE)
+//! Vision-language demo for Gemma 4 (E2B / E4B): its vision tower (`Gemma4VMmProj`, chained on a GPU's device by
+//! `chain_gemma4v`), the picture's soft tokens spliced into the prompt in place of its `<|image|>` markers
+//! (`Gemma4Model::forward_spliced`, whose PLE reads the padding's row there, as Transformers does), and Gemma 4's chat
+//! template (`<|turn>user\n<|image>` + one `<|image|>` a soft token + `<image|>{prompt}<turn|>\n<|turn>model\n`).
+//!
+//! The tower runs on a backend with a device chain only (WebGPU: OAIY's server, `oaiy-llm-server-webgpu`, reads
+//! pictures with Gemma 4 when given its mmproj with `--vision-projector`); on the CPU backend this demo stops at the
+//! tower with that error.
 //!
 //! Usage:
 //!   cargo run --release -p llama-rs --example gemma4_vlm -- \
@@ -25,12 +22,10 @@ use std::time::Instant;
 
 use ggml_rs::{default_backend, Backend};
 use gguf::GgufFile;
-use llama_rs::{
-    preprocess_image, sampler::Sampler, MmProj, Model, SampleParams, VisionConfig,
-};
+use llama_rs::{sampler::Sampler, MmProj, Model, SampleParams};
 
-/// `<|image|>` token id in the Gemma 4 vocabulary, found via probe_image_tokens.
-const GEMMA4_IMAGE_TOKEN_ID: u32 = 258880;
+/// The soft tokens a picture is at most (Gemma 4's image processor's default).
+const SOFT_TOKENS: usize = 280;
 
 fn pick_backend(name: &str) -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     match name {
@@ -78,38 +73,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ----- 1. Preprocess image ---------------------------------------------
     eprintln!("Preprocessing image ...");
-    let cfg = mmproj.config();
-    let vc = VisionConfig {
-        image_size: cfg.image_size,
-        patch_size: cfg.patch_size,
-        mean:       cfg.mean,
-        std:        cfg.std,
-    };
-    let image = preprocess_image(image_path.as_ref(), &vc)?;
+    let image = llama_rs::vision::gemma4_image(&std::fs::read(&image_path)?, mmproj.config().patch_size, SOFT_TOKENS)?;
     eprintln!("  image: {:?}", image.shape());
 
     // ----- 2. Vision tower → soft tokens ----------------------------------
     eprintln!("Running vision tower (one-shot) ...");
     let t2 = Instant::now();
-    let soft_tokens = mmproj.forward(&image)?;
+    let soft_tokens = mmproj.forward(&image)?.to_host();
     eprintln!("  soft-token shape {:?} in {:.2?}", soft_tokens.shape(), t2.elapsed());
 
-    // ----- 3. Build chat template with <|image|> placeholder --------------
-    // Gemma 4 chat template uses `<|turn>{role}\n{content}<turn|>\n` blocks.
-    // Image content is a single `<|image|>` token, which we'll expand to 196
-    // soft-token rows at the splice step.
-    let chat = format!("<|turn>user\n<|image|>{prompt}<turn|>\n<|turn>model\n");
-    let (tokens, embeds) = gemma4.embed_with_vision_at_placeholder(
-        &chat, &soft_tokens, GEMMA4_IMAGE_TOKEN_ID, true /* add BOS */,
-    )?;
-    eprintln!("  spliced sequence: {} tokens (text + {} vision soft tokens)",
-              tokens.len(), soft_tokens.dim(0));
+    // ----- 3. The prompt: the picture's soft tokens between `<|image>` and `<image|>` -------------
+    let tok_id = |t: &str| gemma4.tokenizer.token_id(t).ok_or(format!("the tokenizer lacks {t}"));
+    let (open, image_id, close) = (tok_id("<|image>")?, tok_id("<|image|>")?, tok_id("<image|>")?);
+    let mut tokens = gemma4.tokenizer.encode("<|turn>user\n", true)?;
+    tokens.push(open);
+    let at = tokens.len();
+    tokens.extend(std::iter::repeat_n(image_id, soft_tokens.dim(0)));
+    tokens.push(close);
+    tokens.extend(gemma4.tokenizer.encode(&format!("{prompt}<turn|>\n<|turn>model\n"), false)?);
+    eprintln!("  spliced sequence: {} tokens (text + {} vision soft tokens)", tokens.len(), soft_tokens.dim(0));
 
     // ----- 4. Prefill -----------------------------------------------------
     let mut kv = model.new_kv_cache(8192);
     eprintln!("Prefill ...");
     let t3 = Instant::now();
-    let logits = gemma4.forward_embeds(&embeds, &tokens, &mut kv);
+    let logits = gemma4.forward_spliced(&tokens, &[(at, soft_tokens.data())], &mut kv);
     let dt_prefill = t3.elapsed();
     let n_prompt = tokens.len();
     eprintln!("  prefill: {} tokens in {:.2?} ({:.0} tok/s)",

@@ -885,6 +885,59 @@ was 0.4 ms of recording and 14 ms on the GPU, the one-row matmul reading its
 weights at 170-280 GB/s however its lanes were laid out; the K-quants' wide
 kernels (above) made it 7.7 ms.
 
+### Gemma 4 and its pictures (2026-10-14)
+
+Gemma 4's dense models are chained too (`llama-rs`'s `chain_gemma4`; measured with E2B), as the op-by-op
+`forward_embeds` computes it: the per-layer inputs (the embeddings through the PLE
+projection and its norm, plus the tokens' rows of the PLE table), then each layer's q
+(per-head norm, RoPE by the layer's own base and divisors), k and v where the layer
+keeps its own (the last 20 of E2B's 35 read an earlier layer's cache), attention at
+scale 1 (the sliding layers' within their window), the GeGLU FFN of the layer's own
+width, the PLE gate (`gelu(W x)` times the layer's input, projected back and normed),
+the layer's output scale, then the head. A decode step's vectors are kept from step
+to step (with their bind groups; made fresh each step, recording one took 23-40 ms).
+The PLE table (262,144 rows of 8,960 for E2B) stays as the GGUF packs it and a
+token's row is decoded when a step needs it, as are the embeddings where the head is
+the packed table on the GPU: an E2B engine held 11.3 GB of RAM (9.4 GB of it the PLE
+table as f32) and was killed for want of memory on a 16 GB laptop with the desktop
+open; it holds 2.8 GB with its vision tower. The PLE gates and projections (f32 in the
+GGUF) are f16 on the GPU.
+
+On an NVIDIA A2 (Vulkan, held at 1,200 MHz), Gemma 4 E2B Q4_K_M, greedy:
+
+| | Op by op | Chained |
+|---|---:|---:|
+| Decode | 5.7 tok/s | 46-47 tok/s at 300 tokens of context, 37 at 3,000 |
+| A 21-token prompt | 3.6 s | 0.2-0.6 s |
+| A 2,733-token prompt | | 5.5 s |
+
+Both give the same greedy replies. A dense model's state is its attention cache, so a
+prompt that diverges partway (a conversation's next turn, whose last reply the
+template writes back) keeps the shared part and reads only what follows.
+
+Its pictures go through its mmproj's vision tower (`chain_gemma4v`, given with
+`--vision-projector name=mmproj.gguf`), as Transformers' `Gemma4VisionModel` and
+llama.cpp's `gemma4v` compute it: the picture sized as Gemma 4's processor sizes it
+(its aspect kept, at most 280 soft tokens of 3 x 3 patches of 16 pixels, bicubic),
+the patches through the patch projection plus their column's and row's learned
+positions, 16 blocks (RMS norms on both sides of attention and MLP, q and k normed per
+head and v without a weight, a head's first half rotated by the patch's column and its
+second by its row, full attention at scale 1, each linear layer's input and output
+clamped to its learned range), each 3 x 3 patches' mean times `sqrt(d)`, a weightless
+RMS norm and the projection into the model's width. A picture is `<|image>`, a
+`<|image|>` a soft token, `<image|>` in the prompt; the soft tokens' rows take their
+embeddings' place, and their PLE rows are the padding's (as Transformers looks them
+up). The prefix cache keys them by the picture's bytes, and the last four pictures'
+soft tokens are kept for the turns after. (llama-rs's op-by-op tower left out the
+rotary positions, the pooling, the clamps and the projector's norm; it is gone.)
+
+On the A2 a 768 x 768 picture (256 soft tokens) is read in 0.6-0.9 s (3.7 s the first
+time, its kernels compiled), and its first question answered in 2.5-6 s. Gemma 4 E2B
+named a fox in snow and the word on the sign beside it, told the left and right
+halves (and the top and bottom) of two pictures side by side, which of two pictures
+had an animal, and a door's colour in a second picture three turns into a
+conversation about the first.
+
 ## Qwen3.5 and Qwen3.8 27B on the GPU (2026-10-05)
 
 Qwen3.5's hybrid (Qwen3.5 4B, 9B and 27B, Qwen3.8 27B: `llama-rs`'s

@@ -555,6 +555,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// Values times a scalar in place ([`ChainRecorder::scale_in_place`]): a thread a value. `p[0]`: the values, the
+/// scalar's bits.
+pub(in crate::chain) const SCALE_IN_PLACE: &str = r#"
+@group(0) @binding(6) var<storage, read_write> x: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x) { return; }
+    x[i] = x[i] * bitcast<f32>(p[0].y);
+}
+"#;
+
 /// Rows times their gates' sigmoids ([`ChainRecorder::mul_sigmoid_rows`]), in place: a thread a value. `p[0]`: the
 /// rows, `c`.
 pub(in crate::chain) const MUL_SIGMOID_ROWS: &str = r#"

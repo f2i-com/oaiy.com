@@ -51,10 +51,9 @@ pub struct Gemma4GlobalTensors {
     pub per_layer_model_proj: Tensor,
     /// `[per_layer_dim]` — RMSNorm scale for the projected signal.
     pub per_layer_proj_norm:  Tensor,
-    /// Dequantized PLE table on the model's backend (CPU or CUDA):
-    /// `[vocab_size, n_layers * per_layer_dim]`. ~9 GB F32 for Gemma 4 E2B.
-    /// Sliced per-token via `embed_lookup` at forward time, no host transfer.
-    pub per_layer_token_embd: Tensor,
+    /// The PLE table, `[vocab_size, n_layers * per_layer_dim]`, as the GGUF packs it; a forward decodes its tokens'
+    /// rows ([`PleTable::rows`]).
+    pub per_layer_token_embd: PleTable,
     /// Per-frequency-dim divisors for RoPE (long-rope scaling). Length is
     /// `head_dim_global / 2`. Applied only on global (non-SWA) layers per
     /// `llama.cpp/src/models/gemma4.cpp`.
@@ -91,6 +90,13 @@ pub struct Gemma4Model {
     /// Last `shared_kv_layers` layers reuse the latest earlier non-shared layer
     /// of the same SWA type.
     kv_shared_source:  Vec<Option<usize>>,
+    /// VENDORED-LOCAL: the multimodal soft tokens (`<|image|>`, `<|audio|>`, `<|video|>`), whose PLE rows are the
+    /// padding's (as Transformers' `Gemma4Model` looks them up).
+    soft_token_ids:    Vec<u32>,
+    /// VENDORED-LOCAL: the token embeddings as the GGUF packs them, where the f32 table was let go (see `from_gguf`).
+    tok_rows:          Option<PleTable>,
+    /// VENDORED-LOCAL: the layers chained on the backend's device, where it has a chain.
+    chain:             crate::chain_gemma4::Gemma4Chain,
 }
 
 impl std::fmt::Debug for Gemma4Model {
@@ -120,28 +126,23 @@ impl Gemma4Model {
         let tokenizer = Tokenizer::from_gguf(g)?;
         let idx = TensorIndex::new(g);
 
-        let common = CommonTensors::load_with_index(&idx, &config)?.upload_to(&*backend);
+        let mut common = CommonTensors::load_with_index(&idx, &config)?.upload_to(&*backend);
+        // VENDORED-LOCAL: where the head is a matmul of its own (a backend that keeps a packed head), the embeddings are
+        // read from the packed table a token's row at a time, and the f32 table is let go.
+        let tok_rows = match (&common.output, common.tok_embd.is_device()) {
+            (Weight::TiedEmbed(_), _) | (_, true) => None,
+            _ => PleTable::load_named(g, "token_embd.weight", config.vocab_size, config.embedding_dim).ok(),
+        };
+        if tok_rows.is_some() {
+            common.tok_embd = Arc::new(Tensor::from_vec(Vec::new(), vec![0, config.embedding_dim]));
+        }
 
         // PLE config + globals (optional — small Gemma 4 variants might omit).
         let per_layer_dim = g.get_u64("gemma4.embedding_length_per_layer_input")
             .unwrap_or(0) as usize;
 
         let global = if per_layer_dim > 0 {
-            // Dequantize the PLE table once at load. Gemma 4 E2B: 2.35B elements
-            // = ~9 GB F32 raw (GGUF Q5_K = 1.6 GB packed). We upload it to the
-            // backend so the per-forward `embed_lookup` is a device-side gather
-            // — no per-token host slicing or host→device transfer.
-            let ple_info = g.tensor_by_name("per_layer_token_embd.weight")
-                .ok_or_else(|| LlamaError::MissingTensor("per_layer_token_embd.weight".into()))?;
-            let n_elem = ple_info.numel() as usize;
-            let mut ple_host = vec![0.0f32; n_elem];
-            // VENDORED-LOCAL: byte-source seam (mmap'd and source-backed files).
-            ggml_quants::dequantize(ple_info.dtype, &g.tensor_bytes(ple_info)?, &mut ple_host)?;
-            let vocab = config.vocab_size;
-            let row_size = config.n_layers * per_layer_dim;
-            let per_layer_token_embd = backend.to_device(
-                Tensor::from_vec(ple_host, vec![vocab, row_size]),
-            );
+            let per_layer_token_embd = PleTable::load(g, config.vocab_size, config.n_layers * per_layer_dim)?;
 
             let per_layer_model_proj = backend.to_device(idx.take("per_layer_model_proj.weight", &[])?);
             let per_layer_proj_norm  = backend.to_device(idx.take("per_layer_proj_norm.weight",  &[])?);
@@ -227,10 +228,42 @@ impl Gemma4Model {
             kv_shared_source[layer_idx] = source;
         }
 
+        let soft_token_ids = ["<|image|>", "<|audio|>", "<|video|>"].iter().filter_map(|t| tokenizer.token_id(t)).collect();
         Ok(Self {
             config, tokenizer, common, global, extras, backend, embed_scale_const, per_layer_dim,
-            kv_shared_source,
+            kv_shared_source, soft_token_ids, tok_rows, chain: Default::default(),
         })
+    }
+
+    /// VENDORED-LOCAL: the width of a layer's PLE input (0: none).
+    pub(crate) fn per_layer_dim(&self) -> usize { self.per_layer_dim }
+
+    /// VENDORED-LOCAL: the layer whose cache layer `l`'s attention reads (itself unless it shares an earlier one's).
+    pub(crate) fn kv_source(&self, l: usize) -> usize { self.kv_shared_source[l].unwrap_or(l) }
+
+    /// VENDORED-LOCAL: the token whose PLE row each of `tokens` reads: a multimodal soft token reads the padding's.
+    pub fn ple_ids(&self, tokens: &[u32]) -> Vec<u32> {
+        tokens.iter().map(|t| if self.soft_token_ids.contains(t) { 0 } else { *t }).collect()
+    }
+
+    /// VENDORED-LOCAL: `tokens` with `soft` rows (`(position in tokens, [n, d] values)`) in place of their
+    /// embeddings (a picture's soft tokens), through the model: the last row's logits. Chained on the device where
+    /// the backend can, else op by op.
+    pub fn forward_spliced(&self, tokens: &[u32], soft: &[(usize, &[f32])], kv: &mut KvCache) -> Tensor {
+        let d = self.config.embedding_dim;
+        let embeds = self.embed_text(tokens);
+        let mut host = if embeds.is_device() { embeds.to_host() } else { embeds };
+        for (at, rows) in soft {
+            let n = rows.len() / d;
+            assert!(rows.len() % d == 0 && at + n <= tokens.len(), "soft tokens of width {d} within the tokens");
+            host.data_mut()[at * d..(at + n) * d].copy_from_slice(rows);
+        }
+        let ple = self.ple_ids(tokens);
+        if let Some(logits) = self.chain.run(self, host.data(), &ple, kv) {
+            return logits;
+        }
+        let embeds = self.backend.to_device(host);
+        self.forward_embeds(&embeds, tokens, kv)
     }
 
     /// Look up token embeddings + apply Gemma's `sqrt(d)` scaling. Mirrors
@@ -238,7 +271,10 @@ impl Gemma4Model {
     pub fn embed_text(&self, tokens: &[u32]) -> Tensor {
         let backend = &*self.backend;
         let cfg = &self.config;
-        let mut x = backend.embed_lookup(&self.common.tok_embd, tokens, cfg.embedding_dim);
+        let mut x = match &self.tok_rows {
+            Some(rows) => backend.to_device(Tensor::from_vec(rows.rows(tokens), vec![tokens.len(), cfg.embedding_dim])),
+            None => backend.embed_lookup(&self.common.tok_embd, tokens, cfg.embedding_dim),
+        };
         if let Some(s) = self.embed_scale_const {
             ops::mul_scalar_inplace(backend, &mut x, s);
         }
@@ -247,8 +283,7 @@ impl Gemma4Model {
 
     /// Standard text-only forward. Composes [`embed_text`] + [`forward_embeds`].
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Tensor {
-        let embeds = self.embed_text(tokens);
-        self.forward_embeds(&embeds, tokens, kv)
+        self.forward_spliced(tokens, &[], kv)
     }
 
     /// Vision-language helper: tokenize `prompt` (which must contain exactly
@@ -258,8 +293,10 @@ impl Gemma4Model {
     /// vision soft tokens into the placeholder positions.
     ///
     /// Returns `(tokens, embeds)` ready to be fed into [`forward_embeds`]:
-    /// the tokens drive PLE lookup (placeholder positions get
-    /// `<|image|>`'s PLE), and the embeds carry the actual image content.
+    /// the tokens drive PLE lookup (VENDORED-LOCAL: placeholder positions
+    /// read the padding's row, as Transformers' `Gemma4Model` does), and the
+    /// embeds carry the actual image content. [`Self::forward_spliced`] does
+    /// both in one, chained on a device where it can be.
     pub fn embed_with_vision_at_placeholder(
         &self,
         prompt:               &str,
@@ -334,7 +371,7 @@ impl Gemma4Model {
         // `[seq, n_layers, pld]`. The forward loop reads each layer's slice via
         // `ops::slice_axis1_2d` — one device kernel per layer, no host syncs.
         let per_layer_inputs: Option<Tensor> = self.global.as_ref()
-            .map(|g| compute_per_layer_inputs(backend, &x, tokens, &g.per_layer_token_embd,
+            .map(|g| compute_per_layer_inputs(backend, &x, &self.ple_ids(tokens), &g.per_layer_token_embd,
                                               &g.per_layer_model_proj, &g.per_layer_proj_norm,
                                               cfg.embedding_dim, seq, n_layers, pld, cfg.rms_eps));
 
@@ -465,6 +502,59 @@ impl Gemma4Model {
     }
 }
 
+/// VENDORED-LOCAL: a table of rows as the GGUF packs it (a view of the mapped file, or its bytes from a streamed one), a
+/// token's row decoded when a forward needs it: Gemma's per-layer token table, and its token embeddings where the head
+/// is a packed matmul of its own. Gemma 4 E2B's PLE table is 262,144 rows of 8,960: 1.6 GB as Q5_K, 9.4 GB as the f32
+/// the model held on the host before, which took an engine of it past a 16 GB machine's memory; its embeddings were
+/// 1.6 GB more of f32.
+pub struct PleTable {
+    packed: ggml_rs::QuantizedTensor,
+    vocab: usize,
+    row: usize,
+    row_bytes: usize,
+}
+
+impl std::fmt::Debug for PleTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PleTable({} rows of {}, {:?})", self.vocab, self.row, self.packed.dtype())
+    }
+}
+
+impl PleTable {
+    /// `per_layer_token_embd.weight`, `vocab` rows of `row`.
+    pub fn load(g: &GgufFile, vocab: usize, row: usize) -> Result<Self> {
+        Self::load_named(g, "per_layer_token_embd.weight", vocab, row)
+    }
+
+    /// The tensor `name`, `vocab` rows of `row`.
+    pub fn load_named(g: &GgufFile, name: &str, vocab: usize, row: usize) -> Result<Self> {
+        let info = g.tensor_by_name(name).ok_or_else(|| LlamaError::MissingTensor(name.into()))?;
+        let dtype = info.dtype;
+        if info.numel() as usize != vocab * row || row % dtype.block_size() != 0 || !ggml_quants::is_supported(dtype) {
+            return Err(LlamaError::Config(format!(
+                "{name}: {} values, not {vocab} rows of {row} in {dtype:?}'s blocks", info.numel()
+            )));
+        }
+        let packed = crate::loader::load_tensor_packed(g, info)?;
+        Ok(Self { packed, vocab, row, row_bytes: row / dtype.block_size() * dtype.type_size() })
+    }
+
+    /// The width of a row (`n_layers * per_layer_dim`).
+    pub fn row(&self) -> usize { self.row }
+
+    /// `tokens`' rows, `[tokens.len(), row]`; a token past the table reads row 0 (the padding's).
+    pub fn rows(&self, tokens: &[u32]) -> Vec<f32> {
+        let bytes = self.packed.bytes();
+        let mut out = vec![0f32; tokens.len() * self.row];
+        for (t, dst) in tokens.iter().zip(out.chunks_mut(self.row)) {
+            let id = if (*t as usize) < self.vocab { *t as usize } else { 0 };
+            ggml_quants::dequantize(self.packed.dtype(), &bytes[id * self.row_bytes..(id + 1) * self.row_bytes], dst)
+                .expect("a PLE row in its own blocks");
+        }
+        out
+    }
+}
+
 /// Load an `[N]` norm weight, or substitute a unit-weight tensor of size `n` if
 /// the GGUF doesn't include it. Lets us keep the forward pass unconditional.
 pub fn load_or_unit(idx: &TensorIndex<'_>, name: &str, n: usize) -> Result<Tensor> {
@@ -485,7 +575,7 @@ pub fn compute_per_layer_inputs(
     backend: &dyn Backend,
     hidden: &Tensor,
     tokens: &[u32],
-    table: &Tensor,
+    table: &PleTable,
     per_layer_model_proj: &Tensor,
     per_layer_proj_norm: &Tensor,
     embed_dim: usize,
@@ -509,8 +599,8 @@ pub fn compute_per_layer_inputs(
         .expect("per-layer projection reshape");
     let projection_normed = ops::rmsnorm(backend, &projection_2d, per_layer_proj_norm, rms_eps);
 
-    // 3. Lookup PLE rows via device-side embed_lookup: [seq, row_size].
-    let mut lookup = backend.embed_lookup(table, tokens, row_size);
+    // 3. The tokens' PLE rows, decoded from the packed table: [seq, row_size].
+    let mut lookup = backend.to_device(Tensor::from_vec(table.rows(tokens), vec![seq, row_size]));
 
     // 4. Scale lookup by sqrt(per_layer_dim).
     ops::mul_scalar_inplace(backend, &mut lookup, pl_scale);

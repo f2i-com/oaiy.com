@@ -19,6 +19,44 @@ pub struct Gemma4VBlock {
     pub ffn_up:     Weight,
     pub ffn_down:   Weight,
     pub ffn_post:   Tensor,        // post-FFN RMSNorm scale
+    /// VENDORED-LOCAL: each linear layer's learned input and output ranges (Transformers' `Gemma4ClippableLinear`).
+    pub clamps:     Gemma4VBlockClamps,
+}
+
+/// VENDORED-LOCAL: a linear layer's input and output ranges (`<name>.input_min` etc. in the mmproj; all of `f32`
+/// where it has none).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Clamp {
+    pub input: (f32, f32),
+    pub output: (f32, f32),
+}
+
+impl Clamp {
+    pub const NONE: Clamp = Clamp { input: (f32::MIN, f32::MAX), output: (f32::MIN, f32::MAX) };
+
+    /// `<weight>.{input,output}_{min,max}`, where the file has them.
+    fn of(idx: &TensorIndex<'_>, weight: &str) -> Clamp {
+        let base = weight.trim_end_matches(".weight");
+        let scalar = |suffix: &str, default: f32| {
+            idx.take(&format!("{base}.{suffix}"), &[]).ok().and_then(|t| t.data().first().copied()).unwrap_or(default)
+        };
+        Clamp {
+            input: (scalar("input_min", f32::MIN), scalar("input_max", f32::MAX)),
+            output: (scalar("output_min", f32::MIN), scalar("output_max", f32::MAX)),
+        }
+    }
+}
+
+/// VENDORED-LOCAL: a block's linear layers' ranges.
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4VBlockClamps {
+    pub attn_q: Clamp,
+    pub attn_k: Clamp,
+    pub attn_v: Clamp,
+    pub attn_out: Clamp,
+    pub ffn_gate: Clamp,
+    pub ffn_up: Clamp,
+    pub ffn_down: Clamp,
 }
 
 #[derive(Debug)]
@@ -26,6 +64,8 @@ pub struct Gemma4VProjector {
     /// `[lm_hidden, vision_dim]` after our load-time transpose. Same convention
     /// as the Gemma 3 projector.
     pub input_projection: Weight,
+    /// VENDORED-LOCAL: its ranges.
+    pub clamps: Clamp,
 }
 
 #[derive(Debug)]
@@ -36,6 +76,24 @@ pub struct Gemma4VMmProj {
     pub blocks:        Vec<Gemma4VBlock>,
     pub projector:     Gemma4VProjector,
     pub backend:       Arc<dyn Backend>,
+    /// VENDORED-LOCAL: the tower chained on the backend's device (`chain_gemma4v`), made at the first picture.
+    pub chain:         Gemma4VTowerChain,
+}
+
+/// VENDORED-LOCAL: [`Gemma4VMmProj::chain`]: the tower's weights on the device once a picture has asked for them.
+#[derive(Default)]
+pub struct Gemma4VTowerChain(std::sync::OnceLock<Option<crate::chain_gemma4v::Tower>>);
+
+impl Gemma4VTowerChain {
+    pub(crate) fn get_or_init(&self, make: impl FnOnce() -> Option<crate::chain_gemma4v::Tower>) -> &Option<crate::chain_gemma4v::Tower> {
+        self.0.get_or_init(make)
+    }
+}
+
+impl std::fmt::Debug for Gemma4VTowerChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Gemma4VTowerChain({})", match self.0.get() { None => "not yet", Some(None) => "none", Some(Some(_)) => "on the device" })
+    }
 }
 
 impl Gemma4VMmProj {
@@ -68,6 +126,15 @@ impl Gemma4VMmProj {
                 ffn_up:      idx.take_weight(&format!("v.blk.{i}.ffn_up.weight"),  &[])?,
                 ffn_down:    idx.take_weight(&format!("v.blk.{i}.ffn_down.weight"),&[])?,
                 ffn_post:    idx.take(&format!("v.blk.{i}.ffn_post_norm.weight"),  &[])?,
+                clamps: Gemma4VBlockClamps {
+                    attn_q:   Clamp::of(&idx, &format!("v.blk.{i}.attn_q.weight")),
+                    attn_k:   Clamp::of(&idx, &format!("v.blk.{i}.attn_k.weight")),
+                    attn_v:   Clamp::of(&idx, &format!("v.blk.{i}.attn_v.weight")),
+                    attn_out: Clamp::of(&idx, &format!("v.blk.{i}.attn_out.weight")),
+                    ffn_gate: Clamp::of(&idx, &format!("v.blk.{i}.ffn_gate.weight")),
+                    ffn_up:   Clamp::of(&idx, &format!("v.blk.{i}.ffn_up.weight")),
+                    ffn_down: Clamp::of(&idx, &format!("v.blk.{i}.ffn_down.weight")),
+                },
             });
         }
 
@@ -78,6 +145,7 @@ impl Gemma4VMmProj {
         // what `linear(x, w) = x @ w^T` expects. Use as-is.
         let projector = Gemma4VProjector {
             input_projection: idx.take_weight("mm.input_projection.weight", &[])?,
+            clamps: Clamp::of(&idx, "mm.input_projection.weight"),
         };
 
         verify_gemma4v_shapes(&config, &patch_embd, &position_embd, &blocks, &projector)?;
@@ -100,130 +168,34 @@ impl Gemma4VMmProj {
             ffn_up:      b.ffn_up.try_to_device(&*backend, M),
             ffn_down:    b.ffn_down.try_to_device(&*backend, M),
             ffn_post:    upload(b.ffn_post),
+            clamps:      b.clamps,
         }).collect();
         let projector = Gemma4VProjector {
             input_projection: projector.input_projection.try_to_device(&*backend, M),
+            clamps: projector.clamps,
         };
         let position_embd = upload(position_embd);
         // patch_embd kept on host until forward time (unfold runs CPU-side).
 
-        Ok(Self { config, patch_embd, position_embd, blocks, projector, backend })
+        Ok(Self { config, patch_embd, position_embd, blocks, projector, backend, chain: Default::default() })
     }
 
-    /// Run image preprocessing → Gemma 4 V tower → projector. Same input/output
-    /// contract as [`SigLipMmProj::forward`]: `[3, H, W]` → `[n_soft, lm_hidden]`.
+    /// VENDORED-LOCAL: `image` (`[3, h, w]`, values in `[0, 1]`, each side a multiple of `patch_size * 3`, as
+    /// [`crate::vision::gemma4_image`] makes it) through the tower and the projector: the soft tokens `[(h / 48)
+    /// (w / 48), lm_hidden]`, row by row. On the backend's device ([`crate::chain_gemma4v`]); a backend without a
+    /// chain cannot (the op-by-op pass this replaced left out the rotary positions, the pooling, the clamps and the
+    /// projector's norm, and its tokens were not the model's).
     pub fn forward(&self, image: &Tensor) -> Result<Tensor> {
-        let cfg = &self.config;
-        let backend = &*self.backend;
-        if image.rank() != 3 || image.dim(0) != 3
-            || image.dim(1) != cfg.image_size || image.dim(2) != cfg.image_size
-        {
+        let side = self.config.patch_size * crate::chain_gemma4v::POOL;
+        if image.rank() != 3 || image.dim(0) != 3 || image.dim(1) % side != 0 || image.dim(2) % side != 0 {
             return Err(LlamaError::Config(format!(
-                "image shape {:?} doesn't match expected [3, {sz}, {sz}]",
-                image.shape(), sz = cfg.image_size
+                "image shape {:?} is not [3, h, w] with each side a multiple of {side}", image.shape()
             )));
         }
-
-        // ----- 1. Patch-conv as flattened matmul ------------------------
-        let patches = unfold_patches_to_host(image, cfg.patch_size)?;
-        let patches = backend.to_device(patches);
-        let in_dim = 3 * cfg.patch_size * cfg.patch_size;
-        let patch_w_host = self.patch_embd.to_host();
-        let patch_w_flat = patch_w_host.reshape(vec![cfg.embedding_dim, in_dim])
-            .map_err(|e| LlamaError::Config(format!("patch_embd reshape: {e:?}")))?;
-        let patch_w_flat = backend.to_device(patch_w_flat);
-        let mut x = backend.linear(&patches, &patch_w_flat);
-        // No patch_embd_b — Gemma 4 V conv has no bias.
-
-        // ----- 2. Position embed (axial: row + col) ----------------------
-        // The table is `[2, max_pos, D]`. For patch (py, px) at flat index
-        // `py*side + px`, we add `pos[0][py] + pos[1][px]`. Build the per-
-        // patch slice on host then add as one tensor.
-        let pe_host = self.position_embd.to_host();
-        let pe_shape = pe_host.shape();
-        let max_pos = pe_shape[1];
-        let d = cfg.embedding_dim;
-        let side = cfg.image_size / cfg.patch_size;
-        let np = side * side;
-        let pe_data = pe_host.data();
-        let row_off = 0;                  // pos[0] starts at index 0
-        let col_off = max_pos * d;        // pos[1] starts at max_pos*d
-        let mut pos_block = vec![0.0f32; np * d];
-        for py in 0..side {
-            let row_base = row_off + py * d;
-            for px in 0..side {
-                let col_base = col_off + px * d;
-                let dst = (py * side + px) * d;
-                for j in 0..d {
-                    pos_block[dst + j] = pe_data[row_base + j] + pe_data[col_base + j];
-                }
-            }
-        }
-        let pos_block = backend.to_device(Tensor::from_vec(pos_block, vec![np, d]));
-        backend.add_inplace(&mut x, &pos_block);
-
-        // ----- 3. Transformer blocks ------------------------------------
-        for blk in &self.blocks {
-            x = gemma4v_block_forward(backend, &x, blk, cfg);
-        }
-
-        // ----- 4. No global post-LN (per-block sandwich handles it) ------
-
-        // ----- 5. Projector: single linear -----------------------------
-        let out = self.projector.input_projection.linear(backend, &x);
-        Ok(out)
+        crate::chain_gemma4v::forward(self, image).ok_or_else(|| LlamaError::Config(
+            "Gemma 4's vision tower runs on a GPU (WebGPU), and this backend has none for it".into(),
+        ))
     }
-}
-
-/// One Gemma-style pre-LN+post-LN sandwich block applied to image patches.
-///   `x' = x + attn_post(Attn(ln1(x)))`
-///   `out = x' + ffn_post(MLP(ln2(x')))`
-/// Bidirectional attention via `past = seq` trick (no causal mask).
-fn gemma4v_block_forward(
-    b:   &dyn Backend,
-    x:   &Tensor,
-    blk: &Gemma4VBlock,
-    cfg: &MmProjConfig,
-) -> Tensor {
-    let n_seq = x.dim(0);
-    let n_h   = cfg.n_heads;
-    let hd    = cfg.head_dim;
-    let scale = 1.0 / (hd as f32).sqrt();
-    let eps   = cfg.layer_norm_eps;
-
-    // ----- Pre-attn RMSNorm + Q/K/V proj (no bias) -------------------
-    let xn = ggml_rs::ops::rmsnorm(b, x, &blk.ln1, eps);
-    let q  = blk.attn_q.linear(b, &xn);
-    let k  = blk.attn_k.linear(b, &xn);
-    let v  = blk.attn_v.linear(b, &xn);
-
-    let q_3d = q.reshape(vec![n_seq, n_h, hd]).expect("Q reshape");
-    let k_3d = k.reshape(vec![n_seq, n_h, hd]).expect("K reshape");
-    let v_3d = v.reshape(vec![n_seq, n_h, hd]).expect("V reshape");
-
-    // Per-head Q/K RMSNorm (Gemma 3 does this in the text tower too).
-    let q_3d = ggml_rs::ops::rmsnorm(b, &q_3d, &blk.attn_q_norm, eps);
-    let k_3d = ggml_rs::ops::rmsnorm(b, &k_3d, &blk.attn_k_norm, eps);
-
-    // Bidirectional attention via past = n_seq (mask never fires).
-    let attn = b.attention(&q_3d, &k_3d, &v_3d, n_seq, scale, n_seq, None);
-    let attn = attn.reshape(vec![n_seq, n_h * hd]).expect("attn reshape");
-
-    let mut out = blk.attn_out.linear(b, &attn);
-    // Post-attn RMSNorm (Gemma sandwich), then residual.
-    out = ggml_rs::ops::rmsnorm(b, &out, &blk.attn_post, eps);
-    b.add_inplace(&mut out, x);
-
-    // ----- Pre-FFN RMSNorm + SwiGLU + post-FFN norm + residual --------
-    let xn2 = ggml_rs::ops::rmsnorm(b, &out, &blk.ln2, eps);
-    let gate = blk.ffn_gate.linear(b, &xn2);
-    let up   = blk.ffn_up.linear(b, &xn2);
-    // Gemma uses approx-GeLU on the gate, then multiplies by up — fused.
-    let gated = b.gelu_approx_mul(&gate, &up);
-    let mut down = blk.ffn_down.linear(b, &gated);
-    down = ggml_rs::ops::rmsnorm(b, &down, &blk.ffn_post, eps);
-    b.add_inplace(&mut down, &out);
-    down
 }
 
 fn verify_gemma4v_shapes(

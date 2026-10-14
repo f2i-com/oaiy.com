@@ -17,6 +17,8 @@
 #![deny(rust_2018_idioms)]
 
 mod chain_decode;
+mod chain_gemma4;
+pub mod chain_gemma4v;
 mod chain_mmproj;
 mod chain_qwen35;
 pub use chain_qwen35::{Qwen35Chain, Tapped, SPEC_ROWS};
@@ -260,6 +262,15 @@ impl Model {
             Self::Mixtral(m)  => m.forward(tokens, kv),
             Self::Gemma4Moe(m) => m.forward(tokens, kv),
             Self::Qwen35Moe(m) => m.forward(tokens, kv).expect("Qwen3.6-MoE forward error"),
+        }
+    }
+
+    /// VENDORED-LOCAL: [`Self::forward`] with `soft` rows (`(position in tokens, [n, d] values)`) in place of their
+    /// tokens' embeddings (a picture's soft tokens): Gemma 4's; None for a model that takes none.
+    pub fn forward_spliced(&self, tokens: &[u32], soft: &[(usize, &[f32])], kv: &mut KvCache) -> Option<Tensor> {
+        match self {
+            Self::Gemma4(m) => Some(m.forward_spliced(tokens, soft, kv)),
+            _ => None,
         }
     }
 

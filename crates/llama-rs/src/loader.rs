@@ -64,7 +64,7 @@ impl ggml_rs::quantized::QuantizedHostBytes for MmapView {
 
 /// Load a tensor as a packed [`QuantizedTensor`] without dequantizing.
 /// Zero-copy: the returned tensor's storage is a view into the GGUF mmap.
-fn load_tensor_packed(g: &GgufFile, info: &TensorInfo) -> Result<QuantizedTensor> {
+pub(crate) fn load_tensor_packed(g: &GgufFile, info: &TensorInfo) -> Result<QuantizedTensor> {
     let mut shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).rev().collect();
     if shape.is_empty() { shape.push(info.numel() as usize); }
     // VENDORED-LOCAL: a source-backed (streaming) file has no mmap to view into —

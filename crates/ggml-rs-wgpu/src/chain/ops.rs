@@ -563,6 +563,13 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-tanh-in-place", TANH_IN_PLACE, [&d, &d, &d, &d, &d, &d, buffer(x), &drw], &[n], grid(n.div_ceil(256)));
     }
 
+    fn scale_in_place(&mut self, x: &DeviceVec, len: usize, s: f32) {
+        assert!(x.len >= len, "chain: a scale of {len}");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let n = len as u32;
+        self.dispatch_wide("chain-scale-in-place", SCALE_IN_PLACE, [&d, &d, &d, &d, &d, &d, buffer(x), &drw], &[n, s.to_bits()], grid(n.div_ceil(256)));
+    }
+
     fn mul_sigmoid_rows(&mut self, x: &DeviceVec, gate: &DeviceVec, rows: usize, c: usize) {
         assert!(x.len >= rows * c && gate.len >= rows, "chain: a gate of {rows} rows of {c}");
         let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());

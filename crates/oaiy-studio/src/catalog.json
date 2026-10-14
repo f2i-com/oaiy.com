@@ -161,7 +161,7 @@
       "id": "gemma-4-e2b",
       "group": "llm",
       "name": "Gemma 4 E2B",
-      "about": "Google's compact Gemma 4, for chat. (OAIY's engine does not read pictures with it yet.)",
+      "about": "Google's compact Gemma 4, for chat; on a GPU it reads pictures too (its vision projector comes with it).",
       "license": "Apache-2.0",
       "size_gb": 4.1,
       "vram_gb": 5,

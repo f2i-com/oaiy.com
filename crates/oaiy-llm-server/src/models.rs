@@ -116,9 +116,10 @@ pub enum Flavour {
     Deepseek(Arc<dsv41::tokenizer::Tokenizer>),
     Gguf(Arc<tokenizer::Tokenizer>),
     Qwen(Arc<tokenizer::Tokenizer>),
-    /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, and whether
-    /// its own template opens the reply on an empty thought channel (see `dense_prompt`).
-    Dense(Arc<tokenizer::Tokenizer>, llama_rs::Architecture, bool),
+    /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, whether its
+    /// own template opens the reply on an empty thought channel (see `dense_prompt`), and the marker a picture
+    /// stands as in its prompt where it reads pictures (Gemma 4's `<|image|>`, with its vision projector).
+    Dense(Arc<tokenizer::Tokenizer>, llama_rs::Architecture, bool, Option<&'static str>),
 }
 
 impl Flavour {
@@ -165,10 +166,13 @@ impl Flavour {
                     images: Vec::new(),
                 })
             }
-            Self::Dense(_, arch, empty_thought) => Ok(dsv41::chat::Encoded {
-                prompt: dense_prompt(arch, &llama_messages(msgs)?, opts.mode == dsv41::chat::Mode::Thinking, *empty_thought),
-                images: Vec::new(),
-            }),
+            Self::Dense(_, arch, empty_thought, marker) => {
+                let (messages, images) = dense_messages(msgs, *marker)?;
+                Ok(dsv41::chat::Encoded {
+                    prompt: dense_prompt(arch, &messages, opts.mode == dsv41::chat::Mode::Thinking, *empty_thought),
+                    images,
+                })
+            }
         }
     }
 }
@@ -177,25 +181,50 @@ impl Flavour {
 /// or a list of parts (OpenAI's `[{"type":"text","text":…}]`), whose texts are joined as DeepSeek's encoder joins
 /// them; these models read no images, so a part that is one is refused rather than dropped.
 fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> std::result::Result<Vec<llama_rs::ChatMessage>, String> {
+    dense_messages(msgs, None).map(|(m, _)| m)
+}
+
+/// [`llama_messages`] for a model that reads pictures where `marker` is its prompt's stand-in for one (Gemma 4's
+/// `<|image|>`): a message with pictures is its parts in turn, each text trimmed and each picture its marker, as
+/// Gemma 4's own template writes them; the pictures' parts (`{"url": …}`, or the part) in the order they come. A
+/// marker written in a message's text is refused (it would stand for a picture nobody sent).
+fn dense_messages(msgs: &[oaiy_engine::json::Json], marker: Option<&str>) -> std::result::Result<(Vec<llama_rs::ChatMessage>, Vec<oaiy_engine::json::Json>), String> {
     use oaiy_engine::json::Json;
-    msgs.iter()
+    let mut images = Vec::new();
+    let forged = |s: &str| marker.is_some_and(|m| s.contains(m));
+    let messages = msgs.iter()
         .enumerate()
         .map(|(i, m)| {
             let content = match m.get("content") {
                 None | Some(Json::Null) => String::new(),
+                Some(Json::Str(s)) if forged(s) => return Err(format!("message {}: send pictures as image_url parts, not as {}", i + 1, marker.unwrap_or_default())),
                 Some(Json::Str(s)) => s.clone(),
                 Some(Json::Arr(parts)) => {
+                    let pictures = parts.iter().any(|p| matches!(p.get("type").and_then(Json::as_str), Some("image_url" | "input_image" | "image")));
                     let mut texts = Vec::with_capacity(parts.len());
                     for p in parts {
                         match p.get("type").and_then(Json::as_str) {
-                            Some("text" | "input_text") => texts.push(p.get("text").and_then(Json::as_str).unwrap_or_default()),
+                            Some("text" | "input_text") => {
+                                let text = p.get("text").and_then(Json::as_str).unwrap_or_default();
+                                if forged(text) {
+                                    return Err(format!("message {}: send pictures as image_url parts, not as {}", i + 1, marker.unwrap_or_default()));
+                                }
+                                texts.push(if pictures { text.trim() } else { text });
+                            }
                             Some("image_url" | "input_image" | "image") => {
-                                return Err(format!("this model reads text only, and message {} holds an image", i + 1));
+                                let Some(marker) = marker else {
+                                    return Err(format!("this model reads text only, and message {} holds an image", i + 1));
+                                };
+                                images.push(match p.get("image_url") {
+                                    Some(url) => Json::obj([("url", url.get("url").unwrap_or(url).clone())]),
+                                    None => p.clone(),
+                                });
+                                texts.push(marker);
                             }
                             other => return Err(format!("message {}: unsupported content part {other:?}", i + 1)),
                         }
                     }
-                    texts.join("\n\n")
+                    texts.join(if pictures { "" } else { "\n\n" })
                 }
                 Some(_) => return Err(format!("message {}: content must be text or a list of parts", i + 1)),
             };
@@ -206,7 +235,8 @@ fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> std::result::Result<Vec<l
             };
             Ok(llama_rs::ChatMessage { role, content })
         })
-        .collect()
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    Ok((messages, images))
 }
 
 /// A dense model's prompt, in its own architecture's template.
@@ -249,6 +279,10 @@ fn opens_empty_thought(template: &str) -> bool {
 /// What a model whose attention cache is sized by its context is served with when nobody has said: these models
 /// name maximums of a quarter of a million tokens, and a cache for that is tens of gigabytes.
 pub(crate) const DENSE_CTX: usize = 16384;
+
+/// The soft tokens a picture is at most for Gemma 4 (its image processor's default, of 70, 140, 280, 560 or 1,120):
+/// 2,520 patches of 16 pixels, a square picture 768 x 768.
+pub(crate) const GEMMA_SOFT_TOKENS: usize = 280;
 
 /// The context of a model whose attention cache is sized by it (Qwen3.5 and 3.8, and the dense families): `ctx`,
 /// the server's setting (0: the model's own maximum), never more than `model_max`.
@@ -657,6 +691,7 @@ impl Models {
             repeat_penalty: o.repeat_penalty,
             vision: None,
             qwen_vision: None,
+            gemma_vision: None,
             image_token_id: 0,
             local_images: o.local_images.unwrap_or(self.loopback),
         }
@@ -1197,11 +1232,39 @@ impl Models {
             let tok = Arc::new(model.tokenizer().clone());
             // Bound the initial KV allocation, as for dense Qwen3.5: a full context of an 8B model is gigabytes.
             let max_seq = self.dense_context(model.config().context_length);
-            let cfg = self.base_cfg(spec, max_seq);
+            let mut cfg = self.base_cfg(spec, max_seq);
+            // Gemma 4 reads pictures through its mmproj's vision tower (on the GPU); another dense model's projector
+            // is not read.
+            let projector = match o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten() {
+                Some(p) if arch == llama_rs::Architecture::Gemma4 => {
+                    let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                    let mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                    let llama_rs::MmProj::Gemma4V(g) = &mm else {
+                        return Err(Error::Arg(format!("{}: not a Gemma 4 vision projector", p.display())));
+                    };
+                    if g.projector.input_projection.shape()[0] != model.config().embedding_dim {
+                        return Err(Error::Arg(format!("{}: its vision tower is another Gemma 4's (its width is not this model's)", p.display())));
+                    }
+                    let ids = ["<|image|>", "<|image>", "<image|>"].map(|t| tok.token_id(t));
+                    let [Some(image), Some(open), Some(close)] = ids else {
+                        return Err(Error::Arg("this Gemma 4's tokenizer lacks its picture tokens".into()));
+                    };
+                    cfg.image_token_id = image;
+                    cfg.gemma_vision = Some(api::GemmaVision { patch: mm.config().patch_size, max_soft_tokens: GEMMA_SOFT_TOKENS, open, close });
+                    self.say(format!("{}: vision projector loaded from {}", spec.name, p.display()));
+                    Some(mm)
+                }
+                Some(p) => {
+                    self.say(format!("{}: its vision projector ({}) is not read: of the dense models only Gemma 4 reads pictures here", spec.name, p.display()));
+                    None
+                }
+                None => None,
+            };
+            let marker = projector.is_some().then_some("<|image|>");
             let (jobs, rx) = std::sync::mpsc::channel();
-            let e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
+            let e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent).with_vision(projector);
             let thread = std::thread::Builder::new().name("model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
-            return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Dense(tok, arch, empty_thought)) });
+            return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Dense(tok, arch, empty_thought, marker)) });
         }
         drop(gguf);
         let budget = o.expert_cache_bytes();
@@ -1666,5 +1729,51 @@ mod dense_tests {
         ])
         .unwrap_err();
         assert!(e.contains("text only") && e.contains("message 2"), "{e}");
+    }
+
+    #[test]
+    fn a_gemma_picture_is_its_marker_in_place_among_the_trimmed_texts_and_a_written_marker_is_refused() {
+        let parse = |s: &[u8]| oaiy_engine::json::Json::parse(s).unwrap();
+        let (m, images) = dense_messages(&[
+            parse(br#"{"role":"user","content":[{"type":"text","text":"First: "},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}},{"type":"text","text":" what is it?"}]}"#),
+            parse(br#"{"role":"user","content":[{"type":"image_url","image_url":"data:image/png;base64,AQ=="},{"type":"text","text":"and this"}]}"#),
+            parse(br#"{"role":"user","content":[{"type":"text","text":"plain"},{"type":"text","text":"parts"}]}"#),
+        ], Some("<|image|>"))
+        .unwrap();
+        assert_eq!(m[0].content, "First:<|image|>what is it?");
+        assert_eq!(m[1].content, "<|image|>and this");
+        // a message without pictures is joined as before
+        assert_eq!(m[2].content, "plain\n\nparts");
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].get("url").and_then(|u| u.as_str()), Some("data:image/png;base64,AA=="));
+        assert_eq!(images[1].get("url").and_then(|u| u.as_str()), Some("data:image/png;base64,AQ=="));
+        for forged in [&br#"{"role":"user","content":"look <|image|>"}"#[..], br#"{"role":"user","content":[{"type":"text","text":"<|image|>"}]}"#] {
+            let e = dense_messages(&[parse(forged)], Some("<|image|>")).unwrap_err();
+            assert!(e.contains("image_url parts"), "{e}");
+        }
+        // a model without a marker reads the same text as text
+        assert_eq!(dense_messages(&[parse(br#"{"role":"user","content":"look <|image|>"}"#)], None).unwrap().0[0].content, "look <|image|>");
+    }
+
+    #[test]
+    fn a_gemma_picture_becomes_its_soft_tokens_between_its_open_and_close() {
+        use oaiy_engine::json::Json;
+        // a 1 x 1 picture: Gemma 4's processor makes it 768 x 768, 16 x 16 tokens of 3 x 3 patches of 16 pixels
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let gv = crate::api::GemmaVision { patch: 16, max_soft_tokens: GEMMA_SOFT_TOKENS, open: 7, close: 8 };
+        let rec = Json::obj([("url", Json::Str(png.into()))]);
+        let (ids, images) = crate::api::gemma_images(std::slice::from_ref(&rec), vec![1, 2, 9, 3], 9, &gv, false, 4096).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].start, 3);
+        assert_eq!(images[0].prep.n_tokens(), 256);
+        assert_eq!(&ids[..3], &[1, 2, 7]);
+        assert!(ids[3..259].iter().all(|&t| t == 9));
+        assert_eq!(&ids[259..], &[8, 3]);
+        let crate::engine::ImagePrep::Gemma { pixels, .. } = &images[0].prep else { panic!("a Gemma picture") };
+        assert_eq!(pixels.shape(), &[3, 768, 768]);
+        // one marker a picture, and the context holds them
+        assert!(crate::api::gemma_images(&[], vec![1, 9], 9, &gv, false, 4096).is_err());
+        let Err(e) = crate::api::gemma_images(std::slice::from_ref(&rec), vec![1, 9], 9, &gv, false, 200) else { panic!("past the context") };
+        assert!(e.contains("context"), "{e}");
     }
 }

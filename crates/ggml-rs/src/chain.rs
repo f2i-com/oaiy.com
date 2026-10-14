@@ -810,6 +810,11 @@ pub trait ChainRecorder {
         let _ = (x, len);
         unimplemented!("tanh on this device")
     }
+    /// `len` values times `s`, in place (Gemma 4's layer output scale).
+    fn scale_in_place(&mut self, x: &DeviceVec, len: usize, s: f32) {
+        let _ = (x, len, s);
+        unimplemented!("a scale on this device")
+    }
     /// `out = x` where `x` is positive, else `slope x`, for `len` values (a leaky ReLU; `out` may be `x`).
     fn leaky_relu(&mut self, x: &DeviceVec, out: &DeviceVec, len: usize, slope: f32) {
         let _ = (x, out, len, slope);
