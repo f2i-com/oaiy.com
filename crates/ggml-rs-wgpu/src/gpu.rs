@@ -32,46 +32,54 @@ impl Gpu {
         self.few.get_or_init(|| exl3::FewScratch::new(b))
     }
 
-    /// How many units (SMs) the GPU's workgroups are shared out to ([`shaders::COOP_UNITS_PROBE`]'s count of 4,096
-    /// workgroups of 1024 threads that each work about 0.1 ms: those started before any had finished), counted once
-    /// (a millisecond or so); 1 where a workgroup cannot be that large.
+    /// How many units (SMs) the GPU's workgroups are shared out to ([`shaders::COOP_UNITS_PROBE`]'s count of
+    /// workgroups of 1024 threads that each work a while: those started before any had finished), counted once; 1
+    /// where a workgroup cannot be that large. 256 workgroups first, and 4,096 only where nearly all of those started
+    /// at once (more units than the 256 tell): each works some 0.1 ms on an RTX 5090 and 5.4 on an NVIDIA A2, whose
+    /// 10 units took 4,096 of them 2.2 s, paid by every process's first tensor-core matmul (each media job's).
     pub(crate) fn coop_units(&self) -> u32 {
         *self.coop_units.get_or_init(|| {
             if self.limits.max_compute_invocations_per_workgroup < 1024 || self.limits.max_compute_workgroup_size_x < 1024 {
                 return 1;
             }
-            let pipeline = self.named_pipeline("coop-units-probe", || shaders::COOP_UNITS_PROBE.to_string());
-            let counts = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("oaiy-coop-units"),
-                size: 16,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            let params = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-coop-units-params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            let mut words = [0u8; 32];
-            words[..4].copy_from_slice(&65536u32.to_le_bytes());
-            self.queue().write_buffer(&params, 0, &words);
-            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("oaiy-coop-units"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.dummy().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.dummy().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: counts.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
-                ],
-            });
-            let mut enc = self.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&pipeline);
-                pass.set_bind_group(0, &group, &[]);
-                pass.dispatch_workgroups(4096, 1, 1);
-            }
-            self.queue().submit([enc.finish()]);
-            let got = self.read(&counts, 8);
-            u32::from_le_bytes([got[0], got[1], got[2], got[3]]).max(1)
+            let first = self.coop_units_probe(256);
+            if first < 200 { first } else { self.coop_units_probe(4096) }
         })
+    }
+
+    /// [`Self::coop_units`]'s count over `groups` workgroups.
+    fn coop_units_probe(&self, groups: u32) -> u32 {
+        let pipeline = self.named_pipeline("coop-units-probe", || shaders::COOP_UNITS_PROBE.to_string());
+        let counts = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oaiy-coop-units"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let params = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-coop-units-params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut words = [0u8; 32];
+        words[..4].copy_from_slice(&65536u32.to_le_bytes());
+        self.queue().write_buffer(&params, 0, &words);
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("oaiy-coop-units"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.dummy().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.dummy().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: counts.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
+            ],
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        self.queue().submit([enc.finish()]);
+        let got = self.read(&counts, 8);
+        u32::from_le_bytes([got[0], got[1], got[2], got[3]]).max(1)
     }
 
     /// Copy `len` bytes of `src` back to the host.
