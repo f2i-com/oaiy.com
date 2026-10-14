@@ -191,6 +191,17 @@ kernels. Use one batch for many images to amortize setup; warm per-image timing 
 not first-request latency. (The CUDA build kept a compiled-kernel cache,
 `.cuda-cache`, between jobs.)
 
+## Qwen Image 2.1 Turbo as GGUFs
+
+The catalog's *Qwen Image 2.1 Turbo (4-bit)* (11.1 GB) is Qwen's eight-step Turbo transformer as AtomicChat's Q4_K
+GGUF, the base's VAE and tokenizer (`Qwen/Qwen-Image-2.1-Turbo`), and the text encoder as Qwen's own Qwen3-VL 8B
+GGUFs: `Qwen3VL-8B-Instruct-Q4_K_M.gguf` (the language model, whose tensors are the Turbo's text encoder's) and
+`mmproj-Qwen3VL-8B-Instruct-F16.gguf` (its vision tower, for edits: a reference image's features). Added, they are one
+image model: the GGUF its `text_encoder`, the mmproj its `vision`. A language-model GGUF added to a Qwen Image model
+is its text encoder whatever the file is called, an mmproj its vision; and a worker whose text encoder is such a GGUF
+looks for an mmproj beside it (or beside the file a link names) when a job has reference images, and says which file
+to get where there is none. On an NVIDIA A2 a 512x512 edit of a 1024x1024 reference took 72 s (58 s warm).
+
 ## The kept worker, memory and large pictures
 
 OAIY keeps one `oaiy-media --serve` worker between Qwen Image pictures (WebGPU) on this computer's GPU, as it does on

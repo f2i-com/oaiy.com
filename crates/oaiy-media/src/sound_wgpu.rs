@@ -505,6 +505,13 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     }
     gpu.pieces_in_flight_at_most(0);
     let denoise_seconds = denoise_started.elapsed().as_secs_f64();
+    // (OAIY_CHAIN_PROFILE: the steps' costliest kernels)
+    if std::env::var_os("OAIY_CHAIN_PROFILE").is_some() {
+        eprintln!("sound: {frames} frames of {channels}, {} steps", r.steps);
+        for (name, ms, n) in ggml_rs_wgpu::profile::take_kernels().into_iter().take(14) {
+            eprintln!("    {name:40} {ms:9.2} ms {n:6}");
+        }
+    }
     drop((positive, negative, dit));
     report(event("decoding_sound", 0, 1));
     let decode_started = Instant::now();
