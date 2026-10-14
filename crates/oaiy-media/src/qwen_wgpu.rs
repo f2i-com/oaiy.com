@@ -161,8 +161,46 @@ pub struct WgpuTransformer {
 /// some 14; OAIY_WEBGPU_DEQUANTIZE f16 throughout), each adapter's factors beside them; else f16, each adapter's
 /// factors merged in (`W + B A`).
 pub(crate) fn matrix(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str) -> Result<Mat> {
+    matrix_as(w, lora, gpu, name, false)
+}
+
+/// The transformer's BF16 matrices as Q8_0 (`q8`) rather than f16, where the card has no room for them as f16 beside a
+/// picture's work: OAIY_QWEN_IMAGE_WEIGHTS `f16` or `q8_0`, else Q8_0 where the f16 matrices (`f16_bytes`) and some 5 GiB
+/// are more than the card has free (Vulkan's budget less its use; f16 where it does not say). Qwen Image 2.1's
+/// transformer is 12.8 GB as f16: on an NVIDIA A2 (15.7 GB) a 512x512 picture fitted beside it and a 1024x1024 one ran
+/// out of memory. As Q8_0 it is half that, and what the budget still has no room for streams
+/// (`ggml_rs_wgpu::stream`).
+pub(crate) fn weights_q8(gpu: &ggml_rs_wgpu::WgpuBackend, f16_bytes: u64) -> bool {
+    match std::env::var("OAIY_QWEN_IMAGE_WEIGHTS").map(|v| v.to_ascii_lowercase()).as_deref() {
+        Ok("f16") => return false,
+        Ok("q8_0" | "q8") => return true,
+        _ => {}
+    }
+    gpu.memory_budget().is_some_and(|(budget, used)| f16_bytes + (5 << 30) > budget.saturating_sub(used))
+}
+
+/// [`matrix`], a BF16 matrix as Q8_0 where `q8` ([`weights_q8`]).
+pub(crate) fn matrix_as(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, q8: bool) -> Result<Mat> {
     let key = format!("{name}.weight");
     let shape = w.shape(&key)?;
+    if let (true, &[n, k]) = (q8, shape.as_slice()) {
+        if k % 256 == 0 {
+            if let Some(Raw::Bf16(bytes)) = w.raw(&key)? {
+                let q = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(crate::wgpu_weights::q8_0_bf16(&bytes), vec![n, k], ggml_quants::GgmlType::Q8_0));
+                if !q.is_device() {
+                    candle_core::bail!("{key}: no room on the GPU for its {} MB as Q8_0", (n * k / 32 * 34) >> 20);
+                }
+                let mut low = Vec::new();
+                if !lora.is_empty() {
+                    for (a, b) in lora.factors(name, n, k, &Device::Cpu, DType::F32)? {
+                        let rank = a.dim(0)?;
+                        low.push((f16_vec(gpu, &a, name)?, f16_vec(gpu, &b, name)?, rank));
+                    }
+                }
+                return Ok(Mat { w: W::Quant(q), n, k, lora: low });
+            }
+        }
+    }
     let quant = w.ggml_dtype(&key).and_then(coop_type).filter(|_| std::env::var_os("OAIY_WEBGPU_DEQUANTIZE").is_none());
     if let (Some(g), &[n, k]) = (quant, shape.as_slice()) {
         if let (0, Some(Raw::Ggml(_, bytes))) = (k % 256, w.raw(&key)?) {
@@ -251,6 +289,18 @@ impl WgpuTransformer {
         if adapter.is_some() && !lora.first_adapts("transformer_blocks.0.attn.to_q") {
             candle_core::bail!("not a supported turbo adapter (expected LoRA factors for transformer_blocks.0.attn.to_q)");
         }
+        // (the blocks' matrices as Q8_0 where the card has no room for them as f16: `weights_q8`)
+        let block_names = ["attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "img_mlp.gate_layer", "img_mlp.proj", "img_mlp.out"];
+        let mut f16_bytes = 0u64;
+        for i in 0..BLOCKS {
+            for n in block_names {
+                f16_bytes += w.shape(&format!("transformer_blocks.{i}.{n}.weight"))?.iter().product::<usize>() as u64 * 2;
+            }
+        }
+        let q8 = weights_q8(&gpu, f16_bytes);
+        if q8 {
+            eprintln!("its transformer's {:.1} GB as f16 leave the GPU too little room: its matrices as Q8_0", f16_bytes as f64 / 1e9);
+        }
         let mut m = |name: &str| matrix(&mut w, &mut lora, &gpu, name);
         let (img, text1, text2) = (m("img_in")?, m("txt_in.in_layer")?, m("txt_in.out_layer")?);
         let (time1, time2) = (m("time_text_embed.timestep_embedder.linear_1")?, m("time_text_embed.timestep_embedder.linear_2")?);
@@ -261,7 +311,7 @@ impl WgpuTransformer {
         let mut blocks = Vec::with_capacity(BLOCKS);
         for i in 0..BLOCKS {
             let p = format!("transformer_blocks.{i}");
-            let mut m = |name: &str| matrix(&mut w, &mut lora, &gpu, &format!("{p}.{name}"));
+            let mut m = |name: &str| matrix_as(&mut w, &mut lora, &gpu, &format!("{p}.{name}"), q8);
             blocks.push(Block {
                 q: m("attn.to_q")?,
                 k: m("attn.to_k")?,
