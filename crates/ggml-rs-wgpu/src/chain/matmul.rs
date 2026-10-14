@@ -362,8 +362,10 @@ impl Recorder<'_> {
         if !matches!(q.dtype, ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K | ggml_quants::GgmlType::Q6_K | ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0) || k % block != 0 {
             return false;
         }
-        // (Q8_0 a step's one row alone, where [`decode_in_int8`] timed it the faster: a few rows' kernel by f32 as before)
-        if q.dtype == ggml_quants::GgmlType::Q8_0 && (m > 1 || self.alike) {
+        // (Q8_0 not where a recording's rows are alike: its rows by f32 there, as before. A few rows' int8 kernel for
+        // it too: Music 3's language model steps its guided and unguided rows together, and by f32 its [12288, 4096]
+        // matrices took 9.5 ms each on an NVIDIA A2, a frame 1.4 s)
+        if q.dtype == ggml_quants::GgmlType::Q8_0 && self.alike {
             return false;
         }
         assert!(x.len >= m * k && y.len >= m * n, "chain: an int8 matmul [{n}, {k}] of {m} rows");
@@ -380,7 +382,8 @@ impl Recorder<'_> {
             (ggml_quants::GgmlType::Q5_K, false) => "chain-q8-Q5_K-multi",
             (ggml_quants::GgmlType::Q4_0, true) => "chain-q8-Q4_0-decode",
             (ggml_quants::GgmlType::Q4_0, false) => "chain-q8-Q4_0-multi",
-            (ggml_quants::GgmlType::Q8_0, _) => "chain-q8-Q8_0-decode",
+            (ggml_quants::GgmlType::Q8_0, true) => "chain-q8-Q8_0-decode",
+            (ggml_quants::GgmlType::Q8_0, false) => "chain-q8-Q8_0-multi",
             (_, true) => "chain-q8-Q6_K-decode",
             (_, false) => "chain-q8-Q6_K-multi",
         };

@@ -81,6 +81,14 @@ On an RTX 5090:
 With `q4_k`, a card with 8 GB composes faster than real time. A minute of music
 takes about two minutes in all.
 
+On an NVIDIA A2 (16 GB, held at 1,200 MHz, over Thunderbolt 3), `q8_0`: a 10 s
+song in 198 s (loading 17 s, composing 49 s at 5 frames a second, rendering 132 s).
+Composing was 372 s until 2026-10-14: the language model steps the guided and
+unguided rows together, and Q8_0 had an int8 kernel for one row only, so the two
+rows went through the f32 kernel at 9.5 ms a matrix. `OAIY_CHAIN_PROFILE=1` prints
+the GPU's kernels every 25 frames while composing and every 10 steps while
+rendering.
+
 ## API
 
 ### `POST /v1/audio/music`

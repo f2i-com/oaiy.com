@@ -544,6 +544,27 @@ fn q8_0_from_an_int8_row_is_the_f32_kernels() {
             (blk[0], blk[1]) = (d[0], d[1]);
         }
         let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q8_0));
+        // (a few rows' kernel too: 2, 3 and 8 rows against the f32 kernel's)
+        for m in [2usize, 3, 8] {
+            let (x, y, yq) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
+            let xs: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            DeviceChain::upload(&b, &x, &xs);
+            let mut rec = Recorder::new(&b);
+            rec.matmul_rows_f32(&w, &x, &y, m);
+            rec.read(&y);
+            let want = Box::new(rec).finish().pop().unwrap();
+            let mut rec = Recorder::new(&b);
+            assert!(rec.matmul_rows_q8(&w, &x, &yq, m), "Q8_0 [{n}, {k}] of {m} rows from int8");
+            rec.read(&yq);
+            let got = Box::new(rec).finish().pop().unwrap();
+            for r in 0..m {
+                let (g, e) = (&got[r * n..(r + 1) * n], &want[r * n..(r + 1) * n]);
+                let dot: f64 = g.iter().zip(e).map(|(a, e)| *a as f64 * *e as f64).sum();
+                let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let cos = dot / (norm(g) * norm(e));
+                assert!(cos > 0.9999, "Q8_0 [{n}, {k}] row {r} of {m} from int8: cosine {cos}");
+            }
+        }
         for whole in [false, true] {
             let (x, y, yq) = (b.vec(k), b.vec(n), b.vec(n));
             let xs: Vec<f32> = (0..k).map(|i| if !whole { next() } else if i % 32 == 5 { if next() > 0.0 { 127.0 } else { -127.0 } } else { (next() * 127.0).round() }).collect();

@@ -357,8 +357,15 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let load_seconds = started.elapsed().as_secs_f64();
     let compose_started = Instant::now();
     let mut rng = lm::Rng::new(r.seed);
+    let profiled = ggml_rs_wgpu::profile::chain_on();
     let frames = crate::music_lm_wgpu::generate(&mut model, &depth, &ids, max_frames, if r.greedy { None } else { Some(&mut rng) }, |n| {
         report(event("composing", n, max_frames));
+        // (OAIY_CHAIN_PROFILE: the GPU's kernels over each 25 frames, each dispatch timed in a pass of its own)
+        if profiled && n % 25 == 0 {
+            let kernels = ggml_rs_wgpu::profile::take_kernels();
+            let top: Vec<String> = kernels.iter().take(10).map(|(name, ms, c)| format!("{name} {ms:.0} ms ({c})")).collect();
+            eprintln!("frames to {n}: {:.0} ms of kernels: {}", kernels.iter().map(|k| k.1).sum::<f64>(), top.join(", "));
+        }
         Ok(())
     })?;
     let compose_seconds = compose_started.elapsed().as_secs_f64();
@@ -375,7 +382,15 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("loading_renderer", 0, blocks));
     let acoustic = crate::music_wgpu::WgpuAcoustic::load(&r.model_dir, &gpu, r.steps, r.guidance, |i| report(event("loading_renderer", i, blocks)))?;
     let seed = r.seed;
-    let audio = acoustic.generate(&hidden, frames.len(), |k, len| noise(seed, k, len)?.flatten_all()?.to_vec1::<f32>(), |done, total| report(event("rendering", done, total)))?;
+    let audio = acoustic.generate(&hidden, frames.len(), |k, len| noise(seed, k, len)?.flatten_all()?.to_vec1::<f32>(), |done, total| {
+        report(event("rendering", done, total));
+        // (OAIY_CHAIN_PROFILE: the GPU's kernels over each 10 steps)
+        if profiled && done % 10 == 0 {
+            let kernels = ggml_rs_wgpu::profile::take_kernels();
+            let top: Vec<String> = kernels.iter().take(10).map(|(name, ms, c)| format!("{name} {ms:.0} ms ({c})")).collect();
+            eprintln!("steps to {done}: {:.0} ms of kernels: {}", kernels.iter().map(|k| k.1).sum::<f64>(), top.join(", "));
+        }
+    })?;
     drop(acoustic);
     let render_seconds = render_started.elapsed().as_secs_f64();
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
