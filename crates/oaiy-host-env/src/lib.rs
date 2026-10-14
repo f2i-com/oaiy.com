@@ -27,15 +27,21 @@ use std::process::Command;
 const APPIMAGE_OWN: [&str; 4] = ["APPDIR", "APPIMAGE", "ARGV0", "OWD"];
 
 /// The folder the AppImage this process runs from is mounted at (`$APPDIR`, which its launcher sets, an extracted
-/// one's too); None elsewhere.
+/// one's too); None elsewhere, and on every system but Linux, which has no AppImage (an `APPDIR` there is someone
+/// else's, and its lists are not `:`'s).
 pub fn appdir() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
     appdir_of(std::env::var_os("APPDIR"))
 }
 
-/// [`appdir`] of a value of `APPDIR`: an absolute folder, and not `/` (whose entries are every one).
+/// [`appdir`] of a value of `APPDIR`: a folder from the root, and not `/` (whose entries are every one).
 fn appdir_of(value: Option<OsString>) -> Option<PathBuf> {
     let dir = PathBuf::from(value?);
-    (dir.is_absolute() && dir.parent().is_some()).then_some(dir)
+    // (has_root, not is_absolute: the same on Linux, and the test of a Linux path passes on Windows, where
+    // `/tmp/...` has a root and no drive)
+    (dir.has_root() && dir.parent().is_some()).then_some(dir)
 }
 
 /// A program `program` to start, with the computer's environment ([`apply`]).

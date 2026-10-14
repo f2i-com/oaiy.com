@@ -186,11 +186,8 @@ fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     // explicit allow-list: no PATH games, no OPENAI_API_KEY, no proxy vars.
     cmd.env_clear();
     // (from the computer's environment, where OAIY runs from an AppImage: its PATH without the AppImage's programs)
-    let host: std::collections::HashMap<String, String> = oaiy_host_env::vars().into_iter().collect();
-    for key in env_allow_list() {
-        if let Some(v) = host.get(*key) {
-            cmd.env(key, v);
-        }
+    for (key, v) in allowed_env(oaiy_host_env::vars()) {
+        cmd.env(key, v);
     }
     cmd.env("CODEX_HOME", codex_home);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -491,6 +488,17 @@ fn env_allow_list() -> &'static [&'static str] {
     {
         &["HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"]
     }
+}
+
+/// The allow-list's variables found in `host`, by the allow-list's names. On Windows a variable's name is matched
+/// without its case, as the system reads it: it keeps the case it was set with (`Path`, `windir`), and a lookup by
+/// `PATH` alone gave the child no PATH, so `cmd /c codex` found neither codex nor node.
+fn allowed_env(host: Vec<(String, String)>) -> Vec<(&'static str, String)> {
+    let same = |name: &str, key: &str| if cfg!(windows) { name.eq_ignore_ascii_case(key) } else { name == key };
+    env_allow_list()
+        .iter()
+        .filter_map(|key| host.iter().find(|(name, _)| same(name, key)).map(|(_, v)| (*key, v.clone())))
+        .collect()
 }
 
 /// Accept only an https login URL on a known OpenAI host.
@@ -1225,6 +1233,19 @@ fn arguments_of(call: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_child_is_given_the_allow_lists_variables_by_their_names_as_the_system_reads_them() {
+        let host = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        if cfg!(windows) {
+            // As a Windows environment names them: `Path` and `windir`, which a lookup by `PATH` alone missed.
+            let got = allowed_env(host(&[("Path", r"C:\Windows;C:\nodejs"), ("windir", r"C:\Windows"), ("OPENAI_API_KEY", "sk")]));
+            assert_eq!(got, [("WINDIR", r"C:\Windows".to_string()), ("PATH", r"C:\Windows;C:\nodejs".to_string())]);
+        } else {
+            let got = allowed_env(host(&[("PATH", "/usr/bin"), ("path", "/elsewhere"), ("HOME", "/home/me"), ("OPENAI_API_KEY", "sk")]));
+            assert_eq!(got, [("HOME", "/home/me".to_string()), ("PATH", "/usr/bin".to_string())]);
+        }
+    }
 
     #[test]
     fn the_model_catalogue_is_read_from_the_page_codex_returns() {
