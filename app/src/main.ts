@@ -910,6 +910,23 @@ async function main(): Promise<void> {
             }
           },
         },
+        // The allowed numbers kept as the blocked ones are: a restart with the phone slow to answer lets no one else through.
+        allowedKept: {
+          read: () => {
+            try {
+              return window.localStorage.getItem(ALLOWED_KEPT) ?? '';
+            } catch {
+              return '';
+            }
+          },
+          write: (allowed) => {
+            try {
+              window.localStorage.setItem(ALLOWED_KEPT, allowed);
+            } catch {
+              // No storage: read again from the phone after a restart.
+            }
+          },
+        },
         // A caller's words, or a text, while an agent of theirs answers go where they came, without splitting the reply being written.
         arrived: (session, text) => {
           if (viewing !== session.thread) return;
@@ -1100,6 +1117,8 @@ async function main(): Promise<void> {
 
   /** Where the blocked list is kept as it was last read (see `SessionHooks.blockedKept`). */
   const BLOCKED_KEPT = 'oaiy.phone.blockedNumbers';
+  /** Where the allowed numbers and their switches are kept as they were last read (see `SessionHooks.allowedKept`). */
+  const ALLOWED_KEPT = 'oaiy.phone.allowedNumbers';
 
   /** Aokie's blocked numbers and its allowed numbers, as a screening that says nothing else; null when the phone cannot be asked. */
   async function readBlockedNumbers(): Promise<Screening | null> {

@@ -356,6 +356,37 @@ describe('text-message conversations', () => {
     expect(fake.bodies).toHaveLength(0);
   });
 
+  it('the allowed numbers are kept across a restart too: a phone slow to say them lets no one else through', async () => {
+    const fake = fakeProvider('openai', []);
+    let kept = '';
+    const allowedKept = { read: () => kept, write: (allowed: string) => (kept = allowed) };
+    // The phone says it keeps texts to its allowed numbers: kept.
+    const said = setup({ answer: true, instructions: '' }, fakeDesktop(), { screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false, allowedNumbers: '0400 000 017', callsAllowedOnly: false, otherCallers: 'ring' as const, textsAllowedOnly: true }), allowedKept });
+    await said.sessions.refreshBlocked();
+    expect(JSON.parse(kept)).toEqual({ allowedNumbers: '0400 000 017', callsAllowedOnly: false, textsAllowedOnly: true });
+    // After a restart the phone never answers: the kept list holds, and a stranger's text is kept, not answered.
+    const never = setup({ answer: true, instructions: '' }, fakeDesktop(), { screening: () => new Promise(() => {}), allowedKept });
+    vi.useFakeTimers();
+    try {
+      const arriving = never.sessions.textArrived('+61400000018', '', 'Hi, is this the lawn people?');
+      await vi.advanceTimersByTimeAsync(5000);
+      const stranger = await arriving;
+      expect(never.sessions.notAnswered(stranger)).toContain('not one of the allowed numbers');
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(fake.bodies).toHaveLength(0);
+    expect(never.desktop.commands).toEqual([]);
+    // The phone cannot be asked: still kept to the list; then the phone turns it off, and that is kept.
+    const down = setup({ answer: true, instructions: '' }, fakeDesktop(), { screening: async () => { throw new Error('the plugin is not running'); }, allowedKept });
+    const again = await down.sessions.textArrived('+61400000018', '', 'Hello?');
+    await settled(down.sessions);
+    expect(down.sessions.notAnswered(again)).toContain('not one of the allowed numbers');
+    const off = setup({ answer: true, instructions: '' }, fakeDesktop(), { screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false, allowedNumbers: '0400 000 017', callsAllowedOnly: false, otherCallers: 'ring' as const, textsAllowedOnly: false }), allowedKept });
+    await off.sessions.refreshBlocked();
+    expect(JSON.parse(kept).textsAllowedOnly).toBe(false);
+  });
+
   it('a text kept while another page answered the texts is not answered again when this page takes them over', async () => {
     fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Hello!' } }] }, { text: 'Replied.' }]);
     const messages = { answer: false, instructions: '' };

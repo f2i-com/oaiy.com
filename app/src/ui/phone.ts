@@ -154,6 +154,9 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
     h('label.row', rejectPrivate, ' Do not answer callers who hide their number'),
     h('label', 'Allowed numbers', allowed),
     h('label.row', callsAllowedOnly, ' Answer calls only from the allowed numbers, and ring no one else'),
+    // (the phone keeps calls to the list itself, and an Aokie from before the list says nothing of it: it is stored
+    // there, and every call is answered; texts and ringing back keep to it here whatever Aokie's version)
+    h('p.muted', 'Calls keep to the list with an Aokie that has allowed numbers (newer than 0.0.2); an older one answers every call.'),
     otherCallersRow,
     h('label.row', textsAllowedOnly, ' Answer texts only from the allowed numbers, and text no one else'),
   );

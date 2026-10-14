@@ -183,6 +183,8 @@ export interface SessionHooks {
   screening?: () => Promise<Screening | null>;
   /** The blocked list as it was last read, kept across a restart: gone by until the phone says it again, and while it cannot. */
   blockedKept?: { read: () => string; write: (list: string) => void };
+  /** The allowed numbers and their switches as last read (JSON), kept as the blocked list is: a phone slow to say them after a restart lets no one else through. */
+  allowedKept?: { read: () => string; write: (allowed: string) => void };
 }
 
 /**
@@ -2308,8 +2310,9 @@ export class Sessions {
   private blocked = '';
   private blockedKnown = false;
   /**
-   * Whom the phone deals with while the person tries it out (Aokie's allowed numbers), as last read here: none of
-   * it is said by the phone (an older Aokie), or it is off, until the phone says otherwise.
+   * Whom the phone deals with while the person tries it out (Aokie's allowed numbers), as last read here or before the
+   * last restart (`hooks.allowedKept`): none of it is said by the phone (an older Aokie), or it is off, until the
+   * phone says otherwise.
    */
   private allowed: Pick<Screening, 'allowedNumbers' | 'callsAllowedOnly' | 'textsAllowedOnly'> | null = null;
 
@@ -2327,6 +2330,14 @@ export class Sessions {
       } catch {
         // Nothing kept that can be read: as none.
       }
+      try {
+        const kept = JSON.parse(this.hooks.allowedKept?.read() || 'null') as Record<string, unknown> | null;
+        if (kept && typeof kept === 'object') {
+          this.allowed = { allowedNumbers: typeof kept.allowedNumbers === 'string' ? kept.allowedNumbers : '', callsAllowedOnly: kept.callsAllowedOnly === true, textsAllowedOnly: kept.textsAllowedOnly === true };
+        }
+      } catch {
+        // Nothing kept that can be read: as none.
+      }
     }
     const asked = this.hooks.screening?.().catch(() => null);
     if (!asked) return this.blocked;
@@ -2334,7 +2345,17 @@ export class Sessions {
     const late = new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), BLOCKED_WAIT_MS)));
     const read = await Promise.race([asked, late]);
     clearTimeout(timer);
-    if (read) this.allowed = { allowedNumbers: read.allowedNumbers, callsAllowedOnly: read.callsAllowedOnly, textsAllowedOnly: read.textsAllowedOnly };
+    if (read) {
+      const allowed = { allowedNumbers: read.allowedNumbers ?? '', callsAllowedOnly: !!read.callsAllowedOnly, textsAllowedOnly: !!read.textsAllowedOnly };
+      if (JSON.stringify(allowed) !== JSON.stringify(this.allowed)) {
+        try {
+          this.hooks.allowedKept?.write(JSON.stringify(allowed));
+        } catch {
+          // Not kept: read again after the next restart.
+        }
+      }
+      this.allowed = allowed;
+    }
     if (read && read.blockedNumbers !== this.blocked) {
       this.blocked = read.blockedNumbers;
       try {
