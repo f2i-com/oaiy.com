@@ -15,6 +15,9 @@ pub struct Request {
     pub base: PathBuf,
     pub transformer: PathBuf,
     pub text_encoder: Option<PathBuf>,
+    /// Qwen3-VL's vision tower for reference images, where the text encoder has none (a GGUF of its language model):
+    /// Qwen's mmproj GGUF, or found beside the text encoder ([`vision_root`]).
+    pub vision: Option<PathBuf>,
     pub model: Option<String>,
     pub adapter: Option<PathBuf>,
     /// The transformer is Qwen-Image-2.1-Turbo, the distilled checkpoint (`distilled`; else a transformer file whose
@@ -121,6 +124,7 @@ impl Request {
             base: string("base")?.into(),
             transformer: string("transformer")?.into(),
             text_encoder: match j.get("text_encoder") { None | Some(Json::Null) => None, _ => Some(string("text_encoder")?.into()) },
+            vision: match j.get("vision") { None | Some(Json::Null) => None, _ => Some(string("vision")?.into()) },
             model: j.get("model").and_then(Json::as_str).map(str::to_owned),
             adapter,
             distilled,
@@ -427,6 +431,42 @@ impl Kept {
     }
 }
 
+/// Where a job's reference images are seen from: its `vision` named, else its text encoder (the checkpoint's folder,
+/// whose `model.visual` is the vision tower), else, for a text encoder that is a GGUF of the language model alone (Qwen's
+/// `Qwen3VL-8B-Instruct-Q4_K_M.gguf`), an mmproj GGUF beside it or beside the file a link to it names (Qwen's
+/// `mmproj-Qwen3VL-8B-Instruct-F16.gguf`, the first by name where there are more).
+fn vision_root(r: &Request) -> Result<PathBuf> {
+    if let Some(v) = &r.vision {
+        return Ok(v.clone());
+    }
+    let text = r.text_encoder.clone().unwrap_or_else(|| r.base.join("text_encoder"));
+    if !text.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) || crate::weights::Weights::open(&text).is_ok_and(|w| w.has("model.visual.patch_embed.proj.bias")) {
+        return Ok(text);
+    }
+    let folders = [text.parent().map(Path::to_path_buf), std::fs::canonicalize(&text).ok().and_then(|t| t.parent().map(Path::to_path_buf))];
+    let mut found: Vec<PathBuf> = folders
+        .into_iter()
+        .flatten()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.to_ascii_lowercase().starts_with("mmproj") && f.to_ascii_lowercase().ends_with(".gguf")))
+        .collect();
+    found.sort();
+    found.into_iter().next().ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "a reference image needs Qwen3-VL's vision tower, which the text encoder {} (a GGUF of its language model) has not: put Qwen's mmproj-Qwen3VL-8B-Instruct-F16.gguf (Qwen/Qwen3-VL-8B-Instruct-GGUF) beside it, or name it as the model's vision",
+            text.display()
+        ))
+    })
+}
+
+/// OAIY_MEDIA_MEMORY: how long `what` took since `began` said.
+fn say_time(what: &str, began: Instant) {
+    if std::env::var_os("OAIY_MEDIA_MEMORY").is_some() {
+        eprintln!("{what} in {:.2} s", began.elapsed().as_secs_f64());
+    }
+}
+
 /// OAIY_MEDIA_MEMORY: the card's memory this process uses at `stage` said (Vulkan's budget and use).
 #[cfg(feature = "webgpu")]
 fn say_memory(stage: &str, gpu: Option<&ggml_rs_wgpu::WgpuBackend>) {
@@ -443,6 +483,9 @@ fn say_memory(stage: &str, gpu: Option<&ggml_rs_wgpu::WgpuBackend>) {
 /// the card has free, so some quarter of it), by its latent's tokens and its pixels, with room to spare; what a kept
 /// worker holds that the job does not use then is let go where the card has less ([`generate_kept`]).
 const SAMPLING_BYTES_A_TOKEN: u64 = 640 << 10;
+/// What a prefix position (a text token, a reference's latent token) takes for the steps: its keys and values in each
+/// of the 32 blocks (1 MB), and the vectors that make them.
+const PREFIX_BYTES_A_POSITION: u64 = 1400 << 10;
 const DECODE_BYTES_A_PIXEL: u64 = 1500;
 const ROOM_TO_SPARE: u64 = 768 << 20;
 
@@ -504,10 +547,12 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
         // their latents by the VAE's encoder on WebGPU for a WebGPU job (on the CPU it took 15 s a 1024x1024 one)
         #[cfg(feature = "webgpu")]
         if r.webgpu {
+            let began = Instant::now();
             let encoder = crate::vae_wgpu::WgpuVae::load_encoder(&r.base, r.device)?;
             for image in &images {
                 references.push((encoder.encode(&image.pixels(&Device::Cpu, DType::F32)?)?, image.h / 16, image.w / 16));
             }
+            say_time("the references' latents", began);
         }
         if references.is_empty() {
             let encoder = Vae::load_encoder(&r.base, &dev, dtype)?;
@@ -519,14 +564,17 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
                 ));
             }
         }
-        let root = r.text_encoder.clone().unwrap_or_else(|| r.base.join("text_encoder"));
+        let root = vision_root(r)?;
         // the vision tower on WebGPU for a WebGPU job (on the CPU it took 45 s a 1024x1024 reference)
         #[cfg(feature = "webgpu")]
         if r.webgpu {
+            let began = Instant::now();
             let vision = crate::vision_wgpu::WgpuVisionEncoder::load(&root, r.device)?;
+            say_time("the vision tower loaded", began);
             for image in &images {
                 features.push(vision.encode(image)?);
             }
+            say_time("the references' vision features", began);
         }
         if features.is_empty() {
             let vision = VisionEncoder::load(&root, &dev, dtype)?;
@@ -617,7 +665,10 @@ pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl F
     // (a kept VAE decoder let go where the steps want its room)
     #[cfg(feature = "webgpu")]
     if let Some(k) = kept.as_mut() {
-        let need = (h * w) as u64 * SAMPLING_BYTES_A_TOKEN + ROOM_TO_SPARE;
+        // (and its prefix: the text's tokens and its references' latents, each position's keys and values in every
+        // block and the vectors that make them: a 1024x1024 reference's 4,096 positions 5.5 GB)
+        let prefix: usize = embeddings.iter().map(|e| e.states.dim(1).unwrap_or(0)).max().unwrap_or(0) + references.iter().map(|(_, h, w)| h * w).sum::<usize>();
+        let need = (h * w) as u64 * SAMPLING_BYTES_A_TOKEN + prefix as u64 * PREFIX_BYTES_A_POSITION + ROOM_TO_SPARE;
         let short = |model: &Model| free_on(model.backend()).is_some_and(|free| free < need);
         if short(&model) && k.encoder.as_mut().is_some_and(|(_, e)| e.let_go_layers()) {
             eprintln!("the text encoder's kept layers let go: a {}x{} picture's steps want their room", r.width, r.height);

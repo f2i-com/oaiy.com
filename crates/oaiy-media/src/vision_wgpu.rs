@@ -45,9 +45,10 @@ impl Linear {
         Ok(Self { w: v, b, n, k })
     }
 
-    /// `y[r] = W x[r] + b` for `rows` rows, the inputs as f32.
+    /// `y[r] = W x[r] + b` for `rows` rows, the inputs f16 within a scaled range (`matmul_f16_rows_ranged`: on the
+    /// tensor cores, a 1024x1024 reference's 117 matmuls 5.9 s with f32 inputs on an NVIDIA A2).
     fn forward(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize) {
-        r.matmul_f16_rows_f32(&self.w, self.n, self.k, x, y, rows);
+        r.matmul_f16_rows_ranged(&self.w, self.n, self.k, x, y, rows);
         r.add_bias_rows(y, &self.b, rows, self.n);
     }
 }
@@ -115,7 +116,19 @@ impl WgpuVisionEncoder {
         let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let mut w = Weights::open(root)?;
         let p = "model.visual";
-        let patch_w = w.tensor(&format!("{p}.patch_embed.proj.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let patch_w = if w.has("v.patch_embd.weight.1") {
+            // (an mmproj GGUF's: each of the two frames' kernels a tensor `[1152, 3, 16, 16]`, put together as the
+            // checkpoint's `[1152, 3, 2, 16, 16]`: an output's channel's two frames side by side)
+            let frames = ["v.patch_embd.weight", "v.patch_embd.weight.1"].map(|n| w.tensor(n, &Device::Cpu, DType::F32).and_then(|t| t.flatten_all()?.to_vec1::<f32>()));
+            let [a, b] = frames;
+            let (a, b) = (a?, b?);
+            if a.len() != D * PATCH / 2 || b.len() != a.len() {
+                candle_core::bail!("not Qwen3-VL's vision tower (a frame's patch projection of {} values)", a.len());
+            }
+            a.chunks(256).zip(b.chunks(256)).flat_map(|(a, b)| a.iter().chain(b).copied()).collect()
+        } else {
+            w.tensor(&format!("{p}.patch_embed.proj.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?
+        };
         if patch_w.len() != D * PATCH {
             candle_core::bail!("not Qwen3-VL's vision tower (a patch projection of {} values)", patch_w.len());
         }
@@ -276,6 +289,32 @@ mod tests {
             let c = rows(g, w)?;
             eprintln!("deeper features {i}: the worst row's cosine {c:.6}");
             assert!(c > 0.999, "deeper features {i}: cosine {c}");
+        }
+        Ok(())
+    }
+
+    /// A reference's features' time and values (`--ignored --nocapture`): the vision tower of `OAIY_QWEN_VISION` (an
+    /// mmproj GGUF, or a checkpoint's text encoder folder) on `OAIY_QWEN_IMAGE_REFERENCE` at 1024, twice; the features
+    /// (the embedding, then each DeepStack merger's) written to `OAIY_FEATURES_OUT` as f32 where it is named, to set
+    /// one way's beside another's (OAIY_F16_EXACT=1: the linear layers' inputs f32).
+    #[test]
+    #[ignore = "a timing; needs Qwen3-VL's vision tower (OAIY_QWEN_VISION), a picture (OAIY_QWEN_IMAGE_REFERENCE) and a WebGPU adapter"]
+    fn measure_encode() -> Result<()> {
+        let (Some(vision), Some(image)) = (std::env::var_os("OAIY_QWEN_VISION").map(std::path::PathBuf::from), std::env::var_os("OAIY_QWEN_IMAGE_REFERENCE").map(std::path::PathBuf::from)) else { return Ok(()) };
+        let reference = crate::reference::Reference::load(&image, 1024)?;
+        let gpu = WgpuVisionEncoder::load(&vision, 0)?;
+        let mut features = None;
+        for run in 0..2 {
+            let t = std::time::Instant::now();
+            features = Some(gpu.encode(&reference)?);
+            eprintln!("encode {run}: {:.3} s", t.elapsed().as_secs_f64());
+        }
+        if let (Some(out), Some(f)) = (std::env::var_os("OAIY_FEATURES_OUT"), features) {
+            let mut values = f.embedding.flatten_all()?.to_vec1::<f32>()?;
+            for d in &f.deep {
+                values.extend(d.flatten_all()?.to_vec1::<f32>()?);
+            }
+            std::fs::write(out, values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         }
         Ok(())
     }

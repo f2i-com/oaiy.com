@@ -53,6 +53,7 @@ impl Weights {
         ]
         .into_iter()
         .chain(llama_name(name))
+        .chain(self.mmproj_name(name))
         {
             let exists = match self {
                 Self::Safe(s) => s.get(&candidate).is_some(),
@@ -67,6 +68,50 @@ impl Weights {
 
     pub fn has(&self, name: &str) -> bool {
         self.resolve(name).is_ok()
+    }
+
+    /// Qwen3-VL's vision tower as llama.cpp's mmproj GGUF names it (`clip`, Qwen's own
+    /// `mmproj-Qwen3VL-8B-Instruct-F16.gguf`), for its Hugging Face name: `model.visual.blocks.3.attn.qkv.weight` is
+    /// `v.blk.3.attn_qkv.weight`; the merger's norm and layers `v.post_ln`, `mm.0` and `mm.2`; DeepStack merger `i`
+    /// that of the `i`-th layer `clip.vision.is_deepstack_layers` marks (8, 16 and 24). The patch projection's two
+    /// frames are two tensors there (`v.patch_embd.weight` and `.weight.1`), put together by the vision tower.
+    fn mmproj_name(&self, name: &str) -> Option<String> {
+        let Self::Gguf { content, .. } = self else { return None };
+        let (module, kind) = name.strip_prefix("model.visual.")?.rsplit_once('.')?;
+        let mapped = match module {
+            "pos_embed" => "v.position_embd".to_string(),
+            "patch_embed.proj" => "v.patch_embd".to_string(),
+            "merger.norm" => "v.post_ln".to_string(),
+            "merger.linear_fc1" => "mm.0".to_string(),
+            "merger.linear_fc2" => "mm.2".to_string(),
+            _ => {
+                if let Some((i, part)) = module.strip_prefix("blocks.").and_then(|b| b.split_once('.')) {
+                    i.parse::<usize>().ok()?;
+                    let part = match part {
+                        "norm1" => "ln1",
+                        "norm2" => "ln2",
+                        "attn.qkv" => "attn_qkv",
+                        "attn.proj" => "attn_out",
+                        "mlp.linear_fc1" => "ffn_up",
+                        "mlp.linear_fc2" => "ffn_down",
+                        _ => return None,
+                    };
+                    format!("v.blk.{i}.{part}")
+                } else if let Some((i, part)) = module.strip_prefix("deepstack_merger_list.").and_then(|d| d.split_once('.')) {
+                    let layer = deepstack_layers(content).get(i.parse::<usize>().ok()?).copied()?;
+                    let part = match part {
+                        "norm" => "norm",
+                        "linear_fc1" => "fc1",
+                        "linear_fc2" => "fc2",
+                        _ => return None,
+                    };
+                    format!("v.deepstack.{layer}.{part}")
+                } else {
+                    return None;
+                }
+            }
+        };
+        Some(format!("{mapped}.{kind}"))
     }
 
     /// A GGUF's fused gate or up half as a quantized tensor of its own (None where `name` is not one).
@@ -402,6 +447,16 @@ impl Linear {
 /// Device bytes of a plain tensor (norm scales and the like), for block sizes.
 pub fn bytes_of(t: &Tensor) -> u64 {
     tensor_bytes(t)
+}
+
+/// The vision tower's layers whose states a DeepStack merger takes, as an mmproj GGUF marks them
+/// (`clip.vision.is_deepstack_layers`, a flag a layer), else Qwen3-VL 8B's 8, 16 and 24.
+fn deepstack_layers(content: &gguf_file::Content) -> Vec<usize> {
+    use gguf_file::Value;
+    match content.metadata.get("clip.vision.is_deepstack_layers") {
+        Some(Value::Array(flags)) => flags.iter().enumerate().filter(|(_, f)| matches!(f, Value::Bool(true))).map(|(i, _)| i).collect(),
+        _ => vec![8, 16, 24],
+    }
 }
 
 /// A language model's tensor as llama.cpp's GGUF names it (a text encoder in a GGUF, e.g. Qwen3-VL 8B's as
