@@ -16,7 +16,7 @@
 use super::lm::{self, AUDIO_END, CODE_OFFSET, SEMANTIC_CODES};
 use crate::ltx::store::Store;
 use candle_core::{
-    quantized::{gguf_file, ggml_file, GgmlDType, QTensor},
+    quantized::{ggml_file, GgmlDType, QTensor},
     DType, Device, Result, Tensor,
 };
 use oaiy_engine::json::Json;
@@ -70,6 +70,130 @@ fn quantize(t: &Tensor, dtype: GgmlDType) -> Result<QTensor> {
     ggml_file::qtensor_from_ggml(dtype, &parts.concat(), vec![rows, cols], &Device::Cpu)
 }
 
+/// A metadata value of the converted file.
+enum Meta {
+    Str(String),
+    U32(u32),
+    F32(f32),
+}
+
+/// GGUF's number for a tensor format (candle keeps its own to itself).
+fn ggml_type(d: GgmlDType) -> Result<u32> {
+    Ok(match d {
+        GgmlDType::F32 => 0,
+        GgmlDType::F16 => 1,
+        GgmlDType::Q8_0 => 8,
+        GgmlDType::Q4K => 12,
+        GgmlDType::Q5K => 13,
+        GgmlDType::Q6K => 14,
+        GgmlDType::BF16 => 30,
+        other => return Err(msg(format!("no GGUF number for {other:?} here"))),
+    })
+}
+
+/// The converted file as it is made: each tensor's bytes appended to a spill file beside the target as soon as they
+/// are quantized (only its name, shape and format kept), then the GGUF header (candle's layout: version 2, its
+/// tensors 32 bytes apart) and the spill copied after it. Held in memory until the end, the 36 layers and the text
+/// table were 13.7 GB at once for `q8_0`, and a 16 GB machine (the kind the smaller file is for) killed the
+/// conversion.
+struct Spill {
+    file: std::io::BufWriter<std::fs::File>,
+    path: PathBuf,
+    tensors: Vec<(String, Vec<usize>, GgmlDType)>,
+    open: usize,
+}
+
+impl Spill {
+    fn create(path: PathBuf) -> Result<Self> {
+        Ok(Self { file: std::io::BufWriter::new(std::fs::File::create(&path)?), path, tensors: Vec::new(), open: 0 })
+    }
+
+    /// A tensor whose bytes follow ([`Self::bytes`], then [`Self::end`]).
+    fn begin(&mut self, name: &str, dims: Vec<usize>, dtype: GgmlDType) {
+        self.tensors.push((name.to_string(), dims, dtype));
+        self.open = 0;
+    }
+
+    fn bytes(&mut self, b: &[u8]) -> Result<()> {
+        std::io::Write::write_all(&mut self.file, b)?;
+        self.open += b.len();
+        Ok(())
+    }
+
+    fn end(&mut self) -> Result<()> {
+        let (_, dims, dtype) = self.tensors.last().ok_or_else(|| msg("no tensor begun"))?;
+        let want = dims.iter().product::<usize>() / dtype.block_size() * dtype.type_size();
+        if self.open != want {
+            return Err(msg(format!("{}: {} bytes written, {want} its shape's", self.tensors.last().map_or("", |t| t.0.as_str()), self.open)));
+        }
+        std::io::Write::write_all(&mut self.file, &[0u8; 32][..(32 - self.open % 32) % 32])?;
+        Ok(())
+    }
+
+    fn push(&mut self, name: &str, t: QTensor) -> Result<()> {
+        self.begin(name, t.shape().dims().to_vec(), t.dtype());
+        self.bytes(&t.data()?)?;
+        self.end()
+    }
+
+    /// The header, then the spill's bytes, into `out` (through a partial file renamed, so a half-written file is
+    /// never mistaken for a finished one); the spill removed.
+    fn finish(mut self, out: &Path, meta: &[(&str, Meta)]) -> Result<()> {
+        use std::io::{Seek, Write};
+        self.file.flush()?;
+        drop(self.file);
+        let string = |w: &mut dyn Write, s: &str| -> Result<()> {
+            w.write_all(&(s.len() as u64).to_le_bytes())?;
+            w.write_all(s.as_bytes())?;
+            Ok(())
+        };
+        let partial = out.with_extension("gguf.partial");
+        {
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&partial)?);
+            w.write_all(&0x4655_4747u32.to_le_bytes())?;
+            w.write_all(&2u32.to_le_bytes())?;
+            w.write_all(&(self.tensors.len() as u64).to_le_bytes())?;
+            w.write_all(&(meta.len() as u64).to_le_bytes())?;
+            for (key, value) in meta {
+                string(&mut w, key)?;
+                match value {
+                    Meta::Str(v) => {
+                        w.write_all(&8u32.to_le_bytes())?;
+                        string(&mut w, v)?;
+                    }
+                    Meta::U32(v) => {
+                        w.write_all(&4u32.to_le_bytes())?;
+                        w.write_all(&v.to_le_bytes())?;
+                    }
+                    Meta::F32(v) => {
+                        w.write_all(&6u32.to_le_bytes())?;
+                        w.write_all(&v.to_le_bytes())?;
+                    }
+                }
+            }
+            let mut offset = 0u64;
+            for (name, dims, dtype) in &self.tensors {
+                string(&mut w, name)?;
+                w.write_all(&(dims.len() as u32).to_le_bytes())?;
+                for d in dims.iter().rev() {
+                    w.write_all(&(*d as u64).to_le_bytes())?;
+                }
+                w.write_all(&ggml_type(*dtype)?.to_le_bytes())?;
+                w.write_all(&offset.to_le_bytes())?;
+                let size = (dims.iter().product::<usize>() / dtype.block_size() * dtype.type_size()) as u64;
+                offset += size + (32 - size % 32) % 32;
+            }
+            let at = w.stream_position()?;
+            w.write_all(&[0u8; 32][..((32 - at % 32) % 32) as usize])?;
+            std::io::copy(&mut std::fs::File::open(&self.path)?, &mut w)?;
+            w.flush()?;
+        }
+        std::fs::remove_file(&self.path)?;
+        std::fs::rename(&partial, out)?;
+        Ok(())
+    }
+}
+
 /// Convert `model_dir/language_model` to `out` with `quant` layers.
 /// `progress(done, total)` counts layers.
 pub fn convert(model_dir: &Path, quant: &str, out: &Path, mut progress: impl FnMut(usize, usize)) -> Result<Json> {
@@ -81,55 +205,55 @@ pub fn convert(model_dir: &Path, quant: &str, out: &Path, mut progress: impl FnM
     let layers = int("num_hidden_layers")?;
     let mut store = Store::open(&dir, 0)?;
     let cpu = Device::Cpu;
-    let mut tensors: Vec<(String, QTensor)> = Vec::new();
+    let mut spill = Spill::create(out.with_extension("gguf.spill"))?;
     let total = layers as usize + 1;
     for i in 0..layers {
         let l = format!("model.layers.{i}");
         let mut get = |n: &str| store.tensor(&format!("{l}.{n}.weight"), &cpu, false);
         let qkv = Tensor::cat(&[get("self_attn.q_proj")?, get("self_attn.k_proj")?, get("self_attn.v_proj")?], 0)?;
+        spill.push(&format!("layers.{i}.qkv"), quantize(&qkv, dtype)?)?;
+        drop(qkv);
+        spill.push(&format!("layers.{i}.o"), quantize(&get("self_attn.o_proj")?, dtype)?)?;
         let gate_up = Tensor::cat(&[get("mlp.gate_proj")?, get("mlp.up_proj")?], 0)?;
-        tensors.push((format!("layers.{i}.qkv"), quantize(&qkv, dtype)?));
-        tensors.push((format!("layers.{i}.o"), quantize(&get("self_attn.o_proj")?, dtype)?));
-        tensors.push((format!("layers.{i}.gate_up"), quantize(&gate_up, dtype)?));
-        tensors.push((format!("layers.{i}.down"), quantize(&get("mlp.down_proj")?, dtype)?));
+        spill.push(&format!("layers.{i}.gate_up"), quantize(&gate_up, dtype)?)?;
+        drop(gate_up);
+        spill.push(&format!("layers.{i}.down"), quantize(&get("mlp.down_proj")?, dtype)?)?;
         for (name, key) in [("q_norm", "self_attn.q_norm"), ("k_norm", "self_attn.k_norm"), ("input_norm", "input_layernorm"), ("post_norm", "post_attention_layernorm")] {
-            tensors.push((format!("layers.{i}.{name}"), QTensor::quantize(&get(key)?.to_dtype(DType::F32)?, GgmlDType::F32)?));
+            spill.push(&format!("layers.{i}.{name}"), QTensor::quantize(&get(key)?.to_dtype(DType::F32)?, GgmlDType::F32)?)?;
         }
         progress(i as usize + 1, total);
     }
     let code_rows: Vec<u32> = (CODE_OFFSET..CODE_OFFSET + SEMANTIC_CODES as u32).collect();
     let head_rows: Vec<u32> = std::iter::once(AUDIO_END).chain(code_rows.iter().copied()).collect();
-    tensors.push(("norm".into(), QTensor::quantize(&store.tensor("model.norm.weight", &cpu, false)?.to_dtype(DType::F32)?, GgmlDType::F32)?));
-    tensors.push(("head".into(), quantize(&store.rows("lm_head.weight", &head_rows, &cpu)?, GgmlDType::BF16)?));
-    tensors.push(("codes".into(), quantize(&store.rows("model.embed_tokens.weight", &code_rows, &cpu)?, GgmlDType::BF16)?));
-    // Every token a prompt can hold lies below the first audio code.
-    let text_rows: Vec<u32> = (0..CODE_OFFSET).collect();
-    tensors.push(("text".into(), quantize(&store.rows("model.embed_tokens.weight", &text_rows, &cpu)?, GgmlDType::Q8_0)?));
+    spill.push("norm", QTensor::quantize(&store.tensor("model.norm.weight", &cpu, false)?.to_dtype(DType::F32)?, GgmlDType::F32)?)?;
+    spill.push("head", quantize(&store.rows("lm_head.weight", &head_rows, &cpu)?, GgmlDType::BF16)?)?;
+    spill.push("codes", quantize(&store.rows("model.embed_tokens.weight", &code_rows, &cpu)?, GgmlDType::BF16)?)?;
+    // Every token a prompt can hold lies below the first audio code: its rows a batch at a time (the whole table as
+    // f32 is 2.5 GB, and its copies as many again).
+    let hidden = int("hidden_size")? as usize;
+    spill.begin("text", vec![CODE_OFFSET as usize, hidden], GgmlDType::Q8_0);
+    const BATCH: u32 = 8192;
+    for first in (0..CODE_OFFSET).step_by(BATCH as usize) {
+        let rows: Vec<u32> = (first..(first + BATCH).min(CODE_OFFSET)).collect();
+        let part = quantize(&store.rows("model.embed_tokens.weight", &rows, &cpu)?, GgmlDType::Q8_0)?;
+        spill.bytes(&part.data()?)?;
+    }
+    spill.end()?;
     progress(total, total);
 
     let f = |k: &str, d: f64| config.get(k).and_then(Json::as_f64).unwrap_or(d) as f32;
     let theta = config.get("rope_parameters").and_then(|r| r.get("rope_theta")).and_then(Json::as_f64).unwrap_or(1e6) as f32;
-    let meta: Vec<(&str, gguf_file::Value)> = vec![
-        ("general.architecture", gguf_file::Value::String("music3-lm".into())),
-        ("music3.quant", gguf_file::Value::String(quant.into())),
-        ("music3.layers", gguf_file::Value::U32(layers)),
-        ("music3.heads", gguf_file::Value::U32(int("num_attention_heads")?)),
-        ("music3.kv_heads", gguf_file::Value::U32(int("num_key_value_heads")?)),
-        ("music3.head_dim", gguf_file::Value::U32(int("head_dim")?)),
-        ("music3.eps", gguf_file::Value::F32(f("rms_norm_eps", 1e-6))),
-        ("music3.rope_theta", gguf_file::Value::F32(theta)),
+    let meta = [
+        ("general.architecture", Meta::Str("music3-lm".into())),
+        ("music3.quant", Meta::Str(quant.into())),
+        ("music3.layers", Meta::U32(layers)),
+        ("music3.heads", Meta::U32(int("num_attention_heads")?)),
+        ("music3.kv_heads", Meta::U32(int("num_key_value_heads")?)),
+        ("music3.head_dim", Meta::U32(int("head_dim")?)),
+        ("music3.eps", Meta::F32(f("rms_norm_eps", 1e-6))),
+        ("music3.rope_theta", Meta::F32(theta)),
     ];
-    let meta_refs: Vec<(&str, &gguf_file::Value)> = meta.iter().map(|(k, v)| (*k, v)).collect();
-    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(k, t)| (k.as_str(), t)).collect();
-    // Written beside the target and renamed, so a half-written file is never
-    // mistaken for a finished one.
-    let partial = out.with_extension("gguf.partial");
-    {
-        let mut file = std::io::BufWriter::new(std::fs::File::create(&partial)?);
-        gguf_file::write(&mut file, &meta_refs, &tensor_refs)?;
-        std::io::Write::flush(&mut file)?;
-    }
-    std::fs::rename(&partial, out)?;
+    spill.finish(out, &meta)?;
     let bytes = std::fs::metadata(out)?.len();
     Ok(Json::obj([
         ("path", Json::str(out.to_string_lossy())),
@@ -165,6 +289,38 @@ pub fn run(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spilled file is candle's writer's to the byte (the music model reads it with candle's reader).
+    #[test]
+    fn a_spilled_file_is_candles() -> Result<()> {
+        use candle_core::quantized::gguf_file;
+        let dir = std::env::temp_dir().join(format!("oaiy-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let made = [
+            ("a", QTensor::quantize(&Tensor::randn(0f32, 1., (3, 256), &Device::Cpu)?, GgmlDType::Q4K)?),
+            ("b", QTensor::quantize(&Tensor::randn(0f32, 1., (5,), &Device::Cpu)?, GgmlDType::F32)?),
+            ("c", QTensor::quantize(&Tensor::randn(0f32, 1., (7, 64), &Device::Cpu)?, GgmlDType::Q8_0)?),
+            ("d", QTensor::quantize(&Tensor::randn(0f32, 1., (3, 6), &Device::Cpu)?, GgmlDType::BF16)?),
+        ];
+        let theirs = dir.join("theirs.gguf");
+        {
+            let meta = [("general.architecture", gguf_file::Value::String("music3-lm".into())), ("n", gguf_file::Value::U32(7)), ("x", gguf_file::Value::F32(0.5))];
+            let meta: Vec<(&str, &gguf_file::Value)> = meta.iter().map(|(k, v)| (*k, v)).collect();
+            let tensors: Vec<(&str, &QTensor)> = made.iter().map(|(k, t)| (*k, t)).collect();
+            let mut f = std::fs::File::create(&theirs)?;
+            gguf_file::write(&mut f, &meta, &tensors)?;
+        }
+        let ours = dir.join("ours.gguf");
+        let mut spill = Spill::create(dir.join("ours.gguf.spill"))?;
+        for (name, t) in made {
+            spill.push(name, t)?;
+        }
+        spill.finish(&ours, &[("general.architecture", Meta::Str("music3-lm".into())), ("n", Meta::U32(7)), ("x", Meta::F32(0.5))])?;
+        let (a, b) = (std::fs::read(&theirs)?, std::fs::read(&ours)?);
+        std::fs::remove_dir_all(&dir)?;
+        assert!(a == b, "{} bytes against candle's {}", b.len(), a.len());
+        Ok(())
+    }
 
     #[test]
     fn quantized_matrices_round_trip() -> Result<()> {

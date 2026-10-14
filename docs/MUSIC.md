@@ -53,6 +53,11 @@ Only the 36 layers are quantized, in GGUF block formats. The norms, the output
 rows and the codes' input rows stay at full precision, and the text embeddings
 are `q8_0`.
 
+The conversion writes each tensor to the disk as it is made (a spill file beside the
+target, then the file's header and the spill), so it needs little memory: `q8_0` peaks
+at 1.3 GB of RAM and takes about a minute. It held everything until the end before,
+13.7 GB for `q8_0`, and a 16 GB machine (the kind the smaller file is for) killed it.
+
 - **`q8_0`** is nearly indistinguishable from the original. Where its greedy
   pick differs, the two candidates were within 0.31 logits.
 - **`q4_k`** drifts more, but the model samples from its top 50 anyway.
