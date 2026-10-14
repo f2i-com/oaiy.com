@@ -607,6 +607,67 @@ impl WgpuTransformer {
 mod tests {
     use super::*;
 
+    /// A quantized weight with a LoRA added as it runs ([`mul`]) gives the host's `W x + B (A x)`: a text prefix's few
+    /// rows (from the f16 inputs and exactly) and a picture's many, the second of two such matmuls into the same
+    /// scratch among them.
+    #[test]
+    fn a_quantized_weights_lora_as_it_runs_is_the_hosts() -> Result<()> {
+        let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::nth(0, None) else { return Ok(()) };
+        let (n, k, rank) = (4096usize, 4096usize, 128usize);
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.) as f32
+        };
+        let mut mats = Vec::new();
+        let mut host = Vec::new();
+        for _ in 0..2 {
+            let w: Vec<f32> = (0..n * k).map(|_| next() * 0.05).collect();
+            let a: Vec<f32> = (0..rank * k).map(|_| half::f16::from_f32(next() * 0.05).to_f32()).collect();
+            let b: Vec<f32> = (0..n * rank).map(|_| half::f16::from_f32(next() * 0.05).to_f32()).collect();
+            let q = crate::wgpu_weights::q8_0(&w);
+            let mut deq = vec![0f32; n * k];
+            ggml_quants::dequantize(ggml_quants::GgmlType::Q8_0, &q, &mut deq).unwrap();
+            let qt = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(q, vec![n, k], ggml_quants::GgmlType::Q8_0));
+            let (at, bt) = (Tensor::from_vec(a.clone(), (rank, k), &Device::Cpu)?, Tensor::from_vec(b.clone(), (n, rank), &Device::Cpu)?);
+            mats.push(Mat { w: W::Quant(qt), n, k, lora: vec![(f16_vec(&gpu, &at, "a")?, f16_vec(&gpu, &bt, "b")?, rank)] });
+            host.push((deq, a, b));
+        }
+        for (rows, exact) in [(14usize, true), (14, false), (40, true), (1024, false)] {
+            let xs: Vec<f32> = (0..rows * k).map(|_| next()).collect();
+            let x = gpu.vec(rows * k);
+            gpu.upload(&x, &xs);
+            let low = Low { t: gpu.vec(rows * rank), y: gpu.vec(rows * FF) };
+            let ys: Vec<DeviceVec> = mats.iter().map(|_| gpu.vec(rows * n)).collect();
+            let mut rec = gpu.begin();
+            for (m, y) in mats.iter().zip(&ys) {
+                mul(rec.as_mut(), m, &x, y, rows, exact, &low);
+            }
+            for y in &ys {
+                rec.read(y);
+            }
+            let got = rec.finish();
+            for (i, ((deq, a, b), g)) in host.iter().zip(&got).enumerate() {
+                let mut worst = 0f64;
+                let mut scale = 0f64;
+                for r in [0, rows / 2, rows - 1] {
+                    let xr = &xs[r * k..(r + 1) * k];
+                    let ax: Vec<f64> = (0..rank).map(|j| (0..k).map(|c| a[j * k + c] as f64 * xr[c] as f64).sum()).collect();
+                    for o in [0, 1, n / 2, n - 1] {
+                        let want: f64 = (0..k).map(|c| deq[o * k + c] as f64 * xr[c] as f64).sum::<f64>() + (0..rank).map(|j| b[o * rank + j] as f64 * ax[j]).sum::<f64>();
+                        worst = worst.max((g[r * n + o] as f64 - want).abs());
+                        scale = scale.max(want.abs());
+                    }
+                }
+                eprintln!("matrix {i}, {rows} rows (exact {exact}): worst {worst:.4} of {scale:.3}");
+                assert!(worst <= 2e-2 * scale.max(1.0), "matrix {i}, {rows} rows (exact {exact}): {worst} off of {scale}");
+            }
+        }
+        Ok(())
+    }
+
     /// How long a block's load takes (`--ignored --nocapture`): its seven matrices from `OAIY_QWEN_IMAGE_TRANSFORMER`,
     /// with and without the turbo adapter `OAIY_QWEN_IMAGE_ADAPTER` merged (on the GPU; its kernels' first build in the
     /// second's).
