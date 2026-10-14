@@ -865,6 +865,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A catalog entry's vision projector goes to the entry's own model (its first item), not to a chat model added
+    /// before it that has none: Gemma 4's mmproj was Qwen3.5 9B's once.
+    #[test]
+    fn an_entrys_projector_goes_to_its_own_model() {
+        let dir = std::env::temp_dir().join(format!("oaiy-dl-register-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Other")).unwrap();
+        std::fs::create_dir_all(dir.join("Gemma")).unwrap();
+        let gguf = |path: &Path, arch: &str| {
+            let mut b = b"GGUF".to_vec();
+            b.extend(3u32.to_le_bytes());
+            b.extend(0u64.to_le_bytes());
+            b.extend(1u64.to_le_bytes());
+            b.extend(("general.architecture".len() as u64).to_le_bytes());
+            b.extend(b"general.architecture");
+            b.extend(8u32.to_le_bytes());
+            b.extend((arch.len() as u64).to_le_bytes());
+            b.extend(arch.as_bytes());
+            std::fs::write(path, b).unwrap();
+        };
+        gguf(&dir.join("Other").join("other-Q4_K_M.gguf"), "qwen35");
+        gguf(&dir.join("Gemma").join("gemma-Q4_K_M.gguf"), "gemma4");
+        gguf(&dir.join("Gemma").join("mmproj-F16.gguf"), "clip");
+        let mut cfg = crate::config::default_json();
+        registry::add(&mut cfg, &dir.join("Other").join("other-Q4_K_M.gguf"), None, None).unwrap();
+        let studio = Arc::new(crate::Studio::for_test(&dir, cfg));
+        let entry = Json::obj([("id", Json::str("gemma")), ("add", Json::Arr(vec![Json::str("Gemma/gemma-Q4_K_M.gguf"), Json::str("Gemma/mmproj-F16.gguf")]))]);
+        let said = register(&studio, &entry, &dir).unwrap();
+        assert_eq!(said.len(), 1, "the model said once: {said:?}");
+        let cfg = studio.config();
+        let models = cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap();
+        let projector = |stem: &str| models.iter().find(|m| str_or(m, "path", "").contains(stem)).map(|m| str_or(m, "vision_projector", "").to_string()).unwrap();
+        assert!(projector("gemma-Q4_K_M").ends_with("mmproj-F16.gguf"), "{models:?}");
+        assert_eq!(projector("other-Q4_K_M"), "", "{models:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn gated_and_missing_files_are_explained() {
         assert!(curl_error("curl: (22) The requested URL returned error: 401", "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/resolve/main/model.safetensors").contains("accept its licence at https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m"));
