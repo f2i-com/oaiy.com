@@ -270,6 +270,8 @@ impl Gpu {
         };
         if holds {
             self.hand(Fare::Write(buffer.clone(), offset, data.to_vec()));
+        } else if data.len() >= HOST_WRITE_MIN && self.host_staging() {
+            self.write_through_host(buffer, offset, data.len(), &|from, part| part.copy_from_slice(&data[from..from + part.len()]));
         } else if data.len() < WRITE_BY_PIECES || whole_writes() {
             write_bytes(self.queue(), buffer, offset, data);
         } else {
@@ -291,6 +293,10 @@ impl Gpu {
         };
         if holds {
             return false;
+        }
+        if len >= HOST_WRITE_MIN && self.host_staging() {
+            self.write_through_host(buffer, offset, len, fill);
+            return true;
         }
         let pieces = len >= WRITE_BY_PIECES && !whole_writes();
         let piece = if pieces { WRITE_PIECE } else { len };

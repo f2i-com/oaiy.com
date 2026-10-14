@@ -1650,11 +1650,14 @@ fn measure_step_attention() {
 /// mappable: wgpu's Vulkan backend gives it the host's memory) and into one mapped for writing (read- and
 /// write-mappable: the card's memory, through its BAR), and into the host's own memory for scale; 1 GiB copied by a
 /// kernel from each (its threads' reads many in flight); 1 GiB by the queue's write ([`Gpu::write`]); 1 GiB copied on
-/// the GPU from staging in the host's memory. An NVIDIA A2 in a Thunderbolt 3 enclosure on an Ice Lake laptop (the
-/// card's IOMMU group strict, as an external device's is): back 0.8 GB/s; the CPU's writes into the host's buffer 0.1,
-/// into the card's 0.2, into its own memory 19; the kernel's copy from the host's buffer 2.2, from the card's 65; the
-/// queue's write 0.2 (a model's weights load at that: Qwen3.5 9B's 5.1 GB in 27 s); the GPU's copy 0.08. Every way
-/// the CPU writes memory the card reads is 0.1 to 0.2 GB/s there, where a Thunderbolt 3 card's uploads are some 2.5.
+/// the GPU from staging in the host's memory. An NVIDIA A2 in a Thunderbolt 3 enclosure on an Ice Lake laptop: back
+/// 0.8 GB/s; the CPU's writes into the host's buffer 0.07 (made in 333 ms, filled at 0.21: a buffer mapped at creation
+/// that is not write-mappable is written through wgpu's staging memory, in the card's BAR), into the card's 0.2, into
+/// its own memory 19; the kernel's copy from the host's buffer 2.2, from the card's 65; the GPU's copy 0.08 (its
+/// staging made mapped too). The card's BAR, where wgpu's Vulkan backend puts every write-mappable buffer and the
+/// queue's staging, takes the CPU's writes at 0.21 GB/s over the enclosure's link, where Vulkan's host-visible types
+/// of the host's memory take them at 19 and 20: the queue's write was 0.21 (Qwen3.5 9B's 5.1 GB of weights in 27 s),
+/// and through the host's memory ([`Gpu::host_staging`]) it is 2.1 (5.0 s).
 #[test]
 #[ignore = "a measurement"]
 fn measure_upload_paths() {
@@ -1680,16 +1683,25 @@ fn measure_upload_paths() {
     let t = std::time::Instant::now();
     let got = gpu.read(&dst, 256 << 20);
     eprintln!("256 MB read back: {:.2} GB/s", gb(got.len(), t.elapsed().as_secs_f64()));
-    // the host's buffer: made mapped, filled
+    // the host's buffer: made mapped, filled (twice: the first touch of its pages and the second apart), unmapped
     let t = std::time::Instant::now();
     let in_host = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("measure-host"), size: piece as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE, mapped_at_creation: true });
-    {
+    let made = t.elapsed().as_secs_f64();
+    let (first, second) = {
         let mut view = in_host.slice(..).get_mapped_range_mut().expect("mapped at creation");
         let mut whole = view.slice(..);
-        fill(whole.as_raw_ptr().cast::<u8>().as_ptr() as usize, &data[..piece]);
-    }
+        let at = whole.as_raw_ptr().cast::<u8>().as_ptr() as usize;
+        let t = std::time::Instant::now();
+        fill(at, &data[..piece]);
+        let first = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        fill(at, &data[piece..2 * piece]);
+        (first, t.elapsed().as_secs_f64())
+    };
+    let t = std::time::Instant::now();
     in_host.unmap();
-    let host_fill = gb(piece, t.elapsed().as_secs_f64());
+    eprintln!("the host's 64 MB buffer: made in {:.0} ms, filled at {:.2} GB/s then {:.2}, unmapped in {:.0} ms", made * 1e3, gb(piece, first), gb(piece, second), t.elapsed().as_secs_f64() * 1e3);
+    let host_fill = gb(piece, made + first + second);
     // the card's: mapped for writing, filled (the best of three)
     let in_card = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("measure-card"), size: piece as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
     let mut best = f64::MAX;
