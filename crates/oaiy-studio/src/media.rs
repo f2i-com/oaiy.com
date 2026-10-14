@@ -167,16 +167,21 @@ struct Broker {
     waiting_media: bool,
 }
 
-/// The image worker kept between pictures on the eGPU's card (`oaiy-media --serve`): it keeps the models a job loaded
-/// for the next that names the same files (a picture's 5 s of loading on the card). It is let go when no picture has
-/// come for [`KEEP_CARD`], when a chat waits for the card, or when the card is not lent any more.
+/// The image worker kept between pictures (`oaiy-media --serve`), on the eGPU's card or on this computer's GPU: it keeps
+/// the models a job loaded for the next that names the same files (a picture's 5 s of loading on the card; on an NVIDIA
+/// A2 in a Thunderbolt enclosure, 12 s of a 1024x1024 picture's 118). On the card it is let go when no picture has come
+/// for [`KEEP_CARD`], when a chat waits for the card, or when the card is not lent any more; on this computer's GPU when
+/// no picture has come for as long, at once where a language model there runs or waits to come back, and whenever one
+/// starts ([`Media::let_go_local`]).
 struct Serving {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     /// Its answers (standard output's lines) and its events (standard error's), as they come; `None` once both end.
     said: std::sync::mpsc::Receiver<Said>,
-    /// The program and the card's socket it was started for.
+    /// The program and the card's socket it was started for (`local` for this computer's GPU).
     key: String,
+    /// It is on this computer's GPU, not the eGPU's card.
+    local: bool,
     /// When its last job ended.
     idle_since: std::time::Instant,
 }
@@ -368,19 +373,9 @@ fn output_dir(root: &Path, kind: &str) -> PathBuf {
     day_dir(root, &format!("{kind}s"))
 }
 
-/// `folder/2026-09-26` under the output root.
+/// `folder/2026-09-26` under the output root, today's date where the computer is.
 pub(crate) fn day_dir(root: &Path, folder: &str) -> PathBuf {
-    let days = now() / 86_400;
-    // Civil date from days since 1970 (Howard Hinnant's algorithm).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    let (y, m, d) = crate::util::local_date();
     root.join(folder).join(format!("{y:04}-{m:02}-{d:02}"))
 }
 
@@ -978,6 +973,12 @@ fn kept_on_card(kind: Kind, request: &Json) -> bool {
     kind == Kind::Image && request.get("architecture").is_none_or(|a| a.as_str() == Some("qwen-image"))
 }
 
+/// Whether a job on this computer's GPU is the kept worker's: a Qwen Image picture on WebGPU (the models the worker
+/// keeps are WebGPU's alone).
+fn kept_here(kind: Kind, request: &Json) -> bool {
+    kept_on_card(kind, request) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+}
+
 /// How long a picture waits for the eGPU's language model to finish the requests it is answering, before it is made
 /// on this computer instead.
 const CARD_WAIT: Duration = Duration::from_secs(5 * 60);
@@ -1320,7 +1321,13 @@ impl Media {
                         jobs = self.lock();
                         continue;
                     }
+                    // (a picture worker kept on this computer's GPU waits for another picture as the card's does, where no
+                    // language model there runs or waits to come back)
                     if self.serving.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                        if self.lingers_here(studio) {
+                            jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
+                            continue;
+                        }
                         drop(jobs);
                         self.end_serving(false);
                         jobs = self.lock();
@@ -1406,7 +1413,7 @@ impl Media {
                 Ok(socket) => {
                     self.update(&job.id, |j| j.stage = "on the eGPU".into());
                     let made = if kept_on_card(job.kind, &job.request) {
-                        self.serve_job(studio, &cfg, job, &socket)
+                        self.serve_job(studio, &cfg, job, Some(&socket))
                     } else {
                         // (the kept picture worker let go first: the card's memory the job's)
                         self.end_serving(false);
@@ -1453,7 +1460,15 @@ impl Media {
             studio.llm.stop();
             studio.llm.set_paused(true);
         }
-        let result = if job.cancel.load(Ordering::Relaxed) { Err("cancelled".into()) } else { self.worker(studio, &cfg, job, None) };
+        let result = if job.cancel.load(Ordering::Relaxed) {
+            Err("cancelled".into())
+        } else if kept_here(job.kind, &job.request) {
+            self.serve_job(studio, &cfg, job, None)
+        } else {
+            // (the kept picture worker let go first: the GPU's memory the job's)
+            self.end_serving(false);
+            self.worker(studio, &cfg, job, None)
+        };
         {
             let mut b = self.broker.lock().unwrap_or_else(|p| p.into_inner());
             b.media = false;
@@ -1467,6 +1482,26 @@ impl Media {
     fn lingers(&self) -> bool {
         self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < KEEP_CARD)
             || self.card_used.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() < KEEP_CARD)
+    }
+
+    /// Whether the picture worker kept on this computer's GPU waits for another picture: it has waited less than
+    /// [`KEEP_CARD`], and no language model that shares the GPU runs, starts or waits for media to end.
+    fn lingers_here(&self, studio: &crate::Studio) -> bool {
+        let idle = self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.local && s.idle_since.elapsed() < KEEP_CARD);
+        idle && (!pauses_llm(&studio.config()) || !(studio.llm.is_running() || studio.llm.paused()))
+    }
+
+    /// The picture worker kept on this computer's GPU let go, where it is waiting for a picture (one making a picture
+    /// is let go after it): what the language model calls as it starts ([`crate::llm::Llm::before_start`]).
+    pub fn let_go_local(&self) {
+        let waiting = match self.serving.try_lock() {
+            Ok(slot) => slot.as_ref().is_some_and(|s| s.local),
+            Err(_) => false,
+        };
+        if waiting {
+            self.log.push("letting the kept image worker go: the language model is starting");
+            self.end_serving(false);
+        }
     }
 
     /// The kept worker let go: its standard input closed (it ends, its memory on the card freed), and killed past a wait
@@ -1487,14 +1522,15 @@ impl Media {
         self.log.push("the kept image worker was killed (it had not ended)");
     }
 
-    /// `job` done by the worker kept for pictures on the eGPU's card (at `card`, its socket), started for it where
-    /// there is none for this program and card: its request a line in, its answer a line out, its events read as a
-    /// worker's are.
-    fn serve_job(&self, studio: &crate::Studio, cfg: &Json, job: &Job, card: &str) -> Result<Json, String> {
+    /// `job` done by the worker kept for pictures on the eGPU's card (at `card`, its socket) or, with none, on this
+    /// computer's GPU, started for it where there is none for this program and card: its request a line in, its answer
+    /// a line out, its events read as a worker's are.
+    fn serve_job(&self, studio: &crate::Studio, cfg: &Json, job: &Job, card: Option<&str>) -> Result<Json, String> {
         let media = cfg.get("media").ok_or("no media section")?;
         let program = config::program(&studio.root, str_or(media, "worker", "oaiy-media"));
         std::fs::create_dir_all(studio.output_root()).map_err(|e| e.to_string())?;
-        let key = format!("{}|{card}", program.display());
+        let key = format!("{}|{}", program.display(), card.unwrap_or("local"));
+        let place = if card.is_some() { "the eGPU".to_string() } else { format!("GPU {}", int_or(&job.request, "device", 0)) };
         let label = if job.incognito { "incognito job".to_string() } else { job.id.clone() };
         let mut slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
         if slot.as_mut().is_some_and(|s| s.key != key || !matches!(s.child.try_wait(), Ok(None))) {
@@ -1504,11 +1540,19 @@ impl Media {
         }
         if slot.is_none() {
             let mut command = oaiy_host_env::command(&program);
-            command.arg("--serve").env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{card}"));
-            // (the full attention's rows kernel: a picture's steps 5% faster on the card, its answers the f32 kernel's
-            // there; elsewhere it is still to be tried, docs/TINYGPU.md)
-            if std::env::var_os("OAIY_ATTENTION_KERNEL").is_none() {
-                command.env("OAIY_ATTENTION_KERNEL", "rows");
+            command.arg("--serve");
+            if let Some(card) = card {
+                command.env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{card}"));
+                // (the full attention's rows kernel: a picture's steps 5% faster on the card, its answers the f32
+                // kernel's there; elsewhere it is still to be tried, docs/TINYGPU.md)
+                if std::env::var_os("OAIY_ATTENTION_KERNEL").is_none() {
+                    command.env("OAIY_ATTENTION_KERNEL", "rows");
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
             }
             command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
             let mut child = command.spawn().map_err(|e| format!("could not start {}: {e}", program.display()))?;
@@ -1531,14 +1575,14 @@ impl Media {
                 }
             });
             let stdin = child.stdin.take().ok_or("worker stdin missing")?;
-            self.log.push(format!("{label}: an image worker kept for the eGPU started ({})", program.display()));
-            *slot = Some(Serving { child, stdin, said, key, idle_since: std::time::Instant::now() });
+            self.log.push(format!("{label}: an image worker kept for {place} started ({})", program.display()));
+            *slot = Some(Serving { child, stdin, said, key, local: card.is_none(), idle_since: std::time::Instant::now() });
         }
         let s = slot.as_mut().expect("a kept worker");
         if job.incognito {
-            self.log.push(format!("incognito {} job on the eGPU (kept worker)", job.kind.name()));
+            self.log.push(format!("incognito {} job on {place} (kept worker)", job.kind.name()));
         } else {
-            self.log.push(format!("{}: {} job on the eGPU, kept worker ({} {})", job.id, job.kind.name(), job.model, str_or(&job.request, "memory", "auto")));
+            self.log.push(format!("{}: {} job on {place}, kept worker ({} {})", job.id, job.kind.name(), job.model, str_or(&job.request, "memory", "auto")));
         }
         let sent = writeln!(s.stdin, "{}", job.request.to_json()).and_then(|_| s.stdin.flush());
         if let Err(e) = sent {

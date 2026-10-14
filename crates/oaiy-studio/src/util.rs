@@ -10,6 +10,74 @@ pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// Today's date where the computer is (year, month, day): UTC's moved by the computer's offset from it
+/// ([`utc_offset`]). A day's outputs share a folder named for it, which a picture made before midnight UTC dated the day
+/// before for anyone east of Greenwich.
+pub fn local_date() -> (i64, u32, u32) {
+    utc_date((now() as i64 + utc_offset()).max(0) as u64)
+}
+
+/// The computer's offset from UTC in seconds, as its OS says it now (`date +%z`; on Windows, .NET's local time zone
+/// through PowerShell), asked once an hour (an offset changes on the hour), else 0.
+pub fn utc_offset() -> i64 {
+    static ASKED: Mutex<Option<(u64, i64)>> = Mutex::new(None);
+    let hour = now() / 3600;
+    if let Some((at, offset)) = *ASKED.lock().unwrap_or_else(|p| p.into_inner()) {
+        if at == hour {
+            return offset;
+        }
+    }
+    let offset = ask_utc_offset().unwrap_or(0);
+    *ASKED.lock().unwrap_or_else(|p| p.into_inner()) = Some((hour, offset));
+    offset
+}
+
+fn ask_utc_offset() -> Option<i64> {
+    #[cfg(unix)]
+    {
+        // "+1100", "-0430"
+        let out = oaiy_host_env::command("date").arg("+%z").output().ok()?;
+        let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (sign, digits) = said.split_at_checked(1)?;
+        if !out.status.success() || digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let (h, m): (i64, i64) = (digits[..2].parse().ok()?, digits[2..].parse().ok()?);
+        let seconds = h * 3600 + m * 60;
+        match sign {
+            "+" => Some(seconds),
+            "-" => Some(-seconds),
+            _ => None,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let out = oaiy_host_env::command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "[int][TimeZoneInfo]::Local.GetUtcOffset([DateTime]::UtcNow).TotalSeconds"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .ok()?;
+        let seconds: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        (out.status.success() && seconds.abs() <= 14 * 3600).then_some(seconds)
+    }
+    #[cfg(not(any(unix, windows)))]
+    None
+}
+
+/// The UTC date of `secs` since 1970 (Howard Hinnant's civil-from-days).
+pub fn utc_date(secs: u64) -> (i64, u32, u32) {
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m as u32, d as u32)
+}
+
 pub fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
@@ -186,5 +254,17 @@ mod tests {
         assert_eq!(log.since(0).len(), 3);
         assert_eq!(log.since(4).len(), 1);
         assert_eq!(log.tail(2), "line 3\nline 4");
+    }
+
+    #[test]
+    fn dates_are_civil_and_today_is_within_a_day_of_utcs() {
+        assert_eq!(utc_date(0), (1970, 1, 1));
+        assert_eq!(utc_date(951_782_400), (2000, 2, 29));
+        assert_eq!(utc_date(1_791_936_000), (2026, 10, 14));
+        // (a local date is UTC's, or the day before or after it: no zone is further than 14 hours from it)
+        let (here, utc) = (local_date(), utc_date(now()));
+        let day = |(y, m, d): (i64, u32, u32)| y * 400 + i64::from(m) * 32 + i64::from(d);
+        assert!((day(here) - day(utc)).abs() <= 400, "{here:?} against UTC's {utc:?}");
+        assert!((1..=12).contains(&here.1) && (1..=31).contains(&here.2), "{here:?}");
     }
 }

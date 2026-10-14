@@ -120,6 +120,8 @@ pub struct Llm {
     inner: Mutex<Inner>,
     changed: Condvar,
     pub log: Arc<LogRing>,
+    /// Called before the server starts, whatever starts it ([`Llm::before_start`]).
+    before_start: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Where a running server can be reached.
@@ -301,7 +303,14 @@ impl Llm {
             }),
             changed: Condvar::new(),
             log: Arc::new(LogRing::new(2000)),
+            before_start: Mutex::new(None),
         }
+    }
+
+    /// `f` called before the server starts, whatever starts it (a chat, the page, a configuration's change, media's
+    /// end): what holds the GPU it will want let go first (a picture worker kept between pictures, `media`).
+    pub fn before_start(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.before_start.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(f));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -363,6 +372,10 @@ impl Llm {
         }
         if self.is_running() {
             return Ok(());
+        }
+        let hook = self.before_start.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(f) = hook {
+            f();
         }
         let mut plan = launches(llm, root);
         let mut g = self.lock();

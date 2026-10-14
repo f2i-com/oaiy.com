@@ -1895,6 +1895,83 @@ open(log, "a").write("ended\n")
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A stand-in for this computer's language-model engine: it answers `/health` and every chat ("from this computer"),
+    /// and notes its start in `fake-media.log`, beside the picture worker's notes.
+    #[cfg(unix)]
+    const FAKE_LOCAL_ENGINE: &str = r#"#!/usr/bin/env python3
+import http.server, json, os, sys
+port = int(sys.argv[sys.argv.index("--port") + 1])
+open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake-media.log"), "a").write("engine started\n")
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def whole(self, body):
+        body = json.dumps(body).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self): self.whole({"data": [{"id": "m"}]})
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.whole({"choices": [{"index": 0, "message": {"role": "assistant", "content": "from this computer"}}]})
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+"#;
+
+    /// Pictures on this computer's GPU with no language model there running share one kept worker; the language model
+    /// starting (a chat) lets it go first; a picture made while the language model runs pauses it, and its worker is let
+    /// go and the model comes back once no picture waits.
+    #[cfg(unix)]
+    #[test]
+    fn pictures_here_share_one_kept_worker_which_makes_way_for_the_language_model() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fake_dir("serve-here");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (worker, engine) = (dir.join("fake-media"), dir.join("fake-llm"));
+        for (path, body) in [(&worker, FAKE_SERVE), (&engine, FAKE_LOCAL_ENGINE)] {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = crate::config::default_json();
+        let llm = crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
+        for key in ["server", "server_webgpu"] {
+            crate::util::set(llm, key, Json::str(engine.to_string_lossy()));
+        }
+        crate::util::set(llm, "models", Json::Arr(vec![Json::obj([("name", Json::str("m")), ("path", Json::str("m.gguf"))])]));
+        crate::util::set(llm, "default_model", Json::str("m"));
+        crate::util::set(crate::registry::obj_mut(&mut cfg, &["media"]).unwrap(), "worker", Json::str(worker.to_string_lossy()));
+        let studio = Arc::new(Studio::for_test(&dir, cfg));
+        let runner = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let media = Arc::clone(&runner.media);
+            media.run(&runner);
+        });
+        let log = || std::fs::read_to_string(dir.join("fake-media.log")).unwrap_or_default();
+        let count = |line: &str| log().lines().filter(|l| l.trim() == line).count();
+        let out = dir.join("out");
+        let picture = |prompt: &str| {
+            let job = studio.media.submit(Kind::Image, Json::obj([("prompt", Json::str(prompt)), ("output_dir", Json::str(out.to_string_lossy()))]), "turbo".into(), "1024x1024".into(), 1, 0.0, 8, None);
+            let done = studio.media.wait(&job.id, Duration::from_secs(60)).unwrap();
+            assert_eq!(done.status, "completed", "{:?}\n{}", done.error, studio.media.log.tail(20));
+        };
+        // Two pictures, no language model running: one worker for both, on this computer's GPU, kept after them.
+        picture("fox");
+        picture("owl");
+        assert_eq!((count("started"), count("ended")), (1, 0), "{}", log());
+        assert!(!log().contains("tinygpu"), "no card's adapter: {}", log());
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(count("ended"), 0, "kept while no language model wants the GPU: {}", log());
+        // A chat: the language model starts, and the kept worker is let go before it does.
+        let (status, _, body) = chat(&studio, r#"{"model": "m", "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert!(status == 200 && body.contains("from this computer"), "{status} {body}\n{}\n{}", studio.media.log.tail(20), studio.llm.log.tail(20));
+        let (ended, started) = (log().find("ended"), log().find("engine started"));
+        assert!(ended.is_some() && ended < started, "the worker let go before the engine started: {}", log());
+        // A picture while the language model runs: it is paused, the picture has a worker of its own again, and once no
+        // picture waits that worker is let go and the language model comes back.
+        picture("cat");
+        assert_eq!(count("started"), 2, "{}", log());
+        until("the worker let go and the language model back", || count("ended") == 2 && count("engine started") == 2 && studio.llm.is_running());
+        studio.llm.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The card's server, asked who it is at `socket` (as the image worker's adapter first does).
     #[cfg(unix)]
     fn card_hello(socket: &str) -> String {

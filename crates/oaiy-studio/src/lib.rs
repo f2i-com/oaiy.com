@@ -213,17 +213,27 @@ impl Studio {
     }
 }
 
+/// The language model's supervisor and media's runner: a picture worker media keeps on this computer's GPU makes way for
+/// the language model whenever it starts.
+fn llm_and_media() -> (Arc<llm::Llm>, Arc<media::Media>) {
+    let (llm, media) = (Arc::new(llm::Llm::new()), Arc::new(media::Media::new()));
+    let kept = Arc::clone(&media);
+    llm.before_start(move || kept.let_go_local());
+    (llm, media)
+}
+
 #[cfg(test)]
 impl Studio {
     /// A Studio with `cfg` (nothing started, nothing saved), for the tests of what a request comes to.
     pub(crate) fn for_test(root: &std::path::Path, cfg: Json) -> Studio {
+        let (llm, media) = llm_and_media();
         Studio {
             config_path: root.join("oaiy-studio.json"),
             root: root.to_path_buf(),
             config: RwLock::new(cfg),
-            llm: Arc::new(llm::Llm::new()),
+            llm,
             egpu: Arc::new(egpu::Egpu::new()),
-            media: Arc::new(media::Media::new()),
+            media,
             system: system::System::new(),
             log: Arc::new(LogRing::new(50)),
             downloads: Arc::new(downloads::Downloads::new()),
@@ -544,13 +554,14 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
     // Absolute but not canonical: on Windows canonical paths are `\\?\`-prefixed,
     // which leaks into every output path shown to users.
     let root = std::path::absolute(&root).unwrap_or(root);
+    let (llm, media) = llm_and_media();
     let studio = Arc::new(Studio {
         config_path: args.config.clone(),
         root,
         config: RwLock::new(cfg.clone()),
-        llm: Arc::new(llm::Llm::new()),
+        llm,
         egpu: Arc::new(egpu::Egpu::new()),
-        media: Arc::new(media::Media::new()),
+        media,
         system: system::System::new(),
         log: Arc::new(LogRing::new(1000)),
         downloads: Arc::new(downloads::Downloads::new()),
