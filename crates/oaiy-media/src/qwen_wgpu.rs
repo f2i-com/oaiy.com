@@ -594,7 +594,7 @@ mod tests {
             latent = (latent + (v * -0.0625)?)?;
             eprintln!("step {step}: {:.3} s", t.elapsed().as_secs_f64());
             if std::env::var_os("OAIY_CHAIN_PROFILE").is_some() {
-                eprintln!("  {:?}", ggml_rs_wgpu::profile::take_kernels().into_iter().take(6).collect::<Vec<_>>());
+                eprintln!("  {:?}", ggml_rs_wgpu::profile::take_kernels().into_iter().take(16).collect::<Vec<_>>());
             }
         }
         Ok(())

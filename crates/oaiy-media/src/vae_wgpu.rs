@@ -333,4 +333,28 @@ mod tests {
         assert!(cos > 0.9999 && off * 1000 < g.len(), "cosine {cos}, {off} values off by more than 0.05");
         Ok(())
     }
+
+    /// A picture's decode's time (`--ignored --nocapture`): a random latent of `QWEN_IMAGE_GRID` (64: a 1024 by 1024
+    /// picture) a side, from the published VAE (`OAIY_QWEN_IMAGE_BASE`), twice; with OAIY_CHAIN_PROFILE its costliest
+    /// kernels.
+    #[test]
+    #[ignore = "a timing; needs Qwen Image 2.1's VAE (OAIY_QWEN_IMAGE_BASE) and a WebGPU adapter"]
+    fn measure_decode() -> Result<()> {
+        let Some(base) = std::env::var_os("OAIY_QWEN_IMAGE_BASE").map(std::path::PathBuf::from) else { return Ok(()) };
+        let side: usize = std::env::var("QWEN_IMAGE_GRID").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let latent: Vec<f32> = (0..side * side * 64).map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32 * 3.4 - 1.7).collect();
+        let latent = Tensor::from_vec(latent, (1, side * side, 64), &Device::Cpu)?;
+        let gpu = WgpuVae::load(&base, 0)?;
+        for run in 0..2 {
+            let t = std::time::Instant::now();
+            gpu.decode(&latent, side, side)?;
+            eprintln!("decode {run}: {:.3} s", t.elapsed().as_secs_f64());
+            if std::env::var_os("OAIY_CHAIN_PROFILE").is_some() {
+                for (name, ms, n) in ggml_rs_wgpu::profile::take_kernels().into_iter().take(16) {
+                    eprintln!("    {name:36} {ms:9.2} ms {n:6}");
+                }
+            }
+        }
+        Ok(())
+    }
 }

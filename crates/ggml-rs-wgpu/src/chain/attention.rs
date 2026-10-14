@@ -177,14 +177,18 @@ impl Recorder<'_> {
         // or, with OAIY_ATTENTION_PASSES=2, the two passes'): not copied a fragment at a time first, a layer's cache
         // again (512 MB at 79,000 of the 27B's positions, which a 24 GB card beside its weights had not). Its rows
         // past `kv_len` are zeros or its own, whose weights are none (a cache without rows to 128 past them is copied).
-        // (a causal attention whose query heads share their KV heads 1, 2 or 4 at a time: [`attention_coop_grouped`]'s
-        // kernel, a KV head's queries a workgroup, the cache's rows read once for all of them; OAIY_ATTENTION_GROUPED=0:
-        // the kernels below)
+        // (an attention whose query heads share their KV heads 1, 2 or 4 at a time: [`attention_coop_grouped`]'s kernel,
+        // a KV head's queries a workgroup, the cache's rows read once for all of them; OAIY_ATTENTION_GROUPED=0: the
+        // kernels below. A full one too, its `past` its every position, so each query sees them all: Qwen Image 2.1's 32
+        // heads of 128 over a 1024 x 1024 picture's 4,127 positions in 3.9 s of a step's 13.2 with the one-pass kernel
+        // on an NVIDIA A2)
         let g = n_h / n_kv;
         // (its workgroup's memory near 48 KB, 256 threads)
-        let grouped = !full && kernel == 1 && matches!(g, 1 | 2 | 4) && grouped_on() && self.gpu().limits.max_compute_workgroup_storage_size >= 48 << 10;
+        let grouped = kernel == 1 && matches!(g, 1 | 2 | 4) && grouped_on() && self.gpu().limits.max_compute_workgroup_storage_size >= 48 << 10;
         if grouped && (!halves || halves_in_place()) {
             let rp = rows.div_ceil(64) * 64;
+            // (its workgroups' rows to 64: a full attention's out as long, `attention_rows_full_out_len`)
+            assert!(!full || out.len >= rp * qs, "chain: a full attention's output");
             // the cache's rows as they lie where they are halves with room to 128 positions past `kv_len`, else as an
             // f16 copy of them so padded
             let (q16, kv16) = if halves && kv.len * 2 >= kv_len.div_ceil(128) * 128 * row {
@@ -368,7 +372,7 @@ fn halves_in_place() -> bool {
     *IN_PLACE.get_or_init(|| std::env::var("OAIY_HALVES_TILED").map_or(true, |v| v != "1"))
 }
 
-/// Whether a causal attention takes [`attention_coop_grouped`]'s kernel where it can (OAIY_ATTENTION_GROUPED=0: not).
+/// Whether an attention takes [`attention_coop_grouped`]'s kernel where it can (OAIY_ATTENTION_GROUPED=0: not).
 fn grouped_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("OAIY_ATTENTION_GROUPED").map_or(true, |v| v != "0"))
