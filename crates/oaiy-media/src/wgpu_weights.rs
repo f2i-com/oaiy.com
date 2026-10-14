@@ -38,6 +38,23 @@ pub(crate) fn q8_0(values: &[f32]) -> Vec<u8> {
     out
 }
 
+/// An f16 weight as the card keeps it (two halves a word, the first low) as Q8_0's blocks.
+pub(crate) fn q8_0_f16_words(words: &[f32]) -> Vec<u8> {
+    let mut out = vec![0u8; words.len() / 16 * 34];
+    on_cores(words, 16, &mut out, 34, |src, dst| {
+        let mut x = [0f32; 32];
+        for (w, q) in src.chunks_exact(16).zip(dst.chunks_exact_mut(34)) {
+            for (pair, two) in x.chunks_exact_mut(2).zip(w) {
+                let bits = two.to_bits();
+                pair[0] = half::f16::from_bits(bits as u16).to_f32();
+                pair[1] = half::f16::from_bits((bits >> 16) as u16).to_f32();
+            }
+            ggml_quants::q8_0::quantize(&x, q);
+        }
+    });
+    out
+}
+
 /// A BF16 weight's bytes as Q8_0's blocks.
 pub(crate) fn q8_0_bf16(bytes: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; bytes.len() / 64 * 34];

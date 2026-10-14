@@ -343,3 +343,17 @@ against Diffusers. A full 100-image batch was not run; the batch interface accep
 100 and was exercised with two-, three- and four-image batches and a cancelled
 100-image request.
 The local D: checkpoint is BF16; separate F16 weights were not available to test.
+
+## A card too small for it as f16 (2026-10-14)
+
+On WebGPU the transformer's BF16 matrices go to the card as f16 where it has room for
+them beside a picture's work (their f16 bytes and some 5 GiB; Vulkan's budget less its
+use), else as Q8_0 (`qwen_wgpu::weights_q8`; `OAIY_QWEN_IMAGE_WEIGHTS=f16|q8_0`), each
+with its adapters merged into it first on the card, as the f16 path merges them, then
+read back and quantized. What the budget still has no room for streams from the file
+(`ggml_rs_wgpu::stream`). Qwen Image 2.1 (the 33.8 GB download) on an NVIDIA A2 (15.7
+GB): its 14 GB of f16 left room for 512x512 and ran out of memory at 1024x1024; as Q8_0
+(9.7 GB in use, 11.7 at a step) a 1024x1024 picture with the turbo adapter in 160 s
+(6 steps in 89 s) and 1024x768 in 151 s. Added as it runs beside the Q8_0 matrices
+instead, the adapter gave noise for some prompts (a short one) and not others, where
+merged it does not: a GGUF base with an adapter still takes it as it runs.

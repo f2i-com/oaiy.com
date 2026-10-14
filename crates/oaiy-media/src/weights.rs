@@ -199,6 +199,18 @@ impl Weights {
     /// `name`'s bytes and shape where a safetensors file keeps it as F16 (little-endian halves, read on several
     /// cores): what a device that holds f16 takes as they are. None for anything else (ComfyUI's quantized weights
     /// too).
+    /// Whether `name` is a plain BF16 tensor of a safetensors file ([`Self::raw`] gives its bytes), without reading it.
+    pub fn raw_is_bf16(&self, name: &str) -> bool {
+        let Ok(key) = self.resolve(name) else { return false };
+        match self {
+            Self::Safe(s) => {
+                let quantized = key.strip_suffix(".weight").is_some_and(|p| s.get(&format!("{p}.comfy_quant")).is_some());
+                s.info(&key).is_ok_and(|info| info.dtype == Dtype::BF16) && !quantized
+            }
+            Self::Gguf { .. } => false,
+        }
+    }
+
     pub fn raw_f16(&self, name: &str) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
         let Ok(key) = self.resolve(name) else { return Ok(None) };
         let Self::Safe(s) = self else { return Ok(None) };

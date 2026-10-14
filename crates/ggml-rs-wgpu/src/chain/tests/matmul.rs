@@ -544,8 +544,8 @@ fn q8_0_from_an_int8_row_is_the_f32_kernels() {
             (blk[0], blk[1]) = (d[0], d[1]);
         }
         let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q8_0));
-        // (a few rows' kernel too: 2, 3 and 8 rows against the f32 kernel's)
-        for m in [2usize, 3, 8] {
+        // (a few rows' kernel too: 2 to 16 rows against the f32 kernel's, past a workgroup's 8)
+        for m in [2usize, 3, 8, 9, 13, 16] {
             let (x, y, yq) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
             let xs: Vec<f32> = (0..m * k).map(|_| next()).collect();
             DeviceChain::upload(&b, &x, &xs);
@@ -645,6 +645,139 @@ fn a_weight_past_the_budget_is_the_cards() {
                 let cos = dot / (norm(&g) * norm(&want));
                 assert!(g.iter().all(|v| v.is_finite()) && cos > 0.9999, "{dtype:?} [{n}, {k}], {m} rows, from the {tier}: cosine {cos}");
             }
+        }
+    }
+}
+
+/// Q8_0 weights of a prompt's rows on the tensor cores give the f32 kernel's sums: Qwen Image 2.1's widths (3,072 in,
+/// 3,072 and 12,288 out) at rows that split the matmul along `k` and rows that do not.
+#[test]
+fn q8_0_on_the_tensor_cores_is_the_f32_kernels() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !b.gpu.coop16() {
+        return;
+    }
+    for (n, k) in [(3072usize, 3072usize), (12288, 3072)] {
+        let mut next = rng((n + k) as u32);
+        let xs32: Vec<f32> = (0..n * k).map(|_| next() * 0.05).collect();
+        let mut raw = vec![0u8; n * k / 32 * 34];
+        ggml_quants::q8_0::quantize(&xs32, &mut raw);
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q8_0));
+        for m in [1usize, 2, 9, 14, 17, 24, 25, 768, 790, 3072, 4096, 4120] {
+            let xs: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let (x, y, yf) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
+            DeviceChain::upload(&b, &x, &xs);
+            let mut rec = Recorder::new(&b);
+            ChainRecorder::matmul_rows(&mut rec, &w, &x, &y, m);
+            rec.matmul_rows_f32(&w, &x, &yf, m);
+            rec.read(&y);
+            rec.read(&yf);
+            let r = Box::new(rec).finish();
+            let (got, want) = (&r[0], &r[1]);
+            let dot: f64 = got.iter().zip(want).map(|(a, e)| *a as f64 * *e as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (norm(got) * norm(want));
+            eprintln!("Q8_0 [{n}, {k}] by {m} rows: cosine {cos:.6}");
+            assert!(got.iter().all(|v| v.is_finite()) && cos > 0.9999, "Q8_0 [{n}, {k}] by {m} rows: cosine {cos}");
+        }
+    }
+}
+
+/// An f16 matrix of few outputs (a LoRA's down factor: 128 of them over 3,072) by a prompt's rows on the tensor cores
+/// gives the exact kernel's sums, at rows few enough that the matmul is split along `k` and many enough that it is
+/// not; and its up factor (3,072 or 12,288 outputs over 128).
+#[test]
+fn a_lora_factors_f16_matmul_is_the_exact_kernels() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !b.gpu.coop16() {
+        return;
+    }
+    for (n, k) in [(128usize, 3072usize), (3072, 128), (12288, 128)] {
+        let mut next = rng((n * 3 + k) as u32);
+        let w: Vec<f32> = (0..n * k).map(|_| half::f16::from_f32(next() * 0.05).to_f32()).collect();
+        let w16 = b.vec_f16(&w).expect("f16 values");
+        for m in (1usize..=40).chain([300, 768, 1024, 3072, 4096]) {
+            let xs: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let (x, y, yf) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
+            DeviceChain::upload(&b, &x, &xs);
+            let mut rec = Recorder::new(&b);
+            ChainRecorder::matmul_f16_rows(&mut rec, &w16, n, k, &x, &y, m);
+            ChainRecorder::matmul_f16_rows_f32(&mut rec, &w16, n, k, &x, &yf, m);
+            rec.read(&y);
+            rec.read(&yf);
+            let r = Box::new(rec).finish();
+            let (got, want) = (&r[0], &r[1]);
+            let dot: f64 = got.iter().zip(want).map(|(a, e)| *a as f64 * *e as f64).sum();
+            let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (norm(got) * norm(want));
+            eprintln!("f16 [{n}, {k}] by {m} rows: cosine {cos:.6}");
+            assert!(got.iter().all(|v| v.is_finite()) && cos > 0.9999, "f16 [{n}, {k}] by {m} rows: cosine {cos}");
+        }
+    }
+}
+
+/// A few rows with a few channels far larger than the rest (a text encoder's states, as Qwen Image's prefix takes
+/// them): what the few rows' kernels give against the f32 kernel's, Q8_0 and Q4_K.
+#[test]
+#[ignore = "a measurement: prints the cosines"]
+fn measure_few_rows_with_large_channels() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (n, k) = (3072usize, 3072usize);
+    let mut next = rng(77);
+    let xs32: Vec<f32> = (0..n * k).map(|_| next() * 0.05).collect();
+    let mut q8 = vec![0u8; n * k / 32 * 34];
+    ggml_quants::q8_0::quantize(&xs32, &mut q8);
+    let wq8 = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(q8, vec![n, k], GgmlType::Q8_0));
+    for m in [14usize, 30] {
+        let xs: Vec<f32> = (0..m * k).map(|i| next() * if i % k % 997 == 5 { 300.0 } else { 3.0 }).collect();
+        let (x, y, yf) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
+        DeviceChain::upload(&b, &x, &xs);
+        let mut rec = Recorder::new(&b);
+        ChainRecorder::matmul_rows(&mut rec, &wq8, &x, &y, m);
+        rec.matmul_rows_f32(&wq8, &x, &yf, m);
+        rec.read(&y);
+        rec.read(&yf);
+        let r = Box::new(rec).finish();
+        let (got, want) = (&r[0], &r[1]);
+        let dot: f64 = got.iter().zip(want).map(|(a, e)| *a as f64 * *e as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        eprintln!("Q8_0 by {m} rows with large channels: cosine {:.6}, finite {}", dot / (norm(got) * norm(want)), got.iter().all(|v| v.is_finite()));
+    }
+}
+
+/// Q8_0 weights at Qwen Image 2.1's widths (4,096 and 12,288) give the host's sums (dequantized, in f64) for a text
+/// prefix's few rows and a picture's many, whichever kernel takes them.
+#[test]
+fn q8_0_at_a_pictures_widths_is_the_hosts() {
+    let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+    for (n, k) in [(4096usize, 4096usize), (12288, 4096), (4096, 12288)] {
+        let mut next = rng((n * 7 + k) as u32);
+        let w32: Vec<f32> = (0..n * k).map(|_| next() * 0.05).collect();
+        let mut raw = vec![0u8; n * k / 32 * 34];
+        ggml_quants::q8_0::quantize(&w32, &mut raw);
+        let mut deq = vec![0f32; n * k];
+        ggml_quants::dequantize(GgmlType::Q8_0, &raw, &mut deq).unwrap();
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q8_0));
+        for m in [1usize, 5, 14, 24, 25, 40, 300] {
+            let xs: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let (x, y) = (b.vec(m * k), b.vec(m * n));
+            DeviceChain::upload(&b, &x, &xs);
+            let mut rec = Recorder::new(&b);
+            ChainRecorder::matmul_rows(&mut rec, &w, &x, &y, m);
+            rec.read(&y);
+            let got = Box::new(rec).finish().pop().unwrap();
+            // a few of the outputs against the host's
+            let mut worst = 0f64;
+            let mut scale = 0f64;
+            for r in [0, m / 2, m - 1] {
+                for o in [0, 1, n / 3, n - 1] {
+                    let want: f64 = (0..k).map(|i| deq[o * k + i] as f64 * xs[r * k + i] as f64).sum();
+                    worst = worst.max((got[r * n + o] as f64 - want).abs());
+                    scale = scale.max(want.abs());
+                }
+            }
+            eprintln!("Q8_0 [{n}, {k}] by {m} rows: worst {worst:.4} of {scale:.3}");
+            assert!(worst <= 2e-2 * scale.max(1.0), "Q8_0 [{n}, {k}] by {m} rows: {worst} off of {scale}");
         }
     }
 }

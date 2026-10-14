@@ -55,8 +55,14 @@ pub(crate) fn mul(rec: &mut dyn ChainRecorder, m: &Mat, x: &DeviceVec, y: &Devic
         W::Quant(q) => rec.matmul_rows(q, x, y, rows),
     }
     for (a, b, rank) in &m.lora {
-        rec.matmul_f16_rows(a, *rank, m.k, x, &low.t, rows);
-        rec.matmul_f16_rows(b, m.n, *rank, &low.t, &low.y, rows);
+        // (the inputs as f32 where the weight's own take them so: the text prefix's states, a few channels far past f16)
+        if exact {
+            rec.matmul_f16_rows_f32(a, *rank, m.k, x, &low.t, rows);
+            rec.matmul_f16_rows_f32(b, m.n, *rank, &low.t, &low.y, rows);
+        } else {
+            rec.matmul_f16_rows(a, *rank, m.k, x, &low.t, rows);
+            rec.matmul_f16_rows(b, m.n, *rank, &low.t, &low.y, rows);
+        }
         rec.add(&first(y, rows * m.n), &first(&low.y, rows * m.n));
     }
 }
@@ -184,21 +190,25 @@ pub(crate) fn matrix_as(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::W
     let key = format!("{name}.weight");
     let shape = w.shape(&key)?;
     if let (true, &[n, k]) = (q8, shape.as_slice()) {
-        if k % 256 == 0 {
-            if let Some(Raw::Bf16(bytes)) = w.raw(&key)? {
-                let q = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(crate::wgpu_weights::q8_0_bf16(&bytes), vec![n, k], ggml_quants::GgmlType::Q8_0));
-                if !q.is_device() {
-                    candle_core::bail!("{key}: no room on the GPU for its {} MB as Q8_0", (n * k / 32 * 34) >> 20);
-                }
-                let mut low = Vec::new();
-                if !lora.is_empty() {
-                    for (a, b) in lora.factors(name, n, k, &Device::Cpu, DType::F32)? {
-                        let rank = a.dim(0)?;
-                        low.push((f16_vec(gpu, &a, name)?, f16_vec(gpu, &b, name)?, rank));
-                    }
-                }
-                return Ok(Mat { w: W::Quant(q), n, k, lora: low });
+        if k % 256 == 0 && w.raw_is_bf16(&key) {
+            // its adapters merged into it first, as the f16 path merges them (on the card, its f16 read back), then
+            // Q8_0: added as it runs beside a Q8_0 weight, a turbo adapter gave noise for some prompts
+            let bytes = if lora.is_empty() {
+                let Some(Raw::Bf16(bytes)) = w.raw(&key)? else { unreachable!("a BF16 weight's bytes") };
+                crate::wgpu_weights::q8_0_bf16(&bytes)
+            } else {
+                let (v, ..) = crate::wgpu_weights::f16_matrix(w, gpu, name, lora)?;
+                let mut rec = gpu.begin();
+                rec.read(&v);
+                let words = rec.finish().pop().ok_or_else(|| err(format!("{name}: its merged weights were not read")))?;
+                drop(v);
+                crate::wgpu_weights::q8_0_f16_words(&words)
+            };
+            let q = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], ggml_quants::GgmlType::Q8_0));
+            if !q.is_device() {
+                candle_core::bail!("{key}: no room on the GPU for its {} MB as Q8_0", (n * k / 32 * 34) >> 20);
             }
+            return Ok(Mat { w: W::Quant(q), n, k, lora: Vec::new() });
         }
     }
     let quant = w.ggml_dtype(&key).and_then(coop_type).filter(|_| std::env::var_os("OAIY_WEBGPU_DEQUANTIZE").is_none());
