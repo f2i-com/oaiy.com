@@ -44,6 +44,10 @@ impl Backend for WgpuBackend {
     }
     fn linear_q(&self, x: &Tensor, w: &QuantizedTensor) -> Tensor {
         if let Some(q) = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()) {
+            // (a weight left in its file: the CPU's, as before it was streamed; a chain writes it to the card instead)
+            if let Some((file, _)) = &q.file {
+                return self.cpu.linear_q(x, file);
+            }
             return self.linear_gpu(x, q, w.shape());
         }
         self.cpu.linear_q(x, w)
@@ -52,7 +56,7 @@ impl Backend for WgpuBackend {
     /// a decode step.
     fn linear_q_many(&self, x: &Tensor, ws: &[&QuantizedTensor]) -> Vec<Tensor> {
         let on_gpu: Option<Vec<(&WgpuQuant, &[usize])>> =
-            ws.iter().map(|w| Some((w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?, w.shape()))).collect();
+            ws.iter().map(|w| Some((w.device_storage()?.as_any().downcast_ref::<WgpuQuant>().filter(|q| q.file.is_none())?, w.shape()))).collect();
         let host;
         let x = if x.is_device() {
             host = x.to_host();

@@ -590,3 +590,61 @@ fn q8_0_from_an_int8_row_is_the_f32_kernels() {
         }
     }
 }
+
+/// A weight past the budget gives the card's own result ([`crate::stream`]): from its file (its bytes written into
+/// the slots before each matmul, the default) and from the host's memory (read there for a step's rows, copied into
+/// the slots for a prompt's), for a step's row, a few rows and a prompt's, Q3_K's blocks padded on the card among
+/// the types.
+#[test]
+fn a_weight_past_the_budget_is_the_cards() {
+    let Ok(card) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let Ok(small) = WgpuBackend::new(Some(1)) else { return };
+    // (each type's scale fields small and finite, the rest of its bytes any)
+    for (dtype, n, k, block, scales) in [
+        (GgmlType::Q4_K, 300usize, 512usize, 144usize, &[0usize, 2][..]),
+        (GgmlType::Q3_K, 70, 256, 110, &[108][..]),
+        (GgmlType::Q6_K, 64, 768, 210, &[208][..]),
+        (GgmlType::Q8_0, 100, 128, 34, &[0][..]),
+    ] {
+        let elems = if dtype == GgmlType::Q8_0 { 32 } else { 256 };
+        let mut next = rng(n as u32 * 7 + k as u32);
+        let mut raw: Vec<u8> = (0..n * (k / elems) * block).map(|_| ((next() + 1.0) * 127.9) as u8).collect();
+        for blk in raw.chunks_exact_mut(block) {
+            for &at in scales {
+                let d = half::f16::from_f32(0.002 + (blk[(at + 5) % block] as f32) * 1e-5).to_bits().to_le_bytes();
+                (blk[at], blk[at + 1]) = (d[0], d[1]);
+            }
+        }
+        let host = || ggml_rs::QuantizedTensor::from_bytes_cpu(raw.clone(), vec![n, k], dtype);
+        let on_card = ggml_rs::Backend::to_device_quant(&card, host());
+        let from_file = ggml_rs::Backend::to_device_quant(&small, host());
+        assert!(card.holds(&on_card) && small.holds(&from_file), "{dtype:?}: both held");
+        let q = from_file.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a streamed weight");
+        assert!(q.file.is_some() && small.filed() >= q.nbytes as u64 && small.usage().0 == 0, "{dtype:?}: past the budget, in its file");
+        let bytes = crate::stream::card_bytes(&host(), crate::shaders::padded_block(dtype)).into_owned();
+        let row_bytes = bytes.len() / n;
+        let pinned = small.pin_to_host(&bytes, row_bytes, dtype, &[n, k]);
+        for m in [1usize, 3, 40] {
+            let xs: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let run = |b: &WgpuBackend, w: &ggml_rs::QuantizedTensor| {
+                let (x, y) = (b.vec(m * k), b.vec(m * n));
+                DeviceChain::upload(b, &x, &xs);
+                let mut rec = Recorder::new(b);
+                ChainRecorder::matmul_rows(&mut rec, w, &x, &y, m);
+                rec.read(&y);
+                Box::new(rec).finish().pop().unwrap()
+            };
+            let want = run(&card, &on_card);
+            let mut got = vec![("file", run(&small, &from_file))];
+            if let Some(p) = &pinned {
+                got.push(("host", run(&small, p)));
+            }
+            for (tier, g) in got {
+                let dot: f64 = g.iter().zip(&want).map(|(a, e)| *a as f64 * *e as f64).sum();
+                let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let cos = dot / (norm(&g) * norm(&want));
+                assert!(g.iter().all(|v| v.is_finite()) && cos > 0.9999, "{dtype:?} [{n}, {k}], {m} rows, from the {tier}: cosine {cos}");
+            }
+        }
+    }
+}

@@ -60,7 +60,7 @@ fn webgpu(o: &Options, devices: &[usize]) -> std::result::Result<Picked, String>
     Ok(Picked {
         backend: Arc::new(b),
         // (a GPU whose memory is the computer's says so: what it holds comes out of the RAM the rest would use)
-        label: format!("WebGPU on {} ({}{}), up to {} GiB of weights, the rest on the CPU", a.name, a.backend, if a.unified { ", the computer's own memory" } else { "" }, budget >> 30),
+        label: format!("WebGPU on {} ({}{}), up to {} GiB of weights there, the rest sent to it from the model's file as they are used", a.name, a.backend, if a.unified { ", the computer's own memory" } else { "" }, budget >> 30),
     })
 }
 

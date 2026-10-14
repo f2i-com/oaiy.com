@@ -28,6 +28,7 @@ mod gpu;
 mod memory;
 pub mod profile;
 mod quant;
+mod stream;
 mod upload;
 mod watch;
 
@@ -225,6 +226,8 @@ struct Gpu {
     /// staging buffers there it goes through.
     host_staging: std::sync::OnceLock<bool>,
     host_pieces: Mutex<HostPieces>,
+    /// The two slots a prompt's weights from the host's memory are copied into ([`stream`]).
+    stream_slots: Mutex<stream::Slots>,
 }
 
 /// Which adapter the backend runs on, for logs.
@@ -246,6 +249,10 @@ pub struct WgpuBackend {
     used: Arc<AtomicU64>,
     /// Bytes of the weights it was asked to hold and had no room for within the budget: they stay on the host.
     left: Arc<AtomicU64>,
+    /// Of the weights past the budget, the bytes in the host's memory that the card reads ([`stream`]).
+    streamed: Arc<AtomicU64>,
+    /// And the bytes left in their file that are written to the card each time they are used ([`stream`]).
+    filed: Arc<AtomicU64>,
     summary: AdapterSummary,
     /// One projection at a time: the dispatch and read-back share the queue (EXL3 weights hold it too).
     serial: Arc<Mutex<()>>,
@@ -257,7 +264,7 @@ pub struct WgpuBackend {
 /// to record chains of their own (an expert group).
 impl Clone for WgpuBackend {
     fn clone(&self) -> Self {
-        Self { cpu: CpuBackend::new(), gpu: Arc::clone(&self.gpu), budget: self.budget, used: Arc::clone(&self.used), left: Arc::clone(&self.left), summary: self.summary.clone(), serial: Arc::clone(&self.serial), raw_adapter: self.raw_adapter.clone() }
+        Self { cpu: CpuBackend::new(), gpu: Arc::clone(&self.gpu), budget: self.budget, used: Arc::clone(&self.used), left: Arc::clone(&self.left), streamed: Arc::clone(&self.streamed), filed: Arc::clone(&self.filed), summary: self.summary.clone(), serial: Arc::clone(&self.serial), raw_adapter: self.raw_adapter.clone() }
     }
 }
 
@@ -548,10 +555,12 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), int8_rows: std::sync::OnceLock::new(), decode_int8: Mutex::new(HashMap::new()), dense_arena: Mutex::new(None), subgroups32: !subgroups.is_empty(), coop_split: Mutex::new(HashMap::new()), host_staging: std::sync::OnceLock::new(), host_pieces: Mutex::new(HostPieces::default()) }),
+            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), int8_rows: std::sync::OnceLock::new(), decode_int8: Mutex::new(HashMap::new()), dense_arena: Mutex::new(None), subgroups32: !subgroups.is_empty(), coop_split: Mutex::new(HashMap::new()), host_staging: std::sync::OnceLock::new(), host_pieces: Mutex::new(HostPieces::default()), stream_slots: Mutex::new(stream::Slots::default()) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             left: Arc::new(AtomicU64::new(0)),
+            streamed: Arc::new(AtomicU64::new(0)),
+            filed: Arc::new(AtomicU64::new(0)),
             summary,
             serial: Arc::new(Mutex::new(())),
             raw_adapter: adapter,
@@ -686,7 +695,7 @@ impl WgpuBackend {
     /// back and put on this one, within its budget.
     pub(crate) fn copy_weight(&self, w: &QuantizedTensor) -> Option<QuantizedTensor> {
         let q = w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?;
-        if Arc::ptr_eq(&q.gpu, &self.gpu) {
+        if Arc::ptr_eq(&q.gpu, &self.gpu) || q.host || q.file.is_some() {
             return None;
         }
         let prev = self.used.fetch_add(q.nbytes as u64, Ordering::Relaxed);
@@ -695,7 +704,7 @@ impl WgpuBackend {
             return None;
         }
         let chunks = self.gpu.upload_rows(&q.gpu_bytes(), q.row_bytes, 1);
-        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: q.dtype, chunks, row_bytes: q.row_bytes, nbytes: q.nbytes, used: Arc::clone(&self.used) };
+        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: q.dtype, chunks, row_bytes: q.row_bytes, nbytes: q.nbytes, used: Arc::clone(&self.used), host: false, file: None };
         Some(QuantizedTensor::from_device(Box::new(storage), w.shape().to_vec()))
     }
 
@@ -705,6 +714,16 @@ impl WgpuBackend {
     }
 
     fn upload(&self, w: QuantizedTensor) -> QuantizedTensor {
+        self.upload_by(w, true)
+    }
+
+    /// [`Self::upload`] on the card whatever the budget holds, not counted in it: a kernel's timing's own weight
+    /// (where a model's weights have filled the budget, it went to the host's memory and timed the bus).
+    pub(crate) fn upload_on_card(&self, w: QuantizedTensor) -> QuantizedTensor {
+        self.upload_by(w, false)
+    }
+
+    fn upload_by(&self, w: QuantizedTensor, budgeted: bool) -> QuantizedTensor {
         let Some((elems, block_bytes, _)) = shaders::layout(w.dtype()) else { return w };
         if w.is_device() || w.rank() != 2 || w.dim(1) % elems as usize != 0 || self.gpu.pipeline(w.dtype(), 2).is_none() {
             return w;
@@ -718,17 +737,26 @@ impl WgpuBackend {
         }
         let nbytes = row_bytes * w.dim(0);
         // Reserve before uploading so concurrent loads cannot overshoot together.
-        let prev = self.used.fetch_add(nbytes as u64, Ordering::Relaxed);
-        if prev + nbytes as u64 > self.budget {
+        let prev = if budgeted { self.used.fetch_add(nbytes as u64, Ordering::Relaxed) } else { 0 };
+        if budgeted && prev + nbytes as u64 > self.budget {
             self.used.fetch_sub(nbytes as u64, Ordering::Relaxed);
-            self.left.fetch_add(nbytes as u64, Ordering::Relaxed);
-            return w;
+            // in the host's memory for the card to read, where it has room ([`stream`]); else in the file, for the CPU
+            let host = match padded {
+                Some((host, gpu, at)) => self.upload_to_host(&shaders::pad_blocks(w.bytes(), host, gpu, at), row_bytes, w.dtype(), w.shape()),
+                None => self.upload_to_host(w.bytes(), row_bytes, w.dtype(), w.shape()),
+            };
+            if let Some(q) = host {
+                return q;
+            }
+            // else in its file, written into the card's slots as it is used ([`stream`])
+            return self.upload_as_file(w, row_bytes, padded);
         }
         let chunks = match padded {
             Some((host, gpu, at)) => self.gpu.upload_rows(&shaders::pad_blocks(w.bytes(), host, gpu, at), row_bytes, 1),
             None => self.gpu.upload_rows(w.bytes(), row_bytes, 1),
         };
-        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: w.dtype(), chunks, row_bytes, nbytes, used: Arc::clone(&self.used) };
+        let (nbytes, used) = if budgeted { (nbytes, Arc::clone(&self.used)) } else { (0, Arc::new(AtomicU64::new(0))) };
+        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: w.dtype(), chunks, row_bytes, nbytes, used, host: false, file: None };
         QuantizedTensor::from_device(Box::new(storage), w.shape().to_vec())
     }
 

@@ -11,6 +11,11 @@ pub(super) struct WgpuQuant {
     pub(super) row_bytes: usize,
     pub(super) nbytes: usize,
     pub(super) used: Arc<AtomicU64>,
+    /// Its chunks are in the host's memory, which the card reads over the bus ([`crate::stream`]).
+    pub(super) host: bool,
+    /// Its bytes are in the model's file (no chunks): written into the card's slots each time a matmul takes it
+    /// ([`crate::stream`]); the blocks' padding on the card, where its type has one (`shaders::padded_block`).
+    pub(super) file: Option<(QuantizedTensor, Option<(usize, usize, usize)>)>,
 }
 
 impl std::fmt::Debug for WgpuQuant {
@@ -62,7 +67,10 @@ impl QuantizedDeviceStorage for WgpuQuant {
         self
     }
     fn clone_to_device(&self) -> Box<dyn QuantizedDeviceStorage> {
-        let bytes = self.gpu_bytes();
+        let bytes = match &self.file {
+            Some((w, padded)) => crate::stream::card_bytes(w, *padded).into_owned(),
+            None => self.gpu_bytes(),
+        };
         self.used.fetch_add(self.nbytes as u64, Ordering::Relaxed);
         Box::new(WgpuQuant {
             gpu: Arc::clone(&self.gpu),
@@ -71,6 +79,8 @@ impl QuantizedDeviceStorage for WgpuQuant {
             row_bytes: self.row_bytes,
             nbytes: self.nbytes,
             used: Arc::clone(&self.used),
+            host: false,
+            file: None,
         })
     }
 }

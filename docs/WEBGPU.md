@@ -946,6 +946,34 @@ halves (and the top and bottom) of two pictures side by side, which of two pictu
 had an animal, and a door's colour in a second picture three turns into a
 conversation about the first.
 
+## Models larger than the card (2026-10-14)
+
+A weight the GPU's budget has no room for stays in the model's file, held as the
+card's (`ggml_rs_wgpu::stream`: a `WgpuQuant` with `file`), so the chained runs
+take a model that has some (before, they did not, and such a model ran op by op:
+Qwen3.5 9B held to a 3 GB budget read a 300-token prompt for over ten minutes).
+Each time a matmul takes such a weight the work recorded so far is sent, the feed's
+pieces all submitted, and its bytes written into one of two sets of slots on the card
+through the host's memory (2.2 GB/s over Thunderbolt 3, where the queue's own staging
+memory takes 0.21): drive, then system memory (what of the file it keeps), then card,
+each byte once a step and once a prompt's chunk. Op by op the CPU still multiplies it.
+`OAIY_STREAM_WEIGHTS=0`: as before; `OAIY_STREAM_PIN=1`: such weights in the host's
+memory instead, in buffers the kernels read where they lie (a prompt's rows copied
+into the slots by a kernel): as fast for a prompt, slower for a step, and it holds the
+system's memory. A kernel's timing weight goes on the card whatever the budget holds
+(it was timed over the bus, and a step took f32 kernels for every weight).
+
+On an NVIDIA A2 (15 GB, Thunderbolt 3; 16 GB of system memory):
+
+| Model | On the GPU / streamed | Load | A prompt | A reply |
+|---|---|---:|---:|---:|
+| Qwen3.5 9B, held to a 3 GB budget | 3.2 / 1.9 GB | 6 s | 2,005 tokens in 6.6 s (311 in 1.8) | 1.15 tok/s |
+| Qwen3.5 27B Q4_K_M (the app's 10 GiB budget) | 10.7 / 5.3 GB | 18 s | 2,005 tokens in 21 s (311 in 5.3) | 0.42 tok/s |
+
+A reply is the bus's: its bytes past the budget at some 2.2 GB a second (the CPU
+alone replied at 0.36 tokens a second with the 9B, so it is no help here). A card on
+PCIe 4 x16 takes them some ten times as fast.
+
 ## Qwen3.5 and Qwen3.8 27B on the GPU (2026-10-05)
 
 Qwen3.5's hybrid (Qwen3.5 4B, 9B and 27B, Qwen3.8 27B: `llama-rs`'s

@@ -317,11 +317,29 @@ pub(crate) fn auto_context(base: usize, model_max: usize, most: usize, fits: imp
     (base, n < most.min(model_max))
 }
 
-pub(crate) fn placement(name: &str, on_gpu: u64, left: u64, free: Option<u64>) -> String {
+pub(crate) fn placement(name: &str, on_gpu: u64, streamed: u64, filed: u64, left: u64, free: Option<u64>) -> String {
     let gb = |bytes: u64| bytes as f64 / 1e9;
-    if left == 0 {
+    if left == 0 && streamed == 0 && filed == 0 {
         return format!("{name}: its weights are all on the GPU ({:.1} GB)", gb(on_gpu));
     }
+    // (past the GPU's share: in the host's memory for the GPU to read over the bus, else in the file and written to
+    // the GPU as they are used: `ggml_rs_wgpu::stream`)
+    if left == 0 {
+        let mut parts = Vec::new();
+        if streamed > 0 {
+            parts.push(format!("{:.1} GB in this computer's memory, which the GPU reads them from", gb(streamed)));
+        }
+        if filed > 0 {
+            parts.push(format!("{:.1} GB in the model's file, sent to the GPU as they are used (what the system has not kept in memory read from the drive)", gb(filed)));
+        }
+        return format!(
+            "{name}: {:.1} GB of its weights are on the GPU and {:.1} GB had no room there: {} (each of their bytes over the bus once a token, and once a prompt's chunk)",
+            gb(on_gpu),
+            gb(streamed + filed),
+            parts.join(", ")
+        );
+    }
+    let on_gpu = on_gpu + streamed;
     let memory = match free {
         Some(free) if left > free => format!(
             "; {:.1} GB of memory are free for them, so what does not stay there is read from the drive again at each token (slow: a file that fits the GPU's share, or a larger share with --webgpu-gb, answers faster)",
@@ -340,12 +358,14 @@ pub(crate) fn placement(name: &str, on_gpu: u64, left: u64, free: Option<u64>) -
 #[test]
 fn a_models_weights_are_said_to_be_on_the_gpu_or_read_from_the_file() {
     let gb = 1_000_000_000u64;
-    assert_eq!(placement("m", 5_700_000_000, 0, Some(9 * gb)), "m: its weights are all on the GPU (5.7 GB)");
-    let part = placement("m", 12 * gb, 4 * gb, Some(6 * gb));
+    assert_eq!(placement("m", 5_700_000_000, 0, 0, 0, Some(9 * gb)), "m: its weights are all on the GPU (5.7 GB)");
+    let streamed = placement("m", 10 * gb, 5 * gb, 2 * gb, 0, Some(6 * gb));
+    assert!(streamed.starts_with("m: 10.0 GB of its weights are on the GPU and 7.0 GB had no room there: 5.0 GB in this computer's memory") && streamed.contains("2.0 GB in the model's file"), "{streamed}");
+    let part = placement("m", 12 * gb, 0, 0, 4 * gb, Some(6 * gb));
     assert!(part.starts_with("m: 12.0 GB of its weights are on the GPU and 4.0 GB had no room there") && part.ends_with("; they fit the 6.0 GB of memory that are free"), "{part}");
-    let short = placement("m", 12 * gb, 10 * gb, Some(6 * gb));
+    let short = placement("m", 12 * gb, 0, 0, 10 * gb, Some(6 * gb));
     assert!(short.contains("6.0 GB of memory are free for them") && short.contains("read from the drive again at each token"), "{short}");
-    assert!(placement("m", 12 * gb, 10 * gb, None).ends_with("as they are used"));
+    assert!(placement("m", 12 * gb, 0, 0, 10 * gb, None).ends_with("as they are used"));
 }
 
 /// Where a model's weights are, given what names it: a checkpoint that is a folder (EXL3, safetensors) may be named by
@@ -1097,7 +1117,7 @@ impl Models {
     fn say_placement(&self, name: &str, backend: &dyn ggml_rs::Backend) {
         #[cfg(feature = "webgpu")]
         if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
-            self.say(placement(name, b.usage().0, b.left_on_host(), ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64)));
+            self.say(placement(name, b.usage().0, b.streamed(), b.filed(), b.left_on_host(), ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64)));
         }
         #[cfg(not(feature = "webgpu"))]
         let _ = (name, backend);

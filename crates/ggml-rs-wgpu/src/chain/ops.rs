@@ -3,6 +3,9 @@ use super::*;
 
 impl ChainRecorder for Recorder<'_> {
     fn matmul_rows(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) {
+        // (a weight in the host's memory: a prompt's rows have it copied into the card first, `stream`)
+        let staged = self.stage(w, m);
+        let w = staged.as_ref().unwrap_or(w);
         // several rows (a check of drafts, a short chunk) from int8 activations, where the type has kernels for them
         // (OAIY_NO_Q8: the f32 ones); the K-quants' only where the device does them well (`Gpu::int8_rows`: on Metal
         // their f32 ones)

@@ -532,7 +532,7 @@ fn time_coop(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> Option<(f64
     };
     // (any bytes will do for a time: the kernels do the same work whatever the weights are)
     let raw: Vec<u8> = (0..n * (k / block) * bytes).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(13) as u8).collect();
-    let w = ggml_rs::Backend::to_device_quant(backend, QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+    let w = backend.upload_on_card(QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
     let q = w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?;
     let padded = m.div_ceil(crate::shaders::COOP_TILE as usize) * crate::shaders::COOP_TILE as usize;
     let (x16, y) = (backend.vec(crate::shaders::x_f16_tiled_words(m, k).max(padded * k / 2)), backend.vec(m * n));
@@ -593,7 +593,7 @@ fn time_decode(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> Option<(f
     };
     // (any bytes will do for a time: the kernels do the same work whatever the weights are)
     let raw: Vec<u8> = (0..n * (k / block) * bytes).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(13) as u8).collect();
-    let w = ggml_rs::Backend::to_device_quant(backend, QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+    let w = backend.upload_on_card(QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
     w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?;
     let (x, y) = (backend.vec(k), backend.vec(n));
     DeviceChain::upload(backend, &x, &(0..k).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect::<Vec<_>>());

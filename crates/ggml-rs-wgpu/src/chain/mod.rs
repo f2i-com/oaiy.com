@@ -51,7 +51,7 @@ impl std::fmt::Debug for Aliased {
 /// A buffer for a chain's vector of `len`.
 /// A grid of `groups` workgroups of 256 for a kernel that indexes over two of its dimensions (`id.x + id.y * 65535 *
 /// 256`): a dimension takes 65,535 at most (a chunk of 1,024 rows' FFN is 69,632).
-fn grid(groups: u32) -> (u32, u32, u32) {
+pub(crate) fn grid(groups: u32) -> (u32, u32, u32) {
     (groups.min(65535), groups.div_ceil(65535).max(1), 1)
 }
 
@@ -249,6 +249,22 @@ impl Recorder<'_> {
     /// command buffers already.
     fn fed(&self) -> bool {
         self.gpu().feeds() && self.held.is_empty() && !crate::profile::chain_on() && !crate::profile::pieces_on()
+    }
+
+    /// Everything recorded so far sent to the queue (what is held too), the recording going on: a write made now is
+    /// after it ([`crate::stream`]'s weights from a file). Its reads are copied out at its end, as before.
+    pub(crate) fn submit_so_far(&mut self) {
+        // (a held recording's pieces too: its hold is for what is recorded after)
+        let hold = std::mem::replace(&mut self.hold, false);
+        let held = std::mem::take(&mut self.held);
+        if !held.is_empty() {
+            self.gpu().submit_piece(held);
+        }
+        for list in std::mem::take(&mut self.lists) {
+            self.gpu().feed(list);
+        }
+        self.submit_piece();
+        self.hold = hold;
     }
 
     fn submit_piece(&mut self) {

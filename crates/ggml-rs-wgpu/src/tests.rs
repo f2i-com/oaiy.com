@@ -145,14 +145,16 @@ fn measure_quantized_projections() {
     }
 }
 
+/// A weight past the budget stays in its file, held as the card's ([`crate::stream`]: a chain writes it to the card
+/// as it is used), the budget untouched; op by op the CPU multiplies it, as before.
 #[test]
-fn weights_beyond_the_budget_stay_on_the_host_and_still_compute() {
+fn weights_beyond_the_budget_stay_in_their_file_and_still_compute() {
     let Ok(b) = WgpuBackend::new(Some(0)) else { return };
     let mut rng = Rng(7);
     let (rows, k) = (8, 256);
     let w = random_weights(GgmlType::Q4_K, rows, k, &mut rng);
     let qt = b.try_to_device_quant(QuantizedTensor::from_bytes_cpu(w.clone(), vec![rows, k], GgmlType::Q4_K), 0);
-    assert!(!qt.is_device());
+    assert!(qt.is_device() && b.filed() == (rows * 144) as u64);
     assert_eq!(b.usage().0, 0);
     let x: Vec<f32> = (0..k).map(|_| rng.unit()).collect();
     let y = b.linear_q(&Tensor::from_vec(x.clone(), vec![1, k]), &qt);
