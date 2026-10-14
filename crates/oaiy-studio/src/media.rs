@@ -1511,7 +1511,7 @@ impl Media {
 
     /// The kept worker let go: its standard input closed (it ends, its memory on the card freed), and killed past a wait
     /// (`now`: killed at once, a job it is doing cancelled).
-    fn end_serving(&self, now: bool) {
+    pub(crate) fn end_serving(&self, now: bool) {
         let Some(mut s) = self.serving.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
         drop(s.stdin);
         let deadline = std::time::Instant::now() + if now { Duration::ZERO } else { Duration::from_secs(10) };
@@ -1639,6 +1639,12 @@ impl Media {
         if let Some(e) = result.get("error").and_then(Json::as_str) {
             if !incognito {
                 self.log.push(format!("{label}: worker failed: {e}"));
+            }
+            if gpu_fault(e) {
+                // (its device is lost or its results are not numbers: the next picture is given a new worker, as
+                // each job was before workers were kept)
+                drop(slot);
+                self.end_serving(true);
             }
             return Err(e.to_string());
         }

@@ -188,6 +188,9 @@ impl Studio {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
+        // The worker kept for pictures, waiting for the next: no job, so nothing above ends it, and an update would
+        // find its program still running (on Windows the installer cannot replace it).
+        self.media.end_serving(false);
         self.log.push("studio stopped");
     }
 
@@ -703,10 +706,24 @@ mod tests {
         assert_ne!(got, port);
         let said = moved.expect("the move is said");
         assert!(said.contains(&format!("127.0.0.1:{port} is not to be had")) && said.contains(&format!("listening on 127.0.0.1:{got} instead")), "{said}");
-        // the port free: it is the one listened on, and nothing is said
+        // the port free: it is the one listened on, and nothing is said (on another free port where a test beside this
+        // one was handed the port just let go: seen on Linux, "127.0.0.1:46647 is not to be had (Address already in
+        // use)" the moment after it was)
         drop((held, l));
-        let (l, moved) = listen("127.0.0.1", port, "gateway").unwrap();
-        assert_eq!((l.local_addr().unwrap().port(), moved), (port, None));
+        let mut port = port;
+        let (got, moved) = (0..5)
+            .map(|_| {
+                let (l, moved) = listen("127.0.0.1", port, "gateway").unwrap();
+                let got = (l.local_addr().unwrap().port(), moved);
+                if got.1.is_some() {
+                    drop(l);
+                    port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+                }
+                got
+            })
+            .find(|(_, moved)| moved.is_none())
+            .expect("a free port listened on as it is");
+        assert_eq!((got, moved), (port, None));
         // a host that is not this computer's is not worked around
         assert!(listen("203.0.113.9", port, "UI").is_err());
     }
