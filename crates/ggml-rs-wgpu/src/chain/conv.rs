@@ -55,11 +55,16 @@ impl Recorder<'_> {
         let xb = buffer(x).clone();
         let range = self.x16.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == key ^ (3 << 30)).map(|(.., v)| v.clone()).expect("a convolution's input's scale beside its copy");
         let tile = crate::shaders::COOP_TILE;
-        let pipeline = match taps {
-            27 => self.gpu().named_pipeline("chain-coop-conv3d", || crate::shaders::coop_conv(27)),
-            49 => self.gpu().named_pipeline("chain-coop-conv7x7", || crate::shaders::coop_conv(49)),
-            9 => self.gpu().named_pipeline("chain-coop-conv3x3", || crate::shaders::coop_conv(9)),
-            _ => self.gpu().named_pipeline("chain-coop-conv1x1", || crate::shaders::coop_conv(1)),
+        // (a 3x3's and a 1x1's subgroups split, those that gather the pixels apart from those that multiply, where the
+        // device takes it: matmul::split_f16_on)
+        let split = super::matmul::split_f16_on(self.gpu());
+        let pipeline = match (taps, split) {
+            (27, _) => self.gpu().named_pipeline("chain-coop-conv3d", || crate::shaders::coop_conv(27)),
+            (49, _) => self.gpu().named_pipeline("chain-coop-conv7x7", || crate::shaders::coop_conv(49)),
+            (9, true) => self.gpu().named_pipeline("chain-coop-split-conv3x3", || crate::shaders::coop_split_f16(9)),
+            (9, false) => self.gpu().named_pipeline("chain-coop-conv3x3", || crate::shaders::coop_conv(9)),
+            (_, true) => self.gpu().named_pipeline("chain-coop-split-conv1x1", || crate::shaders::coop_split_f16(1)),
+            (_, false) => self.gpu().named_pipeline("chain-coop-conv1x1", || crate::shaders::coop_conv(1)),
         };
         let kk = taps * cp;
         let tiles = (cout as u32).div_ceil(tile) * (m as u32).div_ceil(tile);

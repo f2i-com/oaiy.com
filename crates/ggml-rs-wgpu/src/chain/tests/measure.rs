@@ -1808,7 +1808,9 @@ fn measure_wide_head_attention() {
 /// A 3x3 convolution on the tensor cores at a VAE decoder's shapes (`--ignored --nocapture`; Qwen Image 2.1's at a
 /// 1024x1024 picture: 1,152 channels at 128x128, 256x256's 576, 512x512's 288), against the f16 matmul of the same work
 /// (its pixels the rows, nine taps' channels the inputs): what its implicit im2col costs. An NVIDIA A2 at 1,200 MHz:
-/// the convolutions 4.05, 3.77 and 3.21 TFLOPS; the f16 matmul 4.46 at the first (where the Q4_K split kernel gives 6.9).
+/// the convolutions 4.05, 3.77 and 3.21 TFLOPS in [`crate::shaders::coop_conv`]'s kernel, 4.41, 4.15 and 3.66 split
+/// ([`crate::shaders::coop_split_f16`]); the f16 matmul 4.47 and 4.98 at the first (where the Q4_K split kernel gives
+/// 6.9: f16 weights are four times the bytes). `OAIY_COOP_SPLIT=0` for the first kernels.
 #[test]
 #[ignore = "a measurement"]
 fn measure_conv3x3() {

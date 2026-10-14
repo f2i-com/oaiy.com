@@ -1213,28 +1213,85 @@ pub fn coop_tiled_split(dtype: GgmlType) -> Option<String> {
         GgmlType::Q8_0 => (words, COOP_AHEAD_HELPERS, COOP_SPLIT_Q8_0_REGS, COOP_SPLIT_Q8_0_LOAD, COOP_SPLIT_Q8_0_DECODE),
         _ => return None,
     };
+    Some(split_source(binding, helpers, "", regs, load, decode, COOP_SPLIT_X_LOAD))
+}
+
+/// [`coop_tiled_split`] for f16 weights (`[n, k]` two to a word, `k` of 4: a last step short of 32 padded with zeros),
+/// a decoding thread's "decode" its 16 halves copied: `taps` 0 a matmul's tokens from their tiled copy ([`X_F16_TILED`]),
+/// 1 or 9 a 1x1's or 3x3 convolution's pixels as [`coop_conv`] gathers them (`Params` as its). The f16 tensor cores'
+/// matmul on an NVIDIA A2 at 1,200 MHz gave 4.5 TFLOPS in [`COOP_KERNEL`] (its convolutions 3.2 to 4.1), where the Q4_K
+/// split kernel's 6.9.
+pub fn coop_split_f16(taps: usize) -> String {
+    let (prelude, x_load) = match taps {
+        0 => ("", COOP_SPLIT_X_LOAD),
+        1 => ("    // the steps a tap\n    let cs = p.k / 32u;\n", COOP_SPLIT_X_CONV1X1),
+        9 => ("    // the steps a tap, and the thread's pixel (its row and column)\n    let cs = p.k / 288u;\n    let gpix = min(t0 + lr, p.m - 1u);\n    let gy = gpix / p.row_bytes;\n    let gx = gpix - gy * p.row_bytes;\n", COOP_SPLIT_X_CONV3X3),
+        _ => panic!("a split f16 kernel's {taps} taps"),
+    };
+    split_source("@group(0) @binding(0) var<storage, read> w4: array<vec4<f16>>;", "", prelude, COOP_SPLIT_F16_REGS, COOP_SPLIT_F16_LOAD, COOP_SPLIT_F16_DECODE, x_load)
+}
+
+/// [`COOP_SPLIT_KERNEL`] with a type's parts put in: its weights' binding, helpers, what its loads share (`prelude`,
+/// once), a set's registers, a step's loads and decode (`SET` the set), and its tokens' loads (`x_load`, into `xaSET` ..
+/// `xdSET`).
+fn split_source(binding: &str, helpers: &str, prelude: &str, regs: &str, load: &str, decode: &str, x_load: &str) -> String {
     let set = |part: &str, s: &str| part.replace("SET", s);
-    let sets = format!("{}{}{}{}", set(regs, "0"), set(COOP_SPLIT_X_REGS, "0"), set(regs, "1"), set(COOP_SPLIT_X_REGS, "1"));
-    let load_of = |s: &str| format!("{}{}", set(load, s), set(COOP_SPLIT_X_LOAD, s));
+    let sets = format!("{prelude}{}{}{}{}", set(regs, "0"), set(COOP_SPLIT_X_REGS, "0"), set(regs, "1"), set(COOP_SPLIT_X_REGS, "1"));
+    let load_of = |s: &str| format!("{}{}", set(load, s), set(x_load, s));
     let decode_of = |s: &str| format!("            let at4 = buf + lr * S4 + lh * 4u;\n{}{}", set(decode, s), set(COOP_SPLIT_X_STORE, s));
     let multiply = format!("{}{}", COOP_SPLIT_MULTIPLY.replace("KK4", "0u"), COOP_SPLIT_MULTIPLY.replace("KK4", "4u"));
     let frags = [("c00", 0u32, 0u32), ("c01", 0, 16), ("c02", 0, 32), ("c03", 0, 48), ("c10", 16, 0), ("c11", 16, 16), ("c12", 16, 32), ("c13", 16, 48)];
     let edges: String = frags.iter().map(|(cf, fr, ft)| COOP_SPLIT_EDGE.replace("CF", cf).replace("FR", &format!("{fr}u")).replace("FT", &format!("{ft}u"))).collect();
-    Some(
-        COOP_SPLIT_KERNEL
-            .replace("WEIGHTS_BINDING", binding)
-            .replace("DECODE_HELPERS", helpers)
-            .replace("SETS\n", &sets)
-            .replace("LOAD_FIRST_0\n", &load_of("0").replace("FIRST", "true"))
-            .replace("LOAD_FIRST_1\n", &load_of("1").replace("FIRST", "true"))
-            .replace("LOAD_0\n", &load_of("0").replace("FIRST", "false"))
-            .replace("LOAD_1\n", &load_of("1").replace("FIRST", "false"))
-            .replace("DECODE_0\n", &decode_of("0"))
-            .replace("DECODE_1\n", &decode_of("1"))
-            .replace("MULTIPLY\n", &multiply)
-            .replace("EDGE_STORES\n", &edges),
-    )
+    COOP_SPLIT_KERNEL
+        .replace("WEIGHTS_BINDING", binding)
+        .replace("DECODE_HELPERS", helpers)
+        .replace("SETS\n", &sets)
+        .replace("LOAD_FIRST_0\n", &load_of("0").replace("FIRST", "true"))
+        .replace("LOAD_FIRST_1\n", &load_of("1").replace("FIRST", "true"))
+        .replace("LOAD_0\n", &load_of("0").replace("FIRST", "false"))
+        .replace("LOAD_1\n", &load_of("1").replace("FIRST", "false"))
+        .replace("DECODE_0\n", &decode_of("0"))
+        .replace("DECODE_1\n", &decode_of("1"))
+        .replace("MULTIPLY\n", &multiply)
+        .replace("EDGE_STORES\n", &edges)
 }
+
+/// f16's parts of [`coop_split_f16`]: a thread's 16 halves of its weight row's step (zeros past `k`), stored as they are.
+const COOP_SPLIT_F16_REGS: &str = "    var waSET = vec4<f16>();\n    var wbSET = vec4<f16>();\n    var wcSET = vec4<f16>();\n    var wdSET = vec4<f16>();\n";
+const COOP_SPLIT_F16_LOAD: &str = r#"            let wk = b * 32u + lh * 16u;
+            let wo = rl * (kx / 4u) + wk / 4u;
+            waSET = select(vec4<f16>(), w4[wo], wk < kx);
+            wbSET = select(vec4<f16>(), w4[wo + 1u], wk + 4u < kx);
+            wcSET = select(vec4<f16>(), w4[wo + 2u], wk + 8u < kx);
+            wdSET = select(vec4<f16>(), w4[wo + 3u], wk + 12u < kx);
+"#;
+const COOP_SPLIT_F16_DECODE: &str = r#"            wt[at4] = waSET;
+            wt[at4 + 1u] = wbSET;
+            wt[at4 + 2u] = wcSET;
+            wt[at4 + 3u] = wdSET;
+"#;
+
+/// [`COOP_X_CONV3X3`]'s gather for [`coop_split_f16`]: a decoding thread's 16 channels of its pixel's tap for step `b`.
+const COOP_SPLIT_X_CONV3X3: &str = r#"            let ctap = b / cs;
+            let dy = ctap / 3u;
+            let cy = gy + dy;
+            let cx = gx + ctap - dy * 3u;
+            let cin = cy >= 1u && cy <= p._pad1 && cx >= 1u && cx <= p.row_bytes;
+            let cb = ((select(0u, cy - 1u, cin) * p.row_bytes + select(0u, cx - 1u, cin)) * cs * 32u + (b - ctap * cs) * 32u + lh * 16u) / 4u;
+            xaSET = select(vec4<f16>(), x16[cb], cin);
+            xbSET = select(vec4<f16>(), x16[cb + 1u], cin);
+            xcSET = select(vec4<f16>(), x16[cb + 2u], cin);
+            xdSET = select(vec4<f16>(), x16[cb + 3u], cin);
+"#;
+
+/// [`COOP_X_CONV1X1`]'s for [`coop_split_f16`].
+const COOP_SPLIT_X_CONV1X1: &str = r#"            let cpix = min(t0 + lr, p.m - 1u);
+            let cb = (cpix * cs * 32u + (b % cs) * 32u + lh * 16u) / 4u;
+            xaSET = x16[cb];
+            xbSET = x16[cb + 1u];
+            xcSET = x16[cb + 2u];
+            xdSET = x16[cb + 3u];
+"#;
 
 /// [`coop_tiled`] for NVFP4 weights ([`COOP_NVFP4_HELPERS`]'s layout; `k` of 64), its sums f32 throughout.
 pub fn coop_tiled_nvfp4() -> String {

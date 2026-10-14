@@ -273,7 +273,11 @@ impl Recorder<'_> {
         }
         let x16 = self.x16_tiled(x, m, k);
         let tile = crate::shaders::COOP_TILE;
-        let pipeline = self.gpu().named_pipeline("chain-coop-f16", crate::shaders::coop_tiled_f16);
+        let pipeline = if split_f16_on(self.gpu()) {
+            self.gpu().named_pipeline("chain-coop-split-f16", || crate::shaders::coop_split_f16(0))
+        } else {
+            self.gpu().named_pipeline("chain-coop-f16", crate::shaders::coop_tiled_f16)
+        };
         let tiles = (n as u32).div_ceil(tile) * (m as u32).div_ceil(tile);
         let (splits, out, parts) = self.coop_parts(tiles, k, m, n, y, split);
         let words = [k as u32, n as u32, m as u32, 0, n as u32, 0, splits, 0];
@@ -421,6 +425,14 @@ fn split_name(dtype: ggml_quants::GgmlType) -> Option<&'static str> {
 /// within a few percent: timed one after the other by 512 tokens in a server's warm-up, the split one came out 3% the
 /// slower where by itself, and in the 9B's prompt, it was 1 to 4% the faster). `OAIY_COOP_SPLIT=1` or `0` decides
 /// without timing (as profiling wants: `OAIY_CHAIN_PROFILE`'s pass a dispatch slowed the split kernel's timing to a tie).
+/// Whether f16 weights' tensor-core matmuls and convolutions take [`crate::shaders::coop_split_f16`]'s kernel (its
+/// subgroups' decode a copy): a device whose subgroups are 32 lanes and whose workgroups take 512 threads, unless
+/// `OAIY_COOP_SPLIT=0`.
+pub(crate) fn split_f16_on(gpu: &Gpu) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    gpu.subgroups32() && gpu.limits.max_compute_invocations_per_workgroup >= 512 && gpu.limits.max_compute_workgroup_size_x >= 512 && !*OFF.get_or_init(|| std::env::var("OAIY_COOP_SPLIT").is_ok_and(|v| v == "0"))
+}
+
 pub(crate) fn coop_split_for(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> bool {
     let gpu = &backend.gpu;
     // (512 threads a workgroup)
