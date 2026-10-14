@@ -367,6 +367,9 @@ fn attach_model3d(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, pi
 fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &Path) -> Result<Added, String> {
     type Fits = Box<dyn Fn(&Json) -> bool>;
     let (section, field, fits): (&str, &str, Fits) = match d.kind() {
+        // (added to a Qwen Image model: Qwen3-VL's vision tower for its reference images, where its text encoder is
+        // a GGUF of the language model alone)
+        "vision_projector" if target.is_some_and(|(s, _)| s == "image") => ("image", "vision", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
         "vision_projector" => ("llm", "vision_projector", Box::new(|_| true)),
         // (not a distilled Turbo checkpoint: it takes no adapter)
         "adapter" => ("image", "adapter", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image" && !bool_or(m, "distilled", false))),
@@ -437,7 +440,8 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
         }
         other => return Err(format!("do not know where a {other} goes")),
     };
-    let value = field_of(d, field).ok_or("detected part has no path")?;
+    // (a projector's path is detected as an LLM's `vision_projector`, a Qwen Image model's `vision` too)
+    let value = field_of(d, field).or_else(|| field_of(d, "vision_projector").filter(|_| field == "vision")).ok_or("detected part has no path")?;
     let lacks = |m: &Json| str_or(m, field, "").trim().is_empty();
     if section == "llm" {
         let Some(Json::Arr(models)) = obj_mut(cfg, &["llm", "models"]) else { return Err("no llm models".into()) };
@@ -593,7 +597,7 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
 
 /// Keys holding file paths, per section, for export and import.
 const LLM_PATHS: [&str; 3] = ["path", "vision_projector", "lora"];
-const IMAGE_PATHS: [&str; 8] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer", "vae"];
+const IMAGE_PATHS: [&str; 9] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "vision", "checkpoint", "tokenizer", "vae"];
 const VIDEO_PATHS: [&str; 5] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae"];
 /// Media settings that travel with the models.
 const MEDIA_SETTINGS: [&str; 4] = ["memory", "ram_gb", "vram_gb", "default_model"];
@@ -861,6 +865,25 @@ mod tests {
         assert_eq!(chat.section, "llm");
         let (chat2, _) = add(&mut cfg, &encoder, None, Some(("image", "no-such-model"))).unwrap();
         assert_eq!(chat2.section, "llm");
+        config::validate(&cfg).unwrap();
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// Qwen's mmproj GGUF added to a Qwen Image model is its vision tower (for its reference images); added to nothing
+    /// in particular it is a chat model's projector as before.
+    #[test]
+    fn an_mmproj_added_to_a_qwen_image_model_is_its_vision() {
+        let d = tmp("mmproj");
+        let mut cfg = config::default_json();
+        let turbo = d.join("Qwen-Image-2.1-Turbo-AD-Q4_K.gguf");
+        gguf(&turbo, "qwen_image21");
+        let (image, _) = add(&mut cfg, &turbo, None, None).unwrap();
+        let proj = d.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf");
+        gguf(&proj, "clip");
+        let (a, _) = add(&mut cfg, &proj, None, Some(("image", &image.name))).unwrap();
+        assert_eq!((a.section, a.name.as_str()), ("image", image.name.as_str()));
+        let path = get(&cfg, &["media", "image", "models", &image.name, "vision"]).and_then(Json::as_str).unwrap_or_default().to_string();
+        assert!(path.ends_with("mmproj-Qwen3VL-8B-Instruct-F16.gguf"), "{path}");
         config::validate(&cfg).unwrap();
         std::fs::remove_dir_all(d).unwrap();
     }

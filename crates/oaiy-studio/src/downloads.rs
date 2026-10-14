@@ -470,8 +470,11 @@ impl Downloads {
                 o.retain(|(k, _)| k != "parts" && k != "add");
                 let d = list.iter().find(|d| d.id == id);
                 let where_ = d.map(|d| d.dir.clone()).unwrap_or_else(|| dir.clone());
-                o.push(("installed".into(), Json::Bool(installed(e, &where_))));
-                o.push(("partial".into(), Json::Bool(d.is_none() && partial(e, &where_))));
+                let have = installed(e, &where_);
+                o.push(("installed".into(), Json::Bool(have)));
+                // (a model all of whose parts are done is installed, not partly downloaded: each part's marker is
+                // what says a part is done)
+                o.push(("partial".into(), Json::Bool(d.is_none() && !have && partial(e, &where_))));
                 o.push(("download".into(), d.map_or(Json::Null, Download::to_json)));
                 Json::Obj(o)
             })
@@ -716,18 +719,32 @@ fn section_name(section: &str) -> &str {
     }
 }
 
-/// Adds what the entry names to the model list, as the Models page's Add does.
+/// Adds what the entry names to the model list, as the Models page's Add does: the first a model, each after it added
+/// to that model (a part of it: a GGUF's vision projector, a Qwen Image model's base, text encoder and vision tower).
 fn register(studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Vec<String>, String> {
     let mut cfg = studio.config();
     let mut added = Vec::new();
+    let mut first: Option<(&'static str, String)> = None;
     for rel in strings(e.get("add")) {
         let path = under(dir, &rel)?;
-        match registry::add(&mut cfg, &path, None, None) {
-            Ok((a, _)) => added.push(match (a.section, a.name.as_str()) {
-                ("picture", "background") => "background removal".to_string(),
-                ("picture", _) => "upscaling".to_string(),
-                (section, name) => format!("{} {name}{}", section_name(section), if a.enabled { String::new() } else { format!(" (needs {})", a.missing.join(", ")) }),
-            }),
+        let result = registry::add(&mut cfg, &path, None, first.as_ref().map(|(s, n)| (*s, n.as_str())));
+        if let (Ok((a, _)), None) = (&result, &first) {
+            first = Some((a.section, a.name.clone()));
+        }
+        match result {
+            Ok((a, _)) => {
+                let said = match (a.section, a.name.as_str()) {
+                    ("picture", "background") => "background removal".to_string(),
+                    ("picture", _) => "upscaling".to_string(),
+                    (section, name) => format!("{} {name}{}", section_name(section), if a.enabled { String::new() } else { format!(" (needs {})", a.missing.join(", ")) }),
+                };
+                // (a model and its parts said once: the parts were added to it, and it is said as it ends up)
+                if let Some(at) = added.iter().position(|s: &String| s.split(" (needs ").next() == said.split(" (needs ").next()) {
+                    added[at] = said;
+                } else {
+                    added.push(said);
+                }
+            }
             Err(err) => return Err(format!("{}: {err}", path.display())),
         }
     }
@@ -821,6 +838,31 @@ mod tests {
         assert_eq!(under(base, "Pixal3D/ckpts/a.json").unwrap(), base.join("Pixal3D").join("ckpts").join("a.json"));
         assert!(under(base, "../etc/passwd").is_err() && under(base, "C:/x").is_err());
         assert_eq!(percent_encode("a b/c+d.gguf"), "a%20b/c%2Bd.gguf");
+    }
+
+    /// A model all of whose parts are done (each part's marker written) is installed and not partly downloaded; one with
+    /// a partial file alone is partly downloaded and not installed.
+    #[test]
+    fn a_model_whose_parts_are_done_is_installed_not_partial() {
+        let dir = std::env::temp_dir().join(format!("oaiy-dl-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = crate::config::default_json();
+        crate::util::set(crate::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "dir", Json::str(dir.to_string_lossy()));
+        let studio = crate::Studio::for_test(&dir, cfg);
+        let of = |id: &str| -> (bool, bool) {
+            let state = studio.downloads.state(&studio);
+            let m = state.get("models").and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "id", "") == id).cloned().unwrap();
+            (crate::util::bool_or(&m, "installed", false), crate::util::bool_or(&m, "partial", false))
+        };
+        let folder = dir.join("Qwen3.5-9B-GGUF");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Qwen3.5-9B-Q4_K_M.gguf.part"), b"half").unwrap();
+        assert_eq!(of("qwen3.5-9b"), (false, true), "a partial file alone");
+        std::fs::remove_file(folder.join("Qwen3.5-9B-Q4_K_M.gguf.part")).unwrap();
+        std::fs::write(folder.join("Qwen3.5-9B-Q4_K_M.gguf"), b"whole").unwrap();
+        std::fs::write(folder.join(".oaiy-qwen3.5-9b.json"), br#"{"id":"qwen3.5-9b"}"#).unwrap();
+        assert_eq!(of("qwen3.5-9b"), (true, false), "every part done");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

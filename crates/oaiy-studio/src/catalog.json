@@ -191,6 +191,21 @@
       "add": ["Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf"]
     },
     {
+      "id": "qwen-image-2.1-turbo",
+      "group": "image",
+      "name": "Qwen Image 2.1 Turbo (4-bit)",
+      "about": "Qwen's eight-step Turbo of Qwen Image 2.1, its transformer and text encoder as 4-bit GGUFs: pictures with legible text, and edits by instruction, on a GPU with 12 GB or more.",
+      "license": "Qwen Research License (research use)",
+      "size_gb": 11.1,
+      "vram_gb": 12,
+      "parts": [
+        { "repo": "AtomicChat/Qwen-Image-2.1-Turbo-GGUF", "include": ["Qwen-Image-2.1-Turbo-AD-Q4_K.gguf"], "into": "Qwen-Image-2.1-Turbo-GGUF" },
+        { "repo": "Qwen/Qwen-Image-2.1-Turbo", "include": ["model_index.json", "LICENSE", "README.md", "processor/**", "scheduler/**", "text_encoder/config.json", "text_encoder/generation_config.json", "transformer/config.json", "vae/**"], "into": "Qwen-Image-2.1-Turbo" },
+        { "repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF", "include": ["Qwen3VL-8B-Instruct-Q4_K_M.gguf", "mmproj-Qwen3VL-8B-Instruct-F16.gguf"], "into": "Qwen3-VL-8B-Instruct-GGUF" }
+      ],
+      "add": ["Qwen-Image-2.1-Turbo-GGUF/Qwen-Image-2.1-Turbo-AD-Q4_K.gguf", "Qwen-Image-2.1-Turbo", "Qwen3-VL-8B-Instruct-GGUF/Qwen3VL-8B-Instruct-Q4_K_M.gguf", "Qwen3-VL-8B-Instruct-GGUF/mmproj-Qwen3VL-8B-Instruct-F16.gguf"]
+    },
+    {
       "id": "qwen-image-2.1",
       "group": "image",
       "name": "Qwen Image 2.1 (turbo)",

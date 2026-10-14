@@ -563,6 +563,11 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         if let Some(te) = path_field(root, model, "text_encoder") {
             f.push(("text_encoder".into(), Json::str(te)));
         }
+        // (Qwen3-VL's vision tower for reference images, where the text encoder is a GGUF of the language model alone;
+        // else the worker looks for an mmproj beside it)
+        if let Some(v) = path_field(root, model, "vision") {
+            f.push(("vision".into(), Json::str(v)));
+        }
         if !refs.is_empty() {
             f.push(("images".into(), Json::Arr(refs.iter().map(Json::str).collect())));
             if let Some(n) = body.get("reference_size").and_then(Json::as_i64) {
