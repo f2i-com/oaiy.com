@@ -267,6 +267,11 @@ impl Recorder<'_> {
         self.hold = hold;
     }
 
+    /// Whether what is recorded waits for the recording's end ([`ChainRecorder::hold`]).
+    pub(crate) fn holding(&self) -> bool {
+        self.hold
+    }
+
     fn submit_piece(&mut self) {
         if !self.dispatches.is_empty() && self.fed() {
             let list = std::mem::take(&mut self.dispatches);

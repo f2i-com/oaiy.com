@@ -560,7 +560,7 @@ fn a_large_write_is_its_bytes() {
     }
 }
 
-/// A narrow rows' norm ([`rmsnorm_narrow4`], 256 / its lanes rows a workgroup) gives [`RMSNORM_ROWS4`]'s bits (a
+/// A narrow rows' norm ([`rmsnorm_narrow4`], 256 / its lanes rows a workgroup) gives [`RMSNORM_ROWS4`]'s values (a
 /// workgroup a row): rows of 1 to 128 vec4s (a head's 64, 128 and 256, a VAE's 144 channels, a row of 4 and of 36),
 /// the weight's rows in turn (heads) or one, plain and through SiLU, more rows than a grid's side takes once.
 #[test]
@@ -587,8 +587,13 @@ fn a_narrow_rows_norm_is_the_rows_kernels_bits() {
             rec.read(&want);
             rec.read(&got);
             let out = Box::new(rec).finish();
+            // (the same bits on an NVIDIA A2 under Linux's Vulkan; on an RTX 5090 under Windows' a value in 12 is 1 to
+            // 4 ulps apart, 10 through SiLU, its row's scale rounded otherwise where RMSNORM_ROWS4 has every thread work
+            // it out: some 6e-7 of a value, where a sum or an index gone wrong is the whole of it)
             let differ = out[0].iter().zip(&out[1]).filter(|(a, e)| a.to_bits() != e.to_bits()).count();
-            assert_eq!(differ, 0, "rows of {n} ({rows}, weights {wrows} rows, SiLU {with}): {differ} values differ");
+            let ulps = out[0].iter().zip(&out[1]).map(|(a, e)| (a.to_bits() as i64 - e.to_bits() as i64).unsigned_abs()).max().unwrap_or(0);
+            let worst = out[0].iter().zip(&out[1]).map(|(a, e)| f64::from((a - e).abs() / (e.abs() + 1e-6))).fold(0.0, f64::max);
+            assert!(worst <= 1e-5, "rows of {n} ({rows}, weights {wrows} rows, SiLU {with}): {differ} values differ, by {ulps} ulps at most ({worst:e} of a value)");
         }
     }
 }

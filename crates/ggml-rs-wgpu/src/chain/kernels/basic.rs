@@ -101,7 +101,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// [`RMSNORM_ROWS4`] for rows of at most `lanes` vec4s (8 to 128, a power of two): 256 / `lanes` rows a workgroup, a
 /// thread a vec4, where RMSNORM_ROWS4's workgroup a row left all but a row's threads idle through its barriers (a
 /// head's norm, 32 vec4s a row: Qwen Image 2.1's queries' and keys', 132,000 rows a block, 8.3 ms where 1.1 on an
-/// NVIDIA A2). Its sums are RMSNORM_ROWS4's, in sixteens then theirs in turn: the same bits.
+/// NVIDIA A2). Its sums are RMSNORM_ROWS4's, in sixteens then theirs in turn: the same bits on the A2, and a few
+/// ulps apart on an RTX 5090 under Windows' Vulkan, where the row's scale (worked out once and shared) rounds
+/// otherwise.
 pub(in crate::chain) fn rmsnorm_narrow4(lanes: usize) -> String {
     assert!(lanes.is_power_of_two() && (8..=128).contains(&lanes), "a narrow norm's {lanes} lanes");
     r#"@group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;

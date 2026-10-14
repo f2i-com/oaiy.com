@@ -634,8 +634,22 @@ fn a_weight_past_the_budget_is_the_cards() {
                 rec.read(&y);
                 Box::new(rec).finish().pop().unwrap()
             };
+            // The same in a held recording, as Flash-Next's next card's layers are recorded: an op before the matmul
+            // reads an input written once the recording is made, which the weight's write from its file must not
+            // send ahead of it.
+            let held = |b: &WgpuBackend, w: &ggml_rs::QuantizedTensor| {
+                let (x_in, x, y) = (b.vec(m * k), b.vec(m * k), b.vec(m * n));
+                DeviceChain::upload(b, &x_in, &vec![0.0; m * k]);
+                let mut rec = Recorder::new(b);
+                ChainRecorder::hold(&mut rec);
+                ChainRecorder::copy(&mut rec, &x_in, 0, &x, 0, m * k);
+                ChainRecorder::matmul_rows(&mut rec, w, &x, &y, m);
+                DeviceChain::upload(b, &x_in, &xs);
+                rec.read(&y);
+                Box::new(rec).finish().pop().unwrap()
+            };
             let want = run(&card, &on_card);
-            let mut got = vec![("file", run(&small, &from_file))];
+            let mut got = vec![("file", run(&small, &from_file)), ("file, held", held(&small, &from_file))];
             if let Some(p) = &pinned {
                 got.push(("host", run(&small, p)));
             }

@@ -185,7 +185,8 @@ impl Recorder<'_> {
     /// `w` for `m` rows of a matmul, where it is not on the card: from the host's memory, for a prompt's rows, a copy of
     /// it in the card's slots (recorded before the matmul, in its pass: the bus carries it once; a step's rows read it
     /// where it lies); from its file, for any rows, its bytes written into the slots (the work recorded so far sent
-    /// first, so the write is after it). None where the matmul reads `w` as it is.
+    /// first, so the write is after it), or, in a held recording, into buffers of its own. None where the matmul reads
+    /// `w` as it is.
     pub(crate) fn stage(&mut self, w: &QuantizedTensor, m: usize) -> Option<QuantizedTensor> {
         let q = w.device_storage()?.as_any().downcast_ref::<WgpuQuant>()?;
         let chunks: Vec<(wgpu::Buffer, u32, u32)> = if let Some((file, padded)) = &q.file {
@@ -194,11 +195,24 @@ impl Recorder<'_> {
             let per = ((chunk_limit(&self.gpu().limits) as usize) / q.row_bytes).max(1);
             let ranges: Vec<(usize, usize)> = (0..rows).step_by(per).map(|r| (r, per.min(rows - r))).collect();
             let sizes: Vec<u64> = ranges.iter().map(|(_, n)| ((n * q.row_bytes) as u64).div_ceil(4) * 4).collect();
-            self.submit_so_far();
-            // (the feed's pieces all submitted first: a write behind them is made by the feed through the queue's
-            // staging memory, 0.21 GB/s on an NVIDIA A2 over Thunderbolt 3, where the host's is 2)
-            self.gpu().settle();
-            let slots = self.gpu().stream_slots(&sizes);
+            let slots = if self.holding() {
+                // (a held recording runs when it is let go, after the inputs written for it once it is recorded:
+                // sending what it holds so far would run that on the inputs of before (Flash-Next's next card's
+                // layers on the last chunk's streams), and the shared slots would be written again before it runs.
+                // Its weight is written now into buffers of its own, which only its matmul reads.)
+                self.gpu().settle();
+                let device = &self.gpu().device;
+                sizes
+                    .iter()
+                    .map(|&size| device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-stream-held"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+                    .collect()
+            } else {
+                self.submit_so_far();
+                // (the feed's pieces all submitted first: a write behind them is made by the feed through the queue's
+                // staging memory, 0.21 GB/s on an NVIDIA A2 over Thunderbolt 3, where the host's is 2)
+                self.gpu().settle();
+                self.gpu().stream_slots(&sizes)
+            };
             let chunks: Vec<(wgpu::Buffer, u32, u32)> = ranges
                 .iter()
                 .zip(slots)
