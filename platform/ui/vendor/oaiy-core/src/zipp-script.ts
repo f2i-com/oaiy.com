@@ -747,23 +747,24 @@ export function validateScriptRequest(input: unknown, opts: { sha256?: ScriptHos
  * The reply channel, the intrinsics the envelope will need later, and the
  * output stubs.
  *
- * `print` IS stubbed: a call reaches this function and writes nothing.
- * `console` is NOT, whatever this assignment looks like. Measured on v0.0.19:
- * after it, `String(console.log)` reads back as the stub, and
- * `console.log("x")` still puts "x" in the engine's own output buffer, where
- * `takeOutput()` finds it. `zipp-executor.ts`'s module comment says the same
- * of the intrinsic from the other side. So the assignment is kept for what it
- * does do — a guest reading or replacing `console` sees the stub, not Zipp's
- * object — and NOT described as something it does not.
+ * `print` IS stubbed: a call reaches this function and writes nothing. So is
+ * `console`, since ZIPP v0.0.24, which calls console's methods as the program
+ * left them (zipp.org 6333c421): `console.log("x")` calls this stub. Up to
+ * v0.0.23 the compiler made `console.log(...)` its own print instruction, so
+ * (measured on v0.0.19) `String(console.log)` read back as the stub while
+ * `console.log("x")` still put "x" in the engine's own output buffer, where
+ * `takeOutput()` found it; `zipp-executor.ts`'s module comment says the same
+ * of the intrinsic from the other side.
  *
  * Nothing crosses to the host either way: the envelope never calls
  * `takeOutput()` for a result, and `attempt` drains and discards the buffer
- * once the job has run. What a chatty script DOES hit is the engine's
- * `lifetimeOutputBytes` (8 MiB on v0.0.19), which draining does not reset —
+ * once the job has run. The engine's `lifetimeOutputBytes` (8 MiB on v0.0.19),
+ * which draining does not reset, is what a chatty script hit up to v0.0.23 —
  * measured, not assumed: nine 1 MiB rounds with a drain after each still ended
  * in `RangeError: script exceeded its output budget`, reported as `resource`.
- * Each job gets a fresh Engine, so the ceiling is per job and a job that hits
- * it fails on its own account.
+ * With both stubs called a script writes nothing towards it. Each job gets a
+ * fresh Engine, so the ceiling is per job and a job that hits it fails on its
+ * own account.
  *
  * The snapshots are taken HERE, first, before the guest shims, before a
  * profile preamble, before a `prepare` hook and long before `globals` are

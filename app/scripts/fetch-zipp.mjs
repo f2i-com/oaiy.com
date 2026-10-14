@@ -18,12 +18,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.23';
+const RELEASE = 'v0.0.24';
 const VERSION = RELEASE.slice(1);
 const BUNDLE = `zipp-wasm-${VERSION}-web-python-base`;
 // The digest of the release's top-level SHA256SUMS, so a changed release file
 // cannot slip in under the same tag.
-const SUMS_SHA256 = process.env.ZIPP_SUMS_SHA256 || '078aef344298b8ae752d56388019c813c258122d73da3294811079738e05a755';
+const SUMS_SHA256 = process.env.ZIPP_SUMS_SHA256 || '2263b0e4f638069708469521cc12ef41f5f63d01a2382ee61ddfb698a70da337';
 const FILES = ['zipp_wasm.js', 'zipp_wasm_bg.wasm', 'zipp_wasm.d.ts', 'LICENSE-APACHE', 'BUILD-INFO.txt'];
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');

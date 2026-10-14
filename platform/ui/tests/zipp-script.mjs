@@ -377,10 +377,11 @@ console.log('\ntrap');
 console.log('\nconsole, print and the output ceiling');
 {
   // What the stubs DO, measured, because the comment used to claim more. The
-  // envelope installs `globalThis.print` and `globalThis.console`: `print` is
-  // replaced and writes nothing; `console` is not, whatever the assignment
-  // looks like — reading `console.log` gives the stub back, and CALLING it still
-  // reaches the engine's own output buffer.
+  // envelope installs `globalThis.print` and `globalThis.console`, and both are
+  // called as stubs that write nothing: ZIPP v0.0.24 calls console's methods as
+  // the program left them (zipp.org 6333c421). Up to v0.0.23 `console` was not
+  // replaced, whatever the assignment looked like — reading `console.log` gave
+  // the stub back, and CALLING it still reached the engine's own output buffer.
   const e = new CountingEngine();
   let reply;
   let output;
@@ -394,21 +395,22 @@ console.log('\nconsole, print and the output ceiling');
   const lines = Array.isArray(output) ? output : [];
   check('print IS stubbed: nothing it writes reaches the engine buffer',
     !lines.some(l => String(l).includes('LEAK-2')), show(output));
-  check('console is NOT: the stub reads back, and the call still writes',
-    reply?.value === 'function(){}' && lines.some(l => String(l).includes('LEAK-1')), `${show(reply)} ${show(output)}`);
+  check('console is stubbed too: the stub reads back, and the call writes nothing (ZIPP v0.0.24 and later)',
+    reply?.value === 'function(){}' && !lines.some(l => String(l).includes('LEAK-1')), `${show(reply)} ${show(output)}`);
 
-  // …and the ceiling that follows from it: `lifetimeOutputBytes` (8 MiB on
-  // v0.0.19) is a LIFETIME total a drain does not reset, so a chatty script
-  // fails `resource` on its own account. Measured: nine 1 MiB rounds with a
-  // drain after each still ended in the same RangeError. The engine per job is
-  // fresh, so the next job is unaffected — the assertion below is that pair.
+  // …and the ceiling: `lifetimeOutputBytes` (8 MiB on v0.0.19) is a LIFETIME
+  // total a drain does not reset. Up to v0.0.23 a chatty script's console.log
+  // reached it and failed `resource` on its own account (nine 1 MiB rounds with
+  // a drain after each still ended in the same RangeError). With the stub
+  // called, the same script writes nothing and runs to its end. The engine per
+  // job is fresh, so the next job is unaffected — the assertion below is that pair.
   check('the engine has an output ceiling and this fixture is over it',
     profile.limits.lifetimeOutputBytes > 0 && 9000 * 1000 > profile.limits.lifetimeOutputBytes,
     String(profile.limits.lifetimeOutputBytes));
   const chatty = 'for (var i = 0; i < 9000; i++) console.log("' + 'y'.repeat(1000) + '"); 42';
   const batch = send({ v: 1, jobs: [job('chatty', 'program', chatty, { instructionSteps: ZIPP_MAX_INSTRUCTION_BUDGET_STEPS }), job('next', 'program', '"fine"')] });
-  check("a script past the output ceiling is 'resource', and says which budget",
-    batch.results[0].ok === false && batch.results[0].errorKind === 'resource' && /output budget/.test(batch.results[0].error), show(batch.results[0]));
+  check('a script that logs past the output ceiling writes nothing to it, so it runs to its end',
+    batch.results[0].ok === true && batch.results[0].value === 42, show(batch.results[0]));
   check('the next job on its own fresh Engine is unaffected', batch.results[1].value === 'fine', show(batch.results[1]));
 
   // The drain itself: nothing a job wrote outlives the job. A stand-in Engine
