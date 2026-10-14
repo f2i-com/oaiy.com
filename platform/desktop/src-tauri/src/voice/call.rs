@@ -1637,7 +1637,9 @@ mod tests {
 
         fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             let this = self.get_mut();
-            if cx.waker().will_wake(futures_util::task::noop_waker_ref()) {
+            // (a look without waiting polls with a no-op waker: its data null, where a task's waker has its task's. `will_wake`
+            // alone compares the vtables' addresses, which an optimized build need not keep apart: there it never matched)
+            if cx.waker().data().is_null() || cx.waker().will_wake(futures_util::task::noop_waker_ref()) {
                 if let Some(frame) = this.peek_only.lock().unwrap().take() {
                     return Poll::Ready(Some(Ok(frame)));
                 }

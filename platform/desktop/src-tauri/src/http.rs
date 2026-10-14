@@ -2489,7 +2489,11 @@ mod tests {
                 assert_eq!(app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap().status(),403,"{method} {path} {origin:?}");
             }
             let req = Request::builder().method(method).uri(path).header("origin","http://localhost:3000").body(Body::empty()).unwrap();
-            assert_eq!(app.clone().oneshot(req).await.unwrap().status().as_u16(),if cfg!(debug_assertions) {200} else {403},"the existing debug UI exception is preserved");
+            // A loopback page (the dev UI, a locally served web app): its reads are restricted reads, which a loopback
+            // origin passes in every build (names and states, no secret: is_restricted_read_path); its calls are the
+            // AI exec surface's, which a release build keeps to OAIY's own pages (is_allowed_origin_privileged).
+            let reads = method == "GET" || method == "HEAD";
+            assert_eq!(app.clone().oneshot(req).await.unwrap().status().as_u16(),if reads || cfg!(debug_assertions) {200} else {403},"the existing debug UI exception is preserved: {method} {path}");
             for auth in [false,true] {
                 let mut req = Request::builder().method(method).uri(path);
                 req = if auth { req.header("authorization","Bearer test-owner") } else { req.header("origin","http://tauri.localhost") };

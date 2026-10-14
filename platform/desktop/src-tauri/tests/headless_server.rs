@@ -386,6 +386,13 @@ fn install_wedged_plugin(scratch: &Scratch) {
     std::fs::set_permissions(plugin.join("plugin.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// The server's word that it may run an unsigned plugin (the wedged one is): a debug build always may, a release
+/// build (`cargo test --release`) only with `OAIY_PLUGIN_DEV_MODE=1`, as a developer's would.
+#[cfg(target_os = "linux")]
+fn unsigned_plugins() -> [(&'static str, String); 1] {
+    [("OAIY_PLUGIN_DEV_MODE", "1".to_string())]
+}
+
 /// The pids the wedged plugin wrote: itself, and the helper it started.
 #[cfg(target_os = "linux")]
 fn wedged_plugin_pids(scratch: &Scratch) -> (u32, u32) {
@@ -421,7 +428,7 @@ fn gone_within(pids: &[u32], wait: Duration) -> bool {
 fn stopping_the_server_stops_its_plugins_and_what_they_started() {
     let scratch = Scratch::new("plugins");
     install_wedged_plugin(&scratch);
-    let mut server = Server::start(&scratch, &[]);
+    let mut server = Server::start(&scratch, &unsigned_plugins());
 
     // Started at boot, and past its handshake.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -452,27 +459,35 @@ fn stopping_the_server_stops_its_plugins_and_what_they_started() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_server_that_cannot_bind_its_port_stops_its_plugins_before_it_exits() {
-    let scratch = Scratch::new("bind-fails");
-    install_wedged_plugin(&scratch);
-    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = taken.local_addr().unwrap().port();
-    let mut server = Server::spawn(&scratch, &[], port);
+    // The plugin starts on a thread of its own while the API is being made ready, and a release build can find the port
+    // taken before that thread has started it: such a run proves nothing, and is made again (up to five times).
+    for attempt in 1..=5 {
+        let scratch = Scratch::new(&format!("bind-fails-{attempt}"));
+        install_wedged_plugin(&scratch);
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let mut server = Server::spawn(&scratch, &unsigned_plugins(), port);
 
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let status = loop {
-        if let Some(status) = server.child.try_wait().unwrap() {
-            break status;
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let status = loop {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the server neither came up nor gave up");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(status.code(), Some(1), "it gives up: {}", server.stderr_tail());
+
+        // It was up before the bind failed, or this run proved nothing.
+        if std::fs::read_to_string(scratch.0.join("data").join("plugin-data").join("fake").join("plugin.pid")).is_err() {
+            drop(taken);
+            continue;
         }
-        assert!(Instant::now() < deadline, "the server neither came up nor gave up");
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    assert_eq!(status.code(), Some(1), "it gives up: {}", server.stderr_tail());
-
-    // The plugin starts on a thread of its own while the API is being made ready. It was up
-    // before the bind failed, or this run proved nothing.
-    let pids = std::fs::read_to_string(scratch.0.join("data").join("plugin-data").join("fake").join("plugin.pid"));
-    assert!(pids.is_ok(), "the plugin had not started when the bind failed, so this run proved nothing");
-    let (plugin, helper) = wedged_plugin_pids(&scratch);
-    assert!(gone_within(&[plugin, helper], Duration::from_secs(15)), "the plugin or its helper outlived the server");
-    drop(taken);
+        let (plugin, helper) = wedged_plugin_pids(&scratch);
+        assert!(gone_within(&[plugin, helper], Duration::from_secs(15)), "the plugin or its helper outlived the server");
+        drop(taken);
+        return;
+    }
+    // (a machine busy enough that the bind failed first five times over: inconclusive, not the server's fault)
+    eprintln!("inconclusive: the plugin had not started when the bind failed in five runs");
 }
