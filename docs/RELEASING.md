@@ -390,14 +390,16 @@ a release matter here:
 
 ## What is not in a release
 
-- **The other engines.** `oaiy-media` (pictures, video, sound, speech, music and 3D, on
-  WebGPU), the `oaiy-studio` host and its tray, and `oaiy-voice`, the speech server for
-  calls (speech on WebGPU, speech-to-text on the CPU). `tools/qwen-image/build.ps1` builds all of them on Windows but
-  `oaiy-voice`, which is a crate of its own. They are built by hand: they are a separate
-  channel, and no workflow here builds them. The desktop finds them beside itself, in an
-  `engines` folder there, or where `OAIY_ENGINES_DIR` points, and prefers a language-model
-  engine there to the one the installer carries. Without them an install runs language
-  models on the engine it carries, and has no image, video or speech models of its own.
+- **The other engines.** The `oaiy-studio` host as a program of its own, with its tray, and
+  `oaiy-voice`, the speech server for calls (speech on WebGPU, speech-to-text on the CPU).
+  (`oaiy-media`, pictures, video, sound, speech, music and 3D, is in the installers since
+  0.1.5: [above](#what-a-release-contains).) `tools/qwen-image/build.ps1` builds the host and
+  the media engine on Windows; `oaiy-voice` is a crate of its own. They are built by hand:
+  they are a separate channel, and no workflow here builds them. The desktop finds them
+  beside itself, in an `engines` folder there, or where `OAIY_ENGINES_DIR` points, and
+  prefers a language-model engine there to the one the installer carries (not a media
+  engine: the installer's is taken over a copy there, and `media.worker` set to a path names
+  one's own build). Without them an install has no speech server for calls.
   (There is no CUDA engine any more: every engine's GPU is WebGPU's. The CUDA code stands
   on the branch `backup/cuda-support-2026-10-08`.)
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or
