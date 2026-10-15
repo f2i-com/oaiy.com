@@ -397,6 +397,20 @@ impl Recorder<'_> {
         self.spare.push((b.size(), b.clone()));
     }
 
+    /// `values` in a vector the host writes as this records (a table a kernel reads: an EXL3 run's jobs, its rows'
+    /// order), held to the recording's end. Never a spare scratch: the host's write lands before anything recorded
+    /// runs, so what read or wrote a scratch let go of earlier in this recording would run after it, over it (a vision
+    /// tower's wide attention let go of each head's sums, 16 KiB as a 2,304-patch projection's row order is: the
+    /// attention wrote its sums over the order, and Qwen3.8-Flash-Next read every picture as noise).
+    pub(crate) fn host_table(&mut self, values: &[u32]) -> DeviceVec {
+        let bytes = ((values.len().max(1) * 4) as u64).next_power_of_two().max(256);
+        let b = self.gpu().pooled(bytes);
+        self.pooled.push((bytes, b.clone()));
+        let v = DeviceVec { len: values.len(), inner: Arc::new(b) };
+        crate::exl3::upload_u32(self.backend, &v, values);
+        v
+    }
+
     /// A read of `len` elements of `buffer` from `offset`, as [`ChainRecorder::read_range`] records a vector's: its
     /// place among the recording's reads.
     pub(crate) fn read_of(&mut self, buffer: &wgpu::Buffer, offset: usize, len: usize) -> usize {

@@ -795,3 +795,46 @@ fn q8_0_at_a_pictures_widths_is_the_hosts() {
         }
     }
 }
+
+/// A prompt's EXL3 rows recorded after scratch the device wrote and let go of are the rows recorded alone: the tables
+/// the host writes as it records (the rows' order, their jobs) take none of that scratch, whose writes, recorded before
+/// them, would run after the host's and over them (a vision tower's wide attention let go of its heads' sums, and
+/// Qwen3.8-Flash-Next read every picture as noise). On the tensor cores and off them, a last lone row and none.
+#[test]
+fn a_prompts_exl3_tables_are_not_written_over_by_scratch_let_go_of() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (k, n, tw) = (512usize, 384usize, 48usize);
+    let mut s = 91u32;
+    let mut next = || {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        s
+    };
+    let words = (0..k / 16 * n / 16 * (tw / 2)).map(|_| next()).collect();
+    let mut sign = |len: usize, mag: f32| (0..len).map(|_| if next() & 1 == 0 { mag } else { -mag }).collect::<Vec<f32>>();
+    let data = ggml_rs::exl3::Exl3Data { suh: sign(k, 0.25), svh: sign(n, 0.125), words, tile_words: tw, input_map: (0..k as u32).collect(), output_map: (0..n as u32).collect() };
+    let w = b.exl3(data).unwrap();
+    assert!(b.holds_exl3(w.as_ref()), "the adapter holds it");
+    let zeros = b.vec(4096);
+    DeviceChain::upload(&b, &zeros, &[0f32; 4096]);
+    for rows in [70usize, 129] {
+        let xs: Vec<f32> = (0..rows * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect();
+        let (x, y) = (b.vec(rows * k), b.vec(rows * n));
+        DeviceChain::upload(&b, &x, &xs);
+        let run = |dirty: bool| {
+            let mut rec = Recorder::new(&b);
+            if dirty {
+                // a scratch of each size these rows' tables take (256 bytes to 16 KiB), zeroed by the device, let go of
+                for len in (6..=12).map(|p| 1usize << p) {
+                    let v = rec.scratch(len);
+                    rec.copy(&zeros, 0, &v, 0, len);
+                    rec.done_with(&v);
+                }
+            }
+            rec.exl3_rows(w.as_ref(), &x, &y, rows);
+            rec.read(&y);
+            Box::new(rec).finish().pop().unwrap()
+        };
+        let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
+        assert_eq!(bits(run(true)), bits(run(false)), "{rows} rows");
+    }
+}

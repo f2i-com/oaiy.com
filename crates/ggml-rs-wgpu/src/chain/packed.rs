@@ -25,9 +25,7 @@ impl Recorder<'_> {
             assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n, "chain: a projection [{n}, {k}] with a rank {r} update, of {rows} rows");
             // The three vectors between its products are the recording's own, every adapted projection's in turn
             // (each is read by what is recorded before the next writes it): a vector each to the recording's end was
-            // more than a card holds (a 609-row prompt's 64 layers under two adapters), and the recorder's spare
-            // scratch is not theirs to share: a small vector there is also what the host writes a table into as it
-            // records (an EXL3 run's jobs), which lands before any dispatch runs.
+            // more than a card holds (a 609-row prompt's 64 layers under two adapters).
             let product = up.map(|u| {
                 let t = self.low_rank_scratch(2, rows * k);
                 self.silu_mul(x, u, &t, rows * k);
@@ -87,8 +85,7 @@ impl Recorder<'_> {
             (f.xh.clone(), f.part.clone(), f.yt.clone(), f.jobs.clone())
         } else {
             let list: Vec<u32> = (0..rows as u32).flat_map(|r| [0, r]).collect();
-            let jobs = self.scratch(list.len());
-            crate::exl3::upload_u32(self.backend, &jobs, &list);
+            let jobs = self.host_table(&list);
             let lens = [rows * k, rows * (splits as usize).max(COOP_SPLITS_MAX) * n, rows * n];
             let [xh, part, yt] = match self.exl3_tmp.take() {
                 Some(t) if t.iter().zip(lens).all(|(v, len)| v.len >= len) => t,
@@ -121,8 +118,7 @@ impl Recorder<'_> {
         if coop {
             const BLOCK: usize = 128;
             let many: Vec<u32> = (0..rows as u32).collect::<Vec<_>>().chunks(BLOCK).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(BLOCK)).collect();
-            let order = self.scratch(many.len());
-            crate::exl3::upload_u32(self.backend, &order, &many);
+            let order = self.host_table(&many);
             let blocks = many.len() / BLOCK;
             let groups = ntiles.div_ceil(8) as usize * blocks;
             let kts = k / 16;
@@ -141,9 +137,7 @@ impl Recorder<'_> {
             let order = if few {
                 self.gpu().few(self.backend).order.clone()
             } else {
-                let order = self.scratch(rows);
-                crate::exl3::upload_u32(self.backend, &order, &(0..rows as u32).collect::<Vec<_>>());
-                order
+                self.host_table(&(0..rows as u32).collect::<Vec<_>>())
             };
             let (few_name, few) = crate::exl3::few_kernel(rows, g.tile_words());
             self.dispatch_wide(few_name, few, [words, buffer(&xh), buffer(&jobs), buffer(&order), &d, &d, buffer(&part), &drw], &[n as u32, k as u32, g.tile_words() as u32, splits, 0, 0], grid(1));
@@ -153,8 +147,7 @@ impl Recorder<'_> {
             const BLOCK: usize = 64;
             let lone = rows % 32 == 1;
             let many: Vec<u32> = (0..(rows - lone as usize) as u32).collect::<Vec<_>>().chunks(BLOCK).flat_map(|b| b.iter().copied().chain(std::iter::repeat(crate::exl3::NONE)).take(BLOCK)).collect();
-            let order = self.scratch(many.len());
-            crate::exl3::upload_u32(self.backend, &order, &many);
+            let order = self.host_table(&many);
             let per = 65535 / splits as usize;
             let blocks = many.len() / BLOCK;
             let kernel = crate::exl3::g_many(BLOCK);
