@@ -290,6 +290,12 @@ fn gguf_file(path: &Path) -> Result<Detected, String> {
     // taking no adapter) and the text encoder made for it, which is a Qwen3-VL as a chat model's GGUF is.
     let file = stem(path).to_ascii_lowercase();
     let for_qwen_image = file.contains("qwen-image") || file.contains("qwen_image");
+    // (the first Qwen-Image, its 2512 release too: a dual-stream transformer 3,072 wide, `qwen_image`; the worker makes
+    // pictures with Qwen Image 2.1's single-stream one, `qwen_image21`, alone, and took the other for it, to fail at
+    // its first picture)
+    if arch == "qwen_image" || g.tensors.iter().any(|t| t.starts_with("transformer_blocks.0.attn.add_k_proj")) {
+        return Err(format!("{}: the first Qwen-Image's transformer ({label}), which OAIY does not make pictures with: it makes them with Qwen Image 2.1's", path.display()));
+    }
     if arch.starts_with("qwen_image") || image_tensors {
         let distilled = file.contains("turbo");
         let mut fields = vec![("architecture", Json::str("qwen-image")), ("transformer", path_json(path)), ("weights", Json::str("gguf"))];
@@ -805,6 +811,9 @@ mod tests {
         gguf(&proj, &[("general.architecture", "clip"), ("general.type", "mmproj")], &[]);
         assert_eq!(detect(&proj).unwrap().kind(), "vision_projector");
         assert_eq!(detect(&proj).unwrap().to_json().get("architecture"), Some(&Json::Null));
+        let first = d.0.join("qwen-image-2512-Q6_K.gguf");
+        gguf(&first, &[("general.architecture", "qwen_image")], &["img_in.weight", "transformer_blocks.0.attn.add_k_proj.weight"]);
+        assert!(detect(&first).unwrap_err().contains("Qwen Image 2.1"), "the first Qwen-Image is not taken for 2.1");
         let image = d.0.join("qwen-image-Q4.gguf");
         gguf(&image, &[("general.architecture", "qwen_image21")], &["img_in.weight"]);
         let r = detect(&image).unwrap();
