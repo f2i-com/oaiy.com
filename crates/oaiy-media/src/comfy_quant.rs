@@ -489,6 +489,10 @@ mod tests {
             .unwrap();
         assert_eq!(b, vec![-0.5, 3.5, 5.5, 6.5]);
         let input = Tensor::new(&[[1f32, 1.]], &Device::Cpu).unwrap();
+        // (each half's shape as its own: a WebGPU load sizes its matrices by them first)
+        for name in ["gate_layer", "proj"] {
+            assert_eq!(weights.shape(&format!("transformer_blocks.0.img_mlp.{name}.weight")).unwrap(), vec![2, 2], "{name}");
+        }
         for (name, expected) in [("gate_layer", vec![3., 7.]), ("proj", vec![11., 15.])] {
             let linear = weights
                 .linear(

@@ -121,15 +121,21 @@ impl Weights {
         Ok(Some(ggml_file::qtensor_from_ggml(t, &bytes, dims, dev)?))
     }
 
-    /// Where a GGUF keeps a block's MLP gate and up projections as one `img_mlp.gate_up` (gate rows first, as
-    /// AtomicChat's Qwen-Image-2.1-Turbo GGUFs do): the fused tensor's key and the half `name` is (0 gate, 1 up).
-    fn gguf_half(&self, name: &str) -> Option<(String, usize)> {
-        if !matches!(self, Self::Gguf { .. }) || self.has(name) {
+    /// Where a file keeps a block's MLP gate and up projections as one `img_mlp.gate_up` (gate rows first, as
+    /// AtomicChat's Qwen-Image-2.1-Turbo GGUFs and ComfyUI's Qwen Image 2.1 safetensors do): the fused tensor's key and
+    /// the half `name` is (0 gate, 1 up).
+    fn fused_half(&self, name: &str) -> Option<(String, usize)> {
+        if self.has(name) {
             return None;
         }
         [("img_mlp.gate_layer.weight", 0), ("img_mlp.proj.weight", 1)]
             .into_iter()
             .find_map(|(suffix, half)| Some((self.resolve(&format!("{}img_mlp.gate_up.weight", name.strip_suffix(suffix)?)).ok()?, half)))
+    }
+
+    /// [`Self::fused_half`] in a GGUF (read as its blocks: [`Self::gguf_bytes`]).
+    fn gguf_half(&self, name: &str) -> Option<(String, usize)> {
+        matches!(self, Self::Gguf { .. }).then(|| self.fused_half(name)).flatten()
     }
 
     /// A GGUF tensor's bytes as stored (its blocks): rows `half` of two, or all of it.
@@ -234,9 +240,11 @@ impl Weights {
 
     /// Inspect dimensions without materializing tensor payloads.
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
-        if let Some((key, _)) = self.gguf_half(name) {
-            let Self::Gguf { content, .. } = self else { unreachable!() };
-            let mut dims = content.tensor_infos[&key].shape.dims().to_vec();
+        if let Some((key, _)) = self.fused_half(name) {
+            let mut dims = match self {
+                Self::Gguf { content, .. } => content.tensor_infos[&key].shape.dims().to_vec(),
+                Self::Safe(s) => s.info(&key).map_err(candle_core::Error::wrap)?.shape.clone(),
+            };
             dims[0] /= 2;
             return Ok(dims);
         }
