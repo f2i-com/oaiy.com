@@ -641,8 +641,10 @@ pub fn validate(v: &Json) -> Result<(), String> {
                 return Err(format!("video model {name} needs {key}"));
             }
         }
-        if family != "ltx-2.5" && str_or(m, "tokenizer", "").trim().is_empty() {
-            return Err(format!("video model {name} needs the Gemma 3 tokenizer.json"));
+        // (a GGUF of Gemma 3 carries its own tokenizer)
+        let gguf = str_or(m, "text_encoder", "").trim().to_ascii_lowercase().ends_with(".gguf");
+        if family != "ltx-2.5" && !gguf && str_or(m, "tokenizer", "").trim().is_empty() {
+            return Err(format!("video model {name} needs the Gemma 3 tokenizer.json (or a GGUF of Gemma 3 as its text_encoder)"));
         }
     }
     let speech = object(media, "speech")?;
@@ -727,6 +729,17 @@ mod tests {
             v = &mut fields.iter_mut().find(|(k, _)| k == key).unwrap().1;
         }
         v
+    }
+
+    #[test]
+    fn an_ltx_2_3_model_needs_a_tokenizer_unless_its_gemma_is_a_gguf() {
+        let model = |fields: &str| {
+            let video = Json::parse(format!(r#"{{"enabled":true,"models":{{"v":{{"family":"ltx-2.3","transformer":"t.safetensors","vae":"t.safetensors",{fields}}}}}}}"#).as_bytes()).unwrap();
+            with(|v| crate::util::set(field(v, &["media"]), "video", video))
+        };
+        assert!(model(r#""text_encoder":"gemma3.safetensors""#).unwrap_err().contains("tokenizer"));
+        model(r#""text_encoder":"gemma3.safetensors","tokenizer":"tokenizer.json""#).unwrap();
+        model(r#""text_encoder":"gemma-3-12b-it-Q4_K_M.GGUF""#).unwrap();
     }
 
     #[test]
