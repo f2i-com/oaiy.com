@@ -112,14 +112,32 @@ fn total_memory() -> Option<u64> {
 
 /// What this computer's GPU takes of the computer's own memory for weights by default, where its memory is the
 /// computer's (an Apple-silicon Mac's): what a caller that sizes something else from the free memory, before the
-/// weights go up, takes off it. None where a GPU has memory of its own.
+/// weights go up, takes off it. None where a GPU has memory of its own, the TinyGPU card among them where
+/// `OAIY_WEBGPU_ADAPTER` names it.
 pub fn unified_gpu_share() -> Option<u64> {
+    unified_share_beside(std::env::var("OAIY_WEBGPU_ADAPTER").ok().as_deref())
+}
+
+/// [`unified_gpu_share`] where the adapter `named` (OAIY_WEBGPU_ADAPTER's) is the one used: the TinyGPU card (an NVIDIA
+/// card in a Thunderbolt enclosure) holds the weights in its own memory, and takes none of the Mac's (GLM-5.3-Flash on
+/// the card was given no expert cache: the Mac's 12 GiB share taken off its 10 GiB free, and the load refused).
+fn unified_share_beside(named: Option<&str>) -> Option<u64> {
+    if named.is_some_and(|n| n.trim().to_lowercase().starts_with("tinygpu")) {
+        return None;
+    }
     // (no adapter is open yet where this is asked: the owner's limit or the two-thirds rule, not Metal's own word)
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         host_unified_budget(None)
     } else {
         None
     }
+}
+
+#[test]
+fn the_tinygpu_card_takes_none_of_the_macs_memory() {
+    assert_eq!(unified_share_beside(Some("tinygpu:/tmp/card.sock")), None);
+    assert_eq!(unified_share_beside(Some(" TinyGPU ")), None);
+    assert_eq!(unified_share_beside(Some("Apple M5 Pro")), unified_share_beside(None), "another adapter named: as by default");
 }
 
 /// What the Mac's owner allows its GPU, in bytes (`iogpu.wired_limit_mb`; 0: the system's own choice).
