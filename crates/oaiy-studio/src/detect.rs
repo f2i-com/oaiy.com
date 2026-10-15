@@ -425,8 +425,9 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
             }
             return Err(format!("{label}: an LTX audio VAE without the bandwidth-extension vocoder OAIY needs"));
         }
+        // (LTX 2.5's own VAE: a diffusion decoder, which the worker runs on WebGPU)
         if config.contains("CausalDiffusionVAE") || has(h, "decoder.diff_blocks.") {
-            return Err(format!("{label}: LTX {} diffusion-decoder VAE, which OAIY does not run; use the conv VAE (ltx-2.5-video-vae-conv) instead", &family[4..]));
+            return Ok(detected(Role::Component { kind: "vae" }, format, format!("LTX {} video VAE, a diffusion decoder (on WebGPU) ({label})", &family[4..]), vec![("vae", p)]));
         }
         if config.contains("upsampler") || config.contains("upscaler") {
             return Err(format!("{label}: LTX latent upscaler; OAIY renders at the requested size in one pass"));
@@ -974,20 +975,21 @@ mod tests {
         let gemma = root.join("text_encoders").join("gemma4-int8.safetensors");
         safetensors(&gemma, &format!("{{{},{},{}}}", t("tokenizer_json", "U8"), t("text_embedding_projection.video_aggregate_embed.weight", "I8"), t("model.layers.0.mlp.down_proj.weight", "I8")));
         assert_eq!(detect(&gemma).unwrap().kind(), "video_text_encoder");
-        // Sorted first in vae/, but neither is a VAE OAIY can use.
+        // Sorted first in vae/: the audio VAE, then the release's own video VAE (its diffusion decoder).
         let audio = root.join("vae").join("a_audio_vae.safetensors");
         safetensors(&audio, &format!(r#"{{"__metadata__":{{"model_version":"2.5.0","config":"{{\"audio_vae\":{{}}}}"}},{},{}}}"#,
             t("audio_vae.decoder.conv_in.conv.bias", "BF16"), t("vocoder.bwe_generator.conv_pre.weight", "BF16")));
         assert_eq!(detect(&audio).unwrap().kind(), "audio_vae");
         let diffusion = root.join("vae").join("b_video_vae.safetensors");
         safetensors(&diffusion, &format!(r#"{{"__metadata__":{{"model_version":"2.5.0","config":"{{\"vae\":{{\"_class_name\":\"CausalDiffusionVAE\"}}}}"}},{},{}}}"#, t("decoder.conv_in.weight", "BF16"), t("decoder.diff_blocks.0.x", "BF16")));
-        assert!(detect(&diffusion).unwrap_err().contains("diffusion-decoder"));
+        let d = detect(&diffusion).unwrap();
+        assert!(d.kind() == "vae" && d.summary.contains("diffusion decoder"), "{}", d.summary);
         let r = detect(&root).unwrap();
         assert_eq!(r.role, Role::Video { family: "ltx-2.5" });
         let field = |k: &str| r.fields.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str().unwrap_or("").to_string());
         assert!(field("text_encoder").unwrap().ends_with("gemma4-int8.safetensors"));
         assert!(field("audio_vae").unwrap().ends_with("a_audio_vae.safetensors"));
-        assert_eq!(field("vae"), None, "no usable video VAE in the folder");
-        assert_eq!(r.missing, vec!["vae".to_string()]);
+        assert!(field("vae").unwrap().ends_with("b_video_vae.safetensors"), "the release's own video VAE");
+        assert!(r.missing.is_empty(), "{:?}", r.missing);
     }
 }

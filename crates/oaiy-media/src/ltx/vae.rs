@@ -759,6 +759,14 @@ pub struct LtxVideoDecoder {
     pub conv_out: CausalConv3d,
 }
 
+/// Whether `store`'s file is a diffusion VAE (its config's class, else its decoder's diffusion blocks).
+pub fn is_diffusion_vae(store: &crate::ltx::store::Store) -> bool {
+    if let Some(class) = store.index.metadata("config").and_then(|c| oaiy_engine::json::Json::parse(c.as_bytes()).ok()).and_then(|c| c.get("vae").and_then(|v| v.get("_class_name")).and_then(oaiy_engine::json::Json::as_str).map(str::to_owned)) {
+        return class == "CausalDiffusionVAE";
+    }
+    store.index.names().any(|n| n.contains("decoder.diff_blocks."))
+}
+
 impl LtxVideoDecoder {
     /// Load the decoder from a Wan2GP-style VAE checkpoint. The
     /// expected key prefixes are `vae.decoder.*` and
@@ -769,6 +777,10 @@ impl LtxVideoDecoder {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        // (LTX 2.5's own VAE decodes by diffusion: on WebGPU alone, `crate::ltx_dvae_wgpu`)
+        if crate::ltx::store::Store::open(weights_path, 0).is_ok_and(|s| is_diffusion_vae(&s)) {
+            candle_core::bail!("{} is LTX 2.5's diffusion VAE, which decodes on WebGPU only (backend \"webgpu\"): on the CPU, name the conv VAE (ltx-2.5-video-vae-conv) as the model's vae", weights_path.display());
+        }
         let vb = safe_builder(weights_path, device, dtype, false)?;
         Self::build(config, device, vb)
     }

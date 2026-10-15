@@ -103,14 +103,23 @@ pub(super) fn webgpu_contexts(_: &Request, _: &mut Store, _: Option<Tensor>, _: 
     candle_core::bail!("this build has no WebGPU (the webgpu feature)")
 }
 
-/// The clip of `latent` (`[1, f h w, 128]`) by the video decoder on WebGPU: `[1, 3, frames, height, width]`.
+/// The clip of `latent` (`[1, f h w, 128]`) by the video decoder on WebGPU: `[1, 3, frames, height, width]`. LTX 2.5's
+/// own VAE (a diffusion decoder) draws its clip's detail from noise of the clip's seed.
 #[cfg(feature = "webgpu")]
 pub(super) fn webgpu_decode(r: &Request, latent: &Tensor, f: usize, h: usize, w: usize) -> Result<Tensor> {
     let mut store = Store::open(&r.vae, 0)?;
+    if crate::ltx_dvae_wgpu::is_diffusion_vae(&store) {
+        let decoder = crate::ltx_dvae_wgpu::WgpuLtxDiffusionVae::load(&mut store, r.device)?;
+        drop(store);
+        return decoder.decode(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w, r.seed.wrapping_add(DIFFUSION_VAE_SEED_OFFSET));
+    }
     let decoder = crate::ltx_vae_wgpu::WgpuLtxVae::load(&mut store, r.device)?;
     drop(store);
     decoder.decode_fitted(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w)
 }
+/// The diffusion VAE's noise apart from the clip's own (its latent's, its sound's).
+#[cfg(feature = "webgpu")]
+const DIFFUSION_VAE_SEED_OFFSET: u64 = 0x5851_f42d_4c95_7f2d;
 #[cfg(not(feature = "webgpu"))]
 pub(super) fn webgpu_decode(_: &Request, _: &Tensor, _: usize, _: usize, _: usize) -> Result<Tensor> {
     candle_core::bail!("this build has no WebGPU (the webgpu feature)")

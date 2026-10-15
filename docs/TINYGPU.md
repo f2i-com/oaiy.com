@@ -147,8 +147,8 @@ tensor cores as they multiply) and a BF16 checkpoint as Q8_0, so the card holds 
 token, the licence accepted). ComfyUI's fp8 and int8 checkpoints (`weight_scale` a tensor or a row, ConvRot's
 rotation undone) are Q8_0 on the card too, made from their codes on every core (`Store::coded`; bit for bit what
 their decoded values make, the rotation within f32's rounding), each block's bytes read ahead of the loader by a
-thread of their own (`ReadAhead`). The video decoder must be the conv one (`ltx-2.5-video-vae-conv`): the
-NADiffusionDecoder some LTX 2.5 releases ship is not implemented. A prompt in sections (`[VISUAL]`, `[SPEECH]`,
+thread of their own (`ReadAhead`). The video decoder is the conv one (`ltx-2.5-video-vae-conv`), or the
+diffusion decoder some LTX 2.5 releases ship (docs/LTX_VIDEO.md, "The diffusion decoder"). A prompt in sections (`[VISUAL]`, `[SPEECH]`,
 `[SOUNDS]`) is followed far better than plain prose.
 
 A 5 s clip with sound (768 x 512, 121 frames, 8 steps) from a 21.5 GB fp8 transformer and a 13 GB int8 Gemma 4 on a

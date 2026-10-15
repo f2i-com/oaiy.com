@@ -24,13 +24,7 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
-/// Whether `store`'s file is a diffusion VAE (its config's class, else its decoder's diffusion blocks).
-pub fn is_diffusion_vae(store: &Store) -> bool {
-    if let Some(class) = store.index.metadata("config").and_then(|c| Json::parse(c.as_bytes()).ok()).and_then(|c| c.get("vae").and_then(|v| v.get("_class_name")).and_then(Json::as_str).map(str::to_owned)) {
-        return class == "CausalDiffusionVAE";
-    }
-    store.index.names().any(|n| n.contains("decoder.diff_blocks."))
-}
+pub use crate::ltx::vae::is_diffusion_vae;
 
 /// The decoder's shape, from the file's config (the reference's defaults where a field is not there).
 #[derive(Clone, Debug, PartialEq)]
@@ -93,20 +87,21 @@ impl Config {
     pub fn min_latent(&self) -> [usize; 3] {
         let mut mins = [1usize; 3];
         let mut strides = [1usize; 3];
-        for (stage, kernel) in self.kernels.iter().take(4).enumerate() {
-            for a in 0..3 {
-                mins[a] = mins[a].max(kernel[a].div_ceil(strides[a]));
-            }
-            for a in 0..3 {
-                strides[a] *= self.upsamples[stage].0[a];
+        for (kernel, (stride, _)) in self.kernels.iter().zip(&self.upsamples) {
+            for ((least, k), (at, s)) in mins.iter_mut().zip(kernel).zip(strides.iter_mut().zip(stride)) {
+                *least = (*least).max(k.div_ceil(*at));
+                *at *= s;
             }
         }
-        for a in 0..3 {
-            mins[a] = mins[a].max(self.kernel5[a].div_ceil(strides[a]));
+        for ((least, k), at) in mins.iter_mut().zip(&self.kernel5).zip(&strides) {
+            *least = (*least).max(k.div_ceil(*at));
         }
         mins
     }
 }
+
+/// A linear layer as the file holds it: its matrix (`[n, k]`), its bias, `n` and `k`.
+type HostLinear = (Vec<f32>, Option<Vec<f32>>, usize, usize);
 
 /// A linear layer on the device: its f16 matrix (`[n, k]`) and its bias.
 struct Linear {
@@ -189,14 +184,14 @@ impl WgpuLtxDiffusionVae {
             v
         };
         let half = |gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, values: &[f32]| -> Result<DeviceVec> { gpu.vec_f16_rounded(values).ok_or_else(|| err(format!("{name}: a weight past f16's range"))) };
-        let linear = |store: &mut Store, name: &str, bias: bool| -> Result<(Vec<f32>, Option<Vec<f32>>, usize, usize)> {
+        let linear = |store: &mut Store, name: &str, bias: bool| -> Result<HostLinear> {
             let info = store.index.info(&format!("{prefix}decoder.{name}.weight")).map_err(err)?.shape.clone();
             let &[n, k] = info.as_slice() else { candle_core::bail!("{name}: a matrix of shape {info:?}") };
             let w = host(store, &format!("decoder.{name}.weight"))?;
             let b = bias.then(|| host(store, &format!("decoder.{name}.bias"))).transpose()?;
             Ok((w, b, n, k))
         };
-        let lin = |gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, (w, b, n, k): (Vec<f32>, Option<Vec<f32>>, usize, usize)| -> Result<Linear> { Ok(Linear { w: half(gpu, name, &w)?, b: b.map(|b| up(gpu, &b)), n, k }) };
+        let lin = |gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, (w, b, n, k): HostLinear| -> Result<Linear> { Ok(Linear { w: half(gpu, name, &w)?, b: b.map(|b| up(gpu, &b)), n, k }) };
         let attention = |store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, p: &str, kernel: [usize; 3]| -> Result<Attention> {
             let (w, b, n3, k) = linear(store, &format!("{p}.attn.qkv"), true)?;
             let b = b.ok_or_else(|| err("qkv bias"))?;
@@ -529,15 +524,101 @@ impl WgpuLtxDiffusionVae {
         Ok(unpatchify(&out, t5, h5, w5, p))
     }
 
-    /// The clip of `latent` (`[f h w, 128]`, the transformer's tokens: `f` frames of `h` by `w`) decoded whole: `[1, 3,
-    /// 8 (f - 1) + 1, 32 h, 32 w]` (RGB in -1..1) on the CPU, its stage-5 noise from `seed`.
-    pub fn decode(&self, latent: &[f32], f: usize, h: usize, w: usize, seed: u64) -> Result<Tensor> {
-        self.decode_with(latent, f, h, w, |n| crate::pipeline::noise(seed, n))
+    /// The stage-4 grid a latent grid makes (the first three upsamplings, the doubled first frames dropped).
+    fn stage4_grid(&self, (t, h, w): (usize, usize, usize)) -> [usize; 3] {
+        let mut g = [t, h, w];
+        for (stride, _) in &self.config.upsamples[..3] {
+            for a in 0..3 {
+                g[a] *= stride[a];
+            }
+            if stride[0] == 2 {
+                g[0] -= 1;
+            }
+        }
+        g
     }
 
-    /// [`Self::decode`] with stage 5's noise from `noise` (asked for its number of values).
-    pub fn decode_with(&self, latent: &[f32], f: usize, h: usize, w: usize, mut noise: impl FnMut(usize) -> Vec<f32>) -> Result<Tensor> {
-        if latent.len() != f * h * w * 128 {
+    /// Pixels (frames, rows, columns) a stage-4 cell makes: stage 4's upsampling, then the patch.
+    fn pixel_scale(&self) -> [usize; 3] {
+        let ([st, sh, sw], _) = self.config.upsamples[3];
+        [st, sh * self.config.patch, sw * self.config.patch]
+    }
+
+    /// The tiles' overlaps (frames, pixels) and their least size on the stage-4 grid (the reference's
+    /// `recommended_pixel_overlaps` and `compute_tile_min_size`): stage 4's and stage 5's reach each side (each block's
+    /// half window, stage 5's in stage-4 cells), in pixels, the frames on 8's and the pixels on 32's.
+    fn overlaps(&self) -> ([usize; 2], [usize; 3]) {
+        let c = &self.config;
+        let ([st, sh, sw], _) = c.upsamples[3];
+        let stride = [st, sh, sw];
+        let reach = |a: usize| (c.depths[3] * (c.kernels[3][a] / 2)).max((c.depths[4] * (c.kernel5[a] / 2)).div_ceil(stride[a]));
+        let scale = self.pixel_scale();
+        let least = [0, 1, 2].map(|a| c.kernels[3][a].max(c.kernel5[a].div_ceil(stride[a])));
+        ([(reach(0) * scale[0]).div_ceil(8) * 8, (reach(1).max(reach(2)) * scale[1]).div_ceil(32) * 32], least)
+    }
+
+    /// The tile sizes (frames, rows, columns in pixels) for a clip of `full` pixels: None where its stage 5 fits
+    /// `tokens` whole, else the reference's choice (`recommended_decode_tiling_config`): every size on the grid's steps
+    /// whose stage 5 fits, the least overlap recomputed, then the largest, then the fewest tiles.
+    fn tile_sizes(&self, full: [usize; 3], tokens: usize) -> Result<Option<[usize; 3]>> {
+        let p = self.config.patch;
+        if full[0] * (full[1] / p) * (full[2] / p) <= tokens {
+            return Ok(None);
+        }
+        let ([ot, ohw], least) = self.overlaps();
+        let scale = self.pixel_scale();
+        let steps = [lcm(scale[0], 8), lcm(scale[1], 32), lcm(scale[2], 32)];
+        let lowest = |a: usize, overlap: usize, floor: usize| (2 * scale[a]).max(2 * overlap).max(least[a] * scale[a]).max(floor).div_ceil(steps[a]) * steps[a];
+        let mins = [lowest(0, ot, 16), lowest(1, ohw, 64), lowest(2, ohw, 64)];
+        let overlap = [ot, ohw, ohw];
+        let candidates = |a: usize| -> Vec<(usize, usize)> {
+            let most = full[a].div_ceil(steps[a]) * steps[a];
+            (mins[a]..=most.max(mins[a])).step_by(steps[a]).filter(|&size| size > overlap[a]).map(|size| (size, split_by_size(full[a], size, overlap[a], 1).len())).collect()
+        };
+        let mut best: Option<(f64, i64, usize, [usize; 3])> = None;
+        for &(tt, nt) in &candidates(0) {
+            for &(th, nh) in &candidates(1) {
+                for &(tw, nw) in &candidates(2) {
+                    if tt * (th / p).max(1) * (tw / p).max(1) > tokens {
+                        continue;
+                    }
+                    let waste = (nt * nh * nw * tt * th * tw) as f64 / (full[0] * full[1] * full[2]) as f64;
+                    let key = (waste, -((tt * th * tw) as i64), nt * nh * nw, [tt, th, tw]);
+                    if best.as_ref().is_none_or(|b| (key.0, key.1, key.2) < (b.0, b.1, b.2)) {
+                        best = Some(key);
+                    }
+                }
+            }
+        }
+        best.map(|b| Some(b.3)).ok_or_else(|| err(format!("the GPU has no room for a tile of the diffusion decoder ({} frames by {}x{} pixels at least): a smaller or shorter clip, or more free memory", mins[0], mins[1], mins[2])))
+    }
+
+    /// How many stage-5 tokens a tile may have: the GPU's free memory (8 GB where the API does not say) less the
+    /// stage-4 features held through the decode and a GB to spare, at seven of stage 5's vectors a token (its blocks'
+    /// most), each vector within a binding.
+    fn tile_tokens(&self, features: usize) -> usize {
+        let c = self.config.channels[4];
+        let free = self.gpu.memory_budget().map_or(8 << 30, |(budget, used)| budget.saturating_sub(used));
+        let usable = free.saturating_sub(1 << 30).saturating_sub(if self.gpu.memory_budget().is_some() { 0 } else { (features * 4) as u64 });
+        let by_memory = usable / (7 * c as u64 * 4);
+        let by_binding = self.gpu.max_binding() / (c as u64 * 4);
+        by_memory.min(by_binding) as usize
+    }
+
+    /// The clip of `latent` (`[f h w, 128]`, the transformer's tokens: `f` frames of `h` by `w`): `[1, 3, 8 (f - 1) +
+    /// 1, 32 h, 32 w]` (RGB in -1..1) on the CPU, whole where the GPU has room, else in tiles; each tile's stage-5 noise
+    /// from `seed`.
+    pub fn decode(&self, latent: &[f32], f: usize, h: usize, w: usize, seed: u64) -> Result<Tensor> {
+        self.decode_with(latent, f, h, w, None, |tile, n| crate::pipeline::noise(seed.wrapping_add(tile as u64 * 0x9e37_79b9_7f4a_7c15), n))
+    }
+
+    /// [`Self::decode`] in tiles of `sizes` (frames, rows, columns in pixels; None: as the GPU's room has them), each
+    /// tile's stage-5 noise from `noise` (asked for its tile's and its number of values), as the reference's
+    /// `_decode_pixels` makes them: stages 1 to 3 once on the whole latent (padded to the grid's floor, its ghost frames
+    /// after), stages 4 and 5 a tile of the stage-4 grid at a time, each alone (the clip's first frame's tile dropping
+    /// the doubled frame, its last's carrying the ghost frames), their pixels blended by their masks.
+    pub fn decode_with(&self, latent: &[f32], f: usize, h: usize, w: usize, sizes: Option<[usize; 3]>, mut noise: impl FnMut(usize, usize) -> Vec<f32>) -> Result<Tensor> {
+        if latent.len() != f * h * w * 128 || f == 0 || h == 0 || w == 0 {
             candle_core::bail!("an LTX latent of {} values for {f}x{h}x{w} tokens", latent.len());
         }
         let Padded { mut values, grid: (ft, fh, fw), before: (top, left) } = floor_padded(latent, (f, h, w), self.config.min_latent());
@@ -547,27 +628,206 @@ impl WgpuLtxDiffusionVae {
         for _ in 0..GHOST_FRAMES {
             values.extend_from_slice(&last);
         }
-        let (grid, x) = self.stages_1_to_3(&values, (ft + GHOST_FRAMES, fh, fw));
+        let ((gt, gh, gw), features) = self.stages_1_to_3(&values, (ft + GHOST_FRAMES, fh, fw));
         drop(values);
-        // stage 5's canvas: the content's frames (at least its kernel's), every row and column of the padded grid
-        let frames5 = (8 * ft - 7).max(self.config.kernel5[0]);
-        let (rows5, cols5) = (fh * 32, fw * 32);
-        let pixels = self.stages_4_and_5(x, grid, &noise(3 * frames5 * rows5 * cols5), true, true)?;
-        // back to the content: its frames, its rows and columns past the floor's padding
+        let s4 = self.stage4_grid((ft, fh, fw));
+        let scale = self.pixel_scale();
+        let p = self.config.patch;
+        let causal = self.config.upsamples[3].0[0] == 2;
+        let full = [s4[0] * scale[0] - usize::from(causal), s4[1] * scale[1], s4[2] * scale[2]];
+        let sizes = match sizes {
+            Some(s) => Some(s),
+            None => self.tile_sizes(full, self.tile_tokens(gt * gh * gw * self.config.channels[3]))?,
+        };
+        let ([ot, ohw], least) = self.overlaps();
+        let tiles = plan(s4, full, sizes, [ot, ohw], least, self.config.upsamples[3].0, p);
+        let c = self.config.channels[3];
+        let mut acc = vec![0f32; 3 * full[0] * full[1] * full[2]];
+        let mut weight = vec![0f32; full[0] * full[1] * full[2]];
+        for (i, tile) in tiles.iter().enumerate() {
+            let [it, ih, iw] = tile.grid;
+            let origin = it.start == 0;
+            let trailing = it.end == s4[0];
+            // (the last tile in time carries the ghost frames' features)
+            let t_end = if trailing { gt } else { it.end };
+            let (nt, nh, nw) = (t_end - it.start, ih.end - ih.start, iw.end - iw.start);
+            let index: Vec<f32> = (it.start..t_end).flat_map(|t| (ih.start..ih.end).flat_map(move |y| (iw.start..iw.end).map(move |x| f32::from_bits(((t * gh + y) * gw + x) as u32)))).collect();
+            let index = self.upload(&index);
+            let x = self.vec(nt * nh * nw * c);
+            self.recorded(|r| r.gather_rows(&features, &index, &x, nt * nh * nw, c, 0, gt * gh * gw));
+            drop(index);
+            // stage 5's canvas: the content's frames (the floor of its kernel's on the last tile), its rows and columns
+            let ([st, sh, sw], _) = self.config.upsamples[3];
+            let mut frames5 = (it.end - it.start) * st - usize::from(origin && st == 2);
+            if trailing {
+                frames5 = frames5.max(self.config.kernel5[0]);
+            }
+            let (rows5, cols5) = (nh * sh * p, nw * sw * p);
+            let pixels = self.stages_4_and_5(x, (nt, nh, nw), &noise(i, 3 * frames5 * rows5 * cols5), origin, trailing)?;
+            // into the clip: the tile's pixels (its frames past them cut), each by its masks
+            let [pt, py, px] = tile.pixels;
+            let (lt, ly, lx) = (pt.end - pt.start, py.end - py.start, px.end - px.start);
+            if ly != rows5 || lx != cols5 || lt > frames5 {
+                candle_core::bail!("a tile's pixels ({frames5}x{rows5}x{cols5}) are not its place in the clip ({lt}x{ly}x{lx})");
+            }
+            let [mt, my, mx] = &tile.masks;
+            for (t, mtv) in mt.iter().enumerate().take(lt) {
+                for (y, myv) in my.iter().enumerate().take(ly) {
+                    let m = mtv * myv;
+                    let at = ((pt.start + t) * full[1] + py.start + y) * full[2] + px.start;
+                    for (xx, mxv) in mx.iter().enumerate() {
+                        weight[at + xx] += m * mxv;
+                    }
+                    for ch in 0..3 {
+                        let from = ((ch * frames5 + t) * rows5 + y) * cols5;
+                        let to = ch * full[0] * full[1] * full[2] + at;
+                        for (xx, mxv) in mx.iter().enumerate() {
+                            acc[to + xx] += pixels[from + xx] * m * mxv;
+                        }
+                    }
+                }
+            }
+        }
+        drop(features);
+        // back to the content: its frames, its rows and columns past the floor's padding, each pixel by its weight
         let frames = 8 * (f - 1) + 1;
         let (top, left) = (top * 32, left * 32);
+        let plane = full[0] * full[1] * full[2];
         let mut out = vec![0f32; 3 * frames * h * 32 * w * 32];
-        for c in 0..3 {
+        for ch in 0..3 {
             for t in 0..frames {
                 for y in 0..h * 32 {
-                    let from = ((c * frames5 + t) * rows5 + top + y) * cols5 + left;
-                    let to = ((c * frames + t) * h * 32 + y) * w * 32;
-                    out[to..to + w * 32].copy_from_slice(&pixels[from..from + w * 32]);
+                    let from = (t * full[1] + top + y) * full[2] + left;
+                    let to = ((ch * frames + t) * h * 32 + y) * w * 32;
+                    for xx in 0..w * 32 {
+                        let wt = weight[from + xx];
+                        if wt <= 0.0 {
+                            candle_core::bail!("a pixel no tile covered");
+                        }
+                        out[to + xx] = acc[ch * plane + from + xx] / wt;
+                    }
                 }
             }
         }
         Tensor::from_vec(out, (1, 3, frames, h * 32, w * 32), &Device::Cpu)
     }
+}
+
+fn lcm(a: usize, b: usize) -> usize {
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    a / gcd(a, b) * b
+}
+
+/// An interval of one axis and the ramps it shares with its neighbours (the reference's `DimensionInterval`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interval {
+    pub start: usize,
+    pub end: usize,
+    pub left: usize,
+    pub right: usize,
+}
+
+impl Interval {
+    /// Through an upsampling of `stride` (the reference's `_propagate_interval_through_upsample_hops`): times the
+    /// stride, and where time doubles (`causal`) the duplicate first frame dropped, a later interval starting one
+    /// earlier.
+    fn up(self, stride: usize, causal: bool) -> Self {
+        let mut i = Interval { start: self.start * stride, end: self.end * stride, left: self.left * stride, right: self.right * stride };
+        if causal && stride == 2 {
+            i.end -= 1;
+            if self.start != 0 {
+                i.start -= 1;
+            }
+        }
+        i
+    }
+}
+
+/// An axis `len` long in intervals of `size` sharing `overlap`, the last grown back to `least` where it is shorter
+/// (the reference's `split_by_size`); one interval where it fits one.
+pub fn split_by_size(len: usize, size: usize, overlap: usize, least: usize) -> Vec<Interval> {
+    if len < least || len <= size {
+        return vec![Interval { start: 0, end: len, left: 0, right: 0 }];
+    }
+    let amount = (len + size - 2 * overlap - 1) / (size - overlap);
+    let mut v = vec![Interval { start: 0, end: size, left: 0, right: overlap }];
+    for i in 1..amount - 1 {
+        v.push(Interval { start: i * (size - overlap), end: i * (size - overlap) + size, left: overlap, right: overlap });
+    }
+    v.push(Interval { start: (amount - 1) * (size - overlap), end: len, left: overlap, right: 0 });
+    let n = v.len();
+    if n > 1 && v[n - 1].end - v[n - 1].start < least {
+        let start = v[n - 1].end - least;
+        let shared = v[n - 2].end - start;
+        v[n - 2].right = shared;
+        v[n - 1].start = start;
+        v[n - 1].left = shared;
+    }
+    v
+}
+
+/// A blend mask `len` long ramped in over `left` and out over `right` (the reference's `compute_trapezoidal_mask_1d`,
+/// its ramps starting past 0: `i / (ramp + 1)`).
+pub fn trapezoid(len: usize, left: usize, right: usize) -> Vec<f32> {
+    let (left, right) = (left.min(len), right.min(len));
+    let mut m = vec![1f32; len];
+    for (i, v) in m.iter_mut().take(left).enumerate() {
+        *v *= (i + 1) as f32 / (left + 1) as f32;
+    }
+    for (i, v) in m[len - right..].iter_mut().enumerate() {
+        *v *= 1.0 - (i + 1) as f32 / (right + 1) as f32;
+    }
+    m
+}
+
+/// A tile: its intervals of the stage-4 grid, its pixels' in the clip, and their blend masks.
+#[derive(Clone, Debug)]
+pub struct Tile {
+    pub grid: [Interval; 3],
+    pub pixels: [Interval; 3],
+    pub masks: [Vec<f32>; 3],
+}
+
+/// The tiles of a stage-4 grid of `s4` making a clip of `full` pixels: one where `sizes` is None, else the reference's
+/// `prepare_tile_schedule` for tiles of `sizes` pixels (frames, rows, columns) sharing `overlap` (frames, pixels), each
+/// axis split on the stage-4 grid (at least `least` cells a tile) and carried to pixels through stage 4's upsampling of
+/// `stride` and the patch (time causal: the first frame not doubled), time slowest.
+pub fn plan(s4: [usize; 3], full: [usize; 3], sizes: Option<[usize; 3]>, overlap: [usize; 2], least: [usize; 3], stride: [usize; 3], patch: usize) -> Vec<Tile> {
+    let scale = [stride[0], stride[1] * patch, stride[2] * patch];
+    let axis = |a: usize| -> Vec<(Interval, Interval)> {
+        let intervals = match sizes {
+            None => vec![Interval { start: 0, end: s4[a], left: 0, right: 0 }],
+            Some(sizes) => {
+                let ov = overlap[a.min(1)] / scale[a];
+                let size = (sizes[a] / scale[a]).max(2.max(ov + 1));
+                split_by_size(s4[a], size, ov, least[a])
+            }
+        };
+        intervals
+            .into_iter()
+            .map(|iv| {
+                let px = if a == 0 { iv.up(stride[0], true) } else { iv.up(stride[a], false).up(patch, false) };
+                (iv, px)
+            })
+            .collect()
+    };
+    let (ts, hs, ws) = (axis(0), axis(1), axis(2));
+    let _ = full;
+    let mut tiles = Vec::new();
+    for &(gt, pt) in &ts {
+        for &(gh, ph) in &hs {
+            for &(gw, pw) in &ws {
+                let mask = |i: Interval| trapezoid(i.end - i.start, i.left, i.right);
+                tiles.push(Tile { grid: [gt, gh, gw], pixels: [pt, ph, pw], masks: [mask(pt), mask(ph), mask(pw)] });
+            }
+        }
+    }
+    tiles
 }
 
 /// The 3D RoPE's pairs by time, row and column for a 64-wide head (the reference's `default_rope_dim_split`: 16, 24,
@@ -684,6 +944,86 @@ mod tests {
         assert_eq!(unpatchify(&patches, t, h, w, p), pixels);
     }
 
+    /// The reference's tilings: a 3 x 12 x 12 latent's grid in 9 tiles of 256 pixels (the last column's 192), a 12 x 7
+    /// x 7 one's in 3 of 64 frames (the first 63, the last 42 with the ghost frames), each 40 frames and 160 pixels
+    /// shared, every frame covered.
+    #[test]
+    fn tiles_are_the_references() {
+        let tiles = plan([9, 48, 48], [17, 384, 384], Some([64, 256, 256]), [40, 160], [6, 6, 6], [2, 2, 2], 4);
+        assert_eq!(tiles.len(), 9);
+        let widths: Vec<usize> = tiles[..3].iter().map(|t| t.pixels[2].end - t.pixels[2].start).collect();
+        assert_eq!(widths, [256, 256, 192]);
+        assert_eq!(tiles[1].grid[2], Interval { start: 12, end: 44, left: 20, right: 20 });
+        let tiles = plan([45, 28, 28], [89, 224, 224], Some([64, 256, 256]), [40, 160], [6, 6, 6], [2, 2, 2], 4);
+        let frames: Vec<(usize, usize)> = tiles.iter().map(|t| (t.pixels[0].start, t.pixels[0].end)).collect();
+        assert_eq!(frames, [(0, 63), (23, 87), (47, 89)]);
+        // every frame covered (where three tiles share frames the masks sum past one: the decode divides by the sum, as
+        // the reference's does where they are not complementary)
+        let mut sum = vec![0f32; 89];
+        for t in &tiles {
+            for (i, m) in t.masks[0].iter().enumerate() {
+                sum[t.pixels[0].start + i] += m;
+            }
+        }
+        assert!(sum.iter().all(|&s| s > 0.0) && sum.iter().any(|&s| s > 1.01), "{sum:?}");
+        assert_eq!(trapezoid(6, 2, 3), vec![1. / 3., 2. / 3., 1., 0.75, 0.5, 0.25]);
+    }
+
+    /// The tiled decode against the reference's (`--ignored`; `OAIY_LTX_DVAE`, and `OAIY_LTX_DVAE_TILED`: folders of the
+    /// reference's tiled decodes, `ref.py tiled`, each tile's noise in the order drawn).
+    #[test]
+    #[ignore = "needs LTX 2.5's diffusion VAE and the reference's tensors"]
+    fn tiled_decodes_are_the_references() -> Result<()> {
+        let (Ok(file), Ok(dirs)) = (std::env::var("OAIY_LTX_DVAE"), std::env::var("OAIY_LTX_DVAE_TILED")) else { return Ok(()) };
+        let mut store = Store::open(std::path::Path::new(&file), 0)?;
+        let dec = WgpuLtxDiffusionVae::load(&mut store, 0)?;
+        for dir in dirs.split(':') {
+            let dir = std::path::PathBuf::from(dir);
+            let meta = Json::parse(&std::fs::read(dir.join("shapes.json"))?).map_err(err)?;
+            let num = |v: &Json| v.as_i64().unwrap() as usize;
+            let shape: Vec<usize> = meta.get("shapes").and_then(|s| s.get("latent")).and_then(Json::as_array).unwrap().iter().map(num).collect();
+            let tile: Vec<usize> = meta.get("tile").and_then(Json::as_array).unwrap().iter().map(num).collect();
+            let read = |name: &str| -> Vec<f32> { std::fs::read(dir.join(format!("{name}.f32"))).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect() };
+            let [_, _, f, h, w] = shape[..] else { panic!("shape") };
+            let latent = read("latent");
+            let tokens: Vec<f32> = (0..f * h * w * 128).map(|i| latent[(i % 128) * f * h * w + i / 128]).collect();
+            let started = std::time::Instant::now();
+            let clip = dec.decode_with(&tokens, f, h, w, Some([tile[0], tile[1], tile[1]]), |i, n| {
+                let noise = read(&format!("noise{i}"));
+                assert_eq!(noise.len(), n, "tile {i}'s noise");
+                noise
+            })?;
+            let (cos, worst) = agree(&clip.flatten_all()?.to_vec1::<f32>()?, &read("pixels"));
+            eprintln!("{}: {:?} in {:.1} s: cosine {cos:.6}, worst {worst:.6}", dir.display(), clip.dims(), started.elapsed().as_secs_f64());
+            assert!(cos > 0.999, "{}: cosine {cos}", dir.display());
+        }
+        Ok(())
+    }
+
+    /// A clip's decode time (`--ignored --nocapture`; `OAIY_LTX_DVAE`, `OAIY_LTX_DVAE_SIZE`: the latent's frames, rows and
+    /// columns, 7,10,16 by default: 49 frames of 512x320): a latent of noise, its tiles as the GPU's room has them.
+    #[test]
+    #[ignore = "needs LTX 2.5's diffusion VAE; a measurement"]
+    fn measure_a_clips_decode() -> Result<()> {
+        let Ok(file) = std::env::var("OAIY_LTX_DVAE") else { return Ok(()) };
+        let size: Vec<usize> = std::env::var("OAIY_LTX_DVAE_SIZE").unwrap_or("7,10,16".into()).split(',').map(|v| v.trim().parse().unwrap()).collect();
+        let [f, h, w] = size[..] else { panic!("OAIY_LTX_DVAE_SIZE: frames,rows,columns") };
+        let mut store = Store::open(std::path::Path::new(&file), 0)?;
+        let dec = WgpuLtxDiffusionVae::load(&mut store, 0)?;
+        let latent = crate::pipeline::noise(5, f * h * w * 128);
+        let started = std::time::Instant::now();
+        let mut tiles = 0;
+        let clip = dec.decode_with(&latent, f, h, w, None, |i, n| {
+            tiles = i + 1;
+            crate::pipeline::noise(9 + i as u64, n)
+        })?;
+        let values = clip.flatten_all()?.to_vec1::<f32>()?;
+        let finite = values.iter().all(|v| v.is_finite());
+        eprintln!("{:?} in {:.1} s, {tiles} tile(s), every value finite: {finite}", clip.dims(), started.elapsed().as_secs_f64());
+        assert!(finite);
+        Ok(())
+    }
+
     /// The decoder against Lightricks' own (`--ignored`; `OAIY_LTX_DVAE`: the release's video VAE file,
     /// `OAIY_LTX_DVAE_GOLDEN`: a folder of the reference's tensors for one latent, `ref.py golden` in OAIY's notes):
     /// stages 1 to 3's output, and the clip from the reference's stage-5 noise.
@@ -694,7 +1034,7 @@ mod tests {
         let dir = std::path::PathBuf::from(dir);
         let shapes = Json::parse(&std::fs::read(dir.join("shapes.json"))?).map_err(err)?;
         let shape = |name: &str| -> Vec<usize> { shapes.get("shapes").and_then(|s| s.get(name)).and_then(Json::as_array).unwrap().iter().map(|v| v.as_i64().unwrap() as usize).collect() };
-        let read = |name: &str| -> Vec<f32> { std::fs::read(dir.join(format!("{name}.f32"))).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+        let read = |name: &str| -> Vec<f32> { std::fs::read(dir.join(format!("{name}.f32"))).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect() };
         let mut store = Store::open(std::path::Path::new(&file), 0)?;
         let started = std::time::Instant::now();
         let dec = WgpuLtxDiffusionVae::load(&mut store, 0)?;
@@ -730,8 +1070,8 @@ mod tests {
         let latent = read("latent");
         let tokens: Vec<f32> = (0..f * lh * lw * 128).map(|i| latent[(i % 128) * f * lh * lw + i / 128]).collect();
         let noise = read("noise");
-        let clip = dec.decode_with(&tokens, f, lh, lw, |n| {
-            assert_eq!(n, noise.len());
+        let clip = dec.decode_with(&tokens, f, lh, lw, None, |tile, n| {
+            assert_eq!((tile, n), (0, noise.len()));
             noise.clone()
         })?;
         let (cos, worst) = agree(&clip.flatten_all()?.to_vec1::<f32>()?, &want[..3 * (8 * (f - 1) + 1) * lh * 32 * lw * 32]);

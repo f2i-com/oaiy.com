@@ -83,7 +83,7 @@ Sulphur validates the shared LTX 2.3 architecture.
 |---|---|---|---|
 | [LTX 2.3](https://huggingface.co/Lightricks/LTX-2.3) | `ltx-2.3-22b-distilled-1.1.safetensors` | Gemma 3 12B BF16, `model.*` tensor layout, with `tokenizer.json` | Included in checkpoint |
 | [Sulphur-2](https://huggingface.co/SulphurAI/Sulphur-2-base) | `sulphur_distil_bf16.safetensors` | Same Gemma 3 encoder | Included in checkpoint |
-| [LTX 2.5](https://huggingface.co/Lightricks/LTX-2.5) | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, including its tokenizer | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` |
+| [LTX 2.5](https://huggingface.co/Lightricks/LTX-2.5) | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, including its tokenizer | `vae/ltx-2.5-video-vae-conv-bf16.safetensors`, or a release's own diffusion-decoder VAE (WebGPU) |
 
 Use the complete distilled checkpoints, or a dev (not distilled) one with the
 model's `distilled: false` in Studio: that runs the reference's guided sampling
@@ -116,9 +116,10 @@ NVFP4 checkpoints load too: two E2M1 values a byte (high nibble first), an
 fp8 scale per 16 in the cuBLAS tiled layout, and a tensor-wide
 `weight_scale_2`; like fp8 they become BF16 on the device. A LoRA
 (`lora_A`/`lora_B` pairs) is added to the weights it adapts as they are read.
-The worker does not interpret GGUF video weights, and does not run the LTX 2.5
-diffusion-decoder VAE (`CausalDiffusionVAE`, with `decoder.diff_blocks.*`);
-the conv VAE decodes the same latents.
+The worker does not interpret GGUF video weights. LTX 2.5's diffusion-decoder
+VAE (`CausalDiffusionVAE`, with `decoder.diff_blocks.*`) decodes on WebGPU (see
+[The diffusion decoder](#the-diffusion-decoder)); the conv VAE decodes the same
+latents, its encoder is the same weights, and it is the one the CPU path takes.
 
 Clips render in one distilled pass by default. `refine` (the distilled
 transformer and a x2 spatial latent upsampler) runs one of the reference's
@@ -147,13 +148,51 @@ For example, the merged
 LTX 2.5 v1.1 fine-tune
 release runs as `diffusion_models/ltx25_v1.1-fp8_scaled.safetensors`
 with `text_encoders/gemma4_12b_ltx25-int8.safetensors` (int8, with
-its tokenizer and LTX projection). Its VAE is the diffusion-decoder one, so pair
-it with the official `ltx-2.5-video-vae-conv-bf16.safetensors`. The studio
-does this itself when another LTX 2.5 model is already configured.
+its tokenizer and LTX projection). Its VAE is the diffusion-decoder one, which
+the worker runs on WebGPU; the official `ltx-2.5-video-vae-conv-bf16.safetensors`
+decodes the same latents too, faster, and is the one a CPU build needs.
 LTX 2.5's Gemma 4 Unified path has distinct RMS normalization, attention scaling,
 global head dimensions, shared K/V projections and proportional rotary positions.
 It cannot use Gemma 3 as a substitute. Model licenses and access requirements are
 available in the linked repositories.
+
+## The diffusion decoder
+
+LTX 2.5 releases ship a video VAE whose decoder is a diffusion model of its own
+(`CausalDiffusionVAE`, decoder `NADiffusionDecoder`). On WebGPU the worker runs it
+as Lightricks' `DiffusionVideoDecoder` does (`crates/oaiy-media/src/ltx_dvae_wgpu.rs`):
+
+* Four deterministic stages of neighborhood-attention blocks (3D windows of
+  3x7x7, 3x7x7, 3x5x5 and 3x5x5, NATTEN's: centred and shifted inward at the
+  edges; absolute 3D RoPE, 16/24/24 of each 64-wide head; RMS norms and SwiGLU),
+  each followed by a linear pixel shuffle, carry the latent (2,048 channels) to a
+  256-channel context the size of the clip's 4x4 patches.
+* Stage 5's eight diffusion blocks (11x11x11 windows) predict the clip's patches
+  from noise in one step (the release's `model_output_type` is x0, one inference
+  step at t = 1, the timestep scaled by 1,000): each block adds the context through
+  its own projection, its norms modulated by the shared AdaLN plus its own table.
+  The clip's detail is drawn from that noise, which comes from the clip's seed.
+* As the reference does, the latent is padded to the grid's floor (3x7x7) and its
+  last frame repeated twice past its end through stages 1 to 4, those frames
+  cropped off before stage 5. Stages 1 to 3 run once on the whole latent; stages 4
+  and 5 run on tiles of the stage-4 grid where the GPU has no room for the clip at
+  once (`diffusion_tiling`'s plan: tiles overlap by stage 5's reach, 40 frames and
+  160 pixels, their pixels blended by trapezoid masks and divided by the masks'
+  sum where three tiles share frames).
+
+Checked against the reference (ltx-core at `be6d6d0`, PyTorch on the CPU in f32)
+with the release's VAE: a 3x8x8 latent's stages and its 17x256x256 clip from the
+reference's own noise agree to a cosine of 1.000000 (the worst pixel 8e-6 off),
+and so do the reference's tiled decodes, 9 tiles of a 17x384x384 clip and 3 of an
+89x224x224 one (`ltx_dvae_wgpu::tests`, the golden tensors through
+`OAIY_LTX_DVAE_GOLDEN` and `OAIY_LTX_DVAE_TILED`). The CPU path refuses it with a
+message naming the conv VAE.
+
+It costs more than the conv VAE: on an M5 Pro's GPU (Metal, where the f16
+matrices go through the f32 kernel and the neighborhood attention is most of the
+time) a 49-frame 512x320 clip decodes whole in 28 s, a 121-frame 768x512 one in 8
+tiles in 6 minutes (`measure_a_clips_decode`, `OAIY_LTX_DVAE_SIZE`). A model's
+`vae` decides which decoder a clip gets.
 
 ## Configure and build
 
