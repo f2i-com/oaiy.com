@@ -1308,6 +1308,10 @@ impl Models {
             _ => self.context(model.config().context_length),
         };
         let cfg = self.base_cfg(spec, max_seq);
+        // (a model streamed from its file reads no pictures: its projector said so, where it was passed silently)
+        if let Some(p) = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten() {
+            self.say(format!("{}: its vision projector ({}) is not read: a model whose experts stream from its file reads no pictures here", spec.name, p.display()));
+        }
 
         let (jobs, rx) = std::sync::mpsc::channel();
         let mut e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
