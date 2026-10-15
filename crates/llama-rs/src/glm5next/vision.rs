@@ -101,10 +101,12 @@
 //! that stand-in and is **positionally blind**, for isolating the other stages in
 //! tests. Real use wants [`MRope::for_grid`].
 //!
-//! **Wired into `Glm5NextModel`: no.** The remaining gap for end-to-end vision is
-//! preprocessing — resize to a multiple of `patch * n_merge` (bicubic) and
-//! normalise by `clip.vision.image_mean` / `image_std`. `oaiy-image` already has
-//! Pillow-exact resize, and `vision::preprocess_image` wraps it.
+//! **Wired in:** a picture's tokens go into the text model through
+//! `Glm5NextModel::forward_spliced` (`forward::forward_chunk_spliced`), in place of
+//! the `<|image|>` tokens the server expands its marker to; [`preprocess_within`]
+//! sizes it (bicubic, to a multiple of `patch * n_merge`, within a token budget)
+//! and normalises by `clip.vision.image_mean` / `image_std`. Each stage's tokens
+//! run in parallel (rayon), their dot products in eight lanes.
 
 use crate::{LlamaError, Result};
 
@@ -138,33 +140,54 @@ fn gelu_erf(x: f32) -> f32 {
     0.5 * x * (1.0 + erf(x * std::f32::consts::FRAC_1_SQRT_2))
 }
 
-/// `out = w @ x` for `w` of `[out_dim, in_dim]` row-major, plus an optional bias.
-fn matvec(w: &[f32], x: &[f32], bias: Option<&[f32]>, out: &mut [f32]) -> Result<()> {
-    let n = x.len();
-    if w.len() != out.len() * n {
+/// `a . b` in eight lanes, which the compiler keeps in vector registers (a plain
+/// `zip().sum()` is one serial chain of adds: the tower ran at a few GFLOP/s on it).
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (x, y) in ca.zip(cb) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let mut tail = 0.0f32;
+    for (x, y) in ra.iter().zip(rb) {
+        tail += x * y;
+    }
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
+}
+
+/// That `w` is `[out_dim, in_dim]` and `bias`, where there is one, `[out_dim]`.
+fn check_matrix(w: &[f32], out_dim: usize, in_dim: usize, bias: Option<&[f32]>) -> Result<()> {
+    if w.len() != out_dim * in_dim {
         return Err(LlamaError::Config(format!(
-            "vision: matvec weight is {} for [{}, {n}]",
-            w.len(),
-            out.len()
+            "vision: matvec weight is {} for [{out_dim}, {in_dim}]",
+            w.len()
         )));
     }
-    for (o, row) in out.iter_mut().zip(w.chunks_exact(n)) {
-        *o = row.iter().zip(x).map(|(a, b)| a * b).sum();
+    if let Some(b) = bias.filter(|b| b.len() != out_dim) {
+        return Err(LlamaError::Config(format!(
+            "vision: bias is {} for a {out_dim}-wide output",
+            b.len()
+        )));
+    }
+    Ok(())
+}
+
+/// `out = w @ x` for `w` of `[out_dim, in_dim]` row-major, plus an optional bias: a matrix [`check_matrix`]
+/// has passed.
+fn matvec_checked(w: &[f32], x: &[f32], bias: Option<&[f32]>, out: &mut [f32]) {
+    for (o, row) in out.iter_mut().zip(w.chunks_exact(x.len())) {
+        *o = dot(row, x);
     }
     if let Some(b) = bias {
-        if b.len() != out.len() {
-            return Err(LlamaError::Config(format!(
-                "vision: bias is {} for a {}-wide output",
-                b.len(),
-                out.len()
-            )));
-        }
         for (o, &bb) in out.iter_mut().zip(b) {
             *o += bb;
         }
     }
-    Ok(())
 }
+
 
 fn rms_norm(x: &mut [f32], w: &[f32], eps: f32) -> Result<()> {
     if w.len() != x.len() {
@@ -233,7 +256,7 @@ pub fn swiglu_clamped_pre(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32])
 ///
 /// glm5next uses M-RoPE (`ggml_rope_multi`, `GGML_ROPE_TYPE_VISION`), which this
 /// stack does not implement yet — see the module docs.
-pub trait VitRope {
+pub trait VitRope: Sync {
     fn rotate(&self, buf: &mut [f32], token: usize, n_head: usize, d_head: usize);
 }
 
@@ -400,10 +423,14 @@ pub fn patch_embed(
     let (nx, ny) = (img_w / p, img_h / p);
     let mut out = vec![0.0f32; nx * ny * sh.n_embd];
 
-    // Stride equals the kernel, so the convolution is one linear map per patch.
-    let mut win = vec![0.0f32; kern];
-    for py in 0..ny {
-        for px in 0..nx {
+    // Stride equals the kernel, so the convolution is one linear map per patch: each
+    // patch's, in parallel, then each put at its place in the reordered sequence.
+    use rayon::prelude::*;
+    let embedded: Vec<(usize, Vec<f32>)> = (0..nx * ny)
+        .into_par_iter()
+        .map(|i| {
+            let (px, py) = (i % nx, i / nx);
+            let mut win = vec![0.0f32; kern];
             for ch in 0..3 {
                 for dy in 0..p {
                     let row = (ch * img_h + py * p + dy) * img_w + px * p;
@@ -411,17 +438,19 @@ pub fn patch_embed(
                     win[dst..dst + p].copy_from_slice(&img[row..row + p]);
                 }
             }
-            let t = reordered_index(px, py, nx, m);
-            let dst = &mut out[t * sh.n_embd..(t + 1) * sh.n_embd];
-            for (c, o) in dst.iter_mut().enumerate() {
-                let r0 = &w.patch_embd_0[c * kern..(c + 1) * kern];
-                let r1 = &w.patch_embd_1[c * kern..(c + 1) * kern];
-                // Both temporal halves see the same pixels for a still image.
-                let a: f32 = r0.iter().zip(win.iter()).map(|(a, b)| a * b).sum();
-                let b: f32 = r1.iter().zip(win.iter()).map(|(a, b)| a * b).sum();
-                *o = a + b + w.patch_bias[c];
-            }
-        }
+            let e: Vec<f32> = (0..sh.n_embd)
+                .map(|c| {
+                    // Both temporal halves see the same pixels for a still image.
+                    let a = dot(&w.patch_embd_0[c * kern..(c + 1) * kern], &win);
+                    let b = dot(&w.patch_embd_1[c * kern..(c + 1) * kern], &win);
+                    a + b + w.patch_bias[c]
+                })
+                .collect();
+            (reordered_index(px, py, nx, m), e)
+        })
+        .collect();
+    for (t, e) in embedded {
+        out[t * sh.n_embd..(t + 1) * sh.n_embd].copy_from_slice(&e);
     }
     Ok(out)
 }
@@ -443,89 +472,90 @@ pub fn vit_block(
         )));
     }
 
+    check_matrix(b.qkv, 3 * e, e, Some(b.qkv_b))?;
+    check_matrix(b.out, e, e, Some(b.out_b))?;
+    check_matrix(b.ffn_gate, sh.n_ff, e, Some(b.ffn_gate_b))?;
+    check_matrix(b.ffn_up, sh.n_ff, e, Some(b.ffn_up_b))?;
+    check_matrix(b.ffn_down, e, sh.n_ff, Some(b.ffn_down_b))?;
+    for (name, v, n) in [("ln1", b.ln1, e), ("ln2", b.ln2, e), ("q_norm", b.q_norm, dh), ("k_norm", b.k_norm, dh)] {
+        if v.len() != n {
+            return Err(LlamaError::Config(format!("vision: {name} is {} for a {n}-wide vector", v.len())));
+        }
+    }
+    use rayon::prelude::*;
+
     // --- attention -------------------------------------------------------
-    let mut q = vec![0.0f32; n_tok * nh * dh];
-    let mut k = vec![0.0f32; n_tok * nh * dh];
-    let mut v = vec![0.0f32; n_tok * nh * dh];
-    let mut qkv = vec![0.0f32; 3 * e];
-
-    for t in 0..n_tok {
+    // Each token's Q | K | V (norms and rotation included), side by side.
+    let mut qkv = vec![0.0f32; n_tok * 3 * e];
+    qkv.par_chunks_mut(3 * e).enumerate().for_each(|(t, row)| {
         let mut cur = x[t * e..(t + 1) * e].to_vec();
-        rms_norm(&mut cur, b.ln1, sh.eps)?;
-        matvec(b.qkv, &cur, Some(b.qkv_b), &mut qkv)?;
-
+        rms_norm(&mut cur, b.ln1, sh.eps).expect("checked");
         // The fused projection is Q | K | V, each n_head * d_head wide.
-        q[t * nh * dh..(t + 1) * nh * dh].copy_from_slice(&qkv[0..e]);
-        k[t * nh * dh..(t + 1) * nh * dh].copy_from_slice(&qkv[e..2 * e]);
-        v[t * nh * dh..(t + 1) * nh * dh].copy_from_slice(&qkv[2 * e..3 * e]);
-
+        matvec_checked(b.qkv, &cur, Some(b.qkv_b), row);
+        let (q, kv) = row.split_at_mut(e);
+        let k = &mut kv[..e];
         // Per-head RMSNorm, weight only.
         for h in 0..nh {
-            let off = t * nh * dh + h * dh;
-            rms_norm(&mut q[off..off + dh], b.q_norm, sh.eps)?;
-            rms_norm(&mut k[off..off + dh], b.k_norm, sh.eps)?;
+            rms_norm(&mut q[h * dh..(h + 1) * dh], b.q_norm, sh.eps).expect("checked");
+            rms_norm(&mut k[h * dh..(h + 1) * dh], b.k_norm, sh.eps).expect("checked");
         }
-        rope.rotate(&mut q[t * nh * dh..(t + 1) * nh * dh], t, nh, dh);
-        rope.rotate(&mut k[t * nh * dh..(t + 1) * nh * dh], t, nh, dh);
-    }
+        rope.rotate(q, t, nh, dh);
+        rope.rotate(k, t, nh, dh);
+    });
 
     let scale = sh.kq_scale();
     let mut ctx = vec![0.0f32; n_tok * e];
-    let mut scores = vec![0.0f32; n_tok];
-    for t in 0..n_tok {
-        for h in 0..nh {
-            let qo = t * nh * dh + h * dh;
-            let qh = &q[qo..qo + dh];
-            let mut max = f32::NEG_INFINITY;
-            for (s, sc) in scores.iter_mut().enumerate() {
-                let ko = s * nh * dh + h * dh;
-                let d: f32 = qh.iter().zip(&k[ko..ko + dh]).map(|(a, b)| a * b).sum();
-                *sc = d * scale;
-                if *sc > max {
-                    max = *sc;
+    ctx.par_chunks_mut(e).enumerate().for_each_init(
+        || vec![0.0f32; n_tok],
+        |scores, (t, out)| {
+            for h in 0..nh {
+                let qh = &qkv[t * 3 * e + h * dh..t * 3 * e + (h + 1) * dh];
+                let mut max = f32::NEG_INFINITY;
+                for (s, sc) in scores.iter_mut().enumerate() {
+                    let ko = s * 3 * e + e + h * dh;
+                    *sc = dot(qh, &qkv[ko..ko + dh]) * scale;
+                    if *sc > max {
+                        max = *sc;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - max).exp();
+                    sum += *sc;
+                }
+                let inv = 1.0 / sum;
+                let co = &mut out[h * dh..(h + 1) * dh];
+                for (s, &sc) in scores.iter().enumerate() {
+                    let p = sc * inv;
+                    let vo = s * 3 * e + 2 * e + h * dh;
+                    for (c, &vv) in co.iter_mut().zip(&qkv[vo..vo + dh]) {
+                        *c += p * vv;
+                    }
                 }
             }
-            let mut sum = 0.0f32;
-            for sc in scores.iter_mut() {
-                *sc = (*sc - max).exp();
-                sum += *sc;
-            }
-            let inv = 1.0 / sum;
-            let co = t * e + h * dh;
-            for (s, &sc) in scores.iter().enumerate() {
-                let p = sc * inv;
-                let vo = s * nh * dh + h * dh;
-                for (c, &vv) in ctx[co..co + dh].iter_mut().zip(&v[vo..vo + dh]) {
-                    *c += p * vv;
-                }
-            }
-        }
-    }
+        },
+    );
+    drop(qkv);
 
-    let mut proj = vec![0.0f32; e];
-    for t in 0..n_tok {
-        matvec(b.out, &ctx[t * e..(t + 1) * e], Some(b.out_b), &mut proj)?;
-        for (dst, &p) in x[t * e..(t + 1) * e].iter_mut().zip(proj.iter()) {
-            *dst += p; // residual
-        }
-    }
-
-    // --- FFN -------------------------------------------------------------
-    let mut g = vec![0.0f32; sh.n_ff];
-    let mut u = vec![0.0f32; sh.n_ff];
-    let mut h = vec![0.0f32; sh.n_ff];
-    let mut d = vec![0.0f32; e];
-    for t in 0..n_tok {
-        let mut cur = x[t * e..(t + 1) * e].to_vec();
-        rms_norm(&mut cur, b.ln2, sh.eps)?;
-        matvec(b.ffn_gate, &cur, Some(b.ffn_gate_b), &mut g)?;
-        matvec(b.ffn_up, &cur, Some(b.ffn_up_b), &mut u)?;
-        swiglu_clamped_pre(&g, &u, sh.swiglu_limit, &mut h)?;
-        matvec(b.ffn_down, &h, Some(b.ffn_down_b), &mut d)?;
-        for (dst, &dv) in x[t * e..(t + 1) * e].iter_mut().zip(d.iter()) {
-            *dst += dv; // residual
-        }
-    }
+    // Output projection and residual, then the FFN and its residual, a token at a time.
+    x.par_chunks_mut(e).zip(ctx.par_chunks(e)).for_each_init(
+        || (vec![0.0f32; e], vec![0.0f32; sh.n_ff], vec![0.0f32; sh.n_ff], vec![0.0f32; sh.n_ff]),
+        |(proj, g, u, h), (xt, ct)| {
+            matvec_checked(b.out, ct, Some(b.out_b), proj);
+            for (dst, &p) in xt.iter_mut().zip(proj.iter()) {
+                *dst += p; // residual
+            }
+            let mut cur = xt.to_vec();
+            rms_norm(&mut cur, b.ln2, sh.eps).expect("checked");
+            matvec_checked(b.ffn_gate, &cur, Some(b.ffn_gate_b), g);
+            matvec_checked(b.ffn_up, &cur, Some(b.ffn_up_b), u);
+            swiglu_clamped_pre(g, u, sh.swiglu_limit, h).expect("same widths");
+            matvec_checked(b.ffn_down, h, Some(b.ffn_down_b), proj);
+            for (dst, &dv) in xt.iter_mut().zip(proj.iter()) {
+                *dst += dv; // residual
+            }
+        },
+    );
     Ok(())
 }
 
@@ -581,29 +611,36 @@ pub fn project(sh: &VisionShape, w: &VisionW<'_>, tokens: &[f32]) -> Result<Vec<
     }
 
     let n_out = n_tok / group;
-    let mut out = vec![0.0f32; n_out * pd];
-    let mut win = vec![0.0f32; group * e];
-    let mut merged = vec![0.0f32; pd];
-    let mut fced = vec![0.0f32; pd];
-    let mut g = vec![0.0f32; sh.proj_ff];
-    let mut u = vec![0.0f32; sh.proj_ff];
-    let mut h = vec![0.0f32; sh.proj_ff];
-
-    for o in 0..n_out {
-        merge_window(tokens, o, group, e, &mut win);
-        matvec(w.merger, &win, Some(w.merger_b), &mut merged)?;
-
-        matvec(w.fc, &merged, None, &mut fced)?;
-        layer_norm(&mut fced, w.post_norm, w.post_norm_b, sh.proj_norm_eps)?;
-        for v in fced.iter_mut() {
-            *v = gelu_erf(*v);
-        }
-
-        matvec(w.gate, &fced, None, &mut g)?;
-        matvec(w.up, &fced, None, &mut u)?;
-        swiglu_clamped_pre(&g, &u, sh.swiglu_limit, &mut h)?;
-        matvec(w.down, &h, None, &mut out[o * pd..(o + 1) * pd])?;
+    check_matrix(w.merger, pd, group * e, Some(w.merger_b))?;
+    check_matrix(w.fc, pd, pd, None)?;
+    check_matrix(w.gate, sh.proj_ff, pd, None)?;
+    check_matrix(w.up, sh.proj_ff, pd, None)?;
+    check_matrix(w.down, pd, sh.proj_ff, None)?;
+    if w.post_norm.len() != pd || w.post_norm_b.len() != pd {
+        return Err(LlamaError::Config(format!("vision: post_norm is {} / {} for a {pd}-wide vector", w.post_norm.len(), w.post_norm_b.len())));
     }
+
+    // Each merged token on its own, in parallel.
+    use rayon::prelude::*;
+    let mut out = vec![0.0f32; n_out * pd];
+    out.par_chunks_mut(pd).enumerate().for_each_init(
+        || (vec![0.0f32; group * e], vec![0.0f32; pd], vec![0.0f32; pd], vec![0.0f32; sh.proj_ff], vec![0.0f32; sh.proj_ff], vec![0.0f32; sh.proj_ff]),
+        |(win, merged, fced, g, u, h), (o, dst)| {
+            merge_window(tokens, o, group, e, win);
+            matvec_checked(w.merger, win, Some(w.merger_b), merged);
+
+            matvec_checked(w.fc, merged, None, fced);
+            layer_norm(fced, w.post_norm, w.post_norm_b, sh.proj_norm_eps).expect("checked");
+            for v in fced.iter_mut() {
+                *v = gelu_erf(*v);
+            }
+
+            matvec_checked(w.gate, fced, None, g);
+            matvec_checked(w.up, fced, None, u);
+            swiglu_clamped_pre(g, u, sh.swiglu_limit, h).expect("same widths");
+            matvec_checked(w.down, h, None, dst);
+        },
+    );
     Ok(out)
 }
 
@@ -913,13 +950,25 @@ pub fn preprocess(
     mean: [f32; 3],
     std: [f32; 3],
 ) -> Result<(Vec<f32>, usize, usize)> {
+    preprocess_within(img, sh, mean, std, MAX_IMAGE_TOKENS)
+}
+
+/// [`preprocess`] with at most `max_tokens` image tokens (the reference's 8,000 at
+/// most): a server's budget for a picture, where each is that many tokens of prompt.
+pub fn preprocess_within(
+    img: &image::DynamicImage,
+    sh: &VisionShape,
+    mean: [f32; 3],
+    std: [f32; 3],
+    max_tokens: usize,
+) -> Result<(Vec<f32>, usize, usize)> {
     let (w, h) = smart_resize(
         img.width() as usize,
         img.height() as usize,
         sh.patch,
         sh.n_merge,
         MIN_IMAGE_TOKENS,
-        MAX_IMAGE_TOKENS,
+        max_tokens.clamp(MIN_IMAGE_TOKENS, MAX_IMAGE_TOKENS),
     )?;
     if w == 0 || h == 0 {
         return Err(LlamaError::Config("vision: empty image".into()));
@@ -947,6 +996,14 @@ pub fn preprocess(
         }
     }
     Ok((out, w, h))
+}
+
+/// [`preprocess_within`] of an image file's bytes (PNG, JPEG or WebP), with the
+/// released mmproj's mean and std.
+pub fn preprocess_bytes_within(bytes: &[u8], sh: &VisionShape, max_tokens: usize) -> Result<(Vec<f32>, usize, usize)> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| LlamaError::Config(format!("vision: cannot decode image: {e}")))?;
+    preprocess_within(&img, sh, IMAGE_MEAN, IMAGE_STD, max_tokens)
 }
 
 /// Preprocess an image and run the whole tower, with M-RoPE.

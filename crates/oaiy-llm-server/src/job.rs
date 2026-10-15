@@ -45,10 +45,12 @@ pub enum ImagePrep {
     Qwen { pixels: ggml_rs::Tensor, side: usize },
     /// Gemma 4's: the picture as its tower takes it (`[3, h, w]`), and its soft tokens.
     Gemma { pixels: ggml_rs::Tensor, tokens: usize },
+    /// GLM-5.3 Flash's: the picture as its tower takes it (`[3, height, width]`, normalised), and its tokens.
+    Glm { pixels: Vec<f32>, width: usize, height: usize, tokens: usize },
 }
 impl ImagePrep {
     pub fn n_tokens(&self) -> usize {
-        match self { Self::Deepseek(p) => p.n_tokens(), Self::Qwen { side, .. } => side * side, Self::Gemma { tokens, .. } => *tokens }
+        match self { Self::Deepseek(p) => p.n_tokens(), Self::Qwen { side, .. } => side * side, Self::Gemma { tokens, .. } | Self::Glm { tokens, .. } => *tokens }
     }
     pub(crate) fn deepseek(&self) -> oaiy_engine::Result<&Prepared> {
         match self { Self::Deepseek(p) => Ok(p), _ => Err(oaiy_engine::Error::Arg("Qwen image sent to DeepSeek worker".into())) }

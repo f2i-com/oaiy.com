@@ -1109,6 +1109,52 @@ impl Glm5NextModel {
         kv.len = st.len;
         Ok(Tensor::from_vec(logits, vec![1, sh.n_vocab]))
     }
+
+    /// VENDORED-LOCAL: [`Self::forward`] with `soft` rows (`(position in tokens, [n, n_embd] values)`) in place of
+    /// their tokens' embeddings: a picture's soft tokens from the vision tower where its `<|image|>` tokens stand.
+    /// The prompt goes through in the same chunks; a picture's rows go with the chunks they fall in.
+    pub fn forward_spliced(&self, tokens: &[u32], soft: &[(usize, &[f32])], kv: &mut crate::kv_cache::KvCache) -> Result<Tensor> {
+        if soft.is_empty() {
+            return self.forward(tokens, kv);
+        }
+        let Some(d) = &self.decoder else {
+            return self.forward(tokens, kv);
+        };
+        if tokens.is_empty() {
+            return Err(LlamaError::Config("glm5next: forward got no tokens".into()));
+        }
+        let sh = d.model.shape();
+        let w = d.model.view();
+        let mut st = d.state.lock().unwrap_or_else(|e| e.into_inner());
+        if kv.len == 0 && st.len != 0 {
+            st.reset();
+        }
+        if st.len + tokens.len() > sh.max_len {
+            return Err(LlamaError::Config(format!(
+                "glm5next: {} tokens at position {} exceeds the {}-token state this model was opened with",
+                tokens.len(),
+                st.len,
+                sh.max_len
+            )));
+        }
+        let n_embd = sh.n_embd;
+        let step = forward::prefill_chunk();
+        let mut logits = Vec::new();
+        for (c, part) in tokens.chunks(step).enumerate() {
+            let at = c * step;
+            // (each span's rows that fall in this chunk, at their place in it)
+            let mine: Vec<(usize, &[f32])> = soft
+                .iter()
+                .filter_map(|&(p, values)| {
+                    let (lo, hi) = (p.max(at), (p + values.len() / n_embd).min(at + part.len()));
+                    (lo < hi).then(|| (lo - at, &values[(lo - p) * n_embd..(hi - p) * n_embd]))
+                })
+                .collect();
+            logits = forward::forward_chunk_spliced(sh, &w, &mut st, part, &mine)?;
+        }
+        kv.len = st.len;
+        Ok(Tensor::from_vec(logits, vec![1, sh.n_vocab]))
+    }
 }
 
 // VENDORED-LOCAL: real-model test paths come from the environment, so the

@@ -114,7 +114,9 @@ pub struct Spec {
 /// The model-specific half of turning a request into tokens.
 pub enum Flavour {
     Deepseek(Arc<dsv41::tokenizer::Tokenizer>),
-    Gguf(Arc<tokenizer::Tokenizer>),
+    /// GLM-5.3 Flash (and the other streamed MoE GGUFs): the marker a picture stands as in its prompt where it reads
+    /// pictures (`<|begin_of_image|><|image|><|end_of_image|>`, with its vision projector).
+    Gguf(Arc<tokenizer::Tokenizer>, Option<&'static str>),
     Qwen(Arc<tokenizer::Tokenizer>),
     /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, whether its
     /// own template opens the reply on an empty thought channel (see `dense_prompt`), and the marker a picture
@@ -127,7 +129,7 @@ impl Flavour {
         match self {
             Self::Deepseek(t) => t.encode(text),
             // llama-rs applies BOS through the template, so not again here.
-            Self::Gguf(t) | Self::Qwen(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
+            Self::Gguf(t, _) | Self::Qwen(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
         }
     }
 
@@ -145,7 +147,7 @@ impl Flavour {
                 dsv41::chat::encode(msgs, opts).map_err(|e| e.to_string())
             }
             Self::Qwen(_) => crate::qwen::chat_prompt(msgs, opts),
-            Self::Gguf(_) => {
+            Self::Gguf(_, marker) => {
                 // The same messages through llama-rs's GLM template. `reasoning
                 // effort` maps onto the three the reference Jinja accepts; the
                 // DeepSeek options carry a 1-100 scale, so it is banded.
@@ -154,7 +156,10 @@ impl Flavour {
                     34..=66 => llama_rs::ReasoningEffort::High,
                     _ => llama_rs::ReasoningEffort::Max,
                 };
-                let out = llama_messages(msgs)?;
+                let (out, images) = match marker {
+                    Some(_) => dense_messages(msgs, *marker)?,
+                    None => (llama_messages(msgs)?, Vec::new()),
+                };
                 // The mode decides which generation prompt: `Thinking` opens
                 // `<think>` for the model to reason in, `Chat` pre-fills
                 // `<think></think>` so it answers directly. Ignoring this was worth
@@ -163,7 +168,7 @@ impl Flavour {
                 let thinking = opts.mode == dsv41::chat::Mode::Thinking;
                 Ok(dsv41::chat::Encoded {
                     prompt: llama_rs::glm5next_template_full(&out, true, effort, thinking),
-                    images: Vec::new(),
+                    images,
                 })
             }
             Self::Dense(_, arch, empty_thought, marker) => {
@@ -279,6 +284,10 @@ fn opens_empty_thought(template: &str) -> bool {
 /// What a model whose attention cache is sized by its context is served with when nobody has said: these models
 /// name maximums of a quarter of a million tokens, and a cache for that is tens of gigabytes.
 pub(crate) const DENSE_CTX: usize = 16384;
+
+/// The tokens a picture is at most for GLM-5.3 Flash (its image processor allows 8,000): each is a token of prompt,
+/// and its experts stream from the drive, so a picture costs what that much text does.
+const GLM_IMAGE_TOKENS: usize = 576;
 
 /// The soft tokens a picture is at most for Gemma 4 (its image processor's default, of 70, 140, 280, 560 or 1,120):
 /// 2,520 patches of 16 pixels, a square picture 768 x 768.
@@ -712,6 +721,7 @@ impl Models {
             vision: None,
             qwen_vision: None,
             gemma_vision: None,
+            glm_vision: None,
             image_token_id: 0,
             local_images: o.local_images.unwrap_or(self.loopback),
         }
@@ -1307,14 +1317,34 @@ impl Models {
             llama_rs::Model::Glm5Next(g) => self.context(g.max_len()),
             _ => self.context(model.config().context_length),
         };
-        let cfg = self.base_cfg(spec, max_seq);
-        // (a model streamed from its file reads no pictures: its projector said so, where it was passed silently)
+        let mut cfg = self.base_cfg(spec, max_seq);
+        // GLM-5.3 Flash reads pictures through its mmproj's vision tower (on the host, a picture's tokens then spliced
+        // in where its `<|image|>` tokens stand); another streamed model's projector is not read.
+        let mut marker = None;
+        let mut tower = None;
         if let Some(p) = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten() {
-            self.say(format!("{}: its vision projector ({}) is not read: a model whose experts stream from its file reads no pictures here", spec.name, p.display()));
+            if matches!(model, llama_rs::Model::Glm5Next(_)) {
+                let t = std::time::Instant::now();
+                let (shape, weights) = llama_rs::glm5next::mmproj::VisionWeights::open(p).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                if shape.proj_dim != model.config().embedding_dim {
+                    return Err(Error::Arg(format!("{}: its vision tower gives {}-wide tokens, not this model's {}", p.display(), shape.proj_dim, model.config().embedding_dim)));
+                }
+                let ids = ["<|image|>", "<|begin_of_image|>", "<|end_of_image|>"].map(|t| tok.token_id(t));
+                let [Some(image), Some(_), Some(_)] = ids else {
+                    return Err(Error::Arg("this GLM's tokenizer lacks its picture tokens".into()));
+                };
+                cfg.image_token_id = image;
+                cfg.glm_vision = Some(api::GlmVision { shape: shape.clone(), max_tokens: GLM_IMAGE_TOKENS });
+                marker = Some("<|begin_of_image|><|image|><|end_of_image|>");
+                self.say(format!("{}: vision projector loaded from {} in {:.1}s ({:.1} GB; at most {GLM_IMAGE_TOKENS} tokens a picture)", spec.name, p.display(), t.elapsed().as_secs_f64(), weights.size_bytes() as f64 / 1e9));
+                tower = Some(Arc::new(glm::GlmTower { shape, weights }));
+            } else {
+                self.say(format!("{}: its vision projector ({}) is not read: of the models whose experts stream from their file only GLM-5.3 Flash reads pictures here", spec.name, p.display()));
+            }
         }
 
         let (jobs, rx) = std::sync::mpsc::channel();
-        let mut e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
+        let mut e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent).with_glm_vision(tower);
         // VENDORED-LOCAL: GLM-5.3-Flash. Prompt states on disk, as DeepSeek has.
         //
         // This matters more here than it does there: MLA's attention is O(n) a
@@ -1369,7 +1399,7 @@ impl Models {
             jobs,
             thread,
             cfg: Arc::new(cfg),
-            flavour: Arc::new(Flavour::Gguf(tok)),
+            flavour: Arc::new(Flavour::Gguf(tok, marker)),
         })
     }
 }

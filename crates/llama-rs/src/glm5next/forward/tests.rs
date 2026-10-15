@@ -358,6 +358,43 @@ fn chunks_of_different_sizes_agree() {
     }
 }
 
+/// A picture's soft tokens stand where their tokens' embeddings would: rows equal
+/// to those tokens' own embeddings change nothing, and other rows do -- the gate on
+/// the splice's position arithmetic (a row landing one place off would show).
+#[test]
+fn spliced_rows_stand_in_for_their_tokens_embeddings() {
+    let sh = shape();
+    let o = weights(&sh);
+    let m = model(&sh, &o);
+    let tokens = [1u32, 4, 2, 7, 0, 3];
+    let e = sh.n_embd;
+    let row = |t: u32| m.tok_embd[t as usize * e..(t as usize + 1) * e].to_vec();
+
+    let mut plain = State::new(&sh).unwrap();
+    let want = forward_chunk(&sh, &m, &mut plain, &tokens).unwrap();
+
+    // positions 2 and 3 given their own tokens' rows
+    let own: Vec<f32> = [tokens[2], tokens[3]].iter().flat_map(|&t| row(t)).collect();
+    let mut st = State::new(&sh).unwrap();
+    let got = forward_chunk_spliced(&sh, &m, &mut st, &tokens, &[(2, &own)]).unwrap();
+    assert_eq!(got, want, "a token's own row spliced in changed the answer");
+
+    // another token's rows there
+    let other: Vec<f32> = [5u32, 6].iter().flat_map(|&t| row(t)).collect();
+    let mut st = State::new(&sh).unwrap();
+    let changed = forward_chunk_spliced(&sh, &m, &mut st, &tokens, &[(2, &other)]).unwrap();
+    assert_ne!(changed, want, "spliced rows were not used");
+    // ... which is what those tokens would have given in that place
+    let mut swapped = tokens;
+    (swapped[2], swapped[3]) = (5, 6);
+    let mut st = State::new(&sh).unwrap();
+    assert_eq!(changed, forward_chunk(&sh, &m, &mut st, &swapped).unwrap());
+
+    // rows past the chunk are refused
+    let mut st = State::new(&sh).unwrap();
+    assert!(forward_chunk_spliced(&sh, &m, &mut st, &tokens, &[(5, &other)]).is_err());
+}
+
 /// And a chunk of one is the one-token path.
 #[test]
 fn a_chunk_of_one_is_a_token() {

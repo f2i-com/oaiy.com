@@ -53,6 +53,8 @@ pub struct Config {
     pub qwen_vision: Option<llama_rs::MmProjConfig>,
     /// Gemma 4's pictures, where its vision projector is loaded.
     pub gemma_vision: Option<GemmaVision>,
+    /// GLM-5.3 Flash's pictures, where its vision projector is loaded.
+    pub glm_vision: Option<GlmVision>,
     pub image_token_id: u32,
     /// Whether an image may name a file on this machine (a path or file://
     /// URL); off unless the server only listens on loopback.
@@ -68,6 +70,14 @@ pub struct GemmaVision {
     pub max_soft_tokens: usize,
     pub open: u32,
     pub close: u32,
+}
+
+/// GLM-5.3 Flash's pictures: its tower's geometry (patch and merge, for sizing a picture) and the tokens a
+/// picture is at most.
+#[derive(Clone, Debug)]
+pub struct GlmVision {
+    pub shape: llama_rs::glm5next::vision::VisionShape,
+    pub max_tokens: usize,
 }
 
 pub struct Server {
@@ -402,6 +412,9 @@ impl Server {
         if let Some(gv) = &a.cfg.gemma_vision {
             return gemma_images(records, prompt, a.cfg.image_token_id, gv, self.local_images, a.cfg.max_seq).map_err(bad);
         }
+        if let Some(gv) = &a.cfg.glm_vision {
+            return glm_images(records, prompt, a.cfg.image_token_id, gv, self.local_images, a.cfg.max_seq).map_err(bad);
+        }
         let Some(vc) = &a.cfg.vision else {
             // (worded for a client that looks for "image" or "vision" to go on in text, as OAIY's Agent does)
             return Err(bad(format!("{} has no vision here (no vision projector is set for it, or the server runs with --no-vision); images are not supported", a.cfg.model_name)));
@@ -461,6 +474,33 @@ pub(crate) fn gemma_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv
         images.push(JobImage { start: ids.len(), prep: crate::engine::ImagePrep::Gemma { pixels, tokens }, hash: crate::disk::fnv(&bytes, 0) });
         ids.extend(std::iter::repeat_n(image_id, tokens));
         ids.push(gv.close);
+    }
+    if ids.len() >= max_seq {
+        return Err(format!("the prompt with its pictures ({} tokens) is past the context ({max_seq})", ids.len()));
+    }
+    Ok((ids, images))
+}
+
+/// GLM-5.3 Flash's pictures: each sized as its image processor sizes it (within `gv.max_tokens`), its `<|image|>` in
+/// `prompt` (`image_id`, between the `<|begin_of_image|>` and `<|end_of_image|>` its template writes) made a token
+/// an image token.
+pub(crate) fn glm_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv: &GlmVision, local: bool, max_seq: usize) -> Result<(Vec<u32>, Vec<JobImage>), String> {
+    let count = prompt.iter().filter(|&&t| t == image_id).count();
+    if count != records.len() {
+        return Err("the pictures' markers in the prompt are not one a picture".into());
+    }
+    let (mut ids, mut images, mut records) = (Vec::with_capacity(prompt.len()), Vec::new(), records.iter());
+    for id in prompt {
+        if id != image_id {
+            ids.push(id);
+            continue;
+        }
+        let i = images.len() + 1;
+        let bytes = vision::image_bytes(records.next().expect("a record a marker"), local).map_err(|e| format!("image {i}: {e}"))?;
+        let (pixels, width, height) = llama_rs::glm5next::vision::preprocess_bytes_within(&bytes, &gv.shape, gv.max_tokens).map_err(|e| format!("image {i}: {e}"))?;
+        let tokens = gv.shape.n_out_tokens(width / gv.shape.patch, height / gv.shape.patch);
+        images.push(JobImage { start: ids.len(), prep: crate::engine::ImagePrep::Glm { pixels, width, height, tokens }, hash: crate::disk::fnv(&bytes, 0) });
+        ids.extend(std::iter::repeat_n(image_id, tokens));
     }
     if ids.len() >= max_seq {
         return Err(format!("the prompt with its pictures ({} tokens) is past the context ({max_seq})", ids.len()));

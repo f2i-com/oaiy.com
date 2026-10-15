@@ -110,11 +110,29 @@ pub struct GlmEngine {
     /// Gemma 4's vision tower, where its projector is loaded, and the soft tokens of the last pictures it read (by
     /// their bytes' hash): a conversation sends its pictures again with each turn.
     vision: Option<llama_rs::MmProj>,
+    /// GLM-5.3 Flash's vision tower, where its projector is loaded.
+    glm_vision: Option<Arc<GlmTower>>,
     soft: std::collections::VecDeque<(u64, Arc<Vec<f32>>)>,
 }
 
 /// Pictures' soft tokens kept for the turns after.
 const SOFT_KEPT: usize = 4;
+
+/// GLM-5.3 Flash's vision tower (`glm5next` mmproj), its weights f32 on the host.
+pub struct GlmTower {
+    pub shape: llama_rs::glm5next::vision::VisionShape,
+    pub weights: llama_rs::glm5next::mmproj::VisionWeights,
+}
+
+impl GlmTower {
+    /// A picture's tokens (`[n, proj_dim]`) from its pixels as `glm5next::vision::preprocess_within` laid them out.
+    pub fn read(&self, pixels: &[f32], width: usize, height: usize) -> llama_rs::Result<Vec<f32>> {
+        use llama_rs::glm5next::vision;
+        let sh = &self.shape;
+        let rope = vision::MRope::for_grid(sh.d_head(), llama_rs::glm5next::mmproj::ROPE_THETA, width / sh.patch, height / sh.patch, sh.n_merge)?;
+        vision::encode_image(sh, &self.weights.view(), &rope, pixels, width, height)
+    }
+}
 
 /// A snapshot of the expert tiers' cumulative counters, for reporting deltas.
 #[derive(Default, Clone, Copy)]
@@ -189,8 +207,15 @@ impl GlmEngine {
             warn: log,
             log,
             vision: None,
+            glm_vision: None,
             soft: Default::default(),
         }
+    }
+
+    /// With GLM-5.3 Flash's vision tower: a job's pictures are read by it.
+    pub fn with_glm_vision(mut self, tower: Option<Arc<GlmTower>>) -> Self {
+        self.glm_vision = tower;
+        self
     }
 
     /// With Gemma 4's vision tower: a job's pictures are read by it.
@@ -345,6 +370,23 @@ impl GlmEngine {
                 out.push(Arc::clone(t));
                 continue;
             }
+            if let (Some(tower), crate::engine::ImagePrep::Glm { pixels, width, height, tokens }) = (&self.glm_vision, &image.prep) {
+                let t = std::time::Instant::now();
+                let soft = tower.read(pixels, *width, *height).map_err(|e| oaiy_engine::Error::Arg(format!("image {}: {e}", i + 1)))?;
+                if soft.len() != tokens * self.model.config().embedding_dim {
+                    return Err(oaiy_engine::Error::Arg(format!("image {}: the vision tower gave {} values, not {tokens} tokens", i + 1, soft.len())));
+                }
+                if self.log {
+                    eprintln!("  picture {} ({width}x{height}, {tokens} tokens) read in {:.2}s", i + 1, t.elapsed().as_secs_f64());
+                }
+                let soft = Arc::new(soft);
+                self.soft.push_back((image.hash, Arc::clone(&soft)));
+                if self.soft.len() > SOFT_KEPT {
+                    self.soft.pop_front();
+                }
+                out.push(soft);
+                continue;
+            }
             let (Some(llama_rs::MmProj::Gemma4V(mm)), crate::engine::ImagePrep::Gemma { pixels, tokens }) = (&self.vision, &image.prep) else {
                 return Err(oaiy_engine::Error::Arg("this model reads text only: no vision projector is loaded for it".into()));
             };
@@ -368,7 +410,7 @@ impl GlmEngine {
     }
 
     fn generate(&mut self, job: &Job) -> Result<()> {
-        if !job.images.is_empty() && self.vision.is_none() {
+        if !job.images.is_empty() && self.vision.is_none() && self.glm_vision.is_none() {
             return Err(oaiy_engine::Error::Arg("this model reads text only: no vision projector is loaded for it".into()));
         }
         if job.prompt.is_empty() {

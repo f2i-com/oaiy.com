@@ -266,10 +266,11 @@ impl Model {
     }
 
     /// VENDORED-LOCAL: [`Self::forward`] with `soft` rows (`(position in tokens, [n, d] values)`) in place of their
-    /// tokens' embeddings (a picture's soft tokens): Gemma 4's; None for a model that takes none.
+    /// tokens' embeddings (a picture's soft tokens): Gemma 4's and GLM-5.3 Flash's; None for a model that takes none.
     pub fn forward_spliced(&self, tokens: &[u32], soft: &[(usize, &[f32])], kv: &mut KvCache) -> Option<Tensor> {
         match self {
             Self::Gemma4(m) => Some(m.forward_spliced(tokens, soft, kv)),
+            Self::Glm5Next(m) => Some(m.forward_spliced(tokens, soft, kv).unwrap_or_else(|e| panic!("{e}"))),
             _ => None,
         }
     }

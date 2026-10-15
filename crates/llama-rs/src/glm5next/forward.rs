@@ -254,6 +254,20 @@ pub fn forward_chunk(
     state: &mut State,
     tokens: &[u32],
 ) -> Result<Vec<f32>> {
+    forward_chunk_spliced(sh, w, state, tokens, &[])
+}
+
+/// [`forward_chunk`] with `soft` rows in place of their tokens' embeddings: each
+/// `(at, rows)` is `rows.len() / n_embd` consecutive positions from `at` (within
+/// the chunk) whose streams open from those rows, as a picture's soft tokens from
+/// the vision tower (`vision::encode_image`) stand where its `<|image|>` tokens are.
+pub fn forward_chunk_spliced(
+    sh: &Shape,
+    w: &ModelW<'_>,
+    state: &mut State,
+    tokens: &[u32],
+    soft: &[(usize, &[f32])],
+) -> Result<Vec<f32>> {
     if hc::HC != sh.hc_count {
         return Err(LlamaError::Config(format!(
             "forward: hyper_connection.count is {} but this build fixes HC at {}",
@@ -284,8 +298,20 @@ pub fn forward_chunk(
 
     // One hyper-connection stream per token, seeded from its embedding exactly as
     // the one-token path seeds its own.
+    let mut rows: Vec<Option<&[f32]>> = vec![None; n];
+    for &(at, values) in soft {
+        if values.len() % n_embd != 0 || at + values.len() / n_embd > n {
+            return Err(LlamaError::Config(format!(
+                "forward: {} soft values at {at} are not whole {n_embd}-wide rows within the {n}-token chunk",
+                values.len()
+            )));
+        }
+        for (i, row) in values.chunks_exact(n_embd).enumerate() {
+            rows[at + i] = Some(row);
+        }
+    }
     let mut streams: Vec<Vec<f32>> = Vec::with_capacity(n);
-    for &token in tokens {
+    for (&token, row) in tokens.iter().zip(&rows) {
         let tok = token as usize;
         if tok >= sh.n_vocab {
             return Err(LlamaError::Config(format!(
@@ -293,7 +319,7 @@ pub fn forward_chunk(
                 sh.n_vocab
             )));
         }
-        streams.push(hc::init(&w.tok_embd[tok * n_embd..(tok + 1) * n_embd]));
+        streams.push(hc::init(row.unwrap_or(&w.tok_embd[tok * n_embd..(tok + 1) * n_embd])));
     }
 
     let mut cur = vec![0.0f32; n * n_embd];
