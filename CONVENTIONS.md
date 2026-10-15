@@ -60,6 +60,12 @@ notification-area icon. Win32 UI is outside std, so this crate depends on
 `windows-sys` (bindings only). Its `unsafe` is confined to `src/tray.rs`, and
 every block there carries a `SAFETY:` comment.
 
+`oaiy-mac-gpu` reads an Apple-silicon Mac's GPU load, memory in use and
+temperature for `oaiy-studio`'s hardware rows: macOS says them only through IOKit
+and CoreFoundation (the IORegistry and the SMC), C calls the studio may not make.
+It is std-only (the frameworks are the system's), its `unsafe` is those calls, and
+every block carries a `SAFETY:` comment; elsewhere it knows nothing.
+
 ## Diffusion compute boundary
 
 `oaiy-media` is a separate, opt-in Rust compute worker. It uses Candle core/nn

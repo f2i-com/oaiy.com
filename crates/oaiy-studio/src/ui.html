@@ -161,6 +161,7 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 /* the eGPU's: its memory and its load, each a meter with its numbers, and what it runs under them */
 .hw-row.card { row-gap: 7px; }
 .hw-row.card .label { grid-row: span 3; }
+.hw-row.card.two .label { grid-row: span 2; }
 .hw-row.card .doing { grid-column: 2 / -1; margin-top: -2px; }
 .meter.split { display: flex; }
 
@@ -443,7 +444,7 @@ dialog::backdrop { background: var(--backdrop); }
 }
 @media (max-width: 860px) {
   .hw-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
-  .hw-row.card .label { grid-row: auto; }
+  .hw-row.card .label, .hw-row.card.two .label { grid-row: auto; }
   .hw-row.card .doing { grid-column: 1 / -1; margin-top: 0; }
   .savebar { padding: 12px var(--pad); }
   .chat { height: calc(100dvh - 330px); }
@@ -1767,23 +1768,48 @@ function morph(box, want) {
   });
   had.slice(wanted.length).forEach(h => h.remove());
 }
+// A GPU whose memory and load are known, as two meters, each with its numbers (the load's with the temperature, where
+// it is known), and what it is doing under them: `doing` is [what, an aside].
+function meterRow(label, m) {
+  const pct = mb => Math.min(100, Math.max(0, mb / m.total * 100)).toFixed(1);
+  const [what, aside] = m.doing || [];
+  const line = [what && `<span>${what}</span>`, aside && `<span class="muted">${aside}</span>`].filter(Boolean).join(" ");
+  const temp = m.temp == null ? "" : ` · <span title="Temperature${m.tempOf ? ": " + m.tempOf : ""}"${m.temp >= 90 ? ' style="color:var(--bad)"' : ""}>${m.temp} °C</span>`;
+  return `<div class="hw-row card${line ? "" : " two"}">${label}
+    <div class="meter split" title="${m.memTitle}"><div style="width:${pct(m.used)}%;background:var(--gpu)"></div><div style="width:${pct(m.kept || 0)}%;background:var(--gpu);opacity:.35"></div></div>
+    <div class="num small">${gb(m.used)} / ${gb(m.total)} GB</div>
+    <div class="meter" title="${m.loadTitle}"><div style="width:${m.load ?? 0}%;background:var(--good)"></div></div>
+    <div class="num small">${m.load == null ? "–" : m.load + "%"} <span class="muted">load</span>${temp}</div>
+    ${line ? `<div class="doing small">${line}</div>` : ""}</div>`;
+}
 function renderHardware() {
   const hw = $("#hw"), rows = [];
   const ram = sys?.ram;
   for (const g of sys?.gpus || []) {
-    // What a GPU's memory holds is known of an NVIDIA card (nvidia-smi); a GPU whose memory is the computer's own
-    // (a Mac's) is as full as the RAM is; of the others only the size is known.
+    // What a GPU's memory holds is known of an NVIDIA card (nvidia-smi) and of a Mac's (its driver's: the memory it has
+    // in use, of the computer's it shares); of the others only the size is known, and a Mac's that did not say is as
+    // full as the RAM is.
     const known = g.memory_used_mb != null && g.memory_total_mb, shared = g.unified && ram?.total_mb;
     const pct = known ? g.memory_used_mb / g.memory_total_mb * 100 : shared ? (ram.total_mb - ram.available_mb) / ram.total_mb * 100 : 0;
     const roles = [];
     const resident = cfg && state?.llm?.resident ? cfg.llm.models.find(m => m.name === state.llm.resident) : null;
     if (cfg && state?.llm?.state === "ready" && modelGpus(resident).includes(g.index)) roles.push("LLM");
     if (cfg && cfg.media.device === g.index) roles.push("media");
+    const label = `<div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>`;
+    const does = roles.length ? "Runs " + roles.join(" and ") : "";
+    if (known && g.utilization != null) {
+      rows.push(meterRow(label, {used: g.memory_used_mb, total: g.memory_total_mb, load: g.utilization, temp: g.temperature,
+        tempOf: g.unified ? "the mean of the GPU's sensors" : "",
+        memTitle: g.unified ? `Memory the GPU has in use: ${gb(g.memory_used_mb)} GB of the computer's ${gb(g.memory_total_mb)} GB, which it shares` : `Video memory: ${gb(g.memory_used_mb)} GB of ${gb(g.memory_total_mb)} GB in use`,
+        loadTitle: g.unified ? "Load: how busy the GPU is, as its driver measures it (Activity Monitor's GPU history)" : "Load: the share of the time the GPU ran work",
+        doing: [does, g.unified ? (does ? "· shares the computer's memory" : "Shares the computer's memory") : ""]}));
+      continue;
+    }
     const size = g.unified ? `Shares the computer's ${g.memory_total_mb ? gb(g.memory_total_mb) + " GB" : "memory"}` : known ? `${gb(g.memory_used_mb)} / ${gb(g.memory_total_mb)} GB` : g.memory_total_mb ? `${gb(g.memory_total_mb)} GB` : "";
-    const does = roles.length ? "Runs " + roles.join(" and ") : g.utilization != null ? g.utilization + "% busy" : "";
+    const busy = does || (g.utilization != null ? g.utilization + "% busy" : "");
     rows.push(`<div class="hw-row"><div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>
       <div class="meter"${known || shared ? ` title="${pct.toFixed(0)}% used"` : ""}><div style="width:${pct}%;background:var(--gpu)"></div></div>
-      <div class="num small">${[size, does && `<span class="muted">${does}</span>`].filter(Boolean).join("<br>")}</div></div>`);
+      <div class="num small">${[size, busy && `<span class="muted">${busy}</span>`].filter(Boolean).join("<br>")}</div></div>`);
   }
   // A Mac's eGPU, which only tinygrad reaches. Its memory and load are said by the card's server while OAIY's engine
   // runs on it (the launcher's, each second); of tinygrad's own server only what it is doing is known.
@@ -1798,14 +1824,10 @@ function renderHardware() {
       : ["Not started", e.models?.length ? "starts on the first request" : "no model is set to it (Models)"];
     const label = `<div class="label">eGPU<small>${e.device === "AMD" ? "AMD" : "NVIDIA"} card, ${by}</small></div>`;
     if (u?.memory_total_mb) {
-      const used = u.memory_used_mb || 0, kept = u.memory_cached_mb || 0, total = u.memory_total_mb, load = u.load;
-      const pct = mb => Math.min(100, mb / total * 100).toFixed(1);
-      rows.push(`<div class="hw-row card">${label}
-        <div class="meter split" title="Video memory: ${gb(used)} GB of ${gb(total)} GB in use${kept >= 1024 ? `, and ${gb(kept)} GB of buffers let go kept for reuse (lighter)` : ""}"><div style="width:${pct(used)}%;background:var(--gpu)"></div><div style="width:${pct(kept)}%;background:var(--gpu);opacity:.35"></div></div>
-        <div class="num small">${gb(used)} / ${gb(total)} GB</div>
-        <div class="meter" title="Compute load: the share of the last second the card spent running kernels"><div style="width:${load ?? 0}%;background:var(--good)"></div></div>
-        <div class="num small">${load == null ? "–" : load + "%"} <span class="muted">load</span></div>
-        <div class="doing small"><span>${does[0]}</span>${does[1] ? ` <span class="muted">${does[1]}</span>` : ""}</div></div>`);
+      const used = u.memory_used_mb || 0, kept = u.memory_cached_mb || 0, total = u.memory_total_mb;
+      rows.push(meterRow(label, {used, kept, total, load: u.load, doing: does,
+        memTitle: `Video memory: ${gb(used)} GB of ${gb(total)} GB in use${kept >= 1024 ? `, and ${gb(kept)} GB of buffers let go kept for reuse (lighter)` : ""}`,
+        loadTitle: "Compute load: the share of the last second the card spent running kernels"}));
     } else {
       rows.push(`<div class="hw-row">${label}
         <div class="meter"><div style="width:${e.state === "ready" && !own ? 100 : 0}%;background:var(--gpu)"></div></div>
@@ -2687,7 +2709,7 @@ async function refreshSystem() { try { sys = await api("/api/system"); renderHar
   { let v = location.hash.slice(1).split(":")[0]; try { v ||= localStorage.getItem("studio-view"); } catch {} if (v && $("#v-" + v)) show(v); }
   window.addEventListener("hashchange", () => { const [v, t] = location.hash.slice(1).split(":"); if ($("#v-" + v)) show(v); if (v === "play" && t) $(`#v-play .ptabs button[data-tab=${t}]`)?.click(); });
   setInterval(refresh, 1500);
-  setInterval(() => { if ($("#v-overview").classList.contains("on") || $("#v-memory").classList.contains("on")) refreshSystem(); }, 3000);
+  setInterval(() => { if ($("#v-overview").classList.contains("on") || $("#v-memory").classList.contains("on")) refreshSystem(); }, 2000);
   setInterval(() => { if ($("#v-logs").classList.contains("on")) pollLogs(false); }, 1500);
   // Downloads: every second while one runs, else now and then (the rail's count).
   refreshDownloads("first");

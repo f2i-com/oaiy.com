@@ -18,3 +18,5 @@ path = "src/main.rs"
 oaiy-engine = { path = "../oaiy-engine" }
 # A program it starts gets the computer's environment, where OAIY runs from an AppImage (std-only too).
 oaiy-host-env = { path = "../oaiy-host-env" }
+# An Apple-silicon Mac's GPU load, memory in use and temperature (std-only; its `unsafe` is macOS's C calls).
+oaiy-mac-gpu = { path = "../oaiy-mac-gpu" }

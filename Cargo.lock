@@ -1544,6 +1544,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oaiy-mac-gpu"
+version = "0.1.0"
+
+[[package]]
 name = "oaiy-media"
 version = "0.1.0"
 dependencies = [
@@ -1583,6 +1587,7 @@ version = "0.1.0"
 dependencies = [
  "oaiy-engine",
  "oaiy-host-env",
+ "oaiy-mac-gpu",
 ]
 
 [[package]]

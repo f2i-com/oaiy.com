@@ -1,7 +1,8 @@
 //! What the machine has: GPUs (through `nvidia-smi`; without an NVIDIA driver,
 //! the display adapters the OS knows, AMD and Intel among them, and an
-//! Apple-silicon Mac's own, whose memory is the computer's), RAM, and a
-//! directory listing for the UI's file picker.
+//! Apple-silicon Mac's own, whose memory is the computer's, with its load,
+//! memory in use and temperature), RAM, and a directory listing for the UI's
+//! file picker.
 
 use oaiy_engine::json::Json;
 use std::path::{Path, PathBuf};
@@ -51,7 +52,8 @@ impl System {
     /// knows (an AMD or Intel GPU, which the engine runs on through WebGPU), with
     /// their `vendor` and total memory only: `index` is then their place in that
     /// list, not nvidia-smi's. A Mac's GPU also says `unified`: its memory is the
-    /// computer's. Empty when neither says.
+    /// computer's; its load, the memory it has in use and its temperature are read
+    /// as it is now (`oaiy_mac_gpu`). Empty when neither says.
     pub fn gpus(&self) -> Json {
         Self::cached(&self.gpus, GPU_TTL, || {
             let out = quiet("nvidia-smi")
@@ -63,7 +65,14 @@ impl System {
             }
             // Adapters do not come and go: asked once.
             static OTHERS: std::sync::OnceLock<Vec<Json>> = std::sync::OnceLock::new();
-            Json::Arr(OTHERS.get_or_init(other_gpus).clone())
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            let mut gpus = OTHERS.get_or_init(other_gpus).clone();
+            #[cfg(target_os = "macos")]
+            for g in gpus.iter_mut().filter(|g| g.get("vendor").and_then(Json::as_str) == Some("apple")) {
+                let gpu = oaiy_mac_gpu::now();
+                now(g, gpu.load, gpu.memory_in_use, gpu.temperature);
+            }
+            Json::Arr(gpus)
         })
     }
 
@@ -183,6 +192,25 @@ fn apple_gpu(chip: &str, total_mb: Option<u64>) -> Json {
             Json::Obj(fields)
         }
         other => other,
+    }
+}
+
+/// `g` (an adapter's) with what it is doing now, where that was read: its load (percent), the bytes of memory it has
+/// in use and its temperature (°C).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn now(g: &mut Json, load: Option<i64>, in_use: Option<i64>, temperature: Option<f64>) {
+    let Json::Obj(fields) = g else { return };
+    let said = [
+        ("utilization", load.map(|p| Json::Int(p.clamp(0, 100)))),
+        ("memory_used_mb", in_use.map(|b| Json::Int(b.max(0) >> 20))),
+        ("temperature", temperature.map(|t| Json::Int(t.round() as i64))),
+    ];
+    for (name, value) in said {
+        let Some(value) = value else { continue };
+        match fields.iter_mut().find(|(k, _)| k == name) {
+            Some((_, v)) => *v = value,
+            None => fields.push((name.into(), value)),
+        }
     }
 }
 
@@ -394,6 +422,26 @@ mod tests {
         assert_eq!(unknown.get("memory_total_mb"), Some(&Json::Null));
         // the others say nothing of it
         assert_eq!(adapter(0, "AMD Radeon(TM) Graphics", "amd", Some(2048)).get("unified"), None);
+    }
+
+    /// What the GPU is doing now goes into its entry where it was read (a Mac's: `oaiy_mac_gpu`), and what was not
+    /// read stays null.
+    #[test]
+    fn a_gpus_load_memory_in_use_and_temperature_are_its_own_now() {
+        let said = |g: &Json| {
+            let int = |k: &str| g.get(k).and_then(Json::as_i64);
+            (int("utilization"), int("memory_used_mb"), int("temperature"))
+        };
+        let mut g = apple_gpu("Apple M5 Pro", Some(24576));
+        now(&mut g, Some(61), Some(892_764_160), Some(34.65));
+        assert_eq!(said(&g), (Some(61), Some(851), Some(35)));
+        assert_eq!(g.get("unified").and_then(Json::as_bool), Some(true));
+        // read again, in place; a load past 100 is 100
+        now(&mut g, Some(140), None, None);
+        assert_eq!(said(&g), (Some(100), Some(851), Some(35)));
+        let mut quiet = apple_gpu("Apple M5 Pro", Some(24576));
+        now(&mut quiet, None, None, None);
+        assert_eq!((quiet.get("utilization"), quiet.get("temperature")), (Some(&Json::Null), Some(&Json::Null)));
     }
 
     #[test]

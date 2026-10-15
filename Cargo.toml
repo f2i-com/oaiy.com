@@ -27,6 +27,9 @@ members = [
     # The computer's own environment for a program OAIY starts from an AppImage (the studio's and OAIY Desktop's).
     # std-only.
     "crates/oaiy-host-env",
+    # What an Apple-silicon Mac's GPU is doing (load, memory in use, temperature) for the studio's page, through IOKit
+    # and the SMC: the C calls the studio may not make. std-only.
+    "crates/oaiy-mac-gpu",
     # The studio as a Windows notification-area app (windows-sys; the only
     # unsafe is its Win32 calls, in src/tray.rs).
     "crates/oaiy-studio-tray",
@@ -71,6 +74,7 @@ default-members = [
     "crates/oaiy-image",
     "crates/oaiy-studio",
     "crates/oaiy-host-env",
+    "crates/oaiy-mac-gpu",
     "crates/oaiy-studio-tray",
     "crates/gguf",
     "crates/ggml-quants",
