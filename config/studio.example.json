@@ -200,17 +200,17 @@
     },
     "video": {
       "enabled": true,
-      "default_model": "sulphur-2",
+      "default_model": "ltx-2.3",
       "memory": "auto",
       "ram_gb": 48,
       "vram_gb": null,
       "ffmpeg": "ffmpeg",
       "fps": 24,
       "models": {
-        "sulphur-2": {
-          "family": "sulphur-2",
-          "transformer": "models/sulphur_distil_bf16.safetensors",
-          "vae": "models/sulphur_distil_bf16.safetensors",
+        "ltx-2.3": {
+          "family": "ltx-2.3",
+          "transformer": "models/ltx-2.3-22b-distilled-1.1.safetensors",
+          "vae": "models/ltx-2.3-22b-distilled-1.1.safetensors",
           "text_encoder": "models/gemma_3_12B_it.safetensors",
           "tokenizer": "models/gemma-3/tokenizer.json",
           "enabled": true

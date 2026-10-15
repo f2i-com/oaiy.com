@@ -4,18 +4,18 @@
   "adapter": "E:\\deepseek\\oaiy\\models\\qwen-image-2.1\\viggle-v0.2.1-r128.safetensors",
   "default_weights": "safetensors",
   "enabled": true,
-  "default_model": "redqwen21",
+  "default_model": "qwen-image-2.1",
   "models": {
-    "redqwen21": {
-      "safetensors_transformer": "E:/stuff/REDQwen21.safetensors",
-      "text_encoder": "E:/stuff/qwen3vl_8b_w4a8.safetensors"
+    "qwen-image-2.1": {
+      "safetensors_transformer": "E:/models/qwen-image-2.1-bf16.safetensors",
+      "text_encoder": "E:/models/qwen3vl_8b_w4a8.safetensors"
     },
-    "realism": {
-      "safetensors_transformer": "E:/stuff/RealismQwen21.safetensors"
+    "qwen-image-2.1-fp16": {
+      "safetensors_transformer": "E:/models/qwen-image-2.1-fp16.safetensors"
     },
-    "realism-w4a8": {
-      "safetensors_transformer": "E:/stuff/RealismQwen21.safetensors",
-      "text_encoder": "E:/stuff/qwen3vl_8b_w4a8.safetensors"
+    "qwen-image-2.1-fp16-w4a8": {
+      "safetensors_transformer": "E:/models/qwen-image-2.1-fp16.safetensors",
+      "text_encoder": "E:/models/qwen3vl_8b_w4a8.safetensors"
     }
   }
 }

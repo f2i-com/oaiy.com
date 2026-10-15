@@ -1,7 +1,7 @@
 # Native LTX video
 
 The `oaiy-media` worker implements text-to-video and image-to-video with optional start/end images for distilled
-LTX 2.3, LTX 2.5 and Sulphur-2 checkpoints in Rust. Clips also get a
+LTX 2.3 and LTX 2.5 checkpoints (and fine-tunes of them) in Rust. Clips also get a
 soundtrack generated with the picture (see [Audio](#audio)). Gemma text encoding, the
 video transformer, eight-step Euler sampling and the convolutional VAE run inside the worker.
 FFmpeg only encodes the decoded pixels into an H.264 MP4; it does not run models.
@@ -73,16 +73,14 @@ The server and inference core remain std-only and forbid unsafe Rust.
 > the matrices into the host's memory first and `OAIY_WHOLE_WRITES` writes them
 > whole, as before.
 
-Sulphur-2 and LTX 2.5 have been validated end to end locally in both text-to-video
-and image-to-video modes. The original LTX 2.3 checkpoint is still downloading;
-Sulphur validates the shared LTX 2.3 architecture.
+LTX 2.3 (the original checkpoint and a distilled fine-tune of it) and LTX 2.5 have been
+validated end to end locally in both text-to-video and image-to-video modes.
 
 ## Models
 
 | Model | Diffusion weights | Text encoder | Decoder |
 |---|---|---|---|
 | [LTX 2.3](https://huggingface.co/Lightricks/LTX-2.3) | `ltx-2.3-22b-distilled-1.1.safetensors` | Gemma 3 12B BF16, `model.*` tensor layout, with `tokenizer.json` | Included in checkpoint |
-| [Sulphur-2](https://huggingface.co/SulphurAI/Sulphur-2-base) | `sulphur_distil_bf16.safetensors` | Same Gemma 3 encoder | Included in checkpoint |
 | [LTX 2.5](https://huggingface.co/Lightricks/LTX-2.5) | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, including its tokenizer | `vae/ltx-2.5-video-vae-conv-bf16.safetensors`, or a release's own diffusion-decoder VAE (WebGPU) |
 
 Use the complete distilled checkpoints, or a dev (not distilled) one with the
@@ -106,7 +104,7 @@ steps). The worker reads published safetensors directly, without conversion:
   ComfyUI Kitchen's `int8_tensorwise` weights with ConvRot (a `.comfy_quant`
   note saying `"convrot": true`) are rotated back after decoding, as Comfy does:
   each group of `convrot_groupsize` columns times the Hadamard matrix. Checkpoints
-  such as the LTX 2.5 Stubelius Remix INT8 (the distilled LoRA already merged in,
+  such as an INT8 LTX 2.5 fine-tune (the distilled LoRA already merged in,
   so it runs on the distilled 8-step schedule at CFG 1) load this way.
 - **Key names:** transformers saved with bare names (`patchify_proj.weight`
   rather than `model.diffusion_model.patchify_proj.weight`) load as they are.
@@ -223,7 +221,7 @@ GPU without a language controller.
 Coder-cli exposes `video_generate`:
 
 ```json
-{"action":"generate","model":"sulphur-2","prompt":"A red fox walks through a snowy forest. The camera slowly follows from the side. Snow falls softly.","width":512,"height":320,"frames":49,"fps":24,"seed":42,"memory":"auto","output_dir":"fox-videos"}
+{"action":"generate","model":"ltx-2.3","prompt":"A red fox walks through a snowy forest. The camera slowly follows from the side. Snow falls softly.","width":512,"height":320,"frames":49,"fps":24,"seed":42,"memory":"auto","output_dir":"fox-videos"}
 ```
 
 Use `action: "status"` for progress and completed file paths. Status includes
@@ -263,7 +261,7 @@ enabled with `--local-images on`; `--local-images off` disables it everywhere.
 For start/end guidance, add both paths:
 
 ```json
-{"action":"generate","model":"sulphur-2","prompt":"The fox walks through the snow.","image":"E:/images/start.png","end_image":"E:/images/end.png","width":512,"height":320,"frames":49}
+{"action":"generate","model":"ltx-2.3","prompt":"The fox walks through the snow.","image":"E:/images/start.png","end_image":"E:/images/end.png","width":512,"height":320,"frames":49}
 ```
 
 The end image goes through the same crop, resize and VAE encoding. Its clean
@@ -333,7 +331,7 @@ The transformer is released before VAE decoding. Ordinary clips decode with
 full spatial context; larger clips use overlapping tiles sized for available
 VRAM. RAM and SSD modes trade transfer time for lower VRAM requirements.
 
-Local Sulphur validation on an RTX 5090 generated a 512×320, 49-frame clip at
+Local LTX 2.3 validation on an RTX 5090 generated a 512×320, 49-frame clip at
 24 fps through the authenticated HTTP queue in approximately 37 seconds with
 GPU residency, 63 seconds with RAM offload, and 106 seconds with direct weight
 reads. The three modes produced byte-identical MP4 files for the same prompt
@@ -354,8 +352,8 @@ run took 20.4 seconds. Its first Gemma 4 prompt was substantially slower (about
 The worker also uses fused RMS normalization and reads only the prompt's Gemma
 vocabulary rows, avoiding the complete embedding-table upload on cache misses.
 
-A start/end Sulphur run at the same 512×320, 49-frame settings took 19.8 seconds
-with cached prompt conditioning. Both Sulphur and LTX 2.5 start/end clips were
+A start/end LTX 2.3 run at the same 512×320, 49-frame settings took 19.8 seconds
+with cached prompt conditioning. Both LTX 2.3 and LTX 2.5 start/end clips were
 checked locally for endpoint resemblance and motion between endpoints.
 A separate same-seed comparison took 16.1 seconds with only a starting image
 and 17.0 seconds with both images. Final-frame PSNR against the requested end
@@ -369,14 +367,14 @@ and excludes the separate Gemma/VAE readers.
 
 ## Audio
 
-LTX 2.3, LTX 2.5 and Sulphur are audio-video models: every transformer block
+LTX 2.3 and LTX 2.5 are audio-video models: every transformer block
 carries an audio stream (2048 wide, 32 heads of 64) next to the video stream. The two streams
 attend to each other both ways. When the request names the model's `audio_vae`,
 the worker generates both streams together:
 
 - **Text:** the `audio_aggregate_embed` projection and the transformer's
   `audio_embeddings_connector` produce the audio prompt context. For LTX 2.5
-  the projection is in the Gemma 4 file; for LTX 2.3 and Sulphur it is in the
+  the projection is in the Gemma 4 file; for LTX 2.3 (fine-tunes included) it is in the
   checkpoint. It is cached
   alongside the video context.
 - **Latent:** a noise latent of 25 frames per second of video, 128 wide,
@@ -391,7 +389,7 @@ Request fields:
 
 | Field | Meaning |
 |---|---|
-| `audio_vae` | A file with `audio_vae.*` plus `vocoder.*` (with its bandwidth extension). LTX 2.3 and Sulphur checkpoints carry these, so for them it is the checkpoint itself; LTX 2.5 ships it separately. The audio VAEs of all three are the same layout, and in the releases tested, the same weights. |
+| `audio_vae` | A file with `audio_vae.*` plus `vocoder.*` (with its bandwidth extension). LTX 2.3 checkpoints (fine-tunes included) carry these, so for them it is the checkpoint itself; LTX 2.5 ships it separately. The audio VAEs of both are the same layout, and in the releases tested, the same weights. |
 | `audio` | `true` or `false`. It defaults to on whenever `audio_vae` is given. |
 
 The result reports `audio`, `sample_rate` and `audio_seconds`.
@@ -488,19 +486,19 @@ request's `speech` this way (`lip_sync`: auto, voice to re-speak an
 `input_audio` with its `transcript`, or off). A saved voice's sample is the
 reference. Discovery marks such models `lip_sync: true`. Measured with face
 landmarks, the lips' best match with the loudness sat within one frame for
-LTX 2.5 and Sulphur on every seed tried; a merged LTX 2.5 fine-tune's varied by
+LTX 2.5 and a distilled LTX 2.3 fine-tune on every seed tried; a merged LTX 2.5 fine-tune's varied by
 a few frames.
 
 ### Start and end images
 
 Before encoding, a start or end image goes through one H.264 frame and back
 (FFmpeg, libx264 veryfast, 4:2:0) at `image_crf`: 33 for the LTX 2.3
-generation (Sulphur is one), 18 for LTX 2.5, 0 to skip, as the reference
+generation (its fine-tunes too), 18 for LTX 2.5, 0 to skip, as the reference
 pipelines do. The models were trained on video frames; a pristine still tended
-to stay still (Sulphur's faces did not move their mouths without it).
+to stay still (an LTX 2.3 fine-tune's faces did not move their mouths without it).
 
 On an RTX 5090, 5-second 768×512 talking-head clips took 166 s (LTX 2.3),
-147 s (LTX 2.5) and 119 s (Sulphur), speech included. A 3-second Sulphur clip
+147 s (LTX 2.5) and 119 s (a distilled LTX 2.3 fine-tune), speech included. A 3-second clip from that fine-tune
 following an MP3 took 66 s. The 121-frame limit caps a clip at about
 5 seconds; a longer soundtrack is cut to the clip.
 
@@ -530,7 +528,7 @@ with `has_watermark, has_logo, has_text_overlay` in the negative prompt and
 `cargo test --workspace` covers request constraints, trusted path selection,
 memory-budget limits and convolution boundary behavior. CUDA integration tests
 exercise the real convolutional VAE. Opt-in reference tests compare Gemma 3
-local/global attention and a Sulphur video block against the official PyTorch implementations;
+local/global attention and an LTX 2.3 video block against the official PyTorch implementations;
 the block test also requires identical RAM-cache and SSD-read results.
 PyTorch is only an offline verification tool, never an inference dependency.
 
@@ -588,7 +586,7 @@ For start/end conditioning, use `--end-frame`, which constructs the official
 keyframe conditioner and compares generated-token velocities and hidden states.
 Use separate output directories for different model checkpoints.
 The starting-image encoder reference uses the VAE script with `--encoder` and
-the Sulphur checkpoint.
+an LTX 2.3 checkpoint.
 Gemma 4 uses `tools/ltx/gemma4_reference.py --gemma <Gemma-4-file>` with both
 `--mode blocks` and `--mode features`. It requires Transformers 5.17 or newer;
 `--reference-deps` can point to an isolated installation for these offline checks.
@@ -597,12 +595,12 @@ The VAE reference uses `tools/ltx/vae_reference.py --vae <vae-file> --source
 and also accepts an isolated dependency directory through `--reference-deps`.
 
 On the local RTX 5090 checks, complete Gemma 3 features differed from the official
-BF16 encoder by about 0.7% relative RMS; the complete Sulphur video transformer
+BF16 encoder by about 0.7% relative RMS; the complete LTX 2.3 video transformer
 differed by 3.4% after fused normalization. The synthetic mixed-timestep
 image-conditioning check differed by 2.7% before the final projection and 7.8%
 in generated-token velocities; the first-frame VAE encoder differed by 0.97%.
 Start/end conditioning checks measured 7.9% generated-token velocity error for
-Sulphur and 11.2% for LTX 2.5 on synthetic inputs. LTX 2.5's first block differed
+LTX 2.3 and 11.2% for LTX 2.5 on synthetic inputs. LTX 2.5's first block differed
 by 0.18% and its final hidden state by 4.28%; the tests bound both early and
 accumulated differences rather than only checking final velocities.
 LTX 2.5 convolutional VAE pixels differed by 1.44%.

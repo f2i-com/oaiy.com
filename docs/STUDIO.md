@@ -197,7 +197,7 @@ headers, never its weights, and decides what it is:
 | Qwen Image `.safetensors` | `img_in.*` + `transformer_blocks.*` | an image model |
 | Diffusers folder | `model_index.json` `QwenImage*Pipeline` | an image model, or the *base* of one when it has no transformer weights |
 | SDXL `.safetensors` | `modelspec.architecture` or `conditioner.embedders.*` | an SDXL image model |
-| LTX 2.3 / 2.5, Sulphur | `__metadata__.model_version` and its `config` | a video model (2.3 files carry their own VAE) |
+| LTX 2.3 / 2.5 | `__metadata__.model_version` and its `config` | a video model (2.3 files carry their own VAE) |
 | LTX 2.5 ComfyUI folder | `diffusion_models/`, `text_encoders/`, `vae/` | a complete video model (with sound when its `vae/` holds the audio VAE) |
 | Qwen3-TTS folder | `config.json` `model_type: qwen3_tts` (VoiceDesign or Base) | half of a speech model; the other half completes it |
 | Breeze TTS 2 folder | `config.json` `model_type: breeze` | a speech model (research and non-commercial use only) |
@@ -209,7 +209,7 @@ headers, never its weights, and decides what it is:
 | `RealESRGAN_x4plus.pth` | its name | the picture tools' upscaler, and a 3D model's (read as tensors only) |
 | MiniMax-Music3 folder | `config.json` `model_type: minimax_music3` | a music model |
 | smaller music language model | GGUF `general.architecture: music3-lm` | the music model's `language_model` |
-| LTX audio VAE | `audio_vae.*` with `vocoder.bwe_generator.*` | the optional audio VAE of every video model that lacks one (LTX 2.3 and Sulphur checkpoints are their own) |
+| LTX audio VAE | `audio_vae.*` with `vocoder.bwe_generator.*` | the optional audio VAE of every video model that lacks one (LTX 2.3 checkpoints are their own) |
 | LoRA `.safetensors` | `lora_A`/`lora_B` keys | the turbo adapter of a Qwen Image model |
 | Text encoders | vocabulary size (Qwen3-VL ~152k, Gemma 262k) or `gemma_config` | the encoder of an image or video model |
 | `tokenizer.json` | CLIP or Gemma special tokens | the tokenizer of an SDXL or LTX 2.3 model |
@@ -271,7 +271,7 @@ mode and caps. The worker applies the setting per block:
 - **SDXL**: the UNet's skip connections make block streaming awkward, so SDXL
   stages by component. The CLIP encoders, then the UNet, then the VAE each hold
   VRAM only while they run, with host copies kept up to the RAM cap.
-- **LTX / Sulphur video**: the existing per-block residency
+- **LTX video**: the existing per-block residency
   ([LTX_VIDEO.md](LTX_VIDEO.md)).
 
 Residency never changes the result (`tools/qwen-image/residency_parity.py`
@@ -534,7 +534,7 @@ sections are:
     `checkpoint`, `tokenizer`, `steps`, `cfg`, `negative_prompt`, `clip_skip`),
     optional `memory`/`ram_gb`/`vram_gb`, `width`, `height`, `enabled`.
   - `video`: the same residency keys, `ffmpeg`, `fps`, and `models`, each with
-    `family` (`ltx-2.3` | `ltx-2.5` | `sulphur-2`), `transformer`, `vae`,
+    `family` (`ltx-2.3` | `ltx-2.5`), `transformer`, `vae`,
     `text_encoder` and `tokenizer` (not for 2.5).
 
 ## What the language model runs on
@@ -572,7 +572,7 @@ On two RTX 5090s and 192 GB RAM, with the studio isolated on GPU 1 and its own p
   32 blocks and 36 encoder layers in RAM), 44 s including cold loads.
 - Chat through the gateway: the first request started `oaiy-llm-server`
   (Qwen3.8 27B Q4 GGUF, loaded in 24 s) and streamed the reply.
-- `POST /v1/videos` (Sulphur 2, 1 s at 512×320) while that LLM held GPU 1: the
+- `POST /v1/videos` (LTX 2.3, 1 s at 512×320) while that LLM held GPU 1: the
   studio stopped the LLM, rendered the clip in 108 s, and restarted the LLM. A chat
   request sent mid-render waited 123 s and was then answered. `…/content` and
   `?variant=thumbnail` served the MP4 and PNG.

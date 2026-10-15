@@ -14,7 +14,7 @@ To select a custom safetensors checkpoint through the server or agent tool,
 set the optional `safetensors_transformer` in the local image configuration:
 
 ```json
-"safetensors_transformer": "E:/stuff/REDQwen21.safetensors"
+"safetensors_transformer": "E:/models/qwen-image-2.1-bf16.safetensors"
 ```
 
 Then request `"weights":"safetensors"` with `image_generate` or the HTTP API.
@@ -24,14 +24,14 @@ original `base/transformer` behavior. The `gguf` choice still uses `transformer`
 Requests cannot override these server-owned checkpoint paths. The standalone
 worker accepts the file directly as its existing `transformer` argument.
 
-The local REDQwen21 checkpoint contains 297 BF16 tensors, with exactly the same
+The local BF16 Qwen Image 2.1 checkpoint tested contains 297 BF16 tensors, with exactly the same
 names and shapes as the base Qwen Image 2.1 transformer. A six-step Viggle turbo
 test generated two 768×768 images at about 2.2 seconds each for sampling and
 decoding. The first batch took 61 seconds including model loading and prompt
 encoding; these are local measurements, not guaranteed latency or quality for
 every fine-tune. No checkpoint conversion or copy is needed.
 Standard 40-step sampling and a six-step reference-image edit also passed
-locally. The authenticated edit request selected REDQwen21 via the server's
+locally. The authenticated edit request selected that checkpoint via the server's
 safetensors option, and the saved manifest records the exact checkpoint path.
 
 ## Build and configuration

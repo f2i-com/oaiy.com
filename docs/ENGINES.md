@@ -80,7 +80,7 @@ Every token is a small, well-planned job:
   encoders, DPM++ 2M Karras, negative prompts and queued batches. See
   [SDXL setup and checkpoint settings](SDXL.md).
 
-- **Native Rust LTX video inference.** Distilled LTX 2.3, LTX 2.5 and Sulphur-2,
+- **Native Rust LTX video inference.** Distilled LTX 2.3 and LTX 2.5,
   with a shared media queue, agent tool, RAM offloading and direct SSD weight
   streaming. See [video configuration and current limits](LTX_VIDEO.md).
 

@@ -13,7 +13,7 @@ Model weights stay at their existing paths; nothing is copied or converted.
 
 Paths inside these files may be absolute or relative to the catalog/manifest.
 The files are data, not executable plugins. Supported architectures remain
-Qwen Image 2.1 and distilled LTX 2.3/2.5/Sulphur. Adding a different architecture's
+Qwen Image 2.1 and distilled LTX 2.3/2.5. Adding a different architecture's
 weights does not implement that architecture.
 
 An absent, invalid or `"enabled":false` image/video manifest disables that
@@ -27,10 +27,10 @@ controller-file changes when it next starts/reuses its daemon; media-file change
 do not restart the daemon or reload the language model.
 
 `image.json` uses `default_weights` (`gguf` or `safetensors`). The local default
-is `safetensors`, pointing to `E:/stuff/REDQwen21.safetensors` through
+is `safetensors`, pointing to `E:/models/qwen-image-2.1-bf16.safetensors` through
 `safetensors_transformer`; six-step turbo is unchanged. `video.json` uses
-`default_model`; the local default is `sulphur-2`, pointing to
-`sulphur_distil_bf16.safetensors` and using eight steps. Requests can still select
+`default_model`; the local default is `ltx-2.3`, pointing to
+`ltx-2.3-distilled.safetensors` and using eight steps. Requests can still select
 another configured option explicitly. The legacy file defaults remain GGUF and
 LTX 2.3 when no default is configured.
 
@@ -57,26 +57,26 @@ The processor/tokenizer and architecture config still come from `base`.
   "base": "D:/Qwen-Image-2.1",
   "adapter": "../models/qwen-image-2.1/viggle-v0.2.1-r128.safetensors",
   "default_weights": "safetensors",
-  "default_model": "redqwen21",
+  "default_model": "qwen-image-2.1",
   "models": {
-    "redqwen21": {
-      "safetensors_transformer": "E:/stuff/REDQwen21.safetensors",
-      "text_encoder": "E:/stuff/qwen3vl_8b_w4a8.safetensors"
+    "qwen-image-2.1": {
+      "safetensors_transformer": "E:/models/qwen-image-2.1-bf16.safetensors",
+      "text_encoder": "E:/models/qwen3vl_8b_w4a8.safetensors"
     },
-    "realism": {"safetensors_transformer": "E:/stuff/RealismQwen21.safetensors"},
-    "realism-w4a8": {
-      "safetensors_transformer": "E:/stuff/RealismQwen21.safetensors",
-      "text_encoder": "E:/stuff/qwen3vl_8b_w4a8.safetensors"
+    "qwen-image-2.1-fp16": {"safetensors_transformer": "E:/models/qwen-image-2.1-fp16.safetensors"},
+    "qwen-image-2.1-fp16-w4a8": {
+      "safetensors_transformer": "E:/models/qwen-image-2.1-fp16.safetensors",
+      "text_encoder": "E:/models/qwen3vl_8b_w4a8.safetensors"
     }
   }
 }
 ```
 
 Use `image_generate` or `POST /v1/images/generations` with
-`{"model":"realism","prompt":"A red panda on a mossy log"}`.
-Omitting `model` uses REDQwen21 with the W4A8 encoder. Remove its `text_encoder`
-override to use the original base encoder. `realism` uses that
-original encoder; `realism-w4a8` selects the quantized encoder. Requests select trusted names; they cannot
+`{"model":"qwen-image-2.1-fp16","prompt":"A red panda on a mossy log"}`.
+Omitting `model` uses the BF16 checkpoint with the W4A8 encoder. Remove its `text_encoder`
+override to use the original base encoder. `qwen-image-2.1-fp16` uses that
+original encoder; `qwen-image-2.1-fp16-w4a8` selects the quantized encoder. Requests select trusted names; they cannot
 supply checkpoint/encoder paths. Status lists named models and readiness.
 Entries can be disabled with `enabled:false`. A flat legacy image manifest
 still works. Reference images remain optional: zero for text-to-image, up to
@@ -84,9 +84,9 @@ three for editing/composition. The selected encoder is used for both text and
 reference-image conditioning. Output manifests record the actual checkpoint,
 encoder and model name.
 
-The realism checkpoint is FP16 with fused gate/up MLP matrices. The loader reads
+The FP16 checkpoint (a ComfyUI export) has fused gate/up MLP matrices. The loader reads
 the two halves in place and applies turbo adapters using their original logical
-layer names. REDQwen21 is BF16 with separate matrices; both use six-step turbo.
+layer names. The BF16 checkpoint has separate matrices; both use six-step turbo.
 
 The optional encoder contains Comfy Kitchen `asym_w4a8_int8` matrices with
 16-element FP8 scale groups, codebooks and ConvRot, plus rotated per-row INT8
