@@ -434,7 +434,8 @@ impl Kept {
 /// Where a job's reference images are seen from: its `vision` named, else its text encoder (the checkpoint's folder,
 /// whose `model.visual` is the vision tower), else, for a text encoder that is a GGUF of the language model alone (Qwen's
 /// `Qwen3VL-8B-Instruct-Q4_K_M.gguf`), an mmproj GGUF beside it or beside the file a link to it names (Qwen's
-/// `mmproj-Qwen3VL-8B-Instruct-F16.gguf`, the first by name where there are more).
+/// `mmproj-Qwen3VL-8B-Instruct-F16.gguf`, the first by name where there are more), else the base checkpoint's own
+/// text encoder where its weights are there (Qwen Image's release: Qwen3-VL whole, its tower in `model.visual`).
 fn vision_root(r: &Request) -> Result<PathBuf> {
     if let Some(v) = &r.vision {
         return Ok(v.clone());
@@ -452,12 +453,18 @@ fn vision_root(r: &Request) -> Result<PathBuf> {
         .filter(|p| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.to_ascii_lowercase().starts_with("mmproj") && f.to_ascii_lowercase().ends_with(".gguf")))
         .collect();
     found.sort();
-    found.into_iter().next().ok_or_else(|| {
-        candle_core::Error::Msg(format!(
-            "a reference image needs Qwen3-VL's vision tower, which the text encoder {} (a GGUF of its language model) has not: put Qwen's mmproj-Qwen3VL-8B-Instruct-F16.gguf (Qwen/Qwen3-VL-8B-Instruct-GGUF) beside it, or name it as the model's vision",
-            text.display()
-        ))
-    })
+    if let Some(mmproj) = found.into_iter().next() {
+        return Ok(mmproj);
+    }
+    let own = r.base.join("text_encoder");
+    if crate::weights::Weights::open(&own).is_ok_and(|w| w.has("model.visual.patch_embed.proj.bias")) {
+        return Ok(own);
+    }
+    Err(candle_core::Error::Msg(format!(
+        "a reference image needs Qwen3-VL's vision tower, which the text encoder {} (a GGUF of its language model) has not, nor has the base's {}: put Qwen's mmproj-Qwen3VL-8B-Instruct-F16.gguf (Qwen/Qwen3-VL-8B-Instruct-GGUF) beside it, or name as the model's vision that file or a Qwen3-VL checkpoint's folder (Qwen Image's own text_encoder, with its model.visual weights)",
+        text.display(),
+        own.display()
+    )))
 }
 
 /// OAIY_MEDIA_MEMORY: how long `what` took since `began` said.
@@ -936,4 +943,45 @@ fn seeds_are_repeatable_and_distinct() {
     assert_eq!(noise(7, 13), noise(7, 13));
     assert_ne!(noise(7, 13), noise(8, 13));
     assert!(noise(0, 10000).iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn a_gguf_text_encoder_sees_through_the_base_checkpoints_tower() {
+    // (the temp folder as the search finds it: a Mac's /var is /private/var)
+    let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("oaiy-image-vision-{}", std::process::id()));
+    let (base, models) = (dir.join("base"), dir.join("models"));
+    std::fs::create_dir_all(base.join("text_encoder")).unwrap();
+    std::fs::create_dir_all(&models).unwrap();
+    // a GGUF of the language model alone (never read: it is not one), nothing beside it
+    let encoder = models.join("encoder.gguf");
+    std::fs::write(&encoder, b"not read").unwrap();
+    std::fs::write(models.join("transformer.gguf"), b"not read").unwrap();
+    let request = |base: &Path| {
+        let j = Json::obj([
+            ("prompt", Json::str("a lighthouse")),
+            ("base", Json::str(base.to_string_lossy())),
+            ("transformer", Json::str(models.join("transformer.gguf").to_string_lossy())),
+            ("text_encoder", Json::str(encoder.to_string_lossy())),
+            ("output_dir", Json::str(dir.join("out").to_string_lossy())),
+        ]);
+        Request::parse(&j).unwrap()
+    };
+    // a base whose text encoder is its config alone (the catalog's): nowhere to see from, and the error says where
+    std::fs::write(base.join("text_encoder/config.json"), b"{}").unwrap();
+    let said = vision_root(&request(&base)).unwrap_err().to_string();
+    assert!(said.contains("mmproj-Qwen3VL-8B-Instruct-F16.gguf") && said.contains("Qwen3-VL checkpoint's folder"), "{said}");
+    // the release's text encoder whole: its tower is the vision
+    let header = r#"{"model.visual.patch_embed.proj.bias":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header.as_bytes());
+    bytes.extend(0f32.to_le_bytes());
+    std::fs::write(base.join("text_encoder/model.safetensors"), bytes).unwrap();
+    assert_eq!(vision_root(&request(&base)).unwrap(), base.join("text_encoder"));
+    // an mmproj beside the GGUF comes first, and a named vision before either
+    std::fs::write(models.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf"), b"").unwrap();
+    assert_eq!(vision_root(&request(&base)).unwrap(), models.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf"));
+    let mut named = request(&base);
+    named.vision = Some(dir.join("elsewhere"));
+    assert_eq!(vision_root(&named).unwrap(), dir.join("elsewhere"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
