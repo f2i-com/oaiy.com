@@ -186,7 +186,16 @@ fn video_follows_a_soundtrack_or_speech() {
     assert!(!str_or(refine, "transformer", "").ends_with("dev.safetensors"));
     let (fast, ..) = video_request(&two, root, &out, &body(&wav), false).unwrap();
     assert!(fast.get("guidance").is_none() && fast.get("refine").is_none(), "auto: one distilled pass");
-    assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","pipeline":"two_stage"}"#), false).unwrap_err().contains("dev_transformer"));
+    assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","pipeline":"two_stage"}"#), false).unwrap_err().contains("spatial_upscaler"));
+    // With the upsampler alone: the distilled transformer does both stages (the reference's distilled pipeline).
+    let distilled = cfg("", r#","spatial_upscaler":"up.safetensors""#);
+    let (r, _, size, _) = video_request(&distilled, root, &out, &body(r#"{"prompt":"x","pipeline":"two_stage","size":"1000x560","sampler":"euler"}"#), false).unwrap();
+    assert_eq!(size, "1024x576");
+    assert!(r.get("guidance").is_none());
+    let refine = r.get("refine").unwrap();
+    assert_eq!(str_or(refine, "transformer", "a"), str_or(&r, "transformer", "b"), "the same weights refine");
+    assert_eq!(str_or(&r, "sampler", ""), "euler");
+    assert!(video_request(&distilled, root, &out, &body(r#"{"prompt":"x","sampler":"heun"}"#), false).unwrap_err().contains("sampler"));
     // Lip-synced speech with the model's ID-LoRA: the saved voice's sample is the reference.
     let mut id = cfg("", r#","audio_vae":"s.safetensors","id_lora":"id.safetensors""#);
     let Json::Obj(top) = &mut id else { unreachable!() };

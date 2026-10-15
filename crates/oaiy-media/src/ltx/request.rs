@@ -45,10 +45,11 @@ impl Guidance {
     }
 }
 
-/// The reference's second stage (its two-stage pipelines): after guided
-/// sampling at half the size, the latent is doubled by `upsampler` and
-/// refined by the distilled `transformer` over the last three steps of its
-/// schedule, with the soundtrack held as in stage one and no guidance.
+/// The reference's second stage (its two-stage pipelines): after sampling at
+/// half the size (guided with a dev transformer, or distilled), the latent is
+/// doubled by `upsampler` and refined by the distilled `transformer` over the
+/// last three steps of its schedule, with no guidance. The same transformer as
+/// stage one's is the reference's distilled pipeline.
 #[derive(Clone, Debug)]
 pub struct Refine {
     pub transformer: PathBuf,
@@ -99,8 +100,11 @@ pub struct Request {
     pub negative_prompt: Option<String>,
     /// NAG's (scale, tau, alpha).
     pub nag: (f64, f64, f64),
-    /// With `guidance`: render at half size, then upsample and refine.
+    /// Render at half size, then upsample and refine.
     pub refine: Option<Refine>,
+    /// How a step moves the latent: "euler", "ancestral" (Euler ancestral, eta 1), or "auto": ancestral for LTX 2.5's
+    /// distilled sampling (the reference's since its 2.5 release, on both stages), Euler otherwise.
+    pub sampler: String,
     /// A LoRA added to the transformer, and its strength.
     pub lora: Option<(PathBuf, f64)>,
     /// ID-LoRA: a clip of the speaker's voice. The clip's speech (the words in
@@ -141,6 +145,16 @@ pub struct Request {
     pub webgpu: bool,
 }
 impl Request {
+    /// Whether its steps are Euler ancestral ones (`sampler`): by itself, LTX 2.5's distilled sampling (not a lip-synced
+    /// voice's, kept as it was validated).
+    pub fn ancestral(&self) -> bool {
+        match self.sampler.as_str() {
+            "ancestral" => true,
+            "euler" => false,
+            _ => self.model == "ltx-2.5" && self.guidance.is_none() && self.reference_voice.is_none() && !self.identity,
+        }
+    }
+
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
         let s = |k: &str| {
             j.get(k)
@@ -238,6 +252,11 @@ impl Request {
                     Some(Refine { transformer: path("transformer")?, upsampler: path("upsampler")? })
                 }
             },
+            sampler: match j.get("sampler") {
+                None | Some(Json::Null) => "auto",
+                Some(v) => v.as_str().filter(|s| ["auto", "euler", "ancestral"].contains(s)).ok_or("sampler must be auto, euler or ancestral")?,
+            }
+            .into(),
             frames_from_audio: j.get("frames").is_none() && (j.get("audio_file").is_some_and(|v| !matches!(v, Json::Null)) || j.get("speech").is_some_and(|v| !matches!(v, Json::Null))),
             output: s("output_dir")?.into(),
             prompt: s("prompt")?,
@@ -354,10 +373,7 @@ impl Request {
         if self.webgpu {
             // (a clip's own sound runs there, the two streams denoised together, and a given soundtrack is followed:
             // the audio stream held as it was given while the picture's is denoised beside it)
-            let unsupported = [
-                (self.reference_voice.is_some() || self.identity, "a reference voice"),
-                (self.refine.is_some(), "two-stage refinement"),
-            ];
+            let unsupported = [(self.reference_voice.is_some() || self.identity, "a reference voice")];
             if let Some((_, what)) = unsupported.iter().find(|(on, _)| *on) {
                 return Err(format!("WebGPU video does not support {what} yet"));
             }

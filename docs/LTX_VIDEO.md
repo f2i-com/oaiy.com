@@ -110,15 +110,28 @@ The worker does not interpret GGUF video weights, and does not run the LTX 2.5
 diffusion-decoder VAE (`CausalDiffusionVAE`, with `decoder.diff_blocks.*`);
 the conv VAE decodes the same latents.
 
-Clips render in one distilled pass by default. `guidance` (with a dev
-transformer) and `refine` (the distilled transformer and a x2 spatial latent
-upsampler) run the reference's two-stage pipeline instead: guided sampling at
-half the size (30 steps; CFG 3 with the reference's negative prompt, STG on
-one block, rescale 0.7, x0-space), the latent doubled, then three distilled
-steps from sigma 0.909. In Studio a model's `dev_transformer` and
-`spatial_upscaler` enable it and a request asks with `pipeline: "two_stage"`.
-It did not make mouths follow a soundtrack measurably better and takes about
-four times as long.
+Clips render in one distilled pass by default. `refine` (the distilled
+transformer and a x2 spatial latent upsampler) runs one of the reference's
+two-stage pipelines instead, on WebGPU as on the CPU: half the size first, the
+latent doubled, then three distilled steps from sigma 0.909 at the full size
+(the start and end images encoded again at that size; the sound noised and
+refined beside the picture, a given soundtrack held as given). With `guidance`
+(and a dev transformer) the first stage is guided sampling (30 steps; CFG 3
+with the reference's negative prompt, STG on one block, rescale 0.7,
+x0-space); without, it is the distilled transformer's eight steps, and the
+refine stage runs on the model already loaded where `refine.transformer` is
+the same file (the reference's distilled pipeline). In Studio a model's
+`spatial_upscaler` enables it (with its `dev_transformer`, the guided first
+stage) and a request asks with `pipeline: "two_stage"`. The guided one did
+not make mouths follow a soundtrack measurably better and takes about four
+times as long; the distilled one is about as fast as one pass (a 768x512,
+49-frame LTX 2.5 clip on an RTX 4090: 13.7 s of steps against 12.8).
+
+`sampler` says how each step moves the latent: `euler`, `ancestral` (Euler
+ancestral, eta 1: a step to sigma_down = next^2 / sigma, then noised back up
+to the next sigma), or `auto`, the reference's choice since its 2.5 release:
+ancestral for LTX 2.5's distilled sampling, on both stages, and Euler for
+guided sampling and LTX 2.3. Clips of a seed made before differ.
 
 For example, the merged
 LTX 2.5 v1.1 fine-tune

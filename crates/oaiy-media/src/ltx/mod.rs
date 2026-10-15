@@ -81,6 +81,31 @@ const MAX_REFERENCE_SECONDS: f64 = 10.;
 /// Stage two's schedule: the distilled one from 0.909375.
 const REFINE_SIGMAS: [f64; 4] = [0.909375, 0.725, 0.421875, 0.];
 
+/// `x` (at `sigma`) moved to `next` by its velocity `v`: an Euler step, or with `noise` an Euler ancestral one (eta 1,
+/// the reference's `EulerAncestralDiffusionStep`): a step to sigma_down = next² / sigma, then noised back up to `next`,
+/// the signal scaled by alpha_next / alpha_down so that the step stays variance-preserving (alpha = 1 - sigma, the
+/// rectified flow's). The last step, to 0, is the denoised prediction either way.
+fn step_to(x: &Tensor, v: &Tensor, sigma: f64, next: f64, noise: Option<&Tensor>) -> Result<Tensor> {
+    let v = v.to_dtype(DType::F32)?;
+    let Some(noise) = noise.filter(|_| next > 0.) else {
+        return x + (v * (next - sigma))?;
+    };
+    let denoised = (x - (v * sigma)?)?;
+    let down = next * next / sigma;
+    let ratio = down / sigma;
+    let stepped = ((x * ratio)? + (denoised * (1. - ratio))?)?;
+    let (alpha_next, alpha_down) = (1. - next, 1. - down);
+    let renoise = (next * next - down * down * alpha_next * alpha_next / (alpha_down * alpha_down)).max(0.).sqrt();
+    (stepped * (alpha_next / alpha_down))? + (noise * renoise)?
+}
+
+/// An Euler ancestral step's fresh noise, shaped as `like`: drawn from the seed apart from every other draw of it, by
+/// the stage (0 or 1), the step, and the stream (video or sound).
+fn ancestral_noise(r: &Request, stage: u64, step: usize, sound: bool, like: &Tensor) -> Result<Tensor> {
+    let seed = r.seed.wrapping_add(ANCESTRAL_SEED_OFFSET).wrapping_add((stage << 32) | (u64::from(sound) << 16) | step as u64);
+    Tensor::from_vec(crate::pipeline::noise(seed, like.elem_count()), like.shape(), like.device())
+}
+
 /// The prompt's contexts for the refining transformer: from the prompt cache
 /// (keyed by that transformer), or Gemma and its connectors.
 fn refine_contexts(
@@ -217,7 +242,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // (a WebGPU clip's images encoded on the CPU, whose matmuls take F32, not BF16)
     let vae_dtype = if r.webgpu { DType::F32 } else { DType::BF16 };
     // Two stages: the first renders at half the size.
-    let two_stage = r.guidance.is_some() && r.refine.is_some();
+    let two_stage = r.refine.is_some();
     let stage_size = if two_stage { (r.width / 2, r.height / 2) } else { (r.width, r.height) };
     let encode_endpoints = |size: (usize, usize), report: &mut dyn FnMut(Json)| -> Result<(Option<Tensor>, Option<Tensor>)> {
         if r.image.is_none() && r.end_image.is_none() {
@@ -625,11 +650,13 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             let delta = (&cond - isolated.to_dtype(DType::F32)?)?;
             velocity = (cond + (delta * (modality - 1.0))?)?;
         }
-        let dt = sigmas[step + 1] - sigma;
-        latent = (latent + (velocity.to_dtype(DType::F32)? * dt)?)?;
+        let next = sigmas[step + 1];
+        let noise = r.ancestral().then(|| ancestral_noise(r, 0, step, false, &latent)).transpose()?;
+        latent = step_to(&latent, &velocity, sigma, next, noise.as_ref())?;
         latent = condition_endpoints(latent, starting_latent.as_ref(), ending_latent.as_ref())?;
         if let (Some(a), Some(v), false) = (audio_latent.as_mut(), audio_velocity, frozen_audio) {
-            *a = (&*a + (v.to_dtype(DType::F32)? * dt)?)?;
+            let noise = r.ancestral().then(|| ancestral_noise(r, 0, step, true, a)).transpose()?;
+            *a = step_to(a, &v, sigma, next, noise.as_ref())?;
             // The reference voice stays as it was given.
             if let Some(voice) = &reference_voice {
                 *a = Tensor::cat(&[voice, &a.narrow(1, ref_tokens, audio_frames)?], 1)?;
@@ -642,6 +669,88 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     }
     // Appended end-keyframe tokens guide attention but are not part of the decoded clip.
     latent = latent.narrow(1, 0, f * h * w)?.contiguous()?;
+    // Two stages on WebGPU: the latent doubled by the upsampler, then refined over the distilled schedule's last three
+    // steps by the distilled transformer: stage one's model again where it is that file (the reference's distilled
+    // pipeline), else its own, loaded once stage one's has let go of the GPU. The endpoints are encoded again at the
+    // full size; the sound is noised and refined beside the picture as the reference's distilled pipeline does it, a
+    // given soundtrack held clean as given (and stage one's sound kept as it is where the GPU has no room for both
+    // streams at the full size).
+    #[cfg(feature = "webgpu")]
+    if let (true, Some(refine), true) = (two_stage, r.refine.clone(), r.webgpu) {
+        report(event("upsampling_latent", 0, 1));
+        let stats = vae::PerChannelStatistics::load_file(&r.vae, &dev)?;
+        let up = upsampler::Upsampler::load(&refine.upsampler, &dev)?;
+        let x = latent.reshape((1, f, h, w, 128))?.permute((0, 4, 1, 2, 3))?.contiguous()?;
+        let x = stats.normalize(&up.forward(&stats.un_normalize(&x)?)?)?;
+        drop(up);
+        report(event("upsampling_latent", 1, 1));
+        h *= 2;
+        w *= 2;
+        let upscaled = x.permute((0, 2, 3, 4, 1))?.contiguous()?.reshape((1, f * h * w, 128))?;
+        let (start, end) = if r.image.is_some() || r.end_image.is_some() { webgpu_endpoints(r, (r.width, r.height), &dev, &mut report)? } else { (None, None) };
+        let (refine_context, refine_audio_context) = if refine.transformer == r.transformer {
+            (context.clone(), audio_context.clone())
+        } else {
+            drop(model);
+            report(event("loading_refine_model", 0, 1));
+            let r2 = Request { transformer: refine.transformer.clone(), guidance: None, ..r.clone() };
+            let mut store2 = Store::open(&r2.transformer, 0)?;
+            let (cached2, cached_audio2) = (cache::PromptCache::new(&r2).and_then(|c| c.load(&dev)), if r2.audio { cache::PromptCache::audio(&r2).and_then(|c| c.load(&dev)) } else { None });
+            let (c, a, _) = webgpu_contexts(&r2, &mut store2, cached2, cached_audio2, None, &mut report)?;
+            model = webgpu_model(&r2, &mut store2, f, h, w, audio_frames, &mut report)?;
+            (c, a)
+        };
+        let Model::Wgpu(m, table, sound) = &mut model else { candle_core::bail!("a WebGPU clip's model is WebGPU's") };
+        let had_sound = sound.is_some();
+        let (t, s) = webgpu_tables(m, r, f, h, w, audio_frames);
+        (*table, *sound) = (t, s.filter(|_| had_sound));
+        if sound.is_some() && !m.room_for_step(f * h * w + if end.is_some() { h * w } else { 0 }) {
+            m.drop_audio();
+            *sound = None;
+            report(event("sound_kept_from_first_stage", 1, 1));
+        }
+        let refine_audio = sound.is_some() && !frozen_audio && audio_latent.is_some();
+        // Re-noised to the first refine sigma (a fresh draw from the seed), the sound too where it is refined.
+        let s0 = REFINE_SIGMAS[0];
+        let noise = Tensor::from_vec(crate::pipeline::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET), f * h * w * 128), (1, f * h * w, 128), &dev)?;
+        latent = ((upscaled * (1. - s0))? + (noise * s0)?)?;
+        if let Some(end) = &end {
+            latent = Tensor::cat(&[&latent, end], 1)?;
+        }
+        latent = condition_endpoints(latent, start.as_ref(), end.as_ref())?;
+        if let (true, Some(a)) = (refine_audio, audio_latent.as_mut()) {
+            let noise = crate::pipeline::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET).wrapping_add(AUDIO_SEED_OFFSET), a.elem_count());
+            *a = ((&*a * (1. - s0))? + (Tensor::from_vec(noise, a.shape(), &dev)? * s0)?)?;
+        }
+        let values = refine_context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let sound_context = refine_audio_context.as_ref().map(|c| c.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()).transpose()?;
+        let clean = (if start.is_some() { h * w } else { 0 }, if end.is_some() { h * w } else { 0 });
+        let refine_steps = REFINE_SIGMAS.len() - 1;
+        report(event("refining_video", 0, refine_steps * 48));
+        for step in 0..refine_steps {
+            let (sigma, next) = (REFINE_SIGMAS[step], REFINE_SIGMAS[step + 1]);
+            let video = latent.flatten_all()?.to_vec1::<f32>()?;
+            let tokens = video.len() / 128;
+            let (v, s) = match (&audio_latent, &sound_context, sound.as_ref()) {
+                (Some(audio), Some(c), Some((sound_table, video_cross))) => {
+                    let a = audio.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let pass = crate::ltx_wgpu::AudioPass { latent: &a, tokens: a.len() / 128, context: c, rows: c.len() / 2048, sigma: if refine_audio { sigma } else { 0. }, table: sound_table, video_cross, skip_self: None };
+                    let (v, s) = m.forward_av(&video, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, None, &pass)?;
+                    (v, Some(s))
+                }
+                _ => (m.forward(&video, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, None)?, None),
+            };
+            report(event("refining_video", (step + 1) * 48, refine_steps * 48));
+            let noise = r.ancestral().then(|| ancestral_noise(r, 1, step, false, &latent)).transpose()?;
+            latent = step_to(&latent, &Tensor::from_vec(v, (1, tokens, 128), &dev)?, sigma, next, noise.as_ref())?;
+            latent = condition_endpoints(latent, start.as_ref(), end.as_ref())?;
+            if let (true, Some(a), Some(s)) = (refine_audio, audio_latent.as_mut(), s) {
+                let noise = r.ancestral().then(|| ancestral_noise(r, 1, step, true, a)).transpose()?;
+                *a = step_to(a, &Tensor::from_vec(s, a.shape(), &dev)?, sigma, next, noise.as_ref())?;
+            }
+        }
+        latent = latent.narrow(1, 0, f * h * w)?.contiguous()?;
+    }
     let (mut gpu, mut host, mut disk) = match &model {
         Model::Candle(m) => m.stats(),
         #[cfg(feature = "webgpu")]
@@ -649,7 +758,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     };
     dev.synchronize()?;
     drop(model);
-    if let (true, Some(refine)) = (two_stage, &r.refine) {
+    if let (true, Some(refine), false) = (two_stage, &r.refine, r.webgpu) {
         // Double the latent: un-normalized through the upsampler, then back.
         report(event("upsampling_latent", 0, 1));
         let stats = vae::PerChannelStatistics::load_file(&r.vae, &dev)?;
@@ -837,6 +946,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
 const AUDIO_SEED_OFFSET: u64 = 0x9e37_79b9_7f4a_7c15;
 /// Stage two's noise, drawn apart from stage one's.
 const REFINE_SEED_OFFSET: u64 = 0xc2b2_ae3d_27d4_eb4f;
+/// The Euler ancestral steps' noises, apart from both.
+const ANCESTRAL_SEED_OFFSET: u64 = 0x1656_67b1_9e37_79f9;
 
 fn inference_device(index: usize) -> Result<Device> {
     // (Candle's CPU backend cannot multiply the model's BF16 weights: video is WebGPU's)

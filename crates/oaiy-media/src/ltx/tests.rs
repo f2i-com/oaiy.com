@@ -99,13 +99,15 @@ fn a_webgpu_clip_has_its_own_sound_or_follows_a_given_one() {
     assert!(request(r#","lora":"l""#).unwrap().lora.is_some(), "a LoRA: the weights it adapts loaded with it");
     let spoken = request(r#","speech":{"text":"hello"}"#).unwrap();
     assert!(spoken.speech.is_some() && spoken.audio && spoken.frames_from_audio, "speech made first and followed, the clip as long as it");
-    for (extra, what) in [
-        (r#","identity":true"#, "reference voice"),
-        (r#","refine":{"transformer":"t","upsampler":"u"}"#, "refinement"),
-    ] {
-        let e = request(extra).unwrap_err();
-        assert!(e.starts_with("WebGPU video does not support") && e.contains(what), "{extra}: {e}");
-    }
+    let e = request(r#","identity":true"#).unwrap_err();
+    assert!(e.starts_with("WebGPU video does not support") && e.contains("reference voice"), "{e}");
+    assert!(request(r#","refine":{"transformer":"t","upsampler":"u"}"#).unwrap().refine.is_some(), "two stages on WebGPU too");
+    // Euler ancestral by itself for LTX 2.5's distilled sampling (the reference's since 2.5), Euler otherwise
+    let v25 = |extra: &str| Request::parse(&Json::parse(format!(r#"{{"model":"ltx-2.5","transformer":"t","text_encoder":"e","vae":"t","output_dir":"o","prompt":"p","backend":"webgpu"{extra}}}"#).as_bytes()).unwrap());
+    assert!(v25("").unwrap().ancestral() && !r.ancestral(), "2.5 distilled ancestral, 2.3 Euler");
+    assert!(!v25(r#","guidance":{"steps":30}"#).unwrap().ancestral(), "guided sampling Euler");
+    assert!(!v25(r#","sampler":"euler""#).unwrap().ancestral() && request(r#","sampler":"ancestral""#).unwrap().ancestral());
+    assert!(v25(r#","sampler":"heun""#).unwrap_err().contains("sampler"));
     let cpu = Json::parse(br#"{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","output_dir":"o","prompt":"p","backend":"cpu"}"#).unwrap();
     assert!(!Request::parse(&cpu).unwrap().webgpu);
     let cuda = Json::parse(br#"{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","output_dir":"o","prompt":"p","backend":"cuda"}"#).unwrap();
@@ -128,5 +130,28 @@ fn starting_frame_is_exact_after_each_euler_update() -> Result<()> {
         latent.narrow(1, 2, 4)?.flatten_all()?.to_vec1::<f32>()?,
         vec![2.; 8]
     );
+    Ok(())
+}
+
+/// A step to the next sigma: Euler without noise; with it the reference's Euler ancestral (eta 1), worked here from its
+/// formula; to sigma 0 the denoised prediction either way.
+#[test]
+fn an_ancestral_step_is_the_references() -> Result<()> {
+    let dev = Device::Cpu;
+    let (x, v, n) = (Tensor::new(&[[0.8f32, -0.3]], &dev)?, Tensor::new(&[[0.5f32, 1.5]], &dev)?, Tensor::new(&[[0.25f32, -1.0]], &dev)?);
+    let (sigma, next) = (0.9f64, 0.725f64);
+    let euler = super::step_to(&x, &v, sigma, next, None)?.to_vec2::<f32>()?;
+    assert_eq!(euler, [[0.8 + 0.5 * (next - sigma) as f32, -0.3 + 1.5 * (next - sigma) as f32]]);
+    let got = super::step_to(&x, &v, sigma, next, Some(&n))?.to_vec2::<f32>()?;
+    for (i, (&xi, (&vi, &ni))) in [0.8f64, -0.3].iter().zip([0.5f64, 1.5].iter().zip([0.25f64, -1.0].iter())).enumerate() {
+        let x0 = xi - sigma * vi;
+        let down = next * (1. + (next / sigma - 1.));
+        let stepped = down / sigma * xi + (1. - down / sigma) * x0;
+        let (an, ad) = (1. - next, 1. - down);
+        let want = an / ad * stepped + ni * (next * next - down * down * an * an / (ad * ad)).max(0.).sqrt();
+        assert!((got[0][i] as f64 - want).abs() < 1e-6, "{i}: {} against {want}", got[0][i]);
+    }
+    let last = super::step_to(&x, &v, sigma, 0., Some(&n))?.to_vec2::<f32>()?;
+    assert!((last[0][0] - (0.8 - 0.9 * 0.5) as f32).abs() < 1e-6 && (last[0][1] - (-0.3 - 0.9 * 1.5) as f32).abs() < 1e-6);
     Ok(())
 }

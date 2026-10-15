@@ -762,8 +762,8 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         "auto" | "fast" => false,
         // Lip-synced speech is its own single pass.
         "two_stage" if identity => false,
-        "two_stage" if dev_transformer.is_some() && upscaler.is_some() => true,
-        "two_stage" => return Err(format!("video model {name} needs dev_transformer and spatial_upscaler for the two-stage pipeline")),
+        "two_stage" if upscaler.is_some() => true,
+        "two_stage" => return Err(format!("video model {name} needs a spatial_upscaler for the two-stage pipeline")),
         _ => return Err("pipeline must be auto, fast or two_stage".into()),
     };
     // OpenAI sizes (1280x720, 1792x1024) exceed LTX's 1024 cap: scale, keep aspect.
@@ -799,14 +799,23 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         f.push(("identity".into(), Json::Bool(true)));
         f.push(("lora".into(), Json::obj([("path", Json::str(lora)), ("strength", Json::Num(num_or(model, "id_lora_strength", 1.0)))])));
     }
-    if let (true, Some(dev), Some(upscaler)) = (two_stage, &dev_transformer, &upscaler) {
-        // Stage one runs the dev weights with the reference's guidance; the
-        // configured (distilled) transformer refines.
+    if let (true, Some(upscaler)) = (two_stage, &upscaler) {
+        // With the dev weights, stage one runs them with the reference's
+        // guidance; the configured (distilled) transformer refines. Without,
+        // the distilled transformer does both (the reference's distilled pipeline).
         let distilled = f.iter().find(|(k, _)| k == "transformer").map(|(_, v)| v.clone()).unwrap_or(Json::Null);
-        f.retain(|(k, _)| k != "transformer");
-        f.push(("transformer".into(), Json::str(dev)));
-        f.push(("guidance".into(), Json::obj::<&str>([])));
+        if let Some(dev) = &dev_transformer {
+            f.retain(|(k, _)| k != "transformer");
+            f.push(("transformer".into(), Json::str(dev)));
+            f.push(("guidance".into(), Json::obj::<&str>([])));
+        }
         f.push(("refine".into(), Json::obj([("transformer", distilled), ("upsampler", Json::str(upscaler))])));
+    }
+    // How each step moves the latent (the worker's auto: Euler ancestral for LTX 2.5's distilled sampling).
+    match body.get("sampler") {
+        None | Some(Json::Null) => {}
+        Some(Json::Str(s)) if ["auto", "euler", "ancestral"].contains(&s.as_str()) => f.push(("sampler".into(), Json::str(s))),
+        Some(_) => return Err("sampler must be auto, euler or ancestral".into()),
     }
     // A soundtrack comes with models that have their audio VAE (LTX 2.3 and
     // Sulphur checkpoints are their own), unless the request says `"audio": false`.

@@ -16,9 +16,18 @@ pub(super) enum Model {
 /// of `f` frames of `h` by `w` and `audio_frames` of audio.
 #[cfg(feature = "webgpu")]
 pub(super) fn webgpu_model(r: &Request, store: &mut Store, f: usize, h: usize, w: usize, audio_frames: usize, report: &mut dyn FnMut(Json)) -> Result<Model> {
-    use crate::ltx_wgpu::{rope_table, video_positions};
     report(event("loading_video_model", 0, 48));
     let m = crate::ltx_wgpu::WgpuLtx::load_streams(store, r.device, r.audio, |n| report(event("loading_video_model", n, 48)))?;
+    let (table, sound) = webgpu_tables(&m, r, f, h, w, audio_frames);
+    Ok(Model::Wgpu(m, table, sound))
+}
+
+/// The rotary tables of a latent of `f` frames of `h` by `w` on `m`'s GPU: the video tokens', and for a clip with
+/// sound the audio tokens' and the video tokens' times for the attention between the streams (a two-stage clip's
+/// second stage makes them again, twice as high and wide).
+#[cfg(feature = "webgpu")]
+pub(super) fn webgpu_tables(m: &crate::ltx_wgpu::WgpuLtx, r: &Request, f: usize, h: usize, w: usize, audio_frames: usize) -> (ggml_rs::DeviceVec, Option<(ggml_rs::DeviceVec, ggml_rs::DeviceVec)>) {
+    use crate::ltx_wgpu::{rope_table, video_positions};
     let positions = video_positions(f, h, w, r.fps, r.end_image.is_some());
     let table = m.upload(&rope_table(&positions, &[20., 2048., 2048.], 4096, 32));
     // (each audio frame at its span's middle and each video token at its time, in seconds: 2,048 channels' tables)
@@ -27,7 +36,7 @@ pub(super) fn webgpu_model(r: &Request, store: &mut Store, f: usize, h: usize, w
         let times: Vec<Vec<f32>> = positions.iter().map(|p| vec![p[0]]).collect();
         (m.upload(&rope_table(&middles, &[20.], 2048, 32)), m.upload(&rope_table(&times, &[20.], 2048, 32)))
     });
-    Ok(Model::Wgpu(m, table, sound))
+    (table, sound)
 }
 #[cfg(not(feature = "webgpu"))]
 pub(super) fn webgpu_model(_: &Request, _: &mut Store, _: usize, _: usize, _: usize, _: usize, _: &mut dyn FnMut(Json)) -> Result<Model> {
