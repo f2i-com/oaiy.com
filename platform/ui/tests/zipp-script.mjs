@@ -377,24 +377,29 @@ console.log('\ntrap');
 console.log('\nconsole, print and the output ceiling');
 {
   // What the stubs DO, measured, because the comment used to claim more. The
-  // envelope installs `globalThis.print` and `globalThis.console`, and both are
+  // envelope declares `print` and installs `globalThis.console`, and both are
   // called as stubs that write nothing: ZIPP v0.0.24 calls console's methods as
   // the program left them (zipp.org 6333c421). Up to v0.0.23 `console` was not
   // replaced, whatever the assignment looked like — reading `console.log` gave
   // the stub back, and CALLING it still reached the engine's own output buffer.
-  const e = new CountingEngine();
-  let reply;
-  let output;
-  try {
-    e.initScript(buildScriptProgram(job('j', 'program', 'console.log("LEAK-1"); print("LEAK-2"); String(console.log).replace(/\\s+/g, "")')));
-    reply = e.evalInContext('__replies[__replies.length - 1]');
-    output = e.takeOutput();
-  } finally {
-    try { e.dispose(); } catch { /* already gone */ }
-  }
+  // On v0.0.25 `globalThis.print = stub` did the same to `print` in a job's
+  // code (compiled by `eval` or `new Function`), hence the declaration.
+  const run = (mode, source) => {
+    const e = new CountingEngine();
+    try {
+      e.initScript(buildScriptProgram(job('j', mode, source)));
+      return { reply: e.evalInContext('__replies[__replies.length - 1]'), output: e.takeOutput() };
+    } finally {
+      try { e.dispose(); } catch { /* already gone */ }
+    }
+  };
+  const { reply, output } = run('program', 'console.log("LEAK-1"); print("LEAK-2"); String(console.log).replace(/\\s+/g, "")');
   const lines = Array.isArray(output) ? output : [];
-  check('print IS stubbed: nothing it writes reaches the engine buffer',
-    !lines.some(l => String(l).includes('LEAK-2')), show(output));
+  const body = run('body', 'print("LEAK-3"); return String(print).replace(/\\s+/g, "")');
+  check('print IS stubbed: nothing it writes reaches the engine buffer, from a program or a function body',
+    !lines.some(l => String(l).includes('LEAK-2')) && body.reply?.value === 'function(){}'
+      && !(Array.isArray(body.output) ? body.output : []).some(l => String(l).includes('LEAK-3')),
+    `${show(output)} ${show(body)}`);
   check('console is stubbed too: the stub reads back, and the call writes nothing (ZIPP v0.0.24 and later)',
     reply?.value === 'function(){}' && !lines.some(l => String(l).includes('LEAK-1')), `${show(reply)} ${show(output)}`);
 

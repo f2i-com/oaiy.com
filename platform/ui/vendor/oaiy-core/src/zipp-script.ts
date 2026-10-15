@@ -747,7 +747,13 @@ export function validateScriptRequest(input: unknown, opts: { sha256?: ScriptHos
  * The reply channel, the intrinsics the envelope will need later, and the
  * output stubs.
  *
- * `print` IS stubbed: a call reaches this function and writes nothing. So is
+ * `print` IS stubbed: a call reaches this function and writes nothing. It is
+ * declared with `var`, not assigned as `globalThis.print`: on ZIPP v0.0.25 the
+ * assignment changed the global object's property (`globalThis.print` read
+ * back as the stub) but not the name, so a job's code, which the envelope
+ * compiles with `eval` or `new Function`, still called ZIPP's own print and
+ * its text reached the engine's output buffer (measured; v0.0.24 called the
+ * stub). The declaration rebinds the name on both. So is
  * `console`, since ZIPP v0.0.24, which calls console's methods as the program
  * left them (zipp.org 6333c421): `console.log("x")` calls this stub. Up to
  * v0.0.23 the compiler made `console.log(...)` its own print instruction, so
@@ -779,7 +785,7 @@ function __emit(o) { __replies.push(o); }
 var __jsonParse = JSON.parse;
 var __isArray = Array.isArray;
 var __hasOwn = Object.prototype.hasOwnProperty;
-globalThis.print = function () {};
+var print = function () {};
 globalThis.console = { log: function(){}, warn: function(){}, error: function(){}, info: function(){}, debug: function(){} };
 `;
 
