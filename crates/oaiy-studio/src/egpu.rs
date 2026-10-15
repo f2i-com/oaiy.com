@@ -198,6 +198,8 @@ fn environment(llm: &Json, root: &Path, runtime: Option<&Runtime>) -> Vec<(Strin
     let egpu = section(llm);
     let device = str_or(egpu, "device", "NV").trim();
     let mut env = vec![("DEV".to_string(), if device.is_empty() { "NV".to_string() } else { device.to_string() }), ("PYTHONUNBUFFERED".into(), "1".into())];
+    // (the launcher of OAIY's engine on the card says the card's memory and load each second, for the page)
+    env.push(("OAIY_EGPU_STATS".into(), "1".into()));
     if runtime.is_some() {
         // (a plugin's files are trusted by their digest: its Python writes no bytecode beside them)
         env.push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
@@ -416,7 +418,8 @@ impl Drop for Lease {
 }
 
 /// What the launcher has said of the card (`llm.egpu.engine` `webgpu`), one for each of its processes: where the
-/// card's socket is, and whether OAIY's engine on it is paused (its memory free for another program on the socket).
+/// card's socket is, whether OAIY's engine on it is paused (its memory free for another program on the socket), and
+/// the card's memory and load as it last said them (each second).
 #[derive(Default)]
 struct Card {
     said: Mutex<CardSaid>,
@@ -427,22 +430,51 @@ struct Card {
 struct CardSaid {
     socket: Option<String>,
     paused: bool,
+    /// `oaiy-egpu: usage {..}`'s word, and when it came.
+    usage: Option<(Json, Instant)>,
 }
 
+/// How long the card's last word on its memory and load is shown: the launcher says it each second.
+const USAGE_FRESH: Duration = Duration::from_secs(5);
+
 impl Card {
-    /// A line of the launcher's output, taken where it is one of its words on the card.
-    fn heard(&self, line: &str) {
+    /// A line of the launcher's output, taken where it is one of its words on the card. True for its word on the
+    /// card's memory and load, which is said each second and kept out of the log.
+    fn heard(&self, line: &str) -> bool {
         let mut s = self.said.lock().unwrap_or_else(|p| p.into_inner());
         match line.trim_end() {
             "oaiy-egpu: paused" => s.paused = true,
             "oaiy-egpu: resumed" => s.paused = false,
-            l => match l.strip_prefix("oaiy-egpu: card at ") {
-                Some(path) => s.socket = Some(path.to_string()),
-                None => return,
-            },
+            l => {
+                if let Some(said) = l.strip_prefix("oaiy-egpu: usage ") {
+                    s.usage = Json::parse(said.as_bytes()).ok().filter(|u| u.as_object().is_some()).map(|u| (u, Instant::now()));
+                    return true;
+                }
+                match l.strip_prefix("oaiy-egpu: card at ") {
+                    Some(path) => s.socket = Some(path.to_string()),
+                    None => return false,
+                }
+            }
         }
         drop(s);
         self.changed.notify_all();
+        false
+    }
+
+    /// The card's memory (MB) and load (percent) as the launcher last said them, where it said them lately: for the
+    /// page's hardware, as `crate::system` says a GPU's.
+    fn usage(&self) -> Json {
+        let s = self.said.lock().unwrap_or_else(|p| p.into_inner());
+        let Some((u, _)) = s.usage.as_ref().filter(|(_, at)| at.elapsed() < USAGE_FRESH) else {
+            return Json::Null;
+        };
+        let mb = |k: &str| u.get(k).and_then(Json::as_i64).map_or(Json::Null, |b| Json::Int(b >> 20));
+        Json::obj([
+            ("memory_total_mb", mb("total")),
+            ("memory_used_mb", mb("used")),
+            ("memory_cached_mb", mb("cached")),
+            ("load", u.get("load").and_then(Json::as_i64).map_or(Json::Null, |p| Json::Int(p.clamp(0, 100)))),
+        ])
     }
 
     /// The card's socket once the launcher has said where it is and that the engine is paused, waiting up to `wait`
@@ -813,8 +845,9 @@ impl Egpu {
                 let (mut reader, mut line) = (BufReader::new(pipe), Vec::new());
                 while reader.by_ref().take(16 << 10).read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
                     let text = String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string();
-                    card.heard(&text);
-                    log.push(text);
+                    if !card.heard(&text) {
+                        log.push(text);
+                    }
                     line.clear();
                 }
             });
@@ -1252,6 +1285,9 @@ impl Egpu {
             ("python", g.python.as_ref().map_or(Json::Null, |(_, p)| Json::str(p.to_string_lossy()))),
             ("provided_by", g.runtime.as_ref().map_or(Json::Null, |r| Json::str(&r.by))),
             ("runs_on", self.runs_on().filter(|_| g.state == State::Ready).map_or(Json::Null, Json::str)),
+            ("engine", Json::str(if webgpu(llm) { "webgpu" } else { "tinygrad" })),
+            // the card's memory and load, as the launcher of OAIY's engine on it says them (none from tinygrad's server)
+            ("usage", g.card.usage()),
             // the card lent to the image worker, and the engine on it paused (for that, or since)
             ("lent", Json::Bool(g.lent)),
             ("paused", Json::Bool(g.paused)),
@@ -1595,6 +1631,11 @@ mod tests {
 
         /// The launcher started (`paused`: holding the card, its engine not started), once it has said `until`.
         fn start(&self, paused: bool, until: &str) -> std::process::Child {
+            self.start_saying(paused, until).0
+        }
+
+        /// As `start`, with the line that said `until`.
+        fn start_saying(&self, paused: bool, until: &str) -> (std::process::Child, String) {
             use std::io::BufRead;
             use std::process::{Command, Stdio};
             let _ = std::fs::remove_file(self.dir.join("pids"));
@@ -1604,7 +1645,7 @@ mod tests {
                 command.arg("--paused");
             }
             command.arg("--webgpu").arg(self.dir.join("fake-engine")).args(["--port", "1"]);
-            command.env("OAIY_EGPU_KEY", "k").env("OAIY_EGPU_EMULATE", "1").env("PYTHONDONTWRITEBYTECODE", "1");
+            command.env("OAIY_EGPU_KEY", "k").env("OAIY_EGPU_EMULATE", "1").env("PYTHONDONTWRITEBYTECODE", "1").env("OAIY_EGPU_STATS", "1");
             let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
             let mut said = std::io::BufReader::new(child.stdout.take().unwrap());
             let mut line = String::new();
@@ -1620,7 +1661,7 @@ mod tests {
                     rest.clear();
                 }
             });
-            child
+            (child, line.trim_end().to_string())
         }
 
         /// The engines started since `start` that are still running: each is ended here, and counted.
@@ -1666,6 +1707,58 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             assert_eq!(launched.engines_left(), 0, "round {round}: an engine outlived its launcher");
         }
+    }
+
+    /// The launcher's word on the card's memory and load, each second, is the status's (in MB and percent) for as long
+    /// as it is fresh, and kept out of the log; its other words are heard as before.
+    #[test]
+    fn the_cards_memory_and_load_are_heard_and_kept_out_of_the_log() {
+        let card = Card::default();
+        assert_eq!(card.usage(), Json::Null);
+        assert!(!card.heard("oaiy-egpu: card at /tmp/x/card.sock") && !card.heard("oaiy-egpu: paused") && !card.heard("tinygpu-webgpu: ready"));
+        let said = card.said.lock().unwrap();
+        assert_eq!((said.socket.as_deref(), said.paused), (Some("/tmp/x/card.sock"), true));
+        drop(said);
+        assert!(card.heard(r#"oaiy-egpu: usage {"total": 25757220864, "used": 19327352832, "cached": 1073741824, "load": 87}"#));
+        let usage = card.usage();
+        let get = |k: &str| usage.get(k).and_then(Json::as_i64);
+        assert_eq!((get("memory_total_mb"), get("memory_used_mb"), get("memory_cached_mb"), get("load")), (Some(24564), Some(18432), Some(1024), Some(87)));
+        // (no load sampled yet: none said)
+        assert!(card.heard(r#"oaiy-egpu: usage {"total": 25757220864, "used": 0, "cached": 0, "load": null}"#));
+        assert_eq!(card.usage().get("load"), Some(&Json::Null));
+        // A word that is not one is still kept out of the log, and nothing shown of it.
+        assert!(card.heard("oaiy-egpu: usage {"));
+        assert_eq!(card.usage(), Json::Null);
+        // Stale: the launcher has stopped saying it.
+        assert!(card.heard(r#"oaiy-egpu: usage {"total": 1048576, "used": 0, "cached": 0, "load": 0}"#));
+        card.said.lock().unwrap().usage.as_mut().unwrap().1 -= USAGE_FRESH;
+        assert_eq!(card.usage(), Json::Null);
+        // The status has it, and which engine the card runs.
+        let egpu = Egpu::new();
+        let cfg = llm(r#"{"llm": {"egpu": {"enabled": true, "engine": "webgpu"}}}"#);
+        let status = egpu.status(cfg.get("llm").unwrap());
+        assert_eq!((status.get("engine").and_then(Json::as_str), status.get("usage")), (Some("webgpu"), Some(&Json::Null)));
+        assert!(environment(cfg.get("llm").unwrap(), Path::new("/"), None).contains(&("OAIY_EGPU_STATS".into(), "1".into())));
+    }
+
+    /// The launcher says the card's memory and load each second, as the studio hears them (here the card's work on the
+    /// CPU, whose memory is said as 16 GB).
+    #[cfg(unix)]
+    #[test]
+    fn the_launcher_says_the_cards_memory_and_load() {
+        use std::io::Write;
+        let Some(launched) = Launched::new("usage", true) else { return };
+        let (mut child, line) = launched.start_saying(true, "oaiy-egpu: usage ");
+        let card = Card::default();
+        assert!(card.heard(&line), "{line}");
+        let usage = card.usage();
+        assert_eq!(usage.get("memory_total_mb").and_then(Json::as_i64), Some(16 << 10), "{line}");
+        assert!(usage.get("memory_used_mb").and_then(Json::as_i64).is_some_and(|mb| mb >= 0), "{line}");
+        assert!(usage.get("load").and_then(Json::as_i64).is_some_and(|p| (0..=100).contains(&p)), "{line}");
+        let mut pipe = child.stdin.take().unwrap();
+        let _ = pipe.write_all(b"");
+        drop(pipe);
+        child.wait().unwrap();
     }
 
     /// A launcher that goes without a word (killed, as a crash would have it) takes its engine with it: the engine's

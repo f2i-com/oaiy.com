@@ -158,6 +158,11 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .hw { display: grid; gap: 14px; }
 .hw-row { display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) minmax(110px, 150px); gap: 14px; align-items: center; }
 .hw-row .label { font: 600 13px var(--display); } .hw-row .label small { display: block; font: 12px var(--body); color: var(--muted); }
+/* the eGPU's: its memory and its load, each a meter with its numbers, and what it runs under them */
+.hw-row.card { row-gap: 7px; }
+.hw-row.card .label { grid-row: span 3; }
+.hw-row.card .doing { grid-column: 2 / -1; margin-top: -2px; }
+.meter.split { display: flex; }
 
 /* lists */
 .list { display: grid; }
@@ -438,6 +443,8 @@ dialog::backdrop { background: var(--backdrop); }
 }
 @media (max-width: 860px) {
   .hw-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .hw-row.card .label { grid-row: auto; }
+  .hw-row.card .doing { grid-column: 1 / -1; margin-top: 0; }
   .savebar { padding: 12px var(--pad); }
   .chat { height: calc(100dvh - 330px); }
 }
@@ -1745,6 +1752,21 @@ function renderExamples() {
 }
 
 /* ---------- overview ---------- */
+// `box`'s children made `want`'s, keeping each node that is of the same kind where it stands: a meter's width then moves
+// as its transition says, where markup put in again would jump.
+function morph(box, want) {
+  const had = [...box.childNodes], wanted = [...want.childNodes];
+  wanted.forEach((w, i) => {
+    const h = had[i];
+    if (!h) return box.appendChild(w);
+    if (h.nodeType !== w.nodeType || h.nodeName !== w.nodeName) return box.replaceChild(w, h);
+    if (w.nodeType !== 1) { if (h.nodeValue !== w.nodeValue) h.nodeValue = w.nodeValue; return; }
+    for (const {name} of [...h.attributes]) if (!w.hasAttribute(name)) h.removeAttribute(name);
+    for (const {name, value} of [...w.attributes]) if (h.getAttribute(name) !== value) h.setAttribute(name, value);
+    morph(h, w);
+  });
+  had.slice(wanted.length).forEach(h => h.remove());
+}
 function renderHardware() {
   const hw = $("#hw"), rows = [];
   const ram = sys?.ram;
@@ -1763,16 +1785,32 @@ function renderHardware() {
       <div class="meter"${known || shared ? ` title="${pct.toFixed(0)}% used"` : ""}><div style="width:${pct}%;background:var(--gpu)"></div></div>
       <div class="num small">${[size, does && `<span class="muted">${does}</span>`].filter(Boolean).join("<br>")}</div></div>`);
   }
-  // A Mac's eGPU, which only tinygrad's server reaches: no reading of its memory, so what it is doing.
+  // A Mac's eGPU, which only tinygrad reaches. Its memory and load are said by the card's server while OAIY's engine
+  // runs on it (the launcher's, each second); of tinygrad's own server only what it is doing is known.
   const e = state?.egpu;
   if (e?.available && e.enabled) {
-    const does = e.state === "ready" ? [`Runs ${esc(e.model || "")}`, "through tinygrad"]
-      : e.state === "starting" ? [`Loading ${esc(e.model || "")}`, "its first start compiles kernels: minutes"]
+    const own = e.engine === "webgpu", by = own ? "OAIY's engine" : "tinygrad", u = e.usage;
+    const does = e.lent ? [`Lent to a media job`, e.model ? `${esc(e.model)} paused` : ""]
+      : e.paused ? [`${esc(e.model || "The language model")} paused`, ""]
+      : e.state === "ready" ? [`Runs ${esc(e.model || "")}`, `through ${by}`]
+      : e.state === "starting" ? [`Loading ${esc(e.model || "")}`, own ? "" : "its first start compiles kernels: minutes"]
       : e.state === "failed" ? ["Not answering", "this computer's GPU answers instead"]
       : ["Not started", e.models?.length ? "starts on the first request" : "no model is set to it (Models)"];
-    rows.push(`<div class="hw-row"><div class="label">eGPU<small>${e.device === "AMD" ? "AMD" : "NVIDIA"} card, through tinygrad</small></div>
-      <div class="meter"><div style="width:${e.state === "ready" ? 100 : 0}%;background:var(--gpu)"></div></div>
-      <div class="num small">${does[0]}<br><span class="muted">${does[1]}</span></div></div>`);
+    const label = `<div class="label">eGPU<small>${e.device === "AMD" ? "AMD" : "NVIDIA"} card, ${by}</small></div>`;
+    if (u?.memory_total_mb) {
+      const used = u.memory_used_mb || 0, kept = u.memory_cached_mb || 0, total = u.memory_total_mb, load = u.load;
+      const pct = mb => Math.min(100, mb / total * 100).toFixed(1);
+      rows.push(`<div class="hw-row card">${label}
+        <div class="meter split" title="Video memory: ${gb(used)} GB of ${gb(total)} GB in use${kept >= 1024 ? `, and ${gb(kept)} GB of buffers let go kept for reuse (lighter)` : ""}"><div style="width:${pct(used)}%;background:var(--gpu)"></div><div style="width:${pct(kept)}%;background:var(--gpu);opacity:.35"></div></div>
+        <div class="num small">${gb(used)} / ${gb(total)} GB</div>
+        <div class="meter" title="Compute load: the share of the last second the card spent running kernels"><div style="width:${load ?? 0}%;background:var(--good)"></div></div>
+        <div class="num small">${load == null ? "–" : load + "%"} <span class="muted">load</span></div>
+        <div class="doing small"><span>${does[0]}</span>${does[1] ? ` <span class="muted">${does[1]}</span>` : ""}</div></div>`);
+    } else {
+      rows.push(`<div class="hw-row">${label}
+        <div class="meter"><div style="width:${e.state === "ready" && !own ? 100 : 0}%;background:var(--gpu)"></div></div>
+        <div class="num small">${does[0]}<br><span class="muted">${does[1]}</span></div></div>`);
+    }
   }
   if (ram?.total_mb) {
     const used = ram.total_mb - ram.available_mb;
@@ -1780,7 +1818,9 @@ function renderHardware() {
       <div class="meter"><div style="width:${used / ram.total_mb * 100}%;background:var(--ram)"></div></div>
       <div class="num small">${gb(used)} / ${gb(ram.total_mb)} GB</div></div>`);
   }
-  hw.innerHTML = rows.join("") || '<div class="empty">No GPU or memory reported. Without a GPU the engines run on the CPU, slowly, and video, sound, speech and 3D do not run.</div>';
+  const made = document.createElement("template");
+  made.innerHTML = rows.join("") || '<div class="empty">No GPU or memory reported. Without a GPU the engines run on the CPU, slowly, and video, sound, speech and 3D do not run.</div>';
+  morph(hw, made.content);
   $("#hw-note").textContent = sys?.gpus?.length ? "" : "";
 }
 function renderState() {
@@ -2636,6 +2676,8 @@ function renderFirstRun() {
 /* ---------- polling ---------- */
 async function refresh() {
   try { state = await api("/api/state"); keyed(state.media.jobs); renderState(); } catch (e) { $("#foot-llm-text").textContent = "Studio unreachable"; }
+  // (the eGPU's memory and load are the state's: shown as they come)
+  if (sys && state?.egpu?.usage && $("#v-overview").classList.contains("on")) renderHardware();
 }
 async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); } catch {} }
 (async () => {

@@ -41,7 +41,7 @@ the card, which over Thunderbolt has taken its link down until the enclosure was
 """
 from __future__ import annotations
 
-import ctypes, hashlib, json, mmap, os, pathlib, signal, socket, struct, subprocess, sys, threading, time, traceback
+import collections, ctypes, hashlib, json, mmap, os, pathlib, signal, socket, struct, subprocess, sys, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 CACHE = pathlib.Path(os.environ.get("TINYGPU_CACHE") or pathlib.Path.home() / ".cache" / "tinygpu-webgpu")
@@ -352,6 +352,9 @@ class Card:
     self.reserve_firmware_memory()
     self.local_memory()
     self.q, self.queued, self.since_sync = None, 0, 0
+    # (the card's load, once watched: the timeline's values of the kernels' submissions the card may not have done, and
+    # the seconds sampled so far (of them, with kernels running), each only ever raised, and that when it was asked)
+    self.computing, self.sampled, self.asked = None, (0.0, 0.0), (0.0, 0.0)
     self.queues = 0   # (the fast path: the submission's queues so far, each FIRST times 4 to the count's power, at most BATCH)
     self.scratch = None
     self.profiled: dict = {}   # (TINYGPU_PROFILE: a kernel's calls, its time, its last grid, its workgroup)
@@ -422,6 +425,51 @@ class Card:
     """The bytes of the buffers let go that tinygrad keeps for the next of their size (given back to the card when it
     is full): with what is free, the room there is."""
     return sum(size * len(bufs) for (size, _spec), bufs in getattr(self.dev.allocator, "cache", {}).items())
+
+  def watch(self, every: float = 0.005):
+    """The card's load sampled from here on, every `every` seconds on a thread of its own, for `usage`: whether what
+    the card is running is a submission of kernels (a copy's, by its copy engine, is not counted). The card does the
+    work it is given in turn, each piece raising the timeline's signal to its number as it ends, so what it runs is the
+    piece numbered one past the signal's value; the signal is in the computer's memory, read here without a word to the
+    card, and nothing of what goes to the card changes."""
+    if self.computing is not None: return
+    self.computing = collections.deque()
+    def sample():
+      busy = span = 0.0
+      was, then = False, time.perf_counter()
+      while True:
+        time.sleep(every)
+        try:
+          done, waiting = self.dev.timeline_signal.value, self.computing
+          # (those done let go; and any past what was given, as after tinygrad has wrapped the timeline round)
+          while waiting and (waiting[0] <= done or waiting[0] >= self.dev.timeline_value): waiting.popleft()
+          now, running = time.perf_counter(), bool(waiting) and waiting[0] == done + 1
+          # (the time since the last sample, half to what each found, not a count of samples: a sample waits for the
+          # interpreter's lock, longest while the requests' thread spins on the card's work, and counted alone the
+          # samples said 65% of a 27B's decoding where the card was busier)
+          busy, span = busy + (now - then) * (was + running) / 2, span + (now - then)
+          was, then = running, now
+          self.sampled = (busy, span)
+        except Exception: pass
+    threading.Thread(target=sample, name="tinygpu-load", daemon=True).start()
+
+  def usage(self) -> dict:
+    """The card's memory and load, from any thread (OAIY's launcher asks each second, for its page): its memory whole,
+    what buffers, tinygrad's own and the firmware hold of it, and tinygrad's cache of buffers let go (`cached`, apart
+    from `used`), in bytes; and the share of the time sampled since the last asking that the card ran kernels, in percent
+    (None until `watch`, and where none was sampled). The allocator's records are copied whole first, in one step of the
+    interpreter's, while the requests' thread may be changing them."""
+    impl = getattr(self.dev.iface, "dev_impl", None)
+    pa = getattr(getattr(impl, "mm", None), "pa_allocator", None)
+    out = {"total": None, "used": None, "cached": None, "load": None}
+    if pa is not None and getattr(impl, "vram_size", None):
+      blocks, cache = list(pa.blocks.values()), list(getattr(self.dev.allocator, "cache", {}).items())
+      free, cached = sum(size for size, _nxt, _prev, free in blocks if free), sum(size * len(bufs) for (size, _spec), bufs in cache)
+      out.update(total=impl.vram_size, used=max(0, impl.vram_size - free - cached), cached=cached)
+    (busy, span), (was_busy, was_span) = self.sampled, self.asked
+    self.asked = (busy, span)
+    if span > was_span: out["load"] = round(min(100.0, 100 * (busy - was_busy) / (span - was_span)))
+    return out
 
   def local_memory(self):
     """The card's local memory (a thread's spills and stack) grown as tinygrad's NVDevice._ensure_has_local_memory does,
@@ -556,10 +604,11 @@ class Card:
   def end(self):
     if self.q is not None and self.queued:
       if self.fast: self.fast.ending(self.q)
-      self.q.signal(self.dev.timeline_signal, self.dev.next_timeline())
+      self.q.signal(self.dev.timeline_signal, at := self.dev.next_timeline())
       # (after the signal is written into the last QMD: the copy has it)
       if self.fast and self.fast.mirror is not None: self.fast.flush()
       self.q.submit(self.dev)
+      if self.computing is not None: self.computing.append(at)
     elif self.q is not None and self.stamps and self.stamps[-1][0] is None:
       self.stamps.pop()   # (a queue with nothing in it is not submitted: its start is never written)
     self.q, self.queued = None, 0
@@ -800,6 +849,8 @@ class Emulator:
     self.pool = ThreadPoolExecutor(self.workers, thread_name_prefix="emu")
     self.local = threading.local()
     self.trace = os.environ.get("TINYGPU_EMU_TRACE") == "1"
+    # (for `usage`: the buffers' bytes, the seconds spent running kernels, and that when it was last asked)
+    self.held, self.spent, self.asked = 0, 0.0, (time.perf_counter(), 0.0)
 
   def info(self) -> dict:
     return {"arch": "cpu", "name": "the card's work on the CPU (tinygpu-webgpu --emulate)", "device": "CPU",
@@ -817,10 +868,22 @@ class Emulator:
     at = self.map(span)
     self.mprotect(at + span - page, page, 0)   # (PROT_NONE)
     if self.trace: print(f"emu: buffer 0x{at + span - page - size:016x} to 0x{at + span - page:016x} ({size} bytes)", file=sys.stderr, flush=True)
+    self.held += size
     return (at + span - page - size, size, at, span)
 
   def free(self, buf):
     self.munmap(buf[2], buf[3])
+    self.held -= buf[1]
+
+  def watch(self): pass
+
+  def usage(self) -> dict:
+    """As the card's (Card.usage): the buffers' bytes of the memory said (info), and the share of the time since the
+    last asking spent running kernels."""
+    now, spent = time.perf_counter(), self.spent
+    then, was = self.asked
+    self.asked = (now, spent)
+    return {"total": self.info()["memory"], "used": self.held, "cached": 0, "load": round(min(100.0, 100 * (spent - was) / max(now - then, 1e-9)))}
 
   def write(self, buf, off: int, data: memoryview):
     ctypes.memmove(buf[0] + off, bytes(data), len(data))
@@ -867,10 +930,12 @@ class Emulator:
     # sizes: integers in the same words)
     args = (ctypes.c_void_p * max(1, 2 * len(bufs) + 1))(*[b[0] + off for b, off in bufs], *([0] if scratch else []), *sizes)
     total = grid[0] * grid[1] * grid[2]
-    parts = min(total, self.workers * 4)
-    if parts <= 1: return self.run(launch, args, grid, 0, total)
-    edges = [total * i // parts for i in range(parts + 1)]
-    for f in [self.pool.submit(self.run, launch, args, grid, a, b - a) for a, b in zip(edges, edges[1:])]: f.result()
+    parts, started = min(total, self.workers * 4), time.perf_counter()
+    try:
+      if parts <= 1: return self.run(launch, args, grid, 0, total)
+      edges = [total * i // parts for i in range(parts + 1)]
+      for f in [self.pool.submit(self.run, launch, args, grid, a, b - a) for a, b in zip(edges, edges[1:])]: f.result()
+    finally: self.spent += time.perf_counter() - started
 
   def copy(self, src, soff: int, dst, doff: int, size: int):
     ctypes.memmove(dst[0] + doff, src[0] + soff, size)

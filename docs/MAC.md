@@ -535,7 +535,13 @@ has tinygrad search for faster kernels once and keep them); `extra_args` to tiny
 server's command line. The control port has
 `GET /api/egpu/check`, `POST /api/egpu/start` (`{"model": name}`, else the first set to
 it) and `POST /api/egpu/stop`; `/api/state` has an `egpu` section, and the Logs page's
-**eGPU** tab (`/api/logs?source=egpu`) is tinygrad's own output.
+**eGPU** tab (`/api/logs?source=egpu`) is tinygrad's own output. With the `webgpu` engine the
+launcher says the card's memory and load each second (`oaiy-egpu: usage {...}`, kept out of
+that log): the section's `usage` has `memory_total_mb`, `memory_used_mb` (buffers, tinygrad's
+own and the firmware's), `memory_cached_mb` (buffers let go that tinygrad keeps for reuse) and
+`load`, the percent of the last second the card ran kernels (sampled from its timeline's signal
+in this Mac's memory every 5 ms; copies to and from the card are not counted). The Overview's
+**eGPU** row shows them as two meters.
 
 **Pictures in a chat** (the `webgpu` engine). A request with a picture goes to the card's
 engine like any other: it reads the picture where its model has a vision projector

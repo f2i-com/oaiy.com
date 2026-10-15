@@ -17,7 +17,7 @@ server reads from no request. Nothing of tinygrad's is changed on disk, and noth
 Python's socket server, which tinygrad's server is built on, is told where to listen and whom to answer, and jinja2,
 which renders the model's chat format, is given the request's word on thinking.
 """
-import hmac, importlib.util, json, os, queue, runpy, socketserver, sys, threading
+import hmac, importlib.util, json, os, queue, runpy, socketserver, sys, threading, time
 
 # Where tinygrad has kept its LLM server: a package since April 2026, a single module before.
 SERVERS = ("tinygrad.llm", "tinygrad.apps.llm")
@@ -41,6 +41,27 @@ def ending(signum=None, frame=None):
         HOLD["came"] = True
         return
     raise KeyboardInterrupt
+
+
+def say(line):
+    """A line on standard output in one write, which a pipe keeps whole: print() writes a line's text and its end
+    apart (unbuffered, as OAIY runs this), and another thread's line written between them would join the two, and OAIY
+    would not know either for its word (`oaiy-egpu: paused`, which a picture waits for)."""
+    os.write(1, (line + "\n").encode())
+
+
+def report(card, every=1.0):
+    """The card's memory and load said every `every` seconds (OAIY_EGPU_STATS=1, which OAIY sets: its page shows them,
+    and the lines are kept out of its log): `oaiy-egpu: usage {"total": .., "used": .., "cached": .., "load": ..}`, the
+    memory in bytes (tinygrad's cache of buffers let go apart from what is used) and the load in percent, the share of
+    the second the card ran kernels (webgpu_server.Card.usage)."""
+    card.watch()
+    while True:
+        time.sleep(every)
+        try:
+            say("oaiy-egpu: usage " + json.dumps(card.usage()))
+        except Exception:
+            pass
 
 
 def local_only():
@@ -198,8 +219,10 @@ def webgpu(args):
     sock = webgpu_server.listen(path)
     lock, closing = threading.Lock(), threading.Event()
     threading.Thread(target=webgpu_server.accept, args=(card, sock, lock, closing), daemon=True).start()
-    print(f"oaiy-egpu: {card.card.info()['name']} held for OAIY's engine", flush=True)
-    print(f"oaiy-egpu: card at {path}", flush=True)
+    say(f"oaiy-egpu: {card.card.info()['name']} held for OAIY's engine")
+    say(f"oaiy-egpu: card at {path}")
+    if os.environ.get("OAIY_EGPU_STATS") == "1" and hasattr(card.card, "usage"):
+        threading.Thread(target=report, args=(card.card,), daemon=True).start()
     env = dict(os.environ, OAIY_WEBGPU_ADAPTER="tinygpu:" + path, OAIY_LLM_API_KEY=KEY)
 
     def start():
@@ -223,8 +246,8 @@ def webgpu(args):
     def said_paused():
         # (the engine's memory on the card is free once its connection has gone, and its buffers with it)
         if not webgpu_server.wait_clients(0, 10):
-            print("oaiy-egpu: a program is still connected to the card", flush=True)
-        print("oaiy-egpu: paused", flush=True)
+            say("oaiy-egpu: a program is still connected to the card")
+        say("oaiy-egpu: paused")
 
     engine, code = [None], 1
     try:
@@ -247,7 +270,7 @@ def webgpu(args):
                 said_paused()
             elif asked == "resume" and engine[0] is None:
                 start()
-                print("oaiy-egpu: resumed", flush=True)
+                say("oaiy-egpu: resumed")
     except KeyboardInterrupt:
         # (within the lifeline's 15 s, with the card's last request)
         code = halt(engine[0], 5) if engine[0] is not None else 0
