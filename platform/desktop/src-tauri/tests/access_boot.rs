@@ -58,11 +58,17 @@ struct Server {
 }
 
 impl Server {
-    /// Start it and wait until it answers.
+    /// Start it and wait until it answers. Its port is released a moment before the server binds it, and another
+    /// program can take it in between (on Windows a test's own outgoing connection did: "os error 10048"), so a
+    /// server that exits for a port in use is started again on another.
     fn start(scratch: &Scratch, extra_env: &[(&str, &str)]) -> Server {
-        let mut server = Server::spawn(scratch, extra_env, "server");
-        server.wait_until_up();
-        server
+        for _ in 0..4 {
+            let mut server = Server::spawn(scratch, extra_env, "server");
+            if server.wait_until_up() {
+                return server;
+            }
+        }
+        panic!("oaiy-server found the port it was given in use four times");
     }
 
     /// Start it and leave it to come up (or not) by itself. `name` names its stderr file, so that two servers
@@ -126,10 +132,19 @@ impl Server {
         }
     }
 
-    fn wait_until_up(&mut self) {
+    /// True once it answers; false where it exited because its port was in use. Any other exit is a failure.
+    fn wait_until_up(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
+                let tail = self.stderr_tail();
+                // Windows' WSAEADDRINUSE, Linux's EADDRINUSE and macOS's
+                if ["os error 10048", "os error 98)", "os error 48)"]
+                    .iter()
+                    .any(|code| tail.contains(code))
+                {
+                    return false;
+                }
                 panic!(
                     "oaiy-server exited early ({status}): {}",
                     self.stderr_tail()
@@ -146,7 +161,7 @@ impl Server {
                 })
                 .is_some_and(|r| r.status().as_u16() == 200);
             if up {
-                return;
+                return true;
             }
             assert!(
                 Instant::now() < deadline,
