@@ -148,11 +148,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
-/// 3D neighborhood attention, heads 64 wide ([`ChainRecorder::neighborhood_attention_3d`]): a workgroup a run of 64
-/// queries along a row of the grid (one time and row, consecutive columns) and a head, a thread a query (its 64 dims
-/// and sums in registers). The run's queries share their window's times and rows; along the row each window is its
-/// own (NATTEN's: centred, shifted inward at the edges), all inside the run's span of columns, which goes through
-/// workgroup memory 16 keys and values at a time, each thread taking the ones in its window. The softmax online.
+/// 3D neighborhood attention, heads 64 wide ([`ChainRecorder::neighborhood_attention_3d`]): a workgroup a block of 4
+/// rows by 64 columns of queries of a time and a head, a thread a query (its 64 dims and sums in registers). The
+/// block's queries share their window's times; their rows' windows overlap (each a row's kernel, centred, shifted
+/// inward at the edges as NATTEN's), and the block goes through their union a key row at a time, so that each row of
+/// keys and values is read once for the 4 rows of queries (a workgroup a row read it for each: 11 of a 11x11x11
+/// window's rows read again by the row below, LTX 2.5's decoder's stage 5 at three times the traffic). Along a row each
+/// window is its own, all inside the block's span of columns, which goes through workgroup memory 16 keys and values at
+/// a time (a vec4 of each a thread), each thread taking the ones in its window. The softmax online.
 /// `p[0]`: `t`, `h`, `w`, the heads; `p[1]`: the kernel's `kt`, `kh`, `kw`.
 pub(in crate::chain) const NEIGHBORHOOD_ATTENTION_3D: &str = r#"
 @group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
@@ -162,9 +165,13 @@ pub(in crate::chain) const NEIGHBORHOOD_ATTENTION_3D: &str = r#"
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 const RUN: u32 = 64u;
+const ROWS: u32 = 4u;
 const CHUNK: u32 = 16u;
-var<workgroup> ks: array<vec4<f32>, 256>;
-var<workgroup> vs: array<vec4<f32>, 256>;
+// a key's 16 vec4s 17 apart: neighbouring threads read neighbouring keys at once, and 16 apart (256 bytes) every one of
+// them was in the same banks of workgroup memory
+const STRIDE: u32 = 17u;
+var<workgroup> ks: array<vec4<f32>, 272>;
+var<workgroup> vs: array<vec4<f32>, 272>;
 
 // where the window of `kernel` around `i` starts on an axis `n` long: centred, shifted inward at the edges
 fn start(i: u32, n: u32, kernel: u32) -> u32 {
@@ -174,7 +181,7 @@ fn start(i: u32, n: u32, kernel: u32) -> u32 {
     return min(s, n - kernel);
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let nt = p[0].x;
     let nh = p[0].y;
@@ -183,55 +190,62 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let kt = min(p[1].x, nt);
     let kh = min(p[1].y, nh);
     let kw = min(p[1].z, nw);
+    let blocks = (nh + ROWS - 1u) / ROWS;
     let w0 = wg.x * RUN;
-    let th = wg.y + wg.z * 65535u;
-    // (the grid's last slice past the runs: a whole workgroup at once)
-    if (th >= nt * nh * heads) { return; }
-    let head = th % heads;
-    let tr = th / heads;
-    let t = tr / nh;
-    let r = tr % nh;
+    let tb = wg.y + wg.z * 65535u;
+    // (the grid's last slice past the blocks: a whole workgroup at once)
+    if (tb >= nt * blocks * heads) { return; }
+    let head = tb % heads;
+    let t = tb / heads / blocks;
+    let r0 = (tb / heads % blocks) * ROWS;
+    let col = lid % RUN;
+    let r = r0 + lid / RUN;
+    let rq = min(r, nh - 1u);
     let c4 = heads * 16u;
-    let wq = min(w0 + lid, nw - 1u);
-    let qo = (tr * nw + wq) * c4 + head * 16u;
+    let wq = min(w0 + col, nw - 1u);
+    let qo = ((t * nh + rq) * nw + wq) * c4 + head * 16u;
 QLOADS
     var m = -3.0e38;
     var l = 0.0;
     let st = start(t, nt, kt);
-    let sh = start(r, nh, kh);
+    let sh = start(rq, nh, kh);
     let mine = start(wq, nw, kw);
     let first = start(w0, nw, kw);
     let last = start(min(w0 + RUN, nw) - 1u, nw, kw) + kw;
+    // the block's rows' windows together: its first row's start to its last row's end
+    let rlo = start(r0, nh, kh);
+    let rhi = start(min(r0 + ROWS, nh) - 1u, nh, kh) + kh;
     for (var dt = 0u; dt < kt; dt++) {
-        for (var dh = 0u; dh < kh; dh++) {
-            let row = ((st + dt) * nh + sh + dh) * nw;
+        for (var kr = rlo; kr < rhi; kr++) {
+            let row = ((st + dt) * nh + kr) * nw;
+            let used = kr >= sh && kr < sh + kh;
             for (var c0 = first; c0 < last; c0 += CHUNK) {
                 workgroupBarrier();
-                for (var e = lid; e < CHUNK * 16u; e += 64u) {
-                    let key = c0 + e / 16u;
-                    if (key < last) {
-                        let o = (row + key) * c4 + head * 16u + e % 16u;
-                        ks[e] = k[o];
-                        vs[e] = v[o];
-                    }
+                let key = c0 + lid / 16u;
+                if (key < last) {
+                    let o = (row + key) * c4 + head * 16u + lid % 16u;
+                    ks[lid / 16u * STRIDE + lid % 16u] = k[o];
+                    vs[lid / 16u * STRIDE + lid % 16u] = v[o];
                 }
                 workgroupBarrier();
-                let lo = max(c0, mine);
-                let hi = min(c0 + CHUNK, mine + kw);
-                for (var key = lo; key < hi; key++) {
-                    let b = (key - c0) * 16u;
-                    let s = SCORE;
-                    let mn = max(m, s);
-                    let a = exp(m - mn);
-                    let e = exp(s - mn);
-                    l = l * a + e;
-                    m = mn;
+                if (used) {
+                    let lo = max(c0, mine);
+                    let hi = min(c0 + CHUNK, mine + kw);
+                    for (var key = lo; key < hi; key++) {
+                        let b = (key - c0) * STRIDE;
+                        let s = SCORE;
+                        let mn = max(m, s);
+                        let a = exp(m - mn);
+                        let e = exp(s - mn);
+                        l = l * a + e;
+                        m = mn;
 ACCUMULATE
+                    }
                 }
             }
         }
     }
-    if (w0 + lid < nw) {
+    if (w0 + col < nw && r < nh) {
         let inv = 1.0 / l;
 STORES
     }

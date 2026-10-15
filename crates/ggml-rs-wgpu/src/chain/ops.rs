@@ -466,15 +466,21 @@ impl ChainRecorder for Recorder<'_> {
         let len = t * h * w * heads * 64;
         assert!(len > 0 && kernel.iter().all(|&k| k > 0) && q.len >= len && k.len >= len && v.len >= len && out.len >= len, "chain: 3D neighborhood attention over {t}x{h}x{w} tokens of {heads} heads");
         let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
-        // (a workgroup a run of 64 columns of a (time, row, head): those past 65,535 in the grid's third dimension)
-        let runs = (t * h * heads) as u32;
+        // (a workgroup a block of 4 rows by 64 columns of a (time, head): those past 65,535 in the grid's third dimension)
+        let runs = (t * h.div_ceil(4) * heads) as u32;
         let words = [t as u32, h as u32, w as u32, heads as u32, kernel[0] as u32, kernel[1] as u32, kernel[2] as u32, 0];
         // (the query's 16 vec4s and its sums named one by one, not an array: an array indexed in a loop goes to the
         // thread's memory, not its registers, on Apple's GPUs)
         static BODY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         let body = BODY.get_or_init(|| {
             let each = |f: &dyn Fn(usize) -> String| (0..16).map(f).collect::<Vec<_>>().join("\n");
-            let score = (0..16).map(|d| format!("dot(q{d}, ks[b + {d}u])")).collect::<Vec<_>>().join(" + ");
+            // (a balanced tree of the 16 dot products: summed in turn they were one chain of 64 dependent multiply-adds
+            // a key, each thread waiting on the last; as a tree the chain is 4 dots and 4 adds long)
+            let mut score: Vec<String> = (0..16).map(|d| format!("dot(q{d}, ks[b + {d}u])")).collect();
+            while score.len() > 1 {
+                score = score.chunks(2).map(|pair| format!("({} + {})", pair[0], pair[1])).collect();
+            }
+            let score = score.pop().unwrap_or_default();
             NEIGHBORHOOD_ATTENTION_3D
                 .replace("QLOADS", &each(&|d| format!("    let q{d} = q[qo + {d}u];\n    var a{d} = vec4<f32>();")))
                 .replace("SCORE", &score)
