@@ -39,6 +39,142 @@ struct Mat {
     bf16: bool,
 }
 
+/// Where the text model's weights are read from: a checkpoint's safetensors, or a GGUF of Gemma 3 as llama.cpp writes
+/// it ([`GgufGemma`]), each by the checkpoint's names.
+enum Gemma {
+    Safe(Store),
+    Gguf(GgufGemma),
+}
+
+/// Gemma 3 from a GGUF (llama.cpp's names and layout, its quantized matrices): each weight by the Hugging Face name
+/// the checkpoint gives it (under `model.`), dequantized; the norms as the checkpoint has them (llama.cpp writes them
+/// with Gemma's 1 added: its `Gemma3RMSNorm` multiplies by 1 + w), the embedding's rows read alone.
+struct GgufGemma {
+    file: gguf::GgufFile,
+}
+
+impl GgufGemma {
+    fn open(path: &Path) -> Result<Self> {
+        let file = gguf::GgufFile::open(path).map_err(err)?;
+        match file.get_str("general.architecture") {
+            Ok("gemma3") => Ok(Self { file }),
+            other => candle_core::bail!("{}: not a GGUF of Gemma 3 (its architecture: {other:?})", path.display()),
+        }
+    }
+
+    /// llama.cpp's name for a Hugging Face Gemma 3 weight under `model.`.
+    fn name(hf: &str) -> Option<String> {
+        let rest = hf.strip_prefix("model.")?;
+        match rest {
+            "embed_tokens.weight" => return Some("token_embd.weight".into()),
+            "norm.weight" => return Some("output_norm.weight".into()),
+            _ => {}
+        }
+        let rest = rest.strip_prefix("layers.")?;
+        let (i, part) = rest.split_once('.')?;
+        let part = match part {
+            "input_layernorm.weight" => "attn_norm.weight",
+            "post_attention_layernorm.weight" => "post_attention_norm.weight",
+            "pre_feedforward_layernorm.weight" => "ffn_norm.weight",
+            "post_feedforward_layernorm.weight" => "post_ffw_norm.weight",
+            "self_attn.q_norm.weight" => "attn_q_norm.weight",
+            "self_attn.k_norm.weight" => "attn_k_norm.weight",
+            "self_attn.q_proj.weight" => "attn_q.weight",
+            "self_attn.k_proj.weight" => "attn_k.weight",
+            "self_attn.v_proj.weight" => "attn_v.weight",
+            "self_attn.o_proj.weight" => "attn_output.weight",
+            "mlp.gate_proj.weight" => "ffn_gate.weight",
+            "mlp.up_proj.weight" => "ffn_up.weight",
+            "mlp.down_proj.weight" => "ffn_down.weight",
+            _ => return None,
+        };
+        Some(format!("blk.{i}.{part}"))
+    }
+
+    fn info(&self, hf: &str) -> Option<&gguf::TensorInfo> {
+        Self::name(hf).and_then(|n| self.file.tensor_by_name(&n))
+    }
+
+    /// Its shape as the checkpoint's (rows first: GGUF's dimensions are the other way round).
+    fn shape(&self, hf: &str) -> Result<Vec<usize>> {
+        let t = self.info(hf).ok_or_else(|| err(format!("{hf}: not in the GGUF")))?;
+        Ok(t.shape.iter().rev().map(|&d| d as usize).collect())
+    }
+
+    /// Its values, dequantized (a norm's less llama.cpp's 1).
+    fn values(&self, hf: &str) -> Result<Vec<f32>> {
+        let t = self.info(hf).ok_or_else(|| err(format!("{hf}: not in the GGUF")))?;
+        let mut out = vec![0f32; t.numel() as usize];
+        ggml_quants::dequantize(t.dtype, &self.file.tensor_bytes(t).map_err(err)?, &mut out).map_err(err)?;
+        if hf.ends_with("norm.weight") {
+            out.iter_mut().for_each(|v| *v -= 1.);
+        }
+        Ok(out)
+    }
+
+    /// Rows `ids` of a matrix (the embedding's), each dequantized alone.
+    fn rows(&self, hf: &str, ids: &[u32]) -> Result<Vec<f32>> {
+        let t = self.info(hf).ok_or_else(|| err(format!("{hf}: not in the GGUF")))?;
+        let (width, rows) = (t.shape[0] as usize, t.shape.get(1).copied().unwrap_or(1) as usize);
+        let row_bytes = t.nbytes() as usize / rows;
+        let bytes = self.file.tensor_bytes(t).map_err(err)?;
+        let mut out = vec![0f32; ids.len() * width];
+        for (o, &id) in out.chunks_exact_mut(width).zip(ids) {
+            let at = id as usize * row_bytes;
+            let row = bytes.get(at..at + row_bytes).ok_or_else(|| err(format!("{hf}: no row {id}")))?;
+            ggml_quants::dequantize(t.dtype, row, o).map_err(err)?;
+        }
+        Ok(out)
+    }
+}
+
+impl Gemma {
+    fn open(path: &Path) -> Result<Self> {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+            Ok(Self::Gguf(GgufGemma::open(path)?))
+        } else {
+            Ok(Self::Safe(Store::open(path, 0)?))
+        }
+    }
+
+    fn has(&self, name: &str) -> bool {
+        match self {
+            Self::Safe(s) => s.index.get(name).is_some(),
+            Self::Gguf(g) => g.info(name).is_some(),
+        }
+    }
+
+    fn values(&mut self, name: &str) -> Result<Vec<f32>> {
+        match self {
+            Self::Safe(s) => s.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>(),
+            Self::Gguf(g) => g.values(name),
+        }
+    }
+
+    /// Rows `ids` of the matrix `name` (the embedding's), as f32.
+    fn rows(&mut self, name: &str, ids: &[u32]) -> Result<Vec<f32>> {
+        match self {
+            Self::Safe(s) => s.rows(name, ids, &Device::Cpu)?.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>(),
+            Self::Gguf(g) => g.rows(name, ids),
+        }
+    }
+}
+
+/// The prompt's tokens: by a tokenizer.json, or by the GGUF's own tokenizer.
+enum Tok {
+    Json(tokenizers::Tokenizer),
+    Gguf(tokenizer::Tokenizer),
+}
+
+impl Tok {
+    fn ids(&self, text: &str) -> Result<Vec<u32>> {
+        match self {
+            Self::Json(t) => Ok(t.encode(text, true).map_err(err)?.get_ids().to_vec()),
+            Self::Gguf(t) => t.encode(text, true).map_err(err),
+        }
+    }
+}
+
 /// [`Mat`] on the host, read and not yet on the GPU: a BF16 checkpoint's bytes as they are (the kernels widen BF16
 /// by a shift: no pass over 460 MB a layer to make f16 of them), else f16 words converted from what the file holds.
 struct MatHost {
@@ -106,7 +242,23 @@ impl MatHost {
 
 /// `names`' matrices one after another (their rows) as f16 words on the host, a BF16 checkpoint's converted from its
 /// bytes on every core.
-fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
+fn mat_host(src: &mut Gemma, names: &[String]) -> Result<MatHost> {
+    let store = match src {
+        Gemma::Safe(store) => store,
+        // (a GGUF's matrices dequantized, as f16 words)
+        Gemma::Gguf(g) => {
+            let (mut n, mut k, mut words) = (0, 0, Vec::new());
+            for name in names {
+                let &[rows, cols] = g.shape(name)?.as_slice() else { candle_core::bail!("{name}: not a matrix") };
+                if k != 0 && cols != k {
+                    candle_core::bail!("{name}: {cols} columns, not {k}");
+                }
+                (k, n) = (cols, n + rows);
+                words.extend(crate::wgpu_weights::f16_words_f32(&g.values(name)?).ok_or_else(|| err(format!("{name}: a weight past f16's range")))?);
+            }
+            return Ok(MatHost { weights: HostWeights::F16(words), n, k });
+        }
+    };
     let (mut n, mut k) = (0, 0);
     for name in names {
         let shape = store.index.info(name).map_err(err)?.shape.clone();
@@ -162,13 +314,13 @@ fn mat_host(store: &mut Store, names: &[String]) -> Result<MatHost> {
     Ok(MatHost { weights: HostWeights::F16(words), n, k })
 }
 
-fn vector(store: &mut Store, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, add: f32) -> Result<DeviceVec> {
-    Ok(vector_up(gpu, &vector_host(store, name, add)?))
+fn vector(src: &mut Gemma, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, add: f32) -> Result<DeviceVec> {
+    Ok(vector_up(gpu, &vector_host(src, name, add)?))
 }
 
 /// A vector's values on the host, `add` added to each.
-fn vector_host(store: &mut Store, name: &str, add: f32) -> Result<Vec<f32>> {
-    Ok(store.tensor_f32(name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?.into_iter().map(|v| v + add).collect())
+fn vector_host(src: &mut Gemma, name: &str, add: f32) -> Result<Vec<f32>> {
+    Ok(src.values(name)?.into_iter().map(|v| v + add).collect())
 }
 
 fn vector_up(gpu: &ggml_rs_wgpu::WgpuBackend, values: &[f32]) -> DeviceVec {
@@ -228,14 +380,14 @@ struct LayerHost {
 }
 
 /// The text model's layer `i` (its weights under `prefix`; `gemma4` LTX 2.5's Gemma 4) read and converted.
-fn layer_host(store: &mut Store, prefix: &str, i: usize, gemma4: bool) -> Result<LayerHost> {
+fn layer_host(store: &mut Gemma, prefix: &str, i: usize, gemma4: bool) -> Result<LayerHost> {
     let p = format!("{prefix}layers.{i}.");
     let n = |s: &str| format!("{p}{s}");
     // Gemma 3's norms scale by 1 + w, Gemma 4's by w
     let add = if gemma4 { 0. } else { 1. };
     let v_name = n("self_attn.v_proj.weight");
     let scalar = if gemma4 {
-        let s = store.tensor_f32(&n("layer_scalar"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let s = store.values(&n("layer_scalar"))?;
         Some(vec![s.first().copied().ok_or_else(|| err(format!("{p}layer_scalar is empty")))? - 1.; G])
     } else {
         None
@@ -249,7 +401,7 @@ fn layer_host(store: &mut Store, prefix: &str, i: usize, gemma4: bool) -> Result
         kn: vector_host(store, &n("self_attn.k_norm.weight"), add)?,
         q: mat_host(store, &[n("self_attn.q_proj.weight")])?,
         k: mat_host(store, &[n("self_attn.k_proj.weight")])?,
-        v: if store.index.get(&v_name).is_some() { Some(mat_host(store, &[v_name])?) } else { None },
+        v: if store.has(&v_name) { Some(mat_host(store, &[v_name])?) } else { None },
         o: mat_host(store, &[n("self_attn.o_proj.weight")])?,
         gate_up: mat_host(store, &[n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?,
         down: mat_host(store, &[n("mlp.down_proj.weight")])?,
@@ -338,20 +490,25 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
     };
     let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
     said("the device");
-    let mut store = Store::open(gemma, 0)?;
+    let mut store = Gemma::open(gemma)?;
     said("the text model's file opened");
-    let prefix = if store.index.get("language_model.model.embed_tokens.weight").is_some() { "language_model.model." } else { "model." };
-    let gemma4 = store.index.get(&format!("{prefix}layers.0.layer_scalar")).is_some();
-    let mut tok = match tokenizer {
-        Some(path) => tokenizers::Tokenizer::from_file(path).map_err(err)?,
-        None if gemma4 => tokenizers::Tokenizer::from_bytes(store.index.read("tokenizer_json").map_err(err)?).map_err(err)?,
-        None => candle_core::bail!("LTX 2.3 requires a Gemma 3 tokenizer path"),
+    let prefix = if store.has("language_model.model.embed_tokens.weight") { "language_model.model." } else { "model." };
+    let gemma4 = store.has(&format!("{prefix}layers.0.layer_scalar"));
+    // (a tokenizer.json given; else Gemma 4's in its own file, or a GGUF's own)
+    let json = |mut t: tokenizers::Tokenizer| -> Result<Tok> {
+        t.with_padding(None);
+        t.with_truncation(None).map_err(err)?;
+        Ok(Tok::Json(t))
     };
-    tok.with_padding(None);
-    tok.with_truncation(None).map_err(err)?;
+    let tok = match (tokenizer, &store) {
+        (Some(path), _) => json(tokenizers::Tokenizer::from_file(path).map_err(err)?)?,
+        (None, Gemma::Safe(s)) if gemma4 => json(tokenizers::Tokenizer::from_bytes(s.index.read("tokenizer_json").map_err(err)?).map_err(err)?)?,
+        (None, Gemma::Gguf(g)) => Tok::Gguf(tokenizer::Tokenizer::from_gguf(&g.file).map_err(err)?),
+        (None, _) => candle_core::bail!("LTX 2.3 requires a Gemma 3 tokenizer path"),
+    };
     let mut ids_all = Vec::new();
     for p in prompts {
-        let mut ids = tok.encode(p.trim(), true).map_err(err)?.get_ids().to_vec();
+        let mut ids = tok.ids(p.trim())?;
         if ids.first() != Some(&2) {
             ids.insert(0, 2);
         }
@@ -371,7 +528,7 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
         let mut prompts = Vec::with_capacity(ids_all.len());
         for ids in &ids_all {
             let s = ids.len();
-            let emb = store.rows(&format!("{prefix}embed_tokens.weight"), ids, &Device::Cpu)?.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let emb = store.rows(&format!("{prefix}embed_tokens.weight"), ids)?;
             let x0: Vec<f32> = emb.iter().map(|v| v * (G as f32).sqrt()).collect();
             // RoPE over each head's halves, its first `turned` pairs (the rest at angle 0), positions after the
             // reference's left padding to 1,024
@@ -436,7 +593,7 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
             // the reader at its next layer)
             let (made, ahead) = std::sync::mpsc::sync_channel::<std::result::Result<LayerHost, String>>(1);
             scope.spawn(move || {
-                let mut file = match Store::open(gemma, 0) {
+                let mut file = match Gemma::open(gemma) {
                     Ok(file) => file,
                     Err(e) => {
                         let _ = made.send(Err(e.to_string()));
@@ -532,10 +689,14 @@ pub fn contexts_streams(gemma: &Path, tokenizer: Option<&Path>, transformer: &mu
     // and its connector: the video's 4,096 wide, the audio's 2,048
     let g = |n: &str| format!("model.diffusion_model.{n}");
     let mut done = LAYERS;
-    let mut stream = |store: &mut Store, transformer: &mut Store, which: &str, width: usize| -> Result<Vec<Vec<f32>>> {
+    let mut stream = |store: &mut Gemma, transformer: &mut Store, which: &str, width: usize| -> Result<Vec<Vec<f32>>> {
         let name = format!("text_embedding_projection.{which}_aggregate_embed");
-        let own = store.index.get(&format!("{name}.weight")).is_some();
-        let proj = projection(if own { store } else { &mut *transformer }, &gpu, &name, (width as f32 / G as f32).sqrt())?;
+        // (a GGUF of Gemma 3 has none: LTX 2.3's are in its checkpoint)
+        let own = match store {
+            Gemma::Safe(s) if s.index.get(&format!("{name}.weight")).is_some() => Some(s),
+            _ => None,
+        };
+        let proj = projection(own.unwrap_or(&mut *transformer), &gpu, &name, (width as f32 / G as f32).sqrt())?;
         said("a stream's projection");
         done += 1;
         progress(done, steps);
@@ -747,6 +908,34 @@ mod tests {
         }
         eprintln!("1,024 rows: the worst row's cosine {worst:.6}");
         assert!(worst > 0.99, "the worst row's cosine {worst}");
+        Ok(())
+    }
+
+    /// A GGUF of Gemma 3's own tokenizer gives its tokenizer.json's tokens (`--ignored`; OAIY_GEMMA3_GGUF the GGUF,
+    /// OAIY_GEMMA3_TOKENIZER Gemma 3's tokenizer.json), and its weights are found by the checkpoint's names.
+    #[test]
+    #[ignore = "needs a GGUF of Gemma 3 and Gemma 3's tokenizer.json"]
+    fn a_gguf_gemmas_tokens_are_its_tokenizer_jsons() -> Result<()> {
+        let (Ok(gguf), Ok(json)) = (std::env::var("OAIY_GEMMA3_GGUF"), std::env::var("OAIY_GEMMA3_TOKENIZER")) else { return Ok(()) };
+        let g = GgufGemma::open(Path::new(&gguf))?;
+        let ours = Tok::Gguf(tokenizer::Tokenizer::from_gguf(&g.file).map_err(err)?);
+        let theirs = Tok::Json(tokenizers::Tokenizer::from_file(&json).map_err(err)?);
+        for prompt in [
+            "A red fox walks through a snowy forest. The camera slowly follows from the side.",
+            "[VISUAL] A lighthouse at sunset, waves rolling in.  [SOUNDS] wind, gulls; [SPEECH] \"Hello there!\"",
+            "Numbers 12345 and 3.14159, a URL https://example.com/a?b=c, emoji 🦊🌊 and café, naïve, 東京, Привет.",
+            "  leading spaces,\ttabs\nand new lines\n\n  twice",
+        ] {
+            assert_eq!(ours.ids(prompt)?, theirs.ids(prompt)?, "{prompt}");
+        }
+        for (i, name) in ["model.embed_tokens.weight", "model.norm.weight"].into_iter().chain((0..LAYERS).flat_map(|i| {
+            ["input_layernorm", "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "self_attn.q_norm", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "post_feedforward_layernorm"].map(move |p| (i, p))
+        }).map(|(i, p)| Box::leak(format!("model.layers.{i}.{p}.weight").into_boxed_str()) as &str)).enumerate() {
+            assert!(g.info(name).is_some(), "{i}: {name} is not in the GGUF");
+        }
+        // (the norms as the checkpoint has them: llama.cpp's 1 taken off, so small, where 1 + w is the scale)
+        let norm = g.values("model.layers.0.input_layernorm.weight")?;
+        eprintln!("layer 0's input norm: mean {:.3}", norm.iter().sum::<f32>() / norm.len() as f32);
         Ok(())
     }
 }

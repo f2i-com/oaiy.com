@@ -781,11 +781,23 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         ("output_dir".into(), Json::str(output_dir(output_root, "video").to_string_lossy())),
         ("ffmpeg".into(), Json::str(config::program(root, str_or(section, "ffmpeg", "ffmpeg")).to_string_lossy())),
     ];
+    // (LTX 2.5's tokenizer is in its Gemma 4 file, and a GGUF of Gemma 3 carries its own)
+    let gguf_text = path_field(root, model, "text_encoder").is_some_and(|p| p.to_ascii_lowercase().ends_with(".gguf"));
     for key in ["transformer", "text_encoder", "vae", "tokenizer"] {
         match path_field(root, model, key) {
             Some(p) => f.push((key.into(), Json::str(p))),
-            None if key == "tokenizer" && family == "ltx-2.5" => {}
+            None if key == "tokenizer" && (family == "ltx-2.5" || gguf_text) => {}
             None => return Err(format!("video model {name} needs {key}")),
+        }
+    }
+    // A dev (not distilled) transformer: the reference's guided sampling (its 30 steps, CFG and STG), in one pass
+    // where there are not two stages (whose first stage is guided already).
+    if model.get("distilled").and_then(Json::as_bool) == Some(false) {
+        match (two_stage, &dev_transformer) {
+            (false, _) => f.push(("guidance".into(), Json::obj::<&str>([]))),
+            // (its two stages guide the dev weights already, below)
+            (true, Some(_)) => {}
+            (true, None) => return Err(format!("video model {name} is a dev model: its two stages need the distilled transformer (set this as dev_transformer and the distilled one as transformer)")),
         }
     }
     // How a followed soundtrack is held: inpaint (the worker's default) or frozen.

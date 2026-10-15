@@ -196,6 +196,11 @@ fn video_follows_a_soundtrack_or_speech() {
     assert_eq!(str_or(refine, "transformer", "a"), str_or(&r, "transformer", "b"), "the same weights refine");
     assert_eq!(str_or(&r, "sampler", ""), "euler");
     assert!(video_request(&distilled, root, &out, &body(r#"{"prompt":"x","sampler":"heun"}"#), false).unwrap_err().contains("sampler"));
+    // A dev model: the reference's guided sampling in one pass; its two stages only beside a distilled transformer.
+    let dev = cfg("", r#","distilled":false,"spatial_upscaler":"up.safetensors""#);
+    let (r, ..) = video_request(&dev, root, &out, &body(r#"{"prompt":"x"}"#), false).unwrap();
+    assert!(r.get("guidance").is_some() && r.get("refine").is_none());
+    assert!(video_request(&dev, root, &out, &body(r#"{"prompt":"x","pipeline":"two_stage"}"#), false).unwrap_err().contains("dev model"));
     // Lip-synced speech with the model's ID-LoRA: the saved voice's sample is the reference.
     let mut id = cfg("", r#","audio_vae":"s.safetensors","id_lora":"id.safetensors""#);
     let Json::Obj(top) = &mut id else { unreachable!() };

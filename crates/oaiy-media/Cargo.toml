@@ -23,10 +23,13 @@ meshopt = "0.6"
 ggml-rs = { path = "../ggml-rs", optional = true }
 ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }
 ggml-quants = { path = "../ggml-quants", optional = true }
+# A GGUF of Gemma 3 as LTX 2.3's text model (llama.cpp's files), its weights and its own tokenizer.
+gguf = { path = "../gguf", optional = true }
+tokenizer = { path = "../tokenizer", optional = true }
 
 [features]
 default = ["webgpu"]
-webgpu = ["dep:ggml-rs", "dep:ggml-rs-wgpu", "dep:ggml-quants"]
+webgpu = ["dep:ggml-rs", "dep:ggml-rs-wgpu", "dep:ggml-quants", "dep:gguf", "dep:tokenizer"]
 
 # On a Mac its WebGPU also takes the TinyGPU adapter (a card in a Thunderbolt enclosure, through tinygrad), where
 # OAIY_WEBGPU_ADAPTER names it (docs/TINYGPU.md), as the LLM engine's does.

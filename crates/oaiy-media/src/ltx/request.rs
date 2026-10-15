@@ -343,7 +343,9 @@ impl Request {
         if self.ram_bytes > 512 * GIB || self.vram_bytes > 192 * GIB {
             return Err("weight budgets exceed supported limits".into());
         }
-        if self.model != "ltx-2.5" && self.tokenizer.is_none() {
+        // (a GGUF of Gemma 3 carries its own tokenizer)
+        let gguf = self.text_encoder.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+        if self.model != "ltx-2.5" && self.tokenizer.is_none() && !gguf {
             return Err("Gemma 3 tokenizer is required".into());
         }
         if self.audio && self.audio_vae.is_none() {

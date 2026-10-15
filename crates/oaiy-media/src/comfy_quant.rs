@@ -28,6 +28,10 @@ pub fn load(s: &StIndex, name: &str, dev: &Device, dtype: DType) -> Result<Optio
     let config = Json::parse(&s.read(&metadata).map_err(candle_core::Error::wrap)?)
         .map_err(candle_core::Error::wrap)?;
     let format = config.get("format").and_then(Json::as_str).unwrap_or("");
+    // (a Comfy fp8 weight is an ordinary scaled fp8 one: read as any is)
+    if format == "float8_e4m3fn" {
+        return Ok(None);
+    }
     let info = s.info(name).map_err(candle_core::Error::wrap)?;
     if info.dtype != Dtype::I8 || info.shape.len() != 2 {
         candle_core::bail!("{name}: ConvRot expects a matrix of I8 storage");
@@ -237,7 +241,9 @@ pub fn w4a8(s: &StIndex, name: &str) -> Result<Option<W4a8>> {
 
 /// The ConvRot group size of a Comfy `int8_tensorwise` weight, when its note
 /// says it was rotated (the stored rows are then Hadamard-rotated in groups).
-/// None for weights without a note, or not rotated.
+/// None for weights without a note, or not rotated, and for Comfy's fp8 ones
+/// (`float8_e4m3fn`: an fp8 matrix and its `weight_scale`, as any scaled fp8
+/// checkpoint stores them, the note saying only so: LTX 2.3's mixed releases).
 pub fn rotation(s: &StIndex, name: &str) -> Result<Option<usize>> {
     let Some(prefix) = name.strip_suffix(".weight") else { return Ok(None) };
     let metadata = format!("{prefix}.comfy_quant");
@@ -247,6 +253,7 @@ pub fn rotation(s: &StIndex, name: &str) -> Result<Option<usize>> {
     let config = Json::parse(&s.read(&metadata).map_err(candle_core::Error::wrap)?).map_err(candle_core::Error::wrap)?;
     match config.get("format").and_then(Json::as_str) {
         Some("int8_tensorwise") => {}
+        Some("float8_e4m3fn") if !matches!(config.get("convrot"), Some(Json::Bool(true))) => return Ok(None),
         other => candle_core::bail!("{name}: unsupported comfy_quant format {other:?}"),
     }
     if !matches!(config.get("convrot"), Some(Json::Bool(true))) {
@@ -375,6 +382,33 @@ mod tests {
                 assert!((g - w).abs() < 1e-5, "group of {gs}, [{c}]: {g} against {w}");
             }
         }
+    }
+    /// Comfy's fp8 note (`float8_e4m3fn`, an fp8 matrix beside its `weight_scale`) says no rotation and no format of
+    /// its own: the weight is read as any scaled fp8 one is. A rotated fp8 note is still refused.
+    #[test]
+    fn a_comfy_fp8_note_is_an_ordinary_scaled_fp8_weight() {
+        let root = std::env::temp_dir().join(format!("oaiy-comfy-fp8-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("weights.safetensors");
+        let notes: [(&str, &[u8]); 2] = [("a", br#"{"format": "float8_e4m3fn"}"#), ("b", br#"{"format": "float8_e4m3fn", "convrot": true, "convrot_groupsize": 4}"#)];
+        let (mut header, mut data) = (Vec::new(), Vec::new());
+        for (name, note) in notes {
+            for (key, ty, shape, bytes) in [(format!("{name}.weight"), "F8_E4M3", vec![2i64, 4], vec![0x38u8; 8]), (format!("{name}.weight_scale"), "F32", vec![], 0.5f32.to_le_bytes().to_vec()), (format!("{name}.comfy_quant"), "U8", vec![note.len() as i64], note.to_vec())] {
+                let start = data.len();
+                data.extend(bytes);
+                header.push((key, Json::obj([("dtype", Json::str(ty)), ("shape", Json::Arr(shape.into_iter().map(Json::Int).collect())), ("data_offsets", Json::Arr(vec![Json::Int(start as i64), Json::Int(data.len() as i64)]))])));
+            }
+        }
+        let header = Json::Obj(header).to_json();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header.as_bytes());
+        bytes.extend(data);
+        std::fs::write(&file, bytes).unwrap();
+        let s = StIndex::open_file(&file).unwrap();
+        assert_eq!(rotation(&s, "a.weight").unwrap(), None);
+        assert!(load(&s, "a.weight", &Device::Cpu, DType::F32).unwrap().is_none(), "read as scaled fp8, not by this module");
+        assert!(rotation(&s, "b.weight").is_err(), "a rotated fp8 weight is not one this reads");
+        let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn packed_codes_scales_rounding_and_rotation_match_reference() {

@@ -85,12 +85,22 @@ Sulphur validates the shared LTX 2.3 architecture.
 | [Sulphur-2](https://huggingface.co/SulphurAI/Sulphur-2-base) | `sulphur_distil_bf16.safetensors` | Same Gemma 3 encoder | Included in checkpoint |
 | [LTX 2.5](https://huggingface.co/Lightricks/LTX-2.5) | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, including its tokenizer | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` |
 
-Use the complete distilled checkpoints. The worker reads published safetensors
-directly, without conversion:
+Use the complete distilled checkpoints, or a dev (not distilled) one with the
+model's `distilled: false` in Studio: that runs the reference's guided sampling
+(30 steps, CFG and STG) in one pass, or, with a distilled `transformer` beside
+it as `dev_transformer`, the guided first of two stages. Gemma 3 12B can also be
+a GGUF of it as llama.cpp writes it (`text_encoder` ending in `.gguf`): its
+matrices are dequantized to f16 as each layer is made, its norms read without
+llama.cpp's added 1, and its own tokenizer used, so no `tokenizer` is needed
+(its tokens are the tokenizer.json's: an ignored test compares them). An LTX 2.3
+audio-video dev checkpoint in ComfyUI's fp8-mixed form with a Q4_K_M Gemma 3:
+a 1 s, 512x320 clip with sound in 94 s on an RTX 4090 (51 s of its 30 guided
+steps). The worker reads published safetensors directly, without conversion:
 
 - **Weight types:** BF16, F16 and F32. It also reads fp8 (`F8_E4M3`) and int8 (`I8`)
   weights, with or without the per-tensor (or per-row) `weight_scale` that
-  ComfyUI's scaled checkpoints store beside each weight. These keep their stored
+  ComfyUI's scaled checkpoints store beside each weight (its mixed checkpoints'
+  `comfy_quant` note `float8_e4m3fn` says only that). These keep their stored
   size on disk and in the RAM tier, and become BF16 on the GPU, so a 21 GB fp8
   transformer streams from SSD at half the bytes of its BF16 original.
   ComfyUI Kitchen's `int8_tensorwise` weights with ConvRot (a `.comfy_quant`

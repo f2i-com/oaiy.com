@@ -1553,6 +1553,7 @@ dependencies = [
  "ggml-quants",
  "ggml-rs",
  "ggml-rs-wgpu",
+ "gguf",
  "half",
  "image",
  "meshopt",
@@ -1560,6 +1561,7 @@ dependencies = [
  "oaiy-image",
  "oaiy-tts",
  "regex",
+ "tokenizer",
  "tokenizers 0.21.4",
 ]
 
