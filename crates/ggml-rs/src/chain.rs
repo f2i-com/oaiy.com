@@ -698,6 +698,24 @@ pub trait ChainRecorder {
         let _ = (qkv, table, out, h, w, heads, win, shift, scale);
         unimplemented!("Swin's window attention on this device")
     }
+    /// 3D neighborhood attention as NATTEN's `na3d` computes it, heads 64 wide: each of a `t` by `h` by `w` grid's
+    /// tokens (`q`, `k`, `v` and `out` `[t h w, heads 64]`, t-major) attends to the `kernel` (`[kt, kh, kw]`, each at
+    /// most its axis) of keys around it, a window centred on it and shifted inward at the grid's edges (never cut); `q`
+    /// already scaled.
+    #[allow(clippy::too_many_arguments)]
+    fn neighborhood_attention_3d(&mut self, q: &DeviceVec, k: &DeviceVec, v: &DeviceVec, out: &DeviceVec, t: usize, h: usize, w: usize, heads: usize, kernel: [usize; 3]) {
+        let _ = (q, k, v, out, t, h, w, heads, kernel);
+        unimplemented!("3D neighborhood attention on this device")
+    }
+    /// Absolute 3D RoPE in place on `x` (`[t h w, heads, head_dim]`, t-major): each head's dims split into the time's,
+    /// the rows' and the columns' (`pairs` of each, in that order, a pair two adjacent dims), pair `j` of an axis turned
+    /// by the token's place on that axis times its frequency. `table` holds each axis's `(cos, sin)` by place and pair:
+    /// time's `[t, pairs[0], 2]`, then the rows' `[h, pairs[1], 2]`, then the columns' `[w, pairs[2], 2]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_3d_rows(&mut self, x: &DeviceVec, table: &DeviceVec, t: usize, h: usize, w: usize, heads: usize, pairs: [usize; 3]) {
+        let _ = (x, table, t, h, w, heads, pairs);
+        unimplemented!("3D RoPE on this device")
+    }
     /// An image's rows (`[h * w, c]`) resized to `oh` by `ow` into `out`, bilinear with the corners aligned (PyTorch's
     /// `align_corners=True`).
     #[allow(clippy::too_many_arguments)]

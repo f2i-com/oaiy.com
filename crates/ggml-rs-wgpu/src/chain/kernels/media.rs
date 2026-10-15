@@ -148,6 +148,132 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// 3D neighborhood attention, heads 64 wide ([`ChainRecorder::neighborhood_attention_3d`]): a workgroup a run of 64
+/// queries along a row of the grid (one time and row, consecutive columns) and a head, a thread a query (its 64 dims
+/// and sums in registers). The run's queries share their window's times and rows; along the row each window is its
+/// own (NATTEN's: centred, shifted inward at the edges), all inside the run's span of columns, which goes through
+/// workgroup memory 16 keys and values at a time, each thread taking the ones in its window. The softmax online.
+/// `p[0]`: `t`, `h`, `w`, the heads; `p[1]`: the kernel's `kt`, `kh`, `kw`.
+pub(in crate::chain) const NEIGHBORHOOD_ATTENTION_3D: &str = r#"
+@group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> k: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> v: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> out: array<vec4<f32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const RUN: u32 = 64u;
+const CHUNK: u32 = 16u;
+var<workgroup> ks: array<vec4<f32>, 256>;
+var<workgroup> vs: array<vec4<f32>, 256>;
+
+// where the window of `kernel` around `i` starts on an axis `n` long: centred, shifted inward at the edges
+fn start(i: u32, n: u32, kernel: u32) -> u32 {
+    let half = kernel / 2u;
+    var s = 0u;
+    if (i > half) { s = i - half; }
+    return min(s, n - kernel);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let nt = p[0].x;
+    let nh = p[0].y;
+    let nw = p[0].z;
+    let heads = p[0].w;
+    let kt = min(p[1].x, nt);
+    let kh = min(p[1].y, nh);
+    let kw = min(p[1].z, nw);
+    let w0 = wg.x * RUN;
+    let th = wg.y + wg.z * 65535u;
+    // (the grid's last slice past the runs: a whole workgroup at once)
+    if (th >= nt * nh * heads) { return; }
+    let head = th % heads;
+    let tr = th / heads;
+    let t = tr / nh;
+    let r = tr % nh;
+    let c4 = heads * 16u;
+    let wq = min(w0 + lid, nw - 1u);
+    let qo = (tr * nw + wq) * c4 + head * 16u;
+QLOADS
+    var m = -3.0e38;
+    var l = 0.0;
+    let st = start(t, nt, kt);
+    let sh = start(r, nh, kh);
+    let mine = start(wq, nw, kw);
+    let first = start(w0, nw, kw);
+    let last = start(min(w0 + RUN, nw) - 1u, nw, kw) + kw;
+    for (var dt = 0u; dt < kt; dt++) {
+        for (var dh = 0u; dh < kh; dh++) {
+            let row = ((st + dt) * nh + sh + dh) * nw;
+            for (var c0 = first; c0 < last; c0 += CHUNK) {
+                workgroupBarrier();
+                for (var e = lid; e < CHUNK * 16u; e += 64u) {
+                    let key = c0 + e / 16u;
+                    if (key < last) {
+                        let o = (row + key) * c4 + head * 16u + e % 16u;
+                        ks[e] = k[o];
+                        vs[e] = v[o];
+                    }
+                }
+                workgroupBarrier();
+                let lo = max(c0, mine);
+                let hi = min(c0 + CHUNK, mine + kw);
+                for (var key = lo; key < hi; key++) {
+                    let b = (key - c0) * 16u;
+                    let s = SCORE;
+                    let mn = max(m, s);
+                    let a = exp(m - mn);
+                    let e = exp(s - mn);
+                    l = l * a + e;
+                    m = mn;
+ACCUMULATE
+                }
+            }
+        }
+    }
+    if (w0 + lid < nw) {
+        let inv = 1.0 / l;
+STORES
+    }
+}
+"#;
+
+/// Absolute 3D RoPE in place ([`ChainRecorder::rope_3d_rows`]): a thread a pair of dims of a head of a token, its
+/// angle's cosine and sine from the table by its axis, its place on it and its pair there. `p[0]`: `t`, `h`, `w`, the
+/// heads; `p[1]`: the time's, the rows' and the columns' pairs, the tokens' pairs in all (`rows heads pairs`).
+pub(in crate::chain) const ROPE_3D_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> table: array<vec2<f32>>;
+@group(0) @binding(6) var<storage, read_write> x: array<vec2<f32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[1].w) { return; }
+    let nt = p[0].x;
+    let nh = p[0].y;
+    let nw = p[0].z;
+    let heads = p[0].w;
+    let pt = p[1].x;
+    let ph = p[1].y;
+    let pw = p[1].z;
+    let pairs = pt + ph + pw;
+    let j = i % pairs;
+    let token = i / (pairs * heads);
+    var at = 0u;
+    if (j < pt) {
+        at = (token / (nh * nw)) * pt + j;
+    } else if (j < pt + ph) {
+        at = nt * pt + ((token / nw) % nh) * ph + j - pt;
+    } else {
+        at = nt * pt + nh * ph + (token % nw) * pw + j - pt - ph;
+    }
+    let cs = table[at];
+    let a = x[i];
+    x[i] = vec2<f32>(a.x * cs.x - a.y * cs.y, a.x * cs.y + a.y * cs.x);
+}
+"#;
+
 /// A bilinear resize with the corners aligned ([`ChainRecorder::resize_bilinear_rows`]): a thread an output value.
 /// `p[0]`: `h`, `w`, `c`, `oh`; `p[1]`: `ow`.
 pub(in crate::chain) const RESIZE_BILINEAR_ROWS: &str = r#"

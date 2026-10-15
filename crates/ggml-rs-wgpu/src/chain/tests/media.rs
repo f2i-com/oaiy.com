@@ -1105,3 +1105,90 @@ fn a_convolutions_f16_bytes_pack_as_its_f32_values() {
         assert!(b.conv_weights_halves(&bad, cout, cin, k).is_none(), "an infinity");
     }
 }
+
+/// 3D neighborhood attention gives NATTEN's `na3d` as the host computes it (each query over the kernel of keys around
+/// it, the window shifted inward at the edges): LTX 2.5's diffusion VAE's kernels (3x7x7 at 2 heads, 3x5x5, 11x11x11
+/// on an axis shorter than it, so clamped), runs of columns past 64 and short of it, every edge.
+#[test]
+fn neighborhood_attention_3d_is_natten_s() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut r = rng(91);
+    let start = |i: usize, n: usize, k: usize| i.saturating_sub(k / 2).min(n - k);
+    for (t, h, w, heads, kernel) in [(4usize, 9usize, 8usize, 2usize, [3usize, 7, 7]), (5, 6, 70, 1, [3, 5, 5]), (3, 12, 13, 1, [11, 11, 11]), (1, 1, 3, 3, [3, 3, 3])] {
+        let (n, c) = (t * h * w, heads * 64);
+        let (q, k, v): (Vec<f32>, Vec<f32>, Vec<f32>) = ((0..n * c).map(|_| r() * 0.5).collect(), (0..n * c).map(|_| r() * 0.5).collect(), (0..n * c).map(|_| r()).collect());
+        let [kt, kh, kw] = [kernel[0].min(t), kernel[1].min(h), kernel[2].min(w)];
+        let mut want = vec![0f32; n * c];
+        for ti in 0..t {
+            for hi in 0..h {
+                for wi in 0..w {
+                    let row = (ti * h + hi) * w + wi;
+                    let keys: Vec<usize> = (0..kt).flat_map(|a| (0..kh).flat_map(move |bb| (0..kw).map(move |cc| ((start(ti, t, kt) + a) * h + start(hi, h, kh) + bb) * w + start(wi, w, kw) + cc))).collect();
+                    for head in 0..heads {
+                        let o = head * 64;
+                        let s: Vec<f64> = keys.iter().map(|&j| (0..64).map(|d| q[row * c + o + d] as f64 * k[j * c + o + d] as f64).sum()).collect();
+                        let m = s.iter().cloned().fold(f64::MIN, f64::max);
+                        let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+                        let l: f64 = e.iter().sum();
+                        for d in 0..64 {
+                            want[row * c + o + d] = (keys.iter().zip(&e).map(|(&j, e)| e * v[j * c + o + d] as f64).sum::<f64>() / l) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        let (qd, kd, vd, od) = (b.vec(n * c), b.vec(n * c), b.vec(n * c), b.vec(n * c));
+        DeviceChain::upload(&b, &qd, &q);
+        DeviceChain::upload(&b, &kd, &k);
+        DeviceChain::upload(&b, &vd, &v);
+        let mut rec = b.begin();
+        rec.neighborhood_attention_3d(&qd, &kd, &vd, &od, t, h, w, heads, kernel);
+        rec.read(&od);
+        close(&rec.finish().pop().unwrap(), &want, &format!("neighborhood attention {t}x{h}x{w} by {kernel:?}"));
+    }
+}
+
+/// Absolute 3D RoPE turns each pair of dims as the host does: LTX 2.5's diffusion VAE's split of a 64-wide head (8
+/// pairs by time, 12 by row, 12 by column), at a token's place on each axis.
+#[test]
+fn rope_3d_is_the_hosts() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut r = rng(93);
+    let (t, h, w, heads, pairs) = (3usize, 5usize, 7usize, 2usize, [8usize, 12, 12]);
+    let n = t * h * w;
+    let x: Vec<f32> = (0..n * heads * 64).map(|_| r()).collect();
+    let angle = |place: usize, pair: usize, of: usize| place as f32 * (1.0 / 10000f64.powf(2.0 * pair as f64 / (2 * of) as f64)) as f32;
+    let mut table = Vec::new();
+    for (len, p) in [(t, pairs[0]), (h, pairs[1]), (w, pairs[2])] {
+        for place in 0..len {
+            for j in 0..p {
+                let a = angle(place, j, p);
+                table.extend([a.cos(), a.sin()]);
+            }
+        }
+    }
+    let mut want = x.clone();
+    for token in 0..n {
+        let places = [token / (h * w), (token / w) % h, token % w];
+        for head in 0..heads {
+            let mut j = 0;
+            for axis in 0..3 {
+                for jj in 0..pairs[axis] {
+                    let a = angle(places[axis], jj, pairs[axis]);
+                    let i = (token * heads + head) * 64 + 2 * j;
+                    let (x0, x1) = (x[i], x[i + 1]);
+                    want[i] = x0 * a.cos() - x1 * a.sin();
+                    want[i + 1] = x0 * a.sin() + x1 * a.cos();
+                    j += 1;
+                }
+            }
+        }
+    }
+    let (xd, td) = (b.vec(x.len()), b.vec(table.len()));
+    DeviceChain::upload(&b, &xd, &x);
+    DeviceChain::upload(&b, &td, &table);
+    let mut rec = b.begin();
+    rec.rope_3d_rows(&xd, &td, t, h, w, heads, pairs);
+    rec.read(&xd);
+    close(&rec.finish().pop().unwrap(), &want, "3D RoPE");
+}

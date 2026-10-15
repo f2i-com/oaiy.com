@@ -462,6 +462,39 @@ impl ChainRecorder for Recorder<'_> {
         self.weigh(4.0 * (hp * wp * n) as f64 * c as f64);
     }
 
+    fn neighborhood_attention_3d(&mut self, q: &DeviceVec, k: &DeviceVec, v: &DeviceVec, out: &DeviceVec, t: usize, h: usize, w: usize, heads: usize, kernel: [usize; 3]) {
+        let len = t * h * w * heads * 64;
+        assert!(len > 0 && kernel.iter().all(|&k| k > 0) && q.len >= len && k.len >= len && v.len >= len && out.len >= len, "chain: 3D neighborhood attention over {t}x{h}x{w} tokens of {heads} heads");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        // (a workgroup a run of 64 columns of a (time, row, head): those past 65,535 in the grid's third dimension)
+        let runs = (t * h * heads) as u32;
+        let words = [t as u32, h as u32, w as u32, heads as u32, kernel[0] as u32, kernel[1] as u32, kernel[2] as u32, 0];
+        // (the query's 16 vec4s and its sums named one by one, not an array: an array indexed in a loop goes to the
+        // thread's memory, not its registers, on Apple's GPUs)
+        static BODY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let body = BODY.get_or_init(|| {
+            let each = |f: &dyn Fn(usize) -> String| (0..16).map(f).collect::<Vec<_>>().join("\n");
+            let score = (0..16).map(|d| format!("dot(q{d}, ks[b + {d}u])")).collect::<Vec<_>>().join(" + ");
+            NEIGHBORHOOD_ATTENTION_3D
+                .replace("QLOADS", &each(&|d| format!("    let q{d} = q[qo + {d}u];\n    var a{d} = vec4<f32>();")))
+                .replace("SCORE", &score)
+                .replace("ACCUMULATE", &each(&|d| format!("                    a{d} = a{d} * a + e * vs[b + {d}u];")))
+                .replace("STORES", &each(&|d| format!("        out[qo + {d}u] = a{d} * inv;")))
+        });
+        self.dispatch_wide("chain-neighborhood-attention-3d", body, [buffer(q), buffer(k), buffer(v), &d, &d, &d, buffer(out), &drw], &words, (w.div_ceil(64) as u32, runs.min(65535), runs.div_ceil(65535)));
+        let window = kernel[0].min(t) * kernel[1].min(h) * kernel[2].min(w);
+        self.weigh(4.0 * (t * h * w * window) as f64 * (heads * 64) as f64);
+    }
+
+    fn rope_3d_rows(&mut self, x: &DeviceVec, table: &DeviceVec, t: usize, h: usize, w: usize, heads: usize, pairs: [usize; 3]) {
+        let n = pairs.iter().sum::<usize>();
+        let all = t * h * w * heads * n;
+        assert!(all > 0 && x.len >= 2 * all && table.len >= 2 * (t * pairs[0] + h * pairs[1] + w * pairs[2]), "chain: 3D RoPE of {t}x{h}x{w} tokens of {heads} heads");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        let words = [t as u32, h as u32, w as u32, heads as u32, pairs[0] as u32, pairs[1] as u32, pairs[2] as u32, all as u32];
+        self.dispatch_wide("chain-rope-3d-rows", ROPE_3D_ROWS, [buffer(table), &d, &d, &d, &d, &d, buffer(x), &drw], &words, grid((all as u32).div_ceil(256)));
+    }
+
     fn resize_bilinear_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize, oh: usize, ow: usize) {
         assert!(h > 0 && w > 0 && x.len >= h * w * c && out.len >= oh * ow * c, "chain: a resize of {h}x{w} to {oh}x{ow}");
         let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
