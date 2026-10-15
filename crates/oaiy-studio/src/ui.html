@@ -1451,6 +1451,7 @@ function missingOf(section, m) {
   if (section === "music" || section === "sound") return empty("path") ? ["path"] : [];
   if (section === "model3d") return ["path", "dino", "naf"].filter(empty);
   if (section === "image" && m.architecture === "flux2-klein-4b") return ["transformer", "text_encoder", "vae", "tokenizer"].filter(empty);
+  if (section === "image" && m.architecture === "flux3-klein") return ["transformer", "text_encoder", "vae"].filter(empty);
   if (section === "image") return (m.architecture || "qwen-image") === "sdxl" ? ["checkpoint", "tokenizer"].filter(empty)
     : [...(empty("base") ? ["base"] : []), ...(empty("transformer") && empty("safetensors_transformer") ? ["transformer"] : [])];
   return [...["transformer", "text_encoder", "vae"].filter(empty), ...(m.family !== "ltx-2.5" && empty("tokenizer") ? ["tokenizer"] : [])];
@@ -1504,8 +1505,12 @@ function renderModels() {
 
   const img = Object.entries(cfg.media.image.models);
   $("#m-image").innerHTML = img.length ? img.map(([name, m]) => {
-    const sdxl = m.architecture === "sdxl", klein = m.architecture === "flux2-klein-4b", miss = missingOf("image", m);
-    const fields = klein
+    const sdxl = m.architecture === "sdxl", klein = m.architecture === "flux2-klein-4b", flux3 = m.architecture === "flux3-klein", miss = missingOf("image", m);
+    const fields = flux3
+      ? field("FLUX 3 Image Klein transformer (model.safetensors)", "image", name, "transformer", m.transformer, {missing: miss.includes("transformer")})
+        + field("Qwen3-VL-4B-Instruct text encoder (folder)", "image", name, "text_encoder", m.text_encoder, {dir: true, missing: miss.includes("text_encoder")})
+        + field("FLUX.2 VAE (ae.safetensors)", "image", name, "vae", m.vae, {missing: miss.includes("vae")})
+      : klein
       ? field("Klein 4B transformer (.safetensors)", "image", name, "transformer", m.transformer, {missing: miss.includes("transformer")})
         + field("Qwen3-4B text encoder", "image", name, "text_encoder", m.text_encoder, {missing: miss.includes("text_encoder")})
         + field("FLUX.2 VAE", "image", name, "vae", m.vae, {missing: miss.includes("vae")})
@@ -1517,7 +1522,7 @@ function renderModels() {
         + field("Transformer (.safetensors)", "image", name, "safetensors_transformer", m.safetensors_transformer) + field("Turbo adapter (optional)", "image", name, "adapter", m.adapter)
         + field("Text encoder override (optional)", "image", name, "text_encoder", m.text_encoder)
         + loraList("image", name, m.loras);
-    return mediaItem("image", name, m, klein ? "FLUX.2 Klein 4B" : sdxl ? "SDXL" : "Qwen Image", miss, fields);
+    return mediaItem("image", name, m, flux3 ? "FLUX 3 Image Klein" : klein ? "FLUX.2 Klein 4B" : sdxl ? "SDXL" : "Qwen Image", miss, fields);
   }).join("") : '<div class="empty">No image model yet. Add an SDXL checkpoint, a Qwen Image .gguf or .safetensors file, or a diffusers folder.</div>';
 
   const sp = Object.entries(cfg.media.speech?.models || {});

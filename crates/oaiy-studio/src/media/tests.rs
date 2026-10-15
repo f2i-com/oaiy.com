@@ -22,6 +22,43 @@ fn body(s: &str) -> Json {
     Json::parse(s.as_bytes()).unwrap()
 }
 
+/// A FLUX 3 Image Klein job: its checkpoint's own steps and guidance (the worker's to say), up to ten references, and
+/// at `size: auto` with references BFL's own size (none sent: the first reference's).
+#[test]
+fn flux3_requests_take_ten_references_and_the_references_size() {
+    let mut c=cfg("","");
+    let m=body(r#"{"architecture":"flux3-klein","transformer":"flux3/model.safetensors","text_encoder":"flux3/text_encoder","vae":"flux3/ae.safetensors"}"#);
+    let mut media=c.get("media").unwrap().clone();
+    let mut image=media.get("image").unwrap().clone();
+    let mut models=image.get("models").unwrap().clone();
+    crate::util::set(&mut models,"flux3",m);
+    crate::util::set(&mut image,"models",models);
+    crate::util::set(&mut media,"image",image);
+    crate::util::set(&mut c,"media",media);
+    config::validate(&c).unwrap();
+    let root=Path::new("/install");
+    let (r,..)=image_request(&c,root,Path::new("/install/outputs"),&body(r#"{"model":"flux3","prompt":"a fox","size":"768x512"}"#),false).unwrap();
+    assert_eq!(r.get("architecture").and_then(Json::as_str),Some("flux3-klein"));
+    assert_eq!((r.get("width").and_then(Json::as_i64),r.get("height").and_then(Json::as_i64)),(Some(768),Some(512)));
+    assert_eq!(r.get("text_encoder").and_then(Json::as_str),Some("/install/flux3/text_encoder"));
+    assert!(r.get("steps").is_none()&&r.get("cfg").is_none()&&r.get("images").is_none()&&r.get("base").is_none());
+    assert!(image_request(&c,root,root,&body(r#"{"model":"flux3","prompt":"a fox","negative_prompt":"blur"}"#),false).is_err());
+    // references: a data URL each, written where the worker reads them
+    let out=std::env::temp_dir().join(format!("oaiy-flux3-refs-{}",std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    let refs=|n: usize| format!(r#"{{"model":"flux3","prompt":"the two together","images":[{}]}}"#,vec![r#""data:image/png;base64,iVBORw0KGgo=""#;n].join(","));
+    let (r,..)=image_request(&c,root,&out,&body(&refs(10)),false).unwrap();
+    assert_eq!(r.get("images").and_then(Json::as_array).map(|a|a.len()),Some(10));
+    assert_eq!(r.get("reference_pixels").and_then(Json::as_i64),Some(1<<20));
+    assert!(r.get("width").is_none()&&r.get("height").is_none());
+    assert!(image_request(&c,root,&out,&body(&refs(11)),false).unwrap_err().contains("at most 10"));
+    let _=std::fs::remove_dir_all(&out);
+    // (a model without its VAE is not one)
+    let mut broken=c.clone();
+    crate::util::set(crate::registry::obj_mut(&mut broken,&["media","image","models","flux3"]).unwrap(),"vae",Json::str(""));
+    assert!(config::validate(&broken).unwrap_err().contains("needs vae"));
+}
+
 #[test]
 fn klein_requests_use_native_paths_fixed_distilled_recipe_and_optional_style_loras() {
     let mut c=cfg("","");

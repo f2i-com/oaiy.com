@@ -245,6 +245,34 @@ fn config() -> Config {
         video_config: None,
     }
 }
+/// A FLUX 3 Image Klein model: its paths the catalog's (its text encoder a folder), its steps and guidance the
+/// checkpoint's own unless named, up to ten references (Qwen Image three), and with references no size: the first's.
+#[test]
+fn flux3_catalog_dispatch_takes_ten_references() {
+    let mut cfg=config();
+    let root=std::env::temp_dir().join(format!("oaiy-flux3-catalog-{}",std::process::id()));
+    std::fs::create_dir_all(root.join("text_encoder")).unwrap();
+    for file in ["model.safetensors","ae.safetensors","ref.png"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
+    std::fs::write(root.join("image.json"),br#"{"default_model":"flux3","models":{"flux3":{"architecture":"flux3-klein","transformer":"model.safetensors","text_encoder":"text_encoder","vae":"ae.safetensors"}}}"#).unwrap();
+    cfg.media_dir=Some(root.clone());
+    cfg.output_root=root.join("output");
+    let request=prepare(&cfg,&Json::parse(br#"{"prompt":"a fox","transformer":"untrusted"}"#).unwrap()).unwrap();
+    assert_eq!(request.get("architecture").and_then(Json::as_str),Some("flux3-klein"));
+    assert_eq!(request.get("transformer").and_then(Json::as_str),root.join("model.safetensors").to_str());
+    assert_eq!(request.get("text_encoder").and_then(Json::as_str),root.join("text_encoder").to_str());
+    assert_eq!((request.get("width").and_then(Json::as_i64),request.get("height").and_then(Json::as_i64)),(Some(1024),Some(1024)));
+    assert!(request.get("steps").is_none()&&request.get("cfg").is_none()&&request.get("loras").is_none());
+    let reference=Json::str(root.join("ref.png").to_string_lossy());
+    let edit=|n: usize| Json::obj([("prompt",Json::str("the same fox at night")),("images",Json::Arr(vec![reference.clone();n]))]);
+    let request=prepare(&cfg,&edit(10)).unwrap();
+    assert_eq!(request.get("images").and_then(Json::as_array).map(|a|a.len()),Some(10));
+    assert_eq!(request.get("reference_pixels").and_then(Json::as_i64),Some(1<<20));
+    assert!(request.get("width").is_none()&&request.get("height").is_none());
+    assert!(prepare(&cfg,&edit(11)).is_err());
+    assert!(prepare(&cfg,&Json::parse(br#"{"prompt":"a fox","negative_prompt":"blur"}"#).unwrap()).is_err());
+    let _=std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn klein_catalog_dispatch_owns_paths_and_can_disable_style_loras() {
     let mut cfg=config();

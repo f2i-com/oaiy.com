@@ -623,6 +623,12 @@ impl WgpuBackend {
         self.gpu.coop_tile != 0
     }
 
+    /// Whether the tensor cores take f16 matrices too (16 x 16 fragments: NVIDIA's, AMD's), not only the K-quants' and
+    /// Q8_0's (Metal's 8 x 8).
+    pub fn f16_tensor_cores(&self) -> bool {
+        self.gpu.coop_tile == 16
+    }
+
     /// The most bytes one vector an op reads or writes may hold (the adapter's storage binding limit: 2 GB here).
     pub fn max_binding(&self) -> u64 {
         (self.gpu.limits.max_storage_buffer_binding_size as u64).min(self.gpu.limits.max_buffer_size)

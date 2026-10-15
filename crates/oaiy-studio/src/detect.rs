@@ -402,6 +402,16 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
         return Ok(detected(Role::Component { kind: "adapter" }, format,
             format!("LoRA adapter ({label}); attach it to a Qwen Image model as its turbo adapter"), vec![("adapter", p)]));
     }
+    // FLUX 3 Image Klein (BFL's model.safetensors, or ComfyUI's file of it): the picture's, its references' and the
+    // text's own blocks, then 28 shared; the distilled checkpoint a flow map (it embeds the time a step goes to)
+    if shape_of(h, "emb_in.image.weight") == Some(&[3072, 128]) && shape_of(h, "txt_in.weight") == Some(&[3072, 20480]) && has(h, "single_blocks.27.q_proj.weight") {
+        let what = if has(h, "ref_time_in.in_layer.weight") { "distilled, 16 steps" } else { "base, 50 steps with guidance" };
+        let mut d = detected(Role::Image { architecture: "flux3-klein" }, format,
+            format!("FLUX 3 Image Klein transformer, {what}; pictures and edits of up to 10 references (FLUX Kommunity License: non-commercial use; see its terms) ({label})"),
+            vec![("architecture", Json::str("flux3-klein")), ("transformer", p)]);
+        d.missing.extend(["text_encoder", "vae"].into_iter().map(String::from));
+        return Ok(d);
+    }
     if shape_of(h, "img_in.weight") == Some(&[3072, 128]) && shape_of(h, "txt_in.weight") == Some(&[3072, 7680])
         && has(h, "double_blocks.4.img_attn.qkv.weight") && has(h, "single_blocks.19.linear1.weight") {
         let mut d = detected(Role::Image { architecture: "flux2-klein-4b" }, format, format!("FLUX.2 Klein 4B transformer ({label}); select base variant explicitly for base weights"),
@@ -526,6 +536,10 @@ fn esrgan(path: &Path) -> Detected {
 fn directory(dir: &Path) -> Result<Detected, String> {
     let label = stem(dir);
     let read = |name: &str| std::fs::read(dir.join(name)).ok().and_then(|b| Json::parse(&b).ok());
+    // BFL's FLUX 3 Image Klein release: its transformer's model.safetensors beside its text encoder and VAE
+    if let Some(d) = safetensors_file(&dir.join("model.safetensors")).ok().filter(|d| matches!(d.role, Role::Image { architecture: "flux3-klein" })) {
+        return Ok(d);
+    }
     // Pixal3D: its pipeline.json names the checkpoints in ckpts/.
     if let Some(pipeline) = read("pipeline.json") {
         let name = str_or(&pipeline, "name", "");
@@ -664,6 +678,13 @@ fn directory(dir: &Path) -> Result<Detected, String> {
             }
             return Ok(detected(Role::Component { kind: "model3d_dino" }, "safetensors", "DINOv3 ViT-L/16: the image encoder 3D models need (Meta's DINOv3 License)".into(), vec![("dino", path_json(dir))]));
         }
+        // (the 4B, 2,560 wide, is FLUX 3 Image Klein's; Qwen Image's is the 8B)
+        if model_type == "qwen3_vl" && has_ext(dir, "safetensors") && config.get("text_config").and_then(|t| t.get("hidden_size")).and_then(Json::as_i64) == Some(2560) {
+            if !dir.join("tokenizer.json").is_file() {
+                return Err(format!("{label}: a Qwen3-VL-4B folder needs its tokenizer.json"));
+            }
+            return Ok(detected(Role::Component { kind: "flux3_text_encoder" }, "safetensors", format!("Qwen3-VL-4B text encoder for FLUX 3 Image Klein ({label})"), vec![("text_encoder", path_json(dir))]));
+        }
         if model_type == "qwen3_vl" && has_ext(dir, "safetensors") {
             return Ok(detected(Role::Component { kind: "text_encoder" }, "safetensors", format!("Qwen3-VL text encoder folder ({label})"), vec![("text_encoder", path_json(dir))]));
         }
@@ -757,10 +778,30 @@ mod tests {
         assert!(matches!(d.role,Role::Image {architecture:"flux2-klein-4b"}));
         assert_eq!(classify(vec![tensor("model.embed_tokens.weight",&[151936,2560]),tensor("model.layers.0.self_attn.q_proj.weight",&[4096,2560])]).kind(),"klein_text_encoder");
         assert_eq!(classify(vec![tensor("bn.running_mean",&[128]),tensor("decoder.conv_in.weight",&[512,32,3,3])]).kind(),"flux2_vae");
+        // FLUX 3 Image Klein's (ComfyUI's file prefixes its names): distilled where it embeds a step's target time
+        let flux3=|more:Vec<(String,Json)>| classify([tensor("model.diffusion_model.emb_in.image.weight",&[3072,128]),tensor("model.diffusion_model.txt_in.weight",&[3072,20480]),tensor("model.diffusion_model.single_blocks.27.q_proj.weight",&[3072,3072])].into_iter().chain(more).collect());
+        let (distilled,base)=(flux3(vec![tensor("model.diffusion_model.ref_time_in.in_layer.weight",&[3072,256])]),flux3(vec![]));
+        assert!(matches!(distilled.role,Role::Image {architecture:"flux3-klein"}) && matches!(base.role,Role::Image {architecture:"flux3-klein"}));
+        assert!(distilled.summary.contains("distilled") && base.summary.contains("base"), "{} / {}", distilled.summary, base.summary);
+        assert_eq!(distilled.missing,["text_encoder","vae"]);
         let h=Header {tensors:vec![("diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight".into(),vec![32,3072])],metadata:Json::obj([("ss_base_model_version",Json::str("flux2_klein_4b"))])};
         let d=classify_header(&h,Path::new("style.safetensors"),"safetensors").unwrap();
         assert_eq!(d.kind(),"klein_lora");
         assert!(!d.fields.iter().any(|(k,_)|k=="adapter"));
+    }
+
+    /// A Qwen3-VL folder is FLUX 3 Image Klein's text encoder where it is the 4B (2,560 wide), Qwen Image's where not.
+    #[test]
+    fn qwen3_vl_4b_is_flux3s_text_encoder() {
+        let d = tmp("qwen3vl");
+        for (width, kind) in [(2560, "flux3_text_encoder"), (4096, "text_encoder")] {
+            let dir = d.0.join(format!("qwen3vl-{width}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), format!(r#"{{"model_type":"qwen3_vl","text_config":{{"hidden_size":{width}}}}}"#)).unwrap();
+            std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+            safetensors(&dir.join("model.safetensors"), r#"{"model.language_model.norm.weight":{"dtype":"BF16","shape":[8],"data_offsets":[0,16]}}"#);
+            assert_eq!(detect(&dir).unwrap().kind(), kind);
+        }
     }
 
     fn gguf(path: &Path, kv: &[(&str, &str)], tensors: &[&str]) {

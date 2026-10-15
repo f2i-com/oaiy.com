@@ -1,6 +1,9 @@
 //! FLUX.2 Klein's text conditioning (Qwen3-4B) on WebGPU, as [`crate::klein::text::TextEncoder`] encodes a prompt: its
 //! chat template's tokens right-padded to 512, causal, a padded position attending to the prompt's own tokens only;
 //! the states after layers 9, 18 and 27 side by side (7,680 wide, the padded positions' too), no final norm.
+//! FLUX 3 Image Klein's ([`FLUX3`]: Qwen3-VL-4B's language model, as BFL's `flux3/text_encoder.py` encodes a prompt)
+//! the same but for its taps (every fourth layer's to the 32nd: 20,480 wide), its RoPE's base, its padding (to the
+//! next multiple of 80 tokens, at most 4,096) and its padded positions' rotation (all at position 1).
 //! The weights f16 on the GPU (the BF16 checkpoint's rounded) a layer at a time, every prompt through it (its 5.4 GB
 //! never all on the card), the embedding's rows looked up on the host; the matmuls read their inputs as f32 (an LLM's
 //! hidden states reach some hundreds).
@@ -9,16 +12,61 @@ use candle_core::{DType, Device, Result, Tensor};
 use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec};
 use std::path::Path;
 
-const LAYERS: usize = 27;
-/// The layers whose output states are the conditioning's (counted from one, as Hugging Face's tuple of hidden states).
-const TAPS: [usize; 3] = [9, 18, 27];
 const D: usize = 2560;
 const HEADS: usize = 32;
 const KV_HEADS: usize = 8;
 const HD: usize = 128;
-const SEQ: usize = 512;
 const EPS: f32 = 1e-6;
-const THETA: f64 = 1_000_000.;
+
+/// How a prompt's tokens are padded.
+#[derive(Clone, Copy, Debug)]
+pub enum Pad {
+    /// To this many, cut to it.
+    To(usize),
+    /// To the next multiple of `of`, cut to `max`.
+    Multiple { of: usize, max: usize },
+}
+
+impl Pad {
+    /// A prompt of `tokens` tokens: how many of them are kept, and how many positions it takes padded.
+    fn sizes(self, tokens: usize) -> (usize, usize) {
+        match self {
+            Pad::To(n) => (tokens.min(n), n),
+            Pad::Multiple { of, max } => (tokens.min(max), (tokens.div_ceil(of) * of).min(max)),
+        }
+    }
+}
+
+/// A FLUX text encoder: which Qwen decoder, which of its layers' states, and how a prompt is made into its tokens.
+#[derive(Clone, Copy, Debug)]
+pub struct Spec {
+    /// The decoder's tensors' prefix.
+    pub prefix: &'static str,
+    /// The layers whose output states are the conditioning's (counted from one, as Hugging Face's tuple of hidden
+    /// states), side by side in this order.
+    pub taps: &'static [usize],
+    /// RoPE's base.
+    pub theta: f64,
+    pub pad: Pad,
+    /// The position a padded token is rotated at: its own (None), or this one.
+    pub pad_position: Option<usize>,
+    /// The prompt in its chat template.
+    pub template: fn(&str) -> String,
+    /// What the checkpoint must be.
+    pub what: &'static str,
+}
+
+/// FLUX.2 Klein 4B's: Qwen3-4B.
+pub const FLUX2: Spec = Spec { prefix: "model.", taps: &[9, 18, 27], theta: 1_000_000., pad: Pad::To(512), pad_position: None, template: crate::klein::text::chat_template, what: "Klein 4B requires the Qwen3-4B text encoder, not Qwen3-VL or Qwen3.5" };
+
+/// FLUX 3 Image Klein's: Qwen3-VL-4B-Instruct's language model (its vision tower unused), as `flux3/text_encoder.py`
+/// runs it: positions counted over the prompt, the padding's all 1 (`masked_fill(mask == 0, 1)`).
+pub const FLUX3: Spec = Spec { prefix: "model.language_model.", taps: &[4, 8, 12, 16, 20, 24, 28, 32], theta: 5_000_000., pad: Pad::Multiple { of: 80, max: 4096 }, pad_position: Some(1), template: flux3_template, what: "FLUX 3 Image Klein requires the Qwen3-VL-4B-Instruct text encoder" };
+
+/// Qwen3-VL's chat template of one user turn and the assistant's to come (no system prompt).
+pub fn flux3_template(prompt: &str) -> String {
+    format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
+}
 
 fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
@@ -47,6 +95,7 @@ struct Layer {
 
 pub struct WgpuKleinText {
     gpu: ggml_rs_wgpu::WgpuBackend,
+    spec: Spec,
     /// The token embedding (`[vocab, D]`), on the host: a prompt's rows looked up there.
     embedding: Vec<f32>,
     /// The weights, a layer's read as the prompts reach it.
@@ -58,8 +107,9 @@ pub struct WgpuKleinText {
 
 /// A prompt's vectors through the layers.
 struct Prompt {
-    /// Its own tokens (the rest of the 512 padding).
+    /// Its own tokens, and all its positions (the rest padding).
     valid: usize,
+    seq: usize,
     x: DeviceVec,
     norm: DeviceVec,
     q: DeviceVec,
@@ -85,14 +135,23 @@ impl WgpuKleinText {
     /// The Qwen3-4B text encoder at `checkpoint` with `tokenizer` (its `tokenizer.json`) on GPU `device` (as the
     /// computer counts them; OAIY_WEBGPU_ADAPTER naming one instead).
     pub fn load(checkpoint: &Path, tokenizer: &Path, device: usize) -> Result<Self> {
+        Self::load_spec(checkpoint, tokenizer, device, FLUX2)
+    }
+
+    /// [`Self::load`] of the text encoder `spec` says.
+    pub fn load_spec(checkpoint: &Path, tokenizer: &Path, device: usize, spec: Spec) -> Result<Self> {
         let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let mut w = Weights::open(checkpoint)?;
-        let shape = |w: &Weights, name: &str| w.shape(&format!("model.layers.0.{name}.weight"));
-        let (q, k, gate) = (shape(&w, "self_attn.q_proj")?, shape(&w, "self_attn.k_proj")?, shape(&w, "mlp.gate_proj")?);
-        if w.shape("model.embed_tokens.weight")? != [151936, D] || q != [HEADS * HD, D] || k != [KV_HEADS * HD, D] || gate.len() != 2 || gate[1] != D {
-            candle_core::bail!("Klein 4B requires the Qwen3-4B text encoder, not Qwen3-VL or Qwen3.5");
+        let p = spec.prefix;
+        let shape = |w: &Weights, name: &str| w.shape(&format!("{p}layers.0.{name}.weight"));
+        let last = spec.taps.iter().copied().max().unwrap_or(0);
+        let (Ok(q), Ok(k), Ok(gate), Ok(embedding)) = (shape(&w, "self_attn.q_proj"), shape(&w, "self_attn.k_proj"), shape(&w, "mlp.gate_proj"), w.shape(&format!("{p}embed_tokens.weight"))) else {
+            candle_core::bail!("{}", spec.what);
+        };
+        if embedding != [151936, D] || q != [HEADS * HD, D] || k != [KV_HEADS * HD, D] || gate.len() != 2 || gate[1] != D || !w.has(&format!("{p}layers.{}.mlp.down_proj.weight", last - 1)) {
+            candle_core::bail!("{}", spec.what);
         }
-        let embedding = w.tensor("model.embed_tokens.weight", &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let embedding = w.tensor(&format!("{p}embed_tokens.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer).map_err(err)?;
         tokenizer.with_padding(None);
         tokenizer.with_truncation(None).map_err(err)?;
@@ -101,7 +160,7 @@ impl WgpuKleinText {
                 candle_core::bail!("incompatible Qwen3 tokenizer: {token} must have id {id}");
             }
         }
-        Ok(Self { gpu, embedding, w, ff: gate[0], tokenizer })
+        Ok(Self { gpu, spec, embedding, w, ff: gate[0], tokenizer })
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
@@ -110,7 +169,7 @@ impl WgpuKleinText {
 
     /// Layer `i`'s weights on the GPU.
     fn layer(&mut self, i: usize) -> Result<Layer> {
-        let p = format!("model.layers.{i}");
+        let p = format!("{}layers.{i}", self.spec.prefix);
         let gpu = &self.gpu;
         let mut none = crate::lora::Loras::open(&[])?;
         let w = &mut self.w;
@@ -139,38 +198,41 @@ impl WgpuKleinText {
         })
     }
 
-    /// `prompt`'s conditioning (`[1, 512, 7680]` on the CPU), as [`crate::klein::text::TextEncoder::encode`] gives it.
+    /// `prompt`'s conditioning (`[1, 512, 7680]` on the CPU, FLUX.2's; FLUX 3's `[1, its padded length, 20480]`), as
+    /// [`crate::klein::text::TextEncoder::encode`] gives it.
     pub fn encode(&mut self, prompt: &str) -> Result<Tensor> {
         self.encode_all(&[prompt])?.pop().ok_or_else(|| err("no conditioning"))
     }
 
     /// Each prompt's conditioning, every prompt through a layer while its weights are on the card.
     pub fn encode_all(&mut self, prompts: &[&str]) -> Result<Vec<Tensor>> {
-        let (ff, vocab) = (self.ff, self.embedding.len() / D);
+        let (ff, vocab, spec) = (self.ff, self.embedding.len() / D, self.spec);
         let (qd, kd) = (HEADS * HD, KV_HEADS * HD);
         let row = 2 * kd;
         let pad = self.tokenizer.token_to_id("<|endoftext|>").ok_or_else(|| err("Qwen3 tokenizer lacks its padding token"))?;
-        // RoPE over each head's halves (NeoX), a position a token
-        let mut table = Vec::with_capacity(SEQ * HD);
-        for p in 0..SEQ {
-            for j in 0..HD / 2 {
-                let a = p as f64 / THETA.powf(j as f64 / (HD / 2) as f64);
-                table.push(a.sin() as f32);
-                table.push(a.cos() as f32);
-            }
-        }
+        let layers = spec.taps.iter().copied().max().unwrap_or(0);
         let mut all = Vec::with_capacity(prompts.len());
         for prompt in prompts {
-            let chat = crate::klein::text::chat_template(prompt);
+            let chat = (spec.template)(prompt);
             let mut ids = self.tokenizer.encode(chat, false).map_err(err)?.get_ids().to_vec();
-            // (the published conditioning: right-padded or cut to 512)
-            ids.truncate(SEQ);
-            let valid = ids.len();
+            // (the published conditioning: right-padded, or cut)
+            let (valid, seq) = spec.pad.sizes(ids.len());
+            ids.truncate(valid);
             if valid == 0 {
                 candle_core::bail!("empty Klein token sequence");
             }
-            ids.resize(SEQ, pad);
-            let mut x0 = Vec::with_capacity(SEQ * D);
+            ids.resize(seq, pad);
+            // RoPE over each head's halves (NeoX), a position a token: a padded one at its own or the spec's
+            let mut table = Vec::with_capacity(seq * HD);
+            for at in 0..seq {
+                let p = if at < valid { at } else { spec.pad_position.unwrap_or(at) };
+                for j in 0..HD / 2 {
+                    let a = p as f64 / spec.theta.powf(j as f64 / (HD / 2) as f64);
+                    table.push(a.sin() as f32);
+                    table.push(a.cos() as f32);
+                }
+            }
+            let mut x0 = Vec::with_capacity(seq * D);
             for &id in &ids {
                 let id = id as usize;
                 if id >= vocab {
@@ -178,26 +240,27 @@ impl WgpuKleinText {
                 }
                 x0.extend_from_slice(&self.embedding[id * D..(id + 1) * D]);
             }
-            let padded = SEQ - valid;
+            let padded = seq - valid;
             let p = Prompt {
                 valid,
-                x: self.vec(SEQ * D),
-                norm: self.vec(SEQ * D),
-                q: self.vec(SEQ * qd),
-                k: self.vec(SEQ * kd),
-                v: self.vec(SEQ * kd),
-                qq: self.vec(SEQ * qd),
-                kk: self.vec(SEQ * kd),
+                seq,
+                x: self.vec(seq * D),
+                norm: self.vec(seq * D),
+                q: self.vec(seq * qd),
+                k: self.vec(seq * kd),
+                v: self.vec(seq * kd),
+                qq: self.vec(seq * qd),
+                kk: self.vec(seq * kd),
                 qpad: self.vec(padded * qd),
                 apad: self.vec(if padded == 0 { 1 } else { self.gpu.attention_rows_full_out_len(padded, HEADS, HD, valid) }),
-                o: self.vec(SEQ * D),
-                g: self.vec(SEQ * ff),
-                u: self.vec(SEQ * ff),
-                act: self.vec(SEQ * ff),
-                kv: self.vec(SEQ * row),
+                o: self.vec(seq * D),
+                g: self.vec(seq * ff),
+                u: self.vec(seq * ff),
+                act: self.vec(seq * ff),
+                kv: self.vec(seq * row),
                 att: self.vec(self.gpu.attention_rows_out_len(valid, HEADS, HD, valid)),
-                attended: self.vec(SEQ * qd),
-                table: self.vec(SEQ * HD),
+                attended: self.vec(seq * qd),
+                table: self.vec(seq * HD),
             };
             self.gpu.upload(&p.x, &x0);
             self.gpu.upload(&p.table, &table);
@@ -205,26 +268,27 @@ impl WgpuKleinText {
         }
         let scale = 1.0 / (HD as f32).sqrt();
         // each prompt's states after the tapped layers, in turn
-        let mut taps: Vec<Vec<Vec<f32>>> = all.iter().map(|_| Vec::with_capacity(TAPS.len())).collect();
-        for i in 0..LAYERS {
+        let mut taps: Vec<Vec<Vec<f32>>> = all.iter().map(|_| Vec::with_capacity(spec.taps.len())).collect();
+        for i in 0..layers {
             let l = self.layer(i)?;
-            let tapped = TAPS.contains(&(i + 1));
+            let tapped = spec.taps.contains(&(i + 1));
             let mut rec = self.gpu.begin();
             rec.keep_groups(false);
             let r = rec.as_mut();
             for p in &all {
-                let (valid, padded) = (p.valid, SEQ - p.valid);
-                let mul = |r: &mut dyn ChainRecorder, m: &Mat, a: &DeviceVec, y: &DeviceVec| r.matmul_f16_rows_f32(&m.v, m.n, m.k, a, y, SEQ);
-                r.rmsnorm_rows(&p.x, &l.input, &p.norm, SEQ, EPS);
+                let (valid, seq) = (p.valid, p.seq);
+                let padded = seq - valid;
+                let mul = |r: &mut dyn ChainRecorder, m: &Mat, a: &DeviceVec, y: &DeviceVec| r.matmul_f16_rows_f32(&m.v, m.n, m.k, a, y, seq);
+                r.rmsnorm_rows(&p.x, &l.input, &p.norm, seq, EPS);
                 mul(r, &l.q, &p.norm, &p.q);
                 mul(r, &l.k, &p.norm, &p.k);
                 mul(r, &l.v, &p.norm, &p.v);
-                r.rmsnorm_rows(&p.q, &l.qn, &p.qq, SEQ * HEADS, EPS);
-                r.rmsnorm_rows(&p.k, &l.kn, &p.kk, SEQ * KV_HEADS, EPS);
-                r.rope_rows(&p.qq, SEQ, HEADS, HD, &p.table, true);
-                r.rope_rows(&p.kk, SEQ, KV_HEADS, HD, &p.table, true);
-                r.store_rows(&p.kk, &p.kv, SEQ, kd, 0, row, 0);
-                r.store_rows(&p.v, &p.kv, SEQ, kd, 0, row, kd);
+                r.rmsnorm_rows(&p.q, &l.qn, &p.qq, seq * HEADS, EPS);
+                r.rmsnorm_rows(&p.k, &l.kn, &p.kk, seq * KV_HEADS, EPS);
+                r.rope_rows(&p.qq, seq, HEADS, HD, &p.table, true);
+                r.rope_rows(&p.kk, seq, KV_HEADS, HD, &p.table, true);
+                r.store_rows(&p.kk, &p.kv, seq, kd, 0, row, 0);
+                r.store_rows(&p.v, &p.kv, seq, kd, 0, row, kd);
                 // the prompt's own tokens causal among themselves; a padded position over all of them and no padding
                 r.attention_rows(&p.qq, &p.kv, &p.att, valid, HEADS, KV_HEADS, HD, 0, None, scale);
                 r.copy(&p.att, 0, &p.attended, 0, valid * qd);
@@ -235,10 +299,10 @@ impl WgpuKleinText {
                 }
                 mul(r, &l.o, &p.attended, &p.o);
                 r.add(&p.x, &p.o);
-                r.rmsnorm_rows(&p.x, &l.post, &p.norm, SEQ, EPS);
+                r.rmsnorm_rows(&p.x, &l.post, &p.norm, seq, EPS);
                 mul(r, &l.gate, &p.norm, &p.g);
                 mul(r, &l.up, &p.norm, &p.u);
-                r.silu_mul(&p.g, &p.u, &p.act, SEQ * ff);
+                r.silu_mul(&p.g, &p.u, &p.act, seq * ff);
                 mul(r, &l.down, &p.act, &p.o);
                 r.add(&p.x, &p.o);
                 if tapped {
@@ -253,19 +317,21 @@ impl WgpuKleinText {
             }
             drop(l);
         }
-        // a token's three states side by side
+        // a token's tapped states side by side
         taps.into_iter()
-            .map(|tap| {
-                if tap.len() != TAPS.len() || tap.iter().any(|t| t.len() != SEQ * D) {
+            .zip(&all)
+            .map(|(tap, p)| {
+                let seq = p.seq;
+                if tap.len() != spec.taps.len() || tap.iter().any(|t| t.len() != seq * D) {
                     return Err(err("the conditioning's tapped states were not all read"));
                 }
-                let mut joined = Vec::with_capacity(SEQ * D * TAPS.len());
-                for t in 0..SEQ {
+                let mut joined = Vec::with_capacity(seq * D * tap.len());
+                for t in 0..seq {
                     for states in &tap {
                         joined.extend_from_slice(&states[t * D..(t + 1) * D]);
                     }
                 }
-                Tensor::from_vec(joined, (1, SEQ, D * TAPS.len()), &Device::Cpu)
+                Tensor::from_vec(joined, (1, seq, D * tap.len()), &Device::Cpu)
             })
             .collect()
     }
@@ -298,17 +364,51 @@ mod tests {
         eprintln!("Candle load and encode {:.1} s", t.elapsed().as_secs_f64());
         assert_eq!(got.dims(), want.dims());
         let (g, e) = (got.flatten_all()?.to_vec1::<f32>()?, want.flatten_all()?.to_vec1::<f32>()?);
-        let width = D * TAPS.len();
+        let (seq, width) = (512, D * FLUX2.taps.len());
         let mut worst = 1f64;
-        for t in 0..SEQ {
+        for t in 0..seq {
             let (a, b) = (&g[t * width..(t + 1) * width], &e[t * width..(t + 1) * width]);
             let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
             let na = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
             let nb = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
             worst = worst.min(dot / (na * nb));
         }
-        eprintln!("{SEQ} tokens: the worst token's cosine {worst:.6}");
+        eprintln!("{seq} tokens: the worst token's cosine {worst:.6}");
         assert!(worst > 0.999, "the worst token's cosine {worst}");
+        Ok(())
+    }
+    /// FLUX 3's text encoder on WebGPU gives what Hugging Face's Qwen3-VL gives in float32 as BFL's encoder runs it
+    /// (`tools/flux3/text_reference.py`: `OAIY_FLUX3_TEXT_EXPECTED`, its file; `OAIY_FLUX3_TEXT_ENCODER`, the encoder's
+    /// folder): the prompt's tokens and its padding's (a multiple of 80, at position 1), the tapped layers' states.
+    #[test]
+    #[ignore = "needs Qwen3-VL-4B-Instruct (OAIY_FLUX3_TEXT_ENCODER), the reference's states (OAIY_FLUX3_TEXT_EXPECTED) and a WebGPU adapter"]
+    fn flux3_text_is_hugging_faces() -> Result<()> {
+        let (Some(dir), Some(expected)) = (std::env::var_os("OAIY_FLUX3_TEXT_ENCODER").map(std::path::PathBuf::from), std::env::var_os("OAIY_FLUX3_TEXT_EXPECTED").map(std::path::PathBuf::from)) else { return Ok(()) };
+        let mut w = Weights::open(&expected)?;
+        let want = w.tensor("tokens", &Device::Cpu, DType::F32)?;
+        let taps: Vec<usize> = w.tensor("taps", &Device::Cpu, DType::F32)?.to_vec1::<f32>()?.into_iter().map(|t| t as usize).collect();
+        let Weights::Safe(index) = &w else { unreachable!("a safetensors file") };
+        let prompt = index.metadata("prompt").expect("the reference's prompt").to_owned();
+        let spec = Spec { taps: if taps == [4, 8] { &[4, 8] } else { FLUX3.taps }, ..FLUX3 };
+        let t = std::time::Instant::now();
+        let mut gpu = WgpuKleinText::load_spec(&dir, &dir.join("tokenizer.json"), 0, spec)?;
+        let got = gpu.encode(&prompt)?;
+        eprintln!("WebGPU load and encode {:.1} s", t.elapsed().as_secs_f64());
+        assert_eq!(got.dims()[1..], want.dims()[..]);
+        let (g, e) = (got.flatten_all()?.to_vec1::<f32>()?, want.flatten_all()?.to_vec1::<f32>()?);
+        let (seq, width) = (want.dims()[0], want.dims()[1]);
+        let mut worst = (1f64, 0);
+        for t in 0..seq {
+            let (a, b) = (&g[t * width..(t + 1) * width], &e[t * width..(t + 1) * width]);
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            if dot / (na * nb) < worst.0 {
+                worst = (dot / (na * nb), t);
+            }
+        }
+        eprintln!("{seq} tokens, taps {taps:?}: the worst token's cosine {:.6} (token {})", worst.0, worst.1);
+        assert!(worst.0 > 0.999, "the worst token's cosine {worst:?}");
         Ok(())
     }
 }

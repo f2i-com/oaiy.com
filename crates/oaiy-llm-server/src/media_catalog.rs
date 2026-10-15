@@ -142,6 +142,22 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
             snapshot.default_weights = "safetensors".into();
             return Ok(snapshot);
         }
+        "flux3-klein" => {
+            let mut fields = vec![("architecture".into(), Json::str("flux3-klein"))];
+            for key in ["transformer", "text_encoder", "vae"] {
+                let p = required_path(root, &j, key)?;
+                if !(p.is_file() || (key == "text_encoder" && p.is_dir())) { return Err(format!("FLUX 3 Image Klein {key} must be a file{}", if key == "text_encoder" { " or folder" } else { "" })); }
+                fields.push((key.into(), Json::str(p.to_string_lossy())));
+            }
+            if let Some(t) = optional_path(root, &j, "tokenizer")? { fields.push(("tokenizer".into(), Json::str(t.to_string_lossy()))); }
+            for key in ["steps", "cfg", "reference_pixels"] { if let Some(v) = j.get(key) { fields.push((key.into(), v.clone())); } }
+            snapshot.klein = Some(Json::Obj(fields));
+            snapshot.sdxl = None;
+            snapshot.loras = Vec::new();
+            snapshot.adapter = None;
+            snapshot.default_weights = "safetensors".into();
+            return Ok(snapshot);
+        }
         "sdxl" => {
             snapshot.klein = None;
             let checkpoint = required_path(root, &j, "checkpoint")?;
@@ -165,7 +181,7 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
             return Ok(snapshot);
         }
         "qwen-image" => { snapshot.sdxl = None; snapshot.klein = None; },
-        _ => return Err("unsupported image architecture; use qwen-image, sdxl or flux2-klein-4b".into()),
+        _ => return Err("unsupported image architecture; use qwen-image, sdxl, flux2-klein-4b or flux3-klein".into()),
     }
     snapshot.text_encoder = optional_path(root, &j, "text_encoder")?;
     snapshot.base = required_path(root, &j, "base")?;

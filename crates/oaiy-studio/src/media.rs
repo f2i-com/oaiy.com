@@ -385,8 +385,9 @@ fn path_field(root: &Path, model: &Json, key: &str) -> Option<String> {
 }
 
 /// Reference images for editing: `images` (an array) or `image` (one or an
-/// array), each a `data:` URL, `{image_url}`, or (from the local UI) a path.
-fn references(body: &Json, output_root: &Path, allow_local: bool) -> Result<Vec<String>, String> {
+/// array), each a `data:` URL, `{image_url}`, or (from the local UI) a path; at
+/// most `max` of them.
+fn references(body: &Json, output_root: &Path, allow_local: bool, max: usize) -> Result<Vec<String>, String> {
     let mut values: Vec<&Json> = Vec::new();
     for key in ["images", "image"] {
         match body.get(key) {
@@ -395,8 +396,8 @@ fn references(body: &Json, output_root: &Path, allow_local: bool) -> Result<Vec<
             Some(one) => values.push(one),
         }
     }
-    if values.len() > 3 {
-        return Err("at most three reference images".into());
+    if values.len() > max {
+        return Err(if max == 3 { "at most three reference images".into() } else { format!("at most {max} reference images") });
     }
     let mut paths = Vec::new();
     for v in values {
@@ -409,7 +410,7 @@ fn references(body: &Json, output_root: &Path, allow_local: bool) -> Result<Vec<
 
 /// The worker request for an image job, and a summary for the job list. With
 /// reference images (`images`/`image`) the job edits them: Qwen Image conditions
-/// on up to three.
+/// on up to three, FLUX 3 Image Klein on up to ten.
 pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, allow_local: bool) -> Result<(Json, String, String, usize), String> {
     let media = cfg.get("media").ok_or("no media section")?;
     let section = media.get("image").ok_or("no image section")?;
@@ -423,7 +424,8 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         Some(v) => v.as_i64().filter(|n| (1..=16).contains(n)).ok_or("n must be between 1 and 16")?,
     };
     let arch = str_or(model, "architecture", "qwen-image");
-    let step = if arch == "sdxl" { 64 } else if arch == "flux2-klein-4b" { 16 } else { 32 };
+    let step = if arch == "sdxl" { 64 } else if arch == "flux2-klein-4b" || arch == "flux3-klein" { 16 } else { 32 };
+    let flux3 = arch == "flux3-klein";
     if arch == "flux2-klein-4b" {
         if body.get("turbo").is_some_and(|v|v.as_bool()!=Some(false)) { return Err("Klein does not use Qwen turbo".into()); }
         for key in ["image", "images", "input_image", "input_reference", "adapter"] {
@@ -435,7 +437,7 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             return Err("native Klein does not support negative prompt conditioning".into());
         }
     }
-    let refs = references(body, output_root, allow_local)?;
+    let refs = references(body, output_root, allow_local, if flux3 { 10 } else { 3 })?;
     if !refs.is_empty() && arch == "sdxl" {
         return Err(format!("{name} is an SDXL model, which cannot edit images; pick a Qwen Image model"));
     }
@@ -452,16 +454,20 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     // OpenAI's fixed sizes (1536x1024, 1792x1024) round to the model's grid.
     let (w, h) = ((w / step).max(1) * step, (h / step).max(1) * step);
     let out = output_dir(output_root, "image");
+    // (FLUX 3's edit at `size: auto` takes BFL's own size: the first reference's, prepared under its pixels, cut back
+    // to its shape)
+    let match_reference = flux3 && !refs.is_empty() && auto && body.get("width").is_none();
     let mut f: Vec<(String, Json)> = vec![
         ("prompt".into(), Json::str(&prompt)),
         ("n".into(), Json::Int(n)),
-        ("width".into(), Json::Int(w)),
-        ("height".into(), Json::Int(h)),
         ("seed".into(), Json::Int(seed(body)?)),
         ("device".into(), Json::Int(int_or(media, "device", 0))),
         ("output_dir".into(), Json::str(out.to_string_lossy())),
         ("model".into(), Json::str(&name)),
     ];
+    if !match_reference {
+        f.extend([("width".into(), Json::Int(w)), ("height".into(), Json::Int(h))]);
+    }
     let steps = |default: i64, lo: i64, hi: i64| -> Result<i64, String> {
         let n = body.get("steps").and_then(Json::as_i64).unwrap_or(int_or(model, "steps", default));
         if !(lo..=hi).contains(&n) {
@@ -511,6 +517,35 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
                 }
             }
             f.push(("loras".into(), Json::Arr(loras)));
+        }
+    } else if flux3 {
+        f.push(("architecture".into(), Json::str(arch)));
+        for key in ["transformer", "text_encoder", "vae"] {
+            f.push((key.into(), Json::str(path_field(root, model, key).ok_or_else(|| format!("FLUX 3 Image Klein model needs {key}"))?)));
+        }
+        if let Some(t) = path_field(root, model, "tokenizer") {
+            f.push(("tokenizer".into(), Json::str(t)));
+        }
+        if body.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) {
+            return Err("FLUX 3 Image Klein does not use Qwen turbo".into());
+        }
+        if body.get("negative_prompt").is_some_and(|v| !matches!(v, Json::Null) && !v.as_str().is_some_and(|s| s.trim().is_empty())) {
+            return Err("FLUX 3 Image Klein has no negative prompt: describe what the picture is instead".into());
+        }
+        // (the checkpoint's own steps and guidance unless the request or the model sets them: the worker knows which)
+        if body.get("steps").is_some_and(|v| v.as_i64().is_none()) { return Err("steps must be an integer".into()); }
+        if let Some(n) = body.get("steps").and_then(Json::as_i64).or_else(|| model.get("steps").and_then(Json::as_i64)) {
+            if !(1..=100).contains(&n) { return Err("steps must be between 1 and 100".into()); }
+            f.push(("steps".into(), Json::Int(n)));
+        }
+        if let Some(v) = body.get("cfg").or_else(|| model.get("cfg")).filter(|v| !matches!(v, Json::Null)) {
+            let cfg_scale = v.as_f64().filter(|c| c.is_finite() && (1.0..=10.0).contains(c)).ok_or("cfg must be a number from 1 to 10")?;
+            f.push(("cfg".into(), Json::Num(cfg_scale)));
+        }
+        if !refs.is_empty() {
+            f.push(("images".into(), Json::Arr(refs.iter().map(Json::str).collect())));
+            // a single reference's canvas: about a megapixel (BFL's own go to 4), or the model's
+            f.push(("reference_pixels".into(), Json::Int(int_or(model, "reference_pixels", 1 << 20))));
         }
     } else {
         f.push(("base".into(), Json::str(path_field(root, model, "base").ok_or("Qwen Image model needs its base folder")?)));

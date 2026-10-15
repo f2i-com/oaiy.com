@@ -1,4 +1,5 @@
-//! SDXL's VAE decoder on WebGPU, as [`crate::sdxl::vae::AutoencoderKL::decode`] computes it: an image its pixels'
+//! SDXL's VAE decoder (and, where asked, its encoder: [`WgpuSdxlVae::encode`]) on WebGPU, as
+//! [`crate::sdxl::vae::AutoencoderKL::decode`] computes it: an image its pixels'
 //! rows of channels, the convolutions on the tensor cores where the adapter has them (the weights f16), each
 //! residual block, the middle's attention (one head, its channels the head) and each upsampling a recording of its
 //! own, its vectors let go once it has run (a 1024x1024 picture's last blocks are 0.5 to 1 GB a vector). On the CPU
@@ -45,11 +46,17 @@ impl WgpuSdxlVae {
     /// `decoder.up_blocks.0.resnets.1` its `decoder.up.3.block.1`), with a `post_quant_conv` or (`post` false: FLUX.2's
     /// published VAE) perhaps none.
     pub fn load_mapped(w: &mut Weights, prefix: &str, cfg: &VaeConfig, gpu: ggml_rs_wgpu::WgpuBackend, map: &dyn Fn(&str) -> String, post: bool) -> Result<Self> {
+        Self::load_parts(w, prefix, cfg, gpu, map, post, false)
+    }
+
+    /// [`Self::load_mapped`], the encoder too (and its `quant_conv`, where the file has one) where `encoder`.
+    pub fn load_parts(w: &mut Weights, prefix: &str, cfg: &VaeConfig, gpu: ggml_rs_wgpu::WgpuBackend, map: &dyn Fn(&str) -> String, post: bool, encoder: bool) -> Result<Self> {
         let (mut convs, mut norms) = (HashMap::new(), HashMap::new());
         for name in w.names() {
             let Some(key) = name.strip_prefix(prefix) else { continue };
             let key = map(key);
-            if !(key.starts_with("decoder.") || key.starts_with("post_quant_conv.")) {
+            let wanted = key.starts_with("decoder.") || key.starts_with("post_quant_conv.") || (encoder && (key.starts_with("encoder.") || key.starts_with("quant_conv.")));
+            if !wanted {
                 continue;
             }
             let (Some(base), Some(stored)) = (key.strip_suffix(".weight"), name.strip_suffix(".weight")) else { continue };
@@ -80,6 +87,9 @@ impl WgpuSdxlVae {
         }
         if !convs.contains_key("decoder.conv_in") || (post && !convs.contains_key("post_quant_conv")) {
             candle_core::bail!("the checkpoint has no VAE decoder under {prefix}");
+        }
+        if encoder && !convs.contains_key("encoder.conv_in") {
+            candle_core::bail!("the checkpoint has no VAE encoder under {prefix}");
         }
         Ok(Self { gpu, cfg: cfg.clone(), convs, norms })
     }
@@ -212,6 +222,61 @@ impl WgpuSdxlVae {
         self.gpu.settle();
         Ok((rgb, h, w))
     }
+
+    /// The latent moments of a picture (`rgb`: its pixels' rows of red, green and blue in -1..1, `h` by `w`, each a
+    /// multiple of 2 to the levels less one), as [`crate::sdxl::vae::AutoencoderKL::encode`]'s encoder and
+    /// `quant_conv` make them (where the file has one): each latent pixel's mean then log-variance, `[h / 8 * w / 8,
+    /// 2 latent_channels]` for four levels, and the latent's height and width. Each downsampling is a 3x3 convolution
+    /// of stride 1 then its odd rows' odd columns: PyTorch's of stride 2 on the picture padded right and below.
+    pub fn encode(&self, rgb: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize)> {
+        let levels = self.cfg.channel_mults.len();
+        let down = 1usize << (levels - 1);
+        if rgb.len() != h * w * 3 || h == 0 || w == 0 || !h.is_multiple_of(down) || !w.is_multiple_of(down) {
+            candle_core::bail!("a {h}x{w} picture of {} values to encode: its sides a multiple of {down}", rgb.len());
+        }
+        let x0 = self.vec(rgb.len());
+        self.gpu.upload(&x0, rgb);
+        let (mut h, mut w) = (h, w);
+        let (mut x, mut c) = {
+            let mut rec = self.gpu.begin();
+            rec.keep_groups(false);
+            let out = self.conv(rec.as_mut(), "encoder.conv_in", &x0, h, w)?;
+            rec.finish();
+            out
+        };
+        drop(x0);
+        for level in 0..levels {
+            for j in 0..self.cfg.layers_per_block {
+                (x, c) = self.residual(&format!("encoder.down.{level}.block.{j}"), &x, h, w, c)?;
+            }
+            if level + 1 != levels {
+                let mut rec = self.gpu.begin();
+                rec.keep_groups(false);
+                let r = rec.as_mut();
+                let (full, cout) = self.conv(r, &format!("encoder.down.{level}.downsample.conv"), &x, h, w)?;
+                let y = self.vec(h / 2 * (w / 2) * cout);
+                r.subsample2x_rows(&full, &y, h, w, cout);
+                rec.finish();
+                drop(full);
+                self.gpu.settle();
+                (x, c, h, w) = (y, cout, h / 2, w / 2);
+            }
+        }
+        (x, c) = self.residual("encoder.mid.block_1", &x, h, w, c)?;
+        x = self.attention("encoder.mid.attn_1", &x, h, w, c)?;
+        (x, c) = self.residual("encoder.mid.block_2", &x, h, w, c)?;
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let r = rec.as_mut();
+        let t = self.norm(r, "encoder.norm_out", &x, h * w, c, true)?;
+        let (raw, co) = self.conv(r, "encoder.conv_out", &t, h, w)?;
+        let out = if self.convs.contains_key("quant_conv") { self.conv(r, "quant_conv", &raw, h, w)?.0 } else { raw.clone() };
+        rec.read_range(&out, 0, h * w * co);
+        let moments = rec.finish().pop().ok_or_else(|| err("the VAE's latent was not read"))?;
+        drop((x, t, raw, out));
+        self.gpu.settle();
+        Ok((moments, h, w))
+    }
 }
 
 #[cfg(test)]
@@ -266,6 +331,55 @@ mod tests {
         }
         let (cosine, rms) = (dot / (gg.sqrt() * ww.sqrt()), (ww / want.len() as f64).sqrt());
         eprintln!("a small VAE's picture: cosine {cosine:.6}, the worst error {worst:.2e} of an RMS of {rms:.3}");
+        assert!(cosine > 0.9995 && worst < 0.1 * rms.max(1e-3), "cosine {cosine}, worst {worst} of {rms}");
+        Ok(())
+    }
+    /// The same small VAE's encoder on WebGPU gives Candle's latent (its mean, scaled as Candle's `encode` scales it)
+    /// for a random picture.
+    #[test]
+    fn a_small_vae_encoder_on_webgpu_is_candles() -> Result<()> {
+        let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::new(Some(2 << 30)) else { return Ok(()) };
+        let cfg = VaeConfig { base_channels: 128, channel_mults: vec![1, 2, 4], layers_per_block: 2, latent_channels: 4, scaling_factor: 0.13025, in_channels: 3, out_channels: 3, norm_groups: 32 };
+        let map = VarMap::new();
+        let reference = AutoencoderKL::load(&cfg, VarBuilder::from_varmap(&map, DType::F32, &Device::Cpu).pp("first_stage_model"))?;
+        let mut seed = 0x0e9c_0de5u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.) as f32
+        };
+        for (name, var) in map.data().lock().unwrap().iter() {
+            if var.dims().len() == 1 {
+                let n = var.dims()[0];
+                let weight = name.ends_with("weight");
+                var.set(&Tensor::from_vec((0..n).map(|_| if weight { 1.0 + 0.3 * next() } else { 0.2 * next() }).collect::<Vec<f32>>(), n, &Device::Cpu)?)?;
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("oaiy-wgpu-sdxl-vae-encoder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("vae.safetensors");
+        map.save(&path)?;
+        let vae = WgpuSdxlVae::load_parts(&mut Weights::open(&path)?, "first_stage_model.", &cfg, gpu, &|k| k.to_owned(), true, true);
+        std::fs::remove_dir_all(dir)?;
+        let vae = vae?;
+        let (h, w) = (24usize, 40usize);
+        let pixels: Vec<f32> = (0..3 * h * w).map(|_| next()).collect();
+        let x = Tensor::from_vec(pixels, (1, h, w, 3), &Device::Cpu)?;
+        let want = reference.encode(&x.permute((0, 3, 1, 2))?.contiguous()?)?.squeeze(0)?.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+        let (moments, lh, lw) = vae.encode(&x.flatten_all()?.to_vec1::<f32>()?, h, w)?;
+        assert_eq!((lh, lw, moments.len()), (h / 4, w / 4, h / 4 * (w / 4) * 8));
+        let got: Vec<f32> = moments.chunks_exact(8).flat_map(|m| m[..4].iter().map(|v| v * cfg.scaling_factor as f32)).collect();
+        let (mut dot, mut gg, mut ww, mut worst) = (0f64, 0f64, 0f64, 0f64);
+        for (g, t) in got.iter().zip(&want) {
+            let (g, t) = (*g as f64, *t as f64);
+            dot += g * t;
+            gg += g * g;
+            ww += t * t;
+            worst = worst.max((g - t).abs());
+        }
+        let (cosine, rms) = (dot / (gg.sqrt() * ww.sqrt()), (ww / want.len() as f64).sqrt());
+        eprintln!("a small VAE's latent: cosine {cosine:.6}, the worst error {worst:.2e} of an RMS of {rms:.3}");
         assert!(cosine > 0.9995 && worst < 0.1 * rms.max(1e-3), "cosine {cosine}, worst {worst} of {rms}");
         Ok(())
     }

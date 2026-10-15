@@ -18,6 +18,8 @@ pub mod klein_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod klein_text_wgpu;
 #[cfg(feature = "webgpu")]
+pub mod flux3_wgpu;
+#[cfg(feature = "webgpu")]
 pub mod vae_wgpu;
 #[cfg(feature = "webgpu")]
 pub mod text_wgpu;
@@ -70,3 +72,4 @@ pub mod esrgan;
 pub mod esrgan_wgpu;
 pub mod picture;
 pub mod klein;
+pub mod flux3;

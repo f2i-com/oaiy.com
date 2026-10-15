@@ -106,6 +106,14 @@ fn nearby(path: &Path, accept: impl Fn(&Path, &Detected) -> bool) -> Option<Path
                     return Some(probe);
                 }
             }
+            // (else the folder itself: a model folder keeps its tokenizer beside its weights, FLUX 3's text encoder's)
+            if probe != c {
+                if let Ok(found) = detect::detect(&c) {
+                    if accept(&c, &found) {
+                        return Some(c);
+                    }
+                }
+            }
         }
     }
     None
@@ -135,7 +143,8 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
         ("image", "base") => &|d| d.format == "diffusers" && field_of(d, "base").is_some(),
         ("image", "tokenizer") if arch == "flux2-klein-4b" => &|d| d.kind() == "klein_tokenizer",
         ("image", "text_encoder") if arch == "flux2-klein-4b" => &|d| d.kind() == "klein_text_encoder",
-        ("image", "vae") if arch == "flux2-klein-4b" => &|d| d.kind() == "flux2_vae",
+        ("image", "vae") if arch == "flux2-klein-4b" || arch == "flux3-klein" => &|d| d.kind() == "flux2_vae",
+        ("image", "text_encoder") if arch == "flux3-klein" => &|d| d.kind() == "flux3_text_encoder",
         ("image", "tokenizer") => &|d| d.kind() == "clip_tokenizer",
         ("video", "tokenizer") => &|d| d.kind() == "tokenizer",
         ("video", "vae") => &|d| d.kind() == "vae",
@@ -386,7 +395,8 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
         }
         "klein_text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "") == "flux2-klein-4b")),
         "klein_tokenizer" => ("image", "tokenizer", Box::new(|m| str_or(m, "architecture", "") == "flux2-klein-4b")),
-        "flux2_vae" => ("image", "vae", Box::new(|m| str_or(m, "architecture", "") == "flux2-klein-4b")),
+        "flux2_vae" => ("image", "vae", Box::new(|m| matches!(str_or(m, "architecture", ""), "flux2-klein-4b" | "flux3-klein"))),
+        "flux3_text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "") == "flux3-klein")),
         "image_base" => ("image", "base", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
         "text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
         "clip_tokenizer" => ("image", "tokenizer", Box::new(|m| str_or(m, "architecture", "") == "sdxl")),
@@ -473,6 +483,8 @@ pub fn missing_fields(section: &str, m: &Json) -> Vec<String> {
             out.extend(["checkpoint", "tokenizer"].into_iter().filter(|k| empty(k)).map(String::from));
         } else if str_or(m, "architecture", "qwen-image") == "flux2-klein-4b" {
             out.extend(["transformer", "text_encoder", "vae", "tokenizer"].into_iter().filter(|k| empty(k)).map(String::from));
+        } else if str_or(m, "architecture", "qwen-image") == "flux3-klein" {
+            out.extend(["transformer", "text_encoder", "vae"].into_iter().filter(|k| empty(k)).map(String::from));
         } else {
             if empty("base") {
                 out.push("base".into());
@@ -783,6 +795,35 @@ mod tests {
         b.extend((arch.len() as u64).to_le_bytes());
         b.extend(arch.as_bytes());
         std::fs::write(path, b).unwrap();
+    }
+
+    /// BFL's FLUX 3 Image Klein release: its model.safetensors picked (or its folder) is a whole image model, its text
+    /// encoder's folder and its VAE found beside it.
+    #[test]
+    fn flux3s_release_brings_its_text_encoder_and_vae() {
+        let d = tmp("flux3");
+        let tensor = |name: &str, shape: &str| format!(r#""{name}":{{"dtype":"BF16","shape":{shape},"data_offsets":[0,0]}}"#);
+        let transformer = [tensor("emb_in.image.weight", "[3072,128]"), tensor("txt_in.weight", "[3072,20480]"), tensor("single_blocks.27.q_proj.weight", "[3072,3072]"), tensor("ref_time_in.in_layer.weight", "[3072,256]")].join(",");
+        safetensors(&d.join("model.safetensors"), &format!("{{{transformer}}}"));
+        safetensors(&d.join("ae.safetensors"), &format!("{{{},{}}}", tensor("bn.running_mean", "[128]"), tensor("decoder.conv_in.weight", "[512,32,3,3]")));
+        let te = d.join("text_encoder");
+        std::fs::create_dir_all(&te).unwrap();
+        std::fs::write(te.join("config.json"), r#"{"model_type":"qwen3_vl","text_config":{"hidden_size":2560}}"#).unwrap();
+        std::fs::write(te.join("tokenizer.json"), "{}").unwrap();
+        safetensors(&te.join("model-00001-of-00002.safetensors"), &format!("{{{}}}", tensor("model.language_model.embed_tokens.weight", "[151936,2560]")));
+        for picked in [d.join("model.safetensors"), d.clone()] {
+            let mut cfg = config::default_json();
+            let (a, found) = add(&mut cfg, &picked, None, None).unwrap();
+            assert!(matches!(found.role, detect::Role::Image { architecture: "flux3-klein" }), "{}", found.summary);
+            assert!(found.summary.contains("distilled"), "{}", found.summary);
+            assert_eq!((a.section, a.enabled), ("image", true), "{:?}", a.missing);
+            let m = get(&cfg, &["media", "image", "models", &a.name]).unwrap();
+            assert_eq!(str_or(m, "architecture", ""), "flux3-klein");
+            assert_eq!(Path::new(str_or(m, "text_encoder", "")), te.as_path());
+            assert_eq!(Path::new(str_or(m, "vae", "")), d.join("ae.safetensors").as_path());
+            config::validate(&cfg).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

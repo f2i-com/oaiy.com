@@ -21,7 +21,7 @@ pub const TARGETS: [&str; 16] = ["chat", "completions", "models", "images", "edi
 pub const SPECS: [&str; 2] = ["openai", "oaiy"];
 pub const MEMORY: [&str; 4] = ["auto", "gpu", "ram", "ssd"];
 pub const VIDEO_FAMILIES: [&str; 2] = ["ltx-2.3", "ltx-2.5"];
-pub const IMAGE_ARCHITECTURES: [&str; 3] = ["qwen-image", "sdxl", "flux2-klein-4b"];
+pub const IMAGE_ARCHITECTURES: [&str; 4] = ["qwen-image", "sdxl", "flux2-klein-4b", "flux3-klein"];
 /// How media jobs share GPUs with the LLM: `auto` pauses the LLM only when the
 /// media device is one of its devices; `pause_llm` always; `coexist` never.
 pub const LLM_POLICIES: [&str; 3] = ["auto", "pause_llm", "coexist"];
@@ -597,6 +597,8 @@ pub fn validate(v: &Json) -> Result<(), String> {
         let required: &[&str] = match arch {
             "sdxl" => &["checkpoint", "tokenizer"],
             "flux2-klein-4b" => &["transformer", "text_encoder", "vae", "tokenizer"],
+            // (its tokenizer the text encoder's folder's, where none is named)
+            "flux3-klein" => &["transformer", "text_encoder", "vae"],
             _ => &["base"],
         };
         for key in required {
@@ -621,6 +623,19 @@ pub fn validate(v: &Json) -> Result<(), String> {
             let steps=match m.get("steps") { None=>if distilled {4}else{50}, Some(v)=>v.as_i64().ok_or_else(||format!("image model {name}: steps must be an integer"))? };
             let cfg=match m.get("cfg") { None=>if distilled {1.0}else{4.0}, Some(v)=>v.as_f64().ok_or_else(||format!("image model {name}: cfg must be numeric"))? };
             if !(1..=100).contains(&steps) || !cfg.is_finite() || !(1.0..=10.0).contains(&cfg) || (distilled&&(steps!=4||cfg!=1.0)) { return Err(format!("image model {name}: distilled Klein requires four steps and cfg 1; base cfg must be 1..10")); }
+        }
+        // FLUX 3 Image Klein: the checkpoint says which it is (the distilled flow map 16 steps and no guidance, the
+        // base 50 and cfg 3.5); a model may set its own
+        if arch == "flux3-klein" {
+            if m.get("steps").is_some_and(|v| !v.as_i64().is_some_and(|n| (1..=100).contains(&n))) {
+                return Err(format!("image model {name}: steps must be an integer from 1 to 100"));
+            }
+            if m.get("cfg").is_some_and(|v| !v.as_f64().is_some_and(|c| c.is_finite() && (1.0..=10.0).contains(&c))) {
+                return Err(format!("image model {name}: cfg must be a number from 1 to 10"));
+            }
+            if m.get("reference_pixels").is_some_and(|v| !v.as_i64().is_some_and(|n| (4096..=4 << 20).contains(&n))) {
+                return Err(format!("image model {name}: reference_pixels must be from 4096 to 4194304"));
+            }
         }
         memory(m, &format!("image model {name}"))?;
     }

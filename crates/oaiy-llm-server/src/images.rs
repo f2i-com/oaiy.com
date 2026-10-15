@@ -785,6 +785,62 @@ fn prepare_klein(c: &Config, settings: &Json, body: &Json) -> Result<Json, Strin
     Ok(request)
 }
 
+/// A FLUX 3 Image Klein job: text-to-image, or an edit of up to ten references. Its steps and guidance are the
+/// checkpoint's own (the worker reads which it is) unless the request or the model names them; with references and
+/// no size, the picture is the first reference's size, as BFL's pipeline makes it.
+fn prepare_flux3(c: &Config, settings: &Json, body: &Json) -> Result<Json, String> {
+    let value = |key| body.get(key).filter(|v| !matches!(v, Json::Null)).or_else(|| settings.get(key));
+    let integer = |key, default, min, max| -> Result<i64, String> {
+        let n = match value(key) { None => default, Some(v) => v.as_i64().ok_or_else(|| format!("{key} must be an integer"))? };
+        if !(min..=max).contains(&n) { return Err(format!("{key} must be between {min} and {max}")); }
+        Ok(n)
+    };
+    let n = integer("n", 1, 1, 1000)?;
+    let valid_prompt = |v: &Json| v.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 65536);
+    match body.get("prompts") {
+        Some(v) => {
+            let a = v.as_array().ok_or("prompts must be an array")?;
+            if (a.len() != 1 && a.len() != n as usize) || a.iter().any(|v| !valid_prompt(v)) { return Err("provide one prompt or n nonempty prompts up to 65536 bytes each".into()); }
+        }
+        None => if !body.get("prompt").is_some_and(valid_prompt) { return Err("prompt must be nonempty and at most 65536 bytes".into()); },
+    }
+    if body.get("negative_prompt").is_some_and(|v| !matches!(v, Json::Null) && !v.as_str().is_some_and(|s| s.trim().is_empty())) {
+        return Err("FLUX 3 Image Klein has no negative prompt: describe what the picture is instead".into());
+    }
+    if body.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) { return Err("FLUX 3 Image Klein does not use Qwen turbo".into()); }
+    let images = reference_paths(body, true)?;
+    let mut fields = vec![
+        ("architecture".into(), Json::str("flux3-klein")),
+        ("n".into(), Json::Int(n)),
+        ("seed".into(), Json::Int(integer("seed", 0, 0, i64::MAX - n)?)),
+        ("device".into(), Json::Int(c.image_device as i64)),
+        ("output_dir".into(), Json::str(output_directory(c, body, "images")?.to_string_lossy())),
+    ];
+    // (no size with references: the first's; else 1024 x 1024)
+    if body.get("width").is_some() || body.get("height").is_some() || images.is_empty() {
+        let (width, height) = (integer("width", 1024, 256, 2048)?, integer("height", 1024, 256, 2048)?);
+        if width % 16 != 0 || height % 16 != 0 { return Err("FLUX 3 Image Klein's width and height must be multiples of 16".into()); }
+        fields.extend([("width".into(), Json::Int(width)), ("height".into(), Json::Int(height))]);
+    }
+    if value("steps").is_some() { fields.push(("steps".into(), Json::Int(integer("steps", 16, 1, 100)?))); }
+    if let Some(v) = value("cfg") {
+        let cfg = v.as_f64().filter(|g| g.is_finite() && (1.0..=10.0).contains(g)).ok_or("cfg must be a number from 1 to 10")?;
+        fields.push(("cfg".into(), Json::Num(cfg)));
+    }
+    for key in ["transformer", "text_encoder", "vae"] { fields.push((key.into(), settings.get(key).cloned().ok_or_else(|| format!("missing FLUX 3 {key}"))?)); }
+    if let Some(t) = settings.get("tokenizer") { fields.push(("tokenizer".into(), t.clone())); }
+    if !images.is_empty() {
+        fields.push(("images".into(), Json::Arr(images)));
+        fields.push(("reference_pixels".into(), Json::Int(integer("reference_pixels", 1 << 20, 4096, 4 << 20)?)));
+    }
+    if let Some(model) = &c.image_model { fields.push(("model".into(), Json::str(model))); }
+    fields.extend(image_memory(c, body)?);
+    for key in ["prompt", "prompts"] { if let Some(v) = body.get(key) { fields.push((key.into(), v.clone())); } }
+    let request = Json::Obj(fields);
+    if request.to_json().len() > 2 * 1024 * 1024 { return Err("image request exceeds 2 MiB".into()); }
+    Ok(request)
+}
+
 fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     let selected = match body.get("model") {
         None => None,
@@ -792,11 +848,19 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     };
     let current = crate::media_catalog::image(c, selected)?;
     let c = &current;
-    if let Some(settings) = &c.klein { return prepare_klein(c, settings, body); }
+    if let Some(settings) = &c.klein {
+        if settings.get("architecture").and_then(Json::as_str) == Some("flux3-klein") {
+            return prepare_flux3(c, settings, body);
+        }
+        return prepare_klein(c, settings, body);
+    }
     if let Some(settings) = &c.sdxl {
         return prepare_sdxl(c, settings, body);
     }
     let images = reference_paths(body, true)?;
+    if images.len() > 3 {
+        return Err("Qwen Image takes at most three reference images".into());
+    }
     let prompt = body.get("prompt").cloned();
     let prompts = body.get("prompts").cloned();
     if prompt.is_none() && prompts.is_none() {
@@ -922,15 +986,17 @@ pub(crate) fn video_reference_path(body: &Json, key: &str, allow_local: bool) ->
     }
 }
 
+/// A job's reference pictures (`images`, absolute local paths): at most ten (FLUX 3 Image Klein's; Qwen Image takes
+/// three, which its own request checks).
 pub(crate) fn reference_paths(body: &Json, allow_local: bool) -> Result<Vec<Json>, String> {
     let Some(value) = body.get("images") else {
         return Ok(Vec::new());
     };
     let paths = value
         .as_array()
-        .ok_or("images must be an array of up to three local paths")?;
-    if paths.len() > 3 {
-        return Err("images accepts at most three reference images".into());
+        .ok_or("images must be an array of up to ten local paths")?;
+    if paths.len() > 10 {
+        return Err("images accepts at most ten reference images".into());
     }
     if !paths.is_empty() && !allow_local {
         return Err(

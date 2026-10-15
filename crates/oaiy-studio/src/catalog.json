@@ -221,6 +221,19 @@
       "add": ["Qwen-Image-2.1", "Qwen-Image-2.1-viggle-turbo/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"]
     },
     {
+      "id": "flux-3-image-klein",
+      "group": "image",
+      "name": "FLUX 3 Image Klein",
+      "about": "Black Forest Labs' 5.6B model: pictures with legible text, edits of up to ten reference pictures, and placement by boxes in the prompt, in 16 steps. Its weights are gated: accept its licence on huggingface.co and add a Hugging Face token first.",
+      "license": "FLUX Kommunity License (non-commercial use; commercial outputs for qualifying users, see its terms)",
+      "size_gb": 20.3,
+      "vram_gb": 16,
+      "parts": [
+        { "repo": "black-forest-labs/flux-3-image-klein", "include": ["model.safetensors", "ae.safetensors", "text_encoder/**", "LICENSE.md", "NOTICE.md", "README.md"], "into": "flux-3-image-klein" }
+      ],
+      "add": ["flux-3-image-klein/model.safetensors"]
+    },
+    {
       "id": "sdxl-base",
       "group": "image",
       "name": "Stable Diffusion XL 1.0",

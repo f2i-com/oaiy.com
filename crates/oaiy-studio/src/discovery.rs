@@ -218,14 +218,14 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         .map(|(name, m)| {
             let arch = str_or(&m, "architecture", "qwen-image");
             let sdxl = arch == "sdxl";
-            let edits = arch == "qwen-image";
+            let edits = arch == "qwen-image" || arch == "flux3-klein";
             let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == image_default)),
                 ("architecture", Json::str(arch)),
                 ("edits", Json::Bool(edits)),
-                ("max_references", Json::Int(if edits { 3 } else { 0 })),
-                ("size_step", Json::Int(if sdxl { 64 } else if arch == "flux2-klein-4b" { 16 } else { 32 })),
+                ("max_references", Json::Int(if arch == "flux3-klein" { 10 } else if edits { 3 } else { 0 })),
+                ("size_step", Json::Int(if sdxl { 64 } else if arch == "flux2-klein-4b" || arch == "flux3-klein" { 16 } else { 32 })),
                 ("default_size", Json::str(format!("{}x{}", int_or(&m, "width", 1024), int_or(&m, "height", 1024)))),
                 ("negative_prompt", Json::Bool(sdxl)),
             ]);

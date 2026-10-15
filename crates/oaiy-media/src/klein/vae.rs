@@ -30,7 +30,7 @@ impl Vae {
                 || (encode && (name.starts_with("encoder.") || name.starts_with("quant_conv.")))
             {
                 let mapped = if original {
-                    name.clone()
+                    original_key(&name)
                 } else {
                     map_key(&name)
                 };
@@ -62,7 +62,7 @@ impl Vae {
         };
         let vb = VarBuilder::from_tensors(tensors, DType::F32, d);
         let decoder = Decoder::new(&cfg, vb.pp("decoder"))?;
-        let post = if w.has("post_quant_conv.weight") {
+        let post = if w.has("post_quant_conv.weight") || w.has("decoder.post_quant_conv.weight") {
             Some(candle_nn::conv2d(
                 32,
                 32,
@@ -78,7 +78,7 @@ impl Vae {
         } else {
             None
         };
-        let quant = if encode && w.has("quant_conv.weight") {
+        let quant = if encode && (w.has("quant_conv.weight") || w.has("encoder.quant_conv.weight")) {
             Some(candle_nn::conv2d(
                 64,
                 64,
@@ -131,6 +131,12 @@ impl Vae {
 /// tensors. Whether the file is in the original layout (else diffusers': [`map_key`] its names).
 #[cfg(feature = "webgpu")]
 pub(crate) fn decoder_on_webgpu(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend) -> Result<(crate::sdxl_vae_wgpu::WgpuSdxlVae, Vec<f32>, Vec<f32>)> {
+    vae_on_webgpu(path, gpu, false)
+}
+
+/// [`decoder_on_webgpu`], the encoder too where `encoder` (FLUX 3's references are encoded by it).
+#[cfg(feature = "webgpu")]
+pub(crate) fn vae_on_webgpu(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, encoder: bool) -> Result<(crate::sdxl_vae_wgpu::WgpuSdxlVae, Vec<f32>, Vec<f32>)> {
     let mut w = Weights::open(path)?;
     let original = w.has("decoder.mid.block_1.conv1.weight");
     let cfg = crate::sdxl::config::VaeConfig { base_channels: 128, channel_mults: vec![1, 2, 4, 4], layers_per_block: 2, latent_channels: 32, scaling_factor: 1., in_channels: 3, out_channels: 3, norm_groups: 32 };
@@ -139,9 +145,26 @@ pub(crate) fn decoder_on_webgpu(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend) -> 
     if mean.len() != 128 || std.len() != 128 {
         candle_core::bail!("a Flux2 VAE's batch-norm statistics are 128 values, not {} and {}", mean.len(), std.len());
     }
-    let map = |key: &str| if original { key.to_owned() } else { map_key(key) };
-    let vae = crate::sdxl_vae_wgpu::WgpuSdxlVae::load_mapped(&mut w, "", &cfg, gpu, &map, false)?;
+    let map = |key: &str| if original { original_key(key) } else { map_key(key) };
+    let vae = crate::sdxl_vae_wgpu::WgpuSdxlVae::load_parts(&mut w, "", &cfg, gpu, &map, false, encoder)?;
     Ok((vae, mean, std))
+}
+
+/// A picture's tokens (`[h w, 128]`, a token a row) from its latent moments (`[2 h * 2 w, 64]`, a pixel a row: each
+/// latent pixel's 32 means then log-variances, as [`crate::sdxl_vae_wgpu::WgpuSdxlVae::encode`] reads them) as
+/// [`Vae::encode`] packs its mean: each token its 2x2 pixels' 32 channels (channel `4 c + 2 dy + dx` pixel `(2 y + dy,
+/// 2 x + dx)`'s channel `c`), less each channel's mean, over its deviation. [`unpack_rows`] undoes it.
+#[cfg(feature = "webgpu")]
+pub(crate) fn pack_rows(moments: &[f32], h: usize, w: usize, mean: &[f32], std: &[f32]) -> Vec<f32> {
+    let mut tokens = vec![0f32; h * w * 128];
+    for (at, token) in tokens.chunks_exact_mut(128).enumerate() {
+        let (y, x) = (at / w, at % w);
+        for (p, v) in token.iter_mut().enumerate() {
+            let (c, dy, dx) = (p / 4, p % 4 / 2, p % 2);
+            *v = (moments[((2 * y + dy) * 2 * w + 2 * x + dx) * 64 + c] - mean[p]) / std[p];
+        }
+    }
+    tokens
 }
 
 /// A picture's latent from its tokens (`[h w, 128]`, a token a row) as [`Vae::decode`] unpacks them: each channel
@@ -158,6 +181,19 @@ pub(crate) fn unpack_rows(tokens: &[f32], h: usize, w: usize, mean: &[f32], std:
         }
     }
     latent
+}
+
+/// A name of BFL's own layout as the loaders read it: that layout keeps the 1x1 convolutions either side of the latent
+/// inside the encoder and the decoder (`encoder.quant_conv`, `decoder.post_quant_conv`: its `ae.safetensors`), the
+/// others beside them.
+fn original_key(k: &str) -> String {
+    if let Some(rest) = k.strip_prefix("decoder.post_quant_conv.") {
+        return format!("post_quant_conv.{rest}");
+    }
+    if let Some(rest) = k.strip_prefix("encoder.quant_conv.") {
+        return format!("quant_conv.{rest}");
+    }
+    k.to_owned()
 }
 
 fn map_key(k: &str) -> String {
@@ -236,6 +272,29 @@ mod tests {
         let want = want.squeeze(0)?.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
         assert_eq!(unpack_rows(&tokens, h, w, &mean, &std), want);
         Ok(())
+    }
+
+    /// Packing a latent's means into tokens is what unpacking them undoes.
+    #[cfg(feature = "webgpu")]
+    #[test]
+    fn packed_rows_unpack_to_the_latents_means() {
+        let (h, w) = (2usize, 3usize);
+        let moments: Vec<f32> = (0..4 * h * w * 64).map(|i| ((i * 29 % 97) as f32 - 48.) / 13.).collect();
+        let mean: Vec<f32> = (0..128).map(|i| i as f32 * 0.02 - 1.).collect();
+        let std: Vec<f32> = (0..128).map(|i| 0.5 + i as f32 * 0.01).collect();
+        let back = unpack_rows(&pack_rows(&moments, h, w, &mean, &std), h, w, &mean, &std);
+        for (pixel, m) in back.chunks_exact(32).zip(moments.chunks_exact(64)) {
+            for (a, b) in pixel.iter().zip(&m[..32]) {
+                assert!((a - b).abs() < 1e-5, "{a} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn bfls_own_layout_keeps_its_latent_convolutions_inside() {
+        assert_eq!(original_key("decoder.post_quant_conv.weight"), "post_quant_conv.weight");
+        assert_eq!(original_key("encoder.quant_conv.bias"), "quant_conv.bias");
+        assert_eq!(original_key("decoder.mid.attn_1.q.weight"), "decoder.mid.attn_1.q.weight");
     }
 
     #[test]
