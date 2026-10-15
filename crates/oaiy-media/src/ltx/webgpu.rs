@@ -109,9 +109,15 @@ pub(super) fn webgpu_contexts(_: &Request, _: &mut Store, _: Option<Tensor>, _: 
 pub(super) fn webgpu_decode(r: &Request, latent: &Tensor, f: usize, h: usize, w: usize) -> Result<Tensor> {
     let mut store = Store::open(&r.vae, 0)?;
     if crate::ltx_dvae_wgpu::is_diffusion_vae(&store) {
+        let loading = std::time::Instant::now();
         let decoder = crate::ltx_dvae_wgpu::WgpuLtxDiffusionVae::load(&mut store, r.device)?;
         drop(store);
-        return decoder.decode(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w, r.seed.wrapping_add(DIFFUSION_VAE_SEED_OFFSET));
+        let decoding = std::time::Instant::now();
+        let clip = decoder.decode(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w, r.seed.wrapping_add(DIFFUSION_VAE_SEED_OFFSET));
+        if std::env::var_os("OAIY_MEDIA_MEMORY").is_some() {
+            eprintln!("the diffusion decoder loaded in {:.1} s, decoded in {:.1} s", (decoding - loading).as_secs_f64(), decoding.elapsed().as_secs_f64());
+        }
+        return clip;
     }
     let decoder = crate::ltx_vae_wgpu::WgpuLtxVae::load(&mut store, r.device)?;
     drop(store);

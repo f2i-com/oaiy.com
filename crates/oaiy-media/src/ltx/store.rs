@@ -547,6 +547,45 @@ impl Store {
         found.sort_unstable();
         found.into_iter().map(|(shard, start, len)| (self.index.shard_path(shard).to_path_buf(), start, len)).collect()
     }
+    /// The tensors named `prefix` and then a name `wanted` takes read through once, whole ranges of their files at a time
+    /// on four threads, into the system's file cache, for reads of them one tensor at a time after: from a USB drive with
+    /// the file not in the cache those came at under 0.1 GB/s each waiting on the last (LTX 2.5's diffusion VAE, read
+    /// after the transformer has had the cache, 17 s to load), where read through they come at the drive's 1 GB/s. The
+    /// bytes read.
+    #[cfg(feature = "webgpu")]
+    pub fn warm(&self, prefix: &str, wanted: impl Fn(&str) -> bool) -> u64 {
+        const PIECE: u64 = 16 << 20;
+        // neighbouring spans of a file as one range (gaps under a MB read through)
+        let mut ranges: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
+        for (path, start, len) in self.spans(prefix, wanted) {
+            match ranges.last_mut() {
+                Some((p, _, end)) if *p == path && start <= *end + (1 << 20) => *end = (*end).max(start + len as u64),
+                _ => ranges.push((path, start, start + len as u64)),
+            }
+        }
+        let pieces: Vec<(&std::path::Path, u64, u64)> = ranges.iter().flat_map(|(p, a, b)| (*a..*b).step_by(PIECE as usize).map(move |at| (p.as_path(), at, (at + PIECE).min(*b)))).collect();
+        let (next, read) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicU64::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let mut buf = vec![0u8; PIECE as usize];
+                    let mut open: Option<(&std::path::Path, std::fs::File)> = None;
+                    while let Some(&(path, a, b)) = pieces.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        if open.as_ref().is_none_or(|(p, _)| *p != path) {
+                            open = std::fs::File::open(path).ok().map(|f| (path, f));
+                        }
+                        let n = (b - a) as usize;
+                        if let Some((_, f)) = &open {
+                            if dsv41::io::read_exact_at(f, &mut buf[..n], a).is_ok() {
+                                read.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        read.into_inner()
+    }
     /// A tensor at full precision (the audio decoder and vocoder run in F32).
     pub fn tensor_f32(&mut self, key: &str, dev: &Device) -> Result<Tensor> {
         let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();

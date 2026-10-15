@@ -177,6 +177,12 @@ impl WgpuLtxDiffusionVae {
         let config = Config::parse(&Json::parse(store.index.metadata("config").ok_or_else(|| err("the diffusion VAE file lacks its config metadata"))?.as_bytes()).map_err(err)?)?;
         let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
         let prefix = if store.index.names().any(|n| n.starts_with("vae.decoder.")) { "vae." } else { "" };
+        // (its tensors are read one at a time below, in the model's order: the file read through first)
+        let warming = std::time::Instant::now();
+        let warmed = store.warm(&format!("{prefix}decoder."), |_| true);
+        if std::env::var_os("OAIY_MEDIA_MEMORY").is_some() {
+            eprintln!("the diffusion decoder's file: {:.2} GB read through in {:.1} s", warmed as f64 / 1e9, warming.elapsed().as_secs_f64());
+        }
         let host = |store: &mut Store, name: &str| -> Result<Vec<f32>> { store.tensor_f32(&format!("{prefix}{name}"), &Device::Cpu)?.flatten_all()?.to_vec1::<f32>() };
         let up = |gpu: &ggml_rs_wgpu::WgpuBackend, values: &[f32]| -> DeviceVec {
             let v = gpu.vec(values.len().max(1));
@@ -247,6 +253,9 @@ impl WgpuLtxDiffusionVae {
         let t_mlp = [host(store, "decoder.t_embedder.mlp.0.weight")?, host(store, "decoder.t_embedder.mlp.0.bias")?, host(store, "decoder.t_embedder.mlp.2.weight")?, host(store, "decoder.t_embedder.mlp.2.bias")?];
         let adaln = [host(store, "decoder.shared_adaln.proj.weight")?, host(store, "decoder.shared_adaln.proj.bias")?];
         let (std, mean) = (host(store, "per_channel_statistics.std-of-means")?, host(store, "per_channel_statistics.mean-of-means")?);
+        if std::env::var_os("OAIY_MEDIA_MEMORY").is_some() {
+            eprintln!("the diffusion decoder's weights read, converted and on the GPU in {:.1} s", warming.elapsed().as_secs_f64());
+        }
         Ok(Self { gpu, config, conv_in, stages, ups, conv_in_x_t, blocks, norm_out, conv_out, t_mlp, adaln, mean, std })
     }
 
@@ -641,6 +650,11 @@ impl WgpuLtxDiffusionVae {
         };
         let ([ot, ohw], least) = self.overlaps();
         let tiles = plan(s4, full, sizes, [ot, ohw], least, self.config.upsamples[3].0, p);
+        // (OAIY_MEDIA_MEMORY: the tiles the GPU's room made, and what it said it had)
+        if std::env::var_os("OAIY_MEDIA_MEMORY").is_some() {
+            let room = self.gpu.memory_budget().map(|(budget, used)| format!("{:.1} of {:.1} GB free", budget.saturating_sub(used) as f64 / 1e9, budget as f64 / 1e9));
+            eprintln!("the diffusion decoder: {} tile(s) of {sizes:?} for {full:?} ({})", tiles.len(), room.unwrap_or_else(|| "its room not said".into()));
+        }
         let c = self.config.channels[3];
         let mut acc = vec![0f32; 3 * full[0] * full[1] * full[2]];
         let mut weight = vec![0f32; full[0] * full[1] * full[2]];
