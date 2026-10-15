@@ -458,10 +458,67 @@ class Card:
 
       def free_cache(*args, **kwargs):
         n = sum(len(v) for v in getattr(allocator, "cache", {}).values())
-        print(f"tinygpu-webgpu: the card's memory full: tinygrad's {n} cached buffers let go", file=sys.stderr, flush=True)
-        return emptied(*args, **kwargs)
+        started = time.perf_counter()
+        out = emptied(*args, **kwargs)
+        print(f"tinygpu-webgpu: the card's memory full: tinygrad's {n} cached buffers let go in {time.perf_counter() - started:.2f} s", file=sys.stderr, flush=True)
+        return out
 
       allocator.free_cache = free_cache
+
+      # tinygrad's cache of buffers let go, taken more cheaply: letting go of one costs some 3.5 ms (the card idle first,
+      # its pages unmapped one entry at a time), and after a model's run there are thousands of them (LTX 2.5's
+      # transformer's: 4,428 let go in 15.4 s before its decoder's first buffer, where tinygrad, finding the card full,
+      # lets go of every one). A buffer is taken from the cache at its size or the smallest up to twice it (the server
+      # clears what it hands out, to its size: the rest unseen); where the card is full, the buffers longest in the cache
+      # are let go first, a batch at a time (twice its size, 256 MB at least), until it fits (what the run now going let
+      # go of lately, the sizes it takes again, kept); every one only where those were not enough. A buffer goes back
+      # to the cache as its own size (one taken for a smaller one is that size still).
+      if hasattr(allocator, "cache"):
+        from collections import deque
+        from tinygrad.device import LRUAllocator
+        plain_alloc, plain_free = super(LRUAllocator, allocator).alloc, super(LRUAllocator, allocator).free
+        lru_free = allocator.free
+        order: deque = deque()   # (size and options, buffer) as each was cached, oldest first; ones taken again since skipped
+
+        def free(opaque, size, options=None):
+          size = getattr(opaque, "size", size)
+          held = allocator.cache[(size, options)]
+          before = len(held)
+          lru_free(opaque, size, options)
+          if len(held) > before:
+            order.append(((size, options), opaque))
+            # (the record kept near what the cache holds: rebuilt, oldest first as far as it knows, past four times it)
+            if len(order) > 4 * sum(len(v) for v in allocator.cache.values()) + 1024:
+              cached = {id(o) for v in allocator.cache.values() for o in v}
+              kept = [e for e in order if id(e[1]) in cached]
+              order.clear(); order.extend(kept)
+
+        def alloc(size, options=None):
+          if len(c := allocator.cache[(size, options)]): return c.pop()
+          fits = [k for k, v in allocator.cache.items() if v and k[1] == options and size <= k[0] <= 2 * size]
+          if fits: return allocator.cache[min(fits, key=lambda k: k[0])].pop()
+          try: return plain_alloc(size, options)
+          except (RuntimeError, MemoryError): pass
+          started, freed, count = time.perf_counter(), 0, 0
+          while order:
+            key, opaque = order.popleft()
+            held = allocator.cache.get(key, [])
+            at = next((i for i, o in enumerate(held) if o is opaque), None)
+            if at is None: continue
+            held.pop(at)
+            plain_free(opaque, key[0], key[1])
+            freed, count = freed + key[0], count + 1
+            if freed >= max(2 * size, 256 << 20):
+              try:
+                out = plain_alloc(size, options)
+                print(f"tinygpu-webgpu: the card's memory full: {count} of tinygrad's cached buffers let go, the longest cached first "
+                      f"({freed >> 20} MB) in {time.perf_counter() - started:.2f} s", file=sys.stderr, flush=True)
+                return out
+              except (RuntimeError, MemoryError): freed = 0
+          allocator.free_cache()
+          return plain_alloc(size, options)
+
+        allocator.alloc, allocator.free = alloc, free
 
   def begin(self):
     if self.q is None:
