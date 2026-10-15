@@ -75,14 +75,14 @@ fn live_catalog_add_remove_disable_and_defaults() {
         ("adapter", Json::str("weights.safetensors")), ("default_model", Json::str("red")),
         ("models", Json::obj([
             ("red", Json::obj([("safetensors_transformer", Json::str("weights.safetensors"))])),
-            ("realism", Json::obj([("safetensors_transformer", Json::str("other.gguf")), ("text_encoder", Json::str("weights.safetensors"))])),
+            ("qwen-image-2.1-fp16", Json::obj([("safetensors_transformer", Json::str("other.gguf")), ("text_encoder", Json::str("weights.safetensors"))])),
             ("off", Json::obj([("enabled", Json::Bool(false))])),
         ])),
     ]));
     let default = prepare(&cfg, &request).unwrap();
     assert_eq!(default.get("model").and_then(Json::as_str), Some("red"));
     let named = prepare(&cfg, &Json::obj([
-        ("prompt",Json::str("fox")), ("model",Json::str("realism")),
+        ("prompt",Json::str("fox")), ("model",Json::str("qwen-image-2.1-fp16")),
         ("text_encoder",Json::str("untrusted")),
     ])).unwrap();
     assert!(named.get("transformer").unwrap().as_str().unwrap().ends_with("other.gguf"));
@@ -98,12 +98,12 @@ fn live_catalog_add_remove_disable_and_defaults() {
     assert!(queued.get("transformer").unwrap().as_str().unwrap().ends_with("weights.safetensors"));
     let weights = Json::obj(["transformer", "text_encoder", "vae", "tokenizer"].map(|k| (k, Json::str("weights.safetensors"))));
     write("video.json", Json::obj([
-        ("default_model", Json::str("sulphur-2")),
-        ("models", Json::obj([("sulphur-2", weights)])),
+        ("default_model", Json::str("ltx-2.3")),
+        ("models", Json::obj([("ltx-2.3", weights)])),
     ]));
     assert!(available("video"));
     let video = prepare_video(&cfg, &request).unwrap();
-    assert_eq!(video.get("model").and_then(Json::as_str), Some("sulphur-2"));
+    assert_eq!(video.get("model").and_then(Json::as_str), Some("ltx-2.3"));
     assert!(Path::new(video.get("transformer").unwrap().as_str().unwrap()).is_absolute());
     std::fs::remove_file(root.join("video.json")).unwrap();
     assert!(!available("video"));
@@ -163,7 +163,7 @@ fn video_requests_use_trusted_paths_and_bounded_memory() {
     std::fs::write(
         &manifest,
         Json::obj([
-            ("models", Json::obj([("sulphur-2", model)])),
+            ("models", Json::obj([("ltx-2.3", model)])),
             ("ram_gb", Json::Int(4)),
             ("vram_gb", Json::Int(8)),
         ])
@@ -175,7 +175,7 @@ fn video_requests_use_trusted_paths_and_bounded_memory() {
     cfg.video_config = Some(manifest);
     let valid = |extra: &str| {
         Json::parse(
-            format!(r#"{{"model":"sulphur-2","prompt":"A bird in flight"{extra}}}"#).as_bytes(),
+            format!(r#"{{"model":"ltx-2.3","prompt":"A bird in flight"{extra}}}"#).as_bytes(),
         )
         .unwrap()
     };

@@ -829,8 +829,8 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         Some(Json::Str(s)) if ["auto", "euler", "ancestral"].contains(&s.as_str()) => f.push(("sampler".into(), Json::str(s))),
         Some(_) => return Err("sampler must be auto, euler or ancestral".into()),
     }
-    // A soundtrack comes with models that have their audio VAE (LTX 2.3 and
-    // Sulphur checkpoints are their own), unless the request says `"audio": false`.
+    // A soundtrack comes with models that have their audio VAE (LTX 2.3
+    // checkpoints are their own), unless the request says `"audio": false`.
     let audio_vae = path_field(root, model, "audio_vae");
     match body.get("audio") {
         None | Some(Json::Null) => {}

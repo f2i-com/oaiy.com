@@ -20,7 +20,7 @@ pub const TARGETS: [&str; 16] = ["chat", "completions", "models", "images", "edi
 /// `OAIY` is oaiy-llm-server's own asynchronous media job API (what coder-cli uses).
 pub const SPECS: [&str; 2] = ["openai", "oaiy"];
 pub const MEMORY: [&str; 4] = ["auto", "gpu", "ram", "ssd"];
-pub const VIDEO_FAMILIES: [&str; 3] = ["ltx-2.3", "ltx-2.5", "sulphur-2"];
+pub const VIDEO_FAMILIES: [&str; 2] = ["ltx-2.3", "ltx-2.5"];
 pub const IMAGE_ARCHITECTURES: [&str; 3] = ["qwen-image", "sdxl", "flux2-klein-4b"];
 /// How media jobs share GPUs with the LLM: `auto` pauses the LLM only when the
 /// media device is one of its devices; `pause_llm` always; `coexist` never.

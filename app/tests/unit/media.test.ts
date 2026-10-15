@@ -28,9 +28,9 @@ const DOC = {
     llm: [{ id: 'qwen3.8-27b', default: true, loaded: false, vision: false }, { id: 'qwen3.5-9b', default: false }],
     image: [
       { id: 'qwen-image-turbo-q4', default: true, architecture: 'qwen-image', edits: true, max_references: 3, size_step: 32, default_size: '1024x1024', negative_prompt: false },
-      { id: 'unholy-desire-sdxl', default: false, architecture: 'sdxl', edits: false, max_references: 0, size_step: 64, default_size: '1024x1024', negative_prompt: true },
+      { id: 'sdxl-base', default: false, architecture: 'sdxl', edits: false, max_references: 0, size_step: 64, default_size: '1024x1024', negative_prompt: true },
     ],
-    video: [{ id: 'sulphur-2', default: true, family: 'sulphur-2', fps: 24, max_frames: 121, max_seconds: 5, max_side: 1024, start_image: true }],
+    video: [{ id: 'ltx-2.3', default: true, family: 'ltx-2.3', fps: 24, max_frames: 121, max_seconds: 5, max_side: 1024, start_image: true }],
     speech: [{ id: 'qwen3-tts', default: true, engine: 'qwen3-tts', license: 'apache-2.0', described_voices: true, saved_voices: true, sample_rate: 24000 }],
     music: [{ id: 'minimax-music3', default: true, max_seconds: 360, sample_rate: 44100, channels: 2 }],
     sound: [{ id: 'moss-soundeffect', default: true, max_seconds: 30, sample_rate: 48000, channels: 1 }],
@@ -38,7 +38,7 @@ const DOC = {
     background: [{ id: 'birefnet', default: true, format: 'png', ready: true, license: 'MIT' }],
     upscale: [{ id: 'real-esrgan-x4plus', default: true, format: 'png', scales: [2, 4], max_pixels: 4194304, ready: true, license: 'BSD-3-Clause' }],
   },
-  defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect', model3d: 'pixal3d' },
+  defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'ltx-2.3', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect', model3d: 'pixal3d' },
   voices: { saved: [{ id: 'Narrator', name: 'Narrator', description: 'A deep, calm male narrator', language: 'english' }], openai_names: ['alloy', 'onyx'] },
   llm: { state: 'stopped', context_tokens: 32768, starts_on_demand: true },
 };
@@ -53,8 +53,8 @@ describe('OAIY discovery', () => {
     expect(found.media.baseUrl).toBe('http://127.0.0.1:8080/v1');
     expect(found.media.endpoints?.videos).toBe('http://127.0.0.1:8080/v1/videos');
     expect(found.media.imageModel).toBe('qwen-image-turbo-q4');
-    expect(found.media.videoModel).toBe('sulphur-2');
-    expect(found.media.imageModels[1]).toMatchObject({ id: 'unholy-desire-sdxl', edits: false, sizeStep: 64, negativePrompt: true });
+    expect(found.media.videoModel).toBe('ltx-2.3');
+    expect(found.media.imageModels[1]).toMatchObject({ id: 'sdxl-base', edits: false, sizeStep: 64, negativePrompt: true });
     expect(found.media.videoModels[0]).toMatchObject({ maxSeconds: 5, maxSide: 1024, startImage: true, fps: 24 });
     expect(found.llm).toEqual({
       base: 'http://127.0.0.1:8080/v1',
@@ -97,11 +97,11 @@ describe('OAIY discovery', () => {
 
   it('keeps the key and a chosen model that still exists when found again', () => {
     const found = readDiscovery(DOC, 'http://127.0.0.1:8080').media;
-    const merged = mergeDiscovered({ ...found, apiKey: 'k', imageModel: 'unholy-desire-sdxl', videoModel: 'gone', model3dModel: 'gone too' }, found);
+    const merged = mergeDiscovered({ ...found, apiKey: 'k', imageModel: 'sdxl-base', videoModel: 'gone', model3dModel: 'gone too' }, found);
     expect(merged.apiKey).toBe('k');
     expect(merged.model3dModel).toBe('pixal3d');
-    expect(merged.imageModel).toBe('unholy-desire-sdxl');
-    expect(merged.videoModel).toBe('sulphur-2');
+    expect(merged.imageModel).toBe('sdxl-base');
+    expect(merged.videoModel).toBe('ltx-2.3');
   });
 
   it('says why when OAIY will not answer this page, needs a key, or is not there', async () => {
@@ -150,7 +150,7 @@ describe('media requests', () => {
   });
 
   it('follows a video job to completion, reporting progress, and downloads it', async () => {
-    const polls = [{ id: 'video_1', status: 'queued' }, { id: 'video_1', status: 'in_progress', progress: 40 }, { id: 'video_1', status: 'completed', progress: 100, seconds: '5', size: '768x512', model: 'sulphur-2' }];
+    const polls = [{ id: 'video_1', status: 'queued' }, { id: 'video_1', status: 'in_progress', progress: 40 }, { id: 'video_1', status: 'completed', progress: 100, seconds: '5', size: '768x512', model: 'ltx-2.3' }];
     let created: Record<string, unknown> = {};
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
       if (init?.method === 'POST') {
@@ -166,7 +166,7 @@ describe('media requests', () => {
     await vi.runAllTimersAsync();
     const result = await pending;
     vi.useRealTimers();
-    expect(created).toMatchObject({ prompt: 'waves', model: 'sulphur-2', seconds: '4', input_reference: { image_url: 'data:image/png;base64,CQ==' } });
+    expect(created).toMatchObject({ prompt: 'waves', model: 'ltx-2.3', seconds: '4', input_reference: { image_url: 'data:image/png;base64,CQ==' } });
     expect(progress).toEqual(['video queued, waiting for the GPU…', 'making the video: 40%', 'downloading the video…']);
     expect(result).toMatchObject({ id: 'video_1', seconds: '5', size: '768x512' });
     expect(result.bytes.byteLength).toBe(4);
@@ -388,7 +388,7 @@ describe('media tools', () => {
     expect(video.description).toContain('lip-synced speech');
     expect(speech.description).toContain('as `say` with the saved `voice` instead');
     expect(tools[0].description).toContain('qwen-image-turbo-q4 (default): default size 1024x1024, sides in steps of 32, edits: up to 3 reference images');
-    expect(tools[0].description).toContain('unholy-desire-sdxl: default size 1024x1024, sides in steps of 64, no edits, takes negative_prompt');
-    expect(tools[1].description).toContain('sulphur-2 (default): up to 5 s, 24 fps, longest side up to 1024 px, can animate a start_image');
+    expect(tools[0].description).toContain('sdxl-base: default size 1024x1024, sides in steps of 64, no edits, takes negative_prompt');
+    expect(tools[1].description).toContain('ltx-2.3 (default): up to 5 s, 24 fps, longest side up to 1024 px, can animate a start_image');
   });
 });

@@ -77,8 +77,8 @@ pub(super) fn audio_latent_frames(frames: usize, fps: usize) -> usize {
 
 /// The H.264 quality an image is re-compressed at before it conditions a
 /// clip, as the reference does: the models were trained on video frames, and a
-/// pristine still tends to stay still. 33 for the LTX 2.3 generation (Sulphur
-/// is one), 18 from 2.4 on; 0 leaves the image as it is.
+/// pristine still tends to stay still. 33 for the LTX 2.3 generation (its
+/// fine-tunes too), 18 from 2.4 on; 0 leaves the image as it is.
 pub(super) fn image_crf(r: &Request) -> u32 {
     r.image_crf.unwrap_or(if r.model == "ltx-2.5" { 18 } else { 33 })
 }

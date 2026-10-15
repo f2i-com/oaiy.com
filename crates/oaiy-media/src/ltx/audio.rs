@@ -456,7 +456,7 @@ pub struct AudioEncoder {
 
 impl AudioEncoder {
     /// `audio_vae.encoder.*` and the latent statistics from an audio VAE file,
-    /// or from an LTX 2.3 / Sulphur checkpoint, which carries its own.
+    /// or from an LTX 2.3 checkpoint, which carries its own.
     pub fn load(path: &Path, dev: &Device) -> Result<Self> {
         let mut store = Store::open(path, 0)?;
         let config = Json::parse(store.index.metadata("config").ok_or_else(|| msg("audio VAE file lacks its config metadata"))?.as_bytes())

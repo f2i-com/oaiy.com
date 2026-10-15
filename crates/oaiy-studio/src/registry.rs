@@ -120,7 +120,7 @@ fn field_of(d: &Detected, key: &str) -> Option<Json> {
 fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Path) -> Option<Json> {
     let arch = str_or(entry, "architecture", "");
     let family = str_or(entry, "family", "");
-    // LTX 2.3 and Sulphur share Gemma 3; LTX 2.5 has its own encoder.
+    // LTX 2.3 and its fine-tunes share Gemma 3; LTX 2.5 has its own encoder.
     let same_group = |f: &str| (f == "ltx-2.5") == (family == "ltx-2.5");
     for (_, other) in get(cfg, &["media", section, "models"]).map(|m| m.members().collect::<Vec<_>>()).unwrap_or_default() {
         let compatible = match section {

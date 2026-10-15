@@ -236,7 +236,7 @@ pub(crate) fn video(c: &Config) -> Result<Json, String> {
     Ok(j)
 }
 pub(crate) fn ready_video(name: &str, model: &Json) -> bool {
-    if !["ltx-2.3", "ltx-2.5", "sulphur-2"].contains(&name) {
+    if !["ltx-2.3", "ltx-2.5"].contains(&name) {
         return false;
     }
     ["transformer", "text_encoder", "vae", "tokenizer"]

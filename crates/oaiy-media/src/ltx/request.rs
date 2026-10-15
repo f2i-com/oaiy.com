@@ -63,7 +63,7 @@ pub struct Request {
     pub text_encoder: PathBuf,
     pub tokenizer: Option<PathBuf>,
     pub vae: PathBuf,
-    /// The audio VAE with its vocoder (LTX 2.3 and Sulphur checkpoints carry
+    /// The audio VAE with its vocoder (LTX 2.3 checkpoints carry
     /// their own; LTX 2.5 ships it separately). With `audio`, the clip gets a
     /// soundtrack generated jointly with the picture.
     pub audio_vae: Option<PathBuf>,
@@ -322,8 +322,8 @@ impl Request {
         Ok(r)
     }
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if !["ltx-2.3", "ltx-2.5", "sulphur-2"].contains(&self.model.as_str()) {
-            return Err("model must be ltx-2.3, ltx-2.5 or sulphur-2".into());
+        if !["ltx-2.3", "ltx-2.5"].contains(&self.model.as_str()) {
+            return Err("model must be ltx-2.3 or ltx-2.5".into());
         }
         if !["auto", "gpu", "ram", "ssd"].contains(&self.memory.as_str()) {
             return Err("memory must be auto, gpu, ram or ssd".into());

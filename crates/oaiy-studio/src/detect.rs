@@ -441,18 +441,16 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
         let transformer = config.contains("\"transformer\"") || has(h, "transformer_blocks.");
         let vae = config.contains("\"vae\"") || has(h, "decoder.conv_in.");
         if transformer {
-            // LTX 2.3 releases (and Sulphur) carry the VAE in the same file.
-            // Sulphur runs the LTX 2.3 path; its own label keeps catalogs readable.
-            let family = if family == "ltx-2.3" && label.to_ascii_lowercase().contains("sulphur") { "sulphur-2" } else { family };
+            // LTX 2.3 releases (and their fine-tunes) carry the VAE in the same file.
             let mut fields = vec![("family", Json::str(family)), ("transformer", p.clone())];
             if vae {
                 fields.push(("vae", p.clone()));
             }
-            // LTX 2.3 releases (and Sulphur) also carry the audio VAE and vocoder.
+            // LTX 2.3 releases (and their fine-tunes) also carry the audio VAE and vocoder.
             if has(h, "audio_vae.decoder.") && has(h, "vocoder.bwe_generator.") {
                 fields.push(("audio_vae", p));
             }
-            let title = if family == "sulphur-2" { "Sulphur 2 (LTX 2.3)".to_string() } else { format!("LTX {}", &family[4..]) };
+            let title = format!("LTX {}", &family[4..]);
             let mut d = detected(Role::Video { family }, format, format!("{title} video transformer ({label})"), fields);
             if !vae {
                 d.missing.push("vae".into());
@@ -484,7 +482,7 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
         let vocab = shape_of(h, "embed_tokens.weight").and_then(|s| s.first().copied()).unwrap_or(0);
         if vocab >= 256_000 {
             return Ok(detected(Role::Component { kind: "video_text_encoder" }, format,
-                format!("Gemma 3 text encoder for LTX 2.3 / Sulphur ({label})"), vec![("text_encoder", p)]));
+                format!("Gemma 3 text encoder for LTX 2.3 ({label})"), vec![("text_encoder", p)]));
         }
         if (150_000..160_000).contains(&vocab) {
             return Ok(detected(Role::Component { kind: "text_encoder" }, format,
@@ -510,7 +508,7 @@ fn tokenizer_file(path: &Path) -> Result<Detected, String> {
         return Ok(detected(Role::Component { kind: "clip_tokenizer" }, "tokenizer", "CLIP tokenizer (for SDXL)".into(), vec![("tokenizer", path_json(path))]));
     }
     if text.contains("<start_of_turn>") || text.contains("<start_of_image>") {
-        return Ok(detected(Role::Component { kind: "tokenizer" }, "tokenizer", "Gemma 3 tokenizer (for LTX 2.3 / Sulphur)".into(), vec![("tokenizer", path_json(path))]));
+        return Ok(detected(Role::Component { kind: "tokenizer" }, "tokenizer", "Gemma 3 tokenizer (for LTX 2.3)".into(), vec![("tokenizer", path_json(path))]));
     }
     Err("tokenizer.json: neither the CLIP nor the Gemma 3 tokenizer".into())
 }

@@ -78,8 +78,8 @@ fn audio_defaults_on_for_ltx_2_5_with_an_audio_vae() {
         Json::parse(format!(r#"{{"model":"ltx-2.5","transformer":"t","text_encoder":"e","vae":"v","output_dir":"o","prompt":"p","backend":"cpu"{extra}}}"#).as_bytes()).unwrap()
     };
     assert!(Request::parse(&base(r#","audio_vae":"a""#)).unwrap().audio);
-    let sulphur = Json::parse(br#"{"model":"sulphur-2","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","audio_vae":"t","output_dir":"o","prompt":"p","backend":"cpu"}"#).unwrap();
-    assert!(Request::parse(&sulphur).unwrap().audio, "LTX 2.3 checkpoints carry their own audio VAE");
+    let ltx23 = Json::parse(br#"{"model":"ltx-2.3","transformer":"t","text_encoder":"e","tokenizer":"k","vae":"t","audio_vae":"t","output_dir":"o","prompt":"p","backend":"cpu"}"#).unwrap();
+    assert!(Request::parse(&ltx23).unwrap().audio, "LTX 2.3 checkpoints carry their own audio VAE");
     assert!(!Request::parse(&base("")).unwrap().audio);
     assert!(!Request::parse(&base(r#","audio_vae":"a","audio":false"#)).unwrap().audio);
     assert!(Request::parse(&base(r#","audio":true"#)).is_err(), "audio without its VAE");

@@ -165,7 +165,7 @@ fn hidden_features(
 
 /// Prompt features for the video stream, and for the audio stream when
 /// `audio`. The aggregate projections sit in the Gemma 4 file for LTX 2.5,
-/// and in the transformer checkpoint (`projection`) for LTX 2.3 and Sulphur.
+/// and in the transformer checkpoint (`projection`) for LTX 2.3.
 #[allow(clippy::too_many_arguments)]
 pub fn encode(
     path: &Path,

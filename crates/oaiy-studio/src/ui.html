@@ -860,7 +860,7 @@ dialog::backdrop { background: var(--backdrop); }
             <button class="btn" id="add-detect">Check</button>
           </div>
           <div id="add-result"></div>
-          <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, Sulphur, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, Pixal3D and DINOv3 folders (3D models), and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code; NAF's naf_release.pth and Real-ESRGAN's RealESRGAN_x4plus.pth are the exceptions, read by oaiy's own reader, which runs nothing from the file.</p>
+          <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, Pixal3D and DINOv3 folders (3D models), and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code; NAF's naf_release.pth and Real-ESRGAN's RealESRGAN_x4plus.pth are the exceptions, read by oaiy's own reader, which runs nothing from the file.</p>
         </div>
       </div>
       <div class="block">
@@ -1562,8 +1562,8 @@ function renderModels() {
       .filter(k => k !== "tokenizer" || m.family !== "ltx-2.5")
       .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json", audio_vae: "Audio VAE (optional, for sound)"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("")
       + `<label class="f"><span>Negative prompt (optional: what its videos should not show, unless a request says otherwise)</span><input type="text" value="${esc(m.negative_prompt || "")}" data-mfield="video|${esc(name)}|negative_prompt" placeholder="watermark, text, logo, subtitles"></label>`;
-    return mediaItem("video", name, m, (m.family || name).toUpperCase().replace("SULPHUR", "Sulphur"), miss, fields);
-  }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3, LTX 2.5 or Sulphur .safetensors file.</div>';
+    return mediaItem("video", name, m, (m.family || name).toUpperCase(), miss, fields);
+  }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3 or LTX 2.5 .safetensors file.</div>';
 
   $$("[data-mfield]").forEach(el => el.oninput = () => { const [s, n, k] = el.dataset.mfield.split("|"); modelObj(s, n)[k] = el.value; touch(); });
   $$("[data-mpick]").forEach(b => b.onclick = () => { const [s, n, k] = b.dataset.mpick.split("|");

@@ -503,7 +503,7 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
         None => config.get("default_model").and_then(Json::as_str).unwrap_or("ltx-2.3"),
         Some(v) => v.as_str().ok_or("model must be a string")?,
     };
-    if !["ltx-2.3", "ltx-2.5", "sulphur-2"].contains(&model) {
+    if !["ltx-2.3", "ltx-2.5"].contains(&model) {
         return Err("unsupported video model".into());
     }
     let selected = config
@@ -608,7 +608,7 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
         fields.push((key.into(), Json::str(value)));
     }
     // Models with an `audio_vae` generate a soundtrack unless asked not to
-    // (for LTX 2.3 and Sulphur it is the checkpoint itself).
+    // (for LTX 2.3 it is the checkpoint itself).
     let audio_vae = selected.get("audio_vae").and_then(Json::as_str);
     if let Some(value) = audio_vae {
         let path = Path::new(value);

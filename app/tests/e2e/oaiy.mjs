@@ -106,9 +106,9 @@ function discovery(origin) {
       model3d: [{ id: 'pixal3d', default: true, format: 'glb', resolutions: [1024, 1536], faces: 200000, input: 'a picture of one object on a plain or transparent background', ready: true, license: "MIT (Pixal3D); DINOv3 under Meta's DINOv3 License" }],
       llm: [{ id: 'qwen3.8-27b', default: true }],
       image: [{ id: 'qwen-image-turbo-q4', default: true, edits: true, max_references: 3, size_step: 32, default_size: '1024x1024' }],
-      video: [{ id: 'sulphur-2', default: true, fps: 24, max_seconds: 5, max_side: 1024, start_image: true }],
+      video: [{ id: 'ltx-2.3', default: true, fps: 24, max_seconds: 5, max_side: 1024, start_image: true }],
     },
-    defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect', model3d: 'pixal3d' },
+    defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'ltx-2.3', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect', model3d: 'pixal3d' },
     voices: { saved: [{ name: 'Narrator', description: 'a deep, calm narrator' }], openai_names: ['alloy'] },
     llm: { context_tokens: 32768 },
   };
@@ -130,7 +130,7 @@ const oaiy = createHttpServer((req, res) => {
   req.on('end', () => {
     const url = req.url.split('?')[0];
     if (url === '/v1/discovery') return send(200, discovery(origin));
-    if (url === '/v1/models') return send(200, { data: [{ id: 'qwen3.8-27b', type: 'llm' }, { id: 'qwen-image-turbo-q4', type: 'image' }, { id: 'sulphur-2', type: 'video' }, { id: 'pixal3d', type: 'model3d' }] });
+    if (url === '/v1/models') return send(200, { data: [{ id: 'qwen3.8-27b', type: 'llm' }, { id: 'qwen-image-turbo-q4', type: 'image' }, { id: 'ltx-2.3', type: 'video' }, { id: 'pixal3d', type: 'model3d' }] });
     if (url === '/v1/chat/completions') {
       chats.push(JSON.parse(body));
       res.setHeader('content-type', 'text/event-stream');
@@ -143,7 +143,7 @@ const oaiy = createHttpServer((req, res) => {
     if (url === '/v1/videos' && req.method === 'POST') {
       videos.push(JSON.parse(body));
       polls = 0;
-      return send(200, { id: 'video_1', object: 'video', status: 'queued', progress: 0, model: 'sulphur-2' });
+      return send(200, { id: 'video_1', object: 'video', status: 'queued', progress: 0, model: 'ltx-2.3' });
     }
     if (url === '/v1/audio/voices' && req.method === 'POST') {
       voicesMade.push(JSON.parse(body));
@@ -183,7 +183,7 @@ const oaiy = createHttpServer((req, res) => {
     if (url === '/v1/3d/models/m3d_1/input') return send(200, PNG, 'image/png');
     if (url === '/v1/videos/video_1') {
       polls++;
-      return send(200, polls < 3 ? { id: 'video_1', status: 'in_progress', progress: polls * 40 } : { id: 'video_1', status: 'completed', progress: 100, seconds: '4', size: '768x512', model: 'sulphur-2' });
+      return send(200, polls < 3 ? { id: 'video_1', status: 'in_progress', progress: polls * 40 } : { id: 'video_1', status: 'completed', progress: 100, seconds: '4', size: '768x512', model: 'ltx-2.3' });
     }
     if (url === '/v1/videos/video_1/content') return send(200, Buffer.from('not really an mp4'), 'video/mp4');
     send(404, { error: { message: `no route ${req.method} ${url}` } });
@@ -239,7 +239,7 @@ try {
     const media = await page.$eval('.media-settings', (s) => ({ text: s.textContent, inputs: [...s.querySelectorAll('input')].map((i) => i.value) }));
     expect(media.text.includes(`oaiy-studio 0.1.0 at ${new URL(oaiyUrl).origin} (images, video, speech, music, sound effects and 3D models)`), media.text);
     expect(media.inputs.includes('pixal3d'), JSON.stringify(media.inputs));
-    expect(media.inputs.includes(`${oaiyUrl}/v1`) && media.inputs.includes('qwen-image-turbo-q4') && media.inputs.includes('sulphur-2'), JSON.stringify(media.inputs));
+    expect(media.inputs.includes(`${oaiyUrl}/v1`) && media.inputs.includes('qwen-image-turbo-q4') && media.inputs.includes('ltx-2.3'), JSON.stringify(media.inputs));
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Cancel').click());
   });
 
@@ -257,7 +257,7 @@ try {
     const imageTool = chats[0].tools.find((t) => t.function.name === 'generate_image').function;
     expect(imageTool.description.includes('qwen-image-turbo-q4 (default): default size 1024x1024'), imageTool.description);
     expect(images.length === 1 && images[0].model === 'qwen-image-turbo-q4' && images[0].response_format === 'b64_json' && images[0].prompt.includes('red fox'), JSON.stringify(images));
-    expect(videos.length === 1 && videos[0].model === 'sulphur-2' && videos[0].seconds === '4' && /^data:image\/png;base64,/.test(videos[0].input_reference?.image_url), JSON.stringify(videos).slice(0, 300));
+    expect(videos.length === 1 && videos[0].model === 'ltx-2.3' && videos[0].seconds === '4' && /^data:image\/png;base64,/.test(videos[0].input_reference?.image_url), JSON.stringify(videos).slice(0, 300));
     const results = chats.slice(1).map((c) => c.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n')).join('\n');
     expect(results.includes('Saved /art/fox.png: 1×1 px, made with qwen-image-turbo-q4') && results.includes('Saved /media/fox.mp4 (4 s, 768x512'), results);
     const shown = await page.$$eval('.msg.presented', (els) => els.map((e) => ({ img: !!e.querySelector('img'), video: !!e.querySelector('video'), text: e.textContent })));

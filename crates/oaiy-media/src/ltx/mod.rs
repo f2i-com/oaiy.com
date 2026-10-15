@@ -787,7 +787,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         let ram = if r.memory == "ssd" || r.memory == "gpu" { 0 } else { r.ram_bytes };
         let mut store = Store::open(&refine.transformer, ram)?;
         // The prompt through the refining transformer's own text connectors:
-        // a fine-tune (Sulphur, or one of LTX 2.5) may have its own.
+        // a fine-tune (of LTX 2.3 or LTX 2.5) may have its own.
         let (context, audio_context) = refine_contexts(r, &refine.transformer, &mut store, &dev, &mut report)?;
         let budget = if r.memory == "ram" || r.memory == "ssd" { 0 } else { r.vram_bytes };
         let mut model = transformer::Transformer::new(store, &dev, budget, r.memory == "gpu", r.audio)?;

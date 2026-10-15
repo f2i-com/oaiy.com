@@ -7,8 +7,8 @@ fn cfg(extra_image: &str, extra_video: &str) -> Json {
     let image = Json::parse(format!(r#"{{"enabled":true,"default_model":"qwen","memory":"auto","ram_gb":32,"vram_gb":20,"models":{{
             "qwen":{{"architecture":"qwen-image","base":"base","transformer":"q.gguf","adapter":"turbo.safetensors"{extra_image}}},
             "anime":{{"architecture":"sdxl","checkpoint":"/abs/anime.safetensors","tokenizer":"tok.json","steps":24,"memory":"ssd"}}}}}}"#).as_bytes()).unwrap();
-    let video = Json::parse(format!(r#"{{"enabled":true,"default_model":"sulphur","ram_gb":48,"vram_gb":null,"fps":24,"ffmpeg":"ffmpeg","models":{{
-            "sulphur":{{"family":"sulphur-2","transformer":"s.safetensors","vae":"s.safetensors","text_encoder":"g.safetensors","tokenizer":"t.json"{extra_video}}}}}}}"#).as_bytes()).unwrap();
+    let video = Json::parse(format!(r#"{{"enabled":true,"default_model":"ltx","ram_gb":48,"vram_gb":null,"fps":24,"ffmpeg":"ffmpeg","models":{{
+            "ltx":{{"family":"ltx-2.3","transformer":"s.safetensors","vae":"s.safetensors","text_encoder":"g.safetensors","tokenizer":"t.json"{extra_video}}}}}}}"#).as_bytes()).unwrap();
     let Json::Obj(top) = &mut v else { unreachable!() };
     let media = &mut top.iter_mut().find(|(k, _)| k == "media").unwrap().1;
     crate::util::set(media, "image", image);
@@ -113,8 +113,8 @@ fn video_requests_fit_openai_sizes_and_seconds_to_ltx() {
     let root = Path::new("/install");
     let out = std::env::temp_dir().join(format!("oaiy-studio-video-{}", std::process::id()));
     let (r, name, size, secs) = video_request(&c, root, &out, &body(r#"{"prompt":"waves","model":"sora-2","seconds":"4","size":"1280x720"}"#), false).unwrap();
-    assert_eq!((name.as_str(), size.as_str()), ("sulphur", "1024x576"));
-    assert_eq!(r.get("model").and_then(Json::as_str), Some("sulphur-2"));
+    assert_eq!((name.as_str(), size.as_str()), ("ltx", "1024x576"));
+    assert_eq!(r.get("model").and_then(Json::as_str), Some("ltx-2.3"));
     assert_eq!(r.get("frames").and_then(Json::as_i64), Some(97));
     assert!((secs - 4.0).abs() < 1e-9);
     assert_eq!(r.get("vram_gb").and_then(Json::as_i64), Some(192));
