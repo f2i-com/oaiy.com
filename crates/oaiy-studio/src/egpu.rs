@@ -1160,7 +1160,7 @@ impl Egpu {
                     g.waiting = g.waiting.saturating_sub(1);
                 }
                 return Err(Unready::Loading(if g.lent {
-                    "the eGPU is making a picture; try again shortly".into()
+                    "the eGPU is making a picture, a video or a sound; try again shortly".into()
                 } else if holds {
                     format!("{name} is still loading on the eGPU; try again shortly")
                 } else {

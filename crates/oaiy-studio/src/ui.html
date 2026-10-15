@@ -1852,11 +1852,11 @@ function renderEgpu() {
   // Its ticks under Models and its row on the Overview follow what the engines say, once they have said it.
   if (egpuOfferedBefore !== !!e?.available && cfg) { egpuOfferedBefore = !!e?.available; renderModels(); }
   if (!e?.available) return;
-  const label = !e.enabled ? "Off" : e.lent ? "Making a picture" : e.paused ? "Paused" : {stopped: "Not started", starting: "Loading", ready: "Ready", failed: "Not answering"}[e.state];
+  const label = !e.enabled ? "Off" : e.lent ? "Making media" : e.paused ? "Paused" : {stopped: "Not started", starting: "Loading", ready: "Ready", failed: "Not answering"}[e.state];
   $("#egpu-tag").innerHTML = `<span class="tag ${e.enabled && e.state === "ready" ? "good" : e.enabled && e.state === "failed" ? "bad" : ""}">${label}</span>`;
   const set = e.models?.length ? "" : " No model is set to it yet: tick one under Models.";
   $("#egpu-detail").textContent = !e.enabled ? "Switched off: every model runs on this computer's own GPU."
-    : e.lent ? `The card is making a picture: ${e.model || "its model"} is paused, and chats with it wait for the card.`
+    : e.lent ? `The card is making a picture, a video or a sound: ${e.model || "its model"} is paused, and chats with it wait for the card.`
     : e.paused ? `The card is held with ${e.model || "its model"} paused (after a picture): the next chat with it loads it again.`
     : e.state === "ready" ? `Serving ${e.model}${e.runs_on ? " on " + e.runs_on : ""}, up to ${e.context_tokens} tokens of context. Loaded in ${e.load_seconds?.toFixed(1)} s, idle ${e.idle_seconds} s.`
     : e.state === "starting" ? `Loading ${e.model || ""}. tinygrad compiles its kernels the first time a model starts, which takes minutes; requests wait for it.`
