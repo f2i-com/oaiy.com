@@ -265,6 +265,49 @@ impl Weights {
         }
     }
 
+    /// Rows `ids` of the matrix `name` (an embedding's), side by side as f32 (`[ids, cols]`), each read from the file
+    /// on its own: a 9B's 248,320 rows are not read whole for a prompt's few hundred.
+    pub fn rows(&mut self, name: &str, ids: &[u32]) -> Result<Vec<f32>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let key = self.resolve(name)?;
+        let shape = self.shape(name)?;
+        let &[n, k] = shape.as_slice() else { candle_core::bail!("{name}: a matrix of shape {shape:?}") };
+        if let Some(bad) = ids.iter().find(|&&i| i as usize >= n) {
+            candle_core::bail!("{name}: row {bad} of {n}");
+        }
+        match self {
+            Self::Safe(s) => {
+                let info = s.info(&key).map_err(candle_core::Error::wrap)?.clone();
+                let size = info.dtype.size();
+                let mut file = File::open(s.shard_path(info.shard))?;
+                let (mut row, mut out) = (vec![0u8; k * size], Vec::with_capacity(ids.len() * k));
+                for &id in ids {
+                    file.seek(SeekFrom::Start(info.start + (id as usize * k * size) as u64))?;
+                    file.read_exact(&mut row)?;
+                    let half = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+                    match info.dtype {
+                        Dtype::BF16 => out.extend(row.chunks_exact(2).map(|b| f32::from_bits((half(b) as u32) << 16))),
+                        Dtype::F16 => out.extend(row.chunks_exact(2).map(|b| half::f16::from_bits(half(b)).to_f32())),
+                        Dtype::F32 => out.extend(row.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+                        other => candle_core::bail!("{name}: rows of {other:?}"),
+                    }
+                }
+                Ok(out)
+            }
+            Self::Gguf { content, file } => {
+                let info = content.tensor_infos.get(&key).ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {key}")))?;
+                let t = info.ggml_dtype;
+                let row = k / t.block_size() * t.type_size();
+                let mut bytes = vec![0u8; ids.len() * row];
+                for (dst, &id) in bytes.chunks_exact_mut(row).zip(ids) {
+                    file.seek(SeekFrom::Start(content.tensor_data_offset + info.offset + (id as usize * row) as u64))?;
+                    file.read_exact(dst)?;
+                }
+                ggml_file::qtensor_from_ggml(t, &bytes, vec![ids.len(), k], &Device::Cpu)?.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()
+            }
+        }
+    }
+
     pub fn tensor(&mut self, name: &str, dev: &Device, dtype: DType) -> Result<Tensor> {
         if let Some(q) = self.gguf_half_qtensor(name, dev)? {
             return q.dequantize(dev)?.to_dtype(dtype);

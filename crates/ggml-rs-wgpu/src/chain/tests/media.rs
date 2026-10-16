@@ -980,6 +980,24 @@ fn a_unets_ops_are_their_formulas() {
     }).fold(0f64, f64::max);
     eprintln!("GEGLU of {rows} rows of {ff}: the worst error {worst:.2e}");
     assert!(worst < 1e-5, "GEGLU: {worst}");
+    // SiTU: both halves far past their caps too (the tanh's argument clamped)
+    let mut fused: Vec<f32> = (0..rows * 2 * ff).map(|_| 30.0 * next()).collect();
+    fused[3] = 4000.0;
+    fused[ff + 5] = -900.0;
+    fused[2 * ff + ff + 7] = 700.0;
+    DeviceChain::upload(&b, &fv, &fused);
+    let mut rec = Recorder::new(&b);
+    rec.situ_rows(&fv, &ov, rows, ff);
+    rec.read(&ov);
+    let got = Box::new(rec).finish().pop().unwrap();
+    let worst = (0..rows * ff).map(|i| {
+        let (r, j) = (i / ff, i % ff);
+        let (h, g) = (fused[r * 2 * ff + j] as f64, fused[r * 2 * ff + ff + j] as f64);
+        let want = 4.0 * (g / 4.0).tanh() / (1.0 + (-g).exp()) * 25.0 * (h / 25.0).tanh();
+        (got[i] as f64 - want).abs() / (1.0 + want.abs())
+    }).fold(0f64, f64::max);
+    eprintln!("SiTU of {rows} rows of {ff}: the worst error {worst:.2e}");
+    assert!(worst < 1e-5, "SiTU: {worst}");
     // the even pixels
     let (h, w, c) = (6usize, 10usize, 5usize);
     let x: Vec<f32> = (0..h * w * c).map(|i| i as f32).collect();

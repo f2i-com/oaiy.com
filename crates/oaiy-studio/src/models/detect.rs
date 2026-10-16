@@ -109,6 +109,20 @@ pub(crate) fn as_qwen_image_encoder(d: &Detected, path: &Path) -> Option<Detecte
     Some(detected(Role::Component { kind: "text_encoder" }, "gguf", format!("Qwen3-VL text encoder for Qwen Image, quantized GGUF ({})", stem(path)), vec![("text_encoder", path_json(path))]))
 }
 
+/// `d`, a Qwen3.5 language model's GGUF 4,096 wide (Qwen3.5-9B's: `qwen35`, 32 blocks), as MOSS-Image's text encoder:
+/// what the person asked for in adding it to a MOSS-Image model. None for anything else.
+pub(crate) fn as_moss_encoder(d: &Detected, path: &Path) -> Option<Detected> {
+    if d.role != Role::Llm || d.format != "gguf" || d.architecture.as_deref() != Some("qwen35") {
+        return None;
+    }
+    let g = read_gguf(path, 0).ok()?;
+    let int = |k: &str| g.kv.iter().find(|(key, _)| key == k).and_then(|(_, v)| v.as_i64());
+    if int("qwen35.embedding_length") != Some(4096) || int("qwen35.block_count") != Some(32) {
+        return None;
+    }
+    Some(detected(Role::Component { kind: "moss_text_encoder" }, "gguf", format!("Qwen3.5-9B text encoder for MOSS-Image, quantized GGUF ({})", stem(path)), vec![("text_encoder", path_json(path))]))
+}
+
 /// A path as configuration text. On Windows a path picked with `/` keeps `/`
 /// throughout, rather than gaining `\` where folders were joined onto it.
 pub(crate) fn path_json(p: &Path) -> Json {
@@ -296,6 +310,14 @@ fn gguf_file(path: &Path) -> Result<Detected, String> {
     if arch == "qwen_image" || g.tensors.iter().any(|t| t.starts_with("transformer_blocks.0.attn.add_k_proj")) {
         return Err(format!("{}: the first Qwen-Image's transformer ({label}), which OAIY does not make pictures with: it makes them with Qwen Image 2.1's", path.display()));
     }
+    // MOSS-Image's transformer (realrebelai's GGUFs of MOSS-Image-SFT and -Base)
+    if arch == "moss_image" {
+        let mut d = detected(Role::Image { architecture: "moss-image" }, "gguf",
+            format!("MOSS-Image transformer, quantized GGUF; pictures from text, tags or JSON layouts (Apache-2.0) ({label})"),
+            vec![("architecture", Json::str("moss-image")), ("transformer", path_json(path))]);
+        d.missing.extend(["text_encoder", "vae"].into_iter().map(String::from));
+        return Ok(d);
+    }
     if arch.starts_with("qwen_image") || image_tensors {
         let distilled = file.contains("turbo");
         let mut fields = vec![("architecture", Json::str("qwen-image")), ("transformer", path_json(path)), ("weights", Json::str("gguf"))];
@@ -422,6 +444,25 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
         d.missing.extend(["text_encoder", "vae"].into_iter().map(String::from));
         return Ok(d);
     }
+    // (a shard of a folder of them stands for its folder)
+    let folder_of_shards = || if label.contains("-of-") { path.parent().map_or(p.clone(), path_json) } else { p.clone() };
+    // MOSS-Image's transformer (ComfyUI's file of it, or a shard of diffusers' folder): picture and text tokens in one
+    // stream, every block modulated by the one shared modulation
+    if shape_of(h, "video_embedder.weight") == Some(&[3072, 128]) && shape_of(h, "text_embedder.proj.weight") == Some(&[3072, 4096]) && has(h, "shared_block_modulation.") {
+        let mut d = detected(Role::Image { architecture: "moss-image" }, format,
+            format!("MOSS-Image transformer; pictures from text, tags or JSON layouts (Apache-2.0) ({label})"),
+            vec![("architecture", Json::str("moss-image")), ("transformer", folder_of_shards())]);
+        d.missing.extend(["text_encoder", "vae"].into_iter().map(String::from));
+        return Ok(d);
+    }
+    // Qwen3.5-9B (its 248,320 tokens 4,096 wide): MOSS-Image's text encoder
+    if shape_of(h, "embed_tokens.weight") == Some(&[248320, 4096]) {
+        return Ok(detected(Role::Component { kind: "moss_text_encoder" }, format, format!("Qwen3.5-9B text encoder for MOSS-Image ({label})"), vec![("text_encoder", folder_of_shards())]));
+    }
+    // MOSS-Image's own VAE: FLUX.2's, its decoder the smaller one (384 wide where FLUX.2's is 512)
+    if shape_of(h, "bn.running_mean") == Some(&[128]) && shape_of(h, "decoder.conv_in.weight") == Some(&[384, 32, 3, 3]) {
+        return Ok(detected(Role::Component { kind: "moss_vae" }, format, format!("FLUX.2 VAE with MOSS-Image's small decoder ({label})"), vec![("vae", p)]));
+    }
     if shape_of(h, "img_in.weight") == Some(&[3072, 128]) && shape_of(h, "txt_in.weight") == Some(&[3072, 7680])
         && has(h, "double_blocks.4.img_attn.qkv.weight") && has(h, "single_blocks.19.linear1.weight") {
         let mut d = detected(Role::Image { architecture: "flux2-klein-4b" }, format, format!("FLUX.2 Klein 4B transformer ({label}); select base variant explicitly for base weights"),
@@ -521,6 +562,10 @@ fn tokenizer_file(path: &Path) -> Result<Detected, String> {
     let mut head = vec![0; meta.len().min(4 << 20) as usize];
     File::open(path).and_then(|mut f| f.read_exact(&mut head)).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&head);
+    // (Qwen3.5's has audio tokens, which Qwen3's has not)
+    if text.contains("<|im_start|>") && text.contains("<|audio_start|>") {
+        return Ok(detected(Role::Component { kind: "moss_tokenizer" }, "tokenizer", "Qwen3.5 tokenizer (for MOSS-Image's text encoder)".into(), vec![("tokenizer", path_json(path))]));
+    }
     if text.contains("<|im_start|>") && text.contains("<|endoftext|>") {
         return Ok(detected(Role::Component { kind: "klein_tokenizer" }, "tokenizer", "Qwen tokenizer (for Klein's Qwen3-4B conditioner)".into(), vec![("tokenizer", path_json(path))]));
     }
@@ -595,6 +640,26 @@ fn directory(dir: &Path) -> Result<Detected, String> {
                 }
             }
             return Ok(detected(Role::Component { kind: "sound_model" }, "diffusers", format!("MOSS-SoundEffect: sound effects from a description ({label})"), vec![("path", path_json(dir))]));
+        }
+        // MOSS-Image (OpenMOSS's MOSS-Image-SFT or -Base): its transformer, VAE and tokenizer, and its text encoder
+        // (Qwen3.5-9B) where the folder holds it
+        if class == "MOSSImagePipeline" {
+            let transformer = dir.join("transformer");
+            if !(transformer.is_dir() && has_ext(&transformer, "safetensors")) {
+                return Err(format!("{label}: a MOSS-Image folder needs its transformer/ weights"));
+            }
+            let mut d = detected(Role::Image { architecture: "moss-image" }, "diffusers",
+                format!("MOSS-Image pipeline folder; pictures from text, tags or JSON layouts (Apache-2.0) ({label})"),
+                vec![("architecture", Json::str("moss-image")), ("transformer", path_json(&transformer))]);
+            let (vae, tokenizer, text_encoder) = (dir.join("vae").join("diffusion_pytorch_model.safetensors"), dir.join("tokenizer").join("tokenizer.json"), dir.join("text_encoder"));
+            for (key, part, there) in [("vae", &vae, vae.is_file()), ("tokenizer", &tokenizer, tokenizer.is_file()), ("text_encoder", &text_encoder, text_encoder.is_dir() && has_ext(&text_encoder, "safetensors"))] {
+                if there {
+                    d.fields.push((key.into(), path_json(part)));
+                } else if key != "tokenizer" {
+                    d.missing.push(key.into());
+                }
+            }
+            return Ok(d);
         }
         return Err(format!("{label}: diffusers pipeline {class:?} is not one OAIY runs"));
     }
@@ -687,6 +752,19 @@ fn directory(dir: &Path) -> Result<Detected, String> {
                 return Err(format!("{label}: a DINOv3 folder needs its model.safetensors"));
             }
             return Ok(detected(Role::Component { kind: "model3d_dino" }, "safetensors", "DINOv3 ViT-L/16: the image encoder 3D models need (Meta's DINOv3 License)".into(), vec![("dino", path_json(dir))]));
+        }
+        // MOSS-Image's transformer alone (its folder in MOSS-Image's)
+        if str_or(&config, "_class_name", "") == "MOSSImageTransformer" && has_ext(dir, "safetensors") {
+            let mut d = detected(Role::Image { architecture: "moss-image" }, "diffusers",
+                format!("MOSS-Image transformer; pictures from text, tags or JSON layouts (Apache-2.0) ({label})"),
+                vec![("architecture", Json::str("moss-image")), ("transformer", path_json(dir))]);
+            d.missing.extend(["text_encoder", "vae"].into_iter().map(String::from));
+            return Ok(d);
+        }
+        // Qwen3.5-9B (4,096 wide): MOSS-Image's text encoder (its own text_encoder folder, or Qwen's release)
+        let width = config.get("text_config").unwrap_or(&config).get("hidden_size").and_then(Json::as_i64);
+        if model_type.starts_with("qwen3_5") && !model_type.contains("moe") && width == Some(4096) && has_ext(dir, "safetensors") {
+            return Ok(detected(Role::Component { kind: "moss_text_encoder" }, "safetensors", format!("Qwen3.5-9B text encoder for MOSS-Image ({label})"), vec![("text_encoder", path_json(dir))]));
         }
         // (the 4B, 2,560 wide, is FLUX 3 Image Klein's; Qwen Image's is the 8B)
         if model_type == "qwen3_vl" && has_ext(dir, "safetensors") && config.get("text_config").and_then(|t| t.get("hidden_size")).and_then(Json::as_i64) == Some(2560) {

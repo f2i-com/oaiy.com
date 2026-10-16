@@ -433,8 +433,9 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         Some(v) => v.as_i64().filter(|n| (1..=16).contains(n)).ok_or("n must be between 1 and 16")?,
     };
     let arch = str_or(model, "architecture", "qwen-image");
-    let step = if arch == "sdxl" { 64 } else if arch == "flux2-klein-4b" || arch == "flux3-klein" { 16 } else { 32 };
+    let step = if arch == "sdxl" { 64 } else if matches!(arch, "flux2-klein-4b" | "flux3-klein" | "moss-image") { 16 } else { 32 };
     let flux3 = arch == "flux3-klein";
+    let moss = arch == "moss-image";
     if arch == "flux2-klein-4b" {
         if body.get("turbo").is_some_and(|v|v.as_bool()!=Some(false)) { return Err("Klein does not use Qwen turbo".into()); }
         for key in ["image", "images", "input_image", "input_reference", "adapter"] {
@@ -449,6 +450,9 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     let refs = references(body, output_root, allow_local, if flux3 { 10 } else { 3 })?;
     if !refs.is_empty() && arch == "sdxl" {
         return Err(format!("{name} is an SDXL model, which cannot edit images; pick a Qwen Image model"));
+    }
+    if !refs.is_empty() && moss {
+        return Err(format!("{name} is a MOSS-Image model, which makes pictures from text alone; pick a Qwen Image or FLUX 3 model to edit"));
     }
     // Editing with `size: auto` keeps the first reference's shape at about a megapixel.
     let auto = matches!(body.get("size").and_then(Json::as_str), None | Some("auto" | ""));
@@ -548,6 +552,36 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         }
         if let Some(loras) = model_loras(root, model, body)? {
             f.push(("loras".into(), loras));
+        }
+    } else if moss {
+        f.push(("architecture".into(), Json::str(arch)));
+        for key in ["transformer", "text_encoder", "vae"] {
+            f.push((key.into(), Json::str(path_field(root, model, key).ok_or_else(|| format!("MOSS-Image model needs {key}"))?)));
+        }
+        if let Some(t) = path_field(root, model, "tokenizer") {
+            f.push(("tokenizer".into(), Json::str(t)));
+        }
+        if body.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) {
+            return Err("MOSS-Image does not use Qwen turbo".into());
+        }
+        if model_loras(root, model, body)?.is_some_and(|l| l.as_array().is_some_and(|a| !a.is_empty())) {
+            return Err("MOSS-Image takes no LoRAs yet".into());
+        }
+        // (the pipeline's own: 50 steps, cfg 3, shift 5, its negative branch skipping block 22; a model's or the
+        // request's where they set them)
+        f.push(("steps".into(), Json::Int(steps(50, 1, 100)?)));
+        let number = |key: &str, default: f64, lo: f64, hi: f64| -> Result<f64, String> {
+            match body.get(key).or_else(|| model.get(key)).filter(|v| !matches!(v, Json::Null)) {
+                None => Ok(default),
+                Some(v) => v.as_f64().filter(|c| c.is_finite() && (lo..=hi).contains(c)).ok_or_else(|| format!("{key} must be a number from {lo} to {hi}")),
+            }
+        };
+        f.push(("cfg".into(), Json::Num(number("cfg", 3., 1., 10.)?)));
+        f.push(("shift".into(), Json::Num(number("shift", 5., 0.1, 20.)?)));
+        let negative = body.get("negative_prompt").and_then(Json::as_str).unwrap_or(str_or(model, "negative_prompt", ""));
+        f.push(("negative_prompt".into(), Json::str(negative)));
+        if let Some(layers) = body.get("uncond_skip_layers").or_else(|| model.get("uncond_skip_layers")).filter(|v| !matches!(v, Json::Null)) {
+            f.push(("uncond_skip_layers".into(), layers.clone()));
         }
     } else {
         f.push(("base".into(), Json::str(path_field(root, model, "base").ok_or("Qwen Image model needs its base folder")?)));

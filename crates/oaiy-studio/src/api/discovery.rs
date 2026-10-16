@@ -225,9 +225,9 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("architecture", Json::str(arch)),
                 ("edits", Json::Bool(edits)),
                 ("max_references", Json::Int(if arch == "flux3-klein" { 10 } else if edits { 3 } else { 0 })),
-                ("size_step", Json::Int(if sdxl { 64 } else if arch == "flux2-klein-4b" || arch == "flux3-klein" { 16 } else { 32 })),
+                ("size_step", Json::Int(if sdxl { 64 } else if matches!(arch, "flux2-klein-4b" | "flux3-klein" | "moss-image") { 16 } else { 32 })),
                 ("default_size", Json::str(format!("{}x{}", int_or(&m, "width", 1024), int_or(&m, "height", 1024)))),
-                ("negative_prompt", Json::Bool(sdxl)),
+                ("negative_prompt", Json::Bool(sdxl || arch == "moss-image")),
             ]);
             with_files(entry, missing_files(&studio.root, &m, &IMAGE_FILES))
         })

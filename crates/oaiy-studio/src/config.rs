@@ -21,7 +21,7 @@ pub const TARGETS: [&str; 16] = ["chat", "completions", "models", "images", "edi
 pub const SPECS: [&str; 2] = ["openai", "oaiy"];
 pub const MEMORY: [&str; 4] = ["auto", "gpu", "ram", "ssd"];
 pub const VIDEO_FAMILIES: [&str; 2] = ["ltx-2.3", "ltx-2.5"];
-pub const IMAGE_ARCHITECTURES: [&str; 4] = ["qwen-image", "sdxl", "flux2-klein-4b", "flux3-klein"];
+pub const IMAGE_ARCHITECTURES: [&str; 5] = ["qwen-image", "sdxl", "flux2-klein-4b", "flux3-klein", "moss-image"];
 /// How media jobs share GPUs with the LLM: `auto` pauses the LLM only when the
 /// media device is one of its devices; `pause_llm` always; `coexist` never.
 pub const LLM_POLICIES: [&str; 3] = ["auto", "pause_llm", "coexist"];
@@ -599,6 +599,8 @@ pub fn validate(v: &Json) -> Result<(), String> {
             "flux2-klein-4b" => &["transformer", "text_encoder", "vae", "tokenizer"],
             // (its tokenizer the text encoder's folder's, where none is named)
             "flux3-klein" => &["transformer", "text_encoder", "vae"],
+            // (its tokenizer beside its text encoder, or a GGUF text encoder's own, where none is named)
+            "moss-image" => &["transformer", "text_encoder", "vae"],
             _ => &["base"],
         };
         for key in required {
@@ -635,6 +637,21 @@ pub fn validate(v: &Json) -> Result<(), String> {
             }
             if m.get("reference_pixels").is_some_and(|v| !v.as_i64().is_some_and(|n| (4096..=4 << 20).contains(&n))) {
                 return Err(format!("image model {name}: reference_pixels must be from 4096 to 4194304"));
+            }
+        }
+        // MOSS-Image: 50 steps, cfg 3, shift 5, its negative branch skipping block 22, unless a model sets its own
+        if arch == "moss-image" {
+            if m.get("steps").is_some_and(|v| !v.as_i64().is_some_and(|n| (1..=100).contains(&n))) {
+                return Err(format!("image model {name}: steps must be an integer from 1 to 100"));
+            }
+            if m.get("cfg").is_some_and(|v| !v.as_f64().is_some_and(|c| c.is_finite() && (1.0..=10.0).contains(&c))) {
+                return Err(format!("image model {name}: cfg must be a number from 1 to 10"));
+            }
+            if m.get("shift").is_some_and(|v| !v.as_f64().is_some_and(|c| c.is_finite() && (0.1..=20.0).contains(&c))) {
+                return Err(format!("image model {name}: shift must be a number from 0.1 to 20"));
+            }
+            if m.get("uncond_skip_layers").is_some_and(|v| !v.as_array().is_some_and(|a| a.iter().all(|i| i.as_i64().is_some_and(|i| (0..1000).contains(&i))))) {
+                return Err(format!("image model {name}: uncond_skip_layers must be a list of block numbers"));
             }
         }
         memory(m, &format!("image model {name}"))?;

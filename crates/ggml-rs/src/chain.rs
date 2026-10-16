@@ -577,6 +577,13 @@ pub trait ChainRecorder {
         let _ = (fused, out, rows, ff);
         unimplemented!("GEGLU on this device")
     }
+    /// MOSS-Image's SiTU of each of `rows` rows, its value and its gate each soft-capped:
+    /// `out = 4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` of `h = fused[..ff]` and `g = fused[ff..]` (`fused`
+    /// `[rows, 2 ff]`, `out` `[rows, ff]`): its blocks' feed-forward gate.
+    fn situ_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize, ff: usize) {
+        let _ = (fused, out, rows, ff);
+        unimplemented!("SiTU on this device")
+    }
     /// `out` (`[h / 2, w / 2, c]`) the even rows' even columns of `x` (`[h, w, c]`): a 3x3 convolution of stride 1
     /// so sampled is one of stride 2 padded by 1 all round (PyTorch's, a UNet's downsampling).
     fn subsample2x_even_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize) {

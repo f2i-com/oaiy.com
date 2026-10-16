@@ -181,6 +181,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`ChainRecorder::situ_rows`]: `p[0]` rows and `ff`. (Each tanh's argument clamped: past 15 it is 1 in f32, and
+/// some backends' tanh overflows there.)
+pub(in crate::chain) const SITU_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let ff = p[0].y;
+    if (i >= p[0].x * ff) { return; }
+    let at = (i / ff) * 2u * ff + i % ff;
+    let h = x[at];
+    let g = x[at + ff];
+    let gate = 4.0 * tanh(clamp(g * 0.25, -15.0, 15.0)) / (1.0 + exp(-g));
+    y[i] = gate * 25.0 * tanh(clamp(h * 0.04, -15.0, 15.0));
+}
+"#;
+
 /// `y[(oy, ox), c] = x[(2 oy, 2 ox), c]`: `p[0]` the input's rows, columns and channels.
 pub(in crate::chain) const SUBSAMPLE2X_EVEN_ROWS: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;

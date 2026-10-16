@@ -386,8 +386,8 @@ crates/
                  worker and its jobs)
   oaiy-studio-tray/  the same host as a Windows notification-area app
   oaiy-media/    image, video, speech, music, sound and 3D worker (Candle): one folder a
-                 family (qwen_image/, flux3/, klein/, sdxl/, ltx/, tts/, music/, sound/,
-                 model3d/, picture/ with BiRefNet and Real-ESRGAN), each with its
+                 family (qwen_image/, flux3/, klein/, moss_image/, sdxl/, ltx/, tts/, music/,
+                 sound/, model3d/, picture/ with BiRefNet and Real-ESRGAN), each with its
                  webgpu module; common/ holds what they share (weights, residency, LoRAs)
   oaiy-tts/      streaming Qwen3-TTS (Candle), shared with oaiy-media's speech
   oaiy-voice/    the resident speech server for calls: Parakeet speech-to-text and

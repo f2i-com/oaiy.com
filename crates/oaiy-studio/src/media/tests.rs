@@ -63,6 +63,37 @@ fn flux3_requests_take_ten_references_and_the_references_size() {
     assert!(config::validate(&broken).unwrap_err().contains("needs vae"));
 }
 
+/// A MOSS-Image job: the pipeline's own settings (50 steps, cfg 3, shift 5) unless the model or the request names
+/// others, its negative prompt the request's (or the model's), its tokenizer where the model names one, no references.
+#[test]
+fn moss_image_requests_take_its_settings_and_a_negative_prompt() {
+    let mut c=cfg("","");
+    let m=body(r#"{"architecture":"moss-image","transformer":"moss/transformer","text_encoder":"moss/text_encoder","vae":"moss/vae/diffusion_pytorch_model.safetensors","tokenizer":"moss/tokenizer/tokenizer.json","negative_prompt":"watermark"}"#);
+    let mut media=c.get("media").unwrap().clone();
+    let mut image=media.get("image").unwrap().clone();
+    let mut models=image.get("models").unwrap().clone();
+    crate::util::set(&mut models,"moss",m);
+    crate::util::set(&mut image,"models",models);
+    crate::util::set(&mut media,"image",image);
+    crate::util::set(&mut c,"media",media);
+    config::validate(&c).unwrap();
+    let root=Path::new("/install");
+    let (r,..)=image_request(&c,root,Path::new("/install/outputs"),&body(r#"{"model":"moss","prompt":"a fox","size":"1184x880"}"#),false).unwrap();
+    assert_eq!(r.get("architecture").and_then(Json::as_str),Some("moss-image"));
+    assert_eq!((r.get("width").and_then(Json::as_i64),r.get("height").and_then(Json::as_i64)),(Some(1184),Some(880)));
+    assert_eq!((r.get("steps").and_then(Json::as_i64),r.get("cfg").and_then(Json::as_f64),r.get("shift").and_then(Json::as_f64)),(Some(50),Some(3.),Some(5.)));
+    assert_eq!(r.get("tokenizer").and_then(Json::as_str),Some("/install/moss/tokenizer/tokenizer.json"));
+    assert_eq!(r.get("negative_prompt").and_then(Json::as_str),Some("watermark"));
+    let (r,..)=image_request(&c,root,root,&body(r#"{"model":"moss","prompt":"a fox","negative_prompt":"blur","steps":30,"cfg":5,"uncond_skip_layers":[24]}"#),false).unwrap();
+    assert_eq!((r.get("steps").and_then(Json::as_i64),r.get("cfg").and_then(Json::as_f64)),(Some(30),Some(5.)));
+    assert_eq!((r.get("negative_prompt").and_then(Json::as_str),r.get("uncond_skip_layers").map(Json::to_json).as_deref()),(Some("blur"),Some("[24]")));
+    let out=std::env::temp_dir().join(format!("oaiy-moss-refs-{}",std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    assert!(image_request(&c,root,&out,&body(r#"{"model":"moss","prompt":"the fox","images":["data:image/png;base64,iVBORw0KGgo="]}"#),false).unwrap_err().contains("from text alone"));
+    assert!(image_request(&c,root,root,&body(r#"{"model":"moss","prompt":"a fox","cfg":20}"#),false).is_err());
+    let _=std::fs::remove_dir_all(&out);
+}
+
 #[test]
 fn klein_requests_use_native_paths_fixed_distilled_recipe_and_optional_style_loras() {
     let mut c=cfg("","");

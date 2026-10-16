@@ -849,6 +849,65 @@ fn prepare_flux3(c: &Config, settings: &Json, body: &Json) -> Result<Json, Strin
     Ok(request)
 }
 
+/// A MOSS-Image job: text-to-image (from a description, tags or a JSON layout), 50 steps at cfg 3 and shift 5, its
+/// negative branch skipping block 22, unless the request or the model names others; no references.
+fn prepare_moss(c: &Config, settings: &Json, body: &Json) -> Result<Json, String> {
+    let value = |key| body.get(key).filter(|v| !matches!(v, Json::Null)).or_else(|| settings.get(key));
+    let integer = |key, default, min, max| -> Result<i64, String> {
+        let n = match value(key) { None => default, Some(v) => v.as_i64().ok_or_else(|| format!("{key} must be an integer"))? };
+        if !(min..=max).contains(&n) { return Err(format!("{key} must be between {min} and {max}")); }
+        Ok(n)
+    };
+    let real = |key, default: f64, min: f64, max: f64| -> Result<f64, String> {
+        match value(key) {
+            None => Ok(default),
+            Some(v) => v.as_f64().filter(|x| x.is_finite() && (min..=max).contains(x)).ok_or_else(|| format!("{key} must be a number from {min} to {max}")),
+        }
+    };
+    let n = integer("n", 1, 1, 1000)?;
+    let valid_prompt = |v: &Json| v.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 65536);
+    match body.get("prompts") {
+        Some(v) => {
+            let a = v.as_array().ok_or("prompts must be an array")?;
+            if (a.len() != 1 && a.len() != n as usize) || a.iter().any(|v| !valid_prompt(v)) { return Err("provide one prompt or n nonempty prompts up to 65536 bytes each".into()); }
+        }
+        None => if !body.get("prompt").is_some_and(valid_prompt) { return Err("prompt must be nonempty and at most 65536 bytes".into()); },
+    }
+    if body.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) { return Err("MOSS-Image does not use Qwen turbo".into()); }
+    if !reference_paths(body, true)?.is_empty() { return Err("MOSS-Image makes pictures from text alone: it takes no reference pictures".into()); }
+    let (width, height) = (integer("width", 1024, 256, 2048)?, integer("height", 1024, 256, 2048)?);
+    if width % 16 != 0 || height % 16 != 0 { return Err("MOSS-Image's width and height must be multiples of 16".into()); }
+    let negative = match value("negative_prompt") {
+        None => String::new(),
+        Some(v) => v.as_str().filter(|s| s.len() <= 65536).ok_or("negative_prompt must be a string of at most 65536 bytes")?.to_owned(),
+    };
+    let mut fields = vec![
+        ("architecture".into(), Json::str("moss-image")),
+        ("n".into(), Json::Int(n)),
+        ("width".into(), Json::Int(width)),
+        ("height".into(), Json::Int(height)),
+        ("steps".into(), Json::Int(integer("steps", 50, 1, 100)?)),
+        ("cfg".into(), Json::Num(real("cfg", 3., 1., 10.)?)),
+        ("shift".into(), Json::Num(real("shift", 5., 0.1, 20.)?)),
+        ("negative_prompt".into(), Json::str(negative)),
+        ("seed".into(), Json::Int(integer("seed", 0, 0, i64::MAX - n)?)),
+        ("device".into(), Json::Int(c.image_device as i64)),
+        ("output_dir".into(), Json::str(output_directory(c, body, "images")?.to_string_lossy())),
+    ];
+    if let Some(layers) = value("uncond_skip_layers") {
+        if !layers.as_array().is_some_and(|a| a.iter().all(|i| i.as_i64().is_some_and(|i| (0..1000).contains(&i)))) { return Err("uncond_skip_layers must be a list of block numbers".into()); }
+        fields.push(("uncond_skip_layers".into(), layers.clone()));
+    }
+    for key in ["transformer", "text_encoder", "vae"] { fields.push((key.into(), settings.get(key).cloned().ok_or_else(|| format!("missing MOSS-Image {key}"))?)); }
+    if let Some(t) = settings.get("tokenizer") { fields.push(("tokenizer".into(), t.clone())); }
+    if let Some(model) = &c.image_model { fields.push(("model".into(), Json::str(model))); }
+    fields.extend(image_memory(c, body)?);
+    for key in ["prompt", "prompts"] { if let Some(v) = body.get(key) { fields.push((key.into(), v.clone())); } }
+    let request = Json::Obj(fields);
+    if request.to_json().len() > 2 * 1024 * 1024 { return Err("image request exceeds 2 MiB".into()); }
+    Ok(request)
+}
+
 fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     let selected = match body.get("model") {
         None => None,
@@ -859,6 +918,9 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     if let Some(settings) = &c.klein {
         if settings.get("architecture").and_then(Json::as_str) == Some("flux3-klein") {
             return prepare_flux3(c, settings, body);
+        }
+        if settings.get("architecture").and_then(Json::as_str) == Some("moss-image") {
+            return prepare_moss(c, settings, body);
         }
         return prepare_klein(c, settings, body);
     }

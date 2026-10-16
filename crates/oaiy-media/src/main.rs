@@ -31,6 +31,7 @@ fn run() -> candle_core::Result<()> {
         println!("oaiy-media --request request.json | --stdin\nNative Rust Qwen Image 2.1, SDXL and LTX video. JSON: base, transformer, adapter (optional), prompt or prompts, output_dir, n, width, height, steps, seed, device, cfg.\nTurbo: 6 steps by default (4 supported), CFG=1. Base: 40 steps, CFG=6.\nSDXL: architecture=sdxl, checkpoint, tokenizer (CLIP tokenizer.json), prompt, negative_prompt, output_dir. Defaults: 1024x1024, 16 steps, CFG=2.5, DPM++ 2M Karras, clip_skip=1 (penultimate); no turbo or reference images.\nVideo: kind=video, model=ltx-2.3|ltx-2.5, transformer, text_encoder, tokenizer (Gemma 3), vae, prompt, output_dir, optional image (starting frame), end_image (final-frame guidance) and cache_dir (bounded prompt cache). Eight steps; memory=auto|gpu|ram|ssd, ram_gb, vram_gb.");
         println!("Klein: architecture=flux2-klein-4b, transformer (original BFL safetensors), text_encoder (Qwen3-4B), tokenizer, vae (Flux2), prompt, output_dir. Distilled: 4 steps, CFG=1. Style adapters: loras=[{{path,strength}}]. Native text-to-image; dimensions multiple of 16; no Qwen turbo, negative prompts or references. Explicit variant=base for Klein base 4B weights.");
         println!("FLUX 3: architecture=flux3-klein, transformer (BFL's model.safetensors, distilled or base), text_encoder (Qwen3-VL-4B-Instruct folder), vae (Flux2), prompt, output_dir, optional images (up to 10 references to edit or compose from), width and height (else the first reference's or 1024x1024; multiples of 16, at most 2048x2048 in area). Distilled: 16 steps, no guidance; base: 50 steps, cfg 3.5. LoRAs: loras=[{{path,strength}}] (BFL's, ComfyUI's or diffusers' names). WebGPU only; the prompt as written (no upsampler).");
+        println!("MOSS-Image: architecture=moss-image, transformer (OpenMOSS's MOSS-Image-SFT or -Base transformer: its folder, a safetensors file, or a GGUF), text_encoder (Qwen3.5-9B: Hugging Face's folder, MOSS-Image's text_encoder, or a GGUF), tokenizer (Qwen3.5's tokenizer.json; else beside the text encoder, or a GGUF's own), vae (Flux2's, or MOSS-Image's small decoder), prompt (text, tags or a JSON layout), negative_prompt, output_dir, width and height (1024x1024; multiples of 16, at most 2048x2048 in area). 50 steps, cfg 3, shift 5, uncond_skip_layers [22]. WebGPU only.");
         return Ok(());
     }
     if args.first().is_some_and(|a| a == "--serve") {
@@ -52,14 +53,21 @@ fn run() -> candle_core::Result<()> {
     }
     let j = Json::parse(&bytes).map_err(candle_core::Error::wrap)?;
     if let Some(a) = j.get("architecture") {
-        if !a.as_str().is_some_and(|s| ["qwen-image", "sdxl", "flux2-klein-4b", "flux3-klein"].contains(&s)) {
-            candle_core::bail!("unsupported architecture; use qwen-image, sdxl, flux2-klein-4b or flux3-klein");
+        if !a.as_str().is_some_and(|s| ["qwen-image", "sdxl", "flux2-klein-4b", "flux3-klein", "moss-image"].contains(&s)) {
+            candle_core::bail!("unsupported architecture; use qwen-image, sdxl, flux2-klein-4b, flux3-klein or moss-image");
         }
     }
     if j.get("architecture").and_then(Json::as_str) == Some("flux3-klein") {
         let r = oaiy_media::flux3::Request::parse(&j).map_err(candle_core::Error::Msg)?;
         configure_cache(&r.output)?;
         let result = oaiy_media::flux3::generate(&r, |event| eprintln!("{}", event.to_json()))?;
+        writeln!(std::io::stdout(), "{}", result.to_json())?;
+        return Ok(());
+    }
+    if j.get("architecture").and_then(Json::as_str) == Some("moss-image") {
+        let r = oaiy_media::moss_image::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+        configure_cache(&r.output)?;
+        let result = oaiy_media::moss_image::generate(&r, |event| eprintln!("{}", event.to_json()))?;
         writeln!(std::io::stdout(), "{}", result.to_json())?;
         return Ok(());
     }

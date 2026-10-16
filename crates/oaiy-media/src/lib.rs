@@ -10,6 +10,7 @@ pub mod common;
 // Pictures.
 pub mod flux3;
 pub mod klein;
+pub mod moss_image;
 pub mod picture;
 pub mod qwen_image;
 pub mod sdxl;

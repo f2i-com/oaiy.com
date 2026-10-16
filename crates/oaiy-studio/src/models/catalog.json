@@ -267,6 +267,34 @@
       "add": ["flux-3-image-klein/model.safetensors"]
     },
     {
+      "id": "moss-image-sft",
+      "group": "image",
+      "name": "MOSS-Image SFT",
+      "about": "OpenMOSS's 5B model: pictures from a description, tags or a JSON layout of boxes, with legible lettering in English and Chinese, in 50 steps. Its text encoder is Qwen3.5-9B.",
+      "license": "Apache-2.0",
+      "size_gb": 27.2,
+      "vram_gb": 16,
+      "parts": [
+        { "repo": "OpenMOSS-Team/MOSS-Image-SFT", "include": ["model_index.json", "LICENSE", "README.md", "transformer/**", "text_encoder/**", "vae/**", "tokenizer/**", "scheduler/**"], "into": "MOSS-Image-SFT" }
+      ],
+      "add": ["MOSS-Image-SFT"]
+    },
+    {
+      "id": "moss-image-sft-q4",
+      "group": "image",
+      "name": "MOSS-Image SFT (4-bit)",
+      "about": "MOSS-Image SFT with its transformer and its Qwen3.5-9B text encoder as 4-bit GGUFs: the same pictures, a little less exact, on a GPU with 8 GB or more.",
+      "license": "Apache-2.0",
+      "size_gb": 9.7,
+      "vram_gb": 8,
+      "parts": [
+        { "repo": "realrebelai/MOSS-Image_GGUFs", "include": ["MOSS-Image-SFT-Q4_K_M.gguf"], "into": "MOSS-Image-GGUF" },
+        { "repo": "OpenMOSS-Team/MOSS-Image-SFT", "include": ["LICENSE", "README.md", "vae/**", "tokenizer/**"], "into": "MOSS-Image-SFT-parts" },
+        { "repo": "unsloth/Qwen3.5-9B-GGUF", "include": ["Qwen3.5-9B-Q4_K_M.gguf"], "into": "Qwen3.5-9B-GGUF" }
+      ],
+      "add": ["MOSS-Image-GGUF/MOSS-Image-SFT-Q4_K_M.gguf", "MOSS-Image-SFT-parts/vae/diffusion_pytorch_model.safetensors", "MOSS-Image-SFT-parts/tokenizer/tokenizer.json", "Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"]
+    },
+    {
       "id": "sdxl-base",
       "group": "image",
       "name": "Stable Diffusion XL 1.0",

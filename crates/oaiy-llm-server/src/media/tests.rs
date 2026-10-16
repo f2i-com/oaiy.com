@@ -457,3 +457,31 @@ fn configured_safetensors_override_is_optional_and_validated() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// A MOSS-Image model: its paths the catalog's (its transformer and text encoder folders or files), the pipeline's own
+/// settings unless the model or the request names others, a negative prompt taken, no references.
+#[test]
+fn moss_image_catalog_dispatch_takes_its_settings() {
+    let mut cfg=config();
+    let root=std::env::temp_dir().join(format!("oaiy-moss-catalog-{}",std::process::id()));
+    std::fs::create_dir_all(root.join("transformer")).unwrap();
+    std::fs::create_dir_all(root.join("text_encoder")).unwrap();
+    for file in ["vae.safetensors","tokenizer.json","ref.png","q4.gguf"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
+    std::fs::write(root.join("image.json"),br#"{"default_model":"moss","models":{"moss":{"architecture":"moss-image","transformer":"transformer","text_encoder":"text_encoder","vae":"vae.safetensors","tokenizer":"tokenizer.json"},"q4":{"architecture":"moss-image","transformer":"q4.gguf","text_encoder":"q4.gguf","vae":"vae.safetensors","steps":30,"cfg":5,"uncond_skip_layers":[24]}}}"#).unwrap();
+    cfg.media_dir=Some(root.clone());
+    cfg.output_root=root.join("output");
+    let request=prepare(&cfg,&Json::parse(br#"{"prompt":"a fox","negative_prompt":"blur","transformer":"untrusted"}"#).unwrap()).unwrap();
+    assert_eq!(request.get("architecture").and_then(Json::as_str),Some("moss-image"));
+    assert_eq!(request.get("transformer").and_then(Json::as_str),root.join("transformer").to_str());
+    assert_eq!(request.get("tokenizer").and_then(Json::as_str),root.join("tokenizer.json").to_str());
+    assert_eq!((request.get("steps").and_then(Json::as_i64),request.get("cfg").and_then(Json::as_f64),request.get("shift").and_then(Json::as_f64)),(Some(50),Some(3.),Some(5.)));
+    assert_eq!(request.get("negative_prompt").and_then(Json::as_str),Some("blur"));
+    assert!(request.get("uncond_skip_layers").is_none());
+    let own=prepare(&cfg,&Json::parse(br#"{"model":"q4","prompt":"a fox","width":768,"height":1360}"#).unwrap()).unwrap();
+    assert_eq!((own.get("steps").and_then(Json::as_i64),own.get("cfg").and_then(Json::as_f64),own.get("width").and_then(Json::as_i64)),(Some(30),Some(5.),Some(768)));
+    assert_eq!(own.get("uncond_skip_layers").map(Json::to_json).as_deref(),Some("[24]"));
+    let reference=Json::str(root.join("ref.png").to_string_lossy());
+    assert!(prepare(&cfg,&Json::obj([("prompt",Json::str("a fox")),("images",Json::Arr(vec![reference]))])).is_err());
+    assert!(prepare(&cfg,&Json::parse(br#"{"prompt":"a fox","width":1000}"#).unwrap()).is_err());
+    let _=std::fs::remove_dir_all(&root);
+}

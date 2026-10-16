@@ -144,6 +144,9 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
         ("image", "tokenizer") if arch == "flux2-klein-4b" => &|d| d.kind() == "klein_tokenizer",
         ("image", "text_encoder") if arch == "flux2-klein-4b" => &|d| d.kind() == "klein_text_encoder",
         ("image", "vae") if arch == "flux2-klein-4b" || arch == "flux3-klein" => &|d| d.kind() == "flux2_vae",
+        ("image", "vae") if arch == "moss-image" => &|d| matches!(d.kind(), "moss_vae" | "flux2_vae"),
+        ("image", "text_encoder") if arch == "moss-image" => &|d| d.kind() == "moss_text_encoder",
+        ("image", "tokenizer") if arch == "moss-image" => &|d| d.kind() == "moss_tokenizer",
         ("image", "text_encoder") if arch == "flux3-klein" => &|d| d.kind() == "flux3_text_encoder",
         ("image", "tokenizer") => &|d| d.kind() == "clip_tokenizer",
         ("video", "tokenizer") => &|d| d.kind() == "tokenizer",
@@ -396,7 +399,10 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
         }
         "klein_text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "") == "flux2-klein-4b")),
         "klein_tokenizer" => ("image", "tokenizer", Box::new(|m| str_or(m, "architecture", "") == "flux2-klein-4b")),
-        "flux2_vae" => ("image", "vae", Box::new(|m| matches!(str_or(m, "architecture", ""), "flux2-klein-4b" | "flux3-klein"))),
+        "flux2_vae" => ("image", "vae", Box::new(|m| matches!(str_or(m, "architecture", ""), "flux2-klein-4b" | "flux3-klein" | "moss-image"))),
+        "moss_vae" => ("image", "vae", Box::new(|m| str_or(m, "architecture", "") == "moss-image")),
+        "moss_text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "") == "moss-image")),
+        "moss_tokenizer" => ("image", "tokenizer", Box::new(|m| str_or(m, "architecture", "") == "moss-image")),
         "flux3_text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "") == "flux3-klein")),
         "image_base" => ("image", "base", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
         "text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
@@ -475,6 +481,13 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
     Ok(Added { section: if section == "image" { "image" } else { "video" }, name: name.clone(), missing, enabled })
 }
 
+/// Whether MOSS-Image's text encoder at `te` brings its own tokenizer: a GGUF's, or a tokenizer.json beside its weights
+/// (as the worker finds it).
+fn moss_tokenizer_beside(te: &Path) -> bool {
+    te.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        || (if te.is_dir() { te.join("tokenizer.json") } else { te.with_file_name("tokenizer.json") }).is_file()
+}
+
 /// Required fields an entry still lacks (mirrors `config::validate`).
 pub fn missing_fields(section: &str, m: &Json) -> Vec<String> {
     let empty = |k: &str| str_or(m, k, "").trim().is_empty();
@@ -486,6 +499,11 @@ pub fn missing_fields(section: &str, m: &Json) -> Vec<String> {
             out.extend(["transformer", "text_encoder", "vae", "tokenizer"].into_iter().filter(|k| empty(k)).map(String::from));
         } else if str_or(m, "architecture", "qwen-image") == "flux3-klein" {
             out.extend(["transformer", "text_encoder", "vae"].into_iter().filter(|k| empty(k)).map(String::from));
+        } else if str_or(m, "architecture", "qwen-image") == "moss-image" {
+            out.extend(["transformer", "text_encoder", "vae"].into_iter().filter(|k| empty(k)).map(String::from));
+            if empty("tokenizer") && !empty("text_encoder") && !moss_tokenizer_beside(Path::new(str_or(m, "text_encoder", ""))) {
+                out.push("tokenizer".into());
+            }
         } else {
             if empty("base") {
                 out.push("base".into());
@@ -544,6 +562,8 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
     // (a Qwen3-VL GGUF added to a Qwen Image model is its text encoder, whatever the file is called)
     let to_image = target.is_some_and(|(s, m)| s == "image" && get(cfg, &["media", "image", "models", m]).is_some_and(|e| str_or(e, "architecture", "qwen-image") == "qwen-image"));
     let d = if to_image { detect::as_qwen_image_encoder(&d, path).unwrap_or(d) } else { d };
+    let to_moss = target.is_some_and(|(s, m)| s == "image" && get(cfg, &["media", "image", "models", m]).is_some_and(|e| str_or(e, "architecture", "") == "moss-image"));
+    let d = if to_moss { detect::as_moss_encoder(&d, path).unwrap_or(d) } else { d };
     let wanted = name.map(str::to_string).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| detect::model_name(path));
     let added = match &d.role {
         Role::Component { .. } => attach(cfg, &d, target, path)?,
@@ -577,6 +597,13 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
                 // Optional: the soundtrack's decoder, from another LTX model or nearby.
                 if let Some(a) = companion(cfg, "video", &entry, "audio_vae", path) {
                     set(&mut entry, "audio_vae", a);
+                }
+            }
+            if section == "image" && str_or(&entry, "architecture", "") == "moss-image" && str_or(&entry, "tokenizer", "").is_empty()
+                && !moss_tokenizer_beside(Path::new(str_or(&entry, "text_encoder", "")))
+            {
+                if let Some(t) = companion(cfg, "image", &entry, "tokenizer", path) {
+                    set(&mut entry, "tokenizer", t);
                 }
             }
             if section == "image" && str_or(&entry, "architecture", "") == "qwen-image" && str_or(&entry, "adapter", "").is_empty() && !bool_or(&entry, "distilled", false) {
@@ -796,6 +823,95 @@ mod tests {
         b.extend((arch.len() as u64).to_le_bytes());
         b.extend(arch.as_bytes());
         std::fs::write(path, b).unwrap();
+    }
+
+    /// A GGUF with `general.architecture` `arch` and the integer key/values `ints` (`{arch}.` before each key).
+    fn gguf_with(path: &Path, arch: &str, ints: &[(&str, u32)]) {
+        let mut b = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend((1 + ints.len() as u64).to_le_bytes());
+        let string = |b: &mut Vec<u8>, s: &str| {
+            b.extend((s.len() as u64).to_le_bytes());
+            b.extend(s.as_bytes());
+        };
+        string(&mut b, "general.architecture");
+        b.extend(8u32.to_le_bytes());
+        string(&mut b, arch);
+        for (k, v) in ints {
+            string(&mut b, &format!("{arch}.{k}"));
+            b.extend(4u32.to_le_bytes());
+            b.extend(v.to_le_bytes());
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// MOSS-Image: OpenMOSS's release folder picked is a whole image model (its transformer, VAE, tokenizer and text
+    /// encoder folders); its 4-bit set as the catalog adds it (a GGUF of its transformer, then its VAE, its tokenizer and
+    /// a Qwen3.5-9B GGUF, each to that model) is one too, the Qwen3.5 GGUF its text encoder where alone it would be a
+    /// chat model; Qwen's own 9B snapshot (shards, no tokenizer) its text encoder folder, the tokenizer then sought.
+    #[test]
+    fn moss_images_release_and_its_quantized_parts_are_one_model() {
+        let d = tmp("moss-image");
+        let tensor = |name: &str, shape: &str| format!(r#""{name}":{{"dtype":"BF16","shape":{shape},"data_offsets":[0,0]}}"#);
+        let release = d.join("MOSS-Image-SFT");
+        for sub in ["transformer", "vae", "tokenizer", "text_encoder"] {
+            std::fs::create_dir_all(release.join(sub)).unwrap();
+        }
+        std::fs::write(release.join("model_index.json"), r#"{"_class_name":"MOSSImagePipeline"}"#).unwrap();
+        std::fs::write(release.join("transformer/config.json"), r#"{"_class_name":"MOSSImageTransformer"}"#).unwrap();
+        let transformer = [tensor("video_embedder.weight", "[3072,128]"), tensor("text_embedder.proj.weight", "[3072,4096]"), tensor("shared_block_modulation.weight", "[18432,3072]")].join(",");
+        safetensors(&release.join("transformer/diffusion_pytorch_model-00001-of-00003.safetensors"), &format!("{{{transformer}}}"));
+        safetensors(&release.join("vae/diffusion_pytorch_model.safetensors"), &format!("{{{},{}}}", tensor("bn.running_mean", "[128]"), tensor("decoder.conv_in.weight", "[384,32,3,3]")));
+        std::fs::write(release.join("tokenizer/tokenizer.json"), r#"{"added_tokens":["<|im_start|>","<|audio_start|>"]}"#).unwrap();
+        std::fs::write(release.join("text_encoder/config.json"), r#"{"model_type":"qwen3_5","text_config":{"hidden_size":4096}}"#).unwrap();
+        safetensors(&release.join("text_encoder/model-00001-of-00004.safetensors"), &format!("{{{}}}", tensor("language_model.embed_tokens.weight", "[248320,4096]")));
+        let mut cfg = config::default_json();
+        let (a, found) = add(&mut cfg, &release, None, None).unwrap();
+        assert!(matches!(found.role, detect::Role::Image { architecture: "moss-image" }), "{}", found.summary);
+        assert_eq!((a.section, a.enabled), ("image", true), "{:?}", a.missing);
+        let m = get(&cfg, &["media", "image", "models", &a.name]).unwrap();
+        for (key, want) in [("transformer", release.join("transformer")), ("text_encoder", release.join("text_encoder")), ("vae", release.join("vae/diffusion_pytorch_model.safetensors")), ("tokenizer", release.join("tokenizer/tokenizer.json"))] {
+            assert_eq!(Path::new(str_or(m, key, "")), want.as_path(), "{key}");
+        }
+        config::validate(&cfg).unwrap();
+        // the 4-bit set, as the catalog adds it
+        let parts = d.join("parts");
+        std::fs::create_dir_all(&parts).unwrap();
+        gguf(&parts.join("MOSS-Image-SFT-Q4_K_M.gguf"), "moss_image");
+        gguf_with(&parts.join("Qwen3.5-9B-Q4_K_M.gguf"), "qwen35", &[("embedding_length", 4096), ("block_count", 32)]);
+        let mut cfg = config::default_json();
+        let mut first: Option<(&str, String)> = None;
+        for part in [parts.join("MOSS-Image-SFT-Q4_K_M.gguf"), release.join("vae/diffusion_pytorch_model.safetensors"), release.join("tokenizer/tokenizer.json"), parts.join("Qwen3.5-9B-Q4_K_M.gguf")] {
+            let (a, _) = add(&mut cfg, &part, None, first.as_ref().map(|(s, n)| (*s, n.as_str()))).unwrap();
+            first.get_or_insert((a.section, a.name.clone()));
+        }
+        let (_, name) = first.unwrap();
+        let m = get(&cfg, &["media", "image", "models", &name]).unwrap();
+        assert_eq!((str_or(m, "architecture", ""), bool_or(m, "enabled", false)), ("moss-image", true));
+        assert_eq!(Path::new(str_or(m, "text_encoder", "")), parts.join("Qwen3.5-9B-Q4_K_M.gguf").as_path());
+        assert!(get(&cfg, &["llm", "models"]).and_then(Json::as_array).is_some_and(|l| l.is_empty()), "the Qwen3.5 GGUF is no chat model here");
+        config::validate(&cfg).unwrap();
+        // (the same GGUF alone: a chat model)
+        let mut alone = config::default_json();
+        assert_eq!(add(&mut alone, &parts.join("Qwen3.5-9B-Q4_K_M.gguf"), None, None).unwrap().0.section, "llm");
+        // Qwen's own snapshot of the 9B: shards with no config or tokenizer of their own
+        let snapshot = d.join("Qwen3.5-9B");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        safetensors(&snapshot.join("model.safetensors-00001-of-00004.safetensors"), &format!("{{{}}}", tensor("model.language_model.embed_tokens.weight", "[248320,4096]")));
+        let found = detect::detect(&snapshot).unwrap();
+        assert_eq!(found.kind(), "moss_text_encoder");
+        assert_eq!(found.fields.iter().find(|(k, _)| k == "text_encoder").and_then(|(_, v)| v.as_str()).map(PathBuf::from), Some(snapshot.clone()));
+        // (beside a GGUF of the transformer, it is found as its text encoder; its tokenizer is not beside it, and
+        // MOSS-Image's then picked is)
+        let mut cfg = config::default_json();
+        let (a, _) = add(&mut cfg, &parts.join("MOSS-Image-SFT-Q4_K_M.gguf"), None, None).unwrap();
+        assert_eq!(a.missing, ["vae", "tokenizer"]);
+        let m = get(&cfg, &["media", "image", "models", &a.name]).unwrap();
+        assert_eq!(Path::new(str_or(m, "text_encoder", "")), snapshot.as_path());
+        let (b, _) = add(&mut cfg, &release.join("tokenizer/tokenizer.json"), None, Some(("image", &a.name))).unwrap();
+        assert_eq!(b.missing, ["vae"]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// BFL's FLUX 3 Image Klein release: its model.safetensors picked (or its folder) is a whole image model, its text

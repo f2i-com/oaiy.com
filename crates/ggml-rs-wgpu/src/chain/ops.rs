@@ -741,6 +741,13 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-geglu-rows", GEGLU_ROWS, [buffer(fused), &d, &d, &d, &d, &d, buffer(out), &drw], &[rows as u32, ff as u32], grid(((rows * ff) as u32).div_ceil(256)));
     }
 
+    fn situ_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize, ff: usize) {
+        assert!(fused.len >= rows * 2 * ff && out.len >= rows * ff, "chain: SiTU of {rows} rows of {ff}");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        self.dispatch_wide("chain-situ-rows", SITU_ROWS, [buffer(fused), &d, &d, &d, &d, &d, buffer(out), &drw], &[rows as u32, ff as u32], grid(((rows * ff) as u32).div_ceil(256)));
+    }
+
     fn subsample2x_even_rows(&mut self, x: &DeviceVec, out: &DeviceVec, h: usize, w: usize, c: usize) {
         assert!(h % 2 == 0 && w % 2 == 0 && x.len >= h * w * c && out.len >= h * w * c / 4, "chain: subsampling {h}x{w} pixels of {c}");
         let dm = self.gpu().dummy().clone();
