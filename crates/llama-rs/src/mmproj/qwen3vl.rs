@@ -56,9 +56,10 @@ pub struct Qwen3VlMmProj {
 }
 
 /// VENDORED-LOCAL: [`Qwen3VlMmProj::chain`]: the tower's weights on the device once a picture has asked for them
-/// (None inside where they cannot go there).
+/// (None inside where they cannot go there), and whether the host's copy of its matrices was let go
+/// ([`Qwen3VlMmProj::keep_on_device`]).
 #[derive(Default)]
-pub struct TowerChain(std::sync::OnceLock<Option<crate::chain_mmproj::Tower>>);
+pub struct TowerChain(std::sync::OnceLock<Option<crate::chain_mmproj::Tower>>, std::sync::atomic::AtomicBool);
 
 impl TowerChain {
     pub(crate) fn get_or_init(&self, make: impl FnOnce() -> Option<crate::chain_mmproj::Tower>) -> &Option<crate::chain_mmproj::Tower> {
@@ -165,6 +166,26 @@ impl Qwen3VlMmProj {
         })
     }
 
+    /// VENDORED-LOCAL: its tower made on the backend's device now (else at the first picture) and the host's f32 copy
+    /// of the matrices there let go: the device's f16 copy is what runs, and the host's was the same weights a second
+    /// time (1.8 GB of a 24 GB Mac's memory, beside the card's copy, or beside its own GPU's in the same memory). The
+    /// bytes let go; 0 where the device holds no tower (it runs op by op, on the host's weights). A picture the
+    /// device's tower then does not take is refused, never run on weights let go.
+    pub fn keep_on_device(&mut self) -> usize {
+        if !crate::chain_mmproj::prepare(self) {
+            return 0;
+        }
+        let mut bytes = 0;
+        for b in &mut self.blocks {
+            for w in [&mut b.attn_qkv, &mut b.attn_out, &mut b.ffn_up, &mut b.ffn_down] {
+                bytes += let_go(w);
+            }
+        }
+        bytes += let_go(&mut self.projector.mm0) + let_go(&mut self.projector.mm2);
+        self.chain.1.store(true, std::sync::atomic::Ordering::Relaxed);
+        bytes
+    }
+
     /// Image → soft tokens. Same contract as the other mmproj variants.
     pub fn forward(&self, image: &Tensor) -> Result<Tensor> {
         let cfg = &self.config;
@@ -184,6 +205,9 @@ impl Qwen3VlMmProj {
         // otherwise multiplied on the host by a backend that keeps dense weights there: 20 s a picture).
         if let Some(out) = crate::chain_mmproj::forward(self, &patches) {
             return Ok(out);
+        }
+        if self.chain.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(LlamaError::Config("the vision tower is on the GPU alone, which could not take this picture".into()));
         }
         let patches = backend.to_device(patches);
         let in_dim = 3 * cfg.patch_size * cfg.patch_size;

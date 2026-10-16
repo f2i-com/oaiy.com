@@ -509,7 +509,8 @@ fn the_minicpmv_tower_on_webgpu_is_transformers() {
     let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
     let want = minicpmv_reference(&reference);
     let file = gguf::GgufFile::open(&mmproj).unwrap();
-    let mm = llama_rs::MmProj::from_gguf(&file, Arc::new(gpu)).unwrap();
+    let mut mm = llama_rs::MmProj::from_gguf(&file, Arc::new(gpu)).unwrap();
+    let mut before = Vec::new();
     for k in 0.. {
         let Some((shape, pixels)) = want.get(&format!("tile.{k}")) else { break };
         let clock = std::time::Instant::now();
@@ -523,5 +524,39 @@ fn the_minicpmv_tower_on_webgpu_is_transformers() {
         let worst = got.data().iter().zip(theirs).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         eprintln!("tile {k} {shape:?}: cosine {cosine:.6}, the largest difference {worst:.4}, in {took:.2} s");
         assert!(cosine > 0.999, "tile {k}: {cosine}");
+        before.push(got);
     }
+    // the host's copy of its matrices let go: the device's tower gives every tile's tokens as it did
+    let freed = mm.keep_on_device();
+    eprintln!("the host's copy let go: {:.2} GB", freed as f64 / 1e9);
+    assert!(freed > 1_000_000_000, "{freed} bytes let go");
+    for (k, was) in before.iter().enumerate() {
+        let (shape, pixels) = &want[&format!("tile.{k}")];
+        let got = mm.forward(&Tensor::from_vec(pixels.clone(), shape.clone())).unwrap().to_host();
+        assert_eq!(got.data(), was.data(), "tile {k} after the host's copy went");
+    }
+}
+
+/// A Qwen3-VL tower (Qwen3.8 27B's projector: OAIY_QWEN3VL_MMPROJ) on the GPU gives a picture's tokens as it did once
+/// the host's copy of its matrices is let go (`MmProj::keep_on_device`: the GPU's f16 copy the one that runs), and that
+/// copy is the most of its weights.
+#[test]
+#[ignore = "needs a WebGPU adapter and a Qwen3-VL mmproj (OAIY_QWEN3VL_MMPROJ)"]
+fn a_qwen3vl_tower_gives_its_tokens_with_the_hosts_copy_let_go() {
+    let Ok(mmproj) = std::env::var("OAIY_QWEN3VL_MMPROJ") else { return };
+    let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+    let file = gguf::GgufFile::open(&mmproj).unwrap();
+    let mut mm = llama_rs::MmProj::from_gguf(&file, Arc::new(gpu)).unwrap();
+    let llama_rs::MmProj::Qwen3Vl(q) = &mm else { panic!("a Qwen3-VL projector") };
+    let side = q.config.image_size;
+    let picture: Vec<f32> = (0..3 * side * side).map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0).collect();
+    let image = Tensor::from_vec(picture, vec![3, side, side]);
+    let clock = std::time::Instant::now();
+    let before = mm.forward(&image).unwrap().to_host();
+    let took = clock.elapsed().as_secs_f64();
+    let freed = mm.keep_on_device();
+    let after = mm.forward(&image).unwrap().to_host();
+    eprintln!("{:?} tokens in {took:.2} s; the host's copy let go: {:.2} GB", before.shape(), freed as f64 / 1e9);
+    assert!(freed > 1_000_000_000, "{freed} bytes let go");
+    assert_eq!(after.data(), before.data());
 }

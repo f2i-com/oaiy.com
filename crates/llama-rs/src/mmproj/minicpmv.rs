@@ -505,6 +505,31 @@ impl MiniCpmVMmProj {
         self.merger_down.shape()[0]
     }
 
+    /// VENDORED-LOCAL: its tower made on the backend's device now (else at the first tile) and the host's f32 copy of
+    /// the matrices there let go (the device's f16 copy is what runs; the host's was the same weights a second time,
+    /// 1.7 GB of MiniCPM-V 4.7's). The bytes let go; 0 where the device holds no tower. The position table, the norms
+    /// and the biases stay: the device's tower reads the table as it runs. A tile the device's tower then does not take
+    /// is refused, never run on weights let go.
+    pub fn keep_on_device(&mut self) -> usize {
+        if !crate::chain_minicpmv::prepare(self) {
+            return 0;
+        }
+        let mut bytes = 0;
+        for b in &mut self.blocks {
+            for w in [&mut b.attn_q, &mut b.attn_k, &mut b.attn_v, &mut b.attn_out, &mut b.ffn_up, &mut b.ffn_down] {
+                bytes += let_go(w);
+            }
+        }
+        if let Some(w) = &mut self.window {
+            for w in [&mut w.q, &mut w.k, &mut w.v, &mut w.o, &mut w.up, &mut w.down] {
+                bytes += let_go(w);
+            }
+        }
+        bytes += let_go(&mut self.merger_up) + let_go(&mut self.merger_down);
+        self.chain.1.store(true, std::sync::atomic::Ordering::Relaxed);
+        bytes
+    }
+
     /// A picture's tiles, as [`tiles`] cuts it for this file's tower.
     pub fn tiles(&self, picture: &image::RgbImage) -> Tiles {
         tiles(picture, self.max_slices, self.config.mean, self.config.std)
@@ -522,6 +547,9 @@ impl MiniCpmVMmProj {
         // chained on the backend's GPU where it has one
         if let Some(out) = crate::chain_minicpmv::forward(self, &self.chain, tile) {
             return Ok(out);
+        }
+        if self.chain.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(LlamaError::Config("MiniCPM-V's vision tower is on the GPU alone, which could not take this tile".into()));
         }
         let (mut gh, mut gw) = (shape[1] / p, shape[2] / p);
         let b = &*self.backend;

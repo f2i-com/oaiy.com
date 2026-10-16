@@ -153,6 +153,16 @@ impl Tower {
     }
 }
 
+/// VENDORED-LOCAL: `mm`'s tower made on its backend's device now (where a first picture would make it): whether it is
+/// there.
+pub(crate) fn prepare(mm: &Qwen3VlMmProj) -> bool {
+    if std::env::var_os("OAIY_NO_CHAIN").is_some() {
+        return false;
+    }
+    let Some(chain) = mm.backend.chain() else { return false };
+    mm.chain.get_or_init(|| Tower::of(mm, chain)).is_some()
+}
+
 /// `patches` (`[n, 3 p p]`, in the raster's order, as `unfold_patches_to_host` gives them) through the tower on the
 /// backend's device: the soft tokens `[n / 4, width]`, on the host. None where the backend has no chain or the
 /// tower's weights cannot go on its device.

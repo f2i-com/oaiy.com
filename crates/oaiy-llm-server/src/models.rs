@@ -331,6 +331,15 @@ pub(crate) fn auto_context(base: usize, model_max: usize, most: usize, fits: imp
     (base, n < most.min(model_max))
 }
 
+/// VENDORED-LOCAL: a vision tower made on its GPU now and the host's copy of its matrices let go (`MmProj::
+/// keep_on_device`: one copy of the tower, the GPU's, not the GPU's and the host's): what the load's line says of it.
+pub(crate) fn on_device_only(mm: &mut llama_rs::MmProj) -> String {
+    match mm.keep_on_device() {
+        0 => String::new(),
+        bytes => format!(" (its tower on the GPU alone: {:.1} GB of the host's copy let go)", bytes as f64 / 1e9),
+    }
+}
+
 pub(crate) fn placement(name: &str, on_gpu: u64, streamed: u64, filed: u64, left: u64, free: Option<u64>) -> String {
     let gb = |bytes: u64| bytes as f64 / 1e9;
     if left == 0 && streamed == 0 && filed == 0 {
@@ -661,6 +670,8 @@ impl Models {
             spec.name,
             t.elapsed().as_secs_f64()
         ));
+        // (what the load used and freed, given back: macOS's allocator kept some 0.6 GB of it)
+        ggml_rs::give_back_freed_memory();
 
         let active = Active {
             jobs: next.jobs.clone(),
@@ -854,7 +865,7 @@ impl Models {
         let projector = match (vision_path, tower_backend) {
             (Some(path), Some(backend)) if path.is_file() => {
                 let file = gguf::GgufFile::open(path).map_err(|e| Error::Arg(format!("{}: {e}", path.display())))?;
-                let mm = llama_rs::MmProj::from_gguf(&file, backend).map_err(|e| Error::Arg(format!("{}: {e}", path.display())))?;
+                let mut mm = llama_rs::MmProj::from_gguf(&file, backend).map_err(|e| Error::Arg(format!("{}: {e}", path.display())))?;
                 let width = match &mm {
                     llama_rs::MmProj::Qwen3Vl(q) => Some(q.projector.mm2.shape()[0]),
                     _ => None,
@@ -869,7 +880,7 @@ impl Models {
                     )));
                 }
                 cfg.qwen_vision = Some(mm.config().clone());
-                self.say(format!("{}: vision projector loaded from {} (576 tokens an image)", spec.name, path.display()));
+                self.say(format!("{}: vision projector loaded from {} (576 tokens an image){}", spec.name, path.display(), on_device_only(&mut mm)));
                 Some(mm)
             }
             (Some(path), Some(backend)) => {
@@ -1244,14 +1255,14 @@ impl Models {
             let projector = if o.vision {
                 o.vision_projectors.get(&spec.name).map(|p| {
                     let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(e.to_string()))?;
-                    let mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+                    let mut mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
                     let width = model.config().embedding_dim;
                     // (Qwen3-VL's tower, or MiniCPM-V 4.7's: a Qwen3.5 model of its own)
                     if !matches!(&mm, llama_rs::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == width)
                         && !matches!(&mm, llama_rs::MmProj::MiniCpmV(m) if m.lm_width() == width) {
                         return Err(Error::Arg("Qwen vision projector does not match the text model".into()));
                     }
-                    self.say(format!("{}: vision projector loaded from {}", spec.name, p.display()));
+                    self.say(format!("{}: vision projector loaded from {}{}", spec.name, p.display(), on_device_only(&mut mm)));
                     Ok(mm)
                 }).transpose()?
             } else { None };

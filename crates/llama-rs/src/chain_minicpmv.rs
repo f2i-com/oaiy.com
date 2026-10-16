@@ -50,9 +50,19 @@ pub(crate) struct Tower {
     down: Lin,
 }
 
-/// [`MiniCpmVMmProj`]'s tower on its device once a tile has asked for it (None inside where it cannot go there).
+/// [`MiniCpmVMmProj`]'s tower on its device once a tile has asked for it (None inside where it cannot go there), and
+/// whether the host's copy of its matrices was let go ([`MiniCpmVMmProj::keep_on_device`]).
 #[derive(Default)]
-pub struct TowerCell(std::sync::OnceLock<Option<Tower>>);
+pub struct TowerCell(std::sync::OnceLock<Option<Tower>>, pub(crate) std::sync::atomic::AtomicBool);
+
+/// VENDORED-LOCAL: `mm`'s tower made on its backend's device now (where a first tile would make it): whether it is there.
+pub(crate) fn prepare(mm: &MiniCpmVMmProj) -> bool {
+    if std::env::var_os("OAIY_NO_CHAIN").is_some() {
+        return false;
+    }
+    let Some(chain) = mm.backend.chain() else { return false };
+    mm.chain.0.get_or_init(|| Tower::of(mm, chain)).is_some()
+}
 
 impl std::fmt::Debug for TowerCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

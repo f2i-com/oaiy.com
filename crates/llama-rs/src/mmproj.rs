@@ -26,6 +26,19 @@ use crate::{LlamaError, Result};
 
 mod gemma4v;
 pub mod minicpmv;
+
+/// VENDORED-LOCAL: `w` let go where it is a dense matrix on the host (a tower's whose device holds its own copy): its
+/// rows kept as its shape's first (what reads its width still reads it), none of its values. The bytes let go.
+pub(crate) fn let_go(w: &mut Weight) -> usize {
+    match w {
+        Weight::Dense(t) if t.numel() > 0 && !t.is_device() => {
+            let bytes = t.numel() * std::mem::size_of::<f32>();
+            *t = Tensor::from_vec(Vec::new(), vec![t.shape()[0], 0]);
+            bytes
+        }
+        _ => 0,
+    }
+}
 mod qwen3vl;
 mod siglip;
 
@@ -245,6 +258,17 @@ pub enum MmProj {
 }
 
 impl MmProj {
+    /// VENDORED-LOCAL: a tower that runs on its backend's device made there now, and the host's copy of its matrices
+    /// let go ([`Qwen3VlMmProj::keep_on_device`], [`MiniCpmVMmProj::keep_on_device`]): the bytes let go, 0 where
+    /// nothing was (another kind of tower, or no device to hold it).
+    pub fn keep_on_device(&mut self) -> usize {
+        match self {
+            MmProj::Qwen3Vl(m) => m.keep_on_device(),
+            MmProj::MiniCpmV(m) => m.keep_on_device(),
+            _ => 0,
+        }
+    }
+
     /// Open an mmproj.gguf and load it via the right loader for its
     /// projector type. Either flavour validates tensor shapes against the
     /// parsed config — a mismatch surfaces as `BadTensorShape` rather than a
