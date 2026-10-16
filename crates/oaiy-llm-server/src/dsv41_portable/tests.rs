@@ -388,7 +388,7 @@ fn the_trunk_and_the_experts_on_the_gpu_answer_as_the_cpu_model_does() {
     assert_eq!(cpu_tokens, gpu_tokens);
 }
 
-/// The CPU model's measurement (dsv41/tests/cpu_speed.rs) with the trunk on the GPU.
+/// The CPU model's measurement (tests/dsv41_cpu_speed.rs) with the trunk on the GPU.
 #[test]
 #[ignore = "loads the 510 GB checkpoint and prefills a 2,000-token prompt; needs a WebGPU adapter"]
 fn measure_prefill_and_warm_decode_with_the_trunk_on_the_gpu() {

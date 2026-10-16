@@ -1,7 +1,7 @@
 //! GLM-5.3-Flash. Routed experts on the CPU, from the RAM tier.
 //!
 //! The third tier of the expert hierarchy in `docs/GLM5NEXT_PERF.md`, and the one
-//! that finally pays. From `dsv41/src/cpu_experts.rs`, whose argument is the whole
+//! that finally pays. From `crate::dsv41::cpu_experts` (src/dsv41/cpu_experts.rs), whose argument is the whole
 //! reason this exists:
 //!
 //! > Moving that record to a GPU costs a PCIe copy (2.6 ms on the dev machine's x2

@@ -196,7 +196,7 @@ bytes. On this machine, 161 GB — 9,845 of 12,096 records, **81%**.
 
 ### 2.3 Tier 2 — CPU execution, AVX-512
 
-From `dsv41/src/cpu_experts.rs`:
+From `crates/oaiy-llm-server/src/dsv41/cpu_experts.rs`:
 
 > Moving that record to a GPU costs a PCIe copy (2.6 ms on the dev machine's x2
 > link, 1.3 ms on its x4); computing it here costs ~0.9-1.1 ms on 24-32 threads.
