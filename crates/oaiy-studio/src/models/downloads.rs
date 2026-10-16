@@ -12,7 +12,7 @@
 //! A finished part leaves `.oaiy-<id>.json` in its folder, which is how the
 //! catalog knows the model is there.
 use crate::util::str_or;
-use crate::{config, registry, Studio};
+use crate::{config, models::registry, Studio};
 use oaiy_engine::json::Json;
 use std::collections::HashMap;
 use std::io::Read;
@@ -847,7 +847,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oaiy-dl-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut cfg = crate::config::default_json();
-        crate::util::set(crate::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "dir", Json::str(dir.to_string_lossy()));
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "dir", Json::str(dir.to_string_lossy()));
         let studio = crate::Studio::for_test(&dir, cfg);
         let of = |id: &str| -> (bool, bool) {
             let state = studio.downloads.state(&studio);

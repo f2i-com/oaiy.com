@@ -516,7 +516,7 @@ pub fn validate(v: &Json) -> Result<(), String> {
             return Err(format!("model {}: devices must be a list of GPU indices", str_or(m, "name", "")));
         }
     }
-    // The eGPU through tinygrad's server (`crate::egpu`, a Mac's): the section is optional, and read on a Mac only.
+    // The eGPU through tinygrad's server (`crate::llm::egpu`, a Mac's): the section is optional, and read on a Mac only.
     if let Some(egpu) = llm.get("egpu").filter(|e| !matches!(e, Json::Null)) {
         if egpu.as_object().is_none() {
             return Err("llm.egpu must be an object".into());
@@ -536,7 +536,7 @@ pub fn validate(v: &Json) -> Result<(), String> {
                 return Err(format!("llm.egpu.{key} must be text"));
             }
         }
-        // Which engine answers on the card: tinygrad's LLM server, or OAIY's own over WebGPU on it (`crate::egpu`).
+        // Which engine answers on the card: tinygrad's LLM server, or OAIY's own over WebGPU on it (`crate::llm::egpu`).
         if egpu.get("engine").is_some_and(|e| !matches!(e, Json::Null) && !matches!(e.as_str(), Some("" | "tinygrad" | "webgpu"))) {
             return Err("llm.egpu.engine must be tinygrad or webgpu".into());
         }

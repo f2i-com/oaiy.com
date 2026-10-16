@@ -198,8 +198,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                     ("default", Json::Bool(name == llm_default)),
                     ("loaded", Json::Bool(loaded.iter().any(|l| l == name))),
                     ("vision", Json::Bool(!str_or(m, "vision_projector", "").is_empty())),
-                    // set to run on the eGPU (a Mac's card in a Thunderbolt enclosure, `crate::egpu`), where it is on
-                    ("egpu", Json::Bool(crate::egpu::assigned(&llm, name))),
+                    // set to run on the eGPU (a Mac's card in a Thunderbolt enclosure, `crate::llm::egpu`), where it is on
+                    ("egpu", Json::Bool(crate::llm::egpu::assigned(&llm, name))),
                 ]),
                 missing_files(&studio.root, m, &LLM_FILES),
             )
@@ -255,7 +255,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         .collect();
     let speech = section("speech");
     let speech_default = effective(speech);
-    let voices = crate::speech::list(&crate::speech::voices_dir(&cfg, &studio.root));
+    let voices = crate::media::speech::list(&crate::media::speech::voices_dir(&cfg, &studio.root));
     let speech_models: Vec<Json> = names(speech)
         .into_iter()
         .map(|(name, m)| {
@@ -281,7 +281,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == music_default)),
-                ("max_seconds", Json::Num(crate::music::MAX_SECONDS)),
+                ("max_seconds", Json::Num(crate::media::music::MAX_SECONDS)),
                 ("sample_rate", Json::Int(44_100)),
                 ("channels", Json::Int(2)),
                 ("quantized", Json::Bool(!str_or(&m, "language_model", "").is_empty())),
@@ -297,8 +297,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == sound_default)),
-                ("max_seconds", Json::Num(crate::sound::MAX_SECONDS)),
-                ("sample_rate", Json::Int(crate::sound::SAMPLE_RATE)),
+                ("max_seconds", Json::Num(crate::media::sound::MAX_SECONDS)),
+                ("sample_rate", Json::Int(crate::media::sound::SAMPLE_RATE)),
                 ("channels", Json::Int(1)),
             ]);
             with_files(entry, missing_files(&studio.root, &m, &SOUND_FILES))
@@ -315,7 +315,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("default", Json::Bool(name == model3d_default)),
                 ("format", Json::str("glb")),
                 ("resolutions", Json::Arr(vec![Json::Int(1024), Json::Int(1536)])),
-                ("faces", Json::Int(int_or(&m, "faces", crate::model3d::DEFAULT_FACES))),
+                ("faces", Json::Int(int_or(&m, "faces", crate::media::model3d::DEFAULT_FACES))),
                 ("input", Json::str(if has("matte") { "a picture of one object; its background is removed" } else { "a picture of one object on a plain or transparent background" })),
                 ("removes_background", Json::Bool(has("matte"))),
                 ("upscales", Json::Bool(has("upscaler"))),
@@ -327,9 +327,9 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         .collect();
     // The picture tools: one model each, when configured.
     let picture = media.get("picture").cloned().unwrap_or(Json::Null);
-    let background_models: Vec<Json> = if crate::picture::ready(&cfg, crate::picture::Op::RemoveBackground) {
+    let background_models: Vec<Json> = if crate::media::picture::ready(&cfg, crate::media::picture::Op::RemoveBackground) {
         vec![with_files(Json::obj([
-            ("id", Json::str(crate::picture::Op::RemoveBackground.model())),
+            ("id", Json::str(crate::media::picture::Op::RemoveBackground.model())),
             ("default", Json::Bool(true)),
             ("format", Json::str("png")),
             ("output", Json::str("the picture at its own size, its background transparent (RGBA)")),
@@ -339,13 +339,13 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
     } else {
         Vec::new()
     };
-    let upscale_models: Vec<Json> = if crate::picture::ready(&cfg, crate::picture::Op::Upscale) {
+    let upscale_models: Vec<Json> = if crate::media::picture::ready(&cfg, crate::media::picture::Op::Upscale) {
         vec![with_files(Json::obj([
-            ("id", Json::str(crate::picture::Op::Upscale.model())),
+            ("id", Json::str(crate::media::picture::Op::Upscale.model())),
             ("default", Json::Bool(true)),
             ("format", Json::str("png")),
             ("scales", Json::Arr(vec![Json::Int(2), Json::Int(4)])),
-            ("max_pixels", Json::Int(crate::picture::MAX_UPSCALE_PIXELS as i64)),
+            ("max_pixels", Json::Int(crate::media::picture::MAX_UPSCALE_PIXELS as i64)),
             ("ready", Json::Bool(true)),
             ("license", Json::str("BSD-3-Clause")),
         ]), missing_files(&studio.root, &picture, &["upscaler"]))]
@@ -438,7 +438,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             "voices".into(),
             Json::obj([
                 ("saved", Json::Arr(voices.clone())),
-                ("openai_names", Json::Arr(crate::speech::STOCK_VOICES.iter().map(|(n, _)| Json::str(*n)).collect())),
+                ("openai_names", Json::Arr(crate::media::speech::STOCK_VOICES.iter().map(|(n, _)| Json::str(*n)).collect())),
             ]),
         ),
         (
@@ -458,12 +458,12 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         // (no paths: what a chat's picker shows)
         (
             "egpu".into(),
-            if crate::egpu::available() {
+            if crate::llm::egpu::available() {
                 let e = studio.egpu.status(&llm);
                 Json::obj([
                     ("available", Json::Bool(true)),
                     ("enabled", e.get("enabled").cloned().unwrap_or(Json::Bool(false))),
-                    ("engine", Json::str(if crate::egpu::webgpu(&llm) { "webgpu" } else { "tinygrad" })),
+                    ("engine", Json::str(if crate::llm::egpu::webgpu(&llm) { "webgpu" } else { "tinygrad" })),
                     ("state", e.get("state").cloned().unwrap_or(Json::Null)),
                     ("model", e.get("model").cloned().unwrap_or(Json::Null)),
                     ("models", e.get("models").cloned().unwrap_or(Json::Arr(Vec::new()))),
@@ -492,7 +492,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
 /// The context of the model the eGPU holds or is loading (a Mac's): its engine's once it has said it, else the
 /// model's setting. None where there is no eGPU, it is off, or it holds nothing.
 fn egpu_context(studio: &Studio, llm: &Json) -> Option<Json> {
-    if !crate::egpu::available() || !crate::egpu::enabled(llm) {
+    if !crate::llm::egpu::available() || !crate::llm::egpu::enabled(llm) {
         return None;
     }
     let e = studio.egpu.status(llm);
@@ -524,7 +524,7 @@ mod tests {
     fn a_3d_model_is_listed_with_its_endpoint_and_default() {
         let root = std::env::temp_dir().join(format!("oaiy-studio-discovery-{}", std::process::id()));
         let mut cfg = crate::config::default_json();
-        let model3d = crate::registry::obj_mut(&mut cfg, &["media", "model3d"]).unwrap();
+        let model3d = crate::models::registry::obj_mut(&mut cfg, &["media", "model3d"]).unwrap();
         crate::util::set(model3d, "models", Json::parse(br#"{"pixal3d":{"path":"P","dino":"D","naf":"N.pth"},"half":{"path":"P"}}"#).unwrap());
         crate::util::set(model3d, "default_model", Json::str("pixal3d"));
         let studio = studio_with(&root, cfg);
@@ -549,10 +549,10 @@ mod tests {
         std::fs::create_dir_all(root.join("moss")).unwrap();
         std::fs::write(root.join("song.gguf"), b"x").unwrap();
         let mut cfg = crate::config::default_json();
-        let sound = crate::registry::obj_mut(&mut cfg, &["media", "sound"]).unwrap();
+        let sound = crate::models::registry::obj_mut(&mut cfg, &["media", "sound"]).unwrap();
         // One relative to the studio and present, one absolute and gone.
         crate::util::set(sound, "models", Json::parse(br#"{"here":{"path":"moss"},"gone":{"path":"Z:/nowhere/moss-soundeffect"}}"#).unwrap());
-        let music = crate::registry::obj_mut(&mut cfg, &["media", "music"]).unwrap();
+        let music = crate::models::registry::obj_mut(&mut cfg, &["media", "music"]).unwrap();
         crate::util::set(music, "models", Json::parse(br#"{"song":{"path":"moss","language_model":"song.gguf","loras":[{"path":"no-such.safetensors"}]}}"#).unwrap());
         let doc = document(&studio_with(&root, cfg), "http://127.0.0.1:8080", true);
         let model = |kind: &str, id: &str| {
@@ -571,7 +571,7 @@ mod tests {
     fn the_language_models_say_which_runs_on_the_egpu_and_the_egpu_says_no_paths() {
         let root = std::env::temp_dir().join(format!("oaiy-studio-egpu-{}", std::process::id()));
         let mut cfg = crate::config::default_json();
-        let llm = crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
+        let llm = crate::models::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
         crate::util::set(llm, "egpu", Json::parse(br#"{"enabled": true, "engine": "webgpu", "python": "/Users/someone/tinygrad/.venv/bin/python"}"#).unwrap());
         crate::util::set(llm, "models", Json::parse(br#"[{"name": "big", "path": "big.gguf", "egpu": true}, {"name": "small", "path": "small.gguf"}]"#).unwrap());
         crate::util::set(llm, "default_model", Json::str("small"));
@@ -597,7 +597,7 @@ mod tests {
         let doc = document(&studio_with(&root, crate::config::default_json()), "http://127.0.0.1:8080", true);
         assert_eq!(doc.get("models").and_then(|m| m.get("background")).and_then(Json::as_array).map(|a| a.len()), Some(0));
         let mut cfg = crate::config::default_json();
-        let picture = crate::registry::obj_mut(&mut cfg, &["media", "picture"]).unwrap();
+        let picture = crate::models::registry::obj_mut(&mut cfg, &["media", "picture"]).unwrap();
         crate::util::set(picture, "background", Json::str("B"));
         crate::util::set(picture, "upscaler", Json::str("U.pth"));
         let doc = document(&studio_with(&root, cfg), "http://127.0.0.1:8080", true);

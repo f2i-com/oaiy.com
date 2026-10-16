@@ -122,7 +122,7 @@ advertises the configured service after operator-approved integration.
 
 Source anchors: `platform/desktop/src-tauri/src/auth/routes.rs` (`ai.use` route),
 `src/ai/routes.rs::engine_discovery`, `src/ai/engine_services.rs::forward_to`,
-`crates/oaiy-studio/src/lib.rs::public`, and `src/discovery.rs::document`.
+`crates/oaiy-studio/src/lib.rs::public`, and `src/api/discovery.rs::document`.
 
 ## Tests, reproduction, and retained evidence
 

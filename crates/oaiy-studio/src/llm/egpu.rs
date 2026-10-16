@@ -40,7 +40,7 @@ const SERVE_PY: &str = include_str!("egpu_serve.py");
 const SERVE_PY: &str = "";
 /// The card's WebGPU server, written beside the launcher for `llm.egpu.engine` `webgpu`.
 #[cfg(any(target_os = "macos", test))]
-const CARD_PY: &str = include_str!("../../../tools/tinygpu/webgpu_server.py");
+const CARD_PY: &str = include_str!("../../../../tools/tinygpu/webgpu_server.py");
 #[cfg(not(any(target_os = "macos", test)))]
 const CARD_PY: &str = "";
 /// After a start that failed, how long requests go to this computer's engine before it is tried again.

@@ -497,7 +497,7 @@ whether it is.
 ### How it is kept to this Mac
 
 Started by itself, tinygrad's server listens on every network interface and asks for no
-key. OAIY starts it through a launcher (`crates/oaiy-studio/src/egpu_serve.py`, written to
+key. OAIY starts it through a launcher (`crates/oaiy-studio/src/llm/egpu_serve.py`, written to
 `cache/egpu/` beside the configuration) that holds it to `127.0.0.1` and to a key made for
 that run, which only the gateway has. Nothing of tinygrad's is changed on disk, and the
 launcher names none of tinygrad's own classes: it tells Python's socket server, which

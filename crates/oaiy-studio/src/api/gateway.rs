@@ -120,7 +120,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("completions", _) => proxy(studio, req, w, "/v1/completions"),
         ("models", _) => models(studio, req, w),
         ("health", _) => json_reply(w, 200, &health(studio)),
-        ("discovery", _) => json_reply(w, 200, &crate::discovery::document(studio, &public_base(studio, req), true)),
+        ("discovery", _) => json_reply(w, 200, &crate::api::discovery::document(studio, &public_base(studio, req), true)),
         ("files", _) => files(studio, req, w, m.rest.trim_start_matches('/')),
         ("images", "openai") if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| {
             let scratch = scratch_for(studio, req, Some(&b));
@@ -152,8 +152,8 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("music", _) => music_openai(studio, req, w, method, &m.rest),
         ("sound", _) => sound_openai(studio, req, w, method, &m.rest),
         ("model3d", _) => model3d_openai(studio, req, w, method, &m.rest, trusted),
-        ("background", _) if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| picture_openai(studio, req, b, trusted, crate::picture::Op::RemoveBackground))),
-        ("upscale", _) if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| picture_openai(studio, req, b, trusted, crate::picture::Op::Upscale))),
+        ("background", _) if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| picture_openai(studio, req, b, trusted, crate::media::picture::Op::RemoveBackground))),
+        ("upscale", _) if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| picture_openai(studio, req, b, trusted, crate::media::picture::Op::Upscale))),
         _ => send(w, Err(fail(404, format!("no route {} {}", method, req.route())))),
     }
 }
@@ -222,12 +222,12 @@ fn relay_to_its_end(w: &mut TcpStream, response: oaiy_engine::http::Response, en
     }
 }
 
-/// A chat request for a model set to run on the eGPU (macOS, `crate::egpu`): answered by the server there (`Some`),
+/// A chat request for a model set to run on the eGPU (macOS, `crate::llm::egpu`): answered by the server there (`Some`),
 /// or left to this computer's engine (`None`) because the request has a picture and the server is tinygrad's, which
 /// does not read one, or because that server cannot be started or has gone: the card unplugged, tinygrad not installed.
 /// A server that is only still loading is waited for, and past the wait the client is told to try again.
 fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json, name: &str) -> Option<io::Result<bool>> {
-    use crate::egpu::{self, Unready};
+    use crate::llm::egpu::{self, Unready};
     let llm = cfg.get("llm")?;
     let asked = Json::parse(&req.body).ok()?;
     // (tinygrad's server reads text alone. OAIY's own engine on the card reads a picture as it does anywhere, where
@@ -314,13 +314,13 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     // model named to stand in for it where one is.
     let mut body = std::borrow::Cow::Borrowed(&req.body[..]);
     let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
-    if let Some(name) = model.clone().filter(|m| crate::egpu::assigned(&llm, m)) {
+    if let Some(name) = model.clone().filter(|m| crate::llm::egpu::assigned(&llm, m)) {
         if upstream == "/v1/chat/completions" {
             if let Some(answered) = egpu_chat(studio, req, w, &cfg, &name) {
                 return answered;
             }
         }
-        let stands_in = crate::egpu::fallback(&llm, &name);
+        let stands_in = crate::llm::egpu::fallback(&llm, &name);
         if stands_in != name {
             if let Some(rewritten) = with_model(&req.body, &stands_in) {
                 body = std::borrow::Cow::Owned(rewritten);
@@ -538,7 +538,7 @@ fn edit_body(req: &Request) -> Result<(Json, Uploads), Reply> {
     let ctype = req.header("content-type").unwrap_or("");
     let mut uploads = Vec::new();
     let body = if multipart(req) {
-        let parts = crate::multipart::parse(ctype, &req.body).map_err(|e| fail(400, e))?;
+        let parts = crate::api::multipart::parse(ctype, &req.body).map_err(|e| fail(400, e))?;
         let mut fields: Vec<(String, Json)> = Vec::new();
         for p in parts {
             let name = p.name.trim_end_matches("[]").to_string();
@@ -546,7 +546,7 @@ fn edit_body(req: &Request) -> Result<(Json, Uploads), Reply> {
                 "mask" => return Err(fail(400, NO_MASK)),
                 "image" | "images" => {
                     let label = p.filename.clone().unwrap_or_else(|| "image".into());
-                    let (ext, ..) = crate::multipart::image_info(&p.data).ok_or_else(|| fail(400, format!("{label}: not a PNG, JPEG or WebP image")))?;
+                    let (ext, ..) = crate::api::multipart::image_info(&p.data).ok_or_else(|| fail(400, format!("{label}: not a PNG, JPEG or WebP image")))?;
                     if p.data.len() > 32 << 20 {
                         return Err(fail(400, "reference images are limited to 32 MiB"));
                     }
@@ -639,7 +639,7 @@ fn speech_audio(studio: &Arc<Studio>, req: &Request) -> Result<(Vec<u8>, &'stati
     }
     let body = parse_body(req)?;
     let format = body.get("response_format").and_then(Json::as_str).unwrap_or("mp3");
-    let ctype = crate::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c)
+    let ctype = crate::media::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c)
         .ok_or_else(|| fail(400, "response_format must be mp3, opus, aac, flac, wav or pcm"))?;
     let speed = match body.get("speed") {
         None | Some(Json::Null) => 1.0,
@@ -659,12 +659,12 @@ fn speech_audio(studio: &Arc<Studio>, req: &Request) -> Result<(Vec<u8>, &'stati
     };
     // A music model sings: `input` is the lyrics and `instructions` the style,
     // as the official Music 3 server takes them.
-    let music = crate::music::names_music_model(&cfg, &body);
+    let music = crate::media::music::names_music_model(&cfg, &body);
     let (job, wait) = if music {
-        let (request, model, label, frames, seconds) = crate::music::music_request(&cfg, &studio.root, &media::day_dir(&out, "music"), &body).map_err(drop_scratch)?;
+        let (request, model, label, frames, seconds) = crate::media::music::music_request(&cfg, &studio.root, &media::day_dir(&out, "music"), &body).map_err(drop_scratch)?;
         (studio.media.submit(Kind::Music, request, model, label, frames, seconds, keep_jobs(&cfg), scratch), MUSIC_WAIT)
     } else {
-        let (request, model, voice, frames) = crate::speech::speech_request(&cfg, &studio.root, &media::day_dir(&out, "speech"), &body).map_err(drop_scratch)?;
+        let (request, model, voice, frames) = crate::media::speech::speech_request(&cfg, &studio.root, &media::day_dir(&out, "speech"), &body).map_err(drop_scratch)?;
         (studio.media.submit(Kind::Speech, request, model, voice, frames, 0.0, keep_jobs(&cfg), scratch), SPEECH_WAIT)
     };
     let done = studio.media.wait(&job.id, wait).ok_or_else(|| fail(500, "the job disappeared"))?;
@@ -689,7 +689,7 @@ fn convert_audio(studio: &Arc<Studio>, cfg: &Json, wav: &std::path::Path, format
         return std::fs::read(wav).map_err(|e| fail(500, e.to_string()));
     }
     let ffmpeg = crate::config::program(&studio.root, cfg.get("media").and_then(|m| m.get("video")).map_or("ffmpeg", |v| str_or(v, "ffmpeg", "ffmpeg")));
-    let args = if music { crate::music::convert_args(format, speed) } else { crate::speech::convert_args(format, speed) };
+    let args = if music { crate::media::music::convert_args(format, speed) } else { crate::media::speech::convert_args(format, speed) };
     let mut command = oaiy_host_env::command(&ffmpeg);
     command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(wav).args(args).arg("pipe:1");
     #[cfg(windows)]
@@ -742,7 +742,7 @@ fn music_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: 
             let cfg = studio.config();
             let scratch = scratch_for(studio, req, Some(&b));
             let out = scratch.clone().unwrap_or_else(|| studio.output_root());
-            let (request, model, label, frames, seconds) = crate::music::music_request(&cfg, &studio.root, &media::day_dir(&out, "music"), &b).map_err(|e| {
+            let (request, model, label, frames, seconds) = crate::media::music::music_request(&cfg, &studio.root, &media::day_dir(&out, "music"), &b).map_err(|e| {
                 if let Some(s) = &scratch {
                     let _ = std::fs::remove_dir_all(s);
                 }
@@ -784,7 +784,7 @@ fn music_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: 
             if format == "wav" {
                 return serve_file(w, &wav, true, req.header("range"));
             }
-            let Some(ctype) = crate::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c) else {
+            let Some(ctype) = crate::media::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c) else {
                 return send(w, Err(fail(400, "format must be mp3, opus, aac, flac, wav or pcm")));
             };
             let cfg = studio.config();
@@ -817,7 +817,7 @@ pub fn sound_object(job: &Job) -> Json {
         ("prompt", Json::str(&job.prompt)),
         ("seconds", job.result.get("duration").cloned().unwrap_or(Json::Num(job.seconds))),
         ("seed", job.request.get("seed").cloned().unwrap_or(Json::Null)),
-        ("sample_rate", Json::Int(crate::sound::SAMPLE_RATE)),
+        ("sample_rate", Json::Int(crate::media::sound::SAMPLE_RATE)),
         ("channels", Json::Int(1)),
         ("error", error),
     ])
@@ -833,7 +833,7 @@ fn sound_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: 
             let cfg = studio.config();
             let scratch = scratch_for(studio, req, Some(&b));
             let out = scratch.clone().unwrap_or_else(|| studio.output_root());
-            let (request, model, label, seconds) = crate::sound::sound_request(&cfg, &studio.root, &media::day_dir(&out, "sound"), &b).map_err(|e| {
+            let (request, model, label, seconds) = crate::media::sound::sound_request(&cfg, &studio.root, &media::day_dir(&out, "sound"), &b).map_err(|e| {
                 if let Some(s) = &scratch {
                     let _ = std::fs::remove_dir_all(s);
                 }
@@ -875,7 +875,7 @@ fn sound_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: 
             if format == "wav" {
                 return serve_file(w, &wav, true, req.header("range"));
             }
-            let Some(ctype) = crate::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c) else {
+            let Some(ctype) = crate::media::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c) else {
                 return send(w, Err(fail(400, "format must be mp3, opus, aac, flac, wav or pcm")));
             };
             let cfg = studio.config();
@@ -930,7 +930,7 @@ fn model3d_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method
             let cfg = studio.config();
             let scratch = scratch_for(studio, req, Some(&b));
             let out = scratch.clone().unwrap_or_else(|| studio.output_root());
-            let (request, name, label) = crate::model3d::model3d_request(&cfg, &studio.root, &media::day_dir(&out, "3d"), &b, trusted).map_err(|e| {
+            let (request, name, label) = crate::media::model3d::model3d_request(&cfg, &studio.root, &media::day_dir(&out, "3d"), &b, trusted).map_err(|e| {
                 if let Some(s) = &scratch {
                     let _ = std::fs::remove_dir_all(s);
                 }
@@ -980,26 +980,26 @@ fn model3d_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method
 /// Saved voices: list, design and save, show, sample clip, delete.
 fn voices(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, rest: &str) -> io::Result<bool> {
     let cfg = studio.config();
-    let dir = crate::speech::voices_dir(&cfg, &studio.root);
+    let dir = crate::media::speech::voices_dir(&cfg, &studio.root);
     let parts: Vec<String> = rest.split('/').filter(|s| !s.is_empty()).map(oaiy_engine::http::percent_decode).collect();
     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     match (req.method.as_str(), parts.as_slice()) {
-        ("GET", []) => json_reply(w, 200, &Json::obj([("object", Json::str("list")), ("data", Json::Arr(crate::speech::list(&dir)))])),
+        ("GET", []) => json_reply(w, 200, &Json::obj([("object", Json::str("list")), ("data", Json::Arr(crate::media::speech::list(&dir)))])),
         ("POST", []) => send(w, create_voice(studio, req, &dir)),
-        ("GET", [name]) => match crate::speech::get(&dir, name) {
+        ("GET", [name]) => match crate::media::speech::get(&dir, name) {
             Some(v) => json_reply(w, 200, &v),
             None => send(w, Err(fail(404, format!("no voice named {name}")))),
         },
         ("GET", [name, "sample"]) => {
-            let clip = crate::speech::sample_file(&dir, name);
-            if crate::speech::valid_name(name) && clip.is_file() {
+            let clip = crate::media::speech::sample_file(&dir, name);
+            if crate::media::speech::valid_name(name) && clip.is_file() {
                 serve_file(w, &clip, false, req.header("range"))
             } else {
                 send(w, Err(fail(404, format!("no sample for {name}"))))
             }
         }
         ("DELETE", [name]) => {
-            if crate::speech::remove(&dir, name) {
+            if crate::media::speech::remove(&dir, name) {
                 json_reply(w, 200, &Json::obj([("id", Json::str(*name)), ("object", Json::str("voice.deleted")), ("deleted", Json::Bool(true))]))
             } else {
                 send(w, Err(fail(404, format!("no voice named {name}"))))
@@ -1022,11 +1022,11 @@ fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path) -> R
         None => !incognito,
     };
     let name = body.get("name").and_then(Json::as_str).unwrap_or("").trim().to_string();
-    if keep && crate::speech::get(dir, &name).is_some() && body.get("replace").and_then(Json::as_bool) != Some(true) {
+    if keep && crate::media::speech::get(dir, &name).is_some() && body.get("replace").and_then(Json::as_bool) != Some(true) {
         return Err(fail(409, format!("a voice named {name} already exists; delete it first, or send replace: true")));
     }
     let cfg = studio.config();
-    let (request, model, label) = crate::speech::voice_request(&cfg, &studio.root, &media::day_dir(&studio.output_root(), "voices"), &body).map_err(|e| fail(400, e))?;
+    let (request, model, label) = crate::media::speech::voice_request(&cfg, &studio.root, &media::day_dir(&studio.output_root(), "voices"), &body).map_err(|e| fail(400, e))?;
     let job = studio.media.submit(Kind::Speech, request, model, format!("voice: {label}"), 1, 0.0, keep_jobs(&cfg), None);
     let done = studio.media.wait(&job.id, SPEECH_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
     if done.status != "completed" {
@@ -1034,11 +1034,11 @@ fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path) -> R
     }
     let path = |k: &str| done.result.get(k).and_then(Json::as_str).map(std::path::PathBuf::from).ok_or_else(|| fail(500, format!("the voice job returned no {k}")));
     if !keep {
-        let handed = crate::speech::hand_back(&label, &path("voice_file")?, &path("path")?).map_err(|e| fail(500, e));
+        let handed = crate::media::speech::hand_back(&label, &path("voice_file")?, &path("path")?).map_err(|e| fail(500, e));
         studio.media.remove(&done.id);
         return handed.and_then(ok);
     }
-    let voice = crate::speech::keep(dir, &label, &path("voice_file")?, &path("path")?).map_err(|e| fail(500, e))?;
+    let voice = crate::media::speech::keep(dir, &label, &path("voice_file")?, &path("path")?).map_err(|e| fail(500, e))?;
     // Its files have moved into the voices folder; the job has nothing left to show.
     studio.media.remove(&done.id);
     ok(voice)
@@ -1094,7 +1094,7 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool,
 
 /// A picture's background removed, or the picture made larger: wait, and answer
 /// as OpenAI Images does, with a base64 PNG or a URL.
-fn picture_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool, op: crate::picture::Op) -> Result<Reply, Reply> {
+fn picture_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool, op: crate::media::picture::Op) -> Result<Reply, Reply> {
     if req.method != "POST" {
         return Err(fail(405, "use POST"));
     }
@@ -1105,7 +1105,7 @@ fn picture_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool
     let cfg = studio.config();
     let scratch = scratch_for(studio, req, Some(&body));
     let root = scratch.clone().unwrap_or_else(|| studio.output_root());
-    let (request, model, label) = crate::picture::picture_request(&cfg, &studio.root, &root, &body, trusted, op).map_err(|e| {
+    let (request, model, label) = crate::media::picture::picture_request(&cfg, &studio.root, &root, &body, trusted, op).map_err(|e| {
         if let Some(s) = &scratch {
             let _ = std::fs::remove_dir_all(s);
         }
@@ -1436,7 +1436,7 @@ mod tests {
     fn a_picture_for_a_model_on_the_egpu_goes_to_oaiys_own_engine_there() {
         let root = std::env::temp_dir();
         let mut cfg = egpu_studio(&root, "small").config();
-        crate::util::set(crate::registry::obj_mut(&mut cfg, &["llm", "egpu"]).unwrap(), "engine", Json::str("webgpu"));
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["llm", "egpu"]).unwrap(), "engine", Json::str("webgpu"));
         let studio = Arc::new(Studio::for_test(&root, cfg));
         let (card, engine) = (StandIn::new(TINYGRAD_SAYS), StandIn::new(ENGINE_SAYS));
         studio.egpu.adopt(&card.addr, "sk-egpu-test", "big", None);
@@ -1811,12 +1811,12 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
         std::fs::write(&engine, FAKE_ENGINE).unwrap();
         std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut cfg = studio.config();
-        let llm = crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
+        let llm = crate::models::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
         crate::util::set(llm, "server", Json::str(engine.to_string_lossy()));
-        let egpu = crate::registry::obj_mut(&mut cfg, &["llm", "egpu"]).unwrap();
+        let egpu = crate::models::registry::obj_mut(&mut cfg, &["llm", "egpu"]).unwrap();
         crate::util::set(egpu, "engine", Json::str("webgpu"));
         crate::util::set(egpu, "env", Json::obj([("OAIY_EGPU_EMULATE", Json::str("1"))]));
-        if let Some(Json::Arr(models)) = crate::registry::obj_mut(&mut cfg, &["llm", "models"]) {
+        if let Some(Json::Arr(models)) = crate::models::registry::obj_mut(&mut cfg, &["llm", "models"]) {
             for m in models.iter_mut().filter(|m| str_or(m, "name", "") == "y") {
                 crate::util::set(m, "egpu", Json::Bool(false));
             }
@@ -1854,7 +1854,7 @@ open(log, "a").write("ended\n")
         std::fs::write(&worker, FAKE_SERVE).unwrap();
         std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut cfg = first.config();
-        let media = crate::registry::obj_mut(&mut cfg, &["media"]).unwrap();
+        let media = crate::models::registry::obj_mut(&mut cfg, &["media"]).unwrap();
         crate::util::set(media, "worker", Json::str(worker.to_string_lossy()));
         let studio = Arc::new(Studio::for_test(&dir, cfg));
         let runner = Arc::clone(&studio);
@@ -1930,13 +1930,13 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut cfg = crate::config::default_json();
-        let llm = crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
+        let llm = crate::models::registry::obj_mut(&mut cfg, &["llm"]).unwrap();
         for key in ["server", "server_webgpu"] {
             crate::util::set(llm, key, Json::str(engine.to_string_lossy()));
         }
         crate::util::set(llm, "models", Json::Arr(vec![Json::obj([("name", Json::str("m")), ("path", Json::str("m.gguf"))])]));
         crate::util::set(llm, "default_model", Json::str("m"));
-        crate::util::set(crate::registry::obj_mut(&mut cfg, &["media"]).unwrap(), "worker", Json::str(worker.to_string_lossy()));
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["media"]).unwrap(), "worker", Json::str(worker.to_string_lossy()));
         let studio = Arc::new(Studio::for_test(&dir, cfg));
         let runner = Arc::clone(&studio);
         std::thread::spawn(move || {
@@ -1995,10 +1995,10 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
         let dir = fake_dir("buttons");
         let Some(first) = fake_card(&dir) else { return };
         let mut cfg = first.config();
-        if let Some(Json::Arr(models)) = crate::registry::obj_mut(&mut cfg, &["llm", "models"]) {
+        if let Some(Json::Arr(models)) = crate::models::registry::obj_mut(&mut cfg, &["llm", "models"]) {
             models.retain(|m| str_or(m, "name", "") == "x");
         }
-        crate::util::set(crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap(), "default_model", Json::str("x"));
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["llm"]).unwrap(), "default_model", Json::str("x"));
         let studio = Arc::new(Studio::for_test(&dir, cfg));
         let cfg = studio.config();
         let llm = cfg.get("llm").unwrap();
@@ -2054,7 +2054,7 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
         let there = || studio.egpu.status(studio.config().get("llm").unwrap()).get("state").and_then(Json::as_str).unwrap_or("").to_string();
         let with = |edit: &dyn Fn(&mut Json)| {
             let mut cfg = studio.config();
-            edit(crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap());
+            edit(crate::models::registry::obj_mut(&mut cfg, &["llm"]).unwrap());
             studio.set_config(cfg).unwrap_or_else(|e| panic!("{e}"));
         };
         let ask_x = r#"{"model": "x", "messages": [{"role": "user", "content": "hi"}]}"#;
@@ -2075,7 +2075,7 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
 
         // another setting (none of the language model's launch), the default where it was: nothing started or stopped
         let mut cfg = studio.config();
-        crate::util::set(crate::registry::obj_mut(&mut cfg, &["media"]).unwrap(), "resume_llm", Json::Bool(false));
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["media"]).unwrap(), "resume_llm", Json::Bool(false));
         studio.set_config(cfg).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!((there().as_str(), starts(&studio)), ("ready", 2));

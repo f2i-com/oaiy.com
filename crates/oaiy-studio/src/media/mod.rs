@@ -8,9 +8,18 @@
 //! only what a job may use and whether the LLM must leave the GPU first.
 //!
 //! On a Mac whose eGPU runs OAIY's engine, a Qwen Image picture is made on the
-//! card instead ([`on_card`]): the card is lent to the worker (`crate::egpu`),
+//! card instead ([`on_card`]): the card is lent to the worker (`crate::llm::egpu`),
 //! its language model paused, until the queue is empty. This computer's GPU and
 //! language model are left alone; a picture the card fails is made here.
+
+
+// The jobs other than pictures and video, each made into the worker's request: picture tools, songs, sound effects,
+// speech, 3D models.
+pub(crate) mod model3d;
+pub(crate) mod music;
+pub(crate) mod picture;
+pub(crate) mod sound;
+pub(crate) mod speech;
 
 use crate::config::{self, VIDEO_FAMILIES};
 use crate::util::{base64_decode, bool_or, int_or, now, num_or, random_id, str_or, LogRing};
@@ -443,9 +452,9 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     }
     // Editing with `size: auto` keeps the first reference's shape at about a megapixel.
     let auto = matches!(body.get("size").and_then(Json::as_str), None | Some("auto" | ""));
-    let first = refs.first().and_then(|p| std::fs::read(p).ok()).and_then(|b| crate::multipart::image_info(&b));
+    let first = refs.first().and_then(|p| std::fs::read(p).ok()).and_then(|b| crate::api::multipart::image_info(&b));
     let (w, h) = match (auto && body.get("width").is_none(), first) {
-        (true, Some((_, iw, ih))) => crate::multipart::size_like(iw, ih, step),
+        (true, Some((_, iw, ih))) => crate::api::multipart::size_like(iw, ih, step),
         _ => size(body, model, (1024, 1024))?,
     };
     if !(256..=2048).contains(&w) || !(256..=2048).contains(&h) {
@@ -932,14 +941,14 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
                 crate::util::set(&mut sb, "input", t);
             }
         }
-        let (request, _, _, speech_frames) = crate::speech::speech_request(cfg, root, &day_dir(output_root, "speech"), &sb).map_err(|e| format!("speech: {e}"))?;
+        let (request, _, _, speech_frames) = crate::media::speech::speech_request(cfg, root, &day_dir(output_root, "speech"), &sb).map_err(|e| format!("speech: {e}"))?;
         f.push(("speech".into(), request));
         // A saved voice's sample is the ID-LoRA reference (the line itself otherwise).
         if identity {
-            let dir = crate::speech::voices_dir(cfg, root);
-            let saved = match crate::speech::inline_voice(s) {
-                Some(v) => crate::speech::inline_sample(v, &output_dir(output_root, "video")).map_err(|e| format!("speech: {e}"))?,
-                None => s.get("voice").and_then(Json::as_str).map(|n| crate::speech::sample_file(&dir, n)).filter(|p| p.is_file()),
+            let dir = crate::media::speech::voices_dir(cfg, root);
+            let saved = match crate::media::speech::inline_voice(s) {
+                Some(v) => crate::media::speech::inline_sample(v, &output_dir(output_root, "video")).map_err(|e| format!("speech: {e}"))?,
+                None => s.get("voice").and_then(Json::as_str).map(|n| crate::media::speech::sample_file(&dir, n)).filter(|p| p.is_file()),
             };
             if let Some(sample) = saved {
                 f.push(("reference_voice".into(), Json::str(sample.to_string_lossy())));
@@ -1020,7 +1029,7 @@ pub fn needs_media_gpu(cfg: &Json, model: Option<&str>) -> bool {
     }
 }
 
-/// Whether a job of `kind` with `request` is made on the eGPU's card (a Mac's, `crate::egpu`): a job on WebGPU (every
+/// Whether a job of `kind` with `request` is made on the eGPU's card (a Mac's, `crate::llm::egpu`): a job on WebGPU (every
 /// one of the worker's: pictures, video, music, sound effects, speech, 3D models, picture tools), where the eGPU is
 /// switched on and answers with OAIY's own engine; pictures where it makes them (`llm.egpu.images`), the others where
 /// it makes media (`llm.egpu.media`), each on unless switched off.
@@ -1028,7 +1037,7 @@ pub fn on_card(cfg: &Json, kind: Kind, request: &Json) -> bool {
     let Some(llm) = cfg.get("llm") else { return false };
     let egpu = llm.get("egpu").unwrap_or(&Json::Null);
     let wanted = if kind == Kind::Image { bool_or(egpu, "images", true) } else { bool_or(egpu, "media", true) };
-    wanted && crate::egpu::enabled(llm) && crate::egpu::webgpu(llm) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+    wanted && crate::llm::egpu::enabled(llm) && crate::llm::egpu::webgpu(llm) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
 }
 
 /// Whether a job the card could make takes it now: speech only where the card is lent already, or its language model
@@ -1720,7 +1729,7 @@ impl Media {
         Ok(result)
     }
 
-    /// The worker run for `job`; `card`: the eGPU card's socket, its WebGPU adapter (`crate::egpu`), else this
+    /// The worker run for `job`; `card`: the eGPU card's socket, its WebGPU adapter (`crate::llm::egpu`), else this
     /// computer's GPU.
     fn worker(&self, studio: &crate::Studio, cfg: &Json, job: &Job, card: Option<&str>) -> Result<Json, String> {
         let media = cfg.get("media").ok_or("no media section")?;

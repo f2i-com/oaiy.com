@@ -59,7 +59,7 @@ fn flux3_requests_take_ten_references_and_the_references_size() {
     let _=std::fs::remove_dir_all(&out);
     // (a model without its VAE is not one)
     let mut broken=c.clone();
-    crate::util::set(crate::registry::obj_mut(&mut broken,&["media","image","models","flux3"]).unwrap(),"vae",Json::str(""));
+    crate::util::set(crate::models::registry::obj_mut(&mut broken,&["media","image","models","flux3"]).unwrap(),"vae",Json::str(""));
     assert!(config::validate(&broken).unwrap_err().contains("needs vae"));
 }
 
@@ -395,7 +395,7 @@ fn qwen_image_turbo_takes_its_own_eight_steps_at_cfg_one_and_no_adapter() {
     let turbo = body(r#"{"architecture":"qwen-image","base":"base","transformer":"Qwen-Image-2.1-Turbo-AD-Q4_K.gguf","text_encoder":"te.gguf","distilled":true}"#);
     let mut models = c.get("media").and_then(|m| m.get("image")).and_then(|i| i.get("models")).unwrap().clone();
     crate::util::set(&mut models, "turbo", turbo);
-    crate::util::set(crate::registry::obj_mut(&mut c, &["media", "image"]).unwrap(), "models", models);
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["media", "image"]).unwrap(), "models", models);
     config::validate(&c).unwrap();
     let root = Path::new("/install");
     let (r, ..) = image_request(&c, root, root, &body(r#"{"model":"turbo","prompt":"a fox"}"#), false).unwrap();
@@ -407,7 +407,7 @@ fn qwen_image_turbo_takes_its_own_eight_steps_at_cfg_one_and_no_adapter() {
     let err = image_request(&c, root, root, &body(r#"{"model":"turbo","prompt":"a fox","steps":30}"#), false).unwrap_err();
     assert!(err.contains("8 steps"), "{err}");
     // An adapter beside a distilled checkpoint is refused where it is set.
-    let image = crate::registry::obj_mut(&mut c, &["media", "image", "models", "turbo"]).unwrap();
+    let image = crate::models::registry::obj_mut(&mut c, &["media", "image", "models", "turbo"]).unwrap();
     crate::util::set(image, "adapter", Json::str("turbo.safetensors"));
     assert!(config::validate(&c).unwrap_err().contains("no turbo adapter"));
 }
@@ -415,7 +415,7 @@ fn qwen_image_turbo_takes_its_own_eight_steps_at_cfg_one_and_no_adapter() {
 #[test]
 fn webgpu_media_goes_to_the_egpu_where_it_runs_oaiys_engine() {
     let mut c = cfg("", "");
-    let llm = crate::registry::obj_mut(&mut c, &["llm"]).unwrap();
+    let llm = crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap();
     crate::util::set(llm, "egpu", body(r#"{"enabled":true,"engine":"webgpu"}"#));
     let qwen = body(r#"{"base":"b","transformer":"t.gguf","steps":8}"#);
     let sdxl = body(r#"{"architecture":"sdxl","checkpoint":"c"}"#);
@@ -431,12 +431,12 @@ fn webgpu_media_goes_to_the_egpu_where_it_runs_oaiys_engine() {
     assert!(kept_on_card(Kind::Image, &qwen) && !kept_on_card(Kind::Image, &sdxl) && !kept_on_card(Kind::Music, &body("{}")));
     assert!(!on_card(&c, Kind::Image, &body(r#"{"base":"b","backend":"cpu"}"#)), "not on WebGPU");
     // pictures and the rest each switched off on their own
-    crate::util::set(crate::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(r#"{"enabled":true,"engine":"webgpu","images":false}"#));
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(r#"{"enabled":true,"engine":"webgpu","images":false}"#));
     assert!(!on_card(&c, Kind::Image, &qwen) && on_card(&c, Kind::Music, &body("{}")));
-    crate::util::set(crate::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(r#"{"enabled":true,"engine":"webgpu","media":false}"#));
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(r#"{"enabled":true,"engine":"webgpu","media":false}"#));
     assert!(on_card(&c, Kind::Image, &qwen) && !on_card(&c, Kind::Music, &body("{}")));
     for egpu in [r#"{"enabled":true,"engine":"tinygrad"}"#, r#"{"enabled":false,"engine":"webgpu"}"#] {
-        crate::util::set(crate::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(egpu));
+        crate::util::set(crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(egpu));
         assert!(!on_card(&c, Kind::Image, &qwen) && !on_card(&c, Kind::Video, &body("{}")), "{egpu}");
     }
 }

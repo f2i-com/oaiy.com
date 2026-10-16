@@ -7,6 +7,10 @@
 //! job that needs its GPU, or after idling) is a kill, and a crash takes down
 //! the model, not the studio.
 
+
+// A graphics card OAIY's own engine cannot reach, through tinygrad's LLM server (macOS only).
+pub(crate) mod egpu;
+
 use crate::config;
 use crate::util::{bool_or, int_or, num_or, random_id, str_or, LogRing};
 use oaiy_engine::json::Json;
@@ -154,7 +158,7 @@ pub fn default_model(llm: &Json) -> String {
 /// card's for nothing). Then nothing starts this engine ahead of time (at launch, after a change of settings, after
 /// media jobs); a request for a model of its own, or one the eGPU cannot answer, still does ([`Llm::ensure_ready`]).
 pub fn holds_a_model(llm: &Json) -> bool {
-    !crate::egpu::enabled(llm) || !crate::egpu::assigned(llm, &default_model(llm))
+    !crate::llm::egpu::enabled(llm) || !crate::llm::egpu::assigned(llm, &default_model(llm))
 }
 
 /// What the log says when [`holds_a_model`] is false and the engine is left stopped.
@@ -167,7 +171,7 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
 /// [`arguments`], with the model a request is waiting for (`first`) as the one the server loads as it starts.
 ///
 /// The server loads its first model at once and the others when they are asked for. That first one is `first` where
-/// it names an enabled model, else the default. A default that is set to run on the eGPU (macOS, `crate::egpu`) is
+/// it names an enabled model, else the default. A default that is set to run on the eGPU (macOS, `crate::llm::egpu`) is
 /// tinygrad's server's to hold, so the first model that is not is loaded here instead: a 24 GB Mac has no room to
 /// load a 27B beside the card for nothing.
 pub fn arguments_for(llm: &Json, root: &Path, port: u16, key: &str, local_images: bool, first: Option<&str>) -> Result<(Vec<String>, Vec<String>), String> {
@@ -183,7 +187,7 @@ pub fn arguments_for(llm: &Json, root: &Path, port: u16, key: &str, local_images
     }
     let default = str_or(llm, "default_model", "");
     let named = |name: &str| models.iter().position(|m| str_or(m, "name", "") == name);
-    let here = |i: &usize| !crate::egpu::assigned(llm, str_or(models[*i], "name", ""));
+    let here = |i: &usize| !crate::llm::egpu::assigned(llm, str_or(models[*i], "name", ""));
     let primary = first.and_then(named).or_else(|| named(default).filter(here)).or_else(|| (0..models.len()).find(here)).or_else(|| named(default)).unwrap_or(0);
     let mut ordered = vec![models[primary]];
     ordered.extend(models.iter().enumerate().filter(|(i, _)| *i != primary).map(|(_, m)| *m));

@@ -14,27 +14,26 @@
 
 #![forbid(unsafe_code)]
 
-mod admin;
 mod config;
 pub use config::AGENT_HTTP_ORIGIN;
-mod detect;
-mod discovery;
-mod egpu;
-/// What runs a Mac's eGPU when a plugin provides it ([`Studio::provide_egpu`]).
-pub use egpu::{available as egpu_available, Runtime as EgpuRuntime};
-mod gateway;
-mod llm;
-mod media;
-mod music;
-mod multipart;
-mod registry;
-mod model3d;
-mod picture;
-pub mod downloads;
-mod sound;
-mod speech;
 mod system;
 mod util;
+
+// The control port (its page, JSON API and playground) and the public API: the gateway's routes, the discovery
+// document, multipart bodies.
+mod admin;
+mod api;
+// Getting models: what a file is, the catalog and its downloads, adding a file to the configuration.
+mod models;
+pub use models::downloads;
+// The language model's server (and a Mac's eGPU through tinygrad).
+mod llm;
+/// What runs a Mac's eGPU when a plugin provides it ([`Studio::provide_egpu`]).
+pub use llm::egpu::{available as egpu_available, Runtime as EgpuRuntime};
+// The media worker and the jobs it takes: pictures, speech, music, sound effects, 3D models.
+mod media;
+use api::{discovery, gateway};
+use llm::egpu;
 
 use oaiy_engine::json::Json;
 use std::io::BufRead;

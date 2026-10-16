@@ -6,9 +6,9 @@
 //! cannot reach it) and, for anything but plain page loads, only from its own
 //! origin (another web page open in the same browser cannot drive it).
 
-use crate::gateway::{self, json_reply, Matched};
+use crate::api::gateway::{self, json_reply, Matched};
 use crate::util::{error_json, str_or};
-use crate::{config, registry, Studio};
+use crate::{config, models::registry, Studio};
 use oaiy_engine::http::{respond, Request};
 use oaiy_engine::json::Json;
 use std::io;
@@ -112,7 +112,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         ("GET", "/api/state") => Ok(studio.state()),
         ("GET", "/api/discovery") => {
             let base = studio.state().get("gateway_url").and_then(Json::as_str).unwrap_or("").to_string();
-            Ok(crate::discovery::document(studio, &base, true))
+            Ok(crate::api::discovery::document(studio, &base, true))
         }
         ("GET", "/api/config") => Ok(cfg.clone()),
         ("PUT" | "POST", "/api/config") => body(req).map_err(|e| (400, e)).and_then(|v| studio.set_config(v).map_err(|e| (400, e))),
@@ -192,7 +192,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         ("GET", "/api/browse") => crate::system::browse(req.query("path").as_deref()).map_err(|e| (400, e)),
         ("POST", "/api/detect") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let path = PathBuf::from(str_or(&b, "path", ""));
-            crate::detect::detect(&path).map(|d| d.to_json()).map_err(|e| (400, e))
+            crate::models::detect::detect(&path).map(|d| d.to_json()).map_err(|e| (400, e))
         }),
         ("POST", "/api/models/add") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let path = PathBuf::from(str_or(&b, "path", "").trim());
@@ -239,7 +239,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             // the model uses it.
             let name = str_or(&b, "model", "").to_string();
             let quant = str_or(&b, "quant", "q4_k").to_string();
-            let (request, out) = crate::music::quantize_request(&cfg, &studio.root, &name, &quant).map_err(|e| (400, e))?;
+            let (request, out) = crate::media::music::quantize_request(&cfg, &studio.root, &name, &quant).map_err(|e| (400, e))?;
             let job = studio.media.submit(crate::media::Kind::Music, request, name.clone(), format!("smaller copy ({quant})"), 1, 0.0, 200, None);
             let s = Arc::clone(studio);
             let id = job.id.clone();
@@ -250,8 +250,8 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
                     return;
                 }
                 let mut next = s.config();
-                let set_it = crate::registry::obj_mut(&mut next, &["media", "music", "models", &name]).map(|m| {
-                    crate::util::set(m, "language_model", crate::detect::path_json(&out));
+                let set_it = crate::models::registry::obj_mut(&mut next, &["media", "music", "models", &name]).map(|m| {
+                    crate::util::set(m, "language_model", crate::models::detect::path_json(&out));
                 });
                 if set_it.is_some() {
                     match s.set_config(next) {
@@ -331,8 +331,8 @@ fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String>
 /// `start` says so.
 fn egpu_start(studio: &Arc<Studio>, cfg: &Json, asked: Option<String>) -> Result<(), String> {
     let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
-    let again = studio.egpu.held().filter(|m| crate::egpu::assigned(&llm, m));
-    match asked.or(again).or_else(|| crate::egpu::models(&llm).into_iter().next()) {
+    let again = studio.egpu.held().filter(|m| crate::llm::egpu::assigned(&llm, m));
+    match asked.or(again).or_else(|| crate::llm::egpu::models(&llm).into_iter().next()) {
         Some(name) => studio.egpu.start(cfg, &studio.root, &name),
         None => Err("no model is set to run on the eGPU (Models), or it is switched off (Settings)".into()),
     }
@@ -341,7 +341,7 @@ fn egpu_start(studio: &Arc<Studio>, cfg: &Json, asked: Option<String>) -> Result
 /// Whether "the language model" is the eGPU's to hold: it is switched on and the default model is set to it
 /// ([`crate::llm::holds_a_model`] says this computer's engine then holds none).
 fn all_on_the_egpu(cfg: &Json) -> bool {
-    cfg.get("llm").is_some_and(|llm| !crate::llm::holds_a_model(llm) && !crate::egpu::models(llm).is_empty())
+    cfg.get("llm").is_some_and(|llm| !crate::llm::holds_a_model(llm) && !crate::llm::egpu::models(llm).is_empty())
 }
 
 /// The page's "Language model" card's Start. This computer's engine's, unless the default model is set to run on the
@@ -359,7 +359,7 @@ pub(crate) fn llm_start(studio: &Arc<Studio>, cfg: &Json) -> Result<(), String> 
     if studio.llm.state() == crate::llm::State::Failed {
         studio.llm.stop();
     }
-    let default = Some(crate::llm::default_model(&llm)).filter(|m| crate::egpu::assigned(&llm, m));
+    let default = Some(crate::llm::default_model(&llm)).filter(|m| crate::llm::egpu::assigned(&llm, m));
     egpu_start(studio, cfg, default)
 }
 
@@ -448,7 +448,7 @@ mod tests {
         remove_model(&mut cfg, "llm", "big").unwrap();
         // Sound effect and 3D models are removed the same way.
         for section in ["sound", "model3d"] {
-            let media = crate::registry::obj_mut(&mut cfg, &["media", section]).unwrap();
+            let media = crate::models::registry::obj_mut(&mut cfg, &["media", section]).unwrap();
             crate::util::set(media, "models", Json::parse(br#"{"m":{"path":"m"}}"#).unwrap());
             crate::util::set(media, "default_model", Json::str("m"));
             remove_model(&mut cfg, section, "m").unwrap();

@@ -18,4 +18,4 @@ crates/oaiy-crypto/src/** text eol=lf
 # carried to a Mac does not run there (its first line names an interpreter that ends in a carriage return).
 tools/mac/** text eol=lf
 tools/engine-smoke.sh text eol=lf
-crates/oaiy-studio/src/egpu_serve.py text eol=lf
+crates/oaiy-studio/src/llm/egpu_serve.py text eol=lf

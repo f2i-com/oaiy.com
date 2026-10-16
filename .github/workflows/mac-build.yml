@@ -77,7 +77,7 @@ jobs:
       - name: Build the portable language-model engine
         run: cargo build --release --locked -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
 
-      # The catalog's small language model (crates/oaiy-studio/src/catalog.json, qwen3.5-4b): the same family and
+      # The catalog's small language model (crates/oaiy-studio/src/models/catalog.json, qwen3.5-4b): the same family and
       # the same kind of file as the model the setup wizard recommends, so the same kernels.
       - name: Fetch the catalog's small language model
         run: curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/Qwen3.5-4B-Q4_K_M.gguf" https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf

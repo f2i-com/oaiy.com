@@ -343,7 +343,7 @@ pub fn browse(path: Option<&str>) -> Result<Json, String> {
             // A Python to run tinygrad with (`python3`, `python3.12`, `python.exe`: the eGPU's setting on a Mac).
             let python = name.to_ascii_lowercase().starts_with("python") && !name.to_ascii_lowercase().ends_with(".py");
             // NAF's and Real-ESRGAN's weights, the PyTorch files a model needs.
-            if shown || python || crate::detect::readable_pth(&name) {
+            if shown || python || crate::models::detect::readable_pth(&name) {
                 files.push((name.to_ascii_lowercase(), entry_json(&p, &name, false, meta.len())));
             }
         }

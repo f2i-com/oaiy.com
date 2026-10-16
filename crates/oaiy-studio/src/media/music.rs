@@ -168,7 +168,7 @@ pub fn quantize_request(cfg: &Json, root: &Path, name: &str, quant: &str) -> Res
 /// FFmpeg arguments turning a 44.1 kHz stereo WAV into `format`. PCM stays
 /// 44.1 kHz stereo (16-bit little-endian, interleaved).
 pub fn convert_args(format: &str, speed: f64) -> Vec<String> {
-    let mut args: Vec<String> = crate::speech::convert_args("wav", speed);
+    let mut args: Vec<String> = crate::media::speech::convert_args("wav", speed);
     args.truncate(args.len().saturating_sub(2));
     let codec: &[&str] = match format {
         "mp3" => &["-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3"],

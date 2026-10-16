@@ -4,7 +4,7 @@
 //! endpoint is enabled.
 
 use crate::config;
-use crate::detect::{self, Detected, Role};
+use crate::models::detect::{self, Detected, Role};
 use crate::util::{bool_or, set, str_or};
 use oaiy_engine::json::Json;
 use std::path::{Path, PathBuf};
@@ -1022,7 +1022,7 @@ mod tests {
             std::fs::create_dir_all(dir.join(part)).unwrap();
         }
         std::fs::write(dir.join("model_index.json"), r#"{"_class_name":"MossSoundEffectPipeline","dit_variant":"1.3B"}"#).unwrap();
-        let found = crate::detect::detect(&dir).unwrap();
+        let found = crate::models::detect::detect(&dir).unwrap();
         assert_eq!(found.kind(), "sound_model");
         let mut cfg = crate::config::default_json();
         if let Some(Json::Obj(g)) = obj_mut(&mut cfg, &["gateway"]) {
