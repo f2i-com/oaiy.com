@@ -239,16 +239,36 @@ impl MtpRows {
     }
 }
 
-/// Room in the prediction layer's cache for `needed` rows (its rows kept).
+/// Room in the prediction layer's cache for `needed` rows (its rows kept): a power of two to 4,096 rows, then
+/// [`mtp_cap`]'s steps of 4,096.
 fn mtp_reserve(chain: &dyn DeviceChain, g: &mut MtpKv, s: &Dims, needed: usize) {
     if g.cap >= needed {
         return;
     }
     let row = 2 * s.n_kv * s.hd;
-    let cap = needed.next_power_of_two().max(256);
+    let cap = mtp_cap(needed);
     g.layer = if g.cap == 0 { chain.vec(cap * row) } else { chain.resize(&g.layer, cap * row) };
     g.out = chain.vec(chain.attention_out_len(s.n_h, s.hd, cap));
     g.cap = cap;
+}
+
+/// The rows [`mtp_reserve`] grows the prediction layer's cache to for `needed`: past 4,096, as the main cache's halves
+/// grow ([`halves_cap`]), where a power of two had its f32 rows at 131,072 for a context of 65,536 (0.5 GB of a 24 GB
+/// card's room for the main cache, 0.25 of it never used).
+pub(super) fn mtp_cap(needed: usize) -> usize {
+    if needed <= 4096 { needed.next_power_of_two().max(256) } else { halves_cap(needed) }
+}
+
+/// The words the prediction layer's cache takes at its most for a context of `positions`: its rows, the rows it had
+/// before it last grew (a resize holds both), and its attention's output. None without the layer.
+pub(super) fn mtp_words(chain: &dyn DeviceChain, st: &State, positions: usize) -> usize {
+    if st.spec.is_none() {
+        return 0;
+    }
+    let s = st.dims;
+    let row = 2 * s.n_kv * s.hd;
+    let cap = mtp_cap(positions + SPEC_ROWS + 1);
+    cap * row + mtp_cap(cap.saturating_sub(4096).max(1)) * row + chain.attention_out_len(s.n_h, s.hd, cap)
 }
 
 /// The prediction layer's block on `rows` rows of `w.x` at positions `at..at + rows` (its RoPE table in `w.table`):

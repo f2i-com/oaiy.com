@@ -77,6 +77,11 @@ same submit as the rest of the step. Its weights are 21.3 GB on the GPU: a 24 GB
 cores (a Mac's) groups no more than 64 of a prompt's rows by expert at once, and a chained run takes its prompt in
 pieces of 64 there.
 
+On a Mac's eGPU its vision tower runs on the Mac's own GPU, which is idle while the card serves the model, and the
+card's room past the weights is the attention cache's: 69,632 positions on the RTX 4090 (`docs/MAC.md`, "How much
+context fits on the card"). The cache is f16 alone, 20 KB a position: a KV head's eight query heads of 256 are more
+than a step's attention kernel holds at once, so it takes them in two fours. A 49,019-token prompt is read in 13.1 s.
+
 RTX 4090 (eGPU), Q4_K_M with its projector: loaded in 2 minutes from an external SSD, all of it on the card; a reply at
 about 120 tokens a second; a question about the 800 x 1344 picture (seven tiles, 487 prompt tokens) read in 5.4 s,
 about the 1024 x 512 one (three tiles, 223 tokens) in 0.9 s. tinygrad's own `qwen35moe` (the eGPU plugin's server,

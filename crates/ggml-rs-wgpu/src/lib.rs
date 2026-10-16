@@ -369,6 +369,18 @@ impl WgpuBackend {
         Self::open(adapter, budget_bytes)
     }
 
+    /// The computer's own GPU, the one `new` picks where `OAIY_WEBGPU_ADAPTER` names none, whatever that names: a
+    /// Mac's Apple GPU beside the TinyGPU card its engine runs a model on (that model's vision tower kept there, off
+    /// the card's memory).
+    pub fn own(budget_bytes: Option<u64>) -> Result<Self, String> {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::PRIMARY;
+        let instance = wgpu::Instance::new(desc.with_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }))
+            .map_err(|e| format!("no WebGPU adapter: {e}"))?;
+        Self::open(adapter, budget_bytes)
+    }
+
     /// The computer's `index`-th GPU (0 the first) as a CUDA device index counts them: the discrete ones on the API
     /// `new` picks, in their order on the PCI bus (nvidia-smi's, and CUDA's of cards alike), else every adapter on it;
     /// `OAIY_WEBGPU_ADAPTER`, where set, naming one instead (as for `new`). A worker told which GPU to use (an image

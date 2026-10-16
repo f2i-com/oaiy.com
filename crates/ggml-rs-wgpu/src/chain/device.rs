@@ -118,7 +118,9 @@ impl DeviceChain for WgpuBackend {
         let g = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
         !*F32.get_or_init(|| std::env::var_os("OAIY_ATTENTION_F32").is_some() || std::env::var_os("OAIY_ATTENTION_PART4").is_some())
             && self.gpu.device.features().contains(wgpu::Features::SHADER_F16)
-            && attention_group_for(g, head_dim, self.gpu.limits.max_compute_workgroup_storage_size)
+            // (a KV head's query heads in whole shares where all of them are more than a workgroup holds: the 35B
+            // MiniCPM-V's 8 of 256 in two fours)
+            && attention_group_of(g, head_dim, self.gpu.limits.max_compute_workgroup_storage_size, 0).is_some()
     }
 
     fn vec(&self, len: usize) -> DeviceVec {

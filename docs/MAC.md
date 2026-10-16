@@ -569,7 +569,8 @@ server, which reads text alone, leaves such a request to this Mac's engine.
 newest 32,768 positions of its cache on the card and the rest in this Mac's memory
 (FLASHNEXT.md), so its context is the setting's. The dense 27B reads every position of its
 cache at every token, so its cache stays on the card: held as f16 alone (no f32 copy beside
-it, on a card with tensor cores and with no drafting layer), it takes 64 KB a position, and
+it, on a card with tensor cores; a model that drafts keeps its drafting layer's own small cache
+as f32), it takes 64 KB a position, and
 77,824 positions fit beside the 27B's 15.8 GB of weights on a 24 GB card with room for a
 prompt's work (about 40,000 as f32). Read from this Mac's memory instead, the cache would cost each token about 0.35 s at
 128,000 positions (the CPU's 50 GB/s against the card's 1 TB/s), a tenth of the card's speed.
@@ -577,7 +578,11 @@ When the engine loads a model on the card it finds what the card has room for by
 (a prompt's working memory first, then the cache 4,096 positions at a time until the card
 refuses; a few seconds of the load), and where the context it was given does not fit it opens
 the model with what does (its log: "the GPU holds its attention cache for 77824 positions
-beside its weights and a prompt's work: its context here is 77824, not 200000"). The card's
+beside its weights and a prompt's work: its context here is 77824, not 200000"). MiniCPM-V
+4.7 35B-A3B, 21.3 GB of weights, holds 69,632 positions at 20 KB each, its vision tower run
+on this Mac's own GPU (the log: "its tower on Apple M5 Pro, off the card"): on the card the
+tower's 1.1 GB was as much as 56,000 positions, and beside it the card held 20,480
+(`OAIY_VISION_ON_CARD=1` keeps it there). The card's
 server logs the refusal that ends the asking. A longer prompt is then
 refused at once as one past any context is (`context_length_exceeded`, "… maximum context
 length is 77824 tokens here"), and the Agent compacts the conversation and asks again, where

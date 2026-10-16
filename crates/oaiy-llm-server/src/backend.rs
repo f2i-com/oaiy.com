@@ -91,6 +91,28 @@ pub(crate) fn others(o: &Options, devices: &[usize], first: &ggml_rs_wgpu::WgpuB
     }
 }
 
+/// The GPU a model's vision tower runs on: the model's own (`model`), but where that is the TinyGPU card on a Mac, the
+/// Mac's own GPU, idle while the card serves the model, its memory the computer's: the card's room is then the
+/// conversation's attention cache's (the 35B MiniCPM-V's tower is 1.1 GB, as much as 56,000 of its positions; beside
+/// it the card held 20,480). With what the log says of it. `OAIY_VISION_ON_CARD`: the card's, as before.
+pub(crate) fn for_vision(model: &Arc<dyn ggml_rs::Backend>) -> (Arc<dyn ggml_rs::Backend>, Option<String>) {
+    #[cfg(all(feature = "webgpu", target_os = "macos"))]
+    {
+        let on_card = std::env::var("OAIY_WEBGPU_ADAPTER").is_ok_and(|a| a.trim().to_lowercase().starts_with("tinygpu"));
+        if on_card && std::env::var_os("OAIY_VISION_ON_CARD").is_none() {
+            // (a budget past any tower's weights: Qwen3-VL's and MiniCPM-V's are near 1 GB of f16)
+            match ggml_rs_wgpu::WgpuBackend::own(Some(4 << 30)) {
+                Ok(b) => {
+                    let name = b.adapter().name.clone();
+                    return (Arc::new(b), Some(format!("its tower on {name}, off the card")));
+                }
+                Err(e) => return (Arc::clone(model), Some(format!("its tower on the card ({e})"))),
+            }
+        }
+    }
+    (Arc::clone(model), None)
+}
+
 pub(crate) fn open(o: &Options, devices: &[usize]) -> Result<Picked> {
     // (the devices name GPUs: a build without WebGPU has none to name)
     #[cfg(not(feature = "webgpu"))]

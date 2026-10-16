@@ -218,11 +218,12 @@ fn qsas_attention_by_groups_is_the_heads() {
 
 /// A step's attention over its cache's f16 halves gives what the f32 cache gives, to f16's rounding: the halves
 /// made in two goes (rows added since the first), groups of 2, 3, 4 (Qwen3.5 9B's) and 6, heads 64, 128 and 256 wide
-/// (where subgroups are 32 lanes, a key read by a subgroup's lanes together).
+/// (where subgroups are 32 lanes, a key read by a subgroup's lanes together), and groups more than a workgroup holds
+/// at once, in shares: 8 of 256 (the 35B MiniCPM-V's, two fours) and 12 of 128 (three fours).
 #[test]
 fn a_steps_attention_over_halves_is_the_f32_caches() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111), (16, 4, 256, 0, 5000), (8, 2, 128, 37, 300)] {
+    for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111), (16, 4, 256, 0, 5000), (8, 2, 128, 37, 300), (16, 2, 256, 0, 4100), (24, 2, 128, 9, 777)] {
         if !b.attention_halves(n_h, n_kv, hd) {
             return;
         }
@@ -732,18 +733,18 @@ fn what_is_kept_for_the_next_run_is_let_go_where_a_buffer_is_refused() {
 /// A cache held as f16 halves alone (the 27B's on a card with tensor cores): rows stored as halves are the halves of
 /// the f32 rows (`halve`'s, bit for bit), and a prompt's attention over them on the tensor cores is the f32 cache's,
 /// whose rows the tensor cores read as the same f16 values (bit for bit); with fewer rows than the tensor cores take,
-/// it declines and records nothing. The 27B's heads (24 of 256 on 4: the one-pass kernels) and Qwen3.5 9B's (16 on 4:
-/// the grouped one).
+/// it declines and records nothing. The 27B's heads (24 of 256 on 4: the one-pass kernels), Qwen3.5 9B's (16 on 4:
+/// the grouped one) and the 35B MiniCPM-V's (16 on 2: the grouped one, its 8 a KV head as two of 4).
 #[test]
 fn a_cache_held_as_halves_alone_is_stored_and_attended_as_the_f32_one() {
-    for n_h in [24usize, 16] {
-        halves_alone_case(n_h);
+    for (n_h, n_kv) in [(24usize, 4usize), (16, 4), (16, 2)] {
+        halves_alone_case(n_h, n_kv);
     }
 }
 
-fn halves_alone_case(n_h: usize) {
+fn halves_alone_case(n_h: usize, n_kv: usize) {
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
-    let (n_kv, hd) = (4usize, 256usize);
+    let hd = 256usize;
     if !DeviceChain::attention_halves(&b, n_h, n_kv, hd) {
         return;
     }

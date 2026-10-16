@@ -1249,11 +1249,14 @@ impl Models {
             // refusing what it has no room for (tinygrad's), the context is what the chain's cache has room for there
             // beside a prompt's work: a longer prompt is then refused as one past any context is, where it failed
             // halfway through for want of room (and OAIY answered it with the Mac's copy of the model).
-            // (its vision tower first, where it has one: on the card it is 0.9 GB of the room the cache is measured in)
+            // (its vision tower first, where it has one: on the card it is 1.1 GB of the room the cache is measured in,
+            // so a Mac runs it on its own GPU: `backend::for_vision`)
             let projector = if o.vision {
                 o.vision_projectors.get(&spec.name).map(|p| {
                     let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(e.to_string()))?;
-                    let mut mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+                    let (tower, said) = crate::backend::for_vision(&backend);
+                    if let Some(said) = said { self.say(format!("{}: {said}", spec.name)); }
+                    let mut mm = llama_rs::MmProj::from_gguf(&file, tower).map_err(|e| Error::Arg(e.to_string()))?;
                     let width = model.config().embedding_dim;
                     // (Qwen3-VL's tower, or MiniCPM-V 4.7's: a Qwen3.5 model of its own)
                     if !matches!(&mm, llama_rs::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == width)

@@ -163,7 +163,7 @@ fn lfm2s_engine_is_transformers() {
         let ids: Vec<u32> = case.get("ids").unwrap().as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as u32).collect();
         let cfg = &m.config;
         let mut kv = llama_rs::KvCache::new(&*backend, cfg.n_layers, ids.len() + 16, cfg.n_kv_heads, cfg.head_dim);
-        let mut row = |tokens: &[u32], kv: &mut llama_rs::KvCache| m.forward_embeds_host(&m.embed_text(tokens), tokens.len(), kv, None).unwrap().to_host().data().to_vec();
+        let row = |tokens: &[u32], kv: &mut llama_rs::KvCache| m.forward_embeds_host(&m.embed_text(tokens), tokens.len(), kv, None).unwrap().to_host().data().to_vec();
         let got = row(&ids, &mut kv);
         let want = floats(case.get("logits").unwrap());
         let c = cosine(&got, &want);

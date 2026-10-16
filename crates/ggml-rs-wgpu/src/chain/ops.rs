@@ -1031,7 +1031,8 @@ impl ChainRecorder for Recorder<'_> {
             ["chain-attention-lanes-8-64", "chain-attention-lanes-8-128", "chain-attention-lanes-8-256"],
         ];
         static LANES_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let g = n_h / n_kv;
+        // a KV head's query heads at once, or in whole shares (`attention_halves`: one there is), a workgroup a share
+        let g = attention_group_of(n_h / n_kv, head_dim, self.gpu().limits.max_compute_workgroup_storage_size, 0).expect("a share of the heads");
         let lanes = self.gpu().subgroups32() && *LANES_ON.get_or_init(|| std::env::var("OAIY_ATTENTION_LANES").map_or(true, |v| v != "0"));
         let part = if lanes {
             let at = match head_dim { 64 => 0, 128 => 1, _ => 2 };
@@ -1039,7 +1040,7 @@ impl ChainRecorder for Recorder<'_> {
         } else {
             self.gpu().named_pipeline(NAMES[g], || attention_part_group_halved(g))
         };
-        self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
+        self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, ((n_h / g) as u32, runs as u32, 1));
         let join = self.named("chain-attention-join", ATTENTION_JOIN);
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
     }

@@ -668,7 +668,8 @@ struct State {
     /// A tapped run's later rows' vectors, made at the first run that keeps a state from inside.
     seg: std::sync::OnceLock<Seg>,
     /// The attention cache held as f16 halves alone, with no f32 copy (`DeviceChain::halves_only`: a card with tensor
-    /// cores, and no drafting layer, whose cache is f32): [`reserve_halves`]. The 27B's cache at 32,768 positions was
+    /// cores, and not a drafting model whose prompts a second device shares, whose copies are f32; a drafting layer's
+    /// own cache is f32 still): [`reserve_halves`]. The 27B's cache at 32,768 positions was
     /// 4.3 GB of f32 and 2.1 of halves beside it on a 24 GB card with 15.8 GB of weights; as halves alone the card holds
     /// 77,824 positions beside a prompt's work ([`Qwen35Chain::context_room`]), and a step's attention read the halves
     /// already.
@@ -985,6 +986,7 @@ fn beside_words(chain: &dyn DeviceChain, st: &State, cap: usize) -> usize {
     let s = st.dims;
     let (state, conv) = (s.nv * s.dv * s.dk, (s.kern - 1) * s.ch);
     chain.attention_out_len(s.n_h, s.hd, cap) + Work::words(&s, 2 * MAX_ROWS) + 2 * scratch_words(chain, &s, cap) + 3 * st.ssm_layers.len() * (state + conv) + TAP_ROWS * 2 * (s.ch + s.nv * s.dv + s.nv) + SPARE.iter().sum::<usize>()
+        + drafts::mtp_words(chain, st, cap)
 }
 
 /// `make`, or None where the device refused one of its vectors for want of room (its panic [`ggml_rs::chain::no_room`]
@@ -1472,6 +1474,8 @@ impl Qwen35Chain {
         let row = 2 * s.n_kv * s.hd;
         let slots = st.attention_layers.len();
         drop_cache(chain, &mut st.kv.lock().unwrap_or_else(|p| p.into_inner()));
+        // (the warm-up's pooled prompt set too: `beside` makes one, which a run takes from the pool)
+        st.prompt_sets.lock().unwrap_or_else(|p| p.into_inner()).clear();
         chain.let_go_of_spare();
         // (a layer's words a position, and the rows a cache of `positions` is made with: `reserve_halves`', `reserve`'s)
         let words = if st.halves_only { row / 2 } else { row };
@@ -1486,7 +1490,8 @@ impl Qwen35Chain {
             let kept: Vec<DeviceVec> = (0..3).flat_map(|_| st.ssm_layers.iter().flat_map(|_| [chain.vec(state), chain.vec(conv)])).collect();
             let seg = Seg::new(chain, &s);
             let spare: Vec<DeviceVec> = SPARE.iter().map(|&n| chain.vec(n)).collect();
-            (out, set, scratch, kept, seg, spare)
+            let drafts = (st.spec.is_some()).then(|| chain.vec(drafts::mtp_words(chain, st, cap)));
+            (out, set, scratch, kept, seg, spare, drafts)
         };
         let beside_words = |cap: usize| beside_words(chain, st, cap);
         // The cache's room, measured: as many words as those in vectors of 128 MB or more (which no adapter keeps to
@@ -1731,7 +1736,9 @@ impl Qwen35Chain {
                         scratch_core: v(r * nv * dv),
                     })
                 });
-                let halves_only = spec.is_none() && chain.halves_only(dims.n_h, dims.n_kv, dims.hd);
+                // (a drafting model's too: the 35B MiniCPM-V's cache as f32 and halves was 60 KB a position, and a 24 GB
+                // card beside its 21.3 GB of weights and its tower held 8,192 of them)
+                let halves_only = (spec.is_none() || self.second.get().is_none()) && chain.halves_only(dims.n_h, dims.n_kv, dims.hd);
                 let kv = Arc::new(Mutex::new(Kv::new(chain.vec(1))));
                 let slots = (0..m.blocks.len()).map(|l| attention_layers.iter().position(|&a| a == l)).collect();
                 let rows = Arc::new(ChainRows { kv: Arc::clone(&kv), backend: Arc::clone(&m.backend), slots, n_kv: dims.n_kv, hd: dims.hd, halves_only });
