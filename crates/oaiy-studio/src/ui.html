@@ -1792,9 +1792,9 @@ function renderHardware() {
   const hw = $("#hw"), rows = [];
   const ram = sys?.ram;
   for (const g of sys?.gpus || []) {
-    // What a GPU's memory holds is known of an NVIDIA card (nvidia-smi) and of a Mac's (its driver's: the memory it has
-    // in use, of the computer's it shares); of the others only the size is known, and a Mac's that did not say is as
-    // full as the RAM is.
+    // What a GPU's memory holds is known of an NVIDIA card (nvidia-smi), of a Mac's (its driver's: the memory it has in
+    // use, of the computer's it shares), of an AMD card's (Linux's amdgpu, Windows' graphics kernel) and of any card's
+    // own memory on Windows; of the others only the size is known, and a Mac's that did not say is as full as the RAM is.
     const known = g.memory_used_mb != null && g.memory_total_mb, shared = g.unified && ram?.total_mb;
     const pct = known ? g.memory_used_mb / g.memory_total_mb * 100 : shared ? (ram.total_mb - ram.available_mb) / ram.total_mb * 100 : 0;
     const roles = [];
@@ -1812,7 +1812,9 @@ function renderHardware() {
       continue;
     }
     const size = g.unified ? `Shares the computer's ${g.memory_total_mb ? gb(g.memory_total_mb) + " GB" : "memory"}` : known ? `${gb(g.memory_used_mb)} / ${gb(g.memory_total_mb)} GB` : g.memory_total_mb ? `${gb(g.memory_total_mb)} GB` : "";
-    const busy = does || (g.utilization != null ? g.utilization + "% busy" : "");
+    // (a temperature where its driver says one, as nouveau's and Intel's on Linux do with nothing else)
+    const hot = g.temperature == null ? "" : `<span title="Temperature"${g.temperature >= 90 ? ' style="color:var(--bad)"' : ""}>${g.temperature} °C</span>`;
+    const busy = [does || (g.utilization != null ? g.utilization + "% busy" : ""), hot].filter(Boolean).join(" · ");
     rows.push(`<div class="hw-row"><div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>
       <div class="meter"${known || shared ? ` title="${pct.toFixed(0)}% used"` : ""}><div style="width:${pct}%;background:var(--gpu)"></div></div>
       <div class="num small">${[size, busy && `<span class="muted">${busy}</span>`].filter(Boolean).join("<br>")}</div></div>`);

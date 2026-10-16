@@ -3130,11 +3130,14 @@ name = "oaiy-engine"
 version = "0.7.0"
 
 [[package]]
-name = "oaiy-host-env"
+name = "oaiy-gpu-stats"
 version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
-name = "oaiy-mac-gpu"
+name = "oaiy-host-env"
 version = "0.1.0"
 
 [[package]]
@@ -3142,8 +3145,8 @@ name = "oaiy-studio"
 version = "0.1.0"
 dependencies = [
  "oaiy-engine",
+ "oaiy-gpu-stats",
  "oaiy-host-env",
- "oaiy-mac-gpu",
 ]
 
 [[package]]

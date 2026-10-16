@@ -1495,6 +1495,13 @@ name = "oaiy-engine"
 version = "0.7.0"
 
 [[package]]
+name = "oaiy-gpu-stats"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
 name = "oaiy-host-env"
 version = "0.1.0"
 
@@ -1544,10 +1551,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oaiy-mac-gpu"
-version = "0.1.0"
-
-[[package]]
 name = "oaiy-media"
 version = "0.1.0"
 dependencies = [
@@ -1586,8 +1589,8 @@ name = "oaiy-studio"
 version = "0.1.0"
 dependencies = [
  "oaiy-engine",
+ "oaiy-gpu-stats",
  "oaiy-host-env",
- "oaiy-mac-gpu",
 ]
 
 [[package]]

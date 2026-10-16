@@ -60,11 +60,13 @@ notification-area icon. Win32 UI is outside std, so this crate depends on
 `windows-sys` (bindings only). Its `unsafe` is confined to `src/tray.rs`, and
 every block there carries a `SAFETY:` comment.
 
-`oaiy-mac-gpu` reads an Apple-silicon Mac's GPU load, memory in use and
-temperature for `oaiy-studio`'s hardware rows: macOS says them only through IOKit
-and CoreFoundation (the IORegistry and the SMC), C calls the studio may not make.
-It is std-only (the frameworks are the system's), its `unsafe` is those calls, and
-every block carries a `SAFETY:` comment; elsewhere it knows nothing.
+`oaiy-gpu-stats` reads each GPU's load, memory in use and temperature for
+`oaiy-studio`'s hardware rows, from what the system itself says: macOS through
+IOKit and CoreFoundation (the IORegistry and the SMC), Windows through the
+graphics kernel's statistics in gdi32 (D3DKMT, bound by `windows-sys`), and Linux
+through sysfs files. The macOS and Windows calls are C calls the studio may not
+make: they are this crate's `unsafe`, and every block carries a `SAFETY:` comment.
+Its only dependency is `windows-sys`, on Windows (bindings only).
 
 ## Diffusion compute boundary
 

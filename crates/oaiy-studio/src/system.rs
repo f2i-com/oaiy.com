@@ -1,8 +1,8 @@
 //! What the machine has: GPUs (through `nvidia-smi`; without an NVIDIA driver,
 //! the display adapters the OS knows, AMD and Intel among them, and an
-//! Apple-silicon Mac's own, whose memory is the computer's, with its load,
-//! memory in use and temperature), RAM, and a directory listing for the UI's
-//! file picker.
+//! Apple-silicon Mac's own, whose memory is the computer's, each with its load,
+//! memory in use and temperature where the OS says them: `oaiy_gpu_stats`), RAM,
+//! and a directory listing for the UI's file picker.
 
 use oaiy_engine::json::Json;
 use std::path::{Path, PathBuf};
@@ -50,10 +50,11 @@ impl System {
     /// `[{index, name, memory_used_mb, memory_total_mb, utilization, temperature}]`
     /// from `nvidia-smi`. Without an NVIDIA driver, the display adapters the OS
     /// knows (an AMD or Intel GPU, which the engine runs on through WebGPU), with
-    /// their `vendor` and total memory only: `index` is then their place in that
-    /// list, not nvidia-smi's. A Mac's GPU also says `unified`: its memory is the
-    /// computer's; its load, the memory it has in use and its temperature are read
-    /// as it is now (`oaiy_mac_gpu`). Empty when neither says.
+    /// their `vendor`, `pci` ids and total memory: `index` is then their place in
+    /// that list, not nvidia-smi's. Each one's load, the memory it has in use and
+    /// its temperature are read as it is now, where the OS says them
+    /// (`oaiy_gpu_stats`: macOS, Linux and Windows). A Mac's GPU also says
+    /// `unified`: its memory is the computer's. Empty when neither says.
     pub fn gpus(&self) -> Json {
         Self::cached(&self.gpus, GPU_TTL, || {
             let out = quiet("nvidia-smi")
@@ -65,13 +66,8 @@ impl System {
             }
             // Adapters do not come and go: asked once.
             static OTHERS: std::sync::OnceLock<Vec<Json>> = std::sync::OnceLock::new();
-            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
             let mut gpus = OTHERS.get_or_init(other_gpus).clone();
-            #[cfg(target_os = "macos")]
-            for g in gpus.iter_mut().filter(|g| g.get("vendor").and_then(Json::as_str) == Some("apple")) {
-                let gpu = oaiy_mac_gpu::now();
-                now(g, gpu.load, gpu.memory_in_use, gpu.temperature);
-            }
+            fill(&mut gpus, &oaiy_gpu_stats::now());
             Json::Arr(gpus)
         })
     }
@@ -102,12 +98,14 @@ fn parse_gpu(line: &str) -> Option<Json> {
     ]))
 }
 
-/// A display adapter the OS knows, in the shape `nvidia-smi`'s give.
-fn adapter(index: usize, name: &str, vendor: &str, total_mb: Option<u64>) -> Json {
+/// A display adapter the OS knows, in the shape `nvidia-smi`'s give, with its PCI vendor and device ids
+/// (`"1002:744c"`; null for an Apple-silicon Mac's GPU, which is on no PCI bus).
+fn adapter(index: usize, name: &str, vendor: &str, pci: Option<(u32, u32)>, total_mb: Option<u64>) -> Json {
     Json::obj([
         ("index", Json::Int(index as i64)),
         ("name", Json::str(name)),
         ("vendor", Json::str(vendor)),
+        ("pci", pci.map_or(Json::Null, |(v, d)| Json::str(format!("{v:04x}:{d:04x}")))),
         ("memory_used_mb", Json::Null),
         ("memory_total_mb", total_mb.map_or(Json::Null, |m| Json::Int(m as i64))),
         ("utilization", Json::Null),
@@ -138,8 +136,10 @@ fn parse_windows_adapters(text: &str) -> Vec<Json> {
         if bytes == 0 || name.trim().is_empty() || name.starts_with("Microsoft") {
             continue;
         }
-        let vendor = id.to_ascii_lowercase().split("ven_").nth(1).map(|v| vendor_of(&v[..v.len().min(4)])).unwrap_or("other");
-        out.push(adapter(out.len(), name.trim(), vendor, Some(bytes / (1024 * 1024))));
+        let id = id.to_ascii_lowercase();
+        let field = |key: &str| id.split(key).nth(1).and_then(|v| v.get(..4)).and_then(|v| u32::from_str_radix(v, 16).ok());
+        let vendor = id.split("ven_").nth(1).map(|v| vendor_of(&v[..v.len().min(4)])).unwrap_or("other");
+        out.push(adapter(out.len(), name.trim(), vendor, field("ven_").zip(field("dev_")), Some(bytes / (1024 * 1024))));
     }
     out
 }
@@ -164,7 +164,10 @@ fn other_gpus() -> Vec<Json> {
     let mut out = Vec::new();
     for card in cards {
         let read = |f: &str| std::fs::read_to_string(card.join("device").join(f)).ok().map(|s| s.trim().to_string());
-        let Some(vendor) = read("vendor").map(|v| vendor_of(&v)) else { continue };
+        let Some(vendor_id) = read("vendor") else { continue };
+        let vendor = vendor_of(&vendor_id);
+        let hex = |v: String| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok();
+        let pci = hex(vendor_id).zip(read("device").and_then(hex));
         let total = read("mem_info_vram_total").and_then(|v| v.parse::<u64>().ok()).filter(|b| *b > 0).map(|b| b / (1024 * 1024));
         let name = read("product_name").filter(|n| !n.is_empty()).unwrap_or_else(|| match vendor {
             "amd" => "AMD GPU".to_string(),
@@ -172,7 +175,7 @@ fn other_gpus() -> Vec<Json> {
             "nvidia" => "NVIDIA GPU".to_string(),
             _ => "GPU".to_string(),
         });
-        out.push(adapter(out.len(), &name, vendor, total));
+        out.push(adapter(out.len(), &name, vendor, pci, total));
     }
     out
 }
@@ -186,7 +189,7 @@ fn apple_gpu(chip: &str, total_mb: Option<u64>) -> Json {
         "" => "Apple GPU",
         chip => chip,
     };
-    match adapter(0, name, "apple", total_mb) {
+    match adapter(0, name, "apple", None, total_mb) {
         Json::Obj(mut fields) => {
             fields.push(("unified".into(), Json::Bool(true)));
             Json::Obj(fields)
@@ -197,7 +200,30 @@ fn apple_gpu(chip: &str, total_mb: Option<u64>) -> Json {
 
 /// `g` (an adapter's) with what it is doing now, where that was read: its load (percent), the bytes of memory it has
 /// in use and its temperature (°C).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// Each adapter's readings now: those of the GPU with its PCI ids (the nth of those ids for the nth such adapter: two
+/// cards alike), an Apple-silicon Mac's own GPU's for its `apple` one. An adapter no reading is for keeps its nulls.
+fn fill(gpus: &mut [Json], readings: &[oaiy_gpu_stats::Gpu]) {
+    let mut taken = vec![false; readings.len()];
+    for g in gpus.iter_mut() {
+        let pci = g.get("pci").and_then(Json::as_str).and_then(|p| {
+            let (v, d) = p.split_once(':')?;
+            Some((u32::from_str_radix(v, 16).ok()?, u32::from_str_radix(d, 16).ok()?))
+        });
+        let apple = g.get("vendor").and_then(Json::as_str) == Some("apple");
+        let found = readings.iter().enumerate().position(|(i, r)| {
+            !taken[i]
+                && match pci {
+                    Some((v, d)) => r.vendor_id == Some(v) && r.device_id == Some(d),
+                    None => apple && r.vendor_id.is_none(),
+                }
+        });
+        if let Some(i) = found {
+            taken[i] = true;
+            now(g, readings[i].load, readings[i].memory_in_use, readings[i].temperature);
+        }
+    }
+}
+
 fn now(g: &mut Json, load: Option<i64>, in_use: Option<i64>, temperature: Option<f64>) {
     let Json::Obj(fields) = g else { return };
     let said = [
@@ -401,6 +427,8 @@ mod tests {
         );
         // What nvidia-smi gives and these leave unknown.
         assert_eq!(gpus[0].get("utilization"), Some(&Json::Null));
+        let pci: Vec<Option<&str>> = gpus.iter().map(|g| g.get("pci").and_then(Json::as_str)).collect();
+        assert_eq!(pci, vec![Some("1002:13c0"), Some("10de:2b85"), Some("8086:56a0")]);
         assert!(parse_windows_adapters("").is_empty());
         assert_eq!(vendor_of("0x1002"), "amd");
         assert_eq!(vendor_of("0x8086"), "intel");
@@ -421,7 +449,8 @@ mod tests {
         assert_eq!(unknown.get("name").and_then(Json::as_str), Some("Apple GPU"));
         assert_eq!(unknown.get("memory_total_mb"), Some(&Json::Null));
         // the others say nothing of it
-        assert_eq!(adapter(0, "AMD Radeon(TM) Graphics", "amd", Some(2048)).get("unified"), None);
+        assert_eq!(adapter(0, "AMD Radeon(TM) Graphics", "amd", Some((0x1002, 0x13c0)), Some(2048)).get("unified"), None);
+        assert_eq!(g.get("pci"), Some(&Json::Null));
     }
 
     /// What the GPU is doing now goes into its entry where it was read (a Mac's: `oaiy_mac_gpu`), and what was not
@@ -442,6 +471,39 @@ mod tests {
         let mut quiet = apple_gpu("Apple M5 Pro", Some(24576));
         now(&mut quiet, None, None, None);
         assert_eq!((quiet.get("utilization"), quiet.get("temperature")), (Some(&Json::Null), Some(&Json::Null)));
+    }
+
+    /// Each display adapter gets the readings of the GPU with its PCI ids (`oaiy_gpu_stats`, on Windows and Linux; two
+    /// cards alike, the first's to the first), an Apple-silicon Mac's GPU those of the one with none; an adapter with
+    /// no reading keeps its nulls.
+    #[test]
+    fn each_adapter_gets_its_own_gpus_readings() {
+        use oaiy_gpu_stats::Gpu;
+        let said = |g: &Json| {
+            let int = |k: &str| g.get(k).and_then(Json::as_i64);
+            (int("utilization"), int("memory_used_mb"), int("temperature"))
+        };
+        let mut gpus = vec![
+            adapter(0, "AMD Radeon RX 7900 XTX", "amd", Some((0x1002, 0x744c)), Some(24560)),
+            adapter(1, "AMD Radeon RX 7900 XTX", "amd", Some((0x1002, 0x744c)), Some(24560)),
+            adapter(2, "Intel(R) Arc(TM) A770 Graphics", "intel", Some((0x8086, 0x56a0)), Some(16288)),
+            adapter(3, "Some GPU", "other", None, None),
+        ];
+        let readings = [
+            Gpu { vendor_id: Some(0x8086), device_id: Some(0x56a0), load: None, memory_in_use: Some(1 << 30), temperature: Some(48.0) },
+            Gpu { vendor_id: Some(0x1002), device_id: Some(0x744c), load: Some(97), memory_in_use: Some(20 << 30), temperature: Some(71.4) },
+            Gpu { vendor_id: Some(0x1002), device_id: Some(0x744c), load: Some(3), memory_in_use: Some(512 << 20), temperature: Some(40.0) },
+            Gpu { vendor_id: None, device_id: None, load: Some(50), memory_in_use: None, temperature: Some(60.0) },
+        ];
+        fill(&mut gpus, &readings);
+        let got: Vec<_> = gpus.iter().map(said).collect();
+        assert_eq!(got, vec![(Some(97), Some(20480), Some(71)), (Some(3), Some(512), Some(40)), (None, Some(1024), Some(48)), (None, None, None)]);
+        // an Apple-silicon Mac's GPU: the reading with no PCI ids
+        let mut mac = vec![apple_gpu("Apple M5 Pro", Some(49152))];
+        fill(&mut mac, &readings[3..]);
+        assert_eq!(said(&mac[0]), (Some(50), None, Some(60)));
+        fill(&mut mac, &[]);
+        assert_eq!(said(&mac[0]), (Some(50), None, Some(60)), "nothing read: as it was");
     }
 
     #[test]

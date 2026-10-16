@@ -1,0 +1,15 @@
+[package]
+name = "oaiy-gpu-stats"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "What a computer's GPUs are doing now (load, memory in use, temperature), from what macOS, Linux and Windows themselves say"
+
+[lib]
+path = "src/lib.rs"
+
+# `oaiy-studio` forbids `unsafe` (CONVENTIONS.md): macOS says these only through IOKit and CoreFoundation (the system's
+# frameworks: std-only there), and Windows through the graphics kernel's calls in gdi32, which windows-sys binds (no
+# runtime); Linux's are files. The calls are all this crate is.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Wdk_Graphics_Direct3D"] }
