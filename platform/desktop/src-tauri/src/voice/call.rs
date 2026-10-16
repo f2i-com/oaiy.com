@@ -231,6 +231,13 @@ enum Speak {
 /// How long after an item's audio should have played Aokie is sure to be done with it.
 const PLAYOUT_MARGIN: Duration = Duration::from_millis(250);
 
+/// The sound an item's first sentence holds before any of it is sent: 240 ms (or the sentence, where it is shorter).
+/// Aokie plays what it is given as it comes, so each piece played as soon as it was made, and a moment's slowness in
+/// the speech engine (the call's own speech-to-text beside it on the computer) was a gap in the call; from this
+/// cushion the speaker plays on while the engine, faster than real time, gets further ahead. The later sentences of
+/// an item follow while its sound still plays, so they hold nothing.
+const PREROLL_SAMPLES: usize = WIRE_RATE as usize * 240 / 1000;
+
 /// How long the transcriber waits for a cut it asked Aokie for.
 const CUT_WAIT: Duration = Duration::from_millis(500);
 
@@ -816,11 +823,34 @@ where
                 let mut cut = false;
                 // When the caller starts to hear this sentence: after what went before it in the item.
                 let mut heard_from: Option<Instant> = None;
-                while let Some(samples) = pcm_rx.recv().await {
-                    if job.epoch != epoch.load(Ordering::SeqCst) {
-                        cut = true;
-                        break;
-                    }
+                // (an item's first sound held until it has its cushion: `PREROLL_SAMPLES`)
+                let mut held: Vec<i16> = Vec::new();
+                let mut holding = item.first_pcm.is_none();
+                loop {
+                    let samples = match pcm_rx.recv().await {
+                        Some(samples) => {
+                            if job.epoch != epoch.load(Ordering::SeqCst) {
+                                cut = true;
+                                break;
+                            }
+                            if holding {
+                                held.extend_from_slice(&samples);
+                                if held.len() < PREROLL_SAMPLES {
+                                    continue;
+                                }
+                                holding = false;
+                                std::mem::take(&mut held)
+                            } else {
+                                samples
+                            }
+                        }
+                        // the sentence's end: what it held
+                        None if !held.is_empty() => {
+                            holding = false;
+                            std::mem::take(&mut held)
+                        }
+                        None => break,
+                    };
                     // At most a second per frame (Aokie takes up to two).
                     for chunk in samples.chunks(WIRE_RATE as usize) {
                         let _ = out_tx.send(Message::Binary(audio::bytes(chunk))).await;
@@ -1903,13 +1933,15 @@ mod tests {
         heard: Arc<Mutex<String>>,
         hearing_ms: Arc<AtomicU64>,
         line_ms: Arc<AtomicU64>,
+        /// Where not 0: each line streamed as the engine streams it, 80 ms of it this many ms after the last.
+        piece_ms: Arc<AtomicU64>,
         /// What it was asked to speak, in order.
         spoken: Arc<Mutex<Vec<String>>>,
     }
 
     impl SpeechServer {
         fn new() -> Self {
-            Self { heard: Arc::new(Mutex::new("Hello?".into())), hearing_ms: Arc::new(AtomicU64::new(0)), line_ms: Arc::new(AtomicU64::new(LINE_MS)), spoken: Arc::default() }
+            Self { heard: Arc::new(Mutex::new("Hello?".into())), hearing_ms: Arc::new(AtomicU64::new(0)), line_ms: Arc::new(AtomicU64::new(LINE_MS)), piece_ms: Arc::default(), spoken: Arc::default() }
         }
 
         /// What the caller's utterances are heard as, from now on.
@@ -1925,13 +1957,18 @@ mod tests {
             self.line_ms.store(ms, Ordering::SeqCst);
         }
 
+        /// Lines streamed from now on, 80 ms of sound every `ms` (40: an engine twice as fast as real time).
+        fn streams_pieces_every(&self, ms: u64) {
+            self.piece_ms.store(ms, Ordering::SeqCst);
+        }
+
         fn spoken(&self) -> Vec<String> {
             self.spoken.lock().unwrap().clone()
         }
 
         async fn serve(&self) -> String {
             use axum::routing::post;
-            let (line_ms, spoken) = (self.line_ms.clone(), self.spoken.clone());
+            let (line_ms, spoken, piece_ms) = (self.line_ms.clone(), self.spoken.clone(), self.piece_ms.clone());
             let (heard, hearing_ms) = (self.heard.clone(), self.hearing_ms.clone());
             let app = axum::Router::new()
                 .route(
@@ -1939,7 +1976,15 @@ mod tests {
                     post(move |axum::Json(body): axum::Json<Value>| {
                         spoken.lock().unwrap().push(body["input"].as_str().unwrap_or("").to_string());
                         let line = audio::bytes(&vec![120i16; WIRE_RATE as usize * line_ms.load(Ordering::SeqCst) as usize / 1000]);
-                        async move { ([("x-sample-rate", "24000")], line) }
+                        let every = piece_ms.load(Ordering::SeqCst);
+                        async move {
+                            let pieces: Vec<Vec<u8>> = line.chunks(if every == 0 { line.len().max(1) } else { WIRE_RATE as usize * 80 / 1000 * 2 }).map(<[u8]>::to_vec).collect();
+                            let stream = futures_util::stream::iter(pieces).then(move |piece| async move {
+                                tokio::time::sleep(Duration::from_millis(every)).await;
+                                Ok::<_, std::convert::Infallible>(piece)
+                            });
+                            ([("x-sample-rate", "24000")], axum::body::Body::from_stream(stream))
+                        }
                     }),
                 )
                 .route(
@@ -2411,6 +2456,29 @@ mod tests {
         aokie.begin(json!({"greetingDelayMs": 3_000}));
         let (at, _) = aokie.first_audio(secs(6)).await.expect("the line");
         assert!(at < Duration::from_millis(1_000), "said {at:?} after it began");
+    }
+
+    /// A line streamed as the engine streams it (80 ms pieces, twice as fast as real time) reaches Aokie as a first
+    /// frame of a quarter second (`PREROLL_SAMPLES`) and the rest as it comes: Aokie plays from that cushion; a line
+    /// shorter than it goes as one frame, at its end.
+    #[tokio::test]
+    async fn an_items_first_sound_goes_with_a_cushion() {
+        for (line_ms, first_ms) in [(1_000u64, 240usize), (160, 160)] {
+            let mut aokie = Aokie::start(json!({"mode": "speak", "greeting": "Please hold."})).await;
+            aokie.speech.streams_pieces_every(40);
+            aokie.speech.lines_last(line_ms);
+            aokie.begin(json!({}));
+            let mut frames = Vec::new();
+            while let Some(m) = aokie.next(secs(6)).await {
+                match m {
+                    Message::Binary(b) => frames.push(b.len() / 2),
+                    Message::Text(t) if t.contains("output_item_done") => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(frames.iter().sum::<usize>(), WIRE_RATE as usize * line_ms as usize / 1000, "{frames:?}");
+            assert_eq!(frames[0], WIRE_RATE as usize * first_ms / 1000, "the first frame: {frames:?}");
+        }
     }
 
     #[tokio::test]

@@ -253,6 +253,147 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// [`ChainRecorder::sample_top_k`]: one workgroup. The `k`-th largest logit is found exactly by a radix select over
+/// the logits' order-preserving keys (a byte a pass, from the top: each pass's histogram of the keys that match what is
+/// found so far, and the byte where the count from the top reaches what is still needed); the logits above it are
+/// candidates, and of those equal to it the ones of the lowest indices (a scan of each thread's equals: a thread holds
+/// a contiguous run of indices) up to `k`. Of the candidates, the one of the largest `logit / temperature + Gumbel
+/// noise` is drawn (the first of equals): exactly a draw from their softmax at the temperature. The noise is a uniform
+/// draw of the PCG hash of (seed, draw number, place, index). `p[0]`: from, n, k, temperature's bits; `p[1]`: seed, at.
+pub(in crate::chain) const SAMPLE_TOP_K: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> draws: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> hist: array<atomic<u32>, 256>;
+var<workgroup> scan: array<u32, 256>;
+var<workgroup> found: array<u32, 2>;
+var<workgroup> bv: array<f32, 256>;
+var<workgroup> bi: array<u32, 256>;
+
+// larger float, larger key
+fn key(v: f32) -> u32 {
+    let b = bitcast<u32>(v);
+    return select(b | 0x80000000u, ~b, (b & 0x80000000u) != 0u);
+}
+
+fn pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) t: u32) {
+    let start = p[0].x;
+    let n = p[0].y;
+    let k = min(max(p[0].z, 1u), n);
+    let temperature = bitcast<f32>(p[0].w);
+    let seed = p[1].x;
+    let at = p[1].y;
+    let draw = bitcast<u32>(draws[0]);
+    let per = (n + 255u) / 256u;
+    let lo = min(t * per, n);
+    let hi = min(lo + per, n);
+    // the k-th largest key, a byte at a time from the top
+    var prefix = 0u;
+    var mask = 0u;
+    var need = k;
+    for (var round = 0u; round < 4u; round++) {
+        let sh = 24u - 8u * round;
+        atomicStore(&hist[t], 0u);
+        workgroupBarrier();
+        for (var i = lo; i < hi; i++) {
+            let kk = key(x[start + i]);
+            if ((kk & mask) == prefix) {
+                atomicAdd(&hist[(kk >> sh) & 255u], 1u);
+            }
+        }
+        workgroupBarrier();
+        if (t == 0u) {
+            var acc = 0u;
+            var b = 255u;
+            loop {
+                let c = atomicLoad(&hist[b]);
+                if (acc + c >= need || b == 0u) {
+                    break;
+                }
+                acc += c;
+                b -= 1u;
+            }
+            found[0] = b;
+            found[1] = need - acc;
+        }
+        workgroupBarrier();
+        prefix |= found[0] << sh;
+        mask |= 255u << sh;
+        need = found[1];
+        workgroupBarrier();
+    }
+    // of the keys equal to the k-th largest, `need` are taken: those of the lowest indices
+    var eq = 0u;
+    for (var i = lo; i < hi; i++) {
+        if (key(x[start + i]) == prefix) {
+            eq++;
+        }
+    }
+    scan[t] = eq;
+    workgroupBarrier();
+    for (var off = 1u; off < 256u; off *= 2u) {
+        var add = 0u;
+        if (t >= off) {
+            add = scan[t - off];
+        }
+        workgroupBarrier();
+        scan[t] += add;
+        workgroupBarrier();
+    }
+    var taken = scan[t] - eq;
+    let greedy = temperature <= 0.0 || k == 1u;
+    var best = -3.4e38;
+    var bidx = 0xffffffffu;
+    for (var i = lo; i < hi; i++) {
+        let v = x[start + i];
+        let kk = key(v);
+        var candidate = kk > prefix;
+        if (kk == prefix) {
+            candidate = taken < need;
+            taken++;
+        }
+        if (candidate) {
+            var s = v;
+            if (!greedy) {
+                let h = pcg(seed ^ pcg(draw ^ pcg(at ^ pcg(i))));
+                let u = (f32(h >> 8u) + 0.5) / 16777216.0;
+                s = v / temperature - log(-log(u));
+            }
+            if (s > best || bidx == 0xffffffffu) {
+                best = s;
+                bidx = i;
+            }
+        }
+    }
+    bv[t] = best;
+    bi[t] = bidx;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (t < st) {
+            let v2 = bv[t + st];
+            let i2 = bi[t + st];
+            if (i2 != 0xffffffffu && (bi[t] == 0xffffffffu || v2 > bv[t] || (v2 == bv[t] && i2 < bi[t]))) {
+                bv[t] = v2;
+                bi[t] = i2;
+            }
+        }
+        workgroupBarrier();
+    }
+    if (t == 0u) {
+        out[at] = bitcast<f32>(bi[0]);
+    }
+}
+"#;
+
 /// [`ChainRecorder::argmax_rows`]'s first pass over rows of `p[0].x` logits (a row a line of the grid's second axis):
 /// a workgroup 4,096 of a row's, a thread 16 (its largest, the first of equals, and the sum of exponentials against it
 /// as it goes), then the threads' combined, the lower index of equals taken; row `r`'s workgroup `g`'s largest, its

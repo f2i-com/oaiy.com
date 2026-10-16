@@ -548,6 +548,13 @@ impl ChainRecorder for Recorder<'_> {
         self.weigh(2.0 * (out * cout) as f64 * (cin * k.div_ceil(stride)) as f64);
     }
 
+    fn sample_top_k(&mut self, x: &DeviceVec, from: usize, n: usize, k: usize, temperature: f32, seed: u32, draws: &DeviceVec, out: &DeviceVec, at: usize) {
+        assert!(n > 0 && x.len >= from + n && from + n < 1 << 31 && out.len > at && draws.len > 0 && temperature >= 0.0, "chain: a draw of {n} logits");
+        let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+        // (the words the same for every draw at `at`: the draw number is read from `draws`, so the bind group is kept)
+        self.dispatch_wide("chain-sample-top-k", SAMPLE_TOP_K, [buffer(x), buffer(draws), &d, &d, &d, &d, buffer(out), &drw], &[from as u32, n as u32, k as u32, temperature.to_bits(), seed, at as u32], (1, 1, 1));
+    }
+
     fn gather_rows(&mut self, x: &DeviceVec, index: &DeviceVec, out: &DeviceVec, rows: usize, c: usize, first: usize, src_rows: usize) {
         assert!(index.len >= first + rows && out.len >= rows * c && x.len >= src_rows * c && rows * c < 1 << 32, "chain: a gather of {rows} rows of {c}");
         let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());

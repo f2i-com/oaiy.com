@@ -10,7 +10,7 @@ use ggml_rs::chain::{ChainRecorder, DeviceChain, DeviceVec};
 use ggml_rs_wgpu::WgpuBackend;
 use oaiy_engine::json::Json;
 use oaiy_tts::sampling::{sample, Rng};
-use oaiy_tts::talker::{Sampling, ASSISTANT, AUDIO_CODES, CODEC_BOS, CODEC_EOS, CODEC_NOTHINK, CODEC_PAD, CODEC_THINK, CODEC_THINK_BOS, CODEC_THINK_EOS, IM_END, IM_START, NEWLINE, TTS_BOS, TTS_EOS, TTS_PAD, USER};
+use oaiy_tts::talker::{Draws, Sampling, ASSISTANT, AUDIO_CODES, CODEC_BOS, CODEC_EOS, CODEC_NOTHINK, CODEC_PAD, CODEC_THINK, CODEC_THINK_BOS, CODEC_THINK_EOS, IM_END, IM_START, NEWLINE, TTS_BOS, TTS_EOS, TTS_PAD, USER};
 use oaiy_tts::voice::Voice;
 use std::path::Path;
 
@@ -98,6 +98,18 @@ struct Kept {
     io: Vec<Io>,
     /// The talker's step of one row: its input, its states and its logits.
     talker: Option<(DeviceVec, DeviceVec, DeviceVec)>,
+    /// A frame's codes drawn on the device ([`WgpuTalker::predict_on_device`]), made at the first.
+    device: Option<OnDevice>,
+}
+
+/// What a frame's codes drawn on the device read and write: the predictor's 15 embedding tables (`[2048, hidden]`
+/// each), the frame's codes (a u32's bits each), the frame's draw number, and a code's embedding (the next step's
+/// input).
+struct OnDevice {
+    tables: Vec<DeviceVec>,
+    codes: DeviceVec,
+    draws: DeviceVec,
+    row: DeviceVec,
 }
 
 /// A predictor step's vectors for `rows` rows: its input, the input projected to its width (the 1.7B's), its states
@@ -305,10 +317,74 @@ impl WgpuTalker {
     /// is made); `on_frame` answering false stops the line there. Why it stopped.
     pub fn frames_with(&mut self, prefill: &[f32], trailing: Option<Vec<f32>>, sampling: Sampling, max_frames: usize, on_frame: impl FnMut(&[u32; 16]) -> Result<bool>) -> Result<FramesEnd> {
         let pad = self.text(&[TTS_PAD])?;
-        let mut kept = self.kept.take().unwrap_or_else(|| Kept { pcache: self.predictor.cache(&self.gpu, 17), io: Vec::new(), talker: None });
+        let mut kept = self.kept.take().unwrap_or_else(|| Kept { pcache: self.predictor.cache(&self.gpu, 17), io: Vec::new(), talker: None, device: None });
         let end = self.run_frames(&pad, &mut kept, prefill, trailing, sampling, max_frames, on_frame);
         self.kept = Some(kept);
         end
+    }
+
+    /// A frame's 16 codes from the talker's state `hidden` and its first code `c0`: the predictor's 15 steps, each code
+    /// drawn on the device ([`ChainRecorder::sample_top_k`]: the host's draw, its top k and temperature, from a stream of
+    /// the seed and the frame's number `draw`) and its embedding gathered there as the next step's input, all in one
+    /// submission, the 15 codes read back. On the host a step was a submission and a read of its logits each: 21.7 ms
+    /// a frame of an M5 Pro's GPU went to them.
+    fn predict_on_device(&self, kept: &mut Kept, hidden: &[f32], c0: u32, s: &Sampling, draw: u32) -> Result<[u32; 16]> {
+        let (g, h, ph) = (&self.gpu, self.hidden, self.predictor_hidden);
+        let Kept { pcache, io, device, .. } = kept;
+        if device.is_none() {
+            let tables = self
+                .predictor_embeddings
+                .iter()
+                .map(|t| {
+                    let d = g.vec(t.values.len());
+                    g.upload(&d, &t.values);
+                    d
+                })
+                .collect();
+            *device = Some(OnDevice { tables, codes: g.vec(16), draws: g.vec(1), row: g.vec(h) });
+        }
+        let dev = device.as_ref().expect("made above");
+        let most = self.predictor_heads.iter().map(|hd| hd.m.n).max().unwrap_or(0);
+        for rows in [1, 2] {
+            if !io.iter().any(|v| v.rows == rows) {
+                io.push(Io { rows, x: g.vec(rows * h), xp: g.vec(rows * ph), states: g.vec(rows * ph), logits: g.vec(rows * most) });
+            }
+        }
+        let (two, one) = (io.iter().find(|v| v.rows == 2).expect("made above"), io.iter().find(|v| v.rows == 1).expect("made above"));
+        let mut x0 = hidden.to_vec();
+        x0.extend_from_slice(self.codec_embedding.row(c0));
+        g.upload(&two.x, &x0);
+        g.upload(&dev.draws, &[f32::from_bits(draw)]);
+        let temperature = if s.greedy { 0.0 } else { s.sub_temperature as f32 };
+        let seed = (s.seed ^ (s.seed >> 32)) as u32;
+        let mut rec = g.begin();
+        let r = rec.as_mut();
+        for i in 0..15 {
+            let (t, v, x) = if i == 0 { (2, two, &two.x) } else { (1, one, &dev.row) };
+            let input = match &self.to_predictor {
+                Some(p) => {
+                    p.run(r, x, &v.xp, t);
+                    &v.xp
+                }
+                None => x,
+            };
+            self.predictor.step(g, r, input, t, pcache, &v.states);
+            let head = &self.predictor_heads[i];
+            head.run(r, &v.states, &v.logits, t);
+            r.sample_top_k(&v.logits, (t - 1) * head.m.n, head.m.n, s.sub_top_k, temperature, seed, &dev.draws, &dev.codes, i + 1);
+            if i < 14 {
+                let table = &self.predictor_embeddings[i];
+                r.gather_rows(&dev.tables[i], &dev.codes, &dev.row, 1, h, i + 1, table.values.len() / table.width);
+            }
+        }
+        r.read_range(&dev.codes, 1, 15);
+        let codes = rec.finish().pop().ok_or_else(|| err("the codes were not read"))?;
+        let mut frame = [0u32; 16];
+        frame[0] = c0;
+        for (slot, code) in frame[1..].iter_mut().zip(&codes) {
+            *slot = code.to_bits();
+        }
+        Ok(frame)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -375,6 +451,10 @@ impl WgpuTalker {
         };
         let (mut hidden, mut logits) = talker_step(self, kept, &mut cache, prefill)?;
         let mut made = 0usize;
+        // (OAIY_TTS_PROFILE: the talker's steps' and the predictor's time, said at the end)
+        let profile = std::env::var_os("OAIY_TTS_PROFILE").is_some();
+        let (mut in_talker, mut in_predictor) = (0f64, 0f64);
+        let said = |made: usize, t: f64, p: f64| if profile { eprintln!("tts profile: {made} frames, talker {:.1} ms a frame, predictor {:.1} ms a frame", t * 1e3 / made.max(1) as f64, p * 1e3 / made.max(1) as f64) };
         while made < max_frames {
             let s = &sampling;
             let penalty = s.repetition_penalty as f32;
@@ -393,21 +473,30 @@ impl WgpuTalker {
             }
             let c0 = sample(&logits, s.temperature, s.top_k, s.top_p, s.greedy, &mut rng);
             if c0 == CODEC_EOS {
+                said(made, in_talker, in_predictor);
                 return Ok(FramesEnd::Ended);
             }
+            let predicting = std::time::Instant::now();
             seen[c0 as usize] = true;
-            // the other 15 codes, the predictor's from this frame's start
+            // the other 15 codes, the predictor's from this frame's start: drawn on the device in one submission (a
+            // round trip a frame), or on the host a code at a time (the reference's order of draws)
             kept.pcache.len = 0;
-            let mut frame = [0u32; 16];
-            frame[0] = c0;
-            let mut x = hidden.clone();
-            x.extend_from_slice(self.codec_embedding.row(c0));
-            for i in 0..15 {
-                let l = predictor_step(self, kept, &x, i)?;
-                let code = sample(&l, s.sub_temperature, s.sub_top_k, 1.0, s.greedy, &mut rng);
-                frame[i + 1] = code;
-                x = self.predictor_embeddings[i].row(code).to_vec();
-            }
+            let frame = if s.draws == Draws::Host {
+                let mut frame = [0u32; 16];
+                frame[0] = c0;
+                let mut x = hidden.clone();
+                x.extend_from_slice(self.codec_embedding.row(c0));
+                for i in 0..15 {
+                    let l = predictor_step(self, kept, &x, i)?;
+                    let code = sample(&l, s.sub_temperature, s.sub_top_k, 1.0, s.greedy, &mut rng);
+                    frame[i + 1] = code;
+                    x = self.predictor_embeddings[i].row(code).to_vec();
+                }
+                frame
+            } else {
+                self.predict_on_device(kept, &hidden, c0, s, made as u32)?
+            };
+            in_predictor += predicting.elapsed().as_secs_f64();
             let step = made;
             made += 1;
             if !on_frame(&frame)? {
@@ -423,8 +512,11 @@ impl WgpuTalker {
                 _ => &pad[..],
             };
             e.iter_mut().zip(text).for_each(|(a, b)| *a += b);
+            let stepping = std::time::Instant::now();
             (hidden, logits) = talker_step(self, kept, &mut cache, &e)?;
+            in_talker += stepping.elapsed().as_secs_f64();
         }
+        said(made, in_talker, in_predictor);
         Ok(FramesEnd::Full)
     }
 }

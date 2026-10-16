@@ -476,6 +476,16 @@ pub trait ChainRecorder {
         let _ = (x, rows, n, out);
         unimplemented!("a row's largest logit on this device")
     }
+    /// A draw from the `n` logits at `x[from..]`, as `oaiy_tts::sampling::sample` draws with top-p 1: the `k` largest
+    /// (of equals, the lower indices), their softmax at `temperature`, one of them drawn (the Gumbel-max trick, from a
+    /// counter-based random stream of `seed`, the draw number in `draws[0]`'s bits and `at`); its index written to
+    /// `out[at]` as a u32's bits. A `temperature` of 0 or a `k` of 1: the largest. A speech model's frame of codes
+    /// drawn on the device, one after another, where each was read back and drawn on the host (a round trip a code).
+    #[allow(clippy::too_many_arguments)]
+    fn sample_top_k(&mut self, x: &DeviceVec, from: usize, n: usize, k: usize, temperature: f32, seed: u32, draws: &DeviceVec, out: &DeviceVec, at: usize) {
+        let _ = (x, from, n, k, temperature, seed, draws, out, at);
+        unimplemented!("a draw of logits on this device")
+    }
     /// QSA's pooled block keys (`Backend::qsa_pool`): `pooled[b] = mean of raw rows b ratio .. (b + 1) ratio`, the
     /// first `blocks` blocks of `raw` (`[.., d]`).
     fn qsa_pool(&mut self, raw: &DeviceVec, pooled: &DeviceVec, blocks: usize, ratio: usize, d: usize) {

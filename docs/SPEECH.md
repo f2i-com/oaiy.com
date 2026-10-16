@@ -163,18 +163,34 @@ let report = tts.speak(text, &voice, &cancel, |pcm: &[i16]| { /* play it */ })?;
 ```
 
 `oaiy_tts::Tts` is the same engine on Candle (`Tts::load(model_dir, &Device::Cpu)`): the
-reference the WebGPU one is written against, whose GPU was CUDA's. On WebGPU the talker
-hands each frame over as it draws it and the codec decodes each chunk of four frames after
-the 120 frames before it, where Candle's stream carries each stage's state from chunk to
-chunk; a voice's speaker embedding and codes are made on the CPU, once a clip. A chunk
-decoded so is 48 dB from the whole decode of the same frames on a long line (after the
-official chunked decode's 25 frames it is 17 dB: audible at every chunk's edge); only a
-stream that keeps its state is the whole decode's at any length, and this one is to become
-that. Measured through `oaiy-voice` on an RTX 5090 (2026-10-08, the 0.6B Base, a voice from
-a 6-second clip): a line of 5.4 s spoken in 4.5 s (real-time factor 0.83), its first audio
-0.94 s after the call. The CUDA engine's figures below (factor 0.15, first audio under
-0.1 s) are what is still to be made up: a frame is 17 round trips to the GPU where CUDA
-replayed one graph, and a chunk's decode reads its 120 frames of context again.
+reference the WebGPU one is written against, whose GPU was CUDA's. On WebGPU:
+
+- **The talker** hands each frame over as it draws it. A frame's other 15 codes are drawn
+  on the GPU (`ChainRecorder::sample_top_k`: the host's draw exactly, its top 50 and its
+  temperature, by the Gumbel-max trick), each code's embedding gathered there for the next
+  step, all in one submission: two round trips a frame where there were 16. Greedy, the
+  same codes as the host's (`codes_drawn_on_the_device_are_the_hosts`).
+- **The codec** decodes a line as a stream (`WgpuCodec::stream`): each causal stage keeps
+  the last inputs it reaches back for, and the transformer the keys and values of its
+  72-frame window, so a chunk costs its own frames alone and its samples are the whole
+  decode's (107 dB from it: float rounding; `a_stream_is_the_whole_decode`). Chunks were
+  decoded after the 120 frames before them at first, 48 dB from the whole decode at every
+  chunk's edge. A voice's stream after its clip's last 120 frames is made once and copied
+  for each line.
+- **They run side by side**: the codec on a device of its own (a queue of its own) and a
+  thread of its own, a line's chunks one frame, then two, then four, each made before the
+  one before it has played.
+
+A voice's speaker embedding and codes are made on the CPU, once a clip. Measured through
+`oaiy-voice` on an M5 Pro's GPU (2026-10-16, the 0.6B Base, the receptionist voice): lines
+of 5.8 to 13.1 s spoken at 2.6 times real time once they speak (2.2 to 2.5 overall), their
+first sound 0.18 to 0.31 s after the call (0.45 s the first line in a voice, whose stream
+is made then), where it was 1.45 times and 0.57 to 0.78 s; heard back by the server's own
+speech-to-text, every word as written. A frame is the talker's 10 ms and the predictor's
+21 ms of the GPU's time, nearly all of it the gaps between some 1,800 small dispatches: the
+talker's weights as Q8_0 were slower still on this GPU (its one-row Q8_0 kernel). The
+CUDA engine's figures below (factor 0.15, first audio under 0.1 s) replayed a frame as one
+CUDA graph.
 
 - **Model folder.** The 0.6B release: `config.json`, `model.safetensors`,
   `vocab.json`, `merges.txt` and `speech_tokenizer/`. The speech tokenizer is

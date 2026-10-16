@@ -5,44 +5,49 @@
 //! decode's 25 frames of left context, where Candle's stream carries each stage's state). A cloned voice's speaker
 //! embedding and reference codes are made on the CPU (both encoders F32), once a clip, and kept.
 
-use crate::codec_wgpu::WgpuCodec;
+use crate::codec_wgpu::{StreamState, WgpuCodec};
 use crate::tts_wgpu::{FramesEnd, WgpuTalker};
 use candle_core::{Device, Result};
-use oaiy_tts::codec::{SAMPLES_PER_FRAME, SAMPLE_RATE};
+use oaiy_tts::codec::SAMPLE_RATE;
 use oaiy_tts::talker::FRAMES_PER_SECOND;
 use oaiy_tts::voice::Voice;
 use oaiy_tts::{clone, Finish, LeadIn, SpeakOptions, SpeakReport};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::Instant;
 
 fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(format!("speech on WebGPU: {e}"))
 }
 
-/// Frames a stream's chunk is decoded after. The codec's attention reaches 72 frames back in each of its eight
-/// layers, and the reach compounds, so a chunk decoded after a fixed number of frames is the whole decode's only
-/// while the line (and its voice's clip before it) is no longer than that. Measured on a line of 249 frames against
-/// its whole decode (`a_streams_chunks_against_the_whole_decode`): after the official chunked decode's 25 frames a
-/// chunk is 17 dB from it (a fiftieth of its power in error, at every chunk's edge), after 80 frames 33 dB, after 120
-/// 48 dB, after 160 62 dB, a chunk of four frames costing 29, 55, 74 and 87 ms. 120: an error 48 dB under the
-/// speech, for a quarter of real time. Those costs were the whole decode's of context and chunk; now only the
-/// transformer reads the context, and the stages after it (nearly all of the cost) the chunk and the 14 frames they
-/// reach back ([`WgpuCodec::decode_after_with`]): the same samples, and a chunk of four after 120 costs 105 ms on an
-/// M5 Pro's GPU, where it cost 520. Only a stream that keeps each stage's state (Candle's does: the transformer's
-/// keys and values, each causal convolution's last inputs) is the whole decode's at any length, at the cost of the
-/// new frames alone; this one is to become that.
+/// The voice's clip's frames a line's codec stream starts after ([`WgpuCodec::stream_after`], once a voice). A line's
+/// chunks are decoded by the codec's stream ([`WgpuCodec::stream`]), which keeps each stage's state: the whole
+/// decode's samples (107 dB from it, its float's rounding), each chunk at the cost of its own frames (9 ms a frame on
+/// an M5 Pro's GPU). Each chunk was decoded after the 120 frames before it at first (with only the transformer
+/// reading them, the stages after it the chunk and the 14 frames they reach back: 105 ms a chunk of four), 48 dB from
+/// the whole decode at every chunk's edge (`a_streams_chunks_against_the_whole_decode` measures that); the clip's
+/// frames before these reach the line's sound no more than they reached those chunks'.
 const STREAM_CONTEXT: usize = 120;
-/// Frames a chunk after the first: four (0.32 s of sound), which halves what the decodes cost against two.
+/// The most frames a chunk has: four (0.32 s of sound). A line's first chunks are one frame and two ([`Stream`]).
 const CHUNK_FRAMES: usize = 4;
-/// The silent frames before a line's speech that are decoded with it: what the lead-in gate keeps of the silence
-/// ([`LeadIn::LEAD`], a tenth of a second) is within them.
-const QUIET_KEPT: usize = 2;
+/// The voices whose codec stream after their clip is kept.
+const VOICE_STREAMS: usize = 8;
+
+/// A voice's codes' hash: the codec's stream after its clip depends on them alone.
+fn voice_key(voice: &Voice) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    voice.ref_codes.hash(&mut h);
+    h.finish()
+}
 
 /// The engine: a Qwen3-TTS Base model resident on one WebGPU adapter.
 pub struct WgpuTts {
     talker: WgpuTalker,
     codec: WgpuCodec,
+    /// The codec's stream after each voice's clip, by its codes ([`voice_key`]), the latest few.
+    voice_streams: Vec<(u64, StreamState)>,
     tokenizer: tokenizers::Tokenizer,
     /// Loaded (on the CPU) when the first voice is made, then kept.
     speaker_encoder: Option<clone::SpeakerEncoder>,
@@ -67,10 +72,20 @@ impl WgpuTts {
         }
         let tokenizer = oaiy_tts::text::tokenizer(model_dir)?;
         let talker = WgpuTalker::load(model_dir, device)?;
-        let codec = WgpuCodec::load(&model_dir.join("speech_tokenizer").join("model.safetensors"), talker.gpu())?;
+        // the codec on a device of its own on the same adapter, so a queue of its own: its chunks run on the GPU beside
+        // the talker's steps, not after them (OAIY_TTS_ONE_QUEUE: the talker's)
+        let own;
+        let codec_gpu = if std::env::var_os("OAIY_TTS_ONE_QUEUE").is_some() {
+            talker.gpu()
+        } else {
+            own = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
+            &own
+        };
+        let codec = WgpuCodec::load(&model_dir.join("speech_tokenizer").join("model.safetensors"), codec_gpu)?;
         let mut tts = Self {
             talker,
             codec,
+            voice_streams: Vec::new(),
             tokenizer,
             speaker_encoder: None,
             speech_encoder: None,
@@ -179,13 +194,19 @@ impl WgpuTts {
         // than anyone speaks).
         let max_frames = ((o.max_seconds.min(2. + 0.6 * text_ids.len() as f64)) * FRAMES_PER_SECOND).ceil() as usize;
         report.prefill_seconds = started.elapsed().as_secs_f64();
-        let Self { talker, codec, .. } = self;
-        // the frames a chunk is decoded after: the voice's clip's last ones, then the line's own
-        let mut before: Vec<[u32; 16]> = voice.ref_codes[voice.ref_codes.len().saturating_sub(STREAM_CONTEXT)..].to_vec();
-        let mut gate = LeadIn::new(o.trim_leading_silence);
-        let mut pending: Vec<[u32; 16]> = Vec::new();
+        // the codec's stream after the voice's clip (made once a voice, then copied for each line)
+        let key = voice_key(voice);
+        if !self.voice_streams.iter().any(|(k, _)| *k == key) {
+            let made = self.codec.stream_after(&voice.ref_codes[voice.ref_codes.len().saturating_sub(STREAM_CONTEXT)..])?;
+            if self.voice_streams.len() >= VOICE_STREAMS {
+                self.voice_streams.remove(0);
+            }
+            self.voice_streams.push((key, made));
+        }
+        let Self { talker, codec, voice_streams, .. } = self;
+        let state = codec.stream_copy(&voice_streams.iter().find(|(k, _)| *k == key).expect("made above").1);
         let mut emit = |samples: Vec<f32>, report: &mut SpeakReport| {
-            if samples.is_empty() {
+            if samples.is_empty() || cancel.load(Ordering::Relaxed) {
                 return;
             }
             if report.first_chunk_seconds.is_none() {
@@ -194,78 +215,160 @@ impl WgpuTts {
             report.audio_seconds += samples.len() as f64 / SAMPLE_RATE as f64;
             on_chunk(&oaiy_tts::audio::to_pcm16(&samples));
         };
-        let decode = |before: &mut Vec<[u32; 16]>, pending: &mut Vec<[u32; 16]>| -> Result<Vec<f32>> {
-            if pending.is_empty() {
-                return Ok(Vec::new());
-            }
-            let samples = codec.decode_after_with(before, pending, STREAM_CONTEXT)?;
-            before.append(pending);
-            let extra = before.len().saturating_sub(STREAM_CONTEXT);
-            before.drain(..extra);
-            Ok(samples)
-        };
-        // While the line opens with silence (the gate closed, nothing heard yet), a frame is heard roughly first
-        // (`WgpuCodec::hear_after`, 21 ms where its decode takes 91), and the frames the gate keeps are decoded once one
-        // is heard to speak, with it (or once a second of silence makes the gate let go): the same samples, sooner. A
-        // line that opened with five silent frames waited for five decodes before its first sound.
-        let mut quiet: Vec<[u32; 16]> = Vec::new();
-        let mut quiet_samples = 0usize;
-        let end = talker.frames_with(&prefill, Some(trailing), o.sampling.clone(), max_frames, |frame| {
-            if cancel.load(Ordering::Relaxed) {
-                return Ok(false);
-            }
-            report.frames += 1;
-            if !gate.open && report.first_chunk_seconds.is_none() {
-                let mut heard_after = before.clone();
-                heard_after.extend_from_slice(&quiet);
-                let heard = codec.hear_after(&heard_after, std::slice::from_ref(frame), STREAM_CONTEXT)?;
-                // (its first samples are the rough decode's own: they are not listened to)
-                let speaks = LeadIn::loud(&heard[heard.len() / 4..]);
-                quiet.push(*frame);
-                quiet_samples += SAMPLES_PER_FRAME;
-                if speaks || quiet_samples >= LeadIn::MAX_SILENCE {
-                    let samples = decode(&mut before, &mut quiet)?;
-                    let mut out = gate.pass(samples);
-                    if !speaks && !gate.open {
-                        // a second of silence: the gate lets go with what it keeps, as it does after a second
-                        gate.open = true;
-                        out = std::mem::take(&mut gate.held);
-                    }
-                    emit(out, &mut report);
-                } else if quiet.len() > QUIET_KEPT {
-                    // the earliest quiet frame is past what the gate could keep: context for the decodes after it
-                    before.push(quiet.remove(0));
-                    let extra = before.len().saturating_sub(STREAM_CONTEXT);
-                    before.drain(..extra);
+        let mut stream = Stream::new(codec, state, &o);
+        let decoding = if std::env::var_os("OAIY_TTS_SERIAL").is_some() {
+            // (the talker's thread decodes each chunk between its frames, as before)
+            let end = talker.frames_with(&prefill, Some(trailing), o.sampling.clone(), max_frames, |frame| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(false);
                 }
-                return Ok(true);
+                report.frames += 1;
+                let samples = stream.frame(*frame)?;
+                emit(samples, &mut report);
+                Ok(true)
+            })?;
+            report.finish = finish_of(end);
+            if report.finish != Finish::Cancelled {
+                let rest = stream.finish()?;
+                emit(rest, &mut report);
             }
-            pending.push(*frame);
-            let want = if report.first_chunk_seconds.is_none() { o.first_chunk_frames } else { o.chunk_frames };
-            if pending.len() >= want.max(1) {
-                let samples = decode(&mut before, &mut pending)?;
-                emit(gate.pass(samples), &mut report);
-            }
-            Ok(true)
-        })?;
-        report.finish = match end {
-            FramesEnd::Stopped => Finish::Cancelled,
-            FramesEnd::Full => Finish::Length,
-            FramesEnd::Ended => Finish::Stop,
+            stream.decoding
+        } else {
+            // The chunks decoded on a thread of their own (and the codec on a queue of its own: the GPU runs them
+            // between the talker's small steps, which leave it idle most of the time), while the talker draws the next
+            // frames; what is decoded is handed out at each frame, and the rest once the line's frames are all drawn.
+            let finishing = AtomicBool::new(false);
+            let (end, decoded) = std::thread::scope(|scope| -> Result<(FramesEnd, f64)> {
+                let (frames_tx, frames_rx) = mpsc::channel::<[u32; 16]>();
+                let (audio_tx, audio_rx) = mpsc::channel::<Result<Vec<f32>>>();
+                let finishing = &finishing;
+                let decoder = scope.spawn(move || {
+                    for frame in frames_rx {
+                        match stream.frame(frame) {
+                            Ok(samples) if samples.is_empty() => {}
+                            Ok(samples) => {
+                                if audio_tx.send(Ok(samples)).is_err() {
+                                    return stream.decoding;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = audio_tx.send(Err(e));
+                                return stream.decoding;
+                            }
+                        }
+                    }
+                    if finishing.load(Ordering::Relaxed) {
+                        let _ = audio_tx.send(stream.finish());
+                    }
+                    stream.decoding
+                });
+                let drawn = talker.frames_with(&prefill, Some(trailing), o.sampling.clone(), max_frames, |frame| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(false);
+                    }
+                    report.frames += 1;
+                    let _ = frames_tx.send(*frame);
+                    while let Ok(samples) = audio_rx.try_recv() {
+                        emit(samples?, &mut report);
+                    }
+                    Ok(true)
+                });
+                finishing.store(matches!(drawn, Ok(FramesEnd::Ended | FramesEnd::Full)), Ordering::Relaxed);
+                drop(frames_tx);
+                if finishing.load(Ordering::Relaxed) {
+                    for samples in &audio_rx {
+                        emit(samples?, &mut report);
+                    }
+                }
+                drop(audio_rx);
+                let decoded = decoder.join().map_err(|_| err("the decoder's thread panicked"))?;
+                Ok((drawn?, decoded))
+            })?;
+            report.finish = finish_of(end);
+            decoded
         };
-        if report.finish != Finish::Cancelled {
-            // (a line silent to its end: its quiet frames are what is left)
-            pending.splice(0..0, quiet.drain(..));
-            let rest = decode(&mut before, &mut pending)?;
-            let mut out = gate.pass(rest);
-            if !gate.open {
-                // Quiet to the end: hand out what the gate held.
-                out = std::mem::take(&mut gate.held);
-            }
-            emit(out, &mut report);
-        }
         report.total_seconds = started.elapsed().as_secs_f64();
+        if std::env::var_os("OAIY_TTS_PROFILE").is_some() {
+            eprintln!("tts profile: decodes {:.1} ms a frame ({decoding:.2} s), prefill {:.0} ms, all {:.2} s", decoding * 1e3 / report.frames.max(1) as f64, report.prefill_seconds * 1e3, report.total_seconds);
+            if ggml_rs_wgpu::profile::chain_on() {
+                for (name, ms, n) in ggml_rs_wgpu::profile::take_kernels().into_iter().take(14) {
+                    eprintln!("  {name}: {ms:.1} ms in {n} dispatches ({:.1} us each)", ms * 1e3 / n.max(1) as f64);
+                }
+            }
+            if ggml_rs_wgpu::profile::pieces_on() {
+                let (busy, span, pieces) = ggml_rs_wgpu::profile::take_pieces();
+                eprintln!("  the GPU busy {busy:.0} ms of {span:.0} ms in {pieces} pieces");
+            }
+        }
         Ok(report)
+    }
+}
+
+fn finish_of(end: FramesEnd) -> Finish {
+    match end {
+        FramesEnd::Stopped => Finish::Cancelled,
+        FramesEnd::Full => Finish::Length,
+        FramesEnd::Ended => Finish::Stop,
+    }
+}
+
+/// A line's frames to its sound through the codec's stream (each chunk decoded from its own frames, after the voice's
+/// clip and the line's frames before it: the whole decode's samples) and the lead-in gate: what [`WgpuTts::speak`]
+/// hands out (on a thread of its own, as the talker draws the next frames). Until the gate opens each frame is decoded
+/// as it comes, so the first sound is out as soon as there is one; then chunks of two frames, then of `chunk_frames`,
+/// each made in less time than the one before it takes to play, so a line's start has no gap.
+struct Stream<'a> {
+    codec: &'a WgpuCodec,
+    state: StreamState,
+    pending: Vec<[u32; 16]>,
+    gate: LeadIn,
+    /// The frames the last chunk handed out had (0: nothing out yet).
+    last: usize,
+    chunk_frames: usize,
+    /// Seconds spent decoding.
+    decoding: f64,
+}
+
+impl<'a> Stream<'a> {
+    fn new(codec: &'a WgpuCodec, state: StreamState, o: &SpeakOptions) -> Self {
+        Self { codec, state, pending: Vec::new(), gate: LeadIn::new(o.trim_leading_silence), last: 0, chunk_frames: o.chunk_frames.max(1), decoding: 0. }
+    }
+
+    /// The pending frames decoded, through the gate.
+    fn decode(&mut self) -> Result<Vec<f32>> {
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let at = Instant::now();
+        let frames = std::mem::take(&mut self.pending);
+        let samples = self.codec.stream(&mut self.state, &frames)?;
+        self.decoding += at.elapsed().as_secs_f64();
+        let out = self.gate.pass(samples);
+        if !out.is_empty() {
+            self.last = frames.len();
+        }
+        Ok(out)
+    }
+
+    /// The line's next frame: the sound to hand out now (none until a chunk is due).
+    fn frame(&mut self, frame: [u32; 16]) -> Result<Vec<f32>> {
+        self.pending.push(frame);
+        // (nothing out yet: a frame at a time; then each chunk twice the last, up to `chunk_frames`)
+        let want = if self.last == 0 { 1 } else { (2 * self.last).min(self.chunk_frames) };
+        if self.pending.len() < want {
+            return Ok(Vec::new());
+        }
+        self.decode()
+    }
+
+    /// The rest of the line once its frames are all drawn.
+    fn finish(&mut self) -> Result<Vec<f32>> {
+        let mut out = self.decode()?;
+        if !self.gate.open {
+            // Quiet to the end: hand out what the gate held.
+            out = std::mem::take(&mut self.gate.held);
+        }
+        Ok(out)
     }
 }
 
@@ -333,6 +436,29 @@ mod tests {
 
     /// The Base model speaking two lines in a voice on WebGPU, streamed (`--ignored --nocapture`; `OAIY_TTS` the
     /// model's folder, `OAIY_TTS_VOICE` a saved voice's `.voice.json`): that it speaks, and how fast.
+    /// A frame's codes drawn on the device (`Draws::Auto`: one submission a frame) are the host's (`Draws::Host`: a
+    /// round trip a code) where both draw the largest: the same line, sample for sample.
+    #[test]
+    #[ignore = "needs a Qwen3-TTS Base model, a saved voice and a WebGPU adapter"]
+    fn codes_drawn_on_the_device_are_the_hosts() -> Result<()> {
+        let dir = PathBuf::from(std::env::var("OAIY_TTS").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-0.6B-Base".into()));
+        let device = std::env::var("OAIY_TTS_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut tts = WgpuTts::load(&dir, device)?;
+        let voice = Voice::open(Path::new(&std::env::var("OAIY_TTS_VOICE").map_err(err)?)).map_err(err)?;
+        tts.options.sampling.greedy = true;
+        tts.options.max_seconds = 3.0;
+        let mut lines = Vec::new();
+        for draws in [oaiy_tts::talker::Draws::Host, oaiy_tts::talker::Draws::Auto] {
+            tts.options.sampling.draws = draws;
+            let mut pcm: Vec<i16> = Vec::new();
+            let r = tts.speak("Thanks for calling, how can I help?", &voice, &AtomicBool::new(false), |c| pcm.extend_from_slice(c))?;
+            eprintln!("{draws:?}: {} frames, {:.2} s in {:.2} s", r.frames, r.audio_seconds, r.total_seconds);
+            lines.push(pcm);
+        }
+        assert!(!lines[0].is_empty() && lines[0] == lines[1], "the device's draws are not the host's ({} and {} samples)", lines[0].len(), lines[1].len());
+        Ok(())
+    }
+
     #[test]
     #[ignore = "needs a Qwen3-TTS Base model, a saved voice and a WebGPU adapter"]
     fn a_line_is_spoken_in_chunks_as_fast_as_it_is_heard() -> Result<()> {

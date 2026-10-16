@@ -388,20 +388,6 @@ impl WgpuCodec {
         self.forward_tail(&frames, new.len())
     }
 
-    /// `new` after `before` heard roughly: as [`Self::decode_after_with`], but the stages after the transformer run on
-    /// `new` alone, with nothing before it (zeros where they reach back), so its first samples are not the decode's
-    /// (a fifth of a frame or so). For telling whether a line has begun to speak: a frame in 21 ms on an M5 Pro,
-    /// where the exact decode takes 91.
-    pub fn hear_after(&self, before: &[[u32; 16]], new: &[[u32; 16]], context: usize) -> Result<Vec<f32>> {
-        if new.is_empty() {
-            return Ok(Vec::new());
-        }
-        let context = before.len().min(context);
-        let mut frames = before[before.len() - context..].to_vec();
-        frames.extend_from_slice(new);
-        self.forward_reaching(&frames, new.len(), 0)
-    }
-
     /// One whole decode of `frames` (`frames.len() * 1920` samples).
     fn forward(&self, frames: &[[u32; 16]]) -> Result<Vec<f32>> {
         let x = upload(&self.gpu, &self.rows(frames)?);
@@ -575,6 +561,262 @@ impl WgpuCodec {
     }
 }
 
+/// The rows a causal stage of a stream reads back for: its input's last `rows` rows of `c`, kept from chunk to chunk
+/// (zeros at a stream's start, as a whole decode's padding).
+struct Tail {
+    v: DeviceVec,
+    rows: usize,
+    c: usize,
+}
+
+/// A stream's state ([`WgpuCodec::stream`]): each causal stage's tail and the transformer's keys and values for its
+/// last `window` frames, so a chunk is decoded from its own frames alone and its samples are the whole decode's.
+pub struct StreamState {
+    pre: Tail,
+    /// Each layer's keys and values (`[window, 2 width]`), `kv_rows` of them, and the frames heard (RoPE's positions).
+    kv: Vec<DeviceVec>,
+    kv_rows: usize,
+    position: usize,
+    /// Each upsampling stage's: its transposed convolution's input, its ConvNeXt's.
+    ups: Vec<(Tail, Tail)>,
+    first: Tail,
+    /// Each vocoder block's: its transposed convolution's input (after its SnakeBeta), and each residual unit's two
+    /// convolutions' inputs (after their activations).
+    blocks: Vec<(Tail, Vec<(Tail, Tail)>)>,
+    last: Tail,
+}
+
+impl WgpuCodec {
+    fn zeros(&self, rows: usize, c: usize) -> Tail {
+        Tail { v: upload(&self.gpu, &vec![0f32; rows.max(1) * c]), rows, c }
+    }
+
+    /// A stream from silence: what a whole decode starts from.
+    pub fn stream_start(&self) -> StreamState {
+        let width = self.heads * self.head_dim;
+        StreamState {
+            pre: self.zeros(self.pre_conv.k - 1, self.pre_conv.cin),
+            kv: self.layers.iter().map(|_| self.gpu.vec(self.window * 2 * width)).collect(),
+            kv_rows: 0,
+            position: 0,
+            ups: self.upsample.iter().map(|(u, b)| (self.zeros((u.k - 1) / u.stride, u.cin), self.zeros(b.k - 1, b.pw2.n))).collect(),
+            first: self.zeros(self.first.k - 1, self.first.cin),
+            blocks: self
+                .blocks
+                .iter()
+                .map(|b| {
+                    let units = b.units.iter().map(|u| (self.zeros((u.conv1.k - 1) * u.dilation, u.conv1.cin), self.zeros(u.conv2.k - 1, u.conv2.cin))).collect();
+                    (self.zeros((b.up.k - 1) / b.up.stride, b.up.cin), units)
+                })
+                .collect(),
+            last: self.zeros(self.last.k - 1, self.last.cin),
+        }
+    }
+
+    /// A stream after `frames` (a voice's clip's): the transformer reads them all, the stages after it the last
+    /// [`Self::reach`] of them (all they look back at), and nothing is heard. Its copies ([`Self::stream_copy`]) start
+    /// each line in that voice, where each line decoded the clip's last 120 frames again at each chunk.
+    pub fn stream_after(&self, frames: &[[u32; 16]]) -> Result<StreamState> {
+        let mut state = self.stream_start();
+        if frames.is_empty() {
+            return Ok(state);
+        }
+        let t = frames.len();
+        let x = upload(&self.gpu, &self.rows(frames)?);
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let r = rec.as_mut();
+        let h = self.front_stream(r, &mut state, &x, t);
+        let kept = self.reach.min(t);
+        let h = self.last_rows(r, &h, t, kept, self.output_proj.n);
+        let y = self.back_stream(r, &mut state, h, kept);
+        r.read_range(&y, 0, 1);
+        rec.finish();
+        Ok(state)
+    }
+
+    /// A copy of `state`, made on the device.
+    pub fn stream_copy(&self, state: &StreamState) -> StreamState {
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let r = rec.as_mut();
+        let copy = |r: &mut dyn ChainRecorder, v: &DeviceVec| {
+            let c = self.gpu.vec(v.len);
+            r.copy(v, 0, &c, 0, v.len);
+            c
+        };
+        let tail = |r: &mut dyn ChainRecorder, t: &Tail| Tail { v: copy(r, &t.v), rows: t.rows, c: t.c };
+        let out = StreamState {
+            pre: tail(r, &state.pre),
+            kv: state.kv.iter().map(|v| copy(r, v)).collect(),
+            kv_rows: state.kv_rows,
+            position: state.position,
+            ups: state.ups.iter().map(|(a, b)| (tail(r, a), tail(r, b))).collect(),
+            first: tail(r, &state.first),
+            blocks: state.blocks.iter().map(|(a, units)| (tail(r, a), units.iter().map(|(u, v)| (tail(r, u), tail(r, v))).collect())).collect(),
+            last: tail(r, &state.last),
+        };
+        r.read_range(&out.last.v, 0, 1);
+        rec.finish();
+        out
+    }
+
+    /// The samples of `frames` (1920 a frame) after what `state` has heard: each causal stage reads its new rows
+    /// after its tail, and the transformer its keys and values kept, so a chunk costs its own frames and its samples
+    /// are the whole decode's at any length (where a chunk decoded after 120 frames of context was 48 dB from it).
+    pub fn stream(&self, state: &mut StreamState, frames: &[[u32; 16]]) -> Result<Vec<f32>> {
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = frames.len();
+        let x = upload(&self.gpu, &self.rows(frames)?);
+        let mut rec = self.gpu.begin();
+        rec.keep_groups(false);
+        let r = rec.as_mut();
+        let h = self.front_stream(r, state, &x, n);
+        let y = self.back_stream(r, state, h, n);
+        r.read(&y);
+        rec.finish().pop().ok_or_else(|| err("the waveform was not read"))
+    }
+
+    /// `x`'s `n` new rows (`[n, tail.c]`) after `tail`'s (`[tail.rows + n, c]`, what a causal stage reads), and the tail
+    /// then the last of those rows.
+    fn after_tail(&self, r: &mut dyn ChainRecorder, tail: &mut Tail, x: &DeviceVec, n: usize) -> DeviceVec {
+        if tail.rows == 0 {
+            return x.clone();
+        }
+        let c = tail.c;
+        let all = self.gpu.vec((tail.rows + n) * c);
+        r.copy(&tail.v, 0, &all, 0, tail.rows * c);
+        r.copy(x, 0, &all, tail.rows * c, n * c);
+        r.copy(&all, n * c, &tail.v, 0, tail.rows * c);
+        all
+    }
+
+    /// `y`'s last `n` of its `total` rows of `c`.
+    fn last_rows(&self, r: &mut dyn ChainRecorder, y: &DeviceVec, total: usize, n: usize, c: usize) -> DeviceVec {
+        if total == n {
+            return y.clone();
+        }
+        let out = self.gpu.vec(n * c);
+        r.copy(y, (total - n) * c, &out, 0, n * c);
+        out
+    }
+
+    /// A causal convolution's output for `x`'s `n` new rows, read after its tail.
+    fn conv_stream(&self, r: &mut dyn ChainRecorder, conv: &Conv, dilation: usize, tail: &mut Tail, x: &DeviceVec, n: usize) -> DeviceVec {
+        let all = self.after_tail(r, tail, x, n);
+        let total = tail.rows + n;
+        let y = self.gpu.vec(total * conv.cout);
+        conv.run(r, &all, total, dilation, &y);
+        self.last_rows(r, &y, total, n, conv.cout)
+    }
+
+    /// A transposed convolution's output for `x`'s `n` new rows (`n stride` of them), read after its tail: an output
+    /// step reaches `(k - 1) / stride` inputs back.
+    fn up_stream(&self, r: &mut dyn ChainRecorder, up: &Up, tail: &mut Tail, x: &DeviceVec, n: usize) -> DeviceVec {
+        let all = self.after_tail(r, tail, x, n);
+        let total = tail.rows + n;
+        let y = up.run(&self.gpu, r, &all, total);
+        self.last_rows(r, &y, total * up.stride, n * up.stride, up.cout)
+    }
+
+    /// [`Self::front`] for `n` new frames' codebook rows after what `state` has heard.
+    fn front_stream(&self, r: &mut dyn ChainRecorder, state: &mut StreamState, x: &DeviceVec, n: usize) -> DeviceVec {
+        let q = self.gpu.vec(n * self.project.n);
+        self.project.run(r, x, &q, n);
+        let h = self.conv_stream(r, &self.pre_conv, 1, &mut state.pre, &q, n);
+        self.transformer_stream(r, state, &h, n)
+    }
+
+    /// [`Self::back`] for the transformer's output for `n` new frames (`h`), after what `state` has heard.
+    fn back_stream(&self, r: &mut dyn ChainRecorder, state: &mut StreamState, mut h: DeviceVec, n: usize) -> DeviceVec {
+        let g = &self.gpu;
+        let mut len = n;
+        for ((up, block), (up_tail, dw_tail)) in self.upsample.iter().zip(state.ups.iter_mut()) {
+            h = self.up_stream(r, up, up_tail, &h, len);
+            len *= up.stride;
+            let all = self.after_tail(r, dw_tail, &h, len);
+            let total = dw_tail.rows + len;
+            self.convnext(r, block, &all, total);
+            h = self.last_rows(r, &all, total, len, block.pw2.n);
+        }
+        h = self.conv_stream(r, &self.first, 1, &mut state.first, &h, len);
+        for (b, (up_tail, unit_tails)) in self.blocks.iter().zip(state.blocks.iter_mut()) {
+            b.snake.run(r, &h, len);
+            h = self.up_stream(r, &b.up, up_tail, &h, len);
+            len *= b.up.stride;
+            let c = b.up.cout;
+            for (unit, (t1, t2)) in b.units.iter().zip(unit_tails.iter_mut()) {
+                let u = g.vec(len * c);
+                r.copy(&h, 0, &u, 0, len * c);
+                unit.act1.run(r, &u, len);
+                let v = self.conv_stream(r, &unit.conv1, unit.dilation, t1, &u, len);
+                unit.act2.run(r, &v, len);
+                let w = self.conv_stream(r, &unit.conv2, 1, t2, &v, len);
+                r.axpy_at(&h, &w, &self.one, 0, len * c);
+            }
+        }
+        self.last_snake.run(r, &h, len);
+        let y = self.conv_stream(r, &self.last, 1, &mut state.last, &h, len);
+        r.clamp_in_place(&y, len * self.last.cout, -1., 1.);
+        y
+    }
+
+    /// [`Self::transformer`] for `n` new rows (`x`, `[n, 1024]`) after what `state` has heard: their queries over the
+    /// keys and values kept (the window's last frames) and their own, at their positions; the keys and values then
+    /// kept the window's last.
+    fn transformer_stream(&self, r: &mut dyn ChainRecorder, state: &mut StreamState, x: &DeviceVec, n: usize) -> DeviceVec {
+        let g = &self.gpu;
+        let (hd, nh) = (self.head_dim, self.heads);
+        let (hidden, width) = (self.input_proj.n, nh * hd);
+        let (start, past) = (state.position, state.kv_rows);
+        let table: Vec<f32> = (start..start + n)
+            .flat_map(|p| (0..hd / 2).flat_map(move |i| {
+                let a = p as f64 / self.theta.powf(2. * i as f64 / hd as f64);
+                [a.sin() as f32, a.cos() as f32]
+            }))
+            .collect();
+        let td = upload(g, &table);
+        let v = |n: usize| g.vec(n);
+        let ff = self.layers.first().map_or(0, |l| l.gate.n);
+        let total = past + n;
+        let (h, nn, q, k, vv, kv, att, o) = (v(n * hidden), v(n * hidden), v(n * width), v(n * width), v(n * width), v(total * 2 * width), v(g.attention_rows_out_len(n, nh, hd, total)), v(n * hidden));
+        let (gate, up, act) = (v(n * ff), v(n * ff), v(n * ff));
+        let keep = total.min(self.window);
+        self.input_proj.run(r, x, &h, n);
+        for (l, cache) in self.layers.iter().zip(&state.kv) {
+            r.rmsnorm_rows(&h, &l.input_norm, &nn, n, self.eps);
+            l.q.run(r, &nn, &q, n);
+            l.k.run(r, &nn, &k, n);
+            l.v.run(r, &nn, &vv, n);
+            r.rope_rows(&q, n, nh, hd, &td, true);
+            r.rope_rows(&k, n, nh, hd, &td, true);
+            if past > 0 {
+                r.copy(cache, 0, &kv, 0, past * 2 * width);
+            }
+            r.store_rows(&k, &kv, n, width, past, 2 * width, 0);
+            r.store_rows(&vv, &kv, n, width, past, 2 * width, width);
+            r.attention_rows(&q, &kv, &att, n, nh, nh, hd, past, Some(self.window), 1. / (hd as f32).sqrt());
+            r.copy(&kv, (total - keep) * 2 * width, cache, 0, keep * 2 * width);
+            l.o.run(r, &att, &o, n);
+            r.add_gated_rows(&h, &o, n, hidden, &l.attn_scale, 0, false);
+            r.rmsnorm_rows(&h, &l.post_norm, &nn, n, self.eps);
+            l.gate.run(r, &nn, &gate, n);
+            l.up.run(r, &nn, &up, n);
+            r.silu_mul(&gate, &up, &act, n * ff);
+            l.down.run(r, &act, &o, n);
+            r.add_gated_rows(&h, &o, n, hidden, &l.mlp_scale, 0, false);
+        }
+        state.kv_rows = keep;
+        state.position += n;
+        r.rmsnorm_rows(&h, &self.norm, &nn, n, self.eps);
+        let y = v(n * self.output_proj.n);
+        self.output_proj.run(r, &nn, &y, n);
+        y
+    }
+}
+
 #[cfg(test)]
 mod golden {
     use super::*;
@@ -635,6 +877,60 @@ mod golden {
         let wave = codec.decode(&frames)?;
         eprintln!("{t} frames decoded in {:.3} s ({} samples)", started.elapsed().as_secs_f64(), wave.len());
         assert!(worst < 1e-3, "{worst}");
+        Ok(())
+    }
+
+    /// A stream ([`WgpuCodec::stream`]: each stage's tail and the transformer's keys and values kept) against one whole
+    /// decode of the same frames (`--ignored --nocapture`; OAIY_TTS the model's folder, OAIY_TTS_DEVICE the adapter):
+    /// from silence in chunks of one, two, four and seven frames, and a line's frames after a voice's 120 (its state
+    /// made once and copied for each line), the same samples, and a chunk's cost its own frames'.
+    #[test]
+    #[ignore = "needs Qwen3-TTS's speech tokenizer and a WebGPU adapter"]
+    fn a_stream_is_the_whole_decode() -> Result<()> {
+        let model = std::path::PathBuf::from(std::env::var("OAIY_TTS").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-0.6B-Base".into()));
+        let device = std::env::var("OAIY_TTS_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let gpu = WgpuBackend::nth(device, None).map_err(err)?;
+        let codec = WgpuCodec::load(&model.join("speech_tokenizer").join("model.safetensors"), &gpu)?;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut code = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % CODES as u64) as u32
+        };
+        let frames: Vec<[u32; 16]> = (0..120 + 100).map(|_| std::array::from_fn(|_| code())).collect();
+        let whole = codec.forward(&frames)?;
+        // from silence, in chunks of 1, 2, 4 and 7 frames
+        let mut state = codec.stream_start();
+        let (mut ours, mut at, mut took) = (Vec::new(), 0, 0f64);
+        for n in [1, 2, 4, 7].iter().cycle() {
+            if at >= frames.len() {
+                break;
+            }
+            let end = (at + n).min(frames.len());
+            let started = std::time::Instant::now();
+            ours.extend(codec.stream(&mut state, &frames[at..end])?);
+            took += started.elapsed().as_secs_f64();
+            at = end;
+        }
+        assert_eq!(ours.len(), whole.len());
+        let e = relative(&ours, &whole);
+        eprintln!("a stream of {} frames in chunks of 1, 2, 4 and 7: relative RMS error {e:.2e} ({:.1} dB), {:.1} ms a frame", frames.len(), -20. * e.log10(), took * 1e3 / frames.len() as f64);
+        assert!(e < 1e-4, "{e}");
+        // after a voice's 120 frames, a line's 100 in chunks of 4 (each a copy of the voice's state)
+        let voice = codec.stream_after(&frames[..120])?;
+        for _ in 0..2 {
+            let mut state = codec.stream_copy(&voice);
+            let mut ours = Vec::new();
+            let started = std::time::Instant::now();
+            for chunk in frames[120..].chunks(4) {
+                ours.extend(codec.stream(&mut state, chunk)?);
+            }
+            let took = started.elapsed().as_secs_f64();
+            let e = relative(&ours, &whole[120 * SAMPLES_PER_FRAME..]);
+            eprintln!("after 120 frames, 100 in chunks of 4: relative RMS error {e:.2e} ({:.1} dB), {:.1} ms a frame", -20. * e.log10(), took * 1e3 / 100.);
+            assert!(e < 1e-4, "{e}");
+        }
         Ok(())
     }
 

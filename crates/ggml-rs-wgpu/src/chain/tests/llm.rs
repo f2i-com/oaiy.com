@@ -643,3 +643,70 @@ fn a_narrow_rows_norm_is_the_rows_kernels_bits() {
         }
     }
 }
+
+/// A speech model's code drawn on the device (`sample_top_k`) is a draw from the softmax of the `k` largest logits at
+/// the temperature, as the host's sampler draws: over 8,000 draws of 2,048 logits (the top 50 at 0.9) the counts are
+/// within a few percent of the exact probabilities, and nothing outside the top 50 is drawn; the `k`-th largest's
+/// equals are taken by the lowest indices (ten at 5.0 and 290 at 1.0, a top 40: the ten and the first thirty ones,
+/// each drawn); a temperature of 0 is the largest (the first of equals); the logits may start past the vector's start.
+#[test]
+fn a_draw_on_the_device_is_the_hosts_top_k_softmax() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let up = |v: &[f32]| {
+        let d = b.vec(v.len());
+        DeviceChain::upload(&b, &d, v);
+        d
+    };
+    // (a draw's number in its own vector; each draw here a place of its own, so a stream of its own)
+    let draws = up(&[f32::from_bits(3)]);
+    let drawn = |x: &DeviceVec, from: usize, n: usize, k: usize, t: f32, count: usize| -> Vec<u32> {
+        let out = b.vec(count);
+        let mut rec = Recorder::new(&b);
+        for at in 0..count {
+            rec.sample_top_k(x, from, n, k, t, 7, &draws, &out, at);
+        }
+        rec.read(&out);
+        Box::new(rec).finish().pop().unwrap().iter().map(|v| v.to_bits()).collect()
+    };
+    let mut next = rng(99);
+    let (n, k, t, count) = (2048usize, 50usize, 0.9f32, 8000usize);
+    let logits: Vec<f32> = (0..n).map(|_| next() * 6.0).collect();
+    let mut padded = vec![-1.0f32; 37];
+    padded.extend_from_slice(&logits);
+    let x = up(&padded);
+    let got = drawn(&x, 37, n, k, t, count);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b)));
+    let top = &order[..k];
+    let weights: Vec<f64> = top.iter().map(|&i| ((logits[i] - logits[top[0]]) as f64 / t as f64).exp()).collect();
+    let total: f64 = weights.iter().sum();
+    let mut seen = vec![0usize; n];
+    for &i in &got {
+        assert!(top.contains(&(i as usize)), "drew {i}, not one of the top {k}");
+        seen[i as usize] += 1;
+    }
+    let distance: f64 = top.iter().zip(&weights).map(|(&i, w)| (seen[i] as f64 / count as f64 - w / total).abs()).sum::<f64>() / 2.0;
+    eprintln!("8,000 draws of the top {k} of {n}: total variation from the exact softmax {distance:.4}");
+    assert!(distance < 0.05, "the draws are not the softmax's: total variation {distance}");
+    // ties at the k-th largest: the lowest indices
+    let mut tied = vec![1.0f32; 300];
+    for i in [3usize, 40, 77, 120, 151, 199, 222, 250, 280, 299] {
+        tied[i] = 5.0;
+    }
+    let x = up(&tied);
+    let got = drawn(&x, 0, 300, 40, 1000.0, 3000);
+    let mut want: Vec<usize> = (0..300).filter(|&i| tied[i] == 5.0).collect();
+    want.extend((0..300).filter(|&i| tied[i] == 1.0).take(30));
+    let mut drew: Vec<usize> = got.iter().map(|&i| i as usize).collect();
+    drew.sort();
+    drew.dedup();
+    want.sort();
+    assert_eq!(drew, want, "the top 40 of ties: the ten fives and the first thirty ones");
+    // greedy: the first of the largest
+    let mut flat = vec![0.5f32; 1000];
+    flat[600] = 2.0;
+    flat[900] = 2.0;
+    let x = up(&flat);
+    assert_eq!(drawn(&x, 0, 1000, 50, 0.0, 3), vec![600, 600, 600]);
+    assert_eq!(drawn(&x, 0, 1000, 1, 0.9, 2), vec![600, 600]);
+}
