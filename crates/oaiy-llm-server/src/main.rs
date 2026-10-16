@@ -1,4 +1,4 @@
-//! oaiy-llm-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible HTTP API,
+//! oaiy-llm-server: OAIY's language models behind an OpenAI-compatible HTTP API,
 //! for chat clients and coding harnesses.
 //!
 //!   oaiy-llm-server --model DIR [--port 8000] [--host 127.0.0.1] [--devices 1,0] ...
@@ -11,7 +11,7 @@
 
 use oaiy_llm_server::Options;
 
-const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|INDEX --observer-vram-gb N (optional; packed weights budget defaults to 16 GiB)\n\noaiy-llm-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible API
+const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|INDEX --observer-vram-gb N (optional; packed weights budget defaults to 16 GiB)\n\noaiy-llm-server: OAIY's language models (GGUF, EXL3 and DeepSeek-V4.1) behind an OpenAI-compatible API
 
   --host ADDR          listen address (default 127.0.0.1; 0.0.0.0 for the network)
   --port N             port (default 8000)
