@@ -13,55 +13,27 @@
 //! OS, and `silent` keeps the server's log off the host's terminal.
 
 // No `unsafe` but where a CPU kernel's SIMD calls must be (each behind a runtime check of the CPU's features, each
-// with its `SAFETY:`): `dsv41::simd` and `llm::glm5next::cpu_experts::dot`, which allow it; anywhere else it is an error.
+// with its `SAFETY:`): `dsv41::simd` and `llm::arch::glm5next::cpu_experts::dot`, which allow it; anywhere else it is an error.
 #![deny(unsafe_code)]
 // The DeepSeek engine that called these helpers (the repetition and tool-phase guards, the
 // observer's internals) was the CUDA build's: they stand for the WebGPU engine to take up
 // (`dsv41_portable`), and until it does nothing calls them.
 #![allow(dead_code)]
 
+// The OpenAI-compatible endpoints.
 mod api;
-mod disk;
-// The request/reply types every engine shares, under the name the DeepSeek-V4.1 worker
-// had them by (`engine`).
-mod job;
-mod engine {
-    pub use crate::job::*;
-}
-// Which backend runs GGUF models: WebGPU or the CPU.
-mod backend;
-pub mod observer;
-mod tool_phase;
-mod repetition;
-// GLM-5.3-Flash served through the same job/event contract.
-pub mod glm;
-// the configured models, and swapping between them.
+// The configured models, and swapping between them.
 pub mod models;
-mod http;
-mod qwen;
-mod lfm2;
-// OrcaSAQ (EXL3: packed on any GPU through WebGPU, else decoded on the CPU), its PEFT adapters and its Qwen vision
-// tower.
-mod orcasaq;
-// Qwen3.8-Flash-Next (qwen4_exp, EXL3, on any GPU through WebGPU).
-#[cfg(feature = "webgpu")]
-mod flashnext;
-// The vision tower an EXL3 checkpoint comes with (OrcaSAQ's, Flash-Next's), on the model's backend.
-#[cfg(feature = "webgpu")]
-mod qwen_vision;
-// DeepSeek-V4.1 without CUDA: the CPU model with its dense trunk on the WebGPU adapter.
-#[cfg(feature = "webgpu")]
-mod dsv41_portable;
-pub mod dsv41;
+// The engines that serve them, and what they share: the job a request becomes and the events its reply streams as,
+// the backend GGUF models run on, prompt states on disk.
+pub mod engines;
+// What keeps a reply in bounds: the repetition and tool-phase guards, the observer.
+pub mod guards;
+// The media worker (pictures, video, speech, music, sound, 3D) as a subprocess, and its catalog.
+pub mod media;
+// The models themselves: the GGUF ones and DeepSeek-V4.1.
 pub mod llm;
-mod lora;
-mod qwen_cache;
-// Conversations Qwen3.8-Flash-Next sets aside in host RAM.
-mod qwen_park;
-#[cfg(test)]
-mod qwen_real;
-pub mod images;
-mod media_catalog;
+pub mod dsv41;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -77,7 +49,7 @@ use std::time::{Duration, Instant};
 /// state written before then holds a recurrent state built with a transposed
 /// decay. Reusing one puts the model straight back into the degeneration the fix
 /// removed -- and it would look like the fix not working, on exactly the prompts a
-/// harness repeats. See `crate::llm::glm5next::kda`.
+/// harness repeats. See `crate::llm::arch::glm5next::kda`.
 const STATE_FORMAT: u8 = 2;
 
 /// Context length when `--ctx` is not given, and for a model that names no
@@ -335,7 +307,7 @@ pub struct Running {
     addr: SocketAddr,
     accept: JoinHandle<()>,
     activity: Arc<Activity>,
-    images: Arc<images::Images>,
+    images: Arc<media::Images>,
 }
 
 /// Requests under way, and when the last one ended.
@@ -455,7 +427,7 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
         ));
     }
 
-    let images = Arc::new(images::Images::new(Arc::clone(&models)));
+    let images = Arc::new(media::Images::new(Arc::clone(&models)));
     let server = Arc::new(api::Server {
         images: Arc::clone(&images),
         models: Arc::clone(&models),
@@ -476,7 +448,7 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
                 let requests = Arc::clone(&requests);
                 let peer = stream.peer_addr().map(|p| p.to_string()).unwrap_or_default();
                 std::thread::spawn(move || {
-                    http::serve(stream, |req, w| {
+                    oaiy_engine::http::serve(stream, |req, w| {
                         let t = Instant::now();
                         requests.active.fetch_add(1, Ordering::Relaxed);
                         let keep = server.handle(req, w);

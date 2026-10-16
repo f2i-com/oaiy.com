@@ -16,32 +16,19 @@
 
 #![deny(rust_2018_idioms)]
 
-mod chain_decode;
-mod chain_gemma4;
-pub mod chain_gemma4v;
-mod chain_minicpmv;
-mod chain_mmproj;
-mod chain_qwen35;
-pub use chain_qwen35::{Qwen35Chain, Tapped, SPEC_ROWS};
+// Each architecture's forward pass (GLM-5.3-Flash's in `glm5next`), and the same models chained on a GPU's device
+// in one submission.
+pub mod arch;
+pub mod chain;
+pub use chain::qwen35::{Qwen35Chain, Tapped, SPEC_ROWS};
 pub mod chat;
 pub mod config;
-pub mod gemma3;
-pub mod gemma4;
-pub mod gemma3n;
 pub mod json_fsm;
-pub mod gemma4moe;
 pub mod kv_cache;
-pub mod llama;
 pub mod loader;
-pub mod mixtral;
-pub mod mmproj;
 pub mod moe;
-pub mod qwen3;
-pub mod glm5next; // GLM-5.3-Flash
-pub mod qwen3moe;
-pub mod qwen35;
-pub mod qwen35moe;
 pub mod sampler;
+// Pictures: their preprocessing, and the vision towers and projectors of an mmproj GGUF.
 pub mod vision;
 // streaming MoE expert backend — experts read on demand
 // from the .gguf file through OAIY's bounded Ecache instead of
@@ -55,25 +42,25 @@ pub use chat::{apply_chat_template, chat_stop_tokens, ChatMessage, Role};
 // choice of thinking or not, which a server needs to pass through.
 pub use chat::{glm5next_template_full, glm5next_template_with, ReasoningEffort};
 pub use config::{Architecture, LlamaConfig, ModelConfig};
-pub use gemma3::Gemma3Model;
-pub use gemma3n::Gemma3nModel;
-pub use gemma4::Gemma4Model;
-pub use gemma4moe::Gemma4MoeModel;
+pub use arch::gemma3::Gemma3Model;
+pub use arch::gemma3n::Gemma3nModel;
+pub use arch::gemma4::Gemma4Model;
+pub use arch::gemma4moe::Gemma4MoeModel;
 pub use kv_cache::KvCache;
-pub use llama::LlamaModel;
-pub use mixtral::{MixtralBlock, MixtralModel};
+pub use arch::llama::LlamaModel;
+pub use arch::mixtral::{MixtralBlock, MixtralModel};
 pub use loader::{
     load_tensor_f32, BlockTensors, CommonBlockTensors, CommonTensors, ModelTensors, TensorIndex,
 };
-pub use qwen3::Qwen3Model;
-pub use qwen3moe::{Qwen3MoeBlock, Qwen3MoeModel};
+pub use arch::qwen3::Qwen3Model;
+pub use arch::qwen3moe::{Qwen3MoeBlock, Qwen3MoeModel};
 // GLM-5.3-Flash
-pub use glm5next::{Glm5NextBlock, Glm5NextConfig, Glm5NextModel, LayerKind};
-pub use qwen35::{ExpertBlocks, ExpertsMaker, Qwen35Block, Qwen35Model, Qwen35Moe, SsmConfig};
+pub use arch::glm5next::{Glm5NextBlock, Glm5NextConfig, Glm5NextModel, LayerKind};
+pub use arch::qwen35::{ExpertBlocks, ExpertsMaker, Qwen35Block, Qwen35Model, Qwen35Moe, SsmConfig};
 pub mod multimodal_rope;
-pub use qwen35moe::{Qwen35MoeBlock, Qwen35MoeModel};
+pub use arch::qwen35moe::{Qwen35MoeBlock, Qwen35MoeModel};
 pub use sampler::{SampleParams, Sampler};
-pub use mmproj::{Gemma4VMmProj, MmProj, MmProjConfig, Projector, ProjectorKind, SigLipMmProj};
+pub use vision::mmproj::{Gemma4VMmProj, MmProj, MmProjConfig, Projector, ProjectorKind, SigLipMmProj};
 pub use moe::{moe_forward, MoeFfn};
 pub use vision::{preprocess_image, preprocess_image_bytes, VisionConfig};
 

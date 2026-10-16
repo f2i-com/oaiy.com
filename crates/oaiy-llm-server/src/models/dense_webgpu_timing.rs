@@ -216,17 +216,17 @@ fn a_chained_flashnext_step_answers_as_its_own_path() {
         Box::new(move |d| b.exl3(d))
     };
     let p = std::path::Path::new(&path);
-    let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+    let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
     let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
         gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
     };
     // (FLASHNEXT_LORA: a PEFT adapter's folder, applied as the weights load: the chain runs each adapted
     // projection with its update beside it, and must answer as the host's path does with the same adapter)
-    let adapters: Vec<crate::lora::Adapter> = std::env::var("FLASHNEXT_LORA")
+    let adapters: Vec<crate::engines::lora::Adapter> = std::env::var("FLASHNEXT_LORA")
         .ok()
-        .map(|dir| vec![crate::lora::Adapter::open_for(std::path::Path::new(&dir), &crate::flashnext::lora_base(p).unwrap()).unwrap()])
+        .map(|dir| vec![crate::engines::lora::Adapter::open_for(std::path::Path::new(&dir), &crate::engines::flashnext::lora_base(p).unwrap()).unwrap()])
         .unwrap_or_default();
-    let model = crate::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, false).unwrap();
+    let model = crate::engines::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, false).unwrap();
     if let Some(a) = adapters.first() {
         eprintln!("with a LoRA for {} projections", a.len());
     }
@@ -320,13 +320,13 @@ fn a_flashnext_adapter_for_its_experts_changes_its_answer_and_one_of_zeros_does_
             Box::new(move |d| b.exl3(d))
         };
         let p = std::path::Path::new(&path);
-        let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+        let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
         let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
             gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
         };
-        let adapters: Vec<crate::lora::Adapter> = adapter.map(|dir| vec![crate::lora::Adapter::open_for(std::path::Path::new(dir), &crate::flashnext::lora_base(p).unwrap()).unwrap()]).unwrap_or_default();
+        let adapters: Vec<crate::engines::lora::Adapter> = adapter.map(|dir| vec![crate::engines::lora::Adapter::open_for(std::path::Path::new(dir), &crate::engines::flashnext::lora_base(p).unwrap()).unwrap()]).unwrap_or_default();
         let t = std::time::Instant::now();
-        let model = crate::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, false).unwrap();
+        let model = crate::engines::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, false).unwrap();
         eprintln!("loaded in {:.1} s{}", t.elapsed().as_secs_f64(), adapters.first().map(|a| format!(", with a LoRA for {} projections", a.len())).unwrap_or_default());
         let prompt: Vec<u32> = model.tokenizer.encode("Write a short story about a cat called Moss who lives on a boat.", false).unwrap();
         let (mut kh, mut kc) = (model.new_kv_cache(prompt.len() + steps + 8), model.new_kv_cache(prompt.len() + steps + 8));
@@ -378,11 +378,11 @@ fn flashnext_chunks_run_together_answer_as_one_at_a_time() {
         Box::new(move |d| b.exl3(d))
     };
     let p = std::path::Path::new(&path);
-    let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+    let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
     let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
         gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
     };
-    let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
+    let model = crate::engines::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
     let tokens: Vec<u32> = (0..2148u32).map(|i| 1000 + (i * 7919) % 20000).collect();
     let spans = [(0usize, 512usize), (512, 1024), (1024, 1536), (1536, 2048), (2048, 2148)];
     let embeds: Vec<ggml_rs::Tensor> = spans.iter().map(|&(a, z)| model.embed_text(&tokens[a..z]).unwrap()).collect();
@@ -451,11 +451,11 @@ fn flashnext_chunks_keep_the_states_their_stops_would() {
         Box::new(move |d| b.exl3(d))
     };
     let p = std::path::Path::new(&path);
-    let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+    let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
     let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
         gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
     };
-    let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
+    let model = crate::engines::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
     let n: usize = std::env::var("FLASHNEXT_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
     let tokens: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
     let taps = [n - 7, n - 1];
@@ -574,11 +574,11 @@ fn flashnext_chunks_of_1024_answer_as_512s() {
         Box::new(move |d| b.exl3(d))
     };
     let p = std::path::Path::new(&path);
-    let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+    let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
     let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
         gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
     };
-    let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
+    let model = crate::engines::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
     if model.prompt_rows() < 1024 {
         eprintln!("chunks of {} here: nothing to compare", model.prompt_rows());
         return;
@@ -645,11 +645,11 @@ fn a_chained_flashnext_attends_past_the_dense_span_as_its_own_path() {
         Box::new(move |d| b.exl3(d))
     };
     let p = std::path::Path::new(&path);
-    let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+    let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
     let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
         gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
     };
-    let model = crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
+    let model = crate::engines::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap();
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
     let cosine = |a: &[f32], b: &[f32]| {
         let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
@@ -722,18 +722,18 @@ fn a_flashnext_check_answers_as_its_steps_do() {
         Box::new(move |d| b.exl3(d))
     };
     let p = std::path::Path::new(&path);
-    let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+    let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
     let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
         gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
     };
     // FLASHNEXT_DRAFT: with the prediction layer, a draft before each check (it changes nothing a check reads)
     let drafting = std::env::var_os("FLASHNEXT_DRAFT").is_some();
     // FLASHNEXT_LORA: an adapter's folder (or a GGUF LoRA), applied as the weights load: its rows are its steps' too
-    let adapters: Vec<crate::lora::Adapter> = std::env::var("FLASHNEXT_LORA")
+    let adapters: Vec<crate::engines::lora::Adapter> = std::env::var("FLASHNEXT_LORA")
         .ok()
-        .map(|dir| vec![crate::lora::Adapter::open_for(std::path::Path::new(&dir), &crate::flashnext::lora_base(p).unwrap()).unwrap()])
+        .map(|dir| vec![crate::engines::lora::Adapter::open_for(std::path::Path::new(&dir), &crate::engines::flashnext::lora_base(p).unwrap()).unwrap()])
         .unwrap_or_default();
-    let model = crate::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, drafting).unwrap();
+    let model = crate::engines::flashnext::load_portable_with(p, backends, &adapters, &packed, &experts, drafting).unwrap();
     if let Some(a) = adapters.first() {
         eprintln!("with a LoRA for {} projections", a.len());
     }
@@ -847,11 +847,11 @@ fn a_drafting_flashnext_answers_as_its_steps_do() {
         Box::new(move |d| b.exl3(d))
     };
     let p = std::path::Path::new(&path);
-    let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+    let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
     let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
         gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
     };
-    let model = crate::flashnext::load_portable(p, backends, &packed, &experts, true).unwrap();
+    let model = crate::engines::flashnext::load_portable(p, backends, &packed, &experts, true).unwrap();
     assert!(model.warm_up() && model.drafts(), "the layer chained");
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
     let cosine = |a: &[f32], b: &[f32]| {
@@ -907,7 +907,7 @@ fn a_drafting_flashnext_answers_as_its_steps_do() {
                 src += 1;
                 continue;
             }
-            let drafted = model.draft(&kv, &seq[seq.len().saturating_sub(crate::flashnext::CHECK_ROWS + 1)..], drafts_a_check).filter(|d| !d.is_empty());
+            let drafted = model.draft(&kv, &seq[seq.len().saturating_sub(crate::engines::flashnext::CHECK_ROWS + 1)..], drafts_a_check).filter(|d| !d.is_empty());
             match drafted.and_then(|d| {
                 let rows: Vec<u32> = std::iter::once(next).chain(d.iter().copied()).collect();
                 Some((d, model.check(&rows, &mut kv)?))
@@ -979,11 +979,11 @@ fn measure_flashnext_mtp_acceptance() {
         Box::new(move |d| b.exl3(d))
     };
     let p = std::path::Path::new(&path);
-    let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+    let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
     let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
         gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
     };
-    let model = crate::flashnext::load_portable(p, backends, &packed, &experts, true).unwrap();
+    let model = crate::engines::flashnext::load_portable(p, backends, &packed, &experts, true).unwrap();
     for (d, g) in gpus.iter().enumerate() {
         let (used, budget) = g.usage();
         eprintln!("GPU {d}: {:.1} GB of {:.1} GB", used as f64 / 1e9, budget as f64 / 1e9);
@@ -1077,11 +1077,11 @@ fn measure_a_chained_flashnext() {
             super::flashnext_gguf_on(std::path::Path::new(&g), &gpus, backends, mtp.as_deref().map(std::path::Path::new)).unwrap()
         }
         Err(_) => {
-            let reserve = crate::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
+            let reserve = crate::engines::flashnext::dense_exl3_bytes(p).unwrap() / backends.len() as u64 + (1 << 30);
             let experts = |device: usize, _layer: &str, list: Vec<[ggml_rs::exl3::Exl3Data; 3]>| -> oaiy_engine::Result<Box<dyn ggml_rs::exl3::Experts>> {
                 gpus[device].exl3_experts_leaving(list, reserve).map_err(oaiy_engine::Error::Arg)
             };
-            crate::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap()
+            crate::engines::flashnext::load_portable(p, backends, &packed, &experts, false).unwrap()
         }
     };
     let tokens: Vec<u32> = (0..16_400u32).map(|i| 1000 + (i * 7919) % 20000).collect();
@@ -1148,7 +1148,7 @@ fn measure_a_chained_flashnext() {
     }
     // checks of drafts as the server makes them (`Flashnext::check`: every row's logits, the run kept undoable):
     // each a mean of 6 after one to warm
-    for rows in 2..=crate::flashnext::CHECK_ROWS {
+    for rows in 2..=crate::engines::flashnext::CHECK_ROWS {
         let mut wall = 0.0;
         for rep in 0..7 {
             let toks: Vec<u32> = (0..rows as u32).map(|i| 3000 + i * 31 + rep * 7).collect();
@@ -1160,7 +1160,7 @@ fn measure_a_chained_flashnext() {
             if rep > 0 {
                 wall += ms;
             }
-            if rep == 6 && rows == 4.min(crate::flashnext::CHECK_ROWS) {
+            if rep == 6 && rows == 4.min(crate::engines::flashnext::CHECK_ROWS) {
                 report(&format!("a check of {rows} rows"), ms);
             }
             runs += 1;
@@ -1169,7 +1169,7 @@ fn measure_a_chained_flashnext() {
     }
     // the same with the rows' tokens picked on the GPU (a greedy request's), a picked run and one that reads its
     // logits in turn on the same tokens: each a mean of 6 after one of each to warm
-    for rows in 1..=4usize.min(crate::flashnext::CHECK_ROWS) {
+    for rows in 1..=4usize.min(crate::engines::flashnext::CHECK_ROWS) {
         let (mut picked, mut read) = (0.0, 0.0);
         for rep in 0..7 {
             let toks: Vec<u32> = (0..rows as u32).map(|i| 4000 + i * 31 + rep * 7).collect();
@@ -1498,7 +1498,7 @@ fn measure_a_chained_qwen35() {
     // (a GGUF, or an EXL3 checkpoint's folder: OrcaSAQ's, its projections packed on the device)
     let model = if std::path::Path::new(&path).is_dir() {
         let gpu = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().expect("the WebGPU backend");
-        crate::orcasaq::load_portable(std::path::Path::new(&path), Arc::clone(&backend), &|d| gpu.exl3(d)).unwrap()
+        crate::engines::orcasaq::load_portable(std::path::Path::new(&path), Arc::clone(&backend), &|d| gpu.exl3(d)).unwrap()
     } else {
         let gguf = gguf::GgufFile::open(&path).unwrap();
         crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap()
@@ -2056,7 +2056,7 @@ fn a_chained_runs_rows_are_its_devices_alone_and_come_back_where_wanted() {
     let first = chained(&mut a, &prompt);
     assert!(a.device_rows.is_some() && a.host_valid() == 0, "{} rows on the host", a.host_valid());
     // a disk's whole state of it (its rows read from the device), restored into another cache: the host's, until a run
-    let whole = crate::qwen_cache::Snapshot::capture(&a, &m.attention_layers, m.backend.as_ref());
+    let whole = crate::engines::qwen::cache::Snapshot::capture(&a, &m.attention_layers, m.backend.as_ref());
     let mut b = model.new_kv_cache(4096);
     whole.restore(&mut b, &m.attention_layers, m.ssm_cfg, m.backend.as_ref()).unwrap();
     assert_eq!(b.host_valid(), prompt.len());

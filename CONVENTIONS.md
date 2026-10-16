@@ -13,7 +13,7 @@ crates (`oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-image`, `dsv41`)
   to the server, are covered below.)
 - **No `unsafe`** in `oaiy-engine`, `oaiy-llm-cli`, `oaiy-studio` or `oaiy-image`: their crate roots say
   `#![forbid(unsafe_code)]`. `oaiy-llm-server`'s says `#![deny(unsafe_code)]`, allowed in its two CPU kernels' SIMD
-  calls alone (`dsv41::simd` and `llm::glm5next::cpu_experts::dot`, each behind a runtime check of the CPU). Where a
+  calls alone (`dsv41::simd` and `llm::arch::glm5next::cpu_experts::dot`, each behind a runtime check of the CPU). Where a
   crate outside that list needs it, every block has a `SAFETY:` comment explaining why safe Rust cannot express it and
   what makes it sound.
 - **Weights are read in place.** GGUF and safetensors, as published. No converters and

@@ -46,7 +46,7 @@ tools.
 
 ## Chat and tools
 
-`crates/oaiy-llm-server/src/lfm2.rs` writes the prompt as its `chat_template.jinja` does: `<|startoftext|>`, ChatML,
+`crates/oaiy-llm-server/src/engines/lfm2/mod.rs` writes the prompt as its `chat_template.jinja` does: `<|startoftext|>`, ChatML,
 the tools listed in the system message as JSON (`List of tools: [...]`), a reply's thinking kept after the last user
 message and dropped before it, and the reply opened on `<think>`. A request that does not think gets `<think></think>`.
 

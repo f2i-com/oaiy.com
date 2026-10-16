@@ -42,7 +42,7 @@ pub enum Architecture {
     Qwen3VlMoe,
     /// Qwen3.6-MoE — qwen35 SSM-hybrid backbone + 256-expert MoE + shared
     /// expert (DeepSeek-V2 / Qwen3-Next pattern). Targets Qwen3.6-35B-A3B.
-    /// `arch=qwen35moe`. Forward in `crates/oaiy-llm-server/src/llm/qwen35moe.rs`.
+    /// `arch=qwen35moe`. Forward in `crates/oaiy-llm-server/src/llm/arch/qwen35moe.rs`.
     Qwen35Moe,
     /// Qwen3.6-MoE-VL — same as Qwen3.6 (qwen35 backbone) + MoE + Qwen3-VL
     /// vision tower. Three-way pending: MoE loader (#85), vision tower (#84),

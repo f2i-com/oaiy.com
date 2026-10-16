@@ -33,13 +33,13 @@ minicpmv.rs`):
   merger (attention within each 2 x 2 window of patches, then the four as one), then the final merger (each 2 x 2 of
   tokens through an MLP into the language model's width): a 448 x 448 tile is 64 tokens (16x), or 256 (4x).
 - **The prompt**: each picture `<image_id>N</image_id><image>` + the overview's tokens + `</image>`, then the slices row
-  by row, each between `<slice>` and `</slice>`, the rows apart by a newline (`crates/oaiy-llm-server/src/qwen.rs`,
+  by row, each between `<slice>` and `</slice>`, the rows apart by a newline (`crates/oaiy-llm-server/src/engines/qwen/mod.rs`,
   `prepare_minicpmv`).
 - **Canvas M-RoPE** (`canvas_positions`): a picture's tokens and markers hold the time channel at the canvas's origin
   (where `<image>` stands), rows and columns counted from it, the slices laid out over the canvas and the overview
   stretched across it; the text after a picture goes on from the origin past the canvas's longer side.
 
-On a GPU the tower is chained (`crates/oaiy-llm-server/src/llm/chain_minicpmv.rs`): its patches taken in the mergers' order from
+On a GPU the tower is chained (`crates/oaiy-llm-server/src/llm/chain/minicpmv.rs`): its patches taken in the mergers' order from
 the start, so each merge is rows as they lie; the window attention (four tokens a window) runs on the host.
 
 ## Speed

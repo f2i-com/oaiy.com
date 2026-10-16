@@ -33,8 +33,8 @@ use crate::dsv41::config::VisionConfig;
 use crate::dsv41::vision;
 use oaiy_engine::json::Json;
 
-use crate::engine::{Event, Finish, Job, JobImage, Sampling};
-use crate::http::{respond, Request, Stream};
+use crate::engines::job::{Event, Finish, Job, JobImage, Sampling};
+use oaiy_engine::http::{respond, Request, Stream};
 
 pub struct Config {
     pub model_name: String,
@@ -52,7 +52,7 @@ pub struct Config {
     pub vision: Option<VisionConfig>,
     pub qwen_vision: Option<crate::llm::MmProjConfig>,
     /// MiniCPM-V 4.7's pictures (a Qwen3.5 model with its projector): cut into tiles and laid out on canvases.
-    pub minicpmv: Option<crate::qwen::MiniCpmV>,
+    pub minicpmv: Option<crate::engines::qwen::MiniCpmV>,
     /// Gemma 4's pictures, where its vision projector is loaded.
     pub gemma_vision: Option<GemmaVision>,
     /// GLM-5.3 Flash's pictures, where its vision projector is loaded.
@@ -78,12 +78,12 @@ pub struct GemmaVision {
 /// picture is at most.
 #[derive(Clone, Debug)]
 pub struct GlmVision {
-    pub shape: crate::llm::glm5next::vision::VisionShape,
+    pub shape: crate::llm::arch::glm5next::vision::VisionShape,
     pub max_tokens: usize,
 }
 
 pub struct Server {
-    pub images: Arc<crate::images::Images>,
+    pub images: Arc<crate::media::Images>,
     // more than one configured model, switched on demand.
     /// The configured models and whichever is loaded. A request naming a different
     /// one unloads the current model first — see [`crate::models::Models::activate`].
@@ -210,7 +210,7 @@ impl Server {
         let result = match (req.method.as_str(), path) {
             ("POST", "/v1/images/generations") => {
                 match Self::parse_body(req).and_then(|body| {
-                    crate::images::reference_paths(&body,self.local_images).map_err(bad)?;
+                    crate::media::reference_paths(&body,self.local_images).map_err(bad)?;
                     self.images.submit(&body).map_err(bad)
                 }) {
                     Ok(job)=>return json_response(w,202,&job),Err(e)=>Err(e),
@@ -219,7 +219,7 @@ impl Server {
             ("POST", "/v1/videos/generations") => {
                 match Self::parse_body(req).and_then(|body| {
                     for key in ["image", "end_image"] {
-                        crate::images::video_reference_path(&body, key, self.local_images).map_err(bad)?;
+                        crate::media::video_reference_path(&body, key, self.local_images).map_err(bad)?;
                     }
                     self.images.submit_video(&body).map_err(bad)
                 }) {
@@ -409,10 +409,10 @@ impl Server {
     /// the prompt into image spans.
     fn prepare_images(&self, a: &crate::models::Active, records: &[Json], prompt: Vec<u32>) -> Result<(Vec<u32>, Vec<JobImage>), ApiError> {
         if let Some(m) = &a.cfg.minicpmv {
-            return crate::qwen::prepare_minicpmv(records, prompt, a.cfg.image_token_id, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(bad);
+            return crate::engines::qwen::prepare_minicpmv(records, prompt, a.cfg.image_token_id, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(bad);
         }
         if let Some(vc) = &a.cfg.qwen_vision {
-            return crate::qwen::prepare_images(records, prompt, a.cfg.image_token_id, vc, self.local_images, a.cfg.max_seq).map_err(bad);
+            return crate::engines::qwen::prepare_images(records, prompt, a.cfg.image_token_id, vc, self.local_images, a.cfg.max_seq).map_err(bad);
         }
         if let Some(gv) = &a.cfg.gemma_vision {
             return gemma_images(records, prompt, a.cfg.image_token_id, gv, self.local_images, a.cfg.max_seq).map_err(bad);
@@ -435,7 +435,7 @@ impl Server {
             preps.push(prep);
         }
         let (ids, starts) = vision::expand_placeholders(&prompt, a.cfg.image_token_id, &preps).map_err(|e| bad(e.to_string()))?;
-        let images = preps.into_iter().zip(starts).zip(hashes).map(|((prep, start), hash)| JobImage { start, prep: crate::engine::ImagePrep::Deepseek(prep), hash }).collect();
+        let images = preps.into_iter().zip(starts).zip(hashes).map(|((prep, start), hash)| JobImage { start, prep: crate::engines::job::ImagePrep::Deepseek(prep), hash }).collect();
         Ok((ids, images))
     }
 
@@ -476,7 +476,7 @@ pub(crate) fn gemma_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv
         let side = 3 * gv.patch;
         let tokens = (pixels.dim(1) / side) * (pixels.dim(2) / side);
         ids.push(gv.open);
-        images.push(JobImage { start: ids.len(), prep: crate::engine::ImagePrep::Gemma { pixels, tokens }, hash: crate::disk::fnv(&bytes, 0) });
+        images.push(JobImage { start: ids.len(), prep: crate::engines::job::ImagePrep::Gemma { pixels, tokens }, hash: crate::engines::disk::fnv(&bytes, 0) });
         ids.extend(std::iter::repeat_n(image_id, tokens));
         ids.push(gv.close);
     }
@@ -502,9 +502,9 @@ pub(crate) fn glm_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv: 
         }
         let i = images.len() + 1;
         let bytes = vision::image_bytes(records.next().expect("a record a marker"), local).map_err(|e| format!("image {i}: {e}"))?;
-        let (pixels, width, height) = crate::llm::glm5next::vision::preprocess_bytes_within(&bytes, &gv.shape, gv.max_tokens).map_err(|e| format!("image {i}: {e}"))?;
+        let (pixels, width, height) = crate::llm::arch::glm5next::vision::preprocess_bytes_within(&bytes, &gv.shape, gv.max_tokens).map_err(|e| format!("image {i}: {e}"))?;
         let tokens = gv.shape.n_out_tokens(width / gv.shape.patch, height / gv.shape.patch);
-        images.push(JobImage { start: ids.len(), prep: crate::engine::ImagePrep::Glm { pixels, width, height, tokens }, hash: crate::disk::fnv(&bytes, 0) });
+        images.push(JobImage { start: ids.len(), prep: crate::engines::job::ImagePrep::Glm { pixels, width, height, tokens }, hash: crate::engines::disk::fnv(&bytes, 0) });
         ids.extend(std::iter::repeat_n(image_id, tokens));
     }
     if ids.len() >= max_seq {
@@ -893,7 +893,7 @@ impl Server {
                 }
                 let mut send = |v: Json| s.send(format!("data: {}\n\n", v.to_json()).as_bytes());
                 if let Some(e) = &error {
-                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(TOOL_CONTRACT_CODE) { TOOL_CONTRACT_CODE } else if e.contains(crate::repetition::CODE) { crate::repetition::CODE } else if e.contains(crate::observer::CODE) { crate::observer::CODE } else { "server_error" }))]))]));
+                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(TOOL_CONTRACT_CODE) { TOOL_CONTRACT_CODE } else if e.contains(crate::guards::repetition::CODE) { crate::guards::repetition::CODE } else if e.contains(crate::guards::observer::CODE) { crate::guards::observer::CODE } else { "server_error" }))]))]));
                 } else {
                     if !tool_calls.is_empty() {
                         send(chunk(Json::obj([("tool_calls", Json::Arr(tool_calls))]), None)).map_err(io_err)?;
@@ -921,11 +921,11 @@ impl Server {
                     return Ok(false);
                 }
                 if let Some(e) = error {
-                    let repetition = e.contains(crate::repetition::CODE);
-                    let observer = e.contains(crate::observer::CODE);
+                    let repetition = e.contains(crate::guards::repetition::CODE);
+                    let observer = e.contains(crate::guards::observer::CODE);
                     let tool_contract = e.contains(TOOL_CONTRACT_CODE);
                     return Err(ApiError { status: if repetition || observer || tool_contract { 422 } else { 500 }, message: e,
-                        code: if tool_contract { TOOL_CONTRACT_CODE } else if repetition { crate::repetition::CODE } else if observer { crate::observer::CODE } else { "server_error" } });
+                        code: if tool_contract { TOOL_CONTRACT_CODE } else if repetition { crate::guards::repetition::CODE } else if observer { crate::guards::observer::CODE } else { "server_error" } });
                 }
                 let mut message = vec![
                     ("role".to_string(), Json::str("assistant")),
@@ -1184,7 +1184,7 @@ fn observer_review_policy(body: &Json) -> Result<(), ApiError> {
 }
 
 fn validate_completed_tool_contract(body: &Json, draft: &str) -> Result<(), String> {
-    crate::observer::validate_tools(&observer_context(body), draft)
+    crate::guards::observer::validate_tools(&observer_context(body), draft)
         .map_err(|e| format!("{TOOL_CONTRACT_CODE}: {e}; no tool from this batch was executed"))
 }
 

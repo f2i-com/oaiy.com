@@ -1,5 +1,5 @@
 //! Vision-language demo for Gemma 4 (E2B / E4B): its vision tower (`Gemma4VMmProj`, chained on a GPU's device by
-//! `chain_gemma4v`), the picture's soft tokens spliced into the prompt in place of its `<|image|>` markers
+//! `chain::gemma4v`), the picture's soft tokens spliced into the prompt in place of its `<|image|>` markers
 //! (`Gemma4Model::forward_spliced`, whose PLE reads the padding's row there, as Transformers does), and Gemma 4's chat
 //! template (`<|turn>user\n<|image>` + one `<|image|>` a soft token + `<image|>{prompt}<turn|>\n<|turn>model\n`).
 //!

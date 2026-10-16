@@ -607,7 +607,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
     ///
     /// Per state row `(h, i)`, with the decay on the **kq** axis -- so it varies
     /// along the row, and every row of a head is scaled by the same vector. See
-    /// `oaiy_llm_server::llm::glm5next::kda` for the reference kernel this is read off; having
+    /// `oaiy_llm_server::llm::arch::glm5next::kda` for the reference kernel this is read off; having
     /// it transposed here is a per-token error that compounds, and reads as a
     /// long-prompt bug rather than a wrong one.
     ///

@@ -1,5 +1,5 @@
 """Write golden cases for the Rust DeepSeek-V4.1 chat encoding
-(crates/oaiy-llm-server/src/dsv41/chat.rs) from the reference encoding/encoding.py.
+(crates/oaiy-llm-server/src/dsv41/chat/mod.rs) from the reference encoding/encoding.py.
 
 Two kinds of case: `encode` (messages + options -> prompt text, image
 records) and `parse` (a completion -> the assistant message, or an error).

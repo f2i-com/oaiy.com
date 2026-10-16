@@ -2,7 +2,7 @@
 
 Oaiy reads turboderp's EXL3 quantization of Qwen3.8-Flash-Next
 ([turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3),
-branch `3.05bpw_h5_ng5`) directly from its safetensors (`crates/oaiy-llm-server/src/flashnext.rs`).
+branch `3.05bpw_h5_ng5`) directly from its safetensors (`crates/oaiy-llm-server/src/engines/flashnext/mod.rs`).
 No Python runtime or conversion is involved.
 
 The model has 125B parameters with 6B active per token, plus a 51B-parameter n-gram
@@ -259,7 +259,7 @@ The Qwen3.5 hybrid and the other engines are not changed.
 ### Checking it
 
 The logic runs on the CPU, with no model: `cargo test -p oaiy-llm-server --lib qwen`.
-That includes `qwen_real.rs`, which drives the real
+That includes `engines/qwen/real.rs`, which drives the real
 `QwenEngine::run` with a fake model whose answers depend on every row and recurrent tensor of the
 cache, and compares an engine that sets conversations aside with one that does not over randomized
 scripts (`PARK_FUZZ_SEEDS` sets how many). (The CUDA build had one more, on the real cards:

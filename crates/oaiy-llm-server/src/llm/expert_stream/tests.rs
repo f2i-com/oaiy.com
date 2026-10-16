@@ -263,9 +263,9 @@ fn streamed_expert_matches_resident_expert() {
         let down_stacked = idx
             .take_weight(&format!("blk.{l}.ffn_down_exps.weight"), &[])
             .expect("down");
-        let gates = crate::llm::qwen3moe::split_stacked_experts(gate_stacked, N_EXPERTS).unwrap();
-        let ups = crate::llm::qwen3moe::split_stacked_experts(up_stacked, N_EXPERTS).unwrap();
-        let downs = crate::llm::qwen3moe::split_stacked_experts(down_stacked, N_EXPERTS).unwrap();
+        let gates = crate::llm::arch::qwen3moe::split_stacked_experts(gate_stacked, N_EXPERTS).unwrap();
+        let ups = crate::llm::arch::qwen3moe::split_stacked_experts(up_stacked, N_EXPERTS).unwrap();
+        let downs = crate::llm::arch::qwen3moe::split_stacked_experts(down_stacked, N_EXPERTS).unwrap();
 
         let stream = shared.layer(l as u32);
         let iter = gates.into_iter().zip(ups.into_iter()).zip(downs.into_iter());
@@ -579,9 +579,9 @@ fn forward_with_logits_matches_resident_moe() {
         let down_stacked = idx
             .take_weight(&format!("blk.{l}.ffn_down_exps.weight"), &[])
             .expect("down");
-        let gates = crate::llm::qwen3moe::split_stacked_experts(gate_stacked, N_EXPERTS).unwrap();
-        let ups = crate::llm::qwen3moe::split_stacked_experts(up_stacked, N_EXPERTS).unwrap();
-        let downs = crate::llm::qwen3moe::split_stacked_experts(down_stacked, N_EXPERTS).unwrap();
+        let gates = crate::llm::arch::qwen3moe::split_stacked_experts(gate_stacked, N_EXPERTS).unwrap();
+        let ups = crate::llm::arch::qwen3moe::split_stacked_experts(up_stacked, N_EXPERTS).unwrap();
+        let downs = crate::llm::arch::qwen3moe::split_stacked_experts(down_stacked, N_EXPERTS).unwrap();
         let pairs: Vec<FfnPair> = gates
             .into_iter()
             .zip(ups)

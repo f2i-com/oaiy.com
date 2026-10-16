@@ -10,7 +10,7 @@ the Apache License, Version 2.0 (see LICENSE-APACHE).
 
 crates/oaiy-llm-server/src/dsv41 implements DeepSeek-V4.1 following
 DeepSeek's reference inference code (inference/model.py) and chat
-encoding (encoding/encoding.py); crates/oaiy-llm-server/src/dsv41/chat.rs ports the
+encoding (encoding/encoding.py); crates/oaiy-llm-server/src/dsv41/chat/mod.rs ports the
 encoding rule for rule, including its prompt templates. That reference
 code and the model weights are published by DeepSeek under the MIT
 License.

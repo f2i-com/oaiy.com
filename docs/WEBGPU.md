@@ -847,7 +847,7 @@ dense families.
 ## Dense models on the GPU (2026-10-05)
 
 A Llama's, Qwen3's or Gemma 3's decode step is one submit (`ggml_rs::chain`, a
-`DeviceChain` the WebGPU backend implements; `llm::chain_decode`): every
+`DeviceChain` the WebGPU backend implements; `llm::chain::decode`): every
 layer's norm, q, k and v (Qwen3's and Gemma 3's per-head norms), RoPE (its sines
 and cosines made on the host as the CPU's rope makes them, a table each base and
 scaling among the layers), the K and V stored into a copy of the KV cache kept on
@@ -887,7 +887,7 @@ kernels (above) made it 7.7 ms.
 
 ### Gemma 4 and its pictures (2026-10-14)
 
-Gemma 4's dense models are chained too (`llm::chain_gemma4`; measured with E2B), as the op-by-op
+Gemma 4's dense models are chained too (`llm::chain::gemma4`; measured with E2B), as the op-by-op
 `forward_embeds` computes it: the per-layer inputs (the embeddings through the PLE
 projection and its norm, plus the tokens' rows of the PLE table), then each layer's q
 (per-head norm, RoPE by the layer's own base and divisors), k and v where the layer
@@ -923,7 +923,7 @@ matrices of a prompt's rows go on the tensor cores too (`matmul_f16_rows_ranged`
 prompt that diverges partway (a conversation's next turn, whose last reply the
 template writes back) keeps the shared part and reads only what follows.
 
-Its pictures go through its mmproj's vision tower (`chain_gemma4v`, given with
+Its pictures go through its mmproj's vision tower (`chain::gemma4v`, given with
 `--vision-projector name=mmproj.gguf`), as Transformers' `Gemma4VisionModel` and
 llama.cpp's `gemma4v` compute it: the picture sized as Gemma 4's processor sizes it
 (its aspect kept, at most 280 soft tokens of 3 x 3 patches of 16 pixels, bicubic),
@@ -988,7 +988,7 @@ queue's staging: the 27B's load 18.2 to 16.7 s.
 
 ## Qwen3.5 and Qwen3.8 27B on the GPU (2026-10-05)
 
-Qwen3.5's hybrid (Qwen3.5 4B, 9B and 27B, Qwen3.8 27B: `llm::chain_qwen35`) runs a decode step or a prompt's chunk in one submit too. Its
+Qwen3.5's hybrid (Qwen3.5 4B, 9B and 27B, Qwen3.8 27B: `llm::chain::qwen35`) runs a decode step or a prompt's chunk in one submit too. Its
 gated delta net layers' projections, causal conv and recurrence run on the GPU:
 a workgroup a value head, a thread a row of its state, the row held in registers
 through the run's tokens (43 us a layer for a step of Qwen3.8 27B when each

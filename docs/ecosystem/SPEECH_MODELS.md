@@ -119,7 +119,7 @@ Everything in-process in Rust on ONNX Runtime, CPU, int8.
 | Piece | Where | For |
 |---|---|---|
 | A reader for PyTorch checkpoints that runs no code | `crates/oaiy-media/src/sound/pth.rs` | `.nemo` weights (needs `LongStorage`, and the shared-storage LSTM tensors checked) |
-| torchaudio-exact resampling, FFT, Slaney filters | `crates/oaiy-media/src/ltx/audio.rs` | 24 kHz in → 16 kHz |
+| torchaudio-exact resampling, FFT, Slaney filters | `crates/oaiy-media/src/ltx/audio/mod.rs` | 24 kHz in → 16 kHz |
 | librosa mel filters, STFT as a GPU conv, a Mimi encoder | `crates/oaiy-media/src/tts/clone.rs` | the mel front end; Pocket TTS cloning |
 | Qwen3 decoder with KV cache; a depth decoder | `tts/model.rs`, `tts/breeze.rs` | MOSS later |
 | SentencePiece | `crates/tokenizer/src/spm.rs` | greedy longest-match: fine for Parakeet, not Pocket TTS (needs Viterbi) |
