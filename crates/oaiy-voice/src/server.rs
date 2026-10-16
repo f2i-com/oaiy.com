@@ -59,6 +59,13 @@ pub trait TextToSpeech: Send + Sync {
     /// Speak `text`, handing out 16-bit mono PCM at [`SPEECH_RATE`] as it is
     /// made; `on_chunk` returning false (or `cancel` set) stops it.
     fn speak(&self, text: &str, voice: Option<&str>, cancel: Arc<AtomicBool>, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String>;
+    /// Make `text` whole and keep it to be said from memory when it is asked for (a caller's greeting, made as the
+    /// call settles): how like its voice it came out and its seed, where it was made. Nothing, where the engine
+    /// keeps nothing.
+    fn prepare(&self, text: &str, voice: Option<&str>) -> Result<Option<(f64, u64)>, String> {
+        let _ = (text, voice);
+        Ok(None)
+    }
 }
 
 pub struct Server {
@@ -188,6 +195,19 @@ impl Server {
         let Some(tts) = &self.tts else { return answer(w, Response::error(503, "server_error", "no text-to-speech model is loaded")) };
         if let Err(e) = tts.check_voice(voice) {
             return answer(w, Response::bad(e));
+        }
+        // ("prepare": made whole and kept, to be said from memory when asked for; nothing is said now)
+        if json.get("prepare").and_then(Json::as_bool) == Some(true) {
+            return match tts.prepare(text, voice) {
+                Ok(made) => {
+                    let body = match made {
+                        Some((likeness, seed)) => Json::obj([("prepared", Json::Bool(true)), ("likeness", Json::Num(likeness)), ("seed", Json::Int(seed as i64))]),
+                        None => Json::obj([("prepared", Json::Bool(false))]),
+                    };
+                    answer(w, Response::json(200, body))
+                }
+                Err(e) => answer(w, Response::error(500, "server_error", e)),
+            };
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
@@ -493,6 +513,9 @@ mod tests {
         let wav = audio::write_wav(&[0.0; 16], 16_000);
         let body = format!("{{\"audio\":\"{}\"}}", b64(&wav)).into_bytes();
         assert_eq!(server(Mode::Tts).handle(&post("/v1/audio/transcriptions", "application/json", body)).status, 404);
+        // a line prepared where the engine keeps nothing: nothing to do, said so
+        let prepared = served(&server(Mode::Both), &post("/v1/audio/speech", "application/json", br#"{"input":"hi","prepare":true}"#.to_vec()));
+        assert!(prepared.starts_with("HTTP/1.1 200") && prepared.contains(r#""prepared":false"#), "{prepared}");
         let speech = post("/v1/audio/speech", "application/json", b"{\"input\":\"hi\"}".to_vec());
         assert!(served(&server(Mode::Stt), &speech).starts_with("HTTP/1.1 404"));
         assert_eq!(server(Mode::Stt).handle(&Request::new("GET", "/nope", vec![], vec![])).status, 404);

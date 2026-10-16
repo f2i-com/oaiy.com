@@ -1113,6 +1113,15 @@ where
                                     opening = Opening::after(Instant::now(), outbound, delay);
                                     if opening.is_none() {
                                         speak(greeting.clone(), true, None);
+                                    } else {
+                                        // Made while the line settles, and kept by the speech server (made again where it does
+                                        // not sound like the voice): said from memory, at once, when it is due.
+                                        let (engines, voice, text) = (engines.clone(), voice.clone(), greeting.clone());
+                                        tokio::spawn(async move {
+                                            if let Err(e) = engines.prepare(&text, voice.as_deref()).await {
+                                                log::warn!("voice: the greeting was not made ahead: {e}");
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -1935,13 +1944,15 @@ mod tests {
         line_ms: Arc<AtomicU64>,
         /// Where not 0: each line streamed as the engine streams it, 80 ms of it this many ms after the last.
         piece_ms: Arc<AtomicU64>,
+        /// The lines it was asked to make ahead (`prepare`), and when, in order.
+        prepared: Arc<Mutex<Vec<(String, Instant)>>>,
         /// What it was asked to speak, in order.
         spoken: Arc<Mutex<Vec<String>>>,
     }
 
     impl SpeechServer {
         fn new() -> Self {
-            Self { heard: Arc::new(Mutex::new("Hello?".into())), hearing_ms: Arc::new(AtomicU64::new(0)), line_ms: Arc::new(AtomicU64::new(LINE_MS)), piece_ms: Arc::default(), spoken: Arc::default() }
+            Self { heard: Arc::new(Mutex::new("Hello?".into())), hearing_ms: Arc::new(AtomicU64::new(0)), line_ms: Arc::new(AtomicU64::new(LINE_MS)), piece_ms: Arc::default(), prepared: Arc::default(), spoken: Arc::default() }
         }
 
         /// What the caller's utterances are heard as, from now on.
@@ -1968,13 +1979,18 @@ mod tests {
 
         async fn serve(&self) -> String {
             use axum::routing::post;
-            let (line_ms, spoken, piece_ms) = (self.line_ms.clone(), self.spoken.clone(), self.piece_ms.clone());
+            let (line_ms, spoken, piece_ms, prepared) = (self.line_ms.clone(), self.spoken.clone(), self.piece_ms.clone(), self.prepared.clone());
             let (heard, hearing_ms) = (self.heard.clone(), self.hearing_ms.clone());
             let app = axum::Router::new()
                 .route(
                     "/v1/audio/speech",
                     post(move |axum::Json(body): axum::Json<Value>| {
-                        spoken.lock().unwrap().push(body["input"].as_str().unwrap_or("").to_string());
+                        let ahead = body["prepare"].as_bool() == Some(true);
+                        if ahead {
+                            prepared.lock().unwrap().push((body["input"].as_str().unwrap_or("").to_string(), Instant::now()));
+                        } else {
+                            spoken.lock().unwrap().push(body["input"].as_str().unwrap_or("").to_string());
+                        }
                         let line = audio::bytes(&vec![120i16; WIRE_RATE as usize * line_ms.load(Ordering::SeqCst) as usize / 1000]);
                         let every = piece_ms.load(Ordering::SeqCst);
                         async move {
@@ -2456,6 +2472,20 @@ mod tests {
         aokie.begin(json!({"greetingDelayMs": 3_000}));
         let (at, _) = aokie.first_audio(secs(6)).await.expect("the line");
         assert!(at < Duration::from_millis(1_000), "said {at:?} after it began");
+    }
+
+    /// The greeting, settled on as the call begins, is made ahead while the line settles (the speech server keeps
+    /// it, made again where it does not sound like the voice), well before it is said.
+    #[tokio::test]
+    async fn the_greeting_is_made_ahead_while_the_line_settles() {
+        let mut aokie = Aokie::start(json!({"greeting": "Thanks for calling."})).await;
+        aokie.begin(json!({}));
+        let (said, _) = aokie.first_audio(secs(6)).await.expect("the greeting");
+        let prepared = aokie.speech.prepared.lock().unwrap().clone();
+        assert_eq!(prepared.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), vec!["Thanks for calling."], "made ahead once");
+        let ahead = said.saturating_sub(prepared[0].1.duration_since(aokie.begun));
+        assert!(ahead > Duration::from_millis(1_000), "made {ahead:?} before it was said");
+        assert_eq!(aokie.speech.spoken(), vec!["Thanks for calling."], "and said");
     }
 
     /// A line streamed as the engine streams it (80 ms pieces, twice as fast as real time) reaches Aokie as a first

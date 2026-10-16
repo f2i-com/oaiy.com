@@ -118,7 +118,20 @@ pub struct Spoken {
     pub first_chunk_seconds: Option<f64>,
     pub total_seconds: f64,
     pub cancelled: bool,
+    /// How like its voice a short line sounds ([`LIKENESS`]), where it was made whole and is short enough to keep.
+    pub likeness: Option<f64>,
+    /// The seed it was made with.
+    pub seed: u64,
 }
+
+/// The likeness to its voice ([`oaiy_media::tts::realtime::WgpuTts::likeness`]) a line must have to be kept: the
+/// talker's draws make one line in twenty or so in another speaker's voice (0.97 or less, where the voice's own score
+/// 0.98 or more), and every line is made with the same seed, so a line that came out so would come out so every time
+/// (a caller's greeting, call after call).
+pub const LIKENESS: f64 = 0.976;
+/// The makings a line being prepared has ([`Speaker::prepare`]): each with the next seed, until one sounds like its
+/// voice; the most like it is kept.
+const PREPARE_TRIES: u64 = 3;
 
 struct Job {
     text: String,
@@ -126,6 +139,19 @@ struct Job {
     cancel: Arc<AtomicBool>,
     chunks: mpsc::Sender<Vec<i16>>,
     done: mpsc::Sender<Result<Spoken, String>>,
+    /// The line, where it is short enough to keep: one kept since it was asked for (a greeting being prepared as
+    /// it was asked to be said) is said from memory.
+    line: Option<Line>,
+    /// Made whole and kept, not said ([`Speaker::prepare`]).
+    prepare: bool,
+}
+
+/// The lines kept, the most recent last, and the seed a line is made with where it is not 0 (a line that came out
+/// unlike its voice is made with the next seed the next time).
+#[derive(Default)]
+struct Kept {
+    lines: Vec<(Line, Arc<Vec<i16>>)>,
+    seeds: HashMap<Line, u64>,
 }
 
 /// The engine, on its thread.
@@ -134,12 +160,12 @@ pub struct Speaker {
     pub model: String,
     pub device: String,
     pub voices: Voices,
-    remembered: Mutex<Vec<(Line, Arc<Vec<i16>>)>>,
+    remembered: Arc<Mutex<Kept>>,
 }
 
 /// A short line in a voice, as [`Speaker`] keeps what it said: its clip (and the clip's time and size: a changed clip
 /// is a new voice) and its words.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct Line {
     clip: PathBuf,
     stamp: (Option<SystemTime>, u64),
@@ -178,13 +204,15 @@ impl Speaker {
         let model = setup.model_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "qwen3-tts".into());
         let voices = setup.voices.clone();
         let gpu = setup.gpu;
+        let remembered = Arc::new(Mutex::new(Kept::default()));
+        let kept = Arc::clone(&remembered);
         std::thread::Builder::new()
             .name("oaiy-voice tts".into())
-            .spawn(move || engine(setup, inbox, ready_tx))
+            .spawn(move || engine(setup, inbox, ready_tx, kept))
             .map_err(|e| format!("the speech thread: {e}"))?;
         let loaded = ready.recv().map_err(|_| "the speech engine stopped while loading".to_string())??;
         eprintln!("[oaiy-voice] {loaded}");
-        Ok(Self { jobs, model, device: format!("webgpu:{gpu}"), voices, remembered: Mutex::default() })
+        Ok(Self { jobs, model, device: format!("webgpu:{gpu}"), voices, remembered })
     }
 
     /// The line `text` in `voice` is, where it is short enough to keep.
@@ -200,20 +228,28 @@ impl Speaker {
 
     /// A kept line's audio (now the most recent).
     fn recall(&self, line: &Line) -> Option<Arc<Vec<i16>>> {
-        let mut kept = self.remembered.lock().unwrap_or_else(|p| p.into_inner());
-        let at = kept.iter().position(|(l, _)| l == line)?;
-        let entry = kept.remove(at);
-        let pcm = Arc::clone(&entry.1);
-        kept.push(entry);
-        Some(pcm)
+        recall(&self.remembered, line)
     }
 
     fn remember(&self, line: Line, pcm: Vec<i16>) {
-        let mut kept = self.remembered.lock().unwrap_or_else(|p| p.into_inner());
-        kept.retain(|(l, _)| l != &line);
-        kept.push((line, Arc::new(pcm)));
-        let over = kept.len().saturating_sub(REMEMBERED);
-        kept.drain(..over);
+        remember(&self.remembered, line, pcm);
+    }
+
+    /// Make `text` in `voice` whole and keep it, said by no one: a caller's greeting, made as the call settles, is
+    /// then said from memory when it is due. Each making is heard for how like its voice it sounds, and made again
+    /// with the next seed where it is not ([`LIKENESS`], [`PREPARE_TRIES`]); the most like it is kept. A line too long
+    /// to keep, or kept already, is nothing to do.
+    pub fn prepare(&self, text: &str, voice: Option<&str>) -> Result<Option<Spoken>, String> {
+        let Some(line) = self.line(text, voice) else { return Ok(None) };
+        if self.recall(&line).is_some() {
+            return Ok(None);
+        }
+        let (chunks, _pcm) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        self.jobs
+            .send(Job { text: text.to_string(), voice: voice.map(str::to_string), cancel: Arc::new(AtomicBool::new(false)), chunks, done, line: Some(line), prepare: true })
+            .map_err(|_| "the speech engine has stopped".to_string())?;
+        result.recv().map_err(|_| "the speech engine stopped mid-line".to_string())?.map(Some)
     }
 
     /// Speak `text` in `voice` (the default when `None`), handing each piece of
@@ -222,8 +258,9 @@ impl Speaker {
     pub fn say(&self, text: &str, voice: Option<&str>, cancel: Arc<AtomicBool>, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<Spoken, String> {
         let (chunks, pcm) = mpsc::channel();
         let (done, result) = mpsc::channel();
+        let line = self.line(text, voice);
         self.jobs
-            .send(Job { text: text.to_string(), voice: voice.map(str::to_string), cancel: Arc::clone(&cancel), chunks, done })
+            .send(Job { text: text.to_string(), voice: voice.map(str::to_string), cancel: Arc::clone(&cancel), chunks, done, line, prepare: false })
             .map_err(|_| "the speech engine has stopped".to_string())?;
         // The pieces end when the engine drops its sender (the line is done).
         for piece in pcm {
@@ -247,6 +284,10 @@ impl crate::server::TextToSpeech for Speaker {
 
     fn check_voice(&self, voice: Option<&str>) -> Result<(), String> {
         self.voices.clip(voice).map(|_| ())
+    }
+
+    fn prepare(&self, text: &str, voice: Option<&str>) -> Result<Option<(f64, u64)>, String> {
+        Ok(Speaker::prepare(self, text, voice)?.map(|s| (s.likeness.unwrap_or(0.), s.seed)))
     }
 
     fn speak(&self, text: &str, voice: Option<&str>, cancel: Arc<AtomicBool>, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String> {
@@ -277,9 +318,16 @@ impl crate::server::TextToSpeech for Speaker {
                 spoken.total_seconds,
                 spoken.first_chunk_seconds.unwrap_or(0.) * 1e3
             );
-            // Kept only where it was heard to its end: a line cut short, kept, was said cut short every time after.
+            // Kept only where it was heard to its end (a line cut short, kept, was said cut short every time after), and
+            // sounds like its voice: one that does not is made with the next seed the next time.
             if let (Some(line), Some(pcm), false) = (line, heard.filter(|h| !h.is_empty()), stopped.load(Ordering::Relaxed)) {
-                self.remember(line, pcm);
+                match spoken.likeness {
+                    Some(like) if like < LIKENESS => {
+                        eprintln!("[oaiy-voice] a line came out unlike its voice (likeness {like:.3}): not kept, made with another seed the next time");
+                        self.remembered.lock().unwrap_or_else(|p| p.into_inner()).seeds.insert(line, spoken.seed + 1);
+                    }
+                    _ => self.remember(line, pcm),
+                }
             }
         }
         Ok(())
@@ -287,7 +335,7 @@ impl crate::server::TextToSpeech for Speaker {
 }
 
 /// The engine's thread: load, then speak each job in turn.
-fn engine(setup: Setup, inbox: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<String, String>>) {
+fn engine(setup: Setup, inbox: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<String, String>>, kept: Arc<Mutex<Kept>>) {
     let started = Instant::now();
     let loaded = Tts::load(&setup.model_dir, setup.gpu).map_err(|e| format!("{}: {e}", setup.model_dir.display()));
     let mut tts = match loaded {
@@ -312,26 +360,88 @@ fn engine(setup: Setup, inbox: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<S
     };
     let _ = ready.send(Ok(format!("loaded {} on GPU {}, {} through WebGPU, in {:.1} s{default}", setup.model_dir.display(), setup.gpu, tts.adapter(), started.elapsed().as_secs_f64())));
     for job in inbox {
+        // (a line kept since it was asked for, a greeting prepared as it was asked to be said: from memory)
+        if !job.prepare {
+            if let Some(pcm) = job.line.as_ref().and_then(|l| recall(&kept, l)) {
+                for piece in pcm.chunks(RECALL_PIECE) {
+                    if job.cancel.load(Ordering::Relaxed) || job.chunks.send(piece.to_vec()).is_err() {
+                        break;
+                    }
+                }
+                let seconds = pcm.len() as f64 / 24_000.;
+                drop(job.chunks);
+                let _ = job.done.send(Ok(Spoken { audio_seconds: seconds, first_chunk_seconds: Some(0.), total_seconds: 0., cancelled: false, likeness: None, seed: 0 }));
+                continue;
+            }
+        }
+        let first_seed = job.line.as_ref().and_then(|l| kept.lock().unwrap_or_else(|p| p.into_inner()).seeds.get(l).copied()).unwrap_or(0);
         let result = setup.voices.clip(job.voice.as_deref()).and_then(|clip| voices.voice(&mut tts, &clip)).and_then(|voice| {
+            if job.prepare {
+                // Made whole and heard, again with the next seed where it is not like its voice; the most like it kept.
+                let mut best: Option<(f64, u64, Vec<i16>, oaiy_tts::SpeakReport)> = None;
+                for seed in first_seed..first_seed + PREPARE_TRIES {
+                    tts.options.sampling.seed = seed;
+                    let mut pcm: Vec<i16> = Vec::new();
+                    let made = tts.speak(&job.text, &voice, &job.cancel, |piece| pcm.extend_from_slice(piece));
+                    tts.options.sampling.seed = 0;
+                    let report = made.map_err(|e| e.to_string())?;
+                    let like = tts.likeness(&pcm, &voice).map_err(|e| e.to_string())?;
+                    eprintln!("[oaiy-voice] prepared a line with seed {seed}: likeness {like:.3}");
+                    if best.as_ref().is_none_or(|b| like > b.0) {
+                        best = Some((like, seed, pcm, report));
+                    }
+                    if like >= LIKENESS {
+                        break;
+                    }
+                }
+                let (like, seed, pcm, report) = best.ok_or("nothing was made")?;
+                if let Some(line) = job.line.clone() {
+                    remember(&kept, line.clone(), pcm);
+                    kept.lock().unwrap_or_else(|p| p.into_inner()).seeds.insert(line, seed);
+                }
+                return Ok(Spoken { audio_seconds: report.audio_seconds, first_chunk_seconds: None, total_seconds: report.total_seconds, cancelled: false, likeness: Some(like), seed });
+            }
             let chunks = job.chunks.clone();
             let cancel = Arc::clone(&job.cancel);
-            let report = tts
-                .speak(&job.text, &voice, &job.cancel, |pcm| {
-                    if chunks.send(pcm.to_vec()).is_err() {
-                        cancel.store(true, Ordering::Relaxed);
-                    }
-                })
-                .map_err(|e| e.to_string())?;
-            Ok(Spoken {
-                audio_seconds: report.audio_seconds,
-                first_chunk_seconds: report.first_chunk_seconds,
-                total_seconds: report.total_seconds,
-                cancelled: report.finish == oaiy_tts::Finish::Cancelled,
-            })
+            // (a short line's samples kept to hear how like its voice it sounds)
+            let mut made: Vec<i16> = Vec::new();
+            let keepable = job.line.is_some();
+            tts.options.sampling.seed = first_seed;
+            let spoken = tts.speak(&job.text, &voice, &job.cancel, |pcm| {
+                if keepable {
+                    made.extend_from_slice(pcm);
+                }
+                if chunks.send(pcm.to_vec()).is_err() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            tts.options.sampling.seed = 0;
+            let report = spoken.map_err(|e| e.to_string())?;
+            let cancelled = report.finish == oaiy_tts::Finish::Cancelled;
+            let likeness = if keepable && !cancelled && !made.is_empty() { tts.likeness(&made, &voice).ok() } else { None };
+            Ok(Spoken { audio_seconds: report.audio_seconds, first_chunk_seconds: report.first_chunk_seconds, total_seconds: report.total_seconds, cancelled, likeness, seed: first_seed })
         });
         drop(job.chunks);
         let _ = job.done.send(result);
     }
+}
+
+/// A kept line's audio (now the most recent).
+fn recall(kept: &Mutex<Kept>, line: &Line) -> Option<Arc<Vec<i16>>> {
+    let mut kept = kept.lock().unwrap_or_else(|p| p.into_inner());
+    let at = kept.lines.iter().position(|(l, _)| l == line)?;
+    let entry = kept.lines.remove(at);
+    let pcm = Arc::clone(&entry.1);
+    kept.lines.push(entry);
+    Some(pcm)
+}
+
+fn remember(kept: &Mutex<Kept>, line: Line, pcm: Vec<i16>) {
+    let mut kept = kept.lock().unwrap_or_else(|p| p.into_inner());
+    kept.lines.retain(|(l, _)| l != &line);
+    kept.lines.push((line, Arc::new(pcm)));
+    let over = kept.lines.len().saturating_sub(REMEMBERED);
+    kept.lines.drain(..over);
 }
 
 /// Voices made so far, by clip (a changed clip is made again).
@@ -388,7 +498,7 @@ mod tests {
     fn a_short_line_said_once_is_kept_and_a_changed_clip_is_a_new_voice() {
         let dir = folder("kept", &[("phone.wav", "RIFF")]);
         let (jobs, _inbox) = mpsc::channel();
-        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Mutex::default() };
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Arc::default() };
         let okay = speaker.line(" Okay — ", None).expect("a short line");
         assert!(speaker.recall(&okay).is_none(), "nothing said yet");
         speaker.remember(okay.clone(), vec![1, 2, 3]);
@@ -420,10 +530,10 @@ mod tests {
                 for piece in [vec![1i16; 4], vec![2; 4], vec![3; 4]] {
                     let _ = job.chunks.send(piece);
                 }
-                let _ = job.done.send(Ok(Spoken { audio_seconds: 0.0005, first_chunk_seconds: Some(0.0), total_seconds: 0.0, cancelled: false }));
+                let _ = job.done.send(Ok(Spoken { audio_seconds: 0.0005, first_chunk_seconds: Some(0.0), total_seconds: 0.0, cancelled: false, likeness: Some(0.99), seed: 0 }));
             }
         });
-        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Mutex::default() };
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Arc::default() };
         // the caller hangs up after the first piece: it is not kept as the line, to be said cut short next time
         let mut heard = Vec::new();
         speaker.speak("Okay —", None, Arc::new(AtomicBool::new(false)), &mut |pcm| {
@@ -443,6 +553,41 @@ mod tests {
         // heard to its end: kept whole
         speaker.speak("Okay —", None, Arc::new(AtomicBool::new(false)), &mut |_| true).unwrap();
         assert_eq!(speaker.recall(&speaker.line("Okay —", None).unwrap()).as_deref(), Some(&[vec![1i16; 4], vec![2; 4], vec![3; 4]].concat()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A short line that came out unlike its voice is not kept, and is made with the next seed the next time; a
+    /// line kept while it waited (a greeting prepared as it was asked to be said) is said from memory by the engine.
+    #[test]
+    fn a_line_unlike_its_voice_is_made_again_with_another_seed() {
+        use crate::server::TextToSpeech as _;
+        let dir = folder("unlike", &[("phone.wav", "RIFF")]);
+        let (jobs, inbox) = mpsc::channel::<Job>();
+        let seeds = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::clone(&seeds);
+        let kept: Arc<Mutex<Kept>> = Arc::default();
+        let engine_kept = Arc::clone(&kept);
+        // A stand-in engine: each line's seed noted (as the real one reads it from what is kept), its first making
+        // unlike the voice, the next like it.
+        std::thread::spawn(move || {
+            for job in inbox {
+                let seed = job.line.as_ref().and_then(|l| engine_kept.lock().unwrap().seeds.get(l).copied()).unwrap_or(0);
+                asked.lock().unwrap().push(seed);
+                let _ = job.chunks.send(vec![seed as i16 + 1; 4]);
+                let likeness = if seed == 0 { 0.95 } else { 0.99 };
+                let _ = job.done.send(Ok(Spoken { audio_seconds: 0.0002, first_chunk_seconds: Some(0.0), total_seconds: 0.0, cancelled: false, likeness: Some(likeness), seed }));
+            }
+        });
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: kept };
+        let greeting = "Hello Jeff, thanks for calling.";
+        speaker.speak(greeting, None, Arc::new(AtomicBool::new(false)), &mut |_| true).unwrap();
+        assert!(speaker.recall(&speaker.line(greeting, None).unwrap()).is_none(), "unlike its voice: not kept");
+        speaker.speak(greeting, None, Arc::new(AtomicBool::new(false)), &mut |_| true).unwrap();
+        assert_eq!(*seeds.lock().unwrap(), vec![0, 1], "made again with the next seed");
+        assert_eq!(speaker.recall(&speaker.line(greeting, None).unwrap()).as_deref(), Some(&vec![2i16; 4]), "like its voice: kept");
+        // said again: from memory, the engine not asked
+        speaker.speak(greeting, None, Arc::new(AtomicBool::new(false)), &mut |_| true).unwrap();
+        assert_eq!(seeds.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

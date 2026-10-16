@@ -181,6 +181,20 @@ reference the WebGPU one is written against, whose GPU was CUDA's. On WebGPU:
   thread of its own, a line's chunks one frame, then two, then four, each made before the
   one before it has played.
 
+- **A line unlike its voice is not kept.** The talker's draws now and then make a line in
+  another speaker's voice: 2 lines in 40 in the receptionist voice, at the model's own
+  sampling (temperature 0.9, top 50), whatever the temperature (0.75 drifted as often; 0.6
+  rambled), on the host's draws and the device's alike. The speaker encoder tells: such a
+  line is 0.97 or less like the voice's clip, its own lines 0.98 or more
+  (`WgpuTts::likeness`, 30 ms a line on the CPU; a line's first second does not tell, so a
+  line spoken live cannot be caught as it starts). Every line is made with the same seed,
+  so a line that drifted drifted every time: `oaiy-voice` keeps a short line only where it
+  is like its voice (`LIKENESS`, 0.976) and makes one that is not with the next seed the
+  next time. A call's greeting is made ahead as the line settles (`"prepare": true`: made
+  whole, again with the next seed where it is not like the voice, up to three times, and
+  kept), then said from memory: a greeting in the receptionist voice that came out 0.970
+  is made 0.990 with the next seed.
+
 A voice's speaker embedding and codes are made on the CPU, once a clip. Measured through
 `oaiy-voice` on an M5 Pro's GPU (2026-10-16, the 0.6B Base, the receptionist voice): lines
 of 5.8 to 13.1 s spoken at 2.6 times real time once they speak (2.2 to 2.5 overall), their

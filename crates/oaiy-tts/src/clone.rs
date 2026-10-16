@@ -384,3 +384,33 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod similarity {
+    use super::*;
+
+    /// How like a voice's clip each line sounds, by the speaker encoder's embedding (`--ignored --nocapture`): OAIY_TTS
+    /// the model's folder, OAIY_SPK_REF the clip (WAV), OAIY_SPK_LINES the lines (24 kHz 16-bit PCM files, by commas).
+    #[test]
+    #[ignore = "needs a Qwen3-TTS model, a voice's clip and lines spoken in it"]
+    fn how_like_the_clip_each_line_sounds() -> Result<()> {
+        let dir = std::path::PathBuf::from(std::env::var("OAIY_TTS").map_err(|e| msg(e.to_string()))?);
+        let spk = SpeakerEncoder::load(&dir.join("model.safetensors"), &Device::Cpu)?;
+        let (channels, rate) = crate::audio::parse_wav(&std::fs::read(std::env::var("OAIY_SPK_REF").map_err(|e| msg(e.to_string()))?)?)?;
+        let clip = crate::audio::resample(&crate::audio::mix(&channels), rate, 24_000);
+        let reference = spk.embed(&clip)?;
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (n(a) * n(b))
+        };
+        for path in std::env::var("OAIY_SPK_LINES").map_err(|e| msg(e.to_string()))?.split(',') {
+            let bytes = std::fs::read(path)?;
+            let line: Vec<f32> = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect();
+            let at = std::time::Instant::now();
+            let e = spk.embed(&line)?;
+            eprintln!("{:.3}  {}  ({:.2} s in {:.0} ms)", cosine(&reference, &e), path.rsplit('/').next().unwrap_or(path), line.len() as f64 / 24_000., at.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(())
+    }
+}

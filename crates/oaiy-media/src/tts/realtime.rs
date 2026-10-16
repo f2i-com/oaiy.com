@@ -171,6 +171,22 @@ impl WgpuTts {
         Ok(Voice { name: String::new(), description: String::new(), language: "auto".into(), ref_text: transcript.trim().into(), ref_codes, speaker })
     }
 
+    /// How like `voice` the line `pcm` (16-bit at 24 kHz) sounds: the cosine of its speaker embedding and the voice's
+    /// own (the speaker encoder's, on the CPU: some 30 ms a line of 3.5 s on an M5 Pro). The talker's draws now and then
+    /// make a line in another speaker's voice (2 lines in 40, at the model's own sampling, in the receptionist voice):
+    /// such a line scores 0.97 or less, where the voice's own lines score 0.98 or more.
+    pub fn likeness(&mut self, pcm: &[i16], voice: &Voice) -> Result<f64> {
+        if self.speaker_encoder.is_none() {
+            self.speaker_encoder = Some(clone::SpeakerEncoder::load(&self.model_dir.join("model.safetensors"), &Device::Cpu)?);
+        }
+        let spk = self.speaker_encoder.as_ref().expect("loaded above");
+        let audio: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+        let e = spk.embed(&audio)?;
+        let dot: f64 = e.iter().zip(&voice.speaker).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        Ok(dot / (norm(&e) * norm(&voice.speaker)).max(1e-30))
+    }
+
     /// Speak `text` in `voice`, handing out 16-bit mono PCM at 24 kHz as it is made (the first chunk after
     /// `options.first_chunk_frames`, then every `options.chunk_frames`), as [`oaiy_tts::Tts::speak`]. `cancel` is
     /// checked at every frame; once it is set, nothing more is handed out.
@@ -462,6 +478,40 @@ mod tests {
         // (OAIY_TTS_SAVE: the codes to a file, to set beside another build's)
         if let Ok(path) = std::env::var("OAIY_TTS_SAVE") {
             std::fs::write(path, format!("{:?}", drawn[0]))?;
+        }
+        Ok(())
+    }
+
+    /// A line spoken with seeds 1 to OAIY_TTS_SEEDS (12), its codes drawn on the host and on the device, each to a
+    /// file in OAIY_TTS_OUT (`host_N.pcm`, `device_N.pcm`): for the speaker encoder to tell how like the voice each
+    /// set sounds (`oaiy_tts::clone`'s `how_like_the_clip_each_line_sounds`).
+    #[test]
+    #[ignore = "needs a Qwen3-TTS Base model, a saved voice and a WebGPU adapter"]
+    fn a_line_spoken_with_seeds_drawn_here_and_there() -> Result<()> {
+        let dir = PathBuf::from(std::env::var("OAIY_TTS").unwrap_or_else(|_| "E:/models/Qwen3-TTS-12Hz-0.6B-Base".into()));
+        let out = PathBuf::from(std::env::var("OAIY_TTS_OUT").map_err(err)?);
+        let seeds: u64 = std::env::var("OAIY_TTS_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+        let text = std::env::var("OAIY_TTS_LINE").unwrap_or_else(|_| "Hello Jeff, thanks for calling. How can I help you today?".into());
+        let mut tts = WgpuTts::load(&dir, 0)?;
+        let voice = Voice::open(Path::new(&std::env::var("OAIY_TTS_VOICE").map_err(err)?)).map_err(err)?;
+        // (OAIY_TTS_SUB_TEMPERATURE: the code predictor's; OAIY_TTS_DEVICE_ONLY: the device's draws alone)
+        if let Some(t) = std::env::var("OAIY_TTS_SUB_TEMPERATURE").ok().and_then(|v| v.parse().ok()) {
+            tts.options.sampling.sub_temperature = t;
+        }
+        if let Some(t) = std::env::var("OAIY_TTS_TEMPERATURE").ok().and_then(|v| v.parse().ok()) {
+            tts.options.sampling.temperature = t;
+        }
+        let only = std::env::var_os("OAIY_TTS_DEVICE_ONLY").is_some();
+        // (OAIY_TTS_FIRST_SEED: seeds from it, 1 unless said; the voice server's lines are seed 0's)
+        let first: u64 = std::env::var("OAIY_TTS_FIRST_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        for seed in first..first + seeds {
+            for (name, draws) in [("host", oaiy_tts::talker::Draws::Host), ("device", oaiy_tts::talker::Draws::Auto)].into_iter().filter(|(n, _)| !only || *n == "device") {
+                tts.options.sampling.seed = seed;
+                tts.options.sampling.draws = draws;
+                let mut pcm: Vec<i16> = Vec::new();
+                tts.speak(&text, &voice, &AtomicBool::new(false), |c| pcm.extend_from_slice(c))?;
+                std::fs::write(out.join(format!("{name}_{seed:02}.pcm")), pcm.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())?;
+            }
         }
         Ok(())
     }
