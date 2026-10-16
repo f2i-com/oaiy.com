@@ -1,8 +1,8 @@
-"""Generate crates/dsv41/src/unicode.rs: the Unicode general-category ranges
+"""Generate crates/oaiy-llm-server/src/dsv41/unicode.rs: the Unicode general-category ranges
 the DeepSeek-V4.1 pre-tokenizer needs (letters, marks, numbers, punctuation,
 symbols), from Python's unicodedata.
 
-Usage: python tools/dsv41/gen_unicode.py > crates/dsv41/src/unicode.rs
+Usage: python tools/dsv41/gen_unicode.py > crates/oaiy-llm-server/src/dsv41/unicode.rs
 """
 
 import sys

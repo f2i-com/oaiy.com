@@ -1,4 +1,4 @@
-//! VENDORED-LOCAL: a decode step's ops chained on a device between host round trips.
+//! a decode step's ops chained on a device between host round trips.
 //!
 //! A backend whose every call is a submit and a read back (WebGPU) spends a dense model's decode step on round trips:
 //! a 3B Llama's 113 of them were most of its 37 ms. A [`DeviceChain`] keeps the activations (and a copy of the KV
@@ -382,7 +382,7 @@ pub trait ChainRecorder {
     /// (`Backend::delta_net_step`).
     #[allow(clippy::too_many_arguments)]
     fn ssm_conv(&mut self, qkv: &DeviceVec, weight: &DeviceVec, state: &DeviceVec, out: &DeviceVec, rows: usize, channels: usize, kernel: usize);
-    /// VENDORED-LOCAL: LFM2's gated short conv over `rows` tokens of `bcx` (`[rows, 3 channels]`: each row's B, C and x,
+    /// LFM2's gated short conv over `rows` tokens of `bcx` (`[rows, 3 channels]`: each row's B, C and x,
     /// its in-projection's thirds): `B * x` through a causal depthwise conv after the `kernel - 1` products `state`
     /// holds (`[kernel - 1, channels]`, oldest first), with `weight` (`[channels, kernel]`), times C, into `out`
     /// (`[rows, channels]`); `state` then holds the last `kernel - 1` products (transformers' `Lfm2ShortConv`).

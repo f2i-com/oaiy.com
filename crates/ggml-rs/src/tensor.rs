@@ -220,7 +220,7 @@ impl fmt::Debug for Tensor {
     }
 }
 
-/// VENDORED-LOCAL: the nearest `f16` to an `f32` (ties to even), as its bits.
+/// the nearest `f16` to an `f32` (ties to even), as its bits.
 pub fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = bits & 0x8000_0000;
@@ -247,7 +247,7 @@ pub fn f32_to_f16_bits(v: f32) -> u16 {
     h as u16
 }
 
-/// VENDORED-LOCAL: an `f16`'s bits as `f32`.
+/// an `f16`'s bits as `f32`.
 pub fn f16_bits_to_f32(h: u16) -> f32 {
     let h = h as u32;
     let (s, e, m) = ((h & 0x8000) << 16, (h >> 10) & 0x1f, h & 0x3ff);
@@ -261,12 +261,12 @@ pub fn f16_bits_to_f32(h: u16) -> f32 {
     }
 }
 
-/// VENDORED-LOCAL: round an `f32` to the nearest `f16` (ties to even) and back.
+/// round an `f32` to the nearest `f16` (ties to even) and back.
 pub fn round_f16(v: f32) -> f32 {
     f16_bits_to_f32(f32_to_f16_bits(v))
 }
 
-/// VENDORED-LOCAL: `values` (an even count) as `f16`, two to an `f32` word: value `2i` in word
+/// `values` (an even count) as `f16`, two to an `f32` word: value `2i` in word
 /// `i`'s low half, `2i + 1` in its high half. Half the memory, and half the reading.
 pub fn pack_f16(values: &[f32]) -> Vec<f32> {
     assert!(values.len() % 2 == 0, "pack_f16: an odd count");
@@ -275,7 +275,7 @@ pub fn pack_f16(values: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// VENDORED-LOCAL: the values `pack_f16` packed.
+/// the values `pack_f16` packed.
 pub fn unpack_f16(words: &[f32]) -> Vec<f32> {
     words.iter().flat_map(|w| {
         let b = w.to_bits();

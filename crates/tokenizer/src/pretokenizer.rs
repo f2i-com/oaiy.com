@@ -66,7 +66,7 @@ fn split_with_lookahead<'a>(re: &Regex, text: &'a str) -> Vec<&'a str> {
     pieces
 }
 
-/// VENDORED-LOCAL: Qwen3.8's regex, with its whitespace lookahead expressed
+/// Qwen3.8's regex, with its whitespace lookahead expressed
 /// explicitly because Rust regex does not support lookaround.
 pub fn split_qwen3(text:&str)->Vec<&str>{
     static R:OnceLock<Regex>=OnceLock::new();

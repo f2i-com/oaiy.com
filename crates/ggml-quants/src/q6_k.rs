@@ -62,7 +62,7 @@ pub fn dequantize(src: &[u8], dst: &mut [f32]) {
     }
 }
 
-// VENDORED-LOCAL: GLM-5.3-Flash. Fused Q6_K x f32 dot products.
+// GLM-5.3-Flash. Fused Q6_K x f32 dot products.
 //
 // The companion to `q4_k::dot_rows`, and needed for the same reason: GLM-5.3-Flash
 // quantises `ffn_down_exps` at Q6_K on 18 of its 42 MoE layers, so a third of the
@@ -153,7 +153,7 @@ pub fn has_avx512() -> bool {
     crate::q4_k::has_avx512()
 }
 
-// VENDORED-LOCAL: GLM-5.3-Flash. AVX-512 Q6_K dot products.
+// GLM-5.3-Flash. AVX-512 Q6_K dot products.
 //
 // GLM-5.3-Flash quantises `ffn_down_exps` at Q6_K on 18 of its 42 MoE layers, so a
 // third of the bytes the CPU expert tier touches come through here and the scalar
@@ -322,6 +322,7 @@ mod fused_dot_tests {
         acc
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn abs_sum(row: &[u8], x: &[f32]) -> f32 {
         let mut w = vec![0.0f32; row.len() / BYTES_PER_BLOCK * BLOCK_SIZE];
         dequantize(row, &mut w);
@@ -330,6 +331,7 @@ mod fused_dot_tests {
 
     /// The AVX-512 kernel against the scalar oracle, relative to `sum |w_i x_i|`
     /// -- see the Q4_K test for why that is the right scale and the result is not.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_dot_matches_the_scalar_oracle() {
         if !has_avx512() {
@@ -352,6 +354,7 @@ mod fused_dot_tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_dot_is_deterministic() {
         if !has_avx512() {
@@ -368,6 +371,7 @@ mod fused_dot_tests {
     }
 
     /// Scalar against AVX-512 at the released `ffn_down_exps` shape.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     #[ignore = "measures"]
     fn measure_avx512_speedup() {

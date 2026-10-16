@@ -70,7 +70,7 @@ fn encode_text_segment(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Resul
     if text.is_empty() { return Ok(()); }
     let merges = tok.merges_rank();
 
-    // VENDORED-LOCAL: preserve added-token matching before NFC normalization.
+    // preserve added-token matching before NFC normalization.
     use unicode_normalization::UnicodeNormalization;
     let normalized;
     let text = if tok.qwen3_pre { normalized=text.nfc().collect::<String>(); &normalized } else {text};

@@ -7,7 +7,7 @@ fn native_file_call_round_trip_preserves_literal_content() {
     let content = "\n<style>\n  :root { --bg: #000; }\n  body::before { background: var(--bg); content: 'λ 😀'; }\n</style>\n<script>const x = a < b && b > 0;</script>\n\n";
     let raw = format!("<tool_call>\n<function=write_file>\n<parameter=path>\nsite/index.html\n</parameter>\n<parameter=content>\n{content}\n</parameter>\n</function>\n</tool_call>");
     let mut stream = NativeStream::default();
-    let mut parser = dsv41::chat::StreamParser::new(Mode::Chat);
+    let mut parser = crate::dsv41::chat::StreamParser::new(Mode::Chat);
     for end in raw.char_indices().map(|(at,c)| at+c.len_utf8()) {
         parser.push(&stream.push(&raw[..end], &tools, false).unwrap());
         assert!(!parser.tool_calls_ready());
@@ -24,11 +24,11 @@ fn native_file_call_round_trip_preserves_literal_content() {
 #[test]
 fn native_stream_releases_reasoning_and_prose_before_completion() {
     let mut stream = NativeStream::default();
-    let mut parser = dsv41::chat::StreamParser::new(Mode::Thinking);
+    let mut parser = crate::dsv41::chat::StreamParser::new(Mode::Thinking);
     let first = stream.push("Let me check", &[], false).unwrap();
-    assert!(matches!(&parser.push(&first)[..], [dsv41::chat::Delta::Reasoning(t)] if t == "Let me check"));
+    assert!(matches!(&parser.push(&first)[..], [crate::dsv41::chat::Delta::Reasoning(t)] if t == "Let me check"));
     let next = stream.push("Let me check</think>Hello", &[], false).unwrap();
-    assert!(parser.push(&next).iter().any(|d| matches!(d,dsv41::chat::Delta::Content(t) if t == "Hello")));
+    assert!(parser.push(&next).iter().any(|d| matches!(d,crate::dsv41::chat::Delta::Content(t) if t == "Hello")));
     assert!(stream.push("Let me check</think>Hello", &[], true).unwrap().is_empty());
     let mut utf8 = NativeStream::default();
     assert_eq!(utf8.push("Hi \u{fffd}", &[], false).unwrap(), "Hi ");
@@ -81,7 +81,7 @@ fn tools() -> Vec<Json> { vec![Json::parse(br#"{"function":{"name":"computer","p
 fn native_calls_preserve_types_and_reject_partial_or_unknown_calls() {
     let call = "<tool_call>\n<function=computer>\n<parameter=action>\nkeyboard_sequence\n</parameter>\n<parameter=keys>\n[{\"x\":42,\"key\":\"h\"}]\n</parameter>\n</function>\n</tool_call>";
     let converted=normalize(call,&tools()).unwrap();
-    let mut parser=dsv41::chat::StreamParser::new(Mode::Chat); parser.push(&converted);
+    let mut parser=crate::dsv41::chat::StreamParser::new(Mode::Chat); parser.push(&converted);
     assert!(parser.tool_call_error().is_none()); let (_,calls)=parser.finish();
     let args=Json::parse(calls[0].arguments.as_bytes()).unwrap(); assert!(args.get("keys").unwrap().as_array().is_some());
     assert!(normalize(&call.replace("</tool_call>",""),&tools()).is_err());
@@ -458,7 +458,7 @@ fn a_minicpmv_prompt_is_transformers() {
     let encoded = chat_prompt_as(msgs.as_array().unwrap(), &Options { mode: Mode::Chat, effort: 50, drop_thinking: true }, Pictures::MiniCpmV).unwrap();
     let id = |s: &str| tok.token_id(s).unwrap();
     let m = MiniCpmV {
-        markers: llama_rs::mmproj::minicpmv::Markers { image_start: id("<image>"), image_end: id("</image>"), slice_start: id("<slice>"), slice_end: id("</slice>"), newline: 198 },
+        markers: crate::llm::mmproj::minicpmv::Markers { image_start: id("<image>"), image_end: id("</image>"), slice_start: id("<slice>"), slice_end: id("</slice>"), newline: 198 },
         merge: if var("OAIY_MINICPMV_MODE").as_deref() == Some("4x") { 2 } else { 4 },
         max_slices: 9,
         mean: [0.5; 3],
@@ -509,7 +509,7 @@ fn the_minicpmv_tower_on_webgpu_is_transformers() {
     let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
     let want = minicpmv_reference(&reference);
     let file = gguf::GgufFile::open(&mmproj).unwrap();
-    let mut mm = llama_rs::MmProj::from_gguf(&file, Arc::new(gpu)).unwrap();
+    let mut mm = crate::llm::MmProj::from_gguf(&file, Arc::new(gpu)).unwrap();
     let mut before = Vec::new();
     for k in 0.. {
         let Some((shape, pixels)) = want.get(&format!("tile.{k}")) else { break };
@@ -546,8 +546,8 @@ fn a_qwen3vl_tower_gives_its_tokens_with_the_hosts_copy_let_go() {
     let Ok(mmproj) = std::env::var("OAIY_QWEN3VL_MMPROJ") else { return };
     let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
     let file = gguf::GgufFile::open(&mmproj).unwrap();
-    let mut mm = llama_rs::MmProj::from_gguf(&file, Arc::new(gpu)).unwrap();
-    let llama_rs::MmProj::Qwen3Vl(q) = &mm else { panic!("a Qwen3-VL projector") };
+    let mut mm = crate::llm::MmProj::from_gguf(&file, Arc::new(gpu)).unwrap();
+    let crate::llm::MmProj::Qwen3Vl(q) = &mm else { panic!("a Qwen3-VL projector") };
     let side = q.config.image_size;
     let picture: Vec<f32> = (0..3 * side * side).map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0).collect();
     let image = Tensor::from_vec(picture, vec![3, side, side]);

@@ -1,4 +1,4 @@
-//! VENDORED-LOCAL: pluggable tensor-byte source seam (OAIY streaming).
+//! pluggable tensor-byte source seam (OAIY streaming).
 //!
 //! The classic [`GgufFile`] path memory-maps a `.gguf` file and lends out
 //! `&[u8]` slices into the mapping. A model whose expert weights are

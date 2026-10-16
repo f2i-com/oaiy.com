@@ -4,7 +4,7 @@
 use std::{path::Path, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use oaiy_engine::{Error, Result, json::Json};
 use ggml_rs::{Backend, Tensor};
-use llama_rs::{Model, KvCache, ChatMessage};
+use crate::llm::{Model, KvCache, ChatMessage};
 
 pub const CODE: &str = "observer_review_failed";
 pub const CONTEXT: usize = 8192;
@@ -157,11 +157,11 @@ impl Observer {
     }
     fn evaluate_input<T>(&mut self, context: &str, draft: &str, cancel: &AtomicBool, instructions: &str, parse: fn(&str)->Result<T>, deadline: Instant) -> Result<T> {
         let input = Json::obj([("context", Json::str(context)), ("draft", Json::str(draft))]).to_json();
-        let mut prompt = llama_rs::apply_chat_template(&self.model.config().arch,
+        let mut prompt = crate::llm::apply_chat_template(&self.model.config().arch,
             &[ChatMessage::system(instructions.to_owned()), ChatMessage::user(input)], true);
         // Qwen gets a small, explicit reasoning phase. Other architectures retain
         // their existing strict reviewer template until their delimiters are supported.
-        let close = if matches!(self.model.config().arch, llama_rs::Architecture::Qwen35 | llama_rs::Architecture::Qwen35Moe) {
+        let close = if matches!(self.model.config().arch, crate::llm::Architecture::Qwen35 | crate::llm::Architecture::Qwen35Moe) {
             self.model.tokenizer().token_id("</think>")
         } else {None};
         if close.is_some() {prompt.push_str("<think>\n");}
@@ -241,7 +241,7 @@ impl Observer {
 
 fn review_draft(draft:&str)->Result<String> {
     let Some(at)=draft.find("<｜DSML｜") else {return Ok(draft.into());};
-    let mut parser=dsv41::chat::StreamParser::new(dsv41::chat::Mode::Chat);
+    let mut parser=crate::dsv41::chat::StreamParser::new(crate::dsv41::chat::Mode::Chat);
     parser.push(&draft[at..]);
     if let Some(error)=parser.tool_call_error() {return Err(err(error));}
     if !parser.tool_calls_ready() {return Err(err("incomplete tool draft cannot be reviewed"));}
@@ -352,7 +352,7 @@ fn packed_budget(free: usize, requested: usize, shared: bool) -> usize {
 pub(crate) fn validate_tools(context: &str, draft: &str) -> std::result::Result<(), String> {
     let context = Json::parse(context.as_bytes()).map_err(|e|e.to_string())?;
     let tools = context.get("tools").and_then(Json::as_array).ok_or("missing tool catalog")?;
-    let mut parser = dsv41::chat::StreamParser::new(dsv41::chat::Mode::Chat);
+    let mut parser = crate::dsv41::chat::StreamParser::new(crate::dsv41::chat::Mode::Chat);
     parser.push(draft);
     if let Some(e) = parser.tool_call_error() { return Err(e); }
     if !parser.tool_calls_ready() { return Err("incomplete tool call".into()); }
@@ -431,7 +431,7 @@ fn err(e: impl std::fmt::Display) -> Error { Error::Format(format!("observer: {e
 
 /// Preserve exact generated token IDs before the first DSML block. Tokenizers
 /// may merge '<' with whitespace, so rewind to the boundary before that token.
-pub(crate) fn repair_prefix(tok: &dsv41::tokenizer::Tokenizer, ids: &[u32]) -> Option<usize> {
+pub(crate) fn repair_prefix(tok: &crate::dsv41::tokenizer::Tokenizer, ids: &[u32]) -> Option<usize> {
     let raw: Vec<u8> = ids.iter().flat_map(|&id| tok.token_bytes(id).iter().copied()).collect();
     let text = std::str::from_utf8(&raw).ok()?;
     let at = text.find("<｜DSML｜")?;

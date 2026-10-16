@@ -4,11 +4,11 @@
 //! already (the delta nets' value heads tiled, the indexer's projection in its two parts, `ssm_a` its `-exp(A_log)`),
 //! which is the layout this engine runs: no channel maps, where the EXL3 loader maps a Hugging Face checkpoint's.
 use super::{bad, Attn, Config, Embed, FlashNext, Gdn, HyperMix, Layer, Mixer, Moe, NgramTable, Ple, ROW_DIM};
-use dsv41::safetensors::Dtype;
+use oaiy_engine::safetensors::Dtype;
 use ggml_quants::GgmlType;
 use ggml_rs::{exl3::{Experts, PackedLinear}, Backend, QuantizedTensor, Tensor};
 use gguf::{GgufFile, Value};
-use llama_rs::loader::Weight;
+use crate::llm::loader::Weight;
 use oaiy_engine::Result;
 use std::{fs::File, path::Path, sync::Arc};
 
@@ -565,8 +565,8 @@ mod tests {
             read_at(&file, &mut buf, embed.start + (t * h * embed.dtype.size()) as u64)?;
             let want: Vec<f32> = match embed.dtype {
                 Dtype::F32 => buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-                Dtype::BF16 => buf.chunks_exact(2).map(|c| dsv41::formats::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-                _ => buf.chunks_exact(2).map(|c| dsv41::formats::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+                Dtype::BF16 => buf.chunks_exact(2).map(|c| oaiy_engine::formats::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+                _ => buf.chunks_exact(2).map(|c| oaiy_engine::formats::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
             };
             let c = cosine(&got, &want);
             eprintln!("token {t}'s embedding ({all:?}): cosine {c:.4}");

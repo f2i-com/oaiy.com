@@ -22,7 +22,7 @@ Their language models are Qwen3.5 ones: they chat, think and call tools as Qwen3
 
 ## A picture
 
-As transformers' `MiniCPMV4_7ForConditionalGeneration` and its processor make it (`crates/llama-rs/src/mmproj/
+As transformers' `MiniCPMV4_7ForConditionalGeneration` and its processor make it (`crates/oaiy-llm-server/src/llm/mmproj/
 minicpmv.rs`):
 
 - **Slices** (`plan`): the tiles the picture's area asks for at about 448 x 448 pixels each (at most 9), give or take
@@ -39,7 +39,7 @@ minicpmv.rs`):
   (where `<image>` stands), rows and columns counted from it, the slices laid out over the canvas and the overview
   stretched across it; the text after a picture goes on from the origin past the canvas's longer side.
 
-On a GPU the tower is chained (`crates/llama-rs/src/chain_minicpmv.rs`): its patches taken in the mergers' order from
+On a GPU the tower is chained (`crates/oaiy-llm-server/src/llm/chain_minicpmv.rs`): its patches taken in the mergers' order from
 the start, so each merge is rows as they lie; the window attention (four tokens a window) runs on the host.
 
 ## Speed
@@ -53,7 +53,7 @@ tokens a second.
 Against transformers 5.21 (`tools/minicpmv/reference.py`: the 1B in float32 on the CPU, a picture and a question; its
 tiles, each tile's tokens, the prompt's tokens and canvas positions, and its reply):
 
-- `mmproj::minicpmv::tests::tiles_and_their_tokens_are_transformers` (llama-rs, the CPU) and
+- `mmproj::minicpmv::tests::tiles_and_their_tokens_are_transformers` (the server's `llm`, the CPU) and
   `qwen::tests::the_minicpmv_tower_on_webgpu_is_transformers` (the server, WebGPU): the same tiles (pixels within one
   level of 255, the resize filters'), and each of transformers' tiles to the same tokens: cosine 1.000000, the largest
   difference 0.0002.
@@ -70,7 +70,7 @@ and describe it the same.
 Its language model is Qwen3.5-MoE (`qwen35moe`, as Qwen3.6-35B-A3B's): the Qwen3.5 hybrid's 40 layers (30 gated delta
 nets, 10 gated attention layers), each with 256 routed experts of which 8 a token, softmax-weighted among themselves,
 and a shared expert by its gate's sigmoid. OAIY runs it as a Qwen3.5 model whose layers have routed experts
-(`llama_rs::Qwen35Moe`, loaded by `Qwen35Model::from_gguf_with`): the experts on the GPU in their GGUF blocks
+(`oaiy_llm_server::llm::Qwen35Moe`, loaded by `Qwen35Model::from_gguf_with`): the experts on the GPU in their GGUF blocks
 (`ggml_rs_wgpu::quant_moe`, which now decodes Q4_K and Q6_K, a Q4_K_M file's experts), routed on the GPU, the shared
 expert among them; the router f32. Chained, a layer's FFN is its router's matmul then the experts' routed sums in the
 same submit as the rest of the step. Its weights are 21.3 GB on the GPU: a 24 GB card. A GPU without 16 x 16 tensor

@@ -10,16 +10,12 @@ members = [
     "crates/oaiy-tts",
     "crates/oaiy-engine",
     "crates/oaiy-llm-cli",
-    # DeepSeek-V4.1 support (docs/DEEPSEEK_V41.md); std-only like the core.
-    "crates/dsv41",
-    # Which SIMD row kernel dsv41's routed experts run on this CPU: the one `unsafe` call dsv41 itself may not make
-    # (it forbids `unsafe`), behind a runtime feature check. std-only.
-    "crates/dsv41-simd",
     # Image decoding for the vision models (PNG, JPEG, Pillow-exact resize);
     # std-only like the core.
     "crates/oaiy-image",
-    # The OpenAI-compatible server: every model on WebGPU (wgpu is a long build, so
-    # not a default member).
+    # The language-model server (OpenAI-compatible): every model on WebGPU, the GGUF models
+    # (src/llm) and DeepSeek-V4.1 (src/dsv41) in it. A default member: its tests are the
+    # models' (oaiy-llm-cli, a default member, builds it and wgpu anyway).
     "crates/oaiy-llm-server",
     # The portable host: supervises oaiy-llm-server and oaiy-media, serves the
     # control UI and the configurable API gateway. std-only, so a default member.
@@ -34,15 +30,14 @@ members = [
     # The studio as a Windows notification-area app (windows-sys; the only
     # unsafe is its Win32 calls, in src/tray.rs).
     "crates/oaiy-studio-tray",
-    # Vendored GGUF compute subsystem (see crates/VENDORED.md). These keep
-    # their own identity and external deps; the std-only rule below does
-    # not apply to them.
+    # The GGUF stack, the server's and oaiy-media's: the file, the quant kernels, the CPU
+    # backend and its chain, the tokenizers. They have their own external deps; the
+    # std-only rule below does not apply to them.
     "crates/gguf",
     "crates/ggml-quants",
     "crates/ggml-rs",
     "crates/tokenizer",
-    "crates/llama-rs",
-    # The GPU backend (VENDORED-LOCAL): every model's kernels on any wgpu adapter
+    # The GPU backend: every model's kernels on any wgpu adapter
     # (Vulkan, Metal, Direct3D 12). A member, not a default member: wgpu adds
     # minutes to every default build.
     "crates/ggml-rs-wgpu",
@@ -71,7 +66,6 @@ members = [
 default-members = [
     "crates/oaiy-engine",
     "crates/oaiy-llm-cli",
-    "crates/dsv41",
     "crates/oaiy-image",
     "crates/oaiy-studio",
     "crates/oaiy-host-env",
@@ -81,19 +75,19 @@ default-members = [
     "crates/ggml-quants",
     "crates/ggml-rs",
     "crates/tokenizer",
-    "crates/llama-rs",
+    "crates/oaiy-llm-server",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
 
-# Hard rule for oaiy-engine, oaiy-image, oaiy-studio and dsv41: std-only, no external crates.
+# Hard rule for oaiy-engine, oaiy-image and oaiy-studio: std-only, no external crates.
 # Do not add a [workspace.dependencies] table.
-# Exception: the vendored GGUF subsystem members (crates/gguf,
-# ggml-quants, ggml-rs, tokenizer, llama-rs, ggml-rs-wgpu — see
-# crates/VENDORED.md) carry their own explicit external dependencies and
-# do not inherit from this workspace.
+# Exception: the GGUF stack (crates/gguf, ggml-quants, ggml-rs, tokenizer, ggml-rs-wgpu)
+# and the crates that run models on it (oaiy-llm-server, oaiy-llm-cli, oaiy-media, oaiy-tts,
+# oaiy-voice) carry their own explicit external dependencies and do not inherit from this
+# workspace.
 
 [profile.dev.package.argon2]
 # oaiy-crypto's tests run Argon2id at the design's 64 MiB floor (a hundred milliseconds when optimised, many seconds without
@@ -113,7 +107,7 @@ codegen-units = 16
 opt-level = 3
 
 [profile.release]
-# A single codegen unit, as the vendored llm workspace builds (first set here for a rustc
+# A single codegen unit, as the GGUF stack has always built (first set here for a rustc
 # 1.92.0 crash on a test of the CUDA backend this workspace no longer has). Every speed the
 # docs give was measured with it: leave it.
 codegen-units = 1

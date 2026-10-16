@@ -8,7 +8,7 @@ The optional observer reviews DeepSeek tool drafts before clients receive execut
 
 ## Configuration
 
-Native server flags: `--observer-model FILE.gguf --observer-device auto --observer-vram-gb 16`. Omit the model flag to disable. The primary must use the DeepSeek engine; the observer uses llama-rs architecture dispatch and supports only architectures implemented there. Original expert sources must be configured for Q4 repair. Changing observer settings requires restarting the process.
+Native server flags: `--observer-model FILE.gguf --observer-device auto --observer-vram-gb 16`. Omit the model flag to disable. The primary must use the DeepSeek engine; the observer uses the GGUF models' architecture dispatch (`oaiy_llm_server::llm`) and supports only architectures implemented there. Original expert sources must be configured for Q4 repair. Changing observer settings requires restarting the process.
 
 The local Qwen GGUF identifies itself as `qwen35`, with 64 trunk layers and one excluded MTP layer. Other supported GGUF models can be selected; arbitrary architectures and checkpoint directories are not automatically supported.
 

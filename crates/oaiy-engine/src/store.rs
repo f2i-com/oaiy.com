@@ -4,7 +4,7 @@
 //! `WeightStore`, usually through [`crate::ecache::Ecache`]. The stores in
 //! the workspace:
 //!
-//! - `llama_rs::expert_stream::GgufExpertStore`: a GGUF MoE model's
+//! - `oaiy_llm_server::llm::expert_stream::GgufExpertStore`: a GGUF MoE model's
 //!   experts, read with positioned reads straight from the `.gguf` file.
 //! - `dsv41::expert::SafetensorsExpertStore`: DeepSeek-V4.1's MXFP4 experts, read
 //!   from the safetensors shards.

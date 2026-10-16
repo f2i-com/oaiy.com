@@ -3,7 +3,7 @@ name = "oaiy-llm-server"
 version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "OpenAI-compatible HTTP server for DeepSeek-V4.1-Flash on OAIY"
+description = "OAIY's language models (GGUF and DeepSeek-V4.1) behind an OpenAI-compatible HTTP API"
 
 [[bin]]
 name = "oaiy-llm-server"
@@ -29,17 +29,17 @@ tinygpu = ["webgpu", "ggml-rs-wgpu/tinygpu"]
 # std-only apart from the workspace crates.
 [dependencies]
 oaiy-engine = { path = "../oaiy-engine" }
-dsv41 = { path = "../dsv41" }
-# This CPU's row kernel for DeepSeek's routed experts (the call dsv41, which forbids `unsafe`, cannot make).
-dsv41-simd = { path = "../dsv41-simd" }
-# VENDORED-LOCAL: GLM-5.3-Flash is served through llama-rs, so a second engine sits
-# beside the DeepSeek one (see src/glm.rs).
-llama-rs = { path = "../llama-rs" }
+oaiy-image = { path = "../oaiy-image" }
+# The GGUF stack: the file, the quant kernels, the CPU backend and its chain, the tokenizers (src/llm runs the models
+# on them; oaiy-media shares them).
 tokenizer = { path = "../tokenizer" }
 gguf = { path = "../gguf" }
 ggml-quants = { path = "../ggml-quants" }
 ggml-rs = { path = "../ggml-rs" }
 rayon = "1.10"
+half = { version = "2.4", features = ["bytemuck", "num-traits"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+thiserror = "1.0"
 ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }
 
 # On a Mac the WebGPU engine also takes the TinyGPU adapter (`tinygpu` above): a card in a Thunderbolt enclosure, held

@@ -3,9 +3,9 @@
 //! Its projections are whatever the caller makes of each `Exl3Data` (`load_portable`): packed on any GPU through
 //! WebGPU, or decoded on the CPU (`ggml_rs_wgpu::exl3`); PEFT adapters are applied beside them as they load
 //! (`load_portable_with`).
-use dsv41::safetensors::{Dtype, StIndex};
+use oaiy_engine::safetensors::{Dtype, StIndex};
 use ggml_rs::{exl3::{Exl3Data, PackedLinear}, Backend, Tensor};
-use llama_rs::{
+use crate::llm::{
     loader::{FfnPair, Weight},
     qwen35::{Qwen35Block, Qwen35Model, SsmConfig},
     Architecture, Model, ModelConfig,

@@ -112,7 +112,7 @@ every `AGE_TOKENS = 128` tokens so an old topic cannot hold VRAM forever. Slots
 used by the current batch are pinned (`begin_batch`). Measured there: ~1,170
 slots per card, ~2,700 over both, **62.7% hits**.
 
-glm5next has `llama-rs/src/expert_stream/device_cache.rs` — and for a long time
+glm5next has `oaiy-llm-server/src/llm/expert_stream/device_cache.rs` — and for a long time
 was not using it. Sweeping the budget over 0, 8 and 24 GB moved the warm token by
 under a millisecond, because `StreamExperts` went through
 `LayerStream::expert_weights`, which reconstructs over the leased *host* record

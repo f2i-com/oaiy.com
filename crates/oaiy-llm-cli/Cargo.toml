@@ -9,11 +9,12 @@ description = "oaiy-llm command line: run GGUF models, experts streamed NVMe -> 
 name = "oaiy-llm"
 path = "src/main.rs"
 
-# The oaiy-llm core plus the workspace's own GGUF stack (crates/VENDORED.md),
+# The oaiy-llm core plus the workspace's own GGUF stack,
 # which carries its own dependencies.
 [dependencies]
 oaiy-engine = { path = "../oaiy-engine" }
-llama-rs = { path = "../llama-rs" }
+# The GGUF models (`oaiy_llm_server::llm`), without the WebGPU engine unless `webgpu` asks for it.
+oaiy-llm-server = { path = "../oaiy-llm-server", default-features = false }
 ggml-rs = { path = "../ggml-rs" }
 gguf = { path = "../gguf" }
 tokenizer = { path = "../tokenizer" }
@@ -25,4 +26,4 @@ ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }
 default = ["webgpu"]
 # GPU inference: `oaiy-llm run model.gguf --webgpu` (`--no-default-features` builds
 # the CPU-only tool).
-webgpu = ["dep:ggml-rs-wgpu"]
+webgpu = ["dep:ggml-rs-wgpu", "oaiy-llm-server/webgpu"]

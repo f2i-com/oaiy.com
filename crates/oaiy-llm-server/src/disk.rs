@@ -23,7 +23,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 use std::time::SystemTime;
 
-/// VENDORED-LOCAL: GLM-5.3-Flash. What a state has to do to live on disk.
+/// GLM-5.3-Flash. What a state has to do to live on disk.
 ///
 /// This file was written around `dsv41_cuda::Snapshot`. GLM-5.3-Flash keeps a
 /// different state -- a delta-rule recurrence and a latent cache rather than window
@@ -55,7 +55,7 @@ pub trait PromptState: Send + 'static {
     }
 }
 
-impl PromptState for llama_rs::glm5next::forward::StateSnapshot {
+impl PromptState for crate::llm::glm5next::forward::StateSnapshot {
     fn pos(&self) -> usize {
         self.len
     }

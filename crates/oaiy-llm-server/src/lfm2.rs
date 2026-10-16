@@ -1,10 +1,10 @@
-//! VENDORED-LOCAL: LiquidAI's LFM2 chat format, as LFM2.5-24B-A2B's `chat_template.jinja` writes it: ChatML after
+//! LiquidAI's LFM2 chat format, as LFM2.5-24B-A2B's `chat_template.jinja` writes it: ChatML after
 //! `<|startoftext|>`, the tools listed in the system message as JSON (`List of tools: [...]`), a reply that opens on
 //! `<think>` (LFM2.5 always thinks first), and calls written as a Python list between `<|tool_call_start|>` and
 //! `<|tool_call_end|>` (`[get_weather(city='Paris', days=3)]`), read into the server's tool markup (DSML) as Qwen's XML
-//! calls are (`qwen::normalize`). The model runs as a Qwen3.5 hybrid (`llama_rs::Qwen35Model`), so its engine is
+//! calls are (`qwen::normalize`). The model runs as a Qwen3.5 hybrid (`crate::llm::Qwen35Model`), so its engine is
 //! Qwen's; only its prompts and its calls are its own.
-use dsv41::chat::{Encoded, Mode, Options, DSML};
+use crate::dsv41::chat::{Encoded, Mode, Options, DSML};
 use oaiy_engine::json::Json;
 
 pub const CALL_START: &str = "<|tool_call_start|>";

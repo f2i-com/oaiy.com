@@ -70,7 +70,7 @@ impl Backend for CpuBackend {
                 .enumerate()
                 .for_each(|(bi, row)| body(bi, row));
         } else if out >= 256 {
-            // VENDORED-LOCAL: decode feeds one row; split the outputs instead
+            // decode feeds one row; split the outputs instead
             // (a tied 128k-vocab head is a second of single-thread work a
             // token). Same products in the same order, so the same bits.
             for bi in 0..b {
@@ -98,7 +98,7 @@ impl Backend for CpuBackend {
         Tensor::from_vec(y, shape)
     }
 
-    // VENDORED-LOCAL: quantized projections without a whole-matrix dequantize.
+    // quantized projections without a whole-matrix dequantize.
     // The trait default inflates the entire weight to F32 on every call (and
     // `linear` then runs one thread while fewer than 16 rows come in, i.e. every
     // decode step). This dequantizes one weight row at a time per worker, dots
@@ -171,7 +171,7 @@ impl Backend for CpuBackend {
                 or[j] = xr[j] * inv_rms * wd[j];
             }
         };
-        // VENDORED-LOCAL: a prompt's rows on every thread (each row's sum as before).
+        // a prompt's rows on every thread (each row's sum as before).
         if x.numel() >= PARALLEL_FROM {
             xd.par_chunks(last).zip(out.par_chunks_mut(last)).for_each(norm);
         } else {
@@ -256,7 +256,7 @@ impl Backend for CpuBackend {
         }
 
         let half = head_dim / 2;
-        // VENDORED-LOCAL: each pair's frequency once, and each (position, pair)'s sine and cosine once for all heads,
+        // each pair's frequency once, and each (position, pair)'s sine and cosine once for all heads,
         // where they were made for every element (the same values); a prompt's rows on every thread.
         let freqs: Vec<(f32, f32)> = (0..half)
             .map(|k| (theta.powf(-2.0 * k as f32 / head_dim as f32), freq_factors.map(|f| f[k]).unwrap_or(1.0)))
@@ -288,7 +288,7 @@ impl Backend for CpuBackend {
         }
     }
 
-    // VENDORED-LOCAL: the fused gate-up's activation, a prompt's rows on every thread (the trait's default, one by one,
+    // the fused gate-up's activation, a prompt's rows on every thread (the trait's default, one by one,
     // was a few seconds of a 2,000-token prompt).
     fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         let seq = fused.dim(0);
@@ -419,7 +419,7 @@ impl Backend for CpuBackend {
         Tensor::from_vec(out, vec![seq, n_h, hd])
     }
 
-    // VENDORED-LOCAL: attention in one pass, each (query, head) row on its own thread, reading its KV head in place.
+    // attention in one pass, each (query, head) row on its own thread, reading its KV head in place.
     // The default copies the cache's prefix and repeats it for every query head of a group, then takes the softmax
     // on one thread over every (query, head, position): a 3B Llama's 2,000-token prompt took 59 s and a decode step
     // 0.9 s on the portable build. A query's dot with a key is 8 running sums (one sum, an add waiting on the last,
@@ -509,10 +509,10 @@ impl Backend for CpuBackend {
     }
 }
 
-// VENDORED-LOCAL: elements from which an elementwise op spreads its rows over the threads (a decode step's stay on one).
+// elements from which an elementwise op spreads its rows over the threads (a decode step's stay on one).
 const PARALLEL_FROM: usize = 1 << 16;
 
-// VENDORED-LOCAL: `a . b` as 8 running sums added at the end, so the loop vectorizes.
+// `a . b` as 8 running sums added at the end, so the loop vectorizes.
 fn dot8(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
     let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn fused_quantized_linear_matches_dequantize_then_linear_exactly() {
-        // VENDORED-LOCAL: the fused path must give the default path's bits.
+        // the fused path must give the default path's bits.
         let (rows, k) = (37, 64);
         let mut bytes = vec![0u8; rows * (k / 32) * 34];
         let mut s = 0x1234_5678u32;

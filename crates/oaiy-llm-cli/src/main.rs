@@ -1,6 +1,6 @@
 //! main.rs — the oaiy-llm command line, for GGUF models.
 //!
-//! Every command opens a `.gguf` file through the workspace's own llama-rs
+//! Every command opens a `.gguf` file through the workspace's own GGUF models (`oaiy_llm_server::llm`)
 //! engine. `--budget` streams a MoE model's experts from the `.gguf` file
 //! through a bounded RAM cache instead of loading them all; `--webgpu` runs
 //! the quantized matmuls on a GPU. DeepSeek-V4.1 safetensors have their own
@@ -19,7 +19,7 @@
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::Arc;
 
-use llama_rs::{apply_chat_template, ChatMessage, Model};
+use oaiy_llm_server::llm::{apply_chat_template, ChatMessage, Model};
 use oaiy_engine::VERSION;
 
 /// Write to stdout and flush, ignoring errors. Output piped into `head`
@@ -326,13 +326,13 @@ fn open_model(o: &Opts) -> Result<Model, i32> {
     Ok(model)
 }
 
-pub(crate) fn sample_params(o: &Opts) -> llama_rs::SampleParams {
-    llama_rs::SampleParams {
+pub(crate) fn sample_params(o: &Opts) -> oaiy_llm_server::llm::SampleParams {
+    oaiy_llm_server::llm::SampleParams {
         temperature: o.temperature,
         top_p: if o.top_p < 1.0 { Some(o.top_p) } else { None },
         top_k: if o.top_k > 0 { Some(o.top_k as usize) } else { None },
         seed: o.seed,
-        ..llama_rs::SampleParams::default()
+        ..oaiy_llm_server::llm::SampleParams::default()
     }
 }
 
@@ -350,7 +350,7 @@ fn generate_to_stdout(
     model: &Model,
     o: &Opts,
     ids: &[u32],
-    kv: &mut llama_rs::KvCache,
+    kv: &mut oaiy_llm_server::llm::KvCache,
 ) -> Result<(Vec<u32>, f64), i32> {
     let started = std::time::Instant::now();
     let mut out_ids: Vec<u32> = Vec::new();
@@ -416,7 +416,7 @@ fn cmd_run(args: &[String]) -> i32 {
         msgs.push(ChatMessage::user(prompt));
         model.encode_chat(&msgs, true)
     } else {
-        model.tokenizer().encode(&prompt, true).map_err(llama_rs::LlamaError::from)
+        model.tokenizer().encode(&prompt, true).map_err(oaiy_llm_server::llm::LlamaError::from)
     };
     let ids = match ids {
         Ok(v) => v,
@@ -437,11 +437,11 @@ fn cmd_run(args: &[String]) -> i32 {
 
     // --trace-out: record the routed (layer, expert) sequence per token.
     // The sink fires per moe_forward call; the ids are re-derived from the
-    // router logits inside llama-rs (moe.rs).
+    // router logits inside `oaiy_llm_server::llm` (moe.rs).
     let trace_buf = o.trace_out.as_ref().map(|_| {
         let buf = Arc::new(std::sync::Mutex::new(Vec::<Vec<Vec<u32>>>::new()));
         let b = Arc::clone(&buf);
-        llama_rs::moe::set_route_trace_sink(Some(Box::new(move |calls| {
+        oaiy_llm_server::llm::moe::set_route_trace_sink(Some(Box::new(move |calls| {
             b.lock().unwrap_or_else(|e| e.into_inner()).push(calls.to_vec());
         })));
         buf
@@ -455,7 +455,7 @@ fn cmd_run(args: &[String]) -> i32 {
     out!("\n");
 
     if let Some(buf) = &trace_buf {
-        llama_rs::moe::set_route_trace_sink(None);
+        oaiy_llm_server::llm::moe::set_route_trace_sink(None);
         let path = o.trace_out.as_deref().unwrap_or_default();
         let calls = buf.lock().unwrap_or_else(|e| e.into_inner());
         if calls.is_empty() {
@@ -520,7 +520,7 @@ fn cmd_chat(args: &[String]) -> i32 {
             continue;
         }
         if line == "/reset" {
-            history.retain(|m| m.role == llama_rs::Role::System);
+            history.retain(|m| m.role == oaiy_llm_server::llm::Role::System);
             out!("(conversation cleared)\n");
             continue;
         }

@@ -82,7 +82,7 @@ impl FlashNext {
                 // prompt after a 14,974-token one found no room, "Allocation of 512.00 MB failed", where the same
                 // prompt alone had it.) The old vectors go as the new ones come, a layer at a time, and before any
                 // new one where none of their rows is kept: made all at once beside the old ones, a cache's growth
-                // took both caches' memory of a card that holds little more than one (the 27B's did, llama-rs's
+                // took both caches' memory of a card that holds little more than one (the 27B's did, `llm`'s
                 // `reserve`).
                 let least = (past + t).next_power_of_two().max(256);
                 let whole = needed.next_power_of_two().max(256);
@@ -238,7 +238,7 @@ impl FlashNext {
         // The states the run keeps from inside it (`taps`: after that many of its rows, ascending; a resumed chunk's
         // its own): a pair of vectors a delta net and one for the n-gram layer's window, and what the caller is given
         // of them: a checkpoint's tensors, as the cache holds its own (the n-gram layer's history its tokens').
-        let (kept, mut tapped): (Vec<Tap>, Vec<llama_rs::Tapped>) = match parked.as_mut() {
+        let (kept, mut tapped): (Vec<Tap>, Vec<crate::llm::Tapped>) = match parked.as_mut() {
             Some(p) => (std::mem::take(&mut p.kept), std::mem::take(&mut p.tapped)),
             None if taps.is_empty() => (Vec::new(), Vec::new()),
             None => {
@@ -268,7 +268,7 @@ impl FlashNext {
                         }
                         let ids: Vec<i64> = before.iter().copied().chain(tokens[..tap.row].iter().map(|&v| v as i64)).collect();
                         ss[ple_slot(cfg)] = Some(Tensor::from_vec(ids[ids.len() - ctx..].iter().map(|&v| v as f32).collect(), vec![ctx]));
-                        llama_rs::Tapped { at: past + tap.row, states: ss, convs: cs }
+                        crate::llm::Tapped { at: past + tap.row, states: ss, convs: cs }
                     })
                     .collect();
                 (kept, tapped)

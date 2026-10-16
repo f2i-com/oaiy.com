@@ -60,11 +60,11 @@ impl DenseKernel for WgpuDense {
 }
 
 /// Put `model`'s dense trunk on `gpu` while its budget holds it: how many matrices went, and their stored bytes.
-pub(crate) fn offload(model: &mut dsv41::model::Model, gpu: &WgpuBackend) -> (usize, u64) {
+pub(crate) fn offload(model: &mut crate::dsv41::model::Model, gpu: &WgpuBackend) -> (usize, u64) {
     model.offload(|_name, w| {
         let (data, n, k, fp8) = match w {
             Weight::Fp8 { w, s, n, k } => {
-                let scales = s.iter().map(|&b| dsv41::formats::e8m0_to_f32(b)).collect();
+                let scales = s.iter().map(|&b| oaiy_engine::formats::e8m0_to_f32(b)).collect();
                 (DenseData::Fp8 { w: w.clone(), scales, n: *n, k: *k }, *n, *k, true)
             }
             Weight::Bf16 { w, n, k } => (DenseData::Bf16 { w: w.clone(), n: *n, k: *k }, *n, *k, false),

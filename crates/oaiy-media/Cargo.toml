@@ -8,7 +8,6 @@ description = "Native Rust Qwen Image and LTX video inference worker for OAIY"
 [dependencies]
 oaiy-engine = { path = "../oaiy-engine" }
 oaiy-image = { path = "../oaiy-image" }
-dsv41 = { path = "../dsv41" }
 # Qwen3-TTS's layers, codec and voice encoders (shared with the realtime engine).
 oaiy-tts = { path = "../oaiy-tts" }
 candle-core = "0.11.0"

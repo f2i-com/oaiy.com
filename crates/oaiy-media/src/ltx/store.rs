@@ -13,7 +13,7 @@
 //! A LoRA (`<module>.lora_A.weight` / `lora_B.weight`, as ID-LoRA and the LTX
 //! trainer save them) is added to its weights as they are read: `W + s B A`.
 use candle_core::{DType, Device, Result, Tensor};
-use dsv41::safetensors::{Dtype, StIndex};
+use oaiy_engine::safetensors::{Dtype, StIndex};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -576,7 +576,7 @@ impl Store {
                         }
                         let n = (b - a) as usize;
                         if let Some((_, f)) = &open {
-                            if dsv41::io::read_exact_at(f, &mut buf[..n], a).is_ok() {
+                            if oaiy_engine::io::read_exact_at(f, &mut buf[..n], a).is_ok() {
                                 read.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
@@ -909,7 +909,7 @@ impl ReadAhead {
                     let mut done = 0;
                     while done < len {
                         let n = piece.len().min(len - done);
-                        if dsv41::io::read_exact_at(file, &mut piece[..n], start + done as u64).is_err() {
+                        if oaiy_engine::io::read_exact_at(file, &mut piece[..n], start + done as u64).is_err() {
                             return;
                         }
                         done += n;

@@ -1,11 +1,11 @@
 //! Native Qwen dense hybrid inference, image embeddings and XML tool protocol.
 use std::sync::{mpsc::Receiver, atomic::Ordering};
-use dsv41::chat::{Encoded, Mode, Options, DSML};
+use crate::dsv41::chat::{Encoded, Mode, Options, DSML};
 use ggml_rs::Tensor;
 use std::sync::Arc;
 use crate::qwen_cache::{Snapshot, RecurrentSnapshot, WholeBuilder};
 use crate::qwen_park::{Held, Parking};
-use llama_rs::{Model, MmProj, MmProjConfig, KvCache};
+use crate::llm::{Model, MmProj, MmProjConfig, KvCache};
 use oaiy_engine::json::Json;
 use crate::engine::{Event, Finish, ImagePrep, Job, JobImage, sample};
 
@@ -247,12 +247,12 @@ pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &M
     if count != records.len() { return Err("image placeholder count does not match image blocks".into()); }
     let side = cfg.image_size / cfg.patch_size / 2;
     if prompt.len().saturating_add(count.saturating_mul(side*side-1)) >= max_seq { return Err("images exceed configured context".into()); }
-    let vc = llama_rs::VisionConfig { image_size: cfg.image_size, patch_size: cfg.patch_size, mean: cfg.mean, std: cfg.std };
+    let vc = crate::llm::VisionConfig { image_size: cfg.image_size, patch_size: cfg.patch_size, mean: cfg.mean, std: cfg.std };
     let mut ids = Vec::new(); let mut images = Vec::new(); let mut records = records.iter();
     for id in prompt {
         if id != image_id { ids.push(id); continue; }
-        let bytes = dsv41::vision::image_bytes(records.next().unwrap(), local).map_err(|e| e.to_string())?;
-        let pixels = llama_rs::vision::preprocess_image_letterboxed(&bytes, &vc).map_err(|e| e.to_string())?;
+        let bytes = crate::dsv41::vision::image_bytes(records.next().unwrap(), local).map_err(|e| e.to_string())?;
+        let pixels = crate::llm::vision::preprocess_image_letterboxed(&bytes, &vc).map_err(|e| e.to_string())?;
         let hash=crate::disk::fnv(&bytes,0);
         images.push(JobImage { start: ids.len(), prep: ImagePrep::Qwen { pixels, side }, hash });
         ids.extend(std::iter::repeat_n(image_id, side*side));
@@ -264,7 +264,7 @@ pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &M
 /// most slices a picture is cut into, and its tower's mean and spread.
 #[derive(Clone, Debug)]
 pub struct MiniCpmV {
-    pub markers: llama_rs::mmproj::minicpmv::Markers,
+    pub markers: crate::llm::mmproj::minicpmv::Markers,
     pub merge: usize,
     pub max_slices: usize,
     pub mean: [f32; 3],
@@ -276,13 +276,13 @@ pub struct MiniCpmV {
 /// tokens and `</image>`, then each row of slices, every slice's tokens between `<slice>` and `</slice>`, the rows apart
 /// by a newline. Each tile is an image of the job, its tokens in a run of their own.
 pub fn prepare_minicpmv(records: &[Json], prompt: Vec<u32>, image_id: u32, m: &MiniCpmV, encode: impl Fn(&str) -> Vec<u32>, local: bool, max_seq: usize) -> Result<(Vec<u32>, Vec<JobImage>), String> {
-    use llama_rs::mmproj::minicpmv;
+    use crate::llm::mmproj::minicpmv;
     let count = prompt.iter().filter(|&&t| t == image_id).count();
     if count != records.len() { return Err("image placeholder count does not match image blocks".into()); }
     let (mut ids, mut images, mut records) = (Vec::new(), Vec::new(), records.iter());
     for (picture, id) in prompt.into_iter().scan(0usize, |n, id| { let at = *n; *n += (id == image_id) as usize; Some((at, id)) }) {
         if id != image_id { ids.push(id); continue; }
-        let bytes = dsv41::vision::image_bytes(records.next().unwrap(), local).map_err(|e| e.to_string())?;
+        let bytes = crate::dsv41::vision::image_bytes(records.next().unwrap(), local).map_err(|e| e.to_string())?;
         let t = minicpmv::tiles_from_bytes(&bytes, m.max_slices, m.mean, m.std).map_err(|e| e.to_string())?;
         let sizes = t.plan.target_sizes();
         let mut tiles = t.tiles.into_iter().zip(sizes).enumerate();
@@ -312,7 +312,7 @@ pub fn prepare_minicpmv(records: &[Json], prompt: Vec<u32>, image_id: u32, m: &M
     Ok((ids, images))
 }
 
-/// What the engine runs: a Qwen3.5 hybrid (llama-rs), or Qwen3.8-Flash-Next.
+/// What the engine runs: a Qwen3.5 hybrid (`llm`), or Qwen3.8-Flash-Next.
 pub enum Hybrid {
     Qwen35(Model),
     #[cfg(feature = "webgpu")]
@@ -327,7 +327,7 @@ impl From<Model> for Hybrid {
 
 impl Hybrid {
     /// The Qwen3.5 model: its checkpoints and disk states are Qwen3.5's shape.
-    fn qwen35(&self) -> Option<&llama_rs::Qwen35Model> {
+    fn qwen35(&self) -> Option<&crate::llm::Qwen35Model> {
         match self { Self::Qwen35(Model::Qwen35(m)) => Some(m), _ => None }
     }
     /// Qwen3.8-Flash-Next's cache: which of its slots hold keys and values a token (`FlashNext::row_slots`), for a
@@ -404,7 +404,7 @@ impl Hybrid {
         match self {
             #[cfg(feature = "webgpu")]
             Self::Flash(_) => crate::flashnext::CHECK_ROWS,
-            _ => llama_rs::SPEC_ROWS,
+            _ => crate::llm::SPEC_ROWS,
         }
     }
     /// Up to `k` drafts after the last of `recent` (the token sampled for position `kv.len`); None or none: a step.
@@ -511,7 +511,7 @@ impl Hybrid {
     }
     /// Whether the model is chained on GPUs, its kernels' pipelines made as each first runs
     /// ([`QwenEngine::warm_up`]): Flash-Next, a chained Qwen3.5 hybrid.
-    /// What the model keeps on its GPU between requests let go ([`llama_rs::Qwen35Chain::let_go_of_spare`]); with
+    /// What the model keeps on its GPU between requests let go ([`crate::llm::Qwen35Chain::let_go_of_spare`]); with
     /// `cache`, its attention cache's copy there too. Other models keep nothing of the kind.
     fn let_go_of_spare(&self, cache: bool) {
         if let Self::Qwen35(Model::Qwen35(m)) = self {
@@ -575,7 +575,7 @@ impl Hybrid {
     /// [`Self::forward_chunks`] and [`Self::forward_chunks_tapped`] (no `taps`: the former) for a dense Qwen hybrid's
     /// rows at `at`, as [`Self::forward`] places them: the text after a picture the cache holds already, in one
     /// chained run as any text is. Another model's: Err (it runs such text a chunk at a time).
-    fn forward_chunks_at(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize], at: &[[u32; 3]]) -> Result<(Tensor, Vec<llama_rs::Tapped>), String> {
+    fn forward_chunks_at(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize], at: &[[u32; 3]]) -> Result<(Tensor, Vec<crate::llm::Tapped>), String> {
         let Self::Qwen35(Model::Qwen35(m)) = self else { return Err("not a dense Qwen hybrid".into()) };
         let (tokens, emb) = self.joined(chunks);
         let embeds = m.backend.to_device(emb);
@@ -586,7 +586,7 @@ impl Hybrid {
         Ok((logits.to_host(), kept))
     }
 
-    fn forward_chunks_tapped(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> Result<(Tensor, Vec<llama_rs::Tapped>), String> {
+    fn forward_chunks_tapped(&self, chunks: &[(&[u32], Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> Result<(Tensor, Vec<crate::llm::Tapped>), String> {
         #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
             let len = kv.len;
@@ -1450,7 +1450,7 @@ fn positions(job: &Job, minicpmv: Option<&MiniCpmV>) -> Result<(Vec<[u32;3]>,u32
             mask[image.start..end].iter_mut().for_each(|t| *t = true);
             sizes.push(size);
         }
-        let (canvas, next) = llama_rs::mmproj::minicpmv::canvas_positions(&job.prompt, &mask, &sizes, m.merge, m.markers);
+        let (canvas, next) = crate::llm::mmproj::minicpmv::canvas_positions(&job.prompt, &mask, &sizes, m.merge, m.markers);
         let canvas = canvas.into_iter().map(|p| [p[0] as u32, p[1] as u32, p[2] as u32]).collect();
         return Ok((canvas, next as u32));
     }

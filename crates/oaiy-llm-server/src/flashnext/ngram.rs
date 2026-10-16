@@ -24,8 +24,8 @@ pub(super) const MUL1: u64 = 0x83DC_D12D;
 
 /// The 65536 decoded `mul1` values, as fp16 (bit-exact with EXL3's codebook).
 pub(super) fn mul1_codebook() -> Vec<f32> {
-    let k_inv = dsv41::formats::f16_to_f32(0x1eee);
-    let k_bias = dsv41::formats::f16_to_f32(0xc931);
+    let k_inv = oaiy_engine::formats::f16_to_f32(0x1eee);
+    let k_bias = oaiy_engine::formats::f16_to_f32(0xc931);
     (0..65536u64).map(|s| {
         let p = (s * MUL1) & 0xffff_ffff;
         let sum = (p & 255) + ((p >> 8) & 255) + ((p >> 16) & 255) + ((p >> 24) & 255);
@@ -44,7 +44,7 @@ pub(super) const ROW_WORDS_MAX: usize = 1 + ROW_DIM * 8 / 16;
 /// each code read once, each state its codes shifted together (where each state's 16 bits were read one at a time).
 pub(super) fn decode_row(bytes: &[u8], k: usize, codebook: &[f32], bias: &[f32], out: &mut [f32]) {
     let word = |i: usize| bytes.get(2 * i..2 * i + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])) as u32;
-    let scale = dsv41::formats::f16_to_f32(word(0) as u16);
+    let scale = oaiy_engine::formats::f16_to_f32(word(0) as u16);
     let mask = (1u32 << k) - 1;
     let mut codes = [0u32; ROW_DIM];
     for (j, c) in codes.iter_mut().enumerate() {

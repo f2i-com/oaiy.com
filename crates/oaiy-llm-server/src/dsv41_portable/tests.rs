@@ -3,7 +3,7 @@
 use super::experts::MARGIN;
 use super::trunk::WgpuDense;
 use super::*;
-use dsv41::model::{Model, ModelOptions};
+use crate::dsv41::model::{Model, ModelOptions};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -12,7 +12,7 @@ fn checkpoint() -> PathBuf {
 }
 
 fn prompt(dir: &std::path::Path, tokens: usize) -> Vec<u32> {
-    let tok = dsv41::tokenizer::Tokenizer::load(dir).unwrap();
+    let tok = crate::dsv41::tokenizer::Tokenizer::load(dir).unwrap();
     // A text kept with the tests (docs/WEBGPU.md as it was on 2026-10-05, some 3,400 tokens), LF whatever the
     // checkout wrote: a CRLF copy is another prompt (other tokens, other experts). The prompt was the docs as they
     // stood, and every edit of them was another prompt: by 2026-10-09 the GPU's logits after its first 400 tokens
@@ -34,7 +34,7 @@ fn prompt(dir: &std::path::Path, tokens: usize) -> Vec<u32> {
 /// the SwiGLU's output can go the other way), never a different answer.
 #[test]
 fn an_expert_on_the_gpu_gives_the_cpus_output_but_for_its_sums_order() {
-    use dsv41::expert::{expert_forward_batch, ExpertJob, ExpertsKernel, DIM, RECORD_BYTES, S1, W1};
+    use crate::dsv41::expert::{expert_forward_batch, ExpertJob, ExpertsKernel, DIM, RECORD_BYTES, S1, W1};
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
     let mut s = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = move || {
@@ -68,8 +68,8 @@ fn an_expert_on_the_gpu_gives_the_cpus_output_but_for_its_sums_order() {
 #[test]
 #[ignore = "a timing; needs a WebGPU adapter; run with --nocapture"]
 fn measure_a_group_of_experts_on_the_gpu() {
-    use dsv41::expert::{ExpertJob, ExpertsKernel, BLOCK, DIM, INTER, RECORD_BYTES, S1, S2, S3, W1, W2, W3};
-    use dsv41::formats::fake_quant_fp8;
+    use crate::dsv41::expert::{ExpertJob, ExpertsKernel, BLOCK, DIM, INTER, RECORD_BYTES, S1, S2, S3, W1, W2, W3};
+    use oaiy_engine::formats::fake_quant_fp8;
     let b = gpu();
     let mut s = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = move || {
@@ -112,7 +112,7 @@ fn measure_a_group_of_experts_on_the_gpu() {
     let sums = ggml_rs_wgpu::dense::forward_batch(&items);
     let gate_up = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    let hq: Vec<Vec<f32>> = sums.chunks(2).map(|p| fake_quant_fp8(&dsv41::expert::swiglu(&p[0], &p[1], Some(&weights), 10.0), BLOCK)).collect();
+    let hq: Vec<Vec<f32>> = sums.chunks(2).map(|p| fake_quant_fp8(&crate::dsv41::expert::swiglu(&p[0], &p[1], Some(&weights), 10.0), BLOCK)).collect();
     let host = t.elapsed().as_secs_f64();
     let items: Vec<(&DenseGpu, &[f32], usize, std::ops::Range<usize>)> = placed.iter().zip(&hq).map(|((_, _, d), h)| (d, h.as_slice(), rows, 0..DIM)).collect();
     let t = Instant::now();
@@ -140,14 +140,14 @@ struct Made;
 
 impl oaiy_engine::store::WeightStore for Made {
     fn record_bytes(&self) -> usize {
-        dsv41::expert::RECORD_BYTES
+        crate::dsv41::expert::RECORD_BYTES
     }
     fn shape(&self) -> (u32, u32) {
         (2, 64)
     }
     fn fetch(&self, layer: u32, expert: u32, dst: &mut [u8]) -> oaiy_engine::Result<()> {
         let mut s = (0x9E37_79B9_7F4A_7C15u64 ^ ((layer as u64) << 32 | expert as u64)).wrapping_mul(0x2545_F491_4F6C_DD1D) | 1;
-        let scales = dsv41::expert::S1.start;
+        let scales = crate::dsv41::expert::S1.start;
         for (i, chunk) in dst.chunks_mut(8).enumerate() {
             s ^= s << 13;
             s ^= s >> 7;
@@ -168,8 +168,8 @@ impl oaiy_engine::store::WeightStore for Made {
 #[test]
 #[ignore = "needs a WebGPU adapter (some 700 MB of it)"]
 fn a_steps_experts_in_one_submit_give_the_two_calls_outputs_but_for_a_rounding() {
-    use dsv41::expert::{BLOCK, DIM, INTER, RECORD_BYTES, S1, S2, S3, W1, W2, W3};
-    use dsv41::formats::{fake_quant_fp8, to_bf16};
+    use crate::dsv41::expert::{BLOCK, DIM, INTER, RECORD_BYTES, S1, S2, S3, W1, W2, W3};
+    use oaiy_engine::formats::{fake_quant_fp8, to_bf16};
     use ggml_rs_wgpu::dense::{forward_batch, forward_units, Unit};
     use oaiy_engine::store::WeightStore;
     let b = WgpuBackend::new(Some(1 << 30)).expect("a WebGPU adapter");
@@ -187,7 +187,7 @@ fn a_steps_experts_in_one_submit_give_the_two_calls_outputs_but_for_a_rounding()
         // the two calls, the SwiGLU on the host between them
         let items: Vec<(&DenseGpu, &[f32], usize, std::ops::Range<usize>)> = (0..6).flat_map(|i| [(&mats[i][0], &xs[i][..], 1, 0..INTER), (&mats[i][1], &xs[i][..], 1, 0..INTER)]).collect();
         let sums = forward_batch(&items);
-        let hq: Vec<Vec<f32>> = sums.chunks(2).zip(&weights).map(|(p, w)| fake_quant_fp8(&dsv41::expert::swiglu(&p[0], &p[1], Some(&[*w]), limit), BLOCK)).collect();
+        let hq: Vec<Vec<f32>> = sums.chunks(2).zip(&weights).map(|(p, w)| fake_quant_fp8(&crate::dsv41::expert::swiglu(&p[0], &p[1], Some(&[*w]), limit), BLOCK)).collect();
         let items: Vec<(&DenseGpu, &[f32], usize, std::ops::Range<usize>)> = (0..6).map(|i| (&mats[i][2], &hq[i][..], 1, 0..DIM)).collect();
         let want: Vec<Vec<f32>> = forward_batch(&items).into_iter().map(|y| y.into_iter().map(to_bf16).collect()).collect();
         // one submit
@@ -220,16 +220,16 @@ fn a_steps_experts_in_one_submit_give_the_two_calls_outputs_but_for_a_rounding()
 #[test]
 #[ignore = "needs a WebGPU adapter (some 700 MB of it)"]
 fn an_idle_rebalance_gives_the_card_the_most_used_experts_and_ram_the_displaced() {
-    use dsv41::expert::{ExpertJob, ExpertsKernel, DIM, RECORD_BYTES};
+    use crate::dsv41::expert::{ExpertJob, ExpertsKernel, DIM, RECORD_BYTES};
     use oaiy_engine::store::WeightStore;
     let record = RECORD_BYTES as u64;
-    let b = WgpuBackend::new(Some(dsv41::moe::GPU_GROUP as u64 * record + MARGIN + 4 * record + record / 2)).expect("a WebGPU adapter");
+    let b = WgpuBackend::new(Some(crate::dsv41::moe::GPU_GROUP as u64 * record + MARGIN + 4 * record + record / 2)).expect("a WebGPU adapter");
     let k = WgpuExperts::new(&b, 0).unwrap();
     assert_eq!(k.tier().0, 4, "a tier of four slots");
     k.set_exclusive(true);
     let (store, cache) = (Made, oaiy_engine::ecache::Ecache::new(8 * RECORD_BYTES, RECORD_BYTES, oaiy_engine::CachePolicy::Lfru));
     // the model's counts of uses, as its MoE keeps them: a call that routed to an expert one
-    let uses = dsv41::moe::Uses::new(2, 64);
+    let uses = crate::dsv41::moe::Uses::new(2, 64);
     // experts 0 to 3 come in as a decode step's misses do (each used twice), and leave RAM
     for e in 0..4u32 {
         let lease = cache.acquire(0, e, &store).unwrap();
@@ -282,7 +282,7 @@ fn an_idle_rebalance_gives_the_card_the_most_used_experts_and_ram_the_displaced(
     // The counts age (the model halves them every so many decode steps). Experts 6 and 7 are then used thirty
     // times: 5, which the card took in after twenty uses, would keep its slot against thirty (twice as much and
     // four more is forty-four) but for the halving.
-    assert_eq!((0..dsv41::moe::USES_AGE_STEPS).filter(|_| uses.step()).count(), 1);
+    assert_eq!((0..crate::dsv41::moe::USES_AGE_STEPS).filter(|_| uses.step()).count(), 1);
     drop(cache.acquire(0, 7, &store).unwrap());
     for _ in 0..30 {
         uses.add(0, &[6, 7]);
@@ -304,10 +304,10 @@ fn an_idle_rebalance_gives_the_card_the_most_used_experts_and_ram_the_displaced(
 #[test]
 #[ignore = "needs a WebGPU adapter (some 700 MB of it)"]
 fn a_usage_profile_orders_a_start_ups_tiers() {
-    use dsv41::expert::{ExpertsKernel, RECORD_BYTES};
+    use crate::dsv41::expert::{ExpertsKernel, RECORD_BYTES};
     let dir = std::env::temp_dir().join(format!("oaiy-usage-{}", std::process::id()));
     let path = dir.join("profile.bin");
-    let uses = dsv41::moe::Uses::new(2, 64);
+    let uses = crate::dsv41::moe::Uses::new(2, 64);
     assert!(!read_usage(&path, &uses), "no profile yet");
     for _ in 0..9 {
         uses.add(1, &[40]);
@@ -317,18 +317,18 @@ fn a_usage_profile_orders_a_start_ups_tiers() {
     }
     uses.add(1, &[0]);
     write_usage(&path, &uses).unwrap();
-    let again = dsv41::moe::Uses::new(2, 64);
+    let again = crate::dsv41::moe::Uses::new(2, 64);
     assert!(read_usage(&path, &again) && again.counts() == uses.counts());
-    assert!(!read_usage(&path, &dsv41::moe::Uses::new(2, 32)), "another model's shape");
+    assert!(!read_usage(&path, &crate::dsv41::moe::Uses::new(2, 32)), "another model's shape");
     std::fs::write(&path, &std::fs::read(&path).unwrap()[..40]).unwrap();
-    assert!(!read_usage(&path, &dsv41::moe::Uses::new(2, 64)), "a file cut short");
+    assert!(!read_usage(&path, &crate::dsv41::moe::Uses::new(2, 64)), "a file cut short");
     let _ = std::fs::remove_dir_all(&dir);
     let order = again.order();
     assert_eq!(order.len(), 128);
     assert_eq!(order[..6], [(1, 40), (0, 3), (0, 7), (1, 0), (0, 0), (0, 1)]);
     // a tier of four slots takes the first four of the order, read from the drive while idle, not RAM's
     let record = RECORD_BYTES as u64;
-    let b = WgpuBackend::new(Some(dsv41::moe::GPU_GROUP as u64 * record + MARGIN + 4 * record + record / 2)).expect("a WebGPU adapter");
+    let b = WgpuBackend::new(Some(crate::dsv41::moe::GPU_GROUP as u64 * record + MARGIN + 4 * record + record / 2)).expect("a WebGPU adapter");
     let mut k = WgpuExperts::new(&b, 0).unwrap();
     k.set_exclusive(true);
     k.start_from(&order);
@@ -356,7 +356,7 @@ fn the_trunk_and_the_experts_on_the_gpu_answer_as_the_cpu_model_does() {
         let first = logits.clone();
         let mut tokens = Vec::new();
         for step in 0..6 {
-            let next = dsv41::model::argmax(&logits);
+            let next = crate::dsv41::model::argmax(&logits);
             tokens.push(next);
             logits = model.forward(&[next], ids.len() + step, &mut |_, _| {}).unwrap();
         }
@@ -367,7 +367,7 @@ fn the_trunk_and_the_experts_on_the_gpu_answer_as_the_cpu_model_does() {
     let mut model = Model::load(&dir, &meta, &opts).unwrap();
     let (count, bytes) = offload(&mut model, backend.as_any().downcast_ref::<WgpuBackend>().unwrap());
     let kernel = Arc::new(WgpuExperts::new(backend.as_any().downcast_ref::<WgpuBackend>().unwrap(), 0).unwrap());
-    model.set_experts_kernel(Some(Arc::clone(&kernel) as Arc<dyn dsv41::expert::ExpertsKernel>));
+    model.set_experts_kernel(Some(Arc::clone(&kernel) as Arc<dyn crate::dsv41::expert::ExpertsKernel>));
     eprintln!("{count} dense matrices on the GPU, {:.2} GB, and the experts", bytes as f64 / 1e9);
     let (gpu_logits, gpu_tokens) = run(&mut model);
     let (slots, hits, misses, admitted) = kernel.tier();
@@ -418,7 +418,7 @@ fn measure_prefill_and_warm_decode_with_the_trunk_on_the_gpu() {
             k.set_admit_on_decode(false);
             eprintln!("a decode step's misses kept out of the tier");
         }
-        model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn dsv41::expert::ExpertsKernel>));
+        model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn crate::dsv41::expert::ExpertsKernel>));
         kernel = Some(k);
         eprintln!("a prompt's busy experts on the GPU");
     }
@@ -444,19 +444,19 @@ fn measure_prefill_and_warm_decode_with_the_trunk_on_the_gpu() {
             after.hits - before.hits,
             after.misses - before.misses,
             spans.iter().map(|(k, v)| format!("{k} {v:.2} s")).collect::<Vec<_>>().join(", "),
-            dsv41::profile::take_line(),
+            crate::dsv41::profile::take_line(),
             ggml_rs_wgpu::profile::take_dense_line()
         );
     };
     let before = model.expert_cache().stats();
-    dsv41::profile::take();
+    crate::dsv41::profile::take();
     *last.borrow_mut() = Instant::now();
     let t = Instant::now();
     let mut logits = model.forward(&ids, 0, &mut trace).unwrap();
     report(&format!("prompt of {} tokens", ids.len()), t.elapsed().as_secs_f64(), before, model.expert_cache().stats(), &spans.borrow());
     let mut times = Vec::new();
     for step in 0..steps {
-        let next = dsv41::model::argmax(&logits);
+        let next = crate::dsv41::model::argmax(&logits);
         spans.borrow_mut().clear();
         let before = model.expert_cache().stats();
         *last.borrow_mut() = Instant::now();
@@ -470,13 +470,13 @@ fn measure_prefill_and_warm_decode_with_the_trunk_on_the_gpu() {
     eprintln!("last {} steps: {:.2} s a token on average", tail.len(), tail.iter().sum::<f64>() / tail.len() as f64);
 }
 
-/// A projection of projections in one call ([`dsv41::linear::chained_together`]) is the two calls to the bit:
+/// A projection of projections in one call ([`crate::dsv41::linear::chained_together`]) is the two calls to the bit:
 /// eight groups of a bf16 weight (a layer's `wo_a`) whose row an fp8 weight (`wo_b`) takes quantized, and a bf16
 /// weight after a bf16 weight (the row rounded and not quantized), each on rows of several sizes of value.
 #[test]
 #[ignore = "needs a WebGPU adapter"]
 fn a_chained_projection_is_the_two_calls_to_the_bit() {
-    use dsv41::linear::{chained_together, forward_together, Out};
+    use crate::dsv41::linear::{chained_together, forward_together, Out};
     let b = WgpuBackend::new(Some(1 << 30)).expect("a WebGPU adapter");
     let mut s = 0x1234_5678_9abc_def1u64;
     let mut next = move || {

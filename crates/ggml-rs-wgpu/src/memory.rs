@@ -157,7 +157,7 @@ fn wired_limit() -> Option<u64> {
 /// most of each token's experts from the disk on a computer with 192 GB.
 ///
 /// The same reader as `ggml_rs_cuda::host_memory`, here because this is the crate every portable build links and
-/// `ggml-rs` and `llama-rs` keep no `unsafe` at all: on Windows it is one documented call, on Linux a file, on a Mac
+/// `ggml-rs` and the server's `llm` keep no `unsafe` at all: on Windows it is one documented call, on Linux a file, on a Mac
 /// two of its own programs' answers. `None` on a platform it has no reader for, so a caller keeps a fallback.
 pub fn host_memory() -> Option<(usize, usize)> {
     host_memory_impl()

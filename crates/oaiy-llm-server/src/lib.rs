@@ -1,5 +1,10 @@
-//! oaiy-llm-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible HTTP API,
+//! oaiy-llm-server: OAIY's language models behind an OpenAI-compatible HTTP API,
 //! for chat clients and coding harnesses.
+//!
+//! The models live here too: [`llm`] runs the GGUF ones (their architectures, the
+//! chained GPU runs, expert streaming) on the workspace's GGUF stack, and [`dsv41`]
+//! runs DeepSeek-V4.1 from its safetensors. The engines beside them (`qwen`, `glm`,
+//! `flashnext`, `lfm2`, ...) serve them on WebGPU.
 //!
 //! The `oaiy-llm-server` binary is a thin wrapper around [`start`]. A program
 //! that wants the model inside its own process (a coding CLI, say) calls
@@ -7,7 +12,9 @@
 //! reachable only by whoever holds the key, on a loopback port picked by the
 //! OS, and `silent` keeps the server's log off the host's terminal.
 
-#![forbid(unsafe_code)]
+// No `unsafe` but where a CPU kernel's SIMD calls must be (each behind a runtime check of the CPU's features, each
+// with its `SAFETY:`): `dsv41::simd` and `llm::glm5next::cpu_experts::dot`, which allow it; anywhere else it is an error.
+#![deny(unsafe_code)]
 // The DeepSeek engine that called these helpers (the repetition and tool-phase guards, the
 // observer's internals) was the CUDA build's: they stand for the WebGPU engine to take up
 // (`dsv41_portable`), and until it does nothing calls them.
@@ -26,9 +33,9 @@ mod backend;
 pub mod observer;
 mod tool_phase;
 mod repetition;
-// VENDORED-LOCAL: GLM-5.3-Flash served through the same job/event contract.
+// GLM-5.3-Flash served through the same job/event contract.
 pub mod glm;
-// VENDORED-LOCAL: the configured models, and swapping between them.
+// the configured models, and swapping between them.
 pub mod models;
 mod http;
 mod qwen;
@@ -45,6 +52,8 @@ mod qwen_vision;
 // DeepSeek-V4.1 without CUDA: the CPU model with its dense trunk on the WebGPU adapter.
 #[cfg(feature = "webgpu")]
 mod dsv41_portable;
+pub mod dsv41;
+pub mod llm;
 mod lora;
 mod qwen_cache;
 // Conversations Qwen3.8-Flash-Next sets aside in host RAM.
@@ -68,7 +77,7 @@ use std::time::{Duration, Instant};
 /// state written before then holds a recurrent state built with a transposed
 /// decay. Reusing one puts the model straight back into the degeneration the fix
 /// removed -- and it would look like the fix not working, on exactly the prompts a
-/// harness repeats. See `llama_rs::glm5next::kda`.
+/// harness repeats. See `crate::llm::glm5next::kda`.
 const STATE_FORMAT: u8 = 2;
 
 /// Context length when `--ctx` is not given, and for a model that names no
@@ -110,11 +119,11 @@ pub struct Options {
     pub usage: Option<PathBuf>,
     /// The model name clients use.
     pub name: String,
-    // VENDORED-LOCAL: more than one model, switched on demand.
+    // more than one model, switched on demand.
     /// Further models a client may ask for by name, as `(name, path)`. The
     /// `model`/`name` pair above is the default and is always available.
     ///
-    /// A `.gguf` (or a directory holding one) is served through llama-rs; anything
+    /// A `.gguf` (or a directory holding one) is served through `llm`; anything
     /// else is taken for a DeepSeek checkpoint directory. Only one is ever resident:
     /// asking for another unloads the current one first.
     pub extra_models: Vec<(String, std::path::PathBuf)>,
@@ -401,11 +410,11 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
     let other = other_loopback(addr).and_then(|a| TcpListener::bind(a).ok());
     listening(addr);
 
-    // VENDORED-LOCAL: the configured models, loaded one at a time.
+    // the configured models, loaded one at a time.
     //
     // Everything a load needs moved into `models.rs`, because a switch has to be
     // able to do it again later: the DeepSeek path (GpuModel, the usage warm-up, the
-    // prompt-state cache) and the GGUF path (llama-rs) are both there, chosen by what
+    // prompt-state cache) and the GGUF path (`llm`) are both there, chosen by what
     // is on disk. Only one model is ever resident.
     let loopback = o.host == "localhost"
         || o.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());

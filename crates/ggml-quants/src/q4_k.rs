@@ -71,7 +71,7 @@ pub fn dequantize(src: &[u8], dst: &mut [f32]) {
     }
 }
 
-// VENDORED-LOCAL: GLM-5.3-Flash. Fused Q4_K x f32 dot products.
+// GLM-5.3-Flash. Fused Q4_K x f32 dot products.
 //
 // The reason this exists: computing a routed expert on the CPU used to mean
 // `dequantize` into f32 and then a matvec over the result. For one GLM-5.3-Flash
@@ -182,7 +182,7 @@ pub fn has_avx512() -> bool {
     }
 }
 
-// VENDORED-LOCAL: GLM-5.3-Flash. AVX-512 Q4_K dot products.
+// GLM-5.3-Flash. AVX-512 Q4_K dot products.
 //
 // The scalar [`dot_row`] is bit-identical to `dequantize` then a sequential dot,
 // and it is compute-bound: measured at about 1.85 cycles per weight, 3.46 ms for a
@@ -455,6 +455,7 @@ mod fused_dot_tests {
 
     /// The sum of |w_i * x_i| for a row: the scale a dot product's rounding error
     /// is actually proportional to.
+    #[cfg(target_arch = "x86_64")]
     fn abs_sum(row: &[u8], x: &[f32]) -> f32 {
         let mut w = vec![0.0f32; row.len() / BYTES_PER_BLOCK * BLOCK_SIZE];
         dequantize(row, &mut w);
@@ -476,6 +477,7 @@ mod fused_dot_tests {
     /// lane-wise version is *better* conditioned than the oracle it is compared
     /// against, because 16 shorter chains accumulate less. 1e-6 is a tight bar on
     /// that scale.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_dot_matches_the_scalar_oracle() {
         if !has_avx512() {
@@ -502,6 +504,7 @@ mod fused_dot_tests {
 
     /// Deterministic: the same inputs must give exactly the same bits every time,
     /// even though those bits differ from the scalar path.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_dot_is_deterministic() {
         if !has_avx512() {
@@ -519,6 +522,7 @@ mod fused_dot_tests {
     }
 
     /// Scalar against AVX-512 at the released projection shape.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     #[ignore = "measures"]
     fn measure_avx512_speedup() {

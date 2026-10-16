@@ -40,7 +40,7 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --name NAME          model name clients use (default deepseek-v4.1-flash)
   --also NAME=PATH     another model a client may ask for by name; repeatable.
                        A .gguf (or a directory holding one) is served through
-                       llama-rs, anything else as a DeepSeek checkpoint. Only one
+                       `llm`, anything else as a DeepSeek checkpoint. Only one
                        is resident: asking for another unloads the current one,
                        which takes as long as a load. /v1/models says which is
                        loaded.
@@ -155,7 +155,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 a.usage = if v == "off" { None } else { Some(v.into()) };
             }
             "--name" => a.name = val()?,
-            // VENDORED-LOCAL: more than one model, switched on demand.
+            // more than one model, switched on demand.
             "--also" => {
                 let spec = val()?;
                 let (name, path) = spec.split_once('=').ok_or_else(|| {
@@ -166,7 +166,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 }
                 a.extra_models.push((name.to_string(), path.into()));
             }
-            // VENDORED-LOCAL: which of them to load at start. `--help` has
+            // which of them to load at start. `--help` has
             // documented this since the option was added for coder-cli's daemon,
             // but the arm never landed here, so a direct invocation was told
             // "unknown option --start" while the documented behaviour existed.

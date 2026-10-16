@@ -2,7 +2,7 @@
 //! the attention length is incorrect: the delta-net and convolution state must
 //! also be restored to exactly the same token boundary.
 use ggml_rs::{Backend, Tensor};
-use llama_rs::{KvCache, qwen35::SsmConfig};
+use crate::llm::{KvCache, qwen35::SsmConfig};
 use std::sync::Arc;
 
 /// `t` for a cache to take as its own: a checkpoint's tensor still on a device is the checkpoint's vector there, which
@@ -150,7 +150,7 @@ impl RecurrentSnapshot {
         let mut convs = copied(kv, &kv.ssm_conv, backend);
         Self(Snapshot { pos: kv.len, layers: (0..kv.ssm_state.len()).map(|i| [None, None, states[i].take(), convs[i].take()]).collect() })
     }
-    /// A checkpoint at `pos` of the recurrent tensors a run kept from inside it (`llama_rs::Tapped`'s, a layer each:
+    /// A checkpoint at `pos` of the recurrent tensors a run kept from inside it (`crate::llm::Tapped`'s, a layer each:
     /// on their device as [`Self::capture_later`]'s copies are, and settled as they are).
     pub fn tapped(pos: usize, states: Vec<Option<Tensor>>, convs: Vec<Option<Tensor>>) -> Self {
         Self(Snapshot { pos, layers: states.into_iter().zip(convs).map(|(state, conv)| [None, None, state, conv]).collect() })

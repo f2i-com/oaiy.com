@@ -12,7 +12,7 @@
 //! host and take `CpuBackend`'s path: a model larger than the GPU still runs,
 //! the rest of it on the CPU.
 
-// VENDORED-LOCAL: this crate is OAIY's addition beside ggml-rs-cuda.
+// this crate is OAIY's addition beside ggml-rs-cuda.
 
 pub mod chain;
 pub mod dense;

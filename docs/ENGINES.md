@@ -119,7 +119,7 @@ Every token is a small, well-planned job:
   left off. See [Serving](#serving-an-openai-compatible-api).
 - **Any GGUF.** Llama, Qwen2/3/3.5, Gemma 3/3n/4, Mixtral, Qwen3-MoE and more, through
   our own pure-Rust GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`, `tokenizer`,
-  `llama-rs`; no llama.cpp, no C++). Chat templates per architecture, and vision towers
+  the server's `llm`; no llama.cpp, no C++). Chat templates per architecture, and vision towers
   for several of them.
 - **MoE experts streamed straight from the `.gguf`.** `--budget 12G` loads only the
   trunk and reads routed experts on demand, with parallel positioned reads, into a
@@ -363,13 +363,17 @@ at the same speed.
 ```
 crates/
   oaiy-engine/   core library (std-only): expert-store seam, LFRU RAM expert cache,
-                 thread pool, JSON reader
+                 thread pool, JSON reader, the safetensors reader and number formats
   oaiy-llm-cli/      `oaiy-llm` binary: run / chat / bench / info / tokenize for GGUF models
-  dsv41/         DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
-                 model, CPU experts (std-only, forbid(unsafe_code))
   oaiy-image/    image decoding (std-only): PNG with its own inflate, JPEG, Pillow's
                  resize — pixel-exact to Pillow
-  oaiy-llm-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
+  oaiy-llm-server/   the language-model server (OpenAI-compatible HTTP), every model on WebGPU:
+    src/llm/         the GGUF models: architectures, chained GPU runs, expert streaming
+                     (once the crate llama-rs)
+    src/dsv41/       DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
+                     model, CPU experts (once the crate dsv41; its SIMD kernels' calls in
+                     src/dsv41/simd.rs, once dsv41-simd)
+    src/qwen.rs, glm.rs, flashnext/, lfm2/ ...   the engines that serve them
   oaiy-studio/   portable host (std-only): supervises oaiy-llm-server and oaiy-media,
                  control UI, configurable OpenAI-style gateway, model detection
   oaiy-studio-tray/  the same host as a Windows notification-area app
@@ -381,17 +385,16 @@ crates/
   oaiy-voice/    the resident speech server for calls: Parakeet speech-to-text and
                  Qwen3-TTS, served as OAIY Voice
   ggml-rs-wgpu/  WebGPU backend: the models' kernels in WGSL, what does not fit on the CPU
-  gguf, ggml-quants, ggml-rs, tokenizer, llama-rs
+  gguf, ggml-quants, ggml-rs, tokenizer
                  our pure-Rust GGUF stack: reader, quant kernels, the CPU
-                 backend, tokenizers, model architectures, expert streaming
+                 backend and its chain, tokenizers (the server's and oaiy-media's)
 tools/dsv41/     Python oracle (the reference model, streamed) and helpers
 docs/            DEEPSEEK_V41.md (the port), ROADMAP.md (streaming roadmap), and the
                  rest (see docs/README.md)
 ```
 
 [`CONVENTIONS.md`](../CONVENTIONS.md) is the engineering contract (std-only rules,
-naming, error handling); [`crates/VENDORED.md`](../crates/VENDORED.md) documents where
-the GGUF stack comes from. The engine's plan and phase log up to September 2026 is in
+naming, error handling). The engine's plan and phase log up to September 2026 is in
 the [archive](archive/ENGINE_PLAN.md).
 
 ## Testing
@@ -412,7 +415,7 @@ they are `#[ignore]`d by default. Vision has its own golden files
 
 ```sh
 cargo test -p oaiy-image --release            # decoders and resize against Pillow
-cargo test -p dsv41 --release --test vision_golden -- --include-ignored
+cargo test -p oaiy-llm-server --release --test dsv41_vision_golden -- --include-ignored
 ```
 
 The CUDA engine's gates (`dsv41-cuda`'s `gpu_model`, `gpu_vision` and
@@ -456,13 +459,12 @@ The CUDA engine's gates (`dsv41-cuda`'s `gpu_model`, `gpu_vision` and
 - On a 192 GB machine the drive sets the pace for new prompts and topics: run from a
   drive that sustains its speed (the T9 does, the internal one throttles). More RAM
   would help most of all.
-- The CLI is text-only. Vision towers live in `llama-rs` (see its examples).
+- The CLI is text-only. Vision towers live in the server's `llm` (see `crates/oaiy-llm-server/examples`).
 
 ## Provenance
 
-OAIY is written from scratch in Rust. The GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`,
-`tokenizer`, `llama-rs`) is the repo author's own Rust code, vendored
-from their `llm` workspace (see `crates/VENDORED.md`). The DeepSeek-V4.1 engine
+OAIY is written from scratch in Rust, the GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`,
+`tokenizer`, and the server's `llm` models) included. The DeepSeek-V4.1 engine
 follows DeepSeek's reference implementation and chat encoding, published under the MIT
 License (see `NOTICE`). `oaiy-image` is our own code; to decode to the same pixels as
 the reference's Pillow, it follows the arithmetic of Pillow's resampling and of

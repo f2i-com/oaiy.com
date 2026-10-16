@@ -10,7 +10,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use crate::error::{GgufError, Result};
-use crate::source::TensorBytes; // VENDORED-LOCAL
+use crate::source::TensorBytes;
 use crate::tensor::{GgmlType, TensorInfo};
 use crate::value::{Array, Value, ValueType};
 use crate::{DEFAULT_ALIGNMENT, GGUF_MAGIC, SUPPORTED_VERSIONS};
@@ -32,7 +32,7 @@ impl Backing {
     }
 }
 
-// VENDORED-LOCAL: one shard of a split GGUF beyond the first. The primary
+// one shard of a split GGUF beyond the first. The primary
 // shard's bytes stay in `GgufInner::backing` so the single-file path is
 // untouched.
 #[derive(Debug)]
@@ -57,12 +57,12 @@ struct GgufInner {
     tensors_by_name:   BTreeMap<String, usize>,
     tensor_data_start: u64,
     alignment:         u64,
-    // VENDORED-LOCAL: when set, tensor bodies are served through this source
+    // when set, tensor bodies are served through this source
     // (e.g. positioned reads from the file, for streamed experts) instead of
     // `backing`, which then holds only the header bytes (header + metadata
     // KV + tensor index + padding).
     source:            Option<Arc<dyn TensorBytes>>,
-    // VENDORED-LOCAL: split GGUF. `tensor_shard[i]` is which shard
+    // split GGUF. `tensor_shard[i]` is which shard
     // `tensors[i]`'s body lives in: 0 for `backing`, otherwise `extra[n - 1]`.
     // A parallel vector rather than a field on `TensorInfo` so the public
     // struct — and every literal that builds one in tests — stays unchanged.
@@ -73,7 +73,7 @@ struct GgufInner {
 impl GgufFile {
     /// Memory-map the file at `path` and parse its header / tensor table.
     ///
-    /// VENDORED-LOCAL: if the file declares `split.count > 1` this follows the
+    /// if the file declares `split.count > 1` this follows the
     /// sibling shards and presents them as one logical file — `tensors()` spans
     /// all of them and `tensor_by_name` resolves across them. Any shard may be
     /// named; the primary (`split.no == 0`) is always the one whose metadata is
@@ -162,7 +162,7 @@ impl GgufFile {
         Self::from_backing(Backing::Bytes(bytes))
     }
 
-    // VENDORED-LOCAL: everything from here to `tensor_source` is the
+    // everything from here to `tensor_source` is the
     // byte-source seam — see `crate::source`.
 
     /// Parse `header_bytes` (raw GGUF bytes up to the tensor data section:
@@ -183,7 +183,7 @@ impl GgufFile {
     /// of a mapping: only the header is held in memory. This is how a model
     /// streams its experts from disk.
     pub fn open_streaming(path: impl AsRef<Path>) -> Result<Self> {
-        // VENDORED-LOCAL: split-aware, and each shard gets its own FileSource.
+        // split-aware, and each shard gets its own FileSource.
         Self::open_following_splits(path.as_ref(), true)
     }
 
@@ -199,14 +199,14 @@ impl GgufFile {
     /// source on a source-backed file. Prefer this over [`tensor_data`] in
     /// code that should work for both.
     pub fn tensor_bytes(&self, t: &TensorInfo) -> Result<Cow<'_, [u8]>> {
-        // VENDORED-LOCAL: resolve the shard first; each has its own source.
+        // resolve the shard first; each has its own source.
         match self.shard_source(self.shard_of(t)) {
             Some(src) => Ok(Cow::Owned(src.read_tensor(t)?)),
             None => Ok(Cow::Borrowed(self.tensor_data(t))),
         }
     }
 
-    // VENDORED-LOCAL: shard resolution for a split GGUF. All of these collapse
+    // shard resolution for a split GGUF. All of these collapse
     // to the single-file behaviour when `extra` is empty.
 
     /// Which shard holds this tensor body. Looked up by name, which is the
@@ -303,7 +303,7 @@ impl GgufFile {
     /// Panics on a source-backed file ([`from_bytes_with_source`]): the
     /// backing then holds only the header. Use [`tensor_bytes`] there.
     pub fn tensor_data(&self, t: &TensorInfo) -> &[u8] {
-        // VENDORED-LOCAL: fail loudly instead of slicing past the header.
+        // fail loudly instead of slicing past the header.
         assert!(
             self.shard_source(self.shard_of(t)).is_none(),
             "tensor_data() on a source-backed GgufFile; use tensor_bytes()"
@@ -317,7 +317,7 @@ impl GgufFile {
     /// Absolute file offset of `t`'s data body. Combine with [`raw_slice`] to
     /// build long-lived zero-copy views of the mmap (so a clone of the
     /// `GgufFile` can keep the slice alive past a lookup-by-name borrow).
-    /// VENDORED-LOCAL: for a split GGUF this is the offset within the tensor
+    /// for a split GGUF this is the offset within the tensor
     /// own shard, so it pairs with [`Self::raw_slice_shard`] and
     /// [`Self::shard_of`], not with [`Self::raw_slice`].
     pub fn tensor_data_offset(&self, t: &TensorInfo) -> usize {
@@ -330,7 +330,7 @@ impl GgufFile {
     /// so the loader can hold an `Arc<GgufFile>` view without copying bytes
     /// into a `Vec<u8>` heap buffer.
     pub fn raw_slice(&self, offset: usize, len: usize) -> &[u8] {
-        // VENDORED-LOCAL: same guard as tensor_data — header-only backing.
+        // same guard as tensor_data — header-only backing.
         assert!(
             self.inner.source.is_none(),
             "raw_slice() on a source-backed GgufFile; use tensor_source()"
@@ -589,7 +589,7 @@ fn parse(backing: Backing) -> Result<GgufInner> {
     let unaligned = c.pos as u64;
     let tensor_data_start = align_up(unaligned, alignment);
 
-    // VENDORED-LOCAL: a freshly parsed file is one shard, so every tensor is 0.
+    // a freshly parsed file is one shard, so every tensor is 0.
     let tensor_shard = vec![0u32; tensors.len()];
 
     Ok(GgufInner {
@@ -600,13 +600,13 @@ fn parse(backing: Backing) -> Result<GgufInner> {
         tensors_by_name,
         tensor_data_start,
         alignment,
-        source: None, // VENDORED-LOCAL: set by from_bytes_with_source
+        source: None, // set by from_bytes_with_source
         tensor_shard,
         extra: Vec::new(),
     })
 }
 
-// VENDORED-LOCAL: split-GGUF helpers.
+// split-GGUF helpers.
 
 impl GgufInner {
     /// Fold another shard tensor table into this one. Bodies stay in that
@@ -836,9 +836,9 @@ mod tests {
         write_to_vec(&md, &[(t1, t1_data), (t2, t2_data)], 32).unwrap()
     }
 
-    /// VENDORED-LOCAL: a streaming open serves the same metadata and tensor
+    /// a streaming open serves the same metadata and tensor
     /// bytes through positioned reads as the mmap does.
-    // VENDORED-LOCAL: split-GGUF tests.
+    // split-GGUF tests.
 
     /// Build a two-shard split GGUF on disk and read it back as one file.
     #[test]

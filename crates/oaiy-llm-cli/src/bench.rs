@@ -6,7 +6,7 @@
 //! resident or with streamed experts (`--budget`), on the CPU or a WebGPU
 //! adapter (`--webgpu`). Model load, TTFT, prefill and
 //! steady-state decode are timed separately, with the backend synchronized
-//! at every timing boundary (`Backend::synchronize`, VENDORED-LOCAL in
+//! at every timing boundary (`Backend::synchronize`, in
 //! ggml-rs).
 //!
 //! The JSON schema is the deliverable; counters that no public API exposes
@@ -605,10 +605,10 @@ fn bench_gguf(o: &Opts) -> i32 {
 /// one entry per `moe_forward` invocation in execution order, each carrying
 /// the top-k expert ids per sequence position.
 ///
-/// The llama-rs routing decision is made inside `expert_stream.rs` (or the
+/// The models' routing decision (`oaiy_llm_server::llm`) is made inside `expert_stream.rs` (or the
 /// resident MoE loop) and the routed ids are not exposed on any public type;
-/// the trace is instead re-derived in `moe_forward_with_logits` (VENDORED-
-/// LOCAL hook) from the same router logits with the same `top_k_softmax`, so
+/// the trace is instead re-derived in `moe_forward_with_logits` (a hook of
+/// the models') from the same router logits with the same `top_k_softmax`, so
 /// the recorded ids are identical by construction. The hook does not know
 /// the layer index, so it is recovered here from call order: the forward
 /// pass visits MoE blocks in layer order, hence `layer = call % n_layers`.

@@ -39,8 +39,8 @@ oaiy/                       workspace root
     llama-rs/               GGUF model architectures; MoE expert streaming (expert_stream.rs)
 ```
 
-The GGUF stack (`gguf` … `llama-rs`) is the repo author's own Rust code, vendored from
-their `llm` workspace (see `crates/VENDORED.md`).
+The GGUF stack (`gguf` … `llama-rs`) is the repo author's own Rust code. (Since 2026-10-16
+`llama-rs` is `crates/oaiy-llm-server/src/llm` and `dsv41` is `crates/oaiy-llm-server/src/dsv41`.)
 
 ## Hard constraints
 

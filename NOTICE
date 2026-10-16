@@ -4,13 +4,13 @@ NOTICE
 OAIY — Orchestrate AI Yourself
 Copyright 2026 F2i
 
-The crates under crates/oaiy-engine, crates/oaiy-llm-cli, crates/oaiy-image,
-crates/oaiy-llm-server and crates/dsv41 are licensed under
+The crates under crates/oaiy-engine, crates/oaiy-llm-cli, crates/oaiy-image and
+crates/oaiy-llm-server (but for its src/llm, below) are licensed under
 the Apache License, Version 2.0 (see LICENSE-APACHE).
 
-crates/dsv41 implements DeepSeek-V4.1 following
+crates/oaiy-llm-server/src/dsv41 implements DeepSeek-V4.1 following
 DeepSeek's reference inference code (inference/model.py) and chat
-encoding (encoding/encoding.py); crates/dsv41/src/chat.rs ports the
+encoding (encoding/encoding.py); crates/oaiy-llm-server/src/dsv41/chat.rs ports the
 encoding rule for rule, including its prompt templates. That reference
 code and the model weights are published by DeepSeek under the MIT
 License.
@@ -24,11 +24,10 @@ and libjpeg-turbo's integer IDCT, chroma upsampling and colour conversion
 (IJG and BSD licenses). This software is based in part on the work of the
 Independent JPEG Group.
 
-The crates under crates/gguf, crates/ggml-quants, crates/ggml-rs,
-crates/tokenizer, and crates/llama-rs are vendored
-from the author's own pure-Rust GGUF compute subsystem (see
-crates/VENDORED.md), licensed MIT OR Apache-2.0 (see LICENSE-MIT and
-LICENSE-APACHE).
+The author's own pure-Rust GGUF compute subsystem, the crates under
+crates/gguf, crates/ggml-quants, crates/ggml-rs and crates/tokenizer and the
+models under crates/oaiy-llm-server/src/llm (once the crate llama-rs), is
+licensed MIT OR Apache-2.0 (see LICENSE-MIT and LICENSE-APACHE).
 
 platform/desktop/src-tauri/src/auth/bip39_english.txt is the English word list of BIP-39
 (https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt), by Marek Palatinus,

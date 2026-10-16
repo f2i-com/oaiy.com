@@ -1,4 +1,4 @@
-//! VENDORED-LOCAL: the configured models, and swapping between them.
+//! the configured models, and swapping between them.
 //!
 //! The server used to load one model for the life of the process. It can now hold
 //! a list and switch on demand, which is what a client asking for a different
@@ -52,7 +52,7 @@ pub enum Kind {
     FlashNext,
     /// `dsv41-cuda`: a safetensors checkpoint directory with Engram tables.
     Deepseek,
-    /// `llama-rs`: a GGUF file, or a directory holding one.
+    /// `llm`: a GGUF file, or a directory holding one.
     Gguf,
 }
 
@@ -113,7 +113,7 @@ pub struct Spec {
 
 /// The model-specific half of turning a request into tokens.
 pub enum Flavour {
-    Deepseek(Arc<dsv41::tokenizer::Tokenizer>),
+    Deepseek(Arc<crate::dsv41::tokenizer::Tokenizer>),
     /// GLM-5.3 Flash (and the other streamed MoE GGUFs): the marker a picture stands as in its prompt where it reads
     /// pictures (`<|begin_of_image|><|image|><|end_of_image|>`, with its vision projector).
     Gguf(Arc<tokenizer::Tokenizer>, Option<&'static str>),
@@ -125,14 +125,14 @@ pub enum Flavour {
     /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, whether its
     /// own template opens the reply on an empty thought channel (see `dense_prompt`), and the marker a picture
     /// stands as in its prompt where it reads pictures (Gemma 4's `<|image|>`, with its vision projector).
-    Dense(Arc<tokenizer::Tokenizer>, llama_rs::Architecture, bool, Option<&'static str>),
+    Dense(Arc<tokenizer::Tokenizer>, crate::llm::Architecture, bool, Option<&'static str>),
 }
 
 impl Flavour {
     pub fn encode(&self, text: &str) -> Vec<u32> {
         match self {
             Self::Deepseek(t) => t.encode(text),
-            // llama-rs applies BOS through the template, so not again here.
+            // `llm` applies BOS through the template, so not again here.
             Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Lfm2(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
         }
     }
@@ -144,22 +144,22 @@ impl Flavour {
     pub fn chat_prompt(
         &self,
         msgs: &[oaiy_engine::json::Json],
-        opts: &dsv41::chat::Options,
-    ) -> std::result::Result<dsv41::chat::Encoded, String> {
+        opts: &crate::dsv41::chat::Options,
+    ) -> std::result::Result<crate::dsv41::chat::Encoded, String> {
         match self {
             Self::Deepseek(_) => {
-                dsv41::chat::encode(msgs, opts).map_err(|e| e.to_string())
+                crate::dsv41::chat::encode(msgs, opts).map_err(|e| e.to_string())
             }
             Self::Qwen(_, style) => crate::qwen::chat_prompt_as(msgs, opts, *style),
             Self::Lfm2(_) => crate::lfm2::chat_prompt(msgs, opts),
             Self::Gguf(_, marker) => {
-                // The same messages through llama-rs's GLM template. `reasoning
+                // The same messages through `llm`'s GLM template. `reasoning
                 // effort` maps onto the three the reference Jinja accepts; the
                 // DeepSeek options carry a 1-100 scale, so it is banded.
                 let effort = match opts.effort {
-                    0..=33 => llama_rs::ReasoningEffort::Low,
-                    34..=66 => llama_rs::ReasoningEffort::High,
-                    _ => llama_rs::ReasoningEffort::Max,
+                    0..=33 => crate::llm::ReasoningEffort::Low,
+                    34..=66 => crate::llm::ReasoningEffort::High,
+                    _ => crate::llm::ReasoningEffort::Max,
                 };
                 let (out, images) = match marker {
                     Some(_) => dense_messages(msgs, *marker)?,
@@ -170,16 +170,16 @@ impl Flavour {
                 // `<think></think>` so it answers directly. Ignoring this was worth
                 // the difference between "Paris." and two hundred tokens of
                 // deliberation that never finished.
-                let thinking = opts.mode == dsv41::chat::Mode::Thinking;
-                Ok(dsv41::chat::Encoded {
-                    prompt: llama_rs::glm5next_template_full(&out, true, effort, thinking),
+                let thinking = opts.mode == crate::dsv41::chat::Mode::Thinking;
+                Ok(crate::dsv41::chat::Encoded {
+                    prompt: crate::llm::glm5next_template_full(&out, true, effort, thinking),
                     images,
                 })
             }
             Self::Dense(_, arch, empty_thought, marker) => {
                 let (messages, images) = dense_messages(msgs, *marker)?;
-                Ok(dsv41::chat::Encoded {
-                    prompt: dense_prompt(arch, &messages, opts.mode == dsv41::chat::Mode::Thinking, *empty_thought),
+                Ok(crate::dsv41::chat::Encoded {
+                    prompt: dense_prompt(arch, &messages, opts.mode == crate::dsv41::chat::Mode::Thinking, *empty_thought),
                     images,
                 })
             }
@@ -187,10 +187,10 @@ impl Flavour {
     }
 }
 
-/// A chat request's messages as llama-rs's templates take them: the text of each, by role. Content may be a string
+/// A chat request's messages as `llm`'s templates take them: the text of each, by role. Content may be a string
 /// or a list of parts (OpenAI's `[{"type":"text","text":…}]`), whose texts are joined as DeepSeek's encoder joins
 /// them; these models read no images, so a part that is one is refused rather than dropped.
-fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> std::result::Result<Vec<llama_rs::ChatMessage>, String> {
+fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> std::result::Result<Vec<crate::llm::ChatMessage>, String> {
     dense_messages(msgs, None).map(|(m, _)| m)
 }
 
@@ -198,7 +198,7 @@ fn llama_messages(msgs: &[oaiy_engine::json::Json]) -> std::result::Result<Vec<l
 /// `<|image|>`): a message with pictures is its parts in turn, each text trimmed and each picture its marker, as
 /// Gemma 4's own template writes them; the pictures' parts (`{"url": …}`, or the part) in the order they come. A
 /// marker written in a message's text is refused (it would stand for a picture nobody sent).
-fn dense_messages(msgs: &[oaiy_engine::json::Json], marker: Option<&str>) -> std::result::Result<(Vec<llama_rs::ChatMessage>, Vec<oaiy_engine::json::Json>), String> {
+fn dense_messages(msgs: &[oaiy_engine::json::Json], marker: Option<&str>) -> std::result::Result<(Vec<crate::llm::ChatMessage>, Vec<oaiy_engine::json::Json>), String> {
     use oaiy_engine::json::Json;
     let mut images = Vec::new();
     let forged = |s: &str| marker.is_some_and(|m| s.contains(m));
@@ -239,11 +239,11 @@ fn dense_messages(msgs: &[oaiy_engine::json::Json], marker: Option<&str>) -> std
                 Some(_) => return Err(format!("message {}: content must be text or a list of parts", i + 1)),
             };
             let role = match m.get("role").and_then(|r| r.as_str()).unwrap_or("user") {
-                "system" => llama_rs::Role::System,
-                "assistant" => llama_rs::Role::Assistant,
-                _ => llama_rs::Role::User,
+                "system" => crate::llm::Role::System,
+                "assistant" => crate::llm::Role::Assistant,
+                _ => crate::llm::Role::User,
             };
-            Ok(llama_rs::ChatMessage { role, content })
+            Ok(crate::llm::ChatMessage { role, content })
         })
         .collect::<std::result::Result<Vec<_>, String>>()?;
     Ok((messages, images))
@@ -260,14 +260,14 @@ fn dense_messages(msgs: &[oaiy_engine::json::Json], marker: Option<&str>) -> std
 /// with thinking off (`empty_thought`, read from the GGUF by `opens_empty_thought`). The 26B-A4B and 31B templates do,
 /// and without it the 26B-A4B wrote its channel's name into the answer ("thought The capital of France is Paris.");
 /// the E2B and E4B templates do not, and with it the E2B reasoned aloud in its answer.
-fn dense_prompt(arch: &llama_rs::Architecture, msgs: &[llama_rs::ChatMessage], thinking: bool, empty_thought: bool) -> String {
-    if thinking && *arch == llama_rs::Architecture::Qwen3 {
-        let mut p = llama_rs::apply_chat_template(&llama_rs::Architecture::Qwen2, msgs, true);
+fn dense_prompt(arch: &crate::llm::Architecture, msgs: &[crate::llm::ChatMessage], thinking: bool, empty_thought: bool) -> String {
+    if thinking && *arch == crate::llm::Architecture::Qwen3 {
+        let mut p = crate::llm::apply_chat_template(&crate::llm::Architecture::Qwen2, msgs, true);
         p.push_str("<think>");
         return p;
     }
-    let mut p = llama_rs::apply_chat_template(arch, msgs, true);
-    if empty_thought && *arch == llama_rs::Architecture::Gemma4 {
+    let mut p = crate::llm::apply_chat_template(arch, msgs, true);
+    if empty_thought && *arch == crate::llm::Architecture::Gemma4 {
         p.push_str("<|channel>thought\n<channel|>");
     }
     p
@@ -331,9 +331,9 @@ pub(crate) fn auto_context(base: usize, model_max: usize, most: usize, fits: imp
     (base, n < most.min(model_max))
 }
 
-/// VENDORED-LOCAL: a vision tower made on its GPU now and the host's copy of its matrices let go (`MmProj::
+/// a vision tower made on its GPU now and the host's copy of its matrices let go (`MmProj::
 /// keep_on_device`: one copy of the tower, the GPU's, not the GPU's and the host's): what the load's line says of it.
-pub(crate) fn on_device_only(mm: &mut llama_rs::MmProj) -> String {
+pub(crate) fn on_device_only(mm: &mut crate::llm::MmProj) -> String {
     match mm.keep_on_device() {
         0 => String::new(),
         bytes => format!(" (its tower on the GPU alone: {:.1} GB of the host's copy let go)", bytes as f64 / 1e9),
@@ -414,9 +414,9 @@ fn a_checkpoint_named_by_its_config_is_its_folder() {
 }
 
 /// The architecture of a dense GGUF, which is loaded whole (see `load_gguf`); None for Qwen3.5 (a path of its
-/// own), the MoE families expert streaming serves, and what llama-rs does not know.
-fn dense_arch(gguf: &gguf::GgufFile) -> Option<llama_rs::Architecture> {
-    use llama_rs::Architecture as A;
+/// own), the MoE families expert streaming serves, and what `llm` does not know.
+fn dense_arch(gguf: &gguf::GgufFile) -> Option<crate::llm::Architecture> {
+    use crate::llm::Architecture as A;
     let name = gguf.get_str("general.architecture").ok()?;
     let experts = gguf.get_u64(&format!("{name}.expert_count")).unwrap_or(0) > 0;
     match A::from_str(name) {
@@ -863,9 +863,9 @@ impl Models {
         let projector = match (vision_path, tower_backend) {
             (Some(path), Some(backend)) if path.is_file() => {
                 let file = gguf::GgufFile::open(path).map_err(|e| Error::Arg(format!("{}: {e}", path.display())))?;
-                let mut mm = llama_rs::MmProj::from_gguf(&file, backend).map_err(|e| Error::Arg(format!("{}: {e}", path.display())))?;
+                let mut mm = crate::llm::MmProj::from_gguf(&file, backend).map_err(|e| Error::Arg(format!("{}: {e}", path.display())))?;
                 let width = match &mm {
-                    llama_rs::MmProj::Qwen3Vl(q) => Some(q.projector.mm2.shape()[0]),
+                    crate::llm::MmProj::Qwen3Vl(q) => Some(q.projector.mm2.shape()[0]),
                     _ => None,
                 };
                 if width != Some(model.config.hidden) {
@@ -925,24 +925,24 @@ impl Models {
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok, crate::qwen::Pictures::Qwen)) })
     }
 
-    /// DeepSeek-V4.1 without CUDA: the CPU model (`dsv41::model`, the reference the CUDA path is tested against), its
+    /// DeepSeek-V4.1 without CUDA: the CPU model (`crate::dsv41::model`, the reference the CUDA path is tested against), its
     /// experts streamed through the host cache from RAM and the drive, and its dense trunk (attention projections,
     /// shared experts, router, head: about 9.7 GB) on the WebGPU adapter while the budget holds it. No images and no
     /// observer (both CUDA's); a conversation's next turn continues the state rather than reading it all again.
     #[cfg(feature = "webgpu")]
     fn load_deepseek_portable(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
-        let tok = Arc::new(dsv41::tokenizer::Tokenizer::load(&spec.path)?);
+        let tok = Arc::new(crate::dsv41::tokenizer::Tokenizer::load(&spec.path)?);
         // As the CUDA build: the server's default context unless one is asked for.
         let max_seq = if o.ctx == 0 { crate::DEFAULT_CTX } else { o.ctx };
         let engram_meta = o.engram_meta.clone().unwrap_or_else(|| spec.path.join("engram_meta.safetensors"));
-        let opts = dsv41::model::ModelOptions { max_seq, expert_cache_bytes: o.expert_cache_bytes() as usize, direct_io: true };
+        let opts = crate::dsv41::model::ModelOptions { max_seq, expert_cache_bytes: o.expert_cache_bytes() as usize, direct_io: true };
         self.say(format!("expert host cache: {:.2} GiB", opts.expert_cache_bytes as f64 / (1u64 << 30) as f64));
-        let mut model = dsv41::model::Model::load(&spec.path, &engram_meta, &opts)?;
+        let mut model = crate::dsv41::model::Model::load(&spec.path, &engram_meta, &opts)?;
         // The routed experts on the CPU through this CPU's fastest kernel (the same bits as the portable one).
-        model.set_expert_row_kernel(dsv41_simd::row_kernel());
-        model.set_expert_tokens_kernel(dsv41_simd::tokens_kernel());
-        self.say(format!("experts on the CPU: the {} kernel", dsv41_simd::row_kernel_name()));
+        model.set_expert_row_kernel(crate::dsv41::simd::row_kernel());
+        model.set_expert_tokens_kernel(crate::dsv41::simd::tokens_kernel());
+        self.say(format!("experts on the CPU: the {} kernel", crate::dsv41::simd::row_kernel_name()));
         // Its usage profile (`--usage`), if an earlier run left one: the experts' counts of uses, and with them the
         // order the tiers are filled in at this start (the most used on the cards, the next in RAM), where without
         // one they are filled by number and find their order as they are used.
@@ -977,7 +977,7 @@ impl Models {
                             k.start_from(order);
                         }
                         let k = Arc::new(k);
-                        model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn dsv41::expert::ExpertsKernel>));
+                        model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn crate::dsv41::expert::ExpertsKernel>));
                         kernel = Some(k);
                         let share = if pinned > 0 { format!(", {pinned} more on the other GPU{} (read while idle)", if others.len() > 1 { "s" } else { "" }) } else { String::new() };
                         format!("a prompt's busy experts ({n} at a time) and {kept} experts kept there between requests{share}; the rest on the CPU")
@@ -1037,7 +1037,7 @@ impl Models {
         // chain's copy of the cache (as the GGUF's: `Qwen35Chain::context_fits`).
         let base = self.dense_context(model.config().context_length);
         let max_seq = match &model {
-            llama_rs::Model::Qwen35(m) => self.auto_context(&spec.name, base, model.config().context_length, AUTO_CTX, |n| m.chain.context_fits(m, n, self.activations_spare())),
+            crate::llm::Model::Qwen35(m) => self.auto_context(&spec.name, base, model.config().context_length, AUTO_CTX, |n| m.chain.context_fits(m, n, self.activations_spare())),
             _ => base,
         };
         let mut cfg = self.base_cfg(spec, max_seq);
@@ -1152,27 +1152,27 @@ impl Models {
     /// A Qwen3.5-MoE GGUF (`qwen35moe`), or an LFM2-MoE one (`lfm2moe`), as a Qwen3.5 hybrid with routed experts: each layer's experts held by the GPU's
     /// kernels (`QuantMoe`: the K-quants, the GSQ-RCO types) where its budget has room, else run on the host; a chained
     /// run's pieces 64 rows at most where the GPU groups no more of a prompt's rows by expert (no tensor cores).
-    fn qwen35_moe(&self, name: &str, gguf: &gguf::GgufFile, backend: &Arc<dyn ggml_rs::Backend>) -> Result<llama_rs::Model> {
+    fn qwen35_moe(&self, name: &str, gguf: &gguf::GgufFile, backend: &Arc<dyn ggml_rs::Backend>) -> Result<crate::llm::Model> {
         #[cfg(feature = "webgpu")]
         {
             let b = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().ok_or_else(|| Error::Arg(format!("{name}: a MoE model's experts need a GPU (WebGPU)")))?;
             let on_host = std::sync::atomic::AtomicUsize::new(0);
-            let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            let make = |_: usize, e: crate::llm::ExpertBlocks| -> crate::llm::Result<Box<dyn ggml_rs::exl3::Experts>> {
                 let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
-                let made = b.quant_experts(data).map_err(llama_rs::LlamaError::Config)?;
+                let made = b.quant_experts(data).map_err(crate::llm::LlamaError::Config)?;
                 if made.on_host() {
                     on_host.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(made)
             };
-            let mut m = llama_rs::Qwen35Model::from_gguf_with(gguf, Arc::clone(backend), Some(&make)).map_err(|e| Error::Arg(e.to_string()))?;
+            let mut m = crate::llm::Qwen35Model::from_gguf_with(gguf, Arc::clone(backend), Some(&make)).map_err(|e| Error::Arg(e.to_string()))?;
             let cores = b.f16_tensor_cores() && std::env::var_os("OAIY_QUANT_MOE_NO_COOP").is_none();
             m.moe_rows = if cores { 0 } else { 64 };
             let host = on_host.into_inner();
             if host > 0 {
                 self.say(format!("{name}: {host} of its {} layers' experts run on the host (no room for them on the GPU)", m.blocks.len()));
             }
-            Ok(llama_rs::Model::Qwen35(m))
+            Ok(crate::llm::Model::Qwen35(m))
         }
         #[cfg(not(feature = "webgpu"))]
         {
@@ -1219,10 +1219,10 @@ impl Models {
                     helper = Some(if swap { std::mem::replace(&mut backend, other) } else { other });
                 }
             }
-            let mut model = if moe { self.qwen35_moe(&spec.name, &gguf, &backend)? } else { llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))? };
+            let mut model = if moe { self.qwen35_moe(&spec.name, &gguf, &backend)? } else { crate::llm::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))? };
             // Its multi-token-prediction layer, where asked for: it drafts tokens a chained run checks.
             if o.mtp.contains(&spec.name) {
-                if let llama_rs::Model::Qwen35(m) = &mut model {
+                if let crate::llm::Model::Qwen35(m) = &mut model {
                     match m.load_mtp(&gguf) {
                         Ok(Some(layer)) => {
                             m.mtp = Some(layer);
@@ -1233,11 +1233,11 @@ impl Models {
                     }
                 }
             }
-            if let (llama_rs::Model::Qwen35(m), Some(h)) = (&model, helper) {
+            if let (crate::llm::Model::Qwen35(m), Some(h)) = (&model, helper) {
                 m.chain.split_onto(h);
             }
             // its chained runs' kernels compiled before the first request waits on them
-            if let llama_rs::Model::Qwen35(m) = &model {
+            if let crate::llm::Model::Qwen35(m) = &model {
                 let warm = std::time::Instant::now();
                 if m.warm_up() {
                     self.say(format!("{}: its chained runs ready in {:.1} s", spec.name, warm.elapsed().as_secs_f64()));
@@ -1256,11 +1256,11 @@ impl Models {
                     let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(e.to_string()))?;
                     let (tower, said) = crate::backend::for_vision(&backend);
                     if let Some(said) = said { self.say(format!("{}: {said}", spec.name)); }
-                    let mut mm = llama_rs::MmProj::from_gguf(&file, tower).map_err(|e| Error::Arg(e.to_string()))?;
+                    let mut mm = crate::llm::MmProj::from_gguf(&file, tower).map_err(|e| Error::Arg(e.to_string()))?;
                     let width = model.config().embedding_dim;
                     // (Qwen3-VL's tower, or MiniCPM-V 4.7's: a Qwen3.5 model of its own)
-                    if !matches!(&mm, llama_rs::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == width)
-                        && !matches!(&mm, llama_rs::MmProj::MiniCpmV(m) if m.lm_width() == width) {
+                    if !matches!(&mm, crate::llm::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == width)
+                        && !matches!(&mm, crate::llm::MmProj::MiniCpmV(m) if m.lm_width() == width) {
                         return Err(Error::Arg("Qwen vision projector does not match the text model".into()));
                     }
                     self.say(format!("{}: vision projector loaded from {}{}", spec.name, p.display(), on_device_only(&mut mm)));
@@ -1268,7 +1268,7 @@ impl Models {
                 }).transpose()?
             } else { None };
             let mut max_seq = self.dense_context(model.config().context_length);
-            if let llama_rs::Model::Qwen35(m) = &model {
+            if let crate::llm::Model::Qwen35(m) = &model {
                 // (longer where nobody set it and a GPU that says what it holds has the room: `context_fits`; a card
                 // that says so only by refusing measures it below, for the context as it is)
                 max_seq = self.auto_context(&spec.name, max_seq, model.config().context_length, AUTO_CTX, |n| m.chain.context_fits(m, n, self.activations_spare()));
@@ -1287,13 +1287,13 @@ impl Models {
             cfg.image_token_id = tok.token_id("<|image_pad|>").or_else(|| lfm2.then(|| tok.token_id("<image>")).flatten()).ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
             cfg.qwen_vision = projector.as_ref().map(|p|p.config().clone());
             // MiniCPM-V 4.7: its markers' ids from its own tokenizer
-            if let Some(llama_rs::MmProj::MiniCpmV(m)) = &projector {
+            if let Some(crate::llm::MmProj::MiniCpmV(m)) = &projector {
                 let id = |s: &str| tok.token_id(s).ok_or_else(|| Error::Arg(format!("MiniCPM-V's tokenizer lacks {s}")));
                 let newline = match tok.encode("\n", false).unwrap_or_default().as_slice() {
                     &[t] => t,
                     other => return Err(Error::Arg(format!("MiniCPM-V's tokenizer makes a newline {other:?}"))),
                 };
-                let markers = llama_rs::mmproj::minicpmv::Markers { image_start: id("<image>")?, image_end: id("</image>")?, slice_start: id("<slice>")?, slice_end: id("</slice>")?, newline };
+                let markers = crate::llm::mmproj::minicpmv::Markers { image_start: id("<image>")?, image_end: id("</image>")?, slice_start: id("<slice>")?, slice_end: id("</slice>")?, newline };
                 cfg.minicpmv = Some(crate::qwen::MiniCpmV { markers, merge: m.merge, max_slices: m.max_slices, mean: m.config.mean, std: m.config.std });
                 self.say(format!("{}: MiniCPM-V 4.7 pictures ({}x: up to {} slices)", spec.name, m.merge * m.merge, m.max_slices));
             }
@@ -1329,7 +1329,7 @@ impl Models {
         // what people keep, and most of the catalog) could not be served at all. They chat; tool calls are read in the
         // GLM and Qwen3.5 formats only, so the Agent's tools need one of those.
         if let Some(arch) = dense_arch(&gguf) {
-            let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            let model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
             self.say_placement(&spec.name, backend.as_ref());
             let empty_thought = gguf.get_str("tokenizer.chat_template").is_ok_and(opens_empty_thought);
             drop(gguf);
@@ -1340,10 +1340,10 @@ impl Models {
             // Gemma 4 reads pictures through its mmproj's vision tower (on the GPU); another dense model's projector
             // is not read.
             let projector = match o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten() {
-                Some(p) if arch == llama_rs::Architecture::Gemma4 => {
+                Some(p) if arch == crate::llm::Architecture::Gemma4 => {
                     let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
-                    let mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
-                    let llama_rs::MmProj::Gemma4V(g) = &mm else {
+                    let mm = crate::llm::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                    let crate::llm::MmProj::Gemma4V(g) = &mm else {
                         return Err(Error::Arg(format!("{}: not a Gemma 4 vision projector", p.display())));
                     };
                     if g.projector.input_projection.shape()[0] != model.config().embedding_dim {
@@ -1379,7 +1379,7 @@ impl Models {
             ));
         }
         #[allow(unused_mut)]
-        let mut model = llama_rs::Model::open_streaming(&path, backend, budget)
+        let mut model = crate::llm::Model::open_streaming(&path, backend, budget)
             .map_err(|e| Error::Arg(e.to_string()))?;
 
         let model = model;
@@ -1388,7 +1388,7 @@ impl Models {
         // The state the model was opened with bounds the context, whatever was
         // asked for.
         let max_seq = match &model {
-            llama_rs::Model::Glm5Next(g) => self.context(g.max_len()),
+            crate::llm::Model::Glm5Next(g) => self.context(g.max_len()),
             _ => self.context(model.config().context_length),
         };
         let mut cfg = self.base_cfg(spec, max_seq);
@@ -1397,9 +1397,9 @@ impl Models {
         let mut marker = None;
         let mut tower = None;
         if let Some(p) = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten() {
-            if matches!(model, llama_rs::Model::Glm5Next(_)) {
+            if matches!(model, crate::llm::Model::Glm5Next(_)) {
                 let t = std::time::Instant::now();
-                let (shape, weights) = llama_rs::glm5next::mmproj::VisionWeights::open(p).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                let (shape, weights) = crate::llm::glm5next::mmproj::VisionWeights::open(p).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
                 if shape.proj_dim != model.config().embedding_dim {
                     return Err(Error::Arg(format!("{}: its vision tower gives {}-wide tokens, not this model's {}", p.display(), shape.proj_dim, model.config().embedding_dim)));
                 }
@@ -1419,7 +1419,7 @@ impl Models {
 
         let (jobs, rx) = std::sync::mpsc::channel();
         let mut e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent).with_glm_vision(tower);
-        // VENDORED-LOCAL: GLM-5.3-Flash. Prompt states on disk, as DeepSeek has.
+        // GLM-5.3-Flash. Prompt states on disk, as DeepSeek has.
         //
         // This matters more here than it does there: MLA's attention is O(n) a
         // token, so a 1740-token prompt measured at 585 s, and a harness sends the
@@ -1780,9 +1780,9 @@ mod dense_webgpu_timing;
 #[cfg(test)]
 mod dense_tests {
     use super::*;
-    use llama_rs::Architecture as A;
+    use crate::llm::Architecture as A;
 
-    fn msgs() -> Vec<llama_rs::ChatMessage> {
+    fn msgs() -> Vec<crate::llm::ChatMessage> {
         llama_messages(&[
             oaiy_engine::json::Json::parse(br#"{"role":"system","content":"Be brief."}"#).unwrap(),
             oaiy_engine::json::Json::parse(br#"{"role":"user","content":"Capital of France?"}"#).unwrap(),
@@ -1840,8 +1840,8 @@ mod dense_tests {
     #[test]
     fn a_message_keeps_its_role_and_its_text() {
         let m = msgs();
-        assert!(matches!(m[0].role, llama_rs::Role::System) && m[0].content == "Be brief.");
-        assert!(matches!(m[1].role, llama_rs::Role::User) && m[1].content == "Capital of France?");
+        assert!(matches!(m[0].role, crate::llm::Role::System) && m[0].content == "Be brief.");
+        assert!(matches!(m[1].role, crate::llm::Role::User) && m[1].content == "Capital of France?");
     }
 
     #[test]
@@ -1850,7 +1850,7 @@ mod dense_tests {
         let m = llama_messages(&[parse(br#"{"role":"user","content":[{"type":"text","text":"Capital"},{"type":"text","text":"of France?"}]}"#)]).unwrap();
         assert_eq!(m[0].content, "Capital\n\nof France?");
         let m = llama_messages(&[parse(br#"{"role":"assistant","content":null}"#)]).unwrap();
-        assert!(matches!(m[0].role, llama_rs::Role::Assistant) && m[0].content.is_empty());
+        assert!(matches!(m[0].role, crate::llm::Role::Assistant) && m[0].content.is_empty());
         let e = llama_messages(&[
             parse(br#"{"role":"user","content":"look"}"#),
             parse(br#"{"role":"tool","content":[{"type":"text","text":"screen"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}"#),

@@ -1,5 +1,5 @@
 """Write golden token ids for the Rust DeepSeek-V4.1 tokenizer
-(crates/dsv41/src/tokenizer.rs), from the reference Hugging Face tokenizer.
+(crates/oaiy-llm-server/src/dsv41/tokenizer.rs), from the reference Hugging Face tokenizer.
 
 The corpus mixes this repo's own sources and docs (code-heavy, like a coding
 harness's prompts), the reference encoding's test prompts, hand-written edge

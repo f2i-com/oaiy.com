@@ -7,7 +7,7 @@ use crate::engine::{Event, Job, Sampling};
 use crate::qwen::{Hybrid, QwenEngine};
 use crate::qwen_park::fixtures::{kv_like_flash, ROWS};
 use ggml_rs::Tensor;
-use llama_rs::KvCache;
+use crate::llm::KvCache;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;

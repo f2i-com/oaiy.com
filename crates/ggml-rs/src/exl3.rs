@@ -1,4 +1,4 @@
-//! VENDORED-LOCAL: original EXL3 mul1 trellis storage (including half bitrates).
+//! original EXL3 mul1 trellis storage (including half bitrates).
 //! Layout follows exllamav3's pack/reconstruct kernels; no requantization.
 use crate::Tensor;
 
@@ -6,7 +6,7 @@ pub trait PackedLinear: std::fmt::Debug + Send + Sync {
     fn shape(&self) -> &[usize];
     fn linear(&self, x: &Tensor) -> Tensor;
     fn nbytes(&self) -> usize;
-    /// VENDORED-LOCAL: the concrete projection, for a backend that runs it in a chain of its own (none by default).
+    /// the concrete projection, for a backend that runs it in a chain of its own (none by default).
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
@@ -19,23 +19,23 @@ pub trait PackedLinear: std::fmt::Debug + Send + Sync {
 /// GPU through WebGPU and the CPU (`ggml_rs_wgpu::exl3`).
 pub trait Experts: std::fmt::Debug + Send + Sync {
     fn forward(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Tensor;
-    /// VENDORED-LOCAL: the concrete experts, for a backend that runs them in a chain of its own (none by default).
+    /// the concrete experts, for a backend that runs them in a chain of its own (none by default).
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
-    /// VENDORED-LOCAL: whether these run on the host (a layer no GPU had room for): `forward` then takes host tensors,
+    /// whether these run on the host (a layer no GPU had room for): `forward` then takes host tensors,
     /// touches no device, and gives a row the same sum whatever rows are beside it, so a chain may call it between a
     /// layer's submits (the layer's router and input read back, the sum uploaded). Not by default.
     fn on_host(&self) -> bool {
         false
     }
-    /// VENDORED-LOCAL: whether the device holds only some of these and reads the others from the host's memory as
+    /// whether the device holds only some of these and reads the others from the host's memory as
     /// it runs (`ggml_rs_wgpu::quant_moe::Cache`): a prompt's chunk then copies each expert it uses that the device
     /// lacks, once a chunk. Not by default.
     fn part_held(&self) -> bool {
         false
     }
-    /// VENDORED-LOCAL: whether a device holds some of these and the host runs the rest (`ggml_rs_wgpu::exl3::
+    /// whether a device holds some of these and the host runs the rest (`ggml_rs_wgpu::exl3::
     /// Exl3MoeTiered`): a chain routes a step's and a check's rows on the device (each expert it holds by its place
     /// there, one it does not weighted 0), reads the layer's router and input back and adds what
     /// [`Self::forward_rest`] gives; a prompt's rows it routes on the host, as [`Self::plan_rows`] plans them. Not by
@@ -43,13 +43,13 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
     fn host_rest(&self) -> bool {
         false
     }
-    /// VENDORED-LOCAL: the routed experts a device does not hold, for `x`'s rows (`[rows, hidden]`) routed by `logits`,
+    /// the routed experts a device does not hold, for `x`'s rows (`[rows, hidden]`) routed by `logits`,
     /// run on the host and summed by their weights; None where the device held every one.
     fn forward_rest(&self, x: &Tensor, logits: &Tensor, top_k: usize) -> Option<Tensor> {
         let _ = (x, logits, top_k);
         None
     }
-    /// VENDORED-LOCAL: a prompt's rows (`x` routed by `logits`) as a device that holds some of these runs them: each
+    /// a prompt's rows (`x` routed by `logits`) as a device that holds some of these runs them: each
     /// row's experts by their places there (the shared one last), after the device has taken in what it can, and the
     /// sums of the rest, run on the host (None: none). None where no device holds any.
     #[allow(clippy::type_complexity)]
@@ -57,24 +57,24 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
         let _ = (x, logits, top_k);
         None
     }
-    /// VENDORED-LOCAL: a hint, for experts a device holds some of ([`Self::host_rest`]): the next run's rows will be
+    /// a hint, for experts a device holds some of ([`Self::host_rest`]): the next run's rows will be
     /// routed about as `logits` (this layer's router on the layer before's input) routes them, so what it would need
     /// from the drive may be read ahead. Nothing by default.
     fn read_ahead(&self, logits: &Tensor, top_k: usize) {
         let _ = (logits, top_k);
     }
-    /// VENDORED-LOCAL: of experts a device holds some of, the routings it held and did not, and the experts taken in.
+    /// of experts a device holds some of, the routings it held and did not, and the experts taken in.
     fn rest_counts(&self) -> Option<(u64, u64, u64)> {
         None
     }
-    /// VENDORED-LOCAL: [`Self::forward`] of experts on the host whose shared expert a device ran
+    /// [`Self::forward`] of experts on the host whose shared expert a device ran
     /// (`ChainRecorder::moe_shared`): `shared` its outputs (`[rows, hidden]`, not yet weighted), added by its gate to
     /// the routed experts' sums. By default the shared expert is run again here.
     fn forward_given(&self, x: &Tensor, logits: &Tensor, top_k: usize, shared: &[f32]) -> Tensor {
         let _ = shared;
         self.forward(x, logits, top_k)
     }
-    /// VENDORED-LOCAL: a low-rank update (a LoRA adapter's `B (A x)`) beside projection `which` (0 gate, 1 up, 2
+    /// a low-rank update (a LoRA adapter's `B (A x)`) beside projection `which` (0 gate, 1 up, 2
     /// down) of these experts, from now on: `slot_of[e]` is the place of expert `e`'s pair (the shared expert last),
     /// `u32::MAX` where it has none, in `a` (`[slots, rank, k]`) and `b` (`[slots, n, rank]`, the adapter's scale in
     /// it). The base weights are not rewritten. An error where these experts take none (the default): an adapter's
@@ -85,7 +85,7 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
     }
 }
 
-/// VENDORED-LOCAL: one row's experts and their weights, as the CUDA routing gives them: the `top_k` of the routed
+/// one row's experts and their weights, as the CUDA routing gives them: the `top_k` of the routed
 /// experts by logit (a tie to the lower index), softmax-weighted among themselves, then the shared expert (index
 /// `logits.len() - 1`) weighted by the sigmoid of its gate.
 pub fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
@@ -109,7 +109,7 @@ pub fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
     out
 }
 
-/// VENDORED-LOCAL: how a MoE layer's router's logits (`[routed + 1]` a row, the shared expert's gate last) pick its
+/// how a MoE layer's router's logits (`[routed + 1]` a row, the shared expert's gate last) pick its
 /// experts and weight them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Routing {

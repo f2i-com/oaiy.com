@@ -233,7 +233,7 @@ pub(crate) fn record_route(rec: &mut crate::chain::Recorder<'_>, logits: &wgpu::
     rec.dispatch_wide("moe-route-weights", ROUTE_WEIGHTS, [logits, &jd, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &words, (rows as u32, 1, 1));
 }
 
-/// VENDORED-LOCAL: LFM2's routing ([`ggml_rs::exl3::Routing::Sigmoid`]) on the GPU, the first of three kernels
+/// LFM2's routing ([`ggml_rs::exl3::Routing::Sigmoid`]) on the GPU, the first of three kernels
 /// ([`record_route_sigmoid`]): each routed expert's score (its logit's sigmoid) plus its selection bias, in the
 /// logits' layout (`[rows, routed + 1]`, the place after the routed ones 0), for [`ROUTE_RANK`] to rank. A thread a
 /// place. `p[0]`: routed, rows.

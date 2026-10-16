@@ -22,7 +22,7 @@
 //! of it (on any GPU through WebGPU, else decoded on the CPU: `ggml_rs_wgpu::exl3`), on one backend, uncaptured.
 use crate::lora::{adapted, stacked, Adapter, Base, Part, VHeads};
 use crate::orcasaq::{inverse, tokenizer, value_map};
-use dsv41::safetensors::{Dtype, StIndex};
+use oaiy_engine::safetensors::{Dtype, StIndex};
 use ggml_rs::{exl3::{Exl3Data, Experts, PackedLinear}, Backend, Tensor};
 use ggml_rs::tensor::round_f16;
 
@@ -51,7 +51,7 @@ pub type ExpertMaker<'a> = &'a (dyn Fn(usize, &str, Vec<[Exl3Data; 3]>) -> Resul
 /// Makes a layer's experts on a device where they are read as records ([`load_portable_tiered`]): given the layer's MLP
 /// prefix, its routed experts' record layout and source, and its shared expert.
 pub type TieredMaker<'a> = &'a (dyn Fn(usize, &str, ggml_rs_wgpu::exl3::RecordLayout, Arc<dyn ggml_rs_wgpu::exl3::ExpertSource>, [Exl3Data; 3]) -> Result<Box<dyn Experts>> + Sync);
-use llama_rs::{
+use crate::llm::{
     loader::Weight,
     KvCache,
 };
@@ -421,8 +421,8 @@ impl FlashNext {
             read_at(file, &mut buf, start + (t as u64) * (h * size) as u64)?;
             match dtype {
                 Dtype::F32 => out.extend(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))),
-                Dtype::BF16 => out.extend(buf.chunks_exact(2).map(|c| dsv41::formats::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))),
-                _ => out.extend(buf.chunks_exact(2).map(|c| dsv41::formats::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))),
+                Dtype::BF16 => out.extend(buf.chunks_exact(2).map(|c| oaiy_engine::formats::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))),
+                _ => out.extend(buf.chunks_exact(2).map(|c| oaiy_engine::formats::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))),
             }
         }
         Ok(Tensor::from_vec(out, vec![tokens.len(), h]))
@@ -432,7 +432,7 @@ impl FlashNext {
     /// what `kv` holds: the last position's logits, on the host. `positions`: the multimodal
     /// rope positions, when the prompt has images.
     pub fn forward(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor> {
-        // VENDORED-LOCAL: a decode step or a prompt's chunk chained on the GPUs where they can (WebGPU); a run with a
+        // a decode step or a prompt's chunk chained on the GPUs where they can (WebGPU); a run with a
         // picture in it (or after one) at the positions it is given, where Qwen's rotation of 64 lays its axes out
         // (op by op, a prompt with a picture was read at 12 tokens/s and answered at 4)
         let placed = positions.filter(|p| self.config.rope_dim == 64 && p.len() == tokens.len());
@@ -618,8 +618,8 @@ impl FlashNext {
         let mut q = ggml_rs::ops::rmsnorm(b, &q, &a.q_norm, cfg.eps);
         let mut k = ggml_rs::ops::rmsnorm(b, &k, &a.k_norm, cfg.eps);
         if let Some(p) = positions {
-            llama_rs::multimodal_rope::text(b, &mut q, p, cfg.rope_dim, cfg.rope_theta);
-            llama_rs::multimodal_rope::text(b, &mut k, p, cfg.rope_dim, cfg.rope_theta);
+            crate::llm::multimodal_rope::text(b, &mut q, p, cfg.rope_dim, cfg.rope_theta);
+            crate::llm::multimodal_rope::text(b, &mut k, p, cfg.rope_dim, cfg.rope_theta);
         } else {
             b.rope_partial_neox(&mut q, rope, hd, cfg.rope_dim, cfg.rope_theta);
             b.rope_partial_neox(&mut k, rope, hd, cfg.rope_dim, cfg.rope_theta);
@@ -894,7 +894,7 @@ mod row_tests {
                 })
                 .collect();
             let w: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-            let scale = dsv41::formats::f16_to_f32(w[0]);
+            let scale = oaiy_engine::formats::f16_to_f32(w[0]);
             let bit = |i: usize| (w[1 + i / 16] >> (i % 16)) & 1;
             let want: Vec<f32> = (0..ROW_DIM)
                 .map(|i| {

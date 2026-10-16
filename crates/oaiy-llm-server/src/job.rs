@@ -1,13 +1,13 @@
 //! What a request hands a model worker and what comes back: the job, its
 //! sampling settings, and the events a reply streams as. Shared by every
-//! engine (DeepSeek on CUDA, GGUF through llama-rs on CUDA, WebGPU or CPU), so
+//! engine (DeepSeek on CUDA, GGUF through `llm` on CUDA, WebGPU or CPU), so
 //! it depends on no GPU crate.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use dsv41::vision::Prepared;
+use crate::dsv41::vision::Prepared;
 
 #[derive(Clone, Debug)]
 pub struct Sampling {
@@ -57,7 +57,7 @@ impl ImagePrep {
             Self::Deepseek(p) => p.n_tokens(),
             Self::Qwen { side, .. } => side * side,
             Self::Gemma { tokens, .. } | Self::Glm { tokens, .. } => *tokens,
-            Self::MiniCpmV { size, merge, .. } => llama_rs::mmproj::minicpmv::tile_tokens(*size, *merge),
+            Self::MiniCpmV { size, merge, .. } => crate::llm::mmproj::minicpmv::tile_tokens(*size, *merge),
         }
     }
     pub(crate) fn deepseek(&self) -> oaiy_engine::Result<&Prepared> {

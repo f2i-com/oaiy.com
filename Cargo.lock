@@ -580,21 +580,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dsv41"
-version = "0.1.0"
-dependencies = [
- "oaiy-engine",
- "oaiy-image",
-]
-
-[[package]]
-name = "dsv41-simd"
-version = "0.1.0"
-dependencies = [
- "dsv41",
-]
-
-[[package]]
 name = "dyn-stack"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1260,21 +1245,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
-name = "llama-rs"
-version = "0.0.1"
-dependencies = [
- "ggml-quants",
- "ggml-rs",
- "gguf",
- "half",
- "image",
- "oaiy-engine",
- "rayon",
- "thiserror 1.0.69",
- "tokenizer",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1529,8 +1499,8 @@ dependencies = [
  "ggml-rs",
  "ggml-rs-wgpu",
  "gguf",
- "llama-rs",
  "oaiy-engine",
+ "oaiy-llm-server",
  "tokenizer",
 ]
 
@@ -1538,15 +1508,16 @@ dependencies = [
 name = "oaiy-llm-server"
 version = "0.7.0"
 dependencies = [
- "dsv41",
- "dsv41-simd",
  "ggml-quants",
  "ggml-rs",
  "ggml-rs-wgpu",
  "gguf",
- "llama-rs",
+ "half",
+ "image",
  "oaiy-engine",
+ "oaiy-image",
  "rayon",
+ "thiserror 1.0.69",
  "tokenizer",
 ]
 
@@ -1556,7 +1527,6 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
- "dsv41",
  "ggml-quants",
  "ggml-rs",
  "ggml-rs-wgpu",
@@ -1608,7 +1578,6 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
- "dsv41",
  "oaiy-engine",
  "tokenizers 0.21.4",
 ]
@@ -1619,7 +1588,6 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
- "dsv41",
  "half",
  "oaiy-engine",
  "oaiy-media",

@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
-use dsv41::safetensors::{Dtype, StIndex};
+use oaiy_engine::safetensors::{Dtype, StIndex};
 
 use super::nemo::{NemoArchive, RawTensor, StorageType};
 use super::{bad, Result};

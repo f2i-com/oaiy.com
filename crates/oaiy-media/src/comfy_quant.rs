@@ -3,7 +3,7 @@
 //! tensor/int8_utils.py (Comfy-Org/comfy-kitchen). Compute uses dense BF16;
 //! this is compatibility loading, not a fused W4A8 activation kernel.
 use candle_core::{DType, Device, Result, Tensor};
-use dsv41::safetensors::{Dtype, StIndex};
+use oaiy_engine::safetensors::{Dtype, StIndex};
 use oaiy_engine::json::Json;
 
 /// `name`'s shape as [`load`] gives it, where its storage's is not: a W4A8 matrix's columns twice its bytes'.
@@ -71,7 +71,7 @@ pub fn load(s: &StIndex, name: &str, dev: &Device, dtype: DType) -> Result<Optio
                     let row_id = start + r;
                     let channel = channel[row_id];
                     for (g, group) in row.chunks_mut(16).enumerate() {
-                        let scale = dsv41::formats::fp8_e4m3_to_f32(rel[row_id * (cols / 16) + g]);
+                        let scale = oaiy_engine::formats::fp8_e4m3_to_f32(rel[row_id * (cols / 16) + g]);
                         let packed = &bytes
                             [row_id * packed_cols + g * 8..row_id * packed_cols + (g + 1) * 8];
                         for (out, &b) in group.chunks_mut(2).zip(packed) {

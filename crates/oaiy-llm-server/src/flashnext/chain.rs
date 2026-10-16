@@ -191,15 +191,15 @@ impl FlashNext {
     /// before its last token, each ended a run, and a run of few rows costs what a chunk of 64 does (its weights are
     /// decoded once whatever its rows): a follow-up turn's 21 new tokens 102 ms, then 42 and 18 for those two. The
     /// states of the chunks that ran (all of them where the logits are given).
-    pub fn forward_chunks_tapped(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> (Option<Tensor>, Vec<llama_rs::Tapped>) {
-        let mut tapped: Vec<llama_rs::Tapped> = Vec::new();
+    pub fn forward_chunks_tapped(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize]) -> (Option<Tensor>, Vec<crate::llm::Tapped>) {
+        let mut tapped: Vec<crate::llm::Tapped> = Vec::new();
         // each chunk's first row among the chunks'
         let starts: Vec<usize> = chunks.iter().scan(0, |at, (t, _)| { let a = *at; *at += t.len(); Some(a) }).collect();
         let logits = self.chunks_run(chunks, kv, done, taps, &starts, &mut tapped);
         (logits, tapped)
     }
 
-    pub(super) fn chunks_run(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize], starts: &[usize], tapped: &mut Vec<llama_rs::Tapped>) -> Option<Tensor> {
+    pub(super) fn chunks_run(&self, chunks: &[(&[u32], &Tensor)], kv: &mut KvCache, done: &mut dyn FnMut(usize), taps: &[usize], starts: &[usize], tapped: &mut Vec<crate::llm::Tapped>) -> Option<Tensor> {
         // each chunk's n-gram features (random reads of a 32 GB table: some 25 ms a chunk of 512) read on a thread of
         // their own, a chunk ahead of the GPUs
         let ctx = self.config.ngram - 1;
@@ -324,7 +324,7 @@ impl FlashNext {
 
     /// A parked chunk's rest ([`Stage::Rest`]; `embeds` any chunk's, not read): its second device's layers recorded
     /// and gone behind the run before's, which is then finished, this chunk's run `pending` in its place.
-    pub(super) fn run_rest<'a>(&'a self, parked: &mut Option<(usize, Box<Parked<'a>>)>, pending: &mut Option<ChainedRun<'a>>, embeds: &Tensor, kv: &mut KvCache, done: &mut dyn FnMut(usize), tapped: &mut Vec<llama_rs::Tapped>) {
+    pub(super) fn run_rest<'a>(&'a self, parked: &mut Option<(usize, Box<Parked<'a>>)>, pending: &mut Option<ChainedRun<'a>>, embeds: &Tensor, kv: &mut KvCache, done: &mut dyn FnMut(usize), tapped: &mut Vec<crate::llm::Tapped>) {
         if let Some((j, q)) = parked.take() {
             let Some(Went::Run(mut run)) = self.run_part(&[], embeds, kv, false, pending, None, Stage::Rest(q), &[]) else { panic!("a chunk's second device's part") };
             tapped.append(&mut run.tapped);

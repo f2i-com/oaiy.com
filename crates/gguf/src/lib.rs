@@ -24,7 +24,7 @@
 
 pub mod error;
 pub mod reader;
-// VENDORED-LOCAL: byte-source seam (see source.rs); additive public API.
+// byte-source seam (see source.rs); additive public API.
 pub mod source;
 pub mod tensor;
 pub mod value;

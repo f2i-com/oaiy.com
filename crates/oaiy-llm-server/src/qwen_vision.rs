@@ -1,11 +1,11 @@
 //! Original Qwen3.8 vision tensors, read directly from the published shard: the vision tower an EXL3 checkpoint
-//! comes with (OrcaSAQ's `vision/` folder, Qwen3.8-Flash-Next's own shards), as a `llama_rs::MmProj` on the model's
-//! backend (any GPU through WebGPU, else the CPU). A GGUF model's tower is its mmproj file's (`llama_rs::MmProj`'s
+//! comes with (OrcaSAQ's `vision/` folder, Qwen3.8-Flash-Next's own shards), as a `crate::llm::MmProj` on the model's
+//! backend (any GPU through WebGPU, else the CPU). A GGUF model's tower is its mmproj file's (`crate::llm::MmProj`'s
 //! own loader).
-use dsv41::safetensors::StIndex;
+use oaiy_engine::safetensors::StIndex;
 use ggml_rs::exl3::{Exl3Data, PackedLinear};
 use ggml_rs::{Backend, Tensor};
-use llama_rs::{
+use crate::llm::{
     loader::Weight,
     mmproj::{Qwen3VlBlock, Qwen3VlMmProj, Qwen3VlProjector},
     MmProj, MmProjConfig, ProjectorKind,

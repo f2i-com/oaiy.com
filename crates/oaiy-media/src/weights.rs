@@ -2,7 +2,7 @@ use candle_core::{
     quantized::{ggml_file, gguf_file, GgmlDType, QMatMul},
     DType, Device, Module, Result, Tensor,
 };
-use dsv41::safetensors::{Dtype, StIndex};
+use oaiy_engine::safetensors::{Dtype, StIndex};
 use std::{fs::File, path::Path};
 
 /// A tensor's bytes as stored, where a device converts them itself: BF16 safetensors, or GGUF's blocks (of their type).

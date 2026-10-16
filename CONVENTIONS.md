@@ -11,10 +11,11 @@ crates (`oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-image`, `dsv41`)
   The core is zero-dependency by design. Do not add a dependency "just for this one
   thing"; write the 30 lines instead. (The GGUF stack, and the GPU backend it brings
   to the server, are covered below.)
-- **No `unsafe`** in `oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-studio`, `oaiy-image` or `dsv41`: their crate roots say
-  `#![forbid(unsafe_code)]`. Where a crate outside that list needs it, every block has
-  a `SAFETY:` comment explaining why safe Rust cannot express it and what makes it
-  sound.
+- **No `unsafe`** in `oaiy-engine`, `oaiy-llm-cli`, `oaiy-studio` or `oaiy-image`: their crate roots say
+  `#![forbid(unsafe_code)]`. `oaiy-llm-server`'s says `#![deny(unsafe_code)]`, allowed in its two CPU kernels' SIMD
+  calls alone (`dsv41::simd` and `llm::glm5next::cpu_experts::dot`, each behind a runtime check of the CPU). Where a
+  crate outside that list needs it, every block has a `SAFETY:` comment explaining why safe Rust cannot express it and
+  what makes it sound.
 - **Weights are read in place.** GGUF and safetensors, as published. No converters and
   no weight format of our own.
 - **Cross-platform.** MSVC/gnu Windows and Unix, from one source. Put platform
@@ -80,9 +81,8 @@ dependencies do not enter `oaiy-llm-server`, `oaiy-engine`, `oaiy-image` or `dsv
 
 ## GGUF stack dependencies
 
-The crates `gguf`, `ggml-quants`, `ggml-rs`, `tokenizer` and
-`llama-rs` are the author's own Rust GGUF stack, vendored from their `llm` workspace
-(see `crates/VENDORED.md`). They keep their own external dependencies and upstream
-style, and the std-only and no-`unsafe` rules above do not apply to them. Local
-changes should be minimal and marked with a comment (`// VENDORED-LOCAL: ...`) so
-re-vendoring diffs stay readable.
+The crates `gguf`, `ggml-quants`, `ggml-rs`, `ggml-rs-wgpu` and `tokenizer` are OAIY's
+GGUF stack (the file, the quant kernels, the CPU backend and its chain, the GPU backend,
+the tokenizers), shared by `oaiy-llm-server` (whose `llm` module runs the GGUF models on
+them) and `oaiy-media`. They have their own external dependencies, and the std-only rule
+above does not apply to them.

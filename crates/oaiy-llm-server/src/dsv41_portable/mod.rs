@@ -1,4 +1,4 @@
-//! DeepSeek-V4.1 without CUDA: the CPU model (`dsv41::model`, the reference the CUDA path is tested against) with its
+//! DeepSeek-V4.1 without CUDA: the CPU model (`crate::dsv41::model`, the reference the CUDA path is tested against) with its
 //! dense trunk on the WebGPU adapter. Measured on the CPU alone, a prompt is compute-bound and its attention (the fp8
 //! trunk's projections among it) costs more than its experts, and a warm decode step spends a flat second there
 //! (docs/DEEPSEEK_V41.md, "The CPU model, measured"): so the trunk goes to the GPU, every fp8 and bf16 matrix the
@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use dsv41::linear::{DenseKernel, Weight};
+use crate::dsv41::linear::{DenseKernel, Weight};
 use ggml_rs_wgpu::dense::{DenseData, DenseGpu, RecordSlots};
 use ggml_rs_wgpu::WgpuBackend;
 

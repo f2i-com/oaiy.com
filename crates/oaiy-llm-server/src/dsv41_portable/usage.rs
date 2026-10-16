@@ -1,12 +1,12 @@
 //! The usage profile: every routed expert's count of uses, kept from one run to the next.
 
-/// A usage profile's first bytes: every routed expert's count of uses ([`dsv41::moe::Uses::counts`]) after them, as
+/// A usage profile's first bytes: every routed expert's count of uses ([`crate::dsv41::moe::Uses::counts`]) after them, as
 /// little-endian u32s, behind the layers and the experts a layer.
 const USAGE_MAGIC: &[u8; 8] = b"OAIYUSE1";
 
 /// Read the usage profile at `path` into `uses`: whether it was one of this model's shape (a missing file, another
 /// model's, or one cut short changes nothing).
-pub(crate) fn read_usage(path: &std::path::Path, uses: &dsv41::moe::Uses) -> bool {
+pub(crate) fn read_usage(path: &std::path::Path, uses: &crate::dsv41::moe::Uses) -> bool {
     let Ok(bytes) = std::fs::read(path) else { return false };
     let (layers, per_layer) = uses.shape();
     let word = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -18,7 +18,7 @@ pub(crate) fn read_usage(path: &std::path::Path, uses: &dsv41::moe::Uses) -> boo
 }
 
 /// Write `uses` as the usage profile at `path` (beside it first, then in its place: a reader never sees half of one).
-pub(crate) fn write_usage(path: &std::path::Path, uses: &dsv41::moe::Uses) -> std::io::Result<()> {
+pub(crate) fn write_usage(path: &std::path::Path, uses: &crate::dsv41::moe::Uses) -> std::io::Result<()> {
     let (layers, per_layer) = uses.shape();
     let mut bytes = Vec::with_capacity(16 + 4 * layers * per_layer);
     bytes.extend_from_slice(USAGE_MAGIC);

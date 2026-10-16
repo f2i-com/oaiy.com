@@ -147,20 +147,20 @@ pub trait Backend: Send + Sync + Debug + 'static {
     fn name(&self) -> &str;
     /// Keep unfused mapped weights available for host/SSD streaming.
     fn streams_weights(&self) -> bool { false }
-    /// VENDORED-LOCAL: whether `w`, as this backend holds it, is sent to its device as it is used (past the device's
+    /// whether `w`, as this backend holds it, is sent to its device as it is used (past the device's
     /// budget: WebGPU's weights in their file), not kept there.
     fn weight_streamed(&self, w: &crate::QuantizedTensor) -> bool {
         let _ = w;
         false
     }
 
-    // VENDORED-LOCAL: MOE-01 — downcast support so model code can reach
+    // MOE-01 — downcast support so model code can reach
     // backend-specific fast paths (the CUDA grouped-MoE kernels) without
     // widening this trait with device concepts. Required (not defaulted):
     // the `&Self -> &dyn Any` coercion needs a concrete Sized implementor.
     fn as_any(&self) -> &dyn std::any::Any;
 
-    // VENDORED-LOCAL: PERF-01 — explicit sync point so benchmarks can stop
+    // PERF-01 — explicit sync point so benchmarks can stop
     // the clock at a phase boundary knowing all queued work has completed.
     /// Block until all work queued on this backend has completed. The CPU
     /// backend is fully synchronous already, so the default is a no-op;
@@ -255,7 +255,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(host.data()[off..].to_vec(), vec![last])
     }
 
-    // VENDORED-LOCAL: MOE-01 — MoE routing as a backend op. Given
+    // MOE-01 — MoE routing as a backend op. Given
     /// `router_logits` (`[seq, n_experts]`), pick the top-`top_k` experts per
     /// token and softmax-normalize their logits into routing weights.
     /// Returns flat `(ids, weights)`, each `seq * top_k` long, in
@@ -275,7 +275,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// `x` shape: `[..., in]`. `w` shape: `[out, in]`. Result: `[..., out]`.
     fn linear(&self, x: &Tensor, w: &Tensor) -> Tensor;
 
-    /// VENDORED-LOCAL: add an unquantized low-rank adapter to a projection.
+    /// add an unquantized low-rank adapter to a projection.
     /// Backends may fuse the update without materializing a full-size delta.
     fn add_lora(&self, y: &mut Tensor, x: &Tensor, a: &Tensor, b: &Tensor) {
         let low = self.linear(x, a);
@@ -290,13 +290,13 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// This is the load-bearing op for fitting big models in memory: with
     /// the override, weights stay packed (4 bits / element for Q4_K) instead
     /// of being inflated 8× to F32.
-    /// VENDORED-LOCAL: a device that chains a decode step's ops between round trips ([`crate::chain`]), if this
+    /// a device that chains a decode step's ops between round trips ([`crate::chain`]), if this
     /// backend has one.
     fn chain(&self) -> Option<&dyn crate::chain::DeviceChain> {
         None
     }
 
-    /// VENDORED-LOCAL: `linear_q` of one input against several weights (a layer's q, k and v), each result in order.
+    /// `linear_q` of one input against several weights (a layer's q, k and v), each result in order.
     /// A backend whose every call is a round trip (WebGPU) makes them one.
     fn linear_q_many(&self, x: &Tensor, ws: &[&QuantizedTensor]) -> Vec<Tensor> {
         ws.iter().map(|w| self.linear_q(x, w)).collect()
@@ -484,7 +484,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// the slice + `silu_mul` pair when gate and up share the same input — cuts
     /// the FFN matmul count from 2→1 plus eliminates one slice. Default impl
     /// is the host fallback; CUDA backend overrides with a single kernel.
-    // VENDORED-LOCAL: GLM-5.3-Flash. Clamped SwiGLU, both orders.
+    // GLM-5.3-Flash. Clamped SwiGLU, both orders.
     /// `out = silu(gate) * up` with a clamp at `limit`.
     ///
     /// `after_silu` picks which side of the activation the gate clamp lands on,
@@ -525,7 +525,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         self.to_device(Tensor::from_vec(out, gate.shape().to_vec()))
     }
 
-    // VENDORED-LOCAL: GLM-5.3-Flash. Clamped SwiGLU over a FUSED gate/up row.
+    // GLM-5.3-Flash. Clamped SwiGLU over a FUSED gate/up row.
     /// As [`Self::swiglu_clamped`], but the input is one `[seq, 2 * ff]` tensor
     /// laid out `gate` then `up` per row — the layout the expert loader prefers,
     /// because it halves the matmul launch count.
@@ -562,7 +562,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         self.to_device(Tensor::from_vec(out, vec![seq, ff]))
     }
 
-    // VENDORED-LOCAL: GLM-5.3-Flash. A per-head stack of matvecs.
+    // GLM-5.3-Flash. A per-head stack of matvecs.
     /// `y[i] = W[i] @ x[i]` for `i` in `0..b`: `w` is `[b, m, k]` row-major,
     /// `x` is `[b, k]`, the result is `[b, m]`.
     ///
@@ -597,7 +597,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         self.to_device(Tensor::from_vec(out, vec![b, m]))
     }
 
-    // VENDORED-LOCAL: GLM-5.3-Flash. One step of the KDA delta rule.
+    // GLM-5.3-Flash. One step of the KDA delta rule.
     /// Advance a Kimi Delta Attention state by one token, in place, and return
     /// this token's output.
     ///
@@ -607,7 +607,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
     ///
     /// Per state row `(h, i)`, with the decay on the **kq** axis -- so it varies
     /// along the row, and every row of a head is scaled by the same vector. See
-    /// `llama_rs::glm5next::kda` for the reference kernel this is read off; having
+    /// `oaiy_llm_server::llm::glm5next::kda` for the reference kernel this is read off; having
     /// it transposed here is a per-token error that compounds, and reads as a
     /// long-prompt bug rather than a wrong one.
     ///
@@ -869,7 +869,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         *x = self.to_device(host);
     }
 
-    /// VENDORED-LOCAL: axial/interleaved NeoX rotations. Keep the host math as
+    /// axial/interleaved NeoX rotations. Keep the host math as
     /// the reference; GPU backends can avoid materializing attention tensors.
     fn rope_axes(&self, x: &mut Tensor, positions: &[[u32;3]], rotated: usize,
         theta: f32, axes: &[usize], frequencies: &[usize], frequency_dim: usize) {
@@ -979,7 +979,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// Returns `(q_only, q_gate)`, each `[seq, n_heads * head_dim]`.
     /// Default impl is host-side (slow d2h + h2d); CUDA overrides with a single
     /// kernel that writes both halves directly on device.
-    /// VENDORED-LOCAL: Qwen3.8-Flash-Next — the delta-net step with a `sigmoid(z)` output
+    /// Qwen3.8-Flash-Next — the delta-net step with a `sigmoid(z)` output
     /// gate instead of `silu(z)` (otherwise identical to [`Backend::delta_net_step`]).
     #[allow(clippy::too_many_arguments)]
     fn delta_net_step_sigmoid(
@@ -1013,7 +1013,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         self.to_device(out)
     }
 
-    /// VENDORED-LOCAL: split each row of `x` (`[rows, a + b]`) into its first `a` and last `b`
+    /// split each row of `x` (`[rows, a + b]`) into its first `a` and last `b`
     /// columns.
     fn split_cols(&self, x: &Tensor, a: usize) -> (Tensor, Tensor) {
         let rows = x.dim(0);
@@ -1025,7 +1025,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         (Tensor::from_vec(l, vec![rows, a]), Tensor::from_vec(r, vec![rows, width - a]))
     }
 
-    /// VENDORED-LOCAL: the n-gram layer's gate. Per row `r` and stream `s` (width `d`):
+    /// the n-gram layer's gate. Per row `r` and stream `s` (width `d`):
     /// `g = signed_sqrt(scale * rms(key[r,s]) * nk[s] . rms(x[r,s]) * nq[s])`,
     /// `gated[r,s] = sigmoid(g) * value[r]`, and `conv_in[r,s] = f16(rms(gated[r,s]) * nc[s])`.
     /// `key`, `x` are `[rows, streams * d]`, `value` `[rows, d]`; the norms `[streams * d]`.
@@ -1059,7 +1059,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         (Tensor::from_vec(gated, vec![rows, width]), Tensor::from_vec(conv_in, vec![rows, width]))
     }
 
-    /// VENDORED-LOCAL: the n-gram layer's dilated causal conv. With `stream` = `window`
+    /// the n-gram layer's dilated causal conv. With `stream` = `window`
     /// (`[kernel - 1) * dilation, width]`) then `conv_in` (`[rows, width]`):
     /// `x[r, c] += gated[r, c] + silu(sum_j w[c, j] * stream[r + j * dilation, c])`.
     /// `window` becomes `stream`'s last `(kernel - 1) * dilation` rows.
@@ -1084,14 +1084,14 @@ pub trait Backend: Send + Sync + Debug + 'static {
         *window = Tensor::from_vec(stream[rows * width..].to_vec(), vec![state, width]);
     }
 
-    /// VENDORED-LOCAL: gated residual — `x += post * y` per stream (as `stream_apply`), then
+    /// gated residual — `x += post * y` per stream (as `stream_apply`), then
     /// each stream RMS-normed and scaled by its part of `weight` (as `hc_norm`).
     fn hc_apply_norm(&self, x: &mut Tensor, y: &Tensor, post: &Tensor, weight: &Tensor, streams: usize, eps: f32) -> Tensor {
         self.stream_apply(x, y, post, streams);
         self.hc_norm(x, weight, streams, eps)
     }
 
-    /// VENDORED-LOCAL: the `[rows, 2 * words]` values of `packed` (`[rows, words]`, see
+    /// the `[rows, 2 * words]` values of `packed` (`[rows, words]`, see
     /// `tensor::pack_f16`).
     fn unpack_f16(&self, packed: &Tensor) -> Tensor {
         let rows = packed.dim(0);
@@ -1100,7 +1100,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(values, vec![rows, cols])
     }
 
-    /// VENDORED-LOCAL: gated residual — `normed @ down^T` (`down`: `[rank + writes, width / 2]`,
+    /// gated residual — `normed @ down^T` (`down`: `[rank + writes, width / 2]`,
     /// f16 packed by `tensor::pack_f16`), then as `hc_gates`: returns (`t`
     /// `[rows, rank + writes]`, the write weights).
     fn hc_down_gates(&self, normed: &Tensor, down: &Tensor, rank: usize, writes: usize, streams: usize) -> (Tensor, Tensor) {
@@ -1109,14 +1109,14 @@ pub trait Backend: Send + Sync + Debug + 'static {
         (t, post)
     }
 
-    /// VENDORED-LOCAL: gated residual — `t @ up^T` as logits (`up`: `[width, cols / 2]`, f16
+    /// gated residual — `t @ up^T` as logits (`up`: `[width, cols / 2]`, f16
     /// packed), then as `hc_mix`.
     fn hc_up_mix(&self, t: &Tensor, up: &Tensor, normed: &Tensor, streams: usize) -> Tensor {
         let logits = self.linear(t, &self.unpack_f16(up));
         self.hc_mix(&logits, normed, streams)
     }
 
-    /// VENDORED-LOCAL: gated residual — each stream of `x` (`[rows, streams * d]`) RMS-normed
+    /// gated residual — each stream of `x` (`[rows, streams * d]`) RMS-normed
     /// and scaled by its part of `weight` (`[streams * d]`).
     fn hc_norm(&self, x: &Tensor, weight: &Tensor, streams: usize, eps: f32) -> Tensor {
         let rows = x.dim(0);
@@ -1134,7 +1134,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(out, x.shape().to_vec())
     }
 
-    /// VENDORED-LOCAL: gated residual — `t` (`[rows, rank + writes]`: the low-rank gate's
+    /// gated residual — `t` (`[rows, rank + writes]`: the low-rank gate's
     /// input, then each stream's write logit, if any): the first `rank` become
     /// `silu(t / streams)`, the rest 0; returns the write weights `2 * sigmoid(logit / streams)`
     /// (`[rows, writes]`).
@@ -1155,7 +1155,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(post, vec![rows, writes])
     }
 
-    /// VENDORED-LOCAL: gated residual — the branch input: the mean over streams of
+    /// gated residual — the branch input: the mean over streams of
     /// `sigmoid(logits) * normed` (both `[rows, streams * d]`) -> `[rows, d]`.
     fn hc_mix(&self, logits: &Tensor, normed: &Tensor, streams: usize) -> Tensor {
         let rows = normed.dim(0);
@@ -1170,7 +1170,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(out, vec![rows, d])
     }
 
-    /// VENDORED-LOCAL: `dst[r] += src[r] * scale[r]` (`scale`: one value per row).
+    /// `dst[r] += src[r] * scale[r]` (`scale`: one value per row).
     fn add_rows_scaled(&self, dst: &mut Tensor, src: &Tensor, scale: &Tensor) {
         let rows = src.dim(0);
         let d = src.numel() / rows.max(1);
@@ -1180,7 +1180,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         for r in 0..rows { for j in 0..d { out[r * d + j] += s[r * d + j] * g[r]; } }
     }
 
-    /// VENDORED-LOCAL: rows `rows[i]` of `src` `[n, d]`, in order: `[rows.len(), d]`.
+    /// rows `rows[i]` of `src` `[n, d]`, in order: `[rows.len(), d]`.
     fn gather_rows(&self, src: &Tensor, rows: &[u32]) -> Tensor {
         let d = src.numel() / src.dim(0).max(1);
         let host = src.to_host();
@@ -1190,7 +1190,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(out, vec![rows.len(), d])
     }
 
-    /// VENDORED-LOCAL: `dst[rows[i]] += src[i] * weights[i]` for each row `i` of `src`.
+    /// `dst[rows[i]] += src[i] * weights[i]` for each row `i` of `src`.
     fn scatter_add_rows(&self, dst: &mut Tensor, src: &Tensor, rows: &[u32], weights: &[f32]) {
         let d = src.numel() / src.dim(0).max(1);
         let s = src.to_host();
@@ -1201,7 +1201,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         }
     }
 
-    /// VENDORED-LOCAL: the mean of `streams` interleaved streams: `x` `[rows, streams * d]`
+    /// the mean of `streams` interleaved streams: `x` `[rows, streams * d]`
     /// (row-major `[rows, streams, d]`) -> `[rows, d]`.
     fn stream_mean(&self, x: &Tensor, streams: usize) -> Tensor {
         let rows = x.dim(0);
@@ -1214,7 +1214,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(out, vec![rows, d])
     }
 
-    /// VENDORED-LOCAL: the residual write-back of a hyper-connection site:
+    /// the residual write-back of a hyper-connection site:
     /// `x[r, s, :] += post[r, s] * y[r, :]` (`x` `[rows, streams * d]`, `y` `[rows, d]`,
     /// `post` `[rows, streams]`).
     fn stream_apply(&self, x: &mut Tensor, y: &Tensor, post: &Tensor, streams: usize) {
@@ -1227,7 +1227,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         for r in 0..rows { for s in 0..streams { for j in 0..d { out[(r * streams + s) * d + j] += ph[r * streams + s] * yh[r * d + j]; } } }
     }
 
-    /// VENDORED-LOCAL: QSA — the mean of each complete `ratio`-row block of `raw`
+    /// QSA — the mean of each complete `ratio`-row block of `raw`
     /// (`[rows, .., d]`, the first `blocks * ratio` rows): `[blocks, d]`.
     fn qsa_pool(&self, raw: &Tensor, blocks: usize, ratio: usize) -> Tensor {
         let d = raw.numel() / raw.dim(0).max(1);
@@ -1238,7 +1238,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(out, vec![blocks, d])
     }
 
-    /// VENDORED-LOCAL: QSA block scores: `out[r, j] = scale * sum_h relu(q[r, h] . pooled[j])`
+    /// QSA block scores: `out[r, j] = scale * sum_h relu(q[r, h] . pooled[j])`
     /// for the blocks query `r` (at position `first + r`) sees whole, `-inf` for the rest.
     fn qsa_block_scores(&self, q: &Tensor, pooled: &Tensor, first: usize, ratio: usize, scale: f32) -> Tensor {
         let rows = q.dim(0);
@@ -1262,7 +1262,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(out, vec![rows, nb])
     }
 
-    /// VENDORED-LOCAL: QSA selection: for each query row of `scores` (`[n, nb]`, the query at
+    /// QSA selection: for each query row of `scores` (`[n, nb]`, the query at
     /// position `first + r`), the tokens it attends to: its `keep` best whole blocks (all of
     /// them when it sees no more) and its incomplete tail block. `[n, keep * ratio + ratio]`
     /// token indices as f32 (exact: under 2^24), `-1` for none.
@@ -1290,7 +1290,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
         Tensor::from_vec(out, vec![n, width])
     }
 
-    /// VENDORED-LOCAL: QSA attention: each query row attends only to the cache rows its row of
+    /// QSA attention: each query row attends only to the cache rows its row of
     /// `sel` names (from `qsa_select`; `-1`: none). `q` `[n, heads, d]`, `k`/`v` cache buffers
     /// `[capacity, kv_heads, d]`; returns `[n, heads, d]`.
     fn sparse_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, sel: &Tensor, scale: f32) -> Tensor {
@@ -1617,10 +1617,10 @@ pub trait Backend: Send + Sync + Debug + 'static {
     }
 }
 
-// VENDORED-LOCAL: MOE-01 — host reference for [`Backend::moe_route_topk`],
+// MOE-01 — host reference for [`Backend::moe_route_topk`],
 /// shared by the default trait method and the CUDA fallback path (when the
 /// router logits are not device-resident). This is exactly the selection +
-/// softmax math the llama-rs MoE block ran inline before routing became a
+/// softmax math the server's `llm` MoE block ran inline before routing became a
 /// backend op: partial-sort top-k, descending order, softmax over the picked
 /// logits. `logits` is the flat `[seq, n_experts]` row-major data; the flat
 /// `(ids, weights)` results are `seq * top_k` long.

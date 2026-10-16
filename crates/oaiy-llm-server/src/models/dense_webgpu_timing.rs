@@ -10,7 +10,7 @@ fn measure_a_dense_models_decode_on_webgpu() {
     let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(Some(8 << 30)) else { return };
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    let model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
     let mut kv = model.new_kv_cache(4096);
     let n: u32 = std::env::var("DENSE_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
     let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();
@@ -39,12 +39,12 @@ fn a_chained_decode_step_answers_as_the_host_path() {
     let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(Some(8 << 30)) else { return };
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    let model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
     // the host path, op by op (a Llama's or a Qwen3's), and the model's own (chained where it can be)
-    let host = |t: &[u32], kv: &mut llama_rs::KvCache| match &model {
-        llama_rs::Model::Llama(m) => m.forward_host(t, kv),
-        llama_rs::Model::Qwen3(m) => m.forward_host(t, kv),
-        llama_rs::Model::Gemma3(m) => m.forward_host(t, kv),
+    let host = |t: &[u32], kv: &mut crate::llm::KvCache| match &model {
+        crate::llm::Model::Llama(m) => m.forward_host(t, kv),
+        crate::llm::Model::Qwen3(m) => m.forward_host(t, kv),
+        crate::llm::Model::Gemma3(m) => m.forward_host(t, kv),
         _ => panic!("a Llama, a Qwen3 or a Gemma 3"),
     };
     let n: u32 = std::env::var("DENSE_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
@@ -470,7 +470,7 @@ fn flashnext_chunks_keep_the_states_their_stops_would() {
     let host = |ts: &[Option<ggml_rs::Tensor>]| -> Vec<Option<Vec<f32>>> { ts.iter().map(|t| t.as_ref().map(|t| t.to_host().data().to_vec())).collect() };
     // a prompt's rows as the server runs them: chunks of the model's own, together
     let most = model.prompt_rows();
-    let run = |from: usize, to: usize, kv: &mut llama_rs::KvCache, taps: &[usize]| {
+    let run = |from: usize, to: usize, kv: &mut crate::llm::KvCache, taps: &[usize]| {
         let spans: Vec<(usize, usize)> = (from..to).step_by(most).map(|a| (a, (a + most).min(to))).collect();
         let embeds: Vec<ggml_rs::Tensor> = spans.iter().map(|&(a, z)| model.embed_text(&tokens[a..z]).unwrap()).collect();
         let chunks: Vec<(&[u32], &ggml_rs::Tensor)> = spans.iter().zip(&embeds).map(|(&(a, z), e)| (&tokens[a..z], e)).collect();
@@ -744,7 +744,7 @@ fn a_flashnext_check_answers_as_its_steps_do() {
         let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         dot / (n(a) * n(b))
     };
-    let step = |t: u32, kv: &mut llama_rs::KvCache| model.forward(&[t], &model.embed_text(&[t]).unwrap(), kv, None).unwrap();
+    let step = |t: u32, kv: &mut crate::llm::KvCache| model.forward(&[t], &model.embed_text(&[t]).unwrap(), kv, None).unwrap();
     // the steps' greedy tokens g and their logits l (l[i] after g[i])
     let room = prompt.len() + 512 + std::env::var("FLASHNEXT_CHECK_AT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     let (mut ks, mut kc) = (model.new_kv_cache(room), model.new_kv_cache(room));
@@ -868,7 +868,7 @@ fn a_drafting_flashnext_answers_as_its_steps_do() {
     ] {
         let pt: Vec<u32> = model.tokenizer.encode(prompt, false).unwrap();
         let e = model.embed_text(&pt).unwrap();
-        let step = |t: u32, kv: &mut llama_rs::KvCache| model.forward(&[t], &model.embed_text(&[t]).unwrap(), kv, None).unwrap();
+        let step = |t: u32, kv: &mut crate::llm::KvCache| model.forward(&[t], &model.embed_text(&[t]).unwrap(), kv, None).unwrap();
         // plain steps
         let mut kv = model.new_kv_cache(pt.len() + gen + 16);
         let mut l = model.forward(&pt, &e, &mut kv, None).unwrap();
@@ -1233,11 +1233,11 @@ fn measure_qwen35_mtp_acceptance() {
     let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
-    if let llama_rs::Model::Qwen35(m) = &mut model {
+    let mut model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    if let crate::llm::Model::Qwen35(m) = &mut model {
         m.mtp = m.load_mtp(&gguf).unwrap();
     }
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let Some(mtp) = m.mtp.as_ref() else { panic!("no MTP layer in {path}") };
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
     let prompts = [
@@ -1268,7 +1268,7 @@ fn measure_qwen35_mtp_acceptance() {
         for (hname, h) in [("pre-norm", first(&hidden)), ("post-norm", first(&normed))] {
             for embed_first in [true, false] {
                 for offset in [0u32, 1] {
-                    let mut mkv = llama_rs::KvCache::new(backend.as_ref(), 1, rows + 8, m.config.n_kv_heads, m.config.head_dim);
+                    let mut mkv = crate::llm::KvCache::new(backend.as_ref(), 1, rows + 8, m.config.n_kv_heads, m.config.head_dim);
                     let positions: Vec<u32> = (0..rows as u32).map(|r| r + offset).collect();
                     let logits = m.mtp_logits_host(mtp, &h, &next, &mut mkv, &positions, embed_first).unwrap().to_host();
                     let v = logits.numel() / rows;
@@ -1304,11 +1304,11 @@ fn measure_qwen35_mtp_depth() {
     let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
-    if let llama_rs::Model::Qwen35(m) = &mut model {
+    let mut model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    if let crate::llm::Model::Qwen35(m) = &mut model {
         m.mtp = m.load_mtp(&gguf).unwrap();
     }
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let Some(mtp) = m.mtp.as_ref() else { panic!("no MTP layer in {path}") };
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
     let prompts = [
@@ -1340,7 +1340,7 @@ fn measure_qwen35_mtp_depth() {
             let rows = n - 1 - d;
             let h_rows = backend.slice_axis0_range(&h, 0, rows);
             let next = m.embed_text(&seq[d + 1..d + 1 + rows]);
-            let mut mkv = llama_rs::KvCache::new(backend.as_ref(), 1, rows + 8, m.config.n_kv_heads, m.config.head_dim);
+            let mut mkv = crate::llm::KvCache::new(backend.as_ref(), 1, rows + 8, m.config.n_kv_heads, m.config.head_dim);
             let positions: Vec<u32> = (0..rows as u32).map(|r| r + d as u32).collect();
             let (out, logits) = m.mtp_host(mtp, &h_rows, &next, &mut mkv, &positions, true).unwrap();
             let logits = logits.to_host();
@@ -1376,11 +1376,11 @@ fn a_drafting_qwen35_answers_as_its_steps_do() {
     let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
-    if let llama_rs::Model::Qwen35(m) = &mut model {
+    let mut model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    if let crate::llm::Model::Qwen35(m) = &mut model {
         m.mtp = m.load_mtp(&gguf).unwrap();
     }
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
     // (QWEN35_PARAS: that many paragraphs of text before the question, some 60 tokens each: the steps and checks
     // deep in a context, their attention over the cache's f16 halves past 4,096 positions)
@@ -1501,14 +1501,14 @@ fn measure_a_chained_qwen35() {
         crate::orcasaq::load_portable(std::path::Path::new(&path), Arc::clone(&backend), &|d| gpu.exl3(d)).unwrap()
     } else {
         let gguf = gguf::GgufFile::open(&path).unwrap();
-        llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap()
+        crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap()
     };
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let mut kv = model.new_kv_cache(4096);
     let tokens: Vec<u32> = (0..2048u32).map(|i| 1000 + (i * 7919) % 20000).collect();
     let mut at = 0;
     let embed_ms = std::cell::Cell::new(0.0f64);
-    let mut forward = |n: usize, kv: &mut llama_rs::KvCache| {
+    let mut forward = |n: usize, kv: &mut crate::llm::KvCache| {
         let t = Instant::now();
         let e = m.embed_text(&tokens[at..at + n]);
         embed_ms.set(t.elapsed().as_secs_f64() * 1e3);
@@ -1517,7 +1517,7 @@ fn measure_a_chained_qwen35() {
         let _ = l.to_host();
         t.elapsed().as_secs_f64() * 1e3
     };
-    let capture = |kv: &llama_rs::KvCache| {
+    let capture = |kv: &crate::llm::KvCache| {
         let t = Instant::now();
         let n: usize = kv.ssm_state.iter().chain(&kv.ssm_conv).flatten().map(|s| s.to_host().numel()).sum();
         (t.elapsed().as_secs_f64() * 1e3, n * 4)
@@ -1589,8 +1589,8 @@ fn measure_a_long_qwen35() {
     let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let fills: usize = std::env::var("QWEN35_FILLS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let pause: f64 = std::env::var("QWEN35_PAUSE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.);
     // (QWEN35_CALL: the tokens a call on the way there, 512 unless given; the server's are 4,096)
@@ -1600,7 +1600,7 @@ fn measure_a_long_qwen35() {
     let mut kv = model.new_kv_cache(past + chunk + 512);
     let tokens: Vec<u32> = (0..(past + chunk + 512) as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
     let at = std::cell::Cell::new(0usize);
-    let forward = |n: usize, kv: &mut llama_rs::KvCache| {
+    let forward = |n: usize, kv: &mut crate::llm::KvCache| {
         let t = Instant::now();
         let e = m.embed_text(&tokens[at.get()..at.get() + n]);
         let l = m.forward_embeds_positions(&e, n, kv, None).unwrap();
@@ -1678,11 +1678,11 @@ fn a_qwen35_prompt_over_two_gpus_answers_as_on_one() {
     let (w0, w1) = (Arc::new(b0), Arc::new(b1));
     let backend: Arc<dyn ggml_rs::Backend> = w0.clone();
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
-    if let llama_rs::Model::Qwen35(m) = &mut model {
+    let mut model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    if let crate::llm::Model::Qwen35(m) = &mut model {
         m.mtp = m.load_mtp(&gguf).unwrap();
     }
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     m.chain.split_onto(w1.clone());
     let gib = |b: &ggml_rs_wgpu::WgpuBackend| b.memory_budget().map_or("?".to_string(), |(budget, used)| format!("{:.1} of {:.1} GiB", used as f64 / (1u64 << 30) as f64, budget as f64 / (1u64 << 30) as f64));
     let warm = std::time::Instant::now();
@@ -1758,8 +1758,8 @@ fn a_qwen35_run_keeps_the_states_its_stops_would() {
     let second = std::env::var_os("QWEN35_TWO").and_then(|_| b.others(None).into_iter().next());
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let two = second.is_some();
     if let Some(b1) = second {
         m.chain.split_onto(Arc::new(b1));
@@ -1779,7 +1779,7 @@ fn a_qwen35_run_keeps_the_states_its_stops_would() {
     // (the same token, or one as good to a tenth of a logit: these prompts' tokens are no text, and two of their
     // next ones can be that close, a run of few rows' kernels apart)
     let agree = |a: &[f32], b: &[f32]| argmax(a) == argmax(b) || (b[argmax(b) as usize] - b[argmax(a) as usize]).abs() < 0.1;
-    let run = |from: usize, to: usize, kv: &mut llama_rs::KvCache| {
+    let run = |from: usize, to: usize, kv: &mut crate::llm::KvCache| {
         let e = m.embed_text(&tokens[from..to]).to_host();
         m.forward_embeds_positions(&e, to - from, kv, None).unwrap().to_host()
     };
@@ -1856,8 +1856,8 @@ fn a_qwen35_prompt_run_whole_answers_as_its_chunks_one_at_a_time() {
     let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     // (QWEN35_LEN: the prompt's tokens, 2,148 unless asked)
     let len: u32 = std::env::var("QWEN35_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(2148);
     let tokens: Vec<u32> = (0..len).map(|i| 1000 + (i * 7919) % 20000).collect();
@@ -1922,17 +1922,17 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
     let model = if matches!(gguf.get_str("general.architecture").ok(), Some("qwen35moe" | "lfm2moe")) {
-        let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
+        let make = |_: usize, e: crate::llm::ExpertBlocks| -> crate::llm::Result<Box<dyn ggml_rs::exl3::Experts>> {
             let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
-            gpu.quant_experts(data).map_err(llama_rs::LlamaError::Config)
+            gpu.quant_experts(data).map_err(crate::llm::LlamaError::Config)
         };
-        let mut m = llama_rs::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();
+        let mut m = crate::llm::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();
         m.moe_rows = if gpu.f16_tensor_cores() { 0 } else { 64 };
-        llama_rs::Model::Qwen35(m)
+        crate::llm::Model::Qwen35(m)
     } else {
-        llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap()
+        crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap()
     };
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let n: u32 = std::env::var("QWEN35_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
     let steps: usize = std::env::var("QWEN35_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
     // (QWEN35_IDS: a file of the prompt's token ids, in place of QWEN35_PROMPT's made-up ones: a chat's, to hold both
@@ -1944,7 +1944,7 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
     let run = |chained: bool| {
         let mut kv = model.new_kv_cache(prompt.len() + steps + 16);
-        let forward = |t: &[u32], kv: &mut llama_rs::KvCache| {
+        let forward = |t: &[u32], kv: &mut crate::llm::KvCache| {
             let e = m.embed_text(t);
             let l = if chained { m.forward_embeds_positions(&e, t.len(), kv, None) } else { m.forward_embeds_host(&e, t.len(), kv, None) };
             l.unwrap().to_host().data().to_vec()
@@ -2001,7 +2001,7 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
         eprintln!("  at step {i} the host's logit of its token {} is {host_gap:.4} above the chain's {}; by the chain's logits, {chain_gap:.4} the other way", host_tokens[i], chain_tokens[i]);
     }
     assert!(runs > prompt.len().div_ceil(512), "the chain ran ({runs} runs)");
-    let moe = m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Attention { moe: Some(_), .. } | llama_rs::Qwen35Block::Ssm { moe: Some(_), .. } | llama_rs::Qwen35Block::Conv { moe: Some(_), .. }));
+    let moe = m.blocks.iter().any(|b| matches!(b, crate::llm::Qwen35Block::Attention { moe: Some(_), .. } | crate::llm::Qwen35Block::Ssm { moe: Some(_), .. } | crate::llm::Qwen35Block::Conv { moe: Some(_), .. }));
     // (a cache held in f16 alone, as a card with tensor cores holds the 27B's, within a tenth of a percent: 0.99985
     // at worst over 32 steps)
     let (agree, tie) = if moe { (0.99, 0.25) } else if m.chain.cache_in_halves(m) { (0.999, 0.05) } else { (0.9999, 0.05) };
@@ -2027,24 +2027,24 @@ fn a_chained_runs_rows_are_its_devices_alone_and_come_back_where_wanted() {
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
     let model = if matches!(gguf.get_str("general.architecture").ok(), Some("qwen35moe" | "lfm2moe")) {
-        let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
+        let make = |_: usize, e: crate::llm::ExpertBlocks| -> crate::llm::Result<Box<dyn ggml_rs::exl3::Experts>> {
             let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
-            gpu.quant_experts(data).map_err(llama_rs::LlamaError::Config)
+            gpu.quant_experts(data).map_err(crate::llm::LlamaError::Config)
         };
-        let mut m = llama_rs::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();
+        let mut m = crate::llm::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();
         m.moe_rows = if gpu.f16_tensor_cores() { 0 } else { 64 };
-        llama_rs::Model::Qwen35(m)
+        crate::llm::Model::Qwen35(m)
     } else {
-        llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap()
+        crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap()
     };
-    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
     let cosine = |a: &[f32], b: &[f32]| {
         let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
         let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         dot / (n(a) * n(b))
     };
-    let chained = |kv: &mut llama_rs::KvCache, tokens: &[u32]| -> Vec<f32> {
+    let chained = |kv: &mut crate::llm::KvCache, tokens: &[u32]| -> Vec<f32> {
         let mut l = Vec::new();
         for chunk in tokens.chunks(512) {
             l = m.forward_embeds_positions(&m.embed_text(chunk), chunk.len(), kv, None).unwrap().to_host().data().to_vec();
@@ -2080,7 +2080,7 @@ fn a_chained_runs_rows_are_its_devices_alone_and_come_back_where_wanted() {
     eprintln!("a step op by op after them: {c:.6} from the chained one, tokens {} and {}", argmax(&host), argmax(&chain));
     // (a MoE model's within a percent, as `a_chained_qwen35_run_answers_as_the_host_path` holds it: its experts' picks
     // tip on the last bits of a sum)
-    let moe = m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Attention { moe: Some(_), .. } | llama_rs::Qwen35Block::Ssm { moe: Some(_), .. } | llama_rs::Qwen35Block::Conv { moe: Some(_), .. }));
+    let moe = m.blocks.iter().any(|b| matches!(b, crate::llm::Qwen35Block::Attention { moe: Some(_), .. } | crate::llm::Qwen35Block::Ssm { moe: Some(_), .. } | crate::llm::Qwen35Block::Conv { moe: Some(_), .. }));
     assert!(c > if moe { 0.99 } else { 0.999 }, "{c}");
     // and a chained run after that: the host's rows to the device, and let go
     let _ = chained(&mut a, &[argmax(&host)]);

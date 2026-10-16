@@ -7,7 +7,7 @@
 //! f16 (BF16 rounded); its activations f32.
 use crate::ltx::store::{untile_scales, Coded, ReadAhead, Store};
 use candle_core::{Device, Result};
-use dsv41::safetensors::Dtype;
+use oaiy_engine::safetensors::Dtype;
 use ggml_rs::{Backend, ChainRecorder, CleanRows, DeviceChain, DeviceVec, QuantizedTensor, RowNorm};
 use crate::wgpu_weights::{f16_words, f16_words_f32, q8_0, q8_0_bf16};
 

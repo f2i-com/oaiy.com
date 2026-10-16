@@ -14,7 +14,7 @@
 //! tokens a state would not read again, by the same rules `QwenEngine::generate` starts from.
 use crate::qwen_cache::RecurrentSnapshot;
 use ggml_rs::Tensor;
-use llama_rs::KvCache;
+use crate::llm::KvCache;
 use std::time::Instant;
 
 /// A recurrent checkpoint the engine keeps with its state: the tokens it covers, its snapshot,

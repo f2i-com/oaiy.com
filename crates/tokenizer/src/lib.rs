@@ -54,9 +54,9 @@ pub enum TokenizerModel {
 
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
-    // VENDORED-LOCAL: HF Qwen3.8 uses NFC, combining marks and single digits.
+    // HF Qwen3.8 uses NFC, combining marks and single digits.
     qwen3_pre: bool,
-    // VENDORED-LOCAL: a piece that is a token whole is that token, merges or no (Hugging Face's `ignore_merges`, as
+    // a piece that is a token whole is that token, merges or no (Hugging Face's `ignore_merges`, as
     // LFM2's tokenizer has it and llama.cpp reads `tokenizer.ggml.pre` lfm2).
     ignore_merges: bool,
     model: TokenizerModel,
@@ -105,7 +105,7 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    /// VENDORED-LOCAL: construct the same byte BPE from a HF checkpoint.
+    /// construct the same byte BPE from a HF checkpoint.
     pub fn from_qwen3_bpe_parts(tokens: Vec<String>, merges: Vec<(String,String)>,
         special_ids: Vec<u32>, eos: u32) -> Result<Self> {
         if eos as usize >= tokens.len() || special_ids.iter().any(|&i|i as usize>=tokens.len()) {

@@ -1,9 +1,9 @@
-//! VENDORED-LOCAL: GLM-5.3-Flash served through the same job/event contract as
+//! GLM-5.3-Flash served through the same job/event contract as
 //! the DeepSeek engine.
 //!
 //! [`engine::Engine`](crate::engine::Engine) is built around `dsv41-cuda`'s
 //! `GpuModel`: safetensors on disk, Engram tables, layered prefill, checkpoints,
-//! image spans. None of that applies to a GGUF opened through `llama_rs::Model`,
+//! image spans. None of that applies to a GGUF opened through `crate::llm::Model`,
 //! and rewriting that engine to abstract over both would put the working DeepSeek
 //! path at risk for no gain.
 //!
@@ -31,7 +31,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
-use llama_rs::{KvCache, Model};
+use crate::llm::{KvCache, Model};
 use oaiy_engine::Result;
 use tokenizer::Tokenizer;
 
@@ -94,13 +94,13 @@ pub struct GlmEngine {
     eos: Vec<u32>,
     /// The tier counters as of the last report, so each one covers its own request.
     tiers: TierCounters,
-    /// VENDORED-LOCAL: GLM-5.3-Flash. Prompt states kept between runs.
+    /// GLM-5.3-Flash. Prompt states kept between runs.
     ///
     /// A prompt is the expensive part of a request here -- 1740 tokens measured at
     /// 585 s, because MLA's attention is O(n) a token -- and a harness sends the
     /// same system prompt every time. Without this the daemon re-reads it on every
     /// start.
-    pub disk: Option<crate::disk::DiskCache<llama_rs::glm5next::forward::StateSnapshot>>,
+    pub disk: Option<crate::disk::DiskCache<crate::llm::glm5next::forward::StateSnapshot>>,
     /// The request running is incognito: keep no prompt state of it.
     forgetting: bool,
     /// The incognito session whose prompt state is held (in memory only), if any.
@@ -109,7 +109,7 @@ pub struct GlmEngine {
     pub log: bool,
     /// Gemma 4's vision tower, where its projector is loaded, and the soft tokens of the last pictures it read (by
     /// their bytes' hash): a conversation sends its pictures again with each turn.
-    vision: Option<llama_rs::MmProj>,
+    vision: Option<crate::llm::MmProj>,
     /// GLM-5.3 Flash's vision tower, where its projector is loaded.
     glm_vision: Option<Arc<GlmTower>>,
     soft: std::collections::VecDeque<(u64, Arc<Vec<f32>>)>,
@@ -120,16 +120,16 @@ const SOFT_KEPT: usize = 4;
 
 /// GLM-5.3 Flash's vision tower (`glm5next` mmproj), its weights f32 on the host.
 pub struct GlmTower {
-    pub shape: llama_rs::glm5next::vision::VisionShape,
-    pub weights: llama_rs::glm5next::mmproj::VisionWeights,
+    pub shape: crate::llm::glm5next::vision::VisionShape,
+    pub weights: crate::llm::glm5next::mmproj::VisionWeights,
 }
 
 impl GlmTower {
     /// A picture's tokens (`[n, proj_dim]`) from its pixels as `glm5next::vision::preprocess_within` laid them out.
-    pub fn read(&self, pixels: &[f32], width: usize, height: usize) -> llama_rs::Result<Vec<f32>> {
-        use llama_rs::glm5next::vision;
+    pub fn read(&self, pixels: &[f32], width: usize, height: usize) -> crate::llm::Result<Vec<f32>> {
+        use crate::llm::glm5next::vision;
         let sh = &self.shape;
-        let rope = vision::MRope::for_grid(sh.d_head(), llama_rs::glm5next::mmproj::ROPE_THETA, width / sh.patch, height / sh.patch, sh.n_merge)?;
+        let rope = vision::MRope::for_grid(sh.d_head(), crate::llm::glm5next::mmproj::ROPE_THETA, width / sh.patch, height / sh.patch, sh.n_merge)?;
         vision::encode_image(sh, &self.weights.view(), &rope, pixels, width, height)
     }
 }
@@ -183,7 +183,7 @@ impl GlmEngine {
         // that feature is off.
         let think_start = tok.token_id("<think>");
         let think_end = tok.token_id("</think>");
-        let mut eos: Vec<u32> = llama_rs::chat_stop_tokens(&model.config().arch)
+        let mut eos: Vec<u32> = crate::llm::chat_stop_tokens(&model.config().arch)
             .iter()
             .filter_map(|s| tok.token_id(s))
             .collect();
@@ -219,7 +219,7 @@ impl GlmEngine {
     }
 
     /// With Gemma 4's vision tower: a job's pictures are read by it.
-    pub fn with_vision(mut self, vision: Option<llama_rs::MmProj>) -> Self {
+    pub fn with_vision(mut self, vision: Option<crate::llm::MmProj>) -> Self {
         self.vision = vision;
         self
     }
@@ -246,7 +246,7 @@ impl GlmEngine {
         if n == self.covered.len() && n < prompt.len() {
             n
         } else if self.rewinds() && n > 0 {
-            // VENDORED-LOCAL: a cache keeps its first rows as they are: the shared part (all but the prompt's last
+            // a cache keeps its first rows as they are: the shared part (all but the prompt's last
             // token, which the reply's logits come from), the rest dropped. A conversation's next turn re-reads only
             // what is new since its last reply (the reply as the template writes it back may differ from as it came).
             let n = n.min(prompt.len() - 1);
@@ -387,7 +387,7 @@ impl GlmEngine {
                 out.push(soft);
                 continue;
             }
-            let (Some(llama_rs::MmProj::Gemma4V(mm)), crate::engine::ImagePrep::Gemma { pixels, tokens }) = (&self.vision, &image.prep) else {
+            let (Some(crate::llm::MmProj::Gemma4V(mm)), crate::engine::ImagePrep::Gemma { pixels, tokens }) = (&self.vision, &image.prep) else {
                 return Err(oaiy_engine::Error::Arg("this model reads text only: no vision projector is loaded for it".into()));
             };
             let t = std::time::Instant::now();
@@ -451,7 +451,7 @@ impl GlmEngine {
         // tens of seconds, and a caller with no progress cannot tell that from a
         // hang.
         //
-        // VENDORED-LOCAL: GLM-5.3-Flash. A chunk, not a token. This loop used to
+        // GLM-5.3-Flash. A chunk, not a token. This loop used to
         // hand `forward` one token at a time so it could report between them, which
         // meant the batched prefill inside it never engaged -- `forward` only
         // chunks what it is given, and it was given one. A chunk of 64 is one
@@ -585,7 +585,7 @@ impl GlmEngine {
         // counters are process-global and cover prefill and decode together, which
         // is why they are reset per request.
         if std::env::var("GLM5_PROF").ok().as_deref() == Some("1") {
-            use llama_rs::glm5next::forward::prof;
+            use crate::llm::glm5next::forward::prof;
             let passes = (prompt.len() - start + n).max(1) as f64;
             eprintln!("  profile over {passes:.0} forward passes, ms a pass:");
             for (name, c) in prof::all() {
@@ -632,7 +632,7 @@ impl GlmEngine {
     fn prefill_step(&self) -> usize {
         match &self.model {
             Model::Llama(_) | Model::Qwen3(_) | Model::Gemma3(_) | Model::Gemma3n(_) | Model::Gemma4(_) => DENSE_PREFILL_CHUNK,
-            _ => llama_rs::glm5next::forward::prefill_chunk().max(1),
+            _ => crate::llm::glm5next::forward::prefill_chunk().max(1),
         }
     }
 

@@ -3,12 +3,12 @@ pub(crate) struct ToolPhase {
     text: String,
     original: bool,
     closed: bool,
-    parser: dsv41::chat::StreamParser,
+    parser: crate::dsv41::chat::StreamParser,
 }
 impl Default for ToolPhase {
     fn default() -> Self {
         Self {text: String::new(), original: false, closed: false,
-            parser: dsv41::chat::StreamParser::new(dsv41::chat::Mode::Chat)}
+            parser: crate::dsv41::chat::StreamParser::new(crate::dsv41::chat::Mode::Chat)}
     }
 }
 impl ToolPhase {

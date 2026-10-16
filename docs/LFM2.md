@@ -28,7 +28,7 @@ oaiy-llm-server --model LFM2.5-24B-A2B-Q4_K_M.gguf --name lfm2.5
 
 ## How OAIY runs it
 
-As a Qwen3.5 hybrid (`llama_rs::Qwen35Model`), its short convs a recurrent layer of their own
+As a Qwen3.5 hybrid (`oaiy_llm_server::llm::Qwen35Model`), its short convs a recurrent layer of their own
 (`Qwen35Block::Conv`): the server's Qwen engine serves it, with its prompt states, its chained runs on the GPU and its
 tools.
 

@@ -196,7 +196,7 @@ fn read_spans(spans: &[(std::path::PathBuf, u64, usize)], at: usize, part: &mut 
     for (path, start, len) in spans {
         let (a, b) = (at.max(begin), end.min(begin + len));
         if a < b {
-            dsv41::io::read_exact_at(&std::fs::File::open(path)?, &mut part[a - at..b - at], start + (a - begin) as u64)?;
+            oaiy_engine::io::read_exact_at(&std::fs::File::open(path)?, &mut part[a - at..b - at], start + (a - begin) as u64)?;
         }
         begin += len;
     }

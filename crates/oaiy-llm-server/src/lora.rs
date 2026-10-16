@@ -2,9 +2,9 @@
 //! llama.cpp GGUF LoRAs for Qwen3.8-Flash-Next (read into Hugging Face names and
 //! order). Adapter tensors stay separate; only already-dense tiny projections are
 //! combined in device memory. Never rewrite or requantize the base checkpoint.
-use dsv41::safetensors::{Dtype, StIndex};
+use oaiy_engine::safetensors::{Dtype, StIndex};
 use ggml_rs::{exl3::PackedLinear, Backend, Tensor};
-use llama_rs::loader::Weight;
+use crate::llm::loader::Weight;
 use oaiy_engine::{json::Json, Error, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -309,7 +309,7 @@ impl Adapter {
         let alpha = g.get_f32("adapter.lora.alpha").unwrap_or(0.0);
         let read = |name: &str| -> Result<Tensor> {
             let info = g.tensor_by_name(name).ok_or_else(|| bad(format!("{name} is missing its pair")))?;
-            let t = llama_rs::loader::load_tensor_f32(&g, info).map_err(|e| bad(format!("{name}: {e}")))?;
+            let t = crate::llm::loader::load_tensor_f32(&g, info).map_err(|e| bad(format!("{name}: {e}")))?;
             if t.data().iter().any(|v| !v.is_finite()) {
                 return Err(bad("nonfinite adapter weights"));
             }

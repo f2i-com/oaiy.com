@@ -14,12 +14,12 @@ const PREFILL_CHUNK: usize = 4096;
 /// next turn continues from there. A prompt that shares neither starts again. A reply ends at the end-of-sentence
 /// token, at a complete tool call, or at `max_tokens`.
 pub(crate) struct Engine {
-    model: dsv41::model::Model,
-    tok: Arc<dsv41::tokenizer::Tokenizer>,
+    model: crate::dsv41::model::Model,
+    tok: Arc<crate::dsv41::tokenizer::Tokenizer>,
     /// The token ids the model's state covers, in order.
     covered: Vec<u32>,
     /// The state after the last prompt's tokens but its last one, and those tokens.
-    checkpoint: Option<(Vec<u32>, dsv41::model::Checkpoint)>,
+    checkpoint: Option<(Vec<u32>, crate::dsv41::model::Checkpoint)>,
     eos: u32,
     log: bool,
     /// Reading the experts into RAM while no request waits ([`Warm`]); None once done, or switched off.
@@ -70,7 +70,7 @@ fn reusable(tokens: &[u32], prompt: &[u32]) -> usize {
 }
 
 impl Engine {
-    pub(crate) fn new(model: dsv41::model::Model, tok: Arc<dsv41::tokenizer::Tokenizer>, log: bool) -> Engine {
+    pub(crate) fn new(model: crate::dsv41::model::Model, tok: Arc<crate::dsv41::tokenizer::Tokenizer>, log: bool) -> Engine {
         let eos = model.cfg.eos_token_id;
         // (OAIY_DSV41_NO_WARM: leave the drive alone between requests: neither the idle reading nor the rebalance,
         // which reads a record for each expert a card gives up)
@@ -275,10 +275,10 @@ impl Engine {
             return Err(oaiy_engine::Error::Arg(format!("a prompt of {} tokens does not fit a context of {max_seq}", prompt.len())));
         }
         let started = std::time::Instant::now();
-        // OAIY_DSV41_PROFILE: where the prompt's and the reply's time went (`dsv41::profile`), and what each read
+        // OAIY_DSV41_PROFILE: where the prompt's and the reply's time went (`crate::dsv41::profile`), and what each read
         let profiling = self.log && std::env::var_os("OAIY_DSV41_PROFILE").is_some();
         let kernel = self.kernel.clone();
-        let read_so_far = move |m: &dsv41::model::Model| {
+        let read_so_far = move |m: &crate::dsv41::model::Model| {
             let st = m.expert_cache().stats();
             let tier = kernel.as_ref().map_or((0, 0, 0, 0), |k| {
                 let (_, hits, misses, admitted) = k.tier();
@@ -297,12 +297,12 @@ impl Engine {
                 after.3 .1 - before.3 .1,
                 after.3 .2 - before.3 .2,
                 after.3 .3 - before.3 .3,
-                dsv41::profile::take_line(),
+                crate::dsv41::profile::take_line(),
                 ggml_rs_wgpu::profile::take_dense_line()
             );
         };
         if profiling {
-            dsv41::profile::take();
+            crate::dsv41::profile::take();
         }
         let at_start = read_so_far(&self.model);
         let common = self.covered.iter().zip(prompt).take_while(|(a, b)| a == b).count();
@@ -351,9 +351,9 @@ impl Engine {
             part("the prompt", at_start, at_reply);
         }
 
-        let think_start = self.tok.special(dsv41::chat::THINK_START);
-        let mut budget = crate::glm::ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(dsv41::chat::THINK_END), job.think_budget);
-        let mut parser = dsv41::chat::StreamParser::new(if budget.thinking { dsv41::chat::Mode::Thinking } else { dsv41::chat::Mode::Chat });
+        let think_start = self.tok.special(crate::dsv41::chat::THINK_START);
+        let mut budget = crate::glm::ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(crate::dsv41::chat::THINK_END), job.think_budget);
+        let mut parser = crate::dsv41::chat::StreamParser::new(if budget.thinking { crate::dsv41::chat::Mode::Thinking } else { crate::dsv41::chat::Mode::Chat });
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
         let (mut pending, mut n) = (Vec::<u8>::new(), 0usize);
         let decode = std::time::Instant::now();

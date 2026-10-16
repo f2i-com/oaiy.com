@@ -149,12 +149,12 @@ fn lfm2s_engine_is_transformers() {
     let (Ok(path), Ok(reference)) = (std::env::var("OAIY_LFM2_GGUF"), std::env::var("OAIY_LFM2_REFERENCE")) else { return };
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(ggml_rs::CpuBackend::new());
     let g = gguf::GgufFile::open(&path).unwrap();
-    let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
+    let make = |_: usize, e: crate::llm::ExpertBlocks| -> crate::llm::Result<Box<dyn ggml_rs::exl3::Experts>> {
         let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
-        ggml_rs_wgpu::quant_moe::quant_experts_cpu(data).map_err(llama_rs::LlamaError::Config)
+        ggml_rs_wgpu::quant_moe::quant_experts_cpu(data).map_err(crate::llm::LlamaError::Config)
     };
-    let m = llama_rs::Qwen35Model::from_gguf_with(&g, Arc::clone(&backend), Some(&make)).unwrap();
-    assert!(m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Conv { moe: Some(_), .. })) && m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Attention { moe: None, .. })));
+    let m = crate::llm::Qwen35Model::from_gguf_with(&g, Arc::clone(&backend), Some(&make)).unwrap();
+    assert!(m.blocks.iter().any(|b| matches!(b, crate::llm::Qwen35Block::Conv { moe: Some(_), .. })) && m.blocks.iter().any(|b| matches!(b, crate::llm::Qwen35Block::Attention { moe: None, .. })));
     let r = Json::parse(&std::fs::read(reference).unwrap()).unwrap();
     let floats = |v: &Json| -> Vec<f32> { v.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect() };
     let argmax = |v: &[f32]| v.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
@@ -162,8 +162,8 @@ fn lfm2s_engine_is_transformers() {
     for (n, case) in r.get("cases").unwrap().as_array().unwrap().iter().enumerate() {
         let ids: Vec<u32> = case.get("ids").unwrap().as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as u32).collect();
         let cfg = &m.config;
-        let mut kv = llama_rs::KvCache::new(&*backend, cfg.n_layers, ids.len() + 16, cfg.n_kv_heads, cfg.head_dim);
-        let row = |tokens: &[u32], kv: &mut llama_rs::KvCache| m.forward_embeds_host(&m.embed_text(tokens), tokens.len(), kv, None).unwrap().to_host().data().to_vec();
+        let mut kv = crate::llm::KvCache::new(&*backend, cfg.n_layers, ids.len() + 16, cfg.n_kv_heads, cfg.head_dim);
+        let row = |tokens: &[u32], kv: &mut crate::llm::KvCache| m.forward_embeds_host(&m.embed_text(tokens), tokens.len(), kv, None).unwrap().to_host().data().to_vec();
         let got = row(&ids, &mut kv);
         let want = floats(case.get("logits").unwrap());
         let c = cosine(&got, &want);

@@ -2,7 +2,7 @@
 //! [`TensorSource`], so the same code serves this crate's own safetensors
 //! reader and oaiy-media's weight store (with its quantized formats).
 use candle_core::{DType, Device, Result, Tensor};
-use dsv41::safetensors::{Dtype, StIndex};
+use oaiy_engine::safetensors::{Dtype, StIndex};
 use std::path::Path;
 
 /// Stop Candle's CUDA tensors made from here on (on this device) from

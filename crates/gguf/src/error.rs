@@ -31,7 +31,7 @@ pub enum GgufError {
     #[error("expected metadata key `{0}` was not found")]
     MissingKey(String),
 
-    // VENDORED-LOCAL: split-GGUF shard handling.
+    // split-GGUF shard handling.
     #[error("split GGUF: {0}")]
     Split(String),
 
@@ -58,7 +58,7 @@ pub enum GgufError {
         numel: u64,
     },
 
-    // VENDORED-LOCAL: error from an external `TensorBytes` source.
+    // error from an external `TensorBytes` source.
     #[error("tensor byte source error: {0}")]
     Source(String),
 }

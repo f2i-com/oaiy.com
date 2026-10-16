@@ -4,7 +4,7 @@
 use super::resident::Resident;
 use super::*;
 
-/// Routed experts on the WebGPU adapter (`dsv41::moe::Experts::gpu`). A prompt's busy ones pass through a set of slots
+/// Routed experts on the WebGPU adapter (`crate::dsv41::moe::Experts::gpu`). A prompt's busy ones pass through a set of slots
 /// made once (`RecordSlots`), each record uploaded as stored and its matrices read in place (their e8m0 scales decoded
 /// by the kernels): uploading each matrix into buffers of its own, its scales widened to f32 on the host, took 0.67 s
 /// for 32 experts of 31 rows, the slots 0.29 s. What the budget has left after those is a tier of experts kept there
@@ -93,7 +93,7 @@ fn read_records(store: &dyn oaiy_engine::store::WeightStore, keys: &[(u32, u32)]
             scope.spawn(|| loop {
                 let i = turn.fetch_add(1, Ordering::Relaxed);
                 let Some(&(layer, expert)) = keys.get(i) else { break };
-                let mut record = vec![0u8; dsv41::expert::RECORD_BYTES];
+                let mut record = vec![0u8; crate::dsv41::expert::RECORD_BYTES];
                 if store.fetch(layer, expert, &mut record).is_ok() {
                     read.lock().unwrap_or_else(|e| e.into_inner()).push((slot(i), record));
                 }
@@ -116,12 +116,12 @@ pub(super) const MARGIN: u64 = 1 << 30;
 pub(crate) const ALONE: u64 = 2 << 30;
 
 impl WgpuExperts {
-    /// Slots for a call of [`dsv41::moe::GPU_GROUP`] experts, or as many as the weight budget has left (after the trunk),
+    /// Slots for a call of [`crate::dsv41::moe::GPU_GROUP`] experts, or as many as the weight budget has left (after the trunk),
     /// and a resident tier in what is left after them but [`MARGIN`], and in `more` bytes past the budget (0, or
     /// [`ALONE`]); None if not one slot fits.
     pub(crate) fn new(gpu: &WgpuBackend, more: u64) -> Option<WgpuExperts> {
-        let record = dsv41::expert::RECORD_BYTES;
-        let group = gpu.record_slots(dsv41::moe::GPU_GROUP, record)?;
+        let record = crate::dsv41::expert::RECORD_BYTES;
+        let group = gpu.record_slots(crate::dsv41::moe::GPU_GROUP, record)?;
         let (used, budget) = gpu.usage();
         let room = ((budget + more).saturating_sub(used).saturating_sub(MARGIN) / record as u64) as usize;
         let resident = (room > 0).then(|| gpu.record_slots_past(room, record, more)).flatten().map(|slots| Mutex::new(Resident::new(slots)));
@@ -137,7 +137,7 @@ impl WgpuExperts {
         })
     }
 
-    /// Start from a usage profile's order (every expert once, the most used first: [`dsv41::moe::Uses::order`]): the
+    /// Start from a usage profile's order (every expert once, the most used first: [`crate::dsv41::moe::Uses::order`]): the
     /// first card's tier is filled with the first of them and the other cards' share with the next, where without a
     /// profile the tier waits for the first requests and the share is each layer's last experts. Before the model
     /// serves anything.
@@ -163,7 +163,7 @@ impl WgpuExperts {
     /// layer's last experts, read at start-up before anything is known of their use), and the first card's as what
     /// the first prompts routed to; neither changes on a request's own path, where a swap is an upload of 18.9 MB and
     /// an expert left in no tier.
-    pub(crate) fn rebalance(&self, store: &dyn oaiy_engine::store::WeightStore, cache: &oaiy_engine::ecache::Ecache, uses: &dsv41::moe::Uses, count: usize) -> usize {
+    pub(crate) fn rebalance(&self, store: &dyn oaiy_engine::store::WeightStore, cache: &oaiy_engine::ecache::Ecache, uses: &crate::dsv41::moe::Uses, count: usize) -> usize {
         use std::sync::atomic::Ordering;
         if !self.exclusive.load(Ordering::Relaxed) || count == 0 {
             return 0;
@@ -203,7 +203,7 @@ impl WgpuExperts {
             // the displaced one's record first: if the drive will not give it, nothing changes
             let back = match old {
                 Some((layer, expert)) => {
-                    let mut record = vec![0u8; dsv41::expert::RECORD_BYTES];
+                    let mut record = vec![0u8; crate::dsv41::expert::RECORD_BYTES];
                     if store.fetch(layer, expert, &mut record).is_err() {
                         continue;
                     }
@@ -249,7 +249,7 @@ impl WgpuExperts {
     /// many as each one's weight budget has room for but [`MARGIN`]: the slots are made now and filled while the server
     /// idles ([`Self::pin_some`]). How many they will hold.
     pub(crate) fn pin_on(&mut self, gpus: &[Arc<WgpuBackend>], layers: usize, per_layer: usize) -> usize {
-        let record = dsv41::expert::RECORD_BYTES;
+        let record = crate::dsv41::expert::RECORD_BYTES;
         let (mut cards, mut total) = (Vec::new(), 0usize);
         for gpu in gpus {
             let (used, budget) = gpu.usage();
@@ -384,8 +384,8 @@ impl WgpuExperts {
 /// another; a step's went that way too, two round trips a card a layer, and once the cards held most of a step's
 /// experts that was what the step waited for.
 fn run(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f32) -> Vec<Vec<f32>> {
-    use dsv41::expert::{BLOCK, DIM, INTER, S1, S2, S3, W1, W2, W3};
-    use dsv41::formats::{fake_quant_fp8, to_bf16};
+    use crate::dsv41::expert::{BLOCK, DIM, INTER, S1, S2, S3, W1, W2, W3};
+    use oaiy_engine::formats::{fake_quant_fp8, to_bf16};
     let rows: Vec<usize> = picks.iter().map(|(_, x, _)| x.len() / DIM).collect();
     let mats: Vec<[DenseGpu; 3]> = picks
         .iter()
@@ -412,7 +412,7 @@ fn run(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f32
         (0..picks.len()).flat_map(|i| [(&mats[i][0], xq[i], rows[i], 0..INTER), (&mats[i][1], xq[i], rows[i], 0..INTER)]).collect();
     let sums = ggml_rs_wgpu::dense::forward_batch(&items);
     let hq: Vec<Vec<f32>> =
-        sums.chunks(2).zip(picks).map(|(p, (_, _, w))| fake_quant_fp8(&dsv41::expert::swiglu(&p[0], &p[1], Some(w), swiglu_limit), BLOCK)).collect();
+        sums.chunks(2).zip(picks).map(|(p, (_, _, w))| fake_quant_fp8(&crate::dsv41::expert::swiglu(&p[0], &p[1], Some(w), swiglu_limit), BLOCK)).collect();
     let items: Vec<(&DenseGpu, &[f32], usize, std::ops::Range<usize>)> = (0..picks.len()).map(|i| (&mats[i][2], hq[i].as_slice(), rows[i], 0..DIM)).collect();
     ggml_rs_wgpu::dense::forward_batch(&items).into_iter().map(|y| y.into_iter().map(to_bf16).collect()).collect()
 }
@@ -427,7 +427,7 @@ enum Begun {
 impl Begun {
     fn finish(self) -> Vec<Vec<f32>> {
         match self {
-            Begun::Pending(pending) => pending.finish().0.into_iter().map(|y| y.into_iter().map(dsv41::formats::to_bf16).collect()).collect(),
+            Begun::Pending(pending) => pending.finish().0.into_iter().map(|y| y.into_iter().map(oaiy_engine::formats::to_bf16).collect()).collect(),
             Begun::Made(outs) => outs,
         }
     }
@@ -437,8 +437,8 @@ impl Begun {
 /// call ([`ggml_rs_wgpu::dense::begin_units`]) and left for [`Begun::finish`], so the caller's own work meanwhile is
 /// beside the card's.
 fn begin(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f32) -> Begun {
-    use dsv41::expert::{BLOCK, DIM, INTER, S1, S2, S3, W1, W2, W3};
-    if picks.len() <= dsv41::moe::GPU_GROUP && picks.iter().all(|(_, x, w)| x.len() == DIM && w.len() == 1) {
+    use crate::dsv41::expert::{BLOCK, DIM, INTER, S1, S2, S3, W1, W2, W3};
+    if picks.len() <= crate::dsv41::moe::GPU_GROUP && picks.iter().all(|(_, x, w)| x.len() == DIM && w.len() == 1) {
         let mats: Vec<[DenseGpu; 3]> = picks
             .iter()
             .map(|&(i, ..)| [slots.mxfp4(i, W1.start, S1.start, INTER, DIM), slots.mxfp4(i, W3.start, S3.start, INTER, DIM), slots.mxfp4(i, W2.start, S2.start, DIM, INTER)])
@@ -447,7 +447,7 @@ fn begin(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f
         let mut quantized: Vec<(*const f32, Vec<f32>)> = Vec::new();
         for (_, x, _) in picks {
             if !quantized.iter().any(|(at, _)| *at == x.as_ptr()) {
-                quantized.push((x.as_ptr(), dsv41::formats::fake_quant_fp8(x, BLOCK)));
+                quantized.push((x.as_ptr(), oaiy_engine::formats::fake_quant_fp8(x, BLOCK)));
             }
         }
         let units: Vec<ggml_rs_wgpu::dense::Unit<'_>> = picks
@@ -459,10 +459,10 @@ fn begin(slots: &RecordSlots, picks: &[(usize, &[f32], &[f32])], swiglu_limit: f
             return Begun::Pending(pending);
         }
     }
-    Begun::Made(picks.chunks(dsv41::moe::GPU_GROUP).flat_map(|part| run(slots, part, swiglu_limit)).collect())
+    Begun::Made(picks.chunks(crate::dsv41::moe::GPU_GROUP).flat_map(|part| run(slots, part, swiglu_limit)).collect())
 }
 
-impl dsv41::expert::ExpertsKernel for WgpuExperts {
+impl crate::dsv41::expert::ExpertsKernel for WgpuExperts {
     /// Each card's share of a decode step's held experts submitted in turn (the other cards', then the first card's
     /// tier), and all read back by the closure: the cards work beside each other and beside whatever the caller does
     /// before it asks, and no thread is started for any of them.
@@ -498,7 +498,7 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
         })
     }
 
-    fn forward(&self, jobs: &[dsv41::expert::ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>> {
+    fn forward(&self, jobs: &[crate::dsv41::expert::ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>> {
         let slots = self.group.lock().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::with_capacity(jobs.len());
         for part in jobs.chunks(slots.len()) {
@@ -541,7 +541,7 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
                         let slots = &self.pinned.as_ref().expect("a share's card").cards[c].0;
                         let handle = scope.spawn(move || {
                             let picks: Vec<(usize, &[f32], &[f32])> = mine.iter().map(|&j| (there[j].expect("its slot").1, jobs[j].1, jobs[j].2)).collect();
-                            let got: Vec<Vec<f32>> = picks.chunks(dsv41::moe::GPU_GROUP).flat_map(|part| run(slots, part, swiglu_limit)).collect();
+                            let got: Vec<Vec<f32>> = picks.chunks(crate::dsv41::moe::GPU_GROUP).flat_map(|part| run(slots, part, swiglu_limit)).collect();
                             (mine, got)
                         });
                         handle
@@ -552,7 +552,7 @@ impl dsv41::expert::ExpertsKernel for WgpuExperts {
             if !first.is_empty() {
                 let r = self.resident.as_ref().expect("a kernel that holds experts").lock().unwrap_or_else(|p| p.into_inner());
                 let picks: Vec<(usize, &[f32], &[f32])> = first.iter().map(|&j| (r.index[&(layer, jobs[j].0)], jobs[j].1, jobs[j].2)).collect();
-                let got: Vec<Vec<f32>> = picks.chunks(dsv41::moe::GPU_GROUP).flat_map(|part| run(&r.slots, part, swiglu_limit)).collect();
+                let got: Vec<Vec<f32>> = picks.chunks(crate::dsv41::moe::GPU_GROUP).flat_map(|part| run(&r.slots, part, swiglu_limit)).collect();
                 for (j, out) in first.into_iter().zip(got) {
                     outs[j] = Some(out);
                 }

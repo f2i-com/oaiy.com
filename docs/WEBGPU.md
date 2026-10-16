@@ -223,7 +223,7 @@ reorganised (the same day, nothing else running): 5.9 to 8.7 and 8.1 to 9.9, the
 prompts in 6.0 to 7.4 s and 14.4 to 19.1 s. What changed:
 
 - A prompt's experts on the CPU take all of an expert's tokens at once
-  (`cpu_experts::TokensKernel`, `expert_forward_tokens`; `dsv41-simd` picks this
+  (`cpu_experts::TokensKernel`, `expert_forward_tokens`; `dsv41::simd` picks this
   CPU's): a block of sixteen rows of a matrix is decoded once and multiplied by each
   token's row, in the order a token alone is summed, so the same bits. A token at a
   time read the 18.9 MB record once a token, and workers on every core were then
@@ -847,7 +847,7 @@ dense families.
 ## Dense models on the GPU (2026-10-05)
 
 A Llama's, Qwen3's or Gemma 3's decode step is one submit (`ggml_rs::chain`, a
-`DeviceChain` the WebGPU backend implements; `llama-rs`'s `chain_decode`): every
+`DeviceChain` the WebGPU backend implements; `llm::chain_decode`): every
 layer's norm, q, k and v (Qwen3's and Gemma 3's per-head norms), RoPE (its sines
 and cosines made on the host as the CPU's rope makes them, a table each base and
 scaling among the layers), the K and V stored into a copy of the KV cache kept on
@@ -887,7 +887,7 @@ kernels (above) made it 7.7 ms.
 
 ### Gemma 4 and its pictures (2026-10-14)
 
-Gemma 4's dense models are chained too (`llama-rs`'s `chain_gemma4`; measured with E2B), as the op-by-op
+Gemma 4's dense models are chained too (`llm::chain_gemma4`; measured with E2B), as the op-by-op
 `forward_embeds` computes it: the per-layer inputs (the embeddings through the PLE
 projection and its norm, plus the tokens' rows of the PLE table), then each layer's q
 (per-head norm, RoPE by the layer's own base and divisors), k and v where the layer
@@ -936,7 +936,7 @@ RMS norm and the projection into the model's width. A picture is `<|image>`, a
 `<|image|>` a soft token, `<image|>` in the prompt; the soft tokens' rows take their
 embeddings' place, and their PLE rows are the padding's (as Transformers looks them
 up). The prefix cache keys them by the picture's bytes, and the last four pictures'
-soft tokens are kept for the turns after. (llama-rs's op-by-op tower left out the
+soft tokens are kept for the turns after. (The old op-by-op tower left out the
 rotary positions, the pooling, the clamps and the projector's norm; it is gone.)
 
 On the A2 a 768 x 768 picture (256 soft tokens) is read in 0.6-0.9 s (3.7 s the first
@@ -988,8 +988,7 @@ queue's staging: the 27B's load 18.2 to 16.7 s.
 
 ## Qwen3.5 and Qwen3.8 27B on the GPU (2026-10-05)
 
-Qwen3.5's hybrid (Qwen3.5 4B, 9B and 27B, Qwen3.8 27B: `llama-rs`'s
-`chain_qwen35`) runs a decode step or a prompt's chunk in one submit too. Its
+Qwen3.5's hybrid (Qwen3.5 4B, 9B and 27B, Qwen3.8 27B: `llm::chain_qwen35`) runs a decode step or a prompt's chunk in one submit too. Its
 gated delta net layers' projections, causal conv and recurrence run on the GPU:
 a workgroup a value head, a thread a row of its state, the row held in registers
 through the run's tokens (43 us a layer for a step of Qwen3.8 27B when each

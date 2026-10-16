@@ -2,7 +2,7 @@
 //! server-sent events or whole), `POST /v1/completions` (raw text),
 //! `GET /v1/models` and `GET /health`.
 //!
-//! Chat requests go through the DeepSeek-V4.1 chat format ([`dsv41::chat`]):
+//! Chat requests go through the DeepSeek-V4.1 chat format ([`crate::dsv41::chat`]):
 //! `tools` and `response_format` attach to the system message, reasoning
 //! comes back as `reasoning_content` (as DeepSeek's own API does), and the
 //! model's DSML tool calls come back as OpenAI `tool_calls`.
@@ -28,9 +28,9 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dsv41::chat::{self, Delta, Mode};
-use dsv41::config::VisionConfig;
-use dsv41::vision;
+use crate::dsv41::chat::{self, Delta, Mode};
+use crate::dsv41::config::VisionConfig;
+use crate::dsv41::vision;
 use oaiy_engine::json::Json;
 
 use crate::engine::{Event, Finish, Job, JobImage, Sampling};
@@ -50,7 +50,7 @@ pub struct Config {
     pub repeat_penalty: f32,
     /// The vision tower's config when it is loaded (else images are refused).
     pub vision: Option<VisionConfig>,
-    pub qwen_vision: Option<llama_rs::MmProjConfig>,
+    pub qwen_vision: Option<crate::llm::MmProjConfig>,
     /// MiniCPM-V 4.7's pictures (a Qwen3.5 model with its projector): cut into tiles and laid out on canvases.
     pub minicpmv: Option<crate::qwen::MiniCpmV>,
     /// Gemma 4's pictures, where its vision projector is loaded.
@@ -78,13 +78,13 @@ pub struct GemmaVision {
 /// picture is at most.
 #[derive(Clone, Debug)]
 pub struct GlmVision {
-    pub shape: llama_rs::glm5next::vision::VisionShape,
+    pub shape: crate::llm::glm5next::vision::VisionShape,
     pub max_tokens: usize,
 }
 
 pub struct Server {
     pub images: Arc<crate::images::Images>,
-    // VENDORED-LOCAL: more than one configured model, switched on demand.
+    // more than one configured model, switched on demand.
     /// The configured models and whichever is loaded. A request naming a different
     /// one unloads the current model first — see [`crate::models::Models::activate`].
     pub models: Arc<crate::models::Models>,
@@ -472,7 +472,7 @@ pub(crate) fn gemma_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv
         }
         let i = images.len() + 1;
         let bytes = vision::image_bytes(records.next().expect("a record a marker"), local).map_err(|e| format!("image {i}: {e}"))?;
-        let pixels = llama_rs::vision::gemma4_image(&bytes, gv.patch, gv.max_soft_tokens).map_err(|e| format!("image {i}: {e}"))?;
+        let pixels = crate::llm::vision::gemma4_image(&bytes, gv.patch, gv.max_soft_tokens).map_err(|e| format!("image {i}: {e}"))?;
         let side = 3 * gv.patch;
         let tokens = (pixels.dim(1) / side) * (pixels.dim(2) / side);
         ids.push(gv.open);
@@ -502,7 +502,7 @@ pub(crate) fn glm_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv: 
         }
         let i = images.len() + 1;
         let bytes = vision::image_bytes(records.next().expect("a record a marker"), local).map_err(|e| format!("image {i}: {e}"))?;
-        let (pixels, width, height) = llama_rs::glm5next::vision::preprocess_bytes_within(&bytes, &gv.shape, gv.max_tokens).map_err(|e| format!("image {i}: {e}"))?;
+        let (pixels, width, height) = crate::llm::glm5next::vision::preprocess_bytes_within(&bytes, &gv.shape, gv.max_tokens).map_err(|e| format!("image {i}: {e}"))?;
         let tokens = gv.shape.n_out_tokens(width / gv.shape.patch, height / gv.shape.patch);
         images.push(JobImage { start: ids.len(), prep: crate::engine::ImagePrep::Glm { pixels, width, height, tokens }, hash: crate::disk::fnv(&bytes, 0) });
         ids.extend(std::iter::repeat_n(image_id, tokens));

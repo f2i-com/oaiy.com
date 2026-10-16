@@ -190,7 +190,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// VENDORED-LOCAL: LFM2's gated short conv ([`SSM_CONV`]'s walk, a thread a channel through the run's tokens): each
+/// LFM2's gated short conv ([`SSM_CONV`]'s walk, a thread a channel through the run's tokens): each
 /// token's `B * x` (the first and last thirds of its row of `bcx`) through the causal conv after the `kernel - 1`
 /// products the state holds, times its C (the middle third); the state left with the last products. `p[0]`: the
 /// channels, the tokens, the kernel.

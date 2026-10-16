@@ -335,7 +335,7 @@ release is made by tagging a version: see [docs/RELEASING.md](docs/RELEASING.md)
 
 | Folder | What |
 |---|---|
-| [`crates/`](crates/) | The engines, in Rust: `oaiy-engine` (the core), `oaiy-llm-server` and `oaiy-llm-cli`, `dsv41` (DeepSeek-V4.1), `oaiy-media`, `oaiy-tts`, `oaiy-voice`, `oaiy-image`, `oaiy-studio` and `oaiy-studio-tray`, and the vendored GGUF stack |
+| [`crates/`](crates/) | The engines, in Rust: `oaiy-engine` (the core), `oaiy-llm-server` (the language models: the GGUF ones and DeepSeek-V4.1) and `oaiy-llm-cli`, `oaiy-media`, `oaiy-tts`, `oaiy-voice`, `oaiy-image`, `oaiy-studio` and `oaiy-studio-tray`, and the GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`, `ggml-rs-wgpu`, `tokenizer`) |
 | [`app/`](app/) | The Agent app (TypeScript, Vite) |
 | [`platform/desktop/`](platform/desktop/) | OAIY Desktop: the dashboard (React), the Tauri 2 and axum host, and `oaiy-server` |
 | [`platform/ui/`](platform/ui/) | The flow editor and its bundled nodes |
@@ -369,6 +369,6 @@ current state: [docs/OAIY_PLAN.md](docs/OAIY_PLAN.md).
 
 ## Licence
 
-The engines are Apache-2.0 (`LICENSE-APACHE`, `NOTICE`), and the vendored GGUF stack is
+The engines are Apache-2.0 (`LICENSE-APACHE`, `NOTICE`), and the GGUF stack is
 MIT OR Apache-2.0 (`LICENSE-MIT`); `app/` and `platform/` are Apache-2.0 (their own
 `LICENSE` and `NOTICE`).

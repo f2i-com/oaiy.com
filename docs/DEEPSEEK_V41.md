@@ -165,14 +165,14 @@ well (one read serves every token in the chunk), so prefill in large chunks.
 
 ## What OAIY already had
 
-The starting point, as of 2026-09-18. The VENDORED-LOCAL module headers are more
+The starting point, as of 2026-09-18. The module headers are more
 current than `docs/ROADMAP.md`, which predates several of these:
 
 - `oaiy_engine::ecache::Ecache` with `HostLease` (zero-copy hits), plus the `WeightStore` seam.
-- VRAM expert cache `llama-rs/src/expert_stream/device_cache.rs` (CACHE-02 / STREAM-01).
+- VRAM expert cache `oaiy-llm-server/src/llm/expert_stream/device_cache.rs` (CACHE-02 / STREAM-01).
 - Pinned staging ring, async H2D stream and upload tickets: `ggml-rs-cuda/src/transfer.rs` (GPU-02).
 - GPU top-k routing and grouped gate/up and down MoE kernels: `ggml-rs-cuda/src/moe.rs`,
-  `llama-rs/src/moe_cuda.rs` (MOE-01/02).
+  `oaiy-llm-server/src/llm/moe_cuda.rs` (MOE-01/02).
 - BPE tokenizers and samplers in the GGUF stack.
 
 Since 2026-09-19 OAIY reads only GGUF and safetensors: the `.oaiy` container, the `xdb`
@@ -229,7 +229,7 @@ the chat encoder and serving in item 7.
   - Writes `golden.safetensors` (every layer's output and `pre_mix`, logits, Engram
     hashes, the first decode step, expert fixtures) and `engram_meta.safetensors`
     (token map, primes, offsets, multipliers).
-- **Gate:** `crates/dsv41/tests/expert_oracle.rs` fetches routed experts (3, 6) and
+- **Gate:** `crates/oaiy-llm-server/tests/dsv41_expert_oracle.rs` fetches routed experts (3, 6) and
   (3, 13) through the store and runs `expert_forward`.
   - It matches the oracle **bit for bit in bf16: 20,480 of 20,480 values, max diff 0**,
     with and without direct I/O. Warm, the test takes 0.19 s: store open 22–33 ms,
@@ -745,7 +745,7 @@ whose positions all carry `<｜deepseek_image｜>`.
 
 `dsv41::model` (the reference the CUDA path is tested against) runs the whole checkpoint
 on the CPU, its experts through the same LFRU host cache. Measured with
-`crates/dsv41/tests/cpu_speed.rs` (`measure_where_prefill_and_warm_decode_time_goes`,
+`crates/oaiy-llm-server/tests/dsv41_cpu_speed.rs` (`measure_where_prefill_and_warm_decode_time_goes`,
 96 GB expert cache, 2,000 tokens of this repository's docs), split by the trace hook's
 timestamps:
 

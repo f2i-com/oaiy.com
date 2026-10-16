@@ -66,7 +66,7 @@ pub(super) struct Parked<'a> {
     pub(super) at: usize,
     /// The states the chunk keeps from inside it (their vectors, and what the caller is given of them).
     pub(super) kept: Vec<Tap>,
-    pub(super) tapped: Vec<llama_rs::Tapped>,
+    pub(super) tapped: Vec<crate::llm::Tapped>,
 }
 
 /// A chained run whose last device is running: its recording (the run's reads its attention layers' rows, then
@@ -77,7 +77,7 @@ pub(super) struct ChainedRun<'a> {
     pub(super) at: usize,
     pub(super) t: usize,
     /// The states it keeps from inside (theirs once the run has run)
-    pub(super) tapped: Vec<llama_rs::Tapped>,
+    pub(super) tapped: Vec<crate::llm::Tapped>,
 }
 
 impl ChainedRun<'_> {

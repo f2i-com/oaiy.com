@@ -129,7 +129,7 @@ local adapter/VAE tests were run separately as recorded in the initial checkpoin
 
 The plain full-workspace command remains blocked while linking examples: Windows
 LNK1104 cannot open `examples/bench.exe`. At the original base, both
-`crates/llama-rs/examples/bench.rs` and `crates/oaiy-tts/examples/bench.rs` already
+`crates/oaiy-llm-server/examples/bench.rs` and `crates/oaiy-tts/examples/bench.rs` already
 produce that filename; `llama-rs` and `dsv41-cuda` also share `generate.exe`.
 Cargo reports these collisions in `klein-workspace-tests-final.log`. No example
 target was changed by this branch. The passing command explicitly excludes

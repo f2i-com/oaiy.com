@@ -51,7 +51,7 @@ pub(super) fn expert_records(idx: &StIndex, m: &str, cfg: &Config) -> Result<(gg
     for e in 0..cfg.experts {
         let p = format!("{m}.experts.{e}");
         let parts = [("gate_proj", h, f), ("up_proj", h, f), ("down_proj", f, h)];
-        let infos: Vec<[&dsv41::safetensors::TensorInfo; 4]> = parts
+        let infos: Vec<[&oaiy_engine::safetensors::TensorInfo; 4]> = parts
             .iter()
             .map(|(proj, _, _)| ["suh", "svh", "mul1", "trellis"].map(|t| idx.info(&format!("{p}.{proj}.{t}"))).into_iter().collect::<Result<Vec<_>>>().map(|v| [v[0], v[1], v[2], v[3]]))
             .collect::<Result<_>>()?;

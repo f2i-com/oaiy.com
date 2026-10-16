@@ -222,7 +222,7 @@ def main():
     if args_cli.candidate_topk_blocks is not None:
         args.candidate_topk_blocks = overrides["candidate_topk_blocks"] = args_cli.candidate_topk_blocks
 
-    # Same deliberate deviation as crates/dsv41/src/attention.rs: the reference
+    # Same deliberate deviation as crates/oaiy-llm-server/src/dsv41/attention.rs: the reference
     # `Indexer.forward` publishes `shared_attn.index_k` only when a new latent
     # arrived, so on a ratio-2 decode step that completes no group, owning
     # indexers (layers 2/8/14) score against layer 20's stale ratio-1 keys. An
