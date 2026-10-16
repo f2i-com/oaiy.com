@@ -43,6 +43,36 @@ fn random_grid(next: &mut impl FnMut() -> f32, t: GgmlType, matrices: usize, row
     bytes
 }
 
+/// `matrices` of `rows` by `cols` in a K-quant (Q4_K or Q6_K): every nibble, high bit and scale at random, each block's
+/// own scales small f16s (Q6_K's sixteen int8 ones, some negative).
+fn random_k(next: &mut impl FnMut() -> f32, t: GgmlType, matrices: usize, rows: usize, cols: usize) -> Vec<u8> {
+    let blocks = matrices * rows * cols / 256;
+    let mut bytes = Vec::with_capacity(blocks * t.type_size());
+    let mut byte = |next: &mut dyn FnMut() -> f32| ((next() + 1.0) * 127.99) as u8;
+    for _ in 0..blocks {
+        if t == GgmlType::Q4_K {
+            bytes.extend(half::f16::from_f32(0.0004 + 0.0002 * next()).to_bits().to_le_bytes());
+            bytes.extend(half::f16::from_f32(0.0004 + 0.0002 * next()).to_bits().to_le_bytes());
+            bytes.extend((0..140).map(|_| byte(&mut *next)));
+        } else {
+            bytes.extend((0..208).map(|_| byte(&mut *next)));
+            bytes.extend(half::f16::from_f32(0.0004 + 0.0002 * next()).to_bits().to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// Experts at random in K-quants, as a Q4_K_M GGUF keeps them: gate and up `gu`, down `down`.
+pub(crate) fn k_experts(seed: u64, hidden: usize, ff: usize, count: usize, gu: GgmlType, down: GgmlType) -> QuantExpertsData {
+    let mut next = rng(seed);
+    let gate = random_k(&mut next, gu, count, ff, hidden);
+    let up = random_k(&mut next, gu, count, ff, hidden);
+    let dn = random_k(&mut next, down, count, hidden, ff);
+    let mut dense = |n: usize| -> Vec<f32> { (0..n).map(|_| half::f16::from_f32(0.03 * next()).to_f32()).collect() };
+    let shared = [dense(ff * hidden), dense(ff * hidden), dense(hidden * ff)];
+    QuantExpertsData { hidden, ff, experts: count, gate: (gu, gate), up: (gu, up), down: (down, dn), shared }
+}
+
 /// Experts at random: the routed ones Q2_0; the shared one's values f16's where `half` (as a Q2_0 matrix's are).
 pub(crate) fn experts(seed: u64, hidden: usize, ff: usize, count: usize, half: bool) -> QuantExpertsData {
     experts_of(seed, hidden, ff, count, half, GgmlType::Q2_0)
@@ -345,6 +375,42 @@ fn the_gpus_grid_experts_are_the_hosts() {
                     }
                     eprintln!("{line}");
                 }
+            }
+        }
+    }
+}
+
+/// Q4_K and Q6_K experts (a Q4_K_M GGUF's: Qwen3.5-MoE's and MiniCPM-V 4.7 35B-A3B's) on the GPU are the host's:
+/// the f32 kernel's sums and the tensor cores', routed on the host and on the GPU.
+#[test]
+fn the_gpus_k_quant_experts_are_the_hosts() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (hidden, ff, count, top_k) = (512, 256, 12, 3);
+    for (gu, down) in [(GgmlType::Q4_K, GgmlType::Q4_K), (GgmlType::Q4_K, GgmlType::Q6_K), (GgmlType::Q6_K, GgmlType::Q6_K)] {
+        let data = k_experts(91, hidden, ff, count, gu, down);
+        let host = quant_experts_cpu(copy(&data)).unwrap();
+        let mut f32s = QuantMoe::try_new(&b, copy(&data), 0).ok().expect("K-quant experts on the GPU");
+        f32s.coop = false;
+        let cores = QuantMoe::try_new(&b, data, 0).ok().expect("K-quant experts on the GPU");
+        for rows in [1, 3, 40, 70] {
+            let (x, logits) = inputs(17 + rows as u64, rows, hidden, count);
+            let want = host.forward(&Tensor::from_vec(x.clone(), vec![rows, hidden]), &Tensor::from_vec(logits.clone(), vec![rows, count + 1]), top_k).to_host().data().to_vec();
+            for (what, moe) in [("f32", &f32s), ("the tensor cores", &cores)] {
+                if !moe.coop && what != "f32" {
+                    continue;
+                }
+                let (hosted, routed, _) = gpu_sums(&b, moe, &x, &logits, rows, hidden, count, top_k);
+                let e = worst(&hosted, &want);
+                let mut line = format!("{gu:?} gate and up, {down:?} down, {rows} rows, {what}: routed on the host {e:.2e}");
+                let shared = rows > 8 && coop_on(&b.gpu);
+                let bound = |cores: bool| if cores || shared { 8e-3 } else { 5e-5 };
+                assert!(e < bound(moe.coop && rows > 1), "{line}");
+                if let Some(routed) = routed {
+                    let e = worst(&routed, &want);
+                    line += &format!(", on the GPU {e:.2e}");
+                    assert!(e < bound(moe.coop && rows > FEW_MAX), "{line}");
+                }
+                eprintln!("{line}");
             }
         }
     }

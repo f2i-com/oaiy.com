@@ -23,7 +23,7 @@ use ggml_rs::{Backend, DeviceChain, DeviceVec, QuantizedTensor, Tensor};
 
 use crate::kv_cache::KvCache;
 use crate::loader::{FfnPair, Weight};
-use crate::qwen35::{Qwen35Block, Qwen35Model};
+use crate::qwen35::{Qwen35Block, Qwen35Model, Qwen35Moe};
 
 // (parts of `impl Qwen35Chain`, each with what it alone uses)
 mod drafts;
@@ -100,6 +100,8 @@ struct LayerVecs {
     attn_norm: DeviceVec,
     post_norm: DeviceVec,
     mixer: Mixer,
+    /// A MoE layer's router (`[experts + 1, d]`, f32: the shared expert's gate its last row).
+    router: Option<DeviceVec>,
 }
 
 enum Mixer {
@@ -127,6 +129,10 @@ struct Dims {
     ch: usize,
     kern: usize,
     vocab: usize,
+    /// A MoE model's router's rows (its experts and the shared one's gate); 0: dense.
+    router: usize,
+    /// The rows a piece takes at most where a MoE model's experts route no more on its device at once (0: as many).
+    moe_rows: usize,
 }
 
 /// The chain's copy of the attention layers' caches, a buffer a layer (row `t`: its K `[n_kv, head_dim]` then its
@@ -211,9 +217,10 @@ impl<'a> W<'a> {
 /// A layer's projections a run reads: the model's own (on the first device), or their copies on the second.
 #[derive(Clone, Copy)]
 enum LayerW<'a> {
-    Attention { q: W<'a>, k: W<'a>, v: W<'a>, o: W<'a>, ffn: FfnW<'a>, down: W<'a> },
-    /// `ba` none where the fused beta-alpha projection's weights are f32 (the layer's vectors hold them)
-    Ssm { qkv: W<'a>, gate: W<'a>, ba: Option<W<'a>>, out: W<'a>, ffn: FfnW<'a>, down: W<'a> },
+    Attention { q: W<'a>, k: W<'a>, v: W<'a>, o: W<'a>, ffn: FfnW<'a>, down: W<'a>, moe: Option<&'a Qwen35Moe> },
+    /// `ba` none where the fused beta-alpha projection's weights are f32 (the layer's vectors hold them); `moe` a MoE
+    /// layer's experts (its `ffn` and `down` then its shared expert's, unread here: the experts hold it)
+    Ssm { qkv: W<'a>, gate: W<'a>, ba: Option<W<'a>>, out: W<'a>, ffn: FfnW<'a>, down: W<'a>, moe: Option<&'a Qwen35Moe> },
 }
 
 /// An FFN's gate and up projections: fused, or a pair.
@@ -231,10 +238,10 @@ impl<'a> LayerW<'a> {
             FfnPair::Split { gate, up } => FfnW::Split(W::of(gate), W::of(up)),
         };
         match b {
-            Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, .. } => {
-                LayerW::Attention { q: W::of(attn_q), k: W::of(attn_k), v: W::of(attn_v), o: W::of(attn_output), ffn: ffn(ffn_pair), down: W::of(ffn_down) }
+            Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, moe, .. } => {
+                LayerW::Attention { q: W::of(attn_q), k: W::of(attn_k), v: W::of(attn_v), o: W::of(attn_output), ffn: ffn(ffn_pair), down: W::of(ffn_down), moe: moe.as_deref() }
             }
-            Qwen35Block::Ssm { attn_qkv, attn_gate, ssm_ba, ssm_out, ffn_pair, ffn_down, .. } => LayerW::Ssm {
+            Qwen35Block::Ssm { attn_qkv, attn_gate, ssm_ba, ssm_out, ffn_pair, ffn_down, moe, .. } => LayerW::Ssm {
                 qkv: W::of(attn_qkv),
                 gate: W::of(attn_gate),
                 ba: match ssm_ba {
@@ -244,6 +251,7 @@ impl<'a> LayerW<'a> {
                 out: W::of(ssm_out),
                 ffn: ffn(ffn_pair),
                 down: W::of(ffn_down),
+                moe: moe.as_deref(),
             },
         }
     }
@@ -274,8 +282,10 @@ impl SplitW {
             })
         };
         Some(match w {
-            LayerW::Attention { q, k, v, o, ffn: f, down } => SplitW::Attention { q: c(q)?, k: c(k)?, v: c(v)?, o: c(o)?, ffn: ffn(f)?, down: c(down)? },
-            LayerW::Ssm { qkv, gate, ba, out, ffn: f, down } => SplitW::Ssm {
+            // (a MoE layer's experts are its device's: not copied)
+            LayerW::Attention { moe: Some(_), .. } | LayerW::Ssm { moe: Some(_), .. } => return None,
+            LayerW::Attention { q, k, v, o, ffn: f, down, moe: None } => SplitW::Attention { q: c(q)?, k: c(k)?, v: c(v)?, o: c(o)?, ffn: ffn(f)?, down: c(down)? },
+            LayerW::Ssm { qkv, gate, ba, out, ffn: f, down, moe: None } => SplitW::Ssm {
                 qkv: c(qkv)?,
                 gate: c(gate)?,
                 ba: match ba {
@@ -298,10 +308,10 @@ impl SplitW {
         }
         match self {
             SplitW::Attention { q, k, v, o, ffn: f, down } => {
-                LayerW::Attention { q: W::Quant(q), k: W::Quant(k), v: W::Quant(v), o: W::Quant(o), ffn: ffn(f), down: W::Quant(down) }
+                LayerW::Attention { q: W::Quant(q), k: W::Quant(k), v: W::Quant(v), o: W::Quant(o), ffn: ffn(f), down: W::Quant(down), moe: None }
             }
             SplitW::Ssm { qkv, gate, ba, out, ffn: f, down } => {
-                LayerW::Ssm { qkv: W::Quant(qkv), gate: W::Quant(gate), ba: ba.as_ref().map(W::Quant), out: W::Quant(out), ffn: ffn(f), down: W::Quant(down) }
+                LayerW::Ssm { qkv: W::Quant(qkv), gate: W::Quant(gate), ba: ba.as_ref().map(W::Quant), out: W::Quant(out), ffn: ffn(f), down: W::Quant(down), moe: None }
             }
         }
     }
@@ -430,6 +440,8 @@ struct Work {
     act: DeviceVec,
     table: DeviceVec,
     last: DeviceVec,
+    /// A MoE layer's router's logits
+    router: DeviceVec,
 }
 
 impl Work {
@@ -457,6 +469,7 @@ impl Work {
             act: first(&self.act, t * s.ff),
             table: first(&self.table, t * s.rot),
             last: self.last.clone(),
+            router: first(&self.router, t * s.router.max(1)),
         }
     }
 
@@ -498,6 +511,7 @@ impl Work {
             act: v(t * s.ff),
             table: v(t * s.rot),
             last: v(s.d),
+            router: v(t * s.router.max(1)),
         }
     }
 }
@@ -678,7 +692,7 @@ mod position_tests {
     #[test]
     fn a_growth_the_device_refuses_leaves_a_cache_the_next_prompt_makes_anew() {
         use std::sync::atomic::Ordering::SeqCst;
-        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0 };
+        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0, router: 0, moe_rows: 0 };
         let (slots, row) = (16, 2 * s.n_kv * s.hd);
         for keep in [1024, 0] {
             let chain = Counting { live: Default::default(), most: Default::default(), left: usize::MAX.into() };
@@ -708,7 +722,7 @@ mod position_tests {
     #[test]
     fn a_cache_grows_without_holding_the_old_one_beside_the_new() {
         use std::sync::atomic::Ordering::SeqCst;
-        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0 };
+        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0, router: 0, moe_rows: 0 };
         let (slots, row) = (16, 2 * s.n_kv * s.hd);
         let layer = |cap: usize| cap * row * 4;
         for keep in [16_384, 0] {
@@ -976,11 +990,12 @@ fn upload_tensor(chain: &dyn DeviceChain, t: &Tensor) -> DeviceVec {
 /// has).
 fn layer_vecs(chain: &dyn DeviceChain, b: &Qwen35Block, slot: usize) -> LayerVecs {
     let up = |t: &Tensor| upload_tensor(chain, t);
+    let router = |moe: &Option<Box<Qwen35Moe>>| moe.as_ref().map(|m| up(&m.router.to_host()));
     match b {
-        Qwen35Block::Attention { attn_norm, attn_q_norm, attn_k_norm, post_norm, .. } => {
-            LayerVecs { attn_norm: up(attn_norm), post_norm: up(post_norm), mixer: Mixer::Attention { q_norm: up(attn_q_norm), k_norm: up(attn_k_norm), slot } }
+        Qwen35Block::Attention { attn_norm, attn_q_norm, attn_k_norm, post_norm, moe, .. } => {
+            LayerVecs { attn_norm: up(attn_norm), post_norm: up(post_norm), mixer: Mixer::Attention { q_norm: up(attn_q_norm), k_norm: up(attn_k_norm), slot }, router: router(moe) }
         }
-        Qwen35Block::Ssm { attn_norm, ssm_conv1d, ssm_a, ssm_ba, ssm_dt_bias, ssm_norm, post_norm, .. } => {
+        Qwen35Block::Ssm { attn_norm, ssm_conv1d, ssm_a, ssm_ba, ssm_dt_bias, ssm_norm, post_norm, moe, .. } => {
             let ba_f32 = match ssm_ba {
                 Weight::Dense(t) => Some(up(t)),
                 _ => None,
@@ -989,6 +1004,7 @@ fn layer_vecs(chain: &dyn DeviceChain, b: &Qwen35Block, slot: usize) -> LayerVec
                 attn_norm: up(attn_norm),
                 post_norm: up(post_norm),
                 mixer: Mixer::Ssm { conv_w: up(ssm_conv1d), a: up(ssm_a), dt: up(ssm_dt_bias), norm: up(ssm_norm), ba_f32, slot },
+                router: router(moe),
             }
         }
     }
@@ -1065,8 +1081,8 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
         } else {
             rec.rmsnorm_rows(&w.x, &lv.attn_norm, &w.xn, t, eps);
         }
-        let (ffn, down) = match (lw, &lv.mixer) {
-            (LayerW::Attention { q, k, v, o, ffn, down }, Mixer::Attention { q_norm, k_norm, slot }) => {
+        let (ffn, down, moe) = match (lw, &lv.mixer) {
+            (LayerW::Attention { q, k, v, o, ffn, down, moe }, Mixer::Attention { q_norm, k_norm, slot }) => {
                 q.rows(rec, &w.xn, &w.qfull, t);
                 k.rows(rec, &w.xn, &w.k, t);
                 v.rows(rec, &w.xn, &w.v, t);
@@ -1096,7 +1112,7 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                     }
                     rec.mul_sigmoid(b.attn, &w.gate, &w.gated, t * s.n_h * s.hd);
                     o.rows(rec, &w.gated, &w.proj, t);
-                    (ffn, down)
+                    (ffn, down, moe)
                 } else {
                 let kvl = &b.kvl[*slot];
                 rec.store_rows(&w.kn, kvl, t, kvd, past, row, 0);
@@ -1123,10 +1139,10 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                 }
                 rec.mul_sigmoid(b.attn, &w.gate, &w.gated, t * s.n_h * s.hd);
                 o.rows(rec, &w.gated, &w.proj, t);
-                (ffn, down)
+                (ffn, down, moe)
                 }
             }
-            (LayerW::Ssm { qkv, gate, ba, out, ffn, down }, Mixer::Ssm { conv_w, a, dt, norm, ba_f32, slot }) => {
+            (LayerW::Ssm { qkv, gate, ba, out, ffn, down, moe }, Mixer::Ssm { conv_w, a, dt, norm, ba_f32, slot }) => {
                 let (state, conv) = &b.states[*slot];
                 qkv.rows(rec, &w.xn, &w.qkv, t);
                 gate.rows(rec, &w.xn, &w.z, t);
@@ -1174,23 +1190,34 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                     }
                 }
                 out.rows(rec, &w.core, &w.proj, t);
-                (ffn, down)
+                (ffn, down, moe)
             }
             _ => unreachable!("a layer's vectors are its block's"),
         };
         rec.add_rmsnorm_rows(&w.x, &w.proj, &lv.post_norm, &w.xn, t, eps);
-        match ffn {
-            FfnW::Fused(gu) => {
-                gu.rows(rec, &w.xn, &w.ffa, t);
-                rec.silu_mul_split_rows(&w.ffa, &w.act, t);
+        match (moe, &lv.router) {
+            // a MoE layer: its router's logits (f32), then its experts routed and summed on the device, the shared one
+            // among them, into the FFN's output
+            (Some(m), Some(router)) => {
+                rec.matmul_f32_rows(router, s.router, s.d, &w.xn, &w.router, t);
+                let routed = rec.moe_routed(&*m.experts, &w.xn, &w.proj, &w.router, m.top_k, t);
+                assert!(routed, "a chained MoE layer's experts route its {t} rows on the device");
             }
-            FfnW::Split(gate, up) => {
-                gate.rows(rec, &w.xn, &w.ffa, t);
-                up.rows(rec, &w.xn, &w.ffb, t);
-                rec.silu_mul(&w.ffa, &w.ffb, &w.act, t * s.ff);
+            _ => {
+                match ffn {
+                    FfnW::Fused(gu) => {
+                        gu.rows(rec, &w.xn, &w.ffa, t);
+                        rec.silu_mul_split_rows(&w.ffa, &w.act, t);
+                    }
+                    FfnW::Split(gate, up) => {
+                        gate.rows(rec, &w.xn, &w.ffa, t);
+                        up.rows(rec, &w.xn, &w.ffb, t);
+                        rec.silu_mul(&w.ffa, &w.ffb, &w.act, t * s.ff);
+                    }
+                }
+                down.rows(rec, &w.act, &w.proj, t);
             }
         }
-        down.rows(rec, &w.act, &w.proj, t);
         *added = true;
     }
 }
@@ -1393,8 +1420,21 @@ impl Qwen35Chain {
                     FfnPair::Fused(w) => held(w),
                     FfnPair::Split { gate, up } => held(gate) && held(up),
                 };
+                // (a MoE layer's experts on this device, routed on it: none on the host, none read from the host's
+                // memory as they run)
+                let moe_held = |moe: &Option<Box<Qwen35Moe>>| {
+                    moe.as_ref().is_none_or(|m| chain.holds_experts(&*m.experts) && !m.experts.on_host() && !m.experts.part_held() && !m.experts.host_rest() && m.router.shape() == [m.router.dim(0), d])
+                };
+                let routers: Vec<usize> = m.blocks.iter().filter_map(|b| match b {
+                    Qwen35Block::Attention { moe, .. } | Qwen35Block::Ssm { moe, .. } => moe.as_ref().map(|m| m.router.dim(0)),
+                }).collect();
+                let router = routers.first().copied().unwrap_or(0);
+                if routers.iter().any(|&r| r != router) || (router > 0 && routers.len() != m.blocks.len()) {
+                    return None;
+                }
                 for b in &m.blocks {
                     let ok = match b {
+                        Qwen35Block::Attention { moe, .. } | Qwen35Block::Ssm { moe, .. } if !moe_held(moe) => false,
                         Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, .. } => {
                             [attn_q, attn_k, attn_v, attn_output, ffn_down].into_iter().all(held)
                                 && attn_q.shape()[0] == 2 * n_h * hd
@@ -1416,7 +1456,7 @@ impl Qwen35Chain {
                     }
                 }
                 let upload = |t: &Tensor| upload_tensor(chain, t);
-                let dims = Dims { d, n_h, n_kv, hd, rot: cfg.rope_dim, ff, nv, nk, dk, dv, ch, kern: sc.conv_kernel, vocab: cfg.vocab_size };
+                let dims = Dims { d, n_h, n_kv, hd, rot: cfg.rope_dim, ff, nv, nk, dk, dv, ch, kern: sc.conv_kernel, vocab: cfg.vocab_size, router, moe_rows: if router > 0 { m.moe_rows } else { 0 } };
                 let (mut attention_layers, mut ssm_layers) = (Vec::new(), Vec::new());
                 let layers = m
                     .blocks
@@ -1441,7 +1481,7 @@ impl Qwen35Chain {
                     convs: ssm_layers.iter().map(|_| chain.vec((sc.conv_kernel - 1) * ch)).collect(),
                 };
                 let spec = m.mtp.as_ref().and_then(|mtp| {
-                    let Qwen35Block::Attention { attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm, attn_v, attn_output, post_norm, ffn_pair, ffn_down } = &mtp.block else { return None };
+                    let Qwen35Block::Attention { attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm, attn_v, attn_output, post_norm, ffn_pair, ffn_down, .. } = &mtp.block else { return None };
                     let ok = [&mtp.eh_proj, attn_q, attn_k, attn_v, attn_output, ffn_down].into_iter().all(held) && pair_held(ffn_pair) && ffn_pair.ff() == ff && attn_q.shape()[0] == 2 * n_h * hd;
                     if !ok {
                         return None;
@@ -1593,6 +1633,8 @@ impl Qwen35Chain {
     /// halves.)
     fn chunks(&self, chain: &dyn DeviceChain, s: &Dims, past: usize, rows: usize) -> Vec<(usize, usize)> {
         let most = if self.second.get().is_some() { MAX_ROWS } else { 2 * MAX_ROWS };
+        // (a MoE model's experts, where its device routes no more at once)
+        let most = if s.moe_rows > 0 { most.min(s.moe_rows) } else { most };
         let mut chunks = Vec::new();
         let mut at = 0;
         while at < rows {

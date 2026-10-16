@@ -180,6 +180,17 @@
       "add": ["MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf", "MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf"]
     },
     {
+      "id": "minicpm-v-4.7-35b-a3b",
+      "group": "llm",
+      "name": "MiniCPM-V 4.7 35B-A3B",
+      "about": "OpenBMB's larger vision model, a mixture of experts (3B of its 35B weights a token): it reads pictures in detail and chats well. Needs a 24 GB GPU (an RTX 4090 runs it at some 120 tokens a second). Its vision projector comes with it.",
+      "license": "Apache-2.0",
+      "size_gb": 22.3,
+      "vram_gb": 23,
+      "parts": [{ "repo": "openbmb/MiniCPM-V-4.7-35B-A3B-gguf", "include": ["MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf", "mmproj-model-f16.gguf"], "into": "MiniCPM-V-4.7-35B-A3B-gguf" }],
+      "add": ["MiniCPM-V-4.7-35B-A3B-gguf/MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf", "MiniCPM-V-4.7-35B-A3B-gguf/mmproj-model-f16.gguf"]
+    },
+    {
       "id": "gemma-3-4b",
       "group": "llm",
       "name": "Gemma 3 4B",

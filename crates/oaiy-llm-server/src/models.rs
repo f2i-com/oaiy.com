@@ -1137,6 +1137,38 @@ impl Models {
     }
 
     // ---------------------------------------------------------------- GGUF
+    /// A Qwen3.5-MoE GGUF (`qwen35moe`) as a Qwen3.5 hybrid with routed experts: each layer's experts held by the GPU's
+    /// kernels (`QuantMoe`: the K-quants, the GSQ-RCO types) where its budget has room, else run on the host; a chained
+    /// run's pieces 64 rows at most where the GPU groups no more of a prompt's rows by expert (no tensor cores).
+    fn qwen35_moe(&self, name: &str, gguf: &gguf::GgufFile, backend: &Arc<dyn ggml_rs::Backend>) -> Result<llama_rs::Model> {
+        #[cfg(feature = "webgpu")]
+        {
+            let b = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().ok_or_else(|| Error::Arg(format!("{name}: a Qwen3.5-MoE model's experts need a GPU (WebGPU)")))?;
+            let on_host = std::sync::atomic::AtomicUsize::new(0);
+            let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
+                let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared };
+                let made = b.quant_experts(data).map_err(llama_rs::LlamaError::Config)?;
+                if made.on_host() {
+                    on_host.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(made)
+            };
+            let mut m = llama_rs::Qwen35Model::from_gguf_with(gguf, Arc::clone(backend), Some(&make)).map_err(|e| Error::Arg(e.to_string()))?;
+            let cores = b.f16_tensor_cores() && std::env::var_os("OAIY_QUANT_MOE_NO_COOP").is_none();
+            m.moe_rows = if cores { 0 } else { 64 };
+            let host = on_host.into_inner();
+            if host > 0 {
+                self.say(format!("{name}: {host} of its {} layers' experts run on the host (no room for them on the GPU)", m.blocks.len()));
+            }
+            Ok(llama_rs::Model::Qwen35(m))
+        }
+        #[cfg(not(feature = "webgpu"))]
+        {
+            let _ = (gguf, backend);
+            Err(Error::Arg(format!("{name}: a Qwen3.5-MoE model's experts need a GPU (the webgpu build)")))
+        }
+    }
+
     fn load_gguf(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
         let path = Kind::gguf_path(&spec.path)?;
@@ -1151,14 +1183,18 @@ impl Models {
         self.say(format!("{} runs on {}", spec.name, picked.label));
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&picked.backend);
         let gguf = gguf::GgufFile::open(&path).map_err(|e| Error::Arg(e.to_string()))?;
-        if gguf.get_str("general.architecture").ok() == Some("qwen35") {
+        // (Qwen3.5-MoE, `qwen35moe`: Qwen3.6-35B-A3B's and MiniCPM-V 4.7 35B-A3B's architecture, the Qwen3.5 hybrid's
+        // layers with routed experts, which a GPU's kernels hold)
+        let moe = gguf.get_str("general.architecture").ok() == Some("qwen35moe");
+        if gguf.get_str("general.architecture").ok() == Some("qwen35") || moe {
             // With a second GPU, a prompt's later layers go to it (copies of their weights and the head): each
             // chunk's first layers run on one as the other runs the chunk before's. The card the host's bytes reach
             // faster carries the model (it moves the more: the cache's rows, the steps), the other the later layers.
+            // (Not a MoE model's: its experts are its card's.)
             #[allow(unused_mut)]
             let (mut backend, mut helper): (Arc<dyn ggml_rs::Backend>, Option<Arc<dyn ggml_rs::Backend>>) = (backend, None);
             #[cfg(feature = "webgpu")]
-            if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
+            if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().filter(|_| !moe) {
                 if let Some(other) = crate::backend::others(o, &devices, b).into_iter().next() {
                     let (mine, theirs) = (b.transfer_rates().0, other.transfer_rates().0);
                     let (bus, other_bus) = (b.adapter().pci_bus_id.clone(), other.adapter().pci_bus_id.clone());
@@ -1169,7 +1205,7 @@ impl Models {
                     helper = Some(if swap { std::mem::replace(&mut backend, other) } else { other });
                 }
             }
-            let mut model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            let mut model = if moe { self.qwen35_moe(&spec.name, &gguf, &backend)? } else { llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))? };
             // Its multi-token-prediction layer, where asked for: it drafts tokens a chained run checks.
             if o.mtp.contains(&spec.name) {
                 if let llama_rs::Model::Qwen35(m) = &mut model {

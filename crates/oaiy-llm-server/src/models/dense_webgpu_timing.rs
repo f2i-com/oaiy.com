@@ -1901,10 +1901,11 @@ fn a_qwen35_prompt_run_whole_answers_as_its_chunks_one_at_a_time() {
     }
 }
 
-/// Qwen3.5's hybrid chained on the GPU (QWEN35_MODEL: the 9B, or Qwen3.8 27B) answers as its host path does: the
-/// same prompt (QWEN35_PROMPT tokens, in chunks of 512 as the server sends them) then 64 greedy steps each way
-/// give the same tokens, every step's logits close (up to where the tokens part, if they do: only at a near tie,
-/// the host's two within a hair, as the prompt's matmuls' f16 sums can tip); and the chain did run.
+/// Qwen3.5's hybrid chained on the GPU (QWEN35_MODEL: the 9B, or Qwen3.8 27B; or a Qwen3.5-MoE one, `qwen35moe`, its
+/// experts the GPU's) answers as its host path does: the same prompt (QWEN35_PROMPT tokens, in chunks of 512 as the
+/// server sends them) then 64 greedy steps each way give the same tokens, every step's logits close (up to where the
+/// tokens part, if they do: only at a near tie, the host's two within a hair, as the prompt's matmuls' f16 sums can
+/// tip); and the chain did run.
 #[test]
 #[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF (E:/models/Qwen3.5-9B-Q4_K_M.gguf, or QWEN35_MODEL)"]
 fn a_chained_qwen35_run_answers_as_the_host_path() {
@@ -1912,9 +1913,20 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     use std::sync::Arc;
     let path = std::env::var("QWEN35_MODEL").unwrap_or_else(|_| r"E:\models\Qwen3.5-9B-Q4_K_M.gguf".into());
     let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+    let gpu = b.clone();
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap();
+    let model = if gguf.get_str("general.architecture").ok() == Some("qwen35moe") {
+        let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared };
+            gpu.quant_experts(data).map_err(llama_rs::LlamaError::Config)
+        };
+        let mut m = llama_rs::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();
+        m.moe_rows = if gpu.f16_tensor_cores() { 0 } else { 64 };
+        llama_rs::Model::Qwen35(m)
+    } else {
+        llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap()
+    };
     let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let n: u32 = std::env::var("QWEN35_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
     let steps: usize = std::env::var("QWEN35_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);

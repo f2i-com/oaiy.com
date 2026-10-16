@@ -69,7 +69,7 @@ pub use qwen3::Qwen3Model;
 pub use qwen3moe::{Qwen3MoeBlock, Qwen3MoeModel};
 // VENDORED-LOCAL: GLM-5.3-Flash
 pub use glm5next::{Glm5NextBlock, Glm5NextConfig, Glm5NextModel, LayerKind};
-pub use qwen35::{Qwen35Block, Qwen35Model, SsmConfig};
+pub use qwen35::{ExpertBlocks, ExpertsMaker, Qwen35Block, Qwen35Model, Qwen35Moe, SsmConfig};
 pub mod multimodal_rope;
 pub use qwen35moe::{Qwen35MoeBlock, Qwen35MoeModel};
 pub use sampler::{SampleParams, Sampler};

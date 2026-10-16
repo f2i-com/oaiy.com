@@ -11,6 +11,8 @@ pub(super) enum Kind {
     IQ2_S,
     IQ2_XXS,
     IQ1_M,
+    Q4_K,
+    Q6_K,
 }
 
 impl Kind {
@@ -20,6 +22,8 @@ impl Kind {
             GgmlType::IQ2_S => Some(Kind::IQ2_S),
             GgmlType::IQ2_XXS => Some(Kind::IQ2_XXS),
             GgmlType::IQ1_M => Some(Kind::IQ1_M),
+            GgmlType::Q4_K => Some(Kind::Q4_K),
+            GgmlType::Q6_K => Some(Kind::Q6_K),
             _ => None,
         }
     }
@@ -30,16 +34,21 @@ impl Kind {
             Kind::IQ2_S => "iq2_s",
             Kind::IQ2_XXS => "iq2_xxs",
             Kind::IQ1_M => "iq1_m",
+            Kind::Q4_K => "q4_k",
+            Kind::Q6_K => "q6_k",
         }
     }
 
-    /// A grid type's block of 256 weights: its bytes in the GGUF, and the words it takes here (padded to whole ones).
+    /// A grid type's (or a K-quant's) block of 256 weights: its bytes in the GGUF, and the words it takes here (padded
+    /// to whole ones).
     fn block(self) -> Option<(usize, usize)> {
         match self {
             Kind::Q2_0 => None,
             Kind::IQ2_S => Some((82, 21)),
             Kind::IQ2_XXS => Some((66, 17)),
             Kind::IQ1_M => Some((56, 14)),
+            Kind::Q4_K => Some((144, 36)),
+            Kind::Q6_K => Some((210, 53)),
         }
     }
 
@@ -94,10 +103,13 @@ impl Kind {
                             }
                             out[16] = u16::from_le_bytes([block[0], block[1]]) as u32;
                         }
-                        // (IQ1_M's fields lie on words' edges as they are: its bytes, little-endian)
+                        // (IQ1_M's and Q4_K's fields lie on words' edges as they are, and Q6_K's but its scale, the
+                        // last two bytes: its bytes, little-endian, the last word padded)
                         _ => {
-                            for (o, c) in out.iter_mut().zip(block.chunks_exact(4)) {
-                                *o = le(c);
+                            for (o, c) in out.iter_mut().zip(block.chunks(4)) {
+                                let mut w = [0u8; 4];
+                                w[..c.len()].copy_from_slice(c);
+                                *o = u32::from_le_bytes(w);
                             }
                         }
                     }
@@ -110,7 +122,7 @@ impl Kind {
     pub(super) fn grid(self) -> Option<(&'static [u64], bool)> {
         use ggml_quants::iq_tables as t;
         match self {
-            Kind::Q2_0 => None,
+            Kind::Q2_0 | Kind::Q4_K | Kind::Q6_K => None,
             Kind::IQ2_S => Some((&t::IQ2S_GRID, false)),
             Kind::IQ2_XXS => Some((&t::IQ2XXS_GRID, false)),
             Kind::IQ1_M => Some((&t::IQ1S_GRID, true)),
@@ -128,6 +140,11 @@ impl Kind {
     /// `fn sub_of(bw: u32, sub: u32) -> Sub`, what the 32 weights `32 sub ..` of the block at `bw` share, and `fn
     /// grp(h: Sub, l: u32) -> array<f32, 8>`, its group `l` of four; `BLOCK_WORDS`; and the grid's binding.
     fn wgsl(self) -> String {
+        match self {
+            Kind::Q4_K => return SUB_Q4_K.to_string(),
+            Kind::Q6_K => return SUB_Q6_K.to_string(),
+            _ => {}
+        }
         let Some((grid, signed)) = self.grid() else { return W8_Q2_0.to_string() };
         let helpers = GRID_HELPERS.replace("LEVELS", &levels_wgsl(grid_codes(grid, signed).1));
         match self {
@@ -260,6 +277,82 @@ fn grp(h: Sub, l: u32) -> array<f32, 8> {
     let dl = select(h.s0, h.s1, l >= 2u);
     let v0 = dl * (levels(e, vec4<u32>(0u, 2u, 4u, 6u)) + delta);
     let v1 = dl * (levels(e, vec4<u32>(8u, 10u, 12u, 14u)) + delta);
+    return array<f32, 8>(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);
+}
+"#;
+
+const SUB_Q4_K: &str = r#"
+// Q4_K, a block 36 words (the GGUF's 144 bytes as they lie): its f16 scale and scale of the mins, twelve bytes of the
+// eight 32s' six-bit scales and mins (ggml's `get_scale_min_k4`), then 128 bytes of nibbles, 32 bytes a pair of 32s (the
+// first's weights their low nibbles, the second's their high). A weight is its nibble times its 32's scale, less its
+// 32's min.
+const BLOCK_WORDS: u32 = 36u;
+struct Sub {
+    q: u32,
+    sh: u32,
+    s: f32,
+    m: f32,
+}
+fn kbyte(bw: u32, i: u32) -> u32 {
+    return (words[bw + i / 4u] >> (8u * (i % 4u))) & 255u;
+}
+fn sub_of(bw: u32, sub: u32) -> Sub {
+    let dm = unpack2x16float(words[bw]);
+    var sc = 0u;
+    var mn = 0u;
+    if (sub < 4u) {
+        sc = kbyte(bw, 4u + sub) & 63u;
+        mn = kbyte(bw, 8u + sub) & 63u;
+    } else {
+        sc = (kbyte(bw, 8u + sub) & 15u) | ((kbyte(bw, sub) >> 6u) << 4u);
+        mn = (kbyte(bw, 8u + sub) >> 4u) | ((kbyte(bw, 4u + sub) >> 6u) << 4u);
+    }
+    return Sub(bw + 4u + 8u * (sub / 2u), 4u * (sub % 2u), dm.x * f32(sc), dm.y * f32(mn));
+}
+fn grp(h: Sub, l: u32) -> array<f32, 8> {
+    let sh = vec4<u32>(0u, 8u, 16u, 24u);
+    let q0 = vec4<f32>((vec4<u32>(words[h.q + 2u * l] >> h.sh) >> sh) & vec4<u32>(15u));
+    let q1 = vec4<f32>((vec4<u32>(words[h.q + 2u * l + 1u] >> h.sh) >> sh) & vec4<u32>(15u));
+    let v0 = h.s * q0 - h.m;
+    let v1 = h.s * q1 - h.m;
+    return array<f32, 8>(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);
+}
+"#;
+
+const SUB_Q6_K: &str = r#"
+// Q6_K, a block 53 words (the GGUF's 210 bytes as they lie, and two of padding): 128 bytes of low nibbles, 64 of the
+// weights' high two bits, sixteen int8 scales (one a 16 weights), its f16 scale. Of a half (128 weights) its 32 `p`:
+// the low nibbles of bytes 32 (p % 2) .. of the half's 64 (p < 2) or their high ones, the high bits the half's 32 bytes'
+// bits 2 p; a weight its six bits less 32, times its 16's scale.
+const BLOCK_WORDS: u32 = 53u;
+struct Sub {
+    ql: u32,
+    qh: u32,
+    sh: u32,
+    hs: u32,
+    s0: f32,
+    s1: f32,
+}
+fn sub_of(bw: u32, sub: u32) -> Sub {
+    let n = sub / 4u;
+    let p = sub % 4u;
+    let d = unpack2x16float(words[bw + 52u]).x;
+    let at = 8u * n + 2u * p;
+    let sw = words[bw + 48u + at / 4u];
+    let b = 8u * (at % 4u);
+    let s0 = f32(bitcast<i32>(sw << (24u - b)) >> 24u);
+    let s1 = f32(bitcast<i32>(sw << (16u - b)) >> 24u);
+    return Sub(bw + 16u * n + 8u * (p % 2u), bw + 32u + 8u * n, 4u * (p / 2u), 2u * p, d * s0, d * s1);
+}
+fn grp(h: Sub, l: u32) -> array<f32, 8> {
+    let sh = vec4<u32>(0u, 8u, 16u, 24u);
+    let lo0 = (vec4<u32>(words[h.ql + 2u * l] >> h.sh) >> sh) & vec4<u32>(15u);
+    let lo1 = (vec4<u32>(words[h.ql + 2u * l + 1u] >> h.sh) >> sh) & vec4<u32>(15u);
+    let hi0 = (vec4<u32>(words[h.qh + 2u * l] >> h.hs) >> sh) & vec4<u32>(3u);
+    let hi1 = (vec4<u32>(words[h.qh + 2u * l + 1u] >> h.hs) >> sh) & vec4<u32>(3u);
+    let s = select(h.s0, h.s1, l >= 2u);
+    let v0 = s * (vec4<f32>(lo0 | (hi0 << vec4<u32>(4u))) - 32.0);
+    let v1 = s * (vec4<f32>(lo1 | (hi1 << vec4<u32>(4u))) - 32.0);
     return array<f32, 8>(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);
 }
 "#;

@@ -431,6 +431,7 @@ fn build(path: &Path, backend: Arc<dyn Backend>, cache_devices: Vec<Arc<dyn Back
                     post_norm,
                     ffn_pair,
                     ffn_down,
+                    moe: None,
                     attn_q: l.weight(&format!("{a}.q_proj"), h, 2 * heads * hd, None, None)?,
                     attn_k: l.weight(&format!("{a}.k_proj"), h, kv * hd, None, None)?,
                     attn_v: l.weight(&format!("{a}.v_proj"), h, kv * hd, None, None)?,
@@ -464,6 +465,7 @@ fn build(path: &Path, backend: Arc<dyn Backend>, cache_devices: Vec<Arc<dyn Back
                     post_norm,
                     ffn_pair,
                     ffn_down,
+                    moe: None,
                     attn_qkv: l.weight(
                         &format!("{a}.in_proj_qkv"),
                         h,
@@ -535,5 +537,6 @@ fn build(path: &Path, backend: Arc<dyn Backend>, cache_devices: Vec<Arc<dyn Back
         backend,
         chain: Default::default(),
         mtp: None,
+        moe_rows: 0,
     }))
 }

@@ -11,14 +11,14 @@ slices, each through a SigLIP tower that merges its tokens inside itself. Two si
 Each projector also comes as `mmproj-model-f16-4x.gguf`: four times the tokens a picture (no merger inside the
 tower), for finer detail.
 
-**Get models → Chat → MiniCPM-V 4.7 1B** fetches the 1B's Q4_K_M file and its projector and adds them as one model; or
-add the two files yourself (the projector attaches to the model). In `oaiy-llm-server`:
+**Get models → Chat → MiniCPM-V 4.7 1B** (or **35B-A3B**) fetches the Q4_K_M file and its projector and adds them as
+one model; or add the two files yourself (the projector attaches to the model). In `oaiy-llm-server`:
 
 ```
 oaiy-llm-server --model MiniCPM-V-4_7-1B-Q4_K_M.gguf --name minicpm-v --vision-projector minicpm-v=mmproj-model-f16.gguf
 ```
 
-Its language model is a Qwen3.5 one, and it chats, thinks and calls tools as Qwen3.5 does.
+Their language models are Qwen3.5 ones: they chat, think and call tools as Qwen3.5 does.
 
 ## A picture
 
@@ -67,6 +67,19 @@ and describe it the same.
 
 ## The 35B-A3B
 
-Its language model is `qwen35moe`, which OAIY's engine does not yet run: Get models does not offer it. On a Mac with
-an eGPU, tinygrad's server in the eGPU plugin runs `qwen35moe` GGUFs on the card (text only: a request with a picture
-goes to OAIY's engine).
+Its language model is Qwen3.5-MoE (`qwen35moe`, as Qwen3.6-35B-A3B's): the Qwen3.5 hybrid's 40 layers (30 gated delta
+nets, 10 gated attention layers), each with 256 routed experts of which 8 a token, softmax-weighted among themselves,
+and a shared expert by its gate's sigmoid. OAIY runs it as a Qwen3.5 model whose layers have routed experts
+(`llama_rs::Qwen35Moe`, loaded by `Qwen35Model::from_gguf_with`): the experts on the GPU in their GGUF blocks
+(`ggml_rs_wgpu::quant_moe`, which now decodes Q4_K and Q6_K, a Q4_K_M file's experts), routed on the GPU, the shared
+expert among them; the router f32. Chained, a layer's FFN is its router's matmul then the experts' routed sums in the
+same submit as the rest of the step. Its weights are 21.3 GB on the GPU: a 24 GB card. A GPU without 16 x 16 tensor
+cores (a Mac's) groups no more than 64 of a prompt's rows by expert at once, and a chained run takes its prompt in
+pieces of 64 there.
+
+RTX 4090 (eGPU), Q4_K_M with its projector: loaded in 2 minutes from an external SSD, all of it on the card; a reply at
+about 120 tokens a second; a question about the 800 x 1344 picture (seven tiles, 487 prompt tokens) read in 5.4 s,
+about the 1024 x 512 one (three tiles, 223 tokens) in 0.9 s. tinygrad's own `qwen35moe` (the eGPU plugin's server,
+9 tokens a second) gives the same greedy reply to the same question, word for word.
+`models::dense_webgpu_timing::a_chained_qwen35_run_answers_as_the_host_path` takes a Qwen3.5-MoE GGUF too (`QWEN35_MODEL`): a
+prompt and greedy steps chained and op by op.

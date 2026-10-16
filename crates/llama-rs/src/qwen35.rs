@@ -119,9 +119,12 @@ pub enum Qwen35Block {
         /// `attn_post_norm` in qwen3next.cpp; equivalent to qwen3's `ffn_norm`).
         post_norm:    Tensor,
         /// FFN: SwiGLU (gate + up + down) — gate and up are auto-fused into
-        /// one matmul at load time, halved by `silu_mul_split`.
+        /// one matmul at load time, halved by `silu_mul_split`. A MoE layer's:
+        /// its shared expert's (see `moe`).
         ffn_pair:     FfnPair,
         ffn_down:     Weight,
+        /// VENDORED-LOCAL: a Qwen3.5-MoE layer's routed experts ([`Qwen35Moe`]), which then are the FFN.
+        moe:          Option<Box<Qwen35Moe>>,
     },
     /// Standard multi-head attention block with MRoPE. Same shape conventions
     /// as Qwen 3 dense, plus per-head Q/K-norm.
@@ -137,8 +140,46 @@ pub enum Qwen35Block {
         post_norm:    Tensor,
         ffn_pair:     FfnPair,
         ffn_down:     Weight,
+        moe:          Option<Box<Qwen35Moe>>,
     },
 }
+
+/// VENDORED-LOCAL: a Qwen3.5-MoE layer's FFN (`qwen35moe`: Qwen3.6-35B-A3B's, MiniCPM-V 4.7 35B-A3B's). The router's
+/// logits (`[experts + 1, hidden]`, f32: the routed experts' rows, then the shared expert's gate,
+/// `ffn_gate_inp_shexp`) send each row to `top_k` experts, softmax-weighted among themselves, and the shared expert by
+/// its gate's sigmoid ([`ggml_rs::exl3::route`]); `experts` holds them all, the shared one too, and sums them. The
+/// block's `ffn_pair` and `ffn_down` are the shared expert's, for what reads a block's FFN shape.
+#[derive(Debug)]
+pub struct Qwen35Moe {
+    pub router: Tensor,
+    pub experts: Box<dyn ggml_rs::exl3::Experts>,
+    pub top_k: usize,
+}
+
+impl Qwen35Moe {
+    /// The layer's FFN of `x` (`[rows, hidden]`, normed), op by op: the router, then the experts.
+    pub fn forward(&self, backend: &dyn Backend, x: &Tensor) -> Tensor {
+        let logits = backend.linear(x, &self.router);
+        self.experts.forward(x, &logits, self.top_k)
+    }
+}
+
+/// VENDORED-LOCAL: a MoE layer's experts as its GGUF holds them: the routed ones' blocks as they are (gate and up
+/// `[experts][ff][hidden]`, down `[experts][hidden][ff]`), the shared one dequantised (gate and up `[ff, hidden]`, down
+/// `[hidden, ff]`); what an [`ExpertsMaker`] makes a layer's [`ggml_rs::exl3::Experts`] of.
+pub struct ExpertBlocks {
+    pub hidden: usize,
+    pub ff: usize,
+    pub experts: usize,
+    pub gate: (ggml_quants::GgmlType, Vec<u8>),
+    pub up: (ggml_quants::GgmlType, Vec<u8>),
+    pub down: (ggml_quants::GgmlType, Vec<u8>),
+    pub shared: [Vec<f32>; 3],
+}
+
+/// VENDORED-LOCAL: what holds a MoE model's experts (its layer, and the experts' blocks): a backend's (the GPU's
+/// kernels), which only its caller knows.
+pub type ExpertsMaker<'a> = &'a (dyn Fn(usize, ExpertBlocks) -> Result<Box<dyn ggml_rs::exl3::Experts>> + Sync);
 
 /// SSM hyperparameters, parsed from the `qwen35.ssm.*` metadata namespace.
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +216,9 @@ pub struct Qwen35Model {
     /// put here where asked for ([`Self::load_mtp`]; the server's `--mtp`), as a check of several rows costs nearly
     /// twice a step's one with the K-quants' kernels.
     pub mtp: Option<Qwen35Mtp>,
+    /// VENDORED-LOCAL: a MoE model's (its layers' [`Qwen35Moe`]): the rows a chained run's piece takes at most, where
+    /// its device routes no more on the GPU at once (its experts' kernels without tensor cores: 64); 0 as the chain's.
+    pub moe_rows: usize,
 }
 
 /// VENDORED-LOCAL: the multi-token-prediction layer (`blk.{n_layers}`, `nextn_predict_layers` 1): the next token's
@@ -274,6 +318,7 @@ impl Qwen35Model {
             post_norm: t("post_attention_norm.weight")?,
             ffn_pair: FfnPair::Split { gate: w("ffn_gate.weight")?, up: w("ffn_up.weight")? },
             ffn_down: w("ffn_down.weight")?,
+            moe: None,
         };
         Ok(Some(Qwen35Mtp { enorm: t("nextn.enorm.weight")?, hnorm: t("nextn.hnorm.weight")?, eh_proj: w("nextn.eh_proj.weight")?, head_norm: t("nextn.shared_head_norm.weight")?, block }))
     }
@@ -308,22 +353,19 @@ impl Qwen35Model {
     }
 
     pub fn from_gguf(g: &GgufFile, backend: Arc<dyn Backend>) -> Result<Self> {
-        // MoE detection: Qwen3.6-35B-A3B uses arch=qwen35 + `qwen35.expert_count > 0`.
-        // The dense Qwen3.5/3.6 loader doesn't handle per-expert FFN tensors,
-        // so we bail with a clear pointer to #88 instead of a missing-tensor crash.
-        if let Ok(n_experts) = g.get_u64("qwen35.expert_count") {
-            if n_experts > 0 {
-                let used = g.get_u64("qwen35.expert_used_count").unwrap_or(0);
-                return Err(LlamaError::Config(format!(
-                    "Qwen3.6-MoE detected ({n_experts} experts, top-{used}). \
-                     Needs the SSM hybrid (existing Qwen3.5/3.6 path) + MoE FFN \
-                     (existing infra) combined into a single forward. Loader \
-                     integration pending (task #88). MoeFfn infra is in \
-                     `llama_rs::moe` and works on real GGUFs (Qwen3-30B-A3B + \
-                     Mixtral 8x7B), but Qwen3.6-MoE additionally needs the \
-                     gated-deltanet-vs-attention layer split per qwen35.full_attention_interval."
-                )));
-            }
+        Self::from_gguf_with(g, backend, None)
+    }
+
+    /// VENDORED-LOCAL: [`Self::from_gguf`], a Qwen3.5-MoE model's (`qwen35moe`, or `qwen35` with experts) too: each
+    /// layer's routed experts made by `experts` (a backend's), its router and shared expert read here.
+    pub fn from_gguf_with(g: &GgufFile, backend: Arc<dyn Backend>, experts: Option<ExpertsMaker<'_>>) -> Result<Self> {
+        let arch = g.architecture()?.to_string();
+        let n_experts = g.get_u64(&format!("{arch}.expert_count")).unwrap_or(0) as usize;
+        let top_k = g.get_u64(&format!("{arch}.expert_used_count")).unwrap_or(0) as usize;
+        if n_experts > 0 && (experts.is_none() || top_k == 0 || top_k > n_experts) {
+            return Err(LlamaError::Config(format!(
+                "a Qwen3.5-MoE model ({n_experts} experts, {top_k} a token) needs its experts held by a GPU's kernels (the server's), which load it as `Qwen35MoeModel` here"
+            )));
         }
         let config = ModelConfig::from_gguf(g)?;
         let tokenizer = Tokenizer::from_gguf(g)?;
@@ -331,7 +373,7 @@ impl Qwen35Model {
 
         // ----- SSM hyperparameters --------------------------------------
         let get = |suffix: &str| -> Result<u64> {
-            Ok(g.get_u64(&format!("qwen35.{suffix}"))?)
+            Ok(g.get_u64(&format!("{arch}.{suffix}"))?)
         };
         let ssm_cfg = SsmConfig {
             conv_kernel:    get("ssm.conv_kernel")?     as usize,
@@ -342,7 +384,7 @@ impl Qwen35Model {
         };
 
         // ----- Attention layer mask --------------------------------------
-        let interval = g.get_u64("qwen35.full_attention_interval")
+        let interval = g.get_u64(&format!("{arch}.full_attention_interval"))
             .map(|v| v as usize).unwrap_or(4);
         let attention_layers: Vec<bool> = (0..config.n_layers)
             .map(|i| i % interval == interval - 1)
@@ -381,8 +423,10 @@ impl Qwen35Model {
         // VENDORED-LOCAL: a layer's FFN gate and up fused into one weight, on the device; where that one is past the
         // device's budget and sent to it as it is used, the two halves as the file maps them instead (the fused copy
         // was the host's memory, held; the file's pages the system keeps or reads again from the drive)
+        // (a MoE layer's: its shared expert's)
+        let shexp = if n_experts > 0 { "_shexp" } else { "" };
         let ffn_pair = |i: usize| -> Result<FfnPair> {
-            let take = |name: &str| idx.take_weight(&format!("blk.{i}.{name}.weight"), &[]);
+            let take = |name: &str| idx.take_weight(&format!("blk.{i}.{name}{shexp}.weight"), &[]);
             if backend.streams_weights() {
                 return Ok(FfnPair::Split { gate: take("ffn_gate")?, up: take("ffn_up")? });
             }
@@ -393,6 +437,39 @@ impl Qwen35Model {
             }
             drop(fused);
             Ok(FfnPair::Split { gate: take("ffn_gate")?, up: take("ffn_up")? }.try_to_device(&*backend, VRAM_SAFETY_MARGIN_BYTES))
+        };
+        let ffn_down = |i: usize| idx.take_weight(&format!("blk.{i}.ffn_down{shexp}.weight"), &[]);
+        // a MoE layer's experts: the routed ones' blocks to the maker, the shared one's and the router's values here
+        let moe = |i: usize| -> Result<Option<Box<Qwen35Moe>>> {
+            let Some(make) = experts.filter(|_| n_experts > 0) else { return Ok(None) };
+            let h = config.embedding_dim;
+            let info = |name: &str| g.tensor_by_name(&format!("blk.{i}.{name}.weight")).ok_or_else(|| LlamaError::Config(format!("blk.{i}.{name}.weight is missing")));
+            let raw = |name: &str| -> Result<(ggml_quants::GgmlType, Vec<u8>)> {
+                let t = info(name)?;
+                Ok((t.dtype, g.tensor_bytes(t)?.into_owned()))
+            };
+            let values = |name: &str| -> Result<Vec<f32>> {
+                let t = info(name)?;
+                let mut out = vec![0f32; t.numel() as usize];
+                ggml_quants::dequantize(t.dtype, &g.tensor_bytes(t)?, &mut out).map_err(|e| LlamaError::Config(format!("blk.{i}.{name}: {e}")))?;
+                Ok(out)
+            };
+            let ff = info("ffn_gate_exps")?.numel() as usize / (n_experts * h);
+            let blocks = ExpertBlocks {
+                hidden: h,
+                ff,
+                experts: n_experts,
+                gate: raw("ffn_gate_exps")?,
+                up: raw("ffn_up_exps")?,
+                down: raw("ffn_down_exps")?,
+                shared: [values("ffn_gate_shexp")?, values("ffn_up_shexp")?, values("ffn_down_shexp")?],
+            };
+            let mut router = values("ffn_gate_inp")?;
+            router.extend(values("ffn_gate_inp_shexp")?);
+            if router.len() != (n_experts + 1) * h {
+                return Err(LlamaError::Config(format!("blk.{i}: a router of {} values, not {} x {h}", router.len(), n_experts + 1)));
+            }
+            Ok(Some(Box::new(Qwen35Moe { router: backend.to_device(Tensor::from_vec(router, vec![n_experts + 1, h])), experts: make(i, blocks)?, top_k })))
         };
         let mut blocks = Vec::with_capacity(config.n_layers);
         for (i, &is_attn) in attention_layers.iter().enumerate() {
@@ -407,7 +484,8 @@ impl Qwen35Model {
                     attn_output: idx.take_weight(&format!("blk.{i}.attn_output.weight"), &[])?,
                     post_norm:   idx.take(&format!("blk.{i}.post_attention_norm.weight"), &[])?,
                     ffn_pair:    ffn_pair(i)?,
-                    ffn_down:    idx.take_weight(&format!("blk.{i}.ffn_down.weight"), &[])?,
+                    ffn_down:    ffn_down(i)?,
+                    moe:         moe(i)?,
                 }
             } else {
                 let ssm_alpha = idx.take_weight(&format!("blk.{i}.ssm_alpha.weight"), &[])?;
@@ -425,7 +503,8 @@ impl Qwen35Model {
                     ssm_out:     idx.take_weight(&format!("blk.{i}.ssm_out.weight"), &[])?,
                     post_norm:   idx.take(&format!("blk.{i}.post_attention_norm.weight"), &[])?,
                     ffn_pair:    ffn_pair(i)?,
-                    ffn_down:    idx.take_weight(&format!("blk.{i}.ffn_down.weight"), &[])?,
+                    ffn_down:    ffn_down(i)?,
+                    moe:         moe(i)?,
                 }
             };
             // each layer to the device as it is read (all of them read first held every layer's fused FFN copy at once:
@@ -437,7 +516,7 @@ impl Qwen35Model {
             config, ssm_cfg, attention_layers,
             tokenizer, blocks,
             tok_embd, packed_tok_embd, int8_tok_embd: None, cache_backends: Vec::new(), output_norm, output,
-            backend, chain: Default::default(), mtp: None,
+            backend, chain: Default::default(), mtp: None, moe_rows: 0,
         })
     }
 
@@ -609,7 +688,7 @@ impl Qwen35Model {
                 }
                 Qwen35Block::Ssm { attn_norm, attn_qkv, attn_gate, ssm_conv1d, ssm_a,
                                    ssm_ba, ssm_dt_bias, ssm_norm, ssm_out,
-                                   post_norm, ffn_pair, ffn_down } => {
+                                   post_norm, ffn_pair, ffn_down, moe } => {
                     // ----- Pre-block RMSNorm + on-device input projections -----
                     let xn = ops::rmsnorm(backend, &x, attn_norm, cfg.rms_eps);
                     let mixed_qkv = attn_qkv.linear(backend, &xn);   // [seq, 8192]
@@ -659,8 +738,10 @@ impl Qwen35Model {
                     // ----- Output projection + fused residual+pre-FFN norm + FFN ---
                     let attn_proj = ssm_out.linear(backend, &attn_out_dev);
                     let xn2 = ops::add_inplace_then_rmsnorm(backend, &mut x, &attn_proj, post_norm, cfg.rms_eps);
-                    let activated = ffn_pair.swiglu(backend, &xn2);
-                    let ffn_out = ffn_down.linear(backend, &activated);
+                    let ffn_out = match moe {
+                        Some(m) => m.forward(backend, &xn2),
+                        None => ffn_down.linear(backend, &ffn_pair.swiglu(backend, &xn2)),
+                    };
                     ops::add_inplace(backend, &mut x, &ffn_out);
                 }
             }
@@ -674,7 +755,7 @@ impl Qwen35Model {
     /// op by op: [`Self::forward_embeds_host`]'s, and the multi-token-prediction layer's.
     #[allow(clippy::too_many_arguments)]
     fn attention_block_host(&self, blk: &Qwen35Block, layer: usize, x: &mut Tensor, seq: usize, kv: &mut KvCache, positions: &[u32], multimodal: Option<&[[u32; 3]]>) {
-        let Qwen35Block::Attention { attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm, attn_v, attn_output, post_norm, ffn_pair, ffn_down } = blk else {
+        let Qwen35Block::Attention { attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm, attn_v, attn_output, post_norm, ffn_pair, ffn_down, moe } = blk else {
             unreachable!("an attention block")
         };
         let cfg = &self.config;
@@ -744,8 +825,10 @@ impl Qwen35Model {
         // FFN (SwiGLU). post_attention_norm is the *pre-FFN* norm
         // (qwen3next convention; equivalent to qwen3's ffn_norm).
         let xn2 = ops::add_inplace_then_rmsnorm(backend, x, &attn_proj, post_norm, cfg.rms_eps);
-        let activated = ffn_pair.swiglu(backend, &xn2);
-        let ffn_out = ffn_down.linear(backend, &activated);
+        let ffn_out = match moe {
+            Some(m) => m.forward(backend, &xn2),
+            None => ffn_down.linear(backend, &ffn_pair.swiglu(backend, &xn2)),
+        };
         ops::add_inplace(backend, x, &ffn_out);
     }
 
@@ -1118,7 +1201,7 @@ fn upload_block(b: Qwen35Block, backend: &dyn Backend) -> Qwen35Block {
     match b {
         Qwen35Block::Attention {
             attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm, attn_v,
-            attn_output, post_norm, ffn_pair, ffn_down,
+            attn_output, post_norm, ffn_pair, ffn_down, moe,
         } => Qwen35Block::Attention {
             attn_norm:   backend.to_device(attn_norm),
             attn_q:      attn_q.try_to_device(backend, m),
@@ -1130,10 +1213,11 @@ fn upload_block(b: Qwen35Block, backend: &dyn Backend) -> Qwen35Block {
             post_norm:   backend.to_device(post_norm),
             ffn_pair:    ffn_pair.try_to_device(backend, m),
             ffn_down:    ffn_down.try_to_device(backend, m),
+            moe,
         },
         Qwen35Block::Ssm {
             attn_norm, attn_qkv, attn_gate, ssm_conv1d, ssm_a, ssm_ba,
-            ssm_dt_bias, ssm_norm, ssm_out, post_norm, ffn_pair, ffn_down,
+            ssm_dt_bias, ssm_norm, ssm_out, post_norm, ffn_pair, ffn_down, moe,
         } => Qwen35Block::Ssm {
             attn_norm:   backend.to_device(attn_norm),
             attn_qkv:    attn_qkv.try_to_device(backend, m),
@@ -1150,6 +1234,7 @@ fn upload_block(b: Qwen35Block, backend: &dyn Backend) -> Qwen35Block {
             post_norm:   backend.to_device(post_norm),
             ffn_pair:    ffn_pair.try_to_device(backend, m),
             ffn_down:    ffn_down.try_to_device(backend, m),
+            moe,
         },
     }
 }
