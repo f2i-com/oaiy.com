@@ -1905,7 +1905,11 @@ fn a_qwen35_prompt_run_whole_answers_as_its_chunks_one_at_a_time() {
 /// experts the GPU's) answers as its host path does: the same prompt (QWEN35_PROMPT tokens, in chunks of 512 as the
 /// server sends them) then 64 greedy steps each way give the same tokens, every step's logits close (up to where the
 /// tokens part, if they do: only at a near tie, the host's two within a hair, as the prompt's matmuls' f16 sums can
-/// tip); and the chain did run.
+/// tip); and the chain did run. A MoE model's within a percent, its tokens parting where both paths' two are within a
+/// quarter of a logit: a layer's top 8 of its experts tips where the paths' sums differ in their last bits (the
+/// chain's f16 cache and sums), and a row with another expert is another row (MiniCPM-V 4.7 35B-A3B on an RTX
+/// 4090, 600 prompt tokens: the prompt's logits at 0.99971, the first step's 0.99531, the tokens parting there with the
+/// host's two 0.11 apart and the chain's 0.03; its chained replies are tinygrad's word for word).
 #[test]
 #[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF (E:/models/Qwen3.5-9B-Q4_K_M.gguf, or QWEN35_MODEL)"]
 fn a_chained_qwen35_run_answers_as_the_host_path() {
@@ -1972,12 +1976,21 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     let upto = first_diff.map_or(each.len(), |i| i + 1);
     let worst = each[..upto].iter().copied().fold(1.0f64, f64::min);
     eprintln!("prompt {n}: host {host_s:.2} s, chained {chain_s:.2} s ({runs} runs) for {steps} steps; prompt logits cosine {:.6}, worst {worst:.6}; first differing token {first_diff:?}", each[0]);
+    eprintln!("  each step's cosine up to there: {:?}", each[..upto].iter().map(|c| format!("{c:.5}")).collect::<Vec<_>>());
+    // where the tokens part, how far apart the two are by each path's own logits
+    let gaps = first_diff.map(|i| {
+        let (h, c) = (&host_logits[i], &chain_logits[i]);
+        let (ht, ct) = (host_tokens[i] as usize, chain_tokens[i] as usize);
+        (i, h[ht] - h[ct], c[ct] - c[ht])
+    });
+    if let Some((i, host_gap, chain_gap)) = gaps {
+        eprintln!("  at step {i} the host's logit of its token {} is {host_gap:.4} above the chain's {}; by the chain's logits, {chain_gap:.4} the other way", host_tokens[i], chain_tokens[i]);
+    }
     assert!(runs > prompt.len().div_ceil(512), "the chain ran ({runs} runs)");
-    assert!(worst >= 0.9999, "{worst}");
-    if let Some(i) = first_diff {
-        let h = &host_logits[i];
-        let gap = h[host_tokens[i] as usize] - h[chain_tokens[i] as usize];
-        eprintln!("  at step {i} the host's logit of its token {} is {gap:.4} above the chain's {}", host_tokens[i], chain_tokens[i]);
-        assert!(gap < 0.05, "the tokens part where the host's two are {gap} apart");
+    let moe = m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Attention { moe: Some(_), .. } | llama_rs::Qwen35Block::Ssm { moe: Some(_), .. }));
+    let (agree, tie) = if moe { (0.99, 0.25) } else { (0.9999, 0.05) };
+    assert!(worst >= agree, "{worst}");
+    if let Some((_, host_gap, chain_gap)) = gaps {
+        assert!(host_gap < tie && (!moe || chain_gap < tie), "the tokens part where the host's two are {host_gap} apart, the chain's {chain_gap}");
     }
 }

@@ -82,4 +82,7 @@ about 120 tokens a second; a question about the 800 x 1344 picture (seven tiles,
 about the 1024 x 512 one (three tiles, 223 tokens) in 0.9 s. tinygrad's own `qwen35moe` (the eGPU plugin's server,
 9 tokens a second) gives the same greedy reply to the same question, word for word.
 `models::dense_webgpu_timing::a_chained_qwen35_run_answers_as_the_host_path` takes a Qwen3.5-MoE GGUF too (`QWEN35_MODEL`): a
-prompt and greedy steps chained and op by op.
+prompt and greedy steps chained and op by op. On the 4090, 600 prompt tokens: chained 1.95 s against 5.7 s op by op, the
+prompt's logits at cosine 0.99971; the two part at the first step, where both paths' two likeliest tokens are within
+0.11 of a logit (a layer's top 8 of 256 experts tips on the last bits of a sum), so a MoE model is held to a cosine of
+0.99 and such a near tie, a dense one to 0.9999.
