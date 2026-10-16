@@ -32,6 +32,37 @@ pub(crate) fn mat(store: &mut Store, gpu: &WgpuBackend, key: &str) -> Result<Mat
     Ok(Mat { w, n, k })
 }
 
+impl Mat {
+    /// `y` (`[rows, n]`) = `x` (`[rows, k]`) times the matrix's transpose.
+    fn run(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        r.matmul_f16_rows(&self.w, self.n, self.k, x, y, rows);
+    }
+}
+
+/// The matrices `keys` (each `[n_i, k]`) one above the next, as one f16 matrix (`[sum n_i, k]`): a layer's gate and up
+/// projections, multiplied in one dispatch where they were two.
+pub(crate) fn mat_rows(store: &mut Store, gpu: &WgpuBackend, keys: &[&str]) -> Result<Mat> {
+    let (mut words, mut n, mut cols) = (Vec::new(), 0, None);
+    for key in keys {
+        let shape = store.index.get(key).ok_or_else(|| err(format!("no {key}")))?.shape.clone();
+        let &[rows, k] = shape.as_slice() else { return Err(err(format!("{key}: a matrix of {shape:?}"))) };
+        if cols.is_some_and(|c| c != k) {
+            return Err(err(format!("{key}: {k} columns, not the others' {cols:?}")));
+        }
+        cols = Some(k);
+        let w = match store.bf16_bytes(key)? {
+            Some(b) => f16_words(&b),
+            None => f16_words_f32(&store.tensor_f32(key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
+        }
+        .ok_or_else(|| err(format!("{key}: past f16's range")))?;
+        words.extend(w);
+        n += rows;
+    }
+    let w = gpu.vec(words.len());
+    gpu.upload(&w, &words);
+    Ok(Mat { w, n, k: cols.unwrap_or(0) })
+}
+
 /// `key`'s values as f32 on `gpu`.
 pub(crate) fn vector(store: &mut Store, gpu: &WgpuBackend, key: &str) -> Result<DeviceVec> {
     let v = store.tensor_f32(key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
@@ -49,8 +80,8 @@ struct Layer {
     k_norm: DeviceVec,
     input_norm: DeviceVec,
     post_norm: DeviceVec,
-    gate: Mat,
-    up: Mat,
+    /// The gate's rows, then the up projection's (`[2 ff, hidden]`): SwiGLU's halves.
+    gate_up: Mat,
     down: Mat,
 }
 
@@ -82,12 +113,11 @@ impl WgpuQwen3 {
                 k_norm: vector(store, gpu, &format!("{l}.self_attn.k_norm.weight"))?,
                 input_norm: vector(store, gpu, &format!("{l}.input_layernorm.weight"))?,
                 post_norm: vector(store, gpu, &format!("{l}.post_attention_layernorm.weight"))?,
-                gate: mat(store, gpu, &format!("{l}.mlp.gate_proj.weight"))?,
-                up: mat(store, gpu, &format!("{l}.mlp.up_proj.weight"))?,
+                gate_up: mat_rows(store, gpu, &[&format!("{l}.mlp.gate_proj.weight"), &format!("{l}.mlp.up_proj.weight")])?,
                 down: mat(store, gpu, &format!("{l}.mlp.down_proj.weight"))?,
             });
         }
-        let (hidden, ff) = (out.first().map_or(0, |l| l.q.k), out.first().map_or(0, |l| l.gate.n));
+        let (hidden, ff) = (out.first().map_or(0, |l| l.q.k), out.first().map_or(0, |l| l.gate_up.n / 2));
         if out.iter().any(|l| l.q.n != heads * head_dim || l.k.n != kv_heads * head_dim || l.o.n != hidden || l.down.n != hidden) {
             return Err(err("the layers' shapes are not the configuration's"));
         }
@@ -134,8 +164,6 @@ impl WgpuQwen3 {
             Some(at) => at,
             None => {
                 let v = |n: usize| gpu.vec(n);
-                let one = v(1);
-                gpu.upload(&one, &[1.0]);
                 let att = v(gpu.attention_rows_out_len(t, nq, hd, cache.capacity));
                 cache.scratch.push(Scratch {
                     rows: t,
@@ -148,15 +176,13 @@ impl WgpuQwen3 {
                     kn: v(t * nkv * hd),
                     att,
                     o: v(t * h),
-                    g: v(t * self.ff),
-                    u: v(t * self.ff),
+                    gu: v(t * 2 * self.ff),
                     act: v(t * self.ff),
-                    one,
                 });
                 cache.scratch.len() - 1
             }
         };
-        let Scratch { td, n, q, k, vv, qn, kn, att, o, g, u, act, one, .. } = &cache.scratch[at];
+        let Scratch { td, n, q, k, vv, qn, kn, att, o, gu, act, .. } = &cache.scratch[at];
         let wider;
         let att = if att.len >= gpu.attention_rows_out_len(t, nq, hd, past + t) {
             att
@@ -166,29 +192,29 @@ impl WgpuQwen3 {
         };
         r.copy(&cache.rope, past * hd, td, 0, t * hd);
         r.copy(x, 0, out, 0, t * h);
-        for (l, kv) in self.layers.iter().zip(&cache.kv) {
-            r.rmsnorm_rows(out, &l.input_norm, &n, t, self.eps);
-            r.matmul_f16_rows(&l.q.w, l.q.n, l.q.k, &n, &q, t);
-            r.matmul_f16_rows(&l.k.w, l.k.n, l.k.k, &n, &k, t);
-            r.matmul_f16_rows(&l.v.w, l.v.n, l.v.k, &n, &vv, t);
-            r.rmsnorm_rows(&q, &l.q_norm, &qn, t * nq, self.eps);
-            r.rmsnorm_rows(&k, &l.k_norm, &kn, t * nkv, self.eps);
-            r.rope_rows(&qn, t, nq, hd, &td, true);
-            r.rope_rows(&kn, t, nkv, hd, &td, true);
-            r.store_rows(&kn, kv, t, nkv * hd, past, 2 * nkv * hd, 0);
-            r.store_rows(&vv, kv, t, nkv * hd, past, 2 * nkv * hd, nkv * hd);
-            r.attention_rows(&qn, kv, &att, t, nq, nkv, hd, past, None, 1.0 / (hd as f32).sqrt());
-            r.matmul_f16_rows(&l.o.w, l.o.n, l.o.k, &att, &o, t);
-            r.axpy_at(out, &o, &one, 0, t * h);
-            r.rmsnorm_rows(out, &l.post_norm, &n, t, self.eps);
-            r.matmul_f16_rows(&l.gate.w, l.gate.n, l.gate.k, &n, &g, t);
-            r.matmul_f16_rows(&l.up.w, l.up.n, l.up.k, &n, &u, t);
-            r.silu_mul(&g, &u, &act, t * self.ff);
-            r.matmul_f16_rows(&l.down.w, l.down.n, l.down.k, &act, &o, t);
-            r.axpy_at(out, &o, &one, 0, t * h);
+        // (each residual's add and the norm after it in one: the attention's and the post-attention norm, the MLP's
+        // and the next layer's input norm, or the final norm after the last; the first layer's input norm before)
+        r.rmsnorm_rows(out, self.layers.first().map_or(&self.norm, |l| &l.input_norm), n, t, self.eps);
+        for (i, (l, kv)) in self.layers.iter().zip(&cache.kv).enumerate() {
+            l.q.run(r, n, q, t);
+            l.k.run(r, n, k, t);
+            l.v.run(r, n, vv, t);
+            r.rmsnorm_rows(q, &l.q_norm, qn, t * nq, self.eps);
+            r.rmsnorm_rows(k, &l.k_norm, kn, t * nkv, self.eps);
+            r.rope_rows(qn, t, nq, hd, td, true);
+            r.rope_rows(kn, t, nkv, hd, td, true);
+            r.store_rows(kn, kv, t, nkv * hd, past, 2 * nkv * hd, 0);
+            r.store_rows(vv, kv, t, nkv * hd, past, 2 * nkv * hd, nkv * hd);
+            r.attention_rows(qn, kv, att, t, nq, nkv, hd, past, None, 1.0 / (hd as f32).sqrt());
+            l.o.run(r, att, o, t);
+            r.add_rmsnorm_rows(out, o, &l.post_norm, n, t, self.eps);
+            l.gate_up.run(r, n, gu, t);
+            r.silu_mul_split_rows(gu, act, t);
+            l.down.run(r, act, o, t);
+            let next = self.layers.get(i + 1).map_or(&self.norm, |l| &l.input_norm);
+            r.add_rmsnorm_rows(out, o, next, n, t, self.eps);
         }
-        r.rmsnorm_rows(out, &self.norm, &n, t, self.eps);
-        r.copy(&n, 0, out, 0, t * h);
+        r.copy(n, 0, out, 0, t * h);
         cache.len += t;
     }
 }
@@ -216,8 +242,7 @@ struct Scratch {
     kn: DeviceVec,
     att: DeviceVec,
     o: DeviceVec,
-    g: DeviceVec,
-    u: DeviceVec,
+    /// The gate's and the up projection's outputs side by side (`[t, 2 ff]`).
+    gu: DeviceVec,
     act: DeviceVec,
-    one: DeviceVec,
 }

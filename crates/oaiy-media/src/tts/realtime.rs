@@ -437,7 +437,8 @@ mod tests {
     /// The Base model speaking two lines in a voice on WebGPU, streamed (`--ignored --nocapture`; `OAIY_TTS` the
     /// model's folder, `OAIY_TTS_VOICE` a saved voice's `.voice.json`): that it speaks, and how fast.
     /// A frame's codes drawn on the device (`Draws::Auto`: one submission a frame) are the host's (`Draws::Host`: a
-    /// round trip a code) where both draw the largest: the same line, sample for sample.
+    /// round trip a code) where both draw the largest: a line's first 40 frames, every one of their 16 codes. (Its
+    /// sound would not tell: a greedy line in this voice is silence.)
     #[test]
     #[ignore = "needs a Qwen3-TTS Base model, a saved voice and a WebGPU adapter"]
     fn codes_drawn_on_the_device_are_the_hosts() -> Result<()> {
@@ -445,17 +446,23 @@ mod tests {
         let device = std::env::var("OAIY_TTS_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut tts = WgpuTts::load(&dir, device)?;
         let voice = Voice::open(Path::new(&std::env::var("OAIY_TTS_VOICE").map_err(err)?)).map_err(err)?;
-        tts.options.sampling.greedy = true;
-        tts.options.max_seconds = 3.0;
-        let mut lines = Vec::new();
+        let text_ids = oaiy_tts::text::encode(&tts.tokenizer, "Thanks for calling, how can I help? We are open until five today.")?;
+        let ref_ids = oaiy_tts::text::encode(&tts.tokenizer, &voice.ref_text)?;
+        let language = tts.talker.language_id(&voice.language)?;
+        let mut drawn = Vec::new();
         for draws in [oaiy_tts::talker::Draws::Host, oaiy_tts::talker::Draws::Auto] {
-            tts.options.sampling.draws = draws;
-            let mut pcm: Vec<i16> = Vec::new();
-            let r = tts.speak("Thanks for calling, how can I help?", &voice, &AtomicBool::new(false), |c| pcm.extend_from_slice(c))?;
-            eprintln!("{draws:?}: {} frames, {:.2} s in {:.2} s", r.frames, r.audio_seconds, r.total_seconds);
-            lines.push(pcm);
+            let (prefill, trailing) = tts.talker.prefill_clone(&text_ids, &ref_ids, &voice, language)?;
+            let sampling = oaiy_tts::talker::Sampling { greedy: true, draws, ..oaiy_tts::talker::Sampling::default() };
+            let frames = tts.talker.frames(&prefill, Some(trailing), sampling, 40, |_| {})?;
+            eprintln!("{draws:?}: {} frames, the first {:?}", frames.len(), frames.first());
+            drawn.push(frames);
         }
-        assert!(!lines[0].is_empty() && lines[0] == lines[1], "the device's draws are not the host's ({} and {} samples)", lines[0].len(), lines[1].len());
+        assert!(drawn[0].len() > 10, "{} frames", drawn[0].len());
+        assert_eq!(drawn[0], drawn[1], "the device's codes are not the host's");
+        // (OAIY_TTS_SAVE: the codes to a file, to set beside another build's)
+        if let Ok(path) = std::env::var("OAIY_TTS_SAVE") {
+            std::fs::write(path, format!("{:?}", drawn[0]))?;
+        }
         Ok(())
     }
 
