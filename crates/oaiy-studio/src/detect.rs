@@ -399,6 +399,16 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
             return Ok(detected(Role::Component { kind: "klein_lora" }, format,
                 format!("FLUX.2 Klein 4B style LoRA ({label})"), vec![("loras", Json::Arr(vec![p]))]));
         }
+        // FLUX 3 Image Klein's: its blocks by kind (BFL's `content_mode_blocks`/`txt_mode_blocks`, diffusers'
+        // `mode_blocks`), its shared blocks' own projections (BFL's `single_blocks.N.q_proj`, diffusers'
+        // `single_transformer_blocks.N.ff.linear_in`), or ai-toolkit's word for it
+        let flux3 = has(h, "mode_blocks.")
+            || h.tensors.iter().any(|(k, _)| (k.contains("single_blocks.") && k.contains(".q_proj.")) || (k.contains("single_transformer_blocks.") && k.contains(".ff.linear_in.")))
+            || h.metadata.get("ss_base_model_version").and_then(Json::as_str).is_some_and(|v| v.starts_with("flux3"));
+        if flux3 {
+            return Ok(detected(Role::Component { kind: "flux3_lora" }, format,
+                format!("FLUX 3 Image Klein LoRA ({label})"), vec![("loras", Json::Arr(vec![p]))]));
+        }
         return Ok(detected(Role::Component { kind: "adapter" }, format,
             format!("LoRA adapter ({label}); attach it to a Qwen Image model as its turbo adapter"), vec![("adapter", p)]));
     }
@@ -788,6 +798,18 @@ mod tests {
         let d=classify_header(&h,Path::new("style.safetensors"),"safetensors").unwrap();
         assert_eq!(d.kind(),"klein_lora");
         assert!(!d.fields.iter().any(|(k,_)|k=="adapter"));
+        // FLUX 3 Image Klein's LoRAs: BFL's names (as ComfyUI and ai-toolkit keep them), diffusers', or only its shared blocks
+        for (name,meta) in [("diffusion_model.content_mode_blocks.image.0.q_proj.lora_A.weight",Json::Null),("transformer.mode_blocks.image.0.attn.to_q.lora_A.weight",Json::Null),
+            ("transformer.single_transformer_blocks.3.ff.linear_in.lora_A.weight",Json::Null),("single_blocks.3.q_proj.lora_down.weight",Json::Null),
+            ("diffusion_model.something.lora_A.weight",Json::obj([("ss_base_model_version",Json::str("flux3"))]))] {
+            let h=Header {tensors:vec![(name.into(),vec![16,3072])],metadata:meta};
+            let d=classify_header(&h,Path::new("tarot.safetensors"),"safetensors").unwrap();
+            assert_eq!(d.kind(),"flux3_lora","{name}");
+            assert!(d.fields.iter().any(|(k,_)|k=="loras"));
+        }
+        // (FLUX.2's diffusers names are not FLUX 3's)
+        let h=Header {tensors:vec![("transformer.single_transformer_blocks.0.attn.to_qkv_mlp_proj.lora_A.weight".into(),vec![16,3072])],metadata:Json::Null};
+        assert_eq!(classify_header(&h,Path::new("other.safetensors"),"safetensors").unwrap().kind(),"adapter");
     }
 
     /// A Qwen3-VL folder is FLUX 3 Image Klein's text encoder where it is the 4B (2,560 wide), Qwen Image's where not.

@@ -833,6 +833,10 @@ fn prepare_flux3(c: &Config, settings: &Json, body: &Json) -> Result<Json, Strin
         fields.push(("images".into(), Json::Arr(images)));
         fields.push(("reference_pixels".into(), Json::Int(integer("reference_pixels", 1 << 20, 4096, 4 << 20)?)));
     }
+    let enabled = match body.get("use_loras") { None => true, Some(v) => v.as_bool().ok_or("use_loras must be boolean")? };
+    if enabled && !c.loras.is_empty() {
+        fields.push(("loras".into(), Json::Arr(c.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect())));
+    }
     if let Some(model) = &c.image_model { fields.push(("model".into(), Json::str(model))); }
     fields.extend(image_memory(c, body)?);
     for key in ["prompt", "prompts"] { if let Some(v) = body.get(key) { fields.push((key.into(), v.clone())); } }

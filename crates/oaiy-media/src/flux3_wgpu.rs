@@ -7,12 +7,14 @@
 //! distilled checkpoint (a flow map), the time the step goes to. No biases anywhere.
 //!
 //! Its matrices as [`crate::qwen_wgpu`] holds Qwen Image's: a checkpoint's floats f16 (its BF16 as Q8_0 where the
-//! card has no room for f16 beside a picture's work), a GGUF's K-quant blocks as they are.
+//! card has no room for f16 beside a picture's work), a GGUF's K-quant blocks as they are; LoRA adapters merged into
+//! them as they load (BFL's names, ComfyUI's and ai-toolkit's, or diffusers': [`diffusers_name`]).
+use crate::lora::{Alias, Loras};
 use crate::qwen_wgpu::{err, first, matrix_as, mul, timestep, vector, weights_q8, Low, Mat};
-use crate::{lora::Loras, weights::Weights};
+use crate::weights::Weights;
 use candle_core::Result;
 use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const EPS: f32 = 1e-6;
 const THETA: f64 = 10_000.;
@@ -63,6 +65,102 @@ impl Config {
         }
         Ok(Self { hidden, heads: hidden / head_dim, head_dim, depth, single, mlp, channels, context, flow_map: w.has(FLOW_MAP_KEY) })
     }
+
+    /// Every matrix a LoRA may adapt, BFL's name for it and its rows and columns: the inputs, the times' embeddings,
+    /// the modulations, each block's attention and MLP, the output.
+    pub fn projections(self) -> Vec<(String, usize, usize)> {
+        let (h, mlp, c) = (self.hidden, self.mlp, self.channels);
+        let mut v: Vec<(String, usize, usize)> = vec![
+            ("emb_in.image".into(), h, c),
+            ("emb_in.image_cond".into(), h, c),
+            ("txt_in".into(), h, self.context),
+            ("time_in.in_layer".into(), h, 256),
+            ("time_in.out_layer".into(), h, h),
+            ("final_layer.image.adaLN_modulation.1".into(), 2 * h, h),
+            ("final_layer.image.linear".into(), c, h),
+        ];
+        if self.flow_map {
+            v.extend([("ref_time_in.in_layer".into(), h, 256), ("ref_time_in.out_layer".into(), h, h)]);
+        }
+        for kind in KINDS {
+            v.push((format!("early_stream_modulations.{}.lin", kind.key()), 3 * h, h));
+            v.push((format!("single_stream_modulations.{}.lin", kind.key()), 3 * h, h));
+        }
+        let blocks = ["content_mode_blocks.image", "content_mode_blocks.image_cond", "txt_mode_blocks"]
+            .iter()
+            .flat_map(|p| (0..self.depth).map(move |i| format!("{p}.{i}")))
+            .chain((0..self.single).map(|i| format!("single_blocks.{i}")));
+        for b in blocks {
+            for (name, out, input) in [("q_proj", h, h), ("k_proj", h, h), ("v_proj", h, h), ("mlp_in", 2 * mlp, h), ("attn_out", h, h), ("mlp_out", h, mlp)] {
+                v.push((format!("{b}.{name}"), out, input));
+            }
+        }
+        v
+    }
+}
+
+/// diffusers' name for a matrix BFL's checkpoint names `module` (`Flux3Transformer2DModel`'s, as its LoRAs name
+/// them): the same weights, renamed, but for the final modulation, whose halves (BFL's shift then scale) diffusers
+/// keeps the other way round (`norm_out.linear`: scale, then shift).
+pub fn diffusers_name(module: &str) -> Option<Alias> {
+    let named = |name: String| Some(Alias { name, swap_halves: false });
+    let layer = |part: &str| -> Option<&'static str> {
+        Some(match part {
+            "q_proj" => "attn.to_q",
+            "k_proj" => "attn.to_k",
+            "v_proj" => "attn.to_v",
+            "attn_out" => "attn.to_out.0",
+            "mlp_in" => "ff.linear_in",
+            "mlp_out" => "ff.linear_out",
+            _ => return None,
+        })
+    };
+    // a block's: `{prefix}.{i}.{layer}`
+    let block = |prefix: &str, rest: &str| -> Option<String> {
+        let (i, part) = rest.split_once('.')?;
+        Some(format!("{prefix}.{i}.{}", layer(part)?))
+    };
+    for kind in ["image_cond", "image"] {
+        if let Some(rest) = module.strip_prefix(&format!("content_mode_blocks.{kind}.")) {
+            return named(block(&format!("mode_blocks.{kind}"), rest)?);
+        }
+    }
+    if let Some(rest) = module.strip_prefix("txt_mode_blocks.") {
+        return named(block("txt_mode_blocks", rest)?);
+    }
+    if let Some(rest) = module.strip_prefix("single_blocks.") {
+        return named(block("single_transformer_blocks", rest)?);
+    }
+    for kind in ["early", "single"] {
+        if let Some(k) = module.strip_prefix(&format!("{kind}_stream_modulations.")).and_then(|r| r.strip_suffix(".lin")) {
+            return named(format!("{kind}_stream_modulations.{k}.linear"));
+        }
+    }
+    if module == "final_layer.image.adaLN_modulation.1" {
+        return Some(Alias { name: "norm_out.linear".into(), swap_halves: true });
+    }
+    named(
+        match module {
+            "txt_in" => "context_embedder",
+            "emb_in.image" => "x_embedders.image",
+            "emb_in.image_cond" => "x_embedders.image_cond",
+            "time_in.in_layer" => "timestep_embedder.linear_1",
+            "time_in.out_layer" => "timestep_embedder.linear_2",
+            "ref_time_in.in_layer" => "target_timestep_embedder.linear_1",
+            "ref_time_in.out_layer" => "target_timestep_embedder.linear_2",
+            "final_layer.image.linear" => "proj_out",
+            _ => return None,
+        }
+        .into(),
+    )
+}
+
+/// `list`'s adapters (each a path and its strength) for the checkpoint `cfg` describes, checked from their headers
+/// alone: every module one of its matrices of its shape, and nothing but LoRA factors.
+pub fn loras(list: &[(PathBuf, f64)], cfg: Config) -> Result<Loras> {
+    let lora = Loras::open(list)?.for_model("FLUX 3 Image Klein", Some(diffusers_name));
+    lora.validate_modules(&cfg.projections())?;
+    Ok(lora)
 }
 
 /// The kinds of token, in the order a sample's take in the shared blocks.
@@ -160,6 +258,7 @@ pub struct WgpuFlux3 {
     single: Vec<Block>,
     final_mod: Mat,
     final_proj: Mat,
+    lora_notes: Vec<String>,
     scratch: Option<Scratch>,
 }
 
@@ -202,20 +301,20 @@ pub fn bf16_time(t: f64) -> f64 {
 
 impl WgpuFlux3 {
     /// The transformer at `path` on GPU `device` (as the computer counts them; OAIY_WEBGPU_ADAPTER naming one
-    /// instead). `progress(done, of)` as its blocks load.
-    pub fn load(path: &Path, device: usize, progress: impl FnMut(usize, usize)) -> Result<Self> {
-        Self::load_on(path, ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?, progress)
+    /// instead), with `loras` (each a path and its strength) merged in. `progress(done, of)` as its blocks load.
+    pub fn load(path: &Path, device: usize, loras: &[(PathBuf, f64)], progress: impl FnMut(usize, usize)) -> Result<Self> {
+        Self::load_on(path, ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?, loras, progress)
     }
 
     /// [`Self::load`] onto `gpu` (the VAE's beside it).
-    pub fn load_on(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, mut progress: impl FnMut(usize, usize)) -> Result<Self> {
+    pub fn load_on(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, loras: &[(PathBuf, f64)], mut progress: impl FnMut(usize, usize)) -> Result<Self> {
         let mut w = Weights::open(path)?;
         let cfg = Config::of(&w)?;
-        let mut lora = Loras::open(&[])?;
+        let mut lora = self::loras(loras, cfg)?;
         // its blocks' matrices f16 where the tensor cores take f16 and there is room for them beside a picture's work;
         // else its BF16 ones as Q8_0, half the size: on Metal's 8 x 8 simdgroup matrices Q8_0's matmuls are the tensor
         // cores' and f16's are not (an M5 Pro's 512x512 step 2.9 s where 6.9 as f16). OAIY_FLUX3_WEIGHTS `f16` or `q8_0`
-        // says which.
+        // says which. A LoRA's factors are merged into a matrix as f16 on the GPU, then made Q8_0.
         let block_params = 4 * cfg.hidden * cfg.hidden + 3 * cfg.hidden * cfg.mlp;
         let f16_bytes = 2 * (block_params * (3 * cfg.depth + cfg.single)) as u64;
         let q8 = match std::env::var("OAIY_FLUX3_WEIGHTS").map(|v| v.to_ascii_lowercase()).as_deref() {
@@ -223,19 +322,17 @@ impl WgpuFlux3 {
             Ok("q8_0" | "q8") => true,
             _ => !gpu.f16_tensor_cores() || weights_q8(&gpu, f16_bytes),
         };
-        let mut m = |w: &mut Weights, name: &str| matrix_as(w, &mut lora, &gpu, name, q8);
         // (the inputs, times and modulations f16 whatever the blocks are: the text's input reads its states as f32,
         // past f16's range, and a Q8_0 matmul takes its inputs as f16)
-        let mut f16 = Loras::open(&[])?;
-        let mut exact = |w: &mut Weights, name: &str| matrix_as(w, &mut f16, &gpu, name, false);
-        let block = |w: &mut Weights, m: &mut dyn FnMut(&mut Weights, &str) -> Result<Mat>, p: &str| -> Result<Block> {
+        let mut m = |w: &mut Weights, name: &str, q8: bool| matrix_as(w, &mut lora, &gpu, name, q8);
+        let block = |w: &mut Weights, m: &mut dyn FnMut(&mut Weights, &str, bool) -> Result<Mat>, p: &str| -> Result<Block> {
             Ok(Block {
-                q: m(w, &format!("{p}.q_proj"))?,
-                k: m(w, &format!("{p}.k_proj"))?,
-                v: m(w, &format!("{p}.v_proj"))?,
-                mlp_in: m(w, &format!("{p}.mlp_in"))?,
-                attn_out: m(w, &format!("{p}.attn_out"))?,
-                mlp_out: m(w, &format!("{p}.mlp_out"))?,
+                q: m(w, &format!("{p}.q_proj"), q8)?,
+                k: m(w, &format!("{p}.k_proj"), q8)?,
+                v: m(w, &format!("{p}.v_proj"), q8)?,
+                mlp_in: m(w, &format!("{p}.mlp_in"), q8)?,
+                attn_out: m(w, &format!("{p}.attn_out"), q8)?,
+                mlp_out: m(w, &format!("{p}.mlp_out"), q8)?,
                 qn: vector(w, &gpu, &format!("{p}.norm.query_norm.scale"), 0.)?,
                 kn: vector(w, &gpu, &format!("{p}.norm.key_norm.scale"), 0.)?,
             })
@@ -249,15 +346,15 @@ impl WgpuFlux3 {
                 Kind::Cond => ("emb_in.image_cond", "content_mode_blocks.image_cond"),
                 Kind::Text => ("txt_in", "txt_mode_blocks"),
             };
-            let input = exact(&mut w, input)?;
+            let input = m(&mut w, input, false)?;
             let mut blocks = Vec::with_capacity(cfg.depth);
             for i in 0..cfg.depth {
                 blocks.push(block(&mut w, &mut m, &format!("{prefix}.{i}"))?);
                 done += 1;
                 progress(done, total);
             }
-            let early = exact(&mut w, &format!("early_stream_modulations.{}.lin", kind.key()))?;
-            let single = exact(&mut w, &format!("single_stream_modulations.{}.lin", kind.key()))?;
+            let early = m(&mut w, &format!("early_stream_modulations.{}.lin", kind.key()), false)?;
+            let single = m(&mut w, &format!("single_stream_modulations.{}.lin", kind.key()), false)?;
             modes.push(Mode { input, blocks, early, single });
         }
         let mut single = Vec::with_capacity(cfg.single);
@@ -266,11 +363,17 @@ impl WgpuFlux3 {
             done += 1;
             progress(done, total);
         }
-        let time_in = [exact(&mut w, "time_in.in_layer")?, exact(&mut w, "time_in.out_layer")?];
-        let ref_time_in = if cfg.flow_map { Some([exact(&mut w, "ref_time_in.in_layer")?, exact(&mut w, "ref_time_in.out_layer")?]) } else { None };
-        let (final_mod, final_proj) = (exact(&mut w, "final_layer.image.adaLN_modulation.1")?, exact(&mut w, "final_layer.image.linear")?);
+        let time_in = [m(&mut w, "time_in.in_layer", false)?, m(&mut w, "time_in.out_layer", false)?];
+        let ref_time_in = if cfg.flow_map { Some([m(&mut w, "ref_time_in.in_layer", false)?, m(&mut w, "ref_time_in.out_layer", false)?]) } else { None };
+        let (final_mod, final_proj) = (m(&mut w, "final_layer.image.adaLN_modulation.1", false)?, m(&mut w, "final_layer.image.linear", false)?);
+        let lora_notes = lora.check()?;
         let modes: [Mode; 3] = modes.try_into().map_err(|_| err("three kinds of token"))?;
-        Ok(Self { gpu, cfg, modes, time_in, ref_time_in, single, final_mod, final_proj, scratch: None })
+        Ok(Self { gpu, cfg, modes, time_in, ref_time_in, single, final_mod, final_proj, lora_notes, scratch: None })
+    }
+
+    /// LoRA adapters that fit only in part, and what of them was left out.
+    pub fn lora_notes(&self) -> &[String] {
+        &self.lora_notes
     }
 
     pub fn config(&self) -> Config {
@@ -510,7 +613,7 @@ mod tests {
         let (image, image_ids, cond, cond_ids) = (values("image")?, ids(values("image_ids")?), values("cond")?, ids(values("cond_ids")?));
         let (text, text_ids, times) = (values("text")?, ids(values("text_ids")?), values("times")?);
         let wants = [values("velocity")?, values("velocity_without_references")?];
-        let mut gpu = WgpuFlux3::load(&path, 0, |_, _| {})?;
+        let mut gpu = WgpuFlux3::load(&path, 0, &[], |_, _| {})?;
         assert_eq!(gpu.config(), Config { hidden: 32, heads: 2, head_dim: 16, depth: 1, single: 2, mlp: 48, channels: 128, context: 48, flow_map: true });
         for (with, want) in [true, false].into_iter().zip(&wants) {
             let tokens = Tokens {
@@ -534,6 +637,190 @@ mod tests {
         }
         Ok(())
     }
+    /// diffusers' names are `Flux3Transformer2DModel`'s, one for each of BFL's matrices, the final modulation's
+    /// halves the other way round.
+    #[test]
+    fn diffusers_names_are_its_transformers() {
+        let name = |m: &str| diffusers_name(m).map(|a| (a.name, a.swap_halves));
+        assert_eq!(name("content_mode_blocks.image_cond.4.k_proj"), Some(("mode_blocks.image_cond.4.attn.to_k".into(), false)));
+        assert_eq!(name("content_mode_blocks.image.0.mlp_in"), Some(("mode_blocks.image.0.ff.linear_in".into(), false)));
+        assert_eq!(name("txt_mode_blocks.2.attn_out"), Some(("txt_mode_blocks.2.attn.to_out.0".into(), false)));
+        assert_eq!(name("single_blocks.27.mlp_out"), Some(("single_transformer_blocks.27.ff.linear_out".into(), false)));
+        assert_eq!(name("early_stream_modulations.image_cond.lin"), Some(("early_stream_modulations.image_cond.linear".into(), false)));
+        assert_eq!(name("ref_time_in.out_layer"), Some(("target_timestep_embedder.linear_2".into(), false)));
+        assert_eq!(name("final_layer.image.adaLN_modulation.1"), Some(("norm_out.linear".into(), true)));
+        assert_eq!(name("single_blocks.0.norm.query_norm"), None);
+        let cfg = Config { hidden: 3072, heads: 24, head_dim: 128, depth: 5, single: 28, mlp: 9216, channels: 128, context: 20480, flow_map: true };
+        let all = cfg.projections();
+        let names: std::collections::BTreeSet<String> = all.iter().map(|(m, ..)| diffusers_name(m).unwrap().name).collect();
+        // (diffusers' 359 tensors less its 43 blocks' two norms)
+        assert_eq!((all.len(), names.len()), (359 - 2 * 43, 359 - 2 * 43));
+    }
+
+    /// Every LoRA in `OAIY_FLUX3_LORAS` (a folder of FLUX 3 Image Klein LoRAs, in any of the layouts) fits the
+    /// distilled checkpoint whole: each of its modules one of the checkpoint's matrices, of its shape.
+    #[test]
+    #[ignore = "needs OAIY_FLUX3_LORAS, a folder of FLUX 3 Image Klein LoRAs"]
+    fn real_loras_fit_the_checkpoint() -> Result<()> {
+        let Some(dir) = std::env::var_os("OAIY_FLUX3_LORAS").map(PathBuf::from) else { return Ok(()) };
+        let cfg = Config { hidden: 3072, heads: 24, head_dim: 128, depth: 5, single: 28, mlp: 9216, channels: 128, context: 20480, flow_map: true };
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "safetensors")).collect();
+        files.sort();
+        assert!(!files.is_empty());
+        for file in files {
+            let mut lora = loras(&[(file.clone(), 1.)], cfg)?;
+            let mut fitted = 0;
+            for (module, out, input) in cfg.projections() {
+                fitted += lora.factors(&module, out, input, &Device::Cpu, DType::F32)?.len();
+            }
+            let notes = lora.check()?;
+            eprintln!("{}: {fitted} of the checkpoint's {} matrices", file.display(), cfg.projections().len());
+            assert!(fitted > 0 && notes.is_empty(), "{}: {notes:?}", file.display());
+        }
+        Ok(())
+    }
+
+    /// The tiny fixture's step: its picture's latent and its references', the text's states, each one's positions,
+    /// and the step's two times.
+    struct Step {
+        image: Vec<f32>,
+        image_ids: Vec<[f64; 4]>,
+        cond: Vec<f32>,
+        cond_ids: Vec<[f64; 4]>,
+        text: Vec<f32>,
+        text_ids: Vec<[f64; 4]>,
+        times: Vec<f32>,
+    }
+
+    impl Step {
+        fn of(w: &mut Weights) -> Result<Self> {
+            let mut values = |name: &str| -> Result<Vec<f32>> { w.tensor(&format!("fixture.{name}"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>() };
+            let ids = |v: Vec<f32>| -> Vec<[f64; 4]> { v.chunks_exact(4).map(|c| [c[0] as f64, c[1] as f64, c[2] as f64, c[3] as f64]).collect() };
+            Ok(Self {
+                image: values("image")?,
+                image_ids: ids(values("image_ids")?),
+                cond: values("cond")?,
+                cond_ids: ids(values("cond_ids")?),
+                text: values("text")?,
+                text_ids: ids(values("text_ids")?),
+                times: values("times")?,
+            })
+        }
+
+        /// The velocity `model` gives it, its references included.
+        fn velocity(&self, model: &mut WgpuFlux3) -> Result<Vec<f32>> {
+            let tokens = Tokens { image: &self.image, image_ids: &self.image_ids, cond: &self.cond, cond_ids: &self.cond_ids, text: &self.text, text_ids: &self.text_ids };
+            model.predict(&tokens, self.times[0] as f64, Some(self.times[1] as f64))
+        }
+    }
+
+    /// diffusers' own LoRAs (`tools/flux3/lora_reference.py`): one made with PEFT and saved by diffusers (its names, its
+    /// scale in its metadata with the `to_k` projections' own alpha, the final modulation's halves the other way round
+    /// from BFL's), one in BFL's names as ai-toolkit saves them. The velocity diffusers' `Flux3Transformer2DModel` gives
+    /// the fixture's step with both applied (at 0.7 and 1.3) is this one's with them merged as it loads.
+    #[test]
+    fn diffusers_loras_are_diffusers() -> Result<()> {
+        if ggml_rs_wgpu::WgpuBackend::new(Some(1 << 30)).is_err() {
+            return Ok(());
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/flux3");
+        let path = dir.join("tiny.safetensors");
+        let step = Step::of(&mut Weights::open(&path)?)?;
+        let want = Weights::open(&dir.join("lora_expected.safetensors"))?.tensor("velocity", &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let loras = [(dir.join("lora_diffusers.safetensors"), 0.7), (dir.join("lora_bfl.safetensors"), 1.3)];
+        let mut model = WgpuFlux3::load(&path, 0, &loras, |_, _| {})?;
+        assert!(model.lora_notes().is_empty(), "{:?}", model.lora_notes());
+        let got = step.velocity(&mut model)?;
+        let plain = step.velocity(&mut WgpuFlux3::load(&path, 0, &[], |_, _| {})?)?;
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let cosine = got.iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() / (norm(&got) * norm(&want));
+        let rms = norm(&want) / (want.len() as f64).sqrt();
+        let worst = |v: &[f32]| v.iter().zip(&want).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0., f64::max);
+        eprintln!("diffusers' LoRAs: cosine {cosine:.7}, the worst error {:.2e} (without them {:.2e}) of an RMS {rms:.3}", worst(&got), worst(&plain));
+        assert!(cosine > 0.9999 && worst(&got) < 0.01 * rms && worst(&plain) > 0.5 * rms, "cosine {cosine}");
+        Ok(())
+    }
+
+    /// LoRAs merged into the transformer as it loads (one in BFL's names as ComfyUI keeps them, with alphas; one in
+    /// diffusers', its scale in its metadata and the final modulation's halves the other way round) give what the
+    /// same transformer gives with them merged into its weights beforehand, on the host.
+    #[test]
+    fn loras_merged_as_it_loads_are_the_weights_merged_before() -> Result<()> {
+        if ggml_rs_wgpu::WgpuBackend::new(Some(1 << 30)).is_err() {
+            return Ok(());
+        }
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/flux3/tiny.safetensors");
+        let dir = std::env::temp_dir().join(format!("oaiy-flux3-lora-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let mut w = Weights::open(&fixture)?;
+        let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+        for name in w.names() {
+            let shape = w.shape(&name)?;
+            tensors.push((name.clone(), shape, w.tensor(&name, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?));
+        }
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 * 2. - 1.
+        };
+        let rank = 4;
+        let comfy = ["content_mode_blocks.image.0.q_proj", "single_blocks.1.mlp_in", "txt_in", "early_stream_modulations.txt.lin", "ref_time_in.out_layer"];
+        let diffusers = ["content_mode_blocks.image_cond.0.v_proj", "single_blocks.0.mlp_out", "final_layer.image.adaLN_modulation.1", "emb_in.image", "time_in.in_layer"];
+        // (each adapter's modules, strength, and alpha: ComfyUI's as tensors, diffusers' in its metadata)
+        let adapters = [(&comfy, 0.8f32, 2f32), (&diffusers, 1.2, 8.)];
+        let mut files: [Vec<(String, Vec<usize>, Vec<f32>)>; 2] = [Vec::new(), Vec::new()];
+        for (which, (modules, strength, alpha)) in adapters.iter().enumerate() {
+            for module in modules.iter() {
+                let (_, shape, weight) = tensors.iter_mut().find(|(n, ..)| *n == format!("{module}.weight")).unwrap();
+                let (out, input) = (shape[0], shape[1]);
+                let a: Vec<f32> = (0..rank * input).map(|_| next()).collect();
+                let mut b: Vec<f32> = (0..out * rank).map(|_| next()).collect();
+                let delta = |b: &[f32]| -> Vec<f32> {
+                    (0..out * input).map(|e| (0..rank).map(|r| b[e / input * rank + r] * a[r * input + e % input]).sum::<f32>() * strength * alpha / rank as f32).collect()
+                };
+                // (the change a quarter of the weight's RMS)
+                let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                let k = 0.25 * rms(weight) / rms(&delta(&b));
+                b.iter_mut().for_each(|x| *x *= k);
+                weight.iter_mut().zip(delta(&b)).for_each(|(w, d)| *w += d);
+                let (name, b) = if which == 0 {
+                    (format!("diffusion_model.{module}"), b)
+                } else {
+                    let alias = diffusers_name(module).unwrap();
+                    let b = if alias.swap_halves { [&b[out / 2 * rank..], &b[..out / 2 * rank]].concat() } else { b };
+                    (format!("transformer.{}", alias.name), b)
+                };
+                let (down, up) = if which == 0 { ("lora_down", "lora_up") } else { ("lora_A", "lora_B") };
+                files[which].push((format!("{name}.{down}.weight"), vec![rank, input], a));
+                files[which].push((format!("{name}.{up}.weight"), vec![out, rank], b));
+                if which == 0 {
+                    files[which].push((format!("{name}.alpha"), vec![], vec![*alpha]));
+                }
+            }
+        }
+        let write = |path: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)], meta: &[(&str, &str)]| {
+            let list: Vec<(&str, &[usize], &[f32])> = tensors.iter().map(|(n, s, v)| (n.as_str(), s.as_slice(), v.as_slice())).collect();
+            crate::lora::write_f32(path, &list, meta);
+        };
+        let (merged, comfy_file, diffusers_file) = (dir.join("merged.safetensors"), dir.join("comfy.safetensors"), dir.join("diffusers.safetensors"));
+        write(&merged, &tensors, &[]);
+        write(&comfy_file, &files[0], &[]);
+        write(&diffusers_file, &files[1], &[("lora_adapter_metadata", r#"{"transformer.r": 4, "transformer.lora_alpha": 8}"#)]);
+        let step = Step::of(&mut w)?;
+        let run = |path: &Path, loras: &[(PathBuf, f64)]| -> Result<Vec<f32>> { step.velocity(&mut WgpuFlux3::load(path, 0, loras, |_, _| {})?) };
+        let before = run(&merged, &[])?;
+        let loaded = run(&fixture, &[(comfy_file, 0.8), (diffusers_file, 1.2)])?;
+        let plain = run(&fixture, &[])?;
+        let rms = (before.iter().map(|a| (*a as f64).powi(2)).sum::<f64>() / before.len() as f64).sqrt();
+        let worst = |v: &[f32]| v.iter().zip(&before).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0., f64::max);
+        eprintln!("merged as it loads: the worst error {:.2e}; without the LoRAs {:.2e}; of an RMS {rms:.3}", worst(&loaded), worst(&plain));
+        assert!(worst(&loaded) < 0.01 * rms && worst(&plain) > 0.2 * rms);
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
     /// Each step's time over a few (`--ignored --nocapture`): the transformer of `OAIY_FLUX3_TRANSFORMER`, a 1024x1024
     /// picture's latent (FLUX3_GRID another side) after 512 text tokens (FLUX3_TEXT another count) and FLUX3_REFS
     /// references of its own size, 3 steps (FLUX3_STEPS another count); with OAIY_CHAIN_PROFILE each step's costliest
@@ -552,7 +839,7 @@ mod tests {
             (seed >> 11) as f64 / (1u64 << 53) as f64 * 2. - 1.
         };
         let t = std::time::Instant::now();
-        let mut gpu = WgpuFlux3::load(&path, 0, |_, _| {})?;
+        let mut gpu = WgpuFlux3::load(&path, 0, &[], |_, _| {})?;
         eprintln!("loaded in {:.1} s", t.elapsed().as_secs_f64());
         let cfg = gpu.config();
         let text: Vec<f32> = (0..nt * cfg.context).map(|i| (next() * if i % 997 == 5 { 300. } else { 3. }) as f32).collect();

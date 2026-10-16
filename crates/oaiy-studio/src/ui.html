@@ -1510,6 +1510,7 @@ function renderModels() {
       ? field("FLUX 3 Image Klein transformer (model.safetensors)", "image", name, "transformer", m.transformer, {missing: miss.includes("transformer")})
         + field("Qwen3-VL-4B-Instruct text encoder (folder)", "image", name, "text_encoder", m.text_encoder, {dir: true, missing: miss.includes("text_encoder")})
         + field("FLUX.2 VAE (ae.safetensors)", "image", name, "vae", m.vae, {missing: miss.includes("vae")})
+        + loraList("image", name, m.loras)
       : klein
       ? field("Klein 4B transformer (.safetensors)", "image", name, "transformer", m.transformer, {missing: miss.includes("transformer")})
         + field("Qwen3-4B text encoder", "image", name, "text_encoder", m.text_encoder, {missing: miss.includes("text_encoder")})

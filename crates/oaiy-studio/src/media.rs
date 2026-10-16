@@ -505,18 +505,8 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         f.push(("variant".into(), Json::str(variant)));
         f.push(("steps".into(), Json::Int(count)));
         f.push(("cfg".into(), Json::Num(cfg_scale)));
-        let enabled = match body.get("use_loras") { None => true, Some(v) => v.as_bool().ok_or("use_loras must be boolean")? };
-        if enabled {
-            let mut loras = Vec::new();
-            if let Some(list) = model.get("loras") {
-                for l in list.as_array().ok_or("loras must be an array")? {
-                    let p = l.as_str().or_else(|| l.get("path").and_then(Json::as_str)).filter(|s| !s.trim().is_empty()).ok_or("LoRA needs a path")?;
-                    let strength = match l.get("strength") { None => 1.0, Some(v) => v.as_f64().ok_or("LoRA strength must be numeric")? };
-                    if !strength.is_finite() || !(-4.0..=4.0).contains(&strength) { return Err("LoRA strength must be between -4 and 4".into()); }
-                    loras.push(Json::obj([("path", Json::str(config::resolve(root, p).to_string_lossy())), ("strength", Json::Num(strength))]));
-                }
-            }
-            f.push(("loras".into(), Json::Arr(loras)));
+        if let Some(loras) = model_loras(root, model, body)? {
+            f.push(("loras".into(), loras));
         }
     } else if flux3 {
         f.push(("architecture".into(), Json::str(arch)));
@@ -546,6 +536,9 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             f.push(("images".into(), Json::Arr(refs.iter().map(Json::str).collect())));
             // a single reference's canvas: about a megapixel (BFL's own go to 4), or the model's
             f.push(("reference_pixels".into(), Json::Int(int_or(model, "reference_pixels", 1 << 20))));
+        }
+        if let Some(loras) = model_loras(root, model, body)? {
+            f.push(("loras".into(), loras));
         }
     } else {
         f.push(("base".into(), Json::str(path_field(root, model, "base").ok_or("Qwen Image model needs its base folder")?)));
@@ -612,6 +605,25 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     }
     f.extend(residency(body, section, model)?);
     Ok((Json::Obj(f), name, format!("{w}x{h}"), n as usize))
+}
+
+/// A FLUX model's `loras` (paths, or `{path, strength}`: strength 1 where left out, from -4 to 4) for its worker, each
+/// path resolved beside the studio; None where the request asks for none (`use_loras: false`).
+fn model_loras(root: &Path, model: &Json, body: &Json) -> Result<Option<Json>, String> {
+    let enabled = match body.get("use_loras") { None => true, Some(v) => v.as_bool().ok_or("use_loras must be boolean")? };
+    if !enabled {
+        return Ok(None);
+    }
+    let mut loras = Vec::new();
+    if let Some(list) = model.get("loras") {
+        for l in list.as_array().ok_or("loras must be an array")? {
+            let p = l.as_str().or_else(|| l.get("path").and_then(Json::as_str)).filter(|s| !s.trim().is_empty()).ok_or("LoRA needs a path")?;
+            let strength = match l.get("strength") { None => 1.0, Some(v) => v.as_f64().ok_or("LoRA strength must be numeric")? };
+            if !strength.is_finite() || !(-4.0..=4.0).contains(&strength) { return Err("LoRA strength must be between -4 and 4".into()); }
+            loras.push(Json::obj([("path", Json::str(config::resolve(root, p).to_string_lossy())), ("strength", Json::Num(strength))]));
+        }
+    }
+    Ok(Some(Json::Arr(loras)))
 }
 
 /// Decode an `input_reference` / `image` value (a `data:` URL, or a local path

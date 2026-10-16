@@ -3,8 +3,9 @@
 //! Qwen3-VL-4B's language model ([`crate::klein_text_wgpu`] with [`crate::klein_text_wgpu::FLUX3`]), each reference
 //! through the FLUX.2 VAE's encoder ([`crate::sdxl_vae_wgpu`]), the transformer ([`crate::flux3_wgpu`]) a flow map
 //! over 16 steps (the distilled checkpoint: each step told the time it goes to) or 50 steps with guidance (the base
-//! one), the VAE's decoder last. The prompt is used as written: BFL's prompt upsampler (a separate model that writes
-//! a full scene caption from a short request) is not run, nor their safety classifier.
+//! one), the VAE's decoder last; LoRA adapters merged into the transformer as it loads. The prompt is used as
+//! written: BFL's prompt upsampler (a separate model that writes a full scene caption from a short request) is not
+//! run, nor their safety classifier.
 pub mod references;
 
 use oaiy_engine::json::Json;
@@ -23,6 +24,8 @@ pub struct Request {
     pub text_encoder: PathBuf,
     pub tokenizer: PathBuf,
     pub vae: PathBuf,
+    /// LoRA adapters, each a path and its strength (1: as trained).
+    pub loras: Vec<(PathBuf, f64)>,
     pub output: PathBuf,
     pub prompts: Vec<String>,
     pub references: Vec<PathBuf>,
@@ -93,9 +96,16 @@ impl Request {
         if !tokenizer.is_file() {
             return Err(format!("FLUX 3 Image Klein requires a tokenizer: {} is not a file", tokenizer.display()));
         }
-        for key in ["loras", "adapter"] {
-            if j.get(key).is_some_and(|v| !matches!(v, Json::Null) && !v.as_array().is_some_and(|a| a.is_empty())) {
-                return Err(format!("FLUX 3 Image Klein does not take {key} yet"));
+        if j.get("adapter").is_some_and(|v| !matches!(v, Json::Null)) {
+            return Err("FLUX 3 Image Klein takes no turbo adapter: give LoRAs as loras".into());
+        }
+        let loras = crate::pipeline::parse_loras(j)?;
+        for (p, strength) in &loras {
+            if !p.is_file() {
+                return Err(format!("LoRA not found: {}", p.display()));
+            }
+            if !strength.is_finite() || !(-4. ..=4.).contains(strength) {
+                return Err("a LoRA's strength must be between -4 and 4".into());
             }
         }
         if j.get("negative_prompt").is_some_and(|v| !matches!(v, Json::Null) && !v.as_str().is_some_and(|s| s.trim().is_empty())) {
@@ -162,6 +172,7 @@ impl Request {
             text_encoder,
             tokenizer,
             vae: path("vae", false)?,
+            loras,
             output,
             prompts,
             references,
@@ -197,6 +208,8 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
     if cfg.context != 20480 {
         bail!("FLUX 3 Image Klein's transformer takes text states 20,480 wide, not {}", cfg.context);
     }
+    // and its LoRAs': each fits the checkpoint (from their headers alone)
+    drop(crate::flux3_wgpu::loras(&r.loras, cfg)?);
     let steps = r.steps.unwrap_or(if cfg.flow_map { 16 } else { 50 });
     let guidance = match (cfg.flow_map, r.guidance) {
         (true, None | Some(1.)) => None,
@@ -232,7 +245,10 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
         bail!("FLUX 3 Image Klein cannot make a {width}x{height} picture");
     }
     event(Json::obj([("stage", Json::str("loading_transformer"))]));
-    let mut model = WgpuFlux3::load_on(&r.transformer, gpu, |_, _| {})?;
+    let mut model = WgpuFlux3::load_on(&r.transformer, gpu, &r.loras, |_, _| {})?;
+    for note in model.lora_notes() {
+        event(Json::obj([("stage", Json::str("lora_note")), ("note", Json::str(note))]));
+    }
     std::fs::create_dir_all(&r.output)?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
     let batch = r.output.join(format!("flux3-{}-{nanos}", std::process::id()));
@@ -304,6 +320,7 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
             ("height", Json::Int(picture.height() as i64)),
             ("references", Json::Int(r.references.len() as i64)),
             ("transformer", Json::str(r.transformer.to_string_lossy())),
+            ("loras", Json::Arr(r.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect())),
             ("backend", Json::str("webgpu")),
             ("noise_generator", Json::str("oaiy-splitmix64-box-muller")),
             ("sampling_seconds", Json::Num(sampling_seconds)),
@@ -342,7 +359,8 @@ mod tests {
     }
 
     /// A job's request: the tokenizer the text encoder's folder's where none is named, at most ten references that
-    /// exist, a size of multiples of 16 within 2048 x 2048's area, or none (the reference's, or 1024 x 1024).
+    /// exist, a size of multiples of 16 within 2048 x 2048's area, or none (the reference's, or 1024 x 1024); LoRAs
+    /// that exist, at strengths from -4 to 4.
     #[test]
     fn requests_are_checked() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/flux3/tiny.safetensors");
@@ -359,7 +377,20 @@ mod tests {
         let image = fixture.to_string_lossy().into_owned();
         let images = |n: usize| format!(r#","images":[{}]"#, vec![format!("\"{image}\""); n].join(","));
         assert_eq!(Request::parse(&body(&images(10))).unwrap().references.len(), 10);
-        for bad in [images(11), r#","images":["/no/such/picture.png"]"#.into(), r#","width":1000,"height":1024"#.into(), r#","width":4096,"height":2048"#.into(), r#","negative_prompt":"blur""#.into(), r#","backend":"cpu""#.into()] {
+        let loras = |list: &str| format!(r#","loras":[{list}]"#);
+        let r = Request::parse(&body(&loras(&format!(r#"{{"path":"{image}","strength":0.75}},"{image}""#)))).unwrap();
+        assert_eq!(r.loras, vec![(fixture.clone(), 0.75), (fixture.clone(), 1.)]);
+        for bad in [
+            images(11),
+            r#","images":["/no/such/picture.png"]"#.into(),
+            r#","width":1000,"height":1024"#.into(),
+            r#","width":4096,"height":2048"#.into(),
+            r#","negative_prompt":"blur""#.into(),
+            r#","backend":"cpu""#.into(),
+            loras(r#""/no/such/lora.safetensors""#),
+            loras(&format!(r#"{{"path":"{image}","strength":5}}"#)),
+            format!(r#","adapter":"{image}""#),
+        ] {
             assert!(Request::parse(&body(&bad)).is_err(), "{bad}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -420,6 +451,7 @@ mod tests {
                 text_encoder: text_encoder.clone(),
                 tokenizer: text_encoder.join("tokenizer.json"),
                 vae: vae.clone(),
+                loras: Vec::new(),
                 output: std::env::temp_dir().join(format!("oaiy-flux3-examples-{}", std::process::id())),
                 prompts: vec![j.get("prompt").and_then(Json::as_str).unwrap_or_default().to_owned()],
                 references: j.get("references").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(|r| repo.join(r)).collect(),

@@ -153,7 +153,7 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
             for key in ["steps", "cfg", "reference_pixels"] { if let Some(v) = j.get(key) { fields.push((key.into(), v.clone())); } }
             snapshot.klein = Some(Json::Obj(fields));
             snapshot.sdxl = None;
-            snapshot.loras = Vec::new();
+            snapshot.loras = crate::images::loras(Some(root), &j)?;
             snapshot.adapter = None;
             snapshot.default_weights = "safetensors".into();
             return Ok(snapshot);

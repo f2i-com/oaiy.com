@@ -238,6 +238,14 @@ impl Weights {
         }
     }
 
+    /// A safetensors file's `__metadata__` string for `key` (a GGUF's: none).
+    pub fn metadata(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::Safe(s) => s.metadata(key),
+            Self::Gguf { .. } => None,
+        }
+    }
+
     /// Inspect dimensions without materializing tensor payloads.
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
         if let Some((key, _)) = self.fused_half(name) {

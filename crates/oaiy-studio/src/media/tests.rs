@@ -22,12 +22,13 @@ fn body(s: &str) -> Json {
     Json::parse(s.as_bytes()).unwrap()
 }
 
-/// A FLUX 3 Image Klein job: its checkpoint's own steps and guidance (the worker's to say), up to ten references, and
-/// at `size: auto` with references BFL's own size (none sent: the first reference's).
+/// A FLUX 3 Image Klein job: its checkpoint's own steps and guidance (the worker's to say), up to ten references, at
+/// `size: auto` with references BFL's own size (none sent: the first reference's), and the model's LoRAs (none where
+/// the request asks for none).
 #[test]
 fn flux3_requests_take_ten_references_and_the_references_size() {
     let mut c=cfg("","");
-    let m=body(r#"{"architecture":"flux3-klein","transformer":"flux3/model.safetensors","text_encoder":"flux3/text_encoder","vae":"flux3/ae.safetensors"}"#);
+    let m=body(r#"{"architecture":"flux3-klein","transformer":"flux3/model.safetensors","text_encoder":"flux3/text_encoder","vae":"flux3/ae.safetensors","loras":[{"path":"flux3/tarot.safetensors","strength":0.8},"/loras/outpaint.safetensors"]}"#);
     let mut media=c.get("media").unwrap().clone();
     let mut image=media.get("image").unwrap().clone();
     let mut models=image.get("models").unwrap().clone();
@@ -42,6 +43,9 @@ fn flux3_requests_take_ten_references_and_the_references_size() {
     assert_eq!((r.get("width").and_then(Json::as_i64),r.get("height").and_then(Json::as_i64)),(Some(768),Some(512)));
     assert_eq!(r.get("text_encoder").and_then(Json::as_str),Some("/install/flux3/text_encoder"));
     assert!(r.get("steps").is_none()&&r.get("cfg").is_none()&&r.get("images").is_none()&&r.get("base").is_none());
+    assert_eq!(r.get("loras").map(Json::to_json).as_deref(),Some(r#"[{"path":"/install/flux3/tarot.safetensors","strength":0.8},{"path":"/loras/outpaint.safetensors","strength":1.0}]"#));
+    let (baseline,..)=image_request(&c,root,root,&body(r#"{"model":"flux3","prompt":"a fox","use_loras":false}"#),false).unwrap();
+    assert!(baseline.get("loras").is_none());
     assert!(image_request(&c,root,root,&body(r#"{"model":"flux3","prompt":"a fox","negative_prompt":"blur"}"#),false).is_err());
     // references: a data URL each, written where the worker reads them
     let out=std::env::temp_dir().join(format!("oaiy-flux3-refs-{}",std::process::id()));

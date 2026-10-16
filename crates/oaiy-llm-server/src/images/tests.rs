@@ -246,14 +246,15 @@ fn config() -> Config {
     }
 }
 /// A FLUX 3 Image Klein model: its paths the catalog's (its text encoder a folder), its steps and guidance the
-/// checkpoint's own unless named, up to ten references (Qwen Image three), and with references no size: the first's.
+/// checkpoint's own unless named, up to ten references (Qwen Image three), with references no size (the first's), and
+/// its LoRAs unless the request asks for none.
 #[test]
 fn flux3_catalog_dispatch_takes_ten_references() {
     let mut cfg=config();
     let root=std::env::temp_dir().join(format!("oaiy-flux3-catalog-{}",std::process::id()));
     std::fs::create_dir_all(root.join("text_encoder")).unwrap();
-    for file in ["model.safetensors","ae.safetensors","ref.png"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
-    std::fs::write(root.join("image.json"),br#"{"default_model":"flux3","models":{"flux3":{"architecture":"flux3-klein","transformer":"model.safetensors","text_encoder":"text_encoder","vae":"ae.safetensors"}}}"#).unwrap();
+    for file in ["model.safetensors","ae.safetensors","ref.png","tarot.safetensors"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
+    std::fs::write(root.join("image.json"),br#"{"default_model":"flux3","models":{"flux3":{"architecture":"flux3-klein","transformer":"model.safetensors","text_encoder":"text_encoder","vae":"ae.safetensors"},"tarot":{"architecture":"flux3-klein","transformer":"model.safetensors","text_encoder":"text_encoder","vae":"ae.safetensors","loras":[{"path":"tarot.safetensors","strength":0.8}]}}}"#).unwrap();
     cfg.media_dir=Some(root.clone());
     cfg.output_root=root.join("output");
     let request=prepare(&cfg,&Json::parse(br#"{"prompt":"a fox","transformer":"untrusted"}"#).unwrap()).unwrap();
@@ -270,6 +271,10 @@ fn flux3_catalog_dispatch_takes_ten_references() {
     assert!(request.get("width").is_none()&&request.get("height").is_none());
     assert!(prepare(&cfg,&edit(11)).is_err());
     assert!(prepare(&cfg,&Json::parse(br#"{"prompt":"a fox","negative_prompt":"blur"}"#).unwrap()).is_err());
+    let styled=prepare(&cfg,&Json::parse(br#"{"model":"tarot","prompt":"a trtcrd of a fox"}"#).unwrap()).unwrap();
+    assert_eq!(styled.get("loras").map(Json::to_json),Some(Json::Arr(vec![Json::obj([("path",Json::str(root.join("tarot.safetensors").to_string_lossy())),("strength",Json::Num(0.8))])]).to_json()));
+    let baseline=prepare(&cfg,&Json::parse(br#"{"model":"tarot","prompt":"a fox","use_loras":false}"#).unwrap()).unwrap();
+    assert!(baseline.get("loras").is_none());
     let _=std::fs::remove_dir_all(&root);
 }
 

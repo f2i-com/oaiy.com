@@ -382,12 +382,13 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
         "vision_projector" => ("llm", "vision_projector", Box::new(|_| true)),
         // (not a distilled Turbo checkpoint: it takes no adapter)
         "adapter" => ("image", "adapter", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image" && !bool_or(m, "distilled", false))),
-        "klein_lora" => {
+        kind @ ("klein_lora" | "flux3_lora") => {
+            let (arch, what) = if kind == "klein_lora" { ("flux2-klein-4b", "a Klein 4B image model before its style LoRA") } else { ("flux3-klein", "a FLUX 3 Image Klein model before its LoRA") };
             let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "image", "models"]) else { return Err("no image models".into()) };
-            let (name, model) = models.iter_mut().find(|(n,m)| str_or(m,"architecture","") == "flux2-klein-4b" && target.is_none_or(|(_,t)| n == t))
-                .ok_or("add or select a Klein 4B image model before its style LoRA")?;
+            let (name, model) = models.iter_mut().find(|(n,m)| str_or(m,"architecture","") == arch && target.is_none_or(|(_,t)| n == t))
+                .ok_or(format!("add or select {what}"))?;
             let mut list = model.get("loras").and_then(Json::as_array).unwrap_or(&[]).to_vec();
-            let added = field_of(d,"loras").ok_or("detected Klein LoRA has no path")?;
+            let added = field_of(d,"loras").ok_or("detected LoRA has no path")?;
             for value in added.as_array().ok_or("detected LoRA list is invalid")? { if !list.contains(value) { list.push(value.clone()); } }
             set(model,"loras",Json::Arr(list));
             let missing = missing_fields("image",model);
@@ -823,6 +824,19 @@ mod tests {
             assert_eq!(Path::new(str_or(m, "vae", "")), d.join("ae.safetensors").as_path());
             config::validate(&cfg).unwrap();
         }
+        // a LoRA picked after it (diffusers' names here) joins its list, once
+        let lora = d.join("tarot.safetensors");
+        safetensors(&lora, &format!("{{{}}}", tensor("transformer.mode_blocks.image.0.attn.to_q.lora_A.weight", "[16,3072]")));
+        let mut cfg = config::default_json();
+        assert!(add(&mut cfg, &lora, None, None).unwrap_err().contains("add or select a FLUX 3 Image Klein model before its LoRA"));
+        let (model, _) = add(&mut cfg, &d.join("model.safetensors"), None, None).unwrap();
+        for _ in 0..2 {
+            let (a, found) = add(&mut cfg, &lora, None, None).unwrap();
+            assert_eq!((found.kind(), a.name.as_str()), ("flux3_lora", model.name.as_str()));
+        }
+        let m = get(&cfg, &["media", "image", "models", &model.name]).unwrap();
+        assert_eq!(m.get("loras").map(Json::to_json), Some(format!("[{}]", Json::str(lora.to_string_lossy()).to_json())));
+        config::validate(&cfg).unwrap();
         let _ = std::fs::remove_dir_all(&d);
     }
 
