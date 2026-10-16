@@ -77,7 +77,7 @@ read into one buffer of exactly its size, so no smaller copy of a secret is left
 The independent review of `5859fd8d` found the primitives sound and the keystore not: a reader could be told "never stored" for a key that exists, a folder swapped
 in by another user was read as the real one, a FIFO hung a read for ever, and opening the store deleted another process's write in progress. The rules now are:
 
-- **The folder is held, not looked up** (`src/keydir.rs`). On Unix the store opens the keys folder once (`O_NOFOLLOW`) and opens, creates, renames and removes every
+- **The folder is held, not looked up** (`src/keydir/`). On Unix the store opens the keys folder once (`O_NOFOLLOW`) and opens, creates, renames and removes every
   file **relative to that descriptor** (`openat`, `renameat`, `unlinkat` through `rustix`'s safe API; the crate stays `#![deny(unsafe_code)]` outside the DPAPI
   module). A file is opened `O_NOFOLLOW | O_NONBLOCK` and judged by `fstat` on the descriptor that will be read: a regular file, owned by this user, no group or
   other permission. Before every operation the folder is judged again (owner, mode) and compared by device and inode with the path: a folder that was replaced,

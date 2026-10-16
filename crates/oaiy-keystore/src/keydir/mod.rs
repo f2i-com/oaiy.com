@@ -16,7 +16,7 @@
 //!   **refused if any folder on it is a reparse point** (walked before the folder is opened and again once it is held), every operation works in the held folder by
 //!   its **real path** (the handle's final path), and the path is opened afresh before each operation and compared with the handle (volume and file index). Every
 //!   file is opened as itself and refused if it is a reparse point, not a regular file, or has more than one name. The handle is also what the store flushes after a
-//!   rename, so that the new name survives a power cut (where the file system can: over SMB `FlushFileBuffers` on a folder is "incorrect function", and the answer is `Durability::Unconfirmed`). The header of `keydir_windows.rs` says what is left: the attacker who can write in the keys folder itself.
+//!   rename, so that the new name survives a power cut (where the file system can: over SMB `FlushFileBuffers` on a folder is "incorrect function", and the answer is `Durability::Unconfirmed`). The header of `windows.rs` says what is left: the attacker who can write in the keys folder itself.
 //!
 //! The two platform modules implement the same small set of operations; the store above them does not know which it is on.
 
@@ -31,10 +31,10 @@ use crate::error::KeyError;
 use crate::store::{Durability, MAX_VALUE_LEN};
 
 #[cfg(unix)]
-#[path = "keydir_unix.rs"]
+#[path = "unix.rs"]
 mod sys;
 #[cfg(windows)]
-#[path = "keydir_windows.rs"]
+#[path = "windows.rs"]
 mod sys;
 
 pub(crate) use sys::KeyDir;

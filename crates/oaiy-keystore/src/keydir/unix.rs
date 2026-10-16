@@ -1,4 +1,4 @@
-//! The keys folder on Unix: a directory descriptor, and every operation relative to it (see `keydir.rs` for why).
+//! The keys folder on Unix: a directory descriptor, and every operation relative to it (see `mod.rs` for why).
 
 use std::fs::{self, File};
 use std::io;

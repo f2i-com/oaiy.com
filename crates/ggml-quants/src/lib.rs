@@ -13,21 +13,16 @@
 pub mod dtype;
 pub mod error;
 
-pub mod iq;
-pub mod iq_tables;
-pub mod iq4_nl;
-pub mod iq4_xs;
-pub mod q2_0;
-pub mod q2_k;
-pub mod q3_k;
-pub mod q4_0;
-pub mod q4_1;
-pub mod q4_k;
-pub mod q5_0;
-pub mod q5_1;
-pub mod q5_k;
-pub mod q6_k;
-pub mod q8_0;
+// The block formats, a module each under the name GGML gives it (`q4_k`, `iq4_xs`, ...), their files grouped by
+// family: ggml's first formats (32 values a block and a scale, Q4_1's and Q5_1's a minimum too) with Q2_0; the
+// K-quants (256-value super-blocks of 16 or 32-value groups); and the importance-weighted ones (IQ4_NL, IQ4_XS and the
+// grid formats, with ggml's tables).
+mod i_quants;
+mod k_quants;
+mod legacy;
+pub use i_quants::{iq, iq4_nl, iq4_xs, iq_tables};
+pub use k_quants::{q2_k, q3_k, q4_k, q5_k, q6_k};
+pub use legacy::{q2_0, q4_0, q4_1, q5_0, q5_1, q8_0};
 
 pub use dtype::GgmlType;
 pub use error::{QuantError, Result};
