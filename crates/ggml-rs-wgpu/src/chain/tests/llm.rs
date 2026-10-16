@@ -124,6 +124,52 @@ fn a_delta_net_matches_the_hosts() {
     }
 }
 
+/// LFM2's gated short conv is transformers' `Lfm2ShortConv` between its projections: each row's `B * x` through the
+/// causal depthwise conv after the state's products, times C, the state then the last products; a step's and a few
+/// rows' (a thread a channel) and a prompt's (a thread a channel and row), each twice, the second from the first's
+/// state.
+#[test]
+fn lfm2s_short_conv_is_the_definitions() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (ch, kern) = (300usize, 3usize);
+    let mut next = rng(0x5eed_0f2c);
+    let cw: Vec<f32> = (0..ch * kern).map(|_| next() * 0.5).collect();
+    let up = |d: &[f32]| {
+        let v = b.vec(d.len().max(1));
+        DeviceChain::upload(&b, &v, d);
+        v
+    };
+    let cw_d = up(&cw);
+    for rows in [1usize, 3, 20, 70] {
+        let state0: Vec<f32> = (0..(kern - 1) * ch).map(|_| next()).collect();
+        let (state_d, mut window) = (up(&state0), state0.clone());
+        for run in 0..2 {
+            let bcx: Vec<f32> = (0..rows * 3 * ch).map(|_| next()).collect();
+            // the definition: the products after the window, oldest first
+            let mut want = vec![0f32; rows * ch];
+            for c in 0..ch {
+                let mut seq: Vec<f64> = (0..kern - 1).map(|k| window[k * ch + c] as f64).collect();
+                seq.extend((0..rows).map(|t| bcx[t * 3 * ch + c] as f64 * bcx[t * 3 * ch + 2 * ch + c] as f64));
+                for t in 0..rows {
+                    let acc: f64 = (0..kern).map(|k| seq[t + k] * cw[c * kern + k] as f64).sum();
+                    want[t * ch + c] = (bcx[t * 3 * ch + ch + c] as f64 * acc) as f32;
+                }
+                for k in 0..kern - 1 {
+                    window[k * ch + c] = seq[rows + k] as f32;
+                }
+            }
+            let (bcx_d, out) = (up(&bcx), b.vec(rows * ch));
+            let mut rec = b.begin();
+            rec.short_conv(&bcx_d, &cw_d, &state_d, &out, rows, ch, kern);
+            rec.read(&out);
+            rec.read(&state_d);
+            let got = rec.finish();
+            close(&got[0], &want, &format!("{rows} rows, run {run}: the output"));
+            close(&got[1], &window, &format!("{rows} rows, run {run}: the state"));
+        }
+    }
+}
+
 /// An alias reads its vector as it is when read, and a clone of it is a copy that does not follow the vector.
 #[test]
 fn an_alias_reads_its_vector_and_a_clone_is_a_copy() {

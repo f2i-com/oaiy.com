@@ -1,0 +1,343 @@
+[
+ {
+  "name": "plain",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is C. elegans?"
+   }
+  ],
+  "tools": null,
+  "prompt": "<|startoftext|><|im_start|>user\nWhat is C. elegans?<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant trained by Liquid AI."
+   },
+   {
+    "role": "user",
+    "content": "Hi!"
+   }
+  ],
+  "tools": null,
+  "prompt": "<|startoftext|><|im_start|>system\nYou are a helpful assistant trained by Liquid AI.<|im_end|>\n<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "history",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Name a colour."
+   },
+   {
+    "role": "assistant",
+    "content": "Blue.",
+    "reasoning_content": "Any colour will do."
+   },
+   {
+    "role": "user",
+    "content": "Another?"
+   }
+  ],
+  "tools": null,
+  "prompt": "<|startoftext|><|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nName a colour.<|im_end|>\n<|im_start|>assistant\nBlue.<|im_end|>\n<|im_start|>user\nAnother?<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "tools",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris for 3 days?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "The weather in a city, today and the days after.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "The city's name, e.g. 'São Paulo'"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "units": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "exact": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "prompt": "<|startoftext|><|im_start|>system\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"The weather in a city, today and the days after.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"The city's name, e.g. 'São Paulo'\"}, \"days\": {\"type\": \"integer\"}, \"units\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"filters\": {\"type\": \"object\"}, \"exact\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris for 3 days?<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "tools-system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You check facts."
+   },
+   {
+    "role": "user",
+    "content": "Look it up."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "exact": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "prompt": "<|startoftext|><|im_start|>system\nYou check facts.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"filters\": {\"type\": \"object\"}, \"exact\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}}]<|im_end|>\n<|im_start|>user\nLook it up.<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "call-and-result",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "Checking.",
+    "reasoning_content": "I should call get_weather.",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "days": 3,
+        "units": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp\": 18, \"sky\": \"clear\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "The weather in a city, today and the days after.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "The city's name, e.g. 'São Paulo'"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "units": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "prompt": "<|startoftext|><|im_start|>system\nUse tools.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"The weather in a city, today and the days after.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"The city's name, e.g. 'São Paulo'\"}, \"days\": {\"type\": \"integer\"}, \"units\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>I should call get_weather.</think>Checking.<|tool_call_start|>[get_weather(city='Paris', days=3, units='celsius')]<|tool_call_end|><|im_end|>\n<|im_start|>tool\n{\"temp\": 18, \"sky\": \"clear\"}<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "two-calls",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Find O'Brien's \"notes\"\nand the weather."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "query": "O'Brien's \"notes\"\nback\\slash",
+        "filters": {
+         "year": 2026,
+         "tags": [
+          "a",
+          "b"
+         ]
+        },
+        "exact": true
+       }
+      }
+     },
+     {
+      "id": "b",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Zürich"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "a",
+    "content": "nothing found"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "b",
+    "content": "rain"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>old thought</think>Nothing, and rain."
+   },
+   {
+    "role": "user",
+    "content": "Thanks."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "The weather in a city, today and the days after.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "The city's name, e.g. 'São Paulo'"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "units": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the web.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "exact": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "prompt": "<|startoftext|><|im_start|>system\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"The weather in a city, today and the days after.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"The city's name, e.g. 'São Paulo'\"}, \"days\": {\"type\": \"integer\"}, \"units\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"filters\": {\"type\": \"object\"}, \"exact\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}}]<|im_end|>\n<|im_start|>user\nFind O'Brien's \"notes\"\nand the weather.<|im_end|>\n<|im_start|>assistant\n<|tool_call_start|>[search(query='O\\'Brien\\'s \"notes\"\\nback\\\\slash', filters={\"year\": 2026, \"tags\": [\"a\", \"b\"]}, exact=True), get_weather(city='Zürich')]<|tool_call_end|><|im_end|>\n<|im_start|>tool\nnothing found<|im_end|>\n<|im_start|>tool\nrain<|im_end|>\n<|im_start|>assistant\nNothing, and rain.<|im_end|>\n<|im_start|>user\nThanks.<|im_end|>\n<|im_start|>assistant\n<think>"
+ }
+]

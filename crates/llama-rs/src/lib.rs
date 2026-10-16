@@ -192,6 +192,9 @@ impl Model {
             // mmproj path.
             Architecture::Qwen3VlMoe => Ok(Self::Qwen3Moe(Qwen3MoeModel::from_gguf(g, backend)?)),
             Architecture::Qwen35Moe => Ok(Self::Qwen35Moe(Qwen35MoeModel::from_gguf(g, backend)?)),
+            // VENDORED-LOCAL: LFM2-MoE as a Qwen3.5 hybrid of short convs, its experts a GPU's (the server's
+            // `Qwen35Model::from_gguf_with`): refused here, where nothing holds them
+            Architecture::Lfm2Moe => Ok(Self::Qwen35(Qwen35Model::from_gguf(g, backend)?)),
             Architecture::Qwen36MoeVl => Err(LlamaError::Config(
                 "Qwen3.6-VL-MoE arch detected. Three pending pieces: MoE loader \
                  (#85), Qwen3-VL vision tower (#84), and integration of both \

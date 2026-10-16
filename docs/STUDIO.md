@@ -152,7 +152,7 @@ The catalog lists mainstream releases only, with their licences:
 
 | Group | Models |
 |---|---|
-| Chat | On any GPU (GGUF): Qwen3.5 9B, 4B and 27B, Qwen3.8 27B at 4, 8 and 3 bits (the Agent can use its tools with these), Qwen3 8B and 4B, Gemma 4 E2B, Gemma 3 4B, MiniCPM-V 4.7 1B and 35B-A3B (read pictures; the 35B a 24 GB GPU: docs/MINICPMV.md), Llama 3.2 3B (chat only). Also on any GPU, each from its own checkpoint: Qwen3.8 27B as 3.21-bit OrcaSAQ, Qwen3.8-Flash-Next (two GPUs, or one with experts on the CPU) and DeepSeek V4.1 Flash (192 GB of RAM; slow), all with tool use. |
+| Chat | On any GPU (GGUF): Qwen3.5 9B, 4B and 27B, Qwen3.8 27B at 4, 8 and 3 bits (the Agent can use its tools with these), Qwen3 8B and 4B, Gemma 4 E2B, Gemma 3 4B, MiniCPM-V 4.7 1B and 35B-A3B (read pictures; the 35B a 24 GB GPU: docs/MINICPMV.md), LFM2.5 24B-A2B (a 16 GB GPU; the Agent can use its tools: docs/LFM2.md), Llama 3.2 3B (chat only). Also on any GPU, each from its own checkpoint: Qwen3.8 27B as 3.21-bit OrcaSAQ, Qwen3.8-Flash-Next (two GPUs, or one with experts on the CPU) and DeepSeek V4.1 Flash (192 GB of RAM; slow), all with tool use. |
 | Images | Qwen Image 2.1 with Viggle's turbo adapter; Stable Diffusion XL 1.0 with its CLIP tokenizer |
 | Video | LTX 2.5 (its BF16 transformer, Gemma 4 text encoder, and video and audio VAEs) |
 | Speech | Qwen3-TTS 1.7B (VoiceDesign and Base); Breeze TTS 2 |

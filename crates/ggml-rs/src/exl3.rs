@@ -109,6 +109,53 @@ pub fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
     out
 }
 
+/// VENDORED-LOCAL: how a MoE layer's router's logits (`[routed + 1]` a row, the shared expert's gate last) pick its
+/// experts and weight them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Routing {
+    /// [`route`]'s (Qwen's): the top k by logit, softmax-weighted among themselves, and the shared expert by its gate.
+    #[default]
+    Softmax,
+    /// LFM2's (`expert_gating_func` 2, transformers' `Lfm2MoeTopKRouter`): each routed expert's score the sigmoid of
+    /// its logit, the top k by score plus `bias` (the bias picks, it never weights), weighted by their scores over
+    /// the scores' sum (plus 1e-6, as transformers' `norm_topk_prob` divides) times `scale`; no shared expert (its
+    /// place in the row weighted 0, its logit unread).
+    Sigmoid { bias: Vec<f32>, scale: f32 },
+}
+
+impl Routing {
+    /// One row's experts and their weights, the routed ones then the shared one, as [`route`] gives them.
+    pub fn route(&self, logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+        match self {
+            Routing::Softmax => route(logits, top_k),
+            Routing::Sigmoid { bias, scale } => route_sigmoid(logits, top_k, bias, *scale),
+        }
+    }
+}
+
+/// [`Routing::Sigmoid`]'s routing of one row: the top `top_k` by score plus bias (a tie to the lower index), their
+/// scores summed in that order.
+pub fn route_sigmoid(logits: &[f32], top_k: usize, bias: &[f32], scale: f32) -> Vec<(usize, f32)> {
+    let routed = logits.len() - 1;
+    assert_eq!(bias.len(), routed, "a selection bias for each of {routed} experts");
+    let k = top_k.min(routed);
+    let score: Vec<f32> = logits[..routed].iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect();
+    let pick: Vec<f32> = score.iter().zip(bias).map(|(s, b)| s + b).collect();
+    let mut top: Vec<usize> = Vec::with_capacity(k + 1);
+    for (e, &v) in pick.iter().enumerate() {
+        if top.len() == k && (k == 0 || v <= pick[top[k - 1]]) {
+            continue;
+        }
+        let at = top.partition_point(|&o| pick[o] >= v);
+        top.insert(at, e);
+        top.truncate(k);
+    }
+    let sum = top.iter().map(|&e| score[e]).sum::<f32>() + 1e-6;
+    let mut out: Vec<(usize, f32)> = top.iter().map(|&e| (e, score[e] / sum * scale)).collect();
+    out.push((routed, 0.0));
+    out
+}
+
 #[derive(Debug)]
 pub struct Exl3Data {
     pub words: Vec<u32>,

@@ -23,7 +23,7 @@ use ggml_rs::{Backend, DeviceChain, DeviceVec, QuantizedTensor, Tensor};
 
 use crate::kv_cache::KvCache;
 use crate::loader::{FfnPair, Weight};
-use crate::qwen35::{Qwen35Block, Qwen35Model, Qwen35Moe};
+use crate::qwen35::{is_no_ffn, Qwen35Block, Qwen35Model, Qwen35Moe};
 
 // (parts of `impl Qwen35Chain`, each with what it alone uses)
 mod drafts;
@@ -107,6 +107,9 @@ struct LayerVecs {
 enum Mixer {
     /// The per-head q and k norms, and which of the attention cache's layers is this one's.
     Attention { q_norm: DeviceVec, k_norm: DeviceVec, slot: usize },
+    /// An LFM2 short conv's weights (`[d, kernel]`), and which recurrent state is this one's (its conv window; the
+    /// delta-net state there a placeholder).
+    Conv { conv_w: DeviceVec, slot: usize },
     /// The conv's weights, `ssm_a`, `dt_bias`, the output norm, the fused beta-alpha projection's weights when they
     /// are f32 (Qwen3.8 27B's; else it is a quantized weight the device holds), and which recurrent state is this one's.
     Ssm { conv_w: DeviceVec, a: DeviceVec, dt: DeviceVec, norm: DeviceVec, ba_f32: Option<DeviceVec>, slot: usize },
@@ -133,6 +136,10 @@ struct Dims {
     router: usize,
     /// The rows a piece takes at most where a MoE model's experts route no more on its device at once (0: as many).
     moe_rows: usize,
+    /// Whether an attention layer's q has a gate half (Qwen3.5's; LFM2's has none).
+    gated: bool,
+    /// An LFM2 short conv's in-projection's width (`3 d`: each row's B, C and x); 0: none.
+    bcx: usize,
 }
 
 /// The chain's copy of the attention layers' caches, a buffer a layer (row `t`: its K `[n_kv, head_dim]` then its
@@ -176,6 +183,8 @@ struct Pool {
 enum W<'a> {
     Quant(&'a QuantizedTensor),
     Packed(&'a dyn ggml_rs::exl3::PackedLinear),
+    /// A MoE layer's FFN of no shared expert (LFM2's: `qwen35::no_ffn`), never multiplied by.
+    Absent,
 }
 
 impl<'a> W<'a> {
@@ -184,6 +193,7 @@ impl<'a> W<'a> {
         match w {
             Weight::Quant(q) => W::Quant(q),
             Weight::Packed(p) => W::Packed(p.as_ref()),
+            w if is_no_ffn(w) => W::Absent,
             _ => unreachable!("the chain state checked every weight"),
         }
     }
@@ -202,6 +212,7 @@ impl<'a> W<'a> {
         match self {
             W::Quant(q) => rec.matmul_rows(q, x, y, rows),
             W::Packed(p) => rec.exl3_rows(p, x, y, rows),
+            W::Absent => unreachable!("a MoE layer's experts are its FFN"),
         }
     }
 
@@ -210,6 +221,7 @@ impl<'a> W<'a> {
         match self {
             W::Quant(q) => rec.matmul(q, x, y),
             W::Packed(p) => rec.exl3_rows(p, x, y, 1),
+            W::Absent => unreachable!("a MoE layer's experts are its FFN"),
         }
     }
 }
@@ -221,6 +233,8 @@ enum LayerW<'a> {
     /// `ba` none where the fused beta-alpha projection's weights are f32 (the layer's vectors hold them); `moe` a MoE
     /// layer's experts (its `ffn` and `down` then its shared expert's, unread here: the experts hold it)
     Ssm { qkv: W<'a>, gate: W<'a>, ba: Option<W<'a>>, out: W<'a>, ffn: FfnW<'a>, down: W<'a>, moe: Option<&'a Qwen35Moe> },
+    /// An LFM2 short conv's projections
+    Conv { in_proj: W<'a>, out: W<'a>, ffn: FfnW<'a>, down: W<'a>, moe: Option<&'a Qwen35Moe> },
 }
 
 /// An FFN's gate and up projections: fused, or a pair.
@@ -253,6 +267,9 @@ impl<'a> LayerW<'a> {
                 down: W::of(ffn_down),
                 moe: moe.as_deref(),
             },
+            Qwen35Block::Conv { in_proj, out_proj, ffn_pair, ffn_down, moe, .. } => {
+                LayerW::Conv { in_proj: W::of(in_proj), out: W::of(out_proj), ffn: ffn(ffn_pair), down: W::of(ffn_down), moe: moe.as_deref() }
+            }
         }
     }
 }
@@ -273,7 +290,7 @@ impl SplitW {
     fn copy(chain: &dyn DeviceChain, w: LayerW<'_>) -> Option<SplitW> {
         let c = |w: W<'_>| match w {
             W::Quant(q) => chain.copy_weight(q),
-            W::Packed(_) => None,
+            W::Packed(_) | W::Absent => None,
         };
         let ffn = |f: FfnW<'_>| -> Option<SplitFfn> {
             Some(match f {
@@ -282,8 +299,8 @@ impl SplitW {
             })
         };
         Some(match w {
-            // (a MoE layer's experts are its device's: not copied)
-            LayerW::Attention { moe: Some(_), .. } | LayerW::Ssm { moe: Some(_), .. } => return None,
+            // (a MoE layer's experts are its device's: not copied; nor is a short conv)
+            LayerW::Attention { moe: Some(_), .. } | LayerW::Ssm { moe: Some(_), .. } | LayerW::Conv { .. } => return None,
             LayerW::Attention { q, k, v, o, ffn: f, down, moe: None } => SplitW::Attention { q: c(q)?, k: c(k)?, v: c(v)?, o: c(o)?, ffn: ffn(f)?, down: c(down)? },
             LayerW::Ssm { qkv, gate, ba, out, ffn: f, down, moe: None } => SplitW::Ssm {
                 qkv: c(qkv)?,
@@ -442,6 +459,8 @@ struct Work {
     last: DeviceVec,
     /// A MoE layer's router's logits
     router: DeviceVec,
+    /// An LFM2 short conv's in-projection's output (each row's B, C and x)
+    bcx: DeviceVec,
 }
 
 impl Work {
@@ -470,6 +489,7 @@ impl Work {
             table: first(&self.table, t * s.rot),
             last: self.last.clone(),
             router: first(&self.router, t * s.router.max(1)),
+            bcx: first(&self.bcx, t * s.bcx.max(1)),
         }
     }
 
@@ -512,6 +532,7 @@ impl Work {
             table: v(t * s.rot),
             last: v(s.d),
             router: v(t * s.router.max(1)),
+            bcx: v(t * s.bcx.max(1)),
         }
     }
 }
@@ -692,7 +713,7 @@ mod position_tests {
     #[test]
     fn a_growth_the_device_refuses_leaves_a_cache_the_next_prompt_makes_anew() {
         use std::sync::atomic::Ordering::SeqCst;
-        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0, router: 0, moe_rows: 0 };
+        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0, router: 0, moe_rows: 0, gated: true, bcx: 0 };
         let (slots, row) = (16, 2 * s.n_kv * s.hd);
         for keep in [1024, 0] {
             let chain = Counting { live: Default::default(), most: Default::default(), left: usize::MAX.into() };
@@ -722,7 +743,7 @@ mod position_tests {
     #[test]
     fn a_cache_grows_without_holding_the_old_one_beside_the_new() {
         use std::sync::atomic::Ordering::SeqCst;
-        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0, router: 0, moe_rows: 0 };
+        let s = super::Dims { d: 5120, n_h: 24, n_kv: 4, hd: 256, rot: 0, ff: 0, nv: 0, nk: 0, dk: 0, dv: 0, ch: 0, kern: 0, vocab: 0, router: 0, moe_rows: 0, gated: true, bcx: 0 };
         let (slots, row) = (16, 2 * s.n_kv * s.hd);
         let layer = |cap: usize| cap * row * 4;
         for keep in [16_384, 0] {
@@ -995,6 +1016,9 @@ fn layer_vecs(chain: &dyn DeviceChain, b: &Qwen35Block, slot: usize) -> LayerVec
         Qwen35Block::Attention { attn_norm, attn_q_norm, attn_k_norm, post_norm, moe, .. } => {
             LayerVecs { attn_norm: up(attn_norm), post_norm: up(post_norm), mixer: Mixer::Attention { q_norm: up(attn_q_norm), k_norm: up(attn_k_norm), slot }, router: router(moe) }
         }
+        Qwen35Block::Conv { attn_norm, conv, post_norm, moe, .. } => {
+            LayerVecs { attn_norm: up(attn_norm), post_norm: up(post_norm), mixer: Mixer::Conv { conv_w: up(conv), slot }, router: router(moe) }
+        }
         Qwen35Block::Ssm { attn_norm, ssm_conv1d, ssm_a, ssm_ba, ssm_dt_bias, ssm_norm, post_norm, moe, .. } => {
             let ba_f32 = match ssm_ba {
                 Weight::Dense(t) => Some(up(t)),
@@ -1054,7 +1078,7 @@ struct Seg {
 
 impl Seg {
     fn new(chain: &dyn DeviceChain, s: &Dims) -> Self {
-        Seg { qkv: chain.vec(TAP_ROWS * s.ch), z: chain.vec(TAP_ROWS * s.nv * s.dv), ba: chain.vec(TAP_ROWS * 2 * s.nv), conv: chain.vec(TAP_ROWS * s.ch), core: chain.vec(TAP_ROWS * s.nv * s.dv) }
+        Seg { qkv: chain.vec(TAP_ROWS * s.ch.max(s.bcx)), z: chain.vec(TAP_ROWS * s.nv * s.dv), ba: chain.vec(TAP_ROWS * 2 * s.nv), conv: chain.vec(TAP_ROWS * s.ch), core: chain.vec(TAP_ROWS * s.nv * s.dv) }
     }
 }
 
@@ -1083,12 +1107,14 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
         }
         let (ffn, down, moe) = match (lw, &lv.mixer) {
             (LayerW::Attention { q, k, v, o, ffn, down, moe }, Mixer::Attention { q_norm, k_norm, slot }) => {
-                q.rows(rec, &w.xn, &w.qfull, t);
+                // each head's q is its query then its gate (LFM2's its query alone)
+                q.rows(rec, &w.xn, if s.gated { &w.qfull } else { &w.q }, t);
                 k.rows(rec, &w.xn, &w.k, t);
                 v.rows(rec, &w.xn, &w.v, t);
-                // each head's q is its query then its gate
-                rec.copy_cols(&w.qfull, &w.q, t * s.n_h, s.hd, 2 * s.hd, 0);
-                rec.copy_cols(&w.qfull, &w.gate, t * s.n_h, s.hd, 2 * s.hd, s.hd);
+                if s.gated {
+                    rec.copy_cols(&w.qfull, &w.q, t * s.n_h, s.hd, 2 * s.hd, 0);
+                    rec.copy_cols(&w.qfull, &w.gate, t * s.n_h, s.hd, 2 * s.hd, s.hd);
+                }
                 rec.rmsnorm_rows(&w.q, q_norm, &w.qn, t * s.n_h, eps);
                 rec.rmsnorm_rows(&w.k, k_norm, &w.kn, t * s.n_kv, eps);
                 rec.rope_partial_rows(&w.qn, t, s.n_h, s.hd, s.rot, &w.table);
@@ -1110,8 +1136,7 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                             rec.copy(o1, 0, b.attn, r * qd, qd);
                         }
                     }
-                    rec.mul_sigmoid(b.attn, &w.gate, &w.gated, t * s.n_h * s.hd);
-                    o.rows(rec, &w.gated, &w.proj, t);
+                    gate_out(rec, s, b.attn, w, o, t);
                     (ffn, down, moe)
                 } else {
                 let kvl = &b.kvl[*slot];
@@ -1137,10 +1162,39 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
                 } else {
                     rec.attention_rows(&w.qn, kvl, b.attn, t, s.n_h, s.n_kv, s.hd, past, None, scale);
                 }
-                rec.mul_sigmoid(b.attn, &w.gate, &w.gated, t * s.n_h * s.hd);
-                o.rows(rec, &w.gated, &w.proj, t);
+                gate_out(rec, s, b.attn, w, o, t);
                 (ffn, down, moe)
                 }
+            }
+            (LayerW::Conv { in_proj, out, ffn, down, moe }, Mixer::Conv { conv_w, slot }) => {
+                let (state, conv) = &b.states[*slot];
+                debug_assert!(check.is_none(), "a model of short convs drafts nothing");
+                in_proj.rows(rec, &w.xn, &w.bcx, t);
+                if b.taps.is_empty() {
+                    rec.short_conv(&w.bcx, conv_w, conv, &w.conv, t, s.d, s.kern);
+                } else {
+                    // in parts, as a delta net's: the first where the rows are, the later ones through the parts' own
+                    // vectors and back, each kept state copied (the delta-net state a placeholder, copied as it is)
+                    let mut done = 0;
+                    for (end, keep) in b.taps.iter().map(|tap| (tap.row, Some(&tap.vecs[*slot]))).chain(std::iter::once((t, None))) {
+                        let n = end - done;
+                        if n > 0 && done == 0 {
+                            rec.short_conv(&w.bcx, conv_w, conv, &w.conv, n, s.d, s.kern);
+                        } else if n > 0 {
+                            let seg = b.seg.expect("a tapped run's later rows' vectors");
+                            rec.copy(&w.bcx, done * s.bcx, &seg.qkv, 0, n * s.bcx);
+                            rec.short_conv(&seg.qkv, conv_w, conv, &seg.conv, n, s.d, s.kern);
+                            rec.copy(&seg.conv, 0, &w.conv, done * s.d, n * s.d);
+                        }
+                        if let Some((sv, cv)) = keep {
+                            rec.copy(state, 0, sv, 0, state.len);
+                            rec.copy(conv, 0, cv, 0, conv.len);
+                        }
+                        done = end;
+                    }
+                }
+                out.rows(rec, &w.conv, &w.proj, t);
+                (ffn, down, moe)
             }
             (LayerW::Ssm { qkv, gate, ba, out, ffn, down, moe }, Mixer::Ssm { conv_w, a, dt, norm, ba_f32, slot }) => {
                 let (state, conv) = &b.states[*slot];
@@ -1219,6 +1273,17 @@ fn record_layers<'w>(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, eps: f32, l
             }
         }
         *added = true;
+    }
+}
+
+/// An attention layer's output (`attn`'s first rows) through its gate's sigmoid where its q has one, then its output
+/// projection into `w.proj`.
+fn gate_out(rec: &mut dyn ggml_rs::ChainRecorder, s: &Dims, attn: &DeviceVec, w: &Work, o: W<'_>, t: usize) {
+    if s.gated {
+        rec.mul_sigmoid(attn, &w.gate, &w.gated, t * s.n_h * s.hd);
+        o.rows(rec, &w.gated, &w.proj, t);
+    } else {
+        o.rows(rec, &first(attn, t * s.n_h * s.hd), &w.proj, t);
     }
 }
 
@@ -1403,18 +1468,30 @@ impl Qwen35Chain {
                 let cfg = &m.config;
                 let sc = &m.ssm_cfg;
                 let held = |w: &Weight| W::held(chain, w);
-                let (nv, nk, dk) = (sc.time_step_rank, sc.group_count, sc.state_size);
-                let dv = if nv == 0 { 0 } else { sc.inner_size / nv };
+                // (an LFM2 model's recurrent layers are short convs: no delta net, whose sizes are then placeholders of
+                // one, its states' too; its attention layers' q has no gate)
+                let lfm2 = m.blocks.iter().any(|b| matches!(b, Qwen35Block::Conv { .. }));
+                let (nv, nk, dk) = if lfm2 { (1, 1, 1) } else { (sc.time_step_rank, sc.group_count, sc.state_size) };
+                let dv = if lfm2 { 1 } else if nv == 0 { 0 } else { sc.inner_size / nv };
                 let (n_h, n_kv, hd, d) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.embedding_dim);
-                if nv == 0 || nk == 0 || dk != dv || ![16, 32, 64, 128].contains(&dk) || !(2..=8).contains(&sc.conv_kernel) {
+                if (!lfm2 && (nv == 0 || nk == 0 || dk != dv || ![16, 32, 64, 128].contains(&dk))) || !(2..=8).contains(&sc.conv_kernel) {
                     return None;
                 }
+                if lfm2 && m.blocks.iter().any(|b| matches!(b, Qwen35Block::Ssm { .. })) {
+                    return None;
+                }
+                let gated = !lfm2;
                 if n_kv == 0 || n_h % n_kv != 0 || cfg.rope_dim == 0 || cfg.rope_dim > hd || cfg.rope_dim % 2 != 0 || !held(&m.output) {
                     return None;
                 }
-                let ch = 2 * nk * dk + nv * dv;
-                let ff = m.blocks.first().map(|b| match b {
-                    Qwen35Block::Attention { ffn_pair, .. } | Qwen35Block::Ssm { ffn_pair, .. } => ffn_pair.ff(),
+                let ch = if lfm2 { d } else { 2 * nk * dk + nv * dv };
+                // (the dense FFNs' width: a MoE model's first layer's where every layer has experts, its shared
+                // expert's)
+                let has_moe = |b: &Qwen35Block| match b {
+                    Qwen35Block::Attention { moe, .. } | Qwen35Block::Ssm { moe, .. } | Qwen35Block::Conv { moe, .. } => moe.is_some(),
+                };
+                let ff = m.blocks.iter().find(|b| !has_moe(b)).or(m.blocks.first()).map(|b| match b {
+                    Qwen35Block::Attention { ffn_pair, .. } | Qwen35Block::Ssm { ffn_pair, .. } | Qwen35Block::Conv { ffn_pair, .. } => ffn_pair.ff(),
                 })?;
                 let pair_held = |p: &FfnPair| match p {
                     FfnPair::Fused(w) => held(w),
@@ -1426,20 +1503,25 @@ impl Qwen35Chain {
                     moe.as_ref().is_none_or(|m| chain.holds_experts(&*m.experts) && !m.experts.on_host() && !m.experts.part_held() && !m.experts.host_rest() && m.router.shape() == [m.router.dim(0), d])
                 };
                 let routers: Vec<usize> = m.blocks.iter().filter_map(|b| match b {
-                    Qwen35Block::Attention { moe, .. } | Qwen35Block::Ssm { moe, .. } => moe.as_ref().map(|m| m.router.dim(0)),
+                    Qwen35Block::Attention { moe, .. } | Qwen35Block::Ssm { moe, .. } | Qwen35Block::Conv { moe, .. } => moe.as_ref().map(|m| m.router.dim(0)),
                 }).collect();
                 let router = routers.first().copied().unwrap_or(0);
-                if routers.iter().any(|&r| r != router) || (router > 0 && routers.len() != m.blocks.len()) {
+                // (LFM2's first layers dense, the rest with experts; Qwen's every layer one or the other)
+                if routers.iter().any(|&r| r != router) || (router > 0 && !lfm2 && routers.len() != m.blocks.len()) {
                     return None;
                 }
+                // a layer's FFN: dense and held, or (a MoE layer's of no shared expert) none
+                let ffn_ok = |p: &FfnPair, down: &Weight, moe: &Option<Box<Qwen35Moe>>| (moe.is_some() && is_no_ffn(down)) || (held(down) && pair_held(p) && p.ff() == ff);
                 for b in &m.blocks {
                     let ok = match b {
-                        Qwen35Block::Attention { moe, .. } | Qwen35Block::Ssm { moe, .. } if !moe_held(moe) => false,
-                        Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, .. } => {
-                            [attn_q, attn_k, attn_v, attn_output, ffn_down].into_iter().all(held)
-                                && attn_q.shape()[0] == 2 * n_h * hd
-                                && pair_held(ffn_pair)
-                                && ffn_pair.ff() == ff
+                        Qwen35Block::Attention { moe, .. } | Qwen35Block::Ssm { moe, .. } | Qwen35Block::Conv { moe, .. } if !moe_held(moe) => false,
+                        Qwen35Block::Attention { attn_q, attn_k, attn_v, attn_output, ffn_pair, ffn_down, moe, .. } => {
+                            [attn_q, attn_k, attn_v, attn_output].into_iter().all(held)
+                                && attn_q.shape()[0] == if gated { 2 } else { 1 } * n_h * hd
+                                && ffn_ok(ffn_pair, ffn_down, moe)
+                        }
+                        Qwen35Block::Conv { in_proj, out_proj, conv, ffn_pair, ffn_down, moe, .. } => {
+                            [in_proj, out_proj].into_iter().all(held) && in_proj.shape()[0] == 3 * d && conv.numel() == d * sc.conv_kernel && ffn_ok(ffn_pair, ffn_down, moe)
                         }
                         Qwen35Block::Ssm { attn_qkv, attn_gate, ssm_ba, ssm_out, ffn_pair, ffn_down, ssm_conv1d, .. } => {
                             [attn_qkv, attn_gate, ssm_out, ffn_down].into_iter().all(held)
@@ -1456,7 +1538,7 @@ impl Qwen35Chain {
                     }
                 }
                 let upload = |t: &Tensor| upload_tensor(chain, t);
-                let dims = Dims { d, n_h, n_kv, hd, rot: cfg.rope_dim, ff, nv, nk, dk, dv, ch, kern: sc.conv_kernel, vocab: cfg.vocab_size, router, moe_rows: if router > 0 { m.moe_rows } else { 0 } };
+                let dims = Dims { d, n_h, n_kv, hd, rot: cfg.rope_dim, ff, nv, nk, dk, dv, ch, kern: sc.conv_kernel, vocab: cfg.vocab_size, router, moe_rows: if router > 0 { m.moe_rows } else { 0 }, gated, bcx: if lfm2 { 3 * d } else { 0 } };
                 let (mut attention_layers, mut ssm_layers) = (Vec::new(), Vec::new());
                 let layers = m
                     .blocks
@@ -1468,7 +1550,7 @@ impl Qwen35Chain {
                                 attention_layers.push(l);
                                 attention_layers.len() - 1
                             }
-                            Qwen35Block::Ssm { .. } => {
+                            Qwen35Block::Ssm { .. } | Qwen35Block::Conv { .. } => {
                                 ssm_layers.push(l);
                                 ssm_layers.len() - 1
                             }

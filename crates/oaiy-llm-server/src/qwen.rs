@@ -213,11 +213,11 @@ fn call_excerpt(raw: &str) -> String {
 /// until the existing strict parser validates the complete call. A token may
 /// end halfway through a UTF-8 character or the opening tool tag.
 #[derive(Default)]
-struct NativeStream { sent: String, tool_sent: String }
+struct NativeStream { sent: String, tool_sent: String, calls: Calls }
 
 impl NativeStream {
     fn tool_preview(&mut self, decoded: &str) -> Result<Option<(String, bool)>, String> {
-        let Some(at) = decoded.find("<tool_call>") else { return Ok(None) };
+        let Some(at) = decoded.find(self.calls.open().0) else { return Ok(None) };
         let draft = decoded[at..].trim_end_matches('\u{fffd}');
         let delta = draft.strip_prefix(&self.tool_sent).ok_or("Qwen tool preview changed after streaming")?;
         if delta.is_empty() { return Ok(None); }
@@ -227,11 +227,11 @@ impl NativeStream {
     }
 
     fn push(&mut self, decoded: &str, tools: &[Json], complete: bool) -> Result<String, String> {
-        let text = if complete { normalize(decoded, tools)? } else {
+        let text = if complete { self.calls.normalize(decoded, tools)? } else {
             if decoded.contains(DSML) { return Err("unexpected DSML in Qwen output".into()); }
-            const TAG: &str = "<tool_call>";
-            let end = decoded.find("<tool_call").unwrap_or_else(|| {
-                let held = (1..TAG.len()).rev().find(|&n| decoded.ends_with(&TAG[..n])).unwrap_or(0);
+            let (tag, start) = self.calls.open();
+            let end = decoded.find(start).unwrap_or_else(|| {
+                let held = (1..tag.len()).rev().find(|&n| decoded.ends_with(&tag[..n])).unwrap_or(0);
                 decoded.len()-held
             });
             decoded[..end].trim_end_matches('\u{fffd}').to_owned()
@@ -658,6 +658,35 @@ pub struct QwenEngine {
     building: Option<(Vec<u64>, bool, WholeBuilder, std::time::Instant)>,
     /// A MiniCPM-V 4.7 model's picture layout (its pictures' positions are its canvas's).
     minicpmv: Option<MiniCpmV>,
+    /// Its model's calls: Qwen's XML, or LFM2's Python list.
+    calls: Calls,
+}
+
+/// How a model writes its tool calls: Qwen's `<tool_call>` XML, or LFM2's Python list between
+/// `<|tool_call_start|>` and `<|tool_call_end|>` (`crate::lfm2`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Calls {
+    #[default]
+    Qwen,
+    Lfm2,
+}
+
+impl Calls {
+    /// What opens a call (its first characters enough to hold back text at).
+    fn open(self) -> (&'static str, &'static str) {
+        match self {
+            Calls::Qwen => ("<tool_call>", "<tool_call"),
+            Calls::Lfm2 => (crate::lfm2::CALL_START, "<|tool_call_start"),
+        }
+    }
+
+    /// A complete reply's calls in the server's tool markup.
+    fn normalize(self, text: &str, tools: &[Json]) -> Result<String, String> {
+        match self {
+            Calls::Qwen => normalize(text, tools),
+            Calls::Lfm2 => crate::lfm2::normalize(text, tools),
+        }
+    }
 }
 
 /// The times a reply is turned from a run without end before it is stopped: a model turned from one may write
@@ -668,11 +697,16 @@ impl QwenEngine {
     pub fn new(model: impl Into<Hybrid>, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let model = model.into();
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true, replying: false, unsaved: Vec::new(), building: None, minicpmv: None }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true, replying: false, unsaved: Vec::new(), building: None, minicpmv: None, calls: Calls::Qwen }
     }
     /// A MiniCPM-V 4.7 model: its pictures laid out on their canvases ([`prepare_minicpmv`], [`positions`]).
     pub fn minicpmv(mut self, layout: Option<MiniCpmV>) -> Self {
         self.minicpmv = layout;
+        self
+    }
+    /// Its model's tool calls' format (Qwen's unless this says otherwise).
+    pub fn calls(mut self, calls: Calls) -> Self {
+        self.calls = calls;
         self
     }
     /// Whether a run that repeats without end is turned from and stopped (it is, unless this says not).
@@ -1010,7 +1044,7 @@ impl QwenEngine {
         let think_end = tok.token_id("</think>");
         let mut thinking = job.think_budget.is_some();
         let mut generated = Vec::new(); let mut think_used = 0usize;
-        let mut stream = NativeStream::default();
+        let mut stream = NativeStream { calls: self.calls, ..Default::default() };
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
         // (OAIY_CHAIN_PROFILE: the prompt's kernels said here, the reply's alone after)
         #[cfg(feature = "webgpu")]

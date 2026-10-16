@@ -18,10 +18,10 @@
 //! grid's bytes take four values at most), so a group is one load of it: as WGSL constants such tables are copied at
 //! each call, which once ran a dispatch past Windows' two seconds and reset the driver (`crate::shaders::layout`'s
 //! note).
-use crate::exl3::{coop_on, many_order, moe_rows_for, record_route, Step, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, WSUM_APPLY, WSUM_ROWS};
+use crate::exl3::{coop_on, many_order, moe_rows_for, record_route, record_route_sigmoid, Step, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, WSUM_APPLY, WSUM_ROWS};
 use crate::{chunk_limit, Gpu, WgpuBackend};
 use ggml_quants::GgmlType;
-use ggml_rs::exl3::{route, Experts};
+use ggml_rs::exl3::{Experts, Routing};
 use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec, Tensor};
 use rayon::prelude::*;
 use std::sync::atomic::Ordering;
@@ -122,8 +122,11 @@ pub struct QuantMoe {
     gu: Group,
     down: Group,
     /// The shared expert: its gate and up matrices one below the other (one matmul gives both, a dispatch fewer a
-    /// layer), and its down one.
-    shared: [Dense; 2],
+    /// layer), and its down one; none where the layer has none.
+    shared: Option<[Dense; 2]>,
+    /// How the router's logits pick and weight the experts, and a sigmoid router's selection bias on the GPU.
+    routing: Routing,
+    bias: Option<DeviceVec>,
     /// Whether a prompt's blocks go to the tensor cores (where the device has them; OAIY_QUANT_MOE_NO_COOP: no).
     coop: bool,
     /// The bytes counted against the backend's budget, given back when the layer goes.
@@ -134,7 +137,8 @@ pub struct QuantMoe {
 
 impl std::fmt::Debug for QuantMoe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "QuantMoe({} routed experts of {}x{} in {} as two groups, and the shared one)", self.routed, self.hidden, self.ff, self.gu.kind.tag())
+        let shared = if self.shared.is_some() { ", and the shared one" } else { "" };
+        write!(f, "QuantMoe({} routed experts of {}x{} in {} as two groups{shared})", self.routed, self.hidden, self.ff, self.gu.kind.tag())
     }
 }
 
@@ -177,7 +181,7 @@ impl QuantMoe {
         if part && !b.host_weights() {
             return Err(data);
         }
-        let shared_bytes = (3 * h * f * 4) as u64;
+        let shared_bytes = if data.shared.is_some() { (3 * h * f * 4) as u64 } else { 0 };
         let total = (gu_bytes + d_bytes) / e as u64 * held as u64 + shared_bytes + if part { ((4 * e + 4 + 3 * TAKE) * 4) as u64 } else { 0 };
         let prev = b.used.fetch_add(total, Ordering::Relaxed);
         if prev + total > b.budget.saturating_sub(reserve) {
@@ -208,7 +212,15 @@ impl QuantMoe {
         };
         let gu = group(&[&data.gate, &data.up], kg, f, h);
         let down = group(&[&data.down], kd, h, f);
-        let shared = [Dense::stacked(b, &data.shared[0], &data.shared[1], 2 * f, h), Dense::new(b, &data.shared[2], h, f)];
+        let shared = data.shared.as_ref().map(|s| [Dense::stacked(b, &s[0], &s[1], 2 * f, h), Dense::new(b, &s[2], h, f)]);
+        let bias = match &data.routing {
+            Routing::Sigmoid { bias, .. } => {
+                let v = b.vec(bias.len());
+                DeviceChain::upload(b, &v, bias);
+                Some(v)
+            }
+            Routing::Softmax => None,
+        };
         let coop = coop_on(&b.gpu) && std::env::var_os("OAIY_QUANT_MOE_NO_COOP").is_none();
         let cache = part.then(|| {
             // each expert's slot (the first `held` their own), no pass yet, no place in a prompt's scratch; the first
@@ -241,7 +253,7 @@ impl QuantMoe {
                 counts: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
             })
         });
-        Ok(QuantMoe { b: b.clone(), routed: e, hidden: h, ff: f, gu, down, shared, coop, bytes: total, cache })
+        Ok(QuantMoe { b: b.clone(), routed: e, hidden: h, ff: f, gu, down, shared, routing: data.routing, bias, coop, bytes: total, cache })
     }
 
     pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
@@ -413,7 +425,13 @@ impl QuantMoe {
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
-        record_route(rec, &buf(logits), &st, self.routed, top_k, rows);
+        match (&self.routing, &self.bias) {
+            (Routing::Sigmoid { scale, .. }, Some(bias)) => {
+                let pick = rec.scratch(rows * (self.routed + 1));
+                record_route_sigmoid(rec, &buf(logits), &buf(bias), &buf(&pick), &st, self.routed, top_k, rows, *scale);
+            }
+            _ => record_route(rec, &buf(logits), &st, self.routed, top_k, rows),
+        }
         if many {
             // blocks of some three times the jobs an expert has on average; the most blocks the experts could fill (a
             // part-filled one each at most), the grid that wide
@@ -475,21 +493,27 @@ impl QuantMoe {
         }
         // the shared expert on every row: its gate and up with their SwiGLU, then its down projection with the
         // experts' sum into the streams, each one dispatch for a step's row or a check's few
-        self.shared[0].rows_swiglu(rec, x, &st.sg, &st.part_gu, rows);
-        if let Some((xs, post, streams)) = into {
-            assert!(xs.len >= rows * streams * h && post.len >= rows * streams, "moe: {rows} rows' {streams} streams");
-            let down = &self.shared[1];
-            if down.half && rec.shared_down_wsum(&down.w, h, f, &st.part_gu, &st.out_d, &st.w, post, xs, rows, top_k, streams) {
-                return;
+        if let Some(shared) = &self.shared {
+            shared[0].rows_swiglu(rec, x, &st.sg, &st.part_gu, rows);
+            if let Some((xs, post, streams)) = into {
+                assert!(xs.len >= rows * streams * h && post.len >= rows * streams, "moe: {rows} rows' {streams} streams");
+                let down = &shared[1];
+                if down.half && rec.shared_down_wsum(&down.w, h, f, &st.part_gu, &st.out_d, &st.w, post, xs, rows, top_k, streams) {
+                    return;
+                }
             }
+            shared[1].rows(rec, &st.part_gu, &st.sd, rows);
         }
-        self.shared[1].rows(rec, &st.part_gu, &st.sd, rows);
+        // (no shared expert: its place weighted 0, the sums reading the routed experts' outputs there, which hold
+        // numbers, where the shared one's vector holds whatever its last user left)
+        let sd = if self.shared.is_some() { buf(&st.sd) } else { buf(&st.out_d) };
         let groups = (((rows * h) as u32).div_ceil(256), 1, 1);
         match into {
             Some((xs, post, streams)) => {
-                rec.dispatch_wide("moe-wsum-apply", WSUM_APPLY, [&buf(&st.out_d), &buf(&st.sd), &buf(&st.w), &buf(post), &d, &d, &buf(xs), &drw], &[h as u32, top_k as u32, rows as u32, streams as u32], groups);
+                assert!(xs.len >= rows * streams * h && post.len >= rows * streams, "moe: {rows} rows' {streams} streams");
+                rec.dispatch_wide("moe-wsum-apply", WSUM_APPLY, [&buf(&st.out_d), &sd, &buf(&st.w), &buf(post), &d, &d, &buf(xs), &drw], &[h as u32, top_k as u32, rows as u32, streams as u32], groups);
             }
-            None => rec.dispatch_wide("moe-wsum-rows", WSUM_ROWS, [&buf(&st.out_d), &buf(&st.sd), &buf(&st.w), &d, &d, &d, &buf(out), &drw], &[h as u32, top_k as u32, rows as u32], groups),
+            None => rec.dispatch_wide("moe-wsum-rows", WSUM_ROWS, [&buf(&st.out_d), &sd, &buf(&st.w), &d, &d, &d, &buf(out), &drw], &[h as u32, top_k as u32, rows as u32], groups),
         }
     }
 }
@@ -509,7 +533,7 @@ impl Experts for QuantMoe {
         let logits = logits.to_host();
         let rows = x.numel() / h;
         let width = self.routed + 1;
-        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&logits.data()[r * width..(r + 1) * width], top_k)).collect();
+        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| self.routing.route(&logits.data()[r * width..(r + 1) * width], top_k)).collect();
         let b = &self.b;
         let (xd, out) = (b.vec(rows * h), b.vec(rows * h));
         DeviceChain::upload(b, &xd, x.data());

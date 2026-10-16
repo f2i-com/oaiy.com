@@ -57,6 +57,8 @@ pub fn apply_chat_template(arch: &Architecture, messages: &[ChatMessage], add_as
         // Gemma 4 introduced new `<|turn>` / `<turn|>` markers.
         Architecture::Gemma4 => gemma4_template(messages, add_assistant),
         Architecture::Qwen2 => chatml_template(messages, add_assistant, false),
+        // VENDORED-LOCAL: LFM2's ChatML after its `<|startoftext|>`, the reply opening on its thought.
+        Architecture::Lfm2Moe => lfm2_template(messages, add_assistant),
         // VENDORED-LOCAL: GLM-5.3-Flash.
         Architecture::Glm5Next => glm5next_template(messages, add_assistant),
         // Qwen3 ships with "thinking mode" enabled by default. To get a normal
@@ -379,7 +381,7 @@ pub fn chat_stop_tokens(arch: &Architecture) -> &'static [&'static str] {
         Architecture::Gemma4 => &["<turn|>"],
         Architecture::Qwen2 | Architecture::Qwen3 | Architecture::Qwen35 |
         Architecture::Qwen3Moe | Architecture::Qwen3VlMoe |
-        Architecture::Qwen35Moe | Architecture::Qwen36MoeVl => &["<|im_end|>"],
+        Architecture::Qwen35Moe | Architecture::Qwen36MoeVl | Architecture::Lfm2Moe => &["<|im_end|>"],
         // VENDORED-LOCAL: GLM-5.3-Flash. Resolved from the GGUF vocab, not guessed:
         // eos 154820 = `<|endoftext|>`, eot 154827 = `<|user|>`, eom 154829 =
         // `<|observation|>`. GLM ends an assistant turn by emitting the *next*
@@ -389,6 +391,24 @@ pub fn chat_stop_tokens(arch: &Architecture) -> &'static [&'static str] {
         Architecture::Mistral => &["</s>"],
         Architecture::Unsupported(_) => &[],
     }
+}
+
+/// VENDORED-LOCAL: LFM2's template (its `chat_template.jinja` without tools): `<|startoftext|>`, then ChatML; the
+/// reply opened with `<think>` (LFM2.5 always thinks first).
+fn lfm2_template(messages: &[ChatMessage], add_assistant: bool) -> String {
+    let mut out = String::from("<|startoftext|>");
+    for m in messages {
+        let role = match m.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        out.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", m.content));
+    }
+    if add_assistant {
+        out.push_str("<|im_start|>assistant\n<think>");
+    }
+    out
 }
 
 /// Generic fallback for unknown architectures. Just dumps role: content per line.

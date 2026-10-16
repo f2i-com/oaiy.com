@@ -289,8 +289,6 @@ impl Snapshot {
         if self.pos == 0 || self.pos > kv.max_len || self.layers.len() != attention.len() {
             return Err("incompatible Qwen checkpoint dimensions".into());
         }
-        let vd = ssm.inner_size / ssm.time_step_rank;
-        let conv = 2 * ssm.state_size * ssm.group_count + ssm.inner_size;
         // Validate every tensor before touching the live state.
         for (i, (layer, &attn)) in self.layers.iter().zip(attention).enumerate() {
             let expected = if attn && reuse_attention {
@@ -299,7 +297,7 @@ impl Snapshot {
                 let shape = vec![self.pos, kv.n_kv_heads_per_layer[i], kv.head_dims[i]];
                 [Some(shape.clone()), Some(shape), None, None]
             } else {
-                [None, None, Some(vec![ssm.time_step_rank, vd, vd]), Some(vec![ssm.conv_kernel - 1, conv])]
+                [None, None, Some(ssm.state_shape().to_vec()), Some(ssm.conv_shape().to_vec())]
             };
             if layer.iter().zip(&expected).any(|(t, s)| t.as_ref().map(Tensor::shape) != s.as_deref()) {
                 return Err("incompatible Qwen checkpoint tensor shape".into());
@@ -556,5 +554,28 @@ mod tests {
         assert_eq!(kv.len, 3);
         for n in 0..bytes.len() { assert!(Arc::<Snapshot>::decode(&bytes[..n]).is_err()); }
         bytes.extend([0]); assert!(Arc::<Snapshot>::decode(&bytes).is_err());
+    }
+
+    /// An LFM2 model's state (its short convs': a placeholder of one value and the conv window over the model's width,
+    /// `SsmConfig` with no delta net) goes back as a delta net's does; one of a delta net's shape is refused.
+    #[test]
+    fn a_short_convs_state_restores() {
+        let backend = ggml_rs::CpuBackend::new();
+        let mut kv = KvCache::new(&backend, 2, 8, 1, 2);
+        kv.len = 3;
+        kv.k[1].data_mut()[..6].fill(2.0);
+        kv.v[1].data_mut()[..6].fill(3.0);
+        kv.ssm_state[0] = Some(Tensor::zeros(vec![1, 1, 1]));
+        kv.ssm_conv[0] = Some(Tensor::from_vec((0..8).map(|v| v as f32).collect(), vec![2, 4]));
+        let snap = Snapshot::capture(&kv, &[false, true], &backend);
+        kv.ssm_conv[0].as_mut().unwrap().data_mut().fill(99.0);
+        kv.len = 6;
+        let lfm2 = SsmConfig { conv_kernel: 3, group_count: 0, inner_size: 4, state_size: 0, time_step_rank: 0 };
+        assert_eq!((lfm2.state_shape(), lfm2.conv_shape()), ([1, 1, 1], [2, 4]));
+        snap.restore(&mut kv, &[false, true], lfm2, &backend).unwrap();
+        assert_eq!(kv.len, 3);
+        assert_eq!(kv.ssm_conv[0].as_ref().unwrap().data(), &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let delta_net = SsmConfig { conv_kernel: 3, group_count: 1, inner_size: 2, state_size: 1, time_step_rank: 1 };
+        assert!(snap.restore(&mut kv, &[false, true], delta_net, &backend).is_err());
     }
 }

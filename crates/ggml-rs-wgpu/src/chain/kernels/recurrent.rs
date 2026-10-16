@@ -190,6 +190,94 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// VENDORED-LOCAL: LFM2's gated short conv ([`SSM_CONV`]'s walk, a thread a channel through the run's tokens): each
+/// token's `B * x` (the first and last thirds of its row of `bcx`) through the causal conv after the `kernel - 1`
+/// products the state holds, times its C (the middle third); the state left with the last products. `p[0]`: the
+/// channels, the tokens, the kernel.
+pub(in crate::chain) const SHORT_CONV: &str = r#"
+@group(0) @binding(0) var<storage, read> bcx: array<f32>;
+@group(0) @binding(1) var<storage, read> cw: array<f32>;
+@group(0) @binding(6) var<storage, read_write> cs: array<f32>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ch = p[0].x;
+    let rows = p[0].y;
+    let kern = p[0].z;
+    let c = id.x;
+    if (c >= ch) { return; }
+    var win: array<f32, 8>;
+    for (var k = 0u; k + 1u < kern; k++) { win[k] = cs[k * ch + c]; }
+    for (var t = 0u; t < rows; t++) {
+        let at = t * 3u * ch + c;
+        let bx = bcx[at] * bcx[at + 2u * ch];
+        var acc = 0.0;
+        for (var k = 0u; k + 1u < kern; k++) { acc += win[k] * cw[c * kern + k]; }
+        acc += bx * cw[c * kern + kern - 1u];
+        out[t * ch + c] = bcx[at + ch] * acc;
+        for (var k = 0u; k + 2u < kern; k++) { win[k] = win[k + 1u]; }
+        win[kern - 2u] = bx;
+    }
+    for (var k = 0u; k + 1u < kern; k++) { cs[k * ch + c] = win[k]; }
+}
+"#;
+
+/// A prompt's [`SHORT_CONV`] ([`SSM_CONV_ROWS`]'s way), a thread a (channel, token): its `kernel` products those up to
+/// it, the run's or (before its first) the state's. The state is left to [`SHORT_CONV_STATE`].
+pub(in crate::chain) const SHORT_CONV_ROWS: &str = r#"
+@group(0) @binding(0) var<storage, read> bcx: array<f32>;
+@group(0) @binding(1) var<storage, read> cw: array<f32>;
+@group(0) @binding(2) var<storage, read> cs: array<f32>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let ch = p[0].x;
+    let kern = p[0].z;
+    let c = wg.x * 256u + li;
+    let t = wg.y;
+    if (c >= ch) { return; }
+    var acc = 0.0;
+    for (var k = 0u; k < kern; k++) {
+        // product t + k - (kern - 1)
+        let j = t + k;
+        var xv = 0.0;
+        if (j + 1u >= kern) {
+            let at = (j + 1u - kern) * 3u * ch + c;
+            xv = bcx[at] * bcx[at + 2u * ch];
+        } else {
+            xv = cs[j * ch + c];
+        }
+        acc += xv * cw[c * kern + k];
+    }
+    out[t * ch + c] = bcx[t * 3u * ch + ch + c] * acc;
+}
+"#;
+
+/// The state after [`SHORT_CONV_ROWS`]: the run's last `kernel - 1` products (a run as long at least), a thread a
+/// channel.
+pub(in crate::chain) const SHORT_CONV_STATE: &str = r#"
+@group(0) @binding(0) var<storage, read> bcx: array<f32>;
+@group(0) @binding(6) var<storage, read_write> cs: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ch = p[0].x;
+    let rows = p[0].y;
+    let kern = p[0].z;
+    let c = id.x;
+    if (c >= ch) { return; }
+    for (var k = 0u; k + 1u < kern; k++) {
+        let at = (rows + 1u + k - kern) * 3u * ch + c;
+        cs[k * ch + c] = bcx[at] * bcx[at + 2u * ch];
+    }
+}
+"#;
+
 /// A gated delta net's recurrence through the run's tokens, a workgroup a value head and a thread a row of its state
 /// (as the host's `delta_net_step`), the row held in registers from the run's start to its end: each token's q and k
 /// (its key head's) L2-normed, the state decayed by `exp(softplus(alpha + dt_bias) * a)`, the delta rule's update by

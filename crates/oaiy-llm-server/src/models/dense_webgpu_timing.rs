@@ -1901,9 +1901,9 @@ fn a_qwen35_prompt_run_whole_answers_as_its_chunks_one_at_a_time() {
     }
 }
 
-/// Qwen3.5's hybrid chained on the GPU (QWEN35_MODEL: the 9B, or Qwen3.8 27B; or a Qwen3.5-MoE one, `qwen35moe`, its
-/// experts the GPU's) answers as its host path does: the same prompt (QWEN35_PROMPT tokens, in chunks of 512 as the
-/// server sends them) then 64 greedy steps each way give the same tokens, every step's logits close (up to where the
+/// Qwen3.5's hybrid chained on the GPU (QWEN35_MODEL: the 9B, or Qwen3.8 27B; or a Qwen3.5-MoE one, `qwen35moe`, or an
+/// LFM2-MoE one, `lfm2moe`, their experts the GPU's) answers as its host path does: the same prompt (QWEN35_PROMPT
+/// tokens, or QWEN35_IDS's, in chunks of 512 as the server sends them) then 64 greedy steps each way give the same tokens, every step's logits close (up to where the
 /// tokens part, if they do: only at a near tie, the host's two within a hair, as the prompt's matmuls' f16 sums can
 /// tip); and the chain did run. A MoE model's within a percent, its tokens parting where both paths' two are within a
 /// quarter of a logit: a layer's top 8 of its experts tips where the paths' sums differ in their last bits (the
@@ -1920,9 +1920,9 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     let gpu = b.clone();
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
     let gguf = gguf::GgufFile::open(&path).unwrap();
-    let model = if gguf.get_str("general.architecture").ok() == Some("qwen35moe") {
+    let model = if matches!(gguf.get_str("general.architecture").ok(), Some("qwen35moe" | "lfm2moe")) {
         let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
-            let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared };
+            let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
             gpu.quant_experts(data).map_err(llama_rs::LlamaError::Config)
         };
         let mut m = llama_rs::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();
@@ -1934,7 +1934,12 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
     let n: u32 = std::env::var("QWEN35_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
     let steps: usize = std::env::var("QWEN35_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-    let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();
+    // (QWEN35_IDS: a file of the prompt's token ids, in place of QWEN35_PROMPT's made-up ones: a chat's, to hold both
+    // paths' first rows against another engine's)
+    let prompt: Vec<u32> = match std::env::var("QWEN35_IDS") {
+        Ok(file) => std::fs::read_to_string(file).unwrap().split_whitespace().map(|v| v.parse().unwrap()).collect(),
+        Err(_) => (0..n).map(|i| 1000 + (i * 7919) % 20000).collect(),
+    };
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
     let run = |chained: bool| {
         let mut kv = model.new_kv_cache(prompt.len() + steps + 16);
@@ -1977,6 +1982,14 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     let worst = each[..upto].iter().copied().fold(1.0f64, f64::min);
     eprintln!("prompt {n}: host {host_s:.2} s, chained {chain_s:.2} s ({runs} runs) for {steps} steps; prompt logits cosine {:.6}, worst {worst:.6}; first differing token {first_diff:?}", each[0]);
     eprintln!("  each step's cosine up to there: {:?}", each[..upto].iter().map(|c| format!("{c:.5}")).collect::<Vec<_>>());
+    // the prompt's row's five likeliest tokens each way, each by how far it is below the first
+    let five = |l: &[f32]| {
+        let mut top: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        top.truncate(5);
+        top.iter().map(|(t, v)| format!("{t}:{:.3}", top[0].1 - v)).collect::<Vec<_>>().join(" ")
+    };
+    eprintln!("  the prompt's five: host {}; chained {}", five(&host_logits[0]), five(&chain_logits[0]));
     // where the tokens part, how far apart the two are by each path's own logits
     let gaps = first_diff.map(|i| {
         let (h, c) = (&host_logits[i], &chain_logits[i]);
@@ -1987,7 +2000,7 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
         eprintln!("  at step {i} the host's logit of its token {} is {host_gap:.4} above the chain's {}; by the chain's logits, {chain_gap:.4} the other way", host_tokens[i], chain_tokens[i]);
     }
     assert!(runs > prompt.len().div_ceil(512), "the chain ran ({runs} runs)");
-    let moe = m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Attention { moe: Some(_), .. } | llama_rs::Qwen35Block::Ssm { moe: Some(_), .. }));
+    let moe = m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Attention { moe: Some(_), .. } | llama_rs::Qwen35Block::Ssm { moe: Some(_), .. } | llama_rs::Qwen35Block::Conv { moe: Some(_), .. }));
     let (agree, tie) = if moe { (0.99, 0.25) } else { (0.9999, 0.05) };
     assert!(worst >= agree, "{worst}");
     if let Some((_, host_gap, chain_gap)) = gaps {

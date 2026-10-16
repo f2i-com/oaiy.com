@@ -897,6 +897,21 @@ impl ChainRecorder for Recorder<'_> {
         self.dispatch_wide("chain-ssm-conv", SSM_CONV, [q, buffer(weight), q, q, q, q, buffer(state), buffer(out)], &words, (groups, 1, 1));
     }
 
+    fn short_conv(&mut self, bcx: &DeviceVec, weight: &DeviceVec, state: &DeviceVec, out: &DeviceVec, rows: usize, channels: usize, kernel: usize) {
+        assert!((2..=8).contains(&kernel) && bcx.len >= rows * 3 * channels && weight.len >= channels * kernel && state.len >= (kernel - 1) * channels && out.len >= rows * channels, "chain: a short conv of {kernel} over {rows} rows of {channels}");
+        let x = buffer(bcx);
+        let words = [channels as u32, rows as u32, kernel as u32];
+        let groups = (channels as u32).div_ceil(256);
+        // a prompt's a thread a (channel, token), then the state; a step's and a few rows' a thread a channel
+        if rows >= 16 && rows <= 65535 {
+            let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
+            self.dispatch_wide("chain-short-conv-rows", SHORT_CONV_ROWS, [x, buffer(weight), buffer(state), &d, &d, &d, &drw, buffer(out)], &words, (groups, rows as u32, 1));
+            self.dispatch_wide("chain-short-conv-state", SHORT_CONV_STATE, [x, &d, &d, &d, &d, &d, buffer(state), &drw], &words, (groups, 1, 1));
+            return;
+        }
+        self.dispatch_wide("chain-short-conv", SHORT_CONV, [x, buffer(weight), x, x, x, x, buffer(state), buffer(out)], &words, (groups, 1, 1));
+    }
+
     fn delta_net(&mut self, conv: &DeviceVec, z: &DeviceVec, beta_alpha: &DeviceVec, ssm_a: &DeviceVec, dt_bias: &DeviceVec, norm: &DeviceVec, state: &DeviceVec, out: &DeviceVec, d: DeltaNet) {
         let ch = 2 * d.k_heads * d.k_dim + d.v_heads * d.v_dim;
         // a pipeline a head size, the size a constant of it

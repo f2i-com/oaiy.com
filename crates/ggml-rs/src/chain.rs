@@ -382,6 +382,15 @@ pub trait ChainRecorder {
     /// (`Backend::delta_net_step`).
     #[allow(clippy::too_many_arguments)]
     fn ssm_conv(&mut self, qkv: &DeviceVec, weight: &DeviceVec, state: &DeviceVec, out: &DeviceVec, rows: usize, channels: usize, kernel: usize);
+    /// VENDORED-LOCAL: LFM2's gated short conv over `rows` tokens of `bcx` (`[rows, 3 channels]`: each row's B, C and x,
+    /// its in-projection's thirds): `B * x` through a causal depthwise conv after the `kernel - 1` products `state`
+    /// holds (`[kernel - 1, channels]`, oldest first), with `weight` (`[channels, kernel]`), times C, into `out`
+    /// (`[rows, channels]`); `state` then holds the last `kernel - 1` products (transformers' `Lfm2ShortConv`).
+    #[allow(clippy::too_many_arguments)]
+    fn short_conv(&mut self, bcx: &DeviceVec, weight: &DeviceVec, state: &DeviceVec, out: &DeviceVec, rows: usize, channels: usize, kernel: usize) {
+        let _ = (bcx, weight, state, out, rows, channels, kernel);
+        unimplemented!("a gated short conv on this device")
+    }
     /// A gated delta net's recurrence over `d.rows` tokens, as the host's (`Backend::delta_net_step`): each token's
     /// conv output `conv` (`[rows, 2 k_heads k_dim + v_heads v_dim]`: q, k, v), gate `z` (`[rows, v_heads v_dim]`)
     /// and `beta_alpha` (`[rows, 2 v_heads]`) with the layer's `ssm_a`, `dt_bias` (`[v_heads]`) and `norm`

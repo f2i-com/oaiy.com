@@ -1,6 +1,7 @@
 //! `quant_moe`'s tests.
 
 use super::*;
+use ggml_rs::exl3::route;
 
 fn rng(mut seed: u64) -> impl FnMut() -> f32 {
     move || {
@@ -48,7 +49,7 @@ fn random_grid(next: &mut impl FnMut() -> f32, t: GgmlType, matrices: usize, row
 fn random_k(next: &mut impl FnMut() -> f32, t: GgmlType, matrices: usize, rows: usize, cols: usize) -> Vec<u8> {
     let blocks = matrices * rows * cols / 256;
     let mut bytes = Vec::with_capacity(blocks * t.type_size());
-    let mut byte = |next: &mut dyn FnMut() -> f32| ((next() + 1.0) * 127.99) as u8;
+    let byte = |next: &mut dyn FnMut() -> f32| ((next() + 1.0) * 127.99) as u8;
     for _ in 0..blocks {
         if t == GgmlType::Q4_K {
             bytes.extend(half::f16::from_f32(0.0004 + 0.0002 * next()).to_bits().to_le_bytes());
@@ -70,7 +71,7 @@ pub(crate) fn k_experts(seed: u64, hidden: usize, ff: usize, count: usize, gu: G
     let dn = random_k(&mut next, down, count, hidden, ff);
     let mut dense = |n: usize| -> Vec<f32> { (0..n).map(|_| half::f16::from_f32(0.03 * next()).to_f32()).collect() };
     let shared = [dense(ff * hidden), dense(ff * hidden), dense(hidden * ff)];
-    QuantExpertsData { hidden, ff, experts: count, gate: (gu, gate), up: (gu, up), down: (down, dn), shared }
+    QuantExpertsData { hidden, ff, experts: count, gate: (gu, gate), up: (gu, up), down: (down, dn), shared: Some(shared), routing: Routing::Softmax }
 }
 
 /// Experts at random: the routed ones Q2_0; the shared one's values f16's where `half` (as a Q2_0 matrix's are).
@@ -88,18 +89,18 @@ pub(crate) fn experts_of(seed: u64, hidden: usize, ff: usize, count: usize, half
         let down = random_q2_0(&mut next, count, hidden, ff);
         let mut dense = |n: usize| -> Vec<f32> { (0..n).map(|_| if half { half::f16::from_f32(0.03 * next()).to_f32() } else { 0.03 * next() }).collect() };
         let shared = [dense(ff * hidden), dense(ff * hidden), dense(hidden * ff)];
-        return QuantExpertsData { hidden, ff, experts: count, gate: (gu, gate), up: (gu, up), down: (GgmlType::Q2_0, down), shared };
+        return QuantExpertsData { hidden, ff, experts: count, gate: (gu, gate), up: (gu, up), down: (GgmlType::Q2_0, down), shared: Some(shared), routing: Routing::Softmax };
     }
     let gate = random_q2_0(&mut next, count, ff, hidden);
     let up = random_q2_0(&mut next, count, ff, hidden);
     let down = random_q2_0(&mut next, count, hidden, ff);
     let mut dense = |n: usize| -> Vec<f32> { (0..n).map(|_| if half { half::f16::from_f32(0.03 * next()).to_f32() } else { 0.03 * next() }).collect() };
     let shared = [dense(ff * hidden), dense(ff * hidden), dense(hidden * ff)];
-    QuantExpertsData { hidden, ff, experts: count, gate: (GgmlType::Q2_0, gate), up: (GgmlType::Q2_0, up), down: (GgmlType::Q2_0, down), shared }
+    QuantExpertsData { hidden, ff, experts: count, gate: (GgmlType::Q2_0, gate), up: (GgmlType::Q2_0, up), down: (GgmlType::Q2_0, down), shared: Some(shared), routing: Routing::Softmax }
 }
 
 pub(crate) fn copy(d: &QuantExpertsData) -> QuantExpertsData {
-    QuantExpertsData { hidden: d.hidden, ff: d.ff, experts: d.experts, gate: d.gate.clone(), up: d.up.clone(), down: d.down.clone(), shared: d.shared.clone() }
+    QuantExpertsData { hidden: d.hidden, ff: d.ff, experts: d.experts, gate: d.gate.clone(), up: d.up.clone(), down: d.down.clone(), shared: d.shared.clone(), routing: d.routing.clone() }
 }
 
 /// `rows` rows of inputs and of router logits (no two alike).
@@ -137,7 +138,8 @@ fn the_hosts_experts_are_three_plain_loops() {
         let top = &order[..top_k];
         let sum: f64 = top.iter().map(|&e| (l[e] as f64).exp()).sum();
         let mut parts: Vec<(f64, &[f32], &[f32], &[f32])> = top.iter().map(|&e| ((l[e] as f64).exp() / sum, &g[e * ff * hidden..(e + 1) * ff * hidden], &u[e * ff * hidden..(e + 1) * ff * hidden], &d[e * hidden * ff..(e + 1) * hidden * ff])).collect();
-        parts.push((1.0 / (1.0 + (-l[count] as f64).exp()), &data.shared[0], &data.shared[1], &data.shared[2]));
+        let sh = data.shared.as_ref().expect("a shared expert");
+        parts.push((1.0 / (1.0 + (-l[count] as f64).exp()), &sh[0], &sh[1], &sh[2]));
         for (w, g, u, d) in parts {
             let act: Vec<f64> = (0..ff)
                 .map(|j| {
@@ -412,6 +414,71 @@ fn the_gpus_k_quant_experts_are_the_hosts() {
                 }
                 eprintln!("{line}");
             }
+        }
+    }
+}
+
+/// LFM2's experts (`Routing::Sigmoid`, no shared expert; Q4_K gate and up, Q6_K down, as LFM2.5-24B-A2B's Q4_K_M
+/// GGUF keeps them) on the GPU are the host's, routed on the host and on the GPU; and the host's routing is
+/// transformers' `Lfm2MoeTopKRouter`: the top k by sigmoid plus bias, weighted by the sigmoids alone over their sum.
+#[test]
+fn lfm2s_sigmoid_routed_experts_on_the_gpu_are_the_hosts() {
+    let (hidden, ff, count, top_k) = (512, 256, 16, 4);
+    let bias: Vec<f32> = (0..count).map(|e| ((e * 7) % 5) as f32 * 0.15 - 0.3).collect();
+    let routing = Routing::Sigmoid { bias: bias.clone(), scale: 1.0 };
+    let (_, logits) = inputs(95, 64, hidden, count);
+    let mut moved = 0;
+    for l in logits.chunks_exact(count + 1) {
+        let score: Vec<f64> = l[..count].iter().map(|&v| 1.0 / (1.0 + (-v as f64).exp())).collect();
+        let by = |key: &dyn Fn(usize) -> f64| {
+            let mut order: Vec<usize> = (0..count).collect();
+            order.sort_by(|&a, &b| key(b).partial_cmp(&key(a)).unwrap().then(a.cmp(&b)));
+            order.truncate(top_k);
+            order
+        };
+        let top = by(&|e| score[e] + bias[e] as f64);
+        moved += usize::from(top != by(&|e| score[e]));
+        let sum: f64 = top.iter().map(|&e| score[e]).sum::<f64>() + 1e-6;
+        let got = routing.route(l, top_k);
+        assert_eq!(got.len(), top_k + 1);
+        assert_eq!(got[top_k], (count, 0.0), "no shared expert");
+        for (&(e, w), &want) in got.iter().zip(&top) {
+            assert_eq!(e, want);
+            assert!((w as f64 - score[e] / sum).abs() < 1e-6, "expert {e}: {w} where {}", score[e] / sum);
+        }
+    }
+    assert!(moved > 0, "the bias changes some row's picks");
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let mut data = k_experts(93, hidden, ff, count, GgmlType::Q4_K, GgmlType::Q6_K);
+    data.shared = None;
+    data.routing = routing;
+    let host = quant_experts_cpu(copy(&data)).unwrap();
+    let mut f32s = QuantMoe::try_new(&b, copy(&data), 0).ok().expect("LFM2's experts on the GPU");
+    f32s.coop = false;
+    let cores = QuantMoe::try_new(&b, data, 0).ok().expect("LFM2's experts on the GPU");
+    for rows in [1, 3, 40, 70] {
+        let (x, logits) = inputs(97 + rows as u64, rows, hidden, count);
+        let want = host.forward(&Tensor::from_vec(x.clone(), vec![rows, hidden]), &Tensor::from_vec(logits.clone(), vec![rows, count + 1]), top_k).to_host().data().to_vec();
+        for (what, moe) in [("f32", &f32s), ("the tensor cores", &cores)] {
+            if !moe.coop && what != "f32" {
+                continue;
+            }
+            let (hosted, routed, into) = gpu_sums(&b, moe, &x, &logits, rows, hidden, count, top_k);
+            let e = worst(&hosted, &want);
+            let mut line = format!("LFM2's experts, {rows} rows, {what}: routed on the host {e:.2e}");
+            let shared = rows > 8 && coop_on(&b.gpu);
+            let bound = |cores: bool| if cores || shared { 8e-3 } else { 5e-5 };
+            assert!(e < bound(moe.coop && rows > 1), "{line}");
+            if let Some(routed) = routed {
+                let e = worst(&routed, &want);
+                line += &format!(", on the GPU {e:.2e}");
+                assert!(e < bound(moe.coop && rows > FEW_MAX), "{line}");
+                let (after, want) = into.expect("the streams' sums");
+                let e = worst(&after, &want);
+                line += &format!(", into streams {e:.2e}");
+                assert!(e < 1e-5, "{line}");
+            }
+            eprintln!("{line}");
         }
     }
 }

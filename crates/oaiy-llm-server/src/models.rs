@@ -120,6 +120,8 @@ pub enum Flavour {
     /// Qwen3.5 (and Flash-Next): its pictures as Qwen3.5's own, or as MiniCPM-V 4.7's (a Qwen3.5 model with its
     /// projector).
     Qwen(Arc<tokenizer::Tokenizer>, crate::qwen::Pictures),
+    /// LFM2 (`lfm2moe`, served as a Qwen3.5 hybrid): its own template and Python-list calls (`crate::lfm2`).
+    Lfm2(Arc<tokenizer::Tokenizer>),
     /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, whether its
     /// own template opens the reply on an empty thought channel (see `dense_prompt`), and the marker a picture
     /// stands as in its prompt where it reads pictures (Gemma 4's `<|image|>`, with its vision projector).
@@ -131,7 +133,7 @@ impl Flavour {
         match self {
             Self::Deepseek(t) => t.encode(text),
             // llama-rs applies BOS through the template, so not again here.
-            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
+            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Lfm2(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
         }
     }
 
@@ -149,6 +151,7 @@ impl Flavour {
                 dsv41::chat::encode(msgs, opts).map_err(|e| e.to_string())
             }
             Self::Qwen(_, style) => crate::qwen::chat_prompt_as(msgs, opts, *style),
+            Self::Lfm2(_) => crate::lfm2::chat_prompt(msgs, opts),
             Self::Gguf(_, marker) => {
                 // The same messages through llama-rs's GLM template. `reasoning
                 // effort` maps onto the three the reference Jinja accepts; the
@@ -1137,16 +1140,16 @@ impl Models {
     }
 
     // ---------------------------------------------------------------- GGUF
-    /// A Qwen3.5-MoE GGUF (`qwen35moe`) as a Qwen3.5 hybrid with routed experts: each layer's experts held by the GPU's
+    /// A Qwen3.5-MoE GGUF (`qwen35moe`), or an LFM2-MoE one (`lfm2moe`), as a Qwen3.5 hybrid with routed experts: each layer's experts held by the GPU's
     /// kernels (`QuantMoe`: the K-quants, the GSQ-RCO types) where its budget has room, else run on the host; a chained
     /// run's pieces 64 rows at most where the GPU groups no more of a prompt's rows by expert (no tensor cores).
     fn qwen35_moe(&self, name: &str, gguf: &gguf::GgufFile, backend: &Arc<dyn ggml_rs::Backend>) -> Result<llama_rs::Model> {
         #[cfg(feature = "webgpu")]
         {
-            let b = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().ok_or_else(|| Error::Arg(format!("{name}: a Qwen3.5-MoE model's experts need a GPU (WebGPU)")))?;
+            let b = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().ok_or_else(|| Error::Arg(format!("{name}: a MoE model's experts need a GPU (WebGPU)")))?;
             let on_host = std::sync::atomic::AtomicUsize::new(0);
             let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
-                let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared };
+                let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
                 let made = b.quant_experts(data).map_err(llama_rs::LlamaError::Config)?;
                 if made.on_host() {
                     on_host.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1184,8 +1187,10 @@ impl Models {
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&picked.backend);
         let gguf = gguf::GgufFile::open(&path).map_err(|e| Error::Arg(e.to_string()))?;
         // (Qwen3.5-MoE, `qwen35moe`: Qwen3.6-35B-A3B's and MiniCPM-V 4.7 35B-A3B's architecture, the Qwen3.5 hybrid's
-        // layers with routed experts, which a GPU's kernels hold)
-        let moe = gguf.get_str("general.architecture").ok() == Some("qwen35moe");
+        // layers with routed experts, which a GPU's kernels hold; and LFM2-MoE, `lfm2moe`, a hybrid of short convs and
+        // attention with experts, served as one: LFM2.5-24B-A2B's)
+        let lfm2 = gguf.get_str("general.architecture").ok() == Some("lfm2moe");
+        let moe = gguf.get_str("general.architecture").ok() == Some("qwen35moe") || lfm2;
         if gguf.get_str("general.architecture").ok() == Some("qwen35") || moe {
             // With a second GPU, a prompt's later layers go to it (copies of their weights and the head): each
             // chunk's first layers run on one as the other runs the chunk before's. The card the host's bytes reach
@@ -1266,7 +1271,8 @@ impl Models {
                 }
             }
             let mut cfg = self.base_cfg(spec, max_seq);
-            cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
+            // (LFM2 reads no pictures: its own picture token stands in, never met)
+            cfg.image_token_id = tok.token_id("<|image_pad|>").or_else(|| lfm2.then(|| tok.token_id("<image>")).flatten()).ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
             cfg.qwen_vision = projector.as_ref().map(|p|p.config().clone());
             // MiniCPM-V 4.7: its markers' ids from its own tokenizer
             if let Some(llama_rs::MmProj::MiniCpmV(m)) = &projector {
@@ -1281,7 +1287,8 @@ impl Models {
             }
             let pictures = if cfg.minicpmv.is_some() { crate::qwen::Pictures::MiniCpmV } else { crate::qwen::Pictures::Qwen };
             let (jobs,rx) = std::sync::mpsc::channel();
-            let mut e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent).repetition_guard(o.repetition_guard).minicpmv(cfg.minicpmv.clone());
+            let calls = if lfm2 { crate::qwen::Calls::Lfm2 } else { crate::qwen::Calls::Qwen };
+            let mut e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent).repetition_guard(o.repetition_guard).minicpmv(cfg.minicpmv.clone()).calls(calls);
             if let Some(dir) = &o.prompt_cache {
                 // Separate format/implementation namespace; replacing weights
                 // in place also invalidates states via size and modification time.
@@ -1301,7 +1308,8 @@ impl Models {
                 }
             }
             let thread = std::thread::Builder::new().name("qwen-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
-            return Ok(Live {name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok, pictures))});
+            let flavour = if lfm2 { Flavour::Lfm2(tok) } else { Flavour::Qwen(tok, pictures) };
+            return Ok(Live {name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(flavour)});
         }
         // Dense models (Llama, Mistral and Qwen2 without experts, Qwen3, Gemma 3, 3n and 4) are loaded whole onto
         // the backend, as Qwen3.5 is above, and answer in their own template with their own stop tokens. Expert
@@ -1684,7 +1692,7 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
     let shares: Vec<std::sync::atomic::AtomicUsize> = gpus.iter().map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
     let experts = |device: usize, e: ExpertBlocks| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
         use std::sync::atomic::Ordering::Relaxed;
-        let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared };
+        let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: Some(e.shared), routing: ggml_rs::exl3::Routing::Softmax };
         match gpus.get(device) {
             Some(b) => {
                 let shared = (3 * data.hidden * data.ff * 4) as u64;

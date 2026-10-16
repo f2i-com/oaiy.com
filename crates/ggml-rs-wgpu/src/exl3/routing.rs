@@ -233,6 +233,90 @@ pub(crate) fn record_route(rec: &mut crate::chain::Recorder<'_>, logits: &wgpu::
     rec.dispatch_wide("moe-route-weights", ROUTE_WEIGHTS, [logits, &jd, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &words, (rows as u32, 1, 1));
 }
 
+/// VENDORED-LOCAL: LFM2's routing ([`ggml_rs::exl3::Routing::Sigmoid`]) on the GPU, the first of three kernels
+/// ([`record_route_sigmoid`]): each routed expert's score (its logit's sigmoid) plus its selection bias, in the
+/// logits' layout (`[rows, routed + 1]`, the place after the routed ones 0), for [`ROUTE_RANK`] to rank. A thread a
+/// place. `p[0]`: routed, rows.
+pub(crate) const ROUTE_SIGMOID_PICK: &str = r#"
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(6) var<storage, read_write> pick: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = p[0].x;
+    let i = id.x;
+    if (i >= (n + 1u) * p[0].y) { return; }
+    let e = i % (n + 1u);
+    if (e == n) {
+        pick[i] = 0.0;
+        return;
+    }
+    pick[i] = 1.0 / (1.0 + exp(-logits[i])) + bias[e];
+}
+"#;
+
+/// [`ROUTE_SIGMOID_PICK`]'s last kernel, after [`ROUTE_RANK`] (as [`ROUTE_WEIGHTS`]: a workgroup a row, a thread an
+/// expert of its top k): their weights, each one's score over the scores' sum (in rank order, plus 1e-6) times the
+/// scale, the place after them (a shared expert's) 0; and the row's gate and up jobs. `p[0]`: routed, k (at most 32),
+/// the scale's bits.
+pub(crate) const ROUTE_SIGMOID_WEIGHTS: &str = r#"
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> jd: array<u32>;
+@group(0) @binding(6) var<storage, read_write> jobs: array<u32>;
+@group(0) @binding(7) var<storage, read_write> w: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> sc: array<f32, 32>;
+
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) j: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    let scale = bitcast<f32>(p[0].z);
+    let r = wg.x;
+    let lr = r * (n + 1u);
+    var e = 0u;
+    var v = 0.0;
+    if (j < k) {
+        e = jd[2u * (r * k + j)];
+        v = 1.0 / (1.0 + exp(-logits[lr + e]));
+    }
+    sc[j] = v;
+    workgroupBarrier();
+    if (j < k) {
+        var sum = 0.0;
+        for (var i = 0u; i < k; i++) { sum += sc[i]; }
+        w[r * (k + 1u) + j] = v / (sum + 1e-6) * scale;
+        let at = 4u * (r * k + j);
+        jobs[at] = 2u * e;
+        jobs[at + 1u] = r;
+        jobs[at + 2u] = 2u * e + 1u;
+        jobs[at + 3u] = r;
+    }
+    if (j == 0u) {
+        w[r * (k + 1u) + k] = 0.0;
+    }
+}
+"#;
+
+/// [`record_route`] for LFM2's routing: the scores and their bias into `pick` (`[rows, routed + 1]`, a scratch
+/// vector), ranked there, then weighted from the logits ([`ROUTE_SIGMOID_PICK`], [`ROUTE_RANK`],
+/// [`ROUTE_SIGMOID_WEIGHTS`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_route_sigmoid(rec: &mut crate::chain::Recorder<'_>, logits: &wgpu::Buffer, bias: &wgpu::Buffer, pick: &wgpu::Buffer, st: &Step, routed: usize, top_k: usize, rows: usize, scale: f32) {
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+    assert!(routed <= 1024 && top_k <= 32 && top_k <= routed, "moe: the top {top_k} of {routed} experts");
+    let d = rec.gpu().dummy().clone();
+    let drw = rec.gpu().dummy_rw().clone();
+    let places = (rows * (routed + 1)) as u32;
+    rec.dispatch_wide("moe-route-sigmoid-pick", ROUTE_SIGMOID_PICK, [logits, bias, &d, &d, &d, &d, pick, &drw], &[routed as u32, rows as u32], (places.div_ceil(256), 1, 1));
+    let jd = buf(&st.jobs_d);
+    rec.dispatch_wide("moe-route-rank", ROUTE_RANK, [pick, &d, &d, &d, &d, &d, &jd, &drw], &[routed as u32, top_k as u32], (rows as u32, (routed as u32).div_ceil(64), 1));
+    rec.dispatch_wide("moe-route-sigmoid-weights", ROUTE_SIGMOID_WEIGHTS, [logits, &jd, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[routed as u32, top_k as u32, scale.to_bits()], (rows as u32, 1, 1));
+}
+
 /// A prompt's routed jobs grouped by expert on the GPU, as [`many_order`] groups them on the host: each expert's down
 /// jobs in blocks of `p[0].w` (a block one expert's, its unused places [`NONE`]; the blocks in the experts' order, a
 /// job's place among its expert's as the atomics fall), and their gate and up jobs in blocks `2 b` and `2 b + 1`.

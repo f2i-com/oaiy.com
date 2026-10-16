@@ -66,6 +66,11 @@ pub enum Architecture {
     /// draft block, which is why `hc_*` stops at `blk.44`. Loaded and
     /// validated; forward lands with the KDA scan (see `glm5next.rs`).
     Glm5Next,
+    /// VENDORED-LOCAL: LiquidAI's LFM2-MoE (`lfm2moe`: LFM2.5-24B-A2B, LFM2-8B-A1B): gated short-conv layers and GQA
+    /// attention layers (`attention.head_count_kv` an array, 0 for a conv layer), dense FFNs in the first
+    /// `leading_dense_block_count` layers and routed experts (sigmoid-gated, a selection bias) in the rest. Served as a
+    /// Qwen3.5 hybrid whose recurrent layers are short convs (see `qwen35.rs`).
+    Lfm2Moe,
     /// Architectures recognized but not yet implemented.
     Unsupported(String),
 }
@@ -86,6 +91,7 @@ impl Architecture {
             "qwen35moe"    => Self::Qwen35Moe,
             "qwen36moevl"  => Self::Qwen36MoeVl,
             "glm5next"     => Self::Glm5Next,
+            "lfm2moe"      => Self::Lfm2Moe,
             other          => Self::Unsupported(other.to_string()),
         }
     }
@@ -107,6 +113,7 @@ impl Architecture {
             Self::Qwen35Moe   => "qwen35moe",
             Self::Qwen36MoeVl => "qwen36moevl",
             Self::Glm5Next    => "glm5next",
+            Self::Lfm2Moe     => "lfm2moe",
             Self::Unsupported(s) => s.as_str(),
         }
     }
@@ -121,7 +128,7 @@ impl Architecture {
             Self::Llama | Self::Mistral => RopeType::Normal,
             Self::Qwen2 | Self::Qwen3 | Self::Qwen35 | Self::Qwen35Moe | Self::Qwen3Moe |
             Self::Qwen3VlMoe | Self::Qwen36MoeVl |
-            Self::Gemma3 | Self::Gemma3n | Self::Gemma4 => RopeType::NeoX,
+            Self::Gemma3 | Self::Gemma3n | Self::Gemma4 | Self::Lfm2Moe => RopeType::NeoX,
             // VENDORED-LOCAL: glm5next is NoPE — `rope.dimension_count` is 0 and
             // the GGUF carries no rope tensors, so this value is never applied.
             // It is reported rather than left to the fallback so `OAIY info`
@@ -230,7 +237,18 @@ impl ModelConfig {
         // Read the array form FIRST: the scalar read below fails on an array and
         // would silently fall back to `n_heads`, claiming 64 KV heads for a model
         // whose attention layers are absorbed-MLA MQA with a single latent row.
-        let recurrent_layers: Option<Vec<bool>> = if arch != Architecture::Glm5Next {
+        // (LFM2's array holds each attention layer's KV heads and 0 for a conv layer: the same mask, its count the
+        // array's largest)
+        let lfm2_kv_heads = (arch == Architecture::Lfm2Moe).then(|| g.metadata().get(&format!("{ns}.attention.head_count_kv")).and_then(|v| v.as_array()).and_then(|a| match a {
+            Array::U32(v) => Some(v.iter().map(|&x| x as u64).collect::<Vec<u64>>()),
+            Array::I32(v) => Some(v.iter().map(|&x| x.max(0) as u64).collect()),
+            Array::U64(v) => Some(v.clone()),
+            Array::I64(v) => Some(v.iter().map(|&x| x.max(0) as u64).collect()),
+            _ => None,
+        })).flatten();
+        let recurrent_layers: Option<Vec<bool>> = if let Some(heads) = &lfm2_kv_heads {
+            Some(heads.iter().map(|&h| h == 0).collect())
+        } else if arch != Architecture::Glm5Next {
             // gemma4 also stores this key as an array, but its entries are real
             // per-layer KV head counts, not a 0/1 recurrent mask. Only glm5next
             // means "0 = this layer is recurrent" by it.
@@ -252,6 +270,7 @@ impl ModelConfig {
         // full-attention layers are MQA over one latent row. Layers marked 0 keep
         // no KV cache at all — they carry a recurrent state instead.
         let n_kv_heads = match &recurrent_layers {
+            Some(_) if lfm2_kv_heads.as_ref().is_some_and(|h| h.iter().any(|&n| n > 0)) => lfm2_kv_heads.iter().flatten().copied().max().unwrap_or(0) as usize,
             Some(mask) if mask.iter().any(|&r| !r) => 1,
             Some(_) => return Err(LlamaError::Config(
                 "attention.head_count_kv array marks every layer recurrent; the arch needs \n                 at least one full-attention layer".into())),

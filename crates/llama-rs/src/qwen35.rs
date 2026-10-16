@@ -142,6 +142,35 @@ pub enum Qwen35Block {
         ffn_down:     Weight,
         moe:          Option<Box<Qwen35Moe>>,
     },
+    /// VENDORED-LOCAL: an LFM2 gated short-conv block (`lfm2moe`; transformers' `Lfm2ShortConv`): the input's
+    /// projection (`shortconv.in_proj`, `[3 d, d]`) gives each row's B, C and x; `B * x` goes through a causal
+    /// depthwise conv (`shortconv.conv`, `[d, kernel]`), whose `kernel - 1` products before a run are the layer's
+    /// conv state, then times C and out through `shortconv.out_proj`. It keeps no other state: the cache's delta-net
+    /// state for the layer is a placeholder of one value, so what keeps a hybrid's states (a checkpoint, a disk state)
+    /// keeps a conv layer's as a delta net's. Its attention layers are `Attention` blocks whose q has no gate half.
+    Conv {
+        attn_norm:    Tensor,
+        in_proj:      Weight,
+        conv:         Tensor,
+        out_proj:     Weight,
+        /// The pre-FFN norm (`ffn_norm`).
+        post_norm:    Tensor,
+        ffn_pair:     FfnPair,
+        ffn_down:     Weight,
+        moe:          Option<Box<Qwen35Moe>>,
+    },
+}
+
+/// VENDORED-LOCAL: the FFN fields of a MoE layer with no shared expert (LFM2's): empty, never read (its experts are
+/// its FFN) and never sent to a device.
+pub(crate) fn no_ffn(h: usize) -> (FfnPair, Weight) {
+    let empty = || Weight::Dense(Tensor::from_vec(Vec::new(), vec![0, h]));
+    (FfnPair::Split { gate: empty(), up: empty() }, Weight::Dense(Tensor::from_vec(Vec::new(), vec![h, 0])))
+}
+
+/// Whether `w` is [`no_ffn`]'s.
+pub(crate) fn is_no_ffn(w: &Weight) -> bool {
+    matches!(w, Weight::Dense(t) if t.numel() == 0)
 }
 
 /// VENDORED-LOCAL: a Qwen3.5-MoE layer's FFN (`qwen35moe`: Qwen3.6-35B-A3B's, MiniCPM-V 4.7 35B-A3B's). The router's
@@ -166,7 +195,8 @@ impl Qwen35Moe {
 
 /// VENDORED-LOCAL: a MoE layer's experts as its GGUF holds them: the routed ones' blocks as they are (gate and up
 /// `[experts][ff][hidden]`, down `[experts][hidden][ff]`), the shared one dequantised (gate and up `[ff, hidden]`, down
-/// `[hidden, ff]`); what an [`ExpertsMaker`] makes a layer's [`ggml_rs::exl3::Experts`] of.
+/// `[hidden, ff]`; none in an LFM2 layer), and how the router picks them; what an [`ExpertsMaker`] makes a layer's
+/// [`ggml_rs::exl3::Experts`] of.
 pub struct ExpertBlocks {
     pub hidden: usize,
     pub ff: usize,
@@ -174,14 +204,16 @@ pub struct ExpertBlocks {
     pub gate: (ggml_quants::GgmlType, Vec<u8>),
     pub up: (ggml_quants::GgmlType, Vec<u8>),
     pub down: (ggml_quants::GgmlType, Vec<u8>),
-    pub shared: [Vec<f32>; 3],
+    pub shared: Option<[Vec<f32>; 3]>,
+    pub routing: ggml_rs::exl3::Routing,
 }
 
 /// VENDORED-LOCAL: what holds a MoE model's experts (its layer, and the experts' blocks): a backend's (the GPU's
 /// kernels), which only its caller knows.
 pub type ExpertsMaker<'a> = &'a (dyn Fn(usize, ExpertBlocks) -> Result<Box<dyn ggml_rs::exl3::Experts>> + Sync);
 
-/// SSM hyperparameters, parsed from the `qwen35.ssm.*` metadata namespace.
+/// SSM hyperparameters, parsed from the `qwen35.ssm.*` metadata namespace. VENDORED-LOCAL: an LFM2 model's (its
+/// short convs) its conv's kernel and channels (`inner_size`), no delta net (`time_step_rank` 0).
 #[derive(Debug, Clone, Copy)]
 pub struct SsmConfig {
     pub conv_kernel:    usize,  // 4
@@ -189,6 +221,23 @@ pub struct SsmConfig {
     pub inner_size:     usize,  // 4096 (= embed_dim for Qwen3.5-9B)
     pub state_size:     usize,  // 128
     pub time_step_rank: usize,  // 32
+}
+
+impl SsmConfig {
+    /// VENDORED-LOCAL: a recurrent layer's state as the cache holds it: a delta net's `[v_heads, v_dim, v_dim]`, a
+    /// short conv's placeholder of one value (see [`Qwen35Block::Conv`]).
+    pub fn state_shape(&self) -> [usize; 3] {
+        match self.time_step_rank {
+            0 => [1, 1, 1],
+            nv => [nv, self.inner_size / nv, self.inner_size / nv],
+        }
+    }
+
+    /// VENDORED-LOCAL: its conv window's, `[kernel - 1, channels]`: a delta net's q and k of every key head and v of
+    /// every value head, a short conv's the model's width.
+    pub fn conv_shape(&self) -> [usize; 2] {
+        [self.conv_kernel - 1, 2 * self.state_size * self.group_count + self.inner_size]
+    }
 }
 
 #[derive(Debug)]
@@ -357,9 +406,13 @@ impl Qwen35Model {
     }
 
     /// VENDORED-LOCAL: [`Self::from_gguf`], a Qwen3.5-MoE model's (`qwen35moe`, or `qwen35` with experts) too: each
-    /// layer's routed experts made by `experts` (a backend's), its router and shared expert read here.
+    /// layer's routed experts made by `experts` (a backend's), its router and shared expert read here. An LFM2-MoE
+    /// model's (`lfm2moe`) too: its short-conv layers [`Qwen35Block::Conv`], its attention layers' q without a gate,
+    /// its first `leading_dense_block_count` layers' FFNs dense and the rest's experts routed by their logits'
+    /// sigmoids and a selection bias, no shared expert ([`ggml_rs::exl3::Routing::Sigmoid`]).
     pub fn from_gguf_with(g: &GgufFile, backend: Arc<dyn Backend>, experts: Option<ExpertsMaker<'_>>) -> Result<Self> {
         let arch = g.architecture()?.to_string();
+        let lfm2 = arch == "lfm2moe";
         let n_experts = g.get_u64(&format!("{arch}.expert_count")).unwrap_or(0) as usize;
         let top_k = g.get_u64(&format!("{arch}.expert_used_count")).unwrap_or(0) as usize;
         if n_experts > 0 && (experts.is_none() || top_k == 0 || top_k > n_experts) {
@@ -375,20 +428,33 @@ impl Qwen35Model {
         let get = |suffix: &str| -> Result<u64> {
             Ok(g.get_u64(&format!("{arch}.{suffix}"))?)
         };
-        let ssm_cfg = SsmConfig {
-            conv_kernel:    get("ssm.conv_kernel")?     as usize,
-            group_count:    get("ssm.group_count")?     as usize,
-            inner_size:     get("ssm.inner_size")?      as usize,
-            state_size:     get("ssm.state_size")?      as usize,
-            time_step_rank: get("ssm.time_step_rank")?  as usize,
+        // (LFM2's conv layers: a kernel and nothing else)
+        let ssm_cfg = if lfm2 {
+            SsmConfig { conv_kernel: get("shortconv.l_cache")? as usize, group_count: 0, inner_size: config.embedding_dim, state_size: 0, time_step_rank: 0 }
+        } else {
+            SsmConfig {
+                conv_kernel:    get("ssm.conv_kernel")?     as usize,
+                group_count:    get("ssm.group_count")?     as usize,
+                inner_size:     get("ssm.inner_size")?      as usize,
+                state_size:     get("ssm.state_size")?      as usize,
+                time_step_rank: get("ssm.time_step_rank")?  as usize,
+            }
         };
 
         // ----- Attention layer mask --------------------------------------
+        // (LFM2's: its layers with KV heads, from `attention.head_count_kv`'s array)
         let interval = g.get_u64(&format!("{arch}.full_attention_interval"))
             .map(|v| v as usize).unwrap_or(4);
-        let attention_layers: Vec<bool> = (0..config.n_layers)
-            .map(|i| i % interval == interval - 1)
-            .collect();
+        let attention_layers: Vec<bool> = match (&config.recurrent_layers, lfm2) {
+            (Some(recurrent), true) => recurrent.iter().map(|&r| !r).collect(),
+            (None, true) => return Err(LlamaError::Config("an LFM2 model's attention.head_count_kv is an array of its layers' KV heads".into())),
+            _ => (0..config.n_layers).map(|i| i % interval == interval - 1).collect(),
+        };
+        // LFM2's experts: sigmoid-gated (`expert_gating_func` 2), from this layer on
+        let dense_layers = if lfm2 { get("leading_dense_block_count").unwrap_or(0) as usize } else { 0 };
+        if lfm2 && n_experts > 0 && g.get_u64(&format!("{arch}.expert_gating_func")).unwrap_or(2) != 2 {
+            return Err(LlamaError::Config("an LFM2-MoE model whose experts are not sigmoid-gated".into()));
+        }
 
         // ----- Common embeddings + LM head -----------------------------
         // Keep an untied packed embedding table mapped, decoding only selected
@@ -408,7 +474,7 @@ impl Qwen35Model {
             let output = load_lm_head_or_tied(&idx, &table)?;
             (Some(table), None, output)
         };
-        let output_norm = idx.take("output_norm.weight", &["norm.weight"])?;
+        let output_norm = idx.take("output_norm.weight", &["norm.weight", "token_embd_norm.weight"])?;
 
         // Move embeddings + LM head onto the backend (tied path shares Arc). VENDORED-LOCAL: before the layers, which
         // go to it as each is read: the head, used for every token, within the device's budget
@@ -424,7 +490,7 @@ impl Qwen35Model {
         // device's budget and sent to it as it is used, the two halves as the file maps them instead (the fused copy
         // was the host's memory, held; the file's pages the system keeps or reads again from the drive)
         // (a MoE layer's: its shared expert's)
-        let shexp = if n_experts > 0 { "_shexp" } else { "" };
+        let shexp = if n_experts > 0 && !lfm2 { "_shexp" } else { "" };
         let ffn_pair = |i: usize| -> Result<FfnPair> {
             let take = |name: &str| idx.take_weight(&format!("blk.{i}.{name}{shexp}.weight"), &[]);
             if backend.streams_weights() {
@@ -441,7 +507,7 @@ impl Qwen35Model {
         let ffn_down = |i: usize| idx.take_weight(&format!("blk.{i}.ffn_down{shexp}.weight"), &[]);
         // a MoE layer's experts: the routed ones' blocks to the maker, the shared one's and the router's values here
         let moe = |i: usize| -> Result<Option<Box<Qwen35Moe>>> {
-            let Some(make) = experts.filter(|_| n_experts > 0) else { return Ok(None) };
+            let Some(make) = experts.filter(|_| n_experts > 0 && i >= dense_layers) else { return Ok(None) };
             let h = config.embedding_dim;
             let info = |name: &str| g.tensor_by_name(&format!("blk.{i}.{name}.weight")).ok_or_else(|| LlamaError::Config(format!("blk.{i}.{name}.weight is missing")));
             let raw = |name: &str| -> Result<(ggml_quants::GgmlType, Vec<u8>)> {
@@ -455,6 +521,16 @@ impl Qwen35Model {
                 Ok(out)
             };
             let ff = info("ffn_gate_exps")?.numel() as usize / (n_experts * h);
+            // (LFM2's: no shared expert, its routing's selection bias)
+            let routing = if lfm2 {
+                let t = g.tensor_by_name(&format!("blk.{i}.exp_probs_b.bias")).ok_or_else(|| LlamaError::Config(format!("blk.{i}.exp_probs_b.bias is missing")))?;
+                let mut bias = vec![0f32; t.numel() as usize];
+                ggml_quants::dequantize(t.dtype, &g.tensor_bytes(t)?, &mut bias).map_err(|e| LlamaError::Config(format!("blk.{i}.exp_probs_b: {e}")))?;
+                let scale = g.get_f32(&format!("{arch}.expert_weights_scale")).unwrap_or(1.0);
+                ggml_rs::exl3::Routing::Sigmoid { bias, scale }
+            } else {
+                ggml_rs::exl3::Routing::Softmax
+            };
             let blocks = ExpertBlocks {
                 hidden: h,
                 ff,
@@ -462,10 +538,12 @@ impl Qwen35Model {
                 gate: raw("ffn_gate_exps")?,
                 up: raw("ffn_up_exps")?,
                 down: raw("ffn_down_exps")?,
-                shared: [values("ffn_gate_shexp")?, values("ffn_up_shexp")?, values("ffn_down_shexp")?],
+                shared: if lfm2 { None } else { Some([values("ffn_gate_shexp")?, values("ffn_up_shexp")?, values("ffn_down_shexp")?]) },
+                routing,
             };
             let mut router = values("ffn_gate_inp")?;
-            router.extend(values("ffn_gate_inp_shexp")?);
+            // (the shared expert's gate the last row: LFM2's a row of zeros, unread)
+            router.extend(if lfm2 { vec![0f32; h] } else { values("ffn_gate_inp_shexp")? });
             if router.len() != (n_experts + 1) * h {
                 return Err(LlamaError::Config(format!("blk.{i}: a router of {} values, not {} x {h}", router.len(), n_experts + 1)));
             }
@@ -473,7 +551,42 @@ impl Qwen35Model {
         };
         let mut blocks = Vec::with_capacity(config.n_layers);
         for (i, &is_attn) in attention_layers.iter().enumerate() {
-            let blk = if is_attn {
+            let blk = if lfm2 {
+                let t = |name: &str| idx.take(&format!("blk.{i}.{name}.weight"), &[]);
+                let w = |name: &str| idx.take_weight(&format!("blk.{i}.{name}.weight"), &[]);
+                let moe = moe(i)?;
+                let (ffn_pair, ffn_down) = if moe.is_some() { no_ffn(config.embedding_dim) } else { (ffn_pair(i)?, ffn_down(i)?) };
+                if is_attn {
+                    Qwen35Block::Attention {
+                        attn_norm: t("attn_norm")?,
+                        attn_q: w("attn_q")?,
+                        attn_q_norm: t("attn_q_norm")?,
+                        attn_k: w("attn_k")?,
+                        attn_k_norm: t("attn_k_norm")?,
+                        attn_v: w("attn_v")?,
+                        attn_output: w("attn_output")?,
+                        post_norm: t("ffn_norm")?,
+                        ffn_pair,
+                        ffn_down,
+                        moe,
+                    }
+                } else {
+                    let conv = t("shortconv.conv")?;
+                    if conv.numel() != config.embedding_dim * ssm_cfg.conv_kernel {
+                        return Err(LlamaError::Config(format!("blk.{i}.shortconv.conv: {} values, not {} x {}", conv.numel(), config.embedding_dim, ssm_cfg.conv_kernel)));
+                    }
+                    Qwen35Block::Conv {
+                        attn_norm: t("attn_norm")?,
+                        in_proj: w("shortconv.in_proj")?,
+                        conv,
+                        out_proj: w("shortconv.out_proj")?,
+                        post_norm: t("ffn_norm")?,
+                        ffn_pair,
+                        ffn_down,
+                        moe,
+                    }
+                }
+            } else if is_attn {
                 Qwen35Block::Attention {
                     attn_norm:   idx.take(&format!("blk.{i}.attn_norm.weight"), &[])?,
                     attn_q:      idx.take_weight(&format!("blk.{i}.attn_q.weight"), &[])?,
@@ -674,9 +787,10 @@ impl Qwen35Model {
         // the actual query (matched to k's head_dim); second half is a
         // per-channel gate that gets sigmoid'd and element-wise multiplied
         // with the attention output before the final output projection.
+        // (LFM2's q has no gate: head_dim a head)
         let q_per_head_full = self.first_attn_q_out_dim() / cfg.n_heads;  // 512 for 9B
-        debug_assert_eq!(q_per_head_full, 2 * head_dim,
-            "expected q_per_head_full=2*head_dim; got {q_per_head_full} vs {}", 2 * head_dim);
+        debug_assert!(q_per_head_full == 2 * head_dim || q_per_head_full == head_dim,
+            "expected q_per_head_full=2*head_dim or head_dim; got {q_per_head_full} vs {head_dim}");
 
         let mut x = embeds.clone();
         let positions: Vec<u32> = (past..past + seq).map(|p| p as u32).collect();
@@ -685,6 +799,19 @@ impl Qwen35Model {
             match blk {
                 Qwen35Block::Attention { .. } => {
                     self.attention_block_host(blk, layer, &mut x, seq, kv, &positions, multimodal);
+                }
+                Qwen35Block::Conv { attn_norm, in_proj, conv, out_proj, post_norm, ffn_pair, ffn_down, moe } => {
+                    let xn = ops::rmsnorm(backend, &x, attn_norm, cfg.rms_eps);
+                    let bcx = in_proj.linear(backend, &xn).to_host();
+                    let y = short_conv_host(bcx.data(), &conv.to_host(), kv, layer, seq, cfg.embedding_dim, self.ssm_cfg.conv_kernel);
+                    let y = backend.to_device(Tensor::from_vec(y, vec![seq, cfg.embedding_dim]));
+                    let proj = out_proj.linear(backend, &y);
+                    let xn2 = ops::add_inplace_then_rmsnorm(backend, &mut x, &proj, post_norm, cfg.rms_eps);
+                    let ffn_out = match moe {
+                        Some(m) => m.forward(backend, &xn2),
+                        None => ffn_down.linear(backend, &ffn_pair.swiglu(backend, &xn2)),
+                    };
+                    ops::add_inplace(backend, &mut x, &ffn_out);
                 }
                 Qwen35Block::Ssm { attn_norm, attn_qkv, attn_gate, ssm_conv1d, ssm_a,
                                    ssm_ba, ssm_dt_bias, ssm_norm, ssm_out,
@@ -773,7 +900,14 @@ impl Qwen35Model {
         // Split q_full per head: first head_dim → query, second head_dim → gate.
         // On CUDA this is a single kernel writing both halves directly on
         // device — eliminates the per-attention-layer host roundtrip.
-        let (q_only, q_gate) = backend.split_q_and_gate(&q_full, n_h, head_dim);
+        // (LFM2's q is the query alone: no gate)
+        let gated = q_full.dim(q_full.rank() - 1) == 2 * n_h * head_dim;
+        let (q_only, q_gate) = if gated {
+            let (q, g) = backend.split_q_and_gate(&q_full, n_h, head_dim);
+            (q, Some(g))
+        } else {
+            (q_full, None)
+        };
         let q_3d = q_only.reshape(vec![seq, n_h, head_dim]).expect("q reshape");
         let k_3d = k_flat.reshape(vec![seq, n_h_kv, head_dim]).expect("k reshape");
         let v_3d = v_flat.reshape(vec![seq, n_h_kv, head_dim]).expect("v reshape");
@@ -819,7 +953,9 @@ impl Qwen35Model {
         // Gate the attention output: `attn_out *= sigmoid(q_gate)`,
         // fused into a single kernel.
         let mut attn_t = attn_out.reshape(vec![seq, n_h * head_dim]).expect("attn reshape");
-        backend.mul_sigmoid_inplace(&mut attn_t, &q_gate);
+        if let Some(q_gate) = &q_gate {
+            backend.mul_sigmoid_inplace(&mut attn_t, q_gate);
+        }
 
         let attn_proj = attn_output.linear(backend, &attn_t);
         // FFN (SwiGLU). post_attention_norm is the *pre-FFN* norm
@@ -841,6 +977,44 @@ impl Qwen35Model {
         }
         self.config.n_heads * self.config.head_dim
     }
+}
+
+/// VENDORED-LOCAL: an LFM2 short conv's middle on the host (as `ChainRecorder::short_conv` on a device): `seq` rows of
+/// `bcx` (`[seq, 3 d]`, B, C and x), `B * x` through the causal depthwise conv after the products the cache holds for
+/// `layer` (its conv state, `[kernel - 1, d]`; zeros at the start), times C: `[seq, d]`. The state is left with the
+/// last products, and the layer's delta-net state with its placeholder (see [`Qwen35Block::Conv`]).
+fn short_conv_host(bcx: &[f32], conv: &Tensor, kv: &mut KvCache, layer: usize, seq: usize, d: usize, kern: usize) -> Vec<f32> {
+    let w = conv.data();
+    let mut window = match kv.ssm_conv[layer].take() {
+        Some(t) => t.to_host().data().to_vec(),
+        None => vec![0f32; (kern - 1) * d],
+    };
+    assert_eq!(window.len(), (kern - 1) * d, "a short conv's state of {} values where its layer's is {} x {d}", window.len(), kern - 1);
+    let mut y = vec![0f32; seq * d];
+    let mut seq_c = vec![0f32; kern - 1 + seq];
+    for c in 0..d {
+        for k in 0..kern - 1 {
+            seq_c[k] = window[k * d + c];
+        }
+        for t in 0..seq {
+            seq_c[kern - 1 + t] = bcx[t * 3 * d + c] * bcx[t * 3 * d + 2 * d + c];
+        }
+        for t in 0..seq {
+            let mut acc = 0f32;
+            for k in 0..kern {
+                acc += seq_c[t + k] * w[c * kern + k];
+            }
+            y[t * d + c] = bcx[t * 3 * d + d + c] * acc;
+        }
+        for k in 0..kern - 1 {
+            window[k * d + c] = seq_c[seq + k];
+        }
+    }
+    kv.ssm_conv[layer] = Some(Tensor::from_vec(window, vec![kern - 1, d]));
+    if kv.ssm_state[layer].is_none() {
+        kv.ssm_state[layer] = Some(Tensor::zeros(vec![1, 1, 1]));
+    }
+    y
 }
 
 /// Fuse the GGUF's separate `ssm_beta` and `ssm_alpha` weights (each shape
@@ -1198,7 +1372,23 @@ const VRAM_SAFETY_MARGIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 fn upload_block(b: Qwen35Block, backend: &dyn Backend) -> Qwen35Block {
     let m = VRAM_SAFETY_MARGIN_BYTES;
+    // (a MoE layer's FFN of no shared expert stays as it is: empty)
+    let pair_up = |p: FfnPair| match &p {
+        FfnPair::Split { gate, .. } if is_no_ffn(gate) => p,
+        _ => p.try_to_device(backend, m),
+    };
+    let down_up = |w: Weight| if is_no_ffn(&w) { w } else { w.try_to_device(backend, m) };
     match b {
+        Qwen35Block::Conv { attn_norm, in_proj, conv, out_proj, post_norm, ffn_pair, ffn_down, moe } => Qwen35Block::Conv {
+            attn_norm: backend.to_device(attn_norm),
+            in_proj:   in_proj.try_to_device(backend, m),
+            conv:      backend.to_device(conv),
+            out_proj:  out_proj.try_to_device(backend, m),
+            post_norm: backend.to_device(post_norm),
+            ffn_pair:  pair_up(ffn_pair),
+            ffn_down:  down_up(ffn_down),
+            moe,
+        },
         Qwen35Block::Attention {
             attn_norm, attn_q, attn_q_norm, attn_k, attn_k_norm, attn_v,
             attn_output, post_norm, ffn_pair, ffn_down, moe,
@@ -1211,8 +1401,8 @@ fn upload_block(b: Qwen35Block, backend: &dyn Backend) -> Qwen35Block {
             attn_v:      attn_v.try_to_device(backend, m),
             attn_output: attn_output.try_to_device(backend, m),
             post_norm:   backend.to_device(post_norm),
-            ffn_pair:    ffn_pair.try_to_device(backend, m),
-            ffn_down:    ffn_down.try_to_device(backend, m),
+            ffn_pair:    pair_up(ffn_pair),
+            ffn_down:    down_up(ffn_down),
             moe,
         },
         Qwen35Block::Ssm {

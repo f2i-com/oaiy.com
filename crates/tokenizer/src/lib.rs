@@ -56,6 +56,9 @@ pub enum TokenizerModel {
 pub struct Tokenizer {
     // VENDORED-LOCAL: HF Qwen3.8 uses NFC, combining marks and single digits.
     qwen3_pre: bool,
+    // VENDORED-LOCAL: a piece that is a token whole is that token, merges or no (Hugging Face's `ignore_merges`, as
+    // LFM2's tokenizer has it and llama.cpp reads `tokenizer.ggml.pre` lfm2).
+    ignore_merges: bool,
     model: TokenizerModel,
 
     /// Token strings, indexed by token id.
@@ -112,7 +115,7 @@ impl Tokenizer {
         let merges_rank=merges.into_iter().enumerate().map(|(i,m)|(m,i as u32)).collect();
         let mut special_tokens:Vec<_>=special_ids.into_iter().map(|i|(tokens[i as usize].clone(),i)).collect();
         special_tokens.sort_by(|a,b|b.0.len().cmp(&a.0.len()));
-        Ok(Self{qwen3_pre:true,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,add_space_prefix:false,spm_by_merge_rank:false,token_types:None,
+        Ok(Self{qwen3_pre:true,ignore_merges:false,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,add_space_prefix:false,spm_by_merge_rank:false,token_types:None,
             merges_rank,bos:None,eos:Some(eos),unk:None,pad:None,special_tokens})
     }
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
@@ -192,8 +195,10 @@ impl Tokenizer {
         // (a Qwen GGUF's own pre-tokenizer, `tokenizer.ggml.pre` qwen2 or qwen35: its letters with their marks, its
         // digits one by one and NFC first, as its Hugging Face tokenizer has them; Llama's splitter otherwise)
         let qwen3_pre = model == TokenizerModel::Gpt2 && matches!(gguf.get_str("tokenizer.ggml.pre"), Ok("qwen2" | "qwen35"));
+        let ignore_merges = model == TokenizerModel::Gpt2 && gguf.get_str("tokenizer.ggml.pre").is_ok_and(|p| p == "lfm2");
         Ok(Self {
             qwen3_pre,
+            ignore_merges,
             model,
             tokens,
             token_to_id,

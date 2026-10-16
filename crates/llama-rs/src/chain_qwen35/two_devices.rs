@@ -299,7 +299,7 @@ impl Qwen35Chain {
                                 attention_slots.push(*slot);
                                 attention_slots.len() - 1
                             }
-                            Mixer::Ssm { slot, .. } => {
+                            Mixer::Ssm { slot, .. } | Mixer::Conv { slot, .. } => {
                                 ssm_slots.push(*slot);
                                 ssm_slots.len() - 1
                             }

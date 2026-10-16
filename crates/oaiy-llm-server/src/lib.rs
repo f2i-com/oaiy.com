@@ -32,6 +32,7 @@ pub mod glm;
 pub mod models;
 mod http;
 mod qwen;
+mod lfm2;
 // OrcaSAQ (EXL3: packed on any GPU through WebGPU, else decoded on the CPU), its PEFT adapters and its Qwen vision
 // tower.
 mod orcasaq;

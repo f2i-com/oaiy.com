@@ -14,8 +14,11 @@ pub struct QuantExpertsData {
     pub gate: (GgmlType, Vec<u8>),
     pub up: (GgmlType, Vec<u8>),
     pub down: (GgmlType, Vec<u8>),
-    /// The shared expert, dequantised by the loader: gate and up `[ff, hidden]`, down `[hidden, ff]`, f32 row-major.
-    pub shared: [Vec<f32>; 3],
+    /// The shared expert, dequantised by the loader: gate and up `[ff, hidden]`, down `[hidden, ff]`, f32 row-major;
+    /// none where the layer has none (LFM2's: its place in a row's experts then weighted 0).
+    pub shared: Option<[Vec<f32>; 3]>,
+    /// How the router's logits pick and weight the experts.
+    pub routing: Routing,
 }
 
 /// The bytes of a row of `cols` weights of type `t`.
@@ -42,9 +45,14 @@ impl QuantExpertsData {
                 return Err(format!("the experts' {what}: {} bytes, {want} for {e} of {rows} x {cols} in {}", bytes.len(), t.name()));
             }
         }
-        for (what, m) in ["gate", "up", "down"].iter().zip(&self.shared) {
+        for (what, m) in ["gate", "up", "down"].iter().zip(self.shared.iter().flatten()) {
             if m.len() != h * f {
                 return Err(format!("the shared expert's {what}: {} values, not {}", m.len(), h * f));
+            }
+        }
+        if let Routing::Sigmoid { bias, .. } = &self.routing {
+            if bias.len() != e {
+                return Err(format!("a selection bias of {} values for {e} experts", bias.len()));
             }
         }
         Ok(())
@@ -70,7 +78,8 @@ pub struct QuantMoeCpu {
 
 impl std::fmt::Debug for QuantMoeCpu {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "QuantMoeCpu({} routed experts of {}x{} in {}, and the shared one, on the host)", self.data.experts, self.data.hidden, self.data.ff, self.data.gate.0.name())
+        let shared = if self.data.shared.is_some() { ", and the shared one" } else { "" };
+        write!(f, "QuantMoeCpu({} routed experts of {}x{} in {}{shared}, on the host)", self.data.experts, self.data.hidden, self.data.ff, self.data.gate.0.name())
     }
 }
 
@@ -92,7 +101,7 @@ impl Experts for QuantMoeCpu {
         let logits = logits.to_host();
         let (xs, ls) = (x.data(), logits.data());
         let rows = xs.len() / h;
-        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| route(&ls[r * (n + 1)..(r + 1) * (n + 1)], top_k)).collect();
+        let assign: Vec<Vec<(usize, f32)>> = (0..rows).map(|r| d.routing.route(&ls[r * (n + 1)..(r + 1) * (n + 1)], top_k)).collect();
         // each routed expert's rows (and their weights)
         let mut by: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
         for (r, a) in assign.iter().enumerate() {
@@ -125,10 +134,12 @@ impl Experts for QuantMoeCpu {
             out[r * h..(r + 1) * h].iter_mut().zip(&y).for_each(|(o, v)| *o += v);
         }
         // the shared expert on every row, weighted by its gate's sigmoid
-        out.par_chunks_mut(h).enumerate().for_each(|(r, o)| {
-            let y = expert(&d.shared[0], &d.shared[1], &d.shared[2], &xs[r * h..(r + 1) * h], assign[r].last().expect("the shared expert").1);
-            o.iter_mut().zip(&y).for_each(|(o, v)| *o += v);
-        });
+        if let Some(sh) = &d.shared {
+            out.par_chunks_mut(h).enumerate().for_each(|(r, o)| {
+                let y = expert(&sh[0], &sh[1], &sh[2], &xs[r * h..(r + 1) * h], assign[r].last().expect("the shared expert").1);
+                o.iter_mut().zip(&y).for_each(|(o, v)| *o += v);
+            });
+        }
         Tensor::from_vec(out, vec![rows, h])
     }
 

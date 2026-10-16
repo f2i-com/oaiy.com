@@ -77,6 +77,12 @@ fn encode_text_segment(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Resul
     let pieces=if tok.qwen3_pre {pretokenizer::split_qwen3(text)} else {pretokenizer::split_llama3(text)};
     for piece in pieces {
         let visible = bytes_to_visible(piece.as_bytes());
+        if tok.ignore_merges {
+            if let Some(id) = tok.id_of(&visible) {
+                out.push(id);
+                continue;
+            }
+        }
         let mut tokens: Vec<String> = visible.chars().map(|c| c.to_string()).collect();
 
         loop {

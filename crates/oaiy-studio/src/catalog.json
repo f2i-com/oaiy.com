@@ -191,6 +191,17 @@
       "add": ["MiniCPM-V-4.7-35B-A3B-gguf/MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf", "MiniCPM-V-4.7-35B-A3B-gguf/mmproj-model-f16.gguf"]
     },
     {
+      "id": "lfm2.5-24b-a2b",
+      "group": "llm",
+      "name": "LFM2.5 24B-A2B",
+      "about": "Liquid AI's reasoning model for agents, a mixture of experts (2B of its 24B weights a token), so it is quick: some 220 tokens a second on an RTX 4090, 46 on an M5 Pro. It thinks before every answer and calls tools. Needs a 16 GB GPU.",
+      "license": "LFM Open License 1.0 (commercial use only below US$10M annual revenue)",
+      "size_gb": 14.5,
+      "vram_gb": 16,
+      "parts": [{ "repo": "LiquidAI/LFM2.5-24B-A2B-GGUF", "include": ["LFM2.5-24B-A2B-Q4_K_M.gguf", "LICENSE"], "into": "LFM2.5-24B-A2B-GGUF" }],
+      "add": ["LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf"]
+    },
+    {
       "id": "gemma-3-4b",
       "group": "llm",
       "name": "Gemma 3 4B",

@@ -22,7 +22,7 @@
 use crate::quant_moe::{Dense, QuantExpertsData};
 use crate::WgpuBackend;
 use ggml_quants::GgmlType;
-use ggml_rs::exl3::{route, Experts};
+use ggml_rs::exl3::{route, Experts, Routing};
 use ggml_rs::{DeviceChain, DeviceVec, Tensor};
 use rayon::prelude::*;
 use std::sync::atomic::Ordering;
@@ -490,7 +490,8 @@ impl QuantMoeHost {
         let q2 = |t: GgmlType| t == GgmlType::Q2_0;
         let grid = Grid::of(data.gate.0).filter(|_| data.up.0 == data.gate.0);
         let wide = if grid.is_some() { 256 } else { BLOCK };
-        if !(q2(data.down.0) && (grid.is_some() || (q2(data.gate.0) && q2(data.up.0)))) || data.hidden % wide != 0 || data.ff % BLOCK != 0 {
+        // (Qwen's routing and a shared expert: the layers these types come in)
+        if !(q2(data.down.0) && (grid.is_some() || (q2(data.gate.0) && q2(data.up.0)))) || data.hidden % wide != 0 || data.ff % BLOCK != 0 || data.shared.is_none() || data.routing != Routing::Softmax {
             return Err(data);
         }
         static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -507,7 +508,7 @@ impl QuantMoeHost {
             b.used.fetch_sub(bytes, Ordering::Relaxed);
             return self;
         }
-        let s = &self.data.shared;
+        let s = self.data.shared.as_ref().expect("a host layer's shared expert");
         let mats = [Dense::stacked(b, &s[0], &s[1], 2 * f, h), Dense::new(b, &s[2], h, f)];
         self.gpu = Some(SharedOnGpu { b: b.clone(), mats, bytes, kept: Mutex::new(Vec::new()) });
         self
@@ -580,12 +581,13 @@ impl QuantMoeHost {
         let d = &self.data;
         let (h, f) = (d.hidden, d.ff);
         let (mut a, mut b, mut y) = (vec![0f32; f], vec![0f32; f], vec![0f32; h]);
-        dense_rows(self.level, &d.shared[0], h, x, &mut a);
-        dense_rows(self.level, &d.shared[1], h, x, &mut b);
+        let s = d.shared.as_ref().expect("a host layer's shared expert");
+        dense_rows(self.level, &s[0], h, x, &mut a);
+        dense_rows(self.level, &s[1], h, x, &mut b);
         for (a, b) in a.iter_mut().zip(&b) {
             *a = silu(*a) * b;
         }
-        dense_rows(self.level, &d.shared[2], f, &a, &mut y);
+        dense_rows(self.level, &s[2], f, &a, &mut y);
         y
     }
 }
