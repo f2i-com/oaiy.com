@@ -14,6 +14,20 @@ use std::sync::Arc;
 /// VENDORED-LOCAL: each cache's [`KvCache::id`].
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// VENDORED-LOCAL: where a cache's rows a device holds alone are read from ([`KvCache::device_rows`]: a chained run's
+/// copy of the attention cache, the one copy of the rows it wrote). The host's K and V hold the cache's first
+/// [`KvCache::host_rows`] rows, the device the rest: a copy of every row on the host as well was the device's cache a
+/// second time in the computer's memory (the 27B's 128 KB a token: 4 GB at 32,000 tokens, beside the card's copy).
+pub trait DeviceRows: Send + Sync + std::fmt::Debug {
+    /// Whether `layer` is one whose rows it holds (an attention layer's).
+    fn holds(&self, layer: usize) -> bool;
+    /// Rows `from..to` of layer `layer` of cache `id`: its K and its V, each `[to - from, heads, dim]`, on the host.
+    /// None where it does not hold them.
+    fn rows(&self, id: u64, layer: usize, from: usize, to: usize) -> Option<(Tensor, Tensor)>;
+    /// Cache `id` is gone: whatever is kept for it goes.
+    fn forget(&self, id: u64);
+}
+
 #[derive(Debug)]
 pub struct KvCache {
     /// VENDORED-LOCAL: optional per-layer placement. These caches grow as tokens arrive.
@@ -55,6 +69,18 @@ pub struct KvCache {
     /// prompt's copy was made three times (for 4,096 rows, 8,192 and 16,384: 3.8 GiB of new memory on the card where
     /// 2.2, and new memory there costs a third of a second a GiB).
     pub expect:      usize,
+    /// VENDORED-LOCAL: with [`Self::device_rows`], the rows the host's K and V hold, from the first (no more than
+    /// [`Self::len`] count); the rest are the device's alone. Without it the host holds them all.
+    pub host_rows:   usize,
+    pub device_rows: Option<Arc<dyn DeviceRows>>,
+}
+
+impl Drop for KvCache {
+    fn drop(&mut self) {
+        if let Some(d) = self.device_rows.take() {
+            d.forget(self.id);
+        }
+    }
 }
 
 impl KvCache {
@@ -114,6 +140,8 @@ impl KvCache {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             dirty_from: 0,
             expect: 0,
+            host_rows: 0,
+            device_rows: None,
         }
     }
 
@@ -123,6 +151,67 @@ impl KvCache {
         self.len = 0;
         for s in &mut self.ssm_state { *s = None; }
         for c in &mut self.ssm_conv  { *c = None; }
+        // (a conversation begun again: what the host held of the last is let go)
+        if self.device_rows.is_some() {
+            self.release_host();
+        }
+    }
+
+    /// VENDORED-LOCAL: the rows the host's K and V hold, from the first: all of them where no device holds rows alone.
+    pub fn host_valid(&self) -> usize {
+        if self.device_rows.is_some() { self.host_rows.min(self.len) } else { self.len }
+    }
+
+    /// VENDORED-LOCAL: layer `layer`'s first `upto` rows (K, then V, each `[upto, heads, dim]`) on the host: the
+    /// host's own, and where the device holds the rest alone, those read from it (not kept: the host holds no more
+    /// rows after than before).
+    pub fn layer_prefix(&self, backend: &dyn Backend, layer: usize, upto: usize) -> (Tensor, Tensor) {
+        let have = self.host_valid().min(upto);
+        let host = |t: &Tensor, n: usize| backend.slice_axis0(t, n).to_host();
+        if have == upto || self.device_rows.as_ref().is_none_or(|d| !d.holds(layer)) {
+            return (host(&self.k[layer], upto), host(&self.v[layer], upto));
+        }
+        let (dk, dv) = self.device_rows.as_ref().and_then(|d| d.rows(self.id, layer, have, upto)).unwrap_or_else(|| panic!("rows {have}..{upto} of layer {layer}: the device does not hold them"));
+        if have == 0 {
+            return (dk, dv);
+        }
+        let join = |t: &Tensor, rest: Tensor| {
+            let mut data = if have > 0 { host(t, have).data().to_vec() } else { Vec::new() };
+            data.extend_from_slice(rest.data());
+            Tensor::from_vec(data, vec![upto, self.n_kv_heads_per_layer[layer], self.head_dims[layer]])
+        };
+        (join(&self.k[layer], dk), join(&self.v[layer], dv))
+    }
+
+    /// VENDORED-LOCAL: the host's K and V given the rows up to `upto` that the device holds alone (for what reads the
+    /// host's cache itself: a run op by op).
+    pub fn materialize(&mut self, backend: &dyn Backend, upto: usize) {
+        let have = self.host_valid();
+        let Some(d) = self.device_rows.clone().filter(|_| have < upto) else { return };
+        for layer in (0..self.k.len()).filter(|&l| d.holds(l)) {
+            let (k, v) = d.rows(self.id, layer, have, upto).unwrap_or_else(|| panic!("rows {have}..{upto} of layer {layer}: the device does not hold them"));
+            let b = self.layer_backends.get(layer).cloned();
+            let b: &dyn Backend = b.as_deref().unwrap_or(backend);
+            self.reserve_layer(b, layer, upto);
+            b.copy_axis0_into(&mut self.k[layer], have, &b.to_device(k));
+            b.copy_axis0_into(&mut self.v[layer], have, &b.to_device(v));
+        }
+        self.host_rows = upto;
+    }
+
+    /// VENDORED-LOCAL: the host's K and V let go, where the device holds every row: rows of none, grown again where
+    /// the host writes some ([`Self::reserve_layer`]). (Made again whole, of zeros, they took memory the allocator had
+    /// freed and zeroed every page of it: the whole of a 16,384-position cache written where none of it was wanted.)
+    pub fn release_host(&mut self) {
+        let Some(d) = self.device_rows.clone() else { return };
+        for layer in (0..self.k.len()).filter(|&l| d.holds(l)) {
+            for t in [&mut self.k[layer], &mut self.v[layer]].into_iter().filter(|t| !t.is_device() && t.numel() > 0) {
+                let mut shape = t.shape().to_vec();
+                shape[0] = 0;
+                *t = Tensor::zeros(shape);
+            }
+        }
+        self.host_rows = 0;
     }
 
     pub fn new_lazy_per_layer_kv(backends: Vec<Arc<dyn Backend>>, max_len: usize,
@@ -136,7 +225,7 @@ impl KvCache {
             n_kv_heads_per_layer: heads.to_vec(), head_dims: dims.to_vec(),
             ssm_state: (0..heads.len()).map(|_| None).collect(),
             ssm_conv: (0..heads.len()).map(|_| None).collect(), layer_backends: backends,
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty_from: 0, expect: 0 }
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed), dirty_from: 0, expect: 0, host_rows: 0, device_rows: None }
     }
 
     pub fn reserve_layer(&mut self, backend: &dyn Backend, layer: usize, needed: usize) {
@@ -144,11 +233,13 @@ impl KvCache {
         if needed <= self.k[layer].dim(0) { return; }
         let capacity = needed.next_power_of_two().min(self.max_len);
         let shape = vec![capacity, self.n_kv_heads_per_layer[layer], self.head_dims[layer]];
+        // (the rows the host holds: a device's alone are not here to keep)
+        let keep = self.host_valid().min(self.k[layer].dim(0));
         // Replace one buffer at a time to bound peak device memory during growth.
         for buffer in [&mut self.k[layer], &mut self.v[layer]] {
             let mut grown = backend.alloc_zeros(shape.clone());
-            if self.len != 0 {
-                let prefix = backend.slice_axis0(buffer, self.len);
+            if keep != 0 {
+                let prefix = backend.slice_axis0(buffer, keep);
                 backend.copy_axis0_into(&mut grown, 0, &prefix);
             }
             *buffer = grown;
@@ -173,10 +264,13 @@ impl KvCache {
         let nkv = self.n_kv_heads_per_layer[layer];
         debug_assert_eq!(new_k.shape(), &[seq, nkv, hd]);
         debug_assert_eq!(new_v.shape(), &[seq, nkv, hd]);
+        // (rows before these the device holds alone: to the host first, which these follow)
+        self.materialize(backend, self.len);
         self.reserve_layer(backend, layer, self.len + seq);
         backend.copy_axis0_into(&mut self.k[layer], self.len, new_k);
         backend.copy_axis0_into(&mut self.v[layer], self.len, new_v);
         self.dirty_from = self.dirty_from.min(self.len);
+        self.host_rows = self.len + seq;
     }
 
     /// VENDORED-LOCAL: [`Self::append`] of `seq` rows given as a device's cache holds them, each row's K then its V
@@ -186,6 +280,7 @@ impl KvCache {
     pub fn append_rows(&mut self, backend: &dyn Backend, layer: usize, rows: &[f32], seq: usize) {
         let inner = self.n_kv_heads_per_layer[layer] * self.head_dims[layer];
         assert_eq!(rows.len(), seq * 2 * inner, "a cache's {seq} rows, K then V");
+        self.materialize(backend, self.len);
         self.reserve_layer(backend, layer, self.len + seq);
         if self.k[layer].is_device() || self.v[layer].is_device() {
             let (mut kh, mut vh) = (Vec::with_capacity(seq * inner), Vec::with_capacity(seq * inner));
@@ -205,6 +300,7 @@ impl KvCache {
             }
         }
         self.dirty_from = self.dirty_from.min(self.len);
+        self.host_rows = self.len + seq;
     }
 
     pub fn n_kv_heads_for(&self, layer: usize) -> usize {
@@ -222,6 +318,66 @@ impl KvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device's rows for one cache: row `t` of a layer holds `t` in K and `-t` in V, layer 1 its only attention layer.
+    #[derive(Debug, Default)]
+    struct Device(std::sync::Mutex<Vec<u64>>);
+
+    impl DeviceRows for Device {
+        fn holds(&self, layer: usize) -> bool {
+            layer == 1
+        }
+        fn rows(&self, _: u64, layer: usize, from: usize, to: usize) -> Option<(Tensor, Tensor)> {
+            assert_eq!(layer, 1);
+            let n = to - from;
+            let k: Vec<f32> = (from..to).flat_map(|t| [t as f32; 4]).collect();
+            Some((Tensor::from_vec(k.clone(), vec![n, 2, 2]), Tensor::from_vec(k.iter().map(|x| -x).collect(), vec![n, 2, 2])))
+        }
+        fn forget(&self, id: u64) {
+            self.0.lock().unwrap().push(id);
+        }
+    }
+
+    /// A cache whose rows a device holds alone past its host's: read whole (the host's then the device's, the host
+    /// given none), brought to the host where a run op by op writes after them, let go, and its id forgotten as it goes.
+    #[test]
+    fn rows_a_device_holds_alone_are_read_from_it_and_kept_only_where_wanted() {
+        let cpu = ggml_rs::CpuBackend::new();
+        let device = Arc::new(Device::default());
+        let mut kv = KvCache::new_per_layer_kv(&cpu, 64, &[1, 2], &[1, 2]);
+        let row = |t: usize| Tensor::from_vec(vec![t as f32; 4], vec![1, 2, 2]);
+        // three rows written here, then seven more on the device
+        for t in 0..3 {
+            let (k, v) = (row(t), Tensor::from_vec(vec![-(t as f32); 4], vec![1, 2, 2]));
+            kv.append(&cpu, 1, &k, &v);
+            kv.commit(1);
+        }
+        kv.device_rows = Some(device.clone());
+        kv.len = 10;
+        assert_eq!(kv.host_valid(), 3);
+        let (k, v) = kv.layer_prefix(&cpu, 1, 10);
+        let want: Vec<f32> = (0..10).flat_map(|t| [t as f32; 4]).collect();
+        assert_eq!((k.shape(), k.data()), (&[10usize, 2, 2][..], &want[..]));
+        assert_eq!(v.data(), want.iter().map(|x| -x).collect::<Vec<_>>().as_slice());
+        assert_eq!(kv.host_valid(), 3, "the device's rows read, not kept");
+        // a run op by op after them: the device's rows to the host first, then its own
+        kv.append(&cpu, 1, &row(10), &Tensor::from_vec(vec![-10.0; 4], vec![1, 2, 2]));
+        kv.commit(1);
+        assert_eq!(kv.host_valid(), 11);
+        assert_eq!(&kv.k_buffer(1).data()[..44], (0..11).flat_map(|t| [t as f32; 4]).collect::<Vec<_>>().as_slice());
+        // a shorter cache (a rollback): the host's rows past it are not its
+        kv.len = 6;
+        assert_eq!(kv.host_valid(), 6);
+        // let go: the host holds none (rows of none), and reads come from the device again
+        kv.release_host();
+        assert_eq!((kv.host_valid(), kv.k_buffer(1).dim(0)), (0, 0));
+        assert_eq!(kv.layer_prefix(&cpu, 1, 6).0.data(), (0..6).flat_map(|t| [t as f32; 4]).collect::<Vec<_>>().as_slice());
+        // a recurrent layer's are the host's, whatever the device holds
+        assert_eq!(kv.layer_prefix(&cpu, 0, 2).0.shape(), &[2, 1, 1]);
+        let id = kv.id;
+        drop(kv);
+        assert_eq!(*device.0.lock().unwrap(), vec![id]);
+    }
 
     /// A device's rows (each K then V) appended as they are read back give the cache [`KvCache::append`] gives: two
     /// batches, one after the other.

@@ -1909,7 +1909,8 @@ fn a_qwen35_prompt_run_whole_answers_as_its_chunks_one_at_a_time() {
 /// quarter of a logit: a layer's top 8 of its experts tips where the paths' sums differ in their last bits (the
 /// chain's f16 cache and sums), and a row with another expert is another row (MiniCPM-V 4.7 35B-A3B on an RTX
 /// 4090, 600 prompt tokens: the prompt's logits at 0.99971, the first step's 0.99531, the tokens parting there with the
-/// host's two 0.11 apart and the chain's 0.03; its chained replies are tinygrad's word for word).
+/// host's two 0.11 apart and the chain's 0.03; its chained replies are tinygrad's word for word). A cache the device
+/// holds in f16 alone (the 27B's on an RTX 4090) within a tenth of a percent.
 #[test]
 #[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF (E:/models/Qwen3.5-9B-Q4_K_M.gguf, or QWEN35_MODEL)"]
 fn a_chained_qwen35_run_answers_as_the_host_path() {
@@ -2001,9 +2002,87 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     }
     assert!(runs > prompt.len().div_ceil(512), "the chain ran ({runs} runs)");
     let moe = m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Attention { moe: Some(_), .. } | llama_rs::Qwen35Block::Ssm { moe: Some(_), .. } | llama_rs::Qwen35Block::Conv { moe: Some(_), .. }));
-    let (agree, tie) = if moe { (0.99, 0.25) } else { (0.9999, 0.05) };
+    // (a cache held in f16 alone, as a card with tensor cores holds the 27B's, within a tenth of a percent: 0.99985
+    // at worst over 32 steps)
+    let (agree, tie) = if moe { (0.99, 0.25) } else if m.chain.cache_in_halves(m) { (0.999, 0.05) } else { (0.9999, 0.05) };
     assert!(worst >= agree, "{worst}");
     if let Some((_, host_gap, chain_gap)) = gaps {
         assert!(host_gap < tie && (!moe || chain_gap < tie), "the tokens part where the host's two are {host_gap} apart, the chain's {chain_gap}");
     }
+}
+
+/// A chained run's K and V rows are its device's alone (the host's cache is given none: every run read them back into
+/// the host's as well, a second copy of the attention cache in the computer's memory), and come back where they are
+/// wanted: a disk's whole state made of them restored into another cache continues as the cache itself does, step for
+/// step, the two taking the device's copy from each other at every step (each one's rows set aside as the other's run
+/// takes it, and brought back); and a step op by op after them reads them on the host (QWEN35_MODEL, any Qwen3.5
+/// hybrid GGUF: a dense one, or a MoE one whose experts the GPU holds).
+#[test]
+#[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF (QWEN35_MODEL)"]
+fn a_chained_runs_rows_are_its_devices_alone_and_come_back_where_wanted() {
+    use std::sync::Arc;
+    let Ok(path) = std::env::var("QWEN35_MODEL") else { return };
+    let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+    let gpu = b.clone();
+    let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+    let gguf = gguf::GgufFile::open(&path).unwrap();
+    let model = if matches!(gguf.get_str("general.architecture").ok(), Some("qwen35moe" | "lfm2moe")) {
+        let make = |_: usize, e: llama_rs::ExpertBlocks| -> llama_rs::Result<Box<dyn ggml_rs::exl3::Experts>> {
+            let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
+            gpu.quant_experts(data).map_err(llama_rs::LlamaError::Config)
+        };
+        let mut m = llama_rs::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();
+        m.moe_rows = if gpu.f16_tensor_cores() { 0 } else { 64 };
+        llama_rs::Model::Qwen35(m)
+    } else {
+        llama_rs::Model::load(&gguf, Arc::clone(&backend)).unwrap()
+    };
+    let llama_rs::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
+    let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
+    let cosine = |a: &[f32], b: &[f32]| {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+        let n = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        dot / (n(a) * n(b))
+    };
+    let chained = |kv: &mut llama_rs::KvCache, tokens: &[u32]| -> Vec<f32> {
+        let mut l = Vec::new();
+        for chunk in tokens.chunks(512) {
+            l = m.forward_embeds_positions(&m.embed_text(chunk), chunk.len(), kv, None).unwrap().to_host().data().to_vec();
+        }
+        l
+    };
+    let prompt: Vec<u32> = (0..700).map(|i| 1000 + (i * 7919) % 20000).collect();
+    let mut a = model.new_kv_cache(4096);
+    let first = chained(&mut a, &prompt);
+    assert!(a.device_rows.is_some() && a.host_valid() == 0, "{} rows on the host", a.host_valid());
+    // a disk's whole state of it (its rows read from the device), restored into another cache: the host's, until a run
+    let whole = crate::qwen_cache::Snapshot::capture(&a, &m.attention_layers, m.backend.as_ref());
+    let mut b = model.new_kv_cache(4096);
+    whole.restore(&mut b, &m.attention_layers, m.ssm_cfg, m.backend.as_ref()).unwrap();
+    assert_eq!(b.host_valid(), prompt.len());
+    // the two step for step, taking the device's copy from each other at every step: each the other's, bit for bit
+    let mut next = argmax(&first);
+    for i in 0..6 {
+        let from_b = chained(&mut b, &[next]);
+        assert_eq!(b.host_valid(), 0, "step {i}: the restored rows kept on the host once on the device");
+        let from_a = chained(&mut a, &[next]);
+        let c = cosine(&from_a, &from_b);
+        eprintln!("step {i}: the cache and its restored state's {c:.7} apart, the largest logit's token {} and {}", argmax(&from_a), argmax(&from_b));
+        assert!(c > 0.99999 && argmax(&from_a) == argmax(&from_b), "step {i}: {c}");
+        next = argmax(&from_a);
+    }
+    assert_eq!(a.host_valid(), 0, "rows kept on the host");
+    // a step op by op after them: their rows to the host first, and its answer the chained one's
+    let host = m.forward_embeds_host(&m.embed_text(&[next]), 1, &mut a, None).unwrap().to_host().data().to_vec();
+    assert_eq!(a.host_valid(), a.len, "the host holds the rows a run op by op read");
+    let chain = chained(&mut b, &[next]);
+    let c = cosine(&host, &chain);
+    eprintln!("a step op by op after them: {c:.6} from the chained one, tokens {} and {}", argmax(&host), argmax(&chain));
+    // (a MoE model's within a percent, as `a_chained_qwen35_run_answers_as_the_host_path` holds it: its experts' picks
+    // tip on the last bits of a sum)
+    let moe = m.blocks.iter().any(|b| matches!(b, llama_rs::Qwen35Block::Attention { moe: Some(_), .. } | llama_rs::Qwen35Block::Ssm { moe: Some(_), .. } | llama_rs::Qwen35Block::Conv { moe: Some(_), .. }));
+    assert!(c > if moe { 0.99 } else { 0.999 }, "{c}");
+    // and a chained run after that: the host's rows to the device, and let go
+    let _ = chained(&mut a, &[argmax(&host)]);
+    assert_eq!(a.host_valid(), 0);
 }

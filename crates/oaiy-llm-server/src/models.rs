@@ -670,8 +670,6 @@ impl Models {
             spec.name,
             t.elapsed().as_secs_f64()
         ));
-        // (what the load used and freed, given back: macOS's allocator kept some 0.6 GB of it)
-        ggml_rs::give_back_freed_memory();
 
         let active = Active {
             jobs: next.jobs.clone(),

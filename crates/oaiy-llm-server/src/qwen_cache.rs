@@ -115,8 +115,10 @@ impl WholeBuilder {
         }
         if let Some(i) = (self.next < self.attention.len()).then_some(self.next) {
             let backend = kv.layer_backends.get(i).map(|b| b.as_ref()).unwrap_or(self.backend.as_ref());
-            self.layers[i][0] = Some(backend.slice_axis0(&kv.k[i], self.pos).to_host());
-            self.layers[i][1] = Some(backend.slice_axis0(&kv.v[i], self.pos).to_host());
+            // (the host's rows, and the rows a chained run's device holds alone read from it)
+            let (k, v) = kv.layer_prefix(backend, i, self.pos);
+            self.layers[i][0] = Some(k);
+            self.layers[i][1] = Some(v);
             self.next += 1;
             return None;
         }
@@ -197,8 +199,8 @@ impl Snapshot {
         let layers = attention.iter().enumerate().map(|(i, &attn)| {
             if attn {
                 let backend = kv.layer_backends.get(i).map(|b| b.as_ref()).unwrap_or(backend);
-                [Some(backend.slice_axis0(&kv.k[i], kv.len).to_host()),
-                 Some(backend.slice_axis0(&kv.v[i], kv.len).to_host()), None, None]
+                let (k, v) = kv.layer_prefix(backend, i, kv.len);
+                [Some(k), Some(v), None, None]
             } else {
                 [None, None, kv.ssm_state[i].as_ref().map(Tensor::to_host),
                  kv.ssm_conv[i].as_ref().map(Tensor::to_host)]
@@ -227,8 +229,8 @@ impl Snapshot {
         let layers = attention.iter().enumerate().map(|(i, &attn)| {
             if attn {
                 let backend = kv.layer_backends.get(i).map(|b| b.as_ref()).unwrap_or(backend);
-                [Some(backend.slice_axis0(&kv.k[i], pos).to_host()),
-                 Some(backend.slice_axis0(&kv.v[i], pos).to_host()), None, None]
+                let (k, v) = kv.layer_prefix(backend, i, pos);
+                [Some(k), Some(v), None, None]
             } else {
                 let layer = &checkpoint.0.layers[i];
                 [None, None, layer[2].as_ref().map(its_own), layer[3].as_ref().map(its_own)]
@@ -282,6 +284,7 @@ impl Snapshot {
             kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(its_own(t)));
         }
         kv.len = self.pos;
+        kv.host_rows = self.pos;
         Ok(())
     }
 
@@ -316,6 +319,10 @@ impl Snapshot {
             kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(its_own(t)));
         }
         kv.len = self.pos;
+        // (the rows written here the host's, until a chained run takes them to its device)
+        if !reuse_attention {
+            kv.host_rows = self.pos;
+        }
         Ok(())
     }
 }

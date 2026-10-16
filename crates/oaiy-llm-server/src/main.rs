@@ -321,7 +321,28 @@ fn watch_stdin() {
     });
 }
 
+/// macOS: the allocator told to give a large block back to the system as it is freed (`MallocLargeCache=0`, which
+/// libmalloc reads as a process starts, so the program starts itself again with it, the same process): it kept every
+/// one, written and the process's, so a prompt state made for the disk left a whole prompt's attention rows held after
+/// it was written (2 GB of the 27B's at 20,000 tokens), and its pressure relief gave none of them back. The cost,
+/// where replies are quickest: LFM2.5 on an RTX 4090 at 202 tokens a second, not 205. OAIY_MALLOC_CACHE (any value)
+/// leaves the allocator as the system has it.
+#[cfg(target_os = "macos")]
+fn allocator_gives_back() {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("MallocLargeCache").is_some() || std::env::var_os("OAIY_MALLOC_CACHE").is_some() {
+        return;
+    }
+    let Ok(me) = std::env::current_exe() else { return };
+    let mut args = std::env::args_os();
+    let name = args.next().unwrap_or_else(|| me.clone().into_os_string());
+    let err = std::process::Command::new(&me).arg0(name).args(args).env("MallocLargeCache", "0").exec();
+    eprintln!("oaiy-llm-server: not started again with the allocator giving freed memory back ({err})");
+}
+
 pub(crate) fn main() {
+    #[cfg(target_os = "macos")]
+    allocator_gives_back();
     let args = match parse_args() {
         Ok(a) => a,
         Err(m) => {

@@ -157,6 +157,113 @@ struct Kv {
     halved: usize,
     /// The `cap` at which the device had no room for the halves (not asked again until the cache grows).
     refused: usize,
+    /// The rows it holds of `owner`'s (as its last run left them), the first `owner_host` of which the host's cache
+    /// holds as well (the rest the device's alone: [`ChainRows`]); `gone`, the owner's cache dropped.
+    rows: usize,
+    owner_host: usize,
+    gone: bool,
+    /// Rows of caches whose copy this was, set aside as another's run took it ([`stash_owner`]): each cache's, from
+    /// its first the host did not hold (a slot's rows each K then V, f32), until that cache runs again or is gone.
+    stash: Vec<(u64, Stash)>,
+}
+
+struct Stash {
+    from: usize,
+    to: usize,
+    slots: Vec<Vec<f32>>,
+}
+
+impl Kv {
+    fn new(out: DeviceVec) -> Kv {
+        Kv { layers: Vec::new(), cap: 0, out, owner: 0, half: Vec::new(), halved: 0, refused: 0, rows: 0, owner_host: 0, gone: false, stash: Vec::new() }
+    }
+
+    /// Rows `from..to` of attention slot `slot`, each its K then its V, read from the device (from the halves where the
+    /// cache is held as halves alone).
+    fn read_rows(&self, chain: &dyn DeviceChain, slot: usize, row: usize, from: usize, to: usize, halves_only: bool) -> Vec<f32> {
+        let mut rec = chain.begin();
+        if halves_only {
+            rec.read_range(&self.half[slot], from * row / 2, (to - from) * row / 2);
+        } else {
+            rec.read_range(&self.layers[slot], from * row, (to - from) * row);
+        }
+        let got = rec.finish().pop().expect("the rows read");
+        if halves_only { from_halves(&got) } else { got }
+    }
+}
+
+/// VENDORED-LOCAL: the rows of a cache this chain's copy of the attention cache holds alone, for the cache to read
+/// ([`crate::kv_cache::DeviceRows`]): a chained run writes its K and V rows there and nowhere else (they came back to
+/// the host's cache as well, every run, which then held all of them a second time in the computer's memory: the 27B's
+/// 128 KB a token, beside the card's copy).
+struct ChainRows {
+    kv: Arc<Mutex<Kv>>,
+    backend: Arc<dyn Backend>,
+    /// each of the model's layers' attention slot (none: a recurrent layer)
+    slots: Vec<Option<usize>>,
+    n_kv: usize,
+    hd: usize,
+    halves_only: bool,
+}
+
+impl std::fmt::Debug for ChainRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ChainRows({} attention layers)", self.slots.iter().flatten().count())
+    }
+}
+
+impl crate::kv_cache::DeviceRows for ChainRows {
+    fn holds(&self, layer: usize) -> bool {
+        self.slots.get(layer).copied().flatten().is_some()
+    }
+
+    fn rows(&self, id: u64, layer: usize, from: usize, to: usize) -> Option<(Tensor, Tensor)> {
+        let slot = self.slots.get(layer).copied().flatten()?;
+        let (kvd, row) = (self.n_kv * self.hd, 2 * self.n_kv * self.hd);
+        let g = self.kv.lock().unwrap_or_else(|p| p.into_inner());
+        let flat = if from >= to {
+            Vec::new()
+        } else if let Some((_, st)) = g.stash.iter().find(|(owner, _)| *owner == id) {
+            if from < st.from || to > st.to {
+                return None;
+            }
+            st.slots[slot][(from - st.from) * row..(to - st.from) * row].to_vec()
+        } else if g.owner == id && to <= g.rows && g.cap >= to {
+            g.read_rows(self.backend.chain()?, slot, row, from, to, self.halves_only)
+        } else {
+            return None;
+        };
+        let n = to.saturating_sub(from);
+        let (mut k, mut v) = (Vec::with_capacity(n * kvd), Vec::with_capacity(n * kvd));
+        for r in flat.chunks_exact(row) {
+            k.extend_from_slice(&r[..kvd]);
+            v.extend_from_slice(&r[kvd..]);
+        }
+        Some((Tensor::from_vec(k, vec![n, self.n_kv, self.hd]), Tensor::from_vec(v, vec![n, self.n_kv, self.hd])))
+    }
+
+    fn forget(&self, id: u64) {
+        let mut g = self.kv.lock().unwrap_or_else(|p| p.into_inner());
+        g.stash.retain(|(owner, _)| *owner != id);
+        if g.owner == id {
+            g.gone = true;
+        }
+    }
+}
+
+/// Before the copy becomes another cache's: the rows of its owner's that the device held alone set aside (read to
+/// the host), for that cache to read and to be brought back from. Nothing where the owner is gone, or the host held
+/// them all.
+fn stash_owner(chain: &dyn DeviceChain, g: &mut Kv, s: &Dims, slots: usize, halves_only: bool) {
+    let (from, to) = (g.owner_host, g.rows.min(g.cap));
+    if g.owner == 0 || g.gone || from >= to {
+        return;
+    }
+    let row = 2 * s.n_kv * s.hd;
+    let rows: Vec<Vec<f32>> = (0..slots).map(|slot| g.read_rows(chain, slot, row, from, to, halves_only)).collect();
+    let owner = g.owner;
+    g.stash.retain(|(o, _)| *o != owner);
+    g.stash.push((owner, Stash { from, to, slots: rows }));
 }
 
 /// A step's attention reads the cache's f16 halves from this many positions on: its parts are then bound by the
@@ -545,7 +652,9 @@ struct State {
     /// The layer of each recurrent state.
     ssm_layers: Vec<usize>,
     output_norm: DeviceVec,
-    kv: Mutex<Kv>,
+    kv: Arc<Mutex<Kv>>,
+    /// Its copy's rows, for the caches it runs ([`ChainRows`]).
+    rows: Arc<ChainRows>,
     pool: Mutex<Pool>,
     /// A decode step's vectors, kept (and so their bind groups).
     step: Work,
@@ -717,7 +826,7 @@ mod position_tests {
         let (slots, row) = (16, 2 * s.n_kv * s.hd);
         for keep in [1024, 0] {
             let chain = Counting { live: Default::default(), most: Default::default(), left: usize::MAX.into() };
-            let mut g = super::Kv { layers: Vec::new(), cap: 0, out: ggml_rs::DeviceChain::vec(&chain, 1), owner: 0, half: Vec::new(), halved: 0, refused: 0 };
+            let mut g = super::Kv::new(ggml_rs::DeviceChain::vec(&chain, 1));
             super::reserve(&chain, &mut g, &s, slots, 1024, 0);
             g.owner = 7;
             // (the output's stand-in, then five layers, and the sixth refused)
@@ -748,7 +857,7 @@ mod position_tests {
         let layer = |cap: usize| cap * row * 4;
         for keep in [16_384, 0] {
             let chain = Counting { live: Default::default(), most: Default::default(), left: usize::MAX.into() };
-            let mut g = super::Kv { layers: Vec::new(), cap: 0, out: ggml_rs::DeviceChain::vec(&chain, 1), owner: 0, half: Vec::new(), halved: 0, refused: 0 };
+            let mut g = super::Kv::new(ggml_rs::DeviceChain::vec(&chain, 1));
             super::reserve(&chain, &mut g, &s, slots, 15_088, 0);
             assert_eq!((g.cap, g.layers.len()), (16_384, slots));
             // (its halves, as a step deep in it makes them)
@@ -1334,6 +1443,12 @@ impl Qwen35Run<'_> {
 }
 
 impl Qwen35Chain {
+    /// VENDORED-LOCAL: whether its device holds the attention cache as f16 halves alone (`State::halves_only`), where
+    /// it runs a chain.
+    pub fn cache_in_halves(&self, m: &Qwen35Model) -> bool {
+        self.state(m).is_some_and(|st| st.halves_only)
+    }
+
     /// The most positions, `want` at most, whose attention cache the model's device holds beside what a prompt's run
     /// makes with it, found by making them where that is how a device says (one that refuses a vector as it is asked
     /// for: the card's adapter). Beside the cache a prompt's run has a second chunk's vectors and their attention's
@@ -1616,17 +1731,22 @@ impl Qwen35Chain {
                         scratch_core: v(r * nv * dv),
                     })
                 });
+                let halves_only = spec.is_none() && chain.halves_only(dims.n_h, dims.n_kv, dims.hd);
+                let kv = Arc::new(Mutex::new(Kv::new(chain.vec(1))));
+                let slots = (0..m.blocks.len()).map(|l| attention_layers.iter().position(|&a| a == l)).collect();
+                let rows = Arc::new(ChainRows { kv: Arc::clone(&kv), backend: Arc::clone(&m.backend), slots, n_kv: dims.n_kv, hd: dims.hd, halves_only });
                 Some(State {
                     dims,
                     layers,
                     attention_layers,
                     ssm_layers,
                     output_norm: upload(&m.output_norm),
-                    kv: Mutex::new(Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0, refused: 0 }),
+                    kv,
+                    rows,
                     pool: Mutex::new(pool),
                     step: Work::new(chain, &dims, 1),
                     logits: chain.vec(cfg.vocab_size),
-                    halves_only: spec.is_none() && chain.halves_only(dims.n_h, dims.n_kv, dims.hd),
+                    halves_only,
                     spec,
                     prompt_sets: Mutex::new(Vec::new()),
                     seg: Default::default(),
@@ -1807,7 +1927,26 @@ impl Qwen35Chain {
         let past = kv.len;
         let eps = cfg.rms_eps;
         self.split_written(kv, past);
+        // The rows a run writes are the device's copy's alone, read from it where they are wanted (the cache's
+        // `DeviceRows`); with a second device for prompts they come back to the host's cache as ever, which that
+        // device's copy is made from.
+        let alone = self.second.get().is_none();
+        if alone {
+            kv.device_rows = Some(Arc::clone(&st.rows) as Arc<dyn crate::kv_cache::DeviceRows>);
+            // (rows of its own the device held alone, set aside as another cache's run took the copy: to the host,
+            // which the copy is made again from below)
+            let theirs = st.kv.lock().unwrap_or_else(|p| p.into_inner()).owner != kv.id;
+            if theirs && kv.host_valid() < past {
+                kv.materialize(&*m.backend, past);
+            }
+        }
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+        if g.owner != kv.id {
+            stash_owner(chain, &mut g, &s, st.attention_layers.len(), st.halves_only);
+            g.stash.retain(|(owner, _)| *owner != kv.id);
+        }
+        // (the rows from `past` on are written on the device: whatever the host held there is stale)
+        kv.host_rows = kv.host_rows.min(past);
         let keep = kept(&g, kv, past);
         let needed = (past + t).max(kv.expect.min(kv.max_len));
         if st.halves_only {
@@ -1817,6 +1956,11 @@ impl Qwen35Chain {
             reserve(chain, &mut g, &s, st.attention_layers.len(), needed, keep);
             sync(chain, &mut g, &s, &st.attention_layers, kv, past);
         }
+        // every row to here is the device's now: what the host held of them (a restore's, a run op by op) let go
+        if alone && kv.host_rows > 0 {
+            kv.release_host();
+        }
+        (g.rows, g.owner_host, g.gone) = (past + t, kv.host_valid(), false);
         // the layers' rows from `past` on are written here: their halves' rows end there; a step deep in a long cache
         // reads the halves, brought up to its own row as it goes
         g.halved = g.halved.min(past);
@@ -1920,11 +2064,13 @@ impl Qwen35Chain {
             W::of(&m.output).one(&mut *rec, last, &st.logits);
             rec.read(&st.logits);
         }
-        for slot in 0..st.attention_layers.len() {
-            if st.halves_only {
-                rec.read_range(&g.half[slot], past * row / 2, t * row / 2);
-            } else {
-                rec.read_range(&g.layers[slot], past * row, t * row);
+        if !alone {
+            for slot in 0..st.attention_layers.len() {
+                if st.halves_only {
+                    rec.read_range(&g.half[slot], past * row / 2, t * row / 2);
+                } else {
+                    rec.read_range(&g.layers[slot], past * row, t * row);
+                }
             }
         }
         rec.flush();
@@ -1944,7 +2090,7 @@ impl Qwen35Chain {
                 Tapped { at: past + tap.row, states, convs }
             })
             .collect();
-        Qwen35Run { rec, layers: st.attention_layers.clone(), past, t, vocab: s.vocab, set: set.map(|v| (&st.prompt_sets, v)), taps, halves: st.halves_only }
+        Qwen35Run { rec, layers: if alone { Vec::new() } else { st.attention_layers.clone() }, past, t, vocab: s.vocab, set: set.map(|v| (&st.prompt_sets, v)), taps, halves: st.halves_only }
     }
 }
 

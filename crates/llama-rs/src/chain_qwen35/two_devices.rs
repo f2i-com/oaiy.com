@@ -317,7 +317,7 @@ impl Qwen35Chain {
                     output_norm: upload_tensor(chain, &m.output_norm),
                     output,
                     logits: chain.vec(s.vocab),
-                    kv: Mutex::new(SplitKv { kv: Kv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, half: Vec::new(), halved: 0, refused: 0 }, upto: 0 }),
+                    kv: Mutex::new(SplitKv { kv: Kv::new(chain.vec(1)), upto: 0 }),
                     pool,
                     seg: Default::default(),
                 })
