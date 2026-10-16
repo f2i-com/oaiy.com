@@ -159,6 +159,7 @@ impl SigLipMmProj {
             // Gated by `supports_siglip_loader()` above — unreachable.
             ProjectorKind::Gemma4V => unreachable!("Gemma4V loader not yet implemented"),
             ProjectorKind::Qwen3Vl => unreachable!("Qwen3Vl handled by separate loader (returns Err in MmProj::from_gguf)"),
+            ProjectorKind::MiniCpmV => unreachable!("MiniCpmV has its own loader"),
         };
 
         verify_shapes(&config, &patch_embd, &patch_embd_b, &position_embd,
@@ -394,7 +395,7 @@ impl SigLipMmProj {
 /// makes the mask predicate `t > past + s` false for every (t, s) in the
 /// valid range. Avoids needing a separate non-causal kernel until vision
 /// becomes hot enough to warrant one.
-fn vision_block_forward(
+pub(super) fn vision_block_forward(
     b:   &dyn Backend,
     x:   &Tensor,
     blk: &VisionBlock,

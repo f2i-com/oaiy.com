@@ -19,6 +19,7 @@
 mod chain_decode;
 mod chain_gemma4;
 pub mod chain_gemma4v;
+mod chain_minicpmv;
 mod chain_mmproj;
 mod chain_qwen35;
 pub use chain_qwen35::{Qwen35Chain, Tapped, SPEC_ROWS};

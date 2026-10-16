@@ -47,10 +47,18 @@ pub enum ImagePrep {
     Gemma { pixels: ggml_rs::Tensor, tokens: usize },
     /// GLM-5.3 Flash's: the picture as its tower takes it (`[3, height, width]`, normalised), and its tokens.
     Glm { pixels: Vec<f32>, width: usize, height: usize, tokens: usize },
+    /// One tile of a MiniCPM-V 4.7 picture (its overview or a slice: `[3, h, w]`, normalised), its patch grid
+    /// (`size`: rows, columns) and the patches a side each of its tokens is (`merge`: 4, or 2 in 4x).
+    MiniCpmV { pixels: ggml_rs::Tensor, size: (usize, usize), merge: usize },
 }
 impl ImagePrep {
     pub fn n_tokens(&self) -> usize {
-        match self { Self::Deepseek(p) => p.n_tokens(), Self::Qwen { side, .. } => side * side, Self::Gemma { tokens, .. } | Self::Glm { tokens, .. } => *tokens }
+        match self {
+            Self::Deepseek(p) => p.n_tokens(),
+            Self::Qwen { side, .. } => side * side,
+            Self::Gemma { tokens, .. } | Self::Glm { tokens, .. } => *tokens,
+            Self::MiniCpmV { size, merge, .. } => llama_rs::mmproj::minicpmv::tile_tokens(*size, *merge),
+        }
     }
     pub(crate) fn deepseek(&self) -> oaiy_engine::Result<&Prepared> {
         match self { Self::Deepseek(p) => Ok(p), _ => Err(oaiy_engine::Error::Arg("Qwen image sent to DeepSeek worker".into())) }

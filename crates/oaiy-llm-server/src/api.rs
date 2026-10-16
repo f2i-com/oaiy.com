@@ -51,6 +51,8 @@ pub struct Config {
     /// The vision tower's config when it is loaded (else images are refused).
     pub vision: Option<VisionConfig>,
     pub qwen_vision: Option<llama_rs::MmProjConfig>,
+    /// MiniCPM-V 4.7's pictures (a Qwen3.5 model with its projector): cut into tiles and laid out on canvases.
+    pub minicpmv: Option<crate::qwen::MiniCpmV>,
     /// Gemma 4's pictures, where its vision projector is loaded.
     pub gemma_vision: Option<GemmaVision>,
     /// GLM-5.3 Flash's pictures, where its vision projector is loaded.
@@ -406,6 +408,9 @@ impl Server {
     /// Decode and size a request's images and expand their placeholders in
     /// the prompt into image spans.
     fn prepare_images(&self, a: &crate::models::Active, records: &[Json], prompt: Vec<u32>) -> Result<(Vec<u32>, Vec<JobImage>), ApiError> {
+        if let Some(m) = &a.cfg.minicpmv {
+            return crate::qwen::prepare_minicpmv(records, prompt, a.cfg.image_token_id, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(bad);
+        }
         if let Some(vc) = &a.cfg.qwen_vision {
             return crate::qwen::prepare_images(records, prompt, a.cfg.image_token_id, vc, self.local_images, a.cfg.max_seq).map_err(bad);
         }

@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // VENDORED-LOCAL: upstream match was not updated when MmProj::Qwen3Vl
         // was added to the enum; this example only handles Gemma mmprojs.
         MmProj::Qwen3Vl(_) => return Err("expected a Gemma mmproj; got Qwen3-VL".into()),
+        MmProj::MiniCpmV(_) => return Err("expected a Gemma mmproj; got MiniCPM-V".into()),
     };
     eprintln!("  mmproj loaded in {:.2?} ({} blocks, {})",
               t1.elapsed(), mmproj.n_blocks(), kind_label);

@@ -14,7 +14,13 @@ const IMAGE: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 // to keep activations small alongside the configured long-context KV cache.
 pub(crate) const PREFILL_CHUNK: usize = 512;
 
-fn content(value: Option<&Json>, images: &mut Vec<Json>) -> Result<String, String> {
+/// How a picture stands in a Qwen prompt: Qwen3.5's own `<|vision_start|><|image_pad|><|vision_end|>` beside its
+/// text, or MiniCPM-V 4.7's bare `<|image_pad|>`, a message's parts each on a line of its own and the whole trimmed (its
+/// template's `join('\n')` and `trim`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pictures { Qwen, MiniCpmV }
+
+fn content(value: Option<&Json>, images: &mut Vec<Json>, style: Pictures) -> Result<String, String> {
     match value {
         None | Some(Json::Null) => Ok(String::new()),
         Some(Json::Str(s)) => {
@@ -22,34 +28,39 @@ fn content(value: Option<&Json>, images: &mut Vec<Json>) -> Result<String, Strin
             Ok(s.clone())
         }
         Some(Json::Arr(parts)) => {
-            let mut out = String::new();
+            let mut out = Vec::new();
             for p in parts {
                 match p.get("type").and_then(Json::as_str) {
-                    Some("text" | "input_text") => out.push_str(&content(p.get("text"), images)?),
+                    Some("text" | "input_text") => out.push(content(p.get("text"), images, style)?),
                     Some("image_url" | "input_image" | "image") => {
                         let rec = if let Some(url) = p.get("image_url") {
                             Json::obj([("url", url.get("url").unwrap_or(url).clone())])
                         } else { p.clone() };
                         images.push(rec);
-                        out.push_str(IMAGE);
+                        out.push(match style { Pictures::Qwen => IMAGE, Pictures::MiniCpmV => "<|image_pad|>" }.to_owned());
                     }
                     _ => return Err("unsupported Qwen content block".into()),
                 }
             }
-            Ok(out)
+            Ok(match style { Pictures::Qwen => out.concat(), Pictures::MiniCpmV => out.join("\n").trim().to_owned() })
         }
         _ => Err("message content must be text or blocks".into()),
     }
 }
 
 pub fn chat_prompt(msgs: &[Json], opts: &Options) -> Result<Encoded, String> {
+    chat_prompt_as(msgs, opts, Pictures::Qwen)
+}
+
+/// [`chat_prompt`], its pictures standing as `style` has them.
+pub fn chat_prompt_as(msgs: &[Json], opts: &Options, style: Pictures) -> Result<Encoded, String> {
     let mut prompt = String::new();
     let mut images = Vec::new();
     for (i,m) in msgs.iter().enumerate() {
         let role = m.get("role").and_then(Json::as_str).unwrap_or("user");
         if !matches!(role, "system" | "user" | "assistant" | "tool") { return Err("unsupported Qwen message role".into()); }
         let before = images.len();
-        let text = content(m.get("content_blocks").or_else(|| m.get("content")), &mut images)?;
+        let text = content(m.get("content_blocks").or_else(|| m.get("content")), &mut images, style)?;
         if role == "system" && images.len() != before { return Err("Qwen system messages cannot contain images".into()); }
         if role == "tool" {
             if i == 0 || msgs[i-1].get("role").and_then(Json::as_str) != Some("tool") { prompt.push_str("<|im_start|>user"); }
@@ -245,6 +256,58 @@ pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &M
         let hash=crate::disk::fnv(&bytes,0);
         images.push(JobImage { start: ids.len(), prep: ImagePrep::Qwen { pixels, side }, hash });
         ids.extend(std::iter::repeat_n(image_id, side*side));
+    }
+    Ok((ids, images))
+}
+
+/// A MiniCPM-V 4.7 model's pictures: its markers' token ids, the patches a side each token is (4, or 2 in 4x), the
+/// most slices a picture is cut into, and its tower's mean and spread.
+#[derive(Clone, Debug)]
+pub struct MiniCpmV {
+    pub markers: llama_rs::mmproj::minicpmv::Markers,
+    pub merge: usize,
+    pub max_slices: usize,
+    pub mean: [f32; 3],
+    pub std: [f32; 3],
+}
+
+/// A MiniCPM-V 4.7 prompt's pictures, as its processor lays them out: each `<|image_pad|>` becomes
+/// `<image_id>N</image_id>` (`encode`'s tokens; N the picture's count in the prompt), then `<image>`, the overview's
+/// tokens and `</image>`, then each row of slices, every slice's tokens between `<slice>` and `</slice>`, the rows apart
+/// by a newline. Each tile is an image of the job, its tokens in a run of their own.
+pub fn prepare_minicpmv(records: &[Json], prompt: Vec<u32>, image_id: u32, m: &MiniCpmV, encode: impl Fn(&str) -> Vec<u32>, local: bool, max_seq: usize) -> Result<(Vec<u32>, Vec<JobImage>), String> {
+    use llama_rs::mmproj::minicpmv;
+    let count = prompt.iter().filter(|&&t| t == image_id).count();
+    if count != records.len() { return Err("image placeholder count does not match image blocks".into()); }
+    let (mut ids, mut images, mut records) = (Vec::new(), Vec::new(), records.iter());
+    for (picture, id) in prompt.into_iter().scan(0usize, |n, id| { let at = *n; *n += (id == image_id) as usize; Some((at, id)) }) {
+        if id != image_id { ids.push(id); continue; }
+        let bytes = dsv41::vision::image_bytes(records.next().unwrap(), local).map_err(|e| e.to_string())?;
+        let t = minicpmv::tiles_from_bytes(&bytes, m.max_slices, m.mean, m.std).map_err(|e| e.to_string())?;
+        let sizes = t.plan.target_sizes();
+        let mut tiles = t.tiles.into_iter().zip(sizes).enumerate();
+        let mut tile = |ids: &mut Vec<u32>, images: &mut Vec<JobImage>| {
+            let (k, (pixels, size)) = tiles.next().expect("a tile for each place");
+            let prep = ImagePrep::MiniCpmV { pixels, size, merge: m.merge };
+            let n = prep.n_tokens();
+            images.push(JobImage { start: ids.len(), prep, hash: crate::disk::fnv(&bytes, k as u64 + 1) });
+            ids.extend(std::iter::repeat_n(image_id, n));
+        };
+        ids.extend(encode(&format!("<image_id>{picture}</image_id>")));
+        ids.push(m.markers.image_start);
+        tile(&mut ids, &mut images);
+        ids.push(m.markers.image_end);
+        if let Some((rows, cols)) = t.plan.grid {
+            for r in 0..rows {
+                if r > 0 { ids.push(m.markers.newline); }
+                for _ in 0..cols {
+                    ids.push(m.markers.slice_start);
+                    tile(&mut ids, &mut images);
+                    ids.push(m.markers.slice_end);
+                }
+            }
+        }
+        if ids.len() >= max_seq { return Err("images exceed configured context".into()); }
     }
     Ok((ids, images))
 }
@@ -593,6 +656,8 @@ pub struct QwenEngine {
     /// The state being made for the disk, a layer at a time: its prompt, whether it is a system prompt's, and when
     /// it began.
     building: Option<(Vec<u64>, bool, WholeBuilder, std::time::Instant)>,
+    /// A MiniCPM-V 4.7 model's picture layout (its pictures' positions are its canvas's).
+    minicpmv: Option<MiniCpmV>,
 }
 
 /// The times a reply is turned from a run without end before it is stopped: a model turned from one may write
@@ -603,7 +668,12 @@ impl QwenEngine {
     pub fn new(model: impl Into<Hybrid>, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let model = model.into();
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true, replying: false, unsaved: Vec::new(), building: None }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true, replying: false, unsaved: Vec::new(), building: None, minicpmv: None }
+    }
+    /// A MiniCPM-V 4.7 model: its pictures laid out on their canvases ([`prepare_minicpmv`], [`positions`]).
+    pub fn minicpmv(mut self, layout: Option<MiniCpmV>) -> Self {
+        self.minicpmv = layout;
+        self
     }
     /// Whether a run that repeats without end is turned from and stopped (it is, unless this says not).
     pub fn repetition_guard(mut self, on: bool) -> Self {
@@ -744,7 +814,7 @@ impl QwenEngine {
     }
     fn generate(&mut self, job: &Job) -> Result<(), String> {
         if job.prompt.is_empty() { return Err("empty Qwen prompt".into()); }
-        let (positions, mut next_position) = positions(job)?;
+        let (positions, mut next_position) = positions(job, self.minicpmv.as_ref())?;
         let mut keys: Vec<_> = job.prompt.iter().map(|&t| t as u64).collect();
         for image in &job.images { for (offset,k) in keys[image.start..image.start+image.prep.n_tokens()].iter_mut().enumerate() { *k = image.hash.rotate_left(17) ^ (offset as u64) ^ (1<<63); } }
         // (checkpoints a cancelled or failed request left on their device: to the host before anything is set aside)
@@ -836,7 +906,7 @@ impl QwenEngine {
             if image.start + image.prep.n_tokens() <= start { continue; }
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
             let t = if let Some((_,t)) = self.vision_cache.iter().find(|(hash,_)| *hash == image.hash) { t.clone() } else {
-                let ImagePrep::Qwen { pixels, .. } = &image.prep else { return Err("wrong image format for Qwen".into()); };
+                let (ImagePrep::Qwen { pixels, .. } | ImagePrep::MiniCpmV { pixels, .. }) = &image.prep else { return Err("wrong image format for Qwen".into()); };
                 let t = self.projector.as_ref().ok_or("Qwen vision projector is not configured")?.forward(pixels).map_err(|e| e.to_string())?.to_host();
                 self.vision_cache.push_back((image.hash,t.clone()));
                 while self.vision_cache.len() > 8 { self.vision_cache.pop_front(); }
@@ -1331,7 +1401,25 @@ fn checkpoint_positions(prompt: &[u32], im_start: Option<u32>) -> Vec<usize> {
     stops.sort_unstable(); stops.dedup(); stops
 }
 
-fn positions(job: &Job) -> Result<(Vec<[u32;3]>,u32),String> {
+/// Each prompt token's M-RoPE position and the one the reply starts at: text one by one, a Qwen picture's tokens over
+/// its grid from where it starts (the text after it past its side); a MiniCPM-V 4.7 prompt's laid out on its pictures'
+/// canvases (`minicpmv::canvas_positions`, as transformers' `get_rope_index`).
+fn positions(job: &Job, minicpmv: Option<&MiniCpmV>) -> Result<(Vec<[u32;3]>,u32),String> {
+    if job.images.iter().any(|i| matches!(i.prep, ImagePrep::MiniCpmV { .. })) {
+        let m = minicpmv.ok_or("MiniCPM-V pictures for a model without their layout")?;
+        let (mut mask, mut sizes) = (vec![false; job.prompt.len()], Vec::new());
+        for image in &job.images {
+            let ImagePrep::MiniCpmV { size, merge, .. } = image.prep else { return Err("wrong image format".into()); };
+            if merge != m.merge { return Err("a picture cut for another mode".into()); }
+            let end = image.start + image.prep.n_tokens();
+            if end > mask.len() { return Err("an image past its prompt".into()); }
+            mask[image.start..end].iter_mut().for_each(|t| *t = true);
+            sizes.push(size);
+        }
+        let (canvas, next) = llama_rs::mmproj::minicpmv::canvas_positions(&job.prompt, &mask, &sizes, m.merge, m.markers);
+        let canvas = canvas.into_iter().map(|p| [p[0] as u32, p[1] as u32, p[2] as u32]).collect();
+        return Ok((canvas, next as u32));
+    }
     let mut positions = Vec::with_capacity(job.prompt.len()); let mut at=0usize; let mut next=0u32;
     for image in &job.images {
         if image.start < at { return Err("overlapping image spans".into()); }

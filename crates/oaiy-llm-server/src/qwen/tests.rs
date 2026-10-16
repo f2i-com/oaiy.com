@@ -440,3 +440,88 @@ fn an_incognito_request_neither_takes_from_the_stash_nor_adds_to_it() {
     m.kv.reset(); m.covered.clear(); m.checkpoints.clear(); m.parking.clear();
     assert_eq!(m.parking.held(), (0, 0));
 }
+
+/// MiniCPM-V 4.7's prompt for a picture and a question, made here (its template, its tokenizer, the picture cut and
+/// laid out as its processor lays it out), is transformers' own (`OAIY_MINICPMV_REFERENCE`: tools/minicpmv/reference.py
+/// with `OAIY_MINICPMV_PROMPT` on `OAIY_MINICPMV_PICTURE`; `OAIY_MINICPMV_MODE` 4x where it ran so), token for token;
+/// its pictures' tiles the reference's grids.
+#[test]
+#[ignore = "needs MiniCPM-V 4.7 (OAIY_MINICPMV_GGUF), a picture (OAIY_MINICPMV_PICTURE) and transformers' prompt for it (OAIY_MINICPMV_REFERENCE, OAIY_MINICPMV_PROMPT)"]
+fn a_minicpmv_prompt_is_transformers() {
+    let var = |k: &str| std::env::var(k).ok();
+    let (Some(model), Some(picture), Some(reference), Some(question)) = (var("OAIY_MINICPMV_GGUF"), var("OAIY_MINICPMV_PICTURE"), var("OAIY_MINICPMV_REFERENCE"), var("OAIY_MINICPMV_PROMPT")) else { return };
+    let tok = tokenizer::Tokenizer::from_gguf(&gguf::GgufFile::open(&model).unwrap()).unwrap();
+    let msgs = Json::Arr(vec![Json::obj([("role", Json::str("user")), ("content", Json::Arr(vec![
+        Json::obj([("type", Json::str("image_url")), ("image_url", Json::obj([("url", Json::str(&picture))]))]),
+        Json::obj([("type", Json::str("text")), ("text", Json::str(&question))]),
+    ]))])]);
+    let encoded = chat_prompt_as(msgs.as_array().unwrap(), &Options { mode: Mode::Chat, effort: 50, drop_thinking: true }, Pictures::MiniCpmV).unwrap();
+    let id = |s: &str| tok.token_id(s).unwrap();
+    let m = MiniCpmV {
+        markers: llama_rs::mmproj::minicpmv::Markers { image_start: id("<image>"), image_end: id("</image>"), slice_start: id("<slice>"), slice_end: id("</slice>"), newline: 198 },
+        merge: if var("OAIY_MINICPMV_MODE").as_deref() == Some("4x") { 2 } else { 4 },
+        max_slices: 9,
+        mean: [0.5; 3],
+        std: [0.5; 3],
+    };
+    let prompt = tok.encode(&encoded.prompt, false).unwrap();
+    let (ids, images) = prepare_minicpmv(&encoded.images, prompt, id("<|image_pad|>"), &m, |s| tok.encode(s, false).unwrap(), true, 1 << 20).unwrap();
+    // the reference's tokens (an I64 tensor of a safetensors file)
+    let bytes = std::fs::read(&reference).unwrap();
+    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let header = Json::parse(&bytes[8..8 + n]).unwrap();
+    let span = header.get("input_ids").unwrap().get("data_offsets").unwrap().as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as usize).collect::<Vec<_>>();
+    let theirs: Vec<u32> = bytes[8 + n + span[0]..8 + n + span[1]].chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()) as u32).collect();
+    if ids != theirs {
+        let first = ids.iter().zip(&theirs).position(|(a, b)| a != b).unwrap_or(ids.len().min(theirs.len()));
+        panic!("{} tokens here, {} transformers'; the first difference at {first}: {:?} against {:?}\n{}", ids.len(), theirs.len(), &ids[first.saturating_sub(3)..(first + 8).min(ids.len())], &theirs[first.saturating_sub(3)..(first + 8).min(theirs.len())], tok.decode(&ids[first.saturating_sub(10)..(first + 10).min(ids.len())]));
+    }
+    eprintln!("{} tokens, the same as transformers'; {} tiles", ids.len(), images.len());
+}
+
+/// A safetensors file's F32 and I64 tensors (`tools/minicpmv/reference.py`'s), each its shape and values as f32.
+fn minicpmv_reference(path: &str) -> std::collections::BTreeMap<String, (Vec<usize>, Vec<f32>)> {
+    let bytes = std::fs::read(path).unwrap();
+    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let header = Json::parse(&bytes[8..8 + n]).unwrap();
+    let mut out = std::collections::BTreeMap::new();
+    for (name, t) in header.as_object().unwrap().iter().filter(|(k, _)| k != "__metadata__") {
+        let shape = t.get("shape").unwrap().as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as usize).collect();
+        let span: Vec<usize> = t.get("data_offsets").unwrap().as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as usize).collect();
+        let raw = &bytes[8 + n + span[0]..8 + n + span[1]];
+        let values = match t.get("dtype").and_then(Json::as_str) {
+            Some("F32") => raw.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect(),
+            _ => raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()) as f32).collect(),
+        };
+        out.insert(name.clone(), (shape, values));
+    }
+    out
+}
+
+/// MiniCPM-V 4.7's tower chained on the first WebGPU adapter (`OAIY_MINICPMV_MMPROJ`) against transformers' own
+/// (`OAIY_MINICPMV_REFERENCE`): each of transformers' tiles to the same tokens, and how long a tile takes.
+#[test]
+#[cfg(feature = "webgpu")]
+#[ignore = "needs MiniCPM-V 4.7's projector (OAIY_MINICPMV_MMPROJ), transformers' run on a picture (OAIY_MINICPMV_REFERENCE) and a WebGPU adapter"]
+fn the_minicpmv_tower_on_webgpu_is_transformers() {
+    let var = |k: &str| std::env::var(k).ok();
+    let (Some(mmproj), Some(reference)) = (var("OAIY_MINICPMV_MMPROJ"), var("OAIY_MINICPMV_REFERENCE")) else { return };
+    let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+    let want = minicpmv_reference(&reference);
+    let file = gguf::GgufFile::open(&mmproj).unwrap();
+    let mm = llama_rs::MmProj::from_gguf(&file, Arc::new(gpu)).unwrap();
+    for k in 0.. {
+        let Some((shape, pixels)) = want.get(&format!("tile.{k}")) else { break };
+        let clock = std::time::Instant::now();
+        let got = mm.forward(&Tensor::from_vec(pixels.clone(), shape.clone())).unwrap().to_host();
+        let took = clock.elapsed().as_secs_f64();
+        let (fshape, theirs) = &want[&format!("features.{k}")];
+        assert_eq!(got.shape(), fshape.as_slice(), "tile {k}");
+        let dot: f64 = got.data().iter().zip(theirs).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let cosine = dot / (norm(got.data()) * norm(theirs));
+        let worst = got.data().iter().zip(theirs).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        eprintln!("tile {k} {shape:?}: cosine {cosine:.6}, the largest difference {worst:.4}, in {took:.2} s");
+        assert!(cosine > 0.999, "tile {k}: {cosine}");
+    }
+}

@@ -250,7 +250,7 @@ impl Qwen3VlMmProj {
     }
 }
 
-fn qwen_merger_gelu(b: &dyn Backend, x: &Tensor) -> Tensor {
+pub(super) fn qwen_merger_gelu(b: &dyn Backend, x: &Tensor) -> Tensor {
     let mut host=x.to_host();
     for v in host.data_mut() {
         // Abramowitz-Stegun 7.1.26: absolute erf error below 1.5e-7.

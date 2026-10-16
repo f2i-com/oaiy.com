@@ -66,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mmproj = MmProj::from_gguf(&mmproj_gguf, backend.clone())?;
     let kind_label = match &mmproj {
         MmProj::Qwen3Vl(_) => "Qwen3-VL (LN + fused QKV + GeLU MLP + post-LN) + 2x2 spatial-merge MLP head",
+        MmProj::MiniCpmV(_) => "MiniCPM-V 4.7 SigLIP tower (window merger inside) + 2x2 merger MLP head",
         MmProj::SigLip(_)  => return Err("expected a Qwen3-VL mmproj; got SigLIP".into()),
         MmProj::Gemma4V(_) => return Err("expected a Qwen3-VL mmproj; got Gemma 4 V".into()),
     };

@@ -117,7 +117,9 @@ pub enum Flavour {
     /// GLM-5.3 Flash (and the other streamed MoE GGUFs): the marker a picture stands as in its prompt where it reads
     /// pictures (`<|begin_of_image|><|image|><|end_of_image|>`, with its vision projector).
     Gguf(Arc<tokenizer::Tokenizer>, Option<&'static str>),
-    Qwen(Arc<tokenizer::Tokenizer>),
+    /// Qwen3.5 (and Flash-Next): its pictures as Qwen3.5's own, or as MiniCPM-V 4.7's (a Qwen3.5 model with its
+    /// projector).
+    Qwen(Arc<tokenizer::Tokenizer>, crate::qwen::Pictures),
     /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, whether its
     /// own template opens the reply on an empty thought channel (see `dense_prompt`), and the marker a picture
     /// stands as in its prompt where it reads pictures (Gemma 4's `<|image|>`, with its vision projector).
@@ -129,7 +131,7 @@ impl Flavour {
         match self {
             Self::Deepseek(t) => t.encode(text),
             // llama-rs applies BOS through the template, so not again here.
-            Self::Gguf(t, _) | Self::Qwen(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
+            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
         }
     }
 
@@ -146,7 +148,7 @@ impl Flavour {
             Self::Deepseek(_) => {
                 dsv41::chat::encode(msgs, opts).map_err(|e| e.to_string())
             }
-            Self::Qwen(_) => crate::qwen::chat_prompt(msgs, opts),
+            Self::Qwen(_, style) => crate::qwen::chat_prompt_as(msgs, opts, *style),
             Self::Gguf(_, marker) => {
                 // The same messages through llama-rs's GLM template. `reasoning
                 // effort` maps onto the three the reference Jinja accepts; the
@@ -720,6 +722,7 @@ impl Models {
             repeat_penalty: o.repeat_penalty,
             vision: None,
             qwen_vision: None,
+            minicpmv: None,
             gemma_vision: None,
             glm_vision: None,
             image_token_id: 0,
@@ -907,7 +910,7 @@ impl Models {
             }
         }
         let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
-        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
+        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok, crate::qwen::Pictures::Qwen)) })
     }
 
     /// DeepSeek-V4.1 without CUDA: the CPU model (`dsv41::model`, the reference the CUDA path is tested against), its
@@ -1064,7 +1067,7 @@ impl Models {
             }
         }
         let thread = std::thread::Builder::new().name("orcasaq-model".into()).spawn(move || e.run(rx))?;
-        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
+        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok, crate::qwen::Pictures::Qwen)) })
     }
 
     /// Qwen3.8-Flash-Next from a GGUF (`qwen4exp`: the GSQ-RCO files) on WebGPU: its layers over every discrete GPU, a
@@ -1120,7 +1123,7 @@ impl Models {
         let park = crate::qwen_park::budget(o.park_gb, ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64));
         let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), None, max_seq, !o.quiet && !o.silent).park_up_to(park).repetition_guard(o.repetition_guard);
         let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
-        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
+        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok, crate::qwen::Pictures::Qwen)) })
     }
 
     /// Says where a GGUF model's weights are once it is loaded on a GPU ([`placement`]).
@@ -1201,7 +1204,10 @@ impl Models {
                 o.vision_projectors.get(&spec.name).map(|p| {
                     let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(e.to_string()))?;
                     let mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
-                    if !matches!(&mm, llama_rs::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == model.config().embedding_dim) {
+                    let width = model.config().embedding_dim;
+                    // (Qwen3-VL's tower, or MiniCPM-V 4.7's: a Qwen3.5 model of its own)
+                    if !matches!(&mm, llama_rs::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == width)
+                        && !matches!(&mm, llama_rs::MmProj::MiniCpmV(m) if m.lm_width() == width) {
                         return Err(Error::Arg("Qwen vision projector does not match the text model".into()));
                     }
                     self.say(format!("{}: vision projector loaded from {}", spec.name, p.display()));
@@ -1226,8 +1232,20 @@ impl Models {
             let mut cfg = self.base_cfg(spec, max_seq);
             cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
             cfg.qwen_vision = projector.as_ref().map(|p|p.config().clone());
+            // MiniCPM-V 4.7: its markers' ids from its own tokenizer
+            if let Some(llama_rs::MmProj::MiniCpmV(m)) = &projector {
+                let id = |s: &str| tok.token_id(s).ok_or_else(|| Error::Arg(format!("MiniCPM-V's tokenizer lacks {s}")));
+                let newline = match tok.encode("\n", false).unwrap_or_default().as_slice() {
+                    &[t] => t,
+                    other => return Err(Error::Arg(format!("MiniCPM-V's tokenizer makes a newline {other:?}"))),
+                };
+                let markers = llama_rs::mmproj::minicpmv::Markers { image_start: id("<image>")?, image_end: id("</image>")?, slice_start: id("<slice>")?, slice_end: id("</slice>")?, newline };
+                cfg.minicpmv = Some(crate::qwen::MiniCpmV { markers, merge: m.merge, max_slices: m.max_slices, mean: m.config.mean, std: m.config.std });
+                self.say(format!("{}: MiniCPM-V 4.7 pictures ({}x: up to {} slices)", spec.name, m.merge * m.merge, m.max_slices));
+            }
+            let pictures = if cfg.minicpmv.is_some() { crate::qwen::Pictures::MiniCpmV } else { crate::qwen::Pictures::Qwen };
             let (jobs,rx) = std::sync::mpsc::channel();
-            let mut e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent).repetition_guard(o.repetition_guard);
+            let mut e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent).repetition_guard(o.repetition_guard).minicpmv(cfg.minicpmv.clone());
             if let Some(dir) = &o.prompt_cache {
                 // Separate format/implementation namespace; replacing weights
                 // in place also invalidates states via size and modification time.
@@ -1247,7 +1265,7 @@ impl Models {
                 }
             }
             let thread = std::thread::Builder::new().name("qwen-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
-            return Ok(Live {name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok))});
+            return Ok(Live {name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok, pictures))});
         }
         // Dense models (Llama, Mistral and Qwen2 without experts, Qwen3, Gemma 3, 3n and 4) are loaded whole onto
         // the backend, as Qwen3.5 is above, and answer in their own template with their own stop tokens. Expert

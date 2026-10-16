@@ -16,20 +16,20 @@ use crate::loader::Weight;
 use crate::mmproj::Qwen3VlMmProj;
 
 /// A linear layer on the device: its matrix (f16, or a packed one the device holds) and its bias.
-enum Mat {
+pub(crate) enum Mat {
     Half(DeviceVec),
     Packed(std::sync::Arc<dyn ggml_rs::exl3::PackedLinear>),
 }
 
-struct Lin {
-    m: Mat,
-    b: DeviceVec,
-    n: usize,
-    k: usize,
+pub(crate) struct Lin {
+    pub(crate) m: Mat,
+    pub(crate) b: DeviceVec,
+    pub(crate) n: usize,
+    pub(crate) k: usize,
 }
 
 impl Lin {
-    fn of(chain: &dyn DeviceChain, w: &Weight, bias: &Tensor) -> Option<Lin> {
+    pub(crate) fn of(chain: &dyn DeviceChain, w: &Weight, bias: &Tensor) -> Option<Lin> {
         let (n, k) = (w.shape()[0], w.shape()[1]);
         let m = match w {
             Weight::Dense(t) if k % 2 == 0 => Mat::Half(chain.vec_f16_rounded(t.to_host().data())?),
@@ -40,7 +40,7 @@ impl Lin {
     }
 
     /// `y[r] = W x[r] + b` for `rows` rows, the inputs as f32.
-    fn run(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+    pub(crate) fn run(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         match &self.m {
             Mat::Half(w) => r.matmul_f16_rows_f32(w, self.n, self.k, x, y, rows),
             Mat::Packed(p) => r.exl3_rows(p.as_ref(), x, y, rows),
@@ -49,14 +49,14 @@ impl Lin {
     }
 }
 
-fn vector(chain: &dyn DeviceChain, values: &[f32]) -> DeviceVec {
+pub(crate) fn vector(chain: &dyn DeviceChain, values: &[f32]) -> DeviceVec {
     let v = chain.vec(values.len().max(1));
     chain.upload(&v, values);
     v
 }
 
 /// A layer norm's weight less one, then its bias: a modulated norm's scale and shift.
-fn norm(chain: &dyn DeviceChain, w: &Tensor, b: &Tensor) -> DeviceVec {
+pub(crate) fn norm(chain: &dyn DeviceChain, w: &Tensor, b: &Tensor) -> DeviceVec {
     let mut v: Vec<f32> = w.to_host().data().iter().map(|x| x - 1.0).collect();
     v.extend_from_slice(b.to_host().data());
     vector(chain, &v)

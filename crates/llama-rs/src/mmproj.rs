@@ -25,11 +25,12 @@ use crate::loader::{TensorIndex, Weight};
 use crate::{LlamaError, Result};
 
 mod gemma4v;
+pub mod minicpmv;
 mod qwen3vl;
 mod siglip;
 
 // (what this file gave the crate and its users, and what the files make for each other)
-pub use {gemma4v::*, qwen3vl::*, siglip::*};
+pub use {gemma4v::*, minicpmv::*, qwen3vl::*, siglip::*};
 
 /// Which downstream LM family this mmproj feeds. Determines both the
 /// vision-tower architecture and the projector adapter.
@@ -62,6 +63,10 @@ pub enum ProjectorKind {
     /// concatenates 4 neighbouring patches into one 4608-dim row. **Loader
     /// recognises but does not yet support this variant** — tracked under #84.
     Qwen3Vl,
+    /// MiniCPM-V 4.7 (`projector_type = "minicpmv4_7"`): a SigLIP-400M tower over a picture's overview and slices,
+    /// each its own size, a window-attention merger inside it (16x) and a 2x2 merger MLP after it
+    /// ([`MiniCpmVMmProj`]).
+    MiniCpmV,
 }
 
 impl ProjectorKind {
@@ -126,6 +131,8 @@ impl MmProjConfig {
             // Qwen3-VL: 2x2 spatial merge → patches/4. For 768/16 = 48-side
             // patch grid, that's 24×24 = 576 soft tokens per image.
             ProjectorKind::Qwen3Vl => self.n_patches() / 4,
+            // MiniCPM-V: a picture's count depends on its slices; a 448 x 448 tile's, 16x
+            ProjectorKind::MiniCpmV => self.n_patches() / 16,
         }
     }
 
@@ -165,6 +172,7 @@ impl MmProjConfig {
             Some("gemma3")          => ProjectorKind::Gemma3,
             Some("gemma4v")         => ProjectorKind::Gemma4V,
             Some("qwen3vl_merger")  => ProjectorKind::Qwen3Vl,
+            Some("minicpmv4_7")     => ProjectorKind::MiniCpmV,
             Some("mlp")     => ProjectorKind::Mlp,
             None            => ProjectorKind::Gemma3,  // legacy default
             Some(other)     => return Err(LlamaError::Config(
@@ -231,6 +239,9 @@ pub enum MmProj {
     /// (`mm.0` → GELU → `mm.2`). 768x768 input @ patch=16 → 2304 patches →
     /// 576 soft tokens at 5120-dim.
     Qwen3Vl(Qwen3VlMmProj),
+    /// MiniCPM-V 4.7's tower and mergers: a picture as tiles ([`MiniCpmVMmProj::tiles`]), each tile's tokens by
+    /// [`MmProj::forward`].
+    MiniCpmV(MiniCpmVMmProj),
 }
 
 impl MmProj {
@@ -248,6 +259,8 @@ impl MmProj {
                 Ok(Self::Gemma4V(Gemma4VMmProj::from_gguf_with_config(g, config, backend.clone())?)),
             ProjectorKind::Qwen3Vl =>
                 Ok(Self::Qwen3Vl(Qwen3VlMmProj::from_gguf_with_config(g, config, backend.clone())?)),
+            ProjectorKind::MiniCpmV =>
+                Ok(Self::MiniCpmV(MiniCpmVMmProj::from_gguf_with_config(g, config, backend.clone())?)),
         }
     }
 
@@ -256,6 +269,7 @@ impl MmProj {
             Self::SigLip(m)  => &m.config,
             Self::Gemma4V(m) => &m.config,
             Self::Qwen3Vl(m) => &m.config,
+            Self::MiniCpmV(m) => &m.config,
         }
     }
 
@@ -264,6 +278,7 @@ impl MmProj {
             Self::SigLip(m)  => &m.backend,
             Self::Gemma4V(m) => &m.backend,
             Self::Qwen3Vl(m) => &m.backend,
+            Self::MiniCpmV(m) => &m.backend,
         }
     }
 
@@ -272,6 +287,7 @@ impl MmProj {
             Self::SigLip(m)  => m.blocks.len(),
             Self::Gemma4V(m) => m.blocks.len(),
             Self::Qwen3Vl(m) => m.blocks.len(),
+            Self::MiniCpmV(m) => m.blocks.len(),
         }
     }
 
@@ -281,6 +297,7 @@ impl MmProj {
             Self::SigLip(m)  => m.forward(image),
             Self::Gemma4V(m) => m.forward(image),
             Self::Qwen3Vl(m) => m.forward(image),
+            Self::MiniCpmV(m) => m.forward(image),
         }
     }
 }
@@ -290,7 +307,7 @@ impl MmProj {
 /// row the layout is `(channel, py, px)` — matching how the GGUF conv weight
 /// is stored, so `patches @ W_flat^T` reproduces a stride-P 2D convolution
 /// exactly. Always runs on host (image is host-resident from preprocess).
-fn unfold_patches_to_host(img: &Tensor, p: usize) -> Result<Tensor> {
+pub(crate) fn unfold_patches_to_host(img: &Tensor, p: usize) -> Result<Tensor> {
     let host = img.to_host();
     let s = host.shape();
     if s.len() != 3 || s[0] != 3 || s[1] % p != 0 || s[2] % p != 0 {

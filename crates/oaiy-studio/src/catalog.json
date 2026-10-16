@@ -169,6 +169,17 @@
       "add": ["gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf", "gemma-4-E2B-it-GGUF/mmproj-F16.gguf"]
     },
     {
+      "id": "minicpm-v-4.7-1b",
+      "group": "llm",
+      "name": "MiniCPM-V 4.7 1B",
+      "about": "OpenBMB's small vision model: it reads a picture in detail (a large one in up to nine slices) and answers about it, quickly on any GPU. Its vision projector comes with it.",
+      "license": "Apache-2.0",
+      "size_gb": 1.8,
+      "vram_gb": 3,
+      "parts": [{ "repo": "openbmb/MiniCPM-V-4.7-1B-gguf", "include": ["MiniCPM-V-4_7-1B-Q4_K_M.gguf", "mmproj-model-f16.gguf"], "into": "MiniCPM-V-4.7-1B-gguf" }],
+      "add": ["MiniCPM-V-4.7-1B-gguf/MiniCPM-V-4_7-1B-Q4_K_M.gguf", "MiniCPM-V-4.7-1B-gguf/mmproj-model-f16.gguf"]
+    },
+    {
       "id": "gemma-3-4b",
       "group": "llm",
       "name": "Gemma 3 4B",
