@@ -3,7 +3,7 @@ use super::{
     store::{Group, Store},
     transformer::norm,
 };
-use crate::math::{heads, prefix_attention, rms, unheads};
+use crate::common::math::{heads, prefix_attention, rms, unheads};
 use candle_core::{DType, Device, Result, Tensor};
 use std::path::Path;
 

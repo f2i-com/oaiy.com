@@ -17,7 +17,7 @@ pub(crate) mod text;
 pub(crate) mod transformer;
 mod upsampler;
 pub mod vae;
-mod webgpu;
+pub mod webgpu;
 #[cfg(test)]
 mod tests;
 use candle_core::{DType, Device, Result, Tensor};
@@ -103,7 +103,7 @@ fn step_to(x: &Tensor, v: &Tensor, sigma: f64, next: f64, noise: Option<&Tensor>
 /// the stage (0 or 1), the step, and the stream (video or sound).
 fn ancestral_noise(r: &Request, stage: u64, step: usize, sound: bool, like: &Tensor) -> Result<Tensor> {
     let seed = r.seed.wrapping_add(ANCESTRAL_SEED_OFFSET).wrapping_add((stage << 32) | (u64::from(sound) << 16) | step as u64);
-    Tensor::from_vec(crate::pipeline::noise(seed, like.elem_count()), like.shape(), like.device())
+    Tensor::from_vec(crate::common::job::noise(seed, like.elem_count()), like.shape(), like.device())
 }
 
 /// The prompt's contexts for the refining transformer: from the prompt cache
@@ -451,7 +451,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     #[cfg(feature = "webgpu")]
     if let (true, Some(context), Model::Wgpu(model, ..)) = (r.guidance.as_ref().is_none_or(|g| g.cfg == 1.), &negative, &mut model) {
         let values = context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        model.nag = Some(crate::ltx_wgpu::Nag { rows: values.len() / 4096, context: values, scale: r.nag.0 as f32, tau: r.nag.1 as f32, alpha: r.nag.2 as f32 });
+        model.nag = Some(crate::ltx::webgpu::transformer::Nag { rows: values.len() / 4096, context: values, scale: r.nag.0 as f32, tau: r.nag.1 as f32, alpha: r.nag.2 as f32 });
         report(event("negative_prompt_nag", 1, 1));
     }
     let int8_weights = matches!(&model, Model::Candle(m) if m.int8);
@@ -459,7 +459,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         report(event("int8_weights", 1, 1));
     }
     let rope = transformer::Rope::video_with_end(f, h, w, r.fps, ending_latent.is_some(), &dev)?;
-    let noise = crate::pipeline::noise(r.seed, f * h * w * 128);
+    let noise = crate::common::job::noise(r.seed, f * h * w * 128);
     let mut latent = Tensor::from_vec(noise, (1, f * h * w, 128), &dev)?;
     if let Some(end) = &ending_latent {
         latent = Tensor::cat(&[&latent, end], 1)?;
@@ -489,7 +489,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let frozen_audio = conditioning_audio.is_some();
     // Inpainting: one fixed noise the soundtrack is mixed with at each step.
     let inpaint_noise = if frozen_audio && r.soundtrack_mode == "inpaint" {
-        let noise = crate::pipeline::noise(r.seed.wrapping_add(AUDIO_SEED_OFFSET), audio_frames * 128);
+        let noise = crate::common::job::noise(r.seed.wrapping_add(AUDIO_SEED_OFFSET), audio_frames * 128);
         Some(Tensor::from_vec(noise, (1, audio_frames, 128), &dev)?)
     } else {
         None
@@ -497,7 +497,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let mut audio_latent = if let Some(latent) = conditioning_audio {
         Some(latent)
     } else if r.audio {
-        let noise = crate::pipeline::noise(r.seed.wrapping_add(AUDIO_SEED_OFFSET), audio_frames * 128);
+        let noise = crate::common::job::noise(r.seed.wrapping_add(AUDIO_SEED_OFFSET), audio_frames * 128);
         let noise = Tensor::from_vec(noise, (1, audio_frames, 128), &dev)?;
         Some(match &reference_voice {
             Some(voice) => Tensor::cat(&[voice, &noise], 1)?,
@@ -588,7 +588,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
                         (Some(audio), Some(audio_context), Some((sound_table, video_cross))) if !isolated => {
                             let (a, c) = (host(audio)?, host(audio_context)?);
                             let sound_sigma = if frozen_audio && inpaint_noise.is_none() { 0. } else { sigma };
-                            let pass = crate::ltx_wgpu::AudioPass { latent: &a, tokens: a.len() / 128, context: &c, rows: c.len() / 2048, sigma: sound_sigma, table: sound_table, video_cross, skip_self: None };
+                            let pass = crate::ltx::webgpu::transformer::AudioPass { latent: &a, tokens: a.len() / 128, context: &c, rows: c.len() / 2048, sigma: sound_sigma, table: sound_table, video_cross, skip_self: None };
                             let (v, s) = m.forward_av(latent, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, perturb, &pass)?;
                             report(event("video_denoising", (step * passes + at + 1) * 48, steps * passes * 48));
                             Ok((Tensor::from_vec(v, (1, tokens, 128), &dev)?, Some(Tensor::from_vec(s, (1, pass.tokens, 128), &dev)?)))
@@ -712,14 +712,14 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         let refine_audio = sound.is_some() && !frozen_audio && audio_latent.is_some();
         // Re-noised to the first refine sigma (a fresh draw from the seed), the sound too where it is refined.
         let s0 = REFINE_SIGMAS[0];
-        let noise = Tensor::from_vec(crate::pipeline::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET), f * h * w * 128), (1, f * h * w, 128), &dev)?;
+        let noise = Tensor::from_vec(crate::common::job::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET), f * h * w * 128), (1, f * h * w, 128), &dev)?;
         latent = ((upscaled * (1. - s0))? + (noise * s0)?)?;
         if let Some(end) = &end {
             latent = Tensor::cat(&[&latent, end], 1)?;
         }
         latent = condition_endpoints(latent, start.as_ref(), end.as_ref())?;
         if let (true, Some(a)) = (refine_audio, audio_latent.as_mut()) {
-            let noise = crate::pipeline::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET).wrapping_add(AUDIO_SEED_OFFSET), a.elem_count());
+            let noise = crate::common::job::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET).wrapping_add(AUDIO_SEED_OFFSET), a.elem_count());
             *a = ((&*a * (1. - s0))? + (Tensor::from_vec(noise, a.shape(), &dev)? * s0)?)?;
         }
         let values = refine_context.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -734,7 +734,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             let (v, s) = match (&audio_latent, &sound_context, sound.as_ref()) {
                 (Some(audio), Some(c), Some((sound_table, video_cross))) => {
                     let a = audio.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                    let pass = crate::ltx_wgpu::AudioPass { latent: &a, tokens: a.len() / 128, context: c, rows: c.len() / 2048, sigma: if refine_audio { sigma } else { 0. }, table: sound_table, video_cross, skip_self: None };
+                    let pass = crate::ltx::webgpu::transformer::AudioPass { latent: &a, tokens: a.len() / 128, context: c, rows: c.len() / 2048, sigma: if refine_audio { sigma } else { 0. }, table: sound_table, video_cross, skip_self: None };
                     let (v, s) = m.forward_av(&video, tokens, &values, values.len() / 4096, sigma, table, clean, h * w, None, &pass)?;
                     (v, Some(s))
                 }
@@ -776,7 +776,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         let audio_rope = if r.audio { Some(transformer::Rope::audio(audio_frames, &dev)?) } else { None };
         // Re-noised to the first refine sigma (a fresh draw from the seed).
         let s0 = REFINE_SIGMAS[0];
-        let noise = crate::pipeline::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET), f * h * w * 128);
+        let noise = crate::common::job::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET), f * h * w * 128);
         let noise = Tensor::from_vec(noise, (1, f * h * w, 128), &dev)?;
         latent = ((upscaled * (1. - s0))? + (noise * s0)?)?;
         if let Some(end) = &end {

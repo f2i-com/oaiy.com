@@ -2,10 +2,10 @@
 //! once per step; five double streams precede twenty fused single streams.
 use super::math;
 use crate::{
-    lora::Loras,
-    math::{attention, heads, layer_norm, unheads},
-    residency::{Budget, Resident, Tiered},
-    weights::{bytes_of, Linear, Weights},
+    common::lora::Loras,
+    common::math::{attention, heads, layer_norm, unheads},
+    common::residency::{Budget, Resident, Tiered},
+    common::weights::{bytes_of, Linear, Weights},
 };
 use candle_core::{DType, Device, Result, Tensor, D};
 use std::path::{Path, PathBuf};
@@ -273,9 +273,9 @@ mod tests {
         let context = Tensor::from_vec(values("context")?, (1, 3, 6), device)?;
         let expected = values("output")?;
         for memory in [
-            crate::residency::Memory::Gpu,
-            crate::residency::Memory::Ram,
-            crate::residency::Memory::Ssd,
+            crate::common::residency::Memory::Gpu,
+            crate::common::residency::Memory::Ram,
+            crate::common::residency::Memory::Ssd,
         ] {
             let budget = Budget {
                 memory,

@@ -162,7 +162,7 @@ impl Module for AttnBlock {
         let q = q.flatten_from(2)?.transpose(1, 2)?.unsqueeze(1)?;
         let k = k.flatten_from(2)?.transpose(1, 2)?.unsqueeze(1)?;
         let v = v.flatten_from(2)?.transpose(1, 2)?.unsqueeze(1)?;
-        let out = crate::math::attention(&q, &k, &v, 0)?
+        let out = crate::common::math::attention(&q, &k, &v, 0)?
             .squeeze(1)?
             .transpose(1, 2)?
             .reshape((b, c, hh, w))?;

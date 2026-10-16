@@ -10,7 +10,7 @@
 //! keeps the 16384 semantic-code rows and the end-of-audio row (not 200k),
 //! and the embedding table is read row by row for the prompt.
 use crate::ltx::store::Store;
-use crate::residency::{Budget, Resident, Tiered};
+use crate::common::residency::{Budget, Resident, Tiered};
 use candle_core::{
     quantized::{gguf_file, QMatMul},
     DType, Device, Module, Result, Tensor, D,

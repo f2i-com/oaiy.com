@@ -7,9 +7,9 @@ model. Architecture `flux3-klein`.
 
 | Piece | What OAIY runs | Code |
 | --- | --- | --- |
-| Transformer (5.6B) | BFL's `model.safetensors`, the distilled checkpoint (a flow map: 16 steps, no guidance) or the base one (50 steps, guidance 3.5); its blocks' matrices f16 where the tensor cores take f16 (NVIDIA's, AMD's) and there is room, else its BF16 ones as Q8_0 (a Mac's GPU: Metal's simdgroup matrices take Q8_0, not f16); `OAIY_FLUX3_WEIGHTS` `f16` or `q8_0` says which | `crates/oaiy-media/src/flux3_wgpu.rs` |
-| Text encoder | Qwen3-VL-4B-Instruct's language model (its vision tower unused), the states of every fourth layer to the 32nd side by side (20,480 wide), the prompt right-padded to the next multiple of 80 tokens | `crates/oaiy-media/src/klein_text_wgpu.rs` (`FLUX3`) |
-| VAE | The FLUX.2 VAE (32 channels, 2x2 patches, batch-norm statistics): its encoder for references, its decoder for the picture | `crates/oaiy-media/src/sdxl_vae_wgpu.rs`, `crates/oaiy-media/src/klein/vae.rs` |
+| Transformer (5.6B) | BFL's `model.safetensors`, the distilled checkpoint (a flow map: 16 steps, no guidance) or the base one (50 steps, guidance 3.5); its blocks' matrices f16 where the tensor cores take f16 (NVIDIA's, AMD's) and there is room, else its BF16 ones as Q8_0 (a Mac's GPU: Metal's simdgroup matrices take Q8_0, not f16); `OAIY_FLUX3_WEIGHTS` `f16` or `q8_0` says which | `crates/oaiy-media/src/flux3/webgpu.rs` |
+| Text encoder | Qwen3-VL-4B-Instruct's language model (its vision tower unused), the states of every fourth layer to the 32nd side by side (20,480 wide), the prompt right-padded to the next multiple of 80 tokens | `crates/oaiy-media/src/klein/webgpu/text.rs` (`FLUX3`) |
+| VAE | The FLUX.2 VAE (32 channels, 2x2 patches, batch-norm statistics): its encoder for references, its decoder for the picture | `crates/oaiy-media/src/sdxl/webgpu/vae.rs`, `crates/oaiy-media/src/klein/vae.rs` |
 | Pipeline | References prepared as BFL's pipeline prepares them, the schedule `6.93 t / (1 + 5.93 t)`, a flow-map step (`x + dt v(x, t, t_next)`) or a guided Euler step | `crates/oaiy-media/src/flux3/` |
 
 The transformer differs from FLUX.2 Klein's: the picture's tokens, its references' and the text's each go first through
@@ -111,19 +111,19 @@ they work as BFL's model card describes.
 
 ## Checks
 
-- `flux3_wgpu::tests::a_tiny_transformer_on_webgpu_is_bfls`: BFL's own `dit.py` made small (32 wide, two heads, one
+- `flux3::webgpu::tests::a_tiny_transformer_on_webgpu_is_bfls`: BFL's own `dit.py` made small (32 wide, two heads, one
   block a kind, two shared; random weights rounded to f16) against the WebGPU transformer, with two references and
   without; fixture by `tools/flux3/reference.py`.
-- `klein_text_wgpu::tests::flux3_text_is_hugging_faces` (ignored: the real encoder): Hugging Face's Qwen3-VL in float32
+- `klein::webgpu::text::tests::flux3_text_is_hugging_faces` (ignored: the real encoder): Hugging Face's Qwen3-VL in float32
   as BFL's encoder runs it (`tools/flux3/text_reference.py`) against the WebGPU encoder, the padding included.
-- `sdxl_vae_wgpu::tests::a_small_vae_encoder_on_webgpu_is_candles`, `flux3::tests::a_reference_round_trips_through_the_vae`
+- `sdxl::webgpu::vae::tests::a_small_vae_encoder_on_webgpu_is_candles`, `flux3::tests::a_reference_round_trips_through_the_vae`
   (ignored: the real VAE), `flux3::references::tests`, `flux3::tests::the_schedule_is_bfls`.
-- `flux3_wgpu::tests::diffusers_loras_are_diffusers`: diffusers' own `Flux3Transformer2DModel` at the tiny sizes, with two
+- `flux3::webgpu::tests::diffusers_loras_are_diffusers`: diffusers' own `Flux3Transformer2DModel` at the tiny sizes, with two
   LoRAs applied by PEFT (`tools/flux3/lora_reference.py`: one made by PEFT and saved by diffusers, adapting every linear
   layer, the final modulation among them, one in BFL's names loaded through diffusers' conversion), against the WebGPU
   transformer with the same files merged as it loads: cosine 0.9999996, the worst error 0.008 of an RMS 2.3 (0.96 with
   the final modulation's halves left as they are stored). Without LoRAs diffusers' transformer is BFL's DiT to 9e-6.
-- `flux3_wgpu::tests::loras_merged_as_it_loads_are_the_weights_merged_before`, and (ignored: real files)
+- `flux3::webgpu::tests::loras_merged_as_it_loads_are_the_weights_merged_before`, and (ignored: real files)
   `real_loras_fit_the_checkpoint` (`OAIY_FLUX3_LORAS`, a folder of them).
 - `flux3::tests::the_examples_are_bfls` (ignored: the real model): BFL's published examples made again from their records
   and their own starting noise (`tools/flux3/noise.py`), each against theirs. On the RTX 4090 (f16): text-to-image

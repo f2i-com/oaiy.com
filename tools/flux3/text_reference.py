@@ -6,7 +6,7 @@ its chat template, right-padded to the next multiple of 80 tokens, the padding's
 the model cut to the taps up to LAYERS (8: the taps 4 and 8; every later layer is the same code, and float32's whole
 32 would want some 15 GB) and one layer more: the last of the hidden states transformers gives is after the final
 norm, which no tap of the whole model is. Writes the prompt, its token count and the tapped states side by side (`[L, 2560 x
-taps]`), for `flux3_text`'s ignored test in `crates/oaiy-media/src/klein_text_wgpu.rs`.
+taps]`), for `flux3_text`'s ignored test in `crates/oaiy-media/src/klein/webgpu/text.rs`.
 """
 import math
 import sys

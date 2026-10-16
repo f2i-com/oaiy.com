@@ -8,8 +8,8 @@
 //! encoder turn that clip into a speaker embedding and reference codes. Later
 //! lines prompt the Base talker with them (in-context), so the voice holds.
 //!
-//! `backend` "webgpu" speaks on WebGPU, the talker ([`crate::tts_wgpu`]) and the speech codec's decoder
-//! ([`crate::codec_wgpu`]) on any GPU, as a worker built with WebGPU and without CUDA does by default (Candle's talker
+//! `backend` "webgpu" speaks on WebGPU, the talker ([`crate::tts::webgpu`]) and the speech codec's decoder
+//! ([`crate::tts::webgpu::codec`]) on any GPU, as a worker built with WebGPU and without CUDA does by default (Candle's talker
 //! needs CUDA: its weights BF16); a voice is designed there too, its clip's speaker embedding and codes then worked out
 //! on the CPU (both encoders F32). Breeze TTS 2 is not on WebGPU.
 pub mod breeze;
@@ -18,6 +18,8 @@ pub mod codec;
 pub mod model;
 #[cfg(feature = "webgpu")]
 pub mod realtime;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
 use candle_core::{Device, Result};
 use oaiy_engine::json::Json;
@@ -107,7 +109,7 @@ impl Request {
                     Some(Voice::from_json(&Json::parse(&bytes).map_err(|e| format!("voice file {p}: {e}"))?)?)
                 }
             },
-            webgpu: crate::pipeline::backend_is_webgpu(j, "speech")?,
+            webgpu: crate::common::job::backend_is_webgpu(j, "speech")?,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
             return Err("speech: this build has no WebGPU (the webgpu feature)".into());
@@ -156,7 +158,7 @@ impl DesignRequest {
             seed: j.get("seed").and_then(Json::as_i64).unwrap_or(0).max(0) as u64,
             device: j.get("device").and_then(Json::as_i64).unwrap_or(0).max(0) as usize,
             output: s("output_dir").ok_or("voice: missing output_dir")?.into(),
-            webgpu: crate::pipeline::backend_is_webgpu(j, "voice")?,
+            webgpu: crate::common::job::backend_is_webgpu(j, "voice")?,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
             return Err("voice: this build has no WebGPU (the webgpu feature)".into());
@@ -227,14 +229,14 @@ fn design_sample(r: &DesignRequest) -> Request {
     }
 }
 
-/// [`design_voice`] on WebGPU: the sample spoken and decoded there ([`crate::tts_wgpu::WgpuTalker`],
-/// [`crate::codec_wgpu::WgpuCodec`]), then the Base model's speaker and speech encoders (F32) on the CPU.
+/// [`design_voice`] on WebGPU: the sample spoken and decoded there ([`crate::tts::webgpu::WgpuTalker`],
+/// [`crate::tts::webgpu::codec::WgpuCodec`]), then the Base model's speaker and speech encoders (F32) on the CPU.
 #[cfg(feature = "webgpu")]
 fn design_voice_webgpu(r: &DesignRequest, started: Instant, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("designing_voice", 0, 3));
     let speak = design_sample(r);
     let tok = tokenizer(&r.design_dir)?;
-    let mut tts = crate::tts_wgpu::WgpuTalker::load(&r.design_dir, r.device)?;
+    let mut tts = crate::tts::webgpu::WgpuTalker::load(&r.design_dir, r.device)?;
     let language = tts.language_id(&r.language)?;
     let instruct = encode(&tok, &r.description)?;
     let prefill = tts.prefill(&encode(&tok, &r.sample)?, Some(&instruct), language)?;
@@ -245,7 +247,7 @@ fn design_voice_webgpu(r: &DesignRequest, started: Instant, mut report: impl FnM
         candle_core::bail!("the voice sample came out too short; try a longer sample text or another seed");
     }
     report(event("designing_voice", 1, 3));
-    let clip = crate::codec_wgpu::WgpuCodec::load(&r.design_dir.join("speech_tokenizer").join("model.safetensors"), &gpu)?.decode(&frames)?;
+    let clip = crate::tts::webgpu::codec::WgpuCodec::load(&r.design_dir.join("speech_tokenizer").join("model.safetensors"), &gpu)?.decode(&frames)?;
     drop(gpu);
     report(event("designing_voice", 2, 3));
     let speaker = clone::SpeakerEncoder::load(&r.base_dir.join("model.safetensors"), &Device::Cpu)?.embed(&clip)?;
@@ -358,14 +360,14 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     Ok(result)
 }
 
-/// [`generate`] on WebGPU: the talker ([`crate::tts_wgpu::WgpuTalker`]), then the codec's decoder
-/// ([`crate::codec_wgpu::WgpuCodec`]) on its device.
+/// [`generate`] on WebGPU: the talker ([`crate::tts::webgpu::WgpuTalker`]), then the codec's decoder
+/// ([`crate::tts::webgpu::codec::WgpuCodec`]) on its device.
 #[cfg(feature = "webgpu")]
 fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
     report(event("loading_speech_model", 0, 1));
     let tok = tokenizer(&r.model_dir)?;
-    let mut tts = crate::tts_wgpu::WgpuTalker::load(&r.model_dir, r.device)?;
+    let mut tts = crate::tts::webgpu::WgpuTalker::load(&r.model_dir, r.device)?;
     let language = tts.language_id(&r.language)?;
     let text_ids = encode(&tok, &r.text)?;
     let (prefill, trailing) = match &r.voice {
@@ -388,7 +390,7 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     drop(tts);
     report(event("decoding_speech", 0, 1));
     let decode_started = Instant::now();
-    let codec = crate::codec_wgpu::WgpuCodec::load(&r.model_dir.join("speech_tokenizer").join("model.safetensors"), &gpu)?;
+    let codec = crate::tts::webgpu::codec::WgpuCodec::load(&r.model_dir.join("speech_tokenizer").join("model.safetensors"), &gpu)?;
     let samples = match (&r.voice, frames.is_empty()) {
         (_, true) => Vec::new(),
         (Some(voice), false) => {

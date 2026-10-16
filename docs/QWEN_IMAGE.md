@@ -348,7 +348,7 @@ The local D: checkpoint is BF16; separate F16 weights were not available to test
 
 On WebGPU the transformer's BF16 matrices go to the card as f16 where it has room for
 them beside a picture's work (their f16 bytes and some 5 GiB; Vulkan's budget less its
-use), else as Q8_0 (`qwen_wgpu::weights_q8`; `OAIY_QWEN_IMAGE_WEIGHTS=f16|q8_0`), each
+use), else as Q8_0 (`qwen_image::webgpu::transformer::weights_q8`; `OAIY_QWEN_IMAGE_WEIGHTS=f16|q8_0`), each
 with its adapters merged into it first on the card, as the f16 path merges them, then
 read back and quantized. What the budget still has no room for streams from the file
 (`ggml_rs_wgpu::stream`). Qwen Image 2.1 (the 33.8 GB download) on an NVIDIA A2 (15.7

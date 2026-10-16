@@ -20,7 +20,7 @@
 //!
 //! `backend` "webgpu" runs it on WebGPU, as a worker built with WebGPU and
 //! without CUDA does by default: the picture's preparation, the flow
-//! transformers and the decoders there ([`crate::model3d_wgpu`]); DINOv3, NAF
+//! transformers and the decoders there ([`crate::model3d::webgpu`]); DINOv3, NAF
 //! and the voxels' projections on the CPU (F32, as the reference runs them).
 pub mod bake;
 pub mod decoder;
@@ -38,6 +38,8 @@ pub mod sparse;
 mod tests;
 #[cfg(test)]
 mod verify;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
 use candle_core::{DType, Device, Result, Tensor};
 use oaiy_engine::json::Json;
@@ -111,7 +113,7 @@ impl Request {
             texture_size: j.get("texture_size").and_then(Json::as_i64).unwrap_or(2048).max(0) as u32,
             matte: s("matte").filter(|v| !v.is_empty()).map(PathBuf::from),
             upscaler: s("upscaler").filter(|v| !v.is_empty()).map(PathBuf::from),
-            webgpu: crate::pipeline::backend_is_webgpu(j, "3d")?,
+            webgpu: crate::common::job::backend_is_webgpu(j, "3d")?,
             model_dir,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
@@ -624,7 +626,7 @@ impl Stages {
 
 #[cfg(feature = "webgpu")]
 fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
-    use crate::model3d_wgpu::{table, WgpuDit3, WgpuLevel, WgpuSparseDecoder, WgpuStructureDecoder};
+    use crate::model3d::webgpu::{table, WgpuDit3, WgpuLevel, WgpuSparseDecoder, WgpuStructureDecoder};
     let started = Instant::now();
     let stages = Stages::default();
     let cpu = Device::Cpu;
@@ -672,7 +674,7 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         let n = coords.len();
         let pos = flow.context(&gpu, Some(global), Some(proj), tokens);
         let neg = flow.context(&gpu, None, None, tokens);
-        let rope = crate::model3d_wgpu::upload_values(&gpu, &table(coords, 128));
+        let rope = crate::model3d::webgpu::upload_values(&gpu, &table(coords, 128));
         let w = flow.scratch(&gpu, n);
         let cin = flow.config().in_channels;
         let (xd, out) = (ggml_rs::DeviceChain::vec(&gpu, n * cin), ggml_rs::DeviceChain::vec(&gpu, n * flow.config().out_channels));
@@ -686,7 +688,7 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
                 None => x.to_vec(),
             };
             ggml_rs::DeviceChain::upload(&gpu, &xd, &input);
-            let mods = crate::model3d_wgpu::upload_values(&gpu, &flow.modulation(t));
+            let mods = crate::model3d::webgpu::upload_values(&gpu, &flow.modulation(t));
             let mut rec = ggml_rs::DeviceChain::begin(&gpu);
             rec.keep_groups(false);
             flow.forward(&w, rec.as_mut(), &xd, &mods, &rope, if conditional { &pos } else { &neg }, &out);

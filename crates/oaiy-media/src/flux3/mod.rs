@@ -1,12 +1,14 @@
 //! FLUX 3 Image Klein: text-to-image, and edits of up to 10 reference pictures, through one model, as BFL's
 //! reference pipeline (`flux3/pipeline.py`, `flux3/generate.py`) makes them, on WebGPU: the prompt through
-//! Qwen3-VL-4B's language model ([`crate::klein_text_wgpu`] with [`crate::klein_text_wgpu::FLUX3`]), each reference
-//! through the FLUX.2 VAE's encoder ([`crate::sdxl_vae_wgpu`]), the transformer ([`crate::flux3_wgpu`]) a flow map
+//! Qwen3-VL-4B's language model ([`crate::klein::webgpu::text`] with [`crate::klein::webgpu::text::FLUX3`]), each reference
+//! through the FLUX.2 VAE's encoder ([`crate::sdxl::webgpu::vae`]), the transformer ([`crate::flux3::webgpu`]) a flow map
 //! over 16 steps (the distilled checkpoint: each step told the time it goes to) or 50 steps with guidance (the base
 //! one), the VAE's decoder last; LoRA adapters merged into the transformer as it loads. The prompt is used as
 //! written: BFL's prompt upsampler (a separate model that writes a full scene caption from a short request) is not
 //! run, nor their safety classifier.
 pub mod references;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
 use oaiy_engine::json::Json;
 use std::{io::Write, path::PathBuf, time::Instant};
@@ -54,9 +56,9 @@ pub fn schedule(steps: usize, alpha: f32) -> Vec<f32> {
         .collect()
 }
 
-/// A picture's latent positions: (0, row, column, `l`), rows and columns times [`crate::flux3_wgpu::IMAGE_ROPE_SCALE`].
+/// A picture's latent positions: (0, row, column, `l`), rows and columns times [`crate::flux3::webgpu::IMAGE_ROPE_SCALE`].
 pub fn latent_ids(h: usize, w: usize, l: f64) -> Vec<[f64; 4]> {
-    let s = crate::flux3_wgpu::IMAGE_ROPE_SCALE;
+    let s = crate::flux3::webgpu::IMAGE_ROPE_SCALE;
     (0..h * w).map(|i| [0., (i / w) as f64 * s, (i % w) as f64 * s, l]).collect()
 }
 
@@ -68,7 +70,7 @@ fn bf16(v: f32) -> f32 {
 
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
-        if !crate::pipeline::backend_is_webgpu(j, "FLUX 3 Image Klein")? {
+        if !crate::common::job::backend_is_webgpu(j, "FLUX 3 Image Klein")? {
             return Err("FLUX 3 Image Klein runs on WebGPU only: leave backend out".into());
         }
         let path = |key: &str, dir: bool| -> std::result::Result<PathBuf, String> {
@@ -99,7 +101,7 @@ impl Request {
         if j.get("adapter").is_some_and(|v| !matches!(v, Json::Null)) {
             return Err("FLUX 3 Image Klein takes no turbo adapter: give LoRAs as loras".into());
         }
-        let loras = crate::pipeline::parse_loras(j)?;
+        let loras = crate::common::job::parse_loras(j)?;
         for (p, strength) in &loras {
             if !p.is_file() {
                 return Err(format!("LoRA not found: {}", p.display()));
@@ -189,7 +191,7 @@ impl Request {
 
 #[cfg(feature = "webgpu")]
 pub fn generate(r: &Request, event: impl FnMut(Json)) -> candle_core::Result<Json> {
-    generate_with(r, crate::pipeline::noise, event)
+    generate_with(r, crate::common::job::noise, event)
 }
 
 #[cfg(not(feature = "webgpu"))]
@@ -200,16 +202,16 @@ pub fn generate(_: &Request, _: impl FnMut(Json)) -> candle_core::Result<Json> {
 /// [`generate`], each picture's starting noise `noise(seed, values)` (a test gives the reference's own).
 #[cfg(feature = "webgpu")]
 pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut event: impl FnMut(Json)) -> candle_core::Result<Json> {
-    use crate::flux3_wgpu::{Config, Tokens, WgpuFlux3};
+    use crate::flux3::webgpu::{Config, Tokens, WgpuFlux3};
     use crate::klein::vae;
     use candle_core::bail;
     // the transformer's header first: which checkpoint, before anything is loaded
-    let cfg = Config::of(&crate::weights::Weights::open(&r.transformer)?)?;
+    let cfg = Config::of(&crate::common::weights::Weights::open(&r.transformer)?)?;
     if cfg.context != 20480 {
         bail!("FLUX 3 Image Klein's transformer takes text states 20,480 wide, not {}", cfg.context);
     }
     // and its LoRAs': each fits the checkpoint (from their headers alone)
-    drop(crate::flux3_wgpu::loras(&r.loras, cfg)?);
+    drop(crate::flux3::webgpu::loras(&r.loras, cfg)?);
     let steps = r.steps.unwrap_or(if cfg.flow_map { 16 } else { 50 });
     let guidance = match (cfg.flow_map, r.guidance) {
         (true, None | Some(1.)) => None,
@@ -219,14 +221,14 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
     let clock = Instant::now();
     event(Json::obj([("stage", Json::str("encoding_text")), ("architecture", Json::str("flux3-klein"))]));
     let (contexts, empty) = {
-        let mut encoder = crate::klein_text_wgpu::WgpuKleinText::load_spec(&r.text_encoder, &r.tokenizer, r.device, crate::klein_text_wgpu::FLUX3)?;
+        let mut encoder = crate::klein::webgpu::text::WgpuKleinText::load_spec(&r.text_encoder, &r.tokenizer, r.device, crate::klein::webgpu::text::FLUX3)?;
         let prompts: Vec<&str> = r.prompts.iter().map(String::as_str).chain(guidance.map(|_| "")).collect();
         let mut all = encoder.encode_all(&prompts)?;
         let empty = if guidance.is_some() { all.pop() } else { None };
         let host = |t: candle_core::Tensor| -> candle_core::Result<(Vec<f32>, usize)> { Ok((t.flatten_all()?.to_vec1::<f32>()?, t.dim(1)?)) };
         (all.into_iter().map(host).collect::<candle_core::Result<Vec<_>>>()?, empty.map(host).transpose()?)
     };
-    let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(crate::qwen_wgpu::err)?;
+    let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(crate::qwen_image::webgpu::transformer::err)?;
     event(Json::obj([("stage", Json::str("loading_vae"))]));
     let (decoder, mean, std) = vae::vae_on_webgpu(&r.vae, gpu.clone(), !r.references.is_empty())?;
     // the references: each prepared as the pipeline prepares it, encoded, its tokens told apart by their last axis
@@ -302,7 +304,7 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
         }
         // (`to_pil`: clamped, then cut to 8 bits as torch's uint8 cast does)
         let bytes: Vec<u8> = pixels.iter().map(|v| ((v.clamp(-1., 1.) + 1.) * 127.5) as u8).collect();
-        let mut picture = image::RgbImage::from_raw(width as u32, height as u32, bytes).ok_or_else(|| crate::qwen_wgpu::err("a picture's pixels"))?;
+        let mut picture = image::RgbImage::from_raw(width as u32, height as u32, bytes).ok_or_else(|| crate::qwen_image::webgpu::transformer::err("a picture's pixels"))?;
         if let Some((left, top, right, bottom)) = crop {
             picture = image::imageops::crop_imm(&picture, left as u32, top as u32, (right - left) as u32, (bottom - top) as u32).to_image();
         }
@@ -404,7 +406,7 @@ mod tests {
     #[ignore = "needs the FLUX.2 VAE (OAIY_FLUX3_VAE), a picture (OAIY_FLUX3_PICTURE) and a WebGPU adapter"]
     fn a_reference_round_trips_through_the_vae() -> candle_core::Result<()> {
         let (Some(vae), Some(picture)) = (std::env::var_os("OAIY_FLUX3_VAE").map(PathBuf::from), std::env::var_os("OAIY_FLUX3_PICTURE").map(PathBuf::from)) else { return Ok(()) };
-        let gpu = ggml_rs_wgpu::WgpuBackend::nth(0, None).map_err(crate::qwen_wgpu::err)?;
+        let gpu = ggml_rs_wgpu::WgpuBackend::nth(0, None).map_err(crate::qwen_image::webgpu::transformer::err)?;
         let (model, mean, std) = crate::klein::vae::vae_on_webgpu(&vae, gpu, true)?;
         let prepared = references::prepare(&[picture], 1 << 20)?;
         let p = &prepared.pictures[0];
@@ -435,7 +437,7 @@ mod tests {
         let (Some(transformer), Some(text_encoder), Some(vae), Some(examples), Some(noise)) = (var("OAIY_FLUX3_TRANSFORMER"), var("OAIY_FLUX3_TEXT_ENCODER"), var("OAIY_FLUX3_VAE"), var("OAIY_FLUX3_EXAMPLES"), var("OAIY_FLUX3_NOISE")) else { return Ok(()) };
         let only = std::env::var("OAIY_FLUX3_ONLY").unwrap_or_default();
         // (a record's references are its repository's paths)
-        let repo = examples.parent().and_then(|p| p.parent()).ok_or_else(|| crate::qwen_wgpu::err("examples/<kind> in BFL's repository"))?;
+        let repo = examples.parent().and_then(|p| p.parent()).ok_or_else(|| crate::qwen_image::webgpu::transformer::err("examples/<kind> in BFL's repository"))?;
         let mut records: Vec<PathBuf> = std::fs::read_dir(&examples)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "json")).collect();
         records.sort();
         let mut worst = f64::INFINITY;

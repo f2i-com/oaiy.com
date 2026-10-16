@@ -226,7 +226,7 @@ impl CrossAttention {
         let v = split(&v, n_kv)?.contiguous()?;
 
         // Reuse bounded/flash attention instead of allocating the full spatial score matrix.
-        let out = crate::math::attention(&q, &k, &v, 0)?;
+        let out = crate::common::math::attention(&q, &k, &v, 0)?;
         // (B, n_heads, N, head_dim) -> (B, N, n_heads*head_dim)
         let out = out
             .transpose(1, 2)?

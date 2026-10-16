@@ -6,13 +6,15 @@
 //! decoder write 25 frames a second) and the acoustic stage ([`acoustic`]:
 //! a flow-matching transformer and the Flow-VAE decoder render them).
 //!
-//! `backend` "webgpu" runs both on WebGPU ([`crate::music_lm_wgpu`], [`crate::music_wgpu`]: any GPU), as a worker
+//! `backend` "webgpu" runs both on WebGPU ([`crate::music::webgpu::lm`], [`crate::music::webgpu`]: any GPU), as a worker
 //! built with WebGPU and without CUDA does by default (Candle's language model is BF16, which its CPU cannot multiply).
 pub mod acoustic;
 pub mod lm;
 pub mod quant;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
-use crate::residency::Budget;
+use crate::common::residency::Budget;
 use candle_core::{DType, Device, Result, Tensor};
 use oaiy_engine::json::Json;
 use std::path::{Path, PathBuf};
@@ -200,7 +202,7 @@ impl Request {
             greedy: j.get("greedy").and_then(Json::as_bool).unwrap_or(false),
             budget: Budget::parse(j)?,
             language_model: s("language_model").filter(|p| !p.trim().is_empty()).map(PathBuf::from),
-            webgpu: crate::pipeline::backend_is_webgpu(j, "music")?,
+            webgpu: crate::common::job::backend_is_webgpu(j, "music")?,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
             return Err("music: this build has no WebGPU (the webgpu feature)".into());
@@ -337,11 +339,11 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     Ok(result)
 }
 
-/// [`generate`] on WebGPU: the language model and depth decoder ([`crate::music_lm_wgpu`]), then the renderer
-/// ([`crate::music_wgpu`]), one after the other on the same device.
+/// [`generate`] on WebGPU: the language model and depth decoder ([`crate::music::webgpu::lm`]), then the renderer
+/// ([`crate::music::webgpu`]), one after the other on the same device.
 #[cfg(feature = "webgpu")]
 fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
-    use crate::music_lm_wgpu::{WgpuDepth, WgpuMusicLm};
+    use crate::music::webgpu::lm::{WgpuDepth, WgpuMusicLm};
     let started = Instant::now();
     let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(|e| candle_core::Error::Msg(format!("music on WebGPU: {e}")))?;
     let ids = prompt_ids(&r.model_dir, &r.prompt, &r.lyrics)?;
@@ -352,13 +354,13 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("loading_music_model", 0, layers));
     let depth = WgpuDepth::load(&r.model_dir.join("rvq_depth_decoder"), &gpu)?;
     let positions = ids[0].len() + max_frames + 2;
-    let f16 = r.language_model.is_none() && crate::music_lm_wgpu::lm_f16(&gpu, positions);
+    let f16 = r.language_model.is_none() && crate::music::webgpu::lm::lm_f16(&gpu, positions);
     let mut model = WgpuMusicLm::load(&r.model_dir.join("language_model"), r.language_model.as_deref(), positions, &gpu, |i| report(event("loading_music_model", i, layers)))?;
     let load_seconds = started.elapsed().as_secs_f64();
     let compose_started = Instant::now();
     let mut rng = lm::Rng::new(r.seed);
     let profiled = ggml_rs_wgpu::profile::chain_on();
-    let frames = crate::music_lm_wgpu::generate(&mut model, &depth, &ids, max_frames, if r.greedy { None } else { Some(&mut rng) }, |n| {
+    let frames = crate::music::webgpu::lm::generate(&mut model, &depth, &ids, max_frames, if r.greedy { None } else { Some(&mut rng) }, |n| {
         report(event("composing", n, max_frames));
         // (OAIY_CHAIN_PROFILE: the GPU's kernels over each 25 frames, each dispatch timed in a pass of its own)
         if profiled && n % 25 == 0 {
@@ -380,7 +382,7 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let render_started = Instant::now();
     let blocks = 36;
     report(event("loading_renderer", 0, blocks));
-    let acoustic = crate::music_wgpu::WgpuAcoustic::load(&r.model_dir, &gpu, r.steps, r.guidance, |i| report(event("loading_renderer", i, blocks)))?;
+    let acoustic = crate::music::webgpu::WgpuAcoustic::load(&r.model_dir, &gpu, r.steps, r.guidance, |i| report(event("loading_renderer", i, blocks)))?;
     let seed = r.seed;
     let audio = acoustic.generate(&hidden, frames.len(), |k, len| noise(seed, k, len)?.flatten_all()?.to_vec1::<f32>(), |done, total| {
         report(event("rendering", done, total));

@@ -130,9 +130,9 @@ fn run() -> candle_core::Result<()> {
         writeln!(std::io::stdout(), "{}", result.to_json())?;
         return Ok(());
     }
-    let r = oaiy_media::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+    let r = oaiy_media::qwen_image::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
     configure_cache(&r.output)?;
-    let result = oaiy_media::pipeline::generate(&r, |event| {
+    let result = oaiy_media::qwen_image::pipeline::generate(&r, |event| {
         eprintln!("{}", event.to_json());
     })?;
     writeln!(std::io::stdout(), "{}", result.to_json())?;
@@ -145,7 +145,7 @@ fn run() -> candle_core::Result<()> {
 /// pictures come one after another. It ends when its standard input does.
 fn serve() -> candle_core::Result<()> {
     use std::io::BufRead;
-    let mut kept = oaiy_media::pipeline::Kept::default();
+    let mut kept = oaiy_media::qwen_image::pipeline::Kept::default();
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -156,13 +156,13 @@ fn serve() -> candle_core::Result<()> {
             if j.get("architecture").is_some_and(|a| a.as_str() != Some("qwen-image")) || j.get("kind").is_some() {
                 candle_core::bail!("a worker that serves takes Qwen Image jobs");
             }
-            let r = oaiy_media::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+            let r = oaiy_media::qwen_image::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
             configure_cache(&r.output)?;
-            oaiy_media::pipeline::generate_kept(&r, Some(&mut kept), |event| eprintln!("{}", event.to_json()))
+            oaiy_media::qwen_image::pipeline::generate_kept(&r, Some(&mut kept), |event| eprintln!("{}", event.to_json()))
         })();
         let answer = answer.unwrap_or_else(|e| {
             // (what it had is let go: a job that failed may have left a model half made)
-            kept = oaiy_media::pipeline::Kept::default();
+            kept = oaiy_media::qwen_image::pipeline::Kept::default();
             Json::obj([("error", Json::str(e.to_string()))])
         });
         let mut out = std::io::stdout().lock();

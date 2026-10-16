@@ -3,7 +3,7 @@
 use super::math;
 use crate::{
     sdxl::vae_layers::{Decoder, Encoder, VaeConfig},
-    weights::Weights,
+    common::weights::Weights,
 };
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, VarBuilder};
@@ -126,17 +126,17 @@ impl Vae {
         )
     }
 }
-/// The decoder's shape as [`crate::sdxl_vae_wgpu`] takes it, and each packed channel's mean and deviation (the
+/// The decoder's shape as [`crate::sdxl::webgpu::vae`] takes it, and each packed channel's mean and deviation (the
 /// published batch-norm statistics, 128 of them): what a decode on WebGPU needs of the file at `path` beside its
 /// tensors. Whether the file is in the original layout (else diffusers': [`map_key`] its names).
 #[cfg(feature = "webgpu")]
-pub(crate) fn decoder_on_webgpu(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend) -> Result<(crate::sdxl_vae_wgpu::WgpuSdxlVae, Vec<f32>, Vec<f32>)> {
+pub(crate) fn decoder_on_webgpu(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend) -> Result<(crate::sdxl::webgpu::vae::WgpuSdxlVae, Vec<f32>, Vec<f32>)> {
     vae_on_webgpu(path, gpu, false)
 }
 
 /// [`decoder_on_webgpu`], the encoder too where `encoder` (FLUX 3's references are encoded by it).
 #[cfg(feature = "webgpu")]
-pub(crate) fn vae_on_webgpu(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, encoder: bool) -> Result<(crate::sdxl_vae_wgpu::WgpuSdxlVae, Vec<f32>, Vec<f32>)> {
+pub(crate) fn vae_on_webgpu(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, encoder: bool) -> Result<(crate::sdxl::webgpu::vae::WgpuSdxlVae, Vec<f32>, Vec<f32>)> {
     let mut w = Weights::open(path)?;
     let original = w.has("decoder.mid.block_1.conv1.weight");
     let cfg = crate::sdxl::config::VaeConfig { base_channels: 128, channel_mults: vec![1, 2, 4, 4], layers_per_block: 2, latent_channels: 32, scaling_factor: 1., in_channels: 3, out_channels: 3, norm_groups: 32 };
@@ -146,12 +146,12 @@ pub(crate) fn vae_on_webgpu(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, encoder
         candle_core::bail!("a Flux2 VAE's batch-norm statistics are 128 values, not {} and {}", mean.len(), std.len());
     }
     let map = |key: &str| if original { original_key(key) } else { map_key(key) };
-    let vae = crate::sdxl_vae_wgpu::WgpuSdxlVae::load_parts(&mut w, "", &cfg, gpu, &map, false, encoder)?;
+    let vae = crate::sdxl::webgpu::vae::WgpuSdxlVae::load_parts(&mut w, "", &cfg, gpu, &map, false, encoder)?;
     Ok((vae, mean, std))
 }
 
 /// A picture's tokens (`[h w, 128]`, a token a row) from its latent moments (`[2 h * 2 w, 64]`, a pixel a row: each
-/// latent pixel's 32 means then log-variances, as [`crate::sdxl_vae_wgpu::WgpuSdxlVae::encode`] reads them) as
+/// latent pixel's 32 means then log-variances, as [`crate::sdxl::webgpu::vae::WgpuSdxlVae::encode`] reads them) as
 /// [`Vae::encode`] packs its mean: each token its 2x2 pixels' 32 channels (channel `4 c + 2 dy + dx` pixel `(2 y + dy,
 /// 2 x + dx)`'s channel `c`), less each channel's mean, over its deviation. [`unpack_rows`] undoes it.
 #[cfg(feature = "webgpu")]

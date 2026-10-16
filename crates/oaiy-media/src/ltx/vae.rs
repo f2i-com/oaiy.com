@@ -5,7 +5,7 @@ use std::path::Path;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Activation, VarBuilder};
 
-use crate::math::layer_norm;
+use crate::common::math::layer_norm;
 fn layer_norm_no_params(x: &Tensor, _eps: f64) -> Result<Tensor> {
     layer_norm(x)
 }
@@ -777,7 +777,7 @@ impl LtxVideoDecoder {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        // (LTX 2.5's own VAE decodes by diffusion: on WebGPU alone, `crate::ltx_dvae_wgpu`)
+        // (LTX 2.5's own VAE decodes by diffusion: on WebGPU alone, `crate::ltx::webgpu::dvae`)
         if crate::ltx::store::Store::open(weights_path, 0).is_ok_and(|s| is_diffusion_vae(&s)) {
             candle_core::bail!("{} is LTX 2.5's diffusion VAE, which decodes on WebGPU only (backend \"webgpu\"): on the CPU, name the conv VAE (ltx-2.5-video-vae-conv) as the model's vae", weights_path.display());
         }

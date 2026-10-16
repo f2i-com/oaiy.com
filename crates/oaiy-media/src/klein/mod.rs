@@ -2,13 +2,15 @@
 //! and runtime LoRA factors. No Python, engine sidecar, or weight conversion.
 //! On WebGPU (a job's `backend`, the default where the build has it) the text
 //! encoder, the transformer and the VAE's decoder run on the GPU
-//! ([`crate::klein_text_wgpu`], [`crate::klein_wgpu`], [`crate::sdxl_vae_wgpu`]).
+//! ([`crate::klein::webgpu::text`], [`crate::klein::webgpu`], [`crate::sdxl::webgpu::vae`]).
 pub mod math;
 pub mod schedule;
 pub mod text;
 pub mod transformer;
 pub mod vae;
-use crate::residency::Budget;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
+use crate::common::residency::Budget;
 use candle_core::{DType, Device, Result, Tensor};
 use oaiy_engine::json::Json;
 use std::{io::Write, path::PathBuf, time::Instant};
@@ -40,7 +42,7 @@ pub struct Request {
 enum Model {
     Candle(transformer::Transformer),
     #[cfg(feature = "webgpu")]
-    Wgpu(crate::klein_wgpu::WgpuKlein),
+    Wgpu(crate::klein::webgpu::WgpuKlein),
 }
 
 impl Model {
@@ -75,7 +77,7 @@ impl Model {
 enum Decoder {
     Candle(vae::Vae),
     #[cfg(feature = "webgpu")]
-    Wgpu(crate::sdxl_vae_wgpu::WgpuSdxlVae, Vec<f32>, Vec<f32>),
+    Wgpu(crate::sdxl::webgpu::vae::WgpuSdxlVae, Vec<f32>, Vec<f32>),
 }
 
 impl Decoder {
@@ -107,7 +109,7 @@ fn decoder(r: &Request, model: &Model, dev: &Device) -> Result<Decoder> {
 /// Each prompt's conditioning and, where asked, the empty prompt's, by the text encoder on WebGPU.
 #[cfg(feature = "webgpu")]
 fn webgpu_contexts(r: &Request, negative: bool) -> Result<(Vec<Tensor>, Option<Tensor>)> {
-    let mut encoder = crate::klein_text_wgpu::WgpuKleinText::load(&r.text_encoder, &r.tokenizer, r.device)?;
+    let mut encoder = crate::klein::webgpu::text::WgpuKleinText::load(&r.text_encoder, &r.tokenizer, r.device)?;
     let prompts: Vec<&str> = r.prompts.iter().map(String::as_str).chain(negative.then_some("")).collect();
     let mut contexts = encoder.encode_all(&prompts)?;
     let negative = if negative { contexts.pop() } else { None };
@@ -121,7 +123,7 @@ fn webgpu_contexts(_: &Request, _: bool) -> Result<(Vec<Tensor>, Option<Tensor>)
 
 #[cfg(feature = "webgpu")]
 fn webgpu_model(r: &Request) -> Result<Model> {
-    Ok(Model::Wgpu(crate::klein_wgpu::WgpuKlein::load(&r.transformer, r.device, &r.loras, |_| {})?))
+    Ok(Model::Wgpu(crate::klein::webgpu::WgpuKlein::load(&r.transformer, r.device, &r.loras, |_| {})?))
 }
 
 #[cfg(not(feature = "webgpu"))]
@@ -131,7 +133,7 @@ fn webgpu_model(_: &Request) -> Result<Model> {
 
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
-        let webgpu = crate::pipeline::backend_is_webgpu(j, "FLUX.2 Klein")?;
+        let webgpu = crate::common::job::backend_is_webgpu(j, "FLUX.2 Klein")?;
         let path = |key: &str| -> std::result::Result<PathBuf, String> {
             let p = PathBuf::from(
                 j.get(key)
@@ -230,7 +232,7 @@ impl Request {
         if width % 16 != 0 || height % 16 != 0 {
             return Err("Klein dimensions must be multiples of 16".into());
         }
-        let loras = crate::pipeline::parse_loras(j)?;
+        let loras = crate::common::job::parse_loras(j)?;
         for (p, _) in &loras {
             if !p.is_file() {
                 return Err(format!("LoRA not found: {}", p.display()));
@@ -266,9 +268,9 @@ impl Request {
 }
 pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     // Header preflight precedes device creation and all model allocations.
-    let index = crate::weights::Weights::open(&r.transformer)?;
+    let index = crate::common::weights::Weights::open(&r.transformer)?;
     transformer::Config::default().validate(&index)?;
-    crate::lora::Loras::open(&r.loras)?
+    crate::common::lora::Loras::open(&r.loras)?
         .validate_modules(&transformer::Config::default().projections())?;
     drop(index);
     let dev = Device::Cpu;
@@ -331,7 +333,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         let context = contexts[if contexts.len() == 1 { 0 } else { i }].to_device(&dev)?;
         let uncond = negative.as_ref().map(|t| t.to_device(&dev)).transpose()?;
         let mut x = Tensor::from_vec(
-            crate::pipeline::noise(seed, h * w * 128),
+            crate::common::job::noise(seed, h * w * 128),
             (1, 128, h, w),
             &dev,
         )?

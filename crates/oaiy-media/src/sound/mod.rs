@@ -5,11 +5,13 @@
 //! makes the audio. As the reference does, it always denoises the full 30 s and
 //! keeps the length asked for.
 //!
-//! `backend` "webgpu" runs it on WebGPU ([`crate::sound_wgpu`]: any GPU), as a worker built with WebGPU and without CUDA
+//! `backend` "webgpu" runs it on WebGPU ([`crate::sound::webgpu`]: any GPU), as a worker built with WebGPU and without CUDA
 //! does by default (Candle's needs CUDA: its models BF16).
 pub mod dac;
 pub mod dit;
 pub mod pth;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
 use crate::ltx::store::Store;
 use crate::tts::model::{Cache, Decoder};
@@ -57,7 +59,7 @@ impl Request {
             device: j.get("device").and_then(Json::as_i64).unwrap_or(0).max(0) as usize,
             output: s("output_dir").ok_or("sound: missing output_dir")?.into(),
             noise_file: s("noise_file").map(PathBuf::from),
-            webgpu: crate::pipeline::backend_is_webgpu(j, "sound")?,
+            webgpu: crate::common::job::backend_is_webgpu(j, "sound")?,
         };
         if r.webgpu && !cfg!(feature = "webgpu") {
             return Err("sound: this build has no WebGPU (the webgpu feature)".into());
@@ -162,7 +164,7 @@ pub(crate) fn sigmas(steps: usize, shift: f64) -> Vec<f64> {
 pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     #[cfg(feature = "webgpu")]
     if r.webgpu {
-        return crate::sound_wgpu::generate(r, report);
+        return crate::sound::webgpu::generate(r, report);
     }
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;

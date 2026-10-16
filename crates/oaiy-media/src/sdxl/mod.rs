@@ -7,9 +7,11 @@ pub mod text_encoder;
 pub mod unet;
 pub mod vae;
 pub mod vae_layers;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
-use crate::residency::{Budget, Memory};
-use crate::weights::Weights;
+use crate::common::residency::{Budget, Memory};
+use crate::common::weights::Weights;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 use oaiy_engine::json::Json;
@@ -38,7 +40,7 @@ pub struct Request {
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
-        let webgpu = crate::pipeline::backend_is_webgpu(j, "SDXL")?;
+        let webgpu = crate::common::job::backend_is_webgpu(j, "SDXL")?;
         let text = |k| {
             j.get(k)
                 .and_then(Json::as_str)
@@ -191,7 +193,7 @@ impl Stages {
             return host.iter().map(|(k, t)| Ok((k.clone(), t.to_device(dev)?))).collect();
         }
         let cpu = component(&mut self.weights, prefix, &Device::Cpu, dtype)?;
-        let bytes: u64 = cpu.values().map(crate::weights::bytes_of).sum();
+        let bytes: u64 = cpu.values().map(crate::common::weights::bytes_of).sum();
         self.streamed_bytes += bytes;
         let placed = cpu.iter().map(|(k, t)| Ok((k.clone(), t.to_device(dev)?))).collect::<Result<_>>()?;
         if bytes <= self.ram_left {
@@ -287,7 +289,7 @@ fn encode_prompt(
 
 /// [`encode_prompt`] with the two encoders on WebGPU.
 #[cfg(feature = "webgpu")]
-fn encode_prompt_webgpu(r: &Request, tokenizer: &tokenizers::Tokenizer, clips: &crate::sdxl_clip_wgpu::WgpuClips, prompt: &str) -> Result<(Tensor, Tensor, bool)> {
+fn encode_prompt_webgpu(r: &Request, tokenizer: &tokenizers::Tokenizer, clips: &crate::sdxl::webgpu::clip::WgpuClips, prompt: &str) -> Result<(Tensor, Tensor, bool)> {
     let dev = Device::Cpu;
     let ids = |t: &Tensor| t.flatten_all()?.to_vec1::<u32>();
     let mut encoded = Vec::new();
@@ -392,8 +394,8 @@ fn save_image(r: &Request, out: &std::path::Path, manifest: &mut std::fs::File, 
     Ok(record)
 }
 
-/// [`generate`] with the UNet, the VAE's decoder and the two CLIP encoders on WebGPU ([`crate::sdxl_wgpu::WgpuUnet`],
-/// [`crate::sdxl_vae_wgpu::WgpuSdxlVae`], [`crate::sdxl_clip_wgpu::WgpuClips`]): every picture's prompt encoded first
+/// [`generate`] with the UNet, the VAE's decoder and the two CLIP encoders on WebGPU ([`crate::sdxl::webgpu::WgpuUnet`],
+/// [`crate::sdxl::webgpu::vae::WgpuSdxlVae`], [`crate::sdxl::webgpu::clip::WgpuClips`]): every picture's prompt encoded first
 /// and the encoders let go (1.6 GB of the card's), the noise the host's from the seed (Candle seeds no generator on
 /// the CPU), a guided step's prompt and negative prompt two passes of one recording, a guidance of 1 the prompt's
 /// pass alone. OAIY_SDXL_CLIP_CPU: the encoders through Candle on the host in f32, as they were.
@@ -417,17 +419,17 @@ fn generate_webgpu(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         streamed_bytes: 0,
     };
     let opened = clock.elapsed().as_secs_f64();
-    let unet = crate::sdxl_wgpu::WgpuUnet::load(&mut stages.weights, UNET, &config::UNetConfig::sdxl_1_0(), r.device)?;
+    let unet = crate::sdxl::webgpu::WgpuUnet::load(&mut stages.weights, UNET, &config::UNetConfig::sdxl_1_0(), r.device)?;
     let unet_at = clock.elapsed().as_secs_f64();
-    let vae = crate::sdxl_vae_wgpu::WgpuSdxlVae::load_on(&mut stages.weights, VAE, &config::VaeConfig::sdxl_default(), unet.backend().clone())?;
+    let vae = crate::sdxl::webgpu::vae::WgpuSdxlVae::load_on(&mut stages.weights, VAE, &config::VaeConfig::sdxl_default(), unet.backend().clone())?;
     let vae_at = clock.elapsed().as_secs_f64();
     let on_host = std::env::var_os("OAIY_SDXL_CLIP_CPU").is_some();
     let host_clips = if on_host { Some(stages.clips(&dev, DType::F32)?) } else { None };
-    let clips = if on_host { None } else { Some(crate::sdxl_clip_wgpu::WgpuClips::load(&mut stages.weights, CLIP_L, CLIP_G, unet.backend().clone())?) };
+    let clips = if on_host { None } else { Some(crate::sdxl::webgpu::clip::WgpuClips::load(&mut stages.weights, CLIP_L, CLIP_G, unet.backend().clone())?) };
     let load_seconds = clock.elapsed().as_secs_f64();
     // (OAIY_LOAD_PROFILE: where the loading went)
     if std::env::var_os("OAIY_LOAD_PROFILE").is_some() {
-        let ns = |i: usize| crate::sdxl_wgpu::LOAD_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+        let ns = |i: usize| crate::sdxl::webgpu::LOAD_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
         eprintln!("load: the device and the checkpoint's index {opened:.2} s, the UNet {:.2} s (reading as f32 {:.2}, packing {:.2}, uploading {:.2}), the VAE {:.2} s, the text encoders {:.2} s", unet_at - opened, ns(0), ns(1), ns(2), vae_at - unet_at, load_seconds - vae_at);
     }
     let sigmas = scheduler::sdxl_default_sigmas(r.steps);
@@ -462,9 +464,9 @@ fn generate_webgpu(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         if r.cfg != 1.0 {
             conds.push(unet.prepare(&row(context, 1)?, &row(y, 1)?)?);
         }
-        let conds: Vec<&crate::sdxl_wgpu::Cond> = conds.iter().collect();
+        let conds: Vec<&crate::sdxl::webgpu::Cond> = conds.iter().collect();
         let seed = r.seed + i as u64;
-        let mut x = Tensor::from_vec(crate::pipeline::noise(seed, 4 * lh * lw), (1, 4, lh, lw), &dev)?.affine(sigmas[0], 0.)?;
+        let mut x = Tensor::from_vec(crate::common::job::noise(seed, 4 * lh * lw), (1, 4, lh, lw), &dev)?.affine(sigmas[0], 0.)?;
         let mut state = scheduler::SamplerState::default();
         let sampling = Instant::now();
         for step in 0..r.steps {

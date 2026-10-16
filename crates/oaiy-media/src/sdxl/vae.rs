@@ -2,7 +2,7 @@
 //! SDXL VAE — `AutoencoderKL` from the LDM paper, 4-channel latent.
 //!
 //! Structurally identical to the 16-channel FLUX-family VAE already in
-//! `crate::vae`, so we reuse those `Encoder` / `Decoder` primitives
+//! `crate::qwen_image::vae`, so we reuse those `Encoder` / `Decoder` primitives
 //! unchanged. The two differences SDXL needs on top:
 //!
 //! 1. **quant_conv** (1×1, 8→8) right after the encoder's `conv_out`,

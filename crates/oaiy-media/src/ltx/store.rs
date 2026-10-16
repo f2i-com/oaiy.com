@@ -66,7 +66,7 @@ mod tests {
         std::fs::write(&file, out)?;
         let mut store = Store::open(&file, 0)?;
         let ours = store.tensor(key, &Device::Cpu, false)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let reference = crate::comfy_quant::load(&store.index, key, &Device::Cpu, DType::F32)?.unwrap().flatten_all()?.to_vec1::<f32>()?;
+        let reference = crate::common::comfy_quant::load(&store.index, key, &Device::Cpu, DType::F32)?.unwrap().flatten_all()?.to_vec1::<f32>()?;
         for (a, b) in ours.iter().zip(&reference) {
             // BF16 storage of the result.
             assert!((a - b).abs() <= b.abs() * 0.008 + 1e-3, "{a} vs {b}");
@@ -239,9 +239,9 @@ mod tests {
         for key in ["a.weight", "b.weight", "c.weight", "d.weight"] {
             let values = store.tensor_f32(key, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
             let coded = store.coded(key)?.expect("coded");
-            assert_eq!(coded.q8_0(), crate::wgpu_weights::q8_0(&values), "{key}: Q8_0");
+            assert_eq!(coded.q8_0(), crate::common::webgpu_weights::q8_0(&values), "{key}: Q8_0");
             let words = |w: Vec<f32>| w.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
-            assert_eq!(words(coded.f16_words().expect("in range")), words(crate::wgpu_weights::f16_words_f32(&values).expect("in range")), "{key}: f16");
+            assert_eq!(words(coded.f16_words().expect("in range")), words(crate::common::webgpu_weights::f16_words_f32(&values).expect("in range")), "{key}: f16");
             assert!(coded.values().iter().zip(&values).all(|(a, b)| a.to_bits() == b.to_bits()), "{key}: values");
         }
         assert!(store.coded("e.weight")?.is_none(), "BF16 is not coded");
@@ -269,9 +269,9 @@ mod tests {
         let made = coded.values();
         let most = values.iter().fold(0f32, |m, v| m.max(v.abs()));
         assert!(most > 0. && made.iter().zip(&values).all(|(a, b)| (a - b).abs() <= most * 1e-5), "the rotation undone");
-        assert_eq!(coded.q8_0(), crate::wgpu_weights::q8_0(&made), "Q8_0 of its values");
+        assert_eq!(coded.q8_0(), crate::common::webgpu_weights::q8_0(&made), "Q8_0 of its values");
         let words = |w: Vec<f32>| w.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
-        assert_eq!(words(coded.f16_words().expect("in range")), words(crate::wgpu_weights::f16_words_f32(&made).expect("in range")), "f16 of its values");
+        assert_eq!(words(coded.f16_words().expect("in range")), words(crate::common::webgpu_weights::f16_words_f32(&made).expect("in range")), "f16 of its values");
         std::fs::remove_file(path)?;
         Ok(())
     }
@@ -296,7 +296,7 @@ mod tests {
                 let q = if way == "coded" {
                     store.coded(&name)?.expect("coded").q8_0()
                 } else {
-                    crate::wgpu_weights::q8_0(&store.tensor_f32(&name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?)
+                    crate::common::webgpu_weights::q8_0(&store.tensor_f32(&name, &Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?)
                 };
                 bytes += q.len() / 34 * 32;
             }
@@ -477,7 +477,7 @@ impl Store {
         if let Some(r) = self.rotations.get(key) {
             return Ok(*r);
         }
-        let r = crate::comfy_quant::rotation(&self.index, key)?;
+        let r = crate::common::comfy_quant::rotation(&self.index, key)?;
         self.rotations.insert(key.to_owned(), r);
         Ok(r)
     }
@@ -955,19 +955,19 @@ pub struct Coded {
 impl Coded {
     /// Its values as Q8_0's blocks, made on every core.
     pub fn q8_0(&self) -> Vec<u8> {
-        crate::wgpu_weights::q8_0_codes(&self.codes, self.group(32), |at, c, x| self.fill(at, c, x))
+        crate::common::webgpu_weights::q8_0_codes(&self.codes, self.group(32), |at, c, x| self.fill(at, c, x))
     }
 
     /// Its values as f16 words, made on every core; None where one is past f16's range.
     pub fn f16_words(&self) -> Option<Vec<f32>> {
-        crate::wgpu_weights::f16_words_codes(&self.codes, self.group(2), |at, c, x| self.fill(at, c, x))
+        crate::common::webgpu_weights::f16_words_codes(&self.codes, self.group(2), |at, c, x| self.fill(at, c, x))
     }
 
     /// Its values, made on every core.
     pub fn values(&self) -> Vec<f32> {
         let mut out = vec![0f32; self.codes.len()];
         let group = self.group(1);
-        crate::wgpu_weights::on_cores_at(&self.codes, group, &mut out, group, |at, c, x| self.fill(at, c, x));
+        crate::common::webgpu_weights::on_cores_at(&self.codes, group, &mut out, group, |at, c, x| self.fill(at, c, x));
         out
     }
 
@@ -987,7 +987,7 @@ impl Coded {
             }
         }
         if let Some(gs) = self.rotation {
-            x[..codes.len()].chunks_exact_mut(gs).for_each(crate::comfy_quant::rotate);
+            x[..codes.len()].chunks_exact_mut(gs).for_each(crate::common::comfy_quant::rotate);
         }
     }
 }
@@ -1020,7 +1020,7 @@ fn e4m3_table() -> &'static [f32; 256] {
 fn unrotated(t: Tensor, rotation: Option<usize>, out: DType) -> Result<Tensor> {
     match rotation {
         None => Ok(t),
-        Some(gs) => crate::comfy_quant::unrotate(&t, gs)?.to_dtype(out),
+        Some(gs) => crate::common::comfy_quant::unrotate(&t, gs)?.to_dtype(out),
     }
 }
 

@@ -4,8 +4,8 @@
 strength-zero control have now succeeded. See [current validation and reproduction](KLEIN_VALIDATED.md).
 
 > **On WebGPU (2026-10-08).** A Klein job runs on WebGPU, on a GPU of any make, when it
-> names no backend: the Qwen3-4B text encoder (`klein_text_wgpu`), the transformer
-> (`klein_wgpu`: a GGUF's K-quant blocks as they are, or a checkpoint's floats as f16,
+> names no backend: the Qwen3-4B text encoder (`klein::webgpu::text`), the transformer
+> (`klein::webgpu`: a GGUF's K-quant blocks as they are, or a checkpoint's floats as f16,
 > LoRA factors beside or merged) and the VAE's decoder (SDXL's on WebGPU, the same
 > AutoencoderKL). From the distilled Q4_K_M GGUF on one RTX 5090 at its 400 W cap, four
 > steps: a 1024x1024 picture in 8.3 s (its steps 1.3 s, 0.31 s each; its decode 0.74 s;

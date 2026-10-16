@@ -1,9 +1,9 @@
 //! Qwen3-4B causal conditioning. Hidden states 9/18/27 (HF tuple indices)
 //! are concatenated, before final RMS normalization, including padded tokens.
 use crate::{
-    math::{heads, swiglu, unheads},
-    residency::{Budget, Resident, Tiered},
-    weights::{bytes_of, Linear, Weights},
+    common::math::{heads, swiglu, unheads},
+    common::residency::{Budget, Resident, Tiered},
+    common::weights::{bytes_of, Linear, Weights},
 };
 use candle_core::{DType, Device, Result, Tensor};
 use std::path::Path;
@@ -93,7 +93,7 @@ fn rms(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
 }
 fn load_block(w: &mut Weights, i: usize, d: &Device, t: DType) -> Result<Block> {
     let p = format!("model.layers.{i}");
-    let mut l = crate::lora::Loras::default();
+    let mut l = crate::common::lora::Loras::default();
     Ok(Block {
         input: w.tensor(&format!("{p}.input_layernorm.weight"), d, t)?,
         post: w.tensor(&format!("{p}.post_attention_layernorm.weight"), d, t)?,

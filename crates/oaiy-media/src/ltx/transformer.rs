@@ -1,5 +1,5 @@
 use super::store::{Group, Store};
-use crate::math::{attention, heads, layer_norm, unheads};
+use crate::common::math::{attention, heads, layer_norm, unheads};
 use candle_core::{DType, Device, Result, Tensor, D};
 
 pub const PREFIX: &str = "model.diffusion_model.";

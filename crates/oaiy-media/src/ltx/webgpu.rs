@@ -1,15 +1,26 @@
 //! The parts of a clip made on WebGPU: the transformer's streams, the prompts' contexts, the ends' latents and
 //! the decoded clip (each with a stand-in for a build without the `webgpu` feature).
 
+// The GPU's own parts (a build with the `webgpu` feature): the transformer, the prompts' context, the video VAE's
+// decoder and LTX 2.5's diffusion decoder.
+#[cfg(feature = "webgpu")]
+pub mod transformer;
+#[cfg(feature = "webgpu")]
+pub mod text;
+#[cfg(feature = "webgpu")]
+pub mod vae;
+#[cfg(feature = "webgpu")]
+pub mod dvae;
+
 use super::*;
 
 /// The transformer a clip is denoised by: Candle's, or (`backend` "webgpu") the video stream on WebGPU with its
 /// tokens' rotary table and, for a clip with sound, the audio stream beside it: the audio tokens' table and the
 /// video tokens' for the attention between the streams.
 pub(super) enum Model {
-    Candle(transformer::Transformer),
+    Candle(super::transformer::Transformer),
     #[cfg(feature = "webgpu")]
-    Wgpu(crate::ltx_wgpu::WgpuLtx, ggml_rs::DeviceVec, Option<(ggml_rs::DeviceVec, ggml_rs::DeviceVec)>),
+    Wgpu(crate::ltx::webgpu::transformer::WgpuLtx, ggml_rs::DeviceVec, Option<(ggml_rs::DeviceVec, ggml_rs::DeviceVec)>),
 }
 
 /// The video stream of `store`'s transformer on WebGPU (and the audio stream where the clip has sound), for a latent
@@ -17,7 +28,7 @@ pub(super) enum Model {
 #[cfg(feature = "webgpu")]
 pub(super) fn webgpu_model(r: &Request, store: &mut Store, f: usize, h: usize, w: usize, audio_frames: usize, report: &mut dyn FnMut(Json)) -> Result<Model> {
     report(event("loading_video_model", 0, 48));
-    let m = crate::ltx_wgpu::WgpuLtx::load_streams(store, r.device, r.audio, |n| report(event("loading_video_model", n, 48)))?;
+    let m = crate::ltx::webgpu::transformer::WgpuLtx::load_streams(store, r.device, r.audio, |n| report(event("loading_video_model", n, 48)))?;
     let (table, sound) = webgpu_tables(&m, r, f, h, w, audio_frames);
     Ok(Model::Wgpu(m, table, sound))
 }
@@ -26,13 +37,13 @@ pub(super) fn webgpu_model(r: &Request, store: &mut Store, f: usize, h: usize, w
 /// sound the audio tokens' and the video tokens' times for the attention between the streams (a two-stage clip's
 /// second stage makes them again, twice as high and wide).
 #[cfg(feature = "webgpu")]
-pub(super) fn webgpu_tables(m: &crate::ltx_wgpu::WgpuLtx, r: &Request, f: usize, h: usize, w: usize, audio_frames: usize) -> (ggml_rs::DeviceVec, Option<(ggml_rs::DeviceVec, ggml_rs::DeviceVec)>) {
-    use crate::ltx_wgpu::{rope_table, video_positions};
+pub(super) fn webgpu_tables(m: &crate::ltx::webgpu::transformer::WgpuLtx, r: &Request, f: usize, h: usize, w: usize, audio_frames: usize) -> (ggml_rs::DeviceVec, Option<(ggml_rs::DeviceVec, ggml_rs::DeviceVec)>) {
+    use crate::ltx::webgpu::transformer::{rope_table, video_positions};
     let positions = video_positions(f, h, w, r.fps, r.end_image.is_some());
     let table = m.upload(&rope_table(&positions, &[20., 2048., 2048.], 4096, 32));
     // (each audio frame at its span's middle and each video token at its time, in seconds: 2,048 channels' tables)
     let sound = r.audio.then(|| {
-        let middles: Vec<Vec<f32>> = transformer::audio_spans(audio_frames).iter().map(|&(s, e)| vec![((s + e) / 2.) as f32]).collect();
+        let middles: Vec<Vec<f32>> = super::transformer::audio_spans(audio_frames).iter().map(|&(s, e)| vec![((s + e) / 2.) as f32]).collect();
         let times: Vec<Vec<f32>> = positions.iter().map(|p| vec![p[0]]).collect();
         (m.upload(&rope_table(&middles, &[20.], 2048, 32)), m.upload(&rope_table(&times, &[20.], 2048, 32)))
     });
@@ -65,7 +76,7 @@ pub(super) fn webgpu_contexts(r: &Request, store: &mut Store, cached: Option<Ten
         Vec::new()
     } else {
         report(event("encoding_video_prompt", 0, 1));
-        crate::ltx_text_wgpu::contexts_streams(&r.text_encoder, r.tokenizer.as_deref(), store, &prompts, r.device, r.audio, |n, of| report(event("encoding_video_prompt", n, of)))?
+        crate::ltx::webgpu::text::contexts_streams(&r.text_encoder, r.tokenizer.as_deref(), store, &prompts, r.device, r.audio, |n, of| report(event("encoding_video_prompt", n, of)))?
     }
     .into_iter();
     let mut next = || -> Result<(Tensor, Option<Tensor>)> {
@@ -108,9 +119,9 @@ pub(super) fn webgpu_contexts(_: &Request, _: &mut Store, _: Option<Tensor>, _: 
 #[cfg(feature = "webgpu")]
 pub(super) fn webgpu_decode(r: &Request, latent: &Tensor, f: usize, h: usize, w: usize) -> Result<Tensor> {
     let mut store = Store::open(&r.vae, 0)?;
-    if crate::ltx_dvae_wgpu::is_diffusion_vae(&store) {
+    if crate::ltx::webgpu::dvae::is_diffusion_vae(&store) {
         let loading = std::time::Instant::now();
-        let decoder = crate::ltx_dvae_wgpu::WgpuLtxDiffusionVae::load(&mut store, r.device)?;
+        let decoder = crate::ltx::webgpu::dvae::WgpuLtxDiffusionVae::load(&mut store, r.device)?;
         drop(store);
         let decoding = std::time::Instant::now();
         let clip = decoder.decode(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w, r.seed.wrapping_add(DIFFUSION_VAE_SEED_OFFSET));
@@ -119,7 +130,7 @@ pub(super) fn webgpu_decode(r: &Request, latent: &Tensor, f: usize, h: usize, w:
         }
         return clip;
     }
-    let decoder = crate::ltx_vae_wgpu::WgpuLtxVae::load(&mut store, r.device)?;
+    let decoder = crate::ltx::webgpu::vae::WgpuLtxVae::load(&mut store, r.device)?;
     drop(store);
     decoder.decode_fitted(&latent.flatten_all()?.to_vec1::<f32>()?, f, h, w)
 }
@@ -135,7 +146,7 @@ pub(super) fn webgpu_decode(_: &Request, _: &Tensor, _: usize, _: usize, _: usiz
 #[cfg(feature = "webgpu")]
 pub(super) fn webgpu_endpoints(r: &Request, (width, height): (usize, usize), dev: &Device, report: &mut dyn FnMut(Json)) -> Result<(Option<Tensor>, Option<Tensor>)> {
     let mut store = Store::open(&r.vae, 0)?;
-    let encoder = crate::ltx_vae_wgpu::WgpuLtxImageEncoder::load(&mut store, r.device)?;
+    let encoder = crate::ltx::webgpu::vae::WgpuLtxImageEncoder::load(&mut store, r.device)?;
     drop(store);
     let mut encode = |path: &Option<PathBuf>, stage: &str| -> Result<Option<Tensor>> {
         path.as_ref()

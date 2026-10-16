@@ -1,6 +1,6 @@
 # FLUX 3 Image Klein reference attribution
 
-The native FLUX 3 Image Klein implementation (`crates/oaiy-media/src/flux3_wgpu.rs`, `crates/oaiy-media/src/flux3/`)
+The native FLUX 3 Image Klein implementation (`crates/oaiy-media/src/flux3/webgpu.rs`, `crates/oaiy-media/src/flux3/`)
 and its test fixtures follow the Black Forest Labs FLUX 3 Image Klein reference implementation:
 https://github.com/black-forest-labs/flux-3-image-klein (Apache License 2.0, Copyright 2026 Black Forest Labs, Inc.).
 Black Forest Labs authors retain their rights in that source. Rust implementation adaptations and integration are by

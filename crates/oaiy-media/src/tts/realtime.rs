@@ -1,12 +1,12 @@
 //! Qwen3-TTS spoken as it is made, on WebGPU: what [`oaiy_tts::Tts`] is on Candle (whose GPU was CUDA's), for a
-//! server that streams a line's audio while the rest is still being made. The talker ([`crate::tts_wgpu::WgpuTalker`])
-//! hands each frame over as it draws it, and the speech codec's decoder ([`crate::codec_wgpu::WgpuCodec`]) decodes
+//! server that streams a line's audio while the rest is still being made. The talker ([`crate::tts::webgpu::WgpuTalker`])
+//! hands each frame over as it draws it, and the speech codec's decoder ([`crate::tts::webgpu::codec::WgpuCodec`]) decodes
 //! the frames a chunk at a time after the frames before them ([`WgpuCodec::decode_after`]: the official chunked
 //! decode's 25 frames of left context, where Candle's stream carries each stage's state). A cloned voice's speaker
 //! embedding and reference codes are made on the CPU (both encoders F32), once a clip, and kept.
 
-use crate::codec_wgpu::{StreamState, WgpuCodec};
-use crate::tts_wgpu::{FramesEnd, WgpuTalker};
+use crate::tts::webgpu::codec::{StreamState, WgpuCodec};
+use crate::tts::webgpu::{FramesEnd, WgpuTalker};
 use candle_core::{Device, Result};
 use oaiy_tts::codec::SAMPLE_RATE;
 use oaiy_tts::talker::FRAMES_PER_SECOND;

@@ -1,0 +1,913 @@
+use crate::common::job::{backend_is_webgpu, noise, parse_loras};
+use crate::common::residency::Budget;
+use crate::qwen_image::{reference::Reference, schedule, text::TextEncoder, transformer::Transformer, vae::Vae, vision::VisionEncoder};
+use candle_core::{DType, Device, Result, Tensor};
+use oaiy_engine::json::Json;
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+#[derive(Clone, Debug)]
+pub struct Request {
+    pub base: PathBuf,
+    pub transformer: PathBuf,
+    pub text_encoder: Option<PathBuf>,
+    /// Qwen3-VL's vision tower for reference images, where the text encoder has none (a GGUF of its language model):
+    /// Qwen's mmproj GGUF, or found beside the text encoder ([`vision_root`]).
+    pub vision: Option<PathBuf>,
+    pub model: Option<String>,
+    pub adapter: Option<PathBuf>,
+    /// The transformer is Qwen-Image-2.1-Turbo, the distilled checkpoint (`distilled`; else a transformer file whose
+    /// name says Turbo, with no adapter): its own 8 steps at CFG 1 ([`schedule::DISTILLED`]).
+    pub distilled: bool,
+    /// More LoRA adapters, each with its strength, applied with the turbo one.
+    pub loras: Vec<(PathBuf, f64)>,
+    pub output: PathBuf,
+    pub prompts: Vec<String>,
+    pub count: usize,
+    pub width: usize,
+    pub height: usize,
+    pub steps: usize,
+    pub seed: u64,
+    pub device: usize,
+    pub cfg: f64,
+    pub images: Vec<PathBuf>,
+    pub reference_size: usize,
+    /// Where the transformer and text-encoder blocks live: GPU, RAM or SSD.
+    pub budget: Budget,
+    /// The text encoder, transformer and VAE's decoder on WebGPU (`backend` "webgpu": any GPU wgpu reaches, Vulkan,
+    /// Metal or Direct3D 12; OAIY_WEBGPU_ADAPTER picking one); reference images' VAE latents and vision features made
+    /// by Candle on its device first.
+    pub webgpu: bool,
+}
+impl Request {
+    /// The sampling schedule: the distilled checkpoint's own, the turbo adapter's, or the base's.
+    pub fn sigmas(&self) -> std::result::Result<Vec<f64>, String> {
+        if self.distilled {
+            schedule::distilled(self.steps)
+        } else {
+            schedule::sigmas(self.steps, self.width * self.height / 256, self.adapter.is_some())
+        }
+    }
+
+    pub fn parse(j: &Json) -> std::result::Result<Self, String> {
+        let string = |key: &str| {
+            j.get(key)
+                .and_then(Json::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{key} must be a nonempty string"))
+        };
+        let number = |key: &str, default: i64| -> std::result::Result<usize, String> {
+            let n = match j.get(key) {
+                None => default,
+                Some(v) => v
+                    .as_i64()
+                    .ok_or_else(|| format!("{key} must be an integer"))?,
+            };
+            usize::try_from(n).map_err(|_| format!("{key} must be nonnegative"))
+        };
+        let adapter = match j.get("adapter") {
+            None | Some(Json::Null) => None,
+            Some(_) => Some(PathBuf::from(string("adapter")?)),
+        };
+        let prompts = if let Some(v) = j.get("prompts") {
+            v.as_array()
+                .ok_or("prompts must be an array")?
+                .iter()
+                .map(|p| {
+                    p.as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                        .ok_or("prompts must contain nonempty strings".to_owned())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            vec![string("prompt")?]
+        };
+        let distilled = match j.get("distilled") {
+            None | Some(Json::Null) => {
+                adapter.is_none()
+                    && j.get("transformer").and_then(Json::as_str).and_then(|t| Path::new(t).file_name()).is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().contains("turbo"))
+            }
+            Some(v) => v.as_bool().ok_or("distilled must be true or false")?,
+        };
+        let cfg = match j.get("cfg") {
+            None => {
+                if adapter.is_some() || distilled {
+                    1.
+                } else {
+                    6.
+                }
+            }
+            Some(v) => v.as_f64().ok_or("cfg must be a number")?,
+        };
+        let r = Self {
+            images: match j.get("images") {
+                None => Vec::new(),
+                Some(v) => v
+                    .as_array()
+                    .ok_or("images must be an array of up to three local paths")?
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "images must contain nonempty local paths".to_owned())
+                    })
+                    .collect::<std::result::Result<_, _>>()?,
+            },
+            reference_size: number("reference_size", 1024)?,
+            base: string("base")?.into(),
+            transformer: string("transformer")?.into(),
+            text_encoder: match j.get("text_encoder") { None | Some(Json::Null) => None, _ => Some(string("text_encoder")?.into()) },
+            vision: match j.get("vision") { None | Some(Json::Null) => None, _ => Some(string("vision")?.into()) },
+            model: j.get("model").and_then(Json::as_str).map(str::to_owned),
+            adapter,
+            distilled,
+            loras: parse_loras(j)?,
+            output: string("output_dir")?.into(),
+            prompts,
+            count: number("n", 1)?,
+            width: number("width", 1024)?,
+            height: number("height", 1024)?,
+            steps: number(
+                "steps",
+                if distilled {
+                    8
+                } else if j.get("adapter").and_then(Json::as_str).is_some() {
+                    6
+                } else {
+                    40
+                },
+            )?,
+            seed: number("seed", 0)? as u64,
+            device: number("device", 0)?,
+            cfg,
+            budget: Budget::parse(j)?,
+            webgpu: backend_is_webgpu(j, "image")?,
+        };
+        r.validate()?;
+        Ok(r)
+    }
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.images.len() > 3 {
+            return Err("images accepts zero, one, two, or three references".into());
+        }
+        if !(256..=1024).contains(&self.reference_size) || self.reference_size % 32 != 0 {
+            return Err("reference_size must be a multiple of 32 between 256 and 1024".into());
+        }
+        for p in &self.images {
+            if !p.is_file() {
+                return Err(format!("reference image not found: {}", p.display()));
+            }
+        }
+        if !(1..=1000).contains(&self.count) {
+            return Err("n must be between 1 and 1000".into());
+        }
+        if self.prompts.is_empty() || (self.prompts.len() != 1 && self.prompts.len() != self.count)
+        {
+            return Err("provide one reusable prompt or exactly n prompts".into());
+        }
+        if self
+            .prompts
+            .iter()
+            .any(|s| s.len() > 16_384 || s.trim().is_empty())
+        {
+            return Err("prompts must contain 1..16384 bytes".into());
+        }
+        if [self.width, self.height]
+            .iter()
+            .any(|n| !(256..=2048).contains(n) || n % 32 != 0)
+        {
+            return Err("width and height must be multiples of 32 between 256 and 2048".into());
+        }
+        if !self.cfg.is_finite()
+            || !(1. ..=10.).contains(&self.cfg)
+            || ((self.adapter.is_some() || self.distilled) && self.cfg != 1.)
+        {
+            return Err("CFG must be 1 for turbo, or between 1 and 10 for base".into());
+        }
+        if self.distilled && self.adapter.is_some() {
+            return Err("the distilled Turbo checkpoint takes no turbo adapter".into());
+        }
+        self.sigmas()?;
+        if self
+            .seed
+            .checked_add(self.count as u64 - 1)
+            .is_none_or(|s| s > i64::MAX as u64)
+        {
+            return Err("seed range exceeds signed 64-bit range".into());
+        }
+        for (path, strength) in &self.loras {
+            if !strength.is_finite() || !(-4. ..=4.).contains(strength) {
+                return Err(format!("LoRA strength must be between -4 and 4 ({})", path.display()));
+            }
+        }
+        for path in [&self.base, &self.transformer]
+            .into_iter()
+            .chain(self.adapter.iter()).chain(self.text_encoder.iter()).chain(self.loras.iter().map(|(p, _)| p))
+        {
+            if !path.exists() {
+                return Err(format!("missing weights: {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The transformer on its device: Candle's (CUDA or the CPU) or the WebGPU chain's.
+enum Model {
+    Candle(Transformer),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::qwen_image::webgpu::transformer::WgpuTransformer),
+}
+
+/// The text encoder on its device: Candle's or the WebGPU chain's (prompts without reference images).
+enum Encoder {
+    Candle(TextEncoder),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::qwen_image::webgpu::text::WgpuTextEncoder),
+}
+
+impl Encoder {
+    fn encode(&mut self, prompt: &str, images: &[crate::qwen_image::vision::Features]) -> Result<crate::qwen_image::text::Conditioning> {
+        match self {
+            Encoder::Candle(e) => e.encode(prompt, images),
+            #[cfg(feature = "webgpu")]
+            Encoder::Wgpu(e) => e.encode_all(&[prompt], images)?.pop().ok_or_else(|| candle_core::Error::Msg("no conditioning".into())),
+        }
+    }
+
+    /// Each prompt's conditioning (WebGPU's: every prompt through a layer while its weights are on the card).
+    fn encode_all(&mut self, prompts: &[&str], images: &[crate::qwen_image::vision::Features]) -> Result<Vec<crate::qwen_image::text::Conditioning>> {
+        match self {
+            #[cfg(feature = "webgpu")]
+            Encoder::Wgpu(e) => e.encode_all(prompts, images),
+            _ => prompts.iter().map(|p| self.encode(p, images)).collect(),
+        }
+    }
+
+    fn residency(&self) -> Json {
+        match self {
+            Encoder::Candle(e) => e.residency(),
+            #[cfg(feature = "webgpu")]
+            Encoder::Wgpu(_) => Json::obj([("device", Json::str("webgpu"))]),
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    fn backend(&self) -> Option<&ggml_rs_wgpu::WgpuBackend> {
+        match self {
+            Encoder::Wgpu(e) => Some(e.backend()),
+            _ => None,
+        }
+    }
+
+    /// Whether WebGPU's encoder keeps its layers on the card between prompts (a kept worker's).
+    fn keep_layers(&mut self, keep: bool) {
+        #[cfg(feature = "webgpu")]
+        if let Encoder::Wgpu(e) = self {
+            e.keep_layers(keep);
+        }
+        let _ = keep;
+    }
+
+    /// The layers it keeps on the card let go: whether it had any.
+    fn let_go_layers(&mut self) -> bool {
+        match self {
+            #[cfg(feature = "webgpu")]
+            Encoder::Wgpu(e) => e.let_go_layers(),
+            _ => false,
+        }
+    }
+}
+
+/// The VAE's decoder on its device: Candle's or the WebGPU chain's.
+enum Decoder {
+    Candle(Vae),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::qwen_image::webgpu::vae::WgpuVae),
+}
+
+impl Decoder {
+    /// The picture of `latent` (`[1, h w, 64]`): `[1, 4, 16 h, 16 w]`.
+    fn decode(&self, latent: &Tensor, h: usize, w: usize) -> Result<Tensor> {
+        match self {
+            Decoder::Candle(v) => v.decode(latent, h, w),
+            #[cfg(feature = "webgpu")]
+            Decoder::Wgpu(v) => v.decode(latent, h, w),
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    fn backend(&self) -> Option<&ggml_rs_wgpu::WgpuBackend> {
+        match self {
+            Decoder::Wgpu(v) => Some(v.backend()),
+            _ => None,
+        }
+    }
+}
+
+/// A prompt's conditioning, as its model made it.
+enum Prefix {
+    Candle(crate::qwen_image::transformer::Prefix),
+    #[cfg(feature = "webgpu")]
+    Wgpu(crate::qwen_image::webgpu::transformer::WgpuPrefix),
+}
+
+impl Model {
+    fn prepare(&mut self, text: &crate::qwen_image::text::Conditioning, refs: &[(Tensor, usize, usize)]) -> Result<Prefix> {
+        match self {
+            Model::Candle(m) => m.prepare(text, refs).map(Prefix::Candle),
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(m) => m.prepare(text, refs).map(Prefix::Wgpu),
+        }
+    }
+
+    /// The velocity at `sigma`, on `latent`'s device and in its dtype.
+    fn conditioned(&mut self, latent: &Tensor, prefix: &Prefix, sigma: f64, h: usize, w: usize) -> Result<Tensor> {
+        match (self, prefix) {
+            (Model::Candle(m), Prefix::Candle(p)) => m.conditioned(latent, p, sigma, h, w),
+            #[cfg(feature = "webgpu")]
+            (Model::Wgpu(m), Prefix::Wgpu(p)) => m.conditioned(latent, p, sigma, h, w)?.to_device(latent.device())?.to_dtype(latent.dtype()),
+            #[cfg(feature = "webgpu")]
+            _ => candle_core::bail!("a prompt's conditioning from another model"),
+        }
+    }
+
+    /// Let go of what a step keeps for the next (the VAE's decode wants the room).
+    fn release_scratch(&mut self) {
+        match self {
+            Model::Candle(_) => {}
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(m) => m.release_scratch(),
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    fn backend(&self) -> Option<&ggml_rs_wgpu::WgpuBackend> {
+        match self {
+            Model::Wgpu(m) => Some(m.backend()),
+            _ => None,
+        }
+    }
+
+    fn lora_notes(&self) -> &[String] {
+        match self {
+            Model::Candle(m) => m.lora_notes(),
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(m) => m.lora_notes(),
+        }
+    }
+
+    fn residency(&self) -> Json {
+        match self {
+            Model::Candle(m) => m.residency(),
+            #[cfg(feature = "webgpu")]
+            Model::Wgpu(_) => Json::obj([("device", Json::str("webgpu"))]),
+        }
+    }
+}
+
+
+
+/// Prompt encoding and diffusion are sequential to bound peak VRAM. All images
+/// in a batch reuse one transformer and VAE; completed images survive failure.
+/// What a worker that takes job after job (`oaiy-media --serve`) keeps of a Qwen Image job's models for the next one
+/// that names the same files: its text encoder, its transformer and its VAE's decoder, each loaded once (on an eGPU's
+/// card, 5 s of a picture's 14). WebGPU's alone: a job on the CPU lets each go as soon as it is done, as a job in a
+/// process of its own does.
+#[derive(Default)]
+pub struct Kept {
+    encoder: Option<(String, Encoder)>,
+    model: Option<(String, Model)>,
+    decoder: Option<(String, Decoder)>,
+}
+
+impl Kept {
+    /// What it holds, by its keys (for the worker's log).
+    pub fn holds(&self) -> Vec<&str> {
+        [self.encoder.as_ref().map(|_| "text encoder"), self.model.as_ref().map(|_| "transformer"), self.decoder.as_ref().map(|_| "decoder")].into_iter().flatten().collect()
+    }
+}
+
+/// Where a job's reference images are seen from: its `vision` named, else its text encoder (the checkpoint's folder,
+/// whose `model.visual` is the vision tower), else, for a text encoder that is a GGUF of the language model alone (Qwen's
+/// `Qwen3VL-8B-Instruct-Q4_K_M.gguf`), an mmproj GGUF beside it or beside the file a link to it names (Qwen's
+/// `mmproj-Qwen3VL-8B-Instruct-F16.gguf`, the first by name where there are more), else the base checkpoint's own
+/// text encoder where its weights are there (Qwen Image's release: Qwen3-VL whole, its tower in `model.visual`).
+fn vision_root(r: &Request) -> Result<PathBuf> {
+    if let Some(v) = &r.vision {
+        return Ok(v.clone());
+    }
+    let text = r.text_encoder.clone().unwrap_or_else(|| r.base.join("text_encoder"));
+    if !text.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) || crate::common::weights::Weights::open(&text).is_ok_and(|w| w.has("model.visual.patch_embed.proj.bias")) {
+        return Ok(text);
+    }
+    let folders = [text.parent().map(Path::to_path_buf), std::fs::canonicalize(&text).ok().and_then(|t| t.parent().map(Path::to_path_buf))];
+    let mut found: Vec<PathBuf> = folders
+        .into_iter()
+        .flatten()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.to_ascii_lowercase().starts_with("mmproj") && f.to_ascii_lowercase().ends_with(".gguf")))
+        .collect();
+    found.sort();
+    if let Some(mmproj) = found.into_iter().next() {
+        return Ok(mmproj);
+    }
+    let own = r.base.join("text_encoder");
+    if crate::common::weights::Weights::open(&own).is_ok_and(|w| w.has("model.visual.patch_embed.proj.bias")) {
+        return Ok(own);
+    }
+    Err(candle_core::Error::Msg(format!(
+        "a reference image needs Qwen3-VL's vision tower, which the text encoder {} (a GGUF of its language model) has not, nor has the base's {}: put Qwen's mmproj-Qwen3VL-8B-Instruct-F16.gguf (Qwen/Qwen3-VL-8B-Instruct-GGUF) beside it, or name as the model's vision that file or a Qwen3-VL checkpoint's folder (Qwen Image's own text_encoder, with its model.visual weights)",
+        text.display(),
+        own.display()
+    )))
+}
+
+/// OAIY_MEDIA_MEMORY: how long `what` took since `began` said.
+fn say_time(what: &str, began: Instant) {
+    if std::env::var_os("OAIY_MEDIA_MEMORY").is_some() {
+        eprintln!("{what} in {:.2} s", began.elapsed().as_secs_f64());
+    }
+}
+
+/// OAIY_MEDIA_MEMORY: the card's memory this process uses at `stage` said (Vulkan's budget and use).
+#[cfg(feature = "webgpu")]
+fn say_memory(stage: &str, gpu: Option<&ggml_rs_wgpu::WgpuBackend>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("OAIY_MEDIA_MEMORY").is_some()) {
+        if let Some((budget, used)) = gpu.and_then(|g| g.memory_budget()) {
+            eprintln!("memory at {stage}: {:.2} GB used of {:.2}", used as f64 / 1e9, budget as f64 / 1e9);
+        }
+    }
+}
+
+/// What a picture's work takes of the card past the models a kept worker holds (on an NVIDIA A2, a 1024x1024
+/// picture's: its steps' vectors 2.1 GB; its VAE decode's 5.5 GB whole, which goes a band of rows at a time to fit what
+/// the card has free, so some quarter of it), by its latent's tokens and its pixels, with room to spare; what a kept
+/// worker holds that the job does not use then is let go where the card has less ([`generate_kept`]).
+const SAMPLING_BYTES_A_TOKEN: u64 = 640 << 10;
+/// What a prefix position (a text token, a reference's latent token) takes for the steps: its keys and values in each
+/// of the 32 blocks (1 MB), and the vectors that make them.
+const PREFIX_BYTES_A_POSITION: u64 = 1400 << 10;
+const DECODE_BYTES_A_PIXEL: u64 = 1500;
+const ROOM_TO_SPARE: u64 = 768 << 20;
+
+/// The card's memory this process may still take (its budget less its use, Vulkan's): None where the API does not say.
+#[cfg(feature = "webgpu")]
+fn free_on(gpu: Option<&ggml_rs_wgpu::WgpuBackend>) -> Option<u64> {
+    gpu.and_then(|g| g.memory_budget()).map(|(budget, used)| budget.saturating_sub(used))
+}
+
+/// `r`'s pictures, each model loaded for it and let go as soon as it is done.
+pub fn generate(r: &Request, event: impl FnMut(Json)) -> Result<Json> {
+    generate_kept(r, None, event)
+}
+
+/// [`generate`], with `kept` the models a worker keeps from job to job: those it has for `r` used as they are, the
+/// others loaded (what it had of them let go first), and all kept for the next job.
+pub fn generate_kept(r: &Request, mut kept: Option<&mut Kept>, mut event: impl FnMut(Json)) -> Result<Json> {
+    r.validate().map_err(candle_core::Error::Msg)?;
+    // (WebGPU's models alone are kept)
+    if !r.webgpu {
+        kept = None;
+    }
+    let keys = (
+        format!("{:?}|{:?}|{}", r.base, r.text_encoder, r.device),
+        format!("{:?}|{:?}|{:?}|{}", r.transformer, r.adapter, r.loras, r.device),
+        format!("{:?}|{}", r.base, r.device),
+    );
+    let dev = Device::Cpu;
+    let dtype = if dev.is_cuda() {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    std::fs::create_dir_all(&r.output)?;
+    let id = format!(
+        "batch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(candle_core::Error::wrap)?
+            .as_nanos()
+    );
+    let out = r.output.join(id);
+    std::fs::create_dir(&out)?;
+    let mut manifest = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(out.join("manifest.jsonl"))?;
+    let t = Instant::now();
+    let mut references = Vec::new();
+    let mut features = Vec::new();
+    if !r.images.is_empty() {
+        event(Json::obj([("stage", Json::str("encoding_references"))]));
+        let images = r
+            .images
+            .iter()
+            .map(|p| Reference::load(p, r.reference_size))
+            .collect::<Result<Vec<_>>>()?;
+        // their latents by the VAE's encoder on WebGPU for a WebGPU job (on the CPU it took 15 s a 1024x1024 one)
+        #[cfg(feature = "webgpu")]
+        if r.webgpu {
+            let began = Instant::now();
+            let encoder = crate::qwen_image::webgpu::vae::WgpuVae::load_encoder(&r.base, r.device)?;
+            for image in &images {
+                references.push((encoder.encode(&image.pixels(&Device::Cpu, DType::F32)?)?, image.h / 16, image.w / 16));
+            }
+            say_time("the references' latents", began);
+        }
+        if references.is_empty() {
+            let encoder = Vae::load_encoder(&r.base, &dev, dtype)?;
+            for image in &images {
+                references.push((
+                    encoder.encode(&image.pixels(&dev, dtype)?)?,
+                    image.h / 16,
+                    image.w / 16,
+                ));
+            }
+        }
+        let root = vision_root(r)?;
+        // the vision tower on WebGPU for a WebGPU job (on the CPU it took 45 s a 1024x1024 reference)
+        #[cfg(feature = "webgpu")]
+        if r.webgpu {
+            let began = Instant::now();
+            let vision = crate::qwen_image::webgpu::vision::WgpuVisionEncoder::load(&root, r.device)?;
+            say_time("the vision tower loaded", began);
+            for image in &images {
+                features.push(vision.encode(image)?);
+            }
+            say_time("the references' vision features", began);
+        }
+        if features.is_empty() {
+            let vision = VisionEncoder::load(&root, &dev, dtype)?;
+            for image in &images {
+                features.push(vision.encode(image)?);
+            }
+        }
+    }
+    dev.synchronize()?;
+    let reference_encoding_seconds = t.elapsed().as_secs_f64();
+    event(Json::obj([("stage", Json::str("loading_text_encoder"))]));
+    let text_load_start = Instant::now();
+    let had = kept.as_mut().and_then(|k| k.encoder.take()).filter(|(k, _)| *k == keys.0).map(|(_, e)| e);
+    #[cfg(feature = "webgpu")]
+    let mut encoder = match had {
+        Some(e) => e,
+        None if r.webgpu => Encoder::Wgpu(crate::qwen_image::webgpu::text::WgpuTextEncoder::load(&r.base, r.text_encoder.as_deref(), r.device)?),
+        None => Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?),
+    };
+    #[cfg(not(feature = "webgpu"))]
+    let mut encoder = match had {
+        Some(e) => e,
+        None => Encoder::Candle(TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?),
+    };
+    encoder.keep_layers(kept.is_some());
+    dev.synchronize()?;
+    let text_load_seconds = text_load_start.elapsed().as_secs_f64();
+    let encoding_start = Instant::now();
+    // every prompt (and CFG's blank negative last) at once: WebGPU's encoder reads its weights once for them all
+    let mut texts: Vec<&str> = r.prompts.iter().map(String::as_str).collect();
+    if r.cfg > 1. {
+        texts.push(" ");
+    }
+    let mut embeddings = encoder.encode_all(&texts, &features)?;
+    let negative = if r.cfg > 1. { embeddings.pop() } else { None };
+    for i in 0..embeddings.len() {
+        event(Json::obj([
+            ("stage", Json::str("encoding")),
+            ("completed", Json::Int((i + 1) as i64)),
+        ]));
+    }
+    let text_residency = encoder.residency();
+    #[cfg(feature = "webgpu")]
+    say_memory("encoded", encoder.backend());
+    match kept.as_mut() {
+        Some(k) => {
+            // (its scratch let go: the transformer's steps want the room)
+            #[cfg(feature = "webgpu")]
+            if let Some(gpu) = encoder.backend() {
+                gpu.release_cached();
+            }
+            k.encoder = Some((keys.0.clone(), encoder));
+        }
+        None => drop(encoder),
+    }
+    drop(features);
+    dev.synchronize()?;
+    let encoding_seconds = encoding_start.elapsed().as_secs_f64();
+    event(Json::obj([("stage", Json::str("loading_transformer"))]));
+    let load_start = Instant::now();
+    let progress = |n: usize| {
+        event(Json::obj([
+            ("stage", Json::str("loading_transformer")),
+            ("block", Json::Int(n as i64)),
+            ("blocks", Json::Int(32)),
+        ]))
+    };
+    let had = kept.as_mut().and_then(|k| k.model.take()).filter(|(k, _)| *k == keys.1).map(|(_, m)| m);
+    #[cfg(feature = "webgpu")]
+    let mut model = match had {
+        Some(m) => m,
+        None if r.webgpu => Model::Wgpu(crate::qwen_image::webgpu::transformer::WgpuTransformer::load(&r.transformer, r.device, r.adapter.as_deref(), &r.loras, progress)?),
+        None => Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?),
+    };
+    #[cfg(not(feature = "webgpu"))]
+    let mut model = match had {
+        Some(m) => m,
+        None => Model::Candle(Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, progress)?),
+    };
+    dev.synchronize()?;
+    let transformer_load_seconds = load_start.elapsed().as_secs_f64();
+    #[cfg(feature = "webgpu")]
+    say_memory("transformer loaded", model.backend());
+    for note in model.lora_notes() {
+        event(Json::obj([("stage", Json::str("lora_note")), ("note", Json::str(note))]));
+    }
+    let (h, w) = (r.height / 16, r.width / 16);
+    // (a kept VAE decoder let go where the steps want its room)
+    #[cfg(feature = "webgpu")]
+    if let Some(k) = kept.as_mut() {
+        // (and its prefix: the text's tokens and its references' latents, each position's keys and values in every
+        // block and the vectors that make them: a 1024x1024 reference's 4,096 positions 5.5 GB)
+        let prefix: usize = embeddings.iter().map(|e| e.states.dim(1).unwrap_or(0)).max().unwrap_or(0) + references.iter().map(|(_, h, w)| h * w).sum::<usize>();
+        let need = (h * w) as u64 * SAMPLING_BYTES_A_TOKEN + prefix as u64 * PREFIX_BYTES_A_POSITION + ROOM_TO_SPARE;
+        let short = |model: &Model| free_on(model.backend()).is_some_and(|free| free < need);
+        if short(&model) && k.encoder.as_mut().is_some_and(|(_, e)| e.let_go_layers()) {
+            eprintln!("the text encoder's kept layers let go: a {}x{} picture's steps want their room", r.width, r.height);
+            say_memory("the encoder's layers let go", model.backend());
+        }
+        if k.decoder.is_some() && short(&model) {
+            k.decoder = None;
+            eprintln!("the kept VAE decoder let go: a {}x{} picture's steps want its room", r.width, r.height);
+            say_memory("the decoder let go", model.backend());
+        }
+    }
+    let sigmas = r.sigmas().map_err(candle_core::Error::Msg)?;
+    let mut files = Vec::new();
+    let mut prefix = None;
+    let negative_prefix = negative
+        .as_ref()
+        .map(|n| model.prepare(n, &references))
+        .transpose()?;
+    // Candle's: the decoder loaded first and each picture decoded once sampled (completed pictures survive a later
+    // failure). WebGPU's: every picture sampled first, the transformer let go, only then the decoder loaded (one device
+    // on the card through the heavy work: a second's had slowed steps) and the pictures decoded, those sampled before a
+    // failure too.
+    let mut vae = None;
+    let mut vae_load_seconds = 0.;
+    if !r.webgpu {
+        event(Json::obj([("stage", Json::str("loading_vae"))]));
+        let load_start = Instant::now();
+        vae = Some(Decoder::Candle(Vae::load(&r.base, &dev, dtype)?));
+        dev.synchronize()?;
+        vae_load_seconds = load_start.elapsed().as_secs_f64();
+    }
+    let mut sampled = Vec::with_capacity(r.count);
+    let mut failure = None;
+    for i in 0..r.count {
+        let picture = (|| -> Result<Sampled> {
+            if prefix.is_none() || embeddings.len() > 1 {
+                drop(prefix.take());
+                event(Json::obj([("stage", Json::str("preparing_conditioning"))]));
+                prefix = Some(model.prepare(&embeddings[if embeddings.len() == 1 { 0 } else { i }], &references)?);
+            }
+            let image_start = Instant::now();
+            let pi = if embeddings.len() == 1 { 0 } else { i };
+            let seed = r.seed + i as u64;
+            let mut latent = Tensor::from_vec(noise(seed, h * w * 64), (1, h * w, 64), &dev)?.to_dtype(dtype)?;
+            for (step, pair) in sigmas.windows(2).enumerate() {
+                let step_start = Instant::now();
+                let mut velocity = model.conditioned(&latent, prefix.as_ref().unwrap(), pair[0], h, w)?;
+                if let Some(neg) = &negative_prefix {
+                    let uncond = model.conditioned(&latent, neg, pair[0], h, w)?;
+                    velocity = (&uncond + ((velocity - &uncond)? * r.cfg)?)?;
+                }
+                latent = (latent.to_dtype(DType::F32)? + (velocity.to_dtype(DType::F32)? * (pair[1] - pair[0]))?)?.to_dtype(dtype)?;
+                dev.synchronize()?;
+                #[cfg(feature = "webgpu")]
+                if step == 0 {
+                    say_memory("a step", model.backend());
+                }
+                event(Json::obj([
+                    ("stage", Json::str("sampling")),
+                    ("image", Json::Int((i + 1) as i64)),
+                    ("step", Json::Int((step + 1) as i64)),
+                    ("steps", Json::Int(r.steps as i64)),
+                    ("seconds", Json::Num(step_start.elapsed().as_secs_f64())),
+                ]));
+            }
+            Ok(Sampled { i, pi, seed, latent, sampling_seconds: image_start.elapsed().as_secs_f64(), image_start })
+        })();
+        match (picture, &vae) {
+            (Ok(p), Some(v)) => {
+                model.release_scratch();
+                save_picture(r, &out, &mut manifest, &mut files, &mut event, v, p, h, w)?;
+            }
+            (Ok(p), None) => sampled.push(p),
+            (Err(e), _) if !sampled.is_empty() => {
+                failure = Some(e);
+                break;
+            }
+            (Err(e), _) => return Err(e),
+        }
+    }
+    let transformer_residency = model.residency();
+    drop(prefix);
+    drop(negative_prefix);
+    model.release_scratch();
+    match kept.as_mut() {
+        Some(k) => k.model = Some((keys.1.clone(), model)),
+        None => drop(model),
+    }
+    if !sampled.is_empty() {
+        // (the kept transformer let go where the decode wants its room, as a job that keeps nothing lets it go)
+        #[cfg(feature = "webgpu")]
+        if let Some(k) = kept.as_mut() {
+            let weights = if k.decoder.as_ref().is_some_and(|(key, _)| *key == keys.2) { 0 } else { 1 << 30 };
+            let need = (r.width * r.height) as u64 * DECODE_BYTES_A_PIXEL + weights + ROOM_TO_SPARE;
+            let short = |k: &Kept| {
+                let gpu = k.model.as_ref().and_then(|(_, m)| m.backend()).or_else(|| k.encoder.as_ref().and_then(|(_, e)| e.backend()));
+                free_on(gpu).is_some_and(|free| free < need)
+            };
+            if short(k) && k.encoder.as_mut().is_some_and(|(_, e)| e.let_go_layers()) {
+                eprintln!("the text encoder's kept layers let go: a {}x{} picture's decode wants their room", r.width, r.height);
+            }
+            if k.model.is_some() && short(k) {
+                k.model = None;
+                eprintln!("the kept transformer let go: a {}x{} picture's decode wants its room", r.width, r.height);
+            }
+        }
+        event(Json::obj([("stage", Json::str("loading_vae"))]));
+        let load_start = Instant::now();
+        let had = kept.as_mut().and_then(|k| k.decoder.take()).filter(|(k, _)| *k == keys.2).map(|(_, d)| d);
+        #[cfg(feature = "webgpu")]
+        let decoder = match had {
+            Some(d) => d,
+            None if r.webgpu => Decoder::Wgpu(crate::qwen_image::webgpu::vae::WgpuVae::load(&r.base, r.device)?),
+            None => Decoder::Candle(Vae::load(&r.base, &dev, dtype)?),
+        };
+        #[cfg(not(feature = "webgpu"))]
+        let decoder = match had {
+            Some(d) => d,
+            None => Decoder::Candle(Vae::load(&r.base, &dev, dtype)?),
+        };
+        dev.synchronize()?;
+        vae_load_seconds = load_start.elapsed().as_secs_f64();
+        #[cfg(feature = "webgpu")]
+        say_memory("decoder loaded", decoder.backend());
+        for p in sampled {
+            save_picture(r, &out, &mut manifest, &mut files, &mut event, &decoder, p, h, w)?;
+        }
+        #[cfg(feature = "webgpu")]
+        say_memory("decoded", decoder.backend());
+        if let Some(k) = kept.as_mut() {
+            // (its scratch let go: 2.4 GB after a 1024x1024 picture, the next picture's steps' room)
+            #[cfg(feature = "webgpu")]
+            if let Some(gpu) = decoder.backend() {
+                gpu.release_cached();
+            }
+            k.decoder = Some((keys.2.clone(), decoder));
+        }
+    }
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    Ok(Json::obj([
+        ("data", Json::Arr(files)),
+        ("output_dir", Json::str(out.to_string_lossy())),
+        ("seconds", Json::Num(t.elapsed().as_secs_f64())),
+        ("text_load_seconds", Json::Num(text_load_seconds)),
+        ("encoding_seconds", Json::Num(encoding_seconds)),
+        (
+            "reference_encoding_seconds",
+            Json::Num(reference_encoding_seconds),
+        ),
+        (
+            "transformer_load_seconds",
+            Json::Num(transformer_load_seconds),
+        ),
+        ("vae_load_seconds", Json::Num(vae_load_seconds)),
+        (
+            "residency",
+            Json::obj([
+                ("budget", r.budget.to_json()),
+                ("transformer", transformer_residency),
+                ("text_encoder", text_residency),
+            ]),
+        ),
+    ]))
+}
+/// A sampled picture's latent, before its decode.
+struct Sampled {
+    i: usize,
+    /// Its prompt's index.
+    pi: usize,
+    seed: u64,
+    latent: Tensor,
+    sampling_seconds: f64,
+    image_start: Instant,
+}
+
+/// `p`'s picture: decoded by `vae`, saved as a PNG, its record in the batch's manifest, announced and listed.
+#[allow(clippy::too_many_arguments)]
+fn save_picture(r: &Request, out: &Path, manifest: &mut File, files: &mut Vec<Json>, event: &mut impl FnMut(Json), vae: &Decoder, p: Sampled, h: usize, w: usize) -> Result<()> {
+    let Sampled { i, pi, seed, latent, sampling_seconds, image_start } = p;
+    let decode_start = Instant::now();
+    let rgba = vae.decode(&latent, h, w)?.to_dtype(DType::F32)?.squeeze(0)?.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let save_start = Instant::now();
+    if rgba.iter().any(|x| !x.is_finite()) {
+        candle_core::bail!("non-finite VAE output for image {}", i + 1);
+    }
+    let bytes: Vec<u8> = rgba.into_iter().map(|x| ((x.clamp(-1., 1.) + 1.) * 127.5).round() as u8).collect();
+    let path = out.join(format!("image-{:04}.png", i + 1));
+    save_png(&path, &bytes, r.width as u32, r.height as u32)?;
+    let record = Json::obj([
+        ("path", Json::str(path.to_string_lossy())),
+        ("seed", Json::Int(seed as i64)),
+        ("prompt", Json::str(&r.prompts[pi])),
+        ("images", Json::Arr(r.images.iter().map(|p| Json::str(p.to_string_lossy())).collect())),
+        ("steps", Json::Int(r.steps as i64)),
+        ("sampling_seconds", Json::Num(sampling_seconds)),
+        ("decode_seconds", Json::Num(decode_seconds)),
+        ("save_seconds", Json::Num(save_start.elapsed().as_secs_f64())),
+        ("image_seconds", Json::Num(image_start.elapsed().as_secs_f64())),
+        ("transformer", Json::str(r.transformer.to_string_lossy())),
+        ("text_encoder", Json::str(r.text_encoder.clone().unwrap_or_else(|| r.base.join("text_encoder")).to_string_lossy())),
+        ("model", r.model.as_ref().map(Json::str).unwrap_or(Json::Null)),
+        ("adapter", r.adapter.as_ref().map_or(Json::Null, |p| Json::str(p.to_string_lossy()))),
+        ("distilled", Json::Bool(r.distilled)),
+        ("loras", Json::Arr(r.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect())),
+    ]);
+    writeln!(manifest, "{}", record.to_json())?;
+    manifest.flush()?;
+    event(Json::obj([
+        ("stage", Json::str("image_saved")),
+        ("image", Json::Int((i + 1) as i64)),
+        ("path", Json::str(path.to_string_lossy())),
+        ("sampling_seconds", Json::Num(sampling_seconds)),
+        ("decode_seconds", Json::Num(decode_seconds)),
+        ("image_seconds", Json::Num(image_start.elapsed().as_secs_f64())),
+    ]));
+    files.push(Json::obj([("path", Json::str(path.to_string_lossy())), ("seed", Json::Int(seed as i64)), ("steps", Json::Int(r.steps as i64))]));
+    Ok(())
+}
+
+fn save_png(path: &Path, bytes: &[u8], width: u32, height: u32) -> Result<()> {
+    use image::ImageEncoder;
+    let file = File::options().create_new(true).write(true).open(path)?;
+    image::codecs::png::PngEncoder::new(file)
+        .write_image(bytes, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(candle_core::Error::wrap)
+}
+
+
+#[test]
+fn a_gguf_text_encoder_sees_through_the_base_checkpoints_tower() {
+    // (the temp folder as the search finds it: a Mac's /var is /private/var)
+    let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("oaiy-image-vision-{}", std::process::id()));
+    let (base, models) = (dir.join("base"), dir.join("models"));
+    std::fs::create_dir_all(base.join("text_encoder")).unwrap();
+    std::fs::create_dir_all(&models).unwrap();
+    // a GGUF of the language model alone (never read: it is not one), nothing beside it
+    let encoder = models.join("encoder.gguf");
+    std::fs::write(&encoder, b"not read").unwrap();
+    std::fs::write(models.join("transformer.gguf"), b"not read").unwrap();
+    let request = |base: &Path| {
+        let j = Json::obj([
+            ("prompt", Json::str("a lighthouse")),
+            ("base", Json::str(base.to_string_lossy())),
+            ("transformer", Json::str(models.join("transformer.gguf").to_string_lossy())),
+            ("text_encoder", Json::str(encoder.to_string_lossy())),
+            ("output_dir", Json::str(dir.join("out").to_string_lossy())),
+        ]);
+        Request::parse(&j).unwrap()
+    };
+    // a base whose text encoder is its config alone (the catalog's): nowhere to see from, and the error says where
+    std::fs::write(base.join("text_encoder/config.json"), b"{}").unwrap();
+    let said = vision_root(&request(&base)).unwrap_err().to_string();
+    assert!(said.contains("mmproj-Qwen3VL-8B-Instruct-F16.gguf") && said.contains("Qwen3-VL checkpoint's folder"), "{said}");
+    // the release's text encoder whole: its tower is the vision
+    let header = r#"{"model.visual.patch_embed.proj.bias":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header.as_bytes());
+    bytes.extend(0f32.to_le_bytes());
+    std::fs::write(base.join("text_encoder/model.safetensors"), bytes).unwrap();
+    assert_eq!(vision_root(&request(&base)).unwrap(), base.join("text_encoder"));
+    // an mmproj beside the GGUF comes first, and a named vision before either
+    std::fs::write(models.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf"), b"").unwrap();
+    assert_eq!(vision_root(&request(&base)).unwrap(), models.join("mmproj-Qwen3VL-8B-Instruct-F16.gguf"));
+    let mut named = request(&base);
+    named.vision = Some(dir.join("elsewhere"));
+    assert_eq!(vision_root(&named).unwrap(), dir.join("elsewhere"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

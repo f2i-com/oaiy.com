@@ -1,75 +1,26 @@
 //! Qwen Image generation/editing and LTX video in Rust on Candle tensor primitives.
 //! No Python process, C++ diffusion runtime, or model-format conversion.
+//!
+//! One module a model family, each with its WebGPU parts in its own `webgpu` module (built with the `webgpu`
+//! feature), and what they share in [`common`].
 #![forbid(unsafe_code)]
 
-pub mod math;
-pub mod pipeline;
-pub mod reference;
-pub mod residency;
-pub mod schedule;
-pub mod text;
-pub mod transformer;
-#[cfg(feature = "webgpu")]
-pub mod wgpu_weights;
-#[cfg(feature = "webgpu")]
-pub mod qwen_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod klein_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod klein_text_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod flux3_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod vae_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod text_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod vision_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod ltx_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod ltx_vae_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod ltx_dvae_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod ltx_text_wgpu;
-pub mod vae;
-pub mod vision;
-pub mod weights;
-pub mod lora;
-mod comfy_quant;
-pub mod ltx;
-pub mod sdxl;
-#[cfg(feature = "webgpu")]
-pub mod sdxl_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod sdxl_vae_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod sdxl_clip_wgpu;
-pub mod music;
-pub mod tts;
-pub mod sound;
-#[cfg(feature = "webgpu")]
-pub mod sound_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod tts_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod qwen3_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod codec_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod music_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod music_lm_wgpu;
-#[cfg(feature = "webgpu")]
-pub mod model3d_wgpu;
-pub mod model3d;
-pub mod birefnet;
-#[cfg(feature = "webgpu")]
-pub mod birefnet_wgpu;
-pub mod esrgan;
-#[cfg(feature = "webgpu")]
-pub mod esrgan_wgpu;
-pub mod picture;
-pub mod klein;
+pub mod common;
+
+// Pictures.
 pub mod flux3;
+pub mod klein;
+pub mod picture;
+pub mod qwen_image;
+pub mod sdxl;
+
+// Video.
+pub mod ltx;
+
+// Sound: songs, speech, sound effects.
+pub mod music;
+pub mod sound;
+pub mod tts;
+
+// 3D models.
+pub mod model3d;

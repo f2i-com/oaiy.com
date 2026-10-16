@@ -17,7 +17,7 @@
 //! (as the official pipeline loads it) or F32, block by block from wherever
 //! the memory budget put it.
 use crate::ltx::store::Store;
-use crate::residency::{Budget, Resident, Tiered};
+use crate::common::residency::{Budget, Resident, Tiered};
 use candle_core::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::path::Path;

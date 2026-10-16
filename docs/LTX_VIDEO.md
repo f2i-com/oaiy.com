@@ -158,7 +158,7 @@ available in the linked repositories.
 
 LTX 2.5 releases ship a video VAE whose decoder is a diffusion model of its own
 (`CausalDiffusionVAE`, decoder `NADiffusionDecoder`). On WebGPU the worker runs it
-as Lightricks' `DiffusionVideoDecoder` does (`crates/oaiy-media/src/ltx_dvae_wgpu.rs`):
+as Lightricks' `DiffusionVideoDecoder` does (`crates/oaiy-media/src/ltx/webgpu/dvae.rs`):
 
 * Four deterministic stages of neighborhood-attention blocks (3D windows of
   3x7x7, 3x7x7, 3x5x5 and 3x5x5, NATTEN's: centred and shifted inward at the
@@ -182,7 +182,7 @@ Checked against the reference (ltx-core at `be6d6d0`, PyTorch on the CPU in f32)
 with the release's VAE: a 3x8x8 latent's stages and its 17x256x256 clip from the
 reference's own noise agree to a cosine of 1.000000 (the worst pixel 8e-6 off),
 and so do the reference's tiled decodes, 9 tiles of a 17x384x384 clip and 3 of an
-89x224x224 one (`ltx_dvae_wgpu::tests`, the golden tensors through
+89x224x224 one (`ltx::webgpu::dvae::tests`, the golden tensors through
 `OAIY_LTX_DVAE_GOLDEN` and `OAIY_LTX_DVAE_TILED`). The CPU path refuses it with a
 message naming the conv VAE.
 

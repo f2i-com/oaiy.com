@@ -172,7 +172,7 @@ impl Request {
             };
             usize::try_from(v).map_err(|_| format!("{k} must be nonnegative"))
         };
-        let webgpu = crate::pipeline::backend_is_webgpu(j, "video")?;
+        let webgpu = crate::common::job::backend_is_webgpu(j, "video")?;
         let r = Self {
             model: s("model")?,
             transformer: s("transformer")?.into(),
