@@ -148,7 +148,7 @@ impl Experts for QuantMoeCpu {
     }
 }
 
-/// The experts of `data` on the host, the reference: [`crate::quant_host::quant_experts_host`] is what a model runs.
+/// The experts of `data` on the host, the reference: [`crate::quant::host::quant_experts_host`] is what a model runs.
 pub fn quant_experts_cpu(data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
     data.validate()?;
     Ok(Box::new(QuantMoeCpu { data }))

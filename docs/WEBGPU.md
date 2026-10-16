@@ -286,7 +286,7 @@ kernels are written for a tile's rate (`exl3-mm-48` and so on: a lane shifts its
 to its first code once a tile and each code is a shift by a constant, its value a read
 of a table the workgroup makes), which took a decode step's 400 matrices from 21.9 ms
 to 10.2. Its PEFT adapters run beside the projections they adapt
-(`quant_linear::LowRank`), and its vision tower is chained too (a new picture answered
+(`quant::linear::LowRank`), and its vision tower is chained too (a new picture answered
 in 2.4 s; a picture prompt takes positions in three axes).
 
 ## Qwen3.8-Flash-Next
@@ -336,7 +336,7 @@ zeros gives the model's own logits exactly. Until then an adapter that named an
 expert's projection stopped the model from loading on WebGPU.
 
 It also reads the GGUFs Strata runs (ISTA-DASLab's GSQ-RCO files: Q2_0 experts with
-K-quant, IQ4 and f16 matrices beside them; `quant_moe`, `quant_linear`). From the Q2_0
+K-quant, IQ4 and f16 matrices beside them; `quant::moe`, `quant::linear`). From the Q2_0
 file over two RTX 5090s (2026-10-08): a reply at 84 to 88 tokens a second, 88 to 96
 drafting with the EXL3 checkpoint's prediction layer (`--mtp-from`), a 1,960-token
 prompt in 0.50 to 0.56 s. Strata's published figure for the model on one RTX 5090
@@ -349,7 +349,7 @@ drafted rows 19.6, and a round of drafting adds some 4 ms for the drafts themsel
 The IQ2_XS file is the one Strata's figure is for. Its routed experts' gate and up
 matrices are grid types (IQ2_S in 34 layers, IQ2_XXS in 11, IQ1_M in 3; their down
 matrices Q2_0): a group of eight weights is one entry of ggml's grid, with its signs and
-a scale. `quant_moe` decodes them on the card as it does Q2_0, the grid in a storage
+a scale. `quant::moe` decodes them on the card as it does Q2_0, the grid in a storage
 buffer of the layer's, two bits a weight (as WGSL constants such tables are copied at
 each call, which once reset the driver). Before these kernels every layer's experts ran
 on the host's reference path: 0.9 tokens a second.
@@ -589,7 +589,7 @@ version of the norm had every thread add the sixteens, and the ranked selection 
 prompt's rows too; Strata's prompt was 1.6 s for it until both were put right.)
 
 On one card, which is what Strata's figure is for, this file is far from it: its
-experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant_host` reads the
+experts are 35.5 GB, so 15 of the 48 layers' run on the host (`quant::host` reads the
 grid types as they lie too: 0.27 to 0.42 ms an expert a row on one AVX-512 core, where
 the reference's dequantising took 18 ms a layer). One RTX 5090 at 400 W: a reply at 43
 to 45 tokens a second, Strata's request at 43 (no drafting there), and its 4,086-token
@@ -627,7 +627,7 @@ bus: 26.6 GB a second on an RTX 5090 with eight lanes of PCIe 5, 13.3 with four,
 the card's own memory gives 1,400 (`measure_a_matrix_in_the_hosts_memory`; the same
 sums bit for bit. A write-mappable one goes to the card's own host-visible memory,
 which is the card's room). So a card with no room for all its layers' experts holds
-the same share of each layer's (`quant_moe::Cache`: 313 of 512 on a 32 GB card, beside
+the same share of each layer's (`quant::moe::Cache`: 313 of 512 on a 32 GB card, beside
 the prediction layer), every expert's matrices are in the host's memory, and the
 experts' kernels read an expert that has no slot from there, its 1.5 MB in 57 us,
 with no word from the host between a layer's router and its experts. The kernels
@@ -722,7 +722,7 @@ the thread (2 to 3% of a reply).
 
 On one card (`--devices 0`) the file does not fit: its experts are 34 GB, and a 32 GB
 card's budget holds 34 of the 48 layers' beside the dense matrices. The other 14
-layers' routed experts run on the host between the chain's submits (`quant_host`:
+layers' routed experts run on the host between the chain's submits (`quant::host`:
 each Q2_0 matrix read as it lies in the file, 0.13 ms an expert a row on one AVX-512
 core where dequantising it whole took 18 ms a layer), their shared expert on the card.
 So one RTX 5090: a reply at 51 to 54 tokens a second, a 160-token prompt in 0.6 s
@@ -949,7 +949,7 @@ conversation about the first.
 ## Models larger than the card (2026-10-14)
 
 A weight the GPU's budget has no room for stays in the model's file, held as the
-card's (`ggml_rs_wgpu::stream`: a `WgpuQuant` with `file`), so the chained runs
+card's (`ggml_rs_wgpu::quant::stream`: a `WgpuQuant` with `file`), so the chained runs
 take a model that has some (before, they did not, and such a model ran op by op:
 Qwen3.5 9B held to a 3 GB budget read a 300-token prompt for over ten minutes).
 Each time a matmul takes such a weight the work recorded so far is sent, the feed's

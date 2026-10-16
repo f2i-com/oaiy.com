@@ -498,7 +498,7 @@ fn attention_coop_one_of(hd: usize, full: bool, tiled: bool) -> String {
 /// A diffusion's attention (every query over every position) on the tensor cores, its queries 64 a workgroup, each of
 /// its 4 subgroups their 16 rows alone (`attention_coop_rows`'s kernel before its head's width is put in): a subgroup's
 /// queries' fragments loaded once and kept, each block of 64 keys staged (its keys, then its values, one run of the
-/// cache's tiled copy, [`crate::shaders::KV_F16_TILED`]) for the 4 subgroups to read, each subgroup's scores, weights and
+/// cache's tiled copy, [`crate::quant::shaders::KV_F16_TILED`]) for the 4 subgroups to read, each subgroup's scores, weights and
 /// sums its own. [`ATTENTION_COOP_ONE`] reads a head's keys and values once a 32 queries, each subgroup's fragments
 /// straight from memory, and every query's fragments again for each block; this, once a 64, from the workgroup's
 /// memory. Its weights' reference is [`ATTENTION_COOP_ONE`]'s (a query's first block's largest score; one more than 8

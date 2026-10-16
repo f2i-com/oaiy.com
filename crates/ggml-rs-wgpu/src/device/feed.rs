@@ -1,10 +1,10 @@
 //! A device's queue: the pieces of work recordings hand it, and the thread that encodes and submits them in turn.
 
-use super::*;
+use crate::*;
 
 /// OAIY_PIECES_IN_FLIGHT's, where it is set: every device's pieces in flight at most that many, whatever was asked
 /// of it ([`WgpuBackend::pieces_in_flight_at_most`]; 0: as many as are recorded).
-pub(super) fn pieces_in_flight_asked() -> Option<usize> {
+pub(crate) fn pieces_in_flight_asked() -> Option<usize> {
     static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *ASKED.get_or_init(|| std::env::var("OAIY_PIECES_IN_FLIGHT").ok().and_then(|v| v.parse().ok()))
 }
@@ -21,7 +21,7 @@ pub(crate) enum Piece {
 
 /// What a device's feed is handed: a piece's dispatches, encoded when its turn comes, command buffers as they are,
 /// or a write of the host's into a buffer (its bytes, at an offset) made in its turn.
-pub(super) enum Fare {
+pub(crate) enum Fare {
     Dispatches(Vec<Dispatch>),
     Commands(Vec<wgpu::CommandBuffer>),
     Write(wgpu::Buffer, u64, Vec<u8>),
@@ -37,28 +37,28 @@ pub(super) enum Fare {
 /// once-only second, where 9.2, 13.9, 13.1 and 6.8). Anything else of the queue's waits for the pieces handed over
 /// first ([`Gpu::queue`]): a write is before the submissions after it.
 #[derive(Default)]
-pub(super) struct Feed {
-    pub(super) state: Mutex<Fed>,
-    pub(super) changed: std::sync::Condvar,
+pub(crate) struct Feed {
+    pub(crate) state: Mutex<Fed>,
+    pub(crate) changed: std::sync::Condvar,
 }
 
 #[derive(Default)]
-pub(super) struct Fed {
+pub(crate) struct Fed {
     /// What was handed over and is not yet submitted, in turn, each with where its submission is wanted.
-    pub(super) waiting: std::collections::VecDeque<(Fare, Arc<Mutex<Option<wgpu::SubmissionIndex>>>)>,
+    pub(crate) waiting: std::collections::VecDeque<(Fare, Arc<Mutex<Option<wgpu::SubmissionIndex>>>)>,
     /// How many were handed over, and how many of them are submitted.
-    pub(super) handed: u64,
-    pub(super) gone: u64,
+    pub(crate) handed: u64,
+    pub(crate) gone: u64,
     /// The device's thread runs (from the first piece handed over), and is to end (the device dropped).
-    pub(super) fed: bool,
-    pub(super) closed: bool,
+    pub(crate) fed: bool,
+    pub(crate) closed: bool,
     /// Why the thread stopped, if it did: a lost device, or an error of the queue's.
-    pub(super) failed: Option<String>,
+    pub(crate) failed: Option<String>,
 }
 
 /// Waits for `device`'s submission `index` (else everything submitted), a second at a time: Err once its loss has been
 /// said, or the wait itself fails.
-pub(super) fn wait_for(device: &wgpu::Device, watch: &Watch, lost: &Mutex<Option<String>>, index: Option<wgpu::SubmissionIndex>) -> Result<(), String> {
+pub(crate) fn wait_for(device: &wgpu::Device, watch: &Watch, lost: &Mutex<Option<String>>, index: Option<wgpu::SubmissionIndex>) -> Result<(), String> {
     loop {
         let polled = {
             let _watched = watch.enter();
@@ -76,7 +76,7 @@ pub(super) fn wait_for(device: &wgpu::Device, watch: &Watch, lost: &Mutex<Option
 }
 
 /// `dispatches` as one pass's command buffer.
-pub(super) fn encode(device: &wgpu::Device, dispatches: &[Dispatch]) -> wgpu::CommandBuffer {
+pub(crate) fn encode(device: &wgpu::Device, dispatches: &[Dispatch]) -> wgpu::CommandBuffer {
     let mut piece = device.create_command_encoder(&Default::default());
     {
         let mut pass = piece.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
@@ -91,7 +91,7 @@ pub(super) fn encode(device: &wgpu::Device, dispatches: &[Dispatch]) -> wgpu::Co
 
 /// OAIY_PIPELINE_LOG: a kernel's pipeline said as it is made (its shader read and its pipeline built since `began`),
 /// with the process's time: which kernels a server's first request makes, and for how long.
-pub(super) fn made(name: &str, began: std::time::Instant) {
+pub(crate) fn made(name: &str, began: std::time::Instant) {
     static ON: std::sync::OnceLock<Option<std::time::Instant>> = std::sync::OnceLock::new();
     if let Some(start) = ON.get_or_init(|| std::env::var_os("OAIY_PIPELINE_LOG").map(|_| std::time::Instant::now())) {
         eprintln!("    pipeline {name}: {:.1} ms, at {:.2} s", began.elapsed().as_secs_f64() * 1e3, start.elapsed().as_secs_f64());
@@ -101,7 +101,7 @@ pub(super) fn made(name: &str, began: std::time::Instant) {
 /// A device's [`Feed`]'s thread: what was handed over submitted in turn (a piece's dispatches encoded then), each
 /// once the device's pieces in flight are fewer than `limit` (as it is then; 0: at once). It ends with the device, or
 /// at a failure (said to whoever waits on the feed next).
-pub(super) fn feed_pieces(feed: Arc<Feed>, device: wgpu::Device, queue: wgpu::Queue, watch: Arc<Watch>, lost: Arc<Mutex<Option<String>>>, limit: Arc<std::sync::atomic::AtomicUsize>) {
+pub(crate) fn feed_pieces(feed: Arc<Feed>, device: wgpu::Device, queue: wgpu::Queue, watch: Arc<Watch>, lost: Arc<Mutex<Option<String>>>, limit: Arc<std::sync::atomic::AtomicUsize>) {
     let mut flying: std::collections::VecDeque<wgpu::SubmissionIndex> = std::collections::VecDeque::new();
     loop {
         let (fare, slot) = {

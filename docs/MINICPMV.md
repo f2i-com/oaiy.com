@@ -71,7 +71,7 @@ Its language model is Qwen3.5-MoE (`qwen35moe`, as Qwen3.6-35B-A3B's): the Qwen3
 nets, 10 gated attention layers), each with 256 routed experts of which 8 a token, softmax-weighted among themselves,
 and a shared expert by its gate's sigmoid. OAIY runs it as a Qwen3.5 model whose layers have routed experts
 (`oaiy_llm_server::llm::Qwen35Moe`, loaded by `Qwen35Model::from_gguf_with`): the experts on the GPU in their GGUF blocks
-(`ggml_rs_wgpu::quant_moe`, which now decodes Q4_K and Q6_K, a Q4_K_M file's experts), routed on the GPU, the shared
+(`ggml_rs_wgpu::quant::moe`, which now decodes Q4_K and Q6_K, a Q4_K_M file's experts), routed on the GPU, the shared
 expert among them; the router f32. Chained, a layer's FFN is its router's matmul then the experts' routed sums in the
 same submit as the rest of the step. Its weights are 21.3 GB on the GPU: a 24 GB card. A GPU without 16 x 16 tensor
 cores (a Mac's) groups no more than 64 of a prompt's rows by expert at once, and a chained run takes its prompt in

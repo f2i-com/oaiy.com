@@ -176,7 +176,7 @@ pub(crate) fn matrix(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::Wgpu
 /// are more than the card has free (Vulkan's budget less its use; f16 where it does not say). Qwen Image 2.1's
 /// transformer is 12.8 GB as f16: on an NVIDIA A2 (15.7 GB) a 512x512 picture fitted beside it and a 1024x1024 one ran
 /// out of memory. As Q8_0 it is half that, and what the budget still has no room for streams
-/// (`ggml_rs_wgpu::stream`).
+/// (`ggml_rs_wgpu::quant::stream`).
 pub(crate) fn weights_q8(gpu: &ggml_rs_wgpu::WgpuBackend, f16_bytes: u64) -> bool {
     match std::env::var("OAIY_QWEN_IMAGE_WEIGHTS").map(|v| v.to_ascii_lowercase()).as_deref() {
         Ok("f16") => return false,

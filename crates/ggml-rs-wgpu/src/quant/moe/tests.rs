@@ -1,4 +1,4 @@
-//! `quant_moe`'s tests.
+//! `quant::moe`'s tests.
 
 use super::*;
 use ggml_rs::exl3::route;

@@ -30,7 +30,7 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
         false
     }
     /// whether the device holds only some of these and reads the others from the host's memory as
-    /// it runs (`ggml_rs_wgpu::quant_moe::Cache`): a prompt's chunk then copies each expert it uses that the device
+    /// it runs (`ggml_rs_wgpu::quant::moe::Cache`): a prompt's chunk then copies each expert it uses that the device
     /// lacks, once a chunk. Not by default.
     fn part_held(&self) -> bool {
         false

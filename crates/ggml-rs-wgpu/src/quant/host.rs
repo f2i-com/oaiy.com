@@ -2,7 +2,7 @@
 //! 34 GB, a 32 GB card holds some 35 of its 48 layers'): a chain reads such a layer's router and input back, these
 //! run, and their sum goes up for the layer's write-back.
 //!
-//! [`crate::quant_moe::QuantMoeCpu`] is the reference the GPU's kernels are held against: it dequantises each expert's
+//! [`crate::quant::moe::QuantMoeCpu`] is the reference the GPU's kernels are held against: it dequantises each expert's
 //! three matrices whole to f32 for a call (20 MB an expert, 200 MB a row of ten). [`QuantMoeHost`] reads a Q2_0 matrix
 //! as it lies in the GGUF (1.4 MB an expert): a block's weights are `(code - 1) * scale`, so a row's product with `x`
 //! is, over its blocks, `scale * (sum of code * x - sum of x)`; a block's sum of `x` is made once for every row, and
@@ -19,7 +19,7 @@
 //! The shared expert is dense (20 MB of f32 a layer, cold at each step: more to read than a row's ten routed experts
 //! together), so where the layer has a GPU it stays there ([`SharedOnGpu`], 10 MB as f16): the chain records it before
 //! it reads the layer's router and input back, and the host adds its output by its gate (`Experts::forward_given`).
-use crate::quant_moe::{Dense, QuantExpertsData};
+use crate::quant::moe::{Dense, QuantExpertsData};
 use crate::WgpuBackend;
 use ggml_quants::GgmlType;
 use ggml_rs::exl3::{route, Experts, Routing};
@@ -705,13 +705,13 @@ impl Experts for QuantMoeHost {
 }
 
 /// The experts of `data` on the host for a model's use: read as they lie where they are Q2_0, or their gate and up
-/// matrices a grid type's ([`QuantMoeHost`]), else the reference ([`crate::quant_moe::QuantMoeCpu`], each expert
+/// matrices a grid type's ([`QuantMoeHost`]), else the reference ([`crate::quant::moe::QuantMoeCpu`], each expert
 /// dequantised for its call).
 pub fn quant_experts_host(data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
     data.validate()?;
     match QuantMoeHost::try_new(data, Level::detect()) {
         Ok(fast) => Ok(Box::new(fast)),
-        Err(data) => crate::quant_moe::quant_experts_cpu(data),
+        Err(data) => crate::quant::moe::quant_experts_cpu(data),
     }
 }
 
@@ -721,14 +721,14 @@ pub fn quant_experts_host_beside(b: &WgpuBackend, data: QuantExpertsData) -> Res
     data.validate()?;
     match QuantMoeHost::try_new(data, Level::detect()) {
         Ok(fast) => Ok(Box::new(fast.beside(b))),
-        Err(data) => crate::quant_moe::quant_experts_cpu(data),
+        Err(data) => crate::quant::moe::quant_experts_cpu(data),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quant_moe::tests::{copy, experts, experts_of, inputs, worst};
+    use crate::quant::moe::tests::{copy, experts, experts_of, inputs, worst};
 
     /// Every level this CPU has.
     fn levels() -> Vec<Level> {
@@ -755,7 +755,7 @@ mod tests {
             let data = experts(31 + rows as u64, hidden, ff, count, true);
             let (x, logits) = inputs(7 + hidden as u64, rows, hidden, count);
             let (xt, lt) = (Tensor::from_vec(x, vec![rows, hidden]), Tensor::from_vec(logits, vec![rows, count + 1]));
-            let want = crate::quant_moe::quant_experts_cpu(copy(&data)).unwrap().forward(&xt, &lt, top_k);
+            let want = crate::quant::moe::quant_experts_cpu(copy(&data)).unwrap().forward(&xt, &lt, top_k);
             for level in levels() {
                 let fast = QuantMoeHost::try_new(copy(&data), level).ok().expect("Q2_0 experts");
                 let got = fast.forward(&xt, &lt, top_k);
@@ -776,7 +776,7 @@ mod tests {
                 let data = experts_of(31 + rows as u64, hidden, ff, count, true, gu);
                 let (x, logits) = inputs(7 + hidden as u64, rows, hidden, count);
                 let (xt, lt) = (Tensor::from_vec(x.clone(), vec![rows, hidden]), Tensor::from_vec(logits.clone(), vec![rows, count + 1]));
-                let want = crate::quant_moe::quant_experts_cpu(copy(&data)).unwrap().forward(&xt, &lt, top_k);
+                let want = crate::quant::moe::quant_experts_cpu(copy(&data)).unwrap().forward(&xt, &lt, top_k);
                 for level in levels() {
                     let fast = QuantMoeHost::try_new(copy(&data), level).ok().expect("a grid type's experts");
                     assert_eq!(fast.grid, Grid::of(gu));
@@ -885,7 +885,7 @@ mod tests {
                 eprintln!("{level:?}: {rows} rows {best:.2} ms");
             }
         }
-        let slow = crate::quant_moe::quant_experts_cpu(data).unwrap();
+        let slow = crate::quant::moe::quant_experts_cpu(data).unwrap();
         let (x, logits) = inputs(1, 1, hidden, count);
         let t = std::time::Instant::now();
         std::hint::black_box(slow.forward(&Tensor::from_vec(x, vec![1, hidden]), &Tensor::from_vec(logits, vec![1, count + 1]), top_k));

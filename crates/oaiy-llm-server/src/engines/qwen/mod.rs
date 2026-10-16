@@ -940,7 +940,7 @@ impl QwenEngine {
         self.kv.expect = keys.len();
         let _ = job.events.send(Event::Progress { done: 0, total });
         #[cfg(feature = "webgpu")]
-        let cold_at_start = ggml_rs_wgpu::quant_moe::cached_experts();
+        let cold_at_start = ggml_rs_wgpu::quant::moe::cached_experts();
         #[cfg(feature = "webgpu")]
         let tiered_at_start = ggml_rs_wgpu::exl3::tiered_experts();
         #[cfg(feature = "webgpu")]
@@ -1071,7 +1071,7 @@ impl QwenEngine {
         // (a card holding only some of a layer's experts: what it read from the host's memory and brought in, for
         // the request's line)
         #[cfg(feature = "webgpu")]
-        let (cold_before, cold_prompt) = (cold_at_start, ggml_rs_wgpu::quant_moe::cached_experts());
+        let (cold_before, cold_prompt) = (cold_at_start, ggml_rs_wgpu::quant::moe::cached_experts());
         #[cfg(feature = "webgpu")]
         let (tiered_before, tiered_prompt) = (tiered_at_start, ggml_rs_wgpu::exl3::tiered_experts());
         #[cfg(feature = "webgpu")]
@@ -1230,7 +1230,7 @@ impl QwenEngine {
         if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s){}", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64(), if drafts_checked > 0 { format!("; {drafts_taken} of {drafts_checked} drafts taken ({checks} checks of {rows_checked} rows {t_check:.2}s, drafting {t_draft:.2}s, undoing {t_undo:.2}s)") } else { String::new() }); }
         #[cfg(feature = "webgpu")]
         if self.log {
-            let now = ggml_rs_wgpu::quant_moe::cached_experts();
+            let now = ggml_rs_wgpu::quant::moe::cached_experts();
             if now.0 > cold_before.0 {
                 eprintln!("  Qwen experts: the prompt read {} from the host's memory and brought {} to the card, the reply {} and {}", cold_prompt.0 - cold_before.0, cold_prompt.1 - cold_before.1, now.0 - cold_prompt.0, now.1 - cold_prompt.1);
             }

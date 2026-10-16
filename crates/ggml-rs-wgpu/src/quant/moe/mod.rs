@@ -16,7 +16,7 @@
 //! in whole words, its fields each on a word's edge (a 32's four index bytes one word, its signs another: the GGUF's
 //! bytes in another order, and a pad). The grid is a storage buffer of the layer's (binding 4), two bits a weight (a
 //! grid's bytes take four values at most), so a group is one load of it: as WGSL constants such tables are copied at
-//! each call, which once ran a dispatch past Windows' two seconds and reset the driver (`crate::shaders::layout`'s
+//! each call, which once ran a dispatch past Windows' two seconds and reset the driver (`crate::quant::shaders::layout`'s
 //! note).
 use crate::exl3::{coop_on, many_order, moe_rows_for, record_route, record_route_sigmoid, Step, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, WSUM_APPLY, WSUM_ROWS};
 use crate::{chunk_limit, Gpu, WgpuBackend};
@@ -549,7 +549,7 @@ impl Experts for QuantMoe {
 impl WgpuBackend {
     /// A MoE layer's experts as a GGUF holds them: on the GPU as groups ([`QuantMoe`]) where the kernels decode their
     /// types and the weight budget holds them, else on the host, their shared expert here
-    /// ([`crate::quant_host::quant_experts_host_beside`]).
+    /// ([`crate::quant::host::quant_experts_host_beside`]).
     pub fn quant_experts(&self, data: QuantExpertsData) -> Result<Box<dyn Experts>, String> {
         self.quant_experts_leaving(data, 0)
     }
@@ -561,7 +561,7 @@ impl WgpuBackend {
         data.validate()?;
         match QuantMoe::make(self, data, 0, Some(slots)) {
             Ok(g) => Ok(Box::new(g)),
-            Err(data) => crate::quant_host::quant_experts_host_beside(self, data),
+            Err(data) => crate::quant::host::quant_experts_host_beside(self, data),
         }
     }
 
@@ -570,7 +570,7 @@ impl WgpuBackend {
         data.validate()?;
         match QuantMoe::try_new(self, data, reserve) {
             Ok(g) => Ok(Box::new(g)),
-            Err(data) => crate::quant_host::quant_experts_host_beside(self, data),
+            Err(data) => crate::quant::host::quant_experts_host_beside(self, data),
         }
     }
 }

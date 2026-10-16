@@ -1923,7 +1923,7 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
     let gguf = gguf::GgufFile::open(&path).unwrap();
     let model = if matches!(gguf.get_str("general.architecture").ok(), Some("qwen35moe" | "lfm2moe")) {
         let make = |_: usize, e: crate::llm::ExpertBlocks| -> crate::llm::Result<Box<dyn ggml_rs::exl3::Experts>> {
-            let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
+            let data = ggml_rs_wgpu::quant::moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
             gpu.quant_experts(data).map_err(crate::llm::LlamaError::Config)
         };
         let mut m = crate::llm::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();
@@ -2028,7 +2028,7 @@ fn a_chained_runs_rows_are_its_devices_alone_and_come_back_where_wanted() {
     let gguf = gguf::GgufFile::open(&path).unwrap();
     let model = if matches!(gguf.get_str("general.architecture").ok(), Some("qwen35moe" | "lfm2moe")) {
         let make = |_: usize, e: crate::llm::ExpertBlocks| -> crate::llm::Result<Box<dyn ggml_rs::exl3::Experts>> {
-            let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
+            let data = ggml_rs_wgpu::quant::moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
             gpu.quant_experts(data).map_err(crate::llm::LlamaError::Config)
         };
         let mut m = crate::llm::Qwen35Model::from_gguf_with(&gguf, Arc::clone(&backend), Some(&make)).unwrap();

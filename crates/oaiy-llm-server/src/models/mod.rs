@@ -346,7 +346,7 @@ pub(crate) fn placement(name: &str, on_gpu: u64, streamed: u64, filed: u64, left
         return format!("{name}: its weights are all on the GPU ({:.1} GB)", gb(on_gpu));
     }
     // (past the GPU's share: in the host's memory for the GPU to read over the bus, else in the file and written to
-    // the GPU as they are used: `ggml_rs_wgpu::stream`)
+    // the GPU as they are used: `ggml_rs_wgpu::quant::stream`)
     if left == 0 {
         let mut parts = Vec::new();
         if streamed > 0 {
@@ -1158,7 +1158,7 @@ impl Models {
             let b = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().ok_or_else(|| Error::Arg(format!("{name}: a MoE model's experts need a GPU (WebGPU)")))?;
             let on_host = std::sync::atomic::AtomicUsize::new(0);
             let make = |_: usize, e: crate::llm::ExpertBlocks| -> crate::llm::Result<Box<dyn ggml_rs::exl3::Experts>> {
-                let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
+                let data = ggml_rs_wgpu::quant::moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
                 let made = b.quant_experts(data).map_err(crate::llm::LlamaError::Config)?;
                 if made.on_host() {
                     on_host.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1704,7 +1704,7 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
     let shares: Vec<std::sync::atomic::AtomicUsize> = gpus.iter().map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
     let experts = |device: usize, e: ExpertBlocks| -> Result<Box<dyn ggml_rs::exl3::Experts>> {
         use std::sync::atomic::Ordering::Relaxed;
-        let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: Some(e.shared), routing: ggml_rs::exl3::Routing::Softmax };
+        let data = ggml_rs_wgpu::quant::moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: Some(e.shared), routing: ggml_rs::exl3::Routing::Softmax };
         match gpus.get(device) {
             Some(b) => {
                 let shared = (3 * data.hidden * data.ff * 4) as u64;
@@ -1725,7 +1725,7 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
                         shares[device].store(slots.min(data.experts) * 1024 + data.experts.min(1023), Relaxed);
                         b.quant_experts_cached(data, slots)
                     } else {
-                        ggml_rs_wgpu::quant_host::quant_experts_host_beside(b, data)
+                        ggml_rs_wgpu::quant::host::quant_experts_host_beside(b, data)
                     }
                 } else if placed[device].fetch_add(bytes, Relaxed) + bytes <= allowance[device] {
                     // (experts the GPU's kernels do not decode, or the card had no room for after all, are the
@@ -1737,10 +1737,10 @@ pub(crate) fn flashnext_gguf_on(path: &Path, gpus: &[&ggml_rs_wgpu::WgpuBackend]
                     made
                 } else {
                     placed[device].fetch_sub(bytes, Relaxed);
-                    ggml_rs_wgpu::quant_host::quant_experts_host_beside(b, data)
+                    ggml_rs_wgpu::quant::host::quant_experts_host_beside(b, data)
                 }
             }
-            None => ggml_rs_wgpu::quant_host::quant_experts_host(data),
+            None => ggml_rs_wgpu::quant::host::quant_experts_host(data),
         }
         .map_err(Error::Arg)
     };

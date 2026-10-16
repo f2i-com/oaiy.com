@@ -1,5 +1,16 @@
 //! A quantized weight on the device: its buffers, and what `ggml-rs` asks of a device's storage.
 
+
+// The quantized matmul's WGSL.
+pub mod shaders;
+// A GGUF's matrix where a chain takes a packed projection.
+pub mod linear;
+// A MoE layer's experts as a GGUF holds them, on the card, and on the host for the layers no card has room for.
+pub mod moe;
+pub mod host;
+// Weights past the GPU's budget, sent to the card as they are used.
+pub(crate) mod stream;
+
 use super::*;
 
 /// A weight matrix on the GPU: its rows in one or more buffers.
@@ -11,10 +22,10 @@ pub(super) struct WgpuQuant {
     pub(super) row_bytes: usize,
     pub(super) nbytes: usize,
     pub(super) used: Arc<AtomicU64>,
-    /// Its chunks are in the host's memory, which the card reads over the bus ([`crate::stream`]).
+    /// Its chunks are in the host's memory, which the card reads over the bus ([`crate::quant::stream`]).
     pub(super) host: bool,
     /// Its bytes are in the model's file (no chunks): written into the card's slots each time a matmul takes it
-    /// ([`crate::stream`]); the blocks' padding on the card, where its type has one (`shaders::padded_block`).
+    /// ([`crate::quant::stream`]); the blocks' padding on the card, where its type has one (`shaders::padded_block`).
     pub(super) file: Option<(QuantizedTensor, Option<(usize, usize, usize)>)>,
 }
 
@@ -68,7 +79,7 @@ impl QuantizedDeviceStorage for WgpuQuant {
     }
     fn clone_to_device(&self) -> Box<dyn QuantizedDeviceStorage> {
         let bytes = match &self.file {
-            Some((w, padded)) => crate::stream::card_bytes(w, *padded).into_owned(),
+            Some((w, padded)) => crate::quant::stream::card_bytes(w, *padded).into_owned(),
             None => self.gpu_bytes(),
         };
         self.used.fetch_add(self.nbytes as u64, Ordering::Relaxed);

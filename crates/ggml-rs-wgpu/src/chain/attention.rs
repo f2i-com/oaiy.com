@@ -324,7 +324,7 @@ impl Recorder<'_> {
     /// of the recording's (the cache's rows left where they are).
     fn attention_q16(&mut self, q: &DeviceVec, rows: usize, padded: usize, qs: usize) -> DeviceVec {
         let q16 = self.scratch(padded * qs / 2);
-        let conv = self.gpu().named_pipeline("chain-x-f16", || crate::shaders::X_F16.to_string());
+        let conv = self.gpu().named_pipeline("chain-x-f16", || crate::quant::shaders::X_F16.to_string());
         let d = self.gpu().dummy().clone();
         let groups = ((padded * qs / 2) as u32).div_ceil(256);
         self.dispatch_kept(&conv, &d, buffer(q), buffer(&q16), &[qs as u32, rows as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
@@ -342,7 +342,7 @@ impl Recorder<'_> {
             Some((a, b)) if a.len >= rp * qs / 2 && b.len >= kp * row / 2 => (a, b),
             _ => (self.scratch(rp * qs / 2), self.scratch(kp * row / 2)),
         };
-        let conv = self.gpu().named_pipeline("chain-x-f16", || crate::shaders::X_F16.to_string());
+        let conv = self.gpu().named_pipeline("chain-x-f16", || crate::quant::shaders::X_F16.to_string());
         let d = self.gpu().dummy().clone();
         for (src, dst, width, n, padded) in [(q, &q16, qs, rows, rp), (kv, &kv16, row, kv_len, kp)] {
             let groups = ((padded * width / 2) as u32).div_ceil(256);
@@ -352,14 +352,14 @@ impl Recorder<'_> {
                 // the cache's a fragment at a time (`tiled`: its KV heads and their width), the one-pass kernels'
                 Some((n_kv, head_dim)) => {
                     let tile = if halved {
-                        self.gpu().named_pipeline("chain-kv-halves-tiled", || crate::shaders::KV_HALVES_TILED.to_string())
+                        self.gpu().named_pipeline("chain-kv-halves-tiled", || crate::quant::shaders::KV_HALVES_TILED.to_string())
                     } else {
-                        self.gpu().named_pipeline("chain-kv-f16-tiled", || crate::shaders::KV_F16_TILED.to_string())
+                        self.gpu().named_pipeline("chain-kv-f16-tiled", || crate::quant::shaders::KV_F16_TILED.to_string())
                     };
                     self.dispatch_kept(&tile, &d, buffer(src), buffer(dst), &[n_kv as u32, head_dim as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
                 }
                 None if halved => {
-                    let copy = self.gpu().named_pipeline("chain-halves-padded", || crate::shaders::HALVES_PADDED.to_string());
+                    let copy = self.gpu().named_pipeline("chain-halves-padded", || crate::quant::shaders::HALVES_PADDED.to_string());
                     self.dispatch_kept(&copy, &d, buffer(src), buffer(dst), &[width as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1));
                 }
                 None => self.dispatch_kept(&conv, &d, buffer(src), buffer(dst), &[width as u32, n as u32, padded as u32], (groups.min(65535), groups.div_ceil(65535), 1)),

@@ -38,7 +38,7 @@ tools.
 - **On the GPU** a conv layer is its in-projection, `ChainRecorder::short_conv` (B times x, the conv over its state,
   times C, in one kernel: a thread a channel for a step, a thread a channel and token for a prompt), and its
   out-projection. An attention layer is Qwen3.5's without the gate half of its q.
-- **The experts** are held by the GPU's K-quant kernels (`ggml_rs_wgpu::quant_moe`, Q4_K and Q6_K). Their routing
+- **The experts** are held by the GPU's K-quant kernels (`ggml_rs_wgpu::quant::moe`, Q4_K and Q6_K). Their routing
   is `ggml_rs::exl3::Routing::Sigmoid`, on the host and on the GPU (`ROUTE_SIGMOID_PICK`, then the ranking Qwen's
   routing uses, then `ROUTE_SIGMOID_WEIGHTS`). A layer with no shared expert has that expert's place in a row weighted 0.
 - **The tokenizer** is Llama 3's split with Hugging Face's `ignore_merges`: a piece that is a token whole is that

@@ -363,7 +363,7 @@ fn measure_coop_splits() {
         let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
         let (x, y) = (b.vec(m * k), b.vec(m * n));
         let units = b.gpu.coop_units();
-        let chosen = crate::shaders::coop_splits((n as u32).div_ceil(128) * (m as u32).div_ceil(128), units, (k / 32) as u32);
+        let chosen = crate::quant::shaders::coop_splits((n as u32).div_ceil(128) * (m as u32).div_ceil(128), units, (k / 32) as u32);
         // (OAIY_BENCH_SECONDS: the chosen split's matmul run that long, what it does each second of it: a card
         // under a power limit's rate at the limit, where the rest is a burst's)
         if let Some(secs) = std::env::var("OAIY_BENCH_SECONDS").ok().and_then(|v| v.parse::<f64>().ok()) {
@@ -410,7 +410,7 @@ fn measure_coop_splits() {
     }
 }
 
-/// Where [`crate::shaders::coop_tiled`]'s time goes (`--ignored --nocapture`): Qwen3.8 27B's FFN gate for 512 tokens,
+/// Where [`crate::quant::shaders::coop_tiled`]'s time goes (`--ignored --nocapture`): Qwen3.8 27B's FFN gate for 512 tokens,
 /// the kernel as it is, its decode replaced by constant stores, by no stores, and its multiply-adds taken out.
 #[test]
 #[ignore = "a measurement"]
@@ -430,7 +430,7 @@ fn measure_coop_parts() {
     let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).unwrap();
     let (x16, y) = (b.vec(m * k / 2), b.vec(m * n));
     DeviceChain::upload(&b, &x16, &vec![f32::from_bits(0x3c003c00); m * k / 2]);
-    let full = crate::shaders::coop_tiled(GgmlType::Q3_K).unwrap();
+    let full = crate::quant::shaders::coop_tiled(GgmlType::Q3_K).unwrap();
     // (the loop's decode: its tile's place, then a block to the stores of its tokens)
     let loop_at = full.find("for (var b0 = w0").unwrap();
     let from = loop_at + full[loop_at..].find("let at4 = buf").unwrap();
@@ -482,8 +482,8 @@ fn measure_coop_variants() {
     let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("on the GPU");
     let x16 = b.vec(m * k / 2);
     let y = b.vec(m * n);
-    let base = crate::shaders::coop_tiled(GgmlType::Q3_K).expect("Q3_K's kernel");
-    let marked = crate::shaders::coop_tiled_marked(GgmlType::Q3_K).expect("Q3_K's kernel");
+    let base = crate::quant::shaders::coop_tiled(GgmlType::Q3_K).expect("Q3_K's kernel");
+    let marked = crate::quant::shaders::coop_tiled_marked(GgmlType::Q3_K).expect("Q3_K's kernel");
     // the loop's barrier (the prologue's kept)
     let step_end = "        xr3 = xn3;\n        workgroupBarrier();\n";
     let no_barrier = {
@@ -1038,7 +1038,7 @@ fn measure_decode_rows_a_lane() {
         let (x, y) = (b.vec(k), b.vec(n));
         DeviceChain::upload(&b, &x, &(0..k).map(|_| next()).collect::<Vec<_>>());
         for (r, ks) in [(1u32, 1u32), (2, 1), (4, 1), (1, 2), (2, 2), (4, 2), (1, 4), (2, 4), (4, 4)] {
-            let Some(src) = crate::shaders::rb_kernel_for_test(dtype, r, 1, ks) else { continue };
+            let Some(src) = crate::quant::shaders::rb_kernel_for_test(dtype, r, 1, ks) else { continue };
             let pipeline = b.gpu.named_pipeline(Box::leak(format!("test-rb-{dtype:?}-{r}-{ks}").into_boxed_str()), || src);
             let reps = 32;
             let run = || {
@@ -1447,8 +1447,8 @@ fn measure_q8_rows_9b() {
     eprintln!("{line}");
 }
 
-/// A prompt's tensor-core matmul each way (`--ignored --nocapture`): [`crate::shaders::coop_tiled`] (each subgroup
-/// decodes, then multiplies) and [`crate::shaders::coop_tiled_split`] (subgroups that decode apart from those that
+/// A prompt's tensor-core matmul each way (`--ignored --nocapture`): [`crate::quant::shaders::coop_tiled`] (each subgroup
+/// decodes, then multiplies) and [`crate::quant::shaders::coop_tiled_split`] (subgroups that decode apart from those that
 /// multiply), on Qwen3.5 9B's FFN gate ([12288, 4096] by 512 tokens; OAIY_COOP_NK another `NxK`), each type's, and how
 /// far apart their sums are (the worst element's, of their RMS: f16 windows' against f32 sums).
 #[test]
@@ -1477,7 +1477,7 @@ fn measure_coop_kernels() {
         let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("on the GPU");
         let mut line = format!("{dtype:?} [{n}, {k}] by {m}:");
         let mut sums: Vec<Vec<f32>> = Vec::new();
-        for (way, src) in [("together", crate::shaders::coop_tiled(dtype).expect("its kernel")), ("apart", crate::shaders::coop_tiled_split(dtype).expect("its kernel"))] {
+        for (way, src) in [("together", crate::quant::shaders::coop_tiled(dtype).expect("its kernel")), ("apart", crate::quant::shaders::coop_tiled_split(dtype).expect("its kernel"))] {
             let name: &'static str = Box::leak(format!("bench-coop-{way}-{dtype:?}").into_boxed_str());
             let pipeline = b.gpu.named_pipeline(name, || src.clone());
             let dispatch = |rec: &mut Recorder| {
@@ -1808,8 +1808,8 @@ fn measure_wide_head_attention() {
 /// A 3x3 convolution on the tensor cores at a VAE decoder's shapes (`--ignored --nocapture`; Qwen Image 2.1's at a
 /// 1024x1024 picture: 1,152 channels at 128x128, 256x256's 576, 512x512's 288), against the f16 matmul of the same work
 /// (its pixels the rows, nine taps' channels the inputs): what its implicit im2col costs. An NVIDIA A2 at 1,200 MHz:
-/// the convolutions 4.05, 3.77 and 3.21 TFLOPS in [`crate::shaders::coop_conv`]'s kernel, 4.41, 4.15 and 3.66 split
-/// ([`crate::shaders::coop_split_f16`]); the f16 matmul 4.47 and 4.98 at the first (where the Q4_K split kernel gives
+/// the convolutions 4.05, 3.77 and 3.21 TFLOPS in [`crate::quant::shaders::coop_conv`]'s kernel, 4.41, 4.15 and 3.66 split
+/// ([`crate::quant::shaders::coop_split_f16`]); the f16 matmul 4.47 and 4.98 at the first (where the Q4_K split kernel gives
 /// 6.9: f16 weights are four times the bytes). `OAIY_COOP_SPLIT=0` for the first kernels.
 #[test]
 #[ignore = "a measurement"]

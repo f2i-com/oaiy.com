@@ -1,10 +1,10 @@
 //! Writes to the device's buffers through the queue's staging memory, or a large one's through the host's
-//! ([`Gpu::write_through_host`](super::Gpu::write_through_host)).
+//! ([`Gpu::write_through_host`](crate::Gpu::write_through_host)).
 
 /// `data` (a multiple of 4 bytes) into `buffer` at `offset` through a write's staging memory, copied there from every
 /// core: one core's copy into the card's memory (Resizable BAR) took 1.4 GB/s, most of a weight's load. Small
 /// writes as `write_buffer`'s.
-pub(super) fn write_bytes(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+pub(crate) fn write_bytes(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
     let size = match wgpu::BufferSize::new(data.len() as u64) {
         Some(size) if data.len() >= 8 << 20 => size,
         _ => return queue.write_buffer(buffer, offset, data),
@@ -28,7 +28,7 @@ pub(super) fn write_bytes(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u6
 /// the bytes from `at` on into `part`, a part of the write's staging memory, a thread a part. A file read there
 /// straight is copied once, where bytes read into the host's memory first are copied again by [`write_bytes`]. False
 /// (nothing written) where the queue gives no such memory.
-pub(super) fn write_with(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, len: usize, fill: &(dyn Fn(usize, &mut [u8]) + Sync)) -> bool {
+pub(crate) fn write_with(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, len: usize, fill: &(dyn Fn(usize, &mut [u8]) + Sync)) -> bool {
     let Some(size) = wgpu::BufferSize::new(len as u64) else { return false };
     let Some(mut view) = queue.write_buffer_with(buffer, offset, size) else { return false };
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
@@ -47,33 +47,33 @@ pub(super) fn write_with(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64
 }
 
 /// The bytes from which a write goes a piece at a time ([`Gpu::write`]), and a piece's.
-pub(super) const WRITE_BY_PIECES: usize = 64 << 20;
-pub(super) const WRITE_PIECE: usize = 32 << 20;
+pub(crate) const WRITE_BY_PIECES: usize = 64 << 20;
+pub(crate) const WRITE_PIECE: usize = 32 << 20;
 
 /// OAIY_WHOLE_WRITES: a large write whole and weights in turn flushed every 256 MB, as they were before a write went
 /// by pieces (a measurement's other side).
-pub(super) fn whole_writes() -> bool {
+pub(crate) fn whole_writes() -> bool {
     static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ASKED.get_or_init(|| std::env::var_os("OAIY_WHOLE_WRITES").is_some())
 }
 
 /// The bytes a write needs before it goes through the host's memory ([`Gpu::write_through_host`]), where the device's
 /// writes do; a smaller one goes through the queue's staging memory as before.
-pub(super) const HOST_WRITE_MIN: usize = 1 << 20;
+pub(crate) const HOST_WRITE_MIN: usize = 1 << 20;
 
 /// The two staging buffers in the host's memory a large write goes through a piece ([`WRITE_PIECE`]) at a time, each
 /// with the submission of its last copy to the card ([`Gpu::write_through_host`]).
 #[derive(Default)]
-pub(super) struct HostPieces(Vec<(wgpu::Buffer, Option<wgpu::SubmissionIndex>)>, usize);
+pub(crate) struct HostPieces(Vec<(wgpu::Buffer, Option<wgpu::SubmissionIndex>)>, usize);
 
-impl super::Gpu {
+impl crate::Gpu {
     /// Whether this device's large writes go through the host's memory ([`Self::write_through_host`]): where the
     /// queue's staging memory, which wgpu's Vulkan backend puts in the card's own host-visible memory (its BAR) where
     /// there is such, takes the CPU's writes at under 0.5 GB/s. An NVIDIA A2 in a Thunderbolt 3 enclosure took them
     /// at 0.21 GB/s from every core, where the host's memory took 20 and the card read it at 2.2: Qwen3.5 9B's 5.1 GB
     /// of weights loaded in 27 s. OAIY_HOST_STAGING=1: wherever it can be (a Vulkan device with read-mappable
     /// buffers); 0: never.
-    pub(super) fn host_staging(&self) -> bool {
+    pub(crate) fn host_staging(&self) -> bool {
         *self.host_staging.get_or_init(|| {
             let asked = std::env::var("OAIY_HOST_STAGING").ok();
             if asked.as_deref() == Some("0") || !self.host_staging_can() {
@@ -136,7 +136,7 @@ impl super::Gpu {
     /// in a staging buffer in the host's memory a piece at a time, each piece copied to the card by the GPU: a
     /// read-mappable buffer, which wgpu's Vulkan backend puts in the host's cached memory, written through its mapping.
     /// Two such buffers in turn, so a piece is made as the last one is copied.
-    pub(super) fn write_through_host(&self, buffer: &wgpu::Buffer, offset: u64, len: usize, fill: &(dyn Fn(usize, &mut [u8]) + Sync)) {
+    pub(crate) fn write_through_host(&self, buffer: &wgpu::Buffer, offset: u64, len: usize, fill: &(dyn Fn(usize, &mut [u8]) + Sync)) {
         use std::sync::atomic::{AtomicU8, Ordering};
         let mut pieces = self.host_pieces.lock().unwrap_or_else(|p| p.into_inner());
         if pieces.0.is_empty() {

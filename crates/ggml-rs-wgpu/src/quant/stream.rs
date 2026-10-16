@@ -11,7 +11,7 @@
 //! With OAIY_STREAM_PIN=1 such a weight goes in the host's memory instead, in a buffer the card's kernels read where
 //! it lies (a step's rows over the bus; a prompt's rows copied into the slots by a kernel, in the recording's pass):
 //! as fast for a prompt, slower for a step (0.95 tokens a second there), and it holds the system's memory.
-use super::*;
+use crate::*;
 use crate::chain::{grid, Recorder};
 
 /// Rows of a matmul from which a weight in the host's memory is copied into the card first: below, read in place.

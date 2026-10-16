@@ -289,7 +289,7 @@ fn iq4_xs_against_a_few_rows_is_the_generic_kernels() {
             (blk[0], blk[1]) = (d[0], d[1]);
         }
         let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::IQ4_XS));
-        for m in 1..=crate::shaders::IQ4_FEW_MAX {
+        for m in 1..=crate::quant::shaders::IQ4_FEW_MAX {
             let (x, y, yf) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
             DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
             let mut rec = Recorder::new(&b);
@@ -325,7 +325,7 @@ fn iq4_xs_from_int8_rows_is_the_f32_kernels() {
             (blk[0], blk[1]) = (d[0], d[1]);
         }
         let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::IQ4_XS));
-        for m in 1..=crate::shaders::IQ4_FEW_MAX {
+        for m in 1..=crate::quant::shaders::IQ4_FEW_MAX {
             for whole in [false, true] {
                 let (x, y, yq) = (b.vec(m * k), b.vec(m * n), b.vec(m * n));
                 // (whole: each 32 has a 127 or a -127, so its scale is one and its values are their own int8)
@@ -406,7 +406,7 @@ fn the_tensor_core_matmuls_are_the_f32_ones() {
 /// on an RTX 5090's 170 SMs (as [`measure_coop_splits`] finds them), and none empty.
 #[test]
 fn a_tensor_core_matmul_is_split_to_fill_the_gpu() {
-    use crate::shaders::coop_splits;
+    use crate::quant::shaders::coop_splits;
     // its FFN's gate and up (1088 tiles, k 5120 in 160 steps), down (160 tiles, k 17408), a delta net's gate (192),
     // attention's q (384), k and v (32 each), output (160, k 6144)
     assert_eq!(coop_splits(1088, 170, 160), 1);
@@ -490,8 +490,8 @@ fn bf16_matmuls_are_the_f16_ones() {
     }
 }
 
-/// Rows quantized to int8 by a subgroup's lanes together ([`crate::shaders::QUANT_Q8_LANES`], where subgroups are 32
-/// lanes) are a thread a block's ([`crate::shaders::QUANT_Q8`]) bit for bit: their words, scales and halves' sums, rows
+/// Rows quantized to int8 by a subgroup's lanes together ([`crate::quant::shaders::QUANT_Q8_LANES`], where subgroups are 32
+/// lanes) are a thread a block's ([`crate::quant::shaders::QUANT_Q8`]) bit for bit: their words, scales and halves' sums, rows
 /// of 4,096 and 12,288 and a few of 96 (a last subgroup part full), a block of zeros and channels a hundred times the
 /// rest among them.
 #[test]
@@ -506,10 +506,10 @@ fn rows_quantized_by_lanes_are_a_thread_a_blocks() {
         x[32..64].fill(0.0);
         let xv = b.vec(m * k);
         DeviceChain::upload(&b, &xv, &x);
-        let (len, xs_at) = crate::shaders::q8_len(m, k);
+        let (len, xs_at) = crate::quant::shaders::q8_len(m, k);
         let blocks = (m * k / 32) as u32;
         let mut got = Vec::new();
-        for (name, src, groups) in [("test-q8-thread", crate::shaders::QUANT_Q8, blocks.div_ceil(256)), ("test-q8-lanes", crate::shaders::QUANT_Q8_LANES, (blocks * 8).div_ceil(256))] {
+        for (name, src, groups) in [("test-q8-thread", crate::quant::shaders::QUANT_Q8, blocks.div_ceil(256)), ("test-q8-lanes", crate::quant::shaders::QUANT_Q8_LANES, (blocks * 8).div_ceil(256))] {
             let out = b.vec(len);
             DeviceChain::upload(&b, &out, &vec![f32::from_bits(0xdead_beef); len]);
             let pipeline = b.gpu.named_pipeline(name, || src.to_string());
@@ -591,7 +591,7 @@ fn q8_0_from_an_int8_row_is_the_f32_kernels() {
     }
 }
 
-/// A weight past the budget gives the card's own result ([`crate::stream`]): from its file (its bytes written into
+/// A weight past the budget gives the card's own result ([`crate::quant::stream`]): from its file (its bytes written into
 /// the slots before each matmul, the default) and from the host's memory (read there for a step's rows, copied into
 /// the slots for a prompt's), for a step's row, a few rows and a prompt's, Q3_K's blocks padded on the card among
 /// the types.
@@ -621,7 +621,7 @@ fn a_weight_past_the_budget_is_the_cards() {
         assert!(card.holds(&on_card) && small.holds(&from_file), "{dtype:?}: both held");
         let q = from_file.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a streamed weight");
         assert!(q.file.is_some() && small.filed() >= q.nbytes as u64 && small.usage().0 == 0, "{dtype:?}: past the budget, in its file");
-        let bytes = crate::stream::card_bytes(&host(), crate::shaders::padded_block(dtype)).into_owned();
+        let bytes = crate::quant::stream::card_bytes(&host(), crate::quant::shaders::padded_block(dtype)).into_owned();
         let row_bytes = bytes.len() / n;
         let pinned = small.pin_to_host(&bytes, row_bytes, dtype, &[n, k]);
         for m in [1usize, 3, 40] {

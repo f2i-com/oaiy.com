@@ -12,29 +12,23 @@
 //! host and take `CpuBackend`'s path: a model larger than the GPU still runs,
 //! the rest of it on the CPU.
 
-// this crate is OAIY's addition beside ggml-rs-cuda.
-
+// The device itself: its pipelines, pools and waits, its queue, its uploads, its memory, its watchdog.
+mod device;
+// Quantized weights on the device: their buffers and matmul shaders, a GGUF's packed matrices and MoE experts (on the
+// card, or on the host past its budget), and weights streamed to the card as they are used.
+pub mod quant;
+// The models' ops chained on the device in one submission, the dense (fp8/bf16) trunk, EXL3's packed projections.
 pub mod chain;
 pub mod dense;
 pub mod exl3;
-pub mod quant_linear;
-pub mod quant_moe;
-pub mod quant_host;
-pub mod shaders;
-
+// `ggml_rs::Backend` on the device, and where a model's time goes.
 mod backend;
-mod feed;
-mod gpu;
-mod memory;
 pub mod profile;
-mod quant;
-mod stream;
-mod upload;
-mod watch;
 
 // (what the crate's files make for each other, and for its users what the root gave them)
-pub(crate) use {feed::*, quant::*, upload::*};
-pub use {memory::*, watch::*};
+pub(crate) use device::{feed::*, upload::*};
+pub(crate) use quant::*;
+pub use device::{memory::*, watch::*};
 
 use ggml_quants::GgmlType;
 use ggml_rs::{Backend, CpuBackend, QuantizedDeviceStorage, QuantizedTensor, RopeType, Tensor};

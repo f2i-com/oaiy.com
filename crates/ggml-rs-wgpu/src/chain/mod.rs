@@ -217,10 +217,10 @@ pub(crate) struct Recorder<'a> {
     weight: f64,
     /// Whether a step's row takes the kernels a check's few rows take ([`ChainRecorder::rows_alike`]).
     alike: bool,
-    /// The layers whose experts' use this recording reads as it finishes ([`crate::quant_moe::Cache`]: a card holding
+    /// The layers whose experts' use this recording reads as it finishes ([`crate::quant::moe::Cache`]: a card holding
     /// some of a layer's experts), each with its read's place among `reads`: the cache's, not the caller's.
-    pub(crate) settles: Vec<(Arc<crate::quant_moe::Cache>, usize)>,
-    /// A prompt's rows' experts copied from the host's memory for the tensor cores' kernels ([`crate::quant_moe::Cache`]):
+    pub(crate) settles: Vec<(Arc<crate::quant::moe::Cache>, usize)>,
+    /// A prompt's rows' experts copied from the host's memory for the tensor cores' kernels ([`crate::quant::moe::Cache`]):
     /// the gate and up group's and the down group's, each layer's in turn (their lengths).
     pub(crate) moe_stage: Option<([usize; 2], [DeviceVec; 2])>,
 }
@@ -252,7 +252,7 @@ impl Recorder<'_> {
     }
 
     /// Everything recorded so far sent to the queue (what is held too), the recording going on: a write made now is
-    /// after it ([`crate::stream`]'s weights from a file). Its reads are copied out at its end, as before.
+    /// after it ([`crate::quant::stream`]'s weights from a file). Its reads are copied out at its end, as before.
     pub(crate) fn submit_so_far(&mut self) {
         // (a held recording's pieces too: its hold is for what is recorded after)
         let hold = std::mem::replace(&mut self.hold, false);

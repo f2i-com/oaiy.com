@@ -145,7 +145,7 @@ fn measure_quantized_projections() {
     }
 }
 
-/// A weight past the budget stays in its file, held as the card's ([`crate::stream`]: a chain writes it to the card
+/// A weight past the budget stays in its file, held as the card's ([`crate::quant::stream`]: a chain writes it to the card
 /// as it is used), the budget untouched; op by op the CPU multiplies it, as before.
 #[test]
 fn weights_beyond_the_budget_stay_in_their_file_and_still_compute() {
@@ -200,7 +200,7 @@ fn a_kernels_packed_dot_products_go_through_a_function_of_their_own_for_metal() 
     let mut seen = 0;
     for dtype in [GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0] {
         for (mr, subgroups) in [1u32, 2, 4].into_iter().flat_map(|mr| [(mr, false), (mr, true)]) {
-            let Some(kernel) = crate::shaders::rb_kernel_q8(dtype, crate::shaders::rb_rows_q8(dtype, mr), mr, subgroups) else { continue };
+            let Some(kernel) = crate::quant::shaders::rb_kernel_q8(dtype, crate::quant::shaders::rb_rows_q8(dtype, mr), mr, subgroups) else { continue };
             let before = calls(&kernel, "dot4I8Packed");
             assert!(before > 0, "{dtype:?} for {mr} tokens has no packed dot product: the test looks at the wrong kernel");
             let wrapped = packed_dots_wrapped(kernel.clone());
@@ -247,7 +247,7 @@ fn no_kernel_writes_a_component_of_a_workgroup_vector() {
     }
     let mut asked = 0;
     for dtype in [GgmlType::Q2_0, GgmlType::Q4_0, GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0] {
-        for kernel in [crate::shaders::source_many(dtype), crate::shaders::tiled_q8(dtype)].into_iter().flatten() {
+        for kernel in [crate::quant::shaders::source_many(dtype), crate::quant::shaders::tiled_q8(dtype)].into_iter().flatten() {
             assert!(wgpu::naga::front::wgsl::parse_str(&kernel).is_ok(), "{dtype:?}'s prompt kernel parses");
             assert_eq!(lane_writes(&kernel), Vec::<String>::new(), "{dtype:?}'s prompt kernel");
             asked += 1;

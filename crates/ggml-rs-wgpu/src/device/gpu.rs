@@ -1,7 +1,7 @@
 //! The device's own functions: its pipelines and bind groups, its pools of scratch, its waits and read-backs,
 //! its uploads.
 
-use super::*;
+use crate::*;
 
 impl Drop for Gpu {
     fn drop(&mut self) {
@@ -83,7 +83,7 @@ impl Gpu {
     }
 
     /// Copy `len` bytes of `src` back to the host.
-    pub(super) fn read(&self, src: &wgpu::Buffer, len: u64) -> Vec<u8> {
+    pub(crate) fn read(&self, src: &wgpu::Buffer, len: u64) -> Vec<u8> {
         let len = len.div_ceil(4) * 4;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oaiy-readback"),
@@ -100,7 +100,7 @@ impl Gpu {
     /// The device's queue, for a write or a submission of the caller's own: after everything handed to the feed has
     /// gone to it (a write is before the submissions after it; a piece still waiting would run after a write made
     /// since it was recorded).
-    pub(super) fn queue(&self) -> &wgpu::Queue {
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
         self.settle();
         &self.queue_raw
     }
@@ -111,7 +111,7 @@ impl Gpu {
     }
 
     /// Waits until everything handed to the feed is submitted (at once where nothing is waiting).
-    pub(super) fn settle(&self) {
+    pub(crate) fn settle(&self) {
         let mut s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
         while s.gone < s.handed {
             if let Some(why) = &s.failed {
@@ -122,7 +122,7 @@ impl Gpu {
     }
 
     /// `fare` handed to the feed (its thread begun at the first), where its submission will be said.
-    pub(super) fn hand(&self, fare: Fare) -> Piece {
+    pub(crate) fn hand(&self, fare: Fare) -> Piece {
         let slot = Arc::new(Mutex::new(None));
         let mut s = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(why) = &s.failed {
@@ -223,7 +223,7 @@ impl Gpu {
         }
     }
 
-    pub(super) fn map_read(&self, staging: &wgpu::Buffer, len: u64) -> Vec<u8> {
+    pub(crate) fn map_read(&self, staging: &wgpu::Buffer, len: u64) -> Vec<u8> {
         let slice = staging.slice(..len);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.wait(None);
@@ -235,7 +235,7 @@ impl Gpu {
     /// [`Self::map_read`] for a read-back that is a fraction of a millisecond away (a decode step's dense call): the
     /// device polled for [`SPIN`] before it is waited for, so the thread is not parked and woken for each (the OS's
     /// wake of a parked thread was most of such a call's wait). OAIY_DENSE_NO_SPIN: waited for from the start.
-    pub(super) fn map_read_soon(&self, staging: &wgpu::Buffer, len: u64) -> Vec<u8> {
+    pub(crate) fn map_read_soon(&self, staging: &wgpu::Buffer, len: u64) -> Vec<u8> {
         /// How long the device is polled before the thread waits.
         const SPIN: std::time::Duration = std::time::Duration::from_millis(2);
         static NO_SPIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -330,7 +330,7 @@ impl Gpu {
     /// ([`WRITE_PIECE`]), as a large write is by itself ([`Self::write`]): weights uploaded in turn and never waited
     /// for each took new staging memory, and all of it was held until the next submission (loading a 16 GB model
     /// exhausted it).
-    pub(super) fn staged_more(&self, bytes: u64) {
+    pub(crate) fn staged_more(&self, bytes: u64) {
         if bytes >= WRITE_BY_PIECES as u64 && !whole_writes() {
             return self.staged.store(0, Ordering::Relaxed);
         }
@@ -365,7 +365,7 @@ impl Gpu {
     }
 
     /// Upload whole rows into buffers below the binding limit.
-    pub(super) fn upload_rows(&self, bytes: &[u8], row_bytes: usize, _hint: usize) -> Vec<(wgpu::Buffer, u32, u32)> {
+    pub(crate) fn upload_rows(&self, bytes: &[u8], row_bytes: usize, _hint: usize) -> Vec<(wgpu::Buffer, u32, u32)> {
         let rows = bytes.len() / row_bytes;
         let per = ((chunk_limit(&self.limits) as usize) / row_bytes).max(1);
         let mut chunks = Vec::new();
@@ -397,7 +397,7 @@ impl Gpu {
     /// A kernel's module, its workgroup memory checked first where the device has less than 48 KB of it (Apple's 32,
     /// OAIY_PORTABLE_LIMITS's): wgpu 30 does not check it, and a kernel past the limit fails where it runs, if its
     /// driver says at all.
-    pub(super) fn shader(&self, name: &str, source: String) -> wgpu::ShaderModule {
+    pub(crate) fn shader(&self, name: &str, source: String) -> wgpu::ShaderModule {
         // Metal: the packed dot products go through a function of their own (`packed_dots_wrapped` says why).
         let source = if self.wraps_packed_dots() { packed_dots_wrapped(source) } else { source };
         if self.limits.max_compute_workgroup_storage_size < 48 << 10 {
@@ -442,7 +442,7 @@ impl Gpu {
         self.device.adapter_info().backend == wgpu::Backend::Metal || std::env::var_os("OAIY_WRAP_PACKED_DOTS").is_some_and(|v| v == "1")
     }
 
-    pub(super) fn exl3_pipeline(&self, many: bool) -> Arc<wgpu::ComputePipeline> {
+    pub(crate) fn exl3_pipeline(&self, many: bool) -> Arc<wgpu::ComputePipeline> {
         let mut slots = self.exl3.lock().unwrap_or_else(|p| p.into_inner());
         let slot = &mut slots[many as usize];
         if let Some(p) = slot.as_ref() {
@@ -462,12 +462,12 @@ impl Gpu {
     }
 
     /// The pipeline `name`, made from the WGSL `source` gives the first time it is asked for.
-    pub(super) fn named_pipeline(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
+    pub(crate) fn named_pipeline(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
         self.named_pipeline_in(name, &self.pipeline_layout, source)
     }
 
     /// The layout of eight storage buffers (the first six read, the last two written) and the parameters at 8.
-    pub(super) fn wide_layout(&self) -> &(wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+    pub(crate) fn wide_layout(&self) -> &(wgpu::BindGroupLayout, wgpu::PipelineLayout) {
         self.wide.get_or_init(|| {
             let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -493,14 +493,14 @@ impl Gpu {
     }
 
     /// A small buffer for the bindings a kernel does not read.
-    pub(super) fn dummy(&self) -> &wgpu::Buffer {
+    pub(crate) fn dummy(&self) -> &wgpu::Buffer {
         self.dummy.get_or_init(|| {
             self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-dummy"), size: 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false })
         })
     }
 
     /// Another, for a written binding a kernel does not write (one buffer may not be bound written twice).
-    pub(super) fn dummy_rw(&self) -> &wgpu::Buffer {
+    pub(crate) fn dummy_rw(&self) -> &wgpu::Buffer {
         self.dummy_rw.get_or_init(|| {
             self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-dummy-rw"), size: 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false })
         })
@@ -607,7 +607,7 @@ impl Gpu {
 
     /// A generated kernel's source, made once for its name and kept (what a recorder's wide dispatch is given each
     /// time, its pipeline made of it the first).
-    pub(super) fn named_source(&self, name: &'static str, make: impl FnOnce() -> String) -> &'static str {
+    pub(crate) fn named_source(&self, name: &'static str, make: impl FnOnce() -> String) -> &'static str {
         static MADE: Mutex<Vec<(&'static str, &'static str)>> = Mutex::new(Vec::new());
         let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((_, source)) = made.iter().find(|(n, _)| *n == name) {
@@ -618,12 +618,12 @@ impl Gpu {
         source
     }
 
-    pub(super) fn named_pipeline_wide(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
+    pub(crate) fn named_pipeline_wide(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
         let layout = &self.wide_layout().1;
         self.named_pipeline_in(name, layout, source)
     }
 
-    pub(super) fn named_pipeline_in(&self, name: &'static str, layout: &wgpu::PipelineLayout, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
+    pub(crate) fn named_pipeline_in(&self, name: &'static str, layout: &wgpu::PipelineLayout, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
         let mut cache = self.named.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = cache.get(name) {
             return Arc::clone(p);
@@ -646,7 +646,7 @@ impl Gpu {
 
     /// `dtype`'s kernel for `m` rows of `x`: the decode kernel for one, the one-row kernel for a few, the tiled one
     /// a prompt takes.
-    pub(super) fn pipeline(&self, dtype: GgmlType, m: usize) -> Option<Arc<wgpu::ComputePipeline>> {
+    pub(crate) fn pipeline(&self, dtype: GgmlType, m: usize) -> Option<Arc<wgpu::ComputePipeline>> {
         let kind = shaders::kind(dtype, m);
         let mut cache = self.pipelines.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = cache.get(&(dtype, kind)) {

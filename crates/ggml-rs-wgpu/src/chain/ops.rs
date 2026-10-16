@@ -24,9 +24,9 @@ impl ChainRecorder for Recorder<'_> {
         let one = self.alike || (m == 1 && kq8 && super::matmul::decode_in_int8(self.backend, w));
         let done = (iq4 && q8 && (m >= 2 || one) && self.matmul_rows_iq4_xs_q8(w, x, y, m))
             || (iq4 && self.matmul_rows_iq4_xs(w, x, y, m))
-            || (((2..=crate::shaders::MULTI_MAX).contains(&m) || (one && m == 1)) && kq8 && self.matmul_rows_q8(w, x, y, m))
-            || (m > crate::shaders::MULTI_MAX && self.matmul_rows_coop(w, x, y, m))
-            || (m > crate::shaders::MULTI_MAX && kq8 && self.matmul_rows_tq8(w, x, y, m));
+            || (((2..=crate::quant::shaders::MULTI_MAX).contains(&m) || (one && m == 1)) && kq8 && self.matmul_rows_q8(w, x, y, m))
+            || (m > crate::quant::shaders::MULTI_MAX && self.matmul_rows_coop(w, x, y, m))
+            || (m > crate::quant::shaders::MULTI_MAX && kq8 && self.matmul_rows_tq8(w, x, y, m));
         if !done {
             self.matmul_rows_f32(w, x, y, m);
         }
@@ -207,7 +207,7 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn moe_rows(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]) {
-        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
+        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant::moe::QuantMoe>()) {
             return q.record(self, x, out, assign);
         }
         if let Some(t) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeTiered>()) {
@@ -218,7 +218,7 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn moe_routed(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, logits: &DeviceVec, top_k: usize, rows: usize) -> bool {
-        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
+        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant::moe::QuantMoe>()) {
             return q.record_routed(self, x, out, logits, top_k, rows, None);
         }
         if let Some(t) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeTiered>()) {
@@ -232,7 +232,7 @@ impl ChainRecorder for Recorder<'_> {
         // no vector for the sums: they go into the streams
         let none = self.gpu().dummy_rw().clone();
         let out = DeviceVec { len: 0, inner: Arc::new(none) };
-        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_moe::QuantMoe>()) {
+        if let Some(q) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant::moe::QuantMoe>()) {
             return q.record_routed(self, x, &out, logits, top_k, rows, Some((streams_x, post, streams)));
         }
         if let Some(t) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeTiered>()) {
@@ -246,7 +246,7 @@ impl ChainRecorder for Recorder<'_> {
         if let Some(t) = experts.as_any().and_then(|a| a.downcast_ref::<crate::exl3::Exl3MoeTiered>()) {
             return t.record_shared(self, x, out, rows);
         }
-        let Some(host) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant_host::QuantMoeHost>()) else { return false };
+        let Some(host) = experts.as_any().and_then(|a| a.downcast_ref::<crate::quant::host::QuantMoeHost>()) else { return false };
         host.record_shared(self, x, out, rows)
     }
 
@@ -655,10 +655,10 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn matmul_nvfp4_rows(&mut self, w: &DeviceVec, scale: &DeviceVec, b: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
-        assert!(k % 64 == 0 && w.len >= n * (k / 8 + k / 64) && scale.len >= 2 && b.len >= n && x.len >= rows * k && y.len >= rows * n && rows.div_ceil(crate::shaders::COOP_TILE as usize) <= 65535, "chain: an NVFP4 matmul [{n}, {k}] of {rows} rows");
+        assert!(k % 64 == 0 && w.len >= n * (k / 8 + k / 64) && scale.len >= 2 && b.len >= n && x.len >= rows * k && y.len >= rows * n && rows.div_ceil(crate::quant::shaders::COOP_TILE as usize) <= 65535, "chain: an NVFP4 matmul [{n}, {k}] of {rows} rows");
         let x16 = self.x16_tiled(x, rows, k);
-        let tile = crate::shaders::COOP_TILE;
-        let pipeline = self.gpu().named_pipeline("chain-coop-nvfp4", crate::shaders::coop_tiled_nvfp4);
+        let tile = crate::quant::shaders::COOP_TILE;
+        let pipeline = self.gpu().named_pipeline("chain-coop-nvfp4", crate::quant::shaders::coop_tiled_nvfp4);
         let tiles = (n as u32).div_ceil(tile) * (rows as u32).div_ceil(tile);
         let (splits, out, parts) = self.coop_parts(tiles, k, rows, n, y, None);
         let words = [k as u32, n as u32, rows as u32, 0, n as u32, (k / 8 + k / 64) as u32, splits, 0];

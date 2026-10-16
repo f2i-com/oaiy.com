@@ -1,10 +1,10 @@
 //! What memory there is: a card's own and the system's budget for this process, and the computer's.
 
-use super::*;
+use crate::*;
 
 /// The adapter's own memory where its API says: Vulkan's largest device-local heap (a discrete card's VRAM), or the
 /// card's memory the TinyGPU adapter gives as its largest buffer. None on Direct3D 12 and Metal.
-pub(super) fn device_memory(adapter: &wgpu::Adapter) -> Option<u64> {
+pub(crate) fn device_memory(adapter: &wgpu::Adapter) -> Option<u64> {
     #[cfg(feature = "tinygpu")]
     if adapter.get_info().driver.starts_with("tinygrad") {
         return Some(adapter.limits().max_buffer_size);
@@ -28,7 +28,7 @@ pub(super) fn device_memory(adapter: &wgpu::Adapter) -> Option<u64> {
 /// Vulkan's budget for this process on the adapter's largest device-local heap (VK_EXT_memory_budget: what the OS
 /// lets it keep there, the rest of the computer's use of the card taken off) and its use of it now. None on other
 /// APIs.
-pub(super) fn heap_budget(adapter: &wgpu::Adapter) -> Option<(u64, u64)> {
+pub(crate) fn heap_budget(adapter: &wgpu::Adapter) -> Option<(u64, u64)> {
     #[cfg(any(windows, target_os = "linux"))]
     {
         // SAFETY: the adapter's handles are only read, by a query that creates and frees nothing.
@@ -52,14 +52,14 @@ pub(super) fn heap_budget(adapter: &wgpu::Adapter) -> Option<(u64, u64)> {
 
 /// The weights a discrete card with `memory` bytes holds by default: all but 4 GiB (the cache, the work buffers and
 /// the rest of the computer's use of it), or half of a card under 8 GiB.
-pub(super) fn discrete_budget(memory: u64) -> u64 {
+pub(crate) fn discrete_budget(memory: u64) -> u64 {
     memory.saturating_sub(4 * GIB).max(memory / 2)
 }
 
 /// Whether the adapter's memory is the computer's own and the adapter its main GPU: an Apple-silicon Mac's (Metal
 /// calls a GPU "integrated" where `hasUnifiedMemory` says so, and there every GPU of the computer's is). A PC's
 /// integrated GPU keeps the small default: it is the slower of what such a computer has, beside a card or not.
-pub(super) fn unified(info: &wgpu::AdapterInfo) -> bool {
+pub(crate) fn unified(info: &wgpu::AdapterInfo) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64")) && info.backend == wgpu::Backend::Metal && info.device_type == wgpu::DeviceType::IntegratedGpu
 }
 
@@ -70,20 +70,20 @@ pub(super) fn unified(info: &wgpu::AdapterInfo) -> bool {
 /// what Macs are said to give their GPUs, two thirds to three quarters: none has told this code yet), the other
 /// third the system's, its programs' and the model's own use of the CPU. Never more than the computer has (`total`;
 /// 0 where that could not be read).
-pub(super) fn unified_budget(total: u64, wired_limit: Option<u64>, metal: Option<u64>) -> u64 {
+pub(crate) fn unified_budget(total: u64, wired_limit: Option<u64>, metal: Option<u64>) -> u64 {
     let may = metal.filter(|&m| m > 0).or(wired_limit.filter(|&w| w > 0)).unwrap_or(total / 3 * 2);
     discrete_budget(if total > 0 { may.min(total) } else { may })
 }
 
 /// [`unified_budget`] of this computer for `adapter`; None where neither its memory nor the GPU's share can be read.
-pub(super) fn host_unified_budget(adapter: Option<&wgpu::Adapter>) -> Option<u64> {
+pub(crate) fn host_unified_budget(adapter: Option<&wgpu::Adapter>) -> Option<u64> {
     let (total, metal) = (total_memory(), adapter.and_then(metal_working_set));
     (total.is_some() || metal.is_some()).then(|| unified_budget(total.unwrap_or(0), wired_limit(), metal))
 }
 
 /// What Metal says this GPU should hold at most (`MTLDevice.recommendedMaxWorkingSetSize`: on Apple silicon the share
 /// of the computer's memory the system lets the GPU keep). None on other systems and other APIs.
-pub(super) fn metal_working_set(adapter: &wgpu::Adapter) -> Option<u64> {
+pub(crate) fn metal_working_set(adapter: &wgpu::Adapter) -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         use objc2_metal::MTLDevice as _;
@@ -164,7 +164,7 @@ pub fn host_memory() -> Option<(usize, usize)> {
 }
 
 #[cfg(windows)]
-pub(super) fn host_memory_impl() -> Option<(usize, usize)> {
+pub(crate) fn host_memory_impl() -> Option<(usize, usize)> {
     // MEMORYSTATUSEX, exactly as documented: `length` must be set by the caller and every other field is written by
     // the call.
     #[repr(C)]
@@ -200,7 +200,7 @@ pub(super) fn host_memory_impl() -> Option<(usize, usize)> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn host_memory_impl() -> Option<(usize, usize)> {
+pub(crate) fn host_memory_impl() -> Option<(usize, usize)> {
     // /proc/meminfo reports both, in kB. MemAvailable is the kernel's own estimate of what a new allocation can have;
     // MemFree undercounts badly because of the page cache.
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -230,7 +230,7 @@ fn mac_available(vm_stat: &str) -> Option<usize> {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn host_memory_impl() -> Option<(usize, usize)> {
+pub(crate) fn host_memory_impl() -> Option<(usize, usize)> {
     // std has no memory query and this crate's other readers are one call each: here two programs' text, so nothing
     // of the system's headers is declared by hand for a computer no test of this crate has run on.
     let total = total_memory()? as usize;
@@ -239,7 +239,7 @@ pub(super) fn host_memory_impl() -> Option<(usize, usize)> {
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-pub(super) fn host_memory_impl() -> Option<(usize, usize)> {
+pub(crate) fn host_memory_impl() -> Option<(usize, usize)> {
     None
 }
 

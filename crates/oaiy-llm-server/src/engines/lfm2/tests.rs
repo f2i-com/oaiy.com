@@ -150,8 +150,8 @@ fn lfm2s_engine_is_transformers() {
     let backend: Arc<dyn ggml_rs::Backend> = Arc::new(ggml_rs::CpuBackend::new());
     let g = gguf::GgufFile::open(&path).unwrap();
     let make = |_: usize, e: crate::llm::ExpertBlocks| -> crate::llm::Result<Box<dyn ggml_rs::exl3::Experts>> {
-        let data = ggml_rs_wgpu::quant_moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
-        ggml_rs_wgpu::quant_moe::quant_experts_cpu(data).map_err(crate::llm::LlamaError::Config)
+        let data = ggml_rs_wgpu::quant::moe::QuantExpertsData { hidden: e.hidden, ff: e.ff, experts: e.experts, gate: e.gate, up: e.up, down: e.down, shared: e.shared, routing: e.routing };
+        ggml_rs_wgpu::quant::moe::quant_experts_cpu(data).map_err(crate::llm::LlamaError::Config)
     };
     let m = crate::llm::Qwen35Model::from_gguf_with(&g, Arc::clone(&backend), Some(&make)).unwrap();
     assert!(m.blocks.iter().any(|b| matches!(b, crate::llm::Qwen35Block::Conv { moe: Some(_), .. })) && m.blocks.iter().any(|b| matches!(b, crate::llm::Qwen35Block::Attention { moe: None, .. })));

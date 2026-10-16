@@ -20,7 +20,7 @@ impl Recorder<'_> {
     pub(crate) fn exl3_rows_of(&mut self, w: &dyn ggml_rs::exl3::PackedLinear, x: &DeviceVec, up: Option<&DeviceVec>, y: &DeviceVec, rows: usize) {
         // a projection with a low-rank update beside it (a LoRA adapter's): the base's rows, then `B (A x)` added to
         // them; a SwiGLU's product, where one is asked for, made once for both
-        if let Some(l) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::LowRank>()) {
+        if let Some(l) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant::linear::LowRank>()) {
             let ((k, n), r) = (l.kn(), l.rank());
             assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n, "chain: a projection [{n}, {k}] with a rank {r} update, of {rows} rows");
             // The three vectors between its products are the recording's own, every adapted projection's in turn
@@ -42,7 +42,7 @@ impl Recorder<'_> {
         }
         // a GGUF's matrix: the quantized matmul of its rows as they are (no transform either side, no channel map),
         // a SwiGLU's product made first where one is asked for
-        if let Some(q) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::QuantLinear>()) {
+        if let Some(q) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant::linear::QuantLinear>()) {
             let (k, n) = q.kn();
             assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n, "chain: a quantized projection [{n}, {k}] of {rows} rows");
             match up {
@@ -56,7 +56,7 @@ impl Recorder<'_> {
             return;
         }
         // (and its matrices of floats, as f16)
-        if let Some(f) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant_linear::HalfLinear>()) {
+        if let Some(f) = w.as_any().and_then(|a| a.downcast_ref::<crate::quant::linear::HalfLinear>()) {
             let (k, n) = f.kn();
             assert!(rows > 0 && x.len >= rows * k && y.len >= rows * n, "chain: an f16 projection [{n}, {k}] of {rows} rows");
             match up {
