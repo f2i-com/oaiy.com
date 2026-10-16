@@ -35,7 +35,7 @@ import { TOOLS } from './agent/tools';
 import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
 import { startTheme } from './ui/theme';
-import { discoverOaiy, mediaAbilities, mergeDiscovered, originOf, type Discovery } from './agent/media';
+import { discoverOaiy, mediaAbilities, mergeDiscovered, originOf, type Discovery, type LlmModel } from './agent/media';
 import { moveOaiy, movedGateway, whereToFollow, whereToLook } from './agent/lookup';
 import { pageHost } from '@oaiy/shared/capabilities/host';
 import type { FeatureId } from '@oaiy/shared/capabilities/features';
@@ -488,10 +488,8 @@ async function main(): Promise<void> {
   });
   const providerChip = h('button.chip.model', { title: 'AI provider', onclick: () => void editSettings() });
   // Where the Agent runs on OAIY's engine, the chip is a menu of the engine's language models instead: choosing one is
-  // choosing it in Engines (the model that loads). Beside it, on a Mac whose eGPU is switched on, the model the card
-  // holds. See renderPickers.
+  // choosing it in Engines (the one model loaded, on a Mac's eGPU or on the Mac, as Engines sets it). See renderPickers.
   const modelPick = h('select.chip.model.pick', { hidden: true, 'aria-label': "The model OAIY's engine runs", onchange: () => void pickModel(modelPick.value) }) as HTMLSelectElement;
-  const egpuPick = h('select.chip.egpu.pick', { hidden: true, 'aria-label': "The model on OAIY's eGPU", onchange: () => void pickEgpu(egpuPick.value) }) as HTMLSelectElement;
   const phoneChip = h('button.chip.toggle.phone', { title: 'Phone: OAIY Desktop, Aokie and text messages', onclick: () => void openPhone() });
   // A call going on now: who with, and a click shows it.
   const callChip = h('button.chip.on-call', { hidden: true, onclick: () => {
@@ -582,11 +580,32 @@ async function main(): Promise<void> {
     if (now !== next) pick.replaceChildren(...options);
   }
 
+  type OaiyFound = Extract<Discovery, { state: 'found' }>;
+  /** Whether OAIY's engine offers its eGPU and it is switched on (a Mac's card, set up in Engines → Settings → eGPU). */
+  const cardOn = (found: OaiyFound | null | undefined): boolean => !!found?.llm.egpu.available && !!found.llm.egpu.enabled;
+
   /**
-   * The header's pickers. The model menu stands in for the provider chip while `p`, the Agent's provider, is the OAIY
-   * whose discovery was read: its language models, each one on the eGPU said so. The eGPU's menu shows where the
-   * engine offers one and it is switched on (in Engines → Settings → eGPU, where the card is set up), with a desktop to
-   * set it through: no model, or the one the card holds, and how its loading goes.
+   * Where `m` is, said after its name in the model menu, on a Mac whose eGPU is switched on: the eGPU or this Mac (as
+   * Engines sets each model), and for the chosen one how its loading goes. With no eGPU, nothing.
+   */
+  function modelPlace(found: OaiyFound, m: LlmModel, chosen: boolean): { text: string; state?: 'ready' | 'starting' | 'failed' | 'stopped' } {
+    if (!cardOn(found)) return { text: '' };
+    if (!m.egpu) return chosen ? { text: ` · Mac · ${m.loaded ? 'ready' : 'not loaded'}`, state: m.loaded ? 'ready' : 'stopped' } : { text: ' · Mac' };
+    const egpu = found.llm.egpu;
+    if (!chosen) return { text: ' · eGPU' };
+    if (egpu.model !== m.id) return { text: ' · eGPU · not loaded', state: 'stopped' };
+    if (egpu.lent) return { text: ' · eGPU · making media', state: 'starting' };
+    if (egpu.paused) return { text: ' · eGPU · paused', state: 'starting' };
+    const state = egpu.state === 'ready' || egpu.state === 'starting' || egpu.state === 'failed' ? egpu.state : 'stopped';
+    return { text: ` · eGPU · ${{ ready: 'ready', starting: 'loading…', failed: 'failed', stopped: 'not loaded' }[state]}`, state };
+  }
+
+  /**
+   * The header's model menu. It stands in for the provider chip while `p`, the Agent's provider, is the OAIY whose
+   * discovery was read: its language models, one chosen. On a Mac whose eGPU is switched on each says where it runs,
+   * the eGPU or this Mac, and the chosen one how its loading goes: one menu, one model loaded, never one on the card
+   * and another (or the same) in the Mac's memory beside it. Choosing one loads it where it runs, and the other lets go
+   * of what it held.
    */
   function renderPickers(p: ProviderConfig | null): void {
     const found = engineFound;
@@ -594,28 +613,20 @@ async function main(): Promise<void> {
     const onEngine = !!p && !!found && p.serverKind === 'oaiy' && originOr(p.baseUrl) === found.origin && models.length > 0;
     providerChip.hidden = onEngine;
     modelPick.hidden = !onEngine;
-    if (onEngine && p && found) {
-      const options = models.map((m) => h('option', { value: m.id, selected: m.id === p.modelId }, `${p.name} · ${m.id}${m.egpu ? ' · eGPU' : ''}`));
-      // A model set by hand that the engine does not have (or none yet) is shown as it is.
-      if (!models.some((m) => m.id === p.modelId)) options.unshift(h('option', { value: '', selected: true, disabled: true }, `${p.name} · ${p.modelId || 'no model'}`));
-      options.push(h('option', { value: PROVIDERS }, 'AI providers…'));
-      replaceOptions(modelPick, options);
-      modelPick.title = p.followEngine
-        ? "The model OAIY's engine runs, as chosen in Engines: the Agent, the phone's agents and flows use it. Choosing another here chooses it there, and it loads with the next message."
-        : `The model this page asks OAIY for (set in Settings, not following Engines). Choosing one here chooses it in Engines too.`;
-    }
-    const egpu = found?.llm.egpu;
-    const showEgpu = !!found && !!desktop && !!egpu?.available && !!egpu.enabled && models.length > 0;
-    egpuPick.hidden = !showEgpu;
-    if (!showEgpu || !egpu) return;
-    const held = models.find((m) => m.egpu)?.id ?? '';
-    const how = !held ? '' : egpu.lent ? ' · making media' : egpu.paused ? ' · paused' : egpu.state === 'ready' ? ' · ready' : egpu.state === 'starting' ? ' · loading…' : egpu.state === 'failed' ? ' · failed' : ' · not loaded';
-    replaceOptions(egpuPick, [
-      h('option', { value: '', selected: !held }, 'eGPU: no model'),
-      ...models.map((m) => h('option', { value: m.id, selected: m.id === held }, `eGPU: ${m.id}${m.id === held ? how : ''}`)),
-    ]);
-    egpuPick.dataset.state = !held ? 'none' : egpu.lent || egpu.paused ? 'starting' : (egpu.state ?? 'stopped');
-    egpuPick.title = `The language model on the eGPU (${egpu.engine === 'webgpu' ? "OAIY's engine over WebGPU" : "tinygrad's LLM server"} on the card): a chat with it is answered there. ${held ? `${held} is ${egpu.lent ? 'paused while the card makes a picture, a video or a sound' : egpu.paused ? 'paused after a picture, and loads with the next chat' : egpu.state === 'ready' ? 'loaded' : egpu.state === 'starting' ? 'loading' : egpu.state === 'failed' ? 'set, but did not load (see Engines → Logs)' : 'set, and loads when it is first asked'}.` : 'None is set.'}`;
+    if (!onEngine || !p || !found) return;
+    const options = models.map((m) => h('option', { value: m.id, selected: m.id === p.modelId }, `${p.name} · ${m.id}${modelPlace(found, m, m.id === p.modelId).text}`));
+    // A model set by hand that the engine does not have (or none yet) is shown as it is.
+    if (!models.some((m) => m.id === p.modelId)) options.unshift(h('option', { value: '', selected: true, disabled: true }, `${p.name} · ${p.modelId || 'no model'}`));
+    options.push(h('option', { value: PROVIDERS }, 'AI providers…'));
+    replaceOptions(modelPick, options);
+    const chosen = models.find((m) => m.id === p.modelId);
+    const state = chosen ? modelPlace(found, chosen, true).state : undefined;
+    if (state) modelPick.dataset.state = state;
+    else delete modelPick.dataset.state;
+    modelPick.title = (p.followEngine
+      ? "The model OAIY's engine runs, as chosen in Engines: the Agent, the phone's agents and flows use it. Choosing another here chooses it there, and it loads now."
+      : `The model this page asks OAIY for (set in Settings, not following Engines). Choosing one here chooses it in Engines too.`)
+      + (cardOn(found) ? ' Each runs on the eGPU or on this Mac, as Engines sets it; one is loaded at a time, and choosing another lets the eGPU, or this Mac, go of the one it held.' : '');
   }
 
   /** OAIY's discovery document read again, after a change made here: the pickers and the providers that follow Engines. */
@@ -638,7 +649,7 @@ async function main(): Promise<void> {
       return;
     }
     if (!p || !model || (model === p.modelId && (p.followEngine || !desktop))) return renderChips();
-    const onEgpu = engineFound?.llm.details.find((m) => m.id === model)?.egpu ?? false;
+    const onEgpu = cardOn(engineFound) && (engineFound?.llm.details.find((m) => m.id === model)?.egpu ?? false);
     modelPick.disabled = true;
     try {
       if (desktop) {
@@ -649,9 +660,13 @@ async function main(): Promise<void> {
         p.followEngine = false;
       }
       await saveProviders(providers, activeId);
-      chat.system(desktop
-        ? `OAIY's engine now runs ${model}${onEgpu ? ', on the eGPU' : ''}: the Agent, the phone's agents and flows use it. It loads with the next message.`
-        : `The Agent now asks OAIY for ${model}.`);
+      chat.system(!desktop
+        ? `The Agent now asks OAIY for ${model}.`
+        : onEgpu
+          ? `OAIY's engine now runs ${model}, on the eGPU: the Agent, the phone's agents and flows use it. It is loading on the card now, and this Mac's engine lets go of any model it held.`
+          : cardOn(engineFound)
+            ? `OAIY's engine now runs ${model}, on this Mac: the Agent, the phone's agents and flows use it. It is loading now, and the eGPU lets go of its model.`
+            : `OAIY's engine now runs ${model}: the Agent, the phone's agents and flows use it. It is loading now.`);
     } catch (error) {
       chat.system(`Could not choose ${model}: ${(error as Error).message}`, 'error');
     } finally {
@@ -659,39 +674,28 @@ async function main(): Promise<void> {
     }
     renderChips();
     await refreshEngine();
+    if (desktop && onEgpu) void watchEgpu(model);
   }
 
-  /** A model chosen in the eGPU's menu ('': none): set in Engines, and loaded on the card now. */
-  async function pickEgpu(model: string): Promise<void> {
-    const d = desktop;
-    if (!d) return renderChips();
-    const uses = agentProvider('project')?.modelId === model;
-    egpuPick.disabled = true;
-    try {
-      const egpu = await d.setEgpuModel(model || null, AbortSignal.timeout(30_000));
-      if (!model) chat.system('No model runs on the eGPU now: the card is let go, and every model runs on this Mac.');
-      else if (egpu.error) chat.system(`${model} is set to run on the eGPU, but it did not start loading: ${egpu.error}`, 'error');
-      else chat.system(`Loading ${model} on the eGPU…${uses ? '' : ' Choose it in the model menu to run the Agent on it.'}`);
-    } catch (error) {
-      chat.system(`Could not set the eGPU's model: ${(error as Error).message}`, 'error');
-    } finally {
-      egpuPick.disabled = false;
-    }
-    await refreshEngine();
-    if (model) void watchEgpu(model);
-  }
-
-  /** While `model` loads on the eGPU, the menu is kept up to date, and its end is said (for up to ten minutes). */
+  /**
+   * While `model`, just chosen, loads on the eGPU, the menu is kept up to date, and its end is said (for up to ten
+   * minutes): its load begins beside the choice, so a first look may find the card not yet starting. Another model
+   * chosen meanwhile ends the watch.
+   */
   async function watchEgpu(model: string): Promise<void> {
     const until = Date.now() + 600_000;
-    while (Date.now() < until && engineFound?.llm.egpu.state === 'starting') {
+    const begun = Date.now();
+    for (;;) {
+      const egpu = engineFound?.llm.egpu;
+      const chosen = agentProvider('project')?.modelId === model;
+      if (!chosen || Date.now() > until) return;
+      if (egpu?.model === model && egpu.state === 'ready') return chat.system(`${model} is loaded on the eGPU.`);
+      if (egpu?.model === model && egpu.state === 'failed') return chat.system(`${model} did not load on the eGPU: Engines → Logs says why.`, 'error');
+      // (not begun within half a minute: it loads with the next message instead, as the engines' log says)
+      if (egpu?.state !== 'starting' && Date.now() - begun > 30_000) return;
       await new Promise((r) => setTimeout(r, 3000));
       await refreshEngine();
     }
-    const egpu = engineFound?.llm.egpu;
-    if (egpu?.model !== model) return;
-    if (egpu.state === 'ready') chat.system(`${model} is loaded on the eGPU.`);
-    else if (egpu.state === 'failed') chat.system(`${model} did not load on the eGPU: Engines → Logs says why.`, 'error');
   }
   gate.onChange(() => {
     renderChips();
@@ -1746,7 +1750,6 @@ A project can hold several apps, each in its own folder (any folder whose manife
     callChip,
     outreachChip,
     gateChip,
-    egpuPick,
     providerChip,
     modelPick,
     h('button.settings-button', { title: 'AI providers', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),

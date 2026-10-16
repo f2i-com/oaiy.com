@@ -139,16 +139,26 @@ fn free_port() -> Result<u16, String> {
 }
 
 /// The oaiy-llm-server command line for the `llm` section. `root` resolves relative paths.
-/// Whether this computer's engine has a model of its own to hold: not when every enabled model is set to run on the
-/// eGPU (and it is switched on), whose server holds them. Then nothing starts it ahead of time (at launch, after a
-/// change of settings, after media jobs); a request the eGPU cannot answer still does ([`Llm::ensure_ready`]).
+/// The language model chosen in Engines (`default_model`), or the first enabled one where none is.
+pub fn default_model(llm: &Json) -> String {
+    let d = str_or(llm, "default_model", "").trim();
+    if !d.is_empty() {
+        return d.to_string();
+    }
+    llm.get("models").and_then(Json::as_array).and_then(|m| m.iter().find(|m| bool_or(m, "enabled", true))).map(|m| str_or(m, "name", "").to_string()).unwrap_or_default()
+}
+
+/// Whether this computer's engine holds a model ahead of time: the default model ([`default_model`]), where it runs
+/// here. Not where it is set to run on the eGPU (and that is switched on), whose server holds it: one model is loaded
+/// at a time, on the card or here, never one on each (a 24 GB Mac held a model of its own in its memory beside the
+/// card's for nothing). Then nothing starts this engine ahead of time (at launch, after a change of settings, after
+/// media jobs); a request for a model of its own, or one the eGPU cannot answer, still does ([`Llm::ensure_ready`]).
 pub fn holds_a_model(llm: &Json) -> bool {
-    let enabled = llm.get("models").and_then(Json::as_array).unwrap_or(&[]).iter().filter(|m| bool_or(m, "enabled", true)).map(|m| str_or(m, "name", ""));
-    !crate::egpu::enabled(llm) || enabled.into_iter().any(|name| !crate::egpu::assigned(llm, name))
+    !crate::egpu::enabled(llm) || !crate::egpu::assigned(llm, &default_model(llm))
 }
 
 /// What the log says when [`holds_a_model`] is false and the engine is left stopped.
-pub const ALL_ON_EGPU: &str = "every language model runs on the eGPU: this computer's engine starts only for a request the eGPU cannot answer";
+pub const ALL_ON_EGPU: &str = "the language model runs on the eGPU: this computer's engine starts only for a request for a model of its own, or one the eGPU cannot answer";
 
 pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bool) -> Result<(Vec<String>, Vec<String>), String> {
     arguments_for(llm, root, port, key, local_images, None)
@@ -741,14 +751,20 @@ mod tests {
     }
 
     #[test]
-    fn with_every_model_on_the_egpu_this_computers_engine_holds_none() {
+    fn with_the_default_model_on_the_egpu_this_computers_engine_holds_none() {
         let holds = |llm: &str| holds_a_model(&Json::parse(llm.as_bytes()).unwrap());
         let all = r#""models": [{"name": "a", "egpu": true}, {"name": "b", "egpu": true}, {"name": "c", "enabled": false}]"#;
         // Every enabled model is the eGPU's (a switched-off one does not count): nothing to load here ahead of time.
         assert!(!holds(&format!(r#"{{"egpu": {{"enabled": true}}, {all}}}"#)));
-        // The eGPU switched off, or one enabled model of this computer's own: the engine starts as ever.
+        // The eGPU switched off: the engine starts as ever.
         assert!(holds(&format!(r#"{{"egpu": {{"enabled": false}}, {all}}}"#)));
-        assert!(holds(r#"{"egpu": {"enabled": true}, "models": [{"name": "a", "egpu": true}, {"name": "c"}]}"#));
         assert!(holds(r#"{"models": [{"name": "a", "egpu": true}]}"#));
+        // A model of this computer's own beside the card's: the default says which is held (the first enabled model
+        // where none is chosen), never both.
+        let mixed = r#""models": [{"name": "a", "egpu": true}, {"name": "c"}]"#;
+        assert!(!holds(&format!(r#"{{"egpu": {{"enabled": true}}, {mixed}}}"#)));
+        assert!(!holds(&format!(r#"{{"egpu": {{"enabled": true}}, "default_model": "a", {mixed}}}"#)));
+        assert!(holds(&format!(r#"{{"egpu": {{"enabled": true}}, "default_model": "c", {mixed}}}"#)));
+        assert_eq!(default_model(&Json::parse(format!(r#"{{{mixed}}}"#).as_bytes()).unwrap()), "a");
     }
 }

@@ -1,7 +1,8 @@
-// The Agent's header chooses OAIY's models: a mock OAIY (two language models, one on a Mac's eGPU) and a mock OAIY
-// Desktop the page is given, as OAIY's window gives it. The model menu lists the engine's models and chooses one in
-// Engines (through the desktop); the eGPU's menu sets the model on the card and says how its loading goes; chats then
-// are answered by the model chosen.
+// The Agent's header chooses OAIY's models: a mock OAIY (two language models, one set to run on a Mac's eGPU, one on
+// the Mac) and a mock OAIY Desktop the page is given, as OAIY's window gives it. One menu lists the engine's models,
+// each with where it runs, and chooses one in Engines (through the desktop), which loads it where it runs and has the
+// other let go of what it held (as the engines do: one model loaded at a time); the menu says how its loading goes;
+// chats then are answered by the model chosen.
 //   node tests/e2e/oaiy-models.mjs
 import { existsSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
@@ -14,9 +15,10 @@ if (!executablePath) {
   process.exit(2);
 }
 
-// What the engines have: the model chosen in Engines, the one set to the eGPU, and how its loading goes (it is ready
-// at the second look after a start).
-const engines = { default: 'qwen3.8-27b', egpu: 'qwen3.8-27b', state: 'ready', looks: 0 };
+// What the engines have: the model chosen in Engines, the one the card holds and how its loading goes (it is ready
+// at the second look after a start), and the one this Mac's engine holds. The 27B is set to the eGPU, the 9B to the Mac.
+const ON_CARD = 'qwen3.8-27b';
+const engines = { default: 'qwen3.8-27b', card: 'qwen3.8-27b', state: 'ready', looks: 0, mac: null };
 const chats = [];
 const asked = [];
 
@@ -30,11 +32,11 @@ function discovery(origin) {
     auth: { type: 'none', required: false },
     endpoints: [{ name: 'chat', path: '/v1/chat/completions', url: `${origin}/v1/chat/completions`, spec: 'openai' }],
     models: {
-      llm: ['qwen3.8-27b', 'qwen3.5-9b'].map((id) => ({ id, default: id === engines.default, loaded: false, egpu: id === engines.egpu })),
+      llm: ['qwen3.8-27b', 'qwen3.5-9b'].map((id) => ({ id, default: id === engines.default, loaded: id === engines.mac, egpu: id === ON_CARD })),
     },
     defaults: { llm: engines.default },
     llm: { context_tokens: 32768 },
-    egpu: { available: true, enabled: true, engine: 'webgpu', state: engines.egpu ? engines.state : 'stopped', model: engines.egpu, models: engines.egpu ? [engines.egpu] : [], lent: false, paused: false },
+    egpu: { available: true, enabled: true, engine: 'webgpu', state: engines.card ? engines.state : 'stopped', model: engines.card, models: [ON_CARD], lent: false, paused: false },
   };
 }
 
@@ -73,22 +75,19 @@ const oaiy = createHttpServer(async (req, res) => {
   reply(res, 404, { error: { message: `no route ${req.method} ${url}` } });
 });
 
-// OAIY Desktop: the engines' relay (choosing a model, the eGPU's), every other route not there.
+// OAIY Desktop: the engines' relay (choosing a model), every other route not there. The engines load the model chosen
+// where it runs and let the other go of what it held.
 const desktop = createHttpServer(async (req, res) => {
   cors(res);
   if (req.method === 'OPTIONS') return res.end();
   const body = await read(req);
   const url = req.url.split('?')[0];
-  if (req.method === 'PUT' && (url === '/api/engines/defaults' || url === '/api/engines/egpu')) {
-    asked.push({ url, auth: req.headers.authorization, body: JSON.parse(body) });
-    if (url === '/api/engines/defaults') {
-      engines.default = JSON.parse(body).model;
-      return reply(res, 200, { group: 'llm', model: engines.default });
-    }
-    engines.egpu = JSON.parse(body).model;
-    engines.state = engines.egpu ? 'starting' : 'stopped';
-    engines.looks = 0;
-    return reply(res, 200, { model: engines.egpu, egpu: { state: engines.state, model: engines.egpu, error: null }, error: null });
+  asked.push({ method: req.method, url, auth: req.headers.authorization, body: body ? JSON.parse(body) : null });
+  if (req.method === 'PUT' && url === '/api/engines/defaults') {
+    engines.default = JSON.parse(body).model;
+    const card = engines.default === ON_CARD;
+    Object.assign(engines, card ? { card: engines.default, state: 'starting', looks: 0, mac: null } : { card: null, state: 'stopped', mac: engines.default });
+    return reply(res, 200, { group: 'llm', model: engines.default });
   }
   reply(res, 404, { error: 'not here' });
 });
@@ -127,26 +126,28 @@ try {
   await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Found oaiy-studio 0.1.0'), { timeout: 15_000 });
   const menu = (cls) => page.$eval(`select.${cls}.pick`, (s) => ({ hidden: s.hidden, value: s.value, options: [...s.options].map((o) => o.textContent), shown: s.selectedOptions[0]?.textContent }));
 
-  await check("the header's model menu lists the engine's language models, the one on the eGPU marked, in place of the provider chip", async () => {
+  await check("one menu lists the engine's language models, each with where it runs, the chosen one ready on the eGPU, in place of the provider chip", async () => {
     await page.waitForFunction(() => !document.querySelector('select.model.pick')?.hidden, { timeout: 10_000 });
     const m = await menu('model');
-    expect(m.value === 'qwen3.8-27b' && m.shown === 'OAIY · qwen3.8-27b · eGPU', JSON.stringify(m));
-    expect(m.options.includes('OAIY · qwen3.5-9b') && m.options.includes('AI providers…'), JSON.stringify(m.options));
+    expect(m.value === 'qwen3.8-27b' && m.shown === 'OAIY · qwen3.8-27b · eGPU · ready', JSON.stringify(m));
+    expect(m.options.includes('OAIY · qwen3.5-9b · Mac') && m.options.includes('AI providers…'), JSON.stringify(m.options));
+    expect(await page.$eval('select.model.pick', (s) => s.dataset.state) === 'ready', 'the menu is not shown ready');
     expect(await page.$eval('button[title="AI provider"]', (b) => b.hidden), 'the provider chip is still shown beside it');
+    expect(!(await page.$('select.egpu.pick')), 'a second menu, for the eGPU, is still there');
   });
 
-  await check("the eGPU's menu says the model on the card, and that it is ready", async () => {
-    const e = await menu('egpu');
-    expect(!e.hidden && e.value === 'qwen3.8-27b' && e.shown === 'eGPU: qwen3.8-27b · ready', JSON.stringify(e));
-    expect(e.options[0] === 'eGPU: no model' && e.options.includes('eGPU: qwen3.5-9b'), JSON.stringify(e.options));
-  });
-
-  await check("choosing a model chooses it in Engines, through the desktop, and the Agent's chats are answered by it", async () => {
+  await check("choosing a Mac's model chooses it in Engines, through the desktop: it loads on the Mac, the card lets go, and chats are answered by it", async () => {
     await page.select('select.model.pick', 'qwen3.5-9b');
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("OAIY's engine now runs qwen3.5-9b"), { timeout: 10_000 });
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("OAIY's engine now runs qwen3.5-9b, on this Mac"), { timeout: 10_000 });
+    expect(await page.$eval('.chat-log', (l) => l.textContent.includes('the eGPU lets go of its model')), 'the card letting go is not said');
     const put = asked.find((a) => a.url === '/api/engines/defaults');
     expect(put && put.auth === 'Bearer desktop-token' && put.body.group === 'llm' && put.body.model === 'qwen3.5-9b', JSON.stringify(asked));
-    await page.waitForFunction(() => document.querySelector('select.model.pick')?.value === 'qwen3.5-9b', { timeout: 10_000 });
+    expect(!asked.some((a) => a.url === '/api/engines/egpu'), 'the eGPU was set apart from the choice');
+    await page.waitForFunction(() => document.querySelector('select.model.pick')?.selectedOptions[0]?.textContent === 'OAIY · qwen3.5-9b · Mac · ready', { timeout: 10_000 }).catch(async (e) => {
+      throw new Error(`${e.message}\n${JSON.stringify(await menu('model'))}`);
+    });
+    const m = await menu('model');
+    expect(m.options.includes('OAIY · qwen3.8-27b · eGPU'), JSON.stringify(m.options));
     await page.type('.chat-input', 'Hello there.');
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Answered by qwen3.5-9b.'), { timeout: 30_000 }).catch(async (e) => {
@@ -156,33 +157,25 @@ try {
     expect(chats.at(-1).model === undefined, chats.at(-1)?.model);
   });
 
-  await check("choosing the eGPU's model sets it there and loads it, and the menu follows its loading", async () => {
-    await page.select('select.egpu.pick', 'qwen3.5-9b');
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Loading qwen3.5-9b on the eGPU'), { timeout: 10_000 });
-    const put = asked.find((a) => a.url === '/api/engines/egpu');
-    expect(put && put.auth === 'Bearer desktop-token' && put.body.model === 'qwen3.5-9b', JSON.stringify(asked));
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('qwen3.5-9b is loaded on the eGPU.'), { timeout: 20_000 });
-    const e = await menu('egpu');
-    expect(e.value === 'qwen3.5-9b' && e.shown === 'eGPU: qwen3.5-9b · ready', JSON.stringify(e));
+  await check("choosing the eGPU's model loads it on the card, the Mac lets go, and the menu follows its loading", async () => {
+    await page.select('select.model.pick', 'qwen3.8-27b');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("OAIY's engine now runs qwen3.8-27b, on the eGPU"), { timeout: 10_000 });
+    expect(await page.$eval('.chat-log', (l) => l.textContent.includes("this Mac's engine lets go of any model it held")), 'the Mac letting go is not said');
+    expect(asked.at(-1).url === '/api/engines/defaults' && asked.at(-1).body.model === 'qwen3.8-27b', JSON.stringify(asked.at(-1)));
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('qwen3.8-27b is loaded on the eGPU.'), { timeout: 20_000 });
     const m = await menu('model');
-    expect(m.shown === 'OAIY · qwen3.5-9b · eGPU', JSON.stringify(m));
+    expect(m.value === 'qwen3.8-27b' && m.shown === 'OAIY · qwen3.8-27b · eGPU · ready', JSON.stringify(m));
+    expect(m.options.includes('OAIY · qwen3.5-9b · Mac'), 'the Mac still shown holding its model: ' + JSON.stringify(m.options));
   });
 
-  await check("'no model' lets the card go", async () => {
-    await page.select('select.egpu.pick', '');
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('No model runs on the eGPU now'), { timeout: 10_000 });
-    expect(asked.at(-1).url === '/api/engines/egpu' && asked.at(-1).body.model === null, JSON.stringify(asked.at(-1)));
-  });
-
-  await check('the header drawn again with nothing changed leaves its menus as they are (one open stays open)', async () => {
+  await check('the header drawn again with nothing changed leaves its menu as it is (one open stays open)', async () => {
     await page.$eval('select.model.pick', (s) => { window.__modelOption = s.options[0]; });
-    await page.$eval('select.egpu.pick', (s) => { window.__egpuOption = s.options[0]; });
     const before = asked.length;
     // the model it runs already: nothing to choose, the header drawn again (as the minute's timer draws it)
-    await page.select('select.model.pick', 'qwen3.5-9b');
+    await page.select('select.model.pick', 'qwen3.8-27b');
     await new Promise((r) => setTimeout(r, 300));
     expect(asked.length === before, `asked ${JSON.stringify(asked.slice(before))}`);
-    expect(await page.evaluate(() => window.__modelOption.isConnected && window.__egpuOption.isConnected), "the menus' options were made again");
+    expect(await page.evaluate(() => window.__modelOption.isConnected), "the menu's options were made again");
   });
 
   if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT, clip: { x: 0, y: 0, width: 1400, height: 70 } });

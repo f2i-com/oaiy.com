@@ -1095,10 +1095,9 @@ select.chip.pick { appearance: none; -webkit-appearance: none; display: inline-b
 select.chip.pick:disabled { opacity: 0.6; cursor: progress; }
 /* (its display above beat the hidden attribute: the eGPU's menu, with no eGPU to offer, was an empty dropdown) */
 select.chip.pick[hidden] { display: none; }
-select.chip.egpu[data-state='ready'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
-select.chip.egpu[data-state='starting'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background-color: var(--warn-soft); }
-select.chip.egpu[data-state='failed'] { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); background-color: var(--err-soft); }
-select.chip.egpu[data-state='none'] { color: var(--muted); }
+select.chip.model.pick[data-state='ready'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+select.chip.model.pick[data-state='starting'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background-color: var(--warn-soft); }
+select.chip.model.pick[data-state='failed'] { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); background-color: var(--err-soft); }
 .chip.on-call::before { content: ''; flex: none; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: var(--glow) currentColor; animation: pulse 1.2s ease-in-out infinite; }
 .phone-form { display: flex; flex-direction: column; gap: 10px; }
 .phone-form textarea { width: 100%; min-height: 90px; resize: vertical; }

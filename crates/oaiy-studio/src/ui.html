@@ -1855,7 +1855,7 @@ function renderState() {
   if (!state) return;
   const own = state.llm;
   const card = state.egpu;
-  // Every model set to the eGPU: "the language model" is the card's server's, and this card is of that one (its
+  // The default model set to the eGPU: "the language model" is the card's server's, and this card is of that one (its
   // buttons too: the studio starts and stops the card's). It said "Stopped" over a model loaded on the eGPU, its
   // Stop left that model there, and its Start loaded the model a second time on this computer. This computer's
   // engine is shown instead only while it runs or loads (standing in for a card that does not answer); one that

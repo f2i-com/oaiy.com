@@ -26,22 +26,4 @@ describe("the engines' models, through the desktop", () => {
     // The engines' reason for refusing is the error.
     await expect(desktop.chooseEngineModel('nope')).rejects.toThrow('is not one of the listed models');
   });
-
-  it("sets the eGPU's model, or none, and answers how its loading started", async () => {
-    const requests = relay([
-      [200, { model: 'qwen3.8-27b', egpu: { state: 'starting', model: 'qwen3.8-27b', error: null }, error: null }],
-      [200, { model: 'qwen3.8-27b', egpu: { state: 'failed', model: null, error: 'the card is held by another program' }, error: null }],
-      [200, { model: null, egpu: { state: 'stopped', model: null, error: null }, error: null }],
-      [409, { error: 'the eGPU is switched off: switch it on in Engines → Settings → eGPU, where the card is set up' }],
-    ]);
-    const desktop = new Desktop('http://127.0.0.1:17972', 'tok');
-    expect(await desktop.setEgpuModel('qwen3.8-27b')).toEqual({ state: 'starting', model: 'qwen3.8-27b', error: undefined });
-    expect(requests[0].url).toBe('http://127.0.0.1:17972/api/engines/egpu');
-    expect(requests[0].init.method).toBe('PUT');
-    expect(JSON.parse(String(requests[0].init.body))).toEqual({ model: 'qwen3.8-27b' });
-    expect(await desktop.setEgpuModel('qwen3.8-27b')).toMatchObject({ state: 'failed', error: 'the card is held by another program' });
-    expect(await desktop.setEgpuModel(null)).toEqual({ state: 'stopped', model: undefined, error: undefined });
-    expect(JSON.parse(String(requests[2].init.body))).toEqual({ model: null });
-    await expect(desktop.setEgpuModel('qwen3.8-27b')).rejects.toThrow('the eGPU is switched off');
-  });
 });

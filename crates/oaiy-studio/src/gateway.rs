@@ -2043,6 +2043,46 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One language model loaded at a time, where the default runs: a default chosen on this computer has the card let
+    /// go of its model (and this computer's engine begin loading it); one chosen on the eGPU has the card load it at
+    /// once, with nothing asked of it yet; a change that leaves the default where it was starts and stops nothing.
+    #[cfg(unix)]
+    #[test]
+    fn choosing_the_default_model_loads_it_where_it_runs_and_lets_the_other_go() {
+        let dir = fake_dir("place");
+        let Some(studio) = fake_card(&dir) else { return };
+        let there = || studio.egpu.status(studio.config().get("llm").unwrap()).get("state").and_then(Json::as_str).unwrap_or("").to_string();
+        let with = |edit: &dyn Fn(&mut Json)| {
+            let mut cfg = studio.config();
+            edit(crate::registry::obj_mut(&mut cfg, &["llm"]).unwrap());
+            studio.set_config(cfg).unwrap_or_else(|e| panic!("{e}"));
+        };
+        let ask_x = r#"{"model": "x", "messages": [{"role": "user", "content": "hi"}]}"#;
+        let (status, _, body) = chat(&studio, ask_x);
+        assert!(status == 200 && body.contains("from the card"), "{status} {body}\n{}", studio.egpu.log.tail(40));
+        assert_eq!(starts(&studio), 1);
+
+        // y, this computer's: the card lets go of x, and this computer's engine is asked to load y
+        with(&|llm| crate::util::set(llm, "default_model", Json::str("y")));
+        until("the card to let go", || there() == "stopped");
+        until("y asked for here", || studio.log.tail(100).contains("y did not start loading on this computer") || studio.log.tail(100).contains("loading y on this computer"));
+
+        // x, the card's: loaded there at once, with no request for it
+        with(&|llm| crate::util::set(llm, "default_model", Json::str("x")));
+        until("x on the card again", || there() == "ready");
+        assert_eq!(studio.llm.status().get("state").and_then(Json::as_str), Some("stopped"), "nothing held here beside the card's");
+        assert_eq!(starts(&studio), 2);
+
+        // another setting (none of the language model's launch), the default where it was: nothing started or stopped
+        let mut cfg = studio.config();
+        crate::util::set(crate::registry::obj_mut(&mut cfg, &["media"]).unwrap(), "resume_llm", Json::Bool(false));
+        studio.set_config(cfg).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!((there().as_str(), starts(&studio)), ("ready", 2));
+        studio.egpu.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_picture_borrows_the_card_its_engine_pauses_and_comes_back_after() {

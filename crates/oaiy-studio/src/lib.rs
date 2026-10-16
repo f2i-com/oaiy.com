@@ -166,8 +166,47 @@ impl Studio {
             self.log.push("eGPU settings changed: stopping tinygrad's server");
             self.egpu.stop();
         }
+        self.place_the_model(&before, &next);
         self.log.push("configuration saved");
         Ok(next)
+    }
+
+    /// One language model loaded at a time, where the default model runs: a default chosen on the eGPU (or moved
+    /// there) has this computer's engine let go of the model it holds and the card load the default; one chosen
+    /// here has the card let go of its model and this computer's engine load the default. Now, not at the next
+    /// request (a model of 16 GB takes a minute to reach the card). Nothing changes while the default and where it
+    /// runs stay as they were: a request for another model still loads it where it runs ([`llm::holds_a_model`]).
+    fn place_the_model(&self, before: &Json, next: &Json) {
+        let placed = |v: &Json| {
+            let llm = v.get("llm").cloned().unwrap_or(Json::Null);
+            let default = llm::default_model(&llm);
+            (egpu::assigned(&llm, &default), default, bool_or(&llm, "enabled", true))
+        };
+        let (on_card, default, enabled) = placed(next);
+        if placed(before) == (on_card, default.clone(), enabled) || !enabled || default.is_empty() {
+            return;
+        }
+        if on_card && self.llm.is_running() {
+            self.log.push(format!("{default} runs on the eGPU: this computer's engine lets go of its model"));
+            self.llm.stop();
+        }
+        if !on_card && self.egpu.state() != llm::State::Stopped {
+            self.log.push(format!("{default} runs on this computer: the eGPU lets go of its model"));
+            self.egpu.stop();
+        }
+        // (the load begun beside the save, which it does not hold up: the card's waits for a server it replaces to
+        // be gone, up to 25 s)
+        let (egpu, mac, cfg, root, log) = (Arc::clone(&self.egpu), Arc::clone(&self.llm), next.clone(), self.root.clone(), Arc::clone(&self.log));
+        let begun = std::thread::Builder::new().name("place-model".into()).spawn(move || {
+            let (where_, started) = if on_card { ("on the eGPU", egpu.start(&cfg, &root, &default)) } else { ("on this computer", mac.start(&cfg, &root)) };
+            match started {
+                Ok(()) => log.push(format!("loading {default} {where_}")),
+                Err(e) => log.push(format!("{default} did not start loading {where_}: {e}")),
+            }
+        });
+        if let Err(e) = begun {
+            self.log.push(format!("the language model was not loaded ahead of time: {e}"));
+        }
     }
 
     /// Stop the language model and any media job, so no engine outlives the

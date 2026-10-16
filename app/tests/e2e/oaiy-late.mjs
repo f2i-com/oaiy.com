@@ -127,10 +127,11 @@ try {
   });
 
   // (A chip's own display beat the hidden attribute: with no eGPU offered, its menu was an empty dropdown in the header.)
-  await check('the header shows no eGPU menu where OAIY offers no eGPU, and no hidden chip at all', async () => {
+  await check("the header says nothing of an eGPU where OAIY offers none, and shows no hidden chip at all", async () => {
     const shown = await page.$$eval('.chip', (cs) => cs.filter((c) => c.hidden && getComputedStyle(c).display !== 'none').map((c) => c.className));
     expect(shown.length === 0, `hidden chips displayed: ${JSON.stringify(shown)}`);
-    expect(await page.$eval('select.egpu.pick', (s) => s.hidden && getComputedStyle(s).display === 'none'), 'the eGPU menu is displayed');
+    const places = await page.$$eval('select.model.pick option', (os) => os.map((o) => o.textContent).filter((t) => / · (eGPU|Mac)\b/.test(t)));
+    expect(places.length === 0, `models said to run on the eGPU or the Mac: ${JSON.stringify(places)}`);
   });
 
   // The Clear button beside the context meter: asked first, then the conversation starts again.
