@@ -453,7 +453,7 @@ mod tests {
         assert_eq!(g.get("pci"), Some(&Json::Null));
     }
 
-    /// What the GPU is doing now goes into its entry where it was read (a Mac's: `oaiy_mac_gpu`), and what was not
+    /// What the GPU is doing now goes into its entry where it was read (`oaiy_gpu_stats`), and what was not
     /// read stays null.
     #[test]
     fn a_gpus_load_memory_in_use_and_temperature_are_its_own_now() {
