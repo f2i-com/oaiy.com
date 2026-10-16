@@ -12,7 +12,8 @@ OUT (target/egpu-plugin unless named) is the plugin, for OAIY's Plugins page to 
   card/            plugin.py (what OAIY talks to), egpu_serve.py (OAIY's launcher), webgpu_server.py (the card's server)
   ui/egpu/         the plugin's page, which OAIY's setup wizard shows a step of at a time: the TinyGPU driver, the
                    card, and NVIDIA's compiler in Docker
-  card/kernels/    the kernel pack for --arch (tools/tinygpu/kernel_pack.py: nvcc only for what the cache lacks)
+  card/kernels/    the kernel pack for --arch (tools/tinygpu/kernel_pack.py: nvcc only for what the cache lacks), and
+                   its sources (sources.zip), from which the plugin makes a card of another architecture its kernels
   card/firmware/   what tinygrad downloads as it first opens a card: NVIDIA's GSP firmware (linux-firmware's, for every
                    card tinygrad knows) and its TinyGPU app, from tinygrad's download cache where it has them. Not
                    with --no-firmware, for a plugin given to others: both are other people's programs (NVIDIA's
@@ -142,7 +143,7 @@ def main():
   ap.add_argument("out", nargs="?", default=str(REPO / "target" / "egpu-plugin"))
   ap.add_argument("--tinygrad", default=os.path.expanduser("~/tinygrad"), help="a checkout of tinygrad, with its Python in .venv")
   ap.add_argument("--python", help="a CPython 3.12 install (python-build-standalone's); the checkout's Python's own by default")
-  ap.add_argument("--arch", default="sm_89", help="the cards' architectures, comma-separated (sm_86 RTX 30, sm_89 RTX 40, sm_120 RTX 50)")
+  ap.add_argument("--arch", default="sm_86,sm_89,sm_120", help="the cards' architectures, comma-separated (sm_86 RTX 30, sm_89 RTX 40, sm_120 RTX 50)")
   ap.add_argument("--sources", action="append", default=[], help="more kernel sources for the pack (kernel_pack.py --sources)")
   ap.add_argument("--no-firmware", action="store_true", help="without NVIDIA's firmware and tinygrad's TinyGPU app: tinygrad downloads them as it first opens a card")
   ap.add_argument("--zip", action="store_true", help="and OUT.zip of it, to install")
@@ -165,7 +166,7 @@ def main():
   copy_files(HERE / "ui", out / "ui")
   if args.no_firmware: print("firmware: left out (tinygrad downloads NVIDIA's and its TinyGPU app as it first opens a card)")
   else: firmware(src, card / "firmware")
-  pack = [sys.executable, str(HERE.parent / "kernel_pack.py"), str(card / "kernels"), "--arch", args.arch]
+  pack = [sys.executable, str(HERE.parent / "kernel_pack.py"), str(card / "kernels"), "--arch", args.arch, "--keep-sources"]
   for s in args.sources: pack += ["--sources", s]
   subprocess.run(pack, check=True)
   program = out / "python" / "bin" / "python3.12"

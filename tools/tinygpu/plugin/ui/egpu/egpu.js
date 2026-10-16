@@ -2,6 +2,8 @@
  * The eGPU plugin's page: its setup's three parts (tinygrad's TinyGPU driver, the card, NVIDIA's compiler in Docker),
  * each with what it needs next, and the job the plugin runs for one of them (its step and what it said).
  *
+ * A card whose architecture the plugin carries no kernels for gets a fourth part, its kernels made by the compiler.
+ *
  * It runs in OAIY Desktop's sandboxed plugin-screen frame, with no network: everything goes through
  * `window.PluginHost.command` to the plugin's connector (`setup.status`, `driver.install`, ...). In OAIY's setup
  * wizard (`PluginHost.setup`), it shows only the step's own card, and tells the wizard when that step is done.
@@ -48,7 +50,12 @@
 
   function errText(e) {
     var m = e && e.message ? e.message : String(e);
-    if (/connector is not available|not started yet/i.test(m)) return 'The eGPU plugin is not running: start it on the Plugins page.';
+    if (/connector is not available|not started yet|not running/i.test(m)) {
+      return 'The eGPU plugin is not running. On the Plugins page, start it; if OAIY asks you to trust it first (it does for a new version), trust it, then start it.';
+    }
+    if (/no command|capability|not granted|denied/i.test(m)) {
+      return 'OAIY is still running the eGPU plugin\'s previous version, which knows nothing of this page. On the Plugins page, trust the new version (OAIY asks once for a changed plugin), then restart it.';
+    }
     return m;
   }
 
@@ -61,7 +68,7 @@
   function showOnly(which) {
     view = which;
     document.documentElement.classList.add('eg-setup');
-    ['driver', 'card', 'compiler'].forEach(function (v) {
+    ['driver', 'card', 'kernels', 'compiler'].forEach(function (v) {
       $('eg-' + v).hidden = v !== which;
     });
   }
@@ -113,13 +120,15 @@
       body = '<p>' + esc(c.name) + ' is there, but its link is down (' + esc(c.link || 'no link') + '). Turn the enclosure off, wait ten seconds, and turn it on again.</p>';
     } else {
       pill('eg-card-pill', 'ok', 'Connected');
-      var kernels = c.covered
+      var k = s.kernels || {};
+      var kernels = k.inPack
         ? (pack.kernels || 0).toLocaleString() + ' in the plugin for ' + c.arch
-        : 'the plugin\'s are for ' + archs + (c.arch ? ', not ' + c.arch : '');
+        : k.ready ? (k.sources || 0).toLocaleString() + ' made for ' + k.arch + ' from the plugin\'s sources'
+        : 'not made yet for ' + (k.arch || c.arch || 'this card') + ' (the plugin\'s are for ' + archs + ')';
       body = '<p><b>' + esc(c.name) + '</b> is connected.</p>' +
         facts([['Link', (c.width || '?') + ' at ' + (c.speed || '?') + ' (' + (c.slot || 'Thunderbolt') + ')'], ['Architecture', c.arch || 'unknown'], ['Kernels', kernels]]);
-      if (!c.covered) {
-        body += '<p class="eg-hint is-warn">The plugin carries no kernels for this card\'s architecture: set up NVIDIA\'s compiler (below), and OAIY compiles them the first time each model needs them.</p>';
+      if (!c.covered && !view) {
+        body += '<p class="eg-hint is-warn">The plugin carries no kernels for this card\'s architecture: they are made for it once (below).</p>';
       }
     }
     if (s.missing > 0) {
@@ -130,11 +139,55 @@
     $('eg-card').classList.toggle('is-done', !!(c.found && c.up));
   }
 
+  function renderKernels(s) {
+    var k = s.kernels || {};
+    var comp = s.compiler || {};
+    var d = s.docker || {};
+    var job = s.job && s.job.state === 'running' && (s.job.name === 'kernels' || s.job.name === 'compiler') ? s.job : null;
+    var show = view === 'kernels' || (!view && k.inPack === false);
+    $('eg-kernels').hidden = !show;
+    if (!show) return;
+    var archs = ((s.pack || {}).archs || []).join(', ');
+    var n = (k.sources || 0).toLocaleString();
+    var why = '<p>The plugin carries kernels for RTX 30, 40 and 50 series cards (' + esc(archs) + '). This card is <b>' + esc(k.arch || 'of an architecture not known yet') +
+      '</b>: its ' + n + ' kernels are made for it from the plugin\'s sources by NVIDIA\'s compiler, once (a few minutes), and kept.</p>';
+    var body, actions = '';
+    if (k.ready) {
+      pill('eg-kernels-pill', 'ok', 'Made');
+      body = '<p>This card\'s ' + n + ' kernels were made for ' + esc(k.arch) + ' from the plugin\'s sources, and are kept: the card is ready.</p>';
+    } else if (job) {
+      pill('eg-kernels-pill', 'warn is-busy', 'Making');
+      body = why + '<p>' + esc(job.step || 'Starting…') + '</p>';
+    } else if (!k.arch) {
+      pill('eg-kernels-pill', 'warn', 'Unknown card');
+      body = '<p>The card\'s architecture is not known yet. Load a model on the eGPU once, and this page knows it.</p>';
+    } else if (!k.canMake) {
+      pill('eg-kernels-pill', 'err', 'Not possible');
+      body = '<p>This plugin carries no kernel sources to make this card\'s kernels from. A newer eGPU plugin does.</p>';
+    } else if (comp.ready) {
+      pill('eg-kernels-pill', 'warn', 'To make');
+      body = why + '<p class="eg-hint">NVIDIA\'s compiler is set up, so they are made by themselves within a minute. Or start now:</p>';
+      actions = button('kernels.make', 'Make the kernels now', true);
+    } else {
+      pill('eg-kernels-pill', 'warn', 'Needs the compiler');
+      body = why + '<p>NVIDIA\'s compiler runs in Docker on a Mac. ' + (d.app || d.cli
+        ? 'This sets it up (tinygrad\'s compiler image, about 2 GB to download) and then makes the kernels.'
+        : 'Get Docker Desktop first, open it once, then come back here.') + '</p>';
+      actions = (d.app || d.cli ? '' : button('docker.download', 'Get Docker Desktop', true)) +
+        button('kernels.make', 'Set up the compiler and make the kernels', !!(d.app || d.cli), !(d.app || d.cli));
+    }
+    setHtml($('eg-kernels-body'), body);
+    setHtml($('eg-kernels-actions'), actions);
+    $('eg-kernels').classList.toggle('is-done', !!k.ready);
+  }
+
   function renderCompiler(s) {
     var k = s.compiler || {};
     var d = s.docker || {};
     var job = s.job && s.job.name === 'compiler' && s.job.state === 'running' ? s.job : null;
     var body, actions = '';
+    // ("optional" but where this card's kernels need it)
+    $('eg-compiler').querySelector('.eg-optional').hidden = (s.kernels || {}).inPack === false;
     var why = '<p class="eg-hint">The plugin carries the kernels OAIY\'s models use, compiled ahead of time. A model newer than the plugin may need more: NVIDIA\'s compiler (nvcc) makes them, and on a Mac it runs in Docker. The first time each is needed takes a few seconds; after that it is kept.</p>';
     if (k.ready) {
       pill('eg-compiler-pill', 'ok', 'Ready');
@@ -144,11 +197,12 @@
         actions = button('docker.start', 'Start Docker', false);
       }
     } else if (!d.cli && !d.app) {
-      pill('eg-compiler-pill', '', 'Optional');
+      pill('eg-compiler-pill', (s.kernels || {}).inPack === false ? 'warn' : '', (s.kernels || {}).inPack === false ? 'Needed' : 'Optional');
       body = why + '<p>Docker Desktop is not installed. Get it from docker.com, open it once, then come back here.</p>';
       actions = button('docker.download', 'Get Docker Desktop', true) + button('compiler.install', 'Set up the compiler', false, true);
     } else {
-      pill('eg-compiler-pill', job ? 'warn' : '', job ? 'Setting up' : 'Optional');
+      var needed = (s.kernels || {}).inPack === false;
+      pill('eg-compiler-pill', job || needed ? 'warn' : '', job ? 'Setting up' : needed ? 'Needed' : 'Optional');
       body = why + '<p>Set up builds tinygrad\'s compiler image in Docker (about 2 GB to download, a few minutes) and puts nvcc in <span class="eg-path">~/.local/bin</span>' +
         (d.running ? '.' : '. Docker Desktop starts first.') + '</p>';
       actions = button('compiler.install', job ? 'Setting up…' : 'Set up the compiler', true, !!job) + (d.running ? '' : button('docker.start', 'Start Docker', false));
@@ -161,10 +215,10 @@
   function renderJob(s) {
     var j = s.job;
     // (the last job, running or how it ended; in the wizard, only its own step's)
-    var show = !!j && (!view || view === j.name);
+    var show = !!j && (!view || view === j.name || (view === 'kernels' && j.name === 'compiler'));
     $('eg-job').hidden = !show;
     if (!show) return;
-    var names = { driver: 'Installing the TinyGPU driver', compiler: 'Setting up NVIDIA\'s compiler' };
+    var names = { driver: 'Installing the TinyGPU driver', compiler: 'Setting up NVIDIA\'s compiler', kernels: 'Making this card\'s kernels' };
     $('eg-job-title').textContent = names[j.name] || j.name;
     if (j.state === 'running') pill('eg-job-pill', 'warn is-busy', 'Running · ' + j.seconds + ' s');
     else if (j.state === 'done') pill('eg-job-pill', 'ok', 'Done');
@@ -181,16 +235,25 @@
 
   function render(s) {
     state = s;
+    // (the parts' cards back where an error had put its one card in their place)
+    if (view) showOnly(view);
+    else ['driver', 'card', 'compiler'].forEach(function (v) { $('eg-' + v).hidden = false; });
     renderDriver(s);
     renderCard(s);
+    renderKernels(s);
     renderCompiler(s);
     renderJob(s);
+    $('eg-problem').hidden = true;
+    // (the steps numbered as they show: the kernels' only for a card the plugin carries none for)
+    var shown = 0;
+    ['driver', 'card', 'kernels', 'compiler'].forEach(function (v) {
+      if (!$('eg-' + v).hidden) $('eg-' + v).querySelector('.eg-step').textContent = String(++shown);
+    });
     var steps = s.steps || {};
-    var c = s.card || {};
-    var ready = steps.driver && steps.card && (c.covered || steps.compiler);
+    var ready = steps.driver && steps.card && steps.kernels;
     pill('eg-overall', ready ? 'ok' : 'warn', ready ? 'Ready' : 'Setup needed');
     $('eg-foot').textContent = 'eGPU plugin ' + (s.version || '') + ' · tinygrad ' + String(s.tinygrad || '?').slice(0, 9) + ' · ' +
-      ((s.pack || {}).kernels || 0).toLocaleString() + ' kernels for ' + (((s.pack || {}).archs || []).join(', ') || 'no card');
+      ((s.pack || {}).kernels || 0).toLocaleString() + ' kernels each for ' + (((s.pack || {}).archs || []).join(', ') || 'no card');
     if (SETUP && view && !doneSaid && steps[view]) {
       doneSaid = true;
       Promise.resolve(SETUP.done()).catch(function () {});
@@ -200,10 +263,10 @@
   }
 
   function renderError(e) {
-    ['driver', 'card', 'compiler'].forEach(function (v) {
-      pill('eg-' + v + '-pill', 'err', 'Unknown');
-      setHtml($('eg-' + v + '-body'), '<p class="eg-hint is-err">' + esc(errText(e)) + '</p>');
-    });
+    // (one card that says what to do, in place of the parts' cards, which have nothing to say)
+    ['driver', 'card', 'kernels', 'compiler', 'job'].forEach(function (v) { $('eg-' + v).hidden = true; });
+    setHtml($('eg-problem-body'), '<p>' + esc(errText(e)) + '</p>');
+    $('eg-problem').hidden = false;
     pill('eg-overall', 'err', 'Not running');
   }
 
@@ -241,10 +304,16 @@
     'compiler.install': 'Setting up NVIDIA\'s compiler in Docker: this takes a few minutes.',
     'driver.openSettings': 'System Settings is open: General, Login Items & Extensions, Driver Extensions.',
     'docker.download': 'Docker Desktop\'s page is open in your browser.',
-    'docker.start': 'Starting Docker Desktop.'
+    'docker.start': 'Starting Docker Desktop.',
+    'kernels.make': 'Making this card\'s kernels: a few minutes.'
   };
 
   document.addEventListener('click', function (ev) {
+    var nav = ev.target && ev.target.closest ? ev.target.closest('button[data-nav]') : null;
+    if (nav && typeof HOST.navigate === 'function') {
+      Promise.resolve(HOST.navigate(nav.getAttribute('data-nav'))).catch(function () {});
+      return;
+    }
     var b = ev.target && ev.target.closest ? ev.target.closest('button[data-action]') : null;
     if (!b || b.disabled || busyAction) return;
     var action = b.getAttribute('data-action');

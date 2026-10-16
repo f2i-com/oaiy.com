@@ -22,10 +22,17 @@ What takes long runs on a thread of its own, one at a time, and `setup.status` s
                     docker.download     -> Docker Desktop's download page, in the browser
                     docker.start        -> Docker Desktop started
                     compiler.install    -> NVIDIA's compiler in Docker: tinygrad's image built, its shim put in (a job)
+                    kernels.make        -> the card's kernels made from the pack's sources, where the pack has none for
+                                           its architecture (the compiler set up first where it is not: a job)
+
+A card whose architecture the pack has no kernels for (it carries the RTX 30, 40 and 50 series': sm_86, sm_89, sm_120)
+gets them made from the pack's sources (card/kernels/sources.zip) into the card's server's cache, by the compiler: by
+itself, once the compiler is set up and the card is there (a watcher looks every minute), or from the setup.
 """
 from __future__ import annotations
 
-import collections, json, os, pathlib, re, shutil, subprocess, sys, threading, time, urllib.request
+import collections, hashlib, json, os, pathlib, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request, zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 CARD = pathlib.Path(__file__).resolve().parent
 ROOT = CARD.parent
@@ -39,7 +46,9 @@ EXTENSIONS_SETTINGS = "x-apple.systempreferences:com.apple.LoginItems-Settings.e
 DOCKER_PAGE = "https://www.docker.com/products/docker-desktop/"
 DOCKER_BINS = ("/Applications/Docker.app/Contents/Resources/bin", str(HOME / ".docker" / "bin"), "/usr/local/bin", "/opt/homebrew/bin")
 # the card's server's kernel cache, and the kernels a pack lacked kept there (tools/tinygpu/webgpu_server.py)
-MISSING = pathlib.Path(os.environ.get("TINYGPU_CACHE") or HOME / ".cache" / "tinygpu-webgpu") / "missing"
+KERNEL_CACHE = pathlib.Path(os.environ.get("TINYGPU_CACHE") or HOME / ".cache" / "tinygpu-webgpu")
+MISSING = KERNEL_CACHE / "missing"
+WORK = HOME / ".cache" / "oaiy-egpu-kernels"   # (where kernels are compiled: the Docker shim's container sees it)
 SHIMS = HOME / ".local" / "bin"
 # NVIDIA's compiler for Linux on arm64, as tinygrad's extra/setup_nvcc_osx.sh builds it
 IMAGE = "cuda-nvcc:12.8"
@@ -50,16 +59,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certifi
   apt-get update && apt-get install -y --no-install-recommends cuda-nvcc-12-8 cuda-nvdisasm-12-8 cuda-cuobjdump-12-8 && rm -rf /var/lib/apt/lists/*
 ENV PATH=/usr/local/cuda/bin:$PATH
 """
-# tinygrad's shim, with Docker's own folders on its PATH (OAIY starts the card's server with a short one)
+# tinygrad's shim, with Docker's own folders on its PATH (OAIY starts the card's server with a short one), its container
+# started by one call at a time (calls in parallel each started one, and all but one failed on its name), and living
+# half an hour from its start (tinygrad's 5 minutes ended a pack's compiles halfway, every call at once)
 SHIM = """#!/bin/sh
 set -eu
 PATH="$PATH:/Applications/Docker.app/Contents/Resources/bin:$HOME/.docker/bin:/usr/local/bin:/opt/homebrew/bin"
 cname="cuda-nvcc-persistent"
-if ! docker inspect --format='{{.State.Running}}' "$cname" 2>/dev/null | grep -q true; then
-  docker rm -f "$cname" >/dev/null 2>&1 || true
-  docker run -d --platform=linux/arm64 --name "$cname" \\
-    -v /var/folders:/var/folders -v "$HOME":"$HOME" \\
-    cuda-nvcc:12.8 sleep 300 >/dev/null
+running() { docker inspect --format='{{.State.Running}}' "$cname" 2>/dev/null | grep -q true; }
+if ! running; then
+  lock="${TMPDIR:-/tmp}/cuda-nvcc-shim.lock"
+  i=0
+  until mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -gt 600 ] && break; sleep 0.1
+  done
+  if ! running; then
+    docker rm -f "$cname" >/dev/null 2>&1 || true
+    docker run -d --platform=linux/arm64 --name "$cname" \\
+      -v /var/folders:/var/folders -v "$HOME":"$HOME" \\
+      cuda-nvcc:12.8 sleep 1800 >/dev/null || true
+  fi
+  rmdir "$lock" 2>/dev/null || true
 fi
 exec docker exec "$cname" "$(basename "$0")" "$@"
 """
@@ -118,8 +138,26 @@ def status() -> dict:
     elif not r["driver"]["enabled"]:
         why = "tinygrad's TinyGPU driver is installed but not allowed: allow it in System Settings, General, Login Items & Extensions"
     pack = r["pack"] or {}
-    have = f"tinygrad {(r['tinygrad'] or '?')[:9]}, {pack.get('kernels', 0):,} kernels for {', '.join(pack.get('archs', [])) or 'no card'}"
+    if why is None and (c := card()).get("found"):
+        k = kernels(c, pack)
+        job = _job[0]
+        if job is not None and job.name == "kernels" and job.state == "running":
+            why = f"making this card's kernels ({k['arch']}): {job.step}"
+        elif not k["ready"]:
+            why = (f"this card's kernels ({k['arch'] or 'its architecture unknown'}) are not in the plugin: the eGPU's setup makes "
+                   f"them, with NVIDIA's compiler in Docker")
+    have = f"tinygrad {(r['tinygrad'] or '?')[:9]}, {per_card(pack):,} kernels for {', '.join(archs_of(pack)) or 'no card'}"
     return {**r, "ready": why is None, "why": why, "state": "Ready" if why is None else "Not ready", "detail": why or have}
+
+
+def archs_of(pack: dict) -> list:
+    """A pack's architectures, in their numbers' order (sm_86, sm_89, sm_120)."""
+    return sorted(pack.get("archs", []), key=lambda a: int(re.sub(r"\D", "", a) or 0))
+
+
+def per_card(pack: dict) -> int:
+    """A pack's kernels for one card (its cubins are every source's for each of its architectures)."""
+    return pack.get("sources") or pack.get("kernels", 0)
 
 
 _seen_card = [0.0, None]
@@ -219,6 +257,41 @@ def missing() -> int:
         return sum(1 for _ in MISSING.glob("*.cu"))
     except OSError:
         return 0
+
+
+def recorded_arch() -> str | None:
+    """The architecture tinygrad named when the card's server last opened a card (its CACHE/card.json)."""
+    try:
+        return json.loads((KERNEL_CACHE / "card.json").read_text()).get("arch") or None
+    except (OSError, ValueError):
+        return None
+
+
+def kernel_name(arch: str, src: str) -> str:
+    """As the card's server names a kernel's cubin (webgpu_server.kernel_name): its architecture and source's hash."""
+    return hashlib.sha256((arch + "\0" + src).encode()).hexdigest()[:24]
+
+
+def made_record(arch: str) -> pathlib.Path:
+    return DATA / f"kernels-{arch}.json"
+
+
+def kernels(c: dict, pack: dict) -> dict:
+    """The card's kernels: in the pack (its architecture one of the pack's), or made for it from the pack's sources
+    (`made_record`, for this pack's sources), or not yet."""
+    arch = c.get("arch") or recorded_arch()
+    in_pack = (arch in pack.get("archs", [])) if arch else None
+    zipped = CARD / "kernels" / "sources.zip"
+    made = None
+    if arch and not in_pack:
+        try:
+            made = json.loads(made_record(arch).read_text())
+        except (OSError, ValueError):
+            made = None
+        if made and made.get("pack") != pack.get("built"):
+            made = None   # (made for another pack's sources)
+    ready = bool(in_pack) or bool(made and made.get("made", 0) >= made.get("sources", 1))
+    return {"arch": arch, "inPack": in_pack, "made": made, "ready": ready, "sources": per_card(pack), "canMake": zipped.is_file()}
 
 
 class Job:
@@ -343,14 +416,7 @@ def install_compiler(job: Job):
     if not cli:
         raise RuntimeError("Docker Desktop is not installed: get it from docker.com, open it once, then set the compiler up")
     env = docker_env()
-    if not docker()["running"]:
-        job.step = "Starting Docker Desktop"
-        quiet(["/usr/bin/open", "-a", "Docker"], 20)
-        deadline = time.monotonic() + 240
-        while not docker()["running"]:
-            if time.monotonic() > deadline:
-                raise RuntimeError("Docker Desktop did not start in 4 minutes: start it, then set the compiler up again")
-            time.sleep(3)
+    docker_running(job)
     job.step = "Building NVIDIA's compiler image (about 2 GB to download)"
     build = subprocess.Popen([cli, "build", "--progress=plain", "--platform=linux/arm64", "-t", IMAGE, "-"], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
@@ -382,12 +448,132 @@ def install_compiler(job: Job):
     job.step = "NVIDIA's compiler is ready"
 
 
+def docker_running(job: Job):
+    """Docker Desktop started where it is not running, and waited for (four minutes at most)."""
+    if docker()["running"]:
+        return
+    job.step = "Starting Docker Desktop"
+    quiet(["/usr/bin/open", "-a", "Docker"], 20)
+    deadline = time.monotonic() + 240
+    while not docker()["running"]:
+        if time.monotonic() > deadline:
+            raise RuntimeError("Docker Desktop did not start in 4 minutes: start it, then try again")
+        time.sleep(3)
+
+
+def find_nvcc() -> tuple[str, dict | None] | None:
+    """nvcc as the card's server finds it (webgpu_server.nvcc): the PATH's, else the Docker shim in ~/.local/bin."""
+    if found := shutil.which("nvcc"):
+        return found, None
+    if os.access(SHIMS / "nvcc", os.X_OK):
+        return str(SHIMS / "nvcc"), docker_env()
+    return None
+
+
+def make_kernels(job: Job):
+    """The card's kernels made from the pack's sources (card/kernels/sources.zip) for its architecture, into the card's
+    server's cache (each cubin named as the server names it, its source beside it), where the pack has none for it:
+    NVIDIA's compiler set up first where it is not, Docker started where the compiler is its shim. Six at a time (each a
+    second or so in Docker); what the cache has already is kept. Recorded for this pack (`made_record`) when all are."""
+    c = card()
+    pack = runtime()["pack"] or {}
+    k = kernels(c, pack)
+    arch = k["arch"]
+    if not arch:
+        raise RuntimeError("the card's architecture is not known: connect the card, or load a model on the eGPU once")
+    if k["inPack"]:
+        job.step = f"The plugin has this card's kernels already ({arch})"
+        return
+    if not k["canMake"]:
+        raise RuntimeError("this plugin carries no kernel sources to make a card's kernels from: a newer plugin does")
+    if find_nvcc() is None:
+        install_compiler(job)
+    program, env = find_nvcc()
+    if env is not None:
+        docker_running(job)
+    with zipfile.ZipFile(CARD / "kernels" / "sources.zip") as z:
+        sources = [z.read(n).decode() for n in z.namelist() if n.endswith(".cu")]
+    KERNEL_CACHE.mkdir(parents=True, exist_ok=True)
+    WORK.mkdir(parents=True, exist_ok=True)
+    todo = [src for src in sources if not (KERNEL_CACHE / f"{kernel_name(arch, src)}.cubin").exists()]
+    job.say(f"{len(sources):,} kernels for {arch}: {len(sources) - len(todo):,} made already, {len(todo):,} to make")
+    done, failed = [len(sources) - len(todo)], []
+
+    def make(src: str):
+        name = kernel_name(arch, src)
+        # (in the home folder's .cache: the shim's container sees the home folder, and no other but /var/folders)
+        with tempfile.TemporaryDirectory(dir=WORK) as tmp:
+            cu, cubin = pathlib.Path(tmp) / f"{name}.cu", pathlib.Path(tmp) / f"{name}.cubin"
+            cu.write_text(src)
+            argv = [program, f"-arch={arch}", "-cubin", "-o", str(cubin), str(cu)]
+            run = subprocess.run(argv, capture_output=True, text=True, env=env)
+            if run.returncode != 0:
+                # (once more: the shim's container may have ended as it was asked, and is started again)
+                run = subprocess.run(argv, capture_output=True, text=True, env=env)
+            if run.returncode != 0:
+                raise RuntimeError(f"{name}: {(run.stderr or run.stdout).strip()[-600:]}")
+            shutil.copyfile(cu, KERNEL_CACHE / f"{name}.cu")
+            shutil.copyfile(cubin, KERNEL_CACHE / f"{name}.{os.getpid()}.cubin")
+            (KERNEL_CACHE / f"{name}.{os.getpid()}.cubin").rename(KERNEL_CACHE / f"{name}.cubin")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for src, result in zip(todo, pool.map(lambda s: _tried(make, s), todo)):
+            if result is not None:
+                failed.append(result)
+                job.say(f"failed: {result}")
+            else:
+                done[0] += 1
+            job.step = f"Making this card's kernels ({arch}): {done[0]:,} of {len(sources):,}"
+    if failed:
+        raise RuntimeError(f"{len(failed)} of {len(sources)} kernels could not be made for {arch}: the first's error is above")
+    DATA.mkdir(parents=True, exist_ok=True)
+    made_record(arch).write_text(json.dumps({"arch": arch, "sources": len(sources), "made": done[0], "pack": pack.get("built"), "at": time.time()}))
+    job.step = f"This card's {len(sources):,} kernels are made ({arch})"
+
+
+def _tried(fn, *args) -> str | None:
+    try:
+        fn(*args)
+        return None
+    except Exception as e:  # (said with its kernel; the others go on)
+        return str(e)
+
+
+def watch_once(tried: set) -> bool:
+    """One look of `watch`'s: whether it started the card's kernels' job."""
+    c = card()
+    if not (c.get("found") and c.get("up")) or (_job[0] is not None and _job[0].state == "running"):
+        return False
+    pack = runtime()["pack"] or {}
+    k = kernels(c, pack)
+    compiler_set_up = find_nvcc() is not None and bool(shutil.which("nvcc") or compiler(docker())["built"])
+    key = (k["arch"], pack.get("built"))
+    if k["arch"] and k["inPack"] is False and not k["ready"] and k["canMake"] and compiler_set_up and key not in tried:
+        tried.add(key)
+        return start("kernels", make_kernels)["started"]
+    return False
+
+
+def watch():
+    """Every minute: a card the pack has no kernels for, with the compiler set up, gets its kernels made by itself (a
+    job, as `kernels.make`'s), once a pack; a failed attempt is not tried again until the plugin starts again."""
+    tried: set = set()
+    time.sleep(20)
+    while True:
+        try:
+            watch_once(tried)
+        except Exception:
+            pass
+        time.sleep(60)
+
+
 def setup_status() -> dict:
     r = runtime()
     c = card()
     pack = r["pack"] or {}
+    k = kernels(c, pack) if c.get("found") else {"arch": recorded_arch(), "inPack": None, "made": None, "ready": False, "sources": per_card(pack), "canMake": False}
     if c.get("found"):
-        c["covered"] = c.get("arch") in pack.get("archs", [])
+        c["covered"] = k["ready"]
     d = docker()
     comp = compiler(d)
     job = _job[0].view() if _job[0] is not None else None
@@ -396,13 +582,14 @@ def setup_status() -> dict:
         "card": c,
         "docker": d,
         "compiler": comp,
-        "pack": {"kernels": pack.get("kernels", 0), "archs": pack.get("archs", [])},
+        "pack": {"kernels": per_card(pack), "archs": archs_of(pack)},
+        "kernels": k,
         "tinygrad": r["tinygrad"],
         "missing": missing(),
         "job": job,
         "version": VERSION,
         # (the wizard's steps: each done when this says so)
-        "steps": {"driver": r["driver"]["enabled"], "card": bool(c.get("found") and c.get("up")), "compiler": comp["ready"]},
+        "steps": {"driver": r["driver"]["enabled"], "card": bool(c.get("found") and c.get("up")), "kernels": k["ready"], "compiler": comp["ready"]},
     }
 
 
@@ -430,10 +617,12 @@ COMMANDS = {
     "docker.download": lambda: opened([DOCKER_PAGE]),
     "docker.start": lambda: opened(["-a", "Docker"]),
     "compiler.install": lambda: start("compiler", install_compiler),
+    "kernels.make": lambda: start("kernels", make_kernels),
 }
 
 
 def main():
+    threading.Thread(target=watch, name="egpu-watch", daemon=True).start()
     for line in sys.stdin:
         line = line.strip()
         if not line:

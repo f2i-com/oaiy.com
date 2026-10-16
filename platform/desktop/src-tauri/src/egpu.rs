@@ -139,11 +139,14 @@ mod tests {
         assert!(claims.provides(modules::EGPU), "{claims:?}");
         assert_eq!(claims.get(modules::EGPU).and_then(|c| c.connector.as_deref()), Some("egpu"));
         assert!(manifest.resolved_capabilities().iter().any(|c| c == "connector.egpu.card.runtime"));
-        // its setup: the driver, the card, and (optional) NVIDIA's compiler, each a view of its page, done when the
-        // plugin's `setup.status` says so; installing changes the computer, so it is journalled
+        // its setup: the driver, the card, its kernels (shown only for a card the pack has none for), and (optional)
+        // NVIDIA's compiler, each a view of its page, done when the plugin's `setup.status` says so; installing and
+        // making kernels change the computer, so they are journalled
         let setup = manifest.setup.as_ref().expect("the eGPU's setup");
         let steps: Vec<(&str, bool)> = setup.steps.iter().map(|s| (s.id.as_str(), s.optional)).collect();
-        assert_eq!(steps, vec![("driver", false), ("card", false), ("compiler", true)]);
+        assert_eq!(steps, vec![("driver", false), ("card", false), ("kernels", false), ("compiler", true)]);
+        let kernels = setup.steps.iter().find(|s| s.id == "kernels").unwrap();
+        assert_eq!(kernels.when.as_ref().map(|w| (w.command.as_str(), w.condition.path.as_str())), Some(("setup.status", "kernels.inPack")));
         for step in &setup.steps {
             match &step.kind {
                 crate::plugins::manifest::StepKind::Screen { screen, view, done } => {
@@ -153,10 +156,10 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        for cmd in ["setup.status", "driver.install", "driver.openSettings", "docker.download", "docker.start", "compiler.install"] {
+        for cmd in ["setup.status", "driver.install", "driver.openSettings", "docker.download", "docker.start", "compiler.install", "kernels.make"] {
             assert!(manifest.grants(&format!("connector.egpu.{cmd}")), "{cmd}");
         }
-        assert!(manifest.is_journalled("driver.install") && manifest.is_journalled("compiler.install") && !manifest.is_journalled("setup.status"));
+        assert!(["driver.install", "compiler.install", "kernels.make"].iter().all(|c| manifest.is_journalled(c)) && !manifest.is_journalled("setup.status"));
         assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
         let _ = std::fs::remove_dir_all(&dir);
     }

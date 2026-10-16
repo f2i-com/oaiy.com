@@ -367,7 +367,15 @@ class Card:
     self.dev, self.spec = Device["NV"], BufferSpec()
     # (a buffer in the computer's memory, mapped for the card: where tinygrad's interface gives one a view of it here)
     self.host_spec = BufferSpec(host=True)
-    self.arch = self.dev.arch
+    # the card's architecture, said where the eGPU plugin reads it (CACHE/card.json: the kernels a card of another
+    # than its pack's needs are made for it); TINYGPU_ARCH: an older one of its major version's kernels, which it runs
+    # as well (an RTX 30's sm_86 on an RTX 40), to check a pack's other kernels on the card there is
+    self.arch = os.environ.get("TINYGPU_ARCH") or self.dev.arch
+    try:
+      CACHE.mkdir(parents=True, exist_ok=True)
+      (CACHE / "card.json").write_text(json.dumps({"arch": self.dev.arch, "seen": time.time()}))
+    except OSError:
+      pass
     self.reserve_firmware_memory()
     self.local_memory()
     self.q, self.queued, self.since_sync = None, 0, 0

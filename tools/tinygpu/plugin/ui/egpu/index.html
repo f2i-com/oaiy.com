@@ -29,9 +29,19 @@
     <div class="eg-body" id="eg-card-body"><p class="eg-hint">Checking…</p></div>
   </section>
 
-  <section class="eg-card" id="eg-compiler" data-view="compiler" aria-labelledby="eg-compiler-title">
+  <section class="eg-card" id="eg-kernels" data-view="kernels" hidden aria-labelledby="eg-kernels-title">
     <div class="eg-card-head">
       <span class="eg-step">3</span>
+      <h2 id="eg-kernels-title">Kernels for your card</h2>
+      <span class="eg-pill" id="eg-kernels-pill"><i></i><b>Checking…</b></span>
+    </div>
+    <div class="eg-body" id="eg-kernels-body"><p class="eg-hint">Checking…</p></div>
+    <div class="eg-actions" id="eg-kernels-actions"></div>
+  </section>
+
+  <section class="eg-card" id="eg-compiler" data-view="compiler" aria-labelledby="eg-compiler-title">
+    <div class="eg-card-head">
+      <span class="eg-step">4</span>
       <h2 id="eg-compiler-title">NVIDIA's compiler <span class="eg-optional">optional</span></h2>
       <span class="eg-pill" id="eg-compiler-pill"><i></i><b>Checking…</b></span>
     </div>
@@ -46,6 +56,11 @@
     </div>
     <p class="eg-job-step" id="eg-job-step"></p>
     <pre class="eg-log" id="eg-job-log"></pre>
+  </section>
+
+  <section class="eg-card" id="eg-problem" hidden>
+    <div class="eg-body" id="eg-problem-body"></div>
+    <div class="eg-actions"><button type="button" class="eg-button is-primary" data-nav="plugins">Open Plugins</button></div>
   </section>
 
   <p class="eg-foot" id="eg-foot"></p>

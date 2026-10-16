@@ -79,8 +79,11 @@ installs from where `/Applications` has none). So neither Docker, nor a compiler
 python3 tools/tinygpu/plugin/bundle.py --zip        # target/egpu-plugin, and target/egpu-plugin.zip
 ```
 
-- `--arch sm_86,sm_89,sm_120` packs the kernels for the RTX 30, 40 and 50 series (`sm_89` alone unless named). What the
-  cache does not have is compiled, so nvcc is needed on the machine that builds the plugin, never on one that runs it.
+- `--arch` names the architectures the pack has kernels for: the RTX 30, 40 and 50 series (`sm_86,sm_89,sm_120`) unless
+  named, 1,270 kernels each, 75 MB of cubins. What the cache does not have is compiled, so nvcc is needed on the
+  machine that builds the plugin, never on one that runs it (each cubin compiled is kept in the cache too, so the next
+  pack copies it). The pack carries its kernels' sources too (`card/kernels/sources.zip`, 10 MB): a card of another
+  architecture gets its kernels made from them (the setup's *Kernels for your card*, below).
 - The pack's kernels are the ones the cache has seen (`~/.cache/tinygpu-webgpu`, and its `missing` folder): run the
   models it should carry on a card with nvcc first, or name more sources with `--sources`.
 - tinygrad comes from `--tinygrad` (`~/tinygrad`), and the Python from that checkout's `.venv`: python-build-standalone's,
@@ -115,19 +118,34 @@ done when the plugin's `setup.status` says so (the wizard asks every few seconds
    Login Items & Extensions, where the person turns TinyGPU on: only they can, and macOS asks them. Done when
    `systemextensionsctl` says `[activated enabled]`.
 2. **Your card.** The NVIDIA card macOS sees on the PCI bus (`system_profiler`), its Thunderbolt link, its
-   architecture by its device id, and whether the plugin's kernels are for it. Done when its link is up.
-3. **NVIDIA's compiler** (optional). For kernels the pack lacks: a model newer than the plugin, or a card of another
-   architecture. *Set up the compiler* starts Docker Desktop where it is not running, builds tinygrad's `cuda-nvcc:12.8`
+   architecture by its device id (else as tinygrad named it when the card's server last opened it: the server writes
+   `card.json` in its cache), and whether the plugin's kernels are for it. Done when its link is up.
+3. **Kernels for your card**, only for a card whose architecture the pack has none for. *Make the kernels* compiles
+   every source in the pack for the card's architecture into the card's server's cache, each named as the server
+   names it, six at a time, NVIDIA's compiler set up first where it is not (step 4). Once the compiler is set up, the
+   plugin does it by itself: a watcher looks every minute for a card the pack has no kernels for. The made kernels are
+   recorded for the pack they came from, so a new plugin's are made again. A kernel neither the pack nor the cache has
+   is compiled as the card asks for it, as before, where there is a compiler.
+4. **NVIDIA's compiler** (optional, but needed for step 3). For kernels the pack lacks: a model newer than the plugin,
+   or a card of another architecture. *Set up the compiler* starts Docker Desktop where it is not running, builds tinygrad's `cuda-nvcc:12.8`
    image (`extra/setup_nvcc_osx.sh`'s: about 2 GB from Ubuntu's and NVIDIA's servers), puts its shim in `~/.local/bin`
    as `nvcc` and `nvdisasm` (a program of the person's own there is left alone), and asks nvcc its version. The card's
    server looks for nvcc on its PATH, then in `~/.local/bin`, with Docker's folders on the shim's PATH
-   (`webgpu_server.nvcc`: OAIY starts it with a short PATH); a compile with Docker not running says to start it.
+   (`webgpu_server.nvcc`: OAIY starts it with a short PATH); a compile with Docker not running says to start it. The
+   plugin's shim is tinygrad's with two changes: one call at a time starts its container (calls in parallel each
+   started one, and all but one failed on its name), and the container lives half an hour, where tinygrad's 5 minutes
+   ended a pack's compiles halfway, every call at once.
 
 What takes long runs on a thread of the plugin's own, one job at a time, and the page shows its step and what it said.
 Nothing is written in the plugin's folder (it is trusted by its digest). Checked on 16 October 2026 on this Mac: the
 compiler's job (Docker started, its image from Docker's cache, the shim, `nvcc --version`) in 6 s; the card's server,
 its PATH `/usr/bin:/bin`, compiled a kernel through the shim; the driver's job, the driver allowed already, changed
-nothing; the page in WebKit, light and dark, in each state and as the wizard's steps.
+nothing; the page in WebKit, light and dark, in each state and as the wizard's steps. A card's kernels for another
+architecture run on the RTX 4090 where the architecture is an older one of its major version (`TINYGPU_ARCH`, which
+the card's server then compiles and loads for), so both other paths ran on it: the pack's `sm_86` kernels (the RTX 30
+series') ran the 35B MiniCPM-V from an empty cache, a picture and a 29,172-token prompt answered right; and for
+`sm_87`, which the pack has none of, the watcher started the kernels' job by itself, which made all 1,270 in 67 s, and
+the 35B ran on them alone, the same answers at the same speed.
 
 tinygrad's own compiler is never started either: the server takes tinygrad's NVCC renderer for the card (`NV:CC`),
 which starts nothing until it is asked (it never is: the kernels come as cubins), where its default (NVRTC's) started

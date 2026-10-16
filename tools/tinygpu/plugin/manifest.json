@@ -4,7 +4,7 @@
   "name": "eGPU",
   "version": "0.2.0",
   "publisher": "OAIY",
-  "description": "An NVIDIA card in a Thunderbolt enclosure for OAIY's engines on a Mac, through tinygrad's TinyGPU driver: its own Python, tinygrad, the card's server and its kernels compiled ahead of time, so neither Docker nor a compiler is needed. Its setup installs the TinyGPU driver, finds the card, and can set up NVIDIA's compiler in Docker for kernels a newer model needs.",
+  "description": "An NVIDIA card in a Thunderbolt enclosure for OAIY's engines on a Mac, through tinygrad's TinyGPU driver: its own Python, tinygrad, the card's server and its kernels compiled ahead of time for the RTX 30, 40 and 50 series, so neither Docker nor a compiler is needed. Its setup installs the TinyGPU driver and finds the card; for another card, or a newer model, it sets up NVIDIA's compiler in Docker and makes the kernels.",
   "pluginApiVersion": 1,
   "minDesktopVersion": "0.1.0",
   "entry": {
@@ -24,7 +24,8 @@
     "connector.egpu.driver.openSettings",
     "connector.egpu.docker.download",
     "connector.egpu.docker.start",
-    "connector.egpu.compiler.install"
+    "connector.egpu.compiler.install",
+    "connector.egpu.kernels.make"
   ],
   "connectors": [
     {
@@ -38,14 +39,16 @@
         "driver.openSettings",
         "docker.download",
         "docker.start",
-        "compiler.install"
+        "compiler.install",
+        "kernels.make"
       ]
     }
   ],
   "commands": {
     "journalled": [
       "driver.install",
-      "compiler.install"
+      "compiler.install",
+      "kernels.make"
     ]
   },
   "modules": {
@@ -85,9 +88,27 @@
         }
       },
       {
+        "id": "kernels",
+        "title": "Kernels for your card",
+        "description": "The plugin carries kernels for RTX 30, 40 and 50 series cards. Another card's are made for it once, by NVIDIA's compiler in Docker.",
+        "kind": "screen",
+        "screen": "egpu",
+        "view": "kernels",
+        "when": {
+          "command": "setup.status",
+          "path": "kernels.inPack",
+          "equals": false
+        },
+        "done": {
+          "command": "setup.status",
+          "path": "steps.kernels",
+          "equals": true
+        }
+      },
+      {
         "id": "compiler",
         "title": "NVIDIA's compiler",
-        "description": "Optional: the plugin carries the kernels OAIY's models use. A newer model's kernels are compiled by NVIDIA's compiler, which runs in Docker on a Mac.",
+        "description": "Optional: the plugin carries the kernels OAIY's models use. A model newer than the plugin may need more; NVIDIA's compiler makes them, and on a Mac it runs in Docker.",
         "optional": true,
         "kind": "screen",
         "screen": "egpu",
