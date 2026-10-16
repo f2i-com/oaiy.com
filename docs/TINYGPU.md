@@ -105,6 +105,30 @@ holds nothing: the engines start the launcher and stop it cleanly, as before (a 
 stopped, and a card's holder killed has taken its link down). `card.status` says whether the card can be used, and why
 not (the driver extension not installed, or not allowed). Turned off or removed, the engines go back to their settings.
 
+**Its setup.** Installed, trusted and started, the plugin sets a Mac up from nothing: OAIY's setup wizard runs it
+after the install (or *Set up…* on the Plugins page), and its **eGPU** page in the sidebar shows the same. Each step is
+done when the plugin's `setup.status` says so (the wizard asks every few seconds):
+
+1. **TinyGPU driver.** *Install the driver* puts tinygrad's TinyGPU.app in /Applications (the plugin's own copy, else
+   the one its tinygrad names, downloaded from tinygrad's releases into the plugin's data folder, as tinygrad would),
+   checks its signature, and runs its `install`, which asks macOS for the driver extension. System Settings opens at
+   Login Items & Extensions, where the person turns TinyGPU on: only they can, and macOS asks them. Done when
+   `systemextensionsctl` says `[activated enabled]`.
+2. **Your card.** The NVIDIA card macOS sees on the PCI bus (`system_profiler`), its Thunderbolt link, its
+   architecture by its device id, and whether the plugin's kernels are for it. Done when its link is up.
+3. **NVIDIA's compiler** (optional). For kernels the pack lacks: a model newer than the plugin, or a card of another
+   architecture. *Set up the compiler* starts Docker Desktop where it is not running, builds tinygrad's `cuda-nvcc:12.8`
+   image (`extra/setup_nvcc_osx.sh`'s: about 2 GB from Ubuntu's and NVIDIA's servers), puts its shim in `~/.local/bin`
+   as `nvcc` and `nvdisasm` (a program of the person's own there is left alone), and asks nvcc its version. The card's
+   server looks for nvcc on its PATH, then in `~/.local/bin`, with Docker's folders on the shim's PATH
+   (`webgpu_server.nvcc`: OAIY starts it with a short PATH); a compile with Docker not running says to start it.
+
+What takes long runs on a thread of the plugin's own, one job at a time, and the page shows its step and what it said.
+Nothing is written in the plugin's folder (it is trusted by its digest). Checked on 16 October 2026 on this Mac: the
+compiler's job (Docker started, its image from Docker's cache, the shim, `nvcc --version`) in 6 s; the card's server,
+its PATH `/usr/bin:/bin`, compiled a kernel through the shim; the driver's job, the driver allowed already, changed
+nothing; the page in WebKit, light and dark, in each state and as the wizard's steps.
+
 tinygrad's own compiler is never started either: the server takes tinygrad's NVCC renderer for the card (`NV:CC`),
 which starts nothing until it is asked (it never is: the kernels come as cubins), where its default (NVRTC's) started
 a compile server in a Docker container as the first program loaded.
@@ -241,7 +265,8 @@ holds it.
 
 ## Set up
 
-(Or the eGPU plugin, above, for steps 1 to 3 and OAIY's side.)
+(Or the eGPU plugin, above: its setup installs the driver and NVIDIA's compiler, and it carries steps 2 and 3 and
+OAIY's side.)
 
 1. **TinyGPU and its driver**, by tinygrad's own instructions (`docs/tinygpu.md` in tinygrad), and **NVIDIA's compiler**
    in Docker: `sh extra/setup_nvcc_osx.sh` from a tinygrad checkout (nvcc behind `~/.local/bin/nvcc`).

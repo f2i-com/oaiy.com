@@ -10,6 +10,8 @@ OUT (target/egpu-plugin unless named) is the plugin, for OAIY's Plugins page to 
                    macOS's libraries), without what the card never uses (Tk, IDLE, the tests, the headers)
   lib/             tinygrad (the checkout --tinygrad names; its commit in tinygrad-commit.txt), jinja2 and markupsafe
   card/            plugin.py (what OAIY talks to), egpu_serve.py (OAIY's launcher), webgpu_server.py (the card's server)
+  ui/egpu/         the plugin's page, which OAIY's setup wizard shows a step of at a time: the TinyGPU driver, the
+                   card, and NVIDIA's compiler in Docker
   card/kernels/    the kernel pack for --arch (tools/tinygpu/kernel_pack.py: nvcc only for what the cache lacks)
   card/firmware/   what tinygrad downloads as it first opens a card: NVIDIA's GSP firmware (linux-firmware's, for every
                    card tinygrad knows) and its TinyGPU app, from tinygrad's download cache where it has them. Not
@@ -160,6 +162,7 @@ def main():
   card.mkdir()
   for f in (HERE / "plugin.py", REPO / "crates" / "oaiy-studio" / "src" / "egpu_serve.py", HERE.parent / "webgpu_server.py"):
     shutil.copy2(f, card / f.name)
+  copy_files(HERE / "ui", out / "ui")
   if args.no_firmware: print("firmware: left out (tinygrad downloads NVIDIA's and its TinyGPU app as it first opens a card)")
   else: firmware(src, card / "firmware")
   pack = [sys.executable, str(HERE.parent / "kernel_pack.py"), str(card / "kernels"), "--arch", args.arch]

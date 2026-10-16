@@ -1,0 +1,52 @@
+<main class="eg" id="eg">
+  <header class="eg-head" id="eg-head">
+    <div class="eg-head-text">
+      <h1>eGPU</h1>
+      <p class="eg-hint">
+        An NVIDIA card in a Thunderbolt enclosure, for OAIY's models. It needs tinygrad's TinyGPU driver and the card.
+        NVIDIA's compiler is optional: the plugin already carries the kernels OAIY's models use.
+      </p>
+    </div>
+    <span class="eg-pill" id="eg-overall"><i></i><b>Checking…</b></span>
+  </header>
+
+  <section class="eg-card" id="eg-driver" data-view="driver" aria-labelledby="eg-driver-title">
+    <div class="eg-card-head">
+      <span class="eg-step">1</span>
+      <h2 id="eg-driver-title">TinyGPU driver</h2>
+      <span class="eg-pill" id="eg-driver-pill"><i></i><b>Checking…</b></span>
+    </div>
+    <div class="eg-body" id="eg-driver-body"><p class="eg-hint">Checking…</p></div>
+    <div class="eg-actions" id="eg-driver-actions"></div>
+  </section>
+
+  <section class="eg-card" id="eg-card" data-view="card" aria-labelledby="eg-card-title">
+    <div class="eg-card-head">
+      <span class="eg-step">2</span>
+      <h2 id="eg-card-title">Your card</h2>
+      <span class="eg-pill" id="eg-card-pill"><i></i><b>Checking…</b></span>
+    </div>
+    <div class="eg-body" id="eg-card-body"><p class="eg-hint">Checking…</p></div>
+  </section>
+
+  <section class="eg-card" id="eg-compiler" data-view="compiler" aria-labelledby="eg-compiler-title">
+    <div class="eg-card-head">
+      <span class="eg-step">3</span>
+      <h2 id="eg-compiler-title">NVIDIA's compiler <span class="eg-optional">optional</span></h2>
+      <span class="eg-pill" id="eg-compiler-pill"><i></i><b>Checking…</b></span>
+    </div>
+    <div class="eg-body" id="eg-compiler-body"><p class="eg-hint">Checking…</p></div>
+    <div class="eg-actions" id="eg-compiler-actions"></div>
+  </section>
+
+  <section class="eg-card eg-job" id="eg-job" hidden aria-live="polite">
+    <div class="eg-card-head">
+      <h2 id="eg-job-title">Working…</h2>
+      <span class="eg-pill" id="eg-job-pill"><i></i><b>Running</b></span>
+    </div>
+    <p class="eg-job-step" id="eg-job-step"></p>
+    <pre class="eg-log" id="eg-job-log"></pre>
+  </section>
+
+  <p class="eg-foot" id="eg-foot"></p>
+</main>

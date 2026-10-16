@@ -2,9 +2,9 @@
   "schemaVersion": 4,
   "id": "egpu",
   "name": "eGPU",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "OAIY",
-  "description": "An NVIDIA card in a Thunderbolt enclosure for OAIY's engines on a Mac, through tinygrad's TinyGPU driver: its own Python, tinygrad, the card's server and its kernels compiled ahead of time, so neither Docker nor a compiler is needed.",
+  "description": "An NVIDIA card in a Thunderbolt enclosure for OAIY's engines on a Mac, through tinygrad's TinyGPU driver: its own Python, tinygrad, the card's server and its kernels compiled ahead of time, so neither Docker nor a compiler is needed. Its setup installs the TinyGPU driver, finds the card, and can set up NVIDIA's compiler in Docker for kernels a newer model needs.",
   "pluginApiVersion": 1,
   "minDesktopVersion": "0.1.0",
   "entry": {
@@ -18,7 +18,13 @@
   },
   "capabilities": [
     "connector.egpu.card.runtime",
-    "connector.egpu.card.status"
+    "connector.egpu.card.status",
+    "connector.egpu.setup.status",
+    "connector.egpu.driver.install",
+    "connector.egpu.driver.openSettings",
+    "connector.egpu.docker.download",
+    "connector.egpu.docker.start",
+    "connector.egpu.compiler.install"
   ],
   "connectors": [
     {
@@ -26,17 +32,95 @@
       "name": "eGPU",
       "commands": [
         "card.runtime",
-        "card.status"
+        "card.status",
+        "setup.status",
+        "driver.install",
+        "driver.openSettings",
+        "docker.download",
+        "docker.start",
+        "compiler.install"
       ]
     }
   ],
+  "commands": {
+    "journalled": [
+      "driver.install",
+      "compiler.install"
+    ]
+  },
   "modules": {
     "provides": [
       "egpu"
     ],
     "connector": "egpu"
   },
+  "setup": {
+    "version": 1,
+    "title": "Set up your eGPU",
+    "steps": [
+      {
+        "id": "driver",
+        "title": "TinyGPU driver",
+        "description": "tinygrad's driver lets this Mac talk to an NVIDIA card. Install it, then allow it in System Settings.",
+        "kind": "screen",
+        "screen": "egpu",
+        "view": "driver",
+        "done": {
+          "command": "setup.status",
+          "path": "steps.driver",
+          "equals": true
+        }
+      },
+      {
+        "id": "card",
+        "title": "Your card",
+        "description": "Connect the enclosure and turn it on. OAIY finds the card on Thunderbolt.",
+        "kind": "screen",
+        "screen": "egpu",
+        "view": "card",
+        "done": {
+          "command": "setup.status",
+          "path": "steps.card",
+          "equals": true
+        }
+      },
+      {
+        "id": "compiler",
+        "title": "NVIDIA's compiler",
+        "description": "Optional: the plugin carries the kernels OAIY's models use. A newer model's kernels are compiled by NVIDIA's compiler, which runs in Docker on a Mac.",
+        "optional": true,
+        "kind": "screen",
+        "screen": "egpu",
+        "view": "compiler",
+        "done": {
+          "command": "setup.status",
+          "path": "steps.compiler",
+          "equals": true
+        }
+      }
+    ]
+  },
   "ui": {
+    "nav": [
+      {
+        "id": "egpu",
+        "label": "eGPU",
+        "icon": "gpu",
+        "screen": "egpu"
+      }
+    ],
+    "screens": [
+      {
+        "id": "egpu",
+        "title": "eGPU",
+        "entry": "ui/egpu/index.html",
+        "files": [
+          "ui/egpu/index.html",
+          "ui/egpu/egpu.css",
+          "ui/egpu/egpu.js"
+        ]
+      }
+    ],
     "statusCards": [
       {
         "id": "card",

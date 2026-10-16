@@ -55,6 +55,11 @@ PACKS = [pathlib.Path(p) for p in os.environ.get("TINYGPU_KERNELS", "").split(os
 # What tinygrad downloads as it first opens a card, carried: NVIDIA's GSP firmware (from linux-firmware) and tinygrad's
 # TinyGPU app (from GitHub). A `firmware` folder beside this file (the eGPU plugin's), or TINYGPU_FIRMWARE ([`carried`]).
 FIRMWARE = pathlib.Path(os.environ.get("TINYGPU_FIRMWARE") or pathlib.Path(__file__).resolve().parent / "firmware")
+# Where a Mac's nvcc is when it is not on the PATH: the shim that runs NVIDIA's in a Docker container, which the eGPU
+# plugin's setup puts where tinygrad's extra/setup_nvcc_osx.sh does; and the folders Docker's own program is in (OAIY
+# starts this server with a short PATH, and the shim calls docker).
+SHIMS = pathlib.Path.home() / ".local" / "bin"
+DOCKER_BINS = ("/Applications/Docker.app/Contents/Resources/bin", str(pathlib.Path.home() / ".docker" / "bin"), "/usr/local/bin", "/opt/homebrew/bin")
 ALIGN = 256
 PROTOCOL = 3   # the requests as below; a client of another version is told so at HELLO (crates/wgpu-tinygpu's PROTOCOL)
 SCRATCH = 160 * 64 * 1024   # a kernel's scratch, where it takes one (wgsl-cuda's SCRATCH_BYTES: 1 KB a warp)
@@ -110,9 +115,23 @@ def carried():
       shutil.copyfile(app, kept)
 
 
-def run_compiler(argv: list, what: str):
-  run = subprocess.run(argv, capture_output=True, text=True)
-  if run.returncode != 0: raise RuntimeError(f"{what}: {run.stderr.strip()[-3000:]}")
+def run_compiler(argv: list, what: str, env: dict | None = None):
+  run = subprocess.run(argv, capture_output=True, text=True, env=env)
+  if run.returncode != 0:
+    said = run.stderr.strip()
+    if "docker daemon" in said.lower() or "docker: not found" in said.lower() or "docker: command not found" in said.lower():
+      raise RuntimeError(f"{what}: Docker is not running, and NVIDIA's compiler runs in it on a Mac: start Docker Desktop")
+    raise RuntimeError(f"{what}: {said[-3000:]}")
+
+
+def nvcc() -> tuple[str, dict | None] | None:
+  """The nvcc to compile with and the environment to run it in: the PATH's, else the Docker shim in ~/.local/bin
+  (`SHIMS`) with Docker's folders after the PATH. None where there is neither."""
+  import shutil
+  if found := shutil.which("nvcc"): return found, None
+  shim = SHIMS / "nvcc"
+  if not os.access(shim, os.X_OK): return None
+  return str(shim), dict(os.environ, PATH=os.pathsep.join([os.environ.get("PATH", ""), *(d for d in DOCKER_BINS if os.path.isdir(d))]))
 
 
 # ---- the card, through tinygrad ----
@@ -130,16 +149,16 @@ def compile_cuda(src: str, arch: str) -> bytes:
   name = kernel_name(arch, src)
   packed = next((p / f"{name}.cubin" for p in PACKS if (p / f"{name}.cubin").is_file()), None)
   def build(tmp: pathlib.Path):
-    import shutil
     cu = tmp.with_suffix(f".{threading.get_ident()}.cu")
     cu.write_text(src)
-    if shutil.which("nvcc") is None:
+    if (compiler := nvcc()) is None:
       missing = CACHE / "missing"
       missing.mkdir(parents=True, exist_ok=True)
       cu.rename(missing / f"{name}.cu")
       raise RuntimeError(f"kernel {name} ({arch}) is not in the eGPU's kernel pack, and there is no nvcc here to compile "
-                         f"it: an update of the eGPU plugin brings it (its source is kept in {missing})")
-    run_compiler(["nvcc", f"-arch={arch}", "-cubin", "-o", str(tmp), str(cu)], "nvcc")
+                         f"it: the eGPU plugin's setup sets up NVIDIA's compiler (in Docker), or an update of the plugin "
+                         f"brings it (its source is kept in {missing})")
+    run_compiler([compiler[0], f"-arch={arch}", "-cubin", "-o", str(tmp), str(cu)], "nvcc", compiler[1])
     cu.rename(tmp.with_name(tmp.name.split(".")[0] + ".cu"))   # (beside its cubin, as it will be named)
   path = packed or cached(".cubin", (arch + "\0" + src).encode(), build)
   compile_cuda.last = path.stem

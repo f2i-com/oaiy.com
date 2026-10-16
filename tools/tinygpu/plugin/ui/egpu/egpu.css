@@ -1,0 +1,309 @@
+/* The eGPU plugin's page: OAIY Desktop's own tokens (desktop/src/styles.css's names), light (Paper Circuit) and dark
+ * (Prism Lab), which the host switches with `fl-dark` on <html>. The document is transparent: the page's canvas shows
+ * through, and the host draws no frame around it. */
+
+:root {
+  --surface: rgba(255, 254, 250, 0.97);
+  --surface-soft: rgba(246, 243, 237, 0.96);
+  --text: #171717;
+  --muted: #68645e;
+  --faint: #6f6a63;
+  --border: #cec8be;
+  --strong-border: #9f998f;
+  --primary: #2457e6;
+  --primary-2: #2457e6;
+  --primary-soft: rgba(36, 87, 230, 0.1);
+  --green: #218450;
+  --green-soft: rgba(33, 132, 80, 0.1);
+  --amber: #9c6a08;
+  --amber-soft: rgba(245, 181, 44, 0.14);
+  --danger: #e94b3c;
+  --danger-soft: rgba(233, 75, 60, 0.08);
+  --focus: #2457e6;
+  --shadow-card: 2px 2px 0 rgba(50, 42, 30, 0.045);
+  --r-card: 8px;
+  --r-ctl: 7px;
+  --font-body: 'Public Sans', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, monospace;
+  color-scheme: light;
+  accent-color: var(--primary);
+}
+
+html.fl-dark {
+  --surface: rgba(14, 20, 34, 0.94);
+  --surface-soft: rgba(24, 34, 53, 0.7);
+  --text: #f4f7ff;
+  --muted: #98a6bd;
+  --faint: #8592ab;
+  --border: #202a3c;
+  --strong-border: #33425c;
+  --primary: #7167ff;
+  --primary-2: #4d8bff;
+  --primary-soft: rgba(113, 103, 255, 0.14);
+  --green: #45d6a2;
+  --green-soft: rgba(69, 214, 162, 0.12);
+  --amber: #f2b84b;
+  --amber-soft: rgba(242, 184, 75, 0.13);
+  --danger: #ff6e78;
+  --danger-soft: rgba(255, 110, 120, 0.1);
+  --focus: #35d4e8;
+  --shadow-card: 0 10px 26px rgba(0, 0, 0, 0.1);
+  --r-card: 11px;
+  --r-ctl: 8px;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body { background: transparent; }
+
+body {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font: inherit; cursor: pointer; }
+
+[hidden] { display: none !important; }
+
+.eg {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 860px;
+}
+
+.eg-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.eg-head h1 {
+  margin: 0 0 4px;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.eg-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 15px 16px 17px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  overflow-wrap: anywhere;
+}
+
+.eg-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.eg-card-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 640;
+}
+
+.eg-step {
+  display: inline-flex;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--strong-border);
+  border-radius: 50%;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.eg-card.is-done .eg-step {
+  border-color: color-mix(in srgb, var(--green) 45%, var(--border));
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.eg-optional {
+  margin-left: 6px;
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.eg-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.eg-body p { margin: 0; }
+
+.eg-hint {
+  margin: 0;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.eg-hint.is-warn { color: var(--amber); }
+.eg-hint.is-err { color: var(--danger); }
+
+.eg-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.eg-facts dt { color: var(--muted); }
+.eg-facts dd { margin: 0; font-family: var(--font-mono); font-size: 11.5px; }
+
+.eg-path {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-soft);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.eg-pill {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--strong-border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  padding: 3px 9px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.eg-pill b { font-weight: 600; }
+
+.eg-pill i {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.eg-pill.is-ok {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.eg-pill.is-warn {
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.eg-pill.is-err {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.eg-pill.is-busy i { animation: eg-pulse 1.3s ease-in-out infinite; }
+
+@keyframes eg-pulse { 50% { opacity: 0.3; } }
+
+.eg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.eg-actions:empty { display: none; }
+
+.eg-button {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--strong-border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  color: var(--text);
+  padding: 0 13px;
+  font-size: 12px;
+  font-weight: 580;
+  transition: background 0.14s, border-color 0.14s, transform 0.06s;
+}
+
+.eg-button:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.eg-button:active:not(:disabled) { transform: translateY(1px); }
+
+.eg-button:disabled { cursor: not-allowed; opacity: 0.45; }
+
+.eg-button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.eg-button.is-primary {
+  border-color: color-mix(in srgb, var(--primary) 80%, white);
+  background: linear-gradient(115deg, var(--primary), var(--primary-2));
+  color: #fff;
+}
+
+.eg-job-step { margin: 0; font-weight: 560; }
+
+.eg-log {
+  max-height: 220px;
+  margin: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.eg-log:empty { display: none; }
+
+.eg-foot {
+  margin: 0;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+/* In OAIY's setup wizard: one step's card, the wizard's own title above it. */
+html.eg-setup .eg-head,
+html.eg-setup .eg-foot,
+html.eg-setup .eg-step { display: none; }
+
+@media (max-width: 560px) {
+  .eg-head { flex-direction: column; }
+  .eg-facts { grid-template-columns: 1fr; }
+  .eg-facts dt { margin-top: 4px; }
+}

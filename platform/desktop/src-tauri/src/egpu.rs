@@ -139,6 +139,25 @@ mod tests {
         assert!(claims.provides(modules::EGPU), "{claims:?}");
         assert_eq!(claims.get(modules::EGPU).and_then(|c| c.connector.as_deref()), Some("egpu"));
         assert!(manifest.resolved_capabilities().iter().any(|c| c == "connector.egpu.card.runtime"));
+        // its setup: the driver, the card, and (optional) NVIDIA's compiler, each a view of its page, done when the
+        // plugin's `setup.status` says so; installing changes the computer, so it is journalled
+        let setup = manifest.setup.as_ref().expect("the eGPU's setup");
+        let steps: Vec<(&str, bool)> = setup.steps.iter().map(|s| (s.id.as_str(), s.optional)).collect();
+        assert_eq!(steps, vec![("driver", false), ("card", false), ("compiler", true)]);
+        for step in &setup.steps {
+            match &step.kind {
+                crate::plugins::manifest::StepKind::Screen { screen, view, done } => {
+                    assert_eq!((screen.as_str(), view.as_str()), ("egpu", step.id.as_str()));
+                    assert_eq!(done.as_ref().map(|d| d.command.as_str()), Some("setup.status"));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        for cmd in ["setup.status", "driver.install", "driver.openSettings", "docker.download", "docker.start", "compiler.install"] {
+            assert!(manifest.grants(&format!("connector.egpu.{cmd}")), "{cmd}");
+        }
+        assert!(manifest.is_journalled("driver.install") && manifest.is_journalled("compiler.install") && !manifest.is_journalled("setup.status"));
+        assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
