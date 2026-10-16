@@ -970,7 +970,9 @@ evaluated); a request's own still wins.
 
 Checked on this Mac's GPU, greedy, against llama.cpp (`llama-completion`, same Q4_K_M file): the same 178 prompt tokens
 and the same 86-token rewrite, ending at `<eos>` in the same place; the chain and the op-by-op path agree. Gemma 4 E2B
-answers as before on both paths, token for token. Speed: 13.7 tokens a second on the M5 Pro, where llama.cpp makes 32.
+answers as before on both paths, token for token. Speed: 13.7 tokens a second on the M5 Pro, where llama.cpp makes 32;
+through OAIY on the RTX 4090 (the eGPU), 56 tokens a second, a first token in 0.3-0.6 s (the instruction comes from the
+prompt cache after the first draft), loaded in about 40 s from the T9.
 
 ## Models larger than the card (2026-10-14)
 
