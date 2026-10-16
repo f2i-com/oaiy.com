@@ -123,9 +123,10 @@ pub enum Flavour {
     /// LFM2 (`lfm2moe`, served as a Qwen3.5 hybrid): its own template and Python-list calls (`crate::engines::lfm2`).
     Lfm2(Arc<tokenizer::Tokenizer>),
     /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, whether its
-    /// own template opens the reply on an empty thought channel (see `dense_prompt`), and the marker a picture
-    /// stands as in its prompt where it reads pictures (Gemma 4's `<|image|>`, with its vision projector).
-    Dense(Arc<tokenizer::Tokenizer>, crate::llm::Architecture, bool, Option<&'static str>),
+    /// own template opens the reply on an empty thought channel (see `dense_prompt`), the marker a picture
+    /// stands as in its prompt where it reads pictures (Gemma 4's `<|image|>`, with its vision projector), and the
+    /// plain prompt it was trained on where its template writes one and no turns ([`PlainPrompt`]).
+    Dense(Arc<tokenizer::Tokenizer>, crate::llm::Architecture, bool, Option<&'static str>, Option<PlainPrompt>),
 }
 
 impl Flavour {
@@ -176,7 +177,11 @@ impl Flavour {
                     images,
                 })
             }
-            Self::Dense(_, arch, empty_thought, marker) => {
+            Self::Dense(tok, _, _, _, Some(plain)) => Ok(crate::dsv41::chat::Encoded {
+                prompt: plain.prompt(tok.bos().and_then(|b| tok.token(b)).unwrap_or(""), &PlainPrompt::draft(msgs)),
+                images: Vec::new(),
+            }),
+            Self::Dense(_, arch, empty_thought, marker, None) => {
                 let (messages, images) = dense_messages(msgs, *marker)?;
                 Ok(crate::dsv41::chat::Encoded {
                     prompt: dense_prompt(arch, &messages, opts.mode == crate::dsv41::chat::Mode::Thinking, *empty_thought),
@@ -278,6 +283,92 @@ fn dense_prompt(arch: &crate::llm::Architecture, msgs: &[crate::llm::ChatMessage
 /// only around earlier reasoning (`'<|channel>thought\n' + thinking_text + '\n<channel|>'`), which this does not match.
 fn opens_empty_thought(template: &str) -> bool {
     template.contains(r"<|channel>thought\n<channel|>") || template.contains("<|channel>thought\n<channel|>")
+}
+
+/// The one plain prompt a completion model was trained on, as its GGUF's chat template builds it from a chat: an
+/// instruction, the last user message (trimmed) and a separator the reply follows, with no turns. jialinyyzz's
+/// humanizer (a Gemma 4 12B that rewrites a draft so it reads as a person's) is trained on `INSTR + "\n\n" +
+/// draft.strip() + "\n\n### Rewritten:\n\n"` and ends on `<eos>`; its template sets `instr` and `sep` and writes
+/// `instr ~ "\n\n" ~ (ns.draft | trim)`, then `sep` for a generation prompt. Wrapped in its architecture's turns
+/// instead, as every other dense model's chat is, it was a prompt the model had never seen. Earlier messages and the
+/// system's are left out, as the template leaves them: each message is rewritten on its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlainPrompt {
+    instr: String,
+    join: String,
+    sep: String,
+}
+
+impl PlainPrompt {
+    /// Read from a chat template that sets `instr` and `sep` (Jinja string literals), writes `instr ~ JOIN ~
+    /// (ns.draft | trim)` and then `sep`, and writes no turn markers. None for any other template.
+    pub(crate) fn of_template(template: &str) -> Option<Self> {
+        let instr = jinja_set(template, "instr")?;
+        let sep = jinja_set(template, "sep")?;
+        let after = &template[template.find("instr ~")? + "instr ~".len()..];
+        let (join, rest) = jinja_string(after.trim_start())?;
+        let rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+        let writes_sep = ["{{-sep-}}", "{{sep}}", "{{-sep}}", "{{sep-}}"].iter().any(|s| template.replace(' ', "").contains(s));
+        let turns = ["<|turn>", "<start_of_turn>", "<|im_start|>", "<|start_header_id|>"].iter().any(|t| template.contains(t));
+        (rest.starts_with("~(ns.draft|trim)") && writes_sep && !turns).then_some(Self { instr, join, sep })
+    }
+
+    /// The prompt for `draft`: `bos`, the instruction, the join, the draft trimmed, the separator.
+    pub(crate) fn prompt(&self, bos: &str, draft: &str) -> String {
+        format!("{bos}{}{}{}{}", self.instr, self.join, draft.trim(), self.sep)
+    }
+
+    /// The draft in a chat's messages, as the template reads it: the last user message's text, its parts' texts
+    /// joined as they come (other parts, pictures, left out); empty with no user message.
+    pub(crate) fn draft(msgs: &[oaiy_engine::json::Json]) -> String {
+        use oaiy_engine::json::Json;
+        let Some(m) = msgs.iter().rev().find(|m| m.get("role").and_then(Json::as_str) == Some("user")) else { return String::new() };
+        match m.get("content") {
+            Some(Json::Str(s)) => s.clone(),
+            Some(Json::Arr(parts)) => parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Json::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Json::as_str))
+                .collect(),
+            _ => String::new(),
+        }
+    }
+}
+
+/// The string a Jinja `set NAME = "…"` statement gives (`{%- set instr = "…" -%}`), its escapes read.
+fn jinja_set(template: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(at) = template[from..].find("set ") {
+        let rest = template[from + at + 4..].trim_start();
+        if let Some(rest) = rest.strip_prefix(name) {
+            if let Some(value) = rest.trim_start().strip_prefix('=') {
+                return jinja_string(value.trim_start()).map(|(s, _)| s);
+            }
+        }
+        from += at + 4;
+    }
+    None
+}
+
+/// A Jinja string literal at the start of `s` (single- or double-quoted, `\n`, `\t`, `\\` and quotes escaped), and
+/// what follows it.
+fn jinja_string(s: &str) -> Option<(String, &str)> {
+    let quote = s.chars().next().filter(|&c| c == '"' || c == '\'')?;
+    let mut out = String::new();
+    let mut chars = s[1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => match chars.next()?.1 {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                other => out.push(other),
+            },
+            c if c == quote => return Some((out, &s[1 + i + 1..])),
+            c => out.push(c),
+        }
+    }
+    None
 }
 
 /// Where a GGUF model's weights are once it is loaded on a GPU, for the log: `on_gpu` bytes there and `left` that had
@@ -1332,11 +1423,26 @@ impl Models {
             let model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
             self.say_placement(&spec.name, backend.as_ref());
             let empty_thought = gguf.get_str("tokenizer.chat_template").is_ok_and(opens_empty_thought);
+            let plain = gguf.get_str("tokenizer.chat_template").ok().and_then(PlainPrompt::of_template);
+            // A plain-prompt model was evaluated at its own sampling (the humanizer at temperature 1.0, top-p 0.95, no
+            // repetition penalty), which its GGUF records (`general.sampling.*`, as llama.cpp reads them): that is its
+            // default, over the server's chat-wide one (0.6). A request's own still wins.
+            let sampling = plain.is_some().then(|| {
+                ["temp", "top_p", "penalty_repeat"].map(|k| gguf.get_f32(&format!("general.sampling.{k}")).ok().filter(|v| v.is_finite()))
+            });
+            if plain.is_some() {
+                self.say(format!("{}: answers its template's one plain prompt (an instruction, the last message, a separator), not chat turns", spec.name));
+            }
             drop(gguf);
             let tok = Arc::new(model.tokenizer().clone());
             // Bound the initial KV allocation, as for dense Qwen3.5: a full context of an 8B model is gigabytes.
             let max_seq = self.dense_context(model.config().context_length);
             let mut cfg = self.base_cfg(spec, max_seq);
+            if let Some([temp, top_p, repeat]) = sampling {
+                cfg.temperature = temp.unwrap_or(cfg.temperature);
+                cfg.top_p = top_p.unwrap_or(cfg.top_p);
+                cfg.repeat_penalty = repeat.unwrap_or(cfg.repeat_penalty);
+            }
             // Gemma 4 reads pictures through its mmproj's vision tower (on the GPU); another dense model's projector
             // is not read.
             let projector = match o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten() {
@@ -1368,7 +1474,7 @@ impl Models {
             let (jobs, rx) = std::sync::mpsc::channel();
             let e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent).with_vision(projector);
             let thread = std::thread::Builder::new().name("model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
-            return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Dense(tok, arch, empty_thought, marker)) });
+            return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Dense(tok, arch, empty_thought, marker, plain)) });
         }
         drop(gguf);
         let budget = o.expert_cache_bytes();
@@ -1835,6 +1941,42 @@ mod dense_tests {
         assert!(opens_empty_thought(big));
         assert!(!opens_empty_thought(small));
         assert!(opens_empty_thought("<|channel>thought\n<channel|>"));
+    }
+
+    /// The humanizer's template (its GGUF's `tokenizer.chat_template`, the lines that build the prompt) gives the plain
+    /// prompt it was trained on: the instruction, the last user message trimmed, the separator; a chat template none.
+    #[test]
+    fn a_plain_prompt_is_read_from_its_template_and_a_chat_template_has_none() {
+        let template = r#"{#- humanizer chat template. It adds no turn markers. -#}
+{%- set instr = "Rewrite the text below so it reads like a person wrote it, not a language model.\n\nReorganize it as you see fit. Vary sentence length on purpose. Cut hedging,\nthroat-clearing, and any sentence that only announces what comes next.\nPrefer the concrete word over the abstract one. It is fine to sound uneven.\n\nEvery fact, number, unit, date, name and quotation must survive unchanged." -%}
+{%- set sep = "\n\n### Rewritten:\n\n" -%}
+{%- set ns = namespace(draft="", text="") -%}
+{%- for message in messages -%}
+  {%- set ns.text = "" -%}
+  {%- if message["content"] is string -%}{%- set ns.text = message["content"] -%}{%- endif -%}
+  {%- if message["role"] == "user" -%}{%- set ns.draft = ns.text -%}{%- endif -%}
+{%- endfor -%}
+{{- instr ~ "\n\n" ~ (ns.draft | trim) -}}
+{%- if add_generation_prompt -%}
+  {{- sep -}}
+{%- endif -%}"#;
+        let p = PlainPrompt::of_template(template).expect("the humanizer's template is a plain one");
+        let parse = |s: &[u8]| oaiy_engine::json::Json::parse(s).unwrap();
+        let chat = [
+            parse(br#"{"role":"system","content":"left out"}"#),
+            parse(br#"{"role":"user","content":"an earlier draft"}"#),
+            parse(br#"{"role":"assistant","content":"its rewrite"}"#),
+            parse(br#"{"role":"user","content":[{"type":"text","text":"  We are "},{"type":"text","text":"delighted to announce.\n"}]}"#),
+        ];
+        const INSTR: &str = "Rewrite the text below so it reads like a person wrote it, not a language model.\n\nReorganize it as you see fit. Vary sentence length on purpose. Cut hedging,\nthroat-clearing, and any sentence that only announces what comes next.\nPrefer the concrete word over the abstract one. It is fine to sound uneven.\n\nEvery fact, number, unit, date, name and quotation must survive unchanged.";
+        assert_eq!(p.prompt("<bos>", &PlainPrompt::draft(&chat)), format!("<bos>{INSTR}\n\nWe are delighted to announce.\n\n### Rewritten:\n\n"));
+        // the model's own self-check: `build_prompt("X")`, whose SHA-256 begins cc51d66b4c593fbe (its USAGE.md)
+        assert_eq!(p.prompt("", " X "), format!("{INSTR}\n\nX\n\n### Rewritten:\n\n"));
+        assert_eq!(PlainPrompt::draft(&chat[..1]), "", "no user message: an empty draft");
+        // Gemma 4's own chat template, and a plain-looking one that writes turns, are not plain prompts
+        assert_eq!(PlainPrompt::of_template(r"{{- '<|turn>model\n' -}}{%- if add_generation_prompt -%}{{- '<|turn>model\n' -}}{%- endif -%}"), None);
+        assert_eq!(PlainPrompt::of_template(&template.replace(r#"{{- instr"#, r#"{{- '<|turn>user\n' ~ instr"#)), None);
+        assert_eq!(jinja_string(r#"'it\'s "quoted"\t' rest"#), Some(("it's \"quoted\"\t".to_string(), " rest")));
     }
 
     #[test]

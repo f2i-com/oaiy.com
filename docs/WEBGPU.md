@@ -946,6 +946,32 @@ halves (and the top and bottom) of two pictures side by side, which of two pictu
 had an animal, and a door's colour in a second picture three turns into a
 conversation about the first.
 
+### Gemma 4 with shared K and V, and a plain-prompt model (2026-10-16)
+
+The dense Gemma 4 path now takes the layout of the larger Gemma 4s (the 12B, the 31B):
+- **Shared K and V:** a full-attention layer keeps fewer KV heads than a sliding one, and may keep no V of its own.
+  jialinyyzz's humanizer (a 12B that rewrites a draft so it reads as a person's) has 16 query heads of 512 in its full
+  layers over one KV head, whose V is the K projection (`attention_k_eq_v`; llama.cpp's
+  `Vcur = wv ? wv * cur : Kcur`). The loader takes K's matrix as V's where a layer has none, and the config reads
+  each layer's KV head count from the `head_count_kv` array (`layer_kv_heads`). The cache, the op-by-op forward and
+  the chain size each layer by its own.
+- **Proportional RoPE:** `rope_freqs` (64 divisors of 1 and 192 of 1e30, a quarter of the head rotated) is read
+  whether or not the model has per-layer embeddings. It was read only with them, so the 12B, and the 26B-A4B (which
+  has none either), rotated every pair of their full layers.
+- **V norm:** each head of V has its own unit RMS, as llama.cpp norms V after the reshape into heads. The op-by-op
+  paths (dense and MoE) normed the whole row, which differs wherever a layer keeps more than one KV head (the 12B's
+  and the 26B-A4B's sliding layers). The chain already normed each head.
+
+The humanizer is a completion model, trained on one plain prompt (`INSTR + "\n\n" + draft.strip() + "\n\n###
+Rewritten:\n\n"`), which its GGUF's chat template builds from a chat: OAIY reads that template's `instr` and `sep`
+(`PlainPrompt`) and builds the same prompt from a request's last user message, rather than Gemma 4's turns, which
+the model never saw. Its default sampling is the one its GGUF records (temperature 1.0, top-p 0.95, as it was
+evaluated); a request's own still wins.
+
+Checked on this Mac's GPU, greedy, against llama.cpp (`llama-completion`, same Q4_K_M file): the same 178 prompt tokens
+and the same 86-token rewrite, ending at `<eos>` in the same place; the chain and the op-by-op path agree. Gemma 4 E2B
+answers as before on both paths, token for token. Speed: 13.7 tokens a second on the M5 Pro, where llama.cpp makes 32.
+
 ## Models larger than the card (2026-10-14)
 
 A weight the GPU's budget has no room for stays in the model's file, held as the

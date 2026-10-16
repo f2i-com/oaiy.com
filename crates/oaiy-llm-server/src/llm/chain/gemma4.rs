@@ -96,6 +96,8 @@ struct Layer {
     ple: Option<(Held, Held, DeviceVec)>,
     scale: Option<f32>,
     hd: usize,
+    /// Its KV heads (a full-attention layer may keep fewer than the sliding ones: one, in a 12B).
+    n_kv: usize,
     /// The layer whose cache its attention reads (its own, or the earlier layer it shares).
     src: usize,
     rope: usize,
@@ -161,7 +163,7 @@ impl State {
             let gx = &m.extras[l];
             let hd = cfg.layer_head_dim(l);
             let swa = cfg.layer_uses_sliding_window(l);
-            let factors = if swa { None } else { m.global.as_ref().and_then(|g| g.rope_freq_factors.clone()) };
+            let factors = if swa { None } else { m.rope_freq_factors.clone() };
             let theta = cfg.layer_rope_theta(l);
             let same = |r: &(f32, Option<Vec<f32>>, usize)| r.0.to_bits() == theta.to_bits() && r.1 == factors && r.2 == hd;
             let rope = match ropes.iter().position(same) {
@@ -196,6 +198,7 @@ impl State {
                 ple,
                 scale: gx.layer_output_scale,
                 hd,
+                n_kv: cfg.layer_kv_heads(l),
                 src,
                 rope,
                 window: if swa { cfg.sliding_window } else { None },
@@ -267,12 +270,14 @@ struct Bufs {
 impl Bufs {
     fn new(chain: &dyn DeviceChain, st: &State, m: &Gemma4Model, t: usize) -> Bufs {
         let cfg = &m.config;
-        let (d, n_h, n_kv, pld) = (cfg.embedding_dim, cfg.n_heads, cfg.n_kv_heads, m.per_layer_dim());
+        let (d, n_h, pld) = (cfg.embedding_dim, cfg.n_heads, m.per_layer_dim());
         let v = |len: usize| chain.vec(len.max(1));
         let mut heads = BTreeMap::new();
         let mut ffn = BTreeMap::new();
         for l in &st.layers {
             let hd = l.hd;
+            // k's and v's vectors as wide as the most KV heads a layer of this head width keeps
+            let n_kv = st.layers.iter().filter(|o| o.hd == hd).map(|o| o.n_kv).max().unwrap_or(l.n_kv);
             heads.entry(hd).or_insert_with(|| [t * n_h * hd, t * n_kv * hd, t * n_kv * hd, t * n_h * hd, t * n_kv * hd, t * n_kv * hd].map(|len| v(len)));
             ffn.entry(l.ff).or_insert_with(|| {
                 let split = matches!(l.ffn, Ffn::Split(..)).then(|| (v(t * l.ff), v(t * l.ff)));
@@ -298,7 +303,7 @@ impl Bufs {
 
 impl Kv {
     /// Room for `needed` rows (grown to a power of two, the rows kept), and the attention's scratch for that many.
-    fn reserve(&mut self, chain: &dyn DeviceChain, st: &State, n_h: usize, n_kv: usize, needed: usize) {
+    fn reserve(&mut self, chain: &dyn DeviceChain, st: &State, n_h: usize, needed: usize) {
         if self.cap >= needed && self.layers.len() == st.layers.len() {
             return;
         }
@@ -309,7 +314,7 @@ impl Kv {
             .enumerate()
             .map(|(l, layer)| {
                 layer.kv.as_ref().map(|_| {
-                    let row = 2 * n_kv * layer.hd;
+                    let row = 2 * layer.n_kv * layer.hd;
                     match self.layers.get(l).and_then(|v| v.as_ref()) {
                         Some(old) => chain.resize(old, cap * row),
                         None => chain.vec(cap * row),
@@ -323,12 +328,12 @@ impl Kv {
     }
 
     /// The device's copy brought up to `past` rows: the rows the host wrote since (all of them for another cache).
-    fn sync(&mut self, chain: &dyn DeviceChain, st: &State, n_kv: usize, kv: &KvCache, past: usize) {
+    fn sync(&mut self, chain: &dyn DeviceChain, st: &State, kv: &KvCache, past: usize) {
         let from = if self.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
         if from < past {
             for (l, layer) in st.layers.iter().enumerate() {
                 let Some(buf) = self.layers[l].as_ref() else { continue };
-                let kvd = n_kv * layer.hd;
+                let kvd = layer.n_kv * layer.hd;
                 let (kh, vh) = (kv.k_buffer(l), kv.v_buffer(l));
                 let (kown, vown);
                 let kd = if kh.is_device() { kown = kh.to_host(); kown.data() } else { kh.data() };
@@ -367,12 +372,12 @@ impl Gemma4Chain {
             return None;
         }
         let one = t == 1;
-        let (n_h, n_kv) = (cfg.n_heads, cfg.n_kv_heads);
+        let n_h = cfg.n_heads;
         let pld = m.per_layer_dim();
         let past = kv.len;
         let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
-        g.reserve(chain, st, n_h, n_kv, past + t);
-        g.sync(chain, st, n_kv, kv, past);
+        g.reserve(chain, st, n_h, past + t);
+        g.sync(chain, st, kv, past);
         // a decode step's vectors are made once and kept (its bind groups with them); a prompt's chunk's are its own
         let mut kept = st.step.lock().unwrap_or_else(|p| p.into_inner());
         let fresh;
@@ -409,6 +414,8 @@ impl Gemma4Chain {
         for (l, layer) in st.layers.iter().enumerate() {
             let (b, gx) = (&m.common.blocks[l], &m.extras[l]);
             let hd = layer.hd;
+            // the KV heads of the cache this layer's attention reads (its own, or the layer's it shares, of its kind)
+            let n_kv = st.layers[layer.src].n_kv;
             let (kvd, row) = (n_kv * hd, 2 * n_kv * hd);
             let table = &tables[layer.rope];
             let [q, k, vv, qn, kn, vn] = &heads[&hd];
@@ -483,7 +490,7 @@ impl Gemma4Chain {
         r.read(&logits);
         let own: Vec<usize> = (0..st.layers.len()).filter(|&l| st.layers[l].kv.is_some()).collect();
         for &l in &own {
-            let row = 2 * n_kv * st.layers[l].hd;
+            let row = 2 * st.layers[l].n_kv * st.layers[l].hd;
             r.read_range(g.layers[l].as_ref().expect("a layer's own cache"), past * row, t * row);
         }
         let mut got = rec.finish().into_iter();

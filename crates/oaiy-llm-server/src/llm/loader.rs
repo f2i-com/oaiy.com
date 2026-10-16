@@ -17,7 +17,7 @@ use ggml_quants::GgmlType;
 use ggml_rs::{Backend, QuantizedTensor, Tensor};
 use gguf::{GgufFile, TensorInfo};
 
-use crate::llm::{LlamaError, ModelConfig, Result};
+use crate::llm::{Architecture, LlamaError, ModelConfig, Result};
 
 /// Materialize a GGUF tensor as a contiguous `Tensor<f32>` (always
 /// dequantizes if the source is packed). Use for tensors that aren't matmul
@@ -572,7 +572,14 @@ impl CommonTensors {
                 attn_norm:   idx.take(&format!("blk.{i}.attn_norm.weight"),    &[])?,
                 attn_q:      idx.take_weight(&format!("blk.{i}.attn_q.weight"),      &[])?,
                 attn_k:      idx.take_weight(&format!("blk.{i}.attn_k.weight"),      &[])?,
-                attn_v:      idx.take_weight(&format!("blk.{i}.attn_v.weight"),      &[])?,
+                attn_v:      match idx.take_weight(&format!("blk.{i}.attn_v.weight"), &[]) {
+                    // Gemma 4's full-attention layers may keep no V (`attention_k_eq_v`, the 12B's and the 31B's): their
+                    // V is the K projection (llama.cpp's `Vcur = wv ? wv * cur : Kcur`), so K's matrix serves as V's.
+                    Err(LlamaError::MissingTensor(_)) if cfg.arch == Architecture::Gemma4 => {
+                        idx.take_weight(&format!("blk.{i}.attn_k.weight"), &[])?
+                    }
+                    v => v?,
+                },
                 attn_output: idx.take_weight(&format!("blk.{i}.attn_output.weight"), &[])?,
                 ffn_norm:    idx.take(&format!("blk.{i}.ffn_norm.weight"),    &[])?,
                 // Auto-fuse gate+up if dtype/shape match — saves one matmul launch
@@ -620,7 +627,7 @@ impl CommonTensors {
             // Per-layer head_dim (Gemma 4) means q/k/v sizes vary by layer.
             let hd = cfg.layer_head_dim(i);
             let q_dim = cfg.n_heads * hd;
-            let k_dim = cfg.n_kv_heads * hd;
+            let k_dim = cfg.layer_kv_heads(i) * hd;
             expect_dense(&b.attn_norm,   &[cfg.embedding_dim],             &format!("blk.{i}.attn_norm"))?;
             expect_w(&b.attn_q,      &[q_dim, cfg.embedding_dim],      &format!("blk.{i}.attn_q"))?;
             expect_w(&b.attn_k,      &[k_dim, cfg.embedding_dim],      &format!("blk.{i}.attn_k"))?;

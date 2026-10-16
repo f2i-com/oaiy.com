@@ -290,11 +290,12 @@ impl Model {
                 .collect();
             return KvCache::new_per_layer_kv(self.backend().as_ref(), len, &n_kv_per_layer, &head_dims);
         }
-        // Gemma 4 (dense) has different head_dim per layer (256 SWA / 512 global) so the
-        // cache must be allocated per-layer (uniform n_kv_heads across layers).
-        if cfg.head_dim_swa.is_some() {
+        // Gemma 4 (dense) has different head_dim per layer (256 SWA / 512 global), and may keep fewer KV heads in its
+        // full-attention layers than in its sliding ones (a 12B: 8 and 1), so the cache is allocated per layer.
+        if cfg.head_dim_swa.is_some() || cfg.kv_heads_per_layer.is_some() {
             let head_dims: Vec<usize> = (0..cfg.n_layers).map(|i| cfg.layer_head_dim(i)).collect();
-            KvCache::new_per_layer(self.backend().as_ref(), len, cfg.n_kv_heads, &head_dims)
+            let heads: Vec<usize> = (0..cfg.n_layers).map(|i| cfg.layer_kv_heads(i)).collect();
+            KvCache::new_per_layer_kv(self.backend().as_ref(), len, &heads, &head_dims)
         } else {
             KvCache::new(self.backend().as_ref(), cfg.n_layers, len, cfg.n_kv_heads, cfg.head_dim)
         }

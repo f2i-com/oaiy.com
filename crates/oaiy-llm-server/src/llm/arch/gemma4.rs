@@ -54,10 +54,6 @@ pub struct Gemma4GlobalTensors {
     /// The PLE table, `[vocab_size, n_layers * per_layer_dim]`, as the GGUF packs it; a forward decodes its tokens'
     /// rows ([`PleTable::rows`]).
     pub per_layer_token_embd: PleTable,
-    /// Per-frequency-dim divisors for RoPE (long-rope scaling). Length is
-    /// `head_dim_global / 2`. Applied only on global (non-SWA) layers per
-    /// `llama.cpp/src/models/gemma4.cpp`.
-    pub rope_freq_factors: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
@@ -83,6 +79,8 @@ pub struct Gemma4Model {
     pub global:    Option<Gemma4GlobalTensors>,
     pub extras:    Vec<Gemma4BlockExtras>,
     pub backend:   Arc<dyn Backend>,
+    /// The full-attention layers' RoPE divisors ([`rope_freq_factors`]), None where the GGUF has none.
+    pub rope_freq_factors: Option<Vec<f32>>,
     embed_scale_const: Option<f32>,
     per_layer_dim:     usize,
     /// For each layer: `Some(src)` if K/V should be reused from layer `src`,
@@ -147,18 +145,10 @@ impl Gemma4Model {
             let per_layer_model_proj = backend.to_device(idx.take("per_layer_model_proj.weight", &[])?);
             let per_layer_proj_norm  = backend.to_device(idx.take("per_layer_proj_norm.weight",  &[])?);
 
-            // RoPE long-rope factors. Stored as 1D F32 of length head_dim_global/2.
-            // Optional — small variants might omit. Only used on global layers.
-            let rope_freq_factors = idx.take("rope_freqs.weight", &[]).ok().map(|t| {
-                let host = t.to_host();
-                host.data().to_vec()
-            });
-
             Some(Gemma4GlobalTensors {
                 per_layer_model_proj,
                 per_layer_proj_norm,
                 per_layer_token_embd,
-                rope_freq_factors,
             })
         } else {
             None
@@ -229,8 +219,9 @@ impl Gemma4Model {
         }
 
         let soft_token_ids = ["<|image|>", "<|audio|>", "<|video|>"].iter().filter_map(|t| tokenizer.token_id(t)).collect();
+        let rope_freq_factors = rope_freq_factors(&idx);
         Ok(Self {
-            config, tokenizer, common, global, extras, backend, embed_scale_const, per_layer_dim,
+            config, tokenizer, common, global, extras, backend, rope_freq_factors, embed_scale_const, per_layer_dim,
             kv_shared_source, soft_token_ids, tok_rows, chain: Default::default(),
         })
     }
@@ -358,7 +349,6 @@ impl Gemma4Model {
             "embeds first dim {} doesn't match tokens.len() {seq}", embeds.dim(0));
         let past = kv.len;
         let n_h = cfg.n_heads;
-        let n_kv = cfg.n_kv_heads;
         let n_layers = cfg.n_layers;
         let pld = self.per_layer_dim;
 
@@ -393,9 +383,9 @@ impl Gemma4Model {
             // RoPE freq factors: applied ONLY on global (non-SWA) layers per
             // llama.cpp's `freq_factors = is_swa(il) ? nullptr : rope_freqs`.
             let is_swa = cfg.layer_uses_sliding_window(layer);
-            let freq_factors: Option<&[f32]> = if !is_swa {
-                self.global.as_ref().and_then(|g| g.rope_freq_factors.as_deref())
-            } else { None };
+            let freq_factors: Option<&[f32]> = if !is_swa { self.rope_freq_factors.as_deref() } else { None };
+            // the layer's own KV heads: a full-attention layer may keep fewer than the sliding ones (one, in a 12B)
+            let n_kv = cfg.layer_kv_heads(layer);
 
             let q_flat = b.attn_q.linear(backend, &xn);
             let q_3d = q_flat.reshape(vec![seq, n_h, hd]).expect("q reshape");
@@ -413,12 +403,11 @@ impl Gemma4Model {
                     let k_flat = b.attn_k.linear(backend, &xn);
                     let v_flat = b.attn_v.linear(backend, &xn);
 
-                    // V-norm: per llama.cpp, Vcur = ggml_rms_norm(Vcur, eps) BEFORE
-                    // reshape — no learnable scale weight, just unit RMS.
-                    let v_normed = ops::rmsnorm_no_scale(backend, &v_flat, cfg.rms_eps);
-
+                    // V-norm: per llama.cpp, Vcur = ggml_rms_norm(Vcur, eps) AFTER the reshape into heads (each head
+                    // its own unit RMS, no learnable scale), as the chained path's does. Over the whole row it was the
+                    // same only where a layer keeps one KV head (E2B's, E4B's); a 12B's sliding layers keep 8.
                     let k_3d = k_flat.reshape(vec![seq, n_kv, hd]).expect("k reshape");
-                    let v = v_normed.reshape(vec![seq, n_kv, hd]).expect("v reshape");
+                    let v = ops::rmsnorm_no_scale(backend, &v_flat.reshape(vec![seq, n_kv, hd]).expect("v reshape"), cfg.rms_eps);
 
                     let mut k = ops::rmsnorm(backend, &k_3d, &gx.attn_k_norm, cfg.rms_eps);
                     ops::rope_with_factors(backend, &mut k, &positions, hd, rope_type, rope_theta, freq_factors);
@@ -553,6 +542,14 @@ impl PleTable {
         }
         out
     }
+}
+
+/// The full-attention layers' RoPE divisors (`rope_freqs.weight`, one a frequency of their head: `head_dim / 2`),
+/// whether or not the model has per-layer embeddings: llama.cpp's `freq_factors = is_swa(il) ? nullptr : rope_freqs`.
+/// Gemma 4's "proportional" RoPE rotates a quarter of a full layer's head this way (a 12B's: 64 divisors of 1, the
+/// other 192 of 1e30, which hold their pairs still); a model without the tensor rotates every pair.
+pub fn rope_freq_factors(idx: &TensorIndex<'_>) -> Option<Vec<f32>> {
+    idx.take("rope_freqs.weight", &[]).ok().map(|t| t.to_host().data().to_vec())
 }
 
 /// Load an `[N]` norm weight, or substitute a unit-weight tensor of size `n` if

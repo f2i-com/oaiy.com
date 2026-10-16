@@ -186,6 +186,9 @@ pub struct ModelConfig {
     /// entries including the trailing NextN block. `None` for every arch that
     /// stores `head_count_kv` as a scalar.
     pub recurrent_layers: Option<Vec<bool>>,
+    /// Gemma 4: each layer's KV head count, from the `attention.head_count_kv` array (`n_kv_heads` is the largest).
+    /// None where the key is a scalar.
+    pub kv_heads_per_layer: Option<Vec<usize>>,
 }
 
 /// Backwards-compat alias for the v0 name.
@@ -276,6 +279,20 @@ impl ModelConfig {
                 "attention.head_count_kv array marks every layer recurrent; the arch needs \n                 at least one full-attention layer".into())),
             None => get_u64_or("attention.head_count_kv", n_heads as u64) as usize,
         };
+        // Gemma 4's array holds each layer's real KV head count: the sliding layers' and the full-attention layers'
+        // differ (8 and 1 in a 12B whose full layers share K as V, 8 and 2 in the 26B-A4B). The scalar is the largest,
+        // as for LFM2; a layer's own is `layer_kv_heads`.
+        let kv_heads_per_layer: Option<Vec<usize>> = (arch == Architecture::Gemma4)
+            .then(|| g.metadata().get(&format!("{ns}.attention.head_count_kv")).and_then(|v| v.as_array()).and_then(|a| match a {
+                Array::U32(v) => Some(v.iter().map(|&x| x as usize).collect::<Vec<usize>>()),
+                Array::I32(v) => Some(v.iter().map(|&x| x.max(0) as usize).collect()),
+                Array::U64(v) => Some(v.iter().map(|&x| x as usize).collect()),
+                Array::I64(v) => Some(v.iter().map(|&x| x.max(0) as usize).collect()),
+                _ => None,
+            }))
+            .flatten()
+            .filter(|h| h.len() == n_layers && h.iter().all(|&n| n > 0));
+        let n_kv_heads = kv_heads_per_layer.as_ref().and_then(|h| h.iter().copied().max()).unwrap_or(n_kv_heads);
         let rms_eps        = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let rope_theta     = get_f32("rope.freq_base").unwrap_or(10000.0);
 
@@ -374,6 +391,7 @@ impl ModelConfig {
             rope_dim_swa,
             activation_sparsity_scale,
             recurrent_layers,
+            kv_heads_per_layer,
         })
     }
 
@@ -396,6 +414,11 @@ impl ModelConfig {
             (Some(swa), true) => swa,
             _                 => self.head_dim,
         }
+    }
+
+    /// KV head count of layer `i`: its own where the GGUF gives one per layer (Gemma 4), else `n_kv_heads`.
+    pub fn layer_kv_heads(&self, i: usize) -> usize {
+        self.kv_heads_per_layer.as_ref().and_then(|v| v.get(i).copied()).unwrap_or(self.n_kv_heads)
     }
 
     /// Effective RoPE freq_base for layer `i`.

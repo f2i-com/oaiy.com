@@ -81,6 +81,9 @@ pub struct Gemma4MoeModel {
     pub output:      Weight,
     pub blocks:      Vec<Gemma4MoeBlockTensors>,
     pub global:    Option<Gemma4GlobalTensors>,
+    /// The full-attention layers' RoPE divisors, read whether or not the model has per-layer embeddings (the 26B-A4B
+    /// has none, and its divisors were read only with them before).
+    pub rope_freq_factors: Option<Vec<f32>>,
     pub extras:    Vec<Gemma4BlockExtras>,
     pub moe_extras: Vec<Gemma4MoeBlockExtras>,
     pub backend:   Arc<dyn Backend>,
@@ -137,12 +140,8 @@ impl Gemma4MoeModel {
             let per_layer_token_embd = crate::llm::arch::gemma4::PleTable::load(g, config.vocab_size, config.n_layers * per_layer_dim)?;
             let per_layer_model_proj = backend.to_device(idx.take("per_layer_model_proj.weight", &[])?);
             let per_layer_proj_norm  = backend.to_device(idx.take("per_layer_proj_norm.weight",  &[])?);
-            let rope_freq_factors = idx.take("rope_freqs.weight", &[]).ok().map(|t| {
-                let host = t.to_host();
-                host.data().to_vec()
-            });
             Some(Gemma4GlobalTensors {
-                per_layer_model_proj, per_layer_proj_norm, per_layer_token_embd, rope_freq_factors,
+                per_layer_model_proj, per_layer_proj_norm, per_layer_token_embd,
             })
         } else {
             None
@@ -253,6 +252,7 @@ impl Gemma4MoeModel {
             config, tokenizer,
             tok_embd: tok_embd_d, output_norm: output_norm_d, output: output_d,
             blocks, global, extras, moe_extras, backend,
+            rope_freq_factors: crate::llm::arch::gemma4::rope_freq_factors(&idx),
             embed_scale_const, per_layer_dim,
             n_experts, expert_used,
         })
@@ -315,7 +315,7 @@ impl Gemma4MoeModel {
             let xn = ops::rmsnorm(backend, &x, &b.attn_norm, cfg.rms_eps);
             let is_swa = cfg.layer_uses_sliding_window(layer);
             let freq_factors: Option<&[f32]> = if !is_swa {
-                self.global.as_ref().and_then(|g| g.rope_freq_factors.as_deref())
+                self.rope_freq_factors.as_deref()
             } else { None };
 
             let q_flat = b.attn_q.linear(backend, &xn);
@@ -332,9 +332,10 @@ impl Gemma4MoeModel {
                 None     => k_flat.clone(),
             };
 
-            let v_normed = ops::rmsnorm_no_scale(backend, &v_flat, cfg.rms_eps);
+            // each head its own unit RMS, as llama.cpp's `ggml_rms_norm` of V reshaped into heads (over the whole row it
+            // differed in the sliding layers, whose 8 KV heads it normed as one)
             let k_3d = k_flat.reshape(vec![seq, n_kv, hd]).expect("k reshape");
-            let v = v_normed.reshape(vec![seq, n_kv, hd]).expect("v reshape");
+            let v = ops::rmsnorm_no_scale(backend, &v_flat.reshape(vec![seq, n_kv, hd]).expect("v reshape"), cfg.rms_eps);
             let mut k = ops::rmsnorm(backend, &k_3d, &gx.attn_k_norm, cfg.rms_eps);
             ops::rope_with_factors(backend, &mut k, &positions, hd, rope_type, rope_theta, freq_factors);
 
