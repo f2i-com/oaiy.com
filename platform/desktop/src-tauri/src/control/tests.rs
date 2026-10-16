@@ -930,20 +930,21 @@ async fn fake_egpu_engines(on: bool) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mut
 }
 
 #[tokio::test]
-async fn the_egpus_model_is_the_one_set_there_and_it_starts_loading() {
+async fn a_model_set_to_the_egpu_loads_there_and_the_others_stay_where_they_were() {
     use super::engines::set_egpu_at;
     let (ui, saved, asked, server) = fake_egpu_engines(true).await;
     let v = set_egpu_at(Some(ui.clone()), Some(" gemma ")).await.unwrap();
     assert_eq!(v, json!({ "model": "gemma", "egpu": { "state": "starting", "model": "gemma", "error": null }, "error": null }));
     assert!(!v.to_string().contains("secret") && !v.to_string().contains("/Users/"), "{v}");
     let written = saved.lock().unwrap().last().unwrap().clone();
-    assert_eq!(written["llm"]["models"], json!([{ "name": "qwen" }, { "name": "gemma", "egpu": true }]), "that model alone");
+    assert_eq!(written["llm"]["models"], json!([{ "name": "qwen", "egpu": true }, { "name": "gemma", "egpu": true }]), "that model set to it, the other as it was");
     assert_eq!(written["gateway"]["api_key"], "sk-gateway-secret", "the rest of the configuration goes back as it was");
     assert_eq!(asked.lock().unwrap().as_slice(), ["start gemma"]);
 
-    // None: no model is set, and the card is let go.
+    // None: the card lets go of its model, and every model stays where it was set to run.
+    let writes = saved.lock().unwrap().len();
     set_egpu_at(Some(ui.clone()), None).await.unwrap();
-    assert_eq!(saved.lock().unwrap().last().unwrap()["llm"]["models"], json!([{ "name": "qwen" }, { "name": "gemma" }]));
+    assert_eq!(saved.lock().unwrap().len(), writes, "nothing is written");
     assert_eq!(asked.lock().unwrap().last().map(String::as_str), Some("stop"));
 
     assert_eq!(set_egpu_at(Some(ui.clone()), Some("ghost")).await.unwrap_err().0, 404);

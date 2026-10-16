@@ -5,8 +5,8 @@
 //!
 //!   GET  /api/engines/defaults              → {running, defaults: {group: model|null}, models: {group: [id]}}
 //!   PUT  /api/engines/defaults {group, model} → {group, model}
-//!   PUT  /api/engines/egpu {model|null}     → {model, egpu} (the language model set to run on a Mac's eGPU, loading on
-//!                                             it; null: none)
+//!   PUT  /api/engines/egpu {model|null}     → {model, egpu} (a language model set to run on a Mac's eGPU, the others
+//!                                             as they were, and loading on it; null: the card lets go of its model)
 //!   POST /api/engines/llm/:action           → {llm: {state, resident, models, error}} (start | stop | restart)
 //!   GET  /api/engines/logs?source=studio|llm|media&lines=100 → {source, lines}
 //!
@@ -137,10 +137,11 @@ struct EgpuBody {
     model: Option<String>,
 }
 
-/// Set `model` (None: no model) as the one language model that runs on the eGPU at `ui` (a Mac's card in a Thunderbolt
-/// enclosure: the engines' `llm.egpu`), and start loading it there. The engines' configuration is read, the models'
-/// `egpu` set (that model alone), and written back, which the engines check; the eGPU itself is switched on in their
-/// Settings, where the card is set up, not here.
+/// Set `model` to run on the eGPU at `ui` (a Mac's card in a Thunderbolt enclosure: the engines' `llm.egpu`), and
+/// start loading it there; None: the card lets go of the model it holds. The engines' configuration is read, that
+/// model's `egpu` set, and written back, which the engines check; the other models stay where they were set to run
+/// (this cleared every other model's, and a model chosen here left the 27B and four others set to load in the Mac's
+/// own memory). The eGPU itself is switched on in their Settings, where the card is set up, not here.
 pub(crate) async fn set_egpu_at(ui: Option<String>, model: Option<&str>) -> Result<Value, (u16, String)> {
     let model = model.map(str::trim).filter(|m| !m.is_empty());
     if model.is_some_and(|m| !model_name(m)) {
@@ -156,21 +157,14 @@ pub(crate) async fn set_egpu_at(ui: Option<String>, model: Option<&str>) -> Resu
     let models = llm.get_mut("models").and_then(Value::as_array_mut).ok_or((502, "the engines' configuration lists no language models".to_string()))?;
     let name = |m: &Value| m.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     if let Some(m) = model {
-        if !models.iter().any(|x| name(x) == m) {
+        let Some(obj) = models.iter_mut().find(|x| name(x) == m).and_then(Value::as_object_mut) else {
             return Err((404, format!("the engines have no language model called {m}")));
+        };
+        if obj.get("egpu") != Some(&Value::Bool(true)) {
+            obj.insert("egpu".into(), Value::Bool(true));
+            studio_json(&ui, reqwest::Method::PUT, "/api/config", Some(config)).await?;
         }
     }
-    for x in models.iter_mut() {
-        let here = model.is_some_and(|m| name(x) == m);
-        if let Some(obj) = x.as_object_mut() {
-            if here {
-                obj.insert("egpu".into(), Value::Bool(true));
-            } else {
-                obj.remove("egpu");
-            }
-        }
-    }
-    studio_json(&ui, reqwest::Method::PUT, "/api/config", Some(config)).await?;
     // (loading starts now, not at the first chat: a model of 16 GB takes a minute to reach the card)
     let started = match model {
         Some(m) => studio_json(&ui, reqwest::Method::POST, "/api/egpu/start", Some(json!({ "model": m }))).await.err().map(|(_, e)| e),
