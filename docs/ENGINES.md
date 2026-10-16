@@ -364,30 +364,40 @@ at the same speed.
 crates/
   oaiy-engine/   core library (std-only): expert-store seam, LFRU RAM expert cache,
                  thread pool, JSON reader, the safetensors reader and number formats
-  oaiy-llm-cli/      `oaiy-llm` binary: run / chat / bench / info / tokenize for GGUF models
+  oaiy-llm-cli/  `oaiy-llm` binary: run / chat / bench / info / tokenize for GGUF models
   oaiy-image/    image decoding (std-only): PNG with its own inflate, JPEG, Pillow's
                  resize — pixel-exact to Pillow
-  oaiy-llm-server/   the language-model server (OpenAI-compatible HTTP), every model on WebGPU:
-    src/llm/         the GGUF models: architectures, chained GPU runs, expert streaming
-                     (once the crate llama-rs)
-    src/dsv41/       DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
-                     model, CPU experts (once the crate dsv41; its SIMD kernels' calls in
-                     src/dsv41/simd.rs, once dsv41-simd)
-    src/qwen.rs, glm.rs, flashnext/, lfm2/ ...   the engines that serve them
-  oaiy-studio/   portable host (std-only): supervises oaiy-llm-server and oaiy-media,
-                 control UI, configurable OpenAI-style gateway, model detection
+  oaiy-llm-server/   the language-model server (OpenAI-compatible HTTP), every model on WebGPU
+    src/api.rs         the endpoints
+    src/models/        the configured models, and swapping between them
+    src/engines/       the engines (qwen/, flashnext/, glm, lfm2/, orcasaq, lora,
+                       dsv41_portable/) and what they share: job, backend, disk
+    src/guards/        repetition, tool phase, the observer
+    src/media/         the media worker as a subprocess, and its catalog
+    src/llm/           the GGUF models: arch/ (each architecture's forward pass), chain/
+                       (the same chained on a GPU), vision/ (preprocessing, mmproj towers),
+                       expert streaming, sampling, chat templates (once the crate llama-rs)
+    src/dsv41/         DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
+                       model, CPU experts, its SIMD kernels' calls in simd.rs (once the
+                       crates dsv41 and dsv41-simd)
+  oaiy-studio/   portable host (std-only): admin/ (control page and port), api/ (the
+                 gateway's routes, discovery), models/ (detection, catalog, downloads),
+                 llm/ (the language model's server, a Mac's eGPU), media/ (the media
+                 worker and its jobs)
   oaiy-studio-tray/  the same host as a Windows notification-area app
-  oaiy-media/    image, video, speech, music, sound and 3D worker (Candle): Qwen Image,
-                 SDXL, LTX, Qwen3-TTS, Breeze TTS 2, MiniMax Music 3,
-                 MOSS-SoundEffect, Pixal3D, BiRefNet, Real-ESRGAN, with
-                 SSD/RAM/GPU block residency
+  oaiy-media/    image, video, speech, music, sound and 3D worker (Candle): one folder a
+                 family (qwen_image/, flux3/, klein/, sdxl/, ltx/, tts/, music/, sound/,
+                 model3d/, picture/ with BiRefNet and Real-ESRGAN), each with its
+                 webgpu module; common/ holds what they share (weights, residency, LoRAs)
   oaiy-tts/      streaming Qwen3-TTS (Candle), shared with oaiy-media's speech
   oaiy-voice/    the resident speech server for calls: Parakeet speech-to-text and
                  Qwen3-TTS, served as OAIY Voice
-  ggml-rs-wgpu/  WebGPU backend: the models' kernels in WGSL, what does not fit on the CPU
+  ggml-rs-wgpu/  WebGPU backend: device/ (the device, its queue and memory), quant/
+                 (quantized weights, their shaders, GGUF experts), chain/, dense/, exl3/
   gguf, ggml-quants, ggml-rs, tokenizer
-                 our pure-Rust GGUF stack: reader, quant kernels, the CPU
-                 backend and its chain, tokenizers (the server's and oaiy-media's)
+                 our pure-Rust GGUF stack: reader, quant kernels (by family: legacy/,
+                 k_quants/, i_quants/), the CPU backend and its chain, tokenizers (the
+                 server's and oaiy-media's)
 tools/dsv41/     Python oracle (the reference model, streamed) and helpers
 docs/            DEEPSEEK_V41.md (the port), ROADMAP.md (streaming roadmap), and the
                  rest (see docs/README.md)
