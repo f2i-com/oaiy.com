@@ -429,11 +429,12 @@ fn every_tool_is_declared_for_a_model() {
         "plugin_install", "plugin_enable", "plugin_disable", "plugin_uninstall", "plugin_settings_set", "plugin_command", "plugin_setup_open",
         "plugin_setup_step_done", "flows_list", "flow_get", "flow_create", "flow_update", "flow_run", "flow_delete", "calendar_settings_get",
         "calendar_settings_set", "link_status", "link_sync_now", "setup_status", "setup_finish", "logs_tail",
-        "contacts_list", "contact_get", "contact_set", "contact_forget_fact", "ui_open", "network_status",
+        "contacts_list", "contact_get", "contact_set", "contact_forget_fact", "ui_open", "network_status", "network_setup", "network_pair",
+        "network_approve", "network_unpair", "network_use_service", "network_pin",
     ] {
         assert!(names.contains(&want), "{want} is declared");
     }
-    let removals = ["chatgpt_sign_out", "service_uninstall", "plugin_uninstall", "flow_delete", "contact_forget_fact"];
+    let removals = ["chatgpt_sign_out", "service_uninstall", "plugin_uninstall", "flow_delete", "contact_forget_fact", "network_unpair"];
     for d in defs {
         let l = d.listing();
         assert_eq!(l["inputSchema"]["type"], "object", "{}", d.name);
@@ -820,8 +821,10 @@ async fn network_status_reads_the_network_and_its_workers_models() {
             get(|| async {
                 Json(json!({ "nodes": [{
                     "nodeId": "w1", "name": "Rig", "role": "worker", "online": true, "address": "192.168.1.20:17975", "fingerprint": "cc dd",
-                    "lastError": null, "devices": [{ "id": "gpu0", "name": "RTX 5090", "memory_total_mb": 32768, "memory_used_mb": 1024 }],
-                    "models": [{ "id": "engine:image:node.w1/flux", "kind": "image", "model": "flux", "state": "kept", "device": "gpu0", "pinned": false }]
+                    "lastError": null, "devices": [{ "id": "gpu0", "name": "RTX 5090", "memory_total_mb": 32768, "memory_used_mb": 1024, "unified": false, "load": 35 }],
+                    "models": [{ "id": "engine:image:node.w1/flux", "kind": "image", "model": "flux", "state": "kept", "device": "gpu0", "pinned": false }],
+                    "machine": { "cpu": { "name": "AMD Ryzen 9 9950X", "cores": 32, "busy": 12 }, "ram": { "total_mb": 65536, "available_mb": 50000 }, "gpus": [] },
+                    "jobs": [{ "kind": "image", "model": "flux", "status": "running", "progress": 50 }, { "kind": "flow", "flow": "logo", "runId": "r1", "status": "waiting", "mine": true }]
                 }] }))
             }),
         )
@@ -830,7 +833,7 @@ async fn network_status_reads_the_network_and_its_workers_models() {
             axum::routing::post(|| async {
                 Json(json!({ "discovery": true, "found": [
                     { "nodeId": "w1", "name": "Rig", "addresses": ["192.168.1.20:17975"], "paired": true, "compatible": true },
-                    { "nodeId": "w2", "name": "Laptop", "addresses": ["192.168.1.30:17975"], "paired": false, "compatible": true }
+                    { "nodeId": "w2", "name": "Laptop", "addresses": ["192.168.1.30:17975"], "hardware": "RTX 4070 (8 GB VRAM) · 32 GB RAM · 16 cores", "paired": false, "compatible": true }
                 ] }))
             }),
         );
@@ -839,9 +842,70 @@ async fn network_status_reads_the_network_and_its_workers_models() {
     assert!(!is_error(&r), "{r}");
     let v = &r["structuredContent"];
     assert_eq!(v["nodes"][0]["models"][0]["id"], "engine:image:node.w1/flux", "{r}");
-    assert_eq!(v["nodes"][0]["gpus"][0], json!({ "name": "RTX 5090", "memoryTotalMb": 32768, "memoryUsedMb": 1024 }), "{r}");
-    assert_eq!(v["foundOnLan"], json!([{ "name": "Laptop", "addresses": ["192.168.1.30:17975"], "compatible": true }]), "{r}");
+    assert_eq!(v["nodes"][0]["gpus"][0], json!({ "name": "RTX 5090", "memoryTotalMb": 32768, "memoryUsedMb": 1024, "vram": true, "busyPercent": 35 }), "{r}");
+    // (what it has and how busy it is, to choose where to run what)
+    assert_eq!(v["nodes"][0]["cpu"], json!({ "name": "AMD Ryzen 9 9950X", "cores": 32, "busyPercent": 12 }), "{r}");
+    assert_eq!(v["nodes"][0]["ramMb"], json!({ "total": 65536, "available": 50000 }), "{r}");
+    assert_eq!((&v["nodes"][0]["queue"]["running"], &v["nodes"][0]["queue"]["waiting"]), (&json!(1), &json!(1)), "{r}");
+    assert_eq!(v["nodes"][0]["queue"]["jobs"][1], json!({ "kind": "flow", "model": null, "flow": "logo", "status": "waiting", "mine": true }), "{r}");
+    assert_eq!(
+        v["foundOnLan"],
+        json!([{ "nodeId": "w2", "name": "Laptop", "hardware": "RTX 4070 (8 GB VRAM) · 32 GB RAM · 16 cores", "addresses": ["192.168.1.30:17975"], "compatible": true }]),
+        "{r}"
+    );
+    assert_eq!(v["agentMaySetUp"], false, "{r}");
     assert!(!r.to_string().contains("cc dd") && !r.to_string().contains("aa bb"), "no certificates: {r}");
+}
+
+/// The Agent sets OAIY Network up only where the person lets it (`agent` on the network's settings): refused otherwise.
+/// Allowed, it pairs: at once where the other computer pairs by itself too, else waiting for that computer's person
+/// and then confirming this side, both ways where this computer lends itself.
+#[tokio::test]
+async fn the_agent_sets_up_and_pairs_only_where_the_person_lets_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let sb = Sandbox::new("network-agent-off");
+    let off = Router::new().route("/api/network/status", get(|| async { Json(json!({ "enabled": true, "role": "primary", "uses": true, "lends": false, "agent": false })) }));
+    let (_, app) = control_with(&sb, Some(off), None);
+    for (tool, args) in [("network_pair", json!({ "address": "192.168.1.20:17975" })), ("network_setup", json!({ "lends": true })), ("network_unpair", json!({ "node": "w1" }))] {
+        let r = call(&app, None, tool, args).await;
+        assert!(is_error(&r) && text(&r).contains("Let the Agent pair and set up this computer"), "{tool}: {r}");
+    }
+
+    let sb = Sandbox::new("network-agent-on");
+    let asked = Arc::new(AtomicUsize::new(0));
+    let confirms: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let (n, c) = (asked.clone(), confirms.clone());
+    let on = Router::new()
+        .route("/api/network/status", get(|| async { Json(json!({ "enabled": true, "role": "both", "uses": true, "lends": true, "agent": true })) }))
+        .route(
+            "/api/network/pairings/start",
+            axum::routing::post(|Json(b): Json<Value>| async move {
+                if b["address"] == "10.0.0.2:17975" {
+                    return Json(json!({ "status": "approved", "auto": true, "code": "111 222", "worker": { "name": "Auto" }, "node": { "nodeId": "a1" } }));
+                }
+                Json(json!({ "status": "pending", "pairingId": "p1", "code": "123 456", "worker": { "name": "Rig" } }))
+            }),
+        )
+        .route(
+            "/api/network/pairings/confirm",
+            axum::routing::post(move |Json(b): Json<Value>| {
+                let (n, c) = (n.clone(), c.clone());
+                async move {
+                    c.lock().unwrap().push(b.clone());
+                    if b.get("accept") == Some(&json!(true)) {
+                        return Json(json!({ "status": "approved", "node": { "nodeId": "w1" } }));
+                    }
+                    Json(if n.fetch_add(1, Ordering::SeqCst) == 0 { json!({ "status": "pending", "code": "123 456" }) } else { json!({ "status": "approved_there", "code": "123 456" }) })
+                }
+            }),
+        );
+    let (_, app) = control_with(&sb, Some(on), None);
+    let r = call(&app, None, "network_pair", json!({ "address": "10.0.0.2:17975" })).await;
+    assert!(!is_error(&r) && text(&r).contains("Paired with Auto: both computers pair by themselves"), "{r}");
+    let r = call(&app, None, "network_pair", json!({ "address": "192.168.1.20:17975", "waitSeconds": 10 })).await;
+    assert!(!is_error(&r) && text(&r).contains("Paired with Rig, both ways"), "{r}");
+    let last = confirms.lock().unwrap().last().cloned().unwrap();
+    assert_eq!((&last["accept"], &last["bothWays"]), (&json!(true), &json!(true)), "this side confirmed, both ways: {last}");
 }
 
 /// The pages the Agent may ask to be shown are the dashboard's own: every view the dashboard can be navigated to (`NAV_VIEWS` in navigate.ts) is one the

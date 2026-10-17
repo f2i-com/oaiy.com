@@ -2125,3 +2125,31 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .network-both-ways { display: flex; align-items: flex-start; gap: 8px; color: var(--text); font-size: 12.5px; cursor: pointer; }
 .network-both-ways input { flex: none; width: auto; height: auto; margin-top: 2px; accent-color: var(--primary); }
 .network-both-ways small { color: var(--faint); }
+
+/* Networking: whether the Agent may set it up (and pair by itself), a box to tick. */
+.network-agent { padding-top: 13px; padding-bottom: 13px; }
+.network-agent.is-on { border-color: color-mix(in srgb, var(--primary) 40%, var(--border)); }
+.network-agent-row { display: flex; align-items: flex-start; gap: 11px; cursor: pointer; }
+.network-agent-row input { flex: none; width: auto; height: auto; margin-top: 3px; accent-color: var(--primary); }
+.network-agent-text { display: flex; flex-direction: column; gap: 4px; }
+.network-agent-text strong { display: inline-flex; align-items: center; gap: 7px; color: var(--text); font-size: 13px; font-weight: 650; }
+.network-agent-text strong > svg { color: var(--primary); }
+.network-agent-text small { color: var(--muted); font-size: 11.5px; line-height: 1.55; }
+
+/* A worker's queue: what it is making (spinning) and what waits (a dot), in the order it runs them. */
+.network-queue { display: flex; flex-direction: column; gap: 3px; margin-top: 12px; }
+.network-queue > .settings-label { margin-bottom: 3px; }
+.network-queue-empty { margin-top: 10px; color: var(--faint); font-size: 11.5px; }
+.network-job { display: flex; align-items: center; gap: 8px; min-height: 24px; color: var(--muted); font-size: 12px; }
+.network-job.is-running { color: var(--text); }
+.network-job > svg { flex: none; color: var(--primary); }
+.network-job-dot { width: 6px; height: 6px; flex: none; margin: 0 3px; border-radius: 50%; background: var(--strong-border); }
+.network-job-what { display: flex; min-width: 0; flex: 1; align-items: center; flex-wrap: wrap; gap: 4px 7px; }
+.network-job-what code { border: 0; background: transparent; padding: 0; color: inherit; font-family: var(--font-mono); font-size: 11px; }
+.network-job-progress { flex: none; color: var(--primary); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+.flow-run-item { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); padding-top: 9px; }
+.flow-run-item-head { display: flex; align-items: center; gap: 8px; }
+.flow-run-item-head .badge { margin-left: 0; }
+.flow-run-item-head .btn-tiny { margin-left: auto; height: 24px; }
+.network-found-hardware { color: var(--muted); font-size: 12px; }
+.network-way-auto { display: inline-flex; align-items: center; gap: 4px; color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); }

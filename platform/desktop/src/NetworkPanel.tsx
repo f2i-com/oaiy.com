@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { AudioLines, Check, Copy, Laptop, Link2, Loader2, Pin, PinOff, Server, TriangleAlert, Unplug, Workflow, X, type LucideIcon } from 'lucide-react';
+import { AudioLines, Bot, Check, Copy, Laptop, Link2, Loader2, Pin, PinOff, Server, TriangleAlert, Unplug, Workflow, X, type LucideIcon } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import {
   network,
   type NetworkDevice,
+  type NetworkJob,
+  type NetworkMachine,
   type NetworkFound,
   type NetworkModel,
   type NetworkNode,
@@ -84,6 +86,7 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
       {error && <div className="banner banner-err">{error}</div>}
       {actionError && <div className="banner banner-err" role="alert">{actionError}</div>}
       <ThisComputer status={status} busy={busy} onChange={change} />
+      <AgentMaySetUp status={status} busy={busy} onChange={change} />
       {status.lends && (
         <WorkerRequests
           requests={requests}
@@ -103,6 +106,7 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
         <PairedComputers
           nodes={nodes}
           uses={status.uses}
+          lends={status.lends}
           defaults={status.defaults}
           services={status.services}
           onNavigate={onNavigate}
@@ -322,6 +326,32 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
   );
 }
 
+/**
+ * Whether the person lets the Agent set up OAIY Network here: its tools then switch Network on, pair and unpair, and
+ * choose which other computers' models, flows and OAIY Voice this one uses; and two computers that both have it on pair
+ * by themselves, with no codes to compare. Saved as it is ticked.
+ */
+function AgentMaySetUp({ status, busy, onChange }: { status: NetworkStatus; busy: boolean; onChange: (c: Parameters<typeof network.setSettings>[0]) => void }) {
+  const on = status.agent === true;
+  return (
+    <section className={`model-section network-agent${on ? ' is-on' : ''}`} data-testid="network-agent">
+      <label className="network-agent-row">
+        <input type="checkbox" checked={on} disabled={busy} onChange={(e) => onChange({ agent: e.target.checked })} />
+        <span className="network-agent-text">
+          <strong>
+            <Bot size={15} aria-hidden /> Let the Agent pair and set up this computer
+          </strong>
+          <small>
+            The Agent can switch OAIY Network on, pair this computer with others, and choose which of their models, flows and OAIY Voice it uses, when you
+            ask it to. Two computers that both have this on pair by themselves, with no codes to compare: tick it only on a network you trust, your home’s
+            or office’s.
+          </small>
+        </span>
+      </label>
+    </section>
+  );
+}
+
 /** The six digits both screens show, large enough to compare at a glance. */
 export function PairingCode({ code }: { code: string }) {
   return (
@@ -477,7 +507,15 @@ function FindWorkers({
     setOutcome(null);
     setApprovedThere(false);
     try {
-      setPairing(await network.startPairing(target));
+      const started = await network.startPairing(target);
+      if (started.status === 'approved') {
+        // (both computers pair by themselves: paired at once, nothing to compare)
+        setOutcome({ text: `Paired with ${started.worker.name}: both computers pair by themselves.`, paired: true });
+        setAddress('');
+        onPaired();
+      } else {
+        setPairing(started);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -497,7 +535,7 @@ function FindWorkers({
         <div className="banner banner-err" role="alert">
           <div>{error}</div>
           <ul className="network-checklist">
-            <li>On the worker, Setup → Networking says “Worker” and shows the address to type here.</li>
+            <li>On the other computer, Setup → Networking has Lend this computer switched on, and shows the address to type here.</li>
             <li>Both computers are on the same network (not a guest Wi-Fi that keeps devices apart).</li>
             <li>The worker’s firewall lets OAIY in (macOS asks the first time; Windows may need “Allow”).</li>
           </ul>
@@ -567,6 +605,7 @@ function FindWorkers({
                 <Server size={16} aria-hidden />
                 <span className="network-found-name">
                   <strong>{f.name || 'An OAIY computer'}</strong>
+                  {f.hardware && <span className="network-found-hardware">{f.hardware}</span>}
                   {f.addresses[0] && <span className="pairing-origin">{f.addresses[0]}</span>}
                   {!f.compatible && <span className="card-warn">A different version of OAIY Network: update both computers to pair them.</span>}
                 </span>
@@ -704,8 +743,9 @@ function NodeModels({ node, onChanged, defaults }: { node: NetworkNode; onChange
 
 const gb = (mb: number) => `${(mb / 1024).toFixed(1)}`;
 
-/** A GPU of a worker: its memory in use as a meter, and how busy it is (not while the worker does not answer). */
-export function Device({ d, live }: { d: NetworkDevice; live: boolean }) {
+/** A GPU of a worker: its memory in use as a meter (VRAM on a card of its own, else the computer's memory it shares),
+ * how busy and how warm it is (not while the worker does not answer). */
+export function Device({ d, live, temperature }: { d: NetworkDevice; live: boolean; temperature?: number | null }) {
   const total = typeof d.memory_total_mb === 'number' && d.memory_total_mb > 0 ? d.memory_total_mb : null;
   const used = typeof d.memory_used_mb === 'number' ? d.memory_used_mb : null;
   const share = total && used !== null ? Math.min(100, Math.max(0, (used / total) * 100)) : null;
@@ -713,12 +753,80 @@ export function Device({ d, live }: { d: NetworkDevice; live: boolean }) {
     <div className="network-device">
       <div className="network-device-head">
         <span className="network-device-name">{d.name}</span>
-        {live && typeof d.load === 'number' && <span className="network-device-load">{Math.round(d.load)}% busy</span>}
+        {live && (typeof d.load === 'number' || typeof temperature === 'number') && (
+          <span className="network-device-load">
+            {[typeof d.load === 'number' ? `${Math.round(d.load)}% busy` : null, typeof temperature === 'number' ? `${Math.round(temperature)}°C` : null].filter(Boolean).join(' · ')}
+          </span>
+        )}
       </div>
       <div className="network-meter" aria-hidden>
         <div className={`network-meter-fill${share !== null && share > 85 ? ' is-full' : ''}`} style={{ width: `${share ?? 0}%` }} />
       </div>
-      <div className="network-device-figure">{total ? `${used !== null ? gb(used) : '?'} of ${gb(total)} GB in use` : 'memory unknown'}</div>
+      <div className="network-device-figure">
+        {total ? `${used !== null ? gb(used) : '?'} of ${gb(total)} GB ${d.unified ? 'shared memory' : 'VRAM'} in use` : 'memory unknown'}
+      </div>
+    </div>
+  );
+}
+
+/** A worker's processor and memory, as tiles beside its GPUs. */
+function MachineTiles({ m, live }: { m: NetworkMachine; live: boolean }) {
+  const cpu = m.cpu;
+  const ram = m.ram;
+  const total = typeof ram?.total_mb === 'number' && ram.total_mb > 0 ? ram.total_mb : null;
+  const used = total !== null && typeof ram?.available_mb === 'number' ? Math.max(0, total - ram.available_mb) : null;
+  return (
+    <>
+      {cpu && (
+        <div className="network-device network-device-cpu">
+          <div className="network-device-head">
+            <span className="network-device-name">Processor</span>
+            {live && typeof cpu.busy === 'number' && <span className="network-device-load">{cpu.busy}% busy</span>}
+          </div>
+          <div className="network-meter" aria-hidden>
+            <div className="network-meter-fill" style={{ width: `${live && typeof cpu.busy === 'number' ? cpu.busy : 0}%` }} />
+          </div>
+          <div className="network-device-figure">{[cpu.name, cpu.cores ? `${cpu.cores} cores` : null].filter(Boolean).join(' · ')}</div>
+        </div>
+      )}
+      {total !== null && (
+        <div className="network-device network-device-ram">
+          <div className="network-device-head">
+            <span className="network-device-name">Memory (RAM)</span>
+          </div>
+          <div className="network-meter" aria-hidden>
+            <div className={`network-meter-fill${used !== null && used / total > 0.85 ? ' is-full' : ''}`} style={{ width: `${used !== null ? Math.min(100, (used / total) * 100) : 0}%` }} />
+          </div>
+          <div className="network-device-figure">{used !== null ? `${gb(used)} of ${gb(total)} GB in use` : `${gb(total)} GB`}</div>
+        </div>
+      )}
+    </>
+  );
+}
+
+const JOB_KIND: Record<string, string> = { image: 'a picture', video: 'a video', speech: 'speech', music: 'music', sound: 'a sound', model3d: 'a 3D model', picture: 'a picture edit', flow: 'a flow run' };
+
+/** A worker's queue: what it is making now and what waits, in the order it runs them. */
+function Queue({ jobs }: { jobs: NetworkJob[] }) {
+  if (jobs.length === 0) return <div className="network-queue-empty">Nothing running or waiting.</div>;
+  const waiting = jobs.filter((j) => j.status === 'waiting').length;
+  return (
+    <div className="network-queue" data-testid="network-queue">
+      <div className="settings-label">
+        Queue <span className="section-count">({jobs.length - waiting} running, {waiting} waiting)</span>
+      </div>
+      {jobs.slice(0, 8).map((j, i) => (
+        <div className={`network-job${j.status === 'running' ? ' is-running' : ''}`} key={`${j.kind}:${j.runId ?? j.model ?? ''}:${i}`}>
+          {j.status === 'running' ? <Loader2 size={12} className="spin" aria-hidden /> : <span className="network-job-dot" aria-hidden />}
+          <span className="network-job-what">
+            {j.status === 'running' ? 'Making' : 'Waiting:'} {JOB_KIND[j.kind] ?? j.kind}
+            {j.model ? <code>{j.model}</code> : j.flow ? <code>{j.flow}</code> : null}
+            {j.mine && <span className="network-way">this computer’s</span>}
+          </span>
+          {j.status === 'running' && typeof j.progress === 'number' && j.progress > 0 && <span className="network-job-progress">{Math.round(j.progress)}%</span>}
+        </div>
+      ))}
+      {jobs.length > 8 && <div className="form-hint">and {jobs.length - 8} more</div>}
     </div>
   );
 }
@@ -747,6 +855,7 @@ function queueText(q: NetworkNode['queue']): string | null {
 function PairedComputers({
   nodes,
   uses,
+  lends,
   defaults,
   services,
   onNavigate,
@@ -756,6 +865,8 @@ function PairedComputers({
   nodes: NetworkNode[];
   /** This computer uses other computers now (else its pairings to use others wait). */
   uses: boolean;
+  /** This computer lends itself now (else the computers paired to use it wait). */
+  lends: boolean;
   defaults: NetworkStatus['defaults'];
   services: NetworkStatus['services'];
   onNavigate?: (view: 'flow-workers' | 'services' | 'engine-workers') => void;
@@ -797,7 +908,12 @@ function PairedComputers({
                   <span className="card-title">{n.name}</span>
                   {worker && <span className={`badge ${n.online ? 'badge-ok' : 'badge-err'}`}>{n.online ? 'Online' : 'Offline'}</span>}
                   {paired && <span className="network-way">{uses ? 'This computer uses it' : 'This computer can use it (Use other computers is off)'}</span>}
-                  {usesThis && <span className="network-way">Uses this computer</span>}
+                  {usesThis && <span className="network-way">{lends ? 'Uses this computer' : 'Can use this computer (Lend this computer is off)'}</span>}
+                  {n.pairedByItself && (
+                    <span className="network-way network-way-auto" title="Both computers let their Agent set up OAIY Network, so they paired with no codes compared. Unpair it if you do not know it.">
+                      <Bot size={11} aria-hidden /> Paired by itself
+                    </span>
+                  )}
                   <button className="btn-tiny btn-danger network-unpair" onClick={() => onUnpair(n)}>
                     <Unplug size={12} aria-hidden /> Unpair
                   </button>
@@ -813,16 +929,17 @@ function PairedComputers({
                     <TriangleAlert size={13} aria-hidden /> Its engines: {n.enginesError}
                   </div>
                 )}
-                {busyNow && <div className="network-busy">{busyNow}</div>}
                 <div className={stale ? 'network-stale' : undefined} hidden={!worker}>
                   {stale && n.lastSeenMs && <div className="network-stale-note">Last report {ago(n.lastSeenMs)}</div>}
-                  {n.devices.length > 0 && (
+                  {(n.devices.length > 0 || n.machine) && (
                     <div className="network-devices">
+                      {n.machine && <MachineTiles m={n.machine} live={!stale} />}
                       {n.devices.map((d) => (
-                        <Device key={d.id} d={d} live={!stale} />
+                        <Device key={d.id} d={d} live={!stale} temperature={n.machine?.gpus?.find((g) => g.name === d.name)?.temperature} />
                       ))}
                     </div>
                   )}
+                  {!stale && (n.jobs ? <Queue jobs={n.jobs} /> : busyNow && <div className="network-busy">{busyNow}</div>)}
                   {n.models.length > 0 && <NodeModels node={n} onChanged={onChanged} defaults={defaults} />}
                 </div>
                 {worker && ((n.flows ?? []).length > 0 || (n.services ?? []).length > 0) && (

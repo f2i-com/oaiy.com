@@ -37,8 +37,12 @@ pub fn locate(reference: &str) -> Option<(Option<u16>, &str)> {
     if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
         return None;
     }
+    // (its path alone, nothing escaped in it: `%2e%2e` is read as `..` where it is fetched, and no query is passed on)
+    let path = path.split(['?', '#']).next()?;
+    if path.contains(['%', '\\']) {
+        return None;
+    }
     let file = engine_file(path)?;
-    let file = file.split(['?', '#']).next()?;
     if file.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
         return None;
     }
@@ -317,7 +321,8 @@ mod tests {
     fn only_this_computers_engine_pictures_are_references() {
         let ok = "http://127.0.0.1:17972/api/ai/engine/gateway/files/images/2026-10-17/a.png";
         assert_eq!(locate(ok), Some((Some(17972), "/api/ai/engine/gateway/files/images/2026-10-17/a.png")));
-        assert!(locate("http://localhost:1/api/ai/engine/gateway/files/x.JPG?v=1").is_some());
+        // (its path alone: a query is not passed on)
+        assert_eq!(locate("http://localhost:1/api/ai/engine/gateway/files/x.JPG?v=1"), Some((Some(1), "/api/ai/engine/gateway/files/x.JPG")));
         // a paired worker's, as OAIY Network serves them on this desktop
         let worker = "http://127.0.0.1:17972/api/network/nodes/abc123/gateway/files/images/b.webp";
         assert_eq!(locate(worker), Some((Some(17972), "/api/network/nodes/abc123/gateway/files/images/b.webp")));
@@ -326,6 +331,10 @@ mod tests {
             "http://127.0.0.1:17972/api/network/nodes//gateway/files/b.png",
             "http://127.0.0.1:17972/api/network/nodes/abc123/gateway/api/config.png",
             "http://127.0.0.1:17972/api/network/nodes/abc123/gateway/files/../../x.png",
+            // (`%2e%2e` is `..` where it is fetched)
+            "http://127.0.0.1:17972/api/ai/engine/gateway/files/%2e%2e/%2e%2e/%2e%2e/api/config.png",
+            "http://127.0.0.1:17972/api/ai/engine/gateway/files/a%2fb.png",
+            "http://127.0.0.1:17972/api/ai/engine/gateway/files/a\\..\\b.png",
             "http://192.168.1.20:17975/worker/v1/gateway/files/b.png",
         ] {
             assert_eq!(locate(not), None, "{not}");

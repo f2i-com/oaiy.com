@@ -1,5 +1,5 @@
 {
- "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (649ccd1): all of them for a project or setup session; the runner session is offered the read tools named in runner; network_status and ui_open's network page added since, model_set_default taking a worker's model, and flows_list and flow_run a worker's node, as tools.rs declares them.",
+ "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from this checkout: all of them for a project or setup session; the runner session is offered the read tools named in runner.",
  "tools": [
   {
    "annotations": {
@@ -247,7 +247,7 @@
     "readOnlyHint": true,
     "title": "OAIY Network"
    },
-   "description": "OAIY Network (other OAIY computers on this LAN): whether it is on, what this computer does (uses: it uses paired computers' models, flows and services; lends: it lends its own; both at once can be on), the workers found on the LAN, and the paired computers, each online or not with its GPUs, models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
+   "description": "OAIY Network (other OAIY computers on this LAN): whether it is on, what this computer does (uses: it uses paired computers' models, flows and services; lends: it lends its own; both at once can be on), the workers found on the LAN (foundOnLan, each saying what it has: its GPUs with their VRAM, memory and cores, to choose which to pair with), the computers asking to use this one (requests), and the paired computers, each online or not with its processor, memory and GPUs (VRAM, how busy), its queue (what it is making, what waits), models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking, or the Agent's where agentMaySetUp (network_setup, network_pair, network_approve, network_unpair, network_use_service, network_pin).",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {},
@@ -256,6 +256,202 @@
    },
    "name": "network_status",
    "title": "OAIY Network"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Set up OAIY Network"
+   },
+   "description": "Switch OAIY Network on or off, and choose what this computer does: uses (it uses paired computers' models, flows and services) and lends (it lends its own to the computers that pair with it), either or both; name is the name other computers see. Only where the person lets the Agent set up OAIY Network (network_status's agentMaySetUp; they tick it in Setup, Networking).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "enabled": {
+      "description": "OAIY Network on (true) or off. Choosing uses or lends switches it on.",
+      "type": "boolean"
+     },
+     "lends": {
+      "description": "This computer lends itself to the computers that pair with it.",
+      "type": "boolean"
+     },
+     "name": {
+      "description": "The name other computers see.",
+      "maxLength": 80,
+      "minLength": 1,
+      "type": "string"
+     },
+     "uses": {
+      "description": "This computer uses other computers.",
+      "type": "boolean"
+     }
+    },
+    "required": [],
+    "type": "object"
+   },
+   "name": "network_setup",
+   "title": "Set up OAIY Network"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Pair with a computer"
+   },
+   "description": "Pair with another OAIY computer on this network that lends itself: node (one network_status lists in foundOnLan) or address (host:port, as that computer's Networking page shows it). Two computers whose people both let their Agent set up OAIY Network pair by themselves at once. Otherwise that computer's person approves the request showing the code this answers: tell the person the code and where (Setup, Networking on that computer); this call waits up to waitSeconds (default 60) and confirms this side once it is approved. Call again with pairingId to keep waiting. bothWays (default true where this computer lends itself) lets the other computer use this one too. Only where the person lets the Agent set up OAIY Network.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "address": {
+      "description": "The other computer's address, host:port.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "bothWays": {
+      "description": "Let the other computer use this one too (default true where this one lends itself).",
+      "type": "boolean"
+     },
+     "node": {
+      "description": "A paired worker's node id, as network_status lists it (OAIY Network).",
+      "minLength": 1,
+      "type": "string"
+     },
+     "pairingId": {
+      "description": "A pairing an earlier call started, to keep waiting for.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "waitSeconds": {
+      "description": "How long to wait for the other computer's approval (default 60).",
+      "maximum": 120,
+      "minimum": 0,
+      "type": "integer"
+     }
+    },
+    "required": [],
+    "type": "object"
+   },
+   "name": "network_pair",
+   "title": "Pair with a computer"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Answer a pairing request"
+   },
+   "description": "Approve (approve true) or deny a computer asking to use this one: id as network_status's requests list it (each with its name and code). Approve only a computer the person expects. Only where the person lets the Agent set up OAIY Network.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "approve": {
+      "description": "Approve (true) or deny (false).",
+      "type": "boolean"
+     },
+     "id": {
+      "description": "The request's id.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "approve"
+    ],
+    "type": "object"
+   },
+   "name": "network_approve",
+   "title": "Answer a pairing request"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Unpair a computer"
+   },
+   "description": "Unpair a paired computer (node, as network_status lists it), both ways: neither uses the other until they pair again; its models stop being this computer's defaults and its services stop being used here. Only where the person lets the Agent set up OAIY Network.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "node": {
+      "description": "A paired worker's node id, as network_status lists it (OAIY Network).",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "node"
+    ],
+    "type": "object"
+   },
+   "name": "network_unpair",
+   "title": "Unpair a computer"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Use another computer's service"
+   },
+   "description": "Use a service a paired computer lends in place of this computer's own: service oaiy-voice, node that computer (network_status lists the services each lends); without node, this computer's own again. With OAIY Voice on another computer, this computer's calls, transcriptions and listening hear and speak there, the phone still connected here. Only where the person lets the Agent set up OAIY Network.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "node": {
+      "description": "A paired worker's node id, as network_status lists it (OAIY Network).",
+      "minLength": 1,
+      "type": "string"
+     },
+     "service": {
+      "description": "The service.",
+      "enum": [
+       "oaiy-voice"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [
+     "service"
+    ],
+    "type": "object"
+   },
+   "name": "network_use_service",
+   "title": "Use another computer's service"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Keep a model loaded on another computer"
+   },
+   "description": "Pin (pin true) a paired computer's model, so it is kept loaded there and loaded again when that computer restarts, or let it go as any other again (pin false): model is its id as network_status lists it (engine:<kind>:node.<nodeId>/<model>). Picture models, and the language model chosen there. Only where the person lets the Agent set up OAIY Network.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "model": {
+      "description": "The model's id, engine:<kind>:node.<nodeId>/<model>.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "pin": {
+      "description": "Keep it loaded (true), or let it go (false).",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "model",
+     "pin"
+    ],
+    "type": "object"
+   },
+   "name": "network_pin",
+   "title": "Keep a model loaded on another computer"
   },
   {
    "annotations": {
@@ -1236,7 +1432,7 @@
     "readOnlyHint": false,
     "title": "Show a dashboard page"
    },
-   "description": "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, network (Networking: OAIY Network, pairing other OAIY computers), plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
+   "description": "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), messages (what the receptionist took when the owner could not be reached), transfers (whether the receptionist may try to reach the owner for a caller who asks, and how), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, network (Networking: OAIY Network, pairing other OAIY computers), plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {

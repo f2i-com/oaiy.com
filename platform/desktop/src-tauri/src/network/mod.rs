@@ -17,6 +17,7 @@ pub mod store;
 pub mod tls;
 
 mod discovery;
+pub mod machine;
 mod primary;
 mod worker;
 
@@ -50,7 +51,7 @@ pub fn paired_worker(node_id: &str) -> Option<String> {
     if !net.settings().uses() {
         return None;
     }
-    net.inner().peers().get(node_id, store::Role::Worker).map(|p| p.name.clone())
+    net.inner().peers().get(node_id, Role::Worker).map(|p| p.name.clone())
 }
 
 #[derive(Clone)]
@@ -192,6 +193,24 @@ impl Network {
         self.apply().await
     }
 
+    /// Unpair `node_id`, both ways, and forget what was chosen of it: its models no longer this computer's defaults,
+    /// its services no longer used here (this computer's own again), its last report gone.
+    pub(crate) fn forget(&self, node_id: &str) -> Result<(), String> {
+        self.inner.peers().remove(node_id)?;
+        let _ = self.inner.defaults().drop_node(node_id);
+        let _ = self.inner.services().drop_node(node_id);
+        lock(&self.inner.nodes).remove(node_id);
+        worker::forget_voices(node_id);
+        Ok(())
+    }
+
+    /// Keep new settings that change nothing running (whether the Agent may set it up).
+    pub(crate) fn keep(&self, settings: Settings) -> Result<(), String> {
+        settings.save(&self.inner.dir)?;
+        *lock(&self.inner.settings) = settings;
+        Ok(())
+    }
+
     /// Start what the settings ask for, stopping what they no longer do.
     pub async fn apply(&self) -> Result<(), String> {
         let _one_at_a_time = self.inner.applying.lock().await;
@@ -220,7 +239,10 @@ impl Network {
             log::info!("network: this computer lends itself, listening on {addr}");
             started = daemon();
             if let Some(d) = &started {
-                if let Err(e) = discovery::advertise(d, &id, &self.display_name(), addr.port()) {
+                // (what it has, said with its name: from its engines where they answer within a few seconds)
+                let read = async { tokio::join!(machine::engines_get(self, "/api/system"), machine::engines_get(self, "/api/resources")) };
+                let (system, resources) = tokio::time::timeout(std::time::Duration::from_secs(5), read).await.unwrap_or((Value::Null, Value::Null));
+                if let Err(e) = discovery::advertise(d, &id, &self.display_name(), addr.port(), &machine::summary(&system, &resources)) {
                     log::warn!("network: not advertised on the LAN ({e}); another computer adds it by its address");
                 }
             }
@@ -279,6 +301,7 @@ impl Network {
             "role": settings.active_role(),
             "uses": settings.uses(),
             "lends": settings.lends(),
+            "agent": settings.agent,
             "settings": settings,
             "nodeId": id.as_ref().map(|i| i.node_id.clone()),
             "name": self.display_name(),

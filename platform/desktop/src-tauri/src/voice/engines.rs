@@ -70,11 +70,21 @@ impl Engines {
         {
             if let Some(remote) = remote {
                 let started = Instant::now();
+                let mut unreachable = 0;
                 loop {
                     match remote.client.get(format!("{}/v1/models", remote.base)).timeout(Duration::from_secs(5)).send().await {
                         Ok(r) if r.status().is_success() => break,
                         Ok(r) if !matches!(r.status().as_u16(), 503 | 502) => {
                             return Err(format!("{id} on {}: HTTP {}: {}", remote.node_name, r.status(), r.text().await.unwrap_or_default()));
+                        }
+                        // (the worker itself not answering, not its service starting: said at once, not waited on
+                        // for each line of a call; asked a second time for a moment's dropout)
+                        Err(e) => {
+                            unreachable += 1;
+                            if unreachable >= 2 {
+                                return Err(format!("{} does not answer ({id} is used there): {e}", remote.node_name));
+                            }
+                            tokio::time::sleep(Duration::from_millis(700)).await;
                         }
                         _ if started.elapsed() > START_WAIT => return Err(format!("{id} on {} did not answer within {} s", remote.node_name, START_WAIT.as_secs())),
                         _ => tokio::time::sleep(Duration::from_millis(500)).await,
@@ -92,17 +102,20 @@ impl Engines {
     async fn voice_at(&self, target: &Target, voice: &str) -> String {
         let Some(remote) = &target.remote else { return voice.to_string() };
         let Some(clip) = super::voices::list().into_iter().find(|c| c.name == voice) else { return voice.to_string() };
-        let key = format!("{}|{}|{}|{}", remote.root, clip.name, clip.file, clip.bytes);
+        let Some(dir) = super::voices::dir() else { return voice.to_string() };
+        let path = dir.join(&clip.file);
+        // (copied again when its clip or its words change, or to another computer at that address)
+        let changed = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis());
+        let key = format!("{}|{}|{}|{}|{}|{}", remote.fingerprint, clip.name, clip.file, clip.bytes, changed(&path), changed(&path.with_extension("txt")));
         if let Some(name) = self.copied.lock().ok().and_then(|c| c.get(&key).cloned()) {
             return name;
         }
-        let Some(dir) = super::voices::dir() else { return voice.to_string() };
-        let path = dir.join(&clip.file);
         let words = std::fs::read_to_string(path.with_extension("txt")).ok();
         let Ok(bytes) = tokio::fs::read(&path).await else { return voice.to_string() };
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("wav").to_string();
         let body = serde_json::json!({ "clip": base64::engine::general_purpose::STANDARD.encode(bytes), "extension": extension, "words": words });
-        let answer = remote.client.put(format!("{}/worker/v1/voices/{}", remote.root, clip.name)).json(&body).timeout(Duration::from_secs(60)).send().await;
+        let name = percent_encoding::utf8_percent_encode(&clip.name, percent_encoding::NON_ALPHANUMERIC);
+        let answer = remote.client.put(format!("{}/worker/v1/voices/{name}", remote.root)).json(&body).timeout(Duration::from_secs(60)).send().await;
         match answer {
             Ok(r) if r.status().is_success() => {
                 let name = r.json::<serde_json::Value>().await.ok().and_then(|v| v["voice"].as_str().map(str::to_owned)).unwrap_or_else(|| voice.to_string());
@@ -118,6 +131,16 @@ impl Engines {
             Err(e) => {
                 log::warn!("voice: {voice} could not be copied to {}: {e}", remote.node_name);
                 voice.to_string()
+            }
+        }
+    }
+
+    /// A worker that did not know a voice copied there (it was removed, or the worker set up again): copied again
+    /// the next time it is spoken in.
+    fn forget_copies(&self, target: &Target, status: reqwest::StatusCode) {
+        if target.remote.is_some() && matches!(status.as_u16(), 400 | 404) {
+            if let Ok(mut c) = self.copied.lock() {
+                c.clear();
             }
         }
     }
@@ -188,6 +211,7 @@ impl Engines {
         }
         let resp = t.http.post(format!("{}/v1/audio/speech", t.base)).json(&body).timeout(Duration::from_secs(60)).send().await.map_err(|e| format!("text-to-speech: {e}"))?;
         if !resp.status().is_success() {
+            self.forget_copies(&t, resp.status());
             return Err(format!("text-to-speech: HTTP {}", resp.status()));
         }
         Ok(())
@@ -204,6 +228,7 @@ impl Engines {
         let resp = t.http.post(format!("{}/v1/audio/speech", t.base)).json(&body).timeout(Duration::from_secs(120)).send().await.map_err(|e| format!("text-to-speech: {e}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
+            self.forget_copies(&t, status);
             return Err(format!("text-to-speech: HTTP {status}: {}", resp.text().await.unwrap_or_default()));
         }
         let rate = resp.headers().get("x-sample-rate").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u32>().ok()).unwrap_or(WIRE_RATE);

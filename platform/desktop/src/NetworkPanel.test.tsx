@@ -134,12 +134,50 @@ describe('NetworkPanel', () => {
     expect(card.textContent).toContain('Online');
     const devices = Array.from(card.querySelectorAll('.network-device')).map((d) => d.textContent);
     expect(devices[0]).toContain('RTX 5090');
-    expect(devices[0]).toContain('4.0 of 32.0 GB in use');
+    expect(devices[0]).toContain('4.0 of 32.0 GB VRAM in use');
     expect(devices[1]).toContain('RTX 3070');
     expect(devices[1]).toContain('memory unknown');
     // the address typed is cleared once it is paired
     expect(input.value).toBe('');
     expect(card.textContent).toContain('flux');
+  });
+
+  it("shows a worker's processor, memory and GPUs, and its queue: what it makes and what waits", async () => {
+    api.status.mockResolvedValue(primary);
+    api.discover.mockResolvedValue({
+      discovery: true,
+      found: [{ nodeId: 'w9', name: 'Laptop', addresses: ['192.168.1.30:17975'], protocol: 2, hardware: 'RTX 4070 (8 GB VRAM) · 32 GB RAM · 16 cores', seenMs: 1, paired: false, compatible: true }],
+    });
+    api.nodes.mockResolvedValue({
+      nodes: [
+        {
+          ...node,
+          machine: { cpu: { name: 'AMD Ryzen 9 9950X', cores: 32, busy: 18 }, ram: { total_mb: 65536, available_mb: 49152 }, gpus: [{ name: 'RTX 5090', temperature: 61 }] },
+          jobs: [
+            { kind: 'image', model: 'flux', status: 'running', progress: 40 },
+            { kind: 'flow', flow: 'logo', runId: 'r2', status: 'waiting', mine: true },
+            { kind: 'video', model: 'ltx', status: 'waiting' },
+          ],
+        },
+      ],
+    });
+    await mount();
+    const card = container.querySelector('[data-testid="network-node"]')!;
+    const tiles = Array.from(card.querySelectorAll('.network-device')).map((d) => d.textContent);
+    expect(tiles[0]).toContain('Processor');
+    expect(tiles[0]).toContain('AMD Ryzen 9 9950X · 32 cores');
+    expect(tiles[0]).toContain('18% busy');
+    expect(tiles[1]).toContain('16.0 of 64.0 GB in use');
+    expect(tiles[2]).toContain('RTX 5090');
+    expect(tiles[2]).toContain('61°C');
+    const queue = card.querySelector('[data-testid="network-queue"]')!.textContent;
+    expect(queue).toContain('1 running, 2 waiting');
+    expect(queue).toContain('Making a picture');
+    expect(queue).toContain('40%');
+    expect(queue).toContain('Waiting: a flow run');
+    expect(queue).toContain('this computer’s');
+    // (one found on the network says what it has, to choose which to pair with)
+    expect(container.querySelector('[data-testid="network-found"]')!.textContent).toContain('RTX 4070 (8 GB VRAM) · 32 GB RAM · 16 cores');
   });
 
   it("pins a worker's model by its id, shows the pin loading, and unpins it by its name there", async () => {
@@ -228,6 +266,26 @@ describe('NetworkPanel', () => {
     const card = container.querySelector('[data-testid="network-node"]')!;
     expect(card.textContent).toContain('This computer uses it');
     expect(card.textContent).toContain('Uses this computer');
+  });
+
+  it('lets the Agent set it up with a tick, saved at once, and pairs at once where both computers pair by themselves', async () => {
+    api.status.mockResolvedValue(primary);
+    api.setSettings.mockResolvedValue({ ...primary, agent: true });
+    api.startPairing.mockResolvedValue({ status: 'approved', code: '111 222', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.20:17975', fingerprint: '1111' } });
+    await mount();
+    const tick = container.querySelector('[data-testid="network-agent"] input') as HTMLInputElement;
+    expect(tick.checked).toBe(false);
+    await act(async () => tick.click());
+    expect(api.setSettings).toHaveBeenCalledWith({ agent: true });
+    const input = container.querySelector('input[aria-label="Worker address"]') as HTMLInputElement;
+    await act(async () => {
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      set.call(input, '192.168.1.20');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => input.closest('form')!.requestSubmit());
+    expect(container.textContent).toContain('Paired with Rig: both computers pair by themselves');
+    expect(container.querySelector('[data-testid="network-pairing"]')).toBeNull();
   });
 
   it('withdraws a pairing it stops waiting for, so the worker no longer shows it', async () => {

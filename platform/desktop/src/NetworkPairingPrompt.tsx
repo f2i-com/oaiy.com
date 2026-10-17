@@ -23,9 +23,16 @@ export default function NetworkPairingPrompt({ waiting, onOpen }: { waiting: num
     }
   }, []);
 
+  // While any wait: read again every few seconds, not only when how many changes (a computer that asks again has its
+  // request replaced, with a new code: the count stays the same).
   useEffect(() => {
-    if (waiting > 0) void refresh();
-    else setRequests([]);
+    if (waiting <= 0) {
+      setRequests([]);
+      return;
+    }
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 4000);
+    return () => window.clearInterval(timer);
   }, [waiting, refresh]);
 
   const decide = async (r: NetworkRequest, approve: boolean) => {

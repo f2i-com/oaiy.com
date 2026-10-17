@@ -2107,6 +2107,8 @@ export interface NetworkSettings {
   uses?: boolean;
   /** It lends itself to the computers that pair with it. */
   lends?: boolean;
+  /** The person lets the Agent set up OAIY Network here; computers that both have it on pair by themselves. */
+  agent?: boolean;
   /** The name other computers show for this one (the computer's own where empty). */
   name: string;
   /** The port a worker listens on. */
@@ -2123,6 +2125,8 @@ export interface NetworkStatus {
   uses: boolean;
   /** It lends itself now. */
   lends: boolean;
+  /** The person lets the Agent set up OAIY Network here (see NetworkSettings). */
+  agent?: boolean;
   settings: NetworkSettings;
   nodeId: string | null;
   name: string;
@@ -2139,6 +2143,9 @@ export interface NetworkStatus {
   /** Workers found on the LAN (a primary). */
   found: number;
   paired: number;
+  /** Of them, the computers this one uses, and the ones that use it (one paired both ways is in both). */
+  using?: number;
+  usedBy?: number;
   /** A primary's engine defaults on its workers, by kind (`llm`, `image`…): the rest are this computer's own. */
   defaults?: Record<string, NetworkDefault>;
   /** A primary's workers answering now. */
@@ -2171,6 +2178,26 @@ export interface NetworkRun {
   finishedAt?: string | null;
 }
 
+/** A computer's processor, memory and GPUs, as it tells the computers that use it. */
+export interface NetworkMachine {
+  cpu?: { name?: string; cores?: number; busy?: number | null } | null;
+  ram?: { total_mb?: number | null; available_mb?: number | null } | null;
+  gpus?: { name?: string; temperature?: number | null; utilization?: number | null }[];
+}
+
+/** One job in a worker's queue: a media job (its kind and model, never its prompt) or a flow run. */
+export interface NetworkJob {
+  kind: string;
+  model?: string | null;
+  flow?: string | null;
+  runId?: string | null;
+  status: 'running' | 'waiting';
+  stage?: string | null;
+  progress?: number | null;
+  /** A run this computer asked for. */
+  mine?: boolean;
+}
+
 /** A service a worker lends (OAIY Voice). */
 export interface NetworkService {
   id: string;
@@ -2195,6 +2222,8 @@ export interface NetworkFound {
   name: string;
   addresses: string[];
   protocol: number;
+  /** What it says it has, in a line: its GPUs (VRAM), memory and cores. */
+  hardware?: string;
   seenMs: number;
   paired: boolean;
   compatible: boolean;
@@ -2244,6 +2273,8 @@ export interface NetworkNode {
   address: string;
   fingerprint: string;
   pairedAtMs: number;
+  /** Paired by itself (both computers let their Agent set up OAIY Network): no codes were compared. */
+  pairedByItself?: boolean;
   online: boolean;
   lastSeenMs: number | null;
   lastError: string | null;
@@ -2255,6 +2286,10 @@ export interface NetworkNode {
   flows?: NetworkFlow[];
   /** The services it lends (a worker): OAIY Voice. */
   services?: NetworkService[];
+  /** What it has and how busy it is (a worker): its processor, memory and GPUs. */
+  machine?: NetworkMachine | null;
+  /** Its queue (a worker): what it is making and what waits, media jobs and flow runs, running first. */
+  jobs?: NetworkJob[];
   /** Its engines' job queue: the job running (if any) and how many wait. */
   queue?: { running: { model?: string; kind?: string } | null; queued: number; max_queued?: number } | null;
 }

@@ -46,4 +46,19 @@ describe('NetworkPairingPrompt', () => {
     expect(toast.push).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Approved Mac mini' }));
     expect(container.textContent).toBe('');
   });
+
+  it('shows the new code of a computer that asks again, the count of those asking the same', async () => {
+    vi.useFakeTimers();
+    try {
+      api.network.requests.mockResolvedValueOnce({ requests: [request] }).mockResolvedValue({ requests: [{ ...request, id: 'r2', code: '654 321' }] });
+      await act(async () => root.render(<NetworkPairingPrompt waiting={1} onOpen={() => {}} />));
+      await act(async () => {});
+      expect(container.textContent).toContain('123 456');
+      await act(async () => { await vi.advanceTimersByTimeAsync(4100); });
+      expect(container.textContent).toContain('654 321');
+      expect(container.textContent).not.toContain('123 456');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

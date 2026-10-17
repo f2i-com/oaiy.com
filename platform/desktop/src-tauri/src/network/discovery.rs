@@ -1,5 +1,6 @@
 //! Workers on the LAN, by mDNS/DNS-SD: a worker advertises `_oaiy-worker._tcp.local.` with its node id, name,
-//! protocol and port (nothing private: no paths, models or keys), and a primary browses for them. Finding a worker
+//! protocol, port and in a line what it has (its GPUs, memory and cores: nothing private, no paths, models or keys),
+//! and a primary browses for them. Finding a worker
 //! grants nothing: it is paired, with the person's approval, before anything of it is used.
 
 use std::collections::HashMap;
@@ -23,16 +24,19 @@ pub(crate) struct Found {
     /// `ip:port` for each of its local addresses.
     pub addresses: Vec<String>,
     pub protocol: u32,
+    /// What it has, as it says it: its GPUs, memory and cores, in a line (`None` from an older OAIY).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<String>,
     pub seen_ms: u64,
 }
 
-/// Advertise this worker on `daemon` (its port, id and name).
-pub(crate) fn advertise(daemon: &mdns_sd::ServiceDaemon, id: &Identity, name: &str, port: u16) -> Result<(), String> {
+/// Advertise this worker on `daemon` (its port, id, name and what it has).
+pub(crate) fn advertise(daemon: &mdns_sd::ServiceDaemon, id: &Identity, name: &str, port: u16, hardware: &str) -> Result<(), String> {
     let short: String = id.node_id.chars().take(12).collect();
     let host = format!("oaiy-{short}.local.");
     let instance: String = format!("{} ({short})", name.chars().filter(|c| !c.is_control() && *c != '.').take(48).collect::<String>());
     let protocol = PROTOCOL.to_string();
-    let props = [("id", id.node_id.as_str()), ("name", name), ("proto", protocol.as_str()), ("ver", env!("CARGO_PKG_VERSION"))];
+    let props = [("id", id.node_id.as_str()), ("name", name), ("proto", protocol.as_str()), ("ver", env!("CARGO_PKG_VERSION")), ("hw", hardware)];
     let info = mdns_sd::ServiceInfo::new(SERVICE, &instance, &host, "", port, &props[..]).map_err(|e| e.to_string())?.enable_addr_auto();
     daemon.register(info).map_err(|e| e.to_string())
 }
@@ -65,8 +69,9 @@ pub(crate) fn browse(daemon: &mdns_sd::ServiceDaemon, found: Arc<Mutex<HashMap<S
                         }
                         let name: String = s.get_property_val_str("name").unwrap_or("").chars().filter(|c| !c.is_control()).take(80).collect();
                         let protocol = s.get_property_val_str("proto").and_then(|p| p.parse().ok()).unwrap_or(0);
+                        let hardware = s.get_property_val_str("hw").map(|h| h.chars().filter(|c| !c.is_control()).take(160).collect::<String>()).filter(|h| !h.is_empty());
                         by_name.insert(s.get_fullname().to_string(), node_id.clone());
-                        let entry = Found { node_id: node_id.clone(), name, addresses, protocol, seen_ms: super::store::now_ms() };
+                        let entry = Found { node_id: node_id.clone(), name, addresses, protocol, hardware, seen_ms: super::store::now_ms() };
                         let mut found = found.lock().unwrap_or_else(|p| p.into_inner());
                         // (as many as a LAN has: a computer advertising thousands of made-up workers fills no memory)
                         if found.len() < MAX_FOUND || found.contains_key(&node_id) {

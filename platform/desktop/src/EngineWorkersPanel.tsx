@@ -79,7 +79,9 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
   }
 
   const defaults = status.defaults ?? {};
-  const kinds = [...new Set(nodes.flatMap((n) => n.models.map((m) => m.kind)))].sort((a, b) => kindOrder(a) - kindOrder(b));
+  // (the kinds the workers have, and any whose default is a worker's still: one not heard from yet, or whose model
+  // has gone, can be given back to this computer all the same)
+  const kinds = [...new Set([...nodes.flatMap((n) => n.models.map((m) => m.kind)), ...Object.keys(defaults)])].sort((a, b) => kindOrder(a) - kindOrder(b));
   /** Whether `m` of `node` is its kind's default here (a worker's language model: whichever it runs now). */
   const isDefault = (node: NetworkNode, m: NetworkModel) => {
     const d = defaults[m.kind];
@@ -121,6 +123,11 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
                       {node && !node.online && (
                         <span className="engine-default-warn">
                           <TriangleAlert size={12} aria-hidden /> offline: what uses it says so, nothing runs in its place
+                        </span>
+                      )}
+                      {node?.online && kind !== 'llm' && !node.models.some((m) => m.id === d.id) && (
+                        <span className="engine-default-warn">
+                          <TriangleAlert size={12} aria-hidden /> {d.nodeName || 'it'} no longer has this model
                         </span>
                       )}
                     </span>

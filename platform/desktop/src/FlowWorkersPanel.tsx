@@ -88,7 +88,7 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
 
 const TERMINAL = new Set(['succeeded', 'failed', 'timed_out', 'cancelled']);
 const RUN_STATE: Record<NetworkRun['status'], { label: string; badge: string }> = {
-  queued: { label: 'Waiting to start', badge: 'badge-pending' },
+  queued: { label: 'Waiting in its queue', badge: 'badge-pending' },
   running: { label: 'Running', badge: 'badge-pending' },
   succeeded: { label: 'Done', badge: 'badge-ok' },
   failed: { label: 'Failed', badge: 'badge-err' },
@@ -96,72 +96,81 @@ const RUN_STATE: Record<NetworkRun['status'], { label: string; badge: string }> 
   cancelled: { label: 'Stopped', badge: 'badge-neutral' },
 };
 
-/** One shared flow: its inputs, Run, and its run as it goes. */
+/** A run of a flow on a worker, as this page follows it. */
+interface Tracked {
+  run: NetworkRun;
+  started: number;
+  error?: string | null;
+}
+
+/**
+ * One shared flow: its inputs, Run, and its runs as they go. Run again while one runs and the next waits in the
+ * worker's queue (one at a time there); each is followed, can be stopped, and shows its answer when it is done.
+ */
 function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(flow.inputs.map((i) => [i.name, typeof i.default === 'string' ? i.default : i.default == null ? '' : JSON.stringify(i.default)])),
   );
-  const [run, setRun] = useState<NetworkRun | null>(null);
+  const [runs, setRuns] = useState<Tracked[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
-  const [started, setStarted] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
   const timer = useRef<number | undefined>(undefined);
+  const going = runs.filter((t) => !TERMINAL.has(t.run.status));
 
-  // While it runs: asked every second and a half, and the time it has taken ticks.
+  // While any runs: each asked every second and a half, and the time each has taken ticks.
   useEffect(() => {
-    if (!run || TERMINAL.has(run.status)) return;
+    if (going.length === 0) return;
     let stopped = false;
     const tick = async () => {
       setNow(Date.now());
-      try {
-        const next = await network.run(node.nodeId, run.runId);
-        if (!stopped) setRun(next);
-      } catch (e) {
-        if (!stopped) setError(e instanceof Error ? e.message : String(e));
-      }
+      const next = await Promise.all(
+        going.map((t) =>
+          network
+            .run(node.nodeId, t.run.runId)
+            .then((run) => ({ ...t, run, error: null }))
+            .catch((e: unknown) => ({ ...t, error: e instanceof Error ? e.message : String(e) })),
+        ),
+      );
+      if (stopped) return;
+      setRuns((all) => all.map((t) => next.find((n) => n.run.runId === t.run.runId) ?? t));
     };
     timer.current = window.setTimeout(tick, 1500);
     return () => {
       stopped = true;
       window.clearTimeout(timer.current);
     };
-  }, [run, node.nodeId]);
+  }, [runs, node.nodeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const start = async () => {
     setStarting(true);
     setError(null);
-    setRun(null);
     try {
-      setStarted(Date.now());
+      const run = await network.runFlow(node.nodeId, flow.flowId, values);
       setNow(Date.now());
-      setRun(await network.runFlow(node.nodeId, flow.flowId, values));
+      setRuns((all) => [{ run, started: Date.now() }, ...all].slice(0, 6));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setStarting(false);
     }
   };
-  const stop = async () => {
-    if (!run) return;
+  const stop = async (t: Tracked) => {
     try {
-      await network.cancelRun(node.nodeId, run.runId);
-      setRun(await network.run(node.nodeId, run.runId));
+      await network.cancelRun(node.nodeId, t.run.runId);
+      const run = await network.run(node.nodeId, t.run.runId);
+      setRuns((all) => all.map((x) => (x.run.runId === run.runId ? { ...x, run } : x)));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
 
-  const going = !!run && !TERMINAL.has(run.status);
-  const state = run ? RUN_STATE[run.status] : null;
-  const seconds = started ? Math.max(0, Math.round((now - started) / 1000)) : 0;
   return (
     <div className="flow-run-card" data-testid="flow-run-card">
       <div className="flow-run-head">
         <Server size={15} aria-hidden />
         <strong>{flow.name}</strong>
-        {state && <span className={`badge ${state.badge}`}>{state.label}</span>}
-        {run && started && <span className="flow-run-time">{seconds} s</span>}
+        {going.length > 1 && <span className="badge badge-pending">{going.length} in its queue</span>}
       </div>
       {flow.description && <p className="form-hint">{flow.description}</p>}
       {flow.inputs.length > 0 && (
@@ -169,32 +178,52 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
           {flow.inputs.map((i) => (
             <label className="form-row" key={i.name}>
               <span>{i.name}</span>
-              <textarea rows={2} value={values[i.name] ?? ''} disabled={going} onChange={(e) => setValues((v) => ({ ...v, [i.name]: e.target.value }))} />
+              <textarea rows={2} value={values[i.name] ?? ''} onChange={(e) => setValues((v) => ({ ...v, [i.name]: e.target.value }))} />
             </label>
           ))}
         </div>
       )}
       <div className="form-actions">
-        <button className="btn btn-primary" disabled={!node.online || starting || going} onClick={() => void start()}>
-          {starting || going ? <Loader2 size={14} className="spin" aria-hidden /> : <Play size={14} aria-hidden />} Run on {node.name}
+        <button className="btn btn-primary" disabled={!node.online || starting} onClick={() => void start()}>
+          {starting ? <Loader2 size={14} className="spin" aria-hidden /> : <Play size={14} aria-hidden />} {going.length > 0 ? `Queue another on ${node.name}` : `Run on ${node.name}`}
         </button>
-        {going && (
-          <button className="btn btn-ghost" onClick={() => void stop()}>
-            <Square size={13} aria-hidden /> Stop
-          </button>
-        )}
       </div>
       {error && (
         <div className="card-warn" role="alert">
           <TriangleAlert size={13} aria-hidden /> {error}
         </div>
       )}
-      {run?.error && (
-        <div className="card-warn" role="alert">
-          <TriangleAlert size={13} aria-hidden /> {run.error.message}
-        </div>
-      )}
-      {run?.status === 'succeeded' && <RunAnswer answer={run.output?.output ?? run.output} />}
+      {runs.map((t, i) => {
+        const state = RUN_STATE[t.run.status];
+        const running = !TERMINAL.has(t.run.status);
+        const end = t.run.finishedAt ? Date.parse(t.run.finishedAt) : running ? now : t.started;
+        const seconds = Math.max(0, Math.round((end - t.started) / 1000));
+        return (
+          <div className="flow-run-item" key={t.run.runId} data-testid="flow-run">
+            <div className="flow-run-item-head">
+              {state && <span className={`badge ${state.badge}`}>{state.label}</span>}
+              <span className="flow-run-time">{seconds} s</span>
+              {running && (
+                <button className="btn-tiny" onClick={() => void stop(t)}>
+                  <Square size={12} aria-hidden /> Stop
+                </button>
+              )}
+            </div>
+            {(t.error || t.run.error) && (
+              <div className="card-warn" role="alert">
+                <TriangleAlert size={13} aria-hidden /> {t.run.error?.message ?? t.error}
+              </div>
+            )}
+            {t.run.status === 'succeeded' && (i === 0 || runs.length <= 2) && <RunAnswer answer={t.run.output?.output ?? t.run.output} />}
+            {t.run.status === 'succeeded' && i > 0 && runs.length > 2 && (
+              <details>
+                <summary className="form-hint">Its answer</summary>
+                <RunAnswer answer={t.run.output?.output ?? t.run.output} />
+              </details>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

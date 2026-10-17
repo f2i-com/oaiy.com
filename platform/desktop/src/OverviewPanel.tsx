@@ -394,13 +394,13 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           {net?.enabled && (
             <button className="overview-tile" onClick={() => onNavigate('network')}>
               <Network size={16} aria-hidden />
-              <strong>{net.lends && net.waiting > 0 ? `${net.waiting} asking` : net.uses ? `${net.online ?? 0} online` : net.paired}</strong>
+              <strong>{net.lends && net.waiting > 0 ? `${net.waiting} asking` : net.uses ? `${net.online ?? 0} online` : (net.usedBy ?? net.paired)}</strong>
               <small>
                 {net.lends && net.waiting > 0
                   ? 'To pair with this computer'
                   : net.uses
-                    ? `Of ${net.paired} paired computer${net.paired === 1 ? '' : 's'}`
-                    : net.paired === 1
+                    ? `Of ${net.using ?? net.paired} paired computer${(net.using ?? net.paired) === 1 ? '' : 's'} to use`
+                    : (net.usedBy ?? net.paired) === 1
                       ? 'Computer using this one'
                       : 'Computers using this one'}
               </small>

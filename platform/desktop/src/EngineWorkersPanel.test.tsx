@@ -91,6 +91,16 @@ describe('EngineWorkersPanel', () => {
     expect(api.network.setDefault).toHaveBeenCalledWith('image', null);
   });
 
+  it("gives back a default whose model the worker no longer has, though no model of its kind is listed", async () => {
+    api.network.status.mockResolvedValue({ ...primary, defaults: { video: { id: 'engine:video:node.w1/ltx', nodeId: 'w1', nodeName: 'Rig', model: 'ltx' } } });
+    api.network.setDefault.mockResolvedValue(primary);
+    await mount();
+    const video = rows('engine-default').find((r) => r.textContent?.includes('ltx'))!;
+    expect(video.textContent).toContain('Rig no longer has this model');
+    await act(async () => video.querySelector('button')!.click());
+    expect(api.network.setDefault).toHaveBeenCalledWith('video', null);
+  });
+
   it('says a default on a worker that does not answer is offline, not run elsewhere', async () => {
     api.network.status.mockResolvedValue({ ...primary, defaults: { image: { id: 'engine:image:node.w1/moss', nodeId: 'w1', nodeName: 'Rig', model: 'moss' } } });
     api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, online: false, lastError: 'connection refused' }] });

@@ -88,11 +88,11 @@ describe('the control API client', () => {
     expect(seen.map((s) => s.method)).toEqual(['initialize', 'notifications/initialized', 'tools/list', 'tools/list']);
     expect(seen.every((s) => s.auth === 'Bearer tok')).toBe(true);
     expect(seen.filter((s) => s.method === 'tools/list').map((s) => s.session)).toEqual(['project', 'runner']);
-    expect(project).toHaveLength(51);
+    expect(project).toHaveLength(57);
     expect(runner.map((t) => t.name).sort()).toEqual([...READ].sort());
     expect(client.protocol).toBe('2025-06-18');
     // What was listed is there without asking again.
-    expect(client.listed('project')).toHaveLength(51);
+    expect(client.listed('project')).toHaveLength(57);
   });
 
   it('never asks for a call, a text or a flow task: they get no tools', async () => {
@@ -154,10 +154,10 @@ describe('the control API client', () => {
   it('starts again after a failed start, and lists again after a refresh (a modules change, the desktop back)', async () => {
     const { client, seen } = fakeServer({ failInitialize: 1 });
     await expect(client.tools('project')).rejects.toThrow('not ready');
-    expect(await client.tools('project')).toHaveLength(51);
+    expect(await client.tools('project')).toHaveLength(57);
     client.refresh();
     // Until listed again, what was listed stays.
-    expect(client.listed('project')).toHaveLength(51);
+    expect(client.listed('project')).toHaveLength(57);
     await client.tools('project');
     expect(seen.filter((s) => s.method === 'initialize')).toHaveLength(2);
     expect(seen.filter((s) => s.method === 'tools/list')).toHaveLength(2);
@@ -221,7 +221,7 @@ describe("the control tools each kind of conversation is given", () => {
       expect(tools.find((t) => t.spec.name === 'flow_run')!.spec.description).toBe('flow_run');
       expect(names).toContain('flow_delete');
       expect(names).toEqual(expect.arrayContaining(['status', 'setup_status', 'plugin_setup_open', 'plugin_setup_status', 'setup_finish', 'agent_model_set']));
-      expect(names.length).toBe(APP_OWN.length + 51 - 5);
+      expect(names.length).toBe(APP_OWN.length + 57 - 5);
       // What the desktop's descriptions call the tools left out, they now call the app's.
       const del = tools.find((t) => t.spec.name === 'flow_delete')!;
       expect(JSON.stringify(del.spec)).not.toMatch(/\bflows_list\b/);

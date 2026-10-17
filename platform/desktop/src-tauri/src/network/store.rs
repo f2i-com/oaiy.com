@@ -44,6 +44,10 @@ pub struct Settings {
     /// It lends itself to the computers that pair with it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lends: Option<bool>,
+    /// The person lets the Agent set up OAIY Network here (its tools pair, unpair and choose what is used), and this
+    /// computer pairs by itself with another that has this on too, with no codes to compare (a network the person
+    /// trusts: their home's or office's).
+    pub agent: bool,
     /// The name other computers show for this one (the computer's own name where empty).
     pub name: String,
     /// The port a worker listens on.
@@ -54,7 +58,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { enabled: false, role: Role::Standalone, uses: None, lends: None, name: String::new(), port: DEFAULT_PORT, bind: String::new() }
+        Settings { enabled: false, role: Role::Standalone, uses: None, lends: None, agent: false, name: String::new(), port: DEFAULT_PORT, bind: String::new() }
     }
 }
 
@@ -103,6 +107,10 @@ pub struct Peer {
     #[serde(default)]
     pub address: String,
     pub paired_at_ms: u64,
+    /// Paired by itself (both computers let their Agent set up OAIY Network): no person compared codes, so the
+    /// Networking page says so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_itself: bool,
 }
 
 /// The paired computers, kept in `peers.json`.
@@ -138,9 +146,20 @@ impl Peers {
         self.list.iter().find(|p| p.fingerprint == fingerprint && p.role == role)
     }
 
-    /// Pair (or pair again) with `peer`: one entry per node id and way, and per certificate and way. In effect once it
-    /// is kept: a pairing that could not be written down lets nothing in.
+    /// Whether `node_id` is kept here with another certificate than `fingerprint`, either way: a computer that names
+    /// itself as one paired with this computer, which it is not (a node id is a computer's own say; its certificate,
+    /// proved on each connection, is what it is).
+    pub fn taken(&self, node_id: &str, fingerprint: &str) -> bool {
+        self.list.iter().any(|p| p.node_id == node_id && p.fingerprint != fingerprint)
+    }
+
+    /// Pair (or pair again) with `peer`: one entry per node id and way, and per certificate and way; refused for a node
+    /// id kept here with another certificate ([`Peers::taken`]): it would stand in for that computer, its defaults and
+    /// services. In effect once it is kept: a pairing that could not be written down lets nothing in.
     pub fn add(&mut self, peer: Peer) -> Result<(), String> {
+        if self.taken(&peer.node_id, &peer.fingerprint) {
+            return Err(TAKEN.into());
+        }
         let mut next: Vec<Peer> = self.list.iter().filter(|p| p.role != peer.role || (p.node_id != peer.node_id && p.fingerprint != peer.fingerprint)).cloned().collect();
         next.push(peer);
         save(&self.path, &next)?;
@@ -160,6 +179,16 @@ impl Peers {
         Ok(removed)
     }
 
+    /// Unpair one way only: `node_id` no longer `role` (a pairing both ways that could not be finished the other way).
+    pub fn remove_way(&mut self, node_id: &str, role: Role) -> Result<(), String> {
+        let before = self.list.len();
+        self.list.retain(|p| p.node_id != node_id || p.role != role);
+        if self.list.len() != before {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// A worker's new address (it moved: another DHCP lease, or another port), kept for the next start.
     pub fn moved(&mut self, node_id: &str, address: &str) -> Result<(), String> {
         match self.list.iter_mut().find(|p| p.node_id == node_id && p.role == Role::Worker) {
@@ -175,6 +204,9 @@ impl Peers {
         save(&self.path, &self.list)
     }
 }
+
+/// What [`Peers::add`] says for a node id paired here with another certificate.
+pub const TAKEN: &str = "another computer is paired here under that node id: unpair it first";
 
 fn save(path: &Path, list: &[Peer]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
@@ -310,7 +342,7 @@ mod tests {
     use super::*;
 
     fn peer(id: &str, fp: &str, role: Role) -> Peer {
-        Peer { node_id: id.into(), name: format!("{id}'s"), role, fingerprint: fp.into(), address: "192.168.1.5:17975".into(), paired_at_ms: 1 }
+        Peer { node_id: id.into(), name: format!("{id}'s"), role, fingerprint: fp.into(), address: "192.168.1.5:17975".into(), paired_at_ms: 1, by_itself: false }
     }
 
     #[test]
@@ -341,7 +373,11 @@ mod tests {
         let mut peers = Peers::open(&dir);
         peers.add(peer("a", "fa", Role::Worker)).unwrap();
         peers.add(peer("b", "fb", Role::Worker)).unwrap();
-        // paired again with a new certificate: the old one no longer lets it in
+        // its node id under another certificate: another computer in its place, refused until it is unpaired; then
+        // paired with the new one, the old one no longer lets it in
+        assert_eq!(peers.add(peer("a", "fa2", Role::Worker)), Err(TAKEN.to_string()));
+        assert_eq!(peers.add(peer("a", "fa2", Role::Primary)), Err(TAKEN.to_string()), "either way");
+        peers.remove("a").unwrap();
         peers.add(peer("a", "fa2", Role::Worker)).unwrap();
         let peers = Peers::open(&dir);
         assert_eq!(peers.list().len(), 2);

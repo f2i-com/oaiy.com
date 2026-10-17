@@ -141,8 +141,46 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 }), &["source"])),
             // OAIY Network
             def("network_status", "OAIY Network", Read,
-                "OAIY Network (other OAIY computers on this LAN): whether it is on, what this computer does (uses: it uses paired computers' models, flows and services; lends: it lends its own; both at once can be on), the workers found on the LAN, and the paired computers, each online or not with its GPUs, models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
+                "OAIY Network (other OAIY computers on this LAN): whether it is on, what this computer does (uses: it uses paired computers' models, flows and services; lends: it lends its own; both at once can be on), the workers found on the LAN (foundOnLan, each saying what it has: its GPUs with their VRAM, memory and cores, to choose which to pair with), the computers asking to use this one (requests), and the paired computers, each online or not with its processor, memory and GPUs (VRAM, how busy), its queue (what it is making, what waits), models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking, or the Agent's where agentMaySetUp (network_setup, network_pair, network_approve, network_unpair, network_use_service, network_pin).",
                 none()),
+            def("network_setup", "Set up OAIY Network", Change,
+                "Switch OAIY Network on or off, and choose what this computer does: uses (it uses paired computers' models, flows and services) and lends (it lends its own to the computers that pair with it), either or both; name is the name other computers see. Only where the person lets the Agent set up OAIY Network (network_status's agentMaySetUp; they tick it in Setup, Networking).",
+                object(json!({
+                    "enabled": { "type": "boolean", "description": "OAIY Network on (true) or off. Choosing uses or lends switches it on." },
+                    "uses": { "type": "boolean", "description": "This computer uses other computers." },
+                    "lends": { "type": "boolean", "description": "This computer lends itself to the computers that pair with it." },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 80, "description": "The name other computers see." }
+                }), &[])),
+            def("network_pair", "Pair with a computer", Change,
+                "Pair with another OAIY computer on this network that lends itself: node (one network_status lists in foundOnLan) or address (host:port, as that computer's Networking page shows it). Two computers whose people both let their Agent set up OAIY Network pair by themselves at once. Otherwise that computer's person approves the request showing the code this answers: tell the person the code and where (Setup, Networking on that computer); this call waits up to waitSeconds (default 60) and confirms this side once it is approved. Call again with pairingId to keep waiting. bothWays (default true where this computer lends itself) lets the other computer use this one too. Only where the person lets the Agent set up OAIY Network.",
+                object(json!({
+                    "node": node_id(),
+                    "address": { "type": "string", "minLength": 1, "description": "The other computer's address, host:port." },
+                    "pairingId": { "type": "string", "minLength": 1, "description": "A pairing an earlier call started, to keep waiting for." },
+                    "bothWays": { "type": "boolean", "description": "Let the other computer use this one too (default true where this one lends itself)." },
+                    "waitSeconds": { "type": "integer", "minimum": 0, "maximum": 120, "description": "How long to wait for the other computer's approval (default 60)." }
+                }), &[])),
+            def("network_approve", "Answer a pairing request", Change,
+                "Approve (approve true) or deny a computer asking to use this one: id as network_status's requests list it (each with its name and code). Approve only a computer the person expects. Only where the person lets the Agent set up OAIY Network.",
+                object(json!({
+                    "id": { "type": "string", "minLength": 1, "description": "The request's id." },
+                    "approve": { "type": "boolean", "description": "Approve (true) or deny (false)." }
+                }), &["id", "approve"])),
+            def("network_unpair", "Unpair a computer", Remove,
+                "Unpair a paired computer (node, as network_status lists it), both ways: neither uses the other until they pair again; its models stop being this computer's defaults and its services stop being used here. Only where the person lets the Agent set up OAIY Network.",
+                object(json!({ "node": node_id() }), &["node"])),
+            def("network_use_service", "Use another computer's service", Change,
+                "Use a service a paired computer lends in place of this computer's own: service oaiy-voice, node that computer (network_status lists the services each lends); without node, this computer's own again. With OAIY Voice on another computer, this computer's calls, transcriptions and listening hear and speak there, the phone still connected here. Only where the person lets the Agent set up OAIY Network.",
+                object(json!({
+                    "service": { "type": "string", "enum": ["oaiy-voice"], "description": "The service." },
+                    "node": node_id()
+                }), &["service"])),
+            def("network_pin", "Keep a model loaded on another computer", Change,
+                "Pin (pin true) a paired computer's model, so it is kept loaded there and loaded again when that computer restarts, or let it go as any other again (pin false): model is its id as network_status lists it (engine:<kind>:node.<nodeId>/<model>). Picture models, and the language model chosen there. Only where the person lets the Agent set up OAIY Network.",
+                object(json!({
+                    "model": { "type": "string", "minLength": 1, "description": "The model's id, engine:<kind>:node.<nodeId>/<model>." },
+                    "pin": { "type": "boolean", "description": "Keep it loaded (true), or let it go (false)." }
+                }), &["model", "pin"])),
             def("chatgpt_sign_in", "Sign in to ChatGPT", Change,
                 "Start signing OAIY in to ChatGPT (its Codex connector). Answers the address for the person to open and sign in at (with deviceCode, a code for them to type instead); ai_sources_list shows when they have.",
                 object(json!({ "deviceCode": { "type": "boolean", "description": "Use the device-code sign-in (a code to type) instead of a browser redirect." } }), &[])),
@@ -537,6 +575,46 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
         }
         "ai_sources_list" => ai_sources_list(d).await,
         "network_status" => network_status(d).await,
+        "network_setup" => network_setup(d, &a).await,
+        "network_pair" => network_pair(d, &a).await,
+        "network_approve" => {
+            network_agent(d).await?;
+            let (id, approve) = (a.req("id"), a.bool("approve").unwrap_or(false));
+            let v = d.post_empty(&format!("/api/network/requests/{}/{}", seg(id), if approve { "approve" } else { "deny" })).await?;
+            let name = v.pointer("/node/name").and_then(Value::as_str).unwrap_or("the computer").to_string();
+            done(if approve { format!("Approved: {name} is paired with this computer.") } else { "Denied.".to_string() }, json!({ "id": id, "status": v.get("status") }))
+        }
+        "network_unpair" => {
+            network_agent(d).await?;
+            let node = a.req("node");
+            d.delete(&format!("/api/network/nodes/{}", seg(node))).await?;
+            done(format!("Unpaired {node}, both ways."), json!({ "node": node }))
+        }
+        "network_use_service" => {
+            network_agent(d).await?;
+            let service = a.req("service");
+            let mut choice = serde_json::Map::new();
+            choice.insert(service.to_string(), a.str("node").map_or(Value::Null, |n| json!(n)));
+            let v = d.put("/api/network/settings", json!({ "services": choice })).await?;
+            let on = v.pointer(&format!("/services/{service}/nodeName")).and_then(Value::as_str).map(str::to_owned);
+            done(
+                match &on { Some(name) => format!("{service} on {name} is used here now."), None => format!("This computer's own {service} is used again.") },
+                json!({ "service": service, "on": on }),
+            )
+        }
+        "network_pin" => {
+            network_agent(d).await?;
+            let (model, pin) = (a.req("model"), a.bool("pin").unwrap_or(true));
+            let Some((node, name)) = model.split_once(":node.").and_then(|(_, rest)| rest.split_once('/')) else {
+                return Err(format!("{model} is not a paired computer's model: network_status lists their ids (engine:<kind>:node.<nodeId>/<model>)."));
+            };
+            if pin {
+                d.put(&format!("/api/network/nodes/{}/pins", seg(node)), json!({ "id": model })).await?;
+            } else {
+                d.delete(&format!("/api/network/nodes/{}/pins/{}", seg(node), seg(name))).await?;
+            }
+            done(if pin { format!("{name} is pinned: kept loaded there.") } else { format!("{name} is let go as any other model again.") }, json!({ "model": model, "pinned": pin }))
+        }
         "agent_model_set" => {
             let source = a.req("source");
             let model = a.str("model");
@@ -1394,6 +1472,102 @@ async fn ai_sources_list(d: &Desk) -> Result<Done, String> {
 }
 
 /// OAIY Network, compact: this computer's part, then each paired computer with its GPUs and models (docs/NETWORK.md).
+/// The network tools that change it: only where the person lets the Agent set up OAIY Network.
+async fn network_agent(d: &Desk) -> Result<Value, String> {
+    let status = d.get("/api/network/status").await?;
+    if status.get("agent").and_then(Value::as_bool) != Some(true) {
+        return Err("The person has not let the Agent set up OAIY Network: they tick Let the Agent pair and set up this computer in Setup, Networking (until then they set it up there themselves).".into());
+    }
+    Ok(status)
+}
+
+async fn network_setup(d: &Desk, a: &Args<'_>) -> Result<Done, String> {
+    network_agent(d).await?;
+    let mut change = serde_json::Map::new();
+    for key in ["uses", "lends"] {
+        if let Some(v) = a.bool(key) {
+            change.insert(key.into(), json!(v));
+        }
+    }
+    // (choosing to use others or to lend switches it on, unless said otherwise)
+    let enabled = a.bool("enabled").or_else(|| (a.bool("uses") == Some(true) || a.bool("lends") == Some(true)).then_some(true));
+    if let Some(v) = enabled {
+        change.insert("enabled".into(), json!(v));
+    }
+    if let Some(name) = a.str("name") {
+        change.insert("name".into(), json!(name));
+    }
+    if change.is_empty() {
+        return Err("Say what to change: enabled, uses, lends or name.".into());
+    }
+    let v = d.put("/api/network/settings", Value::Object(change)).await?;
+    let does = match (v["uses"].as_bool() == Some(true), v["lends"].as_bool() == Some(true)) {
+        (true, true) => "uses other computers and lends itself",
+        (true, false) => "uses other computers",
+        (false, true) => "lends itself",
+        (false, false) => "is off",
+    };
+    let at = v.get("addresses").and_then(Value::as_array).and_then(|l| l.first()).and_then(Value::as_str).map(|a| format!(" Other computers add it at {a}.")).unwrap_or_default();
+    done(format!("OAIY Network: this computer {does}.{at}"), json!({ "enabled": v.get("enabled"), "uses": v.get("uses"), "lends": v.get("lends"), "name": v.get("name"), "addresses": v.get("addresses") }))
+}
+
+async fn network_pair(d: &Desk, a: &Args<'_>) -> Result<Done, String> {
+    let status = network_agent(d).await?;
+    let lends = status.get("lends").and_then(Value::as_bool) == Some(true);
+    let both = a.bool("bothWays").unwrap_or(true) && lends;
+    let wait = Duration::from_secs(a.int("waitSeconds").unwrap_or(60).clamp(0, 120) as u64);
+    let (pairing, mut code, mut name) = match a.str("pairingId") {
+        Some(id) => (id.to_string(), None, None),
+        None => {
+            let mut body = match (a.str("node"), a.str("address")) {
+                (Some(n), _) => json!({ "nodeId": n }),
+                (_, Some(addr)) => json!({ "address": addr }),
+                _ => return Err("Name the computer: node (network_status's foundOnLan) or address (host:port, as its Networking page shows).".into()),
+            };
+            body["bothWays"] = json!(both);
+            let started = d.post_within("/api/network/pairings/start", body, Duration::from_secs(40)).await?;
+            let name = started.pointer("/worker/name").and_then(Value::as_str).unwrap_or("the computer").to_string();
+            if started.get("status").and_then(Value::as_str) == Some("approved") {
+                return done(
+                    format!("Paired with {name}: both computers pair by themselves{}.", if both { ", both ways" } else { "" }),
+                    json!({ "status": "approved", "node": started.pointer("/node/nodeId"), "name": name, "bothWays": both }),
+                );
+            }
+            let id = started.get("pairingId").and_then(Value::as_str).ok_or("The pairing did not start.")?.to_string();
+            (id, started.get("code").and_then(Value::as_str).map(str::to_owned), Some(name))
+        }
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let asked = d.post_within("/api/network/pairings/confirm", json!({ "pairingId": pairing }), Duration::from_secs(20)).await?;
+        if code.is_none() {
+            code = asked.get("code").and_then(Value::as_str).map(str::to_owned);
+        }
+        let who = name.get_or_insert_with(|| "the computer".to_string()).clone();
+        match asked.get("status").and_then(Value::as_str) {
+            // (its person approved: this side confirmed for this computer's person, who lets the Agent set it up)
+            Some("approved_there") => {
+                let paired = d.post_within("/api/network/pairings/confirm", json!({ "pairingId": pairing, "accept": true, "bothWays": both }), Duration::from_secs(20)).await?;
+                return done(
+                    format!("Paired with {who}{}.", if both { ", both ways" } else { "" }),
+                    json!({ "status": paired.get("status"), "node": paired.pointer("/node/nodeId"), "name": who, "bothWays": both }),
+                );
+            }
+            Some("approved") => return done(format!("Paired with {who}."), json!({ "status": "approved", "node": asked.pointer("/node/nodeId") })),
+            Some("denied") => return Err(format!("{who}'s person declined the pairing.")),
+            Some("expired") => return Err("The pairing request expired: start again.".into()),
+            _ if std::time::Instant::now() >= deadline => {
+                let code = code.clone().unwrap_or_default();
+                return done(
+                    format!("Waiting for {who}: on {who}, open Setup, Networking and approve the request showing code {code} (or tick Let the Agent pair and set up this computer there, and pair again). Call network_pair with pairingId {pairing} to keep waiting."),
+                    json!({ "status": "pending", "pairingId": pairing, "code": code, "name": who }),
+                );
+            }
+            _ => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
+    }
+}
+
 async fn network_status(d: &Desk) -> Result<Done, String> {
     let status = d.get("/api/network/status").await?;
     let mut out = json!({});
@@ -1402,8 +1576,19 @@ async fn network_status(d: &Desk) -> Result<Done, String> {
             out[key] = v.clone();
         }
     }
+    // (whether the Agent may set it up: network_setup, network_pair and the others)
+    out["agentMaySetUp"] = json!(status.get("agent").and_then(Value::as_bool) == Some(true));
+    if status.get("lends").and_then(Value::as_bool) == Some(true) && status.get("waiting").and_then(Value::as_u64).unwrap_or(0) > 0 {
+        out["requests"] = part(d.get("/api/network/requests").await, |v| {
+            Value::Array(arr(&v, "requests").iter().map(|r| json!({ "id": r.get("id"), "name": r.get("name"), "address": r.get("address"), "code": r.get("code") })).collect())
+        });
+    }
     if status.get("role").and_then(Value::as_str).unwrap_or("standalone") == "standalone" {
-        out["note"] = json!("OAIY Network is off: the person switches it on in Setup, Networking.");
+        out["note"] = json!(if status.get("agent").and_then(Value::as_bool) == Some(true) {
+            "OAIY Network is off: network_setup switches it on (uses, lends or both), as the person does in Setup, Networking."
+        } else {
+            "OAIY Network is off: the person switches it on in Setup, Networking."
+        });
         return data(out);
     }
     let (nodes, found) = tokio::join!(d.get("/api/network/nodes"), async {
@@ -1431,9 +1616,30 @@ async fn network_status(d: &Desk) -> Result<Done, String> {
                     row["gpus"] = Value::Array(
                         arr(n, "devices")
                             .iter()
-                            .map(|g| json!({ "name": g.get("name"), "memoryTotalMb": g.get("memory_total_mb"), "memoryUsedMb": g.get("memory_used_mb") }))
+                            .map(|g| {
+                                let mut gpu = json!({ "name": g.get("name"), "memoryTotalMb": g.get("memory_total_mb"), "memoryUsedMb": g.get("memory_used_mb") });
+                                // (its own memory, VRAM, or the computer's shared with it; how busy)
+                                if let Some(u) = g.get("unified").and_then(Value::as_bool) {
+                                    gpu["vram"] = json!(!u);
+                                }
+                                if let Some(l) = g.get("load").filter(|l| !l.is_null()) {
+                                    gpu["busyPercent"] = l.clone();
+                                }
+                                gpu
+                            })
                             .collect(),
                     );
+                    // (its processor and memory, and its queue: what it is making and what waits, to choose where to run)
+                    if let Some(m) = n.get("machine").filter(|m| !m.is_null()) {
+                        row["cpu"] = json!({ "name": m.pointer("/cpu/name"), "cores": m.pointer("/cpu/cores"), "busyPercent": m.pointer("/cpu/busy") });
+                        row["ramMb"] = json!({ "total": m.pointer("/ram/total_mb"), "available": m.pointer("/ram/available_mb") });
+                    }
+                    let jobs = arr(n, "jobs");
+                    row["queue"] = json!({
+                        "running": jobs.iter().filter(|j| j["status"] == "running").count(),
+                        "waiting": jobs.iter().filter(|j| j["status"] == "waiting").count(),
+                        "jobs": jobs.iter().take(12).map(|j| json!({ "kind": j.get("kind"), "model": j.get("model"), "flow": j.get("flow"), "status": j.get("status"), "mine": j.get("mine") })).collect::<Vec<_>>(),
+                    });
                     row["models"] = Value::Array(
                         arr(n, "models")
                             .iter()
@@ -1454,7 +1660,7 @@ async fn network_status(d: &Desk) -> Result<Done, String> {
                 arr(&v, "found")
                     .iter()
                     .filter(|f| f.get("paired") != Some(&Value::Bool(true)))
-                    .map(|f| json!({ "name": f.get("name"), "addresses": f.get("addresses"), "compatible": f.get("compatible") }))
+                    .map(|f| json!({ "nodeId": f.get("nodeId"), "name": f.get("name"), "hardware": f.get("hardware"), "addresses": f.get("addresses"), "compatible": f.get("compatible") }))
                     .collect(),
             )
         });

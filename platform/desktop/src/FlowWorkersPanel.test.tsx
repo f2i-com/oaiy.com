@@ -54,7 +54,7 @@ describe('FlowWorkersPanel', () => {
     });
     await act(async () => button('Run on Rig').click());
     expect(api.network.runFlow).toHaveBeenCalledWith('w1', 'logo', { Prompt: 'a lighthouse' });
-    expect(card.textContent).toContain('Waiting to start');
+    expect(card.textContent).toContain('Waiting in its queue');
     await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
     expect(card.textContent).toContain('Running');
     expect(button('Stop')).toBeTruthy();
@@ -63,6 +63,23 @@ describe('FlowWorkersPanel', () => {
     expect(card.textContent).toContain('A fox in a circle');
     expect(api.network.picture).toHaveBeenCalledWith(picture);
     expect(card.querySelector('img')!.getAttribute('src')).toBe('blob:picture');
+  });
+
+  it('queues another run while one runs there, each followed on its own', async () => {
+    api.network.runFlow.mockResolvedValueOnce({ runId: 'r1', status: 'running' }).mockResolvedValueOnce({ runId: 'r2', status: 'queued' });
+    api.network.run.mockImplementation(async (_n: string, id: string) => ({ runId: id, status: id === 'r1' ? 'running' : 'queued' }));
+    await mount();
+    const card = container.querySelector('[data-testid="flow-run-card"]')!;
+    await act(async () => button('Run on Rig').click());
+    await act(async () => button('Queue another on Rig').click());
+    expect(api.network.runFlow).toHaveBeenCalledTimes(2);
+    const runs = Array.from(card.querySelectorAll('[data-testid="flow-run"]')).map((r) => r.textContent);
+    expect(runs[0]).toContain('Waiting in its queue');
+    expect(runs[1]).toContain('Running');
+    expect(card.textContent).toContain('2 in its queue');
+    await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
+    expect(api.network.run).toHaveBeenCalledWith('w1', 'r1');
+    expect(api.network.run).toHaveBeenCalledWith('w1', 'r2');
   });
 
   it('says how a computer shares a flow, where a worker shares none', async () => {

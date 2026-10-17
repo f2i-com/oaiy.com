@@ -56,6 +56,8 @@ pub(crate) struct Incoming {
     pub nonce: String,
     /// The code both screens show, once both random values are known (the person is asked only then).
     pub code: Option<String>,
+    /// The asking computer pairs by itself (see [`PairRequest`]).
+    pub auto: bool,
     pub status: Status,
     pub at: Instant,
 }
@@ -226,6 +228,10 @@ async fn health(State(net): State<Network>, Extension(caller): Extension<Caller>
 struct PairRequest {
     node_id: String,
     name: String,
+    /// The asking computer pairs by itself (its person lets its Agent set up OAIY Network): approved here at once where
+    /// this computer does too.
+    #[serde(default)]
+    auto: bool,
 }
 
 /// `POST /worker/v1/pair`: a primary asks to pair. Answered with this worker's commitment to a random value
@@ -242,6 +248,10 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     let name: String = req.name.chars().filter(|c| !c.is_control()).take(80).collect();
     if node_id.is_empty() {
         return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a node id is needed");
+    }
+    // (a node id paired here with another certificate: it would stand in for that computer)
+    if net.inner().peers().taken(&node_id, &fp) {
+        return refuse(StatusCode::CONFLICT, "node_id_taken", super::store::TAKEN);
     }
     let Ok(id) = net.identity() else {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "this worker has no identity");
@@ -262,6 +272,7 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
         name: if name.trim().is_empty() { "An OAIY computer".into() } else { name },
         nonce: worker_nonce,
         code: None,
+        auto: req.auto,
         fingerprint: fp,
         address,
         status: Status::Pending,
@@ -303,7 +314,16 @@ async fn pair_reveal(State(net): State<Network>, Extension(caller): Extension<Ca
     let code = pairing_code(&r.fingerprint, &me.fingerprint, &req.nonce.to_ascii_lowercase(), &r.nonce);
     log::info!("network: {} ({}) asks to pair; code {code}", r.name, r.address);
     r.code = Some(code);
-    Json(json!({ "nonce": r.nonce })).into_response()
+    let (nonce, auto, name, request) = (r.nonce.clone(), r.auto, r.name.clone(), r.id.clone());
+    drop(waiting);
+    // (both computers pair by themselves: approved here at once, no person asked; past a few so paired, the person is
+    // asked again, so no computer on the network pairs over and over)
+    let room = net.inner().peers().list().iter().filter(|p| p.by_itself).count() < MAX_BY_ITSELF;
+    let approved = auto && room && net.settings().agent && matches!(decide_as(&net, &request, true, true), Ok(Some(_)));
+    if approved {
+        log::info!("network: paired with {name} by itself (both computers let their Agent set up OAIY Network)");
+    }
+    Json(json!({ "nonce": nonce, "approved": approved })).into_response()
 }
 
 /// `GET /worker/v1/pair/:id`: the request's answer, to the certificate that asked alone.
@@ -334,7 +354,8 @@ async fn unpair(State(net): State<Network>, Extension(caller): Extension<Caller>
             refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller")
         };
     };
-    let _ = net.inner().peers().remove(&p.node_id);
+    // (both ways, and what this computer chose of it: unpaired there is unpaired here)
+    let _ = net.forget(&p.node_id);
     log::info!("network: {} unpaired this worker", p.name);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -370,12 +391,21 @@ async fn lends(State(net): State<Network>, Extension(caller): Extension<Caller>,
             log::info!("network: {} lends itself to this computer too, at {}", peer.name, peer.address);
             StatusCode::NO_CONTENT.into_response()
         }
+        Err(e) if e == super::store::TAKEN => refuse(StatusCode::CONFLICT, "node_id_taken", e),
         Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
     }
 }
 
+/// The computers paired by themselves kept at once; past them, the person is asked.
+const MAX_BY_ITSELF: usize = 8;
+
 /// The approval the person gives here (`/api/network/requests/:id/approve`): the primary is paired.
 pub(crate) fn decide(net: &Network, id: &str, approve: bool) -> Result<Option<Peer>, String> {
+    decide_as(net, id, approve, false)
+}
+
+/// As [`decide`]; `by_itself`: approved with no person asked (both computers pair by themselves).
+fn decide_as(net: &Network, id: &str, approve: bool, by_itself: bool) -> Result<Option<Peer>, String> {
     let mut waiting = lock(&net.inner().incoming);
     let Some(r) = waiting.iter_mut().find(|r| r.id == id && r.status == Status::Pending && r.code.is_some() && r.at.elapsed() < REQUEST_TTL) else {
         return Err("no such pairing request (or it has expired)".into());
@@ -391,6 +421,7 @@ pub(crate) fn decide(net: &Network, id: &str, approve: bool) -> Result<Option<Pe
         fingerprint: r.fingerprint.clone(),
         address: r.address.clone(),
         paired_at_ms: now_ms(),
+        by_itself,
     };
     net.inner().peers().add(peer.clone())?;
     r.status = Status::Approved;
@@ -420,9 +451,9 @@ pub(crate) fn waiting(net: &Network) -> Vec<Value> {
 /// `GET /worker/v1/capabilities`: this worker's engines as a primary needs them: their discovery (the models, the
 /// routes) and resources (the GPUs, what is loaded), with nothing of this computer's files or addresses.
 async fn capabilities(State(net): State<Network>, Extension(caller): Extension<Caller>, headers: axum::http::HeaderMap) -> Response {
-    if primary_of(&net, &caller).is_none() {
+    let Some(asking) = primary_of(&net, &caller) else {
         return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
-    }
+    };
     // (a primary that lends itself to this computer too: where it listens now, kept for when this one uses it)
     let lends_on = headers.get("x-oaiy-lends-on").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u16>().ok()).filter(|p| *p != 0);
     if let (Some(port), Some(p)) = (lends_on, primary_of(&net, &caller)) {
@@ -443,15 +474,65 @@ async fn capabilities(State(net): State<Network>, Extension(caller): Extension<C
         Ok((_, d)) => (sanitized_discovery(d), Value::Null),
         Err(e) => (Value::Null, json!(e)),
     };
+    // (the flows read from disk off this thread: each heartbeat asks)
+    let reading = net.clone();
+    let flows = tokio::task::spawn_blocking(move || shared_flows(&reading)["flows"].clone()).await.unwrap_or_else(|_| json!([]));
+    let (resources, system, media_jobs) = tokio::join!(local_resources(&net), super::machine::engines_get(&net, "/api/system"), super::machine::engines_get(&net, "/api/jobs"));
     Json(json!({
         "node": node,
         "discovery": discovery,
         "enginesError": engines,
-        "resources": local_resources(&net).await,
-        "flows": shared_flows(&net)["flows"],
+        "resources": resources,
+        "flows": flows,
         "services": shared_services(&net),
+        "machine": super::machine::machine(&system),
+        "jobs": jobs(&net, &asking, &media_jobs),
     }))
     .into_response()
+}
+
+/// This computer's queue, as the computers that use it see it: the media jobs its engines are making or have waiting
+/// (their kind, model, stage and progress: never what they were asked to make), and the flow runs it is running or
+/// has waiting (a flow's id for the asking computer's own runs alone), in the order they run.
+fn jobs(net: &Network, asking: &Peer, media_jobs: &Value) -> Value {
+    let mut out: Vec<Value> = media_jobs
+        .get("jobs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|j| matches!(j.get("status").and_then(Value::as_str), Some("queued" | "in_progress")))
+        .map(|j| {
+            json!({
+                "kind": j.get("kind"),
+                "model": j.get("model"),
+                "status": if j.get("status").and_then(Value::as_str) == Some("in_progress") { "running" } else { "waiting" },
+                "stage": j.get("stage"),
+                "progress": j.get("progress"),
+            })
+        })
+        .collect();
+    out.sort_by_key(|j| j["status"] != "running");
+    if let Some(bridge) = net.inner().bridge() {
+        use crate::bridge::ledger::RunStatus;
+        let runs = { lock(&bridge.ledger).recent(64, &[RunStatus::Running, RunStatus::Queued]) };
+        let mine = run_caller(asking);
+        let mut runs: Vec<Value> = runs
+            .iter()
+            .map(|r| {
+                let own = r.caller_product == mine;
+                json!({
+                    "kind": "flow",
+                    "flow": if own { r.flow_id.clone() } else { None },
+                    "runId": if own { Some(r.run_id.clone()) } else { None },
+                    "status": if r.status == RunStatus::Running { "running" } else { "waiting" },
+                    "mine": own,
+                })
+            })
+            .collect();
+        runs.sort_by_key(|j| j["status"] != "running");
+        out.extend(runs);
+    }
+    Value::Array(out)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -649,7 +730,9 @@ async fn service(State(net): State<Network>, Extension(caller): Extension<Caller
         Ok(b) => b,
         Err(e) => return refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", e.to_string()),
     };
-    let Ok(client) = reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).build() else {
+    // (one client for every request: its connections to the service kept for the next line of a call)
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    let Some(client) = CLIENT.get_or_init(|| reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).build().ok()).clone() else {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "no HTTP client");
     };
     let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
@@ -681,6 +764,16 @@ struct VoiceCopy {
     words: Option<String>,
 }
 
+/// The voices of one computer kept here for its calls, at most.
+const MAX_VOICE_COPIES: usize = 16;
+
+/// The copies of a computer's voices kept here for its calls removed (it is unpaired).
+pub(crate) fn forget_voices(node_id: &str) {
+    for clip in crate::voice::voices::copies(&copied_voice_name(node_id, "")) {
+        let _ = crate::voice::voices::remove(&clip.name);
+    }
+}
+
 /// The name a primary's voice is kept under here: its own beside this computer's, never in place of one.
 pub(crate) fn copied_voice_name(primary_node: &str, voice: &str) -> String {
     let short: String = primary_node.chars().take(6).collect();
@@ -700,8 +793,22 @@ async fn voice_copy(State(net): State<Network>, Extension(caller): Extension<Cal
         return refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "a voice clip is 20 MB at most");
     }
     let stored = copied_voice_name(&primary.node_id, &name);
+    let prefix = copied_voice_name(&primary.node_id, "");
     let extension = copy.extension.unwrap_or_else(|| "wav".into());
-    match tokio::task::spawn_blocking(move || crate::voice::voices::add(&stored, &extension, &bytes, copy.words.as_deref())).await {
+    // (one copy at a time: two of the same voice at once, a call's greeting and its first line, replace it in turn)
+    static COPYING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = COPYING.lock().await;
+    let kept = tokio::task::spawn_blocking(move || {
+        let clip = crate::voice::voices::add(&stored, &extension, &bytes, copy.words.as_deref())?;
+        // (a computer's copies kept to the last few it spoke in: the oldest go)
+        let copies = crate::voice::voices::copies(&prefix);
+        for old in copies.iter().take(copies.len().saturating_sub(MAX_VOICE_COPIES)).filter(|c| c.name != clip.name) {
+            let _ = crate::voice::voices::remove(&old.name);
+        }
+        Ok::<_, String>(clip)
+    })
+    .await;
+    match kept {
         Ok(Ok(clip)) => Json(json!({ "voice": clip.name })).into_response(),
         Ok(Err(e)) => refuse(StatusCode::BAD_REQUEST, "invalid_request", e),
         Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),

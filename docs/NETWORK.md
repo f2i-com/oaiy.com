@@ -14,9 +14,10 @@ This is the design record; [Setting it up](#setting-it-up) and [What is not done
 | Who orchestrates | A computer can use other computers (a **primary** to them), lend itself (a **worker** to them), or both at once; the computer a person works on talks to FormLogic and its apps, and uses the others through its own routes | One place for identity, permissions, audit and the cloud link per computer used; a computer with a GPU, a model or OAIY Voice to spare lends it while still using another's |
 | Where inference runs | On the worker that has the model, by its own engines (the Studio), as it would locally | No model weights move; each machine's engine knows its own GPU (the Mac's eGPU path included) |
 | How requests travel | Through the primary: a client calls the primary's existing routes, the primary calls the worker | Flows, the Agent and apps never see a LAN address or a worker credential |
-| Discovery | mDNS/DNS-SD (`_oaiy-worker._tcp.local.`) advertising a name, a node id and a port, and a manual address | Standard and LAN-local; multicast is often blocked, so an address always works too. Discovery grants nothing |
+| Discovery | mDNS/DNS-SD (`_oaiy-worker._tcp.local.`) advertising a name, a node id, a port and in a line what the computer has (`hw`: its GPUs with their VRAM, memory and cores), and a manual address | Standard and LAN-local; multicast is often blocked, so an address always works too. Discovery grants nothing; what a computer has helps choose which to pair with (no paths, models or keys) |
 | Trust | Pairing: each node's own key and self-signed certificate; a 6-digit code from both certificates and a fresh random value from each side, the worker's committed to before it learns the primary's, shown on both screens; approval on the worker, then on the primary (the person says the worker showed the same code); each pins the other's certificate | A numeric comparison with committed random values defeats a man in the middle on the first contact, as Bluetooth's does, with no shared secret to type or leak: a computer in the middle learns each side's value only after its own is fixed, so it cannot make the two screens agree (one time in a million). Asking both sides means a computer answering for the worker cannot pair itself by approving its own request |
 | Transport | Mutual TLS (rustls) with the pinned certificates, both directions, after pairing | Encrypted and authenticated at the connection, so no bearer token crosses the LAN in the clear |
+| Node ids | A computer's node id is its own say, so one already paired here under another certificate is refused, either way (`409 node_id_taken`; `Peers::add`) | A computer approved only to use this one cannot name itself as one this computer uses, and take its place, its defaults and its OAIY Voice |
 | Model identity | A remote model is `engine:<kind>:node.<nodeId>/<model>`; the worker's own name kept beside it | Never mistaken for a local model of the same name; a flow that names one shows it offline rather than switching |
 | Placement | Manual: the person chooses a model on a worker, and may pin it there; nothing moves, downloads or evicts by itself | Predictable; a GPU's memory is the person's to spend |
 | Flows and services | A worker runs the flows its person shares (*Let apps run it*) for its primary, and lends OAIY Voice's speech; nothing else of it | A worker's person decides what leaves it: the same mark that lets an app run a flow, and a known service's known routes, never a person's own service |
@@ -88,6 +89,19 @@ A worker unpaired at the primary while it is off is told once it answers again (
 restart of the primary, unpair it on the worker too). Switch off on either side to stop at once; switching on again
 keeps the pairing.
 
+**Letting the Agent set it up.** *Let the Agent pair and set up this computer* (Setup → Networking, saved as it is
+ticked; off until the person ticks it) lets the Agent's tools change OAIY Network: `network_setup` (on or off, uses,
+lends, name), `network_pair` (a computer found on the network or an address; it waits for the other computer's
+approval and confirms this side for the person, both ways where this computer lends itself), `network_approve`
+(a computer asking to use this one), `network_unpair`, `network_use_service` (OAIY Voice on another computer) and
+`network_pin`, beside `network_status` (which says `agentMaySetUp`, and lists the computers asking). With it off they
+refuse, and say where the person ticks it. Two computers that both have it on **pair by themselves**: the asking one
+says so in its request, the other approves it at once, and the asking one finishes at once (both ways where it lends
+itself), with no codes compared, so it is for a network the person trusts. Each card says *Paired by itself*; past
+eight computers so paired, the person is asked again. The Agent's own model on another computer
+is `agent_model_set` with a worker's language model, or (following *the model chosen in Engines*) a worker's
+language model made this computer's default with `model_set_default`.
+
 For computers that should not use multicast at all, start OAIY with `OAIY_NETWORK_DISCOVERY=off` and pair by
 address. `OAIY_NETWORK_NAME` sets the name other computers see (the computer's own name otherwise; the Networking
 page sets it too).
@@ -105,8 +119,10 @@ Once paired, a worker's models are in the primary's engine catalogue (`GET /api/
   computer, or an edit on another worker) reads it through the primary.
 - **The Agent**: Settings → Agent → *On a paired computer* runs the Agent itself on a worker's language model (its
   requests and tool calls go through the primary). Its tools also see the network: `network_status` (read only)
-  lists the paired computers, their GPUs and their models' ids, and `agent_model_set` can choose a worker's
-  language model when the person asks. Pairing and pins stay the person's: no tool changes them.
+  lists the paired computers with what each has and how busy it is (processor, memory, GPUs with their VRAM, its
+  queue), their models' ids, and the computers found on the network with what each says it has;
+  `agent_model_set` can choose a worker's language model when the person asks. Setting the network up and pairing
+  are the Agent's only where the person ticks *Let the Agent pair and set up this computer* (below).
 - **Engines → Other computers** lists each paired worker's GPUs and models by kind, and makes one of them this
   computer's **default** of its kind (*Make default*; *Use this computer's* gives it back). A worker's model as the
   default is marked `default` in the catalogue in place of this computer's own, so Flows' *Default … model* settings
@@ -123,6 +139,16 @@ Once paired, a worker's models are in the primary's engine catalogue (`GET /api/
 - **Any client of this desktop** reaches a worker's media routes at `/api/network/nodes/<id>/gateway/v1/…` and its
   chat at `/api/network/nodes/<id>/v1/chat/completions` (streamed as the worker streams it), with the desktop's own
   credentials (scope `ai.use`).
+
+**What a computer has, and its queue.** Each heartbeat a worker tells the computers that use it its processor
+(name, cores, how busy over the last minute), its memory (in use of all), its GPUs (memory in use of all, VRAM
+where it is the card's own, how busy, how warm) and its **queue**: the media jobs its engines are making and have
+waiting (their kind, model, stage and progress, never what they were asked to make) and the flow runs it is running
+or has waiting (a flow's id and run id for the asking computer's own runs alone), running first. The Networking
+page shows them on each paired computer's card (*Processor*, *Memory (RAM)*, each GPU's *VRAM*, *Queue: 1 running,
+2 waiting*), and the Agent's `network_status` as `cpu`, `ramMb`, `gpus` and `queue`. A worker runs its jobs one
+after another in its own queue; Flows → *On other computers* queues another run of a flow while one runs
+(*Queue another on …*), each followed and stopped on its own.
 
 A model that is offline, or a worker that refuses, answers `503 node_offline` naming the worker and why
 (*connection refused*, *the worker no longer accepts this computer*): nothing falls back to another model. A chat
@@ -196,7 +222,7 @@ restricted, as `/api/engines/` are):
 | Route | Scope | What |
 | --- | --- | --- |
 | `GET /api/network/status` | auth.read | On or off, the role, this computer's name, fingerprint and addresses |
-| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before) |
+| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, agent, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before; `agent` alone, `defaults` or `services` restart nothing) |
 | `POST /api/network/discover` | auth.manage | The workers found on the LAN |
 | `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare |
 | `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it, or withdraws the request it has not answered) |
@@ -269,7 +295,14 @@ again on its port, off and public addresses refused), and the Studio's the pins 
 - **Pins are picture models and the chosen language model**: video, speech, music, sound and 3D models run in a
   worker of their own per job, so they cannot be kept loaded.
 - **No routing trace or debug panel**, no per-worker queue limits beyond the worker's own Studio queue, and no
-  request ids carried from the primary to the worker's jobs.
+  request ids carried from the primary to the worker's jobs. No queue across computers: a job goes to the computer
+  chosen for it and waits there, never moved to one that is free; a media job waiting there cannot be stopped from
+  here (a flow run can).
+- **OAIY Voice on a worker serves calls and transcriptions**, not a plugin's own voice sessions (those use this
+  computer's own OAIY Voice); and a worker's own call and a primary's share its OAIY Voice, each slower, with no
+  priority for the worker's own.
+- **A computer that unpairs one it lends itself to** does not tell it (it cannot reach a computer that does not lend
+  itself): that one shows it *no longer lends itself* until its person unpairs it there too.
 - **Credential rotation**: a computer's identity is made once; to replace it, delete `network/` in its data folder
   and pair again.
 - **Not measured on a second physical computer** yet: the tests above ran both sides on one Mac (loopback), and

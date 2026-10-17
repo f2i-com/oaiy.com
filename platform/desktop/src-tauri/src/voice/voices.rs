@@ -82,10 +82,29 @@ fn list_in(dir: &Path) -> Vec<VoiceClip> {
     clips
 }
 
-/// The voices, by name.
-pub fn list() -> Vec<VoiceClip> {
-    dir().map(list_in).unwrap_or_default()
+/// Whether `name` is a copy of another computer's voice, kept here for its calls (OAIY Network: `from-<id>-<name>`):
+/// spoken in when that computer asks, never this computer's own.
+pub fn is_copy(name: &str) -> bool {
+    name.strip_prefix("from-").and_then(|rest| rest.split_once('-')).is_some_and(|(id, voice)| id.len() == 6 && id.chars().all(|c| c.is_ascii_alphanumeric()) && !voice.is_empty())
 }
+
+/// The voices, by name (this computer's own: not the copies kept for another computer's calls).
+pub fn list() -> Vec<VoiceClip> {
+    dir().map(list_in).unwrap_or_default().into_iter().filter(|c| !is_copy(&c.name)).collect()
+}
+
+/// The copies kept for one computer's calls (`from-<id>-…`), oldest first.
+pub fn copies(prefix: &str) -> Vec<VoiceClip> {
+    let Some(dir) = dir() else { return Vec::new() };
+    let mut found: Vec<(std::time::SystemTime, VoiceClip)> = list_in(dir)
+        .into_iter()
+        .filter(|c| is_copy(&c.name) && c.name.starts_with(prefix))
+        .map(|c| (std::fs::metadata(dir.join(&c.file)).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), c))
+        .collect();
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, c)| c).collect()
+}
+
 
 /// The voice calls are answered in: the one chosen while its clip is there,
 /// else the first there is.
@@ -95,7 +114,7 @@ pub fn chosen() -> Option<String> {
 }
 
 fn chosen_in(dir: &Path) -> Option<String> {
-    let clips = list_in(dir);
+    let clips: Vec<VoiceClip> = list_in(dir).into_iter().filter(|c| !is_copy(&c.name)).collect();
     let picked = std::fs::read_to_string(dir.join("chosen")).ok().map(|s| s.trim().to_string());
     picked
         .and_then(|p| clips.iter().find(|c| c.name.eq_ignore_ascii_case(&p)).map(|c| c.name.clone()))
@@ -258,6 +277,20 @@ mod tests {
         assert!(add_in(&dir, "x", "wav", &[0; 10], None).is_err());
         assert!(add_in(&dir, "../..", "wav", &clip, None).is_err());
         assert!(add_in(&dir, "chosen", "wav", &clip, None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Another computer's voice copied here for its calls is never this computer's own: not the one its calls fall
+    /// back to (it sorts first: `from-…` before `receptionist`), not one it lists.
+    #[test]
+    fn a_copy_of_another_computers_voice_is_not_this_computers_own() {
+        let dir = folder("copies");
+        seed(&dir).unwrap();
+        let clip = vec![1u8; 4096];
+        add_in(&dir, "from-a1b2c3-front-desk", "wav", &clip, None).unwrap();
+        assert_eq!(list_in(&dir).len(), 2);
+        assert_eq!(chosen_in(&dir).as_deref(), Some("receptionist"));
+        assert!(is_copy("from-a1b2c3-front-desk") && !is_copy("from-mum") && !is_copy("from-a1b2c-x") && !is_copy("receptionist"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
