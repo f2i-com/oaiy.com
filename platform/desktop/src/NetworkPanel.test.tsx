@@ -101,11 +101,14 @@ describe('NetworkPanel', () => {
     expect(api.deny).not.toHaveBeenCalled();
   });
 
-  it('on a primary, pairs by address showing the code until the worker approves', async () => {
+  it('on a primary, pairs by address showing the code, the worker approving and then this side', async () => {
     vi.useFakeTimers();
     api.status.mockResolvedValue(primary);
     api.startPairing.mockResolvedValue({ pairingId: 'x', code: '654 321', status: 'pending', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.20:17975', fingerprint: '1111' } });
-    api.confirmPairing.mockResolvedValueOnce({ status: 'pending', code: '654 321' }).mockResolvedValueOnce({ status: 'approved', node });
+    api.confirmPairing
+      .mockResolvedValueOnce({ status: 'pending', code: '654 321' })
+      .mockResolvedValueOnce({ status: 'approved_there', code: '654 321' })
+      .mockResolvedValueOnce({ status: 'approved', node });
     await mount();
     const input = container.querySelector('input[aria-label="Worker address"]') as HTMLInputElement;
     await act(async () => {
@@ -120,6 +123,12 @@ describe('NetworkPanel', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
     await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
     expect(api.confirmPairing).toHaveBeenCalledTimes(2);
+    // approved there: nothing is paired until this side says the worker showed the same code
+    expect(container.querySelector('[data-testid="network-pairing"]')!.textContent).toContain('Did its screen show this same code?');
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(api.confirmPairing).toHaveBeenCalledTimes(2);
+    await act(async () => button('Yes, pair').click());
+    expect(api.confirmPairing).toHaveBeenLastCalledWith('x', true);
     expect(container.textContent).toContain('Paired with Rig');
     const card = container.querySelector('[data-testid="network-node"]')!;
     expect(card.textContent).toContain('Online');

@@ -15,7 +15,7 @@ This is the design record; [Setting it up](#setting-it-up) and [What is not done
 | Where inference runs | On the worker that has the model, by its own engines (the Studio), as it would locally | No model weights move; each machine's engine knows its own GPU (the Mac's eGPU path included) |
 | How requests travel | Through the primary: a client calls the primary's existing routes, the primary calls the worker | Flows, the Agent and apps never see a LAN address or a worker credential |
 | Discovery | mDNS/DNS-SD (`_oaiy-worker._tcp.local.`) advertising a name, a node id and a port, and a manual address | Standard and LAN-local; multicast is often blocked, so an address always works too. Discovery grants nothing |
-| Trust | Pairing: each node's own key and self-signed certificate; a 6-digit code from both certificates shown on both screens; approval on the worker; each pins the other's certificate | A numeric comparison defeats a man in the middle on the first contact, as Bluetooth's does, with no shared secret to type or leak |
+| Trust | Pairing: each node's own key and self-signed certificate; a 6-digit code from both certificates shown on both screens; approval on the worker, then on the primary (the person says the worker showed the same code); each pins the other's certificate | A numeric comparison defeats a man in the middle on the first contact, as Bluetooth's does, with no shared secret to type or leak; asking both sides means a computer answering for the worker cannot pair itself by approving its own request |
 | Transport | Mutual TLS (rustls) with the pinned certificates, both directions, after pairing | Encrypted and authenticated at the connection, so no bearer token crosses the LAN in the clear |
 | Model identity | A remote model is `engine:<kind>:node.<nodeId>/<model>`; the worker's own name kept beside it | Never mistaken for a local model of the same name; a flow that names one shows it offline rather than switching |
 | Placement | Manual: the person chooses a model on a worker, and may pin it there; nothing moves, downloads or evicts by itself | Predictable; a GPU's memory is the person's to spend |
@@ -58,7 +58,9 @@ Both computers run OAIY Desktop (or the headless `oaiy-server`) of the same vers
    Switch on. Workers on the network show under *Add a worker* (found by mDNS); where computers cannot find each
    other (Wi-Fi client isolation, VLANs, a firewall), type the worker's address as its own page shows it.
 3. Press **Pair**. The primary shows a six-digit code; the worker's Networking page shows the same code under
-   *Pairing requests*. Approve it there only if the codes match. The request expires after five minutes.
+   *Pairing requests*. Approve it there only if the codes match. The primary then asks whether the worker showed
+   the same code: *Yes, pair* pairs them; *No* pairs nothing and the worker forgets the primary. The request expires
+   after five minutes.
 4. The worker is listed under *Workers* on the primary with its GPUs (memory in use, or *memory unknown* where it
    cannot be read) and its models, and on the worker as its *Paired primary*.
 
@@ -122,7 +124,7 @@ restricted, as `/api/engines/` are):
 | `PUT /api/network/settings` | auth.manage | `{enabled, role, name, port, bind}` |
 | `POST /api/network/discover` | auth.manage | The workers found on the LAN |
 | `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare |
-| `POST /api/network/pairings/confirm` | auth.manage | Whether the worker approved (then it is paired here) |
+| `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it) |
 | `GET /api/network/requests` | auth.read | On a worker: primaries asking to pair, each with its code |
 | `POST /api/network/requests/:id/approve`, `…/deny` | auth.manage, auth.revoke | The worker's person decides |
 | `GET /api/network/nodes` | auth.read | The paired computers, online or not, their GPUs and models |
@@ -151,7 +153,8 @@ OAIY_DATA_DIR=/tmp/oaiy-worker OAIY_SERVER_PORT=17984 OAIY_ENGINES_UI=http://127
 
 Then `PUT /api/network/settings` `{"enabled": true, "role": "worker", "port": 17986}` on the worker,
 `{"enabled": true, "role": "primary"}` on the primary, `POST /api/network/pairings/start` `{"address":
-"127.0.0.1:17986"}` on the primary, approve the request on the worker, and confirm on the primary.
+"127.0.0.1:17986"}` on the primary, approve the request on the worker, and confirm on the primary
+(`POST /api/network/pairings/confirm` `{"pairingId": …, "accept": true}` once it answers `approved_there`).
 
 Measured that way on the Mac with its RTX 4090 eGPU (2026-10-18; both servers on the Mac, the worker's engines the
 Mac's own):

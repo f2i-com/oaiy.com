@@ -2208,12 +2208,15 @@ export const network = {
   /** Ask a worker to pair, by its address or as found on the LAN: the code to compare with its screen. */
   startPairing: (target: { address?: string; nodeId?: string }) =>
     request<NetworkPairing>('/api/network/pairings/start', { method: 'POST', body: JSON.stringify(target) }),
-  /** Whether the worker's person approved (then it is paired here too). */
-  confirmPairing: (pairingId: string) =>
-    request<{ status: 'pending' | 'approved' | 'denied' | 'expired'; code?: string; node?: NetworkNode }>('/api/network/pairings/confirm', {
-      method: 'POST',
-      body: JSON.stringify({ pairingId }),
-    }),
+  /**
+   * Whether the worker's person approved (`approved_there`: then this computer's person says whether the worker showed
+   * the same code, `accept`, and only with `true` is it paired here too).
+   */
+  confirmPairing: (pairingId: string, accept?: boolean) =>
+    request<{ status: 'pending' | 'approved_there' | 'approved' | 'denied' | 'declined' | 'expired'; code?: string; node?: NetworkNode }>(
+      '/api/network/pairings/confirm',
+      { method: 'POST', body: JSON.stringify(accept === undefined ? { pairingId } : { pairingId, accept }) },
+    ),
   /** Primaries asking to pair with this worker, each with its code. */
   requests: () => request<{ requests: NetworkRequest[] }>('/api/network/requests'),
   approve: (id: string) => request<{ status: string }>(`/api/network/requests/${encodeURIComponent(id)}/approve`, { method: 'POST' }),

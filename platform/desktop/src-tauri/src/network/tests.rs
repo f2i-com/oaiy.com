@@ -131,9 +131,41 @@ async fn pair(primary: &Network, worker: &Network) -> String {
     assert_eq!(before["status"], "pending", "nothing is paired before the worker's person approves");
     let (status, approved) = call(&w, "POST", &format!("/api/network/requests/{}/approve", request["id"].as_str().unwrap()), None).await;
     assert_eq!((status, approved["status"].as_str()), (StatusCode::OK, Some("approved")));
-    let (_, confirmed) = call(&p, "POST", "/api/network/pairings/confirm", Some(pairing)).await;
+    let (_, there) = call(&p, "POST", "/api/network/pairings/confirm", Some(pairing.clone())).await;
+    assert_eq!((there["status"].as_str(), &there["code"]), (Some("approved_there"), &started["code"]), "{there}");
+    let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
+    assert!(nodes["nodes"].as_array().unwrap().iter().all(|n| n["nodeId"] != started["worker"]["nodeId"]), "not paired here before this side says the codes matched");
+    let (_, confirmed) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": true }))).await;
     assert_eq!(confirmed["status"], "approved", "{confirmed}");
     confirmed["node"]["nodeId"].as_str().unwrap().to_string()
+}
+
+/// Approved on the worker, the pairing waits for this side's person to say the codes matched; saying they did not,
+/// nothing is paired here and the worker forgets this computer.
+#[tokio::test]
+async fn a_pairing_needs_both_screens_and_a_no_here_undoes_the_workers_yes() {
+    let worker = node("worker-both", Role::Worker, Some(fake_engines().await)).await;
+    let primary = node("primary-both", Role::Primary, None).await;
+    let (p, w) = (router(primary.clone()), router(worker.clone()));
+    let (_, started) = call(&p, "POST", "/api/network/pairings/start", Some(json!({ "address": worker.listening().unwrap().to_string() }))).await;
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    call(&w, "POST", &format!("/api/network/requests/{}/approve", waiting["requests"][0]["id"].as_str().unwrap()), None).await;
+    let (_, worker_side) = call(&w, "GET", "/api/network/nodes", None).await;
+    assert_eq!(worker_side["nodes"].as_array().unwrap().len(), 1, "the worker's yes");
+    let pairing = json!({ "pairingId": started["pairingId"] });
+    let (_, there) = call(&p, "POST", "/api/network/pairings/confirm", Some(pairing.clone())).await;
+    assert_eq!(there["status"], "approved_there");
+    let (_, again) = call(&p, "POST", "/api/network/pairings/confirm", Some(pairing)).await;
+    assert_eq!(again["status"], "approved_there", "asked again, it still waits for this side");
+    let (_, no) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": false }))).await;
+    assert_eq!(no["status"], "declined");
+    let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
+    assert!(nodes["nodes"].as_array().unwrap().is_empty(), "nothing paired here");
+    let (_, worker_side) = call(&w, "GET", "/api/network/nodes", None).await;
+    assert!(worker_side["nodes"].as_array().unwrap().is_empty(), "the worker forgot this computer: {worker_side}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
 }
 
 #[tokio::test]

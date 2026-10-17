@@ -44,6 +44,8 @@ pub(crate) struct Outgoing {
     pub fingerprint: String,
     pub code: String,
     pub at: Instant,
+    /// The worker's person approved: this computer's person is to say the codes matched too ([`pair_confirm`]).
+    pub approved_there: bool,
 }
 
 /// What a primary last heard from a paired worker.
@@ -262,6 +264,7 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
         code: pairing_code(&id.fingerprint, &fp),
         fingerprint: fp,
         at: Instant::now(),
+        approved_there: false,
     };
     let out = json!({
         "pairingId": pending.id,
@@ -279,10 +282,16 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
 #[serde(rename_all = "camelCase")]
 struct PairConfirm {
     pairing_id: String,
+    /// This computer's person says the worker showed the same code (true), or that it did not (false).
+    #[serde(default)]
+    accept: Option<bool>,
 }
 
-/// `POST /api/network/pairings/confirm` `{pairingId}`: has the worker's person approved? Approved, the worker is
-/// paired here too (its certificate pinned) and its models are asked for at once.
+/// `POST /api/network/pairings/confirm` `{pairingId, accept?}`: has the worker's person approved? Approved there, it
+/// is `approved_there` until this computer's person says the worker showed the same code (`accept: true`): only then
+/// is the worker paired here (its certificate pinned) and its models asked for. Both screens are checked, so a
+/// computer answering for the worker on the network cannot pair itself by approving its own request.
+/// `accept: false` gives up, and tells a worker that approved to forget this computer.
 async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) -> Response {
     let Some(p) = lock(&net.inner().outgoing).iter().find(|o| o.id == req.pairing_id && o.at.elapsed() < PAIRING_TTL).cloned() else {
         return error(StatusCode::NOT_FOUND, "not_found", "no such pairing (or it has expired): start again");
@@ -295,6 +304,16 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         Ok(c) => c,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
     };
+    if req.accept == Some(false) {
+        lock(&net.inner().outgoing).retain(|o| o.id != p.id);
+        if p.approved_there {
+            let _ = client.post(url(&p.address, "/worker/v1/unpair")).timeout(Duration::from_secs(3)).send().await;
+        }
+        return Json(json!({ "status": "declined" })).into_response();
+    }
+    if p.approved_there {
+        return if req.accept == Some(true) { paired(&net, &p).await } else { Json(json!({ "status": "approved_there", "code": p.code })).into_response() };
+    }
     let answer = match client.get(url(&p.address, &format!("/worker/v1/pair/{}", p.request_id))).timeout(Duration::from_secs(8)).send().await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
         Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
@@ -305,14 +324,14 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         Err(e) => return error(StatusCode::BAD_GATEWAY, "unreachable", format!("the worker did not answer: {}", plain(&e))),
     };
     match answer.get("status").and_then(Value::as_str) {
+        Some("approved") if req.accept == Some(true) => paired(&net, &p).await,
         Some("approved") => {
-            let peer = Peer { node_id: p.node_id.clone(), name: p.name.clone(), role: Role::Worker, fingerprint: p.fingerprint.clone(), address: p.address.clone(), paired_at_ms: now_ms() };
-            if let Err(e) = net.inner().peers().add(peer.clone()) {
-                return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
+            // (the person here has five more minutes to say the codes matched)
+            if let Some(o) = lock(&net.inner().outgoing).iter_mut().find(|o| o.id == p.id) {
+                o.approved_there = true;
+                o.at = Instant::now();
             }
-            lock(&net.inner().outgoing).retain(|o| o.id != p.id);
-            check(&net, &peer).await;
-            Json(json!({ "status": "approved", "node": node_json(&net, &peer) })).into_response()
+            Json(json!({ "status": "approved_there", "code": p.code })).into_response()
         }
         Some("denied") => {
             lock(&net.inner().outgoing).retain(|o| o.id != p.id);
@@ -320,6 +339,17 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         }
         _ => Json(json!({ "status": "pending", "code": p.code })).into_response(),
     }
+}
+
+/// The worker of pairing `p`, approved on both screens: paired here, its certificate pinned, its models asked for.
+async fn paired(net: &Network, p: &Outgoing) -> Response {
+    let peer = Peer { node_id: p.node_id.clone(), name: p.name.clone(), role: Role::Worker, fingerprint: p.fingerprint.clone(), address: p.address.clone(), paired_at_ms: now_ms() };
+    if let Err(e) = net.inner().peers().add(peer.clone()) {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
+    }
+    lock(&net.inner().outgoing).retain(|o| o.id != p.id);
+    check(net, &peer).await;
+    Json(json!({ "status": "approved", "node": node_json(net, &peer) })).into_response()
 }
 
 /// `GET /api/network/requests`: primaries asking this worker to pair, each with the code its screen shows.

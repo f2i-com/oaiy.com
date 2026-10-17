@@ -268,6 +268,8 @@ function WorkerRequests({ requests, onDecide }: { requests: NetworkRequest[]; on
 function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; discovery: boolean; onPaired: () => void }) {
   const [address, setAddress] = useState('');
   const [pairing, setPairing] = useState<NetworkPairing | null>(null);
+  /** The worker approved: this side's person says whether it showed the same code. */
+  const [approvedThere, setApprovedThere] = useState(false);
   const [outcome, setOutcome] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -275,7 +277,7 @@ function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; di
 
   // While a pairing waits for the worker's approval, ask every two seconds.
   useEffect(() => {
-    if (!pairing) return;
+    if (!pairing || approvedThere) return;
     let stopped = false;
     const tick = async () => {
       try {
@@ -283,6 +285,10 @@ function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; di
         if (stopped) return;
         if (r.status === 'pending') {
           timer.current = window.setTimeout(tick, 2000);
+          return;
+        }
+        if (r.status === 'approved_there') {
+          setApprovedThere(true);
           return;
         }
         setPairing(null);
@@ -306,12 +312,29 @@ function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; di
       stopped = true;
       window.clearTimeout(timer.current);
     };
-  }, [pairing, onPaired]);
+  }, [pairing, approvedThere, onPaired]);
+
+  /** This side's answer once the worker approved: the codes matched (paired), or they did not (nothing is). */
+  const answer = async (accept: boolean) => {
+    if (!pairing) return;
+    setError(null);
+    try {
+      const r = await network.confirmPairing(pairing.pairingId, accept);
+      setOutcome(r.status === 'approved' ? `Paired with ${r.node?.name ?? pairing.worker.name}.` : 'Not paired: the codes did not match.');
+      onPaired();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPairing(null);
+      setApprovedThere(false);
+    }
+  };
 
   const start = async (target: { address?: string; nodeId?: string }) => {
     setStarting(true);
     setError(null);
     setOutcome(null);
+    setApprovedThere(false);
     try {
       setPairing(await network.startPairing(target));
     } catch (e) {
@@ -340,13 +363,26 @@ function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; di
           <div className="pairing-body">
             Code <span className="pairing-code">{pairing.code}</span>
             <div className="form-hint">
-              On {pairing.worker.name}, open Setup → Networking and approve the request if it shows this same code. Waiting…
+              {approvedThere
+                ? `${pairing.worker.name} approved. Did its screen show this same code? Pair only if it did.`
+                : `On ${pairing.worker.name}, open Setup → Networking and approve the request if it shows this same code. Waiting…`}
             </div>
           </div>
           <div className="pairing-actions">
-            <button className="btn btn-secondary" onClick={() => setPairing(null)}>
-              Stop waiting
-            </button>
+            {approvedThere ? (
+              <>
+                <button className="btn btn-primary" onClick={() => void answer(true)}>
+                  Yes, pair
+                </button>
+                <button className="btn btn-secondary" onClick={() => void answer(false)}>
+                  No
+                </button>
+              </>
+            ) : (
+              <button className="btn btn-secondary" onClick={() => setPairing(null)}>
+                Stop waiting
+              </button>
+            )}
           </div>
         </div>
       )}
