@@ -1184,10 +1184,11 @@ fn kept_on_card(kind: Kind, request: &Json) -> bool {
     kind == Kind::Image && request.get("architecture").is_none_or(|a| matches!(a.as_str(), Some("qwen-image" | "moss-image" | "flux3-klein")))
 }
 
-/// Where a worker making pictures on a Mac's eGPU runs their text encoders (`OAIY_TEXT_ENCODER_GPU=auto`): those that
-/// keep their layers where they run on the card (MOSS-Image's 9B and FLUX 3 Klein's 4B, their 4-bit layers 8 GB beside
-/// the pictures' models: a caption in 1.2 s where the Mac took 3.1 s), leaving the Mac's GPU and memory to its language
-/// model (the flows' reviewer, kept warm there). Streamed over the cable a layer at a time for every picture, encoders
+/// Where a worker making pictures on a Mac's eGPU runs their text encoders (`OAIY_TEXT_ENCODER_GPU=auto`): MOSS-Image's
+/// 9B on the card, its 4-bit layers kept there beside the pictures' models (5.5 GB: a caption in 1.2 s where the Mac
+/// took 3.1 s), FLUX 3 Klein's 4B on the Mac's GPU, read as it encodes (0.8 s, nothing kept: kept on the card too it
+/// left the card 0.3 GB and the pictures' decodes slowed from 0.4 to 3 s), the Mac's memory left to its language model
+/// (the flows' reviewer, kept warm there). Streamed over the cable a layer at a time for every picture, encoders
 /// took 9 to 20 s of one. The studio's own setting of it, where set, is passed on instead (`own`: every encoder on the
 /// Mac).
 fn text_encoders_beside_card(command: &mut std::process::Command) {

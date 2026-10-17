@@ -408,7 +408,15 @@ dialog::backdrop { background: var(--backdrop); }
 .dlg-foot { padding: 12px 20px 16px; display: flex; justify-content: space-between; gap: 10px; align-items: center; }
 /* Wide screens: more room for galleries and forms. */
 @media (min-width: 1700px) { :root { --rail-w: 236px; } }
-@media (max-width: 1080px) { .gen { grid-template-columns: minmax(0, 1fr); } .viewer { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; } .viewer .media img, .viewer .media video { max-height: 70vh; } .viewer .info { max-height: none; } }
+/* (stacked: the picture its own height, the details below it, the dialog scrolling: before, the picture kept 70% of
+   the screen's height in a row that was shorter, and the details were drawn over it) */
+@media (max-width: 1080px) {
+  .gen { grid-template-columns: minmax(0, 1fr); }
+  .viewer { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; height: auto; }
+  .viewer .media img, .viewer .media video { height: auto; max-height: 64vh; }
+  .viewer .info { max-height: none; overflow: visible; }
+  dialog#viewer { height: auto; overflow-y: auto; }
+}
 
 /* ---------- the sections along the bottom ----------
    Where a rail with its names has no room: always in OAIY's window (its own

@@ -12,10 +12,10 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
 
 /// The GPU a text encoder runs on: the job's (`device`, as the computer counts them), or this computer's own where
 /// `OAIY_TEXT_ENCODER_GPU` says: `own` every encoder, `auto` (the studio's choice for a Mac's eGPU) those that do not keep
-/// their layers where they run (`keeps_layers` false), the job's GPU for those that do (MOSS-Image's 9B and FLUX 3
-/// Klein's 4B, their 4-bit layers kept on the card beside the pictures' models: a caption in 1.2 s where the Mac took
-/// 3.1 s, and none of the Mac's memory or GPU, which its language model has). Anything else (`card`), the job's GPU for
-/// every encoder.
+/// their layers where they run (`keeps_layers` false: FLUX 3 Klein's 4B, read as it encodes, 0.8 s on the Mac and
+/// nothing kept), the job's GPU for those that do (MOSS-Image's 9B, its 4-bit layers kept on the card beside the
+/// pictures' models: a caption in 1.2 s where the Mac took 3.1 s). Anything else (`card`), the job's GPU for every
+/// encoder (Klein's then kept there too, where the card has the room).
 pub fn text_encoder_gpu(device: usize, keeps_layers: bool) -> Result<ggml_rs_wgpu::WgpuBackend> {
     let setting = std::env::var("OAIY_TEXT_ENCODER_GPU").map(|v| v.trim().to_ascii_lowercase()).unwrap_or_default();
     let own = match setting.as_str() {

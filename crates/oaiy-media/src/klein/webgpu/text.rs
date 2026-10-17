@@ -156,7 +156,9 @@ impl WgpuKleinText {
 
     /// [`Self::load`] of the text encoder `spec` says.
     pub fn load_spec(checkpoint: &Path, tokenizer: &Path, device: usize, spec: Spec) -> Result<Self> {
-        let gpu = crate::common::webgpu_weights::text_encoder_gpu(device, true)?;
+        // (on the Mac where the studio says `auto`: kept on the card beside both picture models it left the card 0.3 GB,
+        // and the pictures' decodes took 3 s where 0.4; read as it encodes it takes 0.8 s on the Mac and keeps nothing)
+        let gpu = crate::common::webgpu_weights::text_encoder_gpu(device, false)?;
         let w = Weights::open(checkpoint)?;
         let p = spec.prefix;
         let shape = |w: &Weights, name: &str| w.shape(&format!("{p}layers.0.{name}.weight"));
