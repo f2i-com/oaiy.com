@@ -21,7 +21,7 @@ the Studio loads, keeps and lets them go ([STUDIO.md](STUDIO.md#which-model-hold
 | MOSS-Image's prompt: a caption as it is, a layout compiled to the model's one-line form as OpenMOSS's `compile_prompt.py` does (the same bytes on its example), a reply a bracket short closed first | `logic_block` | |
 | Try up to 3 times | `loop_start`, until its end says stop | |
 | This try's prompt: the caption, and on a retry the last review's fix after it | `logic_block` | |
-| The picture (a new seed each try) | `image_gen` | `moss-image-sft-q8-8-step` (the 8-step distillation at its 8 steps on the Q8_0 transformer: [MOSS-IMAGE.md](MOSS-IMAGE.md#distillations-pictures-in-8-passes)) |
+| The picture (a new seed each try) | `image_gen` | `moss-image-sft-q8-8-step-latest` (the 8-step distillation's later low-rank factors at 0.7 strength, on the Q8_0 transformer: [MOSS-IMAGE.md](MOSS-IMAGE.md#distillations-pictures-in-8-passes)) |
 | The review of the picture against the request | `ai_llm` with the picture | the language model chosen in Engines (it must read pictures) |
 | Pass or try again: the review read, the lettering checked | `logic_block` | |
 | Until it passes | `loop_end`, stops when `pass` is true | |

@@ -102,6 +102,22 @@ MLP's up and gate, v and down, or the first and last four blocks) brought it to 
 everywhere. On the RTX 4090 its 8 passes take 7.0 s at 4 bits, 7.1 s at Q8_0 and 8.2 s at f16, so the card uses the
 Q8_0 file (`moss-image-sft-q8-8-step`); the 4-bit one is for a smaller card.
 
+Later factors and another distillation, compared on nine logo layouts (a monogram, a badge with curved lettering, a
+mascot, line art, an app icon, a wordmark, Chinese calligraphy, an esports emblem, a script) at two seeds each, all on
+the Q8_0 transformer, a picture counted clean where its lettering is right and nothing was added:
+
+| Distillation | Clean | 1024x1024 |
+| --- | --- | --- |
+| The 8-step factors (update 2600) | 12 to 13 of 18 | 8.7 s |
+| Its later factors (the repo's `lora_latest`, at the 0.7 strength its card asks for: each `alpha` times 0.7), with the same time path and latent mix | 15 of 18 | 8.8 s |
+| A 4-step continuation of it (the same three files, 4 step codes) | about 9 of 18 | 4.6 s |
+
+The later factors stopped the clutter the first ones add (an app icon among a sheet of other icons, a wordmark among
+portraits); the 4-step one added more of it (a sheet of puppies, people around an icon). On twelve photographs and
+illustrations the later factors drew the same pictures as the first, as well. Text to image uses them
+(`moss-image-sft-q8-8-step-latest`). Either is added as a folder of three files on the Models page, its strength in its
+`alpha`.
+
 Checked again on one brief over six seeds (docs/IMAGE_FLOW.md#logos): the 8-step distillation writes a logo's name
 twice, adds lines nobody asked for or sets the logo in a room, at full precision as at 4 bits and with its text
 encoder on either GPU, where MOSS-Image's own 50 guided steps did not; a layout with its background as an item of its
