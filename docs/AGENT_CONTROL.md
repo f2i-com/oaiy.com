@@ -107,7 +107,7 @@ models are the ones installed, and the one chosen is the person's.
 | Group | Read | Change |
 |---|---|---|
 | Overview | `status`: everything at a glance (engines, services, plugins, modules, ChatGPT, the Agent's model, the FormLogic link, setup, and whether the Agent may change OAIY) | |
-| Engines and models | `models_list`, `model_download_status` | `model_set_default`, `model_download`, `engine_start`, `engine_stop`, `engine_restart` |
+| Engines and models | `models_list`, `model_download_plan` (a model's files in place, on this computer elsewhere, or to download), `model_download_status` | `model_set_default`, `model_download` (every part it needs, none this computer has already), `engine_start`, `engine_stop`, `engine_restart` |
 | AI sources | `ai_sources_list` | `agent_model_set` (the engine or ChatGPT), `chatgpt_sign_in` (answers the address to sign in at), `chatgpt_sign_out` |
 | OAIY Network | `network_status` (on or off, uses and lends, whether the Agent may set it up, the computers asking to pair, paired computers with their GPUs, models' ids, the flows each shares and the services each lends), `flows_list` with `node` (a worker's shared flows) | `flow_run` with `node` (one of a worker's shared flows, run there), `model_set_default` with a worker's model's id, `agent_model_set` with a worker's language model; and, only where the person ticks *Let the Agent pair and set up this computer* in Setup, Networking: `network_setup`, `network_pair`, `network_approve`, `network_unpair` (a removal), `network_use_service`, `network_pin` |
 | Services | `services_list`, `service_logs` | `service_install`, `service_start`, `service_stop`, `service_uninstall` |

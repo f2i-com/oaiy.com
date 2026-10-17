@@ -116,8 +116,11 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                     "group": { "type": "string", "enum": choosable, "description": "The engine group." },
                     "model": { "type": "string", "minLength": 1, "description": "An installed model of that group, by the name models_list shows, or a paired worker's by its id (network_status)." }
                 }), &["group", "model"])),
+            def("model_download_plan", "What a model download takes", Read,
+                "What getting a catalog model takes, before it is got (catalogId from models_list): each of its files (weights, text encoder, VAE…) here already, on this computer elsewhere (another model's, another drive's: used where it is, never downloaded twice; checked by its SHA-256 when it is got), or to download, the gigabytes to download, the free space, the models it needs first, and whether it is gated (its licence accepted on huggingface.co and a Hugging Face token in Settings first).",
+                object(json!({ "catalogId": { "type": "string", "minLength": 1, "description": "The catalog entry's id." } }), &["catalogId"])),
             def("model_download", "Download a model", Change,
-                "Start downloading a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list); it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: check size and memory need first.",
+                "Start getting a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list): every part it needs (its weights, text encoder, VAE), the files this computer has already used where they are rather than downloaded again, each download checked by its SHA-256; it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: model_download_plan says what is left to fetch; check memory need first.",
                 object(json!({ "catalogId": { "type": "string", "minLength": 1, "description": "The catalog entry's id." } }), &["catalogId"])),
             def("engine_start", "Start the language model", Change,
                 "Start the engine's language model (the model chosen for llm). Answers its state; loading takes a while, and status shows when it is ready.",
@@ -561,6 +564,30 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             let _ = d.put("/api/network/settings", json!({ "defaults": on_worker })).await;
             let later = if group == "llm" { " It loads when the language model next starts (engine_restart to load it now)." } else { "" };
             done(format!("The {group} group now uses {model}.{later}"), json!({ "group": group, "model": model }))
+        }
+        "model_download_plan" => {
+            let id = a.req("catalogId");
+            let v = d.get_within(&format!("/api/engines/downloads?plan={}", seg(id)), Duration::from_secs(90)).await?;
+            let gb = |k: &str| (v.get(k).and_then(Value::as_f64).unwrap_or(0.0) / 1e9 * 10.0).round() / 10.0;
+            let (down, here, elsewhere) = (gb("downloadBytes"), gb("hereBytes"), gb("elsewhereBytes"));
+            let files: Vec<Value> = arr(&v, "files")
+                .iter()
+                .map(|f| json!({ "file": f.get("path"), "gb": (f.get("size").and_then(Value::as_f64).unwrap_or(0.0) / 1e9 * 100.0).round() / 100.0, "status": f.get("status"), "from": f.get("from") }))
+                .collect();
+            let mut said = format!("{}: {down} GB to download", v.get("name").and_then(Value::as_str).unwrap_or(id));
+            if elsewhere > 0.0 {
+                said.push_str(&format!(", {elsewhere} GB on this computer already (used where it is)"));
+            }
+            if here > 0.0 {
+                said.push_str(&format!(", {here} GB in place"));
+            }
+            if v.get("gated") == Some(&json!(true)) && v.get("token") != Some(&json!(true)) {
+                said.push_str(". It is gated: the person accepts its licence on huggingface.co and adds a Hugging Face token in Settings first");
+            }
+            done(
+                format!("{said}."),
+                json!({ "downloadGb": down, "elsewhereGb": elsewhere, "hereGb": here, "freeGb": (v.get("free").and_then(Value::as_f64).unwrap_or(0.0) / 1e9).round(), "gated": v.get("gated"), "token": v.get("token"), "needs": v.get("needs"), "files": files }),
+            )
         }
         "model_download" => {
             let id = a.req("catalogId");
@@ -1373,7 +1400,15 @@ fn percent(d: &Value) -> Value {
 }
 
 fn compact_download(d: &Value) -> Value {
-    json!({ "id": d.get("id"), "status": d.get("status"), "percent": percent(d), "file": d.get("file"), "speed": d.get("speed"), "error": d.get("error") })
+    let mut v = json!({ "id": d.get("id"), "status": d.get("status"), "percent": percent(d), "file": d.get("file"), "speed": d.get("speed"), "error": d.get("error") });
+    // (what was on this computer already, used rather than downloaded; and what it added, with what it still needs)
+    if let Some(bytes) = d.get("reused").and_then(Value::as_u64).filter(|b| *b > 0) {
+        v["reusedGb"] = json!((bytes as f64 / 1e9 * 10.0).round() / 10.0);
+    }
+    if let Some(added) = d.get("added").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+        v["added"] = Value::Array(added.clone());
+    }
+    v
 }
 
 fn compact_downloads(v: &Value) -> Vec<Value> {
@@ -1419,6 +1454,9 @@ async fn models_list(d: &Desk, only: Option<&str>) -> Result<Done, String> {
                         "id": m.get("id"), "name": m.get("name"), "sizeGb": m.get("sizeGb"), "vramGb": m.get("vramGb"),
                         "recommended": m.get("recommended"), "installed": m.get("installed"),
                     });
+                    if m.get("gated") == Some(&json!(true)) {
+                        e["gated"] = json!(true);
+                    }
                     if let Some(dl) = m.get("download").filter(|x| !x.is_null()) {
                         e["download"] = json!({ "status": dl.get("status"), "percent": percent(dl) });
                     }

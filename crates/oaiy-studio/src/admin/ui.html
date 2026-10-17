@@ -533,6 +533,14 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-state .file { font: 11px var(--code); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dl-state .err { color: var(--bad); white-space: pre-wrap; }
 .dl-state .ok { color: var(--good); display: flex; align-items: center; gap: 6px; }
+.dl-plan { display: grid; gap: 4px; }
+.dl-plan .have { color: var(--good); }
+.dl-plan summary { cursor: pointer; color: var(--muted); font-size: 11.5px; }
+.dl-plan ul { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 3px; }
+.dl-plan li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 8px; font: 11px var(--code); color: var(--muted); }
+.dl-plan li > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.dl-plan li .why { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dl-plan li.elsewhere .why, .dl-plan li.here .why { color: var(--good); }
 .dl-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .dl-actions .btn { padding: 6px 12px; font-size: 13px; }
 .dl-actions .btn.go { flex: 1; }
@@ -2778,6 +2786,24 @@ function renderDownloads() {
   const n = dl.models.filter(m => dlBusy(m.download)).length;
   $("#get-count").hidden = !n; $("#get-count").textContent = n;
 }
+// What getting a model takes, asked for when the person wants to know (it asks Hugging Face for the files' list).
+const dlPlans = {};
+async function dlPlan(id) {
+  dlPlans[id] = {loading: true}; renderDownloads();
+  try { dlPlans[id] = await api("/api/downloads/plan", {method: "POST", body: {id}}); }
+  catch (e) { dlPlans[id] = {error: e.message}; }
+  renderDownloads();
+}
+function planHtml(p) {
+  if (!p) return "";
+  if (p.loading) return `<div class="line"><span>Looking at its files…</span></div>`;
+  if (p.error) return `<div class="err">${esc(p.error)}</div>`;
+  const said = [`<b>${dlSize(p.download_bytes)}</b> to download`];
+  if (p.elsewhere_bytes) said.push(`<span class="have">${dlSize(p.elsewhere_bytes)} on this computer already, used where it is</span>`);
+  if (p.here_bytes) said.push(`${dlSize(p.here_bytes)} in place`);
+  const files = p.files.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${f.status === "download" ? "to download" : f.status === "here" ? "in place" : "on this computer: " + esc(f.from || "")}</span></li>`).join("");
+  return `<div class="dl-plan"><div><span>${said.join(" · ")}</span></div>${p.files.length > 1 ? `<details><summary>Its ${p.files.length} files</summary><ul>${files}</ul></details>` : ""}</div>`;
+}
 function dlCard(m, group) {
   const d = m.download, busy = dlBusy(d);
   const facts = [`<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`, `<span>GPU <b>${m.vram_gb} GB+</b></span>`, `<span>${esc(m.license)}</span>`];
@@ -2785,7 +2811,7 @@ function dlCard(m, group) {
   let state = "", actions = "";
   if (d && d.status === "downloading") {
     const pct = d.total ? Math.min(100, d.done / d.total * 100) : 0, left = d.speed > 0 && d.total ? (d.total - d.done) / d.speed : NaN;
-    state = `<div class="meter"><div style="width:${pct}%"></div></div><div class="line"><span>${dlSize(d.done)} of ${d.total ? dlSize(d.total) : "…"}</span><span>${d.speed > 0 ? dlSize(d.speed) + "/s" : ""}${dur(left) ? " · " + dur(left) + " left" : ""}</span></div>${d.file ? `<div class="file" title="${esc(d.file)}">${esc(d.file)}</div>` : ""}`;
+    state = `<div class="meter"><div style="width:${pct}%"></div></div><div class="line"><span>${dlSize(d.done)} of ${d.total ? dlSize(d.total) : "…"}${d.reused ? " · " + dlSize(d.reused) + " found here" : ""}</span><span>${d.speed > 0 ? dlSize(d.speed) + "/s" : ""}${dur(left) ? " · " + dur(left) + " left" : ""}</span></div>${d.file ? `<div class="file" title="${esc(d.file)}">${esc(d.file)}</div>` : ""}`;
     actions = `<button class="btn" data-dl="pause" data-id="${m.id}">Pause</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
   } else if (d && d.status === "queued") {
     state = `<div class="line"><span>Waiting for the download before it</span></div>`;
@@ -2800,13 +2826,15 @@ function dlCard(m, group) {
     state = `<div class="err">${esc(d.error || "The download failed.")}</div>`;
     actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button>`;
   } else if (m.installed || d?.status === "done") {
-    state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>`;
+    state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>${d?.reused ? `<div class="line"><span>${dlSize(d.reused)} of it was on this computer already, used where it is</span></div>` : ""}`;
     actions = `<button class="btn" data-goto-models>Open Models</button><button class="btn quiet" data-dl="add" data-id="${m.id}" title="Add it to the model list again (after it was removed)">Add again</button>`;
   } else if (m.partial) {
     state = `<div class="line"><span>Partly downloaded</span></div>`;
     actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume download</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Discard</button>`;
   } else {
-    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Download</button>`;
+    const p = dlPlans[m.id];
+    state = planHtml(p);
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">${p && p.download_bytes != null ? (p.download_bytes ? "Download " + dlSize(p.download_bytes) : "Add it (all here)") : "Download"}</button>${p ? "" : `<button class="btn quiet" data-dl="plan" data-id="${m.id}" title="What it needs: its files here already, on this computer elsewhere, or to download">What it needs</button>`}`;
   }
   return `<article class="dl-card${m.installed ? " installed" : ""}${busy ? " busy" : ""}" data-group="${esc(m.group)}">
     <div class="dl-head"><span class="dl-icon"><svg viewBox="0 0 24 24" aria-hidden="true">${DL_ICONS[m.group] || ""}</svg></span><span class="dl-group">${esc(group)}</span>${m.recommended ? '<span class="tag good">Recommended</span>' : ""}</div>
@@ -2817,6 +2845,7 @@ function dlCard(m, group) {
   </article>`;
 }
 async function dlAct(what, id) {
+  if (what === "plan") return dlPlan(id);
   try {
     const body = {id};
     if (what === "start" || what === "add") body.dir = $("#dl-dir").value.trim();

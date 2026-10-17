@@ -112,10 +112,35 @@
    "annotations": {
     "destructiveHint": false,
     "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "What a model download takes"
+   },
+   "description": "What getting a catalog model takes, before it is got (catalogId from models_list): each of its files (weights, text encoder, VAE…) here already, on this computer elsewhere (another model's, another drive's: used where it is, never downloaded twice; checked by its SHA-256 when it is got), or to download, the gigabytes to download, the free space, the models it needs first, and whether it is gated (its licence accepted on huggingface.co and a Hugging Face token in Settings first).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "catalogId": {
+      "description": "The catalog entry's id.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "catalogId"
+    ],
+    "type": "object"
+   },
+   "name": "model_download_plan",
+   "title": "What a model download takes"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
     "readOnlyHint": false,
     "title": "Download a model"
    },
-   "description": "Start downloading a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list); it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: check size and memory need first.",
+   "description": "Start getting a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list): every part it needs (its weights, text encoder, VAE), the files this computer has already used where they are rather than downloaded again, each download checked by its SHA-256; it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: model_download_plan says what is left to fetch; check memory need first.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
@@ -1489,6 +1514,7 @@
   "status",
   "models_list",
   "model_download_status",
+  "model_download_plan",
   "ai_sources_list",
   "network_status",
   "services_list",

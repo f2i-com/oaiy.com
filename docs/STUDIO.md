@@ -171,13 +171,31 @@ licence. **Recommended** picks one of each kind to start with.
   (`NAME.part`). **Resume** carries on from there, also after the studio
   restarts. **Cancel** deletes the partial file. One download runs at a time,
   and the others wait their turn.
-- **Gated models:** LTX 2.5 and DINOv3 (for Pixal3D) ask you to accept their
-  licence on huggingface.co first. Accept it while signed in, create an access
-  token (read) at huggingface.co/settings/tokens, and save it on the page. The
-  token stays in the configuration file (`downloads.hf_token`); the `HF_TOKEN`
-  environment variable works too.
+- **Everything a model needs, none of it twice:** a download gets every part
+  the model needs (its weights, text encoder, VAE, tokenizer). A file this
+  computer has already (another model's text encoder or VAE, a copy on another
+  drive) is used where it is, not downloaded again: the studio looks through
+  where downloads go, the folder of every model and part in its settings, and
+  `downloads.library` (more folders), for a file as large whose SHA-256 is the
+  one Hugging Face publishes for it, and links it into the new model's folder
+  (the same file on one drive; a link to it on another). Every file downloaded
+  is checked against that SHA-256 too, and deleted if it does not match. A
+  file's SHA-256, once read, is kept beside the settings (`model-hashes.json`).
+- **What it needs:** **What it needs** on a card (and `POST /api/downloads/plan
+  {id}`) says, before a download, which of its files are in place, on this
+  computer elsewhere (and where), and to download, with the gigabytes of each;
+  the desktop's Setup and the Agent's `model_download_plan` show the same.
+- **Gated models:** FLUX 3 Image Klein, LTX 2.5 and DINOv3 (for Pixal3D) ask
+  you to accept their licence on huggingface.co first. Accept it while signed
+  in, create an access token (read) at huggingface.co/settings/tokens, and save
+  it in OAIY's Settings (the desktop sends it with each download it starts) or
+  on this page. The page's token stays in the configuration file
+  (`downloads.hf_token`); the `HF_TOKEN` environment variable works too.
 - **When it finishes:** the files are added as the Models page's **Add**
-  would, parts attaching to their model. **Add again** re-adds a downloaded
+  would, parts attaching to their model: a part missing from the files added
+  is taken from the files that came with it first, then from another model of
+  the same kind. A model whose file is named for nothing (`model.safetensors`)
+  is named as the catalog names it. **Add again** re-adds a downloaded
   model that was removed from the list.
 - **How it downloads:** with the system's `curl`, which Windows 10 and later,
   macOS and Linux include (`downloads.curl` names another). Each finished part
@@ -618,7 +636,7 @@ sections are:
 - `ui`: `host`, `port`, `open` (`app` | `browser` | `none`).
 - `gateway`: `host`, `port`, `api_key`, `public_url`, `cors_origins`, `routes`.
 - `privacy`: `incognito`.
-- `downloads`: `dir` (where Get models saves; default `models`), `hf_token`, `curl`.
+- `downloads`: `dir` (where Get models saves; default `models`), `hf_token`, `curl`, `library` (more folders to look for model files in, so none is downloaded twice).
 - `llm`: `server`, `server_webgpu`, `backend`, `webgpu_gb`, `models` (`[{name, path, vision_projector?, lora?, lora_strength?, devices?, enabled}]`;
   a model's `devices` are its own GPUs, for one too big for the LLM's, such as
   Qwen3.8-Flash-Next: see [FLASHNEXT.md](FLASHNEXT.md)),

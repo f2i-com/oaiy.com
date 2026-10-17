@@ -331,6 +331,12 @@ impl Downloads {
         }
     }
 
+    /// The HuggingFace token, for the engines' downloads of the same person
+    /// (passed with each, never kept there or said back).
+    pub fn token(&self) -> Option<String> {
+        self.hf_token.lock().ok().and_then(|g| g.clone())
+    }
+
     /// Whether a HuggingFace token is currently set (the UI shows status,
     /// never the token itself).
     pub fn has_token(&self) -> bool {

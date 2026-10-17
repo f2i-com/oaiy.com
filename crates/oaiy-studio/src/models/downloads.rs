@@ -11,8 +11,18 @@
 //!
 //! A finished part leaves `.oaiy-<id>.json` in its folder, which is how the
 //! catalog knows the model is there.
+//!
+//! Nothing this computer has already is downloaded again: a file Hugging Face
+//! publishes a SHA-256 for is looked for among the model files here first
+//! ([`library`]), and used where it is (linked into the model's folder); each
+//! file downloaded is checked against it. [`Downloads::plan_of`] says, before a
+//! download, what is here already and what is left to fetch.
 use crate::util::str_or;
-use crate::{config, models::registry, Studio};
+use crate::{
+    config,
+    models::{library, registry, sha256},
+    Studio,
+};
 use oaiy_engine::json::Json;
 use std::collections::HashMap;
 use std::io::Read;
@@ -64,6 +74,11 @@ pub fn default_dir(studio: &Studio) -> PathBuf {
     config::resolve(&studio.root, if dir.is_empty() { "models" } else { &dir })
 }
 
+/// The Hugging Face token: one given with a download (the desktop's, from its Settings), else the studio's own.
+fn token_for(cfg: &Json, given: Option<&str>) -> Option<String> {
+    given.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).or_else(|| token(cfg))
+}
+
 fn token(cfg: &Json) -> Option<String> {
     let t = cfg.get("downloads").map_or("", |d| str_or(d, "hf_token", "")).trim().to_string();
     if !t.is_empty() {
@@ -101,6 +116,8 @@ struct Planned {
     size: Option<u64>,
     /// Sent the Hugging Face token (a file on huggingface.co).
     hub: bool,
+    /// Its SHA-256 as Hugging Face publishes it (a large file's), lowercase hex.
+    sha256: Option<String>,
 }
 
 /// `path` (forward slashes, from a catalog or the hub) under `base`, refusing anything that climbs out.
@@ -130,13 +147,13 @@ fn percent_encode(path: &str) -> String {
 }
 
 /// Runs curl to completion, returning its stdout (text).
-fn curl_text(cfg: &Json, url: &str, auth: bool, head: bool) -> Result<String, String> {
+fn curl_text(cfg: &Json, url: &str, auth: Option<&str>, head: bool) -> Result<String, String> {
     let mut c = command(&curl_program(cfg));
     c.args(["-sS", "-L", "--fail", "--connect-timeout", "30", "--max-time", "120", "-H", "User-Agent: oaiy-studio"]);
     if head {
         c.arg("-I");
     }
-    if let (true, Some(t)) = (auth, token(cfg)) {
+    if let Some(t) = auth {
         c.args(["-H", &format!("Authorization: Bearer {t}")]);
     }
     c.arg(url);
@@ -156,7 +173,7 @@ fn curl_error(stderr: &str, url: &str) -> String {
     });
     if e.contains("401") || e.contains("403") {
         return match repo {
-            Some(r) => format!("{r} is gated: sign in on huggingface.co, accept its licence at https://huggingface.co/{r}, then add a Hugging Face access token (read) here"),
+            Some(r) => format!("{r} is gated: sign in on huggingface.co, accept its licence at https://huggingface.co/{r}, then add a Hugging Face access token (read) in OAIY's Settings or on Get models"),
             None => format!("{url} refused the download ({e})"),
         };
     }
@@ -177,14 +194,14 @@ fn curl_error(stderr: &str, url: &str) -> String {
 }
 
 /// The files a catalog entry's parts name, with their sizes.
-fn plan(cfg: &Json, entry: &Json, dir: &Path) -> Result<Vec<Planned>, String> {
+fn plan(cfg: &Json, entry: &Json, dir: &Path, token: Option<&str>) -> Result<Vec<Planned>, String> {
     let mut out = Vec::new();
     for part in entry.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
         let into = under(dir, str_or(part, "into", ""))?;
         let repo = str_or(part, "repo", "");
         if !repo.is_empty() {
             let rev = str_or(part, "revision", "main");
-            let list = curl_text(cfg, &format!("https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true"), true, false)?;
+            let list = curl_text(cfg, &format!("https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true"), token, false)?;
             let tree = Json::parse(list.as_bytes()).map_err(|e| format!("{repo}: the file list did not read ({e})"))?;
             let (include, exclude) = (strings(part.get("include")), strings(part.get("exclude")));
             for f in tree.as_array().unwrap_or(&[]) {
@@ -196,7 +213,9 @@ fn plan(cfg: &Json, entry: &Json, dir: &Path) -> Result<Vec<Planned>, String> {
                     continue;
                 }
                 let size = f.get("lfs").and_then(|l| l.get("size")).and_then(Json::as_i64).or_else(|| f.get("size").and_then(Json::as_i64)).map(|s| s as u64);
-                out.push(Planned { url: format!("https://huggingface.co/{repo}/resolve/{rev}/{}", percent_encode(path)), dest: under(&into, path)?, size, hub: true });
+                // (a large file's SHA-256, as Hugging Face keeps it: what it is checked against, and found here by)
+                let sha256 = f.get("lfs").and_then(|l| l.get("oid")).and_then(Json::as_str).map(|o| o.trim_start_matches("sha256:").to_ascii_lowercase()).filter(|o| o.len() == 64 && o.bytes().all(|b| b.is_ascii_hexdigit()));
+                out.push(Planned { url: format!("https://huggingface.co/{repo}/resolve/{rev}/{}", percent_encode(path)), dest: under(&into, path)?, size, hub: true, sha256 });
             }
             // Every file the catalog names exactly must be there.
             for name in include.iter().filter(|g| !g.contains('*')) {
@@ -211,14 +230,14 @@ fn plan(cfg: &Json, entry: &Json, dir: &Path) -> Result<Vec<Planned>, String> {
                 return Err(format!("{}: a part names neither a repo nor a url and file", str_or(entry, "id", "")));
             }
             let size = part.get("size").and_then(Json::as_i64).map(|s| s as u64).or_else(|| head_size(cfg, url));
-            out.push(Planned { url: url.to_string(), dest: under(&into, file)?, size, hub: false });
+            out.push(Planned { url: url.to_string(), dest: under(&into, file)?, size, hub: false, sha256: part.get("sha256").and_then(Json::as_str).map(str::to_ascii_lowercase) });
         }
     }
     Ok(out)
 }
 
 fn head_size(cfg: &Json, url: &str) -> Option<u64> {
-    let headers = curl_text(cfg, url, false, true).ok()?;
+    let headers = curl_text(cfg, url, None, true).ok()?;
     headers.lines().filter_map(|l| l.split_once(':')).filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).filter_map(|(_, v)| v.trim().parse().ok()).last()
 }
 
@@ -314,6 +333,11 @@ struct Download {
     speed: f64,
     error: Option<String>,
     added: Vec<String>,
+    /// The bytes and files found on this computer already, used where they are rather than downloaded.
+    reused: u64,
+    reused_files: usize,
+    /// The Hugging Face token given with it (never said back).
+    token: Option<String>,
 }
 
 impl Download {
@@ -330,6 +354,8 @@ impl Download {
             ("speed", Json::Num((self.speed * 10.).round() / 10.)),
             ("error", self.error.as_ref().map_or(Json::Null, Json::str)),
             ("added", Json::Arr(self.added.iter().map(Json::str).collect())),
+            ("reused", Json::Int(self.reused as i64)),
+            ("reused_files", Json::Int(self.reused_files as i64)),
         ])
     }
 }
@@ -379,8 +405,9 @@ impl Downloads {
         v
     }
 
-    /// Queue `id` (and what it needs that is not there yet) into `dir`.
-    pub fn start(&self, studio: &Arc<Studio>, id: &str, dir: Option<PathBuf>) -> Result<Json, String> {
+    /// Queue `id` (and what it needs that is not there yet) into `dir`; `token`: a Hugging Face token for it (the
+    /// desktop's), else the studio's own.
+    pub fn start(&self, studio: &Arc<Studio>, id: &str, dir: Option<PathBuf>, token: Option<String>) -> Result<Json, String> {
         let e = entry(id).ok_or_else(|| format!("no model {id} in the catalog"))?;
         let dir = dir.filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| default_dir(studio));
         if !dir.is_absolute() {
@@ -399,8 +426,24 @@ impl Downloads {
                         d.status = "queued";
                         d.error = None;
                         d.dir = dir.clone();
+                        d.token = token.clone().or(d.token.take());
                     }
-                    None => list.push(Download { id: id.clone(), dir: dir.clone(), status: "queued", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new() }),
+                    None => list.push(Download {
+                        id: id.clone(),
+                        dir: dir.clone(),
+                        status: "queued",
+                        done: 0,
+                        total: 0,
+                        file: String::new(),
+                        files_done: 0,
+                        files_total: 0,
+                        speed: 0.,
+                        error: None,
+                        added: Vec::new(),
+                        reused: 0,
+                        reused_files: 0,
+                        token: token.clone(),
+                    }),
                 }
             }
         }
@@ -488,6 +531,55 @@ impl Downloads {
         ])
     }
 
+    /// What getting `id` takes, before it is got: each of its files here already (where it goes), on this computer
+    /// elsewhere (another model's, another drive's: used where it is; `checked` once its SHA-256 has been read, else
+    /// read when it is got), or to download; and the bytes of each, the folder's free space, and the models it
+    /// needs that are not here yet. Asks Hugging Face for the files' list (`token`: as for [`Downloads::start`]).
+    pub fn plan_of(&self, studio: &Studio, id: &str, token: Option<String>) -> Result<Json, String> {
+        let e = entry(id).ok_or_else(|| format!("no model {id} in the catalog"))?;
+        let dir = default_dir(studio);
+        let cfg = studio.config();
+        let token = token_for(&cfg, token.as_deref());
+        let files = plan(&cfg, e, &dir, token.as_deref())?;
+        let here = library::scan(&library::roots(&studio.root, &cfg, &dir));
+        let (mut at_home, mut elsewhere, mut to_fetch) = (0u64, 0u64, 0u64);
+        let listed: Vec<Json> = files
+            .iter()
+            .map(|f| {
+                let size = f.size.unwrap_or(0);
+                let shown = f.dest.strip_prefix(&dir).unwrap_or(&f.dest).to_string_lossy().replace('\\', "/");
+                let mut o = vec![("path", Json::str(&shown)), ("size", f.size.map_or(Json::Null, |s| Json::Int(s as i64)))];
+                if f.size.is_some_and(|s| size_of(&f.dest) == s) {
+                    at_home += size;
+                    o.push(("status", Json::str("here")));
+                } else if let Some((from, checked)) = f.size.filter(|s| *s >= library::MIN_BYTES).and_then(|s| library::likely(&studio.root, &here, s, f.sha256.as_deref())) {
+                    elsewhere += size;
+                    o.push(("status", Json::str("elsewhere")));
+                    o.push(("from", Json::str(from.to_string_lossy())));
+                    o.push(("checked", Json::Bool(checked)));
+                } else {
+                    to_fetch += size.saturating_sub(size_of(&part_path(&f.dest)));
+                    o.push(("status", Json::str("download")));
+                }
+                Json::obj(o)
+            })
+            .collect();
+        let needs: Vec<Json> = strings(e.get("needs")).into_iter().filter(|n| entry(n).is_some_and(|x| !installed(x, &dir))).map(Json::str).collect();
+        Ok(Json::obj([
+            ("id", Json::str(id)),
+            ("name", Json::str(str_or(e, "name", id))),
+            ("gated", Json::Bool(e.get("gated").and_then(Json::as_bool).unwrap_or(false))),
+            ("token", Json::Bool(token.is_some())),
+            ("dir", Json::str(dir.to_string_lossy())),
+            ("free", self.free_cached(&dir).map_or(Json::Null, |v| Json::Int(v as i64))),
+            ("here_bytes", Json::Int(at_home as i64)),
+            ("elsewhere_bytes", Json::Int(elsewhere as i64)),
+            ("download_bytes", Json::Int(to_fetch as i64)),
+            ("needs", Json::Arr(needs)),
+            ("files", Json::Arr(listed)),
+        ]))
+    }
+
 }
 
 impl Downloads {
@@ -569,17 +661,27 @@ impl Downloads {
         }
     }
 
-    /// Every file of the entry into `dir`; stops early when paused or cancelled.
+    /// Every file of the entry into `dir`: one this computer has already used where it is, the others downloaded and
+    /// checked; stops early when paused or cancelled.
     fn fetch(&self, studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Want, String> {
         let id = str_or(e, "id", "");
         let cfg = studio.config();
-        let files = plan(&cfg, e, dir)?;
+        let given = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).and_then(|d| d.token.clone());
+        let files = plan(&cfg, e, dir, token_for(&cfg, given.as_deref()).as_deref())?;
         let total: u64 = files.iter().filter_map(|f| f.size).sum();
         let have = |f: &Planned| f.size.is_some_and(|s| size_of(&f.dest) == s) || (f.size.is_none() && f.dest.is_file());
         let mut done: u64 = files.iter().filter(|f| have(f)).filter_map(|f| f.size).sum();
         let partials: u64 = files.iter().filter(|f| !have(f)).map(|f| size_of(&part_path(&f.dest))).sum();
+        // (the model files on this computer, looked through once: a file wanted that is one of them is not fetched)
+        self.update(id, |d| d.file = "looking for its files on this computer".into());
+        let here = library::scan(&library::roots(&studio.root, &cfg, dir));
+        let found_here: u64 = files
+            .iter()
+            .filter(|f| !have(f))
+            .filter_map(|f| f.size.filter(|s| *s >= library::MIN_BYTES && library::likely(&studio.root, &here, *s, f.sha256.as_deref()).is_some()))
+            .sum();
         if let Some(free) = free_space(dir) {
-            let need = total.saturating_sub(done + partials);
+            let need = total.saturating_sub(done + partials + found_here);
             if free < need + (1 << 30) {
                 return Err(format!("{} needs {:.1} GB more on that drive and it has {:.1} GB free: choose another folder, or make room", str_or(e, "name", id), need as f64 / 1e9, free as f64 / 1e9));
             }
@@ -599,6 +701,34 @@ impl Downloads {
                 return Ok(want);
             }
             let shown = f.dest.strip_prefix(dir).unwrap_or(&f.dest).to_string_lossy().replace('\\', "/");
+            // Here already (another model's text encoder or VAE, a copy on another drive): used where it is.
+            if let (Some(size), Some(sha)) = (f.size.filter(|s| *s >= library::MIN_BYTES), f.sha256.as_deref()) {
+                if here.iter().any(|h| h.size == size) {
+                    self.update(id, |d| d.file = format!("checking the copy of {shown} on this computer"));
+                    let found = library::find(&studio.root, &here, size, sha, |_| self.wanted(id) != Want::Run);
+                    let want = self.wanted(id);
+                    if want != Want::Run {
+                        return Ok(want);
+                    }
+                    if let Some(from) = found.filter(|from| *from != f.dest) {
+                        let how = library::place(&from, &f.dest)?;
+                        let said = match how {
+                            library::Placed::Linked => "uses the file at",
+                            library::Placed::Pointed => "links to the file at",
+                            library::Placed::Copied => "copied the file at",
+                        };
+                        studio.log.push(format!("{shown}: on this computer already; {said} {}", from.display()));
+                        done += size;
+                        self.update(id, |d| {
+                            d.done = done;
+                            d.files_done += 1;
+                            d.reused += size;
+                            d.reused_files += 1;
+                        });
+                        continue;
+                    }
+                }
+            }
             self.update(id, |d| d.file = shown.clone());
             if let Some(parent) = f.dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -617,7 +747,20 @@ impl Downloads {
                     return Err(format!("{shown}: got {got} bytes of {s}; resume the download to try again"));
                 }
             }
+            // Checked whole against the SHA-256 Hugging Face publishes for it.
+            if let Some(sha) = &f.sha256 {
+                self.update(id, |d| d.file = format!("checking {shown}"));
+                let read = sha256::file(&part, |_| self.wanted(id) != Want::Run).map_err(|e| format!("{shown}: {e}"))?;
+                let Some(got) = read else { return Ok(self.wanted(id)) };
+                if got != *sha {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(format!("{shown} did not download whole (its SHA-256 is not the one Hugging Face publishes): it was deleted; resume the download to fetch it again"));
+                }
+            }
             std::fs::rename(&part, &f.dest).map_err(|e| format!("{}: {e}", f.dest.display()))?;
+            if let Some(sha) = &f.sha256 {
+                library::remember(&studio.root, &f.dest, sha);
+            }
             done += f.size.unwrap_or_else(|| size_of(&f.dest));
             self.update(id, |d| {
                 d.done = done;
@@ -638,7 +781,8 @@ impl Downloads {
     fn curl(&self, cfg: &Json, id: &str, f: &Planned, part: &Path, done_before: u64) -> Result<Want, String> {
         let mut c = command(&curl_program(cfg));
         c.args(["-sS", "-L", "--fail", "--retry", "3", "--retry-delay", "2", "--connect-timeout", "30", "-C", "-", "-H", "User-Agent: oaiy-studio", "-o"]).arg(part);
-        if let (true, Some(t)) = (f.hub, token(cfg)) {
+        let given = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).and_then(|d| d.token.clone());
+        if let (true, Some(t)) = (f.hub, token_for(cfg, given.as_deref())) {
             c.args(["-H", &format!("Authorization: Bearer {t}")]);
         }
         c.arg(&f.url).stdout(Stdio::null()).stderr(Stdio::piped());
@@ -727,7 +871,13 @@ fn register(studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Vec<String>, S
     let mut first: Option<(&'static str, String)> = None;
     for rel in strings(e.get("add")) {
         let path = under(dir, &rel)?;
-        let result = registry::add(&mut cfg, &path, None, first.as_ref().map(|(s, n)| (*s, n.as_str())));
+        // (a model whose file is named for nothing, `model.safetensors`, named as the catalog names it)
+        let generic = first.is_none() && path.file_stem().is_some_and(|n| {
+            let n = n.to_string_lossy().to_ascii_lowercase();
+            n == "model" || n.starts_with("model-0") || n.starts_with("diffusion_pytorch_model")
+        });
+        let name = generic.then(|| str_or(e, "id", "").to_string());
+        let result = registry::add(&mut cfg, &path, name.as_deref(), first.as_ref().map(|(s, n)| (*s, n.as_str())));
         if let (Ok((a, _)), None) = (&result, &first) {
             first = Some((a.section, a.name.clone()));
         }
@@ -908,6 +1058,115 @@ mod tests {
         assert!(curl_error("curl: (22) The requested URL returned error: 404", "https://huggingface.co/a/b/resolve/main/x").contains("not found"));
     }
 
+    /// A file served once per request, from a listener of its own (as Hugging Face's CDN would): how many were asked.
+    fn serve(body: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    head.push(byte[0]);
+                }
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(&body);
+            }
+        });
+        (url, asked)
+    }
+
+    /// A file this computer has already (another model's, another folder's) is used where it is, nothing fetched; one
+    /// it has not is downloaded and checked against its SHA-256, and one that does not match is refused and deleted.
+    #[test]
+    fn nothing_here_already_is_downloaded_again_and_a_download_is_checked() {
+        use std::sync::atomic::Ordering;
+        let root = std::env::temp_dir().join(format!("oaiy-dl-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, kept) = (root.join("models"), root.join("drive/qwen3-vl"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        let encoder: Vec<u8> = (0..library::MIN_BYTES as usize + 11).map(|i| (i * 7 % 253) as u8).collect();
+        std::fs::write(kept.join("encoder.safetensors"), &encoder).unwrap();
+        let sha_of = |b: &[u8]| {
+            let mut h = sha256::Sha256::new();
+            h.update(b);
+            h.hex()
+        };
+        let mut cfg = crate::config::default_json();
+        let named = Json::parse(format!(r#"{{"x":{{"text_encoder":"{}"}}}}"#, kept.join("encoder.safetensors").display()).as_bytes()).unwrap();
+        let mut image = cfg.get("media").and_then(|m| m.get("image")).cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
+        crate::util::set(&mut image, "models", named);
+        let mut media = cfg.get("media").cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
+        crate::util::set(&mut media, "image", image);
+        crate::util::set(&mut cfg, "media", media);
+        let studio = Arc::new(Studio::for_test(&root, cfg));
+        let d = Downloads::new();
+        let entry = |id: &str, url: &str, size: usize, sha: &str| {
+            Json::parse(format!(r#"{{"id":"{id}","parts":[{{"url":"{url}","file":"text_encoder/model.safetensors","size":{size},"sha256":"{sha}","into":"{id}"}}]}}"#).as_bytes()).unwrap()
+        };
+        let start = |id: &str| {
+            d.list.lock().unwrap().push(Download { id: id.into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, token: None });
+        };
+
+        // here already, elsewhere: used where it is, the server never asked
+        let (url, asked) = serve(encoder.clone());
+        start("one");
+        let e = entry("one", &url, encoder.len(), &sha_of(&encoder));
+        assert_eq!(d.fetch(&studio, &e, &dir).unwrap(), Want::Run);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "nothing fetched");
+        assert_eq!(std::fs::read(dir.join("one/text_encoder/model.safetensors")).unwrap(), encoder);
+        let one = d.list.lock().unwrap().iter().find(|x| x.id == "one").cloned().unwrap();
+        assert_eq!((one.reused, one.reused_files), (encoder.len() as u64, 1));
+
+        // not here: downloaded, checked, and known by its SHA-256 from then on
+        let other: Vec<u8> = encoder.iter().map(|b| b.wrapping_add(1)).collect();
+        let (url, asked) = serve(other.clone());
+        start("two");
+        assert_eq!(d.fetch(&studio, &entry("two", &url, other.len(), &sha_of(&other)), &dir).unwrap(), Want::Run);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        let got = dir.join("two/text_encoder/model.safetensors");
+        assert_eq!(std::fs::read(&got).unwrap(), other);
+        assert_eq!(library::known(&studio.root, &got), Some(sha_of(&other)));
+
+        // a download that is not what Hugging Face says it is: refused, and not kept
+        let (url, _) = serve(other.clone());
+        start("three");
+        let err = d.fetch(&studio, &entry("three", &url, other.len(), &"ab".repeat(32)), &dir).unwrap_err();
+        assert!(err.contains("did not download whole"), "{err}");
+        let three = dir.join("three/text_encoder/model.safetensors");
+        assert!(!three.exists() && !part_path(&three).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What getting a few catalog models takes on this computer, from its own settings (read, nothing written or
+    /// started): OAIY_TEST_STUDIO_CONFIG=<its oaiy-studio.json> cargo test -p oaiy-studio plans_here -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn plans_here() {
+        let Ok(path) = std::env::var("OAIY_TEST_STUDIO_CONFIG") else { return };
+        let path = PathBuf::from(path);
+        let cfg = Json::parse(&std::fs::read(&path).unwrap()).unwrap();
+        let studio = Studio::for_test(path.parent().unwrap(), cfg);
+        for id in std::env::var("OAIY_TEST_PLANS").unwrap_or_else(|_| "qwen3.5-9b,moss-image-sft-q4,flux-3-image-klein".into()).split(',') {
+            let started = Instant::now();
+            match studio.downloads.plan_of(&studio, id, None) {
+                Ok(p) => {
+                    let gb = |k: &str| p.get(k).and_then(Json::as_i64).unwrap_or(0) as f64 / 1e9;
+                    println!("{id}: {:.2} GB to download, {:.2} GB elsewhere here, {:.2} GB in place ({:.1} s)", gb("download_bytes"), gb("elsewhere_bytes"), gb("here_bytes"), started.elapsed().as_secs_f64());
+                    for f in p.get("files").and_then(Json::as_array).unwrap_or(&[]) {
+                        println!("  {:<10} {:>8.2} GB  {}  {}", str_or(f, "status", ""), f.get("size").and_then(Json::as_i64).unwrap_or(0) as f64 / 1e9, str_or(f, "path", ""), str_or(f, "from", ""));
+                    }
+                }
+                Err(e) => println!("{id}: {e}"),
+            }
+        }
+    }
+
     /// A real download of a small model (BiRefNet's config) with curl, into a temp folder.
     /// cargo test --release -p oaiy-studio downloads -- --ignored --nocapture
     #[test]
@@ -917,15 +1176,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let e = Json::parse(br#"{"id":"t","parts":[{"repo":"ZhengPeng7/BiRefNet","include":["config.json","BiRefNet_config.py"],"into":"BiRefNet"}]}"#).unwrap();
         let cfg = crate::config::default_json();
-        let files = plan(&cfg, &e, &dir).unwrap();
+        let files = plan(&cfg, &e, &dir, None).unwrap();
         assert_eq!(files.len(), 2);
         let d = Downloads::new();
-        d.list.lock().unwrap().push(Download { id: "t".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new() });
+        d.list.lock().unwrap().push(Download { id: "t".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, token: None });
         for f in &files {
             std::fs::create_dir_all(f.dest.parent().unwrap()).unwrap();
             // Half a file first, as a pause leaves it; curl carries on from there.
             if let Some(s) = f.size {
-                let whole = curl_text(&cfg, &f.url, true, false).unwrap();
+                let whole = curl_text(&cfg, &f.url, None, false).unwrap();
                 assert_eq!(whole.len() as u64, s);
                 std::fs::write(part_path(&f.dest), &whole.as_bytes()[..(s / 2) as usize]).unwrap();
             }

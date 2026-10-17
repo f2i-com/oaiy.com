@@ -423,7 +423,7 @@ fn every_tool_is_declared_for_a_model() {
     names.dedup();
     assert_eq!(names.len(), defs.len(), "names are unique");
     for want in [
-        "status", "models_list", "model_download_status", "model_set_default", "model_download", "engine_start", "engine_stop", "engine_restart",
+        "status", "models_list", "model_download_status", "model_set_default", "model_download_plan", "model_download", "engine_start", "engine_stop", "engine_restart",
         "ai_sources_list", "agent_model_set", "chatgpt_sign_in", "chatgpt_sign_out", "services_list", "service_logs", "service_install",
         "service_start", "service_stop", "service_uninstall", "plugins_list", "plugin_catalog", "plugin_settings_get", "plugin_setup_status",
         "plugin_install", "plugin_enable", "plugin_disable", "plugin_uninstall", "plugin_settings_set", "plugin_command", "plugin_setup_open",
@@ -855,6 +855,44 @@ async fn network_status_reads_the_network_and_its_workers_models() {
     );
     assert_eq!(v["agentMaySetUp"], false, "{r}");
     assert!(!r.to_string().contains("cc dd") && !r.to_string().contains("aa bb"), "no certificates: {r}");
+}
+
+/// What getting a model takes, in words and in parts: what is downloaded, what this computer has already (used where
+/// it is), and that a gated model needs its licence and a token first; a download says what it found here.
+#[tokio::test]
+async fn a_models_plan_says_what_is_here_already_and_what_is_left_to_fetch() {
+    #[derive(serde::Deserialize)]
+    struct Q {
+        plan: Option<String>,
+    }
+    let sb = Sandbox::new("download-plan");
+    let desk = Router::new().route(
+        "/api/engines/downloads",
+        get(|axum::extract::Query(q): axum::extract::Query<Q>| async move {
+            match q.plan.as_deref() {
+                Some("flux-3-image-klein") => Json(json!({
+                    "id": "flux-3-image-klein", "name": "FLUX 3 Image Klein", "gated": true, "token": false, "free": 400_000_000_000u64,
+                    "hereBytes": 0, "elsewhereBytes": 9_700_000_000u64, "downloadBytes": 10_600_000_000u64, "needs": [],
+                    "files": [
+                        { "path": "flux-3-image-klein/model.safetensors", "size": 10_600_000_000u64, "status": "download" },
+                        { "path": "flux-3-image-klein/text_encoder/model.safetensors", "size": 9_700_000_000u64, "status": "elsewhere", "from": "/Volumes/T9/flux-3/text_encoder/model.safetensors", "checked": true }
+                    ]
+                })),
+                _ => Json(json!({ "running": true, "downloads": [{ "id": "moss-image-sft-q4", "status": "done", "done": 9, "total": 9, "reused": 9_700_000_000u64, "reused_files": 1, "added": ["image model moss-image-sft-q4"] }] })),
+            }
+        }),
+    );
+    let (_, app) = control_with(&sb, Some(desk), None);
+    let r = call(&app, None, "model_download_plan", json!({ "catalogId": "flux-3-image-klein" })).await;
+    assert!(!is_error(&r), "{r}");
+    let said = text(&r);
+    assert!(said.contains("10.6 GB to download") && said.contains("9.7 GB on this computer already"), "{said}");
+    assert!(said.contains("gated") && said.contains("Hugging Face token in Settings"), "{said}");
+    let v = &r["structuredContent"];
+    assert_eq!(v["files"][1]["status"], "elsewhere", "{r}");
+    assert_eq!(v["files"][1]["from"], "/Volumes/T9/flux-3/text_encoder/model.safetensors", "{r}");
+    let r = call(&app, None, "model_download_status", json!({})).await;
+    assert_eq!(r["structuredContent"]["downloads"][0]["reusedGb"], 9.7, "{r}");
 }
 
 /// The Agent sets OAIY Network up only where the person lets it (`agent` on the network's settings): refused otherwise.

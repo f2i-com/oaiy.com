@@ -755,11 +755,11 @@ export default function SettingsPanel() {
       <section className="model-section">
         <h3 className="section-title">HuggingFace token</h3>
         <p className="form-hint">
-          Some models are gated or private (Llama, some Gemma releases). Paste
+          Some models are gated or private (FLUX 3, Llama, some Gemma releases). Paste
           an access token from{' '}
           <code className="path-code">huggingface.co/settings/tokens</code> (and
           accept the model's terms on its HF page) so OAIY can download
-          them. Stored locally; only ever sent to huggingface.co.
+          them, here and in Engines. Stored locally; only ever sent to huggingface.co.
         </p>
         <div className="settings-row settings-row-flat">
           <span className="settings-label">Status</span>

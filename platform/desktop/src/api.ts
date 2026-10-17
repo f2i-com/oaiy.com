@@ -2033,6 +2033,28 @@ export interface EngineDownload {
   /** Bytes a second, as the engines measure it (smoothed, to a tenth); 0 while nothing is moving. */
   speed?: number;
   error?: string | null;
+  /** What it added: a model, and what it still needs (`image model x (needs vae)`). */
+  added?: string[];
+  /** The bytes and files this computer had already, used where they are rather than downloaded. */
+  reused?: number;
+  reusedFiles?: number;
+}
+
+/** What getting a catalog model takes, before it is got. */
+export interface EnginePlan {
+  id: string;
+  name: string;
+  /** Its licence is accepted on huggingface.co first, with a Hugging Face token (`token`: one is set). */
+  gated: boolean;
+  token: boolean;
+  free?: number | null;
+  hereBytes: number;
+  /** On this computer already elsewhere (another model's, another drive's): used where it is. */
+  elsewhereBytes: number;
+  downloadBytes: number;
+  /** Catalog models it needs that are not here yet. */
+  needs: string[];
+  files: Array<{ path: string; size?: number | null; status: 'here' | 'elsewhere' | 'download'; from?: string | null; checked?: boolean }>;
 }
 
 /** One model of the engines' catalog. */
@@ -2052,6 +2074,8 @@ export interface EngineCatalogModel {
   /** The GPUs it takes, when more than one. */
   gpuCount?: number | null;
   needs: string[];
+  /** Its licence is accepted on huggingface.co first, and a Hugging Face token added in Settings. */
+  gated?: boolean;
   installed: boolean;
   partial: boolean;
   download: EngineDownload | null;
@@ -2083,7 +2107,9 @@ export const engines = {
   /** The catalog and the models chosen in Engines. */
   catalog: () => request<EngineCatalog>('/api/engines/catalog'),
   downloads: () => request<{ running: boolean; downloads: EngineDownload[]; error?: string }>('/api/engines/downloads'),
-  /** Download a catalog model into the engines' own folder. */
+  /** What getting a catalog model takes: its files here already, on this computer elsewhere, or to download. */
+  plan: (id: string) => request<EnginePlan>(`/api/engines/downloads?plan=${encodeURIComponent(id)}`),
+  /** Download a catalog model into the engines' own folder (every part it needs; none this computer has already). */
   download: (id: string) =>
     request<{ running: boolean; downloads: EngineDownload[] }>('/api/engines/downloads', { method: 'POST', body: JSON.stringify({ id }) }),
   /** A native picker for a language model file (.gguf); `null` when it was closed. The desktop's window only. */

@@ -123,13 +123,16 @@ fn field_of(d: &Detected, key: &str) -> Option<Json> {
     d.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
-/// The part named by `missing` for a new entry: from another configured model
-/// of the same kind first, then from files near the picked one.
+/// The part named by `missing` for a new entry: from the files near the picked one first (what came with it: a
+/// downloaded model's own VAE and text encoder), then from another configured model of the same kind.
 fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Path) -> Option<Json> {
     let arch = str_or(entry, "architecture", "");
     let family = str_or(entry, "family", "");
     // LTX 2.3 and its fine-tunes share Gemma 3; LTX 2.5 has its own encoder.
     let same_group = |f: &str| (f == "ltx-2.5") == (family == "ltx-2.5");
+    if let Some(v) = companion_nearby(section, &arch, family, missing, picked) {
+        return Some(v);
+    }
     for (_, other) in get(cfg, &["media", section, "models"]).map(|m| m.members().collect::<Vec<_>>()).unwrap_or_default() {
         let compatible = match section {
             "image" => str_or(other, "architecture", "qwen-image") == arch,
@@ -139,6 +142,11 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
             return Some(v.clone());
         }
     }
+    None
+}
+
+/// The part named by `missing` among the files near `picked`.
+fn companion_nearby(section: &str, arch: &str, family: &str, missing: &str, picked: &Path) -> Option<Json> {
     let want: &dyn Fn(&Detected) -> bool = match (section, missing) {
         ("image", "base") => &|d| d.format == "diffusers" && field_of(d, "base").is_some(),
         ("image", "tokenizer") if arch == "flux2-klein-4b" => &|d| d.kind() == "klein_tokenizer",

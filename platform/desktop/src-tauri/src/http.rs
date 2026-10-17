@@ -937,6 +937,10 @@ fn engine_download(d: &serde_json::Value) -> serde_json::Value {
         "filesTotal": d.get("files_total"),
         "speed": d.get("speed"),
         "error": d.get("error"),
+        // What it added (a model, and what it still needs, "(needs …)"), and what was on this computer already.
+        "added": d.get("added").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "reused": d.get("reused"),
+        "reusedFiles": d.get("reused_files"),
     })
 }
 
@@ -957,6 +961,8 @@ fn engine_model(m: &serde_json::Value) -> serde_json::Value {
         "ramGb": m.get("ram_gb"),
         "gpuCount": m.get("gpu_count"),
         "needs": m.get("needs").cloned().unwrap_or_else(|| serde_json::json!([])),
+        // Its licence is accepted on huggingface.co first, and a Hugging Face token added (Settings).
+        "gated": m.get("gated").and_then(|r| r.as_bool()).unwrap_or(false),
         "installed": m.get("installed").and_then(|r| r.as_bool()).unwrap_or(false),
         "partial": m.get("partial").and_then(|r| r.as_bool()).unwrap_or(false),
         "download": engine_download(m.get("download").unwrap_or(&serde_json::Value::Null)),
@@ -1022,14 +1028,52 @@ fn catalog_id(id: &str) -> bool {
 }
 
 /// Start downloading catalog model `id` at `ui`, into the engines' own
-/// download folder (no folder is ever passed on).
-pub(crate) async fn engines_download_at(ui: Option<String>, id: &str) -> Result<serde_json::Value, (u16, String)> {
+/// download folder (no folder is ever passed on); `token`: the Hugging Face
+/// token from this desktop's Settings, for this download alone.
+pub(crate) async fn engines_download_at(ui: Option<String>, id: &str, token: Option<String>) -> Result<serde_json::Value, (u16, String)> {
     if !catalog_id(id) {
         return Err((400, format!("{id:?} is not a catalog model id")));
     }
     let ui = ui.ok_or((409, ENGINES_NOT_RUNNING.to_string()))?;
-    let state = studio_json(&ui, reqwest::Method::POST, "/api/downloads", Some(serde_json::json!({ "id": id }))).await?;
+    let mut body = serde_json::json!({ "id": id });
+    if let Some(t) = token {
+        body["hf_token"] = serde_json::Value::String(t);
+    }
+    let state = studio_json(&ui, reqwest::Method::POST, "/api/downloads", Some(body)).await?;
     Ok(serde_json::json!({ "running": true, "downloads": engine_downloads(&state) }))
+}
+
+/// What getting catalog model `id` at `ui` takes: each of its files here already, on this computer elsewhere (used
+/// where it is, not downloaded again), or to download, with the bytes of each (the engines' plan, camelCase).
+pub(crate) async fn engines_plan_at(ui: Option<String>, id: &str, token: Option<String>) -> Result<serde_json::Value, (u16, String)> {
+    if !catalog_id(id) {
+        return Err((400, format!("{id:?} is not a catalog model id")));
+    }
+    let ui = ui.ok_or((409, ENGINES_NOT_RUNNING.to_string()))?;
+    let mut body = serde_json::json!({ "id": id });
+    if let Some(t) = token {
+        body["hf_token"] = serde_json::Value::String(t);
+    }
+    let p = studio_json(&ui, reqwest::Method::POST, "/api/downloads/plan", Some(body)).await?;
+    let files: Vec<serde_json::Value> = p
+        .get("files")
+        .and_then(|f| f.as_array())
+        .into_iter()
+        .flatten()
+        .map(|f| serde_json::json!({ "path": f.get("path"), "size": f.get("size"), "status": f.get("status"), "from": f.get("from"), "checked": f.get("checked") }))
+        .collect();
+    Ok(serde_json::json!({
+        "id": p.get("id"),
+        "name": p.get("name"),
+        "gated": p.get("gated"),
+        "token": p.get("token"),
+        "free": p.get("free"),
+        "hereBytes": p.get("here_bytes"),
+        "elsewhereBytes": p.get("elsewhere_bytes"),
+        "downloadBytes": p.get("download_bytes"),
+        "needs": p.get("needs"),
+        "files": files,
+    }))
 }
 
 /// `GET /api/engines/catalog`
@@ -1037,9 +1081,21 @@ async fn engines_catalog() -> axum::response::Response {
     Json(engines_catalog_at(engines_ui()).await).into_response()
 }
 
-/// `GET /api/engines/downloads`
-async fn engines_downloads() -> axum::response::Response {
-    Json(engines_downloads_at(engines_ui()).await).into_response()
+#[derive(Deserialize)]
+struct EngineDownloadsQuery {
+    /// A catalog model: what getting it takes, in place of the downloads.
+    plan: Option<String>,
+}
+
+/// `GET /api/engines/downloads` (`?plan=<id>`: what getting that model takes, [`engines_plan_at`])
+async fn engines_downloads(State(st): State<AppState>, Query(q): Query<EngineDownloadsQuery>) -> axum::response::Response {
+    let Some(id) = q.plan.as_deref().map(str::trim).filter(|i| !i.is_empty()) else {
+        return Json(engines_downloads_at(engines_ui()).await).into_response();
+    };
+    match engines_plan_at(engines_ui(), id, st.downloads.token()).await {
+        Ok(v) => Json(v).into_response(),
+        Err((status, message)) => (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), Json(serde_json::json!({ "error": message }))).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1048,9 +1104,10 @@ struct EngineDownloadBody {
     id: String,
 }
 
-/// `POST /api/engines/downloads {id}`: download a model from the engines' catalog.
-async fn engines_download_start(Json(body): Json<EngineDownloadBody>) -> axum::response::Response {
-    match engines_download_at(engines_ui(), body.id.trim()).await {
+/// `POST /api/engines/downloads {id}`: download a model from the engines' catalog (with this desktop's Hugging Face
+/// token, for a gated one).
+async fn engines_download_start(State(st): State<AppState>, Json(body): Json<EngineDownloadBody>) -> axum::response::Response {
+    match engines_download_at(engines_ui(), body.id.trim(), st.downloads.token()).await {
         Ok(v) => Json(v).into_response(),
         Err((status, message)) => (
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -1774,6 +1831,8 @@ pub async fn serve(
         .route("/api/models/downloads/:id/resume", post(resume_download))
         .route("/api/models/downloads/:id/cancel", post(cancel_download))
         .route("/api/models/:name", delete(delete_model))
+        // (the engines' downloads, with this desktop's Hugging Face token: from its state)
+        .route("/api/engines/downloads", get(engines_downloads).post(engines_download_start))
         // python
         .route("/api/node", get(node_status))
         .route("/api/node/install", post(install_node))
@@ -1803,7 +1862,6 @@ pub async fn serve(
         .merge(setup_routes)
         .route("/api/engines", axum::routing::get(engines_status))
         .route("/api/engines/catalog", axum::routing::get(engines_catalog))
-        .route("/api/engines/downloads", axum::routing::get(engines_downloads).post(engines_download_start))
         .merge(companion_routes)
         .merge(link_routes)
         .merge(ai_routes)
@@ -2840,16 +2898,16 @@ mod tests {
         assert_eq!(v["downloads"].as_array().unwrap().len(), 1, "only the models downloading");
         assert_eq!(v["downloads"][0]["status"], "downloading");
 
-        let v = super::engines_download_at(Some(ui.clone()), "qwen3.5-9b").await.unwrap();
+        let v = super::engines_download_at(Some(ui.clone()), "qwen3.5-9b", None).await.unwrap();
         assert_eq!(v["downloads"][0]["id"], "qwen3.5-9b");
         // The engines' own folder: no folder is ever passed on.
         assert_eq!(asked.lock().unwrap().last().unwrap(), &serde_json::json!({ "id": "qwen3.5-9b" }));
 
-        let refused = super::engines_download_at(Some(ui.clone()), "nope").await.unwrap_err();
+        let refused = super::engines_download_at(Some(ui.clone()), "nope", None).await.unwrap_err();
         assert_eq!(refused, (400, "no model nope in the catalog".to_string()));
         let before = asked.lock().unwrap().len();
         for bad in ["", "../x", "a b", "x/y"] {
-            assert_eq!(super::engines_download_at(Some(ui.clone()), bad).await.unwrap_err().0, 400, "{bad:?}");
+            assert_eq!(super::engines_download_at(Some(ui.clone()), bad, None).await.unwrap_err().0, 400, "{bad:?}");
         }
         assert_eq!(asked.lock().unwrap().len(), before, "a bad id never reaches the engines");
         server.abort();
@@ -2859,7 +2917,7 @@ mod tests {
     async fn with_no_engines_the_relay_says_so() {
         assert_eq!(super::engines_catalog_at(None).await["running"], false);
         assert_eq!(super::engines_downloads_at(None).await["downloads"], serde_json::json!([]));
-        assert_eq!(super::engines_download_at(None, "qwen3.5-9b").await.unwrap_err().0, 409);
+        assert_eq!(super::engines_download_at(None, "qwen3.5-9b", None).await.unwrap_err().0, 409);
         // Engines that went away since: not running, and why.
         let v = super::engines_catalog_at(Some("http://127.0.0.1:9".into())).await;
         assert_eq!(v["running"], false);

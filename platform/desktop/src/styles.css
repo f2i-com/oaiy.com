@@ -2153,3 +2153,15 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .flow-run-item-head .btn-tiny { margin-left: auto; height: 24px; }
 .network-found-hardware { color: var(--muted); font-size: 12px; }
 .network-way-auto { display: inline-flex; align-items: center; gap: 4px; color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); }
+
+/* What getting a model takes: to download, here already (used where it is), its files. */
+.download-plan { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.download-plan-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; color: var(--text); font-size: 12.5px; }
+.download-plan-line > svg { color: var(--primary); }
+.download-plan-have { display: inline-flex; align-items: center; gap: 4px; color: var(--green); font-size: 12px; }
+.download-plan-parts summary { cursor: pointer; color: var(--muted); font-size: 11.5px; }
+.download-plan-parts ul { display: flex; flex-direction: column; gap: 3px; margin: 6px 0 0; padding: 0; list-style: none; }
+.download-plan-parts li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 10px; font-size: 11.5px; color: var(--muted); }
+.download-plan-parts li code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; background: transparent; padding: 0; color: var(--text); font-family: var(--font-mono); font-size: 11px; }
+.download-plan-status { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.download-plan-parts li.is-elsewhere .download-plan-status, .download-plan-parts li.is-here .download-plan-status { color: var(--green); }

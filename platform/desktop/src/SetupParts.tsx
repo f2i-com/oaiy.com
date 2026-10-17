@@ -11,6 +11,7 @@ import {
   type EngineCatalog,
   type EngineCatalogModel,
   type EngineDownload,
+  type EnginePlan,
   type ServiceSnapshot,
 } from './api';
 import { chosenModel, groupModels, recommendedModel, type StepState } from './setupFlow';
@@ -381,8 +382,60 @@ export function DownloadProgress({ name, dl }: { name: string; dl: EngineDownloa
         {dl.status === 'queued' ? 'Waiting to start…' : dl.status === 'adding' ? 'Adding it to Engines…' : `${formatBytes(dl.done)} of ${formatBytes(dl.total)}`}
         {dl.speed ? ` · ${formatSpeed(dl.speed)}` : ''}
         {dl.filesTotal && dl.filesTotal > 1 ? ` · file ${Math.min((dl.filesDone ?? 0) + 1, dl.filesTotal)} of ${dl.filesTotal}` : ''}
+        {dl.reused ? ` · ${formatBytes(dl.reused)} found on this computer` : ''}
       </small>
+      {/* (looking for its files on this computer, or checking one: said, as it takes a while for a large file) */}
+      {dl.file && /^(checking|looking)/.test(dl.file) && <small className="form-hint">{dl.file[0].toUpperCase() + dl.file.slice(1)}…</small>}
     </span>
+  );
+}
+
+/**
+ * What getting a model takes, before it is got: the gigabytes to download, those this computer has already (another
+ * model's text encoder or VAE, a copy on another drive: used where they are, never downloaded twice), and for a
+ * gated model, its licence and a Hugging Face token first. Each part listed under it.
+ */
+export function DownloadPlan({ plan }: { plan: EnginePlan }) {
+  const short = (path: string) => path.split('/').slice(-2).join('/');
+  const tight = plan.free != null && plan.downloadBytes + (1 << 30) > plan.free;
+  return (
+    <div className="download-plan" data-testid="download-plan">
+      <span className="download-plan-line">
+        <Download size={13} aria-hidden /> <strong>{formatBytes(plan.downloadBytes)}</strong> to download
+        {plan.elsewhereBytes > 0 && (
+          <span className="download-plan-have">
+            <Check size={12} aria-hidden /> {formatBytes(plan.elsewhereBytes)} on this computer already, used where it is
+          </span>
+        )}
+        {plan.hereBytes > 0 && <span className="download-plan-have">{formatBytes(plan.hereBytes)} in place</span>}
+      </span>
+      {plan.gated && !plan.token && (
+        <span className="card-warn">
+          <TriangleAlert size={12} aria-hidden /> {plan.name} is gated: accept its licence on huggingface.co, then add a Hugging Face token in Settings.
+        </span>
+      )}
+      {tight && (
+        <span className="card-warn">
+          <TriangleAlert size={12} aria-hidden /> The drive has {formatBytes(plan.free)} free: make room first.
+        </span>
+      )}
+      {plan.files.length > 1 && (
+        <details className="download-plan-parts">
+          <summary>Its {plan.files.length} files</summary>
+          <ul>
+            {plan.files.map((f) => (
+              <li key={f.path} className={`is-${f.status}`}>
+                <code>{short(f.path)}</code>
+                <span>{f.size ? formatBytes(f.size) : ''}</span>
+                <span className="download-plan-status">
+                  {f.status === 'download' ? 'to download' : f.status === 'here' ? 'in place' : `on this computer${f.from ? `: ${f.from}` : ''}`}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
   );
 }
 
@@ -473,6 +526,8 @@ export function EngineModelCard({
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<string | null>(null);
   const [added, setAdded] = useState<AddedModelFile | null>(null);
+  const [plan, setPlan] = useState<EnginePlan | null>(null);
+  const [planError, setPlanError] = useState<string | null>(null);
   const chosen = chosenModel(catalog, group);
   const options = chosen ? [] : groupModels(catalog, group);
   // A download under way holds the choice: it is the one shown, and the others wait.
@@ -485,6 +540,21 @@ export function EngineModelCard({
     setAdded(a);
     onChanged();
   };
+  // What getting the model offered takes (its files here already, elsewhere on this computer, or to download).
+  const planFor = offer && !offer.installed && catalog?.running && !(dl && ACTIVE.has(dl.status)) ? offer.id : null;
+  useEffect(() => {
+    setPlan(null);
+    setPlanError(null);
+    if (!planFor) return;
+    let gone = false;
+    engines
+      .plan(planFor)
+      .then((p) => !gone && setPlan(p))
+      .catch((e: unknown) => !gone && setPlanError(errorText(e)));
+    return () => {
+      gone = true;
+    };
+  }, [planFor]);
 
   const download = async () => {
     if (!offer) return;
@@ -553,16 +623,29 @@ export function EngineModelCard({
           })}
         </div>
         {llm && options.length > 1 && <small className="form-hint">The Agent works OAIY with tools, which it can use with the models marked Agent tools; with the others it chats only.</small>}
+        {plan && planFor === plan.id && <DownloadPlan plan={plan} />}
+        {!plan && planError && <p className="card-warn">{planError}</p>}
+        {!plan && !planError && planFor && offer.gated && <p className="form-hint">It is gated: its licence is accepted on huggingface.co first, with a Hugging Face token in Settings.</p>}
         {dl && ACTIVE.has(dl.status) && <DownloadProgress name={offer.name} dl={dl} />}
         {dl?.status === 'failed' && dl.error && <p className="card-warn">{dl.error}</p>}
-        {offer.installed && <p className="form-hint">Downloaded. Choose it in Engines to use it.</p>}
+        {offer.installed && (
+          <p className="form-hint">
+            Downloaded{dl?.reused ? `: ${formatBytes(dl.reused)} of it was on this computer already, used where it is` : ''}. Choose it in Engines to use it.
+          </p>
+        )}
+        {dl?.status === 'done' && (dl.added ?? []).filter((a) => a.includes('(needs ')).map((a) => (
+          <p key={a} className="card-warn">
+            <TriangleAlert size={12} aria-hidden /> Added as {a}: add what it still needs in Engines.
+          </p>
+        ))}
         {ownFile && <OwnModelFile onAdded={addedFile} />}
       </div>
     );
     if (!offer.installed && !(dl && ACTIVE.has(dl.status)))
       action = (
         <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void download()}>
-          {busy ? <Loader2 size={14} className="spin" /> : <Download size={14} />} {dl?.status === 'failed' ? 'Try again' : `Download${offer.sizeGb ? ` (${offer.sizeGb} GB)` : ''}`}
+          {busy ? <Loader2 size={14} className="spin" /> : <Download size={14} />}{' '}
+          {dl?.status === 'failed' ? 'Try again' : plan && planFor === plan.id ? (plan.downloadBytes > 0 ? `Download (${formatBytes(plan.downloadBytes)})` : 'Add it (all here)') : `Download${offer.sizeGb ? ` (${offer.sizeGb} GB)` : ''}`}
         </button>
       );
   }

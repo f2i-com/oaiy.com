@@ -238,9 +238,16 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             Ok(crate::resources::snapshot(studio))
         })(),
         ("GET", "/api/downloads") => Ok(studio.downloads.state(studio)),
+        // (`hf_token`: one for this download alone, the desktop's from its Settings; never kept or said back)
         ("POST", "/api/downloads") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);
-            studio.downloads.start(studio, str_or(&b, "id", ""), dir).map_err(|e| (400, e))
+            let token = Some(str_or(&b, "hf_token", "").trim().to_string()).filter(|t| !t.is_empty());
+            studio.downloads.start(studio, str_or(&b, "id", ""), dir, token).map_err(|e| (400, e))
+        }),
+        // What getting a model takes: its files here already, on this computer elsewhere, or to download.
+        ("POST", "/api/downloads/plan") => body(req).map_err(|e| (400, e)).and_then(|b| {
+            let token = Some(str_or(&b, "hf_token", "").trim().to_string()).filter(|t| !t.is_empty());
+            studio.downloads.plan_of(studio, str_or(&b, "id", ""), token).map_err(|e| (400, e))
         }),
         ("POST", "/api/downloads/pause") => body(req).map_err(|e| (400, e)).map(|b| studio.downloads.pause(studio, str_or(&b, "id", ""))),
         ("POST", "/api/downloads/cancel") => body(req).map_err(|e| (400, e)).map(|b| studio.downloads.cancel(studio, str_or(&b, "id", ""))),

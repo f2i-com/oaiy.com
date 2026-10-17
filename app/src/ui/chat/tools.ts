@@ -83,6 +83,7 @@ const TOOLS: Record<string, [string, string]> = {
   models_list: ['Looked at the models', 'cpu'],
   model_download_status: ['Checked the downloads', 'arrow-down'],
   model_set_default: ['Chose a model', 'cpu'],
+  model_download_plan: ['Checked what a model needs', 'arrow-down'],
   model_download: ['Started a download', 'arrow-down'],
   engine_start: ['Started the engine', 'power'],
   engine_stop: ['Stopped the engine', 'power'],

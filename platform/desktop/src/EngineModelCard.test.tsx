@@ -7,11 +7,11 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const m = vi.hoisted(() => ({ download: vi.fn() }));
+const m = vi.hoisted(() => ({ download: vi.fn(), plan: vi.fn() }));
 
 vi.mock('./api', async (importOriginal) => {
   const real = await importOriginal<typeof import('./api')>();
-  return { ...real, engines: { ...real.engines, download: m.download } };
+  return { ...real, engines: { ...real.engines, download: m.download, plan: m.plan } };
 });
 
 import { EngineModelCard } from './SetupParts';
@@ -78,6 +78,8 @@ const type = async (input: HTMLInputElement, value: string) => {
 
 beforeEach(() => {
   m.download.mockReset().mockResolvedValue({ running: true, downloads: [] });
+  // (what a download takes: not answered unless a test says, so the catalog's size is shown)
+  m.plan.mockReset().mockReturnValue(new Promise(() => {}));
   invoke.mockReset();
   onChanged.mockReset();
   (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
@@ -191,5 +193,31 @@ describe('the engine model card, with nothing chosen in Engines', () => {
     expect(options()[0].querySelector('input')).toBeNull();
     expect(host.textContent).toContain('The catalog recommends:');
     expect(host.textContent).not.toContain('Agent tools');
+  });
+
+  it("says what a download takes before it starts: what this computer has already, used where it is, and a gated model's token", async () => {
+    m.plan.mockResolvedValue({
+      id: 'qwen3.5-9b',
+      name: 'Qwen3.5 9B',
+      gated: true,
+      token: false,
+      free: 400e9,
+      hereBytes: 0,
+      elsewhereBytes: 5.2e9,
+      downloadBytes: 0.5e9,
+      needs: [],
+      files: [
+        { path: 'Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf', size: 5.2e9, status: 'elsewhere', from: '/Volumes/T9/qwen/Qwen3.5-9B-Q4_K_M.gguf', checked: true },
+        { path: 'Qwen3.5-9B-GGUF/mmproj.gguf', size: 0.5e9, status: 'download' },
+      ],
+    });
+    await render();
+    expect(m.plan).toHaveBeenCalledWith('qwen3.5-9b');
+    const plan = host.querySelector('[data-testid="download-plan"]')!;
+    expect(plan.textContent).toContain('to download');
+    expect(plan.textContent).toContain('on this computer already, used where it is');
+    expect(plan.textContent).toContain('/Volumes/T9/qwen/Qwen3.5-9B-Q4_K_M.gguf');
+    expect(plan.textContent).toContain('is gated: accept its licence on huggingface.co, then add a Hugging Face token in Settings');
+    expect(button(/^Download \(/)!.textContent).toContain('476.8 MiB');
   });
 });
