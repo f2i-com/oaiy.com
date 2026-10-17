@@ -104,6 +104,17 @@ pub(super) async fn read_capped_with_limit(resp: reqwest::Response, limit: u64) 
     Ok(out)
 }
 
+/// The client for `provider`: OAIY's own engine's waits while it loads its model (see `egress::engine_client`),
+/// every other provider's the usual limits.
+fn client_for(provider: &AiProvider, streaming: bool, direct: bool) -> Result<reqwest::Client, GatewayError> {
+    if provider.id == super::routes::ENGINE_PROVIDER_ID {
+        egress::engine_client(streaming)
+    } else {
+        egress::provider_client(streaming, direct)
+    }
+    .map_err(GatewayError::Upstream)
+}
+
 /// Non-streaming chat. Returns an OpenAI `chat.completion` JSON regardless of the
 /// provider's protocol.
 pub async fn chat(provider: &AiProvider, body: Value) -> Result<Value, GatewayError> {
@@ -131,7 +142,7 @@ async fn chat_buffered(provider: &AiProvider, mut body: Value, max_response_byte
         Protocol::Anthropic => openai_chat_to_anthropic(&body),
     };
 
-    let client = egress::provider_client(false, direct).map_err(GatewayError::Upstream)?;
+    let client = client_for(provider, false, direct)?;
     let rb = apply_auth(with_json_body(client.post(target), &out_body)?, provider, key.as_deref());
     let resp = rb
         .send()
@@ -185,7 +196,7 @@ pub async fn chat_stream(provider: &AiProvider, mut body: Value) -> Result<reqwe
     let key = provider.api_key.clone();
     let target = egress::validate(&provider.base_url, "/v1/chat/completions", provider.allow_local)
         .map_err(GatewayError::BadRequest)?;
-    let client = egress::client(true).map_err(GatewayError::Upstream)?;
+    let client = client_for(provider, true, false)?;
     let rb = apply_auth(with_json_body(client.post(target), &body)?, provider, key.as_deref());
     let resp = rb
         .send()

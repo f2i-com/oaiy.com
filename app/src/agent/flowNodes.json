@@ -1736,6 +1736,10 @@
    {
     "id": "image",
     "type": "image"
+   },
+   {
+    "id": "info",
+    "type": "object"
    }
   ],
   "properties": [
@@ -1844,6 +1848,15 @@
     "id": "steps",
     "type": "number",
     "default": 20
+   },
+   {
+    "id": "seed",
+    "type": "number"
+   },
+   {
+    "id": "release",
+    "type": "boolean",
+    "default": false
    },
    {
     "id": "imageInputCount",

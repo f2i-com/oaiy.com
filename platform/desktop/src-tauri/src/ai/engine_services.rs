@@ -37,7 +37,7 @@ pub const GATEWAY_PREFIX: &str = "/api/ai/engine/gateway";
 /// Pictures, video and 3D models come in as data: URLs.
 const FORWARD_BODY_LIMIT: usize = 96 << 20;
 /// The gateway routes a flow may reach through the desktop.
-const MEDIA_TARGETS: [&str; 10] = ["images", "edits", "videos", "speech", "voices", "music", "sound", "model3d", "background", "upscale"];
+const MEDIA_TARGETS: [&str; 11] = ["images", "edits", "videos", "speech", "voices", "music", "sound", "model3d", "background", "upscale", "files"];
 
 /// A job's sub-routes, below its endpoint (`{id}` is the job's id).
 struct Job {
@@ -85,7 +85,7 @@ const KINDS: [Kind; 8] = [
         icon: "🎨",
         what: "Pictures from a prompt; with reference pictures, edits",
         node_types: &["image_gen", "service_call"],
-        body: r#"{"model": {{model}}, "prompt": {{prompt}}, "negative_prompt": {{negative_prompt}}, "size": {{size}}, "images": {{images}}, "seed": {{seed}}, "n": 1, "response_format": "b64_json"}"#,
+        body: r#"{"model": {{model}}, "prompt": {{prompt}}, "negative_prompt": {{negative_prompt}}, "size": {{size}}, "images": {{images}}, "seed": {{seed}}, "release": {{release}}, "n": 1, "response_format": "b64_json"}"#,
         response_type: "json",
         response_path: "data.0.b64_json",
         output: "image",
@@ -344,6 +344,12 @@ fn media_entry(k: &Kind, path: &str, m: &Value) -> Value {
         "outputFormat": k.format,
         "inputs": k.inputs.iter().map(|(id, name, ty)| json!({ "id": id, "name": name, "type": ty })).collect::<Vec<_>>(),
     });
+    // (a picture's provenance beside it: its file's URL, seed, model and each stage's time)
+    if k.output == "image" && k.response_path == "data.0.b64_json" {
+        e["infoPath"] = json!("data.0.oaiy");
+        // (and where that file is fetched: through here, with the caller's own credential)
+        e["filesUrl"] = json!(format!("{GATEWAY_PREFIX}/files"));
+    }
     if let Some(j) = &k.job {
         let at = |sub: &str| format!("{endpoint}{sub}");
         e["job"] = json!({
@@ -385,6 +391,10 @@ async fn forward_to(gateway: &str, discovery: &Value, req: Request) -> Response 
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     if !forwardable(discovery, &path) {
         return ai_error(StatusCode::NOT_FOUND, "not_forwarded", format!("{path} is not one of the engine's media routes"));
+    }
+    // The engine's files (the pictures and videos it made) are only read.
+    if method != "GET" && endpoint_path(discovery, "files").is_some_and(|p| path == p || path.starts_with(&format!("{p}/"))) {
+        return ai_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", format!("{method} is not forwarded"));
     }
     let content_type = req.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let range = req.headers().get(axum::http::header::RANGE).and_then(|v| v.to_str().ok()).map(str::to_owned);
@@ -514,8 +524,26 @@ mod tests {
         assert!(forwardable(&d, "/v1/images/background_removal"));
         assert!(!forwardable(&d, "/v1/audio/musicx"));
         assert!(!forwardable(&d, "/v1/chat/completions"), "the language model goes through the provider");
-        assert!(!forwardable(&d, "/files/a.png"));
+        assert!(forwardable(&d, "/files/images/a.png"), "the engine's pictures, read with the caller's own credential");
+        assert!(!forwardable(&d, "/filesx/a.png"));
         assert!(!forwardable(&d, "/oaiy/images"), "the OAIY-dialect route is not one of the contracts");
+    }
+
+    #[tokio::test]
+    async fn the_engines_files_are_only_read() {
+        // (nothing listens on the discard port: a call that got through would be a 502, not a 405)
+        let post = Request::builder().method("POST").uri(format!("{GATEWAY_PREFIX}/files/images/a.png")).body(Body::empty()).unwrap();
+        assert_eq!(forward_to("http://127.0.0.1:9", &discovery(), post).await.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let get = Request::builder().method("GET").uri(format!("{GATEWAY_PREFIX}/files/images/a.png")).body(Body::empty()).unwrap();
+        assert_eq!(forward_to("http://127.0.0.1:9", &discovery(), get).await.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn a_picture_says_where_its_file_is_fetched() {
+        let image = services_from_discovery(&discovery()).into_iter().find(|s| s["id"] == "engine:image:qwen").unwrap();
+        assert_eq!(image["infoPath"], "data.0.oaiy");
+        assert_eq!(image["filesUrl"], "/api/ai/engine/gateway/files");
+        assert!(image["bodyTemplate"].as_str().unwrap().contains(r#""release": {{release}}"#));
     }
 
     #[tokio::test]

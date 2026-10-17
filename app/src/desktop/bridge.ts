@@ -124,6 +124,9 @@ export async function pairingStatus(origin: string, pairingId: string): Promise<
   return { status: (['pending', 'approved', 'denied', 'expired'].includes(status) ? status : 'pending') as 'pending', token };
 }
 
+/** A run's ends (the bridge's terminal states). */
+const RUN_ENDED = new Set(['succeeded', 'failed', 'timed_out', 'cancelled']);
+
 /** A paired OAIY Desktop: its events and its plugins' commands. */
 export class Desktop {
   constructor(readonly origin: string, readonly token: string) {}
@@ -418,15 +421,59 @@ export class Desktop {
   }
 
   /** Run a stored flow with `input` (by its input nodes' labels) and wait for its result. */
-  async runFlow(flowId: string, input: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  /**
+   * A file OAIY's engine made (a flow's picture), by the desktop URL the flow
+   * gave for it; null when the URL is not one of the engine's files here (the
+   * token goes to nothing else).
+   */
+  async engineFile(url: string, signal?: AbortSignal): Promise<Uint8Array | null> {
+    let at: URL;
+    try {
+      at = new URL(url);
+    } catch {
+      return null;
+    }
+    if (at.origin !== new URL(this.origin).origin || !at.pathname.startsWith('/api/ai/engine/gateway/files/')) return null;
+    const resp = await fetch(at.href, { headers: { authorization: `Bearer ${this.token}` }, signal });
+    if (!resp.ok) await reply(resp);
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+
+  /**
+   * Run a stored flow and wait for it, up to `timeoutMs`: started, then followed every `pollMs` (a flow that loads
+   * models runs for minutes, longer than a page or Node keeps one request waiting for its answer). What the run is
+   * when it ends, or as it stands when the time is up (`queued` or `running`). Stopped (`signal`), the run is cancelled
+   * on the desktop too, and the models it was using let go.
+   */
+  async runFlow(flowId: string, input: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal, pollMs = 1_000): Promise<Record<string, unknown>> {
     const key = `oaiy-app:${flowId}:${crypto.randomUUID()}`;
     const body = await reply(await fetch(`${this.origin}/api/bridge/runs`, {
       method: 'POST',
       headers: this.headers(),
-      body: JSON.stringify({ protocol: 'oaiy-bridge/1', caller: { product: 'oaiy-app', label: 'OAIY agent' }, flowId, input, mode: 'sync', timeoutMs, correlationId: key, idempotencyKey: key }),
+      body: JSON.stringify({ protocol: 'oaiy-bridge/1', caller: { product: 'oaiy-app', label: 'OAIY agent' }, flowId, input, mode: 'async', timeoutMs, correlationId: key, idempotencyKey: key }),
       signal,
     }));
-    return isRecord(body) ? body : {};
+    let run: Record<string, unknown> = isRecord(body) ? body : {};
+    const id = typeof run.runId === 'string' ? run.runId : '';
+    if (!id) return run;
+    const deadline = Date.now() + timeoutMs + 5_000;
+    try {
+      while (!RUN_ENDED.has(String(run.status ?? '')) && Date.now() < deadline) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, pollMs);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+          }, { once: true });
+        });
+        const now = await reply(await fetch(`${this.origin}/api/bridge/runs/${encodeURIComponent(id)}`, { headers: this.headers(), signal }));
+        if (isRecord(now)) run = now;
+      }
+    } catch (error) {
+      if (signal?.aborted) void fetch(`${this.origin}/api/bridge/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST', headers: this.headers(), body: '{}' }).catch(() => {});
+      throw error;
+    }
+    return run;
   }
 
   /** The plugins, and whether each runs. */

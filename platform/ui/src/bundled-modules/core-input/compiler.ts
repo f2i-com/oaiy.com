@@ -28,16 +28,21 @@ const CoreInputCompiler: ModuleCompiler = {
         // string literal below, so escape it (a `"`/`\`/newline would otherwise break the
         // generated code or inject into it — same raw-vs-escaped class as core-service).
         const nodeLabel = escapeString(String(data.label || '').toLowerCase().replace(/\s+/g, '_'));
+        const exactLabel = escapeString(String(data.label || '').trim());
         const nodeId = node.id;
         const defaultValue = JSON.stringify(data.value || '');
 
         // Priority order:
         // 1. __inputs["nodeId"] - exact node ID match
-        // 2. __inputs["label"] - label-based match (lowercased, spaces to underscores)
-        // 3. __inputs["input"] - generic input key (used when subflow is called with single input)
-        // 4. defaultValue - fallback to configured default
+        // 2. __inputs["Label"] - the label as written (what the agent's flow tools and the bridge's callers send)
+        // 3. __inputs["label"] - label-based match (lowercased, spaces to underscores)
+        // 4. __inputs["input"] - generic input key (used when subflow is called with single input)
+        // 5. defaultValue - fallback to configured default
+        const byExact = exactLabel && exactLabel !== nodeLabel
+          ? `__inputs["${exactLabel}"] != null ? __inputs["${exactLabel}"] : (`
+          : '';
         code += `
-  ${letOrAssign}${outputVar} = (__inputs["${nodeId}"] != null ? __inputs["${nodeId}"] : (__inputs["${nodeLabel}"] != null ? __inputs["${nodeLabel}"] : (__inputs["input"] != null ? __inputs["input"] : ${defaultValue})));
+  ${letOrAssign}${outputVar} = (__inputs["${nodeId}"] != null ? __inputs["${nodeId}"] : (${byExact}__inputs["${nodeLabel}"] != null ? __inputs["${nodeLabel}"] : (__inputs["input"] != null ? __inputs["input"] : ${defaultValue}))${byExact ? ')' : ''});
   workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }

@@ -24,6 +24,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// provider that returns 200 then goes silent can't pin the connection forever —
 /// without cutting off a legitimately long but active stream.
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// OAIY's own engine holds a chat while it loads its model, up to its own limit (15 minutes: a card handed back
+/// from a picture model takes a minute or two to load the language model again), so neither cap above may cut
+/// it: the whole request and the silence before its first token get the engine's wait.
+const ENGINE_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Reject any address a proxy must never reach (identical predicate to
 /// `downloads::is_disallowed_ip`): loopback, RFC1918 private, link-local incl.
@@ -221,6 +225,20 @@ pub(super) fn provider_client(streaming: bool, direct: bool) -> Result<reqwest::
         builder = builder.timeout(REQUEST_TIMEOUT);
     }
     if direct { builder = builder.no_proxy(); }
+    builder.build().map_err(|e| format!("http client build failed: {e}"))
+}
+
+/// The client for OAIY's own engine (on this computer, so never through a proxy): see `ENGINE_WAIT`.
+pub(super) fn engine_client(streaming: bool) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(ENGINE_WAIT)
+        .no_proxy();
+    if !streaming {
+        builder = builder.timeout(ENGINE_WAIT);
+    }
     builder.build().map_err(|e| format!("http client build failed: {e}"))
 }
 

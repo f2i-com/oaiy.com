@@ -134,6 +134,87 @@ async function main(): Promise<void> {
     `status=${condResult.status} gate=${JSON.stringify(condResult.results?.['gate'])} error=${condResult.error ?? ''}`
   );
 
+  // A node behind a condition's branch declares its named outputs inside the
+  // branch's guard; a block after the merge that read one (an image node's
+  // `info`) threw "not defined" whenever the branch was not taken, instead of
+  // reading null — an optional edit step failed the whole flow without an edit.
+  const gated: WorkflowGraph = {
+    nodes: [
+      { id: 'ask', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: "return '';" } },
+      { id: 'gate', type: 'condition', position: { x: 100, y: 0 }, data: { operator: 'not_empty' } },
+      { id: 'pic', type: 'image_gen', position: { x: 200, y: 0 }, data: { service: 'engine:image:none' } },
+      { id: 'after', type: 'logic_block', position: { x: 300, y: 0 }, data: { code: 'return { image: picture, info: info, asked: asked };' } },
+    ],
+    edges: [
+      { source: 'ask', target: 'gate', targetHandle: 'value' },
+      { source: 'gate', target: 'pic', sourceHandle: 'true', targetHandle: 'prompt' },
+      { source: 'pic', target: 'after', sourceHandle: 'image', targetHandle: 'picture' },
+      { source: 'pic', target: 'after', sourceHandle: 'info', targetHandle: 'info' },
+      { source: 'ask', target: 'after', targetHandle: 'asked' },
+    ],
+  } as WorkflowGraph;
+  const gatedResult = await runFlow(gated, { timeoutMs: 30_000 });
+  check(
+    "a block after a branch that was not taken reads the branch's named outputs as null",
+    gatedResult.status === 'completed' &&
+      JSON.stringify(gatedResult.results?.['after']) === JSON.stringify({ image: null, info: null, asked: '' }),
+    `status=${gatedResult.status} error=${gatedResult.error ?? ''} got=${JSON.stringify(gatedResult.results?.['after'])}`
+  );
+
+  // The condition's definition names its input `value` (the editor draws it as
+  // `input`); the compiler read only `input`, so a flow wired from the
+  // definition, as the agent writes them, saw null and never took its true branch.
+  const byValue: WorkflowGraph = {
+    nodes: [
+      { id: 'ask', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: "return 'make it blue';" } },
+      { id: 'gate', type: 'condition', position: { x: 100, y: 0 }, data: { operator: 'not_empty' } },
+      { id: 'yes', type: 'logic_block', position: { x: 200, y: 0 }, data: { code: "return 'ran: ' + v;" } },
+    ],
+    edges: [
+      { source: 'ask', target: 'gate', targetHandle: 'value' },
+      { source: 'gate', target: 'yes', sourceHandle: 'true', targetHandle: 'v' },
+    ],
+  } as WorkflowGraph;
+  const byValueResult = await runFlow(byValue, { timeoutMs: 30_000 });
+  check(
+    "a condition wired to its declared `value` handle reads what it is given",
+    byValueResult.status === 'completed' && byValueResult.results?.['yes'] === 'ran: make it blue',
+    `status=${byValueResult.status} error=${byValueResult.error ?? ''} got=${JSON.stringify(byValueResult.results?.['yes'])}`
+  );
+
+  // A flow made a tool is given its inputs by their labels as written ("Prompt",
+  // "letter head"): the agent and the bridge's callers send them so. Only the id
+  // and the lowercased, underscored label were looked up, so every input with a
+  // capital or a space in its label ran on its default, quietly.
+  const labelled = (inputs: Record<string, unknown>) =>
+    runFlow(
+      {
+        nodes: [
+          { id: 'n1', type: 'input_text', position: { x: 0, y: 0 }, data: { label: 'Letter head', value: 'default' } },
+          { id: 'n2', type: 'input_text', position: { x: 0, y: 100 }, data: { label: 'plain', value: 'default' } },
+          { id: 'both', type: 'logic_block', position: { x: 200, y: 0 }, data: { code: 'return [head, plain];' } },
+        ],
+        edges: [
+          { source: 'n1', target: 'both', sourceHandle: 'text', targetHandle: 'head' },
+          { source: 'n2', target: 'both', sourceHandle: 'text', targetHandle: 'plain' },
+        ],
+      } as WorkflowGraph,
+      { inputs, timeoutMs: 30_000 }
+    );
+  for (const [inputs, want] of [
+    [{ 'Letter head': 'as written', plain: 'p' }, ['as written', 'p']],
+    [{ letter_head: 'underscored' }, ['underscored', 'default']],
+    [{ n1: 'by id', 'Letter head': 'as written' }, ['by id', 'default']],
+    [{}, ['default', 'default']],
+  ] as Array<[Record<string, unknown>, string[]]>) {
+    const got = await labelled(inputs);
+    check(
+      `a flow's input is found by ${JSON.stringify(Object.keys(inputs))}`,
+      got.status === 'completed' && JSON.stringify(got.results?.['both']) === JSON.stringify(want),
+      `status=${got.status} error=${got.error ?? ''} got=${JSON.stringify(got.results?.['both'])}`
+    );
+  }
+
   // The shape a linked provider writes EVERY block in: an IIFE wrapper with
   // small named helpers inside it, each with its own `return`. Inlining that
   // into do/while and rewriting every `return` to `break` compiled a break into

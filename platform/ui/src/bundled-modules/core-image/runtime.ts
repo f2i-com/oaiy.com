@@ -1432,6 +1432,16 @@ async function serviceImage(
   nodeId: string,
   label = 'Image',
 ): Promise<string> {
+  return (await serviceImageInfo(contract, vars, nodeId, label)).image;
+}
+
+/** {@link serviceImage}, with what the service said of the picture (OAIY's engine: its file's URL, seed and timings). */
+async function serviceImageInfo(
+  contract: CustomService | string,
+  vars: Record<string, unknown>,
+  nodeId: string,
+  label = 'Image',
+): Promise<{ image: string; info: unknown }> {
   ctx.onNodeStatus?.(nodeId, 'running');
   try {
     if ('image' in vars && (vars.image == null || vars.image === '')) {
@@ -1442,7 +1452,7 @@ async function serviceImage(
     ctx.onImage?.(nodeId, r.image);
     ctx.onNodeStatus?.(nodeId, 'completed');
     ctx.log('success', `[${label}] done`);
-    return r.image;
+    return { image: r.image, info: r.info ?? null };
   } catch (e) {
     ctx.onNodeStatus?.(nodeId, 'error');
     throw e;
@@ -1450,14 +1460,21 @@ async function serviceImage(
 }
 
 async function generateService(contract: CustomService | string, vars: Record<string, unknown>, nodeId: string): Promise<string> {
+  return (await generateServiceInfo(contract, vars, nodeId)).image;
+}
+
+/** {@link generateService}, with what the service said of the picture (its `info` output). */
+async function generateServiceInfo(contract: CustomService | string, vars: Record<string, unknown>, nodeId: string): Promise<{ image: string; info: unknown }> {
   if (!vars.prompt) throw new Error('Image Gen: the prompt is empty (connect one to the Prompt input)');
-  return serviceImage(contract, vars, nodeId, 'Image Gen');
+  return serviceImageInfo(contract, vars, nodeId, 'Image Gen');
 }
 
   return {
     generate,
     generateService,
+    generateServiceInfo,
     serviceImage,
+    serviceImageInfo,
     save,
     resize,
   };

@@ -27,7 +27,17 @@ import {
   fsConfinementOn,
 } from './context';
 import { ssrfSafeFetch } from './ssrf-guard';
+import { fetch as undiciFetch, Agent } from 'undici';
 import * as ffmpeg from './ffmpeg';
+
+/** The longest a flow's HTTP request may wait (its own timeout, or the default, is capped at this). */
+const MAX_HTTP_TIMEOUT_MS = 30 * 60_000;
+/**
+ * Node's fetch gave up on an answer whose headers took 300 s, whatever the request's own timeout said: OAIY's engine
+ * holds a chat while it loads its model (a card handed back from a picture model, minutes), and a flow's review step
+ * failed with UND_ERR_HEADERS_TIMEOUT. The request's timeout governs; undici's waits only stand behind it.
+ */
+const PATIENT = new Agent({ headersTimeout: MAX_HTTP_TIMEOUT_MS, bodyTimeout: MAX_HTTP_TIMEOUT_MS });
 import * as browser from './browser';
 import * as oaiyServer from './oaiy-server';
 
@@ -98,7 +108,6 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
   const toMs = (v: unknown) => (typeof v === 'number' && v > 0 ? v : undefined);
   // Cap the (input-controlled) timeout so a flow can't pin the single-threaded worker
   // far beyond the job's own ceiling on a slow/never-responding endpoint.
-  const MAX_HTTP_TIMEOUT_MS = 30 * 60_000;
   const timeoutMs = Math.min(
     toMs(r.timeout_ms) ??
       (toMs(r.timeout_secs) !== undefined ? Number(r.timeout_secs) * 1000 : undefined) ??
@@ -123,7 +132,9 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
     const init: RequestInit = { method, headers, body, signal: ac.signal };
     let resp: Response;
     try {
-      resp = confined ? await ssrfSafeFetch(url, init) : await fetch(url, init);
+      resp = confined
+        ? await ssrfSafeFetch(url, init)
+        : ((await undiciFetch(url, { ...init, dispatcher: PATIENT } as Parameters<typeof undiciFetch>[1])) as unknown as Response);
     } catch (e) {
       // Node's fetch throws a bare `TypeError: fetch failed` and hides the real
       // reason on `.cause`. Surfaced verbatim through the runtime that became

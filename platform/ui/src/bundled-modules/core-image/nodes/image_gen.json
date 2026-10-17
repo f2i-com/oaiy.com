@@ -40,7 +40,16 @@
       "name": "Image",
       "type": "image",
       "position": "right",
+      "varSuffix": "",
       "description": "Generated image (base64)"
+    },
+    {
+      "id": "info",
+      "name": "Info",
+      "type": "object",
+      "position": "right",
+      "varSuffix": "_info",
+      "description": "What OAIY's engine said of the picture: its file's URL, the model, seed and each stage's time (null elsewhere)"
     }
   ],
   "properties": [
@@ -210,6 +219,21 @@
       "default": 20,
       "min": 1,
       "max": 150
+    },
+    {
+      "id": "seed",
+      "name": "Seed",
+      "type": "number",
+      "default": "",
+      "placeholder": "random",
+      "description": "The same seed, prompt and size make the same picture again; empty: a new one each run (OAIY's engine)"
+    },
+    {
+      "id": "release",
+      "name": "Free the picture model after this step",
+      "type": "boolean",
+      "default": false,
+      "description": "Let the picture model go as soon as this picture is made, not kept for the next: for a flow's last picture, before a step that needs another model (OAIY's engine)"
     },
     {
       "id": "imageInputCount",

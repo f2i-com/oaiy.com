@@ -319,7 +319,7 @@ fn desktop_script(theme: &str, page: Page) -> String {
     let backup = if page == Page::Agent { format!(", backupToken: {:?}", crate::backup::agent::page_token()) } else { String::new() };
     format!(
         "window.__OAIY_DESKTOP__ = Object.freeze({{ origin: {origin:?}, token: {token:?}, theme: {theme:?}{backup} }});",
-        origin = format!("http://127.0.0.1:{}", crate::DESKTOP_PORT),
+        origin = format!("http://127.0.0.1:{}", crate::api_port()),
         token = crate::internal_token(),
     )
 }

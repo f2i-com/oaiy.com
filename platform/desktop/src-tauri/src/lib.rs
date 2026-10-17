@@ -51,6 +51,19 @@ pub mod installed;
 /// stable target. Shared by both binaries (the GUI and the headless server).
 pub const DESKTOP_PORT: u16 = 17972;
 
+static API_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(DESKTOP_PORT);
+
+/// The port this process's API listens on: `DESKTOP_PORT` unless the desktop's `serverPort` or the headless
+/// server's `OAIY_SERVER_PORT` chose another. What a child it spawns, or a page it serves, is told to call back on.
+pub fn api_port() -> u16 {
+    API_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set once the port is chosen, before anything is spawned or served.
+pub fn set_api_port(port: u16) {
+    API_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The bearer this process shares with the child processes it spawns.
 ///
 /// Privileged routes — `/api/ai/*` among them — fail closed on a missing
@@ -1554,6 +1567,7 @@ pub fn run() {
                 .and_then(|s| s.trim().parse::<u16>().ok())
                 .filter(|p| *p != 0))
                 .unwrap_or(DESKTOP_PORT);
+            crate::set_api_port(server_port);
             // The desktop never binds beyond loopback (design 4.5.5 rule 8, 10.3): `lanAccess` is ignored, and one
             // line says so. Its Host allow-list is the loopback names on any port (`auth::host`), which is what a
             // request to a loopback listener carries.

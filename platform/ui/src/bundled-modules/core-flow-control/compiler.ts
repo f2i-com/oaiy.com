@@ -31,8 +31,10 @@ const CoreFlowControlCompiler: ModuleCompiler = {
     const data = node.data;
     const letOrAssign = skipVarDeclaration ? '' : 'let ';
     const debug = debugEnabled ?? false;
-    // Check multiple possible handle names: 'default', 'input', 'input_0' (for subflow), 'result' (for output node)
-    const inputVar = inputs.get('default') || inputs.get('input') || inputs.get('input_0') || inputs.get('result') || 'null';
+    // Check multiple possible handle names: 'default', 'input', 'value' (the condition's declared handle: the editor
+    // draws it as `input`, but a flow written from the node's definition, as the agent writes them, wires `value`),
+    // 'input_0' (for subflow), 'result' (for output node)
+    const inputVar = inputs.get('default') || inputs.get('input') || inputs.get('value') || inputs.get('input_0') || inputs.get('result') || 'null';
 
     let code = `
   // --- Node: ${node.id} (${nodeType}) ---`;

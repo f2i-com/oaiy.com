@@ -36,6 +36,8 @@ export interface ContractResult {
   text?: string;
   /** The answer at the response path, when it is none of the above. */
   value?: unknown;
+  /** What the service said of its answer, at its `infoPath` (OAIY's engine: a picture's file, seed and timings). */
+  info?: unknown;
 }
 
 export interface ContractOptions {
@@ -230,6 +232,20 @@ function reference(value: unknown): string | null {
 }
 
 /** A node value's bytes: a data:, blob: or http(s) URL, or a file path. */
+/**
+ * A file on the desktop's own routes (a picture OAIY's engine made, by the URL a
+ * flow passes on in place of its bytes), read with the desktop's credential; null
+ * for any other URL, which the caller reads as it would anyway.
+ */
+export async function desktopFileBytes(url: string, signal?: AbortSignal): Promise<{ bytes: Uint8Array; mime: string } | null> {
+  const desktop = desktopAccess();
+  const credential = desktopCredential(url, desktop);
+  if (credential === undefined) return null;
+  const r = await fetch(url, { headers: credential ? { Authorization: `Bearer ${credential}` } : {}, signal });
+  if (!r.ok) throw new Error(`could not read ${url}: HTTP ${r.status}`);
+  return { bytes: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get('content-type') || mimeOf(url) };
+}
+
 export async function valueBytes(ctx: RuntimeContext, value: unknown): Promise<{ bytes: Uint8Array; mime: string } | null> {
   const ref = reference(value);
   if (!ref) return null;
@@ -245,6 +261,8 @@ export async function valueBytes(ctx: RuntimeContext, value: unknown): Promise<{
     return { bytes: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get('content-type') || mimeOf(ref) };
   }
   if (/^https?:\/\//.test(ref)) {
+    const own = await desktopFileBytes(ref, ctx.abortSignal);
+    if (own) return own;
     const r = (await ctx.fetch(ref)) as unknown as Reply;
     if (!r.ok) throw new Error(`could not read ${ref}: HTTP ${r.status}`);
     return { bytes: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get('content-type') || mimeOf(ref) };
@@ -402,6 +420,25 @@ function extFor(service: CustomService, mime: string | null, fallback: string): 
 }
 
 /**
+ * The engine's word on its answer, with its file named where the caller can
+ * fetch it: the gateway's own URL becomes the desktop's (`filesUrl`), which a
+ * paired caller reaches with its token, as it reaches the service itself.
+ */
+function withDesktopFile(info: unknown, filesUrl: string | undefined): unknown {
+  if (!filesUrl || !info || typeof info !== 'object' || Array.isArray(info)) return info;
+  const file = (info as Record<string, unknown>).file;
+  if (typeof file !== 'string') return info;
+  let path: string;
+  try {
+    path = new URL(file, 'http://engine').pathname;
+  } catch {
+    return info;
+  }
+  const at = /^\/files\/(.+)$/.exec(path);
+  return at ? { ...info, file: absoluteUrl(`${filesUrl.replace(/\/+$/, '')}/${at[1]}`) } : info;
+}
+
+/**
  * Run `serviceOrId` with the node's values. `vars.model` defaults to the
  * service's model; everything else is the node's.
  */
@@ -453,6 +490,7 @@ export async function runContract(
   let bytes: Uint8Array | null = null;
   let mime: string | null = null;
   let value: unknown;
+  let info: unknown;
   if (service.job) {
     const id = await followJob(ctx, service, await first.json(), label);
     ({ bytes, mime } = await jobContent(ctx, service, id, label));
@@ -462,7 +500,9 @@ export async function runContract(
   } else if (service.responseType === 'text') {
     value = await first.text();
   } else {
-    value = extractPath(await first.json(), service.responsePath);
+    const answer = await first.json();
+    value = extractPath(answer, service.responsePath);
+    if (service.infoPath) info = withDesktopFile(extractPath(answer, service.infoPath), service.filesUrl);
   }
 
   const output = service.output || '';
@@ -472,7 +512,7 @@ export async function runContract(
     else if (typeof value === 'string' && /^(data:|https?:\/\/|blob:)/.test(value)) image = value;
     else if (typeof value === 'string' && value) image = `data:${mimeOf(service.outputFormat || 'png')};base64,${value}`;
     else throw new Error(`${label}: no picture at "${service.responsePath}" in the answer`);
-    return { output, image };
+    return info === undefined ? { output, image } : { output, image, info };
   }
   if (output === 'audio' || output === 'video' || output === 'model3d') {
     if (!bytes && typeof value === 'string' && value) {

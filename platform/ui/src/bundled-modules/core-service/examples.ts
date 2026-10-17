@@ -126,6 +126,10 @@ export interface CustomService {
   responseType: ServiceResponseType;
   /** Dot/bracket path into the response; `''` returns the whole parsed body. */
   responsePath: string;
+  /** Dot/bracket path to what the service says of its answer beside it (OAIY's engine: a picture's provenance). */
+  infoPath?: string;
+  /** Where the service's files are fetched (OAIY's engine: through the desktop), for the `file` in its info. */
+  filesUrl?: string;
   /** Name of a Project Constant that holds the API key. Resolved at runtime. */
   apiKeyConstant?: string;
   /** Marker: built-in examples render as read-only in the Services panel. */

@@ -58,14 +58,18 @@ const CoreImageCompiler: ModuleCompiler = {
           if (imageVars.length === 0 && inputs.get('image')) imageVars.push(inputs.get('image')!);
           const width = Number(data.width) || 1024;
           const height = Number(data.height) || 1024;
+          // (a seed to make it again, else a new one each run; `release`: its model let go as soon as it is done, as
+          // a flow's last picture wants, not kept for the next)
+          const seed = data.seed === '' || data.seed == null || !Number.isFinite(Number(data.seed)) || Number(data.seed) < 0 ? null : Math.floor(Number(data.seed));
           code += `
   ${letOrAssign}${outputVar} = null;
   let ${outputVar}_image = null;
+  let ${outputVar}_info = null;
   if (${promptInputVar} === null) {
     console.log("[Image Gen] (${node.id}) Skipped - prompt is null");
     workflow_context["${node.id}"] = null;
   } else {
-    ${outputVar} = await Image.generateService(
+    const ${outputVar}_made = await Image.generateServiceInfo(
       ${contract},
       {
         prompt: [${JSON.stringify(String(data.prompt || ''))}, typeof ${promptInputVar} === 'string' ? ${promptInputVar} : ''].filter(Boolean).join("\\n"),
@@ -73,10 +77,14 @@ const CoreImageCompiler: ModuleCompiler = {
         size: ${JSON.stringify(`${width}x${height}`)},
         images: [${imageVars.join(', ')}].filter((x) => x != null),
         model: ${JSON.stringify(contractModel(preset, data.model))},
+        seed: ${JSON.stringify(seed)},
+        release: ${data.release === true ? 'true' : 'null'},
       },
       "${node.id}"
     );
+    ${outputVar} = ${outputVar}_made.image;
     ${outputVar}_image = ${outputVar};
+    ${outputVar}_info = ${outputVar}_made.info;
     workflow_context["${node.id}"] = ${outputVar};
   }`;
           break;
@@ -227,6 +235,7 @@ const CoreImageCompiler: ModuleCompiler = {
         code += `
   ${letOrAssign}${outputVar} = null;
   let ${outputVar}_image = null;
+  let ${outputVar}_info = null;
   if (${promptInputVar} === null) {
     console.log("[Image Gen] (${node.id}) Skipped - prompt is null");
     ${outputVar} = null;

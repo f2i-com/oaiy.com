@@ -7,6 +7,7 @@
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { getEngineBase } from '../../lib/engineEndpoint';
+import { absoluteUrl, desktopFileBytes } from '../core-service/contractRuntime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createAIMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -692,6 +693,8 @@ async function chat(
     ctx.log('info', '[AI] Aborted by user before chat started');
     return '__ABORT__';
   }
+  // A route on the desktop (OAIY's engine, named by a flow that had no list of its services): where it is now.
+  if (endpoint.startsWith('/api/')) endpoint = absoluteUrl(endpoint);
 
   // Fold video frames into the image input array up-front, before any
   // provider branch sees `input`. The frame extractor is a no-op when
@@ -1027,6 +1030,13 @@ async function chat(
   const fetchImageUrl = async (url: string): Promise<string | null> => {
     try {
       ctx.log('info', `[AI] Fetching image from URL: ${url}`);
+      // A picture OAIY's engine made, passed on by its URL: read with the desktop's credential.
+      const own = await desktopFileBytes(url, ctx.abortSignal);
+      if (own) {
+        let bin = '';
+        for (let i = 0; i < own.bytes.length; i += 0x8000) bin += String.fromCharCode(...own.bytes.subarray(i, i + 0x8000));
+        return `data:${own.mime.startsWith('image/') ? own.mime : 'image/png'};base64,${btoa(bin)}`;
+      }
       const response = await ctx.secureFetch(url, {
         method: 'GET',
         purpose: 'Fetch image for AI vision',

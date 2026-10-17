@@ -9,6 +9,7 @@
  */
 import type { SessionTool } from '../agent/agent';
 import type { Desktop } from './bridge';
+import { FLOW_TOOL_WAIT_MS } from './flowTools';
 import catalog from '../agent/flowNodes.json';
 
 export interface NodeType {
@@ -203,11 +204,11 @@ export function flowBuilderTools(desktop: () => Desktop | null, toolsChanged: ()
     {
       spec: {
         name: 'flow_run',
-        description: 'Run a stored flow on OAIY Desktop and wait for what it returns (up to 2 minutes). input: its inputs by their labels.',
+        description: 'Run a stored flow on OAIY Desktop and wait for what it returns (up to 10 minutes: one that loads picture or video models takes minutes). input: its inputs by their labels.',
         parameters: { type: 'object', required: ['id'], properties: { id: { type: 'string' }, input: { type: 'object', description: 'The inputs, by label' } } },
       },
       run: async (input, signal) => {
-        const result = await connected(desktop).runFlow(String(input.id), isRecord(input.input) ? input.input : {}, 120_000, signal);
+        const result = await connected(desktop).runFlow(String(input.id), isRecord(input.input) ? input.input : {}, FLOW_TOOL_WAIT_MS, signal);
         const status = String(result.status ?? '');
         if (status === 'succeeded') {
           const out = isRecord(result.output) && 'output' in result.output ? result.output.output : result.output;

@@ -49,6 +49,32 @@ export function engineKindOf(id: string): string | null {
   return m ? m[1].toLowerCase() : null;
 }
 
+/** OAIY's engine's chat route on the desktop (its `oaiy-engine` provider). */
+export const ENGINE_CHAT_ENDPOINT = '/api/ai/providers/oaiy-engine/v1/chat/completions';
+
+/**
+ * OAIY's engine's language model for an `engine:llm` id (or `engine:llm:<model>`)
+ * that no list here has: a flow run by the desktop's bridge, the CLI or the
+ * Agent has none, and the AI node fell back to a local GGUF and failed. The
+ * desktop answers with the model chosen in Engines, as it does for the listed one.
+ */
+export function engineChatService(id: string): CustomService | null {
+  if (!/^engine:llm(?::.+)?$/i.test(id)) return null;
+  return {
+    id,
+    name: 'OAIY engine · LLM',
+    group: 'engine',
+    kind: 'llm',
+    endpoint: ENGINE_CHAT_ENDPOINT,
+    method: 'POST',
+    apiFormat: 'openai',
+    headers: '{}',
+    bodyTemplate: '',
+    responseType: 'json',
+    responsePath: 'choices.0.message.content',
+  };
+}
+
 /** The engine's default service of `kind` in `list` (else its first). */
 export function engineDefault(list: CustomService[], kind: string): CustomService | null {
   const of = list.filter((s) => s.group === 'engine' && s.kind === kind);

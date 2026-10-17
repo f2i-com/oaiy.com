@@ -1373,11 +1373,18 @@ workflow_context;
     };
     const test = reachable(node.id, new Set());
     if (test === 'true') return body;
-    const declare = skipVarDeclaration ? '' : `\n  let ${outputVar} = null;`;
-    // The body declares the output itself when it is allowed to; inside the
-    // guard that declaration would be scoped to the branch, so it is hoisted
+    // The body declares its outputs itself when it is allowed to (the node's
+    // value and any named outputs beside it: an image node's `_image` and
+    // `_info`); inside the guard those declarations would be scoped to the
+    // branch, and a node after a merge that reads one threw "not defined" when
+    // the branch did not run. So each is hoisted, null until the branch runs,
     // and the body told to assign instead.
-    const inner = skipVarDeclaration ? body : body.replace(`let ${outputVar}`, `${outputVar}`);
+    const named = skipVarDeclaration ? [] : [...new Set([...body.matchAll(new RegExp(`\\blet (${outputVar}_\\w+)\\b`, 'g'))].map(m => m[1]))];
+    const declare = skipVarDeclaration ? '' : [outputVar, ...named].map(v => `\n  let ${v} = null;`).join('');
+    const inner = skipVarDeclaration ? body : named.reduce(
+      (b, v) => b.replace(new RegExp(`\\blet ${v}\\b`), v),
+      body.replace(`let ${outputVar}`, `${outputVar}`),
+    );
     return `${declare}
   // Branch gate: only runs when this condition took this path
   if (${test}) {${inner}

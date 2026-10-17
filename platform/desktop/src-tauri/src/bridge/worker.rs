@@ -1175,7 +1175,7 @@ pub fn run_flow_cli_with(
     // operations would quietly address whatever else is listening there.
     cmd.env(
         "OAIY_SERVER_URL",
-        format!("http://127.0.0.1:{}", crate::DESKTOP_PORT),
+        format!("http://127.0.0.1:{}", crate::api_port()),
     );
     // And who it is when it gets there. Privileged routes — the AI gateway
     // among them — fail closed on a missing Origin, and a spawned CLI has none,

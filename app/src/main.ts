@@ -20,7 +20,7 @@ import { confirmOutreach } from './ui/outreach';
 import { personState } from './ui/chat/outreachCard';
 import type { Turn } from './agent/protocol';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
-import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
+import { flowSessionTools, flowToolHooks, readFlowStore, type FlowTool } from './desktop/flowTools';
 import { pluginSessionTools, type PluginToolAudience } from './desktop/pluginTools';
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
@@ -241,6 +241,8 @@ async function main(): Promise<void> {
   let holdsTasks = false;
   // Flows made tools in the flow editor: every agent may use them.
   let flowTools: SessionTool[] = [];
+  /** The same flows, kept to make a project's own (whose pictures are saved in it), and the names they were given around. */
+  let flowStore: { tools: FlowTool[]; taken: Set<string> } = { tools: [], taken: new Set() };
   /** Flows in front of the agents' tools. */
   let toolHooks: ToolHook[] = [];
   /** The names the agents' own tools go by: a flow or a plugin's tool with one of them gets a prefix. */
@@ -808,7 +810,7 @@ async function main(): Promise<void> {
         // Outreach where the person is (never a call, a text, a flow's task or "Set up OAIY").
         // OAIY's own tools (its control API) after them, as this kind of conversation is offered them.
         sessionTools: () => withControl(kind(), [
-          ...(canDo('flowTools') ? flowTools : []),
+          ...(canDo('flowTools') ? flowSessionTools(flowStore.tools, () => desktop, flowStore.taken, () => place().vfs) : []),
           ...(desktop ? [transcribe, ...(calendarOn() ? calendar : [])] : []),
           ...(desktop && canDo('flowTools') ? flowBuilder : []),
           ...(runner() ? phone : []),
@@ -2458,6 +2460,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const d = desktop;
     if (!d || !canDo('flowTools')) {
       flowTools = [];
+      flowStore = { tools: [], taken: new Set() };
       toolHooks = [];
       return;
     }
@@ -2466,6 +2469,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       const taken = new Set([...builtInToolNames, ...controlNames()]);
       const store = await readFlowStore(d, AbortSignal.timeout(10_000));
       flowTools = flowSessionTools(store.tools, () => desktop, taken);
+      flowStore = { tools: store.tools, taken };
       toolHooks = flowToolHooks(store.hooks, () => desktop);
     } catch {
       /* the desktop is away: keep what was there */

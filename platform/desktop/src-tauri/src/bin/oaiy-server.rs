@@ -245,6 +245,8 @@ async fn server_main() {
     // (What this install is, in words, with no secret in it, is printed by `http::serve` once the credential store is
     // open and the listener is bound: a banner that says "listening" is not printed by a server that then stops.)
     let port: u16 = config.port;
+    // (the flows it runs, and the pages it serves, call back on this port, not the desktop's default)
+    oaiy_desktop_lib::set_api_port(port);
     let bind = config.bind.addr();
     // Trimmed and of the shape of design 4.1, or the server would not be here.
     let auth_token = config.static_token.clone();

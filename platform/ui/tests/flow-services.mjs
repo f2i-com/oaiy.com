@@ -368,10 +368,31 @@ await check('the new nodes compile to their contract calls (the engine by defaul
 
 await check('image_gen, video_gen, ai_llm and Service Call resolve engine entries', () => {
   const img = compile(M.ImageCompiler, 'image_gen', { service: 'engine:image:qwen', width: 768, height: 512 }, { prompt: 'node_in' });
-  assert.match(img, /Image\.generateService\(/);
+  assert.match(img, /Image\.generateServiceInfo\(/);
   assert.match(img, /size: "768x512"/);
+  // a new picture each run and the model kept, unless the node says otherwise; what the engine said of it on `info`
+  assert.match(img, /seed: null,/);
+  assert.match(img, /release: null,/);
+  assert.match(img, /node_n1_out_info = node_n1_out_made\.info;/);
+  const again = compile(M.ImageCompiler, 'image_gen', { service: 'engine:image:qwen', seed: 7, release: true }, { prompt: 'node_in' });
+  assert.match(again, /seed: 7,/);
+  assert.match(again, /release: true,/);
+  assert.match(compile(M.ImageCompiler, 'image_gen', { service: 'engine:image:qwen', seed: -1 }, { prompt: 'node_in' }), /seed: null,/);
   assert.match(compile(M.ImageCompiler, 'image_gen', { endpoint: 'http://x/y', apiFormat: 'openai' }, { prompt: 'node_in' }), /Image\.generate\(/);
   assert.match(compile(M.VideoCompiler, 'video_gen', { service: 'engine:video' }, { prompt: 'node_in' }), /VideoFrames\.generateService\(\s*"engine:video"/);
+  // an engine id no list here has (the bridge, the CLI and the Agent run flows with none): the desktop's chat route,
+  // made absolute when the flow runs, not a local GGUF that wants a model id
+  const listed = store.get('oaiy.desktopServices');
+  store.delete('oaiy.desktopServices');
+  try {
+    for (const service of ['engine:llm', 'engine:llm:unlisted']) {
+      const unlisted = compile(M.AICompiler, 'ai_llm', { service }, { input: 'node_in' });
+      assert.ok(unlisted.includes('"/api/ai/providers/oaiy-engine/v1/chat/completions"'), `${service}: the engine's chat route`);
+      assert.ok(!unlisted.includes('oaiy-llm://local') && !/OPENAI_API_KEY/.test(unlisted), `${service}: no local GGUF, no OpenAI key`);
+    }
+  } finally {
+    store.set('oaiy.desktopServices', listed);
+  }
   const llm = compile(M.AICompiler, 'ai_llm', { service: 'engine:llm:flash' }, { input: 'node_in' });
   assert.ok(llm.includes(`${ORIGIN}/api/ai/providers/oaiy-engine/v1/chat/completions`));
   assert.match(llm, /""\s*,\s*""\s*,\s*""\s*\);/, 'no custom body, response path or headers: the standard OpenAI request');
@@ -447,6 +468,32 @@ await check("the desktop's credential goes only to its engine routes", async () 
   // The same contract pointed elsewhere on the desktop goes through the runtime's own fetch, without the token.
   await M.runContract(ctx, { ...cut, endpoint: `${ORIGIN}/api/services` }, { image: 'data:image/png;base64,AAAA' }, { nodeId: 'n1' });
   assert.deepEqual(viaCtx, [[`${ORIGIN}/api/services`, undefined]]);
+});
+
+await check("a picture's file is named where the caller fetches it, and a picture passed on by that URL is read with the credential", async () => {
+  const seen = [];
+  const png = new Uint8Array([137, 80, 78, 71]);
+  globalThis.fetch = async (url, init = {}) => {
+    seen.push([String(url), init.headers?.Authorization, init.method || 'GET', init.body]);
+    if (String(url).includes('/files/')) return { ok: true, status: 200, headers: new Map([['content-type', 'image/png']]), arrayBuffer: async () => png.buffer };
+    return reply(200, { data: [{ b64_json: 'iVBORw==', oaiy: { file: 'http://127.0.0.1:8080/files/images/2026-10-17/b.png', seed: 7 } }] });
+  };
+  const ctx = fakeCtx();
+  const viaCtx = [];
+  ctx.fetch = async (url) => { viaCtx.push(url); return { ok: true, status: 200, headers: new Map([['content-type', 'image/png']]), arrayBuffer: async () => png.buffer }; };
+  const picture = {
+    ...desktop.find((s) => s.id === 'engine:background:birefnet'),
+    infoPath: 'data.0.oaiy',
+    filesUrl: '/api/ai/engine/gateway/files',
+  };
+  const made = `${ORIGIN}/api/ai/engine/gateway/files/images/2026-10-17/a.png`;
+  const r = await M.runContract(ctx, picture, { image: made }, { nodeId: 'n1' });
+  assert.deepEqual(r.info, { file: `${ORIGIN}/api/ai/engine/gateway/files/images/2026-10-17/b.png`, seed: 7 });
+  assert.deepEqual(seen[0].slice(0, 3), [made, 'Bearer tok', 'GET']);
+  assert.ok(String(seen[1][3]).includes('data:image/png;base64,iVBORw=='), 'the picture went to the engine as its bytes');
+  // a picture elsewhere is read by the runtime's own fetch, with no credential
+  await M.runContract(ctx, picture, { image: 'http://example.com/c.png' }, { nodeId: 'n1' });
+  assert.deepEqual(viaCtx, ['http://example.com/c.png']);
 });
 
 await check('a stopped flow cancels the job', async () => {
