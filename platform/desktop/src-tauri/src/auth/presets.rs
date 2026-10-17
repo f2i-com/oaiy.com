@@ -624,9 +624,11 @@ mod tests {
     /// `flows`, `flows-host`, `flows-web`, `formlogic`, `cli`, `cli-admin`, `run`) reach three more each, and no other preset holds either.
     /// Scoped plugin voice adds one services.read status and five speech.use actions. The model on a Mac's eGPU
     /// (`PUT /api/engines/egpu`, `models.write`, as the engines' other choices) adds one for `owner`, `cli` and
-    /// `cli-admin`, which hold that scope. OAIY Network adds fifteen: its status, settings, pairing and unpairing
-    /// (`auth.read`, `auth.manage`, `auth.revoke`: thirteen, with its pins, the owner's alone) and a paired worker's models (`ai.use`:
-    /// two, for the nine presets that use this desktop's own engines).
+    /// `cli-admin`, which hold that scope. OAIY Network adds nineteen: its status, settings, pairing and unpairing
+    /// (`auth.read`, `auth.manage`, `auth.revoke`: thirteen, with its pins, the owner's alone), a paired worker's models (`ai.use`:
+    /// two, for the nine presets that use this desktop's own engines), and the flows a worker shares, run there (`flows.read`,
+    /// `runs.read`, `runs.write`: four for the presets that hold all three, two for `readonly`, which reads, and one for `run`,
+    /// which reads the flows alone).
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -636,18 +638,18 @@ mod tests {
         assert_eq!(
             reaches,
             [
-                ("owner", 165 + 11 + 8 + 3 + 6 + 1 + 15),
-                ("agent", 78 + 5 + 7 + 3 + 5 + 2),
-                ("flows", 64 + 3 + 6 + 2),
-                ("flows-host", 54 + 3 + 6 + 2),
+                ("owner", 165 + 11 + 8 + 3 + 6 + 1 + 19),
+                ("agent", 78 + 5 + 7 + 3 + 5 + 2 + 4),
+                ("flows", 64 + 3 + 6 + 2 + 4),
+                ("flows-host", 54 + 3 + 6 + 2 + 4),
                 ("flows-web", 38 + 3 + 6 + 2),
                 ("formlogic", 36 + 3 + 1 + 2),
-                ("cli", 75 + 1 + 3 + 1 + 1 + 2),
-                ("cli-admin", 86 + 1 + 3 + 1 + 1 + 2),
+                ("cli", 75 + 1 + 3 + 1 + 1 + 2 + 4),
+                ("cli-admin", 86 + 1 + 3 + 1 + 1 + 2 + 4),
                 ("mcp", 7),
-                ("readonly", 28 + 1 + 1),
+                ("readonly", 28 + 1 + 1 + 2),
                 ("companion", 17 + 4),
-                ("run", 32 + 3 + 6 + 2),
+                ("run", 32 + 3 + 6 + 2 + 1),
                 ("ceremony", 4),
             ]
         );

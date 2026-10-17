@@ -1719,6 +1719,8 @@ pub async fn serve(
     }
     let ring_routes = crate::ring::routes::router(crate::ring::shared().unwrap_or_else(|| crate::ring::Ring::in_memory(Default::default())));
     let plugin_ai_host = bridge.host.clone();
+    // (OAIY Network's worker runs the flows it shares for its primary: their store and ledger, below)
+    let bridge_for_network = (bridge.ledger.clone(), bridge.flows.clone());
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +
@@ -1728,6 +1730,7 @@ pub async fn serve(
     // OAIY Network (docs/NETWORK.md): off until switched on; on, a worker's listener on the LAN or a primary's
     // heartbeat to its workers, started here and changed from the Networking page.
     let network = crate::network::Network::open(&data_dir_for_auth, ai_state.clone());
+    network.set_bridge(bridge_for_network.0, bridge_for_network.1);
     network.share();
     if !isolated {
         let started = network.clone();

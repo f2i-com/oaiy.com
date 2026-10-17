@@ -41,6 +41,8 @@ const HEAD: Duration = Duration::from_secs(15);
 const IDLE: Duration = Duration::from_secs(120);
 const CHAT_LIMIT: usize = 16 << 20;
 const MEDIA_LIMIT: usize = 96 << 20;
+/// A voice clip copied here, base64 in JSON (a clip is 20 MB at most).
+const VOICE_LIMIT: usize = 32 << 20;
 
 /// A primary asking this worker to pair, waiting for the person's approval.
 #[derive(Clone, Debug)]
@@ -180,6 +182,12 @@ fn routes(net: Network) -> Router {
         .route("/worker/v1/capabilities", get(capabilities))
         .route("/worker/v1/resources", get(resources))
         .route("/worker/v1/pins", post(pins))
+        .route("/worker/v1/flows", get(flows))
+        .route("/worker/v1/flows/:id/runs", post(run_flow).layer(DefaultBodyLimit::max(MEDIA_LIMIT)))
+        .route("/worker/v1/runs/:id", get(run_status))
+        .route("/worker/v1/runs/:id/cancel", post(cancel_run))
+        .route("/worker/v1/services/:service/*path", any(service).layer(DefaultBodyLimit::max(MEDIA_LIMIT)))
+        .route("/worker/v1/voices/:name", axum::routing::put(voice_copy).layer(DefaultBodyLimit::max(VOICE_LIMIT)))
         .route("/worker/v1/chat", post(chat).layer(DefaultBodyLimit::max(CHAT_LIMIT)))
         .route("/worker/v1/gateway/*path", any(gateway).layer(DefaultBodyLimit::max(MEDIA_LIMIT)))
         .with_state(net)
@@ -392,7 +400,269 @@ async fn capabilities(State(net): State<Network>, Extension(caller): Extension<C
         Ok((_, d)) => (sanitized_discovery(d), Value::Null),
         Err(e) => (Value::Null, json!(e)),
     };
-    Json(json!({ "node": node, "discovery": discovery, "enginesError": engines, "resources": local_resources(&net).await })).into_response()
+    Json(json!({
+        "node": node,
+        "discovery": discovery,
+        "enginesError": engines,
+        "resources": local_resources(&net).await,
+        "flows": shared_flows(&net)["flows"],
+        "services": shared_services(&net),
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Flows: the ones this worker shares ("Let apps run it" in its Flows editor), run here for its paired primary
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The flows this worker shares with apps, its primary among them: `{flows: [{flowId, name, description, inputs}]}`.
+pub(crate) fn shared_flows(net: &Network) -> Value {
+    net.inner().bridge().map(|b| crate::bridge::flow_connector::list(&b.flows)).unwrap_or_else(|| json!({ "flows": [] }))
+}
+
+/// The caller a primary's runs are kept under here, so it reads and cancels its own alone.
+fn run_caller(primary: &Peer) -> String {
+    format!("oaiy-network:{}", primary.node_id)
+}
+
+/// `GET /worker/v1/flows`: the flows this worker shares.
+async fn flows(State(net): State<Network>, Extension(caller): Extension<Caller>) -> Response {
+    if primary_of(&net, &caller).is_none() {
+        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+    }
+    Json(shared_flows(&net)).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FlowRun {
+    #[serde(default)]
+    input: Option<Value>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    /// The primary's own key for the run: asked twice, it runs once.
+    #[serde(default)]
+    key: Option<String>,
+}
+
+/// The longest a primary's run may take here.
+const RUN_LIMIT_MS: u64 = 60 * 60 * 1000;
+
+/// `POST /worker/v1/flows/:id/runs` `{input?, timeoutMs?, key?}`: one of the flows this worker shares, run here (its
+/// runner, its engines) for its primary. Answered at once with the run (`queued`); [`run_status`] follows it.
+async fn run_flow(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(id): Path<String>, req: Request) -> Response {
+    let Some(primary) = primary_of(&net, &caller) else {
+        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+    };
+    let base = rebase_to(&req);
+    let Some(bridge) = net.inner().bridge() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "flows_unavailable", "this computer runs no flows here");
+    };
+    let shared = bridge.flows.get(&id).and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|d| crate::bridge::flow_connector::shared(&d));
+    if !shared {
+        return refuse(StatusCode::NOT_FOUND, "flow_not_shared", format!("{} shares no flow {id}: on it, open the flow and switch on Let apps run it", net.display_name()));
+    }
+    let body = match axum::body::to_bytes(req.into_body(), MEDIA_LIMIT).await {
+        Ok(b) => b,
+        Err(e) => return refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", e.to_string()),
+    };
+    let asked: FlowRun = match serde_json::from_slice(&body) {
+        Ok(a) => a,
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, "invalid_request", format!("send {{input?, timeoutMs?, key?}}: {e}")),
+    };
+    // (its pictures, given inline, stored with this computer's engines first, as the desktop's own runs do)
+    let input = match asked.input {
+        Some(i) => tokio::task::spawn_blocking(move || crate::bridge::pictures::referenced(i)).await.ok(),
+        None => None,
+    };
+    let key = asked.key.filter(|k| !k.trim().is_empty() && k.len() <= 200).unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let request = crate::bridge::ledger::RunRequest {
+        caller_product: run_caller(&primary),
+        flow_id: Some(id.clone()),
+        inline_graph: false,
+        input,
+        timeout_ms: Some(asked.timeout_ms.unwrap_or(10 * 60 * 1000).clamp(1000, RUN_LIMIT_MS)),
+        mode: "async".into(),
+        correlation_id: format!("network:{}", uuid::Uuid::new_v4().simple()),
+        idempotency_key: format!("network:{}:{key}", primary.node_id),
+        lineage: Default::default(),
+        trigger_event: None,
+    };
+    let outcome = { lock(&bridge.ledger).reserve(&request) };
+    match outcome {
+        crate::bridge::ledger::ReserveOutcome::Reserved(rec) => {
+            log::info!("network: {} runs {id} here ({})", primary.name, rec.run_id);
+            run_answer(StatusCode::CREATED, &rec, base.as_deref())
+        }
+        crate::bridge::ledger::ReserveOutcome::Duplicate(rec) => run_answer(StatusCode::OK, &rec, base.as_deref()),
+        crate::bridge::ledger::ReserveOutcome::Refused { reason } => refuse(StatusCode::UNPROCESSABLE_ENTITY, "invalid_request", format!("refused by a loop guard: {reason}")),
+    }
+}
+
+/// `GET /worker/v1/runs/:id`: a run this primary asked for, as it is now (its output's pictures named at the
+/// primary's route for this worker).
+async fn run_status(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(id): Path<String>, req: Request) -> Response {
+    let Some(primary) = primary_of(&net, &caller) else {
+        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+    };
+    let base = rebase_to(&req);
+    match own_run(&net, &primary, &id) {
+        Some(rec) => run_answer(StatusCode::OK, &rec, base.as_deref()),
+        None => refuse(StatusCode::NOT_FOUND, "not_found", "no such run of this computer's"),
+    }
+}
+
+/// `POST /worker/v1/runs/:id/cancel`: a run this primary asked for, stopped.
+async fn cancel_run(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(id): Path<String>) -> Response {
+    let Some(primary) = primary_of(&net, &caller) else {
+        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+    };
+    let (Some(bridge), Some(_)) = (net.inner().bridge(), own_run(&net, &primary, &id)) else {
+        return refuse(StatusCode::NOT_FOUND, "not_found", "no such run of this computer's");
+    };
+    let outcome = { lock(&bridge.ledger).request_cancel(&id) };
+    match outcome {
+        Ok(status) => Json(json!({ "runId": id, "status": status, "cancelRequested": true })).into_response(),
+        Err(e) => refuse(StatusCode::CONFLICT, "not_cancellable", e),
+    }
+}
+
+fn own_run(net: &Network, primary: &Peer, id: &str) -> Option<crate::bridge::ledger::RunRecord> {
+    let bridge = net.inner().bridge()?;
+    let rec = { lock(&bridge.ledger).get(id) }?;
+    (rec.caller_product == run_caller(primary)).then_some(rec)
+}
+
+/// The primary's own address for this worker's gateway (`x-oaiy-base`), where a run's pictures are named.
+fn rebase_to(req: &Request) -> Option<String> {
+    req.headers().get("x-oaiy-base").and_then(|v| v.to_str().ok()).filter(|b| b.starts_with("http://") && b.len() < 512).map(str::to_owned)
+}
+
+/// A run's record, its pictures (this desktop's own engine route, `http://127.0.0.1:<port>/api/ai/engine/gateway/…`)
+/// named at `base`, the primary's route for this worker's gateway.
+fn run_answer(status: StatusCode, rec: &crate::bridge::ledger::RunRecord, base: Option<&str>) -> Response {
+    let mut text = serde_json::to_string(rec).unwrap_or_else(|_| "{}".into());
+    if let Some(base) = base {
+        let port = crate::api_port();
+        for host in ["127.0.0.1", "localhost"] {
+            text = text.replace(&format!("http://{host}:{port}{}", crate::ai::engine_services::GATEWAY_PREFIX), base.trim_end_matches('/'));
+        }
+    }
+    (status, [("content-type", "application/json")], text).into_response()
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Services: the ones a worker lends its primary (OAIY Voice), their speech routes alone
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The services a worker lends its paired primary, each with the routes of its a primary reaches: OAIY Voice's speech
+/// (its models and voices, speech-to-text and text-to-speech), so a primary connected to the phone can have this
+/// computer hear and speak its calls. Nothing else of a service (its settings, files or other routes), and no other
+/// service (one a person added could be anything).
+pub(crate) const SHARED_SERVICES: [(&str, &[(&str, &str)]); 1] = [(
+    crate::voice::engines::STT_SERVICE,
+    &[("GET", "/v1/models"), ("GET", "/health"), ("GET", "/v1/audio/voices"), ("POST", "/v1/audio/transcriptions"), ("POST", "/v1/audio/speech")],
+)];
+
+/// The services this worker lends, as the primary shows them: `[{id, name, installed, status}]` (one not added here
+/// is left out).
+pub(crate) fn shared_services(net: &Network) -> Vec<Value> {
+    let Ok(registry) = net.inner().ai.registry.lock() else { return Vec::new() };
+    let snapshot = registry.snapshot();
+    SHARED_SERVICES
+        .iter()
+        .filter_map(|(id, _)| snapshot.services.iter().find(|s| s.id == *id))
+        .map(|s| json!({ "id": s.id, "name": s.name, "installed": s.installed, "status": s.status }))
+        .collect()
+}
+
+/// `/worker/v1/services/:service/<path>`: one of a shared service's routes, on this computer's own (started where it
+/// is not running: a call is coming), its answer streamed back as it comes (a line of speech, word by word).
+async fn service(State(net): State<Network>, Extension(caller): Extension<Caller>, Path((service, path)): Path<(String, String)>, req: Request) -> Response {
+    if primary_of(&net, &caller).is_none() {
+        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+    }
+    let path = format!("/{path}");
+    let method = req.method().as_str().to_ascii_uppercase();
+    let Some((id, _)) = SHARED_SERVICES.iter().find(|(id, routes)| *id == service && routes.iter().any(|(m, p)| *m == method && *p == path)) else {
+        return refuse(StatusCode::NOT_FOUND, "not_shared", format!("{method} {path} is not one of the routes {service} lends"));
+    };
+    let id = *id;
+    let registry = net.inner().ai.registry.clone();
+    let port = tokio::task::spawn_blocking(move || -> Result<u16, String> {
+        let mut r = registry.lock().map_err(|_| "the services are unavailable".to_string())?;
+        r.start(id).map_err(|e| format!("{id} did not start: {e}"))?;
+        r.service_port(id).ok_or_else(|| format!("{id} has no port"))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    let port = match port {
+        Ok(p) => p,
+        Err(e) => return refuse(StatusCode::CONFLICT, "service_unavailable", e),
+    };
+    let content_type = req.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let body = match axum::body::to_bytes(req.into_body(), MEDIA_LIMIT).await {
+        Ok(b) => b,
+        Err(e) => return refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", e.to_string()),
+    };
+    let Ok(client) = reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).build() else {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "no HTTP client");
+    };
+    let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
+        return refuse(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", method);
+    };
+    let mut call = client.request(m, format!("http://127.0.0.1:{port}{path}"));
+    if let Some(ct) = content_type {
+        call = call.header("content-type", ct);
+    }
+    if !body.is_empty() {
+        call = call.body(body);
+    }
+    match call.send().await {
+        Ok(r) => passthrough(r),
+        // (just started, loading its models: asked again until it answers, as this computer's own calls do)
+        Err(e) if e.is_connect() => refuse(StatusCode::SERVICE_UNAVAILABLE, "service_starting", format!("{id} is starting on {}", net.display_name())),
+        Err(e) => refuse(StatusCode::BAD_GATEWAY, "service_unreachable", format!("{id} did not answer: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct VoiceCopy {
+    /// The clip, base64 (a WAV, MP3, FLAC or OGG of the voice).
+    clip: String,
+    #[serde(default)]
+    extension: Option<String>,
+    /// What it says, where its primary has that written down.
+    #[serde(default)]
+    words: Option<String>,
+}
+
+/// The name a primary's voice is kept under here: its own beside this computer's, never in place of one.
+pub(crate) fn copied_voice_name(primary_node: &str, voice: &str) -> String {
+    let short: String = primary_node.chars().take(6).collect();
+    format!("from-{short}-{voice}")
+}
+
+/// `PUT /worker/v1/voices/:name` `{clip, extension?, words?}`: the voice its primary answers calls in, copied here
+/// (under a name of its own, `from-<primary>-<name>`) so this computer's speech server speaks in it.
+async fn voice_copy(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(name): Path<String>, Json(copy): Json<VoiceCopy>) -> Response {
+    let Some(primary) = primary_of(&net, &caller) else {
+        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+    };
+    let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, copy.clip.trim()) else {
+        return refuse(StatusCode::BAD_REQUEST, "invalid_request", "the clip is not base64");
+    };
+    if bytes.len() > crate::voice::voices::MAX_CLIP_BYTES {
+        return refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "a voice clip is 20 MB at most");
+    }
+    let stored = copied_voice_name(&primary.node_id, &name);
+    let extension = copy.extension.unwrap_or_else(|| "wav".into());
+    match tokio::task::spawn_blocking(move || crate::voice::voices::add(&stored, &extension, &bytes, copy.words.as_deref())).await {
+        Ok(Ok(clip)) => Json(json!({ "voice": clip.name })).into_response(),
+        Ok(Err(e)) => refuse(StatusCode::BAD_REQUEST, "invalid_request", e),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
 }
 
 /// `GET /worker/v1/resources`: the GPUs and what holds them.

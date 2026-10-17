@@ -232,7 +232,20 @@ export function WizardFrame({
 // ---------------------------------------------------------------------------
 
 /** A service (OAIY Voice) the step needs: installed through the services route, with its progress. */
-export function ServiceCard({ id, why, services, onChanged }: { id: string; why?: string; services: ServiceSnapshot[] | null; onChanged: () => void }) {
+export function ServiceCard({
+  id,
+  why,
+  services,
+  onChanged,
+  onComputer,
+}: {
+  id: string;
+  why?: string;
+  services: ServiceSnapshot[] | null;
+  onChanged: () => void;
+  /** The paired computer (OAIY Network) whose service this computer uses in place of its own, by its name. */
+  onComputer?: string | null;
+}) {
   const svc = services?.find((s) => s.id === id) ?? null;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -276,7 +289,8 @@ export function ServiceCard({ id, why, services, onChanged }: { id: string; why?
   const pct = /(\d{1,3}(?:\.\d+)?)\s?%/.exec(line)?.[1];
   let status: ReactNode;
   let action: ReactNode = null;
-  if (!services) status = <span className="form-hint">Checking…</span>;
+  if (onComputer) status = <span className="badge badge-ok">On {onComputer} (OAIY Network)</span>;
+  else if (!services) status = <span className="form-hint">Checking…</span>;
   else if (!svc) status = <span className="card-warn">This OAIY has no {id} service.</span>;
   else if (installing) {
     status = (

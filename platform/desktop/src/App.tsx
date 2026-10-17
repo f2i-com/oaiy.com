@@ -30,7 +30,7 @@ import {
   type LucideIcon,
   Network,
 } from 'lucide-react';
-import { API_BASE, DESKTOP_LAUNCH, openExternal, phone as phoneApi } from './api';
+import { API_BASE, DESKTOP_LAUNCH, network as networkApi, openExternal, phone as phoneApi } from './api';
 import { moduleOn, useModules } from './useModules';
 import { arrangeSections, buildSections, newBadge, pluginPageOf, sectionOf as findSection, type Group, type NavSection } from './sections';
 import { useWaitingRequests } from './calendarRequests';
@@ -38,6 +38,8 @@ import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
 import NetworkPanel from './NetworkPanel';
 import EngineWorkersPanel from './EngineWorkersPanel';
+import FlowWorkersPanel from './FlowWorkersPanel';
+import NetworkPairingPrompt from './NetworkPairingPrompt';
 import ModelsPanel from './ModelsPanel';
 import PythonPanel from './PythonPanel';
 import PluginsPanel from './PluginsPanel';
@@ -101,6 +103,8 @@ type BuiltinView =
   | 'network'
   /** Engines → Other computers: the paired workers' models, and which is this computer's default of its kind. */
   | 'engine-workers'
+  /** Flows → On other computers: the flows the paired workers share, run there from here. */
+  | 'flow-workers'
   | 'plugins'
   | 'runs'
   | 'models'
@@ -132,7 +136,7 @@ interface Section {
 const SECTIONS: Section[] = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard, group: 'Home', tabs: ['overview'] },
   { id: 'agent', label: 'Agent', icon: Bot, group: 'Work', tabs: ['agent'] },
-  { id: 'flows', label: 'Flows', icon: Workflow, group: 'Work', tabs: ['flows', 'runs'] },
+  { id: 'flows', label: 'Flows', icon: Workflow, group: 'Work', tabs: ['flows', 'runs', 'flow-workers'] },
   { id: 'calendar', label: 'Calendar', icon: CalendarDays, group: 'Work', tabs: ['calendar', 'hours'] },
   { id: 'contacts', label: 'Contacts', icon: BookUser, group: 'Work', tabs: ['contacts'] },
   { id: 'messages', label: 'Messages', icon: Inbox, group: 'Work', tabs: ['messages'] },
@@ -200,6 +204,11 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
     tab: 'Engines',
     icon: Cpu,
     copy: 'The language, picture, video, speech, music and 3D models this machine runs, and their endpoints.',
+  },
+  'flow-workers': {
+    tab: 'On other computers',
+    icon: Network,
+    copy: 'The flows other OAIY computers on your network share, run there, on their own models and GPUs.',
   },
   'engine-workers': {
     tab: 'Other computers',
@@ -505,6 +514,29 @@ export default function App() {
     };
   }, []);
 
+  // OAIY Network: primaries asking to pair with this worker, counted on the Networking entry and asked wherever the
+  // person is (NetworkPairingPrompt). Asked every few seconds while the window is shown; nothing while it is off.
+  const [netWaiting, setNetWaiting] = useState(0);
+  useEffect(() => {
+    if (isolated) return;
+    let cancelled = false;
+    const look = async () => {
+      if (document.hidden) return;
+      try {
+        const s = await networkApi.status();
+        if (!cancelled) setNetWaiting(s.role === 'worker' ? s.waiting : 0);
+      } catch {
+        /* starting, or an older desktop: no requests to show */
+      }
+    };
+    void look();
+    const id = window.setInterval(look, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [isolated]);
+
   // A call going on now: the Agent's nav entry says so (the Agent page shows the call itself).
   // Asked only while there is a phone.
   const [onCall, setOnCall] = useState(false);
@@ -622,7 +654,7 @@ export default function App() {
     const Icon = s.icon;
     const active = section?.id === s.id;
     const calling = s.id === 'agent' && onCall;
-    const badge = newBadge(s, seen);
+    const badge = newBadge(s, seen) ?? (s.id === 'network' && netWaiting > 0 ? String(netWaiting) : null);
     if (s.sub) return navSub(s, calling);
     return (
       <button
@@ -868,6 +900,7 @@ export default function App() {
               </div>
             ) : <>
             {!isolated && <PairingPrompt />}
+            {!isolated && view !== 'network' && <NetworkPairingPrompt waiting={netWaiting} onOpen={() => setView('network')} />}
             {view === 'overview' && (
               <OverviewPanel
                 onNavigate={(v) => setView(v)}
@@ -878,8 +911,9 @@ export default function App() {
               <PluginScreenPage pluginId={pluginView[1]} navId={pluginView[2]} onNavigate={(v) => setView(v)} />
             )}
             {view === 'services' && <ServicesPanel />}
-            {view === 'network' && <NetworkPanel />}
+            {view === 'network' && <NetworkPanel onNavigate={(v) => setView(v)} />}
             {view === 'engine-workers' && <EngineWorkersPanel onOpenNetworking={() => setView('network')} />}
+            {view === 'flow-workers' && <FlowWorkersPanel onOpenNetworking={() => setView('network')} />}
             {view === 'plugins' && <PluginsPanel />}
             {view === 'runs' && <RunsPanel />}
             {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}

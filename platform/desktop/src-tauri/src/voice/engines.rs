@@ -29,19 +29,100 @@ pub struct Engines {
     http: reqwest::Client,
     /// Fixed addresses (tests): no services are started.
     fixed: Option<(String, String)>,
+    /// The voices copied to a worker whose speech is used in place of this computer's (OAIY Network), by worker,
+    /// voice and clip: the name each is kept under there.
+    copied: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// A worker's speech used whatever the network's settings say (tests).
+    pinned: Option<crate::network::ServiceTarget>,
+}
+
+/// Where a speech service answers: the client that reaches it and its address, this computer's own or a paired
+/// worker's chosen in its place (`remote`).
+struct Target {
+    http: reqwest::Client,
+    base: String,
+    remote: Option<crate::network::ServiceTarget>,
 }
 
 impl Engines {
     pub fn new(registry: RegistryHandle) -> Self {
-        Self { registry: Some(registry), http: reqwest::Client::new(), fixed: None }
+        Self { registry: Some(registry), http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: None }
+    }
+
+    /// Speech on a paired worker, whatever the network's settings say (tests).
+    pub fn via(remote: crate::network::ServiceTarget) -> Self {
+        Self { registry: None, http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: Some(remote) }
     }
 
     /// Speech at fixed addresses (tests, or a voice server run by hand).
     pub fn at(stt: &str, tts: &str) -> Self {
-        Self { registry: None, http: reqwest::Client::new(), fixed: Some((stt.to_string(), tts.to_string())) }
+        Self { registry: None, http: reqwest::Client::new(), fixed: Some((stt.to_string(), tts.to_string())), copied: Default::default(), pinned: None }
     }
 
-    /// A speech service's address, started if it is not running and waited on until it answers.
+    /// Where a speech service answers now: a paired worker's chosen in place of this computer's (OAIY Network, Services
+    /// → Other computers), else this computer's own, started if it is not running; either waited on until it answers.
+    async fn target(&self, id: &'static str) -> Result<Target, String> {
+        let remote = match &self.pinned {
+            Some(r) => Some(r.clone()),
+            None if self.fixed.is_none() && self.registry.is_some() => crate::network::service_target(id),
+            None => None,
+        };
+        {
+            if let Some(remote) = remote {
+                let started = Instant::now();
+                loop {
+                    match remote.client.get(format!("{}/v1/models", remote.base)).timeout(Duration::from_secs(5)).send().await {
+                        Ok(r) if r.status().is_success() => break,
+                        Ok(r) if !matches!(r.status().as_u16(), 503 | 502) => {
+                            return Err(format!("{id} on {}: HTTP {}: {}", remote.node_name, r.status(), r.text().await.unwrap_or_default()));
+                        }
+                        _ if started.elapsed() > START_WAIT => return Err(format!("{id} on {} did not answer within {} s", remote.node_name, START_WAIT.as_secs())),
+                        _ => tokio::time::sleep(Duration::from_millis(500)).await,
+                    }
+                }
+                return Ok(Target { http: remote.client.clone(), base: remote.base.clone(), remote: Some(remote) });
+            }
+        }
+        Ok(Target { http: self.http.clone(), base: self.base(id).await?, remote: None })
+    }
+
+    /// The voice as `target` knows it: this computer's own name, or on a worker the copy of its clip kept there (copied
+    /// the first time it is used there, and again when its clip changes). A voice that cannot be copied is asked for
+    /// by its own name (the worker may have it).
+    async fn voice_at(&self, target: &Target, voice: &str) -> String {
+        let Some(remote) = &target.remote else { return voice.to_string() };
+        let Some(clip) = super::voices::list().into_iter().find(|c| c.name == voice) else { return voice.to_string() };
+        let key = format!("{}|{}|{}|{}", remote.root, clip.name, clip.file, clip.bytes);
+        if let Some(name) = self.copied.lock().ok().and_then(|c| c.get(&key).cloned()) {
+            return name;
+        }
+        let Some(dir) = super::voices::dir() else { return voice.to_string() };
+        let path = dir.join(&clip.file);
+        let words = std::fs::read_to_string(path.with_extension("txt")).ok();
+        let Ok(bytes) = tokio::fs::read(&path).await else { return voice.to_string() };
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("wav").to_string();
+        let body = serde_json::json!({ "clip": base64::engine::general_purpose::STANDARD.encode(bytes), "extension": extension, "words": words });
+        let answer = remote.client.put(format!("{}/worker/v1/voices/{}", remote.root, clip.name)).json(&body).timeout(Duration::from_secs(60)).send().await;
+        match answer {
+            Ok(r) if r.status().is_success() => {
+                let name = r.json::<serde_json::Value>().await.ok().and_then(|v| v["voice"].as_str().map(str::to_owned)).unwrap_or_else(|| voice.to_string());
+                if let Ok(mut c) = self.copied.lock() {
+                    c.insert(key, name.clone());
+                }
+                name
+            }
+            Ok(r) => {
+                log::warn!("voice: {voice} could not be copied to {}: HTTP {}", remote.node_name, r.status());
+                voice.to_string()
+            }
+            Err(e) => {
+                log::warn!("voice: {voice} could not be copied to {}: {e}", remote.node_name);
+                voice.to_string()
+            }
+        }
+    }
+
+    /// A speech service's address on this computer, started if it is not running and waited on until it answers.
     async fn base(&self, id: &'static str) -> Result<String, String> {
         if let Some((stt, tts)) = &self.fixed {
             return Ok(if id == STT_SERVICE { stt.clone() } else { tts.clone() });
@@ -68,9 +149,9 @@ impl Engines {
     /// Start both (a call is coming: the first words should not wait for a model to load).
     pub async fn warm(&self) -> Result<(), String> {
         if STT_SERVICE == TTS_SERVICE && self.fixed.is_none() {
-            return self.base(STT_SERVICE).await.map(|_| ());
+            return self.target(STT_SERVICE).await.map(|_| ());
         }
-        let (a, b) = tokio::join!(self.base(STT_SERVICE), self.base(TTS_SERVICE));
+        let (a, b) = tokio::join!(self.target(STT_SERVICE), self.target(TTS_SERVICE));
         a.and(b).map(|_| ())
     }
 
@@ -82,12 +163,12 @@ impl Engines {
 
     /// What was said in a recording: a 16 kHz mono 16-bit WAV.
     pub async fn transcribe_wav(&self, wav: Vec<u8>) -> Result<String, String> {
-        let base = self.base(STT_SERVICE).await?;
+        let t = self.target(STT_SERVICE).await?;
         let body = serde_json::json!({
             "audio": base64::engine::general_purpose::STANDARD.encode(wav),
             "response_format": "json",
         });
-        let resp = self.http.post(format!("{base}/v1/audio/transcriptions")).json(&body).timeout(Duration::from_secs(60)).send().await.map_err(|e| format!("speech-to-text: {e}"))?;
+        let resp = t.http.post(format!("{}/v1/audio/transcriptions", t.base)).json(&body).timeout(Duration::from_secs(60)).send().await.map_err(|e| format!("speech-to-text: {e}"))?;
         let status = resp.status();
         let value: serde_json::Value = resp.json().await.map_err(|e| format!("speech-to-text answer: {e}"))?;
         if !status.is_success() {
@@ -100,12 +181,12 @@ impl Engines {
     /// greeting, while the line settles. The server makes it again with another seed where it does not sound like its
     /// voice (one line in twenty or so does not, and a greeting so made was the same at every call).
     pub async fn prepare(&self, text: &str, voice: Option<&str>) -> Result<(), String> {
-        let base = self.base(TTS_SERVICE).await?;
+        let t = self.target(TTS_SERVICE).await?;
         let mut body = serde_json::json!({ "input": text, "response_format": "pcm", "prepare": true });
         if let Some(v) = voice {
-            body["voice"] = serde_json::Value::String(v.to_string());
+            body["voice"] = serde_json::Value::String(self.voice_at(&t, v).await);
         }
-        let resp = self.http.post(format!("{base}/v1/audio/speech")).json(&body).timeout(Duration::from_secs(60)).send().await.map_err(|e| format!("text-to-speech: {e}"))?;
+        let resp = t.http.post(format!("{}/v1/audio/speech", t.base)).json(&body).timeout(Duration::from_secs(60)).send().await.map_err(|e| format!("text-to-speech: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("text-to-speech: HTTP {}", resp.status()));
         }
@@ -115,12 +196,12 @@ impl Engines {
     /// Speak `text`: its audio at the wire rate, chunk by chunk as it is made,
     /// until done or `out` is closed (the item was cancelled).
     pub async fn speak(&self, text: &str, voice: Option<&str>, out: &mpsc::Sender<Vec<i16>>) -> Result<(), String> {
-        let base = self.base(TTS_SERVICE).await?;
+        let t = self.target(TTS_SERVICE).await?;
         let mut body = serde_json::json!({ "input": text, "response_format": "pcm" });
         if let Some(v) = voice {
-            body["voice"] = serde_json::Value::String(v.to_string());
+            body["voice"] = serde_json::Value::String(self.voice_at(&t, v).await);
         }
-        let resp = self.http.post(format!("{base}/v1/audio/speech")).json(&body).timeout(Duration::from_secs(120)).send().await.map_err(|e| format!("text-to-speech: {e}"))?;
+        let resp = t.http.post(format!("{}/v1/audio/speech", t.base)).json(&body).timeout(Duration::from_secs(120)).send().await.map_err(|e| format!("text-to-speech: {e}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
             return Err(format!("text-to-speech: HTTP {status}: {}", resp.text().await.unwrap_or_default()));

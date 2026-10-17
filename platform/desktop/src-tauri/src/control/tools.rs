@@ -77,6 +77,10 @@ fn flow_id() -> Value {
     json!({ "type": "string", "minLength": 1, "description": "The flow's id, as flows_list shows it." })
 }
 
+fn node_id() -> Value {
+    json!({ "type": "string", "minLength": 1, "description": "A paired worker's node id, as network_status lists it (OAIY Network)." })
+}
+
 fn contact_number() -> Value {
     json!({ "type": "string", "minLength": 1, "description": "Their phone number, written any way (0491 570 006, +61491570006, or the key contacts_list shows)." })
 }
@@ -137,7 +141,7 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 }), &["source"])),
             // OAIY Network
             def("network_status", "OAIY Network", Read,
-                "OAIY Network (other OAIY computers on this LAN): whether it is on, this computer's role (primary: it uses paired workers' models; worker: it lends its own), the workers found on the LAN, and the paired computers, each online or not with its GPUs and models. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
+                "OAIY Network (other OAIY computers on this LAN): whether it is on, this computer's role (primary: it uses paired workers' models; worker: it lends its own), the workers found on the LAN, and the paired computers, each online or not with its GPUs, models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
                 none()),
             def("chatgpt_sign_in", "Sign in to ChatGPT", Change,
                 "Start signing OAIY in to ChatGPT (its Codex connector). Answers the address for the person to open and sign in at (with deviceCode, a code for them to type instead); ai_sources_list shows when they have.",
@@ -225,8 +229,8 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 object(json!({ "pluginId": plugin_id() }), &["pluginId"])),
             // Flows
             def("flows_list", "Flows", Read,
-                "The flows stored on this desktop: id, name, description, the inputs each takes (by name, with the value it has when none is given), and whether it is shared with apps (oaiyRemote: FormLogic and other apps may run it through the oaiy-flows connector).",
-                none()),
+                "The flows stored on this desktop: id, name, description, the inputs each takes (by name, with the value it has when none is given), and whether it is shared with apps (oaiyRemote: FormLogic and other apps may run it through the oaiy-flows connector). With node (a paired worker's node id, as network_status lists it, OAIY Network): the flows that computer shares, which flow_run with the same node runs there.",
+                object(json!({ "node": node_id() }), &[])),
             def("flow_get", "A flow", Read,
                 "One flow's document as stored ({name, nodes, edges}). Read one before flow_create or flow_update, to follow its shape.",
                 object(json!({ "id": flow_id() }), &["id"])),
@@ -243,9 +247,10 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                     "flow": { "type": "object", "description": "The flow's whole new document." }
                 }), &["id", "flow"])),
             def("flow_run", "Run a flow", Change,
-                "Run a stored flow with an optional input (an object, each input by the name flows_list gives). By default waits for it (up to timeoutSeconds, 60) and answers its status and output, and the pictures its answer names as images; with wait false, answers the run at once.",
+                "Run a stored flow with an optional input (an object, each input by the name flows_list gives). By default waits for it (up to timeoutSeconds, 60) and answers its status and output, and the pictures its answer names as images; with wait false, answers the run at once. With node (OAIY Network), one of the flows that paired worker shares, run there by its own runner and models.",
                 object(json!({
                     "id": flow_id(),
+                    "node": node_id(),
                     "input": { "description": "The flow's input." },
                     "wait": { "type": "boolean", "description": "Wait for the result (default true)." },
                     "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600, "description": "How long the run may take (default 60)." }
@@ -695,6 +700,15 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             let version = v.pointer(&format!("/plugins/{id}/version")).cloned().unwrap_or(Value::Null);
             done(format!("{id}'s setup is recorded as finished."), json!({ "pluginId": id, "version": version }))
         }
+        "flows_list" if a.str("node").is_some() => {
+            let node = a.req("node");
+            let v = d.get(&format!("/api/network/nodes/{}/flows", seg(node))).await?;
+            let flows: Vec<Value> = arr(&v, "flows")
+                .iter()
+                .map(|f| json!({ "id": f.get("flowId"), "name": f.get("name"), "description": f.get("description"), "inputs": f.get("inputs"), "node": node }))
+                .collect();
+            data(json!({ "flows": flows }))
+        }
         "flows_list" => {
             let v = d.get("/api/bridge/flows").await?;
             let mut flows = Vec::new();
@@ -729,7 +743,7 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             d.put_json_body(&format!("/api/bridge/flows/{}", seg(id)), a.value("flow").cloned().unwrap_or_default()).await?;
             done(format!("Saved flow {id}."), json!({ "id": id }))
         }
-        "flow_run" => flow_run(d, a.req("id"), a.value("input").cloned(), a.bool("wait").unwrap_or(true), a.int("timeoutSeconds").unwrap_or(60) as u64).await,
+        "flow_run" => flow_run(d, a.req("id"), a.str("node"), a.value("input").cloned(), a.bool("wait").unwrap_or(true), a.int("timeoutSeconds").unwrap_or(60) as u64).await,
         "flow_delete" => {
             let id = a.req("id");
             d.delete(&format!("/api/bridge/flows/{}", seg(id))).await?;
@@ -1383,7 +1397,7 @@ async fn ai_sources_list(d: &Desk) -> Result<Done, String> {
 async fn network_status(d: &Desk) -> Result<Done, String> {
     let status = d.get("/api/network/status").await?;
     let mut out = json!({});
-    for key in ["enabled", "role", "name", "addresses", "listening", "discovery", "waiting", "found", "paired"] {
+    for key in ["enabled", "role", "name", "addresses", "listening", "discovery", "waiting", "found", "paired", "defaults", "services"] {
         if let Some(v) = status.get(key).filter(|v| !v.is_null()) {
             out[key] = v.clone();
         }
@@ -1425,6 +1439,9 @@ async fn network_status(d: &Desk) -> Result<Done, String> {
                             .map(|m| json!({ "id": m.get("id"), "kind": m.get("kind"), "model": m.get("model"), "state": m.get("state") }))
                             .collect(),
                     );
+                    // (the flows it shares, run there with flow_run's node, and the services it lends: OAIY Voice)
+                    row["flows"] = Value::Array(arr(n, "flows").iter().map(|f| json!({ "id": f.get("flowId"), "name": f.get("name"), "inputs": f.get("inputs") })).collect());
+                    row["services"] = Value::Array(arr(n, "services").iter().map(|x| json!({ "id": x.get("id"), "name": x.get("name"), "installed": x.get("installed"), "status": x.get("status") })).collect());
                     row
                 })
                 .collect(),
@@ -1770,7 +1787,13 @@ async fn plugin_setup_status(d: &Desk, id: &str) -> Result<Done, String> {
                         let sid = s(r, "id");
                         let svc = services.as_ref().and_then(|v| arr(v, "services").iter().find(|x| x.get("id").and_then(Value::as_str) == Some(sid.as_str())).cloned());
                         let installed = svc.as_ref().and_then(|x| x.get("installed")).and_then(Value::as_bool).unwrap_or(false);
-                        json!({ "kind": "service", "id": sid, "met": installed, "status": svc.as_ref().and_then(|x| x.get("status").cloned()), "why": r.get("why") })
+                        // (a paired computer's used in place of this computer's own: OAIY Network)
+                        let on = crate::network::service_target(&sid).map(|t| t.node_name);
+                        let mut row = json!({ "kind": "service", "id": sid, "met": installed || on.is_some(), "status": svc.as_ref().and_then(|x| x.get("status").cloned()), "why": r.get("why") });
+                        if let Some(name) = on {
+                            row["onComputer"] = json!(name);
+                        }
+                        row
                     }
                     Some("engineModel") => {
                         let group = s(r, "group");
@@ -1877,7 +1900,13 @@ async fn flow_create(d: &Desk, id: Option<&str>, flow: Value) -> Result<Done, St
     done(format!("Stored the flow {shown}."), json!({ "id": id, "name": name }))
 }
 
-async fn flow_run(d: &Desk, id: &str, input: Option<Value>, wait: bool, timeout_s: u64) -> Result<Done, String> {
+async fn flow_run(d: &Desk, id: &str, node: Option<&str>, input: Option<Value>, wait: bool, timeout_s: u64) -> Result<Done, String> {
+    // (a paired worker's shared flow, run there: OAIY Network)
+    if let Some(node) = node {
+        let body = json!({ "input": input, "timeoutMs": timeout_s * 1000, "wait": wait });
+        let r = d.post_within(&format!("/api/network/nodes/{}/flows/{}/runs", seg(node), seg(id)), body, Duration::from_secs(timeout_s + 30)).await?;
+        return run_answer(d, id, &r).await;
+    }
     if !flow_ids(d).await?.iter().any(|f| f == id) {
         return Err(format!("There is no flow {id:?}: flows_list shows them."));
     }
@@ -1895,6 +1924,11 @@ async fn flow_run(d: &Desk, id: &str, input: Option<Value>, wait: bool, timeout_
         body["input"] = input;
     }
     let r = d.post_within("/api/bridge/runs", body, Duration::from_secs(timeout_s + 20)).await?;
+    run_answer(d, id, &r).await
+}
+
+/// A run's record as the Agent is told it: its status, output and error, and the pictures it names as images.
+async fn run_answer(d: &Desk, id: &str, r: &Value) -> Result<Done, String> {
     let status = r.get("status").and_then(Value::as_str).unwrap_or("unknown").to_string();
     let error = r.get("error").filter(|e| !e.is_null()).map(|e| e.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| e.to_string()));
     let summary = match (status.as_str(), &error) {

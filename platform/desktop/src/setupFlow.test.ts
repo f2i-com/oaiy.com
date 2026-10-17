@@ -519,3 +519,11 @@ describe('capabilities in plain words', () => {
     expect(describeCapabilities(['flow.run'])[0].text).toBe('Run your flows');
   });
 });
+
+describe('a service used on a paired computer (OAIY Network)', () => {
+  it('counts as set up here', () => {
+    const req = { kind: 'service', id: 'oaiy-voice' } as const;
+    expect(requirementMet(req, [], null)).toBe(false);
+    expect(requirementMet(req, [], null, { 'oaiy-voice': { nodeId: 'w1', nodeName: 'Rig' } })).toBe(true);
+  });
+});

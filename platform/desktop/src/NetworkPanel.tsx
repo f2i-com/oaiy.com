@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { Check, Copy, Laptop, Link2, Loader2, Pin, PinOff, Server, TriangleAlert, Unplug, X, type LucideIcon } from 'lucide-react';
+import { AudioLines, Check, Copy, Laptop, Link2, Loader2, Pin, PinOff, Server, TriangleAlert, Unplug, Workflow, X, type LucideIcon } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import {
   network,
@@ -20,7 +20,7 @@ import {
  *
  * Off by default: a computer that never switches it on sees only the switch.
  */
-export default function NetworkPanel() {
+export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow-workers' | 'services' | 'engine-workers') => void } = {}) {
   const [status, setStatus] = useState<NetworkStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [nodes, setNodes] = useState<NetworkNode[]>([]);
@@ -98,12 +98,14 @@ export default function NetworkPanel() {
           }}
         />
       )}
-      {status.role === 'primary' && <FindWorkers found={found} discovery={status.discovery} onPaired={refresh} />}
+      {status.role === 'primary' && <FindWorkers found={found} discovery={status.discovery} inProgress={status.pairings} onPaired={refresh} />}
       {status.role !== 'standalone' && (
         <PairedComputers
           nodes={nodes}
           role={status.role}
           defaults={status.defaults}
+          services={status.services}
+          onNavigate={onNavigate}
           onChanged={refresh}
           onUnpair={async (n) => {
             if (!window.confirm(`Unpair ${n.name}? It can no longer ${status.role === 'primary' ? 'lend its models to this computer' : 'use this computer'} until you pair again.`)) return;
@@ -127,14 +129,14 @@ const ROLES: { value: Exclude<NetworkRole, 'standalone'>; label: string; tag: st
     label: 'Use other computers',
     tag: 'Primary',
     icon: Laptop,
-    hint: 'Pair with OAIY computers on this network and use their models here, in Engines, Flows and the Agent.',
+    hint: 'Pair with OAIY computers on this network and use their models, the flows they share and their OAIY Voice from here.',
   },
   {
     value: 'worker',
     label: 'Lend this computer',
     tag: 'Worker',
     icon: Server,
-    hint: 'A paired primary runs models on this computer’s GPUs. Only computers you approve here can.',
+    hint: 'A paired primary uses this computer’s GPUs and models, the flows it shares and its OAIY Voice. Only computers you approve here can.',
   },
 ];
 
@@ -191,9 +193,31 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
         </h3>
       </div>
       <p className="form-hint">
-        OAIY Network lets OAIY computers on the same network share their GPUs: a primary uses a worker’s models as if they were its own,
-        and nothing leaves your network. It stays off until you switch it on.
+        OAIY Network lets OAIY computers on the same network work as one: a primary uses a worker’s models, GPUs, shared flows and OAIY
+        Voice as if they were its own, and nothing leaves your network. It stays off until you switch it on.
       </p>
+      {!status.enabled && (
+        <ol className="network-steps" data-testid="network-steps">
+          <li>
+            <Server size={16} aria-hidden />
+            <span>
+              <strong>On the computer with the GPU</strong> choose <em>Lend this computer</em> and switch on.
+            </span>
+          </li>
+          <li>
+            <Laptop size={16} aria-hidden />
+            <span>
+              <strong>On this computer</strong> choose <em>Use other computers</em> and switch on: the worker shows up, or add it by its address.
+            </span>
+          </li>
+          <li>
+            <Link2 size={16} aria-hidden />
+            <span>
+              <strong>Pair them:</strong> approve on both screens if they show the same code. Its models, the flows it shares and its OAIY Voice then work from here.
+            </span>
+          </li>
+        </ol>
+      )}
       <form className="dl-form" onSubmit={save}>
         <div className="network-roles" role="radiogroup" aria-label="This computer's role">
           {ROLES.map((r) => {
@@ -274,6 +298,11 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
             ) : (
               <div className="network-invalid">Not listening: switch it on again, or choose another port.</div>
             ))}
+          {status.role === 'worker' && (
+            <div>
+              It lends its primary its models and GPUs, the flows it shares (<em>Let apps run it</em> in Flows) and OAIY Voice, when set up here.
+            </div>
+          )}
           {!status.discovery && <div>Finding computers on the network (mDNS) is off here: add them by their address.</div>}
         </div>
       )}
@@ -282,7 +311,7 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
 }
 
 /** The six digits both screens show, large enough to compare at a glance. */
-function PairingCode({ code }: { code: string }) {
+export function PairingCode({ code }: { code: string }) {
   return (
     <div className="network-code" aria-label={`Pairing code ${code}`}>
       {code}
@@ -338,11 +367,22 @@ function WorkerRequests({ requests, onDecide }: { requests: NetworkRequest[]; on
   );
 }
 
-function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; discovery: boolean; onPaired: () => void }) {
+function FindWorkers({
+  found,
+  discovery,
+  inProgress,
+  onPaired,
+}: {
+  found: NetworkFound[];
+  discovery: boolean;
+  /** The pairings this computer is in the middle of: one started before the page was left is shown again. */
+  inProgress?: NetworkPairing[];
+  onPaired: () => void;
+}) {
   const [address, setAddress] = useState('');
-  const [pairing, setPairing] = useState<NetworkPairing | null>(null);
+  const [pairing, setPairing] = useState<NetworkPairing | null>(() => inProgress?.[0] ?? null);
   /** The worker approved: this side's person says whether it showed the same code. */
-  const [approvedThere, setApprovedThere] = useState(false);
+  const [approvedThere, setApprovedThere] = useState(() => inProgress?.[0]?.status === 'approved_there');
   const [outcome, setOutcome] = useState<{ text: string; paired: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -436,7 +476,16 @@ function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; di
           Add a worker {discovery && <span className="section-count">({unpaired.length} found)</span>}
         </h3>
       </div>
-      {error && <div className="banner banner-err" role="alert">{error}</div>}
+      {error && (
+        <div className="banner banner-err" role="alert">
+          <div>{error}</div>
+          <ul className="network-checklist">
+            <li>On the worker, Setup → Networking says “Worker” and shows the address to type here.</li>
+            <li>Both computers are on the same network (not a guest Wi-Fi that keeps devices apart).</li>
+            <li>The worker’s firewall lets OAIY in (macOS asks the first time; Windows may need “Allow”).</li>
+          </ul>
+        </div>
+      )}
       {outcome && <div className={`banner ${outcome.paired ? 'banner-ok' : 'banner-pending'}`}>{outcome.text}</div>}
       {pairing && (
         <div className="pairing-card pairing-pending network-pairing" data-testid="network-pairing">
@@ -445,6 +494,11 @@ function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; di
             <strong>{pairing.worker.name}</strong>
             <span className="pairing-origin">{pairing.worker.address}</span>
           </div>
+          <ol className="network-progress" aria-label="Pairing">
+            <li className="is-done">Code shown</li>
+            <li className={approvedThere ? 'is-done' : 'is-now'}>Approved on {pairing.worker.name}</li>
+            <li className={approvedThere ? 'is-now' : ''}>Codes matched here</li>
+          </ol>
           <PairingCode code={pairing.code} />
           <div className="network-pairing-step">
             {approvedThere ? (
@@ -669,12 +723,16 @@ function PairedComputers({
   nodes,
   role,
   defaults,
+  services,
+  onNavigate,
   onUnpair,
   onChanged,
 }: {
   nodes: NetworkNode[];
   role: NetworkRole;
   defaults: NetworkStatus['defaults'];
+  services: NetworkStatus['services'];
+  onNavigate?: (view: 'flow-workers' | 'services' | 'engine-workers') => void;
   onUnpair: (n: NetworkNode) => void;
   onChanged: () => void;
 }) {
@@ -735,6 +793,34 @@ function PairedComputers({
                   )}
                   {n.models.length > 0 && <NodeModels node={n} onChanged={onChanged} defaults={defaults} />}
                 </div>
+                {worker && ((n.flows ?? []).length > 0 || (n.services ?? []).length > 0) && (
+                  <div className="network-extras">
+                    {(n.flows ?? []).length > 0 && (
+                      <div className="network-extra">
+                        <span className="settings-label">Flows it shares</span>
+                        <span className="network-extra-what">{(n.flows ?? []).map((f) => f.name).join(', ')}</span>
+                        {onNavigate && (
+                          <button className="btn-tiny" onClick={() => onNavigate('flow-workers')}>
+                            <Workflow size={12} aria-hidden /> Run them
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {(n.services ?? []).length > 0 && (
+                      <div className="network-extra">
+                        <span className="settings-label">Services it lends</span>
+                        <span className="network-extra-what">
+                          {(n.services ?? []).map((x) => `${x.name}${services?.[x.id]?.nodeId === n.nodeId ? ' (in use here)' : x.installed ? '' : ' (not set up there)'}`).join(', ')}
+                        </span>
+                        {onNavigate && (
+                          <button className="btn-tiny" onClick={() => onNavigate('services')}>
+                            <AudioLines size={12} aria-hidden /> Use here
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}

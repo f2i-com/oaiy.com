@@ -6,6 +6,7 @@ import {
   calendar,
   engines,
   isTauri,
+  network as networkApi,
   plugins as pluginsApi,
   services as servicesApi,
   setup as setupApi,
@@ -116,6 +117,9 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   const needsServices = !!declared?.steps.some((s) => s.requires?.some((r) => r.kind === 'service'));
   const needsEngines = !!declared?.steps.some((s) => s.requires?.some((r) => r.kind === 'engineModel'));
   const [services, refreshServices] = usePoll(() => servicesApi.list().then((s) => s.services), 3000, needsServices);
+  // (a service used on a paired computer in place of this computer's own, OAIY Network, is one this computer has)
+  const [netStatus] = usePoll(() => networkApi.status().catch(() => null), 5000, needsServices);
+  const remoteServices = netStatus?.services ?? null;
   const [catalog, refreshCatalog] = usePoll(() => engines.catalog(), 3000, needsEngines);
 
   const [checks, setChecks] = useState<Record<string, CheckOutcome>>({});
@@ -128,8 +132,8 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   })();
 
   const steps: PluginStep[] = useMemo(
-    () => (declared ? pluginSteps(declared, { record: recordState, permissionsAccepted: accepted, services, catalog, checks, whens, host }) : []),
-    [declared, recordState, accepted, services, catalog, checks, whens, host],
+    () => (declared ? pluginSteps(declared, { record: recordState, permissionsAccepted: accepted, services, catalog, remoteServices, checks, whens, host }) : []),
+    [declared, recordState, accepted, services, catalog, remoteServices, checks, whens, host],
   );
 
   // Where it is, by step id (a step can come and go with its `when`).
@@ -270,7 +274,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
             <div className="setup-reqs">
               {(s.requires ?? []).map((r) =>
                 r.kind === 'service' ? (
-                  <ServiceCard key={`s:${r.id}`} id={r.id} why={r.why} services={services} onChanged={() => void refreshServices()} />
+                  <ServiceCard key={`s:${r.id}`} id={r.id} why={r.why} services={services} onChanged={() => void refreshServices()} onComputer={remoteServices?.[r.id]?.nodeName} />
                 ) : (
                   <EngineModelCard key={`m:${r.group}`} group={r.group} why={r.why} catalog={catalog} onChanged={() => void refreshCatalog()} onOpenEngines={() => onNavigate('engines')} />
                 ),

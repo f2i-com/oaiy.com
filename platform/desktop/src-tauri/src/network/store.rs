@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const PEERS_FILE: &str = "peers.json";
 pub const DEFAULTS_FILE: &str = "defaults.json";
+pub const SERVICES_FILE: &str = "remote-services.json";
 
 /// The port a worker listens on unless set (the desktop's API is 17972, its voice gateway 17872).
 pub const DEFAULT_PORT: u16 = 17975;
@@ -211,6 +212,56 @@ impl Defaults {
         let kinds: Vec<String> = self.map.iter().filter(|(_, d)| d.node_id() == node_id).map(|(k, _)| k.clone()).collect();
         for kind in kinds {
             self.set(&kind, None)?;
+        }
+        Ok(())
+    }
+}
+
+/// The services a primary uses on a worker in place of its own (OAIY Voice), by service id: the worker's node id.
+#[derive(Debug)]
+pub struct ServiceChoices {
+    path: PathBuf,
+    map: std::collections::BTreeMap<String, String>,
+}
+
+impl ServiceChoices {
+    pub fn open(dir: &Path) -> ServiceChoices {
+        let path = dir.join(SERVICES_FILE);
+        let map = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        ServiceChoices { path, map }
+    }
+
+    pub fn all(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.map
+    }
+
+    pub fn get(&self, service: &str) -> Option<&str> {
+        self.map.get(service).map(String::as_str)
+    }
+
+    /// `service` used on worker `node` (`None`: this computer's own again), in effect once it is kept.
+    pub fn set(&mut self, service: &str, node: Option<&str>) -> Result<(), String> {
+        let mut next = self.map.clone();
+        match node {
+            Some(n) => next.insert(service.to_string(), n.to_string()),
+            None => next.remove(service),
+        };
+        if next == self.map {
+            return Ok(());
+        }
+        if let Some(dir) = self.path.parent() {
+            crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
+        }
+        crate::secret_file::write(&self.path, serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        self.map = next;
+        Ok(())
+    }
+
+    /// The services used on `node` let go (it was unpaired): this computer's own again.
+    pub fn drop_node(&mut self, node: &str) -> Result<(), String> {
+        let services: Vec<String> = self.map.iter().filter(|(_, n)| *n == node).map(|(s, _)| s.clone()).collect();
+        for service in services {
+            self.set(&service, None)?;
         }
         Ok(())
     }

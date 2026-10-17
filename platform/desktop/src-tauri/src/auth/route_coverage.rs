@@ -553,6 +553,12 @@ pub(super) const NOT_ON_MAIN_ROUTER: &[(&str, &str)] = &[
     ("network/worker.rs", "/worker/v1/pins"),
     ("network/worker.rs", "/worker/v1/chat"),
     ("network/worker.rs", "/worker/v1/gateway/*path"),
+    ("network/worker.rs", "/worker/v1/flows"),
+    ("network/worker.rs", "/worker/v1/flows/:id/runs"),
+    ("network/worker.rs", "/worker/v1/runs/:id"),
+    ("network/worker.rs", "/worker/v1/runs/:id/cancel"),
+    ("network/worker.rs", "/worker/v1/services/:service/*path"),
+    ("network/worker.rs", "/worker/v1/voices/:name"),
 ];
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -713,10 +719,10 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
     // (`backup/routes.rs`: the status and the Agent page's hand-over of its storage), and the routes of
     // `/api/auth/` that the access model has built so far are the rows with `since: 2` that exist:
     // `info`, `whoami` and `derive`, and the web login's fifteen (`login.rs`, `console.rs`). The last one is the
-    // eGPU's model (`PUT /api/engines/egpu`, `control/engines.rs`), then OAIY Network's fifteen (`network/primary.rs`).
+    // eGPU's model (`PUT /api/engines/egpu`, `control/engines.rs`), then OAIY Network's nineteen (`network/primary.rs`).
     assert_eq!(
         pairs.len(),
-        165 + 11 + 8 + 3 + 15 + 3 + 6 + 1 + 15,
+        165 + 11 + 8 + 3 + 15 + 3 + 6 + 1 + 19,
         "main-router (method, path) pairs"
     );
     let mut built: Vec<String> = ROUTES
@@ -783,7 +789,7 @@ fn the_table_has_a_row_for_every_route_the_boot_test_probes_and_the_counts_the_d
     let new_or_reserved = ROUTES.iter().filter(|r| r.since == 2).count();
     // 161 in the design, the eleven routes the code gained since (see above), the eight of the encrypted backup, and
     // the eGPU's model.
-    assert_eq!(existing, 165 + 11 + 8 + 3 + 6 + 1 + 15, "and OAIY Network's fifteen");
+    assert_eq!(existing, 165 + 11 + 8 + 3 + 6 + 1 + 19, "and OAIY Network's nineteen");
     // 41 new and 60 reserved in the design; `GET /api/update` (reserved) is gone, replaced by the
     // real `GET /api/update/status`, and four reserved rows (`GET|PATCH /api/messages`,
     // `GET|PUT /api/ring/settings`) are `since: 1` now that their routes exist.
@@ -1048,7 +1054,7 @@ mod fixtures {
         assert_eq!(names["voice/mod.rs"], 2);
         // (a Mac's Agent page: its files, from a listener that serves nothing else)
         assert_eq!(names["embed.rs"], 2);
-        // (an OAIY Network worker's listener on the LAN: its eight routes, for a paired primary)
-        assert_eq!(names["network/worker.rs"], 9);
+        // (an OAIY Network worker's listener on the LAN: its routes, for a paired primary)
+        assert_eq!(names["network/worker.rs"], 15);
     }
 }

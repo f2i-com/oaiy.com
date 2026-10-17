@@ -1,4 +1,5 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import RemoteServices from './RemoteServices';
 import { useVisiblePoll } from './useVisiblePoll';
 import {
   appConfig,
@@ -291,6 +292,8 @@ export default function ServicesPanel() {
           ))}
         </section>
       ))}
+
+      <RemoteServices />
 
       <section className="service-section">
         {showAddForm ? (

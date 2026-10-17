@@ -2132,6 +2132,42 @@ export interface NetworkStatus {
   paired: number;
   /** A primary's engine defaults on its workers, by kind (`llm`, `image`…): the rest are this computer's own. */
   defaults?: Record<string, NetworkDefault>;
+  /** A primary's workers answering now. */
+  online?: number;
+  /** A primary's pairings in progress (the code it is showing), so a page opened again shows them. */
+  pairings?: NetworkPairing[];
+  /** A primary's services used on a worker in place of its own (`oaiy-voice`), by service. */
+  services?: Record<string, { nodeId: string; nodeName: string }>;
+}
+
+/** A flow a worker shares (Let apps run it there), run there from this computer. */
+export interface NetworkFlow {
+  flowId: string;
+  name: string;
+  description?: string;
+  /** Its text inputs, by the name a run's `input` takes, with the value each has when none is given. */
+  inputs: { name: string; default?: unknown }[];
+}
+
+/** A run on a worker, as it is now. */
+export interface NetworkRun {
+  runId: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'timed_out' | 'cancelled';
+  flowId?: string;
+  /** The runner's report: `output.output` is the flow's own answer. */
+  output?: { output?: unknown; error?: string | null } & Record<string, unknown>;
+  error?: { code: string; message: string } | null;
+  reservedAt?: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
+/** A service a worker lends (OAIY Voice). */
+export interface NetworkService {
+  id: string;
+  name: string;
+  installed: boolean;
+  status: string;
 }
 
 /** A paired worker's model chosen as this computer's engine default of its kind (Engines → Other computers). */
@@ -2202,6 +2238,10 @@ export interface NetworkNode {
   enginesError: string | null;
   devices: NetworkDevice[];
   models: NetworkModel[];
+  /** The flows it shares (a worker). */
+  flows?: NetworkFlow[];
+  /** The services it lends (a worker): OAIY Voice. */
+  services?: NetworkService[];
   /** Its engines' job queue: the job running (if any) and how many wait. */
   queue?: { running: { model?: string; kind?: string } | null; queued: number; max_queued?: number } | null;
 }
@@ -2248,6 +2288,27 @@ export const network = {
   /** A worker's model as this computer's engine default of `kind` (its id), or this computer's own again (null). */
   setDefault: (kind: string, id: string | null) =>
     request<NetworkStatus>('/api/network/settings', { method: 'PUT', body: JSON.stringify({ defaults: { [kind]: id } }) }),
+  /** A worker's service (`oaiy-voice`) used in place of this computer's own (its node id), or this computer's again (null). */
+  useService: (service: string, nodeId: string | null) =>
+    request<NetworkStatus>('/api/network/settings', { method: 'PUT', body: JSON.stringify({ services: { [service]: nodeId } }) }),
+  /** The flows a worker shares. */
+  flows: (nodeId: string) => request<{ flows: NetworkFlow[] }>(`/api/network/nodes/${encodeURIComponent(nodeId)}/flows`),
+  /** One of a worker's shared flows, run there: answered at once with the run (`queued`). */
+  runFlow: (nodeId: string, flowId: string, input: Record<string, unknown>) =>
+    request<NetworkRun>(`/api/network/nodes/${encodeURIComponent(nodeId)}/flows/${encodeURIComponent(flowId)}/runs`, {
+      method: 'POST',
+      body: JSON.stringify({ input }),
+    }),
+  run: (nodeId: string, runId: string) => request<NetworkRun>(`/api/network/nodes/${encodeURIComponent(nodeId)}/runs/${encodeURIComponent(runId)}`),
+  cancelRun: (nodeId: string, runId: string) =>
+    request<unknown>(`/api/network/nodes/${encodeURIComponent(nodeId)}/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
+  /** A picture a worker made, by the address a run names it at (its path on this desktop), as a Blob to show. */
+  picture: async (address: string): Promise<Blob> => {
+    const path = new URL(address, API_BASE).pathname;
+    const resp = await fetch(`${API_BASE}${path}`);
+    if (!resp.ok) throw new Error(`${resp.status}: ${resp.statusText}`);
+    return resp.blob();
+  },
 };
 
 // ----- setup (the wizard's record, on the desktop) -----

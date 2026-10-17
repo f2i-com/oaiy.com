@@ -28,10 +28,11 @@
 #       ticked); the vault design's reserved /api/backup rows below are a different design's and are not these;
 #   + PUT /api/engines/egpu (models.write, as the engines' other choices beside it; marked "added since the
 #       appendix"): the language model set to run on a Mac's eGPU, chosen from the Agent page's header;
-#   + the fifteen routes of OAIY Network (`network/primary.rs`, docs/NETWORK.md; marked "added since the appendix"):
+#   + the nineteen routes of OAIY Network (`network/primary.rs`, docs/NETWORK.md; marked "added since the appendix"):
 #       its status, settings, discovery and pairing, a worker's approval of a primary and unpairing (auth.read,
-#       auth.manage, auth.revoke: whom this computer trusts), and a paired worker's models (ai.use, as this
-#       desktop's own engine gateway). The worker's own listener (`/worker/v1/*`) is not on this API;
+#       auth.manage, auth.revoke: whom this computer trusts), a paired worker's models (ai.use, as this
+#       desktop's own engine gateway), and the flows a worker shares, run there (flows.read, runs.read, runs.write,
+#       as this desktop's own runs). The worker's own listener (`/worker/v1/*`) is not on this API;
 #   ~ four rows the design reserved (since 2, "(rsv)": the routes were not built) and the code built since,
 #       before the access model merged (marked "built since the appendix"): GET /api/messages and
 #       GET /api/ring/settings, PATCH /api/messages/:id and PUT /api/ring/settings. Their since is 1 now, because
@@ -130,6 +131,10 @@ PUT /api/network/nodes/:id/pins scope:auth.manage 1 all  # added since the appen
 DELETE /api/network/nodes/:id/pins/:pin scope:auth.manage 1 all  # added since the appendix: OAIY Network: a worker's pinned model let go again
 POST /api/network/nodes/:id/v1/chat/completions scope:ai.use 1 all  # added since the appendix: OAIY Network: a worker's language model
 ANY /api/network/nodes/:id/gateway/*path scope:ai.use 1 all  # added since the appendix: OAIY Network: a worker's media routes and files
+GET /api/network/nodes/:id/flows scope:flows.read 1 all  # added since the appendix: OAIY Network: the flows a worker shares
+POST /api/network/nodes/:id/flows/:flow/runs scope:runs.write 1 all  # added since the appendix: OAIY Network: a worker's shared flow run there
+GET /api/network/nodes/:id/runs/:run scope:runs.read 1 all  # added since the appendix: OAIY Network: a run on a worker, as it is now
+POST /api/network/nodes/:id/runs/:run/cancel scope:runs.write 1 all  # added since the appendix: OAIY Network: a run on a worker stopped
 POST /api/python/install scope:runtimes.install 1 all
 POST /api/python/venvs scope:runtimes.install 1 all
 DELETE /api/python/venvs/:name scope:runtimes.install 1 all

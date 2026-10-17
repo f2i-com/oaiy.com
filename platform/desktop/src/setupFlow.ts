@@ -251,8 +251,10 @@ export function chosenModel(catalog: EngineCatalog | null, group: string): strin
 export type Met = boolean | null;
 
 /** Is `req` met now? `null` while it cannot be told (not read yet). */
-export function requirementMet(req: Requirement, services: ServiceSnapshot[] | null, catalog: EngineCatalog | null): Met {
+export function requirementMet(req: Requirement, services: ServiceSnapshot[] | null, catalog: EngineCatalog | null, remote?: Record<string, unknown> | null): Met {
   if (req.kind === 'service') {
+    // (a paired computer's, used in place of this computer's own: OAIY Network)
+    if (remote?.[req.id]) return true;
     if (!services) return null;
     const s = services.find((x) => x.id === req.id);
     return !!s && (s.installed || !s.installable) && s.status !== 'installing';
@@ -275,6 +277,8 @@ export interface PluginFacts {
   permissionsAccepted: boolean;
   services: ServiceSnapshot[] | null;
   catalog: EngineCatalog | null;
+  /** The services used on a paired computer in place of this computer's own (OAIY Network), by id. */
+  remoteServices?: Record<string, unknown> | null;
   /** The last `done` check of each step (run on the desktop). */
   checks: Record<string, CheckOutcome | undefined>;
   /** The last `when` check of each step: a step is hidden while it does not pass. */
@@ -301,7 +305,7 @@ export function pluginSteps(setup: DeclaredSetup, facts: PluginFacts): PluginSte
         done = facts.permissionsAccepted;
         break;
       case 'requirements':
-        done = (step.requires ?? []).every((r) => requirementMet(r, facts.services, facts.catalog) === true);
+        done = (step.requires ?? []).every((r) => requirementMet(r, facts.services, facts.catalog, facts.remoteServices) === true);
         break;
       case 'settings':
         done = recordedDone.has(step.id);

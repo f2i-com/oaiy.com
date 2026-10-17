@@ -178,6 +178,22 @@ describe('NetworkPanel', () => {
     expect(row.closest('details')).toBeNull();
   });
 
+  it('shows a pairing started before the page was left again, at the step it is at', async () => {
+    vi.useFakeTimers();
+    api.status.mockResolvedValue({ ...primary, pairings: [{ pairingId: 'x', code: '654 321', status: 'approved_there', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.20:17975', fingerprint: '1111' } }] });
+    await mount();
+    const card = container.querySelector('[data-testid="network-pairing"]')!;
+    expect(card.textContent).toContain('654 321');
+    expect(card.textContent).toContain('Did its screen show this same code?');
+    expect(card.querySelector('.network-progress .is-now')!.textContent).toBe('Codes matched here');
+  });
+
+  it('says how it goes while it is off', async () => {
+    api.status.mockResolvedValue(off);
+    await mount();
+    expect(container.querySelectorAll('[data-testid="network-steps"] li')).toHaveLength(3);
+  });
+
   it('withdraws a pairing it stops waiting for, so the worker no longer shows it', async () => {
     vi.useFakeTimers();
     api.status.mockResolvedValue(primary);

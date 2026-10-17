@@ -221,6 +221,36 @@ pub fn referenced(inputs: Value) -> Value {
     }
 }
 
+/// A run's inputs with each picture of this desktop's (a reference to its own engines' files, or a paired worker's
+/// as this desktop serves them) given inline as a data URL: what a run on another computer is sent, which cannot read
+/// this desktop's addresses. One that cannot be read stays as it was (the run says so where it needs it).
+pub fn inline_local(mut inputs: Value) -> Value {
+    let one = |value: &mut Value| {
+        let Some(text) = value.as_str() else { return };
+        let Some((port, path)) = locate(text) else { return };
+        if port != Some(crate::api_port()) {
+            return;
+        }
+        let mime = match path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref() {
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("webp") => "image/webp",
+            _ => "image/png",
+        };
+        if let Ok(bytes) = fetch_local(text) {
+            *value = Value::String(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)));
+        }
+    };
+    if let Some(fields) = inputs.as_object_mut() {
+        for value in fields.values_mut() {
+            match value {
+                Value::Array(list) => list.iter_mut().for_each(one),
+                _ => one(value),
+            }
+        }
+    }
+    inputs
+}
+
 /// Store a picture with this desktop's engines (`POST` to their files' route) and answer its reference, as this
 /// desktop's own address of it (as a picture the engines made is named).
 pub fn upload_local(bytes: &[u8], mime: &str) -> Result<String, String> {

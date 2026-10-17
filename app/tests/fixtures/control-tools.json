@@ -1,5 +1,5 @@
 {
- "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (649ccd1): all of them for a project or setup session; the runner session is offered the read tools named in runner; network_status and ui_open's network page added since, and model_set_default taking a worker's model, as tools.rs declares them.",
+ "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (649ccd1): all of them for a project or setup session; the runner session is offered the read tools named in runner; network_status and ui_open's network page added since, model_set_default taking a worker's model, and flows_list and flow_run a worker's node, as tools.rs declares them.",
  "tools": [
   {
    "annotations": {
@@ -247,7 +247,7 @@
     "readOnlyHint": true,
     "title": "OAIY Network"
    },
-   "description": "OAIY Network (other OAIY computers on this LAN): whether it is on, this computer's role (primary: it uses paired workers' models; worker: it lends its own), the workers found on the LAN, and the paired computers, each online or not with its GPUs and models. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
+   "description": "OAIY Network (other OAIY computers on this LAN): whether it is on, this computer's role (primary: it uses paired workers' models; worker: it lends its own), the workers found on the LAN, and the paired computers, each online or not with its GPUs, models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {},
@@ -810,10 +810,16 @@
     "readOnlyHint": true,
     "title": "Flows"
    },
-   "description": "The flows stored on this desktop: id and name.",
+   "description": "The flows stored on this desktop: id, name, description, the inputs each takes (by name, with the value it has when none is given), and whether it is shared with apps (oaiyRemote: FormLogic and other apps may run it through the oaiy-flows connector). With node (a paired worker's node id, as network_status lists it, OAIY Network): the flows that computer shares, which flow_run with the same node runs there.",
    "inputSchema": {
     "additionalProperties": false,
-    "properties": {},
+    "properties": {
+     "node": {
+      "description": "A paired worker's node id, as network_status lists it (OAIY Network).",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
     "required": [],
     "type": "object"
    },
@@ -911,7 +917,7 @@
     "readOnlyHint": false,
     "title": "Run a flow"
    },
-   "description": "Run a stored flow with an optional input. By default waits for it (up to timeoutSeconds, 60) and answers its status and output; with wait false, answers the run at once.",
+   "description": "Run a stored flow with an optional input (an object, each input by the name flows_list gives). By default waits for it (up to timeoutSeconds, 60) and answers its status and output, and the pictures its answer names as images; with wait false, answers the run at once. With node (OAIY Network), one of the flows that paired worker shares, run there by its own runner and models.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
@@ -922,6 +928,11 @@
      },
      "input": {
       "description": "The flow's input."
+     },
+     "node": {
+      "description": "A paired worker's node id, as network_status lists it (OAIY Network).",
+      "minLength": 1,
+      "type": "string"
      },
      "timeoutSeconds": {
       "description": "How long the run may take (default 60).",

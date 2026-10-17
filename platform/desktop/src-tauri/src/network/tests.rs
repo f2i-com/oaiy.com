@@ -321,6 +321,163 @@ async fn a_workers_model_can_be_this_computers_default() {
     }
 }
 
+/// The flows a worker shares ("Let apps run it" there) are its primary's to list and run there, by its own runner: one
+/// it does not share is not; a run is followed and stopped from the primary, its pictures named at the primary's route
+/// for the worker; another computer's runs are not the primary's to read.
+#[tokio::test]
+async fn a_primary_runs_the_flows_a_worker_shares_there() {
+    let worker = node("worker-flows", Role::Worker, Some(fake_engines().await)).await;
+    let flows = std::sync::Arc::new(crate::bridge::worker::FlowStore::new(temp("flows")));
+    let shared = json!({ "name": "Make a logo", "oaiyRemote": true, "nodes": [{ "id": "n1", "type": "input_text", "data": { "label": "Prompt", "value": "a fox" } }] });
+    flows.put("logo", &shared.to_string()).unwrap();
+    flows.put("private", &json!({ "name": "Mine", "nodes": [] }).to_string()).unwrap();
+    let ledger = crate::bridge::ledger::new_handle();
+    worker.set_bridge(ledger.clone(), flows);
+    let primary = node("primary-flows", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let (status, listed) = call(&p, "GET", &format!("/api/network/nodes/{node_id}/flows"), None).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["flows"].as_array().unwrap().len(), 1, "its shared flows alone: {listed}");
+    assert_eq!((&listed["flows"][0]["flowId"], &listed["flows"][0]["inputs"][0]["name"]), (&json!("logo"), &json!("Prompt")));
+    // (and with its node, as the heartbeat heard them)
+    let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
+    assert_eq!(nodes["nodes"][0]["flows"][0]["name"], "Make a logo", "{nodes}");
+    let (status, refused) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/flows/private/runs"), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert!(refused.to_string().contains("Let apps run it"), "{refused}");
+    let (status, run) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/flows/logo/runs"), Some(json!({ "input": { "Prompt": "a lighthouse" } }))).await;
+    assert_eq!((status, &run["status"]), (StatusCode::CREATED, &json!("queued")), "{run}");
+    let run_id = run["runId"].as_str().unwrap().to_string();
+    let kept = ledger.lock().unwrap().get(&run_id).unwrap();
+    assert_eq!((kept.flow_id.as_deref(), kept.input.clone()), (Some("logo"), Some(json!({ "Prompt": "a lighthouse" }))));
+    // finished there with a picture of its engines': named at this computer's route for the worker
+    {
+        let mut l = ledger.lock().unwrap();
+        l.claim(&run_id, crate::bridge::ledger::Runtime::Desktop, "test");
+        let picture = format!("http://127.0.0.1:{}/api/ai/engine/gateway/files/images/x.png", crate::api_port());
+        l.finish(&run_id, crate::bridge::ledger::RunStatus::Succeeded, Some(json!({ "output": { "image": picture } })), None).unwrap();
+    }
+    let resp = p.clone().oneshot(Request::get(format!("/api/network/nodes/{node_id}/runs/{run_id}")).header("host", "127.0.0.1:17972").body(Body::empty()).unwrap()).await.unwrap();
+    let done: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(done["status"], "succeeded");
+    assert_eq!(done["output"]["output"]["image"], format!("http://127.0.0.1:17972/api/network/nodes/{node_id}/gateway/files/images/x.png"), "{done}");
+    // a run is stopped from here; one the worker keeps for someone else is not this computer's to read
+    let (_, second) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/flows/logo/runs"), Some(json!({}))).await;
+    let (status, stopped) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/runs/{}/cancel", second["runId"].as_str().unwrap()), None).await;
+    assert_eq!((status, &stopped["status"]), (StatusCode::OK, &json!("cancelled")), "{stopped}");
+    let other = {
+        let request = crate::bridge::ledger::RunRequest {
+            caller_product: "formlogic".into(),
+            flow_id: Some("logo".into()),
+            inline_graph: false,
+            input: None,
+            timeout_ms: None,
+            mode: "queued".into(),
+            correlation_id: "c".into(),
+            idempotency_key: "k".into(),
+            lineage: Default::default(),
+            trigger_event: None,
+        };
+        match ledger.lock().unwrap().reserve(&request) {
+            crate::bridge::ledger::ReserveOutcome::Reserved(r) => r.run_id,
+            _ => unreachable!(),
+        }
+    };
+    let (status, _) = call(&p, "GET", &format!("/api/network/nodes/{node_id}/runs/{other}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "another caller's run");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A stand-in for OAIY Voice: its models, a transcription, and speech (24 kHz PCM) in a voice it has, the copies of a
+/// primary's voices (`from-…`) among them.
+#[cfg(unix)]
+const FAKE_VOICE: &str = r#"#!/usr/bin/env python3
+import http.server, json, sys
+port = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def whole(self, code, body, ctype="application/json", extra=()):
+        self.send_response(code); self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(body)))
+        for k, v in extra: self.send_header(k, v)
+        self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        if self.path == "/v1/models": self.whole(200, json.dumps({"data": [{"id": "parakeet"}]}).encode())
+        else: self.whole(404, b"{}")
+    def do_POST(self):
+        asked = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if self.path == "/v1/audio/transcriptions": self.whole(200, json.dumps({"text": "hello from the worker"}).encode())
+        elif self.path == "/v1/audio/speech":
+            if asked.get("voice") and not asked["voice"].startswith("from-"): self.whole(400, b'{"error": "no such voice"}')
+            else: self.whole(200, b"\x01\x00" * 4800, "audio/pcm", [("X-Sample-Rate", "24000")])
+        else: self.whole(404, b"{}")
+http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+"#;
+
+/// OAIY Voice set up on a worker, used from the primary in place of its own (Services → Other computers): the primary's
+/// speech-to-text and speech go to the worker's, started there when asked, the primary's voice copied there first; the
+/// worker lends that service's speech routes alone; unpairing gives it back.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_primary_uses_oaiy_voice_on_a_worker() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp("fake-voice");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("fake-oaiy-voice");
+    std::fs::write(&script, FAKE_VOICE).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let template: crate::services::template::ServiceTemplate = serde_json::from_value(json!({
+        "id": "oaiy-voice", "name": "OAIY Voice", "description": "a stand-in", "category": "Speech", "defaultPort": port,
+        "autostart": false, "run": { "command": script.to_string_lossy(), "args": ["${port}"], "env": {} },
+        "health": { "url": "http://127.0.0.1:${port}/v1/models", "timeoutSecs": 20 },
+    }))
+    .unwrap();
+    crate::voice::voices::init(&temp("voices-data"));
+    let worker = node("worker-voice", Role::Worker, Some(fake_engines().await)).await;
+    {
+        let mut registry = worker.inner().ai.registry.lock().unwrap();
+        std::fs::create_dir_all(registry.data_dir().join("templates")).unwrap();
+        registry.add_template(template).unwrap();
+    }
+    let primary = node("primary-voice", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let (status, v) = call(&p, "PUT", "/api/network/settings", Some(json!({ "services": { "oaiy-voice": node_id } }))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["services"]["oaiy-voice"]["nodeName"], "the worker-voice", "{v}");
+    let engines = crate::voice::engines::Engines::via(primary::service_target_of(&primary, "oaiy-voice").unwrap());
+    let heard = engines.transcribe_wav(vec![0u8; 3200]).await.unwrap();
+    assert_eq!(heard, "hello from the worker");
+    let voice = crate::voice::voices::chosen().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    engines.speak("Good morning.", Some(&voice), &tx).await.unwrap();
+    drop(tx);
+    let mut samples = 0;
+    while let Some(chunk) = rx.recv().await {
+        samples += chunk.len();
+    }
+    assert!(samples >= 4000, "spoken on the worker, in a copy of this computer's voice: {samples} samples");
+    assert!(crate::voice::voices::list().iter().any(|c| c.name.starts_with("from-") && c.name.ends_with(&voice)), "the voice copied there");
+    // the worker lends that service's speech routes, and nothing else of it or of another
+    let lent = primary::service_target_of(&primary, "oaiy-voice").unwrap();
+    for (path, code) in [("/worker/v1/services/oaiy-voice/v1/config", 404), ("/worker/v1/services/ollama/v1/models", 404)] {
+        let r = lent.client.get(format!("{}{path}", lent.root)).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), code, "{path}");
+    }
+    // a service the worker has not set up is not chosen; unpairing gives this computer's own back
+    let (status, _) = call(&p, "PUT", "/api/network/settings", Some(json!({ "services": { "oaiy-voice": "nobody" } }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    call(&p, "DELETE", &format!("/api/network/nodes/{node_id}"), None).await;
+    assert!(primary.inner().services().all().is_empty());
+    let _ = worker.inner().ai.registry.lock().unwrap().stop("oaiy-voice");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
 /// A worker saved again while it listens (renamed) keeps its port: the listener before it has let the port go first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_saved_again_listens_on_the_same_port() {

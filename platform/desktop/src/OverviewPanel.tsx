@@ -4,6 +4,7 @@ import {
   CircleDot,
   History,
   ListChecks,
+  Network,
   Package,
   Plug,
   Server,
@@ -22,7 +23,9 @@ import {
   aiProviders,
   codex,
   bridge,
+  network,
   nodeRuntime,
+  type NetworkStatus,
   type RuntimeStatus,
   pairing,
   plugins,
@@ -66,6 +69,7 @@ export type OverviewNav =
   | 'providers'
   | 'python'
   | 'connections'
+  | 'network'
   | 'settings';
 
 interface Props {
@@ -111,6 +115,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [provs, setProvs] = useState<AiProviderPublic[] | null>(() => peek('providers') ?? null);
   const [apps, setApps] = useState<PairedApp[] | null>(() => peek('pairedApps') ?? null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(() => peek('runtimeStatus') ?? null);
+  const [net, setNet] = useState<NetworkStatus | null>(() => peek('networkStatus') ?? null);
   // Shown until dismissed; the rows tick themselves, so it stays honest.
   const [guideOpen, setGuideOpen] = useState<boolean>(() => shouldAutoOpen());
   const [codexConnected, setCodexConnected] = useState(false);
@@ -121,14 +126,17 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
     if (refreshing.current) return;
     refreshing.current = true;
     // Each read is independent: one failing surface must not blank the others.
-    const [s, p, a, c, r, cx] = await Promise.allSettled([
+    const [s, p, a, c, r, cx, n] = await Promise.allSettled([
       services.list(),
       plugins.list(),
       aiProviders.list(),
       pairing.paired(),
       bridge.status(),
       codex.status(),
+      // (OAIY Network's status: an older desktop, or a test's, may have none)
+      (async () => network.status())(),
     ]);
+    if (n.status === 'fulfilled') { setNet(n.value); put('networkStatus', n.value); }
     refreshing.current = false;
     setCodexConnected(cx.status === 'fulfilled' && cx.value.connected);
     const labels = ['services', 'plugins', 'AI providers', 'connections', 'runtime'];
@@ -382,6 +390,14 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             <strong>{apps === null ? '—' : apps.length}</strong>
             <small>Connected apps</small>
           </button>
+          {/* OAIY Network, once it is switched on: the workers answering (a primary), or whom this one lends to */}
+          {net?.enabled && (
+            <button className="overview-tile" onClick={() => onNavigate('network')}>
+              <Network size={16} aria-hidden />
+              <strong>{net.role === 'primary' ? `${net.online ?? 0}/${net.paired}` : net.waiting > 0 ? `${net.waiting} asking` : net.paired}</strong>
+              <small>{net.role === 'primary' ? 'Other computers online' : net.waiting > 0 ? 'To pair with this computer' : net.paired === 1 ? 'Computer using this one' : 'Computers using this one'}</small>
+            </button>
+          )}
         </div>
         <BackupLine onOpenSettings={() => onNavigate('settings')} />
       </section>

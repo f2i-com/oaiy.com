@@ -75,6 +75,10 @@ pub fn router(net: Network) -> Router {
         .route("/api/network/nodes/:id/pins/:pin", delete(unpin))
         .route("/api/network/nodes/:id/v1/chat/completions", post(node_chat).layer(DefaultBodyLimit::max(CHAT_LIMIT)))
         .route("/api/network/nodes/:id/gateway/*path", any(node_gateway).layer(DefaultBodyLimit::max(MEDIA_LIMIT)))
+        .route("/api/network/nodes/:id/flows", get(node_flows))
+        .route("/api/network/nodes/:id/flows/:flow/runs", post(node_run_flow).layer(DefaultBodyLimit::max(MEDIA_LIMIT)))
+        .route("/api/network/nodes/:id/runs/:run", get(node_run))
+        .route("/api/network/nodes/:id/runs/:run/cancel", post(node_cancel_run))
         .with_state(net)
 }
 
@@ -91,7 +95,24 @@ async fn status(State(net): State<Network>) -> Response {
     s["waiting"] = json!(worker::waiting(&net).len());
     s["found"] = json!(lock(&net.inner().found).len());
     s["paired"] = json!(net.inner().peers().list().len());
+    // (a primary: its workers answering now, and the pairings it is in the middle of, so a page opened again shows
+    // the code it was showing)
+    let workers: Vec<String> = net.inner().peers().list().iter().filter(|p| p.role == Role::Worker).map(|p| p.node_id.clone()).collect();
+    s["online"] = json!(lock(&net.inner().nodes).iter().filter(|(id, n)| n.online && workers.contains(id)).count());
+    s["pairings"] = Value::Array(
+        lock(&net.inner().outgoing)
+            .iter()
+            .filter(|o| o.at.elapsed() < PAIRING_TTL)
+            .map(|o| json!({
+                "pairingId": o.id,
+                "code": o.code,
+                "worker": { "nodeId": o.node_id, "name": o.name, "address": o.address, "fingerprint": short(&o.fingerprint) },
+                "status": if o.approved_there { "approved_there" } else { "pending" },
+            }))
+            .collect(),
+    );
     s["defaults"] = defaults_json(&net);
+    s["services"] = services_json(&net);
     Json(s).into_response()
 }
 
@@ -106,6 +127,8 @@ struct SettingsChange {
     /// Engine defaults on a worker, by kind: a worker's model's id (`engine:<kind>:node.<nodeId>/<model>`), or null for
     /// this computer's own again.
     defaults: Option<std::collections::BTreeMap<String, Option<String>>>,
+    /// Services used on a worker in place of this computer's own (`{"oaiy-voice": "<nodeId>"}`), or null for its own.
+    services: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
 
 /// `PUT /api/network/settings`: switch Network on or off, choose this computer's role, name and (a worker's) port, and
@@ -116,7 +139,12 @@ async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsCha
             return error(StatusCode::BAD_REQUEST, "invalid_request", e);
         }
     }
-    // (only defaults: nothing running is started again)
+    if let Some(services) = &change.services {
+        if let Err(e) = set_services(&net, services) {
+            return error(StatusCode::BAD_REQUEST, "invalid_request", e);
+        }
+    }
+    // (only defaults or services: nothing running is started again)
     if change.enabled.is_none() && change.role.is_none() && change.name.is_none() && change.port.is_none() && change.bind.is_none() {
         return status(State(net)).await;
     }
@@ -472,6 +500,9 @@ fn node_json(net: &Network, p: &Peer) -> Value {
         "node": caps.get("node").cloned().unwrap_or(Value::Null),
         "enginesError": caps.get("enginesError").cloned().unwrap_or(Value::Null),
         "devices": resources.get("devices").cloned().unwrap_or(json!([])),
+        // (the flows it shares, run there from here: `…/flows/:flow/runs`; the services it lends, OAIY Voice)
+        "flows": caps.get("flows").cloned().filter(Value::is_array).unwrap_or(json!([])),
+        "services": caps.get("services").cloned().filter(Value::is_array).unwrap_or(json!([])),
         "queue": resources.get("queue").cloned().unwrap_or(Value::Null),
         "models": models,
     })
@@ -496,8 +527,9 @@ async fn unpair(State(net): State<Network>, Path(node_id): Path<String>) -> Resp
     if let Err(e) = net.inner().peers().remove(&node_id) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
     }
-    // (its models no longer this computer's defaults: its own again)
+    // (its models no longer this computer's defaults, nor its services used here: its own again)
     let _ = net.inner().defaults().drop_node(&node_id);
+    let _ = net.inner().services().drop_node(&node_id);
     lock(&net.inner().nodes).remove(&node_id);
     log::info!("network: unpaired {}", peer.name);
     StatusCode::NO_CONTENT.into_response()
@@ -725,6 +757,83 @@ pub async fn chat_on_worker(node_id: &str, mut body: Value) -> Response {
     chat_on(net, node_id, axum::body::Bytes::from(body.to_string())).await
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Services on a worker (OAIY Voice), used in place of this computer's own
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A service on a worker, as this computer's speech reaches it: the client that reaches the worker (its certificate
+/// pinned), the worker's root (`https://<address>`), the service's routes there and the worker's name.
+#[derive(Clone)]
+pub struct ServiceTarget {
+    pub client: reqwest::Client,
+    pub root: String,
+    pub base: String,
+    pub node_name: String,
+}
+
+/// Where `service` runs for this computer, where a paired worker's is chosen in its place (a primary's, Network on):
+/// calls' speech and the transcription route use it as they would this computer's own.
+pub fn service_target(service: &str) -> Option<ServiceTarget> {
+    service_target_of(super::shared()?, service)
+}
+
+pub(crate) fn service_target_of(net: &Network, service: &str) -> Option<ServiceTarget> {
+    if net.settings().active_role() != Role::Primary {
+        return None;
+    }
+    let node = net.inner().services().get(service)?.to_string();
+    let peer = net.inner().peers().get(&node).filter(|p| p.role == Role::Worker).cloned()?;
+    let client = client_for(&net.identity().ok()?, &peer.fingerprint).ok()?;
+    let root = url(&peer.address, "");
+    Some(ServiceTarget { base: format!("{root}/worker/v1/services/{service}"), root, client, node_name: peer.name })
+}
+
+/// The services used on workers, as the Services and Networking pages show them: by service, the worker.
+fn services_json(net: &Network) -> Value {
+    let peers = net.inner().peers().list().to_vec();
+    let chosen = net.inner().services().all().clone();
+    Value::Object(
+        chosen
+            .into_iter()
+            .map(|(service, node)| {
+                let name = peers.iter().find(|p| p.node_id == node).map(|p| p.name.clone()).unwrap_or_default();
+                (service, json!({ "nodeId": node, "nodeName": name }))
+            })
+            .collect(),
+    )
+}
+
+/// Use (a node id) or let go (null) a worker's service in place of this computer's own. A service one of its paired
+/// workers lends and has added.
+fn set_services(net: &Network, change: &std::collections::BTreeMap<String, Option<String>>) -> Result<(), String> {
+    for (service, node) in change {
+        let Some(node) = node.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+            net.inner().services().set(service, None)?;
+            continue;
+        };
+        if net.settings().active_role() != Role::Primary {
+            return Err("switch Network on as a primary to use a worker's services".into());
+        }
+        if !worker::SHARED_SERVICES.iter().any(|(id, _)| id == service) {
+            return Err(format!("{service} is not a service a worker lends"));
+        }
+        let Some(peer) = net.inner().peers().get(node).filter(|p| p.role == Role::Worker).cloned() else {
+            return Err(format!("{node} is not a worker paired with this computer"));
+        };
+        let listed = lock(&net.inner().nodes)
+            .get(node)
+            .and_then(|s| s.capabilities.as_ref())
+            .and_then(|c| c.get("services").and_then(Value::as_array).cloned())
+            .is_some_and(|l| l.iter().any(|x| x["id"] == service.as_str() && x["installed"] == json!(true)));
+        if !listed {
+            return Err(format!("{} has no {service} set up (add it on its Services page)", peer.name));
+        }
+        net.inner().services().set(service, Some(node))?;
+        log::info!("network: {service} on {} in place of this computer's", peer.name);
+    }
+    Ok(())
+}
+
 /// The defaults on workers as the Networking and Engines pages show them: by kind, its id, model and worker.
 fn defaults_json(net: &Network) -> Value {
     let peers = net.inner().peers().list().to_vec();
@@ -805,14 +914,152 @@ async fn node_gateway(State(net): State<Network>, Path((node_id, path)): Path<(S
         }
     }
     // (the worker names its files at this desktop's route for it, as its caller reached it, not at its own loopback)
-    let host = headers.get("host").and_then(|v| v.to_str().ok()).filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c)));
-    if let Some(host) = host {
-        call = call.header("x-oaiy-base", format!("http://{host}/api/network/nodes/{node_id}/gateway"));
+    if let Some(base) = base_for(&headers, &node_id) {
+        call = call.header("x-oaiy-base", base);
     }
     if !body.is_empty() {
         call = call.body(body);
     }
     match call.send().await {
+        Ok(r) => worker::passthrough(r),
+        Err(e) => offline(&net, &peer, &e),
+    }
+}
+
+/// This desktop's route for a worker's gateway as its caller reached this desktop (its `Host`), where a worker names
+/// the files it made: `http://<host>/api/network/nodes/<id>/gateway`.
+fn base_for(headers: &axum::http::HeaderMap, node_id: &str) -> Option<String> {
+    // (a caller in this process, the Agent's tools, sends no Host: this desktop's own address)
+    let own = format!("127.0.0.1:{}", crate::api_port());
+    let host = match headers.get("host").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => own.as_str(),
+    };
+    if host.is_empty() || host.len() > 255 || !host.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c)) {
+        return None;
+    }
+    Some(format!("http://{host}/api/network/nodes/{node_id}/gateway"))
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// A worker's flows: the ones it shares, run there
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A flow's id as the flows folder keeps it.
+fn flow_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// `GET /api/network/nodes/:id/flows`: the flows the worker shares (`Let apps run it` there), with their inputs.
+async fn node_flows(State(net): State<Network>, Path(node_id): Path<String>) -> Response {
+    let (peer, client) = match worker_of(&net, &node_id) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    match client.get(url(&peer.address, "/worker/v1/flows")).timeout(Duration::from_secs(15)).send().await {
+        Ok(r) => worker::passthrough(r),
+        Err(e) => offline(&net, &peer, &e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunFlow {
+    #[serde(default)]
+    input: Option<Value>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    /// Answer once it has finished (or `timeoutMs` has passed: then as it is, 202), not at once.
+    #[serde(default)]
+    wait: bool,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+fn terminal(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "timed_out" | "cancelled")
+}
+
+/// `POST /api/network/nodes/:id/flows/:flow/runs` `{input?, timeoutMs?, wait?, key?}`: one of the worker's shared
+/// flows, run there by its own runner and engines. This computer's pictures in `input` are sent inline (the worker
+/// cannot read this computer's addresses); the pictures the run makes are named at this computer's route for the
+/// worker. Answered at once with the run (follow it at `…/runs/:run`), or with `wait` once it has finished.
+async fn node_run_flow(State(net): State<Network>, Path((node_id, flow)): Path<(String, String)>, headers: axum::http::HeaderMap, Json(asked): Json<RunFlow>) -> Response {
+    if !flow_id(&flow) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "a flow's id is letters, digits, - and _");
+    }
+    let (peer, client) = match worker_of(&net, &node_id) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    let input = match asked.input {
+        Some(i) => tokio::task::spawn_blocking(move || crate::bridge::pictures::inline_local(i)).await.ok(),
+        None => None,
+    };
+    let base = base_for(&headers, &node_id);
+    let with_base = |call: reqwest::RequestBuilder| match &base {
+        Some(b) => call.header("x-oaiy-base", b),
+        None => call,
+    };
+    let body = json!({ "input": input, "timeoutMs": asked.timeout_ms, "key": asked.key });
+    let started = match with_base(client.post(url(&peer.address, &format!("/worker/v1/flows/{flow}/runs"))).json(&body)).timeout(Duration::from_secs(120)).send().await {
+        Ok(r) => r,
+        Err(e) => return offline(&net, &peer, &e),
+    };
+    if !asked.wait || !started.status().is_success() {
+        return worker::passthrough(started);
+    }
+    let mut run: Value = match started.json().await {
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::BAD_GATEWAY, "upstream_error", format!("the worker's answer: {e}")),
+    };
+    let Some(run_id) = run["runId"].as_str().map(str::to_owned) else {
+        return error(StatusCode::BAD_GATEWAY, "upstream_error", "the worker answered no run");
+    };
+    let deadline = Instant::now() + Duration::from_millis(asked.timeout_ms.unwrap_or(10 * 60 * 1000).min(60 * 60 * 1000)) + Duration::from_secs(10);
+    while !terminal(run["status"].as_str().unwrap_or("")) {
+        if Instant::now() >= deadline {
+            return (StatusCode::ACCEPTED, Json(run)).into_response();
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        match with_base(client.get(url(&peer.address, &format!("/worker/v1/runs/{run_id}")))).timeout(Duration::from_secs(15)).send().await {
+            Ok(r) if r.status().is_success() => run = r.json().await.unwrap_or(run),
+            Ok(r) => return worker::passthrough(r),
+            Err(e) => return offline(&net, &peer, &e),
+        }
+    }
+    Json(run).into_response()
+}
+
+/// `GET /api/network/nodes/:id/runs/:run`: a run of this computer's on the worker, as it is now.
+async fn node_run(State(net): State<Network>, Path((node_id, run)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    let (peer, client) = match worker_of(&net, &node_id) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    if !flow_id(&run) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "not a run's id");
+    }
+    let mut call = client.get(url(&peer.address, &format!("/worker/v1/runs/{run}"))).timeout(Duration::from_secs(15));
+    if let Some(b) = base_for(&headers, &node_id) {
+        call = call.header("x-oaiy-base", b);
+    }
+    match call.send().await {
+        Ok(r) => worker::passthrough(r),
+        Err(e) => offline(&net, &peer, &e),
+    }
+}
+
+/// `POST /api/network/nodes/:id/runs/:run/cancel`: a run of this computer's on the worker, stopped.
+async fn node_cancel_run(State(net): State<Network>, Path((node_id, run)): Path<(String, String)>) -> Response {
+    let (peer, client) = match worker_of(&net, &node_id) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    if !flow_id(&run) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "not a run's id");
+    }
+    match client.post(url(&peer.address, &format!("/worker/v1/runs/{run}/cancel"))).timeout(Duration::from_secs(15)).send().await {
         Ok(r) => worker::passthrough(r),
         Err(e) => offline(&net, &peer, &e),
     }

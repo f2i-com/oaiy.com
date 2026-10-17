@@ -217,7 +217,18 @@ pub fn router(state: AiState) -> Router {
 
 /// `GET /api/ai/engine/services`.
 async fn list(State(st): State<AiState>) -> Response {
-    let voice = voice_installed(&st).then(voice_entry).into_iter().collect::<Vec<_>>();
+    // (OAIY Voice's transcription: this computer's own, or a paired worker's used in its place, OAIY Network)
+    let on_worker = crate::network::service_target(crate::voice::engines::STT_SERVICE).map(|t| t.node_name);
+    let voice = (voice_installed(&st) || on_worker.is_some())
+        .then(|| {
+            let mut e = voice_entry();
+            if let Some(name) = &on_worker {
+                e["description"] = json!(format!("Writes out what is said in a recording (OAIY Voice on {name})"));
+            }
+            e
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     match engine_discovery(&st).await {
         Ok((_, discovery)) => {
             let mut services = services_from_discovery(&discovery);

@@ -924,6 +924,7 @@
       "identity.json": "network",
       "peers.json": "network",
       "defaults.json": "network",
+      "remote-services.json": "network",
       "playwright-browser.json": "templates",
       "plugin-data": "plugin-data-other",
       "plugins": "plugins",

@@ -1986,3 +1986,112 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .engine-worker-devices { margin-top: 0; }
 .engine-worker-kind { display: flex; flex-direction: column; gap: 2px; border-top: 1px solid var(--border); padding-top: 9px; }
 .engine-worker-kind > .settings-label { margin-bottom: 3px; }
+
+/* Networking: how it goes, while it is off — three steps, numbered. */
+.network-steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; counter-reset: step; }
+.network-steps li {
+  position: relative;
+  display: flex;
+  gap: 9px;
+  border: 1px dashed var(--strong-border);
+  border-radius: var(--r-card);
+  padding: 11px 12px 11px 34px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  counter-increment: step;
+}
+.network-steps li::before {
+  position: absolute;
+  top: 11px;
+  left: 10px;
+  display: grid;
+  width: 17px;
+  height: 17px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--primary-soft);
+  color: var(--primary);
+  content: counter(step);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+.network-steps li > svg { flex: none; margin-top: 1px; color: var(--faint); }
+.network-steps strong { color: var(--text); font-weight: 600; }
+.network-steps em { color: var(--text); font-style: normal; font-weight: 600; }
+
+/* A pairing's three steps, the one it waits on lit. */
+.network-progress { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 11.5px; }
+.network-progress li { display: inline-flex; align-items: center; gap: 6px; color: var(--faint); }
+.network-progress li + li::before { width: 14px; height: 1px; background: var(--strong-border); content: ''; }
+.network-progress li.is-done { color: var(--green); }
+.network-progress li.is-now { color: var(--primary); font-weight: 650; }
+
+/* What to check when a worker does not answer. */
+.network-checklist { margin: 6px 0 0; padding-left: 18px; color: var(--muted); }
+.network-checklist li { margin-top: 2px; }
+
+/* Flows → On other computers: a worker's shared flow, its inputs, Run, and its run as it goes. */
+.flow-run-card {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-soft);
+  padding: 12px 14px;
+}
+.flow-run-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 13.5px; }
+.flow-run-head > svg { flex: none; color: var(--muted); }
+.flow-run-head .badge { margin-left: 0; }
+.flow-run-time { color: var(--faint); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+.flow-run-inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.flow-run-inputs textarea { min-height: 54px; font-size: 12.5px; }
+.flow-run-answer { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.flow-run-pictures { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.flow-run-picture {
+  width: 100%;
+  aspect-ratio: 1;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--canvas);
+  object-fit: cover;
+}
+.flow-run-picture.is-loading { animation: led-pulse 1.3s ease-in-out infinite; }
+.flow-run-text p { margin: 3px 0 0; color: var(--text); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; }
+.flow-run-json {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--canvas);
+  padding: 9px 11px;
+  font-size: 11px;
+}
+
+/* Services → On other computers: a service a worker lends (OAIY Voice), used here with a press. */
+.remote-service {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-soft);
+  padding: 11px 13px;
+}
+.remote-service.is-used { border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); background: var(--primary-soft); }
+.remote-service > svg { flex: none; color: var(--muted); }
+.remote-service-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+.remote-service-name { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; font-size: 13px; }
+.remote-service-name .badge { margin-left: 0; }
+.remote-service small { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.remote-service > .btn-tiny { flex: none; }
+
+/* A worker's flows it shares and services it lends, under its models, each with where to use them. */
+.network-extras { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.network-extra { display: flex; min-height: 28px; align-items: center; flex-wrap: wrap; gap: 4px 10px; }
+.network-extra > .settings-label { flex: none; width: 128px; }
+.network-extra-what { min-width: 0; flex: 1; color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.network-extra .btn-tiny { flex: none; height: 24px; }

@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use self::identity::Identity;
 use self::store::{Peers, Role, Settings};
 
-pub use primary::{apply_defaults, chat_on_worker, default_chat_entry, remote_services, router};
+pub use primary::{apply_defaults, chat_on_worker, default_chat_entry, remote_services, router, service_target, ServiceTarget};
 
 /// The protocol a worker and a primary speak (`/worker/v1`).
 pub const PROTOCOL: u32 = 2;
@@ -75,6 +75,10 @@ pub(crate) struct Inner {
     untold: Mutex<Vec<store::Peer>>,
     /// A primary's engine defaults on its workers, by kind.
     defaults: Mutex<store::Defaults>,
+    /// The services a primary uses on its workers (OAIY Voice), by service.
+    services: Mutex<store::ServiceChoices>,
+    /// This computer's flows and run ledger (a worker runs the flows it shares for its primary): none in some tests.
+    bridge: Mutex<Option<Bridge>>,
     /// Workers advertised on the LAN (mDNS), by node id.
     found: Arc<Mutex<HashMap<String, discovery::Found>>>,
     running: Mutex<Running>,
@@ -82,6 +86,13 @@ pub(crate) struct Inner {
     applying: tokio::sync::Mutex<()>,
     /// mDNS off (tests): advertising and browsing are not started.
     mdns: bool,
+}
+
+/// This computer's flows and the ledger their runs are kept in.
+#[derive(Clone)]
+pub(crate) struct Bridge {
+    pub ledger: crate::bridge::ledger::LedgerHandle,
+    pub flows: Arc<crate::bridge::worker::FlowStore>,
 }
 
 /// What is running for the role in effect.
@@ -114,6 +125,8 @@ impl Network {
                 settings: Mutex::new(Settings::load(&dir)),
                 peers: Mutex::new(Peers::open(&dir)),
                 defaults: Mutex::new(store::Defaults::open(&dir)),
+                services: Mutex::new(store::ServiceChoices::open(&dir)),
+                bridge: Mutex::new(None),
                 dir,
                 ai,
                 identity: Mutex::new(None),
@@ -127,6 +140,11 @@ impl Network {
                 mdns,
             }),
         }
+    }
+
+    /// This computer's flows and run ledger, for the flows a worker shares with its primary.
+    pub fn set_bridge(&self, ledger: crate::bridge::ledger::LedgerHandle, flows: Arc<crate::bridge::worker::FlowStore>) {
+        *lock(&self.inner.bridge) = Some(Bridge { ledger, flows });
     }
 
     /// This Network as the desktop's ([`shared`]); the first opened is kept.
@@ -295,6 +313,14 @@ impl Inner {
 
     pub(crate) fn defaults(&self) -> MutexGuard<'_, store::Defaults> {
         lock(&self.defaults)
+    }
+
+    pub(crate) fn services(&self) -> MutexGuard<'_, store::ServiceChoices> {
+        lock(&self.services)
+    }
+
+    pub(crate) fn bridge(&self) -> Option<Bridge> {
+        lock(&self.bridge).clone()
     }
 }
 

@@ -19,6 +19,7 @@ This is the design record; [Setting it up](#setting-it-up) and [What is not done
 | Transport | Mutual TLS (rustls) with the pinned certificates, both directions, after pairing | Encrypted and authenticated at the connection, so no bearer token crosses the LAN in the clear |
 | Model identity | A remote model is `engine:<kind>:node.<nodeId>/<model>`; the worker's own name kept beside it | Never mistaken for a local model of the same name; a flow that names one shows it offline rather than switching |
 | Placement | Manual: the person chooses a model on a worker, and may pin it there; nothing moves, downloads or evicts by itself | Predictable; a GPU's memory is the person's to spend |
+| Flows and services | A worker runs the flows its person shares (*Let apps run it*) for its primary, and lends OAIY Voice's speech; nothing else of it | A worker's person decides what leaves it: the same mark that lets an app run a flow, and a known service's known routes, never a person's own service |
 | Files | A worker's picture is streamed through the primary at a primary address (`/api/network/nodes/<id>/gateway/files/…`), and the worker's answers name their files there (`url`, `oaiy.file`), not at its own loopback address | The by-reference picture flow (docs/IMAGE_FLOW.md) keeps working; no worker URL reaches a client |
 | Pins | A pin is the worker's Studio's own setting (`media.pinned`, `llm.pinned`), set by its paired primary | It outlives a restart of either computer, and the worker's engine enforces it, not a primary that may be away |
 
@@ -121,6 +122,41 @@ naming a language model the worker no longer runs (its person chose another) is 
 the one it runs, rather than answered by that one. A media answer names its files at the primary's route for the
 worker, as the caller reached the primary (`http://<host>/api/network/nodes/<id>/gateway/files/…`).
 
+## A worker's flows
+
+A worker lends its primary the flows it **shares**: the ones its person marked *Let apps run it* in its Flows editor
+(the same mark that lets FormLogic run a flow), and no other. They are listed with the worker (its card on the
+Networking page, `GET /api/network/nodes`, the Agent's `network_status`) and run there, by the worker's own runner,
+models and GPUs:
+
+- **Flows → On other computers**: each worker's shared flows with their inputs; *Run on <worker>* starts one, the run
+  is followed as it goes (and can be stopped), and its answer shows when it is done: its pictures, read through the
+  primary, and its words.
+- **The Agent**: `flows_list` with `node` lists a worker's shared flows, and `flow_run` with `node` runs one there
+  (waiting for it by default, its pictures handed to the Agent as images).
+- **Routes**: `GET /api/network/nodes/:id/flows`, `POST /api/network/nodes/:id/flows/:flow/runs`
+  (`{input?, timeoutMs?, wait?, key?}`: answered at once with the run, or with `wait` once it has finished),
+  `GET /api/network/nodes/:id/runs/:run`, `POST /api/network/nodes/:id/runs/:run/cancel`.
+
+A run is kept in the worker's own run ledger (its Run history), under the primary that asked: a primary reads and
+stops its own runs alone. Pictures in a run's input that are this primary's are sent inline (the worker cannot read
+the primary's addresses); the pictures a run makes are named at the primary's route for the worker.
+
+## A worker's services: OAIY Voice
+
+A worker lends its primary **OAIY Voice** when it is set up there: **Services → On other computers** lists it, and
+*Use it here* makes it this computer's speech in place of its own (*Use this computer's* gives it back). The
+computer connected to the phone stays the primary: its calls, the transcription route (`/api/voice/transcribe`, the
+flow editor's speech-to-text and the Agent's listening) then send their speech-to-text and speech to the worker,
+which starts its OAIY Voice when asked. A call's voice is copied to the worker the first time it is used there (kept
+there as `from-<primary>-<name>`, beside the worker's own voices). A plugin's setup that asks for OAIY Voice counts
+the worker's. Set with `PUT /api/network/settings` `{"services": {"oaiy-voice": "<nodeId>"}}` (`null` gives it back),
+listed in `GET /api/network/status` as `services`.
+
+The worker lends that service's speech routes alone (`/worker/v1/services/oaiy-voice/…`: its models and voices,
+`/v1/audio/transcriptions`, `/v1/audio/speech`, streamed as it speaks), and no other service: one a person added
+could be anything.
+
 ## Pinning
 
 A worker's model can be **pinned** from the primary's Networking page (*Pin* beside the model): it is loaded on the
@@ -164,10 +200,14 @@ restricted, as `/api/engines/` are):
 | `PUT /api/network/nodes/:id/pins`, `DELETE …/pins/:model` | auth.manage | Pin a worker's model (`{id}` or `{model, kind}`), unpin it |
 | `POST /api/network/nodes/:id/v1/chat/completions` | ai.use | Its language model, streamed |
 | `ANY /api/network/nodes/:id/gateway/*path` | ai.use | Its media routes, jobs and files |
+| `GET /api/network/nodes/:id/flows` | flows.read | The flows it shares |
+| `POST /api/network/nodes/:id/flows/:flow/runs` | runs.write | One run there (`{input?, timeoutMs?, wait?, key?}`) |
+| `GET /api/network/nodes/:id/runs/:run`, `POST …/cancel` | runs.read, runs.write | A run there, as it is now; stopped |
 
 The worker (`/worker/v1/*` on its LAN port, TLS with client certificates): `health` (anyone: a name, a node id, the
 protocol), `pair` and `pair/:id` (anyone with a certificate, to ask), `unpair` (the caller's own pairing or request
-withdrawn), and, for its paired primary only, `capabilities`, `resources`, `pins`, `chat` and `gateway/*path`. The gateway takes the engine's media routes and
+withdrawn), and, for its paired primary only, `capabilities`, `resources`, `pins`, `chat`, `gateway/*path`, `flows`,
+`flows/:id/runs`, `runs/:id` (and `…/cancel`), `services/oaiy-voice/*path` and `voices/:name` (a voice copied there). The gateway takes the engine's media routes and
 files only (not its settings, logs, downloads or playground), and what it answers about itself leaves out its local
 paths and loopback addresses.
 
