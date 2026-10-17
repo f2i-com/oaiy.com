@@ -519,10 +519,10 @@ The rules, one GPU at a time:
   Klein's side by side (a picture made with one and edited with the other loads
   nothing the second time; in Q4 both fit on a 24 GB card), Qwen Image's alone.
   On a Mac's eGPU it places their text encoders by what they keep
-  (`OAIY_TEXT_ENCODER_GPU=auto`): MOSS-Image's 9B on the card, its 4-bit layers
-  kept there beside the pictures' models (5.5 GB; a caption in 1.3 s, where the
-  Mac took 3.1 s), FLUX 3 Klein's 4B on the Mac's own GPU, its layers read as it
-  encodes (0.9 s either way, and the card's memory left to the pictures). Sent to
+  (`OAIY_TEXT_ENCODER_GPU=auto`): MOSS-Image's 9B and FLUX 3 Klein's 4B on the
+  card, their 4-bit layers kept there beside the pictures' models (8 GB; a
+  caption in 1.2 s, where the Mac took 3.1 s), so the Mac's GPU and memory are
+  its language model's (the flows' reviewer, pinned there to stay warm). Sent to
   the card a layer at a time for every picture, encoders took 9 to 45 s.
   `own` puts every encoder on the Mac, `card` every one on the card. A chat that wants its GPU, a job that
   asks for its models to go after it (`"release": true`, the image node's

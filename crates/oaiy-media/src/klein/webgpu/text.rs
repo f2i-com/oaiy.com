@@ -116,6 +116,9 @@ pub struct WgpuKleinText {
     /// The MLP's width.
     ff: usize,
     tokenizer: tokenizers::Tokenizer,
+    /// The layers it keeps on the GPU between prompts, where it is kept ([`Self::keep_layers`]).
+    resident: Vec<Option<Layer>>,
+    keep: bool,
 }
 
 /// A prompt's vectors through the layers.
@@ -153,7 +156,7 @@ impl WgpuKleinText {
 
     /// [`Self::load`] of the text encoder `spec` says.
     pub fn load_spec(checkpoint: &Path, tokenizer: &Path, device: usize, spec: Spec) -> Result<Self> {
-        let gpu = crate::common::webgpu_weights::text_encoder_gpu(device, false)?;
+        let gpu = crate::common::webgpu_weights::text_encoder_gpu(device, true)?;
         let w = Weights::open(checkpoint)?;
         let p = spec.prefix;
         let shape = |w: &Weights, name: &str| w.shape(&format!("{p}layers.0.{name}.weight"));
@@ -173,7 +176,18 @@ impl WgpuKleinText {
                 candle_core::bail!("incompatible Qwen3 tokenizer: {token} must have id {id}");
             }
         }
-        Ok(Self { gpu, spec, vocab, w, ff: gate[0], tokenizer })
+        let layers = spec.taps.iter().copied().max().unwrap_or(0);
+        Ok(Self { gpu, spec, vocab, w, ff: gate[0], tokenizer, resident: (0..layers).map(|_| None).collect(), keep: false })
+    }
+
+    /// Keep its layers on the GPU from one prompt to the next (a worker kept between pictures, on a card: the 4-bit
+    /// GGUF's 2.5 GB sent once, not each picture over the cable), or let them go.
+    pub fn keep_layers(&mut self, keep: bool) {
+        self.keep = keep;
+        if !keep && self.resident.iter().any(Option::is_some) {
+            self.resident.iter_mut().for_each(|l| *l = None);
+            self.gpu.release_cached();
+        }
     }
 
     /// The GPU it is on.
@@ -296,7 +310,10 @@ impl WgpuKleinText {
         // each prompt's states after the tapped layers, in turn
         let mut taps: Vec<Vec<Vec<f32>>> = all.iter().map(|_| Vec::with_capacity(spec.taps.len())).collect();
         for i in 0..layers {
-            let l = self.layer(i)?;
+            let l = match self.resident.get_mut(i).and_then(Option::take) {
+                Some(l) => l,
+                None => self.layer(i)?,
+            };
             let tapped = spec.taps.contains(&(i + 1));
             let mut rec = self.gpu.begin();
             rec.keep_groups(false);
@@ -341,7 +358,13 @@ impl WgpuKleinText {
                     tap.push(states);
                 }
             }
-            drop(l);
+            if self.keep {
+                if let Some(slot) = self.resident.get_mut(i) {
+                    *slot = Some(l);
+                }
+            } else {
+                drop(l);
+            }
         }
         // a token's tapped states side by side
         taps.into_iter()
