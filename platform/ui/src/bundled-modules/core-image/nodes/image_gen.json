@@ -133,94 +133,6 @@
       "showIf": { "property": "service", "equals": "" }
     },
     {
-      "id": "wan2gpModel",
-      "name": "Wan2GP Model",
-      "type": "select",
-      "default": "",
-      "options": [
-        { "value": "qwen", "label": "Qwen Image Edit Plus (20B)" },
-        { "value": "flux2_klein_4b", "label": "Flux 2 Klein (4B)" },
-        { "value": "flux2_klein_9b", "label": "Flux 2 Klein (9B)" },
-        { "value": "z_image", "label": "Z-Image Turbo (6B)" }
-      ],
-      "description": "Model for Wan2GP image generation",
-      "showWhen": { "apiFormat": ["wan2gp"] }
-    },
-    {
-      "id": "wan2gpVram",
-      "name": "VRAM",
-      "type": "select",
-      "default": "auto",
-      "options": [
-        { "value": "auto", "label": "Auto" },
-        { "value": "6", "label": "6 GB (Low)" },
-        { "value": "8", "label": "8 GB" },
-        { "value": "10", "label": "10 GB" },
-        { "value": "12", "label": "12 GB" },
-        { "value": "16", "label": "16 GB" },
-        { "value": "24", "label": "24 GB+" }
-      ],
-      "description": "VRAM budget for generation",
-      "showWhen": { "apiFormat": ["wan2gp"] }
-    },
-    {
-      "id": "wan2gpResolution",
-      "name": "Resolution",
-      "type": "select",
-      "default": "1024x1024",
-      "options": [
-        { "value": "1024x1024", "label": "1024x1024 (1:1)" },
-        { "value": "1280x720", "label": "1280x720 (16:9)" },
-        { "value": "720x1280", "label": "720x1280 (9:16)" },
-        { "value": "1024x576", "label": "1024x576 (16:9)" },
-        { "value": "576x1024", "label": "576x1024 (9:16)" },
-        { "value": "832x624", "label": "832x624 (4:3)" },
-        { "value": "624x832", "label": "624x832 (3:4)" },
-        { "value": "512x512", "label": "512x512 (1:1)" }
-      ],
-      "description": "Output resolution for Wan2GP",
-      "showWhen": { "apiFormat": ["wan2gp"] }
-    },
-    {
-      "id": "wan2gpSteps",
-      "name": "Steps",
-      "type": "number",
-      "default": 4,
-      "min": 1,
-      "max": 100,
-      "description": "Number of inference steps",
-      "showWhen": { "apiFormat": ["wan2gp"] }
-    },
-    {
-      "id": "wan2gpSampler",
-      "name": "Sampler",
-      "type": "select",
-      "default": "lightning",
-      "options": [
-        { "value": "default", "label": "Default (Euler)" },
-        { "value": "lightning", "label": "Lightning (Distilled)" }
-      ],
-      "description": "Sampling algorithm (Lightning for nunchaku distilled models, Default for standard weights)",
-      "showWhen": { "apiFormat": ["wan2gp"] }
-    },
-    {
-      "id": "wan2gpSeed",
-      "name": "Seed",
-      "type": "number",
-      "default": -1,
-      "min": -1,
-      "description": "Seed for reproducible generation (-1 = random)",
-      "showWhen": { "apiFormat": ["wan2gp"] }
-    },
-    {
-      "id": "wan2gpRandomSeed",
-      "name": "Random Seed",
-      "type": "boolean",
-      "default": true,
-      "description": "Use a random seed each generation",
-      "showWhen": { "apiFormat": ["wan2gp"] }
-    },
-    {
       "id": "negativePrompt",
       "name": "Negative Prompt",
       "type": "textarea",
@@ -246,6 +158,7 @@
     },
     {
       "id": "steps",
+      "showIf": { "property": "service", "notStartsWith": "engine:" },
       "name": "Steps",
       "type": "number",
       "default": 20,
@@ -262,6 +175,7 @@
     },
     {
       "id": "release",
+      "advanced": true,
       "name": "Free the picture model after this step",
       "type": "boolean",
       "default": false,
@@ -278,6 +192,7 @@
     },
     {
       "id": "maxImageDimension",
+      "advanced": true,
       "name": "Max Input Image Dimension",
       "type": "number",
       "default": 0,
@@ -287,6 +202,7 @@
     },
     {
       "id": "maxImageSizeKB",
+      "advanced": true,
       "name": "Max Input Image Size (KB)",
       "type": "number",
       "default": 0,

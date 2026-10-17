@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useRef } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   ArrowDownAZ,
   ChevronDown,
@@ -155,6 +155,10 @@ export default function FlowsSidebar({
   const [sort, setSort] = useState<FlowSort>(() => remembered(SORT_KEY, ['recent', 'name'] as const, 'recent'));
   const [examplesOpen, setExamplesOpen] = useState(() => remembered(EXAMPLES_KEY, ['open', 'closed'] as const, 'open') === 'open');
   const searchRef = useRef<HTMLInputElement>(null);
+  // Where each flow sits in the list while it is on screen: opening a flow (which may save it) never moves it, nor does
+  // an edit; the newest-changed first as the list is first drawn, a flow made since on top. Sorting again re-sorts.
+  const placed = useRef<Map<string, number>>(new Map());
+  const activeRef = useRef<HTMLDivElement>(null);
 
   const toggleServiceExpanded = useCallback((packageId: string) => {
     setExpandedServices(prev => {
@@ -196,14 +200,33 @@ export default function FlowsSidebar({
   }, [inCategory]);
   const activeTag = tag && tags.includes(tag) ? tag : null;
 
+  // The flows' places (see `placed`): kept for the ones placed, the new ones on top, the gone forgotten.
+  const ranks = useMemo(() => {
+    const ranks = placed.current;
+    for (const id of [...ranks.keys()]) if (!flows.some((f) => f.id === id)) ranks.delete(id);
+    const unplaced = flows.filter((f) => !ranks.has(f.id)).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+    if (ranks.size === 0) {
+      unplaced.forEach((f, i) => ranks.set(f.id, i));
+    } else {
+      let top = Math.min(...ranks.values());
+      for (const f of [...unplaced].reverse()) ranks.set(f.id, --top);
+    }
+    return new Map(ranks);
+  }, [flows, sort]);
+
   // Filter flows by category, the tag and the search; then in the chosen order.
   const filteredFlows = useMemo(() => {
     const q = query.trim().toLowerCase();
     const kept = inCategory.filter((f) => (!activeTag || f.tags?.includes(activeTag)) && (!q || matches(f, q)));
     return sort === 'name'
       ? [...kept].sort((a, b) => a.name.localeCompare(b.name))
-      : [...kept].sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-  }, [inCategory, activeTag, query, sort]);
+      : [...kept].sort((a, b) => (ranks.get(a.id) ?? 0) - (ranks.get(b.id) ?? 0));
+  }, [inCategory, activeTag, query, sort, ranks]);
+
+  // The open flow in view in the list (opened from elsewhere: the canvas, an example, a new flow).
+  useEffect(() => {
+    activeRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [activeFlowId]);
 
   // The examples not in the project yet (one added is a flow of the list), as the search and tag find them.
   const shownExamples = useMemo(() => {
@@ -379,6 +402,7 @@ export default function FlowsSidebar({
               type="button"
               onClick={() => {
                 const next = sort === 'recent' ? 'name' : 'recent';
+                placed.current.clear();
                 setSort(next);
                 remember(SORT_KEY, next);
               }}
@@ -511,6 +535,7 @@ export default function FlowsSidebar({
                         onContextMenu={(e) => handleContextMenu(e, flow.id)}
                         aria-label={`Select flow: ${flow.name}`}
                         aria-current={active ? 'true' : undefined}
+                        ref={active ? activeRef : undefined}
                         data-flow-name={flow.name}
                         title={flow.description ? `${flow.name}\n${flow.description}` : flow.name}
                       >

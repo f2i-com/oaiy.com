@@ -47,6 +47,14 @@ export function shouldShowProperty(
       return typedCondition.in.includes(targetValue);
     }
 
+    // (a service of OAIY's engines, `engine:…`, or another: what one of them does not take is not shown for it)
+    if (typedCondition.startsWith !== undefined) {
+      return String(targetValue ?? '').startsWith(typedCondition.startsWith);
+    }
+    if (typedCondition.notStartsWith !== undefined) {
+      return !String(targetValue ?? '').startsWith(typedCondition.notStartsWith);
+    }
+
     return true;
   }
 

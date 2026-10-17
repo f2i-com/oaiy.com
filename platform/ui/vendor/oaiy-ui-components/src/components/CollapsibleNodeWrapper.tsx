@@ -1,5 +1,5 @@
 import { memo, useState, useCallback, useEffect, type ReactNode } from 'react';
-import { Handle, Position } from '@xyflow/react';
+import { Handle, Position, useNodeId, useStore } from '@xyflow/react';
 
 export interface ValidationIssue {
   field: string;
@@ -25,13 +25,13 @@ export interface CollapsibleNodeWrapperProps {
   icon: ReactNode;
   /** Width of the node when expanded */
   width: number;
-  /** Width when collapsed (default: 160) */
+  /** Width when collapsed (at least 200: room for its ports' names) */
   collapsedWidth?: number;
   /** Status for visual styling */
   status?: 'running' | 'completed' | 'error';
   /** Validation issues to display warning indicator */
   validationIssues?: ValidationIssue[];
-  /** Whether the node starts collapsed */
+  /** Whether the node starts collapsed (it does: compact until expanded) */
   defaultCollapsed?: boolean;
   /** Controlled collapsed state */
   isCollapsed?: boolean;
@@ -151,11 +151,13 @@ const colorMap = {
   },
 };
 
-const sizeMap = {
-  sm: '!w-4 !h-4',
-  md: '!w-5 !h-5',
-  lg: '!w-6 !h-6',
-};
+// The compact card's measures: a handle sits on its port's row, so the rows are a fixed height under a fixed
+// header (whatever is in the preview or the form below them).
+const HEADER = 38;
+const PORTS_TOP = 4;
+const ROW = 20;
+// (a collapsed card at least this wide: room for its ports' names side by side)
+const MIN_COLLAPSED = 224;
 
 // Run status → visible pill + screen-reader text. Semantic status hues (not the
 // customizable accent): amber=running, green=completed, red=error, each with a
@@ -166,15 +168,27 @@ const STATUS_META = {
   error: { label: 'Error', pill: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300', dot: 'bg-red-500' },
 } as const;
 
+/** A port's name as its row shows it: its label, else its id (a node's one output, `output`, as "out"). */
+function portName(h: HandleConfig): string {
+  if (h.label) return h.label;
+  return h.id === 'default' || h.id === 'output' || h.id === 'out' ? 'out' : h.id === 'input' ? 'in' : h.id.replace(/_/g, ' ');
+}
+
+/**
+ * A node's card on the canvas. Compact until expanded (the default): its name (the node's own label where it has one,
+ * its kind above it), its ports a row each with their names (inputs left, outputs right), and a line of what it is
+ * set to; so a flow reads at a glance, how its steps feed each other, before any one is opened. Expanded, its form
+ * below the ports. The handles sit on their ports' rows.
+ */
 function CollapsibleNodeWrapper({
   title,
   color,
   icon,
   width,
-  collapsedWidth = 160,
+  collapsedWidth = MIN_COLLAPSED,
   status,
   validationIssues = [],
-  defaultCollapsed = false,
+  defaultCollapsed = true,
   isCollapsed: controlledCollapsed,
   onCollapsedChange,
   children,
@@ -188,14 +202,23 @@ function CollapsibleNodeWrapper({
   titleExtra,
 }: CollapsibleNodeWrapperProps) {
   const [internalCollapsed, setInternalCollapsed] = useState(defaultCollapsed);
+  // The node's own name (a flow's "Make the picture" over its kind's "Image Gen"), where it has one.
+  const nodeId = useNodeId();
+  const label = useStore((st) => {
+    const raw = nodeId ? (st.nodeLookup.get(nodeId)?.data as { label?: unknown } | undefined)?.label : undefined;
+    return typeof raw === 'string' ? raw.trim() : '';
+  });
+  const name = label && label !== title ? label : title;
+  const kind = label && label !== title ? title : '';
 
   // Support both controlled and uncontrolled modes
   const isCollapsed = controlledCollapsed !== undefined ? controlledCollapsed : internalCollapsed;
 
-  const colors = colorMap[color];
+  const colors = colorMap[color] ?? colorMap.slate;
   const hasIssues = validationIssues.length > 0;
   const statusClass = status ? `node-${status}` : '';
-  const currentWidth = isCollapsed ? collapsedWidth : width;
+  const currentWidth = isCollapsed ? Math.max(collapsedWidth, MIN_COLLAPSED) : Math.max(width, MIN_COLLAPSED);
+  const rows = Math.max(inputHandles.length, outputHandles.length);
 
   // Sync with controlled state
   useEffect(() => {
@@ -210,107 +233,44 @@ function CollapsibleNodeWrapper({
     onCollapsedChange?.(newState);
   }, [isCollapsed, onCollapsedChange]);
 
-  // Calculate handle positions - evenly distribute on edge
+  // A side's handle on its port's row; a top or bottom one spread along the edge.
   const getHandleStyle = (index: number, total: number, position: Position): React.CSSProperties => {
-    const headerHeight = 40; // header is ~40px
-
     if (position === Position.Left || position === Position.Right) {
-      // Vertical distribution. When collapsed, distribute handles compactly
-      // (smaller gap/offset) rather than clamping every index to a single 50px
-      // point — that stacked all of a multi-input/output node's handles on top of
-      // one another, leaving them visually indistinguishable + untargetable.
-      const startOffset = isCollapsed ? headerHeight + 6 : headerHeight + 15;
-      const gap = isCollapsed ? 12 : 25;
-      const top = startOffset + (index * gap);
-      return { top: `${top}px` };
-    } else {
-      // Horizontal distribution (top/bottom)
-      const totalWidth = currentWidth;
-      const gap = totalWidth / (total + 1);
-      const left = gap * (index + 1);
-      return { left: `${left}px` };
+      return { top: `${HEADER + PORTS_TOP + index * ROW + ROW / 2}px` };
     }
+    const gap = currentWidth / (total + 1);
+    return { left: `${gap * (index + 1)}px` };
   };
 
-  const renderHandle = (handle: HandleConfig, index: number, total: number) => {
-    const sizeClass = sizeMap[handle.size || 'md'];
-    const baseStyle = getHandleStyle(index, total, handle.position);
-    // Add z-index to ensure handles render above labels
-    const style = { ...baseStyle, zIndex: 20 };
+  const renderHandle = (handle: HandleConfig, index: number, total: number) => (
+    <Handle
+      key={handle.id}
+      type={handle.type}
+      position={handle.position}
+      id={handle.id}
+      className={`oaiy-port ${handle.color}`}
+      style={{ ...getHandleStyle(index, total, handle.position), zIndex: 20 }}
+      isConnectable={true}
+      title={portName(handle)}
+    />
+  );
 
-    return (
-      <Handle
-        key={handle.id}
-        type={handle.type}
-        position={handle.position}
-        id={handle.id}
-        className={`${handle.color} ${sizeClass}`}
-        style={style}
-        isConnectable={true}
-      />
-    );
-  };
-
-  // Render handle labels only when expanded
-  const renderHandleLabels = (handles: HandleConfig[], position: Position) => {
-    if (isCollapsed) return null;
-
-    const headerHeight = 40;
-    const startOffset = headerHeight + 15;
-    const gap = 25;
-
-    return handles.map((handle, index) => {
-      if (!handle.label) return null;
-      const top = startOffset + (index * gap) - 4;
-      // Position labels with pointer-events: none so they don't block handle interaction
-      // Left labels: position to left of node, right-aligned (text ends near handle)
-      // Right labels: position to right of node, left-aligned (text starts near handle)
-      const labelStyle: React.CSSProperties = position === Position.Left
-        ? { right: `calc(100% + 8px)`, top: `${top}px`, pointerEvents: 'none', zIndex: 10 }
-        : { left: `calc(100% + 8px)`, top: `${top}px`, pointerEvents: 'none', zIndex: 10 };
-
-      return (
-        <div
-          key={`label-${handle.id}`}
-          className={`absolute text-[9px] ${handle.labelColor || 'text-slate-600 dark:text-slate-400'} bg-white/90 dark:bg-slate-900/80 px-1 rounded whitespace-nowrap`}
-          style={labelStyle}
-        >
-          {handle.label}
-        </div>
-      );
-    });
-  };
+  const issuesText = validationIssues.map((i) => `${i.field}: ${i.message}`).join('\n');
 
   return (
     <div
-      className={`border-2 ${colors.border} rounded-lg shadow-xl overflow-visible relative group transition-all duration-200 ${statusClass} ${className}`}
+      className={`oaiy-node ${colors.border} ${statusClass} ${isCollapsed ? 'collapsed' : 'expanded'} ${className}`}
       style={{ width: currentWidth }}
     >
-      {/* Inner wrapper - clips header and content to match rounded corners */}
-      <div className="bg-white dark:bg-slate-800 rounded-md overflow-hidden">
-        {/* Header - draggable, collapse button on right */}
-        <div
-          className={`${colors.headerBg} px-2 py-1.5 border-b border-slate-300 dark:border-slate-700 flex items-center gap-2 select-none`}
-        >
-          {/* Icon */}
-          <div className={`w-5 h-5 rounded-full ${colors.iconBg} flex items-center justify-center flex-shrink-0`}>
-            {icon}
+      <div className="oaiy-node-card">
+        {/* Header: the kind, the name, its state; double-click (or the chevron) opens it */}
+        <div className={`oaiy-node-head ${colors.headerBg}`} onDoubleClick={toggleCollapse}>
+          <div className={`oaiy-node-icon ${colors.iconBg}`}>{icon}</div>
+          <div className="oaiy-node-names">
+            {kind && <span className={`oaiy-node-kind ${colors.text}`}>{kind}</span>}
+            <span className="oaiy-node-name" title={name}>{name}</span>
           </div>
-
-          {/* Title - truncate when collapsed */}
-          <span className={`${colors.text} font-semibold text-xs ${titleExtra ? '' : 'flex-grow'} truncate`}>
-            {title}
-          </span>
-
-          {/* Title extra content (badges, counts, etc) */}
-          {titleExtra && !isCollapsed && (
-            <div className="flex items-center gap-1 flex-grow">
-              {titleExtra}
-            </div>
-          )}
-
-          {/* Run-status pill — visible label when expanded, always announced to
-              screen readers (role=status + aria-live) so status changes are heard. */}
+          {titleExtra && !isCollapsed && <div className="flex items-center gap-1">{titleExtra}</div>}
           {status && (
             <div
               role="status"
@@ -318,95 +278,60 @@ function CollapsibleNodeWrapper({
               title={STATUS_META[status].label}
               className={`flex items-center gap-1 flex-shrink-0 ${isCollapsed ? '' : 'px-1.5 py-0.5 rounded-full ' + STATUS_META[status].pill}`}
             >
-              <span
-                aria-hidden="true"
-                className={`w-1.5 h-1.5 rounded-full ${STATUS_META[status].dot} ${status === 'running' ? 'animate-pulse' : ''}`}
-              />
-              {!isCollapsed && (
-                <span className="text-[10px] font-medium leading-none">{STATUS_META[status].label}</span>
-              )}
+              <span aria-hidden="true" className={`w-1.5 h-1.5 rounded-full ${STATUS_META[status].dot} ${status === 'running' ? 'animate-pulse' : ''}`} />
+              {!isCollapsed && <span className="text-[10px] font-medium leading-none">{STATUS_META[status].label}</span>}
               <span className="sr-only">{`Status: ${STATUS_META[status].label}`}</span>
             </div>
           )}
-
-          {/* Validation indicator in header when collapsed */}
-          {isCollapsed && hasIssues && (
+          {hasIssues && (
             <div
               role="img"
-              aria-label={`Validation ${validationIssues.length === 1 ? 'issue' : 'issues'}: ${validationIssues.map(i => `${i.field}: ${i.message}`).join('; ')}`}
+              aria-label={`Validation ${validationIssues.length === 1 ? 'issue' : 'issues'}: ${issuesText.replace(/\n/g, '; ')}`}
               className="w-4 h-4 bg-amber-500 rounded-full flex items-center justify-center flex-shrink-0"
-              title={validationIssues.map(i => `${i.field}: ${i.message}`).join('\n')}
+              title={issuesText}
             >
               <svg aria-hidden="true" className="w-2.5 h-2.5 text-slate-900" fill="currentColor" viewBox="0 0 20 20">
                 <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
               </svg>
             </div>
           )}
-
-          {/* Collapse toggle button - nodrag to prevent drag when clicking */}
           <button
             type="button"
-            className={`nodrag p-0.5 rounded ${colors.hoverBg} transition-colors flex-shrink-0`}
+            className={`nodrag oaiy-node-toggle ${colors.hoverBg}`}
             onClick={toggleCollapse}
-            title={isCollapsed ? 'Expand' : 'Collapse'}
-            aria-label={isCollapsed ? `Expand ${title} node` : `Collapse ${title} node`}
+            title={isCollapsed ? 'Show its settings' : 'Make it compact'}
+            aria-label={isCollapsed ? `Expand ${name} node` : `Collapse ${name} node`}
             aria-expanded={!isCollapsed}
           >
-            <svg
-              aria-hidden="true"
-              className={`w-3 h-3 ${colors.text} transition-transform duration-200 ${isCollapsed ? '' : 'rotate-180'}`}
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
+            <svg aria-hidden="true" className={`w-3 h-3 transition-transform duration-200 ${isCollapsed ? '' : 'rotate-180'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
             </svg>
           </button>
         </div>
 
-        {/* Content */}
-        {isCollapsed ? (
-          // Collapsed preview (minimal info)
-          collapsedPreview && (
-            <div className="px-2 py-1.5 text-[10px]">
-              {collapsedPreview}
-            </div>
-          )
-        ) : (
-          // Full content
-          <div className="p-3 space-y-3">
-            {children}
+        {/* Its ports, a row each: what comes in on the left, what goes out on the right */}
+        {rows > 0 && (
+          <div className="oaiy-node-ports" style={{ height: PORTS_TOP + rows * ROW + 4 }}>
+            {Array.from({ length: rows }).map((_, i) => (
+              <div key={i} className="oaiy-node-port" style={{ height: ROW }}>
+                <span className={inputHandles[i]?.labelColor}>{inputHandles[i] ? portName(inputHandles[i]) : ''}</span>
+                <span className={outputHandles[i]?.labelColor}>{outputHandles[i] ? portName(outputHandles[i]) : ''}</span>
+              </div>
+            ))}
           </div>
+        )}
+
+        {isCollapsed ? (
+          collapsedPreview && <div className="oaiy-node-preview">{collapsedPreview}</div>
+        ) : (
+          <div className="oaiy-node-body">{children}</div>
         )}
       </div>
 
-      {/* Handles - rendered by wrapper with calculated positions */}
       {inputHandles.map((h, i) => renderHandle(h, i, inputHandles.length))}
       {outputHandles.map((h, i) => renderHandle(h, i, outputHandles.length))}
       {topHandles.map((h, i) => renderHandle(h, i, topHandles.length))}
       {bottomHandles.map((h, i) => renderHandle(h, i, bottomHandles.length))}
-
-      {/* Handle labels - only when expanded */}
-      {renderHandleLabels(inputHandles, Position.Left)}
-      {renderHandleLabels(outputHandles, Position.Right)}
-
-      {/* Validation Warning Indicator - only when expanded */}
-      {!isCollapsed && hasIssues && (
-        <div
-          role="img"
-          aria-label={`Validation ${validationIssues.length === 1 ? 'issue' : 'issues'}: ${validationIssues.map(i => `${i.field}: ${i.message}`).join('; ')}`}
-          className="absolute -bottom-1 -right-1 w-5 h-5 bg-amber-500 rounded-full flex items-center justify-center cursor-help shadow-lg border-2 border-slate-800 z-10"
-          title={validationIssues.map(i => `${i.field}: ${i.message}`).join('\n')}
-        >
-          <svg aria-hidden="true" className="w-3 h-3 text-slate-900" fill="currentColor" viewBox="0 0 20 20">
-            <path
-              fillRule="evenodd"
-              d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
-              clipRule="evenodd"
-            />
-          </svg>
-        </div>
-      )}
 
       {/* Resize Handles - only when expanded */}
       {!isCollapsed && resizeHandles}

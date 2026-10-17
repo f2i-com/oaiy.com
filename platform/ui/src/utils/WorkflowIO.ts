@@ -286,28 +286,45 @@ export function applyAutoLayout(nodes: Node[], edges: Edge[], direction: 'LR' | 
   const dagreGraph = new dagre.graphlib.Graph();
   dagreGraph.setDefaultEdgeLabel(() => ({}));
 
+  // Each node at the size it is drawn (React Flow measures it), so compact cards sit close and expanded ones get
+  // their room; a node not drawn yet at its type's usual size.
+  const sizeOf = (node: Node) => {
+    const measured = (node as Node & { measured?: { width?: number; height?: number } }).measured;
+    const fallback = getNodeDimensions(node.type || 'default');
+    return { width: measured?.width ?? node.width ?? fallback.width, height: measured?.height ?? node.height ?? fallback.height };
+  };
+
   dagreGraph.setGraph({
     rankdir: direction,
-    nodesep: 120,  // Spacing between nodes in the same rank
-    ranksep: 180,  // Spacing between ranks (levels)
-    marginx: 60,
-    marginy: 60,
+    nodesep: direction === 'LR' ? 36 : 48,  // Spacing between nodes in the same rank
+    ranksep: direction === 'LR' ? 90 : 70,  // Spacing between ranks (levels)
+    marginx: 40,
+    marginy: 40,
   });
 
   nodes.forEach((node) => {
-    const { width, height } = getNodeDimensions(node.type || 'default');
-    dagreGraph.setNode(node.id, { width, height });
+    dagreGraph.setNode(node.id, sizeOf(node));
   });
 
   edges.forEach((edge) => {
     dagreGraph.setEdge(edge.source, edge.target);
   });
 
+  // The flow's inputs (nodes nothing feeds) all in the first column, where a reader looks for them, rather than each
+  // beside the step that takes it: one invisible root before them all, taken out after.
+  const ROOT = '__oaiy_layout_root__';
+  const fed = new Set(edges.map((e) => e.target));
+  const sources = nodes.filter((n) => !fed.has(n.id) && !n.parentId);
+  if (sources.length > 1) {
+    dagreGraph.setNode(ROOT, { width: 1, height: 1 });
+    sources.forEach((n) => dagreGraph.setEdge(ROOT, n.id, { weight: 10 }));
+  }
+
   dagre.layout(dagreGraph);
 
   return nodes.map((node) => {
     const nodeWithPosition = dagreGraph.node(node.id);
-    const { width, height } = getNodeDimensions(node.type || 'default');
+    const { width, height } = sizeOf(node);
 
     return {
       ...node,

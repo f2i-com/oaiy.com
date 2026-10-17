@@ -844,9 +844,16 @@ export function useProject() {
     return true;
   }, [project.flows]);
 
+  // (the canvas saves a flow as it draws it, opening it too: a graph that is what the flow has is no edit, and leaves
+  // the flow, its time and the list's order, as it was)
   const updateFlowGraph = useCallback((flowId: string, graph: WorkflowGraph) => {
-    updateFlow(flowId, { graph });
-  }, [updateFlow]);
+    setProject((prev) => {
+      const flow = prev.flows.find((f) => f.id === flowId);
+      if (flow && JSON.stringify(flow.graph) === JSON.stringify(graph)) return prev;
+      const now = new Date().toISOString();
+      return { ...prev, updatedAt: now, flows: prev.flows.map((f) => (f.id === flowId ? { ...f, graph, updatedAt: now } : f)) };
+    });
+  }, []);
 
   /**
    * Reload all macros from disk (folder macros, user macros, overrides)

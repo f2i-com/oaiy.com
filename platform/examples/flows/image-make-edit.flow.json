@@ -23,7 +23,7 @@
    "type": "input_text",
    "position": {
     "x": 0,
-    "y": 200
+    "y": 510
    },
    "data": {
     "label": "Picture",
@@ -35,7 +35,7 @@
    "type": "input_text",
    "position": {
     "x": 0,
-    "y": 400
+    "y": 686
    },
    "data": {
     "label": "Edit",
@@ -46,8 +46,8 @@
    "id": "to_make",
    "type": "logic_block",
    "position": {
-    "x": 320,
-    "y": 0
+    "x": 314,
+    "y": 211
    },
    "data": {
     "label": "What to make it from",
@@ -63,8 +63,8 @@
    "id": "has_make",
    "type": "condition",
    "position": {
-    "x": 320,
-    "y": 200
+    "x": 628,
+    "y": 218
    },
    "data": {
     "label": "A picture to make?",
@@ -75,8 +75,8 @@
    "id": "has_edit",
    "type": "condition",
    "position": {
-    "x": 320,
-    "y": 400
+    "x": 314,
+    "y": 632
    },
    "data": {
     "label": "An edit asked for?",
@@ -87,8 +87,8 @@
    "id": "enhance",
    "type": "ai_llm",
    "position": {
-    "x": 640,
-    "y": 0
+    "x": 942,
+    "y": 201
    },
    "data": {
     "label": "Enhance the prompt (OpenMOSS's prompt enhancer)",
@@ -102,8 +102,8 @@
    "id": "make",
    "type": "image_gen",
    "position": {
-    "x": 960,
-    "y": 0
+    "x": 1262,
+    "y": 125
    },
    "data": {
     "label": "Make it (MOSS-Image, 6 steps)",
@@ -118,8 +118,8 @@
    "id": "made_ref",
    "type": "logic_block",
    "position": {
-    "x": 1280,
-    "y": 0
+    "x": 1582,
+    "y": 71
    },
    "data": {
     "label": "The picture made, by reference",
@@ -135,8 +135,8 @@
    "id": "source",
    "type": "logic_block",
    "position": {
-    "x": 1280,
-    "y": 220
+    "x": 1896,
+    "y": 258
    },
    "data": {
     "label": "The picture to edit",
@@ -152,8 +152,8 @@
    "id": "edit_image",
    "type": "image_gen",
    "position": {
-    "x": 1600,
-    "y": 220
+    "x": 2210,
+    "y": 445
    },
    "data": {
     "label": "Edit it (FLUX 3 Klein, Q4_K_M, 4 steps)",
@@ -169,8 +169,8 @@
    "id": "result",
    "type": "logic_block",
    "position": {
-    "x": 1920,
-    "y": 120
+    "x": 2530,
+    "y": 358
    },
    "data": {
     "label": "The result",
@@ -190,8 +190,8 @@
    "id": "out",
    "type": "output",
    "position": {
-    "x": 2240,
-    "y": 120
+    "x": 2844,
+    "y": 405
    },
    "data": {
     "label": "Result",

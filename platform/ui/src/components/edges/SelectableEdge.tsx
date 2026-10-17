@@ -2,8 +2,9 @@ import { memo } from 'react';
 import {
   BaseEdge,
   EdgeLabelRenderer,
-  getSmoothStepPath,
+  getBezierPath,
   useReactFlow,
+  useStore,
   type EdgeProps,
 } from '@xyflow/react';
 
@@ -16,10 +17,15 @@ function SelectableEdge({
   sourcePosition,
   targetPosition,
   selected,
+  source,
+  target,
 }: EdgeProps) {
   const { setEdges } = useReactFlow();
+  // (a selected node's wires stand out with it: what feeds it and what it feeds, at a glance)
+  const nodeSelected = useStore((st) => !!(st.nodeLookup.get(source)?.selected || st.nodeLookup.get(target)?.selected));
 
-  const [edgePath, labelX, labelY] = getSmoothStepPath({
+  // A soft curve between the two ports (right angles made long links a grid of crossing lines).
+  const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
     sourceY,
     sourcePosition,
@@ -37,13 +43,11 @@ function SelectableEdge({
   // track light/dark and the user's customizable accent. These are CSS custom
   // properties, so they must be applied via `style` (SVG attributes don't
   // resolve var()); selected uses the brand accent, idle uses muted text tones.
-  const strokeColor = selected
+  const lit = selected || nodeSelected;
+  const strokeColor = lit
     ? 'rgb(var(--accent-primary))'
-    : 'rgb(var(--color-text-tertiary))';
-  const strokeWidth = selected ? 4 : 3;
-  const startCircleColor = selected
-    ? 'rgb(var(--accent-primary))'
-    : 'rgb(var(--color-text-secondary))';
+    : 'rgb(var(--color-text-tertiary) / 0.75)';
+  const strokeWidth = selected ? 3 : lit ? 2.25 : 1.75;
 
   return (
     <>
@@ -51,27 +55,19 @@ function SelectableEdge({
       <defs>
         <marker
           id={`arrow-${id}`}
-          markerWidth="12"
-          markerHeight="12"
-          refX="10"
-          refY="6"
+          markerWidth="9"
+          markerHeight="9"
+          refX="8"
+          refY="4.5"
           orient="auto"
           markerUnits="userSpaceOnUse"
         >
           <path
-            d="M2,2 L10,6 L2,10 L4,6 Z"
+            d="M1,1 L8,4.5 L1,8 L2.5,4.5 Z"
             style={{ fill: strokeColor }}
           />
         </marker>
       </defs>
-      {/* Start circle marker at source */}
-      <circle
-        cx={sourceX}
-        cy={sourceY}
-        r={selected ? 7 : 6}
-        strokeWidth={1.5}
-        style={{ fill: startCircleColor, stroke: strokeColor }}
-      />
       {/* Invisible wider path for easier clicking */}
       <path
         id={`${id}-interaction`}

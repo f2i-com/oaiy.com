@@ -277,6 +277,9 @@ export interface PropertyCondition {
   equals?: unknown;
   notEquals?: unknown;
   in?: unknown[];
+  /** The property's value (as text) starts, or does not start, with this. */
+  startsWith?: string;
+  notStartsWith?: string;
 }
 
 export interface PropertyOption {

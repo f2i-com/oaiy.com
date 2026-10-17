@@ -813,6 +813,79 @@ select:focus-visible,
   right: -0.75rem;
 }
 
+/* A node's card (CollapsibleNodeWrapper): compact until expanded, its ports a row each with the handles on them. */
+.oaiy-node {
+  position: relative;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 12px;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 0.16);
+  transition: box-shadow 0.15s;
+}
+.oaiy-node-card { overflow: hidden; border-radius: 11px; background: rgb(var(--color-bg-secondary)); }
+.oaiy-node-head {
+  display: flex;
+  height: 38px;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+  padding: 0 6px 0 9px;
+  user-select: none;
+}
+.oaiy-node-icon { display: grid; width: 22px; height: 22px; flex: none; place-items: center; border-radius: 7px; color: #fff; }
+.oaiy-node-icon svg { width: 13px; height: 13px; }
+.oaiy-node-names { display: flex; min-width: 0; flex: 1; flex-direction: column; line-height: 1.2; }
+.oaiy-node-kind { overflow: hidden; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.oaiy-node-name { overflow: hidden; color: rgb(var(--color-text-primary)); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.oaiy-node-toggle {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgb(var(--color-text-faint));
+  cursor: pointer;
+}
+.oaiy-node-port {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 13px;
+  color: rgb(var(--color-text-secondary));
+  font-size: 10.5px;
+}
+.oaiy-node-port > span { max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.oaiy-node-port > span:last-child { text-align: right; }
+.oaiy-node-ports { padding-top: 4px; }
+/* (two lines at most: a card stays compact; the whole of it is in the node's settings) */
+.oaiy-node-preview {
+  display: -webkit-box;
+  overflow: hidden;
+  border-top: 1px solid rgb(var(--color-border-secondary));
+  padding: 6px 10px 7px;
+  color: rgb(var(--color-text-faint));
+  font-size: 10.5px;
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.oaiy-node-body { display: flex; flex-direction: column; gap: 12px; border-top: 1px solid rgb(var(--color-border-secondary)); padding: 12px; }
+/* its handles: small dots on the edge, a wider ring to aim at */
+.react-flow__handle.oaiy-port {
+  width: 12px !important;
+  height: 12px !important;
+  min-width: 12px !important;
+  min-height: 12px !important;
+  border: 2px solid rgb(var(--color-bg-secondary));
+}
+.react-flow__handle-left.oaiy-port { left: -6px; }
+.react-flow__handle-right.oaiy-port { right: -6px; }
+.react-flow__handle.oaiy-port::after { position: absolute; inset: -7px; border-radius: 50%; content: ''; }
+
 /* Edge styles */
 .react-flow__edge {
   pointer-events: all;

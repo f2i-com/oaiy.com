@@ -61,10 +61,10 @@ function ConditionNode({ data }: ConditionNodeProps) {
   const operatorLabel = operators.find(op => op.value === operator)?.label || operator;
 
   const collapsedPreview = (
-    <div className="text-slate-400">
-      <span className="text-cyan-400">IF</span>
-      <span className="ml-1 text-[10px] font-mono">{operatorLabel.split(' ')[0]}</span>
-    </div>
+    <span>
+      <span className="text-cyan-400">if</span> the value {(operatorLabel.match(/\(([^)]+)\)/)?.[1] ?? operatorLabel).toLowerCase()}
+      {data.compareValue ? <span className="font-mono"> {String(data.compareValue)}</span> : null}
+    </span>
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [

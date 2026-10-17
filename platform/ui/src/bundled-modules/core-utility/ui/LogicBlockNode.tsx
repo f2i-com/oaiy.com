@@ -106,11 +106,13 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
 
   const editorHeight = Math.max(80, size.height - 180);
 
-  const collapsedPreview = (
-    <div className="text-slate-400">
-      <span className="text-blue-400">{inputCount} input{inputCount > 1 ? 's' : ''}</span>
-    </div>
-  );
+  // What the block does, in its compact card: its first comment (a block's own description), else its first line.
+  const firstLine = useMemo(() => {
+    const lines = String(data.code || '').split('\n').map((l) => l.trim()).filter(Boolean);
+    const comment = lines.find((l) => l.startsWith('//'));
+    return (comment ? comment.replace(/^\/\/\s*/, '') : lines[0] || '').slice(0, 140);
+  }, [data.code]);
+  const collapsedPreview = firstLine ? <span title={firstLine}>{firstLine}</span> : null;
 
   const inputHandles = useMemo<HandleConfig[]>(() => {
     // Use standard handle IDs that match the node definition: input, input2, input3, etc. (one for each input the

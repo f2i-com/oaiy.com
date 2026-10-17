@@ -217,8 +217,7 @@
       "default": 0,
       "min": 0,
       "max": 10,
-      "description": "Number of image inputs for vision",
-      "advanced": true
+      "description": "How many pictures it takes (each an input of its own)"
     },
     {
       "id": "videoFrames",
@@ -232,6 +231,7 @@
     },
     {
       "id": "mmprojPath",
+      "showIf": { "service": "", "provider": "oaiy-local" },
       "name": "Vision Projector (mmproj)",
       "type": "filepath",
       "default": "",

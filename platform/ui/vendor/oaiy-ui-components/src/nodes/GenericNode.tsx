@@ -94,6 +94,21 @@ function getColorName(color: string | undefined): NodeColor {
 // GenericNode Component
 // ============================================
 
+/** What a node is set to, in a line for its compact card: the service or model it uses, its size, the start of its
+ * instructions. */
+function summaryOf(data: Record<string, unknown>): string {
+  const parts: string[] = [];
+  const service = typeof data.service === 'string' ? data.service.trim() : '';
+  if (service === 'engine:llm') parts.push('the chosen language model');
+  else if (service) parts.push(service.replace(/^engine:[a-z0-9]+:/, '').replace(/^engine:/, ''));
+  else if (typeof data.model === 'string' && data.model.trim()) parts.push(data.model.trim());
+  if (Number(data.width) > 0 && Number(data.height) > 0) parts.push(`${data.width}×${data.height}`);
+  if (Number(data.imageInputCount) > 0) parts.push(`${data.imageInputCount} picture${Number(data.imageInputCount) > 1 ? 's' : ''} in`);
+  const text = [data.systemPrompt, data.prompt].find((t): t is string => typeof t === 'string' && t.trim() !== '');
+  const line = parts.join(' · ');
+  return text ? `${line}${line ? ' — ' : ''}${text.trim().split(/\s+/).slice(0, 12).join(' ')}…` : line;
+}
+
 export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
   // Get node type from the store using the node id
   const nodeType = useStore((state) => {
@@ -211,8 +226,12 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
       color={getColorName(definition.color)}
       icon={getIcon(definition.icon)}
       width={nodeWidth}
+      collapsedWidth={230}
       inputHandles={inputHandles}
       outputHandles={outputHandles}
+      isCollapsed={data._collapsed as boolean | undefined}
+      onCollapsedChange={data.onCollapsedChange as ((collapsed: boolean) => void) | undefined}
+      collapsedPreview={summaryOf(data) || undefined}
     >
       <div className="flex flex-col gap-3">
         {notice && (

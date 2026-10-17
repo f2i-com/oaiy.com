@@ -1,5 +1,5 @@
 import { useCallback, useRef, useMemo, useState, useEffect, useLayoutEffect } from 'react';
-import { Layers, Map as MapIcon, Package as PackageIcon, Play, Plus, RefreshCw, RotateCcw, Save, ScrollText, SlidersHorizontal, Square, X } from 'lucide-react';
+import { ChevronsDownUp, ChevronsUpDown, LayoutGrid, Layers, Map as MapIcon, Package as PackageIcon, Play, Plus, RefreshCw, RotateCcw, Save, ScrollText, SlidersHorizontal, Square, X } from 'lucide-react';
 import {
   ReactFlow,
   Background,
@@ -471,15 +471,14 @@ export default function OAIYBuilder({
   // Use stable handlers to avoid recreating functions on each render
   const handlers = useStableHandlers(updateNodeData);
 
-  const handleAutoLayoutHorizontal = useCallback(() => {
-    autoLayout('LR');
+  // Laid out, then the whole flow in view (once React Flow has the new positions).
+  const layOut = useCallback((direction: 'LR' | 'TB') => {
+    autoLayout(direction);
     setContextMenu(null);
+    requestAnimationFrame(() => requestAnimationFrame(() => reactFlowInstance.current?.fitView({ padding: 0.12, duration: 300, maxZoom: 1 })));
   }, [autoLayout]);
-
-  const handleAutoLayoutVertical = useCallback(() => {
-    autoLayout('TB');
-    setContextMenu(null);
-  }, [autoLayout]);
+  const handleAutoLayoutHorizontal = useCallback(() => layOut('LR'), [layOut]);
+  const handleAutoLayoutVertical = useCallback(() => layOut('TB'), [layOut]);
 
   // Node grouping hook
   const {
@@ -505,6 +504,9 @@ export default function OAIYBuilder({
     setNodes((nds) => nds.map((n) => ({ ...n, data: { ...n.data, _collapsed: true } })));
     setContextMenu(null);
   }, [setNodes]);
+
+  // (a node never opened or closed is compact: the cards' default)
+  const allCollapsed = nodes.length > 0 && nodes.every((n) => (n.data as { _collapsed?: boolean })._collapsed !== false);
 
   const handleExpandAll = useCallback(() => {
     setNodes((nds) => nds.map((n) => ({ ...n, data: { ...n.data, _collapsed: false } })));
@@ -1246,6 +1248,29 @@ export default function OAIYBuilder({
           >
             <SlidersHorizontal size={16} />
             <span>Properties</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleAutoLayoutHorizontal}
+            disabled={nodes.length === 0}
+            className="oaiy-tool"
+            aria-label="Lay the flow out neatly"
+            title="Tidy: lay the flow out neatly, left to right in the order its steps run (right-click the canvas for top to bottom)"
+            data-testid="flow-tidy"
+          >
+            <LayoutGrid size={16} />
+            <span>Tidy</span>
+          </button>
+          <button
+            type="button"
+            onClick={allCollapsed ? handleExpandAll : handleCollapseAll}
+            disabled={nodes.length === 0}
+            className="oaiy-tool"
+            aria-label={allCollapsed ? 'Show every node’s settings' : 'Make every node compact'}
+            title={allCollapsed ? 'Expand every node: their settings on the canvas' : 'Compact every node: their names and connections only'}
+          >
+            {allCollapsed ? <ChevronsUpDown size={16} /> : <ChevronsDownUp size={16} />}
+            <span>{allCollapsed ? 'Expand' : 'Compact'}</span>
           </button>
           <span className="sep" aria-hidden="true" />
 
