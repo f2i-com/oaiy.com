@@ -65,6 +65,9 @@ pub fn client(id: &Identity, pin: Pin) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .use_preconfigured_tls(client_config(id, pin)?)
         .connect_timeout(std::time::Duration::from_secs(5))
+        // (a worker that has sent nothing for twenty minutes is not waited for longer: a picture on a slow GPU, or a long
+        // prompt read before the first word, sends nothing for minutes, but not for that long)
+        .read_timeout(std::time::Duration::from_secs(20 * 60))
         // (a worker is reached at the address it was found at; its own redirects are not followed)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()

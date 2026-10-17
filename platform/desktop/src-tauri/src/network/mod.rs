@@ -35,7 +35,7 @@ use self::store::{Peers, Role, Settings};
 pub use primary::{remote_services, router};
 
 /// The protocol a worker and a primary speak (`/worker/v1`).
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 static SHARED: OnceLock<Network> = OnceLock::new();
 
@@ -71,9 +71,13 @@ pub(crate) struct Inner {
     outgoing: Mutex<Vec<primary::Outgoing>>,
     /// What a primary last heard from each paired worker.
     nodes: Mutex<HashMap<String, primary::NodeState>>,
+    /// Workers unpaired here that did not answer then: told when they do (while this computer runs).
+    untold: Mutex<Vec<store::Peer>>,
     /// Workers advertised on the LAN (mDNS), by node id.
     found: Arc<Mutex<HashMap<String, discovery::Found>>>,
     running: Mutex<Running>,
+    /// Settings applied one change at a time: two at once would each start a listener and an advertisement.
+    applying: tokio::sync::Mutex<()>,
     /// mDNS off (tests): advertising and browsing are not started.
     mdns: bool,
 }
@@ -81,8 +85,8 @@ pub(crate) struct Inner {
 /// What is running for the role in effect.
 #[derive(Default)]
 struct Running {
-    /// A worker's listener: where it listens, and the sender that stops it.
-    listener: Option<(std::net::SocketAddr, tokio::sync::watch::Sender<bool>)>,
+    /// A worker's listener: where it listens, the sender that stops it, and its task (ended: its port is free).
+    listener: Option<(std::net::SocketAddr, tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
     /// A primary's heartbeat: the sender that stops it.
     heartbeat: Option<tokio::sync::watch::Sender<bool>>,
     mdns: Option<mdns_sd::ServiceDaemon>,
@@ -113,8 +117,10 @@ impl Network {
                 incoming: Mutex::new(Vec::new()),
                 outgoing: Mutex::new(Vec::new()),
                 nodes: Mutex::new(HashMap::new()),
+                untold: Mutex::new(Vec::new()),
                 found: Arc::new(Mutex::new(HashMap::new())),
                 running: Mutex::new(Running::default()),
+                applying: tokio::sync::Mutex::new(()),
                 mdns,
             }),
         }
@@ -156,6 +162,10 @@ impl Network {
     /// Take new settings: kept, and what runs changed to match (a worker's listener and advertisement, a primary's
     /// heartbeat and browsing).
     pub async fn set(&self, settings: Settings) -> Result<(), String> {
+        // (an address a worker cannot listen on is refused before anything is kept or stopped)
+        if settings.active_role() == Role::Worker {
+            bind_address(&settings)?;
+        }
         settings.save(&self.inner.dir)?;
         *lock(&self.inner.settings) = settings;
         self.apply().await
@@ -163,38 +173,43 @@ impl Network {
 
     /// Start what the settings ask for, stopping what they no longer do.
     pub async fn apply(&self) -> Result<(), String> {
-        self.stop();
+        let _one_at_a_time = self.inner.applying.lock().await;
+        // (the listener stopped and its task ended, so its port is free to listen on again: a worker renamed keeps it)
+        if let Some(ended) = self.stop_running() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ended).await;
+        }
         let settings = self.settings();
         let role = settings.active_role();
         if role == Role::Standalone {
             return Ok(());
         }
         let id = self.identity()?;
-        let daemon = if self.inner.mdns {
-            match mdns_sd::ServiceDaemon::new() {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    log::warn!("network: mDNS could not start ({e}); workers are added by their address");
-                    None
-                }
+        // (started once what it serves is: nothing is left running, or advertised, by a listener that failed)
+        let daemon = || {
+            if !self.inner.mdns {
+                return None;
             }
-        } else {
-            None
+            mdns_sd::ServiceDaemon::new()
+                .map_err(|e| log::warn!("network: mDNS could not start ({e}); workers are added by their address"))
+                .ok()
         };
+        let mut started = None;
         match role {
             Role::Worker => {
                 let bind = bind_address(&settings)?;
-                let (addr, stop) = worker::listen(self.clone(), &id, bind).await?;
+                let (addr, stop, task) = worker::listen(self.clone(), &id, bind).await?;
                 log::info!("network: this computer is a worker, listening on {addr}");
-                if let Some(d) = &daemon {
+                started = daemon();
+                if let Some(d) = &started {
                     if let Err(e) = discovery::advertise(d, &id, &self.display_name(), addr.port()) {
                         log::warn!("network: not advertised on the LAN ({e}); a primary adds it by its address");
                     }
                 }
-                lock(&self.inner.running).listener = Some((addr, stop));
+                lock(&self.inner.running).listener = Some((addr, stop, task));
             }
             Role::Primary => {
-                if let Some(d) = &daemon {
+                started = daemon();
+                if let Some(d) = &started {
                     if let Err(e) = discovery::browse(d, self.inner.found.clone()) {
                         log::warn!("network: workers on the LAN are not looked for ({e}); add them by their address");
                     }
@@ -203,15 +218,22 @@ impl Network {
             }
             Role::Standalone => {}
         }
-        lock(&self.inner.running).mdns = daemon;
+        lock(&self.inner.running).mdns = started;
         Ok(())
     }
 
     /// Stop everything running (Network off, or about to start again).
     pub fn stop(&self) {
+        drop(self.stop_running());
+    }
+
+    /// As [`Network::stop`], answering the listener's task, which ends once its port is free.
+    fn stop_running(&self) -> Option<tokio::task::JoinHandle<()>> {
         let mut running = lock(&self.inner.running);
-        if let Some((_, stop)) = running.listener.take() {
+        let mut task = None;
+        if let Some((_, stop, t)) = running.listener.take() {
             let _ = stop.send(true);
+            task = Some(t);
         }
         if let Some(stop) = running.heartbeat.take() {
             let _ = stop.send(true);
@@ -220,11 +242,12 @@ impl Network {
             let _ = d.shutdown();
         }
         lock(&self.inner.found).clear();
+        task
     }
 
     /// Where a worker listens (none unless it is one, switched on).
     pub fn listening(&self) -> Option<std::net::SocketAddr> {
-        lock(&self.inner.running).listener.as_ref().map(|(a, _)| *a)
+        lock(&self.inner.running).listener.as_ref().map(|(a, _, _)| *a)
     }
 
     /// What the Networking page shows of this computer.
@@ -250,7 +273,7 @@ impl Network {
 impl Drop for Inner {
     fn drop(&mut self) {
         let running = self.running.get_mut().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, stop)) = running.listener.take() {
+        if let Some((_, stop, _)) = running.listener.take() {
             let _ = stop.send(true);
         }
         if let Some(stop) = running.heartbeat.take() {
@@ -305,11 +328,16 @@ fn typeable(ips: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
     out
 }
 
+/// This computer's name, asked of the system once (a stranger's `health` must not start a process each time).
 fn hostname() -> String {
-    std::env::var("OAIY_NETWORK_NAME")
-        .ok()
-        .or_else(|| std::process::Command::new("hostname").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()))
-        .map(|s| s.trim().trim_end_matches(".local").to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "This computer".to_string())
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("OAIY_NETWORK_NAME")
+            .ok()
+            .or_else(|| std::process::Command::new("hostname").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()))
+            .map(|s| s.trim().trim_end_matches(".local").to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "This computer".to_string())
+    })
+    .clone()
 }

@@ -20,7 +20,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::identity::{pairing_code, short, Identity};
+use super::identity::{commitment, is_nonce, nonce, pairing_code, short, Identity};
 use super::store::{now_ms, Peer, Role, Settings};
 use super::tls::{self, Pin};
 use super::{lock, worker, Network, PROTOCOL};
@@ -255,13 +255,37 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
     if node_id == id.node_id {
         return error(StatusCode::BAD_REQUEST, "invalid_address", "that address is this computer");
     }
+    // The code: the worker committed to its random value above; this computer's is told now, to that same certificate,
+    // and the worker's told back is held to its commitment (identity::pairing_code).
+    let Some(committed) = answer.get("commitment").and_then(Value::as_str).filter(|c| is_nonce(c)).map(str::to_ascii_lowercase) else {
+        return error(StatusCode::BAD_GATEWAY, "pairing_refused", "the worker pairs another way: update OAIY on both computers to pair them");
+    };
+    let mine = match nonce() {
+        Ok(n) => n,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
+    };
+    let same_worker = match client_for(&id, &fp) {
+        Ok(c) => c,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
+    };
+    let told = match same_worker.post(url(&address, &format!("/worker/v1/pair/{request_id}"))).json(&json!({ "nonce": mine })).timeout(Duration::from_secs(10)).send().await {
+        Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
+        Ok(r) => return error(StatusCode::BAD_GATEWAY, "pairing_refused", format!("the worker refused (HTTP {})", r.status())),
+        Err(e) => return error(StatusCode::BAD_GATEWAY, "unreachable", format!("{address} did not answer as an OAIY worker: {}", plain(&e))),
+    };
+    let Some(theirs) = told.get("nonce").and_then(Value::as_str).filter(|n| is_nonce(n)).map(str::to_ascii_lowercase) else {
+        return error(StatusCode::BAD_GATEWAY, "pairing_refused", "the worker's answer was not a pairing request");
+    };
+    if commitment(&id.fingerprint, &fp, &theirs) != committed {
+        return error(StatusCode::BAD_GATEWAY, "pairing_refused", "the worker's answer does not match what it committed to: something on the network is in the way, so it is not paired");
+    }
     let pending = Outgoing {
         id: uuid::Uuid::new_v4().simple().to_string(),
         address,
         request_id: request_id.to_string(),
         node_id: node_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(64).collect(),
         name: answer.get("name").and_then(Value::as_str).unwrap_or("An OAIY worker").chars().filter(|c| !c.is_control()).take(80).collect(),
-        code: pairing_code(&id.fingerprint, &fp),
+        code: pairing_code(&id.fingerprint, &fp, &mine, &theirs),
         fingerprint: fp,
         at: Instant::now(),
         approved_there: false,
@@ -291,7 +315,8 @@ struct PairConfirm {
 /// is `approved_there` until this computer's person says the worker showed the same code (`accept: true`): only then
 /// is the worker paired here (its certificate pinned) and its models asked for. Both screens are checked, so a
 /// computer answering for the worker on the network cannot pair itself by approving its own request.
-/// `accept: false` gives up, and tells a worker that approved to forget this computer.
+/// `accept: false` gives up, and tells the worker so: a request its person has not answered yet is withdrawn there,
+/// and a worker that approved (perhaps since this computer last asked) forgets this computer.
 async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) -> Response {
     let Some(p) = lock(&net.inner().outgoing).iter().find(|o| o.id == req.pairing_id && o.at.elapsed() < PAIRING_TTL).cloned() else {
         return error(StatusCode::NOT_FOUND, "not_found", "no such pairing (or it has expired): start again");
@@ -306,7 +331,8 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
     };
     if req.accept == Some(false) {
         lock(&net.inner().outgoing).retain(|o| o.id != p.id);
-        if p.approved_there {
+        // (a worker paired already, asked again: its pairing stands, and a second yes there changes nothing)
+        if !paired_already(&net, &p) {
             let _ = client.post(url(&p.address, "/worker/v1/unpair")).timeout(Duration::from_secs(3)).send().await;
         }
         return Json(json!({ "status": "declined" })).into_response();
@@ -339,6 +365,11 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         }
         _ => Json(json!({ "status": "pending", "code": p.code })).into_response(),
     }
+}
+
+/// Whether the worker of pairing `p` is paired here already, with the same certificate.
+fn paired_already(net: &Network, p: &Outgoing) -> bool {
+    net.inner().peers().get(&p.node_id).is_some_and(|w| w.fingerprint == p.fingerprint)
 }
 
 /// The worker of pairing `p`, approved on both screens: paired here, its certificate pinned, its models asked for.
@@ -386,6 +417,9 @@ fn node_json(net: &Network, p: &Peer) -> Value {
     let resources = caps.get("resources").cloned().unwrap_or(Value::Null);
     let models: Vec<Value> = if caps.get("discovery").is_some_and(|d| !d.is_null()) {
         let pins = resources.get("pins").and_then(Value::as_array).cloned().unwrap_or_default();
+        // (the language model's pin is its chosen one's, running or not)
+        let llm_pinned = resources.pointer("/policy/llm_pinned") == Some(&json!(true));
+        let chosen_llm = caps.pointer("/discovery/defaults/llm").and_then(Value::as_str).map(str::to_owned);
         crate::ai::engine_services::services_from_discovery(&caps["discovery"])
             .into_iter()
             .map(|e| {
@@ -393,7 +427,9 @@ fn node_json(net: &Network, p: &Peer) -> Value {
                 let held = resources.get("models").and_then(Value::as_array).and_then(|l| l.iter().find(|m| m["model"].as_str() == Some(model.as_str())));
                 // (a picture model's pin, loaded or not yet: `media.pinned`; the language model's, `llm.pinned`)
                 let pin = pins.iter().find(|p| p["model"].as_str() == Some(model.as_str()));
-                let pinned = pin.is_some() || held.is_some_and(|m| m["pinned"] == json!(true));
+                let pinned = pin.is_some()
+                    || held.is_some_and(|m| m["pinned"] == json!(true))
+                    || (e["kind"] == "llm" && llm_pinned && chosen_llm.as_deref() == Some(model.as_str()));
                 json!({
                     "id": scoped_id(e["kind"].as_str().unwrap_or(""), &p.node_id, &model),
                     "kind": e["kind"],
@@ -439,12 +475,9 @@ async fn unpair(State(net): State<Network>, Path(node_id): Path<String>) -> Resp
     let Some(peer) = net.inner().peers().get(&node_id).cloned() else {
         return error(StatusCode::NOT_FOUND, "not_found", "no such paired computer");
     };
-    if peer.role == Role::Worker {
-        if let Ok(id) = net.identity() {
-            if let Ok(c) = client_for(&id, &peer.fingerprint) {
-                let _ = c.post(url(&peer.address, "/worker/v1/unpair")).timeout(Duration::from_secs(3)).send().await;
-            }
-        }
+    if peer.role == Role::Worker && !tell_unpaired(&net, &peer).await {
+        // (it did not answer: told when it does, so it stops accepting this computer too)
+        lock(&net.inner().untold).push(peer.clone());
     }
     if let Err(e) = net.inner().peers().remove(&node_id) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
@@ -452,6 +485,23 @@ async fn unpair(State(net): State<Network>, Path(node_id): Path<String>) -> Resp
     lock(&net.inner().nodes).remove(&node_id);
     log::info!("network: unpaired {}", peer.name);
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Tell a worker unpaired here that it is: whether it heard (it answered, or no longer knows this computer).
+async fn tell_unpaired(net: &Network, peer: &Peer) -> bool {
+    let Some(c) = net.identity().ok().and_then(|id| client_for(&id, &peer.fingerprint).ok()) else { return false };
+    matches!(c.post(url(&peer.address, "/worker/v1/unpair")).timeout(Duration::from_secs(3)).send().await, Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::FORBIDDEN)
+}
+
+/// The workers unpaired here that did not hear of it, told again; one paired again since is not told.
+pub(crate) async fn tell_untold(net: &Network) {
+    let untold: Vec<Peer> = std::mem::take(&mut *lock(&net.inner().untold));
+    for peer in untold {
+        let again = net.inner().peers().get(&peer.node_id).is_some_and(|p| p.fingerprint == peer.fingerprint);
+        if !again && !tell_unpaired(net, &peer).await {
+            lock(&net.inner().untold).push(peer);
+        }
+    }
 }
 
 /// A paired worker, by node id, and the client that reaches it.
@@ -523,15 +573,16 @@ async fn pin(State(net): State<Network>, Path(node_id): Path<String>, Json(body)
 
 /// `DELETE /api/network/nodes/:id/pins/:pin`: the pinned model (its name on the worker) let go as any other again.
 async fn unpin(State(net): State<Network>, Path((node_id, model)): Path<(String, String)>) -> Response {
-    // (its kind as the worker lists it: the language model's pin is its own)
-    let kind = lock(&net.inner().nodes)
-        .get(&node_id)
-        .and_then(|s| s.capabilities.as_ref())
-        .and_then(|c| c.pointer("/resources/models").and_then(Value::as_array).cloned())
-        .and_then(|models| models.iter().find(|m| m.get("model").and_then(Value::as_str) == Some(model.as_str())).and_then(|m| m.get("kind").and_then(Value::as_str).map(str::to_owned)))
-        .map(|k| if k == "language" { "llm".to_string() } else { "image".to_string() })
-        .unwrap_or_else(|| "image".to_string());
-    pin_change(&net, &node_id, &model, &kind, false).await
+    // (its kind as the worker's catalogue lists it, loaded or not: the language model's pin is its own)
+    let caps = lock(&net.inner().nodes).get(&node_id).and_then(|s| s.capabilities.clone()).unwrap_or(Value::Null);
+    let listed = caps.get("discovery").filter(|d| !d.is_null()).map(crate::ai::engine_services::services_from_discovery).unwrap_or_default();
+    let kind = listed
+        .iter()
+        .find(|e| e["model"].as_str() == Some(model.as_str()))
+        .and_then(|e| e["kind"].as_str())
+        .map(|k| if k == "llm" { "llm" } else { "image" })
+        .unwrap_or("image");
+    pin_change(&net, &node_id, &model, kind, false).await
 }
 
 async fn pin_change(net: &Network, node_id: &str, model: &str, kind: &str, pin: bool) -> Response {
@@ -594,11 +645,20 @@ async fn node_gateway(State(net): State<Network>, Path((node_id, path)): Path<(S
         Ok(b) => b,
         Err(e) => return error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", e.to_string()),
     };
-    let mut call = client.request(m, url(&peer.address, &format!("/worker/v1/gateway/{path}{query}")));
+    // (and the URL keeps it: one its parser would fold is refused, not sent somewhere else)
+    let Some(target) = crate::ai::engine_services::exact_url(&url(&peer.address, ""), &format!("/worker/v1/gateway/{path}"), &query) else {
+        return error(StatusCode::BAD_REQUEST, "bad_path", "not one of the worker's media routes");
+    };
+    let mut call = client.request(m, target);
     for name in ["content-type", "range"] {
         if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
             call = call.header(name, v);
         }
+    }
+    // (the worker names its files at this desktop's route for it, as its caller reached it, not at its own loopback)
+    let host = headers.get("host").and_then(|v| v.to_str().ok()).filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c)));
+    if let Some(host) = host {
+        call = call.header("x-oaiy-base", format!("http://{host}/api/network/nodes/{node_id}/gateway"));
     }
     if !body.is_empty() {
         call = call.body(body);
@@ -620,6 +680,8 @@ pub(crate) fn heartbeat(net: Network) -> tokio::sync::watch::Sender<bool> {
         loop {
             let workers: Vec<Peer> = net.inner().peers().list().iter().filter(|p| p.role == Role::Worker).cloned().collect();
             futures_util::future::join_all(workers.iter().map(|p| check(&net, p))).await;
+            forget_lapsed(&net).await;
+            tell_untold(&net).await;
             {
                 let paired: Vec<String> = workers.iter().map(|p| p.node_id.clone()).collect();
                 lock(&net.inner().nodes).retain(|id, _| paired.contains(id));
@@ -631,6 +693,27 @@ pub(crate) fn heartbeat(net: Network) -> tokio::sync::watch::Sender<bool> {
         }
     });
     stop
+}
+
+/// Pairings that ran out here: a worker whose person approved, with no answer from this computer's person, is told to
+/// forget this computer (it paired on its side only); one still asking is told to stop.
+pub(crate) async fn forget_lapsed(net: &Network) {
+    let lapsed: Vec<Outgoing> = {
+        let mut outgoing = lock(&net.inner().outgoing);
+        let (gone, kept): (Vec<Outgoing>, Vec<Outgoing>) = outgoing.drain(..).partition(|o| o.at.elapsed() >= PAIRING_TTL);
+        *outgoing = kept;
+        gone
+    };
+    let Ok(id) = net.identity() else { return };
+    for p in lapsed {
+        // (paired here, before or since: nothing to undo)
+        if paired_already(net, &p) {
+            continue;
+        }
+        if let Ok(client) = client_for(&id, &p.fingerprint) {
+            let _ = client.post(url(&p.address, "/worker/v1/unpair")).timeout(Duration::from_secs(3)).send().await;
+        }
+    }
 }
 
 /// One worker's capabilities, asked now: at its address, else where the LAN last saw it (it moved).
@@ -692,6 +775,9 @@ pub(crate) fn remote_services_of(net: &Network) -> Vec<Value> {
         let resources = state.capabilities.as_ref().and_then(|c| c.get("resources")).cloned().unwrap_or(Value::Null);
         for e in crate::ai::engine_services::services_from_discovery(discovery) {
             let mut entry = remote_entry(e, &p, state.online);
+            if !stays_below(&entry, &format!("/api/network/nodes/{}/gateway", p.node_id)) {
+                continue;
+            }
             // (pinned there: kept loaded on the worker, `PUT /api/network/nodes/:id/pins`)
             let model = entry["model"].as_str().unwrap_or("").to_string();
             let pinned = resources.get("pins").and_then(Value::as_array).is_some_and(|l| l.iter().any(|x| x["model"].as_str() == Some(model.as_str())))
@@ -701,6 +787,19 @@ pub(crate) fn remote_services_of(net: &Network) -> Vec<Value> {
         }
     }
     out
+}
+
+/// Whether each of a worker's entry's routes stays below that worker's gateway here: a worker naming `..` in its
+/// discovery would send this desktop's clients (with their credentials) to another of this desktop's routes.
+fn stays_below(e: &Value, gateway: &str) -> bool {
+    let mut routes: Vec<&str> = ["endpoint", "filesUrl"].iter().filter_map(|f| e.get(*f).and_then(Value::as_str)).collect();
+    if let Some(job) = e.get("job").and_then(Value::as_object) {
+        routes.extend(job.values().filter_map(Value::as_str).filter(|v| v.starts_with('/')));
+    }
+    routes.into_iter().all(|r| match r.strip_prefix(gateway) {
+        Some(rest) => crate::ai::engine_services::plain_path(rest.split('?').next().unwrap_or("")),
+        None => !r.contains(".."),
+    })
 }
 
 fn remote_entry(mut e: Value, p: &Peer, ready: bool) -> Value {

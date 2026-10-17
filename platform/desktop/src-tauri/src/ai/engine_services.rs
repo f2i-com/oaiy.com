@@ -380,17 +380,32 @@ fn forwardable(discovery: &Value, path: &str) -> bool {
 }
 
 /// Whether `path` names a route below the one it starts with, and nothing else: no `.` or `..` segment (nor one
-/// written `%2e`, which the URL parser reads as a dot), no empty segment, no backslash, query or fragment. Checked
-/// before a path is put in a URL, where `media/../other` would become another route (on the engines' gateway, or a
-/// worker's own routes past OAIY Network's gateway).
+/// written `%2e`, which the URL parser reads as a dot), no empty segment, no backslash, query or fragment, no control
+/// character (the URL parser drops a tab or a newline, so `.<newline>.` would be `..`), and no slash written `%2f` (a
+/// segment decoded further on). Checked before a path is put in a URL, where `media/../other` would become another
+/// route (on the engines' gateway, or a worker's own routes past OAIY Network's gateway); [`exact_url`] then makes
+/// sure the URL kept it.
 pub(crate) fn plain_path(path: &str) -> bool {
     let rest = path.strip_prefix('/').unwrap_or(path);
+    let lower = path.to_ascii_lowercase();
     !rest.is_empty()
-        && !path.contains(['\\', '?', '#', '\0'])
+        && !path.contains(['\\', '?', '#'])
+        && !path.chars().any(char::is_control)
+        && !lower.contains("%2f")
+        && !lower.contains("%5c")
         && rest.split('/').all(|seg| {
             let seg = seg.to_ascii_lowercase().replace("%2e", ".");
             !seg.is_empty() && seg != "." && seg != ".."
         })
+}
+
+/// `base` + `path` (+ `query`) as a URL, only if the URL parser kept `path` as written: one it would fold or strip
+/// (a dot segment, a tab or a newline) lands on another route than the one checked, so no URL is made.
+pub(crate) fn exact_url(base: &str, path: &str, query: &str) -> Option<reqwest::Url> {
+    let base = base.trim_end_matches('/');
+    let url = reqwest::Url::parse(&format!("{base}{path}{query}")).ok()?;
+    let base_path = reqwest::Url::parse(base).ok()?.path().trim_end_matches('/').to_string();
+    (url.path() == format!("{base_path}{path}")).then_some(url)
 }
 
 /// `/api/ai/engine/gateway/<gateway path>`: the call, sent on to the gateway and its answer streamed back.
@@ -449,7 +464,10 @@ async fn forward_to(gateway: &str, discovery: &Value, path: String, req: Request
     let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
         return ai_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", method);
     };
-    let mut call = client.request(m, format!("{gateway}{path}{query}"));
+    let Some(target) = exact_url(gateway, &path, &query) else {
+        return ai_error(StatusCode::NOT_FOUND, "not_forwarded", format!("{path} is not one of the engine's media routes"));
+    };
+    let mut call = client.request(m, target);
     if let Some(ct) = content_type {
         call = call.header("content-type", ct);
     }
@@ -582,6 +600,15 @@ mod tests {
         }
         for bad in ["/files/../api/config", "/files/%2e%2e/x", "/files/%2E./x", "/files/.%2e/x", "/files/./a.png", "/files//a.png", "/files/a\\..\\b", "/files/a.png?x", "/v1/images/generations/..", "/", ""] {
             assert!(!plain_path(bad), "{bad}");
+        }
+        // (a path decoded once already: a tab, a newline or a return the URL parser drops, and a slash or a backslash
+        // still encoded, decoded again further on)
+        for bad in ["/v1/images/.\n./.\n./pins", "/v1/images/.\t./x", "/v1/images/.\r./x", "/v1/images/\0", "/files/a%2f..%2fpins", "/files/a%2F..%2Fx", "/files/a%5c..%5cx"] {
+            assert!(!plain_path(bad), "{bad:?}");
+        }
+        assert_eq!(exact_url("http://127.0.0.1:9/gw/", "/files/a.png", "?x=1").map(|u| u.to_string()), Some("http://127.0.0.1:9/gw/files/a.png?x=1".into()));
+        for folded in ["/files/.\n./x", "/files/%2e%2e/x", "/files/a\tb"] {
+            assert!(exact_url("http://127.0.0.1:9/gw", folded, "").is_none(), "{folded:?}");
         }
         // (nothing listens on the discard port: a call that got through would be a 502)
         let get = Request::builder().method("GET").uri(format!("{GATEWAY_PREFIX}/files/%2e%2e/%2e%2e/v1/discovery")).body(Body::empty()).unwrap();

@@ -52,7 +52,13 @@ impl Identity {
     /// The identity kept in `dir`, made (and kept) where there is none.
     pub fn load_or_create(dir: &Path) -> Result<Identity, String> {
         let path = dir.join(FILE);
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        // (made only where there is none: one that cannot be read now is not replaced, which would unpair everything)
+        let read = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        if let Some(text) = read {
             let stored: Stored = serde_json::from_str(&text).map_err(|e| format!("{} is not an identity: {e}", path.display()))?;
             let b64 = base64::engine::general_purpose::STANDARD;
             let cert_der = b64.decode(&stored.cert).map_err(|e| format!("its certificate: {e}"))?;
@@ -88,13 +94,32 @@ pub fn short(fingerprint: &str) -> String {
     fingerprint.chars().take(16).collect::<Vec<_>>().chunks(4).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join(" ")
 }
 
-/// The code both computers show while they are paired: six digits from both certificates' fingerprints, in either
-/// order. A computer in the middle of the first contact has a certificate of its own, so the two screens would differ.
-pub fn pairing_code(a: &str, b: &str) -> String {
-    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    let digest = Sha256::digest(format!("oaiy-network-pairing-v1|{lo}|{hi}").as_bytes());
+/// The code both computers show while they pair: six digits from both certificates' fingerprints and a fresh random
+/// value from each side, the worker's committed to ([`commitment`]) before it was told the primary's. A computer in the
+/// middle of the first contact has certificates of its own, and learns each side's value only once its own is fixed:
+/// it cannot choose what would make the two screens agree, which they then do one time in a million.
+pub fn pairing_code(primary: &str, worker: &str, primary_nonce: &str, worker_nonce: &str) -> String {
+    let digest = Sha256::digest(format!("oaiy-network-pairing-v2|{primary}|{worker}|{primary_nonce}|{worker_nonce}").as_bytes());
     let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
     format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
+/// The worker's commitment to its random value for a pairing (sent before it is told the primary's), for those two
+/// certificates alone.
+pub fn commitment(primary: &str, worker: &str, worker_nonce: &str) -> String {
+    Sha256::digest(format!("oaiy-network-commit-v2|{primary}|{worker}|{worker_nonce}").as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A fresh random value for a pairing: 32 bytes from the system's generator, in hex.
+pub fn nonce() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| format!("no random value: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether `s` is a value [`nonce`] makes (or a [`commitment`]): 64 hex digits.
+pub fn is_nonce(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -121,13 +146,30 @@ mod tests {
     }
 
     #[test]
-    fn the_pairing_code_is_both_certificates_and_either_order() {
+    fn the_pairing_code_is_both_certificates_and_both_sides_random_values() {
         let (a, b, c) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
-        assert_eq!(pairing_code(&a, &b), pairing_code(&b, &a));
-        assert_ne!(pairing_code(&a, &b), pairing_code(&a, &c), "a third certificate in the middle shows another code");
-        let code = pairing_code(&a, &b);
+        let (np, nw) = (nonce().unwrap(), nonce().unwrap());
+        assert!(is_nonce(&np) && is_nonce(&nw) && np != nw);
+        let code = pairing_code(&a, &b, &np, &nw);
+        assert_eq!(code, pairing_code(&a, &b, &np, &nw));
+        assert_ne!(code, pairing_code(&a, &c, &np, &nw), "a third certificate in the middle shows another code");
+        assert_ne!(code, pairing_code(&a, &b, &nonce().unwrap(), &nw), "another value, another code");
         assert_eq!(code.len(), 7);
         assert!(code.chars().enumerate().all(|(i, ch)| if i == 3 { ch == ' ' } else { ch.is_ascii_digit() }));
+        // (the worker's commitment holds its value to those two certificates)
+        assert_eq!(commitment(&a, &b, &nw), commitment(&a, &b, &nw));
+        assert_ne!(commitment(&a, &b, &nw), commitment(&c, &b, &nw));
+        assert!(is_nonce(&commitment(&a, &b, &nw)) && !is_nonce("zz") && !is_nonce(&"g".repeat(64)));
         assert_eq!(short(&a), "aaaa aaaa aaaa aaaa");
+    }
+
+    #[test]
+    fn an_identity_that_cannot_be_read_is_not_replaced() {
+        let dir = std::env::temp_dir().join(format!("oaiy-network-identity-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(FILE)).unwrap();
+        assert!(Identity::load_or_create(&dir).is_err(), "a folder where the file is: an error, not a new identity");
+        assert!(dir.join(FILE).is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

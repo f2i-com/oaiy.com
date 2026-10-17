@@ -19,15 +19,26 @@ use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::identity::{fingerprint, pairing_code, Identity};
+use super::identity::{commitment, fingerprint, is_nonce, nonce, pairing_code, Identity};
 use super::store::{now_ms, Peer, Role};
 use super::{lock, tls, Network, PROTOCOL};
 
-/// Pairing requests waiting at once, and how long one waits.
+/// Pairing requests waiting at once (from one address, and in all), and how long one waits.
+const WAITING_PER_ADDRESS: usize = 2;
 const MAX_WAITING: usize = 8;
 const REQUEST_TTL: Duration = Duration::from_secs(5 * 60);
-/// Connections served at once.
+/// Connections served at once; of those, still in their TLS handshake from one address, and of computers not paired
+/// here (asking `health` or to pair: one request each) in all and from one address. A computer on the LAN holding
+/// connections open takes a share of them, and the paired primary the rest.
 const MAX_CONNECTIONS: usize = 64;
+const HANDSHAKES_PER_ADDRESS: usize = 16;
+const MAX_STRANGERS: usize = 16;
+const STRANGERS_PER_ADDRESS: usize = 4;
+/// How long a connection has for its TLS handshake, and a request for its head (a paired primary's connection waits
+/// for its next request for as long).
+const HANDSHAKE: Duration = Duration::from_secs(10);
+const HEAD: Duration = Duration::from_secs(15);
+const IDLE: Duration = Duration::from_secs(120);
 const CHAT_LIMIT: usize = 16 << 20;
 const MEDIA_LIMIT: usize = 96 << 20;
 
@@ -39,7 +50,10 @@ pub(crate) struct Incoming {
     pub name: String,
     pub fingerprint: String,
     pub address: String,
-    pub code: String,
+    /// This worker's random value for the code, committed to in its answer and told once the primary has told its own.
+    pub nonce: String,
+    /// The code both screens show, once both random values are known (the person is asked only then).
+    pub code: Option<String>,
     pub status: Status,
     pub at: Instant,
 }
@@ -59,33 +73,91 @@ pub(crate) struct Caller {
     pub addr: SocketAddr,
 }
 
-/// Listen on `bind` (TLS, this computer's certificate), serving the worker's routes until the returned sender says stop.
-pub(crate) async fn listen(net: Network, id: &Identity, bind: SocketAddr) -> Result<(SocketAddr, tokio::sync::watch::Sender<bool>), String> {
+/// Connections counted by the address they come from; a count is given back as its [`Counted`] is dropped.
+#[derive(Clone, Default)]
+struct PerAddress(Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>);
+
+struct Counted(PerAddress, std::net::IpAddr);
+
+impl PerAddress {
+    /// One more from `ip`, if it has fewer than `max`.
+    fn take(&self, ip: std::net::IpAddr, max: usize) -> Option<Counted> {
+        let mut map = lock(&self.0);
+        let n = map.entry(ip).or_insert(0);
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(Counted(self.clone(), ip))
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        let mut map = lock(&(self.0).0);
+        if let Some(n) = map.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.1);
+            }
+        }
+    }
+}
+
+/// Listen on `bind` (TLS, this computer's certificate), serving the worker's routes until the returned sender says
+/// stop; the task returned ends once the listener is closed (its port free to bind again).
+pub(crate) async fn listen(net: Network, id: &Identity, bind: SocketAddr) -> Result<(SocketAddr, tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>), String> {
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(|e| format!("the worker could not listen on {bind}: {e}"))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let acceptor = tokio_rustls::TlsAcceptor::from(tls::server_config(id)?);
-    let app = routes(net);
+    let app = routes(net.clone());
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-    tokio::spawn(async move {
+    let strangers = Arc::new(tokio::sync::Semaphore::new(MAX_STRANGERS));
+    let (handshaking, stranger_from) = (PerAddress::default(), PerAddress::default());
+    let task = tokio::spawn(async move {
         loop {
             let accepted = tokio::select! {
                 a = listener.accept() => a,
                 _ = stopped.changed() => break,
             };
-            let Ok((tcp, peer)) = accepted else { continue };
+            let (tcp, peer) = match accepted {
+                Ok(a) => a,
+                // (out of file descriptors, say: tried again in a moment, not at once in a loop)
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             // (the LAN alone: a connection from anywhere else is closed before TLS)
             if !tls::local_address(peer.ip()) {
                 continue;
             }
             let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
-            let (acceptor, app, mut stopped) = (acceptor.clone(), app.clone(), stopped.clone());
+            let Some(shaking) = handshaking.take(peer.ip(), HANDSHAKES_PER_ADDRESS) else { continue };
+            let (acceptor, app, net, strangers, stranger_from, mut stopped) = (acceptor.clone(), app.clone(), net.clone(), strangers.clone(), stranger_from.clone(), stopped.clone());
             tokio::spawn(async move {
                 let _slot = slot;
-                let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await else { return };
+                let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE, acceptor.accept(tcp)).await else { return };
+                drop(shaking);
                 let fp = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| fingerprint(c.as_ref()));
-                let svc = hyper_util::service::TowerToHyperService::new(app.layer(Extension(Caller { fingerprint: fp, addr: peer })));
-                let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                let caller = Caller { fingerprint: fp, addr: peer };
+                // (a computer not paired here: a request a connection, within the strangers' share)
+                let paired = primary_of(&net, &caller).is_some();
+                let _stranger = if paired {
+                    None
+                } else {
+                    let Ok(permit) = strangers.try_acquire_owned() else { return };
+                    let Some(counted) = stranger_from.take(peer.ip(), STRANGERS_PER_ADDRESS) else { return };
+                    Some((permit, counted))
+                };
+                let svc = hyper_util::service::TowerToHyperService::new(app.layer(Extension(caller)));
+                let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                if !paired {
+                    builder = builder.http1_only();
+                }
+                builder.http1().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(if paired { IDLE } else { HEAD }).keep_alive(paired);
+                builder.http2().timer(hyper_util::rt::TokioTimer::new()).keep_alive_interval(Some(IDLE)).keep_alive_timeout(HEAD);
                 let conn = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), svc);
                 tokio::pin!(conn);
                 tokio::select! {
@@ -96,14 +168,14 @@ pub(crate) async fn listen(net: Network, id: &Identity, bind: SocketAddr) -> Res
             });
         }
     });
-    Ok((addr, stop))
+    Ok((addr, stop, task))
 }
 
 fn routes(net: Network) -> Router {
     Router::new()
         .route("/worker/v1/health", get(health))
         .route("/worker/v1/pair", post(pair))
-        .route("/worker/v1/pair/:id", get(pair_status))
+        .route("/worker/v1/pair/:id", get(pair_status).post(pair_reveal))
         .route("/worker/v1/unpair", post(unpair))
         .route("/worker/v1/capabilities", get(capabilities))
         .route("/worker/v1/resources", get(resources))
@@ -147,8 +219,9 @@ struct PairRequest {
     name: String,
 }
 
-/// `POST /worker/v1/pair`: a primary asks to pair. It waits for the person here, who sees the same code as the
-/// primary's screen shows.
+/// `POST /worker/v1/pair`: a primary asks to pair. Answered with this worker's commitment to a random value
+/// ([`commitment`]); the primary then tells its own ([`pair_reveal`]), and the request waits for the person here, who
+/// sees the same code as the primary's screen shows.
 async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, Json(req): Json<PairRequest>) -> Response {
     if net.settings().active_role() != Role::Worker {
         return refuse(StatusCode::FORBIDDEN, "not_a_worker", "this computer is not taking pairing requests");
@@ -164,25 +237,64 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     let Ok(id) = net.identity() else {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "this worker has no identity");
     };
+    let Ok(worker_nonce) = nonce() else {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "no random value for the pairing");
+    };
+    let address = caller.addr.ip().to_string();
     let mut waiting = lock(&net.inner().incoming);
     waiting.retain(|r| r.at.elapsed() < REQUEST_TTL && r.fingerprint != fp);
-    if waiting.iter().filter(|r| r.status == Status::Pending).count() >= MAX_WAITING {
+    let pending = waiting.iter().filter(|r| r.status == Status::Pending);
+    if pending.clone().count() >= MAX_WAITING || pending.filter(|r| r.address == address).count() >= WAITING_PER_ADDRESS {
         return refuse(StatusCode::TOO_MANY_REQUESTS, "too_many", "too many pairing requests are waiting");
     }
     let request = Incoming {
         id: uuid::Uuid::new_v4().simple().to_string(),
         node_id,
         name: if name.trim().is_empty() { "An OAIY computer".into() } else { name },
-        code: pairing_code(&fp, &id.fingerprint),
+        nonce: worker_nonce,
+        code: None,
         fingerprint: fp,
-        address: caller.addr.ip().to_string(),
+        address,
         status: Status::Pending,
         at: Instant::now(),
     };
-    log::info!("network: {} ({}) asks to pair; code {}", request.name, request.address, request.code);
-    let answer = json!({ "requestId": request.id, "nodeId": id.node_id, "name": net.display_name(), "protocol": PROTOCOL });
+    let answer = json!({
+        "requestId": request.id,
+        "nodeId": id.node_id,
+        "name": net.display_name(),
+        "protocol": PROTOCOL,
+        "commitment": commitment(&request.fingerprint, &id.fingerprint, &request.nonce),
+    });
     waiting.push(request);
     (StatusCode::ACCEPTED, Json(answer)).into_response()
+}
+
+#[derive(Deserialize)]
+struct Reveal {
+    nonce: String,
+}
+
+/// `POST /worker/v1/pair/:id` `{nonce}`: the primary that asked tells its random value, once; this worker's, which it
+/// committed to, is told back, and the code both screens show is made of both. Only then is the person here asked.
+async fn pair_reveal(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(id): Path<String>, Json(req): Json<Reveal>) -> Response {
+    if !is_nonce(&req.nonce) {
+        return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a random value of 64 hex digits is needed");
+    }
+    let Ok(me) = net.identity() else {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "this worker has no identity");
+    };
+    let mut waiting = lock(&net.inner().incoming);
+    let Some(r) = waiting.iter_mut().find(|r| r.id == id && Some(&r.fingerprint) == caller.fingerprint.as_ref() && r.at.elapsed() < REQUEST_TTL) else {
+        return refuse(StatusCode::NOT_FOUND, "not_found", "no such pairing request (or it has expired)");
+    };
+    // (told once: a second value would let the caller try again for a code of its choosing)
+    if r.code.is_some() {
+        return refuse(StatusCode::CONFLICT, "already_told", "this pairing request has its code already");
+    }
+    let code = pairing_code(&r.fingerprint, &me.fingerprint, &req.nonce.to_ascii_lowercase(), &r.nonce);
+    log::info!("network: {} ({}) asks to pair; code {code}", r.name, r.address);
+    r.code = Some(code);
+    Json(json!({ "nonce": r.nonce })).into_response()
 }
 
 /// `GET /worker/v1/pair/:id`: the request's answer, to the certificate that asked alone.
@@ -194,10 +306,24 @@ async fn pair_status(State(net): State<Network>, Extension(caller): Extension<Ca
     }
 }
 
-/// `POST /worker/v1/unpair`: the primary unpaired this worker: its certificate no longer lets it in here either.
+/// `POST /worker/v1/unpair`: the primary unpaired this worker (its certificate no longer lets it in here either), or
+/// gave up a pairing it asked for (its request is withdrawn, so the person here is no longer asked).
 async fn unpair(State(net): State<Network>, Extension(caller): Extension<Caller>) -> Response {
+    let withdrawn = match caller.fingerprint.as_deref() {
+        Some(fp) => {
+            let mut waiting = lock(&net.inner().incoming);
+            let before = waiting.len();
+            waiting.retain(|r| r.fingerprint != fp);
+            before != waiting.len()
+        }
+        None => false,
+    };
     let Some(p) = primary_of(&net, &caller) else {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return if withdrawn {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller")
+        };
     };
     let _ = net.inner().peers().remove(&p.node_id);
     log::info!("network: {} unpaired this worker", p.name);
@@ -207,7 +333,7 @@ async fn unpair(State(net): State<Network>, Extension(caller): Extension<Caller>
 /// The approval the person gives here (`/api/network/requests/:id/approve`): the primary is paired.
 pub(crate) fn decide(net: &Network, id: &str, approve: bool) -> Result<Option<Peer>, String> {
     let mut waiting = lock(&net.inner().incoming);
-    let Some(r) = waiting.iter_mut().find(|r| r.id == id && r.status == Status::Pending && r.at.elapsed() < REQUEST_TTL) else {
+    let Some(r) = waiting.iter_mut().find(|r| r.id == id && r.status == Status::Pending && r.code.is_some() && r.at.elapsed() < REQUEST_TTL) else {
         return Err("no such pairing request (or it has expired)".into());
     };
     if !approve {
@@ -233,7 +359,8 @@ pub(crate) fn waiting(net: &Network) -> Vec<Value> {
     waiting.retain(|r| r.at.elapsed() < REQUEST_TTL);
     waiting
         .iter()
-        .filter(|r| r.status == Status::Pending)
+        // (a request whose primary has not told its random value has no code yet: nothing to ask the person)
+        .filter(|r| r.status == Status::Pending && r.code.is_some())
         .map(|r| json!({
             "id": r.id,
             "nodeId": r.node_id,
@@ -381,11 +508,22 @@ async fn chat(State(net): State<Network>, Extension(caller): Extension<Caller>, 
         .and_then(|e| e.get("path").and_then(Value::as_str))
         .unwrap_or("/v1/chat/completions")
         .to_string();
-    // (the engine answers with its chosen model, as the desktop's own engine provider does)
+    // (the engine answers with its chosen model, as the desktop's own engine provider does: one asked for by name that
+    // is not that one any more is refused, rather than answered by another model)
     let mut request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return refuse(StatusCode::BAD_REQUEST, "invalid_request", format!("the body is not JSON: {e}")),
     };
+    let asked = request.get("model").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned);
+    if let (Some(asked), Some(chosen)) = (asked, discovery.pointer("/defaults/llm").and_then(Value::as_str)) {
+        if asked != chosen && !asked.ends_with(&format!("/{chosen}")) {
+            return refuse(
+                StatusCode::CONFLICT,
+                "model_unavailable",
+                format!("{} runs {chosen} now, not {asked}: choose its language model again", net.display_name()),
+            );
+        }
+    }
     if let Some(o) = request.as_object_mut() {
         o.remove("model");
     }
@@ -406,10 +544,34 @@ async fn gateway(State(net): State<Network>, Extension(caller): Extension<Caller
     if primary_of(&net, &caller).is_none() {
         return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
     }
+    // (the primary's own address for this worker's gateway, where its answers name their files: see `rebase`)
+    let base = req.headers().get("x-oaiy-base").and_then(|v| v.to_str().ok()).filter(|b| b.starts_with("http://") && b.len() < 512).map(str::to_owned);
     match crate::ai::engine_services::local_engines(&net.inner().ai).await {
-        Ok((g, d)) => crate::ai::engine_services::forward_path(&g, &d, format!("/{path}"), req).await,
+        Ok((g, d)) => {
+            let answer = crate::ai::engine_services::forward_path(&g, &d, format!("/{path}"), req).await;
+            match base {
+                Some(base) => rebase(answer, &g, &base).await,
+                None => answer,
+            }
+        }
         Err(e) => refuse(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
     }
+}
+
+/// An engines' JSON answer with their own address (this computer's loopback, which on the primary is the primary's
+/// own) put as `base`, the primary's route for this worker: a picture's `url` or `file` is fetched through the primary.
+async fn rebase(answer: Response, gateway: &str, base: &str) -> Response {
+    let json = answer.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|t| t.contains("json"));
+    if !json {
+        return answer;
+    }
+    let (mut parts, body) = answer.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MEDIA_LIMIT).await else {
+        return refuse(StatusCode::BAD_GATEWAY, "upstream_error", "the answer could not be passed on");
+    };
+    let text = String::from_utf8_lossy(&bytes).replace(gateway.trim_end_matches('/'), base.trim_end_matches('/'));
+    parts.headers.remove("content-length");
+    Response::from_parts(parts, Body::from(text))
 }
 
 /// An upstream answer passed on as it streams (its status and the headers that describe the body).

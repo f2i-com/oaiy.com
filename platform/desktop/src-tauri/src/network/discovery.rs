@@ -11,6 +11,8 @@ use super::identity::Identity;
 use super::{tls, PROTOCOL};
 
 pub const SERVICE: &str = "_oaiy-worker._tcp.local.";
+/// Workers found on the LAN kept at once.
+const MAX_FOUND: usize = 64;
 
 /// A worker seen on the LAN.
 #[derive(Clone, Debug, Serialize)]
@@ -65,7 +67,11 @@ pub(crate) fn browse(daemon: &mdns_sd::ServiceDaemon, found: Arc<Mutex<HashMap<S
                         let protocol = s.get_property_val_str("proto").and_then(|p| p.parse().ok()).unwrap_or(0);
                         by_name.insert(s.get_fullname().to_string(), node_id.clone());
                         let entry = Found { node_id: node_id.clone(), name, addresses, protocol, seen_ms: super::store::now_ms() };
-                        found.lock().unwrap_or_else(|p| p.into_inner()).insert(node_id, entry);
+                        let mut found = found.lock().unwrap_or_else(|p| p.into_inner());
+                        // (as many as a LAN has: a computer advertising thousands of made-up workers fills no memory)
+                        if found.len() < MAX_FOUND || found.contains_key(&node_id) {
+                            found.insert(node_id, entry);
+                        }
                     }
                     mdns_sd::ServiceEvent::ServiceRemoved(_, fullname) => {
                         if let Some(id) = by_name.remove(&fullname) {

@@ -103,14 +103,17 @@ impl Peers {
         self.list.iter().find(|p| p.fingerprint == fingerprint && p.role == role)
     }
 
-    /// Pair (or pair again) with `peer`: one entry per node id, and per certificate.
+    /// Pair (or pair again) with `peer`: one entry per node id, and per certificate. In effect once it is kept: a pairing
+    /// that could not be written down lets nothing in.
     pub fn add(&mut self, peer: Peer) -> Result<(), String> {
-        self.list.retain(|p| p.node_id != peer.node_id && p.fingerprint != peer.fingerprint);
-        self.list.push(peer);
-        self.save()
+        let mut next: Vec<Peer> = self.list.iter().filter(|p| p.node_id != peer.node_id && p.fingerprint != peer.fingerprint).cloned().collect();
+        next.push(peer);
+        save(&self.path, &next)?;
+        self.list = next;
+        Ok(())
     }
 
-    /// Unpair: its connections are refused from now on.
+    /// Unpair: its connections are refused from now on, even where that could not be written down (then said so).
     pub fn remove(&mut self, node_id: &str) -> Result<bool, String> {
         let before = self.list.len();
         self.list.retain(|p| p.node_id != node_id);
@@ -133,11 +136,15 @@ impl Peers {
     }
 
     fn save(&self) -> Result<(), String> {
-        if let Some(dir) = self.path.parent() {
-            crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
-        }
-        crate::secret_file::write(&self.path, serde_json::to_vec_pretty(&self.list).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        save(&self.path, &self.list)
     }
+}
+
+fn save(path: &Path, list: &[Peer]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
+    }
+    crate::secret_file::write(path, serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
 pub fn now_ms() -> u64 {

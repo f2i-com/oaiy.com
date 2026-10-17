@@ -15,11 +15,11 @@ This is the design record; [Setting it up](#setting-it-up) and [What is not done
 | Where inference runs | On the worker that has the model, by its own engines (the Studio), as it would locally | No model weights move; each machine's engine knows its own GPU (the Mac's eGPU path included) |
 | How requests travel | Through the primary: a client calls the primary's existing routes, the primary calls the worker | Flows, the Agent and apps never see a LAN address or a worker credential |
 | Discovery | mDNS/DNS-SD (`_oaiy-worker._tcp.local.`) advertising a name, a node id and a port, and a manual address | Standard and LAN-local; multicast is often blocked, so an address always works too. Discovery grants nothing |
-| Trust | Pairing: each node's own key and self-signed certificate; a 6-digit code from both certificates shown on both screens; approval on the worker, then on the primary (the person says the worker showed the same code); each pins the other's certificate | A numeric comparison defeats a man in the middle on the first contact, as Bluetooth's does, with no shared secret to type or leak; asking both sides means a computer answering for the worker cannot pair itself by approving its own request |
+| Trust | Pairing: each node's own key and self-signed certificate; a 6-digit code from both certificates and a fresh random value from each side, the worker's committed to before it learns the primary's, shown on both screens; approval on the worker, then on the primary (the person says the worker showed the same code); each pins the other's certificate | A numeric comparison with committed random values defeats a man in the middle on the first contact, as Bluetooth's does, with no shared secret to type or leak: a computer in the middle learns each side's value only after its own is fixed, so it cannot make the two screens agree (one time in a million). Asking both sides means a computer answering for the worker cannot pair itself by approving its own request |
 | Transport | Mutual TLS (rustls) with the pinned certificates, both directions, after pairing | Encrypted and authenticated at the connection, so no bearer token crosses the LAN in the clear |
 | Model identity | A remote model is `engine:<kind>:node.<nodeId>/<model>`; the worker's own name kept beside it | Never mistaken for a local model of the same name; a flow that names one shows it offline rather than switching |
 | Placement | Manual: the person chooses a model on a worker, and may pin it there; nothing moves, downloads or evicts by itself | Predictable; a GPU's memory is the person's to spend |
-| Files | A worker's picture is streamed through the primary at a primary address (`/api/network/nodes/<id>/gateway/files/…`) | The by-reference picture flow (docs/IMAGE_FLOW.md) keeps working; no worker URL reaches a client |
+| Files | A worker's picture is streamed through the primary at a primary address (`/api/network/nodes/<id>/gateway/files/…`), and the worker's answers name their files there (`url`, `oaiy.file`), not at its own loopback address | The by-reference picture flow (docs/IMAGE_FLOW.md) keeps working; no worker URL reaches a client |
 | Pins | A pin is the worker's Studio's own setting (`media.pinned`, `llm.pinned`), set by its paired primary | It outlives a restart of either computer, and the worker's engine enforces it, not a primary that may be away |
 
 ## The pieces
@@ -35,9 +35,16 @@ WORKER   worker listener (/worker/v1/*) ─ its own Studio (gateway + resources)
 ```
 
 - **Identity** (`network/identity.rs`): a node id, a P-256 key pair and a self-signed certificate, made when Network is
-  first switched on and kept in the data folder (`network/identity.json`, owner-only). Its fingerprint is the
-  SHA-256 of the certificate; the pairing code is six digits of the SHA-256 of both fingerprints, so both screens
-  show the same code only when each computer sees the other's real certificate.
+  first switched on and kept in the data folder (`network/identity.json`, owner-only; one that cannot be read is an
+  error, never replaced). Its fingerprint is the SHA-256 of the certificate. Pairing: the worker answers the
+  primary's request with a commitment (SHA-256) to a random value of its own; the primary then tells its random
+  value (`POST /worker/v1/pair/:id`, once), the worker tells its own back, and the primary checks it against the
+  commitment. The code is six digits of the SHA-256 of both fingerprints and both values, so both screens show the
+  same code only when each computer sees the other's real certificate. Protocol 2 (OAIY Network's first release
+  paired with protocol 1: update both computers).
+- **Worker connections**: 64 at once; of those, 16 at most in their TLS handshake from one address, and 16 from
+  computers not paired with it (four from one address), each carrying one request (`health`, pairing) with 15 s for
+  its head. A LAN computer holding connections open cannot keep the paired primary out.
 - **Peers** (`network/peers.json`): each paired node's id, name, role, certificate fingerprint, last address and when
   it was paired; revoking removes it, and a revoked node's connections are refused at once.
 - **Worker listener**: on a worker, `/worker/v1/*` over TLS on the LAN, bound only while it is enabled. Before pairing
@@ -54,18 +61,23 @@ Both computers run OAIY Desktop (or the headless `oaiy-server`) of the same vers
 1. **On the worker** (the computer that lends its GPUs): Setup → Networking, choose *Lend this computer (worker)*,
    and Switch on. It listens on port 17975 (change it there), only on LAN addresses, and shows the addresses a
    primary can type. Allow OAIY through the computer's firewall for that port if it asks.
-2. **On the primary** (the computer you work on): Setup → Networking, choose *Use other computers (primary)*, and
+2. **On the primary** (the computer you work on): Setup → Networking, choose *Use other computers*, and
    Switch on. Workers on the network show under *Add a worker* (found by mDNS); where computers cannot find each
    other (Wi-Fi client isolation, VLANs, a firewall), type the worker's address as its own page shows it.
 3. Press **Pair**. The primary shows a six-digit code; the worker's Networking page shows the same code under
    *Pairing requests*. Approve it there only if the codes match. The primary then asks whether the worker showed
-   the same code: *Yes, pair* pairs them; *No* pairs nothing and the worker forgets the primary. The request expires
-   after five minutes.
-4. The worker is listed under *Workers* on the primary with its GPUs (memory in use, or *memory unknown* where it
-   cannot be read) and its models, and on the worker as its *Paired primary*.
+   the same code: *Yes, pair* pairs them; *No* pairs nothing and the worker forgets the primary. *Stop waiting*
+   withdraws the request, so the worker no longer shows it. The request expires after five minutes; one the worker
+   approved that the primary never answered is undone on the worker then too.
+4. The worker is listed under *Workers* on the primary with its GPUs (memory in use as a meter and how busy each
+   is, or *memory unknown* where it cannot be read), the job it is running, and its models with their state and
+   where each is loaded; on the worker the primary is listed as its *Paired primary*. A worker that does not answer
+   is shown offline with why, and what it last reported dimmed (*Last report … ago*).
 
 Unpair from either side: the other side refuses it from then on, and the primary shows the worker offline with why.
-Switch off on either side to stop at once; switching on again keeps the pairing.
+A worker unpaired at the primary while it is off is told once it answers again (while the primary runs; after a
+restart of the primary, unpair it on the worker too). Switch off on either side to stop at once; switching on again
+keeps the pairing.
 
 For computers that should not use multicast at all, start OAIY with `OAIY_NETWORK_DISCOVERY=off` and pair by
 address. `OAIY_NETWORK_NAME` sets the name other computers see (the computer's own name otherwise; the Networking
@@ -91,7 +103,10 @@ Once paired, a worker's models are in the primary's engine catalogue (`GET /api/
   credentials (scope `ai.use`).
 
 A model that is offline, or a worker that refuses, answers `503 node_offline` naming the worker and why
-(*connection refused*, *the worker no longer accepts this computer*): nothing falls back to another model.
+(*connection refused*, *the worker no longer accepts this computer*): nothing falls back to another model. A chat
+naming a language model the worker no longer runs (its person chose another) is `409 model_unavailable`, naming
+the one it runs, rather than answered by that one. A media answer names its files at the primary's route for the
+worker, as the caller reached the primary (`http://<host>/api/network/nodes/<id>/gateway/files/…`).
 
 ## Pinning
 
@@ -101,12 +116,15 @@ worker and kept loaded there.
 - A picture model (Qwen Image, MOSS-Image, FLUX 3 Image Klein on WebGPU) is pinned in the worker's Studio
   (`media.pinned`, crates/oaiy-studio/src/media/pins.rs): its picture worker is kept whatever the keep time or a
   release asks; it is loaded when the Studio starts, and again whenever its worker ends (a failure, a cancelled
-  picture), by a small picture made when nothing else is queued; one that cannot load is shown *could not load*
-  with why, kept, and tried again every five minutes.
+  picture, a crash while it waited), by a small picture made when nothing else is queued; one that cannot load (or
+  cannot be pinned any more, its settings changed) is shown *could not load* with why, kept, and tried again every
+  five minutes. Unpinned while it loads, its loading job is cancelled.
 - A job that would let a pinned model go is refused, saying which pin holds the GPU: another family's picture that
   the worker cannot keep beside it, a video, speech or music job on the same GPU, and a chat for a language model
-  on the eGPU's card while a pinned picture model holds the card. MOSS-Image's and Klein's are kept side by side,
-  so both can be pinned together; a second model of a family, or Qwen Image beside them, is refused at pinning.
+  on the eGPU's card while a pinned picture model holds the card. A job refused for a pin on the card leaves the card
+  lent to the pinned worker (the card's language model is not brought back beside it). MOSS-Image's and Klein's are
+  kept side by side, so both can be pinned together; a second model of a family, or Qwen Image beside them, is
+  refused at pinning. A pin on this computer's own GPU lets a language model there come back beside it.
 - The language model chosen on the worker can be pinned too (`llm.pinned`: never stopped for media or for being
   idle). Another of its language models is chosen in the worker's own Engines first.
 
@@ -124,7 +142,7 @@ restricted, as `/api/engines/` are):
 | `PUT /api/network/settings` | auth.manage | `{enabled, role, name, port, bind}` |
 | `POST /api/network/discover` | auth.manage | The workers found on the LAN |
 | `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare |
-| `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it) |
+| `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it, or withdraws the request it has not answered) |
 | `GET /api/network/requests` | auth.read | On a worker: primaries asking to pair, each with its code |
 | `POST /api/network/requests/:id/approve`, `…/deny` | auth.manage, auth.revoke | The worker's person decides |
 | `GET /api/network/nodes` | auth.read | The paired computers, online or not, their GPUs and models |
@@ -135,8 +153,8 @@ restricted, as `/api/engines/` are):
 | `ANY /api/network/nodes/:id/gateway/*path` | ai.use | Its media routes, jobs and files |
 
 The worker (`/worker/v1/*` on its LAN port, TLS with client certificates): `health` (anyone: a name, a node id, the
-protocol), `pair` and `pair/:id` (anyone with a certificate, to ask), and, for its paired primary only,
-`capabilities`, `resources`, `pins`, `chat` and `gateway/*path`. The gateway takes the engine's media routes and
+protocol), `pair` and `pair/:id` (anyone with a certificate, to ask), `unpair` (the caller's own pairing or request
+withdrawn), and, for its paired primary only, `capabilities`, `resources`, `pins`, `chat` and `gateway/*path`. The gateway takes the engine's media routes and
 files only (not its settings, logs, downloads or playground), and what it answers about itself leaves out its local
 paths and loopback addresses.
 
@@ -173,9 +191,12 @@ Mac's own):
 | Pinning MOSS-Image Q8 8-step from the primary | Loaded on the card by itself in 33 s; kept past a release and a picture asking for release (10.8 s, nothing reloaded); a Qwen Image picture refused at once, naming the pin; unpinned again |
 | Pairing, both screens | `approved_there` after the worker's yes, paired only on the primary's yes |
 
-The desktop's tests cover the same with a fake engine (src/network/tests.rs: pairing and use, a stranger and an
-impostor, unpairing from each side, pins, off and public addresses refused), and the Studio's the pins with a fake
-picture worker (`a_pinned_picture_model_is_loaded_kept_and_never_let_go_by_a_job`).
+The desktop's tests cover the same with a fake engine (src/network/tests.rs: pairing and use, the committed pairing
+code, a pairing given up or run out, a stranger and an impostor, unpairing from each side and while a worker is
+off, pins, paths that would leave the gateway (dot segments, tabs and newlines, encoded slashes), a worker saved
+again on its port, off and public addresses refused), and the Studio's the pins with a fake picture worker
+(`a_pinned_picture_model_is_loaded_kept_and_never_let_go_by_a_job`) and a fake eGPU card
+(`a_pin_on_the_card_keeps_it_lent_through_a_job_refused_for_it`).
 
 ## Not done
 

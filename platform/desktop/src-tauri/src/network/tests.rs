@@ -32,6 +32,7 @@ async fn fake_engines() -> String {
                 "devices": [{"id": "egpu", "name": "NV card (eGPU)", "unified": false, "memory_total_mb": 24564, "memory_used_mb": 9000}],
                 "models": [{"model": "tiny-image", "kind": "image", "device": "egpu", "state": "kept", "pinned": false}],
                 "queue": {"running": null, "queued": 0},
+                "policy": {"llm_pinned": true},
                 "events": [{"event": "load", "model": "tiny-image", "why": "a picture"}],
             }))
         }))
@@ -168,6 +169,119 @@ async fn a_pairing_needs_both_screens_and_a_no_here_undoes_the_workers_yes() {
     }
 }
 
+/// Given up here before the worker's person answered, a pairing is withdrawn there (they are no longer asked); one
+/// that ran out after the worker's yes, with no answer here, is undone there (it was paired on that side alone).
+#[tokio::test]
+async fn a_pairing_given_up_or_run_out_here_is_undone_on_the_worker() {
+    let worker = node("worker-lapse", Role::Worker, Some(fake_engines().await)).await;
+    let primary = node("primary-lapse", Role::Primary, None).await;
+    let (p, w) = (router(primary.clone()), router(worker.clone()));
+    let address = json!({ "address": worker.listening().unwrap().to_string() });
+    let (_, started) = call(&p, "POST", "/api/network/pairings/start", Some(address.clone())).await;
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    assert_eq!(waiting["requests"].as_array().unwrap().len(), 1);
+    let (_, stopped) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": false }))).await;
+    assert_eq!(stopped["status"], "declined");
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    assert!(waiting["requests"].as_array().unwrap().is_empty(), "withdrawn there: {waiting}");
+
+    let (_, started) = call(&p, "POST", "/api/network/pairings/start", Some(address)).await;
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    call(&w, "POST", &format!("/api/network/requests/{}/approve", waiting["requests"][0]["id"].as_str().unwrap()), None).await;
+    let (_, there) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"] }))).await;
+    assert_eq!(there["status"], "approved_there");
+    let (_, worker_side) = call(&w, "GET", "/api/network/nodes", None).await;
+    assert_eq!(worker_side["nodes"].as_array().unwrap().len(), 1, "paired on the worker's side alone");
+    for o in lock(&primary.inner().outgoing).iter_mut() {
+        o.at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(6 * 60)).unwrap();
+    }
+    primary::forget_lapsed(&primary).await;
+    let (_, worker_side) = call(&w, "GET", "/api/network/nodes", None).await;
+    assert!(worker_side["nodes"].as_array().unwrap().is_empty(), "undone there: {worker_side}");
+    let (late, _) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": true }))).await;
+    assert_eq!(late, StatusCode::NOT_FOUND, "too late to say yes here");
+
+    // paired, then asked again and given up: the pairing there stands
+    pair(&primary, &worker).await;
+    let (_, again) = call(&p, "POST", "/api/network/pairings/start", Some(json!({ "address": worker.listening().unwrap().to_string() }))).await;
+    call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": again["pairingId"], "accept": false }))).await;
+    let (_, worker_side) = call(&w, "GET", "/api/network/nodes", None).await;
+    assert_eq!(worker_side["nodes"].as_array().unwrap().len(), 1, "still paired there: {worker_side}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// The code is made of both sides' random values, the worker's committed to first: the worker asks its person only once
+/// the primary has told its own, tells its value back once, held to its commitment, and both screens show one code.
+#[tokio::test]
+async fn the_pairing_code_comes_from_a_value_committed_to_first() {
+    use super::identity::{commitment, nonce, pairing_code, Identity};
+    let worker = node("worker-commit", Role::Worker, None).await;
+    let w = router(worker.clone());
+    let me = Identity::generate().unwrap();
+    let asking = tls::client(&me, Pin::Record(Default::default())).unwrap();
+    let at = |path: &str| format!("https://{}{path}", worker.listening().unwrap());
+    let asked: Value = asking.post(at("/worker/v1/pair")).json(&json!({ "nodeId": me.node_id, "name": "a primary" })).send().await.unwrap().json().await.unwrap();
+    let committed = asked["commitment"].as_str().unwrap().to_string();
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    assert!(waiting["requests"].as_array().unwrap().is_empty(), "not asked before the primary's value is told: {waiting}");
+    let reveal = at(&format!("/worker/v1/pair/{}", asked["requestId"].as_str().unwrap()));
+    let r = asking.post(&reveal).json(&json!({ "nonce": "not hex" })).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    let mine = nonce().unwrap();
+    let told: Value = asking.post(&reveal).json(&json!({ "nonce": mine })).send().await.unwrap().json().await.unwrap();
+    let theirs = told["nonce"].as_str().unwrap();
+    let worker_fp = worker.identity().unwrap().fingerprint;
+    assert_eq!(commitment(&me.fingerprint, &worker_fp, theirs), committed, "the value told back is the one committed to");
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    assert_eq!(waiting["requests"][0]["code"], pairing_code(&me.fingerprint, &worker_fp, &mine, theirs), "{waiting}");
+    let again = asking.post(&reveal).json(&json!({ "nonce": nonce().unwrap() })).send().await.unwrap();
+    assert_eq!(again.status(), reqwest::StatusCode::CONFLICT, "told once: no second try at a code of the caller's choosing");
+    // (another certificate cannot tell it for the one that asked)
+    let other = tls::client(&Identity::generate().unwrap(), Pin::Record(Default::default())).unwrap();
+    let r = other.post(&reveal).json(&json!({ "nonce": nonce().unwrap() })).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::NOT_FOUND);
+    worker.stop();
+}
+
+/// A worker unpaired at the primary while it was off is told once it answers again, and stops accepting the primary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_unpaired_while_off_is_told_when_it_is_back() {
+    let worker = node("worker-untold", Role::Worker, Some(fake_engines().await)).await;
+    let primary = node("primary-untold", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let (p, w) = (router(primary.clone()), router(worker.clone()));
+    let port = worker.listening().unwrap().port();
+    worker.stop();
+    let (status, _) = call(&p, "DELETE", &format!("/api/network/nodes/{node_id}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, still) = call(&w, "GET", "/api/network/nodes", None).await;
+    assert_eq!(still["nodes"].as_array().unwrap().len(), 1, "it did not hear, being off");
+    worker.set(Settings { enabled: true, role: Role::Worker, name: "the worker-untold".into(), port, bind: "127.0.0.1".into() }).await.unwrap();
+    primary::tell_untold(&primary).await;
+    let (_, told) = call(&w, "GET", "/api/network/nodes", None).await;
+    assert!(told["nodes"].as_array().unwrap().is_empty(), "told once back: {told}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A worker saved again while it listens (renamed) keeps its port: the listener before it has let the port go first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_saved_again_listens_on_the_same_port() {
+    let worker = node("worker-again", Role::Worker, None).await;
+    let port = worker.listening().unwrap().port();
+    for name in ["the worker renamed", "and again"] {
+        worker.set(Settings { enabled: true, role: Role::Worker, name: name.into(), port, bind: "127.0.0.1".into() }).await.unwrap();
+        assert_eq!(worker.listening().map(|a| a.port()), Some(port));
+    }
+    let stranger = tls::client(&super::identity::Identity::generate().unwrap(), Pin::Record(Default::default())).unwrap();
+    let health: Value = stranger.get(format!("https://127.0.0.1:{port}/worker/v1/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(health["name"], "and again");
+    worker.stop();
+}
+
 #[tokio::test]
 async fn a_primary_pairs_with_a_worker_and_uses_its_engines_through_its_own_routes() {
     let engines = fake_engines().await;
@@ -202,9 +316,16 @@ async fn a_primary_pairs_with_a_worker_and_uses_its_engines_through_its_own_rout
     assert_eq!(llm["id"], format!("engine:llm:node.{worker_id}/tiny-llm"));
 
     // a picture made on the worker, through the primary
-    let (status, made) = call(&p, "POST", image["endpoint"].as_str().unwrap(), Some(json!({ "model": "tiny-image", "prompt": "a fox" }))).await;
-    assert_eq!(status, StatusCode::OK, "{made}");
+    let resp = p
+        .clone()
+        .oneshot(Request::post(image["endpoint"].as_str().unwrap()).header("host", "127.0.0.1:17972").header("content-type", "application/json").body(Body::from(json!({ "model": "tiny-image", "prompt": "a fox" }).to_string())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let made: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(made["data"][0]["oaiy"]["model"], "tiny-image");
+    // (its file named where the caller reaches it: this desktop's route for the worker, not the worker's own loopback)
+    assert_eq!(made["data"][0]["oaiy"]["file"], format!("http://127.0.0.1:17972/api/network/nodes/{worker_id}/gateway/files/images/2026-10-18/x/image-0001.png"), "{made}");
     // its file, through the primary too
     let resp = p.clone().oneshot(Request::get(format!("/api/network/nodes/{worker_id}/gateway/files/images/2026-10-18/x/image-0001.png")).body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -213,12 +334,16 @@ async fn a_primary_pairs_with_a_worker_and_uses_its_engines_through_its_own_rout
     // a chat, streamed
     let resp = p
         .clone()
-        .oneshot(Request::post(llm["endpoint"].as_str().unwrap()).header("content-type", "application/json").body(Body::from(json!({ "model": "x", "stream": true, "messages": [{"role": "user", "content": "hi"}] }).to_string())).unwrap())
+        .oneshot(Request::post(llm["endpoint"].as_str().unwrap()).header("content-type", "application/json").body(Body::from(json!({ "model": "tiny-llm", "stream": true, "messages": [{"role": "user", "content": "hi"}] }).to_string())).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.headers()["content-type"], "text/event-stream");
     let text = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
     assert!(text.contains("Hel") && text.contains("[DONE]"), "{text}");
+    // (a model the worker does not run now is refused, not answered by the one it does)
+    let (status, v) = call(&p, "POST", llm["endpoint"].as_str().unwrap(), Some(json!({ "model": "another-llm", "messages": [{"role": "user", "content": "hi"}] }))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("runs tiny-llm now"), "{v}");
     // only the engine's media routes are reached: not its control port, not a path outside them
     let (status, _) = call(&p, "GET", &format!("/api/network/nodes/{worker_id}/gateway/api/config"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -291,6 +416,12 @@ async fn a_primary_pins_a_workers_model_and_unpins_it() {
     assert!(v.to_string().contains("not kept beside tiny-image"), "the engines' reason: {v}");
     let (status, v) = call(&p, "DELETE", &format!("{pins}/tiny-image"), None).await;
     assert_eq!((status, &v["asked"]), (StatusCode::OK, &json!({ "model": "tiny-image", "kind": "image", "pin": false })), "{v}");
+    // (the language model pinned there, not running: shown pinned, and unpinned as the language model, not a picture)
+    let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
+    let llm = nodes["nodes"][0]["models"].as_array().unwrap().iter().find(|m| m["model"] == "tiny-llm").cloned().unwrap();
+    assert_eq!((&llm["state"], &llm["pinned"]), (&json!("not loaded"), &json!(true)), "{llm}");
+    let (status, v) = call(&p, "DELETE", &format!("{pins}/tiny-llm"), None).await;
+    assert_eq!((status, &v["asked"]), (StatusCode::OK, &json!({ "model": "tiny-llm", "kind": "llm", "pin": false })), "{v}");
     for bad in [json!({ "model": "../../etc/passwd" }), json!({ "model": "/Users/x/model.gguf" }), json!({ "id": "engine:image:node.someoneelse/tiny-image" })] {
         let (status, v) = call(&p, "PUT", &pins, Some(bad.clone())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {v}");
@@ -298,10 +429,22 @@ async fn a_primary_pins_a_workers_model_and_unpins_it() {
     let (status, _) = call(&p, "PUT", "/api/network/nodes/nobody/pins", Some(json!({ "model": "tiny-image" }))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     // a client of the worker's media routes (ai.use) cannot step past them to its pins or unpairing
-    for path in ["gateway/../pins", "gateway/%2e%2e/unpair", "gateway/v1/images/generations/../../../unpair"] {
+    // (nor with a tab or a newline the URL parser drops, `.%0A.` being `..` once parsed, nor a slash still encoded)
+    for path in [
+        "gateway/../pins",
+        "gateway/%2e%2e/unpair",
+        "gateway/v1/images/generations/../../../unpair",
+        "gateway/v1/images/.%0A./.%0A./.%0A./pins",
+        "gateway/v1/images/.%09./.%09./.%09./unpair",
+        "gateway/v1/images/.%0D./.%0D./.%0D./unpair",
+        "gateway/v1/images/a%252f..%252f..%252f..%252fpins",
+    ] {
         let (status, v) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/{path}"), Some(json!({ "model": "tiny-image" }))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {v}");
     }
+    // (encoded twice, it passes here as it is a plain segment, and the worker, decoding it again, refuses it)
+    let (status, v) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/gateway/v1/images/.%250A./.%250A./.%250A./pins"), Some(json!({ "model": "tiny-image" }))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
     let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
     assert_eq!(nodes["nodes"].as_array().unwrap().len(), 1, "still paired");
     // a stranger cannot pin on the worker
