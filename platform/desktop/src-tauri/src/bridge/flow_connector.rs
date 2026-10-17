@@ -156,7 +156,8 @@ pub fn run(
         caller_product: CONNECTOR.into(),
         flow_id: Some(id.to_string()),
         inline_graph: false,
-        input: Some(inputs),
+        // (its pictures stored with the engines first, the run keeping their references)
+        input: Some(pictures::referenced(inputs)),
         timeout_ms: Some(seconds * 1000),
         // Reserved for this connector to claim: the worker leaves `queued` runs alone.
         mode: "queued".into(),

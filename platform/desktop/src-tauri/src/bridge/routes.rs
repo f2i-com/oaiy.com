@@ -316,7 +316,11 @@ async fn create_run(
     if let Err(rej) = validate(&body) {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", rej.message());
     }
-    let req = to_run_request(&body);
+    let mut req = to_run_request(&body);
+    // Pictures given inline go to the engines now and the run keeps their references (its record keeps its input).
+    if let Some(input) = req.input.take() {
+        req.input = tokio::task::spawn_blocking(move || super::pictures::referenced(input)).await.ok();
+    }
     // Block-scoped: this handler awaits below, and a std MutexGuard anywhere in
     // the async fn's state — even one already drop()ed — makes the future !Send
     // and the whole route fail to compile as a handler. The guard must
@@ -1750,6 +1754,10 @@ async fn revoke_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -
     }
 }
 
+/// The largest request a run or a connector command takes: a run's inputs may be pictures given inline (Image to
+/// image takes up to 10, a few MB of data URL each, stored with the engines before the flow runs), past axum's 2 MB.
+const RUN_INPUT_LIMIT: usize = 64 << 20;
+
 /// The bridge router, ready to `.merge()` into the main app.
 pub fn router(state: BridgeState) -> Router {
     Router::new()
@@ -1758,7 +1766,7 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/bridge/status", get(runtime_status))
         .route(
             "/api/bridge/runs",
-            get(queued_runs).post(create_run).delete(clear_runs),
+            get(queued_runs).post(create_run).delete(clear_runs).layer(axum::extract::DefaultBodyLimit::max(RUN_INPUT_LIMIT)),
         )
         .route("/api/bridge/runs/:id", get(get_run))
         .route("/api/bridge/runs/:id/claim", post(claim_run))
@@ -1773,7 +1781,7 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/plugins", get(list_plugins))
         .route(
             "/api/bridge/connectors/:id/request",
-            post(connector_request),
+            post(connector_request).layer(axum::extract::DefaultBodyLimit::max(RUN_INPUT_LIMIT)),
         )
         .route("/api/plugins/:id/start", post(start_plugin))
         .route("/api/plugins/:id/stop", post(stop_plugin))
@@ -2323,6 +2331,22 @@ mod tests {
                 req = req.header("content-type", "application/json");
             }
             read(app.clone().oneshot(req.body(body.map_or_else(Body::empty, |b| Body::from(b.to_string()))).unwrap()).await.unwrap()).await
+        }
+
+        /// A run's inputs may be pictures given inline (Image to image takes up to 10): past axum's 2 MB, the request
+        /// is read and judged (here, a flow that does not exist), not refused for its size.
+        #[tokio::test]
+        async fn a_run_may_carry_pictures_past_two_mb() {
+            let (_sb, st) = release_state("big-run", Publishers::default());
+            let app = router(st);
+            let picture = format!("data:image/png;base64,{}", "A".repeat(3 << 20));
+            let input = json!({"Prompt": "a cat", "Pictures": [picture.clone(), picture]});
+            for path in ["/api/bridge/runs", "/api/bridge/connectors/oaiy-flows/request"] {
+                let body = json!({"protocol": "oaiy-bridge/1", "caller": {"product": "test"}, "flowId": "not-a-flow", "input": input,
+                    "command": "flow.run", "payload": {"flowId": "not-a-flow", "inputs": input}});
+                let (status, _) = send(&app, path, &[], Some(body)).await;
+                assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            }
         }
 
         #[tokio::test]

@@ -289,7 +289,8 @@ pub(crate) fn write_atomic(path: &Path, value: &Value) -> Result<(), String> {
 /// Merged inside the guard layers: all of it is restricted (see `http.rs`).
 pub fn router(control: Control) -> Router {
     Router::new()
-        .route("/api/mcp", post(mcp::handle))
+        // (a tool call may carry pictures, as `flow_run`'s inputs to Image to image: up to 10, a few MB each)
+        .route("/api/mcp", post(mcp::handle).layer(axum::extract::DefaultBodyLimit::max(64 << 20)))
         .route("/api/control/settings", get(get_settings).put(put_settings))
         .route("/api/control/log", get(get_log))
         .route("/api/control/desktop-log", get(desktop_log))

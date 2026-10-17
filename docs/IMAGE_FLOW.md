@@ -1,68 +1,104 @@
-# Make, edit and check a picture: a flow over OAIY's engines
+# Text to image and Image to image: picture flows over OAIY's engines
 
-[`platform/examples/flows/image-make-edit-review.flow.json`](../platform/examples/flows/image-make-edit-review.flow.json)
-is a flow that makes a picture with MOSS-Image, edits it with FLUX 3 Klein where an edit is asked for, and has a vision
-model check the result. It runs in the flow editor, from the Agent's chat as a tool, and through the desktop's API for
-other programs. The engines decide which model holds which GPU as it goes: the flow names models, and the Studio loads,
-keeps and lets them go ([STUDIO.md](STUDIO.md#which-model-holds-which-gpu)).
+OAIY ships two picture flows, in every desktop's **Flows** from the start:
+
+- **Text to image** ([`text-to-image.flow.json`](../platform/examples/flows/text-to-image.flow.json)): a picture
+  from a prompt, with MOSS-Image.
+- **Image to image** ([`image-to-image.flow.json`](../platform/examples/flows/image-to-image.flow.json)): a
+  picture from up to 10 pictures and a prompt, with FLUX 3 Klein: one picture edited, or several combined.
+
+Each enhances its prompt, makes the picture, has a vision model check it, and makes it again (up to 3 tries) until
+the check passes. They run in the flow editor, from the Agent's chat as tools, and through the desktop's API, its MCP
+and FormLogic for other programs. The engines decide which model holds which GPU as they go: a flow names models, and
+the Studio loads, keeps and lets them go ([STUDIO.md](STUDIO.md#which-model-holds-which-gpu)).
+
+## Text to image
 
 | Step | Node | Model |
 | --- | --- | --- |
-| The idea made a full caption, as OpenMOSS's prompt enhancer writes them ([MOSS-IMAGE.md](MOSS-IMAGE.md#prompting)); skipped when a **Picture** is given | `ai_llm`, `engine:llm` | the language model chosen in Engines (Qwen3.5-9B on the Mac's GPU here) |
-| The picture (or the one given) | `image_gen` | `moss-image-sft-q4-6-step` (the 8-step distillation at 6 steps: the same picture by eye) |
-| An edit, only where **Edit** has one (the branch is skipped otherwise) | `condition`, then `image_gen` with the picture as its reference | `flux-3-image-klein-q4-4-step` ([FLUX3.md](FLUX3.md#speed)) |
-| A review of the final picture, against the request (an edit's changes being what was asked) and against the picture before the edit | `ai_llm` with both pictures | the language model chosen in Engines (it must read pictures) |
-| The answer | `logic_block`, `output` | |
+| **Prompt**, what to make | `input_text` | |
+| The prompt made a full caption, as OpenMOSS's prompt enhancer writes them ([MOSS-IMAGE.md](MOSS-IMAGE.md#prompting)) | `ai_llm`, `engine:llm` | the language model chosen in Engines (Qwen3.5-9B on the Mac's GPU here) |
+| Try up to 3 times | `loop_start`, until its end says stop | |
+| This try's prompt: the caption, and on a retry the last review's fix after it | `logic_block` | |
+| The picture (a new seed each try) | `image_gen` | `moss-image-sft-q4-8-step` (the 8-step distillation at its 8 steps: at 6 the pictures were a little softer, for 2 s less) |
+| The review of the picture against the request | `ai_llm` with the picture | the language model chosen in Engines (it must read pictures) |
+| Pass or try again: the review read, the lettering checked | `logic_block` | |
+| Until it passes | `loop_end`, stops when `pass` is true | |
+| The answer: the first try that passed, else the one with the fewest issues | `logic_block`, `output` | |
 
-Its inputs are **Prompt** (what to make), **Edit** (a change, or empty) and **Picture** (empty, or a picture to edit
-instead of making one: a data URL, or a picture of the engines' by its address; with no Edit it is only reviewed,
-against the Prompt where there is one). It answers with JSON:
+## Image to image
+
+| Step | Node | Model |
+| --- | --- | --- |
+| **Prompt**, what to make or change, and **Pictures** | `input_text` | |
+| The pictures given, as a list of at most 10: a list, one picture, or a list written as JSON (more than 10 is refused; none makes a picture from the prompt alone) | `logic_block` | |
+| The full caption of the picture to make, written by a vision model that sees the pictures (768 px) in order: the request folded in, the references named by their order ("the jacket from the second image"), what the request leaves alone described as it is, its lettering quoted | `ai_llm` with the pictures | the language model chosen in Engines |
+| Try up to 3 times, this try's prompt | `loop_start`, `logic_block` | |
+| The picture, the shape of the first one given (about a megapixel) | `image_gen` with the pictures, **Same shape as the first picture** | `flux-3-image-klein-q4-4-step` ([FLUX3.md](FLUX3.md#speed)) |
+| The review, pass or try again, until it passes, the answer | as in Text to image | |
+
+The caption is what BFL ask of FLUX 3 Klein: a complete description of the picture to make, the edit folded in, rather
+than a one-line instruction (which reframes the shot), with the references given in order (the upsampler they publish
+is told "the first image, the second image, ..."). Without it an edit kept the stripes it was asked for and lost the
+lighthouse's lettering; with it the lettering is quoted and kept.
+
+## The check
+
+The reviewer answers JSON, `{"pass", "issues", "fix", "text": {"requested", "found"}}`: whether the picture shows
+what was asked, each problem in a few words, one sentence on what the picture must show instead (the next try's prompt
+carries it), and the lettering asked for and read. Three things keep it honest:
+
+- **It sees the result alone.** Shown the references as well, the 4B vision models here mistook one for the other: a
+  result with the stripes asked for was failed for lacking them (true of the reference), and one that had lost its
+  lettering passed. Against the request and the caption (which describes the whole picture to make) one picture is
+  judged reliably.
+- **The lettering is checked in code too.** Each phrase the caption quotes (the enhancer quotes exactly the lettering
+  the picture must show) must be among what the reviewer reads, word for word: a small model reading a picture is
+  reliable, one judging whether it matches is lenient. A phrase missing fails the try, and the next is told to write it.
+- **Stray text counts only where it gets in the way:** garbled letters beside the text asked for, or any text on a
+  picture meant to be clean (a logo, a product shot); a scene's own signs and a reflection's mirrored letters are fine.
+
+A reply that is not JSON cannot fail a picture: it passes unchecked (`checked: false`, the reply kept as `review`).
+
+## Inputs and the answer
+
+Text to image takes **Prompt**. Image to image takes **Prompt** and **Pictures**: a list of up to 10 pictures, each a
+data URL, a picture of the engines' by its address, or a file (one picture alone also works). Both answer:
 
 ```json
 {
   "image": "http://127.0.0.1:17972/api/ai/engine/gateway/files/images/2026-10-17/…/image-0001-seed-42.png",
-  "original": "…the picture before the edit…",
-  "edited": true, "given": false,
-  "prompt": "…", "caption": "…the enhanced caption…", "edit": "…",
-  "review": {
-    "verdict": "pass", "confidence": 1,
-    "text": {"requested": ["GOOD NIGHT"], "found": ["GOOD NIGHT"], "exact": true, "unintended": []},
-    "colours": {"requested": ["dark blue mug", "white letters"], "matches": true, "note": "…"},
-    "objects": {"missing": [], "extra": []},
-    "composition": "…",
-    "edit": {"applied": true, "unaffected_preserved": true, "note": "…"},
-    "issues": [], "uncertain": []
-  },
-  "pictures": {"made": {"file": "…", "job": "…", "model": "…", "seed": 7, "steps": 8, "timings": {…}}, "edited": {…}}
+  "pass": true, "checked": true, "tries": 2,
+  "issues": [],
+  "text": {"requested": ["HARBOR"], "quoted": ["HARBOR"], "found": ["HARBOR"], "missing": []},
+  "prompt": "…", "caption": "…the enhanced caption…",
+  "attempts": [
+    {"image": "…the first try…", "pass": false, "issues": ["the text \"HARBOR\" is not in the picture"], "seed": 7},
+    {"image": "…", "pass": true, "issues": [], "seed": 8}
+  ]
 }
 ```
 
-The pictures are references, never their bytes: `image` and `original` are the files' URLs on the desktop (a caller
-fetches them with its own credential), and `pictures` is what the engine said of each (its job, model, seed, steps,
-size and each stage's time: [STUDIO.md](STUDIO.md#which-model-holds-which-gpu)). The same seed, prompt, size and model
-make the same picture again. Inside the flow the steps pass the same references: the edit and the review read the
-pictures from the desktop as they need them.
+The pictures are references, never their bytes: each is its file's URL on the desktop (a caller fetches it with its
+own credential). Inside the flow the steps pass the same references (Image Gen answers its file's URL where the engine
+names one), so a run's whole record stays a few KB: with two pictures' bytes in it a run had passed the 4 MB a flow's
+step may hand on, and failed with `host.call: request exceeds the 4194304-code-unit transport limit`. When no try
+passes, `image` is the try with the fewest issues and `pass` is false.
 
-The review is advice: the flow hands it back and does not make the picture again. A caller that wants another try runs
-the flow again (a new seed each time, unless the flow's seed is set).
+## Running them
 
-## Running it
-
-- **In the editor:** it is in **Flows** from the start (OAIY stores the examples it ships in your flows once; one
-  you delete stays deleted, and the rail's **Examples** adds it again). Type a prompt (and an edit) into the input
-  nodes and run it.
-- **From the chat:** in the editor's flow list, **Give it to the agent… → A tool of its own** (the file already says
-  `make_and_check_image` and what it is for). The Agent offers it as a tool; using it, the pictures are saved in the
-  project under `flows/make_and_check_image/` and the model is handed their paths (to look at with `view_image`, show
-  with `present_file`, or edit further with `generate_image`'s `reference_images`).
-- **From another program** (5CD, a script): pair it with the desktop (`POST /api/bridge/pairing`, approved in OAIY's
-  window) or, on a headless `oaiy-server`, use its `OAIY_SERVER_TOKEN`; then, with that bearer:
+- **In the editor:** both are in **Flows** from the start (OAIY stores the examples it ships in your flows once; one
+  you delete stays deleted, and the rail's **Examples** adds it again). Type a prompt into the inputs and run.
+- **From the chat:** in the flow list, **Give it to the agent… → A tool of its own** (the files already say
+  `text_to_image` and `image_to_image` and what they are for). Using one, the pictures are saved in the project under
+  `flows/<tool>/` and the model is handed their paths (to look at with `view_image`, show with `present_file`).
+- **From another program** (a script, an app on this computer): pair it with the desktop (`POST /api/bridge/pairing`,
+  approved in OAIY's window) or, on a headless `oaiy-server`, use its `OAIY_SERVER_TOKEN`; then, with that bearer:
 
   ```sh
-  curl -X PUT  $DESKTOP/api/bridge/flows/image-make-edit-review -d @image-make-edit-review.flow.json
-  curl -X POST $DESKTOP/api/bridge/runs -d '{"protocol": "oaiy-bridge/1", "flowId": "image-make-edit-review",
-    "input": {"Prompt": "a ceramic mug that says \"GOOD MORNING\"", "Edit": ""}, "mode": "sync", "timeoutMs": 900000,
-    "idempotencyKey": "…"}'
+  curl -X POST $DESKTOP/api/bridge/runs -d '{"protocol": "oaiy-bridge/1", "flowId": "image-to-image",
+    "input": {"Prompt": "put the mug from the second image on the rock in the first", "Pictures": ["data:image/png;base64,…", "data:image/jpeg;base64,…"]},
+    "mode": "sync", "timeoutMs": 900000, "idempotencyKey": "…"}'
   curl -O $IMAGE_URL     # the answer's `image`, with the same bearer
   ```
 
@@ -70,45 +106,45 @@ the flow again (a new seed each time, unless the flow's seed is set).
   `POST /api/bridge/runs/{id}/cancel` stops it (its picture's engine job is cancelled with it).
 - **From an app elsewhere, or a FormLogic automation:** share it (**Let apps run it** in its menu in Flows) and run it
   through the `oaiy-flows` connector, which answers the pictures themselves (a JPEG within the relay's size where
-  needed): [REMOTE_FORMLOGIC.md](../platform/docs/REMOTE_FORMLOGIC.md#running-an-oaiy-flow-from-formlogic). A
-  picture to edit goes in **Picture** as a data URL.
-- **From an MCP client:** OAIY's MCP `flow_run` (`id` `image-make-edit-review`, `input` as above) answers the run and
-  the pictures as images ([AGENT_CONTROL.md](AGENT_CONTROL.md#the-tools)).
+  needed): [REMOTE_FORMLOGIC.md](../platform/docs/REMOTE_FORMLOGIC.md#running-an-oaiy-flow-from-formlogic).
+- **From an MCP client:** OAIY's MCP `flow_run` (`id` `text-to-image` or `image-to-image`, `input` as above) answers
+  the run and the pictures as images ([AGENT_CONTROL.md](AGENT_CONTROL.md#the-tools)).
 
 A flow is code that runs on the computer, so storing one needs the `flows.write` credential its caller was given, and a
 flow reads only what its nodes are allowed to: the engine's own files through the desktop, not arbitrary paths.
 
-## The fast one
+## Speed
 
-[`image-make-edit.flow.json`](../platform/examples/flows/image-make-edit.flow.json) is the same flow without the review:
-the same inputs, the pictures and what made them in its answer. An app that wants the picture alone runs it; one that
-wants it checked runs the reviewed one. Both are in a desktop's flows from the start.
+On this Mac (M5 Pro, 24 GB) with the RTX 4090 in its enclosure, through the desktop's API as an app runs them, the
+models placed as below; seconds end to end:
 
-On this Mac, kept warm, with an edit:
+| Run | Seconds |
+| --- | --- |
+| Text to image, its picture model loaded first | 31 |
+| Text to image, warm, passed on the first try | 24.2, 25.5 (22.3, 22.6 at 6 steps) |
+| Text to image, a retry: each further try (the picture, its review) | about 20 more |
+| Image to image, an edit of a 1024 x 1024 picture, first try (run by the flow runner itself, the picture by its address) | 27 to 30 |
+| Image to image, the same from FormLogic's connector (a 768 x 768 JPEG; the answer 122 KB, within the relay) | 22.4 |
+| Image to image, an edit that needed 2 tries / all 3 (the lettering lost, then kept) | 37.9 / 67.8 |
+| Image to image, two pictures combined (the mug from one put into the other), first try | 37.0 |
+| From MCP, `flow_run` of Text to image (the picture answered as an image; at 6 steps) | 21.6 |
 
-| | Fast flow | Reviewed flow |
-| --- | --- | --- |
-| The prompt enhanced (Qwen3.5-9B on the Mac's GPU) | 5 s | 5 s |
-| MOSS-Image: its text encoder on the card (1.1 s), 6 steps (5.1 s), the VAE | 6.6 s | 6.6 s |
-| FLUX 3 Klein: its text encoder on the Mac (0.9 s), the reference, 4 steps, the VAE | 8.0 s | 8.0 s |
-| The review: both pictures read (the instructions before them kept from the last run) and its answer | | 16 s |
-| A run | **20.5–22 s** | **36.5–37 s** |
-
-The review reads the pictures it checks since cf75e290: a chat step had taken a picture passed by its address for a
-file path, and in a flow the CLI runs (all of them but the editor's) dropped it, so the review had judged the request's
-text alone.
+The card's peak with both picture models and MOSS-Image's text encoder kept: 20.0 GB of 24.
 
 ## How the models come and go
 
 On a Mac with an RTX 4090 in an eGPU enclosure (24 GB on the card, 24 GB of unified memory) the models are placed so
 that nothing waits for a load once they are warm:
 
-- **The card holds the picture models**, kept between pictures by one worker side by side: MOSS-Image (Q4_K_M, 8
-  passes) and FLUX 3 Klein (Q4_K_M, 8 steps), 12.4 GB of the card together.
-- **The Mac's GPU holds the language model** (the caption and the review) and runs the picture models' text encoders
-  (Qwen3.5-9B's and Qwen3-VL-4B's, Q4_K_M), which reach the card only as their output. The language model can be one of
-  those files: Qwen3.5-9B (MOSS-Image's encoder) with its vision projector, or Qwen3-VL-4B (Klein's encoder,
-  [QWEN3VL.md](QWEN3VL.md)), smaller and the less careful reviewer; either way 41 to 42 s a run warm.
+- **The card holds the picture models**, kept between pictures by one worker side by side for 30 minutes
+  (`media.keep_minutes`): MOSS-Image (Q4_K_M, the 8-step distillation) and FLUX 3 Klein (Q4_K_M, 4 steps),
+  with MOSS-Image's text encoder (Qwen3.5-9B Q4_K_M, its layers kept beside them: a caption in 1.2 s), about 19 GB
+  of the card's 24 at its peak.
+- **The Mac's GPU holds the language model** (the enhancer and the reviewer), pinned there so it stays warm
+  (`llm.pinned`), and runs Klein's text encoder (Qwen3-VL-4B Q4_K_M, read as it encodes: 0.8 s, nothing kept). Kept on
+  the card as well, Klein's encoder left the card 0.3 GB and slowed the pictures' decodes from 0.4 to 3 s. The language
+  model can be one of those files: Qwen3.5-9B (MOSS-Image's encoder) with its vision projector, or Qwen3-VL-4B
+  ([QWEN3VL.md](QWEN3VL.md)), smaller and the less careful reviewer.
 - **Every weight is a Q4_K GGUF on the internal SSD** (the VAEs aside, 0.25 and 0.34 GB).
 
 With a language model on the card instead (MiniCPM-V 4.7 35B), the card is lent to each picture (its model let go)
@@ -118,7 +154,10 @@ loads, either way, and the model is read ahead from its file as it goes to the c
 Every load and unload is an event on `GET /api/resources` (control port), each with its reason, and every job carries its
 timings: the benchmark below is read from them.
 
-## Benchmark
+## Benchmark of the make, edit and check flow
+
+The flows these two replaced made a picture, edited it where an edit was asked for and reviewed it once (the review was
+advice, nothing was made again). Measured with them, on the same Mac and engines; the stages are the same models'.
 
 All on one Mac (M5 Pro, 24 GB of unified memory) with an RTX 4090 in a Thunderbolt enclosure, 1024x1024, the edit
 "make the mug dark blue and change the words to GOOD NIGHT in white", the same seeds, the caption and the review at
@@ -179,9 +218,13 @@ end to end), against 21 to 75 s loading it (75 under memory pressure).
 - `crates/oaiy-studio`: timings, provenance, `release`, the out-of-memory retry, the full queue, a pinned language model,
   a caller hanging up mid-picture (its job cancelled), and the card's memory confirmed free before its model loads again.
 - `platform/cli/test/logic-block-scope.ts`: a block after an untaken branch reads the branch's outputs as null; a
-  condition wired to its declared `value` handle; a flow's inputs found by their labels as written.
+  condition wired to its declared `value` handle; a flow's inputs found by their labels as written; a loop that tries
+  until its value passes collects that value (not the loop's own link) and stops, a block in it reading the last try's.
 - `platform/ui/tests/flow-services.mjs`: the image node's seed, `release` and info; an unlisted `engine:llm` compiles to
-  the desktop's chat route; a picture's file is named where the caller fetches it, and read back with the credential.
+  the desktop's chat route; a picture's file is named where the caller fetches it, and read back with the credential;
+  Image Gen passes on its file's URL (shown from its bytes), takes a list of pictures and keeps the first one's shape.
+- `platform/desktop/src-tauri` (`bridge::pictures`): a large picture given to a flow, alone or in a list, goes by
+  reference.
 - `platform/desktop/src-tauri` (`ai::engine_services`): the engine's files forwarded for reading only; the picture entry's
   `infoPath` and `filesUrl`.
 - `app/tests/unit/flowTools.test.ts`: a flow's pictures kept in the project, the model handed paths; the token sent only
@@ -196,12 +239,11 @@ end to end), against 21 to 75 s loading it (75 under memory pressure).
   35B there.
 - **No look-ahead across a flow.** The engines see one request at a time, not the graph: two flows at once take turns
   on the card step by step, and with the language model on the card each turn is a reload.
-- **The review is advice.** A smaller reviewer makes mistakes: Qwen3.5-9B once called a dark blue mug light blue;
-  MiniCPM-V 4.7 1B listed the edit it was asked to check as the picture's fault. It does not make the picture again.
+- **The check is a small model's.** It fails a good picture now and then (a scene's signs taken for stray text), which
+  costs a try, and passes what it cannot see (what an edit should have kept, beyond what the caption describes and the
+  lettering checked in code). After 3 tries the flow answers its best with `pass: false`.
 - **Keeping weights in RAM** between loads is not done: on a 24 GB Mac the 21 GB 35B cannot stay in the page cache
   beside everything else, and the picture models' Q4 weights load in 2 to 5 s from the internal SSD anyway.
-- **Picture bytes in a run's record.** The flow's answer holds references only, but the desktop keeps each node's
-  result with the run, the pictures' bytes among them.
 - **Long flows and one request.** A run in `sync` mode holds one HTTP request open until it ends (Node's fetch, for
   one, gives up on headers after 300 s): callers of long flows start them `async` and follow them, as the Agent does.
 - **Cards and Docker.** A model whose kernels for some shape are not yet compiled for the card compiles them with nvcc

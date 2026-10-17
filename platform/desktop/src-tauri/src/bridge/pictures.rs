@@ -193,6 +193,20 @@ pub fn by_reference(inputs: &mut Value, upload: &dyn Fn(&[u8], &str) -> Result<S
     Ok(())
 }
 
+/// A run's inputs as the ledger keeps them: [`by_reference`], so a run's record (written again each time the run
+/// changes) holds a picture's address, not its MB; as given where the engines cannot take them now (the worker tries
+/// again as the run starts, and says so if they still cannot).
+pub fn referenced(inputs: Value) -> Value {
+    let mut stored = inputs.clone();
+    match by_reference(&mut stored, &upload_local) {
+        Ok(()) => stored,
+        Err(e) => {
+            log::warn!("bridge: a run's pictures stay inline for now: {e}");
+            inputs
+        }
+    }
+}
+
 /// Store a picture with this desktop's engines (`POST` to their files' route) and answer its reference, as this
 /// desktop's own address of it (as a picture the engines made is named).
 pub fn upload_local(bytes: &[u8], mime: &str) -> Result<String, String> {
