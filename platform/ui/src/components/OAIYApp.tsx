@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { EXAMPLE_FLOWS, flowFromExample } from '../lib/exampleFlows';
 import OAIYBuilder from './OAIYBuilder';
 import FlowsSidebar from './panels/FlowsSidebar';
 import { createLogger } from '../utils/logger';
@@ -86,6 +87,7 @@ export default function OAIYApp() {
     setActiveFlowId,
     resetCounter,
     createFlow,
+    addFlow,
     updateFlow,
     deleteFlow,
     duplicateFlow,
@@ -781,6 +783,9 @@ export default function OAIYApp() {
               onDuplicateFlow={duplicateFlow}
               onRenameFlow={renameFlow}
               onSetFlowLocalOnly={setFlowLocalOnly}
+              onSetFlowRemote={(flowId, remote) => updateFlow(flowId, { remote })}
+              examples={EXAMPLE_FLOWS}
+              onAddExample={(example) => addFlow(flowFromExample(example))}
               onSaveAsMacro={handleSaveAsMacro}
               onEditMacro={handleEditMacro}
               onSaveMacro={handleSaveMacroChanges}

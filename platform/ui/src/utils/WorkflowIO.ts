@@ -69,7 +69,8 @@ const HANDLE_MIGRATION_MAP: Record<string, { sourceHandle?: Record<string, strin
   },
   'condition': {
     sourceHandle: { 'default': 'true', '_undefined_': 'true' },
-    targetHandle: { 'default': 'condition', '_undefined_': 'condition' },
+    // (the node's one input is drawn as `input`: `condition` and the definition's `value` were never a handle)
+    targetHandle: { 'default': 'input', '_undefined_': 'input', 'condition': 'input', 'value': 'input' },
   },
   'action_http': {
     sourceHandle: { 'default': 'response', '_undefined_': 'response' },
@@ -83,7 +84,8 @@ const HANDLE_MIGRATION_MAP: Record<string, { sourceHandle?: Record<string, strin
     sourceHandle: { 'default': 'result', '_undefined_': 'result' },
   },
   'logic_block': {
-    sourceHandle: { 'default': 'result', '_undefined_': 'result' },
+    // (its output is drawn as `output`: `result` was never a handle, and such an edge was not drawn)
+    sourceHandle: { 'default': 'output', '_undefined_': 'output', 'result': 'output' },
   },
   'json_parse': {
     sourceHandle: { 'default': 'output', '_undefined_': 'output' },
@@ -124,6 +126,34 @@ export const PERSISTENT_UNDERSCORE_FIELDS = [
 /** Sensitive fields that should not be exported */
 export const SENSITIVE_FIELDS = ['apiKey', 'password', 'token', 'secret'];
 
+/** Whether a logic block's input handle is one the editor draws (`input`, `input2`, …). */
+const isLogicInputId = (h: string | null | undefined) => !h || h === 'default' || /^input\d*$/.test(h);
+
+/**
+ * Logic blocks wired by the names of their inputs (as a flow written for the
+ * CLI, or by the Agent, addresses them: `targetHandle: "picture"`) given those
+ * names as their `inputNames`, so the editor draws each on a handle of its own
+ * (`migrateEdgeHandles` then moves the edges there) and the block's code reads
+ * them by the same names. Before, such a flow opened with those edges missing
+ * from the canvas.
+ */
+export function nameLogicBlockInputs<N extends { id: string; type?: string; data: unknown }>(nodes: N[], edges: Edge[]): N[] {
+  return nodes.map((node) => {
+    if (node.type !== 'logic_block') return node;
+    const incoming = edges.filter((e) => e.target === node.id);
+    const named = incoming.map((e) => e.targetHandle).filter((h): h is string => !isLogicInputId(h));
+    if (named.length === 0) return node;
+    const data = (node.data ?? {}) as Record<string, unknown>;
+    const names = Array.isArray(data.inputNames) ? [...(data.inputNames as string[])] : [];
+    // The handles already used by number keep their places; the names go after them.
+    const numbered = incoming.map((e) => e.targetHandle).filter((h): h is string => !!h && /^input\d*$/.test(h));
+    const used = Math.max(0, ...numbered.map((h) => (h === 'input' ? 1 : Number(h.slice(5)))));
+    while (names.length < used) names.push(`var${names.length + 1}`);
+    for (const name of named) if (!names.includes(name) && names.length < 8) names.push(name);
+    return { ...node, data: { ...data, inputNames: names, inputCount: Math.max(Number(data.inputCount) || 1, names.length) } };
+  });
+}
+
 /**
  * Migrate edges to use new handle IDs based on connected node types.
  * Special handling for template nodes which use dynamic inputNames.
@@ -154,8 +184,13 @@ export function migrateEdgeHandles(edges: Edge[], nodes: Node[]): Edge[] {
     // Migrate target handle based on target node type
     const targetType = nodeMap.get(edge.target);
     if (targetType) {
-      // Special handling for template nodes - map inputNames to handle IDs
-      if (targetType === 'template') {
+      // A logic block's inputs by the names it gives them (`inputNames`), as a flow written for the CLI addresses
+      // them, onto the handles the editor draws them on: the compiler declares each name either way.
+      if (targetType === 'logic_block' && targetHandle && !/^input\d*$/.test(targetHandle) && targetHandle !== 'default') {
+        const inputNames = (nodeDataMap.get(edge.target)?.inputNames as string[]) || [];
+        const idx = inputNames.indexOf(targetHandle);
+        if (idx !== -1 && idx < 8) targetHandle = idx === 0 ? 'input' : `input${idx + 1}`;
+      } else if (targetType === 'template') {
         const nodeData = nodeDataMap.get(edge.target);
         const inputNames = (nodeData?.inputNames as string[]) || [];
         const standardIds = ['input', 'input2', 'input3', 'input4', 'input5', 'input6'];

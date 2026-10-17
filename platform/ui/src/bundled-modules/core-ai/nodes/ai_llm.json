@@ -69,6 +69,78 @@
       "description": "Optional image for vision models"
     },
     {
+      "id": "image_1",
+      "name": "Image 2",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 2 for vision",
+      "showIf": { "property": "imageInputCount", "in": [2, 3, 4, 5, 6, 7, 8, 9, 10] }
+    },
+    {
+      "id": "image_2",
+      "name": "Image 3",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 3 for vision",
+      "showIf": { "property": "imageInputCount", "in": [3, 4, 5, 6, 7, 8, 9, 10] }
+    },
+    {
+      "id": "image_3",
+      "name": "Image 4",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 4 for vision",
+      "showIf": { "property": "imageInputCount", "in": [4, 5, 6, 7, 8, 9, 10] }
+    },
+    {
+      "id": "image_4",
+      "name": "Image 5",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 5 for vision",
+      "showIf": { "property": "imageInputCount", "in": [5, 6, 7, 8, 9, 10] }
+    },
+    {
+      "id": "image_5",
+      "name": "Image 6",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 6 for vision",
+      "showIf": { "property": "imageInputCount", "in": [6, 7, 8, 9, 10] }
+    },
+    {
+      "id": "image_6",
+      "name": "Image 7",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 7 for vision",
+      "showIf": { "property": "imageInputCount", "in": [7, 8, 9, 10] }
+    },
+    {
+      "id": "image_7",
+      "name": "Image 8",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 8 for vision",
+      "showIf": { "property": "imageInputCount", "in": [8, 9, 10] }
+    },
+    {
+      "id": "image_8",
+      "name": "Image 9",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 9 for vision",
+      "showIf": { "property": "imageInputCount", "in": [9, 10] }
+    },
+    {
+      "id": "image_9",
+      "name": "Image 10",
+      "type": "image",
+      "position": "left",
+      "description": "Picture 10 for vision",
+      "showIf": { "property": "imageInputCount", "in": [10] }
+    },
+    {
       "id": "video",
       "name": "Video",
       "type": "video",

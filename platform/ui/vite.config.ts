@@ -127,7 +127,8 @@ export default defineConfig({
       // keeps the api/ PHP backend + its SQLite DB (var/oaiy.sqlite), cli/, and
       // desktop/ out of reach of the dev server's /@fs/ route.
       // ../../shared is the code the editor shares with the Agent (imported as @oaiy/shared, see resolve.alias).
-      allow: [__dirname, path.resolve(__dirname, '../../shared')],
+      // (and the example flows the rail offers, read as they are shipped)
+      allow: [__dirname, path.resolve(__dirname, '../../shared'), path.resolve(__dirname, '../examples/flows')],
     },
     // Note: to switch ffmpeg.wasm to its multi-threaded build (3-5×
     // faster) we'll need to add COOP/COEP here (and in production

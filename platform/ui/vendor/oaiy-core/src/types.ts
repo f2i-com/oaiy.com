@@ -512,6 +512,11 @@ export interface Flow {
   isDemo?: boolean;
   /** If true, this is a built-in macro (loaded from /macros folder) */
   isBuiltIn?: boolean;
+  /**
+   * Shared with apps: in OAIY, FormLogic and other apps may run it through the `oaiy-flows` connector
+   * (`"oaiyRemote": true` in the desktop's document of it).
+   */
+  remote?: boolean;
 }
 
 /**

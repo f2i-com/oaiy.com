@@ -32,6 +32,38 @@
       "position": "left",
       "required": true,
       "description": "Image generation prompt"
+    },
+    {
+      "id": "image_0",
+      "name": "Image",
+      "type": "image",
+      "position": "left",
+      "description": "A picture to start from (img2img, or an edit's reference)",
+      "showIf": { "property": "imageInputCount", "in": [1, 2, 3, 4] }
+    },
+    {
+      "id": "image_1",
+      "name": "Image 2",
+      "type": "image",
+      "position": "left",
+      "description": "Reference picture 2",
+      "showIf": { "property": "imageInputCount", "in": [2, 3, 4] }
+    },
+    {
+      "id": "image_2",
+      "name": "Image 3",
+      "type": "image",
+      "position": "left",
+      "description": "Reference picture 3",
+      "showIf": { "property": "imageInputCount", "in": [3, 4] }
+    },
+    {
+      "id": "image_3",
+      "name": "Image 4",
+      "type": "image",
+      "position": "left",
+      "description": "Reference picture 4",
+      "showIf": { "property": "imageInputCount", "in": [4] }
     }
   ],
   "outputs": [

@@ -6,6 +6,9 @@ import '../../../services/monacoSetup';
 import Editor from '@monaco-editor/react';
 import { useNodeResize, CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 
+/** A logic block's input handles, in order (`inputNames` labels them, and names them in its code). */
+export const LOGIC_INPUT_IDS = ['input', 'input2', 'input3', 'input4', 'input5', 'input6', 'input7', 'input8'];
+
 // Hook to detect current theme from document class
 function useDocumentTheme() {
   const [isDark, setIsDark] = useState(() =>
@@ -84,7 +87,7 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
   }, [inputNames]);
 
   const handleAddInput = useCallback(() => {
-    if (inputCount < 6) {
+    if (inputCount < LOGIC_INPUT_IDS.length) {
       const newCount = inputCount + 1;
       const newNames = [...inputNames, `var${newCount}`];
       onInputCountChangeRef.current?.(newCount);
@@ -110,8 +113,9 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => {
-    // Use standard handle IDs that match the node definition: input, input2, input3, etc.
-    const standardIds = ['input', 'input2', 'input3', 'input4', 'input5'];
+    // Use standard handle IDs that match the node definition: input, input2, input3, etc. (one for each input the
+    // block may have: the sixth used to have none)
+    const standardIds = LOGIC_INPUT_IDS;
     return standardIds.slice(0, inputCount).map((id, index) => ({
       id,
       type: 'target' as const,
@@ -179,7 +183,7 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
                 </button>
                 <button
                   onClick={handleAddInput}
-                  disabled={inputCount >= 6}
+                  disabled={inputCount >= LOGIC_INPUT_IDS.length}
                   className="w-5 h-5 flex items-center justify-center bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed rounded text-slate-700 dark:text-slate-300 text-xs"
                 >
                   +

@@ -368,6 +368,19 @@ const CoreUtilityCompiler: ModuleCompiler = {
     let ${handleId} = ${sourceVar};`;
             }
           }
+          // The names the editor gives the block's inputs (its `inputNames`, shown on the handles `input`,
+          // `input2`, …): each is its handle's value, so a block reads what its inputs are called. Before, the
+          // names were only labels: a block with a second input named `picture` threw "picture is not defined".
+          // A name that is not an identifier, or is one of the names above, stays a label.
+          const declared = new Set(['context', 'input', '$input', 'nodes', 'inputs', 'event', 'upstream', 'app', 'loop_index', ...inputs.keys()]);
+          const names = Array.isArray(data.inputNames) ? (data.inputNames as unknown[]) : [];
+          names.forEach((name, i) => {
+            if (typeof name !== 'string' || !/^[A-Za-z_$][\w$]*$/.test(name) || RESERVED_WORDS.has(name) || declared.has(name)) return;
+            declared.add(name);
+            const handle = i === 0 ? 'input' : `input${i + 1}`;
+            out += `
+    let ${name} = ${inputs.get(handle) ?? (i === 0 ? inputVar : 'null')};`;
+          });
           if (isInLoop && loopStartId) {
             out += `
     let loop_index = _i_${sanitizeId(loopStartId)};`;
@@ -560,5 +573,14 @@ ${captureTail('return ')}
     return code;
   },
 };
+
+
+/** JavaScript's reserved words: never a name a block's input can be declared as. */
+const RESERVED_WORDS = new Set([
+  'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger', 'default', 'delete', 'do', 'else', 'enum', 'export',
+  'extends', 'false', 'finally', 'for', 'function', 'if', 'import', 'in', 'instanceof', 'new', 'null', 'return', 'super',
+  'switch', 'this', 'throw', 'true', 'try', 'typeof', 'var', 'void', 'while', 'with', 'yield', 'let', 'static', 'await',
+  'implements', 'interface', 'package', 'private', 'protected', 'public', 'arguments', 'eval', 'undefined', 'NaN', 'Infinity',
+]);
 
 export default CoreUtilityCompiler;

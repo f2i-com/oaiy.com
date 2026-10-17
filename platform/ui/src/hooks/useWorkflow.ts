@@ -9,6 +9,7 @@ import * as db from '../services/database';
 import { validateWorkflow as validateWorkflowUtil } from '../utils/WorkflowValidation';
 import {
   migrateEdgeHandles,
+  nameLogicBlockInputs,
   applyAutoLayout,
   graphToReactFlowNodes,
   graphToReactFlowEdges,
@@ -116,9 +117,10 @@ const getInitialState = () => {
   const autosaved = loadAutosaved();
   if (autosaved) {
     // Migrate old handle IDs to new semantic names, and filter out any self-loop edges
-    const migratedEdges = migrateEdgeHandles(autosaved.edges, autosaved.nodes)
+    const nodes = nameLogicBlockInputs(autosaved.nodes, autosaved.edges);
+    const migratedEdges = migrateEdgeHandles(autosaved.edges, nodes)
       .filter(e => e.source !== e.target);
-    return { nodes: autosaved.nodes, edges: migratedEdges };
+    return { nodes, edges: migratedEdges };
   }
   return { nodes: initialNodes, edges: initialEdges };
 };
@@ -337,8 +339,8 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
           return pts.some((p) => p!.x !== first.x || p!.y !== first.y);
         })();
         const shouldAutoLayout = graphWithDefaults.edges.length > 0 && !hasUsablePositions;
-        const nodes = graphToReactFlowNodes(graphWithDefaults, shouldAutoLayout);
         const edges = graphToReactFlowEdges(graphWithDefaults);
+        const nodes = nameLogicBlockInputs(graphToReactFlowNodes(graphWithDefaults, shouldAutoLayout), edges);
         // Migrate old handle IDs to new semantic names
         const migratedEdges = migrateEdgeHandles(edges, nodes);
         return { nodes, edges: migratedEdges };
@@ -1402,8 +1404,8 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
 
   // Load a graph directly (used by AI Flow Designer)
   const loadGraph = useCallback((graph: WorkflowGraph, applyLayout = true) => {
-    const newNodes = graphToReactFlowNodes(graph, applyLayout);
     const newEdges = graphToReactFlowEdges(graph);
+    const newNodes = nameLogicBlockInputs(graphToReactFlowNodes(graph, applyLayout), newEdges);
     // Migrate old handle IDs to new semantic names (for backward compatibility)
     const migratedEdges = migrateEdgeHandles(newEdges, newNodes);
     setNodes(newNodes);

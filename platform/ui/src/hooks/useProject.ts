@@ -464,6 +464,14 @@ export function useProject() {
     return newFlow;
   }, []);
 
+  /** Put a flow made elsewhere (an example) in the project under its own id, and open it; one there already is opened. */
+  const addFlow = useCallback((flow: Flow) => {
+    setProject((prev) => (prev.flows.some((f) => f.id === flow.id)
+      ? prev
+      : { ...prev, updatedAt: new Date().toISOString(), flows: [...prev.flows, flow] }));
+    setActiveFlowId(flow.id);
+  }, []);
+
   const updateFlow = useCallback((flowId: string, updates: Partial<Omit<Flow, 'id' | 'createdAt'>>) => {
     const now = new Date().toISOString();
     setProject((prev) => ({
@@ -1257,6 +1265,7 @@ export function useProject() {
 
     // Flow operations
     createFlow,
+    addFlow,
     updateFlow,
     deleteFlow,
     duplicateFlow,

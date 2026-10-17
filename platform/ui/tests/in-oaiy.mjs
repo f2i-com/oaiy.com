@@ -46,7 +46,7 @@ const uiStub = path.join(os.tmpdir(), `oaiy-in-oaiy-stub-${process.pid}.mjs`);
 fs.writeFileSync(uiStub, 'export function invalidateDynamicOptions() {}\nexport function subscribeToDynamicOptionsInvalidation() { return () => {}; }\n');
 await esbuild.build({
   stdin: {
-    contents: `export { flowKey, fromDoc, reconcile, shared } from './src/hooks/useDesktopFlows.ts';
+    contents: `export { flowKey, fromDoc, reconcile, shared, toDoc } from './src/hooks/useDesktopFlows.ts';
 export { desktopTheme } from './src/contexts/ThemeContext.tsx';
 export { taskText } from './src/bundled-modules/core-agent/runtime.ts';
 export { shellNavItems } from './src/components/chrome/ShellChrome.tsx';
@@ -67,7 +67,7 @@ export { forgetPageHost } from '@oaiy/shared/capabilities/host';`,
   plugins: [{ name: 'oaiy-ui-components', setup: (build) => build.onResolve({ filter: /^oaiy-ui-components$/ }, () => ({ path: uiStub })) }],
 });
 fs.rmSync(uiStub, { force: true });
-const { flowKey, fromDoc, reconcile, shared, desktopTheme, taskText, shellNavItems, currentCaps, currentAvailabilityEnv, paletteShowsNode, nodeNotice, hasSavedDesktopLink, forgetPageHost } = await import(pathToFileURL(bundlePath).href);
+const { flowKey, fromDoc, reconcile, shared, toDoc, desktopTheme, taskText, shellNavItems, currentCaps, currentAvailabilityEnv, paletteShowsNode, nodeNotice, hasSavedDesktopLink, forgetPageHost } = await import(pathToFileURL(bundlePath).href);
 fs.rmSync(bundlePath, { force: true });
 
 const flow = (extra = {}) => ({ id: 'f1', name: 'Greeting', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] }, ...extra });
@@ -84,6 +84,20 @@ check('what is sent is the name, the nodes and the edges: a move of the view is 
   const a = flow();
   assert.equal(flowKey(a), flowKey({ ...a, updatedAt: 'later' }));
   assert.notEqual(flowKey(a), flowKey({ ...a, name: 'Other' }));
+});
+
+check("a desktop flow's description, tags and sharing come with it, and go back into its document", () => {
+  const doc = { name: 'Pictures', description: 'Makes one', tags: ['image', 3], oaiyRemote: true, oaiyTool: { name: 'make' }, nodes: [], edges: [] };
+  const f = fromDoc('pictures', doc, '');
+  assert.equal(f.description, 'Makes one');
+  assert.deepEqual(f.tags, ['image']);
+  assert.equal(f.remote, true);
+  assert.equal(fromDoc('plain', { name: 'Plain', nodes: [] }, '').remote, undefined);
+  // Back: the editor's part put in, the rest of the document (the agent's tool) kept, a sharing switched off gone.
+  const back = JSON.parse(JSON.stringify(toDoc({ ...f, remote: false, name: 'Pictures 2' }, doc)));
+  assert.deepEqual(back, { name: 'Pictures 2', description: 'Makes one', tags: ['image'], oaiyTool: { name: 'make' }, nodes: [], edges: [] });
+  // A change to any of them is one to send.
+  for (const change of [{ description: 'Other' }, { tags: ['x'] }, { remote: false }]) assert.notEqual(flowKey(f), flowKey({ ...f, ...change }), JSON.stringify(change));
 });
 
 check("macros, demos, built-in and local-only flows stay the editor's own", () => {

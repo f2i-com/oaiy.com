@@ -1,23 +1,31 @@
 import { useState, useCallback, useMemo, useRef } from 'react';
 import {
+  ArrowDownAZ,
+  ChevronDown,
+  ChevronRight,
   ChevronsLeft,
   ChevronsRight,
+  Clock,
   Copy,
   FileText,
+  Globe,
   HardDrive,
   Layers,
   MoreHorizontal,
   Package,
   Pencil,
+  Plus,
   RotateCcw,
   Save,
   Search,
+  Sparkles,
   Trash2,
   Wrench,
   X,
 } from 'lucide-react';
 import type { Flow, OAIYPackageManifest } from 'oaiy-core';
 import { oaiyDesktop } from '../../lib/oaiyAgentTools';
+import type { ExampleFlow } from '../../lib/exampleFlows';
 import ConfirmDialog from '../ui/ConfirmDialog';
 import Menu, { MenuItem } from '../ui/Menu';
 import AgentToolDialog from '../dialogs/AgentToolDialog';
@@ -28,8 +36,10 @@ import PackageServicesPanel from './PackageServicesPanel';
  * The flows rail: the project's flows (and a loaded package's), to open one.
  *
  * Making a flow is New flow in the editor's header, and importing one is its
- * Import menu, so neither is repeated here: the rail is the list, a search
- * when it grows, and each flow's own actions in its ⋯ menu (or a right-click).
+ * Import menu, so neither is repeated here: the rail is the list, found in by
+ * a search (name, description, tags) and its tags, in the order last changed
+ * or by name; the examples OAIY ships under it, to add; and each flow's own
+ * actions in its ⋯ menu (or a right-click).
  */
 
 // Flow category for filtering
@@ -74,10 +84,41 @@ interface FlowsSidebarProps {
   onClosePackage?: (packageId: string) => void;
   // Export as package
   onExportAsPackage?: (flowId: string) => void;
+  /** In OAIY: share a flow with apps (FormLogic, the API), or stop. */
+  onSetFlowRemote?: (flowId: string, remote: boolean) => void;
+  /** The examples OAIY ships, and adding one to the project. */
+  examples?: ExampleFlow[];
+  onAddExample?: (example: ExampleFlow) => void;
 }
 
-/** Past this many flows the rail offers a search. */
-const SEARCH_FROM = 6;
+type FlowSort = 'recent' | 'name';
+const SORT_KEY = 'oaiy.flowsSort';
+const EXAMPLES_KEY = 'oaiy.flowsExamples';
+
+/** A remembered choice of the rail's (this browser's, best effort). */
+function remembered<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const v = localStorage.getItem(key);
+    return allowed.includes(v as T) ? (v as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function remember(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // storage unavailable: the choice lasts this visit
+  }
+}
+
+/** Tags the editor sets for its own bookkeeping, not ones a person browses by. */
+const HIDDEN_TAGS = new Set(['user-created']);
+
+/** Whether a flow (or example) matches a search: its name, description or a tag. */
+function matches(f: { name: string; description?: string; tags?: string[] }, q: string): boolean {
+  return f.name.toLowerCase().includes(q) || !!f.description?.toLowerCase().includes(q) || !!f.tags?.some((t) => t.toLowerCase().includes(q));
+}
 
 export default function FlowsSidebar({
   flows,
@@ -101,12 +142,18 @@ export default function FlowsSidebar({
   onSelectPackageFlow,
   onClosePackage,
   onExportAsPackage,
+  onSetFlowRemote,
+  examples = [],
+  onAddExample,
 }: FlowsSidebarProps) {
   const [editingFlowId, setEditingFlowId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
   const [menu, setMenu] = useState<{ flowId: string; anchor: HTMLElement | null; at: { x: number; y: number } | null } | null>(null);
   const [expandedServices, setExpandedServices] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState('');
+  const [tag, setTag] = useState<string | null>(null);
+  const [sort, setSort] = useState<FlowSort>(() => remembered(SORT_KEY, ['recent', 'name'] as const, 'recent'));
+  const [examplesOpen, setExamplesOpen] = useState(() => remembered(EXAMPLES_KEY, ['open', 'closed'] as const, 'open') === 'open');
   const searchRef = useRef<HTMLInputElement>(null);
 
   const toggleServiceExpanded = useCallback((packageId: string) => {
@@ -139,13 +186,31 @@ export default function FlowsSidebar({
     return { user, macros };
   }, [flows]);
 
-  // Filter flows by category, then by the search.
+  const inCategory = activeCategory === 'user' ? categorizedFlows.user : activeCategory === 'macros' ? categorizedFlows.macros : flows;
+
+  // The tags to browse by: those of the flows in view, the most used first.
+  const tags = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const f of inCategory) for (const t of f.tags ?? []) if (!HIDDEN_TAGS.has(t)) counts.set(t, (counts.get(t) ?? 0) + 1);
+    return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t]) => t);
+  }, [inCategory]);
+  const activeTag = tag && tags.includes(tag) ? tag : null;
+
+  // Filter flows by category, the tag and the search; then in the chosen order.
   const filteredFlows = useMemo(() => {
-    const inCategory = activeCategory === 'user' ? categorizedFlows.user : activeCategory === 'macros' ? categorizedFlows.macros : flows;
     const q = query.trim().toLowerCase();
-    if (!q) return inCategory;
-    return inCategory.filter((f) => f.name.toLowerCase().includes(q) || f.description?.toLowerCase().includes(q) || f.tags?.some((t) => t.toLowerCase().includes(q)));
-  }, [flows, activeCategory, categorizedFlows, query]);
+    const kept = inCategory.filter((f) => (!activeTag || f.tags?.includes(activeTag)) && (!q || matches(f, q)));
+    return sort === 'name'
+      ? [...kept].sort((a, b) => a.name.localeCompare(b.name))
+      : [...kept].sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  }, [inCategory, activeTag, query, sort]);
+
+  // The examples not in the project yet (one added is a flow of the list), as the search and tag find them.
+  const shownExamples = useMemo(() => {
+    if (activeCategory === 'macros' || !onAddExample) return [];
+    const q = query.trim().toLowerCase();
+    return examples.filter((e) => !flows.some((f) => f.id === e.id) && (!activeTag || e.tags.includes(activeTag)) && (!q || matches(e, q)));
+  }, [examples, flows, activeCategory, activeTag, query, onAddExample]);
 
   // Category counts
   const categoryCounts = useMemo(() => ({
@@ -309,6 +374,21 @@ export default function FlowsSidebar({
               {loadedPackages && loadedPackages.size > 0 ? 'Your flows' : 'Flows'}
               <small>{flows.length}</small>
             </h2>
+            <span className="oaiy-rail-tools">
+            <button
+              type="button"
+              onClick={() => {
+                const next = sort === 'recent' ? 'name' : 'recent';
+                setSort(next);
+                remember(SORT_KEY, next);
+              }}
+              className="oaiy-icon-btn"
+              aria-label={sort === 'recent' ? 'Sorted by last changed: sort by name' : 'Sorted by name: sort by last changed'}
+              title={sort === 'recent' ? 'Last changed first (click for A to Z)' : 'A to Z (click for last changed first)'}
+              data-testid="flows-sort"
+            >
+              {sort === 'recent' ? <Clock size={15} /> : <ArrowDownAZ size={15} />}
+            </button>
             {/* Collapse on md+; below md the panel is an overlay, so this dismisses it. */}
             <button
               type="button"
@@ -320,6 +400,7 @@ export default function FlowsSidebar({
             >
               <ChevronsLeft size={16} />
             </button>
+            </span>
           </div>
           <div className="oaiy-seg" role="tablist" aria-label="Which flows">
             {([
@@ -339,7 +420,7 @@ export default function FlowsSidebar({
               </button>
             ))}
           </div>
-          {(flows.length >= SEARCH_FROM || query) && (
+          {(flows.length > 0 || examples.length > 0 || query) && (
             <div className="oaiy-search">
               <Search size={14} />
               <input
@@ -359,6 +440,15 @@ export default function FlowsSidebar({
               )}
             </div>
           )}
+          {tags.length > 0 && (
+            <div className="oaiy-tags" role="group" aria-label="Show the flows with a tag">
+              {tags.slice(0, 12).map((t) => (
+                <button key={t} type="button" aria-pressed={activeTag === t} onClick={() => setTag(activeTag === t ? null : t)}>
+                  {t}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Flow List */}
@@ -367,11 +457,11 @@ export default function FlowsSidebar({
             <div className="oaiy-empty bare">
               <FileText size={22} />
               <p className="oaiy-empty-title">
-                {query ? 'No flow matches' : activeCategory === 'macros' ? 'No macros yet' : 'No flows yet'}
+                {query || activeTag ? 'No flow matches' : activeCategory === 'macros' ? 'No macros yet' : 'No flows yet'}
               </p>
               <p className="oaiy-empty-text">
-                {query
-                  ? 'Try another word, or clear the search.'
+                {query || activeTag
+                  ? 'Try another word or tag, or clear the search.'
                   : activeCategory === 'macros'
                     ? 'Save a flow as a macro from its ⋯ menu to use it as a node.'
                     : 'Make one with New flow, or bring one in with Import.'}
@@ -405,7 +495,7 @@ export default function FlowsSidebar({
                       <div
                         role="button"
                         tabIndex={0}
-                        className={`oaiy-flow-item${active ? ' active' : ''}${flow.isMacro ? ' macro' : flow.localOnly ? ' local' : ''}`}
+                        className={`oaiy-flow-item${active ? ' active' : ''}${flow.isMacro ? ' macro' : flow.localOnly ? ' local' : ''}${flow.description ? ' has-desc' : ''}`}
                         onClick={() => onSelectFlow(flow.id)}
                         onKeyDown={(e) => {
                           if (e.target !== e.currentTarget) return;
@@ -422,14 +512,16 @@ export default function FlowsSidebar({
                         aria-label={`Select flow: ${flow.name}`}
                         aria-current={active ? 'true' : undefined}
                         data-flow-name={flow.name}
-                        title={flow.name}
+                        title={flow.description ? `${flow.name}\n${flow.description}` : flow.name}
                       >
                         {flowIcon(flow)}
-                        <span>{flow.name}</span>
+                        <span className="oaiy-flow-text">
+                          <span>{flow.name}</span>
+                          {flow.description && <small>{flow.description}</small>}
+                        </span>
+                        {flow.remote && <Globe size={13} className="oaiy-flow-shared" aria-label="Shared with apps" />}
                         {running ? (
                           <span className="oaiy-pill dot accent live" title="Running">running</span>
-                        ) : flow.tags && flow.tags.length > 0 ? (
-                          <span className="oaiy-pill">{flow.tags[0]}</span>
                         ) : null}
                         <button
                           type="button"
@@ -451,6 +543,53 @@ export default function FlowsSidebar({
               })}
             </ul>
           )}
+
+          {/* The examples OAIY ships that are not in the project (yet, or any more): one click adds one. */}
+          {shownExamples.length > 0 && (
+            <div className="oaiy-rail-group" data-testid="flows-examples">
+              <button
+                type="button"
+                className="oaiy-rail-group-head"
+                aria-expanded={examplesOpen}
+                onClick={() => {
+                  setExamplesOpen(!examplesOpen);
+                  remember(EXAMPLES_KEY, examplesOpen ? 'closed' : 'open');
+                }}
+              >
+                {examplesOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                Examples <small>{shownExamples.length}</small>
+              </button>
+              {examplesOpen && (
+                <ul>
+                  {shownExamples.map((example) => (
+                    <li key={example.id}>
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        className={`oaiy-flow-item example${example.description ? ' has-desc' : ''}`}
+                        onClick={() => onAddExample?.(example)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            onAddExample?.(example);
+                          }
+                        }}
+                        aria-label={`Add the example flow: ${example.name}`}
+                        title={`Add it to your flows${example.description ? `\n${example.description}` : ''}`}
+                      >
+                        <Sparkles size={15} aria-hidden="true" />
+                        <span className="oaiy-flow-text">
+                          <span>{example.name}</span>
+                          {example.description && <small>{example.description}</small>}
+                        </span>
+                        <span className="oaiy-flow-add"><Plus size={12} /> Add</span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
 
         {/* A flow's own actions: from its ⋯ button, or a right-click. */}
@@ -465,6 +604,16 @@ export default function FlowsSidebar({
                   label="Give it to the agent…"
                   hint="As a tool, or before or instead of one of its tools"
                   onSelect={() => setAgentFlow(menuFlow)}
+                />
+              )}
+              {oaiyDesktop() && onSetFlowRemote && !menuFlow.isMacro && !menuFlow.localOnly && (
+                <MenuItem
+                  icon={<Globe size={14} />}
+                  label={menuFlow.remote ? 'Stop apps running it' : 'Let apps run it'}
+                  hint={menuFlow.remote
+                    ? 'FormLogic and other apps can run it now'
+                    : 'FormLogic and other apps, through the oaiy-flows connector'}
+                  onSelect={() => onSetFlowRemote(menuFlow.id, !menuFlow.remote)}
                 />
               )}
               {onExportAsPackage && (

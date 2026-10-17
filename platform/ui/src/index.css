@@ -2744,6 +2744,48 @@ button.oaiy-row:focus-visible,
 .oaiy-flow-item .oaiy-flow-more:focus-visible { opacity: 1; }
 .oaiy-flow-item .oaiy-flow-more:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
 .oaiy-flow-rename { height: 34px; }
+/* A flow's name over its description, and what the rail shows beside them. */
+.oaiy-flow-item.has-desc { height: auto; min-height: 34px; padding-top: 5px; padding-bottom: 5px; }
+.oaiy-flow-item > .oaiy-flow-text { display: flex; flex-direction: column; gap: 1px; }
+.oaiy-flow-text > span,
+.oaiy-flow-text > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.oaiy-flow-text > small { color: rgb(var(--color-text-faint)); font-size: 11px; line-height: 1.35; }
+.oaiy-flow-item > .oaiy-flow-shared { flex: none; color: rgb(var(--signal-green)); }
+.oaiy-flow-item.example > svg { color: rgb(var(--signal-amber)); }
+.oaiy-flow-item .oaiy-flow-add { display: inline-flex; flex: none; align-items: center; gap: 3px; color: rgb(var(--accent-primary)); font-size: 11.5px; font-weight: 600; }
+.oaiy-rail-tools { display: flex; align-items: center; gap: 2px; }
+/* The tags to browse by, under the search. */
+.oaiy-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.oaiy-tags > button {
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 999px;
+  background: transparent;
+  color: rgb(var(--color-text-secondary));
+  padding: 1px 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.oaiy-tags > button:hover { color: rgb(var(--color-text-primary)); }
+.oaiy-tags > button[aria-pressed='true'] { border-color: rgb(var(--accent-primary) / 0.6); background: rgb(var(--accent-primary) / 0.14); color: rgb(var(--color-text-primary)); }
+/* A group under the list (the examples), its heading a toggle. */
+.oaiy-rail-group { margin-top: 12px; }
+.oaiy-rail-group-head {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: rgb(var(--color-text-faint));
+  padding: 4px 6px 6px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.oaiy-rail-group-head:hover { color: rgb(var(--color-text-primary)); }
+.oaiy-rail-group-head small { font-family: var(--font-mono); font-weight: 500; letter-spacing: 0; }
 .oaiy-rail-section { border-bottom: 1px solid rgb(var(--color-border-secondary)); }
 .oaiy-rail-section > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px 6px; }
 .oaiy-rail-section > header .oaiy-label { display: flex; align-items: center; gap: 6px; }

@@ -8,19 +8,21 @@ keeps and lets them go ([STUDIO.md](STUDIO.md#which-model-holds-which-gpu)).
 
 | Step | Node | Model |
 | --- | --- | --- |
-| The idea made a full caption, as OpenMOSS's prompt enhancer writes them ([MOSS-IMAGE.md](MOSS-IMAGE.md#prompting)) | `ai_llm`, `engine:llm` | the language model chosen in Engines (Qwen3.5-9B on the Mac's GPU here) |
-| The picture | `image_gen` | `moss-image-sft-q4-8-step` |
+| The idea made a full caption, as OpenMOSS's prompt enhancer writes them ([MOSS-IMAGE.md](MOSS-IMAGE.md#prompting)); skipped when a **Picture** is given | `ai_llm`, `engine:llm` | the language model chosen in Engines (Qwen3.5-9B on the Mac's GPU here) |
+| The picture (or the one given) | `image_gen` | `moss-image-sft-q4-8-step` |
 | An edit, only where **Edit** has one (the branch is skipped otherwise) | `condition`, then `image_gen` with the picture as its reference | `flux-3-image-klein-q4-8-step` ([FLUX3.md](FLUX3.md#speed)) |
 | A review of the final picture, against the request (an edit's changes being what was asked) and against the picture before the edit | `ai_llm` with both pictures | the language model chosen in Engines (it must read pictures) |
 | The answer | `logic_block`, `output` | |
 
-Its inputs are **Prompt** and **Edit**. It answers with JSON:
+Its inputs are **Prompt** (what to make), **Edit** (a change, or empty) and **Picture** (empty, or a picture to edit
+instead of making one: a data URL, or a picture of the engines' by its address; with no Edit it is only reviewed,
+against the Prompt where there is one). It answers with JSON:
 
 ```json
 {
   "image": "http://127.0.0.1:17972/api/ai/engine/gateway/files/images/2026-10-17/…/image-0001-seed-42.png",
   "original": "…the picture before the edit…",
-  "edited": true,
+  "edited": true, "given": false,
   "prompt": "…", "caption": "…the enhanced caption…", "edit": "…",
   "review": {
     "verdict": "pass", "confidence": 1,
@@ -46,7 +48,9 @@ the flow again (a new seed each time, unless the flow's seed is set).
 
 ## Running it
 
-- **In the editor:** import the file (**Import flows…**), type a prompt (and an edit) into the input nodes, run it.
+- **In the editor:** it is in **Flows** from the start (OAIY stores the examples it ships in your flows once; one
+  you delete stays deleted, and the rail's **Examples** adds it again). Type a prompt (and an edit) into the input
+  nodes and run it.
 - **From the chat:** in the editor's flow list, **Give it to the agent… → A tool of its own** (the file already says
   `make_and_check_image` and what it is for). The Agent offers it as a tool; using it, the pictures are saved in the
   project under `flows/make_and_check_image/` and the model is handed their paths (to look at with `view_image`, show
@@ -64,6 +68,12 @@ the flow again (a new seed each time, unless the flow's seed is set).
 
   `mode: "async"` answers at once with the run's id: `GET /api/bridge/runs/{id}` follows it, and
   `POST /api/bridge/runs/{id}/cancel` stops it (its picture's engine job is cancelled with it).
+- **From an app elsewhere, or a FormLogic automation:** share it (**Let apps run it** in its menu in Flows) and run it
+  through the `oaiy-flows` connector, which answers the pictures themselves (a JPEG within the relay's size where
+  needed): [REMOTE_FORMLOGIC.md](../platform/docs/REMOTE_FORMLOGIC.md#running-an-oaiy-flow-from-formlogic). A
+  picture to edit goes in **Picture** as a data URL.
+- **From an MCP client:** OAIY's MCP `flow_run` (`id` `image-make-edit-review`, `input` as above) answers the run and
+  the pictures as images ([AGENT_CONTROL.md](AGENT_CONTROL.md#the-tools)).
 
 A flow is code that runs on the computer, so storing one needs the `flows.write` credential its caller was given, and a
 flow reads only what its nodes are allowed to: the engine's own files through the desktop, not arbitrary paths.

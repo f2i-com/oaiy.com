@@ -406,6 +406,39 @@ async function main(): Promise<void> {
     `status=${realm.status} error=${realm.error ?? ''} got=${JSON.stringify(realm.results?.['realm'])}`
   );
 
+  // The names the editor gives a block's inputs. It draws them on `input`, `input2`, … and labels each with its
+  // name (`inputNames`); the block's code reads them by those names. They used to be labels only: a block whose
+  // second input was named `picture` threw "picture is not defined". A name that is not an identifier, or is one of
+  // the block's own (`input`), stays a label; the handles' own names still work.
+  const byName = await runFlow(
+    {
+      nodes: [
+        { id: 'p', type: 'logic_block', position: { x: 0, y: 0 }, data: { code: 'return "a cat";' } },
+        { id: 'q', type: 'logic_block', position: { x: 0, y: 100 }, data: { code: 'return 7;' } },
+        {
+          id: 'both',
+          type: 'logic_block',
+          position: { x: 200, y: 0 },
+          data: {
+            inputCount: 3,
+            inputNames: ['prompt', 'seed', 'not a name'],
+            code: 'return [prompt, seed, input, input2, typeof input3];',
+          },
+        },
+      ],
+      edges: [
+        { source: 'p', target: 'both', sourceHandle: 'output', targetHandle: 'input' },
+        { source: 'q', target: 'both', sourceHandle: 'output', targetHandle: 'input2' },
+      ],
+    } as WorkflowGraph,
+    { timeoutMs: 30_000 }
+  );
+  check(
+    "a block reads its inputs by the names the editor gives them",
+    byName.status === 'completed' && JSON.stringify(byName.results?.['both']) === JSON.stringify(['a cat', 7, 'a cat', 7, 'undefined']),
+    `status=${byName.status} error=${byName.error ?? ''} got=${JSON.stringify(byName.results?.['both'])}`
+  );
+
   console.log(`logic-block-scope: ${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

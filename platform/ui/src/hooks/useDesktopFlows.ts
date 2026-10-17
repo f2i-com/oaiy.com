@@ -13,8 +13,10 @@
  * Which side changed is told three ways: each flow as it was when the two last
  * agreed is kept (in this page's storage, so a restart knows it too). A flow
  * changed on one side takes that side's; changed on both, this side's goes there.
- * Macros, demos and built-in flows stay the editor's own. Outside OAIY this does
- * nothing.
+ * A flow's name, description, tags, whether it is shared with apps, nodes and
+ * edges go both ways; what else the desktop's document holds (a tool's
+ * description the agent wrote) is kept as it is. Macros, demos and built-in
+ * flows stay the editor's own. Outside OAIY this does nothing.
  */
 import { useEffect, useRef } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
@@ -23,13 +25,36 @@ import { hookFlowId, oaiyDesktop, toolFlowId } from '../lib/oaiyAgentTools';
 
 const PULL_MS = 15_000;
 const SETTLE_MS = 1_200;
-const SYNCED_KEY = 'oaiy-desktop-flows-synced';
+// (`-2`: a flow's description, tags and sharing became part of what is compared)
+const SYNCED_KEY = 'oaiy-desktop-flows-synced-2';
 
-type Doc = { name?: string; nodes?: unknown[]; edges?: unknown[]; oaiyTool?: unknown; oaiyToolHook?: unknown };
+type Doc = {
+  name?: string;
+  description?: unknown;
+  tags?: unknown;
+  oaiyRemote?: unknown;
+  nodes?: unknown[];
+  edges?: unknown[];
+  oaiyTool?: unknown;
+  oaiyToolHook?: unknown;
+};
 
 /** What of a flow the desktop keeps: a change to any of it is sent. */
-export function flowKey(f: Pick<Flow, 'name' | 'graph'>): string {
-  return JSON.stringify([f.name, f.graph?.nodes ?? [], f.graph?.edges ?? []]);
+export function flowKey(f: Pick<Flow, 'name' | 'graph' | 'description' | 'tags' | 'remote'>): string {
+  return JSON.stringify([f.name, f.description ?? '', f.tags ?? [], !!f.remote, f.graph?.nodes ?? [], f.graph?.edges ?? []]);
+}
+
+/** A flow as the desktop's document of it: `doc` (as it is stored there) with this flow's part put in. */
+export function toDoc(f: Flow, doc: Doc | null = null): Doc {
+  return {
+    ...(doc ?? {}),
+    name: f.name,
+    description: f.description || undefined,
+    tags: f.tags?.length ? f.tags : undefined,
+    oaiyRemote: f.remote ? true : undefined,
+    nodes: f.graph.nodes,
+    edges: f.graph.edges,
+  };
 }
 
 /** Whether a flow of the editor's goes to the desktop. */
@@ -40,7 +65,17 @@ export function shared(f: Flow): boolean {
 /** A desktop flow as a flow of the editor's. */
 export function fromDoc(id: string, doc: Doc, now: string): Flow | null {
   if (!Array.isArray(doc.nodes)) return null;
-  return { id, name: doc.name || id, createdAt: now, updatedAt: now, graph: { nodes: doc.nodes as Flow['graph']['nodes'], edges: (Array.isArray(doc.edges) ? doc.edges : []) as Flow['graph']['edges'] } };
+  const tags = Array.isArray(doc.tags) ? doc.tags.filter((t): t is string => typeof t === 'string') : [];
+  return {
+    id,
+    name: doc.name || id,
+    ...(typeof doc.description === 'string' && doc.description ? { description: doc.description } : {}),
+    ...(tags.length ? { tags } : {}),
+    ...(doc.oaiyRemote === true ? { remote: true } : {}),
+    createdAt: now,
+    updatedAt: now,
+    graph: { nodes: doc.nodes as Flow['graph']['nodes'], edges: (Array.isArray(doc.edges) ? doc.edges : []) as Flow['graph']['edges'] },
+  };
 }
 
 /** What a pull changes here: flows to add or replace, ids to remove, and the flows as the two sides now agree. */
@@ -77,7 +112,7 @@ export function reconcile(there: Map<string, Flow>, here: Flow[], agreed: Map<st
       synced.set(id, theirKey);
     } else if (last !== theirKey && (last === undefined || myKey === last)) {
       // Changed there, not here: theirs.
-      put.push({ ...mine, name: theirs.name, graph: theirs.graph });
+      put.push({ ...mine, name: theirs.name, description: theirs.description, tags: theirs.tags, remote: theirs.remote, graph: theirs.graph });
       synced.set(id, theirKey);
     }
     // Changed here (or both): the push sends this side's.
@@ -193,7 +228,11 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
       for (const [id, f] of current) {
         const key = flowKey(f);
         if (synced.current.get(id) === key) continue;
-        const saved = await call('PUT', `/api/bridge/flows/${encodeURIComponent(id)}`, { name: f.name, nodes: f.graph.nodes, edges: f.graph.edges });
+        // Into the document as the desktop has it, so what the editor does not show (a description the agent
+        // reads) is not lost.
+        const stored = there.current.has(id) ? await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`) : null;
+        const doc = stored?.ok ? ((await stored.json().catch(() => null)) as Doc | null) : null;
+        const saved = await call('PUT', `/api/bridge/flows/${encodeURIComponent(id)}`, toDoc(f, doc));
         if (!saved?.ok) continue;
         synced.current.set(id, key);
         there.current.add(id);
