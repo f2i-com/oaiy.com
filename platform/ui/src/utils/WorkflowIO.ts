@@ -310,11 +310,12 @@ export function applyAutoLayout(nodes: Node[], edges: Edge[], direction: 'LR' | 
     dagreGraph.setEdge(edge.source, edge.target);
   });
 
-  // The flow's inputs (nodes nothing feeds) all in the first column, where a reader looks for them, rather than each
-  // beside the step that takes it: one invisible root before them all, taken out after.
+  // The flow's inputs (its input nodes nothing feeds) all in the first column, where a reader looks for them, rather
+  // than each beside the step that takes it: one invisible root before them all, taken out after. Another node nothing
+  // feeds (a loop's start) stays beside the steps it leads to.
   const ROOT = '__oaiy_layout_root__';
   const fed = new Set(edges.map((e) => e.target));
-  const sources = nodes.filter((n) => !fed.has(n.id) && !n.parentId);
+  const sources = nodes.filter((n) => !fed.has(n.id) && !n.parentId && /^(input_|macro_input$)/.test(n.type || ''));
   if (sources.length > 1) {
     dagreGraph.setNode(ROOT, { width: 1, height: 1 });
     sources.forEach((n) => dagreGraph.setEdge(ROOT, n.id, { weight: 10 }));

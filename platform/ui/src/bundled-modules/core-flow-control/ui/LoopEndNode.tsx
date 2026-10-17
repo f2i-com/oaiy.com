@@ -74,13 +74,19 @@ function LoopEndNode({ data }: LoopEndNodeProps) {
   const showStopValue = stopCondition !== 'none';
   const showStopField = stopCondition === 'json_field';
 
+  // When it stops, in words: its card's summary (and how many it has collected, after a run)
+  const stopWords: Record<string, string> = {
+    contains: `stops when it contains "${data.stopValue || ''}"`,
+    equals: `stops when it is "${data.stopValue || ''}"`,
+    starts_with: `stops when it starts "${data.stopValue || ''}"`,
+    json_field: `stops when ${data.stopField || 'a field'} is ${data.stopValue || ''}`,
+    starts_with_done: 'stops when it says DONE:',
+  };
   const collapsedPreview = (
-    <div className="text-slate-400">
-      <span className={stopCondition !== 'none' ? 'text-purple-400' : 'text-amber-400'}>
-        {stopCondition !== 'none' ? 'WHEN DONE' : 'END FOR'}
-      </span>
-      {resultCount > 0 && <span className="ml-1 text-[10px]">({resultCount})</span>}
-    </div>
+    <span>
+      {stopWords[stopCondition] ?? 'collects every round'}
+      {resultCount > 0 && ` · ${resultCount} collected`}
+    </span>
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [

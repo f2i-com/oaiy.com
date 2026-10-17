@@ -72,14 +72,13 @@ function LoopStartNode({ data }: LoopStartNodeProps) {
     return issues;
   }, [data.loopName]);
 
+  // What it repeats, in words: its card's summary
   const collapsedPreview = (
-    <div className="text-slate-400">
-      <div className={`font-mono text-[10px] ${loopMode === 'while_true' ? 'text-purple-400' : 'text-amber-400'}`}>
-        {loopMode === 'count' && `FOR 1..${iterations}`}
-        {loopMode === 'foreach' && 'FOR EACH'}
-        {loopMode === 'while_true' && 'WHILE TRUE'}
-      </div>
-    </div>
+    <span>
+      {loopMode === 'count' && `${iterations} times`}
+      {loopMode === 'foreach' && 'once for each item'}
+      {loopMode === 'while_true' && `until its end says stop (${iterations} at most)`}
+    </span>
   );
 
   // Input handles using HandleConfig
@@ -89,6 +88,8 @@ function LoopStartNode({ data }: LoopStartNodeProps) {
         { id: 'count', type: 'target', position: Position.Left, color: '!bg-amber-500', label: 'count', labelColor: 'text-amber-400', size: 'md' },
       ];
     }
+    // (a loop that runs until it is stopped takes nothing in: `i` is its try's number)
+    if (loopMode === 'while_true') return [];
     return [
       { id: 'array', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'array', labelColor: 'text-blue-400', size: 'md' },
     ];

@@ -151,13 +151,10 @@ const colorMap = {
   },
 };
 
-// The compact card's measures: a handle sits on its port's row, so the rows are a fixed height under a fixed
-// header (whatever is in the preview or the form below them).
-const HEADER = 38;
-const PORTS_TOP = 4;
-const ROW = 20;
+// A port's row: its handle sits in it, so the card can be as tall as its name and summary need.
+const ROW = 22;
 // (a collapsed card at least this wide: room for its ports' names side by side)
-const MIN_COLLAPSED = 224;
+const MIN_COLLAPSED = 232;
 
 // Run status → visible pill + screen-reader text. Semantic status hues (not the
 // customizable accent): amber=running, green=completed, red=error, each with a
@@ -194,10 +191,10 @@ function CollapsibleNodeWrapper({
   children,
   collapsedPreview,
   resizeHandles,
-  inputHandles = [],
-  outputHandles = [],
-  topHandles = [],
-  bottomHandles = [],
+  inputHandles: givenInputs = [],
+  outputHandles: givenOutputs = [],
+  topHandles: givenTop = [],
+  bottomHandles: givenBottom = [],
   className = '',
   titleExtra,
 }: CollapsibleNodeWrapperProps) {
@@ -218,6 +215,13 @@ function CollapsibleNodeWrapper({
   const hasIssues = validationIssues.length > 0;
   const statusClass = status ? `node-${status}` : '';
   const currentWidth = isCollapsed ? Math.max(collapsedWidth, MIN_COLLAPSED) : Math.max(width, MIN_COLLAPSED);
+  // A port on a side is a row of the card; one on its top or bottom edge (a loop's link from its start to its end,
+  // given among the inputs or outputs) sits on that edge, not in a row.
+  const side = (h: HandleConfig) => h.position === Position.Left || h.position === Position.Right;
+  const inputHandles = givenInputs.filter(side);
+  const outputHandles = givenOutputs.filter(side);
+  const topHandles = [...givenTop, ...givenInputs.filter((h) => h.position === Position.Top), ...givenOutputs.filter((h) => h.position === Position.Top)];
+  const bottomHandles = [...givenBottom, ...givenInputs.filter((h) => h.position === Position.Bottom), ...givenOutputs.filter((h) => h.position === Position.Bottom)];
   const rows = Math.max(inputHandles.length, outputHandles.length);
 
   // Sync with controlled state
@@ -233,15 +237,7 @@ function CollapsibleNodeWrapper({
     onCollapsedChange?.(newState);
   }, [isCollapsed, onCollapsedChange]);
 
-  // A side's handle on its port's row; a top or bottom one spread along the edge.
-  const getHandleStyle = (index: number, total: number, position: Position): React.CSSProperties => {
-    if (position === Position.Left || position === Position.Right) {
-      return { top: `${HEADER + PORTS_TOP + index * ROW + ROW / 2}px` };
-    }
-    const gap = currentWidth / (total + 1);
-    return { left: `${gap * (index + 1)}px` };
-  };
-
+  // A side's handle sits in its port's row (centred on it); a top or bottom one is spread along that edge.
   const renderHandle = (handle: HandleConfig, index: number, total: number) => (
     <Handle
       key={handle.id}
@@ -249,7 +245,9 @@ function CollapsibleNodeWrapper({
       position={handle.position}
       id={handle.id}
       className={`oaiy-port ${handle.color}`}
-      style={{ ...getHandleStyle(index, total, handle.position), zIndex: 20 }}
+      style={handle.position === Position.Left || handle.position === Position.Right
+        ? { top: '50%', zIndex: 20 }
+        : { left: `${(currentWidth / (total + 1)) * (index + 1)}px`, zIndex: 20 }}
       isConnectable={true}
       title={portName(handle)}
     />
@@ -309,13 +307,15 @@ function CollapsibleNodeWrapper({
           </button>
         </div>
 
-        {/* Its ports, a row each: what comes in on the left, what goes out on the right */}
+        {/* Its ports, a row each with its handle: what comes in on the left, what goes out on the right */}
         {rows > 0 && (
-          <div className="oaiy-node-ports" style={{ height: PORTS_TOP + rows * ROW + 4 }}>
+          <div className="oaiy-node-ports">
             {Array.from({ length: rows }).map((_, i) => (
-              <div key={i} className="oaiy-node-port" style={{ height: ROW }}>
+              <div key={i} className="oaiy-node-port" style={{ minHeight: ROW }}>
+                {inputHandles[i] && renderHandle(inputHandles[i], i, inputHandles.length)}
                 <span className={inputHandles[i]?.labelColor}>{inputHandles[i] ? portName(inputHandles[i]) : ''}</span>
                 <span className={outputHandles[i]?.labelColor}>{outputHandles[i] ? portName(outputHandles[i]) : ''}</span>
+                {outputHandles[i] && renderHandle(outputHandles[i], i, outputHandles.length)}
               </div>
             ))}
           </div>
@@ -328,8 +328,6 @@ function CollapsibleNodeWrapper({
         )}
       </div>
 
-      {inputHandles.map((h, i) => renderHandle(h, i, inputHandles.length))}
-      {outputHandles.map((h, i) => renderHandle(h, i, outputHandles.length))}
       {topHandles.map((h, i) => renderHandle(h, i, topHandles.length))}
       {bottomHandles.map((h, i) => renderHandle(h, i, bottomHandles.length))}
 

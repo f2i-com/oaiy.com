@@ -51,11 +51,10 @@ function InputTextNode({ data }: InputTextNodeProps) {
     ? (typeof data.value === 'object' ? JSON.stringify(data.value) : String(data.value))
     : '';
 
-  const collapsedPreview = (
-    <div className="text-slate-400 truncate text-[10px]">
-      {displayValue ? displayValue.substring(0, 50) + (displayValue.length > 50 ? '...' : '') : <span className="italic text-slate-500">Empty</span>}
-    </div>
-  );
+  // (a short start of its value, whole words, in its compact card; empty, what a caller sends)
+  const collapsedPreview = displayValue
+    ? <span>“{displayValue.length > 60 ? `${displayValue.slice(0, 60).replace(/\s+\S*$/, '')}…` : displayValue}”</span>
+    : <span className="italic">empty: given when the flow runs</span>;
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
     { id: 'text', type: 'source', position: Position.Right, color: '!bg-green-500', size: 'lg' },

@@ -2,6 +2,7 @@ import { memo, useState, useRef, useEffect, useCallback, useMemo, type ChangeEve
 import { Position } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 import { BLOCKED_MEDIA_WORDS, mediaUrlBlocked } from '../../../lib/localMedia';
+import { desktopFileBytes } from '../../core-service/contractRuntime';
 
 
 interface ImageViewNodeData {
@@ -40,6 +41,28 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
   // subsequent valid image on the "Invalid image format" placeholder.
   useEffect(() => {
     setHasLoadError(false);
+  }, [data.imageUrl]);
+
+  // A picture OAIY's engine made, passed on by its URL, is read with the desktop's credential (an <img> sends none)
+  // and shown from its bytes; any other source as it is.
+  const [shown, setShown] = useState<string | undefined>(data.imageUrl);
+  useEffect(() => {
+    const url = data.imageUrl ?? '';
+    setShown(url);
+    if (!/^https?:\/\//i.test(url)) return;
+    let blob: string | null = null;
+    let live = true;
+    desktopFileBytes(url)
+      .then((got) => {
+        if (!got || !live) return;
+        blob = URL.createObjectURL(new Blob([got.bytes as BlobPart], { type: got.mime }));
+        setShown(blob);
+      })
+      .catch(() => setHasLoadError(true));
+    return () => {
+      live = false;
+      if (blob) URL.revokeObjectURL(blob);
+    };
   }, [data.imageUrl]);
 
   const handleCollapsedChange = useCallback((collapsed: boolean) => {
@@ -134,7 +157,7 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
               } ${isExpanded ? 'h-64' : 'h-32'}`}>
               {isValidImage && !hasLoadError ? (
                 <img
-                  src={data.imageUrl}
+                  src={shown}
                   alt={data.label || 'Image'}
                   className="max-w-full max-h-full object-contain rounded"
                   onError={() => setHasLoadError(true)}

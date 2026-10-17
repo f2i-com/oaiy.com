@@ -88,6 +88,7 @@ export { runContract, contractTiming } from './src/bundled-modules/core-service/
 export { default as ServiceCompiler } from './src/bundled-modules/core-service/compiler.ts';
 export { default as AudioCompiler } from './src/bundled-modules/core-audio/compiler.ts';
 export { default as ImageCompiler } from './src/bundled-modules/core-image/compiler.ts';
+export { default as ImageRuntime } from './src/bundled-modules/core-image/runtime.ts';
 export { default as VideoCompiler } from './src/bundled-modules/core-video/compiler.ts';
 export { default as AICompiler } from './src/bundled-modules/core-ai/compiler.ts';
 export { default as Model3DCompiler } from './src/bundled-modules/core-3d/compiler.ts';`,
@@ -378,6 +379,10 @@ await check('image_gen, video_gen, ai_llm and Service Call resolve engine entrie
   assert.match(again, /seed: 7,/);
   assert.match(again, /release: true,/);
   assert.match(compile(M.ImageCompiler, 'image_gen', { service: 'engine:image:qwen', seed: -1 }, { prompt: 'node_in' }), /seed: null,/);
+  // an input may carry a list of pictures (an image-to-image flow's, up to 10), and an edit may keep its first one's shape
+  const edit = compile(M.ImageCompiler, 'image_gen', { service: 'engine:image:klein', imageInputCount: 2, matchPicture: true }, { prompt: 'node_in', image_0: 'node_pics', image_1: 'node_one' });
+  assert.match(edit, /images: \[node_pics, node_one\]\.flat\(\)\.filter\(/);
+  assert.match(edit, /size: "auto"/);
   assert.match(compile(M.ImageCompiler, 'image_gen', { endpoint: 'http://x/y', apiFormat: 'openai' }, { prompt: 'node_in' }), /Image\.generate\(/);
   assert.match(compile(M.VideoCompiler, 'video_gen', { service: 'engine:video' }, { prompt: 'node_in' }), /VideoFrames\.generateService\(\s*"engine:video"/);
   // an engine id no list here has (the bridge, the CLI and the Agent run flows with none): the desktop's chat route,
@@ -494,6 +499,21 @@ await check("a picture's file is named where the caller fetches it, and a pictur
   // a picture elsewhere is read by the runtime's own fetch, with no credential
   await M.runContract(ctx, picture, { image: 'http://example.com/c.png' }, { nodeId: 'n1' });
   assert.deepEqual(viaCtx, ['http://example.com/c.png']);
+});
+
+await check("Image Gen passes on its picture's file where the engine names one, and shows the picture as it comes", async () => {
+  const shown = [];
+  globalThis.fetch = async () => reply(200, { data: [{ b64_json: 'iVBORw==', oaiy: { file: 'http://127.0.0.1:8080/files/images/2026-10-17/b.png', seed: 7 } }] });
+  const picture = { ...desktop.find((s) => s.id === 'engine:background:birefnet'), infoPath: 'data.0.oaiy', filesUrl: '/api/ai/engine/gateway/files' };
+  const ctx = { ...fakeCtx(), onImage: (node, url) => shown.push([node, url]) };
+  const methods = M.ImageRuntime.createMethods(ctx);
+  const r = await methods.serviceImageInfo(picture, { prompt: 'a fox' }, 'n1');
+  assert.equal(r.image, `${ORIGIN}/api/ai/engine/gateway/files/images/2026-10-17/b.png`, 'the file, not the bytes');
+  assert.deepEqual(shown, [['n1', 'data:image/png;base64,iVBORw==']], 'the node shows the picture itself');
+  // a service that names no file: its bytes, as before
+  globalThis.fetch = async () => reply(200, { data: [{ b64_json: 'iVBORw==' }] });
+  const plain = await methods.serviceImageInfo({ ...picture, infoPath: undefined }, { prompt: 'a fox' }, 'n1');
+  assert.equal(plain.image, 'data:image/png;base64,iVBORw==');
 });
 
 await check('a stopped flow cancels the job', async () => {

@@ -7,7 +7,7 @@
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import type { CustomService } from '../core-service/examples';
-import { runContract } from '../core-service/contractRuntime';
+import { imageDataUrl as pictureDataUrl, runContract } from '../core-service/contractRuntime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createImageMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -1111,9 +1111,9 @@ async function save(
   ctx.log('info', `[ImageSave] Source: path=${source.path}, dataUrl=${source.dataUrl ? 'yes (' + source.dataUrl.substring(0, 50) + '...)' : 'no'}, url=${source.url}`);
   ctx.log('info', `[ImageSave] Tauri available: ${!!ctx.tauri}`);
 
-  // Determine what we're working with
+  // Determine what we're working with (a picture by its URL, as OAIY's engine's are passed on, read as its bytes)
   const imagePath = source.path;
-  const imageDataUrl = source.dataUrl;
+  const imageDataUrl = source.dataUrl || (!imagePath && source.url && ctx.tauri ? (await pictureDataUrl(ctx, source.url)) ?? undefined : undefined);
 
   // Update the node's preview image in real-time
   if (ctx.onImage) {
@@ -1284,9 +1284,11 @@ async function resize(
   ctx.onNodeStatus?.(nodeId, 'running');
 
   try {
+    // (a picture by its URL, as OAIY's engine's are passed on: its bytes)
+    if (typeof imageData === 'string' && /^https?:\/\//.test(imageData)) imageData = (await pictureDataUrl(ctx, imageData)) ?? '';
     if (!imageData || !imageData.startsWith('data:image')) {
       ctx.onNodeStatus?.(nodeId, 'error');
-      ctx.log('error', '[ImageResize] Invalid image data - must be a base64 data URL');
+      ctx.log('error', '[ImageResize] Invalid image data - must be a base64 data URL or a picture\'s URL');
       return 'Error: Invalid image data';
     }
 
@@ -1423,7 +1425,8 @@ async function resizeImageWithQuality(
  */
 /**
  * A picture from a contract service (OAIY's engine, or a service that
- * declares what it makes): a data: URL, shown on the node as it arrives.
+ * declares what it makes), shown on the node as it arrives: its file's URL
+ * where the service names one (OAIY's engine does), else a data: URL.
  * Background removal and upscaling take the node's picture as `image`.
  */
 async function serviceImage(
@@ -1452,7 +1455,10 @@ async function serviceImageInfo(
     ctx.onImage?.(nodeId, r.image);
     ctx.onNodeStatus?.(nodeId, 'completed');
     ctx.log('success', `[${label}] done`);
-    return { image: r.image, info: r.info ?? null };
+    // (passed on by its file where it has one: a 1024 x 1024 picture's bytes are about 2 MB of text, and a flow's
+    // steps hand their values on in requests of at most 4 MB, so two pictures as bytes stopped a flow outright)
+    const file = r.info && typeof r.info === 'object' ? (r.info as Record<string, unknown>).file : null;
+    return { image: typeof file === 'string' && /^https?:\/\//.test(file) ? file : r.image, info: r.info ?? null };
   } catch (e) {
     ctx.onNodeStatus?.(nodeId, 'error');
     throw e;

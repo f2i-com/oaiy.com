@@ -104,9 +104,8 @@ function summaryOf(data: Record<string, unknown>): string {
   else if (typeof data.model === 'string' && data.model.trim()) parts.push(data.model.trim());
   if (Number(data.width) > 0 && Number(data.height) > 0) parts.push(`${data.width}×${data.height}`);
   if (Number(data.imageInputCount) > 0) parts.push(`${data.imageInputCount} picture${Number(data.imageInputCount) > 1 ? 's' : ''} in`);
-  const text = [data.systemPrompt, data.prompt].find((t): t is string => typeof t === 'string' && t.trim() !== '');
-  const line = parts.join(' · ');
-  return text ? `${line}${line ? ' — ' : ''}${text.trim().split(/\s+/).slice(0, 12).join(' ')}…` : line;
+  // (its instructions are in its settings: the card says only what it runs on)
+  return parts.join(' · ');
 }
 
 export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {

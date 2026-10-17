@@ -439,6 +439,38 @@ async function main(): Promise<void> {
     `status=${byName.status} error=${byName.error ?? ''} got=${JSON.stringify(byName.results?.['both'])}`
   );
 
+  // A loop that tries until its value passes (the image flows' retries): its end collects the value wired to its
+  // input, whatever order the edges are in. The loop's own link (start `loop` → end `loop`, which the editor draws)
+  // used to be taken for the value when it came first: the loop collected its counter, and a stop condition reading
+  // that never held, so every try ran. A block in the loop reads the last try's value as the flow's context left it.
+  const tries = await runFlow(
+    {
+      nodes: [
+        { id: 'tries', type: 'loop_start', position: { x: 0, y: 0 }, data: { loopMode: 'while_true', iterations: 5 } },
+        {
+          id: 'step',
+          type: 'logic_block',
+          position: { x: 200, y: 0 },
+          data: { inputCount: 1, inputNames: ['attempt'], code: 'const last = nodes.step; return { attempt, pass: attempt >= 2, before: last ? last.attempt : null };' },
+        },
+        { id: 'done', type: 'loop_end', position: { x: 400, y: 0 }, data: { stopCondition: 'json_field', stopField: 'pass', stopValue: 'true' } },
+      ],
+      edges: [
+        { source: 'tries', target: 'done', sourceHandle: 'loop', targetHandle: 'loop' },
+        { source: 'tries', target: 'step', sourceHandle: 'item', targetHandle: 'input' },
+        { source: 'step', target: 'done', sourceHandle: 'output', targetHandle: 'input' },
+      ],
+    } as WorkflowGraph,
+    { timeoutMs: 30_000 }
+  );
+  check(
+    'a loop collects the value wired to its end and stops when it passes',
+    tries.status === 'completed' &&
+      JSON.stringify(tries.results?.['done']) ===
+        JSON.stringify([{ attempt: 1, pass: false, before: null }, { attempt: 2, pass: true, before: 1 }]),
+    `status=${tries.status} error=${tries.error ?? ''} got=${JSON.stringify(tries.results?.['done'])}`
+  );
+
   console.log(`logic-block-scope: ${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

@@ -997,8 +997,10 @@ workflow_context;
       code += this.generateNodeCode(innerNode, graph, undefined, true, startNode.id);
     }
 
-    // Find what connects to the loop_end to collect results
-    const endInputEdge = graph.edges.find(e => e.target === endNode.id);
+    // Find what connects to the loop_end to collect results: its value input, not the loop's own link from its start
+    // (the `loop` handle the editor draws between the two) nor a stop value. Before, a flow whose loop link was drawn
+    // first collected the loop's counter, and its stop condition, reading that, never held.
+    const endInputEdge = graph.edges.find(e => e.target === endNode.id && e.targetHandle !== 'loop' && e.targetHandle !== 'stop');
     // Use getSourceVar to properly determine the output variable name (respects single-output nodes)
     const endSourceNode = endInputEdge ? graph.nodes.find(n => n.id === endInputEdge.source) : null;
     const resultSource = endInputEdge && endSourceNode

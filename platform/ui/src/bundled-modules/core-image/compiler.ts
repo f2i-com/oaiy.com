@@ -58,6 +58,8 @@ const CoreImageCompiler: ModuleCompiler = {
           if (imageVars.length === 0 && inputs.get('image')) imageVars.push(inputs.get('image')!);
           const width = Number(data.width) || 1024;
           const height = Number(data.height) || 1024;
+          // (`auto`: an edit keeps its first picture's shape, at about a megapixel)
+          const size = data.matchPicture === true ? 'auto' : `${width}x${height}`;
           // (a seed to make it again, else a new one each run; `release`: its model let go as soon as it is done, as
           // a flow's last picture wants, not kept for the next)
           const seed = data.seed === '' || data.seed == null || !Number.isFinite(Number(data.seed)) || Number(data.seed) < 0 ? null : Math.floor(Number(data.seed));
@@ -74,8 +76,8 @@ const CoreImageCompiler: ModuleCompiler = {
       {
         prompt: [${JSON.stringify(String(data.prompt || ''))}, typeof ${promptInputVar} === 'string' ? ${promptInputVar} : ''].filter(Boolean).join("\\n"),
         negative_prompt: ${JSON.stringify(String(data.negativePrompt || ''))},
-        size: ${JSON.stringify(`${width}x${height}`)},
-        images: [${imageVars.join(', ')}].filter((x) => x != null),
+        size: ${JSON.stringify(size)},
+        images: [${imageVars.join(', ')}].flat().filter((x) => x != null && x !== ''),
         model: ${JSON.stringify(contractModel(preset, data.model))},
         seed: ${JSON.stringify(seed)},
         release: ${data.release === true ? 'true' : 'null'},

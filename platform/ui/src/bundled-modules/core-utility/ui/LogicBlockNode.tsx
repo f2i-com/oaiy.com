@@ -32,6 +32,8 @@ interface LogicBlockNodeData {
   inputNames?: string[];
   _status?: 'running' | 'completed' | 'error';
   _collapsed?: boolean;
+  /** The block's own name, where the flow gives it one. */
+  label?: string;
   onCodeChange?: (value: string) => void;
   onInputCountChange?: (value: number) => void;
   onInputNamesChange?: (value: string[]) => void;
@@ -106,13 +108,16 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
 
   const editorHeight = Math.max(80, size.height - 180);
 
-  // What the block does, in its compact card: its first comment (a block's own description), else its first line.
+  // What the block does, in its compact card where its name does not say: its first comment's first clause (a block's
+  // own description), else its first line. A named block's card is its name.
+  const named = typeof data.label === 'string' && data.label.trim() !== '';
   const firstLine = useMemo(() => {
     const lines = String(data.code || '').split('\n').map((l) => l.trim()).filter(Boolean);
     const comment = lines.find((l) => l.startsWith('//'));
-    return (comment ? comment.replace(/^\/\/\s*/, '') : lines[0] || '').slice(0, 140);
+    const text = comment ? comment.replace(/^\/\/\s*/, '').split(/[:;(]/)[0].trim() : lines[0] || '';
+    return text.length > 70 ? `${text.slice(0, 70).replace(/\s+\S*$/, '')}…` : text;
   }, [data.code]);
-  const collapsedPreview = firstLine ? <span title={firstLine}>{firstLine}</span> : null;
+  const collapsedPreview = !named && firstLine ? <span>{firstLine}</span> : null;
 
   const inputHandles = useMemo<HandleConfig[]>(() => {
     // Use standard handle IDs that match the node definition: input, input2, input3, etc. (one for each input the

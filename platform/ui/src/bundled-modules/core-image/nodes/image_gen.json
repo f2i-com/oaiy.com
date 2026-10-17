@@ -38,7 +38,7 @@
       "name": "Image",
       "type": "image",
       "position": "left",
-      "description": "A picture to start from (img2img, or an edit's reference)",
+      "description": "A picture to start from (img2img, or an edit's reference), or a list of them (OAIY's engine: FLUX 3 Klein takes up to 10)",
       "showIf": { "property": "imageInputCount", "in": [1, 2, 3, 4] }
     },
     {
@@ -73,7 +73,7 @@
       "type": "image",
       "position": "right",
       "varSuffix": "",
-      "description": "Generated image (base64)"
+      "description": "The picture made: its file's URL where OAIY's engine made it, else its bytes (a data URL)"
     },
     {
       "id": "info",
@@ -155,6 +155,14 @@
       "default": 1024,
       "min": 64,
       "max": 2048
+    },
+    {
+      "id": "matchPicture",
+      "showIf": { "property": "service", "startsWith": "engine:" },
+      "name": "Same shape as the first picture",
+      "type": "boolean",
+      "default": false,
+      "description": "Make the picture the shape of the first picture given it (at about a megapixel) instead of Width x Height: for edits"
     },
     {
       "id": "steps",

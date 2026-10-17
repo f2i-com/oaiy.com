@@ -813,30 +813,41 @@ select:focus-visible,
   right: -0.75rem;
 }
 
-/* A node's card (CollapsibleNodeWrapper): compact until expanded, its ports a row each with the handles on them. */
+/* A node's card (CollapsibleNodeWrapper): compact until expanded; its name in full, its ports a row each with their
+   handles in them, a short line of what it is set to. Nothing is cut: the card grows to what it says. */
 .oaiy-node {
   position: relative;
   border-width: 1px;
   border-style: solid;
   border-radius: 12px;
-  box-shadow: 0 6px 18px rgb(0 0 0 / 0.16);
+  background: rgb(var(--color-bg-secondary));
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.12), 0 8px 22px rgb(0 0 0 / 0.14);
   transition: box-shadow 0.15s;
 }
-.oaiy-node-card { overflow: hidden; border-radius: 11px; background: rgb(var(--color-bg-secondary)); }
+.oaiy-node:hover { box-shadow: 0 1px 2px rgb(0 0 0 / 0.14), 0 10px 28px rgb(0 0 0 / 0.2); }
+.oaiy-node-card { border-radius: 11px; }
 .oaiy-node-head {
   display: flex;
-  height: 38px;
-  align-items: center;
-  gap: 8px;
+  min-height: 40px;
+  align-items: flex-start;
+  gap: 9px;
   border-bottom: 1px solid rgb(var(--color-border-secondary));
-  padding: 0 6px 0 9px;
+  border-radius: 11px 11px 0 0;
+  padding: 8px 6px 8px 10px;
   user-select: none;
 }
-.oaiy-node-icon { display: grid; width: 22px; height: 22px; flex: none; place-items: center; border-radius: 7px; color: #fff; }
+.oaiy-node.collapsed .oaiy-node-head { border-bottom-color: rgb(var(--color-border-secondary) / 0.6); }
+.oaiy-node-icon { display: grid; width: 24px; height: 24px; flex: none; place-items: center; border-radius: 7px; color: #fff; }
 .oaiy-node-icon svg { width: 13px; height: 13px; }
-.oaiy-node-names { display: flex; min-width: 0; flex: 1; flex-direction: column; line-height: 1.2; }
-.oaiy-node-kind { overflow: hidden; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
-.oaiy-node-name { overflow: hidden; color: rgb(var(--color-text-primary)); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.oaiy-node-names { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; padding-top: 1px; }
+.oaiy-node-kind { font-size: 9px; font-weight: 700; letter-spacing: 0.07em; line-height: 1.2; text-transform: uppercase; }
+.oaiy-node-name {
+  color: rgb(var(--color-text-primary));
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
 .oaiy-node-toggle {
   display: grid;
   width: 22px;
@@ -848,30 +859,30 @@ select:focus-visible,
   background: transparent;
   color: rgb(var(--color-text-faint));
   cursor: pointer;
+  opacity: 0.7;
 }
+.oaiy-node:hover .oaiy-node-toggle { opacity: 1; }
+.oaiy-node-ports { padding: 5px 0; }
 .oaiy-node-port {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 0 13px;
+  gap: 12px;
+  padding: 0 14px;
   color: rgb(var(--color-text-secondary));
-  font-size: 10.5px;
+  font-size: 11px;
+  line-height: 1.25;
 }
-.oaiy-node-port > span { max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.oaiy-node-port > span:last-child { text-align: right; }
-.oaiy-node-ports { padding-top: 4px; }
-/* (two lines at most: a card stays compact; the whole of it is in the node's settings) */
+.oaiy-node-port > span { overflow-wrap: anywhere; }
+.oaiy-node-port > span:last-of-type { text-align: right; }
 .oaiy-node-preview {
-  display: -webkit-box;
-  overflow: hidden;
-  border-top: 1px solid rgb(var(--color-border-secondary));
-  padding: 6px 10px 7px;
+  border-top: 1px solid rgb(var(--color-border-secondary) / 0.6);
+  padding: 7px 12px 9px;
   color: rgb(var(--color-text-faint));
-  font-size: 10.5px;
+  font-size: 11px;
   line-height: 1.4;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
 }
 .oaiy-node-body { display: flex; flex-direction: column; gap: 12px; border-top: 1px solid rgb(var(--color-border-secondary)); padding: 12px; }
 /* its handles: small dots on the edge, a wider ring to aim at */
