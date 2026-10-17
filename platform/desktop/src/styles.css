@@ -1748,7 +1748,210 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .overview-tile-static { cursor: default; }
 .overview-tile-static:hover { border-color: var(--border); transform: none; }
 
-/* Networking: a worker's model, with its Pin / Unpin beside it */
-.network-model { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 1px 0; }
-.network-model > span { min-width: 0; overflow-wrap: anywhere; }
-.network-model .btn-tiny { flex: none; }
+/* ---------------------------------------------------------------------------
+ * NETWORKING — this computer's role, pairing (the code both screens show), and
+ * the paired computers with their GPUs and models.
+ * ------------------------------------------------------------------------- */
+
+/* The two roles as cards to choose between; the chosen one lit in the primary colour. */
+.network-roles { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.network-role {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-soft);
+  color: var(--text);
+  padding: 12px 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s, background 0.14s, box-shadow 0.14s;
+}
+.network-role:hover:not(:disabled) { border-color: var(--strong-border); }
+.network-role:disabled { cursor: not-allowed; opacity: 0.55; }
+.network-role.is-chosen {
+  border-color: color-mix(in srgb, var(--primary) 60%, var(--border));
+  background: var(--primary-soft);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+.network-role-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-raised);
+  color: var(--muted);
+}
+.network-role.is-chosen .network-role-icon { border-color: color-mix(in srgb, var(--primary) 40%, var(--border)); color: var(--primary); }
+.network-role-text { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.network-role-text strong { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; font-size: 13px; font-weight: 650; }
+.network-role-text small { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.network-role-tag { color: var(--faint); font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.network-role.is-chosen .network-role-tag { color: var(--primary); }
+.network-port { flex: 0 0 110px; }
+.network-invalid { color: var(--amber); }
+
+/* This computer's name, certificate and the addresses to type on a primary, each with a copy button. */
+.network-identity { display: flex; flex-direction: column; gap: 6px; }
+.network-addresses { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
+.network-copyable {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-raised);
+  padding: 1px 2px 1px 7px;
+}
+.network-copyable code { min-width: 0; border: 0; background: transparent; color: var(--text); padding: 0; font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.network-copy {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--faint);
+  padding: 0;
+  cursor: pointer;
+}
+.network-copy:hover { background: var(--primary-soft); color: var(--primary); }
+
+.network-list { display: flex; flex-direction: column; gap: 10px; }
+
+/* A pairing in progress (on either screen): the six digits large, to compare at a glance. */
+.network-pairing { display: flex; flex-direction: column; gap: 10px; }
+.network-pairing .pairing-head { margin-bottom: 0; }
+.network-pairing .pairing-head > svg { flex: none; color: var(--primary); }
+.network-pairing .pairing-head .pairing-origin { margin-left: 0; }
+.network-pairing .pairing-actions { margin-top: 2px; }
+.network-code {
+  width: fit-content;
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--canvas);
+  color: var(--text);
+  padding: 8px 16px;
+  font-family: var(--font-mono);
+  font-size: 30px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.14em;
+  line-height: 1.15;
+}
+.network-pairing-step { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.network-pairing-step > svg { flex: none; color: var(--primary); }
+.network-pairing-step strong { color: var(--text); }
+.network-looking { display: flex; align-items: center; gap: 7px; }
+.network-looking > svg { flex: none; color: var(--primary); }
+
+/* A worker found on the network, with its Pair button. */
+.network-found {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  padding: 9px 10px 9px 12px;
+}
+.network-found > svg { flex: none; color: var(--muted); }
+.network-found-name { display: flex; min-width: 0; flex: 1; align-items: center; flex-wrap: wrap; gap: 4px 8px; font-size: 13px; }
+.network-found-name .pairing-origin { margin-left: 0; }
+
+/* Adding a worker by its address: the field and its button on one line. */
+.network-add { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--border); padding-top: 13px; }
+.network-add .form-row { min-width: 200px; }
+
+.banner-ok {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+/* A paired computer: who it is, its GPUs (memory as meters) and its models. */
+.network-node .card-head > svg { color: var(--node, var(--muted)); }
+.network-unpair { margin-left: auto; }
+.network-about { overflow-wrap: anywhere; }
+.network-node .card-warn { margin-top: 8px; font-size: 12px; overflow-wrap: anywhere; }
+.network-node .card-warn > svg { flex: none; }
+.network-busy { margin-top: 8px; color: var(--primary); font-size: 12px; }
+.network-stale .network-devices,
+.network-stale .network-models { opacity: 0.6; }
+.network-stale-note { margin-top: 10px; color: var(--faint); font-size: 11.5px; }
+.network-stale-note + .network-devices { margin-top: 6px; }
+.network-devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; margin-top: 12px; }
+.network-device {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  padding: 9px 11px;
+}
+.network-device-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.network-device-name { min-width: 0; font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
+.network-device-load { flex: none; color: var(--faint); font-family: var(--font-mono); font-size: 10.5px; }
+.network-device-figure { color: var(--muted); font-family: var(--font-mono); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.network-meter { height: 6px; overflow: hidden; border-radius: 999px; background: var(--canvas); box-shadow: inset 0 0 0 1px var(--border); }
+.network-meter-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--primary), var(--cyan)); transition: width 0.5s ease; }
+.network-meter-fill.is-full { background: var(--amber); }
+
+/* Its models, a row each: the kind, the name, its state, where it is loaded, and Pin / Unpin. */
+.network-models { display: flex; flex-direction: column; gap: 2px; margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+.network-models > .settings-label { margin-bottom: 4px; }
+.network-model { display: flex; min-height: 32px; align-items: center; gap: 10px; min-width: 0; border-radius: var(--r-sm); padding: 3px 6px; margin: 0 -6px; }
+.network-model:hover { background: var(--surface-soft); }
+.network-model .btn-tiny { flex: none; margin-left: auto; height: 24px; padding: 0 8px; }
+/* Pin on every row would shout: quiet until its row is pointed at; Unpin (on a pinned row) stays plain to see. */
+.network-pin:not(.is-pinned) { border-color: transparent; background: transparent; color: var(--faint); }
+.network-model:hover .network-pin:not(.is-pinned),
+.network-pin:not(.is-pinned):focus-visible { border-color: var(--border); background: var(--surface-raised); color: var(--muted); }
+.network-kind {
+  flex: none;
+  width: 66px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.network-model-name { display: flex; min-width: 0; flex: 1; align-items: center; flex-wrap: wrap; gap: 4px 8px; font-size: 12px; }
+.network-model-name code { border: 0; background: transparent; color: var(--text); padding: 0; font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; overflow-wrap: anywhere; }
+.network-state,
+.network-pinned {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.network-state-ok { background: var(--green-soft); color: var(--green); }
+.network-state-busy { background: var(--primary-soft); color: var(--primary); }
+.network-state-idle { background: var(--amber-soft); color: var(--amber); }
+.network-state-off { color: var(--faint); padding-left: 0; }
+.network-pinned { border: 1px solid color-mix(in srgb, var(--cyan) 40%, var(--border)); background: var(--cyan-soft); color: var(--cyan); }
+.network-pinned.is-failed { border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); background: var(--danger-soft); color: var(--danger); }
+.network-where { color: var(--muted); font-size: 11.5px; }
+.network-pin-error { flex-basis: 100%; color: var(--danger); font-size: 11.5px; overflow-wrap: anywhere; }
+.network-more > summary {
+  width: fit-content;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.network-more > summary:hover { color: var(--text); }
+.network-more[open] > summary { margin-bottom: 4px; }

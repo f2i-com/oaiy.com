@@ -132,8 +132,13 @@ describe('NetworkPanel', () => {
     expect(container.textContent).toContain('Paired with Rig');
     const card = container.querySelector('[data-testid="network-node"]')!;
     expect(card.textContent).toContain('Online');
-    expect(card.textContent).toContain('RTX 5090: 4.0 GB of 32.0 GB in use');
-    expect(card.textContent).toContain('RTX 3070: memory unknown');
+    const devices = Array.from(card.querySelectorAll('.network-device')).map((d) => d.textContent);
+    expect(devices[0]).toContain('RTX 5090');
+    expect(devices[0]).toContain('4.0 of 32.0 GB in use');
+    expect(devices[1]).toContain('RTX 3070');
+    expect(devices[1]).toContain('memory unknown');
+    // the address typed is cleared once it is paired
+    expect(input.value).toBe('');
     expect(card.textContent).toContain('flux');
   });
 
@@ -146,16 +151,62 @@ describe('NetworkPanel', () => {
     api.unpin.mockResolvedValue({});
     await mount();
     const card = container.querySelector('[data-testid="network-node"]')!;
-    expect(card.textContent).toContain('moss · not loaded');
-    expect(card.textContent).toContain('pinned · loading');
+    const rows = Array.from(card.querySelectorAll('.network-model'));
+    const moss = rows.find((r) => r.textContent?.includes('moss'))!;
+    expect(moss.textContent).toContain('Not loaded');
+    expect(moss.textContent).toContain('Pinned · loading');
     // (a pinned model is listed among the loaded ones, the rest folded away)
     expect(card.querySelector('details')!.textContent).toContain('klein');
-    const rows = Array.from(card.querySelectorAll('.network-model'));
     const buttonOf = (model: string) => rows.find((r) => r.textContent?.includes(model))!.querySelector('button')!;
+    const asked = api.nodes.mock.calls.length;
     await act(async () => buttonOf('moss').click());
     expect(api.unpin).toHaveBeenCalledWith('w1', 'moss');
+    // (the page asks again straight away, not at the next poll)
+    expect(api.nodes.mock.calls.length).toBeGreaterThan(asked);
     await act(async () => buttonOf('klein').click());
     expect(api.pin).toHaveBeenCalledWith('w1', 'engine:image:node.w1/klein');
+  });
+
+  it('withdraws a pairing it stops waiting for, so the worker no longer shows it', async () => {
+    vi.useFakeTimers();
+    api.status.mockResolvedValue(primary);
+    api.startPairing.mockResolvedValue({ pairingId: 'x', code: '654 321', status: 'pending', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.20:17975', fingerprint: '1111' } });
+    api.confirmPairing.mockResolvedValue({ status: 'declined' });
+    await mount();
+    const input = container.querySelector('input[aria-label="Worker address"]') as HTMLInputElement;
+    await act(async () => {
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      set.call(input, '192.168.1.20');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => input.closest('form')!.requestSubmit());
+    await act(async () => button('Stop waiting').click());
+    expect(api.confirmPairing).toHaveBeenCalledWith('x', false);
+    expect(container.querySelector('[data-testid="network-pairing"]')).toBeNull();
+    // and nothing asks after it any more
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(api.confirmPairing).toHaveBeenCalledTimes(1);
+  });
+
+  it("saves only a change, and a worker's port only when it is one", async () => {
+    api.status.mockResolvedValue(worker);
+    await mount();
+    expect(button('Save').disabled).toBe(true);
+    const port = Array.from(container.querySelectorAll('label')).find((l) => l.textContent?.startsWith('Port'))!.querySelector('input')!;
+    const type = async (value: string) =>
+      act(async () => {
+        const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+        set.call(port, value);
+        port.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+    await type('80');
+    expect(button('Save').disabled).toBe(true);
+    expect(container.textContent).toContain('A port from 1024 to 65535');
+    await type('18000');
+    expect(button('Save').disabled).toBe(false);
+    api.setSettings.mockResolvedValue(worker);
+    await act(async () => button('Save').click());
+    expect(api.setSettings).toHaveBeenCalledWith(expect.objectContaining({ enabled: true, role: 'worker', port: 18000 }));
   });
 
   it('shows an offline worker with why, and unpairs it only when confirmed', async () => {
@@ -165,6 +216,10 @@ describe('NetworkPanel', () => {
     const card = container.querySelector('[data-testid="network-node"]')!;
     expect(card.textContent).toContain('Offline');
     expect(card.textContent).toContain('connection refused');
+    // what it last said is shown as that, its models' states left out (not "Loaded" while it does not answer)
+    expect(card.textContent).toContain('Last report');
+    expect(card.querySelector('.network-stale')).not.toBeNull();
+    expect(card.textContent).not.toContain('Loaded');
     const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true);
     await act(async () => button('Unpair').click());
     expect(api.unpair).not.toHaveBeenCalled();

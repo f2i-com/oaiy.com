@@ -2189,6 +2189,8 @@ export interface NetworkNode {
   enginesError: string | null;
   devices: NetworkDevice[];
   models: NetworkModel[];
+  /** Its engines' job queue: the job running (if any) and how many wait. */
+  queue?: { running: { model?: string; kind?: string } | null; queued: number; max_queued?: number } | null;
 }
 
 export interface NetworkPairing {
