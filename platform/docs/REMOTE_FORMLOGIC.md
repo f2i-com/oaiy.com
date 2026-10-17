@@ -203,7 +203,7 @@ In the automation (saved, **Desktop relay**, run on the **Linked computer**), a 
 | --- | --- |
 | `connector` | `oaiy-flows` |
 | `command` | `flow.run` (or `flows.list`: the shared flows, each `{flowId, name, description, inputs: [{name, default}]}`) |
-| `payload` | `{"flowId": "image-make-edit-review", "inputs": {"Prompt": "$inputs.prompt", "Edit": "$inputs.edit", "Picture": "$inputs.picture"}}`, with `timeoutSeconds` (default 300, at most 600), `pictures` (`"inline"`, the default, or `"none"`) and `maxPictureBytes` |
+| `payload` | `{"flowId": "image-to-image", "inputs": {"Prompt": "$inputs.prompt", "Pictures": "$inputs.pictures"}}` (or `{"flowId": "text-to-image", "inputs": {"Prompt": "$inputs.prompt"}}`), with `timeoutSeconds` (default 300, at most 600), `pictures` (`"inline"`, the default, or `"none"`) and `maxPictureBytes` |
 
 The node answers `{runId, status, output, error, pictures}`:
 
@@ -214,10 +214,11 @@ The node answers `{runId, status, output, error, pictures}`:
   `maxPictureBytes`, by default 150,000 characters, so that the answer fits the encrypted relay's 192 KiB: a picture
   larger than the room left is sent as a JPEG that fits (a lower quality first, then smaller), and one that cannot
   fit is `{ref, included: false, reason}`. An app on this computer may ask for more.
-- A picture given to the flow as an input is a data URL (`data:image/png;base64,…`, a PNG, JPEG or WebP). From
-  64 KiB on it is kept with the engines first and handed to the flow as their address for it, as a picture the
-  engines made is: a flow passes pictures from step to step by address, and one of a few MB inline is more than a
-  step's call may carry. Keep it within the relay's own limits (a few MB).
+- A picture given to the flow as an input is a data URL (`data:image/png;base64,…`, a PNG, JPEG or WebP), or a list
+  of them (Image to image's **Pictures** takes up to 10). From 64 KiB on each is kept with the engines first and
+  handed to the flow as their address for it, as a picture the engines made is: a flow passes pictures from step to
+  step by address, and one of a few MB inline is more than a step's call may carry. Keep them within the relay's own
+  limits (a few MB in all).
 
 A browser paired with this OAIY reaches the same commands directly, `POST /api/bridge/connectors/oaiy-flows/request
 {command, payload}`, and OAIY's MCP has `flows_list` and `flow_run` (which answers the pictures as images).

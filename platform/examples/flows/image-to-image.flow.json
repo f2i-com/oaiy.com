@@ -1,0 +1,414 @@
+{
+ "name": "Image to image",
+ "description": "A picture from pictures and a prompt: edit one picture, or combine several (up to 10). A vision model sees them and enhances the prompt into a full caption, FLUX 3 Klein (4 steps) makes the picture in the first one's shape, a vision model checks it and it is made again (up to 3 tries) when the check finds a problem. Inputs: Prompt (what to make or change), Pictures (a list of up to 10: URLs, data URLs or files; one picture alone also works; none makes a picture from the prompt). Answers the picture's file reference, whether it passed and each try's findings.",
+ "tags": [
+  "image",
+  "example"
+ ],
+ "nodes": [
+  {
+   "id": "prompt",
+   "type": "input_text",
+   "position": {
+    "x": 0,
+    "y": 249
+   },
+   "data": {
+    "label": "Prompt",
+    "value": "Turn it into a watercolour painting, keeping the composition and colours"
+   }
+  },
+  {
+   "id": "pictures",
+   "type": "input_text",
+   "position": {
+    "x": 0,
+    "y": 530
+   },
+   "data": {
+    "label": "Pictures",
+    "value": ""
+   }
+  },
+  {
+   "id": "given",
+   "type": "logic_block",
+   "position": {
+    "x": 322,
+    "y": 349
+   },
+   "data": {
+    "label": "The pictures given (up to 10)",
+    "code": "// The pictures given, as a list of at most 10 (FLUX 3 Klein's references): a list, one picture, or a list written\n// as JSON; none at all makes a picture from the prompt alone\nlet list = pictures;\nif (typeof list === 'string') {\n  const t = list.trim();\n  if (t.startsWith('[')) { try { list = JSON.parse(t); } catch { list = [t]; } } else list = t ? [t] : [];\n}\nlist = (Array.isArray(list) ? list : list ? [list] : [])\n  .map((p) => (p && typeof p === 'object' ? p.url || p.file || p.dataUrl || p.path : p))\n  .filter((p) => typeof p === 'string' && p.trim())\n  .map((p) => p.trim());\nif (list.length > 10) throw new Error(`FLUX 3 Klein takes at most 10 pictures; ${list.length} were given`);\nreturn list;",
+    "inputCount": 1,
+    "inputNames": [
+     "pictures"
+    ]
+   }
+  },
+  {
+   "id": "enhance_ask",
+   "type": "logic_block",
+   "position": {
+    "x": 644,
+    "y": 207
+   },
+   "data": {
+    "label": "What to enhance",
+    "code": "// What the enhancer is asked (as BFL's prompt upsampler is: the references shown to it first, in order)\nconst n = Array.isArray(given) ? given.length : 0;\nreturn n\n  ? `Reference images follow in order (the first image, the second image, ...): ${n} of them.\\nUser request: ${request}\\nOutput the caption.`\n  : `User request: ${request}\\nOutput the caption.`;",
+    "inputCount": 2,
+    "inputNames": [
+     "request",
+     "given"
+    ]
+   }
+  },
+  {
+   "id": "enhance",
+   "type": "ai_llm",
+   "position": {
+    "x": 966,
+    "y": 259
+   },
+   "data": {
+    "label": "Enhance the prompt (sees the pictures)",
+    "service": "engine:llm",
+    "model": "",
+    "systemPrompt": "You write the caption for FLUX 3 Image Klein, a picture model that makes one picture from a caption and the reference pictures it is given: to edit one picture, or to combine several. The reference pictures are shown to you in order (the first image, the second image, ...). Write the complete caption of the picture to make, with the person's request folded in: the framing, the subjects, the background, the lighting and the style, referring to the references by their order where it helps (\"the woman from the first image wearing the jacket from the second image\"). For an edit, describe the reference as it is with the change made, keeping what the request does not mention: the same people and faces, poses, objects, colours and framing, and any lettering the references show, quoted exactly as it is written there unless the request changes it. Describe the picture as it will look, never the change: no \"now\", \"instead\", \"originally\" or \"changed\". Quote any text the request asks for exactly. For a style, describe its look (palette, strokes, texture) rather than naming an artwork. Write cohesive prose, one paragraph, with no lists, JSON or quality tags. Reply with the caption alone. With no reference pictures, write the caption of the picture the request describes.",
+    "imageInputCount": 1,
+    "maxImageDimension": 768,
+    "maxTokens": 600,
+    "enableThinking": false
+   }
+  },
+  {
+   "id": "ask",
+   "type": "logic_block",
+   "position": {
+    "x": 1288,
+    "y": 12
+   },
+   "data": {
+    "label": "What to check",
+    "code": "// What the reviewer is asked: the person's own request and the caption the picture was made from (it sees the result\n// alone: a small vision model shown the references as well mistook one for the other)\nconst n = Array.isArray(given) ? given.length : 0;\nconst from = n ? `It was made from ${n === 1 ? 'a reference picture' : `${n} reference pictures`} and this caption, which describes the whole picture` : 'It was made from this caption';\nreturn `The person asked for: ${request}\\n\\n${from}: ${caption}\\n\\nCheck the picture against what the person asked for and the caption.`;",
+    "inputCount": 3,
+    "inputNames": [
+     "request",
+     "caption",
+     "given"
+    ]
+   }
+  },
+  {
+   "id": "attempts",
+   "type": "loop_start",
+   "position": {
+    "x": 966,
+    "y": 112
+   },
+   "data": {
+    "label": "Try up to 3 times",
+    "loopName": "tries",
+    "loopMode": "while_true",
+    "iterations": 3
+   }
+  },
+  {
+   "id": "attempt_prompt",
+   "type": "logic_block",
+   "position": {
+    "x": 1288,
+    "y": 242
+   },
+   "data": {
+    "label": "This try's prompt",
+    "code": "// The prompt for this try: the enhanced one, and on a retry the last review's fix with it (a model told what to\n// get right this time; the review read as the step before it left it, the loop's last try)\nconst last = nodes.verdict;\nconst fix = attempt > 1 && last && typeof last.fix === 'string' ? last.fix.trim() : '';\nreturn fix ? `${caption}\\n\\n${fix}` : caption;",
+    "inputCount": 2,
+    "inputNames": [
+     "caption",
+     "attempt"
+    ]
+   }
+  },
+  {
+   "id": "make",
+   "type": "image_gen",
+   "position": {
+    "x": 1610,
+    "y": 261
+   },
+   "data": {
+    "label": "Make it (FLUX 3 Klein, 4 steps)",
+    "service": "engine:image:flux-3-image-klein-q4-4-step",
+    "imageInputCount": 1,
+    "matchPicture": true,
+    "width": 1024,
+    "height": 1024,
+    "seed": "",
+    "release": false
+   }
+  },
+  {
+   "id": "review",
+   "type": "ai_llm",
+   "position": {
+    "x": 1932,
+    "y": 0
+   },
+   "data": {
+    "label": "Review it",
+    "service": "engine:llm",
+    "model": "",
+    "systemPrompt": "You check a picture an image model made by editing or combining reference pictures, against what the person asked for and the caption it was made from, which describes the whole picture to make. Reply with JSON alone, no prose and no code fence, in exactly this shape:\n{\"pass\": true or false, \"issues\": [\"each real problem, in a few words\"], \"fix\": \"one sentence saying what the picture must show instead, as an instruction to the painter, or empty\", \"text\": {\"requested\": [each word or phrase the request asks to be written in the picture, exactly as asked: lettering, never the things it shows], \"found\": [each word or phrase you can read in the picture, letter by letter]}}\nPass when the picture shows what the person asked for (what the request changes is changed, what it combines is combined) and matches the caption's description of the rest. Any text asked for must be exact, letter by letter. Detail neither mentions is not an issue. Fail only for a problem the person would notice. The text lists hold the words alone; leave them empty where there is no text.",
+    "imageInputCount": 1,
+    "maxTokens": 500,
+    "enableThinking": false
+   }
+  },
+  {
+   "id": "verdict",
+   "type": "logic_block",
+   "position": {
+    "x": 2254,
+    "y": 362
+   },
+   "data": {
+    "label": "Pass or try again",
+    "code": "// Pass or try again: the review read from its reply (a reply that is not JSON cannot fail the picture: it is kept\n// as text, the picture passed unchecked), with the picture's file reference. The lettering is checked here too: the\n// reviewer lists what it reads, and each phrase that must be there has to be among it (a small vision model reading\n// a picture is reliable; one judging whether it matches is lenient)\nconst text = String(review == null ? '' : review).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\nconst at = text.indexOf('{'), end = text.lastIndexOf('}');\nlet found = null;\ntry { found = JSON.parse(at >= 0 && end > at ? text.slice(at, end + 1) : text); } catch { found = null; }\nconst checked = !!found && typeof found.pass === 'boolean';\nconst issues = checked && Array.isArray(found.issues) ? found.issues.filter((x) => typeof x === 'string' && x.trim()) : [];\nconst words = (s) => String(s).toUpperCase().replace(/[^A-Z0-9\\u00C0-\\uFFFF]+/g, ' ').trim();\nconst lists = checked && found.text && typeof found.text === 'object' ? found.text : {};\nconst strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && words(x)) : []);\nconst read = ` ${strings(lists.found).map(words).join(' ')} `;\n// (each phrase the caption quotes: the enhancer quotes exactly the lettering the picture must show, the request's own\n// and, for an edit, what the references show that the request leaves alone)\nconst must = [];\nString(caption == null ? '' : caption).replace(/[\"\\u201C]([^\"\\u201D]{1,60})[\"\\u201D]/g, (all, q) => { must.push(q); return all; });\nconst missing = checked ? [...new Set(must.map(words).filter(Boolean))].filter((p) => !read.includes(` ${p} `)) : [];\nfor (const p of missing) issues.push(`the text \"${p}\" is not in the picture`);\nconst fix = [checked && typeof found.fix === 'string' ? found.fix.trim() : '', ...missing.map((p) => `The text \"${p}\" must be written in it, exactly.`)].filter(Boolean).join(' ');\nreturn {\n  pass: checked ? found.pass === true && missing.length === 0 : true,\n  checked,\n  attempt,\n  image: (made && made.file) || image,\n  seed: made && made.seed != null ? made.seed : null,\n  issues,\n  fix,\n  text: checked ? { requested: strings(lists.requested), quoted: must, found: strings(lists.found), missing } : null,\n  review: checked ? null : text,\n};",
+    "inputCount": 5,
+    "inputNames": [
+     "review",
+     "made",
+     "image",
+     "attempt",
+     "caption"
+    ]
+   }
+  },
+  {
+   "id": "done",
+   "type": "loop_end",
+   "position": {
+    "x": 2576,
+    "y": 143
+   },
+   "data": {
+    "label": "Until it passes",
+    "stopCondition": "json_field",
+    "stopField": "pass",
+    "stopValue": "true"
+   }
+  },
+  {
+   "id": "result",
+   "type": "logic_block",
+   "position": {
+    "x": 2898,
+    "y": 496
+   },
+   "data": {
+    "label": "The result",
+    "code": "// The flow's answer: the picture (its file's URL, never the picture itself), whether it passed, and each try's\n// findings. The first try that passed, else the try with the fewest issues (the latest of those).\nconst tries = Array.isArray(attempts) ? attempts.filter((t) => t && typeof t === 'object') : [];\nlet best = tries.find((t) => t.pass) || null;\nif (!best) for (const t of tries) if (!best || t.issues.length <= best.issues.length) best = t;\nreturn {\n  image: best ? best.image : null,\n  pass: !!(best && best.pass),\n  checked: !!(best && best.checked),\n  tries: tries.length,\n  issues: best ? best.issues : [],\n  text: best ? best.text : null,\n  prompt,\n  caption,\n  attempts: tries.map((t) => ({ image: t.image, pass: t.pass, issues: t.issues, seed: t.seed })),\n};",
+    "inputCount": 3,
+    "inputNames": [
+     "attempts",
+     "prompt",
+     "caption"
+    ]
+   }
+  },
+  {
+   "id": "out",
+   "type": "output",
+   "position": {
+    "x": 3220,
+    "y": 492
+   },
+   "data": {
+    "label": "Result",
+    "outputType": "json"
+   }
+  }
+ ],
+ "edges": [
+  {
+   "id": "e1",
+   "source": "pictures",
+   "target": "given",
+   "sourceHandle": "text",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e2",
+   "source": "prompt",
+   "target": "enhance_ask",
+   "sourceHandle": "text",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e3",
+   "source": "given",
+   "target": "enhance_ask",
+   "sourceHandle": "output",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e4",
+   "source": "enhance_ask",
+   "target": "enhance",
+   "sourceHandle": "output",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e5",
+   "source": "given",
+   "target": "enhance",
+   "sourceHandle": "output",
+   "targetHandle": "image"
+  },
+  {
+   "id": "e6",
+   "source": "prompt",
+   "target": "ask",
+   "sourceHandle": "text",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e7",
+   "source": "enhance",
+   "target": "ask",
+   "sourceHandle": "response",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e8",
+   "source": "given",
+   "target": "ask",
+   "sourceHandle": "output",
+   "targetHandle": "input3"
+  },
+  {
+   "id": "e9",
+   "source": "attempts",
+   "target": "done",
+   "sourceHandle": "loop",
+   "targetHandle": "loop"
+  },
+  {
+   "id": "e10",
+   "source": "enhance",
+   "target": "attempt_prompt",
+   "sourceHandle": "response",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e11",
+   "source": "attempts",
+   "target": "attempt_prompt",
+   "sourceHandle": "item",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e12",
+   "source": "attempt_prompt",
+   "target": "make",
+   "sourceHandle": "output",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e13",
+   "source": "given",
+   "target": "make",
+   "sourceHandle": "output",
+   "targetHandle": "image_0"
+  },
+  {
+   "id": "e14",
+   "source": "ask",
+   "target": "review",
+   "sourceHandle": "output",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e15",
+   "source": "make",
+   "target": "review",
+   "sourceHandle": "image",
+   "targetHandle": "image"
+  },
+  {
+   "id": "e16",
+   "source": "review",
+   "target": "verdict",
+   "sourceHandle": "response",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e17",
+   "source": "make",
+   "target": "verdict",
+   "sourceHandle": "info",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e18",
+   "source": "make",
+   "target": "verdict",
+   "sourceHandle": "image",
+   "targetHandle": "input3"
+  },
+  {
+   "id": "e19",
+   "source": "attempts",
+   "target": "verdict",
+   "sourceHandle": "item",
+   "targetHandle": "input4"
+  },
+  {
+   "id": "e20",
+   "source": "enhance",
+   "target": "verdict",
+   "sourceHandle": "response",
+   "targetHandle": "input5"
+  },
+  {
+   "id": "e21",
+   "source": "verdict",
+   "target": "done",
+   "sourceHandle": "output",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e22",
+   "source": "done",
+   "target": "result",
+   "sourceHandle": "results",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e23",
+   "source": "prompt",
+   "target": "result",
+   "sourceHandle": "text",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e24",
+   "source": "enhance",
+   "target": "result",
+   "sourceHandle": "response",
+   "targetHandle": "input3"
+  },
+  {
+   "id": "e25",
+   "source": "result",
+   "target": "out",
+   "sourceHandle": "output",
+   "targetHandle": "result"
+  }
+ ],
+ "oaiyTool": {
+  "name": "image_to_image",
+  "description": "Edit a picture, or combine up to 10 pictures into one, from an instruction (FLUX 3 Klein): the instruction is enhanced by a vision model that sees the pictures, the result is checked (the change made, the rest kept, exact text) and made again, up to 3 tries, until it passes. Pictures takes a list of pictures (data URLs or file references). Returns the picture's file reference and the review's findings."
+ }
+}

@@ -75,8 +75,8 @@ const MAX_CAPTURE: usize = 16 * 1024;
 /// desktop's flows once ([`FlowStore::seed_examples`]), and so in the Flows editor, for the person to run, change or
 /// share with apps.
 pub const EXAMPLES: [(&str, &str); 2] = [
-    ("image-make-edit-review", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/flows/image-make-edit-review.flow.json"))),
-    ("image-make-edit", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/flows/image-make-edit.flow.json"))),
+    ("text-to-image", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/flows/text-to-image.flow.json"))),
+    ("image-to-image", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/flows/image-to-image.flow.json"))),
 ];
 
 /// Where flow files live and how ids map to paths.

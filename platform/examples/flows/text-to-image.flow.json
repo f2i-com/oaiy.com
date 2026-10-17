@@ -1,0 +1,322 @@
+{
+ "name": "Text to image",
+ "description": "A picture from a prompt: the prompt enhanced, the picture made with MOSS-Image (6 steps), checked by a vision model and made again (up to 3 tries) when the check finds a problem, the review's fix added to the prompt. Input: Prompt. Answers the picture's file reference, whether it passed and each try's findings.",
+ "tags": [
+  "image",
+  "example"
+ ],
+ "nodes": [
+  {
+   "id": "prompt",
+   "type": "input_text",
+   "position": {
+    "x": 0,
+    "y": 328
+   },
+   "data": {
+    "label": "Prompt",
+    "value": "A ceramic coffee mug on a wooden desk by a window, morning light, with the words \"GOOD MORNING\" printed on the mug in red letters"
+   }
+  },
+  {
+   "id": "enhance",
+   "type": "ai_llm",
+   "position": {
+    "x": 322,
+    "y": 294
+   },
+   "data": {
+    "label": "Enhance the prompt",
+    "service": "engine:llm",
+    "model": "",
+    "systemPrompt": "You turn a person's picture idea into one detailed English caption for MOSS-Image, a text-to-image model, as OpenMOSS's prompt enhancer does. Describe the visible picture concretely: the subject and what it is doing, its appearance, the setting, the framing, the medium, the lighting, materials, colour palette and mood. Keep every subject, count, relationship, style and exclusion the person asked for; add detail only where it makes the picture more specific, and keep a minimalist request minimalist. Quote any text that should appear in the picture exactly, in its own language, with its line breaks. Where the picture should be clean (a logo, an icon, a product shot), say plainly what must not appear: no other letters or words, no watermark. Write cohesive prose, one or two paragraphs, with no lists, JSON or quality tags. Reply with the caption alone.",
+    "maxTokens": 700,
+    "enableThinking": false
+   }
+  },
+  {
+   "id": "ask",
+   "type": "logic_block",
+   "position": {
+    "x": 644,
+    "y": 18
+   },
+   "data": {
+    "label": "What to check",
+    "code": "// What the reviewer is asked: the person's own request (the caption is how it was put to the model)\nreturn `The person asked for: ${request}\\n\\nThe caption the picture was made from: ${caption}\\n\\nCheck the picture against what the person asked for.`;",
+    "inputCount": 2,
+    "inputNames": [
+     "request",
+     "caption"
+    ]
+   }
+  },
+  {
+   "id": "attempts",
+   "type": "loop_start",
+   "position": {
+    "x": 322,
+    "y": 148
+   },
+   "data": {
+    "label": "Try up to 3 times",
+    "loopName": "tries",
+    "loopMode": "while_true",
+    "iterations": 3
+   }
+  },
+  {
+   "id": "attempt_prompt",
+   "type": "logic_block",
+   "position": {
+    "x": 644,
+    "y": 161
+   },
+   "data": {
+    "label": "This try's prompt",
+    "code": "// The prompt for this try: the enhanced one, and on a retry the last review's fix with it (a model told what to\n// get right this time; the review read as the step before it left it, the loop's last try)\nconst last = nodes.verdict;\nconst fix = attempt > 1 && last && typeof last.fix === 'string' ? last.fix.trim() : '';\nreturn fix ? `${caption}\\n\\n${fix}` : caption;",
+    "inputCount": 2,
+    "inputNames": [
+     "caption",
+     "attempt"
+    ]
+   }
+  },
+  {
+   "id": "make",
+   "type": "image_gen",
+   "position": {
+    "x": 966,
+    "y": 129
+   },
+   "data": {
+    "label": "Make it (MOSS-Image, 6 steps)",
+    "service": "engine:image:moss-image-sft-q4-6-step",
+    "width": 1024,
+    "height": 1024,
+    "seed": "",
+    "release": false
+   }
+  },
+  {
+   "id": "review",
+   "type": "ai_llm",
+   "position": {
+    "x": 1288,
+    "y": 0
+   },
+   "data": {
+    "label": "Review it",
+    "service": "engine:llm",
+    "model": "",
+    "systemPrompt": "You check a picture an image model made against what the person asked for. Reply with JSON alone, no prose and no code fence, in exactly this shape:\n{\"pass\": true or false, \"issues\": [\"each real problem, in a few words\"], \"fix\": \"one sentence saying what the picture must show instead, as an instruction to the painter, or empty\", \"text\": {\"requested\": [each word or phrase the request asks to be written in the picture, exactly as asked: lettering, never the things it shows], \"found\": [each word or phrase you can read in the picture, letter by letter]}}\nPass when the picture shows what was asked: the subjects and how many, any text exactly as asked (read it letter by letter: a wrong, missing or extra letter is an issue), the colours, the setting and the style. Other text is an issue only where it gets in the way: garbled letters on or beside the text asked for, or any text at all on a picture meant to be clean (a logo, an icon, a product shot); the signs and labels a scene would have anyway, and a reflection's mirrored letters, are fine. Detail the request does not mention is not an issue. Fail only for a problem the person would notice. The text lists hold the words alone; leave them empty where there is no text.",
+    "imageInputCount": 1,
+    "maxTokens": 500,
+    "enableThinking": false
+   }
+  },
+  {
+   "id": "verdict",
+   "type": "logic_block",
+   "position": {
+    "x": 1610,
+    "y": 204
+   },
+   "data": {
+    "label": "Pass or try again",
+    "code": "// Pass or try again: the review read from its reply (a reply that is not JSON cannot fail the picture: it is kept\n// as text, the picture passed unchecked), with the picture's file reference. The lettering is checked here too: the\n// reviewer lists what it reads, and each phrase that must be there has to be among it (a small vision model reading\n// a picture is reliable; one judging whether it matches is lenient)\nconst text = String(review == null ? '' : review).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\nconst at = text.indexOf('{'), end = text.lastIndexOf('}');\nlet found = null;\ntry { found = JSON.parse(at >= 0 && end > at ? text.slice(at, end + 1) : text); } catch { found = null; }\nconst checked = !!found && typeof found.pass === 'boolean';\nconst issues = checked && Array.isArray(found.issues) ? found.issues.filter((x) => typeof x === 'string' && x.trim()) : [];\nconst words = (s) => String(s).toUpperCase().replace(/[^A-Z0-9\\u00C0-\\uFFFF]+/g, ' ').trim();\nconst lists = checked && found.text && typeof found.text === 'object' ? found.text : {};\nconst strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && words(x)) : []);\nconst read = ` ${strings(lists.found).map(words).join(' ')} `;\n// (each phrase the caption quotes: the enhancer quotes exactly the lettering the picture must show, the request's own\n// and, for an edit, what the references show that the request leaves alone)\nconst must = [];\nString(caption == null ? '' : caption).replace(/[\"\\u201C]([^\"\\u201D]{1,60})[\"\\u201D]/g, (all, q) => { must.push(q); return all; });\nconst missing = checked ? [...new Set(must.map(words).filter(Boolean))].filter((p) => !read.includes(` ${p} `)) : [];\nfor (const p of missing) issues.push(`the text \"${p}\" is not in the picture`);\nconst fix = [checked && typeof found.fix === 'string' ? found.fix.trim() : '', ...missing.map((p) => `The text \"${p}\" must be written in it, exactly.`)].filter(Boolean).join(' ');\nreturn {\n  pass: checked ? found.pass === true && missing.length === 0 : true,\n  checked,\n  attempt,\n  image: (made && made.file) || image,\n  seed: made && made.seed != null ? made.seed : null,\n  issues,\n  fix,\n  text: checked ? { requested: strings(lists.requested), quoted: must, found: strings(lists.found), missing } : null,\n  review: checked ? null : text,\n};",
+    "inputCount": 5,
+    "inputNames": [
+     "review",
+     "made",
+     "image",
+     "attempt",
+     "caption"
+    ]
+   }
+  },
+  {
+   "id": "done",
+   "type": "loop_end",
+   "position": {
+    "x": 1932,
+    "y": 22
+   },
+   "data": {
+    "label": "Until it passes",
+    "stopCondition": "json_field",
+    "stopField": "pass",
+    "stopValue": "true"
+   }
+  },
+  {
+   "id": "result",
+   "type": "logic_block",
+   "position": {
+    "x": 2254,
+    "y": 430
+   },
+   "data": {
+    "label": "The result",
+    "code": "// The flow's answer: the picture (its file's URL, never the picture itself), whether it passed, and each try's\n// findings. The first try that passed, else the try with the fewest issues (the latest of those).\nconst tries = Array.isArray(attempts) ? attempts.filter((t) => t && typeof t === 'object') : [];\nlet best = tries.find((t) => t.pass) || null;\nif (!best) for (const t of tries) if (!best || t.issues.length <= best.issues.length) best = t;\nreturn {\n  image: best ? best.image : null,\n  pass: !!(best && best.pass),\n  checked: !!(best && best.checked),\n  tries: tries.length,\n  issues: best ? best.issues : [],\n  text: best ? best.text : null,\n  prompt,\n  caption,\n  attempts: tries.map((t) => ({ image: t.image, pass: t.pass, issues: t.issues, seed: t.seed })),\n};",
+    "inputCount": 3,
+    "inputNames": [
+     "attempts",
+     "prompt",
+     "caption"
+    ]
+   }
+  },
+  {
+   "id": "out",
+   "type": "output",
+   "position": {
+    "x": 2576,
+    "y": 426
+   },
+   "data": {
+    "label": "Result",
+    "outputType": "json"
+   }
+  }
+ ],
+ "edges": [
+  {
+   "id": "e1",
+   "source": "prompt",
+   "target": "enhance",
+   "sourceHandle": "text",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e2",
+   "source": "prompt",
+   "target": "ask",
+   "sourceHandle": "text",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e3",
+   "source": "enhance",
+   "target": "ask",
+   "sourceHandle": "response",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e4",
+   "source": "attempts",
+   "target": "done",
+   "sourceHandle": "loop",
+   "targetHandle": "loop"
+  },
+  {
+   "id": "e5",
+   "source": "enhance",
+   "target": "attempt_prompt",
+   "sourceHandle": "response",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e6",
+   "source": "attempts",
+   "target": "attempt_prompt",
+   "sourceHandle": "item",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e7",
+   "source": "attempt_prompt",
+   "target": "make",
+   "sourceHandle": "output",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e8",
+   "source": "ask",
+   "target": "review",
+   "sourceHandle": "output",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e9",
+   "source": "make",
+   "target": "review",
+   "sourceHandle": "image",
+   "targetHandle": "image"
+  },
+  {
+   "id": "e10",
+   "source": "review",
+   "target": "verdict",
+   "sourceHandle": "response",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e11",
+   "source": "make",
+   "target": "verdict",
+   "sourceHandle": "info",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e12",
+   "source": "make",
+   "target": "verdict",
+   "sourceHandle": "image",
+   "targetHandle": "input3"
+  },
+  {
+   "id": "e13",
+   "source": "attempts",
+   "target": "verdict",
+   "sourceHandle": "item",
+   "targetHandle": "input4"
+  },
+  {
+   "id": "e14",
+   "source": "enhance",
+   "target": "verdict",
+   "sourceHandle": "response",
+   "targetHandle": "input5"
+  },
+  {
+   "id": "e15",
+   "source": "verdict",
+   "target": "done",
+   "sourceHandle": "output",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e16",
+   "source": "done",
+   "target": "result",
+   "sourceHandle": "results",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e17",
+   "source": "prompt",
+   "target": "result",
+   "sourceHandle": "text",
+   "targetHandle": "input2"
+  },
+  {
+   "id": "e18",
+   "source": "enhance",
+   "target": "result",
+   "sourceHandle": "response",
+   "targetHandle": "input3"
+  },
+  {
+   "id": "e19",
+   "source": "result",
+   "target": "out",
+   "sourceHandle": "output",
+   "targetHandle": "result"
+  }
+ ],
+ "oaiyTool": {
+  "name": "text_to_image",
+  "description": "Make a picture from a description: the prompt is enhanced, the picture made with MOSS-Image, then a vision model checks it (exact text, colours, objects, composition) and it is made again, up to 3 tries, until it passes. Returns the picture's file reference and the review's findings."
+ }
+}

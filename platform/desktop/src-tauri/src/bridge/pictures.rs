@@ -167,17 +167,28 @@ pub fn data_url(text: &str) -> Option<(Vec<u8>, &str)> {
     Some((bytes, mime))
 }
 
-/// A flow's inputs with each picture given inline (a data URL of [`BY_REFERENCE_FROM`] or more, at the top level)
-/// stored with the engines first and replaced by its reference: a flow hands a picture from step to step by its
-/// address, and a few MB of one inline is more than one step's call may carry (4 MiB). `upload` stores one and
-/// answers its reference.
+/// A flow's inputs with each picture given inline (a data URL of [`BY_REFERENCE_FROM`] or more, an input's value or
+/// one of a list's, as an image-to-image flow takes its pictures) stored with the engines first and replaced by its
+/// reference: a flow hands a picture from step to step by its address, and a few MB of one inline is more than one
+/// step's call may carry (4 MiB). `upload` stores one and answers its reference.
 pub fn by_reference(inputs: &mut Value, upload: &dyn Fn(&[u8], &str) -> Result<String, String>) -> Result<(), String> {
     let Some(fields) = inputs.as_object_mut() else { return Ok(()) };
-    for (name, value) in fields.iter_mut() {
-        let Some(text) = value.as_str().filter(|t| t.len() >= BY_REFERENCE_FROM) else { continue };
-        let Some((bytes, mime)) = data_url(text) else { continue };
+    let one = |name: &str, value: &mut Value| -> Result<(), String> {
+        let Some(text) = value.as_str().filter(|t| t.len() >= BY_REFERENCE_FROM) else { return Ok(()) };
+        let Some((bytes, mime)) = data_url(text) else { return Ok(()) };
         let reference = upload(&bytes, mime).map_err(|e| format!("the picture in {name} could not be handed to the engines: {e}"))?;
         *value = Value::String(reference);
+        Ok(())
+    };
+    for (name, value) in fields.iter_mut() {
+        match value {
+            Value::Array(list) => {
+                for (i, item) in list.iter_mut().enumerate() {
+                    one(&format!("{name} ({})", i + 1), item)?;
+                }
+            }
+            _ => one(name, value)?,
+        }
     }
     Ok(())
 }
@@ -303,6 +314,14 @@ mod tests {
         let mut again = json!({"Picture": inline});
         let err = by_reference(&mut again, &|_: &[u8], _: &str| Err("engines stopped".to_string())).unwrap_err();
         assert!(err.contains("Picture") && err.contains("engines stopped"), "{err}");
+        // a list's pictures each (an image-to-image flow's), the rest of the list as it is
+        let mut list = json!({"Pictures": [inline, "http://example.com/b.png", small, inline]});
+        by_reference(&mut list, &upload).unwrap();
+        assert_eq!(list["Pictures"], json!(["http://127.0.0.1:1/api/ai/engine/gateway/files/inputs/ref_a.png", "http://example.com/b.png", small, "http://127.0.0.1:1/api/ai/engine/gateway/files/inputs/ref_a.png"]));
+        assert_eq!(seen.borrow().len(), 3);
+        let mut broken = json!({"Pictures": ["a", inline]});
+        let err = by_reference(&mut broken, &|_: &[u8], _: &str| Err("engines stopped".to_string())).unwrap_err();
+        assert!(err.contains("Pictures (2)"), "{err}");
     }
 
     #[test]
