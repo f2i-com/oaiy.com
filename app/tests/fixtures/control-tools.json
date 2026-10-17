@@ -1,5 +1,5 @@
 {
- "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (649ccd1): all of them for a project or setup session; the runner session is offered the read tools named in runner; network_status and ui_open's network page added since, as tools.rs declares them.",
+ "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (649ccd1): all of them for a project or setup session; the runner session is offered the read tools named in runner; network_status and ui_open's network page added since, and model_set_default taking a worker's model, as tools.rs declares them.",
  "tools": [
   {
    "annotations": {
@@ -76,7 +76,7 @@
     "readOnlyHint": false,
     "title": "Choose a model"
    },
-   "description": "Choose the model a group of the engine uses: model is one of the group's installed models from models_list (not a catalog id). The engines refuse a model the group does not have. Restart the language model (engine_restart) for an llm change to take effect now.",
+   "description": "Choose the model a group of the engine uses: model is one of the group's installed models from models_list (not a catalog id), or a paired worker's model of that group by its id as network_status lists it (engine:<group>:node.<nodeId>/<model>, OAIY Network: this computer's default then runs on that worker). The engines refuse a model the group does not have. Restart the language model (engine_restart) for an llm change to take effect now.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
@@ -94,7 +94,7 @@
       "type": "string"
      },
      "model": {
-      "description": "An installed model of that group, by the name models_list shows.",
+      "description": "An installed model of that group, by the name models_list shows, or a paired worker's by its id (network_status).",
       "minLength": 1,
       "type": "string"
      }

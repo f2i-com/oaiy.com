@@ -107,10 +107,10 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "How the engine's model downloads stand: each with its status, percent done, speed and any error.",
                 none()),
             def("model_set_default", "Choose a model", Change,
-                "Choose the model a group of the engine uses: model is one of the group's installed models from models_list (not a catalog id). The engines refuse a model the group does not have. Restart the language model (engine_restart) for an llm change to take effect now.",
+                "Choose the model a group of the engine uses: model is one of the group's installed models from models_list (not a catalog id), or a paired worker's model of that group by its id as network_status lists it (engine:<group>:node.<nodeId>/<model>, OAIY Network: this computer's default then runs on that worker). The engines refuse a model the group does not have. Restart the language model (engine_restart) for an llm change to take effect now.",
                 object(json!({
                     "group": { "type": "string", "enum": choosable, "description": "The engine group." },
-                    "model": { "type": "string", "minLength": 1, "description": "An installed model of that group, by the name models_list shows." }
+                    "model": { "type": "string", "minLength": 1, "description": "An installed model of that group, by the name models_list shows, or a paired worker's by its id (network_status)." }
                 }), &["group", "model"])),
             def("model_download", "Download a model", Change,
                 "Start downloading a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list); it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: check size and memory need first.",
@@ -505,7 +505,17 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
         "model_download_status" => model_download_status(d).await,
         "model_set_default" => {
             let (group, model) = (a.req("group"), a.req("model"));
+            let mut on_worker = serde_json::Map::new();
+            // (a paired worker's model, OAIY Network: this computer's default of its group, kept by the network's settings)
+            if model.starts_with(&format!("engine:{group}:node.")) {
+                on_worker.insert(group.to_string(), json!(model));
+                d.put("/api/network/settings", json!({ "defaults": on_worker })).await?;
+                return done(format!("The {group} group now uses {model}, on a paired computer."), json!({ "group": group, "model": model }));
+            }
             d.put("/api/engines/defaults", json!({ "group": group, "model": model })).await?;
+            // (this computer's own model chosen: a worker's that was the group's default is not any more)
+            on_worker.insert(group.to_string(), Value::Null);
+            let _ = d.put("/api/network/settings", json!({ "defaults": on_worker })).await;
             let later = if group == "llm" { " It loads when the language model next starts (engine_restart to load it now)." } else { "" };
             done(format!("The {group} group now uses {model}.{later}"), json!({ "group": group, "model": model }))
         }

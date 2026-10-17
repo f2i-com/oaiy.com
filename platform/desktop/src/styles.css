@@ -1955,3 +1955,34 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .network-more > summary:hover { color: var(--text); }
 .network-more[open] > summary { margin-bottom: 4px; }
+
+/* Engines → Other computers: each kind's default (this computer's own, or a worker's model), then each worker's
+   models by kind with Make default. */
+.engine-defaults { display: flex; flex-direction: column; gap: 2px; border-top: 1px solid var(--border); padding-top: 10px; }
+.engine-default { display: flex; min-height: 34px; align-items: center; gap: 10px; min-width: 0; padding: 3px 0; }
+.engine-default + .engine-default { border-top: 1px dashed var(--border); }
+.engine-default .btn-tiny { flex: none; margin-left: auto; height: 26px; }
+.engine-default-which { display: flex; min-width: 0; flex: 1; align-items: center; flex-wrap: wrap; gap: 4px 8px; font-size: 12px; }
+.engine-default-which > svg { flex: none; color: var(--muted); }
+.engine-default-which code { border: 0; background: transparent; color: var(--text); padding: 0; font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; overflow-wrap: anywhere; }
+.engine-default-warn { display: inline-flex; align-items: center; gap: 4px; color: var(--amber); font-size: 11.5px; }
+.engine-default-chip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border));
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  padding: 1px 8px;
+  font-size: 10.5px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.network-model .engine-default-chip { margin-left: auto; }
+.network-model-name .engine-default-chip { margin-left: 0; }
+.network-model.is-default { background: color-mix(in srgb, var(--primary-soft) 60%, transparent); }
+.engine-worker-devices { margin-top: 0; }
+.engine-worker-kind { display: flex; flex-direction: column; gap: 2px; border-top: 1px solid var(--border); padding-top: 9px; }
+.engine-worker-kind > .settings-label { margin-bottom: 3px; }

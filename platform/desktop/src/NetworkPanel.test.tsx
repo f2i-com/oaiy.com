@@ -167,6 +167,17 @@ describe('NetworkPanel', () => {
     expect(api.pin).toHaveBeenCalledWith('w1', 'engine:image:node.w1/klein');
   });
 
+  it("marks a worker's model that is this computer's default, listed with the loaded ones", async () => {
+    api.status.mockResolvedValue({ ...primary, defaults: { image: { id: 'engine:image:node.w1/klein', nodeId: 'w1', nodeName: 'Rig', model: 'klein' } } });
+    const klein = { id: 'engine:image:node.w1/klein', kind: 'image', model: 'klein', state: 'not loaded', device: null, pinned: false };
+    api.nodes.mockResolvedValue({ nodes: [{ ...node, models: [node.models[0], klein] }] });
+    await mount();
+    const card = container.querySelector('[data-testid="network-node"]')!;
+    const row = Array.from(card.querySelectorAll('.network-model')).find((r) => r.textContent?.includes('klein'))!;
+    expect(row.textContent).toContain('Default');
+    expect(row.closest('details')).toBeNull();
+  });
+
   it('withdraws a pairing it stops waiting for, so the worker no longer shows it', async () => {
     vi.useFakeTimers();
     api.status.mockResolvedValue(primary);

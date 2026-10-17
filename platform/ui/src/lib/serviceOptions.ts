@@ -77,7 +77,7 @@ export function serviceOptions(
     if (!def) return;
     options.push({
       value: `engine:${kind}`,
-      label: `Default ${KIND_NAME[kind] ?? `${kind} model`} (${def.model || def.name})`,
+      label: `Default ${KIND_NAME[kind] ?? `${kind} model`} (${def.nodeId ? `${def.model} on ${def.nodeName || 'a paired computer'}` : def.model || def.name})`,
       description: 'Follows the default set in OAIY → Engines',
       group: GROUP_ENGINE,
     });

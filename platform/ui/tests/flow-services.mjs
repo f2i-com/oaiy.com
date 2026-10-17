@@ -539,10 +539,15 @@ await check("a paired worker's model (OAIY Network) keeps its node, goes to it, 
   // its language model, unlisted (a headless run): to that worker, never this computer's
   assert.equal(M.engineChatService('engine:llm:node.abc123/qwen').endpoint, '/api/network/nodes/abc123/v1/chat/completions');
   assert.equal(M.engineChatService('engine:llm').endpoint, '/api/ai/providers/oaiy-engine/v1/chat/completions');
-  // never a kind's default, even with no model of this computer's for it
+  // never a kind's default unless chosen as one, even with no model of this computer's for it
   assert.equal(M.engineDefault([mapped], 'image'), null);
   const local = { ...mapped, id: 'engine:image:qwen', model: 'qwen', nodeId: undefined, default: false };
   assert.equal(M.engineDefault([mapped, local], 'image').id, 'engine:image:qwen');
+  // chosen as this computer's default (the desktop marks it): the kind's default, named with its computer
+  const chosen = { ...mapped, default: true, ready: true, nodeTypes: ['image_gen'] };
+  assert.equal(M.engineDefault([{ ...local, default: false }, chosen], 'image').id, 'engine:image:node.abc123/flux');
+  const withDefault = M.serviceOptions('image_gen', env({ desktop: [{ ...local, nodeTypes: ['image_gen'] }, chosen] }), () => {});
+  assert.ok(withDefault.some((o) => o.value === 'engine:image' && o.label === 'Default picture model (flux on Rig)'), JSON.stringify(withDefault));
   const options = M.serviceOptions('image_gen', env({ desktop: [mapped, { ...local, nodeTypes: ['image_gen'] }].map((x) => ({ ...x, nodeTypes: ['image_gen'] })) }), () => {});
   assert.ok(options.some((o) => o.label === 'Image · flux · Rig (offline)'), JSON.stringify(options));
 });

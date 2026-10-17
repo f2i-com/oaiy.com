@@ -222,16 +222,25 @@ async fn list(State(st): State<AiState>) -> Response {
         Ok((_, discovery)) => {
             let mut services = services_from_discovery(&discovery);
             services.extend(voice);
-            // (and the models of the workers paired over OAIY Network, under node-scoped ids: crate::network)
+            // (and the models of the workers paired over OAIY Network, under node-scoped ids, a worker's model the
+            // default of its kind where one is chosen so: crate::network)
             services.extend(crate::network::remote_services());
+            crate::network::apply_defaults(&mut services);
             Json(json!({ "running": true, "services": services })).into_response()
         }
         Err(reason) => {
             let mut services = voice;
             services.extend(crate::network::remote_services());
+            crate::network::apply_defaults(&mut services);
             Json(json!({ "running": false, "reason": reason, "services": services })).into_response()
         }
     }
+}
+
+/// This computer's own engine's models as flow services, as `GET /api/ai/engine/services` lists them (empty where the
+/// engines do not answer): OAIY Network keeps the default of a kind beside a worker's chosen in its place.
+pub(crate) async fn local_catalogue(st: &AiState) -> Vec<Value> {
+    engine_discovery(st).await.map(|(_, d)| services_from_discovery(&d)).unwrap_or_default()
 }
 
 fn voice_installed(st: &AiState) -> bool {

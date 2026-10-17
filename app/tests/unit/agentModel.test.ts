@@ -163,6 +163,18 @@ describe('the provider each kind of conversation runs on', () => {
     expect(providerFor('project', choice, ENGINE_PROVIDER, null, null)).toBe(ENGINE_PROVIDER);
   });
 
+  it("on the engine, where a paired worker's language model is the engine's default (OAIY Network): that worker, through the desktop", () => {
+    const body = { model: { source: 'engine' }, engineDefault: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m', engineDefaultName: 'Rig' };
+    const choice = parseAgentModel(body)!;
+    expect(choice).toEqual({ source: 'engine', model: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m', name: 'Rig' });
+    expect(providerFor('project', choice, ENGINE_PROVIDER, DESK, null)!.baseUrl).toBe(`${DESK.origin}/api/network/nodes/abc123/v1`);
+    // the default back on this computer: the engine's own again, and a change the Agent sees
+    expect(parseAgentModel({ model: { source: 'engine' } })).toEqual(ENGINE);
+    expect(sameModel(choice, ENGINE)).toBe(false);
+    // (only a worker's language model: anything else named so is the engine's own)
+    expect(parseAgentModel({ model: { source: 'engine' }, engineDefault: 'engine:image:node.abc123/flux' })).toEqual(ENGINE);
+  });
+
   it("on ChatGPT with no model named: Codex's default, once it is known (and until then, none: the run looks it up first)", () => {
     expect(providerFor('setup', { source: 'chatgpt' }, ENGINE_PROVIDER, DESK, 'gpt-5.5')!.modelId).toBe('gpt-5.5');
     expect(providerFor('setup', { source: 'chatgpt' }, ENGINE_PROVIDER, DESK, null)!.modelId).toBe('');

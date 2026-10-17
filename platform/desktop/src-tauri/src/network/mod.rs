@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use self::identity::Identity;
 use self::store::{Peers, Role, Settings};
 
-pub use primary::{remote_services, router};
+pub use primary::{apply_defaults, chat_on_worker, default_chat_entry, remote_services, router};
 
 /// The protocol a worker and a primary speak (`/worker/v1`).
 pub const PROTOCOL: u32 = 2;
@@ -73,6 +73,8 @@ pub(crate) struct Inner {
     nodes: Mutex<HashMap<String, primary::NodeState>>,
     /// Workers unpaired here that did not answer then: told when they do (while this computer runs).
     untold: Mutex<Vec<store::Peer>>,
+    /// A primary's engine defaults on its workers, by kind.
+    defaults: Mutex<store::Defaults>,
     /// Workers advertised on the LAN (mDNS), by node id.
     found: Arc<Mutex<HashMap<String, discovery::Found>>>,
     running: Mutex<Running>,
@@ -111,6 +113,7 @@ impl Network {
             inner: Arc::new(Inner {
                 settings: Mutex::new(Settings::load(&dir)),
                 peers: Mutex::new(Peers::open(&dir)),
+                defaults: Mutex::new(store::Defaults::open(&dir)),
                 dir,
                 ai,
                 identity: Mutex::new(None),
@@ -288,6 +291,10 @@ impl Drop for Inner {
 impl Inner {
     pub(crate) fn peers(&self) -> MutexGuard<'_, Peers> {
         lock(&self.peers)
+    }
+
+    pub(crate) fn defaults(&self) -> MutexGuard<'_, store::Defaults> {
+        lock(&self.defaults)
     }
 }
 

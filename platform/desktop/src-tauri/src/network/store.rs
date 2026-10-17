@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const PEERS_FILE: &str = "peers.json";
+pub const DEFAULTS_FILE: &str = "defaults.json";
 
 /// The port a worker listens on unless set (the desktop's API is 17972, its voice gateway 17872).
 pub const DEFAULT_PORT: u16 = 17975;
@@ -145,6 +146,74 @@ fn save(path: &Path, list: &[Peer]) -> Result<(), String> {
         crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
     }
     crate::secret_file::write(path, serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// A paired worker's model chosen as this computer's engine default for its kind (a primary's), with this computer's
+/// own default for the kind then: one chosen here since, in Engines, takes its place again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerDefault {
+    /// Its id in the engine catalogue (`engine:<kind>:node.<nodeId>/<model>`).
+    pub id: String,
+    #[serde(default)]
+    pub instead_of: Option<String>,
+}
+
+impl WorkerDefault {
+    /// The worker it is on.
+    pub fn node_id(&self) -> &str {
+        self.id.split_once(":node.").and_then(|(_, rest)| rest.split_once('/')).map_or("", |(node, _)| node)
+    }
+}
+
+/// The engine defaults on a worker, by kind, kept in `defaults.json`.
+#[derive(Debug)]
+pub struct Defaults {
+    path: PathBuf,
+    map: std::collections::BTreeMap<String, WorkerDefault>,
+}
+
+impl Defaults {
+    pub fn open(dir: &Path) -> Defaults {
+        let path = dir.join(DEFAULTS_FILE);
+        let map = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        Defaults { path, map }
+    }
+
+    pub fn all(&self) -> &std::collections::BTreeMap<String, WorkerDefault> {
+        &self.map
+    }
+
+    pub fn get(&self, kind: &str) -> Option<&WorkerDefault> {
+        self.map.get(kind)
+    }
+
+    /// `kind`'s default on a worker (`None`: this computer's own again), in effect once it is kept.
+    pub fn set(&mut self, kind: &str, chosen: Option<WorkerDefault>) -> Result<(), String> {
+        let mut next = self.map.clone();
+        match chosen {
+            Some(d) => next.insert(kind.to_string(), d),
+            None => next.remove(kind),
+        };
+        if next == self.map {
+            return Ok(());
+        }
+        if let Some(dir) = self.path.parent() {
+            crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
+        }
+        crate::secret_file::write(&self.path, serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        self.map = next;
+        Ok(())
+    }
+
+    /// The defaults on `node_id` let go (it was unpaired): this computer's own again.
+    pub fn drop_node(&mut self, node_id: &str) -> Result<(), String> {
+        let kinds: Vec<String> = self.map.iter().filter(|(_, d)| d.node_id() == node_id).map(|(k, _)| k.clone()).collect();
+        for kind in kinds {
+            self.set(&kind, None)?;
+        }
+        Ok(())
+    }
 }
 
 pub fn now_ms() -> u64 {

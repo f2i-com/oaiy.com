@@ -267,6 +267,60 @@ async fn a_worker_unpaired_while_off_is_told_when_it_is_back() {
     }
 }
 
+/// A worker's model chosen as this computer's default of its kind: the catalogue marks it its kind's default (this
+/// computer's own not), the engine's chats go to the worker for a language model, one chosen in Engines since takes
+/// its place again, and unpairing the worker lets it go.
+#[tokio::test]
+async fn a_workers_model_can_be_this_computers_default() {
+    let worker = node("worker-default", Role::Worker, Some(fake_engines().await)).await;
+    let primary = node("primary-default", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let image = format!("engine:image:node.{node_id}/tiny-image");
+    let set = |defaults: Value| call(&p, "PUT", "/api/network/settings", Some(json!({ "defaults": defaults })));
+    let (status, v) = set(json!({ "image": image })).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!((&v["defaults"]["image"]["model"], &v["defaults"]["image"]["nodeName"]), (&json!("tiny-image"), &json!("the worker-default")), "{v}");
+    assert!(primary.listening().is_none() && v["enabled"] == true, "only the defaults changed: {v}");
+    // this computer's own picture model (its engines answering now) and the worker's, as the catalogue lists them
+    let catalogue = || {
+        let mut services = vec![json!({ "id": "engine:image:qwen", "kind": "image", "model": "qwen", "default": true }), json!({ "id": "engine:llm:flash", "kind": "llm", "model": "flash", "default": true })];
+        services.extend(primary::remote_services_of(&primary));
+        primary::apply_defaults_of(&primary, &mut services);
+        services
+    };
+    let services = catalogue();
+    let default_of = |kind: &str| services.iter().filter(|s| s["kind"] == kind && s["default"] == true).map(|s| s["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(default_of("image"), vec![image.clone()], "the worker's picture model is the default, this computer's not");
+    assert_eq!(default_of("llm"), vec!["engine:llm:flash".to_string()], "a kind with no default chosen on a worker keeps its own");
+    // (this computer's default then is kept beside it, learnt once its engines answered)
+    assert_eq!(primary.inner().defaults().get("image").unwrap().instead_of.as_deref(), Some("qwen"));
+    for bad in [json!({ "image": format!("engine:llm:node.{node_id}/tiny-llm") }), json!({ "image": "engine:image:node.nobody/tiny-image" }), json!({ "image": format!("engine:image:node.{node_id}/gone") })] {
+        let (status, v) = set(bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    // the language model: the worker's chosen one answers the engine's chats
+    let (status, _) = set(json!({ "llm": format!("engine:llm:node.{node_id}/tiny-llm") })).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = primary::default_chat_entry_of(&primary, Some("flash")).unwrap();
+    assert_eq!(entry["nodeId"], json!(node_id));
+    let answer = primary::chat_on(&primary, &node_id, axum::body::Bytes::from(json!({ "stream": true, "messages": [{"role": "user", "content": "hi"}] }).to_string())).await;
+    let text = String::from_utf8(axum::body::to_bytes(answer.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+    assert!(text.contains("Hel"), "{text}");
+    // another language model chosen here since, in Engines: this computer's own again
+    assert!(primary::default_chat_entry_of(&primary, Some("big")).is_none());
+    assert!(primary.inner().defaults().get("llm").is_none());
+    // let go by hand, and with the worker unpaired
+    let (_, v) = set(json!({ "image": null })).await;
+    assert!(v["defaults"].get("image").is_none(), "{v}");
+    set(json!({ "image": image })).await;
+    call(&p, "DELETE", &format!("/api/network/nodes/{node_id}"), None).await;
+    assert!(primary.inner().defaults().all().is_empty(), "unpaired: none left on it");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
 /// A worker saved again while it listens (renamed) keeps its port: the listener before it has let the port go first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_saved_again_listens_on_the_same_port() {

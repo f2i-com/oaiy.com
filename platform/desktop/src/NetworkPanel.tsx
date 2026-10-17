@@ -103,6 +103,7 @@ export default function NetworkPanel() {
         <PairedComputers
           nodes={nodes}
           role={status.role}
+          defaults={status.defaults}
           onChanged={refresh}
           onUnpair={async (n) => {
             if (!window.confirm(`Unpair ${n.name}? It can no longer ${status.role === 'primary' ? 'lend its models to this computer' : 'use this computer'} until you pair again.`)) return;
@@ -518,18 +519,21 @@ function FindWorkers({ found, discovery, onPaired }: { found: NetworkFound[]; di
 }
 
 /** A worker's own GPU (`this computer`, where its language model runs) is the one that shares its memory. */
-function deviceName(n: NetworkNode, device: string | null): string | null {
+export function deviceName(n: NetworkNode, device: string | null): string | null {
   if (!device) return null;
-  const named = n.devices.find((d) => d.id === device) ?? (device === 'this computer' ? n.devices.find((d) => d.unified) : undefined);
-  return named?.name ?? (device === 'this computer' ? `${n.name}’s own GPU` : device);
+  // (a GPU by its id; else one its engine's own words name, "on WebGPU on Apple M5 Pro (Metal, …)"; else its own GPU)
+  const named = n.devices.find((d) => d.id === device) ?? n.devices.find((d) => device.includes(d.name));
+  if (named) return named.name;
+  if (device === 'this computer' || device.length > 24) return n.devices.find((d) => d.unified)?.name ?? `${n.name}’s own GPU`;
+  return device;
 }
 
 /** What can be pinned on a worker: its picture models, and its language model once it is the one chosen there (one
  * pinned can be unpinned, loaded or not). */
 const pinnable = (m: NetworkModel) => m.kind === 'image' || (m.kind === 'llm' && (m.state !== 'not loaded' || m.pinned));
 
-const KIND: Record<string, string> = { llm: 'Text', image: 'Picture', video: 'Video', speech: 'Speech', music: 'Music', sound: 'Sound', vision: 'Vision', embedding: 'Embedding' };
-const STATE: Record<string, { label: string; tone: 'ok' | 'busy' | 'idle' | 'off' }> = {
+export const KIND: Record<string, string> = { llm: 'Text', image: 'Picture', video: 'Video', speech: 'Speech', music: 'Music', sound: 'Sound', model3d: '3D', vision: 'Vision', embedding: 'Embedding' };
+export const STATE: Record<string, { label: string; tone: 'ok' | 'busy' | 'idle' | 'off' }> = {
   ready: { label: 'Ready', tone: 'ok' },
   kept: { label: 'Loaded', tone: 'ok' },
   in_use: { label: 'Working', tone: 'busy' },
@@ -541,11 +545,16 @@ const STATE: Record<string, { label: string; tone: 'ok' | 'busy' | 'idle' | 'off
 const PIN_STATE: Record<string, string> = { warming: 'Pinned · loading', ready: 'Pinned', failed: 'Pinned · could not load', waiting: 'Pinned · waiting to load' };
 
 /** A worker's models: the pinned and loaded ones, then the rest it can load, folded away. Each can be pinned there. */
-function NodeModels({ node, onChanged }: { node: NetworkNode; onChanged: () => void }) {
+function NodeModels({ node, onChanged, defaults }: { node: NetworkNode; onChanged: () => void; defaults: NetworkStatus['defaults'] }) {
+  /** This computer's default of its kind (Engines → Other computers); a worker's language model, whichever it runs. */
+  const isDefault = (m: NetworkModel) => {
+    const d = defaults?.[m.kind];
+    return !!d && (m.kind === 'llm' ? d.nodeId === node.nodeId : d.id === m.id);
+  };
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const loaded = node.models.filter((m) => m.state !== 'not loaded' || m.pinned);
-  const rest = node.models.filter((m) => m.state === 'not loaded' && !m.pinned);
+  const loaded = node.models.filter((m) => m.state !== 'not loaded' || m.pinned || isDefault(m));
+  const rest = node.models.filter((m) => m.state === 'not loaded' && !m.pinned && !isDefault(m));
   const toggle = async (m: NetworkModel) => {
     setBusy(m.id);
     setError(null);
@@ -569,6 +578,11 @@ function NodeModels({ node, onChanged }: { node: NetworkNode; onChanged: () => v
           <code>{m.model}</code>
           {node.online && (m.state !== 'not loaded' || m.pinned) && <span className={`network-state network-state-${state.tone}`}>{state.label}</span>}
           {where && <span className="network-where">on {where}</span>}
+          {isDefault(m) && (
+            <span className="engine-default-chip" title="This computer's default of its kind (Engines → Other computers)">
+              <Check size={11} aria-hidden /> Default
+            </span>
+          )}
           {m.pinned && (
             <span className={`network-pinned${pinState === 'failed' ? ' is-failed' : ''}`}>
               <Pin size={11} aria-hidden /> {PIN_STATE[pinState] ?? 'Pinned'}
@@ -612,7 +626,7 @@ function NodeModels({ node, onChanged }: { node: NetworkNode; onChanged: () => v
 const gb = (mb: number) => `${(mb / 1024).toFixed(1)}`;
 
 /** A GPU of a worker: its memory in use as a meter, and how busy it is (not while the worker does not answer). */
-function Device({ d, live }: { d: NetworkDevice; live: boolean }) {
+export function Device({ d, live }: { d: NetworkDevice; live: boolean }) {
   const total = typeof d.memory_total_mb === 'number' && d.memory_total_mb > 0 ? d.memory_total_mb : null;
   const used = typeof d.memory_used_mb === 'number' ? d.memory_used_mb : null;
   const share = total && used !== null ? Math.min(100, Math.max(0, (used / total) * 100)) : null;
@@ -654,11 +668,13 @@ function queueText(q: NetworkNode['queue']): string | null {
 function PairedComputers({
   nodes,
   role,
+  defaults,
   onUnpair,
   onChanged,
 }: {
   nodes: NetworkNode[];
   role: NetworkRole;
+  defaults: NetworkStatus['defaults'];
   onUnpair: (n: NetworkNode) => void;
   onChanged: () => void;
 }) {
@@ -717,7 +733,7 @@ function PairedComputers({
                       ))}
                     </div>
                   )}
-                  {n.models.length > 0 && <NodeModels node={n} onChanged={onChanged} />}
+                  {n.models.length > 0 && <NodeModels node={n} onChanged={onChanged} defaults={defaults} />}
                 </div>
               </div>
             );
@@ -725,7 +741,10 @@ function PairedComputers({
         </div>
       )}
       {role === 'primary' && nodes.length > 0 && (
-        <p className="form-hint">A worker’s models are listed in Engines and in Flows’ model menus, named with the worker, and run on the worker.</p>
+        <p className="form-hint">
+          A worker’s models are listed in Flows’ model menus, named with the worker, and run on the worker; Engines → Other computers makes one this
+          computer’s default of its kind.
+        </p>
       )}
     </section>
   );

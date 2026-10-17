@@ -37,6 +37,7 @@ import { useWaitingRequests } from './calendarRequests';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
 import NetworkPanel from './NetworkPanel';
+import EngineWorkersPanel from './EngineWorkersPanel';
 import ModelsPanel from './ModelsPanel';
 import PythonPanel from './PythonPanel';
 import PluginsPanel from './PluginsPanel';
@@ -98,6 +99,8 @@ type BuiltinView =
   | 'services'
   /** OAIY Network: other OAIY computers on the LAN, paired, and their GPUs and models. */
   | 'network'
+  /** Engines → Other computers: the paired workers' models, and which is this computer's default of its kind. */
+  | 'engine-workers'
   | 'plugins'
   | 'runs'
   | 'models'
@@ -134,7 +137,7 @@ const SECTIONS: Section[] = [
   { id: 'contacts', label: 'Contacts', icon: BookUser, group: 'Work', tabs: ['contacts'] },
   { id: 'messages', label: 'Messages', icon: Inbox, group: 'Work', tabs: ['messages'] },
   { id: 'transfers', label: 'Transfers', icon: PhoneForwarded, group: 'Work', tabs: ['transfers'] },
-  { id: 'engines', label: 'Engines', icon: Cpu, group: 'Setup', tabs: ['engines', 'models'] },
+  { id: 'engines', label: 'Engines', icon: Cpu, group: 'Setup', tabs: ['engines', 'engine-workers', 'models'] },
   { id: 'services', label: 'Services', icon: Server, group: 'Setup', tabs: ['services', 'python'] },
   { id: 'network', label: 'Networking', icon: Network, group: 'Setup', tabs: ['network'] },
   { id: 'connections', label: 'Connections', icon: Plug, group: 'Setup', tabs: ['connections', 'providers', 'plugins'] },
@@ -197,6 +200,11 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
     tab: 'Engines',
     icon: Cpu,
     copy: 'The language, picture, video, speech, music and 3D models this machine runs, and their endpoints.',
+  },
+  'engine-workers': {
+    tab: 'Other computers',
+    icon: Network,
+    copy: 'The models of the computers paired over OAIY Network, and which of them this machine uses by default.',
   },
   models: { tab: 'Model files', icon: Package, copy: 'Download weights from Hugging Face and manage what is on disk.' },
   services: { tab: 'Services', icon: Server, copy: 'Start, stop and install the local AI services this machine offers OAIY.' },
@@ -871,6 +879,7 @@ export default function App() {
             )}
             {view === 'services' && <ServicesPanel />}
             {view === 'network' && <NetworkPanel />}
+            {view === 'engine-workers' && <EngineWorkersPanel onOpenNetworking={() => setView('network')} />}
             {view === 'plugins' && <PluginsPanel />}
             {view === 'runs' && <RunsPanel />}
             {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}

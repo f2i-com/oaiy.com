@@ -923,6 +923,7 @@
       "network": "network",
       "identity.json": "network",
       "peers.json": "network",
+      "defaults.json": "network",
       "playwright-browser.json": "templates",
       "plugin-data": "plugin-data-other",
       "plugins": "plugins",

@@ -259,7 +259,7 @@ fn preferences(prefs: &Prefs) -> Value {
 pub fn router(state: AiState) -> Router {
     let data_dir = state.registry.lock().unwrap_or_else(|e| e.into_inner()).data_dir().to_path_buf();
     let store = Arc::new(Store::open(&data_dir));
-    preferences_router(Prefs { store, providers: state.providers.clone() }).merge(
+    preferences_router(Prefs { store, providers: state.providers.clone(), ai: Some(state.clone()) }).merge(
         Router::new()
             .route("/api/engines/recommendation", get(recommendation))
             .with_state(Recommend { codex: state.codex, data_dir }),
@@ -271,6 +271,8 @@ pub fn router(state: AiState) -> Router {
 struct Prefs {
     store: Arc<Store>,
     providers: super::providers::ProviderStoreHandle,
+    /// This computer's engines, for the model chosen in Engines now (none in some tests).
+    ai: Option<AiState>,
 }
 
 fn preferences_router(prefs: Prefs) -> Router {
@@ -280,7 +282,21 @@ fn preferences_router(prefs: Prefs) -> Router {
 }
 
 async fn get_preferences(State(prefs): State<Prefs>) -> Response {
-    Json(preferences(&prefs)).into_response()
+    let mut answer = preferences(&prefs);
+    // On the engine with no model named: where a paired worker's language model is this computer's default (OAIY
+    // Network), that one (`engineDefault`, the Agent runs on it as the engine's chats do), and its worker's name.
+    let model = prefs.store.model();
+    if model.source == Source::Engine && model.model.is_none() {
+        let local = match &prefs.ai {
+            Some(ai) => super::routes::engine_now(ai).await.ok().map(|(_, m)| m).filter(|m| !m.is_empty()),
+            None => None,
+        };
+        if let Some(entry) = crate::network::default_chat_entry(local.as_deref()) {
+            answer["engineDefault"] = entry["id"].clone();
+            answer["engineDefaultName"] = entry["nodeName"].clone();
+        }
+    }
+    Json(answer).into_response()
 }
 
 async fn put_preferences(State(prefs): State<Prefs>, body: Option<Json<Value>>) -> Response {
@@ -643,7 +659,7 @@ mod tests {
         let dir = Scratch::new("http");
         let providers = super::super::providers::new_handle();
         providers.lock().unwrap().upsert(provider("lm-studio", super::super::providers::Protocol::OpenAi, Some("qwen3.5-9b"), true)).unwrap();
-        let (base, server) = serve(preferences_router(Prefs { store: Arc::new(Store::open(&dir.0)), providers })).await;
+        let (base, server) = serve(preferences_router(Prefs { store: Arc::new(Store::open(&dir.0)), providers, ai: None })).await;
         let url = format!("{base}/api/agent/preferences");
         let http = reqwest::Client::new();
 

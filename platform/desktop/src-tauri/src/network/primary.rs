@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::identity::{commitment, is_nonce, nonce, pairing_code, short, Identity};
-use super::store::{now_ms, Peer, Role, Settings};
+use super::store::{now_ms, Peer, Role, Settings, WorkerDefault};
 use super::tls::{self, Pin};
 use super::{lock, worker, Network, PROTOCOL};
 
@@ -91,6 +91,7 @@ async fn status(State(net): State<Network>) -> Response {
     s["waiting"] = json!(worker::waiting(&net).len());
     s["found"] = json!(lock(&net.inner().found).len());
     s["paired"] = json!(net.inner().peers().list().len());
+    s["defaults"] = defaults_json(&net);
     Json(s).into_response()
 }
 
@@ -102,10 +103,23 @@ struct SettingsChange {
     name: Option<String>,
     port: Option<u16>,
     bind: Option<String>,
+    /// Engine defaults on a worker, by kind: a worker's model's id (`engine:<kind>:node.<nodeId>/<model>`), or null for
+    /// this computer's own again.
+    defaults: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
 
-/// `PUT /api/network/settings`: switch Network on or off, choose this computer's role, name and (a worker's) port.
+/// `PUT /api/network/settings`: switch Network on or off, choose this computer's role, name and (a worker's) port, and
+/// (a primary) which of its workers' models are this computer's engine defaults.
 async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsChange>) -> Response {
+    if let Some(defaults) = &change.defaults {
+        if let Err(e) = set_defaults(&net, defaults).await {
+            return error(StatusCode::BAD_REQUEST, "invalid_request", e);
+        }
+    }
+    // (only defaults: nothing running is started again)
+    if change.enabled.is_none() && change.role.is_none() && change.name.is_none() && change.port.is_none() && change.bind.is_none() {
+        return status(State(net)).await;
+    }
     let mut s: Settings = net.settings();
     if let Some(v) = change.enabled {
         s.enabled = v;
@@ -482,6 +496,8 @@ async fn unpair(State(net): State<Network>, Path(node_id): Path<String>) -> Resp
     if let Err(e) = net.inner().peers().remove(&node_id) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
     }
+    // (its models no longer this computer's defaults: its own again)
+    let _ = net.inner().defaults().drop_node(&node_id);
     lock(&net.inner().nodes).remove(&node_id);
     log::info!("network: unpaired {}", peer.name);
     StatusCode::NO_CONTENT.into_response()
@@ -611,14 +627,147 @@ async fn pin_change(net: &Network, node_id: &str, model: &str, kind: &str, pin: 
 /// `POST /api/network/nodes/:id/v1/chat/completions`: an OpenAI chat request for the worker's language model, its
 /// answer streamed back as the worker streams it (a cancelled request closes the worker's stream with it).
 async fn node_chat(State(net): State<Network>, Path(node_id): Path<String>, body: axum::body::Bytes) -> Response {
-    let (peer, client) = match worker_of(&net, &node_id) {
+    chat_on(&net, &node_id, body).await
+}
+
+pub(crate) async fn chat_on(net: &Network, node_id: &str, body: axum::body::Bytes) -> Response {
+    let (peer, client) = match worker_of(net, node_id) {
         Ok(w) => w,
         Err(r) => return r,
     };
     match client.post(url(&peer.address, "/worker/v1/chat")).header("content-type", "application/json").body(body).send().await {
         Ok(r) => worker::passthrough(r),
-        Err(e) => offline(&net, &peer, &e),
+        Err(e) => offline(net, &peer, &e),
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Engine defaults on a worker
+// ---------------------------------------------------------------------------------------------------------------
+
+/// This computer's own default model of `kind` in a catalogue (its engine's entry marked default).
+fn local_default(services: &[Value], kind: &str) -> Option<String> {
+    services
+        .iter()
+        .find(|s| s["kind"] == kind && s.get("nodeId").is_none() && s["default"] == json!(true))
+        .and_then(|s| s["model"].as_str())
+        .map(str::to_owned)
+}
+
+/// The catalogue entry of `kind`'s default on a worker, where one is chosen and in effect: a primary's, its worker
+/// paired and its models known here (a worker not heard from since this computer started leaves this computer's own
+/// default in place until it is; one heard from and offline now is the default still, and says so when used). A
+/// language model is the worker's chosen one, whichever that is now. `local` is this computer's own default of the kind
+/// now, where known: one chosen since the worker's was (in Engines) is this computer's own again.
+fn in_effect(net: &Network, kind: &str, remote: &[Value], local: Option<&str>) -> Option<Value> {
+    if net.settings().active_role() != Role::Primary {
+        return None;
+    }
+    let mut chosen = net.inner().defaults().get(kind).cloned()?;
+    if let Some(now) = local {
+        // (this computer's own not known when the worker's was chosen, its engines not answering: it is now)
+        if chosen.instead_of.is_none() {
+            chosen.instead_of = Some(now.to_string());
+            let _ = net.inner().defaults().set(kind, Some(chosen.clone()));
+        }
+        if Some(now) != chosen.instead_of.as_deref() {
+            log::info!("network: {kind}'s default chosen here again ({now}), in place of {}", chosen.id);
+            let _ = net.inner().defaults().set(kind, None);
+            return None;
+        }
+    }
+    remote
+        .iter()
+        .find(|e| e["kind"] == kind && if kind == "llm" { e["nodeId"].as_str() == Some(chosen.node_id()) } else { e["id"].as_str() == Some(chosen.id.as_str()) })
+        .cloned()
+}
+
+/// The engine catalogue with the defaults on workers in effect: each such model marked its kind's default, and this
+/// computer's own of that kind not (what `GET /api/ai/engine/services` answers).
+pub fn apply_defaults(services: &mut [Value]) {
+    if let Some(net) = super::shared() {
+        apply_defaults_of(net, services);
+    }
+}
+
+pub(crate) fn apply_defaults_of(net: &Network, services: &mut [Value]) {
+    let kinds: Vec<String> = net.inner().defaults().all().keys().cloned().collect();
+    for kind in kinds {
+        let local = local_default(services, &kind);
+        let remote: Vec<Value> = services.iter().filter(|s| s.get("nodeId").is_some()).cloned().collect();
+        let Some(entry) = in_effect(net, &kind, &remote, local.as_deref()) else { continue };
+        for s in services.iter_mut().filter(|s| s["kind"] == kind.as_str()) {
+            s["default"] = json!(s["id"] == entry["id"]);
+        }
+    }
+}
+
+/// The worker whose language model is this computer's default now (`local`: this computer's own, where known): the
+/// engine's chats go there ([`chat_on_worker`]).
+pub fn default_chat_entry(local: Option<&str>) -> Option<Value> {
+    default_chat_entry_of(super::shared()?, local)
+}
+
+pub(crate) fn default_chat_entry_of(net: &Network, local: Option<&str>) -> Option<Value> {
+    in_effect(net, "llm", &remote_services_of(net), local)
+}
+
+/// A chat for this computer's engine, answered by the worker whose language model is the default (its chosen model,
+/// whatever the caller named), streamed as the worker streams it.
+pub async fn chat_on_worker(node_id: &str, mut body: Value) -> Response {
+    let Some(net) = super::shared() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "network_off", "OAIY Network is not on as a primary here");
+    };
+    if let Some(o) = body.as_object_mut() {
+        o.remove("model");
+        o.remove("provider");
+    }
+    chat_on(net, node_id, axum::body::Bytes::from(body.to_string())).await
+}
+
+/// The defaults on workers as the Networking and Engines pages show them: by kind, its id, model and worker.
+fn defaults_json(net: &Network) -> Value {
+    let peers = net.inner().peers().list().to_vec();
+    let defaults = net.inner().defaults().all().clone();
+    Value::Object(
+        defaults
+            .into_iter()
+            .map(|(kind, d)| {
+                let node = d.node_id().to_string();
+                let name = peers.iter().find(|p| p.node_id == node).map(|p| p.name.clone()).unwrap_or_default();
+                let model = d.id.rsplit_once('/').map_or("", |(_, m)| m).to_string();
+                (kind, json!({ "id": d.id, "nodeId": node, "nodeName": name, "model": model, "insteadOf": d.instead_of }))
+            })
+            .collect(),
+    )
+}
+
+/// Choose (an id) or let go (null) the defaults on workers, by kind. A model is one of a paired worker's, of that kind,
+/// as this computer's catalogue lists it; this computer's own default then is kept beside it ([`in_effect`]).
+async fn set_defaults(net: &Network, change: &std::collections::BTreeMap<String, Option<String>>) -> Result<(), String> {
+    let local = crate::ai::engine_services::local_catalogue(&net.inner().ai).await;
+    for (kind, id) in change {
+        let Some(id) = id.as_deref().map(str::trim).filter(|i| !i.is_empty()) else {
+            net.inner().defaults().set(kind, None)?;
+            continue;
+        };
+        if net.settings().active_role() != Role::Primary {
+            return Err("switch Network on as a primary to use a worker's model as a default".into());
+        }
+        let Some(rest) = id.strip_prefix(&format!("engine:{kind}:node.")) else {
+            return Err(format!("{id} is not a worker's {kind} model (engine:{kind}:node.<nodeId>/<model>)"));
+        };
+        let node = rest.split_once('/').map_or("", |(n, _)| n);
+        let Some(peer) = net.inner().peers().get(node).filter(|p| p.role == Role::Worker).cloned() else {
+            return Err(format!("{node} is not a worker paired with this computer"));
+        };
+        if !remote_services_of(net).iter().any(|e| e["id"] == id && e["kind"] == kind.as_str()) {
+            return Err(format!("{id} is not one of {}'s models now", peer.name));
+        }
+        net.inner().defaults().set(kind, Some(WorkerDefault { id: id.to_string(), instead_of: local_default(&local, kind) }))?;
+        log::info!("network: {kind}'s default is {id} on {}", peer.name);
+    }
+    Ok(())
 }
 
 /// `/api/network/nodes/:id/gateway/<path>`: the worker's engines' media routes (a picture, a song, a video's job)

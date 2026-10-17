@@ -79,7 +79,7 @@ pub const ENGINE_PROVIDER_ID: &str = "oaiy-engine";
 
 /// The engines' gateway and the model chosen in Engines, asked of the engines now
 /// (their control page's state gives the gateway, the gateway's discovery the model).
-async fn engine_now(st: &AiState) -> Result<(String, String), String> {
+pub(super) async fn engine_now(st: &AiState) -> Result<(String, String), String> {
     let (gateway, discovery) = engine_discovery(st).await?;
     Ok((gateway, chosen_model(&discovery)))
 }
@@ -404,7 +404,20 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
         let codex = st.codex.clone();
         return codex_answer(body, codex_alias, move |body, alias, emit| codex.chat_streaming(body, alias, emit)).await;
     }
-    let (p, engine) = match resolve_chat_provider(st, provider_id).await {
+    let resolved = resolve_chat_provider(st, provider_id).await;
+    // A paired worker's language model chosen as this computer's default (OAIY Network): the engine's chats go there,
+    // this computer's own engine running or not.
+    let for_engine = match &resolved {
+        Ok((_, engine)) => *engine,
+        Err(_) => provider_id.is_none_or(|id| id == ENGINE_PROVIDER_ID),
+    };
+    if for_engine {
+        let local = resolved.as_ref().ok().and_then(|(p, _)| p.model.clone());
+        if let Some(entry) = crate::network::default_chat_entry(local.as_deref()) {
+            return crate::network::chat_on_worker(entry["nodeId"].as_str().unwrap_or(""), body).await;
+        }
+    }
+    let (p, engine) = match resolved {
         Ok(found) => found,
         Err((status, code, message)) => return ai_error(status, code, message),
     };

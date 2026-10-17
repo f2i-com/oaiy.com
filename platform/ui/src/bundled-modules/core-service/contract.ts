@@ -89,12 +89,13 @@ export function engineChatService(id: string): CustomService | null {
 }
 
 /**
- * The engine's default service of `kind` in `list` (else its first): this computer's own. A paired worker's model is
- * used where a flow names it, never as a default (a worker appearing changes no flow).
+ * The engine's default service of `kind` in `list`: the one marked default, else this computer's first. A paired
+ * worker's model is the default only where the person chose it as one (OAIY → Engines → Other computers: the desktop
+ * marks it); otherwise it is used where a flow names it, so a worker appearing changes no flow.
  */
 export function engineDefault(list: CustomService[], kind: string): CustomService | null {
-  const of = list.filter((s) => s.group === 'engine' && s.kind === kind && !s.nodeId);
-  return of.find((s) => s.default) ?? of[0] ?? null;
+  const of = list.filter((s) => s.group === 'engine' && s.kind === kind);
+  return of.find((s) => s.default) ?? of.find((s) => !s.nodeId) ?? null;
 }
 
 /**

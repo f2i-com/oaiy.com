@@ -57,13 +57,23 @@ type Send = (input: string, init: RequestInit) => Promise<Response>;
 const send: Send = (input, init) => fetch(input, init);
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
-/** The choice in the desktop's answer (`{model: {source, provider?, model?}, providerName?}`), or null when it is not one. */
+/**
+ * The choice in the desktop's answer (`{model: {source, provider?, model?}, providerName?}`), or null when it is not
+ * one. On the engine with no model named, a paired worker's language model the desktop says is the engine's default
+ * (`engineDefault`, OAIY Network: chosen in OAIY → Engines → Other computers) is the one: the Agent runs there, as the
+ * engine's chats do.
+ */
 export function parseAgentModel(body: unknown): AgentModel | null {
   const model = isRecord(body) ? body.model : null;
   if (!isRecord(model)) return null;
   const name = typeof model.model === 'string' ? model.model.trim() : '';
   if (model.source === 'engine') {
-    if (!workerModel(name)) return ENGINE;
+    if (!workerModel(name)) {
+      const onWorker = isRecord(body) && typeof body.engineDefault === 'string' ? body.engineDefault.trim() : '';
+      if (!workerModel(onWorker)) return ENGINE;
+      const label = isRecord(body) && typeof body.engineDefaultName === 'string' ? body.engineDefaultName.trim() : '';
+      return label ? { source: 'engine', model: onWorker, name: label } : { source: 'engine', model: onWorker };
+    }
     const label = isRecord(body) && typeof body.providerName === 'string' ? body.providerName.trim() : '';
     return label ? { source: 'engine', model: name, name: label } : { source: 'engine', model: name };
   }

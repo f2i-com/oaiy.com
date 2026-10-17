@@ -2130,6 +2130,19 @@ export interface NetworkStatus {
   /** Workers found on the LAN (a primary). */
   found: number;
   paired: number;
+  /** A primary's engine defaults on its workers, by kind (`llm`, `image`…): the rest are this computer's own. */
+  defaults?: Record<string, NetworkDefault>;
+}
+
+/** A paired worker's model chosen as this computer's engine default of its kind (Engines → Other computers). */
+export interface NetworkDefault {
+  /** Its id in the engine catalogue (`engine:<kind>:node.<nodeId>/<model>`). */
+  id: string;
+  nodeId: string;
+  nodeName: string;
+  model: string;
+  /** This computer's own default of the kind when it was chosen (one chosen in Engines since takes its place again). */
+  insteadOf?: string | null;
 }
 
 export interface NetworkFound {
@@ -2232,6 +2245,9 @@ export const network = {
     request<unknown>(`/api/network/nodes/${encodeURIComponent(nodeId)}/pins/${encodeURIComponent(model)}`, { method: 'DELETE' }),
   /** Unpair: its certificate no longer lets it in. */
   unpair: (nodeId: string) => request<void>(`/api/network/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' }),
+  /** A worker's model as this computer's engine default of `kind` (its id), or this computer's own again (null). */
+  setDefault: (kind: string, id: string | null) =>
+    request<NetworkStatus>('/api/network/settings', { method: 'PUT', body: JSON.stringify({ defaults: { [kind]: id } }) }),
 };
 
 // ----- setup (the wizard's record, on the desktop) -----

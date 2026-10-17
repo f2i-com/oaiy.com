@@ -98,6 +98,19 @@ Once paired, a worker's models are in the primary's engine catalogue (`GET /api/
   requests and tool calls go through the primary). Its tools also see the network: `network_status` (read only)
   lists the paired computers, their GPUs and their models' ids, and `agent_model_set` can choose a worker's
   language model when the person asks. Pairing and pins stay the person's: no tool changes them.
+- **Engines → Other computers** lists each paired worker's GPUs and models by kind, and makes one of them this
+  computer's **default** of its kind (*Make default*; *Use this computer's* gives it back). A worker's model as the
+  default is marked `default` in the catalogue in place of this computer's own, so Flows' *Default … model* settings
+  use it; a worker's language model as the default answers the engine's chats
+  (`/api/ai/providers/oaiy-engine/v1/chat/completions`, and chats that name no provider when none is switched on),
+  and the Agent on *the model chosen in Engines* runs on it (`GET /api/agent/preferences` answers it as
+  `engineDefault`). A worker's language model as the default is whichever it runs now. Choosing a default in the
+  Engines tab (or with the Agent's `model_set_default`) makes this computer's own the default again: the default it
+  had is kept beside the worker's, and one chosen since takes its place. Unpairing the worker gives its kinds back. A
+  default on a worker that is offline says so when it is used; one not heard from since this computer started
+  leaves this computer's own in place until it is. Set with `PUT /api/network/settings`
+  `{"defaults": {"image": "engine:image:node.<id>/<model>"}}` (`null` gives it back), listed in `GET
+  /api/network/status` as `defaults`; the Agent's `model_set_default` takes a worker's model's id too.
 - **Any client of this desktop** reaches a worker's media routes at `/api/network/nodes/<id>/gateway/v1/…` and its
   chat at `/api/network/nodes/<id>/v1/chat/completions` (streamed as the worker streams it), with the desktop's own
   credentials (scope `ai.use`).
@@ -200,8 +213,9 @@ again on its port, off and public addresses refused), and the Studio's the pins 
 
 ## Not done
 
-- **Engines (the Studio's page) does not list a worker's models**, nor filter by computer; a worker's model cannot be
-  an Engines default. Its models are chosen in Flows' menus, the Agent's settings and the Networking page.
+- **The Engines tab itself (the engines' own page) lists this computer's models alone**: a worker's are on the
+  *Other computers* tab beside it. Plugins' text completions through the engine keep this computer's language model,
+  whatever the default.
 - **No Load now / Release when idle**: a pin loads a model and keeps it; there is no loading without pinning, and
   no per-pin device, priority, memory budget or concurrency limit (a pin goes where the worker's pictures go).
 - **Pins are picture models and the chosen language model**: video, speech, music, sound and 3D models run in a
