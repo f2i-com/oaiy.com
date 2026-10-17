@@ -195,6 +195,38 @@ async function withSetting(value, fn) {
   }
 }
 
+// A picture passed to a chat step by its address (one OAIY's engine made: `http://127.0.0.1:…/files/….png`) was taken
+// for a file path (slashes, a picture's ending), and with no file reader (a flow the CLI runs) dropped: the model
+// answered without it. It is read as the address it is; one that cannot be read stops the step.
+await check('a picture passed to a chat step by its address reaches the model, and one that cannot be read stops the step', async () => {
+  const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const picture = `${DEFAULT}/api/ai/engine/gateway/files/images/2026-10-17/a.png`;
+  const served = () => ({ ok: true, status: 200, headers: new Map([['content-type', 'image/png']]), arrayBuffer: async () => png.buffer, blob: async () => ({ type: 'image/png', arrayBuffer: async () => png.buffer }) });
+  const missing = () => ({ ok: false, status: 404, headers: new Map(), arrayBuffer: async () => new ArrayBuffer(0), blob: async () => ({ type: '', arrayBuffer: async () => new ArrayBuffer(0) }) });
+  const sent = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => (String(url) === picture ? served() : String(url).includes('/files/') ? missing() : realFetch(url, init));
+  try {
+    const methods = M.AIRuntime.createMethods(ctxFor({
+      // (the image size limits a picture is held to: the defaults)
+      getModuleSetting: () => undefined,
+      secureFetch: async (url, init = {}) => {
+        if (String(url) === picture) return served();
+        if (String(url).includes('/files/')) return missing();
+        sent.push(JSON.parse(init.body));
+        return { status: 200, ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: 'a picture' } }] }) };
+      },
+    }));
+    const ask = (image) => methods.chat('', 'What is it?', image, 'http://127.0.0.1:8123/v1/chat/completions', 'm', '', false, 16, 0, 'text', true, 'auto', 'n1');
+    assert.equal(await ask(picture), 'a picture');
+    const parts = sent.at(-1).messages.at(-1).content;
+    assert.ok(Array.isArray(parts) && parts.some((p) => p.type === 'image_url' && p.image_url.url.startsWith('data:image/png;base64,')), JSON.stringify(sent.at(-1)).slice(0, 400));
+    await assert.rejects(ask(`${DEFAULT}/api/ai/engine/gateway/files/images/gone.png`), /could not be read/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 await check('the setting starts at the loopback address, and every reach asks it', async () => {
   assert.equal(M.DEFAULT_ENGINE_BASE, DEFAULT);
   assert.equal(M.getEngineBase(), DEFAULT);

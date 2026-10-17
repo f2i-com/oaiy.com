@@ -996,10 +996,13 @@ async function chat(
   // Images can be: data:image URLs, file paths, or URLs
   let imageInputs: string[] = [];
 
-  // Helper to check if a string looks like an image file path
+  // Helper to check if a string looks like an image file path (an address with a scheme is not one: a picture OAIY's
+  // engine made, `http://127.0.0.1:…/files/….png`, has slashes and a picture's ending too, was taken for a file, and
+  // with no file reader (the CLI's runs) was dropped, so a review step judged a picture it never saw)
   const isImagePath = (s: string): boolean => {
     const lower = s.toLowerCase();
     return (
+      !/^[a-z][a-z0-9+.-]*:\/\//.test(lower) &&
       (lower.includes('\\') || lower.includes('/')) &&
       (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') ||
        lower.endsWith('.gif') || lower.endsWith('.webp') || lower.endsWith('.bmp'))
@@ -1107,21 +1110,21 @@ async function chat(
   for (const item of inputItems) {
     if (typeof item !== 'string' || !item) continue;
 
+    // A picture wired in that cannot be read stops the step, rather than the model answering without it.
+    const unread = (what: string) => new Error(`[AI] the picture ${what.length > 120 ? `${what.slice(0, 120)}…` : what} could not be read, so it was not sent`);
     if (item.startsWith('data:image')) {
       // Already base64 data URL
       imageInputs.push(item);
-    } else if (isImagePath(item)) {
-      // Local file path - need to read it
-      const dataUrl = await readImageFile(item);
-      if (dataUrl) {
-        imageInputs.push(dataUrl);
-      }
     } else if (isImageUrl(item)) {
       // HTTP/HTTPS image URL - fetch and convert to base64
       const dataUrl = await fetchImageUrl(item);
-      if (dataUrl) {
-        imageInputs.push(dataUrl);
-      }
+      if (!dataUrl) throw unread(item);
+      imageInputs.push(dataUrl);
+    } else if (isImagePath(item)) {
+      // Local file path - need to read it
+      const dataUrl = await readImageFile(item);
+      if (!dataUrl) throw unread(item);
+      imageInputs.push(dataUrl);
     } else {
       // Non-image string input - append to prompt
       finalPrompt = finalPrompt ? `${finalPrompt}\n\n${item}` : item;
