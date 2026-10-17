@@ -350,7 +350,7 @@ The **Endpoints** page edits `gateway.routes`. Each route has a `path`, a
 | `model3d` | 3D model jobs on `/v1/3d/models`: create from a picture, poll, download the GLB and the cut-out picture, cancel ([3D models](MODEL3D.md)) | the same |
 | `background` | `/v1/images/background_removal`: a picture's background removed, answered at once as OpenAI Images does ([Picture tools](PICTURE_TOOLS.md)) | the same |
 | `upscale` | `/v1/images/upscale`: a picture two or four times larger ([Picture tools](PICTURE_TOOLS.md)) | the same |
-| `files` | generated media under the output folder | — |
+| `files` | generated media under the output folder; `POST` to the route itself keeps a picture there (`inputs/`, beside edits' uploads) and answers `{url, bytes, width, height}`, for a caller to name it by its address afterwards (the picture as the body, `image/png`, `image/jpeg` or `image/webp`, or JSON `{"data": "data:image/…;base64,…"}`; up to 32 MiB; refused in incognito) | — |
 | `health` | `{status, llm, media_busy}`, never behind the key | — |
 
 Routes can be renamed, duplicated at other paths (the same service in both
@@ -562,6 +562,9 @@ which programs the studio runs, so:
 - if `ui.host` is not loopback and `gateway.api_key` is set, every API call from
   another machine needs that key. The page takes it once as `?key=`, or asks for
   it. Connections from this machine itself (loopback) need no key.
+
+`POST /api/open-file {url}` opens one of the outputs (`/files/…`) in this computer's own viewer: the gallery's
+**Open** in OAIY's window, which opens no windows of its own. It answers a client on this computer alone.
 
 Keep `ui.host` on `127.0.0.1` unless you mean to control the machine remotely.
 Saving a non-loopback `ui.host` is refused until `gateway.api_key` is set.

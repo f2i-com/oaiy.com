@@ -126,6 +126,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("models", _) => models(studio, req, w),
         ("health", _) => json_reply(w, 200, &health(studio)),
         ("discovery", _) => json_reply(w, 200, &crate::api::discovery::document(studio, &public_base(studio, req), true)),
+        ("files", _) if method == "POST" && m.rest.trim_matches('/').is_empty() => send(w, upload(studio, req)),
         ("files", _) => files(studio, req, w, m.rest.trim_start_matches('/')),
         ("images", "openai") if m.rest.is_empty() => {
             let caller = w.try_clone().ok();
@@ -592,6 +593,42 @@ fn edit_body(req: &Request) -> Result<(Json, Uploads), Reply> {
         return Err(fail(400, "an edit needs at least one image"));
     }
     Ok((body, uploads))
+}
+
+/// `POST` to the files' route: a picture kept with the edits' uploads (`inputs/` under the output root), for a caller
+/// to name by its address from then on rather than send again (a flow hands a picture from step to step by its
+/// address). The body is the picture (`image/png`, `image/jpeg` or `image/webp`), or JSON `{"data": "data:image/…;
+/// base64,…"}`. Answers `{url, bytes, width, height}`, `url` its `/files/…` address. In incognito, refused: an upload
+/// outlives the request, and incognito keeps nothing.
+fn upload(studio: &Studio, req: &Request) -> Result<Reply, Reply> {
+    if incognito_mode(studio) || incognito_header(req) {
+        return Err(fail(400, "incognito keeps no files: send the picture with the request that uses it"));
+    }
+    let ctype = req.header("content-type").unwrap_or("").to_ascii_lowercase();
+    let data = if ctype.starts_with("application/json") {
+        let body = parse_body(req)?;
+        let text = body.get("data").and_then(Json::as_str).ok_or_else(|| fail(400, "data: the picture as a data: URL or base64"))?;
+        let b64 = match text.strip_prefix("data:") {
+            Some(rest) => rest.split_once(";base64,").map(|(_, b)| b).ok_or_else(|| fail(400, "data: a data: URL must be base64"))?,
+            None => text,
+        };
+        crate::util::base64_decode(b64.trim()).map_err(|e| fail(400, format!("data: {e}")))?
+    } else {
+        req.body.clone()
+    };
+    if data.len() > 32 << 20 {
+        return Err(fail(400, "a picture is limited to 32 MiB"));
+    }
+    let (ext, width, height) = crate::api::multipart::image_info(&data).ok_or_else(|| fail(400, "not a PNG, JPEG or WebP image"))?;
+    let saved = save_uploads(studio, None, vec![(ext, data.clone())])?;
+    let path = saved.first().and_then(Json::as_str).map(PathBuf::from).ok_or_else(|| fail(500, "the picture was not kept"))?;
+    let url = media::file_url(&studio.output_root(), &path).ok_or_else(|| fail(500, "the picture has no address"))?;
+    ok(Json::obj([
+        ("url", Json::str(url)),
+        ("bytes", Json::Int(data.len() as i64)),
+        ("width", Json::Int(width as i64)),
+        ("height", Json::Int(height as i64)),
+    ]))
 }
 
 /// Write checked uploads under `scratch/inputs` (incognito) or the output
@@ -1394,6 +1431,9 @@ mod tests {
         assert_eq!((v.target.as_str(), v.rest.as_str()), ("videos", "/video_abc/content"));
         assert_eq!(route(&r, "DELETE", "/v1/videos/x").unwrap().rest, "/x");
         assert_eq!(route(&r, "GET", "/files/images/a.png").unwrap().target, "files");
+        // (a picture handed to the engines is posted to the files' route itself)
+        let up = route(&r, "POST", "/files").unwrap();
+        assert_eq!((up.target.as_str(), up.rest.as_str()), ("files", ""));
         assert!(route(&r, "POST", "/v1/videosx").is_none());
         assert!(route(&r, "POST", "/v1/chat/completions/extra").is_none());
         // Custom paths and dialects come from the table.

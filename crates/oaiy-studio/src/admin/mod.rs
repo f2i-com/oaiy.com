@@ -287,6 +287,20 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             });
             Ok(reply)
         }),
+        // The viewer's Open in OAIY's window, which opens no other windows: the output in this computer's own viewer.
+        // An output's file alone, and for a client on this computer alone (it shows on this screen).
+        ("POST", "/api/open-file") => {
+            if remote {
+                Err((403, "an output opens on this computer for its own window alone".into()))
+            } else {
+                body(req).map_err(|e| (400, e)).and_then(|b| {
+                    let rel = b.get("url").and_then(Json::as_str).and_then(output_path).ok_or((400, "not an output's file".to_string()))?;
+                    let path = crate::media::resolve_file(&studio.output_root(), &rel).ok_or((404, "no such output file".to_string()))?;
+                    crate::open_path(&path.to_string_lossy());
+                    Ok(Json::obj([("opened", Json::str(path.to_string_lossy()))]))
+                })
+            }
+        }
         ("POST", "/api/open-outputs") => {
             let dir = studio.output_root();
             let _ = std::fs::create_dir_all(&dir);
@@ -299,6 +313,17 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         Ok(v) => json_reply(w, 200, &v),
         Err((status, message)) => err(w, status, &message),
     }
+}
+
+/// The part of an output's address after `/files/` (as the page has it: alone, or after this server's address), its
+/// query or fragment left off.
+fn output_path(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next()?;
+    let path = path.strip_prefix("/files/").or_else(|| {
+        let rest = path.strip_prefix("http://").or_else(|| path.strip_prefix("https://"))?;
+        rest.split_once('/').and_then(|(_, p)| p.strip_prefix("files/"))
+    })?;
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String> {
@@ -403,6 +428,16 @@ pub(crate) fn llm_stop(studio: &Arc<Studio>, cfg: &Json) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The viewer's Open names an output by its address, which the page has alone or after the server's.
+    #[test]
+    fn an_output_is_named_by_its_address() {
+        assert_eq!(output_path("/files/images/a%20b.png").as_deref(), Some("images/a%20b.png"));
+        assert_eq!(output_path("http://127.0.0.1:7860/files/images/a.png?v=2#x").as_deref(), Some("images/a.png"));
+        assert_eq!(output_path("/v1/files/images/a.png"), None);
+        assert_eq!(output_path("/files/"), None);
+        assert_eq!(output_path("file:///etc/passwd"), None);
+    }
 
     #[test]
     fn the_page_has_oaiy_s_type() {
