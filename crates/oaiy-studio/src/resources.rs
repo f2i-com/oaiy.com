@@ -160,21 +160,24 @@ pub fn snapshot(studio: &Studio) -> Json {
     let keep = crate::media::keep_for(&cfg).as_secs_f64();
     let running = studio.media.running_job();
     // (each model the kept worker holds: its process's memory shared among them)
+    let pins = crate::media::pins::pinned(&cfg);
     if let Some(k) = studio.media.kept_worker() {
         let busy_with = running.as_ref().map(|r| str_or(r, "model", "").to_string());
         for model in &k.models {
             let busy = busy_with.as_deref() == Some(model.as_str());
+            let pinned = pins.contains(model);
             models.push(Json::obj([
                 ("model", Json::str(model)),
                 ("kind", Json::str("image")),
                 ("device", Json::str(&k.device)),
                 ("state", Json::str(if busy { "in_use" } else { "kept" })),
                 ("leases", Json::Int(busy as i64)),
-                ("pinned", Json::Bool(false)),
+                ("pinned", Json::Bool(pinned)),
                 ("estimated_mb", model_mb(&cfg, "image", model).map_or(Json::Null, Json::Int)),
                 ("resident_ram_mb", rss_mb(k.pid).map_or(Json::Null, Json::Int)),
                 ("idle_seconds", Json::Num((k.idle_seconds * 10.).round() / 10.)),
-                ("keep_seconds_left", if busy_with.is_some() { Json::Null } else { Json::Num(((keep - k.idle_seconds).max(0.) * 10.).round() / 10.) }),
+                // (a pinned model's worker is kept, whatever the keep time)
+                ("keep_seconds_left", if busy_with.is_some() || pinned { Json::Null } else { Json::Num(((keep - k.idle_seconds).max(0.) * 10.).round() / 10.) }),
             ]));
         }
     }
@@ -201,6 +204,8 @@ pub fn snapshot(studio: &Studio) -> Json {
             ("llm_pinned", Json::Bool(pinned)),
             ("one_job_at_a_time", Json::Bool(true)),
         ])),
+        // (the pinned picture models and where each stands: `crate::media::pins`)
+        ("pins", crate::media::pins::snapshot(&cfg, &studio.media)),
         ("events", Json::Arr(events(0).into_iter().rev().take(50).collect::<Vec<_>>().into_iter().rev().collect())),
     ])
 }

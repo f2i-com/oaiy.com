@@ -21,6 +21,8 @@ pub(crate) mod picture;
 pub(crate) mod sound;
 pub(crate) mod speech;
 
+pub mod pins;
+
 use crate::config::{self, VIDEO_FAMILIES};
 use crate::util::{base64_decode, bool_or, int_or, now, num_or, random_id, str_or, LogRing};
 use oaiy_engine::json::Json;
@@ -292,6 +294,8 @@ pub struct Media {
     /// The picture worker and the lent card let go as soon as the queue is empty, not kept for the keep time: a job
     /// asked (`release`), or someone did (`POST /api/resources/release`). Cleared as the next job starts.
     releasing: AtomicBool,
+    /// Where each pinned picture model stands ([`pins`]).
+    pins: Mutex<pins::States>,
 }
 
 /// A chat request's hold on the LLM; released on drop.
@@ -1344,7 +1348,29 @@ impl Media {
             card_used: Mutex::new(None),
             memory_probe: Mutex::new(None),
             releasing: AtomicBool::new(false),
+            pins: Mutex::new(pins::States::new()),
         }
+    }
+
+    /// Where each pinned picture model stands ([`pins::tend`] keeps it).
+    pub fn pin_states(&self) -> std::sync::MutexGuard<'_, pins::States> {
+        self.pins.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The pinned model the kept picture worker holds, where it holds one (`media.pinned`): it is kept whatever the keep
+    /// time, and a job that would let it go is refused.
+    fn holds_pinned(&self, cfg: &Json) -> Option<String> {
+        let wanted = pins::pinned(cfg);
+        if wanted.is_empty() {
+            return None;
+        }
+        let slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref().and_then(|s| s.models.iter().map(|(_, m)| m).find(|m| wanted.contains(m)).cloned())
+    }
+
+    /// Why `job` is not run while the kept worker holds pinned `held` on the GPU it needs.
+    fn held_by_pin(held: &str, job: &Job) -> String {
+        format!("the GPU keeps the pinned picture model {held} loaded, and {} would let it go: unpin it (OAIY Network, or POST /api/resources/unpin) to run this here", job.model)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Job>> {
@@ -1653,7 +1679,11 @@ impl Media {
                     // (The eGPU's card likewise, once its kept worker has waited for another picture for long enough,
                     // or at once where a chat waits for the card.)
                     if studio.egpu.is_lent() {
-                        if self.lingers(keep_for(&studio.config())) && !studio.egpu.wanted() {
+                        // (a pinned model's worker keeps the card, whatever the keep time, a release or a chat for the
+                        // card's language model, which is told so at once)
+                        let held = self.holds_pinned(&studio.config());
+                        studio.egpu.set_pin_holder(held.clone());
+                        if held.is_some() || self.lingers(keep_for(&studio.config())) && !studio.egpu.wanted() {
                             jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
                             continue;
                         }
@@ -1670,7 +1700,7 @@ impl Media {
                     // (a picture worker kept on this computer's GPU waits for another picture as the card's does, where no
                     // language model there runs or waits to come back)
                     if self.serving.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
-                        if self.lingers_here(studio, keep_for(&studio.config())) {
+                        if self.holds_pinned(&studio.config()).is_some() || self.lingers_here(studio, keep_for(&studio.config())) {
                             jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
                             continue;
                         }
@@ -1691,7 +1721,9 @@ impl Media {
             self.changed.notify_all();
             let mut outcome = self.run_one(studio, &next);
             let cancelled = next.cancel.load(Ordering::Relaxed);
-            if let Some(e) = outcome.as_ref().err().filter(|e| !cancelled && out_of_memory(e)) {
+            // (not where a pinned model is kept, unless it is the job's own: a job does not let a pin go)
+            let pin_kept = self.holds_pinned(&studio.config()).filter(|held| *held != next.model);
+            if let Some(e) = outcome.as_ref().err().filter(|e| !cancelled && out_of_memory(e) && pin_kept.is_none()) {
                 // (once: the kept picture worker and the GPU's cache let go, as nothing else here holds a lease)
                 self.log.push(format!("{}: out of memory ({}); trying it once more with the kept picture worker let go", if next.incognito { "incognito job" } else { next.id.as_str() }, e.lines().next().unwrap_or("")));
                 crate::resources::event("retry", &next.model, "", "out of memory: tried once more with everything idle let go");
@@ -1777,6 +1809,8 @@ impl Media {
                     });
                     let made = if kept_on_card(job.kind, &job.request) {
                         self.serve_job(studio, &cfg, job, Some(&socket))
+                    } else if let Some(held) = self.holds_pinned(&cfg) {
+                        Err(Self::held_by_pin(&held, job))
                     } else {
                         // (the kept picture worker let go first: the card's memory the job's)
                         self.end_serving(false, "another media job's worker needs the eGPU");
@@ -1835,6 +1869,8 @@ impl Media {
             Err("cancelled".into())
         } else if kept_here(job.kind, &job.request) {
             self.serve_job(studio, &cfg, job, None)
+        } else if let Some(held) = self.holds_pinned(&cfg).filter(|_| self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.local)) {
+            Err(Self::held_by_pin(&held, job))
         } else {
             // (the kept picture worker let go first: the GPU's memory the job's)
             self.end_serving(false, "another media job's worker needs this GPU");
@@ -1865,8 +1901,9 @@ impl Media {
     /// The picture worker kept on this computer's GPU let go, where it is waiting for a picture (one making a picture
     /// is let go after it): what the language model calls as it starts ([`crate::llm::Llm::before_start`]).
     pub fn let_go_local(&self) {
+        // (a pinned model's worker stays: the language model starts beside it)
         let waiting = match self.serving.try_lock() {
-            Ok(slot) => slot.as_ref().is_some_and(|s| s.local),
+            Ok(slot) => slot.as_ref().is_some_and(|s| s.local && !s.models.iter().any(|(_, m)| self.pins.lock().unwrap_or_else(|p| p.into_inner()).contains_key(m))),
             Err(_) => false,
         };
         if waiting {
@@ -1906,7 +1943,18 @@ impl Media {
         let key = format!("{}|{}", program.display(), card.unwrap_or("local"));
         let place = if card.is_some() { "the eGPU".to_string() } else { format!("GPU {}", int_or(&job.request, "device", 0)) };
         let label = if job.incognito { "incognito job".to_string() } else { job.id.clone() };
+        let wanted = pins::pinned(cfg);
         let mut slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
+        let held = match slot.as_mut() {
+            Some(s) if s.key != key => {
+                let alive = matches!(s.child.try_wait(), Ok(None));
+                s.models.iter().map(|(_, m)| m.clone()).find(|m| alive && wanted.contains(m))
+            }
+            _ => None,
+        };
+        if let Some(held) = held {
+            return Err(Self::held_by_pin(&held, job));
+        }
         if slot.as_mut().is_some_and(|s| s.key != key || !matches!(s.child.try_wait(), Ok(None))) {
             drop(slot);
             self.end_serving(false, "a worker for another program or GPU is needed");
@@ -1958,6 +2006,9 @@ impl Media {
         // (what the worker keeps once this job has loaded its model: see `kept_beside`)
         let family = str_or(&job.request, "architecture", "qwen-image").to_string();
         if !s.models.iter().any(|(f, m)| *f == family && *m == job.model) {
+            if let Some((_, held)) = s.models.iter().find(|(f, m)| wanted.contains(m) && !kept_beside(f, &family)) {
+                return Err(Self::held_by_pin(held, job));
+            }
             let (stay, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut s.models).into_iter().partition(|(f, _)| kept_beside(f, &family));
             for (_, model) in &gone {
                 crate::resources::event("unload", model, &s.device, &format!("let go in the kept worker for {}", job.model));

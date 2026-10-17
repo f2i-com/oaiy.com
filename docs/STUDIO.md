@@ -537,6 +537,19 @@ The rules, one GPU at a time:
   the GPU ends it at once. `POST /api/resources/release` with
   `{"what": "pictures"}` ends it by hand (`"language"` stops the idle language
   model, `"all"` both).
+- **Pinned picture models** (`media.pinned`, a list of picture models' names;
+  `POST /api/resources/pins` and `POST /api/resources/unpin` with `{model, kind}`,
+  which OAIY Network's primary sends a paired worker, [NETWORK.md](NETWORK.md#pinning))
+  are kept in the picture worker whatever the keep time, a release, or a chat
+  wanting the card (which is told so at once): a job that would let one go is
+  refused, saying which pin holds the GPU. They are loaded when the Studio
+  starts, and again whenever their worker ends, by a small picture made when
+  nothing else is queued; one that cannot load is shown failed with why, kept,
+  and tried again every five minutes. Only what the worker keeps together can
+  be pinned together (MOSS-Image's and Klein's; one model of a family).
+  `GET /api/resources` lists `pins` with each one's state (`warming`, `ready`,
+  `failed`, `waiting`). `kind: "llm"` pins the language model chosen in
+  Engines (`llm.pinned`).
 - Between the card's language model and a picture worker, either way, the next
   waits until the card's launcher says the last one's memory is let go (up to
   30 s): a model loaded into a card still holding the last one's buffers ran out
@@ -624,7 +637,8 @@ sections are:
   nowhere else.
 - `media`: `worker`, `output_dir`, `device`, `llm_policy`, `resume_llm`,
   `keep_jobs`, `keep_minutes` (how long a picture's models stay loaded for the next, on the eGPU or this computer's
-  GPU: 2 by default, 0 lets them go after each; a chat that needs the GPU takes it back at once), and:
+  GPU: 2 by default, 0 lets them go after each; a chat that needs the GPU takes it back at once), `pinned` (picture
+  models kept loaded whatever comes, above), and:
   - `image`: `enabled`, `default_model`, `memory`, `ram_gb`, `vram_gb` (null =
     free VRAM), and `models`. Each model has `architecture` (`qwen-image`: `base`,
     `transformer` or `safetensors_transformer`, `adapter`, `loras` (`[{path, strength}]`), `text_encoder`; `sdxl`:

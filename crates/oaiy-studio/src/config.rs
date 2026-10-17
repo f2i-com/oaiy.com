@@ -586,6 +586,13 @@ pub fn validate(v: &Json) -> Result<(), String> {
     if media.get("keep_minutes").is_some_and(|v| !matches!(v, Json::Null) && !v.as_f64().is_some_and(|m| m.is_finite() && (0.0..=1440.0).contains(&m))) {
         return Err("media.keep_minutes must be a number of minutes from 0 to 1440".into());
     }
+    // (the picture models kept loaded: their names, `crate::media::pins`)
+    if let Some(pinned) = media.get("pinned").filter(|v| !matches!(v, Json::Null)) {
+        let names = pinned.as_array().ok_or("media.pinned must be a list of picture models' names")?;
+        if names.len() > crate::media::pins::MAX_PINS || names.iter().any(|n| !n.as_str().is_some_and(|n| !n.trim().is_empty() && n.len() <= 200)) {
+            return Err(format!("media.pinned must be a list of at most {} picture models' names", crate::media::pins::MAX_PINS));
+        }
+    }
     let image = object(media, "image")?;
     memory(image, "media.image")?;
     gib(image, "ram_gb", "media.image", 512)?;

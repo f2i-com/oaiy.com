@@ -189,6 +189,38 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             }
             Ok(crate::resources::snapshot(studio))
         })(),
+        // A model kept loaded (`crate::media::pins`): a picture model pinned in the picture worker on its GPU, or the
+        // language model chosen in Engines (`llm.pinned`); unpinned, it is let go as any other again. Saved in the
+        // settings, so a pin outlives a restart; refused where the pins there are cannot be kept beside it.
+        ("POST", "/api/resources/pins") | ("POST", "/api/resources/unpin") => (|| -> Result<Json, (u16, String)> {
+            let pin = route == "/api/resources/pins";
+            let b = body(req).map_err(|e| (400, e))?;
+            let model = str_or(&b, "model", "").trim().to_string();
+            if model.is_empty() || model.len() > 200 || model.contains(['/', '\\']) || model.contains("..") {
+                return Err((400, "model must be a model's name, as /v1/discovery lists it".into()));
+            }
+            let next = if str_or(&b, "kind", "image") == "llm" {
+                let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+                if crate::llm::default_model(&llm) != model {
+                    return Err((409, format!("{model} is not the language model chosen in Engines: choose it first, then pin it")));
+                }
+                let mut next = cfg.clone();
+                let mut section = llm;
+                crate::util::set(&mut section, "pinned", Json::Bool(pin));
+                crate::util::set(&mut next, "llm", section);
+                next
+            } else {
+                if pin {
+                    crate::media::pins::check(&cfg, &model).map_err(|e| (409, e))?;
+                } else if !crate::media::pins::pinned(&cfg).contains(&model) {
+                    return Ok(crate::resources::snapshot(studio));
+                }
+                crate::media::pins::with(&cfg, &model, pin)
+            };
+            studio.set_config(next).map_err(|e| (400, e))?;
+            crate::resources::event(if pin { "pin" } else { "unpin" }, &model, "", if pin { "pinned: kept loaded" } else { "unpinned: let go as any other model again" });
+            Ok(crate::resources::snapshot(studio))
+        })(),
         ("GET", "/api/downloads") => Ok(studio.downloads.state(studio)),
         ("POST", "/api/downloads") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);

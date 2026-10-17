@@ -696,6 +696,9 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         let media = Arc::clone(&runner.media);
         media.run(&runner);
     }).map_err(|e| e.to_string())?;
+    // (the pinned picture models loaded, and loaded again whenever their worker ends: `media::pins`)
+    let pinner = Arc::clone(&studio);
+    std::thread::Builder::new().name("pins".into()).spawn(move || media::pins::keep(pinner)).map_err(|e| e.to_string())?;
     // Stop an idle LLM so its memory returns to the machine; the next request loads it again.
     // Incognito folders left by a crash are gone before anything serves.
     let _ = std::fs::remove_dir_all(studio.output_root().join(".incognito"));

@@ -385,6 +385,9 @@ struct Inner {
     resume_after: bool,
     /// A request waits for the lent card: whoever has it gives it back as soon as it may (`crate::media`).
     wanted: bool,
+    /// The pinned picture model whose worker keeps the lent card (`media.pinned`): requests for the card's language
+    /// model are told so rather than waiting for a card that is not given back.
+    pin_holder: Option<String>,
     /// The card's Python, tinygrad and launcher from a provider ([`Egpu::provide`]); None: the settings'.
     runtime: Option<Runtime>,
 }
@@ -602,6 +605,7 @@ impl Egpu {
                 paused: false,
                 resume_after: false,
                 wanted: false,
+                pin_holder: None,
                 runtime: None,
             }),
             changed: Condvar::new(),
@@ -1166,6 +1170,7 @@ impl Egpu {
         }
         g.lent = false;
         g.wanted = false;
+        g.pin_holder = None;
         g.last_used = Instant::now();
         if g.paused && g.resume_after {
             self.resume(&mut g);
@@ -1177,6 +1182,11 @@ impl Egpu {
     /// Whether the card is lent to the image worker now.
     pub fn is_lent(&self) -> bool {
         self.lock().lent
+    }
+
+    /// The pinned picture model whose worker keeps the lent card, or none (the media runner says, as it keeps it).
+    pub fn set_pin_holder(&self, model: Option<String>) {
+        self.lock().pin_holder = model;
     }
 
     /// Whether a request waits for the lent card (its model's): the image worker is to give it back once its job is done.
@@ -1219,8 +1229,12 @@ impl Egpu {
             if g.paused && !g.lent && holds && matches!(g.state, State::Starting | State::Ready) {
                 self.resume(&mut g);
             }
-            // (one waiting for the lent card says so: the image worker keeps it no longer than its job)
+            // (one waiting for the lent card says so: the image worker keeps it no longer than its job, unless a pinned
+            // model's worker keeps it, which is said at once)
             if g.lent {
+                if let Some(pin) = g.pin_holder.clone() {
+                    return Err(Unready::Gone(format!("the eGPU's card keeps the pinned picture model {pin} loaded: unpin it to use the card's language model")));
+                }
                 g.wanted = true;
             }
             if !g.lent { match g.state {

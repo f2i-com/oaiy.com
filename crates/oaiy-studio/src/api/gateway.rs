@@ -2003,6 +2003,73 @@ open(log, "a").write("ended\n")
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A pinned picture model (`media.pinned`): loaded by the pins' keeper (`media::pins::tend`) with nothing asked, kept
+    /// past the keep time and a release, a job that would let it go (another family's picture, another kind's worker)
+    /// refused with the pin named, its own pictures made in the same worker; unpinned, it is let go as any other again.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_picture_model_is_loaded_kept_and_never_let_go_by_a_job() {
+        use crate::media::pins;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fake_dir("pins");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = dir.join("fake-media");
+        std::fs::write(&worker, FAKE_SERVE).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = crate::config::default_json();
+        let media = crate::models::registry::obj_mut(&mut cfg, &["media"]).unwrap();
+        crate::util::set(media, "worker", Json::str(worker.to_string_lossy()));
+        crate::util::set(media, "keep_minutes", Json::Int(0));
+        crate::util::set(media, "output_dir", Json::str(dir.join("out").to_string_lossy()));
+        let model = |arch: &str| Json::obj([("architecture", Json::str(arch)), ("transformer", Json::str("t.gguf")), ("text_encoder", Json::str("te.gguf")), ("vae", Json::str("vae.safetensors")), ("base", Json::str("qwen"))]);
+        let image = crate::models::registry::obj_mut(&mut cfg, &["media", "image"]).unwrap();
+        crate::util::set(image, "models", Json::obj([("qwen", model("qwen-image")), ("moss", model("moss-image"))]));
+        let cfg = pins::with(&cfg, "qwen", true);
+        let studio = Arc::new(Studio::for_test(&dir, cfg));
+        let runner = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let media = Arc::clone(&runner.media);
+            media.run(&runner);
+        });
+        let log = || std::fs::read_to_string(dir.join("fake-media.log")).unwrap_or_default();
+        let count = |line: &str| log().lines().filter(|l| l.trim() == line).count();
+        let state = || studio.media.pin_states().get("qwen").cloned();
+        // Loaded with nothing asked, and kept: the keep time (none) and a release pass it by.
+        until("the pinned model loaded", || {
+            pins::tend(&studio);
+            state() == Some(pins::State::Ready)
+        });
+        assert_eq!(count("started"), 1, "{}\n{}", log(), studio.media.log.tail(20));
+        std::thread::sleep(Duration::from_millis(1500));
+        studio.media.release_now();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(count("ended"), 0, "kept past the keep time and a release: {}", log());
+        let snapshot = crate::resources::snapshot(&studio);
+        assert_eq!(snapshot.get("pins").and_then(|p| p.as_array()).map(|p| str_or(&p[0], "state", "")), Some("ready"), "{}", snapshot.to_json());
+        let kept = snapshot.get("models").and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "model", "") == "qwen").cloned().unwrap();
+        assert_eq!((kept.get("pinned").and_then(Json::as_bool), kept.get("keep_seconds_left")), (Some(true), Some(&Json::Null)));
+        // What would let it go is refused, the pin named; its own pictures are made in the same worker.
+        let out = dir.join("out");
+        let ask = |prompt: &str, arch: &str, model: &str, kind: Kind| {
+            let job = studio.media.submit(kind, Json::obj([("prompt", Json::str(prompt)), ("output_dir", Json::str(out.to_string_lossy())), ("architecture", Json::str(arch))]), model.into(), "1024x1024".into(), 1, 0.0, 50, None);
+            studio.media.wait(&job.id, Duration::from_secs(60)).unwrap()
+        };
+        for (arch, model, kind) in [("moss-image", "moss", Kind::Image), ("ltx-video", "ltx", Kind::Video)] {
+            let done = ask("owl", arch, model, kind);
+            assert_eq!(done.status, "failed", "{model}");
+            assert!(done.error.as_deref().is_some_and(|e| e.contains("pinned picture model qwen")), "{model}: {:?}", done.error);
+        }
+        assert_eq!(ask("fox", "qwen-image", "qwen", Kind::Image).status, "completed");
+        assert_eq!((count("started"), count("ended")), (1, 0), "{}", log());
+        // Unpinned: let go as any other model (here at once, with no keep time).
+        studio.set_config(pins::with(&studio.config(), "qwen", false)).unwrap();
+        until("the unpinned model let go", || count("ended") == 1);
+        pins::tend(&studio);
+        assert!(state().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A stand-in for this computer's language-model engine: it answers `/health` and every chat ("from this computer"),
     /// and notes its start in `fake-media.log`, beside the picture worker's notes.
     #[cfg(unix)]
