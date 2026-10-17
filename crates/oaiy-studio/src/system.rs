@@ -181,8 +181,9 @@ fn other_gpus() -> Vec<Json> {
 }
 
 /// An Apple-silicon Mac's GPU, in the shape the others have: the chip's own name (its GPU has no other) and, for its
-/// memory, the computer's, which is what it has. `unified` says so: a page shows it as sharing the RAM, and the
-/// weights' share of it is the engine's own to pick ([`crate::llm::auto_webgpu_gb`] leaves it alone).
+/// memory, the computer's, which is what it has. `unified` says so: a page shows that memory once, as unified memory
+/// with the GPU's part of it, and the weights' share of it is the engine's own to pick ([`crate::llm::auto_webgpu_gb`]
+/// leaves it alone).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn apple_gpu(chip: &str, total_mb: Option<u64>) -> Json {
     let name = match chip.trim() {

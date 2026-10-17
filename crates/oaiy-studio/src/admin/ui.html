@@ -21,7 +21,7 @@
   color-scheme: dark;
   --bg: #080d18; --panel: #0e1422; --panel-2: #131c2d; --line: #202a3c; --line-2: #33425c;
   --text: #f4f7ff; --muted: #98a6bd; --faint: #8592ab;
-  --ssd: #f2b84b; --ram: #35d4e8; --gpu: #7167ff; --bad: #ff6e78; --good: #45d6a2; --magenta: #e76bf3; --azure: #4d8bff;
+  --ssd: #f2b84b; --ram: #35d4e8; --shared: #35d4e8; --gpu: #7167ff; --bad: #ff6e78; --good: #45d6a2; --magenta: #e76bf3; --azure: #4d8bff;
   --well: #060a13; --well-text: #c9d3e6; --media-bg: #05080f; --on-accent: #FFFFFF; --on-tier: #0b0f19; --backdrop: rgba(3, 6, 12, .6);
   --rail-w: 216px; --dock-h: 0px; --pad: clamp(16px, 2.6vw, 44px);
   --display: "Public Sans", "Bahnschrift", "Segoe UI Variable Display", system-ui, sans-serif;
@@ -36,7 +36,7 @@
   color-scheme: light;
   --bg: #f8f5ee; --panel: #fffefa; --panel-2: #f3f0e9; --line: #cec8be; --line-2: #9f998f;
   --text: #171717; --muted: #68645e; --faint: #6f6a63;
-  --ssd: #9c6a08; --ram: #1675b9; --gpu: #2457e6; --bad: #e94b3c; --good: #218450; --magenta: #c2410c; --azure: #1675b9;
+  --ssd: #9c6a08; --ram: #1675b9; --shared: #7ab6dd; --gpu: #2457e6; --bad: #e94b3c; --good: #218450; --magenta: #c2410c; --azure: #1675b9;
   --well: #f1ede5; --well-text: #2a2723; --media-bg: #ebe7de; --on-accent: #FFFFFF; --on-tier: #FFFFFF; --backdrop: rgba(40, 34, 26, .35);
 }
 @media (prefers-color-scheme: light) {
@@ -44,7 +44,7 @@
     color-scheme: light;
     --bg: #f8f5ee; --panel: #fffefa; --panel-2: #f3f0e9; --line: #cec8be; --line-2: #9f998f;
     --text: #171717; --muted: #68645e; --faint: #6f6a63;
-    --ssd: #9c6a08; --ram: #1675b9; --gpu: #2457e6; --bad: #e94b3c; --good: #218450; --magenta: #c2410c; --azure: #1675b9;
+    --ssd: #9c6a08; --ram: #1675b9; --shared: #7ab6dd; --gpu: #2457e6; --bad: #e94b3c; --good: #218450; --magenta: #c2410c; --azure: #1675b9;
     --well: #f1ede5; --well-text: #2a2723; --media-bg: #ebe7de; --on-accent: #FFFFFF; --on-tier: #FFFFFF; --backdrop: rgba(40, 34, 26, .35);
   }
 }
@@ -158,11 +158,12 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .hw { display: grid; gap: 14px; }
 .hw-row { display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) minmax(110px, 150px); gap: 14px; align-items: center; }
 .hw-row .label { font: 600 13px var(--display); } .hw-row .label small { display: block; font: 12px var(--body); color: var(--muted); }
-/* the eGPU's: its memory and its load, each a meter with its numbers, and what it runs under them */
+/* a GPU's memory and load, each a meter with its numbers, and what it runs under them (`--rows`: the lines they take);
+   a Mac's unified memory with its parts' key under it */
 .hw-row.card { row-gap: 7px; }
-.hw-row.card .label { grid-row: span 3; }
-.hw-row.card.two .label { grid-row: span 2; }
+.hw-row.card .label { grid-row: span var(--rows, 3); }
 .hw-row.card .doing { grid-column: 2 / -1; margin-top: -2px; }
+.hw-row .keys { display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .meter.split { display: flex; }
 
 /* lists */
@@ -444,7 +445,7 @@ dialog::backdrop { background: var(--backdrop); }
 }
 @media (max-width: 860px) {
   .hw-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
-  .hw-row.card .label, .hw-row.card.two .label { grid-row: auto; }
+  .hw-row.card .label { grid-row: auto; }
   .hw-row.card .doing { grid-column: 1 / -1; margin-top: 0; }
   .savebar { padding: 12px var(--pad); }
   .chat { height: calc(100dvh - 330px); }
@@ -1780,49 +1781,67 @@ function morph(box, want) {
   });
   had.slice(wanted.length).forEach(h => h.remove());
 }
-// A GPU whose memory and load are known, as two meters, each with its numbers (the load's with the temperature, where
-// it is known), and what it is doing under them: `doing` is [what, an aside].
-function meterRow(label, m) {
-  const pct = mb => Math.min(100, Math.max(0, mb / m.total * 100)).toFixed(1);
-  const [what, aside] = m.doing || [];
-  const line = [what && `<span>${what}</span>`, aside && `<span class="muted">${aside}</span>`].filter(Boolean).join(" ");
-  const temp = m.temp == null ? "" : ` · <span title="Temperature${m.tempOf ? ": " + m.tempOf : ""}"${m.temp >= 90 ? ' style="color:var(--bad)"' : ""}>${m.temp} °C</span>`;
-  return `<div class="hw-row card${line ? "" : " two"}">${label}
-    <div class="meter split" title="${m.memTitle}"><div style="width:${pct(m.used)}%;background:var(--gpu)"></div><div style="width:${pct(m.kept || 0)}%;background:var(--gpu);opacity:.35"></div></div>
-    <div class="num small">${gb(m.used)} / ${gb(m.total)} GB</div>
-    <div class="meter" title="${m.loadTitle}"><div style="width:${m.load ?? 0}%;background:var(--good)"></div></div>
-    <div class="num small">${m.load == null ? "–" : m.load + "%"} <span class="muted">load</span>${temp}</div>
+// Meters in a row, each a bar of parts (`[percent, colour, lighter]`, one after another) with its numbers beside it, and
+// under them `doing`: [what, an aside], or markup of its own. The label spans the lines they take.
+function meterRow(label, meters, doing) {
+  const line = Array.isArray(doing) ? [doing[0] && `<span>${doing[0]}</span>`, doing[1] && `<span class="muted">${doing[1]}</span>`].filter(Boolean).join(" ") : doing || "";
+  const bar = parts => parts.map(([pct, colour, light]) => `<div style="width:${Math.min(100, Math.max(0, pct)).toFixed(1)}%;background:${colour}${light ? ";opacity:.35" : ""}"></div>`).join("");
+  return `<div class="hw-row card" style="--rows:${meters.length + (line ? 1 : 0)}">${label}
+    ${meters.map(m => `<div class="meter split" title="${m.title}">${bar(m.parts)}</div>
+    <div class="num small">${m.num}</div>`).join("\n    ")}
     ${line ? `<div class="doing small">${line}</div>` : ""}</div>`;
 }
+// A GPU's memory meter (`kept`: buffers let go, kept for reuse) and its load meter, with the temperature where it is known.
+const memMeter = (used, total, title, kept = 0, unit = "") => ({parts: [[used / total * 100, "var(--gpu)"], [kept / total * 100, "var(--gpu)", true]],
+  num: `${gb(used)} / ${gb(total)} GB${unit && ` <span class="muted">${unit}</span>`}`, title});
+const hotText = (temp, of = "") => temp == null ? "" : `<span title="Temperature${of && ": " + of}"${temp >= 90 ? ' style="color:var(--bad)"' : ""}>${temp} °C</span>`;
+const loadMeter = (load, title, temp, of) => ({parts: [[load ?? 0, "var(--good)"]], title,
+  num: `${load == null ? "–" : load + "%"} <span class="muted">load</span>${temp == null ? "" : " · " + hotText(temp, of)}`});
 function renderHardware() {
   const hw = $("#hw"), rows = [];
   const ram = sys?.ram;
+  // A Mac's GPU has no memory of its own: the CPU and the GPU share the computer's (unified memory). That is one row,
+  // under the Mac's GPU in place of a RAM row after the GPUs, with what the GPU has in use as its own part; the GPU's
+  // row has its load alone.
+  const unified = (sys?.gpus || []).filter(g => g.unified);
+  const unifiedRow = () => {
+    if (!ram?.total_mb) return "";
+    const used = ram.total_mb - ram.available_mb, of = mb => mb / ram.total_mb * 100;
+    const said = unified.filter(g => g.memory_used_mb != null), gpu = Math.min(used, said.reduce((sum, g) => sum + g.memory_used_mb, 0));
+    const key = (swatch, text) => `<span class="key"><i style="${swatch}"></i>${text}</span>`;
+    return meterRow(`<div class="label">Unified memory<small>Shared by the CPU and GPU</small></div>`,
+      [{parts: [[of(gpu), "var(--gpu)"], [of(used - gpu), "var(--shared)"]], num: `${gb(used)} / ${gb(ram.total_mb)} GB`,
+        title: `Unified memory: ${gb(used)} GB of ${gb(ram.total_mb)} GB in use${said.length ? `, ${gb(gpu)} GB of it the GPU's` : ""}`}],
+      `<span class="keys">${said.length ? key("background:var(--gpu)", `GPU ${gb(gpu)} GB`) : ""}${key("background:var(--shared)", `${said.length ? "Apps and system" : "In use"} ${gb(used - gpu)} GB`)}${key("background:var(--bg);box-shadow:inset 0 0 0 1px var(--line-2)", `Free ${gb(ram.available_mb)} GB`)}</span>`);
+  };
   for (const g of sys?.gpus || []) {
-    // What a GPU's memory holds is known of an NVIDIA card (nvidia-smi), of a Mac's (its driver's: the memory it has in
-    // use, of the computer's it shares), of an AMD card's (Linux's amdgpu, Windows' graphics kernel) and of any card's
-    // own memory on Windows; of the others only the size is known, and a Mac's that did not say is as full as the RAM is.
-    const known = g.memory_used_mb != null && g.memory_total_mb, shared = g.unified && ram?.total_mb;
-    const pct = known ? g.memory_used_mb / g.memory_total_mb * 100 : shared ? (ram.total_mb - ram.available_mb) / ram.total_mb * 100 : 0;
+    // What a GPU's memory holds is known of an NVIDIA card (nvidia-smi), of an AMD card's (Linux's amdgpu, Windows'
+    // graphics kernel) and of any card's own memory on Windows; of the others only the size is known.
+    const known = g.memory_used_mb != null && g.memory_total_mb;
+    const pct = known ? g.memory_used_mb / g.memory_total_mb * 100 : 0;
     const roles = [];
     const resident = cfg && state?.llm?.resident ? cfg.llm.models.find(m => m.name === state.llm.resident) : null;
     if (cfg && state?.llm?.state === "ready" && modelGpus(resident).includes(g.index)) roles.push("LLM");
     if (cfg && cfg.media.device === g.index) roles.push("media");
     const label = `<div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>`;
     const does = roles.length ? "Runs " + roles.join(" and ") : "";
-    if (known && g.utilization != null) {
-      rows.push(meterRow(label, {used: g.memory_used_mb, total: g.memory_total_mb, load: g.utilization, temp: g.temperature,
-        tempOf: g.unified ? "the mean of the GPU's sensors" : "",
-        memTitle: g.unified ? `Memory the GPU has in use: ${gb(g.memory_used_mb)} GB of the computer's ${gb(g.memory_total_mb)} GB, which it shares` : `Video memory: ${gb(g.memory_used_mb)} GB of ${gb(g.memory_total_mb)} GB in use`,
-        loadTitle: g.unified ? "Load: how busy the GPU is, as its driver measures it (Activity Monitor's GPU history)" : "Load: the share of the time the GPU ran work",
-        doing: [does, g.unified ? (does ? "· shares the computer's memory" : "Shares the computer's memory") : ""]}));
+    if (g.unified) {
+      const load = g.utilization == null ? [] : [loadMeter(g.utilization, "Load: how busy the GPU is, as its driver measures it (Activity Monitor's GPU history)", g.temperature, "the mean of the GPU's sensors")];
+      const aside = [does ? "· uses the unified memory" : "Uses the unified memory", !load.length && hotText(g.temperature)].filter(Boolean).join(" · ");
+      rows.push(meterRow(label, load, [does, aside]));
+      if (g === unified[0]) rows.push(unifiedRow());
       continue;
     }
-    const size = g.unified ? `Shares the computer's ${g.memory_total_mb ? gb(g.memory_total_mb) + " GB" : "memory"}` : known ? `${gb(g.memory_used_mb)} / ${gb(g.memory_total_mb)} GB` : g.memory_total_mb ? `${gb(g.memory_total_mb)} GB` : "";
+    if (known && g.utilization != null) {
+      rows.push(meterRow(label, [memMeter(g.memory_used_mb, g.memory_total_mb, `Video memory: ${gb(g.memory_used_mb)} GB of ${gb(g.memory_total_mb)} GB in use`),
+        loadMeter(g.utilization, "Load: the share of the time the GPU ran work", g.temperature)], [does, ""]));
+      continue;
+    }
+    const size = known ? `${gb(g.memory_used_mb)} / ${gb(g.memory_total_mb)} GB` : g.memory_total_mb ? `${gb(g.memory_total_mb)} GB` : "";
     // (a temperature where its driver says one, as nouveau's and Intel's on Linux do with nothing else)
-    const hot = g.temperature == null ? "" : `<span title="Temperature"${g.temperature >= 90 ? ' style="color:var(--bad)"' : ""}>${g.temperature} °C</span>`;
-    const busy = [does || (g.utilization != null ? g.utilization + "% busy" : ""), hot].filter(Boolean).join(" · ");
+    const busy = [does || (g.utilization != null ? g.utilization + "% busy" : ""), hotText(g.temperature)].filter(Boolean).join(" · ");
     rows.push(`<div class="hw-row"><div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>
-      <div class="meter"${known || shared ? ` title="${pct.toFixed(0)}% used"` : ""}><div style="width:${pct}%;background:var(--gpu)"></div></div>
+      <div class="meter"${known ? ` title="${pct.toFixed(0)}% used"` : ""}><div style="width:${pct}%;background:var(--gpu)"></div></div>
       <div class="num small">${[size, busy && `<span class="muted">${busy}</span>`].filter(Boolean).join("<br>")}</div></div>`);
   }
   // A Mac's eGPU, which only tinygrad reaches. Its memory and load are said by the card's server while OAIY's engine
@@ -1839,16 +1858,16 @@ function renderHardware() {
     const label = `<div class="label">eGPU<small>${e.device === "AMD" ? "AMD" : "NVIDIA"} card, ${by}</small></div>`;
     if (u?.memory_total_mb) {
       const used = u.memory_used_mb || 0, kept = u.memory_cached_mb || 0, total = u.memory_total_mb;
-      rows.push(meterRow(label, {used, kept, total, load: u.load, doing: does,
-        memTitle: `Video memory: ${gb(used)} GB of ${gb(total)} GB in use${kept >= 1024 ? `, and ${gb(kept)} GB of buffers let go kept for reuse (lighter)` : ""}`,
-        loadTitle: "Compute load: the share of the last second the card spent running kernels"}));
+      // (its own memory, VRAM, beside the Mac's unified memory)
+      rows.push(meterRow(label, [memMeter(used, total, `Video memory: ${gb(used)} GB of ${gb(total)} GB in use${kept >= 1024 ? `, and ${gb(kept)} GB of buffers let go kept for reuse (lighter)` : ""}`, kept, "VRAM"),
+        loadMeter(u.load, "Compute load: the share of the last second the card spent running kernels")], does));
     } else {
       rows.push(`<div class="hw-row">${label}
         <div class="meter"><div style="width:${e.state === "ready" && !own ? 100 : 0}%;background:var(--gpu)"></div></div>
         <div class="num small">${does[0]}<br><span class="muted">${does[1]}</span></div></div>`);
     }
   }
-  if (ram?.total_mb) {
+  if (ram?.total_mb && !unified.length) {
     const used = ram.total_mb - ram.available_mb;
     rows.push(`<div class="hw-row"><div class="label">RAM<small>System memory</small></div>
       <div class="meter"><div style="width:${used / ram.total_mb * 100}%;background:var(--ram)"></div></div>
