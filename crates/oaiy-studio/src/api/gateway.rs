@@ -2070,6 +2070,55 @@ open(log, "a").write("ended\n")
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A picture model pinned on the eGPU's card: a job refused for the pin (another family's picture, another kind's
+    /// worker) leaves the card lent to the pinned worker, its language model not brought back beside it; unpinned, the
+    /// card is given back.
+    #[cfg(unix)]
+    #[test]
+    fn a_pin_on_the_card_keeps_it_lent_through_a_job_refused_for_it() {
+        use crate::media::pins;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fake_dir("pin-card");
+        let Some(first) = fake_card(&dir) else { return };
+        let worker = dir.join("fake-media");
+        std::fs::write(&worker, FAKE_SERVE).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = first.config();
+        let media = crate::models::registry::obj_mut(&mut cfg, &["media"]).unwrap();
+        crate::util::set(media, "worker", Json::str(worker.to_string_lossy()));
+        crate::util::set(media, "keep_minutes", Json::Int(0));
+        crate::util::set(media, "output_dir", Json::str(dir.join("out").to_string_lossy()));
+        let model = |arch: &str| Json::obj([("architecture", Json::str(arch)), ("transformer", Json::str("t.gguf")), ("text_encoder", Json::str("te.gguf")), ("vae", Json::str("vae.safetensors")), ("base", Json::str("qwen"))]);
+        let mut image = media.get("image").cloned().unwrap_or(Json::Obj(Vec::new()));
+        crate::util::set(&mut image, "models", Json::obj([("qwen", model("qwen-image")), ("moss", model("moss-image"))]));
+        crate::util::set(media, "image", image);
+        let studio = Arc::new(Studio::for_test(&dir, pins::with(&cfg, "qwen", true)));
+        let runner = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let media = Arc::clone(&runner.media);
+            media.run(&runner);
+        });
+        let log = || std::fs::read_to_string(dir.join("fake-media.log")).unwrap_or_default();
+        until("the pinned model loaded on the card", || {
+            pins::tend(&studio);
+            studio.media.pin_states().get("qwen") == Some(&pins::State::Ready)
+        });
+        assert!(log().contains("started tinygpu:/") && studio.egpu.is_lent(), "{}\n{}", log(), studio.media.log.tail(20));
+        let out = dir.join("out");
+        for (arch, model, kind) in [("moss-image", "moss", Kind::Image), ("ltx-video", "ltx", Kind::Video)] {
+            let job = studio.media.submit(kind, Json::obj([("prompt", Json::str("owl")), ("output_dir", Json::str(out.to_string_lossy())), ("architecture", Json::str(arch))]), model.into(), "1024x1024".into(), 1, 0.0, 50, None);
+            let done = studio.media.wait(&job.id, Duration::from_secs(60)).unwrap();
+            assert!(done.status == "failed" && done.error.as_deref().is_some_and(|e| e.contains("pinned picture model qwen")), "{model}: {:?}", done.error);
+            assert!(studio.egpu.is_lent(), "the card stays lent to the pinned worker after {model}'s refusal: {}", studio.egpu.log.tail(20));
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(studio.egpu.is_lent() && !log().contains("ended"), "{}", log());
+        studio.set_config(pins::with(&studio.config(), "qwen", false)).unwrap();
+        until("the card given back once unpinned", || !studio.egpu.is_lent());
+        studio.egpu.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A stand-in for this computer's language-model engine: it answers `/health` and every chat ("from this computer"),
     /// and notes its start in `fake-media.log`, beside the picture worker's notes.
     #[cfg(unix)]

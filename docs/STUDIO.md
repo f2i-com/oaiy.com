@@ -542,10 +542,12 @@ The rules, one GPU at a time:
   which OAIY Network's primary sends a paired worker, [NETWORK.md](NETWORK.md#pinning))
   are kept in the picture worker whatever the keep time, a release, or a chat
   wanting the card (which is told so at once): a job that would let one go is
-  refused, saying which pin holds the GPU. They are loaded when the Studio
-  starts, and again whenever their worker ends, by a small picture made when
-  nothing else is queued; one that cannot load is shown failed with why, kept,
-  and tried again every five minutes. Only what the worker keeps together can
+  refused, saying which pin holds the GPU, and the card stays lent to the
+  pinned worker (its language model is not brought back beside it). They are
+  loaded when the Studio starts, and again whenever their worker ends (a crash
+  while it waited included), by a small picture made when nothing else is
+  queued; one that cannot load is shown failed with why, kept, and tried again
+  every five minutes. Only what the worker keeps together can
   be pinned together (MOSS-Image's and Klein's; one model of a family).
   `GET /api/resources` lists `pins` with each one's state (`warming`, `ready`,
   `failed`, `waiting`). `kind: "llm"` pins the language model chosen in

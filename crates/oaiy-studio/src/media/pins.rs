@@ -130,7 +130,13 @@ pub(crate) fn tend(studio: &Arc<Studio>) {
     let cfg = studio.config();
     let wanted = pinned(&cfg);
     let media = &studio.media;
+    // (a kept worker that ended by itself is forgotten first: what it kept is loaded again)
+    media.reap_ended();
     let kept: Vec<String> = media.kept_worker().map(|k| k.models).unwrap_or_default();
+    // (the loading jobs looked up before the pins are locked, never with them: the runner locks the jobs and then the
+    // kept worker, and the kept worker's users the pins)
+    let loading: Vec<String> = media.pin_states().values().filter_map(|s| if let State::Warming(job) = s { Some(job.clone()) } else { None }).collect();
+    let jobs: BTreeMap<String, Option<super::Job>> = loading.into_iter().map(|id| (id.clone(), media.get(&id))).collect();
     let mut next: Option<String> = None;
     {
         let mut states = media.pin_states();
@@ -138,7 +144,7 @@ pub(crate) fn tend(studio: &Arc<Studio>) {
         for model in &wanted {
             let state = states.get(model).cloned();
             let now = match state.clone() {
-                Some(State::Warming(job)) => match media.get(&job) {
+                Some(State::Warming(job)) => match jobs.get(&job).cloned().flatten() {
                     Some(j) if !j.finished() => continue,
                     Some(j) if j.status == "completed" && kept.contains(model) => State::Ready,
                     Some(j) => State::Failed(j.error.unwrap_or_else(|| format!("its loading job {}", j.status)), Instant::now()),
@@ -165,6 +171,13 @@ pub(crate) fn tend(studio: &Arc<Studio>) {
     // (loaded when nothing else is: a person's picture never waits for a pin's)
     let Some(model) = next else { return };
     if media.busy() || media.queued() > 0 {
+        return;
+    }
+    // (still one that can be kept: its settings may have changed since it was pinned, its backend say)
+    if let Err(e) = check(&cfg, &model) {
+        media.log.push(format!("pinned {model} could not be loaded: {e}"));
+        crate::resources::event("pin_failed", &model, "", &e);
+        media.pin_states().insert(model, State::Failed(e, Instant::now()));
         return;
     }
     match warm(studio, &cfg, &model) {

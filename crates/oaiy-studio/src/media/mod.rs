@@ -1360,12 +1360,34 @@ impl Media {
     /// The pinned model the kept picture worker holds, where it holds one (`media.pinned`): it is kept whatever the keep
     /// time, and a job that would let it go is refused.
     fn holds_pinned(&self, cfg: &Json) -> Option<String> {
+        self.holds_pinned_where(cfg, None)
+    }
+
+    /// As [`Self::holds_pinned`], for the kept worker on the eGPU's card (`Some(true)`) or on this computer's GPU
+    /// (`Some(false)`) alone.
+    fn holds_pinned_where(&self, cfg: &Json, on_card: Option<bool>) -> Option<String> {
         let wanted = pins::pinned(cfg);
         if wanted.is_empty() {
             return None;
         }
         let slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
-        slot.as_ref().and_then(|s| s.models.iter().map(|(_, m)| m).find(|m| wanted.contains(m)).cloned())
+        slot.as_ref()
+            .filter(|s| on_card.is_none_or(|card| s.local != card))
+            .and_then(|s| s.models.iter().map(|(_, m)| m).find(|m| wanted.contains(m)).cloned())
+    }
+
+    /// The kept worker forgotten where it ended by itself while it waited (it crashed): what it kept is not loaded any
+    /// more, so a pin of it is loaded again and the card is not kept for it. One doing a job is the job's to see (the
+    /// job holds it, so it is not waited for here).
+    pub(crate) fn reap_ended(&self) {
+        let ended = match self.serving.try_lock() {
+            Ok(mut slot) => slot.as_mut().is_some_and(|s| !matches!(s.child.try_wait(), Ok(None))),
+            Err(_) => false,
+        };
+        if ended {
+            self.log.push("the kept image worker had ended by itself");
+            self.end_serving(true, "it had ended by itself");
+        }
     }
 
     /// Why `job` is not run while the kept worker holds pinned `held` on the GPU it needs.
@@ -1681,7 +1703,7 @@ impl Media {
                     if studio.egpu.is_lent() {
                         // (a pinned model's worker keeps the card, whatever the keep time, a release or a chat for the
                         // card's language model, which is told so at once)
-                        let held = self.holds_pinned(&studio.config());
+                        let held = self.holds_pinned_where(&studio.config(), Some(true));
                         studio.egpu.set_pin_holder(held.clone());
                         if held.is_some() || self.lingers(keep_for(&studio.config())) && !studio.egpu.wanted() {
                             jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
@@ -1700,7 +1722,15 @@ impl Media {
                     // (a picture worker kept on this computer's GPU waits for another picture as the card's does, where no
                     // language model there runs or waits to come back)
                     if self.serving.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
-                        if self.holds_pinned(&studio.config()).is_some() || self.lingers_here(studio, keep_for(&studio.config())) {
+                        let pinned_here = self.holds_pinned_where(&studio.config(), Some(false)).is_some();
+                        // (a pin kept here: the language model media paused comes back beside it, as one starting does)
+                        if pinned_here && studio.llm.paused() {
+                            drop(jobs);
+                            self.resume_llm(studio);
+                            jobs = self.lock();
+                            continue;
+                        }
+                        if pinned_here || self.lingers_here(studio, keep_for(&studio.config())) {
                             jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
                             continue;
                         }
@@ -1822,15 +1852,21 @@ impl Media {
                         Ok(done) => return Ok(done),
                         Err(e) if job.cancel.load(Ordering::Relaxed) => return Err(e),
                         // (out of memory: tried on the card once more by the caller, with everything idle let go)
+                        // (the card kept lent while a pinned model's worker holds it, a job refused for it among them:
+                        // its language model would load beside the pinned worker)
                         Err(e) if out_of_memory(&e) || !falls_back_here(&cfg) => {
                             self.log.push(format!("{label}: the eGPU did not make it ({})", e.lines().next().unwrap_or("")));
-                            studio.egpu.give_back();
+                            if self.holds_pinned_where(&cfg, Some(true)).is_none() {
+                                studio.egpu.give_back();
+                            }
                             return Err(e);
                         }
                         // (the card's language model comes back while this computer makes it)
                         Err(e) => {
                             self.log.push(format!("{label}: the eGPU did not make it ({}); this computer makes it", e.lines().next().unwrap_or("")));
-                            studio.egpu.give_back();
+                            if self.holds_pinned_where(&cfg, Some(true)).is_none() {
+                                studio.egpu.give_back();
+                            }
                         }
                     }
                 }
@@ -1901,9 +1937,11 @@ impl Media {
     /// The picture worker kept on this computer's GPU let go, where it is waiting for a picture (one making a picture
     /// is let go after it): what the language model calls as it starts ([`crate::llm::Llm::before_start`]).
     pub fn let_go_local(&self) {
-        // (a pinned model's worker stays: the language model starts beside it)
+        // (a pinned model's worker stays: the language model starts beside it. The pins are read before the kept worker
+        // is locked: `pins::tend` locks the pins and then the jobs, and the runner the jobs and then the kept worker)
+        let pinned: Vec<String> = self.pins.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect();
         let waiting = match self.serving.try_lock() {
-            Ok(slot) => slot.as_ref().is_some_and(|s| s.local && !s.models.iter().any(|(_, m)| self.pins.lock().unwrap_or_else(|p| p.into_inner()).contains_key(m))),
+            Ok(slot) => slot.as_ref().is_some_and(|s| s.local && !s.models.iter().any(|(_, m)| pinned.contains(m))),
             Err(_) => false,
         };
         if waiting {

@@ -199,6 +199,11 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             if model.is_empty() || model.len() > 200 || model.contains(['/', '\\']) || model.contains("..") {
                 return Err((400, "model must be a model's name, as /v1/discovery lists it".into()));
             }
+            // (one pin or unpin at a time, each on the settings as they are now: two at once would each keep its own
+            // change and lose the other's)
+            static PINNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _one_at_a_time = PINNING.lock().unwrap_or_else(|p| p.into_inner());
+            let cfg = studio.config();
             let next = if str_or(&b, "kind", "image") == "llm" {
                 let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
                 if crate::llm::default_model(&llm) != model {
@@ -218,6 +223,17 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
                 crate::media::pins::with(&cfg, &model, pin)
             };
             studio.set_config(next).map_err(|e| (400, e))?;
+            if !pin {
+                // (a loading it was waiting for is not wanted any more; the job id read, then the pins let go, before
+                // the queue is locked to cancel it)
+                let loading = match studio.media.pin_states().get(&model) {
+                    Some(crate::media::pins::State::Warming(job)) => Some(job.clone()),
+                    _ => None,
+                };
+                if let Some(job) = loading {
+                    studio.media.cancel(&job);
+                }
+            }
             crate::resources::event(if pin { "pin" } else { "unpin" }, &model, "", if pin { "pinned: kept loaded" } else { "unpinned: let go as any other model again" });
             Ok(crate::resources::snapshot(studio))
         })(),
