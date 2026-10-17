@@ -38,6 +38,7 @@ for what OAIY is and how to build it.
 | [MEDIA_CATALOG.md](MEDIA_CATALOG.md) | The media model manifests the engines read (`config/media.example`). |
 | [WEBGPU.md](WEBGPU.md) | The engines' GPU backend: WebGPU on any GPU, else the CPU. |
 | [MAC.md](MAC.md) | OAIY on an Apple-silicon Mac: building it there, its own GPU and the computer's memory, and a card in a Thunderbolt enclosure through tinygrad's server. |
+| [NETWORK.md](NETWORK.md) | OAIY Network: one OAIY using the GPUs and models of other OAIY computers on the LAN: pairing with a code on both screens, mutual TLS, the remote models in Flows and the Agent, pinning a model on a worker, the routes, how it was tested, and what is not done. |
 | [QWEN_IMAGE.md](QWEN_IMAGE.md) | Pictures and picture edits with Qwen Image 2.1, in Rust. |
 | [QWEN3VL.md](QWEN3VL.md) | Qwen3-VL (dense, 2B/4B/8B): pictures and chat with DeepStack and M-RoPE, the same file Klein's text encoder; how it was checked against transformers. |
 | [IMAGE_FLOW.md](IMAGE_FLOW.md) | A flow that makes a picture (MOSS-Image), edits it (FLUX 3 Klein) and has a vision model check it, from the editor, the chat or another program, the engines loading and letting go of each model; its benchmark. |

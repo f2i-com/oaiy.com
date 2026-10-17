@@ -1,5 +1,5 @@
 {
- "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (649ccd1): all of them for a project or setup session; the runner session is offered the read tools named in runner.",
+ "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (649ccd1): all of them for a project or setup session; the runner session is offered the read tools named in runner; network_status and ui_open's network page added since, as tools.rs declares them.",
  "tools": [
   {
    "annotations": {
@@ -208,12 +208,12 @@
     "readOnlyHint": false,
     "title": "Choose the Agent's model"
    },
-   "description": "Choose what the Agent itself runs on: source engine (the model chosen in Engines), chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out) or provider (one of the AI providers ai_sources_list shows, such as LM Studio or Ollama, by its providerId; an OpenAI-compatible one, since the Agent works with tool calls; model is optional, the provider's own when left out). Live phone calls keep their own fast route on ChatGPT.",
+   "description": "Choose what the Agent itself runs on: source engine (the model chosen in Engines; with model, a paired worker's language model by its id as network_status lists it, engine:llm:node.<nodeId>/<model>), chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out) or provider (one of the AI providers ai_sources_list shows, such as LM Studio or Ollama, by its providerId; an OpenAI-compatible one, since the Agent works with tool calls; model is optional, the provider's own when left out). Live phone calls keep their own fast route on ChatGPT.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
      "model": {
-      "description": "chatgpt: a model from Codex's catalogue; provider: a model the provider lists.",
+      "description": "chatgpt: a model from Codex's catalogue; provider: a model the provider lists; engine: a paired worker's language model's id (network_status).",
       "minLength": 1,
       "type": "string"
      },
@@ -239,6 +239,23 @@
    },
    "name": "agent_model_set",
    "title": "Choose the Agent's model"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "OAIY Network"
+   },
+   "description": "OAIY Network (other OAIY computers on this LAN): whether it is on, this computer's role (primary: it uses paired workers' models; worker: it lends its own), the workers found on the LAN, and the paired computers, each online or not with its GPUs and models. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "network_status",
+   "title": "OAIY Network"
   },
   {
    "annotations": {
@@ -1208,7 +1225,7 @@
     "readOnlyHint": false,
     "title": "Show a dashboard page"
    },
-   "description": "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
+   "description": "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, network (Networking: OAIY Network, pairing other OAIY computers), plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
@@ -1266,6 +1283,7 @@
   "models_list",
   "model_download_status",
   "ai_sources_list",
+  "network_status",
   "services_list",
   "service_logs",
   "plugins_list",

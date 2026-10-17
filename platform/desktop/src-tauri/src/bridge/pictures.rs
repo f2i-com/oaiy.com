@@ -37,13 +37,27 @@ pub fn locate(reference: &str) -> Option<(Option<u16>, &str)> {
     if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
         return None;
     }
-    let file = path.strip_prefix(FILES_PATH)?;
+    let file = engine_file(path)?;
     let file = file.split(['?', '#']).next()?;
     if file.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
         return None;
     }
     let ext = file.rsplit_once('.')?.1.to_ascii_lowercase();
     matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp").then_some((port, path))
+}
+
+/// The file a path of this desktop's names among the engines' pictures: its own engine's (`FILES_PATH`), or a paired
+/// worker's, as OAIY Network serves them here (`/api/network/nodes/<id>/gateway/files/…`).
+fn engine_file(path: &str) -> Option<&str> {
+    if let Some(file) = path.strip_prefix(FILES_PATH) {
+        return Some(file);
+    }
+    let rest = path.strip_prefix("/api/network/nodes/")?;
+    let (node, rest) = rest.split_once('/')?;
+    if node.is_empty() || !node.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    rest.strip_prefix("gateway/files/")
 }
 
 /// The pictures an answer names, each once: its top level first, then what is under it, in the order each level
@@ -274,6 +288,18 @@ mod tests {
         let ok = "http://127.0.0.1:17972/api/ai/engine/gateway/files/images/2026-10-17/a.png";
         assert_eq!(locate(ok), Some((Some(17972), "/api/ai/engine/gateway/files/images/2026-10-17/a.png")));
         assert!(locate("http://localhost:1/api/ai/engine/gateway/files/x.JPG?v=1").is_some());
+        // a paired worker's, as OAIY Network serves them on this desktop
+        let worker = "http://127.0.0.1:17972/api/network/nodes/abc123/gateway/files/images/b.webp";
+        assert_eq!(locate(worker), Some((Some(17972), "/api/network/nodes/abc123/gateway/files/images/b.webp")));
+        for not in [
+            "http://127.0.0.1:17972/api/network/nodes/../gateway/files/b.png",
+            "http://127.0.0.1:17972/api/network/nodes//gateway/files/b.png",
+            "http://127.0.0.1:17972/api/network/nodes/abc123/gateway/api/config.png",
+            "http://127.0.0.1:17972/api/network/nodes/abc123/gateway/files/../../x.png",
+            "http://192.168.1.20:17975/worker/v1/gateway/files/b.png",
+        ] {
+            assert_eq!(locate(not), None, "{not}");
+        }
         for not in [
             "https://127.0.0.1:17972/api/ai/engine/gateway/files/a.png",
             "http://example.com/api/ai/engine/gateway/files/a.png",

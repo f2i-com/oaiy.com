@@ -16,6 +16,7 @@ const m = vi.hoisted(() => ({
   catalog: vi.fn(),
   codexStatus: vi.fn(),
   codexModels: vi.fn(),
+  nodes: vi.fn(),
 }));
 
 vi.mock('./api', async (importOriginal) => {
@@ -28,6 +29,7 @@ vi.mock('./api', async (importOriginal) => {
     engines: { ...real.engines, catalog: m.catalog },
     codex: { ...real.codex, status: m.codexStatus },
     codexModels: m.codexModels,
+    network: { ...real.network, nodes: m.nodes },
   };
 });
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: vi.fn() }) }));
@@ -63,6 +65,7 @@ beforeEach(() => {
   m.catalog.mockResolvedValue({ running: true, models: [], defaults: { llm: 'Picked-In-Engines' } });
   m.codexStatus.mockResolvedValue({ available: true, connected: false });
   m.codexModels.mockResolvedValue([]);
+  m.nodes.mockResolvedValue({ nodes: [] });
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -124,6 +127,28 @@ describe('Settings → Agent with the routes', () => {
     await settle();
     expect(m.controlSet).toHaveBeenCalledWith({ agentMayChange: false });
     expect(section('What the Agent may do').textContent).toContain('Off: the Agent can still look at OAIY');
+  });
+
+  it("offers a paired worker's language model (OAIY Network) only where there is one, and saves it as the engine's", async () => {
+    await render();
+    expect(section('The Agent’s model').textContent).not.toContain('On a paired computer');
+    m.nodes.mockResolvedValue({
+      nodes: [{ nodeId: 'w1', name: 'Rig', role: 'worker', online: true, models: [{ id: 'engine:llm:node.w1/qwen', kind: 'llm', model: 'qwen' }, { id: 'engine:image:node.w1/flux', kind: 'image', model: 'flux' }] }],
+    });
+    act(() => root.unmount());
+    root = createRoot(host);
+    await render();
+    const choice = Array.from(section('The Agent’s model').querySelectorAll('.ai-choice')).find((c) => c.textContent?.includes('On a paired computer'))!;
+    await act(async () => choice.querySelector<HTMLInputElement>('input[type="radio"]')!.click());
+    await settle();
+    const select = choice.querySelector('select')!;
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual(['Choose a model…', 'qwen · Rig']);
+    await act(async () => {
+      select.value = 'engine:llm:node.w1/qwen';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await settle();
+    expect(m.prefsSet).toHaveBeenCalledWith({ model: { source: 'engine', model: 'engine:llm:node.w1/qwen' } });
   });
 
   it('picks the ChatGPT model from Codex’s catalogue, or goes back to the engine', async () => {

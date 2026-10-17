@@ -104,6 +104,7 @@ A path is matched without regard to case. The first row that matches counts; a p
 | `data-node-signing.key` | excluded | Never | The data node's signing key. To do again: Enrol this computer as a data node again and approve it in FormLogic. |
 | `companion/**` | excluded | Never | The phone pairing: keys, the roster of trusted phones and the relay's bearer: The phone pairing: this computer's key for the phone, the roster of trusted phones and the relay's bearer. To do again: Pair your phone again and enter the relay key again. |
 | `bridge/pairings.json` | excluded | Never | Tokens of paired browsers and apps. To do again: Pair your browsers and apps with OAIY again. |
+| `network/**` | excluded | Never | OAIY Network: this computer's identity on the LAN, its settings and the computers paired with it: A computer's own key and the certificates it trusts: a restored computer is another one to its peers, and pairs again. To do again: Switch OAIY Network on again in Setup, Networking, and pair the computers again. |
 | `ai/codex-home/**` | excluded | Never | The ChatGPT sign-in, which belongs to the Codex program. To do again: Sign in to ChatGPT again. |
 | `engines/**` | excluded | Never | The engines' programs, models and settings (their settings hold a gateway key and the Hugging Face token). To do again: Choose your engine models again, and enter your Hugging Face token if you use one. |
 | `hf-token` | excluded | Never | The Hugging Face token. To do again: Enter your Hugging Face token again if you use one. |

@@ -45,6 +45,16 @@
       "redo": "Pair your browsers and apps with OAIY again."
     },
     {
+      "id": "network",
+      "class": "excluded",
+      "paths": [
+        "network/**"
+      ],
+      "what": "OAIY Network: this computer's identity on the LAN, its settings and the computers paired with it",
+      "reason": "A computer's own key and the certificates it trusts: a restored computer is another one to its peers, and pairs again.",
+      "redo": "Switch OAIY Network on again in Setup, Networking, and pair the computers again."
+    },
+    {
       "id": "codex-signin",
       "class": "excluded",
       "paths": ["ai/codex-home/**"],
@@ -910,6 +920,9 @@
       "owner.json.creating": "access",
       "package-manifest.json": "plugins",
       "pairings.json": "pairings",
+      "network": "network",
+      "identity.json": "network",
+      "peers.json": "network",
       "playwright-browser.json": "templates",
       "plugin-data": "plugin-data-other",
       "plugins": "plugins",

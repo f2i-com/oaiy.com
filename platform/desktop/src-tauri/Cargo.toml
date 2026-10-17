@@ -168,6 +168,15 @@ minisign-verify = "0.2"
 # git-lfs OID — which IS its SHA-256 — in `X-Linked-ETag`, so the overwhelming
 # majority of downloads can be verified with nothing asked of the user.
 sha2 = "0.10"
+# OAIY Network (src/network): each node's own certificate, mutual TLS with the certificates pinned at pairing, the
+# workers advertised on the LAN by mDNS, and served over TLS by hyper itself (axum's own serve is plain TCP).
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+mdns-sd = "0.21"
+if-addrs = "0.15"
 
 # The access model's auth core (src/auth): every secret is compared in constant time (`subtle`),
 # and the CSRF value of a cookie session is an HMAC-SHA256 of its token's secret (`hmac`).
@@ -236,9 +245,6 @@ opt-level = 3
 opt-level = 3
 
 [dev-dependencies]
-# The tests of the updater's redirect policy build a reqwest 0.13 client, which needs the TLS provider the updater plugin installs for
-# itself when it runs; the tests install the same one (already in the tree: the plugin's own).
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # The tests encrypt and decrypt backups with age's default scrypt cost (about a second
 # when optimised), which is tens of seconds unoptimised: keep the hot crates optimised in

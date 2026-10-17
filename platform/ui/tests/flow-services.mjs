@@ -83,7 +83,7 @@ await esbuild.build({
     contents: `export { mapToCustomService, mapEngineService, combineDesktopServices } from './src/lib/desktopServices.ts';
 export { paletteShowsNode, nodeNotice, initialServiceFor, nodeTypeForService, isListed, DESKTOP_NODE_FEATURE } from './src/lib/nodeAvailability.ts';
 export { serviceOptions } from './src/lib/serviceOptions.ts';
-export { resolveService, renderContractBody, nodeContract } from './src/bundled-modules/core-service/contract.ts';
+export { resolveService, renderContractBody, nodeContract, engineChatService, remoteModelOf, engineDefault } from './src/bundled-modules/core-service/contract.ts';
 export { runContract, contractTiming } from './src/bundled-modules/core-service/contractRuntime.ts';
 export { default as ServiceCompiler } from './src/bundled-modules/core-service/compiler.ts';
 export { default as AudioCompiler } from './src/bundled-modules/core-audio/compiler.ts';
@@ -473,6 +473,13 @@ await check("the desktop's credential goes only to its engine routes", async () 
   // The same contract pointed elsewhere on the desktop goes through the runtime's own fetch, without the token.
   await M.runContract(ctx, { ...cut, endpoint: `${ORIGIN}/api/services` }, { image: 'data:image/png;base64,AAAA' }, { nodeId: 'n1' });
   assert.deepEqual(viaCtx, [[`${ORIGIN}/api/services`, undefined]]);
+  // A paired worker's engines (OAIY Network) are the desktop's too; its settings and pairing are not a contract's.
+  await M.runContract(ctx, { ...cut, endpoint: `${ORIGIN}/api/network/nodes/abc123/gateway/v1/images/background` }, { image: 'data:image/png;base64,AAAA' }, { nodeId: 'n1' });
+  assert.deepEqual(seen.at(-1), [`${ORIGIN}/api/network/nodes/abc123/gateway/v1/images/background`, 'Bearer tok']);
+  for (const path of ['/api/network/settings', '/api/network/nodes/abc123', '/api/network/nodes/../settings/gateway/x', '/api/network/nodes/abc123/v1/chat/completions/x']) {
+    await M.runContract(ctx, { ...cut, endpoint: `${ORIGIN}${path}` }, { image: 'data:image/png;base64,AAAA' }, { nodeId: 'n1' });
+    assert.deepEqual(viaCtx.at(-1), [`${ORIGIN}${path}`, undefined], path);
+  }
 });
 
 await check("a picture's file is named where the caller fetches it, and a picture passed on by that URL is read with the credential", async () => {
@@ -514,6 +521,30 @@ await check("Image Gen passes on its picture's file where the engine names one, 
   globalThis.fetch = async () => reply(200, { data: [{ b64_json: 'iVBORw==' }] });
   const plain = await methods.serviceImageInfo({ ...picture, infoPath: undefined }, { prompt: 'a fox' }, 'n1');
   assert.equal(plain.image, 'data:image/png;base64,iVBORw==');
+});
+
+await check("a paired worker's model (OAIY Network) keeps its node, goes to it, is never a default, and says when it is offline", () => {
+  const remote = {
+    id: 'engine:image:node.abc123/flux', name: 'OAIY engine · Image · flux · Rig', kind: 'image', model: 'flux', default: false,
+    endpoint: '/api/network/nodes/abc123/gateway/v1/images/generations', method: 'POST', bodyTemplate: '{}', responseType: 'json',
+    responsePath: 'data.0.b64_json', nodeId: 'abc123', nodeName: 'Rig', ready: false,
+  };
+  const mapped = M.mapEngineService(remote, ORIGIN);
+  assert.equal(mapped.nodeId, 'abc123');
+  assert.equal(mapped.ready, false);
+  assert.equal(mapped.endpoint, `${ORIGIN}/api/network/nodes/abc123/gateway/v1/images/generations`);
+  assert.deepEqual(M.remoteModelOf('engine:image:node.abc123/flux:1.0'), { kind: 'image', nodeId: 'abc123', model: 'flux:1.0' });
+  assert.equal(M.remoteModelOf('engine:image:flux'), null);
+  assert.equal(M.remoteModelOf('engine:image:node.../../etc/x'), null, 'a node id is its own characters alone');
+  // its language model, unlisted (a headless run): to that worker, never this computer's
+  assert.equal(M.engineChatService('engine:llm:node.abc123/qwen').endpoint, '/api/network/nodes/abc123/v1/chat/completions');
+  assert.equal(M.engineChatService('engine:llm').endpoint, '/api/ai/providers/oaiy-engine/v1/chat/completions');
+  // never a kind's default, even with no model of this computer's for it
+  assert.equal(M.engineDefault([mapped], 'image'), null);
+  const local = { ...mapped, id: 'engine:image:qwen', model: 'qwen', nodeId: undefined, default: false };
+  assert.equal(M.engineDefault([mapped, local], 'image').id, 'engine:image:qwen');
+  const options = M.serviceOptions('image_gen', env({ desktop: [mapped, { ...local, nodeTypes: ['image_gen'] }].map((x) => ({ ...x, nodeTypes: ['image_gen'] })) }), () => {});
+  assert.ok(options.some((o) => o.label === 'Image · flux · Rig (offline)'), JSON.stringify(options));
 });
 
 await check('a stopped flow cancels the job', async () => {

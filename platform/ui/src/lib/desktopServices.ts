@@ -94,6 +94,10 @@ export interface EngineServiceEntry {
   outputFormat?: string;
   requestFormat?: string;
   inputs?: CustomService['inputs'];
+  /** A paired worker's model (OAIY Network): its node, its name, whether it answers now. */
+  nodeId?: string;
+  nodeName?: string;
+  ready?: boolean;
   job?: {
     idPath: string;
     statusUrl: string;
@@ -269,6 +273,13 @@ export function mapEngineService(e: EngineServiceEntry, origin: string): CustomS
     default: e.default === true,
     installHint: "OAIY's engine: add or change its models in OAIY → Engines.",
   };
+  // (a paired worker's model, OAIY Network: which computer runs it, and whether it answers now)
+  if (typeof e.nodeId === 'string' && e.nodeId) {
+    out.nodeId = e.nodeId;
+    out.nodeName = typeof e.nodeName === 'string' ? e.nodeName : '';
+    out.ready = e.ready !== false;
+    out.installHint = `A model of ${out.nodeName || 'a paired computer'} (OAIY Network): pair or check it in OAIY → Networking.`;
+  }
   if (e.apiFormat === 'openai') out.apiFormat = 'openai';
   if (e.output && KNOWN_OUTPUTS.has(e.output)) out.output = e.output as CustomService['output'];
   if (e.outputFormat) out.outputFormat = e.outputFormat;

@@ -429,7 +429,7 @@ fn every_tool_is_declared_for_a_model() {
         "plugin_install", "plugin_enable", "plugin_disable", "plugin_uninstall", "plugin_settings_set", "plugin_command", "plugin_setup_open",
         "plugin_setup_step_done", "flows_list", "flow_get", "flow_create", "flow_update", "flow_run", "flow_delete", "calendar_settings_get",
         "calendar_settings_set", "link_status", "link_sync_now", "setup_status", "setup_finish", "logs_tail",
-        "contacts_list", "contact_get", "contact_set", "contact_forget_fact", "ui_open",
+        "contacts_list", "contact_get", "contact_set", "contact_forget_fact", "ui_open", "network_status",
     ] {
         assert!(names.contains(&want), "{want} is declared");
     }
@@ -481,6 +481,9 @@ async fn every_tool_runs_and_a_desktop_without_its_routes_is_explained() {
     assert!(is_error(&r) && text(&r).contains("no PUT /api/agent/preferences"), "{r}");
     let r = call(&app, None, "agent_model_set", json!({ "source": "engine", "model": "gpt-5.5" })).await;
     assert!(is_error(&r) && text(&r).contains("model goes with chatgpt or provider"), "{r}");
+    // A paired worker's language model (OAIY Network) goes to the preference route, which checks it is paired.
+    let r = call(&app, None, "agent_model_set", json!({ "source": "engine", "model": "engine:llm:node.abc123/qwen" })).await;
+    assert!(is_error(&r) && text(&r).contains("no PUT /api/agent/preferences"), "{r}");
     // A provider is named by its id, and only with source provider.
     let r = call(&app, None, "agent_model_set", json!({ "source": "provider" })).await;
     assert!(is_error(&r) && text(&r).contains("name the provider"), "{r}");
@@ -788,6 +791,54 @@ async fn a_plugins_setup_step_is_shown_with_the_navigate_payload() {
     // The person accepts what a plugin may do: the Agent shows it rather than recording it.
     let r = call(&app, None, "plugin_setup_step_done", json!({ "pluginId": "demo", "stepId": "permissions" })).await;
     assert!(is_error(&r) && text(&r).contains("plugin_setup_open"), "{r}");
+}
+
+/// OAIY Network as a read: off says how it is switched on and asks for nothing more; a primary's paired workers come
+/// with their GPUs and models (the ids a flow takes), the workers found unpaired, and none of the certificates.
+#[tokio::test]
+async fn network_status_reads_the_network_and_its_workers_models() {
+    let sb = Sandbox::new("network");
+    let off = Router::new().route(
+        "/api/network/status",
+        get(|| async { Json(json!({ "enabled": false, "role": "standalone", "name": "Mac", "fingerprint": "aa bb", "addresses": [] })) }),
+    );
+    let (_, app) = control_with(&sb, Some(off), None);
+    let r = call(&app, Some("runner"), "network_status", json!({})).await;
+    assert!(!is_error(&r), "{r}");
+    assert_eq!(r["structuredContent"]["role"], "standalone", "{r}");
+    assert!(r["structuredContent"]["note"].as_str().unwrap().contains("Setup, Networking"), "{r}");
+    assert!(r["structuredContent"].get("nodes").is_none(), "{r}");
+
+    let sb = Sandbox::new("network-primary");
+    let primary = Router::new()
+        .route("/api/network/status", get(|| async { Json(json!({ "enabled": true, "role": "primary", "name": "Mac", "fingerprint": "aa bb", "discovery": true, "paired": 1 })) }))
+        .route(
+            "/api/network/nodes",
+            get(|| async {
+                Json(json!({ "nodes": [{
+                    "nodeId": "w1", "name": "Rig", "role": "worker", "online": true, "address": "192.168.1.20:17975", "fingerprint": "cc dd",
+                    "lastError": null, "devices": [{ "id": "gpu0", "name": "RTX 5090", "memory_total_mb": 32768, "memory_used_mb": 1024 }],
+                    "models": [{ "id": "engine:image:node.w1/flux", "kind": "image", "model": "flux", "state": "kept", "device": "gpu0", "pinned": false }]
+                }] }))
+            }),
+        )
+        .route(
+            "/api/network/discover",
+            axum::routing::post(|| async {
+                Json(json!({ "discovery": true, "found": [
+                    { "nodeId": "w1", "name": "Rig", "addresses": ["192.168.1.20:17975"], "paired": true, "compatible": true },
+                    { "nodeId": "w2", "name": "Laptop", "addresses": ["192.168.1.30:17975"], "paired": false, "compatible": true }
+                ] }))
+            }),
+        );
+    let (_, app) = control_with(&sb, Some(primary), None);
+    let r = call(&app, Some("runner"), "network_status", json!({})).await;
+    assert!(!is_error(&r), "{r}");
+    let v = &r["structuredContent"];
+    assert_eq!(v["nodes"][0]["models"][0]["id"], "engine:image:node.w1/flux", "{r}");
+    assert_eq!(v["nodes"][0]["gpus"][0], json!({ "name": "RTX 5090", "memoryTotalMb": 32768, "memoryUsedMb": 1024 }), "{r}");
+    assert_eq!(v["foundOnLan"], json!([{ "name": "Laptop", "addresses": ["192.168.1.30:17975"], "compatible": true }]), "{r}");
+    assert!(!r.to_string().contains("cc dd") && !r.to_string().contains("aa bb"), "no certificates: {r}");
 }
 
 /// The pages the Agent may ask to be shown are the dashboard's own: every view the dashboard can be navigated to (`NAV_VIEWS` in navigate.ts) is one the

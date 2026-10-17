@@ -318,6 +318,24 @@ pub static ROUTES: &[Route] = &[
     scope(Verb::Post, "/api/engines/llm/:action", "models.write"),
     // the language model set to run on a Mac's eGPU, and loading it there
     scope(Verb::Put, "/api/engines/egpu", "models.write"),
+    // OAIY Network (`network/primary.rs`, docs/NETWORK.md): its settings, finding and pairing workers, approving a
+    // primary (on a worker) and unpairing are trust decisions (`auth.*`); a paired worker's models are used as this
+    // desktop's own engines are (`ai.use`). Reached from the dashboard as the eGPU's choice is (since 1).
+    scope(Verb::Get, "/api/network/status", "auth.read"),
+    scope(Verb::Put, "/api/network/settings", "auth.manage"),
+    scope(Verb::Post, "/api/network/discover", "auth.manage"),
+    scope(Verb::Post, "/api/network/pairings/start", "auth.manage"),
+    scope(Verb::Post, "/api/network/pairings/confirm", "auth.manage"),
+    scope(Verb::Get, "/api/network/requests", "auth.read"),
+    scope(Verb::Post, "/api/network/requests/:id/approve", "auth.manage"),
+    scope(Verb::Post, "/api/network/requests/:id/deny", "auth.revoke"),
+    scope(Verb::Get, "/api/network/nodes", "auth.read"),
+    scope(Verb::Delete, "/api/network/nodes/:id", "auth.revoke"),
+    scope(Verb::Get, "/api/network/nodes/:id/resources", "auth.read"),
+    scope(Verb::Put, "/api/network/nodes/:id/pins", "auth.manage"),
+    scope(Verb::Delete, "/api/network/nodes/:id/pins/:pin", "auth.manage"),
+    scope(Verb::Post, "/api/network/nodes/:id/v1/chat/completions", "ai.use"),
+    scope(Verb::Any, "/api/network/nodes/:id/gateway/*path", "ai.use"),
     // runtimes.install
     scope(Verb::Post, "/api/python/install", "runtimes.install"),
     scope(Verb::Post, "/api/python/venvs", "runtimes.install"),
@@ -1135,12 +1153,12 @@ mod tests {
         // seven of the receptionist's transfers and messages).
         assert_eq!(
             want.len(),
-            161 + 41 + 60 - 1 + 4 + 7 + 8 + 3 + 6 + 1,
+            161 + 41 + 60 - 1 + 4 + 7 + 8 + 3 + 6 + 1 + 15,
             "the rows of the design and its documented differences"
         );
         assert_eq!(
-            added, 29,
-            "the routes added since the appendix are the twenty-nine the file lists"
+            added, 44,
+            "the routes added since the appendix are the forty-four the file lists (OAIY Network's fifteen among them)"
         );
         // Four rows the appendix reserves were built (the messages and the ring's settings): the scope is the
         // design's and the `since` is 1, since the routes exist.

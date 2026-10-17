@@ -48,7 +48,9 @@ export function serviceGroup(s: CustomService): string {
 
 /** The label inside its group: an engine entry without its "OAIY engine · " prefix. */
 function labelFor(s: CustomService): string {
-  return s.group === 'engine' ? s.name.replace(/^OAIY engine · /, '') : s.name;
+  const label = s.group === 'engine' ? s.name.replace(/^OAIY engine · /, '') : s.name;
+  // (a paired worker that does not answer now: its model listed, said so)
+  return s.nodeId && s.ready === false ? `${label} (offline)` : label;
 }
 
 export function serviceOptions(

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Check, Cpu, ExternalLink, Loader2, MessageSquare, Plug, RotateCcw, TriangleAlert, X } from 'lucide-react';
+import { Check, Cpu, ExternalLink, Loader2, MessageSquare, Network, Plug, RotateCcw, TriangleAlert, X } from 'lucide-react';
 import { AgentProviderPicker, type ProviderPick } from './AgentProviderPicker';
 import ChatGptConnector from './ChatGptConnector';
 import {
@@ -9,6 +9,7 @@ import {
   control,
   engineRecommendation,
   engines,
+  network,
   type AgentModelSource,
   type AgentPreferences,
   type ControlLogEntry,
@@ -20,8 +21,9 @@ import { answered, errorText, usePoll } from './SetupParts';
 
 /**
  * Settings → Agent: what the Agent may change in OAIY (the switch), the model
- * it thinks with (the engine's, ChatGPT with a model from Codex's catalogue, or
- * an AI provider's), and every change it made through the MCP API, newest first.
+ * it thinks with (the engine's, ChatGPT with a model from Codex's catalogue, an
+ * AI provider's, or a paired worker's language model over OAIY Network), and
+ * every change it made through the MCP API, newest first.
  *
  * Each part reads a route a desktop may not have yet; without it, the part
  * says so plainly (the switch shows as on, the log shows nothing yet).
@@ -49,11 +51,17 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
   const [status, refreshStatus] = usePoll(() => codex.status(), 8000);
   const connected = status?.connected === true;
   const [models, refreshModels, modelsError] = usePoll(() => codexModels(), 60000, connected);
-  const [picked, setPicked] = useState<AgentModelSource | null>(null);
+  // (a paired worker's language models, OAIY Network: offered where there are any)
+  const [nodes] = usePoll(() => network.nodes().catch(() => null), 15000);
+  const workerModels = (nodes?.nodes ?? [])
+    .filter((n) => n.role === 'worker')
+    .flatMap((n) => n.models.filter((m) => m.kind === 'llm').map((m) => ({ id: m.id, label: `${m.model} · ${n.name}${n.online ? '' : ' (offline)'}` })));
+  const [picked, setPicked] = useState<AgentModelSource | 'worker' | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const source = picked ?? prefs?.model.source ?? 'engine';
+  const onWorker = prefs?.model.source === 'engine' && !!prefs.model.model?.startsWith('engine:llm:node.') ? prefs.model.model : null;
+  const source = picked ?? (onWorker ? 'worker' : prefs?.model.source) ?? 'engine';
   const line = localModelLine(rec, catalog);
   const onProvider = prefs?.model.source === 'provider' && prefs.model.provider && prefs.model.model ? prefs.model : null;
   const providerPick: ProviderPick | null = onProvider ? { provider: onProvider.provider!, model: onProvider.model!, name: prefs?.providerName ?? onProvider.provider! } : null;
@@ -82,10 +90,11 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
     }
   };
 
-  const choose = (next: AgentModelSource) => {
+  const choose = (next: AgentModelSource | 'worker') => {
     setPicked(next);
-    // ChatGPT is set once it is signed in (the Agent could not answer with it before); a provider once it and a model are chosen.
-    if (next === 'engine' && prefs?.model.source !== 'engine') void save({ model: { source: 'engine' } });
+    // ChatGPT is set once it is signed in (the Agent could not answer with it before); a provider or a worker's model once
+    // one is chosen.
+    if (next === 'engine' && (prefs?.model.source !== 'engine' || onWorker)) void save({ model: { source: 'engine' } });
     if (next === 'chatgpt' && connected && prefs?.model.source !== 'chatgpt') void save({ model: { source: 'chatgpt' } });
   };
 
@@ -197,6 +206,39 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
               </div>
             )}
           </div>
+          {(workerModels.length > 0 || onWorker) && (
+            <div className={`ai-choice${source === 'worker' ? ' is-selected' : ''}`}>
+              <label className="ai-choice-head">
+                <input type="radio" name="agent-model" checked={source === 'worker'} disabled={saving} onChange={() => choose('worker')} />
+                <span className="setup-req-icon" aria-hidden>
+                  <Network size={16} />
+                </span>
+                <span className="ai-choice-text">
+                  <strong>On a paired computer</strong>
+                  <small className="ai-choice-fact">
+                    {onWorker ? workerModels.find((m) => m.id === onWorker)?.label ?? onWorker : 'A worker’s language model, over OAIY Network (Setup → Networking).'}
+                  </small>
+                </span>
+              </label>
+              {source === 'worker' && (
+                <div className="ai-choice-body">
+                  <select
+                    aria-label="A paired computer's language model"
+                    value={onWorker ?? ''}
+                    disabled={saving}
+                    onChange={(e) => e.target.value && void save({ model: { source: 'engine', model: e.target.value } })}
+                  >
+                    <option value="">Choose a model…</option>
+                    {workerModels.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
       {error && (

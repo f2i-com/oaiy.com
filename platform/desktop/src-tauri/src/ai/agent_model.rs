@@ -9,7 +9,9 @@
 //!   { "model": { "source": "provider", "provider": "lm-studio", "model": "qwen3.5-9b" } }
 //!   ```
 //!   `engine` (the default) is OAIY's own engine, answering with the model
-//!   chosen in Engines. `chatgpt` is the Codex connector's generic route; with
+//!   chosen in Engines, or with a paired worker's language model where `model`
+//!   names one (`engine:llm:node.<nodeId>/<model>`, OAIY Network: the worker
+//!   answers through this desktop, docs/NETWORK.md). `chatgpt` is the Codex connector's generic route; with
 //!   no `model` it runs Codex's own default (its catalogue's `isDefault`).
 //!   `provider` is one of the AI providers (LM Studio, Ollama, an API key),
 //!   reached through the desktop's gateway, with the model named or the one
@@ -133,8 +135,8 @@ impl ModelChoice {
             }
             Some(_) => return Err("`model.model` must be a string".into()),
         };
-        if source == Source::Engine && model.is_some() {
-            return Err("the engine answers with the model chosen in Engines: choose it there (model_set_default for the llm group), and send no `model` with \"engine\"".into());
+        if source == Source::Engine && model.as_deref().is_some_and(|m| worker_llm(m).is_none()) {
+            return Err("the engine answers with the model chosen in Engines: choose it there (model_set_default for the llm group), and send no `model` with \"engine\" (or a paired worker's language model, engine:llm:node.<nodeId>/<model>)".into());
         }
         Ok(Self { source, model, provider })
     }
@@ -229,9 +231,22 @@ impl Store {
 
 /// `{ "model": {…} }`, as both routes answer; on a provider, its name beside it
 /// (`providerName`, for what the Agent shows), when it is still there.
+/// A paired worker's language model as the Agent's `engine` choice names it (`engine:llm:node.<nodeId>/<model>`): its
+/// node and its name there.
+pub fn worker_llm(id: &str) -> Option<(&str, &str)> {
+    let (node, model) = id.strip_prefix("engine:llm:node.")?.split_once('/')?;
+    (!node.is_empty() && node.len() <= 64 && node.chars().all(|c| c.is_ascii_alphanumeric()) && !model.is_empty()).then_some((node, model))
+}
+
 fn preferences(prefs: &Prefs) -> Value {
     let model = prefs.store.model();
     let mut answer = json!({ "model": model.to_json() });
+    // (a paired worker's language model: the worker's name, as a provider's is)
+    if let Some((node, _)) = model.model.as_deref().filter(|_| model.source == Source::Engine).and_then(worker_llm) {
+        if let Some(name) = crate::network::paired_worker(node) {
+            answer["providerName"] = json!(name);
+        }
+    }
     if let Some(id) = model.provider.as_deref() {
         if let Some(p) = prefs.providers.lock().unwrap_or_else(|e| e.into_inner()).get_full(id) {
             answer["providerName"] = json!(p.name);
@@ -286,6 +301,12 @@ async fn put_preferences(State(prefs): State<Prefs>, body: Option<Json<Value>>) 
         Ok(c) => c,
         Err(e) => return bad(e),
     };
+    // (a worker's language model: one of a worker paired here, never a computer named at random)
+    if let Some((node, _)) = choice.model.as_deref().filter(|_| choice.source == Source::Engine).and_then(worker_llm) {
+        if crate::network::paired_worker(node).is_none() {
+            return bad(format!("node {node} is not a worker paired with this computer: pair it in Setup, Networking (OAIY Network)"));
+        }
+    }
     let saving = prefs.store.clone();
     match tokio::task::spawn_blocking(move || saving.set_model(&choice)).await {
         Ok(Ok(())) => Json(preferences(&prefs)).into_response(),
@@ -536,6 +557,13 @@ mod tests {
         }
         let why = ModelChoice::parse(&json!({ "source": "engine", "model": "m" })).unwrap_err();
         assert!(why.contains("model_set_default"), "the refusal names the fix: {why}");
+        // A paired worker's language model (OAIY Network), by its id here; nothing else that looks like one.
+        let remote = ModelChoice::parse(&json!({ "source": "engine", "model": "engine:llm:node.abc123/qwen3.5-9b" })).unwrap();
+        assert_eq!(remote.to_json(), json!({ "source": "engine", "model": "engine:llm:node.abc123/qwen3.5-9b" }));
+        assert_eq!(worker_llm("engine:llm:node.abc123/qwen3.5-9b"), Some(("abc123", "qwen3.5-9b")));
+        for bad in ["engine:llm:node./x", "engine:llm:node.a b/x", "engine:llm:node.abc123/", "engine:image:node.abc123/x", "engine:llm:node.../x"] {
+            assert!(ModelChoice::parse(&json!({ "source": "engine", "model": bad })).is_err(), "{bad}");
+        }
         // A provider, with its model or (until it is checked against the providers) without one.
         let lm = ModelChoice::parse(&json!({ "source": "provider", "provider": "lm-studio", "model": "qwen3.5-9b" })).unwrap();
         assert_eq!(lm, ModelChoice { source: Source::Provider, model: Some("qwen3.5-9b".into()), provider: Some("lm-studio".into()) });
@@ -627,6 +655,11 @@ mod tests {
         assert_eq!(put.json::<Value>().await.unwrap(), json!({ "model": { "source": "chatgpt", "model": "gpt-5.5" } }));
         let v: Value = http.get(&url).send().await.unwrap().json().await.unwrap();
         assert_eq!(v["model"]["model"], "gpt-5.5");
+
+        // A worker's language model is one of a worker paired here (none is, in this test): refused, saying so.
+        let put = http.put(&url).json(&json!({ "model": { "source": "engine", "model": "engine:llm:node.abc123/qwen" } })).send().await.unwrap();
+        assert_eq!(put.status(), 400);
+        assert!(put.text().await.unwrap().contains("not a worker paired with this computer"));
 
         for bad in [
             json!({ "model": { "source": "nope" } }),

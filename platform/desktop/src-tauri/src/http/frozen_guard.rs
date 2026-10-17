@@ -6,7 +6,8 @@
 //! for four lines of `is_personal_path` (marked there) that name the routes the receptionist's transfers and
 //! messages add (`/api/ring/*`, `/api/messages/*`) and for the lines (marked there) that name the routes of the
 //! backup (`/api/backup/status`, `/api/backup/agent/*`, `/api/backup/agent-import*`) and for the line (marked there)
-//! that names the route choosing the eGPU's model (`/api/engines/egpu`). Those routes did not exist at
+//! that names the route choosing the eGPU's model (`/api/engines/egpu`), and for the function and its lines (marked
+//! there) that name OAIY Network's routes (`/api/network/*`). Those routes did not exist at
 //! 2ea1ee8 and were given the guard of every route of their kind (a read is a restricted read, a change is
 //! privileged, what carries the Agent's storage is an export read) when they were built, before the access model
 //! merged (the eGPU's, built after it, has the guard of the engines' other choices); the differential compares the
@@ -130,6 +131,8 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || is_personal_path(path)
                 || is_control_path(path)
                 || is_engine_control_path(path)
+                // (Not in the guard of 2ea1ee8: the same line as the live guard's, for OAIY Network's routes. See the module docs.)
+                || is_network_path(path)
                 // (Not in the guard of 2ea1ee8: the same line as the live guard's, for the routes of the backup, which that guard was given
                 // when they were built. See the module docs.)
                 || is_backup_path(path)
@@ -139,6 +142,8 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
         // executable code the worker hands to the CLI, so it is exec surface.
         Method::PUT => {
             is_bridge_exec_path(path) || is_personal_path(path) || is_setup_path(path) || is_control_path(path) || is_engine_control_path(path)
+                // (Not in the guard of 2ea1ee8: the same line as the live guard's, for OAIY Network's routes. See the module docs.)
+                || is_network_path(path)
         }
         Method::DELETE => {
             path.starts_with("/api/services/")
@@ -150,6 +155,8 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || is_ai_exec_path(path)
                 || is_personal_path(path)
                 || is_control_path(path)
+                // (Not in the guard of 2ea1ee8: the same line as the live guard's, for OAIY Network's routes. See the module docs.)
+                || is_network_path(path)
         }
         _ => false,
     }
@@ -172,6 +179,12 @@ fn is_engine_control_path(path: &str) -> bool {
         // model. See the module docs.)
         || path == "/api/engines/egpu"
         || path.starts_with("/api/engines/llm/")
+}
+
+/// OAIY Network (`network/primary.rs`): its changes privileged, its reads restricted, as the live guard's.
+/// (Not in the guard of 2ea1ee8: the same as the live guard's, for OAIY Network's routes. See the module docs.)
+fn is_network_path(path: &str) -> bool {
+    path.starts_with("/api/network/")
 }
 
 /// The setup wizard's record and its checks (`setup.rs`). Changing it is
@@ -290,7 +303,9 @@ fn is_backup_path(path: &str) -> bool {
 /// snapshot. Gated on the broad allow-list (blocks only a remote cross-origin page; loopback dev
 /// tools + the native CLI still pass).
 fn is_restricted_read_path(path: &str) -> bool {
-    path == "/api/config"
+    // (Not in the guard of 2ea1ee8: the same line as the live guard's, for OAIY Network's routes. See the module docs.)
+    is_network_path(path)
+        || path == "/api/config"
         // (Not in the guard of 2ea1ee8: the same line as the live guard's, for the status of the backup. See the module docs.)
         || path == "/api/backup/status"
         || path == "/api/python/logs"

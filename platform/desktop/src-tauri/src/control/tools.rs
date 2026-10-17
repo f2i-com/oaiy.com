@@ -129,12 +129,16 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "The AI sources flows and the Agent can use: OAIY's engine, configured providers and local AI services, ChatGPT (signed in or not, and as whom), and the Agent's own model preference.",
                 none()),
             def("agent_model_set", "Choose the Agent's model", Change,
-                "Choose what the Agent itself runs on: source engine (the model chosen in Engines), chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out) or provider (one of the AI providers ai_sources_list shows, such as LM Studio or Ollama, by its providerId; an OpenAI-compatible one, since the Agent works with tool calls; model is optional, the provider's own when left out). Live phone calls keep their own fast route on ChatGPT.",
+                "Choose what the Agent itself runs on: source engine (the model chosen in Engines; with model, a paired worker's language model by its id as network_status lists it, engine:llm:node.<nodeId>/<model>), chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out) or provider (one of the AI providers ai_sources_list shows, such as LM Studio or Ollama, by its providerId; an OpenAI-compatible one, since the Agent works with tool calls; model is optional, the provider's own when left out). Live phone calls keep their own fast route on ChatGPT.",
                 object(json!({
                     "source": { "type": "string", "enum": ["engine", "chatgpt", "provider"], "description": "engine, chatgpt or provider." },
                     "provider": { "type": "string", "minLength": 1, "description": "provider only: the AI provider's providerId (provider:<id> is read too)." },
-                    "model": { "type": "string", "minLength": 1, "description": "chatgpt: a model from Codex's catalogue; provider: a model the provider lists." }
+                    "model": { "type": "string", "minLength": 1, "description": "chatgpt: a model from Codex's catalogue; provider: a model the provider lists; engine: a paired worker's language model's id (network_status)." }
                 }), &["source"])),
+            // OAIY Network
+            def("network_status", "OAIY Network", Read,
+                "OAIY Network (other OAIY computers on this LAN): whether it is on, this computer's role (primary: it uses paired workers' models; worker: it lends its own), the workers found on the LAN, and the paired computers, each online or not with its GPUs and models. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
+                none()),
             def("chatgpt_sign_in", "Sign in to ChatGPT", Change,
                 "Start signing OAIY in to ChatGPT (its Codex connector). Answers the address for the person to open and sign in at (with deviceCode, a code for them to type instead); ai_sources_list shows when they have.",
                 object(json!({ "deviceCode": { "type": "boolean", "description": "Use the device-code sign-in (a code to type) instead of a browser redirect." } }), &[])),
@@ -300,7 +304,7 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "Record OAIY's first-run setup as finished, so the dashboard stops offering it.",
                 none()),
             def("ui_open", "Show a dashboard page", Change,
-                "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), messages (what the receptionist took when the owner could not be reached), transfers (whether the receptionist may try to reach the owner for a caller who asks, and how), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
+                "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), messages (what the receptionist took when the owner could not be reached), transfers (whether the receptionist may try to reach the owner for a caller who asks, and how), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, network (Networking: OAIY Network, pairing other OAIY computers), plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
                 object(json!({
                     "view": { "type": "string", "minLength": 1, "description": "The page." },
                     "contact": { "type": "string", "minLength": 1, "description": "With view contacts: a person's phone number, written any way, to open their contact." }
@@ -517,13 +521,15 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             done(format!("The language model is {state}."), v)
         }
         "ai_sources_list" => ai_sources_list(d).await,
+        "network_status" => network_status(d).await,
         "agent_model_set" => {
             let source = a.req("source");
             let model = a.str("model");
             // As ai_sources_list's id names it, or bare.
             let provider = a.str("provider").map(|p| p.strip_prefix("provider:").unwrap_or(p));
-            if source == "engine" && model.is_some() {
-                return Err("model goes with chatgpt or provider: on the engine the Agent uses the model chosen in Engines (model_set_default for llm).".into());
+            // (on the engine, a model is a paired worker's language model, OAIY Network; the desktop checks it is one)
+            if source == "engine" && model.is_some_and(|m| !m.starts_with("engine:llm:node.")) {
+                return Err("model goes with chatgpt or provider: on the engine the Agent uses the model chosen in Engines (model_set_default for llm), or a paired worker's language model by its id (engine:llm:node.<nodeId>/<model>, as network_status lists it).".into());
             }
             if source != "provider" && provider.is_some() {
                 return Err("provider goes with source provider only.".into());
@@ -547,6 +553,7 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
                     let model = v.pointer("/model/model").and_then(Value::as_str).unwrap_or("its model");
                     format!("{name} ({model})")
                 }
+                ("engine", Some(m)) => format!("{m} on {} (OAIY Network)", v.get("providerName").and_then(Value::as_str).unwrap_or("a paired worker")),
                 _ => "the engine (the model chosen in Engines)".to_string(),
             };
             done(format!("The Agent now runs on {on}."), v)
@@ -1362,6 +1369,71 @@ async fn ai_sources_list(d: &Desk) -> Result<Done, String> {
     }))
 }
 
+/// OAIY Network, compact: this computer's part, then each paired computer with its GPUs and models (docs/NETWORK.md).
+async fn network_status(d: &Desk) -> Result<Done, String> {
+    let status = d.get("/api/network/status").await?;
+    let mut out = json!({});
+    for key in ["enabled", "role", "name", "addresses", "listening", "discovery", "waiting", "found", "paired"] {
+        if let Some(v) = status.get(key).filter(|v| !v.is_null()) {
+            out[key] = v.clone();
+        }
+    }
+    if status.get("role").and_then(Value::as_str).unwrap_or("standalone") == "standalone" {
+        out["note"] = json!("OAIY Network is off: the person switches it on in Setup, Networking.");
+        return data(out);
+    }
+    let (nodes, found) = tokio::join!(d.get("/api/network/nodes"), async {
+        if status.get("role").and_then(Value::as_str) == Some("primary") {
+            Some(d.post_empty("/api/network/discover").await)
+        } else {
+            None
+        }
+    });
+    out["nodes"] = part(nodes, |v| {
+        Value::Array(
+            arr(&v, "nodes")
+                .iter()
+                .map(|n| {
+                    let mut row = json!({
+                        "nodeId": n.get("nodeId"), "name": n.get("name"), "role": n.get("role"), "online": n.get("online"),
+                        "address": n.get("address"),
+                    });
+                    for key in ["lastError", "enginesError"] {
+                        if let Some(e) = n.get(key).filter(|e| !e.is_null()) {
+                            row[key] = e.clone();
+                        }
+                    }
+                    row["gpus"] = Value::Array(
+                        arr(n, "devices")
+                            .iter()
+                            .map(|g| json!({ "name": g.get("name"), "memoryTotalMb": g.get("memory_total_mb"), "memoryUsedMb": g.get("memory_used_mb") }))
+                            .collect(),
+                    );
+                    row["models"] = Value::Array(
+                        arr(n, "models")
+                            .iter()
+                            .map(|m| json!({ "id": m.get("id"), "kind": m.get("kind"), "model": m.get("model"), "state": m.get("state") }))
+                            .collect(),
+                    );
+                    row
+                })
+                .collect(),
+        )
+    });
+    if let Some(found) = found {
+        out["foundOnLan"] = part(found, |v| {
+            Value::Array(
+                arr(&v, "found")
+                    .iter()
+                    .filter(|f| f.get("paired") != Some(&Value::Bool(true)))
+                    .map(|f| json!({ "name": f.get("name"), "addresses": f.get("addresses"), "compatible": f.get("compatible") }))
+                    .collect(),
+            )
+        });
+    }
+    data(out)
+}
+
 async fn services_list(d: &Desk) -> Result<Done, String> {
     let v = d.get("/api/services").await?;
     let rows: Vec<Value> = arr(&v, "services")
@@ -1910,8 +1982,8 @@ async fn setup_status(d: &Desk) -> Result<Done, String> {
 }
 
 /// The dashboard's own pages, as it names them.
-pub(crate) const VIEWS: [&str; 18] = [
-    "overview", "agent", "flows", "calendar", "contacts", "messages", "transfers", "hours", "engines", "services", "plugins", "runs", "models", "python", "providers", "connections", "settings", "setup",
+pub(crate) const VIEWS: [&str; 19] = [
+    "overview", "agent", "flows", "calendar", "contacts", "messages", "transfers", "hours", "engines", "services", "network", "plugins", "runs", "models", "python", "providers", "connections", "settings", "setup",
 ];
 
 // ---------------------------------------------------------------------------

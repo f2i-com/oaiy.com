@@ -24,6 +24,8 @@ import {
   providerFor,
   readAgentModel,
   sameModel,
+  workerModel,
+  workerProvider,
   type AgentKind,
 } from '../../src/desktop/agentModel';
 import { NetGate } from '../../src/gate/netgate';
@@ -129,6 +131,35 @@ describe('the provider each kind of conversation runs on', () => {
     // No name from the desktop: its id.
     expect(desktopProvider(DESK, { source: 'provider', provider: 'ollama', model: 'gemma4' }).name).toBe('ollama');
     // No desktop to reach it by: the engine.
+    expect(providerFor('project', choice, ENGINE_PROVIDER, null, null)).toBe(ENGINE_PROVIDER);
+  });
+
+  it("on a paired worker's language model (OAIY Network): every conversation through the desktop's route for that worker, with the desktop token", () => {
+    const body = { model: { source: 'engine', model: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m' }, providerName: 'Rig' };
+    const choice = parseAgentModel(body)!;
+    expect(choice).toEqual({ source: 'engine', model: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m', name: 'Rig' });
+    for (const kind of KINDS) {
+      const p = providerFor(kind, choice, ENGINE_PROVIDER, DESK, null)!;
+      expect(p).toMatchObject({
+        id: 'oaiy-worker-abc123',
+        type: 'custom',
+        serverKind: 'other',
+        name: 'Rig (OAIY Network)',
+        apiKey: 'desk-token',
+        baseUrl: 'http://127.0.0.1:17972/api/network/nodes/abc123/v1',
+        modelId: 'qwen3.5-9b-q4-k-m',
+        parallelAgents: 1,
+      });
+      expect(p.followEngine).toBeUndefined();
+    }
+    expect(modelChipText(workerProvider(DESK, choice as { source: 'engine'; model: string; name: string }))).toBe('Rig (OAIY Network) · qwen3.5-9b-q4-k-m');
+    // Not the same choice as the engine's own, nor another worker's model.
+    expect(sameModel(choice, ENGINE)).toBe(false);
+    expect(sameModel(choice, { source: 'engine', model: 'engine:llm:node.other/qwen3.5-9b-q4-k-m' })).toBe(false);
+    expect(sameModel(choice, parseAgentModel(body)!)).toBe(true);
+    // Something else in the engine's model is the engine's own; with no desktop, the engine too.
+    expect(parseAgentModel({ model: { source: 'engine', model: '../x' } })).toEqual(ENGINE);
+    expect(workerModel('engine:image:node.abc123/flux')).toBeNull();
     expect(providerFor('project', choice, ENGINE_PROVIDER, null, null)).toBe(ENGINE_PROVIDER);
   });
 

@@ -88,6 +88,7 @@ const TOOLS: Record<string, [string, string]> = {
   engine_stop: ['Stopped the engine', 'power'],
   engine_restart: ['Restarted the engine', 'refresh'],
   ai_sources_list: ['Looked at the AI sources', 'sparkle'],
+  network_status: ['Looked at OAIY Network', 'server'],
   agent_model_set: ["Chose the Agent's model", 'sparkle'],
   chatgpt_sign_in: ['Started the ChatGPT sign-in', 'user'],
   chatgpt_sign_out: ['Signed out of ChatGPT', 'user'],

@@ -535,12 +535,24 @@ pub(super) fn scan(files: &[(String, String)]) -> Scan {
 
 /// Routes the scan finds that are not on the main router: the voice gateway's own listener
 /// (`voice/mod.rs`, port 17872, its own token) answers its own `/api/health` and realtime stream;
-/// a Mac's listener for the Agent's page (`embed.rs`, port 17974) answers with its built files alone.
+/// a Mac's listener for the Agent's page (`embed.rs`, port 17974) answers with its built files alone;
+/// an OAIY Network worker's listener (`network/worker.rs`, its own port, mutual TLS) answers its paired primary.
 pub(super) const NOT_ON_MAIN_ROUTER: &[(&str, &str)] = &[
     ("voice/mod.rs", "/api/health"),
     ("voice/mod.rs", "/api/ai/providers/:id/v1/realtime/stream"),
     ("embed.rs", "/"),
     ("embed.rs", "/*path"),
+    // an OAIY Network worker's listener on the LAN (`network/worker.rs`): mutual TLS, a paired primary's pinned
+    // certificate for all but health and pairing; it serves nothing of this API
+    ("network/worker.rs", "/worker/v1/health"),
+    ("network/worker.rs", "/worker/v1/pair"),
+    ("network/worker.rs", "/worker/v1/pair/:id"),
+    ("network/worker.rs", "/worker/v1/unpair"),
+    ("network/worker.rs", "/worker/v1/capabilities"),
+    ("network/worker.rs", "/worker/v1/resources"),
+    ("network/worker.rs", "/worker/v1/pins"),
+    ("network/worker.rs", "/worker/v1/chat"),
+    ("network/worker.rs", "/worker/v1/gateway/*path"),
 ];
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -701,10 +713,10 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
     // (`backup/routes.rs`: the status and the Agent page's hand-over of its storage), and the routes of
     // `/api/auth/` that the access model has built so far are the rows with `since: 2` that exist:
     // `info`, `whoami` and `derive`, and the web login's fifteen (`login.rs`, `console.rs`). The last one is the
-    // eGPU's model (`PUT /api/engines/egpu`, `control/engines.rs`).
+    // eGPU's model (`PUT /api/engines/egpu`, `control/engines.rs`), then OAIY Network's fifteen (`network/primary.rs`).
     assert_eq!(
         pairs.len(),
-        165 + 11 + 8 + 3 + 15 + 3 + 6 + 1,
+        165 + 11 + 8 + 3 + 15 + 3 + 6 + 1 + 15,
         "main-router (method, path) pairs"
     );
     let mut built: Vec<String> = ROUTES
@@ -771,7 +783,7 @@ fn the_table_has_a_row_for_every_route_the_boot_test_probes_and_the_counts_the_d
     let new_or_reserved = ROUTES.iter().filter(|r| r.since == 2).count();
     // 161 in the design, the eleven routes the code gained since (see above), the eight of the encrypted backup, and
     // the eGPU's model.
-    assert_eq!(existing, 165 + 11 + 8 + 3 + 6 + 1);
+    assert_eq!(existing, 165 + 11 + 8 + 3 + 6 + 1 + 15, "and OAIY Network's fifteen");
     // 41 new and 60 reserved in the design; `GET /api/update` (reserved) is gone, replaced by the
     // real `GET /api/update/status`, and four reserved rows (`GET|PATCH /api/messages`,
     // `GET|PUT /api/ring/settings`) are `since: 1` now that their routes exist.
@@ -1032,9 +1044,11 @@ mod fixtures {
         for (file, _) in NOT_ON_MAIN_ROUTER {
             *names.entry(file).or_default() += 1;
         }
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 3);
         assert_eq!(names["voice/mod.rs"], 2);
         // (a Mac's Agent page: its files, from a listener that serves nothing else)
         assert_eq!(names["embed.rs"], 2);
+        // (an OAIY Network worker's listener on the LAN: its eight routes, for a paired primary)
+        assert_eq!(names["network/worker.rs"], 9);
     }
 }

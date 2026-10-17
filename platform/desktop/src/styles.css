@@ -1747,3 +1747,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .overview-status .btn-tiny { margin-left: auto; }
 .overview-tile-static { cursor: default; }
 .overview-tile-static:hover { border-color: var(--border); transform: none; }
+
+/* Networking: a worker's model, with its Pin / Unpin beside it */
+.network-model { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 1px 0; }
+.network-model > span { min-width: 0; overflow-wrap: anywhere; }
+.network-model .btn-tiny { flex: none; }

@@ -180,6 +180,11 @@ export interface CustomService {
   kind?: string;
   /** OAIY engine entries: the default model of its kind. */
   default?: boolean;
+  /** A paired worker's model (OAIY Network, docs/NETWORK.md): the computer that runs it. */
+  nodeId?: string;
+  nodeName?: string;
+  /** False while that worker does not answer (its model is listed, not ready). */
+  ready?: boolean;
   /**
    * OAIY Desktop services: whether it is in use (running, or set to start
    * with OAIY). One that is not is still installed and still runs a flow

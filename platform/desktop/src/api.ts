@@ -2095,6 +2095,140 @@ export const engines = {
   addModelFile: (path: string) => tauriInvoke<AddedModelFile>('add_engine_model', { path }),
 };
 
+// ----- OAIY Network (other OAIY computers on the LAN: docs/NETWORK.md) -----
+
+export type NetworkRole = 'standalone' | 'primary' | 'worker';
+
+export interface NetworkSettings {
+  enabled: boolean;
+  role: NetworkRole;
+  /** The name other computers show for this one (the computer's own where empty). */
+  name: string;
+  /** The port a worker listens on. */
+  port: number;
+  /** The address a worker listens on (empty: every interface). */
+  bind: string;
+}
+
+export interface NetworkStatus {
+  enabled: boolean;
+  /** The role in effect (standalone while Network is off). */
+  role: NetworkRole;
+  settings: NetworkSettings;
+  nodeId: string | null;
+  name: string;
+  /** This computer's certificate's fingerprint, as a person compares it. */
+  fingerprint: string | null;
+  /** Where a worker listens. */
+  listening: string | null;
+  /** This computer's LAN addresses with the worker's port: what a primary types where discovery is blocked. */
+  addresses: string[];
+  discovery: boolean;
+  protocol: number;
+  /** Pairing requests waiting here (a worker). */
+  waiting: number;
+  /** Workers found on the LAN (a primary). */
+  found: number;
+  paired: number;
+}
+
+export interface NetworkFound {
+  nodeId: string;
+  name: string;
+  addresses: string[];
+  protocol: number;
+  seenMs: number;
+  paired: boolean;
+  compatible: boolean;
+}
+
+export interface NetworkRequest {
+  id: string;
+  nodeId: string;
+  name: string;
+  address: string;
+  code: string;
+  fingerprint: string;
+  secondsLeft: number;
+}
+
+export interface NetworkDevice {
+  id: string;
+  name: string;
+  unified?: boolean;
+  memory_total_mb?: number | null;
+  memory_used_mb?: number | null;
+  load?: number | null;
+}
+
+export interface NetworkModel {
+  /** Its id in this computer's engine catalogue (`engine:<kind>:node.<id>/<model>`). */
+  id: string;
+  kind: string;
+  model: string;
+  state: string;
+  device: string | null;
+  /** Kept loaded on the worker (a pin): `warming` while it loads, `ready`, `failed` (with why) or `waiting`. */
+  pinned: boolean;
+  pinState?: 'warming' | 'ready' | 'failed' | 'waiting' | null;
+  pinError?: string | null;
+}
+
+export interface NetworkNode {
+  nodeId: string;
+  name: string;
+  /** What it is to this computer: a worker, or (to a worker) its primary. */
+  role: NetworkRole;
+  address: string;
+  fingerprint: string;
+  pairedAtMs: number;
+  online: boolean;
+  lastSeenMs: number | null;
+  lastError: string | null;
+  node: { appVersion?: string; os?: string; arch?: string } | null;
+  enginesError: string | null;
+  devices: NetworkDevice[];
+  models: NetworkModel[];
+}
+
+export interface NetworkPairing {
+  pairingId: string;
+  code: string;
+  worker: { nodeId: string; name: string; address: string; fingerprint: string };
+  status: string;
+}
+
+export const network = {
+  status: () => request<NetworkStatus>('/api/network/status'),
+  /** Switch Network on or off, choose this computer's role, name or (a worker's) port. */
+  setSettings: (change: Partial<NetworkSettings>) =>
+    request<NetworkStatus>('/api/network/settings', { method: 'PUT', body: JSON.stringify(change) }),
+  /** The workers advertised on the LAN (a primary). */
+  discover: () => request<{ discovery: boolean; found: NetworkFound[] }>('/api/network/discover', { method: 'POST' }),
+  /** Ask a worker to pair, by its address or as found on the LAN: the code to compare with its screen. */
+  startPairing: (target: { address?: string; nodeId?: string }) =>
+    request<NetworkPairing>('/api/network/pairings/start', { method: 'POST', body: JSON.stringify(target) }),
+  /** Whether the worker's person approved (then it is paired here too). */
+  confirmPairing: (pairingId: string) =>
+    request<{ status: 'pending' | 'approved' | 'denied' | 'expired'; code?: string; node?: NetworkNode }>('/api/network/pairings/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ pairingId }),
+    }),
+  /** Primaries asking to pair with this worker, each with its code. */
+  requests: () => request<{ requests: NetworkRequest[] }>('/api/network/requests'),
+  approve: (id: string) => request<{ status: string }>(`/api/network/requests/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
+  deny: (id: string) => request<{ status: string }>(`/api/network/requests/${encodeURIComponent(id)}/deny`, { method: 'POST' }),
+  nodes: () => request<{ nodes: NetworkNode[] }>('/api/network/nodes'),
+  /** Keep a worker's model loaded there (a picture model, or its chosen language model), by its id here. */
+  pin: (nodeId: string, id: string) =>
+    request<unknown>(`/api/network/nodes/${encodeURIComponent(nodeId)}/pins`, { method: 'PUT', body: JSON.stringify({ id }) }),
+  /** Let a worker's pinned model go as any other again, by its name there. */
+  unpin: (nodeId: string, model: string) =>
+    request<unknown>(`/api/network/nodes/${encodeURIComponent(nodeId)}/pins/${encodeURIComponent(model)}`, { method: 'DELETE' }),
+  /** Unpair: its certificate no longer lets it in. */
+  unpair: (nodeId: string) => request<void>(`/api/network/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' }),
+};
+
 // ----- setup (the wizard's record, on the desktop) -----
 
 export interface FirstRunState {

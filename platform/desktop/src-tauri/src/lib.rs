@@ -46,6 +46,8 @@ pub mod update;
 pub mod auth;
 /// Where each system's package keeps the files the installer carries (the CLI, a Node runtime).
 pub mod installed;
+/// OAIY Network: other OAIY computers' GPUs and models, paired on the LAN (docs/NETWORK.md).
+pub mod network;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).

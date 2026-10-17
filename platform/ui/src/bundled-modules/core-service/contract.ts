@@ -53,6 +53,16 @@ export function engineKindOf(id: string): string | null {
 export const ENGINE_CHAT_ENDPOINT = '/api/ai/providers/oaiy-engine/v1/chat/completions';
 
 /**
+ * A model of a worker paired over OAIY Network (docs/NETWORK.md): `engine:<kind>:node.<nodeId>/<model>`, its node and
+ * the worker's own name for it; null for any other id. Parsed whole, never split on its colons: a model's name is not
+ * a path or a second id.
+ */
+export function remoteModelOf(id: string): { kind: string; nodeId: string; model: string } | null {
+  const m = /^engine:([a-z0-9]+):node\.([A-Za-z0-9]{1,64})\/(.+)$/.exec(id);
+  return m ? { kind: m[1].toLowerCase(), nodeId: m[2], model: m[3] } : null;
+}
+
+/**
  * OAIY's engine's language model for an `engine:llm` id (or `engine:llm:<model>`)
  * that no list here has: a flow run by the desktop's bridge, the CLI or the
  * Agent has none, and the AI node fell back to a local GGUF and failed. The
@@ -60,12 +70,15 @@ export const ENGINE_CHAT_ENDPOINT = '/api/ai/providers/oaiy-engine/v1/chat/compl
  */
 export function engineChatService(id: string): CustomService | null {
   if (!/^engine:llm(?::.+)?$/i.test(id)) return null;
+  // A paired worker's language model goes to that worker (through the desktop), never to this computer's: a worker
+  // that is not paired any more is said so by the desktop, rather than another model answering in its place.
+  const remote = remoteModelOf(id);
   return {
     id,
-    name: 'OAIY engine · LLM',
+    name: remote ? `OAIY engine · LLM · ${remote.model} · a paired worker` : 'OAIY engine · LLM',
     group: 'engine',
     kind: 'llm',
-    endpoint: ENGINE_CHAT_ENDPOINT,
+    endpoint: remote ? `/api/network/nodes/${remote.nodeId}/v1/chat/completions` : ENGINE_CHAT_ENDPOINT,
     method: 'POST',
     apiFormat: 'openai',
     headers: '{}',
@@ -75,9 +88,12 @@ export function engineChatService(id: string): CustomService | null {
   };
 }
 
-/** The engine's default service of `kind` in `list` (else its first). */
+/**
+ * The engine's default service of `kind` in `list` (else its first): this computer's own. A paired worker's model is
+ * used where a flow names it, never as a default (a worker appearing changes no flow).
+ */
 export function engineDefault(list: CustomService[], kind: string): CustomService | null {
-  const of = list.filter((s) => s.group === 'engine' && s.kind === kind);
+  const of = list.filter((s) => s.group === 'engine' && s.kind === kind && !s.nodeId);
   return of.find((s) => s.default) ?? of[0] ?? null;
 }
 

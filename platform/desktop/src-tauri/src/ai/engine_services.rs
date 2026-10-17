@@ -222,9 +222,15 @@ async fn list(State(st): State<AiState>) -> Response {
         Ok((_, discovery)) => {
             let mut services = services_from_discovery(&discovery);
             services.extend(voice);
+            // (and the models of the workers paired over OAIY Network, under node-scoped ids: crate::network)
+            services.extend(crate::network::remote_services());
             Json(json!({ "running": true, "services": services })).into_response()
         }
-        Err(reason) => Json(json!({ "running": false, "reason": reason, "services": voice })).into_response(),
+        Err(reason) => {
+            let mut services = voice;
+            services.extend(crate::network::remote_services());
+            Json(json!({ "running": false, "reason": reason, "services": services })).into_response()
+        }
     }
 }
 
@@ -376,18 +382,35 @@ fn forwardable(discovery: &Value, path: &str) -> bool {
 /// `/api/ai/engine/gateway/<gateway path>`: the call, sent on to the gateway and its answer streamed back.
 async fn forward(State(st): State<AiState>, req: Request) -> Response {
     match engine_discovery(&st).await {
-        Ok((gateway, discovery)) => forward_to(&gateway, &discovery, req).await,
+        Ok((gateway, discovery)) => {
+            let path = req.uri().path().strip_prefix(GATEWAY_PREFIX).unwrap_or("").to_string();
+            forward_to(&gateway, &discovery, path, req).await
+        }
         Err(e) => ai_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
     }
 }
 
-/// Send `req` (a `GATEWAY_PREFIX` route) on to `gateway`, if `discovery` has it as a media route.
-async fn forward_to(gateway: &str, discovery: &Value, req: Request) -> Response {
+/// This computer's engines, for OAIY Network's worker (`crate::network`): their gateway and discovery document
+/// (nothing started), and where their control pages are.
+pub(crate) async fn local_engines(st: &AiState) -> Result<(String, Value), String> {
+    engine_discovery(st).await
+}
+
+pub(crate) fn local_engines_ui(st: &AiState) -> Option<String> {
+    st.engines_ui()
+}
+
+/// A worker's `/worker/v1/gateway/<gateway path>`: as [`forward`], the path given.
+pub(crate) async fn forward_path(gateway: &str, discovery: &Value, path: String, req: Request) -> Response {
+    forward_to(gateway, discovery, path, req).await
+}
+
+/// Send `req` (for the gateway's `path`) on to `gateway`, if `discovery` has it as a media route.
+async fn forward_to(gateway: &str, discovery: &Value, path: String, req: Request) -> Response {
     let method = req.method().as_str().to_ascii_uppercase();
     if !matches!(method.as_str(), "GET" | "POST" | "DELETE") {
         return ai_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", format!("{method} is not forwarded"));
     }
-    let path = req.uri().path().strip_prefix(GATEWAY_PREFIX).unwrap_or("").to_string();
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     if !forwardable(discovery, &path) {
         return ai_error(StatusCode::NOT_FOUND, "not_forwarded", format!("{path} is not one of the engine's media routes"));
@@ -439,6 +462,11 @@ async fn forward_to(gateway: &str, discovery: &Value, req: Request) -> Response 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gateway path a request to this desktop's gateway route names.
+    fn gateway_path(req: &Request) -> String {
+        req.uri().path().strip_prefix(GATEWAY_PREFIX).unwrap_or("").to_string()
+    }
 
     fn discovery() -> Value {
         json!({
@@ -535,9 +563,9 @@ mod tests {
     async fn the_engines_files_are_only_read() {
         // (nothing listens on the discard port: a call that got through would be a 502, not a 405)
         let post = Request::builder().method("POST").uri(format!("{GATEWAY_PREFIX}/files/images/a.png")).body(Body::empty()).unwrap();
-        assert_eq!(forward_to("http://127.0.0.1:9", &discovery(), post).await.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(forward_to("http://127.0.0.1:9", &discovery(), gateway_path(&post), post).await.status(), StatusCode::METHOD_NOT_ALLOWED);
         let get = Request::builder().method("GET").uri(format!("{GATEWAY_PREFIX}/files/images/a.png")).body(Body::empty()).unwrap();
-        assert_eq!(forward_to("http://127.0.0.1:9", &discovery(), get).await.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(forward_to("http://127.0.0.1:9", &discovery(), gateway_path(&get), get).await.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
@@ -567,7 +595,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from("{}"))
             .unwrap();
-        let response = forward_to(&gateway, &discovery(), req).await;
+        let response = forward_to(&gateway, &discovery(), gateway_path(&req), req).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
@@ -616,7 +644,7 @@ mod tests {
         let desktop_app = Router::new().route(&format!("{GATEWAY_PREFIX}/*path"),
             any(move |req: Request| {
                 let (g, d) = (upstream.clone(), hidden.clone());
-                async move { forward_to(&g, &d, req).await }
+                async move { forward_to(&g, &d, gateway_path(&req), req).await }
             })).layer(middleware::from_fn_with_state(guard, scoped_guard));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let desktop = format!("http://{}{GATEWAY_PREFIX}/v1/images/generations", listener.local_addr().unwrap());
@@ -684,7 +712,7 @@ mod tests {
         let app = Router::new().route(&format!("{GATEWAY_PREFIX}/*path"),
             any(move |req: Request| {
                 let (g, d) = (g.clone(), d.clone());
-                async move { forward_to(&g, &d, req).await }
+                async move { forward_to(&g, &d, gateway_path(&req), req).await }
             })).layer(middleware::from_fn_with_state(guard, scoped_guard));
         let mut records = Vec::new();
         let mut hashes = Vec::new();
@@ -768,7 +796,7 @@ mod tests {
                 &format!("{GATEWAY_PREFIX}/*path"),
                 any(move |req: Request| {
                     let (g, d) = (g.clone(), d.clone());
-                    async move { forward_to(&g, &d, req).await }
+                    async move { forward_to(&g, &d, gateway_path(&req), req).await }
                 })
                 .layer(DefaultBodyLimit::max(FORWARD_BODY_LIMIT)),
             )

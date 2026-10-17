@@ -28,6 +28,7 @@ import {
   TriangleAlert,
   Workflow,
   type LucideIcon,
+  Network,
 } from 'lucide-react';
 import { API_BASE, DESKTOP_LAUNCH, openExternal, phone as phoneApi } from './api';
 import { moduleOn, useModules } from './useModules';
@@ -35,6 +36,7 @@ import { arrangeSections, buildSections, newBadge, pluginPageOf, sectionOf as fi
 import { useWaitingRequests } from './calendarRequests';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
+import NetworkPanel from './NetworkPanel';
 import ModelsPanel from './ModelsPanel';
 import PythonPanel from './PythonPanel';
 import PluginsPanel from './PluginsPanel';
@@ -94,6 +96,8 @@ type BuiltinView =
   | 'engines'
   | 'overview'
   | 'services'
+  /** OAIY Network: other OAIY computers on the LAN, paired, and their GPUs and models. */
+  | 'network'
   | 'plugins'
   | 'runs'
   | 'models'
@@ -132,6 +136,7 @@ const SECTIONS: Section[] = [
   { id: 'transfers', label: 'Transfers', icon: PhoneForwarded, group: 'Work', tabs: ['transfers'] },
   { id: 'engines', label: 'Engines', icon: Cpu, group: 'Setup', tabs: ['engines', 'models'] },
   { id: 'services', label: 'Services', icon: Server, group: 'Setup', tabs: ['services', 'python'] },
+  { id: 'network', label: 'Networking', icon: Network, group: 'Setup', tabs: ['network'] },
   { id: 'connections', label: 'Connections', icon: Plug, group: 'Setup', tabs: ['connections', 'providers', 'plugins'] },
 ];
 const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, group: 'Setup', tabs: ['settings', 'agent-settings'] };
@@ -196,6 +201,7 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   models: { tab: 'Model files', icon: Package, copy: 'Download weights from Hugging Face and manage what is on disk.' },
   services: { tab: 'Services', icon: Server, copy: 'Start, stop and install the local AI services this machine offers OAIY.' },
   python: { tab: 'Python', icon: HardDrive, copy: 'A bundled Python and reusable venvs, so no system Python is needed.' },
+  network: { tab: 'Networking', icon: Network, copy: 'Other OAIY computers on your network: pair them, and use their GPUs and models from here.' },
   connections: { tab: 'Connections', icon: ShieldCheck, copy: 'Apps and accounts allowed to run flows and call plugins on this machine.' },
   providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this device.' },
   plugins: { tab: 'Plugins', icon: Puzzle, copy: 'Supervised extensions that add connectors and events to your flows.' },
@@ -864,6 +870,7 @@ export default function App() {
               <PluginScreenPage pluginId={pluginView[1]} navId={pluginView[2]} onNavigate={(v) => setView(v)} />
             )}
             {view === 'services' && <ServicesPanel />}
+            {view === 'network' && <NetworkPanel />}
             {view === 'plugins' && <PluginsPanel />}
             {view === 'runs' && <RunsPanel />}
             {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}

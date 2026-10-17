@@ -36,6 +36,8 @@ export const NAV_VIEWS = [
   'engines',
   'models',
   'services',
+  /** Networking: OAIY Network, other OAIY computers on the LAN and pairing them. */
+  'network',
   'python',
   'connections',
   'providers',

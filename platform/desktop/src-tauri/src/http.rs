@@ -794,6 +794,7 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || is_personal_path(path)
                 || is_control_path(path)
                 || is_engine_control_path(path)
+                || is_network_path(path)
                 // The Agent page handing its storage over to a backup a session the desktop opened.
                 || crate::backup::routes::is_backup_path(path)
         }
@@ -802,6 +803,7 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
         // executable code the worker hands to the CLI, so it is exec surface.
         Method::PUT => {
             is_bridge_exec_path(path) || is_personal_path(path) || is_setup_path(path) || is_control_path(path) || is_engine_control_path(path)
+                || is_network_path(path)
         }
         Method::DELETE => {
             path.starts_with("/api/services/")
@@ -813,6 +815,7 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || is_ai_exec_path(path)
                 || is_personal_path(path)
                 || is_control_path(path)
+                || is_network_path(path)
         }
         _ => false,
     }
@@ -1057,6 +1060,13 @@ async fn engines_download_start(Json(body): Json<EngineDownloadBody>) -> axum::r
     }
 }
 
+/// OAIY Network (`network/primary.rs`): pairing and unpairing computers, its settings, and a paired worker's
+/// models. Every change is privileged (whom this computer trusts, and running another computer's models), and every
+/// read is a restricted read (a pairing request's code, the paired computers' addresses). 
+fn is_network_path(path: &str) -> bool {
+    path.starts_with("/api/network/")
+}
+
 /// The setup wizard's record and its checks (`setup.rs`). Changing it is
 /// privileged: accepting a plugin's capabilities is a trust act, and a check
 /// runs one of the plugin's commands. Reading it is a restricted read.
@@ -1167,7 +1177,8 @@ fn is_export_path(path: &str) -> bool {
 /// snapshot. Gated on the broad allow-list (blocks only a remote cross-origin page; loopback dev
 /// tools + the native CLI still pass).
 fn is_restricted_read_path(path: &str) -> bool {
-    path == "/api/config"
+    is_network_path(path)
+        || path == "/api/config"
         || path == "/api/python/logs"
         || path == "/api/node"
         || path == "/api/node/logs"
@@ -1714,6 +1725,19 @@ pub async fn serve(
     // registry clone), merged INSIDE the guard layers like the bridge — provider
     // CRUD and the credential-injecting chat proxy need the same origin/token gate.
     let ai_state = crate::ai::AiState::new(ai_providers, registry_for_ai, ai_codex);
+    // OAIY Network (docs/NETWORK.md): off until switched on; on, a worker's listener on the LAN or a primary's
+    // heartbeat to its workers, started here and changed from the Networking page.
+    let network = crate::network::Network::open(&data_dir_for_auth, ai_state.clone());
+    network.share();
+    if !isolated {
+        let started = network.clone();
+        tokio::spawn(async move {
+            if let Err(e) = started.apply().await {
+                log::warn!("network: not started: {e}");
+            }
+        });
+    }
+    let network_routes = crate::network::router(network);
     let plugin_ai_routes = crate::ai::plugin_completion::router(ai_state.clone(), plugin_ai_host, isolated);
     // Aokie's gateway (17872): calls, and a provider's chat for Aokie's own speech lanes.
     if !isolated { tokio::spawn(crate::voice::serve_gateway(voice, crate::ai::provider_chat_router(ai_state.clone()))); }
@@ -1780,6 +1804,7 @@ pub async fn serve(
         .merge(companion_routes)
         .merge(link_routes)
         .merge(ai_routes)
+        .merge(network_routes)
         // The MCP server and the Agent's switch: inside the guard, like everything else.
         .merge(crate::control::router(control.clone()))
         // What the access model has built so far: who am I, derive a credential, what the server saw.

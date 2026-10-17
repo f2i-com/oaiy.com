@@ -55,6 +55,11 @@ interface Desktop {
 
 /** The desktop routes a contract may call with the desktop's credential. */
 const DESKTOP_ROUTES = ['/api/ai/engine/', '/api/voice/transcribe', '/api/ai/providers/oaiy-engine/'];
+/**
+ * A paired worker's engines as the desktop serves them (OAIY Network, docs/NETWORK.md): its gateway and its chat, and
+ * none of OAIY Network's own routes (settings, pairing), which a contract has no business calling with the credential.
+ */
+const WORKER_ROUTE = /^\/api\/network\/nodes\/[A-Za-z0-9]{1,64}\/(gateway\/|v1\/chat\/completions$)/;
 /** How often a job is polled (tests shorten it). */
 export const contractTiming = { pollMs: 2000 };
 const JOB_LIMIT_MS = 3 * 60 * 60 * 1000;
@@ -93,7 +98,7 @@ function desktopCredential(url: string, desktop: Desktop): string | null | undef
     return undefined;
   }
   if (u.origin !== new URL(desktop.origin).origin) return undefined;
-  if (!DESKTOP_ROUTES.some((r) => u.pathname.startsWith(r))) return undefined;
+  if (!DESKTOP_ROUTES.some((r) => u.pathname.startsWith(r)) && !WORKER_ROUTE.test(u.pathname)) return undefined;
   return desktop.token;
 }
 
