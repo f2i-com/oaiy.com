@@ -1184,13 +1184,15 @@ fn kept_on_card(kind: Kind, request: &Json) -> bool {
     kind == Kind::Image && request.get("architecture").is_none_or(|a| matches!(a.as_str(), Some("qwen-image" | "moss-image" | "flux3-klein")))
 }
 
-/// A worker making pictures on a Mac's eGPU runs their text encoders on the Mac's own GPU (`OAIY_TEXT_ENCODER_GPU`):
-/// streamed over the cable a layer at a time they took 9 to 20 s of a picture, on the Mac's GPU 3 to 4 s, and the card
-/// keeps its memory for the pictures' models, kept there between pictures. The studio's own setting of it, where set,
-/// is passed on instead.
+/// Where a worker making pictures on a Mac's eGPU runs their text encoders (`OAIY_TEXT_ENCODER_GPU=auto`): one that
+/// keeps its layers where it runs on the card (MOSS-Image's 9B, its 4-bit layers 5.5 GB beside the pictures' models:
+/// a caption in 1.3 s, where the Mac took 3.1 s and its memory), the others on the Mac's own GPU (FLUX 3 Klein's 4B,
+/// sent a layer at a time as it encodes: 0.9 s on either, so the card keeps that memory). Streamed over the cable a layer
+/// at a time for every picture, encoders took 9 to 20 s of one. The studio's own setting of it, where set, is passed on
+/// instead (`own`: every encoder on the Mac).
 fn text_encoders_beside_card(command: &mut std::process::Command) {
     if cfg!(target_os = "macos") && std::env::var_os("OAIY_TEXT_ENCODER_GPU").is_none() {
-        command.env("OAIY_TEXT_ENCODER_GPU", "own");
+        command.env("OAIY_TEXT_ENCODER_GPU", "auto");
     }
 }
 

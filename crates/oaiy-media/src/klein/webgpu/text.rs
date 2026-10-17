@@ -153,7 +153,7 @@ impl WgpuKleinText {
 
     /// [`Self::load`] of the text encoder `spec` says.
     pub fn load_spec(checkpoint: &Path, tokenizer: &Path, device: usize, spec: Spec) -> Result<Self> {
-        let gpu = crate::common::webgpu_weights::text_encoder_gpu(device)?;
+        let gpu = crate::common::webgpu_weights::text_encoder_gpu(device, false)?;
         let w = Weights::open(checkpoint)?;
         let p = spec.prefix;
         let shape = |w: &Weights, name: &str| w.shape(&format!("{p}layers.0.{name}.weight"));

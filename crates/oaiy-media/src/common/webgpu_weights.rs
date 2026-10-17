@@ -10,12 +10,19 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
-/// The GPU a picture model's text encoder runs on: the computer's own where `OAIY_TEXT_ENCODER_GPU` is `own` (a Mac's,
-/// beside the eGPU's card the worker makes its pictures on: the encoder's layers are not sent over the cable one at a
-/// time, and the card's memory is left to the pictures' models, kept there between pictures), else GPU `device` as the
-/// worker's other models take it. The states it makes go to the picture's model through the host either way.
-pub fn text_encoder_gpu(device: usize) -> Result<ggml_rs_wgpu::WgpuBackend> {
-    let own = std::env::var("OAIY_TEXT_ENCODER_GPU").is_ok_and(|v| v.trim().eq_ignore_ascii_case("own"));
+/// The GPU a text encoder runs on: the job's (`device`, as the computer counts them), or this computer's own where
+/// `OAIY_TEXT_ENCODER_GPU` says: `own` every encoder, `auto` (the studio's choice for a Mac's eGPU) those that do not keep
+/// their layers where they run (`keeps_layers` false: FLUX 3 Klein's 4B, its layers sent as it encodes, as quick on the
+/// Mac and the card's memory left to the pictures), the job's GPU for those that do (MOSS-Image's 9B, its 4-bit layers
+/// kept on the card: a caption in 1.3 s where it took 3.1 s on the Mac, and nothing of the Mac's memory). Anything else
+/// (`card`), the job's GPU for every encoder.
+pub fn text_encoder_gpu(device: usize, keeps_layers: bool) -> Result<ggml_rs_wgpu::WgpuBackend> {
+    let setting = std::env::var("OAIY_TEXT_ENCODER_GPU").map(|v| v.trim().to_ascii_lowercase()).unwrap_or_default();
+    let own = match setting.as_str() {
+        "own" => true,
+        "auto" => !keeps_layers,
+        _ => false,
+    };
     if own { ggml_rs_wgpu::WgpuBackend::own(None) } else { ggml_rs_wgpu::WgpuBackend::nth(device, None) }.map_err(err)
 }
 

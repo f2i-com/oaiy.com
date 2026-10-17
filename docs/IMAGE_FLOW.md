@@ -9,8 +9,8 @@ keeps and lets them go ([STUDIO.md](STUDIO.md#which-model-holds-which-gpu)).
 | Step | Node | Model |
 | --- | --- | --- |
 | The idea made a full caption, as OpenMOSS's prompt enhancer writes them ([MOSS-IMAGE.md](MOSS-IMAGE.md#prompting)); skipped when a **Picture** is given | `ai_llm`, `engine:llm` | the language model chosen in Engines (Qwen3.5-9B on the Mac's GPU here) |
-| The picture (or the one given) | `image_gen` | `moss-image-sft-q4-8-step` |
-| An edit, only where **Edit** has one (the branch is skipped otherwise) | `condition`, then `image_gen` with the picture as its reference | `flux-3-image-klein-q4-8-step` ([FLUX3.md](FLUX3.md#speed)) |
+| The picture (or the one given) | `image_gen` | `moss-image-sft-q4-6-step` (the 8-step distillation at 6 steps: the same picture by eye) |
+| An edit, only where **Edit** has one (the branch is skipped otherwise) | `condition`, then `image_gen` with the picture as its reference | `flux-3-image-klein-q4-4-step` ([FLUX3.md](FLUX3.md#speed)) |
 | A review of the final picture, against the request (an edit's changes being what was asked) and against the picture before the edit | `ai_llm` with both pictures | the language model chosen in Engines (it must read pictures) |
 | The answer | `logic_block`, `output` | |
 
@@ -77,6 +77,26 @@ the flow again (a new seed each time, unless the flow's seed is set).
 
 A flow is code that runs on the computer, so storing one needs the `flows.write` credential its caller was given, and a
 flow reads only what its nodes are allowed to: the engine's own files through the desktop, not arbitrary paths.
+
+## The fast one
+
+[`image-make-edit.flow.json`](../platform/examples/flows/image-make-edit.flow.json) is the same flow without the review:
+the same inputs, the pictures and what made them in its answer. An app that wants the picture alone runs it; one that
+wants it checked runs the reviewed one. Both are in a desktop's flows from the start.
+
+On this Mac, kept warm, with an edit:
+
+| | Fast flow | Reviewed flow |
+| --- | --- | --- |
+| The prompt enhanced (Qwen3.5-9B on the Mac's GPU) | 5 s | 5 s |
+| MOSS-Image: its text encoder on the card (1.1 s), 6 steps (5.1 s), the VAE | 6.6 s | 6.6 s |
+| FLUX 3 Klein: its text encoder on the Mac (0.9 s), the reference, 4 steps, the VAE | 8.0 s | 8.0 s |
+| The review: both pictures read (the instructions before them kept from the last run) and its answer | | 16 s |
+| A run | **20.5–22 s** | **36.5–37 s** |
+
+The review reads the pictures it checks since cf75e290: a chat step had taken a picture passed by its address for a
+file path, and in a flow the CLI runs (all of them but the editor's) dropped it, so the review had judged the request's
+text alone.
 
 ## How the models come and go
 

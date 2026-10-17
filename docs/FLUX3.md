@@ -44,8 +44,15 @@ and the transformer read from an external SSD:
 | Q4_K_M | 8 | 20.0 s | 3.4 s | 9.7 s | 8.5 GB | 32.9 dB |
 | Q4_K_M | 4 | 14.4 s | 3.6 s | 4.2 s | 8.5 GB | 28.5 dB |
 
-All six are the same edit by eye: the colour asked for, the lettering exact, the rest of the picture kept. The image flow
-([IMAGE_FLOW.md](IMAGE_FLOW.md)) edits with the Q4_K_M at 8 steps.
+All six are the same edit by eye: the colour asked for, the lettering exact, the rest of the picture kept. The image flows
+([IMAGE_FLOW.md](IMAGE_FLOW.md)) edit with the Q4_K_M at 4 steps (an entry `flux-3-image-klein-q4-4-step`: the 8-step
+entry's files with `"steps": 4`; an edit kept warm in 8.0 s, its 4 steps 4.9 s, where 8 steps took 13 s), which on two
+other edits (a mug's colour and lettering; a boat's colour and a gull added) was again the same picture by eye at full
+size.
+
+Its text encoder multiplies by the 4-bit GGUF's blocks as they are and reads a prompt's embedding rows alone, kept by the
+picture worker between pictures: a caption in 0.9 s on a Mac's GPU, where making the layers' halves on the host each
+picture took 3.3 s (the conditioning the same: against the BF16 checkpoint, cosine mean 0.980, worst 0.970).
 
 ## Getting it
 

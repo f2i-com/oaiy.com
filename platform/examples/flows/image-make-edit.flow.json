@@ -1,6 +1,6 @@
 {
  "name": "Make and edit a picture",
- "description": "A picture from a prompt with MOSS-Image (its prompt enhanced first), or a picture given to it; edited with FLUX 3 Klein (Q4_K_M, 8 steps) where an edit is asked for. No review: the fast way, for an app that wants the picture alone. Answers the pictures' file references. Inputs: Prompt (what to make), Edit (a change, or empty), Picture (a picture to edit instead of making one: a data URL, or empty).",
+ "description": "A picture from a prompt with MOSS-Image (6 steps, its prompt enhanced first), or a picture given to it; edited with FLUX 3 Klein (Q4_K_M, 4 steps) where an edit is asked for. No review: the fast way, for an app that wants the picture alone. Answers the pictures' file references. Inputs: Prompt (what to make), Edit (a change, or empty), Picture (a picture to edit instead of making one: a data URL, or empty).",
  "tags": [
   "image",
   "example"
@@ -106,8 +106,8 @@
     "y": 0
    },
    "data": {
-    "label": "Make it (MOSS-Image, 8 steps)",
-    "service": "engine:image:moss-image-sft-q4-8-step",
+    "label": "Make it (MOSS-Image, 6 steps)",
+    "service": "engine:image:moss-image-sft-q4-6-step",
     "width": 1024,
     "height": 1024,
     "seed": "",
@@ -156,8 +156,8 @@
     "y": 220
    },
    "data": {
-    "label": "Edit it (FLUX 3 Klein, Q4_K_M, 8 steps)",
-    "service": "engine:image:flux-3-image-klein-q4-8-step",
+    "label": "Edit it (FLUX 3 Klein, Q4_K_M, 4 steps)",
+    "service": "engine:image:flux-3-image-klein-q4-4-step",
     "imageInputCount": 1,
     "width": 1024,
     "height": 1024,
