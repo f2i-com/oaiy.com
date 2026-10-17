@@ -529,10 +529,31 @@ fn a_pinned_language_model_keeps_its_gpu() {
 /// A job's error that says it ran out of memory is tried once more; others are not.
 #[test]
 fn out_of_memory_is_told_apart() {
-    for e in ["the GPU is out of memory", "CUDA error: out of memory", "Metal: Insufficient Memory", "weights: no room on the GPU for its 4096 MB", "failed to allocate 2 GiB", "OutOfMemory"] {
+    for e in ["the GPU is out of memory", "CUDA error: out of memory", "Metal: Insufficient Memory", "weights: no room on the GPU for its 4096 MB", "failed to allocate 2 GiB", "OutOfMemory", "tinygpu: MemoryError: Allocation of 512.00 MB failed on NV. Used: 0 B at crates/wgpu-tinygpu/src/lib.rs:224"] {
         assert!(out_of_memory(e), "{e}");
     }
     for e in ["cancelled", "the model has no tokenizer", "zoom lens not found", "a room with a view"] {
         assert!(!out_of_memory(e), "{e}");
     }
+}
+
+/// A worker on the eGPU's card runs every text encoder there, read from its file as it encodes, so the Mac's GPU is left
+/// to its language model and the card keeps the pictures' models side by side; the studio's own setting passes on.
+#[test]
+fn a_card_worker_runs_its_text_encoders_on_the_card_and_keeps_none() {
+    let mut command = std::process::Command::new("true");
+    text_encoders_beside_card(&mut command);
+    let set: std::collections::HashMap<_, _> = command.get_envs().map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string()))).collect();
+    for (name, value) in [("OAIY_TEXT_ENCODER_GPU", "card"), ("OAIY_TEXT_ENCODER_KEEP", "0")] {
+        let expected = if std::env::var_os(name).is_none() { Some(Some(std::ffi::OsString::from(value))) } else { None };
+        assert_eq!(set.get(std::ffi::OsStr::new(name)).cloned(), expected, "{name}");
+    }
+}
+
+/// Media the card was to make are not made on this computer's GPU when it cannot, unless the settings say so.
+#[test]
+fn media_meant_for_the_card_fall_back_here_only_when_asked() {
+    assert!(!falls_back_here(&Json::Null));
+    assert!(!falls_back_here(&body(r#"{"media": {"keep_minutes": 30}}"#)));
+    assert!(falls_back_here(&body(r#"{"media": {"fallback_here": true}}"#)));
 }

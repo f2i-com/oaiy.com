@@ -289,7 +289,7 @@ fn generate_kept_with(r: &Request, mut kept: Option<&mut Kept>, noise: impl Fn(u
             None => WgpuMossText::load(&r.text_encoder, r.tokenizer.as_deref(), r.device)?,
         };
         let gguf = r.text_encoder.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
-        encoder.keep_layers(kept.is_some() && gguf && !encoder.backend().adapter().unified);
+        encoder.keep_layers(kept.is_some() && gguf && !encoder.backend().adapter().unified && crate::common::webgpu_weights::keep_text_layers());
         let encoded = encoder.encode_all(&missing)?;
         for (prompt, (s, n)) in missing.iter().zip(encoded) {
             for (slot, _) in states.iter_mut().zip(&wanted).filter(|(slot, p)| slot.is_none() && *p == prompt) {

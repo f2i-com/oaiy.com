@@ -26,6 +26,13 @@ pub fn text_encoder_gpu(device: usize, keeps_layers: bool) -> Result<ggml_rs_wgp
     if own { ggml_rs_wgpu::WgpuBackend::own(None) } else { ggml_rs_wgpu::WgpuBackend::nth(device, None) }.map_err(err)
 }
 
+/// Whether a text encoder kept with its worker keeps its layers on a card between prompts (`OAIY_TEXT_ENCODER_KEEP`, on
+/// unless `0`): off, each prompt's encoding reads them from their file and sends them as it goes, and the card keeps
+/// only the pictures' models.
+pub fn keep_text_layers() -> bool {
+    std::env::var("OAIY_TEXT_ENCODER_KEEP").map_or(true, |v| v.trim() != "0")
+}
+
 /// `f` over `src` and `dst` in matching runs on every core: `per` of `src`'s items to `per_out` of `dst`'s.
 pub(crate) fn on_cores<S: Sync, T: Send>(src: &[S], per: usize, dst: &mut [T], per_out: usize, f: impl Fn(&[S], &mut [T]) + Sync) {
     on_cores_at(src, per, dst, per_out, |_, a, b| f(a, b));

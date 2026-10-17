@@ -1184,17 +1184,26 @@ fn kept_on_card(kind: Kind, request: &Json) -> bool {
     kind == Kind::Image && request.get("architecture").is_none_or(|a| matches!(a.as_str(), Some("qwen-image" | "moss-image" | "flux3-klein")))
 }
 
-/// Where a worker making pictures on a Mac's eGPU runs their text encoders (`OAIY_TEXT_ENCODER_GPU=auto`): MOSS-Image's
-/// 9B on the card, its 4-bit layers kept there beside the pictures' models (5.5 GB: a caption in 1.2 s where the Mac
-/// took 3.1 s), FLUX 3 Klein's 4B on the Mac's GPU, read as it encodes (0.8 s, nothing kept: kept on the card too it
-/// left the card 0.3 GB and the pictures' decodes slowed from 0.4 to 3 s), the Mac's memory left to its language model
-/// (the flows' reviewer, kept warm there). Streamed over the cable a layer at a time for every picture, encoders
-/// took 9 to 20 s of one. The studio's own setting of it, where set, is passed on instead (`own`: every encoder on the
-/// Mac).
+/// Where a worker making pictures on a Mac's eGPU runs their text encoders: on the card, every one
+/// (`OAIY_TEXT_ENCODER_GPU=card`), and read from their files as they encode rather than kept there
+/// (`OAIY_TEXT_ENCODER_KEEP=0`). The Mac's GPU is its language model's, and the pictures' models stay warm side by side:
+/// MOSS-Image's 8-step Q8_0 and FLUX 3 Klein with both encoders kept had the card full (an allocation failed); without
+/// them the card's peak is 16.5 GB. A new prompt's encoding takes 2.4 s for MOSS-Image's 9B (0.2 s kept), 1 s for
+/// Klein's 4B. Where the studio's own environment says otherwise, that is passed on instead.
 fn text_encoders_beside_card(command: &mut std::process::Command) {
-    if cfg!(target_os = "macos") && std::env::var_os("OAIY_TEXT_ENCODER_GPU").is_none() {
-        command.env("OAIY_TEXT_ENCODER_GPU", "auto");
+    for (name, value) in [("OAIY_TEXT_ENCODER_GPU", "card"), ("OAIY_TEXT_ENCODER_KEEP", "0")] {
+        if std::env::var_os(name).is_none() {
+            command.env(name, value);
+        }
     }
+}
+
+/// Whether media the eGPU's card was to make are made on this computer's GPU when the card cannot
+/// (`media.fallback_here`, off unless set): off, the job fails with the card's reason, a job out of memory having been
+/// tried on the card once more with everything idle let go. On a Mac the GPU is its language model's: a picture model
+/// there is several times slower, heats it, and can take the memory the language model needs.
+fn falls_back_here(cfg: &Json) -> bool {
+    cfg.get("media").is_some_and(|m| bool_or(m, "fallback_here", false))
 }
 
 /// Whether the kept worker holds a model of family `kept` beside one of family `new` that it loads (as `oaiy-media
@@ -1247,7 +1256,8 @@ pub fn pauses_llm(cfg: &Json) -> bool {
 /// Whether a job's error says it ran out of memory (the GPU's or the computer's): such a job is tried once more.
 fn out_of_memory(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
-    ["out of memory", "outofmemory", "out-of-memory", "no room on the gpu", "failed to allocate", "allocation failed", "insufficient memory", "(oom)", " oom "].iter().any(|w| e.contains(w))
+    // (the eGPU's card says "tinygpu: MemoryError: Allocation of 512.00 MB failed on NV")
+    ["out of memory", "outofmemory", "out-of-memory", "no room on the gpu", "failed to allocate", "allocation failed", "insufficient memory", "memoryerror", "(oom)", " oom "].iter().any(|w| e.contains(w))
 }
 
 /// Progress (0-100) and a stage label from one worker event line.
@@ -1761,6 +1771,12 @@ impl Media {
                     match made {
                         Ok(done) => return Ok(done),
                         Err(e) if job.cancel.load(Ordering::Relaxed) => return Err(e),
+                        // (out of memory: tried on the card once more by the caller, with everything idle let go)
+                        Err(e) if out_of_memory(&e) || !falls_back_here(&cfg) => {
+                            self.log.push(format!("{label}: the eGPU did not make it ({})", e.lines().next().unwrap_or("")));
+                            studio.egpu.give_back();
+                            return Err(e);
+                        }
                         // (the card's language model comes back while this computer makes it)
                         Err(e) => {
                             self.log.push(format!("{label}: the eGPU did not make it ({}); this computer makes it", e.lines().next().unwrap_or("")));
@@ -1768,6 +1784,7 @@ impl Media {
                         }
                     }
                 }
+                Err(e) if !falls_back_here(&cfg) => return Err(format!("the eGPU is not free for it: {e}")),
                 Err(e) => self.log.push(format!("{label}: the eGPU is not free for it ({e}); this computer makes it")),
             }
         }

@@ -259,7 +259,7 @@ fn generate_inner(r: &Request, mut kept: Option<&mut Kept>, noise: impl Fn(u64, 
         };
         // (its layers kept where it runs on a card, as MOSS-Image's are; on a Mac's GPU read as it encodes)
         let gguf = r.text_encoder.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
-        encoder.keep_layers(kept.is_some() && gguf && !encoder.backend().adapter().unified);
+        encoder.keep_layers(kept.is_some() && gguf && !encoder.backend().adapter().unified && crate::common::webgpu_weights::keep_text_layers());
         let prompts: Vec<&str> = r.prompts.iter().map(String::as_str).chain(guidance.map(|_| "")).collect();
         let mut all = encoder.encode_all(&prompts)?;
         if let Some(k) = kept.as_deref_mut() {

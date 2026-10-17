@@ -518,15 +518,19 @@ The rules, one GPU at a time:
   `media.keep_minutes` (2 unless set). It keeps MOSS-Image's and FLUX 3 Image
   Klein's side by side (a picture made with one and edited with the other loads
   nothing the second time; in Q4 both fit on a 24 GB card), Qwen Image's alone.
-  On a Mac's eGPU it places their text encoders by what they keep
-  (`OAIY_TEXT_ENCODER_GPU=auto`): MOSS-Image's 9B on the card, its 4-bit layers
-  kept there beside the pictures' models (5.5 GB; a caption in 1.2 s, where the
-  Mac took 3.1 s), FLUX 3 Klein's 4B on the Mac's GPU, read as it encodes (0.8 s,
-  nothing kept; kept on the card as well it left the card 0.3 GB and slowed the
-  pictures' decodes from 0.4 to 3 s). The Mac's memory is left to its language
-  model (the flows' reviewer, pinned there to stay warm). Sent to
-  the card a layer at a time for every picture, encoders took 9 to 45 s.
-  `own` puts every encoder on the Mac, `card` every one on the card. A chat that wants its GPU, a job that
+  On a Mac's eGPU every picture model and its text encoder runs on the card,
+  the encoders read from their files as they encode rather than kept there
+  (`OAIY_TEXT_ENCODER_GPU=card`, `OAIY_TEXT_ENCODER_KEEP=0`): MOSS-Image's 9B in
+  2.4 s, FLUX 3 Klein's 4B in 1 s, a prompt seen in the last 16 not at all. With
+  both encoders kept, MOSS-Image's 8-step Q8_0 and Klein filled the card (an
+  allocation of 512 MB failed); without them the card's peak is 16.5 GB with
+  both models warm. The Mac's GPU is left to its language model (the flows'
+  reviewer, pinned there to stay warm). A picture the card was to make is never
+  made on the Mac instead: out of memory, it is tried on the card once more with
+  everything idle let go, and otherwise it fails with the card's reason
+  (`media.fallback_here: true` lets this computer make it). Before, a card out of
+  memory sent FLUX 3 Klein to the Mac's GPU, where it failed after 47 s.
+  `OAIY_TEXT_ENCODER_GPU=own` puts every encoder on the Mac, `auto` those that keep no layers; `OAIY_TEXT_ENCODER_KEEP=1` keeps them on the card. A chat that wants its GPU, a job that
   asks for its models to go after it (`"release": true`, the image node's
   **Free the picture model after this step**), or another worker that needs
   the GPU ends it at once. `POST /api/resources/release` with

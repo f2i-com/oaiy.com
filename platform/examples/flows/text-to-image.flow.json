@@ -107,7 +107,7 @@
    },
    "data": {
     "label": "Make it (MOSS-Image, 8 steps)",
-    "service": "engine:image:moss-image-sft-q4-8-step",
+    "service": "engine:image:moss-image-sft-q8-8-step",
     "width": 1024,
     "height": 1024,
     "seed": "",

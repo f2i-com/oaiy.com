@@ -21,7 +21,7 @@ the Studio loads, keeps and lets them go ([STUDIO.md](STUDIO.md#which-model-hold
 | MOSS-Image's prompt: a caption as it is, a layout compiled to the model's one-line form as OpenMOSS's `compile_prompt.py` does (the same bytes on its example), a reply a bracket short closed first | `logic_block` | |
 | Try up to 3 times | `loop_start`, until its end says stop | |
 | This try's prompt: the caption, and on a retry the last review's fix after it | `logic_block` | |
-| The picture (a new seed each try) | `image_gen` | `moss-image-sft-q4-8-step` (the 8-step distillation at its 8 steps: at 6 the pictures were a little softer, for 2 s less) |
+| The picture (a new seed each try) | `image_gen` | `moss-image-sft-q8-8-step` (the 8-step distillation at its 8 steps on the Q8_0 transformer: [MOSS-IMAGE.md](MOSS-IMAGE.md#distillations-pictures-in-8-passes)) |
 | The review of the picture against the request | `ai_llm` with the picture | the language model chosen in Engines (it must read pictures) |
 | Pass or try again: the review read, the lettering checked | `logic_block` | |
 | Until it passes | `loop_end`, stops when `pass` is true | |
@@ -162,16 +162,16 @@ The card's peak with both picture models and MOSS-Image's text encoder kept: 20.
 On a Mac with an RTX 4090 in an eGPU enclosure (24 GB on the card, 24 GB of unified memory) the models are placed so
 that nothing waits for a load once they are warm:
 
-- **The card holds the picture models**, kept between pictures by one worker side by side for 30 minutes
-  (`media.keep_minutes`): MOSS-Image (Q4_K_M, the 8-step distillation) and FLUX 3 Klein (Q4_K_M, 4 steps),
-  with MOSS-Image's text encoder (Qwen3.5-9B Q4_K_M, its layers kept beside them: a caption in 1.2 s), about 19 GB
-  of the card's 24 at its peak.
-- **The Mac's GPU holds the language model** (the enhancer and the reviewer), pinned there so it stays warm
-  (`llm.pinned`), and runs Klein's text encoder (Qwen3-VL-4B Q4_K_M, read as it encodes: 0.8 s, nothing kept). Kept on
-  the card as well, Klein's encoder left the card 0.3 GB and slowed the pictures' decodes from 0.4 to 3 s. The language
-  model can be one of those files: Qwen3.5-9B (MOSS-Image's encoder) with its vision projector, or Qwen3-VL-4B
-  ([QWEN3VL.md](QWEN3VL.md)), smaller and the less careful reviewer.
-- **Every weight is a Q4_K GGUF on the internal SSD** (the VAEs aside, 0.25 and 0.34 GB).
+- **The card holds the picture models and their text encoders**, the models kept between pictures by one worker side
+  by side for 30 minutes (`media.keep_minutes`): MOSS-Image's 8-step distillation on its Q8_0 transformer and FLUX 3
+  Klein (Q4_K_M, 4 steps), 16.5 GB of the card at its peak. Their text encoders (Qwen3.5-9B and Qwen3-VL-4B, Q4_K_M)
+  run there too, read from their files as they encode (2.4 s and 1 s a new prompt): kept there as well, the card was
+  full ([STUDIO.md](STUDIO.md#which-model-holds-which-gpu)).
+- **The Mac's GPU holds the language model** alone (the enhancer and the reviewer), pinned there so it stays warm
+  (`llm.pinned`). A picture is never made there instead of on the card. The language model can be Qwen3.5-9B (the same
+  file as MOSS-Image's encoder) with its vision projector, or Qwen3-VL-4B ([QWEN3VL.md](QWEN3VL.md)), smaller and the
+  less careful reviewer.
+- **Every weight is on the internal SSD:** the GGUFs Q4_K but for MOSS-Image's Q8_0 (the VAEs aside, 0.25 and 0.34 GB).
 
 With a language model on the card instead (MiniCPM-V 4.7 35B), the card is lent to each picture (its model let go)
 and taken back for each language step: the Studio waits for the card's memory to be let go before the next model

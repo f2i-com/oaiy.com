@@ -94,6 +94,14 @@ with a few faults: a monogram's background filled with garbled letters, a badge'
 abstract mark. Made again from prompts written this way (layouts for the monogram, the badge, the bakery's mark and a
 Chinese seal), those faults were gone, and line breaks came out as written.
 
+Its weights' precision matters more than the model's own (each pass hands its rounding to the next). Twelve prompts
+at one seed, the distance of each picture from the f16 transformer's (mean absolute difference of 255): Q8_0 13 (a
+portrait 1.7: the same picture), Q4_K_M 36, a different take of each with softer detail (fur, petals, the
+background). Taking any one kind of the 4-bit file's tensors from the Q8_0 file instead (attention q and k, o, the
+MLP's up and gate, v and down, or the first and last four blocks) brought it to 32 to 35 at best: the rounding counts
+everywhere. On the RTX 4090 its 8 passes take 7.0 s at 4 bits, 7.1 s at Q8_0 and 8.2 s at f16, so the card uses the
+Q8_0 file (`moss-image-sft-q8-8-step`); the 4-bit one is for a smaller card.
+
 Checked again on one brief over six seeds (docs/IMAGE_FLOW.md#logos): the 8-step distillation writes a logo's name
 twice, adds lines nobody asked for or sets the logo in a room, at full precision as at 4 bits and with its text
 encoder on either GPU, where MOSS-Image's own 50 guided steps did not; a layout with its background as an item of its
