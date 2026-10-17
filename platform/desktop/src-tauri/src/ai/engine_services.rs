@@ -379,6 +379,20 @@ fn forwardable(discovery: &Value, path: &str) -> bool {
     MEDIA_TARGETS.iter().filter_map(|t| endpoint_path(discovery, t)).any(|p| path == p || path.starts_with(&format!("{p}/")))
 }
 
+/// Whether `path` names a route below the one it starts with, and nothing else: no `.` or `..` segment (nor one
+/// written `%2e`, which the URL parser reads as a dot), no empty segment, no backslash, query or fragment. Checked
+/// before a path is put in a URL, where `media/../other` would become another route (on the engines' gateway, or a
+/// worker's own routes past OAIY Network's gateway).
+pub(crate) fn plain_path(path: &str) -> bool {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    !rest.is_empty()
+        && !path.contains(['\\', '?', '#', '\0'])
+        && rest.split('/').all(|seg| {
+            let seg = seg.to_ascii_lowercase().replace("%2e", ".");
+            !seg.is_empty() && seg != "." && seg != ".."
+        })
+}
+
 /// `/api/ai/engine/gateway/<gateway path>`: the call, sent on to the gateway and its answer streamed back.
 async fn forward(State(st): State<AiState>, req: Request) -> Response {
     match engine_discovery(&st).await {
@@ -412,7 +426,7 @@ async fn forward_to(gateway: &str, discovery: &Value, path: String, req: Request
         return ai_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", format!("{method} is not forwarded"));
     }
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    if !forwardable(discovery, &path) {
+    if !plain_path(&path) || !forwardable(discovery, &path) {
         return ai_error(StatusCode::NOT_FOUND, "not_forwarded", format!("{path} is not one of the engine's media routes"));
     }
     // The engine's files (the pictures and videos it made) are only read; a picture is handed to the engines by a
@@ -557,6 +571,21 @@ mod tests {
         assert!(forwardable(&d, "/files/images/a.png"), "the engine's pictures, read with the caller's own credential");
         assert!(!forwardable(&d, "/filesx/a.png"));
         assert!(!forwardable(&d, "/oaiy/images"), "the OAIY-dialect route is not one of the contracts");
+    }
+
+    /// A path that would leave its route once put in a URL is never forwarded: dot segments however written, empty
+    /// segments, backslashes, a query or fragment smuggled in the path.
+    #[tokio::test]
+    async fn a_path_that_leaves_its_route_is_not_forwarded() {
+        for ok in ["/files/images/a.png", "/v1/audio/music/music_1/content", "/files/images/a..b.png"] {
+            assert!(plain_path(ok), "{ok}");
+        }
+        for bad in ["/files/../api/config", "/files/%2e%2e/x", "/files/%2E./x", "/files/.%2e/x", "/files/./a.png", "/files//a.png", "/files/a\\..\\b", "/files/a.png?x", "/v1/images/generations/..", "/", ""] {
+            assert!(!plain_path(bad), "{bad}");
+        }
+        // (nothing listens on the discard port: a call that got through would be a 502)
+        let get = Request::builder().method("GET").uri(format!("{GATEWAY_PREFIX}/files/%2e%2e/%2e%2e/v1/discovery")).body(Body::empty()).unwrap();
+        assert_eq!(forward_to("http://127.0.0.1:9", &discovery(), gateway_path(&get), get).await.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

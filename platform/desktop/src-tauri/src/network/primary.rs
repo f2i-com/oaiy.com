@@ -554,6 +554,10 @@ async fn node_gateway(State(net): State<Network>, Path((node_id, path)): Path<(S
     if !matches!(method.as_str(), "GET" | "POST" | "DELETE") {
         return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", format!("{method} is not forwarded"));
     }
+    // (a path that stays below the worker's gateway: `../pins` would be another of its routes)
+    if !crate::ai::engine_services::plain_path(&path) {
+        return error(StatusCode::BAD_REQUEST, "bad_path", "not one of the worker's media routes");
+    }
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     let headers = req.headers().clone();
     let body = match axum::body::to_bytes(req.into_body(), MEDIA_LIMIT).await {

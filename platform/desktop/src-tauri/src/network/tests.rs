@@ -265,6 +265,13 @@ async fn a_primary_pins_a_workers_model_and_unpins_it() {
     }
     let (status, _) = call(&p, "PUT", "/api/network/nodes/nobody/pins", Some(json!({ "model": "tiny-image" }))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // a client of the worker's media routes (ai.use) cannot step past them to its pins or unpairing
+    for path in ["gateway/../pins", "gateway/%2e%2e/unpair", "gateway/v1/images/generations/../../../unpair"] {
+        let (status, v) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/{path}"), Some(json!({ "model": "tiny-image" }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {v}");
+    }
+    let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
+    assert_eq!(nodes["nodes"].as_array().unwrap().len(), 1, "still paired");
     // a stranger cannot pin on the worker
     let stranger = tls::client(&super::identity::Identity::generate().unwrap(), Pin::Record(Default::default())).unwrap();
     let r = stranger.post(format!("https://{}/worker/v1/pins", worker.listening().unwrap())).json(&json!({ "model": "tiny-image" })).send().await.unwrap();
