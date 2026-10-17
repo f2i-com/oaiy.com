@@ -128,7 +128,7 @@ may contain PII. Treat it as untrusted text: it reaches log lines and UI.
 | `GET /api/bridge/runs/{runId}` | poll one run |
 | `GET /api/bridge/runs/{runId}/events` | stream run events (SSE) |
 | `POST /api/bridge/runs/{runId}/cancel` | request cancellation |
-| `POST /api/bridge/connectors/{connectorId}/request` | call a connector command |
+| `POST /api/bridge/connectors/{connectorId}/request` | call a connector command (a plugin's; or `oaiy-flows`, the desktop's own: `flows.list` and `flow.run` of the flows shared with apps, see `platform/docs/REMOTE_FORMLOGIC.md`) |
 | `GET /api/bridge/events` | stream runtime/plugin events (SSE) |
 | `POST /api/bridge/devices` | register/refresh this device with a cloud tenant |
 

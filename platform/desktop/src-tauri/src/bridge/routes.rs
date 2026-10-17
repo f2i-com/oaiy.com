@@ -243,6 +243,10 @@ async fn capabilities(State(st): State<BridgeState>) -> impl IntoResponse {
     // listed as unavailable WITH a reason rather than omitted, so a caller can
     // tell "installed but stopped" from "never heard of it".
     let mut caps: Vec<serde_json::Value> = Vec::new();
+    // This desktop's own flows connector, always there (what it runs is the flows shared with apps).
+    for cmd in super::flow_connector::COMMANDS {
+        caps.push(json!({ "id": format!("connector.{}.{cmd}", super::flow_connector::CONNECTOR), "available": true }));
+    }
 
     if let Ok(mut reg) = st.plugins.lock() {
         // Scan here too, not only in `/api/plugins`.
@@ -625,12 +629,7 @@ async fn list_plugins(State(st): State<BridgeState>) -> axum::response::Response
 #[serde(rename_all = "camelCase")]
 struct ConnectorBody {
     command: String,
-    /// Accepted and validated as part of the wire shape, but not yet forwarded —
-    /// the supervised plugin process is not wired up, so the handler refuses
-    /// typed rather than pretending to deliver it. Kept in the struct so a caller
-    /// sending a correct request is not rejected for a field this build cannot
-    /// act on yet.
-    #[allow(dead_code)]
+    /// The command's arguments, forwarded to the plugin (or read by `oaiy-flows`).
     #[serde(default)]
     payload: Option<serde_json::Value>,
     #[serde(default)]
@@ -687,6 +686,21 @@ async fn connector_request(
     Path(connector_id): Path<String>,
     Json(body): Json<ConnectorBody>,
 ) -> axum::response::Response {
+    // This desktop's flows, as a connector of its own (`super::flow_connector`): a FormLogic automation's
+    // `connector_request` node, or a paired app, runs a flow shared with apps. Never forwarded to a plugin.
+    if connector_id == super::flow_connector::CONNECTOR {
+        let st = st.clone();
+        let payload = body.payload.unwrap_or(serde_json::Value::Null);
+        let result = tokio::task::spawn_blocking(move || {
+            super::flow_connector::answer(&st.ledger, &st.flows, st.node.as_ref(), &body.command, &payload, body.idempotency_key.as_deref())
+        })
+        .await;
+        return match result {
+            Ok(Ok(value)) => (StatusCode::OK, Json(json!({ "ok": true, "result": value }))).into_response(),
+            Ok(Err((status, code, message))) => bridge_error(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST), code, message),
+            Err(join) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("the flow connector failed: {join}")),
+        };
+    }
     // The host gates first (state, allow-list, journalling), forwards second.
     // Run on a blocking thread: the plugin RPC legitimately takes seconds and
     // must not park an async executor thread for the duration.

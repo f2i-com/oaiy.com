@@ -173,7 +173,8 @@ Each file rolls at 2 MiB and keeps one previous file.
   through the plugin's own gate alone: a binding's follow-up actions after a run, an
   app script's effects, and a `connector_request` node in a flow graph (the CLI the
   runner starts asks this computer's own bridge, with the desktop's own token, and
-  the bridge does not ask the list). Whoever can save a flow or a binding on the
+  the bridge does not ask the list; its own flows connector, `oaiy-flows`, runs only
+  the flows the person shared). Whoever can save a flow or a binding on the
   provider, in an owner's session or with a leaked key, can therefore ask for any
   command a plugin declares this way, `dongle.installDriver` and `consent.set`
   included. The list closes the relay; these are three more ways in, and closing them
@@ -187,6 +188,39 @@ Each file rolls at 2 MiB and keeps one previous file.
   one is written to the log.
 - Commands are not signed or end-to-end encrypted (see the table above), so the
   provider itself can queue any command the list allows.
+
+## Running an OAIY flow from FormLogic
+
+A flow made in OAIY's Flows can be run by a FormLogic automation, or by any app that holds a token for this
+computer, through a connector of OAIY's own, `oaiy-flows`. Only the flows the person here shares run: **Let apps
+run it** in the flow's menu (⋯) in Flows, which stores `"oaiyRemote": true` in its document; **Stop apps running it**
+takes it back. A flow can read files, drive a browser or run code, and an automation is written on the website,
+so the computer decides which of its flows the website may start, flow by flow.
+
+In the automation (saved, **Desktop relay**, run on the **Linked computer**), a **connector request** node:
+
+| Field | Value |
+| --- | --- |
+| `connector` | `oaiy-flows` |
+| `command` | `flow.run` (or `flows.list`: the shared flows, each `{flowId, name, description, inputs: [{name, default}]}`) |
+| `payload` | `{"flowId": "image-make-edit-review", "inputs": {"Prompt": "$inputs.prompt", "Edit": "$inputs.edit", "Picture": "$inputs.picture"}}`, with `timeoutSeconds` (default 300, at most 600), `pictures` (`"inline"`, the default, or `"none"`) and `maxPictureBytes` |
+
+The node answers `{runId, status, output, error, pictures}`:
+
+- `output` is the flow's own answer (its output node's value). The run is in OAIY's run history like any other.
+- `pictures` holds the pictures the answer names, each once, the answer's top level first: `{ref, included,
+  mimeType, data, width, height, bytes, reencoded}`, `data` the picture's base64 and `ref` the address in the answer
+  it stands for (an address on this computer, which nothing elsewhere can read). Together their base64 stays within
+  `maxPictureBytes`, by default 150,000 characters, so that the answer fits the encrypted relay's 192 KiB: a picture
+  larger than the room left is sent as a JPEG that fits (a lower quality first, then smaller), and one that cannot
+  fit is `{ref, included: false, reason}`. An app on this computer may ask for more.
+- A picture given to the flow as an input is a data URL (`data:image/png;base64,…`, a PNG, JPEG or WebP). From
+  64 KiB on it is kept with the engines first and handed to the flow as their address for it, as a picture the
+  engines made is: a flow passes pictures from step to step by address, and one of a few MB inline is more than a
+  step's call may carry. Keep it within the relay's own limits (a few MB).
+
+A browser paired with this OAIY reaches the same commands directly, `POST /api/bridge/connectors/oaiy-flows/request
+{command, payload}`, and OAIY's MCP has `flows_list` and `flow_run` (which answers the pictures as images).
 
 ## Reliability and limits
 

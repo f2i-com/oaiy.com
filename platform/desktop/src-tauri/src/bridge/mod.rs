@@ -36,9 +36,11 @@
 
 pub mod conditions;
 pub mod deadletters;
+pub mod flow_connector;
 pub mod leases;
 pub mod ledger;
 pub mod pairing;
+pub mod pictures;
 pub mod routes;
 pub mod script_host;
 pub mod triggers;

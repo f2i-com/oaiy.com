@@ -142,6 +142,9 @@ ed25519-dalek = { version = "2", features = ["signature"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 base64 = "0.22"
 getrandom = "0.2"
+# A flow's pictures handed to a caller off this computer (the `oaiy-flows` connector, MCP): decoded and made a JPEG
+# small enough for the way back (FormLogic's encrypted relay answers at most 192 KiB). The engines' own `image`.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # The end-to-end envelope a provider's web app seals chat with. NaCl `crypto_box`
 # — X25519 ECDH → HSalsa20 → XSalsa20-Poly1305 — which is exactly what the

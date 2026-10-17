@@ -392,8 +392,10 @@ async fn forward_to(gateway: &str, discovery: &Value, req: Request) -> Response 
     if !forwardable(discovery, &path) {
         return ai_error(StatusCode::NOT_FOUND, "not_forwarded", format!("{path} is not one of the engine's media routes"));
     }
-    // The engine's files (the pictures and videos it made) are only read.
-    if method != "GET" && endpoint_path(discovery, "files").is_some_and(|p| path == p || path.starts_with(&format!("{p}/"))) {
+    // The engine's files (the pictures and videos it made) are only read; a picture is handed to the engines by a
+    // POST to the files' route itself (kept with their inputs), never to a file's address.
+    let refused = |p: &str| path.starts_with(&format!("{p}/")) || (path == p && method != "POST");
+    if method != "GET" && endpoint_path(discovery, "files").is_some_and(|p| refused(&p)) {
         return ai_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", format!("{method} is not forwarded"));
     }
     let content_type = req.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);

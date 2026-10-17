@@ -71,6 +71,14 @@ const CHILD_POLL: Duration = Duration::from_millis(250);
 /// Cap on captured child output kept for error reporting.
 const MAX_CAPTURE: usize = 16 * 1024;
 
+/// The example flows OAIY ships (`platform/examples/flows`), each with the id it is stored under: in every
+/// desktop's flows once ([`FlowStore::seed_examples`]), and so in the Flows editor, for the person to run, change or
+/// share with apps.
+pub const EXAMPLES: [(&str, &str); 1] = [(
+    "image-make-edit-review",
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/flows/image-make-edit-review.flow.json")),
+)];
+
 /// Where flow files live and how ids map to paths.
 pub struct FlowStore {
     dir: PathBuf,
@@ -130,6 +138,40 @@ impl FlowStore {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Store each example flow OAIY ships ([`EXAMPLES`]) once: one this folder never had, and has not now. The ids
+    /// stored are kept in `.examples` beside the flows, so an example the person deleted stays deleted. An example
+    /// is stored as one: not given to the Agent (its `oaiyTool` left out) and not shared with apps.
+    pub fn seed_examples(&self) {
+        let marker = self.dir.join(".examples");
+        let mut seeded: Vec<String> = std::fs::read_to_string(&marker)
+            .map(|text| text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default();
+        let before = seeded.len();
+        for (id, text) in EXAMPLES {
+            if seeded.iter().any(|s| s == id) {
+                continue;
+            }
+            let Ok(mut doc) = serde_json::from_str::<Value>(text) else {
+                log::warn!("flows: the example {id} is not JSON; not stored");
+                continue;
+            };
+            if let Some(fields) = doc.as_object_mut() {
+                fields.remove("oaiyTool");
+                fields.remove("oaiyRemote");
+            }
+            if self.get(id).is_none() {
+                if let Err(e) = self.put(id, &serde_json::to_string_pretty(&doc).unwrap_or_default()) {
+                    log::warn!("flows: the example {id} could not be stored: {e}");
+                    continue;
+                }
+            }
+            seeded.push(id.to_string());
+        }
+        if seeded.len() != before {
+            let _ = std::fs::write(&marker, seeded.join("\n") + "\n");
         }
     }
 
@@ -841,90 +883,107 @@ impl Worker {
 
     /// Execute one claimed run. Returns (status, output, error) for finish().
     fn execute(&self, run: &RunRecord) -> (RunStatus, Option<Value>, Option<RunError>) {
-        let Some(flow_id) = run.flow_id.as_deref() else {
-            return fail(
-                RunErrorCode::InvalidFlow,
-                "this run has no flowId; inline graphs are not executable on the desktop yet",
-            );
-        };
-        let Some(flow_path) = self.flows.path_of(flow_id) else {
-            return fail(
-                RunErrorCode::InvalidRequest,
-                &format!("flow id {flow_id:?} is not a valid identifier"),
-            );
-        };
-        if !flow_path.is_file() {
-            let known: Vec<String> = self.flows.list().into_iter().map(|(id, _)| id).collect();
-            return (
-                RunStatus::Failed,
-                None,
-                Some(
-                    RunError::new(
-                        RunErrorCode::FlowNotFound,
-                        format!("no flow named {flow_id:?} is stored on this desktop"),
-                    )
-                    .with_detail(format!(
-                        "Push it with PUT /api/bridge/flows/{flow_id}. Stored flows: {}",
-                        if known.is_empty() { "(none)".into() } else { known.join(", ") }
-                    )),
-                ),
-            );
-        }
-
-        // Inputs travel by file, not argv: values can be large, can contain
-        // quoting hazards, and argv is visible to every process lister on the
-        // machine — inputs may hold user data.
-        let scratch = std::env::temp_dir().join(format!("oaiy-run-{}", run.run_id));
-        if let Err(e) = std::fs::create_dir_all(&scratch) {
-            return fail(RunErrorCode::Internal, &format!("cannot create scratch dir: {e}"));
-        }
-        let inputs_path = scratch.join("inputs.json");
-        let out_path = scratch.join("result.json");
-        let inputs_body = run
-            .input
-            .clone()
-            .unwrap_or_else(|| Value::Object(Default::default()));
-        if let Err(e) = std::fs::write(&inputs_path, inputs_body.to_string()) {
-            return fail(RunErrorCode::Internal, &format!("cannot write inputs: {e}"));
-        }
-
-        let timeout = run
-            .timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(DEFAULT_TIMEOUT);
-
-        let outcome = run_flow_cli(
-            CliRequest {
-                flow_path: &flow_path,
-                inputs_path: &inputs_path,
-                out_path: &out_path,
-                // A locally stored flow talks to nothing on anyone's behalf.
-                connector_path: None,
-                timeout,
-                // The engine's own default: a flow stored here was written
-                // against no provider's policy, and the desktop sets none.
-                instruction_budget: None,
-                // And against no provider's standard library either. A flow
-                // stored on this desktop speaks for nobody, so it gets nobody's
-                // prelude — the same reason it gets no connector config.
-                profile_path: None,
-                node: self.node.as_ref(),
-            },
-            // Cancellation: the flag the cancel endpoint sets. Observed from
-            // here because the worker is the only thing that can stop the work.
-            &|| {
-                self.ledger
-                    .lock()
-                    .ok()
-                    .and_then(|l| l.get(&run.run_id))
-                    .map(|r| r.cancel_requested)
-                    .unwrap_or(false)
-            },
-        );
-
-        let _ = std::fs::remove_dir_all(&scratch);
-        bridge_outcome(outcome, timeout)
+        execute_run(&self.flows, self.node.as_ref(), &self.ledger, run)
     }
+}
+
+/// Execute one claimed run on this thread. Returns (status, output, error) for finish(): the worker's way, and the
+/// `oaiy-flows` connector's, which claims the runs it reserves itself (so a flow it is asked for from inside another
+/// flow's run never waits on this worker, which is running that one).
+pub(crate) fn execute_run(
+    flows: &FlowStore,
+    node: Option<&crate::services::node_runtime::NodeHandle>,
+    ledger: &LedgerHandle,
+    run: &RunRecord,
+) -> (RunStatus, Option<Value>, Option<RunError>) {
+    let Some(flow_id) = run.flow_id.as_deref() else {
+        return fail(
+            RunErrorCode::InvalidFlow,
+            "this run has no flowId; inline graphs are not executable on the desktop yet",
+        );
+    };
+    let Some(flow_path) = flows.path_of(flow_id) else {
+        return fail(
+            RunErrorCode::InvalidRequest,
+            &format!("flow id {flow_id:?} is not a valid identifier"),
+        );
+    };
+    if !flow_path.is_file() {
+        let known: Vec<String> = flows.list().into_iter().map(|(id, _)| id).collect();
+        return (
+            RunStatus::Failed,
+            None,
+            Some(
+                RunError::new(
+                    RunErrorCode::FlowNotFound,
+                    format!("no flow named {flow_id:?} is stored on this desktop"),
+                )
+                .with_detail(format!(
+                    "Push it with PUT /api/bridge/flows/{flow_id}. Stored flows: {}",
+                    if known.is_empty() { "(none)".into() } else { known.join(", ") }
+                )),
+            ),
+        );
+    }
+
+    // Inputs travel by file, not argv: values can be large, can contain
+    // quoting hazards, and argv is visible to every process lister on the
+    // machine — inputs may hold user data.
+    let scratch = std::env::temp_dir().join(format!("oaiy-run-{}", run.run_id));
+    if let Err(e) = std::fs::create_dir_all(&scratch) {
+        return fail(RunErrorCode::Internal, &format!("cannot create scratch dir: {e}"));
+    }
+    let inputs_path = scratch.join("inputs.json");
+    let out_path = scratch.join("result.json");
+    let mut inputs_body = run
+        .input
+        .clone()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    // A picture given inline (an app's, FormLogic's) reaches the flow as the engines' reference to it.
+    if let Err(e) = super::pictures::by_reference(&mut inputs_body, &super::pictures::upload_local) {
+        let _ = std::fs::remove_dir_all(&scratch);
+        return fail(RunErrorCode::InvalidRequest, &e);
+    }
+    if let Err(e) = std::fs::write(&inputs_path, inputs_body.to_string()) {
+        return fail(RunErrorCode::Internal, &format!("cannot write inputs: {e}"));
+    }
+
+    let timeout = run
+        .timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_TIMEOUT);
+
+    let outcome = run_flow_cli(
+        CliRequest {
+            flow_path: &flow_path,
+            inputs_path: &inputs_path,
+            out_path: &out_path,
+            // A locally stored flow talks to nothing on anyone's behalf.
+            connector_path: None,
+            timeout,
+            // The engine's own default: a flow stored here was written
+            // against no provider's policy, and the desktop sets none.
+            instruction_budget: None,
+            // And against no provider's standard library either. A flow
+            // stored on this desktop speaks for nobody, so it gets nobody's
+            // prelude — the same reason it gets no connector config.
+            profile_path: None,
+            node,
+        },
+        // Cancellation: the flag the cancel endpoint sets. Observed from
+        // here because the runner is the only thing that can stop the work.
+        &|| {
+            ledger
+                .lock()
+                .ok()
+                .and_then(|l| l.get(&run.run_id))
+                .map(|r| r.cancel_requested)
+                .unwrap_or(false)
+        },
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    bridge_outcome(outcome, timeout)
 }
 
 /// How the bridge lane reports what the CLI did. Pure, so every arm is pinned
@@ -1487,6 +1546,24 @@ mod tests {
         ] {
             assert!(!FlowStore::valid_id(bad), "{bad:?} must be refused");
         }
+    }
+
+    /// Each example is stored once, as an example (not the Agent's, not shared with apps), and one deleted stays so.
+    #[test]
+    fn examples_are_stored_once_and_a_deleted_one_stays_deleted() {
+        let dir = std::env::temp_dir().join(format!("oaiy-flowstore-examples-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FlowStore::new(dir.clone());
+        store.seed_examples();
+        let (id, _) = EXAMPLES[0];
+        let doc: Value = serde_json::from_str(&store.get(id).expect("stored")).unwrap();
+        assert!(doc.get("nodes").is_some_and(Value::is_array));
+        assert!(doc.get("oaiyTool").is_none() && doc.get("oaiyRemote").is_none());
+        assert!(store.list().iter().all(|(id, _)| FlowStore::valid_id(id)), "the record of what was stored is no flow");
+        store.delete(id).unwrap();
+        store.seed_examples();
+        assert!(store.get(id).is_none(), "an example the person deleted is not stored again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

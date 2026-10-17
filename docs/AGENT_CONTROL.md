@@ -111,7 +111,7 @@ models are the ones installed, and the one chosen is the person's.
 | AI sources | `ai_sources_list` | `agent_model_set` (the engine or ChatGPT), `chatgpt_sign_in` (answers the address to sign in at), `chatgpt_sign_out` |
 | Services | `services_list`, `service_logs` | `service_install`, `service_start`, `service_stop`, `service_uninstall` |
 | Plugins | `plugins_list`, `plugin_catalog`, `plugin_settings_get`, `plugin_setup_status` | `plugin_install` (from a folder or archive on this computer, never a URL), `plugin_enable`, `plugin_disable`, `plugin_restart`, `plugin_uninstall`, `plugin_settings_set`, `plugin_command` (a declared connector command, through the same gate as the dashboard), `plugin_setup_open`, `plugin_setup_step_done`, `plugin_setup_finish` |
-| Flows | `flows_list`, `flow_get` | `flow_create`, `flow_update`, `flow_run`, `flow_delete` |
+| Flows | `flows_list` (each flow's description, the inputs it takes by name, and whether it is shared with apps), `flow_get` | `flow_create`, `flow_update`, `flow_run` (answers the run's output, and the pictures its answer names as images: at most four, each as it is or a JPEG under 3.5 MB), `flow_delete` |
 | Calendar | `calendar_settings_get` | `calendar_settings_set` (the business's name, the receptionist's name, hours, services, booking rules) |
 | Contacts | `contacts_list`, `contact_get` | `contact_set` (a name or the person's notes for the receptionist), `contact_forget_fact` |
 | FormLogic | `link_status` | `link_sync_now` |

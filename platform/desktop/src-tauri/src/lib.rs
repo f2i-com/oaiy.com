@@ -1944,6 +1944,8 @@ pub fn build_bridge_state(
     // resolve differently on the same machine.
     bridge::ScriptHost::global().set_node_runtime(node.clone());
     let flows = std::sync::Arc::new(bridge::FlowStore::new(data_dir.join("flows")));
+    // The examples OAIY ships, in the person's flows the first time (the editor shows them from there).
+    flows.seed_examples();
     // Durable pairing tokens under <data>/bridge, so a paired consumer stays
     // paired across restarts.
     let pairing = bridge::pairing::open_handle(data_dir.join("bridge").join("pairings.json"));

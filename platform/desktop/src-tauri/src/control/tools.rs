@@ -221,7 +221,7 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 object(json!({ "pluginId": plugin_id() }), &["pluginId"])),
             // Flows
             def("flows_list", "Flows", Read,
-                "The flows stored on this desktop: id and name.",
+                "The flows stored on this desktop: id, name, description, the inputs each takes (by name, with the value it has when none is given), and whether it is shared with apps (oaiyRemote: FormLogic and other apps may run it through the oaiy-flows connector).",
                 none()),
             def("flow_get", "A flow", Read,
                 "One flow's document as stored ({name, nodes, edges}). Read one before flow_create or flow_update, to follow its shape.",
@@ -239,7 +239,7 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                     "flow": { "type": "object", "description": "The flow's whole new document." }
                 }), &["id", "flow"])),
             def("flow_run", "Run a flow", Change,
-                "Run a stored flow with an optional input. By default waits for it (up to timeoutSeconds, 60) and answers its status and output; with wait false, answers the run at once.",
+                "Run a stored flow with an optional input (an object, each input by the name flows_list gives). By default waits for it (up to timeoutSeconds, 60) and answers its status and output, and the pictures its answer names as images; with wait false, answers the run at once.",
                 object(json!({
                     "id": flow_id(),
                     "input": { "description": "The flow's input." },
@@ -334,19 +334,21 @@ pub(crate) fn list(session: Session) -> Vec<Value> {
 // Calling a tool
 // ---------------------------------------------------------------------------
 
-/// What a tool did: a sentence for the model, and the JSON behind it.
+/// What a tool did: a sentence for the model, the JSON behind it, and any pictures it answered with (MCP image
+/// content, after the text).
 pub(crate) struct Done {
     pub summary: String,
     pub data: Value,
+    pub images: Vec<Value>,
 }
 
 fn done(summary: impl Into<String>, data: Value) -> Result<Done, String> {
-    Ok(Done { summary: summary.into(), data })
+    Ok(Done { summary: summary.into(), data, images: Vec::new() })
 }
 
 /// A read's answer: the JSON only.
 fn data(data: Value) -> Result<Done, String> {
-    Ok(Done { summary: String::new(), data })
+    Ok(Done { summary: String::new(), data, images: Vec::new() })
 }
 
 fn error_result(message: &str) -> Value {
@@ -361,7 +363,9 @@ fn success_result(d: Done) -> Value {
     };
     let body = if data.as_object().is_some_and(|o| o.is_empty()) { String::new() } else { data.to_string() };
     let text = [d.summary.as_str(), body.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("\n");
-    json!({ "content": [{ "type": "text", "text": if text.is_empty() { "Done.".to_string() } else { text } }], "structuredContent": data })
+    let mut content = vec![json!({ "type": "text", "text": if text.is_empty() { "Done.".to_string() } else { text } })];
+    content.extend(d.images);
+    json!({ "content": content, "structuredContent": data })
 }
 
 /// Check `args` against `tool`'s schema: no unknown names, the required ones
@@ -676,7 +680,20 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
         }
         "flows_list" => {
             let v = d.get("/api/bridge/flows").await?;
-            let flows: Vec<Value> = arr(&v, "flows").iter().map(|f| json!({ "id": f.get("flowId"), "name": f.get("name") })).collect();
+            let mut flows = Vec::new();
+            for f in arr(&v, "flows") {
+                let id = f.get("flowId").and_then(Value::as_str).unwrap_or_default();
+                // What each takes and whether apps may run it, from its document (a copy given to the Agent as a
+                // tool, `tool-…`, is listed as it is stored).
+                let doc = d.get(&format!("/api/bridge/flows/{}", seg(id))).await.unwrap_or(Value::Null);
+                flows.push(json!({
+                    "id": id,
+                    "name": f.get("name"),
+                    "description": doc.get("description").and_then(Value::as_str).unwrap_or(""),
+                    "inputs": crate::bridge::flow_connector::inputs_of(&doc),
+                    "oaiyRemote": crate::bridge::flow_connector::shared(&doc),
+                }));
+            }
             data(json!({ "flows": flows }))
         }
         "flow_get" => {
@@ -779,6 +796,10 @@ const QUICK: Duration = Duration::from_secs(8);
 /// A flow document larger than this is not read back whole.
 const MAX_FLOW_BYTES: usize = 200 * 1024;
 
+/// The pictures `flow_run` hands back, at most, and the bytes of each (under what MCP clients take for one).
+const MAX_PICTURES: usize = 4;
+const MAX_PICTURE: usize = 3_500_000;
+
 /// The desktop's own router, called in-process with this process's bearer:
 /// the same gate, validation and module checks as any other caller.
 pub(crate) struct Desk {
@@ -833,6 +854,26 @@ impl Desk {
 
     pub async fn get(&self, path: &str) -> Result<Value, String> {
         self.expect(Method::GET, path, None, WAIT).await
+    }
+
+    /// A file's bytes (a picture the engines made), as they are.
+    async fn bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {}", crate::internal_token()))
+            .body(Body::empty())
+            .map_err(|e| format!("the request for {} could not be made: {e}", bare(path)))?;
+        let response = match tokio::time::timeout(WAIT, self.router.clone().oneshot(request)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(never)) => match never {},
+            Err(_) => return Err(format!("OAIY did not answer GET {} within {} s.", bare(path), WAIT.as_secs())),
+        };
+        if !response.status().is_success() {
+            return Err(format!("GET {} answered {}.", bare(path), response.status()));
+        }
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_BODY).await.map_err(|e| format!("{} could not be read: {e}", bare(path)))?;
+        Ok(bytes.to_vec())
     }
 
     async fn get_within(&self, path: &str, wait: Duration) -> Result<Value, String> {
@@ -1779,7 +1820,29 @@ async fn flow_run(d: &Desk, id: &str, input: Option<Value>, wait: bool, timeout_
         ("succeeded", None) => format!("The run of {id} succeeded."),
         (s, None) => format!("The run of {id} is {s}."),
     };
-    done(summary, json!({ "runId": r.get("runId"), "status": status, "output": r.get("output").map(trim), "error": r.get("error") }))
+    let images = match r.get("output") {
+        Some(report) => picture_content(d, report.get("output").unwrap_or(report)).await,
+        None => Vec::new(),
+    };
+    let mut done = done(summary, json!({ "runId": r.get("runId"), "status": status, "output": r.get("output").map(trim), "error": r.get("error") }))?;
+    done.images = images;
+    Ok(done)
+}
+
+/// The pictures a run's answer names, as MCP image content: a client is handed pictures, not this computer's
+/// addresses. At most [`MAX_PICTURES`], each as it is or, larger than [`MAX_PICTURE`], a JPEG that fits.
+async fn picture_content(d: &Desk, answer: &Value) -> Vec<Value> {
+    use base64::Engine as _;
+    let mut content = Vec::new();
+    for reference in crate::bridge::pictures::references(answer).into_iter().take(MAX_PICTURES) {
+        let Some((_, path)) = crate::bridge::pictures::locate(&reference) else { continue };
+        let Ok(bytes) = d.bytes(path).await else { continue };
+        let fitted = tokio::task::spawn_blocking(move || crate::bridge::pictures::fit(&bytes, MAX_PICTURE)).await;
+        if let Ok(Ok(f)) = fitted {
+            content.push(json!({ "type": "image", "mimeType": f.mime, "data": base64::engine::general_purpose::STANDARD.encode(&f.bytes) }));
+        }
+    }
+    content
 }
 
 // ---------------------------------------------------------------------------

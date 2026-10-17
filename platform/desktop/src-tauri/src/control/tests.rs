@@ -527,8 +527,16 @@ async fn a_read_and_a_change_go_through_the_desktops_router_and_its_gate() {
         }
     };
 
+    // The examples OAIY ships are there from the start; deleted, the list is empty.
     let r = tool("flows_list", json!({})).await;
     assert!(!is_error(&r), "{r}");
+    let listed: Vec<String> = r["structuredContent"]["flows"].as_array().unwrap().iter().filter_map(|f| f["id"].as_str().map(str::to_string)).collect();
+    assert_eq!(listed, crate::bridge::worker::EXAMPLES.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>());
+    for id in &listed {
+        let r = tool("flow_delete", json!({ "id": id })).await;
+        assert!(!is_error(&r), "{r}");
+    }
+    let r = tool("flows_list", json!({})).await;
     assert_eq!(r["structuredContent"], json!({ "flows": [] }));
 
     let flow = json!({ "name": "Hello there", "nodes": [{ "id": "in", "type": "input_text" }], "edges": [] });
@@ -549,7 +557,14 @@ async fn a_read_and_a_change_go_through_the_desktops_router_and_its_gate() {
     let r = tool("flow_update", json!({ "id": "hello-there", "flow": { "name": "Hello again", "nodes": [], "edges": [] } })).await;
     assert!(!is_error(&r), "{r}");
     let r = tool("flows_list", json!({})).await;
-    assert_eq!(r["structuredContent"]["flows"], json!([{ "id": "hello-there", "name": "Hello again" }, { "id": "hello-there-2", "name": "Hello there" }]));
+    // Each with what it takes (its text inputs by label) and whether apps may run it.
+    assert_eq!(
+        r["structuredContent"]["flows"],
+        json!([
+            { "id": "hello-there", "name": "Hello again", "description": "", "inputs": [], "oaiyRemote": false },
+            { "id": "hello-there-2", "name": "Hello there", "description": "", "inputs": [{ "name": "in", "default": null }], "oaiyRemote": false },
+        ])
+    );
     let r = tool("flow_update", json!({ "id": "nope", "flow": {} })).await;
     assert!(is_error(&r) && text(&r).contains("flow_create"), "{r}");
 
@@ -567,7 +582,7 @@ async fn a_read_and_a_change_go_through_the_desktops_router_and_its_gate() {
         .iter()
         .map(|e| (e["tool"].as_str().unwrap().to_string(), e["ok"].as_bool().unwrap()))
         .collect();
-    let expect: Vec<(String, bool)> = [
+    let mut expect: Vec<(String, bool)> = [
         ("flow_delete", false),
         ("flow_delete", true),
         ("flow_update", false),
@@ -580,6 +595,8 @@ async fn a_read_and_a_change_go_through_the_desktops_router_and_its_gate() {
     .iter()
     .map(|(t, ok)| (t.to_string(), *ok))
     .collect();
+    // (first of all, the examples deleted)
+    expect.extend(listed.iter().map(|_| ("flow_delete".to_string(), true)));
     assert_eq!(log, expect);
 }
 
