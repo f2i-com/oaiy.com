@@ -17,7 +17,8 @@ the Studio loads, keeps and lets them go ([STUDIO.md](STUDIO.md#which-model-hold
 | Step | Node | Model |
 | --- | --- | --- |
 | **Prompt**, what to make | `input_text` | |
-| The prompt made a full caption, as OpenMOSS's prompt enhancer writes them ([MOSS-IMAGE.md](MOSS-IMAGE.md#prompting)) | `ai_llm`, `engine:llm` | the language model chosen in Engines (Qwen3.5-9B on the Mac's GPU here) |
+| The prompt enhanced as OpenMOSS's prompt enhancer does ([MOSS-IMAGE.md](MOSS-IMAGE.md#prompting)): a caption for a scene, a photograph or an illustration; for a picture designed around its lettering (a logo, an emblem, a poster, a sign) a layout of its parts and lettering in boxes | `ai_llm`, `engine:llm` | the language model chosen in Engines (Qwen3.5-9B on the Mac's GPU here) |
+| MOSS-Image's prompt: a caption as it is, a layout compiled to the model's one-line form as OpenMOSS's `compile_prompt.py` does (the same bytes on its example), a reply a bracket short closed first | `logic_block` | |
 | Try up to 3 times | `loop_start`, until its end says stop | |
 | This try's prompt: the caption, and on a retry the last review's fix after it | `logic_block` | |
 | The picture (a new seed each try) | `image_gen` | `moss-image-sft-q4-8-step` (the 8-step distillation at its 8 steps: at 6 the pictures were a little softer, for 2 s less) |
@@ -52,13 +53,38 @@ carries it), and the lettering asked for and read. Three things keep it honest:
   result with the stripes asked for was failed for lacking them (true of the reference), and one that had lost its
   lettering passed. Against the request and the caption (which describes the whole picture to make) one picture is
   judged reliably.
-- **The lettering is checked in code too.** Each phrase the caption quotes (the enhancer quotes exactly the lettering
-  the picture must show) must be among what the reviewer reads, word for word: a small model reading a picture is
-  reliable, one judging whether it matches is lenient. A phrase missing fails the try, and the next is told to write it.
+- **The lettering is checked in code too.** Each piece of a layout's wording, or each phrase a caption quotes (the
+  enhancer quotes exactly the lettering the picture must show), must be among what the reviewer reads, word for word,
+  as many times as it is asked for and no more; a layout's picture (designed: a logo, a poster) has no other text. A
+  small model reading a picture is reliable, one judging whether it matches is lenient: it passed a logo with its
+  name twice, having read it twice. A phrase missing, doubled or joined by another fails the try, and the next is told.
 - **Stray text counts only where it gets in the way:** garbled letters beside the text asked for, or any text on a
   picture meant to be clean (a logo, a product shot); a scene's own signs and a reflection's mirrored letters are fine.
 
-A reply that is not JSON cannot fail a picture: it passes unchecked (`checked: false`, the reply kept as `review`).
+A reply cut short (one listing a picture's repeated text runs out of room) is read as far as it goes, and a `"pass":
+false` in it fails the try. A reply that is not JSON at all cannot fail a picture: it passes unchecked (`checked:
+false`, the reply kept as `review`).
+
+## Logos
+
+Text to image is a logo generator when the prompt asks for a logo: the flow is the same, the enhancer's layout and the
+lettering check doing the work. MOSS-Image's 8-step distillation draws lettering less faithfully than the model it was
+distilled from: from a logo's brief it writes the name twice, adds a line nobody asked for ("COFFEE ROASTERY"), or puts
+the logo on a café's wall. Six seeds of one brief, the same on each setup:
+
+| Setup | Lettering right, once, nothing added | Plain background |
+| --- | --- | --- |
+| The 4-bit 8-step model, the brief as written | 1 of 6 | 4 of 6 |
+| The same, its text encoder on the Mac instead of the card (the same pictures, but for small details) | 1 of 6 | 4 of 6 |
+| The full-precision 8-step model | 1 of 6 | 4 of 6 |
+| MOSS-Image itself (50 guided steps), the enhancer's caption (3 seeds) | 3 of 3 | 3 of 3 |
+| The 4-bit 8-step model, OpenMOSS's layout with the background its own item | 6 of 6 | 5 of 6 |
+
+So it is the distilled model's, not OAIY's inference (its encoder's placement and its weights' precision change
+nothing that matters), and a layout answers it. Through the flow, four logo briefs (a coffee roastery, a tech startup,
+a bakery, a sports team) passed in one or two tries, 22 to 45 s each, every name spelt right and written once; their
+edits in Image to image (other colours, a dark version, a tagline added, one colour) and a product mockup passed
+first time.
 
 ## Inputs and the answer
 

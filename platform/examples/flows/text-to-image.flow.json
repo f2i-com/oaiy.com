@@ -1,6 +1,6 @@
 {
  "name": "Text to image",
- "description": "A picture from a prompt: the prompt enhanced, the picture made with MOSS-Image (8 steps), checked by a vision model and made again (up to 3 tries) when the check finds a problem, the review's fix added to the prompt. Input: Prompt. Answers the picture's file reference, whether it passed and each try's findings.",
+ "description": "A picture from a prompt: the prompt enhanced (a caption, or for a logo, poster or sign a layout of its parts and lettering, as OpenMOSS's enhancer writes them), the picture made with MOSS-Image (8 steps), checked by a vision model and made again (up to 3 tries) when the check finds a problem, the review's fix added to the prompt. Input: Prompt. Answers the picture's file reference, whether it passed and each try's findings.",
  "tags": [
   "image",
   "example"
@@ -11,7 +11,7 @@
    "type": "input_text",
    "position": {
     "x": 0,
-    "y": 328
+    "y": 290
    },
    "data": {
     "label": "Prompt",
@@ -23,27 +23,43 @@
    "type": "ai_llm",
    "position": {
     "x": 322,
-    "y": 294
+    "y": 246
    },
    "data": {
-    "label": "Enhance the prompt",
+    "label": "Enhance the prompt (a caption, or a layout)",
     "service": "engine:llm",
     "model": "",
-    "systemPrompt": "You turn a person's picture idea into one detailed English caption for MOSS-Image, a text-to-image model, as OpenMOSS's prompt enhancer does. Describe the visible picture concretely: the subject and what it is doing, its appearance, the setting, the framing, the medium, the lighting, materials, colour palette and mood. Keep every subject, count, relationship, style and exclusion the person asked for; add detail only where it makes the picture more specific, and keep a minimalist request minimalist. Quote any text that should appear in the picture exactly, in its own language, with its line breaks. Where the picture should be clean (a logo, an icon, a product shot), say plainly what must not appear: no other letters or words, no watermark. Write cohesive prose, one or two paragraphs, with no lists, JSON or quality tags. Reply with the caption alone.",
-    "maxTokens": 700,
+    "systemPrompt": "You write the prompt for MOSS-Image, a text-to-image model, from a person's request, as OpenMOSS's prompt enhancer does. Reply with JSON alone, no code fence, in one of two forms.\nA caption, for ordinary scenes, photographs and illustrations: {\"caption\": \"...\"}, cohesive English prose describing the visible picture concretely: the subject and what it is doing, its appearance, the setting, the framing, the medium, the lighting, materials, colour palette and mood. Keep every subject, count, relationship, style and exclusion the person asked for; keep a minimalist request minimalist.\nA layout, when the picture is designed around its lettering or the placement of its parts (a logo, an emblem, a poster, a sign, a label, a cover, a card): {\"width\": 1024, \"height\": 1024, \"bbox_coord_space\": \"abs\", \"bbox_format\": \"xyxy\", \"summary\": {\"meta\": [its medium and genre, e.g. \"logo\", \"flat vector graphic\"], \"canvas\": \"single\", \"caption\": \"the whole picture in a sentence or two: what it is, its style, palette and background\"}, \"items\": [...]}. The items, in this order: first the background, {\"label\": \"object\", \"caption\": what the background is (for a logo: an empty, plain, flat white background with nothing on it), \"bbox\": [0, 0, 1024, 1024]}; then each visible element once, {\"label\": \"object\" or \"character\", \"caption\": its appearance, \"bbox\": [x_min, y_min, x_max, y_max]}; then each piece of wording, {\"label\": \"text\", \"caption\": its typography and colour, \"text\": the exact characters (\\n for a line break), \"bbox\": [...]}. Boxes are in pixels from the top-left of the 1024 x 1024 canvas; nothing but the items appears. Size things as a designer would: a logo's mark about 300 to 450 pixels across, its name a line about as wide as the mark or wider and 90 to 140 pixels tall, a poster's title large. For example, for a logo for a bookshop called PAGE & QUILL with an open book and a quill: {\"width\": 1024, \"height\": 1024, \"bbox_coord_space\": \"abs\", \"bbox_format\": \"xyxy\", \"summary\": {\"meta\": [\"logo\", \"flat vector graphic\"], \"canvas\": \"single\", \"caption\": \"A single minimalist flat vector logo for a bookshop: one mark above one line of lettering, centred on an empty plain white background, in navy and gold.\"}, \"items\": [{\"label\": \"object\", \"caption\": \"An empty, plain, flat white background with nothing on it.\", \"bbox\": [0, 0, 1024, 1024]}, {\"label\": \"object\", \"caption\": \"One open book in navy with a gold quill resting across its pages, flat vector shapes with clean edges.\", \"bbox\": [312, 144, 712, 576]}, {\"label\": \"text\", \"caption\": \"Clean navy serif capitals, evenly spaced, on one line.\", \"text\": \"PAGE & QUILL\", \"bbox\": [176, 656, 848, 776]}]}\nEither way, write exactly the wording the person asked for, in its own language, and nothing more: no tagline, slogan or label they did not ask for. In a caption, quote only the wording written in the picture, once, where it appears, and refer to a name otherwise without quotes.",
+    "maxTokens": 1400,
     "enableThinking": false
+   }
+  },
+  {
+   "id": "the_prompt",
+   "type": "logic_block",
+   "position": {
+    "x": 644,
+    "y": 292
+   },
+   "data": {
+    "label": "MOSS-Image's prompt",
+    "code": "// MOSS-Image's prompt from the enhancer's reply: a caption as it is, or a layout compiled to the model's one-line\n// form as OpenMOSS's compile_prompt.py does (boxes from the canvas's top-left in pixels, x then y, to boxes about its\n// centre, y then x, their edges enclosed), scaled to the picture's 1024 x 1024. A reply that is neither is a caption.\nconst SIZE = 1024;\nconst raw = String(reply == null ? '' : reply).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\nconst quoted = (t) => { const q = []; String(t).replace(/[\"\\u201C]([^\"\\u201D]{1,60})[\"\\u201D]/g, (all, x) => { q.push(x); return all; }); return q; };\nconst caption = (t) => ({ prompt: t, described: t, lettering: quoted(t), layout: false });\n// (a reply a bracket or two short, as a language model sometimes ends one, closed before it is read)\nconst closed = (t) => {\n  const open = [];\n  let inString = false, escaped = false;\n  for (const ch of t) {\n    if (inString) { if (escaped) escaped = false; else if (ch === '\\\\') escaped = true; else if (ch === '\"') inString = false; continue; }\n    if (ch === '\"') inString = true;\n    else if (ch === '{') open.push('}');\n    else if (ch === '[') open.push(']');\n    else if (ch === '}' || ch === ']') open.pop();\n  }\n  return t + open.reverse().join('');\n};\nconst read = (t) => { try { return JSON.parse(t); } catch { return null; } };\nconst at = raw.indexOf('{');\nconst draft = at < 0 ? null : read(raw.slice(at, raw.lastIndexOf('}') + 1)) || read(closed(raw.slice(at)));\nif (draft && typeof draft.caption === 'string' && !Array.isArray(draft.items)) return caption(draft.caption);\nif (!draft || !Array.isArray(draft.items) || !draft.summary || typeof draft.summary.caption !== 'string') {\n  // (JSON that cannot be read: its captions as one, never the JSON itself)\n  const said = [];\n  raw.replace(/\"caption\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"/g, (all, c) => { said.push(c.replace(/\\\\\"/g, '\"')); return all; });\n  return caption(at < 0 ? raw : said.join(' ') || raw);\n}\nconst sx = SIZE / (Number(draft.width) || SIZE), sy = SIZE / (Number(draft.height) || SIZE);\nconst edge = (v) => Math.min(Math.max(v, 0), SIZE);\nconst items = [];\nfor (const it of draft.items) {\n  if (!it || typeof it !== 'object' || !Array.isArray(it.bbox) || it.bbox.length !== 4 || typeof it.caption !== 'string' || !it.caption.trim()) continue;\n  const text = typeof it.text === 'string' && it.text.trim() ? it.text : null;\n  const label = ['object', 'character', 'text'].includes(it.label) ? it.label : text ? 'text' : 'object';\n  if (label === 'text' && !text) continue;\n  const [x1, y1, x2, y2] = it.bbox.map(Number);\n  if (![x1, y1, x2, y2].every(Number.isFinite)) continue;\n  const box = [Math.floor(edge(y1 * sy)) - SIZE / 2, Math.floor(edge(x1 * sx)) - SIZE / 2, Math.ceil(edge(y2 * sy)) - SIZE / 2, Math.ceil(edge(x2 * sx)) - SIZE / 2];\n  if (!(box[0] < box[2] && box[1] < box[3])) continue;\n  const item = { label, caption: it.caption };\n  if (text) item.text = text;\n  for (const k of ['tags', 'palette']) if (Array.isArray(it[k])) item[k] = it[k].filter((x) => typeof x === 'string');\n  item.bbox = box;\n  items.push(item);\n}\nif (!items.length) return caption(draft.summary.caption);\nconst summary = {};\nfor (const [k, v] of Object.entries(draft.summary)) if (['meta', 'canvas', 'caption', 'palette'].includes(k)) summary[k] = typeof v === 'string' && k !== 'caption' && k !== 'canvas' ? [v] : v;\nconst lettering = items.filter((i) => i.text).map((i) => i.text);\nreturn {\n  prompt: JSON.stringify({ summary, items, bbox_coord_space: 'abs_centralized', bbox_format: 'yxyx' }),\n  described: [summary.caption, ...items.map((i) => (i.text ? `The text \"${i.text}\": ${i.caption}` : i.caption))].join('\\n'),\n  lettering,\n  layout: true,\n};",
+    "inputCount": 1,
+    "inputNames": [
+     "reply"
+    ]
    }
   },
   {
    "id": "ask",
    "type": "logic_block",
    "position": {
-    "x": 644,
+    "x": 966,
     "y": 18
    },
    "data": {
     "label": "What to check",
-    "code": "// What the reviewer is asked: the person's own request (the caption is how it was put to the model)\nreturn `The person asked for: ${request}\\n\\nThe caption the picture was made from: ${caption}\\n\\nCheck the picture against what the person asked for.`;",
+    "code": "// What the reviewer is asked: the person's own request (the caption, or the layout described, is how it was put to the\n// model)\nconst made = caption && typeof caption === 'object' ? caption.described : caption;\nreturn `The person asked for: ${request}\\n\\nThe picture was made from this description: ${made}\\n\\nCheck the picture against what the person asked for.`;",
     "inputCount": 2,
     "inputNames": [
      "request",
@@ -55,8 +71,8 @@
    "id": "attempts",
    "type": "loop_start",
    "position": {
-    "x": 322,
-    "y": 148
+    "x": 644,
+    "y": 144
    },
    "data": {
     "label": "Try up to 3 times",
@@ -69,12 +85,12 @@
    "id": "attempt_prompt",
    "type": "logic_block",
    "position": {
-    "x": 644,
+    "x": 966,
     "y": 161
    },
    "data": {
     "label": "This try's prompt",
-    "code": "// The prompt for this try: the enhanced one, and on a retry the last review's fix with it (a model told what to\n// get right this time; the review read as the step before it left it, the loop's last try)\nconst last = nodes.verdict;\nconst fix = attempt > 1 && last && typeof last.fix === 'string' ? last.fix.trim() : '';\nreturn fix ? `${caption}\\n\\n${fix}` : caption;",
+    "code": "// The prompt for this try: the enhanced one, and on a retry the last review's fix with it (a model told what to\n// get right this time; the review read as the step before it left it, the loop's last try). In a layout the fix goes\n// after its summary's caption, the layout kept whole.\nconst last = nodes.verdict;\nconst fix = attempt > 1 && last && typeof last.fix === 'string' ? last.fix.trim() : '';\nconst made = caption && typeof caption === 'object';\nconst base = made ? caption.prompt : caption;\nif (!fix) return base;\nif (made && caption.layout) {\n  const layout = JSON.parse(base);\n  layout.summary.caption = `${layout.summary.caption} ${fix}`;\n  return JSON.stringify(layout);\n}\nreturn `${base}\\n\\n${fix}`;",
     "inputCount": 2,
     "inputNames": [
      "caption",
@@ -86,7 +102,7 @@
    "id": "make",
    "type": "image_gen",
    "position": {
-    "x": 966,
+    "x": 1288,
     "y": 129
    },
    "data": {
@@ -102,16 +118,16 @@
    "id": "review",
    "type": "ai_llm",
    "position": {
-    "x": 1288,
+    "x": 1610,
     "y": 0
    },
    "data": {
     "label": "Review it",
     "service": "engine:llm",
     "model": "",
-    "systemPrompt": "You check a picture an image model made against what the person asked for. Reply with JSON alone, no prose and no code fence, in exactly this shape:\n{\"pass\": true or false, \"issues\": [\"each real problem, in a few words\"], \"fix\": \"one sentence saying what the picture must show instead, as an instruction to the painter, or empty\", \"text\": {\"requested\": [each word or phrase the request asks to be written in the picture, exactly as asked: lettering, never the things it shows], \"found\": [each word or phrase you can read in the picture, letter by letter]}}\nPass when the picture shows what was asked: the subjects and how many, any text exactly as asked (read it letter by letter: a wrong, missing or extra letter is an issue), the colours, the setting and the style. Other text is an issue only where it gets in the way: garbled letters on or beside the text asked for, or any text at all on a picture meant to be clean (a logo, an icon, a product shot); the signs and labels a scene would have anyway, and a reflection's mirrored letters, are fine. Detail the request does not mention is not an issue. Fail only for a problem the person would notice. The text lists hold the words alone; leave them empty where there is no text.",
+    "systemPrompt": "You check a picture an image model made against what the person asked for. Reply with JSON alone, no prose and no code fence, in exactly this shape:\n{\"pass\": true or false, \"issues\": [\"each real problem, in a few words\"], \"fix\": \"one sentence saying what the picture must show instead, as an instruction to the painter, or empty\", \"text\": {\"requested\": [each word or phrase the request asks to be written in the picture, exactly as asked: lettering, never the things it shows], \"found\": [each word or phrase you can read in the picture, letter by letter, as many times as it is written there (at most 3)]}}\nPass when the picture shows what was asked: the subjects and how many, any text exactly as asked (read it letter by letter: a wrong, missing or extra letter is an issue), the colours, the setting and the style. Other text is an issue only where it gets in the way: garbled letters on or beside the text asked for, or any text at all on a picture meant to be clean (a logo, an icon, a product shot); the signs and labels a scene would have anyway, and a reflection's mirrored letters, are fine. A logo, an emblem or an icon is the flat design alone on its background: shown as a sign, on a wall, a package or a product, in a photo or a scene, it fails. Detail the request does not mention is not an issue. Fail only for a problem the person would notice. The text lists hold the words alone; leave them empty where there is no text.",
     "imageInputCount": 1,
-    "maxTokens": 500,
+    "maxTokens": 800,
     "enableThinking": false
    }
   },
@@ -119,12 +135,12 @@
    "id": "verdict",
    "type": "logic_block",
    "position": {
-    "x": 1610,
-    "y": 204
+    "x": 1932,
+    "y": 182
    },
    "data": {
     "label": "Pass or try again",
-    "code": "// Pass or try again: the review read from its reply (a reply that is not JSON cannot fail the picture: it is kept\n// as text, the picture passed unchecked), with the picture's file reference. The lettering is checked here too: the\n// reviewer lists what it reads, and each phrase that must be there has to be among it (a small vision model reading\n// a picture is reliable; one judging whether it matches is lenient)\nconst text = String(review == null ? '' : review).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\nconst at = text.indexOf('{'), end = text.lastIndexOf('}');\nlet found = null;\ntry { found = JSON.parse(at >= 0 && end > at ? text.slice(at, end + 1) : text); } catch { found = null; }\nconst checked = !!found && typeof found.pass === 'boolean';\nconst issues = checked && Array.isArray(found.issues) ? found.issues.filter((x) => typeof x === 'string' && x.trim()) : [];\nconst words = (s) => String(s).toUpperCase().replace(/[^A-Z0-9\\u00C0-\\uFFFF]+/g, ' ').trim();\nconst lists = checked && found.text && typeof found.text === 'object' ? found.text : {};\nconst strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && words(x)) : []);\nconst read = ` ${strings(lists.found).map(words).join(' ')} `;\n// (each phrase the caption quotes: the enhancer quotes exactly the lettering the picture must show, the request's own\n// and, for an edit, what the references show that the request leaves alone)\nconst must = [];\nString(caption == null ? '' : caption).replace(/[\"\\u201C]([^\"\\u201D]{1,60})[\"\\u201D]/g, (all, q) => { must.push(q); return all; });\nconst missing = checked ? [...new Set(must.map(words).filter(Boolean))].filter((p) => !read.includes(` ${p} `)) : [];\nfor (const p of missing) issues.push(`the text \"${p}\" is not in the picture`);\nconst fix = [checked && typeof found.fix === 'string' ? found.fix.trim() : '', ...missing.map((p) => `The text \"${p}\" must be written in it, exactly.`)].filter(Boolean).join(' ');\nreturn {\n  pass: checked ? found.pass === true && missing.length === 0 : true,\n  checked,\n  attempt,\n  image: (made && made.file) || image,\n  seed: made && made.seed != null ? made.seed : null,\n  issues,\n  fix,\n  text: checked ? { requested: strings(lists.requested), quoted: must, found: strings(lists.found), missing } : null,\n  review: checked ? null : text,\n};",
+    "code": "// Pass or try again: the review read from its reply (a reply that is not JSON cannot fail the picture: it is kept\n// as text, the picture passed unchecked), with the picture's file reference. The lettering is checked here too: the\n// reviewer lists what it reads, and each phrase that must be there has to be among it (a small vision model reading\n// a picture is reliable; one judging whether it matches is lenient)\nconst text = String(review == null ? '' : review).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\n// (a reply cut short, as one listing a picture's repeated text runs out of room, closed and read as far as it goes)\nconst closed = (t) => {\n  const open = [];\n  let inString = false, escaped = false;\n  for (const ch of t) {\n    if (inString) { if (escaped) escaped = false; else if (ch === '\\\\') escaped = true; else if (ch === '\"') inString = false; continue; }\n    if (ch === '\"') inString = true;\n    else if (ch === '{') open.push('}');\n    else if (ch === '[') open.push(']');\n    else if (ch === '}' || ch === ']') open.pop();\n  }\n  return t + (inString ? '\"' : '') + open.reverse().join('');\n};\nconst parsed = (t) => { try { return JSON.parse(t); } catch { return null; } };\nconst at = text.indexOf('{');\nlet found = at < 0 ? null : parsed(text.slice(at, text.lastIndexOf('}') + 1)) || parsed(closed(text.slice(at)));\nif (!found && /\"pass\"\\s*:\\s*false/.test(text)) found = { pass: false, issues: ['the review was cut short'] };\nconst checked = !!found && typeof found.pass === 'boolean';\nconst issues = checked && Array.isArray(found.issues) ? found.issues.filter((x) => typeof x === 'string' && x.trim()) : [];\nconst words = (s) => String(s).toUpperCase().replace(/[^A-Z0-9\\u00C0-\\uFFFF]+/g, ' ').trim();\nconst lists = checked && found.text && typeof found.text === 'object' ? found.text : {};\nconst strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && words(x)) : []);\nconst read = ` ${strings(lists.found).map(words).join(' ')} `;\n// (each piece of a layout's wording, or each phrase a caption quotes: the enhancer quotes exactly the lettering the\n// picture must show, the request's own and, for an edit, what the references show that the request leaves alone)\nconst must = caption && typeof caption === 'object' ? (Array.isArray(caption.lettering) ? caption.lettering.slice() : []) : [];\nif (!(caption && typeof caption === 'object')) String(caption == null ? '' : caption).replace(/[\"\\u201C]([^\"\\u201D]{1,60})[\"\\u201D]/g, (all, q) => { must.push(q); return all; });\nconst asked = must.map(words).filter(Boolean);\nconst phrases = [...new Set(asked)];\nconst said = new Map(must.map((m) => [words(m), m.trim()]));\nconst as = (p) => said.get(p) || p;\nconst missing = checked ? phrases.filter((p) => !read.includes(` ${p} `)) : [];\nfor (const p of missing) issues.push(`the text \"${as(p)}\" is not in the picture`);\n// (each phrase as many times as it is asked for: a distilled model writes a name twice)\nconst times = (p) => { let n = 0; for (let i = read.indexOf(` ${p} `); i >= 0; i = read.indexOf(` ${p} `, i + p.length + 1)) n++; return n; };\nconst doubled = checked ? phrases.filter((p) => times(p) > asked.filter((a) => a === p).length) : [];\nfor (const p of doubled) issues.push(`the text \"${as(p)}\" is written more than once`);\n// (a designed picture, a layout's, has its own lettering and nothing else)\nconst own = new Set(phrases.join(' ').split(' '));\nconst designed = !!(caption && typeof caption === 'object' && caption.layout);\nconst extra = checked && designed ? [...new Set(read.trim().split(/\\s+/).filter((w) => w.length > 1 && !own.has(w)))] : [];\nif (extra.length) issues.push(`text that was not asked for: ${extra.slice(0, 6).join(' ')}`);\nconst fix = [\n  checked && typeof found.fix === 'string' ? found.fix.trim() : '',\n  ...missing.map((p) => `The text \"${as(p)}\" must be written in it, exactly.`),\n  ...doubled.map((p) => `The text \"${as(p)}\" is written once only.`),\n  extra.length ? `The only lettering is ${phrases.map((p) => `\"${as(p)}\"`).join(' and ')}.` : '',\n].filter(Boolean).map((t) => (/[.!?]$/.test(t) ? t : `${t}.`)).join(' ');\nreturn {\n  pass: checked ? found.pass === true && !missing.length && !doubled.length && !extra.length : true,\n  checked,\n  attempt,\n  image: (made && made.file) || image,\n  seed: made && made.seed != null ? made.seed : null,\n  issues,\n  fix,\n  text: checked ? { requested: strings(lists.requested), quoted: must, found: strings(lists.found), missing, doubled, extra } : null,\n  review: checked ? null : text,\n};",
     "inputCount": 5,
     "inputNames": [
      "review",
@@ -139,8 +155,8 @@
    "id": "done",
    "type": "loop_end",
    "position": {
-    "x": 1932,
-    "y": 22
+    "x": 2254,
+    "y": 30
    },
    "data": {
     "label": "Until it passes",
@@ -153,12 +169,12 @@
    "id": "result",
    "type": "logic_block",
    "position": {
-    "x": 2254,
-    "y": 430
+    "x": 2576,
+    "y": 394
    },
    "data": {
     "label": "The result",
-    "code": "// The flow's answer: the picture (its file's URL, never the picture itself), whether it passed, and each try's\n// findings. The first try that passed, else the try with the fewest issues (the latest of those).\nconst tries = Array.isArray(attempts) ? attempts.filter((t) => t && typeof t === 'object') : [];\nlet best = tries.find((t) => t.pass) || null;\nif (!best) for (const t of tries) if (!best || t.issues.length <= best.issues.length) best = t;\nreturn {\n  image: best ? best.image : null,\n  pass: !!(best && best.pass),\n  checked: !!(best && best.checked),\n  tries: tries.length,\n  issues: best ? best.issues : [],\n  text: best ? best.text : null,\n  prompt,\n  caption,\n  attempts: tries.map((t) => ({ image: t.image, pass: t.pass, issues: t.issues, seed: t.seed })),\n};",
+    "code": "// The flow's answer: the picture (its file's URL, never the picture itself), whether it passed, and each try's\n// findings. The first try that passed, else the try with the fewest issues (the latest of those).\nconst tries = Array.isArray(attempts) ? attempts.filter((t) => t && typeof t === 'object') : [];\nlet best = tries.find((t) => t.pass) || null;\nif (!best) for (const t of tries) if (!best || t.issues.length <= best.issues.length) best = t;\nreturn {\n  image: best ? best.image : null,\n  pass: !!(best && best.pass),\n  checked: !!(best && best.checked),\n  tries: tries.length,\n  issues: best ? best.issues : [],\n  text: best ? best.text : null,\n  prompt,\n  caption: caption && typeof caption === 'object' ? caption.described : caption,\n  layout: !!(caption && typeof caption === 'object' && caption.layout),\n  attempts: tries.map((t) => ({ image: t.image, pass: t.pass, issues: t.issues, seed: t.seed })),\n};",
     "inputCount": 3,
     "inputNames": [
      "attempts",
@@ -171,8 +187,8 @@
    "id": "out",
    "type": "output",
    "position": {
-    "x": 2576,
-    "y": 426
+    "x": 2898,
+    "y": 390
    },
    "data": {
     "label": "Result",
@@ -190,125 +206,132 @@
   },
   {
    "id": "e2",
+   "source": "enhance",
+   "target": "the_prompt",
+   "sourceHandle": "response",
+   "targetHandle": "input"
+  },
+  {
+   "id": "e3",
    "source": "prompt",
    "target": "ask",
    "sourceHandle": "text",
    "targetHandle": "input"
   },
   {
-   "id": "e3",
-   "source": "enhance",
+   "id": "e4",
+   "source": "the_prompt",
    "target": "ask",
-   "sourceHandle": "response",
+   "sourceHandle": "output",
    "targetHandle": "input2"
   },
   {
-   "id": "e4",
+   "id": "e5",
    "source": "attempts",
    "target": "done",
    "sourceHandle": "loop",
    "targetHandle": "loop"
   },
   {
-   "id": "e5",
-   "source": "enhance",
+   "id": "e6",
+   "source": "the_prompt",
    "target": "attempt_prompt",
-   "sourceHandle": "response",
+   "sourceHandle": "output",
    "targetHandle": "input"
   },
   {
-   "id": "e6",
+   "id": "e7",
    "source": "attempts",
    "target": "attempt_prompt",
    "sourceHandle": "item",
    "targetHandle": "input2"
   },
   {
-   "id": "e7",
+   "id": "e8",
    "source": "attempt_prompt",
    "target": "make",
    "sourceHandle": "output",
    "targetHandle": "prompt"
   },
   {
-   "id": "e8",
+   "id": "e9",
    "source": "ask",
    "target": "review",
    "sourceHandle": "output",
    "targetHandle": "prompt"
   },
   {
-   "id": "e9",
+   "id": "e10",
    "source": "make",
    "target": "review",
    "sourceHandle": "image",
    "targetHandle": "image"
   },
   {
-   "id": "e10",
+   "id": "e11",
    "source": "review",
    "target": "verdict",
    "sourceHandle": "response",
    "targetHandle": "input"
   },
   {
-   "id": "e11",
+   "id": "e12",
    "source": "make",
    "target": "verdict",
    "sourceHandle": "info",
    "targetHandle": "input2"
   },
   {
-   "id": "e12",
+   "id": "e13",
    "source": "make",
    "target": "verdict",
    "sourceHandle": "image",
    "targetHandle": "input3"
   },
   {
-   "id": "e13",
+   "id": "e14",
    "source": "attempts",
    "target": "verdict",
    "sourceHandle": "item",
    "targetHandle": "input4"
   },
   {
-   "id": "e14",
-   "source": "enhance",
+   "id": "e15",
+   "source": "the_prompt",
    "target": "verdict",
-   "sourceHandle": "response",
+   "sourceHandle": "output",
    "targetHandle": "input5"
   },
   {
-   "id": "e15",
+   "id": "e16",
    "source": "verdict",
    "target": "done",
    "sourceHandle": "output",
    "targetHandle": "input"
   },
   {
-   "id": "e16",
+   "id": "e17",
    "source": "done",
    "target": "result",
    "sourceHandle": "results",
    "targetHandle": "input"
   },
   {
-   "id": "e17",
+   "id": "e18",
    "source": "prompt",
    "target": "result",
    "sourceHandle": "text",
    "targetHandle": "input2"
   },
   {
-   "id": "e18",
-   "source": "enhance",
+   "id": "e19",
+   "source": "the_prompt",
    "target": "result",
-   "sourceHandle": "response",
+   "sourceHandle": "output",
    "targetHandle": "input3"
   },
   {
-   "id": "e19",
+   "id": "e20",
    "source": "result",
    "target": "out",
    "sourceHandle": "output",

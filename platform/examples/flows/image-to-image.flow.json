@@ -11,7 +11,7 @@
    "type": "input_text",
    "position": {
     "x": 0,
-    "y": 249
+    "y": 250
    },
    "data": {
     "label": "Prompt",
@@ -23,7 +23,7 @@
    "type": "input_text",
    "position": {
     "x": 0,
-    "y": 530
+    "y": 532
    },
    "data": {
     "label": "Pictures",
@@ -35,7 +35,7 @@
    "type": "logic_block",
    "position": {
     "x": 322,
-    "y": 349
+    "y": 350
    },
    "data": {
     "label": "The pictures given (up to 10)",
@@ -51,7 +51,7 @@
    "type": "logic_block",
    "position": {
     "x": 644,
-    "y": 207
+    "y": 208
    },
    "data": {
     "label": "What to enhance",
@@ -68,7 +68,7 @@
    "type": "ai_llm",
    "position": {
     "x": 966,
-    "y": 259
+    "y": 260
    },
    "data": {
     "label": "Enhance the prompt (sees the pictures)",
@@ -122,7 +122,7 @@
    },
    "data": {
     "label": "This try's prompt",
-    "code": "// The prompt for this try: the enhanced one, and on a retry the last review's fix with it (a model told what to\n// get right this time; the review read as the step before it left it, the loop's last try)\nconst last = nodes.verdict;\nconst fix = attempt > 1 && last && typeof last.fix === 'string' ? last.fix.trim() : '';\nreturn fix ? `${caption}\\n\\n${fix}` : caption;",
+    "code": "// The prompt for this try: the enhanced one, and on a retry the last review's fix with it (a model told what to\n// get right this time; the review read as the step before it left it, the loop's last try). In a layout the fix goes\n// after its summary's caption, the layout kept whole.\nconst last = nodes.verdict;\nconst fix = attempt > 1 && last && typeof last.fix === 'string' ? last.fix.trim() : '';\nconst made = caption && typeof caption === 'object';\nconst base = made ? caption.prompt : caption;\nif (!fix) return base;\nif (made && caption.layout) {\n  const layout = JSON.parse(base);\n  layout.summary.caption = `${layout.summary.caption} ${fix}`;\n  return JSON.stringify(layout);\n}\nreturn `${base}\\n\\n${fix}`;",
     "inputCount": 2,
     "inputNames": [
      "caption",
@@ -135,7 +135,7 @@
    "type": "image_gen",
    "position": {
     "x": 1610,
-    "y": 261
+    "y": 262
    },
    "data": {
     "label": "Make it (FLUX 3 Klein, 4 steps)",
@@ -159,9 +159,9 @@
     "label": "Review it",
     "service": "engine:llm",
     "model": "",
-    "systemPrompt": "You check a picture an image model made by editing or combining reference pictures, against what the person asked for and the caption it was made from, which describes the whole picture to make. Reply with JSON alone, no prose and no code fence, in exactly this shape:\n{\"pass\": true or false, \"issues\": [\"each real problem, in a few words\"], \"fix\": \"one sentence saying what the picture must show instead, as an instruction to the painter, or empty\", \"text\": {\"requested\": [each word or phrase the request asks to be written in the picture, exactly as asked: lettering, never the things it shows], \"found\": [each word or phrase you can read in the picture, letter by letter]}}\nPass when the picture shows what the person asked for (what the request changes is changed, what it combines is combined) and matches the caption's description of the rest. Any text asked for must be exact, letter by letter. Detail neither mentions is not an issue. Fail only for a problem the person would notice. The text lists hold the words alone; leave them empty where there is no text.",
+    "systemPrompt": "You check a picture an image model made by editing or combining reference pictures, against what the person asked for and the caption it was made from, which describes the whole picture to make. Reply with JSON alone, no prose and no code fence, in exactly this shape:\n{\"pass\": true or false, \"issues\": [\"each real problem, in a few words\"], \"fix\": \"one sentence saying what the picture must show instead, as an instruction to the painter, or empty\", \"text\": {\"requested\": [each word or phrase the request asks to be written in the picture, exactly as asked: lettering, never the things it shows], \"found\": [each word or phrase you can read in the picture, letter by letter, as many times as it is written there (at most 3)]}}\nPass when the picture shows what the person asked for (what the request changes is changed, what it combines is combined) and matches the caption's description of the rest. Any text asked for must be exact, letter by letter. Detail neither mentions is not an issue. Fail only for a problem the person would notice. The text lists hold the words alone; leave them empty where there is no text.",
     "imageInputCount": 1,
-    "maxTokens": 500,
+    "maxTokens": 800,
     "enableThinking": false
    }
   },
@@ -170,11 +170,11 @@
    "type": "logic_block",
    "position": {
     "x": 2254,
-    "y": 362
+    "y": 364
    },
    "data": {
     "label": "Pass or try again",
-    "code": "// Pass or try again: the review read from its reply (a reply that is not JSON cannot fail the picture: it is kept\n// as text, the picture passed unchecked), with the picture's file reference. The lettering is checked here too: the\n// reviewer lists what it reads, and each phrase that must be there has to be among it (a small vision model reading\n// a picture is reliable; one judging whether it matches is lenient)\nconst text = String(review == null ? '' : review).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\nconst at = text.indexOf('{'), end = text.lastIndexOf('}');\nlet found = null;\ntry { found = JSON.parse(at >= 0 && end > at ? text.slice(at, end + 1) : text); } catch { found = null; }\nconst checked = !!found && typeof found.pass === 'boolean';\nconst issues = checked && Array.isArray(found.issues) ? found.issues.filter((x) => typeof x === 'string' && x.trim()) : [];\nconst words = (s) => String(s).toUpperCase().replace(/[^A-Z0-9\\u00C0-\\uFFFF]+/g, ' ').trim();\nconst lists = checked && found.text && typeof found.text === 'object' ? found.text : {};\nconst strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && words(x)) : []);\nconst read = ` ${strings(lists.found).map(words).join(' ')} `;\n// (each phrase the caption quotes: the enhancer quotes exactly the lettering the picture must show, the request's own\n// and, for an edit, what the references show that the request leaves alone)\nconst must = [];\nString(caption == null ? '' : caption).replace(/[\"\\u201C]([^\"\\u201D]{1,60})[\"\\u201D]/g, (all, q) => { must.push(q); return all; });\nconst missing = checked ? [...new Set(must.map(words).filter(Boolean))].filter((p) => !read.includes(` ${p} `)) : [];\nfor (const p of missing) issues.push(`the text \"${p}\" is not in the picture`);\nconst fix = [checked && typeof found.fix === 'string' ? found.fix.trim() : '', ...missing.map((p) => `The text \"${p}\" must be written in it, exactly.`)].filter(Boolean).join(' ');\nreturn {\n  pass: checked ? found.pass === true && missing.length === 0 : true,\n  checked,\n  attempt,\n  image: (made && made.file) || image,\n  seed: made && made.seed != null ? made.seed : null,\n  issues,\n  fix,\n  text: checked ? { requested: strings(lists.requested), quoted: must, found: strings(lists.found), missing } : null,\n  review: checked ? null : text,\n};",
+    "code": "// Pass or try again: the review read from its reply (a reply that is not JSON cannot fail the picture: it is kept\n// as text, the picture passed unchecked), with the picture's file reference. The lettering is checked here too: the\n// reviewer lists what it reads, and each phrase that must be there has to be among it (a small vision model reading\n// a picture is reliable; one judging whether it matches is lenient)\nconst text = String(review == null ? '' : review).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\n// (a reply cut short, as one listing a picture's repeated text runs out of room, closed and read as far as it goes)\nconst closed = (t) => {\n  const open = [];\n  let inString = false, escaped = false;\n  for (const ch of t) {\n    if (inString) { if (escaped) escaped = false; else if (ch === '\\\\') escaped = true; else if (ch === '\"') inString = false; continue; }\n    if (ch === '\"') inString = true;\n    else if (ch === '{') open.push('}');\n    else if (ch === '[') open.push(']');\n    else if (ch === '}' || ch === ']') open.pop();\n  }\n  return t + (inString ? '\"' : '') + open.reverse().join('');\n};\nconst parsed = (t) => { try { return JSON.parse(t); } catch { return null; } };\nconst at = text.indexOf('{');\nlet found = at < 0 ? null : parsed(text.slice(at, text.lastIndexOf('}') + 1)) || parsed(closed(text.slice(at)));\nif (!found && /\"pass\"\\s*:\\s*false/.test(text)) found = { pass: false, issues: ['the review was cut short'] };\nconst checked = !!found && typeof found.pass === 'boolean';\nconst issues = checked && Array.isArray(found.issues) ? found.issues.filter((x) => typeof x === 'string' && x.trim()) : [];\nconst words = (s) => String(s).toUpperCase().replace(/[^A-Z0-9\\u00C0-\\uFFFF]+/g, ' ').trim();\nconst lists = checked && found.text && typeof found.text === 'object' ? found.text : {};\nconst strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && words(x)) : []);\nconst read = ` ${strings(lists.found).map(words).join(' ')} `;\n// (each piece of a layout's wording, or each phrase a caption quotes: the enhancer quotes exactly the lettering the\n// picture must show, the request's own and, for an edit, what the references show that the request leaves alone)\nconst must = caption && typeof caption === 'object' ? (Array.isArray(caption.lettering) ? caption.lettering.slice() : []) : [];\nif (!(caption && typeof caption === 'object')) String(caption == null ? '' : caption).replace(/[\"\\u201C]([^\"\\u201D]{1,60})[\"\\u201D]/g, (all, q) => { must.push(q); return all; });\nconst asked = must.map(words).filter(Boolean);\nconst phrases = [...new Set(asked)];\nconst said = new Map(must.map((m) => [words(m), m.trim()]));\nconst as = (p) => said.get(p) || p;\nconst missing = checked ? phrases.filter((p) => !read.includes(` ${p} `)) : [];\nfor (const p of missing) issues.push(`the text \"${as(p)}\" is not in the picture`);\n// (each phrase as many times as it is asked for: a distilled model writes a name twice)\nconst times = (p) => { let n = 0; for (let i = read.indexOf(` ${p} `); i >= 0; i = read.indexOf(` ${p} `, i + p.length + 1)) n++; return n; };\nconst doubled = checked ? phrases.filter((p) => times(p) > asked.filter((a) => a === p).length) : [];\nfor (const p of doubled) issues.push(`the text \"${as(p)}\" is written more than once`);\n// (a designed picture, a layout's, has its own lettering and nothing else)\nconst own = new Set(phrases.join(' ').split(' '));\nconst designed = !!(caption && typeof caption === 'object' && caption.layout);\nconst extra = checked && designed ? [...new Set(read.trim().split(/\\s+/).filter((w) => w.length > 1 && !own.has(w)))] : [];\nif (extra.length) issues.push(`text that was not asked for: ${extra.slice(0, 6).join(' ')}`);\nconst fix = [\n  checked && typeof found.fix === 'string' ? found.fix.trim() : '',\n  ...missing.map((p) => `The text \"${as(p)}\" must be written in it, exactly.`),\n  ...doubled.map((p) => `The text \"${as(p)}\" is written once only.`),\n  extra.length ? `The only lettering is ${phrases.map((p) => `\"${as(p)}\"`).join(' and ')}.` : '',\n].filter(Boolean).map((t) => (/[.!?]$/.test(t) ? t : `${t}.`)).join(' ');\nreturn {\n  pass: checked ? found.pass === true && !missing.length && !doubled.length && !extra.length : true,\n  checked,\n  attempt,\n  image: (made && made.file) || image,\n  seed: made && made.seed != null ? made.seed : null,\n  issues,\n  fix,\n  text: checked ? { requested: strings(lists.requested), quoted: must, found: strings(lists.found), missing, doubled, extra } : null,\n  review: checked ? null : text,\n};",
     "inputCount": 5,
     "inputNames": [
      "review",
@@ -190,7 +190,7 @@
    "type": "loop_end",
    "position": {
     "x": 2576,
-    "y": 143
+    "y": 154
    },
    "data": {
     "label": "Until it passes",
@@ -204,11 +204,11 @@
    "type": "logic_block",
    "position": {
     "x": 2898,
-    "y": 496
+    "y": 498
    },
    "data": {
     "label": "The result",
-    "code": "// The flow's answer: the picture (its file's URL, never the picture itself), whether it passed, and each try's\n// findings. The first try that passed, else the try with the fewest issues (the latest of those).\nconst tries = Array.isArray(attempts) ? attempts.filter((t) => t && typeof t === 'object') : [];\nlet best = tries.find((t) => t.pass) || null;\nif (!best) for (const t of tries) if (!best || t.issues.length <= best.issues.length) best = t;\nreturn {\n  image: best ? best.image : null,\n  pass: !!(best && best.pass),\n  checked: !!(best && best.checked),\n  tries: tries.length,\n  issues: best ? best.issues : [],\n  text: best ? best.text : null,\n  prompt,\n  caption,\n  attempts: tries.map((t) => ({ image: t.image, pass: t.pass, issues: t.issues, seed: t.seed })),\n};",
+    "code": "// The flow's answer: the picture (its file's URL, never the picture itself), whether it passed, and each try's\n// findings. The first try that passed, else the try with the fewest issues (the latest of those).\nconst tries = Array.isArray(attempts) ? attempts.filter((t) => t && typeof t === 'object') : [];\nlet best = tries.find((t) => t.pass) || null;\nif (!best) for (const t of tries) if (!best || t.issues.length <= best.issues.length) best = t;\nreturn {\n  image: best ? best.image : null,\n  pass: !!(best && best.pass),\n  checked: !!(best && best.checked),\n  tries: tries.length,\n  issues: best ? best.issues : [],\n  text: best ? best.text : null,\n  prompt,\n  caption: caption && typeof caption === 'object' ? caption.described : caption,\n  layout: !!(caption && typeof caption === 'object' && caption.layout),\n  attempts: tries.map((t) => ({ image: t.image, pass: t.pass, issues: t.issues, seed: t.seed })),\n};",
     "inputCount": 3,
     "inputNames": [
      "attempts",
@@ -222,7 +222,7 @@
    "type": "output",
    "position": {
     "x": 3220,
-    "y": 492
+    "y": 494
    },
    "data": {
     "label": "Result",

@@ -94,6 +94,12 @@ with a few faults: a monogram's background filled with garbled letters, a badge'
 abstract mark. Made again from prompts written this way (layouts for the monogram, the badge, the bakery's mark and a
 Chinese seal), those faults were gone, and line breaks came out as written.
 
+Checked again on one brief over six seeds (docs/IMAGE_FLOW.md#logos): the 8-step distillation writes a logo's name
+twice, adds lines nobody asked for or sets the logo in a room, at full precision as at 4 bits and with its text
+encoder on either GPU, where MOSS-Image's own 50 guided steps did not; a layout with its background as an item of its
+own (an empty, plain white background over the whole canvas) had the lettering right in all six. Without that item, a
+layout's empty space was sometimes filled with copies of the mark.
+
 ## Distillations: pictures in 8 passes
 
 A distillation of MOSS-Image-SFT as data-space DMD makes one (arXiv 2610.12102) makes a picture in a few passes of the
