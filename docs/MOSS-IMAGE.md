@@ -75,6 +75,25 @@ A request takes `negative_prompt`, `steps` (50), `cfg` (3), `shift` (5) and `unc
 skipping off), each also a model's own setting. A JSON layout goes in as the prompt, with the picture's size the layout's
 (see OpenMOSS's user guide).
 
+## Prompting
+
+MOSS-Image reads a description, a list of tags, or a JSON layout, and English best of all. OpenMOSS's guide and its
+prompt enhancer (an agent skill, `skills/moss-image-prompt-enhancer` in github.com/OpenMOSS/MOSS-Image) come to this:
+
+- Describe each visible thing concretely: subject, medium, palette, lighting, framing.
+- Put the exact text in quotes, with its line breaks (`\n`) where they matter.
+- Say what must not appear ("no other letters or words"). A distillation's passes take no negative prompt, so this
+  goes in the prompt itself; with guidance OpenMOSS suggest `nsfw, worst quality, bad anatomy, watermark, jpeg artifact`.
+- Where text placement matters (a logo, a poster), use a layout: a `summary` and flat `items`, each with a `label`
+  (`object`, `character` or `text`), a `caption`, the exact `text` for text, and a box. The skill's
+  `scripts/compile_prompt.py` turns a draft with boxes in pixels from the top-left (`abs`, `xyxy`) into the model's
+  one-line form (`abs_centralized`, `yxyx`); the picture's width and height must be the draft's.
+
+On the 4-bit set with its 8-step distillation, twelve logos made from short prompts mostly had their text right,
+with a few faults: a monogram's background filled with garbled letters, a badge's name misspelt, a word added to an
+abstract mark. Made again from prompts written this way (layouts for the monogram, the badge, the bakery's mark and a
+Chinese seal), those faults were gone, and line breaks came out as written.
+
 ## Distillations: pictures in 8 passes
 
 A distillation of MOSS-Image-SFT as data-space DMD makes one (arXiv 2610.12102) makes a picture in a few passes of the
