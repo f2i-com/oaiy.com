@@ -635,10 +635,26 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
     Ok((added, d))
 }
 
-/// Keys holding file paths, per section, for export and import.
+/// Keys holding file paths, per section, for export and import. (A model's `loras`, a list of `{path, strength}`, are
+/// paths too: [`LORAS`].)
 const LLM_PATHS: [&str; 3] = ["path", "vision_projector", "lora"];
 const IMAGE_PATHS: [&str; 9] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "vision", "checkpoint", "tokenizer", "vae"];
 const VIDEO_PATHS: [&str; 5] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae"];
+const SPEECH_PATHS: [&str; 3] = ["design", "base", "breeze"];
+const MUSIC_PATHS: [&str; 2] = ["path", "language_model"];
+const SOUND_PATHS: [&str; 1] = ["path"];
+const MODEL3D_PATHS: [&str; 5] = ["path", "dino", "naf", "matte", "upscaler"];
+const LORAS: &str = "loras";
+/// The media sections a models file carries, each with its path keys, its settings beside `MEDIA_SETTINGS` and the
+/// routes its models are served on.
+const MEDIA_SECTIONS: [(&str, &[&str], &[&str], &[&str]); 6] = [
+    ("image", &IMAGE_PATHS, &[], &["images", "edits", "files"]),
+    ("video", &VIDEO_PATHS, &["fps", "ffmpeg"], &["videos", "files"]),
+    ("speech", &SPEECH_PATHS, &[], &["speech", "voices"]),
+    ("music", &MUSIC_PATHS, &[], &["music"]),
+    ("sound", &SOUND_PATHS, &[], &["sound"]),
+    ("model3d", &MODEL3D_PATHS, &[], &["model3d"]),
+];
 /// Media settings that travel with the models.
 const MEDIA_SETTINGS: [&str; 4] = ["memory", "ram_gb", "vram_gb", "default_model"];
 
@@ -650,12 +666,15 @@ fn absolute(root: &Path, m: &Json, keys: &[&str]) -> Json {
             set(&mut m, key, Json::str(abs));
         }
     }
+    if let Some(Json::Arr(loras)) = m.get(LORAS).cloned() {
+        set(&mut m, LORAS, Json::Arr(loras.iter().map(|l| absolute(root, l, &["path"])).collect()));
+    }
     m
 }
 
-/// Every configured model (language, image, video), with their parts, defaults
-/// and memory settings, as a file another install can import. Paths are made
-/// absolute so the file does not depend on where this studio lives.
+/// Every configured model (language, image, video, speech, music, sound effect and 3D), with their parts, LoRAs,
+/// settings, defaults and memory settings, as a file another install can import. Paths are made absolute so the file
+/// does not depend on where this studio lives.
 pub fn export(cfg: &Json, root: &Path) -> Json {
     let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
     let llm_models: Vec<Json> = llm.get("models").and_then(Json::as_array).unwrap_or(&[]).iter().map(|m| absolute(root, m, &LLM_PATHS)).collect();
@@ -666,18 +685,18 @@ pub fn export(cfg: &Json, root: &Path) -> Json {
         out.push(("models".into(), Json::Obj(models)));
         Json::Obj(out)
     };
-    Json::obj([
-        ("oaiy_models", Json::Int(1)),
-        ("exported_at", Json::Int(crate::util::now() as i64)),
-        ("llm", Json::obj([("default_model", llm.get("default_model").cloned().unwrap_or(Json::str(""))), ("models", Json::Arr(llm_models))])),
-        ("image", media("image", &IMAGE_PATHS, &[])),
-        ("video", media("video", &VIDEO_PATHS, &["fps", "ffmpeg"])),
-    ])
+    let mut file = vec![
+        ("oaiy_models".to_string(), Json::Int(1)),
+        ("exported_at".to_string(), Json::Int(crate::util::now() as i64)),
+        ("llm".to_string(), Json::obj([("default_model", llm.get("default_model").cloned().unwrap_or(Json::str(""))), ("models", Json::Arr(llm_models))])),
+    ];
+    file.extend(MEDIA_SECTIONS.iter().map(|(kind, keys, extra, _)| (kind.to_string(), media(kind, keys, extra))));
+    Json::Obj(file)
 }
 
-/// Bring an exported file in. `replace` clears the current models first;
-/// otherwise models merge by name (the file's version wins). Entries whose
-/// files are not on this machine come in disabled and are reported, so a file
+/// Bring an exported file in. `replace` clears the current models of each section the file has first (a file from
+/// before a section was exported leaves that section's models as they are); otherwise models merge by name (the
+/// file's version wins). Entries whose files are not on this machine come in disabled and are reported, so a file
 /// from another PC imports cleanly and shows what to repoint.
 pub fn import(cfg: &mut Json, doc: &Json, replace: bool, root: &Path) -> Result<Json, String> {
     if doc.get("oaiy_models").and_then(Json::as_i64) != Some(1) {
@@ -685,15 +704,23 @@ pub fn import(cfg: &mut Json, doc: &Json, replace: bool, root: &Path) -> Result<
     }
     let mut missing = Vec::new();
     let mut tools_missing = Vec::new();
-    let mut counts = (0, 0, 0);
+    let mut counts: Vec<(&str, i64)> = Vec::new();
     // Relative paths mean what they mean everywhere else: beside the studio.
     let exists = |p: &str| config::resolve(root, p).exists();
     let mut check = |section: &str, name: &str, m: &mut Json, keys: &[&str]| {
         let mut ok = true;
+        let mut gone = |field: &str, p: &str| {
+            missing.push(Json::obj([("section", Json::str(section)), ("model", Json::str(name)), ("field", Json::str(field)), ("path", Json::str(p))]));
+            ok = false;
+        };
         for key in keys {
             if let Some(p) = m.get(key).and_then(Json::as_str).filter(|p| !p.trim().is_empty() && !exists(p)) {
-                missing.push(Json::obj([("section", Json::str(section)), ("model", Json::str(name)), ("field", Json::str(*key)), ("path", Json::str(p))]));
-                ok = false;
+                gone(key, p);
+            }
+        }
+        for l in m.get(LORAS).and_then(Json::as_array).unwrap_or(&[]) {
+            if let Some(p) = l.get("path").and_then(Json::as_str).filter(|p| !p.trim().is_empty() && !exists(p)) {
+                gone(LORAS, p);
             }
         }
         if !ok {
@@ -706,6 +733,7 @@ pub fn import(cfg: &mut Json, doc: &Json, replace: bool, root: &Path) -> Result<
         if replace {
             models.clear();
         }
+        let mut n = 0;
         for m in incoming {
             let name = str_or(m, "name", "").to_string();
             if name.is_empty() || str_or(m, "path", "").is_empty() {
@@ -715,8 +743,9 @@ pub fn import(cfg: &mut Json, doc: &Json, replace: bool, root: &Path) -> Result<
             check("llm", &name, &mut m, &LLM_PATHS);
             models.retain(|x| str_or(x, "name", "") != name);
             models.push(m);
-            counts.0 += 1;
+            n += 1;
         }
+        counts.push(("llm", n));
     }
     if let Some(d) = get(doc, &["llm", "default_model"]).and_then(Json::as_str).filter(|d| !d.is_empty()) {
         let known = get(cfg, &["llm", "models"]).and_then(Json::as_array).is_some_and(|m| m.iter().any(|x| str_or(x, "name", "") == d));
@@ -724,8 +753,13 @@ pub fn import(cfg: &mut Json, doc: &Json, replace: bool, root: &Path) -> Result<
             set(obj_mut(cfg, &["llm"]).ok_or("no llm section")?, "default_model", Json::str(d));
         }
     }
-    for (kind, keys) in [("image", &IMAGE_PATHS[..]), ("video", &VIDEO_PATHS[..])] {
+    let mut needed: Vec<&str> = Vec::new();
+    if counts.iter().any(|&(_, n)| n > 0) {
+        needed.extend(["chat", "completions", "models"]);
+    }
+    for (kind, keys, _, routes) in MEDIA_SECTIONS {
         let Some(section_in) = doc.get(kind) else { continue };
+        let mut n = 0;
         {
             let Some(Json::Obj(models)) = obj_mut(cfg, &["media", kind, "models"]) else { return Err(format!("no {kind} section")) };
             if replace {
@@ -736,8 +770,12 @@ pub fn import(cfg: &mut Json, doc: &Json, replace: bool, root: &Path) -> Result<
                 check(kind, name, &mut m, keys);
                 models.retain(|(n, _)| n != name);
                 models.push((name.to_string(), m));
-                if kind == "image" { counts.1 += 1 } else { counts.2 += 1 }
+                n += 1;
             }
+        }
+        counts.push((kind, n));
+        if n > 0 {
+            needed.extend(routes);
         }
         let section = obj_mut(cfg, &["media", kind]).ok_or("no media section")?;
         for key in ["memory", "ram_gb", "vram_gb", "fps"] {
@@ -770,27 +808,16 @@ pub fn import(cfg: &mut Json, doc: &Json, replace: bool, root: &Path) -> Result<
             set(llm, "default_model", Json::str(known.first().map_or("", String::as_str)));
         }
     }
-    let mut needed = Vec::new();
-    if counts.0 > 0 {
-        needed.extend(["chat", "completions", "models"]);
-    }
-    if counts.1 > 0 {
-        needed.extend(["images", "edits", "files"]);
-    }
-    if counts.2 > 0 {
-        needed.extend(["videos", "files"]);
-    }
     for target in needed {
         add_route_if_absent(cfg, target);
     }
     config::validate(cfg)?;
     missing.extend(tools_missing);
-    Ok(Json::obj([
-        ("llm", Json::Int(counts.0)),
-        ("image", Json::Int(counts.1)),
-        ("video", Json::Int(counts.2)),
-        ("missing", Json::Arr(missing)),
-    ]))
+    // (every section's count, 0 where the file had none of it)
+    let count = |kind: &str| counts.iter().find(|(k, _)| *k == kind).map_or(0, |&(_, n)| n);
+    let mut report: Vec<(String, Json)> = std::iter::once("llm").chain(MEDIA_SECTIONS.iter().map(|s| s.0)).map(|k| (k.to_string(), Json::Int(count(k)))).collect();
+    report.push(("missing".into(), Json::Arr(missing)));
+    Ok(Json::Obj(report))
 }
 
 #[cfg(test)]
@@ -1099,6 +1126,74 @@ mod tests {
         assert!(report.get("missing").unwrap().as_array().unwrap().iter().any(|m| str_or(m, "field", "") == "ffmpeg"));
         assert_eq!(get(&third, &["media", "video", "ffmpeg"]).cloned(), before);
         assert!(import(&mut third, &Json::parse(b"{}").unwrap(), false, &d).is_err());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// Speech, music, sound effect and 3D models travel too, each with its settings, and LoRAs with their strengths:
+    /// a LoRA not on the other machine switches its model off like any of its files.
+    #[test]
+    fn every_section_and_its_loras_travel_in_a_models_file() {
+        let d = tmp("export-all");
+        for dir in ["tts", "music", "sfx", "pixal3d", "dino"] {
+            std::fs::create_dir_all(d.join(dir)).unwrap();
+        }
+        for file in ["naf_release.pth", "style.safetensors", "transformer.safetensors", "te.gguf", "vae.safetensors"] {
+            std::fs::write(d.join(file), b"x").unwrap();
+        }
+        let mut cfg = config::default_json();
+        let at = |f: &str| Json::str(d.join(f).to_string_lossy());
+        let media = |cfg: &mut Json, kind: &str, name: &str, m: Json| {
+            let Some(Json::Obj(models)) = obj_mut(cfg, &["media", kind, "models"]) else { panic!("no {kind}") };
+            models.push((name.into(), m));
+            set(obj_mut(cfg, &["media", kind]).unwrap(), "default_model", Json::str(name));
+        };
+        media(&mut cfg, "image", "moss", Json::obj([("architecture", Json::str("moss-image")), ("transformer", at("transformer.safetensors")), ("text_encoder", at("te.gguf")), ("vae", at("vae.safetensors")),
+            ("steps", Json::Int(30)), ("loras", Json::Arr(vec![Json::obj([("path", at("style.safetensors")), ("strength", Json::Num(0.8))])]))]));
+        media(&mut cfg, "speech", "tts", Json::obj([("design", at("tts"))]));
+        media(&mut cfg, "music", "song", Json::obj([("path", at("music")), ("precision", Json::str("f32"))]));
+        set(obj_mut(&mut cfg, &["media", "music"]).unwrap(), "ram_gb", Json::Int(20));
+        media(&mut cfg, "sound", "sfx", Json::obj([("path", at("sfx"))]));
+        media(&mut cfg, "model3d", "pixal", Json::obj([("path", at("pixal3d")), ("dino", at("dino")), ("naf", at("naf_release.pth"))]));
+        config::validate(&cfg).unwrap();
+        let file = export(&cfg, &d);
+        for kind in ["image", "speech", "music", "sound", "model3d"] {
+            assert_eq!(get(&file, &[kind, "models"]).map(|m| m.members().count()), Some(1), "{kind}");
+        }
+        assert_eq!(get(&file, &["music", "ram_gb"]).and_then(Json::as_i64), Some(20));
+        // Into a fresh install: all of them, their settings, defaults and routes.
+        let mut other = config::default_json();
+        if let Some(Json::Arr(routes)) = obj_mut(&mut other, &["gateway", "routes"]) {
+            routes.retain(|r| !["music", "model3d"].contains(&str_or(r, "target", "")));
+        }
+        let report = import(&mut other, &file, false, &d).unwrap();
+        for kind in ["image", "speech", "music", "sound", "model3d"] {
+            assert_eq!(report.get(kind).and_then(Json::as_i64), Some(1), "{kind}");
+            assert!(get(&other, &["media", kind, "default_model"]).and_then(Json::as_str).is_some_and(|n| !n.is_empty()), "{kind}");
+        }
+        assert_eq!((report.get("llm").and_then(Json::as_i64), report.get("video").and_then(Json::as_i64)), (Some(0), Some(0)));
+        assert!(report.get("missing").unwrap().as_array().unwrap().is_empty());
+        let moss = get(&other, &["media", "image", "models", "moss"]).unwrap();
+        assert_eq!(moss.get("steps").and_then(Json::as_i64), Some(30));
+        assert_eq!(get(moss, &["loras"]).and_then(|l| l.at(0)).and_then(|l| l.get("strength")).and_then(Json::as_f64), Some(0.8));
+        assert_eq!(get(&other, &["media", "music", "ram_gb"]).and_then(Json::as_i64), Some(20));
+        let routes = get(&other, &["gateway", "routes"]).unwrap().as_array().unwrap();
+        assert!(["music", "model3d"].iter().all(|t| routes.iter().any(|r| str_or(r, "target", "") == *t)), "their routes come back");
+        // Elsewhere, without the LoRA: the model comes in switched off, the LoRA named.
+        std::fs::remove_file(d.join("style.safetensors")).unwrap();
+        let mut third = config::default_json();
+        let report = import(&mut third, &file, true, &d).unwrap();
+        let missing = report.get("missing").unwrap().as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!((str_or(&missing[0], "model", ""), str_or(&missing[0], "field", "")), ("moss", "loras"));
+        assert_eq!(get(&third, &["media", "image", "models", "moss", "enabled"]), Some(&Json::Bool(false)));
+        assert_eq!(get(&third, &["media", "sound", "models", "sfx", "enabled"]), None, "the others as they were");
+        // A file from before these sections were exported leaves them be, even replacing.
+        let mut old = file.clone();
+        if let Json::Obj(f) = &mut old {
+            f.retain(|(k, _)| !["speech", "music", "sound", "model3d"].contains(&k.as_str()));
+        }
+        import(&mut third, &old, true, &d).unwrap();
+        assert!(get(&third, &["media", "speech", "models", "tts"]).is_some());
         std::fs::remove_dir_all(d).unwrap();
     }
 

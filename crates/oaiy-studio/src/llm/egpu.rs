@@ -744,6 +744,33 @@ impl Egpu {
         }
     }
 
+    /// Start the server as the studio starts (`llm.autostart`), once the card's Python, tinygrad and launcher are known:
+    /// a provider's (OAIY Desktop's eGPU plugin says them a few seconds after the studio starts), else after `wait`
+    /// the settings'. A server started or stopped meanwhile (a request, Start or Stop, a change of settings) has its
+    /// way, and this stands down: Ok(None). `still` is asked last whether the settings still want it, and with what:
+    /// the configuration, its folder and the model. Ok(Some(model)) once it is being started.
+    pub fn start_when_provided(self: &Arc<Self>, wait: Duration, still: impl FnOnce() -> Option<(Json, PathBuf, String)>) -> Result<Option<String>, String> {
+        let deadline = Instant::now() + wait;
+        let mut g = self.lock();
+        let epoch = g.epoch;
+        while g.runtime.is_none() && g.epoch == epoch && g.state == State::Stopped {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            g = self.changed.wait_timeout(g, left).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        if g.epoch != epoch || g.state != State::Stopped {
+            return Ok(None);
+        }
+        drop(g);
+        let Some((cfg, root, name)) = still() else { return Ok(None) };
+        match self.begin(&cfg, &root, &name, epoch, true, false, false)? {
+            Begun::Launched | Begun::Held => Ok(Some(name)),
+            Begun::InUse(other) => Err(format!("the eGPU is answering with {other}")),
+        }
+    }
+
     /// Start the server with `name` unless it has it, in place of a model nobody is using. `epoch`: the stops
     /// someone asked for that the caller had seen; one more since, and this start stands down. `again`: start even
     /// where a start with `name` has just failed (a start by hand: a request waits out [`RETRY_AFTER`], or every
@@ -1574,6 +1601,57 @@ mod tests {
         assert!(!has_picture(&text));
         let picture = llm(r#"{"messages": [{"role": "user", "content": [{"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}]}"#);
         assert!(has_picture(&picture));
+    }
+
+    /// At launch the card's model waits for the provider (or `wait`), and stands down for anything that started or
+    /// stopped the card meanwhile.
+    #[test]
+    fn a_start_at_launch_waits_for_the_provider_and_gives_way_to_a_start_or_stop_meanwhile() {
+        let asked = |egpu: &Arc<Egpu>, wait: Duration| {
+            let (egpu, started) = (Arc::clone(egpu), Instant::now());
+            std::thread::spawn(move || {
+                let mut when = None;
+                let r = egpu.start_when_provided(wait, || {
+                    when = Some(started.elapsed());
+                    None
+                });
+                (r, when)
+            })
+        };
+        // The provider says within the wait: asked as it says, not at the end of the wait.
+        let egpu = Arc::new(Egpu::new());
+        let waiting = asked(&egpu, Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(150));
+        egpu.provide(Some(provided(Path::new("/plugins/egpu/card"))));
+        let (r, when) = waiting.join().unwrap();
+        assert_eq!(r, Ok(None));
+        assert!(when.is_some_and(|w| w >= Duration::from_millis(150) && w < Duration::from_secs(5)), "{when:?}");
+        // None says: the settings' at the end of the wait.
+        let egpu = Arc::new(Egpu::new());
+        let (_, when) = asked(&egpu, Duration::from_millis(100)).join().unwrap();
+        assert!(when.is_some_and(|w| w >= Duration::from_millis(100)), "{when:?}");
+        // Stopped by hand while it waited: not started, not asked.
+        let waiting = asked(&egpu, Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(50));
+        egpu.stop();
+        assert_eq!(waiting.join().unwrap(), (Ok(None), None));
+        // A request started it meanwhile: left to it.
+        let egpu = Arc::new(Egpu::new());
+        let waiting = asked(&egpu, Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(50));
+        egpu.adopt("127.0.0.1:1", "k", "big", None);
+        egpu.changed.notify_all();
+        assert_eq!(waiting.join().unwrap(), (Ok(None), None));
+        // Wanted still: started, and a start that fails says why.
+        let dir = std::env::temp_dir().join(format!("oaiy-egpu-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.gguf"), b"GGUF").unwrap();
+        let cfg = llm(r#"{"llm": {"egpu": {"enabled": true, "python": "no-such-python-here"}, "models": [{"name": "m", "path": "m.gguf", "egpu": true}]}}"#);
+        let egpu = Arc::new(Egpu::new());
+        let err = egpu.start_when_provided(Duration::from_millis(10), || Some((cfg, dir.clone(), "m".into()))).unwrap_err();
+        assert!(err.contains("no Python here has tinygrad"), "{err}");
+        assert_eq!((egpu.state(), egpu.held().as_deref()), (State::Failed, Some("m")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

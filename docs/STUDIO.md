@@ -233,15 +233,28 @@ needs. The studio fills parts itself where it can:
 Adding a model also enables the gateway route that serves it, if that route had
 been removed or turned off.
 
+### Finding a model
+
+The search box over **Your model list** shows only the models every word typed is
+in: a model's name, its kind (language, image, video, speech, music, sound effect,
+3D) and type (MOSS-Image, Qwen Image, LTX 2.3...), its tags (Default, Loaded), the
+files and folders it is made of and its settings, `egpu` for one that runs on the
+eGPU and `off` for one switched off. Lists with no match fold away. **Enter** goes to
+the first match and puts the cursor in its first field; **Esc** clears the search.
+
 ### Saving and moving your model list
 
-Models → **Export models** downloads `oaiy-models.json`: every language, image
-and video model with its parts, the defaults, and the memory settings. Paths are
-written absolute, so the file works from any install folder. **Import models**
-reads one back and asks whether to merge (same-named models are updated, others
-kept) or replace the whole list, or cancel. Entries whose files are not on this
-machine come in switched off and are listed, ready to repoint with Browse. An
-`ffmpeg` path is taken only if that file exists here. Relative paths are read
+Models → **Export models** saves `oaiy-models.json`: every language, image, video,
+speech, music, sound effect and 3D model with its parts, LoRAs and settings, the
+defaults, and the memory settings. Paths are written absolute, so the file works
+from any install folder. In OAIY's window the file goes to the Downloads folder (a
+browser saves it as it saves any download). **Import models** reads one back and
+asks whether to merge (same-named models are updated, others kept) or replace the
+whole list, or cancel. Replacing clears only the kinds of model the file has: a
+file exported before speech, music, sound effect and 3D models travelled leaves
+those as they are. Entries whose files (or LoRAs) are not on this machine come in
+switched off and are listed, ready to repoint with Browse. An `ffmpeg` path is
+taken only if that file exists here. Relative paths are read
 beside the studio. A route you turned off stays off; import only adds a route
 when the table has none for what the new models serve. The same operations
 are available to scripts as `GET /api/models/export` and
@@ -260,7 +273,11 @@ weights may live:
 | `ssd` | only the block in use is off the disk |
 
 The strip on that page shows where a model of a given size lands for the chosen
-mode and caps. The worker applies the setting per block:
+mode and caps. On a Mac, whose GPU has no memory of its own (it shares the unified
+memory with the CPU), the pages say so: the GPU memory cap for the VRAM cap, Memory
+for RAM, and the Overview's Hardware shows one Unified memory row (the GPU's part, the
+rest in use, what is free) in place of a RAM row; an eGPU's memory is its VRAM. The
+worker applies the setting per block:
 
 - **Qwen Image**: the 32 transformer blocks and the 36 Qwen3-VL text-encoder
   layers each settle on the GPU, in RAM or on the SSD
@@ -520,7 +537,9 @@ sections are:
   read its prompt again when it comes back: `null`, the default, leaves it to the server's own
   default of 8 and passes no flag, so a server from before the option still starts; a number
   is passed as `--park-gb`, 0 = off; see [FLASHNEXT.md](FLASHNEXT.md#two-conversations-on-one-model)),
-  `vision`, `autostart`,
+  `vision`, `autostart` (the Overview's "Start when OAIY opens": the default model loads as
+  the studio starts, on the eGPU where it is set to run there, once OAIY Desktop's eGPU plugin
+  has said what runs the card, or after 30 s with the settings' Python),
   `idle_stop_minutes`, `extra_args`. On a Mac only: `egpu` (`enabled`, `python`, `tinygrad`,
   `device`, `ctx`, `fallback_model`, `env`, `extra_args`) and a model's `egpu: true`, for a
   card in a Thunderbolt enclosure through tinygrad's server: see

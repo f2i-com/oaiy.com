@@ -106,6 +106,7 @@ section.view { display: none; } section.view.on { display: block; }
 /* controls */
 .btn { border: 1px solid var(--line-2); background: var(--panel-2); border-radius: var(--r); padding: 7px 14px; cursor: pointer; white-space: nowrap; }
 .btn:hover { border-color: var(--muted); }
+a.btn { color: inherit; text-decoration: none; display: inline-block; }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn.go { background: var(--gpu); border-color: var(--gpu); color: var(--on-accent); font-weight: 600; }
 .btn.go:hover { filter: brightness(1.08); }
@@ -117,9 +118,10 @@ label.f { display: grid; gap: 5px; font-size: 12px; color: var(--muted); align-c
    intrinsic width) unless told they may shrink: then phones scroll sideways. */
 .drop, .list, .item, .gen-form, label.f, .hw, .detected, .block, .progress { grid-template-columns: minmax(0, 1fr); min-width: 0; }
 label.f > span { display: flex; justify-content: space-between; gap: 8px; }
-input[type=text], input[type=number], input[type=password], select, textarea {
+input[type=text], input[type=number], input[type=password], input[type=search], select, textarea {
   background: var(--bg); border: 1px solid var(--line-2); border-radius: var(--r); padding: 7px 10px; width: 100%; font-size: 14px; }
 textarea { resize: vertical; min-height: 84px; line-height: 1.45; }
+input[type=search] { -webkit-appearance: none; appearance: none; }
 input:focus, select:focus, textarea:focus { border-color: var(--gpu); outline: none; }
 input[type=checkbox] { accent-color: var(--gpu); width: 16px; height: 16px; }
 input[type=range] { width: 100%; accent-color: var(--gpu); }
@@ -165,6 +167,10 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .hw-row.card .doing { grid-column: 2 / -1; margin-top: -2px; }
 .hw-row .keys { display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .meter.split { display: flex; }
+/* the Models page's search, over the model lists; a model it took you to, outlined a moment */
+.model-search { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.model-search input { flex: 1 1 260px; min-width: 0; }
+.item.found { outline: 2px solid var(--gpu); outline-offset: 3px; }
 
 /* lists */
 .list { display: grid; }
@@ -558,7 +564,7 @@ dialog::backdrop { background: var(--backdrop); }
     <!-- Overview -->
     <section class="view on" id="v-overview">
       <h1>Overview</h1>
-      <p class="lede">Models run from where their weights live. Hot weights stay on the GPU, warm ones in RAM, and the rest stream from the SSD when needed, so a small machine can run big models.</p>
+      <p class="lede" id="ov-lede">Models run from where their weights live. Hot weights stay on the GPU, warm ones in RAM, and the rest stream from the SSD when needed, so a small machine can run big models.</p>
       <div class="dl-empty-hint" id="first-run" hidden><p><strong>No models yet.</strong> Get models downloads ready-to-run ones from Hugging Face (a chat model, pictures, speech and more) and sets them up for you.</p><button class="btn go" data-goto="get">Get models</button></div>
       <div class="block">
         <div class="spread"><h2>Hardware</h2><span class="muted small" id="hw-note"></span></div>
@@ -577,6 +583,7 @@ dialog::backdrop { background: var(--backdrop); }
             <button class="btn" id="llm-restart">Restart</button>
             <button class="btn warn" id="llm-stop">Stop</button>
           </div>
+          <label class="check" style="margin-top:14px"><input type="checkbox" id="llm-autostart"><span>Start when OAIY opens <span class="muted small" id="llm-autostart-what"></span></span></label>
           <p class="muted small" id="llm-note"></p>
         </div>
         <div>
@@ -876,7 +883,11 @@ dialog::backdrop { background: var(--backdrop); }
         <div class="spread"><h2 data-jump="Your list">Your model list</h2><div class="row">
           <a class="btn" id="export-models" href="/api/models/export" download="oaiy-models.json">Export models</a>
           <label class="btn" style="cursor:pointer">Import models<input type="file" id="import-models" accept="application/json,.json" hidden></label></div></div>
-        <p class="muted small" style="margin:0">Export saves every model with its parts, defaults and memory settings to a file. Import it on this machine or another: models merge by name, or replace the whole list. Paths that do not exist there come in switched off and are listed.</p>
+        <p class="muted small" style="margin:0 0 14px">Export saves every model (language, image, video, speech, music, sound effect and 3D) with its parts, LoRAs, settings, defaults and memory settings to a JSON file. Import it on this machine or another: models merge by name, or replace the whole list. Paths that do not exist there come in switched off and are listed.</p>
+        <div class="model-search">
+          <input type="search" id="model-search" placeholder="Search your models: a name, a type, a file or a folder" aria-label="Search your models" autocomplete="off" spellcheck="false">
+          <span class="muted small" id="model-search-count"></span>
+        </div>
       </div>
       <div class="block"><div class="spread"><h2 data-jump="Language">Language models</h2><span class="muted small">Served on chat and completions routes</span></div><div class="list" id="m-llm"></div></div>
       <div class="block"><div class="spread"><h2 data-jump="Image">Image models</h2><span class="muted small">Served on the images route</span></div><div class="list" id="m-image"></div></div>
@@ -909,7 +920,7 @@ dialog::backdrop { background: var(--backdrop); }
     <!-- Memory -->
     <section class="view" id="v-memory" data-jump>
       <h1>Memory</h1>
-      <p class="lede">Choose where weights live for each kind of job. Keeping blocks on the GPU is fastest, keeping them in RAM costs one PCIe copy per block, and streaming from the SSD saves both kinds of memory. The output is identical either way; only speed and memory use change.</p>
+      <p class="lede" id="mem-lede">Choose where weights live for each kind of job. Keeping blocks on the GPU is fastest, keeping them in RAM costs one PCIe copy per block, and streaming from the SSD saves both kinds of memory. The output is identical either way; only speed and memory use change.</p>
       <div class="block" id="mem-image"></div>
       <div class="block" id="mem-video"></div>
       <div class="block">
@@ -933,12 +944,12 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block">
         <h2>Language model memory</h2>
         <div class="grid-f">
-          <label class="f"><span>RAM expert cache (GB)</span><input type="number" min="0" id="llm-ram" data-bind="llm.ram_gb" data-type="int"><small class="help">0 = 80% of the free memory.</small></label>
-          <label class="f"><span>VRAM headroom (GB)</span><input type="number" min="0" step="0.5" id="llm-headroom" data-bind="llm.vram_headroom_gb" data-type="num"></label>
+          <label class="f"><span data-mac="Expert cache in memory (GB)">RAM expert cache (GB)</span><input type="number" min="0" id="llm-ram" data-bind="llm.ram_gb" data-type="int"><small class="help">0 = 80% of the free memory.</small></label>
+          <label class="f"><span data-mac="GPU memory headroom (GB)">VRAM headroom (GB)</span><input type="number" min="0" step="0.5" id="llm-headroom" data-bind="llm.vram_headroom_gb" data-type="num"></label>
           <label class="f"><span>CPU threads for missed experts</span><input type="number" min="0" data-bind="llm.cpu_threads" data-type="intnull" placeholder="all cores"><small class="help">Empty = all cores.</small></label>
           <label class="f"><span>Stop when idle (minutes)</span><input type="number" min="0" data-bind="llm.idle_stop_minutes" data-type="int"><small class="help">0 = never.</small></label>
         </div>
-        <p class="muted small">Mixture-of-experts models keep their shared weights on the GPU, cache hot experts in VRAM and RAM, and read the rest from the SSD a token at a time.</p>
+        <p class="muted small" data-mac="Mixture-of-experts models keep their shared weights on the GPU, cache hot experts in the GPU's memory and in the rest of memory, and read the others from the SSD a token at a time.">Mixture-of-experts models keep their shared weights on the GPU, cache hot experts in VRAM and RAM, and read the rest from the SSD a token at a time.</p>
       </div>
     </section>
 
@@ -985,17 +996,17 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>
           <label class="f"><span>Repeat penalty</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="num"><small class="help">1 = off; 1.1 stops a reply looping on a phrase.</small></label>
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
-          <label class="f"><span>Conversations in RAM (GB)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"><small class="help">Flash-Next sets conversations aside there. 0 = off, empty = the server's default.</small></label>
+          <label class="f"><span data-mac="Conversations in memory (GB)">Conversations in RAM (GB)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"><small class="help">Flash-Next sets conversations aside there. 0 = off, empty = the server's default.</small></label>
           <label class="f"><span>Runs on</span><select data-bind="llm.backend">
             <option value="auto">Auto: a GPU (WebGPU), else the CPU</option>
             <option value="webgpu">WebGPU (any GPU)</option>
             <option value="cpu">CPU only</option></select></label>
           <label class="f"><span>WebGPU weights (GB)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="a card's memory less 4, a Mac's share"><small class="help">Empty = by the GPU's memory.</small></label>
         </div>
-        <p class="muted small">WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in RAM and run on the CPU. A Mac's own GPU shares the computer's memory: left empty, it holds what a card with two thirds of that memory would.</p>
+        <p class="muted small" data-mac="WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in memory and run on the CPU. This Mac's GPU has no memory of its own: it shares the unified memory with the CPU, and left empty it holds what a card with two thirds of that memory would.">WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in RAM and run on the CPU. A Mac's own GPU shares the computer's memory: left empty, it holds what a card with two thirds of that memory would.</p>
         <div class="row" style="margin-top:14px; gap:22px">
           <label class="check"><input type="checkbox" data-bind="llm.enabled"> Enabled</label>
-          <label class="check"><input type="checkbox" data-bind="llm.autostart"> Load at startup</label>
+          <label class="check"><input type="checkbox" data-bind="llm.autostart"> Start when OAIY opens</label>
           <label class="check"><input type="checkbox" data-bind="llm.thinking"> Think by default</label>
           <label class="check"><input type="checkbox" data-bind="llm.prompt_cache"> Keep prompt states between runs</label>
           <label class="check"><input type="checkbox" data-bind="llm.vision"> Vision</label>
@@ -1213,10 +1224,16 @@ $("#import-models").onchange = async e => {
   try {
     const r = await api("/api/models/import?mode=" + (replace ? "replace" : "merge"), {method: "POST", body: doc});
     const miss = r.missing.length ? `\n${r.missing.length} path(s) not found here, switched off: ` + r.missing.slice(0, 4).map(m => `${m.model} ${m.field}`).join(", ") : "";
-    toast(`Imported ${r.llm} language, ${r.image} image and ${r.video} video model(s)` + miss, r.missing.length > 0);
+    const kinds = [["llm", "language"], ["image", "image"], ["video", "video"], ["speech", "speech"], ["music", "music"], ["sound", "sound effect"], ["model3d", "3D"]];
+    const got = kinds.filter(([k]) => r[k] > 0).map(([k, w]) => `${r[k]} ${w}`);
+    toast((got.length ? `Imported ${got.length > 1 ? got.slice(0, -1).join(", ") + " and " + got[got.length - 1] : got[0]} model${kinds.reduce((n, [k]) => n + (r[k] || 0), 0) === 1 ? "" : "s"}` : "The file had no models") + miss, r.missing.length > 0);
     await loadConfig();
   } catch (err) { toast(err.message, true); }
 };
+
+// In OAIY's window what this page offers to save (the models file, a line of speech, a song, a 3D model) goes to the
+// Downloads folder, and OAIY says where it went, or that it failed; a browser shows its own.
+window.__oaiyDownloaded = (path, ok) => ok ? toast(path ? `Saved ${path.split(/[\\/]/).pop()} in Downloads` : "Saved in Downloads") : toast("The file was not saved", true);
 
 /* ---------- theme ---------- */
 function applyTheme(t) {
@@ -1462,7 +1479,7 @@ function lastResidency(name) {
   const j = state?.media?.jobs?.find(j => j.model === name && j.residency && j.residency !== null);
   if (!j) return "";
   const r = j.residency.transformer || j.residency;
-  if (r.gpu_blocks !== undefined) return `<span class="tag gpu">${r.gpu_blocks} GPU</span><span class="tag ram">${r.ram_blocks} RAM</span><span class="tag ssd">${r.ssd_blocks} SSD</span>`;
+  if (r.gpu_blocks !== undefined) return `<span class="tag gpu">${r.gpu_blocks} GPU</span><span class="tag ram">${r.ram_blocks} ${macMemory() ? "memory" : "RAM"}</span><span class="tag ssd">${r.ssd_blocks} SSD</span>`;
   if (r.mode) return `<span class="tag ${r.mode === "resident" ? "gpu" : "ram"}">${r.mode === "resident" ? "All on GPU" : "Staged"}</span>`;
   return "";
 }
@@ -1620,7 +1637,54 @@ function renderModels() {
   $$("[data-remove]").forEach(b => b.onclick = async () => { const [section, name] = b.dataset.remove.split("|");
     if (!await ask({title: `Remove ${name}?`, text: "It leaves the model list; the files stay on disk.", buttons: [{label: "Cancel", value: null}, {label: "Remove", value: "ok", kind: "warn"}]})) return;
     try { await api("/api/models/remove", {method: "POST", body: {section, name}}); await loadConfig(); toast("Removed " + name); } catch (e) { toast(e.message, true); } });
+  filterModels();
 }
+// The Models page's lists, each with its models in the order they are shown, and the words its kind is found by.
+const modelKinds = {llm: "language chat llm", image: "image picture", video: "video", speech: "speech voice tts", music: "music song", sound: "sound effect sfx", model3d: "3d model mesh"};
+function modelLists() {
+  return Object.keys(modelKinds).map(k => [k, $("#m-" + k), k === "llm" ? cfg.llm.models.map(m => [m.name, m]) : Object.entries(cfg.media[k]?.models || {})]);
+}
+// Show the models every word of the search is in: a model's name, its kind and type, its tags (Default, Loaded, what it
+// needs), the files and folders it is made of and its settings, "egpu" where it runs there, "off" where it is switched
+// off. Lists with none of them fold away. The first shown, for Enter to go to.
+function filterModels() {
+  const box = $("#model-search");
+  if (!box || !cfg) return null;
+  const words = box.value.toLowerCase().split(/\s+/).filter(Boolean);
+  let shown = 0, total = 0, first = null;
+  for (const [kind, list, entries] of modelLists()) {
+    if (!list) continue;
+    let here = 0;
+    $$(":scope > .item", list).forEach((item, i) => {
+      const [name, m] = entries[i] || ["", {}];
+      const said = [];
+      const walk = v => typeof v === "string" ? said.push(v) : v && typeof v === "object" ? Object.values(v).forEach(walk) : null;
+      walk(m);
+      const hay = [name, modelKinds[kind], ...$$(".tag", item).map(t => t.textContent), m.egpu ? "egpu" : "", m.enabled === false ? "off" : "", ...said].join(" ").toLowerCase();
+      const hit = words.every(w => hay.includes(w));
+      item.hidden = !hit;
+      total++;
+      if (hit) { here++; shown++; first ??= item; }
+    });
+    $$(":scope > .empty", list).forEach(e => e.hidden = words.length > 0);
+    list.closest(".block").hidden = words.length > 0 && here === 0;
+  }
+  $("#model-search-count").textContent = !words.length ? "" : shown ? `${shown} of ${total} model${total === 1 ? "" : "s"} · Enter goes to the first` : "No model matches";
+  if ($("#v-models").classList.contains("on")) renderJump("models");
+  return first;
+}
+$("#model-search").oninput = () => filterModels();
+$("#model-search").onkeydown = e => {
+  if (e.key === "Escape") { e.target.value = ""; filterModels(); return; }
+  if (e.key !== "Enter") return;
+  const item = filterModels();
+  if (!item) return;
+  item.scrollIntoView({behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start"});
+  item.classList.add("found");
+  setTimeout(() => item.classList.remove("found"), 1600);
+  // (its first field, the one to change, without scrolling it away again)
+  $("input[type=text], input[type=number], select", item)?.focus({preventScroll: true});
+};
 function mediaItem(section, name, m, arch, miss, fields) {
   const isDefault = cfg.media[section].default_model === name;
   return `<div class="item"><div class="item-head"><strong>${esc(name)}</strong><span class="tag">${esc(arch)}</span>
@@ -1633,9 +1697,10 @@ function mediaItem(section, name, m, arch, miss, fields) {
 }
 
 /* ---------- memory ---------- */
-const tiers = [["gpu", "GPU"], ["auto", "Auto"], ["ram", "RAM"], ["ssd", "SSD"]];
+// (a Mac's GPU has no memory of its own: its "VRAM" is its part of the unified memory, its "RAM" the rest of it)
+const tiers = () => [["gpu", "GPU"], ["auto", "Auto"], ["ram", macMemory() ? "Memory" : "RAM"], ["ssd", "SSD"]];
 function segment(el, value, onpick) {
-  el.innerHTML = tiers.map(([v, l]) => `<button type="button" data-tier="${v}" aria-pressed="${v === value}">${l}</button>`).join("");
+  el.innerHTML = tiers().map(([v, l]) => `<button type="button" data-tier="${v}" aria-pressed="${v === value}">${l}</button>`).join("");
   $$("button", el).forEach(b => b.onclick = () => { $$("button", el).forEach(x => x.setAttribute("aria-pressed", x === b)); onpick(b.dataset.tier); });
 }
 function gpuTotalGb(i) { const g = sys?.gpus?.find(g => g.index === i); return g?.memory_total_mb ? g.memory_total_mb / 1024 : 32; }
@@ -1648,24 +1713,29 @@ function strip(memory, vramCap, ramCap, modelGb) {
   else if (memory === "ram") ram = Math.min(total, ramCap);
   const ssd = Math.max(0, total - gpu - ram);
   const seg = (cls, v, label) => v > 0.001 ? `<div class="${cls}" style="flex-grow:${v}" title="${label} ${v.toFixed(1)} GB">${v / total > .12 ? label + " " + v.toFixed(1) + " GB" : ""}</div>` : "";
-  return `<div class="strip" role="img" aria-label="GPU ${gpu.toFixed(1)} GB, RAM ${ram.toFixed(1)} GB, SSD ${ssd.toFixed(1)} GB">${seg("t-gpu", gpu, "GPU")}${seg("t-ram", ram, "RAM")}${seg("t-ssd", ssd, "SSD")}</div>
-    <div class="strip-legend"><span class="key"><i style="background:var(--gpu)"></i>Resident on the GPU</span><span class="key"><i style="background:var(--ram)"></i>Copied up from RAM each pass</span><span class="key"><i style="background:var(--ssd)"></i>Read from the SSD each pass</span></div>`;
+  const mac = macMemory(), held = mac ? "Memory" : "RAM";
+  return `<div class="strip" role="img" aria-label="GPU ${gpu.toFixed(1)} GB, ${held} ${ram.toFixed(1)} GB, SSD ${ssd.toFixed(1)} GB">${seg("t-gpu", gpu, "GPU")}${seg("t-ram", ram, held)}${seg("t-ssd", ssd, "SSD")}</div>
+    <div class="strip-legend"><span class="key"><i style="background:var(--gpu)"></i>Resident on the GPU</span><span class="key"><i style="background:var(--ram)"></i>${mac ? "Copied to the GPU from memory each pass" : "Copied up from RAM each pass"}</span><span class="key"><i style="background:var(--ssd)"></i>Read from the SSD each pass</span></div>`;
 }
 const tierHelp = {gpu: "Everything on the GPU: fastest, needs the most VRAM.", auto: "Fill the GPU up to the VRAM cap, keep the overflow in RAM, and stream the rest from the SSD.",
   ram: "Only the block in use sits on the GPU; the others wait in RAM.", ssd: "Only the block in use is anywhere but the SSD. Slowest; uses the least memory."};
+const tierHelpMac = {gpu: "Everything on the GPU: fastest, needs the most of the GPU's memory.", auto: "Fill the GPU's memory up to the cap, keep the overflow in the rest of memory, and stream the rest from the SSD.",
+  ram: "Only the block in use sits on the GPU; the others wait in the rest of memory.", ssd: tierHelp.ssd};
+// What the GPU memory cap says it is: a number, or what is free.
+const capText = s => s.vram_gb == null ? (macMemory() ? "what is free" : "free VRAM") : s.vram_gb + " GB";
 function renderMemory() {
   for (const kind of ["image", "video"]) {
     const s = cfg.media[kind], el = $("#mem-" + kind);
     const example = kind === "image" ? 20 : 44;
     const vcap = s.vram_gb ?? Math.max(0, gpuTotalGb(cfg.media.device) - 6);
     el.innerHTML = `<div class="spread"><h2>${kind === "image" ? "Image" : "Video"} jobs</h2><div class="seg" id="seg-${kind}"></div></div>
-      <p class="muted" style="margin:0 0 12px">${tierHelp[s.memory || "auto"]}</p>
+      <p class="muted" style="margin:0 0 12px">${(macMemory() ? tierHelpMac : tierHelp)[s.memory || "auto"]}</p>
       ${strip(s.memory || "auto", vcap, s.ram_gb ?? 32, example)}
       <p class="muted small">Shown for a ${example} GB model (${kind === "image" ? "Qwen Image 2.1 in BF16" : "LTX 2.3 22B in BF16"}). Output is identical in every mode.</p>
       <div class="grid-f" style="margin-top:6px">
-        <label class="f"><span>VRAM cap <b class="num" id="${kind}-vram-v">${s.vram_gb == null ? "free VRAM" : s.vram_gb + " GB"}</b></span><input type="range" min="0" max="${Math.round(gpuTotalGb(cfg.media.device))}" value="${s.vram_gb ?? Math.round(vcap)}" id="${kind}-vram"></label>
-        <label class="f"><span>RAM for weights <b class="num" id="${kind}-ram-v">${s.ram_gb ?? 32} GB</b></span><input type="range" min="0" max="${Math.max(8, Math.round((state?.ram_total_mb || sys?.ram?.total_mb || 65536) / 1024))}" value="${s.ram_gb ?? 32}" id="${kind}-ram"></label>
-        <div class="f"><span></span><label class="check"><input type="checkbox" id="${kind}-vram-auto" ${s.vram_gb == null ? "checked" : ""}> Use whatever VRAM is free</label></div>
+        <label class="f"><span>${macMemory() ? "GPU memory cap" : "VRAM cap"} <b class="num" id="${kind}-vram-v">${capText(s)}</b></span><input type="range" min="0" max="${Math.round(gpuTotalGb(cfg.media.device))}" value="${s.vram_gb ?? Math.round(vcap)}" id="${kind}-vram"></label>
+        <label class="f"><span>${macMemory() ? "Memory for weights" : "RAM for weights"} <b class="num" id="${kind}-ram-v">${s.ram_gb ?? 32} GB</b></span><input type="range" min="0" max="${Math.max(8, Math.round((state?.ram_total_mb || sys?.ram?.total_mb || 65536) / 1024))}" value="${s.ram_gb ?? 32}" id="${kind}-ram"></label>
+        <div class="f"><span></span><label class="check"><input type="checkbox" id="${kind}-vram-auto" ${s.vram_gb == null ? "checked" : ""}> ${macMemory() ? "Use whatever memory the GPU has free" : "Use whatever VRAM is free"}</label></div>
       </div>`;
     segment($("#seg-" + kind), s.memory || "auto", v => { s.memory = v; renderMemory(); touch(); });
     $("#" + kind + "-vram").oninput = e => { s.vram_gb = +e.target.value; $("#" + kind + "-vram-auto").checked = false; renderStripOnly(kind); touch(); };
@@ -1684,7 +1754,7 @@ function renderStripOnly(kind) {
   const holder = document.createElement("div");
   holder.innerHTML = strip(s.memory || "auto", vcap, s.ram_gb ?? 32, kind === "image" ? 20 : 44);
   $(".strip", el).replaceWith(holder.firstElementChild);
-  $("#" + kind + "-vram-v").textContent = s.vram_gb == null ? "free VRAM" : s.vram_gb + " GB";
+  $("#" + kind + "-vram-v").textContent = capText(s);
   $("#" + kind + "-ram-v").textContent = (s.ram_gb ?? 32) + " GB";
 }
 function gpuList() {
@@ -1728,7 +1798,7 @@ function shareNote() {
   const models = cfg.llm.models.filter(m => m.enabled !== false);
   const named = list => list.map(m => `${m.name} (GPU ${modelGpus(m).join(", ")})`).join(", ");
   const shared = models.filter(m => modelGpus(m).includes(d)), free = models.filter(m => !modelGpus(m).includes(d));
-  $("#share-note").textContent = pol === "coexist" ? "Media and the language models run side by side. Make sure both fit in VRAM."
+  $("#share-note").textContent = pol === "coexist" ? `Media and the language models run side by side. Make sure both fit in ${macMemory() ? "the GPU's memory" : "VRAM"}.`
     : pol === "pause_llm" ? `Every media job stops the language model first; chat requests wait until the job finishes.`
     : [shared.length ? `Media jobs on GPU ${d} take turns with ${named(shared)}: it stops while a job runs, and its chat requests wait.` : `No language model uses GPU ${d}, so chat and media run at the same time.`,
        shared.length && free.length ? `${named(free)} keep${free.length === 1 ? "s" : ""} answering while media runs.` : ""].filter(Boolean).join(" ");
@@ -1797,6 +1867,20 @@ const memMeter = (used, total, title, kept = 0, unit = "") => ({parts: [[used / 
 const hotText = (temp, of = "") => temp == null ? "" : `<span title="Temperature${of && ": " + of}"${temp >= 90 ? ' style="color:var(--bad)"' : ""}>${temp} °C</span>`;
 const loadMeter = (load, title, temp, of) => ({parts: [[load ?? 0, "var(--good)"]], title,
   num: `${load == null ? "–" : load + "%"} <span class="muted">load</span>${temp == null ? "" : " · " + hotText(temp, of)}`});
+// A Mac's GPU has no memory of its own: it shares the unified memory with the CPU (renderHardware). There the pages say
+// the GPU's memory where they say VRAM elsewhere, and memory where they say RAM: the text of each `data-mac` element,
+// and the two ledes, which name the eGPU's own VRAM where there is one.
+function macMemory() { return !!sys?.gpus?.some(g => g.unified); }
+function macWords() {
+  const mac = macMemory(), card = !!(state?.egpu?.available && state.egpu.enabled);
+  const put = (el, text) => { if (el && el.textContent !== text) el.textContent = text; };
+  $$("[data-mac]").forEach(el => { el.dataset.pc ??= el.textContent; put(el, mac ? el.dataset.mac : el.dataset.pc); });
+  for (const id of ["ov-lede", "mem-lede"]) { const el = $("#" + id); if (el) el.dataset.pc ??= el.textContent; }
+  put($("#ov-lede"), !mac ? $("#ov-lede")?.dataset.pc
+    : `Models run from where their weights live. Hot weights stay on the GPU (in its share of the Mac's unified memory${card ? ", or in the eGPU's own VRAM" : ""}), warm ones in the rest of memory, and the rest stream from the SSD when needed, so a small machine can run big models.`);
+  put($("#mem-lede"), !mac ? $("#mem-lede")?.dataset.pc
+    : `Choose where weights live for each kind of job. This Mac's GPU holds weights in its share of the unified memory: blocks it holds run fastest, blocks kept in the rest of memory are copied to it each pass, and streaming from the SSD saves memory.${card ? " A job the eGPU makes holds its GPU part in the card's own VRAM, and copies the rest across Thunderbolt." : ""} The output is identical either way; only speed and memory use change.`);
+}
 function renderHardware() {
   const hw = $("#hw"), rows = [];
   const ram = sys?.ram;
@@ -1905,6 +1989,13 @@ function renderState() {
   $("#llm-start").disabled = lent || l.state === "ready" || l.state === "starting";
   $("#llm-restart").disabled = lent || l.state !== "ready";
   $("#llm-stop").disabled = lent || l.state === "stopped";
+  if (saved) {
+    const models = saved.llm.models.filter(m => m.enabled !== false);
+    const first = models.find(m => m.name === saved.llm.default_model) || models[0];
+    $("#llm-autostart").checked = !!saved.llm.autostart;
+    $("#llm-autostart-what").textContent = first ? `· loads ${first.name}${allOnCard ? " on the eGPU" : ""}` : "";
+  }
+  macWords();
   $("#llm-note").textContent = state.restart_required ? "Listener changes apply after the studio restarts."
     : standingIn ? "Every model is set to run on the eGPU: this computer's engine is standing in for it. Stop stops both."
     : onCard && own.state === "failed" ? `This computer's engine could not stand in for the eGPU earlier (${own.error || "it failed to start"}).` : "";
@@ -1989,6 +2080,17 @@ function statusRaw(j) {
 $("#llm-start").onclick = () => api("/api/llm/start", {method: "POST"}).then(refresh).catch(e => toast(e.message, true));
 $("#llm-stop").onclick = () => api("/api/llm/stop", {method: "POST"}).then(refresh);
 $("#llm-restart").onclick = () => api("/api/llm/restart", {method: "POST"}).then(refresh).catch(e => toast(e.message, true));
+$("#llm-autostart").onchange = async e => {
+  // Saved as it is ticked, as incognito is (Settings has the same tick, with the drafts there): the model loaded now
+  // stays loaded.
+  try {
+    const next = clone(saved); next.llm.autostart = e.target.checked;
+    saved = await api("/api/config", {method: "PUT", body: next});
+    cfg.llm.autostart = saved.llm.autostart;
+    bindFields(); dirty();
+    toast(saved.llm.autostart ? "The language model starts when OAIY opens" : "The language model starts at the first chat request");
+  } catch (err) { e.target.checked = !e.target.checked; toast(err.message, true); }
+};
 $("#open-outputs").onclick = () => api("/api/open-outputs", {method: "POST"});
 
 function renderSelects() {
@@ -2557,7 +2659,7 @@ function openViewer(id) {
   $("#viewer-prompt").textContent = j.prompt;
   const st = j.settings || {}, r = j.residency?.transformer || j.residency;
   const rows = [["Model", j.model], ["Size", j.size], ["Seed", st.seed], ["Steps", st.steps], ["Memory", st.memory],
-    ["Placement", r && r.gpu_blocks !== undefined ? `${r.gpu_blocks} GPU, ${r.ram_blocks} RAM, ${r.ssd_blocks} SSD blocks` : r?.mode],
+    ["Placement", r && r.gpu_blocks !== undefined ? `${r.gpu_blocks} GPU, ${r.ram_blocks} ${macMemory() ? "memory" : "RAM"}, ${r.ssd_blocks} SSD blocks` : r?.mode],
     ["Length", (j.kind === "video" || j.kind === "music" || j.kind === "sound") && j.seconds ? j.seconds.toFixed(1) + " s" : null], ["Took", j.seconds_taken ? j.seconds_taken.toFixed(1) + " s" : null],
     ["Created", new Date(j.created_at * 1000).toLocaleString()], ["Status", j.status], ["Error", j.error]].filter(([, v]) => v !== null && v !== undefined && v !== "");
   $("#viewer-meta").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
@@ -2734,7 +2836,7 @@ async function refresh() {
   // (the eGPU's memory and load are the state's: shown as they come)
   if (sys && state?.egpu?.usage && $("#v-overview").classList.contains("on")) renderHardware();
 }
-async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); } catch {} }
+async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); macWords(); } catch {} }
 (async () => {
   await refresh(); await refreshSystem(); await loadConfig(); renderState(); renderHardware(); loadVoices();
   try { const t = localStorage.getItem("studio-play-tab"); if (t) $(`#v-play .ptabs button[data-tab=${t}]`)?.click(); } catch {}

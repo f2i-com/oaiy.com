@@ -370,6 +370,10 @@ pub fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Args, Strin
 /// How many ports past the configured one are tried before any free one the system gives.
 const PORTS_AFTER: u16 = 20;
 
+/// How long a language model that starts with OAIY on a Mac's eGPU waits for OAIY Desktop's eGPU plugin to say what
+/// runs the card (it says a few seconds after the studio starts) before the settings' Python is used.
+const EGPU_RUNTIME_WAIT: Duration = Duration::from_secs(30);
+
 /// A listener on `host:port`, or, where that port is not to be had, on the next free one of the [`PORTS_AFTER`] after
 /// it, else on any the system gives: with what was taken instead, for the log. Another program may hold the port
 /// (8080 is many a program's), Windows may keep it reserved (Hyper-V's and Docker's excluded ranges refuse a bind
@@ -681,9 +685,28 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         println!("  type 'help' for console commands");
     }
     let llm_cfg = cfg.get("llm").cloned().unwrap_or(Json::Null);
-    if (args.start_llm || bool_or(&llm_cfg, "autostart", false)) && !llm::holds_a_model(&llm_cfg) {
-        studio.log.push(llm::ALL_ON_EGPU);
-    } else if args.start_llm || bool_or(&llm_cfg, "autostart", false) {
+    let forced = args.start_llm;
+    if (forced || bool_or(&llm_cfg, "autostart", false)) && !llm::holds_a_model(&llm_cfg) {
+        // The default model runs on the eGPU: it starts there, not here, once the card's runtime is known.
+        let s = Arc::clone(&studio);
+        let begun = std::thread::Builder::new().name("autostart-egpu".into()).spawn(move || {
+            let still = || {
+                let cfg = s.config();
+                let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+                let name = llm::default_model(&llm);
+                let wanted = (forced || bool_or(&llm, "autostart", false)) && bool_or(&llm, "enabled", true) && !llm::holds_a_model(&llm) && !name.is_empty();
+                wanted.then(|| (cfg, s.root.clone(), name))
+            };
+            match s.egpu.start_when_provided(EGPU_RUNTIME_WAIT, still) {
+                Ok(Some(name)) => s.log.push(format!("loading {name} on the eGPU: the language model starts with OAIY")),
+                Ok(None) => {}
+                Err(e) => s.log.push(format!("the language model did not start on the eGPU with OAIY: {e}")),
+            }
+        });
+        if let Err(e) = begun {
+            studio.log.push(format!("the language model did not start on the eGPU with OAIY: {e}"));
+        }
+    } else if forced || bool_or(&llm_cfg, "autostart", false) {
         if let Err(e) = studio.llm.start(&cfg, &studio.root) {
             studio.log.push(format!("LLM not started: {e}"));
             if !quiet {
@@ -764,6 +787,33 @@ mod tests {
         assert_eq!((got, moved), (port, None));
         // a host that is not this computer's is not worked around
         assert!(listen("203.0.113.9", port, "UI").is_err());
+    }
+
+    /// "Start when OAIY opens" is saved from the Overview as it is ticked: the model loaded meanwhile stays loaded.
+    #[test]
+    fn starting_with_oaiy_is_saved_without_stopping_the_model_that_is_loaded() {
+        let dir = std::env::temp_dir().join(format!("oaiy-studio-autostart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.gguf"), b"GGUF").unwrap();
+        let mut cfg = config::default_json();
+        let mut llm = cfg.get("llm").cloned().unwrap();
+        util::set(&mut llm, "egpu", Json::parse(br#"{"enabled": true}"#).unwrap());
+        util::set(&mut llm, "models", Json::parse(br#"[{"name": "big", "path": "big.gguf", "egpu": true}]"#).unwrap());
+        util::set(&mut cfg, "llm", llm);
+        config::validate(&cfg).unwrap();
+        let studio = Studio::for_test(&dir, cfg.clone());
+        studio.egpu.adopt("127.0.0.1:1", "k", "big", None);
+        for on in [true, false] {
+            let mut next = studio.config();
+            let mut llm = next.get("llm").cloned().unwrap();
+            util::set(&mut llm, "autostart", Json::Bool(on));
+            util::set(&mut next, "llm", llm);
+            studio.set_config(next).unwrap();
+            assert_eq!(studio.config().get("llm").map(|l| bool_or(l, "autostart", !on)), Some(on));
+            assert_eq!((studio.egpu.state(), studio.egpu.held().as_deref()), (llm::State::Ready, Some("big")), "autostart {on}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

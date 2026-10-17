@@ -775,6 +775,10 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
     // whole call came to it a minute after the call had ended, in one burst, as the person looked at it. On macOS 14
     // and later this keeps it running as if it were shown. (The other pages have nothing to do while hidden.)
     let made = if page == Page::Agent { made.background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled) } else { made };
+    // The engines' page offers files to save (its models file, a line of speech, a song, a 3D model): WebKit, with no
+    // one to hand a download to, cancels it, and the button did nothing. WebView2 saves them by itself.
+    #[cfg(not(windows))]
+    let made = if page == Page::Engines { made.on_download(engines_download) } else { made };
     made
         .additional_browser_args(BROWSER_ARGS)
         // A page that (re)loads starts in the theme it was made with: tell it the one now.
@@ -797,6 +801,46 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
             open_outside(&for_windows, &url);
             NewWindowResponse::Deny
         })
+}
+
+/// The engines' page's downloads, saved where a browser saves them: the Downloads folder, under the name the page
+/// gives, numbered rather than over a file there (wry's choice). Its own files alone. As each ends the page is told
+/// where it went, or that it failed (`__oaiyDownloaded`).
+#[cfg(not(windows))]
+fn engines_download<R: Runtime>(webview: tauri::Webview<R>, event: tauri::webview::DownloadEvent<'_>) -> bool {
+    use tauri::webview::DownloadEvent;
+    // (where each is going: a Mac says no path as one ends)
+    static SAVING: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    let saving = || SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    match event {
+        DownloadEvent::Requested { url, destination } => {
+            if !own(Page::Engines, &url) {
+                log::warn!("embed: the engines' page asked to save {url}, which is not its own: not saved");
+                return false;
+            }
+            log::info!("embed: saving {url} to {}", destination.display());
+            saving().push((url.to_string(), destination.clone()));
+            true
+        }
+        DownloadEvent::Finished { url, path, success } => {
+            let went = {
+                let mut s = saving();
+                let at = s.iter().position(|(u, _)| u == url.as_str());
+                at.map(|i| s.remove(i).1)
+            };
+            let path = path.or(went);
+            if !success {
+                log::warn!("embed: saving {url} failed");
+            }
+            let script = format!(
+                "window.__oaiyDownloaded && window.__oaiyDownloaded({}, {success})",
+                serde_json::Value::from(path.map(|p| p.display().to_string()))
+            );
+            let _ = webview.eval(script);
+            true
+        }
+        _ => true,
+    }
 }
 
 /// Hide the embedded pages (the dashboard shows one of its own).
