@@ -1,0 +1,367 @@
+{
+ "name": "Make, edit and check a picture",
+ "description": "A picture from a prompt with MOSS-Image (its prompt enhanced first), edited with FLUX 3 Klein (Q4_K_M, 8 steps) where an edit is asked for, then checked by a vision model: the pictures' file references and the review's findings.",
+ "nodes": [
+  {
+   "id": "prompt",
+   "type": "input_text",
+   "position": {
+    "x": 0,
+    "y": 0
+   },
+   "data": {
+    "label": "Prompt",
+    "value": ""
+   }
+  },
+  {
+   "id": "edit",
+   "type": "input_text",
+   "position": {
+    "x": 0,
+    "y": 360
+   },
+   "data": {
+    "label": "Edit",
+    "value": ""
+   }
+  },
+  {
+   "id": "enhance",
+   "type": "ai_llm",
+   "position": {
+    "x": 300,
+    "y": 0
+   },
+   "data": {
+    "label": "Enhance the prompt (OpenMOSS's prompt enhancer)",
+    "service": "engine:llm",
+    "systemPrompt": "You turn a person's picture idea into one detailed English caption for MOSS-Image, a text-to-image model, as OpenMOSS's prompt enhancer does. Describe the visible picture concretely: the subject and what it is doing, its appearance, the setting, the framing, the medium, the lighting, materials, colour palette and mood. Keep every subject, count, relationship, style and exclusion the person asked for; add detail only where it makes the picture more specific, and keep a minimalist request minimalist. Quote any text that should appear in the picture exactly, in its own language, with its line breaks. Where the picture should be clean (a logo, an icon, a product shot), say plainly what must not appear: no other letters or words, no watermark. Write cohesive prose, one or two paragraphs, with no lists, JSON or quality tags. Reply with the caption alone.",
+    "maxTokens": 700,
+    "enableThinking": false
+   }
+  },
+  {
+   "id": "make",
+   "type": "image_gen",
+   "position": {
+    "x": 620,
+    "y": 0
+   },
+   "data": {
+    "label": "Make it (MOSS-Image, 8 steps)",
+    "service": "engine:image:moss-image-sft-q4-8-step",
+    "width": 1024,
+    "height": 1024,
+    "seed": "",
+    "release": false
+   }
+  },
+  {
+   "id": "has_edit",
+   "type": "condition",
+   "position": {
+    "x": 300,
+    "y": 360
+   },
+   "data": {
+    "label": "An edit asked for?",
+    "operator": "not_empty"
+   }
+  },
+  {
+   "id": "made_ref",
+   "type": "logic_block",
+   "position": {
+    "x": 940,
+    "y": 0
+   },
+   "data": {
+    "label": "The picture made, by reference",
+    "code": "// the picture made, by its file's URL where OAIY's engine gave one (its bytes otherwise): what is passed on,\n// so the steps after it are handed a reference, not the picture\nreturn (made && made.file) || made_image;"
+   }
+  },
+  {
+   "id": "edit_image",
+   "type": "image_gen",
+   "position": {
+    "x": 940,
+    "y": 240
+   },
+   "data": {
+    "label": "Edit it (FLUX 3 Klein, Q4_K_M, 8 steps)",
+    "service": "engine:image:flux-3-image-klein-q4-8-step",
+    "imageInputCount": 1,
+    "width": 1024,
+    "height": 1024,
+    "seed": "",
+    "release": false
+   }
+  },
+  {
+   "id": "final_image",
+   "type": "logic_block",
+   "position": {
+    "x": 1260,
+    "y": 0
+   },
+   "data": {
+    "label": "The picture to review",
+    "code": "// the picture to review: the edited one where there is one, else the one made (by reference, as above)\nreturn (edited && edited.file) || edited_image || made_ref;"
+   }
+  },
+  {
+   "id": "before_image",
+   "type": "logic_block",
+   "position": {
+    "x": 1260,
+    "y": 240
+   },
+   "data": {
+    "label": "Before the edit",
+    "code": "// the picture before the edit, for the reviewer to compare (none without an edit)\nreturn (edited || edited_image) ? made_ref : null;"
+   }
+  },
+  {
+   "id": "ask",
+   "type": "logic_block",
+   "position": {
+    "x": 1260,
+    "y": 480
+   },
+   "data": {
+    "label": "What to check",
+    "code": "// what the reviewer is asked: the request the final picture must meet (an edit's changes are what was asked for)\nconst idea = String(prompt == null ? '' : prompt).trim();\nconst change = String(edit == null ? '' : edit).trim();\nif (!change) {\n  return `The person asked for: ${idea}\\n\\nThe caption the picture was made from: ${caption}\\n\\nCheck the picture against what the person asked for.`;\n}\nreturn `The person first asked for: ${idea}\\n\\nThen they asked for this change, which the final picture must show: ${change}\\n\\n` +\n  'The change is correct, not an issue: where it replaces something from the first request (a colour, a word), the final ' +\n  'picture must have the new one. Everything the change does not mention must look as it did before the edit (the second picture).';"
+   }
+  },
+  {
+   "id": "review",
+   "type": "ai_llm",
+   "position": {
+    "x": 1580,
+    "y": 120
+   },
+   "data": {
+    "label": "Review it (a vision model)",
+    "service": "engine:llm",
+    "model": "",
+    "systemPrompt": "You check a generated picture against what was asked, and you are careful and specific. The first picture is the final one; a second picture, where there is one, is how it looked before it was edited. Reply with JSON alone, no prose and no code fence, in exactly this shape:\n{\"verdict\": \"pass\" or \"needs_attention\", \"confidence\": a number from 0 to 1, \"text\": {\"requested\": [the exact text asked for], \"found\": [the text you can read in the final picture], \"exact\": true, false or null, \"unintended\": [text that appears but was not asked for]}, \"colours\": {\"requested\": [colours asked for], \"matches\": true, false or null, \"note\": \"...\"}, \"objects\": {\"missing\": [...], \"extra\": [...]}, \"composition\": \"one sentence\", \"edit\": {\"applied\": true, false or null, \"unaffected_preserved\": true, false or null, \"note\": \"...\"}, \"issues\": [\"each concrete problem\"], \"uncertain\": [\"what you could not tell for sure\"]}\nJudge the final picture against the request as you are given it: when a change was asked for, the picture must show the change, and what the change replaced is no longer asked for. Use null where the request says nothing about it, and for edit when there was no edit. Read lettering letter by letter before you call it exact. A verdict of pass needs no issues that matter.",
+    "imageInputCount": 2,
+    "maxTokens": 900,
+    "enableThinking": false
+   }
+  },
+  {
+   "id": "result",
+   "type": "logic_block",
+   "position": {
+    "x": 1900,
+    "y": 120
+   },
+   "data": {
+    "label": "The result",
+    "code": "// The flow's answer: references to the pictures (their files' URLs, never the pictures themselves), what made\n// them, and the review's findings (read from its reply; kept as text where it is not JSON).\nconst parse = (reply) => {\n  if (reply == null) return null;\n  const text = String(reply).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\n  const at = text.indexOf('{'), end = text.lastIndexOf('}');\n  try { return JSON.parse(at >= 0 && end > at ? text.slice(at, end + 1) : text); } catch { return { unparsed: text }; }\n};\nconst final = edited || made;\nreturn {\n  image: final ? final.file : null,\n  original: made ? made.file : null,\n  edited: !!edited,\n  prompt,\n  caption,\n  edit: edited ? edit : null,\n  review: parse(review),\n  pictures: { made, edited: edited || null },\n};"
+   }
+  },
+  {
+   "id": "out",
+   "type": "output",
+   "position": {
+    "x": 2220,
+    "y": 120
+   },
+   "data": {
+    "label": "Result",
+    "outputType": "json"
+   }
+  }
+ ],
+ "edges": [
+  {
+   "id": "e1",
+   "source": "prompt",
+   "target": "enhance",
+   "sourceHandle": "text",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e2",
+   "source": "enhance",
+   "target": "make",
+   "sourceHandle": "response",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e3",
+   "source": "make",
+   "target": "made_ref",
+   "sourceHandle": "image",
+   "targetHandle": "made_image"
+  },
+  {
+   "id": "e4",
+   "source": "make",
+   "target": "made_ref",
+   "sourceHandle": "info",
+   "targetHandle": "made"
+  },
+  {
+   "id": "e5",
+   "source": "edit",
+   "target": "has_edit",
+   "sourceHandle": "text",
+   "targetHandle": "value"
+  },
+  {
+   "id": "e6",
+   "source": "has_edit",
+   "target": "edit_image",
+   "sourceHandle": "true",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e7",
+   "source": "made_ref",
+   "target": "edit_image",
+   "sourceHandle": "default",
+   "targetHandle": "image_0"
+  },
+  {
+   "id": "e8",
+   "source": "made_ref",
+   "target": "final_image",
+   "sourceHandle": "default",
+   "targetHandle": "made_ref"
+  },
+  {
+   "id": "e9",
+   "source": "edit_image",
+   "target": "final_image",
+   "sourceHandle": "image",
+   "targetHandle": "edited_image"
+  },
+  {
+   "id": "e10",
+   "source": "edit_image",
+   "target": "final_image",
+   "sourceHandle": "info",
+   "targetHandle": "edited"
+  },
+  {
+   "id": "e11",
+   "source": "made_ref",
+   "target": "before_image",
+   "sourceHandle": "default",
+   "targetHandle": "made_ref"
+  },
+  {
+   "id": "e12",
+   "source": "edit_image",
+   "target": "before_image",
+   "sourceHandle": "image",
+   "targetHandle": "edited_image"
+  },
+  {
+   "id": "e13",
+   "source": "edit_image",
+   "target": "before_image",
+   "sourceHandle": "info",
+   "targetHandle": "edited"
+  },
+  {
+   "id": "e14",
+   "source": "prompt",
+   "target": "ask",
+   "sourceHandle": "text",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e15",
+   "source": "enhance",
+   "target": "ask",
+   "sourceHandle": "response",
+   "targetHandle": "caption"
+  },
+  {
+   "id": "e16",
+   "source": "edit",
+   "target": "ask",
+   "sourceHandle": "text",
+   "targetHandle": "edit"
+  },
+  {
+   "id": "e17",
+   "source": "final_image",
+   "target": "review",
+   "sourceHandle": "default",
+   "targetHandle": "image_0"
+  },
+  {
+   "id": "e18",
+   "source": "before_image",
+   "target": "review",
+   "sourceHandle": "default",
+   "targetHandle": "image_1"
+  },
+  {
+   "id": "e19",
+   "source": "ask",
+   "target": "review",
+   "sourceHandle": "default",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e20",
+   "source": "make",
+   "target": "result",
+   "sourceHandle": "info",
+   "targetHandle": "made"
+  },
+  {
+   "id": "e21",
+   "source": "edit_image",
+   "target": "result",
+   "sourceHandle": "info",
+   "targetHandle": "edited"
+  },
+  {
+   "id": "e22",
+   "source": "review",
+   "target": "result",
+   "sourceHandle": "response",
+   "targetHandle": "review"
+  },
+  {
+   "id": "e23",
+   "source": "enhance",
+   "target": "result",
+   "sourceHandle": "response",
+   "targetHandle": "caption"
+  },
+  {
+   "id": "e24",
+   "source": "prompt",
+   "target": "result",
+   "sourceHandle": "text",
+   "targetHandle": "prompt"
+  },
+  {
+   "id": "e25",
+   "source": "edit",
+   "target": "result",
+   "sourceHandle": "text",
+   "targetHandle": "edit"
+  },
+  {
+   "id": "e26",
+   "source": "result",
+   "target": "out",
+   "sourceHandle": "default",
+   "targetHandle": "result"
+  }
+ ],
+ "oaiyTool": {
+  "name": "make_and_check_image",
+  "description": "Make a picture from a description (MOSS-Image, with the prompt enhanced first), optionally edit it (FLUX 3 Klein: say what to change in Edit, or leave Edit empty), and have a vision model check it for exact text, unintended text, colours, missing or extra objects, composition and whether the edit kept the rest. Returns the picture's file reference and the review's findings."
+ }
+}

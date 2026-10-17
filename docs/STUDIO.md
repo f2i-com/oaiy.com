@@ -486,6 +486,69 @@ header `X-OAIY-Incognito: 1` or a body field `"incognito": true`.
   `--expert-trace` or the expert-usage profile. The tool-call observer forgets
   its reviews afterwards.
 
+### Which model holds which GPU
+
+The studio decides when models load and go, for chats, pictures and the flows
+that use both ([IMAGE_FLOW.md](IMAGE_FLOW.md)). `GET /api/resources` on the
+control port shows it all at once:
+
+- `devices`: each GPU and its memory in use (the eGPU's from its server; a
+  Mac's GPU from Metal);
+- `models`: the language models (the eGPU's and this computer's), the picture
+  worker kept between pictures and the job running, each with its device and
+  state, its leases (chats being answered, a job running), whether it is
+  pinned, its size on disk and the memory its process holds, and how long it
+  has been idle and may stay;
+- `queue`: the job running and how many wait, out of `max_queued` (32);
+- `events`: the last 50 loads and unloads: `load`, `loaded`, `unload`,
+  `lend` (the card's language model let go for a media job), `give_back`,
+  `evict`, `retry` and `release`, each with its model, device and why.
+
+The rules, one GPU at a time:
+
+- A media job takes its GPU. On a Mac's eGPU the card is lent to it: its
+  language model is let go, and brought back after. On this computer's GPU a
+  language model sharing it is stopped first. A chat being answered always
+  finishes first.
+- **Keep it loaded** (`llm.pinned`, on the language model's settings) keeps
+  the language model where it is. Media then run on this computer's GPU, or
+  beside it, and the model is not stopped when idle. `POST /api/resources/release`
+  with `{"what": "language"}` is refused while it is pinned.
+- One picture worker is kept between pictures with its models, for
+  `media.keep_minutes` (2 unless set). It keeps MOSS-Image's and FLUX 3 Image
+  Klein's side by side (a picture made with one and edited with the other loads
+  nothing the second time; in Q4 both fit on a 24 GB card), Qwen Image's alone.
+  On a Mac's eGPU it runs their text encoders on the Mac's own GPU
+  (`OAIY_TEXT_ENCODER_GPU=own`): 3 s there against 9 to 45 s streamed to the card
+  a layer at a time, and the card's memory is left to the pictures' models. A chat that wants its GPU, a job that
+  asks for its models to go after it (`"release": true`, the image node's
+  **Free the picture model after this step**), or another worker that needs
+  the GPU ends it at once. `POST /api/resources/release` with
+  `{"what": "pictures"}` ends it by hand (`"language"` stops the idle language
+  model, `"all"` both).
+- Between the card's language model and a picture worker, either way, the next
+  waits until the card's launcher says the last one's memory is let go (up to
+  30 s): a model loaded into a card still holding the last one's buffers ran out
+  of memory, and a picture started beside them thrashed.
+- This computer's engine is not offered the models set to the eGPU: a request
+  naming one would load it here beside the card's copy. Only where the card does
+  not answer is its model (or `llm.egpu.fallback_model`) loaded here.
+- A job that runs out of GPU memory is tried once more with everything idle
+  let go (a `retry` event). A job cancelled with `POST /api/jobs/{id}/cancel`
+  is not retried.
+- One media job runs at a time, and up to 32 wait in order. Past that the
+  gateway answers `503` with "the media queue is full", and the caller tries
+  again later.
+
+Each job reports its timings (`timings` in `/api/jobs` and `/api/state`): the
+wait in the queue, each stage (`encoding_text`, `loading_transformer`,
+`sampling`, `decoding` and so on) with its seconds and the device's memory in
+use when it began, the total, the device, and the peak memory seen. An OpenAI
+images reply gives each picture an `oaiy` block (none in incognito): `file` (its
+URL on the gateway), `job`, `model`, its seed, steps, size and sampling times,
+and those `timings`. The same seed, prompt, size and model make the same
+picture again.
+
 ## The control port
 
 The UI port (`ui.port`, 7860) serves the page, a JSON API under `/api/`, the

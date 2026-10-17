@@ -39,6 +39,7 @@ for what OAIY is and how to build it.
 | [WEBGPU.md](WEBGPU.md) | The engines' GPU backend: WebGPU on any GPU, else the CPU. |
 | [MAC.md](MAC.md) | OAIY on an Apple-silicon Mac: building it there, its own GPU and the computer's memory, and a card in a Thunderbolt enclosure through tinygrad's server. |
 | [QWEN_IMAGE.md](QWEN_IMAGE.md) | Pictures and picture edits with Qwen Image 2.1, in Rust. |
+| [IMAGE_FLOW.md](IMAGE_FLOW.md) | A flow that makes a picture (MOSS-Image), edits it (FLUX 3 Klein) and has a vision model check it, from the editor, the chat or another program, the engines loading and letting go of each model; its benchmark. |
 | [SDXL.md](SDXL.md) | SDXL 1.0 checkpoints (and derivatives) in the media worker. |
 | [LTX_VIDEO.md](LTX_VIDEO.md) | Video from text or a picture with LTX, with its soundtrack. |
 | [SPEECH.md](SPEECH.md) | Speech with Qwen3-TTS and Breeze TTS 2, saved voices, and the real-time voice used on calls. |

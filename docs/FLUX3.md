@@ -30,6 +30,23 @@ transformer read from an external SSD, the VAE's decode):
 | Apple M5 Pro (Q8_0 weights) | 3.7 min (11.6 s a step) | | |
 | Apple M5 Pro (f16 weights) | 7.4 min (25.5 s a step) | 15.3 min | |
 
+The distilled checkpoint is a flow map, each step told the time it goes to, so it takes fewer steps as they are (a
+request's or the model entry's `steps`), and realrebelai's GGUFs of it load in a third of the time. An edit with one
+reference (a mug made blue and its lettering changed), 1024x1024, the same seed, on the RTX 4090 with the text encoder
+and the transformer read from an external SSD:
+
+| Transformer | Steps | Total | Loading it | Sampling | Card memory at most | PSNR against BF16, 16 steps |
+| --- | --- | --- | --- | --- | --- | --- |
+| BF16 safetensors (11.1 GB) | 16 | 59–93 s | 21–34 s | 25.8 s | 23.5 GB | |
+| BF16 | 8 | 40.4 s | 17.5 s | 12.0 s | 18.3 GB | 34.4 dB |
+| BF16 | 4 | 32.9 s | 16.9 s | 5.1 s | 16.7 GB | 28.6 dB |
+| Q4_K_M GGUF (3.4 GB) | 16 | 40.1 s | 8.6 s | 20.7 s | 14.1 GB | 26.5 dB |
+| Q4_K_M | 8 | 20.0 s | 3.4 s | 9.7 s | 8.5 GB | 32.9 dB |
+| Q4_K_M | 4 | 14.4 s | 3.6 s | 4.2 s | 8.5 GB | 28.5 dB |
+
+All six are the same edit by eye: the colour asked for, the lettering exact, the rest of the picture kept. The image flow
+([IMAGE_FLOW.md](IMAGE_FLOW.md)) edits with the Q4_K_M at 8 steps.
+
 ## Getting it
 
 The weights are gated on Hugging Face under the **FLUX Kommunity License** (non-commercial use, with a commercial-output
@@ -54,6 +71,31 @@ A model entry:
   "vae": "flux-3-image-klein/ae.safetensors"
 }
 ```
+
+The text encoder may be a GGUF too, in the folder's place: Qwen's own
+[Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF) (Q4_K_M, 2.5 GB against the
+folder's 8.3), its K-quant blocks made f16 as each layer loads, with the folder's `tokenizer.json` beside it (or named
+as `tokenizer`). Its states against the BF16 checkpoint's for an edit's prompt: cosine 0.980 on average, 0.970 at worst
+(`klein::webgpu::text`'s `flux3_text_from_a_gguf_is_the_checkpoints`); an edit made with it is the BF16 encoder's at
+44 dB. Loaded and run on a Mac's GPU from the internal SSD it takes 3.1 s, against 10.3 s for the folder from an
+external SSD.
+
+A quantized transformer serves in `model.safetensors`' place:
+[realrebelai/FLUX-3-Image-Klein_GGUFs](https://huggingface.co/realrebelai/FLUX-3-Image-Klein_GGUFs) has both checkpoints
+(`DISTILLED/` and `BASE/`, Q4_0 to Q8_0; BFL's tensor names, its K-quant blocks run as they are), with BFL's text encoder
+and VAE beside it. The distilled Q4_K_M at 8 steps:
+
+```json
+"flux-3-image-klein-q4-8-step": {
+  "architecture": "flux3-klein",
+  "transformer": "FLUX-3-Image-Klein-Q4/flux3_image_klein_sd-Q4_K_M.gguf",
+  "text_encoder": "FLUX-3-Image-Klein-Q4/Qwen3VL-4B-Instruct-Q4_K_M.gguf",
+  "vae": "FLUX-3-Image-Klein-Q4/ae.safetensors",
+  "steps": 8
+}
+```
+
+(`tokenizer.json` beside the text encoder's GGUF.)
 
 Optional: `tokenizer` (else the text encoder folder's `tokenizer.json`), `steps` and `cfg` (else the checkpoint's own),
 `reference_pixels` (a single reference's canvas at most this many pixels; OAIY's default is 1 MiB, BFL's own 4 MiB),
