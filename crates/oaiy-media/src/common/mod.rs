@@ -12,3 +12,5 @@ pub mod weights;
 pub mod qwen3_webgpu;
 #[cfg(feature = "webgpu")]
 pub mod webgpu_weights;
+#[cfg(test)]
+pub(crate) mod timing;

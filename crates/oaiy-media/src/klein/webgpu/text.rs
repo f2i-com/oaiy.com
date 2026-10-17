@@ -4,12 +4,15 @@
 //! FLUX 3 Image Klein's ([`FLUX3`]: Qwen3-VL-4B's language model, as BFL's `flux3/text_encoder.py` encodes a prompt)
 //! the same but for its taps (every fourth layer's to the 32nd: 20,480 wide), its RoPE's base, its padding (to the
 //! next multiple of 80 tokens, at most 4,096) and its padded positions' rotation (all at position 1).
-//! The weights f16 on the GPU (the BF16 checkpoint's rounded) a layer at a time, every prompt through it (its 5.4 GB
-//! never all on the card), the embedding's rows looked up on the host; the matmuls read their inputs as f32 (an LLM's
-//! hidden states reach some hundreds).
-use crate::common::weights::Weights;
+//! The weights on the GPU a layer at a time, every prompt through it (its 5.4 GB never all on the card): a GGUF's
+//! K-quant blocks as they are (the 4-bit file's 2.5 GB sent, where its rows were made 8 GB of halves on the host for
+//! each picture, 2.5 s of a 3.3 s encode), anything else f16 (the BF16 checkpoint's rounded); the embedding's rows of a
+//! prompt's tokens alone read from the file (not the whole table made f32, 1.5 GB, at each load). The f16 matmuls read
+//! their inputs as f32 (an LLM's hidden states reach some hundreds).
+use crate::common::weights::{Raw, Weights};
+use crate::qwen_image::webgpu::transformer::coop_type;
 use candle_core::{DType, Device, Result, Tensor};
-use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec};
+use ggml_rs::{Backend, ChainRecorder, DeviceChain, DeviceVec, QuantizedTensor};
 use std::path::Path;
 
 const D: usize = 2560;
@@ -73,10 +76,20 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
 }
 
 /// A matrix on the GPU as f16 (`[n, k]`).
-struct Mat {
-    v: DeviceVec,
-    n: usize,
-    k: usize,
+/// A matrix on the GPU: a GGUF's K-quant blocks, or f16.
+enum Mat {
+    F16 { v: DeviceVec, n: usize, k: usize },
+    Quant(QuantizedTensor),
+}
+
+impl Mat {
+    /// `y` (`[rows, n]`) = `x` (`[rows, k]`, f32) times the matrix's transpose.
+    fn run(&self, r: &mut dyn ChainRecorder, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        match self {
+            Self::F16 { v, n, k } => r.matmul_f16_rows_f32(v, *n, *k, x, y, rows),
+            Self::Quant(q) => r.matmul_rows(q, x, y, rows),
+        }
+    }
 }
 
 struct Layer {
@@ -96,8 +109,8 @@ struct Layer {
 pub struct WgpuKleinText {
     gpu: ggml_rs_wgpu::WgpuBackend,
     spec: Spec,
-    /// The token embedding (`[vocab, D]`), on the host: a prompt's rows looked up there.
-    embedding: Vec<f32>,
+    /// The token embedding's rows (`[vocab, D]`): a prompt's read from the file as it is encoded.
+    vocab: usize,
     /// The weights, a layer's read as the prompts reach it.
     w: Weights,
     /// The MLP's width.
@@ -141,7 +154,7 @@ impl WgpuKleinText {
     /// [`Self::load`] of the text encoder `spec` says.
     pub fn load_spec(checkpoint: &Path, tokenizer: &Path, device: usize, spec: Spec) -> Result<Self> {
         let gpu = crate::common::webgpu_weights::text_encoder_gpu(device)?;
-        let mut w = Weights::open(checkpoint)?;
+        let w = Weights::open(checkpoint)?;
         let p = spec.prefix;
         let shape = |w: &Weights, name: &str| w.shape(&format!("{p}layers.0.{name}.weight"));
         let last = spec.taps.iter().copied().max().unwrap_or(0);
@@ -151,7 +164,7 @@ impl WgpuKleinText {
         if embedding != [151936, D] || q != [HEADS * HD, D] || k != [KV_HEADS * HD, D] || gate.len() != 2 || gate[1] != D || !w.has(&format!("{p}layers.{}.mlp.down_proj.weight", last - 1)) {
             candle_core::bail!("{}", spec.what);
         }
-        let embedding = w.tensor(&format!("{p}embed_tokens.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let vocab = embedding[0];
         let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer).map_err(err)?;
         tokenizer.with_padding(None);
         tokenizer.with_truncation(None).map_err(err)?;
@@ -160,7 +173,12 @@ impl WgpuKleinText {
                 candle_core::bail!("incompatible Qwen3 tokenizer: {token} must have id {id}");
             }
         }
-        Ok(Self { gpu, spec, embedding, w, ff: gate[0], tokenizer })
+        Ok(Self { gpu, spec, vocab, w, ff: gate[0], tokenizer })
+    }
+
+    /// The GPU it is on.
+    pub fn backend(&self) -> &ggml_rs_wgpu::WgpuBackend {
+        &self.gpu
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
@@ -174,8 +192,19 @@ impl WgpuKleinText {
         let mut none = crate::common::lora::Loras::open(&[])?;
         let w = &mut self.w;
         let mut mat = |w: &mut Weights, name: &str| -> Result<Mat> {
+            let key = format!("{p}.{name}.weight");
+            if let Some(g) = w.ggml_dtype(&key).and_then(coop_type) {
+                if let (&[n, k], Some(Raw::Ggml(_, bytes))) = (w.shape(&key)?.as_slice(), w.raw(&key)?) {
+                    if k % 256 == 0 {
+                        let q = gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], g));
+                        if q.is_device() {
+                            return Ok(Mat::Quant(q));
+                        }
+                    }
+                }
+            }
             let (v, n, k) = crate::common::webgpu_weights::f16_matrix(w, gpu, &format!("{p}.{name}"), &mut none)?;
-            Ok(Mat { v, n, k })
+            Ok(Mat::F16 { v, n, k })
         };
         let vector = |w: &mut Weights, name: &str| -> Result<DeviceVec> {
             let values = w.tensor(&format!("{p}.{name}.weight"), &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -206,7 +235,8 @@ impl WgpuKleinText {
 
     /// Each prompt's conditioning, every prompt through a layer while its weights are on the card.
     pub fn encode_all(&mut self, prompts: &[&str]) -> Result<Vec<Tensor>> {
-        let (ff, vocab, spec) = (self.ff, self.embedding.len() / D, self.spec);
+        let (ff, vocab, spec) = (self.ff, self.vocab, self.spec);
+        let embedding = format!("{}embed_tokens.weight", spec.prefix);
         let (qd, kd) = (HEADS * HD, KV_HEADS * HD);
         let row = 2 * kd;
         let pad = self.tokenizer.token_to_id("<|endoftext|>").ok_or_else(|| err("Qwen3 tokenizer lacks its padding token"))?;
@@ -232,14 +262,10 @@ impl WgpuKleinText {
                     table.push(a.cos() as f32);
                 }
             }
-            let mut x0 = Vec::with_capacity(seq * D);
-            for &id in &ids {
-                let id = id as usize;
-                if id >= vocab {
-                    candle_core::bail!("token {id} past the embedding's {vocab}");
-                }
-                x0.extend_from_slice(&self.embedding[id * D..(id + 1) * D]);
+            if let Some(id) = ids.iter().find(|&&id| id as usize >= vocab) {
+                candle_core::bail!("token {id} past the embedding's {vocab}");
             }
+            let x0 = self.w.rows(&embedding, &ids)?;
             let padded = seq - valid;
             let p = Prompt {
                 valid,
@@ -278,7 +304,7 @@ impl WgpuKleinText {
             for p in &all {
                 let (valid, seq) = (p.valid, p.seq);
                 let padded = seq - valid;
-                let mul = |r: &mut dyn ChainRecorder, m: &Mat, a: &DeviceVec, y: &DeviceVec| r.matmul_f16_rows_f32(&m.v, m.n, m.k, a, y, seq);
+                let mul = |r: &mut dyn ChainRecorder, m: &Mat, a: &DeviceVec, y: &DeviceVec| m.run(r, a, y, seq);
                 r.rmsnorm_rows(&p.x, &l.input, &p.norm, seq, EPS);
                 mul(r, &l.q, &p.norm, &p.q);
                 mul(r, &l.k, &p.norm, &p.k);

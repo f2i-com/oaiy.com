@@ -280,6 +280,16 @@ fn json_call(block: &str, tools: &[Json]) -> Result<String, String> {
     Ok(out)
 }
 
+/// How far into a prompt of `len` keys its state may be kept on (and taken from) the disk: all of it, but for a
+/// prompt with pictures where the disk's namespace does not fingerprint the vision pipeline, the text before its first
+/// picture alone.
+fn text_until(job: &Job, image_disk_cache: bool, len: usize) -> usize {
+    match job.images.iter().map(|i| i.start).min() {
+        Some(first) if !image_disk_cache => first,
+        _ => len,
+    }
+}
+
 /// The start of a rejected tool call, as the model wrote it, for the error.
 fn call_excerpt(raw: &str) -> String {
     let from = raw.find("<tool_call").unwrap_or(0);
@@ -982,8 +992,12 @@ impl QwenEngine {
         }
         // Persist images only when the caller identifies both the projector and
         // preprocessing version. The prompt keys also include the image bytes.
-        if let Some(model) = model.filter(|_| job.images.is_empty() || self.image_disk_cache) {
-            if let Some((saved, snap)) = self.disk.as_mut().and_then(|d| d.load_best(&keys, keys.len()-1, start, self.log)) {
+        // The text before a prompt's first picture is text like any other (a
+        // picture-reviewing step's long instructions): its state comes from
+        // the disk whatever follows it.
+        let text_until = text_until(job, self.image_disk_cache, keys.len());
+        if let Some(model) = model.filter(|_| text_until > 0) {
+            if let Some((saved, snap)) = self.disk.as_mut().and_then(|d| d.load_best(&keys, text_until.min(keys.len()-1), start, self.log)) {
                 match snap.restore(&mut self.kv, &model.attention_layers, model.ssm_cfg, model.backend.as_ref()) {
                     Ok(()) => {
                         // A disk restore replaces the attention buffers. Even
@@ -1350,9 +1364,11 @@ impl QwenEngine {
         }
         // and the disk's whole states of them, once the engine is idle (disk states are the Qwen3.5 hybrid's and
         // Flash-Next's, of text; memory checkpoints any model's): `save_unsaved`
-        let stored = (self.model.qwen35().is_some() && (job.images.is_empty() || self.image_disk_cache)) || (self.model.row_slots().is_some() && job.images.is_empty());
+        // (of a prompt with pictures, without the vision pipeline's own namespace: what is before the first, text,
+        // as `text_until` was above)
+        let stored = self.model.qwen35().is_some() || (self.model.row_slots().is_some() && job.images.is_empty());
         if let Some(disk) = self.disk.as_ref().filter(|_| stored && !job.forget) {
-            for &at in &to_disk {
+            for &at in to_disk.iter().filter(|&&at| at <= text_until) {
                 let saved = keys[..at].to_vec();
                 if !disk.has(&saved) && !self.unsaved.contains(&saved) {
                     self.unsaved.push(saved);

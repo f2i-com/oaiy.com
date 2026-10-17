@@ -205,6 +205,9 @@ pub struct Kept {
     gpu: Option<(usize, ggml_rs_wgpu::WgpuBackend)>,
     model: Option<(String, webgpu::WgpuFlux3)>,
     vae: Option<((String, bool), Vae)>,
+    /// The text encoder, by its files (its weights still read a layer at a time as it encodes: kept, it is the file
+    /// opened and the tokenizer read once, not each picture).
+    text: Option<(String, crate::klein::webgpu::text::WgpuKleinText)>,
 }
 
 #[cfg(feature = "webgpu")]
@@ -248,9 +251,19 @@ fn generate_inner(r: &Request, mut kept: Option<&mut Kept>, noise: impl Fn(u64, 
     let clock = Instant::now();
     event(Json::obj([("stage", Json::str("encoding_text")), ("architecture", Json::str("flux3-klein"))]));
     let (contexts, empty) = {
-        let mut encoder = crate::klein::webgpu::text::WgpuKleinText::load_spec(&r.text_encoder, &r.tokenizer, r.device, crate::klein::webgpu::text::FLUX3)?;
+        let text_key = format!("{}|{}|{}", r.text_encoder.display(), r.tokenizer.display(), r.device);
+        let had = kept.as_deref_mut().and_then(|k| k.text.take()).filter(|(key, _)| *key == text_key).map(|(_, t)| t);
+        let mut encoder = match had {
+            Some(t) => t,
+            None => crate::klein::webgpu::text::WgpuKleinText::load_spec(&r.text_encoder, &r.tokenizer, r.device, crate::klein::webgpu::text::FLUX3)?,
+        };
         let prompts: Vec<&str> = r.prompts.iter().map(String::as_str).chain(guidance.map(|_| "")).collect();
         let mut all = encoder.encode_all(&prompts)?;
+        if let Some(k) = kept.as_deref_mut() {
+            // (its scratch let go: the steps want the room)
+            encoder.backend().release_cached();
+            k.text = Some((text_key, encoder));
+        }
         let empty = if guidance.is_some() { all.pop() } else { None };
         let host = |t: candle_core::Tensor| -> candle_core::Result<(Vec<f32>, usize)> { Ok((t.flatten_all()?.to_vec1::<f32>()?, t.dim(1)?)) };
         (all.into_iter().map(host).collect::<candle_core::Result<Vec<_>>>()?, empty.map(host).transpose()?)
@@ -262,7 +275,7 @@ fn generate_inner(r: &Request, mut kept: Option<&mut Kept>, noise: impl Fn(u64, 
         None => {
             let g = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(crate::qwen_image::webgpu::transformer::err)?;
             if let Some(k) = kept.as_deref_mut() {
-                *k = Kept { gpu: Some((r.device, g.clone())), ..Kept::default() };
+                *k = Kept { gpu: Some((r.device, g.clone())), text: k.text.take(), ..Kept::default() };
             }
             g
         }
