@@ -475,8 +475,23 @@ fn webgpu_media_goes_to_the_egpu_where_it_runs_oaiys_engine() {
     // speech takes the card only where it is lent already or holds no language model; the rest take it
     assert!(takes_card(Kind::Speech, true, true) && takes_card(Kind::Speech, false, false) && !takes_card(Kind::Speech, false, true));
     assert!(takes_card(Kind::Music, false, true) && takes_card(Kind::Image, false, true));
-    // (the kept worker takes Qwen Image pictures; the others are a worker's of their own)
+    // (the kept worker takes Qwen Image and MOSS-Image pictures; the others are a worker's of their own)
     assert!(kept_on_card(Kind::Image, &qwen) && !kept_on_card(Kind::Image, &sdxl) && !kept_on_card(Kind::Music, &body("{}")));
+    let moss = body(r#"{"architecture":"moss-image","transformer":"t.gguf","distill":"g.safetensors"}"#);
+    assert!(kept_on_card(Kind::Image, &moss) && kept_here(Kind::Image, &moss));
+    // the keep time: the settings' minutes (0: none), else two minutes
+    assert_eq!(keep_for(&c), std::time::Duration::from_secs(120));
+    for (minutes, seconds) in [("0", 0.), ("0.5", 30.), ("30", 1800.)] {
+        crate::util::set(crate::models::registry::obj_mut(&mut c, &["media"]).unwrap(), "keep_minutes", body(minutes));
+        assert_eq!(keep_for(&c), std::time::Duration::from_secs_f64(seconds), "{minutes}");
+        config::validate(&c).unwrap();
+    }
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["media"]).unwrap(), "keep_minutes", Json::Null);
+    assert_eq!(keep_for(&c), std::time::Duration::from_secs(120), "empty: the default");
+    config::validate(&c).unwrap();
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["media"]).unwrap(), "keep_minutes", body("-1"));
+    assert!(config::validate(&c).is_err());
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["media"]).unwrap(), "keep_minutes", body("2"));
     assert!(!on_card(&c, Kind::Image, &body(r#"{"base":"b","backend":"cpu"}"#)), "not on WebGPU");
     // pictures and the rest each switched off on their own
     crate::util::set(crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap(), "egpu", body(r#"{"enabled":true,"engine":"webgpu","images":false}"#));

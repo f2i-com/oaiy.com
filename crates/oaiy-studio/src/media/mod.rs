@@ -177,10 +177,11 @@ struct Broker {
 }
 
 /// The image worker kept between pictures (`oaiy-media --serve`), on the eGPU's card or on this computer's GPU: it keeps
-/// the models a job loaded for the next that names the same files (a picture's 5 s of loading on the card; on an NVIDIA
-/// A2 in a Thunderbolt enclosure, 12 s of a 1024x1024 picture's 118). On the card it is let go when no picture has come
-/// for [`KEEP_CARD`], when a chat waits for the card, or when the card is not lent any more; on this computer's GPU when
-/// no picture has come for as long, at once where a language model there runs or waits to come back, and whenever one
+/// the models a job loaded for the next that names the same files (a Qwen Image picture's 5 s of loading on the card;
+/// on an NVIDIA A2 in a Thunderbolt enclosure, 12 s of a 1024x1024 picture's 118; a 4-bit MOSS-Image distillation's
+/// picture 7.6 s on the card where it took 24). On the card it is let go when no picture has come for the keep time
+/// ([`keep_for`]), when a chat waits for the card, or when the card is not lent any more; on this computer's GPU when no
+/// picture has come for as long, at once where a language model there runs or waits to come back, and whenever one
 /// starts ([`Media::let_go_local`]).
 struct Serving {
     child: std::process::Child,
@@ -201,8 +202,15 @@ enum Said {
     Gone,
 }
 
-/// How long the kept image worker (and the lent card) waits for another picture.
+/// How long the kept image worker (and the lent card) waits for another picture, unless the settings say
+/// (`media.keep_minutes`).
 const KEEP_CARD: Duration = Duration::from_secs(120);
+
+/// How long the kept image worker (and the lent card) waits for another picture: `media.keep_minutes` (0: it is let go
+/// after each), else [`KEEP_CARD`].
+fn keep_for(cfg: &Json) -> Duration {
+    cfg.get("media").and_then(|m| m.get("keep_minutes")).and_then(Json::as_f64).filter(|m| m.is_finite() && *m >= 0.).map_or(KEEP_CARD, |m| Duration::from_secs_f64(m * 60.))
+}
 
 pub struct Media {
     serving: Mutex<Option<Serving>>,
@@ -213,7 +221,8 @@ pub struct Media {
     queue_signal: Condvar,
     pub log: Arc<LogRing>,
     /// When a job of a worker of its own (not the kept one's) last ended on the card: the card is kept for another
-    /// for [`KEEP_CARD`], as the kept worker keeps it for a picture (each lending's end loads the language model again).
+    /// for the keep time ([`keep_for`]), as the kept worker keeps it for a picture (each lending's end loads the language
+    /// model again).
     card_used: Mutex<Option<std::time::Instant>>,
 }
 
@@ -1090,14 +1099,14 @@ fn takes_card(kind: Kind, lent: bool, llm_loaded: bool) -> bool {
     kind != Kind::Speech || lent || !llm_loaded
 }
 
-/// Whether a job on the card is the kept worker's (`oaiy-media --serve`, which takes Qwen Image pictures alone): the
-/// others are a worker's of their own, as on this computer.
+/// Whether a job on the card is the kept worker's (`oaiy-media --serve`, which takes Qwen Image and MOSS-Image pictures):
+/// the others are a worker's of their own, as on this computer.
 fn kept_on_card(kind: Kind, request: &Json) -> bool {
-    kind == Kind::Image && request.get("architecture").is_none_or(|a| a.as_str() == Some("qwen-image"))
+    kind == Kind::Image && request.get("architecture").is_none_or(|a| matches!(a.as_str(), Some("qwen-image" | "moss-image")))
 }
 
-/// Whether a job on this computer's GPU is the kept worker's: a Qwen Image picture on WebGPU (the models the worker
-/// keeps are WebGPU's alone).
+/// Whether a job on this computer's GPU is the kept worker's: a Qwen Image or MOSS-Image picture on WebGPU (the models
+/// the worker keeps are WebGPU's alone).
 fn kept_here(kind: Kind, request: &Json) -> bool {
     kept_on_card(kind, request) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
 }
@@ -1433,7 +1442,7 @@ impl Media {
                     // (The eGPU's card likewise, once its kept worker has waited for another picture for long enough,
                     // or at once where a chat waits for the card.)
                     if studio.egpu.is_lent() {
-                        if self.lingers() && !studio.egpu.wanted() {
+                        if self.lingers(keep_for(&studio.config())) && !studio.egpu.wanted() {
                             jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
                             continue;
                         }
@@ -1447,7 +1456,7 @@ impl Media {
                     // (a picture worker kept on this computer's GPU waits for another picture as the card's does, where no
                     // language model there runs or waits to come back)
                     if self.serving.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
-                        if self.lingers_here(studio) {
+                        if self.lingers_here(studio, keep_for(&studio.config())) {
                             jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
                             continue;
                         }
@@ -1600,17 +1609,17 @@ impl Media {
         result
     }
 
-    /// Whether the card is kept for another job: the kept worker has waited less than [`KEEP_CARD`] for another
-    /// picture, or a job of a worker of its own ended on the card less than that ago.
-    fn lingers(&self) -> bool {
-        self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < KEEP_CARD)
-            || self.card_used.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() < KEEP_CARD)
+    /// Whether the card is kept for another job: the kept worker has waited less than `keep` for another picture, or a
+    /// job of a worker of its own ended on the card less than that ago.
+    fn lingers(&self, keep: Duration) -> bool {
+        self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < keep)
+            || self.card_used.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() < keep)
     }
 
     /// Whether the picture worker kept on this computer's GPU waits for another picture: it has waited less than
-    /// [`KEEP_CARD`], and no language model that shares the GPU runs, starts or waits for media to end.
-    fn lingers_here(&self, studio: &crate::Studio) -> bool {
-        let idle = self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.local && s.idle_since.elapsed() < KEEP_CARD);
+    /// `keep`, and no language model that shares the GPU runs, starts or waits for media to end.
+    fn lingers_here(&self, studio: &crate::Studio, keep: Duration) -> bool {
+        let idle = self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.local && s.idle_since.elapsed() < keep);
         idle && (!pauses_llm(&studio.config()) || !(studio.llm.is_running() || studio.llm.paused()))
     }
 

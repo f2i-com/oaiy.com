@@ -119,3 +119,20 @@ At 1024x1024, everything counted:
 | RTX 4090 (eGPU), OpenMOSS's weights | 8.6 s | 54 s (most of it reading 28 GB from an external SSD) |
 | RTX 4090, the 4-bit set (Q4_K_M GGUFs) | 7.2 s | 21 s |
 | Apple M5 Pro (Q8_0) | 116 s | 158 s (some 21 minutes for the 50 guided steps) |
+
+Between pictures the studio keeps the worker (`oaiy-media --serve`), and with it the text encoder, the transformer and
+its distillation and the VAE, for as long as the Memory page's **Keep the picture model loaded** says (2 minutes unless set; 0
+lets it go after each picture), or until a chat wants the GPU. The text states of its last 16 prompts are kept too. A
+GGUF text encoder's layers stay on a card (the 4-bit 9B's 5.5 GB). A checkpoint's 18 GB of f16 do not fit beside the
+f16 transformer on 24 GB, so it goes on reading them a layer at a time; on a Mac, whose GPU memory is the computer's,
+it does that too. On the RTX 4090 at 1024x1024, the kept worker alone:
+
+| Picture | The 4-bit set | OpenMOSS's weights |
+| --- | --- | --- |
+| The first (everything loaded) | 24.4 s | 49.7 s |
+| The next, a new prompt | 7.6 s | 33.3 s (its text encoder read again) |
+| The next, a prompt it has had | 7.4 s | 9.8 s |
+
+Through OAIY's API, the card lent from its language model first, the 4-bit set's first picture took 29.5 s and each
+next one with a new prompt 8.6 s. A chat while the worker waits takes the card back at once; the language model then
+loads again (the 35B some 100 s), as after any picture on the card.

@@ -938,6 +938,7 @@ dialog::backdrop { background: var(--backdrop); }
             <option value="pause_llm">Always pause the LLM</option>
             <option value="coexist">Never pause (both fit)</option></select></label>
           <div class="f"><span></span><label class="check"><input type="checkbox" id="resume-llm"> Restart the LLM after media jobs</label></div>
+          <label class="f"><span>Keep the picture model loaded (minutes)</span><input type="number" min="0" max="1440" step="0.5" data-bind="media.keep_minutes" data-type="numnull" placeholder="2"><small class="help">After a picture its models wait this long for the next, which then takes seconds, not a reload. A chat that needs the GPU takes it back at once. 0 = unload after each picture; empty = 2.</small></label>
         </div>
         <p class="muted small" id="share-note"></p>
       </div>

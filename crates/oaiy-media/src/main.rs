@@ -147,13 +147,16 @@ fn run() -> candle_core::Result<()> {
     Ok(())
 }
 
-/// `oaiy-media --serve`: Qwen Image jobs one after another, each a line of JSON on standard input, each one's answer a
-/// line on standard output (its result, or `{"error": ...}`), its events on standard error as a job's are. The models a
-/// job loads are kept for the next that names the same files (`pipeline::Kept`): a worker that OAIY keeps while
-/// pictures come one after another. It ends when its standard input does.
+/// `oaiy-media --serve`: Qwen Image and MOSS-Image jobs one after another, each a line of JSON on standard input, each
+/// one's answer a line on standard output (its result, or `{"error": ...}`), its events on standard error as a job's
+/// are. The models a job loads are kept for the next that names the same files (`pipeline::Kept`, `moss_image::Kept`;
+/// one family's at a time, the other's let go first): a worker that OAIY keeps while pictures come one after another.
+/// It ends when its standard input does.
 fn serve() -> candle_core::Result<()> {
     use std::io::BufRead;
     let mut kept = oaiy_media::qwen_image::pipeline::Kept::default();
+    #[cfg(feature = "webgpu")]
+    let mut moss = oaiy_media::moss_image::Kept::default();
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -161,8 +164,18 @@ fn serve() -> candle_core::Result<()> {
         }
         let answer = (|| -> candle_core::Result<Json> {
             let j = Json::parse(line.as_bytes()).map_err(candle_core::Error::wrap)?;
+            #[cfg(feature = "webgpu")]
+            if j.get("architecture").and_then(Json::as_str) == Some("moss-image") && j.get("kind").is_none() {
+                kept = oaiy_media::qwen_image::pipeline::Kept::default();
+                let r = oaiy_media::moss_image::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+                return oaiy_media::moss_image::generate_kept(&r, &mut moss, |event| eprintln!("{}", event.to_json()));
+            }
             if j.get("architecture").is_some_and(|a| a.as_str() != Some("qwen-image")) || j.get("kind").is_some() {
-                candle_core::bail!("a worker that serves takes Qwen Image jobs");
+                candle_core::bail!("a worker that serves takes Qwen Image and MOSS-Image jobs");
+            }
+            #[cfg(feature = "webgpu")]
+            {
+                moss = oaiy_media::moss_image::Kept::default();
             }
             let r = oaiy_media::qwen_image::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
             configure_cache(&r.output)?;
@@ -171,6 +184,10 @@ fn serve() -> candle_core::Result<()> {
         let answer = answer.unwrap_or_else(|e| {
             // (what it had is let go: a job that failed may have left a model half made)
             kept = oaiy_media::qwen_image::pipeline::Kept::default();
+            #[cfg(feature = "webgpu")]
+            {
+                moss = oaiy_media::moss_image::Kept::default();
+            }
             Json::obj([("error", Json::str(e.to_string()))])
         });
         let mut out = std::io::stdout().lock();

@@ -546,7 +546,8 @@ sections are:
   [MAC.md](MAC.md#a-card-in-a-thunderbolt-enclosure-through-tinygrad). The section is read
   nowhere else.
 - `media`: `worker`, `output_dir`, `device`, `llm_policy`, `resume_llm`,
-  `keep_jobs`, and:
+  `keep_jobs`, `keep_minutes` (how long a picture's models stay loaded for the next, on the eGPU or this computer's
+  GPU: 2 by default, 0 lets them go after each; a chat that needs the GPU takes it back at once), and:
   - `image`: `enabled`, `default_model`, `memory`, `ram_gb`, `vram_gb` (null =
     free VRAM), and `models`. Each model has `architecture` (`qwen-image`: `base`,
     `transformer` or `safetensors_transformer`, `adapter`, `loras` (`[{path, strength}]`), `text_encoder`; `sdxl`:

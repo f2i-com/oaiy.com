@@ -89,6 +89,7 @@ pub const DEFAULT: &str = r#"{
     "llm_policy": "auto",
     "resume_llm": true,
     "keep_jobs": 200,
+    "keep_minutes": 2,
     "image": {
       "enabled": true,
       "default_model": "",
@@ -579,6 +580,10 @@ pub fn validate(v: &Json) -> Result<(), String> {
     }
     if !LLM_POLICIES.contains(&str_or(media, "llm_policy", "auto")) {
         return Err(format!("media.llm_policy must be one of {}", LLM_POLICIES.join(", ")));
+    }
+    // (how long a picture's models wait for the next: 0 lets them go after each, a day at most)
+    if media.get("keep_minutes").is_some_and(|v| !matches!(v, Json::Null) && !v.as_f64().is_some_and(|m| m.is_finite() && (0.0..=1440.0).contains(&m))) {
+        return Err("media.keep_minutes must be a number of minutes from 0 to 1440".into());
     }
     let image = object(media, "image")?;
     memory(image, "media.image")?;

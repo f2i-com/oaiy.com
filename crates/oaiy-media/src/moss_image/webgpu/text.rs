@@ -263,6 +263,9 @@ pub struct WgpuMossText {
     names: Names,
     layers: usize,
     tok: Tok,
+    /// The layers it keeps on the GPU between prompts, where it is kept ([`Self::keep_layers`]).
+    resident: Vec<Option<Layer>>,
+    keep: bool,
 }
 
 impl WgpuMossText {
@@ -303,7 +306,22 @@ impl WgpuMossText {
             None if names == Names::Gguf => Tok::Gguf(tokenizer::Tokenizer::from_gguf(&gguf::GgufFile::open(checkpoint).map_err(err)?).map_err(err)?),
             None => candle_core::bail!("MOSS-Image's text encoder needs Qwen3.5's tokenizer.json"),
         };
-        Ok(Self { gpu, w, names, layers, tok })
+        Ok(Self { gpu, w, names, layers, tok, resident: (0..layers).map(|_| None).collect(), keep: false })
+    }
+
+    /// Keep its layers on the GPU from one prompt to the next (a worker kept between pictures: the 4-bit GGUF's 5.5 GB
+    /// once, not read and sent each picture), or let them go.
+    pub fn keep_layers(&mut self, keep: bool) {
+        self.keep = keep;
+        if !keep && self.resident.iter().any(Option::is_some) {
+            self.resident.iter_mut().for_each(|l| *l = None);
+            self.gpu.release_cached();
+        }
+    }
+
+    /// The GPU it is on.
+    pub fn backend(&self) -> &ggml_rs_wgpu::WgpuBackend {
+        &self.gpu
     }
 
     /// The prompt's tokens as the pipeline makes them: its chat template, at most [`MAX_TOKENS`].
@@ -527,7 +545,10 @@ impl WgpuMossText {
         }
         let work = ids.iter().map(|i| self.work(i)).collect::<Result<Vec<_>>>()?;
         for i in 0..layers.min(self.layers) {
-            let layer = self.layer(i)?;
+            let layer = match self.resident[i].take() {
+                Some(l) => l,
+                None => self.layer(i)?,
+            };
             for p in &work {
                 // (each delta net's recurrence from nothing: its conv window and state zero)
                 if matches!(layer.mixer, Mixer::Delta { .. }) {
@@ -539,7 +560,11 @@ impl WgpuMossText {
                 Self::record(rec.as_mut(), &layer, p);
                 rec.finish();
             }
-            drop(layer);
+            if self.keep {
+                self.resident[i] = Some(layer);
+            } else {
+                drop(layer);
+            }
             self.gpu.settle();
         }
         let key = self.names.final_norm();

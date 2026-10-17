@@ -204,46 +204,151 @@ pub fn generate(_: &Request, _: impl FnMut(Json)) -> candle_core::Result<Json> {
     candle_core::bail!("this build has no WebGPU (the webgpu feature)")
 }
 
+/// What a worker that takes job after job (`oaiy-media --serve`) keeps of a MOSS-Image job for the next that names the
+/// same files: its text encoder, its transformer with its distillation, its VAE's decoder, and its last prompts' text
+/// states. The text encoder's layers stay on the GPU where it is a GGUF on a card of its own (the 4-bit 9B's 5.5 GB once,
+/// not read and sent each picture); a checkpoint's 18 GB, and a Mac's GPU (its memory the computer's), go on reading
+/// them a layer at a time.
+#[cfg(feature = "webgpu")]
+#[derive(Default)]
+pub struct Kept {
+    text: Option<(String, webgpu::text::WgpuMossText)>,
+    model: Option<(String, webgpu::WgpuMoss, Option<distill::Distillation>)>,
+    vae: Option<(String, Vae)>,
+    /// Text states by text encoder and prompt, the latest last ([`PROMPTS_KEPT`] at most).
+    prompts: Vec<(String, String, Vec<f32>, usize)>,
+}
+
+#[cfg(feature = "webgpu")]
+type Vae = (crate::sdxl::webgpu::vae::WgpuSdxlVae, Vec<f32>, Vec<f32>);
+
+/// The prompts whose text states a kept worker keeps (some 0.2 to 8 MB each).
+#[cfg(feature = "webgpu")]
+const PROMPTS_KEPT: usize = 16;
+
+#[cfg(feature = "webgpu")]
+impl Kept {
+    /// What it holds (for the worker's log).
+    pub fn holds(&self) -> Vec<&str> {
+        [self.text.as_ref().map(|_| "text encoder"), self.model.as_ref().map(|_| "transformer"), self.vae.as_ref().map(|_| "decoder")].into_iter().flatten().collect()
+    }
+}
+
 /// [`generate`], each picture's starting noise `noise(seed, values)` (its tokens' channels, a token a row; a test gives
 /// the pipeline's own).
 #[cfg(feature = "webgpu")]
-pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut event: impl FnMut(Json)) -> candle_core::Result<Json> {
+pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, event: impl FnMut(Json)) -> candle_core::Result<Json> {
+    generate_kept_with(r, None, noise, event)
+}
+
+/// [`generate`] by a worker kept between jobs: the models `kept` holds for these files used, and what it loads kept
+/// for the next job.
+#[cfg(feature = "webgpu")]
+pub fn generate_kept(r: &Request, kept: &mut Kept, event: impl FnMut(Json)) -> candle_core::Result<Json> {
+    generate_kept_with(r, Some(kept), crate::common::job::noise, event)
+}
+
+/// [`generate_with`] and [`generate_kept`]: `kept`'s models where it has them for these files.
+#[cfg(feature = "webgpu")]
+fn generate_kept_with(r: &Request, mut kept: Option<&mut Kept>, noise: impl Fn(u64, usize) -> Vec<f32>, mut event: impl FnMut(Json)) -> candle_core::Result<Json> {
     use crate::klein::vae;
     use crate::moss_image::webgpu::{text::WgpuMossText, Config, WgpuMoss};
     use candle_core::bail;
-    // the transformer's header first: which checkpoint, before anything is loaded; a distillation's codes
+    // the transformer's header first: which checkpoint, before anything is loaded
     let cfg = Config::of(&crate::common::weights::Weights::open(&r.transformer)?)?;
-    let mut distill = r.distill.as_deref().map(distill::Distillation::open).transpose()?;
-    if let Some(d) = &distill {
-        if r.steps > d.codes.len() {
-            bail!("the distillation makes a picture in at most {} passes, not {}", d.codes.len(), r.steps);
-        }
-        if d.channels != cfg.channels {
-            bail!("the distillation mixes {} channels, MOSS-Image's latent has {}", d.channels, cfg.channels);
-        }
-    }
     if cfg.context != 4096 {
         bail!("MOSS-Image's transformer takes text states 4,096 wide, not {}", cfg.context);
     }
     if let Some(bad) = r.skip_layers.iter().find(|&&i| i >= cfg.layers) {
         bail!("MOSS-Image's transformer has {} blocks: it cannot skip block {bad}", cfg.layers);
     }
-    let guided = distill.is_none() && r.guidance != 1.;
+    let keys = (
+        format!("{:?}|{:?}|{}", r.text_encoder, r.tokenizer, r.device),
+        format!("{:?}|{:?}|{}", r.transformer, r.distill, r.device),
+        format!("{:?}|{}", r.vae, r.device),
+    );
+    let guided = r.distill.is_none() && r.guidance != 1.;
     let clock = Instant::now();
-    event(Json::obj([("stage", Json::str("encoding_text")), ("architecture", Json::str("moss-image"))]));
-    let (contexts, negative) = {
-        let mut encoder = WgpuMossText::load(&r.text_encoder, r.tokenizer.as_deref(), r.device)?;
-        let prompts: Vec<&str> = r.prompts.iter().map(String::as_str).chain(guided.then_some(r.negative_prompt.as_str())).collect();
-        let mut all = encoder.encode_all(&prompts)?;
-        let negative = if guided { all.pop() } else { None };
-        (all, negative)
+    // each prompt's text states (and the negative one's last): a kept worker's where it has them, the rest encoded
+    let wanted: Vec<&str> = r.prompts.iter().map(String::as_str).chain(guided.then_some(r.negative_prompt.as_str())).collect();
+    let mut states: Vec<Option<(Vec<f32>, usize)>> = wanted
+        .iter()
+        .map(|p| kept.as_ref().and_then(|k| k.prompts.iter().find(|(e, q, ..)| *e == keys.0 && q == p)).map(|(.., s, n)| (s.clone(), *n)))
+        .collect();
+    let mut missing: Vec<&str> = Vec::new();
+    for (p, s) in wanted.iter().zip(&states) {
+        if s.is_none() && !missing.contains(p) {
+            missing.push(p);
+        }
+    }
+    if !missing.is_empty() {
+        event(Json::obj([("stage", Json::str("encoding_text")), ("architecture", Json::str("moss-image"))]));
+        let had = kept.as_mut().and_then(|k| k.text.take()).filter(|(k, _)| *k == keys.0).map(|(_, t)| t);
+        let mut encoder = match had {
+            Some(t) => t,
+            None => WgpuMossText::load(&r.text_encoder, r.tokenizer.as_deref(), r.device)?,
+        };
+        let gguf = r.text_encoder.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+        encoder.keep_layers(kept.is_some() && gguf && !encoder.backend().adapter().unified);
+        let encoded = encoder.encode_all(&missing)?;
+        for (prompt, (s, n)) in missing.iter().zip(encoded) {
+            for (slot, _) in states.iter_mut().zip(&wanted).filter(|(slot, p)| slot.is_none() && *p == prompt) {
+                *slot = Some((s.clone(), n));
+            }
+            if let Some(k) = kept.as_mut() {
+                k.prompts.retain(|(e, q, ..)| !(*e == keys.0 && q == prompt));
+                k.prompts.push((keys.0.clone(), prompt.to_string(), s, n));
+                if k.prompts.len() > PROMPTS_KEPT {
+                    k.prompts.remove(0);
+                }
+            }
+        }
+        match kept.as_mut() {
+            Some(k) => {
+                // (its scratch let go: the steps want the room)
+                encoder.backend().release_cached();
+                k.text = Some((keys.0.clone(), encoder));
+            }
+            None => drop(encoder),
+        }
+    }
+    let mut states: Vec<(Vec<f32>, usize)> = states.into_iter().map(|s| s.ok_or_else(|| candle_core::Error::Msg("a prompt was not encoded".into()))).collect::<candle_core::Result<_>>()?;
+    let negative = if guided { states.pop() } else { None };
+    // the transformer (a distillation's beside it) and the VAE: a kept worker's where they are these files'; another
+    // transformer's let go before this one loads (two on one card), and its VAE with it (on its GPU)
+    let had = kept.as_mut().and_then(|k| k.model.take()).filter(|(k, ..)| *k == keys.1).map(|(_, m, d)| (m, d));
+    let (mut model, distill) = match had {
+        Some(md) => md,
+        None => {
+            if let Some(k) = kept.as_mut() {
+                k.vae = None;
+            }
+            let mut distill = r.distill.as_deref().map(distill::Distillation::open).transpose()?;
+            if let Some(d) = &distill {
+                if d.channels != cfg.channels {
+                    bail!("the distillation mixes {} channels, MOSS-Image's latent has {}", d.channels, cfg.channels);
+                }
+            }
+            event(Json::obj([("stage", Json::str("loading_transformer"))]));
+            let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(crate::qwen_image::webgpu::transformer::err)?;
+            let model = WgpuMoss::load_with(&r.transformer, gpu, distill.as_mut(), |_, _| {})?;
+            (model, distill)
+        }
     };
-    let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(crate::qwen_image::webgpu::transformer::err)?;
-    event(Json::obj([("stage", Json::str("loading_vae"))]));
-    let (decoder, mean, std) = vae::vae_on_webgpu(&r.vae, gpu.clone(), false)?;
-    event(Json::obj([("stage", Json::str("loading_transformer"))]));
-    let mut model = WgpuMoss::load_with(&r.transformer, gpu, distill.as_mut(), |_, _| {})?;
-    let prompts = contexts.iter().map(|(states, n)| model.prompt(states, *n)).collect::<candle_core::Result<Vec<_>>>()?;
+    if let Some(d) = &distill {
+        if r.steps > d.codes.len() {
+            bail!("the distillation makes a picture in at most {} passes, not {}", d.codes.len(), r.steps);
+        }
+    }
+    let had = kept.as_mut().and_then(|k| k.vae.take()).filter(|(k, _)| *k == keys.2).map(|(_, v)| v);
+    let (decoder, mean, std) = match had {
+        Some(v) => v,
+        None => {
+            event(Json::obj([("stage", Json::str("loading_vae"))]));
+            vae::vae_on_webgpu(&r.vae, model.backend().clone(), false)?
+        }
+    };
+    let prompts = states.iter().map(|(states, n)| model.prompt(states, *n)).collect::<candle_core::Result<Vec<_>>>()?;
     let negative = negative.map(|(states, n)| model.prompt(&states, n)).transpose()?;
     std::fs::create_dir_all(&r.output)?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
@@ -327,6 +432,11 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
         manifest.flush()?;
         event(Json::obj([("stage", Json::str("image_saved")), ("image", Json::Int(i as i64 + 1)), ("path", Json::str(path.to_string_lossy()))]));
         data.push(record);
+    }
+    drop((prompts, negative));
+    if let Some(k) = kept {
+        k.model = Some((keys.1, model, distill));
+        k.vae = Some((keys.2, (decoder, mean, std)));
     }
     Ok(Json::obj([
         ("data", Json::Arr(data)),
