@@ -824,6 +824,7 @@
     "_about": "Every name the desktop's own code uses for a file or a folder under its data folder, and every name the Agent's page uses in its browser storage, mapped to the row that classifies it or to the reason it is not a store. A test reads the sources and fails when a name is not here, so a new store cannot be added without a decision.",
     "desktopNames": {
       "/../../examples/flows/image-make-edit-review.flow.json": "not-a-store: the example flow in the source tree, compiled into the app (bridge/worker.rs EXAMPLES) and stored in flows once",
+      "/../../examples/flows/image-make-edit.flow.json": "not-a-store: the fast example flow in the source tree, compiled into the app (bridge/worker.rs EXAMPLES) and stored in flows once",
       ".examples": "flows",
       ".install-markers-backfilled": "rebuilt",
       ".install.lock": "rebuilt",

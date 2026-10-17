@@ -531,7 +531,9 @@ async fn a_read_and_a_change_go_through_the_desktops_router_and_its_gate() {
     let r = tool("flows_list", json!({})).await;
     assert!(!is_error(&r), "{r}");
     let listed: Vec<String> = r["structuredContent"]["flows"].as_array().unwrap().iter().filter_map(|f| f["id"].as_str().map(str::to_string)).collect();
-    assert_eq!(listed, crate::bridge::worker::EXAMPLES.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>());
+    let mut shipped: Vec<String> = crate::bridge::worker::EXAMPLES.iter().map(|(id, _)| id.to_string()).collect();
+    shipped.sort();
+    assert_eq!(listed, shipped, "listed by id");
     for id in &listed {
         let r = tool("flow_delete", json!({ "id": id })).await;
         assert!(!is_error(&r), "{r}");

@@ -74,10 +74,10 @@ const MAX_CAPTURE: usize = 16 * 1024;
 /// The example flows OAIY ships (`platform/examples/flows`), each with the id it is stored under: in every
 /// desktop's flows once ([`FlowStore::seed_examples`]), and so in the Flows editor, for the person to run, change or
 /// share with apps.
-pub const EXAMPLES: [(&str, &str); 1] = [(
-    "image-make-edit-review",
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/flows/image-make-edit-review.flow.json")),
-)];
+pub const EXAMPLES: [(&str, &str); 2] = [
+    ("image-make-edit-review", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/flows/image-make-edit-review.flow.json"))),
+    ("image-make-edit", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/flows/image-make-edit.flow.json"))),
+];
 
 /// Where flow files live and how ids map to paths.
 pub struct FlowStore {
