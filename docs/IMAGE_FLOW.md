@@ -75,9 +75,10 @@ that nothing waits for a load once they are warm:
 
 - **The card holds the picture models**, kept between pictures by one worker side by side: MOSS-Image (Q4_K_M, 8
   passes) and FLUX 3 Klein (Q4_K_M, 8 steps), 12.4 GB of the card together.
-- **The Mac's GPU holds the language model** (Qwen3.5-9B Q4_K_M with its vision projector: the caption and the review)
-  and runs the picture models' text encoders (Qwen3.5-9B's and Qwen3-VL-4B's, Q4_K_M), which reach the card only as
-  their output.
+- **The Mac's GPU holds the language model** (the caption and the review) and runs the picture models' text encoders
+  (Qwen3.5-9B's and Qwen3-VL-4B's, Q4_K_M), which reach the card only as their output. The language model can be one of
+  those files: Qwen3.5-9B (MOSS-Image's encoder) with its vision projector, or Qwen3-VL-4B (Klein's encoder,
+  [QWEN3VL.md](QWEN3VL.md)), smaller and the less careful reviewer; either way 41 to 42 s a run warm.
 - **Every weight is a Q4_K GGUF on the internal SSD** (the VAEs aside, 0.25 and 0.34 GB).
 
 With a language model on the card instead (MiniCPM-V 4.7 35B), the card is lent to each picture (its model let go)

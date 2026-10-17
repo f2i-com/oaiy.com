@@ -48,7 +48,8 @@ describe.skipIf(!origin || !token)('the image flow from the chat (live)', () => 
     const results = events.flatMap((e) => (e.type === 'tool_result' ? [e.result] : []));
     const flowCall = calls.find((c) => c.name === 'make_and_check_image');
     const errors = events.flatMap((e) => (e.type === 'error' ? [e.message] : []));
-    expect(flowCall, `the model called: ${calls.map((c) => c.name).join(', ')}; errors: ${errors.join(' | ')}`).toBeTruthy();
+    const said = events.flatMap((e) => (e.type === 'done' ? [e.text] : [])).join(' ');
+    expect(flowCall, `the model called: ${calls.map((c) => c.name).join(', ')}; errors: ${errors.join(' | ')}; it said: ${said.slice(0, 600)}`).toBeTruthy();
     const flowResult = results.find((r) => r.name === 'make_and_check_image');
     expect(flowResult?.isError, flowResult?.content).toBe(false);
     // the pictures are files in the project, and the model was handed their paths, never their bytes
