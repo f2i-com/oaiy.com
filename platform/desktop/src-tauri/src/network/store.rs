@@ -13,25 +13,37 @@ pub const SERVICES_FILE: &str = "remote-services.json";
 /// The port a worker listens on unless set (the desktop's API is 17972, its voice gateway 17872).
 pub const DEFAULT_PORT: u16 = 17975;
 
-/// What this computer is on the network.
+/// What a computer is on the network, and what a paired computer is to this one. A computer can use other computers
+/// (a primary to them), lend itself (a worker to them), or both; a pairing is one way, the computer that uses the
+/// other the primary of it, so two computers that use each other are paired twice.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Not on it (as with Network switched off).
     #[default]
     Standalone,
-    /// Uses paired workers' models, through its own API.
+    /// Uses paired workers' models, through its own API; a peer of this role uses this computer.
     Primary,
-    /// Makes what a paired primary asks of it, on its own engines.
+    /// Makes what a paired primary asks of it, on its own engines; a peer of this role is one this computer uses.
     Worker,
+    /// Both: uses other computers and lends itself (a computer's own, never a peer's).
+    Both,
 }
 
-/// Network's settings: off, standalone, until the person switches it on and chooses a role.
+/// Network's settings: off until the person switches it on, using other computers, lending this one, or both.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     pub enabled: bool,
+    /// The one role chosen before a computer could both use others and lend itself: what `uses` and `lends` are where
+    /// they are not set (a settings file of then).
     pub role: Role,
+    /// It uses other computers (their models, flows and services).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uses: Option<bool>,
+    /// It lends itself to the computers that pair with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lends: Option<bool>,
     /// The name other computers show for this one (the computer's own name where empty).
     pub name: String,
     /// The port a worker listens on.
@@ -42,7 +54,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { enabled: false, role: Role::Standalone, name: String::new(), port: DEFAULT_PORT, bind: String::new() }
+        Settings { enabled: false, role: Role::Standalone, uses: None, lends: None, name: String::new(), port: DEFAULT_PORT, bind: String::new() }
     }
 }
 
@@ -56,9 +68,24 @@ impl Settings {
         crate::secret_file::write(&dir.join(SETTINGS_FILE), serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
     }
 
-    /// The role in effect: none while Network is off.
+    /// It uses other computers now (Network on, and set so).
+    pub fn uses(&self) -> bool {
+        self.enabled && self.uses.unwrap_or(matches!(self.role, Role::Primary | Role::Both))
+    }
+
+    /// It lends itself now (Network on, and set so): its listener is up, and computers may ask to pair.
+    pub fn lends(&self) -> bool {
+        self.enabled && self.lends.unwrap_or(matches!(self.role, Role::Worker | Role::Both))
+    }
+
+    /// What it is now: none while Network is off, else using others, lending itself, or both.
     pub fn active_role(&self) -> Role {
-        if self.enabled { self.role } else { Role::Standalone }
+        match (self.uses(), self.lends()) {
+            (true, true) => Role::Both,
+            (true, false) => Role::Primary,
+            (false, true) => Role::Worker,
+            (false, false) => Role::Standalone,
+        }
     }
 }
 
@@ -96,8 +123,14 @@ impl Peers {
         &self.list
     }
 
-    pub fn get(&self, node_id: &str) -> Option<&Peer> {
-        self.list.iter().find(|p| p.node_id == node_id)
+    /// The pairing with `node_id` of this role: a computer this one uses (`Worker`), or one that uses it (`Primary`).
+    pub fn get(&self, node_id: &str, role: Role) -> Option<&Peer> {
+        self.list.iter().find(|p| p.node_id == node_id && p.role == role)
+    }
+
+    /// Whether `node_id` is paired with this computer, either way.
+    pub fn knows(&self, node_id: &str) -> bool {
+        self.list.iter().any(|p| p.node_id == node_id)
     }
 
     /// The paired computer with this certificate (a connection's own), of this role.
@@ -105,17 +138,18 @@ impl Peers {
         self.list.iter().find(|p| p.fingerprint == fingerprint && p.role == role)
     }
 
-    /// Pair (or pair again) with `peer`: one entry per node id, and per certificate. In effect once it is kept: a pairing
-    /// that could not be written down lets nothing in.
+    /// Pair (or pair again) with `peer`: one entry per node id and way, and per certificate and way. In effect once it
+    /// is kept: a pairing that could not be written down lets nothing in.
     pub fn add(&mut self, peer: Peer) -> Result<(), String> {
-        let mut next: Vec<Peer> = self.list.iter().filter(|p| p.node_id != peer.node_id && p.fingerprint != peer.fingerprint).cloned().collect();
+        let mut next: Vec<Peer> = self.list.iter().filter(|p| p.role != peer.role || (p.node_id != peer.node_id && p.fingerprint != peer.fingerprint)).cloned().collect();
         next.push(peer);
         save(&self.path, &next)?;
         self.list = next;
         Ok(())
     }
 
-    /// Unpair: its connections are refused from now on, even where that could not be written down (then said so).
+    /// Unpair, both ways: its connections are refused from now on, even where that could not be written down (then
+    /// said so).
     pub fn remove(&mut self, node_id: &str) -> Result<bool, String> {
         let before = self.list.len();
         self.list.retain(|p| p.node_id != node_id);
@@ -126,9 +160,9 @@ impl Peers {
         Ok(removed)
     }
 
-    /// A worker's new address (it moved: another DHCP lease), kept for the next start.
+    /// A worker's new address (it moved: another DHCP lease, or another port), kept for the next start.
     pub fn moved(&mut self, node_id: &str, address: &str) -> Result<(), String> {
-        match self.list.iter_mut().find(|p| p.node_id == node_id) {
+        match self.list.iter_mut().find(|p| p.node_id == node_id && p.role == Role::Worker) {
             Some(p) if p.address != address => {
                 p.address = address.to_string();
                 self.save()
@@ -290,7 +324,13 @@ mod tests {
         on.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), on);
         assert_eq!(on.active_role(), Role::Worker);
-        assert_eq!(Settings { enabled: false, ..on }.active_role(), Role::Standalone, "a role chosen but Network off: standalone");
+        assert!(on.lends() && !on.uses(), "a worker's settings of before: it lends itself");
+        assert_eq!(Settings { enabled: false, ..on.clone() }.active_role(), Role::Standalone, "a role chosen but Network off: standalone");
+        // both: it uses others and lends itself
+        let both = Settings { uses: Some(true), ..on };
+        assert_eq!((both.active_role(), both.uses(), both.lends()), (Role::Both, true, true));
+        let neither = Settings { uses: Some(false), lends: Some(false), ..both };
+        assert_eq!(neither.active_role(), Role::Standalone);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -309,8 +349,11 @@ mod tests {
         assert!(peers.by_fingerprint("fb", Role::Primary).is_none(), "a worker's certificate is not a primary's");
         let mut peers = peers;
         peers.moved("b", "192.168.1.9:17975").unwrap();
-        assert_eq!(Peers::open(&dir).get("b").unwrap().address, "192.168.1.9:17975");
-        assert!(peers.remove("a").unwrap() && !peers.remove("a").unwrap());
+        assert_eq!(Peers::open(&dir).get("b", Role::Worker).unwrap().address, "192.168.1.9:17975");
+        // paired the other way too (it uses this computer as well): one pairing each way
+        peers.add(peer("a", "fa2", Role::Primary)).unwrap();
+        assert!(peers.get("a", Role::Worker).is_some() && peers.get("a", Role::Primary).is_some() && peers.knows("a"));
+        assert!(peers.remove("a").unwrap() && !peers.remove("a").unwrap() && !peers.knows("a"), "unpaired both ways");
         assert!(Peers::open(&dir).by_fingerprint("fa2", Role::Worker).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

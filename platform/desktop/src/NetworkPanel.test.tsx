@@ -35,9 +35,9 @@ const base = {
   found: 0,
   paired: 0,
 };
-const off = { ...base, enabled: false, role: 'standalone', nodeId: null, fingerprint: null, settings: { enabled: false, role: 'standalone', name: '', port: 17975, bind: '' } };
-const worker = { ...base, enabled: true, role: 'worker', listening: '0.0.0.0:17975', addresses: ['192.168.1.20:17975'], settings: { enabled: true, role: 'worker', name: 'Rig', port: 17975, bind: '' } };
-const primary = { ...base, enabled: true, role: 'primary', settings: { enabled: true, role: 'primary', name: '', port: 17975, bind: '' } };
+const off = { ...base, enabled: false, role: 'standalone', uses: false, lends: false, nodeId: null, fingerprint: null, settings: { enabled: false, role: 'standalone', name: '', port: 17975, bind: '' } };
+const worker = { ...base, enabled: true, role: 'worker', uses: false, lends: true, listening: '0.0.0.0:17975', addresses: ['192.168.1.20:17975'], settings: { enabled: true, role: 'worker', name: 'Rig', port: 17975, bind: '' } };
+const primary = { ...base, enabled: true, role: 'primary', uses: true, lends: false, settings: { enabled: true, role: 'primary', name: '', port: 17975, bind: '' } };
 const node = {
   nodeId: 'w1',
   name: 'Rig',
@@ -85,7 +85,7 @@ describe('NetworkPanel', () => {
     api.setSettings.mockResolvedValue(primary);
     api.status.mockResolvedValue(primary);
     await act(async () => button('Switch on').click());
-    expect(api.setSettings).toHaveBeenCalledWith(expect.objectContaining({ enabled: true, role: 'primary' }));
+    expect(api.setSettings).toHaveBeenCalledWith(expect.objectContaining({ enabled: true, uses: true, lends: false }));
   });
 
   it("on a worker, shows a primary's request with its code and approves only that one", async () => {
@@ -128,7 +128,7 @@ describe('NetworkPanel', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
     expect(api.confirmPairing).toHaveBeenCalledTimes(2);
     await act(async () => button('Yes, pair').click());
-    expect(api.confirmPairing).toHaveBeenLastCalledWith('x', true);
+    expect(api.confirmPairing).toHaveBeenLastCalledWith('x', true, false);
     expect(container.textContent).toContain('Paired with Rig');
     const card = container.querySelector('[data-testid="network-node"]')!;
     expect(card.textContent).toContain('Online');
@@ -194,6 +194,42 @@ describe('NetworkPanel', () => {
     expect(container.querySelectorAll('[data-testid="network-steps"] li')).toHaveLength(3);
   });
 
+  it('uses other computers and lends itself at once, either switched on or both', async () => {
+    api.status.mockResolvedValue(primary);
+    api.setSettings.mockResolvedValue({ ...primary, uses: true, lends: true, role: 'both' });
+    await mount();
+    const lend = Array.from(container.querySelectorAll('[role="checkbox"]')).find((b) => b.textContent?.includes('Lend this computer')) as HTMLButtonElement;
+    expect(lend.getAttribute('aria-checked')).toBe('false');
+    await act(async () => lend.click());
+    expect(lend.getAttribute('aria-checked')).toBe('true');
+    await act(async () => button('Save').click());
+    expect(api.setSettings).toHaveBeenCalledWith(expect.objectContaining({ enabled: true, uses: true, lends: true, port: 17975 }));
+    // both off: nothing to save
+    const use = Array.from(container.querySelectorAll('[role="checkbox"]')).find((b) => b.textContent?.includes('Use other computers')) as HTMLButtonElement;
+    await act(async () => use.click());
+    await act(async () => lend.click());
+    expect(container.textContent).toContain('Choose one, or both');
+  });
+
+  it('pairs both ways at once where this computer lends itself too, and shows a computer paired both ways on one card', async () => {
+    vi.useFakeTimers();
+    const both = { ...primary, uses: true, lends: true, role: 'both', listening: '0.0.0.0:17975', addresses: ['192.168.1.20:17975'] };
+    api.status.mockResolvedValue({ ...both, pairings: [{ pairingId: 'x', code: '654 321', status: 'approved_there', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.21:17975', fingerprint: '1111' } }] });
+    api.confirmPairing.mockResolvedValue({ status: 'approved', node });
+    await mount();
+    const tick = container.querySelector('.network-both-ways input') as HTMLInputElement;
+    expect(tick.checked).toBe(true);
+    expect(container.querySelector('.network-both-ways')!.textContent).toContain('Let Rig use this computer too');
+    api.status.mockResolvedValue(both);
+    api.nodes.mockResolvedValue({ nodes: [{ ...node, uses: true, usesThis: true }] });
+    await act(async () => button('Yes, pair').click());
+    expect(api.confirmPairing).toHaveBeenLastCalledWith('x', true, true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    const card = container.querySelector('[data-testid="network-node"]')!;
+    expect(card.textContent).toContain('This computer uses it');
+    expect(card.textContent).toContain('Uses this computer');
+  });
+
   it('withdraws a pairing it stops waiting for, so the worker no longer shows it', async () => {
     vi.useFakeTimers();
     api.status.mockResolvedValue(primary);
@@ -208,7 +244,7 @@ describe('NetworkPanel', () => {
     });
     await act(async () => input.closest('form')!.requestSubmit());
     await act(async () => button('Stop waiting').click());
-    expect(api.confirmPairing).toHaveBeenCalledWith('x', false);
+    expect(api.confirmPairing).toHaveBeenCalledWith('x', false, false);
     expect(container.querySelector('[data-testid="network-pairing"]')).toBeNull();
     // and nothing asks after it any more
     await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
@@ -233,7 +269,7 @@ describe('NetworkPanel', () => {
     expect(button('Save').disabled).toBe(false);
     api.setSettings.mockResolvedValue(worker);
     await act(async () => button('Save').click());
-    expect(api.setSettings).toHaveBeenCalledWith(expect.objectContaining({ enabled: true, role: 'worker', port: 18000 }));
+    expect(api.setSettings).toHaveBeenCalledWith(expect.objectContaining({ enabled: true, uses: false, lends: true, port: 18000 }));
   });
 
   it('shows an offline worker with why, and unpairs it only when confirmed', async () => {

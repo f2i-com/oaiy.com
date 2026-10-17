@@ -548,6 +548,7 @@ pub(super) const NOT_ON_MAIN_ROUTER: &[(&str, &str)] = &[
     ("network/worker.rs", "/worker/v1/pair"),
     ("network/worker.rs", "/worker/v1/pair/:id"),
     ("network/worker.rs", "/worker/v1/unpair"),
+    ("network/worker.rs", "/worker/v1/lends"),
     ("network/worker.rs", "/worker/v1/capabilities"),
     ("network/worker.rs", "/worker/v1/resources"),
     ("network/worker.rs", "/worker/v1/pins"),
@@ -1055,6 +1056,6 @@ mod fixtures {
         // (a Mac's Agent page: its files, from a listener that serves nothing else)
         assert_eq!(names["embed.rs"], 2);
         // (an OAIY Network worker's listener on the LAN: its routes, for a paired primary)
-        assert_eq!(names["network/worker.rs"], 15);
+        assert_eq!(names["network/worker.rs"], 16);
     }
 }

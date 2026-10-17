@@ -179,6 +179,7 @@ fn routes(net: Network) -> Router {
         .route("/worker/v1/pair", post(pair))
         .route("/worker/v1/pair/:id", get(pair_status).post(pair_reveal))
         .route("/worker/v1/unpair", post(unpair))
+        .route("/worker/v1/lends", post(lends))
         .route("/worker/v1/capabilities", get(capabilities))
         .route("/worker/v1/resources", get(resources))
         .route("/worker/v1/pins", post(pins))
@@ -197,9 +198,9 @@ fn refuse(status: StatusCode, code: &str, message: impl Into<String>) -> Respons
     (status, Json(json!({ "error": { "code": code, "message": message.into() } }))).into_response()
 }
 
-/// The paired primary calling, if it is one (and this computer is a worker, switched on).
+/// The paired primary calling, if it is one (and this computer lends itself, switched on).
 fn primary_of(net: &Network, caller: &Caller) -> Option<Peer> {
-    if net.settings().active_role() != Role::Worker {
+    if !net.settings().lends() {
         return None;
     }
     let fp = caller.fingerprint.as_deref()?;
@@ -231,8 +232,8 @@ struct PairRequest {
 /// ([`commitment`]); the primary then tells its own ([`pair_reveal`]), and the request waits for the person here, who
 /// sees the same code as the primary's screen shows.
 async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, Json(req): Json<PairRequest>) -> Response {
-    if net.settings().active_role() != Role::Worker {
-        return refuse(StatusCode::FORBIDDEN, "not_a_worker", "this computer is not taking pairing requests");
+    if !net.settings().lends() {
+        return refuse(StatusCode::FORBIDDEN, "not_a_worker", "this computer is not taking pairing requests (Lend this computer is off there)");
     }
     let Some(fp) = caller.fingerprint.clone() else {
         return refuse(StatusCode::UNAUTHORIZED, "no_certificate", "a primary presents its certificate to pair");
@@ -338,6 +339,41 @@ async fn unpair(State(net): State<Network>, Extension(caller): Extension<Caller>
     StatusCode::NO_CONTENT.into_response()
 }
 
+#[derive(Deserialize)]
+struct Lends {
+    /// The port the primary listens on, lending itself.
+    port: u16,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /worker/v1/lends` `{port, name?}`: the paired primary lets this computer use it too (paired both ways at once,
+/// its person's choice as they paired): kept here as a computer this one uses, at the address it called from and the
+/// port it gives. This computer uses it once Use other computers is on here.
+async fn lends(State(net): State<Network>, Extension(caller): Extension<Caller>, Json(asked): Json<Lends>) -> Response {
+    let Some(primary) = primary_of(&net, &caller) else {
+        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+    };
+    if asked.port == 0 {
+        return refuse(StatusCode::BAD_REQUEST, "invalid_request", "the port it listens on is needed");
+    }
+    let name: String = asked.name.unwrap_or_default().chars().filter(|c| !c.is_control()).take(80).collect();
+    let peer = Peer {
+        role: Role::Worker,
+        name: if name.trim().is_empty() { primary.name.clone() } else { name },
+        address: SocketAddr::new(caller.addr.ip(), asked.port).to_string(),
+        paired_at_ms: now_ms(),
+        ..primary
+    };
+    match net.inner().peers().add(peer.clone()) {
+        Ok(()) => {
+            log::info!("network: {} lends itself to this computer too, at {}", peer.name, peer.address);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
+    }
+}
+
 /// The approval the person gives here (`/api/network/requests/:id/approve`): the primary is paired.
 pub(crate) fn decide(net: &Network, id: &str, approve: bool) -> Result<Option<Peer>, String> {
     let mut waiting = lock(&net.inner().incoming);
@@ -383,9 +419,16 @@ pub(crate) fn waiting(net: &Network) -> Vec<Value> {
 
 /// `GET /worker/v1/capabilities`: this worker's engines as a primary needs them: their discovery (the models, the
 /// routes) and resources (the GPUs, what is loaded), with nothing of this computer's files or addresses.
-async fn capabilities(State(net): State<Network>, Extension(caller): Extension<Caller>) -> Response {
+async fn capabilities(State(net): State<Network>, Extension(caller): Extension<Caller>, headers: axum::http::HeaderMap) -> Response {
     if primary_of(&net, &caller).is_none() {
         return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+    }
+    // (a primary that lends itself to this computer too: where it listens now, kept for when this one uses it)
+    let lends_on = headers.get("x-oaiy-lends-on").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u16>().ok()).filter(|p| *p != 0);
+    if let (Some(port), Some(p)) = (lends_on, primary_of(&net, &caller)) {
+        if net.inner().peers().get(&p.node_id, Role::Worker).is_some() {
+            let _ = net.inner().peers().moved(&p.node_id, &SocketAddr::new(caller.addr.ip(), port).to_string());
+        }
     }
     let id = net.identity().map(|i| i.node_id).unwrap_or_default();
     let node = json!({

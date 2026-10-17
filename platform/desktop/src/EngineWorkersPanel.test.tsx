@@ -13,7 +13,7 @@ import EngineWorkersPanel from './EngineWorkersPanel';
 let container: HTMLDivElement;
 let root: Root;
 
-const primary = { enabled: true, role: 'primary', name: 'Mac', defaults: {} };
+const primary = { enabled: true, role: 'primary', uses: true, lends: false, name: 'Mac', defaults: {} };
 const rig = {
   nodeId: 'w1',
   name: 'Rig',
@@ -48,10 +48,10 @@ const rows = (testId: string) => Array.from(container.querySelectorAll(`[data-te
 
 describe('EngineWorkersPanel', () => {
   it('says where to switch OAIY Network on, and asks for nothing else while it is off', async () => {
-    api.network.status.mockResolvedValue({ ...primary, enabled: false, role: 'standalone' });
+    api.network.status.mockResolvedValue({ ...primary, enabled: false, role: 'standalone', uses: false });
     const open = vi.fn();
     await mount(open);
-    expect(container.textContent).toContain('It is off until you switch it on as a primary');
+    expect(container.textContent).toContain('It is off until you switch on Use other computers');
     expect(api.network.nodes).not.toHaveBeenCalled();
     await act(async () => Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.includes('Open Networking'))!.click());
     expect(open).toHaveBeenCalled();

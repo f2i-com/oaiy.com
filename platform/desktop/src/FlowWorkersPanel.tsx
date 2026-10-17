@@ -18,7 +18,7 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
       const s = await network.status();
       setStatus(s);
       setError(null);
-      setNodes(s.role === 'primary' ? (await network.nodes()).nodes.filter((n) => n.role === 'worker') : []);
+      setNodes(s.uses ? (await network.nodes()).nodes.filter((n) => (n.uses ?? n.role === 'worker')) : []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -31,7 +31,7 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
   if (!status) {
     return <div className="panel">{error ? <div className="banner banner-err">{error}</div> : <div className="empty-state">Loading…</div>}</div>;
   }
-  if (status.role !== 'primary' || nodes.length === 0) {
+  if (!status.uses || nodes.length === 0) {
     return (
       <div className="panel" data-testid="flow-workers">
         <section className="model-section">
@@ -39,11 +39,11 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
             <h3 className="section-title">Flows on other computers</h3>
           </div>
           <p className="form-hint">
-            {status.role === 'worker'
-              ? 'This computer lends itself to a primary (OAIY Network): the flows it shares run here when the primary asks.'
-              : status.role === 'primary'
-                ? 'No worker is paired yet. Pair one in Setup → Networking, and the flows it shares show here, to run on it from this computer.'
-                : 'With OAIY Network, this computer runs the flows another OAIY computer on your network shares, on that computer’s own models and GPUs. It is off until you switch it on as a primary.'}
+            {status.uses
+              ? 'No computer is paired to be used yet. Pair one in Setup → Networking, and the flows it shares show here, to run on it from this computer.'
+              : status.lends
+                ? 'This computer lends itself (OAIY Network): the flows it shares run here when a paired computer asks. Switch on Use other computers too to run other computers’ flows from here.'
+                : 'With OAIY Network, this computer runs the flows another OAIY computer on your network shares, on that computer’s own models and GPUs. It is off until you switch on Use other computers.'}
           </p>
           <div className="form-actions">
             <button className="btn btn-secondary" onClick={onOpenNetworking}>

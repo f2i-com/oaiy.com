@@ -247,7 +247,7 @@
     "readOnlyHint": true,
     "title": "OAIY Network"
    },
-   "description": "OAIY Network (other OAIY computers on this LAN): whether it is on, this computer's role (primary: it uses paired workers' models; worker: it lends its own), the workers found on the LAN, and the paired computers, each online or not with its GPUs, models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
+   "description": "OAIY Network (other OAIY computers on this LAN): whether it is on, what this computer does (uses: it uses paired computers' models, flows and services; lends: it lends its own; both at once can be on), the workers found on the LAN, and the paired computers, each online or not with its GPUs, models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {},

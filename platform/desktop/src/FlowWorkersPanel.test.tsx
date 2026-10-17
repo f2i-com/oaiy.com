@@ -16,7 +16,7 @@ const picture = 'http://127.0.0.1:17972/api/network/nodes/w1/gateway/files/image
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers();
-  api.network.status.mockResolvedValue({ enabled: true, role: 'primary' });
+  api.network.status.mockResolvedValue({ enabled: true, role: 'primary', uses: true, lends: false });
   api.network.nodes.mockResolvedValue({ nodes: [rig] });
   api.network.picture.mockResolvedValue(new Blob(['x']));
   Object.defineProperty(URL, 'createObjectURL', { configurable: true, writable: true, value: () => 'blob:picture' });
@@ -73,9 +73,9 @@ describe('FlowWorkersPanel', () => {
   });
 
   it('points to Networking while OAIY Network is off', async () => {
-    api.network.status.mockResolvedValue({ enabled: false, role: 'standalone' });
+    api.network.status.mockResolvedValue({ enabled: false, role: 'standalone', uses: false, lends: false });
     await mount();
-    expect(container.textContent).toContain('It is off until you switch it on as a primary');
+    expect(container.textContent).toContain('It is off until you switch on Use other computers');
     expect(api.network.nodes).not.toHaveBeenCalled();
   });
 });

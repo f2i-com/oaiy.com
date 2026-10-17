@@ -141,7 +141,7 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 }), &["source"])),
             // OAIY Network
             def("network_status", "OAIY Network", Read,
-                "OAIY Network (other OAIY computers on this LAN): whether it is on, this computer's role (primary: it uses paired workers' models; worker: it lends its own), the workers found on the LAN, and the paired computers, each online or not with its GPUs, models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
+                "OAIY Network (other OAIY computers on this LAN): whether it is on, what this computer does (uses: it uses paired computers' models, flows and services; lends: it lends its own; both at once can be on), the workers found on the LAN, and the paired computers, each online or not with its GPUs, models, the flows it shares (flow_run with node runs one there) and the services it lends (OAIY Voice); which of this computer's defaults (defaults, by kind) and services (services) are a worker's. A worker's model ids (engine:<kind>:node.<nodeId>/<model>) are what a flow's service or model setting takes to run there. Switching it on, pairing and unpairing are the person's, in Setup, Networking.",
                 none()),
             def("chatgpt_sign_in", "Sign in to ChatGPT", Change,
                 "Start signing OAIY in to ChatGPT (its Codex connector). Answers the address for the person to open and sign in at (with deviceCode, a code for them to type instead); ai_sources_list shows when they have.",
@@ -1397,7 +1397,7 @@ async fn ai_sources_list(d: &Desk) -> Result<Done, String> {
 async fn network_status(d: &Desk) -> Result<Done, String> {
     let status = d.get("/api/network/status").await?;
     let mut out = json!({});
-    for key in ["enabled", "role", "name", "addresses", "listening", "discovery", "waiting", "found", "paired", "defaults", "services"] {
+    for key in ["enabled", "role", "uses", "lends", "name", "addresses", "listening", "discovery", "waiting", "found", "paired", "defaults", "services"] {
         if let Some(v) = status.get(key).filter(|v| !v.is_null()) {
             out[key] = v.clone();
         }
@@ -1407,7 +1407,8 @@ async fn network_status(d: &Desk) -> Result<Done, String> {
         return data(out);
     }
     let (nodes, found) = tokio::join!(d.get("/api/network/nodes"), async {
-        if status.get("role").and_then(Value::as_str) == Some("primary") {
+        // (using other computers: `uses`, or as an older desktop answers, its one role)
+        if status.get("uses").and_then(Value::as_bool).unwrap_or_else(|| matches!(status.get("role").and_then(Value::as_str), Some("primary" | "both"))) {
             Some(d.post_empty("/api/network/discover").await)
         } else {
             None
@@ -1419,7 +1420,7 @@ async fn network_status(d: &Desk) -> Result<Done, String> {
                 .iter()
                 .map(|n| {
                     let mut row = json!({
-                        "nodeId": n.get("nodeId"), "name": n.get("name"), "role": n.get("role"), "online": n.get("online"),
+                        "nodeId": n.get("nodeId"), "name": n.get("name"), "role": n.get("role"), "uses": n.get("uses"), "usesThis": n.get("usesThis"), "online": n.get("online"),
                         "address": n.get("address"),
                     });
                     for key in ["lastError", "enginesError"] {

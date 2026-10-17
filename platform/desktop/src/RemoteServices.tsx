@@ -30,7 +30,7 @@ export default function RemoteServices() {
     try {
       const s = await network.status();
       setStatus(s);
-      setNodes(s.role === 'primary' ? (await network.nodes()).nodes.filter((n) => n.role === 'worker' && (n.services ?? []).length > 0) : []);
+      setNodes(s.uses ? (await network.nodes()).nodes.filter((n) => (n.uses ?? n.role === 'worker') && (n.services ?? []).length > 0) : []);
     } catch {
       /* an older desktop, or Network not answering: nothing to show */
     }
@@ -52,7 +52,7 @@ export default function RemoteServices() {
     }
   };
 
-  if (!status || status.role !== 'primary' || nodes.length === 0) return null;
+  if (!status || !status.uses || nodes.length === 0) return null;
   const chosen = status.services ?? {};
   return (
     <section className="service-section" data-testid="remote-services">

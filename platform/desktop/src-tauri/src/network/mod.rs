@@ -44,13 +44,13 @@ pub fn shared() -> Option<&'static Network> {
     SHARED.get()
 }
 
-/// The name of worker `node_id`, where it is paired with this computer as a primary.
+/// The name of worker `node_id`, where this computer uses it (it is paired as this computer's worker).
 pub fn paired_worker(node_id: &str) -> Option<String> {
     let net = shared()?;
-    if net.settings().active_role() != store::Role::Primary {
+    if !net.settings().uses() {
         return None;
     }
-    net.inner().peers().get(node_id).filter(|p| p.role == store::Role::Worker).map(|p| p.name.clone())
+    net.inner().peers().get(node_id, store::Role::Worker).map(|p| p.name.clone())
 }
 
 #[derive(Clone)]
@@ -180,11 +180,11 @@ impl Network {
         hostname()
     }
 
-    /// Take new settings: kept, and what runs changed to match (a worker's listener and advertisement, a primary's
-    /// heartbeat and browsing).
+    /// Take new settings: kept, and what runs changed to match (lending: the listener and its advertisement; using
+    /// others: the heartbeat to them and browsing for them; both, both).
     pub async fn set(&self, settings: Settings) -> Result<(), String> {
-        // (an address a worker cannot listen on is refused before anything is kept or stopped)
-        if settings.active_role() == Role::Worker {
+        // (an address it cannot listen on is refused before anything is kept or stopped)
+        if settings.lends() {
             bind_address(&settings)?;
         }
         settings.save(&self.inner.dir)?;
@@ -200,8 +200,7 @@ impl Network {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ended).await;
         }
         let settings = self.settings();
-        let role = settings.active_role();
-        if role == Role::Standalone {
+        if !settings.uses() && !settings.lends() {
             return Ok(());
         }
         let id = self.identity()?;
@@ -215,29 +214,28 @@ impl Network {
                 .ok()
         };
         let mut started = None;
-        match role {
-            Role::Worker => {
-                let bind = bind_address(&settings)?;
-                let (addr, stop, task) = worker::listen(self.clone(), &id, bind).await?;
-                log::info!("network: this computer is a worker, listening on {addr}");
-                started = daemon();
-                if let Some(d) = &started {
-                    if let Err(e) = discovery::advertise(d, &id, &self.display_name(), addr.port()) {
-                        log::warn!("network: not advertised on the LAN ({e}); a primary adds it by its address");
-                    }
+        if settings.lends() {
+            let bind = bind_address(&settings)?;
+            let (addr, stop, task) = worker::listen(self.clone(), &id, bind).await?;
+            log::info!("network: this computer lends itself, listening on {addr}");
+            started = daemon();
+            if let Some(d) = &started {
+                if let Err(e) = discovery::advertise(d, &id, &self.display_name(), addr.port()) {
+                    log::warn!("network: not advertised on the LAN ({e}); another computer adds it by its address");
                 }
-                lock(&self.inner.running).listener = Some((addr, stop, task));
             }
-            Role::Primary => {
+            lock(&self.inner.running).listener = Some((addr, stop, task));
+        }
+        if settings.uses() {
+            if started.is_none() {
                 started = daemon();
-                if let Some(d) = &started {
-                    if let Err(e) = discovery::browse(d, self.inner.found.clone()) {
-                        log::warn!("network: workers on the LAN are not looked for ({e}); add them by their address");
-                    }
-                }
-                lock(&self.inner.running).heartbeat = Some(primary::heartbeat(self.clone()));
             }
-            Role::Standalone => {}
+            if let Some(d) = &started {
+                if let Err(e) = discovery::browse(d, self.inner.found.clone()) {
+                    log::warn!("network: computers on the LAN are not looked for ({e}); add them by their address");
+                }
+            }
+            lock(&self.inner.running).heartbeat = Some(primary::heartbeat(self.clone()));
         }
         lock(&self.inner.running).mdns = started;
         Ok(())
@@ -279,6 +277,8 @@ impl Network {
         json!({
             "enabled": settings.enabled,
             "role": settings.active_role(),
+            "uses": settings.uses(),
+            "lends": settings.lends(),
             "settings": settings,
             "nodeId": id.as_ref().map(|i| i.node_id.clone()),
             "name": self.display_name(),

@@ -34,7 +34,7 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
       const s = await network.status();
       setStatus(s);
       setError(null);
-      if (s.role === 'standalone') {
+      if (!s.uses && !s.lends) {
         setNodes([]);
         setRequests([]);
         setFound([]);
@@ -42,8 +42,8 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
       }
       const [n, r, f] = await Promise.all([
         network.nodes(),
-        s.role === 'worker' ? network.requests() : Promise.resolve({ requests: [] }),
-        s.role === 'primary' ? network.discover() : Promise.resolve({ discovery: false, found: [] }),
+        s.lends ? network.requests() : Promise.resolve({ requests: [] }),
+        s.uses ? network.discover() : Promise.resolve({ discovery: false, found: [] }),
       ]);
       setNodes(n.nodes);
       setRequests(r.requests);
@@ -84,7 +84,7 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
       {error && <div className="banner banner-err">{error}</div>}
       {actionError && <div className="banner banner-err" role="alert">{actionError}</div>}
       <ThisComputer status={status} busy={busy} onChange={change} />
-      {status.role === 'worker' && (
+      {status.lends && (
         <WorkerRequests
           requests={requests}
           onDecide={async (id, approve) => {
@@ -98,17 +98,17 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
           }}
         />
       )}
-      {status.role === 'primary' && <FindWorkers found={found} discovery={status.discovery} inProgress={status.pairings} onPaired={refresh} />}
-      {status.role !== 'standalone' && (
+      {status.uses && <FindWorkers found={found} discovery={status.discovery} inProgress={status.pairings} lends={status.lends} onPaired={refresh} />}
+      {(status.uses || status.lends) && (
         <PairedComputers
           nodes={nodes}
-          role={status.role}
+          uses={status.uses}
           defaults={status.defaults}
           services={status.services}
           onNavigate={onNavigate}
           onChanged={refresh}
           onUnpair={async (n) => {
-            if (!window.confirm(`Unpair ${n.name}? It can no longer ${status.role === 'primary' ? 'lend its models to this computer' : 'use this computer'} until you pair again.`)) return;
+            if (!window.confirm(`Unpair ${n.name}? Neither can use the other until you pair them again.`)) return;
             setActionError(null);
             try {
               await network.unpair(n.nodeId);
@@ -123,22 +123,27 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
   );
 }
 
-const ROLES: { value: Exclude<NetworkRole, 'standalone'>; label: string; tag: string; icon: LucideIcon; hint: string }[] = [
+/** What this computer does on the network: either, or both. */
+const WAYS: { key: 'uses' | 'lends'; label: string; icon: LucideIcon; hint: string }[] = [
   {
-    value: 'primary',
+    key: 'uses',
     label: 'Use other computers',
-    tag: 'Primary',
     icon: Laptop,
     hint: 'Pair with OAIY computers on this network and use their models, the flows they share and their OAIY Voice from here.',
   },
   {
-    value: 'worker',
+    key: 'lends',
     label: 'Lend this computer',
-    tag: 'Worker',
     icon: Server,
-    hint: 'A paired primary uses this computer’s GPUs and models, the flows it shares and its OAIY Voice. Only computers you approve here can.',
+    hint: 'Computers you pair with use this one’s GPUs and models, the flows it shares and its OAIY Voice. Only those you approve here can.',
   },
 ];
+
+/** What this computer does now, in a word or two. */
+export function doesNow(status: Pick<NetworkStatus, 'enabled' | 'uses' | 'lends'>): string {
+  if (!status.enabled || (!status.uses && !status.lends)) return 'Off';
+  return status.uses && status.lends ? 'Uses and lends' : status.uses ? 'Uses others' : 'Lends';
+}
 
 /** A value to copy (an address to type on another computer), with its button. */
 function Copyable({ value }: { value: string }) {
@@ -165,49 +170,54 @@ function Copyable({ value }: { value: string }) {
 function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy: boolean; onChange: (c: Parameters<typeof network.setSettings>[0]) => void }) {
   const [name, setName] = useState(status.settings.name);
   const [port, setPort] = useState(String(status.settings.port));
-  const [role, setRole] = useState<NetworkRole>(status.settings.role === 'standalone' ? 'primary' : status.settings.role);
+  // (switched off: using other computers, as most do first)
+  const [uses, setUses] = useState(status.enabled ? status.uses : true);
+  const [lends, setLends] = useState(status.enabled ? status.lends : false);
   useEffect(() => {
     setName(status.settings.name);
     setPort(String(status.settings.port));
-    if (status.settings.role !== 'standalone') setRole(status.settings.role);
-  }, [status.settings.name, status.settings.port, status.settings.role]);
+    if (status.enabled) {
+      setUses(status.uses);
+      setLends(status.lends);
+    }
+  }, [status.settings.name, status.settings.port, status.enabled, status.uses, status.lends]);
 
   const portNumber = Number(port);
-  const portOk = role !== 'worker' || (Number.isInteger(portNumber) && portNumber >= 1024 && portNumber <= 65535);
-  const changed = !status.enabled || role !== status.settings.role || name.trim() !== status.settings.name || (role === 'worker' && portNumber !== status.settings.port);
+  const portOk = !lends || (Number.isInteger(portNumber) && portNumber >= 1024 && portNumber <= 65535);
+  const some = uses || lends;
+  const changed = !status.enabled || uses !== status.uses || lends !== status.lends || name.trim() !== status.settings.name || (lends && portNumber !== status.settings.port);
 
   const save = (e: FormEvent) => {
     e.preventDefault();
-    if (!portOk) return;
-    onChange({ enabled: true, role, name: name.trim(), ...(role === 'worker' ? { port: portNumber } : {}) });
+    if (!portOk || !some) return;
+    onChange({ enabled: true, uses, lends, name: name.trim(), ...(lends ? { port: portNumber } : {}) });
   };
+  const chosen = { uses, lends };
+  const toggle = (key: 'uses' | 'lends') => (key === 'uses' ? setUses(!uses) : setLends(!lends));
 
   return (
     <section className="model-section">
       <div className="section-title-row">
         <h3 className="section-title">
-          This computer{' '}
-          <span className={`badge ${status.enabled ? 'badge-ok' : 'badge-neutral'}`}>
-            {status.enabled ? (status.role === 'worker' ? 'Worker' : 'Primary') : 'Off'}
-          </span>
+          This computer <span className={`badge ${status.enabled ? 'badge-ok' : 'badge-neutral'}`}>{doesNow(status)}</span>
         </h3>
       </div>
       <p className="form-hint">
-        OAIY Network lets OAIY computers on the same network work as one: a primary uses a worker’s models, GPUs, shared flows and OAIY
-        Voice as if they were its own, and nothing leaves your network. It stays off until you switch it on.
+        OAIY Network lets OAIY computers on the same network work as one: a computer uses another’s models, GPUs, shared flows and OAIY Voice
+        as if they were its own, and can lend its own at the same time. Nothing leaves your network, and it stays off until you switch it on.
       </p>
       {!status.enabled && (
         <ol className="network-steps" data-testid="network-steps">
           <li>
             <Server size={16} aria-hidden />
             <span>
-              <strong>On the computer with the GPU</strong> choose <em>Lend this computer</em> and switch on.
+              <strong>On the computer with the GPU</strong> (or the model, flow or OAIY Voice you want) switch on <em>Lend this computer</em>.
             </span>
           </li>
           <li>
             <Laptop size={16} aria-hidden />
             <span>
-              <strong>On this computer</strong> choose <em>Use other computers</em> and switch on: the worker shows up, or add it by its address.
+              <strong>On this computer</strong> switch on <em>Use other computers</em>: it shows up here, or add it by its address. A computer can do both.
             </span>
           </li>
           <li>
@@ -219,28 +229,29 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
         </ol>
       )}
       <form className="dl-form" onSubmit={save}>
-        <div className="network-roles" role="radiogroup" aria-label="This computer's role">
-          {ROLES.map((r) => {
-            const Icon = r.icon;
-            const chosen = role === r.value;
+        <div className="network-roles" role="group" aria-label="What this computer does on the network">
+          {WAYS.map((w) => {
+            const Icon = w.icon;
+            const on = chosen[w.key];
             return (
               <button
-                key={r.value}
+                key={w.key}
                 type="button"
-                role="radio"
-                aria-checked={chosen}
-                className={`network-role${chosen ? ' is-chosen' : ''}`}
+                role="checkbox"
+                aria-checked={on}
+                className={`network-role${on ? ' is-chosen' : ''}`}
                 disabled={busy}
-                onClick={() => setRole(r.value)}
+                onClick={() => toggle(w.key)}
               >
                 <span className="network-role-icon">
                   <Icon size={17} aria-hidden />
                 </span>
                 <span className="network-role-text">
-                  <strong>
-                    {r.label} <span className="network-role-tag">{r.tag}</span>
-                  </strong>
-                  <small>{r.hint}</small>
+                  <strong>{w.label}</strong>
+                  <small>{w.hint}</small>
+                </span>
+                <span className="network-role-check" aria-hidden>
+                  {on && <Check size={13} />}
                 </span>
               </button>
             );
@@ -251,7 +262,7 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
             <span>Name other computers see</span>
             <input value={name} placeholder={status.name} onChange={(e) => setName(e.target.value)} disabled={busy} maxLength={80} />
           </label>
-          {role === 'worker' && (
+          {lends && (
             <label className="form-row network-port">
               <span>Port</span>
               <input
@@ -265,8 +276,9 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
           )}
         </div>
         {!portOk && <span className="form-hint network-invalid">A port from 1024 to 65535.</span>}
+        {!some && <span className="form-hint network-invalid">Choose one, or both.</span>}
         <div className="form-actions">
-          <button className="btn btn-primary" type="submit" disabled={busy || !portOk || !changed}>
+          <button className="btn btn-primary" type="submit" disabled={busy || !portOk || !changed || !some}>
             {status.enabled ? 'Save' : 'Switch on'}
           </button>
           {status.enabled && (
@@ -287,10 +299,10 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
               </>
             )}
           </div>
-          {status.role === 'worker' &&
+          {status.lends &&
             (status.listening ? (
               <div className="network-addresses">
-                <span>{status.discovery ? 'Primaries on this network find it, or add it at' : 'A primary adds it at'}</span>
+                <span>{status.discovery ? 'Other computers on this network find it, or add it at' : 'Another computer adds it at'}</span>
                 {status.addresses.map((a) => (
                   <Copyable key={a} value={a} />
                 ))}
@@ -298,9 +310,9 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
             ) : (
               <div className="network-invalid">Not listening: switch it on again, or choose another port.</div>
             ))}
-          {status.role === 'worker' && (
+          {status.lends && (
             <div>
-              It lends its primary its models and GPUs, the flows it shares (<em>Let apps run it</em> in Flows) and OAIY Voice, when set up here.
+              It lends the computers paired with it its models and GPUs, the flows it shares (<em>Let apps run it</em> in Flows) and OAIY Voice, when set up here.
             </div>
           )}
           {!status.discovery && <div>Finding computers on the network (mDNS) is off here: add them by their address.</div>}
@@ -333,11 +345,11 @@ function WorkerRequests({ requests, onDecide }: { requests: NetworkRequest[]; on
     <section className="model-section">
       <div className="section-title-row">
         <h3 className="section-title">
-          Pairing requests <span className="section-count">({requests.length})</span>
+          Asking to use this computer <span className="section-count">({requests.length})</span>
         </h3>
       </div>
       {requests.length === 0 ? (
-        <p className="form-hint">When a primary asks to use this computer, it shows here. Approve it only if its code matches the one on the primary’s screen.</p>
+        <p className="form-hint">When another computer asks to use this one, it shows here. Approve it only if its code matches the one on that computer’s screen.</p>
       ) : (
         <div className="network-list">
           {requests.map((r) => (
@@ -371,15 +383,20 @@ function FindWorkers({
   found,
   discovery,
   inProgress,
+  lends,
   onPaired,
 }: {
   found: NetworkFound[];
   discovery: boolean;
   /** The pairings this computer is in the middle of: one started before the page was left is shown again. */
   inProgress?: NetworkPairing[];
+  /** This computer lends itself too: the computer it pairs with may use it as well, as its person chooses. */
+  lends: boolean;
   onPaired: () => void;
 }) {
   const [address, setAddress] = useState('');
+  /** Paired both ways at once: the other computer may use this one too. */
+  const [bothWays, setBothWays] = useState(true);
   const [pairing, setPairing] = useState<NetworkPairing | null>(() => inProgress?.[0] ?? null);
   /** The worker approved: this side's person says whether it showed the same code. */
   const [approvedThere, setApprovedThere] = useState(() => inProgress?.[0]?.status === 'approved_there');
@@ -438,7 +455,7 @@ function FindWorkers({
     setPairing(null);
     setApprovedThere(false);
     try {
-      const r = await network.confirmPairing(pairing.pairingId, accept);
+      const r = await network.confirmPairing(pairing.pairingId, accept, accept && lends && bothWays);
       if (r.status === 'approved') setAddress('');
       setOutcome(
         r.status === 'approved'
@@ -473,7 +490,7 @@ function FindWorkers({
     <section className="model-section">
       <div className="section-title-row">
         <h3 className="section-title">
-          Add a worker {discovery && <span className="section-count">({unpaired.length} found)</span>}
+          Add a computer to use {discovery && <span className="section-count">({unpaired.length} found)</span>}
         </h3>
       </div>
       {error && (
@@ -512,6 +529,14 @@ function FindWorkers({
               </>
             )}
           </div>
+          {approvedThere && lends && (
+            <label className="network-both-ways">
+              <input type="checkbox" checked={bothWays} onChange={(e) => setBothWays(e.target.checked)} />
+              <span>
+                Let {pairing.worker.name} use this computer too <small>(this computer lends itself: one pairing, both ways)</small>
+              </span>
+            </label>
+          )}
           <div className="pairing-actions">
             {approvedThere ? (
               <>
@@ -533,7 +558,7 @@ function FindWorkers({
       {discovery &&
         (unpaired.length === 0 ? (
           <p className="form-hint network-looking">
-            <Loader2 size={13} className="spin" aria-hidden /> Looking for OAIY workers on this network… A computer shows here once it is switched on as a worker.
+            <Loader2 size={13} className="spin" aria-hidden /> Looking for OAIY computers on this network… One shows here once Lend this computer is on there.
           </p>
         ) : (
           <div className="network-list">
@@ -541,7 +566,7 @@ function FindWorkers({
               <div className="network-found" key={f.nodeId} data-testid="network-found">
                 <Server size={16} aria-hidden />
                 <span className="network-found-name">
-                  <strong>{f.name || 'An OAIY worker'}</strong>
+                  <strong>{f.name || 'An OAIY computer'}</strong>
                   {f.addresses[0] && <span className="pairing-origin">{f.addresses[0]}</span>}
                   {!f.compatible && <span className="card-warn">A different version of OAIY Network: update both computers to pair them.</span>}
                 </span>
@@ -567,7 +592,7 @@ function FindWorkers({
           {starting ? <Loader2 size={14} className="spin" aria-hidden /> : <Link2 size={14} aria-hidden />} Pair
         </button>
       </form>
-      <span className="form-hint">The address a worker shows on its own Networking page, for networks where computers can’t find each other.</span>
+      <span className="form-hint">The address the other computer shows on its own Networking page, for networks where computers can’t find each other.</span>
     </section>
   );
 }
@@ -721,7 +746,7 @@ function queueText(q: NetworkNode['queue']): string | null {
 
 function PairedComputers({
   nodes,
-  role,
+  uses,
   defaults,
   services,
   onNavigate,
@@ -729,7 +754,8 @@ function PairedComputers({
   onChanged,
 }: {
   nodes: NetworkNode[];
-  role: NetworkRole;
+  /** This computer uses other computers now (else its pairings to use others wait). */
+  uses: boolean;
   defaults: NetworkStatus['defaults'];
   services: NetworkStatus['services'];
   onNavigate?: (view: 'flow-workers' | 'services' | 'engine-workers') => void;
@@ -740,16 +766,20 @@ function PairedComputers({
     <section className="model-section">
       <div className="section-title-row">
         <h3 className="section-title">
-          {role === 'primary' ? 'Workers' : 'Paired primary'} <span className="section-count">({nodes.length})</span>
+          Paired computers <span className="section-count">({nodes.length})</span>
         </h3>
       </div>
       {nodes.length === 0 ? (
-        <p className="form-hint">{role === 'primary' ? 'No worker is paired yet: add one above.' : 'No primary uses this computer yet.'}</p>
+        <p className="form-hint">{uses ? 'No computer is paired yet: add one above.' : 'No computer uses this one yet.'}</p>
       ) : (
         <div className="network-list">
           {nodes.map((n) => {
-            const worker = n.role === 'worker';
-            const Icon = worker ? Server : Laptop;
+            // (paired one way or both: this computer uses it, and it uses this computer; one this computer is paired
+            // to use waits while Use other computers is off here)
+            const paired = n.uses ?? n.role === 'worker';
+            const usesThis = n.usesThis ?? n.role === 'primary';
+            const worker = paired && uses;
+            const Icon = paired ? Server : Laptop;
             const busyNow = worker && n.online ? queueText(n.queue) : null;
             // (a worker that does not answer: what it last said, dimmed, its load and models' states left out)
             const stale = worker && !n.online;
@@ -766,6 +796,8 @@ function PairedComputers({
                   <Icon size={16} aria-hidden />
                   <span className="card-title">{n.name}</span>
                   {worker && <span className={`badge ${n.online ? 'badge-ok' : 'badge-err'}`}>{n.online ? 'Online' : 'Offline'}</span>}
+                  {paired && <span className="network-way">{uses ? 'This computer uses it' : 'This computer can use it (Use other computers is off)'}</span>}
+                  {usesThis && <span className="network-way">Uses this computer</span>}
                   <button className="btn-tiny btn-danger network-unpair" onClick={() => onUnpair(n)}>
                     <Unplug size={12} aria-hidden /> Unpair
                   </button>
@@ -782,7 +814,7 @@ function PairedComputers({
                   </div>
                 )}
                 {busyNow && <div className="network-busy">{busyNow}</div>}
-                <div className={stale ? 'network-stale' : undefined}>
+                <div className={stale ? 'network-stale' : undefined} hidden={!worker}>
                   {stale && n.lastSeenMs && <div className="network-stale-note">Last report {ago(n.lastSeenMs)}</div>}
                   {n.devices.length > 0 && (
                     <div className="network-devices">
@@ -826,7 +858,7 @@ function PairedComputers({
           })}
         </div>
       )}
-      {role === 'primary' && nodes.length > 0 && (
+      {uses && nodes.some((n) => n.uses ?? n.role === 'worker') && (
         <p className="form-hint">
           A worker’s models are listed in Flows’ model menus, named with the worker, and run on the worker; Engines → Other computers makes one this
           computer’s default of its kind.

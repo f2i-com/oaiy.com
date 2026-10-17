@@ -11,7 +11,7 @@ This is the design record; [Setting it up](#setting-it-up) and [What is not done
 
 | Question | Decision | Why |
 | --- | --- | --- |
-| Who orchestrates | One primary per person; workers never talk to FormLogic or to each other | One place for identity, permissions, audit and the cloud link; a worker needs no account |
+| Who orchestrates | A computer can use other computers (a **primary** to them), lend itself (a **worker** to them), or both at once; the computer a person works on talks to FormLogic and its apps, and uses the others through its own routes | One place for identity, permissions, audit and the cloud link per computer used; a computer with a GPU, a model or OAIY Voice to spare lends it while still using another's |
 | Where inference runs | On the worker that has the model, by its own engines (the Studio), as it would locally | No model weights move; each machine's engine knows its own GPU (the Mac's eGPU path included) |
 | How requests travel | Through the primary: a client calls the primary's existing routes, the primary calls the worker | Flows, the Agent and apps never see a LAN address or a worker credential |
 | Discovery | mDNS/DNS-SD (`_oaiy-worker._tcp.local.`) advertising a name, a node id and a port, and a manual address | Standard and LAN-local; multicast is often blocked, so an address always works too. Discovery grants nothing |
@@ -59,23 +59,31 @@ WORKER   worker listener (/worker/v1/*) ─ its own Studio (gateway + resources)
 
 Both computers run OAIY Desktop (or the headless `oaiy-server`) of the same version, on the same network.
 
-1. **On the worker** (the computer that lends its GPUs): Setup → Networking, choose *Lend this computer (worker)*,
-   and Switch on. It listens on port 17975 (change it there), only on LAN addresses, and shows the addresses a
-   primary can type. Allow OAIY through the computer's firewall for that port if it asks.
-2. **On the primary** (the computer you work on): Setup → Networking, choose *Use other computers*, and
-   Switch on. Workers on the network show under *Add a worker* (found by mDNS); where computers cannot find each
-   other (Wi-Fi client isolation, VLANs, a firewall), type the worker's address as its own page shows it.
-3. Press **Pair**. The primary shows a six-digit code; the worker's Networking page shows the same code under
-   *Pairing requests*. Approve it there only if the codes match. The primary then asks whether the worker showed
-   the same code: *Yes, pair* pairs them; *No* pairs nothing and the worker forgets the primary. *Stop waiting*
-   withdraws the request, so the worker no longer shows it. The request expires after five minutes; one the worker
-   approved that the primary never answered is undone on the worker then too.
-4. The worker is listed under *Workers* on the primary with its GPUs (memory in use as a meter and how busy each
-   is, or *memory unknown* where it cannot be read), the job it is running, and its models with their state and
-   where each is loaded; on the worker the primary is listed as its *Paired primary*. A worker that does not answer
-   is shown offline with why, and what it last reported dimmed (*Last report … ago*).
+Each computer has two switches on Setup → Networking, either or both on: **Use other computers** (it is a primary
+to the computers it pairs with) and **Lend this computer** (it is a worker to them). A computer can lend its GPU and
+models while it uses another's OAIY Voice, say.
 
-Unpair from either side: the other side refuses it from then on, and the primary shows the worker offline with why.
+1. **On the computer that lends** (its GPUs, models, shared flows or OAIY Voice): switch on *Lend this computer*. It
+   listens on port 17975 (change it there), only on LAN addresses, and shows the addresses another computer can type.
+   Allow OAIY through the computer's firewall for that port if it asks.
+2. **On the computer that uses it**: switch on *Use other computers*. Computers lending themselves show under *Add a
+   computer to use* (found by mDNS); where computers cannot find each other (Wi-Fi client isolation, VLANs, a
+   firewall), type the address the other computer's page shows.
+3. Press **Pair**. This computer shows a six-digit code; the other's Networking page (or a prompt on whichever page
+   it is on) shows the same code under *Asking to use this computer*. Approve it there only if the codes match. This
+   computer then asks whether the other showed the same code: *Yes, pair* pairs them; *No* pairs nothing and the
+   other forgets this computer. *Stop waiting* withdraws the request. The request expires after five minutes; one
+   approved there that this computer never answered is undone there then too. Where this computer lends itself too,
+   *Let it use this computer too* (ticked) pairs them both ways at once: the other may then use this computer as well
+   (once *Use other computers* is on there), and is told where this computer listens.
+4. Each paired computer is one card under *Paired computers*, saying which way it is paired (*This computer uses
+   it*, *Uses this computer*, or both). One this computer uses shows its GPUs (memory in use as a meter and how busy
+   each is), the job it is running, its models with their state and where each is loaded, the flows it shares and
+   the services it lends. One that does not answer is shown offline with why, and what it last reported dimmed
+   (*Last report … ago*).
+
+Unpair from either side: both ways are forgotten, the other side refuses it from then on, and a computer that used it
+shows it offline with why.
 A worker unpaired at the primary while it is off is told once it answers again (while the primary runs; after a
 restart of the primary, unpair it on the worker too). Switch off on either side to stop at once; switching on again
 keeps the pairing.
@@ -188,7 +196,7 @@ restricted, as `/api/engines/` are):
 | Route | Scope | What |
 | --- | --- | --- |
 | `GET /api/network/status` | auth.read | On or off, the role, this computer's name, fingerprint and addresses |
-| `PUT /api/network/settings` | auth.manage | `{enabled, role, name, port, bind}` |
+| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before) |
 | `POST /api/network/discover` | auth.manage | The workers found on the LAN |
 | `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare |
 | `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it, or withdraws the request it has not answered) |
@@ -205,8 +213,8 @@ restricted, as `/api/engines/` are):
 | `GET /api/network/nodes/:id/runs/:run`, `POST …/cancel` | runs.read, runs.write | A run there, as it is now; stopped |
 
 The worker (`/worker/v1/*` on its LAN port, TLS with client certificates): `health` (anyone: a name, a node id, the
-protocol), `pair` and `pair/:id` (anyone with a certificate, to ask), `unpair` (the caller's own pairing or request
-withdrawn), and, for its paired primary only, `capabilities`, `resources`, `pins`, `chat`, `gateway/*path`, `flows`,
+protocol), `pair` and `pair/:id` (anyone with a certificate, to ask), `unpair` (the caller's own pairing, both ways,
+or request withdrawn), and, for its paired primary only, `lends` (it lends itself to this one too: paired both ways), `capabilities`, `resources`, `pins`, `chat`, `gateway/*path`, `flows`,
 `flows/:id/runs`, `runs/:id` (and `…/cancel`), `services/oaiy-voice/*path` and `voices/:name` (a voice copied there). The gateway takes the engine's media routes and
 files only (not its settings, logs, downloads or playground), and what it answers about itself leaves out its local
 paths and loopback addresses.

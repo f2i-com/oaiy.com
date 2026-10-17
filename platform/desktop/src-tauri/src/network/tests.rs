@@ -102,7 +102,7 @@ fn ai(engines: Option<String>) -> crate::ai::AiState {
 
 async fn node(tag: &str, role: Role, engines: Option<String>) -> Network {
     let net = Network::open_with(&temp(tag), ai(engines), false);
-    net.set(Settings { enabled: true, role, name: format!("the {tag}"), port: 0, bind: "127.0.0.1".into() }).await.unwrap();
+    net.set(Settings { enabled: true, uses: None, lends: None, role, name: format!("the {tag}"), port: 0, bind: "127.0.0.1".into() }).await.unwrap();
     net
 }
 
@@ -119,6 +119,11 @@ async fn call(app: &Router, method: &str, path: &str, body: Option<Value>) -> (S
 
 /// Pair `primary` with `worker`, the worker's person approving.
 async fn pair(primary: &Network, worker: &Network) -> String {
+    pair_with(primary, worker, false).await
+}
+
+/// As [`pair`]; `both_ways`: the primary's person lets the worker use it too.
+async fn pair_with(primary: &Network, worker: &Network, both_ways: bool) -> String {
     let (p, w) = (router(primary.clone()), router(worker.clone()));
     let address = worker.listening().unwrap().to_string();
     let (status, started) = call(&p, "POST", "/api/network/pairings/start", Some(json!({ "address": address }))).await;
@@ -126,7 +131,7 @@ async fn pair(primary: &Network, worker: &Network) -> String {
     let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
     let request = &waiting["requests"][0];
     assert_eq!(request["code"], started["code"], "both screens show the same code");
-    assert!(request["name"].as_str().unwrap().starts_with("the primary"), "{request}");
+    assert_eq!(request["name"], primary.display_name(), "{request}");
     let pairing = json!({ "pairingId": started["pairingId"] });
     let (_, before) = call(&p, "POST", "/api/network/pairings/confirm", Some(pairing.clone())).await;
     assert_eq!(before["status"], "pending", "nothing is paired before the worker's person approves");
@@ -136,7 +141,7 @@ async fn pair(primary: &Network, worker: &Network) -> String {
     assert_eq!((there["status"].as_str(), &there["code"]), (Some("approved_there"), &started["code"]), "{there}");
     let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
     assert!(nodes["nodes"].as_array().unwrap().iter().all(|n| n["nodeId"] != started["worker"]["nodeId"]), "not paired here before this side says the codes matched");
-    let (_, confirmed) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": true }))).await;
+    let (_, confirmed) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": true, "bothWays": both_ways }))).await;
     assert_eq!(confirmed["status"], "approved", "{confirmed}");
     confirmed["node"]["nodeId"].as_str().unwrap().to_string()
 }
@@ -258,7 +263,7 @@ async fn a_worker_unpaired_while_off_is_told_when_it_is_back() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, still) = call(&w, "GET", "/api/network/nodes", None).await;
     assert_eq!(still["nodes"].as_array().unwrap().len(), 1, "it did not hear, being off");
-    worker.set(Settings { enabled: true, role: Role::Worker, name: "the worker-untold".into(), port, bind: "127.0.0.1".into() }).await.unwrap();
+    worker.set(Settings { enabled: true, uses: None, lends: None, role: Role::Worker, name: "the worker-untold".into(), port, bind: "127.0.0.1".into() }).await.unwrap();
     primary::tell_untold(&primary).await;
     let (_, told) = call(&w, "GET", "/api/network/nodes", None).await;
     assert!(told["nodes"].as_array().unwrap().is_empty(), "told once back: {told}");
@@ -478,13 +483,52 @@ async fn a_primary_uses_oaiy_voice_on_a_worker() {
     }
 }
 
+/// A computer can use others and lend itself at once: two such computers paired both ways in one pairing (the one
+/// asking lets the other use it too), each then using the other, one card a computer; unpairing forgets both ways on
+/// both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_computers_can_use_each_other() {
+    let a = node("a-both", Role::Primary, Some(fake_engines().await)).await;
+    let b = node("b-both", Role::Worker, Some(fake_engines().await)).await;
+    for n in [&a, &b] {
+        n.set(Settings { uses: Some(true), lends: Some(true), ..n.settings() }).await.unwrap();
+        assert_eq!(n.settings().active_role(), Role::Both);
+    }
+    assert!(a.listening().is_some() && b.listening().is_some(), "both lend themselves");
+    let b_id = pair_with(&a, &b, true).await;
+    let a_id = a.identity().unwrap().node_id;
+    assert!(a.inner().peers().get(&b_id, Role::Worker).is_some() && a.inner().peers().get(&b_id, Role::Primary).is_some(), "a uses b, and b may use a");
+    let a_on_b = b.inner().peers().get(&a_id, Role::Worker).cloned().expect("b keeps a as a computer it uses");
+    assert_eq!(a_on_b.address, a.listening().unwrap().to_string(), "where a listens");
+    // b uses a, through its own routes
+    primary::check(&b, &a_on_b).await;
+    let (_, nodes) = call(&router(b.clone()), "GET", "/api/network/nodes", None).await;
+    let seen = &nodes["nodes"][0];
+    assert_eq!(nodes["nodes"].as_array().unwrap().len(), 1, "one card a computer: {nodes}");
+    assert_eq!((&seen["uses"], &seen["usesThis"], &seen["online"]), (&json!(true), &json!(true), &json!(true)), "{seen}");
+    assert!(seen["models"].as_array().unwrap().iter().any(|m| m["model"] == "tiny-image"), "{seen}");
+    // a only uses (not both ways): b keeps nothing of a to use
+    let c = node("c-uses", Role::Primary, None).await;
+    let b_for_c = pair(&c, &b).await;
+    assert_eq!(b_for_c, b_id);
+    let c_id = c.identity().unwrap().node_id;
+    assert!(b.inner().peers().get(&c_id, Role::Primary).is_some() && b.inner().peers().get(&c_id, Role::Worker).is_none());
+    // unpaired at a: forgotten both ways, on both
+    call(&router(a.clone()), "DELETE", &format!("/api/network/nodes/{b_id}"), None).await;
+    assert!(!a.inner().peers().knows(&b_id) && !b.inner().peers().knows(&a_id), "forgotten both ways on both");
+    assert!(b.inner().peers().knows(&c_id), "and nothing else");
+    for n in [&a, &b, &c] {
+        n.stop();
+    }
+}
+
 /// A worker saved again while it listens (renamed) keeps its port: the listener before it has let the port go first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_saved_again_listens_on_the_same_port() {
     let worker = node("worker-again", Role::Worker, None).await;
     let port = worker.listening().unwrap().port();
     for name in ["the worker renamed", "and again"] {
-        worker.set(Settings { enabled: true, role: Role::Worker, name: name.into(), port, bind: "127.0.0.1".into() }).await.unwrap();
+        worker.set(Settings { enabled: true, uses: None, lends: None, role: Role::Worker, name: name.into(), port, bind: "127.0.0.1".into() }).await.unwrap();
         assert_eq!(worker.listening().map(|a| a.port()), Some(port));
     }
     let stranger = tls::client(&super::identity::Identity::generate().unwrap(), Pin::Record(Default::default())).unwrap();
@@ -594,11 +638,11 @@ async fn a_stranger_reaches_only_health_and_an_impostor_is_not_trusted() {
     let primary_id = primary.identity().unwrap().node_id;
     let resp = w.clone().oneshot(Request::delete(format!("/api/network/nodes/{primary_id}")).body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let peer = primary.inner().peers().get(&worker_id).cloned().unwrap();
+    let peer = primary.inner().peers().get(&worker_id, Role::Worker).cloned().unwrap();
     primary::check(&primary, &peer).await;
     let (_, nodes) = call(&router(primary.clone()), "GET", "/api/network/nodes", None).await;
     assert_eq!(nodes["nodes"][0]["online"], false);
-    assert!(nodes["nodes"][0]["lastError"].as_str().unwrap().contains("no longer accepts"), "{nodes}");
+    assert!(nodes["nodes"][0]["lastError"].as_str().unwrap().contains("no longer lends itself"), "{nodes}");
     // a request for its model now says plainly which worker did not answer
     let (status, body) = call(&router(primary.clone()), "POST", &format!("/api/network/nodes/{worker_id}/gateway/v1/images/generations"), Some(json!({}))).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "the worker's own refusal is passed on: {body}");
@@ -699,7 +743,7 @@ async fn off_nothing_listens_and_a_worker_is_never_reached_off_the_lan() {
     assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_address")), "{body}");
     // a worker binding a public address is refused too
     let worker = Network::open_with(&temp("bind"), ai(None), false);
-    let err = worker.set(Settings { enabled: true, role: Role::Worker, name: String::new(), port: 0, bind: "8.8.8.8".into() }).await.unwrap_err();
+    let err = worker.set(Settings { enabled: true, uses: None, lends: None, role: Role::Worker, name: String::new(), port: 0, bind: "8.8.8.8".into() }).await.unwrap_err();
     assert!(err.contains("not a local network address"), "{err}");
     primary.stop();
 }

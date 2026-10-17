@@ -524,7 +524,7 @@ export default function App() {
       if (document.hidden) return;
       try {
         const s = await networkApi.status();
-        if (!cancelled) setNetWaiting(s.role === 'worker' ? s.waiting : 0);
+        if (!cancelled) setNetWaiting(s.lends ? s.waiting : 0);
       } catch {
         /* starting, or an older desktop: no requests to show */
       }

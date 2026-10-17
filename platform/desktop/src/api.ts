@@ -2097,11 +2097,16 @@ export const engines = {
 
 // ----- OAIY Network (other OAIY computers on the LAN: docs/NETWORK.md) -----
 
-export type NetworkRole = 'standalone' | 'primary' | 'worker';
+/** What a computer does on the network: uses others (`primary`), lends itself (`worker`), or `both`. */
+export type NetworkRole = 'standalone' | 'primary' | 'worker' | 'both';
 
 export interface NetworkSettings {
   enabled: boolean;
   role: NetworkRole;
+  /** It uses other computers. */
+  uses?: boolean;
+  /** It lends itself to the computers that pair with it. */
+  lends?: boolean;
   /** The name other computers show for this one (the computer's own where empty). */
   name: string;
   /** The port a worker listens on. */
@@ -2112,8 +2117,12 @@ export interface NetworkSettings {
 
 export interface NetworkStatus {
   enabled: boolean;
-  /** The role in effect (standalone while Network is off). */
+  /** The role in effect (standalone while Network is off; `both` while it uses others and lends itself). */
   role: NetworkRole;
+  /** It uses other computers now. */
+  uses: boolean;
+  /** It lends itself now. */
+  lends: boolean;
   settings: NetworkSettings;
   nodeId: string | null;
   name: string;
@@ -2226,8 +2235,12 @@ export interface NetworkModel {
 export interface NetworkNode {
   nodeId: string;
   name: string;
-  /** What it is to this computer: a worker, or (to a worker) its primary. */
+  /** What it is to this computer first: a worker (this computer uses it), else a primary (it uses this computer). */
   role: NetworkRole;
+  /** This computer uses it. */
+  uses?: boolean;
+  /** It uses this computer. */
+  usesThis?: boolean;
   address: string;
   fingerprint: string;
   pairedAtMs: number;
@@ -2267,10 +2280,10 @@ export const network = {
    * Whether the worker's person approved (`approved_there`: then this computer's person says whether the worker showed
    * the same code, `accept`, and only with `true` is it paired here too).
    */
-  confirmPairing: (pairingId: string, accept?: boolean) =>
+  confirmPairing: (pairingId: string, accept?: boolean, bothWays?: boolean) =>
     request<{ status: 'pending' | 'approved_there' | 'approved' | 'denied' | 'declined' | 'expired'; code?: string; node?: NetworkNode }>(
       '/api/network/pairings/confirm',
-      { method: 'POST', body: JSON.stringify(accept === undefined ? { pairingId } : { pairingId, accept }) },
+      { method: 'POST', body: JSON.stringify(accept === undefined ? { pairingId } : { pairingId, accept, ...(bothWays ? { bothWays } : {}) }) },
     ),
   /** Primaries asking to pair with this worker, each with its code. */
   requests: () => request<{ requests: NetworkRequest[] }>('/api/network/requests'),

@@ -120,7 +120,12 @@ async fn status(State(net): State<Network>) -> Response {
 #[serde(rename_all = "camelCase")]
 struct SettingsChange {
     enabled: Option<bool>,
+    /// One role, as before a computer could do both (`primary`, `worker`, `both`): `uses` and `lends` set from it.
     role: Option<Role>,
+    /// It uses other computers.
+    uses: Option<bool>,
+    /// It lends itself to the computers that pair with it.
+    lends: Option<bool>,
     name: Option<String>,
     port: Option<u16>,
     bind: Option<String>,
@@ -131,8 +136,9 @@ struct SettingsChange {
     services: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
 
-/// `PUT /api/network/settings`: switch Network on or off, choose this computer's role, name and (a worker's) port, and
-/// (a primary) which of its workers' models are this computer's engine defaults.
+/// `PUT /api/network/settings`: switch Network on or off; whether this computer uses other computers, lends itself, or
+/// both; its name and (lending) port; and (using others) which of their models are this computer's engine defaults and
+/// which of their services it uses.
 async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsChange>) -> Response {
     if let Some(defaults) = &change.defaults {
         if let Err(e) = set_defaults(&net, defaults).await {
@@ -145,7 +151,7 @@ async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsCha
         }
     }
     // (only defaults or services: nothing running is started again)
-    if change.enabled.is_none() && change.role.is_none() && change.name.is_none() && change.port.is_none() && change.bind.is_none() {
+    if change.enabled.is_none() && change.role.is_none() && change.uses.is_none() && change.lends.is_none() && change.name.is_none() && change.port.is_none() && change.bind.is_none() {
         return status(State(net)).await;
     }
     let mut s: Settings = net.settings();
@@ -154,6 +160,14 @@ async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsCha
     }
     if let Some(v) = change.role {
         s.role = v;
+        s.uses = Some(matches!(v, Role::Primary | Role::Both));
+        s.lends = Some(matches!(v, Role::Worker | Role::Both));
+    }
+    if let Some(v) = change.uses {
+        s.uses = Some(v);
+    }
+    if let Some(v) = change.lends {
+        s.lends = Some(v);
     }
     if let Some(v) = change.name {
         s.name = v.chars().filter(|c| !c.is_control()).take(80).collect::<String>().trim().to_string();
@@ -179,8 +193,8 @@ async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsCha
 
 /// `POST /api/network/discover`: the workers advertised on the LAN (browsed continuously while this is a primary).
 async fn discover(State(net): State<Network>) -> Response {
-    if net.settings().active_role() != Role::Primary {
-        return error(StatusCode::CONFLICT, "not_a_primary", "switch Network on as a primary to look for workers");
+    if !net.settings().uses() {
+        return error(StatusCode::CONFLICT, "not_a_primary", "switch on Use other computers to look for them");
     }
     let mine = net.identity().map(|i| i.node_id).unwrap_or_default();
     let found: Vec<Value> = {
@@ -190,7 +204,8 @@ async fn discover(State(net): State<Network>) -> Response {
             .filter(|f| f.node_id != mine)
             .map(|f| {
                 let mut v = json!(f);
-                v["paired"] = json!(peers.get(&f.node_id).is_some());
+                // (paired as one this computer uses: one that only uses this computer can still be used, once paired so)
+                v["paired"] = json!(peers.get(&f.node_id, Role::Worker).is_some());
                 v["compatible"] = json!(f.protocol == PROTOCOL);
                 v
             })
@@ -254,8 +269,8 @@ struct PairStart {
 /// `POST /api/network/pairings/start` `{address}` (or `{nodeId}` of a worker found on the LAN): ask the worker to pair.
 /// Answers the code to compare with the worker's screen, where its person approves.
 async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> Response {
-    if net.settings().active_role() != Role::Primary {
-        return error(StatusCode::CONFLICT, "not_a_primary", "switch Network on as a primary to pair with a worker");
+    if !net.settings().uses() {
+        return error(StatusCode::CONFLICT, "not_a_primary", "switch on Use other computers to pair with one");
     }
     let id = match net.identity() {
         Ok(i) => i,
@@ -351,6 +366,9 @@ struct PairConfirm {
     /// This computer's person says the worker showed the same code (true), or that it did not (false).
     #[serde(default)]
     accept: Option<bool>,
+    /// And lets the worker use this computer too (this computer lending itself): paired both ways at once.
+    #[serde(default)]
+    both_ways: bool,
 }
 
 /// `POST /api/network/pairings/confirm` `{pairingId, accept?}`: has the worker's person approved? Approved there, it
@@ -380,7 +398,7 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         return Json(json!({ "status": "declined" })).into_response();
     }
     if p.approved_there {
-        return if req.accept == Some(true) { paired(&net, &p).await } else { Json(json!({ "status": "approved_there", "code": p.code })).into_response() };
+        return if req.accept == Some(true) { paired(&net, &p, req.both_ways).await } else { Json(json!({ "status": "approved_there", "code": p.code })).into_response() };
     }
     let answer = match client.get(url(&p.address, &format!("/worker/v1/pair/{}", p.request_id))).timeout(Duration::from_secs(8)).send().await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
@@ -392,7 +410,7 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         Err(e) => return error(StatusCode::BAD_GATEWAY, "unreachable", format!("the worker did not answer: {}", plain(&e))),
     };
     match answer.get("status").and_then(Value::as_str) {
-        Some("approved") if req.accept == Some(true) => paired(&net, &p).await,
+        Some("approved") if req.accept == Some(true) => paired(&net, &p, req.both_ways).await,
         Some("approved") => {
             // (the person here has five more minutes to say the codes matched)
             if let Some(o) = lock(&net.inner().outgoing).iter_mut().find(|o| o.id == p.id) {
@@ -411,18 +429,41 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
 
 /// Whether the worker of pairing `p` is paired here already, with the same certificate.
 fn paired_already(net: &Network, p: &Outgoing) -> bool {
-    net.inner().peers().get(&p.node_id).is_some_and(|w| w.fingerprint == p.fingerprint)
+    net.inner().peers().get(&p.node_id, Role::Worker).is_some_and(|w| w.fingerprint == p.fingerprint)
 }
 
 /// The worker of pairing `p`, approved on both screens: paired here, its certificate pinned, its models asked for.
-async fn paired(net: &Network, p: &Outgoing) -> Response {
+async fn paired(net: &Network, p: &Outgoing, both_ways: bool) -> Response {
     let peer = Peer { node_id: p.node_id.clone(), name: p.name.clone(), role: Role::Worker, fingerprint: p.fingerprint.clone(), address: p.address.clone(), paired_at_ms: now_ms() };
     if let Err(e) = net.inner().peers().add(peer.clone()) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
     }
     lock(&net.inner().outgoing).retain(|o| o.id != p.id);
+    // (both ways: the worker may use this computer too, which lends itself, and is told where it listens)
+    if both_ways && net.settings().lends() {
+        lend_to(net, &peer).await;
+    }
     check(net, &peer).await;
-    Json(json!({ "status": "approved", "node": node_json(net, &peer) })).into_response()
+    Json(json!({ "status": "approved", "node": node_json(net, &p.node_id) })).into_response()
+}
+
+/// Let worker `peer` use this computer too (paired the other way as well): kept here as a computer that uses this one,
+/// and the worker told where this computer listens (`/worker/v1/lends`), so it keeps this one as a computer it uses.
+async fn lend_to(net: &Network, peer: &Peer) {
+    let host = peer.address.rsplit_once(':').map_or(peer.address.as_str(), |(h, _)| h).to_string();
+    let user = Peer { role: Role::Primary, address: host, paired_at_ms: now_ms(), ..peer.clone() };
+    if let Err(e) = net.inner().peers().add(user) {
+        log::warn!("network: {} could not be let use this computer: {e}", peer.name);
+        return;
+    }
+    let (Some(port), Ok(id)) = (net.listening().map(|a| a.port()), net.identity()) else { return };
+    let Ok(client) = client_for(&id, &peer.fingerprint) else { return };
+    let told = client.post(url(&peer.address, "/worker/v1/lends")).json(&json!({ "port": port, "name": net.display_name() })).timeout(Duration::from_secs(5)).send().await;
+    match told {
+        Ok(r) if r.status().is_success() => log::info!("network: {} may use this computer too", peer.name),
+        Ok(r) => log::warn!("network: {} was not told it may use this computer (HTTP {})", peer.name, r.status()),
+        Err(e) => log::warn!("network: {} was not told it may use this computer: {}", peer.name, plain(&e)),
+    }
 }
 
 /// `GET /api/network/requests`: primaries asking this worker to pair, each with the code its screen shows.
@@ -434,7 +475,7 @@ async fn approve(State(net): State<Network>, Path(id): Path<String>) -> Response
     match worker::decide(&net, &id, true) {
         Ok(Some(peer)) => {
             log::info!("network: paired with {} (a primary)", peer.name);
-            Json(json!({ "status": "approved", "node": node_json(&net, &peer) })).into_response()
+            Json(json!({ "status": "approved", "node": node_json(&net, &peer.node_id) })).into_response()
         }
         Ok(None) => Json(json!({ "status": "denied" })).into_response(),
         Err(e) => error(StatusCode::NOT_FOUND, "not_found", e),
@@ -453,7 +494,15 @@ async fn deny(State(net): State<Network>, Path(id): Path<String>) -> Response {
 // ---------------------------------------------------------------------------------------------------------------
 
 /// A paired computer as the Networking page shows it: who, where, whether it answers, its GPUs and models.
-fn node_json(net: &Network, p: &Peer) -> Value {
+/// A paired computer as the Networking page shows it: whether this computer uses it (`uses`: it is a worker here, with
+/// its GPUs, models, flows and services) and whether it uses this computer (`usesThis`), and `role`, what it is to this
+/// computer first (`worker` where this computer uses it, else `primary`).
+fn node_json(net: &Network, node_id: &str) -> Value {
+    let (worker, user) = {
+        let peers = net.inner().peers();
+        (peers.get(node_id, Role::Worker).cloned(), peers.get(node_id, Role::Primary).cloned())
+    };
+    let Some(p) = worker.clone().or(user.clone()) else { return Value::Null };
     let state = lock(&net.inner().nodes).get(&p.node_id).cloned().unwrap_or_default();
     let caps = state.capabilities.clone().unwrap_or(Value::Null);
     let resources = caps.get("resources").cloned().unwrap_or(Value::Null);
@@ -491,6 +540,8 @@ fn node_json(net: &Network, p: &Peer) -> Value {
         "nodeId": p.node_id,
         "name": p.name,
         "role": p.role,
+        "uses": worker.is_some(),
+        "usesThis": user.is_some(),
         "address": p.address,
         "fingerprint": short(&p.fingerprint),
         "pairedAtMs": p.paired_at_ms,
@@ -510,19 +561,32 @@ fn node_json(net: &Network, p: &Peer) -> Value {
 
 /// `GET /api/network/nodes`: the paired computers (a primary's workers, a worker's primary).
 async fn nodes(State(net): State<Network>) -> Response {
-    let peers: Vec<Peer> = net.inner().peers().list().to_vec();
-    Json(json!({ "nodes": peers.iter().map(|p| node_json(&net, p)).collect::<Vec<_>>() })).into_response()
+    // (one a computer, paired one way or both)
+    let mut ids: Vec<String> = Vec::new();
+    for p in net.inner().peers().list() {
+        if !ids.contains(&p.node_id) {
+            ids.push(p.node_id.clone());
+        }
+    }
+    Json(json!({ "nodes": ids.iter().map(|id| node_json(&net, id)).collect::<Vec<_>>() })).into_response()
 }
 
 /// `DELETE /api/network/nodes/:id`: unpair. Its certificate no longer lets it in from now on; a worker is told, if it
 /// answers, so it stops accepting this computer too.
 async fn unpair(State(net): State<Network>, Path(node_id): Path<String>) -> Response {
-    let Some(peer) = net.inner().peers().get(&node_id).cloned() else {
+    let (as_worker, as_user) = {
+        let peers = net.inner().peers();
+        (peers.get(&node_id, Role::Worker).cloned(), peers.get(&node_id, Role::Primary).cloned())
+    };
+    let Some(peer) = as_worker.clone().or(as_user) else {
         return error(StatusCode::NOT_FOUND, "not_found", "no such paired computer");
     };
-    if peer.role == Role::Worker && !tell_unpaired(&net, &peer).await {
-        // (it did not answer: told when it does, so it stops accepting this computer too)
-        lock(&net.inner().untold).push(peer.clone());
+    // (both ways: a computer this one uses is told, and forgets this one both ways too; one that did not answer is
+    // told when it does)
+    if let Some(worker) = as_worker {
+        if !tell_unpaired(&net, &worker).await {
+            lock(&net.inner().untold).push(worker);
+        }
     }
     if let Err(e) = net.inner().peers().remove(&node_id) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
@@ -545,7 +609,7 @@ async fn tell_unpaired(net: &Network, peer: &Peer) -> bool {
 pub(crate) async fn tell_untold(net: &Network) {
     let untold: Vec<Peer> = std::mem::take(&mut *lock(&net.inner().untold));
     for peer in untold {
-        let again = net.inner().peers().get(&peer.node_id).is_some_and(|p| p.fingerprint == peer.fingerprint);
+        let again = net.inner().peers().get(&peer.node_id, Role::Worker).is_some_and(|p| p.fingerprint == peer.fingerprint);
         if !again && !tell_unpaired(net, &peer).await {
             lock(&net.inner().untold).push(peer);
         }
@@ -554,10 +618,10 @@ pub(crate) async fn tell_untold(net: &Network) {
 
 /// A paired worker, by node id, and the client that reaches it.
 fn worker_of(net: &Network, node_id: &str) -> Result<(Peer, reqwest::Client), Response> {
-    if net.settings().active_role() != Role::Primary {
+    if !net.settings().uses() {
         return Err(error(StatusCode::CONFLICT, "network_off", "OAIY Network is not on as a primary here"));
     }
-    let Some(peer) = net.inner().peers().get(node_id).filter(|p| p.role == Role::Worker).cloned() else {
+    let Some(peer) = net.inner().peers().get(node_id, Role::Worker).cloned() else {
         return Err(error(StatusCode::NOT_FOUND, "node_unknown", format!("no worker {node_id} is paired with this computer")));
     };
     let id = net.identity().map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e))?;
@@ -577,7 +641,7 @@ fn plain(e: &reqwest::Error) -> String {
     }
     let text = cause.to_string();
     if e.is_connect() && text.to_ascii_lowercase().contains("refused") {
-        return "connection refused (is OAIY running there, with Network on as a worker?)".into();
+        return "connection refused (is OAIY running there, with Lend this computer on?)".into();
     }
     text
 }
@@ -692,7 +756,7 @@ fn local_default(services: &[Value], kind: &str) -> Option<String> {
 /// language model is the worker's chosen one, whichever that is now. `local` is this computer's own default of the kind
 /// now, where known: one chosen since the worker's was (in Engines) is this computer's own again.
 fn in_effect(net: &Network, kind: &str, remote: &[Value], local: Option<&str>) -> Option<Value> {
-    if net.settings().active_role() != Role::Primary {
+    if !net.settings().uses() {
         return None;
     }
     let mut chosen = net.inner().defaults().get(kind).cloned()?;
@@ -778,11 +842,11 @@ pub fn service_target(service: &str) -> Option<ServiceTarget> {
 }
 
 pub(crate) fn service_target_of(net: &Network, service: &str) -> Option<ServiceTarget> {
-    if net.settings().active_role() != Role::Primary {
+    if !net.settings().uses() {
         return None;
     }
     let node = net.inner().services().get(service)?.to_string();
-    let peer = net.inner().peers().get(&node).filter(|p| p.role == Role::Worker).cloned()?;
+    let peer = net.inner().peers().get(&node, Role::Worker).cloned()?;
     let client = client_for(&net.identity().ok()?, &peer.fingerprint).ok()?;
     let root = url(&peer.address, "");
     Some(ServiceTarget { base: format!("{root}/worker/v1/services/{service}"), root, client, node_name: peer.name })
@@ -811,13 +875,13 @@ fn set_services(net: &Network, change: &std::collections::BTreeMap<String, Optio
             net.inner().services().set(service, None)?;
             continue;
         };
-        if net.settings().active_role() != Role::Primary {
+        if !net.settings().uses() {
             return Err("switch Network on as a primary to use a worker's services".into());
         }
         if !worker::SHARED_SERVICES.iter().any(|(id, _)| id == service) {
             return Err(format!("{service} is not a service a worker lends"));
         }
-        let Some(peer) = net.inner().peers().get(node).filter(|p| p.role == Role::Worker).cloned() else {
+        let Some(peer) = net.inner().peers().get(node, Role::Worker).cloned() else {
             return Err(format!("{node} is not a worker paired with this computer"));
         };
         let listed = lock(&net.inner().nodes)
@@ -860,14 +924,14 @@ async fn set_defaults(net: &Network, change: &std::collections::BTreeMap<String,
             net.inner().defaults().set(kind, None)?;
             continue;
         };
-        if net.settings().active_role() != Role::Primary {
+        if !net.settings().uses() {
             return Err("switch Network on as a primary to use a worker's model as a default".into());
         }
         let Some(rest) = id.strip_prefix(&format!("engine:{kind}:node.")) else {
             return Err(format!("{id} is not a worker's {kind} model (engine:{kind}:node.<nodeId>/<model>)"));
         };
         let node = rest.split_once('/').map_or("", |(n, _)| n);
-        let Some(peer) = net.inner().peers().get(node).filter(|p| p.role == Role::Worker).cloned() else {
+        let Some(peer) = net.inner().peers().get(node, Role::Worker).cloned() else {
             return Err(format!("{node} is not a worker paired with this computer"));
         };
         if !remote_services_of(net).iter().any(|e| e["id"] == id && e["kind"] == kind.as_str()) {
@@ -1121,8 +1185,14 @@ pub(crate) async fn check(net: &Network, peer: &Peer) {
         addresses.extend(f.addresses.iter().filter(|a| **a != peer.address).cloned());
     }
     let mut last_error = None;
+    // (this computer lending itself too: where it listens, so a worker that uses it as well keeps its address)
+    let lends_on = net.listening().map(|a| a.port().to_string());
     for address in addresses {
-        match client.get(url(&address, "/worker/v1/capabilities")).timeout(HEARTBEAT_DEADLINE).send().await {
+        let mut ask = client.get(url(&address, "/worker/v1/capabilities")).timeout(HEARTBEAT_DEADLINE);
+        if let Some(port) = &lends_on {
+            ask = ask.header("x-oaiy-lends-on", port);
+        }
+        match ask.send().await {
             Ok(r) if r.status().is_success() => {
                 let caps = r.json::<Value>().await.unwrap_or(Value::Null);
                 if address != peer.address {
@@ -1133,7 +1203,7 @@ pub(crate) async fn check(net: &Network, peer: &Peer) {
                 *s = NodeState { online: true, last_seen_ms: now_ms(), last_error: None, capabilities: Some(caps) };
                 return;
             }
-            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => last_error = Some("the worker no longer accepts this computer (unpaired there)".to_string()),
+            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => last_error = Some("it no longer lends itself to this computer (unpaired there, or Lend this computer is off there)".to_string()),
             Ok(r) => last_error = Some(format!("the worker answered HTTP {}", r.status())),
             Err(e) => last_error = Some(plain(&e)),
         }
@@ -1159,7 +1229,7 @@ pub fn remote_services() -> Vec<Value> {
 }
 
 pub(crate) fn remote_services_of(net: &Network) -> Vec<Value> {
-    if net.settings().active_role() != Role::Primary {
+    if !net.settings().uses() {
         return Vec::new();
     }
     let workers: Vec<Peer> = net.inner().peers().list().iter().filter(|p| p.role == Role::Worker).cloned().collect();

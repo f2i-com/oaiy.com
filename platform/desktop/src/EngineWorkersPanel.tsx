@@ -22,12 +22,12 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
       const s = await network.status();
       setStatus(s);
       setError(null);
-      if (s.role !== 'primary') {
+      if (!s.uses) {
         setNodes([]);
         return;
       }
       const [n, c] = await Promise.all([network.nodes(), engines.catalog().catch(() => null)]);
-      setNodes(n.nodes.filter((x) => x.role === 'worker'));
+      setNodes(n.nodes.filter((x) => x.uses ?? x.role === 'worker'));
       setLocal(c?.defaults ?? {});
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -56,7 +56,7 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
     return <div className="panel">{error ? <div className="banner banner-err">{error}</div> : <div className="empty-state">Loading…</div>}</div>;
   }
 
-  if (status.role !== 'primary') {
+  if (!status.uses) {
     return (
       <div className="panel" data-testid="engine-workers">
         <section className="model-section">
@@ -64,9 +64,9 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
             <h3 className="section-title">Models on other computers</h3>
           </div>
           <p className="form-hint">
-            {status.role === 'worker'
-              ? 'This computer lends its models to a primary (OAIY Network). Other computers’ models are used from a primary.'
-              : 'With OAIY Network, this computer uses the models of other OAIY computers on your network as its own, and can make one its default for a kind. It is off until you switch it on as a primary.'}
+            {status.lends
+              ? 'This computer lends itself (OAIY Network). Switch on Use other computers too, in Setup → Networking, to use other computers’ models here.'
+              : 'With OAIY Network, this computer uses the models of other OAIY computers on your network as its own, and can make one its default for a kind. It is off until you switch on Use other computers.'}
           </p>
           <div className="form-actions">
             <button className="btn btn-secondary" onClick={onOpenNetworking}>

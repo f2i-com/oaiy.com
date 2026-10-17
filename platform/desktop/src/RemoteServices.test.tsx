@@ -30,9 +30,9 @@ const button = (label: string) => Array.from(container.querySelectorAll('button'
 
 describe('RemoteServices', () => {
   it("uses a worker's OAIY Voice here with a press, and gives it back", async () => {
-    api.network.status.mockResolvedValue({ enabled: true, role: 'primary', services: {} });
-    api.network.useService.mockResolvedValueOnce({ enabled: true, role: 'primary', services: { 'oaiy-voice': { nodeId: 'w1', nodeName: 'Rig' } } });
-    api.network.useService.mockResolvedValueOnce({ enabled: true, role: 'primary', services: {} });
+    api.network.status.mockResolvedValue({ enabled: true, role: 'primary', uses: true, services: {} });
+    api.network.useService.mockResolvedValueOnce({ enabled: true, role: 'primary', uses: true, services: { 'oaiy-voice': { nodeId: 'w1', nodeName: 'Rig' } } });
+    api.network.useService.mockResolvedValueOnce({ enabled: true, role: 'primary', uses: true, services: {} });
     await mount();
     const row = container.querySelector('[data-testid="remote-service"]')!;
     expect(row.textContent).toContain('OAIY Voice');
@@ -46,7 +46,7 @@ describe('RemoteServices', () => {
   });
 
   it('shows nothing where no paired computer lends a service', async () => {
-    api.network.status.mockResolvedValue({ enabled: true, role: 'primary' });
+    api.network.status.mockResolvedValue({ enabled: true, role: 'primary', uses: true });
     api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, services: [] }] });
     await mount();
     expect(container.textContent).toBe('');

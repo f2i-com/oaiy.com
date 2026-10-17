@@ -2095,3 +2095,33 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .network-extra > .settings-label { flex: none; width: 128px; }
 .network-extra-what { min-width: 0; flex: 1; color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
 .network-extra .btn-tiny { flex: none; height: 24px; }
+
+/* A paired computer's way: this computer uses it, it uses this computer, or both. */
+.network-way {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  padding: 1px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+/* The two things a computer does, each a card that is on or off: a tick in its corner. */
+.network-role { position: relative; }
+.network-role-check {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  place-items: center;
+  margin-left: auto;
+  border: 1px solid var(--strong-border);
+  border-radius: 5px;
+  background: var(--surface-raised);
+  color: #fff;
+}
+.network-role.is-chosen .network-role-check { border-color: var(--primary); background: var(--primary); }
+.network-both-ways { display: flex; align-items: flex-start; gap: 8px; color: var(--text); font-size: 12.5px; cursor: pointer; }
+.network-both-ways input { flex: none; width: auto; height: auto; margin-top: 2px; accent-color: var(--primary); }
+.network-both-ways small { color: var(--faint); }
