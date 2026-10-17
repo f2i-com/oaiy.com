@@ -517,13 +517,20 @@ fn a_pinned_language_model_keeps_its_gpu() {
     let on = crate::llm::egpu::available();
     assert_eq!(on_card(&c, Kind::Image, &picture), on, "unpinned: the card lent where there is one");
     crate::util::set(crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap(), "pinned", Json::Bool(true));
-    assert!(pinned(&c) && !on_card(&c, Kind::Image, &picture), "pinned on the card: made here");
+    assert!(pinned(&c) && !on_card(&c, Kind::Image, &picture), "pinned on the card: not lent for it");
+    // and not made here instead, unless the settings say so; a call's speech is made here as ever
+    assert!(refused_here(&c, Kind::Image, &picture) && refused_here(&c, Kind::Video, &body("{}")));
+    assert!(!refused_here(&c, Kind::Speech, &body("{}")));
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["media"]).unwrap(), "fallback_here", Json::Bool(true));
+    assert!(!refused_here(&c, Kind::Image, &picture), "media.fallback_here: made here");
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["media"]).unwrap(), "fallback_here", Json::Bool(false));
     assert!(!pauses_llm(&c) && !needs_media_gpu(&c, Some("big")), "pinned: never stopped for media");
     // the pinned model on this computer's GPU: the card may still be lent (the model is not there)
     let llm = crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap();
     crate::util::set(llm, "models", body(r#"[{"name":"big","path":"big.gguf","egpu":true},{"name":"here","path":"here.gguf"}]"#));
     crate::util::set(llm, "default_model", Json::str("here"));
     assert_eq!(on_card(&c, Kind::Image, &picture), on);
+    assert!(!refused_here(&c, Kind::Image, &picture), "the card lent: made there");
 }
 
 /// A job's error that says it ran out of memory is tried once more; others are not.

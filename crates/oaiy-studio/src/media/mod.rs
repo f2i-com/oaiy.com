@@ -1156,12 +1156,25 @@ pub fn needs_media_gpu(cfg: &Json, model: Option<&str>) -> bool {
 /// switched on and answers with OAIY's own engine; pictures where it makes them (`llm.egpu.images`), the others where
 /// it makes media (`llm.egpu.media`), each on unless switched off.
 pub fn on_card(cfg: &Json, kind: Kind, request: &Json) -> bool {
+    // (a pinned language model the card holds is never let go for media)
+    let held = cfg.get("llm").is_some_and(|llm| pinned(cfg) && !crate::llm::holds_a_model(llm));
+    for_card(cfg, kind, request) && !held
+}
+
+/// Whether a job of `kind` is the eGPU's card's to make, the card's language model aside: the eGPU switched on with
+/// OAIY's own engine, and the job's kind (pictures, or the other media) not switched off for it.
+fn for_card(cfg: &Json, kind: Kind, request: &Json) -> bool {
     let Some(llm) = cfg.get("llm") else { return false };
     let egpu = llm.get("egpu").unwrap_or(&Json::Null);
     let wanted = if kind == Kind::Image { bool_or(egpu, "images", true) } else { bool_or(egpu, "media", true) };
-    // (a pinned language model the card holds is never let go for media: they are made on this computer's GPU)
-    let held = pinned(cfg) && !crate::llm::holds_a_model(llm);
-    wanted && !held && crate::llm::egpu::enabled(llm) && crate::llm::egpu::webgpu(llm) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+    wanted && crate::llm::egpu::enabled(llm) && crate::llm::egpu::webgpu(llm) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+}
+
+/// Whether a job the card is for, which the card's pinned language model keeps from it, is refused rather than made on
+/// this computer's GPU: so unless `media.fallback_here` says otherwise (speech aside, which a call speaks on this
+/// computer's GPU by design). A Mac's GPU is its language model's; a picture there is slow and heats it.
+fn refused_here(cfg: &Json, kind: Kind, request: &Json) -> bool {
+    kind != Kind::Speech && for_card(cfg, kind, request) && !on_card(cfg, kind, request) && !falls_back_here(cfg)
 }
 
 /// Whether the language model is pinned (`llm.pinned`): never let go for media, nor when it is idle.
@@ -1751,6 +1764,9 @@ impl Media {
         let cfg = studio.config();
         let media = cfg.get("media").cloned().unwrap_or(Json::Null);
         let device = int_or(&media, "device", 0);
+        if refused_here(&cfg, job.kind, &job.request) {
+            return Err("the eGPU's card holds its pinned language model, and media are not made on this computer's GPU (media.fallback_here lets them)".into());
+        }
         if on_card(&cfg, job.kind, &job.request) && takes_card(job.kind, studio.egpu.is_lent(), studio.egpu.is_running()) && !job.cancel.load(Ordering::Relaxed) {
             let label = if job.incognito { "incognito job" } else { job.id.as_str() };
             match studio.egpu.lend(&cfg, &studio.root, CARD_WAIT) {

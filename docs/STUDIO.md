@@ -528,7 +528,8 @@ The rules, one GPU at a time:
   reviewer, pinned there to stay warm). A picture the card was to make is never
   made on the Mac instead: out of memory, it is tried on the card once more with
   everything idle let go, and otherwise it fails with the card's reason
-  (`media.fallback_here: true` lets this computer make it). Before, a card out of
+  (`media.fallback_here: true` lets this computer make it), nor where the card holds a pinned language model (the job
+  fails, saying so; speech for a call is made on the Mac as ever). Before, a card out of
   memory sent FLUX 3 Klein to the Mac's GPU, where it failed after 47 s.
   `OAIY_TEXT_ENCODER_GPU=own` puts every encoder on the Mac, `auto` those that keep no layers; `OAIY_TEXT_ENCODER_KEEP=1` keeps them on the card. A chat that wants its GPU, a job that
   asks for its models to go after it (`"release": true`, the image node's
