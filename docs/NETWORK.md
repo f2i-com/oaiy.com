@@ -167,8 +167,11 @@ Mac's own):
 | Text to image (the flow) with its picture step on the worker | 27 s, passed first time, the review reading the picture by its primary address |
 | A chat streamed from the worker's language model | streamed as it came |
 | The Agent's kind of request (a tool call) through the worker | `tool_calls` answered in 1.9 s |
+| A chat stream closed by the client | The worker's engine stopped within about a second (its CPU 64% → 4%), not at the answer's end |
 | The worker stopped | `503 node_offline`, *connection refused*; the flow failed saying so, nothing fell back |
 | Both restarted | The worker listened again by itself; the primary saw it online within 2 s |
+| Pinning MOSS-Image Q8 8-step from the primary | Loaded on the card by itself in 33 s; kept past a release and a picture asking for release (10.8 s, nothing reloaded); a Qwen Image picture refused at once, naming the pin; unpinned again |
+| Pairing, both screens | `approved_there` after the worker's yes, paired only on the primary's yes |
 
 The desktop's tests cover the same with a fake engine (src/network/tests.rs: pairing and use, a stranger and an
 impostor, unpairing from each side, pins, off and public addresses refused), and the Studio's the pins with a fake
