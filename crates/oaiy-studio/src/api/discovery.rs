@@ -113,7 +113,7 @@ fn names(section: Option<&Json>) -> Vec<(String, Json)> {
 
 /// The files each kind of model names, by field (what `missing_files` checks).
 const LLM_FILES: [&str; 3] = ["path", "vision_projector", "lora"];
-const IMAGE_FILES: [&str; 8] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer", "vae"];
+const IMAGE_FILES: [&str; 9] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer", "vae", "distill"];
 const VIDEO_FILES: [&str; 8] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae", "dev_transformer", "spatial_upscaler", "id_lora"];
 const SPEECH_FILES: [&str; 3] = ["design", "base", "breeze"];
 const MUSIC_FILES: [&str; 2] = ["path", "language_model"];
@@ -227,7 +227,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("max_references", Json::Int(if arch == "flux3-klein" { 10 } else if edits { 3 } else { 0 })),
                 ("size_step", Json::Int(if sdxl { 64 } else if matches!(arch, "flux2-klein-4b" | "flux3-klein" | "moss-image") { 16 } else { 32 })),
                 ("default_size", Json::str(format!("{}x{}", int_or(&m, "width", 1024), int_or(&m, "height", 1024)))),
-                ("negative_prompt", Json::Bool(sdxl || arch == "moss-image")),
+                // (a MOSS-Image distillation's passes take none)
+                ("negative_prompt", Json::Bool(sdxl || (arch == "moss-image" && str_or(&m, "distill", "").trim().is_empty()))),
             ]);
             with_files(entry, missing_files(&studio.root, &m, &IMAGE_FILES))
         })

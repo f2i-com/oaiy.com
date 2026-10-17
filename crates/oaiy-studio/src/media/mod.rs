@@ -567,21 +567,28 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         if model_loras(root, model, body)?.is_some_and(|l| l.as_array().is_some_and(|a| !a.is_empty())) {
             return Err("MOSS-Image takes no LoRAs yet".into());
         }
-        // (the pipeline's own: 50 steps, cfg 3, shift 5, its negative branch skipping block 22; a model's or the
-        // request's where they set them)
-        f.push(("steps".into(), Json::Int(steps(50, 1, 100)?)));
-        let number = |key: &str, default: f64, lo: f64, hi: f64| -> Result<f64, String> {
-            match body.get(key).or_else(|| model.get(key)).filter(|v| !matches!(v, Json::Null)) {
-                None => Ok(default),
-                Some(v) => v.as_f64().filter(|c| c.is_finite() && (lo..=hi).contains(c)).ok_or_else(|| format!("{key} must be a number from {lo} to {hi}")),
+        // a distillation's: its passes (8, or fewer where the model or the request says), one forward each, with no
+        // guidance, shift, negative prompt or skipped block
+        if let Some(distill) = path_field(root, model, "distill") {
+            f.push(("distill".into(), Json::str(distill)));
+            f.push(("steps".into(), Json::Int(steps(8, 1, 100)?)));
+        } else {
+            // (the pipeline's own: 50 steps, cfg 3, shift 5, its negative branch skipping block 22; a model's or the
+            // request's where they set them)
+            f.push(("steps".into(), Json::Int(steps(50, 1, 100)?)));
+            let number = |key: &str, default: f64, lo: f64, hi: f64| -> Result<f64, String> {
+                match body.get(key).or_else(|| model.get(key)).filter(|v| !matches!(v, Json::Null)) {
+                    None => Ok(default),
+                    Some(v) => v.as_f64().filter(|c| c.is_finite() && (lo..=hi).contains(c)).ok_or_else(|| format!("{key} must be a number from {lo} to {hi}")),
+                }
+            };
+            f.push(("cfg".into(), Json::Num(number("cfg", 3., 1., 10.)?)));
+            f.push(("shift".into(), Json::Num(number("shift", 5., 0.1, 20.)?)));
+            let negative = body.get("negative_prompt").and_then(Json::as_str).unwrap_or(str_or(model, "negative_prompt", ""));
+            f.push(("negative_prompt".into(), Json::str(negative)));
+            if let Some(layers) = body.get("uncond_skip_layers").or_else(|| model.get("uncond_skip_layers")).filter(|v| !matches!(v, Json::Null)) {
+                f.push(("uncond_skip_layers".into(), layers.clone()));
             }
-        };
-        f.push(("cfg".into(), Json::Num(number("cfg", 3., 1., 10.)?)));
-        f.push(("shift".into(), Json::Num(number("shift", 5., 0.1, 20.)?)));
-        let negative = body.get("negative_prompt").and_then(Json::as_str).unwrap_or(str_or(model, "negative_prompt", ""));
-        f.push(("negative_prompt".into(), Json::str(negative)));
-        if let Some(layers) = body.get("uncond_skip_layers").or_else(|| model.get("uncond_skip_layers")).filter(|v| !matches!(v, Json::Null)) {
-            f.push(("uncond_skip_layers".into(), layers.clone()));
         }
     } else {
         f.push(("base".into(), Json::str(path_field(root, model, "base").ok_or("Qwen Image model needs its base folder")?)));

@@ -3,7 +3,9 @@
 //! a JSON layout) and the negative one through Qwen3.5-9B ([`webgpu::text`]); the transformer ([`webgpu`]) over 50
 //! Euler steps of its own schedule (shifted, then snapped to its training grid) with classifier-free guidance whose
 //! negative branch skips block 22 (`uncond_skip_layers`); the FLUX.2 VAE's decoder (MOSS-Image's own smaller one, or
-//! FLUX.2's) last.
+//! FLUX.2's) last. With a distillation ([`distill`]) the transformer makes the picture in its few passes instead (8),
+//! without guidance or a negative prompt.
+pub mod distill;
 #[cfg(feature = "webgpu")]
 pub mod webgpu;
 
@@ -35,6 +37,9 @@ pub struct Request {
     pub shift: f64,
     /// The blocks the negative branch leaves out (zero-based).
     pub skip_layers: Vec<usize>,
+    /// A distillation ([`distill`]): its file or folder. `steps` are then its passes (8 by default), and there is no
+    /// guidance, negative prompt, shift or skipped block.
+    pub distill: Option<PathBuf>,
     pub seed: u64,
     pub device: usize,
 }
@@ -160,6 +165,11 @@ impl Request {
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         };
         let seed = number("seed", 0, 0, i64::MAX - count as i64)? as u64;
+        let distill = match j.get("distill") {
+            None | Some(Json::Null) => None,
+            Some(v) if v.as_str().is_some_and(|s| s.trim().is_empty()) => None,
+            Some(_) => Some(path("distill", true)?),
+        };
         let output = j.get("output_dir").and_then(Json::as_str).filter(|s| !s.trim().is_empty()).ok_or("output_dir is required")?.into();
         Ok(Self {
             transformer: path("transformer", true)?,
@@ -172,10 +182,12 @@ impl Request {
             count,
             width,
             height,
-            steps: number("steps", 50, 1, 100)?,
-            guidance: real(&["cfg", "guidance"], 3., 1., 10.)?,
+            steps: number("steps", if distill.is_some() { 8 } else { 50 }, 1, 100)?,
+            // (a distillation's passes take none of these: one forward each, from its own times)
+            guidance: if distill.is_some() { 1. } else { real(&["cfg", "guidance"], 3., 1., 10.)? },
             shift: real(&["shift"], 5., 0.1, 20.)?,
-            skip_layers,
+            skip_layers: if distill.is_some() { Vec::new() } else { skip_layers },
+            distill,
             seed,
             device: number("device", 0, 0, 31)?,
         })
@@ -199,15 +211,24 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
     use crate::klein::vae;
     use crate::moss_image::webgpu::{text::WgpuMossText, Config, WgpuMoss};
     use candle_core::bail;
-    // the transformer's header first: which checkpoint, before anything is loaded
+    // the transformer's header first: which checkpoint, before anything is loaded; a distillation's codes
     let cfg = Config::of(&crate::common::weights::Weights::open(&r.transformer)?)?;
+    let mut distill = r.distill.as_deref().map(distill::Distillation::open).transpose()?;
+    if let Some(d) = &distill {
+        if r.steps > d.codes.len() {
+            bail!("the distillation makes a picture in at most {} passes, not {}", d.codes.len(), r.steps);
+        }
+        if d.channels != cfg.channels {
+            bail!("the distillation mixes {} channels, MOSS-Image's latent has {}", d.channels, cfg.channels);
+        }
+    }
     if cfg.context != 4096 {
         bail!("MOSS-Image's transformer takes text states 4,096 wide, not {}", cfg.context);
     }
     if let Some(bad) = r.skip_layers.iter().find(|&&i| i >= cfg.layers) {
         bail!("MOSS-Image's transformer has {} blocks: it cannot skip block {bad}", cfg.layers);
     }
-    let guided = r.guidance != 1.;
+    let guided = distill.is_none() && r.guidance != 1.;
     let clock = Instant::now();
     event(Json::obj([("stage", Json::str("encoding_text")), ("architecture", Json::str("moss-image"))]));
     let (contexts, negative) = {
@@ -221,7 +242,7 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
     event(Json::obj([("stage", Json::str("loading_vae"))]));
     let (decoder, mean, std) = vae::vae_on_webgpu(&r.vae, gpu.clone(), false)?;
     event(Json::obj([("stage", Json::str("loading_transformer"))]));
-    let mut model = WgpuMoss::load_on(&r.transformer, gpu, |_, _| {})?;
+    let mut model = WgpuMoss::load_with(&r.transformer, gpu, distill.as_mut(), |_, _| {})?;
     let prompts = contexts.iter().map(|(states, n)| model.prompt(states, *n)).collect::<candle_core::Result<Vec<_>>>()?;
     let negative = negative.map(|(states, n)| model.prompt(&states, n)).transpose()?;
     std::fs::create_dir_all(&r.output)?;
@@ -231,7 +252,7 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
     let mut manifest = std::fs::OpenOptions::new().create_new(true).write(true).open(batch.join("manifest.jsonl"))?;
     let (h, w) = (r.height / 16, r.width / 16);
     let sigmas = schedule(r.steps, r.shift as f32);
-    let steps = sigmas.len() - 1;
+    let steps = if distill.is_some() { r.steps } else { sigmas.len() - 1 };
     let mut data = Vec::new();
     for i in 0..r.count {
         let seed = r.seed + i as u64;
@@ -239,7 +260,16 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
         let (text, prompt) = (&prompts[if prompts.len() == 1 { 0 } else { i }], &r.prompts[index]);
         let mut x = noise(seed, h * w * 128);
         let sample = Instant::now();
-        for step in 0..steps {
+        // a distillation's: each pass from the noise and the clean estimate so far, at its next time; the last
+        // estimate is the picture's latent
+        if let Some(d) = &distill {
+            x = d.sample(&x, steps, |step, x, time| {
+                let v = model.predict(x, h, w, time, text, &[]);
+                event(Json::obj([("stage", Json::str("sampling")), ("image", Json::Int(i as i64 + 1)), ("step", Json::Int(step as i64 + 1)), ("steps", Json::Int(steps as i64))]));
+                v
+            })?;
+        }
+        for step in 0..if distill.is_some() { 0 } else { steps } {
             let (sigma, next) = (sigmas[step], sigmas[step + 1]);
             let t = sigma * TRAINING_STEPS as f32;
             let conditional = model.predict(&x, h, w, t, text, &[])?;
@@ -284,6 +314,7 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
             ("cfg", Json::Num(r.guidance)),
             ("shift", Json::Num(r.shift)),
             ("uncond_skip_layers", Json::Arr(r.skip_layers.iter().map(|&i| Json::Int(i as i64)).collect())),
+            ("distilled", Json::Bool(distill.is_some())),
             ("width", Json::Int(r.width as i64)),
             ("height", Json::Int(r.height as i64)),
             ("transformer", Json::str(r.transformer.to_string_lossy())),
@@ -386,6 +417,7 @@ mod tests {
                 guidance: real("cfg"),
                 shift: real("shift"),
                 skip_layers: text("uncond_skip_layers").split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+                distill: None,
                 seed: int("seed") as u64,
                 device: 0,
             };

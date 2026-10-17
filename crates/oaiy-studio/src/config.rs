@@ -639,6 +639,15 @@ pub fn validate(v: &Json) -> Result<(), String> {
                 return Err(format!("image model {name}: reference_pixels must be from 4096 to 4194304"));
             }
         }
+        // a distillation's file or folder: MOSS-Image's alone (its passes the model's steps)
+        if m.get("distill").is_some_and(|v| !matches!(v, Json::Null)) {
+            if !m.get("distill").is_some_and(|v| v.as_str().is_some()) {
+                return Err(format!("image model {name}: distill must be the path of a distillation"));
+            }
+            if arch != "moss-image" && !str_or(m, "distill", "").trim().is_empty() {
+                return Err(format!("image model {name}: a distillation (distill) is for MOSS-Image models"));
+            }
+        }
         // MOSS-Image: 50 steps, cfg 3, shift 5, its negative branch skipping block 22, unless a model sets its own
         if arch == "moss-image" {
             if m.get("steps").is_some_and(|v| !v.as_i64().is_some_and(|n| (1..=100).contains(&n))) {

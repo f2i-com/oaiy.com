@@ -8,11 +8,13 @@
 //!
 //! Its matrices as [`crate::flux3::webgpu`] holds FLUX 3's: a checkpoint's floats f16 (its BF16 as Q8_0 where the
 //! tensor cores take Q8_0 and not f16, or the card has no room for f16 beside a picture's work), a GGUF's K-quant
-//! blocks as they are. The text encoder is [`text`].
+//! blocks as they are. The text encoder is [`text`]. A distillation's factors ([`crate::moss_image::distill`]) are
+//! kept beside each block's matrices as f16, added as the step runs (`B A x`, in [`mul`]).
 pub mod text;
 
 use crate::common::lora::Loras;
 use crate::common::weights::Weights;
+use crate::moss_image::distill::{Distillation, Factors, REPLACES};
 use crate::qwen_image::webgpu::transformer::{err, first, matrix_as, mul, vector, weights_q8, Low, Mat};
 use candle_core::Result;
 use ggml_rs::{ChainRecorder, DeviceChain, DeviceVec, RowNorm};
@@ -99,6 +101,14 @@ pub fn timestep(t: f32) -> Vec<f32> {
     let half = FREQ / 2;
     let phase = |j: usize| t as f64 * 10_000f64.powf(-(j as f64) / half as f64);
     (0..half).map(|j| phase(j).cos() as f32).chain((0..half).map(|j| phase(j).sin() as f32)).collect()
+}
+
+/// `values` (`what`'s) as f16 on `gpu`.
+fn f16_vec(gpu: &ggml_rs_wgpu::WgpuBackend, values: &[f32], what: &str) -> Result<DeviceVec> {
+    let words = crate::common::webgpu_weights::f16_words_f32(values).ok_or_else(|| err(format!("{what}: an odd count, or past f16's range")))?;
+    let v = gpu.vec(words.len());
+    gpu.upload(&v, &words);
+    Ok(v)
 }
 
 /// A linear layer's weight and (where it has one) bias.
@@ -201,6 +211,11 @@ pub struct WgpuMoss {
     final_norm: DeviceVec,
     final_norm_less_1: DeviceVec,
     final_proj: Mat,
+    /// A distillation's largest rank and widest adapted output (the running vectors of its factors; 0: none).
+    rank: usize,
+    widest: usize,
+    /// Its blocks' matrices quantized (Q8_0 of the BF16 checkpoint's, or a GGUF's), not f16.
+    quantized: bool,
     scratch: Option<Scratch>,
     /// Each picture size and prompt length's RoPE table.
     tables: Vec<((usize, usize, usize), DeviceVec)>,
@@ -214,7 +229,13 @@ impl WgpuMoss {
     }
 
     /// [`Self::load`] onto `gpu` (the VAE's beside it).
-    pub fn load_on(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, mut progress: impl FnMut(usize, usize)) -> Result<Self> {
+    pub fn load_on(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, progress: impl FnMut(usize, usize)) -> Result<Self> {
+        Self::load_with(path, gpu, None, progress)
+    }
+
+    /// [`Self::load_on`] with `distill`'s factors beside each block's projections and its time embedding and
+    /// modulations' biases in place of the transformer's.
+    pub fn load_with(path: &Path, gpu: ggml_rs_wgpu::WgpuBackend, mut distill: Option<&mut Distillation>, mut progress: impl FnMut(usize, usize)) -> Result<Self> {
         let mut w = Weights::open(path)?;
         let cfg = Config::of(&w)?;
         let mut none = Loras::open(&[])?;
@@ -250,9 +271,33 @@ impl WgpuMoss {
                 kn: vector(&mut w, &gpu, &format!("{p}.k_norm.weight"), 0.)?,
             });
         }
-        let time = [linear(&mut w, &mut none, "time_embedding.0", true)?, linear(&mut w, &mut none, "time_embedding.2", true)?];
-        let modulation = linear(&mut w, &mut none, "shared_block_modulation", true)?;
-        let head_modulation = linear(&mut w, &mut none, "video_head_modulation", true)?;
+        // (a distillation's in place of these, each of the shape it replaces)
+        if let Some(d) = distill.as_deref_mut() {
+            for name in REPLACES {
+                let Some(dw) = d.replacing(name) else { candle_core::bail!("the distillation has no {name}") };
+                if dw.shape(name)? != w.shape(name)? {
+                    candle_core::bail!("the distillation's {name} is {:?}, the transformer's {:?}", dw.shape(name)?, w.shape(name)?);
+                }
+            }
+        }
+        let mut time_layer = |w: &mut Weights, name: &str| -> Result<Linear> {
+            match distill.as_deref_mut().and_then(|d| d.replacing(&format!("{name}.weight"))) {
+                Some(dw) => linear(dw, &mut none, name, true),
+                None => linear(w, &mut none, name, true),
+            }
+        };
+        let time = [time_layer(&mut w, "time_embedding.0")?, time_layer(&mut w, "time_embedding.2")?];
+        let mut modulated = |w: &mut Weights, name: &str| -> Result<Linear> {
+            let m = matrix_as(w, &mut Loras::open(&[])?, &gpu, name, false)?;
+            let bias = format!("{name}.bias");
+            let b = match distill.as_deref_mut().and_then(|d| d.replacing(&bias)) {
+                Some(dw) => vector(dw, &gpu, &bias, 0.)?,
+                None => vector(w, &gpu, &bias, 0.)?,
+            };
+            Ok(Linear { m, b: Some(b) })
+        };
+        let modulation = modulated(&mut w, "shared_block_modulation")?;
+        let head_modulation = modulated(&mut w, "video_head_modulation")?;
         let host = |w: &mut Weights, name: &str| -> Result<Vec<f32>> { w.tensor(name, &candle_core::Device::Cpu, candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>() };
         let upload = |v: &[f32]| {
             let d = gpu.vec(v.len());
@@ -260,12 +305,59 @@ impl WgpuMoss {
             d
         };
         let mut blocks = Vec::with_capacity(cfg.layers);
+        let (mut rank, mut widest) = (0, 0);
         for i in 0..cfg.layers {
             let p = format!("layers.{i}");
             let fused = w.has(&format!("{p}.proj.qkv.weight"));
             let mut m = |name: &str| matrix_as(&mut w, &mut none, &gpu, &format!("{p}.proj.{name}"), q8);
-            let qkv = if fused { Qkv::Fused(m("qkv")?) } else { Qkv::Apart([m("q")?, m("k")?, m("v")?]) };
-            let (o, up_gate, down) = (m("o")?, m("ffn_up_gate")?, m("ffn_down")?);
+            let mut qkv = if fused { Qkv::Fused(m("qkv")?) } else { Qkv::Apart([m("q")?, m("k")?, m("v")?]) };
+            let (mut o, mut up_gate, mut down) = (m("o")?, m("ffn_up_gate")?, m("ffn_down")?);
+            if let Some(d) = distill.as_deref_mut() {
+                let mut beside = |mat: &mut Mat, f: Factors| -> Result<()> {
+                    if (f.out, f.input) != (mat.n, mat.k) {
+                        candle_core::bail!("{p}: the distillation's factors are for a {}x{} matrix, not {}x{}", f.out, f.input, mat.n, mat.k);
+                    }
+                    (rank, widest) = (rank.max(f.rank), widest.max(f.out));
+                    mat.lora.push((f16_vec(&gpu, &f.a, &p)?, f16_vec(&gpu, &f.b, &p)?, f.rank));
+                    Ok(())
+                };
+                let mut take = |module: &str| d.factors(i, module);
+                match &mut qkv {
+                    Qkv::Apart(mats) => {
+                        for (mat, module) in mats.iter_mut().zip(["q", "k", "v"]) {
+                            if let Some(f) = take(module)? {
+                                beside(mat, f)?;
+                            }
+                        }
+                    }
+                    // ComfyUI's one matrix: the three factors' `A`s stacked and their `B`s along its diagonal
+                    Qkv::Fused(mat) => {
+                        let parts = [take("q")?, take("k")?, take("v")?];
+                        if parts.iter().any(Option::is_some) {
+                            let Some(r) = parts.iter().flatten().map(|f| f.rank).max() else { unreachable!() };
+                            let (d3, k) = (mat.n / 3, mat.k);
+                            let (mut a, mut b) = (vec![0f32; 3 * r * k], vec![0f32; mat.n * 3 * r]);
+                            for (j, f) in parts.iter().enumerate() {
+                                let Some(f) = f else { continue };
+                                if (f.out, f.input) != (d3, k) {
+                                    candle_core::bail!("{p}: the distillation's factors are for a {}x{} matrix, not {d3}x{k}", f.out, f.input);
+                                }
+                                a[j * r * k..(j * r + f.rank) * k].copy_from_slice(&f.a);
+                                for row in 0..d3 {
+                                    let at = (j * d3 + row) * 3 * r + j * r;
+                                    b[at..at + f.rank].copy_from_slice(&f.b[row * f.rank..(row + 1) * f.rank]);
+                                }
+                            }
+                            beside(mat, Factors { a, b, rank: 3 * r, out: mat.n, input: k })?;
+                        }
+                    }
+                }
+                for (mat, module) in [(&mut o, "o"), (&mut up_gate, "ffn_up_gate"), (&mut down, "ffn_down")] {
+                    if let Some(f) = take(module)? {
+                        beside(mat, f)?;
+                    }
+                }
+            }
             let mut norms = host(&mut w, &format!("{p}.norm1.weight"))?;
             norms.extend(host(&mut w, &format!("{p}.norm2.weight"))?);
             let less_1: Vec<f32> = norms.iter().map(|v| v - 1.).collect();
@@ -284,6 +376,7 @@ impl WgpuMoss {
         let final_values = host(&mut w, "final_norm_video.weight")?;
         let final_less_1: Vec<f32> = final_values.iter().map(|v| v - 1.).collect();
         let final_proj = matrix_as(&mut w, &mut none, &gpu, "final_linear_video", false)?;
+        let quantized = blocks.iter().any(|b| matches!(b.o.w, crate::qwen_image::webgpu::transformer::W::Quant(_)));
         Ok(Self {
             final_norm: upload(&final_values),
             final_norm_less_1: upload(&final_less_1),
@@ -297,6 +390,9 @@ impl WgpuMoss {
             head_modulation,
             blocks,
             final_proj,
+            rank,
+            widest,
+            quantized,
             scratch: None,
             tables: Vec::new(),
         })
@@ -304,6 +400,11 @@ impl WgpuMoss {
 
     pub fn config(&self) -> Config {
         self.cfg
+    }
+
+    /// Whether its blocks' matrices are quantized (Q8_0 of the checkpoint's BF16 ones, or a GGUF's), not f16.
+    pub fn quantized(&self) -> bool {
+        self.quantized
     }
 
     /// The GPU it is on (the VAE beside it).
@@ -425,7 +526,7 @@ impl WgpuMoss {
             shifts: v(2 * d),
             block_mods: (0..layers).map(|_| v(4 * d)).collect(),
             final_mods: v(2 * d),
-            low: Low { t: v(1), y: v(1) },
+            low: Low { t: v(rows * self.rank), y: v(rows * self.widest) },
         }
     }
 
@@ -606,6 +707,171 @@ mod tests {
         std::fs::remove_file(&file).ok();
         let worst = got.iter().zip(&want).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0., f64::max);
         assert!(worst < 1e-3, "{worst}");
+        Ok(())
+    }
+
+    /// Every tensor of `path` (a safetensors file), each with its shape and values.
+    fn all(path: &Path) -> Result<Vec<(String, Vec<usize>, Vec<f32>)>> {
+        let mut w = Weights::open(path)?;
+        w.names().into_iter().map(|n| Ok((n.clone(), w.shape(&n)?, w.tensor(&n, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?))).collect()
+    }
+
+    fn write(path: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) {
+        let list: Vec<(&str, &[usize], &[f32])> = tensors.iter().map(|(n, s, v)| (n.as_str(), s.as_slice(), v.as_slice())).collect();
+        crate::common::lora::write_f32(path, &list, &[]);
+    }
+
+    /// A distillation (`tools/moss_image/distill_fixture.py`'s for the tiny transformer: OpenMOSS's transformer with
+    /// its factors merged and its time embedding and biases in, in f32) gives a step's velocity at two of its times as
+    /// the reference does, and its sampler's three passes from the same noise the same latent: in its one file, as
+    /// kohya's factors and the two other files in a folder, and beside ComfyUI's fused q, k and v. Without it the
+    /// step is another.
+    #[test]
+    fn a_tiny_distilled_transformer_on_webgpu_is_openmosss() -> Result<()> {
+        if ggml_rs_wgpu::WgpuBackend::new(Some(1 << 30)).is_err() {
+            return Ok(());
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/moss_image");
+        let (tiny, adapter) = (dir.join("tiny.safetensors"), dir.join("tiny_distill.safetensors"));
+        let base = all(&tiny)?;
+        let parts = all(&adapter)?;
+        let value = |list: &[(String, Vec<usize>, Vec<f32>)], name: &str| list.iter().find(|(n, ..)| n == name).map(|t| t.2.clone()).unwrap();
+        let (latent, size, text) = (value(&base, "fixture.latent"), value(&base, "fixture.size"), value(&base, "fixture.text"));
+        let (h, w) = (size[0] as usize, size[1] as usize);
+        let wants = [(1000., value(&parts, "fixture.velocity_1000")), (791., value(&parts, "fixture.velocity_791"))];
+        let (noise, sampled) = (value(&parts, "fixture.noise"), value(&parts, "fixture.sampled"));
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let close = |got: &[f32], want: &[f32], what: &str| {
+            assert_eq!(got.len(), want.len(), "{what}");
+            let cosine = got.iter().zip(want).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() / (norm(got) * norm(want));
+            let rms = norm(want) / (want.len() as f64).sqrt();
+            let worst = got.iter().zip(want).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0., f64::max);
+            eprintln!("{what}: cosine {cosine:.7}, the worst error {worst:.2e} of an RMS {rms:.3}");
+            assert!(cosine > 0.9999 && worst < 0.01 * rms, "{what}: cosine {cosine}, worst {worst} of {rms}");
+        };
+        let check = |model: &Path, distill: &Path, layout: &str| -> Result<()> {
+            let mut d = crate::moss_image::distill::Distillation::open(distill)?;
+            assert_eq!(d.codes, [1000., 791., 24.]);
+            let mut gpu = WgpuMoss::load_with(model, ggml_rs_wgpu::WgpuBackend::nth(0, None).map_err(err)?, Some(&mut d), |_, _| {})?;
+            let prompt = gpu.prompt(&text, text.len() / 48)?;
+            for (time, want) in &wants {
+                close(&gpu.predict(&latent, h, w, *time, &prompt, &[])?, want, &format!("{layout}, time {time}"));
+            }
+            let got = d.sample(&noise, 3, |_, x, time| gpu.predict(x, h, w, time, &prompt, &[]))?;
+            close(&got, &sampled, &format!("{layout}, three passes"));
+            Ok(())
+        };
+        check(&tiny, &adapter, "one file")?;
+        // kohya's factors (`lora_down`, `lora_up` and an alpha of twice the rank: each `B` halved to keep the step) and
+        // the replacements and the sampler's in files of their own, in a folder
+        let folder = std::env::temp_dir().join(format!("oaiy-moss-distill-{}", std::process::id()));
+        std::fs::create_dir_all(&folder)?;
+        let mut kohya = Vec::new();
+        for (name, shape, values) in parts.iter().filter(|(n, ..)| n.contains(".lora_")) {
+            let (module, factor) = name.rsplit_once('.').unwrap();
+            let up = factor == "lora_B";
+            let values = if up { values.iter().map(|v| v / 2.).collect() } else { values.clone() };
+            kohya.push((format!("diffusion_model.{module}.{}.weight", if up { "lora_up" } else { "lora_down" }), shape.clone(), values));
+            if !up {
+                kohya.push((format!("diffusion_model.{module}.alpha"), vec![], vec![2. * shape[0] as f32]));
+            }
+        }
+        write(&folder.join("lora.safetensors"), &kohya);
+        let named = |names: &[&str]| parts.iter().filter(|(n, ..)| names.contains(&n.as_str())).cloned().collect::<Vec<_>>();
+        write(&folder.join("time_embedding.safetensors"), &named(&crate::moss_image::distill::REPLACES));
+        write(&folder.join("dataspace.safetensors"), &named(&["latent_mix.Q", "step_codes"]));
+        check(&tiny, &folder, "kohya's, in a folder")?;
+        // ComfyUI's one file: each block's q, k and v one matrix, their rows stacked
+        let mut fused: Vec<_> = base.iter().filter(|(n, ..)| !(n.ends_with(".proj.q.weight") || n.ends_with(".proj.k.weight") || n.ends_with(".proj.v.weight"))).cloned().collect();
+        for i in 0..3 {
+            let part = |x: &str| base.iter().find(|(n, ..)| *n == format!("layers.{i}.proj.{x}.weight")).unwrap().clone();
+            let (q, k, v) = (part("q"), part("k"), part("v"));
+            fused.push((format!("layers.{i}.proj.qkv.weight"), vec![3 * q.1[0], q.1[1]], [q.2, k.2, v.2].concat()));
+        }
+        let fused_file = folder.join("fused.safetensors");
+        write(&fused_file, &fused);
+        check(&fused_file, &adapter, "fused q, k and v")?;
+        std::fs::remove_dir_all(&folder).ok();
+        // (without it the step is another: the test tells them apart)
+        let mut plain = WgpuMoss::load(&tiny, 0, |_, _| {})?;
+        let prompt = plain.prompt(&text, text.len() / 48)?;
+        let got = plain.predict(&latent, h, w, 1000., &prompt, &[])?;
+        let apart = got.iter().zip(&wants[0].1).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum::<f64>().sqrt() / norm(&wants[0].1);
+        assert!(apart > 0.05, "{apart}");
+        Ok(())
+    }
+
+    /// The sampler's input to each pass is the noise plus the latent mix of the estimate so far, a token at a time.
+    #[test]
+    fn a_pass_takes_the_noise_and_the_mixed_estimate() -> Result<()> {
+        let file = std::env::temp_dir().join(format!("oaiy-moss-dataspace-{}.safetensors", std::process::id()));
+        // two channels: Q = [[1, 2], [3, 4]]; two codes
+        write(&file, &[("latent_mix.Q".into(), vec![2, 2], vec![1., 2., 3., 4.]), ("step_codes".into(), vec![2], vec![1000., 500.])]);
+        let d = crate::moss_image::distill::Distillation::open(&file)?;
+        std::fs::remove_file(&file).ok();
+        assert_eq!(d.mix_in(&[1., 1., 0., 0.], &[1., 0., 0., 1.]), [2., 4., 2., 4.]);
+        // a velocity of 1 everywhere: the first pass sees the noise; the next, the noise and the mix of `z - 1` ([0, 1])
+        let mut seen = Vec::new();
+        let x0 = d.sample(&[1., 2.], 2, |pass, x, time| {
+            seen.push((pass, x.to_vec(), time));
+            Ok(vec![1.; 2])
+        })?;
+        assert_eq!(seen, [(0, vec![1., 2.], 1000.), (1, vec![1. + 2., 2. + 4.], 500.)]);
+        assert_eq!(x0, [0., 1.]);
+        Ok(())
+    }
+
+    /// The real transformer (`OAIY_MOSS_TRANSFORMER`) with a distillation of it (`OAIY_MOSS_DISTILL`) against OpenMOSS's
+    /// modules in float32 with its factors merged (`tools/moss_image/distill_reference.py`'s file,
+    /// `OAIY_MOSS_DISTILL_REFERENCE`): each pass's velocity from the reference's own input, and the sampler's estimate
+    /// after all its passes from the same noise. As f16 (the BF16 checkpoint's exactly) the estimate is the reference's
+    /// (the reference with its weights as f16: 0.6% off); on the RTX 4090, whose tensor cores take the inputs as f16,
+    /// each pass 0.2 to 0.8% off and the estimate 0.986, the same picture. Quantized, each pass is off by the weights'
+    /// rounding (Q8_0's:
+    /// 5% of the velocity; the reference with its weights rounded so is off as much), and the passes, each taking the
+    /// last's estimate through the small latent mix, carry it on: the estimate is another picture of the same scene
+    /// (the reference's own Q8_0 run: cosine 0.865 to its f32 one; this one's 0.857). A Q4_K_M GGUF's passes are 0.93
+    /// to 0.98 and its estimate 0.64, still the scene.
+    #[test]
+    #[ignore = "needs MOSS-Image's transformer (OAIY_MOSS_TRANSFORMER), a distillation (OAIY_MOSS_DISTILL), its reference (OAIY_MOSS_DISTILL_REFERENCE) and a WebGPU adapter"]
+    fn a_distilled_step_is_the_references() -> Result<()> {
+        let var = |k: &str| std::env::var_os(k).map(std::path::PathBuf::from);
+        let (Some(path), Some(distill), Some(reference)) = (var("OAIY_MOSS_TRANSFORMER"), var("OAIY_MOSS_DISTILL"), var("OAIY_MOSS_DISTILL_REFERENCE")) else { return Ok(()) };
+        let mut w = Weights::open(&reference)?;
+        let mut values = |name: &str| -> Result<Vec<f32>> { w.tensor(name, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>() };
+        let (noise, text, codes, sampled) = (values("noise")?, values("text")?, values("codes")?, values("sampled")?);
+        let passes: Vec<(Vec<f32>, Vec<f32>)> = (0..codes.len()).map_while(|r| Some((values(&format!("pass{r}.input")).ok()?, values(&format!("pass{r}.velocity")).ok()?))).collect();
+        let mut d = crate::moss_image::distill::Distillation::open(&distill)?;
+        assert_eq!(d.codes, codes);
+        let clock = std::time::Instant::now();
+        let mut gpu = WgpuMoss::load_with(&path, ggml_rs_wgpu::WgpuBackend::nth(0, None).map_err(err)?, Some(&mut d), |_, _| {})?;
+        eprintln!("loaded in {:.1} s", clock.elapsed().as_secs_f64());
+        let prompt = gpu.prompt(&text, text.len() / gpu.config().context)?;
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let alike = |got: &[f32], want: &[f32]| {
+            let cosine = got.iter().zip(want).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() / (norm(got) * norm(want));
+            (cosine, got.iter().zip(want).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum::<f64>().sqrt() / norm(want))
+        };
+        let name = path.to_string_lossy().to_ascii_lowercase();
+        let (floor, estimate_floor) = match (gpu.quantized(), name.contains("q4_") || name.contains("q3_") || name.contains("q2_")) {
+            (false, _) => (0.9999, 0.98),
+            (true, false) => (0.998, 0.8),
+            (true, true) => (0.9, 0.5),
+        };
+        let mut worst = 1f64;
+        for (r, (input, want)) in passes.iter().enumerate() {
+            let (cosine, error) = alike(&gpu.predict(input, 16, 16, codes[r], &prompt, &[])?, want);
+            eprintln!("pass {r} (time {}): cosine {cosine:.6}, error {:.3}% of the velocity", codes[r], 100. * error);
+            worst = worst.min(cosine);
+        }
+        let got = d.sample(&noise, passes.len(), |_, x, time| gpu.predict(x, 16, 16, time, &prompt, &[]))?;
+        // (OAIY_MOSS_DISTILL_DUMP: the estimate to a file, `sampled` in it, to be looked at)
+        if let Some(dump) = var("OAIY_MOSS_DISTILL_DUMP") {
+            crate::common::lora::write_f32(&dump, &[("sampled", &[256, 128], &got)], &[]);
+        }
+        let (cosine, error) = alike(&got, &sampled);
+        eprintln!("{} passes from the noise: cosine {cosine:.6}, error {:.3}% of the estimate", passes.len(), 100. * error);
+        assert!(worst > floor && cosine > estimate_floor, "the worst pass's cosine {worst} (floor {floor}), the estimate's {cosine} (floor {estimate_floor})");
         Ok(())
     }
 

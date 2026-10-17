@@ -12,6 +12,7 @@ Apache-2.0.
 | Text encoder | Qwen3.5-9B's language model (its vision tower unused): the last hidden state after the final norm, `[n, 4096]`. MOSS-Image's own `text_encoder/` is Qwen's Qwen3.5-9B, its few F32 tensors as BF16 (every tensor checked), so Qwen's own release serves too, or a GGUF of it (llama.cpp's, with its own tokenizer) | `crates/oaiy-media/src/moss_image/webgpu/text.rs` |
 | VAE | The FLUX.2 VAE's decoder: MOSS-Image's own `vae/` (FLUX.2's encoder with a smaller decoder, 384 wide where FLUX.2's is 512) or FLUX.2's | `crates/oaiy-media/src/sdxl/webgpu/vae.rs`, `crates/oaiy-media/src/klein/vae.rs` |
 | Pipeline | The scheduler's 50 sigmas (shift 5, then each snapped to its training grid), Euler steps, guidance 3 whose negative branch skips block 22 | `crates/oaiy-media/src/moss_image/mod.rs` |
+| Distillation (optional) | A data-space DMD distillation's low-rank factors beside the blocks' matrices, its time embedding, and its 8-pass sampler without guidance ([below](#distillations-pictures-in-8-passes)) | `crates/oaiy-media/src/moss_image/distill.rs` |
 
 The transformer is one stream: the picture's tokens, then the text's. The text's tokens first go through a projection and
 two blocks of their own (with biases, attending among themselves, once a prompt); then all of them through 42 blocks
@@ -73,3 +74,48 @@ At 512x512 the M5 Pro takes 5.3 s a step (20 steps in 2.6 minutes).
 A request takes `negative_prompt`, `steps` (50), `cfg` (3), `shift` (5) and `uncond_skip_layers` (`[22]`; `[]` turns the
 skipping off), each also a model's own setting. A JSON layout goes in as the prompt, with the picture's size the layout's
 (see OpenMOSS's user guide).
+
+## Distillations: pictures in 8 passes
+
+A distillation of MOSS-Image-SFT as data-space DMD makes one (arXiv 2610.12102) makes a picture in a few passes of the
+transformer, without guidance or a negative prompt, in place of 50 guided steps. It is MOSS-Image's own transformer
+with three things of its own:
+
+- Rank-128 low-rank factors for each block's six projections (q, k, v, o, `ffn_up_gate`, `ffn_down`). A factor's
+  change to a weight is about 0.02% of it, under a tenth of bf16's rounding step and a third of f16's. Merged into f16
+  weights, a cosine of 0.8 of the change survives; merged into Q8_0, none of it does. So OAIY keeps them as f16 beside
+  the matrices (f16, Q8_0 or a GGUF's) and adds `B A x` as the step runs.
+- Its time embedding and the two modulations' biases, in place of the transformer's.
+- Its sampler: from fixed noise `z`, each pass runs the transformer at the next of its step codes (1000, 968, 926,
+  871, 791, 671, 463, 24) on `z + Q x0`, where `Q` is its 128 x 128 latent mix and `x0` the clean estimate so far
+  (zero at first); the estimate becomes `z - v`, and the last is the picture's latent. Fewer passes are its first
+  ones.
+
+OAIY reads it from one file holding all of it (`layers.{i}.proj.{module}.lora_A`/`lora_B`, the replacements,
+`latent_mix.Q`, `step_codes`), or from a folder of three: `lora.safetensors` (kohya's names, with its alpha),
+`time_embedding.safetensors` and `dataspace.safetensors`. Added on the Models page by itself, it becomes a model of its
+own, with the parts of a MOSS-Image model already in the list (named after it, `-8-step`) and the original left as it
+was. Added to a MOSS-Image model, that model takes it. Its field on the model's card is **Distillation**; a request's
+`steps` (1 to 8) are its passes.
+
+How it was checked:
+
+- On the tiny transformer (`tools/moss_image/distill_fixture.py`: OpenMOSS's transformer with random factors merged in
+  float32), a step at two of its times and three passes of its sampler: cosine 1.0000000 on Metal and 0.9999998 on the
+  card's emulator. The same holds for its one file, kohya's folder of three, and ComfyUI's fused q, k and v.
+- On the real transformer against OpenMOSS's modules in float32 with the factors merged
+  (`tools/moss_image/distill_reference.py`, a 16 x 16 latent, all 8 passes):
+  - On the RTX 4090 (f16) each pass is 0.2 to 0.8% off, and the final estimate has cosine 0.986: the same picture.
+  - On a Mac (Q8_0) each pass is about 5% off. The reference with its own weights rounded to Q8_0 is just as far off,
+    and the error carries through the passes (the latent mix hands each pass the last's estimate), so the picture is
+    another one of the same scene (cosine 0.86).
+  - With a Q4_K_M GGUF of the transformer, the passes have cosine 0.93 to 0.98 and the final estimate 0.64, still the
+    same scene.
+
+At 1024x1024, everything counted:
+
+| GPU | Its passes | The whole picture |
+| --- | --- | --- |
+| RTX 4090 (eGPU), OpenMOSS's weights | 8.6 s | 54 s (most of it reading 28 GB from an external SSD) |
+| RTX 4090, the 4-bit set (Q4_K_M GGUFs) | 7.2 s | 21 s |
+| Apple M5 Pro (Q8_0) | 116 s | 158 s (some 21 minutes for the 50 guided steps) |

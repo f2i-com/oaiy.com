@@ -12,4 +12,7 @@ team, Alibaba Group and the HuggingFace Inc. team. Test reference vectors were e
 (`tools/moss_image/`); the native runtime does not invoke the reference Python implementations.
 
 Model weights remain separate user-supplied files and retain their own licenses: MOSS-Image's (Apache 2.0), Qwen3.5-9B's
-(Apache 2.0), and those of third-party quantizations (realrebelai's GGUFs: Apache 2.0).
+(Apache 2.0), and those of third-party quantizations (realrebelai's GGUFs: Apache 2.0) and distillations. A
+distillation's sampler (`moss_image::distill`) follows the data-space DMD method (arXiv 2610.12102) as such a
+distillation's own files describe it; `tools/moss_image/distill_*.py` evaluate it on the CPU and are never invoked by
+the native runtime.

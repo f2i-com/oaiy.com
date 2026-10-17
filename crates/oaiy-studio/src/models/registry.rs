@@ -261,6 +261,45 @@ fn attach_music(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> R
     Ok(Added { section: "music", name, missing: Vec::new(), enabled: true })
 }
 
+/// A MOSS-Image distillation: added to a MOSS-Image model, that model makes its pictures in the distillation's passes;
+/// added by itself, it is a model of its own, a MOSS-Image model's parts (the image default's where that is one, else
+/// the first's) with it, named after that model and its passes. The model's steps are its passes.
+fn attach_moss_distill(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
+    let value = field_of(d, "distill").ok_or("detected distillation has no path")?;
+    let passes = field_of(d, "steps").and_then(|v| v.as_i64()).filter(|n| *n > 0).unwrap_or(8);
+    let default = get(cfg, &["media", "image", "default_model"]).and_then(Json::as_str).unwrap_or("").to_string();
+    let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "image", "models"]) else { return Err("no image models".into()) };
+    let moss = |m: &Json| str_or(m, "architecture", "") == "moss-image";
+    let name = match target {
+        Some((_, t)) => {
+            let model = models.iter().find(|(n, _)| n == t).map(|(_, m)| m).ok_or_else(|| format!("no image model {t}"))?;
+            if !moss(model) {
+                return Err(format!("{} is for MOSS-Image models; {t} is not one", d.summary));
+            }
+            t.to_string()
+        }
+        None => {
+            let base = models.iter().find(|(n, m)| *n == default && moss(m)).or_else(|| models.iter().find(|(_, m)| moss(m)))
+                .ok_or("add a MOSS-Image model first (its transformer, text encoder and VAE), then its distillation")?;
+            let taken: Vec<String> = models.iter().map(|(k, _)| k.clone()).collect();
+            let name = unique(&taken, &format!("{}-{passes}-step", base.0));
+            // (its parts, not the guided sampler's settings: the distillation's passes take none of them)
+            let mut entry = Json::Obj(base.1.members().filter(|(k, _)| !["cfg", "shift", "uncond_skip_layers", "negative_prompt", "steps"].contains(k)).map(|(k, v)| (k.to_string(), v.clone())).collect());
+            set(&mut entry, "enabled", Json::Bool(true));
+            models.push((name.clone(), entry));
+            name
+        }
+    };
+    let model = models.iter_mut().find(|(n, _)| *n == name).map(|(_, m)| m).ok_or("the model went")?;
+    set(model, "distill", value);
+    set(model, "steps", Json::Int(passes));
+    let missing = missing_fields("image", model);
+    let enabled = missing.is_empty() && bool_or(model, "enabled", true);
+    set(model, "enabled", Json::Bool(enabled));
+    add_route_if_absent(cfg, "images");
+    Ok(Added { section: "image", name, missing, enabled })
+}
+
 /// A MOSS-SoundEffect folder is a sound model of its own (or fills the chosen one).
 fn attach_sound(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
     let value = field_of(d, "path").ok_or("detected part has no path")?;
@@ -432,6 +471,7 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
         "speech_design" | "speech_base" | "speech_breeze" => return attach_speech(cfg, d, target),
         "music_model" | "music_lm" => return attach_music(cfg, d, target),
         "sound_model" => return attach_sound(cfg, d, target),
+        "moss_distill" => return attach_moss_distill(cfg, d, target),
         "model3d_matte" | "model3d_upscaler" => {
             // Picture tools first (they need nothing else), then any 3D model.
             let (field, key) = if d.kind() == "model3d_matte" { ("background", "matte") } else { ("upscaler", "upscaler") };
@@ -638,7 +678,7 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
 /// Keys holding file paths, per section, for export and import. (A model's `loras`, a list of `{path, strength}`, are
 /// paths too: [`LORAS`].)
 const LLM_PATHS: [&str; 3] = ["path", "vision_projector", "lora"];
-const IMAGE_PATHS: [&str; 9] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "vision", "checkpoint", "tokenizer", "vae"];
+const IMAGE_PATHS: [&str; 10] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "vision", "checkpoint", "tokenizer", "vae", "distill"];
 const VIDEO_PATHS: [&str; 5] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae"];
 const SPEECH_PATHS: [&str; 3] = ["design", "base", "breeze"];
 const MUSIC_PATHS: [&str; 2] = ["path", "language_model"];
@@ -938,6 +978,61 @@ mod tests {
         assert_eq!(Path::new(str_or(m, "text_encoder", "")), snapshot.as_path());
         let (b, _) = add(&mut cfg, &release.join("tokenizer/tokenizer.json"), None, Some(("image", &a.name))).unwrap();
         assert_eq!(b.missing, ["vae"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A MOSS-Image distillation (its one file, or its folder of three, any of them picked): added by itself it is a
+    /// model of its own, the image default MOSS-Image model's parts with it and its passes its steps, the guided
+    /// sampler's settings left out; added to a MOSS-Image model, that model takes it. With no MOSS-Image model, or to
+    /// another kind, it is refused; its path travels in an export.
+    #[test]
+    fn a_moss_image_distillation_is_a_model_of_its_own_or_the_chosen_ones() {
+        let d = tmp("moss-distill");
+        let tensor = |name: &str, shape: &str| format!(r#""{name}":{{"dtype":"F32","shape":{shape},"data_offsets":[0,0]}}"#);
+        let factors = [tensor("layers.0.proj.ffn_down.lora_A", "[128,8192]"), tensor("layers.0.proj.ffn_down.lora_B", "[3072,128]")].join(",");
+        let codes = [tensor("latent_mix.Q", "[128,128]"), tensor("step_codes", "[8]")].join(",");
+        let whole = d.join("generator.safetensors");
+        safetensors(&whole, &format!("{{{factors},{codes},{}}}", tensor("time_embedding.2.weight", "[3072,3072]")));
+        let three = d.join("three");
+        std::fs::create_dir_all(&three).unwrap();
+        safetensors(&three.join("lora.safetensors"), &format!("{{{}}}", tensor("diffusion_model.layers.0.proj.ffn_up_gate.lora_down.weight", "[128,3072]")));
+        safetensors(&three.join("time_embedding.safetensors"), &format!("{{{},{}}}", tensor("time_embedding.2.weight", "[3072,3072]"), tensor("video_head_modulation.bias", "[6144]")));
+        safetensors(&three.join("dataspace.safetensors"), &format!("{{{codes}}}"));
+        for (picked, at) in [(whole.clone(), whole.clone()), (d.clone(), whole.clone()), (three.join("lora.safetensors"), three.clone()), (three.join("dataspace.safetensors"), three.clone()), (three.clone(), three.clone())] {
+            let found = detect::detect(&picked).unwrap();
+            assert_eq!(found.kind(), "moss_distill", "{}: {}", picked.display(), found.summary);
+            assert_eq!(found.fields.iter().find(|(k, _)| k == "distill").and_then(|(_, v)| v.as_str()).map(PathBuf::from), Some(at), "{}", picked.display());
+            assert!(found.summary.contains("8 passes"), "{}", found.summary);
+        }
+        let mut cfg = config::default_json();
+        assert!(add(&mut cfg, &whole, None, None).unwrap_err().contains("add a MOSS-Image model first"));
+        let base = Json::parse(br#"{"architecture":"moss-image","transformer":"t","text_encoder":"te.gguf","vae":"vae.safetensors","steps":50,"cfg":4,"negative_prompt":"blurry","enabled":true}"#).unwrap();
+        let other = Json::parse(br#"{"architecture":"sdxl","checkpoint":"x.safetensors","tokenizer":"t.json","enabled":true}"#).unwrap();
+        let Some(Json::Obj(models)) = obj_mut(&mut cfg, &["media", "image", "models"]) else { panic!() };
+        models.extend([("xl".to_string(), other), ("moss-image-sft".to_string(), base)]);
+        set(obj_mut(&mut cfg, &["media", "image"]).unwrap(), "default_model", Json::str("xl"));
+        // by itself: a model of its own, the first MOSS-Image model's parts (the default is none)
+        let (a, _) = add(&mut cfg, &whole, None, None).unwrap();
+        assert_eq!((a.section, a.name.as_str(), a.enabled), ("image", "moss-image-sft-8-step", true));
+        let m = get(&cfg, &["media", "image", "models", "moss-image-sft-8-step"]).unwrap();
+        assert_eq!((str_or(m, "transformer", ""), str_or(m, "text_encoder", ""), str_or(m, "distill", "")), ("t", "te.gguf", whole.to_str().unwrap()));
+        assert_eq!(m.get("steps").and_then(Json::as_i64), Some(8));
+        assert!(["cfg", "negative_prompt", "shift"].iter().all(|k| m.get(k).is_none()), "the guided sampler's settings stay with the other");
+        assert_eq!(get(&cfg, &["media", "image", "models", "moss-image-sft", "steps"]).and_then(Json::as_i64), Some(50), "the base model as it was");
+        config::validate(&cfg).unwrap();
+        // to a chosen MOSS-Image model: that one takes it; to another kind, refused
+        let (b, _) = add(&mut cfg, &three, None, Some(("image", "moss-image-sft"))).unwrap();
+        assert_eq!(b.name, "moss-image-sft");
+        let m = get(&cfg, &["media", "image", "models", "moss-image-sft"]).unwrap();
+        assert_eq!((str_or(m, "distill", ""), m.get("steps").and_then(Json::as_i64)), (three.to_str().unwrap(), Some(8)));
+        assert!(add(&mut cfg, &whole, None, Some(("image", "xl"))).unwrap_err().contains("for MOSS-Image models"));
+        config::validate(&cfg).unwrap();
+        let file = export(&cfg, Path::new("/unused"));
+        assert_eq!(get(&file, &["image", "models", "moss-image-sft-8-step", "distill"]).and_then(Json::as_str), whole.to_str());
+        // (a distillation on another kind of model is no setting)
+        let mut bad = cfg.clone();
+        set(obj_mut(&mut bad, &["media", "image", "models", "xl"]).unwrap(), "distill", Json::str("x"));
+        assert!(config::validate(&bad).unwrap_err().contains("for MOSS-Image models"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -166,6 +166,11 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
                 fields.push((key.into(), Json::str(p.to_string_lossy())));
             }
             if let Some(t) = optional_path(root, &j, "tokenizer")? { fields.push(("tokenizer".into(), Json::str(t.to_string_lossy()))); }
+            // (a distillation of it: its file or folder; its passes then the model's steps)
+            if let Some(d) = optional_path(root, &j, "distill")? {
+                if !d.exists() { return Err(format!("MOSS-Image distill must be a file or folder: {}", d.display())); }
+                fields.push(("distill".into(), Json::str(d.to_string_lossy())));
+            }
             for key in ["steps", "cfg", "shift", "negative_prompt", "uncond_skip_layers"] { if let Some(v) = j.get(key) { fields.push((key.into(), v.clone())); } }
             snapshot.klein = Some(Json::Obj(fields));
             snapshot.sdxl = None;

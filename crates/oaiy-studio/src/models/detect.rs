@@ -416,6 +416,10 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
     let label = stem(path);
     let spec = h.metadata.get("modelspec.architecture").and_then(Json::as_str).unwrap_or("");
     let config = h.metadata.get("config").and_then(Json::as_str).unwrap_or("");
+    // (before the LoRAs: its folder's factors are a kohya LoRA's)
+    if let Some(d) = moss_distillation(h, path, format) {
+        return Ok(d);
+    }
     if has(h, ".lora_A.") || has(h, ".lora_down.") || h.metadata.get("lora_adapter_metadata").is_some() {
         if h.metadata.get("ss_base_model_version").and_then(Json::as_str) == Some("flux2_klein_4b") {
             return Ok(detected(Role::Component { kind: "klein_lora" }, format,
@@ -588,9 +592,44 @@ fn esrgan(path: &Path) -> Detected {
     detected(Role::Component { kind: "model3d_upscaler" }, "pth", "Real-ESRGAN x4plus: enlarges small pictures for 3D models (BSD-3-Clause)".into(), vec![("upscaler", path_json(path))])
 }
 
+/// A distillation of MOSS-Image to a few passes without guidance (data-space DMD: `moss_image::distill`): its one file
+/// (each block's factors, the time embedding it replaces, its latent mix `latent_mix.Q` and `step_codes`), or one of
+/// its folder's three (`lora.safetensors`, `time_embedding.safetensors`, `dataspace.safetensors`) standing for the
+/// folder.
+fn moss_distillation(h: &Header, path: &Path, format: &'static str) -> Option<Detected> {
+    let mixes = |h: &Header| has(h, "latent_mix.Q") && has(h, "step_codes");
+    let found = |at: &Path, codes: &Header| {
+        let passes = shape_of(codes, "step_codes").and_then(|s| s.first().copied()).unwrap_or(0);
+        Some(detected(Role::Component { kind: "moss_distill" }, format,
+            format!("MOSS-Image distillation: pictures in {passes} passes without guidance (data-space DMD); add it to a MOSS-Image model ({})", stem(at)),
+            vec![("distill", path_json(at)), ("steps", Json::Int(passes))]))
+    };
+    if mixes(h) && has(h, ".proj.ffn_down.lora_") {
+        return found(path, h);
+    }
+    let dir = path.parent()?;
+    let part = mixes(h) || has(h, "diffusion_model.layers.0.proj.ffn_up_gate.lora_down") || (has(h, "time_embedding.2.weight") && has(h, "video_head_modulation.bias") && h.tensors.len() <= 8);
+    if part && MOSS_DISTILL_PARTS.iter().all(|p| dir.join(p).is_file()) {
+        let codes = read_header(&dir.join(MOSS_DISTILL_PARTS[2])).ok()?;
+        if mixes(&codes) {
+            return found(dir, &codes);
+        }
+    }
+    None
+}
+
+/// A MOSS-Image distillation's folder of three: its factors, the time embedding it replaces, its latent mix and codes.
+const MOSS_DISTILL_PARTS: [&str; 3] = ["lora.safetensors", "time_embedding.safetensors", "dataspace.safetensors"];
+
 fn directory(dir: &Path) -> Result<Detected, String> {
     let label = stem(dir);
     let read = |name: &str| std::fs::read(dir.join(name)).ok().and_then(|b| Json::parse(&b).ok());
+    // a MOSS-Image distillation's folder: its one file, or its three
+    for file in ["generator.safetensors", MOSS_DISTILL_PARTS[2]] {
+        if let Some(d) = read_header(&dir.join(file)).ok().and_then(|h| moss_distillation(&h, &dir.join(file), "safetensors")) {
+            return Ok(d);
+        }
+    }
     // BFL's FLUX 3 Image Klein release: its transformer's model.safetensors beside its text encoder and VAE
     if let Some(d) = safetensors_file(&dir.join("model.safetensors")).ok().filter(|d| matches!(d.role, Role::Image { architecture: "flux3-klein" })) {
         return Ok(d);

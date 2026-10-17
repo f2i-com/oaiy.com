@@ -466,8 +466,8 @@ fn moss_image_catalog_dispatch_takes_its_settings() {
     let root=std::env::temp_dir().join(format!("oaiy-moss-catalog-{}",std::process::id()));
     std::fs::create_dir_all(root.join("transformer")).unwrap();
     std::fs::create_dir_all(root.join("text_encoder")).unwrap();
-    for file in ["vae.safetensors","tokenizer.json","ref.png","q4.gguf"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
-    std::fs::write(root.join("image.json"),br#"{"default_model":"moss","models":{"moss":{"architecture":"moss-image","transformer":"transformer","text_encoder":"text_encoder","vae":"vae.safetensors","tokenizer":"tokenizer.json"},"q4":{"architecture":"moss-image","transformer":"q4.gguf","text_encoder":"q4.gguf","vae":"vae.safetensors","steps":30,"cfg":5,"uncond_skip_layers":[24]}}}"#).unwrap();
+    for file in ["vae.safetensors","tokenizer.json","ref.png","q4.gguf","generator.safetensors"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
+    std::fs::write(root.join("image.json"),br#"{"default_model":"moss","models":{"moss":{"architecture":"moss-image","transformer":"transformer","text_encoder":"text_encoder","vae":"vae.safetensors","tokenizer":"tokenizer.json"},"q4":{"architecture":"moss-image","transformer":"q4.gguf","text_encoder":"q4.gguf","vae":"vae.safetensors","steps":30,"cfg":5,"uncond_skip_layers":[24]},"fast":{"architecture":"moss-image","transformer":"transformer","text_encoder":"text_encoder","vae":"vae.safetensors","distill":"generator.safetensors","cfg":5}}}"#).unwrap();
     cfg.media_dir=Some(root.clone());
     cfg.output_root=root.join("output");
     let request=prepare(&cfg,&Json::parse(br#"{"prompt":"a fox","negative_prompt":"blur","transformer":"untrusted"}"#).unwrap()).unwrap();
@@ -483,5 +483,10 @@ fn moss_image_catalog_dispatch_takes_its_settings() {
     let reference=Json::str(root.join("ref.png").to_string_lossy());
     assert!(prepare(&cfg,&Json::obj([("prompt",Json::str("a fox")),("images",Json::Arr(vec![reference]))])).is_err());
     assert!(prepare(&cfg,&Json::parse(br#"{"prompt":"a fox","width":1000}"#).unwrap()).is_err());
+    // a distillation: its passes, and none of the guided sampler's settings
+    let fast=prepare(&cfg,&Json::parse(br#"{"model":"fast","prompt":"a fox","negative_prompt":"blur"}"#).unwrap()).unwrap();
+    assert_eq!(fast.get("distill").and_then(Json::as_str),root.join("generator.safetensors").to_str());
+    assert_eq!(fast.get("steps").and_then(Json::as_i64),Some(8));
+    assert!(["cfg","shift","negative_prompt","uncond_skip_layers"].iter().all(|k| fast.get(k).is_none()),"{}",fast.to_json());
     let _=std::fs::remove_dir_all(&root);
 }

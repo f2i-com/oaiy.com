@@ -850,7 +850,8 @@ fn prepare_flux3(c: &Config, settings: &Json, body: &Json) -> Result<Json, Strin
 }
 
 /// A MOSS-Image job: text-to-image (from a description, tags or a JSON layout), 50 steps at cfg 3 and shift 5, its
-/// negative branch skipping block 22, unless the request or the model names others; no references.
+/// negative branch skipping block 22, unless the request or the model names others; no references. With a
+/// distillation (`distill`), its passes (8 unless fewer are asked for), one forward each, and none of the others.
 fn prepare_moss(c: &Config, settings: &Json, body: &Json) -> Result<Json, String> {
     let value = |key| body.get(key).filter(|v| !matches!(v, Json::Null)).or_else(|| settings.get(key));
     let integer = |key, default, min, max| -> Result<i64, String> {
@@ -881,20 +882,27 @@ fn prepare_moss(c: &Config, settings: &Json, body: &Json) -> Result<Json, String
         None => String::new(),
         Some(v) => v.as_str().filter(|s| s.len() <= 65536).ok_or("negative_prompt must be a string of at most 65536 bytes")?.to_owned(),
     };
+    let distill = settings.get("distill").and_then(Json::as_str).filter(|d| !d.trim().is_empty());
     let mut fields = vec![
         ("architecture".into(), Json::str("moss-image")),
         ("n".into(), Json::Int(n)),
         ("width".into(), Json::Int(width)),
         ("height".into(), Json::Int(height)),
-        ("steps".into(), Json::Int(integer("steps", 50, 1, 100)?)),
-        ("cfg".into(), Json::Num(real("cfg", 3., 1., 10.)?)),
-        ("shift".into(), Json::Num(real("shift", 5., 0.1, 20.)?)),
-        ("negative_prompt".into(), Json::str(negative)),
         ("seed".into(), Json::Int(integer("seed", 0, 0, i64::MAX - n)?)),
         ("device".into(), Json::Int(c.image_device as i64)),
         ("output_dir".into(), Json::str(output_directory(c, body, "images")?.to_string_lossy())),
     ];
-    if let Some(layers) = value("uncond_skip_layers") {
+    if let Some(d) = distill {
+        fields.extend([("distill".into(), Json::str(d)), ("steps".into(), Json::Int(integer("steps", 8, 1, 100)?))]);
+    } else {
+        fields.extend([
+            ("steps".into(), Json::Int(integer("steps", 50, 1, 100)?)),
+            ("cfg".into(), Json::Num(real("cfg", 3., 1., 10.)?)),
+            ("shift".into(), Json::Num(real("shift", 5., 0.1, 20.)?)),
+            ("negative_prompt".into(), Json::str(negative)),
+        ]);
+    }
+    if let (None, Some(layers)) = (distill, value("uncond_skip_layers")) {
         if !layers.as_array().is_some_and(|a| a.iter().all(|i| i.as_i64().is_some_and(|i| (0..1000).contains(&i)))) { return Err("uncond_skip_layers must be a list of block numbers".into()); }
         fields.push(("uncond_skip_layers".into(), layers.clone()));
     }

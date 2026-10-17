@@ -92,6 +92,23 @@ fn moss_image_requests_take_its_settings_and_a_negative_prompt() {
     assert!(image_request(&c,root,&out,&body(r#"{"model":"moss","prompt":"the fox","images":["data:image/png;base64,iVBORw0KGgo="]}"#),false).unwrap_err().contains("from text alone"));
     assert!(image_request(&c,root,root,&body(r#"{"model":"moss","prompt":"a fox","cfg":20}"#),false).is_err());
     let _=std::fs::remove_dir_all(&out);
+    // a distillation of it: its passes (8, or fewer asked for), and none of the guided sampler's settings
+    let mut models=c.get("media").and_then(|m| m.get("image")).and_then(|i| i.get("models")).unwrap().clone();
+    let mut fast=models.get("moss").unwrap().clone();
+    crate::util::set(&mut fast,"distill",Json::str("moss/generator.safetensors"));
+    crate::util::set(&mut models,"moss",fast);
+    let (mut media,)=(c.get("media").unwrap().clone(),);
+    let mut image=media.get("image").unwrap().clone();
+    crate::util::set(&mut image,"models",models);
+    crate::util::set(&mut media,"image",image);
+    crate::util::set(&mut c,"media",media);
+    config::validate(&c).unwrap();
+    let (r,..)=image_request(&c,root,root,&body(r#"{"model":"moss","prompt":"a fox","negative_prompt":"blur","cfg":5}"#),false).unwrap();
+    assert_eq!(r.get("distill").and_then(Json::as_str),Some("/install/moss/generator.safetensors"));
+    assert_eq!(r.get("steps").and_then(Json::as_i64),Some(8));
+    assert!(["cfg","shift","negative_prompt","uncond_skip_layers"].iter().all(|k| r.get(k).is_none()),"{}",r.to_json());
+    let (r,..)=image_request(&c,root,root,&body(r#"{"model":"moss","prompt":"a fox","steps":4}"#),false).unwrap();
+    assert_eq!(r.get("steps").and_then(Json::as_i64),Some(4));
 }
 
 #[test]
