@@ -10,6 +10,15 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
+/// The GPU a picture model's text encoder runs on: the computer's own where `OAIY_TEXT_ENCODER_GPU` is `own` (a Mac's,
+/// beside the eGPU's card the worker makes its pictures on: the encoder's layers are not sent over the cable one at a
+/// time, and the card's memory is left to the pictures' models, kept there between pictures), else GPU `device` as the
+/// worker's other models take it. The states it makes go to the picture's model through the host either way.
+pub fn text_encoder_gpu(device: usize) -> Result<ggml_rs_wgpu::WgpuBackend> {
+    let own = std::env::var("OAIY_TEXT_ENCODER_GPU").is_ok_and(|v| v.trim().eq_ignore_ascii_case("own"));
+    if own { ggml_rs_wgpu::WgpuBackend::own(None) } else { ggml_rs_wgpu::WgpuBackend::nth(device, None) }.map_err(err)
+}
+
 /// `f` over `src` and `dst` in matching runs on every core: `per` of `src`'s items to `per_out` of `dst`'s.
 pub(crate) fn on_cores<S: Sync, T: Send>(src: &[S], per: usize, dst: &mut [T], per_out: usize, f: impl Fn(&[S], &mut [T]) + Sync) {
     on_cores_at(src, per, dst, per_out, |_, a, b| f(a, b));

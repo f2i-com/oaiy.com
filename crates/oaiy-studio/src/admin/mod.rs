@@ -164,6 +164,31 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             studio.egpu.stop();
             Ok(studio.egpu.status(cfg.get("llm").unwrap_or(&Json::Null)))
         }
+        // What is loaded on each GPU, what is using it, and what loaded and let it go (`crate::resources`); memory
+        // freed by hand: the picture worker and the lent card (`pictures`), the language models unless pinned
+        // (`language`), or both (`all`).
+        ("GET", "/api/resources") => Ok(crate::resources::snapshot(studio)),
+        ("POST", "/api/resources/release") => (|| -> Result<Json, (u16, String)> {
+            let what = body(req).ok().map(|b| str_or(&b, "what", "pictures").to_string()).unwrap_or_else(|| "pictures".into());
+            if !matches!(what.as_str(), "pictures" | "language" | "all") {
+                return Err((400, "what must be pictures, language or all".into()));
+            }
+            if what != "language" {
+                studio.media.release_now();
+            }
+            if what != "pictures" {
+                if crate::media::pinned(&cfg) {
+                    return Err((409, "the language model is pinned (llm.pinned): unpin it to let it go".into()));
+                }
+                crate::resources::event("release", "", "", "asked: the language models let go");
+                studio.llm.stop();
+                // (the card's own server is the one a lent card's picture worker uses: not while lent)
+                if !studio.egpu.is_lent() {
+                    studio.egpu.stop();
+                }
+            }
+            Ok(crate::resources::snapshot(studio))
+        })(),
         ("GET", "/api/downloads") => Ok(studio.downloads.state(studio)),
         ("POST", "/api/downloads") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);

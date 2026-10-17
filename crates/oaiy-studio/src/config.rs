@@ -60,6 +60,7 @@ pub const DEFAULT: &str = r#"{
   "llm": {
     "enabled": true,
     "autostart": false,
+    "pinned": false,
     "server": "oaiy-llm-server",
     "server_webgpu": "oaiy-llm-server-webgpu",
     "backend": "auto",

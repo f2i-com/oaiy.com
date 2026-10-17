@@ -91,8 +91,10 @@ impl Request {
             Ok(v as usize)
         };
         let text_encoder = path("text_encoder", true)?;
+        // (the folder's own tokenizer, or, for a GGUF of the encoder, the `tokenizer.json` beside it)
         let tokenizer = match j.get("tokenizer") {
             None | Some(Json::Null) if text_encoder.is_dir() => text_encoder.join("tokenizer.json"),
+            None | Some(Json::Null) => text_encoder.with_file_name("tokenizer.json"),
             _ => path("tokenizer", false)?,
         };
         if !tokenizer.is_file() {
@@ -194,6 +196,26 @@ pub fn generate(r: &Request, event: impl FnMut(Json)) -> candle_core::Result<Jso
     generate_with(r, crate::common::job::noise, event)
 }
 
+/// What a worker that serves keeps of FLUX 3 Image Klein between pictures ([`generate_kept`]): its GPU, its transformer
+/// (with the LoRAs merged into it) and its VAE (with its encoder where a picture had references), each for as long as
+/// the next job names the same files. The text encoder is not kept: it reads its layers from its file for each prompt.
+#[cfg(feature = "webgpu")]
+#[derive(Default)]
+pub struct Kept {
+    gpu: Option<(usize, ggml_rs_wgpu::WgpuBackend)>,
+    model: Option<(String, webgpu::WgpuFlux3)>,
+    vae: Option<((String, bool), Vae)>,
+}
+
+#[cfg(feature = "webgpu")]
+type Vae = (crate::sdxl::webgpu::vae::WgpuSdxlVae, Vec<f32>, Vec<f32>);
+
+/// [`generate`] with what `kept` has from the jobs before it, and what this one loads kept for the next.
+#[cfg(feature = "webgpu")]
+pub fn generate_kept(r: &Request, kept: &mut Kept, event: impl FnMut(Json)) -> candle_core::Result<Json> {
+    generate_inner(r, Some(kept), crate::common::job::noise, event)
+}
+
 #[cfg(not(feature = "webgpu"))]
 pub fn generate(_: &Request, _: impl FnMut(Json)) -> candle_core::Result<Json> {
     candle_core::bail!("this build has no WebGPU (the webgpu feature)")
@@ -201,7 +223,12 @@ pub fn generate(_: &Request, _: impl FnMut(Json)) -> candle_core::Result<Json> {
 
 /// [`generate`], each picture's starting noise `noise(seed, values)` (a test gives the reference's own).
 #[cfg(feature = "webgpu")]
-pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut event: impl FnMut(Json)) -> candle_core::Result<Json> {
+pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, event: impl FnMut(Json)) -> candle_core::Result<Json> {
+    generate_inner(r, None, noise, event)
+}
+
+#[cfg(feature = "webgpu")]
+fn generate_inner(r: &Request, mut kept: Option<&mut Kept>, noise: impl Fn(u64, usize) -> Vec<f32>, mut event: impl FnMut(Json)) -> candle_core::Result<Json> {
     use crate::flux3::webgpu::{Config, Tokens, WgpuFlux3};
     use crate::klein::vae;
     use candle_core::bail;
@@ -228,9 +255,28 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
         let host = |t: candle_core::Tensor| -> candle_core::Result<(Vec<f32>, usize)> { Ok((t.flatten_all()?.to_vec1::<f32>()?, t.dim(1)?)) };
         (all.into_iter().map(host).collect::<candle_core::Result<Vec<_>>>()?, empty.map(host).transpose()?)
     };
-    let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(crate::qwen_image::webgpu::transformer::err)?;
-    event(Json::obj([("stage", Json::str("loading_vae"))]));
-    let (decoder, mean, std) = vae::vae_on_webgpu(&r.vae, gpu.clone(), !r.references.is_empty())?;
+    // the GPU, the VAE and the transformer: the kept ones where the job names the same (a GPU of another number lets go
+    // of what was kept on the last)
+    let gpu = match kept.as_deref_mut().and_then(|k| k.gpu.clone()).filter(|(d, _)| *d == r.device) {
+        Some((_, g)) => g,
+        None => {
+            let g = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(crate::qwen_image::webgpu::transformer::err)?;
+            if let Some(k) = kept.as_deref_mut() {
+                *k = Kept { gpu: Some((r.device, g.clone())), ..Kept::default() };
+            }
+            g
+        }
+    };
+    let with_encoder = !r.references.is_empty();
+    let vae_key = r.vae.to_string_lossy().into_owned();
+    let had = kept.as_deref_mut().and_then(|k| k.vae.take()).filter(|((path, encoder), _)| *path == vae_key && (*encoder || !with_encoder));
+    let (vae_encoder, (decoder, mean, std)) = match had {
+        Some(((_, encoder), v)) => (encoder, v),
+        None => {
+            event(Json::obj([("stage", Json::str("loading_vae"))]));
+            (with_encoder, vae::vae_on_webgpu(&r.vae, gpu.clone(), with_encoder)?)
+        }
+    };
     // the references: each prepared as the pipeline prepares it, encoded, its tokens told apart by their last axis
     let prepared = references::prepare(&r.references, r.reference_pixels)?;
     let (mut cond, mut cond_ids) = (Vec::new(), Vec::new());
@@ -246,11 +292,19 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
     if width % 16 != 0 || height % 16 != 0 || width * height > MAX_PIXELS {
         bail!("FLUX 3 Image Klein cannot make a {width}x{height} picture");
     }
-    event(Json::obj([("stage", Json::str("loading_transformer"))]));
-    let mut model = WgpuFlux3::load_on(&r.transformer, gpu, &r.loras, |_, _| {})?;
-    for note in model.lora_notes() {
-        event(Json::obj([("stage", Json::str("lora_note")), ("note", Json::str(note))]));
-    }
+    let model_key = format!("{}|{:?}", r.transformer.display(), r.loras);
+    let had = kept.as_deref_mut().and_then(|k| k.model.take()).filter(|(key, _)| *key == model_key).map(|(_, m)| m);
+    let mut model = match had {
+        Some(m) => m,
+        None => {
+            event(Json::obj([("stage", Json::str("loading_transformer"))]));
+            let m = WgpuFlux3::load_on(&r.transformer, gpu.clone(), &r.loras, |_, _| {})?;
+            for note in m.lora_notes() {
+                event(Json::obj([("stage", Json::str("lora_note")), ("note", Json::str(note))]));
+            }
+            m
+        }
+    };
     std::fs::create_dir_all(&r.output)?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
     let batch = r.output.join(format!("flux3-{}-{nanos}", std::process::id()));
@@ -333,6 +387,10 @@ pub fn generate_with(r: &Request, noise: impl Fn(u64, usize) -> Vec<f32>, mut ev
         event(Json::obj([("stage", Json::str("image_saved")), ("image", Json::Int(i as i64 + 1)), ("path", Json::str(path.to_string_lossy()))]));
         data.push(record);
     }
+    if let Some(k) = kept {
+        k.model = Some((model_key, model));
+        k.vae = Some(((vae_key, vae_encoder), (decoder, mean, std)));
+    }
     Ok(Json::obj([
         ("data", Json::Arr(data)),
         ("output_dir", Json::str(batch.to_string_lossy())),
@@ -376,6 +434,12 @@ mod tests {
         let r = Request::parse(&body("")).unwrap();
         assert_eq!((r.tokenizer.clone(), r.size, r.steps, r.guidance, r.references.len()), (dir.join("tokenizer.json"), None, None, None, 0));
         assert_eq!(Request::parse(&body(r#","width":768,"height":512,"steps":8"#)).unwrap().size, Some((768, 512)));
+        // a GGUF of the text encoder: the tokenizer beside it
+        let gguf = dir.join("encoder-Q4_K_M.gguf");
+        std::fs::write(&gguf, b"GGUF").unwrap();
+        let f = fixture.to_string_lossy();
+        let one = Json::parse(format!(r#"{{"architecture":"flux3-klein","transformer":"{f}","vae":"{f}","text_encoder":"{}","prompt":"a fox","output_dir":"{}"}}"#, gguf.display(), dir.join("out").display()).as_bytes()).unwrap();
+        assert_eq!(Request::parse(&one).unwrap().tokenizer, dir.join("tokenizer.json"));
         let image = fixture.to_string_lossy().into_owned();
         let images = |n: usize| format!(r#","images":[{}]"#, vec![format!("\"{image}\""); n].join(","));
         assert_eq!(Request::parse(&body(&images(10))).unwrap().references.len(), 10);

@@ -62,6 +62,15 @@ impl Kind {
     }
 }
 
+/// A stage a job went through: its name, when it began (seconds after the job started) and the memory its device had
+/// in use then (MB), where that could be read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stage {
+    pub name: String,
+    pub at: f64,
+    pub memory_mb: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Job {
     pub id: String,
@@ -92,6 +101,14 @@ pub struct Job {
     pub expires_at: Option<u64>,
     /// Deleted while running: forget it as soon as it stops.
     forget: bool,
+    /// When it was queued and when it started; the stages it went through ([`Stage`]), each as it began.
+    queued: std::time::Instant,
+    started: Option<std::time::Instant>,
+    pub stages: Vec<Stage>,
+    /// Where it ran: `egpu` (a Mac's eGPU), or this computer's GPU `gpu{n}`.
+    pub device: Option<String>,
+    /// Its models let go as soon as it is done, not kept for the next (`release`: a flow's last picture).
+    pub release: bool,
 }
 
 impl Job {
@@ -106,6 +123,35 @@ impl Job {
 
     pub fn finished(&self) -> bool {
         matches!(self.status.as_str(), "completed" | "failed" | "cancelled")
+    }
+
+    /// Its stage as it is now, noted as the next it went through (from when it started; a stage before it starts is
+    /// its waiting in the queue, not noted).
+    fn note_stage(&mut self) {
+        let Some(started) = self.started else { return };
+        self.stages.push(Stage { name: self.stage.clone(), at: started.elapsed().as_secs_f64(), memory_mb: None });
+    }
+
+    /// How long it waited and each stage took, its device, and the most memory that device had in use at a stage's
+    /// start: `{queue_seconds, stages: [{stage, seconds, memory_mb}], total_seconds, device, peak_memory_mb}`. A stage
+    /// still running counts to now.
+    pub fn timings(&self) -> Json {
+        let Some(started) = self.started else { return Json::Null };
+        let queue = started.saturating_duration_since(self.queued).as_secs_f64();
+        let ends: Vec<f64> = self.stages.iter().skip(1).map(|s| s.at).chain(std::iter::once(if self.finished() { self.stages.last().map_or(0., |s| s.at) } else { started.elapsed().as_secs_f64() })).collect();
+        let round = |v: f64| Json::Num((v * 1000.).round() / 1000.);
+        let stages: Vec<Json> = self.stages.iter().zip(&ends).filter(|(s, _)| !(self.finished() && std::ptr::eq(*s, self.stages.last().unwrap_or(s)))).map(|(s, end)| {
+            Json::obj([("stage", Json::str(&s.name)), ("seconds", round((end - s.at).max(0.))), ("memory_mb", s.memory_mb.map_or(Json::Null, Json::Int))])
+        }).collect();
+        let total = ends.last().copied().unwrap_or(0.);
+        let peak = self.stages.iter().filter_map(|s| s.memory_mb).max();
+        Json::obj([
+            ("queue_seconds", round(queue)),
+            ("stages", Json::Arr(stages)),
+            ("total_seconds", round(total)),
+            ("device", self.device.as_deref().map_or(Json::Null, Json::str)),
+            ("peak_memory_mb", peak.map_or(Json::Null, Json::Int)),
+        ])
     }
 
     pub fn to_json(&self, output_root: &Path) -> Json {
@@ -127,6 +173,7 @@ impl Job {
             ("error", self.error.as_ref().map_or(Json::Null, Json::str)),
             ("residency", self.result.get("residency").cloned().unwrap_or(Json::Null)),
             ("seconds_taken", self.result.get("seconds").cloned().unwrap_or(Json::Null)),
+            ("timings", self.timings()),
             ("seconds", match self.kind {
                 Kind::Video => Json::Num(self.clip_seconds()),
                 Kind::Speech | Kind::Music | Kind::Sound => self.result.get("duration").cloned().unwrap_or(Json::Null),
@@ -194,6 +241,10 @@ struct Serving {
     local: bool,
     /// When its last job ended.
     idle_since: std::time::Instant,
+    /// The models it keeps loaded, with their families (a job's `architecture`): MOSS-Image's and FLUX 3 Image Klein's
+    /// side by side, Qwen Image's alone. Its device: `egpu`, `gpu{n}`.
+    models: Vec<(String, String)>,
+    device: String,
 }
 
 enum Said {
@@ -202,13 +253,25 @@ enum Said {
     Gone,
 }
 
+/// The media jobs that may wait in the queue: past it a request is refused (`503`, try again), not queued.
+pub const MAX_QUEUED: usize = 32;
+
+/// The picture worker kept between pictures, as `crate::resources` shows it.
+pub struct KeptWorker {
+    /// The models it keeps loaded.
+    pub models: Vec<String>,
+    pub device: String,
+    pub idle_seconds: f64,
+    pub pid: u32,
+}
+
 /// How long the kept image worker (and the lent card) waits for another picture, unless the settings say
 /// (`media.keep_minutes`).
 const KEEP_CARD: Duration = Duration::from_secs(120);
 
 /// How long the kept image worker (and the lent card) waits for another picture: `media.keep_minutes` (0: it is let go
 /// after each), else [`KEEP_CARD`].
-fn keep_for(cfg: &Json) -> Duration {
+pub fn keep_for(cfg: &Json) -> Duration {
     cfg.get("media").and_then(|m| m.get("keep_minutes")).and_then(Json::as_f64).filter(|m| m.is_finite() && *m >= 0.).map_or(KEEP_CARD, |m| Duration::from_secs_f64(m * 60.))
 }
 
@@ -224,6 +287,11 @@ pub struct Media {
     /// for the keep time ([`keep_for`]), as the kept worker keeps it for a picture (each lending's end loads the language
     /// model again).
     card_used: Mutex<Option<std::time::Instant>>,
+    /// Reads a device's memory in use for the jobs' stages ([`Media::set_memory_probe`]).
+    memory_probe: Mutex<Option<Arc<dyn Fn(&str) -> Option<i64> + Send + Sync>>>,
+    /// The picture worker and the lent card let go as soon as the queue is empty, not kept for the keep time: a job
+    /// asked (`release`), or someone did (`POST /api/resources/release`). Cleared as the next job starts.
+    releasing: AtomicBool,
 }
 
 /// A chat request's hold on the LLM; released on drop.
@@ -1072,6 +1140,10 @@ pub fn model_devices(cfg: &Json, name: &str) -> Vec<i64> {
 /// the media GPU. A model elsewhere keeps answering while media runs.
 pub fn needs_media_gpu(cfg: &Json, model: Option<&str>) -> bool {
     let media = cfg.get("media").cloned().unwrap_or(Json::Null);
+    // (a pinned language model is never stopped for media: they run beside it)
+    if pinned(cfg) {
+        return false;
+    }
     match str_or(&media, "llm_policy", "auto") {
         "coexist" => false,
         "pause_llm" => true,
@@ -1087,7 +1159,14 @@ pub fn on_card(cfg: &Json, kind: Kind, request: &Json) -> bool {
     let Some(llm) = cfg.get("llm") else { return false };
     let egpu = llm.get("egpu").unwrap_or(&Json::Null);
     let wanted = if kind == Kind::Image { bool_or(egpu, "images", true) } else { bool_or(egpu, "media", true) };
-    wanted && crate::llm::egpu::enabled(llm) && crate::llm::egpu::webgpu(llm) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+    // (a pinned language model the card holds is never let go for media: they are made on this computer's GPU)
+    let held = pinned(cfg) && !crate::llm::holds_a_model(llm);
+    wanted && !held && crate::llm::egpu::enabled(llm) && crate::llm::egpu::webgpu(llm) && request.get("backend").is_none_or(|b| b.as_str() == Some("webgpu"))
+}
+
+/// Whether the language model is pinned (`llm.pinned`): never let go for media, nor when it is idle.
+pub fn pinned(cfg: &Json) -> bool {
+    cfg.get("llm").is_some_and(|l| bool_or(l, "pinned", false))
 }
 
 /// Whether a job the card could make takes it now: speech only where the card is lent already, or its language model
@@ -1102,7 +1181,24 @@ fn takes_card(kind: Kind, lent: bool, llm_loaded: bool) -> bool {
 /// Whether a job on the card is the kept worker's (`oaiy-media --serve`, which takes Qwen Image and MOSS-Image pictures):
 /// the others are a worker's of their own, as on this computer.
 fn kept_on_card(kind: Kind, request: &Json) -> bool {
-    kind == Kind::Image && request.get("architecture").is_none_or(|a| matches!(a.as_str(), Some("qwen-image" | "moss-image")))
+    kind == Kind::Image && request.get("architecture").is_none_or(|a| matches!(a.as_str(), Some("qwen-image" | "moss-image" | "flux3-klein")))
+}
+
+/// A worker making pictures on a Mac's eGPU runs their text encoders on the Mac's own GPU (`OAIY_TEXT_ENCODER_GPU`):
+/// streamed over the cable a layer at a time they took 9 to 20 s of a picture, on the Mac's GPU 3 to 4 s, and the card
+/// keeps its memory for the pictures' models, kept there between pictures. The studio's own setting of it, where set,
+/// is passed on instead.
+fn text_encoders_beside_card(command: &mut std::process::Command) {
+    if cfg!(target_os = "macos") && std::env::var_os("OAIY_TEXT_ENCODER_GPU").is_none() {
+        command.env("OAIY_TEXT_ENCODER_GPU", "own");
+    }
+}
+
+/// Whether the kept worker holds a model of family `kept` beside one of family `new` that it loads (as `oaiy-media
+/// --serve` keeps them): MOSS-Image's and FLUX 3 Image Klein's side by side, a family's one model at a time, Qwen
+/// Image's alone.
+fn kept_beside(kept: &str, new: &str) -> bool {
+    kept != new && matches!((kept, new), ("moss-image", "flux3-klein") | ("flux3-klein", "moss-image"))
 }
 
 /// Whether a job on this computer's GPU is the kept worker's: a Qwen Image or MOSS-Image picture on WebGPU (the models
@@ -1119,6 +1215,9 @@ const CARD_WAIT: Duration = Duration::from_secs(5 * 60);
 /// always, `coexist` never, `auto` when the media device is one the LLM uses
 /// (its `devices`, or those of an enabled model with GPUs of its own).
 pub fn pauses_llm(cfg: &Json) -> bool {
+    if pinned(cfg) {
+        return false;
+    }
     let media = cfg.get("media").cloned().unwrap_or(Json::Null);
     let device = int_or(&media, "device", 0);
     let llm = cfg.get("llm");
@@ -1140,6 +1239,12 @@ pub fn pauses_llm(cfg: &Json) -> bool {
         // Without explicit devices oaiy-llm-server takes the first two GPUs.
         _ => if devices.is_empty() { device < 2 } else { devices.contains(&device) },
     }
+}
+
+/// Whether a job's error says it ran out of memory (the GPU's or the computer's): such a job is tried once more.
+fn out_of_memory(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    ["out of memory", "outofmemory", "out-of-memory", "no room on the gpu", "failed to allocate", "allocation failed", "insufficient memory", "(oom)", " oom "].iter().any(|w| e.contains(w))
 }
 
 /// Progress (0-100) and a stage label from one worker event line.
@@ -1211,6 +1316,8 @@ impl Media {
             serving: Mutex::new(None),
             log: Arc::new(LogRing::new(2000)),
             card_used: Mutex::new(None),
+            memory_probe: Mutex::new(None),
+            releasing: AtomicBool::new(false),
         }
     }
 
@@ -1253,6 +1360,11 @@ impl Media {
             scratch,
             expires_at: None,
             forget: false,
+            queued: std::time::Instant::now(),
+            started: None,
+            stages: Vec::new(),
+            device: None,
+            release: false,
         };
         let mut jobs = self.lock();
         // Forget the oldest finished jobs beyond `keep` (their files stay on disk).
@@ -1398,11 +1510,81 @@ impl Media {
     }
 
     fn update(&self, id: &str, f: impl FnOnce(&mut Job)) {
-        let mut jobs = self.lock();
-        if let Some(j) = jobs.iter_mut().find(|j| j.id == id) {
-            f(j);
+        let noted = {
+            let mut jobs = self.lock();
+            jobs.iter_mut().find(|j| j.id == id).and_then(|j| {
+                let before = j.stage.clone();
+                f(j);
+                (j.stage != before && j.started.is_some()).then(|| {
+                    j.note_stage();
+                    (j.stages.len() - 1, j.device.clone())
+                })
+            })
+        };
+        // (a new stage's memory, read outside the jobs' lock: the card's word, or this computer's GPU)
+        if let Some((i, device)) = noted {
+            let probe = self.memory_probe.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(mb) = device.as_deref().and_then(|d| probe.as_ref().and_then(|probe| probe(d))) {
+                if let Some(j) = self.lock().iter_mut().find(|j| j.id == id) {
+                    if let Some(s) = j.stages.get_mut(i) {
+                        s.memory_mb = Some(mb);
+                    }
+                }
+            }
         }
         self.changed.notify_all();
+    }
+
+    /// The picture worker kept between pictures, where there is one.
+    pub fn kept_worker(&self) -> Option<KeptWorker> {
+        let slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref().map(|s| KeptWorker { models: s.models.iter().map(|(_, m)| m.clone()).collect(), device: s.device.clone(), idle_seconds: s.idle_since.elapsed().as_secs_f64(), pid: s.child.id() })
+    }
+
+    /// The job running, where one is: `{id, kind, model, device, stage, seconds}`.
+    pub fn running_job(&self) -> Option<Json> {
+        let jobs = self.lock();
+        jobs.iter().find(|j| j.status == "in_progress").map(|j| {
+            Json::obj([
+                ("id", Json::str(if j.incognito { "incognito" } else { &j.id })),
+                ("kind", Json::str(j.kind.name())),
+                ("model", Json::str(&j.model)),
+                ("device", j.device.as_deref().map_or(Json::Null, Json::str)),
+                ("stage", Json::str(&j.stage)),
+                ("seconds", Json::Num(j.started.map_or(0., |s| (s.elapsed().as_secs_f64() * 10.).round() / 10.))),
+            ])
+        })
+    }
+
+    /// Let `id`'s models go as soon as it is done (a flow's last picture: the next node wants another model).
+    pub fn release_after(&self, id: &str) {
+        let mut jobs = self.lock();
+        if let Some(j) = jobs.iter_mut().find(|j| j.id == id) {
+            j.release = true;
+        }
+    }
+
+    /// Let the picture worker and the lent card go as soon as no job is running or waiting (`POST
+    /// /api/resources/release`), whatever the keep time.
+    pub fn release_now(&self) {
+        self.releasing.store(true, Ordering::Relaxed);
+        crate::resources::event("release", "", "", "asked: the picture worker and the lent card let go once the queue is empty");
+        self.queue_signal.notify_all();
+    }
+
+    /// The jobs waiting in the queue.
+    pub fn queued(&self) -> usize {
+        self.lock().iter().filter(|j| j.status == "queued").count()
+    }
+
+    /// The chat requests being answered now (each a lease on its model).
+    pub fn chats(&self) -> usize {
+        self.broker.lock().unwrap_or_else(|p| p.into_inner()).chats
+    }
+
+    /// What reads a device's memory in use (MB) for the jobs' stages: `egpu` the card's, `gpu{n}` this computer's.
+    pub fn set_memory_probe(&self, probe: Arc<dyn Fn(&str) -> Option<i64> + Send + Sync>) {
+        *self.memory_probe.lock().unwrap_or_else(|p| p.into_inner()) = Some(probe);
     }
 
     /// Hold the LLM for one chat request. With `exclusive` (its model shares the
@@ -1434,6 +1616,9 @@ impl Media {
                     if let Some(j) = jobs.iter_mut().find(|j| j.status == "queued") {
                         j.status = "in_progress".into();
                         j.stage = "starting".into();
+                        j.started = Some(std::time::Instant::now());
+                        j.note_stage();
+                        self.releasing.store(false, Ordering::Relaxed);
                         break j.clone();
                     }
                     // Nothing queued: bring back an LLM that media paused. Here
@@ -1447,7 +1632,10 @@ impl Media {
                             continue;
                         }
                         drop(jobs);
-                        self.end_serving(false);
+                        let ended = std::time::Instant::now();
+                        self.end_serving(false, "no picture came for the keep time, or a chat wants the eGPU");
+                        // (and its memory let go on the card before the language model loads there again)
+                        studio.egpu.await_freed(ended, Duration::from_secs(30));
                         self.log.push("giving the eGPU back to its language model");
                         studio.egpu.give_back();
                         jobs = self.lock();
@@ -1461,7 +1649,7 @@ impl Media {
                             continue;
                         }
                         drop(jobs);
-                        self.end_serving(false);
+                        self.end_serving(false, "no picture came for the keep time, or a language model wants this GPU");
                         jobs = self.lock();
                         continue;
                     }
@@ -1475,8 +1663,19 @@ impl Media {
                 }
             };
             self.changed.notify_all();
-            let outcome = self.run_one(studio, &next);
+            let mut outcome = self.run_one(studio, &next);
             let cancelled = next.cancel.load(Ordering::Relaxed);
+            if let Some(e) = outcome.as_ref().err().filter(|e| !cancelled && out_of_memory(e)) {
+                // (once: the kept picture worker and the GPU's cache let go, as nothing else here holds a lease)
+                self.log.push(format!("{}: out of memory ({}); trying it once more with the kept picture worker let go", if next.incognito { "incognito job" } else { next.id.as_str() }, e.lines().next().unwrap_or("")));
+                crate::resources::event("retry", &next.model, "", "out of memory: tried once more with everything idle let go");
+                self.end_serving(false, "a job ran out of memory");
+                self.update(&next.id, |j| j.stage = "retrying".into());
+                outcome = self.run_one(studio, &next);
+            }
+            if self.lock().iter().any(|j| j.id == next.id && j.release) {
+                self.releasing.store(true, Ordering::Relaxed);
+            }
             let fault = outcome.as_ref().err().is_some_and(|e| gpu_fault(e));
             self.update(&next.id, |j| {
                 j.completed_at = Some(now());
@@ -1543,12 +1742,15 @@ impl Media {
             let label = if job.incognito { "incognito job" } else { job.id.as_str() };
             match studio.egpu.lend(&cfg, &studio.root, CARD_WAIT) {
                 Ok(socket) => {
-                    self.update(&job.id, |j| j.stage = "on the eGPU".into());
+                    self.update(&job.id, |j| {
+                        j.device = Some("egpu".into());
+                        j.stage = "on the eGPU".into();
+                    });
                     let made = if kept_on_card(job.kind, &job.request) {
                         self.serve_job(studio, &cfg, job, Some(&socket))
                     } else {
                         // (the kept picture worker let go first: the card's memory the job's)
-                        self.end_serving(false);
+                        self.end_serving(false, "another media job's worker needs the eGPU");
                         let made = self.worker(studio, &cfg, job, Some(&socket));
                         *self.card_used.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
                         made
@@ -1592,13 +1794,14 @@ impl Media {
             studio.llm.stop();
             studio.llm.set_paused(true);
         }
+        self.update(&job.id, |j| j.device = Some(format!("gpu{device}")));
         let result = if job.cancel.load(Ordering::Relaxed) {
             Err("cancelled".into())
         } else if kept_here(job.kind, &job.request) {
             self.serve_job(studio, &cfg, job, None)
         } else {
             // (the kept picture worker let go first: the GPU's memory the job's)
-            self.end_serving(false);
+            self.end_serving(false, "another media job's worker needs this GPU");
             self.worker(studio, &cfg, job, None)
         };
         {
@@ -1612,14 +1815,14 @@ impl Media {
     /// Whether the card is kept for another job: the kept worker has waited less than `keep` for another picture, or a
     /// job of a worker of its own ended on the card less than that ago.
     fn lingers(&self, keep: Duration) -> bool {
-        self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < keep)
+        !self.releasing.load(Ordering::Relaxed) && self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < keep)
             || self.card_used.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() < keep)
     }
 
     /// Whether the picture worker kept on this computer's GPU waits for another picture: it has waited less than
     /// `keep`, and no language model that shares the GPU runs, starts or waits for media to end.
     fn lingers_here(&self, studio: &crate::Studio, keep: Duration) -> bool {
-        let idle = self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.local && s.idle_since.elapsed() < keep);
+        let idle = !self.releasing.load(Ordering::Relaxed) && self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.local && s.idle_since.elapsed() < keep);
         idle && (!pauses_llm(&studio.config()) || !(studio.llm.is_running() || studio.llm.paused()))
     }
 
@@ -1632,14 +1835,17 @@ impl Media {
         };
         if waiting {
             self.log.push("letting the kept image worker go: the language model is starting");
-            self.end_serving(false);
+            self.end_serving(false, "the language model is starting");
         }
     }
 
     /// The kept worker let go: its standard input closed (it ends, its memory on the card freed), and killed past a wait
     /// (`now`: killed at once, a job it is doing cancelled).
-    pub(crate) fn end_serving(&self, now: bool) {
+    pub(crate) fn end_serving(&self, now: bool, why: &str) {
         let Some(mut s) = self.serving.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+        for (_, model) in &s.models {
+            crate::resources::event("unload", model, &s.device, why);
+        }
         drop(s.stdin);
         let deadline = std::time::Instant::now() + if now { Duration::ZERO } else { Duration::from_secs(10) };
         while std::time::Instant::now() < deadline {
@@ -1667,7 +1873,7 @@ impl Media {
         let mut slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
         if slot.as_mut().is_some_and(|s| s.key != key || !matches!(s.child.try_wait(), Ok(None))) {
             drop(slot);
-            self.end_serving(false);
+            self.end_serving(false, "a worker for another program or GPU is needed");
             slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
         }
         if slot.is_none() {
@@ -1675,6 +1881,7 @@ impl Media {
             command.arg("--serve");
             if let Some(card) = card {
                 command.env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{card}"));
+                text_encoders_beside_card(&mut command);
                 // (the full attention's rows kernel: a picture's steps 5% faster on the card, its answers the f32
                 // kernel's there; elsewhere it is still to be tried, docs/TINYGPU.md)
                 if std::env::var_os("OAIY_ATTENTION_KERNEL").is_none() {
@@ -1708,9 +1915,21 @@ impl Media {
             });
             let stdin = child.stdin.take().ok_or("worker stdin missing")?;
             self.log.push(format!("{label}: an image worker kept for {place} started ({})", program.display()));
-            *slot = Some(Serving { child, stdin, said, key, local: card.is_none(), idle_since: std::time::Instant::now() });
+            let device = if card.is_some() { "egpu".to_string() } else { format!("gpu{}", int_or(&job.request, "device", 0)) };
+            *slot = Some(Serving { child, stdin, said, key, local: card.is_none(), idle_since: std::time::Instant::now(), models: Vec::new(), device });
         }
         let s = slot.as_mut().expect("a kept worker");
+        // (what the worker keeps once this job has loaded its model: see `kept_beside`)
+        let family = str_or(&job.request, "architecture", "qwen-image").to_string();
+        if !s.models.iter().any(|(f, m)| *f == family && *m == job.model) {
+            let (stay, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut s.models).into_iter().partition(|(f, _)| kept_beside(f, &family));
+            for (_, model) in &gone {
+                crate::resources::event("unload", model, &s.device, &format!("let go in the kept worker for {}", job.model));
+            }
+            crate::resources::event("load", &job.model, &s.device, if stay.is_empty() { "a picture, in the worker kept between pictures" } else { "a picture, in the kept worker beside the models it has" });
+            s.models = stay;
+            s.models.push((family, job.model.clone()));
+        }
         if job.incognito {
             self.log.push(format!("incognito {} job on {place} (kept worker)", job.kind.name()));
         } else {
@@ -1719,7 +1938,7 @@ impl Media {
         let sent = writeln!(s.stdin, "{}", job.request.to_json()).and_then(|_| s.stdin.flush());
         if let Err(e) = sent {
             drop(slot);
-            self.end_serving(true);
+            self.end_serving(true, "the request could not be sent to it");
             return Err(format!("sending the request to the kept worker: {e}"));
         }
         let (id, kind, n, incognito) = (job.id.clone(), job.kind, job.n, job.incognito);
@@ -1754,7 +1973,7 @@ impl Media {
             Err(e) => {
                 // (a cancelled job, or a worker gone: it is let go at once, its memory with it)
                 drop(slot);
-                self.end_serving(true);
+                self.end_serving(true, "it failed a job");
                 if !incognito && e != "cancelled" {
                     self.log.push(format!("{label}: the kept worker failed: {e}"));
                 }
@@ -1771,7 +1990,7 @@ impl Media {
                 // (its device is lost or its results are not numbers: the next picture is given a new worker, as
                 // each job was before workers were kept)
                 drop(slot);
-                self.end_serving(true);
+                self.end_serving(true, "it ended or failed");
             }
             return Err(e.to_string());
         }
@@ -1790,6 +2009,7 @@ impl Media {
         command.arg("--stdin").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(socket) = card {
             command.env("OAIY_WEBGPU_ADAPTER", format!("tinygpu:{socket}"));
+            text_encoders_beside_card(&mut command);
         }
         #[cfg(windows)]
         {

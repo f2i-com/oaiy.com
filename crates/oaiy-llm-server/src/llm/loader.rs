@@ -60,6 +60,10 @@ impl ggml_rs::quantized::QuantizedHostBytes for MmapView {
     fn as_bytes(&self) -> &[u8] {
         self.file.raw_slice_shard(self.shard, self.offset, self.len)
     }
+
+    fn prefetch(&self) {
+        self.file.will_need_shard(self.shard, self.offset, self.len);
+    }
 }
 
 /// Load a tensor as a packed [`QuantizedTensor`] without dequantizing.

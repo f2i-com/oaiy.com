@@ -436,6 +436,8 @@ struct CardSaid {
 
 /// How long the card's last word on its memory and load is shown: the launcher says it each second.
 const USAGE_FRESH: Duration = Duration::from_secs(5);
+/// The card's memory in use (not counting tinygrad's cached buffers) under which a departed worker's has been let go.
+const CARD_FREE_MB: i64 = 2048;
 
 impl Card {
     /// A line of the launcher's output, taken where it is one of its words on the card. True for its word on the
@@ -459,6 +461,29 @@ impl Card {
         drop(s);
         self.changed.notify_all();
         false
+    }
+
+    /// Whether the card's memory in use, less tinygrad's cached buffers (which a load lets go), is under `limit_mb` in a
+    /// word the launcher said after `since`, waiting up to `wait` for one: None where it says nothing of it.
+    fn freed_since(&self, since: Instant, limit_mb: i64, wait: Duration) -> Option<bool> {
+        let deadline = Instant::now() + wait;
+        let mut heard_any = false;
+        loop {
+            {
+                let s = self.said.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some((u, at)) = s.usage.as_ref() {
+                    heard_any = true;
+                    let mb = |k: &str| u.get(k).and_then(Json::as_i64).unwrap_or(0) >> 20;
+                    if *at > since && mb("used") - mb("cached") < limit_mb {
+                        return Some(true);
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return heard_any.then_some(false);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// The card's memory (MB) and load (percent) as the launcher last said them, where it said them lately: for the
@@ -1099,6 +1124,9 @@ impl Egpu {
             }
             g = self.changed.wait_timeout(g, left.min(Duration::from_millis(500))).unwrap_or_else(|p| p.into_inner()).0;
         }
+        // (when this pauses a running engine: a picture's worker started while its model's memory was still being let
+        // go thrashed the card, a picture of 18 s taking 128)
+        let paused_now = (!g.paused && matches!(g.state, State::Ready)).then(Instant::now);
         if !g.paused {
             g.paused = true;
             if let Some(pipe) = g.lifeline.as_mut() {
@@ -1114,7 +1142,14 @@ impl Egpu {
             g.generation != generation || !g.lent || !matches!(g.state, State::Starting | State::Ready)
         };
         match card.paused_at(Duration::from_secs(180), gone) {
-            Some(socket) => Ok(socket),
+            Some(socket) => {
+                if let Some(since) = paused_now {
+                    if card.freed_since(since, CARD_FREE_MB, Duration::from_secs(30)) == Some(false) {
+                        self.log.push("studio: the card's memory was not let go within 30 s of its engine's pause; the picture starts anyway");
+                    }
+                }
+                Ok(socket)
+            }
             None => {
                 self.give_back();
                 Err("the eGPU's launcher did not say the card was free".into())
@@ -1285,6 +1320,33 @@ impl Egpu {
     fn runs_on(&self) -> Option<String> {
         let tail = self.log.tail(400);
         tail.lines().rev().find_map(|l| l.starts_with("loaded model").then(|| l.rsplit_once(" on ").map(|(_, on)| on.trim().to_string())).flatten())
+    }
+
+    /// The card's memory and load as its launcher last said them (`{memory_total_mb, memory_used_mb, memory_cached_mb,
+    /// load}`), or null where it has not said lately.
+    pub fn card_usage(&self) -> Json {
+        let card = Arc::clone(&self.lock().card);
+        card.usage()
+    }
+
+    /// Wait, up to `wait`, for the card's memory to be let go after the image worker that had it has gone (`since`):
+    /// the launcher frees a departed worker's buffers once it notices, and the language model brought back before then
+    /// ran out of memory loading and its server ended (a flow's picture, then its review). True once it is free, or
+    /// where the launcher says nothing of its memory (then after a moment's grace).
+    pub fn await_freed(&self, since: Instant, wait: Duration) -> bool {
+        let card = Arc::clone(&self.lock().card);
+        match card.freed_since(since, CARD_FREE_MB, wait) {
+            Some(freed) => {
+                if !freed {
+                    self.log.push(format!("studio: the card's memory was not let go within {} s; its language model loads anyway", wait.as_secs()));
+                }
+                freed
+            }
+            None => {
+                std::thread::sleep(Duration::from_secs(2));
+                true
+            }
+        }
     }
 
     pub fn status(&self, llm: &Json) -> Json {
@@ -1785,6 +1847,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             assert_eq!(launched.engines_left(), 0, "round {round}: an engine outlived its launcher");
         }
+    }
+
+    /// The card is free for its language model once the launcher, after the worker has gone, says its memory in use
+    /// (less tinygrad's cached buffers) is under the limit; a word from before then does not count.
+    #[test]
+    fn the_card_is_free_once_the_launcher_says_the_workers_memory_is_let_go() {
+        let card = Card::default();
+        let short = Duration::from_millis(300);
+        // nothing said of its memory: nothing to go on
+        assert_eq!(card.freed_since(Instant::now(), 2048, short), None);
+        card.heard(r#"oaiy-egpu: usage {"total": 25757220864, "used": 1073741824, "cached": 0, "load": 0}"#);
+        let gone = Instant::now();
+        // low, but said before the worker went
+        assert_eq!(card.freed_since(gone, 2048, short), Some(false));
+        // the worker's 11 GB still held (1 GB of it tinygrad's cache)
+        card.heard(r#"oaiy-egpu: usage {"total": 25757220864, "used": 12884901888, "cached": 1073741824, "load": 40}"#);
+        assert_eq!(card.freed_since(gone, 2048, short), Some(false));
+        // let go: 3 GB in use, 2 GB of it cache
+        card.heard(r#"oaiy-egpu: usage {"total": 25757220864, "used": 3221225472, "cached": 2147483648, "load": 0}"#);
+        assert_eq!(card.freed_since(gone, 2048, short), Some(true));
     }
 
     /// The launcher's word on the card's memory and load, each second, is the status's (in MB and percent) for as long

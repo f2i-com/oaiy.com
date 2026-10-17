@@ -1008,6 +1008,7 @@ dialog::backdrop { background: var(--backdrop); }
         <div class="row" style="margin-top:14px; gap:22px">
           <label class="check"><input type="checkbox" data-bind="llm.enabled"> Enabled</label>
           <label class="check"><input type="checkbox" data-bind="llm.autostart"> Start when OAIY opens</label>
+          <label class="check" title="Pictures, videos and flows then use another GPU, or wait, rather than unload it; it is not stopped when idle either."><input type="checkbox" data-bind="llm.pinned"> Keep it loaded</label>
           <label class="check"><input type="checkbox" data-bind="llm.thinking"> Think by default</label>
           <label class="check"><input type="checkbox" data-bind="llm.prompt_cache"> Keep prompt states between runs</label>
           <label class="check"><input type="checkbox" data-bind="llm.vision"> Vision</label>
@@ -1986,7 +1987,7 @@ function renderState() {
       : l.state === "ready" ? `Serving ${l.model || ""} on the eGPU${l.runs_on ? ` (${l.runs_on})` : ""}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
       : l.state === "starting" ? `Loading ${l.model || ""} on the eGPU...` : l.state === "failed" ? l.error
       : "Not running. It starts on the eGPU at the first chat request.")
-    : l.state === "ready" ? `Serving ${l.models.join(", ")} on ${l.runs_on || "the GPU"}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
+    : l.state === "ready" ? `Serving ${l.resident || l.models[0] || ""} on ${l.runs_on || "the GPU"}${l.models.length > 1 ? ` (one model at a time; ${l.models.length - 1} more it loads in its place when asked)` : ""}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
     : l.state === "starting" ? `Loading ${l.models[0] || ""}...` : l.state === "failed" ? l.error : l.paused_for_media ? "Paused while a media job uses its GPU." : "Not running. It starts on the first chat request.";
   $("#llm-start").disabled = lent || l.state === "ready" || l.state === "starting";
   $("#llm-restart").disabled = lent || l.state !== "ready";

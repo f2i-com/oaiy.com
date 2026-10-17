@@ -30,6 +30,17 @@ impl Backing {
             Backing::Bytes(b) => b,
         }
     }
+
+    /// Ask the OS to read `offset..offset + len` of a mapped file now, in large reads (`MADV_WILLNEED`), rather than a
+    /// page at a time as a copy faults it in. Advice only: nothing changes if it is not taken.
+    fn will_need(&self, offset: usize, len: usize) {
+        #[cfg(unix)]
+        if let Backing::Mmap(m) = self {
+            let _ = m.advise_range(memmap2::Advice::WillNeed, offset, len);
+        }
+        #[cfg(not(unix))]
+        let _ = (offset, len);
+    }
 }
 
 // one shard of a split GGUF beyond the first. The primary
@@ -224,6 +235,14 @@ impl GgufFile {
     /// Number of shards backing this file: 1 unless it is a split GGUF.
     pub fn n_shards(&self) -> usize {
         1 + self.inner.extra.len()
+    }
+
+    /// Read ahead `len` bytes at `offset` of shard `shard` (as [`Self::raw_slice_shard`] addresses them), for a copy
+    /// about to read them all: a model's weights going to a GPU. Under memory pressure a page-at-a-time read of a
+    /// mapped file runs at a fraction of the disk's speed (64 MB/s against the drive's 980 measured on a Mac).
+    pub fn will_need_shard(&self, shard: usize, offset: usize, len: usize) {
+        let backing = if shard == 0 { &self.inner.backing } else { &self.inner.extra[shard - 1].backing };
+        backing.will_need(offset, len);
     }
 
     fn shard_slice(&self, shard: usize) -> &[u8] {

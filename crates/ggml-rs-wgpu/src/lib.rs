@@ -748,6 +748,8 @@ impl WgpuBackend {
             return w;
         }
         let nbytes = row_bytes * w.dim(0);
+        // (all of it is about to be read: from a mapped file, in large reads now, not a page at a time as it is copied)
+        w.prefetch();
         // Reserve before uploading so concurrent loads cannot overshoot together.
         let prev = if budgeted { self.used.fetch_add(nbytes as u64, Ordering::Relaxed) } else { 0 };
         if budgeted && prev + nbytes as u64 > self.budget {

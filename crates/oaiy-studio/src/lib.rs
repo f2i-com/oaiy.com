@@ -32,6 +32,8 @@ mod llm;
 pub use llm::egpu::{available as egpu_available, Runtime as EgpuRuntime};
 // The media worker and the jobs it takes: pictures, speech, music, sound effects, 3D models.
 mod media;
+// The models loaded on each GPU as one view, and what loaded and let them go.
+mod resources;
 use api::{discovery, gateway};
 use llm::egpu;
 
@@ -228,7 +230,7 @@ impl Studio {
         }
         // The worker kept for pictures, waiting for the next: no job, so nothing above ends it, and an update would
         // find its program still running (on Windows the installer cannot replace it).
-        self.media.end_serving(false);
+        self.media.end_serving(false, "the studio is stopping");
         self.log.push("studio stopped");
     }
 
@@ -620,6 +622,58 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         saving: std::sync::Mutex::new(()),
         port_overrides: (args.ui_port, args.port),
     });
+    // a media job's stages each read its device's memory: the card's (its launcher's word each second), or this
+    // computer's GPU's
+    let weak = Arc::downgrade(&studio);
+    studio.media.set_memory_probe(Arc::new(move |device: &str| {
+        let studio = weak.upgrade()?;
+        if device == "egpu" {
+            return studio.egpu.card_usage().get("memory_used_mb").and_then(Json::as_i64);
+        }
+        let index: i64 = device.strip_prefix("gpu")?.parse().ok()?;
+        let gpus = studio.system.gpus();
+        gpus.as_array()?.iter().find(|g| g.get("index").and_then(Json::as_i64) == Some(index))?.get("memory_used_mb").and_then(Json::as_i64)
+    }));
+    // The language models' engines watched each second, each change of theirs an event of `crate::resources`: loading,
+    // loaded, let go, the card lent to media and given back, whoever caused it (a request, a flow, a setting, Stop).
+    let watched = Arc::downgrade(&studio);
+    let _ = std::thread::Builder::new().name("resources-watch".into()).spawn(move || {
+        let mut last: [(String, String, bool); 2] = Default::default();
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(studio) = watched.upgrade() else { return };
+            let cfg = studio.config();
+            let card = studio.egpu.status(cfg.get("llm").unwrap_or(&Json::Null));
+            let local = studio.llm.status();
+            let now = [
+                (str_or(&card, "state", "stopped").to_string(), str_or(&card, "model", "").to_string(), bool_or(&card, "lent", false) || bool_or(&card, "paused", false)),
+                (str_or(&local, "state", "stopped").to_string(), local.get("resident").and_then(Json::as_str).or_else(|| local.get("models").and_then(|m| m.at(0)).and_then(Json::as_str)).unwrap_or("").to_string(), bool_or(&local, "paused_for_media", false)),
+            ];
+            for (i, ((state, model, lent), (was, was_model, was_lent))) in now.iter().zip(&last).enumerate() {
+                let device = if i == 0 { "egpu".to_string() } else { local.get("runs_on").and_then(Json::as_str).unwrap_or("this computer").to_string() };
+                let model = if model.is_empty() { was_model } else { model };
+                let seconds = |s: &Json| s.get("load_seconds").and_then(Json::as_f64).map_or(String::new(), |t| format!(" after {t:.1} s"));
+                // (the card's server started paused, to lend the card to pictures, loads nothing)
+                let paused_start = i == 0 && *lent;
+                match (was.as_str(), state.as_str()) {
+                    (a, b) if a == b => {}
+                    (_, "starting") if !paused_start => resources::event("load", model, &device, "loading"),
+                    (_, "ready") if !paused_start => resources::event("loaded", model, &device, &format!("ready{}", seconds(if i == 0 { &card } else { &local }))),
+                    ("starting" | "ready", "stopped") => resources::event("unload", model, &device, "let go"),
+                    (_, "failed") => resources::event("unload", model, &device, "it failed to load or stopped answering"),
+                    _ => {}
+                }
+                if lent != was_lent && !was.is_empty() && !(i == 0 && *lent && was != "ready") {
+                    if *lent {
+                        resources::event(if i == 0 { "lend" } else { "evict" }, model, &device, if i == 0 { "the card lent to a media job: its language model let go" } else { "paused for a media job on its GPU" });
+                    } else {
+                        resources::event("give_back", model, &device, "back to its language model after media");
+                    }
+                }
+            }
+            last = now;
+        }
+    });
     let ui = cfg.get("ui").cloned().unwrap_or(Json::Null);
     let gw = cfg.get("gateway").cloned().unwrap_or(Json::Null);
     let (ui_host, gw_host) = (str_or(&ui, "host", "127.0.0.1").to_string(), str_or(&gw, "host", "127.0.0.1").to_string());
@@ -652,7 +706,8 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
             std::thread::sleep(Duration::from_secs(30));
             ticks += 1;
             idle.media.sweep();
-            let minutes = idle.config().get("llm").map_or(0, |l| int_or(l, "idle_stop_minutes", 0));
+            // (a pinned language model is never stopped for being idle)
+            let minutes = idle.config().get("llm").filter(|l| !bool_or(l, "pinned", false)).map_or(0, |l| int_or(l, "idle_stop_minutes", 0));
             // Never mid-reply: a long stream updates nothing until it ends.
             if minutes > 0 && idle.media.chats_active() == 0 && idle.llm.state() == llm::State::Ready && idle.llm.idle_for() > Duration::from_secs(minutes as u64 * 60) {
                 idle.log.push(format!("LLM idle for {minutes} min: stopping it to free memory"));

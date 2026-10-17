@@ -37,6 +37,9 @@ pub trait QuantizedDeviceStorage: fmt::Debug + Send + Sync + 'static {
 /// eviction to disk transparently, no `.to_vec()` doubling at load time.
 pub trait QuantizedHostBytes: Send + Sync + 'static {
     fn as_bytes(&self) -> &[u8];
+    /// Start reading the bytes in now, all of them, for a copy about to read them (a mapped file's pages); nothing
+    /// for bytes already in memory.
+    fn prefetch(&self) {}
 }
 
 impl<T> QuantizedHostBytes for T
@@ -136,6 +139,13 @@ impl QuantizedTensor {
             QuantizedStorage::Cpu(_) => "cpu",
             QuantizedStorage::Mmap(_) => "mmap",
             QuantizedStorage::Device(s) => s.device_name(),
+        }
+    }
+
+    /// Read the packed bytes in ahead of a copy of them all (see [`QuantizedHostBytes::prefetch`]).
+    pub fn prefetch(&self) {
+        if let QuantizedStorage::Mmap(s) = &self.storage {
+            s.prefetch();
         }
     }
 

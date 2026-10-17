@@ -189,8 +189,11 @@ pub fn arguments_for(llm: &Json, root: &Path, port: u16, key: &str, local_images
     let named = |name: &str| models.iter().position(|m| str_or(m, "name", "") == name);
     let here = |i: &usize| !crate::llm::egpu::assigned(llm, str_or(models[*i], "name", ""));
     let primary = first.and_then(named).or_else(|| named(default).filter(here)).or_else(|| (0..models.len()).find(here)).or_else(|| named(default)).unwrap_or(0);
+    // (the models set to the eGPU are its server's: offered here too, a request naming one would load it on this
+    // computer beside the card's copy, 21 GB of a 24 GB Mac for a 35B. Only a model asked for first, where the card
+    // does not answer, is loaded here)
     let mut ordered = vec![models[primary]];
-    ordered.extend(models.iter().enumerate().filter(|(i, _)| *i != primary).map(|(_, m)| *m));
+    ordered.extend(models.iter().enumerate().filter(|(i, _)| *i != primary && here(i)).map(|(_, m)| *m));
     let path = |m: &Json, key: &str| config::resolve(root, str_or(m, key, "")).to_string_lossy().into_owned();
     let mut a: Vec<String> = Vec::new();
     let mut push = |k: &str, v: String| {
@@ -735,23 +738,24 @@ mod tests {
     }
 
     #[test]
-    fn the_model_a_request_waits_for_is_loaded_first_and_one_set_to_the_egpu_is_not_loaded_for_nothing() {
+    fn the_model_a_request_waits_for_is_loaded_first_and_the_egpus_are_not_offered_here() {
         let root = Path::new("/install");
         let first = |llm: &str, want: Option<&str>| arguments_for(&Json::parse(llm.as_bytes()).unwrap(), root, 1, "k", true, want).unwrap().1;
         let models = r#""models": [{"name": "big", "path": "big.gguf", "egpu": true}, {"name": "small", "path": "small.gguf"}, {"name": "tiny", "path": "tiny.gguf"}]"#;
-        // The default is tinygrad's to hold: this computer's engine starts with the first model that is its own.
+        // The default is tinygrad's to hold: this computer's engine starts with the first model that is its own, and
+        // is not offered the eGPU's (a request naming one would load it here beside the card's copy).
         let on = format!(r#"{{"default_model": "big", "egpu": {{"enabled": true}}, {models}}}"#);
-        assert_eq!(first(&on, None), ["small", "big", "tiny"]);
+        assert_eq!(first(&on, None), ["small", "tiny"]);
         // A request waiting for a model (the eGPU's, when it does not answer there) gets that one loaded first.
         assert_eq!(first(&on, Some("big")), ["big", "small", "tiny"]);
-        assert_eq!(first(&on, Some("tiny")), ["tiny", "big", "small"]);
-        assert_eq!(first(&on, Some("ghost")), ["small", "big", "tiny"]);
+        assert_eq!(first(&on, Some("tiny")), ["tiny", "small"]);
+        assert_eq!(first(&on, Some("ghost")), ["small", "tiny"]);
         // The eGPU switched off, or a default of this computer's own: the default leads, as ever.
         assert_eq!(first(&format!(r#"{{"default_model": "big", "egpu": {{"enabled": false}}, {models}}}"#), None), ["big", "small", "tiny"]);
-        assert_eq!(first(&format!(r#"{{"default_model": "tiny", "egpu": {{"enabled": true}}, {models}}}"#), None), ["tiny", "big", "small"]);
-        // Every model on the eGPU: the default, since something must lead.
+        assert_eq!(first(&format!(r#"{{"default_model": "tiny", "egpu": {{"enabled": true}}, {models}}}"#), None), ["tiny", "small"]);
+        // Every model on the eGPU: the default, since something must lead, and it alone.
         let all = r#"{"default_model": "b", "egpu": {"enabled": true}, "models": [{"name": "a", "path": "a.gguf", "egpu": true}, {"name": "b", "path": "b.gguf", "egpu": true}]}"#;
-        assert_eq!(first(all, None), ["b", "a"]);
+        assert_eq!(first(all, None), ["b"]);
     }
 
     #[test]

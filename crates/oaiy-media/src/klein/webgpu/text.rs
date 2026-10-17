@@ -140,7 +140,7 @@ impl WgpuKleinText {
 
     /// [`Self::load`] of the text encoder `spec` says.
     pub fn load_spec(checkpoint: &Path, tokenizer: &Path, device: usize, spec: Spec) -> Result<Self> {
-        let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
+        let gpu = crate::common::webgpu_weights::text_encoder_gpu(device)?;
         let mut w = Weights::open(checkpoint)?;
         let p = spec.prefix;
         let shape = |w: &Weights, name: &str| w.shape(&format!("{p}layers.0.{name}.weight"));
@@ -409,6 +409,38 @@ mod tests {
         }
         eprintln!("{seq} tokens, taps {taps:?}: the worst token's cosine {:.6} (token {})", worst.0, worst.1);
         assert!(worst.0 > 0.999, "the worst token's cosine {worst:?}");
+        Ok(())
+    }
+
+    /// A GGUF of Qwen3-VL-4B-Instruct (llama.cpp's names, its K-quant blocks made f16 as each layer loads) in the
+    /// checkpoint's place: the same states, within what its quantization costs.
+    #[test]
+    #[ignore = "needs Qwen3-VL-4B-Instruct (OAIY_FLUX3_TEXT_ENCODER), a GGUF of it (OAIY_FLUX3_TEXT_GGUF) and a WebGPU adapter"]
+    fn flux3_text_from_a_gguf_is_the_checkpoints() -> Result<()> {
+        let (Some(dir), Some(gguf)) = (std::env::var_os("OAIY_FLUX3_TEXT_ENCODER").map(std::path::PathBuf::from), std::env::var_os("OAIY_FLUX3_TEXT_GGUF").map(std::path::PathBuf::from)) else { return Ok(()) };
+        let prompt = "Make the mug dark blue and change the words on it to \"GOOD NIGHT\" in white letters; keep everything else the same";
+        let tokenizer = dir.join("tokenizer.json");
+        let t = std::time::Instant::now();
+        let want = WgpuKleinText::load_spec(&dir, &tokenizer, 0, FLUX3)?.encode(prompt)?;
+        let checkpoint = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let got = WgpuKleinText::load_spec(&gguf, &tokenizer, 0, FLUX3)?.encode(prompt)?;
+        let quantized = t.elapsed().as_secs_f64();
+        assert_eq!(got.dims(), want.dims());
+        let (g, e) = (got.flatten_all()?.to_vec1::<f32>()?, want.flatten_all()?.to_vec1::<f32>()?);
+        let width = want.dims()[2];
+        let (mut worst, mut sum, n) = (1f64, 0f64, g.len() / width);
+        for t in 0..n {
+            let (a, b) = (&g[t * width..(t + 1) * width], &e[t * width..(t + 1) * width]);
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let c = dot / (na * nb);
+            worst = worst.min(c);
+            sum += c;
+        }
+        eprintln!("{n} positions: cosine mean {:.5}, worst {worst:.5}; loaded and encoded in {checkpoint:.1} s (checkpoint), {quantized:.1} s (GGUF)", sum / n as f64);
+        assert!(worst > 0.95, "the worst position's cosine {worst}");
         Ok(())
     }
 }

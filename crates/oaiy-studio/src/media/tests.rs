@@ -503,3 +503,36 @@ fn webgpu_media_goes_to_the_egpu_where_it_runs_oaiys_engine() {
         assert!(!on_card(&c, Kind::Image, &qwen) && !on_card(&c, Kind::Video, &body("{}")), "{egpu}");
     }
 }
+
+/// A pinned language model is never let go for media: the card it holds is not lent (pictures are made on this
+/// computer's GPU), and one on this computer's GPU is not stopped (they run beside it). Unpinned, as before.
+#[test]
+fn a_pinned_language_model_keeps_its_gpu() {
+    let mut c = cfg("", "");
+    let llm = crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap();
+    crate::util::set(llm, "egpu", body(r#"{"enabled":true,"engine":"webgpu"}"#));
+    crate::util::set(llm, "models", body(r#"[{"name":"big","path":"big.gguf","egpu":true}]"#));
+    crate::util::set(llm, "default_model", Json::str("big"));
+    let picture = body(r#"{"base":"b","transformer":"t.gguf"}"#);
+    let on = crate::llm::egpu::available();
+    assert_eq!(on_card(&c, Kind::Image, &picture), on, "unpinned: the card lent where there is one");
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap(), "pinned", Json::Bool(true));
+    assert!(pinned(&c) && !on_card(&c, Kind::Image, &picture), "pinned on the card: made here");
+    assert!(!pauses_llm(&c) && !needs_media_gpu(&c, Some("big")), "pinned: never stopped for media");
+    // the pinned model on this computer's GPU: the card may still be lent (the model is not there)
+    let llm = crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap();
+    crate::util::set(llm, "models", body(r#"[{"name":"big","path":"big.gguf","egpu":true},{"name":"here","path":"here.gguf"}]"#));
+    crate::util::set(llm, "default_model", Json::str("here"));
+    assert_eq!(on_card(&c, Kind::Image, &picture), on);
+}
+
+/// A job's error that says it ran out of memory is tried once more; others are not.
+#[test]
+fn out_of_memory_is_told_apart() {
+    for e in ["the GPU is out of memory", "CUDA error: out of memory", "Metal: Insufficient Memory", "weights: no room on the GPU for its 4096 MB", "failed to allocate 2 GiB", "OutOfMemory"] {
+        assert!(out_of_memory(e), "{e}");
+    }
+    for e in ["cancelled", "the model has no tokenizer", "zoom lens not found", "a room with a view"] {
+        assert!(!out_of_memory(e), "{e}");
+    }
+}

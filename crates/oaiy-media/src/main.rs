@@ -147,16 +147,20 @@ fn run() -> candle_core::Result<()> {
     Ok(())
 }
 
-/// `oaiy-media --serve`: Qwen Image and MOSS-Image jobs one after another, each a line of JSON on standard input, each
-/// one's answer a line on standard output (its result, or `{"error": ...}`), its events on standard error as a job's
-/// are. The models a job loads are kept for the next that names the same files (`pipeline::Kept`, `moss_image::Kept`;
-/// one family's at a time, the other's let go first): a worker that OAIY keeps while pictures come one after another.
-/// It ends when its standard input does.
+/// `oaiy-media --serve`: Qwen Image, MOSS-Image and FLUX 3 Image Klein jobs one after another, each a line of JSON on
+/// standard input, each one's answer a line on standard output (its result, or `{"error": ...}`), its events on
+/// standard error as a job's are. The models a job loads are kept for the next that names the same files
+/// (`pipeline::Kept`, `moss_image::Kept`, `flux3::Kept`): MOSS-Image's and Klein's side by side (a picture made with one
+/// and edited with the other, each kept warm: in Q4 both fit beside each other on a 24 GB card), Qwen Image's alone,
+/// the others let go first. A worker that OAIY keeps while pictures come one after another; it ends when its standard
+/// input does.
 fn serve() -> candle_core::Result<()> {
     use std::io::BufRead;
     let mut kept = oaiy_media::qwen_image::pipeline::Kept::default();
     #[cfg(feature = "webgpu")]
     let mut moss = oaiy_media::moss_image::Kept::default();
+    #[cfg(feature = "webgpu")]
+    let mut flux3 = oaiy_media::flux3::Kept::default();
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -170,12 +174,19 @@ fn serve() -> candle_core::Result<()> {
                 let r = oaiy_media::moss_image::Request::parse(&j).map_err(candle_core::Error::Msg)?;
                 return oaiy_media::moss_image::generate_kept(&r, &mut moss, |event| eprintln!("{}", event.to_json()));
             }
+            #[cfg(feature = "webgpu")]
+            if j.get("architecture").and_then(Json::as_str) == Some("flux3-klein") && j.get("kind").is_none() {
+                kept = oaiy_media::qwen_image::pipeline::Kept::default();
+                let r = oaiy_media::flux3::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+                return oaiy_media::flux3::generate_kept(&r, &mut flux3, |event| eprintln!("{}", event.to_json()));
+            }
             if j.get("architecture").is_some_and(|a| a.as_str() != Some("qwen-image")) || j.get("kind").is_some() {
-                candle_core::bail!("a worker that serves takes Qwen Image and MOSS-Image jobs");
+                candle_core::bail!("a worker that serves takes Qwen Image, MOSS-Image and FLUX 3 Image Klein jobs");
             }
             #[cfg(feature = "webgpu")]
             {
                 moss = oaiy_media::moss_image::Kept::default();
+                flux3 = oaiy_media::flux3::Kept::default();
             }
             let r = oaiy_media::qwen_image::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
             configure_cache(&r.output)?;
@@ -187,6 +198,7 @@ fn serve() -> candle_core::Result<()> {
             #[cfg(feature = "webgpu")]
             {
                 moss = oaiy_media::moss_image::Kept::default();
+                flux3 = oaiy_media::flux3::Kept::default();
             }
             Json::obj([("error", Json::str(e.to_string()))])
         });

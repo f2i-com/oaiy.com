@@ -273,7 +273,7 @@ impl WgpuMossText {
     /// tokenizer.json; a GGUF's own where none), on GPU `device` (as the computer counts them; OAIY_WEBGPU_ADAPTER
     /// naming one instead).
     pub fn load(checkpoint: &Path, tokenizer: Option<&Path>, device: usize) -> Result<Self> {
-        let gpu = ggml_rs_wgpu::WgpuBackend::nth(device, None).map_err(err)?;
+        let gpu = crate::common::webgpu_weights::text_encoder_gpu(device)?;
         let w = Weights::open(checkpoint)?;
         let names = if checkpoint.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
             Names::Gguf

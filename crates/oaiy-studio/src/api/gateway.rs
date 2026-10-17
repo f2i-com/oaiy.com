@@ -115,6 +115,11 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
 /// local file references allowed).
 pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched, trusted: bool) -> io::Result<bool> {
     let method = req.method.as_str();
+    // (a new media job joins the queue only where it has room: past it, try again)
+    let media = matches!(m.target.as_str(), "images" | "edits" | "videos" | "speech" | "music" | "sound" | "model3d" | "background" | "upscale");
+    if media && method == "POST" && m.rest.trim_matches('/').is_empty() && studio.media.queued() >= media::MAX_QUEUED {
+        return send(w, Err(fail(503, format!("the media queue is full ({} jobs waiting); try again soon", media::MAX_QUEUED))));
+    }
     match (m.target.as_str(), m.spec.as_str()) {
         ("chat", _) => proxy(studio, req, w, "/v1/chat/completions"),
         ("completions", _) => proxy(studio, req, w, "/v1/completions"),
@@ -122,10 +127,13 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("health", _) => json_reply(w, 200, &health(studio)),
         ("discovery", _) => json_reply(w, 200, &crate::api::discovery::document(studio, &public_base(studio, req), true)),
         ("files", _) => files(studio, req, w, m.rest.trim_start_matches('/')),
-        ("images", "openai") if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| {
-            let scratch = scratch_for(studio, req, Some(&b));
-            images_openai(studio, req, b, trusted, scratch)
-        })),
+        ("images", "openai") if m.rest.is_empty() => {
+            let caller = w.try_clone().ok();
+            send(w, parse_body(req).and_then(|b| {
+                let scratch = scratch_for(studio, req, Some(&b));
+                images_openai(studio, req, b, trusted, scratch, caller.as_ref())
+            }))
+        }
         ("edits", _) if m.rest.is_empty() => send(w, edit_body(req).and_then(|(mut b, uploads)| {
             // Everything is parsed and checked before anything is written, so
             // uploads land in the right folder (an `incognito` form field
@@ -140,7 +148,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
                 })?;
                 crate::util::set(&mut b, "images", Json::Arr(saved));
             }
-            images_openai(studio, req, b, trusted, scratch)
+            images_openai(studio, req, b, trusted, scratch, None)
         })),
         ("images", "oaiy") | ("videos", "oaiy") => {
             let kind = if m.target == "images" { Kind::Image } else { Kind::Video };
@@ -1044,15 +1052,51 @@ fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path) -> R
     ok(voice)
 }
 
-/// OpenAI Images: generate, wait, and answer with base64 PNGs or URLs.
-fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool, scratch: Option<PathBuf>) -> Result<Reply, Reply> {
+/// Whether the caller on `stream` has hung up (its end closed or reset): nothing more is due from it once its request is
+/// read, so anything but "nothing yet" says it has gone.
+fn caller_gone(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    let gone = match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted),
+    };
+    let _ = stream.set_nonblocking(false);
+    gone
+}
+
+/// Wait for job `id` as `Media::wait` does, but cancel it when its caller hangs up (a flow stopped mid-picture): the
+/// GPU is not held for a picture nobody will take.
+fn wait_for_caller(studio: &Studio, id: &str, limit: Duration, caller: Option<&TcpStream>) -> Option<media::Job> {
+    let Some(caller) = caller else { return studio.media.wait(id, limit) };
+    let until = std::time::Instant::now() + limit;
+    loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        let job = studio.media.wait(id, left.min(Duration::from_millis(500)))?;
+        if job.finished() || left.is_zero() {
+            return Some(job);
+        }
+        if caller_gone(caller) {
+            studio.media.cancel(id);
+            studio.log.push(format!("image job {id} cancelled: its caller hung up"));
+            return studio.media.wait(id, Duration::from_secs(30));
+        }
+    }
+}
+
+/// OpenAI Images: generate, wait, and answer with base64 PNGs or URLs. `caller`: the connection asking, whose hanging
+/// up cancels the job.
+fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool, scratch: Option<PathBuf>, caller: Option<&TcpStream>) -> Result<Reply, Reply> {
     if req.method != "POST" {
         return Err(fail(405, "use POST"));
     }
     check_image_body(&body)?;
     let format = body.get("response_format").and_then(Json::as_str).unwrap_or("b64_json");
     let job = submit_image(studio, &body, trusted || multipart(req), scratch)?;
-    let done = studio.media.wait(&job.id, IMAGE_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
+    let done = wait_for_caller(studio, &job.id, IMAGE_WAIT, caller).ok_or_else(|| fail(500, "the job disappeared"))?;
     if done.status != "completed" {
         if done.incognito {
             // Still running after the wait: stop it too, or its scratch folder
@@ -1067,8 +1111,9 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool,
     }
     let root = studio.output_root();
     let base = public_base(studio, req);
+    let records: Vec<Json> = done.result.get("data").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default();
     let mut data = Vec::new();
-    for file in &done.files {
+    for (i, file) in done.files.iter().enumerate() {
         let item = if format == "url" {
             let url = media::file_url(&root, file).ok_or_else(|| fail(500, "output outside the output root"))?;
             ("url", Json::str(format!("{base}{url}")))
@@ -1076,7 +1121,12 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool,
             let bytes = std::fs::read(file).map_err(|e| fail(500, format!("reading {}: {e}", file.display())))?;
             ("b64_json", Json::str(base64_encode(&bytes)))
         };
-        data.push(Json::obj([item, ("revised_prompt", Json::str(&done.prompt))]));
+        let mut fields = vec![(item.0.to_string(), item.1), ("revised_prompt".to_string(), Json::str(&done.prompt))];
+        // (what made it, for a flow or an app to keep: a reference to its file, never its path; none for incognito)
+        if !done.incognito {
+            fields.push(("oaiy".into(), provenance(&done, records.get(i), media::file_url(&root, file).map(|u| format!("{base}{u}")))));
+        }
+        data.push(Json::Obj(fields));
     }
     // Incognito images returned inline exist nowhere else now; URLs stay
     // fetchable until the job expires (ten minutes).
@@ -1090,6 +1140,19 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool,
         ("size", Json::str(&done.size)),
         ("model", Json::str(&done.model)),
     ]))
+}
+
+/// A picture's provenance in an images answer: its job, its file's URL, the model, the worker's own record of it
+/// (seed, steps, size and the like: its paths left out) and how long each stage took
+/// (`{job, file, model, seed, ..., timings}`).
+fn provenance(job: &media::Job, record: Option<&Json>, file: Option<String>) -> Json {
+    const KEPT: [&str; 13] = ["seed", "steps", "cfg", "shift", "width", "height", "architecture", "distilled", "uncond_skip_layers", "negative_prompt", "sampling_seconds", "decode_seconds", "noise_generator"];
+    let mut fields = vec![("job".to_string(), Json::str(&job.id)), ("file".to_string(), file.map_or(Json::Null, Json::str)), ("model".to_string(), Json::str(&job.model))];
+    if let Some(r) = record {
+        fields.extend(KEPT.iter().filter_map(|k| r.get(k).map(|v| (k.to_string(), v.clone()))));
+    }
+    fields.push(("timings".into(), job.timings()));
+    Json::Obj(fields)
 }
 
 /// A picture's background removed, or the picture made larger: wait, and answer
@@ -1157,7 +1220,12 @@ fn submit_image(studio: &Arc<Studio>, body: &Json, allow_local: bool, scratch: O
         }
         fail(400, e)
     })?;
-    Ok(studio.media.submit(Kind::Image, request, model, size, n, 0.0, keep_jobs(&cfg), scratch))
+    let job = studio.media.submit(Kind::Image, request, model, size, n, 0.0, keep_jobs(&cfg), scratch);
+    // (`release`: its models let go as soon as it is done, as a flow's last picture asks)
+    if body.get("release").and_then(Json::as_bool) == Some(true) {
+        studio.media.release_after(&job.id);
+    }
+    Ok(job)
 }
 
 fn submit_video(studio: &Arc<Studio>, body: &Json, trusted: bool, scratch: Option<PathBuf>) -> Result<Job, Reply> {
@@ -1969,6 +2037,135 @@ http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
         assert_eq!(count("started"), 2, "{}", log());
         until("the worker let go and the language model back", || count("ended") == 2 && count("engine started") == 2 && studio.llm.is_running());
         studio.llm.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kept picture worker as `FAKE_SERVE`, its stages said, that runs out of memory once for the prompt `oom` (the
+    /// first worker it is; the next does it).
+    #[cfg(unix)]
+    const FAKE_SERVE_STAGES: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+log = os.path.join(here, "fake-media.log")
+open(log, "a").write("started\n")
+for line in sys.stdin:
+    ask = json.loads(line)
+    for stage in ["encoding_text", "loading_transformer", "sampling", "decoding"]:
+        print(json.dumps({"stage": stage, "image": 1, "step": 1, "steps": 1}), file=sys.stderr, flush=True)
+        time.sleep(0.05)
+    if ask["prompt"] == "never":
+        time.sleep(60)
+    if ask["prompt"] == "oom" and not os.path.exists(os.path.join(here, "oom-once")):
+        open(os.path.join(here, "oom-once"), "w").write("")
+        print(json.dumps({"error": "the GPU is out of memory"}), flush=True)
+        continue
+    os.makedirs(ask["output_dir"], exist_ok=True)
+    path = os.path.join(ask["output_dir"], ask["prompt"] + ".png")
+    open(path, "wb").write(b"\x89PNG\r\n\x1a\n")
+    print(json.dumps({"data": [{"path": path, "seed": 7, "steps": 8, "transformer": "/a/local/path"}], "seconds": 0.2}), flush=True)
+open(log, "a").write("ended\n")
+"#;
+
+    /// The scheduler's word on a picture: each stage timed (and the queue's wait), its provenance in the answer (its
+    /// file's URL, seed and timings, never a local path); `release` lets its kept worker go at once, not after the keep
+    /// time; a job that runs out of memory is tried once more with the kept worker let go; the view of what is loaded
+    /// shows the kept worker; and a queue already full refuses a new job.
+    #[cfg(unix)]
+    #[test]
+    fn pictures_are_timed_released_retried_and_turned_away_when_the_queue_is_full() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fake_dir("scheduler");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = dir.join("fake-media");
+        std::fs::write(&worker, FAKE_SERVE_STAGES).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = crate::config::default_json();
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["media"]).unwrap(), "worker", Json::str(worker.to_string_lossy()));
+        let studio = Arc::new(Studio::for_test(&dir, cfg));
+        let runner = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let media = Arc::clone(&runner.media);
+            media.run(&runner);
+        });
+        let log = || std::fs::read_to_string(dir.join("fake-media.log")).unwrap_or_default();
+        let count = |line: &str| log().lines().filter(|l| l.trim() == line).count();
+        let out = dir.join("out");
+        let picture = |prompt: &str, release: bool| {
+            let job = studio.media.submit(Kind::Image, Json::obj([("prompt", Json::str(prompt)), ("output_dir", Json::str(out.to_string_lossy()))]), "turbo".into(), "1024x1024".into(), 1, 0.0, 8, None);
+            if release {
+                studio.media.release_after(&job.id);
+            }
+            studio.media.wait(&job.id, Duration::from_secs(60)).unwrap()
+        };
+        // timed: the queue's wait, then each stage as it began, the last counted to its end
+        let done = picture("fox", false);
+        assert_eq!(done.status, "completed", "{:?}", done.error);
+        let t = done.timings();
+        let stages: Vec<String> = t.get("stages").and_then(Json::as_array).unwrap().iter().map(|s| str_or(s, "stage", "").to_string()).collect();
+        assert_eq!(stages, ["starting", "encoding_text", "loading_transformer", "sampling", "decoding"], "{}", t.to_json());
+        assert!(t.get("total_seconds").and_then(Json::as_f64).is_some_and(|s| s >= 0.15), "{}", t.to_json());
+        assert_eq!(t.get("device").and_then(Json::as_str), Some("gpu0"));
+        // its provenance, as an images answer carries it: the worker's record, its paths left out
+        let record = done.result.get("data").and_then(|d| d.at(0)).cloned();
+        let p = provenance(&done, record.as_ref(), Some("http://x/files/fox.png".into()));
+        assert_eq!((p.get("seed").and_then(Json::as_i64), p.get("file").and_then(Json::as_str)), (Some(7), Some("http://x/files/fox.png")));
+        assert!(p.get("transformer").is_none() && p.get("timings").is_some_and(|t| t.get("stages").is_some()), "{}", p.to_json());
+        // kept, and shown so
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!((count("started"), count("ended")), (1, 0), "{}", log());
+        let view = crate::resources::snapshot(&studio);
+        let kept = view.get("models").and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "kind", "") == "image").cloned().unwrap_or(Json::Null);
+        assert_eq!((str_or(&kept, "model", ""), str_or(&kept, "state", "")), ("turbo", "kept"), "{}", view.to_json());
+        // MOSS-Image's and FLUX 3 Image Klein's kept side by side in the one worker; a Qwen Image picture lets both go
+        let of = |prompt: &str, architecture: &str, model: &str| {
+            let job = studio.media.submit(Kind::Image, Json::obj([("prompt", Json::str(prompt)), ("architecture", Json::str(architecture)), ("output_dir", Json::str(out.to_string_lossy()))]), model.into(), "1024x1024".into(), 1, 0.0, 8, None);
+            studio.media.wait(&job.id, Duration::from_secs(60)).unwrap().status
+        };
+        assert_eq!(of("a mug", "moss-image", "moss"), "completed");
+        assert_eq!(of("the mug blue", "flux3-klein", "klein"), "completed");
+        assert_eq!(studio.media.kept_worker().unwrap().models, ["moss", "klein"]);
+        let view = crate::resources::snapshot(&studio);
+        let kept: Vec<&str> = view.get("models").and_then(Json::as_array).unwrap().iter().filter(|m| str_or(m, "state", "") == "kept").map(|m| str_or(m, "model", "")).collect();
+        assert_eq!(kept, ["moss", "klein"], "{}", view.to_json());
+        assert_eq!(of("another mug", "moss-image", "moss"), "completed");
+        assert_eq!(studio.media.kept_worker().unwrap().models, ["moss", "klein"], "the same model again loads nothing");
+        assert_eq!(of("a fox", "qwen-image", "turbo"), "completed");
+        assert_eq!(studio.media.kept_worker().unwrap().models, ["turbo"]);
+        assert_eq!((count("started"), count("ended")), (1, 0), "all in the one worker: {}", log());
+        // released after a picture that asks: let go as soon as it is done
+        assert_eq!(picture("owl", true).status, "completed");
+        until("the released worker to end", || count("ended") == 1);
+        // out of memory once: tried again (a new worker) and made
+        let done = picture("oom", false);
+        assert_eq!(done.status, "completed", "{:?}\n{}", done.error, studio.media.log.tail(10));
+        assert!(done.stages.iter().any(|s| s.name == "retrying"), "{:?}", done.stages);
+        assert!(crate::resources::events(0).iter().any(|e| str_or(e, "event", "") == "retry"));
+        // a caller that hangs up mid-picture: its job cancelled, the GPU not held for a picture nobody will take
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (served, _) = listener.accept().unwrap();
+        let gone = studio.media.submit(Kind::Image, Json::obj([("prompt", Json::str("never")), ("output_dir", Json::str(out.to_string_lossy()))]), "turbo".into(), "1x1".into(), 1, 0.0, 100, None);
+        until("the hung-up picture to start", || studio.media.get(&gone.id).is_some_and(|j| j.status == "in_progress"));
+        let waiter = {
+            let (studio, id) = (Arc::clone(&studio), gone.id.clone());
+            std::thread::spawn(move || wait_for_caller(&studio, &id, Duration::from_secs(60), Some(&served)).map(|j| j.status))
+        };
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!waiter.is_finished(), "it waits while its caller is there");
+        drop(client);
+        assert_eq!(waiter.join().unwrap().as_deref(), Some("cancelled"));
+                // a full queue: a new picture turned away (the runner held up by a picture that never ends)
+        let slow = studio.media.submit(Kind::Image, Json::obj([("prompt", Json::str("never")), ("output_dir", Json::str(out.to_string_lossy()))]), "turbo".into(), "1x1".into(), 1, 0.0, 100, None);
+        until("the never-ending picture to start", || studio.media.get(&slow.id).is_some_and(|j| j.status == "in_progress"));
+        let waiting: Vec<_> = (0..crate::media::MAX_QUEUED).map(|i| studio.media.submit(Kind::Image, Json::obj([("prompt", Json::str(format!("q{i}"))), ("output_dir", Json::str(out.to_string_lossy()))]), "turbo".into(), "1x1".into(), 1, 0.0, 100, None)).collect();
+        until("the queue to fill", || studio.media.queued() >= crate::media::MAX_QUEUED);
+        let (status, _, body) = ask(&studio, "images", r#"{"prompt": "one too many"}"#);
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("queue is full"), "{body}");
+        for j in waiting.iter().chain([&slow]) {
+            studio.media.cancel(&j.id);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
