@@ -88,6 +88,26 @@ fn native_calls_preserve_types_and_reject_partial_or_unknown_calls() {
     assert!(normalize(&call.replace("function=computer","function=unknown"),&tools()).is_err());
     assert!(normalize(&format!("{call} unwanted suffix"),&tools()).is_err());
 }
+/// Qwen3-VL calls in Qwen3's own form, JSON in the call's tags (its arguments an object, or that object as a string):
+/// read as the XML form is, each argument's type kept, and an undeclared function still refused.
+#[test]
+fn json_calls_are_read_as_the_xml_ones() {
+    for call in [
+        "<tool_call>\n{\"name\": \"computer\", \"arguments\": {\"action\": \"keyboard_sequence\", \"keys\": [{\"x\": 42, \"key\": \"h\"}]}}\n</tool_call>",
+        "<tool_call>\n{\"name\": \"computer\", \"arguments\": \"{\\\"action\\\": \\\"keyboard_sequence\\\", \\\"keys\\\": [{\\\"x\\\": 42, \\\"key\\\": \\\"h\\\"}]}\"}\n</tool_call>",
+    ] {
+        let converted = normalize(call, &tools()).unwrap();
+        let mut parser = crate::dsv41::chat::StreamParser::new(Mode::Chat);
+        parser.push(&converted);
+        assert!(parser.tool_call_error().is_none(), "{converted}");
+        let (_, calls) = parser.finish();
+        let args = Json::parse(calls[0].arguments.as_bytes()).unwrap();
+        assert_eq!(args.get("action").and_then(Json::as_str), Some("keyboard_sequence"));
+        assert!(args.get("keys").unwrap().as_array().is_some(), "{converted}");
+    }
+    assert!(normalize("<tool_call>{\"name\": \"unknown\", \"arguments\": {}}</tool_call>", &tools()).is_err());
+    assert!(normalize("<tool_call>{\"name\": \"computer\", \"arguments\": [1]}</tool_call>", &tools()).is_err());
+}
 #[test]
 fn a_function_named_with_the_parameter_tag_is_read_as_the_function() {
     let call = "<tool_call>\n<parameter=computer>\n<parameter=action>\nkeyboard_sequence\n</parameter>\n</parameter>\n</tool_call>";
@@ -560,4 +580,44 @@ fn a_qwen3vl_tower_gives_its_tokens_with_the_hosts_copy_let_go() {
     eprintln!("{:?} tokens in {took:.2} s; the host's copy let go: {:.2} GB", before.shape(), freed as f64 / 1e9);
     assert!(freed > 1_000_000_000, "{freed} bytes let go");
     assert_eq!(after.data(), before.data());
+}
+
+/// Qwen3-VL's turns carry no thought: an instruct model's template opens the reply straight away, and an earlier reply
+/// stands as it was said; its pictures stand as Qwen3.5's.
+#[test]
+fn qwen3_vl_prompts_open_no_thought() {
+    let msgs = Json::Arr(vec![
+        Json::obj([("role", Json::str("user")), ("content", Json::str("hi"))]),
+        Json::obj([("role", Json::str("assistant")), ("content", Json::str("hello"))]),
+        Json::obj([("role", Json::str("user")), ("content", Json::Arr(vec![
+            Json::obj([("type", Json::str("image_url")), ("image_url", Json::obj([("url", Json::str("data:image/png;base64,iVBORw0KGgo="))]))]),
+            Json::obj([("type", Json::str("text")), ("text", Json::str("what is it?"))]),
+        ]))]),
+    ]);
+    let encoded = chat_prompt_as(msgs.as_array().unwrap(), &Options { mode: Mode::Chat, effort: 50, drop_thinking: true }, Pictures::Qwen3Vl).unwrap();
+    assert!(!encoded.prompt.contains("<think>"), "{}", encoded.prompt);
+    assert!(encoded.prompt.contains("<|im_start|>assistant\nhello<|im_end|>"), "{}", encoded.prompt);
+    assert!(encoded.prompt.contains("<|vision_start|><|image_pad|><|vision_end|>what is it?"), "{}", encoded.prompt);
+    assert!(encoded.prompt.ends_with("<|im_end|>\n<|im_start|>assistant\n"), "{}", encoded.prompt);
+    assert_eq!(encoded.images.len(), 1);
+}
+
+/// Qwen3-VL is told of its tools in its own template's words (the tools as JSON, each call asked for as JSON in the
+/// call's tags), after the system's text; a past call is shown in that form.
+#[test]
+fn qwen3_vl_tools_are_offered_in_its_own_form() {
+    let msgs = Json::parse(br#"[
+        {"role": "system", "content": "Be brief.", "tools": [{"type": "function", "function": {"name": "computer", "parameters": {"type": "object"}}}]},
+        {"role": "user", "content": "press h"},
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "computer", "arguments": "{\"action\": \"key\"}"}}]},
+        {"role": "tool", "content": "done"}
+    ]"#).unwrap();
+    let encoded = chat_prompt_as(msgs.as_array().unwrap(), &Options { mode: Mode::Chat, effort: 50, drop_thinking: true }, Pictures::Qwen3Vl).unwrap();
+    let p = &encoded.prompt;
+    assert!(p.starts_with("<|im_start|>system\nBe brief.\n\n# Tools\n\nYou may call one or more functions"), "{p}");
+    assert!(p.contains("<tools>\n{\"type\":\"function\""), "{p}");
+    assert!(p.contains("{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n"), "{p}");
+    assert!(p.contains("<|im_start|>assistant\n<tool_call>\n{\"name\": \"computer\", \"arguments\": {\"action\": \"key\"}}\n</tool_call><|im_end|>\n"), "{p}");
+    assert!(p.contains("<|im_start|>user\n<tool_response>\ndone\n</tool_response><|im_end|>\n"), "{p}");
+    assert!(!p.contains("<function="), "{p}");
 }

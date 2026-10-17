@@ -76,10 +76,44 @@ impl Qwen3Model {
         Ok(Self { config, tokenizer, common, extras, backend, chain: Default::default() })
     }
 
+    /// The model as the chain reads it: Qwen3's per-head q and k norms, and Qwen3-VL's M-RoPE sections.
+    fn dense(&self) -> crate::llm::chain::decode::Dense<'_> {
+        let norms = self.extras.iter().map(|e| (&e.attn_q_norm, &e.attn_k_norm)).collect();
+        crate::llm::chain::decode::Dense { qk_norms: Some(norms), mrope: self.config.mrope_sections, ..crate::llm::chain::decode::Dense::plain(&self.config, &self.common) }
+    }
+
+    /// `tokens`' embeddings, on the host (`[tokens, d]`): a prompt's rows, a picture's then spliced in.
+    pub fn embed_text(&self, tokens: &[u32]) -> Tensor {
+        let e = self.backend.embed_lookup(&self.common.tok_embd, tokens, self.config.embedding_dim);
+        if e.is_device() { e.to_host() } else { e }
+    }
+
+    /// Rows given as their embeddings (`embeds`, `[tokens, d]` on the host: a picture's tokens spliced among the
+    /// text's) after what `kv` holds, at `positions` (each row's time, height and width: Qwen3-VL's pictures over their
+    /// grid, the text after one past its side; None, the rows that follow), with `deepstack[i]` (`[tokens, d]`, zero
+    /// where no picture is) added after layer `i`: the last row's logits. Chained on the device (a step's single row
+    /// as a step); without a chain, only text at the rows that follow.
+    pub fn forward_embeds_positions(&self, tokens: &[u32], embeds: &Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>, deepstack: &[Vec<f32>]) -> Result<Tensor> {
+        let dense = self.dense();
+        let seq = tokens.len();
+        let chained = if seq == 1 && deepstack.is_empty() {
+            self.chain.step_at(&*self.backend, &dense, tokens[0], kv, positions.and_then(|p| p.first().copied()))
+        } else {
+            self.chain.prompt_embeds(&*self.backend, &dense, embeds.data(), seq, kv, positions, deepstack)
+        };
+        if let Some(logits) = chained {
+            return Ok(logits);
+        }
+        let at_rows = positions.is_none_or(|p| p.iter().enumerate().all(|(i, q)| q.iter().all(|&a| a as usize == kv.len + i)));
+        if !deepstack.is_empty() || !at_rows {
+            return Err(LlamaError::Config("a picture's rows need a GPU the model runs chained on".into()));
+        }
+        Ok(self.forward_host(tokens, kv))
+    }
+
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Tensor {
         // a decode step chained on the device when the backend has one for this model.
-        let norms = self.extras.iter().map(|e| (&e.attn_q_norm, &e.attn_k_norm)).collect();
-        let dense = crate::llm::chain::decode::Dense { qk_norms: Some(norms), ..crate::llm::chain::decode::Dense::plain(&self.config, &self.common) };
+        let dense = self.dense();
         let chained = if tokens.len() == 1 {
             self.chain.step(&*self.backend, &dense, tokens[0], kv)
         } else {

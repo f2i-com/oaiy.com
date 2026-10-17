@@ -374,6 +374,8 @@ fn build(path: &Path, backend: Arc<dyn Backend>, cache_devices: Vec<Arc<dyn Back
         activation_sparsity_scale: None,
         recurrent_layers: None,
         kv_heads_per_layer: None,
+        mrope_sections: None,
+        deepstack_layers: 0,
     };
     let tok = tokenizer(path, vocab)?;
     let l = Loader {

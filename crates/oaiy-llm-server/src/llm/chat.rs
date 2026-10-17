@@ -56,7 +56,8 @@ pub fn apply_chat_template(arch: &Architecture, messages: &[ChatMessage], add_as
         Architecture::Gemma3 | Architecture::Gemma3n => gemma3_template(messages, add_assistant),
         // Gemma 4 introduced new `<|turn>` / `<turn|>` markers.
         Architecture::Gemma4 => gemma4_template(messages, add_assistant),
-        Architecture::Qwen2 => chatml_template(messages, add_assistant, false),
+        // (Qwen3-VL-Instruct's template opens no thought either)
+        Architecture::Qwen2 | Architecture::Qwen3Vl => chatml_template(messages, add_assistant, false),
         // LFM2's ChatML after its `<|startoftext|>`, the reply opening on its thought.
         Architecture::Lfm2Moe => lfm2_template(messages, add_assistant),
         // GLM-5.3-Flash.
@@ -380,7 +381,7 @@ pub fn chat_stop_tokens(arch: &Architecture) -> &'static [&'static str] {
         Architecture::Gemma3 | Architecture::Gemma3n => &["<end_of_turn>"],
         Architecture::Gemma4 => &["<turn|>"],
         Architecture::Qwen2 | Architecture::Qwen3 | Architecture::Qwen35 |
-        Architecture::Qwen3Moe | Architecture::Qwen3VlMoe |
+        Architecture::Qwen3Moe | Architecture::Qwen3Vl | Architecture::Qwen3VlMoe |
         Architecture::Qwen35Moe | Architecture::Qwen36MoeVl | Architecture::Lfm2Moe => &["<|im_end|>"],
         // GLM-5.3-Flash. Resolved from the GGUF vocab, not guessed:
         // eos 154820 = `<|endoftext|>`, eot 154827 = `<|user|>`, eom 154829 =

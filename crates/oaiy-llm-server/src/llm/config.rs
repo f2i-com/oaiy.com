@@ -40,6 +40,11 @@ pub enum Architecture {
     /// `n_deepstack_layers` metadata. Routes to `Qwen3MoeModel` (same LM
     /// stack) + the existing `qwen3vl_merger` mmproj loader.
     Qwen3VlMoe,
+    /// Qwen3-VL (dense) — Qwen3's decoder (q and k normed a head at a time) with interleaved M-RoPE over a row's
+    /// time, height and width (`rope.dimension_sections`), and DeepStack: its tower's mergers' tokens added to the
+    /// first `n_deepstack_layers` layers' states at a picture's rows. Qwen3-VL-2B/4B/8B-Instruct. Routes to
+    /// `Qwen3Model`; its tower is the `qwen3vl_merger` mmproj's.
+    Qwen3Vl,
     /// Qwen3.6-MoE — qwen35 SSM-hybrid backbone + 256-expert MoE + shared
     /// expert (DeepSeek-V2 / Qwen3-Next pattern). Targets Qwen3.6-35B-A3B.
     /// `arch=qwen35moe`. Forward in `crates/oaiy-llm-server/src/llm/arch/qwen35moe.rs`.
@@ -87,6 +92,7 @@ impl Architecture {
             "gemma4"       => Self::Gemma4,
             "qwen35"       => Self::Qwen35,
             "qwen3moe"     => Self::Qwen3Moe,
+            "qwen3vl"      => Self::Qwen3Vl,
             "qwen3vlmoe"   => Self::Qwen3VlMoe,
             "qwen35moe"    => Self::Qwen35Moe,
             "qwen36moevl"  => Self::Qwen36MoeVl,
@@ -109,6 +115,7 @@ impl Architecture {
             Self::Gemma4      => "gemma4",
             Self::Qwen35      => "qwen35",
             Self::Qwen3Moe    => "qwen3moe",
+            Self::Qwen3Vl     => "qwen3vl",
             Self::Qwen3VlMoe  => "qwen3vlmoe",
             Self::Qwen35Moe   => "qwen35moe",
             Self::Qwen36MoeVl => "qwen36moevl",
@@ -127,7 +134,7 @@ impl Architecture {
         match self {
             Self::Llama | Self::Mistral => RopeType::Normal,
             Self::Qwen2 | Self::Qwen3 | Self::Qwen35 | Self::Qwen35Moe | Self::Qwen3Moe |
-            Self::Qwen3VlMoe | Self::Qwen36MoeVl |
+            Self::Qwen3Vl | Self::Qwen3VlMoe | Self::Qwen36MoeVl |
             Self::Gemma3 | Self::Gemma3n | Self::Gemma4 | Self::Lfm2Moe => RopeType::NeoX,
             // glm5next is NoPE — `rope.dimension_count` is 0 and
             // the GGUF carries no rope tensors, so this value is never applied.
@@ -189,6 +196,12 @@ pub struct ModelConfig {
     /// Gemma 4: each layer's KV head count, from the `attention.head_count_kv` array (`n_kv_heads` is the largest).
     /// None where the key is a scalar.
     pub kv_heads_per_layer: Option<Vec<usize>>,
+    /// Qwen3-VL: how many of a head's rotary pairs follow a row's time, height and width
+    /// (`rope.dimension_sections`, interleaved: pair `j` below three times the height's count with `j % 3 == 1` the
+    /// height's, `j % 3 == 2` the width's, the rest the time's). None: one position a row.
+    pub mrope_sections: Option<[usize; 3]>,
+    /// Qwen3-VL: the first layers after each of which a DeepStack merger's tokens are added (`n_deepstack_layers`).
+    pub deepstack_layers: usize,
 }
 
 /// Backwards-compat alias for the v0 name.
@@ -295,6 +308,16 @@ impl ModelConfig {
         let n_kv_heads = kv_heads_per_layer.as_ref().and_then(|h| h.iter().copied().max()).unwrap_or(n_kv_heads);
         let rms_eps        = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let rope_theta     = get_f32("rope.freq_base").unwrap_or(10000.0);
+        // (Qwen3-VL's interleaved M-RoPE and DeepStack; the other architectures read theirs their own way)
+        let mrope_sections = (arch == Architecture::Qwen3Vl).then(|| g.metadata().get(&format!("{ns}.rope.dimension_sections")).and_then(|v| v.as_array()).and_then(|a| {
+            let v: Vec<usize> = match a {
+                gguf::Array::I32(v) => v.iter().map(|&x| x.max(0) as usize).collect(),
+                gguf::Array::U32(v) => v.iter().map(|&x| x as usize).collect(),
+                _ => return None,
+            };
+            (v.len() >= 3).then(|| [v[0], v[1], v[2]])
+        })).flatten();
+        let deepstack_layers = if arch == Architecture::Qwen3Vl { get_u64_or("n_deepstack_layers", 0) as usize } else { 0 };
 
         if n_heads == 0 || n_kv_heads == 0 || embedding_dim == 0 {
             return Err(LlamaError::Config("zero-sized dimension in config".into()));
@@ -392,6 +415,8 @@ impl ModelConfig {
             activation_sparsity_scale,
             recurrent_layers,
             kv_heads_per_layer,
+            mrope_sections,
+            deepstack_layers,
         })
     }
 

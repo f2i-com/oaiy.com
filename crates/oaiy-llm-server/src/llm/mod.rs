@@ -178,6 +178,9 @@ impl Model {
             // The vision tower is loaded separately via the qwen3vl_merger
             // mmproj path.
             Architecture::Qwen3VlMoe => Ok(Self::Qwen3Moe(Qwen3MoeModel::from_gguf(g, backend)?)),
+            // Qwen3-VL (dense): Qwen3's decoder, its positions in three axes and its DeepStack the model's own
+            // (`Qwen3Model::forward_embeds_positions`); its tower the `qwen3vl_merger` mmproj's.
+            Architecture::Qwen3Vl => Ok(Self::Qwen3(Qwen3Model::from_gguf(g, backend)?)),
             Architecture::Qwen35Moe => Ok(Self::Qwen35Moe(Qwen35MoeModel::from_gguf(g, backend)?)),
             // LFM2-MoE as a Qwen3.5 hybrid of short convs, its experts a GPU's (the server's
             // `Qwen35Model::from_gguf_with`): refused here, where nothing holds them

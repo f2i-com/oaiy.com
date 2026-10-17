@@ -34,6 +34,21 @@ pub struct Qwen3VlProjector {
     pub mm2_b:  Tensor,
 }
 
+/// One of Qwen3-VL's DeepStack mergers (`v.deepstack.{block}.*`): the states after vision block `block`, each 2 x 2
+/// patches side by side, layer-normed (over the four together), then `fc1` → erf-GELU → `fc2` to the text model's
+/// width. Its tokens are added to the text model's hidden states at the picture's rows after one of its first layers
+/// (the first merger's after layer 0, the next's after layer 1, …), as transformers' `_deepstack_process` adds them.
+#[derive(Debug)]
+pub struct Qwen3VlDeepstack {
+    pub block:  usize,
+    pub norm_w: Tensor,  // [4 D]
+    pub norm_b: Tensor,  // [4 D]
+    pub fc1:    Weight,  // [4 D, 4 D]
+    pub fc1_b:  Tensor,
+    pub fc2:    Weight,  // [lm_hidden, 4 D]
+    pub fc2_b:  Tensor,
+}
+
 #[derive(Debug)]
 pub struct Qwen3VlMmProj {
     pub config:        MmProjConfig,
@@ -49,6 +64,8 @@ pub struct Qwen3VlMmProj {
     pub post_ln_w:     Tensor,                 // [D]
     pub post_ln_b:     Tensor,                 // [D]
     pub projector:     Qwen3VlProjector,
+    /// Qwen3-VL's DeepStack mergers, by the vision block they read (none in Qwen3.5's tower, which has no DeepStack).
+    pub deepstack:     Vec<Qwen3VlDeepstack>,
     pub backend:       Arc<dyn Backend>,
     /// the tower chained on the backend's device (`chain::mmproj`), made at the first picture; a
     /// loader gives `Default::default()`.
@@ -129,6 +146,29 @@ impl Qwen3VlMmProj {
         let mm2_b = idx.take("mm.2.bias", &[])?;
         let projector = Qwen3VlProjector { mm0, mm0_b, mm2, mm2_b };
 
+        // ----- DeepStack mergers (Qwen3-VL's; Qwen3.5's tower has none) --
+        let mut deepstack = Vec::new();
+        for block in 0..config.n_layers {
+            let name = |part: &str| format!("v.deepstack.{block}.{part}");
+            let Some(norm_w) = idx.try_take(&name("norm.weight")) else { continue };
+            deepstack.push(Qwen3VlDeepstack {
+                block,
+                norm_w: norm_w?,
+                norm_b: idx.take(&name("norm.bias"), &[])?,
+                fc1:    idx.take_weight(&name("fc1.weight"), &[])?,
+                fc1_b:  idx.take(&name("fc1.bias"), &[])?,
+                fc2:    idx.take_weight(&name("fc2.weight"), &[])?,
+                fc2_b:  idx.take(&name("fc2.bias"), &[])?,
+            });
+        }
+        let merged = 4 * config.embedding_dim;
+        for ds in &deepstack {
+            let (s1, s2) = (ds.fc1.shape(), ds.fc2.shape());
+            if ds.norm_w.shape() != [merged] || s1.len() != 2 || s1[1] != merged || s2.len() != 2 || s2[1] != s1[0] || s2[0] != projector.mm2.shape()[0] {
+                return Err(LlamaError::Config(format!("v.deepstack.{}: not a merger of 2 x 2 patches to the projector's width", ds.block)));
+            }
+        }
+
         verify_qwen3vl_shapes(&config, &patch_embd, &position_embd, &blocks, &projector)?;
 
         // ----- upload to backend (1 GB margin — vision is one-shot) ----
@@ -154,6 +194,15 @@ impl Qwen3VlMmProj {
             mm2:   projector.mm2.try_to_device(&*backend, M),
             mm2_b: upload(projector.mm2_b),
         };
+        let deepstack = deepstack.into_iter().map(|d| Qwen3VlDeepstack {
+            block:  d.block,
+            norm_w: upload(d.norm_w),
+            norm_b: upload(d.norm_b),
+            fc1:    d.fc1.try_to_device(&*backend, M),
+            fc1_b:  upload(d.fc1_b),
+            fc2:    d.fc2.try_to_device(&*backend, M),
+            fc2_b:  upload(d.fc2_b),
+        }).collect();
         let post_ln_w = upload(post_ln_w);
         let post_ln_b = upload(post_ln_b);
         let position_embd = upload(position_embd);
@@ -161,7 +210,7 @@ impl Qwen3VlMmProj {
 
         Ok(Self {
             config, patch_embd, patch_embd_b: upload(patch_embd_b),
-            position_embd, blocks, post_ln_w, post_ln_b, projector, backend,
+            position_embd, blocks, post_ln_w, post_ln_b, projector, deepstack, backend,
             chain: Default::default(),
         })
     }
@@ -182,12 +231,21 @@ impl Qwen3VlMmProj {
             }
         }
         bytes += let_go(&mut self.projector.mm0) + let_go(&mut self.projector.mm2);
+        for d in &mut self.deepstack {
+            bytes += let_go(&mut d.fc1) + let_go(&mut d.fc2);
+        }
         self.chain.1.store(true, std::sync::atomic::Ordering::Relaxed);
         bytes
     }
 
     /// Image → soft tokens. Same contract as the other mmproj variants.
     pub fn forward(&self, image: &Tensor) -> Result<Tensor> {
+        self.forward_deepstack(image).map(|(tokens, _)| tokens)
+    }
+
+    /// Image → soft tokens, and each DeepStack merger's tokens beside them (`[n / 4, lm_hidden]` each, in
+    /// [`Self::deepstack`]'s order; none for a tower without them).
+    pub fn forward_deepstack(&self, image: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         let cfg = &self.config;
         let backend = &*self.backend;
         if image.rank() != 3 || image.dim(0) != 3
@@ -203,7 +261,7 @@ impl Qwen3VlMmProj {
         let patches = unfold_patches_to_host(image, cfg.patch_size)?;
         // the whole tower chained on the backend's device where it can be (the plain matrices are
         // otherwise multiplied on the host by a backend that keeps dense weights there: 20 s a picture).
-        if let Some(out) = crate::llm::chain::mmproj::forward(self, &patches) {
+        if let Some(out) = crate::llm::chain::mmproj::forward_taps(self, &patches) {
             return Ok(out);
         }
         if self.chain.1.load(std::sync::atomic::Ordering::Relaxed) {
@@ -221,46 +279,27 @@ impl Qwen3VlMmProj {
         // ----- 2. Add learned absolute positions ------------------------
         backend.add_inplace(&mut x, &self.position_embd);
 
-        // ----- 3. Transformer blocks ------------------------------------
-        for blk in &self.blocks {
+        // ----- 3. Transformer blocks (DeepStack's mergers reading theirs) --
+        let mut taps = Vec::with_capacity(self.deepstack.len());
+        for (i, blk) in self.blocks.iter().enumerate() {
             x = qwen3vl_block_forward(backend, &x, blk, cfg);
+            for ds in self.deepstack.iter().filter(|d| d.block == i) {
+                let merged = backend.to_device(merge_2x2(&x.to_host(), cfg));
+                let normed = backend.layer_norm(&merged, &ds.norm_w, &ds.norm_b, cfg.layer_norm_eps);
+                let mut h = ds.fc1.linear(backend, &normed);
+                backend.add_inplace_broadcast_last(&mut h, &ds.fc1_b);
+                let h = qwen_merger_gelu(backend, &h);
+                let mut out = ds.fc2.linear(backend, &h);
+                backend.add_inplace_broadcast_last(&mut out, &ds.fc2_b);
+                taps.push(out.to_host());
+            }
         }
 
         // ----- 4. Post-LN ----------------------------------------------
         x = backend.layer_norm(&x, &self.post_ln_w, &self.post_ln_b, cfg.layer_norm_eps);
 
         // ----- 5. 2x2 spatial merge → [N/4, 4*D] -----------------------
-        // The patch grid is `side` x `side`; collapse 2x2 neighbourhoods into
-        // one row by concatenating their D-vectors in row-major order. Done
-        // on host because it's a contiguous shuffle, not a matmul, and the
-        // tensor is small (2304 * 1152 = ~2.7M elements).
-        let side = cfg.image_size / cfg.patch_size;
-        let new_side = side / 2;
-        let d = cfg.embedding_dim;
-        let merge_dim = 4 * d;
-        let n_merged = new_side * new_side;
-        let host = x.to_host();
-        let src = host.data();
-        let mut merged = vec![0.0f32; n_merged * merge_dim];
-        for by in 0..new_side {
-            for bx in 0..new_side {
-                let dst_off = (by * new_side + bx) * merge_dim;
-                // Sub-quadrant order: (0,0), (0,1), (1,0), (1,1) — row-major
-                // within the 2x2 block. Matches HF's `Qwen3VLPatchMerger`.
-                for sy in 0..2 {
-                    for sx in 0..2 {
-                        let py = by * 2 + sy;
-                        let px = bx * 2 + sx;
-                        let src_off = (py * side + px) * d;
-                        let quad = sy * 2 + sx;
-                        let dst_quad_off = dst_off + quad * d;
-                        merged[dst_quad_off..dst_quad_off + d]
-                            .copy_from_slice(&src[src_off..src_off + d]);
-                    }
-                }
-            }
-        }
-        let mut h = backend.to_device(Tensor::from_vec(merged, vec![n_merged, merge_dim]));
+        let mut h = backend.to_device(merge_2x2(&x.to_host(), cfg));
 
         // ----- 6. mm.0 → GELU → mm.2 -----------------------------------
         let mut h0 = self.projector.mm0.linear(backend, &h);
@@ -270,8 +309,34 @@ impl Qwen3VlMmProj {
         h = qwen_merger_gelu(backend, &h0);
         let mut out = self.projector.mm2.linear(backend, &h);
         backend.add_inplace_broadcast_last(&mut out, &self.projector.mm2_b);
-        Ok(out)
+        Ok((out, taps))
     }
+}
+
+/// The patch grid's states (`[side * side, D]`, row-major) with each 2 x 2 neighbourhood's four side by side in one
+/// row (`[side / 2 * side / 2, 4 D]`), each block's (0,0), (0,1), (1,0), (1,1): HF's `Qwen3VLPatchMerger`'s order.
+/// On the host: a contiguous shuffle, and small (2304 x 1152 values).
+fn merge_2x2(host: &Tensor, cfg: &MmProjConfig) -> Tensor {
+    let side = cfg.image_size / cfg.patch_size;
+    let new_side = side / 2;
+    let d = cfg.embedding_dim;
+    let merge_dim = 4 * d;
+    let n_merged = new_side * new_side;
+    let src = host.data();
+    let mut merged = vec![0.0f32; n_merged * merge_dim];
+    for by in 0..new_side {
+        for bx in 0..new_side {
+            let dst_off = (by * new_side + bx) * merge_dim;
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let src_off = ((by * 2 + sy) * side + bx * 2 + sx) * d;
+                    let dst = dst_off + (sy * 2 + sx) * d;
+                    merged[dst..dst + d].copy_from_slice(&src[src_off..src_off + d]);
+                }
+            }
+        }
+    }
+    Tensor::from_vec(merged, vec![n_merged, merge_dim])
 }
 
 pub(super) fn qwen_merger_gelu(b: &dyn Backend, x: &Tensor) -> Tensor {
@@ -407,4 +472,56 @@ fn verify_qwen3vl_shapes(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each row's cosine with the reference's, the worst first, and the mean.
+    fn cosines(got: &[f32], want: &[f32], width: usize) -> (f64, f64) {
+        let rows = want.len() / width;
+        let (mut worst, mut sum) = (1f64, 0f64);
+        for r in 0..rows {
+            let (a, b) = (&got[r * width..(r + 1) * width], &want[r * width..(r + 1) * width]);
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let c = dot / (na * nb);
+            worst = worst.min(c);
+            sum += c;
+        }
+        (worst, sum / rows as f64)
+    }
+
+    /// Qwen3-VL-4B's tower from llama.cpp's mmproj GGUF, on the device, against transformers' (float32) on the same
+    /// picture: its soft tokens and its three DeepStack features
+    /// (`tools/qwen3vl/vision_reference.py` makes the reference).
+    #[test]
+    #[ignore = "needs Qwen3-VL's mmproj GGUF (OAIY_QWEN3VL_MMPROJ), the reference (OAIY_QWEN3VL_VISION_EXPECTED) and a WebGPU adapter"]
+    fn qwen3vl_tower_and_deepstack_are_transformers() {
+        let (Ok(mmproj), Ok(expected)) = (std::env::var("OAIY_QWEN3VL_MMPROJ"), std::env::var("OAIY_QWEN3VL_VISION_EXPECTED")) else { return };
+        let Ok(gpu) = ggml_rs_wgpu::WgpuBackend::new(None) else { return };
+        let backend: Arc<dyn Backend> = Arc::new(gpu);
+        let file = GgufFile::open(&mmproj).unwrap();
+        let MmProj::Qwen3Vl(mm) = MmProj::from_gguf(&file, backend).unwrap() else { panic!("not a Qwen3-VL tower") };
+        assert_eq!(mm.deepstack.iter().map(|d| d.block).collect::<Vec<_>>(), [5, 11, 17]);
+        let want = oaiy_engine::safetensors::StIndex::open_file(std::path::Path::new(&expected)).unwrap();
+        let image = Tensor::from_vec(want.read_f32("image").unwrap(), vec![3, 768, 768]);
+        let (tokens, deepstack) = (want.read_f32("tokens").unwrap(), want.read_f32("deepstack").unwrap());
+        let width = mm.projector.mm2.shape()[0];
+        let t = std::time::Instant::now();
+        let (got, taps) = mm.forward_deepstack(&image).unwrap();
+        eprintln!("the tower in {:.2} s", t.elapsed().as_secs_f64());
+        assert_eq!(got.shape(), [576, width]);
+        let (worst, mean) = cosines(got.to_host().data(), &tokens, width);
+        eprintln!("soft tokens: cosine worst {worst:.5}, mean {mean:.5}");
+        assert!(worst > 0.995, "soft tokens: worst cosine {worst}");
+        assert_eq!(taps.len(), 3);
+        for (i, tap) in taps.iter().enumerate() {
+            let (worst, mean) = cosines(tap.to_host().data(), &deepstack[i * 576 * width..(i + 1) * 576 * width], width);
+            eprintln!("DeepStack {i}: cosine worst {worst:.5}, mean {mean:.5}");
+            assert!(worst > 0.995, "DeepStack {i}: worst cosine {worst}");
+        }
+    }
 }

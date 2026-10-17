@@ -71,6 +71,15 @@ struct Block {
     fc2: Lin,
 }
 
+/// A DeepStack merger on the device ([`crate::llm::vision::mmproj::Qwen3VlDeepstack`]): after vision block `block`,
+/// its four-patch rows layer-normed, `fc1`, erf-GELU, `fc2`.
+struct Deepstack {
+    block: usize,
+    norm: DeviceVec,
+    fc1: Lin,
+    fc2: Lin,
+}
+
 /// The tower on the device, made at the first picture.
 pub(crate) struct Tower {
     patch: Lin,
@@ -82,6 +91,7 @@ pub(crate) struct Tower {
     post: DeviceVec,
     mm0: Lin,
     mm2: Lin,
+    deepstack: Vec<Deepstack>,
     /// Where the merger's order takes each patch from (its place in the raster).
     order: Vec<usize>,
 }
@@ -148,6 +158,11 @@ impl Tower {
             post: norm(chain, &mm.post_ln_w, &mm.post_ln_b),
             mm0: Lin::of(chain, &mm.projector.mm0, &mm.projector.mm0_b)?,
             mm2: Lin::of(chain, &mm.projector.mm2, &mm.projector.mm2_b)?,
+            deepstack: mm
+                .deepstack
+                .iter()
+                .map(|d| Some(Deepstack { block: d.block, norm: norm(chain, &d.norm_w, &d.norm_b), fc1: Lin::of(chain, &d.fc1, &d.fc1_b)?, fc2: Lin::of(chain, &d.fc2, &d.fc2_b)? }))
+                .collect::<Option<Vec<_>>>()?,
             order,
         })
     }
@@ -167,6 +182,12 @@ pub(crate) fn prepare(mm: &Qwen3VlMmProj) -> bool {
 /// backend's device: the soft tokens `[n / 4, width]`, on the host. None where the backend has no chain or the
 /// tower's weights cannot go on its device.
 pub(crate) fn forward(mm: &Qwen3VlMmProj, patches: &Tensor) -> Option<Tensor> {
+    forward_taps(mm, patches).map(|(tokens, _)| tokens)
+}
+
+/// [`forward`], and each DeepStack merger's tokens (`[n / 4, width]` each, in the tower's order of them): its block's
+/// states, in the merger's order already, read four patches a row.
+pub(crate) fn forward_taps(mm: &Qwen3VlMmProj, patches: &Tensor) -> Option<(Tensor, Vec<Tensor>)> {
     if std::env::var_os("OAIY_NO_CHAIN").is_some() {
         return None;
     }
@@ -188,6 +209,12 @@ pub(crate) fn forward(mm: &Qwen3VlMmProj, patches: &Tensor) -> Option<Tensor> {
     let att = v(chain.attention_rows_full_out_len(n, heads, hd, n));
     let (f, fg) = (v(n * ff), v(n * ff));
     let (mh, mg, out) = (v(n / 4 * merged), v(n / 4 * merged), v(n / 4 * width));
+    // (each DeepStack merger's output kept to the end, read with the tokens; its scratch the merger's own)
+    let taps: Vec<DeviceVec> = tower.deepstack.iter().map(|_| v(n / 4 * width)).collect();
+    let (dn, dh, dg) = match tower.deepstack.first() {
+        Some(first) => (v(n / 4 * merged), v(n / 4 * first.fc1.n), v(n / 4 * first.fc1.n)),
+        None => (v(1), v(1), v(1)),
+    };
     let scale = 1.0 / (hd as f32).sqrt();
     {
         let mut rec = chain.begin();
@@ -198,7 +225,7 @@ pub(crate) fn forward(mm: &Qwen3VlMmProj, patches: &Tensor) -> Option<Tensor> {
         rec.finish();
     }
     // a recording a block (each one's scratch let go before the next's)
-    for b in &tower.blocks {
+    for (i, b) in tower.blocks.iter().enumerate() {
         let mut rec = chain.begin();
         rec.keep_groups(false);
         let r = rec.as_mut();
@@ -219,6 +246,12 @@ pub(crate) fn forward(mm: &Qwen3VlMmProj, patches: &Tensor) -> Option<Tensor> {
         r.gelu(&f, &fg, n * ff);
         b.fc2.run(r, &fg, &o, n);
         r.add(&x, &o);
+        for (ds, tap) in tower.deepstack.iter().zip(&taps).filter(|(ds, _)| ds.block == i) {
+            r.norm_mod_rows(&x, &dn, n / 4, merged, &ds.norm, 0, Some(merged), RowNorm::Layer, eps);
+            ds.fc1.run(r, &dn, &dh, n / 4);
+            r.gelu_erf(&dh, &dg, n / 4 * ds.fc1.n);
+            ds.fc2.run(r, &dg, tap, n / 4);
+        }
         rec.finish();
     }
     let mut rec = chain.begin();
@@ -229,7 +262,14 @@ pub(crate) fn forward(mm: &Qwen3VlMmProj, patches: &Tensor) -> Option<Tensor> {
     tower.mm0.run(r, &normed, &mh, n / 4);
     r.gelu_erf(&mh, &mg, n / 4 * merged);
     tower.mm2.run(r, &mg, &out, n / 4);
+    for tap in &taps {
+        r.read(tap);
+    }
     r.read(&out);
-    let values = rec.finish().pop()?;
-    Some(Tensor::from_vec(values, vec![n / 4, width]))
+    let mut values = rec.finish();
+    let tokens = Tensor::from_vec(values.pop()?, vec![n / 4, width]);
+    if values.len() != taps.len() {
+        return None;
+    }
+    Some((tokens, values.into_iter().map(|t| Tensor::from_vec(t, vec![n / 4, width])).collect()))
 }

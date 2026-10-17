@@ -188,6 +188,8 @@ pub fn load(root: &Path, backend: Arc<dyn Backend>, width: usize, exl3: Option<E
         post_ln_w: t("merger.norm.weight", &[d])?,
         post_ln_b: t("merger.norm.bias", &[d])?,
         projector,
+        // (Qwen3.5's tower has no DeepStack mergers)
+        deepstack: Vec::new(),
         config: cfg,
         backend,
         chain: Default::default(),

@@ -30,12 +30,15 @@ pub(crate) struct Dense<'a> {
     pub layers: Vec<(f32, Option<&'a [f32]>, Option<usize>)>,
     /// The logits through `tanh(l / c) * c`.
     pub softcap: Option<f32>,
+    /// Qwen3-VL's interleaved M-RoPE: how many rotary pairs follow a row's time, height and width
+    /// ([`ModelConfig::mrope_sections`]); None, one position a row (a text row's three are the same anyway).
+    pub mrope: Option<[usize; 3]>,
 }
 
 impl<'a> Dense<'a> {
     /// A model whose layers are Llama's.
     pub fn plain(cfg: &'a ModelConfig, common: &'a CommonTensors) -> Dense<'a> {
-        Dense { cfg, common, qk_norms: None, post_norms: None, gelu: false, embed_scale: None, layers: Vec::new(), softcap: None }
+        Dense { cfg, common, qk_norms: None, post_norms: None, gelu: false, embed_scale: None, layers: Vec::new(), softcap: None, mrope: None }
     }
 
     /// Layer `l`'s RoPE base, divisors and window.
@@ -157,15 +160,35 @@ fn sync(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, kv
 /// Each distinct RoPE's sines and cosines for positions `past..past + rows`, `[rows, head_dim]`, as the CPU's rope
 /// makes them.
 fn rope_tables(m: &Dense<'_>, past: usize, rows: usize) -> Vec<Vec<f32>> {
+    let positions: Vec<[u32; 3]> = (past..past + rows).map(|p| [p as u32; 3]).collect();
+    rope_tables_at(m, &positions)
+}
+
+/// Which of a row's three positions (time, height, width) rotary pair `j` turns by, under Qwen3-VL's interleaved
+/// M-RoPE with `sections` pairs a axis (transformers' `apply_interleaved_mrope`): the height's every third pair from
+/// the second while they last, the width's every third from the third, the time's the rest.
+pub(crate) fn mrope_axis(j: usize, sections: [usize; 3]) -> usize {
+    match j % 3 {
+        1 if j < 3 * sections[1] => 1,
+        2 if j < 3 * sections[2] => 2,
+        _ => 0,
+    }
+}
+
+/// [`rope_tables`] for rows at `positions` (a row's time, height and width: a picture's rows over its grid, the text
+/// after it past its side), each pair turning by the axis [`mrope_axis`] gives it (all by the time's without M-RoPE).
+fn rope_tables_at(m: &Dense<'_>, positions: &[[u32; 3]]) -> Vec<Vec<f32>> {
     let hd = m.cfg.head_dim;
     m.ropes()
         .0
         .iter()
         .map(|(theta, factors)| {
-            (past..past + rows)
-                .flat_map(|pos| {
+            positions
+                .iter()
+                .flat_map(|at| {
                     (0..hd / 2).flat_map(move |j| {
                         let factor = factors.map(|f| f[j]).unwrap_or(1.0);
+                        let pos = at[m.mrope.map_or(0, |s| mrope_axis(j, s))];
                         let (s, c) = (pos as f32 * theta.powf(-2.0 * j as f32 / hd as f32) / factor).sin_cos();
                         [s, c]
                     })
@@ -249,10 +272,27 @@ impl ChainDecoder {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() || tokens.len() < 2 {
             return None;
         }
+        let emb = backend.embed_lookup(&m.common.tok_embd, tokens, m.cfg.embedding_dim);
+        let mut emb = if emb.is_device() { emb.to_host() } else { emb };
+        if let Some(s) = m.embed_scale {
+            emb.data_mut().iter_mut().for_each(|e| *e *= s);
+        }
+        self.prompt_embeds(backend, m, emb.data(), tokens.len(), kv, None, &[])
+    }
+
+    /// [`Self::prompt`] of `t` rows given as their embeddings (`[t, d]`: a picture's tokens among a prompt's), at
+    /// `positions` (each row's time, height and width; None: the rows after what `kv` holds), with `deepstack[i]`
+    /// (`[t, d]`, zero where no picture is) added to the states after layer `i`: Qwen3-VL's DeepStack.
+    pub(crate) fn prompt_embeds(&self, backend: &dyn Backend, m: &Dense<'_>, emb: &[f32], t: usize, kv: &mut KvCache, positions: Option<&[[u32; 3]]>, deepstack: &[Vec<f32>]) -> Option<Tensor> {
+        if std::env::var_os("OAIY_NO_CHAIN").is_some() || t == 0 || emb.len() != t * m.cfg.embedding_dim {
+            return None;
+        }
+        if positions.is_some_and(|p| p.len() != t) || deepstack.len() > m.cfg.n_layers || deepstack.iter().any(|d| d.len() != emb.len()) {
+            return None;
+        }
         let st = self.state(backend, m)?;
         let chain = backend.chain()?;
         let cfg = m.cfg;
-        let t = tokens.len();
         let (n_h, n_kv, hd, d) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.embedding_dim);
         let (qd, kvd, row) = (n_h * hd, n_kv * hd, 2 * n_kv * hd);
         let ff = m.common.blocks[0].ffn_pair.ff();
@@ -263,7 +303,11 @@ impl ChainDecoder {
         reserve(chain, &mut g, cfg, past + t);
         sync(chain, &mut g, cfg, kv, past);
         let rope_of = m.ropes().1;
-        let tables: Vec<DeviceVec> = rope_tables(m, past, t)
+        let tables = match positions {
+            Some(at) => rope_tables_at(m, at),
+            None => rope_tables(m, past, t),
+        };
+        let tables: Vec<DeviceVec> = tables
             .iter()
             .map(|values| {
                 let table = chain.vec(values.len());
@@ -275,12 +319,15 @@ impl ChainDecoder {
             [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * d, t * d, t * 2 * ff, t * ff].map(|len| chain.vec(len));
         let attn = chain.vec(chain.attention_rows_out_len(t, n_h, hd, past + t));
         let (last, logits) = (chain.vec(d), chain.vec(cfg.vocab_size));
-        let emb = backend.embed_lookup(&m.common.tok_embd, tokens, cfg.embedding_dim);
-        let mut emb = if emb.is_device() { emb.to_host() } else { emb };
-        if let Some(s) = m.embed_scale {
-            emb.data_mut().iter_mut().for_each(|e| *e *= s);
-        }
-        chain.upload(&x, emb.data());
+        chain.upload(&x, emb);
+        let deepstack: Vec<DeviceVec> = deepstack
+            .iter()
+            .map(|rows| {
+                let v = chain.vec(rows.len());
+                chain.upload(&v, rows);
+                v
+            })
+            .collect();
         let mut rec = chain.begin();
         // the chunk's vectors are its own: no bind groups kept to hold their memory after it
         rec.keep_groups(false);
@@ -328,6 +375,10 @@ impl ChainDecoder {
                 }
                 None => rec.add(&x, &proj),
             }
+            // (Qwen3-VL: a DeepStack merger's tokens at the picture's rows, after the layer)
+            if let Some(ds) = deepstack.get(l) {
+                rec.add(&x, ds);
+            }
         }
         // the head of the last token's row only
         rec.rmsnorm_rows(&x, &st.output_norm, &xn, t, cfg.rms_eps);
@@ -354,6 +405,12 @@ impl ChainDecoder {
     /// One decode step of `token`, chained, if the backend can: the logits `[1, vocab]`; None leaves the step to the
     /// model's own path.
     pub(crate) fn step(&self, backend: &dyn Backend, m: &Dense<'_>, token: u32, kv: &mut KvCache) -> Option<Tensor> {
+        self.step_at(backend, m, token, kv, None)
+    }
+
+    /// [`Self::step`] with the token at `position` (its time, height and width: a reply after a picture, which is
+    /// shorter in positions than in rows); None: at the row it takes.
+    pub(crate) fn step_at(&self, backend: &dyn Backend, m: &Dense<'_>, token: u32, kv: &mut KvCache, position: Option<[u32; 3]>) -> Option<Tensor> {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() {
             return None;
         }
@@ -369,7 +426,7 @@ impl ChainDecoder {
         sync(chain, &mut g, cfg, kv, past);
         // each RoPE's sines and cosines at this position
         let rope_of = m.ropes().1;
-        for (values, table) in rope_tables(m, past, 1).iter().zip(&st.rope_tables) {
+        for (values, table) in rope_tables_at(m, &[position.unwrap_or([past as u32; 3])]).iter().zip(&st.rope_tables) {
             chain.upload(table, values);
         }
         let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
@@ -447,5 +504,24 @@ impl ChainDecoder {
         kv.commit(1);
         kv.dirty_from = usize::MAX;
         Some(Tensor::from_vec(logits, vec![1, cfg.vocab_size]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mrope_axis;
+
+    /// Qwen3-VL's interleaved M-RoPE (sections 24, 20, 20 of a 128-wide head's 64 pairs) as transformers'
+    /// `apply_interleaved_mrope` assigns pairs: the height's every third from the second below 60, the width's every
+    /// third from the third below 60, the time's the rest; Qwen3.5's (11, 11, 10 of 32) the same way.
+    #[test]
+    fn each_rotary_pair_turns_by_its_axis() {
+        let axes: Vec<usize> = (0..64).map(|j| mrope_axis(j, [24, 20, 20])).collect();
+        assert_eq!(&axes[..7], &[0, 1, 2, 0, 1, 2, 0]);
+        assert_eq!((axes[57], axes[58], axes[59], axes[60], axes[61], axes[62], axes[63]), (0, 1, 2, 0, 0, 0, 0));
+        assert_eq!((axes.iter().filter(|&&a| a == 1).count(), axes.iter().filter(|&&a| a == 2).count()), (20, 20));
+        let qwen35: Vec<usize> = (0..32).map(|j| mrope_axis(j, [11, 11, 10])).collect();
+        assert_eq!((qwen35[31], qwen35[29], qwen35[30]), (1, 2, 0));
+        assert_eq!((qwen35.iter().filter(|&&a| a == 1).count(), qwen35.iter().filter(|&&a| a == 2).count()), (11, 10));
     }
 }

@@ -324,6 +324,23 @@ impl MmProj {
             Self::MiniCpmV(m) => m.forward(image),
         }
     }
+
+    /// [`Self::forward`], and the tokens a Qwen3-VL tower's DeepStack mergers add to the text model's first layers'
+    /// states at the picture's rows (one `[tokens, width]` a merger, in order; none for the other towers).
+    pub fn forward_deepstack(&self, image: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        match self {
+            Self::Qwen3Vl(m) => m.forward_deepstack(image),
+            _ => self.forward(image).map(|t| (t, Vec::new())),
+        }
+    }
+
+    /// How many DeepStack mergers the tower has (Qwen3-VL's: three; the others none).
+    pub fn deepstack_layers(&self) -> usize {
+        match self {
+            Self::Qwen3Vl(m) => m.deepstack.len(),
+            _ => 0,
+        }
+    }
 }
 
 /// Reshape a CHW image `[3, H, W]` into row-major patches `[N, 3*P*P]` where

@@ -1291,7 +1291,10 @@ impl Models {
         // attention with experts, served as one: LFM2.5-24B-A2B's)
         let lfm2 = gguf.get_str("general.architecture").ok() == Some("lfm2moe");
         let moe = gguf.get_str("general.architecture").ok() == Some("qwen35moe") || lfm2;
-        if gguf.get_str("general.architecture").ok() == Some("qwen35") || moe {
+        // (Qwen3-VL, `qwen3vl`: Qwen3's dense decoder with its pictures' positions in three axes and DeepStack, served
+        // by the same engine for its pictures, in a template with no thought)
+        let qwen3vl = gguf.get_str("general.architecture").ok() == Some("qwen3vl");
+        if gguf.get_str("general.architecture").ok() == Some("qwen35") || moe || qwen3vl {
             // With a second GPU, a prompt's later layers go to it (copies of their weights and the head): each
             // chunk's first layers run on one as the other runs the chunk before's. The card the host's bytes reach
             // faster carries the model (it moves the more: the cache's rows, the steps), the other the later layers.
@@ -1299,7 +1302,7 @@ impl Models {
             #[allow(unused_mut)]
             let (mut backend, mut helper): (Arc<dyn ggml_rs::Backend>, Option<Arc<dyn ggml_rs::Backend>>) = (backend, None);
             #[cfg(feature = "webgpu")]
-            if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().filter(|_| !moe) {
+            if let Some(b) = backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>().filter(|_| !moe && !qwen3vl) {
                 if let Some(other) = crate::engines::backend::others(o, &devices, b).into_iter().next() {
                     let (mine, theirs) = (b.transfer_rates().0, other.transfer_rates().0);
                     let (bus, other_bus) = (b.adapter().pci_bus_id.clone(), other.adapter().pci_bus_id.clone());
@@ -1354,6 +1357,10 @@ impl Models {
                         && !matches!(&mm, crate::llm::MmProj::MiniCpmV(m) if m.lm_width() == width) {
                         return Err(Error::Arg("Qwen vision projector does not match the text model".into()));
                     }
+                    // (Qwen3-VL's tower gives as many DeepStack mergers' tokens as its text model adds; Qwen3.5's none)
+                    if mm.deepstack_layers() != model.config().deepstack_layers {
+                        return Err(Error::Arg(format!("the vision projector has {} DeepStack mergers, the text model takes {}", mm.deepstack_layers(), model.config().deepstack_layers)));
+                    }
                     self.say(format!("{}: vision projector loaded from {}{}", spec.name, p.display(), on_device_only(&mut mm)));
                     Ok(mm)
                 }).transpose()?
@@ -1388,7 +1395,13 @@ impl Models {
                 cfg.minicpmv = Some(crate::engines::qwen::MiniCpmV { markers, merge: m.merge, max_slices: m.max_slices, mean: m.config.mean, std: m.config.std });
                 self.say(format!("{}: MiniCPM-V 4.7 pictures ({}x: up to {} slices)", spec.name, m.merge * m.merge, m.max_slices));
             }
-            let pictures = if cfg.minicpmv.is_some() { crate::engines::qwen::Pictures::MiniCpmV } else { crate::engines::qwen::Pictures::Qwen };
+            let pictures = if cfg.minicpmv.is_some() {
+                crate::engines::qwen::Pictures::MiniCpmV
+            } else if qwen3vl {
+                crate::engines::qwen::Pictures::Qwen3Vl
+            } else {
+                crate::engines::qwen::Pictures::Qwen
+            };
             let (jobs,rx) = std::sync::mpsc::channel();
             let calls = if lfm2 { crate::engines::qwen::Calls::Lfm2 } else { crate::engines::qwen::Calls::Qwen };
             let mut e = crate::engines::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent).repetition_guard(o.repetition_guard).minicpmv(cfg.minicpmv.clone()).calls(calls);

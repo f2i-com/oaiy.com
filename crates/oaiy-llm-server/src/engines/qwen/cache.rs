@@ -179,6 +179,13 @@ impl RecurrentSnapshot {
             return Err("recurrent checkpoint no longer matches the live cache".into());
         }
         for (i, layer) in self.0.layers.iter().enumerate() {
+            // (a layer with nothing recurrent, a pure-attention model's every one (Qwen3-VL's): its rows up to the
+            // checkpoint are the cache's already, and nothing is put back)
+            if layer[2].is_none() && layer[3].is_none() {
+                kv.ssm_state[i] = None;
+                kv.ssm_conv[i] = None;
+                continue;
+            }
             let backend = kv.layer_backends[i].clone();
             kv.ssm_state[i] = layer[2].as_ref().map(|t| backend.to_device(its_own(t)));
             kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(its_own(t)));
@@ -407,6 +414,22 @@ impl crate::engines::disk::PromptState for Arc<Snapshot> {
 mod tests {
     use super::*;
     use crate::engines::disk::PromptState;
+
+    /// A pure-attention model's checkpoint (Qwen3-VL's: nothing recurrent in it) puts its prefix back by cutting the
+    /// cache to it, where it reached for a recurrent layer's device it never had and panicked.
+    #[test]
+    fn a_pure_attention_checkpoint_cuts_the_cache_back() {
+        let backend = ggml_rs::CpuBackend::new();
+        let mut kv = KvCache::new(&backend, 2, 16, 1, 2);
+        kv.layer_backends.clear();
+        kv.len = 5;
+        let snap = RecurrentSnapshot::capture_later(&kv, None);
+        kv.len = 9;
+        snap.restore_slots(&mut kv, 7).unwrap();
+        assert_eq!(kv.len, 5);
+        assert!(kv.ssm_state.iter().chain(&kv.ssm_conv).all(Option::is_none));
+        assert!(snap.restore_slots(&mut kv, 4).is_err(), "a prefix the request does not share is not put back");
+    }
 
     #[test]
     fn recurrent_checkpoint_rewinds_live_attention_but_rejects_overwritten_prefix() {

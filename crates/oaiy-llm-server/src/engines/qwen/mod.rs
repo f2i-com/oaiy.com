@@ -27,9 +27,10 @@ pub(crate) const PREFILL_CHUNK: usize = 512;
 
 /// How a picture stands in a Qwen prompt: Qwen3.5's own `<|vision_start|><|image_pad|><|vision_end|>` beside its
 /// text, or MiniCPM-V 4.7's bare `<|image_pad|>`, a message's parts each on a line of its own and the whole trimmed (its
-/// template's `join('\n')` and `trim`).
+/// template's `join('\n')` and `trim`). Qwen3-VL's stand as Qwen3.5's, in a template with no thought: an instruct
+/// model's turns open and close without the `<think>` block Qwen3.5's carry.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Pictures { Qwen, MiniCpmV }
+pub enum Pictures { Qwen, MiniCpmV, Qwen3Vl }
 
 fn content(value: Option<&Json>, images: &mut Vec<Json>, style: Pictures) -> Result<String, String> {
     match value {
@@ -48,12 +49,12 @@ fn content(value: Option<&Json>, images: &mut Vec<Json>, style: Pictures) -> Res
                             Json::obj([("url", url.get("url").unwrap_or(url).clone())])
                         } else { p.clone() };
                         images.push(rec);
-                        out.push(match style { Pictures::Qwen => IMAGE, Pictures::MiniCpmV => "<|image_pad|>" }.to_owned());
+                        out.push(match style { Pictures::Qwen | Pictures::Qwen3Vl => IMAGE, Pictures::MiniCpmV => "<|image_pad|>" }.to_owned());
                     }
                     _ => return Err("unsupported Qwen content block".into()),
                 }
             }
-            Ok(match style { Pictures::Qwen => out.concat(), Pictures::MiniCpmV => out.join("\n").trim().to_owned() })
+            Ok(match style { Pictures::Qwen | Pictures::Qwen3Vl => out.concat(), Pictures::MiniCpmV => out.join("\n").trim().to_owned() })
         }
         _ => Err("message content must be text or blocks".into()),
     }
@@ -80,6 +81,35 @@ pub fn chat_prompt_as(msgs: &[Json], opts: &Options, style: Pictures) -> Result<
             continue;
         }
         prompt.push_str(&format!("<|im_start|>{role}\n"));
+        // (Qwen3-VL's own template: the system's text, then its tools as JSON, each call asked for as JSON in the call's
+        // tags, the form it was trained on; a past call shown the same way)
+        if style == Pictures::Qwen3Vl {
+            prompt.push_str(&text);
+            if role == "system" {
+                if let Some(tools) = m.get("tools").and_then(Json::as_array).filter(|t| !t.is_empty()) {
+                    if !text.is_empty() { prompt.push_str("\n\n"); }
+                    prompt.push_str("# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+                    for t in tools { prompt.push('\n'); prompt.push_str(&t.to_json()); }
+                    prompt.push_str("\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
+                }
+            }
+            if let Some(calls) = m.get("tool_calls").and_then(Json::as_array) {
+                for (n, call) in calls.iter().enumerate() {
+                    let f = call.get("function").unwrap_or(call);
+                    let name = f.get("name").and_then(Json::as_str).ok_or("tool call without name")?;
+                    identifier(name)?;
+                    let args = match f.get("arguments") {
+                        Some(Json::Str(s)) => s.clone(),
+                        Some(v) => v.to_json(),
+                        None => "{}".into(),
+                    };
+                    if n > 0 || !text.is_empty() { prompt.push('\n'); }
+                    prompt.push_str(&format!("<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>"));
+                }
+            }
+            prompt.push_str("<|im_end|>\n");
+            continue;
+        }
         if role == "system" {
             if let Some(tools) = m.get("tools").and_then(Json::as_array).filter(|t| !t.is_empty()) {
                 prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>\n");
@@ -88,7 +118,7 @@ pub fn chat_prompt_as(msgs: &[Json], opts: &Options, style: Pictures) -> Result<
             }
             if opts.mode == Mode::Thinking && opts.effort <= 33 { prompt.push_str("Keep your thinking brief and focused.\n\n"); }
         }
-        if role == "assistant" { prompt.push_str("<think>\n\n</think>\n\n"); }
+        if role == "assistant" && style != Pictures::Qwen3Vl { prompt.push_str("<think>\n\n</think>\n\n"); }
         prompt.push_str(&text);
         if let Some(calls) = m.get("tool_calls").and_then(Json::as_array) {
             for call in calls {
@@ -110,6 +140,10 @@ pub fn chat_prompt_as(msgs: &[Json], opts: &Options, style: Pictures) -> Result<
             }
         }
         prompt.push_str("<|im_end|>\n");
+    }
+    if style == Pictures::Qwen3Vl {
+        prompt.push_str("<|im_start|>assistant\n");
+        return Ok(Encoded { prompt, images });
     }
     prompt.push_str("<|im_start|>assistant\n<think>\n");
     if opts.mode != Mode::Thinking { prompt.push_str("\n</think>\n\n"); }
@@ -179,6 +213,13 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
     let mut out = format!("{prefix}<{DSML} calls>");
     loop {
         let (block, tail) = rest.split_once("</tool_call>").ok_or("incomplete Qwen tool call")?;
+        // (Qwen3's and Qwen3-VL's own form: `{"name": ..., "arguments": {...}}` in the call's tags)
+        if block.trim().starts_with('{') {
+            out.push_str(&json_call(block, tools)?);
+            if tail.trim().is_empty() { break; }
+            rest = tail.trim().strip_prefix("<tool_call>").ok_or("unexpected suffix after tool call")?;
+            continue;
+        }
         let repaired = repair_function_tag(block, tools);
         let block = repaired.as_deref().unwrap_or(block);
         let f = block.trim().strip_prefix("<function=").ok_or("missing function tag")?;
@@ -208,6 +249,34 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
         rest = tail.trim().strip_prefix("<tool_call>").ok_or("unexpected suffix after tool call")?;
     }
     out.push_str(&format!("</{DSML} calls>"));
+    Ok(out)
+}
+
+/// A call in Qwen3's JSON form (`{"name": ..., "arguments": {...}}`, the arguments an object or that object as a
+/// string) in the server's markup, each argument a string where the function's schema says it is one.
+fn json_call(block: &str, tools: &[Json]) -> Result<String, String> {
+    let call = Json::parse(block.trim().as_bytes()).map_err(|e| format!("invalid JSON tool call: {e}"))?;
+    let name = call.get("name").and_then(Json::as_str).ok_or("a JSON tool call without its name")?;
+    identifier(name)?;
+    let schema = tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name)).ok_or("Qwen called an undeclared function")?;
+    let args = match call.get("arguments").or_else(|| call.get("parameters")) {
+        Some(Json::Str(s)) => Json::parse(s.as_bytes()).map_err(|e| format!("invalid JSON arguments: {e}"))?,
+        Some(v) => v.clone(),
+        None => Json::Obj(vec![]),
+    };
+    let Json::Obj(args) = args else { return Err("tool arguments must be an object".into()) };
+    let mut out = format!("<{DSML} invoke name=\"{name}\">");
+    for (key, value) in args {
+        identifier(&key)?;
+        let typ = schema.get("parameters").and_then(|p| p.get("properties")).and_then(|p| p.get(&key)).and_then(|p| p.get("type"));
+        let is_string = typ.and_then(Json::as_str) == Some("string") || typ.and_then(Json::as_array).is_some_and(|a| a.iter().any(|t| t.as_str() == Some("string")));
+        let raw = match (&value, is_string) {
+            (Json::Str(s), true) => s.clone(),
+            _ => value.to_json(),
+        };
+        out.push_str(&format!("<{DSML} parameter name=\"{key}\" string=\"{is_string}\">{raw}</{DSML} parameter>"));
+    }
+    out.push_str(&format!("</{DSML} invoke>"));
     Ok(out)
 }
 
@@ -353,6 +422,7 @@ impl Hybrid {
     fn tokenizer(&self) -> Result<&tokenizer::Tokenizer, String> {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(&m.tokenizer),
+            Self::Qwen35(Model::Qwen3(m)) => Ok(&m.tokenizer),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => Ok(&f.tokenizer),
@@ -394,6 +464,7 @@ impl Hybrid {
     fn embed(&self, tokens: &[u32]) -> Result<Tensor, String> {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(m.embed_text(tokens).to_host()),
+            Self::Qwen35(Model::Qwen3(m)) => Ok(m.embed_text(tokens)),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.embed_text(tokens).map_err(|e| e.to_string()),
@@ -626,11 +697,21 @@ impl Hybrid {
         Ok((logits.to_host(), kept))
     }
     fn forward(&self, tokens: &[u32], embeds: Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor, String> {
+        self.forward_deepstack(tokens, embeds, kv, positions, &[])
+    }
+
+    /// [`Self::forward`] with `deepstack[i]` (`[tokens, width]`, zero where no picture is) added to the states after
+    /// layer `i`: Qwen3-VL's DeepStack, its pictures' rows read from its tower's mergers. Only Qwen3-VL has it.
+    fn forward_deepstack(&self, tokens: &[u32], embeds: Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>, deepstack: &[Vec<f32>]) -> Result<Tensor, String> {
+        if !deepstack.is_empty() && !matches!(self, Self::Qwen35(Model::Qwen3(_))) {
+            return Err("DeepStack tokens for a model without DeepStack".into());
+        }
         match self {
             Self::Qwen35(Model::Qwen35(m)) => {
                 let embeds = m.backend.to_device(embeds);
                 Ok(m.forward_embeds_positions(&embeds, tokens.len(), kv, positions).map_err(|e| e.to_string())?.to_host())
             }
+            Self::Qwen35(Model::Qwen3(m)) => Ok(m.forward_embeds_positions(tokens, &embeds, kv, positions, deepstack).map_err(|e| e.to_string())?.to_host()),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.forward(tokens, &embeds, kv, positions).map_err(|e| e.to_string()),
@@ -645,7 +726,8 @@ pub struct QwenEngine {
     projector: Option<MmProj>,
     kv: KvCache,
     covered: Vec<u64>,
-    vision_cache: std::collections::VecDeque<(u64, Tensor)>,
+    /// Pictures' soft tokens by their hash, and their DeepStack tokens (Qwen3-VL's; none for the other towers).
+    vision_cache: std::collections::VecDeque<(u64, Tensor, Vec<Tensor>)>,
     log: bool,
     checkpoints: Vec<(Vec<u64>, RecurrentSnapshot, bool)>,
     pub disk: Option<crate::engines::disk::DiskCache<Arc<Snapshot>>>,
@@ -950,14 +1032,15 @@ impl QwenEngine {
         for image in &job.images {
             if image.start + image.prep.n_tokens() <= start { continue; }
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
-            let t = if let Some((_,t)) = self.vision_cache.iter().find(|(hash,_)| *hash == image.hash) { t.clone() } else {
+            let (t, ds) = if let Some((_,t,ds)) = self.vision_cache.iter().find(|(hash,_,_)| *hash == image.hash) { (t.clone(), ds.clone()) } else {
                 let (ImagePrep::Qwen { pixels, .. } | ImagePrep::MiniCpmV { pixels, .. }) = &image.prep else { return Err("wrong image format for Qwen".into()); };
-                let t = self.projector.as_ref().ok_or("Qwen vision projector is not configured")?.forward(pixels).map_err(|e| e.to_string())?.to_host();
-                self.vision_cache.push_back((image.hash,t.clone()));
+                let (t, ds) = self.projector.as_ref().ok_or("Qwen vision projector is not configured")?.forward_deepstack(pixels).map_err(|e| e.to_string())?;
+                let (t, ds): (Tensor, Vec<Tensor>) = (t.to_host(), ds.into_iter().map(|d| d.to_host()).collect());
+                self.vision_cache.push_back((image.hash,t.clone(),ds.clone()));
                 while self.vision_cache.len() > 8 { self.vision_cache.pop_front(); }
-                t
+                (t, ds)
             };
-            soft.push((image.start,t));
+            soft.push((image.start,t,ds));
         }
         let mut logits = None;
         let mut pos = start;
@@ -1023,11 +1106,19 @@ impl QwenEngine {
                 let end = (pos + hybrid.prompt_rows()).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
                 let mut embeds = hybrid.embed(&job.prompt[pos..end])?;
                 let width = hybrid.width();
-                for (at,t) in &soft {
+                // (Qwen3-VL's DeepStack: each merger's tokens at the pictures' rows of the chunk, zero elsewhere)
+                let layers = soft.iter().filter(|(at, t, _)| *at < end && at + t.dim(0) > pos).map(|(_, _, ds)| ds.len()).max().unwrap_or(0);
+                let mut deepstack = vec![vec![0f32; (end - pos) * width]; layers];
+                for (at,t,ds) in &soft {
                     let from = pos.max(*at); let to = end.min(*at+t.dim(0));
-                    if from < to { embeds.data_mut()[(from-pos)*width..(to-pos)*width].copy_from_slice(&t.data()[(from-at)*width..(to-at)*width]); }
+                    if from < to {
+                        embeds.data_mut()[(from-pos)*width..(to-pos)*width].copy_from_slice(&t.data()[(from-at)*width..(to-at)*width]);
+                        for (rows, d) in deepstack.iter_mut().zip(ds) {
+                            rows[(from-pos)*width..(to-pos)*width].copy_from_slice(&d.data()[(from-at)*width..(to-at)*width]);
+                        }
+                    }
                 }
-                let out = hybrid.forward(&job.prompt[pos..end], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&positions[pos..end]))?;
+                let out = hybrid.forward_deepstack(&job.prompt[pos..end], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&positions[pos..end]), &deepstack)?;
                 logits = Some(out);
                 self.covered.extend_from_slice(&keys[pos..end]);
                 let _ = job.events.send(Event::Progress { done: end-start, total });
