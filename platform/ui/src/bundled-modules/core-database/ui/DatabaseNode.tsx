@@ -40,9 +40,9 @@ function DatabaseNode({ data }: DatabaseNodeProps) {
   }, []);
 
   const collapsedPreview = (
-    <div className="text-slate-400">
+    <div className="text-slate-600 dark:text-slate-400">
       {data.collectionName ? (
-        <span className="text-emerald-400 font-mono text-[10px]">{data.collectionName}</span>
+        <span className="text-emerald-700 dark:text-emerald-400 font-mono text-[10px]">{data.collectionName}</span>
       ) : (
         <span className="italic text-slate-500">No name</span>
       )}

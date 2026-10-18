@@ -100,13 +100,17 @@ export function pickFolderViaInput(): Promise<string | null> {
       });
       settle(folderName);
     };
-    const onFocus = () => {
-      setTimeout(() => {
-        if (!settled && (!input.files || input.files.length === 0)) settle(null);
-      }, 500);
-      window.removeEventListener('focus', onFocus);
-    };
-    window.addEventListener('focus', onFocus);
+    // (cancel as the file picker below has it: the input's own event, else the focus guess, given time)
+    input.addEventListener('cancel', () => settle(null));
+    if (!('oncancel' in (input as unknown as Record<string, unknown>))) {
+      const onFocus = () => {
+        setTimeout(() => {
+          if (!settled && (!input.files || input.files.length === 0)) settle(null);
+        }, 1500);
+        window.removeEventListener('focus', onFocus);
+      };
+      window.addEventListener('focus', onFocus);
+    }
     document.body.appendChild(input);
     input.click();
   });
@@ -163,15 +167,19 @@ function pickViaInput(options: OpenDialogOptions): Promise<string | string[] | n
       files.forEach((f, i) => { void saveBlob(urls[i], f); });
       settle(options.multiple ? urls : (urls[0] ?? null));
     };
-    // Best-effort cancel detection: when window regains focus and no file
-    // was picked within 500ms, assume the user cancelled.
-    const onFocus = () => {
-      setTimeout(() => {
-        if (!settled && (!input.files || input.files.length === 0)) settle(null);
-      }, 500);
-      window.removeEventListener('focus', onFocus);
-    };
-    window.addEventListener('focus', onFocus);
+    // Cancel: the input's own `cancel` event where the browser has one (Chrome, Firefox, Safari 16.4+). Only where it
+    // has not, the window getting focus back with no file picked: WebKit gives focus back before `change` (for a
+    // large file, well after), so that guess there threw a picked file away as a cancel.
+    input.addEventListener('cancel', () => settle(null));
+    if (!('oncancel' in (input as unknown as Record<string, unknown>))) {
+      const onFocus = () => {
+        setTimeout(() => {
+          if (!settled && (!input.files || input.files.length === 0)) settle(null);
+        }, 1500);
+        window.removeEventListener('focus', onFocus);
+      };
+      window.addEventListener('focus', onFocus);
+    }
     document.body.appendChild(input);
     input.click();
   });

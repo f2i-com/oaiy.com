@@ -3,6 +3,20 @@ import { Position } from '@xyflow/react';
 import { useNodeResize, CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 import { pathToMediaUrl } from 'oaiy-core';
 import { BLOCKED_MEDIA_WORDS, mediaUrlBlocked } from '../../../lib/localMedia';
+import { desktopFileBytes } from '../../core-service/contractRuntime';
+import { triggerDownloadFromBlob } from '../../../lib/download';
+
+/**
+ * The file a run made, as bytes to save: OAIY's own files with the desktop's credential (fetched bare they were a
+ * refusal, saved as the picture), anything else as it is; an answer that is not the file is an error, not a download.
+ */
+async function outputBlob(url: string): Promise<Blob> {
+  const own = await desktopFileBytes(url);
+  if (own) return new Blob([own.bytes as BlobPart], { type: own.mime });
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.blob();
+}
 
 
 interface OutputNodeData {
@@ -233,8 +247,7 @@ function OutputNode({ data }: OutputNodeProps) {
 
         try {
           // Fetch the video
-          const response = await fetch(videoUrl);
-          const blob = await response.blob();
+          const blob = await outputBlob(videoUrl);
 
           // Determine file extension from URL or content type
           let ext = 'mp4';
@@ -247,14 +260,8 @@ function OutputNode({ data }: OutputNodeProps) {
             ext = 'avi';
           }
 
-          // Create download link
-          const blobUrl = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = blobUrl;
           const suffix = outputArray.length > 1 ? `_${i + 1}` : '';
-          a.download = `${data.label || 'output'}${suffix}.${ext}`;
-          a.click();
-          URL.revokeObjectURL(blobUrl);
+          triggerDownloadFromBlob(`${data.label || 'output'}${suffix}.${ext}`, blob);
           savedCount++;
 
           // Small delay between downloads to avoid browser blocking
@@ -293,8 +300,7 @@ function OutputNode({ data }: OutputNodeProps) {
 
         try {
           // Fetch the image
-          const response = await fetch(imageUrl);
-          const blob = await response.blob();
+          const blob = await outputBlob(imageUrl);
 
           // Determine file extension from URL or content type
           let ext = 'png';
@@ -309,14 +315,8 @@ function OutputNode({ data }: OutputNodeProps) {
             ext = 'webp';
           }
 
-          // Create download link
-          const blobUrl = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = blobUrl;
           const suffix = outputArray.length > 1 ? `_${i + 1}` : '';
-          a.download = `${data.label || 'output'}${suffix}.${ext}`;
-          a.click();
-          URL.revokeObjectURL(blobUrl);
+          triggerDownloadFromBlob(`${data.label || 'output'}${suffix}.${ext}`, blob);
           savedCount++;
 
           // Small delay between downloads to avoid browser blocking
@@ -349,13 +349,7 @@ function OutputNode({ data }: OutputNodeProps) {
         : typeof data.outputValue === 'object'
           ? JSON.stringify(data.outputValue, null, 2)
           : String(data.outputValue || '');
-      const blob = new Blob([textContent], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${data.label || 'output'}.txt`;
-      a.click();
-      URL.revokeObjectURL(url);
+      triggerDownloadFromBlob(`${data.label || 'output'}.txt`, new Blob([textContent], { type: 'text/plain' }));
 
       // Show toast notification
       if (data.onShowToast) {
@@ -367,12 +361,12 @@ function OutputNode({ data }: OutputNodeProps) {
   const contentHeight = Math.max(60, size.height - 160);
 
   const collapsedPreview = (
-    <div className="text-slate-400">
+    <div className="text-slate-600 dark:text-slate-400">
       {hasOutput ? (
         isVideoArray || isSingleVideo ? (
-          <span className="text-orange-400">Video{isMultiple ? ` (${outputArray.length})` : ''}</span>
+          <span className="text-orange-700 dark:text-orange-400">Video{isMultiple ? ` (${outputArray.length})` : ''}</span>
         ) : isImageArray || isSingleImage ? (
-          <span className="text-pink-400">Image{isMultiple ? ` (${outputArray.length})` : ''}</span>
+          <span className="text-pink-700 dark:text-pink-400">Image{isMultiple ? ` (${outputArray.length})` : ''}</span>
         ) : (
           <span className="truncate text-[10px]">{displayValue.substring(0, 40)}...</span>
         )
@@ -525,7 +519,7 @@ function OutputNode({ data }: OutputNodeProps) {
                           >
                             <source src={audioSrc} type="audio/wav" />
                           </audio>
-                          <span className="text-[10px] text-slate-400 truncate max-w-[80px]">{fileName}</span>
+                          <span className="text-[10px] text-slate-600 dark:text-slate-400 truncate max-w-[80px]">{fileName}</span>
                         </div>
                       );
                     })}
@@ -545,7 +539,7 @@ function OutputNode({ data }: OutputNodeProps) {
                         type="audio/wav"
                       />
                     </audio>
-                    <span className="text-[10px] text-slate-400 truncate max-w-[80px]">
+                    <span className="text-[10px] text-slate-600 dark:text-slate-400 truncate max-w-[80px]">
                       {displayValue.split(/[\\/]/).pop()}
                     </span>
                   </div>

@@ -35,7 +35,7 @@
  */
 import { invalidateDynamicOptions } from 'oaiy-ui-components';
 import type { CustomService, ServiceNodeTag } from 'oaiy-core/modules/core-service/examples';
-import { getEngineBase } from './engineEndpoint';
+import { getEngineBase, isRemoteEngine } from './engineEndpoint';
 import { mayLookOnLoad, refreshDesktopStatus, subscribeDesktopStatus } from './desktopDetection';
 
 /** Shared contract with the compilers (core-service/contract.ts reads this key). */
@@ -125,6 +125,16 @@ function desktopAccess(): { origin: string; token: string | null; inOaiy: boolea
   return { origin: getEngineBase().replace(/\/+$/, ''), token: null, inOaiy: false };
 }
 
+/** The host a desktop's own services are reached at from here: 127.0.0.1, or the desktop's when it is another computer. */
+function companionHost(origin: string | undefined): string {
+  if (!origin || !isRemoteEngine(origin)) return '127.0.0.1';
+  try {
+    return new URL(origin).hostname;
+  } catch {
+    return '127.0.0.1';
+  }
+}
+
 /**
  * Map one desktop service to a `CustomService`. Running and stopped ones are
  * surfaced (a stopped one auto-starts when a flow using it runs); one that is
@@ -135,12 +145,14 @@ function desktopAccess(): { origin: string; token: string | null; inOaiy: boolea
  * AI LLM node uses its standard OpenAI request path (which handles vision +
  * streaming) rather than the generic custom-template branch.
  */
-export function mapToCustomService(s: DesktopServiceSnapshot): CustomService | null {
+export function mapToCustomService(s: DesktopServiceSnapshot, origin?: string): CustomService | null {
   if (s.installed === false) return null;
   const port = s.port || s.defaultPort;
   if (!port) return null;
   const cat = (s.category || '').toLowerCase();
-  const base = `http://127.0.0.1:${port}`;
+  // On the desktop's computer: this one's loopback, or the other computer the engine address names (a service of
+  // that desktop at 127.0.0.1 here was a service of this computer's, or nothing).
+  const base = `http://${companionHost(origin)}:${port}`;
   const id = `companion:${s.id}`;
   const running = s.status === 'running';
   const statusTag = running ? 'running' : s.status;
@@ -310,7 +322,7 @@ export function combineDesktopServices(
   const ranked = [...services].sort((a, b) => (a.status === 'running' ? 0 : 1) - (b.status === 'running' ? 0 : 1));
   return [
     ...engine.map((e) => mapEngineService(e, origin)).filter((x): x is CustomService => x !== null),
-    ...ranked.map(mapToCustomService).filter((x): x is CustomService => x !== null),
+    ...ranked.map((s) => mapToCustomService(s, origin)).filter((x): x is CustomService => x !== null),
   ];
 }
 
@@ -404,9 +416,29 @@ async function pollOnce(): Promise<void> {
   // Drop a result that arrives after a stop/start happened mid-flight, so a
   // late-resolving fetch can't restore a list the teardown already cleared.
   if (gen !== pollGen) return;
-  publish(combineDesktopServices(services?.services ?? [], engine?.services ?? [], desktop.origin));
-  setLoaded(services !== null || engine !== null);
+  // A list that does not come this time (the engine slow to answer while it loads a model) is the last one that
+  // came, for a few polls: one miss emptied the pickers, and the nodes said their models were missing.
+  const kept = (fresh: { services?: unknown[] } | null, last: ListKept) => {
+    if (fresh) return { list: fresh.services ?? [], missed: 0, origin: desktop.origin };
+    const missed = last.origin === desktop.origin ? last.missed + 1 : LIST_MISSES;
+    return missed < LIST_MISSES ? { ...last, missed } : { list: [], missed, origin: desktop.origin };
+  };
+  lastServices = kept(services, lastServices) as ListKept<DesktopServiceSnapshot>;
+  lastEngine = kept(engine, lastEngine) as ListKept<EngineServiceEntry>;
+  publish(combineDesktopServices(lastServices.list, lastEngine.list, desktop.origin));
+  setLoaded(services !== null || engine !== null || lastServices.list.length > 0 || lastEngine.list.length > 0);
 }
+
+/** A list from the desktop as it last came, and the polls since that it did not. */
+interface ListKept<T = unknown> {
+  list: T[];
+  missed: number;
+  origin: string;
+}
+/** Polls a list may not come before it is taken for gone. */
+const LIST_MISSES = 3;
+let lastServices: ListKept<DesktopServiceSnapshot> = { list: [], missed: LIST_MISSES, origin: '' };
+let lastEngine: ListKept<EngineServiceEntry> = { list: [], missed: LIST_MISSES, origin: '' };
 
 function startPoll(): void {
   if (pollTimer !== null) return;
@@ -422,6 +454,8 @@ function stopPoll(): void {
     pollTimer = null;
   }
   publish([]); // authoritative clear, runs under the new generation
+  lastServices = { list: [], missed: LIST_MISSES, origin: '' };
+  lastEngine = { list: [], missed: LIST_MISSES, origin: '' };
   setLoaded(false);
 }
 

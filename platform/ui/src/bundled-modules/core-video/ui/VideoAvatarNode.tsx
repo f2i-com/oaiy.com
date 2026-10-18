@@ -62,7 +62,7 @@ function VideoAvatarNode({ data }: VideoAvatarNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className="text-purple-400">Ditto Avatar</span>
+            <span className="text-purple-700 dark:text-purple-400">Ditto Avatar</span>
         </div>
     );
 
@@ -121,7 +121,7 @@ function VideoAvatarNode({ data }: VideoAvatarNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Guidance Scale</label>
-                            <span className="text-xs text-purple-400">{guidanceScale.toFixed(1)}</span>
+                            <span className="text-xs text-purple-700 dark:text-purple-400">{guidanceScale.toFixed(1)}</span>
                         </div>
                         <input
                             type="range"
@@ -141,7 +141,7 @@ function VideoAvatarNode({ data }: VideoAvatarNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Inference Steps</label>
-                            <span className="text-xs text-purple-400">{inferenceSteps}</span>
+                            <span className="text-xs text-purple-700 dark:text-purple-400">{inferenceSteps}</span>
                         </div>
                         <input
                             type="range"
@@ -158,7 +158,7 @@ function VideoAvatarNode({ data }: VideoAvatarNodeProps) {
                     </div>
 
                     {/* Info */}
-                    <div className="flex items-center gap-2 px-2 py-1.5 bg-purple-900/20 border border-purple-800/30 rounded text-xs text-purple-300">
+                    <div className="flex items-center gap-2 px-2 py-1.5 bg-purple-900/20 border border-purple-800/30 rounded text-xs text-purple-700 dark:text-purple-300">
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>

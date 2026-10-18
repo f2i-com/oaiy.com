@@ -106,23 +106,23 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
 
   const collapsedPreview = (
     <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-      <span className="text-orange-400">{intervalSeconds}s</span>
+      <span className="text-orange-700 dark:text-orange-400">{intervalSeconds}s</span>
       <span className="text-slate-500"> / </span>
-      <span className="text-orange-300">{maxFrames} max</span>
+      <span className="text-orange-700 dark:text-orange-300">{maxFrames} max</span>
     </div>
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
     {
       id: 'video', type: 'target', position: Position.Left,
-      color: '!bg-orange-500', label: 'video', labelColor: 'text-orange-400', size: 'md'
+      color: '!bg-orange-500', label: 'video', labelColor: 'text-orange-700 dark:text-orange-400', size: 'md'
     },
   ], []);
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
     {
       id: 'frames', type: 'source', position: Position.Right,
-      color: '!bg-orange-500', label: 'frames', labelColor: 'text-orange-400', size: 'lg'
+      color: '!bg-orange-500', label: 'frames', labelColor: 'text-orange-700 dark:text-orange-400', size: 'lg'
     },
   ], []);
 

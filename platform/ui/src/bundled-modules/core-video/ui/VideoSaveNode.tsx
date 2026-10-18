@@ -55,8 +55,8 @@ function VideoSaveNode({ data }: VideoSaveNodeProps) {
     }, [savedPath]);
 
     const collapsedPreview = (
-        <div className="text-slate-400">
-            <span className="text-orange-400">{data.format?.toUpperCase() || 'MP4'}</span>
+        <div className="text-slate-600 dark:text-slate-400">
+            <span className="text-orange-700 dark:text-orange-400">{data.format?.toUpperCase() || 'MP4'}</span>
             {data.filename && <span className="ml-1 text-[10px]">{data.filename}</span>}
         </div>
     );
@@ -71,7 +71,7 @@ function VideoSaveNode({ data }: VideoSaveNodeProps) {
     ], []);
 
     const titleExtra = (
-        <span className="ml-auto px-1.5 py-0.5 bg-orange-900 text-orange-400 text-[10px] rounded">
+        <span className="ml-auto px-1.5 py-0.5 bg-orange-900 text-orange-700 dark:text-orange-400 text-[10px] rounded">
             AUTO
         </span>
     );

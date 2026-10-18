@@ -5,8 +5,9 @@
  * Provides quick access to copy/paste, grouping, and layout operations.
  */
 
-import { useCallback, useEffect, useRef, type ReactNode } from 'react';
-import { ClipboardPaste, Copy, FoldVertical, Group, LayoutGrid, Rows3, UnfoldVertical, Ungroup } from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { ClipboardPaste, Copy, FoldVertical, Group, LayoutGrid, Redo2, Rows3, Undo2, UnfoldVertical, Ungroup } from 'lucide-react';
+import { shortcut } from '../../lib/keys';
 import type { Node } from '@xyflow/react';
 
 /** One item: the editor's menu row, with its shortcut at the end. */
@@ -59,6 +60,11 @@ export interface CanvasContextMenuProps {
   onExpandAll: () => void;
   /** Close the context menu */
   onClose: () => void;
+  /** Undo and redo the last change on the canvas, where there is one */
+  onUndo?: () => void;
+  onRedo?: () => void;
+  canUndo?: boolean;
+  canRedo?: boolean;
   /** Convert screen position to flow position */
   screenToFlowPosition?: (position: { x: number; y: number }) => { x: number; y: number };
 }
@@ -77,6 +83,10 @@ export function CanvasContextMenu({
   onExpandAll,
   onClose,
   screenToFlowPosition,
+  onUndo,
+  onRedo,
+  canUndo = false,
+  canRedo = false,
 }: CanvasContextMenuProps) {
   const hasSelectedNodes = nodes.some((n) => n.selected);
   const canGroup = nodes.filter((n) => n.selected).length >= 2;
@@ -128,6 +138,18 @@ export function CanvasContextMenu({
   }, [onExpandAll, onClose]);
 
   const menuRef = useRef<HTMLDivElement>(null);
+  // At the pointer, moved in where it would run off the window (a right click near its right or bottom edge)
+  const [at, setAt] = useState(position);
+  useLayoutEffect(() => {
+    const menu = menuRef.current;
+    if (!menu) return;
+    const { width, height } = menu.getBoundingClientRect();
+    const margin = 8;
+    setAt({
+      x: Math.max(margin, Math.min(position.x, window.innerWidth - width - margin)),
+      y: Math.max(margin, Math.min(position.y, window.innerHeight - height - margin)),
+    });
+  }, [position]);
 
   // Close the menu when Escape is pressed.
   useEffect(() => {
@@ -160,16 +182,21 @@ export function CanvasContextMenu({
         aria-orientation="vertical"
         aria-label="Canvas"
         className="oaiy-menu"
-        style={{ left: position.x, top: position.y }}
+        style={{ left: at.x, top: at.y }}
       >
+        {/* Undo/Redo Section */}
+        {onUndo && <Item icon={<Undo2 size={14} />} label="Undo" shortcut={shortcut('Z')} onClick={() => { onUndo(); onClose(); }} disabled={!canUndo} />}
+        {onRedo && <Item icon={<Redo2 size={14} />} label="Redo" shortcut={shortcut('Z', { shift: true })} onClick={() => { onRedo(); onClose(); }} disabled={!canRedo} />}
+        {(onUndo || onRedo) && <hr />}
+
         {/* Copy/Paste Section */}
-        <Item icon={<Copy size={14} />} label="Copy" shortcut="Ctrl+C" onClick={handleCopy} disabled={!hasSelectedNodes} />
-        <Item icon={<ClipboardPaste size={14} />} label="Paste" shortcut="Ctrl+V" onClick={handlePaste} disabled={!hasClipboard} />
+        <Item icon={<Copy size={14} />} label="Copy" shortcut={shortcut('C')} onClick={handleCopy} disabled={!hasSelectedNodes} />
+        <Item icon={<ClipboardPaste size={14} />} label="Paste" shortcut={shortcut('V')} onClick={handlePaste} disabled={!hasClipboard} />
 
         <hr />
 
         {/* Group Section */}
-        <Item icon={<Group size={14} />} label="Group the selection" shortcut="Ctrl+G" onClick={handleGroup} disabled={!canGroup} />
+        <Item icon={<Group size={14} />} label="Group the selection" shortcut={shortcut('G')} onClick={handleGroup} disabled={!canGroup} />
         <Item icon={<Ungroup size={14} />} label="Ungroup" onClick={handleUngroup} disabled={!canUngroup} />
 
         <hr />

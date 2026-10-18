@@ -1,5 +1,12 @@
 import React, { useCallback } from 'react';
 
+/** A stored value not in the list, as a person reads it: a paired worker's model by its name (`engine:<kind>:node.<id>/<model>`), an engine model without its prefix. */
+function readableValue(value: string): string {
+  const worker = /^engine:[a-z0-9]+:node\.[A-Za-z0-9]+\/(.+)$/.exec(value);
+  if (worker) return `${worker[1]} on a paired computer`;
+  return value.replace(/^engine:[a-z0-9]+:/, '');
+}
+
 export interface SelectOption {
   value: string | number;
   label: string;
@@ -7,7 +14,8 @@ export interface SelectOption {
   /** Options sharing a group are shown under it (<optgroup>), in first-seen order. */
   group?: string;
   /** Picking it runs this instead of changing the value ("Add a service…"). */
-  action?: () => void;
+  /** Run instead of picking a value; `choose` picks one afterwards (what the action made). */
+  action?: (choose: (value: string) => void) => void;
 }
 
 export interface SelectFieldProps {
@@ -41,7 +49,7 @@ export const SelectField: React.FC<SelectFieldProps> = ({
       if (selectedOption?.action) {
         // An action, not a value: run it and show the value as it was.
         e.target.value = value !== undefined ? String(value) : '';
-        selectedOption.action();
+        selectedOption.action((made) => onChange(made));
         return;
       }
       if (selectedOption) {
@@ -91,7 +99,7 @@ export const SelectField: React.FC<SelectFieldProps> = ({
         {value != null && String(value) !== '' &&
           !options.some((o) => String(o.value) === String(value)) && (
             <option value={String(value)} className="bg-[rgb(var(--color-bg-elevated))] text-[rgb(var(--color-text-primary))]">
-              {String(value)} (unavailable)
+              {readableValue(String(value))} (unavailable)
             </option>
           )}
         {options.filter((option) => !option.group).map(renderOption)}

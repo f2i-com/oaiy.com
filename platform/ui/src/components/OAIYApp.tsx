@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { EXAMPLE_FLOWS, flowFromExample } from '../lib/exampleFlows';
+import { shortcut } from '../lib/keys';
 import OAIYBuilder from './OAIYBuilder';
 import FlowsSidebar from './panels/FlowsSidebar';
 import { createLogger } from '../utils/logger';
@@ -46,6 +47,8 @@ import { saveService, listAllServices } from '../utils/serviceRegistry';
 import { sanitizeProjectForExport } from '../utils/ProjectIO';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
+import { oaiyDesktop } from '../lib/oaiyAgentTools';
+import { takeBootNotice } from '../lib/bootNotice';
 
 // Re-export types for backward compatibility
 export type { LoadedPackage, ActivePackageFlow };
@@ -96,6 +99,8 @@ export default function OAIYApp() {
     updateFlowGraph,
     getAllFlows,
     exportProject,
+    saveNow,
+    saveState,
     importProject,
     newProject,
     renameProject,
@@ -113,6 +118,12 @@ export default function OAIYApp() {
   } = useProject();
 
   const { addToast } = useToast();
+  // What happened while the page was starting (a shared link opened, or not), said once it is up.
+  useEffect(() => {
+    const notice = takeBootNotice();
+    if (notice) addToast(notice.text, notice.kind);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // The browser is offering to install the editor as an app (never true in OAIY's own window).
   const installOffered = useInstallState().available;
@@ -281,14 +292,37 @@ export default function OAIYApp() {
         if (macroAutoSaveRef.current) {
           clearTimeout(macroAutoSaveRef.current);
         }
-        // Schedule new auto-save
+        // Schedule new auto-save (of the macro as it is then: saveMacroChanges reads the newest project)
+        pendingMacroRef.current = activeFlowId;
         macroAutoSaveRef.current = setTimeout(async () => {
+          macroAutoSaveRef.current = null;
+          pendingMacroRef.current = null;
           await saveMacroChanges(activeFlowId);
           logger.debug(`Auto-saved macro "${flow.name}"`);
         }, MACRO_AUTOSAVE_DEBOUNCE_MS);
       }
     }
   }, [activeFlowId, updateFlowGraph, project.flows, saveMacroChanges]);
+
+  // A macro's last edit, waiting for its autosave, is saved when the page goes rather than lost.
+  const pendingMacroRef = useRef<string | null>(null);
+  const saveMacroRef = useRef(saveMacroChanges);
+  saveMacroRef.current = saveMacroChanges;
+  useEffect(() => {
+    const flush = () => {
+      const id = pendingMacroRef.current;
+      if (!id) return;
+      if (macroAutoSaveRef.current) clearTimeout(macroAutoSaveRef.current);
+      macroAutoSaveRef.current = null;
+      pendingMacroRef.current = null;
+      void saveMacroRef.current(id);
+    };
+    window.addEventListener('pagehide', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      flush();
+    };
+  }, []);
 
   // A new flow opens on the canvas, whichever section was showing.
   const handleCreateFlow = useCallback((name: string) => {
@@ -473,8 +507,16 @@ export default function OAIYApp() {
       // dispatcher loop forever (the backend's run will eventually be
       // marked stale by its own cleanup).
       return new Promise<RunOutcome>((resolve) => {
+        // The run's 10 minutes start when it starts, not when it was queued: behind another run (one runs at a time)
+        // it had used them up waiting, and was given up having never run. Waiting has a limit of its own.
         const TIMEOUT_MS = 10 * 60 * 1000; // 10 min
-        const timer = window.setTimeout(() => {
+        const WAIT_MS = 30 * 60 * 1000;
+        let timer: number | null = null;
+        let started = false;
+        let unsub: () => void = () => {};
+        let settled = false;
+        const giveUp = (error: string) => {
+          settled = true;
           // Unsubscribe BEFORE aborting so the 'aborted' state change (notified
           // synchronously by abort()) can't re-enter this subscriber and overwrite
           // the timeout message. abort() frees the capacity-1 queue slot — otherwise
@@ -482,22 +524,36 @@ export default function OAIYApp() {
           // the AbortSignal into the runtime; a pure synchronous hang can't be killed.
           unsub();
           jq.jobManager.abort(jobId);
-          resolve({ status: 'error', error: 'Run exceeded 10 min timeout in browser.' });
-        }, TIMEOUT_MS);
-        const unsub = jq.subscribeToJob(jobId, (job) => {
+          resolve({ status: 'error', error });
+        };
+        const limit = (ms: number, error: string) => {
+          if (timer !== null) window.clearTimeout(timer);
+          timer = window.setTimeout(() => giveUp(error), ms);
+        };
+        const done = () => {
+          settled = true;
+          if (timer !== null) window.clearTimeout(timer);
+          unsub();
+        };
+        limit(WAIT_MS, 'Run waited 30 min in this browser for another run to end, and was given up.');
+        unsub = jq.subscribeToJob(jobId, (job) => {
+          if (!started && job.status === 'running') {
+            started = true;
+            limit(TIMEOUT_MS, 'Run exceeded 10 min timeout in browser.');
+          }
           if (job.status === 'completed') {
-            window.clearTimeout(timer);
-            unsub();
+            done();
             resolve({ status: 'done', result: (job.result as Record<string, unknown> | undefined) ?? {} });
           } else if (job.status === 'failed' || job.status === 'aborted') {
-            window.clearTimeout(timer);
-            unsub();
+            done();
             resolve({
               status: 'error',
               error: job.error || `Job ${job.status}`,
             });
           }
         });
+        // (ended as it was subscribed to: unsubscribed now that there is something to call)
+        if (settled) unsub();
       });
     },
   });
@@ -538,17 +594,17 @@ export default function OAIYApp() {
       // Shift held (e.key reflects the produced character — 'S'/'N' otherwise,
       // which silently no-ops and lets the browser's own Ctrl+S through).
       const key = e.key.toLowerCase();
-      // Ctrl/Cmd + S exports the project as a JSON file to the browser's
-      // download folder — there's no server-side "save" in the web build.
+      // Ctrl/Cmd + S saves now (the project is saved a moment after each change anyway; in OAIY's window the
+      // desktop has it a moment after that). Exporting a file is in the Projects menu, not on every press.
       if ((e.ctrlKey || e.metaKey) && key === 's') {
         e.preventDefault();
-        exportProject();
-        addToast(`Project "${project.name}" exported as JSON`, 'success');
+        const saved = saveNow();
+        addToast(saved ? 'Saved' : 'Not saved: this browser’s storage is full or unavailable', saved ? 'success' : 'error');
       }
-      // Ctrl/Cmd + N for new project
+      // Ctrl/Cmd + N: a new flow (a new project, which replaces this one, is in the Projects menu)
       if ((e.ctrlKey || e.metaKey) && key === 'n') {
         e.preventDefault();
-        setShowNewProjectDialog(true);
+        setNewFlowOpen(true);
       }
       // Ctrl/Cmd + B collapses/expands the flows rail — the convention every
       // editor uses for its file sidebar, and what both collapse buttons
@@ -561,7 +617,7 @@ export default function OAIYApp() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [exportProject, newProject, project.name, addToast]);
+  }, [saveNow, addToast]);
 
   // localStorage QuotaExceededError → sticky warning toast.
   //
@@ -651,14 +707,15 @@ export default function OAIYApp() {
           crumb={SECTION_LABEL[section]}
           theme={resolvedTheme}
           onSetTheme={followsOaiy ? undefined : setTheme}
-          savedLabel={section === 'workflows' ? 'Saved locally' : undefined}
+          savedLabel={section === 'workflows' ? (saveState === 'saved' ? 'Saved in this browser' : saveState === 'saving' ? 'Saving…' : 'Not saved: storage full') : undefined}
+          savedProblem={saveState === 'not-saved'}
           chips={
             section === 'workflows' ? (
               <>
                 {activePackageFlowData && activePackage ? (
                   <em className="oaiy-chip accent">{activePackage.manifest.name}</em>
                 ) : null}
-                {activeFlow?.localOnly && <em className="oaiy-chip ok">Local</em>}
+                {activeFlow?.localOnly && <em className="oaiy-chip ok" title="Kept in this window only: not in OAIY Desktop">This window only</em>}
                 {backend.share && (
                   <em className="oaiy-chip accent">Shared · {backend.dispatchState}</em>
                 )}
@@ -670,7 +727,7 @@ export default function OAIYApp() {
               {railSection && (
                 <ShellIconAction
                   label="Toggle the flows rail"
-                  title="Show or hide the flows (Ctrl+B)"
+                  title={`Show or hide the flows (${shortcut('B')})`}
                   on={flowsSidebarOpen}
                   onClick={() => setFlowsSidebarOpen(!flowsSidebarOpen)}
                 >
@@ -988,8 +1045,8 @@ export default function OAIYApp() {
       {/* New project confirmation dialog */}
       <ConfirmDialog
         isOpen={showNewProjectDialog}
-        title="Create New Project"
-        message="This will create a new empty project. Any unsaved changes will be lost."
+        title="Start a new project?"
+        message={`This replaces "${project.name}" with a new, empty project: its flows are gone from here unless you export it first (Projects → Export).${oaiyDesktop() ? ' The flows OAIY Desktop keeps are not deleted: they come back into the new project.' : ''}`}
         confirmLabel="Create New"
         cancelLabel="Cancel"
         variant="warning"

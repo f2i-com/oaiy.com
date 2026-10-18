@@ -129,7 +129,7 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
       position: Position.Left,
       color: '!bg-blue-500',
       label: inputNames[index] || id,
-      labelColor: 'text-blue-400',
+      labelColor: 'text-blue-700 dark:text-blue-400',
       size: 'md' as const,
     }));
   }, [inputNames, inputCount]);

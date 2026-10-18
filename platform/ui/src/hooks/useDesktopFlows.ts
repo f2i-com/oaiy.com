@@ -11,8 +11,11 @@
  *   and one deleted there (unchanged here) is removed here.
  *
  * Which side changed is told three ways: each flow as it was when the two last
- * agreed is kept (in this page's storage, so a restart knows it too). A flow
- * changed on one side takes that side's; changed on both, this side's goes there.
+ * agreed is kept (in this page's storage, saved only with the project itself, so
+ * a restart reads the two as they were together). A flow changed on one side
+ * takes that side's; changed on both, this side's goes there. Only a flow
+ * deleted here (Delete) is removed there: one missing here for another reason
+ * (a new project, an import, a project that could not be read) comes back.
  * A flow's name, description, tags, whether it is shared with apps, nodes and
  * edges go both ways; what else the desktop's document holds (a tool's
  * description the agent wrote) is kept as it is. Macros, demos and built-in
@@ -57,9 +60,10 @@ export function toDoc(f: Flow, doc: Doc | null = null): Doc {
   };
 }
 
-/** Whether a flow of the editor's goes to the desktop. */
+/** Whether a flow of the editor's goes to the desktop: not a flow from a shared link (untrusted here, it would run
+ * there, the Agent's to run, unsandboxed). */
 export function shared(f: Flow): boolean {
-  return !f.isMacro && !f.isDemo && !f.isBuiltIn && !f.localOnly;
+  return !f.isMacro && !f.isDemo && !f.isBuiltIn && !f.localOnly && (f as { untrusted?: unknown }).untrusted !== true;
 }
 
 /** A desktop flow as a flow of the editor's. */
@@ -88,9 +92,18 @@ export interface Pulled {
 /**
  * The desktop's flows against the editor's, given each as the two last agreed.
  * Flows changed here are left for the push (it sends them); so are flows
- * deleted here (it removes them there).
+ * deleted here (`deleted`: it removes them there). A flow known before and
+ * missing here, not deleted here, comes back. `listed`: the ids the desktop
+ * listed, a flow among them that could not be read (absent from `there`) is
+ * left as it is on both sides, not taken for deleted there.
  */
-export function reconcile(there: Map<string, Flow>, here: Flow[], agreed: Map<string, string>): Pulled {
+export function reconcile(
+  there: Map<string, Flow>,
+  here: Flow[],
+  agreed: Map<string, string>,
+  deleted: ReadonlySet<string> = new Set(),
+  listed?: ReadonlySet<string>,
+): Pulled {
   const synced = new Map(agreed);
   const put: Flow[] = [];
   const remove: string[] = [];
@@ -100,8 +113,9 @@ export function reconcile(there: Map<string, Flow>, here: Flow[], agreed: Map<st
     const mine = local.get(id);
     const theirKey = flowKey(theirs);
     if (!mine) {
-      // New there: it comes here. Known before and gone here: deleted here, the push removes it there.
-      if (last === undefined) {
+      // New there: it comes here. Deleted here: the push removes it there. Known before and missing here for
+      // another reason (a new project, an import): it comes back, rather than being deleted there.
+      if (!deleted.has(id)) {
         put.push(theirs);
         synced.set(id, theirKey);
       }
@@ -118,7 +132,7 @@ export function reconcile(there: Map<string, Flow>, here: Flow[], agreed: Map<st
     // Changed here (or both): the push sends this side's.
   }
   for (const [id, last] of agreed) {
-    if (there.has(id)) continue;
+    if (there.has(id) || listed?.has(id)) continue;
     const mine = local.get(id);
     // Gone there: if unchanged here it was deleted there; changed here, the push sends it back.
     if (!mine || flowKey(mine) === last) {
@@ -146,6 +160,37 @@ function saveSynced(synced: Map<string, string>): void {
   }
 }
 
+/** The agreed flows waiting to be saved with the project's next write (`projectWritten`). */
+let unsaved: Map<string, string> | null = null;
+/** Flows deleted here (Delete) and not yet removed there. */
+const deletedHere = new Set<string>();
+/** Asked to forget what the two sides agreed (a new project, an import): done at the next push. */
+let forgetAsked = false;
+
+/** The project was written to this page's storage: what the two sides agreed is saved with it, never ahead of it. */
+export function projectWritten(): void {
+  if (!unsaved) return;
+  saveSynced(unsaved);
+  unsaved = null;
+}
+
+/**
+ * Flow `id` was deleted here, by the person, or is to be kept here only ("Keep it in this window only"): it is
+ * removed on the desktop too (a copy left there went stale, the agent and apps still seeing it).
+ */
+export function markDeletedHere(id: string): void {
+  deletedHere.add(id);
+}
+
+/**
+ * The project was replaced (a new one, or one imported): what the two sides last agreed no longer says anything,
+ * so nothing missing here is deleted there, and the desktop's flows come back into the new project.
+ */
+export function forgetDesktopSync(): void {
+  forgetAsked = true;
+  deletedHere.clear();
+}
+
 /**
  * `changedThere` hears the ids of flows here replaced by the desktop's (the
  * canvas redraws the open one).
@@ -161,6 +206,10 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
   /** Ids on the desktop, as last listed. */
   const there = useRef(new Set<string>());
   const pulledOnce = useRef(false);
+  /** A push under way, and whether another was asked for meanwhile (it runs after, with what is newest then). */
+  const pushing = useRef(false);
+  const pushAgain = useRef(false);
+  const pushRef = useRef<() => Promise<void>>(async () => {});
 
   const call = async (method: string, path: string, body?: unknown): Promise<Response | null> => {
     if (!desktop) return null;
@@ -174,6 +223,73 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
       return null;
     }
   };
+
+  const keep = () => {
+    unsaved = new Map(synced.current);
+  };
+
+  /** Send what changed here, and remove what was deleted here: one at a time, again after if asked meanwhile. */
+  const push = async (): Promise<void> => {
+    if (!desktop) return;
+    // Not before the first pull: a flow changed there while the editor was closed comes here first.
+    if (!pulledOnce.current) return;
+    if (pushing.current) {
+      pushAgain.current = true;
+      return;
+    }
+    pushing.current = true;
+    try {
+      do {
+        pushAgain.current = false;
+        if (forgetAsked) {
+          forgetAsked = false;
+          synced.current = new Map();
+          keep();
+        }
+        const flows = latest.current.flows;
+        const current = new Map(flows.filter(shared).map((f) => [f.id, f]));
+        for (const [id, f] of current) {
+          const key = flowKey(f);
+          if (synced.current.get(id) === key) continue;
+          // Into the document as the desktop has it, so what the editor does not show (a description the agent
+          // reads) is not lost.
+          const stored = there.current.has(id) ? await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`) : null;
+          const doc = stored?.ok ? ((await stored.json().catch(() => null)) as Doc | null) : null;
+          const saved = await call('PUT', `/api/bridge/flows/${encodeURIComponent(id)}`, toDoc(f, doc));
+          // (not sent: tried again after the next pull, as nothing says the two agree)
+          if (!saved?.ok) continue;
+          synced.current.set(id, key);
+          there.current.add(id);
+          // Made a tool, or put in front of one: each copy follows the flow, keeping what it is to the agent.
+          for (const copyId of [toolFlowId(f), hookFlowId(f)]) {
+            if (!there.current.has(copyId)) continue;
+            const copy = await call('GET', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
+            const doc = copy?.ok ? ((await copy.json().catch(() => null)) as Doc | null) : null;
+            if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: f.graph.nodes, edges: f.graph.edges });
+          }
+        }
+        // Deleted here, by the person: removed there too (and as the agent's tool, or what goes in front of one).
+        for (const id of [...deletedHere]) {
+          // (one here again, and kept in step: not removed)
+          if (flows.some((f) => f.id === id && shared(f))) {
+            deletedHere.delete(id);
+            continue;
+          }
+          const gone = await call('DELETE', `/api/bridge/flows/${encodeURIComponent(id)}`);
+          if (!gone || !(gone.ok || gone.status === 404)) continue;
+          synced.current.delete(id);
+          deletedHere.delete(id);
+          for (const copyId of [toolFlowId({ id } as Flow), hookFlowId({ id } as Flow)]) {
+            if (there.current.has(copyId)) await call('DELETE', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
+          }
+        }
+        keep();
+      } while (pushAgain.current);
+    } finally {
+      pushing.current = false;
+    }
+  };
+  pushRef.current = push;
 
   // Bring the desktop's flows in: new ones, and ones changed there.
   useEffect(() => {
@@ -194,9 +310,16 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
         if (flow) flows.set(id, flow);
       }
       if (!live) return;
-      const { put, remove, synced: agreed } = reconcile(flows, latest.current.flows.filter(shared), synced.current);
+      if (forgetAsked) {
+        forgetAsked = false;
+        synced.current = new Map();
+      }
+      // (left as they are: flows deleted here, for the push to remove there, and flows here that are not the
+      // desktop's, a local-only one of the same id, which a flow there must not come in over)
+      const leave = new Set([...deletedHere, ...latest.current.flows.filter((f) => !shared(f)).map((f) => f.id)]);
+      const { put, remove, synced: agreed } = reconcile(flows, latest.current.flows.filter(shared), synced.current, leave, there.current);
       synced.current = agreed;
-      saveSynced(agreed);
+      keep();
       pulledOnce.current = true;
       if (put.length || remove.length) {
         setProject((prev) => {
@@ -208,53 +331,31 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
         const replaced = put.filter((f) => latest.current.flows.some((p) => p.id === f.id)).map((f) => f.id);
         if (replaced.length) onChanged.current?.(replaced);
       }
+      // (what changed here meanwhile, or did not reach the desktop before, is sent now)
+      void pushRef.current();
     };
     void pull();
     const timer = window.setInterval(() => void pull(), PULL_MS);
+    // (the window closing or hidden: what changed in the last moment is sent now, not after the pause)
+    const flush = () => void pushRef.current();
+    const hidden = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', hidden);
     return () => {
       live = false;
       window.clearInterval(timer);
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', hidden);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Send what changed here, and remove what was deleted here.
+  // A moment after the last edit, what changed is sent.
   useEffect(() => {
     if (!desktop) return;
-    const timer = window.setTimeout(async () => {
-      // Not before the first pull: a flow changed there while the editor was closed comes here first.
-      if (!pulledOnce.current) return;
-      const current = new Map(project.flows.filter(shared).map((f) => [f.id, f]));
-      for (const [id, f] of current) {
-        const key = flowKey(f);
-        if (synced.current.get(id) === key) continue;
-        // Into the document as the desktop has it, so what the editor does not show (a description the agent
-        // reads) is not lost.
-        const stored = there.current.has(id) ? await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`) : null;
-        const doc = stored?.ok ? ((await stored.json().catch(() => null)) as Doc | null) : null;
-        const saved = await call('PUT', `/api/bridge/flows/${encodeURIComponent(id)}`, toDoc(f, doc));
-        if (!saved?.ok) continue;
-        synced.current.set(id, key);
-        there.current.add(id);
-        // Made a tool, or put in front of one: each copy follows the flow, keeping what it is to the agent.
-        for (const copyId of [toolFlowId(f), hookFlowId(f)]) {
-          if (!there.current.has(copyId)) continue;
-          const copy = await call('GET', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
-          const doc = copy?.ok ? ((await copy.json().catch(() => null)) as Doc | null) : null;
-          if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: f.graph.nodes, edges: f.graph.edges });
-        }
-      }
-      for (const id of [...synced.current.keys()]) {
-        if (current.has(id) || project.flows.some((f) => f.id === id)) continue;
-        const gone = await call('DELETE', `/api/bridge/flows/${encodeURIComponent(id)}`);
-        if (gone && (gone.ok || gone.status === 404)) synced.current.delete(id);
-        // A deleted flow is no longer the agent's tool, nor in front of one.
-        for (const copyId of [toolFlowId({ id } as Flow), hookFlowId({ id } as Flow)]) {
-          if (there.current.has(copyId)) await call('DELETE', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
-        }
-      }
-      saveSynced(synced.current);
-    }, SETTLE_MS);
+    const timer = window.setTimeout(() => void pushRef.current(), SETTLE_MS);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.flows]);

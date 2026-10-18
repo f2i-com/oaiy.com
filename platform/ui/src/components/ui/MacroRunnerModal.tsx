@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { Check, FolderOpen, Layers, Loader2, Play, RotateCcw, XCircle } from 'lucide-react';
+import { Check, FolderOpen, Layers, Loader2, Play, RotateCcw, Square, XCircle } from 'lucide-react';
 import type { Flow, MacroPortDefinition } from 'oaiy-core';
 import { useJobQueue } from '../../contexts/JobQueueContext';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -13,7 +13,11 @@ interface MacroRunnerModalProps {
 }
 
 export default function MacroRunnerModal({ macro, onClose, onShowToast }: MacroRunnerModalProps) {
-  const { submitJob, subscribeToJob, jobs } = useJobQueue();
+  const { submitJob, subscribeToJob, jobs, jobManager } = useJobQueue();
+  // The job whose end was told (once: the queue tells a job's state each time anything about it changes)
+  const toldRef = useRef<string | null>(null);
+  const toastRef = useRef(onShowToast);
+  toastRef.current = onShowToast;
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const [isRunning, setIsRunning] = useState(false);
   const [runningJobId, setRunningJobId] = useState<string | null>(null);
@@ -49,6 +53,9 @@ export default function MacroRunnerModal({ macro, onClose, onShowToast }: MacroR
     if (!runningJobId) return;
 
     const unsubscribe = subscribeToJob(runningJobId, (job) => {
+      if (job.status !== 'completed' && job.status !== 'failed' && job.status !== 'aborted') return;
+      if (toldRef.current === job.id) return;
+      toldRef.current = job.id;
       if (job.status === 'completed') {
         setIsRunning(false);
         // Extract results from nodeOutputs using output node IDs
@@ -65,20 +72,20 @@ export default function MacroRunnerModal({ macro, onClose, onShowToast }: MacroR
           Object.assign(extractedResults, job.results);
         }
         setResults(extractedResults);
-        onShowToast?.('Macro completed successfully', 'success');
+        toastRef.current?.('Macro completed successfully', 'success');
       } else if (job.status === 'failed') {
         setIsRunning(false);
         setError(job.error || 'Unknown error');
-        onShowToast?.('Macro failed', 'error');
+        toastRef.current?.('Macro failed', 'error');
       } else if (job.status === 'aborted') {
         setIsRunning(false);
-        setError('Macro was aborted');
-        onShowToast?.('Macro aborted', 'info');
+        setError('Macro was stopped');
+        toastRef.current?.('Macro stopped', 'info');
       }
     });
 
     return unsubscribe;
-  }, [runningJobId, subscribeToJob, onShowToast, macroOutputs]);
+  }, [runningJobId, subscribeToJob, macroOutputs]);
 
   const handleInputChange = useCallback((inputId: string, value: string) => {
     setInputValues((prev) => ({ ...prev, [inputId]: value }));
@@ -307,9 +314,16 @@ export default function MacroRunnerModal({ macro, onClose, onShowToast }: MacroR
       initialFocusRef={firstInputRef as React.RefObject<HTMLElement | null>}
       footer={
         <>
-          <button type="button" onClick={onClose} className="btn btn-secondary" disabled={isRunning}>
-            {results ? 'Close' : 'Cancel'}
-          </button>
+          {isRunning && runningJobId ? (
+            <button type="button" onClick={() => jobManager.abort(runningJobId)} className="btn btn-danger">
+              <Square size={12} fill="currentColor" />
+              Stop
+            </button>
+          ) : (
+            <button type="button" onClick={onClose} className="btn btn-secondary">
+              {results ? 'Close' : 'Cancel'}
+            </button>
+          )}
           {!results && (
             <button type="button" onClick={handleRun} disabled={isRunning} className="btn btn-primary">
               {isRunning ? (

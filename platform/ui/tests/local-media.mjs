@@ -251,6 +251,12 @@ await check('a flow file added with "Import flows…" arrives without them, in e
   assert.equal(graphed.name, 'graphed');
   assert.deepEqual(STALE_FLOW.graph.nodes[0].data, { label: 'Out', outputValue: 'http://192.168.77.7:8188/view?filename=stale.png' }, 'what it was given is unchanged');
   assert.equal(M.normalizeFlowData({ name: 'neither' }), null);
+  // what other flows of the file call it by, and that it is a macro, are kept in the flat shape too
+  const macro = M.normalizeFlowData({ id: 'm1', name: 'M', isMacro: true, macroMetadata: { inputs: [], outputs: [] }, nodes: [], edges: [] });
+  assert.equal(macro.id, 'm1');
+  assert.equal(macro.isMacro, true);
+  assert.deepEqual(macro.macroMetadata, { inputs: [], outputs: [] });
+  assert.equal('isMacro' in flat, false);
 });
 
 await check('a flow that a shared link brings (App.tsx keeps its project) arrives without them, and what is not a flow with a graph is left as it is', () => {

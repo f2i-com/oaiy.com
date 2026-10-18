@@ -1706,6 +1706,8 @@ select,
   white-space: nowrap;
 }
 .oaiy-saved svg { color: rgb(var(--signal-green)); }
+.oaiy-saved.problem { color: rgb(var(--signal-danger)); }
+.oaiy-saved.problem svg { color: rgb(var(--signal-danger)); }
 
 .oaiy-actions {
   display: flex;
@@ -2033,7 +2035,7 @@ select,
 @media (max-width: 960px) {
   .oaiy-dock { grid-template-columns: auto minmax(150px, 1fr) auto; }
   .oaiy-dock > em { display: none; }
-  .oaiy-saved { display: none; }
+  .oaiy-saved:not(.problem) { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -2728,6 +2730,9 @@ button.oaiy-row:focus-visible,
   display: flex;
   min-width: 220px;
   max-width: 320px;
+  /* (kept inside the window: a tall menu scrolls rather than running off it) */
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   flex-direction: column;
   border: 1px solid rgb(var(--color-border-strong));
   border-radius: var(--r-ctl);
@@ -3346,6 +3351,17 @@ button.oaiy-row:focus-visible,
   cursor: pointer;
 }
 .oaiy-toast > button:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
+/* A toast's action ("Show log"): a word button, not the square dismiss. */
+.oaiy-toast > button.oaiy-toast-action {
+  width: auto;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid rgb(var(--tone) / 0.45);
+  color: rgb(var(--color-text-primary));
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
 .oaiy-toast.success { --tone: var(--signal-green); }
 .oaiy-toast.error { --tone: var(--signal-danger); }
 .oaiy-toast.warning { --tone: var(--signal-amber); }

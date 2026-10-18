@@ -192,11 +192,13 @@ function InputFileNode({ data }: InputFileNodeProps) {
 
   const hasFile = data.fileName && (data.fileContent || data.filePath);
   const isImage = data.fileType === 'image';
+  // (a picture's preview is its content: saved once, as the content)
+  const preview = data.imagePreview || (isImage && data.fileContent?.startsWith('data:image/') ? data.fileContent : undefined);
 
   const collapsedPreview = (
-    <div className="text-slate-400">
+    <div className="text-slate-600 dark:text-slate-400">
       {hasFile ? (
-        <span className="text-emerald-400 truncate block">{data.fileName}</span>
+        <span className="text-emerald-700 dark:text-emerald-400 truncate block">{data.fileName}</span>
       ) : (
         <span className="italic text-slate-500">No file</span>
       )}
@@ -222,12 +224,23 @@ function InputFileNode({ data }: InputFileNodeProps) {
       {data.showBodyProperties !== false && (
         <>
           <div
+            // (a button to the keyboard too: Tab to it, Enter or Space picks a file)
+            role="button"
+            tabIndex={0}
+            aria-label={hasFile ? `Change the file (${data.fileName})` : 'Pick a file, or drop one here'}
             onClick={handleClick}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                e.stopPropagation();
+                void handleClick();
+              }
+            }}
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             className={`
-              w-full h-24 border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition-all
+              nodrag w-full h-24 border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500
               ${isDragging
                 ? 'border-emerald-500 bg-emerald-900/30'
                 : hasFile
@@ -244,16 +257,16 @@ function InputFileNode({ data }: InputFileNodeProps) {
                 </svg>
               </div>
             ) : hasFile ? (
-              isImage && data.imagePreview && mediaUrlBlocked(data.imagePreview) ? (
+              isImage && preview && mediaUrlBlocked(preview) ? (
                 <span className="text-amber-600 dark:text-amber-400 text-[10px] p-2" data-blocked-media>{BLOCKED_MEDIA_WORDS}</span>
-              ) : isImage && data.imagePreview ? (
-                <img src={data.imagePreview} alt={data.fileName} className="max-w-full max-h-full object-contain rounded" />
+              ) : isImage && preview ? (
+                <img src={preview} alt={data.fileName} className="max-w-full max-h-full object-contain rounded" />
               ) : (
                 <div className="text-center px-2">
                   <svg className="w-6 h-6 mx-auto text-emerald-500 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
-                  <p className="text-emerald-400 text-xs truncate max-w-full">{data.fileName}</p>
+                  <p className="text-emerald-700 dark:text-emerald-400 text-xs truncate max-w-full">{data.fileName}</p>
                 </div>
               )
             ) : (
@@ -277,7 +290,7 @@ function InputFileNode({ data }: InputFileNodeProps) {
       )}
 
       {error && (
-        <div className="flex items-center gap-2 px-2 py-1.5 bg-red-900/30 border border-red-600/50 rounded text-red-400 text-xs">
+        <div className="flex items-center gap-2 px-2 py-1.5 bg-red-900/30 border border-red-600/50 rounded text-red-700 dark:text-red-400 text-xs">
           <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>

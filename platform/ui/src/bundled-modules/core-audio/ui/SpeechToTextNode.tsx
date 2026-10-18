@@ -61,9 +61,9 @@ function SpeechToTextNode({ data }: SpeechToTextNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className="text-violet-400">{data.language || 'auto-detect'}</span>
+            <span className="text-violet-700 dark:text-violet-400">{data.language || 'auto-detect'}</span>
             {data.detectedLanguage && (
-                <span className="ml-1 text-emerald-400">({data.detectedLanguage})</span>
+                <span className="ml-1 text-emerald-700 dark:text-emerald-400">({data.detectedLanguage})</span>
             )}
         </div>
     );
@@ -221,7 +221,7 @@ function SpeechToTextNode({ data }: SpeechToTextNodeProps) {
 
                     {/* Diarization info */}
                     {enableDiarization && (
-                        <div className="flex items-center gap-2 px-2 py-1.5 bg-amber-900/20 border border-amber-800/30 rounded text-xs text-amber-300">
+                        <div className="flex items-center gap-2 px-2 py-1.5 bg-amber-900/20 border border-amber-800/30 rounded text-xs text-amber-700 dark:text-amber-300">
                             <svg className="w-4 h-4 text-amber-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                             </svg>
@@ -235,20 +235,20 @@ function SpeechToTextNode({ data }: SpeechToTextNodeProps) {
                             {/* Duration and language */}
                             <div className="flex items-center justify-between text-xs">
                                 {data.duration !== undefined && (
-                                    <span className="text-slate-400">
-                                        Duration: <span className="text-violet-400">{formatDuration(data.duration)}</span>
+                                    <span className="text-slate-600 dark:text-slate-400">
+                                        Duration: <span className="text-violet-700 dark:text-violet-400">{formatDuration(data.duration)}</span>
                                     </span>
                                 )}
                                 {data.detectedLanguage && (
-                                    <span className="text-slate-400">
-                                        Language: <span className="text-emerald-400">{data.detectedLanguage}</span>
+                                    <span className="text-slate-600 dark:text-slate-400">
+                                        Language: <span className="text-emerald-700 dark:text-emerald-400">{data.detectedLanguage}</span>
                                     </span>
                                 )}
                             </div>
 
                             {/* Transcript preview */}
                             <div className="bg-slate-100/50 dark:bg-slate-900/50 border border-slate-300 dark:border-slate-700 rounded p-2">
-                                <div className="text-xs text-slate-400 mb-1">Transcript Preview:</div>
+                                <div className="text-xs text-slate-600 dark:text-slate-400 mb-1">Transcript Preview:</div>
                                 <div className="nowheel text-xs text-slate-700 dark:text-slate-300 max-h-24 overflow-y-auto">
                                     {data.transcriptText.substring(0, 200)}
                                     {data.transcriptText.length > 200 && '...'}
@@ -257,8 +257,8 @@ function SpeechToTextNode({ data }: SpeechToTextNodeProps) {
 
                             {/* Segment count */}
                             {data.segments && data.segments.length > 0 && (
-                                <div className="text-xs text-slate-400">
-                                    <span className="text-blue-400">{data.segments.length}</span> segments detected
+                                <div className="text-xs text-slate-600 dark:text-slate-400">
+                                    <span className="text-blue-700 dark:text-blue-400">{data.segments.length}</span> segments detected
                                 </div>
                             )}
                         </div>

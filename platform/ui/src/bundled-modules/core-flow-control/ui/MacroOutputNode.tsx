@@ -54,7 +54,7 @@ function MacroOutputNode({ data }: NodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className="text-violet-400 font-medium">{name}</span>
+            <span className="text-violet-700 dark:text-violet-400 font-medium">{name}</span>
             <span className="ml-1 text-slate-500">({outputType})</span>
         </div>
     );
@@ -119,7 +119,7 @@ function MacroOutputNode({ data }: NodeProps) {
                     </div>
 
                     {/* Info */}
-                    <div className="flex items-center gap-2 px-2 py-1.5 bg-violet-900/20 border border-violet-800/30 rounded text-xs text-violet-300">
+                    <div className="flex items-center gap-2 px-2 py-1.5 bg-violet-900/20 border border-violet-800/30 rounded text-xs text-violet-700 dark:text-violet-300">
                         <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>

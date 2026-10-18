@@ -69,7 +69,7 @@ function MusicGenNode({ data }: MusicGenNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className="text-purple-400">{duration}s</span>
+            <span className="text-purple-700 dark:text-purple-400">{duration}s</span>
             <span className="ml-1 text-slate-500">{service === 'heartmula' ? 'HM' : 'ACE'}</span>
             <span className="ml-1 truncate">{data.prompt?.substring(0, 12) || 'music'}...</span>
         </div>
@@ -176,7 +176,7 @@ function MusicGenNode({ data }: MusicGenNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Duration</label>
-                            <span className="text-xs text-purple-400">{duration}s</span>
+                            <span className="text-xs text-purple-700 dark:text-purple-400">{duration}s</span>
                         </div>
                         <input
                             type="range"
@@ -227,7 +227,7 @@ function MusicGenNode({ data }: MusicGenNodeProps) {
                                     </svg>
                                 )}
                             </button>
-                            <span className="text-xs text-purple-300 truncate flex-1">Music generated</span>
+                            <span className="text-xs text-purple-700 dark:text-purple-300 truncate flex-1">Music generated</span>
                         </div>
                     )}
 

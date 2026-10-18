@@ -17,6 +17,7 @@
  */
 
 import { pickFileViaInput, pickFolderViaInput, type OpenDialogOptions } from './dialog';
+import { triggerDownloadFromBlob } from '../lib/download';
 import { getEngineBase } from '../lib/engineEndpoint';
 import { secretVault } from './secretVault';
 
@@ -269,19 +270,6 @@ function mimeFromExt(filename: string): string {
     case 'csv': return 'text/csv';
     default: return 'application/octet-stream';
   }
-}
-
-function triggerDownloadFromBlob(filename: string, blob: Blob): void {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  // Browser needs a beat to start the download before revoking.
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
 /** Materialise a WebVfsEntry into a Blob for download / object-URL use. */

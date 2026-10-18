@@ -138,7 +138,24 @@ export function areTypesCompatible(
  * fields) so the prop type lines up without a cast. */
 export function makeIsValidConnection(
   nodes: Node[],
+  edges: Edge[] = [],
 ): (connectionOrEdge: Connection | Edge) => boolean {
+  // Where each node's wires go, for the loop check: a wire from B back to A, where A already leads to B, makes a
+  // circle the run cannot order (it failed only at Run). A loop's own way back (Loop End to its Loop Start) is one.
+  const next = new Map<string, string[]>();
+  for (const e of edges) next.set(e.source, [...(next.get(e.source) ?? []), e.target]);
+  const leadsTo = (from: string, to: string): boolean => {
+    const seen = new Set<string>();
+    const queue = [from];
+    while (queue.length) {
+      const id = queue.shift()!;
+      if (id === to) return true;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      queue.push(...(next.get(id) ?? []));
+    }
+    return false;
+  };
   // Build these once when the validator is created, not per handle-hover:
   // an id→Node map (O(1) lookup vs two O(N) finds per call) and a single
   // parse of the custom services from localStorage.
@@ -151,6 +168,9 @@ export function makeIsValidConnection(
     const srcNode = nodesById.get(source);
     const tgtNode = nodesById.get(target);
     if (!srcNode || !tgtNode) return true;
+    if (source === target) return false;
+    const loopBack = srcNode.type === 'loop_end' && tgtNode.type === 'loop_start';
+    if (!loopBack && leadsTo(target, source)) return false;
     const srcType = getHandleType(srcNode, connectionOrEdge.sourceHandle, 'source', customServices);
     const tgtType = getHandleType(tgtNode, connectionOrEdge.targetHandle, 'target', customServices);
     return areTypesCompatible(srcType, tgtType);

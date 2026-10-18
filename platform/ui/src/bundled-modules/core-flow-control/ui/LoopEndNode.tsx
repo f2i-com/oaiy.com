@@ -90,23 +90,23 @@ function LoopEndNode({ data }: LoopEndNodeProps) {
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'loop', type: 'target', position: Position.Top, color: '!bg-amber-500', label: 'loop', labelColor: 'text-amber-400', size: 'md' },
+    { id: 'loop', type: 'target', position: Position.Top, color: '!bg-amber-500', label: 'loop', labelColor: 'text-amber-700 dark:text-amber-400', size: 'md' },
     { id: 'input', type: 'target', position: Position.Left, color: '!bg-blue-500', size: 'lg' },
   ], []);
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'results', type: 'source', position: Position.Right, color: '!bg-green-500', label: '[ ]', labelColor: 'text-green-400', size: 'lg' },
+    { id: 'results', type: 'source', position: Position.Right, color: '!bg-green-500', label: '[ ]', labelColor: 'text-green-700 dark:text-green-400', size: 'lg' },
   ], []);
 
   const titleExtra = (
     <>
       {data.loopName && (
-        <span className="px-1.5 py-0.5 bg-amber-800 text-amber-300 text-[10px] rounded font-mono">
+        <span className="px-1.5 py-0.5 bg-amber-800 text-amber-700 dark:text-amber-300 text-[10px] rounded font-mono">
           {data.loopName}
         </span>
       )}
       {resultCount > 0 && (
-        <span className="ml-auto px-1.5 py-0.5 bg-amber-900 text-amber-400 text-[10px] rounded">
+        <span className="ml-auto px-1.5 py-0.5 bg-amber-900 text-amber-700 dark:text-amber-400 text-[10px] rounded">
           {resultCount}
         </span>
       )}

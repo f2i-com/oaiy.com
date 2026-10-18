@@ -23,6 +23,7 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
+import { shortcut } from '../../lib/keys';
 import type { Flow, OAIYPackageManifest } from 'oaiy-core';
 import { oaiyDesktop } from '../../lib/oaiyAgentTools';
 import type { ExampleFlow } from '../../lib/exampleFlows';
@@ -171,7 +172,7 @@ export default function FlowsSidebar({
       return next;
     });
   }, []);
-  const [deleteConfirm, setDeleteConfirm] = useState<{ flowId: string; flowName: string } | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ flowId: string; flowName: string; onDesktop?: boolean } | null>(null);
   const [activeCategory, setActiveCategory] = useState<FlowCategory>('all');
 
   // Categorize flows
@@ -264,7 +265,7 @@ export default function FlowsSidebar({
   const handleDeleteRequest = useCallback((flowId: string) => {
     const flow = flows.find(f => f.id === flowId);
     if (flow) {
-      setDeleteConfirm({ flowId, flowName: flow.name });
+      setDeleteConfirm({ flowId, flowName: flow.name, onDesktop: !!oaiyDesktop() && !flow.isMacro && !flow.localOnly && !flow.isDemo && (flow as { untrusted?: boolean }).untrusted !== true });
     }
     setMenu(null);
   }, [flows]);
@@ -289,7 +290,7 @@ export default function FlowsSidebar({
       const isModified = hasMacroBeenModified?.(flow.id) ?? false;
       return <Layers size={15} aria-label={isModified ? 'Macro, changed' : 'Macro'} />;
     }
-    if (flow.localOnly) return <HardDrive size={15} aria-label="Local only" />;
+    if (flow.localOnly) return <HardDrive size={15} aria-label="Kept in this window only" />;
     return <FileText size={15} aria-hidden="true" />;
   };
 
@@ -308,7 +309,7 @@ export default function FlowsSidebar({
           className="oaiy-icon-btn"
           aria-label="Expand the flows panel"
           aria-expanded={false}
-          title="Expand flows (Ctrl+B)"
+          title={`Expand flows (${shortcut('B')})`}
         >
           <ChevronsRight size={16} />
         </button>
@@ -420,7 +421,7 @@ export default function FlowsSidebar({
               className="oaiy-icon-btn"
               aria-label="Collapse the flows panel"
               aria-expanded
-              title="Collapse flows (Ctrl+B)"
+              title={`Collapse flows (${shortcut('B')})`}
             >
               <ChevronsLeft size={16} />
             </button>
@@ -656,13 +657,31 @@ export default function FlowsSidebar({
               ) : (
                 <MenuItem icon={<Layers size={14} />} label="Save as a macro" hint="Use it as a node in other flows" onSelect={() => onSaveAsMacro?.(menuFlow.id)} />
               )}
-              <MenuItem
-                icon={<HardDrive size={14} />}
-                label={menuFlow.localOnly ? 'Allow cloud services' : 'Keep it local only'}
-                onSelect={() => onSetFlowLocalOnly(menuFlow.id, !menuFlow.localOnly)}
-              />
-              <hr />
-              <MenuItem icon={<Trash2 size={14} />} label="Delete…" danger onSelect={() => handleDeleteRequest(menuFlow.id)} />
+              {/* What it does: whether OAIY Desktop keeps the flow (for the agent, the CLI and other apps). Nothing
+                  else: a flow's services are its nodes'. Only where there is a desktop to keep it. */}
+              {oaiyDesktop() && !menuFlow.isMacro && (
+                <MenuItem
+                  icon={<HardDrive size={14} />}
+                  label={menuFlow.localOnly ? 'Keep it in OAIY Desktop too' : 'Keep it in this window only'}
+                  hint={menuFlow.localOnly ? 'The agent, the CLI and other apps see it again' : 'Taken off OAIY Desktop: the agent, the CLI and other apps no longer see it'}
+                  onSelect={() => {
+                    onSetFlowLocalOnly(menuFlow.id, !menuFlow.localOnly);
+                    addToast(
+                      menuFlow.localOnly
+                        ? `“${menuFlow.name}” is kept in OAIY Desktop again.`
+                        : `“${menuFlow.name}” is kept in this window only: it is taken off OAIY Desktop, and changes here are no longer sent there.`,
+                      'info',
+                      6000,
+                    );
+                  }}
+                />
+              )}
+              {!(menuFlow.isMacro && menuFlow.isBuiltIn) && (
+                <>
+                  <hr />
+                  <MenuItem icon={<Trash2 size={14} />} label="Delete…" danger onSelect={() => handleDeleteRequest(menuFlow.id)} />
+                </>
+              )}
             </>
           )}
         </Menu>
@@ -672,7 +691,7 @@ export default function FlowsSidebar({
         <ConfirmDialog
           isOpen={deleteConfirm !== null}
           title="Delete this flow?"
-          message={`“${deleteConfirm?.flowName}” and all its nodes are deleted. This cannot be undone.`}
+          message={`“${deleteConfirm?.flowName}” and all its nodes are deleted${deleteConfirm?.onDesktop ? ', here and in OAIY Desktop (with the agent’s tool made from it, if there is one)' : ''}. This cannot be undone.`}
           confirmLabel="Delete flow"
           cancelLabel="Cancel"
           variant="danger"

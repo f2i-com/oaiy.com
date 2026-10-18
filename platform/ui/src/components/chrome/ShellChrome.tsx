@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Menu,
   X,
   Check,
@@ -292,6 +293,7 @@ export function ShellTopbar({
   children,
   chips,
   savedLabel,
+  savedProblem = false,
   theme,
   onSetTheme,
   actions,
@@ -307,6 +309,8 @@ export function ShellTopbar({
   children: ReactNode;
   chips?: ReactNode;
   savedLabel?: string;
+  /** The label says it is not saved: a warning, not a tick. */
+  savedProblem?: boolean;
   theme: 'light' | 'dark';
   /** Absent in OAIY's window, where the theme is OAIY's (its sidebar switches it). */
   onSetTheme?: (t: 'light' | 'dark') => void;
@@ -339,8 +343,8 @@ export function ShellTopbar({
           {children}
           {chips}
           {savedLabel && (
-            <small className="oaiy-saved">
-              <Check size={13} />
+            <small className={`oaiy-saved${savedProblem ? ' problem' : ''}`} role={savedProblem ? 'alert' : undefined}>
+              {savedProblem ? <AlertTriangle size={13} /> : <Check size={13} />}
               {savedLabel}
             </small>
           )}

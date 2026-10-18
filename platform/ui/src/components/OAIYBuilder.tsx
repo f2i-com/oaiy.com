@@ -1,5 +1,5 @@
 import { useCallback, useRef, useMemo, useState, useEffect, useLayoutEffect } from 'react';
-import { ChevronsDownUp, ChevronsUpDown, LayoutGrid, Layers, Map as MapIcon, Package as PackageIcon, Play, Plus, RefreshCw, RotateCcw, Save, ScrollText, SlidersHorizontal, Square, X } from 'lucide-react';
+import { ChevronsDownUp, ChevronsUpDown, LayoutGrid, Layers, Loader2, Map as MapIcon, Package as PackageIcon, Play, Plus, RefreshCw, RotateCcw, Save, ScrollText, SlidersHorizontal, Square, X } from 'lucide-react';
 import {
   ReactFlow,
   Background,
@@ -35,6 +35,8 @@ import RunWorkflowModal, { hasInputNodes } from './ui/RunWorkflowModal';
 import ComfyUIWorkflowDialog, { type ComfyUIWorkflowConfig } from 'oaiy-core/modules/core-image/ui/ComfyUIWorkflowDialog';
 import { ServiceStartupDialog } from './PackageManager/ServiceStartupDialog';
 import { CanvasContextMenu } from './OAIYBuilder/CanvasContextMenu';
+import { useUndoHistory } from '../hooks/useUndoHistory';
+import { isMac, shortcut } from '../lib/keys';
 import { makeIsValidConnection } from '../utils/edgeTypeValidation';
 import TypedConnectionLine from './OAIYBuilder/TypedConnectionLine';
 
@@ -145,7 +147,7 @@ interface OAIYBuilderProps {
    */
   active?: boolean;
   // Toast notifications
-  onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning') => void;
+  onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, action?: { label: string; onClick: () => void }) => void;
   // Package mode props
   packageMode?: {
     manifest: OAIYPackageManifest;
@@ -263,6 +265,7 @@ export default function OAIYBuilder({
     onNodesChange,
     onEdgesChange,
     onConnect: onConnectBase,
+    onReconnect,
     addNode,
     updateNodeData,
     deleteSelected,
@@ -272,12 +275,25 @@ export default function OAIYBuilder({
     autoLayout,
     getWorkflowGraph,
   } = useWorkflow({
+    flowId,
     availableFlows,
     initialGraph,
     onGraphChange,
     projectSettings,
     onUpdateSettings,
   });
+
+  // Undo and redo (⌘Z, ⇧⌘Z): a delete offers its undo as it happens, as nothing asks before it.
+  const { undo, redo, canUndo, canRedo } = useUndoHistory({
+    nodes,
+    edges,
+    setNodes,
+    setEdges,
+    onRemoved: (count) =>
+      onShowToast?.(`Deleted ${count} node${count === 1 ? '' : 's'}`, 'info', 6000, { label: 'Undo', onClick: () => undoRef.current() }),
+  });
+  const undoRef = useRef(undo);
+  undoRef.current = undo;
 
   // Ref to hold quick connect close function (set after hook initialization)
   const quickConnectCloseRef = useRef<(() => void) | null>(null);
@@ -295,13 +311,14 @@ export default function OAIYBuilder({
   // — `isValidConnection` only fires during a drag, so the closure cost
   // is bounded to user interaction.
   const isValidConnection = useMemo(
-    () => makeIsValidConnection(nodes),
-    [nodes],
+    () => makeIsValidConnection(nodes, edges),
+    [nodes, edges],
   );
 
   // Workflow execution hook - manages job submission, running, stopping, and completion
   const {
     isRunning,
+    isWaiting,
     logs,
     showRunModal,
     showServiceDialog,
@@ -327,7 +344,10 @@ export default function OAIYBuilder({
     hasInputNodes,
     packageMode,
     packagePermissionContext,
+    onShowLog: () => showLogRef.current?.(),
   });
+  /** Opens the log (set below, where the panels are). */
+  const showLogRef = useRef<(() => void) | null>(null);
 
   // Calculate selected nodes for multi-selection display
   const selectedNodes = useMemo(() => nodes.filter(n => n.selected), [nodes]);
@@ -435,6 +455,7 @@ export default function OAIYBuilder({
       saveBoolPref('oaiy.ui.logPanelVisible', open);
     }
   }, [compact]);
+  showLogRef.current = () => setLog(true);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [showMiniMap, setShowMiniMap] = useState(true); // Toggle minimap visibility
   // The canvas's own width: the map gives way to the toolbar when it is
@@ -962,10 +983,33 @@ export default function OAIYBuilder({
         return;
       }
 
+      // Undo / Redo: ⌘Z, ⇧⌘Z (Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y elsewhere). A text field's own undo is its own (above).
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+        event.preventDefault();
+        if (event.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (event.ctrlKey && !event.metaKey && event.key === 'y') {
+        event.preventDefault();
+        redo();
+        return;
+      }
+
+      // Copy, paste and select all are the canvas's on the canvas alone: text selected in the Log or the
+      // Properties panel copies as text, as anywhere else.
+      const onCanvas = !!target.closest('.react-flow');
+      const textSelected = (window.getSelection()?.toString() ?? '').length > 0;
+      if ((event.ctrlKey || event.metaKey) && ['c', 'v', 'a'].includes(event.key) && (!onCanvas || textSelected)) {
+        return;
+      }
+
       // Copy: Ctrl+C / Cmd+C
       if ((event.ctrlKey || event.metaKey) && event.key === 'c') {
         event.preventDefault();
-        copySelected();
+        if (!copySelected() && nodes.some((n) => n.selected)) {
+          onShowToast?.('Not copied: this browser’s storage is full or unavailable', 'error');
+        }
         return;
       }
 
@@ -997,7 +1041,7 @@ export default function OAIYBuilder({
         deleteSelected();
       }
     },
-    [deleteSelected, copySelected, pasteClipboard, setNodes, setEdges, handleGroupSelected]
+    [deleteSelected, copySelected, pasteClipboard, setNodes, setEdges, handleGroupSelected, nodes, onShowToast, undo, redo]
   );
 
   // Handle ComfyUI workflow dialog confirmation
@@ -1083,6 +1127,7 @@ export default function OAIYBuilder({
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onReconnect={onReconnect}
           isValidConnection={isValidConnection}
           onEdgeClick={handleEdgeClick}
           onInit={(instance) => {
@@ -1131,10 +1176,11 @@ export default function OAIYBuilder({
           zoomOnScroll
           zoomActivationKeyCode={null}
           preventScrolling
-          // Multi-select: Ctrl+drag creates selection box (overrides pan when Ctrl held)
+          // Multi-select: Ctrl+drag creates selection box (overrides pan when Ctrl held); on a Mac, where Ctrl-click
+          // is a right click, Shift+drag draws the box and ⌘-click adds to the selection
           selectionOnDrag
-          selectionKeyCode="Control"
-          multiSelectionKeyCode="Control"
+          selectionKeyCode={isMac ? 'Shift' : 'Control'}
+          multiSelectionKeyCode={isMac ? 'Meta' : 'Control'}
           elementsSelectable
           selectNodesOnDrag={false}
           // Auto-pan when dragging nodes or connections near edges
@@ -1143,8 +1189,10 @@ export default function OAIYBuilder({
           autoPanSpeed={8}
           // Require minimum movement before starting drag (prevents accidental drags)
           nodeDragThreshold={3}
-          // Allow connections even when not perfectly aligned
-          connectionMode={ConnectionMode.Loose}
+          // A wire runs from an output to an input (Loose let an output be wired to an output, which ran nothing);
+          // a generous radius snaps a wire let go near a handle onto it.
+          connectionMode={ConnectionMode.Strict}
+          connectionRadius={36}
           // Zoom settings
           minZoom={0.1}
           maxZoom={2}
@@ -1198,7 +1246,9 @@ export default function OAIYBuilder({
             position={contextMenu}
             nodes={nodes}
             hasClipboard={hasClipboard()}
-            onCopy={copySelected}
+            onCopy={() => {
+              if (!copySelected()) onShowToast?.('Not copied: this browser’s storage is full or unavailable', 'error');
+            }}
             onPaste={pasteClipboard}
             onGroupSelected={handleGroupSelected}
             onUngroupSelected={handleUngroupSelected}
@@ -1208,10 +1258,14 @@ export default function OAIYBuilder({
             onExpandAll={handleExpandAll}
             onClose={() => setContextMenu(null)}
             screenToFlowPosition={reactFlowInstance.current?.screenToFlowPosition}
+            onUndo={undo}
+            onRedo={redo}
+            canUndo={canUndo}
+            canRedo={canRedo}
           />
         )}
 
-        {/* Quick-Connect Popup - shown when dragging connection for 3+ seconds */}
+        {/* Quick-Connect Popup - shown when a wire is held still for a moment, or let go on the empty canvas */}
         {quickConnectState && (
           <QuickConnectPopup
             state={quickConnectState}
@@ -1294,6 +1348,16 @@ export default function OAIYBuilder({
             <button type="button" onClick={stopWorkflow} className="btn btn-danger solid" aria-label="Stop Workflow" title="Stop the flow">
               <Square size={13} fill="currentColor" /> Stop
             </button>
+          ) : isWaiting ? (
+            <button
+              type="button"
+              onClick={stopWorkflow}
+              className="btn btn-secondary"
+              aria-label="Waiting to run: cancel"
+              title="Another flow is running: this one starts when it ends. Click to cancel."
+            >
+              <Loader2 size={13} className="animate-spin" /> Waiting… Cancel
+            </button>
           ) : isMacro ? (
             <button
               type="button"
@@ -1340,7 +1404,7 @@ export default function OAIYBuilder({
             <span>{packageMode.manifest.name}</span>
             <small>v{packageMode.manifest.version}</small>
             {onReloadPackage && (
-              <button type="button" onClick={onReloadPackage} className="oaiy-icon-btn sm" title="Reload package (Ctrl+Shift+R)" aria-label="Reload package">
+              <button type="button" onClick={onReloadPackage} className="oaiy-icon-btn sm" title={`Reload package (${shortcut('R', { shift: true })})`} aria-label="Reload package">
                 <RefreshCw size={13} />
               </button>
             )}
@@ -1374,7 +1438,7 @@ export default function OAIYBuilder({
                 <div className="oaiy-side-body">
                   {selectedNodes.length > 1 ? (
                     <div className="flex flex-col gap-2 p-3">
-                      <p className="oaiy-help faint px-1">Ctrl+C copies them, Delete removes them. Pick one to set it up.</p>
+                      <p className="oaiy-help faint px-1">{shortcut('C')} copies them, Delete removes them ({shortcut('Z')} brings them back). Pick one to set it up.</p>
                       <ul className="m-0 flex list-none flex-col gap-1 p-0">
                         {selectedNodes.map((node) => {
                           const def = node.data.__definition as { name?: string; color?: string; icon?: string } | undefined;

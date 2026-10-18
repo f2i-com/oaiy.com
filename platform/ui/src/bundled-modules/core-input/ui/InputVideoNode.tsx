@@ -150,9 +150,9 @@ function InputVideoNode({ data }: InputVideoNodeProps) {
   const hasVideo = data.fileName && data.filePath;
 
   const collapsedPreview = (
-    <div className="text-slate-400">
+    <div className="text-slate-600 dark:text-slate-400">
       {hasVideo ? (
-        <span className="text-orange-400 truncate block">{data.fileName}</span>
+        <span className="text-orange-700 dark:text-orange-400 truncate block">{data.fileName}</span>
       ) : (
         <span className="italic text-slate-500">No video</span>
       )}
@@ -204,7 +204,7 @@ function InputVideoNode({ data }: InputVideoNodeProps) {
                 <svg className="w-6 h-6 mx-auto text-orange-500 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
                 </svg>
-                <p className="text-orange-400 text-xs truncate max-w-full">{data.fileName}</p>
+                <p className="text-orange-700 dark:text-orange-400 text-xs truncate max-w-full">{data.fileName}</p>
               </div>
             ) : (
               <>
@@ -227,7 +227,7 @@ function InputVideoNode({ data }: InputVideoNodeProps) {
       )}
 
       {error && (
-        <div className="flex items-center gap-2 px-2 py-1.5 bg-red-900/30 border border-red-600/50 rounded text-red-400 text-xs">
+        <div className="flex items-center gap-2 px-2 py-1.5 bg-red-900/30 border border-red-600/50 rounded text-red-700 dark:text-red-400 text-xs">
           <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>

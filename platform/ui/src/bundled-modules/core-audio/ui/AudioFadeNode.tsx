@@ -45,11 +45,11 @@ function AudioFadeNode({ data }: AudioFadeNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className="text-pink-400">{fadeDuration}s</span>
+            <span className="text-pink-700 dark:text-pink-400">{fadeDuration}s</span>
             <span className="mx-0.5">|</span>
-            <span className="text-purple-400">{fadeType === 'exponential' ? 'exp' : 'lin'}</span>
+            <span className="text-purple-700 dark:text-purple-400">{fadeType === 'exponential' ? 'exp' : 'lin'}</span>
             <span className="mx-0.5">|</span>
-            <span className="text-blue-400">{fadeDirection}</span>
+            <span className="text-blue-700 dark:text-blue-400">{fadeDirection}</span>
         </div>
     );
 
@@ -144,7 +144,7 @@ function AudioFadeNode({ data }: AudioFadeNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Fade Duration</label>
-                            <span className="text-xs text-pink-400">{fadeDuration}s</span>
+                            <span className="text-xs text-pink-700 dark:text-pink-400">{fadeDuration}s</span>
                         </div>
                         <input
                             type="range"

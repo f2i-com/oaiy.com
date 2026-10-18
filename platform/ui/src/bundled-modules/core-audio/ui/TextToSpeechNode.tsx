@@ -156,7 +156,7 @@ function TextToSpeechNode({ data }: TextToSpeechNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className="text-teal-400">
+            <span className="text-teal-700 dark:text-teal-400">
                 {selectedPreset.label.split(' (')[0]}
             </span>
         </div>
@@ -253,7 +253,7 @@ function TextToSpeechNode({ data }: TextToSpeechNodeProps) {
 
                             <button
                                 type="button"
-                                className="text-xs text-teal-400 hover:text-teal-300 text-left"
+                                className="text-xs text-teal-700 dark:text-teal-400 hover:text-teal-300 text-left"
                                 onClick={() => setShowExternalAdvanced(v => !v)}
                                 onMouseDown={(e) => e.stopPropagation()}
                             >
@@ -398,7 +398,7 @@ function TextToSpeechNode({ data }: TextToSpeechNodeProps) {
                                     </svg>
                                 )}
                             </button>
-                            <span className="text-xs text-teal-300 truncate flex-1">Audio generated</span>
+                            <span className="text-xs text-teal-700 dark:text-teal-300 truncate flex-1">Audio generated</span>
                         </div>
                     )}
                 </>

@@ -174,13 +174,31 @@ await check("OAIY's own window looks for the desktop as it opens, as it always h
   p.services.startDesktopServiceSync();
   await p.settle();
   assert.equal(p.health().length, 2, 'the detection probes at once, and so does the service sync');
-  assert.ok(p.health().every((r) => r.url === `${DEFAULT}/api/health`), p.health().map((r) => r.url).join(', '));
+  assert.ok(p.health().every((r) => r.url === `${given.origin}/api/health`), `at the address the window gives, not the engine address: ${p.health().map((r) => r.url).join(', ')}`);
   assert.ok(p.timers.size >= 1, 'the poll runs');
   assert.ok([...p.timers.values()].some((t) => t.ms === 10_000));
   const urls = p.requests.map((r) => r.url);
   assert.ok(urls.includes(`${given.origin}/api/services`) && urls.includes(`${given.origin}/api/ai/engine/services`), `and the desktop's service lists: ${urls.join(', ')}`);
   assert.equal(p.detection.getDesktopInfo().available, true);
   assert.equal(p.detection.getDesktopInfo().checked, true);
+});
+
+await check("a desktop that misses one poll is still there, and its services stay in the pickers; three in a row and it is gone", async () => {
+  const p = await page({ hostname: 'oaiyflows.localhost', protocol: 'http:', desktop: given });
+  p.detection.startDesktopDetection();
+  p.services.startDesktopServiceSync();
+  await p.settle();
+  const listed = p.store.get(KEYS.services);
+  assert.ok(listed && listed.includes('py-rig'), 'the list came');
+  globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+  const tick = async () => { for (const t of [...p.timers.values()]) t.fn(); await p.settle(); };
+  await tick();
+  assert.equal(p.detection.getDesktopInfo().available, true, 'one miss: still there');
+  assert.equal(p.store.get(KEYS.services), listed, 'and the list is kept');
+  await tick();
+  await tick();
+  assert.equal(p.detection.getDesktopInfo().available, false, 'three: gone');
+  assert.ok(!String(p.store.get(KEYS.services) ?? '').includes('py-rig'), 'and its services with it');
 });
 
 await check('OAIY\'s own window looks even with nothing saved and a stale list in storage: the list is kept until the first probe has answered', async () => {

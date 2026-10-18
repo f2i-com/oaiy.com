@@ -56,7 +56,7 @@ export function serviceForNode(draft: CustomService, nodeType: string): CustomSe
   return out;
 }
 
-function AddServiceDialog({ nodeType }: { nodeType: string }) {
+function AddServiceDialog({ nodeType, choose }: { nodeType: string; choose?: (serviceId: string) => void }) {
   const inOaiy = oaiyDesktop() !== null;
   const label = NODE_LABEL[nodeType] || 'this node';
   // Built once per opening: ServiceForm compares its draft with this to know
@@ -81,8 +81,11 @@ function AddServiceDialog({ nodeType }: { nodeType: string }) {
       setError('Give the service a name and its endpoint URL.');
       return;
     }
-    saveService(serviceForNode(svc, nodeType));
+    const saved = serviceForNode(svc, nodeType);
+    saveService(saved);
     close();
+    // (picked on the node it was added from, once the lists have it)
+    if (choose) setTimeout(() => choose(saved.id), 0);
   };
   return (
     <ServiceForm
@@ -130,7 +133,7 @@ function AddServiceDialog({ nodeType }: { nodeType: string }) {
 }
 
 /** Open the dialog for a node of `nodeType` (only one at a time). */
-export function openAddServiceDialog(nodeType: string): void {
+export function openAddServiceDialog(nodeType: string, choose?: (serviceId: string) => void): void {
   if (typeof document === 'undefined') return;
   close();
   const host = document.createElement('div');
@@ -140,7 +143,7 @@ export function openAddServiceDialog(nodeType: string): void {
   open = { root, host };
   root.render(
     <ConfirmDialogProvider>
-      <AddServiceDialog nodeType={nodeType} />
+      <AddServiceDialog nodeType={nodeType} choose={choose} />
     </ConfirmDialogProvider>,
   );
 }

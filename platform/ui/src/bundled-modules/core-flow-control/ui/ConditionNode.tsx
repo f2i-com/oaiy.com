@@ -62,22 +62,22 @@ function ConditionNode({ data }: ConditionNodeProps) {
 
   const collapsedPreview = (
     <span>
-      <span className="text-cyan-400">if</span> the value {(operatorLabel.match(/\(([^)]+)\)/)?.[1] ?? operatorLabel).toLowerCase()}
+      <span className="text-cyan-700 dark:text-cyan-400">if</span> the value {(operatorLabel.match(/\(([^)]+)\)/)?.[1] ?? operatorLabel).toLowerCase()}
       {data.compareValue ? <span className="font-mono"> {String(data.compareValue)}</span> : null}
     </span>
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'input', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'value', labelColor: 'text-blue-400', size: 'lg' },
+    { id: 'input', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'value', labelColor: 'text-blue-700 dark:text-blue-400', size: 'lg' },
   ], []);
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'true', type: 'source', position: Position.Right, color: '!bg-green-500', label: 'true', labelColor: 'text-green-400', size: 'md' },
-    { id: 'false', type: 'source', position: Position.Right, color: '!bg-red-500', label: 'false', labelColor: 'text-red-400', size: 'md' },
+    { id: 'true', type: 'source', position: Position.Right, color: '!bg-green-500', label: 'true', labelColor: 'text-green-700 dark:text-green-400', size: 'md' },
+    { id: 'false', type: 'source', position: Position.Right, color: '!bg-red-500', label: 'false', labelColor: 'text-red-700 dark:text-red-400', size: 'md' },
   ], []);
 
   const titleExtra = (
-    <span className="ml-auto px-1.5 py-0.5 bg-cyan-900 text-cyan-400 text-[10px] rounded">
+    <span className="ml-auto px-1.5 py-0.5 bg-cyan-900 text-cyan-700 dark:text-cyan-400 text-[10px] rounded">
       IF
     </span>
   );

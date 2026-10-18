@@ -85,30 +85,30 @@ function LoopStartNode({ data }: LoopStartNodeProps) {
   const inputHandles = useMemo<HandleConfig[]>(() => {
     if (loopMode === 'count') {
       return [
-        { id: 'count', type: 'target', position: Position.Left, color: '!bg-amber-500', label: 'count', labelColor: 'text-amber-400', size: 'md' },
+        { id: 'count', type: 'target', position: Position.Left, color: '!bg-amber-500', label: 'count', labelColor: 'text-amber-700 dark:text-amber-400', size: 'md' },
       ];
     }
     // (a loop that runs until it is stopped takes nothing in: `i` is its try's number)
     if (loopMode === 'while_true') return [];
     return [
-      { id: 'array', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'array', labelColor: 'text-blue-400', size: 'md' },
+      { id: 'array', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'array', labelColor: 'text-blue-700 dark:text-blue-400', size: 'md' },
     ];
   }, [loopMode]);
 
   // Output handles using HandleConfig
   const outputHandles = useMemo<HandleConfig[]>(() => {
     const handles: HandleConfig[] = [
-      { id: 'item', type: 'source', position: Position.Right, color: '!bg-green-500', label: loopMode === 'foreach' ? 'item' : 'i', labelColor: 'text-green-400', size: 'lg' },
+      { id: 'item', type: 'source', position: Position.Right, color: '!bg-green-500', label: loopMode === 'foreach' ? 'item' : 'i', labelColor: 'text-green-700 dark:text-green-400', size: 'lg' },
     ];
     if (loopMode === 'foreach') {
-      handles.push({ id: 'index', type: 'source', position: Position.Right, color: '!bg-amber-500', label: 'index', labelColor: 'text-amber-400', size: 'sm' });
+      handles.push({ id: 'index', type: 'source', position: Position.Right, color: '!bg-amber-500', label: 'index', labelColor: 'text-amber-700 dark:text-amber-400', size: 'sm' });
     }
     return handles;
   }, [loopMode]);
 
   // Bottom handles for loop connection
   const bottomHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'loop', type: 'source', position: Position.Bottom, color: '!bg-amber-500', label: 'loop end', labelColor: 'text-amber-400', size: 'lg' },
+    { id: 'loop', type: 'source', position: Position.Bottom, color: '!bg-amber-500', label: 'loop end', labelColor: 'text-amber-700 dark:text-amber-400', size: 'lg' },
   ], []);
 
   const title = data.loopName ? `Loop: ${data.loopName}` : 'Loop Start';

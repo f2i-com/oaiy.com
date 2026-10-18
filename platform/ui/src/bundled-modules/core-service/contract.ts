@@ -62,6 +62,45 @@ export function remoteModelOf(id: string): { kind: string; nodeId: string; model
   return m ? { kind: m[1].toLowerCase(), nodeId: m[2], model: m[3] } : null;
 }
 
+/** What each kind of the engine's models is called, in words. */
+export const ENGINE_KIND_LABEL: Readonly<Record<string, string>> = {
+  llm: 'language model',
+  image: 'picture model',
+  video: 'video model',
+  speech: 'speech model',
+  music: 'music model',
+  sound: 'sound-effect model',
+  model3d: '3D model',
+  background: 'background-removal model',
+  upscale: 'upscaler',
+  transcription: 'transcription',
+};
+
+/**
+ * What service id `id` names, in words for a person (a node's card, a notice, an error), never the raw id:
+ * `engine:image` is "the default picture model", `engine:image:node.<id>/flux` "flux on Rig" (the worker's name
+ * where `list` has it), `engine:music:song` "song", `companion:rig` "rig". `offline` says whether a paired worker's
+ * model is listed as not answering now.
+ */
+export function describeService(id: string, list: readonly CustomService[] = []): { text: string; kind: string | null; worker: string | null; offline: boolean } {
+  const entry = list.find((s) => s.id === id);
+  const remote = remoteModelOf(id);
+  if (remote) {
+    const worker = entry?.nodeName || 'a paired computer';
+    return { text: `${remote.model} on ${worker}`, kind: remote.kind, worker, offline: entry?.ready === false };
+  }
+  const kind = engineKindOf(id);
+  if (kind) {
+    const def = engineDefault(list as CustomService[], kind);
+    return { text: `the default ${ENGINE_KIND_LABEL[kind] ?? `${kind} model`}`, kind, worker: def?.nodeId ? def.nodeName || 'a paired computer' : null, offline: !!def?.nodeId && def.ready === false };
+  }
+  const model = /^engine:([a-z0-9]+):(.+)$/i.exec(id);
+  if (model) return { text: entry?.model || model[2], kind: model[1].toLowerCase(), worker: null, offline: false };
+  if (id.startsWith('voice:')) return { text: 'OAIY Voice', kind: 'transcription', worker: null, offline: false };
+  if (id.startsWith('companion:')) return { text: entry?.name?.replace(/ \((running|stopped|starting)\)$/, '') || id.slice('companion:'.length), kind: null, worker: null, offline: false };
+  return { text: entry?.name || id, kind: null, worker: null, offline: false };
+}
+
 /**
  * OAIY's engine's language model for an `engine:llm` id (or `engine:llm:<model>`)
  * that no list here has: a flow run by the desktop's bridge, the CLI or the

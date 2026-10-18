@@ -119,9 +119,9 @@ function SubflowNode({ data }: NodeProps) {
   const collapsedPreview = (
     <div className="text-slate-500 dark:text-slate-400">
       {selectedFlow ? (
-        <span className="text-cyan-400 truncate">{selectedFlow.name}</span>
+        <span className="text-cyan-700 dark:text-cyan-400 truncate">{selectedFlow.name}</span>
       ) : flowName ? (
-        <span className="text-yellow-400 text-[10px]">Missing</span>
+        <span className="text-yellow-700 dark:text-yellow-400 text-[10px]">Missing</span>
       ) : (
         <span className="italic text-slate-600 dark:text-slate-400">None</span>
       )}
@@ -220,7 +220,7 @@ function SubflowNode({ data }: NodeProps) {
                   <label className="text-slate-500 dark:text-slate-400 text-xs block">Mappings</label>
                   {inputHandleNames.map((handleId: string, i: number) => (
                     <div key={handleId} className="flex items-center gap-1.5 min-w-0">
-                      <span className="text-[10px] text-cyan-400 w-5 flex-shrink-0 font-medium">in{i}</span>
+                      <span className="text-[10px] text-cyan-700 dark:text-cyan-400 w-5 flex-shrink-0 font-medium">in{i}</span>
                       <svg className="w-3 h-3 text-slate-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
                       </svg>
@@ -251,7 +251,7 @@ function SubflowNode({ data }: NodeProps) {
                   <span>{selectedFlow.graph.nodes.length} nodes</span>
                 </div>
                 {selectedFlow.localOnly && (
-                  <div className="flex items-center gap-1 text-[10px] text-green-400">
+                  <div className="flex items-center gap-1 text-[10px] text-green-700 dark:text-green-400">
                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
                     </svg>
@@ -263,7 +263,7 @@ function SubflowNode({ data }: NodeProps) {
           )}
 
           {flowName && !selectedFlow && (
-            <div className="flex items-center gap-2 px-2 py-1.5 bg-yellow-900/30 border border-yellow-600/50 rounded text-yellow-400 text-xs">
+            <div className="flex items-center gap-2 px-2 py-1.5 bg-yellow-900/30 border border-yellow-600/50 rounded text-yellow-700 dark:text-yellow-400 text-xs">
               <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
               </svg>

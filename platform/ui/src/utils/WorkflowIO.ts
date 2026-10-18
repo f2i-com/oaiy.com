@@ -362,7 +362,7 @@ export function graphToReactFlowEdges(graph: WorkflowGraph): Edge[] {
  * @returns React Flow nodes
  */
 export function graphToReactFlowNodes(graph: WorkflowGraph, shouldApplyLayout = false): Node[] {
-  const nodes = graph.nodes.map((n, index) => ({
+  const nodes: Node[] = graph.nodes.map((n, index) => ({
     id: n.id,
     type: n.type,
     // Use stored position or calculate default grid position
@@ -371,7 +371,12 @@ export function graphToReactFlowNodes(graph: WorkflowGraph, shouldApplyLayout = 
       y: 100 + Math.floor(index / 4) * 200,
     },
     data: n.data || {},
+    // A grouped node's box, and a box's size (Ctrl+G)
+    ...(n.parentId && graph.nodes.some((p) => p.id === n.parentId) ? { parentId: n.parentId, ...(n.extent === 'parent' ? { extent: 'parent' as const } : {}) } : {}),
+    ...(n.style ? { style: { ...n.style } } : {}),
   }));
+  // (a group box before the nodes in it: the canvas needs a parent drawn first)
+  nodes.sort((a, b) => (a.type === 'group' ? 0 : 1) - (b.type === 'group' ? 0 : 1));
 
   // Apply auto-layout if requested
   if (shouldApplyLayout && graph.edges.length > 0) {

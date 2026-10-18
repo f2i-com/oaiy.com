@@ -30,7 +30,9 @@ export interface UseWorkflowExecutionOptions {
   getWorkflowGraph: () => WorkflowGraph | null;
   setNodes: React.Dispatch<React.SetStateAction<Node[]>>;
   updateNodeData: (nodeId: string, data: Record<string, unknown>) => void;
-  onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning') => void;
+  onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, action?: { label: string; onClick: () => void }) => void;
+  /** Open the log (a failed run's toast offers it). */
+  onShowLog?: () => void;
   /** Check if workflow has input nodes that need configuration */
   hasInputNodes: (nodes: Node[]) => boolean;
   /** Package mode for service checking */
@@ -55,6 +57,8 @@ export interface UseWorkflowExecutionOptions {
 export interface WorkflowExecutionState {
   /** Whether the workflow is currently running */
   isRunning: boolean;
+  /** Queued behind another run (one runs at a time): not started yet, and can be cancelled */
+  isWaiting: boolean;
   /** Current job ID if one is active */
   currentJobId: string | null;
   /** Combined logs from job queue or local logs */
@@ -99,12 +103,18 @@ export function useWorkflowExecution({
   hasInputNodes,
   packageMode,
   packagePermissionContext,
+  onShowLog,
 }: UseWorkflowExecutionOptions): WorkflowExecutionState & WorkflowExecutionActions {
+  const showLogRef = useRef(onShowLog);
+  showLogRef.current = onShowLog;
+  const toastRef = useRef(onShowToast);
+  toastRef.current = onShowToast;
   // Job queue integration
-  const { jobManager, isFlowRunning, getJobForFlow, jobs } = useJobQueue();
+  const { jobManager, isFlowRunning, getJobForFlow, jobs, getLastResult } = useJobQueue();
 
-  // Track manually started jobs (set when user clicks run button)
-  const [manualJobId, setManualJobId] = useState<string | null>(null);
+  // Track manually started jobs (set when user clicks run button); a flow opened again starts on its last good run,
+  // so its outputs are shown again rather than blank
+  const [manualJobId, setManualJobId] = useState<string | null>(() => getLastResult(flowId)?.id ?? null);
 
   // Local logs state for when there's no active job
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
@@ -117,17 +127,27 @@ export function useWorkflowExecution({
   const [flowTransitioning, setFlowTransitioning] = useState(false);
   const prevFlowIdRef = useRef(flowId);
 
-  // Derive the active job ID from the job queue
-  const activeJobFromQueue = useMemo(() => {
+  // The flow's live job in the queue: running, or waiting its turn behind another flow's
+  const liveJob = useMemo(() => {
     const existingJob = getJobForFlow(flowId);
-    return existingJob && existingJob.status === 'running' ? existingJob.id : null;
+    return existingJob && (existingJob.status === 'running' || existingJob.status === 'pending') ? existingJob : null;
   }, [flowId, getJobForFlow, jobs]);
+  const activeJobFromQueue = liveJob?.id ?? null;
 
-  // The current job is either the manually started job or the active job from queue
-  const currentJobId = manualJobId || activeJobFromQueue;
+  // The current job: the live one (a run started elsewhere, by the agent or an app, included), else the one started
+  // here last, whose log and result stay shown after it ends
+  const currentJobId = activeJobFromQueue || manualJobId;
 
-  // Track if this flow is running
-  const isRunning = isFlowRunning(flowId) || (currentJobId !== null && getJobForFlow(flowId)?.status === 'running');
+  // A live job started elsewhere (by the agent, an app) is followed as one started here: its log and result stay
+  // shown after it ends, not lost the moment it stops being live.
+  useEffect(() => {
+    if (activeJobFromQueue && activeJobFromQueue !== manualJobId) setManualJobId(activeJobFromQueue);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeJobFromQueue]);
+
+  // Track if this flow is running, or waiting its turn
+  const isRunning = isFlowRunning(flowId) || liveJob?.status === 'running';
+  const isWaiting = !isRunning && liveJob?.status === 'pending';
 
   // Get logs for the current job
   const jobLogs = useJobLogs(currentJobId);
@@ -169,9 +189,13 @@ export function useWorkflowExecution({
     currentJobId,
     useCallback(
       (nodeId: string, status: 'running' | 'completed' | 'error') => {
+        // A node's "running" arriving after its run was stopped or ended (a step still finishing) would stay on it,
+        // spinning, with nothing running: not shown. Its error is.
+        const job = currentJobId ? jobManager.getJob(currentJobId) : undefined;
+        if (status !== 'error' && job && job.status !== 'running') return;
         updateNodeData(nodeId, { _status: status });
       },
-      [updateNodeData]
+      [updateNodeData, currentJobId, jobManager]
     )
   );
 
@@ -204,8 +228,9 @@ export function useWorkflowExecution({
       return;
     }
 
-    // Find the current job by ID
-    const job = jobs.find((j) => j.id === currentJobId);
+    // Find the current job by ID (whole as kept for its flow, where the queue's history has slimmed it)
+    const kept = getLastResult(flowId);
+    const job = kept?.id === currentJobId ? kept : jobs.find((j) => j.id === currentJobId);
     if (!job) return;
 
     // Only process completion once per job
@@ -308,24 +333,39 @@ export function useWorkflowExecution({
           });
         });
       } else {
-        // Just clear statuses for failed/aborted jobs
+        // A failed or stopped run: what was still running is not any more, and the node that failed keeps its Error
+        // mark (it shows where the run went wrong).
         setNodes((nds) =>
           nds.map((node) => {
-            if (node.data._status) {
+            if (node.data._status === 'running') {
               return { ...node, data: { ...node.data, _status: undefined } };
             }
             return node;
           })
         );
+        if (job.status === 'failed') {
+          const why = String((job as { error?: unknown }).error ?? '').replace(/^(Error:\s*)+/, '').trim();
+          toastRef.current?.(
+            why ? `The run failed: ${why.length > 220 ? `${why.slice(0, 220)}…` : why}` : 'The run failed.',
+            'error',
+            9000,
+            showLogRef.current ? { label: 'Show log', onClick: () => showLogRef.current?.() } : undefined,
+          );
+        }
       }
     }
-  }, [currentJobId, jobs, setNodes, edges]);
+  }, [currentJobId, jobs, setNodes, edges, getLastResult, flowId]);
 
   // Actually submit the workflow to the job queue
   const submitWorkflow = useCallback(() => {
-    // Guard against double-submit: don't queue a second job if this flow is
-    // already running or has a pending job waiting to start.
-    if (isFlowRunning(flowId) || getJobForFlow(flowId)?.status === 'pending') {
+    // Guard against double-submit: no second job while this flow has one, running, waiting its turn, or still
+    // stopping (a stopped job keeps the run slot until it has ended).
+    const existing = getJobForFlow(flowId);
+    if (existing) {
+      onShowToast?.(
+        existing.status === 'pending' ? 'This flow is already waiting to run.' : existing.status === 'aborted' ? 'The last run is still stopping: run it again in a moment.' : 'This flow is already running.',
+        'info',
+      );
       return;
     }
 
@@ -485,10 +525,11 @@ export function useWorkflowExecution({
 
   // Stop workflow via job queue
   const stopWorkflow = useCallback(() => {
-    if (currentJobId) {
-      jobManager.abort(currentJobId);
-    }
-  }, [currentJobId, jobManager]);
+    // (the flow's live job, running or waiting: not an older one this page started)
+    const live = getJobForFlow(flowId);
+    const id = live && (live.status === 'running' || live.status === 'pending') ? live.id : currentJobId;
+    if (id) jobManager.abort(id);
+  }, [currentJobId, jobManager, getJobForFlow, flowId]);
 
   // Clear logs
   const clearLogs = useCallback(() => {
@@ -517,6 +558,7 @@ export function useWorkflowExecution({
   return {
     // State
     isRunning,
+    isWaiting,
     currentJobId,
     logs,
     showRunModal,

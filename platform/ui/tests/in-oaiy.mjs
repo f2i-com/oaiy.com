@@ -54,7 +54,10 @@ export { currentCaps } from './src/lib/caps.ts';
 export { currentAvailabilityEnv } from './src/lib/availabilityEnv.ts';
 export { paletteShowsNode, nodeNotice } from './src/lib/nodeAvailability.ts';
 export { hasSavedDesktopLink } from './src/lib/desktopLink.ts';
-export { forgetPageHost } from '@oaiy/shared/capabilities/host';`,
+export { forgetPageHost } from '@oaiy/shared/capabilities/host';
+export { withNewIds, rewriteFlowRefs } from './src/lib/flowIds.ts';
+export { reachesUntrusted } from './src/lib/flowIds.ts';
+export { UndoHistory, restoreOnto, canvasKey } from './src/lib/undoHistory.ts';`,
     resolveDir: UI,
     loader: 'ts',
   },
@@ -67,7 +70,8 @@ export { forgetPageHost } from '@oaiy/shared/capabilities/host';`,
   plugins: [{ name: 'oaiy-ui-components', setup: (build) => build.onResolve({ filter: /^oaiy-ui-components$/ }, () => ({ path: uiStub })) }],
 });
 fs.rmSync(uiStub, { force: true });
-const { flowKey, fromDoc, reconcile, shared, toDoc, desktopTheme, taskText, shellNavItems, currentCaps, currentAvailabilityEnv, paletteShowsNode, nodeNotice, hasSavedDesktopLink, forgetPageHost } = await import(pathToFileURL(bundlePath).href);
+const M = await import(pathToFileURL(bundlePath).href);
+const { flowKey, fromDoc, reconcile, shared, toDoc, desktopTheme, taskText, shellNavItems, currentCaps, currentAvailabilityEnv, paletteShowsNode, nodeNotice, hasSavedDesktopLink, forgetPageHost } = M;
 fs.rmSync(bundlePath, { force: true });
 
 const flow = (extra = {}) => ({ id: 'f1', name: 'Greeting', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] }, ...extra });
@@ -140,8 +144,22 @@ check('a flow deleted there goes here unless changed here; one deleted here is n
   assert.equal(gone.synced.has('a'), false);
   const kept = reconcile(new Map(), [named('a', 'A edited')], new Map([['a', key(a)]]));
   assert.deepEqual(kept.remove, []);
-  const deletedHere = reconcile(new Map([['a', a]]), [], new Map([['a', key(a)]]));
+  const deletedHere = reconcile(new Map([['a', a]]), [], new Map([['a', key(a)]]), new Set(['a']));
   assert.deepEqual(deletedHere.put, [], 'the push removes it there');
+});
+
+check('a flow missing here but not deleted here (a new project, an import) comes back rather than being deleted there', () => {
+  const a = named('a', 'A');
+  const back = reconcile(new Map([['a', a]]), [], new Map([['a', key(a)]]));
+  assert.deepEqual(back.put.map((f) => f.id), ['a']);
+  assert.equal(back.synced.get('a'), key(a));
+});
+
+check('a flow the desktop listed but could not send is left as it is here, not taken for deleted there', () => {
+  const a = named('a', 'A');
+  const r = reconcile(new Map(), [a], new Map([['a', key(a)]]), new Set(), new Set(['a']));
+  assert.deepEqual(r.remove, []);
+  assert.equal(r.synced.get('a'), key(a));
 });
 
 check('"Ask the Agent" words its task from the input, the setting and the context', () => {
@@ -267,6 +285,67 @@ check('the capabilities are the same object until the link changes, so a compone
     assert.notEqual(b, a);
     assert.equal(currentCaps(), b);
   });
+});
+
+check('flows brought in (a shared link, Import flows…) get ids of their own, and the subflow and macro nodes that call each other follow', () => {
+  const flows = [
+    { id: 'a', name: 'A', graph: { nodes: [{ id: 'n1', type: 'subflow', data: { flowId: 'b' } }, { id: 'n2', type: 'macro', data: { _macroWorkflowId: 'm' } }], edges: [] } },
+    { id: 'b', name: 'B', graph: { nodes: [{ id: 'n3', type: 'subflow', data: { flowId: 'elsewhere' } }], edges: [] } },
+    { id: 'm', name: 'M', isMacro: true, graph: { nodes: [], edges: [] } },
+  ];
+  let n = 0;
+  const { flows: out, ids } = M.withNewIds(flows, () => `new-${++n}`);
+  assert.deepEqual(out.map((f) => f.id), ['new-1', 'new-2', 'new-3']);
+  assert.equal(ids.get('b'), 'new-2');
+  assert.equal(out[0].graph.nodes[0].data.flowId, 'new-2');
+  assert.equal(out[0].graph.nodes[1].data._macroWorkflowId, 'new-3');
+  assert.equal(out[1].graph.nodes[0].data.flowId, 'elsewhere', 'a flow not brought in is still named as it was');
+  assert.equal(flows[0].graph.nodes[0].data.flowId, 'b', 'what it was given is unchanged');
+  assert.equal(out[2], M.rewriteFlowRefs([out[2]], ids)[0], 'a flow with nothing to rename is the same object');
+});
+
+check('a shared flow runs sandboxed, and so does a flow that calls one; the rest of the project does not', () => {
+  const flows = [
+    { id: 'mine', graph: { nodes: [], edges: [] } },
+    { id: 'shared', untrusted: true, graph: { nodes: [], edges: [] } },
+    { id: 'calls', graph: { nodes: [{ id: 'x', type: 'subflow', data: { flowId: 'mid' } }], edges: [] } },
+    { id: 'mid', graph: { nodes: [{ id: 'y', type: 'macro', data: { _macroWorkflowId: 'shared' } }], edges: [] } },
+  ];
+  const graph = (id) => flows.find((f) => f.id === id).graph;
+  assert.equal(M.reachesUntrusted('mine', graph('mine'), flows), false);
+  assert.equal(M.reachesUntrusted('shared', graph('shared'), flows), true);
+  assert.equal(M.reachesUntrusted('calls', graph('calls'), flows), true, 'through a flow it calls');
+});
+
+check('undo goes back over adds, deletes, moves and wires, keeps what a run put on the nodes, and redo comes forward again', () => {
+  const node = (id, x = 0, data = {}) => ({ id, type: 'input_text', position: { x, y: 0 }, data });
+  const h = new M.UndoHistory();
+  const a = { nodes: [node('a')], edges: [] };
+  assert.equal(h.record(a), null, 'the first state is where it starts');
+  const b = { nodes: [node('a'), node('b', 200)], edges: [] };
+  assert.deepEqual(h.record(b).nodes, a.nodes, 'a node added is a step');
+  assert.equal(h.record({ nodes: b.nodes.map((n) => ({ ...n, selected: true, data: { ...n.data, outputValue: 'ran', _status: 'completed' } })), edges: [] }), null, 'a selection or a run is not');
+  const c = { nodes: b.nodes, edges: [{ id: 'e1', source: 'a', target: 'b' }] };
+  h.record(c);
+  const moved = { nodes: [node('a', 50), node('b', 200)], edges: c.edges };
+  // an undo straight after a change takes it in first (it had not settled)
+  const ran = { nodes: moved.nodes.map((n) => ({ ...n, data: { ...n.data, outputValue: 'ran' } })), edges: moved.edges };
+  const back = h.undo(ran);
+  assert.equal(M.canvasKey(back.nodes, back.edges), M.canvasKey(c.nodes, c.edges), 'the move is undone');
+  const shown = M.restoreOnto(back, ran);
+  assert.equal(shown.nodes[0].data.outputValue, 'ran', "a run's output stays on the node");
+  const unwired = M.restoreOnto(h.undo(shown), shown);
+  assert.equal(unwired.edges.length, 0, 'then the wire');
+  const first = M.restoreOnto(h.undo(unwired), unwired);
+  assert.equal(first.nodes.length, 1, 'then the node added');
+  assert.equal(h.undo(first), null, 'and no further');
+  assert.equal(h.redo(a).nodes.length, 2);
+  assert.ok(h.canRedo);
+  // a change after an undo ends what could be redone
+  h.record({ nodes: [node('a'), node('b', 200), node('c', 400)], edges: [] });
+  assert.equal(h.canRedo, false);
+  // a picture dropped on a node is compared by its length and start, not whole
+  assert.ok(M.canvasKey([node('p', 0, { fileContent: `data:image/png;base64,${'A'.repeat(100000)}` })], []).length < 400);
 });
 
 console.log(`\n${pass} passed, ${failures.length} failed`);

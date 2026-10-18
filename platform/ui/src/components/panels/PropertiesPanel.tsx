@@ -152,6 +152,23 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
             && typeof value === 'string'
             && value.length > 0
         ) {
+            // OAIY's own models and services (`engine:…`, `voice:…`, "Default picture model" among them) are looked
+            // up when the flow runs: nothing of the one they are now is copied in, or the node would keep calling it
+            // after the default changed (and carry this computer's address in the saved flow). What an earlier pick
+            // copied in goes, so it does not win over them.
+            if (/^(engine|voice):/.test(value)) {
+                updateNodeData(selectedNode.id, {
+                    service: value,
+                    endpoint: undefined,
+                    method: undefined,
+                    headers: undefined,
+                    bodyTemplate: undefined,
+                    responseType: undefined,
+                    responsePath: undefined,
+                    model: undefined,
+                });
+                return;
+            }
             const svc = getService(value);
             if (svc) {
                 const patch: Record<string, unknown> = { service: value };

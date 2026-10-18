@@ -1,7 +1,9 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { flushSync } from 'react-dom';
-import { useNodesState, useEdgesState, type Node, type Edge, addEdge, type Connection, type EdgeChange } from '@xyflow/react';
+import { useNodesState, useEdgesState, type Node, type Edge, addEdge, reconnectEdge, type Connection, type EdgeChange } from '@xyflow/react';
 import { v4 as uuidv4 } from 'uuid';
+import { reachesUntrusted } from '../lib/flowIds';
+import { triggerDownloadFromBlob } from '../lib/download';
 import { invoke } from '@tauri-apps/api/core';
 import type { NodeType, LogEntry, WorkflowGraph, Flow, DatabaseRequest, DatabaseResult, ProjectSettings } from 'oaiy-core';
 import { createRuntime, extractNodeOutputs, getModuleLoader } from 'oaiy-core';
@@ -59,6 +61,23 @@ const isHeavyRunOutput = (value: unknown): boolean => {
   if (value.length > 4096 && /^(iVBORw0KGgo|\/9j\/|R0lGOD|UklGR)/.test(value)) return true;
   return false;
 };
+
+/** The largest file an input node keeps with the flow (as the characters of its content): about 3 MB of picture. */
+const INPUT_FILE_KEPT_CHARS = 4 * 1024 * 1024;
+
+/** What of a canvas node's layout is kept with the flow: the group box it sits in, and a box's size. */
+function layoutOf(n: Node): { parentId?: string; extent?: 'parent'; style?: { width?: number; height?: number } } {
+  const out: { parentId?: string; extent?: 'parent'; style?: { width?: number; height?: number } } = {};
+  if (n.parentId) out.parentId = n.parentId;
+  if (n.extent === 'parent') out.extent = 'parent';
+  if (n.type === 'group') {
+    const style = (n.style ?? {}) as { width?: unknown; height?: unknown };
+    const width = typeof n.width === 'number' ? n.width : typeof style.width === 'number' ? style.width : n.measured?.width;
+    const height = typeof n.height === 'number' ? n.height : typeof style.height === 'number' ? style.height : n.measured?.height;
+    if (typeof width === 'number' && typeof height === 'number') out.style = { width, height };
+  }
+  return out;
+}
 
 // Initial demo nodes - ComfyUI Image Generation
 // Demonstrates: Text Input -> Image Gen (ComfyUI) -> Output
@@ -155,7 +174,17 @@ function currentProjectIsUntrusted(): boolean {
   }
 }
 
+/**
+ * Whether a run must be hardened: the project was marked (an older import), or the flow run (`flowId`), or one it
+ * calls (a Subflow or macro, at any depth, among `flows`), is a shared flow marked untrusted where it was brought in.
+ */
+export function runIsUntrusted(flowId: string | undefined, graph: { nodes?: unknown[] }, flows: Flow[]): boolean {
+  return currentProjectIsUntrusted() || reachesUntrusted(flowId, graph, flows);
+}
+
 interface UseWorkflowOptions {
+  /** The flow on the canvas (a shared, untrusted one runs hardened). */
+  flowId?: string;
   availableFlows?: Flow[];
   initialGraph?: WorkflowGraph;
   onGraphChange?: (graph: WorkflowGraph) => void;
@@ -164,7 +193,9 @@ interface UseWorkflowOptions {
 }
 
 export function useWorkflow(options: UseWorkflowOptions = {}) {
-  const { availableFlows = [], initialGraph, onGraphChange, projectSettings } = options;
+  const { availableFlows = [], initialGraph, onGraphChange, projectSettings, flowId } = options;
+  const flowIdRef = useRef(flowId);
+  flowIdRef.current = flowId;
 
   // Store project settings in a ref for use in save logic
   const projectSettingsRef = useRef(projectSettings);
@@ -483,6 +514,8 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       position: n.position
         ? { x: Math.round(n.position.x), y: Math.round(n.position.y) }
         : undefined,
+      parentId: n.parentId,
+      size: n.style ? [Math.round(n.style.width ?? 0), Math.round(n.style.height ?? 0)] : undefined,
       data: Object.fromEntries(
         Object.entries(n.data || {}).filter(([key]) =>
           !key.startsWith('_') && !defaultProviderFields.has(key) && !RUN_OUTPUT_FIELDS.has(key)
@@ -506,55 +539,30 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
     return JSON.stringify({ nodes: normalizedNodes, edges: normalizedEdges });
   }, []);
 
-  // Store normalized original graph for comparison
-  // We use startingState (which has migrations applied) rather than initialGraph
-  // This ensures the comparison accounts for edge handle migrations
-  const originalGraphRef = useRef<string | null>(null);
-  if (originalGraphRef.current === null && startingState.nodes.length > 0) {
-    // Convert startingState (React Flow format) back to WorkflowGraph for comparison
-    const originalGraph: WorkflowGraph = {
-      nodes: startingState.nodes.map(n => ({
-        id: n.id,
-        type: n.type as NodeType,
-        data: n.data || {},
-      })),
-      edges: startingState.edges.map(e => ({
-        source: e.source,
-        target: e.target,
-        sourceHandle: e.sourceHandle || undefined,
-        targetHandle: e.targetHandle || undefined,
-      })),
-    };
-    originalGraphRef.current = normalizeGraphForComparison(originalGraph);
-  }
-
-  // Notify parent of graph changes (for project persistence)
-  useEffect(() => {
-    // Don't notify while running (nodes have temporary _status data)
-    if (isRunning || !onGraphChangeRef.current) return;
-
-    // Skip persistence while a node is actively being dragged — ReactFlow
-    // fires onNodesChange every frame, so persisting here would setProject at
-    // ~60fps. The final drag-end change (dragging back to false) still fires
-    // this effect, so the settled position is persisted exactly once.
-    if (nodes.some((n) => n.dragging)) return;
-
+  // The graph saved with the flow from what is on the canvas: run outputs, temporary fields and inherited
+  // defaults left out. (The same for what was opened, so an unchanged flow compares equal and is not rewritten.)
+  const canvasToGraph = (nodes: Node[], edges: Edge[]): WorkflowGraph => {
     // Allow persistent underscore fields through (macro data, collapsed state)
     const persistentUnderscoreFields = ['_macroWorkflowId', '_macroName', '_macroInputs', '_macroOutputs', '_collapsed'];
 
     // Convert React Flow state back to WorkflowGraph
-    const graph: WorkflowGraph = {
+    return {
       nodes: nodes.map((n) => {
         // First strip inherited defaults (before filtering underscore fields)
         // This ensures auto-applied defaults aren't saved, preventing false modifications
         const strippedData = stripInheritedDefaults(n.data, n.type as string);
 
+        // An input node's file (a picture dropped on Input: File) is what the person gave the flow, not a run
+        // output: kept, up to a size this browser's storage can hold; its preview is the same picture, not kept twice.
+        const inputFile = String(n.type).startsWith('input_');
         // Then filter out temporary underscore fields + heavy run outputs
         const cleanedData = Object.fromEntries(
           Object.entries(strippedData).filter(([key, value]) => {
             // Drop transient run outputs so they're never baked into the saved flow
             // (re-applied live each run; persisting them revives stale outputs on reload).
             if (RUN_OUTPUT_FIELDS.has(key)) return false;
+            if (inputFile && key === 'imagePreview' && value === strippedData.fileContent) return false;
+            if (inputFile && key === 'fileContent') return typeof value !== 'string' || value.length <= INPUT_FILE_KEPT_CHARS;
             // Drop heavy run outputs (generated images, large blobs) so they
             // don't bloat the persisted project or blow the localStorage quota.
             if (isHeavyRunOutput(value)) return false;
@@ -571,6 +579,8 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
           type: n.type as NodeType,
           data: cleanedData,
           position: n.position, // Preserve position for re-loading
+          // A grouped node's box (Ctrl+G), and a box's size: kept, or the group falls apart on reload.
+          ...layoutOf(n),
         };
       }),
       edges: edges.map((e) => ({
@@ -580,6 +590,30 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
         targetHandle: e.targetHandle || undefined,
       })),
     };
+  };
+
+  // Store normalized original graph for comparison
+  // We use startingState (which has migrations applied) rather than initialGraph
+  // This ensures the comparison accounts for edge handle migrations
+  // (as it is saved, positions and groups included: the baseline once lacked the positions, so it never matched and
+  // every open rewrote the flow; after each save it is the graph last saved)
+  const originalGraphRef = useRef<string | null>(null);
+  if (originalGraphRef.current === null && startingState.nodes.length > 0) {
+    originalGraphRef.current = normalizeGraphForComparison(canvasToGraph(startingState.nodes, startingState.edges));
+  }
+
+  // Notify parent of graph changes (for project persistence)
+  useEffect(() => {
+    // Don't notify while running (nodes have temporary _status data)
+    if (isRunning || !onGraphChangeRef.current) return;
+
+    // Skip persistence while a node is actively being dragged — ReactFlow
+    // fires onNodesChange every frame, so persisting here would setProject at
+    // ~60fps. The final drag-end change (dragging back to false) still fires
+    // this effect, so the settled position is persisted exactly once.
+    if (nodes.some((n) => n.dragging)) return;
+
+    const graph = canvasToGraph(nodes, edges);
 
     // Compare with original - only notify if actually changed
     const currentNormalized = normalizeGraphForComparison(graph);
@@ -587,8 +621,21 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       return;
     }
 
+    originalGraphRef.current = currentNormalized;
     onGraphChangeRef.current(graph);
   }, [nodes, edges, isRunning, normalizeGraphForComparison]);
+
+  // A wire's end dragged to another handle (the canvas lets wires be picked up): moved there, the input it lands on
+  // taking only it, as a new wire does.
+  const onReconnect = useCallback((oldEdge: Edge, connection: Connection) => {
+    if (connection.source === connection.target) return;
+    setEdges((eds) => {
+      const others = eds.filter(
+        (e) => e.id === oldEdge.id || e.target !== connection.target || (e.targetHandle ?? null) !== (connection.targetHandle ?? null),
+      );
+      return reconnectEdge(oldEdge, connection, others);
+    });
+  }, [setEdges]);
 
   // Add a new node at the center of the viewport
   // Returns the ID of the created node
@@ -637,7 +684,27 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
     // Prevent self-loop connections (node connecting to itself)
     if (connection.source === connection.target) return;
 
-    setEdges((eds) => addEdge({ ...connection, id: `e-${uuidv4().slice(0, 8)}` }, eds));
+    // An input takes one wire: a new one into a connected input replaces the old (the run read the first, so the
+    // old prompt was still used after a rewire). Not where both come after a condition (its branches meeting
+    // again, of which one runs: the run takes whichever has a value).
+    setEdges((eds) => {
+      const gated = new Set<string>();
+      const queue = nodes.filter((n) => n.type === 'condition').map((n) => n.id);
+      while (queue.length) {
+        const id = queue.shift()!;
+        if (gated.has(id)) continue;
+        gated.add(id);
+        for (const e of eds) if (e.source === id) queue.push(e.target);
+      }
+      const fromBranch = !!connection.source && gated.has(connection.source);
+      const kept = eds.filter(
+        (e) =>
+          e.target !== connection.target ||
+          (e.targetHandle ?? null) !== (connection.targetHandle ?? null) ||
+          (fromBranch && gated.has(e.source)),
+      );
+      return addEdge({ ...connection, id: `e-${uuidv4().slice(0, 8)}` }, kept);
+    });
 
     // Propagate data from source to target node for certain node type combinations
     if (connection.source && connection.target) {
@@ -1070,13 +1137,13 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
     // engages Web Worker isolation + the permission gate, granting only benign capabilities so a
     // malicious logic_block can't run arbitrary JS / steal API keys in this origin. The user's own
     // flows (no marker) stay trusted/unchanged. See engine-security review finding #2.
-    if (currentProjectIsUntrusted()) {
+    if (runIsUntrusted(flowIdRef.current, graph, availableFlowsRef.current)) {
       runtime.setFlowContext('imported-flow', UNTRUSTED_PACKAGE_ID);
       runtime.setPackagePermissions(UNTRUSTED_FLOW_PERMISSIONS);
       addLog({
         source: 'Security',
         message:
-          'Imported/shared project — running sandboxed (untrusted): code blocks and secret access are disabled.',
+          'A shared flow (or one it calls) — running sandboxed: code blocks and saved secrets are disabled.',
         type: 'info',
       });
     }
@@ -1296,13 +1363,8 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
   const saveWorkflow = useCallback(() => {
     const workflow = prepareWorkflowForExport(nodes, edges);
 
-    const blob = new Blob([JSON.stringify(workflow, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `oaiy-workflow-${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    // (revoked at once, WebKit lost the download: the shared helper gives it a beat)
+    triggerDownloadFromBlob(`oaiy-workflow-${Date.now()}.json`, new Blob([JSON.stringify(workflow, null, 2)], { type: 'application/json' }));
 
     addLog({
       source: 'System',
@@ -1433,6 +1495,7 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
     onNodesChange,
     onEdgesChange,
     onConnect,
+    onReconnect,
     addNode,
     updateNodeData,
     runWorkflow,

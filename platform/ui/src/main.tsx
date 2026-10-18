@@ -26,8 +26,8 @@ import { currentAvailabilityEnv } from './lib/availabilityEnv';
 // Every Service dropdown: OAIY's engine models, the desktop's services (Python
 // rigs, ComfyUI …) and the user's own, grouped, with "Add a service…" last.
 registerDynamicOptionsResolver('service:list', (rest: string) =>
-  serviceOptions(rest, currentAvailabilityEnv(), (nodeType) => {
-    void import('./lib/addServiceDialog').then((m) => m.openAddServiceDialog(nodeType));
+  serviceOptions(rest, currentAvailabilityEnv(), (nodeType, choose) => {
+    void import('./lib/addServiceDialog').then((m) => m.openAddServiceDialog(nodeType, choose));
   }),
 );
 // A node in a flow whose service is not installed says so on the node.

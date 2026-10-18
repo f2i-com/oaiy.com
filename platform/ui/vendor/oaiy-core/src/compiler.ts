@@ -217,6 +217,16 @@ export class OAIYCompiler {
    * ```
    */
   compile(graph: WorkflowGraph, inputs?: WorkflowInputs): string {
+    // A group box (Ctrl+G) is the canvas's layout, not a step: it is left out, with any wire to it, rather than
+    // refused as a node type this build cannot run.
+    if (graph.nodes.some((n) => (n.type as string) === 'group')) {
+      const boxes = new Set(graph.nodes.filter((n) => (n.type as string) === 'group').map((n) => n.id));
+      graph = {
+        ...graph,
+        nodes: graph.nodes.filter((n) => !boxes.has(n.id)),
+        edges: graph.edges.filter((e) => !boxes.has(e.source) && !boxes.has(e.target)),
+      };
+    }
     const endTimer = metrics.startTimer('compilation');
     metrics.increment('compilations');
     metrics.setGauge('lastCompilationNodes', graph.nodes.length);

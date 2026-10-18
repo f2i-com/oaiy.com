@@ -39,7 +39,7 @@ export interface UseQuickConnectOptions {
   reactFlowInstance: React.MutableRefObject<{
     screenToFlowPosition: (position: { x: number; y: number }) => { x: number; y: number };
   } | null>;
-  /** Delay in ms before showing quick connect popup (default: 2000) */
+  /** Delay in ms before showing quick connect popup (default: 900) */
   showDelay?: number;
 }
 
@@ -56,8 +56,10 @@ export function useQuickConnect({
   addNode,
   onConnect,
   reactFlowInstance,
-  showDelay = 2000,
+  showDelay = 900,
 }: UseQuickConnectOptions) {
+  // Shows the popup for the wire being drawn, at a point (set as the drag starts)
+  const showAtRef = useRef<((pos: { x: number; y: number }) => void) | null>(null);
   // Quick-connect state for connection drag
   const [quickConnectState, setQuickConnectState] = useState<QuickConnectState | null>(null);
   const quickConnectTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -98,10 +100,8 @@ export function useQuickConnect({
       }
     }
 
-    // Start timer to show quick-connect popup
-    quickConnectTimerRef.current = setTimeout(() => {
-      const pos = connectionDragPositionRef.current || { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-
+    // Start timer to show quick-connect popup (or show it at once where the wire is let go on the empty canvas)
+    const showAt = (pos: { x: number; y: number }) => {
       // Get the source handle element position for drawing connection line
       let sourceHandlePosition: { x: number; y: number } | null = null;
       const handleSelector = `[data-nodeid="${params.nodeId}"][data-handleid="${params.handleId}"]`;
@@ -127,11 +127,15 @@ export function useQuickConnect({
         searchQuery: '',
         sourceHandlePosition,
       });
+    };
+    showAtRef.current = showAt;
+    quickConnectTimerRef.current = setTimeout(() => {
+      showAt(connectionDragPositionRef.current || { x: window.innerWidth / 2, y: window.innerHeight / 2 });
     }, showDelay);
   }, [nodes, moduleNodes, handleConnectionDragMove, showDelay]);
 
   // Handle connection drag end - clear timer but keep popup if visible
-  const handleConnectEnd = useCallback(() => {
+  const handleConnectEnd = useCallback((event?: MouseEvent | TouchEvent, connection?: { isValid?: boolean | null; toNode?: unknown }) => {
     // Clear the timer
     if (quickConnectTimerRef.current) {
       clearTimeout(quickConnectTimerRef.current);
@@ -140,6 +144,16 @@ export function useQuickConnect({
 
     // Stop tracking mouse position
     document.removeEventListener('mousemove', handleConnectionDragMove);
+
+    // A wire let go on the empty canvas (no handle, no node under it) offers the nodes to put there, as a hold does
+    const target = event?.target as Element | null | undefined;
+    if (!quickConnectVisibleRef.current && connection && !connection.isValid && !connection.toNode && target?.closest?.('.react-flow__pane')) {
+      const point = 'changedTouches' in (event as TouchEvent) ? (event as TouchEvent).changedTouches[0] : (event as MouseEvent);
+      if (point) showAtRef.current?.({ x: point.clientX, y: point.clientY });
+      showAtRef.current = null;
+      return;
+    }
+    showAtRef.current = null;
 
     // If popup is NOT visible, reset state
     // If popup IS visible, keep it open so user can select a node

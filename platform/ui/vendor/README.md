@@ -26,6 +26,26 @@ project-constant wiring (`setProjectConstants` + `ctx.getConstant`) that lets
 the web runtime resolve API-key constants (e.g. `OPENAI_API_KEY`) at run time —
 see the "BYOK from the wizard" fix.
 
+From the flow-editor review (2026-10-18), to carry over on a re-sync (or to
+upstream into `oaiy/packages/*`):
+
+- `oaiy-core/src/types.ts`: `GraphNode` has `parentId`, `extent` and `style`
+  (`width`/`height`), so a flow keeps its groups (Ctrl+G) when saved.
+- `oaiy-core/src/compiler.ts`: `compile()` leaves out `group` nodes (and any
+  edge touching one) before compiling: a box on the canvas, not a step.
+- `oaiy-core/src/constants.ts` + `oaiy-core/src/queue/JobManager.ts`: the
+  queue's history keeps its newest `MAX_FULL_JOB_HISTORY` (10) runs whole; older
+  ones keep their timing, status and last `SLIM_JOB_HISTORY_LOGS` (50) logs
+  (50 whole runs held every picture they made in memory).
+- `oaiy-core/src/module-types.ts` and
+  `oaiy-ui-components/src/nodes/fields/SelectField.tsx`: an option's `action`
+  is given a `choose(value)` to pick a value afterwards ("Add a service…"
+  picks the service added); SelectField passes its `onChange`.
+- `oaiy-ui-components/src/nodes/fields/SelectField.tsx` (the stored value that
+  is not listed) and `oaiy-ui-components/src/nodes/GenericNode.tsx` (the card's
+  summary): a paired worker's model (`engine:<kind>:node.<id>/<model>`) is
+  shown as "<model> on a paired computer", not its id.
+
 ## Re-syncing from upstream (optional)
 
 If you ever want to pull newer upstream source, re-copy `src/` from the

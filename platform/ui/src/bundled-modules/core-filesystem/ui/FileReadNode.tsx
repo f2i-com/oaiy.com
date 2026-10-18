@@ -64,16 +64,16 @@ function FileReadNode({ data }: FileReadNodeProps) {
   // Color coding for different modes
   const getModeColor = () => {
     switch (readAs) {
-      case 'json': return 'text-amber-400';
-      case 'csv': return 'text-purple-400';
-      case 'lines': return 'text-cyan-400';
-      case 'base64': return 'text-emerald-400';
-      default: return 'text-blue-400';
+      case 'json': return 'text-amber-700 dark:text-amber-400';
+      case 'csv': return 'text-purple-700 dark:text-purple-400';
+      case 'lines': return 'text-cyan-700 dark:text-cyan-400';
+      case 'base64': return 'text-emerald-700 dark:text-emerald-400';
+      default: return 'text-blue-700 dark:text-blue-400';
     }
   };
 
   const collapsedPreview = (
-    <div className="text-slate-400">
+    <div className="text-slate-600 dark:text-slate-400">
       <span className={`text-[10px] ${getModeColor()}`}>
         {currentMode.label}
       </span>
@@ -84,12 +84,12 @@ function FileReadNode({ data }: FileReadNodeProps) {
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'path', type: 'target', position: Position.Left, color: '!bg-emerald-500', label: 'path', labelColor: 'text-emerald-400', size: 'md' },
+    { id: 'path', type: 'target', position: Position.Left, color: '!bg-emerald-500', label: 'path', labelColor: 'text-emerald-700 dark:text-emerald-400', size: 'md' },
   ], []);
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'content', type: 'source', position: Position.Right, color: '!bg-emerald-500', label: 'content', labelColor: 'text-emerald-400', size: 'lg' },
-    { id: 'info', type: 'source', position: Position.Right, color: '!bg-slate-500', label: 'info', labelColor: 'text-slate-400', size: 'sm' },
+    { id: 'content', type: 'source', position: Position.Right, color: '!bg-emerald-500', label: 'content', labelColor: 'text-emerald-700 dark:text-emerald-400', size: 'lg' },
+    { id: 'info', type: 'source', position: Position.Right, color: '!bg-slate-500', label: 'info', labelColor: 'text-slate-600 dark:text-slate-400', size: 'sm' },
   ], []);
 
   return (
@@ -142,7 +142,7 @@ function FileReadNode({ data }: FileReadNodeProps) {
 
       {/* Current File Preview */}
       {data._fileName && (
-        <div className="flex items-center gap-2 px-2 py-1.5 bg-emerald-900/20 border border-emerald-600/30 rounded text-emerald-400 text-xs truncate">
+        <div className="flex items-center gap-2 px-2 py-1.5 bg-emerald-900/20 border border-emerald-600/30 rounded text-emerald-700 dark:text-emerald-400 text-xs truncate">
           <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
           </svg>

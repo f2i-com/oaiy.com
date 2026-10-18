@@ -8,6 +8,16 @@
 import { useCallback, useRef, type CSSProperties } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import type { Node, Edge } from '@xyflow/react';
+import { RUN_OUTPUT_FIELDS } from '../utils/runOutputs';
+
+/** A node's field holding a key, password or token (not the NAME of a project constant: `apiKeyConstant`). */
+const SECRET_FIELD = /api_?key|password|secret|token|authorization/i;
+
+/** A value too large or too media-like to copy: a picture, a clip, a big blob. */
+function heavy(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(heavy) || JSON.stringify(value).length > 64 * 1024;
+  return typeof value === 'string' && (value.length > 64 * 1024 || /^data:(image|video|audio)\//i.test(value));
+}
 
 const CLIPBOARD_KEY = 'oaiy_workflow_clipboard';
 
@@ -125,11 +135,15 @@ export function useClipboard({
         ...(typeof n.width === 'number' ? { width: n.width } : {}),
         ...(typeof n.height === 'number' ? { height: n.height } : {}),
         data: Object.fromEntries(
-          Object.entries(n.data as Record<string, unknown>).filter(([key]) => {
+          Object.entries(n.data as Record<string, unknown>).filter(([key, value]) => {
             // Keep persistent underscore fields
             if (PERSISTENT_UNDERSCORE_FIELDS.includes(key)) return true;
             // Strip other underscore-prefixed fields (like _status)
             if (key.startsWith('_')) return false;
+            // Not a run's outputs, pictures or large values (they filled this browser's storage, and the paste was
+            // then the clipboard before), nor a key or password typed into the node (kept in storage with no end).
+            if (RUN_OUTPUT_FIELDS.has(key) || heavy(value)) return false;
+            if (SECRET_FIELD.test(key) && !key.endsWith('Constant')) return false;
             return true;
           })
         ),

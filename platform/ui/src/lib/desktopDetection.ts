@@ -42,8 +42,26 @@ import { hasSavedDesktopLink } from './desktopLink';
 // Which window this is, read as the page loads, before any flow or other script of the person's runs (shared/capabilities/host.ts).
 pageHost();
 
+/**
+ * Where OAIY's window says its desktop is (it gives the page its address), read as the page loads, as the window is:
+ * the desktop on a port of its own (another app had 17972) was asked about at the engine address, found missing, and
+ * the pickers emptied. Null in a browser tab, which asks at the engine address.
+ */
+const givenOrigin: string | null = (() => {
+  if (pageHost().kind !== 'oaiy-window') return null;
+  const given = (globalThis as { __OAIY_DESKTOP__?: { origin?: unknown } }).__OAIY_DESKTOP__;
+  return given && typeof given.origin === 'string' && given.origin ? given.origin.replace(/\/+$/, '') : null;
+})();
+
+/** The address this page asks the desktop at, now. */
+function probeBase(): string {
+  return givenOrigin ?? getEngineBase();
+}
+
 const POLL_INTERVAL_MS = 10_000;
 const FETCH_TIMEOUT_MS = 1500;
+/** Probes of the poll missing in a row before a desktop that was there is said to be gone (one late answer is not). */
+const MISSES_BEFORE_GONE = 3;
 
 export interface DesktopInfo {
   /**
@@ -67,9 +85,11 @@ type Listener = (info: DesktopInfo) => void;
 let current: DesktopInfo = {
   checked: false,
   available: false,
-  baseUrl: getEngineBase(),
+  baseUrl: probeBase(),
   lastChange: Date.now(),
 };
+/** The poll's probes that missed in a row, of a desktop that was there. */
+let misses = 0;
 
 const listeners = new Set<Listener>();
 let pollTimer: number | null = null;
@@ -78,16 +98,16 @@ let pollPromise: Promise<void> | null = null;
 /** Bumped by Disconnect: an answer that was asked for before it is not about the link that is there now. */
 let generation = 0;
 
-async function probeOnce(): Promise<void> {
+async function probeOnce(asked = false): Promise<void> {
   // The address this probe asks about: the setting as it is now. If the person
   // changes it while the answer is on its way, that answer is about a desktop
   // they no longer point at (a probe of the new address is already running, see
   // subscribeEngineBase below) and must not be published over it.
-  const base = getEngineBase();
+  const base = probeBase();
   // A Disconnect while this is on its way is a change of mind about the very thing it answers: its answer is dropped, as one about an address
   // that has since changed is.
   const gen = generation;
-  const stale = () => getEngineBase() !== base || gen !== generation;
+  const stale = () => probeBase() !== base || gen !== generation;
   try {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -112,6 +132,7 @@ async function probeOnce(): Promise<void> {
       // desktop-backed nodes at a stranger.
       const isOaiyCompanion = body?.product === 'oaiy-desktop';
       if (stale()) return;
+      misses = 0;
       const next: DesktopInfo = {
         checked: true,
         available: isOaiyCompanion,
@@ -131,6 +152,10 @@ async function probeOnce(): Promise<void> {
     // and would flood the console otherwise.
   }
   if (stale()) return;
+  // A desktop that was there and misses one poll (busy loading a model, the network blinking) is kept for a few more:
+  // one miss emptied every picker in the editor. Asked on purpose (Connect, Check again), the answer is the answer.
+  if (!asked && current.available && current.baseUrl === base && ++misses < MISSES_BEFORE_GONE) return;
+  misses = 0;
   publish({
     checked: true,
     available: false,
@@ -202,7 +227,8 @@ export function stopDesktopDetection(): void {
 export function resetDesktopDetection(): void {
   generation++;
   stopDesktopDetection();
-  publish({ checked: false, available: false, baseUrl: getEngineBase(), lastChange: current.available ? Date.now() : current.lastChange });
+  misses = 0;
+  publish({ checked: false, available: false, baseUrl: probeBase(), lastChange: current.available ? Date.now() : current.lastChange });
 }
 
 /** Snapshot of the current companion status. */
@@ -235,7 +261,7 @@ export function subscribeDesktopStatus(listener: Listener): () => void {
  * the UI to refresh without waiting for the next tick.
  */
 export async function refreshDesktopStatus(): Promise<DesktopInfo> {
-  await probeOnce();
+  await probeOnce(true);
   return current;
 }
 

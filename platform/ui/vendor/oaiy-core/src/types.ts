@@ -66,6 +66,12 @@ export interface GraphNode {
   data: Record<string, unknown>;
   /** Optional position for UI persistence */
   position?: { x: number; y: number };
+  /** The group box it sits in (its position then relative to the box), for UI persistence */
+  parentId?: string;
+  /** Kept inside its group box */
+  extent?: 'parent';
+  /** A group box's size, for UI persistence */
+  style?: { width?: number; height?: number };
 }
 
 /**

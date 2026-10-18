@@ -21,7 +21,7 @@ import {
   revertMacroOverride,
 } from '../utils/userMacroStorage';
 import { createLogger } from '../utils/logger';
-import { useDesktopFlows } from './useDesktopFlows';
+import { forgetDesktopSync, markDeletedHere, projectWritten, useDesktopFlows } from './useDesktopFlows';
 
 const logger = createLogger('Project');
 import {
@@ -92,6 +92,8 @@ async function loadMacrosFromFolder(): Promise<Flow[]> {
 }
 
 const PROJECT_STORAGE_KEY = 'oaiy_project';
+/** The flow open last, opened again at the next start. */
+const ACTIVE_FLOW_KEY = 'oaiy-active-flow';
 const RUN_HISTORY_KEY = 'oaiy_run_history';
 const MAX_RUN_HISTORY = 50;
 
@@ -169,7 +171,27 @@ export function useProject() {
   // Equivalent: loaded case -> project.flows === parsed.flows; demo case ->
   // project.flows === [...defaultExampleFlows]. (Do NOT hoist loadProjectFromStorage
   // to the hook body — that would parse on every render.)
-  const [activeFlowId, setActiveFlowId] = useState<string | null>(() => project.flows[0]?.id ?? null);
+  // The flow opened: one a shared link just added, else the one open last time, else the first.
+  const [activeFlowId, setActiveFlowId] = useState<string | null>(() => {
+    const has = (id: string | null) => !!id && project.flows.some((f) => f.id === id);
+    try {
+      const shared = sessionStorage.getItem('oaiy-open-flow');
+      sessionStorage.removeItem('oaiy-open-flow');
+      if (has(shared)) return shared;
+      const last = localStorage.getItem(ACTIVE_FLOW_KEY);
+      if (has(last)) return last;
+    } catch {
+      /* no storage: the first flow */
+    }
+    return project.flows[0]?.id ?? null;
+  });
+  useEffect(() => {
+    try {
+      if (activeFlowId) localStorage.setItem(ACTIVE_FLOW_KEY, activeFlowId);
+    } catch {
+      /* no storage: the first flow next time */
+    }
+  }, [activeFlowId]);
   const [runHistory, setRunHistory] = useState<RunRecord[]>(loadRunHistory);
   const [resetCounter, setResetCounter] = useState(0);
   const [userDataLoaded, setUserDataLoaded] = useState(false);
@@ -177,6 +199,10 @@ export function useProject() {
   const [macroOverrideIds, setMacroOverrideIds] = useState<Set<string>>(new Set());
   // Track original macro states for dirty detection (from disk or saved override)
   const [originalMacroStates, setOriginalMacroStates] = useState<Map<string, Flow>>(new Map());
+
+  /** The project as it is now, for callbacks run later (a macro's autosave). */
+  const latestProjectRef = useRef(project);
+  latestProjectRef.current = project;
 
   // In OAIY's window, the desktop's flows and these are the same flows. The
   // canvas holds the open flow's nodes itself: one changed there is shown anew.
@@ -338,7 +364,10 @@ export function useProject() {
   // stutter while editing and write the full blob dozens of times a second.
   // The latest pending snapshot is always flushed on unmount and on pagehide
   // (tab close / navigation), so the debounce never costs the user data.
-  const writeProjectToStorage = useCallback((proj: OAIYProject) => {
+  // What the "Saved" label says: written, waiting for the pause, or not written (this browser's storage full).
+  const [saveState, setSaveState] = useState<'saved' | 'saving' | 'not-saved'>('saved');
+
+  const writeProjectToStorage = useCallback((proj: OAIYProject): boolean => {
     try {
       const flowsToSave = proj.flows.filter(flow => !flow.isBuiltIn);
       const projectToSave = {
@@ -348,6 +377,10 @@ export function useProject() {
       };
       localStorage.setItem(PROJECT_STORAGE_KEY, JSON.stringify(projectToSave));
       markStorageWriteSucceeded(); // re-arm the quota warning for a later failure
+      // (what the editor and the desktop last agreed is saved with the project, never ahead of it)
+      projectWritten();
+      setSaveState('saved');
+      return true;
     } catch (error) {
       if (import.meta.env.DEV) {
         logger.warn('Failed to save project', { error });
@@ -357,6 +390,8 @@ export function useProject() {
       // loses every change made after the quota was hit. No-op for
       // non-quota errors (e.g. serialization bugs).
       notifyStorageQuotaExceeded('project', error);
+      setSaveState('not-saved');
+      return false;
     }
   }, []);
 
@@ -366,6 +401,7 @@ export function useProject() {
 
   useEffect(() => {
     pendingProjectRef.current = project;
+    setSaveState((was) => (was === 'not-saved' ? was : 'saving'));
     if (projectSaveTimerRef.current) clearTimeout(projectSaveTimerRef.current);
     projectSaveTimerRef.current = setTimeout(() => {
       projectSaveTimerRef.current = null;
@@ -375,6 +411,17 @@ export function useProject() {
     // project change and flushing there would defeat the debounce. The flush
     // lives in the mount/unmount effect below.
   }, [project, writeProjectToStorage]);
+
+  /** Write the project now, not after the pause (Cmd+S): whether it was written. */
+  const saveNow = useCallback((): boolean => {
+    if (projectSaveTimerRef.current) {
+      clearTimeout(projectSaveTimerRef.current);
+      projectSaveTimerRef.current = null;
+    }
+    const pending = pendingProjectRef.current;
+    if (!pending) return true;
+    return writeProjectToStorage(pending);
+  }, [writeProjectToStorage]);
 
   // Flush the latest pending project on unmount + pagehide so a debounced
   // write in flight is never lost to a tab close / reload / navigation.
@@ -486,6 +533,18 @@ export function useProject() {
   }, []);
 
   const deleteFlow = useCallback((flowId: string) => {
+    const flow = latestProjectRef.current.flows.find((f) => f.id === flowId);
+    // A built-in macro comes from the macros folder and is there again on reload: it is reverted, not deleted. A macro
+    // of the person's own is deleted where it is kept too, or it came back on reload.
+    if (flow?.isMacro && flow.isBuiltIn) {
+      logger.warn(`Cannot delete the built-in macro "${flow.name}": revert it instead`);
+      return;
+    }
+    if (flow?.isMacro && isUserCreatedMacro(flow)) {
+      void deleteUserMacroFromStorage(flowId).catch((e) => logger.warn(`Could not delete the macro "${flow.name}" from storage`, { error: e }));
+    }
+    // (deleted by the person: in OAIY's window, removed on the desktop too)
+    markDeletedHere(flowId);
     // Use functional updates to avoid stale closure issues
     setProject((prev) => {
       const remaining = prev.flows.filter((f) => f.id !== flowId);
@@ -511,8 +570,12 @@ export function useProject() {
     if (!source) return null;
 
     const now = new Date().toISOString();
+    // A copy is the person's own: not a built-in (which is never saved, so the copy was gone on reload), not a demo,
+    // and not given to other apps until they say so. A shared flow's copy runs sandboxed as the flow does.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { isBuiltIn, isDemo, remote, ...own } = source;
     const newFlow: Flow = {
-      ...source,
+      ...own,
       id: uuidv4(),
       name: `${source.name} (Copy)`,
       createdAt: now,
@@ -538,6 +601,8 @@ export function useProject() {
   }, [updateFlow]);
 
   const setFlowLocalOnly = useCallback((flowId: string, localOnly: boolean) => {
+    // (kept in this window only: its copy on the desktop is removed, not left there going stale)
+    if (localOnly) markDeletedHere(flowId);
     updateFlow(flowId, { localOnly });
   }, [updateFlow]);
 
@@ -640,7 +705,8 @@ export function useProject() {
    * Check if a macro has unsaved changes (in-memory edits not yet saved to file)
    */
   const isMacroDirty = useCallback((flowId: string): boolean => {
-    const currentFlow = project.flows.find(f => f.id === flowId);
+    // (the newest project: a save scheduled after an edit compares what the edit made, not the render before it)
+    const currentFlow = latestProjectRef.current.flows.find(f => f.id === flowId);
     if (!currentFlow || !currentFlow.isBuiltIn) return false;
 
     const originalState = originalMacroStates.get(flowId);
@@ -715,7 +781,9 @@ export function useProject() {
    * Save changes to a macro (handles both built-in overrides and user macros)
    */
   const saveMacroChanges = useCallback(async (flowId: string): Promise<boolean> => {
-    const flow = project.flows.find(f => f.id === flowId);
+    // (the newest project, not the one this callback was made with: the autosave runs it a moment after the last
+    // edit, and saved the version one change behind)
+    const flow = latestProjectRef.current.flows.find(f => f.id === flowId);
     if (!flow) {
       logger.warn(`Cannot save: flow not found ${flowId}`);
       return false;
@@ -1197,6 +1265,8 @@ export function useProject() {
       }
     }
 
+    // (an imported project deletes nothing on the desktop: the flows it lacks come back into it)
+    forgetDesktopSync();
     setProject(importedProject);
     if (importedProject.flows.length > 0) {
       setActiveFlowId(importedProject.flows[0].id);
@@ -1205,6 +1275,8 @@ export function useProject() {
   }, []);
 
   const newProject = useCallback((name?: string) => {
+    // (a new project deletes nothing on the desktop: its flows come back into it)
+    forgetDesktopSync();
     const fresh = createEmptyProject();
     if (name) {
       fresh.name = name;
@@ -1221,6 +1293,8 @@ export function useProject() {
   }, []);
 
   const resetToDefaults = useCallback(() => {
+    // (the desktop's flows are not deleted by a reset: they come back into it)
+    forgetDesktopSync();
     // Clear localStorage and reset to demo project with default example flows
     try {
       localStorage.removeItem(PROJECT_STORAGE_KEY);
@@ -1262,6 +1336,8 @@ export function useProject() {
   }, [project.flows]);
 
   return {
+    saveNow,
+    saveState,
     // Project state
     project,
     activeFlow,

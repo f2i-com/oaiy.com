@@ -966,7 +966,7 @@ function AILLMNode({ data }: AILLMNodeProps) {
         : `External · ${presetLabel}`;
   const collapsedPreview = (
     <div className="text-slate-600 dark:text-slate-400 space-y-0.5">
-      <div className="truncate text-purple-400 font-medium">
+      <div className="truncate text-purple-700 dark:text-purple-400 font-medium">
         {headerLabel}
       </div>
       {effectiveModel && (
@@ -978,10 +978,10 @@ function AILLMNode({ data }: AILLMNodeProps) {
   // Build handle configurations
   const inputHandles = useMemo<HandleConfig[]>(() => {
     const handles: HandleConfig[] = [
-      { id: 'prompt', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'prompt', labelColor: 'text-blue-400', size: 'lg' },
-      { id: 'headers', type: 'target', position: Position.Left, color: '!bg-orange-500', label: 'headers', labelColor: 'text-orange-400', size: 'sm' },
-      { id: 'apiKey', type: 'target', position: Position.Left, color: '!bg-yellow-500', label: 'api key', labelColor: 'text-yellow-400', size: 'sm' },
-      { id: 'history', type: 'target', position: Position.Left, color: '!bg-purple-400', label: 'history', labelColor: 'text-purple-400', size: 'sm' },
+      { id: 'prompt', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'prompt', labelColor: 'text-blue-700 dark:text-blue-400', size: 'lg' },
+      { id: 'headers', type: 'target', position: Position.Left, color: '!bg-orange-500', label: 'headers', labelColor: 'text-orange-700 dark:text-orange-400', size: 'sm' },
+      { id: 'apiKey', type: 'target', position: Position.Left, color: '!bg-yellow-500', label: 'api key', labelColor: 'text-yellow-700 dark:text-yellow-400', size: 'sm' },
+      { id: 'history', type: 'target', position: Position.Left, color: '!bg-purple-400', label: 'history', labelColor: 'text-purple-700 dark:text-purple-400', size: 'sm' },
     ];
     // Add dynamic image input handles - first one uses 'image' to match node definition
     for (let i = 0; i < imageInputCount; i++) {
@@ -991,7 +991,7 @@ function AILLMNode({ data }: AILLMNodeProps) {
         position: Position.Left,
         color: '!bg-pink-500',
         label: imageInputCount === 1 ? 'image' : `image ${i + 1}`,
-        labelColor: 'text-pink-400',
+        labelColor: 'text-pink-700 dark:text-pink-400',
         size: 'sm'
       });
     }
@@ -1008,7 +1008,7 @@ function AILLMNode({ data }: AILLMNodeProps) {
       position: Position.Left,
       color: '!bg-orange-500',
       label: 'video',
-      labelColor: 'text-orange-400',
+      labelColor: 'text-orange-700 dark:text-orange-400',
       size: 'sm',
     });
     return handles;

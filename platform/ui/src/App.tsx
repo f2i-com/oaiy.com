@@ -17,6 +17,9 @@ import PasswordPromptModal from './components/dialogs/PasswordPromptModal';
 import { getCliRunConfig, type CliRunConfig } from './hooks/useCliRunMode';
 import { createLogger } from './utils/logger';
 import { flowWithoutRunOutputs } from './utils/runOutputs';
+import { withNewIds } from './lib/flowIds';
+import { BOOT_NOTICE_KEY } from './lib/bootNotice';
+import { v4 as uuidv4 } from 'uuid';
 
 const logger = createLogger('App');
 
@@ -111,33 +114,52 @@ function App() {
           logger.info('Loaded shared flow', {
             hash: result.hash, isEditable: result.isEditable, title: result.meta.title,
           });
-          // Persist the loaded snapshot through the same key useProject
-          // reads from at init, then strip ?flow= from the URL so a
-          // page reload doesn't re-prompt.
+          // The shared flows join this browser's own project, under ids of their own, never in place of its flows
+          // (useProject reads the same key at init, and opens the first shared flow).
           try {
             const PROJECT_KEY = 'oaiy_project';
             const flowJson = result.flow as { flows?: unknown[]; settings?: unknown; constants?: unknown };
-            localStorage.setItem(PROJECT_KEY, JSON.stringify({
-              version: '1.0.0',
-              name: result.meta.title || 'Shared flow',
-              description: '',
-              createdAt: result.meta.created_at,
-              updatedAt: result.meta.updated_at,
-              // A shared flow arrives without the run outputs its author left in its nodes: an address there is a request when it is shown.
-              flows: Array.isArray(flowJson.flows) ? flowJson.flows.map(flowWithoutRunOutputs) : [],
-              settings: flowJson.settings ?? {},
-              constants: Array.isArray(flowJson.constants) ? flowJson.constants : [],
-              llmEndpoints: [],
-              imageGenEndpoints: [],
-              httpPresets: [],
-              // SECURITY: a shared flow is UNTRUSTED — mark the project so the run path executes it
-              // hardened (worker isolation + permission gate, no code:execute/secrets:read), blocking
-              // a malicious logic_block from running arbitrary JS / stealing API keys in this origin.
-              // Set HERE by the importer, NOT copied from flowJson, so the flow can't unset it.
-              untrusted: true,
-            }));
+            // A shared flow arrives without the run outputs its author left in its nodes: an address there is a request when it is shown.
+            const incoming = (Array.isArray(flowJson.flows) ? flowJson.flows.map(flowWithoutRunOutputs) : [])
+              .filter((f): f is { id: string; name?: string; graph?: { nodes?: unknown[]; edges?: unknown[] } } => !!f && typeof (f as { id?: unknown }).id === 'string');
+            // SECURITY: each shared flow is UNTRUSTED, marked HERE by the importer (never copied from the link, so a
+            // flow can't unset it): it runs hardened (worker isolation + permission gate, no code:execute or
+            // secrets:read), and is not sent to OAIY Desktop. The visitor's own flows keep running as before.
+            const { flows: added } = withNewIds(incoming, uuidv4);
+            const marked = added.map((f) => ({ ...f, untrusted: true }));
+            let own: Record<string, unknown> | null = null;
+            try {
+              own = JSON.parse(localStorage.getItem(PROJECT_KEY) || 'null');
+            } catch {
+              own = null;
+            }
+            const base = own && Array.isArray(own.flows)
+              ? own
+              : {
+                  version: '1.0.0',
+                  name: result.meta.title || 'Shared flow',
+                  description: '',
+                  createdAt: result.meta.created_at,
+                  updatedAt: result.meta.updated_at,
+                  flows: [],
+                  settings: flowJson.settings ?? {},
+                  constants: Array.isArray(flowJson.constants) ? flowJson.constants : [],
+                  llmEndpoints: [],
+                  imageGenEndpoints: [],
+                  httpPresets: [],
+                };
+            localStorage.setItem(PROJECT_KEY, JSON.stringify({ ...base, flows: [...(base.flows as unknown[]), ...marked] }));
+            if (marked[0]) sessionStorage.setItem('oaiy-open-flow', marked[0].id);
+            sessionStorage.setItem(
+              BOOT_NOTICE_KEY,
+              JSON.stringify({
+                kind: 'success',
+                text: `Added ${marked.length === 1 ? `"${marked[0].name || result.meta.title || 'the shared flow'}"` : `${marked.length} shared flows`} from the link. A shared flow runs sandboxed: no code blocks, no saved secrets.`,
+              }),
+            );
           } catch (e) {
             logger.warn('Failed to persist shared flow to localStorage', { e });
+            sessionStorage.setItem(BOOT_NOTICE_KEY, JSON.stringify({ kind: 'error', text: 'The shared flow could not be kept: this browser’s storage is full or unavailable.' }));
           }
           // Drop the query string so a reload doesn't re-fetch + re-prompt.
           const cleanUrl = window.location.origin + window.location.pathname;
@@ -145,6 +167,14 @@ function App() {
         }
       } catch (err) {
         logger.error('Failed to load shared flow', { err });
+        try {
+          sessionStorage.setItem(
+            BOOT_NOTICE_KEY,
+            JSON.stringify({ kind: 'error', text: `The shared flow could not be opened: ${err instanceof Error ? err.message : String(err)}` }),
+          );
+        } catch {
+          /* no storage: the log says it */
+        }
       }
     }
 

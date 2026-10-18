@@ -22,7 +22,7 @@
  */
 import type { RuntimeContext } from 'oaiy-core/src/module-types';
 import type { CustomService } from './examples';
-import { engineDefault, engineKindOf, extractPath, renderContractBody } from './contract';
+import { describeService, engineDefault, engineKindOf, extractPath, remoteModelOf, renderContractBody } from './contract';
 import { getEngineBase } from '../../lib/engineEndpoint';
 
 /** What a contract call gives back. */
@@ -62,6 +62,8 @@ const DESKTOP_ROUTES = ['/api/ai/engine/', '/api/voice/transcribe', '/api/ai/pro
 const WORKER_ROUTE = /^\/api\/network\/nodes\/[A-Za-z0-9]{1,64}\/(gateway\/|v1\/chat\/completions$)/;
 /** How often a job is polled (tests shorten it). */
 export const contractTiming = { pollMs: 2000 };
+/** Polls of a job's status failing in a row before the run gives up on it. */
+const POLL_MISSES = 4;
 const JOB_LIMIT_MS = 3 * 60 * 60 * 1000;
 
 function trimSlash(s: string): string {
@@ -188,9 +190,12 @@ async function resolveAtRun(ctx: RuntimeContext, id: string): Promise<CustomServ
   const kind = engineKindOf(id);
   const found = kind ? engineDefault(services, kind) : services.find((s) => s.id === id);
   if (!found) {
+    const { text, worker } = describeService(id, services);
     throw new Error(
-      `The service "${id}" is not available${why}: its model is not installed in OAIY's Engines, or the engines are not running. ` +
-        'Pick another service, or add the model in Engines.',
+      worker && remoteModelOf(id)
+        ? `${text} is not available${why}: that computer is not paired any more, or does not have the model now (OAIY → Networking). Pick another model.`
+        : `${text.charAt(0).toUpperCase()}${text.slice(1)} is not available${why}: its model is not installed in OAIY's Engines, or the engines are not running. ` +
+            'Pick another service, or add the model in Engines.',
     );
   }
   return found;
@@ -368,14 +373,16 @@ async function followJob(ctx: RuntimeContext, service: CustomService, started: u
   const id = String(extractPath(started, job.idPath) ?? '');
   if (!id) throw new Error(`${label}: the service started no job (no ${job.idPath} in its answer)`);
   const at = (u: string) => absoluteUrl(u.replace(/\{id\}/g, encodeURIComponent(id)));
+  // (sent without the run's abort signal: on Stop that signal has fired, and the cancel went with it unsent)
   const cancel = () => {
-    if (job.cancelUrl) void send(ctx, at(job.cancelUrl), 'POST', { 'Content-Type': 'application/json' }, '{}').catch(() => {});
+    if (job.cancelUrl) void send({ ...ctx, abortSignal: undefined }, at(job.cancelUrl), 'POST', { 'Content-Type': 'application/json' }, '{}').catch(() => {});
   };
   ctx.log('info', `[${label}] job ${id} started`);
   const began = Date.now();
   let shown = -1;
   let state = String(extractPath(started, job.statusPath) ?? '');
   let last: unknown = started;
+  let missed = 0;
   for (;;) {
     if (job.done.includes(state)) return id;
     if (job.failed.includes(state)) {
@@ -392,9 +399,23 @@ async function followJob(ctx: RuntimeContext, service: CustomService, started: u
       cancel();
       throw e;
     }
-    const reply = await send(ctx, at(job.statusUrl), 'GET', {});
-    if (!reply.ok) throw await failure(reply, `${label}: polling job ${id}`);
-    last = await reply.json();
+    // A stop during the poll cancels the job as one during the wait does; a poll that fails now and then (the
+    // engine busy, the network blinking) is tried again, and only several in a row give up, cancelling the job
+    // rather than leaving it running with nobody waiting for it.
+    let reply: Reply;
+    try {
+      reply = await send(ctx, at(job.statusUrl), 'GET', {});
+      if (!reply.ok) throw await failure(reply, `${label}: polling job ${id}`);
+      last = await reply.json();
+      missed = 0;
+    } catch (e) {
+      if (ctx.abortSignal?.aborted || ++missed >= POLL_MISSES) {
+        cancel();
+        throw e;
+      }
+      ctx.log('warn', `[${label}] job ${id}: no answer this time (${e instanceof Error ? e.message : String(e)}), asking again`);
+      continue;
+    }
     state = String(extractPath(last, job.statusPath) ?? '');
     const progress = job.progressPath ? Number(extractPath(last, job.progressPath)) : NaN;
     if (Number.isFinite(progress) && progress >= shown + 10) {

@@ -66,7 +66,7 @@ function AudioMixerNode({ data }: AudioMixerNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className="text-teal-400">V:{(videoVol * 100).toFixed(0)}%</span>
+            <span className="text-teal-700 dark:text-teal-400">V:{(videoVol * 100).toFixed(0)}%</span>
             <span className="ml-1">A:{(audioVol * 100).toFixed(0)}%</span>
         </div>
     );
@@ -100,7 +100,7 @@ function AudioMixerNode({ data }: AudioMixerNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Video Volume</label>
-                            <span className="text-xs text-teal-400">{(videoVol * 100).toFixed(0)}%</span>
+                            <span className="text-xs text-teal-700 dark:text-teal-400">{(videoVol * 100).toFixed(0)}%</span>
                         </div>
                         <input
                             type="range"
@@ -120,7 +120,7 @@ function AudioMixerNode({ data }: AudioMixerNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Audio Volume</label>
-                            <span className="text-xs text-teal-400">{(audioVol * 100).toFixed(0)}%</span>
+                            <span className="text-xs text-teal-700 dark:text-teal-400">{(audioVol * 100).toFixed(0)}%</span>
                         </div>
                         <input
                             type="range"
@@ -170,7 +170,7 @@ function AudioMixerNode({ data }: AudioMixerNodeProps) {
                     </div>
 
                     {/* Info */}
-                    <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-900/20 border border-teal-800/30 rounded text-xs text-teal-300">
+                    <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-900/20 border border-teal-800/30 rounded text-xs text-teal-700 dark:text-teal-300">
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>

@@ -84,7 +84,7 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
   const collapsedPreview = (
     <div className="text-slate-500 dark:text-slate-400">
       {hasImage ? (
-        <span className="text-indigo-400">Image</span>
+        <span className="text-indigo-700 dark:text-indigo-400">Image</span>
       ) : (
         <span className="italic text-slate-600 dark:text-slate-400">No image</span>
       )}

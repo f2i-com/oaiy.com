@@ -264,7 +264,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-500 dark:text-slate-400">
-            <span className="text-orange-400 font-medium">{isWan2gp ? 'Wan2GP' : 'ComfyUI'}</span>
+            <span className="text-orange-700 dark:text-orange-400 font-medium">{isWan2gp ? 'Wan2GP' : 'ComfyUI'}</span>
             {!isWan2gp && data.comfyWorkflowName && (
                 <span className="text-slate-600 dark:text-slate-400 ml-1 text-xs">({data.comfyWorkflowName})</span>
             )}
@@ -286,7 +286,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
         const hasPromptNode = data.comfyPrimaryPromptNodeId !== null || (hasEmbeddedWorkflow && data.workflowInputs?.promptNodeId);
         const showPromptInput = !hasWorkflow || hasPromptNode;
         if (showPromptInput) {
-            handles.push({ id: 'prompt', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'prompt', labelColor: 'text-blue-400', size: 'lg' });
+            handles.push({ id: 'prompt', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'prompt', labelColor: 'text-blue-700 dark:text-blue-400', size: 'lg' });
         }
 
         // Dynamic image inputs
@@ -300,7 +300,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                     position: Position.Left,
                     color: config.allowBypass ? '!bg-purple-400' : '!bg-purple-500',
                     label: `${label.toLowerCase()}${bypassIndicator}`,
-                    labelColor: config.allowBypass ? 'text-purple-300' : 'text-purple-400',
+                    labelColor: config.allowBypass ? 'text-purple-700 dark:text-purple-300' : 'text-purple-700 dark:text-purple-400',
                     size: 'md',
                 });
             });
@@ -316,7 +316,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                     position: Position.Left,
                     color: '!bg-purple-500',
                     label: label.toLowerCase(),
-                    labelColor: 'text-purple-400',
+                    labelColor: 'text-purple-700 dark:text-purple-400',
                     size: 'md',
                 });
             });
@@ -328,7 +328,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                 position: Position.Left,
                 color: '!bg-purple-500',
                 label: 'image',
-                labelColor: 'text-purple-400',
+                labelColor: 'text-purple-700 dark:text-purple-400',
                 size: 'md',
             });
         }
@@ -341,7 +341,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                 position: Position.Left,
                 color: '!bg-purple-400',
                 label: 'start image (opt)',
-                labelColor: 'text-purple-300',
+                labelColor: 'text-purple-700 dark:text-purple-300',
                 size: 'sm',
             });
             handles.push({
@@ -350,7 +350,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                 position: Position.Left,
                 color: '!bg-purple-400',
                 label: 'end image (opt)',
-                labelColor: 'text-purple-300',
+                labelColor: 'text-purple-700 dark:text-purple-300',
                 size: 'sm',
             });
         }
@@ -362,7 +362,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
             position: Position.Left,
             color: '!bg-green-500',
             label: 'frames',
-            labelColor: 'text-green-400',
+            labelColor: 'text-green-700 dark:text-green-400',
             size: 'sm',
         });
 
@@ -373,7 +373,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
             position: Position.Left,
             color: '!bg-cyan-500',
             label: 'duration',
-            labelColor: 'text-cyan-400',
+            labelColor: 'text-cyan-700 dark:text-cyan-400',
             size: 'sm',
         });
 
@@ -385,7 +385,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                 position: Position.Left,
                 color: '!bg-teal-400',
                 label: 'audio (opt)',
-                labelColor: 'text-teal-300',
+                labelColor: 'text-teal-700 dark:text-teal-300',
                 size: 'sm',
             });
         }
@@ -557,7 +557,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                         {(data.comfyWorkflow || hasEmbeddedWorkflow) ? (
                             <div className="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded p-2">
                                 <div className="flex items-center justify-between mb-1">
-                                    <span className="text-sm text-green-400 font-medium truncate flex-1">
+                                    <span className="text-sm text-green-700 dark:text-green-400 font-medium truncate flex-1">
                                         {data.comfyWorkflowName || (hasEmbeddedWorkflow ? `Embedded (${embeddedWorkflowNodeCount} nodes)` : 'workflow.json')}
                                     </span>
                                     {data.comfyWorkflow && (
@@ -587,10 +587,10 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                                         <div className="flex items-center gap-2 text-xs">
                                             <span className="text-slate-500">Seed:</span>
                                             {data.comfySeedMode === 'random' && (
-                                                <span className="text-green-400">Random each run</span>
+                                                <span className="text-green-700 dark:text-green-400">Random each run</span>
                                             )}
                                             {data.comfySeedMode === 'fixed' && (
-                                                <span className="text-blue-400">Fixed ({data.comfyFixedSeed})</span>
+                                                <span className="text-blue-700 dark:text-blue-400">Fixed ({data.comfyFixedSeed})</span>
                                             )}
                                             {data.comfySeedMode === 'workflow' && (
                                                 <span className="text-slate-600 dark:text-slate-400">From workflow</span>
@@ -609,9 +609,9 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                                                     <span className="w-2 h-2 rounded-full bg-purple-500" />
                                                     <span className="text-slate-600 dark:text-slate-300">{config.title}</span>
                                                     {config.allowBypass ? (
-                                                        <span className="text-green-400 text-[10px]">(optional)</span>
+                                                        <span className="text-green-700 dark:text-green-400 text-[10px]">(optional)</span>
                                                     ) : (
-                                                        <span className="text-amber-400 text-[10px]">(required)</span>
+                                                        <span className="text-amber-700 dark:text-amber-400 text-[10px]">(required)</span>
                                                     )}
                                                 </div>
                                             ))}
@@ -627,7 +627,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                                             {/* Frame Count - only when detected */}
                                             {videoAnalysis && videoAnalysis.lengths.length > 0 && (
                                                 <div className="flex items-center gap-2">
-                                                    <label className="text-xs text-slate-400 w-14">Frames:</label>
+                                                    <label className="text-xs text-slate-600 dark:text-slate-400 w-14">Frames:</label>
                                                     <input
                                                         type="number"
                                                         value={data.comfyFrameCount ?? ''}
@@ -644,7 +644,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                                             )}
                                             {/* Resolution - always show when workflow loaded */}
                                             <div className="flex items-center gap-2">
-                                                <label className="text-xs text-slate-400 w-14">Size:</label>
+                                                <label className="text-xs text-slate-600 dark:text-slate-400 w-14">Size:</label>
                                                 <input
                                                     type="number"
                                                     value={data.comfyWidth ?? ''}
@@ -674,7 +674,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                                             {/* Frame Rate - only when detected */}
                                             {videoAnalysis && videoAnalysis.frameRates.length > 0 && (
                                                 <div className="flex items-center gap-2">
-                                                    <label className="text-xs text-slate-400 w-14">FPS:</label>
+                                                    <label className="text-xs text-slate-600 dark:text-slate-400 w-14">FPS:</label>
                                                     <input
                                                         type="number"
                                                         value={data.comfyFrameRate ?? ''}
@@ -696,7 +696,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
 
                                 <button
                                     onClick={() => fileInputRef.current?.click()}
-                                    className="mt-2 text-xs text-orange-400 hover:text-orange-300"
+                                    className="mt-2 text-xs text-orange-700 dark:text-orange-400 hover:text-orange-300"
                                     onMouseDown={(e) => e.stopPropagation()}
                                 >
                                     Change workflow

@@ -292,7 +292,8 @@ export interface PropertyOption {
    * An action rather than a value ("Add a service…"): picking it runs this
    * and leaves the field's value as it was. Only from dynamic resolvers.
    */
-  action?: () => void;
+  /** Run instead of picking a value ("Add a service…"); `choose` picks one for the field afterwards (the service just added). */
+  action?: (choose: (value: string) => void) => void;
   /**
    * Listed only while it is the field's value: a choice no longer offered
    * (a stopped service) that a saved flow still uses stays visible there.

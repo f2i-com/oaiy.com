@@ -72,6 +72,8 @@ interface JobQueueContextValue {
   ) => string;
   /** Subscribe to updates for a specific job */
   subscribeToJob: (jobId: string, callback: (job: Job) => void) => () => void;
+  /** A flow's last run that finished well, whole (its outputs shown again when the flow is opened again) */
+  getLastResult: (flowId: string) => Job | undefined;
 }
 
 const JobQueueContext = createContext<JobQueueContextValue | null>(null);
@@ -258,13 +260,26 @@ export function JobQueueProvider({
     jobManager.setProjectConstants(constantsMap, secretConstantNames);
   }, [constantsMap, secretConstantNames, jobManager]);
 
+  // Each flow's last run that finished well, kept whole: the queue's history keeps only its newest runs whole, and
+  // a flow opened again shows its outputs from it (they are not saved with the flow).
+  const lastResultsRef = useRef(new Map<string, Job>());
+  const keepLastResults = useCallback((allJobs: readonly Job[]) => {
+    for (const job of allJobs) {
+      if (job.status !== 'completed' || job.result === undefined) continue;
+      const kept = lastResultsRef.current.get(job.flowId);
+      if (!kept || (kept.id !== job.id && (kept.completedAt ?? 0) < (job.completedAt ?? 0))) lastResultsRef.current.set(job.flowId, job);
+    }
+  }, []);
+  const getLastResult = useCallback((flowId: string) => lastResultsRef.current.get(flowId), []);
+
   // Subscribe to job state changes
   useEffect(() => {
     const unsubscribe = jobManager.onStateChange((allJobs) => {
+      keepLastResults(allJobs);
       setJobs([...allJobs]);
     });
     return unsubscribe;
-  }, [jobManager]);
+  }, [jobManager, keepLastResults]);
 
   // Config update handler
   const setConfig = useCallback(
@@ -393,6 +408,7 @@ export function JobQueueProvider({
       clearHistory,
       submitJob,
       subscribeToJob,
+      getLastResult,
     }),
     [
       jobManager,
@@ -407,6 +423,7 @@ export function JobQueueProvider({
       clearHistory,
       submitJob,
       subscribeToJob,
+      getLastResult,
     ],
   );
 

@@ -39,8 +39,8 @@ function ImageSaveNode({ data }: ImageSaveNodeProps) {
   }, []);
 
   const collapsedPreview = (
-    <div className="text-slate-400">
-      <span className="text-teal-400">{data.format?.toUpperCase() || 'PNG'}</span>
+    <div className="text-slate-600 dark:text-slate-400">
+      <span className="text-teal-700 dark:text-teal-400">{data.format?.toUpperCase() || 'PNG'}</span>
       {data.filename && <span className="ml-1 text-[10px]">{data.filename}</span>}
     </div>
   );
@@ -55,7 +55,7 @@ function ImageSaveNode({ data }: ImageSaveNodeProps) {
   ], []);
 
   const titleExtra = (
-    <span className="ml-auto px-1.5 py-0.5 bg-teal-900 text-teal-400 text-[10px] rounded">
+    <span className="ml-auto px-1.5 py-0.5 bg-teal-900 text-teal-700 dark:text-teal-400 text-[10px] rounded">
       AUTO
     </span>
   );

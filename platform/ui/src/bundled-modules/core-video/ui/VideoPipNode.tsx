@@ -142,7 +142,7 @@ function VideoPipNode({ data }: VideoPipNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className="text-cyan-400">PiP</span>
+            <span className="text-cyan-700 dark:text-cyan-400">PiP</span>
             <span className="ml-1">{position}</span>
         </div>
     );
@@ -198,7 +198,7 @@ function VideoPipNode({ data }: VideoPipNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Size</label>
-                            <span className="text-xs text-cyan-400">{size}%</span>
+                            <span className="text-xs text-cyan-700 dark:text-cyan-400">{size}%</span>
                         </div>
                         <input
                             type="range"
@@ -218,7 +218,7 @@ function VideoPipNode({ data }: VideoPipNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Margin</label>
-                            <span className="text-xs text-cyan-400">{margin}px</span>
+                            <span className="text-xs text-cyan-700 dark:text-cyan-400">{margin}px</span>
                         </div>
                         <input
                             type="range"
@@ -258,7 +258,7 @@ function VideoPipNode({ data }: VideoPipNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Main Volume</label>
-                            <span className="text-xs text-cyan-400">{(mainVolume * 100).toFixed(0)}%</span>
+                            <span className="text-xs text-cyan-700 dark:text-cyan-400">{(mainVolume * 100).toFixed(0)}%</span>
                         </div>
                         <input
                             type="range"
@@ -278,7 +278,7 @@ function VideoPipNode({ data }: VideoPipNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">PiP Volume</label>
-                            <span className="text-xs text-cyan-400">{(pipVolume * 100).toFixed(0)}%</span>
+                            <span className="text-xs text-cyan-700 dark:text-cyan-400">{(pipVolume * 100).toFixed(0)}%</span>
                         </div>
                         <input
                             type="range"
@@ -303,7 +303,7 @@ function VideoPipNode({ data }: VideoPipNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Start Time</label>
-                            <span className="text-xs text-cyan-400">{formatTime(startTime)}</span>
+                            <span className="text-xs text-cyan-700 dark:text-cyan-400">{formatTime(startTime)}</span>
                         </div>
                         <input
                             type="range"
@@ -323,7 +323,7 @@ function VideoPipNode({ data }: VideoPipNodeProps) {
                     <div>
                         <div className="flex justify-between items-center mb-1">
                             <label className="text-slate-600 dark:text-slate-400 text-xs">Duration</label>
-                            <span className="text-xs text-cyan-400">{pipDuration === 0 ? 'Auto' : formatTime(pipDuration)}</span>
+                            <span className="text-xs text-cyan-700 dark:text-cyan-400">{pipDuration === 0 ? 'Auto' : formatTime(pipDuration)}</span>
                         </div>
                         <input
                             type="range"
@@ -341,14 +341,14 @@ function VideoPipNode({ data }: VideoPipNodeProps) {
 
                     {/* Calculated End Time Display */}
                     <div className="flex items-center justify-between px-2 py-1.5 bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded text-xs">
-                        <span className="text-slate-400">PiP appears:</span>
-                        <span className="text-cyan-400 font-mono">
+                        <span className="text-slate-600 dark:text-slate-400">PiP appears:</span>
+                        <span className="text-cyan-700 dark:text-cyan-400 font-mono">
                             {formatTime(startTime)} → {endTime !== null ? formatTime(endTime) : 'end of PiP'}
                         </span>
                     </div>
 
                     {/* Info */}
-                    <div className="flex items-center gap-2 px-2 py-1.5 bg-cyan-900/20 border border-cyan-800/30 rounded text-xs text-cyan-300">
+                    <div className="flex items-center gap-2 px-2 py-1.5 bg-cyan-900/20 border border-cyan-800/30 rounded text-xs text-cyan-700 dark:text-cyan-300">
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>

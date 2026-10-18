@@ -99,7 +99,10 @@ function getColorName(color: string | undefined): NodeColor {
 function summaryOf(data: Record<string, unknown>): string {
   const parts: string[] = [];
   const service = typeof data.service === 'string' ? data.service.trim() : '';
+  const worker = /^engine:[a-z0-9]+:node\.[A-Za-z0-9]+\/(.+)$/.exec(service);
   if (service === 'engine:llm') parts.push('the chosen language model');
+  // (a paired worker's model by its name, not its node id: engine:<kind>:node.<id>/<model>)
+  else if (worker) parts.push(`${worker[1]} on a paired computer`);
   else if (service) parts.push(service.replace(/^engine:[a-z0-9]+:/, '').replace(/^engine:/, ''));
   else if (typeof data.model === 'string' && data.model.trim()) parts.push(data.model.trim());
   if (Number(data.width) > 0 && Number(data.height) > 0) parts.push(`${data.width}×${data.height}`);

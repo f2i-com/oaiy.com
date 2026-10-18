@@ -2,7 +2,19 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import type { Node } from '@xyflow/react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { FolderOpen, Play } from 'lucide-react';
+import { pathToMediaUrl } from 'oaiy-core';
 import { uiLogger as logger } from '../../utils/logger';
+
+/** A file's value as the field shows it: a browser's picked file (a blob: URL, its name after #) by its name. */
+function shownPath(value: string): string {
+  if (!value.startsWith('blob:')) return value;
+  const name = value.split('#')[1];
+  try {
+    return name ? decodeURIComponent(name) : 'the file picked';
+  } catch {
+    return name || 'the file picked';
+  }
+}
 import Dialog from './Dialog';
 
 // Input node types that should appear in the run modal
@@ -264,21 +276,28 @@ export default function RunWorkflowModal({
                       skipped. Clicking it triggers the file picker so
                       the user can swap. */}
                   {(() => {
-                    const preview =
+                    // The picture the run will use: the one just picked here (not the node's earlier one), else the node's
+                    const chosen = formValues.get(node.id);
+                    const picked = chosen !== undefined && chosen !== node.value;
+                    const nodePreview =
                       typeof node.nodeData.imagePreview === 'string'
                         ? (node.nodeData.imagePreview as string)
-                        : '';
-                    const currentPath =
-                      formValues.get(node.id) ?? node.value;
+                        : typeof node.nodeData.fileContent === 'string' && (node.nodeData.fileContent as string).startsWith('data:image/')
+                          ? (node.nodeData.fileContent as string)
+                          : '';
+                    const preview = picked ? '' : nodePreview;
+                    const currentPath = chosen ?? node.value;
                     const isImage =
                       preview.startsWith('data:image/') ||
-                      /\.(png|jpe?g|gif|webp|bmp)$/i.test(currentPath);
+                      /\.(png|jpe?g|gif|webp|bmp)$/i.test(shownPath(currentPath));
                     if (!isImage) return null;
                     const previewSrc = preview
                       ? preview
-                      : currentPath && !currentPath.startsWith('data:')
-                        ? `file://${currentPath.replace(/\\/g, '/')}`
-                        : '';
+                      : /^(blob|https?):/i.test(currentPath)
+                        ? currentPath
+                        : currentPath && !currentPath.startsWith('data:')
+                          ? pathToMediaUrl(currentPath)
+                          : '';
                     if (!previewSrc) return null;
                     return (
                       <button
@@ -309,7 +328,8 @@ export default function RunWorkflowModal({
                   <input
                     ref={index === 0 ? firstInputRef as React.RefObject<HTMLInputElement> : undefined}
                     type="text"
-                    value={formValues.get(node.id) ?? node.value}
+                    // (a file picked in a browser is a blob: URL: shown by its name)
+                    value={shownPath(formValues.get(node.id) ?? node.value)}
                     onChange={(e) => handleValueChange(node.id, e.target.value)}
                     placeholder={node.type === 'input_folder' ? 'Pick or type a folder path…' : 'Pick or type a file path…'}
                     className="oaiy-input mono flex-1"

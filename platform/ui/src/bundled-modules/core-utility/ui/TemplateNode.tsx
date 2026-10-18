@@ -90,8 +90,8 @@ function TemplateNode({ data }: TemplateNodeProps) {
   const textareaHeight = Math.max(80, size.height - 200);
 
   const collapsedPreview = (
-    <div className="text-slate-400">
-      <span className="text-amber-400">{inputCount} vars</span>
+    <div className="text-slate-600 dark:text-slate-400">
+      <span className="text-amber-700 dark:text-amber-400">{inputCount} vars</span>
       {templateVariables.length > 0 && (
         <span className="ml-1 text-[10px] font-mono">{`{{${templateVariables[0]}}}`}</span>
       )}
@@ -107,7 +107,7 @@ function TemplateNode({ data }: TemplateNodeProps) {
       position: Position.Left,
       color: '!bg-blue-500',
       label: inputNames[index] || id,
-      labelColor: 'text-blue-400',
+      labelColor: 'text-blue-700 dark:text-blue-400',
       size: 'md' as const,
     }));
   }, [inputNames, inputCount]);

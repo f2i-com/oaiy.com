@@ -25,7 +25,7 @@ import { Position, useStore } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 import { subscribeToDynamicOptionsInvalidation, useNodeNotice } from 'oaiy-ui-components';
 import type { ServiceInputDecl } from '../examples';
-import { resolveService as lookupService } from '../contract';
+import { describeService, resolveService as lookupService } from '../contract';
 
 interface ServiceCallNodeData {
   service?: string;
@@ -165,13 +165,14 @@ function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
     }));
   }, [service]);
 
-  const title = service?.name || (missing ? `${data.service} (not available)` : 'Service Call');
+  // (in words, as the pickers say it: not the raw id of a worker's model)
+  const title = service?.name || (missing ? `${describeService(String(data.service)).text} (not available)` : 'Service Call');
   const endpointPreview = data.endpoint || service?.endpoint || '';
   const collapsedPreview = (
     <div className="text-slate-500 dark:text-slate-400 text-xs">
       {service ? (
         <>
-          <span className="text-cyan-400 font-medium">{service.name}</span>
+          <span className="text-cyan-700 dark:text-cyan-400 font-medium">{service.name}</span>
           {endpointPreview && (
             <span className="text-slate-500 ml-1 truncate">
               {endpointPreview.replace(/^https?:\/\//, '')}

@@ -20,6 +20,7 @@ import type {
 } from 'oaiy-core';
 import { createLogger } from '../utils/logger';
 import { registerImportedServices } from '../utils/ProjectIO';
+import { rewriteFlowRefs } from '../lib/flowIds';
 import { withoutRunOutputs } from '../utils/runOutputs';
 
 const logger = createLogger('PackageManager');
@@ -201,10 +202,13 @@ export function normalizeFlowData(data: Record<string, unknown>): Partial<Flow> 
   // Check for flat format: { nodes: [...], edges: [...], name, ... }
   if (Array.isArray(data.nodes) && Array.isArray(data.edges)) {
     return {
+      // (its id, for the subflow and macro nodes of other flows in the same file that name it)
+      ...(typeof data.id === 'string' && data.id ? { id: data.id } : {}),
       name: data.name as string | undefined,
       description: data.description as string | undefined,
       tags: data.tags as string[] | undefined,
       localOnly: data.localOnly as boolean | undefined,
+      ...(data.isMacro === true ? { isMacro: true, macroMetadata: data.macroMetadata as Flow['macroMetadata'] } : {}),
       graph: {
         nodes: withoutRunOutputs(data.nodes as WorkflowGraph['nodes']),
         edges: data.edges as WorkflowGraph['edges'],
@@ -497,8 +501,11 @@ export function usePackageManager(options: UsePackageManagerOptions) {
         // Get current project settings to apply defaults
         const settings = getSettings();
 
-        // Import each valid flow
+        // Import each valid flow, under an id of its own (createFlow's); the subflow and macro nodes naming another
+        // flow of the same file are renamed to match, or they called whatever had the old id (or nothing)
         let lastFlow: Flow | null = null;
+        const ids = new Map<string, string>();
+        const created: Array<{ flow: Flow; data: Partial<Flow> }> = [];
         for (const flowData of flowsToImport) {
           const flowName = flowData.name || fileName;
 
@@ -508,16 +515,23 @@ export function usePackageManager(options: UsePackageManagerOptions) {
           // Create a new flow with the imported data
           const newFlow = createFlow(flowName, graphWithDefaults);
           lastFlow = newFlow;
-
-          // Update with additional properties if present
-          if (flowData.description || flowData.tags || flowData.localOnly) {
-            updateFlow(newFlow.id, {
-              description: flowData.description,
-              tags: flowData.tags,
-              localOnly: flowData.localOnly,
-            });
-          }
+          if (flowData.id) ids.set(flowData.id, newFlow.id);
+          created.push({ flow: { ...newFlow, graph: graphWithDefaults }, data: flowData });
         }
+        const linked = rewriteFlowRefs(created.map((c) => c.flow), ids);
+        created.forEach(({ flow, data }, i) => {
+          // Update with additional properties if present: what it is to other flows (a macro) included
+          const updates: Partial<Omit<Flow, 'id' | 'createdAt'>> = {};
+          if (linked[i] !== flow) updates.graph = linked[i].graph;
+          if (data.description) updates.description = data.description;
+          if (data.tags) updates.tags = data.tags;
+          if (data.localOnly) updates.localOnly = data.localOnly;
+          if (data.isMacro) {
+            updates.isMacro = true;
+            if (data.macroMetadata) updates.macroMetadata = data.macroMetadata;
+          }
+          if (Object.keys(updates).length > 0) updateFlow(flow.id, updates);
+        });
 
         // Clear any active package flow to ensure we're viewing user flows
         setActivePackageFlow(null);

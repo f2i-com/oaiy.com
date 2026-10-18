@@ -3,16 +3,23 @@ import { AlertTriangle, Check, Info, X, XCircle } from 'lucide-react';
 
 export type ToastType = 'success' | 'error' | 'info' | 'warning';
 
+/** A button on a toast: what to do about what it says ("Show log"). */
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 interface Toast {
   id: string;
   message: string;
   type: ToastType;
   duration?: number;
+  action?: ToastAction;
 }
 
 interface ToastContextValue {
   toasts: Toast[];
-  addToast: (message: string, type?: ToastType, duration?: number) => void;
+  addToast: (message: string, type?: ToastType, duration?: number, action?: ToastAction) => void;
   removeToast: (id: string) => void;
 }
 
@@ -33,9 +40,9 @@ interface ToastProviderProps {
 export function ToastProvider({ children }: ToastProviderProps) {
   const [toasts, setToasts] = useState<Toast[]>([]);
 
-  const addToast = useCallback((message: string, type: ToastType = 'info', duration: number = 3000) => {
+  const addToast = useCallback((message: string, type: ToastType = 'info', duration: number = 3000, action?: ToastAction) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    setToasts(prev => [...prev, { id, message, type, duration }]);
+    setToasts(prev => [...prev, { id, message, type, duration, action }]);
   }, []);
 
   const removeToast = useCallback((id: string) => {
@@ -120,6 +127,18 @@ function ToastItem({ toast, onRemove }: ToastItemProps) {
     >
       <Icon size={16} aria-hidden="true" />
       <span>{toast.message}</span>
+      {toast.action && (
+        <button
+          type="button"
+          className="oaiy-toast-action"
+          onClick={() => {
+            toast.action?.onClick();
+            handleClose();
+          }}
+        >
+          {toast.action.label}
+        </button>
+      )}
       <button onClick={handleClose} aria-label="Dismiss" type="button">
         <X size={14} aria-hidden="true" />
       </button>

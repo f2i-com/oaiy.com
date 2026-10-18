@@ -83,7 +83,7 @@ await esbuild.build({
     contents: `export { mapToCustomService, mapEngineService, combineDesktopServices } from './src/lib/desktopServices.ts';
 export { paletteShowsNode, nodeNotice, initialServiceFor, nodeTypeForService, isListed, DESKTOP_NODE_FEATURE } from './src/lib/nodeAvailability.ts';
 export { serviceOptions } from './src/lib/serviceOptions.ts';
-export { resolveService, renderContractBody, nodeContract, engineChatService, remoteModelOf, engineDefault } from './src/bundled-modules/core-service/contract.ts';
+export { resolveService, renderContractBody, nodeContract, engineChatService, remoteModelOf, engineDefault, describeService } from './src/bundled-modules/core-service/contract.ts';
 export { runContract, contractTiming } from './src/bundled-modules/core-service/contractRuntime.ts';
 export { default as ServiceCompiler } from './src/bundled-modules/core-service/compiler.ts';
 export { default as AudioCompiler } from './src/bundled-modules/core-audio/compiler.ts';
@@ -158,6 +158,10 @@ await check("a desktop service that is not installed is not listed; a stopped in
   assert.ok(ids.indexOf('companion:my-rig') < ids.indexOf('companion:my-llm'), 'running ones first');
   assert.equal(M.mapToCustomService(SERVICES[0]), null);
   assert.equal(M.mapToCustomService(SERVICES[2]).group, 'desktop');
+  // a desktop on another computer (the engine address names it): its services are on that computer, not this one's loopback
+  assert.match(M.mapToCustomService(SERVICES[2], 'http://192.168.1.50:17972').endpoint, /^http:\/\/192\.168\.1\.50:\d+\//);
+  assert.match(M.mapToCustomService(SERVICES[2], ORIGIN).endpoint, /^http:\/\/127\.0\.0\.1:\d+\//);
+  assert.ok(M.combineDesktopServices(SERVICES, [], 'http://192.168.1.50:17972').filter((x) => x.group === 'desktop').every((x) => x.endpoint.startsWith('http://192.168.1.50:')));
 });
 
 await check('the palette in OAIY shows a service node only when something installed runs it', () => {
@@ -460,6 +464,37 @@ await check('a job is followed to its file, the MP3 falling back to the WAV, wit
   assert.ok(calls.every((c) => c.auth === 'Bearer tok'));
 });
 
+await check('a stop during a poll cancels the job (the cancel is not sent with the stopped signal), and a single missed poll is asked again', async () => {
+  const service = { ...desktop.find((s) => s.id === 'engine:music:song') };
+  service.job = { ...service.job, cancelUrl: `${service.job.statusUrl}/cancel` };
+  // a blip: one poll fails, the next answers, and the job is followed to its end
+  let polls = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    if (url.endsWith('/v1/audio/music') && init.method === 'POST') return reply(200, { id: 'm2', status: 'queued' });
+    if (url.endsWith('/m2')) return ++polls === 1 ? reply(503, { error: 'busy' }) : reply(200, { id: 'm2', status: 'completed' });
+    if (url.endsWith('/m2/content')) return reply(200, new Uint8Array([82, 73, 70, 70]), 'audio/wav');
+    return reply(404, {});
+  };
+  const r = await M.runContract(fakeCtx(), service, { prompt: 'x', model: 'song' }, { nodeId: 'n1', filename: 'tune', label: 'Music' });
+  assert.equal(r.output, 'audio');
+  assert.equal(polls, 2);
+  // a stop while the poll is out: the poll's fetch is aborted, and the cancel still goes, unaborted
+  const stop = new AbortController();
+  const cancels = [];
+  globalThis.fetch = async (url, init = {}) => {
+    if (url.endsWith('/v1/audio/music') && init.method === 'POST') return reply(200, { id: 'm3', status: 'queued' });
+    if (url.endsWith('/m3/cancel')) { cancels.push(init.signal?.aborted ?? false); return reply(200, {}); }
+    if (url.endsWith('/m3')) {
+      stop.abort();
+      throw new DOMException('aborted', 'AbortError');
+    }
+    return reply(404, {});
+  };
+  await assert.rejects(M.runContract(fakeCtx(stop.signal), service, { prompt: 'x', model: 'song' }, { nodeId: 'n1', label: 'Music' }));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(cancels, [false], 'the cancel went once, not aborted');
+});
+
 await check("the desktop's credential goes only to its engine routes", async () => {
   const seen = [];
   globalThis.fetch = async (url, init = {}) => { seen.push([String(url), init.headers?.Authorization]); return reply(200, { data: [{ b64_json: 'iVBORw==' }] }); };
@@ -550,6 +585,24 @@ await check("a paired worker's model (OAIY Network) keeps its node, goes to it, 
   assert.ok(withDefault.some((o) => o.value === 'engine:image' && o.label === 'Default picture model (flux on Rig)'), JSON.stringify(withDefault));
   const options = M.serviceOptions('image_gen', env({ desktop: [mapped, { ...local, nodeTypes: ['image_gen'] }].map((x) => ({ ...x, nodeTypes: ['image_gen'] })) }), () => {});
   assert.ok(options.some((o) => o.label === 'Image · flux · Rig (offline)'), JSON.stringify(options));
+  // said in words, never the raw id; and an offline worker's model is said to be offline on the node
+  assert.equal(M.describeService('engine:image:node.abc123/flux', [mapped]).text, 'flux on Rig');
+  assert.equal(M.describeService('engine:image:node.zzz/flux').text, 'flux on a paired computer');
+  assert.equal(M.describeService('engine:image').text, 'the default picture model');
+  assert.equal(M.describeService('engine:music:song').text, 'song');
+  const offline = M.nodeNotice('image_gen', { service: 'engine:image:node.abc123/flux' }, env({ desktop: [{ ...mapped, nodeTypes: ['image_gen'] }] }));
+  assert.match(offline ?? '', /“flux” runs on Rig, which does not answer now/);
+  assert.equal(M.nodeNotice('image_gen', { service: 'engine:image:node.abc123/flux' }, env({ desktop: [{ ...mapped, ready: true, nodeTypes: ['image_gen'] }] })), null);
+  const missingWorker = M.nodeNotice('image_gen', { service: 'engine:image:node.gone1/flux' }, env({ desktop: [] }));
+  assert.ok(missingWorker.includes('flux on a paired computer') && !missingWorker.includes('node.gone1'), missingWorker);
+  const offlineDefault = M.serviceOptions('image_gen', env({ desktop: [{ ...local, nodeTypes: ['image_gen'] }, { ...chosen, ready: false }] }), () => {});
+  assert.ok(offlineDefault.some((o) => o.value === 'engine:image' && o.label.endsWith('(offline)')), JSON.stringify(offlineDefault));
+  // a new Image node where only a worker has a picture model starts on that model (`engine:image` names nothing
+  // there), and not on one that is offline
+  const onlyWorker = env({ desktop: [{ ...mapped, ready: true, nodeTypes: ['image_gen'] }] });
+  assert.equal(M.initialServiceFor('image_gen', onlyWorker), 'engine:image:node.abc123/flux');
+  assert.equal(M.initialServiceFor('image_gen', env({ desktop: [{ ...mapped, nodeTypes: ['image_gen'] }] })), null);
+  assert.equal(M.initialServiceFor('image_gen', env({ desktop: [{ ...mapped, ready: true, nodeTypes: ['image_gen'] }, { ...local, ready: undefined, nodeTypes: ['image_gen'] }] })), 'engine:image');
 });
 
 await check('a stopped flow cancels the job', async () => {

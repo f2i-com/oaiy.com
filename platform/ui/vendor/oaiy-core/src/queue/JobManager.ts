@@ -27,7 +27,7 @@ import type { UntrustedWorkerFactory } from '../untrusted-executor';
 import type { ScriptExecutor } from '../script-executor';
 import type { ModuleRegistry, LoadedModule } from '../module-types';
 import { createLogger } from '../logger';
-import { MAX_JOB_HISTORY_SIZE, FORCE_ABORT_TIMEOUT_MS, MAX_LOG_ENTRIES_PER_JOB } from '../constants';
+import { MAX_JOB_HISTORY_SIZE, MAX_FULL_JOB_HISTORY, SLIM_JOB_HISTORY_LOGS, FORCE_ABORT_TIMEOUT_MS, MAX_LOG_ENTRIES_PER_JOB } from '../constants';
 import { metrics } from '../metrics';
 
 const logger = createLogger('JobManager');
@@ -952,6 +952,21 @@ export class JobManager {
     this.history.unshift(stored);
     if (this.history.length > MAX_JOB_HISTORY_SIZE) {
       this.history.pop();
+    }
+    // The newest few keep everything; the one passing out of them keeps its timing, status and last logs (a new
+    // object: whoever holds the full job, as the editor's last result of a flow, keeps it).
+    const older = this.history[MAX_FULL_JOB_HISTORY];
+    if (older && (older.result !== undefined || older.graph.nodes.length > 0 || older.logs.length > SLIM_JOB_HISTORY_LOGS)) {
+      this.history[MAX_FULL_JOB_HISTORY] = {
+        ...older,
+        graph: { nodes: [], edges: [] },
+        inputs: undefined,
+        result: undefined,
+        results: undefined,
+        nodeOutputs: undefined,
+        pendingAIRequest: undefined,
+        logs: older.logs.slice(-SLIM_JOB_HISTORY_LOGS),
+      };
     }
   }
 

@@ -84,9 +84,9 @@ function FileWriteNode({ data }: FileWriteNodeProps) {
 
   const displayName = filenamePattern || targetPath;
   const collapsedPreview = (
-    <div className="text-slate-400">
+    <div className="text-slate-600 dark:text-slate-400">
       {displayName ? (
-        <span className="text-teal-400 text-[10px] truncate block">{displayName.split(/[/\\]/).pop()}</span>
+        <span className="text-teal-700 dark:text-teal-400 text-[10px] truncate block">{displayName.split(/[/\\]/).pop()}</span>
       ) : (
         <span className="italic text-slate-500 text-[10px]">No path</span>
       )}
@@ -94,13 +94,13 @@ function FileWriteNode({ data }: FileWriteNodeProps) {
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'content', type: 'target', position: Position.Left, color: '!bg-teal-500', label: 'content', labelColor: 'text-teal-400', size: 'md' },
-    { id: 'folder', type: 'target', position: Position.Left, color: '!bg-green-500', label: 'folder', labelColor: 'text-green-400', size: 'md' },
-    { id: 'info', type: 'target', position: Position.Left, color: '!bg-slate-500', label: 'info', labelColor: 'text-slate-400', size: 'sm' },
+    { id: 'content', type: 'target', position: Position.Left, color: '!bg-teal-500', label: 'content', labelColor: 'text-teal-700 dark:text-teal-400', size: 'md' },
+    { id: 'folder', type: 'target', position: Position.Left, color: '!bg-green-500', label: 'folder', labelColor: 'text-green-700 dark:text-green-400', size: 'md' },
+    { id: 'info', type: 'target', position: Position.Left, color: '!bg-slate-500', label: 'info', labelColor: 'text-slate-600 dark:text-slate-400', size: 'sm' },
   ], []);
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'path', type: 'source', position: Position.Right, color: '!bg-teal-500', label: 'path', labelColor: 'text-teal-400', size: 'lg' },
+    { id: 'path', type: 'source', position: Position.Right, color: '!bg-teal-500', label: 'path', labelColor: 'text-teal-700 dark:text-teal-400', size: 'lg' },
   ], []);
 
   return (
@@ -192,7 +192,7 @@ function FileWriteNode({ data }: FileWriteNodeProps) {
 
       {/* Last Written */}
       {data._lastWrittenPath && (
-        <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-900/20 border border-teal-600/30 rounded text-teal-400 text-xs">
+        <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-900/20 border border-teal-600/30 rounded text-teal-700 dark:text-teal-400 text-xs">
           <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
           </svg>

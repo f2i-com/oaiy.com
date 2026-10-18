@@ -384,8 +384,8 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
   }, [data.endpoint, data.apiKey, data.comfyWorkflow, isLocal, isCustom, isComfyUI, defaultEndpoint, effectiveApiKeyConstant, hasEmbeddedWorkflow]);
 
   const collapsedPreview = (
-    <div className="text-slate-400">
-      <span className="text-pink-400 font-medium">{selectedFormat?.label || 'Custom'}</span>
+    <div className="text-slate-600 dark:text-slate-400">
+      <span className="text-pink-700 dark:text-pink-400 font-medium">{selectedFormat?.label || 'Custom'}</span>
       {isComfyUI && data.comfyWorkflowName && (
         <span className="text-slate-500 ml-1 text-xs">({data.comfyWorkflowName})</span>
       )}
@@ -412,12 +412,12 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
     const hasPromptNode = data.comfyPrimaryPromptNodeId !== null || (hasEmbeddedWorkflow && data.workflowInputs?.promptNodeId);
     const showPromptInput = !isComfyUI || !hasWorkflow || hasPromptNode;
     if (showPromptInput) {
-      handles.push({ id: 'prompt', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'prompt', labelColor: 'text-blue-400', size: 'lg' });
+      handles.push({ id: 'prompt', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'prompt', labelColor: 'text-blue-700 dark:text-blue-400', size: 'lg' });
     }
 
     // API key input for cloud providers
     if (!isLocal) {
-      handles.push({ id: 'apiKey', type: 'target', position: Position.Left, color: '!bg-yellow-500', label: 'api key', labelColor: 'text-yellow-400', size: 'sm' });
+      handles.push({ id: 'apiKey', type: 'target', position: Position.Left, color: '!bg-yellow-500', label: 'api key', labelColor: 'text-yellow-700 dark:text-yellow-400', size: 'sm' });
     }
 
     // Dynamic image inputs
@@ -433,7 +433,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
           position: Position.Left,
           color: config.allowBypass ? '!bg-purple-400' : '!bg-purple-500',
           label: `${label.toLowerCase()}${bypassIndicator}`,
-          labelColor: config.allowBypass ? 'text-purple-300' : 'text-purple-400',
+          labelColor: config.allowBypass ? 'text-purple-700 dark:text-purple-300' : 'text-purple-700 dark:text-purple-400',
           size: 'md',
         });
       });
@@ -449,7 +449,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
           position: Position.Left,
           color: '!bg-purple-500',
           label: label.toLowerCase(),
-          labelColor: 'text-purple-400',
+          labelColor: 'text-purple-700 dark:text-purple-400',
           size: 'md',
         });
       });
@@ -461,7 +461,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
         position: Position.Left,
         color: '!bg-purple-500',
         label: 'image',
-        labelColor: 'text-purple-400',
+        labelColor: 'text-purple-700 dark:text-purple-400',
         size: 'md',
       });
     } else if (effectiveImageInputCount > 0) {
@@ -473,7 +473,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
           position: Position.Left,
           color: '!bg-purple-500',
           label: effectiveImageInputCount === 1 ? 'image' : `image ${i + 1}`,
-          labelColor: 'text-purple-400',
+          labelColor: 'text-purple-700 dark:text-purple-400',
           size: 'md',
         });
       }
@@ -481,7 +481,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
 
     // Body input for custom API
     if (isCustom) {
-      handles.push({ id: 'body', type: 'target', position: Position.Left, color: '!bg-orange-500', label: 'body', labelColor: 'text-orange-400', size: 'md' });
+      handles.push({ id: 'body', type: 'target', position: Position.Left, color: '!bg-orange-500', label: 'body', labelColor: 'text-orange-700 dark:text-orange-400', size: 'md' });
     }
 
     return handles;
@@ -669,7 +669,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
                 {(data.comfyWorkflow || hasEmbeddedWorkflow) ? (
                   <div className="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded p-2">
                     <div className="flex items-center justify-between mb-1">
-                      <span className="text-sm text-green-400 font-medium truncate flex-1">
+                      <span className="text-sm text-green-700 dark:text-green-400 font-medium truncate flex-1">
                         {data.comfyWorkflowName || (hasEmbeddedWorkflow ? `Embedded (${embeddedWorkflowNodeCount} nodes)` : 'workflow.json')}
                       </span>
                       {data.comfyWorkflow && (
@@ -699,13 +699,13 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
                         <div className="flex items-center gap-2 text-xs">
                           <span className="text-slate-500">Seed:</span>
                           {data.comfySeedMode === 'random' && (
-                            <span className="text-green-400">Random each run</span>
+                            <span className="text-green-700 dark:text-green-400">Random each run</span>
                           )}
                           {data.comfySeedMode === 'fixed' && (
-                            <span className="text-blue-400">Fixed ({data.comfyFixedSeed})</span>
+                            <span className="text-blue-700 dark:text-blue-400">Fixed ({data.comfyFixedSeed})</span>
                           )}
                           {data.comfySeedMode === 'workflow' && (
-                            <span className="text-slate-400">From workflow</span>
+                            <span className="text-slate-600 dark:text-slate-400">From workflow</span>
                           )}
                         </div>
                       </div>
@@ -719,11 +719,11 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
                           {data.comfyImageInputConfigs.map((config) => (
                             <div key={config.nodeId} className="flex items-center gap-2 text-xs">
                               <span className="w-2 h-2 rounded-full bg-purple-500" />
-                              <span className="text-slate-300">{config.title}</span>
+                              <span className="text-slate-600 dark:text-slate-300">{config.title}</span>
                               {config.allowBypass ? (
-                                <span className="text-green-400 text-[10px]">(optional)</span>
+                                <span className="text-green-700 dark:text-green-400 text-[10px]">(optional)</span>
                               ) : (
-                                <span className="text-amber-400 text-[10px]">(required)</span>
+                                <span className="text-amber-700 dark:text-amber-400 text-[10px]">(required)</span>
                               )}
                             </div>
                           ))}
@@ -733,7 +733,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
 
                     <button
                       onClick={() => fileInputRef.current?.click()}
-                      className="mt-2 text-xs text-pink-400 hover:text-pink-300"
+                      className="mt-2 text-xs text-pink-700 dark:text-pink-400 hover:text-pink-300"
                       onMouseDown={(e) => e.stopPropagation()}
                     >
                       Change workflow
@@ -748,7 +748,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
                     <svg className="w-6 h-6 mx-auto text-slate-500 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
                     </svg>
-                    <span className="text-sm text-slate-400">Load ComfyUI workflow</span>
+                    <span className="text-sm text-slate-600 dark:text-slate-400">Load ComfyUI workflow</span>
                     <p className="text-xs text-slate-600 mt-1">.json exported from ComfyUI</p>
                   </button>
                 )}
@@ -874,17 +874,17 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
                     <button
                       onClick={handleRemoveImageInput}
                       disabled={effectiveImageInputCount === 0}
-                      className="w-5 h-5 flex items-center justify-center rounded bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300"
+                      className="w-5 h-5 flex items-center justify-center rounded bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-600 dark:text-slate-300"
                       onMouseDown={(e) => e.stopPropagation()}
                     >
                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 12H4" />
                       </svg>
                     </button>
-                    <span className="text-xs text-slate-400 w-4 text-center">{effectiveImageInputCount}</span>
+                    <span className="text-xs text-slate-600 dark:text-slate-400 w-4 text-center">{effectiveImageInputCount}</span>
                     <button
                       onClick={handleAddImageInput}
-                      className="w-5 h-5 flex items-center justify-center rounded bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-300"
+                      className="w-5 h-5 flex items-center justify-center rounded bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-600 dark:text-slate-300"
                       onMouseDown={(e) => e.stopPropagation()}
                     >
                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">

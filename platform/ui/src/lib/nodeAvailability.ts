@@ -25,7 +25,10 @@
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { whyMissing, type FeatureId } from '@oaiy/shared/capabilities/features';
 import {
+  ENGINE_KIND_LABEL,
   NODE_ENGINE_KIND,
+  describeService,
+  engineDefault,
   isOaiyServiceId,
   resolveService,
   servesNode,
@@ -58,18 +61,7 @@ export const DEFAULT_SERVICE: Readonly<Record<string, string>> = {
 /** `data.service` values that are the node's own request code, not a preset. */
 const LEGACY_SERVICE_VALUES: ReadonlySet<string> = new Set(['ace-step', 'heartmula', 'qwen3-tts', 'chatterbox-tts']);
 
-const KIND_LABEL: Readonly<Record<string, string>> = {
-  llm: 'language model',
-  image: 'picture model',
-  video: 'video model',
-  speech: 'speech model',
-  music: 'music model',
-  sound: 'sound-effect model',
-  model3d: '3D model',
-  background: 'background-removal model',
-  upscale: 'upscaler',
-  transcription: 'transcription',
-};
+const KIND_LABEL = ENGINE_KIND_LABEL;
 
 /**
  * The nodes that need OAIY Desktop, and the feature each needs (shared/capabilities/features.ts). `browser_request` is not one:
@@ -127,10 +119,11 @@ export function paletteShowsNode(id: string, env: AvailabilityEnv): boolean {
   return servesNode(all, id as never);
 }
 
-/** What `engine:<kind>[:<model>]` / `voice:*` names, for a message. */
-function describeOaiyId(id: string): { kind: string; model: string } {
+/** What `engine:<kind>[:<model>]` / `voice:*` names, for a message (a paired worker's model by its name and computer). */
+function describeOaiyId(id: string, list: CustomService[]): { kind: string; model: string } {
   const [, kind = '', ...rest] = id.split(':');
-  return { kind: id.startsWith('voice:') ? 'transcription' : kind, model: rest.join(':') };
+  if (id.startsWith('voice:')) return { kind: 'transcription', model: rest.join(':') };
+  return { kind, model: rest.length ? describeService(id, list).text : '' };
 }
 
 /**
@@ -145,14 +138,20 @@ export function nodeNotice(nodeType: string, data: Record<string, unknown>, env:
   const picked = typeof data.service === 'string' ? data.service.trim() : '';
   const id = picked || DEFAULT_SERVICE[nodeType] || '';
   if (!id || LEGACY_SERVICE_VALUES.has(id)) return null;
-  if (resolveService(id, { custom: env.custom, desktop: env.desktop })) return null;
+  const found = resolveService(id, { custom: env.custom, desktop: env.desktop });
+  // A paired worker's model is there, but its computer does not answer now (OAIY Network): said, as a run would fail.
+  if (found?.nodeId && found.ready === false) {
+    const { text, worker } = describeService(found.id, env.desktop);
+    return `“${text.replace(/ on .*$/, '')}” runs on ${worker}, which does not answer now (OAIY Network). Check it in OAIY → Networking, or pick another model.`;
+  }
+  if (found) return null;
   if (isOaiyServiceId(id)) {
     if (!env.inOaiy) return 'This uses OAIY\'s own engine, which flows reach in the OAIY app. Open the flow there, or pick another service.';
     if (!env.loaded) return null;
     if (id.startsWith('voice:')) {
       return 'OAIY Voice is not installed, so nothing here writes out recordings. Install it in OAIY → Services, or pick another service.';
     }
-    const { kind, model } = describeOaiyId(id);
+    const { kind, model } = describeOaiyId(id, env.desktop);
     const what = KIND_LABEL[kind] || `${kind} model`;
     return model
       ? `The ${what} “${model}” is not installed in OAIY's engine (or its files are missing). Add it in OAIY → Engines, or pick another service.`
@@ -173,10 +172,14 @@ export function nodeNotice(nodeType: string, data: Record<string, unknown>, env:
 export function initialServiceFor(nodeType: string, env: AvailabilityEnv): string | null {
   if (!SERVICE_NODE_TYPES.has(nodeType)) return null;
   const all = [...env.desktop, ...env.custom].filter((s) => s.nodeTypes?.includes(nodeType as never));
-  const engine = all.filter((s) => s.group === 'engine');
-  // `engine:<kind>` follows the default set in OAIY → Engines.
-  if (engine.length > 0 && engine[0].kind && engine[0].kind !== 'transcription') return `engine:${engine[0].kind}`;
-  const pick = engine[0] ?? all[0];
+  // (a paired worker's model that does not answer now is not started on)
+  const engine = all.filter((s) => s.group === 'engine' && s.ready !== false);
+  // `engine:<kind>` follows the default set in OAIY → Engines, where there is one: where only a paired worker has
+  // a model of the kind (not chosen as the default), `engine:<kind>` names nothing, and the node starts on that model.
+  const kind = engine[0]?.kind;
+  const byDefault = kind ? engineDefault(all, kind) : null;
+  if (kind && kind !== 'transcription' && byDefault && byDefault.ready !== false) return `engine:${kind}`;
+  const pick = engine.find((s) => !s.nodeId) ?? engine[0] ?? all.find((s) => s.group !== 'engine' && s.ready !== false);
   return pick ? pick.id : null;
 }
 

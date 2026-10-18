@@ -174,7 +174,20 @@ const StatusBadge = memo(function StatusBadge({ status }: { status: Job['status'
 /**
  * What a finished job returned: its pictures, or its fields.
  */
-const JobOutputViewer = memo(function JobOutputViewer({ result }: { result: unknown }) {
+/** What a run's result calls a value, in words: the node it came from by its label, `__output__` as the result. */
+function resultLabel(key: string, graph: { nodes?: Array<{ id: string; type?: string; data?: Record<string, unknown> }> } | undefined): string {
+  if (key === '__output__') return 'Result';
+  const node = graph?.nodes?.find((n) => n.id === key);
+  if (node) {
+    const label = typeof node.data?.label === 'string' && node.data.label.trim() ? node.data.label.trim() : '';
+    if (label) return label;
+    const type = String(node.type || 'node').replace(/_/g, ' ');
+    return type.charAt(0).toUpperCase() + type.slice(1);
+  }
+  return key.replace(/^_+|_+$/g, '') || key;
+}
+
+const JobOutputViewer = memo(function JobOutputViewer({ result, graph }: { result: unknown; graph?: Parameters<typeof resultLabel>[1] }) {
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [selectedImageIndex, setSelectedImageIndex] = useState(0);
   const [imageErrors, setImageErrors] = useState<Set<number>>(new Set());
@@ -285,16 +298,20 @@ const JobOutputViewer = memo(function JobOutputViewer({ result }: { result: unkn
 
       return (
         <div className="space-y-1.5">
-          {entries.slice(0, 10).map(([key, value]) => {
+          {entries
+            // (the result is also each output node's: one shown once, as the node's)
+            .filter(([key, value], _i, all) => key !== '__output__' || all.length === 1 || !all.some(([k, v]) => k !== key && v === value))
+            .slice(0, 10)
+            .map(([key, value]) => {
             const valueImageUrls = extractImageUrls(value);
             if (valueImageUrls.length > 0) {
               return (
                 <div key={key} className="flex flex-col gap-1">
-                  <span className="font-mono text-[11px] font-semibold text-signal-cyan">{key}</span>
+                  <span className="text-[11px] font-semibold text-signal-cyan">{resultLabel(key, graph)}</span>
                   {valueImageUrls.length === 1 && isSafeUrl(valueImageUrls[0]) ? (
                     <img
                       src={valueImageUrls[0]}
-                      alt={key}
+                      alt={resultLabel(key, graph)}
                       className="max-h-40 w-full rounded-[var(--r-sm)] border border-edge-primary object-contain"
                     />
                   ) : (
@@ -308,7 +325,7 @@ const JobOutputViewer = memo(function JobOutputViewer({ result }: { result: unkn
 
             return (
               <div key={key} className="flex flex-col">
-                <span className="font-mono text-[11px] font-semibold text-signal-cyan">{key}</span>
+                <span className="text-[11px] font-semibold text-signal-cyan">{resultLabel(key, graph)}</span>
                 <span className="break-words pl-2 font-mono text-[11px] text-content-secondary">
                   {formatValue(value)}
                 </span>
@@ -420,7 +437,7 @@ const JobItem = memo(function JobItem({ job, onAbort, onNavigate, showAbort, isE
         </div>
       )}
 
-      {isExpanded && hasOutput && <JobOutputViewer result={job.result} />}
+      {isExpanded && hasOutput && <JobOutputViewer result={job.result} graph={job.graph} />}
     </li>
   );
 });

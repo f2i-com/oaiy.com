@@ -32,6 +32,16 @@ export const MAX_LOOP_DETECTION_ITERATIONS = 1000;
 export const MAX_JOB_HISTORY_SIZE = 50;
 
 /**
+ * How many of the newest finished jobs keep everything (graph, inputs, result,
+ * logs). Older ones keep what ran when and how it ended, and their last logs:
+ * 50 full runs held every picture they made in memory.
+ */
+export const MAX_FULL_JOB_HISTORY = 10;
+
+/** The logs an older job in history keeps (its last ones). */
+export const SLIM_JOB_HISTORY_LOGS = 50;
+
+/**
  * Timeout (ms) for force-aborting a job after abort is requested.
  * If a job doesn't respond to abort within this time, it's forcefully terminated.
  */

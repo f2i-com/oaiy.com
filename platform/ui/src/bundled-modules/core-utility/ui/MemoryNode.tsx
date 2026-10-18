@@ -67,8 +67,8 @@ function MemoryNode({ data }: MemoryNodeProps) {
   }, [data.key]);
 
   const collapsedPreview = (
-    <div className="text-slate-400">
-      <span className={mode === 'read' ? 'text-cyan-400' : 'text-orange-400'}>{mode.toUpperCase()}</span>
+    <div className="text-slate-600 dark:text-slate-400">
+      <span className={mode === 'read' ? 'text-cyan-700 dark:text-cyan-400' : 'text-orange-700 dark:text-orange-400'}>{mode.toUpperCase()}</span>
       {data.key && <span className="ml-1 font-mono text-[10px]">{data.key}</span>}
     </div>
   );
@@ -76,7 +76,7 @@ function MemoryNode({ data }: MemoryNodeProps) {
   const inputHandles = useMemo<HandleConfig[]>(() => {
     if (mode === 'write') {
       return [
-        { id: 'value', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'value', labelColor: 'text-blue-400', size: 'lg' },
+        { id: 'value', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'value', labelColor: 'text-blue-700 dark:text-blue-400', size: 'lg' },
       ];
     }
     return [];

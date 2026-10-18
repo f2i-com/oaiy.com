@@ -156,23 +156,23 @@ function TextChunkerNode({ data }: TextChunkerNodeProps) {
 
   const collapsedPreview = (
     <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-      <span className="text-amber-400">{currentMode.label}</span>
-      {isAutoDetected && <span className="text-emerald-400 ml-1">●</span>}
+      <span className="text-amber-700 dark:text-amber-400">{currentMode.label}</span>
+      {isAutoDetected && <span className="text-emerald-700 dark:text-emerald-400 ml-1">●</span>}
       {showChunkSize && (
         <>
           <span className="text-slate-500"> · </span>
-          <span className="text-amber-300">{chunkSize}</span>
+          <span className="text-amber-700 dark:text-amber-300">{chunkSize}</span>
         </>
       )}
     </div>
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'text', type: 'target', position: Position.Left, color: '!bg-amber-500', label: 'input', labelColor: 'text-amber-400', size: 'md' },
+    { id: 'text', type: 'target', position: Position.Left, color: '!bg-amber-500', label: 'input', labelColor: 'text-amber-700 dark:text-amber-400', size: 'md' },
   ], []);
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'chunks', type: 'source', position: Position.Right, color: '!bg-amber-500', label: 'chunks', labelColor: 'text-amber-400', size: 'lg' },
+    { id: 'chunks', type: 'source', position: Position.Right, color: '!bg-amber-500', label: 'chunks', labelColor: 'text-amber-700 dark:text-amber-400', size: 'lg' },
   ], []);
 
   const showBodyProperties = data.showBodyProperties !== false;
@@ -198,7 +198,7 @@ function TextChunkerNode({ data }: TextChunkerNodeProps) {
             <div className="flex items-center justify-between mb-1">
               <label className="text-slate-600 dark:text-slate-400 text-xs">Content Type</label>
               {isAutoDetected && (
-                <span className="text-emerald-400 text-[10px] flex items-center gap-1">
+                <span className="text-emerald-700 dark:text-emerald-400 text-[10px] flex items-center gap-1">
                   <span>●</span> Auto
                 </span>
               )}

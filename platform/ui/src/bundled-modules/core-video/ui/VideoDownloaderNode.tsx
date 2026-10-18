@@ -52,9 +52,9 @@ function VideoDownloaderNode({ data }: VideoDownloaderNodeProps) {
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-            <span className={mode === 'video' ? 'text-orange-400' : 'text-red-400'}>{mode}</span>
+            <span className={mode === 'video' ? 'text-orange-700 dark:text-orange-400' : 'text-red-700 dark:text-red-400'}>{mode}</span>
             <span className="mx-0.5">|</span>
-            <span className="text-orange-300">{quality}</span>
+            <span className="text-orange-700 dark:text-orange-300">{quality}</span>
         </div>
     );
 
@@ -198,7 +198,7 @@ function VideoDownloaderNode({ data }: VideoDownloaderNodeProps) {
                             <svg className="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                             </svg>
-                            <span className="text-xs text-orange-300 truncate flex-1">
+                            <span className="text-xs text-orange-700 dark:text-orange-300 truncate flex-1">
                                 {data.duration ? `${data.duration.toFixed(1)}s` : 'Downloaded'}
                                 {data.width && data.height && ` (${data.width}x${data.height})`}
                             </span>

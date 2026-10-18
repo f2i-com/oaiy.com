@@ -48,8 +48,8 @@ function VideoAppendNode({ data }: VideoAppendNodeProps) {
     }, []);
 
     const collapsedPreview = (
-        <div className="text-slate-400">
-            <span className="text-purple-400">{totalCount}</span>
+        <div className="text-slate-600 dark:text-slate-400">
+            <span className="text-purple-700 dark:text-purple-400">{totalCount}</span>
             <span className="ml-1 text-[10px]">{usingArray ? 'array' : 'videos'}</span>
         </div>
     );
@@ -90,14 +90,14 @@ function VideoAppendNode({ data }: VideoAppendNodeProps) {
                         <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7" />
                         </svg>
-                        <span className="text-slate-400">
+                        <span className="text-slate-600 dark:text-slate-400">
                             {usingArray ? (
                                 <>
-                                    <span className="text-purple-400 font-medium">{totalCount}</span> videos from array
+                                    <span className="text-purple-700 dark:text-purple-400 font-medium">{totalCount}</span> videos from array
                                 </>
                             ) : (
                                 <>
-                                    <span className="text-purple-400 font-medium">{totalCount}</span> video{totalCount !== 1 ? 's' : ''} connected
+                                    <span className="text-purple-700 dark:text-purple-400 font-medium">{totalCount}</span> video{totalCount !== 1 ? 's' : ''} connected
                                 </>
                             )}
                         </span>
@@ -131,7 +131,7 @@ function VideoAppendNode({ data }: VideoAppendNodeProps) {
                     </div>
 
                     {/* Info */}
-                    <div className="flex items-start gap-2 px-2 py-1.5 bg-purple-900/20 border border-purple-800/30 rounded text-xs text-purple-300">
+                    <div className="flex items-start gap-2 px-2 py-1.5 bg-purple-900/20 border border-purple-800/30 rounded text-xs text-purple-700 dark:text-purple-300">
                         <svg className="w-4 h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>

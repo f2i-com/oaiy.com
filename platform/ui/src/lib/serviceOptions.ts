@@ -56,7 +56,7 @@ function labelFor(s: CustomService): string {
 export function serviceOptions(
   nodeType: string,
   env: AvailabilityEnv,
-  onAdd: (nodeType: string) => void,
+  onAdd: (nodeType: string, choose?: (serviceId: string) => void) => void,
 ): PropertyOption[] {
   const all = [...env.desktop, ...env.custom];
   const anyKind = !nodeType || nodeType === 'service_call';
@@ -77,7 +77,7 @@ export function serviceOptions(
     if (!def) return;
     options.push({
       value: `engine:${kind}`,
-      label: `Default ${KIND_NAME[kind] ?? `${kind} model`} (${def.nodeId ? `${def.model} on ${def.nodeName || 'a paired computer'}` : def.model || def.name})`,
+      label: `Default ${KIND_NAME[kind] ?? `${kind} model`} (${def.nodeId ? `${def.model} on ${def.nodeName || 'a paired computer'}` : def.model || def.name})${def.nodeId && def.ready === false ? ' (offline)' : ''}`,
       description: 'Follows the default set in OAIY → Engines',
       group: GROUP_ENGINE,
     });
@@ -109,7 +109,8 @@ export function serviceOptions(
       ? "Models: OAIY → Engines. Python rigs and local servers: OAIY → Services. Or describe an HTTP service here."
       : 'Describe an HTTP service for this node',
     group: GROUP_MORE,
-    action: () => onAdd(nodeType),
+    // (the service added is picked on the node it was added from)
+    action: (choose) => onAdd(nodeType, choose),
   });
   return options;
 }

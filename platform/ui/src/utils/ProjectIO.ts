@@ -12,6 +12,7 @@ import type {
   LogEntry,
 } from 'oaiy-core';
 import { getModuleLoader } from 'oaiy-core';
+import { triggerDownloadFromBlob } from '../lib/download';
 import { withoutRunOutputs } from './runOutputs';
 import {
   defaultLLMEndpoints,
@@ -286,12 +287,7 @@ export const sanitizeProjectForExport = (project: OAIYProject): ExportedProject 
 export const exportProjectToFile = (project: OAIYProject): void => {
   const sanitizedProject = sanitizeProjectForExport(project);
   const blob = new Blob([JSON.stringify(sanitizedProject, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `oaiy-project-${project.name.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
+  triggerDownloadFromBlob(`oaiy-project-${project.name.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}.json`, blob);
 };
 
 /**

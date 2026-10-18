@@ -180,6 +180,34 @@ for (const rel of SURFACES) {
 }
 if (!surfaceProblems) pass(`${SURFACES.length} surfaces: no hard-coded slate/blue classes, and no modal of their own`);
 
+// ---------------------------------------------------------------------------
+// The node UIs keep their own colours, but each pale text colour (a 300 or 400
+// shade, made for the dark canvas) has a light-mode pair: on the light canvas
+// it was text nobody could read. `text-cyan-700 dark:text-cyan-400`, not
+// `text-cyan-400` alone.
+// ---------------------------------------------------------------------------
+const NODE_UIS = fs.readdirSync(path.join(SRC, 'bundled-modules'))
+  .flatMap((mod) => {
+    const dir = path.join(SRC, 'bundled-modules', mod, 'ui');
+    return fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.tsx')).map((f) => path.join('bundled-modules', mod, 'ui', f)) : [];
+  });
+const PALE_ALONE = /(?<![:a-z!/-])text-[a-z]+-(?:300|400)\b/g;
+console.log('\n-- the node UIs\' pale text, paired for the light theme --');
+let paleProblems = 0;
+for (const rel of NODE_UIS) {
+  const text = stripComments(fs.readFileSync(path.join(SRC, rel), 'utf8')).replace(/^\s*\/\/.*$/gm, '');
+  const hits = [...new Set(text.match(PALE_ALONE) ?? [])];
+  if (hits.length) {
+    fail(`${rel}: pale text with no light-mode pair: ${hits.slice(0, 8).join(' ')}${hits.length > 8 ? ` (+${hits.length - 8})` : ''}`);
+    paleProblems++;
+  }
+}
+if (!paleProblems) pass(`${NODE_UIS.length} node UIs: every pale text colour has a light-mode pair`);
+const paleProbe = 'className="text-cyan-400 text-cyan-700 dark:text-cyan-400 hover:text-teal-300 text-slate-500"';
+const paleCaught = paleProbe.match(PALE_ALONE) ?? [];
+if (paleCaught.length === 1) pass('the check catches a pale colour alone and passes a paired one');
+else fail(`the pale-text check itself: expected 1 hit in the probe, got ${paleCaught.length} (${paleCaught.join(' ')})`);
+
 // The check itself: a known offender is caught, and a token class is not.
 const probe = 'className="text-slate-500 dark:bg-slate-800 hover:bg-blue-600/20 text-content-secondary bg-surface-tertiary"';
 const caught = probe.match(HARD_CODED) ?? [];
