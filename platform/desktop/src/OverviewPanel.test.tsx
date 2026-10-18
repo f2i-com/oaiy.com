@@ -532,7 +532,10 @@ describe('the Overview line about backups', () => {
 
   it('turns into a nudge after 30 days, with a button that opens Settings', async () => {
     dismissGuide();
-    backupStatusMock.mockResolvedValue(backupStatus({ lastBackupAt: new Date(Date.now() - 42 * 86_400_000).toISOString() }));
+    // 42 calendar days back at the same wall-clock time: 42 × 24 h crosses a daylight-saving change an hour off.
+    const at = new Date();
+    at.setDate(at.getDate() - 42);
+    backupStatusMock.mockResolvedValue(backupStatus({ lastBackupAt: at.toISOString() }));
     await mount();
     expect(text()).toContain('It has been 42 days since your last backup');
     await act(async () => button('Back up now')!.click());
