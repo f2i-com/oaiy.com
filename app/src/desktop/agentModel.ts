@@ -23,8 +23,12 @@ import { OAIY_ENGINE_WINDOW } from '../agent/context';
 /** The person's choice, as the desktop keeps it. */
 export type AgentModel = EngineChoice | { source: 'chatgpt'; model?: string } | ProviderChoice;
 
-/** The engine: the model chosen in Engines, or (`model`) a paired worker's language model, `name` the worker's. */
-export type EngineChoice = { source: 'engine'; model?: string; name?: string };
+/**
+ * The engine: the model chosen in Engines, or (`model`) a paired worker's language model, `name` the worker's.
+ * `viaDefault`: the worker's model is the engine's default (Engines, Other computers, or the Agent's model menu), not a
+ * choice of the Agent's own in Settings → Agent; choosing another in Engines moves the Agent with it.
+ */
+export type EngineChoice = { source: 'engine'; model?: string; name?: string; viaDefault?: true };
 
 /** A paired worker's language model's id (`engine:llm:node.<nodeId>/<model>`): its node and its name there; null for anything else. */
 export function workerModel(id: string): { node: string; model: string } | null {
@@ -72,7 +76,7 @@ export function parseAgentModel(body: unknown): AgentModel | null {
       const onWorker = isRecord(body) && typeof body.engineDefault === 'string' ? body.engineDefault.trim() : '';
       if (!workerModel(onWorker)) return ENGINE;
       const label = isRecord(body) && typeof body.engineDefaultName === 'string' ? body.engineDefaultName.trim() : '';
-      return label ? { source: 'engine', model: onWorker, name: label } : { source: 'engine', model: onWorker };
+      return label ? { source: 'engine', model: onWorker, name: label, viaDefault: true } : { source: 'engine', model: onWorker, viaDefault: true };
     }
     const label = isRecord(body) && typeof body.providerName === 'string' ? body.providerName.trim() : '';
     return label ? { source: 'engine', model: name, name: label } : { source: 'engine', model: name };

@@ -487,6 +487,15 @@ async fn a_workers_model_can_be_this_computers_default() {
     // another language model chosen here since, in Engines: this computer's own again
     assert!(primary::default_chat_entry_of(&primary, Some("big")).is_none());
     assert!(primary.inner().defaults().get("llm").is_none());
+    // chosen as Engines and the Agent's model menu choose (`PUT /api/engines/defaults`): a worker's, checked as the settings
+    // route checks it, then this computer's own again even where it is the one the worker's stood in for
+    let llm = format!("engine:llm:node.{node_id}/tiny-llm");
+    primary::choose_default_of(&primary, "llm", Some(&llm)).await.unwrap();
+    assert_eq!(primary.inner().defaults().get("llm").unwrap().id, llm);
+    assert!(primary::choose_default_of(&primary, "llm", Some("engine:llm:node.nobody/tiny-llm")).await.is_err());
+    assert_eq!(primary.inner().defaults().get("llm").unwrap().id, llm, "a refused choice changes nothing");
+    primary::choose_default_of(&primary, "llm", None).await.unwrap();
+    assert!(primary.inner().defaults().get("llm").is_none() && primary::default_chat_entry_of(&primary, Some("flash")).is_none());
     // let go by hand, and with the worker unpaired
     let (_, v) = set(json!({ "image": null })).await;
     assert!(v["defaults"].get("image").is_none(), "{v}");

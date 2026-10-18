@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use self::identity::Identity;
 use self::store::{Peers, Role, Settings};
 
-pub use primary::{apply_defaults, chat_on_worker, default_chat_entry, remote_services, router, service_target, ServiceTarget};
+pub use primary::{apply_defaults, chat_on_worker, choose_default, default_chat_entry, remote_services, router, service_target, ServiceTarget};
 
 /// The protocol a worker and a primary speak (`/worker/v1`).
 pub const PROTOCOL: u32 = 2;

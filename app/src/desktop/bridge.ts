@@ -65,6 +65,19 @@ export function readContact(value: unknown): Contact | null {
   };
 }
 
+/** A paired computer's language model, as the desktop's engine catalogue lists it (OAIY Network). */
+export interface NetworkModel {
+  /** `engine:llm:node.<nodeId>/<model>`: what `chooseEngineModel` takes. */
+  id: string;
+  model: string;
+  node: string;
+  nodeName: string;
+  /** It answers now (its computer is online and its engines up). */
+  ready: boolean;
+  /** It is this desktop's engine's language model now, in place of its own. */
+  chosen: boolean;
+}
+
 export class DesktopError extends Error {
   constructor(message: string, readonly status = 0, readonly code = '') {
     super(message);
@@ -407,6 +420,20 @@ export class Desktop {
   /** Choose the language model OAIY's engines run, as their Engines page does (it loads when it is first asked). */
   async chooseEngineModel(model: string, signal?: AbortSignal): Promise<void> {
     await reply(await fetch(`${this.origin}/api/engines/defaults`, { method: 'PUT', headers: this.headers(), body: JSON.stringify({ group: 'llm', model }), signal }));
+  }
+
+  /**
+   * The language models of the computers this desktop uses over OAIY Network, as its engine catalogue lists them
+   * (`engine:llm:node.<nodeId>/<model>`, each with its computer's name and whether it answers now). Choosing one with
+   * `chooseEngineModel` makes it the engine's: the Agent, the phone's agents and flows run there.
+   */
+  async networkModels(signal?: AbortSignal): Promise<NetworkModel[]> {
+    const body = await reply(await fetch(`${this.origin}/api/ai/engine/services`, { headers: this.headers(), signal }));
+    const list = isRecord(body) && Array.isArray(body.services) ? body.services : [];
+    return list
+      .filter(isRecord)
+      .filter((s) => s.kind === 'llm' && typeof s.nodeId === 'string' && typeof s.id === 'string' && typeof s.model === 'string')
+      .map((s) => ({ id: String(s.id), model: String(s.model), node: String(s.nodeId), nodeName: typeof s.nodeName === 'string' && s.nodeName ? s.nodeName : 'another computer', ready: s.ready !== false, chosen: s.default === true }));
   }
 
   /** The flows stored on the desktop; `macro`: one the editor keeps as a macro (a step other flows use), as the desktop says. */

@@ -152,9 +152,12 @@ Once paired, a worker's models are in the primary's engine catalogue (`GET /api/
   use it; a worker's language model as the default answers the engine's chats
   (`/api/ai/providers/oaiy-engine/v1/chat/completions`, and chats that name no provider when none is switched on),
   and the Agent on *the model chosen in Engines* runs on it (`GET /api/agent/preferences` answers it as
-  `engineDefault`). A worker's language model as the default is whichever it runs now. Choosing a default in the
-  Engines tab (or with the Agent's `model_set_default`) makes this computer's own the default again: the default it
-  had is kept beside the worker's, and one chosen since takes its place. Unpairing the worker gives its kinds back. A
+  `engineDefault`). A worker's language model as the default is whichever it runs now. The Agent's model menu lists
+  the paired workers' language models too, each worker's under its name, and choosing one there makes it the default
+  as *Make default* does (`PUT /api/engines/defaults` takes a worker's id, `engine:llm:node.<id>/<model>`, and hands it
+  to the network). Choosing one of this computer's own in the Engines tab, in the Agent's menu, or with the Agent's
+  `model_set_default` makes this computer's own the default again, even the one the worker's stood in for: the
+  default it had is kept beside the worker's, and one chosen since takes its place. Unpairing the worker gives its kinds back. A
   default on a worker that is offline says so when it is used; one not heard from since this computer started
   leaves this computer's own in place until it is. Set with `PUT /api/network/settings`
   `{"defaults": {"image": "engine:image:node.<id>/<model>"}}` (`null` gives it back), listed in `GET

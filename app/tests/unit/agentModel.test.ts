@@ -166,8 +166,10 @@ describe('the provider each kind of conversation runs on', () => {
   it("on the engine, where a paired worker's language model is the engine's default (OAIY Network): that worker, through the desktop", () => {
     const body = { model: { source: 'engine' }, engineDefault: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m', engineDefaultName: 'Rig' };
     const choice = parseAgentModel(body)!;
-    expect(choice).toEqual({ source: 'engine', model: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m', name: 'Rig' });
+    expect(choice).toEqual({ source: 'engine', model: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m', name: 'Rig', viaDefault: true });
     expect(providerFor('project', choice, ENGINE_PROVIDER, DESK, null)!.baseUrl).toBe(`${DESK.origin}/api/network/nodes/abc123/v1`);
+    // (the Agent's own choice of the same model, in Settings → Agent, is not the engine's default)
+    expect(parseAgentModel({ model: { source: 'engine', model: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m' }, providerName: 'Rig' })).toEqual({ source: 'engine', model: 'engine:llm:node.abc123/qwen3.5-9b-q4-k-m', name: 'Rig' });
     // the default back on this computer: the engine's own again, and a change the Agent sees
     expect(parseAgentModel({ model: { source: 'engine' } })).toEqual(ENGINE);
     expect(sameModel(choice, ENGINE)).toBe(false);

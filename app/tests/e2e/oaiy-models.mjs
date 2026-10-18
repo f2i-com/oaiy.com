@@ -2,7 +2,9 @@
 // the Mac) and a mock OAIY Desktop the page is given, as OAIY's window gives it. One menu lists the engine's models,
 // each with where it runs, and chooses one in Engines (through the desktop), which loads it where it runs and has the
 // other let go of what it held (as the engines do: one model loaded at a time); the menu says how its loading goes;
-// chats then are answered by the model chosen.
+// chats then are answered by the model chosen. A computer paired over OAIY Network lends its language model: the menu
+// lists it under that computer's name, choosing it makes it the engine's (the Agent then runs there, through the
+// desktop), and choosing one of this Mac's takes the engine back.
 //   node tests/e2e/oaiy-models.mjs
 import { existsSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
@@ -21,6 +23,11 @@ const ON_CARD = 'qwen3.8-27b';
 const engines = { default: 'qwen3.8-27b', card: 'qwen3.8-27b', state: 'ready', looks: 0, mac: null };
 const chats = [];
 const asked = [];
+// The paired computer (OAIY Network) and its language model, by the id the desktop's catalogue gives it; `chosen`: the
+// engine's default is that one, in place of this Mac's.
+const NODE = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+const REMOTE = `engine:llm:node.${NODE}/Qwen3.8-Flash-Next`;
+const network = { chosen: false, chats: [] };
 
 function discovery(origin) {
   if (engines.state === 'starting' && ++engines.looks >= 2) engines.state = 'ready';
@@ -83,7 +90,25 @@ const desktop = createHttpServer(async (req, res) => {
   const body = await read(req);
   const url = req.url.split('?')[0];
   asked.push({ method: req.method, url, auth: req.headers.authorization, body: body ? JSON.parse(body) : null });
+  if (req.method === 'PUT' && url === '/api/engines/defaults' && JSON.parse(body).model === REMOTE) {
+    network.chosen = true;
+    return reply(res, 200, { group: 'llm', model: REMOTE });
+  }
+  if (req.method === 'GET' && url === '/api/ai/engine/services') {
+    return reply(res, 200, { running: true, services: [{ id: REMOTE, kind: 'llm', model: 'Qwen3.8-Flash-Next', nodeId: NODE, nodeName: 'Desktop', locality: 'network', ready: true, default: network.chosen }] });
+  }
+  if (req.method === 'GET' && url === '/api/agent/preferences') {
+    return reply(res, 200, network.chosen ? { model: { source: 'engine' }, engineDefault: REMOTE, engineDefaultName: 'Desktop' } : { model: { source: 'engine' } });
+  }
+  if (req.method === 'POST' && url === `/api/network/nodes/${NODE}/v1/chat/completions`) {
+    network.chats.push(JSON.parse(body));
+    res.setHeader('content-type', 'text/event-stream');
+    const say = (e) => `data: ${JSON.stringify(e)}\n\n`;
+    return res.end(say({ choices: [{ index: 0, delta: { content: 'Answered on Desktop.' } }] }) + say({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + 'data: [DONE]\n\n');
+  }
   if (req.method === 'PUT' && url === '/api/engines/defaults') {
+    // (one of this Mac's chosen: a paired computer's that was the default is not any more)
+    network.chosen = false;
     engines.default = JSON.parse(body).model;
     const card = engines.default === ON_CARD;
     Object.assign(engines, card ? { card: engines.default, state: 'starting', looks: 0, mac: null } : { card: null, state: 'stopped', mac: engines.default });
@@ -166,6 +191,50 @@ try {
     const m = await menu('model');
     expect(m.value === 'qwen3.8-27b' && m.shown === 'OAIY · qwen3.8-27b · eGPU · ready', JSON.stringify(m));
     expect(m.options.includes('OAIY · qwen3.5-9b · Mac'), 'the Mac still shown holding its model: ' + JSON.stringify(m.options));
+  });
+
+  await check("a paired computer's language model is in the menu, under that computer's name", async () => {
+    await page.waitForFunction(() => [...(document.querySelector('select.model.pick')?.options ?? [])].some((o) => o.textContent === 'Qwen3.8-Flash-Next · Desktop'), { timeout: 15_000 }).catch(async (e) => {
+      throw new Error(`${e.message}\n${JSON.stringify(await menu('model'))}`);
+    });
+    const group = await page.$eval('select.model.pick', (s) => [...s.querySelectorAll('optgroup')].map((g) => g.label));
+    expect(group.length === 1 && group[0] === 'On Desktop (OAIY Network)', JSON.stringify(group));
+    const m = await menu('model');
+    expect(m.shown === 'OAIY · qwen3.8-27b · eGPU · ready' && m.options.at(-1) === 'AI providers…', JSON.stringify(m));
+  });
+
+  await check("choosing it makes it the engine's, through the desktop, and the Agent runs there", async () => {
+    await page.select('select.model.pick', REMOTE);
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("OAIY's engine now runs Qwen3.8-Flash-Next on Desktop, over OAIY Network"), { timeout: 10_000 });
+    const put = asked.filter((a) => a.url === '/api/engines/defaults').at(-1);
+    expect(put.body.group === 'llm' && put.body.model === REMOTE && put.auth === 'Bearer desktop-token', JSON.stringify(put));
+    await page.waitForFunction(() => document.querySelector('select.model.pick')?.selectedOptions[0]?.textContent === 'Qwen3.8-Flash-Next · Desktop', { timeout: 10_000 }).catch(async (e) => {
+      throw new Error(`${e.message}\n${JSON.stringify(await menu('model'))}`);
+    });
+    expect(await page.$eval('button[title="AI provider"]', (b) => b.hidden), 'the provider chip took the menu\'s place');
+    expect(!(await page.$eval('.chat-log', (l) => l.textContent.includes("The Agent now runs on OAIY's engine"))), 'the change was said wrongly');
+    const before = chats.length;
+    await page.type('.chat-input', 'And now?');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Answered on Desktop.'), { timeout: 30_000 }).catch(async (e) => {
+      throw new Error(`${e.message}\nlog: ${(await page.$eval('.chat-log', (l) => l.textContent)).slice(-600)}`);
+    });
+    expect(network.chats.length === 1 && network.chats[0].model === 'Qwen3.8-Flash-Next' && chats.length === before, `remote ${JSON.stringify(network.chats.map((c) => c.model))}, local ${chats.length - before}`);
+  });
+
+  await check("choosing one of this Mac's again takes the engine back from the paired computer", async () => {
+    await page.select('select.model.pick', 'qwen3.8-27b');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("OAIY's engine now runs qwen3.8-27b, on the eGPU"), { timeout: 10_000 });
+    expect(!network.chosen, 'the paired computer is still the default');
+    await page.waitForFunction(() => document.querySelector('select.model.pick')?.selectedOptions[0]?.textContent.startsWith('OAIY · qwen3.8-27b · eGPU'), { timeout: 10_000 }).catch(async (e) => {
+      throw new Error(`${e.message}\n${JSON.stringify(await menu('model'))}`);
+    });
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('qwen3.8-27b is loaded on the eGPU.'), { timeout: 20_000 }).catch(() => {});
+    const before = network.chats.length;
+    await page.type('.chat-input', 'Back here?');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction((n) => (document.querySelector('.chat-log')?.textContent.match(/Answered by qwen3\.8-27b\./g) ?? []).length >= n, { timeout: 30_000 }, 1);
+    expect(network.chats.length === before, 'a chat still went to the paired computer');
   });
 
   await check('the header drawn again with nothing changed leaves its menu as it is (one open stays open)', async () => {

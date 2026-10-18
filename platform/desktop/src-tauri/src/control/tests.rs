@@ -554,9 +554,10 @@ async fn every_tool_runs_and_a_desktop_without_its_routes_is_explained() {
     // A paired worker's language model (OAIY Network) goes to the preference route, which checks it is paired.
     let r = call(&app, None, "agent_model_set", json!({ "source": "engine", "model": "engine:llm:node.abc123/qwen" })).await;
     assert!(is_error(&r) && text(&r).contains("no PUT /api/agent/preferences"), "{r}");
-    // A paired worker's model as a group's default (OAIY Network) goes to the network's settings, not the engines'.
+    // A paired worker's model as a group's default (OAIY Network) goes to the engines' defaults route too, which hands it to the
+    // network: with none open here, it says so.
     let r = call(&app, None, "model_set_default", json!({ "group": "image", "model": "engine:image:node.abc123/flux" })).await;
-    assert!(is_error(&r) && text(&r).contains("no PUT /api/network/settings"), "{r}");
+    assert!(is_error(&r) && text(&r).contains("OAIY Network is not on here"), "{r}");
     // A provider is named by its id, and only with source provider.
     let r = call(&app, None, "agent_model_set", json!({ "source": "provider" })).await;
     assert!(is_error(&r) && text(&r).contains("name the provider"), "{r}");

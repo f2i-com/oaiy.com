@@ -1060,6 +1060,25 @@ async fn set_defaults(net: &Network, change: &std::collections::BTreeMap<String,
     Ok(())
 }
 
+/// Choose `kind`'s default: one of a paired worker's models (`id`, `engine:<kind>:node.<nodeId>/<model>`), or this
+/// computer's own again (None), as `PUT /api/engines/defaults` does for the Engines page and the Agent's model menu.
+/// Choosing among the models of a computer already paired is a choice of model, not of trust: the pairing was that.
+/// With Network not open here there is no worker to choose, and None has nothing to undo.
+pub async fn choose_default(kind: &str, id: Option<&str>) -> Result<(), String> {
+    match super::shared() {
+        Some(net) => choose_default_of(net, kind, id).await,
+        None if id.is_some() => Err("OAIY Network is not on here: pair the other computer in Setup, Networking".into()),
+        None => Ok(()),
+    }
+}
+
+pub(crate) async fn choose_default_of(net: &Network, kind: &str, id: Option<&str>) -> Result<(), String> {
+    let change = std::collections::BTreeMap::from([(kind.to_string(), id.map(str::to_owned))]);
+    let uses = net.settings().uses();
+    set_defaults(net, &change, uses, false).await?;
+    set_defaults(net, &change, uses, true).await
+}
+
 /// `/api/network/nodes/:id/gateway/<path>`: the worker's engines' media routes (a picture, a song, a video's job)
 /// and the files they made, as this desktop's own gateway route serves its own.
 async fn node_gateway(State(net): State<Network>, Path((node_id, path)): Path<(String, String)>, req: Request) -> Response {

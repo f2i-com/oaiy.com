@@ -587,17 +587,11 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
         "model_download_status" => model_download_status(d).await,
         "model_set_default" => {
             let (group, model) = (a.req("group"), a.req("model"));
-            let mut on_worker = serde_json::Map::new();
-            // (a paired worker's model, OAIY Network: this computer's default of its group, kept by the network's settings)
+            // (a paired worker's model, OAIY Network, or this computer's own, which lets go of a worker's: the route does both)
+            d.put("/api/engines/defaults", json!({ "group": group, "model": model })).await?;
             if model.starts_with(&format!("engine:{group}:node.")) {
-                on_worker.insert(group.to_string(), json!(model));
-                d.put("/api/network/settings", json!({ "defaults": on_worker })).await?;
                 return done(format!("The {group} group now uses {model}, on a paired computer."), json!({ "group": group, "model": model }));
             }
-            d.put("/api/engines/defaults", json!({ "group": group, "model": model })).await?;
-            // (this computer's own model chosen: a worker's that was the group's default is not any more)
-            on_worker.insert(group.to_string(), Value::Null);
-            let _ = d.put("/api/network/settings", json!({ "defaults": on_worker })).await;
             let later = if group == "llm" { " It loads when the language model next starts (engine_restart to load it now)." } else { "" };
             done(format!("The {group} group now uses {model}.{later}"), json!({ "group": group, "model": model }))
         }

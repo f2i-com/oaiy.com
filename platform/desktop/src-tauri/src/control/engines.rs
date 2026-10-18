@@ -4,7 +4,8 @@
 //! language model, and the engines' own log.
 //!
 //!   GET  /api/engines/defaults              → {running, defaults: {group: model|null}, models: {group: [id]}}
-//!   PUT  /api/engines/defaults {group, model} → {group, model}
+//!   PUT  /api/engines/defaults {group, model} → {group, model} (a paired worker's model, `engine:<group>:node.<id>/<model>`:
+//!                                             that computer's, over OAIY Network; one of this computer's: its own again)
 //!   PUT  /api/engines/egpu {model|null}     → {model, egpu} (a language model set to run on a Mac's eGPU, the others
 //!                                             as they were, and loading on it; null: the card lets go of its model)
 //!   POST /api/engines/llm/:action           → {llm: {state, resident, models, error}} (start | stop | restart)
@@ -147,7 +148,20 @@ async fn edit_config(ui: &str, change: impl Fn(&mut Value) -> Result<bool, (u16,
 }
 
 async fn set_default(State(control): State<Control>, Json(body): Json<DefaultBody>) -> Response {
-    answer(set_default_at(control.engines_ui(), body.group.trim(), &body.model).await)
+    let (group, model) = (body.group.trim(), body.model.trim());
+    // (a paired worker's model, OAIY Network: this computer's default of its group, kept by the network)
+    if model.starts_with(&format!("engine:{group}:node.")) {
+        return answer(crate::network::choose_default(group, Some(model)).await.map(|()| json!({ "group": group, "model": model })).map_err(|e| (400, e)));
+    }
+    let chosen = set_default_at(control.engines_ui(), group, model).await;
+    // (this computer's own chosen: a worker's that was the group's default is not any more, or the menu that chose it
+    // here would go on running the worker's)
+    if chosen.is_ok() {
+        if let Err(e) = crate::network::choose_default(group, None).await {
+            log::warn!("network: {group}'s default on a worker was not let go of: {e}");
+        }
+    }
+    answer(chosen)
 }
 
 #[derive(Deserialize)]
