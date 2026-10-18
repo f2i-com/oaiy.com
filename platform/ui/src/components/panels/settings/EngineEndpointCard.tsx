@@ -49,6 +49,8 @@ export default function EngineEndpointCard() {
   };
 
   const live = status?.baseUrl ?? getEngineBase();
+  // Save is the card's action only once the address differs from the one in use (Connect, below, is the other).
+  const changed = value.trim() !== getEngineBase();
   const remote = isRemoteEngine(live);
   // A tab in a browser has not looked for the desktop until its person presses Connect (or has a link): neither there nor not there.
   const notAsked = !status?.checked && !mayLookOnLoad();
@@ -91,7 +93,7 @@ export default function EngineEndpointCard() {
             }}
           />
         </label>
-        <button type="submit" className="btn btn-primary">Save</button>
+        <button type="submit" className={changed ? 'btn btn-primary' : 'btn'} disabled={!changed}>Save</button>
         <button
           type="button"
           className="btn"

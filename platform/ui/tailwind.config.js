@@ -55,6 +55,8 @@ export default {
           green: 'rgb(var(--signal-green) / <alpha-value>)',
           amber: 'rgb(var(--signal-amber) / <alpha-value>)',
           danger: 'rgb(var(--signal-danger) / <alpha-value>)',
+          // (danger as words are written in it: deeper on the light theme's paper)
+          'danger-ink': 'rgb(var(--signal-danger-ink) / <alpha-value>)',
           cyan: 'rgb(var(--signal-cyan) / <alpha-value>)',
           magenta: 'rgb(var(--signal-magenta) / <alpha-value>)',
         },

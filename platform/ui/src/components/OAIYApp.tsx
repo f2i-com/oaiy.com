@@ -182,6 +182,8 @@ export default function OAIYApp() {
   // help button. Skipping marks it completed too, so dismissing once
   // sticks.
   const [wizardOpen, setWizardOpen] = useState<boolean>(() => !hasCompletedWizard());
+  /** What the wizard made, said once it closes (said while it is open, the toasts covered its last step's button). */
+  const wizardNoteRef = useRef<string | null>(null);
   const [editingFlowName, setEditingFlowName] = useState(false);
   const [flowNameValue, setFlowNameValue] = useState('');
   const flowNameInputRef = useRef<HTMLInputElement>(null);
@@ -1083,7 +1085,11 @@ export default function OAIYApp() {
           so the user doesn't get prompted again. */}
       <WelcomeWizard
         isOpen={wizardOpen}
-        onClose={() => setWizardOpen(false)}
+        onClose={() => {
+          setWizardOpen(false);
+          if (wizardNoteRef.current) addToast(wizardNoteRef.current, 'success');
+          wizardNoteRef.current = null;
+        }}
         // Every non-built-in service the user already has. The wizard lists
         // them so a returning user can REUSE one for a starter flow instead of
         // re-creating it, and flags presets that are already configured.
@@ -1094,10 +1100,8 @@ export default function OAIYApp() {
         configuredKeyConstants={(project.constants ?? [])
           .filter((c) => !!c.value && (c.isSecret || c.category === 'api_key'))
           .map((c) => c.key)}
-        onSaveService={(svc) => {
-          saveService(svc);
-          addToast(`Service "${svc.name}" added`, 'success');
-        }}
+        // (no toast: the wizard lists each service it adds)
+        onSaveService={(svc) => saveService(svc)}
         onSaveApiKey={(constantName, value) => {
           // Wired into project constants as a secret. The runtime resolves
           // it via ctx.getConstant at run time — same as keys typed in
@@ -1177,7 +1181,7 @@ export default function OAIYApp() {
           // Show the canvas, whichever section was open when the wizard
           // was — otherwise there is just a toast and no flow in sight.
           setSection('workflows');
-          addToast(`Created "${starterFlow.name}" — click Run to try it`, 'success');
+          wizardNoteRef.current = `“${starterFlow.name}” is ready: press Run to try it`;
         }}
       />
 

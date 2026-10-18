@@ -857,11 +857,17 @@ export class JobManager {
         job.status = 'failed';
         job.error = errorStr;
         metrics.increment('jobsFailed');
-        this.addJobLog(job.id, {
-          source: 'System',
-          message: `Error: ${errorStr}`,
-          type: 'error',
-        });
+        // Said once: an error wrapped on its way up says "Error: " for each wrapping, and one the runtime has just
+        // logged ("Workflow Error: …", its last line) is not logged again.
+        const said = errorStr.replace(/^(Error:\s*)+/, '');
+        const last = job.logs[job.logs.length - 1];
+        if (!(last && last.type === 'error' && last.message.endsWith(said))) {
+          this.addJobLog(job.id, {
+            source: 'System',
+            message: `Error: ${said}`,
+            type: 'error',
+          });
+        }
       }
     } finally {
       // Record job execution time

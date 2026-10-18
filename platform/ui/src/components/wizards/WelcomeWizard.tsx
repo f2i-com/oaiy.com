@@ -676,7 +676,7 @@ function AddServiceStep(props: {
                       type="button"
                       onClick={() => onRemoveService(svc.id)}
                       aria-label={`Remove ${svc.name}`}
-                      className="grid h-4 w-4 place-items-center rounded-full text-content-faint hover:bg-signal-danger/10 hover:text-signal-danger"
+                      className="grid h-4 w-4 place-items-center rounded-full text-content-faint hover:bg-signal-danger/10 hover:text-signal-danger-ink"
                     >
                       <X size={11} />
                     </button>
@@ -710,7 +710,8 @@ function AddServiceStep(props: {
               >
                 <span className="shrink-0 text-lg leading-none" aria-hidden="true">{p.icon}</span>
                 <span className="min-w-0">
-                  <span className="block truncate text-[12.5px] font-semibold text-content-primary">{p.label}</span>
+                  {/* (wrapped, not cut: "OpenAI GPT Image 2" is two lines in a third of the dialog) */}
+                  <span className="block text-[12.5px] font-semibold leading-snug text-content-primary">{p.label}</span>
                   {services.some((s) => s.endpoint === p.endpoint)
                     ? <span className="block text-[11px] text-signal-green">added</span>
                     : p.needsApiKey

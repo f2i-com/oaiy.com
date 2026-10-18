@@ -240,7 +240,8 @@ function CollapsibleNodeWrapper({
   // A side's handle sits in its port's row (centred on it); a top or bottom one is spread along that edge.
   const renderHandle = (handle: HandleConfig, index: number, total: number) => (
     <Handle
-      key={handle.id}
+      // (by kind as well: a node may take in and give out a port of the same name, Image View's `image`)
+      key={`${handle.type}:${handle.id}`}
       type={handle.type}
       position={handle.position}
       id={handle.id}

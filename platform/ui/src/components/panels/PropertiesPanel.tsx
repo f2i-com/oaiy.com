@@ -122,10 +122,10 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
                 <div className="oaiy-note warn">
                     <strong>Unknown node type</strong>
                     <p className="mt-1 mb-0">
-                        No definition for <code className="oaiy-code">{selectedNode.type}</code>. The flow was
-                        likely saved with a node from a plugin that is no longer installed, or the node's id
-                        was renamed in an update. Select it on the canvas and press Delete to remove it, or
-                        replace it with a current one.
+                        This editor has no <code className="oaiy-code">{selectedNode.type}</code> node. The flow
+                        was saved with a node from a plugin that is not installed here, one only OAIY Desktop
+                        runs, or one renamed in an update. It is the dashed card on the canvas: press Delete to
+                        remove it, or replace it with a current one.
                     </p>
                 </div>
             </div>
@@ -228,11 +228,23 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
 
     return (
         <div className={`flex flex-col ${className}`}>
-            {/* Which node: its kind's colour, its name, its id. */}
-            <div className="flex items-center gap-2.5 border-b border-edge-secondary px-3.5 py-3">
-                <span className={`h-8 w-1.5 shrink-0 rounded-full ${SWATCH_CLASS[definition.color || 'slate'] ?? SWATCH_CLASS.slate}`} />
-                <div className="min-w-0">
-                    <h3 className="m-0 truncate text-[13.5px] font-semibold text-content-primary">{definition.name}</h3>
+            {/* Which node: its kind's colour, its kind, its name and its id. The name is the node's own, as its card
+                shows it ("Write the picture prompt" over "Service Call"), and is set here; left empty, the card shows
+                the kind. An input's or an output's name is also what the flow's inputs and results are called. */}
+            <div className="flex items-start gap-2.5 border-b border-edge-secondary px-3.5 py-3">
+                <span className={`mt-0.5 h-11 w-1.5 shrink-0 rounded-full ${SWATCH_CLASS[definition.color || 'slate'] ?? SWATCH_CLASS.slate}`} />
+                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <span className="truncate text-[10px] font-bold uppercase tracking-[0.07em] text-content-faint">{definition.name}</span>
+                    <input
+                        type="text"
+                        className="oaiy-prop-name"
+                        value={typeof selectedNode.data.label === 'string' ? selectedNode.data.label : ''}
+                        placeholder={definition.name}
+                        onChange={(e) => updateNodeData(selectedNode.id, { label: e.target.value === '' ? undefined : e.target.value })}
+                        aria-label="Node name"
+                        title="The node's name, as its card shows it"
+                        spellCheck={false}
+                    />
                     <div className="truncate font-mono text-[11px] text-content-faint">{selectedNode.id}</div>
                 </div>
             </div>

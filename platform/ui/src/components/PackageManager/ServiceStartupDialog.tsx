@@ -226,7 +226,7 @@ export function ServiceStartupDialog({
             <div className="oaiy-row-main">
               <span className="oaiy-row-title">{service.name}</span>
               {service.status === 'error' && service.error ? (
-                <span className="flex items-start justify-between gap-1 break-all text-[12px] text-signal-danger" title={service.error}>
+                <span className="flex items-start justify-between gap-1 break-all text-[12px] text-signal-danger-ink" title={service.error}>
                   <span className="flex-1">{service.error}</span>
                   <CopyLink text={service.error} label="Copy" className="shrink-0" />
                 </span>

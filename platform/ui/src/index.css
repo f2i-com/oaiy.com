@@ -151,6 +151,9 @@
   --signal-green: 69 214 162;
   --signal-amber: 242 184 75;
   --signal-danger: 255 110 120;
+  /* The danger colour as words are written in it (an error line, a Delete item): on the
+     light theme's paper the signal itself is 3.8:1, under the 4.5 text needs. */
+  --signal-danger-ink: 255 110 120;
 
   /* Dynamic background tint (can be customized via ThemeContext) */
   --bg-primary: 8 13 24;
@@ -229,6 +232,7 @@
   --signal-green: 33 132 80;
   --signal-amber: 156 106 8;
   --signal-danger: 233 75 60;
+  --signal-danger-ink: 190 45 35;
 
   --bg-primary: 248 245 238;
   --bg-secondary: 255 254 250;
@@ -279,6 +283,7 @@
   --signal-green: 69 214 162;
   --signal-amber: 242 184 75;
   --signal-danger: 255 110 120;
+  --signal-danger-ink: 255 110 120;
 
   /* Background colors */
   --color-bg-primary: 7 10 18;
@@ -774,6 +779,22 @@ select:focus-visible,
   outline: none !important;
 }
 
+/* React Flow draws its own node kinds (input, default, output, group) as a 150px box
+   with padding and centred text, by the kind's name. The editor's Output node is a kind
+   named `output`, so its card was laid in that box: measured 150px wide while it drew
+   232 (Fit, the map and Tidy left it hanging off the canvas), set 10px in, its title
+   centred. The editor's own kinds size themselves (a group box keeps React Flow's width
+   until its own style, always given, sets it). */
+/* (two classes: React Flow's sheet loads after this one) */
+.react-flow__node.react-flow__node-output,
+.react-flow__node.react-flow__node-group {
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+  text-align: inherit;
+}
+.react-flow__node.react-flow__node-output { width: auto; }
+
 .react-flow__node.selected,
 .react-flow__node:focus,
 .react-flow__node:focus-visible {
@@ -786,6 +807,43 @@ select:focus-visible,
 .react-flow__node.selected>div {
   box-shadow: 0 0 0 2px rgb(var(--accent-primary));
   border-radius: var(--radius-lg);
+}
+
+/* A node of a kind this editor does not have (a plugin's that is not installed, a desktop
+   node in the web editor) is drawn by React Flow's own default (or input) box. The resets
+   above left it a transparent box with no border: there, holding its wires, and nowhere to
+   be seen, so it could not be selected to be deleted, as its properties say to. Drawn as a
+   dashed card. */
+.react-flow__node.react-flow__node-default,
+.react-flow__node.react-flow__node-input {
+  min-height: 34px;
+  border: 1px dashed rgb(var(--color-border-strong)) !important;
+  border-radius: 10px;
+  background: rgb(var(--color-bg-secondary)) !important;
+  color: rgb(var(--color-text-secondary));
+  font-size: 11px;
+}
+.react-flow__node.react-flow__node-default::before,
+.react-flow__node.react-flow__node-input::before {
+  display: block;
+  color: rgb(var(--color-text-faint));
+  content: 'Unknown node';
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.react-flow__node.react-flow__node-default.selected,
+.react-flow__node.react-flow__node-input.selected { border-color: rgb(var(--accent-primary)) !important; }
+/* (its wires' ends small dots on its edges, as a card's ports are, not the 24px rings below) */
+.react-flow__node-default > .react-flow__handle,
+.react-flow__node-input > .react-flow__handle {
+  width: 10px !important;
+  height: 10px !important;
+  min-width: 10px !important;
+  min-height: 10px !important;
+  border: 2px solid rgb(var(--color-bg-secondary));
+  background: rgb(var(--color-text-faint));
 }
 
 .react-flow__handle {
@@ -896,6 +954,11 @@ select:focus-visible,
 .react-flow__handle-left.oaiy-port { left: -6px; }
 .react-flow__handle-right.oaiy-port { right: -6px; }
 .react-flow__handle.oaiy-port::after { position: absolute; inset: -7px; border-radius: 50%; content: ''; }
+/* Aimed at, and, while a wire is drawn, whether this port takes it: a ring in the accent
+   under the pointer, green where the wire can be let go, red where it cannot. */
+.react-flow__handle.oaiy-port:hover { box-shadow: 0 0 0 3px rgb(var(--accent-primary) / 0.4); }
+.react-flow__handle.oaiy-port.connectingto { box-shadow: 0 0 0 4px rgb(var(--signal-danger) / 0.45); }
+.react-flow__handle.oaiy-port.connectingto.valid { box-shadow: 0 0 0 4px rgb(var(--signal-green) / 0.5); }
 
 /* Edge styles */
 .react-flow__edge {
@@ -1521,7 +1584,7 @@ select,
 }
 .oaiy-nav button.active,
 .oaiy-settings-btn.active {
-  background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent);
+  background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent) border-box;
   color: rgb(var(--color-text-primary));
 }
 .oaiy-nav button.active::before,
@@ -1620,7 +1683,9 @@ select,
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: 72px minmax(0, 1fr) 64px;
+  /* The dock's row is as tall as the dock: a tab in a browser has none, and the
+     canvas reaches the foot of the window there (a fixed row left a 64px band). */
+  grid-template-rows: 72px minmax(0, 1fr) auto;
 }
 
 .oaiy-topbar {
@@ -1675,6 +1740,26 @@ select,
   background: rgb(var(--color-bg-tertiary) / 0.6);
   box-shadow: none;
 }
+/* The selected node's name, at the head of its properties: text until hovered or edited. */
+.oaiy-prop-name {
+  width: 100%;
+  min-width: 0;
+  margin: 0 0 0 -5px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  outline: 0;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  padding: 1px 4px;
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+}
+.oaiy-prop-name::placeholder { color: rgb(var(--color-text-primary)); opacity: 1; }
+.oaiy-prop-name:hover { border-color: rgb(var(--color-border-primary)); }
+.oaiy-prop-name:focus { border-color: rgb(var(--accent-primary)); background: rgb(var(--color-bg-tertiary) / 0.6); box-shadow: none; }
+.oaiy-prop-name:focus::placeholder { color: rgb(var(--color-text-faint)); }
 .oaiy-chip {
   flex: none;
   border: 1px solid rgb(var(--color-border-primary));
@@ -1706,8 +1791,8 @@ select,
   white-space: nowrap;
 }
 .oaiy-saved svg { color: rgb(var(--signal-green)); }
-.oaiy-saved.problem { color: rgb(var(--signal-danger)); }
-.oaiy-saved.problem svg { color: rgb(var(--signal-danger)); }
+.oaiy-saved.problem { color: rgb(var(--signal-danger-ink)); }
+.oaiy-saved.problem svg { color: rgb(var(--signal-danger-ink)); }
 
 .oaiy-actions {
   display: flex;
@@ -1823,6 +1908,7 @@ select,
   z-index: 9;
   display: grid;
   min-width: 0;
+  min-height: 64px;
   grid-template-columns: auto minmax(200px, 1fr) auto auto auto;
   align-items: center;
   gap: 9px;
@@ -2039,7 +2125,8 @@ select,
 }
 
 @media (max-width: 760px) {
-  .oaiy-workspace { grid-template-rows: 65px minmax(0, 1fr) 56px; }
+  .oaiy-workspace { grid-template-rows: 65px minmax(0, 1fr) auto; }
+  .oaiy-dock { min-height: 56px; }
   .oaiy-topbar { padding: 0 10px 0 14px; }
   .oaiy-title > span,
   .oaiy-chip { display: none; }
@@ -2097,14 +2184,17 @@ select,
   /* Off-canvas it has room for words again, so undo the 1240px icon-only
      collapse rather than shipping a 264px drawer of unlabelled glyphs. */
   .oaiy-sidebar .oaiy-brand,
-  .oaiy-sidebar .oaiy-brand > span,
-  .oaiy-sidebar .oaiy-brand > small,
   .oaiy-sidebar .oaiy-new > span,
   .oaiy-sidebar .oaiy-nav button > span,
   .oaiy-sidebar .oaiy-nav button > em,
   .oaiy-sidebar .oaiy-settings-btn > span,
-  .oaiy-sidebar .oaiy-engine > span,
   .oaiy-sidebar .oaiy-trust span { display: revert; }
+  /* (`revert` is the browser's own display, inline for these: the tagline ran into the motto
+     and the engine's name into its state, on one line. They take their own back.) */
+  .oaiy-sidebar .oaiy-brand > span,
+  .oaiy-sidebar .oaiy-brand > small,
+  .oaiy-sidebar .oaiy-engine-get { display: block; }
+  .oaiy-sidebar .oaiy-engine > span { display: flex; }
   .oaiy-sidebar { align-items: stretch; padding-right: 14px; padding-left: 14px; }
   .oaiy-sidebar .oaiy-brand { padding: revert; text-align: left; }
   .oaiy-sidebar .oaiy-new,
@@ -2166,6 +2256,10 @@ select,
 :root.oaiy-app .btn-primary { box-shadow: 0 4px 14px rgb(var(--accent-primary) / 0.22), inset 0 1px 0 rgb(255 255 255 / 0.18); }
 :root.oaiy-app.light .btn-primary { border-color: rgb(var(--accent-primary)); background: rgb(var(--accent-fill, var(--accent-primary))); box-shadow: 2px 2px 0 rgb(50 42 30 / 0.14); }
 :root.oaiy-app .btn-primary:hover:not(:disabled) { transform: none; filter: brightness(1.08); }
+/* Focused from the keyboard, the primary shows the ring every control has: its own shadow,
+   above, outranked the global focus rule, and Run had no visible focus at all. */
+:root.oaiy-app .btn-primary:focus-visible,
+:root.oaiy-app.light .btn-primary:focus-visible { box-shadow: 0 0 0 2px rgb(var(--color-bg-elevated)), 0 0 0 5px rgb(var(--accent-primary)); }
 :root.oaiy-app .btn-ghost { border-color: rgb(var(--color-border-primary)); }
 :root.oaiy-app .btn-ghost:hover:not(:disabled) { border-color: rgb(var(--color-border-strong)); }
 
@@ -2173,7 +2267,7 @@ select,
 .btn-danger {
   border-color: rgb(var(--signal-danger) / 0.4);
   background: rgb(var(--signal-danger) / 0.1);
-  color: rgb(var(--signal-danger));
+  color: rgb(var(--signal-danger-ink));
 }
 .btn-danger:hover:not(:disabled) { border-color: rgb(var(--signal-danger)); background: rgb(var(--signal-danger) / 0.16); }
 .btn-warning {
@@ -2239,7 +2333,7 @@ select,
 .oaiy-input.inline { width: auto; min-width: 160px; flex: 1 1 180px; }
 .oaiy-help { margin: 0; color: rgb(var(--color-text-secondary)); font-size: 12px; line-height: 1.55; }
 .oaiy-help.faint { color: rgb(var(--color-text-faint)); }
-.oaiy-error-text { margin: 0; color: rgb(var(--signal-danger)); font-size: 12px; line-height: 1.5; }
+.oaiy-error-text { margin: 0; color: rgb(var(--signal-danger-ink)); font-size: 12px; line-height: 1.5; }
 .oaiy-ok-text { margin: 0; color: rgb(var(--signal-green)); font-size: 12px; line-height: 1.5; }
 .oaiy-warn-text { margin: 0; color: rgb(var(--signal-amber)); font-size: 12px; line-height: 1.5; }
 .oaiy-form-grid.narrow { max-width: 440px; }
@@ -2290,7 +2384,7 @@ select,
 }
 .oaiy-pill.dot::before { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; content: ''; }
 .oaiy-pill.ok { --tone: var(--signal-green); }
-.oaiy-pill.err { --tone: var(--signal-danger); }
+.oaiy-pill.err { --tone: var(--signal-danger-ink); }
 .oaiy-pill.warn { --tone: var(--signal-amber); }
 .oaiy-pill.accent { --tone: var(--accent-primary); }
 .oaiy-pill.info { --tone: var(--signal-cyan); }
@@ -2321,7 +2415,7 @@ select,
   border: 1px solid rgb(var(--signal-danger) / 0.35);
   border-radius: var(--r-ctl);
   background: rgb(var(--signal-danger) / 0.08);
-  color: rgb(var(--signal-danger));
+  color: rgb(var(--signal-danger-ink));
   padding: 9px 12px;
   font-size: 12px;
   line-height: 1.5;
@@ -2500,7 +2594,7 @@ select,
   font-weight: 600;
 }
 .oaiy-subnav > button:hover { background: rgb(var(--color-bg-tertiary) / 0.7); color: rgb(var(--color-text-primary)); }
-.oaiy-subnav > button.active { background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent); color: rgb(var(--color-text-primary)); }
+.oaiy-subnav > button.active { background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent) border-box; color: rgb(var(--color-text-primary)); }
 .oaiy-subnav > button.active::before {
   position: absolute;
   top: 9px;
@@ -2761,7 +2855,7 @@ button.oaiy-row:focus-visible,
 .oaiy-menu > button:focus-visible { background: rgb(var(--accent-primary) / 0.1); outline: 0; }
 .oaiy-menu > button:disabled { cursor: not-allowed; opacity: 0.45; }
 .oaiy-menu > button:disabled:hover { background: transparent; }
-.oaiy-menu > button.danger { color: rgb(var(--signal-danger)); }
+.oaiy-menu > button.danger { color: rgb(var(--signal-danger-ink)); }
 .oaiy-menu > button.danger > svg { color: currentColor; }
 .oaiy-menu > hr { margin: 4px 2px; border: 0; border-top: 1px solid rgb(var(--color-border-secondary)); }
 
@@ -2800,7 +2894,9 @@ button.oaiy-row:focus-visible,
 .oaiy-flow-item > svg { flex: none; color: rgb(var(--color-text-faint)); }
 .oaiy-flow-item > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .oaiy-flow-item:hover { background: rgb(var(--color-bg-tertiary) / 0.7); color: rgb(var(--color-text-primary)); }
-.oaiy-flow-item.active { background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent); color: rgb(var(--color-text-primary)); }
+/* (the gradient laid over the border box as well: from the padding box it repeated into the
+   transparent border, a hairline of accent down the row's right edge) */
+.oaiy-flow-item.active { background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent) border-box; color: rgb(var(--color-text-primary)); }
 .oaiy-flow-item.active::before {
   position: absolute;
   top: 8px;
@@ -3019,6 +3115,9 @@ button.oaiy-row:focus-visible,
 }
 .oaiy-builder.narrow .oaiy-side.left { left: 0; }
 .oaiy-builder.narrow .oaiy-side.right { right: 0; }
+/* The toolbar lies over the panel's foot (below): the panel ends above it, so its last
+   field and the palette's hint are not under the toolbar. */
+.oaiy-builder.narrow .oaiy-side { padding-bottom: 70px; }
 
 /* A narrow builder with a panel open over the canvas: the toolbar moves to
    the side left clear, and stays above the panel so it can close it. */
@@ -3134,7 +3233,7 @@ button.oaiy-row:focus-visible,
 .oaiy-log-line time { flex: none; color: rgb(var(--color-text-faint)); }
 .oaiy-log-line > .oaiy-pill { padding: 0 6px; font-size: 9px; line-height: 1.6; }
 .oaiy-log-line > span:last-child { min-width: 0; color: rgb(var(--color-text-secondary)); white-space: pre-wrap; word-break: break-word; }
-.oaiy-log-line.error > span:last-child { color: rgb(var(--signal-danger)); }
+.oaiy-log-line.error > span:last-child { color: rgb(var(--signal-danger-ink)); }
 .oaiy-log-line.success > span:last-child,
 .oaiy-log-line.output > span:last-child { color: rgb(var(--signal-green)); }
 .oaiy-log-cursor { display: inline-block; width: 6px; height: 12px; margin-left: 2px; background: rgb(var(--signal-green)); vertical-align: middle; animation: blink 1s step-end infinite; }
@@ -3320,6 +3419,8 @@ button.oaiy-row:focus-visible,
   gap: 10px;
   pointer-events: none;
 }
+/* Where OAIY Desktop's dock is under the canvas, the toolbar sits that much higher. */
+body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
 .oaiy-toast {
   --tone: var(--accent-primary);
   display: flex;

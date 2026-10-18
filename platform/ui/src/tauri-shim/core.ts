@@ -19,6 +19,7 @@
 import { pickFileViaInput, pickFolderViaInput, type OpenDialogOptions } from './dialog';
 import { triggerDownloadFromBlob } from '../lib/download';
 import { getEngineBase } from '../lib/engineEndpoint';
+import { mayAskDesktop } from '../lib/desktopDetection';
 import { secretVault } from './secretVault';
 
 type InvokeArgs = Record<string, unknown> | undefined;
@@ -875,6 +876,8 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
     if (typeof port !== 'number') {
       return { success: false, already_running: false, error: 'no port' };
     }
+    // A tab nobody linked to the desktop does not ask it (lib/desktopDetection.ts): the request goes straight to the port.
+    if (!mayAskDesktop()) return { success: false, already_running: false };
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 2000);

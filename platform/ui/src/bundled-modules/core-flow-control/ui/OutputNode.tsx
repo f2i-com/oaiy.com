@@ -368,7 +368,8 @@ function OutputNode({ data }: OutputNodeProps) {
         ) : isImageArray || isSingleImage ? (
           <span className="text-pink-700 dark:text-pink-400">Image{isMultiple ? ` (${outputArray.length})` : ''}</span>
         ) : (
-          <span className="truncate text-[10px]">{displayValue.substring(0, 40)}...</span>
+          // (an ellipsis only where the value goes on: "Words: 8" is all of "Words: 8")
+          <span className="text-[10px]">{displayValue.length > 80 ? `${displayValue.slice(0, 80)}…` : displayValue}</span>
         )
       ) : (
         <span className="italic text-slate-500">Waiting...</span>

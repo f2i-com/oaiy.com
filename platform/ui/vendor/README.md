@@ -46,6 +46,22 @@ upstream into `oaiy/packages/*`):
   summary): a paired worker's model (`engine:<kind>:node.<id>/<model>`) is
   shown as "<model> on a paired computer", not its id.
 
+From the flow-editor polish (2026-10-18), likewise:
+
+- `oaiy-core/src/runtime.ts`: "Registered dynamic module: …" goes to the
+  developer's console (`runtimeLogger.debug`), not the run's log: every run
+  registered every module, a dozen lines before the flow's first step.
+- `oaiy-core/src/runtime.ts` (`Workflow Error: …`) and
+  `oaiy-core/src/queue/JobManager.ts` (the failed job's `Error: …` line): the
+  message is written with the `Error: ` prefixes an error collects on its way up
+  removed, so the log says "Error: Browser blocked…", not
+  "Error: Error: Error: Browser blocked…"; and the job's line is left out when
+  the runtime's "Workflow Error: …" with the same message is the job's last
+  line (the same paragraph twice, one under the other).
+- `oaiy-ui-components/src/components/CollapsibleNodeWrapper.tsx`: a port's
+  handle is keyed by its kind and id (`target:image`), not its id alone: Image
+  View takes in and gives out `image`, two siblings with one key.
+
 ## Re-syncing from upstream (optional)
 
 If you ever want to pull newer upstream source, re-copy `src/` from the

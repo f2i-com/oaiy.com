@@ -186,7 +186,7 @@ export function ComfyUIWorkflowDialog({ analysis, onConfirm, onCancel }: ComfyUI
       {/* Negative prompts info */}
       {negativePrompts.length > 0 && (
         <p className="oaiy-help">
-          <strong className="text-signal-danger">Negative prompts:</strong> {negativePrompts.map(p => p.title).join(', ')}.{' '}
+          <strong className="text-signal-danger-ink">Negative prompts:</strong> {negativePrompts.map(p => p.title).join(', ')}.{' '}
           <span className="text-content-faint">They keep their own values.</span>
         </p>
       )}

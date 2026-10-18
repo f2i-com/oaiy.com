@@ -115,6 +115,7 @@ export { desktopAccess, absoluteUrl } from './src/bundled-modules/core-service/c
 export { default as AIRuntime } from './src/bundled-modules/core-ai/runtime.ts';
 export { default as BrowserRuntime } from './src/bundled-modules/core-browser/runtime.ts';
 export { refreshDesktopServices } from './src/lib/desktopServices.ts';
+export { rememberDesktopLink } from './src/lib/desktopLink.ts';
 import * as detection from './src/lib/desktopDetection.ts';
 export { detection };`,
     resolveDir: UI,
@@ -224,6 +225,23 @@ await check('a picture passed to a chat step by its address reaches the model, a
     await assert.rejects(ask(`${DEFAULT}/api/ai/engine/gateway/files/images/gone.png`), /could not be read/);
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+// A tab in a browser asks the desktop only once its person has pressed Connect (lib/desktopDetection.ts). A run that
+// called a service on this computer asked the desktop to start it all the same: a request the page had no word to make
+// (on a public address, a permission prompt, and a look at the visitor's network). The call goes straight to the port.
+await check('a tab never linked to the desktop does not ask it to start a service a run calls', async () => {
+  asked();
+  try {
+    assert.deepEqual(await M.invoke('ensure_service_ready_by_port', { port: 8123 }), { success: false, already_running: false });
+    const methods = M.AIRuntime.createMethods(ctxFor());
+    assert.equal(await methods.chat('', 'hi', null, 'http://127.0.0.1:8123/v1/chat/completions', 'm', '', false, 16, 0, 'text', false, 'auto', 'n1'), 'hello');
+    assert.deepEqual(api(asked(), DEFAULT), []);
+  } finally {
+    // From here on the tab is linked, as after Connect: the reaches below are what such a tab asks.
+    M.rememberDesktopLink();
+    asked();
   }
 });
 

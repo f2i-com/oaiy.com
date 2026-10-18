@@ -208,7 +208,8 @@ export function CanvasContextMenu({
         <hr />
 
         {/* Collapse/Expand Section */}
-        <Item icon={<FoldVertical size={14} />} label="Collapse every node" onClick={handleCollapse} />
+        {/* (in the toolbar's words: Compact, Expand) */}
+        <Item icon={<FoldVertical size={14} />} label="Make every node compact" onClick={handleCollapse} />
         <Item icon={<UnfoldVertical size={14} />} label="Expand every node" onClick={handleExpand} />
       </div>
     </>

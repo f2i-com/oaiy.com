@@ -344,7 +344,9 @@ export function useWorkflowExecution({
           })
         );
         if (job.status === 'failed') {
-          const why = String((job as { error?: unknown }).error ?? '').replace(/^(Error:\s*)+/, '').trim();
+          const full = String((job as { error?: unknown }).error ?? '').replace(/^(Error:\s*)+/, '').trim();
+          // Its first sentence (the rest, advice that can run to a paragraph, is in the log the toast opens).
+          const why = full.match(/^.+?[.!?](?=\s|$)/s)?.[0] ?? full;
           toastRef.current?.(
             why ? `The run failed: ${why.length > 220 ? `${why.slice(0, 220)}…` : why}` : 'The run failed.',
             'error',

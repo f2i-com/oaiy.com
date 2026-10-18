@@ -252,7 +252,7 @@ export default function PackageServicesPanel({
 
                 {/* Error message */}
                 {service.error && (
-                  <div className="mb-1.5 flex items-start justify-between gap-1 break-all rounded-[var(--r-sm)] bg-signal-danger/10 p-1.5 text-[11px] text-signal-danger">
+                  <div className="mb-1.5 flex items-start justify-between gap-1 break-all rounded-[var(--r-sm)] bg-signal-danger/10 p-1.5 text-[11px] text-signal-danger-ink">
                     <span className="flex-1">{service.error}</span>
                     <CopyLink text={service.error} label="Copy" className="shrink-0" />
                   </div>

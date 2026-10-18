@@ -1078,8 +1078,11 @@ export default function OAIYBuilder({
 
   // Drawn over the canvas's foot: the map only while there is room beside the toolbar.
   const mapRoom = canvasWidth === 0 || canvasWidth >= 520;
-  const tightToolbar = canvasWidth > 0 && canvasWidth < 560;
   const inspectorOpen = propsOpen || logOpen;
+  // The toolbar drops its words where, with them (about 530px), it would cover the zoom buttons at the canvas's
+  // corner, and where a panel lies over the canvas (the toolbar moves to the side left clear, about 300px of it: with
+  // its words it ran off the window).
+  const tightToolbar = (canvasWidth > 0 && canvasWidth < 650) || (narrow && (paletteOpen || inspectorOpen));
 
   return (
     <div

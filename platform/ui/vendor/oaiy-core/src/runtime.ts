@@ -1913,9 +1913,9 @@ export class OAIYRuntime {
       perJobCleanup ? { ...runtimeModule, cleanup: perJobCleanup } : runtimeModule,
     );
 
-    if (this.onLog) {
-      this.onLog({ source: 'ModuleLoader', message: `Registered dynamic module: ${runtimeModule.name}`, type: 'info' });
-    }
+    // The developer's console, not the run's log: each run registers every module, and a dozen lines of it
+    // before the flow's first step said nothing about the flow.
+    runtimeLogger.debug(`Registered dynamic module: ${runtimeModule.name}`);
   }
 
   async cleanupDynamicModules(): Promise<void> {
@@ -2458,7 +2458,8 @@ ${WORKFLOW_TRAMPOLINE}`;
       const error = e instanceof Error ? e.message : String(e);
       const isAbort = error.includes('__ABORT__') || error.includes('aborted');
       if (!isAbort) {
-        this.log('error', `Workflow Error: ${error}`);
+        // (an error wrapped on its way up says "Error: " once for each wrapping)
+        this.log('error', `Workflow Error: ${error.replace(/^(Error:\s*)+/, '')}`);
       }
       throw e;
     }

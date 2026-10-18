@@ -102,6 +102,11 @@ function renderIcon(emoji: string | undefined) {
   return DefaultServiceIcon;
 }
 
+/** An address with a place to break after each slash: a long one wraps between its parts, not inside a word. */
+function breakable(address: string) {
+  return address.split('/').flatMap((part, i, all) => (i < all.length - 1 ? [part, '/', <wbr key={i} />] : [part]));
+}
+
 function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
   // Bump on every Services-registry change so the resolved service +
   // derived handles refresh without forcing a workflow reload.
@@ -168,21 +173,16 @@ function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
   // (in words, as the pickers say it: not the raw id of a worker's model)
   const title = service?.name || (missing ? `${describeService(String(data.service)).text} (not available)` : 'Service Call');
   const endpointPreview = data.endpoint || service?.endpoint || '';
-  const collapsedPreview = (
-    <div className="text-slate-500 dark:text-slate-400 text-xs">
-      {service ? (
-        <>
-          <span className="text-cyan-700 dark:text-cyan-400 font-medium">{service.name}</span>
-          {endpointPreview && (
-            <span className="text-slate-500 ml-1 truncate">
-              {endpointPreview.replace(/^https?:\/\//, '')}
-            </span>
-          )}
-        </>
-      ) : (
-        <span className="italic text-slate-600 dark:text-slate-400">Pick a service preset</span>
-      )}
-    </div>
+  // The service's name is the card's title (or its kind, over a name of the node's own): the line under the ports
+  // says where it calls. (The name and the address side by side broke the name over two lines.)
+  const collapsedPreview = service ? (
+    endpointPreview ? (
+      <div className="font-mono text-[10px] text-slate-500 dark:text-slate-400" title={endpointPreview}>
+        {breakable(endpointPreview.replace(/^https?:\/\//, ''))}
+      </div>
+    ) : null
+  ) : (
+    <div className="italic text-slate-600 dark:text-slate-400">Pick a service preset</div>
   );
 
   return (

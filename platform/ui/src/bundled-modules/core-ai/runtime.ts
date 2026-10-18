@@ -7,6 +7,7 @@
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { getEngineBase } from '../../lib/engineEndpoint';
+import { mayAskDesktop } from '../../lib/desktopDetection';
 import { absoluteUrl, desktopFileBytes } from '../core-service/contractRuntime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
@@ -942,8 +943,9 @@ async function chat(
         // Service auto-start not available
       }
     }
-  } else if (!ctx.tauri && endpoint.includes('127.0.0.1')) {
-    // Browser build (oaiy-web): no Tauri, but the OAIY Desktop may own
+  } else if (!ctx.tauri && endpoint.includes('127.0.0.1') && mayAskDesktop()) {
+    // Browser build (oaiy-web), in a page that may ask the desktop (a tab nobody
+    // linked never does): no Tauri, but the OAIY Desktop may own
     // this port. Ask it to start the matching service if it's stopped —
     // so picking an OAIY Desktop service in a flow and running it "just
     // works" without manually starting it first (Phase 3.5). Fire-and-
@@ -1174,7 +1176,7 @@ async function chat(
     throw new Error('No endpoint configured for AI request');
   }
 
-  ctx.log('info', `[AI] Calling ${model} at ${endpoint}...`);
+  ctx.log('info', `[AI] Calling ${model ? `${model} at ` : ''}${endpoint}...`);
 
   try {
     // Determine format based on endpoint

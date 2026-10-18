@@ -71,7 +71,7 @@ function MusicGenNode({ data }: MusicGenNodeProps) {
         <div className="text-slate-600 dark:text-slate-400 text-[10px]">
             <span className="text-purple-700 dark:text-purple-400">{duration}s</span>
             <span className="ml-1 text-slate-500">{service === 'heartmula' ? 'HM' : 'ACE'}</span>
-            <span className="ml-1 truncate">{data.prompt?.substring(0, 12) || 'music'}...</span>
+            <span className="ml-1">{data.prompt ? (data.prompt.length > 40 ? `${data.prompt.slice(0, 40)}…` : data.prompt) : 'music'}</span>
         </div>
     );
 

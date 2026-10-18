@@ -199,6 +199,14 @@ export function mayLookOnLoad(): boolean {
 }
 
 /**
+ * Whether a run may ask the desktop for something its flow did not name (to start the service on a port it calls): where
+ * this page may look for the desktop, or once it has been found. A tab nobody linked never asks.
+ */
+export function mayAskDesktop(): boolean {
+  return mayLookOnLoad() || current.available;
+}
+
+/**
  * Start the periodic probe, where this page may look (see `mayLookOnLoad`; a tab with no link does nothing here).
  * Safe to call multiple times — only one underlying timer runs at any moment.
  * The first probe fires immediately so the initial UI doesn't wait for the

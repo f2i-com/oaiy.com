@@ -432,7 +432,8 @@ const JobItem = memo(function JobItem({ job, onAbort, onNavigate, showAbort, isE
 
       {job.status === 'failed' && job.error && (
         <div className="oaiy-banner mt-2">
-          <span className="min-w-0 flex-1 break-words" title={job.error}>{job.error}</span>
+          {/* (an error wrapped on its way up says "Error: " once for each wrapping: the banner is the error, said once) */}
+          <span className="min-w-0 flex-1 break-words" title={job.error}>{job.error.replace(/^(Error:\s*)+/, '')}</span>
           <CopyLink text={job.error} label="Copy" className="shrink-0" />
         </div>
       )}
