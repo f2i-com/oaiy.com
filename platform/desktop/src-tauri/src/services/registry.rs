@@ -413,10 +413,22 @@ fn oaiy_program(cmd: &str) -> Option<PathBuf> {
     let dirs = oaiy_program_dirs(
         std::env::var_os("OAIY_ENGINES_DIR").map(PathBuf::from),
         std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
-        crate::engines::bundled().map(Path::to_path_buf),
+        installer_engines(),
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release"),
     );
     dirs.into_iter().map(|d| d.join(&file)).find(|p| p.is_file()).map(|p| std::path::absolute(&p).unwrap_or(p))
+}
+
+/// The engines folder the installer carries, once the app has said where
+/// (`engines::set_bundled`). Only the app with its window has one: the
+/// headless server is no installer's, and has no `engines` module.
+#[cfg(feature = "gui")]
+fn installer_engines() -> Option<PathBuf> {
+    crate::engines::bundled().map(Path::to_path_buf)
+}
+#[cfg(not(feature = "gui"))]
+fn installer_engines() -> Option<PathBuf> {
+    None
 }
 
 /// Where OAIY's own programs are looked for, in the engines' order
