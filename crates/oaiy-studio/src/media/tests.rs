@@ -41,9 +41,11 @@ fn flux3_requests_take_ten_references_and_the_references_size() {
     let (r,..)=image_request(&c,root,Path::new("/install/outputs"),&body(r#"{"model":"flux3","prompt":"a fox","size":"768x512"}"#),false).unwrap();
     assert_eq!(r.get("architecture").and_then(Json::as_str),Some("flux3-klein"));
     assert_eq!((r.get("width").and_then(Json::as_i64),r.get("height").and_then(Json::as_i64)),(Some(768),Some(512)));
-    assert_eq!(r.get("text_encoder").and_then(Json::as_str),Some("/install/flux3/text_encoder"));
+    // (a part named under the install is joined to it as the OS joins paths: "/install\flux3/..." on Windows)
+    let under=|p: &str| root.join(p).to_string_lossy().into_owned();
+    assert_eq!(r.get("text_encoder").and_then(Json::as_str),Some(under("flux3/text_encoder").as_str()));
     assert!(r.get("steps").is_none()&&r.get("cfg").is_none()&&r.get("images").is_none()&&r.get("base").is_none());
-    assert_eq!(r.get("loras").map(Json::to_json).as_deref(),Some(r#"[{"path":"/install/flux3/tarot.safetensors","strength":0.8},{"path":"/loras/outpaint.safetensors","strength":1.0}]"#));
+    assert_eq!(r.get("loras").map(Json::to_json),Some(format!(r#"[{{"path":{},"strength":0.8}},{{"path":"/loras/outpaint.safetensors","strength":1.0}}]"#,Json::str(under("flux3/tarot.safetensors")).to_json())));
     let (baseline,..)=image_request(&c,root,root,&body(r#"{"model":"flux3","prompt":"a fox","use_loras":false}"#),false).unwrap();
     assert!(baseline.get("loras").is_none());
     assert!(image_request(&c,root,root,&body(r#"{"model":"flux3","prompt":"a fox","negative_prompt":"blur"}"#),false).is_err());
@@ -82,7 +84,9 @@ fn moss_image_requests_take_its_settings_and_a_negative_prompt() {
     assert_eq!(r.get("architecture").and_then(Json::as_str),Some("moss-image"));
     assert_eq!((r.get("width").and_then(Json::as_i64),r.get("height").and_then(Json::as_i64)),(Some(1184),Some(880)));
     assert_eq!((r.get("steps").and_then(Json::as_i64),r.get("cfg").and_then(Json::as_f64),r.get("shift").and_then(Json::as_f64)),(Some(50),Some(3.),Some(5.)));
-    assert_eq!(r.get("tokenizer").and_then(Json::as_str),Some("/install/moss/tokenizer/tokenizer.json"));
+    // (a part named under the install is joined to it as the OS joins paths: "/install\moss/..." on Windows)
+    let under=|p: &str| root.join(p).to_string_lossy().into_owned();
+    assert_eq!(r.get("tokenizer").and_then(Json::as_str),Some(under("moss/tokenizer/tokenizer.json").as_str()));
     assert_eq!(r.get("negative_prompt").and_then(Json::as_str),Some("watermark"));
     let (r,..)=image_request(&c,root,root,&body(r#"{"model":"moss","prompt":"a fox","negative_prompt":"blur","steps":30,"cfg":5,"uncond_skip_layers":[24]}"#),false).unwrap();
     assert_eq!((r.get("steps").and_then(Json::as_i64),r.get("cfg").and_then(Json::as_f64)),(Some(30),Some(5.)));
@@ -104,7 +108,7 @@ fn moss_image_requests_take_its_settings_and_a_negative_prompt() {
     crate::util::set(&mut c,"media",media);
     config::validate(&c).unwrap();
     let (r,..)=image_request(&c,root,root,&body(r#"{"model":"moss","prompt":"a fox","negative_prompt":"blur","cfg":5}"#),false).unwrap();
-    assert_eq!(r.get("distill").and_then(Json::as_str),Some("/install/moss/generator.safetensors"));
+    assert_eq!(r.get("distill").and_then(Json::as_str),Some(under("moss/generator.safetensors").as_str()));
     assert_eq!(r.get("steps").and_then(Json::as_i64),Some(8));
     assert!(["cfg","shift","negative_prompt","uncond_skip_layers"].iter().all(|k| r.get(k).is_none()),"{}",r.to_json());
     let (r,..)=image_request(&c,root,root,&body(r#"{"model":"moss","prompt":"a fox","steps":4}"#),false).unwrap();
@@ -670,5 +674,325 @@ fn a_job_cancelled_while_it_waits_for_the_chats_ends_then() {
     drop(b);
     assert!(!studio.llm.paused());
     drop(lease);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A studio in `dir` whose engines are names no program has, so that nothing real is started: the media worker a bare
+/// name found nowhere, the language model's server a path to nothing (a bare name could be found on the PATH), and no
+/// GPU asked about for its memory (`llm.webgpu_gb`). `with` sets the rest.
+fn quiet_studio(dir: &Path, with: impl FnOnce(&mut Json)) -> Arc<crate::Studio> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let mut c = config::default_json();
+    let media = crate::models::registry::obj_mut(&mut c, &["media"]).unwrap();
+    crate::util::set(media, "worker", Json::str("no-such-worker-here"));
+    crate::util::set(media, "output_dir", Json::str(dir.join("out").to_string_lossy()));
+    let llm = crate::models::registry::obj_mut(&mut c, &["llm"]).unwrap();
+    for key in ["server", "server_webgpu"] {
+        crate::util::set(llm, key, Json::str(dir.join("no-such-llm-server").to_string_lossy()));
+    }
+    crate::util::set(llm, "webgpu_gb", Json::Int(8));
+    with(&mut c);
+    config::validate(&c).unwrap();
+    Arc::new(crate::Studio::for_test(dir, c))
+}
+
+/// `c` with MOSS-Image (`moss`) and FLUX 3 Klein (`klein`) as its picture models, the ones `pins` names pinned.
+fn with_pins(c: &mut Json, pins: &[&str]) {
+    let models = body(r#"{
+        "moss": {"architecture": "moss-image", "transformer": "moss/transformer", "text_encoder": "moss/text_encoder", "vae": "moss/vae/diffusion_pytorch_model.safetensors", "tokenizer": "moss/tokenizer/tokenizer.json"},
+        "klein": {"architecture": "flux3-klein", "transformer": "flux3/model.safetensors", "text_encoder": "flux3/text_encoder", "vae": "flux3/ae.safetensors"}}"#);
+    crate::util::set(crate::models::registry::obj_mut(c, &["media", "image"]).unwrap(), "models", models);
+    for model in pins {
+        *c = pins::with(c, model, true);
+    }
+}
+
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "waited too long for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A stand-in for the picture worker kept on this computer's GPU, keeping `models` (family, model): a harmless program
+/// that waits for its standard input to end (`findstr`, `cat`), so it is alive, with its answers and events what the
+/// test sends on the sender it is given back.
+fn stand_in(studio: &crate::Studio, models: &[(&str, &str)]) -> std::sync::mpsc::Sender<Said> {
+    let mut command = if cfg!(windows) {
+        let mut c = std::process::Command::new("findstr");
+        c.arg("x");
+        c
+    } else {
+        std::process::Command::new("cat")
+    };
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let (tx, said) = std::sync::mpsc::channel();
+    let program = config::program(&studio.root, str_or(studio.config().get("media").unwrap(), "worker", ""));
+    *studio.media.serving.lock().unwrap() = Some(Serving {
+        child,
+        stdin,
+        said: Some(said),
+        busy: false,
+        key: format!("{}|local", program.display()),
+        local: true,
+        idle_since: std::time::Instant::now(),
+        models: models.iter().map(|(f, m)| (f.to_string(), m.to_string())).collect(),
+        device: "gpu0".into(),
+    });
+    tx
+}
+
+/// The stand-in kept now made to end, as a worker that crashes, and seen gone.
+fn crash(studio: &crate::Studio) {
+    let mut slot = studio.media.serving.lock().unwrap();
+    let s = slot.as_mut().expect("a kept worker");
+    s.child.kill().unwrap();
+    let _ = s.child.wait();
+}
+
+/// A default language model chosen while media holds the GPU it would load on, or while media paused the language
+/// model, is not loaded beside the job (Flash-Next, on GPUs 0 and 1, was loaded beside a clip being made on GPU 1): it
+/// is left for media's end, whose runner then loads it with the settings as they are. One on another GPU than the
+/// job's is loaded at once; and the restart a change of settings makes of a running one waits as the first does.
+#[test]
+fn a_default_chosen_while_media_holds_its_gpu_is_loaded_once_media_is_done() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-place-{}", std::process::id()));
+    let studio = quiet_studio(&dir, |c| {
+        crate::util::set(crate::models::registry::obj_mut(c, &["media"]).unwrap(), "device", Json::Int(1));
+        let llm = crate::models::registry::obj_mut(c, &["llm"]).unwrap();
+        crate::util::set(llm, "devices", body("[0]"));
+        crate::util::set(llm, "models", body(r#"[{"name": "small", "path": "small.gguf"}, {"name": "big", "path": "big.gguf", "devices": [0, 1]}]"#));
+        crate::util::set(llm, "default_model", Json::str("small"));
+    });
+    let choose = |name: &str| {
+        let mut next = studio.config();
+        crate::util::set(crate::models::registry::obj_mut(&mut next, &["llm"]).unwrap(), "default_model", Json::str(name));
+        studio.set_config(next).unwrap();
+    };
+    let said = |line: &str| studio.log.tail(100).matches(line).count();
+    // (each start of the server is said as it is tried: the one named is a path to nothing, so each fails)
+    let starts = || studio.llm.log.tail(200).matches("studio: starting").count();
+    let waits = "big loads on this computer once the media jobs on its GPU are done";
+    // Media paused it (a job on its GPU): another default waits for media's end.
+    studio.llm.set_paused(true);
+    choose("big");
+    until("big to wait for media", || said(waits) == 1);
+    assert_eq!((starts(), studio.llm.paused()), (0, true));
+    // A job holds GPU 1: a model on GPU 0 alone is loaded beside it at once.
+    studio.llm.set_paused(false);
+    studio.media.broker.lock().unwrap().media = true;
+    choose("small");
+    until("small to be started", || said("small did not start loading on this computer") == 1);
+    assert_eq!((starts(), studio.llm.paused()), (1, false), "{}", studio.log.tail(20));
+    // ...and with it running, one on GPUs 0 and 1 is not restarted beside the job, by the change of settings or after.
+    studio.llm.adopt("127.0.0.1:1", "k");
+    choose("big");
+    until("big to wait for media again", || said(waits) == 2);
+    assert!(said("the LLM restarts once the media jobs on its GPU are done") == 1, "{}", studio.log.tail(20));
+    assert_eq!((starts(), studio.llm.paused(), studio.llm.state()), (1, true, crate::llm::State::Stopped));
+    // The job ends: the runner brings it back, with the settings as they are, big first.
+    studio.media.broker.lock().unwrap().media = false;
+    let runner = Arc::clone(&studio);
+    std::thread::spawn(move || {
+        let media = Arc::clone(&runner.media);
+        media.run(&runner);
+    });
+    until("the runner to start it", || starts() == 2);
+    let last = studio.llm.log.tail(200).lines().rfind(|l| l.contains("studio: starting")).unwrap_or_default().to_string();
+    assert!(last.contains("--name big"), "{last}");
+    assert!(!studio.llm.paused());
+    studio.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The studio's stop is for good: every job is cancelled, an incognito one too (a pin's loading is one); the runner
+/// ends without bringing back the language model a job paused, and the pins' keeper with it; a pin is not loaded, a
+/// job that comes after is cancelled as it comes, and nothing starts the language model's server again.
+#[test]
+fn after_the_studio_stops_nothing_is_started_again() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-stopped-{}", std::process::id()));
+    let studio = quiet_studio(&dir, |c| with_pins(c, &["moss"]));
+    let runner = {
+        let studio = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let media = Arc::clone(&studio.media);
+            media.run(&studio);
+        })
+    };
+    let keeper = {
+        let studio = Arc::clone(&studio);
+        std::thread::spawn(move || pins::keep(studio))
+    };
+    // A job held up by a chat on its GPU, an incognito one queued behind it, and the language model paused by media.
+    let lease = studio.media.chat_lease(true, Duration::ZERO).unwrap();
+    let job = studio.media.submit(Kind::Image, body(r#"{"prompt":"a","architecture":"sdxl"}"#), "anime".into(), "1x1".into(), 1, 0.0, 8, None);
+    until("the job to wait for the chat", || studio.media.broker.lock().unwrap().waiting_media);
+    let private = studio.media.submit(Kind::Image, body(r#"{"prompt":"b","architecture":"sdxl"}"#), "anime".into(), "1x1".into(), 1, 0.0, 8, Some(dir.join("scratch")));
+    studio.llm.set_paused(true);
+    studio.shutdown();
+    assert_eq!(studio.media.get(&job.id).map(|j| j.status), Some("cancelled".to_string()));
+    // (an incognito job cancelled is forgotten at the runner's next sweep, as it leaves nothing behind)
+    let private = studio.media.get(&private.id);
+    assert!(private.as_ref().is_none_or(|j| j.status == "cancelled"), "{:?}", private.map(|j| j.status));
+    until("the runner and the pins' keeper to end", || runner.is_finished() && keeper.is_finished());
+    assert!(!studio.media.log.tail(200).contains("restarting the LLM after media jobs"), "{}", studio.media.log.tail(20));
+    let start = studio.llm.start(&studio.config(), &studio.root);
+    assert!(start.as_ref().is_err_and(|e| e.contains("stopping")), "{start:?}");
+    assert_eq!(studio.llm.log.tail(200).matches("studio: starting").count(), 0, "the server was never started");
+    // A pin is not loaded, and a job that comes is cancelled as it comes.
+    pins::tend(&studio);
+    assert!(studio.media.pin_states().is_empty() && studio.media.queued() == 0);
+    let late = studio.media.submit(Kind::Image, body(r#"{"prompt":"c"}"#), "moss".into(), "1x1".into(), 1, 0.0, 8, None);
+    assert_eq!(studio.media.get(&late.id).map(|j| j.status), Some("cancelled".to_string()));
+    // (asked again, as the tray asks as the session ends and then as it quits: nothing more)
+    studio.shutdown();
+    drop(lease);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An error answered by the kept picture worker: the worker lets go of every model it kept (`oaiy-media --serve`), so
+/// none is said to be kept here. Only the failed job's, and only where it was loading it, was forgotten before: the
+/// others were shown loaded, and a job was refused for a pin the worker no longer held.
+#[test]
+fn a_picture_that_fails_leaves_the_kept_worker_keeping_nothing() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-kept-error-{}", std::process::id()));
+    let studio = quiet_studio(&dir, |c| with_pins(c, &["klein"]));
+    let answers = stand_in(&studio, &[("moss-image", "moss"), ("flux3-klein", "klein")]);
+    assert_eq!(studio.media.holds_pinned(&studio.config()).as_deref(), Some("klein"));
+    let job = studio.media.submit(Kind::Image, body(r#"{"prompt":"a fox","architecture":"moss-image"}"#), "moss".into(), "1x1".into(), 1, 0.0, 8, None);
+    let made = {
+        let (studio, job) = (Arc::clone(&studio), job.clone());
+        std::thread::spawn(move || studio.media.serve_job(&studio, &studio.config(), &job, None))
+    };
+    // (answered once its request is sent: what the worker said before it is let go unread)
+    until("the request to be sent", || studio.media.serving.lock().unwrap().as_ref().is_some_and(|s| s.busy));
+    answers.send(Said::Answer(r#"{"error":"the stand-in could not make it"}"#.into())).unwrap();
+    assert_eq!(made.join().unwrap().unwrap_err(), "the stand-in could not make it");
+    let kept = studio.media.kept_worker().expect("the worker is kept: it answered");
+    assert!(kept.models.is_empty(), "{:?}", kept.models);
+    assert_eq!(studio.media.holds_pinned(&studio.config()), None, "no job is refused for a pin it let go");
+    studio.media.end_serving(true, "the test is done");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The pins' keeper forgets a kept worker that ended by itself as it waited, and only such a one: not one alive, nor
+/// one doing a job (the job's to see end), each looked at and taken under the one lock.
+#[test]
+fn only_a_kept_worker_that_ended_as_it_waited_is_forgotten() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-reap-{}", std::process::id()));
+    let studio = quiet_studio(&dir, |_| {});
+    let _answers = stand_in(&studio, &[("moss-image", "moss")]);
+    studio.media.reap_ended();
+    assert!(studio.media.kept_worker().is_some(), "alive: kept");
+    studio.media.serving.lock().unwrap().as_mut().unwrap().busy = true;
+    crash(&studio);
+    studio.media.reap_ended();
+    assert!(studio.media.kept_worker().is_some(), "doing a job: the job's to see");
+    studio.media.serving.lock().unwrap().as_mut().unwrap().busy = false;
+    studio.media.reap_ended();
+    assert!(studio.media.kept_worker().is_none(), "ended as it waited: forgotten");
+    assert!(studio.media.log.tail(20).contains("had ended by itself"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What loads a pin again by itself is bounded: a worker that ended by itself as it waited has what it kept loaded
+/// again once, not twice; a pin whose loading fails is tried [`pins::TRIES`] times in a row; then each is held, shown
+/// failed with why, until a person pins it again.
+#[test]
+fn a_pin_is_loaded_again_by_itself_only_so_often() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-pin-again-{}", std::process::id()));
+    let studio = quiet_studio(&dir, |c| with_pins(c, &["moss"]));
+    let state = || studio.media.pin_states().get("moss").cloned();
+    let warming = || match state() {
+        Some(pins::State::Warming(job, _)) => job,
+        other => panic!("not loading: {other:?}\n{}", studio.media.log.tail(20)),
+    };
+    let _first = stand_in(&studio, &[("moss-image", "moss")]);
+    pins::tend(&studio);
+    assert_eq!(state(), Some(pins::State::Ready));
+    // It crashes as it waits: loaded again, once.
+    crash(&studio);
+    pins::tend(&studio);
+    let job = warming();
+    assert_eq!(studio.media.queued(), 1);
+    let _second = stand_in(&studio, &[("moss-image", "moss")]);
+    studio.media.update(&job, |j| j.status = "completed".into());
+    pins::tend(&studio);
+    assert_eq!(state(), Some(pins::State::Ready));
+    // Again: held, nothing loaded, and said.
+    crash(&studio);
+    pins::tend(&studio);
+    pins::tend(&studio);
+    assert!(matches!(state(), Some(pins::State::Held(ref why)) if why == pins::WORKER_ENDED), "{:?}", state());
+    assert_eq!(studio.media.queued(), 0);
+    let shown = pins::snapshot(&studio.config(), &studio.media);
+    let row = shown.at(0).unwrap();
+    assert_eq!((str_or(row, "state", ""), str_or(row, "error", "").contains("ended by itself")), ("failed", true), "{}", shown.to_json());
+    // A person pins it again: loaded.
+    studio.media.pins_asked("moss", true);
+    pins::tend(&studio);
+    let job = warming();
+    // Its loading fails: tried again after a while, up to TRIES loads in all, then held.
+    studio.media.cancel(&job);
+    pins::tend(&studio);
+    assert!(matches!(state(), Some(pins::State::Failed(_, _, 1))), "{:?}", state());
+    pins::tend(&studio);
+    assert_eq!(studio.media.queued(), 0, "not tried again at once");
+    let Some(long_ago) = std::time::Instant::now().checked_sub(pins::RETRY + Duration::from_secs(1)) else { return };
+    studio.media.pin_states().insert("moss".into(), pins::State::Failed("no room".into(), long_ago, pins::TRIES - 1));
+    pins::tend(&studio);
+    let job = warming();
+    assert!(matches!(state(), Some(pins::State::Warming(_, n)) if n == pins::TRIES - 1));
+    studio.media.cancel(&job);
+    pins::tend(&studio);
+    let Some(pins::State::Failed(e, _, n)) = state() else { panic!("{:?}", state()) };
+    assert_eq!(n, pins::TRIES);
+    studio.media.pin_states().insert("moss".into(), pins::State::Failed(e, long_ago, n));
+    pins::tend(&studio);
+    assert!(matches!(state(), Some(pins::State::Held(ref why)) if why.contains("3 times in a row")), "{:?}", state());
+    assert_eq!(studio.media.queued(), 0);
+    studio.media.pins_asked("moss", true);
+    pins::tend(&studio);
+    warming();
+    studio.media.end_serving(true, "the test is done");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A GPU fault in a picture of the kept worker's: no pin is loaded again by itself (the warm job queued during the
+/// runner's pause after the fault loaded the model on the card that had just reset), until a person pins it again.
+#[test]
+fn a_gpu_fault_holds_the_pins_until_a_person_pins_again() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-pin-fault-{}", std::process::id()));
+    let studio = quiet_studio(&dir, |c| with_pins(c, &["moss"]));
+    let answers = stand_in(&studio, &[("moss-image", "moss")]);
+    let runner = {
+        let studio = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let media = Arc::clone(&studio.media);
+            media.run(&studio);
+        })
+    };
+    let state = || studio.media.pin_states().get("moss").cloned();
+    pins::tend(&studio);
+    assert_eq!(state(), Some(pins::State::Ready));
+    let job = studio.media.submit(Kind::Image, body(r#"{"prompt":"a fox","architecture":"moss-image"}"#), "moss".into(), "1x1".into(), 1, 0.0, 8, None);
+    until("the picture's request to be sent", || studio.media.serving.lock().unwrap().as_ref().is_some_and(|s| s.busy));
+    answers.send(Said::Answer(r#"{"error":"wgpu error: Validation Error: Parent device is lost"}"#.into())).unwrap();
+    until("the picture to fail", || studio.media.get(&job.id).is_some_and(|j| j.status == "failed"));
+    assert!(studio.media.kept_worker().is_none(), "a worker whose device was lost is let go");
+    pins::tend(&studio);
+    pins::tend(&studio);
+    assert!(matches!(state(), Some(pins::State::Held(ref why)) if why.contains("GPU fault")), "{:?}", state());
+    assert_eq!(studio.media.queued(), 0, "nothing queued for the card that faulted");
+    // A person pins it again: its loading is queued (and run once the runner's pause ends).
+    studio.media.pins_asked("moss", true);
+    pins::tend(&studio);
+    assert!(matches!(state(), Some(pins::State::Warming(..))), "{:?}", state());
+    // (the studio stopped: the runner leaves its pause, and ends)
+    studio.shutdown();
+    until("the runner to end", || runner.is_finished());
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,8 +1,9 @@
 //! Pinned picture models (`media.pinned`): kept loaded in the picture worker on their GPU whatever the keep time, a
 //! release or another job (one that would let a pinned model go is refused, saying which pin holds the GPU), and
 //! loaded again as the studio starts and after the worker ends ([`keep`]). A pin that cannot load is shown failed, and
-//! kept: it is tried again after [`RETRY`]. OAIY Network pins a worker's models this way (docs/NETWORK.md); the
-//! language model's pin is `llm.pinned`.
+//! kept: it is tried again after [`RETRY`], [`TRIES`] times in a row at most. None is loaded again by itself after a
+//! GPU fault, nor once the worker has ended by itself twice ([`State::Held`]): a person pins it again for that. OAIY
+//! Network pins a worker's models this way (docs/NETWORK.md); the language model's pin is `llm.pinned`.
 //!
 //! The picture worker is one process on one GPU, keeping MOSS-Image's and FLUX 3 Image Klein's models side by side
 //! and Qwen Image's alone (`super::kept_beside`): what is pinned is what it can keep together, checked as a pin is
@@ -21,7 +22,11 @@ use std::time::{Duration, Instant};
 pub const MAX_PINS: usize = 4;
 
 /// A pin that failed to load is tried again after this.
-const RETRY: Duration = Duration::from_secs(5 * 60);
+pub(crate) const RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// The loads of a pin that may fail one after another: past them it is held ([`State::Held`]). A model that cannot
+/// load (a file gone, too little memory) was loaded again every five minutes, for as long as the studio ran.
+pub(crate) const TRIES: u32 = 3;
 
 /// How often the pins are looked after.
 const EVERY: Duration = Duration::from_secs(3);
@@ -29,15 +34,26 @@ const EVERY: Duration = Duration::from_secs(3);
 /// The picture a model is loaded with: small, its answer thrown away.
 const WARM_PROMPT: &str = "A plain light grey square.";
 
+/// What a pin held after a GPU fault says ([`super::Media::hold_pins`]).
+pub(crate) const FAULT_HELD: &str = "not loaded again by itself after a GPU fault (a driver that reset is given no more work without a person): pin it again to load it, or start the studio again";
+
+/// What a pin held after its worker ended by itself twice says ([`super::Media::pins_hold`]).
+pub(crate) const WORKER_ENDED: &str = "not loaded again by itself: the picture worker ended by itself more than once while it waited; pin it again to load it, or start the studio again";
+
 /// Where a pinned model stands.
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
-    /// Being loaded, by the job named.
-    Warming(String),
+    /// Being loaded, by the job named, after the loads of it that failed one after another before it.
+    Warming(String, u32),
     /// Loaded in the picture worker.
     Ready,
-    /// It could not be loaded, as said, at the time given; tried again after [`RETRY`].
-    Failed(String, Instant),
+    /// It could not be loaded, as said, at the time given, the loads that failed one after another counted; tried
+    /// again after [`RETRY`], up to [`TRIES`] in all.
+    Failed(String, Instant, u32),
+    /// Not loaded again by itself, as said: after a GPU fault, its worker found ended by itself more than once, or
+    /// [`TRIES`] loads that failed. A person's pin of it again loads it (`POST /api/resources/pins`,
+    /// [`super::Media::pins_asked`]), as does the studio's next start. Shown failed, the error saying so.
+    Held(String),
 }
 
 /// The models pinned, in the order they were.
@@ -96,7 +112,8 @@ pub fn with(cfg: &Json, model: &str, pin: bool) -> Json {
 }
 
 /// The pins as `GET /api/resources` shows them: `{model, state, error?, job?}`, state `warming`, `ready`, `failed` or
-/// `waiting` (not looked after yet, or waiting for the queue to empty).
+/// `waiting` (not looked after yet, or waiting for the queue to empty). A pin held ([`State::Held`]) is `failed`, its
+/// error saying why it is not loaded again and what loads it.
 pub fn snapshot(cfg: &Json, media: &Media) -> Json {
     let states = media.pin_states();
     Json::Arr(
@@ -106,8 +123,8 @@ pub fn snapshot(cfg: &Json, media: &Media) -> Json {
                 let mut row = vec![("model", Json::str(&model))];
                 match states.get(&model) {
                     Some(State::Ready) => row.push(("state", Json::str("ready"))),
-                    Some(State::Warming(job)) => row.extend([("state", Json::str("warming")), ("job", Json::str(job))]),
-                    Some(State::Failed(e, _)) => row.extend([("state", Json::str("failed")), ("error", Json::str(e))]),
+                    Some(State::Warming(job, _)) => row.extend([("state", Json::str("warming")), ("job", Json::str(job))]),
+                    Some(State::Failed(e, ..) | State::Held(e)) => row.extend([("state", Json::str("failed")), ("error", Json::str(e))]),
                     None => row.push(("state", Json::str("waiting"))),
                 }
                 Json::obj(row)
@@ -116,51 +133,70 @@ pub fn snapshot(cfg: &Json, media: &Media) -> Json {
     )
 }
 
-/// Look after the pins, for as long as the studio runs.
+/// Look after the pins, for as long as the studio runs: not past its stop (`crate::Studio::shutdown`), when this held it,
+/// and loaded a pin again in a worker that outlived OAIY.
 pub fn keep(studio: Arc<Studio>) {
-    loop {
+    while !studio.media.closed() {
         std::thread::sleep(EVERY);
         tend(&studio);
     }
 }
 
 /// One look: each pin is ready where the kept worker holds it, its loading followed where it is loading, and the first
-/// one neither loaded (nor failed lately) where no other job is waiting or running.
+/// one neither loaded (nor failed lately, nor held) where no other job is waiting or running. Held, not loaded, where
+/// the pins are held ([`super::Media::pins_hold`]: a GPU fault, the worker found ended by itself more than once), or
+/// where its loads failed [`TRIES`] times in a row. Nothing once the studio has stopped.
 pub(crate) fn tend(studio: &Arc<Studio>) {
+    let media = &studio.media;
+    if media.closed() {
+        return;
+    }
     let cfg = studio.config();
     let wanted = pinned(&cfg);
-    let media = &studio.media;
-    // (a kept worker that ended by itself is forgotten first: what it kept is loaded again)
+    // (a kept worker that ended by itself is forgotten first: what it kept is loaded again, once)
     media.reap_ended();
+    let hold = media.pins_hold();
     let kept: Vec<String> = media.kept_worker().map(|k| k.models).unwrap_or_default();
     // (the loading jobs looked up before the pins are locked, never with them: the runner locks the jobs and then the
     // kept worker, and the kept worker's users the pins)
-    let loading: Vec<String> = media.pin_states().values().filter_map(|s| if let State::Warming(job) = s { Some(job.clone()) } else { None }).collect();
+    let loading: Vec<String> = media.pin_states().values().filter_map(|s| if let State::Warming(job, _) = s { Some(job.clone()) } else { None }).collect();
     let jobs: BTreeMap<String, Option<super::Job>> = loading.into_iter().map(|id| (id.clone(), media.get(&id))).collect();
-    let mut next: Option<String> = None;
+    // (the first to load, with the loads of it that failed one after another before)
+    let mut next: Option<(String, u32)> = None;
     {
         let mut states = media.pin_states();
         states.retain(|m, _| wanted.contains(m));
         for model in &wanted {
             let state = states.get(model).cloned();
             let now = match state.clone() {
-                Some(State::Warming(job)) => match jobs.get(&job).cloned().flatten() {
+                Some(State::Warming(job, failed)) => match jobs.get(&job).cloned().flatten() {
                     Some(j) if !j.finished() => continue,
                     Some(j) if j.status == "completed" && kept.contains(model) => State::Ready,
-                    Some(j) => State::Failed(j.error.unwrap_or_else(|| format!("its loading job {}", j.status)), Instant::now()),
-                    None => State::Failed("its loading job was forgotten".into(), Instant::now()),
+                    Some(j) => State::Failed(j.error.unwrap_or_else(|| format!("its loading job {}", j.status)), Instant::now(), failed + 1),
+                    None => State::Failed("its loading job was forgotten".into(), Instant::now(), failed + 1),
                 },
                 _ if kept.contains(model) => State::Ready,
-                Some(State::Failed(e, at)) if at.elapsed() < RETRY => State::Failed(e, at),
-                _ => {
+                // (held until a person pins it again: `Media::pins_asked`)
+                Some(State::Held(_)) => continue,
+                Some(State::Failed(e, _, failed)) if failed >= TRIES => State::Held(format!("{e} (its loading failed {failed} times in a row: pin it again to load it, or start the studio again)")),
+                Some(State::Failed(e, at, failed)) if at.elapsed() < RETRY => State::Failed(e, at, failed),
+                // (not loaded again by itself: after a GPU fault, or a worker that keeps ending)
+                _ if hold.is_some() => State::Held(hold.clone().unwrap_or_default()),
+                other => {
                     if next.is_none() {
-                        next = Some(model.clone());
+                        next = Some((model.clone(), if let Some(State::Failed(_, _, failed)) = other { failed } else { 0 }));
                     }
                     continue;
                 }
             };
-            if matches!(now, State::Failed(..)) && !matches!(state, Some(State::Failed(..))) {
-                if let State::Failed(e, _) = &now {
+            // (a loading that failed while the pins are held is held, not tried again: a warm job the GPU fault ended)
+            let now = match (now, &hold) {
+                (State::Failed(..), Some(why)) => State::Held(why.clone()),
+                (now, _) => now,
+            };
+            let said = |s: &Option<State>| matches!(s, Some(State::Failed(..) | State::Held(_)));
+            if !said(&state) || (matches!(now, State::Held(_)) && !matches!(state, Some(State::Held(_)))) {
+                if let State::Failed(e, ..) | State::Held(e) = &now {
                     media.log.push(format!("pinned {model} could not be loaded: {e}"));
                     crate::resources::event("pin_failed", model, "", e);
                 }
@@ -169,7 +205,7 @@ pub(crate) fn tend(studio: &Arc<Studio>) {
         }
     }
     // (loaded when nothing else is: a person's picture never waits for a pin's)
-    let Some(model) = next else { return };
+    let Some((model, failed)) = next else { return };
     if media.busy() || media.queued() > 0 {
         return;
     }
@@ -177,19 +213,19 @@ pub(crate) fn tend(studio: &Arc<Studio>) {
     if let Err(e) = check(&cfg, &model) {
         media.log.push(format!("pinned {model} could not be loaded: {e}"));
         crate::resources::event("pin_failed", &model, "", &e);
-        media.pin_states().insert(model, State::Failed(e, Instant::now()));
+        media.pin_states().insert(model, State::Failed(e, Instant::now(), failed + 1));
         return;
     }
     match warm(studio, &cfg, &model) {
         Ok(job) => {
             media.log.push(format!("loading pinned {model} ({job})"));
             crate::resources::event("pin_warm", &model, "", "pinned: loading it to keep it loaded");
-            media.pin_states().insert(model, State::Warming(job));
+            media.pin_states().insert(model, State::Warming(job, failed));
         }
         Err(e) => {
             media.log.push(format!("pinned {model} could not be loaded: {e}"));
             crate::resources::event("pin_failed", &model, "", &e);
-            media.pin_states().insert(model, State::Failed(e, Instant::now()));
+            media.pin_states().insert(model, State::Failed(e, Instant::now(), failed + 1));
         }
     }
 }

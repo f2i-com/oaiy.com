@@ -83,6 +83,14 @@ pub struct Studio {
     version: std::sync::atomic::AtomicU64,
     /// `--ui-port` / `--port`: in effect, never written to the file.
     port_overrides: (Option<u16>, Option<u16>),
+    /// Stopped for good ([`Studio::shutdown`]): its listeners closed, a request still on a connection it had refused,
+    /// and nothing it supervises started again. A host that starts its engines again (OAIY Desktop, when an update is
+    /// put back) starts a new studio, which reads the settings from their file, rather than finding this one: it kept
+    /// answering, and was taken for one running, with its downloads refused for good.
+    closed: std::sync::atomic::AtomicBool,
+    /// Where each of its listeners listens, and the thread that takes its connections ([`serve`]): ended by
+    /// [`Studio::shutdown`], so the ports are free for the next studio.
+    listeners: std::sync::Mutex<Vec<(std::net::SocketAddr, std::thread::JoinHandle<()>)>>,
 }
 
 /// The key `GET /api/config` adds to the settings it answers: their version, sent back with a save of them.
@@ -104,6 +112,11 @@ const SECRETS: [(&str, &str); 2] = [("downloads", "hf_token"), ("gateway", "api_
 impl Studio {
     pub fn config(&self) -> Json {
         self.config.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Whether the studio has stopped for good ([`Studio::shutdown`]).
+    pub fn closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The eGPU's Python, tinygrad and launcher from a provider (OAIY Desktop's eGPU plugin), or the settings' again
@@ -248,9 +261,12 @@ impl Studio {
             if !llm::holds_a_model(llm) {
                 self.log.push(llm::ALL_ON_EGPU);
             } else if bool_or(llm, "enabled", true) {
-                // Saved either way; a failed restart is reported, not a failed save.
-                if let Err(e) = self.llm.start(&next, &self.root) {
-                    self.log.push(format!("the LLM did not restart: {e}"));
+                // Saved either way; a failed restart is reported, not a failed save. Not beside a media job on the GPU
+                // the new settings load it on (another default model, on more GPUs): then once media is done.
+                match start_llm_beside_media(&self.llm, &self.media, &next, &self.root) {
+                    Ok(true) => {}
+                    Ok(false) => self.log.push("the LLM restarts once the media jobs on its GPU are done"),
+                    Err(e) => self.log.push(format!("the LLM did not restart: {e}")),
                 }
             }
         }
@@ -276,6 +292,11 @@ impl Studio {
     /// here has the card let go of its model and this computer's engine load the default. Now, not at the next
     /// request (a model of 16 GB takes a minute to reach the card). Nothing changes while the default and where it
     /// runs stay as they were: a request for another model still loads it where it runs ([`llm::holds_a_model`]).
+    ///
+    /// This computer's is not loaded beside a media job, though: while media has paused the language model, or a job
+    /// holds the GPU the default would load on, it is left for media's end, which brings the language model back with
+    /// the settings as they are then, this default ([`start_llm_beside_media`]). Picking another model while a clip was
+    /// made on GPU 1 loaded a model of GPUs 0 and 1 beside it.
     fn place_the_model(&self, before: &Json, next: &Json) {
         let placed = |v: &Json| {
             let llm = v.get("llm").cloned().unwrap_or(Json::Null);
@@ -283,7 +304,7 @@ impl Studio {
             (egpu::assigned(&llm, &default), default, bool_or(&llm, "enabled", true))
         };
         let (on_card, default, enabled) = placed(next);
-        if placed(before) == (on_card, default.clone(), enabled) || !enabled || default.is_empty() {
+        if placed(before) == (on_card, default.clone(), enabled) || !enabled || default.is_empty() || self.closed() {
             return;
         }
         if on_card && self.llm.is_running() {
@@ -296,11 +317,12 @@ impl Studio {
         }
         // (the load begun beside the save, which it does not hold up: the card's waits for a server it replaces to
         // be gone, up to 25 s)
-        let (egpu, mac, cfg, root, log) = (Arc::clone(&self.egpu), Arc::clone(&self.llm), next.clone(), self.root.clone(), Arc::clone(&self.log));
+        let (egpu, mac, media, cfg, root, log) = (Arc::clone(&self.egpu), Arc::clone(&self.llm), Arc::clone(&self.media), next.clone(), self.root.clone(), Arc::clone(&self.log));
         let begun = std::thread::Builder::new().name("place-model".into()).spawn(move || {
-            let (where_, started) = if on_card { ("on the eGPU", egpu.start(&cfg, &root, &default)) } else { ("on this computer", mac.start(&cfg, &root)) };
+            let (where_, started) = if on_card { ("on the eGPU", egpu.start(&cfg, &root, &default).map(|()| true)) } else { ("on this computer", start_llm_beside_media(&mac, &media, &cfg, &root)) };
             match started {
-                Ok(()) => log.push(format!("loading {default} {where_}")),
+                Ok(true) => log.push(format!("loading {default} {where_}")),
+                Ok(false) => log.push(format!("{default} loads {where_} once the media jobs on its GPU are done")),
                 Err(e) => log.push(format!("{default} did not start loading {where_}: {e}")),
             }
         });
@@ -311,17 +333,30 @@ impl Studio {
 
     /// Stop the language model and any media job, so no engine outlives the
     /// studio holding GPU memory. Waits briefly for a media worker to be killed.
+    ///
+    /// For good: its listeners are closed (the ports free for a studio started after it), and nothing is started again,
+    /// the language model a media job paused as the job ends, a pinned picture model as the pins are looked after, a
+    /// job that comes. Once: asked again (the tray asks as the session ends, then as it quits), it does nothing.
     pub fn shutdown(&self) {
-        // Downloads first: one being added to the models saves the settings, and none may after this (a restore puts
+        if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        // The listeners first: a host that starts its engines again after this (OAIY Desktop, an update put back) finds
+        // none answering and starts a new studio on the same ports, rather than taking this one for a running one.
+        self.stop_listening();
+        // (media's runner and the pins' keeper end, and the language model is started by nothing after: a job that
+        // paused it ended after the stop and its runner started oaiy-llm-server again, a pin's keeper started oaiy-media
+        // again within 3 s, and an update then found the engines' programs running. Before the downloads' stop, which
+        // can take a few seconds, so no job starts meanwhile)
+        self.media.close();
+        self.llm.close();
+        // Downloads next: one being added to the models saves the settings, and none may after this (a restore puts
         // its settings back once the studio stops), nor may its curl outlive it (the next start's resume would run a
         // second curl on the same partial file).
         self.downloads.shutdown();
-        self.llm.stop();
         self.egpu.stop();
-        let mut cancelled = false;
-        for job in self.media.list() {
-            cancelled |= self.media.cancel(&job.id);
-        }
+        // (every job, incognito ones too: a pin's loading is one, and the list the page shows has none of them)
+        let cancelled = self.media.cancel_all();
         if cancelled {
             // The runner polls the cancel flag every 200 ms and kills the worker.
             for _ in 0..25 {
@@ -335,6 +370,33 @@ impl Studio {
         // find its program still running (on Windows the installer cannot replace it).
         self.media.end_serving(false, "the studio is stopping");
         self.log.push("studio stopped");
+    }
+
+    /// Its listeners closed ([`serve`]), each accept loop woken by a connection of this studio's own to find it stopped,
+    /// and waited for (a few seconds at most) as it lets go of its port: a studio started just after this one listens on
+    /// the same ports, not on others beside them (the gateway's port is what the Agent and Aokie are told).
+    fn stop_listening(&self) {
+        let loops = std::mem::take(&mut *self.listeners.lock().unwrap_or_else(|p| p.into_inner()));
+        for (addr, _) in &loops {
+            // (a listener on every address is reached on loopback; dropped at once, so the closing that waits is this
+            // side's, not the port's)
+            let mut to = *addr;
+            if to.ip().is_unspecified() {
+                to.set_ip(if to.is_ipv4() { std::net::Ipv4Addr::LOCALHOST.into() } else { std::net::Ipv6Addr::LOCALHOST.into() });
+            }
+            let _ = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(1));
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        for (addr, accepting) in loops {
+            while !accepting.is_finished() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if accepting.is_finished() {
+                let _ = accepting.join();
+            } else {
+                self.log.push(format!("the listener on {addr} did not stop: its port is let go as OAIY ends"));
+            }
+        }
     }
 
     pub fn state(&self) -> Json {
@@ -368,6 +430,26 @@ fn llm_and_media() -> (Arc<llm::Llm>, Arc<media::Media>) {
     (llm, media)
 }
 
+/// This computer's language model started with `cfg` now (a change of settings, another default model), or left for
+/// media's end where it would load beside a media job: media has paused it (a job on its GPU, or one after another), or
+/// a job holds the GPU it would load on (`media::needs_media_gpu`). Media's runner brings back the language model it
+/// paused once its queue is empty, with the settings as they are then, so what was chosen meanwhile is what loads
+/// ([`media::Media::run`]); one that was not running is marked paused for it here. Whether it was started.
+///
+/// A job is held off while it starts, as by a chat that shares its GPU ([`media::Media::chat_lease`]): one that comes
+/// meanwhile finds it starting and stops it, rather than the two loading on the GPU together.
+fn start_llm_beside_media(llm: &Arc<llm::Llm>, media: &media::Media, cfg: &Json, root: &std::path::Path) -> Result<bool, String> {
+    if llm.paused() {
+        return Ok(false);
+    }
+    let Ok(_held) = media.chat_lease(media::needs_media_gpu(cfg, None), Duration::ZERO) else {
+        // (the runner is in that job meanwhile, and looks at the queue, and so at this, once it ends)
+        llm.set_paused(true);
+        return Ok(false);
+    };
+    llm.start(cfg, root).map(|()| true)
+}
+
 #[cfg(test)]
 impl Studio {
     /// A Studio with `cfg` (nothing started, nothing saved), for the tests of what a request comes to.
@@ -389,6 +471,8 @@ impl Studio {
             saving: std::sync::Mutex::new(()),
             version: std::sync::atomic::AtomicU64::new(first_version()),
             port_overrides: (None, None),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            listeners: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -518,12 +602,20 @@ impl Drop for Counted {
 /// Serve a listener, each connection on a thread of its own, at most [`MAX_CONNECTIONS`] at once. Each request's head
 /// is gated before its body is read ([`admin::gate`], [`gateway_gate`]): a request refused is refused without the
 /// 64 MiB it may say it brings.
+///
+/// Until the studio stops ([`Studio::shutdown`], which wakes it): then the listener is let go, and a request that comes
+/// on a connection it had is refused (`503`), so a client's next is made to whatever listens on the port then.
 fn serve(listener: TcpListener, studio: Arc<Studio>, admin: bool) {
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let addr = listener.local_addr();
+    let port = addr.as_ref().map(|a| a.port()).unwrap_or(0);
     let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    std::thread::spawn(move || {
+    let listening = Arc::clone(&studio);
+    let accepting = std::thread::spawn(move || {
         let mut pause = Duration::from_millis(5);
         for conn in listener.incoming() {
+            if studio.closed() {
+                break;
+            }
             let mut stream = match conn {
                 Ok(stream) => stream,
                 // Out of file descriptors (EMFILE) fails every accept at once until one closes: a pause, longer each
@@ -553,7 +645,12 @@ fn serve(listener: TcpListener, studio: Arc<Studio>, admin: bool) {
                 let _counted = counted;
                 oaiy_engine::http::serve_gated(
                     stream,
-                    |req| if admin { admin::gate(&studio, req, port, peer_loopback) } else { gateway_gate(&studio, req) },
+                    |req| {
+                        if studio.closed() {
+                            return Some(oaiy_engine::http::Refusal { status: 503, body: util::error_json("the studio has stopped", "server_error", "stopped").to_json() });
+                        }
+                        if admin { admin::gate(&studio, req, port, peer_loopback) } else { gateway_gate(&studio, req) }
+                    },
                     |req, w| {
                         if admin {
                             return admin::handle(&studio, req, w);
@@ -567,6 +664,9 @@ fn serve(listener: TcpListener, studio: Arc<Studio>, admin: bool) {
             }
         }
     });
+    if let Ok(addr) = addr {
+        listening.listeners.lock().unwrap_or_else(|p| p.into_inner()).push((addr, accepting));
+    }
 }
 
 /// The names a gateway that listens on loopback answers to besides loopback's own: Docker's for this computer (a
@@ -818,6 +918,8 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         saving: std::sync::Mutex::new(()),
         version: std::sync::atomic::AtomicU64::new(first_version()),
         port_overrides: (args.ui_port, args.port),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        listeners: std::sync::Mutex::new(Vec::new()),
     });
     // a media job's stages each read its device's memory: the card's (its launcher's word each second), or this
     // computer's GPU's
@@ -904,6 +1006,10 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         let mut ticks = 0u64;
         loop {
             std::thread::sleep(Duration::from_secs(30));
+            // (not past the studio's stop: this holds it, and with it what it held)
+            if idle.closed() {
+                return;
+            }
             ticks += 1;
             idle.media.sweep();
             // (a pinned language model is never stopped for being idle)
@@ -1143,6 +1249,77 @@ mod tests {
         assert_eq!((got, moved), (port, None));
         // a host that is not this computer's is not worked around
         assert!(listen("203.0.113.9", port, "UI").is_err());
+    }
+
+    /// A studio stopped lets go of its ports, and a request on a connection it had is refused: a host that starts its
+    /// engines again after it (OAIY Desktop, an update put back) finds none running and starts a new one, on the same
+    /// ports. The stopped one kept answering, was taken for one running, and refused every download for good.
+    #[test]
+    fn a_stopped_studio_lets_go_of_its_ports_and_a_new_one_takes_them() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("oaiy-studio-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let free = || TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let (ui, gw) = (free(), free());
+        let mut cfg = config::default_json();
+        for (section, port) in [("ui", ui), ("gateway", gw)] {
+            let mut s = cfg.get(section).cloned().unwrap();
+            util::set(&mut s, "port", Json::Int(port as i64));
+            util::set(&mut cfg, section, s);
+        }
+        // (nothing real is started: names no program has)
+        let mut media = cfg.get("media").cloned().unwrap();
+        util::set(&mut media, "worker", Json::str("no-such-worker-here"));
+        util::set(&mut cfg, "media", media);
+        let mut llm = cfg.get("llm").cloned().unwrap();
+        util::set(&mut llm, "server", Json::str(dir.join("no-such-llm-server").to_string_lossy()));
+        util::set(&mut llm, "server_webgpu", Json::str(dir.join("no-such-llm-server").to_string_lossy()));
+        util::set(&mut cfg, "llm", llm);
+        let path = dir.join(config::FILE_NAME);
+        config::save(&path, &cfg).unwrap();
+        let args = Args { config: path, open: Some("none".into()), ui_port: None, port: None, start_llm: false };
+        let first = launch(&args, true).unwrap();
+        assert_eq!((first.ui_url.clone(), first.gateway_url.clone()), (format!("http://127.0.0.1:{ui}"), format!("http://127.0.0.1:{gw}")));
+        assert!(running_instance(&args).is_some());
+        // A connection kept open, as a client keeps one for its next request.
+        let mut kept = std::net::TcpStream::connect(("127.0.0.1", ui)).unwrap();
+        kept.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let ask = |s: &mut std::net::TcpStream| -> String {
+            write!(s, "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{ui}\r\nConnection: keep-alive\r\n\r\n").unwrap();
+            let (mut got, mut buf) = (Vec::new(), [0u8; 8192]);
+            // (the head, then the body to its length, so the next answer on the connection starts where this ends)
+            loop {
+                let n = s.read(&mut buf).unwrap_or(0);
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                    if rest.len() >= len || n == 0 {
+                        return head.lines().next().unwrap_or("").to_string();
+                    }
+                }
+                if n == 0 {
+                    return text;
+                }
+            }
+        };
+        assert!(ask(&mut kept).contains(" 200 "), "served while it runs");
+        // ...and one left open and idle across the next start, as a page's or a client's pool leaves one.
+        let mut idle = std::net::TcpStream::connect(("127.0.0.1", ui)).unwrap();
+        idle.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert!(ask(&mut idle).contains(" 200 "));
+        first.studio.shutdown();
+        assert!(running_instance(&args).is_none(), "nothing answers for the stopped studio");
+        assert!(ask(&mut kept).contains(" 503 "), "a request on its connection is refused");
+        let second = launch(&args, true).unwrap();
+        let moved = second.studio.log.tail(20);
+        assert_eq!((second.ui_url.clone(), second.gateway_url.clone()), (first.ui_url.clone(), first.gateway_url.clone()), "the same ports, a connection of the old one's still open: {moved}");
+        assert!(running_instance(&args).is_some());
+        assert!(ask(&mut idle).contains(" 503 "), "the old one's connection is still the old one's, and refused");
+        assert!(!second.studio.closed() && !second.studio.media.closed());
+        second.studio.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// "Start when OAIY opens" is saved from the Overview as it is ticked: the model loaded meanwhile stays loaded.

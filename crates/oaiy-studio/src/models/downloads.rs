@@ -1787,7 +1787,7 @@ mod tests {
             h.hex()
         };
         let mut cfg = crate::config::default_json();
-        let named = Json::parse(format!(r#"{{"x":{{"text_encoder":"{}"}}}}"#, kept.join("encoder.safetensors").display()).as_bytes()).unwrap();
+        let named = Json::parse(format!(r#"{{"x":{{"text_encoder":"{}"}}}}"#, kept.join("encoder.safetensors").display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
         let mut image = cfg.get("media").and_then(|m| m.get("image")).cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
         crate::util::set(&mut image, "models", named);
         let mut media = cfg.get("media").cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
@@ -1957,7 +1957,7 @@ mod tests {
             std::fs::write(f, b"weights").unwrap();
         }
         // the settings name the shared GGUF (the language model): it stays
-        let cfg = Json::parse(format!(r#"{{"llm":{{"models":[{{"name":"qwen3.5-9b","path":"{}"}}]}}}}"#, shared.display()).as_bytes()).unwrap();
+        let cfg = Json::parse(format!(r#"{{"llm":{{"models":[{{"name":"qwen3.5-9b","path":"{}"}}]}}}}"#, shared.display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
         let mut full = crate::config::default_json();
         crate::util::set(&mut full, "llm", cfg.get("llm").cloned().unwrap());
         let studio = Studio::for_test(&root, full);

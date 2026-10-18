@@ -76,6 +76,8 @@ struct Inner {
     /// server that failed again at once ([`retry_after`]).
     failures: u32,
     failed_at: Option<Instant>,
+    /// Stopped for good, as the studio stops ([`Llm::close`]): nothing starts it again.
+    closed: bool,
 }
 
 /// How long after a failure a request starts a server again: 5 s, doubled with each failure after it, at most 2 min.
@@ -201,6 +203,9 @@ pub fn holds_a_model(llm: &Json) -> bool {
 
 /// What the log says when [`holds_a_model`] is false and the engine is left stopped.
 pub const ALL_ON_EGPU: &str = "the language model runs on the eGPU: this computer's engine starts only for a request for a model of its own, or one the eGPU cannot answer";
+
+/// What a start of the language model is told once the studio has stopped ([`Llm::close`]).
+const CLOSED: &str = "the studio is stopping: the language model is not started again";
 
 /// The server's command line. Its key is not on it: it goes in the environment (`OAIY_LLM_API_KEY`, see `server_command`),
 /// where another user's `ps` does not show it.
@@ -360,6 +365,7 @@ impl Llm {
                 held: 0,
                 failures: 0,
                 failed_at: None,
+                closed: false,
             }),
             reap: Mutex::new(()),
             changed: Condvar::new(),
@@ -438,6 +444,9 @@ impl Llm {
         if !bool_or(llm, "enabled", true) {
             return Err("the LLM is disabled in the configuration".into());
         }
+        if self.lock().closed {
+            return Err(CLOSED.into());
+        }
         if self.is_running() {
             return Ok(());
         }
@@ -450,6 +459,10 @@ impl Llm {
         let webgpu_gb = llm.get("webgpu_gb").and_then(Json::as_i64).filter(|n| *n > 0).or_else(|| auto_webgpu_gb(&crate::system::System::new().gpus(), llm));
         let _reap = self.reap.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        // (asked again under the locks `close` takes: a start that began as the studio stopped starts nothing after it)
+        if g.closed {
+            return Err(CLOSED.into());
+        }
         if matches!(g.state, State::Starting | State::Ready) {
             return Ok(());
         }
@@ -581,6 +594,20 @@ impl Llm {
     pub fn stop(&self) {
         let _reap = self.reap.lock().unwrap_or_else(|p| p.into_inner());
         let child = Self::halt(&mut self.lock());
+        self.changed.notify_all();
+        self.end(child);
+    }
+
+    /// Stopped for good, as the studio stops (`crate::Studio::shutdown`): nothing starts it again, a media job's end
+    /// (which brings back the language model it paused), a request still being answered, a change of settings. Its
+    /// server started again after the studio had stopped outlived OAIY, and an update found its program running.
+    pub fn close(&self) {
+        let _reap = self.reap.lock().unwrap_or_else(|p| p.into_inner());
+        let child = {
+            let mut g = self.lock();
+            g.closed = true;
+            Self::halt(&mut g)
+        };
         self.changed.notify_all();
         self.end(child);
     }

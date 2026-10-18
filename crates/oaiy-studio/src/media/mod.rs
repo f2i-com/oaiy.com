@@ -334,6 +334,19 @@ pub struct Media {
     releasing: AtomicBool,
     /// Where each pinned picture model stands ([`pins`]).
     pins: Mutex<pins::States>,
+    /// Stopped for good, as the studio stops ([`Media::close`]): no job is started or queued after it, no worker is
+    /// started, and nothing media stopped is brought back (the language model it paused, the card it was lent). The
+    /// runner ends, and the pins' keeper with it: each held the studio, and an update found the engines' programs still
+    /// running after OAIY had stopped them (on Windows the installer cannot replace them).
+    closed: AtomicBool,
+    /// Why the pinned picture models are not loaded again by themselves: a GPU fault ([`Media::hold_pins`]). Until a
+    /// person pins or unpins one ([`Media::pins_asked`]), or the studio starts again: a driver that reset is given no
+    /// more work that boot but by a person.
+    pins_held: Mutex<Option<String>>,
+    /// The times the kept picture worker was found to have ended by itself (it crashed) since a person last pinned or
+    /// unpinned a model: past one, what it kept is not loaded again by itself ([`pins::tend`]). A worker that crashes
+    /// as it waits was loaded again within 3 s, for ever.
+    ended_by_itself: std::sync::atomic::AtomicU32,
 }
 
 /// A chat request's hold on the LLM; released on drop.
@@ -1387,6 +1400,62 @@ impl Media {
             memory_probe: Mutex::new(None),
             releasing: AtomicBool::new(false),
             pins: Mutex::new(pins::States::new()),
+            closed: AtomicBool::new(false),
+            pins_held: Mutex::new(None),
+            ended_by_itself: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Stopped for good ([`Media::closed`]), as the studio stops (`crate::Studio::shutdown`). Set under the queue's
+    /// lock and the runner told: waiting for a job with none queued it waits with no end, and would never see it.
+    pub fn close(&self) {
+        let _jobs = self.lock();
+        self.closed.store(true, Ordering::SeqCst);
+        self.queue_signal.notify_all();
+        self.changed.notify_all();
+    }
+
+    /// Whether media has stopped for good ([`Media::close`]).
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Every job not finished cancelled, incognito ones too (a pin's loading is one: [`Media::list`] shows none of
+    /// them). Whether any was.
+    pub fn cancel_all(&self) -> bool {
+        let ids: Vec<String> = self.lock().iter().filter(|j| !j.finished()).map(|j| j.id.clone()).collect();
+        // (each one, not up to the first: a loop, not `any`)
+        let mut any = false;
+        for id in &ids {
+            any |= self.cancel(id);
+        }
+        any
+    }
+
+    /// The pinned picture models not loaded again by themselves after a GPU fault, `why` (`pins::FAULT_HELD`): what
+    /// has one loaded stays so, what has not is shown held ([`pins::State::Held`]), until a person pins or unpins
+    /// one ([`Media::pins_asked`]) or the studio starts again. The runner waits a while after a fault before the next
+    /// job, and the warm job the pins' keeper queued meanwhile loaded the model on the card that had just reset.
+    pub(crate) fn hold_pins(&self, why: &str) {
+        *self.pins_held.lock().unwrap_or_else(|p| p.into_inner()) = Some(why.to_string());
+    }
+
+    /// Why the pinned picture models are not loaded again by themselves, where they are not: a GPU fault
+    /// ([`Media::hold_pins`]), or the kept worker found ended by itself more than once (`pins::WORKER_ENDED`).
+    pub(crate) fn pins_hold(&self) -> Option<String> {
+        let fault = self.pins_held.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        fault.or_else(|| (self.ended_by_itself.load(Ordering::SeqCst) > 1).then(|| pins::WORKER_ENDED.to_string()))
+    }
+
+    /// A person pinned `model` (again: `pin`) or unpinned it, with `POST /api/resources/pins` or `/unpin`: the pins are
+    /// loaded by themselves again (a hold after a GPU fault lifted, the worker's endings forgotten), and a pin of
+    /// `model` that was held, or had failed, is loaded at the keeper's next look. An unpinned one is forgotten there.
+    pub(crate) fn pins_asked(&self, model: &str, pin: bool) {
+        *self.pins_held.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.ended_by_itself.store(0, Ordering::SeqCst);
+        let mut states = self.pin_states();
+        if pin && matches!(states.get(model), Some(pins::State::Held(_) | pins::State::Failed(..))) {
+            states.remove(model);
         }
     }
 
@@ -1416,15 +1485,21 @@ impl Media {
 
     /// The kept worker forgotten where it ended by itself while it waited (it crashed): what it kept is not loaded any
     /// more, so a pin of it is loaded again and the card is not kept for it. One doing a job is the job's to see (the
-    /// job holds it, so it is not waited for here).
+    /// job holds it, so it is not waited for here). Counted ([`Media::pins_hold`]): it is loaded again once by itself.
     pub(crate) fn reap_ended(&self) {
+        // (taken from its place under the same lock it was found idle and ended under: the lock let go between the two,
+        // the runner could give it a job meanwhile, and the worker then killed was that job's)
         let ended = match self.serving.try_lock() {
-            Ok(mut slot) => slot.as_mut().is_some_and(|s| !s.busy && !matches!(s.child.try_wait(), Ok(None))),
-            Err(_) => false,
+            Ok(mut slot) => {
+                let gone = slot.as_mut().is_some_and(|s| !s.busy && !matches!(s.child.try_wait(), Ok(None)));
+                if gone { slot.take() } else { None }
+            }
+            Err(_) => None,
         };
-        if ended {
+        if let Some(s) = ended {
             self.log.push("the kept image worker had ended by itself");
-            self.end_serving(true, "it had ended by itself");
+            self.ended_by_itself.fetch_add(1, Ordering::SeqCst);
+            self.end_worker(s, true, "it had ended by itself");
         }
     }
 
@@ -1441,6 +1516,9 @@ impl Media {
     #[allow(clippy::too_many_arguments)]
     pub fn submit(&self, kind: Kind, request: Json, model: String, size: String, n: usize, seconds: f64, keep: usize, scratch: Option<PathBuf>) -> Job {
         let prompt = str_or(&request, "prompt", "").to_string();
+        // (once media has stopped, a job that comes, from a request answered as the studio stopped, is cancelled as it
+        // comes: no runner is left to run it, and its caller would wait for it to its end)
+        let closed = self.closed();
         let job = Job {
             id: random_id(match kind {
                 Kind::Image => "img_",
@@ -1452,11 +1530,11 @@ impl Media {
                 Kind::Picture => "pic_",
             }),
             kind,
-            status: "queued".into(),
+            status: if closed { "cancelled" } else { "queued" }.into(),
             progress: 0.0,
-            stage: "queued".into(),
+            stage: if closed { "cancelled" } else { "queued" }.into(),
             created_at: now(),
-            completed_at: None,
+            completed_at: closed.then(now),
             prompt,
             model,
             size,
@@ -1466,8 +1544,8 @@ impl Media {
             result: Json::Null,
             files: Vec::new(),
             preview: None,
-            error: None,
-            cancel: Arc::new(AtomicBool::new(false)),
+            error: closed.then(|| "the studio is stopping".to_string()),
+            cancel: Arc::new(AtomicBool::new(closed)),
             incognito: scratch.is_some(),
             scratch,
             expires_at: None,
@@ -1725,6 +1803,12 @@ impl Media {
             let next = {
                 let mut jobs = self.lock();
                 loop {
+                    // (media stopped for good, as the studio stops: no job is started, and nothing this stopped comes
+                    // back, the language model it paused nor the card; asked under the queue's lock, which `close` sets
+                    // it under, so it is never missed while this waits)
+                    if self.closed() {
+                        return;
+                    }
                     if let Some(j) = jobs.iter_mut().find(|j| j.status == "queued") {
                         j.status = "in_progress".into();
                         j.stage = "starting".into();
@@ -1803,6 +1887,11 @@ impl Media {
                 self.releasing.store(true, Ordering::Relaxed);
             }
             let fault = outcome.as_ref().err().is_some_and(|e| gpu_fault(e));
+            if fault {
+                // (before the job is said to be done: from then the queue is empty to the pins' keeper, which would load
+                // a pin again on the card that faulted, the warm job run as soon as the pause below ends)
+                self.hold_pins(pins::FAULT_HELD);
+            }
             self.update(&next.id, |j| {
                 j.completed_at = Some(now());
                 if j.incognito {
@@ -1842,12 +1931,21 @@ impl Media {
                 // Starting the next job on a card whose driver is still
                 // recovering is how one fault became a system crash.
                 self.log.push(format!("GPU fault: waiting {}s before the next media job", GPU_FAULT_PAUSE.as_secs()));
-                std::thread::sleep(GPU_FAULT_PAUSE);
+                // (in steps, the studio's stopping heard: it would wait out the pause first, holding the studio)
+                let until = std::time::Instant::now() + GPU_FAULT_PAUSE;
+                while std::time::Instant::now() < until && !self.closed() {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
         }
     }
 
     fn resume_llm(&self, studio: &crate::Studio) {
+        // (not once the studio stops: its language model's server started again after it was stopped outlived OAIY, and
+        // an update could not replace its program. The server refuses a start then too: `crate::llm::Llm::close`)
+        if self.closed() {
+            return;
+        }
         studio.llm.set_paused(false);
         let cfg = studio.config();
         if !crate::llm::holds_a_model(cfg.get("llm").unwrap_or(&Json::Null)) {
@@ -2056,11 +2154,21 @@ impl Media {
             }
         });
         if let Some(why) = why {
+            // (one that crashed as it waited, found by a job rather than by the pins' keeper: counted the same,
+            // `Media::reap_ended`)
+            if why == "it had ended by itself" {
+                self.ended_by_itself.fetch_add(1, Ordering::SeqCst);
+            }
             drop(slot);
             self.end_serving(false, why);
             slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
         }
         if slot.is_none() {
+            // (none started once the studio stops: a job given to it just before, held up past the stop's wait for it,
+            // started a worker after the stop had ended the kept one, and nothing ended that)
+            if self.closed() {
+                return Err("the studio is stopping".into());
+            }
             let mut command = oaiy_host_env::command(&program);
             command.arg("--serve");
             if let Some(card) = card {
@@ -2095,8 +2203,6 @@ impl Media {
         let s = slot.as_mut().expect("a kept worker");
         // (what the worker keeps once this job has loaded its model: see `kept_beside`)
         let family = str_or(&job.request, "architecture", "qwen-image").to_string();
-        // (a model it was not keeping, which this job loads: not counted as kept if the job fails)
-        let mut loads = false;
         if !s.models.iter().any(|(f, m)| *f == family && *m == job.model) {
             if let Some((_, held)) = s.models.iter().find(|(f, m)| wanted.contains(m) && !kept_beside(f, &family)) {
                 return Err(Self::held_by_pin(held, job));
@@ -2108,7 +2214,6 @@ impl Media {
             crate::resources::event("load", &job.model, &s.device, if stay.is_empty() { "a picture, in the worker kept between pictures" } else { "a picture, in the kept worker beside the models it has" });
             s.models = stay;
             s.models.push((family.clone(), job.model.clone()));
-            loads = true;
         }
         if job.incognito {
             self.log.push(format!("incognito {} job on {place} (kept worker)", job.kind.name()));
@@ -2192,11 +2297,14 @@ impl Media {
                 if let Some(s) = taken {
                     self.end_worker(s, true, "it ended or failed");
                 }
-            } else if let Some(s) = slot.as_mut().filter(|_| mine && loads) {
-                // (the model this job was to load is not said to be kept: it may never have loaded, and a pin of it, so
-                // counted, would never be loaded again)
-                s.models.retain(|(f, m)| !(*f == family && *m == job.model));
-                crate::resources::event("unload", &job.model, &s.device, "its picture failed: not counted as kept");
+            } else if let Some(s) = slot.as_mut().filter(|_| mine) {
+                // (none is said to be kept any more: the worker lets go of every model it kept when a job fails, `oaiy-media
+                // --serve`, a failed job may have left one half made. Only this job's was forgotten here before, and only
+                // where it was loading it: the others were shown loaded when they were not, a pin of one counted as loaded
+                // and never loaded again, and a job refused for a pin the worker no longer held)
+                for (_, model) in std::mem::take(&mut s.models) {
+                    crate::resources::event("unload", &model, &s.device, "its worker let it go: a picture failed");
+                }
             }
             return Err(e.to_string());
         }
@@ -2208,6 +2316,10 @@ impl Media {
     /// The worker run for `job`; `card`: the eGPU card's socket, its WebGPU adapter (`crate::llm::egpu`), else this
     /// computer's GPU.
     fn worker(&self, studio: &crate::Studio, cfg: &Json, job: &Job, card: Option<&str>) -> Result<Json, String> {
+        // (none started once the studio stops, as `serve_job` starts none)
+        if self.closed() {
+            return Err("the studio is stopping".into());
+        }
         let media = cfg.get("media").ok_or("no media section")?;
         let program = config::program(&studio.root, str_or(media, "worker", "oaiy-media"));
         let output_root = studio.output_root();

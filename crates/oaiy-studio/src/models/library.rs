@@ -204,6 +204,17 @@ fn changed(m: &std::fs::Metadata) -> u128 {
     m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis())
 }
 
+/// The key a file's SHA-256 is kept under: its path as written, but on Windows one spelling of it, whatever its
+/// separators and case (`E:/models/x.gguf`, `E:\models\x.gguf` and `e:\Models\X.gguf` are one file there, and a
+/// configuration names files both ways, so a file read under one spelling was read again under another).
+fn key(path: &Path) -> String {
+    if cfg!(windows) {
+        path.components().collect::<PathBuf>().to_string_lossy().to_lowercase()
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 fn with_hashes<T>(studio_root: &Path, f: impl FnOnce(&mut Hashes) -> T) -> T {
     let mut guard = HASHES.lock().unwrap_or_else(|p| p.into_inner());
     let file = studio_root.join(HASHES_FILE);
@@ -223,7 +234,7 @@ fn read_hashes(file: &Path) -> HashMap<String, (u64, u128, String)> {
             let at = e.get("changed").and_then(Json::as_i64).unwrap_or(-1);
             let sha = str_or(&e, "sha256", "");
             if size >= 0 && at >= 0 && sha.len() == 64 {
-                known.insert(path, (size as u64, at as u128, sha.to_string()));
+                known.insert(key(Path::new(&path)), (size as u64, at as u128, sha.to_string()));
             }
         }
     }
@@ -252,14 +263,14 @@ impl Hashes {
 /// The SHA-256 of `path` known already (read before, the file unchanged since), without reading it.
 pub fn known(studio_root: &Path, path: &Path) -> Option<String> {
     let m = std::fs::metadata(path).ok()?;
-    with_hashes(studio_root, |h| h.known.get(&path.to_string_lossy().into_owned()).filter(|(s, at, _)| *s == m.len() && *at == changed(&m)).map(|(_, _, sha)| sha.clone()))
+    with_hashes(studio_root, |h| h.known.get(&key(path)).filter(|(s, at, _)| *s == m.len() && *at == changed(&m)).map(|(_, _, sha)| sha.clone()))
 }
 
 /// Keep `sha` as the SHA-256 of `path` (as it is now).
 pub fn remember(studio_root: &Path, path: &Path, sha: &str) {
     let Ok(m) = std::fs::metadata(path) else { return };
     with_hashes(studio_root, |h| {
-        h.known.insert(path.to_string_lossy().into_owned(), (m.len(), changed(&m), sha.to_string()));
+        h.known.insert(key(path), (m.len(), changed(&m), sha.to_string()));
         h.save();
     });
 }
@@ -442,7 +453,7 @@ mod tests {
         h.update(&encoder);
         let sha = h.hex();
         // the folder the configuration names a model's part in is looked through
-        let cfg = Json::parse(format!(r#"{{"media":{{"image":{{"models":{{"flux":{{"text_encoder":"{}"}}}}}}}}}}"#, kept.display()).as_bytes()).unwrap();
+        let cfg = Json::parse(format!(r#"{{"media":{{"image":{{"models":{{"flux":{{"text_encoder":"{}"}}}}}}}}}}"#, kept.display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
         let roots = roots(&studio, &cfg, &downloads);
         assert_eq!(roots, vec![downloads.clone(), kept.clone()]);
         let files = scan(&roots);

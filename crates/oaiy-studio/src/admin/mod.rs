@@ -247,11 +247,17 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Res
             if !changed.0 {
                 return Ok(crate::resources::snapshot(studio));
             }
+            // (a person's pin or unpin of a picture model: the pins are loaded by themselves again, after a GPU fault or
+            // a worker that kept ending, and one pinned again that was held, or had failed, is loaded at the next look.
+            // Pinned again, the settings do not change, and this is all it does)
+            if kind != "llm" {
+                studio.media.pins_asked(&model, pin);
+            }
             if !pin {
                 // (a loading it was waiting for is not wanted any more; the job id read, then the pins let go, before
                 // the queue is locked to cancel it)
                 let loading = match studio.media.pin_states().get(&model) {
-                    Some(crate::media::pins::State::Warming(job)) => Some(job.clone()),
+                    Some(crate::media::pins::State::Warming(job, _)) => Some(job.clone()),
                     _ => None,
                 };
                 if let Some(job) = loading {
