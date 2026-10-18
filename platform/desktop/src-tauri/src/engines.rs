@@ -22,7 +22,9 @@ static RUNNING: Mutex<Option<oaiy_studio::Running>> = Mutex::new(None);
 /// What runs the eGPU, as the plugin providing it says (`crate::egpu`): given to the engines started here now, and
 /// again whenever they start.
 static EGPU_RUNTIME: Mutex<Option<oaiy_studio::EgpuRuntime>> = Mutex::new(None);
-static UI_URL: OnceLock<String> = OnceLock::new();
+/// Where the engines' control pages are now: set each time they are found or started (they may come back on another port
+/// after a restart, and the Engines page and the activity an install asks about must follow them there).
+static UI_URL: Mutex<Option<String>> = Mutex::new(None);
 static BUNDLED: OnceLock<PathBuf> = OnceLock::new();
 
 /// The engines an installer carries, `<resources>/resources/engines`: the portable language-model server
@@ -155,7 +157,7 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     if let Some(url) = oaiy_studio::running_instance(&args) {
         log::info!("engines: using the ones already running at {url}");
         crate::http::set_engines_ui(&url);
-        let _ = UI_URL.set(url.clone());
+        *UI_URL.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
         return Ok(url);
     }
     if m == Mode::Attach {
@@ -168,14 +170,14 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     let url = running.ui_url.clone();
     log::info!("engines: started (control pages {url}, gateway {})", running.gateway_url);
     crate::http::set_engines_ui(&url);
-    let _ = UI_URL.set(url.clone());
+    *UI_URL.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
     *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some(running);
     Ok(url)
 }
 
 /// Where the engines' control pages are, once found or started.
 pub fn ui_url() -> Option<String> {
-    UI_URL.get().cloned()
+    UI_URL.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The engines were started by this desktop (and so stop with it), rather than found already running.
@@ -400,7 +402,10 @@ pub fn provide_egpu(runtime: Option<oaiy_studio::EgpuRuntime>) {
 
 /// Stop the engines this desktop started (a studio that was already running is left running).
 pub fn stop() {
-    if let Some(running) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    // (taken out first, and stopped without the lock held: a shutdown can take seconds, and whatever asks whether the
+    // engines were started here meanwhile must not wait for it)
+    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(running) = running {
         log::info!("engines: stopping");
         running.studio.shutdown();
     }

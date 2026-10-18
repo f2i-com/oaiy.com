@@ -12,6 +12,8 @@ import {
 } from './api';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
+import { accessName, pairingFrom, pairingGrants } from './pairingWords';
+import { agoWords } from './BackupPanel';
 import { useVisiblePoll } from './useVisiblePoll';
 
 /**
@@ -329,8 +331,7 @@ export default function ConnectionsPanel() {
               </div>
               <p className="card-desc card-address">
                 <b>{req.product}</b>
-                {req.origin ? ` · ${req.origin}` : ''} — it will be able to run flows and call
-                plugins through OAIY Desktop.
+                {pairingFrom(req.origin)} {pairingGrants(req.access)}
               </p>
               <p className="card-desc pairing-code">
                 Only approve if this code matches what the app is showing: <code>{req.code}</code>
@@ -365,8 +366,9 @@ export default function ConnectionsPanel() {
           <h3 className="section-title">Connected apps</h3>
         </div>
         <p className="form-hint">
-          <TriangleAlert size={12} aria-hidden /> A connected app can run flows and call plugins on this machine. Revoking takes effect
-          immediately.
+          <TriangleAlert size={12} aria-hidden /> A connected app can run flows (which can run programs) and use your plugins and AI
+          models; an Agent can also reach your calls, texts, calendar, contacts and OAIY’s settings. A connection works only from
+          the site that made it, and is forgotten after 90 days unused. Revoking takes effect immediately.
         </p>
         {!loaded ? (
           <p className="form-hint">{error ? 'The connected apps could not be read.' : 'Reading the connected apps…'}</p>
@@ -381,7 +383,10 @@ export default function ConnectionsPanel() {
               <li key={app.id}>
                 <span className="pairing-app">
                   <ShieldCheck size={14} aria-hidden /> <strong>{app.label ?? app.product}</strong>
-                  <span className="pairing-product">{app.product}</span>
+                  <span className="pairing-product">
+                    {accessName(app.access)} · {app.product}
+                    {app.lastUsedMs ? ` · last used ${agoWords(new Date(app.lastUsedMs).toISOString())}` : ''}
+                  </span>
                   {/* The name and product are whatever the consumer called
                       itself; the origin is the only part that says which site
                       this actually is — which is what a revoke decision needs.

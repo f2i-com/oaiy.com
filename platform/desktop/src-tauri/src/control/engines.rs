@@ -240,7 +240,8 @@ pub(crate) async fn logs_at(ui: Option<String>, source: &str, lines: usize) -> R
     let all: Vec<Value> = v
         .get("lines")
         .and_then(Value::as_array)
-        .map(|l| l.iter().filter_map(|x| x.get("line").and_then(Value::as_str).or_else(|| x.as_str())).map(|s| Value::String(s.to_string())).collect())
+        // (scrubbed like every log route's lines: what the engines' children printed can carry a key)
+        .map(|l| l.iter().filter_map(|x| x.get("line").and_then(Value::as_str).or_else(|| x.as_str())).map(|s| Value::String(crate::auth::scrub::scrub_line(s))).collect())
         .unwrap_or_default();
     let tail = all[all.len().saturating_sub(lines)..].to_vec();
     Ok(json!({ "source": source, "lines": tail }))

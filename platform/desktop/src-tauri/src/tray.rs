@@ -40,6 +40,35 @@ pub fn show_main_for_a_ring(app: &tauri::AppHandle) {
     }
 }
 
+/// Tray > Quit: the Agent page saves its work first (its word waited for up to five seconds, as before an update), then OAIY
+/// stops. Off the main thread: the page is asked through the event loop, which this menu event is running on.
+///
+/// Not while the data folder is being copied or moved (Settings shows how far it got): the folder OAIY starts in next is the
+/// new one already, so quitting now would leave the rest behind in the old one, with nothing to say so.
+fn quit(app: &tauri::AppHandle) {
+    let moving = app
+        .try_state::<crate::migrate::MigrationHandle>()
+        .is_some_and(|m| m.lock().map(|g| g.running).unwrap_or(false));
+    if moving {
+        use tauri_plugin_notification::NotificationExt;
+        let _ = app
+            .notification()
+            .builder()
+            .title("OAIY is still moving your data folder")
+            .body("Quit once it has finished (Settings shows how far it got): quitting now would leave part of it in the old folder.")
+            .show();
+        show_main(app);
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if let Some(updater) = app.try_state::<crate::update::UpdaterHandle>().map(|u| u.inner().clone()) {
+            crate::update::gui::flush_agent(&app, &updater);
+        }
+        app.exit(0);
+    });
+}
+
 /// "Check for updates": show OAIY on its Settings page, where the answer is, and look. (The check is limited to one
 /// in 30 seconds, like every other way of asking; a refusal only means the page already shows the last answer.)
 fn check_for_updates(app: &tauri::AppHandle) {
@@ -80,9 +109,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
                 show_main(app);
             }
             "update-check" => check_for_updates(app),
-            "quit" => {
-                app.exit(0);
-            }
+            "quit" => quit(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

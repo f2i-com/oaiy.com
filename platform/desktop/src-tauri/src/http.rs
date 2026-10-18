@@ -177,8 +177,11 @@ async fn health(extras: Option<axum::Extension<crate::auth::HealthExtras>>) -> J
 
 // ------- services -------
 
-async fn list_services(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_services(State(state): State<AppState>, public: Option<axum::Extension<PublicView>>) -> impl IntoResponse {
     match state.registry.lock() {
+        // (a web page that is not OAIY's: what the services are and whether they run, without this machine's paths, process ids
+        // or what a service printed; and no scan of the templates folder on its behalf)
+        Ok(reg) if public.is_some() => (StatusCode::OK, Json(reg.public_snapshot())).into_response(),
         Ok(mut reg) => {
             // Pick up any package dropped into templates/ since last poll, so
             // services are dynamically loadable just by adding a file there.
@@ -1379,6 +1382,15 @@ struct AuthConfig {
 }
 
 impl AuthConfig {
+    /// Is `presented` the owner's: the configured token, or this process's own internal one?
+    fn owner_token(&self, presented: &str) -> bool {
+        if presented.is_empty() {
+            return false;
+        }
+        let internal = crate::internal_token();
+        self.token.as_deref().is_some_and(|want| token_eq(want, presented)) || (!internal.is_empty() && token_eq(internal, presented))
+    }
+
     /// Does `presented` match the configured token, this process's own internal
     /// token, OR a live paired token?
     fn token_matches(&self, presented: &str) -> bool {
@@ -1525,6 +1537,142 @@ async fn origin_guard(
     next.run(req).await
 }
 
+/// Marks a `GET /api/services` that a web page asked without a token: [`list_services`] answers the view without the
+/// machine's paths, process ids and service errors (see [`tighten`]).
+#[derive(Clone, Copy)]
+pub(crate) struct PublicView;
+
+/// GET reads that name absolute paths (the data folder, every model file's, the Python runtime's and its environments')
+/// or a download's address, which no web page reads: the dashboard (OAIY's own origin), the CLI (a program, which sends
+/// no `Origin`) and a token holder do. A page the owner happens to have open, on any website, must not.
+fn is_page_gated_read_path(path: &str) -> bool {
+    matches!(path, "/api/models" | "/api/models/downloads" | "/api/models/catalog" | "/api/python")
+}
+
+/// Whether a request was sent by a web page: it says its `Origin`, or the browser says where the fetch came from
+/// (`Sec-Fetch-Site`, which a same-origin GET carries without an `Origin`: a page on a name rebound to this computer).
+/// `Sec-Fetch-Site: none` is the person opening the address themselves.
+fn from_a_page(req: &Request) -> bool {
+    req.headers().contains_key(ORIGIN)
+        || req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v != "none")
+}
+
+/// An origin that only looks like one of OAIY's own: the embedded pages' and the dashboard's origins of the OTHER
+/// system (on a Mac `http://oaiy.localhost`, which is whatever web server holds port 80 of this computer, not OAIY's
+/// window: [`embedded_window_origins`]), or a subdomain of oaiy.com that OAIY does not serve its pages from (one site's
+/// mistake must not be every desktop's).
+fn is_impostor_origin(origin: &str) -> bool {
+    let own: &[&str] = if cfg!(windows) {
+        &["http://oaiy.localhost", "http://oaiyflows.localhost", "http://tauri.localhost"]
+    } else {
+        &["oaiy://localhost", "oaiyflows://localhost", "tauri://localhost"]
+    };
+    let lookalike = ["oaiy", "oaiyflows", "tauri"].iter().any(|s| {
+        origin == format!("{s}://localhost") || origin == format!("http://{s}.localhost") || origin == format!("https://{s}.localhost")
+    });
+    if lookalike && !own.contains(&origin) {
+        return true;
+    }
+    if let Some(rest) = origin.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or(rest);
+        let host = host.split(':').next().unwrap_or(host);
+        return host.ends_with(".oaiy.com") && host != "www.oaiy.com";
+    }
+    false
+}
+
+/// Whether a paired app's token reaches this request: the route's row in the access table (`auth/routes.rs`) is open, or
+/// names a scope the grant holds ([`crate::bridge::pairing::PairingAccess::reaches`]). A route with no row, or one for a
+/// login, the console or the desk, is no paired app's.
+pub(super) fn paired_reaches(access: crate::bridge::pairing::PairingAccess, req: &Request) -> bool {
+    use crate::auth::routes::{lookup, Class, Verb};
+    let Some(matched) = req.extensions().get::<axum::extract::MatchedPath>() else {
+        return false;
+    };
+    let Some(verb) = Verb::of_method(req.method()) else {
+        return false;
+    };
+    match lookup(verb, matched.as_str()).map(|r| r.class) {
+        Some(Class::Public) => true,
+        Some(Class::Scope(scope)) => access.reaches(scope),
+        _ => false,
+    }
+}
+
+/// What the old guard was tightened by after the third review (October 2026). In front of it rather than inside it, so
+/// [`origin_guard`] stays the guard the differential test (`legacy_neutrality`) holds to its frozen copy; the test puts
+/// this same step in front of both. It only ever refuses, takes a paired token off a request, or marks a request for a
+/// smaller answer: it never lets through what the old guard would refuse.
+///
+/// - An impostor origin ([`is_impostor_origin`]) is refused everything but discovery and pairing.
+/// - A paired token reaches only what its grant does, from the page it was granted to ([`paired_reaches`],
+///   [`crate::bridge::pairing::PairingManager::grant_for`]); anywhere else it is taken off the request, which the old
+///   guard then judges as one without a token (OAIY's own pages still pass by their origin).
+/// - On the desktop, without a token: the page-gated reads ([`is_page_gated_read_path`]) refuse a page whose origin is
+///   not one the old guard trusts, `GET /api/bridge/flows/:id` (a flow may hold a key in a node) is a restricted read
+///   like the flows' list, `DELETE /api/bridge/pairing` takes the privileged gate like the other pairing changes, and a
+///   web page's `GET /api/services` is marked for the [`PublicView`].
+fn tighten(auth: &AuthConfig, mut req: Request) -> Result<Request, axum::response::Response> {
+    let refuse = || (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "origin not allowed" }))).into_response();
+    let m = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let origin = req.headers().get(ORIGIN).and_then(|o| o.to_str().ok()).map(str::to_owned);
+    let read = m == Method::GET || m == Method::HEAD;
+    let discovery = m == Method::OPTIONS
+        || (m == Method::POST && path == "/api/bridge/pairing")
+        || (read
+            && (path == "/api/health"
+                || path == "/api/bridge/capabilities"
+                || path.strip_prefix("/api/bridge/pairing/").is_some_and(|id| !id.is_empty() && !id.contains('/'))));
+    if !discovery && origin.as_deref().is_some_and(is_impostor_origin) {
+        return Err(refuse());
+    }
+
+    let bearer = bearer_token(&req).filter(|b| !b.is_empty());
+    let owner = bearer.as_deref().is_some_and(|b| auth.owner_token(b));
+    let mut paired = false;
+    if let (false, Some(b), Some(p)) = (owner, bearer.as_deref(), &auth.pairing) {
+        let grant = p.lock().map(|mut mgr| mgr.grant_for(b, origin.as_deref())).unwrap_or(crate::bridge::pairing::Grant::Unknown);
+        match grant {
+            crate::bridge::pairing::Grant::Unknown => {}
+            crate::bridge::pairing::Grant::Paired(access) if paired_reaches(access, &req) => paired = true,
+            _ => {
+                req.headers_mut().remove(AUTHORIZATION);
+            }
+        }
+    }
+    if !auth.gui_mode || owner || paired {
+        return Ok(req);
+    }
+    let trusted = origin.as_deref().is_some_and(is_allowed_origin);
+    if read && is_page_gated_read_path(&path) && from_a_page(&req) && !trusted {
+        return Err(refuse());
+    }
+    if read && path.starts_with("/api/bridge/flows/") && !trusted {
+        return Err(refuse());
+    }
+    if m == Method::DELETE && path == "/api/bridge/pairing" && !origin.as_deref().is_some_and(is_allowed_origin_privileged) {
+        return Err(refuse());
+    }
+    if read && path == "/api/services" && from_a_page(&req) && !trusted {
+        req.extensions_mut().insert(PublicView);
+    }
+    Ok(req)
+}
+
+/// [`tighten`] as a layer of its own, for the differential test: the same step in front of the frozen guard.
+#[cfg(test)]
+pub(super) async fn tightened(State(auth): State<AuthConfig>, req: Request, next: Next) -> axum::response::Response {
+    match tighten(&auth, req) {
+        Ok(req) => next.run(req).await,
+        Err(refused) => refused,
+    }
+}
+
 /// What the access guard decides with: the old guard's settings (what `legacy` mode judges by) and the
 /// new guard.
 #[derive(Clone)]
@@ -1552,7 +1700,10 @@ async fn access_guard(
         s.guard.handle(req, next).await
     } else {
         req.extensions_mut().insert(crate::auth::principal::Principal::legacy_owner());
-        origin_guard(State(s.legacy), req, next).await
+        match tighten(&s.legacy, req) {
+            Ok(req) => origin_guard(State(s.legacy), req, next).await,
+            Err(refused) => refused,
+        }
     }
 }
 
@@ -1986,7 +2137,9 @@ pub(crate) fn cors_layer() -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers(Any)
+        // The headers the preflight asks for, named back: a wildcard does not cover `Authorization` (the Fetch standard), so a
+        // paired page's bearer would fail its preflight in a browser that keeps to it.
+        .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
         // The dashboard (another origin) reads /api/modules' ETag to ask again with If-None-Match.
         .expose_headers([axum::http::header::ETAG])
 }
@@ -2982,3 +3135,162 @@ mod tests {
         assert!(privileged_allowed(false, true, false, true), "GUI no-token: webview origin passes");
     }
 }
+
+/// The step the old guard was tightened by after the third review ([`tighten`]), through the listener's own guard.
+#[cfg(test)]
+mod tightened_tests {
+    use super::{access_guard, AccessState, AuthConfig, PublicView};
+    use crate::bridge::pairing::{PairingAccess, PairingManager};
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::{get, post, put};
+    use axum::{middleware, Extension, Router};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    async fn ok() -> &'static str {
+        "ok"
+    }
+
+    fn router(pairing: crate::bridge::PairingHandle) -> Router {
+        let unused = std::env::temp_dir().join("oaiy-tightened-nothing-is-made-here");
+        let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, true, None, &|_| None)
+            .expect("a legacy guard");
+        let state = AccessState { legacy: AuthConfig { token: None, gui_mode: true, pairing: Some(pairing) }, guard };
+        Router::new()
+            .route("/api/health", get(ok))
+            .route("/api/models", get(ok))
+            .route("/api/python", get(ok))
+            .route(
+                "/api/services",
+                get(|public: Option<Extension<PublicView>>| async move { if public.is_some() { "public" } else { "full" } }),
+            )
+            .route("/api/bridge/flows/:id", get(ok))
+            .route("/api/bridge/connectors/:id/request", post(ok))
+            .route("/api/bridge/pairing", get(ok).post(ok).delete(ok))
+            .route("/api/network/settings", put(ok))
+            .route("/api/voice/calls", get(ok))
+            .route("/api/mcp", post(ok))
+            .layer(middleware::from_fn_with_state(state, access_guard))
+    }
+
+    async fn ask(app: &Router, method: &str, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
+        let mut req = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status().as_u16();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn pairing() -> crate::bridge::PairingHandle {
+        Arc::new(Mutex::new(PairingManager::new()))
+    }
+
+    fn grant(p: &crate::bridge::PairingHandle, origin: Option<&str>, access: PairingAccess) -> String {
+        let mut m = p.lock().unwrap();
+        let id = m.request_for("app", None, origin.map(str::to_owned), access).unwrap().pairing_id;
+        m.approve(&id).unwrap().token.unwrap()
+    }
+
+    const OWN: &str = if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" };
+
+    #[tokio::test]
+    async fn the_reads_with_paths_in_them_are_not_for_a_web_page() {
+        let app = router(pairing());
+        for path in ["/api/models", "/api/python"] {
+            assert_eq!(ask(&app, "GET", path, &[("origin", "https://evil.example")]).await.0, 403, "{path}: another site");
+            // A page on a name rebound to this computer sends no Origin on a same-origin GET, but its browser says where it is.
+            assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "same-origin")]).await.0, 403, "{path}: a rebound name");
+            assert_eq!(ask(&app, "GET", path, &[("origin", OWN)]).await.0, 200, "{path}: the dashboard");
+            assert_eq!(ask(&app, "GET", path, &[]).await.0, 200, "{path}: the CLI, which sends neither");
+            assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "none")]).await.0, 200, "{path}: the person opening it");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_web_page_sees_the_services_without_this_machines_details() {
+        let app = router(pairing());
+        assert_eq!(ask(&app, "GET", "/api/services", &[("origin", "https://evil.example")]).await, (200, "public".into()));
+        assert_eq!(ask(&app, "GET", "/api/services", &[("sec-fetch-site", "cross-site")]).await, (200, "public".into()));
+        for headers in [&[("origin", OWN)][..], &[("origin", "https://oaiy.com")], &[]] {
+            assert_eq!(ask(&app, "GET", "/api/services", headers).await, (200, "full".into()), "{headers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_flow_is_read_as_the_flows_are() {
+        let app = router(pairing());
+        assert_eq!(ask(&app, "GET", "/api/bridge/flows/x", &[("origin", "https://evil.example")]).await.0, 403);
+        assert_eq!(ask(&app, "GET", "/api/bridge/flows/x", &[]).await.0, 403, "as the flows' list: an origin or a token");
+        assert_eq!(ask(&app, "GET", "/api/bridge/flows/x", &[("origin", OWN)]).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn an_origin_that_only_looks_like_oaiys_gets_nothing_but_discovery() {
+        let app = router(pairing());
+        let impostors: &[&str] = if cfg!(windows) {
+            &["https://oaiy.localhost", "https://tauri.localhost", "https://x.oaiy.com"]
+        } else {
+            &["http://oaiy.localhost", "http://oaiyflows.localhost", "http://tauri.localhost", "https://tauri.localhost", "https://x.oaiy.com"]
+        };
+        for origin in impostors {
+            assert_eq!(ask(&app, "GET", "/api/services", &[("origin", origin)]).await.0, 403, "{origin}");
+            assert_eq!(ask(&app, "GET", "/api/health", &[("origin", origin)]).await.0, 200, "{origin}: discovery stays open");
+            assert_eq!(ask(&app, "POST", "/api/bridge/pairing", &[("origin", origin)]).await.0, 200, "{origin}: so does asking to pair");
+        }
+        for origin in ["https://oaiy.com", "https://www.oaiy.com", OWN] {
+            assert_eq!(ask(&app, "GET", "/api/services", &[("origin", origin)]).await, (200, "full".into()), "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paired_apps_token_reaches_what_it_was_granted_from_where_it_was_granted() {
+        let p = pairing();
+        let token = grant(&p, Some("https://formlogic.com"), PairingAccess::Apps);
+        let bearer = format!("Bearer {token}");
+        let app = router(p);
+        let from = |origin| [("authorization", bearer.as_str()), ("origin", origin)];
+        assert_eq!(ask(&app, "POST", "/api/bridge/connectors/x/request", &from("https://formlogic.com")).await.0, 200);
+        assert_eq!(ask(&app, "POST", "/api/bridge/connectors/x/request", &[("authorization", bearer.as_str())]).await.0, 200, "from no page");
+        assert_eq!(ask(&app, "POST", "/api/bridge/connectors/x/request", &from("https://evil.example")).await.0, 403, "another page");
+        // What an app's grant does not reach: the Agent's, and OAIY Network's trust, whatever the app says.
+        for (method, path) in [("GET", "/api/voice/calls"), ("POST", "/api/mcp"), ("PUT", "/api/network/settings"), ("GET", "/api/bridge/pairing")] {
+            assert_eq!(ask(&app, method, path, &from("https://formlogic.com")).await.0, 403, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_agents_grant_reaches_the_agents_routes_but_never_pairing_or_the_network() {
+        let p = pairing();
+        let token = grant(&p, Some("https://agent.example"), PairingAccess::Agent);
+        let bearer = format!("Bearer {token}");
+        let app = router(p);
+        let from = [("authorization", bearer.as_str()), ("origin", "https://agent.example")];
+        assert_eq!(ask(&app, "GET", "/api/voice/calls", &from).await.0, 200);
+        assert_eq!(ask(&app, "POST", "/api/mcp", &from).await.0, 200);
+        assert_eq!(ask(&app, "PUT", "/api/network/settings", &from).await.0, 403);
+        assert_eq!(ask(&app, "GET", "/api/bridge/pairing", &from).await.0, 403);
+        assert_eq!(ask(&app, "DELETE", "/api/bridge/pairing", &from).await.0, 403);
+    }
+
+    #[tokio::test]
+    async fn the_dashboards_own_origin_still_passes_with_a_token_it_does_not_reach() {
+        // A paired token taken off a request leaves the request as one without it: OAIY's own page passes by its origin.
+        let p = pairing();
+        let token = grant(&p, None, PairingAccess::Apps);
+        let app = router(p);
+        let bearer = format!("Bearer {token}");
+        assert_eq!(ask(&app, "PUT", "/api/network/settings", &[("authorization", bearer.as_str()), ("origin", OWN)]).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn clearing_the_pairing_requests_takes_the_privileged_gate() {
+        let app = router(pairing());
+        assert_eq!(ask(&app, "DELETE", "/api/bridge/pairing", &[]).await.0, 403, "not a program without a token");
+        assert_eq!(ask(&app, "DELETE", "/api/bridge/pairing", &[("origin", OWN)]).await.0, 200);
+    }
+}
+

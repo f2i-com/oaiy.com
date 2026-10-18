@@ -108,7 +108,8 @@ export async function startPairing(origin: string, label: string): Promise<{ pai
   const body = await reply(await fetch(`${origin}/api/bridge/pairing`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ product: 'oaiy-app', label }),
+    // An Agent's access (its phone, calendar, contacts and settings tools), not an app's: the desktop asks the person for it.
+    body: JSON.stringify({ product: 'oaiy-app', label, access: 'agent' }),
   }));
   if (!isRecord(body) || typeof body.pairingId !== 'string' || typeof body.code !== 'string') throw new DesktopError('OAIY Desktop did not start pairing');
   return { pairingId: body.pairingId, code: body.code };

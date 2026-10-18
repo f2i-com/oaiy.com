@@ -335,7 +335,10 @@ Loopback ≠ trusted. Any local process — including a web page's JavaScript vi
 - **Reads** (`/api/health`, `/api/bridge/capabilities`) are open. They disclose
   nothing an attacker cannot infer by port-scanning.
 - **Everything else** needs either a bearer token minted by OAIY Desktop and
-  handed to a paired client, or an origin on the trust list.
+  handed to a paired client, or an origin on the trust list. A paired token
+  works from the origin it was granted to alone, and reaches what its pairing
+  asked for (`access`: `apps`, the routes above; `agent`, the OAIY Agent's).
+  Approving, denying and revoking pairings are never a paired client's.
 - Capability grants are checked per call against the **exact** capability id, and
   fail closed. A caller granted `connector.aokie.call.answer` cannot invoke
   `connector.aokie.call.dial`. Wildcards are expanded at grant time, never

@@ -42,11 +42,14 @@ impl LogBuffer {
         Self(Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))))
     }
 
+    /// Keep a line, scrubbed of anything shaped like a credential (`auth::scrub`): every reader of a log (the log routes,
+    /// the Agent's `logs_tail`, a service's last crash in the services' list) gets the line as kept, so it is scrubbed once,
+    /// here, where it arrives.
     pub fn push(&self, stream: &'static str, text: String) {
         let line = LogLine {
             timestamp: Utc::now(),
             stream,
-            text,
+            text: crate::auth::scrub::scrub_line(&text),
         };
         if let Ok(mut buf) = self.0.lock() {
             if buf.len() >= MAX_LOG_LINES {
@@ -354,6 +357,18 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn a_line_is_kept_scrubbed_of_what_looks_like_a_credential() {
+        let logs = LogBuffer::new();
+        logs.push("stderr", "calling with Authorization: Bearer oaiypat_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
+        logs.push("stdout", "HF_TOKEN=hf_abcdefghijklmnopqrstuvwxyz123456 loaded".into());
+        logs.push("stdout", "listening on 127.0.0.1:8080".into());
+        let kept: Vec<String> = logs.snapshot(None).into_iter().map(|l| l.text).collect();
+        assert!(!kept[0].contains("oaiypat_0123") && kept[0].contains("[redacted]"), "{kept:?}");
+        assert!(!kept[1].contains("hf_abcdef"), "{kept:?}");
+        assert_eq!(kept[2], "listening on 127.0.0.1:8080", "an ordinary line is kept as it was");
+    }
+
     /// A child's output that is not UTF-8 (a Windows tool's code page, a progress bar's bytes) is read on, not the
     /// end of reading: stopped, the pipe filled and the child hung. A line past the cap is cut.
     #[test]
@@ -486,13 +501,28 @@ mod tests {
         let mut explicit = HashMap::new();
         explicit.insert("OAIY_SCRUB_TEST_OVERLAP_TOKEN".to_string(), "the-steps-own".to_string());
 
-        let printed = printed_by_a_spawned_child(&explicit);
+        // (the child says the value in a sentence, not as `NAME=value`: a log keeps the value of a token-named pair redacted)
+        let (command, args) = if cfg!(windows) {
+            ("cmd.exe".to_string(), vec!["/C".to_string(), format!("echo overlap is %OAIY_SCRUB_TEST_OVERLAP_TOKEN% & echo {}", env_probe::END)])
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), format!("echo \"overlap is $OAIY_SCRUB_TEST_OVERLAP_TOKEN\"; echo {}", env_probe::END)])
+        };
+        let runner = Runner::spawn(SpawnConfig { command: &command, args: &args, env: &explicit, cwd: None }).expect("spawn the child");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let printed = loop {
+            let lines = runner.logs.snapshot(None);
+            if is_complete(&lines) {
+                break lines;
+            }
+            assert!(Instant::now() < deadline, "the child never finished");
+            std::thread::sleep(Duration::from_millis(50));
+        };
 
         // Both values are made up for the test; neither is anyone's credential.
         let value = printed
             .iter()
             .filter(|l| l.stream == "stdout")
-            .find_map(|l| l.text.trim().strip_prefix("OAIY_SCRUB_TEST_OVERLAP_TOKEN="))
+            .find_map(|l| l.text.trim().strip_prefix("overlap is "))
             .map(str::to_owned);
         assert_eq!(value.as_deref(), Some("the-steps-own"), "the child should hold the step's own value, and only that");
     }

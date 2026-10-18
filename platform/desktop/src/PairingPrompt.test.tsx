@@ -58,6 +58,21 @@ describe('PairingPrompt', () => {
     expect(push).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Approved New workspace' }));
   });
 
+  it('says what is granted: an app may run flows, which can run programs; an Agent reaches the phone and settings too', async () => {
+    pending.mockResolvedValue({ pending: [request] });
+    await mount();
+    let prompt = container.querySelector('[role="alert"]')!;
+    expect(prompt.textContent).toContain('https://new.example');
+    expect(prompt.textContent).toContain('A flow can run programs on this computer');
+    expect(prompt.textContent).not.toContain('OAIY Agent');
+    pending.mockResolvedValue({ pending: [{ ...request, access: 'agent', origin: undefined }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    prompt = container.querySelector('[role="alert"]')!;
+    expect(prompt.textContent).toContain('a program on this computer');
+    expect(prompt.textContent).toContain('wants to be your OAIY Agent');
+    expect(prompt.textContent).toContain('calendar and contacts');
+  });
+
   it('denies a request when asked', async () => {
     pending.mockResolvedValue({ pending: [request] });
     await mount();

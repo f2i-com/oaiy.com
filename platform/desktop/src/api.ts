@@ -634,12 +634,17 @@ export const modules = {
 
 // ----- pairing (a consumer earning a bearer token) -----
 
+/** What a paired app may reach: an app's (flows, plugins, AI models) or an Agent's (those, the phone, calendar, contacts and settings). */
+export type PairingAccess = 'apps' | 'agent';
+
 export interface PendingPairing {
   pairingId: string;
   product: string;
   label?: string;
   origin?: string;
   code: string;
+  /** What it asks for (an older desktop does not say: an app's). */
+  access?: PairingAccess;
   status: 'pending' | 'approved' | 'denied' | 'expired';
   createdAtMs: number;
 }
@@ -698,7 +703,10 @@ export interface PairedApp {
    *  both supplied by the consumer and neither is unique, so this is the only
    *  field that says WHICH site holds the grant. Absent for a native caller. */
   origin?: string | null;
+  access?: PairingAccess;
   createdAtMs: number;
+  /** When it was last used (the desktop notes it at most once a day); none: not since it was approved. */
+  lastUsedMs?: number | null;
 }
 
 export const pairing = {

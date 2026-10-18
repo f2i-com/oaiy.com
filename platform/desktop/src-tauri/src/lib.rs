@@ -333,7 +333,10 @@ fn open_path(webview: tauri::Webview, path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let arg = if p.is_file() {
+        // (a folder that is a bundle, an app above all, is shown in Finder too: `open` on it would launch it)
+        const BUNDLES: [&str; 8] = ["app", "bundle", "framework", "plugin", "appex", "xpc", "pkg", "mpkg"];
+        let bundle = p.extension().and_then(|e| e.to_str()).is_some_and(|e| BUNDLES.iter().any(|b| b.eq_ignore_ascii_case(e)));
+        let arg = if p.is_file() || bundle {
             vec!["-R".to_string(), path.clone()]
         } else {
             vec![path.clone()]
@@ -454,12 +457,39 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
 /// holds several keys now (`dataDir`, `modelsDir`), so every read/write goes
 /// through this to avoid one key clobbering another.
 fn read_config_obj(app: &tauri::AppHandle) -> serde_json::Map<String, serde_json::Value> {
-    config_pointer_path(app)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| s.strip_prefix('\u{feff}').unwrap_or(&s).to_string())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
+    match config_pointer_path(app).map(|p| crate::secret_file::read_text(&p)) {
+        Some(crate::secret_file::Text::Text(s)) => config_obj_of(&s).unwrap_or_default(),
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// The pointer file's object, from its text (`None` when it is not a JSON object).
+fn config_obj_of(text: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    serde_json::from_str::<serde_json::Value>(text).ok().and_then(|v| v.as_object().cloned())
+}
+
+/// The pointer object a change is made to. A file that cannot be read now (another program holds it, its permissions
+/// say no) may be perfectly good: nothing is written over it. One that was read but is not a JSON object (a typo, a
+/// file an editor saved in another encoding) is put aside as `desktop-config.json.corrupt` first, so the keys in it
+/// (`dataDir`, `serverPort`, `accessMode`) are kept somewhere rather than replaced by the one key being changed.
+pub(crate) fn config_obj_for_change(p: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    use crate::secret_file::Text;
+    let bad = match crate::secret_file::read_text(p) {
+        Text::Missing => return Ok(serde_json::Map::new()),
+        Text::Text(s) => match config_obj_of(&s) {
+            Some(obj) => return Ok(obj),
+            None => "it is not a JSON object".to_string(),
+        },
+        Text::Undecodable(why) => why,
+        Text::Unreadable(e) => return Err(format!("{} could not be read ({e}): nothing was changed", p.display())),
+    };
+    match crate::secret_file::keep_aside(p) {
+        Ok(aside) => {
+            log::warn!("{} could not be used ({bad}): kept as {} and started again", p.display(), aside.display());
+            Ok(serde_json::Map::new())
+        }
+        Err(e) => Err(format!("{} could not be used ({bad}) or put aside ({e}): nothing was changed", p.display())),
+    }
 }
 
 /// Read one non-empty string key from the pointer object, if present.
@@ -479,7 +509,7 @@ fn write_config_str(app: &tauri::AppHandle, key: &str, val: Option<&str>) -> Res
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir: {e}"))?;
     }
-    let mut obj = read_config_obj(app);
+    let mut obj = config_obj_for_change(&p)?;
     match val {
         Some(v) if !v.trim().is_empty() => {
             obj.insert(key.to_string(), serde_json::Value::String(v.to_string()));
@@ -495,6 +525,27 @@ fn write_config_str(app: &tauri::AppHandle, key: &str, val: Option<&str>) -> Res
     let body = serde_json::Value::Object(obj);
     let pretty = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string());
     atomic_write(&p, &pretty)
+}
+
+/// This install's device id, kept in the pointer file (`deviceId`, beside the data folder's own path, so a backup restored
+/// on another computer does not bring it along). Made once: an install already in use keeps the id it has always had
+/// ([`crate::stable_device_id`], from its data folder's path); a new one gets a random id, since two computers with the
+/// same user name and the default folder would otherwise get the same one.
+fn kept_device_id(app: &tauri::AppHandle, data_dir: &Path) -> String {
+    let valid = |id: &str| id.strip_prefix("dev_").is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+    if let Some(id) = read_config_str(app, "deviceId").filter(|id| valid(id)) {
+        return id;
+    }
+    let in_use = data_dir.join("bridge").join("ledger.jsonl").exists();
+    let id = if in_use {
+        crate::stable_device_id(data_dir)
+    } else {
+        format!("dev_{}", &uuid::Uuid::new_v4().simple().to_string()[..16])
+    };
+    if let Err(e) = write_config_str(app, "deviceId", Some(&id)) {
+        log::warn!("the device id could not be kept ({e}): it is made again next time");
+    }
+    id
 }
 
 /// The user's chosen data dir from the pointer file, if any (else OS default).
@@ -572,7 +623,7 @@ fn write_extra_model_dirs(app: &tauri::AppHandle, dirs: &[String]) -> Result<(),
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir: {e}"))?;
     }
-    let mut obj = read_config_obj(app);
+    let mut obj = config_obj_for_change(&p)?;
     if dirs.is_empty() {
         obj.remove("extraModelDirs");
     } else {
@@ -1022,12 +1073,14 @@ async fn report_fatal_server_error(app: &tauri::AppHandle, detail: &str) {
     }
     use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
-    let ours = port_holder_is_oaiy().await;
+    // (the port this desktop tried: its `serverPort` when one is set, not always the default)
+    let port = crate::api_port();
+    let ours = port_holder_is_oaiy(port).await;
     let (title, body) = if ours {
         (
             "OAIY is already running",
             format!(
-                "Another copy of OAIY Desktop already has port {DESKTOP_PORT}.\n\n\
+                "Another copy of OAIY Desktop already has port {port}.\n\n\
                  Only one can run at a time — they share the same data folder, and \
                  two plugin hosts would fight over the same hardware. Use the copy \
                  that is already open (check the system tray).",
@@ -1037,7 +1090,7 @@ async fn report_fatal_server_error(app: &tauri::AppHandle, detail: &str) {
         (
             "OAIY could not start its local API",
             format!(
-                "Port {DESKTOP_PORT} is being used by another program, so OAIY \
+                "Port {port} is being used by another program, so OAIY \
                  cannot serve its local API and nothing in this window will work.\n\n\
                  Close whatever is using that port and start OAIY again.\n\n{detail}"
             ),
@@ -1060,14 +1113,14 @@ async fn report_fatal_server_error(app: &tauri::AppHandle, detail: &str) {
 ///
 /// Asks the same `/api/health` handshake every client uses — a fixed loopback
 /// port is trivially squatted, so identity is asserted rather than assumed.
-async fn port_holder_is_oaiy() -> bool {
+async fn port_holder_is_oaiy(port: u16) -> bool {
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
     else {
         return false;
     };
-    let url = format!("http://127.0.0.1:{DESKTOP_PORT}/api/health");
+    let url = format!("http://127.0.0.1:{port}/api/health");
     let Ok(resp) = client.get(&url).send().await else {
         return false;
     };
@@ -1160,6 +1213,12 @@ async fn restart_app(webview: tauri::Webview, app: tauri::AppHandle, migration: 
     if !reasons.is_empty() {
         let said: Vec<String> = reasons.iter().map(|b| b.message.clone()).collect();
         return Err(format!("Restarting has to wait. {} Try again when it is finished.", said.join(" ")));
+    }
+    // The Agent page saves its work first, as it does before an update or a restore's restart (a blocking wait of up to five
+    // seconds for its word: not on the async runtime's thread).
+    if let Some(updater) = app.try_state::<crate::update::UpdaterHandle>().map(|u| u.inner().clone()) {
+        let saving = app.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::update::gui::flush_agent(&saving, &updater)).await;
     }
     relaunch(app);
     Ok(())
@@ -1614,9 +1673,9 @@ pub fn run() {
             let data_dir_for_bridge = data_dir.clone();
             let app_for_http = app.handle().clone();
             // A stable per-install id, so run history on a consumer can tell two
-            // machines apart. Derived from the data dir rather than minted fresh
-            // each launch, which would make every restart look like a new device.
-            let device_id_for_http = crate::stable_device_id(&data_dir);
+            // machines apart: kept once made, rather than minted fresh each launch,
+            // which would make every restart look like a new device.
+            let device_id_for_http = kept_device_id(&app_for_http, &data_dir);
             let config_provider: Arc<dyn http::ConfigProvider> =
                 Arc::new(TauriConfigProvider { app: app_handle });
             let app_for_dialog = app.handle().clone();
@@ -1920,6 +1979,14 @@ pub fn run() {
                         api.prevent_exit();
                     }
                 }
+                // Clicking the Dock icon, or opening OAIY.app again, while its window is hidden (closing it only hides it):
+                // the window comes back, as it does from the tray.
+                #[cfg(target_os = "macos")]
+                RunEvent::Reopen { has_visible_windows, .. } => {
+                    if !has_visible_windows {
+                        crate::tray::show_main(app_handle);
+                    }
+                }
                 // On real Exit (tray > Quit, or programmatic app.exit),
                 // stop every running service so we don't leak orphaned
                 // processes. Done synchronously — the user just clicked
@@ -2032,7 +2099,7 @@ pub fn build_bridge_state(
     }
 }
 
-/// A stable per-install device id.
+/// A stable per-install device id (the headless server's, and the one a desktop already in use keeps: see `kept_device_id`).
 ///
 /// Derived from the data dir path rather than minted per launch: a consumer
 /// reads `deviceId` to attribute runs to a machine, and a fresh id every restart
@@ -2043,4 +2110,36 @@ pub fn stable_device_id(data_dir: &std::path::Path) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data_dir.to_string_lossy().to_lowercase().hash(&mut h);
     format!("dev_{:016x}", h.finish())
+}
+
+#[cfg(all(test, feature = "gui"))]
+mod config_pointer_tests {
+    use super::gui::config_obj_for_change;
+    use crate::secret_file::testing::TempDir;
+
+    #[test]
+    fn a_change_starts_from_the_keys_already_there_in_either_encoding() {
+        let dir = TempDir::new("pointer-keys");
+        let p = dir.0.join("desktop-config.json");
+        std::fs::write(&p, r#"{"dataDir":"/Volumes/Data/OAIY","serverPort":17980}"#).unwrap();
+        assert_eq!(config_obj_for_change(&p).unwrap().len(), 2);
+        // Windows PowerShell's `>` writes UTF-16 with a byte order mark: the same keys.
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(r#"{"dataDir":"D:\\OAIY"}"#.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(&p, utf16).unwrap();
+        assert_eq!(config_obj_for_change(&p).unwrap().get("dataDir").and_then(|v| v.as_str()), Some("D:\\OAIY"));
+        std::fs::remove_file(&p).unwrap();
+        assert!(config_obj_for_change(&p).unwrap().is_empty(), "no file: no keys");
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_object_is_kept_aside_before_it_is_written_over() {
+        let dir = TempDir::new("pointer-typo");
+        let p = dir.0.join("desktop-config.json");
+        let typo = r#"{"dataDir":"/Volumes/Data/OAIY", "serverPort": 17980,,}"#;
+        std::fs::write(&p, typo).unwrap();
+        assert!(config_obj_for_change(&p).unwrap().is_empty());
+        let aside = p.with_file_name(format!("{}.corrupt", p.file_name().unwrap().to_string_lossy()));
+        assert_eq!(std::fs::read_to_string(aside).unwrap(), typo, "what was in it is kept");
+    }
 }

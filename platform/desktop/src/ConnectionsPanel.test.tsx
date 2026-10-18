@@ -766,7 +766,10 @@ describe('ConnectionsPanel · Connected apps', () => {
   it('says what a connected app can do beside the list, and nothing about the list before it is read', async () => {
     pairedMock.mockReturnValue(new Promise(() => {}));
     await mount();
-    expect(container.textContent).toContain('A connected app can run flows and call plugins on this machine');
+    // Flows can run programs, and an Agent reaches more: the hint says so, and how long a connection lasts.
+    expect(container.textContent).toContain('A connected app can run flows (which can run programs) and use your plugins and AI models');
+    expect(container.textContent).toContain('an Agent can also reach your calls');
+    expect(container.textContent).toContain('forgotten after 90 days unused');
     expect(container.textContent).toContain('Reading the connected apps');
     expect(container.textContent).not.toContain('Nothing is connected');
   });

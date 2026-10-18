@@ -3,6 +3,7 @@ import { useVisiblePoll } from './useVisiblePoll';
 import { Check, X, Link2 } from 'lucide-react';
 import { pairing, type PendingPairing } from './api';
 import { useToast } from './Toasts';
+import { pairingFrom, pairingGrants } from './pairingWords';
 
 /**
  * App-wide pairing prompt.
@@ -87,8 +88,7 @@ export default function PairingPrompt() {
           <div className="pairing-body">
             <span>
               <b>{req.product}</b>
-              {req.origin ? ` · ${req.origin}` : ''} is requesting access to run flows and call
-              plugins through OAIY Desktop.
+              {pairingFrom(req.origin)} {pairingGrants(req.access)}
             </span>
             <span className="pairing-code">
               Confirm the code matches: <code>{req.code}</code>

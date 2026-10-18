@@ -339,6 +339,13 @@ pub struct RegistrySnapshot {
     pub template_errors: Vec<TemplateLoadError>,
 }
 
+/// The services as a web page that is not OAIY's sees them (`GET /api/services` without a token or a trusted origin): what
+/// each is and whether it runs, without this machine's paths, process ids, GPUs or what a service printed when it failed.
+#[derive(Serialize)]
+pub struct PublicRegistrySnapshot {
+    pub services: Vec<ServiceSnapshot>,
+}
+
 /// Combine the primary models dir with extra roots into an ordered, deduped
 /// search list (primary first). Skips empties + duplicates (case-insensitive
 /// on Windows, where the filesystem is).
@@ -1532,6 +1539,28 @@ impl Registry {
             data_dir: self.data_dir.display().to_string(),
             template_errors: self.template_errors.clone(),
         }
+    }
+
+    /// [`Self::snapshot`] for a web page that is not OAIY's ([`PublicRegistrySnapshot`]): no data folder or template
+    /// errors, no error text, crash, process id, start time or GPU, and a node's body with only its `${port}` filled in
+    /// (the folders' placeholders stay placeholders).
+    pub fn public_snapshot(&self) -> PublicRegistrySnapshot {
+        let mut services = self.snapshot().services;
+        for (snap, service) in services.iter_mut().filter_map(|snap| self.services.get(&snap.id).map(|s| (snap, s))) {
+            snap.error = None;
+            snap.last_crash = None;
+            snap.pid = None;
+            snap.started_at = None;
+            snap.gpu = None;
+            snap.node = service.template.node.as_ref().map(|n| {
+                let mut n = n.clone();
+                if let Some(bt) = &n.body_template {
+                    n.body_template = Some(bt.replace("${port}", &service.port.to_string()));
+                }
+                n
+            });
+        }
+        PublicRegistrySnapshot { services }
     }
 
     /// Map venv name → ids of services whose run spec references it

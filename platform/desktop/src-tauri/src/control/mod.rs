@@ -354,7 +354,8 @@ async fn desktop_log(Query(q): Query<LinesQuery>) -> Response {
         Ok(Ok(bytes)) => {
             let text = String::from_utf8_lossy(&bytes);
             let all: Vec<&str> = text.lines().collect();
-            let tail: Vec<&str> = all[all.len().saturating_sub(lines)..].to_vec();
+            // (scrubbed like every log route's lines: the Agent's `logs_tail` hands them to its model)
+            let tail: Vec<String> = all[all.len().saturating_sub(lines)..].iter().map(|l| crate::auth::scrub::scrub_line(l)).collect();
             Json(json!({ "available": true, "lines": tail })).into_response()
         }
         Ok(Err(e)) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("the desktop's log could not be read: {e}")),

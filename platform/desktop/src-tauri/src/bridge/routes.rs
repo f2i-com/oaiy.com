@@ -1646,6 +1646,9 @@ struct PairingRequestBody {
     product: String,
     #[serde(default)]
     label: Option<String>,
+    /// What it asks for: `apps` (the default) or `agent` (`pairing::PairingAccess`).
+    #[serde(default)]
+    access: Option<String>,
 }
 
 /// Raise a pairing request. UNAUTHENTICATED by design — its only power is to put
@@ -1658,22 +1661,37 @@ async fn create_pairing(
     headers: axum::http::HeaderMap,
     Json(body): Json<PairingRequestBody>,
 ) -> axum::response::Response {
+    use super::pairing::{PairingAccess, MAX_LABEL_CHARS, MAX_PRODUCT_CHARS};
     if body.product.trim().is_empty() {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "product is required".into());
     }
+    // (both are shown in the prompt: nothing real is longer, and a page must not fill the window with one)
+    if body.product.chars().count() > MAX_PRODUCT_CHARS {
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", format!("product is longer than {MAX_PRODUCT_CHARS} characters"));
+    }
+    if body.label.as_deref().is_some_and(|l| l.chars().count() > MAX_LABEL_CHARS) {
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", format!("label is longer than {MAX_LABEL_CHARS} characters"));
+    }
+    let access = match body.access.as_deref() {
+        None => PairingAccess::Apps,
+        Some(name) => match PairingAccess::by_name(name) {
+            Some(access) => access,
+            None => return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", format!("access {name:?} is not apps or agent")),
+        },
+    };
     let origin = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|o| o.to_str().ok())
         .map(str::to_string);
     match st.pairing.lock() {
-        Ok(mut mgr) => {
-            let req = mgr.request(&body.product, body.label, origin);
-            (
+        Ok(mut mgr) => match mgr.request_for(&body.product, body.label, origin, access) {
+            Ok(req) => (
                 StatusCode::CREATED,
-                Json(json!({ "pairingId": req.pairing_id, "code": req.code, "status": req.status })),
+                Json(json!({ "pairingId": req.pairing_id, "code": req.code, "status": req.status, "access": req.access })),
             )
-                .into_response()
-        }
+                .into_response(),
+            Err(why) => bridge_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", why),
+        },
         Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
     }
 }
@@ -1688,7 +1706,7 @@ async fn poll_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -> 
         Ok(mut mgr) => match mgr.poll(&id) {
             Some(req) => (
                 StatusCode::OK,
-                Json(json!({ "status": req.status, "token": req.token, "product": req.product })),
+                Json(json!({ "status": req.status, "token": req.token, "product": req.product, "access": req.access })),
             )
                 .into_response(),
             None => bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("unknown pairing {id}")),
@@ -1733,7 +1751,7 @@ async fn deny_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -> 
 /// The apps currently paired, secret-free. PRIVILEGED.
 async fn list_paired(State(st): State<BridgeState>) -> axum::response::Response {
     match st.pairing.lock() {
-        Ok(mgr) => (StatusCode::OK, Json(json!({ "paired": mgr.paired() }))).into_response(),
+        Ok(mut mgr) => (StatusCode::OK, Json(json!({ "paired": mgr.paired() }))).into_response(),
         Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
     }
 }

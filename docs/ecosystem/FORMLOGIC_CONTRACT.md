@@ -16,8 +16,8 @@ Code: `formlogic/ui/src/client-runtime/oaiy/` (`oaiyRuntime.ts`, `oaiyPairing.ts
 |---|---|
 | Transport | Plain HTTP to `http://127.0.0.1:17972` (`OAIY_BASE_URL`); events are polled |
 | Detection | `GET /api/health`, no auth; `product === 'oaiy-desktop'` and protocol major `oaiy-bridge/1`; every 10 s, every 30 s after 3 failures |
-| Pairing | `POST /api/bridge/pairing {product, label}` → `{pairingId, code}`; the person approves in OAIY; FormLogic polls `GET /api/bridge/pairing/{id}` every 1.5 s for `{status: pending/approved/denied/expired, token}` (404 means expired; it waits 3 min, OAIY keeps requests 5 min) |
-| Auth | `Authorization: Bearer <token>`, kept in `sessionStorage` under `oaiy.token:<baseUrl>`; OAIY's own webview and `oaiy.com` are trusted by Origin, FormLogic uses the token |
+| Pairing | `POST /api/bridge/pairing {product, label}` → `{pairingId, code, access: "apps"}`; the person approves in OAIY; FormLogic polls `GET /api/bridge/pairing/{id}` every 1.5 s for `{status: pending/approved/denied/expired, token}` (404 means expired; it waits 3 min, OAIY keeps requests 5 min) |
+| Auth | `Authorization: Bearer <token>`, kept in `sessionStorage` under `oaiy.token:<baseUrl>`; OAIY's own webview and `oaiy.com` are trusted by Origin, FormLogic uses the token, which works only from the origin that paired (and is forgotten after 90 days unused) and reaches an app's routes (`access: "apps"`: every call below) |
 | Commands | `POST /api/bridge/connectors/{id}/request {command, payload, idempotencyKey}` → `{ok:true, result}`, where `result` is the plugin's `{ok, data}` |
 | Other calls | `GET /api/bridge/capabilities` (ids like `connector.<id>.*`), `GET /api/plugins`, `POST /api/plugins/{id}/start` and `/stop`, `GET /api/services`, `GET /api/ai/sources`, `POST /api/ai/providers/{id}/v1/chat/completions` |
 | Events | `GET /api/bridge/events?since=<seq>&limit=500` → `{events:[{seq, envelope}], next}`, every 2 s; the first poll only records the position, so old events never trigger flows |

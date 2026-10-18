@@ -5381,7 +5381,9 @@ fn the_window_registers_each_command_plugin_and_item_of_both_features_once() {
     assert_eq!(unique("permission", permissions.clone()), permissions.len());
     assert_eq!(permissions.iter().filter(|p| **p == "dialog:default").count(), 1);
     assert!(permissions.iter().all(|p| !p.starts_with("updater:")), "the updater plugin's own commands answer nobody: {permissions:?}");
-    assert_eq!(capabilities["windows"], serde_json::json!(["main"]));
+    // (the dashboard's own webview: not the pages embedded in the same window)
+    assert_eq!(capabilities["webviews"], serde_json::json!(["main"]));
+    assert!(capabilities.get("windows").is_none(), "a window's grant would reach its embedded pages too");
     // The tray: each item once.
     let tray = source_text(include_str!("../tray.rs"));
     let ids: Vec<&str> = tray.split("MenuItem::with_id(handle, \"").skip(1).map(|rest| rest.split('"').next().unwrap()).collect();

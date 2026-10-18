@@ -315,10 +315,16 @@ fn serve_path(root: Option<&Path>, page: Page, uri_path: &str) -> Response<Vec<u
 /// What each embedded page knows from its first line: where the desktop is, a token for it, and the theme.
 /// The Agent's page also gets the secret its restore hand-over asks for (`backupToken`): no other page
 /// has it, and no route returns it.
+///
+/// Only the page at its own address is told: the script runs in whatever the webview loads, and a popup the page opens
+/// (a blob or a blank page of its own, let through by `on_new_window`) shares it but has no navigation guard, so a link
+/// followed there would hand the token to that site.
 fn desktop_script(theme: &str, page: Page) -> String {
     let backup = if page == Page::Agent { format!(", backupToken: {:?}", crate::backup::agent::page_token()) } else { String::new() };
+    let url = page.url();
+    let own = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()) + &url.port().map(|p| format!(":{p}")).unwrap_or_default();
     format!(
-        "window.__OAIY_DESKTOP__ = Object.freeze({{ origin: {origin:?}, token: {token:?}, theme: {theme:?}{backup} }});",
+        "if (location.protocol + '//' + location.host === {own:?}) window.__OAIY_DESKTOP__ = Object.freeze({{ origin: {origin:?}, token: {token:?}, theme: {theme:?}{backup} }});",
         origin = format!("http://127.0.0.1:{}", crate::api_port()),
         token = crate::internal_token(),
     )
@@ -387,14 +393,19 @@ fn intent_script(intent: &str) -> String {
 
 /// Ask the agent's page (made at startup, hidden) to do one of `AGENT_INTENTS`.
 #[tauri::command]
-pub async fn agent_intent<R: Runtime>(app: AppHandle<R>, intent: String) -> Result<(), String> {
+pub async fn agent_intent<R: Runtime>(app: AppHandle<R>, webview: tauri::Webview<R>, intent: String) -> Result<(), String> {
+    // (the dashboard's alone: the flow editor runs plugins' screens, and `answerWithOaiy` has the Agent answer calls and texts)
+    if !crate::update::gui::is_dashboard(webview.label()) {
+        log::warn!("refused an Agent intent from the webview \"{}\"", webview.label());
+        return Err("Only OAIY's own window can do that.".to_string());
+    }
     if !AGENT_INTENTS.contains(&intent.as_str()) {
         return Err(format!("no agent intent called {intent}"));
     }
-    let webview = app
+    let agent = app
         .get_webview(Page::Agent.label())
         .ok_or("the Agent is not open: open it once from the sidebar, then try again")?;
-    webview.eval(intent_script(&intent)).map_err(|e| e.to_string())
+    agent.eval(intent_script(&intent)).map_err(|e| e.to_string())
 }
 
 /// The Agent's page, when it exists (hidden or shown): what the desktop asks to save its work before an update.
@@ -791,7 +802,13 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
             if own(page, url) {
                 return true;
             }
-            open_outside(&for_navigation, url);
+            // WebView2 asks this for the page itself alone, so a link followed in it opens in the browser. WebKit asks it for
+            // every frame too, and wry does not say which: a frame that loads another site (a model's reply, a plugin's screen
+            // in the flow editor's sandbox setting its `location`) must not open the browser with nobody's click. There the
+            // navigation is only stopped; the pages' links open outside through `on_new_window` (they are `target="_blank"`).
+            if cfg!(windows) {
+                open_outside(&for_navigation, url);
+            }
             false
         })
         .on_new_window(move |url, _features| {
@@ -948,6 +965,16 @@ mod tests {
         assert_eq!(parse_theme("sepia"), None);
         assert!(desktop_script("light", Page::Flows).contains(r#"theme: "light""#));
         assert_eq!(theme_script("dark"), r#"window.__oaiySetTheme ? window.__oaiySetTheme("dark") : (window.__OAIY_THEME__ = "dark");"#);
+    }
+
+    #[test]
+    fn only_the_page_at_its_own_address_is_told_where_the_desktop_is() {
+        for page in [Page::Agent, Page::Flows] {
+            let url = page.url();
+            let own = format!("{}://{}", url.scheme(), url.host_str().unwrap()) + &url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            let script = desktop_script("dark", page);
+            assert!(script.starts_with(&format!("if (location.protocol + '//' + location.host === {own:?}) window.__OAIY_DESKTOP__ =")), "{script}");
+        }
     }
 
     #[test]

@@ -21,6 +21,10 @@
 //! - the desktop's mode (`gui_mode`) and the headless server's, with a token configured and without.
 //!
 //! Routes the model adds are not compared (the new guard judges them, by design); unknown paths are.
+//!
+//! The step the guard was tightened by after the third review (`http::tighten`: impostor origins, what a paired token
+//! reaches and from where, the reads with paths in them that no web page reads) runs in front of the old guard, not inside
+//! it, and the frozen guard is compared with that same step in front of it: what is compared is still the old guard.
 
 use std::sync::{Arc, Mutex};
 
@@ -186,17 +190,17 @@ fn live(gui: bool, token: Option<&str>, pairing: crate::bridge::PairingHandle) -
     stub_routes().layer(middleware::from_fn_with_state(state, access_guard))
 }
 
-/// The frozen guard, over the same routes.
+/// The frozen guard, over the same routes, behind the step the live guard was tightened by (see the module docs).
 fn frozen(gui: bool, token: Option<&str>, pairing: crate::bridge::PairingHandle) -> Router {
     let state = frozen_guard::AuthConfig {
         token: token.map(str::to_owned),
         gui_mode: gui,
-        pairing: Some(pairing),
+        pairing: Some(pairing.clone()),
     };
-    stub_routes().layer(middleware::from_fn_with_state(
-        state,
-        frozen_guard::origin_guard,
-    ))
+    let tightened = AuthConfig { token: token.map(str::to_owned), gui_mode: gui, pairing: Some(pairing) };
+    stub_routes()
+        .layer(middleware::from_fn_with_state(state, frozen_guard::origin_guard))
+        .layer(middleware::from_fn_with_state(tightened, super::tightened))
 }
 
 /// What an answer is, for comparing: the status, every header but `date` (sorted, so an added or a changed
@@ -474,7 +478,9 @@ async fn the_routes_of_the_receptionists_transfers_and_messages_are_in_the_compa
         for (name, guarded) in [("live", live(true, Some(STATIC_TOKEN), pairing.clone())), ("frozen", frozen(true, Some(STATIC_TOKEN), pairing.clone()))] {
             let stranger = ask(&guarded, &method, &path, None, Some("http://evil.example")).await;
             assert_eq!(stranger.status, 403, "{name}: {method} {path} from a page that is not the window");
-            let window = ask(&guarded, &method, &path, None, Some("http://oaiy.localhost")).await;
+            // (this system's own: on a Mac `http://oaiy.localhost` is whatever holds port 80, not the window)
+            let own = if cfg!(windows) { "http://oaiy.localhost" } else { "oaiy://localhost" };
+            let window = ask(&guarded, &method, &path, None, Some(own)).await;
             assert_eq!(window.status, 200, "{name}: {method} {path} from the desktop's own window");
             let token = ask(&guarded, &method, &path, Some(&format!("Bearer {STATIC_TOKEN}")), None).await;
             assert_eq!(token.status, 200, "{name}: {method} {path} with the configured token");

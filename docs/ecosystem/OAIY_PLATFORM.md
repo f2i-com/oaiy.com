@@ -71,19 +71,39 @@ Two transports, neither a WebSocket.
 
 - `GET /api/health` → `{status:"ok", product:"oaiy-desktop", companion:"oaiy-desktop",
   protocol:"oaiy-bridge/1", version, apiVersion:1, pluginApiVersion:1}`.
-- Pairing (`bridge/pairing.rs`): `POST /api/bridge/pairing {product, label?}` (open; the
-  Origin is recorded) → `201 {pairingId:"pair_<32hex>", code:<6 of
-  23456789ABCDEFGHJKMNPQRSTUVWXYZ>, status:"pending"}`. The person approves in the dashboard
-  (`/approve` or `/deny`, from the desktop window only). The client polls
-  `GET /api/bridge/pairing/:id` until `{status:"approved", token:"oaiypat_<64hex>"}`. Pending
-  requests last 5 minutes, at most 12. Tokens persist in `<data>/pairings.json`
-  (`GET /api/bridge/pairings`, `DELETE /api/bridge/pairings/:id`).
+- Pairing (`bridge/pairing.rs`): `POST /api/bridge/pairing {product, label?, access?}` (open;
+  the Origin is recorded; `product` at most 64 characters, `label` 200) → `201
+  {pairingId:"pair_<32hex>", code:<6 of 23456789ABCDEFGHJKMNPQRSTUVWXYZ>, status:"pending",
+  access}`. `access` is what the client asks for, and the prompt says it: `apps` (the default:
+  run and keep flows and triggers, plugins' commands, start and stop plugins and services, the
+  AI gateway and speech) or `agent` (the OAIY Agent in a browser tab: an app's, and calls,
+  texts, the calendar and contacts, the engines' models and the Agent's control tools). The
+  person approves in the dashboard (`/approve` or `/deny`, from the desktop window only). The
+  client polls `GET /api/bridge/pairing/:id` until `{status:"approved", token:"oaiypat_<64hex>",
+  access}`. Pending requests last 5 minutes, at most 12, at most 3 from one origin (its oldest
+  makes room); an approved one waiting to be collected is never pushed out (a new request is
+  `429 rate_limited` then). Tokens persist in `<data>/pairings.json` (`GET /api/bridge/pairings`
+  with each one's `access` and `lastUsedMs`, `DELETE /api/bridge/pairings/:id`); one unused for
+  90 days is forgotten.
+- What a paired token reaches (`http.rs` `tighten`, in front of `origin_guard`): the routes whose
+  scope in the access table (`auth/routes.rs`) its `access` holds, and only from the page it was
+  granted to (a program's token, granted with no Origin, from no page). Pairing itself,
+  OAIY Network, plugin installs and trust, service definitions, runtimes, setup, the link, AI
+  provider keys and the owner's settings are never a paired app's. Anywhere else the token is
+  taken off the request, which is then judged as one without a token.
 - Auth (`http.rs` `origin_guard`): open are OPTIONS, `GET /api/health`,
   `GET /api/bridge/capabilities`, the pairing POST and poll. Everything that executes needs a
   bearer (a paired token, `OAIY_SERVER_TOKEN`, or the internal child token) or a trusted
-  Origin (`tauri://localhost`, `*.oaiy.com`; loopback only in debug builds). The linked
-  FormLogic origin is trusted only for non-privileged calls. Headless mode denies all but the
-  open routes.
+  Origin (`tauri://localhost`, `https://oaiy.com` and `https://www.oaiy.com`; loopback only in
+  debug builds). OAIY's embedded pages count by this system's own origins alone (`oaiy://localhost`
+  on a Mac, `http://oaiy.localhost` on Windows): the other system's, and any other subdomain of
+  oaiy.com, are refused everything but the open routes. The linked FormLogic origin is trusted
+  only for non-privileged calls. Headless mode denies all but the open routes.
+- Reads with this computer's paths in them (`/api/models`, `/api/models/downloads`,
+  `/api/models/catalog`, `/api/python`) are for OAIY's own pages, programs (no Origin, no
+  `Sec-Fetch-Site`) and token holders, never another web page; `/api/services` answers another
+  web page without the data folder, template errors, service errors, crashes, process ids and
+  GPUs.
 - What a paired FormLogic does: chat through `/api/ai/sources` and
   `/api/ai/providers/:id/v1/chat/completions`; Aokie commands through
   `POST /api/bridge/connectors/aokie/request {command, payload, idempotencyKey}` →
