@@ -75,7 +75,12 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
     if (connected) void refreshModels();
   }, [connected, refreshModels]);
 
-  const save = async (next: AgentPreferences) => {
+  // The Agent's model changed (saved here, or by the Agent or the setup wizard): the radios follow it, not a choice made before.
+  const savedModel = JSON.stringify(prefs?.model ?? null);
+  useEffect(() => setPicked(null), [savedModel]);
+
+  /** `revert`: a choice of the radios alone, put back to what the Agent uses when it could not be saved. */
+  const save = async (next: AgentPreferences, revert = false) => {
     setSaving(true);
     setSaved(false);
     setError(null);
@@ -85,6 +90,7 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
       setSaved(true);
     } catch (e) {
       setError(`Not saved: ${errorText(e)}`);
+      if (revert) setPicked(null);
     } finally {
       setSaving(false);
     }
@@ -94,8 +100,8 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
     setPicked(next);
     // ChatGPT is set once it is signed in (the Agent could not answer with it before); a provider or a worker's model once
     // one is chosen.
-    if (next === 'engine' && (prefs?.model.source !== 'engine' || onWorker)) void save({ model: { source: 'engine' } });
-    if (next === 'chatgpt' && connected && prefs?.model.source !== 'chatgpt') void save({ model: { source: 'chatgpt' } });
+    if (next === 'engine' && (prefs?.model.source !== 'engine' || onWorker)) void save({ model: { source: 'engine' } }, true);
+    if (next === 'chatgpt' && connected && prefs?.model.source !== 'chatgpt') void save({ model: { source: 'chatgpt' } }, true);
   };
 
   if (prefs === null) {
@@ -130,19 +136,22 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
       ) : (
         <div className="ai-choices is-compact" role="radiogroup" aria-label="The Agent’s model">
           <div className={`ai-choice${source === 'engine' ? ' is-selected' : ''}`}>
-            <label className="ai-choice-head">
-              <input type="radio" name="agent-model" checked={source === 'engine'} disabled={saving} onChange={() => choose('engine')} />
-              <span className="setup-req-icon" aria-hidden>
-                <Cpu size={16} />
-              </span>
-              <span className="ai-choice-text">
-                <strong>On this computer</strong>
-                <small className="ai-choice-fact">{modelLineText(line)}</small>
-              </span>
+            {/* (the way to Engines beside the choice, not in its label: a button is no part of the radio's name) */}
+            <div className="ai-choice-head-row">
+              <label className="ai-choice-head">
+                <input type="radio" name="agent-model" checked={source === 'engine'} disabled={saving} onChange={() => choose('engine')} />
+                <span className="setup-req-icon" aria-hidden>
+                  <Cpu size={16} />
+                </span>
+                <span className="ai-choice-text">
+                  <strong>On this computer</strong>
+                  <small className="ai-choice-fact">{modelLineText(line)}</small>
+                </span>
+              </label>
               <button type="button" className="btn-tiny" onClick={onOpenEngines}>
                 Engines <ExternalLink size={12} />
               </button>
-            </label>
+            </div>
           </div>
           <div className={`ai-choice${source === 'chatgpt' ? ' is-selected' : ''}`}>
             <label className="ai-choice-head">
@@ -160,19 +169,21 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
             {source === 'chatgpt' && (
               <div className="ai-choice-body">
                 {connected ? (
-                  <label className="form-row agent-model-pick">
-                    <span>Model, from Codex’s catalogue</span>
-                    <select
-                      value={prefs?.model.source === 'chatgpt' ? prefs.model.model ?? '' : ''}
-                      disabled={saving}
-                      onChange={(e) => void save({ model: e.target.value ? { source: 'chatgpt', model: e.target.value } : { source: 'chatgpt' } })}
-                    >
-                      {options.map((o) => (
-                        <option key={o.value || 'default'} value={o.value}>
-                          {o.label}
-                        </option>
-                      ))}
-                    </select>
+                  <div className="form-row agent-model-pick">
+                    <label className="form-row">
+                      <span>Model, from Codex’s catalogue</span>
+                      <select
+                        value={prefs?.model.source === 'chatgpt' ? prefs.model.model ?? '' : ''}
+                        disabled={saving}
+                        onChange={(e) => void save({ model: e.target.value ? { source: 'chatgpt', model: e.target.value } : { source: 'chatgpt' } })}
+                      >
+                        {options.map((o) => (
+                          <option key={o.value || 'default'} value={o.value}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     {modelsError && !models && (
                       <small className="card-warn">
                         The catalogue could not be read ({modelsError}).{' '}
@@ -181,7 +192,7 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
                         </button>
                       </small>
                     )}
-                  </label>
+                  </div>
                 ) : (
                   <ChatGptConnector
                     bare

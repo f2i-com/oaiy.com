@@ -343,15 +343,14 @@ function ContactEditor({
   useEffect(() => onDirty(dirty), [dirty, onDirty]);
   useEffect(() => () => onDirty(false), [onDirty]);
 
-  // Newer from the desktop (the receptionist remembered something, the Agent named them): taken while nothing here changed.
+  // Newer from the desktop (the receptionist remembered something, the Agent named them): taken for each field not
+  // changed here, so a name learned while the notes are being edited is not saved back as the old one.
   const incoming = JSON.stringify(contact);
   useEffect(() => {
     if (incoming === JSON.stringify(base)) return;
     setBase(contact);
-    if (!dirty) {
-      setName(contact.name);
-      setNotes(contact.notes);
-    }
+    if (keptName(name) === base.name) setName(contact.name);
+    if (keptNotes(notes) === base.notes) setNotes(contact.notes);
     setRemoved((r) => new Set([...r].filter((id) => contact.facts.some((f) => factId(f) === id))));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [incoming]);
@@ -709,7 +708,10 @@ function ImportPanel({ onImported, onClose }: { onImported: (r: ImportReport) =>
 
   const choose = async (f: File | undefined) => {
     if (!f) return;
+    // (a preview still on its way for the file before is not this one's)
+    seq.current++;
     setReport(null);
+    setBusy(null);
     if (f.size > MAX_FILE) {
       setFile(null);
       setProblem('That file is over 8 MB: split it, and import each part.');

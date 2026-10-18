@@ -555,8 +555,9 @@ kbd {
 .section-title-row {
   display: flex;
   align-items: baseline;
+  flex-wrap: wrap;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px 12px;
 }
 
 /* ---------------------------------------------------------------------------
@@ -699,7 +700,8 @@ code {
   font-family: var(--font-mono);
   font-size: 11px;
 }
-.path-code { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+/* A path is one box: a long one wraps inside it, rather than running on with its border broken across lines. */
+.path-code { display: inline-block; max-width: 100%; color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .path-code-small {
   border-color: transparent;
   background: transparent;
@@ -792,7 +794,11 @@ code {
 .settings-value .badge,
 .section-title .badge,
 .dl-head .badge,
-.form-actions .badge { margin-left: 0; }
+.form-actions .badge,
+.run-head .badge,
+.card-head .badge,
+.overview-hero-title .badge,
+.datadir-row .badge { margin-left: 0; }
 
 /* ---------------------------------------------------------------------------
  * BANNERS
@@ -816,9 +822,11 @@ code {
   color: var(--primary);
 }
 .banner-pending .path-code { color: var(--primary); }
+/* An icon in a banner's words sits on their line. */
+.banner > span > svg:first-child { vertical-align: -2px; }
 .banner-dismissable {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
 }
@@ -884,7 +892,9 @@ code {
 .card-desc { margin: 7px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
 .card-reason { margin: 6px 0 0; color: var(--amber); font-size: 12.5px; overflow-wrap: anywhere; }
 .card-meta { margin: 5px 0 0; color: var(--faint); font-size: 12px; }
-.card-warn { display: flex; align-items: center; gap: 6px; color: var(--amber); }
+.card-warn { display: flex; align-items: flex-start; gap: 6px; color: var(--amber); font-size: 12.5px; line-height: 1.5; overflow-wrap: anywhere; }
+/* (on the first line of a warning that runs to two) */
+.card-warn > svg { flex: none; margin-top: 2px; }
 .card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .card-actions-flush { margin-top: 0; }
 .card-address { overflow-wrap: anywhere; }
@@ -998,6 +1008,13 @@ code {
   border-top: 1px solid var(--border);
   padding-top: 14px;
 }
+/* A form under a sub-heading of its own, or straight under its section's title: no rule of its own (a rule under a
+   title reads as a second divider). */
+.dl-form-flush,
+.section-title + .dl-form,
+.section-title-row + .dl-form,
+.section-title-row + .network-add { border-top: 0; padding-top: 0; }
+.settings-label.settings-subhead { margin: 6px 0 0; border-top: 1px solid var(--border); color: var(--text); padding-top: 14px; }
 
 .dl-row {
   --node: var(--strong-border);
@@ -1019,7 +1036,7 @@ code {
 
 .dl-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .dl-name { font-family: var(--font-mono); font-size: 12px; font-weight: 600; word-break: break-all; }
-.dl-meta { color: var(--muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
+.dl-meta { color: var(--muted); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
 .dl-error { color: var(--danger); font-size: 11px; }
 
 .progress-bar {
@@ -1292,6 +1309,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .seg > button:hover { background: var(--surface-soft); color: var(--text); }
 .seg > button.active { background: var(--primary-soft); color: var(--primary); }
+.seg > button:focus-visible { outline-offset: -2px; }
 
 .run-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .run-row {
@@ -1326,6 +1344,11 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   line-clamp: 3;
 }
 .run-more { margin-top: 8px; }
+/* The filter and the list's buttons, together at the title's right (and together on a line of their own when narrow). */
+.run-tools { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.run-tools .seg { margin-left: 0; }
+/* "Show all" and "Details" side by side. */
+.run-more + .run-more { margin-left: 6px; }
 .run-detail {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
@@ -1605,6 +1628,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   .endpoint-dock { gap: 10px; padding: 0 12px 0 16px; }
   .dock-status > span, .dock-trust { display: none; }
   .form-row-pair { flex-direction: column; }
+  /* (stacked, a field's width basis would become its height) */
+  .form-row-pair > .network-port { flex: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1645,7 +1670,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   border-color: color-mix(in srgb, var(--primary) 55%, transparent);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 25%, transparent);
 }
-.pairing-head { display: flex; align-items: center; gap: 8px; font-size: 14px; margin-bottom: 6px; }
+.pairing-head { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 14px; margin-bottom: 6px; overflow-wrap: anywhere; }
 .pairing-body { display: flex; flex-direction: column; gap: 4px; font-size: 13px; opacity: 0.85; }
 .pairing-code code {
   font-size: 15px; letter-spacing: 2px; font-weight: 600;
@@ -1655,6 +1680,10 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .pairing-actions { display: flex; gap: 8px; margin-top: 12px; }
 .pairing-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .pairing-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; }
+/* A long address or origin wraps in its row: the row's button stays in view. */
+.pairing-list li > span { min-width: 0; overflow-wrap: anywhere; }
+.pairing-list li > button { flex: none; }
+.pairing-origin { max-width: 100%; overflow-wrap: anywhere; }
 .pairing-list li + li { border-top: 1px solid var(--border); padding-top: 8px; }
 .pairing-app { display: inline-flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 6px; }
 .pairing-app > svg { color: var(--green); }
@@ -1693,7 +1722,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .today-grid .overview-tile strong.ok { color: var(--green); }
 .today-grid .overview-tile strong.warn { color: var(--amber); }
 /* Five tiles stay one row down to a narrow window, their states a little smaller there. */
-.overview-grid.today-grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
+.overview-grid.today-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, max(128px, calc((100% - 48px) / 5))), 1fr)); }
 .today-grid .overview-tile strong { max-width: 100%; overflow: hidden; font-size: clamp(16px, 1.45vw, 20px); line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 1000px) { .today-grid .overview-tile { padding: 14px; } }
 .overview-tile > svg { color: var(--muted); }
@@ -2183,3 +2212,4 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 /* A dismissable banner with actions: its words take the room, its buttons sit together at the right. */
 .banner-dismissable > span:first-child { flex: 1 1 auto; min-width: 0; }
 .banner-dismissable > .banner-actions { display: inline-flex; flex: none; align-items: center; gap: 6px; margin-left: auto; }
+.banner-detail { display: block; margin-top: 4px; font-family: var(--font-mono); font-size: 11.5px; opacity: 0.85; overflow-wrap: anywhere; }

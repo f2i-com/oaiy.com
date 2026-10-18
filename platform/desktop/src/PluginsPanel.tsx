@@ -30,6 +30,7 @@ import { useLiveSetup } from './useLiveSetup';
 import { openSetup, refetchSetup, useSetupState } from './useSetupState';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
+import { useVisiblePoll } from './useVisiblePoll';
 import LogsViewer from './LogsViewer';
 import PackageTrustBadge from './PackageTrustBadge';
 
@@ -90,25 +91,31 @@ export default function PluginsPanel() {
   // The setup state as last rendered, for the poll: a plugin waiting for its setup is not toasted as unhealthy.
   const setupInfo = useRef<{ state: ReturnType<typeof useSetupState>; live: ReturnType<typeof useLiveSetup> }>({ state: null, live: {} });
 
+  // (the latest reading wins: an older one landing after a newer one would toast a crash, then a recovery, that
+  // did not happen)
+  const asked = useRef(0);
   const refresh = useCallback(async () => {
+    const mine = ++asked.current;
     try {
       const snap = await plugins.list();
+      if (mine !== asked.current) return;
       setError(null);
       for (const p of snap.plugins) {
+        const shown = p.manifest?.name ?? p.declared?.name ?? p.id;
         const prev = seen.current.get(p.id);
         if (prev !== undefined && prev !== p.state && !firstPoll.current) {
           if (p.state === 'crashed') {
             toast.push({
               kind: 'error',
-              title: `Plugin "${p.id}" crashed`,
+              title: `${shown} crashed`,
               body: p.reason ?? 'The process exited unexpectedly.',
             });
           } else if (p.state === 'running' && prev !== 'running') {
-            toast.push({ kind: 'success', title: `Plugin "${p.id}" is running` });
+            toast.push({ kind: 'success', title: `${shown} is running` });
           } else if (p.state === 'unhealthy' && !waitingForSetup(p, pluginSetupStatus(p, setupInfo.current.state, setupInfo.current.live))) {
             toast.push({
               kind: 'error',
-              title: `Plugin "${p.id}" is unhealthy`,
+              title: `${shown} is unhealthy`,
               body: p.reason ?? 'Health probes are failing.',
             });
           }
@@ -129,15 +136,12 @@ export default function PluginsPanel() {
     } catch (e) {
       // A poll failure is usually a momentary blip; keep the last snapshot and
       // show the error rather than blanking the list.
-      setError(e instanceof Error ? e.message : String(e));
+      if (mine === asked.current) setError(e instanceof Error ? e.message : String(e));
     }
   }, [toast]);
 
-  useEffect(() => {
-    refresh();
-    const id = window.setInterval(refresh, POLL_MS);
-    return () => window.clearInterval(id);
-  }, [refresh]);
+  // (not while the window is hidden in the tray)
+  useVisiblePoll(() => void refresh(), POLL_MS);
 
   const runAction = useCallback(
     async (id: string, fn: () => Promise<unknown>) => {
@@ -183,18 +187,22 @@ export default function PluginsPanel() {
       // A release build does not start a package nobody signed until the person says so:
       // not a failure, but "Click Start" would be the wrong thing to tell them.
       const needsTrust = out.trust?.state === 'unsigned';
+      // (a signature that does not check out: it never starts, so nothing here says to start it)
+      const quarantined = out.trust?.state === 'quarantined';
       toast.push({
-        kind: 'success',
+        kind: quarantined ? 'error' : 'success',
         title: out.replaced
           ? `Updated ${out.name} to v${out.version}`
           : `Installed ${out.name} v${out.version}`,
-        body: needsTrust
-          ? 'It is not signed, so it will not start until you trust it.'
-          : opensSetup
-            ? 'Its setup opens now.'
-            : out.setup
-              ? 'If its setup has something new, its card says so.'
-              : 'Click Start to run it.',
+        body: quarantined
+          ? 'Its signature does not check out, so it will not start. Install a copy from its publisher.'
+          : needsTrust
+            ? 'It is not signed, so it will not start until you trust it.'
+            : opensSetup
+              ? 'Its setup opens now.'
+              : out.setup
+                ? 'If its setup has something new, its card says so.'
+                : 'Click Start to run it.',
       });
       setInstallSource('');
       void refetchModules();
@@ -260,7 +268,7 @@ export default function PluginsPanel() {
       {snapshot && (
         <div className="datadir-note datadir-row">
           <span>
-            Plugins live in <code>{snapshot.root}</code>.
+            Plugins live in <code className="path-code">{snapshot.root}</code>
           </span>
           <button
             className="btn-tiny"

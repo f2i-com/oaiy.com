@@ -89,7 +89,8 @@
   .sidebar nav .nav-children > .nav-child { min-height: 36px; justify-content: center; padding: 0; }
   .sidebar nav .nav-children > .nav-child.active::before { left: 0; }
   .sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: block; }
-  .nav-count {
+  /* (the sidebar's: a count elsewhere, a Messages tab's, stays beside its word) */
+  .sidebar .nav-count {
     position: absolute;
     top: 3px;
     right: 1px;
@@ -174,7 +175,9 @@
 .cal-toolbar-end { display: flex; align-items: center; gap: 12px; }
 
 /* FormLogic, quietly: a dot, a few words, and Sync now as an icon. */
-.cal-sync { display: inline-flex; align-items: center; gap: 7px; color: var(--faint); font-size: 12px; white-space: nowrap; }
+.cal-sync { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 7px; color: var(--faint); font-size: 12px; white-space: nowrap; }
+/* (a sync error is FormLogic's own words, of any length: cut to the line, whole in its title) */
+.cal-sync > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .cal-sync > i { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--green); }
 .cal-sync.is-warn > i { background: var(--amber); }
 .cal-sync.is-err > i { background: var(--danger); }

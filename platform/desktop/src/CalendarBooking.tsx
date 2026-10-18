@@ -93,14 +93,16 @@ export function SlotPicker({ settings, service, minutes, date, time, wanted, cur
     return current && current.date === date && !t.includes(current.time) ? [...t, current.time].sort() : t;
   }, [free, date, current]);
 
-  // A day or service picked: keep the time when it is still free, else the nearest free one.
+  // A day or service picked: keep the time when it is still free, else the nearest free one. Not while another week is
+  // looked at: its free times say nothing about the day chosen, which keeps its time.
+  const inWeek = date >= week && date < ymd(addDays(parseYmd(week), 7));
   useEffect(() => {
-    if (!free || other) return;
+    if (!free || other || !inWeek) return;
     if (time && times.includes(time)) return;
     const next = pickTime(times, aim.current ?? time);
     if (next !== time) onPick(date, next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [free, times, date, other]);
+  }, [free, times, date, other, inWeek]);
 
   const days = Array.from({ length: 7 }, (_, i) => ymd(addDays(parseYmd(week), i)));
   const thisWeek = ymd(mondayOf(new Date()));
@@ -148,6 +150,8 @@ export function SlotPicker({ settings, service, minutes, date, time, wanted, cur
           <p className="form-hint">Finding free times…</p>
         ) : failed ? (
           <p className="card-warn">The free times could not be read. Pick a time yourself below.</p>
+        ) : !inWeek ? (
+          <p className="form-hint">Pick a day above to see its free times.</p>
         ) : times.length === 0 ? (
           <p className="form-hint">{closed(date) ? `Closed on ${DAY_NAMES[weekdayOf(parseYmd(date))]}s.` : date < today ? 'That day is past.' : 'Nothing free that day for this.'} Pick another day, or another time below.</p>
         ) : (

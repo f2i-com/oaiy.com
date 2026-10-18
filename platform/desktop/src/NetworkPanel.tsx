@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { AudioLines, Bot, Check, Copy, Unlock, Laptop, Link2, Loader2, Pin, PinOff, Server, TriangleAlert, Unplug, Workflow, X, type LucideIcon } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import {
+  isNotFound,
   network,
   type NetworkDevice,
   type NetworkJob,
@@ -14,6 +15,9 @@ import {
   type NetworkRole,
   type NetworkStatus,
 } from './api';
+
+/** How many answers in a row a pairing may miss (two seconds apart) before this screen gives it up. */
+const PAIRING_MISSES = 5;
 
 /**
  * Setup → Networking: OAIY Network (docs/NETWORK.md). This computer's place on the network (off, a primary that uses
@@ -122,8 +126,8 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
         .map((p) => (
           <div className="banner banner-pending banner-dismissable network-by-itself" key={`${p.name}:${p.at}`} role="status">
             <span>
-              <Bot size={13} aria-hidden /> <strong>{p.name}</strong> paired with this computer by itself at{' '}
-              {new Date(p.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Unpair it below if you do not know it.
+              <Bot size={13} aria-hidden /> <strong>{p.name}</strong> paired with this computer by itself {pairedWhen(p.at)}. Unpair it below if you
+              do not know it.
             </span>
             <button className="banner-dismiss" aria-label={`Dismiss: ${p.name} is known`} title="Dismiss" onClick={() => dismissByItself(`${p.name}:${p.at}`)}>
               <X size={13} aria-hidden />
@@ -396,8 +400,10 @@ function AgentMaySetUp({ status, busy, onChange }: { status: NetworkStatus; busy
           </strong>
           <small>
             The Agent can switch OAIY Network on, pair this computer with others, and choose which of their models, flows and OAIY Voice it uses, when you
-            ask it to. A code it is shown is still yours to compare. A computer pairs with this one by itself, with no codes, only while you (or the
-            Agent here) open pairing below, for a few minutes: on a network you trust, your home’s or office’s.
+            ask it to. A code it is shown is still yours to compare.
+            {status.lends
+              ? ' A computer pairs with this one by itself, with no codes, only while you (or the Agent here) open pairing below, for a few minutes: on a network you trust, your home’s or office’s.'
+              : ' Another computer can pair with this one by itself only while this one lends itself (Lend this computer, above).'}
           </small>
         </span>
       </label>
@@ -528,10 +534,15 @@ function FindWorkers({
   useEffect(() => {
     if (!pairing || approvedThere) return;
     let stopped = false;
+    // (a blip on the way, the worker's Wi-Fi or a slow answer, is asked again: the request still stands on the worker,
+    // and the code shown here is what its person compares. A few in a row end it; a request the worker no longer has
+    // ends it at once.)
+    let misses = 0;
     const tick = async () => {
       try {
         const r = await network.confirmPairing(pairing.pairingId);
         if (stopped) return;
+        misses = 0;
         if (r.status === 'pending') {
           timer.current = window.setTimeout(tick, 2000);
           return;
@@ -550,10 +561,14 @@ function FindWorkers({
         );
         onPaired();
       } catch (e) {
-        if (!stopped) {
-          setError(e instanceof Error ? e.message : String(e));
-          setPairing(null);
+        if (stopped) return;
+        misses += 1;
+        if (misses < PAIRING_MISSES && !isNotFound(e)) {
+          timer.current = window.setTimeout(tick, 2000);
+          return;
         }
+        setError(e instanceof Error ? e.message : String(e));
+        setPairing(null);
       }
     };
     timer.current = window.setTimeout(tick, 1500);
@@ -720,7 +735,7 @@ function FindWorkers({
           <span>{discovery ? 'Or add one by its address' : 'Add one by its address'}</span>
           <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder="192.168.1.20:17975" disabled={starting || !!pairing} aria-label="Worker address" />
         </label>
-        <button className="btn btn-secondary" type="submit" disabled={starting || !!pairing || !address.trim()}>
+        <button className="btn btn-primary" type="submit" disabled={starting || !!pairing || !address.trim()}>
           {starting ? <Loader2 size={14} className="spin" aria-hidden /> : <Link2 size={14} aria-hidden />} Pair
         </button>
       </form>
@@ -932,6 +947,13 @@ export function Queue({ jobs }: { jobs: NetworkJob[] }) {
   );
 }
 
+/** When a computer paired by itself: its time today, with its day before today (the notice stays until dismissed). */
+function pairedWhen(at: number): string {
+  const d = new Date(at);
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === new Date().toDateString() ? `at ${time}` : `on ${d.toLocaleDateString([], { day: 'numeric', month: 'short' })} at ${time}`;
+}
+
 /** How long ago, in a person's words. */
 function ago(ms: number): string {
   const minutes = Math.round((Date.now() - ms) / 60000);
@@ -948,7 +970,9 @@ const ARCH: Record<string, string> = { aarch64: 'arm64', x86_64: 'x64' };
 function queueText(q: NetworkNode['queue']): string | null {
   if (!q) return null;
   const running = q.running && typeof q.running === 'object' ? q.running : null;
-  const what = running ? `Working on ${running.kind ? `a ${KIND[running.kind]?.toLowerCase() ?? running.kind} job` : 'a job'}${running.model ? ` (${running.model})` : ''}` : null;
+  // ("a text job", "an embedding job", "a 3D job")
+  const word = running?.kind ? (KIND[running.kind] === '3D' ? '3D' : (KIND[running.kind] ?? running.kind).toLowerCase()) : null;
+  const what = running ? `Working on ${word ? `${/^[aeiou]/i.test(word) ? 'an' : 'a'} ${word} job` : 'a job'}${running.model ? ` (${running.model})` : ''}` : null;
   const waiting = q.queued > 0 ? `${q.queued} waiting` : null;
   return [what, waiting].filter(Boolean).join(' · ') || null;
 }

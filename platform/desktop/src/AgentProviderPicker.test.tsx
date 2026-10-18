@@ -112,6 +112,19 @@ describe('choosing an AI provider for the Agent', () => {
     expect(Array.from(select('Model').options).map((o) => o.value).filter(Boolean)).toEqual(['qwen3.5-9b', 'gemma-4-e4b']);
   });
 
+  it('lets the address be emptied and typed again, and asks for one before connecting', async () => {
+    await render();
+    await change(input('Address'), '');
+    // (an emptied field stays empty: the preset's address does not come back under the caret)
+    expect(input('Address').value).toBe('');
+    await click(button(/Connect/));
+    expect(host.querySelector('[role="alert"]')!.textContent).toContain('Enter the server’s address');
+    expect(m.upsert).not.toHaveBeenCalled();
+    // Another preset chosen: its own address again.
+    await change(select('Provider'), 'preset:ollama');
+    expect(input('Address').value).toBe('http://localhost:11434/v1');
+  });
+
   it('asks an API provider for its key, keeps it with the desktop, and not on the open web', async () => {
     m.models.mockResolvedValue(['gpt-5.5']);
     await render();

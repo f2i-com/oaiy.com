@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, Cloud, Link2, Radio, ShieldCheck, TriangleAlert, X } from 'lucide-react';
 import {
   companion,
@@ -12,6 +12,7 @@ import {
 } from './api';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
+import { useVisiblePoll } from './useVisiblePoll';
 
 /**
  * Connections — every app that has been granted access to this machine, and any
@@ -61,6 +62,11 @@ export default function ConnectionsPanel() {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
   const [removingCopies, setRemovingCopies] = useState(false);
+  const [relayBusy, setRelayBusy] = useState(false);
+  // (the latest reading of each wins: a poll asked before a change lands after it with what was there before, and would
+  // show a disconnected account, or a cancelled link, back for a moment)
+  const accountAsk = useRef(0);
+  const pairAsk = useRef(0);
 
   const refreshRelay = useCallback(async () => {
     try {
@@ -74,8 +80,10 @@ export default function ConnectionsPanel() {
   }, []);
 
   const refreshAccount = useCallback(async () => {
+    const mine = ++accountAsk.current;
     try {
       const next = await linkApi.status();
+      if (mine !== accountAsk.current) return;
       setAccount(next);
       put('linkStatus', next);
       setStatusError(null);
@@ -89,13 +97,15 @@ export default function ConnectionsPanel() {
           : f;
       });
     } catch (e) {
-      setStatusError(e instanceof Error ? e.message : String(e));
+      if (mine === accountAsk.current) setStatusError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
   const refresh = useCallback(async () => {
+    const mine = ++pairAsk.current;
     try {
       const [p, a] = await Promise.all([pairing.pending(), pairing.paired()]);
+      if (mine !== pairAsk.current) return;
       setPending(p.pending ?? []);
       setPaired(a.paired ?? []);
       put('pendingPairings', p.pending ?? []);
@@ -103,15 +113,12 @@ export default function ConnectionsPanel() {
       setLoaded(true);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (mine === pairAsk.current) setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
-  useEffect(() => {
-    refresh();
-    const id = window.setInterval(refresh, POLL_MS);
-    return () => window.clearInterval(id);
-  }, [refresh]);
+  // (not while the window is hidden in the tray)
+  useVisiblePoll(() => void refresh(), POLL_MS);
 
   // Not polled: it only changes when this screen changes it.
   useEffect(() => {
@@ -121,11 +128,7 @@ export default function ConnectionsPanel() {
   // Polled, unlike the companion relay above: both lanes to the provider fail
   // on their own schedule, so a status fetched once at mount would sit showing
   // a healthy link through a check-in or a command lane that has since stopped.
-  useEffect(() => {
-    void refreshAccount();
-    const id = window.setInterval(() => void refreshAccount(), POLL_MS);
-    return () => window.clearInterval(id);
-  }, [refreshAccount]);
+  useVisiblePoll(() => void refreshAccount(), POLL_MS);
 
   // While a link is in flight the ceremony is happening in the user's browser,
   // so this screen has no way to know it finished except by asking.
@@ -153,6 +156,7 @@ export default function ConnectionsPanel() {
 
   const cancelLink = async () => {
     setAccountError(null);
+    accountAsk.current++;
     try {
       const next = await linkApi.cancel();
       setAccount(next);
@@ -171,6 +175,7 @@ export default function ConnectionsPanel() {
     )
       return;
     setAccountError(null);
+    accountAsk.current++;
     try {
       const next = await linkApi.unlink();
       setAccount(next);
@@ -198,6 +203,7 @@ export default function ConnectionsPanel() {
   const removeCopies = async () => {
     setAccountError(null);
     setRemovingCopies(true);
+    accountAsk.current++;
     try {
       const next = await linkApi.removeCopies();
       setAccount(next);
@@ -216,7 +222,9 @@ export default function ConnectionsPanel() {
 
   const saveRelay = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (relayBusy) return;
     setRelayError(null);
+    setRelayBusy(true);
     try {
       const next = await companion.setRelay({
         baseUrl: relayForm.baseUrl.trim(),
@@ -231,6 +239,8 @@ export default function ConnectionsPanel() {
       toast.push({ kind: 'success', title: 'Companion relay saved' });
     } catch (err) {
       setRelayError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRelayBusy(false);
     }
   };
 
@@ -242,6 +252,7 @@ export default function ConnectionsPanel() {
     )
       return;
     setRelayError(null);
+    setRelayBusy(true);
     try {
       const next = await companion.clearRelay();
       setRelay(next);
@@ -249,6 +260,8 @@ export default function ConnectionsPanel() {
       toast.push({ kind: 'success', title: 'Companion relay disconnected' });
     } catch (err) {
       setRelayError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRelayBusy(false);
     }
   };
 
@@ -310,20 +323,19 @@ export default function ConnectionsPanel() {
           </div>
           {pending.map((req) => (
             <div key={req.pairingId} className="service-card service-card-starting">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <div className="card-head">
                 <Link2 size={15} aria-hidden />
-                <strong style={{ fontSize: 15 }}>{req.label ?? req.product} wants to connect</strong>
+                <strong className="card-title">{req.label ?? req.product} wants to connect</strong>
               </div>
-              <p style={{ fontSize: 12.5, opacity: 0.75, margin: '6px 0 0' }}>
+              <p className="card-desc card-address">
                 <b>{req.product}</b>
                 {req.origin ? ` · ${req.origin}` : ''} — it will be able to run flows and call
                 plugins through OAIY Desktop.
               </p>
-              <p style={{ fontSize: 12.5, margin: '6px 0 0' }}>
-                Only approve if this code matches what the app is showing:{' '}
-                <code style={{ fontWeight: 650, letterSpacing: '0.08em' }}>{req.code}</code>
+              <p className="card-desc pairing-code">
+                Only approve if this code matches what the app is showing: <code>{req.code}</code>
               </p>
-              <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+              <div className="card-actions">
                 <button
                   className="btn btn-primary"
                   disabled={busy.has(req.pairingId)}
@@ -647,7 +659,7 @@ export default function ConnectionsPanel() {
             <div className="form-actions">
               <button
                 type="submit"
-                className="btn btn-secondary"
+                className="btn btn-primary"
                 disabled={
                   linking ||
                   !accountForm.connectorId ||
@@ -689,7 +701,7 @@ export default function ConnectionsPanel() {
                   <code className="pairing-origin">no credential — reconnect</code>
                 )}
               </span>
-              <button className="btn-tiny btn-danger" onClick={() => void disconnectRelay()}>
+              <button className="btn-tiny btn-danger" disabled={relayBusy} onClick={() => void disconnectRelay()}>
                 Disconnect
               </button>
             </li>
@@ -733,8 +745,8 @@ export default function ConnectionsPanel() {
           <div className="form-actions">
             <button
               type="submit"
-              className="btn btn-secondary"
-              disabled={!relayForm.baseUrl.trim() || !relayForm.token}
+              className="btn btn-primary"
+              disabled={!relayForm.baseUrl.trim() || !relayForm.token || relayBusy}
             >
               {relay?.configured ? 'Replace relay' : 'Connect relay'}
             </button>

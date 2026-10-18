@@ -204,6 +204,11 @@ export default function AiProvidersPanel() {
       });
       return;
     }
+    // (not before the list is known: an add then could replace a provider of the same id unseen)
+    if (!editingId && providers === null) {
+      toast.push({ kind: 'error', title: 'The providers are still loading', body: 'Try again in a moment.' });
+      return;
+    }
     if (!editingId && providers?.some((p) => p.id === id)) {
       toast.push({
         kind: 'error',
@@ -215,16 +220,19 @@ export default function AiProvidersPanel() {
 
     setSaving(true);
     let created = false;
+    // What the form does not edit is taken from the provider as it is now: Disable pressed on its card while the
+    // form was open stays done.
+    const now = editingId ? providers?.find((p) => p.id === editingId) : undefined;
     try {
       await aiProviders.upsert({
         id,
         name,
-        category: form.category,
+        category: now ? (now.category ?? undefined) : form.category,
         protocol: form.protocol,
         baseUrl,
         model: form.model.trim() || undefined,
-        capabilities: form.capabilities,
-        enabled: form.enabled,
+        capabilities: now ? now.capabilities : form.capabilities,
+        enabled: now ? now.enabled : form.enabled,
         allowLocal: form.allowLocal,
       });
       created = true;
@@ -293,7 +301,15 @@ export default function AiProvidersPanel() {
       {loadError && (
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>Couldn't reach the AI gateway: {loadError}</span>
-          <button className="banner-dismiss" onClick={() => setLoadError(null)} aria-label="Dismiss">
+          {/* (with nothing loaded yet, dismissing asks again: else the page would wait on "Loading providers…" for good) */}
+          <button
+            className="banner-dismiss"
+            onClick={() => {
+              setLoadError(null);
+              if (providers === null) void refresh();
+            }}
+            aria-label="Dismiss"
+          >
             ×
           </button>
         </div>
@@ -325,7 +341,7 @@ export default function AiProvidersPanel() {
             <div className="section-title-row">
               <h3 className="section-title">{editingId ? `Edit ${editingId}` : 'Add a provider'}</h3>
               <button type="button" className="btn-tiny" onClick={resetForm}>
-                cancel
+                Cancel
               </button>
             </div>
 
@@ -446,10 +462,10 @@ export default function AiProvidersPanel() {
         <div className="empty-state">Loading providers…</div>
       ) : providers.length === 0 ? (
         <div className="empty-state">
-          <Sparkles size={22} style={{ opacity: 0.5 }} />
+          <Sparkles size={22} aria-hidden />
           <p>No AI providers configured.</p>
-          <p style={{ fontSize: 13, opacity: 0.7 }}>
-            Use <strong>+ Add provider</strong> above to give your flows a cloud (or local) chat
+          <p>
+            Use <strong>Add provider</strong> above to give your flows a cloud (or local) chat
             model. The key stays on this device — flows reach the provider through OAIY, never with
             the key in the browser.
           </p>

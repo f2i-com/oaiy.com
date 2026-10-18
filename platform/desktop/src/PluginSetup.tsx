@@ -143,7 +143,10 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
     if (loaded && currentId === null && steps.length)
       setCurrentId(initialStep && steps.some((s) => s.step.id === initialStep) ? initialStep : steps[firstOpenStep(steps)].step.id);
   }, [loaded, currentId, steps, initialStep]);
-  const index = Math.max(0, steps.findIndex((s) => s.step.id === currentId));
+  // (a step it was on that went, hidden by its `when`, is not a reason to go back to the first: the first open one is
+  // shown, and the step again if it comes back)
+  const found = steps.findIndex((s) => s.step.id === currentId);
+  const index = found >= 0 ? found : currentId !== null && steps.length ? firstOpenStep(steps) : 0;
   const current: PluginStep | undefined = steps[index];
 
   const runCheck = useCallback(
@@ -391,12 +394,15 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
     try {
       await mark('permissions');
       await loadDetail();
-      next();
     } catch (e) {
       setStepError(errorText(e));
-    } finally {
       setBusy(false);
+      return;
     }
+    setBusy(false);
+    // (on the last step Finish is waited for, its own busy state kept while it goes: not freed under it for a second press)
+    if (isLast) await finish();
+    else next();
   };
 
   const footer = (

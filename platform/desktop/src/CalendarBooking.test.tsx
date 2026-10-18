@@ -119,6 +119,19 @@ describe('the free-time picker', () => {
     expect(onChip()).toBe('2 pm');
   });
 
+  it('keeps the time chosen while another week is looked at', async () => {
+    const onPick = vi.fn();
+    await act(async () => root.render(<Picker date={day(0)} wanted="09:30" onPick={onPick} />));
+    await settle();
+    // The week after has its own free times; the day chosen is not in it.
+    free.mockResolvedValue({ minutes: 60, days: Array.from({ length: 7 }, (_, i) => ({ date: day(7 + i), times: ['10:00'] })) });
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="The week after"]')!.click());
+    await settle();
+    expect(onPick).not.toHaveBeenCalled();
+    expect(host.textContent).toContain('Pick a day above to see its free times.');
+    expect(host.textContent).not.toContain('Nothing free that day');
+  });
+
   it('says when a day has nothing free, and offers another time', async () => {
     const onPick = vi.fn();
     await act(async () => root.render(<Picker date={day(2)} onPick={onPick} />));

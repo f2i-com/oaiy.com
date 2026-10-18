@@ -39,10 +39,15 @@ export default function HoursPanel({ onOpenCalendar }: { onOpenCalendar?: () => 
   const toast = useToast();
   const [settings, setSettings] = useState<CalendarSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // (each save counted: a reading asked before one, landing after it, says the hours as they were and would put them
+  // back on the page)
+  const saves = useRef(0);
   const load = useCallback(async () => {
+    const asked = saves.current;
     try {
       const today = ymd(new Date());
       const got = await calendar.get(today, today);
+      if (asked !== saves.current) return;
       setSettings(got.settings);
       setError(null);
     } catch (e) {
@@ -59,6 +64,7 @@ export default function HoursPanel({ onOpenCalendar }: { onOpenCalendar?: () => 
         <SettingsForm
           settings={settings}
           onSaved={(s) => {
+            saves.current += 1;
             setSettings(s);
             toast.push({ kind: 'success', title: 'Saved', body: 'The receptionist offers these hours and services from now on.' });
           }}
@@ -153,7 +159,9 @@ export function SettingsForm({
     };
     setS((x) => ({ ...x, services: swap(x.services) }));
     setKeys(swap);
-    requestAnimationFrame(() => root.current?.querySelector<HTMLButtonElement>(`[data-svc="${keys[i]}"] .${by < 0 ? 'svc-up' : 'svc-down'}`)?.focus());
+    // (the arrow the same way, unless the service is now at that end and its arrow is off: then the other one)
+    const arrow = j === 0 ? 'svc-down' : j === s.services.length - 1 ? 'svc-up' : by < 0 ? 'svc-up' : 'svc-down';
+    requestAnimationFrame(() => root.current?.querySelector<HTMLButtonElement>(`[data-svc="${keys[i]}"] .${arrow}`)?.focus());
   };
   const removeService = (i: number) => {
     setRemoved({ svc: s.services[i], key: keys[i], index: i });

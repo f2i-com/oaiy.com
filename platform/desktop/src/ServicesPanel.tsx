@@ -172,8 +172,11 @@ export default function ServicesPanel() {
       const a = document.createElement('a');
       a.href = url;
       a.download = `${id}.oaiy-service.json`;
+      // (in the page and its URL kept a while, as Contacts' export does: a webview can start the download only after the click returns)
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
       toast.push({
         kind: 'success',
         title: `Exported "${name}"`,
@@ -201,7 +204,7 @@ export default function ServicesPanel() {
     <div className="panel">
       {error && (
         <div className="banner banner-err">
-          Couldn't reach OAIY API: {error}
+          Couldn't reach OAIY: {error}
         </div>
       )}
       {actionError && (
@@ -220,9 +223,10 @@ export default function ServicesPanel() {
       {snapshot && (
         <div className="datadir-note datadir-row">
           <span>
-            Services live in <code>{snapshot.dataDir}</code>. Drop a package <code>*.json</code> into{' '}
-            <code>templates/</code>, or use <strong>Import package</strong> at the end of the page;{' '}
-            <strong>Export</strong> makes one of any service.
+            Services live in <code className="path-code">{snapshot.dataDir}</code>
+            <br />
+            Drop a package <code>*.json</code> into <code>templates/</code>, or use <strong>Import package</strong> at the end of
+            the page; <strong>Export</strong> makes one of any service.
           </span>
           <button
             className="btn-tiny"
@@ -366,9 +370,12 @@ function AddServiceForm({ onCancel, onSaved, onError }: AddFormProps) {
   const [argsText, setArgsText] = useState('');
   const [port, setPort] = useState(8000);
   const [healthUrl, setHealthUrl] = useState('');
+  // (one add at a time: a second press while the first is on its way would add it twice, or fail on the id)
+  const [saving, setSaving] = useState(false);
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     const template: ServiceTemplateInput = {
       id: id.trim().toLowerCase(),
       name: name.trim() || id.trim(),
@@ -387,11 +394,14 @@ function AddServiceForm({ onCancel, onSaved, onError }: AddFormProps) {
         ? { url: healthUrl.trim(), timeoutSecs: 10 }
         : undefined,
     };
+    setSaving(true);
     try {
       await services.add(template);
       onSaved();
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -400,7 +410,7 @@ function AddServiceForm({ onCancel, onSaved, onError }: AddFormProps) {
       <div className="section-title-row">
         <h3 className="section-title">Add custom service</h3>
         <button type="button" className="btn-tiny" onClick={onCancel}>
-          cancel
+          Cancel
         </button>
       </div>
       <div className="form-row-pair">
@@ -486,8 +496,8 @@ function AddServiceForm({ onCancel, onSaved, onError }: AddFormProps) {
         />
       </label>
       <div className="form-actions">
-        <button type="submit" className="btn btn-primary" disabled={!id || !command}>
-          Add service
+        <button type="submit" className="btn btn-primary" disabled={!id || !command || saving}>
+          {saving ? 'Adding…' : 'Add service'}
         </button>
         <span className="form-hint">
           Saves to <code className="path-code-small">templates/&lt;id&gt;.json</code>
@@ -831,7 +841,7 @@ function ServiceCard({
           <button
             onClick={onDelete}
             disabled={
-              pending || service.status === 'running' || service.status === 'installing'
+              pending || service.status === 'running' || service.status === 'installing' || service.status === 'starting'
             }
             className="btn btn-ghost btn-danger"
             title={`Remove ${service.name} from Services, its template too (Uninstall removes only its installed files). Stop it first.`}

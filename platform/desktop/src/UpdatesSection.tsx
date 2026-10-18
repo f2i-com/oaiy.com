@@ -179,6 +179,12 @@ export default function UpdatesSection() {
         </div>
       )}
 
+      {/* (the status above is the last one read: when it can no longer be read, said so, not shown as current) */}
+      {readError && (
+        <div className="banner banner-err" role="status">
+          Could not read the update status just now: {readError}
+        </div>
+      )}
       {/* (what failed is said in the line above; this says why) */}
       {shownError && (
         <div className="banner banner-err" role="alert">
@@ -192,7 +198,7 @@ export default function UpdatesSection() {
           type="button"
           className="btn btn-secondary"
           disabled={busy !== null || moving || s.nextCheckIn != null}
-          title={s.nextCheckIn != null ? `OAIY checked a moment ago. You can check again in ${s.nextCheckIn} seconds.` : undefined}
+          title={s.nextCheckIn != null ? `OAIY checked a moment ago. You can check again in ${s.nextCheckIn} second${s.nextCheckIn === 1 ? '' : 's'}.` : undefined}
           onClick={() => void run('check', () => updates.check())}
         >
           <RefreshCw size={14} /> Check for updates

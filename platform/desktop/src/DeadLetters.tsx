@@ -25,8 +25,18 @@ function when(ms: number): string {
 
 export default function DeadLetters() {
   const [items, setItems] = useState<DeadLetter[] | null>(null);
-  /** What is being asked about which entry: Redrive says "Redriving…" for a redrive alone. */
-  const [busy, setBusy] = useState<{ id: string; action: 'redrive' | 'dismiss' } | null>(null);
+  /** How many there are in all: the list holds the newest hundred. */
+  const [total, setTotal] = useState(0);
+  /** What is being asked about each entry, by its id: Redrive says "Redriving…" for a redrive alone. One entry's
+   *  answer frees that entry only, so another's slow redrive cannot be pressed again meanwhile. */
+  const [busy, setBusy] = useState<Record<string, 'redrive' | 'dismiss'>>({});
+  const mark = (id: string, action: 'redrive' | 'dismiss' | null) =>
+    setBusy((prev) => {
+      const next = { ...prev };
+      if (action) next[id] = action;
+      else delete next[id];
+      return next;
+    });
   // Section-level, not per row: a successful redrive REMOVES its row, so a note
   // pinned to it would vanish with the thing it was confirming.
   const [note, setNote] = useState<string | null>(null);
@@ -35,6 +45,7 @@ export default function DeadLetters() {
     try {
       const r = await bridge.deadLetters();
       setItems(r.deadLetters);
+      setTotal(r.total ?? r.deadLetters.length);
     } catch {
       // The panel above already surfaces a dead bridge; don't say it twice.
     }
@@ -44,7 +55,7 @@ export default function DeadLetters() {
   useVisiblePoll(() => void refresh(), POLL_MS);
 
   const redrive = async (item: DeadLetter) => {
-    setBusy({ id: item.id, action: 'redrive' });
+    mark(item.id, 'redrive');
     setNote(null);
     try {
       const r = await bridge.redrive(item.id);
@@ -61,13 +72,13 @@ export default function DeadLetters() {
     } catch (e) {
       setNote(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(null);
+      mark(item.id, null);
     }
   };
 
   const dismiss = async (item: DeadLetter) => {
     if (!window.confirm(`Dismiss ${item.event}? It is taken off this list and never run.`)) return;
-    setBusy({ id: item.id, action: 'dismiss' });
+    mark(item.id, 'dismiss');
     setNote(null);
     try {
       await bridge.dismissDeadLetter(item.id);
@@ -75,7 +86,7 @@ export default function DeadLetters() {
     } catch (e) {
       setNote(`${item.event} could not be dismissed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setBusy(null);
+      mark(item.id, null);
     }
   };
 
@@ -99,7 +110,7 @@ export default function DeadLetters() {
     <section className="service-section">
       <div className="section-title-row">
         <h3 className="section-title">
-          <Inbox size={14} /> Events that produced no work ({items.length})
+          <Inbox size={14} /> Events that produced no work ({total > items.length ? `${items.length} of ${total}` : items.length})
         </h3>
       </div>
       <p className="form-hint">
@@ -113,7 +124,7 @@ export default function DeadLetters() {
           <li key={d.id} className="run-row">
             <div className="run-head">
               <span className="badge badge-err">
-                {d.reason.kind === 'shed' ? 'dropped' : d.reason.kind === 'not_delivered' ? 'not sent to FormLogic' : 'not run'}
+                {d.reason.kind === 'shed' ? 'dropped' : d.reason.kind === 'not_delivered' ? 'not sent to the linked account' : 'not run'}
               </span>
               <strong className="run-flow">{d.event}</strong>
               <span className="run-meta">
@@ -124,9 +135,11 @@ export default function DeadLetters() {
             </div>
 
             <p className="run-error">
-              {d.reason.kind === 'shed'
-                ? 'The host event queue was full, so this was dropped before dispatch.'
-                : (d.reason.detail ?? 'No binding reserved a run.')}
+              <span className="run-error-text">
+                {d.reason.kind === 'shed'
+                  ? 'The host event queue was full, so this was dropped before dispatch.'
+                  : (d.reason.detail ?? 'No binding reserved a run.')}
+              </span>
             </p>
 
             {d.lastOutcome && (
@@ -134,11 +147,11 @@ export default function DeadLetters() {
             )}
 
             <div className="form-actions">
-              <button className="btn-tiny" disabled={busy?.id === d.id} onClick={() => void redrive(d)}>
-                <RotateCw size={13} /> {busy?.id === d.id && busy.action === 'redrive' ? 'Redriving…' : 'Redrive'}
+              <button className="btn-tiny" disabled={!!busy[d.id]} onClick={() => void redrive(d)}>
+                <RotateCw size={13} /> {busy[d.id] === 'redrive' ? 'Redriving…' : 'Redrive'}
               </button>
-              <button className="btn-tiny" disabled={busy?.id === d.id} onClick={() => void dismiss(d)}>
-                <X size={13} /> {busy?.id === d.id && busy.action === 'dismiss' ? 'Dismissing…' : 'Dismiss'}
+              <button className="btn-tiny" disabled={!!busy[d.id]} onClick={() => void dismiss(d)}>
+                <X size={13} /> {busy[d.id] === 'dismiss' ? 'Dismissing…' : 'Dismiss'}
               </button>
             </div>
           </li>

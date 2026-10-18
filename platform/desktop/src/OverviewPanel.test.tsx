@@ -436,6 +436,12 @@ describe('describeLastBackup', () => {
     expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(0) }), NOW)).toEqual({ text: 'Last backup: today', nudge: false, kind: 'recent' });
     expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(1) }), NOW).text).toBe('Last backup: yesterday');
     expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(3) }), NOW)).toEqual({ text: 'Last backup: 3 days ago', nudge: false, kind: 'recent' });
+    // By the calendar here, not by 24 hours: last night at 11 is "yesterday" at 9 the next morning, and a backup at
+    // 1 am is "today" at 11 pm.
+    const morning = new Date(2026, 8, 30, 9, 0);
+    expect(describeLastBackup(backupStatus({ lastBackupAt: new Date(2026, 8, 29, 23, 0).toISOString() }), morning).text).toBe('Last backup: yesterday');
+    expect(describeLastBackup(backupStatus({ lastBackupAt: new Date(2026, 8, 30, 1, 0).toISOString() }), new Date(2026, 8, 30, 23, 0)).text).toBe('Last backup: today');
+    expect(describeLastBackup(backupStatus({ lastBackupAt: new Date(2026, 8, 28, 10, 0).toISOString() }), morning).text).toBe('Last backup: 2 days ago');
   });
 
   it('is not a nudge at 29 or 30 days, and is one from 31', () => {

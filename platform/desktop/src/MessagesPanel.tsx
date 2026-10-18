@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Inbox, Phone, Search, Trash2, Undo2, UserRound, X } from 'lucide-react';
+import { Bot, Check, Inbox, Phone, Search, Trash2, Undo2, UserRound, X } from 'lucide-react';
 import { isNotFound, messages as api, type CallerMessage } from './api';
 import { numberKey, readableNumber, saidWhen } from './contactsModel';
 import { useToast } from './Toasts';
@@ -61,10 +61,15 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
   const [confirming, setConfirming] = useState<string | null>(null);
   /** The messages a change is on its way for. */
   const asking = useRef(new Set<string>());
+  // (each change counted: a reading asked before one lands says what was there before it, and would undo it on screen,
+  // a Handled message coming back as new)
+  const writes = useRef(0);
 
   const load = useCallback(async () => {
+    const asked = writes.current;
     try {
       const r = await api.list();
+      if (asked !== writes.current || asking.current.size > 0) return;
       setList(r.messages ?? []);
       setNotice(r.notice ?? null);
       setError(null);
@@ -82,6 +87,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
       // The message waits for its own answer (and only its own: another message's answer coming back first does not free it), so that no second
       // change is asked for it while one is on its way: a "seen" that lands after a "handled" makes the message new again.
       asking.current.add(id);
+      writes.current += 1;
       setBusyIds((prev) => new Set(prev).add(id));
       try {
         const next = await api.mark(id, state);
@@ -101,6 +107,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
   );
 
   const remove = async (id: string) => {
+    writes.current += 1;
     setBusyIds((prev) => new Set(prev).add(id));
     try {
       await api.remove(id);
@@ -192,9 +199,13 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
           <p>
             {list.length === 0
               ? 'No messages yet. When the receptionist cannot put someone through to you, it asks what they want you to know and keeps it here.'
-              : filter === 'open' && !q.trim()
-                ? 'Nothing waiting for you.'
-                : 'No message matches.'}
+              : q.trim()
+                ? 'No message matches.'
+                : filter === 'open'
+                  ? 'Nothing waiting for you.'
+                  : filter === 'handled'
+                    ? 'Nothing handled yet.'
+                    : 'No messages.'}
           </p>
         </div>
       )}
@@ -231,7 +242,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
                   )}
                   {onOpenAgent && (
                     <button type="button" className="btn-tiny" onClick={onOpenAgent} title="The Agent, where their calls and texts are">
-                      Agent
+                      <Bot size={12} /> Agent
                     </button>
                   )}
                   {m.state === 'handled' ? (
@@ -248,12 +259,12 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
                       <button type="button" className="btn-tiny btn-danger" disabled={busyIds.has(m.id)} onClick={() => void remove(m.id)}>
                         <Trash2 size={12} /> Delete it
                       </button>
-                      <button type="button" className="btn-tiny" onClick={() => setConfirming(null)} aria-label="Keep it">
+                      <button type="button" className="btn-tiny" onClick={() => setConfirming(null)} aria-label="Keep it" title="Keep it">
                         <X size={12} />
                       </button>
                     </>
                   ) : (
-                    <button type="button" className="btn-tiny" onClick={() => setConfirming(m.id)} aria-label={`Delete the message from ${whoOf(m)}`}>
+                    <button type="button" className="btn-tiny" onClick={() => setConfirming(m.id)} aria-label={`Delete the message from ${whoOf(m)}`} title="Delete">
                       <Trash2 size={12} />
                     </button>
                   )}

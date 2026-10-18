@@ -88,7 +88,8 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
   const [listError, setListError] = useState<string | null>(null);
   const usable = useMemo(() => agentCapable(providers ?? []), [providers]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [baseUrl, setBaseUrl] = useState('');
+  /** The address typed for a preset; `null` while it is the preset's own (an emptied field stays empty). */
+  const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [key, setKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -151,14 +152,14 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
     setError(null);
     setModels(null);
     const p = id.startsWith(PRESET) ? PROVIDER_PRESETS.find((x) => `${PRESET}${x.id}` === id) : null;
-    setBaseUrl(p?.baseUrl ?? '');
+    setBaseUrl(p ? null : '');
     setKey('');
   };
 
   /** Save the preset as a provider (with its key), then ask it for its models. */
   const connect = async () => {
     if (!preset) return;
-    const url = (baseUrl || preset.baseUrl).trim();
+    const url = (baseUrl ?? preset.baseUrl).trim();
     if (!url) {
       setError('Enter the server’s address (it ends in /v1).');
       return;
@@ -238,7 +239,7 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
           <small className="form-hint">{preset.help}</small>
           <label className="form-row">
             <span>Address</span>
-            <input type="text" aria-label="Address" placeholder="http://localhost:8000/v1" value={baseUrl || preset.baseUrl} disabled={off} onChange={(e) => setBaseUrl(e.target.value)} />
+            <input type="text" aria-label="Address" placeholder="http://localhost:8000/v1" value={baseUrl ?? preset.baseUrl} disabled={off} onChange={(e) => setBaseUrl(e.target.value)} />
           </label>
           {preset.key !== 'none' && (
             <label className="form-row">

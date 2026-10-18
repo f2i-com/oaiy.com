@@ -63,6 +63,12 @@ const POLL_MS = 4000;
 /** How many failed runs the person has seen (opened Run history from here, or dismissed the warning). */
 const FAILED_SEEN = 'oaiy.overview.failedSeen';
 
+/** A reason's first line, at most 200 characters (a panic's text runs on). */
+function firstLine(reason: string): string {
+  const line = reason.split('\n', 1)[0].trim();
+  return line.length > 200 ? `${line.slice(0, 199)}…` : line;
+}
+
 function readFailedSeen(): number {
   try {
     const n = Number(localStorage.getItem(FAILED_SEEN) ?? 0);
@@ -268,7 +274,11 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
       {unavailable.length > 0 && (
         <div className="banner banner-err banner-dismissable" role="status">
           <span>Couldn't refresh {unavailable.join(', ')}. Showing last known values where available.</span>
-          <button className="btn" onClick={() => void refresh()}>Refresh status</button>
+          <span className="banner-actions">
+            <button className="btn-tiny" onClick={() => void refresh()}>
+              <RotateCcw size={12} /> Refresh status
+            </button>
+          </span>
         </div>
       )}
       <UpdateBanner onOpenSettings={() => onNavigate('settings')} />
@@ -432,13 +442,25 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>
             <TriangleAlert size={13} />{' '}
-            {crashedPlug.length === 1
-              ? `${plugName(crashedPlug[0])} has ${crashedPlug[0].state === 'crashed' ? 'stopped' : 'a problem'}${crashedPlug[0].reason ? `: ${crashedPlug[0].reason}` : '.'}`
-              : `${crashedPlug.length} plugins need attention: ${crashedPlug.map(plugName).join(', ')}.`}
+            {crashedPlug.length === 1 ? (
+              <>
+                {`${plugName(crashedPlug[0])} has ${crashedPlug[0].state === 'crashed' ? 'stopped' : 'a problem'}.`}
+                {crashedPlug[0].reason && (
+                  // What the plugin said, in its own words: under the plain line, its first line only (all of it on hover).
+                  <span className="banner-detail" title={crashedPlug[0].reason}>
+                    {firstLine(crashedPlug[0].reason)}
+                  </span>
+                )}
+              </>
+            ) : (
+              `${crashedPlug.length} plugins need attention: ${crashedPlug.map(plugName).join(', ')}.`
+            )}
           </span>
-          <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
-            <Plug size={13} /> Open Plugins
-          </button>
+          <span className="banner-actions">
+            <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
+              <Plug size={13} /> Open Plugins
+            </button>
+          </span>
         </div>
       )}
 
@@ -471,15 +493,19 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           {net?.enabled && (
             <button className="overview-tile" onClick={() => onNavigate('network')}>
               <Network size={16} aria-hidden />
-              <strong>{net.lends && net.waiting > 0 ? `${net.waiting} asking` : net.uses ? `${net.online ?? 0} online` : (net.usedBy ?? net.paired)}</strong>
+              <strong>{net.lends && net.waiting > 0 ? `${net.waiting} asking` : net.uses ? `${net.online ?? 0} online` : net.lends ? (net.usedBy ?? net.paired) : net.paired}</strong>
               <small>
                 {net.lends && net.waiting > 0
                   ? 'To pair with this computer'
                   : net.uses
                     ? `Of ${net.using ?? net.paired} paired computer${(net.using ?? net.paired) === 1 ? '' : 's'}`
-                    : (net.usedBy ?? net.paired) === 1
-                      ? 'Computer using this one'
-                      : 'Computers using this one'}
+                    : !net.lends
+                      ? net.paired === 1
+                        ? 'Paired computer'
+                        : 'Paired computers'
+                      : (net.usedBy ?? net.paired) === 1
+                        ? 'Computer using this one'
+                        : 'Computers using this one'}
               </small>
             </button>
           )}
@@ -495,7 +521,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             <h3 className="section-title">Next steps</h3>
           </div>
           {runtime && !runtime.ready && (
-            <div className="datadir-note">
+            <div className="datadir-note datadir-row">
               <span>
                 <TriangleAlert size={13} /> Flows cannot run on this machine —{' '}
                 {runtime.flowRuntime.detail ?? 'the OAIY runtime is unavailable.'}
@@ -506,7 +532,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             </div>
           )}
           {provs !== null && provs.length === 0 && !codexConnected && (
-            <div className="datadir-note">
+            <div className="datadir-note datadir-row">
               <span>No AI provider configured — flows have no chat model to call.</span>
               <button className="btn-tiny" onClick={() => onNavigate('providers')}>
                 <Sparkles size={13} /> Add a provider
@@ -514,7 +540,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             </div>
           )}
           {plug !== null && plug.length === 0 && (
-            <div className="datadir-note">
+            <div className="datadir-note datadir-row">
               <span>No plugins installed — connectors and device events come from plugins.</span>
               <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
                 <Plug size={13} /> Open Plugins
@@ -522,7 +548,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             </div>
           )}
           {plug !== null && plug.length > 0 && runningPlug === 0 && (
-            <div className="datadir-note">
+            <div className="datadir-note datadir-row">
               <span>No plugin is running — their connectors are unavailable to flows.</span>
               <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
                 <Plug size={13} /> Start one
@@ -530,7 +556,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             </div>
           )}
           {svc !== null && svc.length > 0 && runningSvc === 0 && (
-            <div className="datadir-note">
+            <div className="datadir-note datadir-row">
               <span>No local service is running — local models are offline.</span>
               <button className="btn-tiny" onClick={() => onNavigate('services')}>
                 <Server size={13} /> Open Services
@@ -540,7 +566,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           {provs !== null &&
             provs.length > 0 &&
             readyProv === 0 && (
-              <div className="datadir-note">
+              <div className="datadir-note datadir-row">
                 <span>Every AI provider is disabled or missing a key.</span>
                 <button className="btn-tiny" onClick={() => onNavigate('providers')}>
                   <Sparkles size={13} /> Fix providers
@@ -555,7 +581,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             readyProv > 0 &&
             crashedPlug.length === 0 &&
             (plug.length === 0 || runningPlug > 0) && (
-              <div className="datadir-note">
+              <div className="datadir-note datadir-row">
                 <span>
                   <CircleDot size={13} /> Ready — {readyProv} provider{readyProv === 1 ? '' : 's'} and{' '}
                   {runningPlug} plugin{runningPlug === 1 ? '' : 's'} available to your flows.
@@ -582,11 +608,9 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
       {/* Only while nothing at all is installed: a service counts too (its tile above already shows it). */}
       {plug !== null && plug.length === 0 && svc !== null && svc.length === 0 && cards.length === 0 && (
         <div className="empty-state">
-          <Package size={22} style={{ opacity: 0.5 }} />
+          <Package size={22} aria-hidden />
           <p>Nothing installed yet.</p>
-          <p style={{ fontSize: 13, opacity: 0.7 }}>
-            Install a plugin, such as the phone, or a local service, and what it brings shows up here.
-          </p>
+          <p>Install a plugin, such as the phone, or a local service, and what it brings shows up here.</p>
         </div>
       )}
     </div>

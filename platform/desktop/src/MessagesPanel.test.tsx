@@ -146,6 +146,28 @@ describe('Messages', () => {
     expect(ids().sort()).toEqual(['msg_a', 'msg_b', 'msg_c']);
   });
 
+  it('keeps a message handled when a reading asked before it lands after it', async () => {
+    await mount();
+    // A reading on its way (the ten-second poll) that answers with the list as it was before Handled was pressed.
+    const before = stored;
+    let answer!: () => void;
+    api.list.mockImplementationOnce(() => new Promise((r) => (answer = () => r({ messages: before, total: before.length, unread: 1 }))));
+    await act(async () => vi.advanceTimersByTime(10_100));
+    await click(button('Handled', card('msg_a')));
+    expect(ids()).toEqual(['msg_b']);
+    await act(async () => answer());
+    await settle();
+    expect(ids()).toEqual(['msg_b']);
+  });
+
+  it('says when nothing has been handled yet, rather than that nothing matches', async () => {
+    stored = [message({ id: 'only' })];
+    await mount();
+    await click(button('Handled', host.querySelector('[role=tablist]')!));
+    expect(text()).toContain('Nothing handled yet.');
+    expect(text()).not.toContain('No message matches.');
+  });
+
   it('asks before it deletes a message, and keeps it when the owner changes their mind', async () => {
     await mount();
     await click(button('Delete the message from Sam'));

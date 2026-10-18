@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FolderOpen } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { peek, put } from './useCached';
 import {
@@ -150,7 +151,7 @@ export default function PythonPanel() {
     <div className="panel">
       {error && (
         <div className="banner banner-err">
-          <span>⚠ Couldn't reach the OAIY Desktop: {error}</span>
+          <span>⚠ Couldn't reach OAIY: {error}</span>
         </div>
       )}
       {actionError && (
@@ -176,26 +177,28 @@ export default function PythonPanel() {
             {snapshot.installed ? 'installed' : 'not installed'}
           </span>
         </h3>
-        <div className="datadir-note">
-          Runtime folder: <code className="path-code">{snapshot.runtimeDir}</code>
+        <div className="datadir-note datadir-row">
+          <span>
+            Runtime folder: <code className="path-code">{snapshot.runtimeDir}</code>
+            {snapshot.interpreterPath && (
+              <>
+                <br />
+                Interpreter: <code className="path-code">{snapshot.interpreterPath}</code>
+              </>
+            )}
+          </span>
           {snapshot.installed && (
             <button
               className="btn-tiny"
+              title="Open in file explorer"
               onClick={() =>
                 openInExplorer(snapshot.runtimeDir).catch((e) =>
                   setActionError(e instanceof Error ? e.message : String(e)),
                 )
               }
             >
-              open
+              <FolderOpen size={13} /> Open
             </button>
-          )}
-          {snapshot.interpreterPath && (
-            <>
-              <br />
-              Interpreter:{' '}
-              <code className="path-code">{snapshot.interpreterPath}</code>
-            </>
           )}
         </div>
         {!snapshot.installed && (
@@ -307,7 +310,7 @@ export default function PythonPanel() {
                 }
                 title="Open venv folder"
               >
-                Reveal
+                <FolderOpen size={13} /> Open
               </button>
               <button
                 className="btn btn-ghost btn-danger"
@@ -333,9 +336,18 @@ export default function PythonPanel() {
         <section className="model-section">
           <div className="section-title-row">
             <h3 className="section-title">
+              {/* (the desktop keeps the last job once it is over: said as what happened, not as still going) */}
               {snapshot.currentJob.kind === 'installruntime'
-                ? 'Installing Python runtime'
-                : `Setting up venv: ${snapshot.currentJob.target}`}
+                ? !snapshot.currentJob.finishedAt
+                  ? 'Installing Python runtime'
+                  : snapshot.currentJob.error
+                    ? 'Python runtime: install failed'
+                    : 'Python runtime installed'
+                : !snapshot.currentJob.finishedAt
+                  ? `Setting up venv: ${snapshot.currentJob.target}`
+                  : snapshot.currentJob.error
+                    ? `Venv ${snapshot.currentJob.target}: setup failed`
+                    : `Venv ${snapshot.currentJob.target} set up`}
             </h3>
             <button
               className="btn btn-ghost"

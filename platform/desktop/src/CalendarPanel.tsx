@@ -307,7 +307,8 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
               return `${a ? `${a.service || 'Appointment'}, ${sayWhen(a.start)}` : 'one'} (${p.message})`;
             })
             .join('; ')}
-          . It is kept here, and sent again once it is changed.
+          {sync.problems!.length > 3 ? `; and ${sync.problems!.length - 3} more` : ''}.{' '}
+          {sync.problems!.length === 1 ? 'It is kept here, and sent again once it is changed.' : 'They are kept here, and each is sent again once it is changed.'}
         </div>
       )}
 
@@ -563,11 +564,13 @@ function RequestRow({
   onOpen: (a: Appointment, edit?: boolean) => void;
 }) {
   const [textThem, setTextThem] = useState(textByDefault && !!a.phone);
+  // (the phone gone, nothing is texted: the tick is not even shown then)
+  const texting = canText && textThem;
   const [busy, setBusy] = useState(false);
   const go = async (status: AppointmentStatus) => {
     setBusy(true);
     try {
-      await onDecide(a, status, status === 'confirmed' && textThem);
+      await onDecide(a, status, status === 'confirmed' && texting);
     } finally {
       setBusy(false);
     }
@@ -700,7 +703,8 @@ function WeekGrid({
               onMouseMove={(e) => setGhost(onAppt(e) ? null : { date, min: minuteAt(e) })}
               onMouseLeave={() => setGhost(null)}
               onClick={(e) => {
-                if (onAppt(e)) return;
+                // (a past day offers no time to book, as its column shows: no booking opens for another day)
+                if (onAppt(e) || past) return;
                 onSlot(date, hhmm(minuteAt(e)));
               }}
             >

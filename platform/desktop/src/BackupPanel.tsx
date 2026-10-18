@@ -109,7 +109,9 @@ export function describeLastBackup(status: BackupStatus, now: Date | number = ne
   if (!Number.isFinite(at)) {
     return { text: 'You have not made a backup yet.', nudge: true, kind: 'never' };
   }
-  const days = Math.max(0, Math.floor((new Date(now).getTime() - at) / DAY_MS));
+  // Days as the calendar counts them, here: one made at 23:00 was "yesterday" at 09:00 the next morning, not "today".
+  const midnight = (t: number) => new Date(t).setHours(0, 0, 0, 0);
+  const days = Math.max(0, Math.round((midnight(new Date(now).getTime()) - midnight(at)) / DAY_MS));
   if (days > NUDGE_AFTER_DAYS) {
     return {
       text: `It has been ${spanWords(days)} since your last backup. A backup takes a minute.`,
@@ -582,11 +584,9 @@ export function BackupSection() {
       )}
 
       {/* ---------- make a backup ---------- */}
-      <h4 className="settings-label" style={{ marginTop: 14 }}>
-        Make a backup
-      </h4>
+      <h4 className="settings-label settings-subhead">Make a backup</h4>
       <form
-        className="dl-form"
+        className="dl-form dl-form-flush"
         onSubmit={(e) => {
           e.preventDefault();
           void create();
@@ -685,15 +685,13 @@ export function BackupSection() {
       )}
 
       {/* ---------- restore ---------- */}
-      <h4 className="settings-label" style={{ marginTop: 14 }}>
-        Restore from a backup
-      </h4>
+      <h4 className="settings-label settings-subhead">Restore from a backup</h4>
       <p className="form-hint">
         Only restore a backup you made yourself. First OAIY checks the file and shows what would change; nothing is
         changed until you restart.
       </p>
       <form
-        className="dl-form"
+        className="dl-form dl-form-flush"
         onSubmit={(e) => {
           e.preventDefault();
           void check();

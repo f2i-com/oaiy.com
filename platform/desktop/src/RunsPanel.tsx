@@ -244,32 +244,35 @@ export default function RunsPanel() {
           <h3 className="section-title">
             {filter === 'failures' ? 'Failed runs' : 'All runs'}
           </h3>
-          <div className="seg">
-            <button
-              className={filter === 'failures' ? 'active' : ''}
-              onClick={() => setFilter('failures')}
-            >
-              Failures{failed > 0 ? ` (${failed})` : ''}
+          <div className="run-tools">
+            <div className="seg" role="group" aria-label="Which runs">
+              <button
+                className={filter === 'failures' ? 'active' : ''}
+                aria-pressed={filter === 'failures'}
+                onClick={() => setFilter('failures')}
+              >
+                Failures{failed > 0 ? ` (${failed})` : ''}
+              </button>
+              <button className={filter === 'all' ? 'active' : ''} aria-pressed={filter === 'all'} onClick={() => setFilter('all')}>
+                All{data ? ` (${data.total})` : ''}
+              </button>
+            </div>
+            <button className="btn-tiny" onClick={() => void refresh()} title="Refresh now" aria-label="Refresh now">
+              <RefreshCw size={13} />
             </button>
-            <button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>
-              All{data ? ` (${data.total})` : ''}
+            {/* Disabled while empty rather than hidden: a button that appears and
+                vanishes with the list is harder to find than one that is always
+                in the same place. */}
+            <button
+              className="btn-tiny btn-danger"
+              onClick={() => void clear()}
+              disabled={clearing || !data || data.total === 0}
+              title="Clear finished runs"
+              aria-label="Clear finished runs"
+            >
+              <Trash2 size={13} />
             </button>
           </div>
-          <button className="btn-tiny" onClick={() => void refresh()} title="Refresh now">
-            <RefreshCw size={13} />
-          </button>
-          {/* Disabled while empty rather than hidden: a button that appears and
-              vanishes with the list is harder to find than one that is always
-              in the same place. */}
-          <button
-            className="btn-tiny btn-danger"
-            onClick={() => void clear()}
-            disabled={clearing || !data || data.total === 0}
-            title="Clear finished runs"
-            aria-label="Clear finished runs"
-          >
-            <Trash2 size={13} />
-          </button>
         </div>
 
         {data === null ? (

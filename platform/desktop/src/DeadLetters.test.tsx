@@ -144,6 +144,25 @@ describe('DeadLetters', () => {
     confirm.mockRestore();
   });
 
+  it('keeps an entry waiting on its own redrive while another is dismissed, and counts all of them', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    listMock.mockResolvedValue({ deadLetters: [SHED, GUARDED], total: 140 });
+    let release!: (v: { reserved: boolean; outcomes: string[] }) => void;
+    redriveMock.mockReturnValue(new Promise((r) => (release = r)));
+    await mount();
+    // The newest hundred are listed; the heading says how many there are in all.
+    expect(text()).toContain('Events that produced no work (2 of 140)');
+    const rows = () => [...host.querySelectorAll('.run-row')];
+    const inRow = (i: number, label: string) => [...rows()[i].querySelectorAll('button')].find((b) => b.textContent?.includes(label))!;
+    await click(inRow(0, 'Redrive'));
+    await click(inRow(1, 'Dismiss'));
+    // The second's answer frees the second alone: the first, still being redriven, cannot be pressed again.
+    expect(inRow(0, 'Redriving…').disabled).toBe(true);
+    await act(async () => release({ reserved: true, outcomes: [] }));
+    expect(inRow(0, 'Redrive').disabled).toBe(false);
+    confirm.mockRestore();
+  });
+
   it('says a dismiss that failed, and keeps the last redrive said after its entry, the last, has gone', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     dismissMock.mockRejectedValue(new Error('bridge is down'));

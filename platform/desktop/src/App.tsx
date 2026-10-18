@@ -606,8 +606,13 @@ export default function App() {
   // plugin screen is never left on a guess.
   useEffect(() => {
     if (!view.startsWith('plugin:') || modules === null) return;
-    if (!pluginPageOf(sections, view)) setView('overview');
-  }, [view, modules, sections]);
+    if (pluginPageOf(sections, view)) return;
+    // (gone, not left by the person, as above: asking whether to leave could keep them on a page that is not there)
+    const lost = hasUnsaved();
+    forgetUnsaved();
+    setViewNow('overview');
+    if (lost) toast?.push({ kind: 'info', title: 'That page went', body: `Its plugin was removed or switched off, and ${lost} not saved went with it.` });
+  }, [view, modules, sections]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Mark AFTER render: the first open of a view still animates, a return does not.
   // A plugin screen once opened loses its "New" badge.

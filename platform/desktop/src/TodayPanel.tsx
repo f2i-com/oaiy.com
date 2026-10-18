@@ -34,6 +34,8 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
   const [phoneState, setPhoneState] = useState<{ connected: boolean; onCall: boolean } | null>(null);
   const [model, setModel] = useState<EnginesStatus | null>(null);
   const [upcoming, setUpcoming] = useState<Appointment[] | null>(null);
+  /** The requests waiting to be confirmed: from today on, one earlier today still waiting too (as the sidebar counts them). */
+  const [waiting, setWaiting] = useState<Appointment[] | null>(null);
   const [sync, setSync] = useState<CalendarSync | null>(null);
   const [linked, setLinked] = useState<LinkStatus | null>(null);
   /** The phone and the calendar, while a plugin provides them. */
@@ -57,6 +59,7 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
     if (cal.status === 'fulfilled') {
       const now = `${ymd(new Date())}T${pad(new Date().getHours())}:${pad(new Date().getMinutes())}`;
       setUpcoming(cal.value.appointments.filter((a) => (a.status === 'confirmed' || a.status === 'requested') && a.start >= now));
+      setWaiting(cal.value.appointments.filter((a) => a.status === 'requested'));
     }
     setSync(s.status === 'fulfilled' ? s.value : null);
     setLinked(l.status === 'fulfilled' ? l.value : null);
@@ -71,7 +74,7 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
     return () => window.clearInterval(id);
   }, [refresh]);
 
-  const requests = (upcoming ?? []).filter((a) => a.status === 'requested');
+  const requests = waiting ?? [];
   const next = (upcoming ?? []).find((a) => a.status === 'confirmed') ?? upcoming?.[0];
   const when = next ? sayWhen(next.start) : null;
   const llm = model?.llm;

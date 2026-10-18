@@ -48,11 +48,16 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
   // only way we learn about it is the account appearing.
   useEffect(() => {
     if (!login) return;
+    // (once: a reading slower than the poll could land after the one that said so, and say it again)
+    let done = false;
     const id = window.setInterval(async () => {
       try {
         const s = await codex.status();
+        if (done) return;
         setStatus(s);
         if (s.connected) {
+          done = true;
+          window.clearInterval(id);
           setLogin(null);
           toast.push({ kind: 'success', title: 'ChatGPT connected', body: s.email ?? undefined });
           connectedRef.current?.(s);
@@ -61,7 +66,10 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
         /* keep waiting */
       }
     }, POLL_MS);
-    return () => window.clearInterval(id);
+    return () => {
+      done = true;
+      window.clearInterval(id);
+    };
   }, [login, toast]);
 
   const startLogin = async () => {
@@ -125,8 +133,15 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
           <code>codex</code> CLI on this machine
           {status.detail ? ` — ${status.detail}` : ''}.
         </p>
-        <ol className="setup-wizard-instructions"><li>Follow the official Codex CLI installation guide.</li><li>Restart OAIY if the CLI is not detected, then check again.</li><li>Sign in here. OAIY uses a separate Codex sign-in for this connection.</li></ol>
-        <div className="form-actions"><button className="btn" onClick={() => openExternal('https://developers.openai.com/codex/cli/')}>Codex installation guide</button><button className="btn" onClick={() => void refresh()}>Check again</button></div>
+        <ol className="setup-instructions"><li>Follow the official Codex CLI installation guide.</li><li>Restart OAIY if the CLI is not detected, then check again.</li><li>Sign in here. OAIY uses a separate Codex sign-in for this connection.</li></ol>
+        <div className="form-actions">
+          <button className="btn" onClick={() => openExternal('https://developers.openai.com/codex/cli/')}>
+            Codex installation guide <ExternalLink size={13} />
+          </button>
+          <button className="btn" onClick={() => void refresh()}>
+            Check again
+          </button>
+        </div>
       </section>
     );
   }
@@ -162,7 +177,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
 
       {/* A device-code sign-in: the code must be visible and copyable. */}
       {statusError && <p role="alert" className="form-hint">Could not check Codex. <button className="btn-tiny" onClick={() => void refresh()}>Retry status</button></p>}
-      {!status && !statusError && <p role="status" className="form-hint">Checking Codex availability...</p>}
+      {!status && !statusError && <p role="status" className="form-hint">Checking Codex availability…</p>}
       {login && (
         <div className="datadir-note">
           <span>

@@ -172,7 +172,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
     <div className="panel">
       {error && (
         <div className="banner banner-err">
-          Couldn't reach OAIY API: {error}
+          Couldn't reach OAIY: {error}
         </div>
       )}
       {/* What this page is for, beside the engines' own Get models (which most people want) */}
@@ -264,7 +264,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
             </button>
           </div>
           <p className="form-hint">
-            HuggingFace browser URLs (containing <code>/blob/</code>) are
+            Hugging Face browser URLs (containing <code>/blob/</code>) are
             rewritten to direct downloads automatically.
           </p>
         </form>
@@ -376,7 +376,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
           <div className="empty-state">No models downloaded yet.</div>
         )}
         {snapshot && snapshot.models.length < snapshot.total && (
-          <div className="datadir-note">
+          <div className="datadir-note datadir-row">
             <span>
               {snapshot.total - snapshot.models.length} more model
               {snapshot.total - snapshot.models.length === 1 ? '' : 's'} not shown.
@@ -402,7 +402,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
                 }
                 title="Show in file explorer"
               >
-                <FolderOpen size={13} /> Reveal
+                <FolderOpen size={13} /> Show
               </button>
               <button
                 className="btn-tiny btn-danger"
@@ -439,10 +439,13 @@ interface RowProps {
 }
 
 function DownloadRow({ dl, onPause, onResume, onCancel }: RowProps) {
+  // (a finished download of a size never told is whole: a full bar, not an empty one)
   const pct =
-    dl.bytesTotal && dl.bytesTotal > 0
-      ? Math.min(100, (dl.bytesDownloaded / dl.bytesTotal) * 100)
-      : 0;
+    dl.status === 'completed'
+      ? 100
+      : dl.bytesTotal && dl.bytesTotal > 0
+        ? Math.min(100, (dl.bytesDownloaded / dl.bytesTotal) * 100)
+        : 0;
   const indeterminate =
     dl.status === 'active' && (!dl.bytesTotal || dl.bytesTotal === 0);
   return (

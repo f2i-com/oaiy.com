@@ -233,7 +233,7 @@ export default function SettingsPanel() {
         setHfTokenSet(await appConfig.getHfTokenStatus());
         toast.push({
           kind: 'success',
-          title: value ? 'HuggingFace token saved' : 'HuggingFace token cleared',
+          title: value ? 'Hugging Face token saved' : 'Hugging Face token cleared',
           body: value
             ? 'Gated/private repo downloads will use it.'
             : undefined,
@@ -270,7 +270,7 @@ export default function SettingsPanel() {
               toast.push({
                 kind: 'success',
                 title: mode === 'move' ? 'Files moved' : 'Files copied',
-                body: `${s.filesDone} file(s) now in the new folder. Restart to use it.`,
+                body: `${s.filesDone} file${s.filesDone === 1 ? '' : 's'} now in the new folder. Restart to use it.`,
                 timeoutMs: 8000,
               });
             }
@@ -484,7 +484,7 @@ export default function SettingsPanel() {
 
   return (
     <div className="panel">
-      {error && <div className="banner banner-err">⚠ {error}</div>}
+      {error && <div className="banner banner-err" role="alert">⚠ {error}</div>}
 
       <SetupSection />
 
@@ -546,7 +546,9 @@ export default function SettingsPanel() {
             {cfg.isCustom && (
               <div className="settings-row">
                 <span className="settings-label">Default</span>
-                <code className="path-code">{cfg.defaultDir}</code>
+                <div className="settings-value">
+                  <code className="path-code">{cfg.defaultDir}</code>
+                </div>
               </div>
             )}
           </div>
@@ -605,14 +607,14 @@ export default function SettingsPanel() {
               </>
             ) : mig?.done && !mig.error ? (
               <span>
-                ✓ Brought {mig.filesDone} file(s) over. Restart OAIY
+                ✓ Brought {mig.filesDone} file{mig.filesDone === 1 ? '' : 's'} over. Restart OAIY
                 (button above) to start using the new folder.
               </span>
             ) : (
               <>
                 <strong>Bring your data to the new folder?</strong>
                 <p className="form-hint" style={{ margin: '6px 0' }}>
-                  {plan.fileCount} file(s) · {formatBytes(plan.totalBytes)} in{' '}
+                  {plan.fileCount} file{plan.fileCount === 1 ? '' : 's'} · {formatBytes(plan.totalBytes)} in{' '}
                   {plan.subdirs.join(', ')}. Python runtimes &amp; venvs aren't
                   moved — reinstall them in the new location (one click each).
                 </p>
@@ -691,7 +693,9 @@ export default function SettingsPanel() {
             {cfg.modelsIsCustom && (
               <div className="settings-row">
                 <span className="settings-label">Default</span>
-                <code className="path-code">{cfg.modelsDefaultDir}</code>
+                <div className="settings-value">
+                  <code className="path-code">{cfg.modelsDefaultDir}</code>
+                </div>
               </div>
             )}
           </div>
@@ -764,12 +768,12 @@ export default function SettingsPanel() {
       </section>
 
       <section className="model-section">
-        <h3 className="section-title">HuggingFace token</h3>
+        <h3 className="section-title">Hugging Face token</h3>
         <p className="form-hint">
           Some models are gated or private (FLUX 3, Llama, some Gemma releases). Paste
           an access token from{' '}
           <code className="path-code">huggingface.co/settings/tokens</code> (and
-          accept the model's terms on its HF page) so OAIY can download
+          accept the model's terms on its Hugging Face page) so OAIY can download
           them, here and in Engines. Stored locally; only ever sent to huggingface.co.
         </p>
         <div className="settings-row settings-row-flat">

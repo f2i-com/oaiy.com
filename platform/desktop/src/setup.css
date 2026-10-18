@@ -607,6 +607,11 @@ details.setup-more-source > summary:hover { color: var(--text); }
 .ai-choice-text > small { max-width: 76ch; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
 .ai-choice-text > small.ai-choice-fact { color: var(--text); }
 .ai-choice-head > .btn-tiny { flex: none; align-self: center; }
+/* A choice with a button beside it (Settings → Agent's "Engines"): the button outside the label, at its right. */
+.ai-choice-head-row { display: flex; align-items: center; }
+.ai-choice-head-row > .ai-choice-head { min-width: 0; flex: 1; }
+.ai-choice-head-row > .btn-tiny { flex: none; margin-right: 16px; }
+.ai-choices.is-compact .ai-choice-head-row > .btn-tiny { margin-right: 14px; }
 .ai-choice-body { border-top: 1px solid var(--border); padding: 14px 16px 16px 44px; }
 .ai-choice-body .setup-req { background: var(--surface-solid); }
 .chatgpt-connector.is-bare { display: flex; flex-direction: column; gap: 10px; }

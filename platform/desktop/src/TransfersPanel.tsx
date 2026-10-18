@@ -184,6 +184,17 @@ export default function TransfersPanel() {
     }
   };
 
+  // Back to what is saved: the form, and the lines typed for the urgent phrases and VIPs.
+  const discard = () => {
+    if (!saved) return;
+    editing.current = false;
+    setDraft(saved);
+    setUrgentText(lines(saved.urgentPhrases));
+    setVipText(lines(saved.vipNumbers));
+    setJustSaved(false);
+    setError(null);
+  };
+
   if (missing) {
     return (
       <div className="panel transfers-page">
@@ -315,48 +326,51 @@ export default function TransfersPanel() {
 
       <section className="model-section">
         <h3 className="section-title">How it rings</h3>
-        <div className="transfers-grid">
-          <label>
-            Ring for (seconds)
+        <div className="transfers-grid transfers-grid-fields">
+          <label className="form-row">
+            <span>Ring for (seconds)</span>
             <input type="number" min={20} max={90} value={current.ringSeconds} onChange={(e) => patch({ ringSeconds: Number(e.target.value) })} />
           </label>
-          <label>
-            This computer
+          <label className="form-row">
+            <span>This computer</span>
             <select value={current.desktopRing} onChange={(e) => patch({ desktopRing: e.target.value as RingSettings['desktopRing'] })}>
               <option value="auto">Rings while I am at it</option>
               <option value="always">Always rings</option>
               <option value="never">Never rings</option>
             </select>
           </label>
-          <label>
-            Phones
+          <label className="form-row">
+            <span>Phones</span>
             <select value={current.phoneRing} onChange={(e) => patch({ phoneRing: e.target.value as RingSettings['phoneRing'] })}>
               <option value="when_away">Ring when I am away</option>
               <option value="always">Always ring</option>
               <option value="never">Never ring</option>
             </select>
-            <small className="form-hint">A phone rings when you are away, and also when no Companion on this computer can take the call. Choose “Always ring” to have it ring even when one does.</small>
           </label>
-          <label>
-            I am
+        </div>
+        <p className="form-hint">A phone rings when you are away, and also when no Companion on this computer can take the call. Choose “Always ring” under Phones to have it ring even when one does.</p>
+        <div className="transfers-grid transfers-grid-wide">
+          <label className="form-row">
+            <span>I am</span>
             <select value={current.away} onChange={(e) => patch({ away: e.target.value as RingSettings['away'] })}>
               <option value="auto">Away when I am not at this computer</option>
               <option value="on">Away</option>
               <option value="off">Here</option>
             </select>
           </label>
-          <label>
-            The receptionist may ask on its own
+          <label className="form-row">
+            <span>The receptionist may ask on its own</span>
             <select value={current.initiative} onChange={(e) => patch({ initiative: e.target.value as RingSettings['initiative'] })}>
               <option value="on_request">Only when the caller asks for a person</option>
               <option value="on_request_or_urgent">Also when they say one of my urgent phrases</option>
             </select>
           </label>
+          <label className="form-row">
+            <span>Urgent phrases, one a line</span>
+            <textarea rows={3} value={urgentText} onChange={(e) => { setJustSaved(false); setUrgentText(e.target.value); }} placeholder={'gas leak\nburst pipe'} aria-label="Urgent phrases" onFocus={() => (typing.current = true)} onBlur={() => (typing.current = false)} />
+            <small className="form-hint">Used only when the receptionist may ask on its own for them.</small>
+          </label>
         </div>
-        <label className="transfers-grid">
-          <span className="form-hint">Urgent phrases, one a line (used only when the setting above allows it)</span>
-          <textarea rows={3} value={urgentText} onChange={(e) => { setJustSaved(false); setUrgentText(e.target.value); }} placeholder={'gas leak\nburst pipe'} aria-label="Urgent phrases" onFocus={() => (typing.current = true)} onBlur={() => (typing.current = false)} />
-        </label>
       </section>
 
       <section className="model-section">
@@ -370,13 +384,13 @@ export default function TransfersPanel() {
         </label>
         {current.quietHours.enabled && (
           <>
-            <div className="transfers-grid">
-              <label>
-                From
+            <div className="transfers-grid transfers-grid-fields">
+              <label className="form-row">
+                <span>From</span>
                 <input type="time" value={current.quietHours.start} onChange={(e) => patchQuiet({ start: e.target.value })} />
               </label>
-              <label>
-                To
+              <label className="form-row">
+                <span>To</span>
                 <input type="time" value={current.quietHours.end} onChange={(e) => patchQuiet({ end: e.target.value })} />
               </label>
             </div>
@@ -398,30 +412,31 @@ export default function TransfersPanel() {
             </label>
           </>
         )}
-        <label className="transfers-grid">
-          <span className="form-hint">VIP numbers, one a line: they ring through quiet hours. A caller ID can be faked, so the limits above still apply to them.</span>
+        <label className="form-row transfers-vip">
+          <span>VIP numbers, one a line</span>
           <textarea rows={3} value={vipText} onChange={(e) => { setJustSaved(false); setVipText(e.target.value); }} placeholder="0491 570 006" aria-label="VIP numbers" onFocus={() => (typing.current = true)} onBlur={() => (typing.current = false)} />
+          <small className="form-hint">They ring through quiet hours. A caller ID can be faked, so the limits below still apply to them.</small>
         </label>
       </section>
 
       <section className="model-section">
         <h3 className="section-title">Limits</h3>
         <p className="form-hint">So one caller cannot make your devices ring over and over.</p>
-        <div className="transfers-grid">
-          <label>
-            Tries a call
+        <div className="transfers-grid transfers-grid-fields">
+          <label className="form-row">
+            <span>Tries a call</span>
             <input type="number" min={1} max={5} value={current.limits.perCall} onChange={(e) => patchLimits({ perCall: Number(e.target.value) })} />
           </label>
-          <label>
-            Seconds between tries
+          <label className="form-row">
+            <span>Seconds between tries</span>
             <input type="number" min={10} max={600} value={current.limits.gapSeconds} onChange={(e) => patchLimits({ gapSeconds: Number(e.target.value) })} />
           </label>
-          <label>
-            Tries a caller in an hour
+          <label className="form-row">
+            <span>Tries a caller in an hour</span>
             <input type="number" min={1} max={10} value={current.limits.perCallerHour} onChange={(e) => patchLimits({ perCallerHour: Number(e.target.value) })} />
           </label>
-          <label>
-            Tries in an hour, everyone
+          <label className="form-row">
+            <span>Tries in an hour, everyone</span>
             <input type="number" min={1} max={100} value={current.limits.globalHour} onChange={(e) => patchLimits({ globalHour: Number(e.target.value) })} />
           </label>
         </div>
@@ -468,15 +483,32 @@ export default function TransfersPanel() {
           <TriangleAlert size={13} /> {error}
         </p>
       )}
-      <div className="section-title-row">
-        <button type="button" className="button" disabled={!dirty || saving} onClick={() => void save()}>
+      {/* The Hours page's save bar: in view while something is not saved, a quiet line at the end once it is. */}
+      <div className={`hours-savebar transfers-savebar${dirty ? ' is-dirty' : ''}`} role="region" aria-label="Save">
+        <div className="hours-savebar-text" aria-live="polite">
+          {dirty ? (
+            <>
+              <strong>
+                <i aria-hidden /> Unsaved changes
+              </strong>
+              <small>Calls are put through as saved until you save.</small>
+            </>
+          ) : justSaved ? (
+            <strong className="transfers-saved">
+              <Check size={13} /> Saved
+            </strong>
+          ) : (
+            <small>These are saved. Change anything above, then save it here.</small>
+          )}
+        </div>
+        {dirty && (
+          <button type="button" className="btn btn-ghost" disabled={saving} onClick={discard}>
+            Discard
+          </button>
+        )}
+        <button type="button" className="btn btn-primary" disabled={!dirty || saving} onClick={() => void save()}>
           {saving ? <Loader2 size={14} className="spin" aria-label="Saving" /> : null} Save changes
         </button>
-        {justSaved && !dirty && (
-          <span className="transfers-saved">
-            <Check size={13} /> Saved
-          </span>
-        )}
       </div>
     </div>
   );
