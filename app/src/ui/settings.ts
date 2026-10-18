@@ -404,8 +404,10 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     };
     renderMedia();
 
+    // (Settings, as the gear says: its sections are the AI providers, the agent, and images, video and audio)
     dialog.append(
-      h('h2', 'AI providers'),
+      h('h2', 'Settings'),
+      h('strong.settings-section', 'AI providers'),
       h('p.muted', 'Keys are stored encrypted in this browser and sent only to their own provider. Sandboxed code never sees them.'),
       h('div.settings-grid', list, form),
       h(

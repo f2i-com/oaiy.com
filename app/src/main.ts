@@ -458,9 +458,11 @@ async function main(): Promise<void> {
   const tree = new FileTree(null as unknown as Vfs, (path) => {
     editor.open(path);
     tree.select(path);
-    // A web page or 3D model opened is the one the preview shows.
+    // A web page or 3D model opened is the one the preview shows (a preview up stays up, showing it); any other file
+    // comes up in the editor, not behind the preview where nothing seemed to happen.
     if (isPagePath(path)) preview.setPage(path.replace(/^\/+/, ''));
     else if (isModelPath(path)) preview.setModel(path.replace(/^\/+/, ''));
+    else showPane('editor');
     if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
   }, notice);
   const editor = new EditorPane(null as unknown as Vfs);
@@ -1208,8 +1210,10 @@ async function main(): Promise<void> {
     workspace.inert = false;
     shownFiles = null;
     showFiles(project);
-    // A SoftN app or a web page opens on its preview, so the person sees it being built.
+    // A SoftN app or a web page opens on its preview, so the person sees it being built; a project with nothing to
+    // preview opens on the editor, not on an empty preview left up by the last one.
     if (isSoftnProject(project.vfs) || findPages(project.vfs).length) showPane('preview');
+    else if (center.dataset.pane === 'preview') showPane('editor');
     chat.replay(agent.turns);
     renderSessions();
     registerOaiy();
@@ -1880,9 +1884,17 @@ A project can hold several apps, each in its own folder (any folder whose manife
       center.dataset.pane = view;
       for (const b of centerTabs.querySelectorAll('button')) b.classList.toggle('active', b.dataset.pane === view);
     }
-    preview.setVisible(center.dataset.pane === 'preview' && (view === 'preview' || !window.matchMedia('(max-width: 900px)').matches));
+    showPreview();
     if (view === 'agent') chat.focus();
   }
+  /** Whether the preview is on screen: its pane chosen, and its tab too on a narrow screen (one pane at a time). */
+  function showPreview(): void {
+    preview.setVisible(center.dataset.pane === 'preview' && (workspace.dataset.view === 'preview' || !narrow.matches));
+  }
+  const narrow = window.matchMedia('(max-width: 900px)');
+  // The window resized across the narrow layout's edge: back to three panes, a preview hidden behind another tab is on
+  // screen again (it was left showing what it last drew, and did not follow the files).
+  narrow.addEventListener('change', showPreview);
   showPane('editor');
   showView('agent');
   // A tap anywhere outside the open project menu closes it.

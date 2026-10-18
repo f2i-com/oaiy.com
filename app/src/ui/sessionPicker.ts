@@ -156,7 +156,8 @@ export class SessionPicker {
       conversationAvatar(kind, name, !!tab.live, tab.lastWay, tab.hidden),
       h(
         'span.convo-text',
-        h('span.convo-name', { class: tab.working || tab.live ? 'working' : '' }, name, ...(tab.live ? [h('span.convo-live', 'Live')] : [])),
+        // (the name in a box of its own, so a long one ends in an ellipsis before the Live tag and the working dot)
+        h('span.convo-name', { class: tab.working || tab.live ? 'working' : '' }, h('span.convo-title', name), ...(tab.live ? [h('span.convo-live', 'Live')] : [])),
         h('span.convo-detail', conversationDetail(tab, true)),
       ),
       h('span.convo-more', `${others.length} other${others.length === 1 ? '' : 's'}`),

@@ -29,6 +29,12 @@ describe("the chat's Markdown", () => {
     expect(renderMarkdown('## Title\n- a\n- [x] done\n3. three\n> quoted\n---')).toBe('<h4>Title</h4><ul><li>a</li><li class="task done"><span class="task-box" role="img" aria-label="done"></span>done</li></ul><ol start="3"><li>three</li></ol><blockquote>quoted</blockquote><hr>');
   });
 
+  it('nests a list indented under an item, and keeps an indented line with its item', () => {
+    expect(renderMarkdown('- a\n  - a1\n  - a2\n- b\n  more about b\n1. one')).toBe('<ul><li>a<ul><li>a1</li><li>a2</li></ul></li><li>b<br>more about b</li></ul><ol><li>one</li></ol>');
+    // (one space more is not a list of its own: the next item of the same list)
+    expect(renderMarkdown('1. one\n 2. two\n    - deep\n3. three')).toBe('<ol><li>one</li><li>two<ul><li>deep</li></ul></li><li>three</li></ol>');
+  });
+
   it('makes an address written bare a link, ending where the sentence or a quote does', () => {
     const html = renderMarkdown('Open https://auth.openai.com/device?code=AB&x=1, then "https://example.com/a" and [docs](https://oaiy.com).');
     expect(html).toContain('<a href="https://auth.openai.com/device?code=AB&amp;x=1" target="_blank" rel="noopener noreferrer">https://auth.openai.com/device?code=AB&amp;x=1</a>,');

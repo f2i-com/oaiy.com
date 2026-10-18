@@ -41,14 +41,16 @@ function cells(row: string): string[] {
   return line.split(/(?<!\\)\|/).map((c) => c.trim());
 }
 
-/** Escaped lines as blocks: paragraphs, lists, headings, tables, quotes and rules. */
+/** Escaped lines as blocks: paragraphs, lists (nested ones too), headings, tables, quotes and rules. */
 function blocks(lines: string[]): string {
   let html = '';
-  let list: 'ul' | 'ol' | null = null;
-  const closeList = () => {
-    if (list) html += `</${list}>`;
-    list = null;
+  // The lists open, outermost first, each with how far its items are indented; the last item of each is open too
+  // (a list nested in it goes inside it).
+  const lists: Array<{ kind: 'ul' | 'ol'; indent: number }> = [];
+  const closeLists = (deeperThan = -1) => {
+    while (lists.length && lists[lists.length - 1].indent > deeperThan) html += `</li></${lists.pop()!.kind}>`;
   };
+  const closeList = () => closeLists();
   for (let n = 0; n < lines.length; n++) {
     const raw = lines[n];
     // A table: a row of cells, then the separator, then rows while they have a pipe.
@@ -70,18 +72,30 @@ function blocks(lines: string[]): string {
     const bullet = /^\s*[-*+] (.*)$/.exec(raw);
     const numbered = /^\s*(\d+)[.)] (.*)$/.exec(raw);
     const kind = bullet ? 'ul' : numbered ? 'ol' : null;
-    if (list && kind !== list) closeList();
-    if (kind && !list) {
-      html += kind === 'ol' && numbered && numbered[1] !== '1' ? `<ol start="${Number(numbered[1])}">` : `<${kind}>`;
-      list = kind;
-    }
     if (kind) {
+      const indent = raw.length - raw.trimStart().length;
+      // Back out of the lists indented deeper than this item; two spaces past the list it is in, it starts one inside
+      // that list's last item; otherwise it is the next item (of a new list, when it changes from bullets to numbers).
+      closeLists(indent);
+      const top = lists[lists.length - 1];
+      if (top && indent < top.indent + 2 && top.kind === kind) html += '</li>';
+      else {
+        if (top && indent < top.indent + 2) html += `</li></${lists.pop()!.kind}>`;
+        html += kind === 'ol' && numbered && numbered[1] !== '1' ? `<ol start="${Number(numbered[1])}">` : `<${kind}>`;
+        lists.push({ kind, indent });
+      }
       const item = bullet?.[1] ?? numbered![2];
       const task = /^\[([ xX])\] (.*)$/.exec(item);
       // (a task's box is said, done or not, to a screen reader as to the eye)
-      html += task ? `<li class="task${task[1] === ' ' ? '' : ' done'}"><span class="task-box" role="img" aria-label="${task[1] === ' ' ? 'to do' : 'done'}"></span>${inline(task[2])}</li>` : `<li>${inline(item)}</li>`;
+      html += task ? `<li class="task${task[1] === ' ' ? '' : ' done'}"><span class="task-box" role="img" aria-label="${task[1] === ' ' ? 'to do' : 'done'}"></span>${inline(task[2])}` : `<li>${inline(item)}`;
       continue;
     }
+    // An indented line under an item goes on with that item, on a line of its own.
+    if (lists.length && /^\s{2,}\S/.test(raw)) {
+      html += `<br>${inline(raw.trim())}`;
+      continue;
+    }
+    closeList();
     const heading = /^(#{1,4}) (.*)$/.exec(raw);
     if (heading) html += `<h${heading[1].length + 2}>${inline(heading[2])}</h${heading[1].length + 2}>`;
     else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(raw)) html += '<hr>';

@@ -66,6 +66,10 @@ function promptText(e: { system: string; turns: Turn[]; tools: string[] }): stri
 /** Steps after the one in progress that the checklist shows before folding the rest into "+N more". */
 const PLAN_UPCOMING = 4;
 
+/** A message of the person's longer than this (lines, or characters) is shown folded to its first lines. */
+const FOLD_LINES = 14;
+const FOLD_CHARS = 1500;
+
 /** How many turns of a saved conversation are drawn at a time (the latest first; older ones as the log is scrolled up to them). */
 const REPLAY_PAGE = 60;
 
@@ -267,6 +271,14 @@ export class ChatPane {
       const watch = new ResizeObserver(() => this.pin());
       watch.observe(this.feed);
       watch.observe(this.log);
+      // A narrower message box (the window or the pane resized, a phone turned) wraps what is written onto more
+      // lines: it grows again to show them, rather than hiding the rest. (Its own height changing is not a reason.)
+      let width = 0;
+      new ResizeObserver(() => {
+        if (this.input.clientWidth === width) return;
+        width = this.input.clientWidth;
+        if (this.input.value) this.grow();
+      }).observe(this.input);
     }
     // A code block's Copy button.
     this.log.addEventListener('click', (e) => {
@@ -349,7 +361,7 @@ export class ChatPane {
     this.updateSend();
     for (const url of this.pendingUrls.splice(0)) URL.revokeObjectURL(url);
     clear(this.pending);
-    this.files.forEach((file, i) => {
+    this.files.forEach((file) => {
       const url = file.type.startsWith('image/') ? URL.createObjectURL(file) : null;
       if (url) this.pendingUrls.push(url);
       const thumb = url ? h('img', { src: url, alt: '' }) : h('span.file-icon', icon('file'));
@@ -359,7 +371,11 @@ export class ChatPane {
           { title: `${file.name} (${file.size.toLocaleString()} bytes)` },
           thumb,
           h('span.attachment-name', file.name),
-          h('button.icon', { type: 'button', title: 'Remove', 'aria-label': `Remove ${file.name}`, onclick: () => { this.files.splice(i, 1); this.renderPending(); } }, icon('x')),
+          // (by the file, not its place: a second click on a row already gone removes nothing else)
+          h('button.icon', { type: 'button', title: 'Remove', 'aria-label': `Remove ${file.name}`, onclick: () => {
+            this.files = this.files.filter((f) => f !== file);
+            this.renderPending();
+          } }, icon('x')),
         ),
       );
     });
@@ -470,7 +486,8 @@ export class ChatPane {
   }
 
   setStatus(text: string): void {
-    this.status.textContent = text;
+    // (said again with each piece of a streamed reply: the line is redrawn only when its words change)
+    if (this.status.textContent !== text) this.status.textContent = text;
   }
 
   /**
@@ -1078,8 +1095,20 @@ export class ChatPane {
 
   /** The person's own words, and what they attached. */
   private ownBubble(text: string, attachments: Attachment[], during: boolean, note: string): void {
-    const box = h('div.msg.user', { class: during ? 'during' : '' }, h('div.msg-body', text || (attachments.length ? '' : ' ')));
+    const body = h('div.msg-body', text || (attachments.length ? '' : ' '));
+    const box = h('div.msg.user', { class: during ? 'during' : '' }, body);
     if (!text && attachments.length) box.classList.add('only-files');
+    // A long paste (a log, a page of text) is folded to its first lines, so it does not fill the log: Show all opens it.
+    if (text.split('\n').length > FOLD_LINES || text.length > FOLD_CHARS) {
+      body.classList.add('folded');
+      const more = h('button.msg-more', { type: 'button', 'aria-expanded': 'false' }, 'Show all') as HTMLButtonElement;
+      more.addEventListener('click', () => {
+        const open = !body.classList.toggle('folded');
+        more.textContent = open ? 'Show less' : 'Show all';
+        more.setAttribute('aria-expanded', String(open));
+      });
+      box.append(more);
+    }
     if (during) box.append(h('div.msg-note', note));
     if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
     this.add(box, 'you');
@@ -1167,7 +1196,9 @@ export class ChatPane {
     // (a reply being written ends here: drawn whole, a code block it left open closed)
     this.finishReply();
     const short = !text.includes('\n') && text.length <= 110;
-    const row = h('div.msg.system', { class: `${kind} ${short ? 'line' : 'card'}${text.includes('\n') ? ' lines' : ''}` }, icon(kind === 'error' ? 'alert' : 'info'), h('pre', text));
+    // (a note that begins with a mark of its own, 📞 or 🕶, needs no other beside it)
+    const mark = kind === 'error' || !/^\p{Extended_Pictographic}/u.test(text) ? [icon(kind === 'error' ? 'alert' : 'info')] : [];
+    const row = h('div.msg.system', { class: `${kind} ${short ? 'line' : 'card'}${text.includes('\n') ? ' lines' : ''}` }, ...mark, h('pre', text));
     this.add(row);
     this.scroll();
     return row;
@@ -1440,7 +1471,7 @@ export class ChatPane {
     const state = h('span.task-state', 'queued');
     const activity = h('span.task-activity');
     const report = h('pre.task-report');
-    const row = h('li.agent-task.queued', h('div.task-head', h('span.task-mark'), h('span.task-title', title), state), activity, h('details.task-more', h('summary', 'report'), report));
+    const row = h('li.agent-task.queued', h('div.task-head', h('span.task-mark'), h('span.task-title', { title }, title), state), activity, h('details.task-more', h('summary', 'Report'), report));
     const card = this.cards.get(id.split('#')[0]);
     let target = list ?? card?.querySelector('.agent-tasks');
     // A sub-agent under another tool's row (the review of a picture): a list of its own just after the row (or its group), seen without opening it.
@@ -1467,7 +1498,8 @@ export class ChatPane {
     if (e.activity) entry.activity.textContent = activityText(e.activity);
     if (e.result !== undefined) {
       entry.report.textContent = e.result || '(no report)';
-      entry.activity.textContent = e.state === 'done' ? 'finished' : entry.activity.textContent;
+      // (done, its badge says so: the last thing it was doing is no longer news)
+      entry.activity.textContent = e.state === 'done' ? '' : entry.activity.textContent;
     }
     if (e.state === 'running') this.setStatus(`Sub-agent: ${e.title}${e.activity ? `: ${activityText(e.activity)}` : ''}`);
   }
@@ -1553,9 +1585,11 @@ export class ChatPane {
         const why = this.unsaidWhy(via);
         if (why) this.quietText(e.delta, why);
         else this.assistantText(e.delta);
+        this.setStatus('writing…');
         break;
       }
       case 'thinking':
+        this.setStatus('thinking…');
         if (!this.thinking) {
           const box = this.thoughtBox('', true);
           this.thinking = { box, text: '' };
@@ -1573,6 +1607,8 @@ export class ChatPane {
         break;
       case 'prompt':
         this.promptView(e);
+        // The model is asked: the agent is at work from here, before its first words (a local model can take a while).
+        this.setStatus('thinking…');
         break;
       case 'tool_draft':
         this.doneThinking();
