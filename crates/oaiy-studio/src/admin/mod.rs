@@ -547,6 +547,17 @@ mod tests {
         assert_eq!(menu.matches(" data-more>").count(), in_menu.len() - 4, "the entries More holds");
     }
 
+    /// The Endpoints page's routes name every service a route can serve: one it lacked showed as Chat, its first
+    /// choice, in that route's row (the speech, music, sound, 3D and picture tool routes did).
+    #[test]
+    fn the_route_table_offers_every_service() {
+        let start = PAGE.find("const targets = [").expect("the page lists the services");
+        let list = &PAGE[start..start + PAGE[start..].find("]];").expect("the list ends")];
+        for target in crate::config::TARGETS {
+            assert!(list.contains(&format!(r#"["{target}", ""#)), "{target} is not offered on the Endpoints page");
+        }
+    }
+
     #[test]
     fn only_this_listener_s_names_are_answered() {
         assert!(allowed_host("127.0.0.1:7860", 7860, "127.0.0.1"));

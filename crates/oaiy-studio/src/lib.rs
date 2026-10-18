@@ -235,7 +235,7 @@ impl Studio {
         // unload a model mid-conversation.
         let launch = |v: &Json| {
             let llm = v.get("llm").cloned().unwrap_or(Json::Null);
-            let args = llm::arguments(&llm, &self.root, 0, "", true).map(|(a, _)| a).unwrap_or_default();
+            let args = llm::arguments(&llm, &self.root, 0, true).map(|(a, _)| a).unwrap_or_default();
             let backend = ["server", "server_webgpu", "backend"].map(|k| str_or(&llm, k, "").to_string());
             let incognito = v.get("privacy").is_some_and(|p| bool_or(p, "incognito", false));
             (args, backend, llm.get("webgpu_gb").cloned(), bool_or(&llm, "enabled", true), incognito)

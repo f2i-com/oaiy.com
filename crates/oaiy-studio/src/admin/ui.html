@@ -102,26 +102,42 @@ section.view { display: none; } section.view.on { display: block; }
 .spread { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .muted { color: var(--muted); } .small { font-size: 12px; } .num { font-family: var(--display); font-variant-numeric: tabular-nums; }
 .path { font: 12px/1.4 var(--code); color: var(--muted); word-break: break-all; }
+/* (a long path in a line of text, such as the configuration's, breaks where it must rather than widening the page) */
+.wrap-any { overflow-wrap: anywhere; }
 
 /* controls */
 .btn { border: 1px solid var(--line-2); background: var(--panel-2); border-radius: var(--r); padding: 7px 14px; cursor: pointer; white-space: nowrap; }
-.btn:hover { border-color: var(--muted); }
+.btn:not(:disabled):hover { border-color: var(--muted); }
 a.btn { color: inherit; text-decoration: none; display: inline-block; }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn.go { background: var(--go, var(--gpu)); border-color: var(--go, var(--gpu)); color: var(--on-accent); font-weight: 600; }
-.btn.go:hover { filter: brightness(1.08); }
+.btn.go:not(:disabled):hover { filter: brightness(1.08); border-color: var(--go, var(--gpu)); }
 .btn.warn { color: var(--bad); }
 .btn.quiet { background: transparent; border-color: transparent; color: var(--muted); padding: 5px 8px; }
-.btn.quiet:hover { color: var(--text); border-color: var(--line-2); }
+.btn.quiet:not(:disabled):hover { color: var(--text); border-color: var(--line-2); }
+.btn.quiet.warn:not(:disabled):hover { color: var(--bad); }
 label.f { display: grid; gap: 5px; font-size: 12px; color: var(--muted); align-content: start; }
+/* (a field that is not one box, such as a row of choices under its name, stacks the same way, its name above) */
+div.f { display: grid; gap: 5px; align-content: start; min-width: 0; }
+.f > .seg { justify-self: start; }
 /* Single-column grids size their track to the widest child (an input's
    intrinsic width) unless told they may shrink: then phones scroll sideways. */
 .drop, .list, .item, .gen-form, label.f, .hw, .detected, .block, .progress { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+/* The Overview's language model and its endpoints side by side where the addresses fit on one line beside it (the
+   rule above made every block one column, these two stacked at any width). */
+@media (min-width: 1240px) { .block.cols { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); } }
 label.f > span { display: flex; justify-content: space-between; gap: 8px; }
 input[type=text], input[type=number], input[type=password], input[type=search], select, textarea {
   background: var(--bg); border: 1px solid var(--line-2); border-radius: var(--r); padding: 7px 10px; width: 100%; font-size: 14px; }
 textarea { resize: vertical; min-height: 84px; line-height: 1.45; }
 input[type=search] { -webkit-appearance: none; appearance: none; }
+/* A choice drawn as the boxes are, the same height and colours in both themes and every browser, its arrow two
+   strokes of the muted colour; a long choice ends in an ellipsis before the arrow rather than under it. */
+select { -webkit-appearance: none; appearance: none; padding-right: 30px; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 16px) 52%, calc(100% - 11px) 52%; background-size: 5px 5px; background-repeat: no-repeat; }
+select:disabled { opacity: .55; cursor: default; }
+select option, select optgroup { background: var(--panel); color: var(--text); }
 input:focus, select:focus, textarea:focus { border-color: var(--gpu); outline: none; }
 input[type=checkbox] { accent-color: var(--gpu); width: 16px; height: 16px; }
 input[type=range] { width: 100%; accent-color: var(--gpu); }
@@ -141,6 +157,7 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--r); overflow: hidden; max-width: 100%; }
 .seg button { all: unset; cursor: pointer; padding: 6px 13px; color: var(--muted); font: 500 13px var(--display); letter-spacing: .02em; }
 .seg button + button { border-left: 1px solid var(--line-2); }
+.seg button:hover { color: var(--text); }
 .seg button[aria-pressed="true"] { background: var(--panel-2); color: var(--text); }
 .seg button:focus-visible { outline: 2px solid var(--gpu); outline-offset: -2px; }
 .seg button[data-tier=gpu][aria-pressed=true] { box-shadow: inset 0 -2px var(--gpu); }
@@ -153,7 +170,7 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .strip > div { display: flex; align-items: center; padding: 0 10px; font: 600 12px var(--display); letter-spacing: .03em; color: var(--on-tier); white-space: nowrap; overflow: hidden; min-width: 0; transition: flex-grow .35s ease; }
 .strip .t-gpu { background: var(--gpu); } .strip .t-ram { background: var(--ram); }
 .strip .t-ssd { background: repeating-linear-gradient(135deg, var(--ssd) 0 8px, color-mix(in srgb, var(--ssd) 84%, #000) 8px 16px); }
-.strip-legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.strip-legend { display: flex; gap: 6px 18px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
 .key { display: inline-flex; align-items: center; gap: 6px; } .key i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 .meter { height: 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
 .meter > div { height: 100%; transition: width .5s ease; }
@@ -170,6 +187,7 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 /* the Models page's search, over the model lists; a model it took you to, outlined a moment */
 .model-search { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .model-search input { flex: 1 1 260px; min-width: 0; }
+.model-search span:empty { display: none; }
 .item.found { outline: 2px solid var(--gpu); outline-offset: 3px; }
 
 /* lists */
@@ -177,10 +195,20 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .item { display: grid; gap: 10px; padding: 14px 0; border-bottom: 1px solid var(--line); }
 .item:last-child { border-bottom: 0; }
 .item-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-.item-head strong { font: 600 15px var(--display); letter-spacing: .01em; }
-.item-more > summary { cursor: pointer; width: fit-content; color: var(--muted); font-size: 13px; padding: 2px 0; }
+.item-head strong { font: 600 15px var(--display); letter-spacing: .01em; overflow-wrap: anywhere; }
+/* A model's actions together at the end of its line (Make default, Enabled, Remove): on a narrow screen they wrap
+   as one group under its name and tags, rather than one by one between them. */
+.item-acts { margin-left: auto; display: flex; align-items: center; gap: 4px 14px; flex-wrap: wrap; justify-content: flex-end; }
+.item-more > summary { cursor: pointer; width: fit-content; max-width: 100%; color: var(--muted); font-size: 13px; padding: 2px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .item-more > summary:hover { color: var(--text); }
+.item-more > summary .file { margin-left: 8px; font: 11.5px var(--code); color: var(--faint); }
 .item-more[open] > summary { margin-bottom: 10px; }
+/* Its fields two rows of the grid each (subgrid), a name and a box: the boxes in a line start level whatever their
+   names wrap to. A group of several rows (LoRAs, the smaller music model) takes the whole width. */
+.item-more .cols > label.f { grid-row: span 2; grid-template-rows: subgrid; row-gap: 5px; }
+.item-more .cols > label.f > span { align-self: end; }
+.item-more .cols > div.f { grid-column: 1 / -1; }
+.item-more > .check, .item-more > .f, .item-more > .row { margin-top: 12px; }
 .tag { font-size: 12px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--line-2); color: var(--muted); }
 .tag.gpu { color: var(--gpu); border-color: color-mix(in srgb, var(--gpu) 45%, transparent); }
 .tag.ram { color: var(--ram); border-color: color-mix(in srgb, var(--ram) 45%, transparent); }
@@ -188,11 +216,13 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .tag.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
 .tag.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
 .empty { color: var(--muted); padding: 18px 0; }
+.empty .btn.quiet { color: var(--gpu); }
 .table-wrap { overflow-x: auto; }
 table.routes { width: 100%; border-collapse: collapse; min-width: 640px; }
 table.routes th { text-align: left; font: 500 12px var(--body); color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--line); }
 table.routes td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 table.routes input, table.routes select { padding: 5px 8px; font-size: 13px; }
+table.routes select { padding-right: 28px; }
 table.routes td.path input { font-family: var(--code); }
 
 /* add model */
@@ -203,6 +233,7 @@ table.routes td.path input { font-family: var(--code); }
 /* playground */
 .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
 .tabs button { all: unset; cursor: pointer; padding: 9px 16px; color: var(--muted); font: 500 14px var(--display); letter-spacing: .02em; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tabs button:hover { color: var(--text); }
 .tabs button[aria-selected=true] { color: var(--text); border-color: var(--gpu); }
 .tabs button:focus-visible { outline: 2px solid var(--gpu); }
 .chat { display: grid; grid-template-rows: minmax(0, 1fr) auto; height: calc(100vh - 290px); height: calc(100dvh - 290px); min-height: 340px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); }
@@ -227,9 +258,11 @@ table.routes td.path input { font-family: var(--code); }
 .gen-form { display: grid; gap: 14px; }
 .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(150px, 16vw, 260px), 1fr)); gap: 12px; }
 .gallery figure { cursor: pointer; }
+.gallery > .empty { grid-column: 1 / -1; }
 .gallery .fail { aspect-ratio: 4 / 3; display: grid; place-items: center; padding: 12px; color: var(--bad); font-size: 12px; text-align: center; background: var(--panel-2); }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
 .chips button { all: unset; cursor: pointer; padding: 4px 12px; border: 1px solid var(--line-2); border-radius: 14px; color: var(--muted); font-size: 13px; }
+.chips button:hover { color: var(--text); border-color: var(--muted); }
 .chips button[aria-pressed=true] { color: var(--text); border-color: var(--gpu); background: color-mix(in srgb, var(--gpu) 14%, transparent); }
 .chips button:focus-visible { outline: 2px solid var(--gpu); }
 .now { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); }
@@ -252,17 +285,22 @@ pre.json { max-height: 420px; overflow: auto; }
 body.incognito .banner { display: flex; }
 .gallery figure { margin: 0; background: var(--panel); border-radius: var(--r); overflow: hidden; }
 .gallery img, .gallery video { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block; background: var(--media-bg); }
-.gallery figcaption { padding: 7px 10px; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+.gallery figcaption { padding: 7px 10px; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+/* (the prompt in two lines at most, ending in an ellipsis; its size or length beside it on one line) */
+.gallery figcaption .p { min-width: 0; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
+.gallery figcaption > span:last-child { flex: none; white-space: nowrap; }
 .progress { display: grid; gap: 6px; }
 .progress .meter > div { background: var(--gpu); }
 .job { display: grid; grid-template-columns: 64px minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .job img { cursor: pointer; }
 .job img, .job .ph { width: 64px; height: 48px; object-fit: cover; border-radius: 4px; background: var(--panel-2); }
 .job .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.log { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; height: calc(100vh - 250px - var(--dock-h)); height: calc(100dvh - 250px - var(--dock-h)); min-height: 280px; overflow: auto; font: 12px/1.55 var(--code); white-space: pre-wrap; word-break: break-all; color: var(--well-text); }
+.log:empty::before { content: "Nothing logged yet."; color: var(--faint); font-family: var(--body); }
+.log { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; height: calc(100vh - 290px - var(--dock-h)); height: calc(100dvh - 290px - var(--dock-h)); min-height: 280px; overflow: auto; font: 12px/1.55 var(--code); white-space: pre-wrap; word-break: break-all; color: var(--well-text); }
 .endpoint { display: grid; grid-template-columns: minmax(90px, 120px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .endpoint code { font: 13px var(--code); color: var(--text); word-break: break-all; }
 pre.example { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; font: 12px/1.55 var(--code); overflow-x: auto; color: var(--well-text); margin: 8px 0 0; }
+#examples h3:not(:first-child) { margin-top: 18px; }
 
 /* ---------- playground ---------- */
 /* Panels are sized to the window by fitPlayground(): --play-h is the height
@@ -274,12 +312,13 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .ptabs { display: inline-flex; padding: 3px; gap: 2px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
 .ptabs button { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; padding: 7px 16px; border-radius: 8px; color: var(--muted); font: 500 14px var(--display); letter-spacing: .02em; }
 .ptabs button svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.ptabs button:hover { color: var(--text); }
 .ptabs button[aria-selected=true] { background: var(--panel-2); color: var(--text); box-shadow: inset 0 -2px var(--gpu); }
 .ptabs button:focus-visible { outline: 2px solid var(--gpu); }
 
 .chatbox { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: var(--play-h); min-height: 360px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
 .chatbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid var(--line); }
-.chatbar select { width: auto; min-width: 180px; max-width: 100%; padding: 5px 10px; }
+.chatbar select { width: auto; min-width: 180px; max-width: 100%; padding: 5px 30px 5px 10px; }
 .chatbar .grow { flex: 1; }
 .chatbar details { position: relative; }
 .chatbar details > summary { list-style: none; cursor: pointer; }
@@ -316,12 +355,19 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .controls textarea.prompt { min-height: 110px; font-size: 14px; }
 .controls details summary { cursor: pointer; font-size: 13px; color: var(--muted); }
 .controls details[open] summary { margin-bottom: 12px; }
+.controls details summary:hover { color: var(--text); }
+/* (a row of short fields in the controls, their names one line each: spaced as the rest of the column is, not with
+   a form's margin and an empty help line under it) */
+.controls .grid-f { row-gap: 14px; }
+.controls .grid-f > .f { grid-row: auto; grid-template-rows: none; margin-bottom: 0; }
 .aspects { display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 6px; }
-.aspects button { all: unset; cursor: pointer; display: grid; justify-items: center; gap: 5px; padding: 8px 4px; border: 1px solid var(--line-2); border-radius: 9px; font-size: 11px; color: var(--muted); text-align: center; }
+.aspects button { all: unset; cursor: pointer; display: grid; grid-template-rows: 24px auto auto; justify-items: center; align-items: center; gap: 4px; padding: 8px 4px; border: 1px solid var(--line-2); border-radius: 9px; font-size: 11px; color: var(--muted); text-align: center; }
+.aspects button:hover { color: var(--text); border-color: var(--muted); }
 .aspects button i { display: block; border: 1.5px solid currentColor; border-radius: 3px; }
 .aspects button[aria-pressed=true] { color: var(--text); border-color: var(--gpu); background: color-mix(in srgb, var(--gpu) 12%, transparent); }
 .aspects button:focus-visible { outline: 2px solid var(--gpu); }
 .dropzone { border: 1.5px dashed var(--line-2); border-radius: 10px; padding: 12px; display: grid; gap: 8px; justify-items: center; text-align: center; font-size: 12px; color: var(--muted); cursor: pointer; transition: border-color .15s, background .15s; }
+.dropzone:hover { border-color: var(--muted); }
 .dropzone.over { border-color: var(--gpu); background: color-mix(in srgb, var(--gpu) 10%, transparent); }
 .dropzone .thumbs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
 .dropzone .thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; }
@@ -342,6 +388,7 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .strip-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; min-height: 0; }
 .strip-row:empty { display: none; }
 .strip-row button { all: unset; cursor: pointer; flex: none; width: 88px; height: 66px; border-radius: 8px; overflow: hidden; border: 2px solid transparent; background: var(--panel-2); }
+.strip-row button:hover { border-color: var(--line-2); }
 .strip-row button[aria-pressed=true] { border-color: var(--gpu); }
 .strip-row button:focus-visible { outline: 2px solid var(--gpu); }
 .strip-row img, .strip-row video { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -366,6 +413,7 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .sp-item details { font-size: 12px; color: var(--muted); }
 .sp-item details pre { white-space: pre-wrap; margin: 6px 0 0; font: 12px/1.5 var(--code, ui-monospace, monospace); color: var(--text); }
 .quant-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.quant-row select { width: auto; flex: 0 1 320px; min-width: 0; }
 figure .audio-card { display: grid; place-items: center; aspect-ratio: 4 / 3; background: var(--panel-2); color: var(--muted); }
 figure .audio-card svg { width: 40px; height: 40px; stroke: currentColor; fill: none; stroke-width: 1.4; }
 @media (max-width: 1080px) {
@@ -478,11 +526,19 @@ dialog::backdrop { background: var(--backdrop); }
   .dock .theme-toggle { padding: 5px 6px; }
   .endpoint { grid-template-columns: minmax(0, 1fr) auto; } .endpoint > span { grid-column: 1 / -1; }
   .now { grid-template-columns: 64px minmax(0, 1fr); } .now > :last-child { grid-column: 1 / -1; }
+  /* (a route in two lines: on, its path and Remove; then its method, what it serves and its dialect) */
   table.routes { min-width: 0; } table.routes thead { display: none; }
-  table.routes tr { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
-  table.routes td { border: 0; padding: 0; } table.routes td.path { grid-column: 2; }
-  table.routes td:nth-child(n+3) { grid-column: 1 / -1; }
-  dialog, dialog.wide, dialog#viewer { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; margin: 0; }
+  table.routes tr { display: grid; grid-template-columns: auto minmax(0, .6fr) minmax(0, 1.6fr) minmax(0, .6fr) auto; grid-template-areas: "on path path path del" "method method serves spec spec";
+    gap: 6px 8px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  table.routes td { border: 0; padding: 0; min-width: 0; }
+  table.routes td:nth-child(1) { grid-area: on; } table.routes td:nth-child(2) { grid-area: path; } table.routes td:nth-child(3) { grid-area: method; }
+  table.routes td:nth-child(4) { grid-area: serves; } table.routes td:nth-child(5) { grid-area: spec; } table.routes td:nth-child(6) { grid-area: del; }
+  /* (the file picker and the viewer take the whole screen; a question stays a card in the middle of it) */
+  dialog.wide, dialog#viewer, dialog#picker { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; margin: 0; }
+  /* (the Add box's path on a line of its own, Browse and Check under it) */
+  .drop .pathfield { flex-wrap: wrap; } .drop .pathfield input { flex: 1 1 100%; }
+  /* (a row of short numbers in the playground's controls stays a row: three boxes fit a phone) */
+  .controls .grid-f[style] { grid-template-columns: repeat(auto-fit, minmax(84px, 1fr)) !important; }
   .files { max-height: calc(100dvh - 190px); }
   .seg button { padding: 6px 10px; }
   .grid-f[style] { grid-template-columns: minmax(0, 1fr) !important; }
@@ -501,7 +557,7 @@ dialog::backdrop { background: var(--backdrop); }
 /* ---------- get models ---------- */
 .dl-top { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr)); gap: 18px 28px; margin-bottom: 22px; }
 .dl-top .f { display: grid; gap: 6px; font-size: 13px; }
-.dl-top .f > span:first-child { font: 600 13px var(--display); letter-spacing: .02em; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.dl-top .f > span:first-child { font: 600 13px var(--display); letter-spacing: .02em; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; justify-content: flex-start; }
 .dl-top .f > span:first-child .muted { font: 400 12px var(--body); letter-spacing: 0; }
 .dl-free { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
 .dl-free .meter { width: 120px; height: 6px; }
@@ -540,10 +596,12 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-state .line { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); }
 .dl-state .file { font: 11px var(--code); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dl-state .err { color: var(--bad); white-space: pre-wrap; }
-.dl-state .ok { color: var(--good); display: flex; align-items: center; gap: 6px; }
+.dl-state .ok { color: var(--good); display: flex; align-items: flex-start; gap: 6px; }
+.dl-state .ok svg { flex: none; margin-top: 1px; }
 .dl-plan { display: grid; gap: 4px; }
 .dl-plan .have { color: var(--good); }
 .dl-plan summary { cursor: pointer; color: var(--muted); font-size: 11.5px; }
+.dl-plan summary:hover { color: var(--text); }
 .dl-plan ul { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 3px; }
 .dl-plan li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 8px; font: 11px var(--code); color: var(--muted); }
 .dl-plan li > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
@@ -603,7 +661,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block cols">
         <div>
           <div class="spread"><h2>Language model</h2><span id="llm-tag"></span></div>
-          <p class="muted" id="llm-detail">Not running.</p>
+          <p class="muted" id="llm-detail" style="margin:0 0 14px">Not running.</p>
           <div class="row">
             <button class="btn go" id="llm-start">Start</button>
             <button class="btn" id="llm-restart">Restart</button>
@@ -892,9 +950,10 @@ dialog::backdrop { background: var(--backdrop); }
     <!-- Models -->
     <section class="view" id="v-models" data-jump>
       <h1>Models</h1>
-      <div class="dl-empty-hint" id="models-first-run" hidden><p><strong>Nothing to add yet?</strong> Get models downloads ready-to-run models and adds them here.</p><button class="btn go" data-goto="get">Get models</button></div>
       <p class="lede">Pick a file or folder and the studio reads its headers to work out what it is. Language models go to chat, image models to images, video models to videos. Parts such as projectors, adapters, encoders and tokenizers attach to the model that needs them.</p>
+      <div class="dl-empty-hint" id="models-first-run" hidden><p><strong>Nothing to add yet?</strong> Get models downloads ready-to-run models and adds them here.</p><button class="btn go" data-goto="get">Get models</button></div>
       <div class="block">
+        <h2 data-jump="Add">Add a model</h2>
         <div class="drop">
           <div class="pathfield">
             <input type="text" id="add-path" placeholder="Path to a .gguf, .safetensors, tokenizer.json or model folder" aria-label="Model path">
@@ -922,7 +981,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block"><div class="spread"><h2 data-jump="Music">Music models</h2><span class="muted small">Served on /v1/audio/music, and on /v1/audio/speech by name</span></div><div class="list" id="m-music"></div></div>
       <div class="block"><div class="spread"><h2 data-jump="Sound effects">Sound effect models</h2><span class="muted small">Served on /v1/audio/sound_effects</span></div><div class="list" id="m-sound"></div></div>
       <div class="block"><div class="spread"><h2 data-jump="3D">3D models</h2><span class="muted small">Served on /v1/3d/models</span></div><div class="list" id="m-model3d"></div></div>
-      <div class="block"><div class="spread"><h2 data-jump="Picture tools">Picture tools</h2><span class="muted small">Served on /v1/images/background and /v1/images/upscale</span></div><div class="list" id="m-picture"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Picture tools">Picture tools</h2><span class="muted small">Served on /v1/images/background_removal and /v1/images/upscale</span></div><div class="list" id="m-picture"></div></div>
     </section>
 
     <!-- Get models -->
@@ -992,7 +1051,7 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Port</span><input type="number" data-bind="gateway.port" data-type="int"></label>
           <label class="f"><span>API key</span><input type="password" data-bind="gateway.api_key" autocomplete="off"><small class="help">Empty = none.</small></label>
           <label class="f"><span>Public URL for file links</span><input type="text" data-bind="gateway.public_url" placeholder="http://my-pc:8080"></label>
-          <label class="f"><span>Allowed web origins</span><textarea data-bind="gateway.cors_origins" data-type="lines" rows="2" placeholder="http://localhost:3000"></textarea><small class="help">One per line, * for any.</small></label>
+          <label class="f"><span>Allowed web origins</span><textarea data-bind="gateway.cors_origins" data-type="lines" rows="3" placeholder="http://localhost:3000"></textarea><small class="help">One per line, * for any.</small></label>
         </div>
         <p class="muted small">Web pages can reach this port too, so without an API key, browser requests are refused unless their origin is listed. Apps, scripts and SDKs outside a browser are unaffected.</p>
         <p class="muted small">Use 0.0.0.0 to serve your network, and set an API key when you do. Address changes apply the next time the studio starts.</p>
@@ -1022,17 +1081,17 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Reply limit (tokens)</span><input type="number" data-bind="llm.max_tokens" data-type="int"></label>
           <label class="f"><span>Temperature</span><input type="number" step="0.05" data-bind="llm.temperature" data-type="num"></label>
           <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>
-          <label class="f"><span>Repeat penalty</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="num"><small class="help">1 = off; 1.1 stops a reply looping on a phrase.</small></label>
+          <label class="f"><span>Repeat penalty</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="numnull" placeholder="1"><small class="help">1 = off; 1.1 stops a reply looping on a phrase.</small></label>
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
           <label class="f"><span data-mac="Conversations in memory (GB)">Conversations in RAM (GB)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"><small class="help">Flash-Next sets conversations aside there. 0 = off, empty = the server's default.</small></label>
           <label class="f"><span>Runs on</span><select data-bind="llm.backend">
             <option value="auto">Auto: GPU, else CPU</option>
             <option value="webgpu">WebGPU (any GPU)</option>
             <option value="cpu">CPU only</option></select></label>
-          <label class="f"><span>WebGPU weights (GB)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="a card's memory less 4, a Mac's share"><small class="help">Empty = by the GPU's memory.</small></label>
+          <label class="f"><span>WebGPU weights (GB)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="auto"><small class="help">Empty = a card's memory less 4 GB, or a Mac's share.</small></label>
         </div>
         <p class="muted small" data-mac="WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in memory and run on the CPU. This Mac's GPU has no memory of its own: it shares the unified memory with the CPU, and left empty it holds what a card with two thirds of that memory would.">WebGPU runs every model on any Direct3D 12, Vulkan or Metal GPU: weights past the limit stay in RAM and run on the CPU. A Mac's own GPU shares the computer's memory: left empty, it holds what a card with two thirds of that memory would.</p>
-        <div class="row" style="margin-top:14px; gap:22px">
+        <div class="row" style="margin-top:14px; gap:10px 22px">
           <label class="check"><input type="checkbox" data-bind="llm.enabled"> Enabled</label>
           <label class="check"><input type="checkbox" data-bind="llm.autostart"> Start when OAIY opens</label>
           <label class="check" title="Pictures, videos and flows then use another GPU, or wait, rather than unload it; it is not stopped when idle either."><input type="checkbox" data-bind="llm.pinned"> Keep it loaded</label>
@@ -1043,7 +1102,7 @@ dialog::backdrop { background: var(--backdrop); }
       </div>
       <!-- A Mac's eGPU through tinygrad's server: shown where the engines offer it (macOS) -->
       <div class="block" id="egpu-block" hidden>
-        <h2>eGPU through tinygrad</h2>
+        <div class="spread"><h2>eGPU through tinygrad</h2><span id="egpu-tag"></span></div>
         <p class="muted small" style="margin-top:0">macOS has no driver for a graphics card in a Thunderbolt enclosure, so OAIY's own engine cannot see one. tinygrad can, through its TinyGPU app. With that set up, a model ticked "On the eGPU" under Models is answered by tinygrad's server on the card, and by this Mac's own GPU whenever the card is not there. It holds one model at a time, reads GGUF files, and answers chats: a request with a picture goes to this Mac's engine.</p>
         <div class="grid-f" style="grid-template-columns:1fr">
           <label class="f"><span>Python that has tinygrad</span><div class="pathfield"><input type="text" data-bind="llm.egpu.python" placeholder="/opt/homebrew/bin/python3"><button class="btn" type="button" data-pick="llm.egpu.python">Browse</button></div><small class="help">Empty = look for one.</small></label>
@@ -1059,16 +1118,17 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Context (tokens)</span><input type="number" min="512" step="1024" data-bind="llm.egpu.ctx" data-type="intnull" placeholder="8192"><small class="help">The card's memory for it is taken at the start.</small></label>
           <label class="f"><span>When the card is not there, answer with</span><select data-bind="llm.egpu.fallback_model" id="egpu-fallback"></select></label>
         </div>
-        <div class="row" style="margin-top:14px; gap:14px; align-items:center">
-          <label class="check" style="margin-right:8px"><input type="checkbox" data-bind="llm.egpu.enabled"> Use the eGPU</label>
-          <label class="check" style="margin-right:8px" title="With OAIY's own engine on the card: a Qwen Image picture is made on the card, its language model paused meanwhile (the card's memory is the picture's) and loaded again after. Pictures made while it is off, or while the card is not there, are made on this Mac."><input type="checkbox" data-bind="llm.egpu.images" id="egpu-images"> Make pictures on it too</label>
-          <label class="check" style="margin-right:8px" title="With OAIY's own engine on the card: video, music, sound effects, speech and 3D models are made on the card, its language model paused meanwhile and loaded again after. Made while it is off, or while the card is not there, they are made on this Mac."><input type="checkbox" data-bind="llm.egpu.media" id="egpu-media"> Make video, music, sound and speech on it too</label>
-          <button class="btn" type="button" id="egpu-check">Check tinygrad</button>
-          <button class="btn" type="button" id="egpu-start">Start</button>
-          <button class="btn" type="button" id="egpu-stop">Stop</button>
-          <span id="egpu-tag"></span>
+        <div class="row" style="margin-top:4px; gap:10px 22px">
+          <label class="check"><input type="checkbox" data-bind="llm.egpu.enabled"> Use the eGPU</label>
+          <label class="check" title="With OAIY's own engine on the card: a Qwen Image picture is made on the card, its language model paused meanwhile (the card's memory is the picture's) and loaded again after. Pictures made while it is off, or while the card is not there, are made on this Mac."><input type="checkbox" data-bind="llm.egpu.images" id="egpu-images"> Make pictures on it too</label>
+          <label class="check" title="With OAIY's own engine on the card: video, music, sound effects, speech and 3D models are made on the card, its language model paused meanwhile and loaded again after. Made while it is off, or while the card is not there, they are made on this Mac."><input type="checkbox" data-bind="llm.egpu.media" id="egpu-media"> Make video, music, sound and speech on it too</label>
         </div>
-        <p class="muted small" id="egpu-detail" style="white-space:pre-wrap"></p>
+        <p class="muted small" id="egpu-detail" style="white-space:pre-wrap; margin:14px 0 10px"></p>
+        <div class="row">
+          <button class="btn" type="button" id="egpu-start">Start</button>
+          <button class="btn warn" type="button" id="egpu-stop">Stop</button>
+          <button class="btn quiet" type="button" id="egpu-check">Check tinygrad</button>
+        </div>
         <p class="small" id="egpu-check-out" style="white-space:pre-wrap" hidden></p>
       </div>
       <div class="block">
@@ -1089,17 +1149,18 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Jobs kept in the list</span><input type="number" data-bind="media.keep_jobs" data-type="int"></label>
           <label class="f"><span>Open the UI as</span><select data-bind="ui.open"><option value="app">App window</option><option value="browser">Browser tab</option><option value="none">Nothing (console)</option></select></label>
         </div>
-        <div class="row" style="margin-top:14px; gap:22px">
+        <div class="row" style="margin-top:14px; gap:10px 22px">
           <label class="check"><input type="checkbox" data-bind="media.image.enabled"> Image generation</label>
           <label class="check"><input type="checkbox" data-bind="media.video.enabled"> Video generation</label>
         </div>
-        <p class="muted small" id="cfg-path"></p>
+        <p class="muted small wrap-any" id="cfg-path"></p>
       </div>
     </section>
 
     <!-- Logs -->
     <section class="view" id="v-logs">
       <h1>Logs</h1>
+      <p class="lede">What the studio and its engines print, newest at the bottom.</p>
       <div class="tabs" role="tablist">
         <button role="tab" aria-selected="true" data-log="studio">Studio</button>
         <button role="tab" aria-selected="false" data-log="llm">Language model</button>
@@ -1152,7 +1213,8 @@ const key = (() => { try { const k = new URLSearchParams(location.search).get("k
 // and a video played under the pointer began again.
 function keepRows(box, items, markup, empty) {
   if (!items.length) {
-    if (box.dataset.rows !== "none") { box.innerHTML = empty; box.dataset.rows = "none"; }
+    // (written again where what it says changed: the Gallery's says which filter found nothing)
+    if (box.dataset.rows !== "none" || box.emptyMarkup !== empty) { box.innerHTML = empty; box.dataset.rows = "none"; box.emptyMarkup = empty; }
     return;
   }
   if (box.dataset.rows !== "some") { box.innerHTML = ""; box.dataset.rows = "some"; }
@@ -1207,6 +1269,15 @@ async function needKey() {
     input: {type: "password", placeholder: "API key"}, buttons: [{label: "Unlock", value: "ok", kind: "go"}]});
   if (r?.text.trim()) { try { sessionStorage.setItem("studio-key", r.text.trim()); } catch {} location.reload(); }
   keyAsked = false;
+}
+// A path box shows the end of its path, the file or folder's own name, where the whole does not fit (it showed
+// "/Volumes/T9/models/fro…", the same in every row), and the whole path when the pointer rests on it. Not one the
+// person is typing in; boxes of a page not shown have no width yet, and are done when it is.
+function pathEnds(root = document) {
+  for (const el of $$(".pathfield input[type=text]", root)) {
+    if (el.title !== el.value) el.title = el.value;
+    if (el !== document.activeElement && el.offsetWidth && el.scrollWidth > el.clientWidth) el.scrollLeft = el.scrollWidth;
+  }
 }
 function toast(msg, err) {
   const t = document.createElement("div");
@@ -1401,6 +1472,7 @@ function show(view) {
   try { localStorage.setItem("studio-view", view); } catch {}
   if (location.hash.split(":")[0] !== "#" + view) history.replaceState(null, "", "#" + view);
   if (view === "logs") pollLogs(true);
+  requestAnimationFrame(() => pathEnds($("#v-" + view)));
   if (view === "play") requestAnimationFrame(fitPlayground);
   if (view === "gallery") refreshGallery();
   if (view === "endpoints") renderCompanion();
@@ -1447,6 +1519,7 @@ function bindFields() {
   $$("[data-pick]").forEach(b => b.onclick = () => pick({dir: !!b.dataset.dir, title: "Choose " + b.dataset.pick.split(".").pop()}, path => {
     setPath(cfg, b.dataset.pick, path); bindFields(); touch();
   }));
+  pathEnds();
 }
 
 function renderConfig() {
@@ -1562,13 +1635,13 @@ function loraList(section, name, list, label = "LoRAs (optional; each with a str
   const dir = section === "llm";
   const rows = (list || []).map((l, i) => {
     const path = typeof l === "string" ? l : (l.path || ""), strength = typeof l === "string" ? 1 : (l.strength ?? 1);
-    return `<div class="pathfield" style="margin-top:4px">
+    return `<div class="pathfield">
       <input type="text" value="${esc(path)}" data-lora="${section}|${esc(name)}|${i}|path" placeholder="${dir ? "LoRA folder (adapter_config.json, or a Flash-Next .gguf)" : "LoRA .safetensors"}">
       <input type="number" step="0.05" min="-4" max="4" value="${esc(String(strength))}" data-lora="${section}|${esc(name)}|${i}|strength" title="Strength (1 = as trained)" style="width:6em;flex:none">
       <button class="btn quiet warn" type="button" data-lora-remove="${section}|${esc(name)}|${i}">Remove</button></div>`;
   }).join("");
-  return `<div class="f"><span>${esc(label)}</span>${rows}
-    <div style="margin-top:4px"><button class="btn" type="button" data-lora-add="${section}|${esc(name)}"${dir ? ' data-dir="1"' : ""}>Add LoRA…</button></div></div>`;
+  return `<div class="f"><span class="small muted">${esc(label)}</span>${rows}
+    <div><button class="btn" type="button" data-lora-add="${section}|${esc(name)}"${dir ? ' data-dir="1"' : ""}>Add LoRA…</button></div></div>`;
 }
 function modelLoras(section, name) {
   const m = modelObj(section, name);
@@ -1586,7 +1659,7 @@ function modelObj(section, name) {
 function renderPictureTools() {
   const p = cfg.media.picture || {};
   const tools = [["background", "Background removal (BiRefNet: its folder)", true], ["upscaler", "Upscaling (Real-ESRGAN: its .pth or folder)", false]];
-  $("#m-picture").innerHTML = `<div class="item">${tools.map(([key, label, dir]) => `<div class="pathfield-row">${field(label, "picture", "tools", key, p[key], {dir})}${p[key] ? `<button class="btn quiet warn" type="button" data-ptool-clear="${key}">Remove</button>` : ""}</div>`).join("")}</div>`;
+  $("#m-picture").innerHTML = `<div class="item"><div class="cols" style="gap:12px">${tools.map(([key, label, dir]) => `<div class="pathfield-row">${field(label, "picture", "tools", key, p[key], {dir})}${p[key] ? `<button class="btn quiet warn" type="button" data-ptool-clear="${key}">Remove</button>` : ""}</div>`).join("")}</div></div>`;
   $$("[data-ptool-clear]").forEach(b => b.onclick = () => { cfg.media.picture[b.dataset.ptoolClear] = ""; renderModels(); touch(); });
 }
 function missingOf(section, m) {
@@ -1620,7 +1693,7 @@ function egpuTick(m) {
   const gguf = own || /\.gguf$/i.test((m.path || "").trim());
   const who = own ? "OAIY's engine on the eGPU (over WebGPU)" : "tinygrad's server on the eGPU";
   const held = state.egpu.model === m.name ? {ready: "Loaded on the eGPU", starting: "Loading on the eGPU"}[state.egpu.state] : "";
-  return `<div class="row" style="margin-top:8px; gap:10px; align-items:center">
+  return `<div class="row" style="gap:10px; align-items:center">
     <label class="check" title="${gguf ? `Chats with this model are answered by ${who}. When the card is not there, this Mac's GPU answers (Settings says with which model).` : "tinygrad's server reads GGUF files only."}"><input type="checkbox" data-egpu="${esc(m.name)}" ${m.egpu ? "checked" : ""} ${gguf || m.egpu ? "" : "disabled"}> On the eGPU (${own ? "WebGPU" : "tinygrad"}), when the card is there</label>
     ${held ? `<span class="tag gpu">${held}</span>` : ""}${m.egpu && !egpuOn() ? '<span class="muted small">The eGPU is switched off under Settings.</span>' : ""}
     ${m.egpu && own ? `<label class="f" style="margin:0" title="The context this model is started with on the card: empty is the eGPU's (Settings). A model whose attention cache can be this Mac's past what the card holds (Qwen3.8-Flash-Next's) can be given far more, up to 262,144; one whose cache must all be on the card (a dense 27B) fills a 24 GB card at 32,768."><span class="small">Context on the eGPU</span><input type="number" min="512" step="1024" style="width:110px" data-egpuctx="${esc(m.name)}" value="${esc(m.egpu_ctx ?? "")}" placeholder="${esc(cfg?.llm?.egpu?.ctx ?? 8192)}"></label>` : ""}</div>`;
@@ -1636,16 +1709,16 @@ function renderModels() {
   const llm = cfg.llm.models;
   $("#m-llm").innerHTML = llm.length ? llm.map(m => `<div class="item">
     <div class="item-head"><strong>${esc(m.name)}</strong>
-      ${cfg.llm.default_model === m.name || (!cfg.llm.default_model && llm[0] === m) ? '<span class="tag good">Default</span>' : `<button class="btn quiet" data-default="llm|${esc(m.name)}">Make default</button>`}
+      ${isDefaultLlm(m) ? '<span class="tag good">Default</span>' : ""}
       ${state?.llm?.resident === m.name && state.llm.state === "ready" ? '<span class="tag gpu">Loaded</span>' : ""}
-      <span style="flex:1"></span>
+      <span class="item-acts">${isDefaultLlm(m) ? "" : `<button class="btn quiet" data-default="llm|${esc(m.name)}">Make default</button>`}
       <label class="check"><input type="checkbox" data-menable="llm|${esc(m.name)}" ${m.enabled !== false ? "checked" : ""}> Enabled</label>
-      <button class="btn quiet warn" data-remove="llm|${esc(m.name)}">Remove</button></div>
-    <details class="item-more" data-item="llm|${esc(m.name)}" ${openItem("llm", m.name, !(m.path || "").trim()) ? "open" : ""}><summary>Files and settings <span class="muted small">${esc(baseName(m.path))}</span></summary>
-    <label class="check" style="margin-bottom:8px" title="Qwen3.5 and Qwen3.8 GGUFs that have a multi-token-prediction layer, and Qwen3.8-Flash-Next, on WebGPU: the layer drafts the next few tokens and the model checks them in one run. Experimental: on Qwen3.8 27B a third to two fifths faster on predictable text (lists, facts, code), a little faster on stories and about even at higher temperatures, holding about 0.3 GB more on the GPU; on Flash-Next two fifths to three fifths faster on lists, facts and code (79 to 94 tokens a second where 55 to 58) and a little faster on stories, with the same replies as without it, holding about 1 GB more."><input type="checkbox" data-mtp="${esc(m.name)}" ${m.mtp ? "checked" : ""}> Draft tokens with its MTP layer (experimental)</label>
+      <button class="btn quiet warn" data-remove="llm|${esc(m.name)}">Remove</button></span></div>
+    <details class="item-more" data-item="llm|${esc(m.name)}" ${openItem("llm", m.name, !(m.path || "").trim()) ? "open" : ""}>${itemSummary(m.path)}
     <div class="cols" style="gap:12px">${field("Weights", "llm", m.name, "path", m.path)}${field("Vision projector (optional)", "llm", m.name, "vision_projector", m.vision_projector)}${field("LoRA adapter folder (optional)", "llm", m.name, "lora", m.lora, {dir: true})}<label class="f"><span>LoRA strength (1 = as trained)</span><input type="number" step="0.05" min="-4" max="4" value="${esc(String(m.lora_strength ?? 1))}" data-lorastrength="${esc(m.name)}"></label></div>
     ${loraList("llm", m.name, m.loras, "More LoRAs (optional; stacked with the one above, each with a strength)")}
-    <div class="f" style="margin-top:8px"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>
+    <div class="f"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>
+    <label class="check" title="Qwen3.5 and Qwen3.8 GGUFs that have a multi-token-prediction layer, and Qwen3.8-Flash-Next, on WebGPU: the layer drafts the next few tokens and the model checks them in one run. Experimental: on Qwen3.8 27B a third to two fifths faster on predictable text (lists, facts, code), a little faster on stories and about even at higher temperatures, holding about 0.3 GB more on the GPU; on Flash-Next two fifths to three fifths faster on lists, facts and code (79 to 94 tokens a second where 55 to 58) and a little faster on stories, with the same replies as without it, holding about 1 GB more."><input type="checkbox" data-mtp="${esc(m.name)}" ${m.mtp ? "checked" : ""}> Draft tokens with its MTP layer (experimental)</label>
     ${egpuTick(m)}
     </details>
   </div>`).join("") : '<div class="empty">No language model yet. Add a .gguf file or model folder above.</div>';
@@ -1734,6 +1807,7 @@ function renderModels() {
 
   renderPictureTools();
   watchOpenItems();
+  pathEnds($("#v-models"));
   $$("[data-mfield]").forEach(el => el.oninput = () => { const [s, n, k] = el.dataset.mfield.split("|"); modelObj(s, n)[k] = el.value; touch(); });
   $$("[data-mpick]").forEach(b => b.onclick = () => { const [s, n, k] = b.dataset.mpick.split("|");
     pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const miss = s === "llm" || s === "picture" ? [] : missingOf(s, modelObj(s, n)); if (s !== "llm" && s !== "picture" && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
@@ -1800,6 +1874,13 @@ function filterModels() {
     $$(":scope > .empty", list).forEach(e => e.hidden = words.length > 0);
     list.closest(".block").hidden = words.length > 0 && here === 0;
   }
+  // (the picture tools, two paths rather than models: their list folds away too unless a word is in them, where it
+  // stayed under every search, empty boxes at the end of the results)
+  const pic = $("#m-picture"), tools = cfg.media?.picture || {};
+  if (pic) {
+    const hay = ["picture tools background removal upscaling upscaler birefnet real-esrgan", tools.background, tools.upscaler].join(" ").toLowerCase();
+    pic.closest(".block").hidden = words.length > 0 && !words.every(w => hay.includes(w));
+  }
   $("#model-search-count").textContent = !words.length ? "" : shown ? `${shown} of ${total} model${total === 1 ? "" : "s"} · Enter goes to the first` : "No model matches";
   if ($("#v-models").classList.contains("on")) renderJump("models");
   return first;
@@ -1819,13 +1900,27 @@ $("#model-search").onkeydown = e => {
 function mediaItem(section, name, m, arch, miss, fields) {
   const isDefault = cfg.media[section].default_model === name;
   return `<div class="item"><div class="item-head"><strong>${esc(name)}</strong><span class="tag">${esc(arch)}</span>
-    ${isDefault ? '<span class="tag good">Default</span>' : `<button class="btn quiet" data-default="${section}|${esc(name)}">Make default</button>`}
+    ${isDefault ? '<span class="tag good">Default</span>' : ""}
     ${miss.length ? `<span class="tag bad">Needs ${miss.map(esc).join(", ")}</span>` : lastResidency(name)}
-    <span style="flex:1"></span>
-    <label class="check"><input type="checkbox" data-menable="${section}|${esc(name)}" ${m.enabled !== false ? "checked" : ""} ${miss.length ? "disabled" : ""}> Enabled</label>
-    <button class="btn quiet warn" data-remove="${section}|${esc(name)}">Remove</button></div>
-    <details class="item-more" data-item="${section}|${esc(name)}" ${openItem(section, name, miss.length > 0) ? "open" : ""}><summary>Files and settings</summary>
+    <span class="item-acts">${isDefault ? "" : `<button class="btn quiet" data-default="${section}|${esc(name)}">Make default</button>`}
+    <label class="check" ${miss.length ? 'title="It can be switched on once it has the files it needs"' : ""}><input type="checkbox" data-menable="${section}|${esc(name)}" ${m.enabled !== false ? "checked" : ""} ${miss.length ? "disabled" : ""}> Enabled</label>
+    <button class="btn quiet warn" data-remove="${section}|${esc(name)}">Remove</button></span></div>
+    <details class="item-more" data-item="${section}|${esc(name)}" ${openItem(section, name, miss.length > 0) ? "open" : ""}>${itemSummary(mainFile(section, m))}
     <div class="cols" style="gap:12px">${fields}</div></details></div>`;
+}
+// The language model the others are measured against: the one named default, else the first.
+function isDefaultLlm(m) { return cfg.llm.default_model === m.name || (!cfg.llm.default_model && cfg.llm.models[0] === m); }
+// A model's folded part: its name, and the file or folder it is mostly made of (with the folder it is in: one named
+// "transformer" or "model" said little alone), so a row closed says which files it is.
+function itemSummary(path) {
+  const file = String(path || "").split(/[\\/]/).filter(Boolean).slice(-2).join("/");
+  return `<summary title="${esc(path || "")}">Files and settings${file ? `<span class="file">${esc(file)}</span>` : ""}</summary>`;
+}
+function mainFile(section, m) {
+  if (section === "image") return m.transformer || m.checkpoint || m.safetensors_transformer || m.base;
+  if (section === "video") return m.transformer;
+  if (section === "speech") return m.breeze || m.design || m.base;
+  return m.path;
 }
 
 // Each model's files and settings, folded under its name (the list was pages long): the ones opened stay open across
@@ -1835,6 +1930,7 @@ function openItem(section, name, needed) { return needed || openItems.has(`${sec
 function baseName(path) { return String(path || "").split(/[\\/]/).filter(Boolean).pop() || ""; }
 function watchOpenItems() {
   $$("details[data-item]").forEach(d => d.ontoggle = () => {
+    if (d.open) pathEnds(d);
     d.open ? openItems.add(d.dataset.item) : openItems.delete(d.dataset.item);
     try { localStorage.setItem("oaiy-open-models", JSON.stringify([...openItems])); } catch {}
   });
@@ -1952,7 +2048,10 @@ function shareNote() {
 }
 
 /* ---------- endpoints ---------- */
-const targets = [["chat", "Chat"], ["completions", "Completions"], ["models", "Model list"], ["images", "Images"], ["edits", "Image edits"], ["videos", "Videos"], ["files", "Generated files"], ["health", "Health"], ["discovery", "Discovery (for apps)"]];
+// Every service a route can serve (config.rs's TARGETS): one missing here showed as Chat, the first, in its row.
+const targets = [["chat", "Chat"], ["completions", "Completions"], ["models", "Model list"], ["images", "Images"], ["edits", "Image edits"], ["videos", "Videos"],
+  ["speech", "Speech"], ["voices", "Saved voices"], ["music", "Music"], ["sound", "Sound effects"], ["model3d", "3D models"], ["background", "Background removal"],
+  ["upscale", "Upscaling"], ["files", "Generated files"], ["health", "Health"], ["discovery", "Discovery (for apps)"]];
 function renderRoutes() {
   $("#routes").innerHTML = cfg.gateway.routes.map((r, i) => `<tr>
     <td><input type="checkbox" data-r="${i}|enabled" ${r.enabled !== false ? "checked" : ""} aria-label="Enabled"></td>
@@ -1975,9 +2074,11 @@ function renderExamples() {
   const lm = cfg.llm.default_model || cfg.llm.models[0]?.name || "your-model";
   if (chat) out.push(["Chat", `curl ${base}${chat.path}${auth} \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${lm}","messages":[{"role":"user","content":"Hello"}],"stream":true}'`]);
   if (img) out.push(["Image", img.spec === "oaiy" ? `curl ${base}${img.path}${auth} -d '{"prompt":"a red fox in snow"}'\ncurl ${base}${img.path}/status` : `curl ${base}${img.path}${auth} \\\n  -H "Content-Type: application/json" \\\n  -d '{"prompt":"a red fox in snow","size":"1024x1024","response_format":"url"}'`]);
-  if (edit) out.push(["Image edit", `curl ${base}${edit.path}${auth} \
-  -F image=@photo.png -F prompt="make it a snowy night" -F response_format=url`]);
-  if (vid) out.push(["Video", vid.spec === "oaiy" ? `curl ${base}${vid.path}${auth} -d '{"prompt":"waves at dusk"}'\ncurl ${base}${vid.path}/status` : `curl ${base}${vid.path}${auth} -H "Content-Type: application/json" -d '{"prompt":"waves at dusk","seconds":"4","size":"1280x720"}'\ncurl ${base}${vid.path}/VIDEO_ID\ncurl -o clip.mp4 ${base}${vid.path}/VIDEO_ID/content`]);
+  // (a backslash at a line's end inside a template is no character at all: the example came out on one line)
+  if (edit) out.push(["Image edit", `curl ${base}${edit.path}${auth} \\\n  -F image=@photo.png -F prompt="make it a snowy night" -F response_format=url`]);
+  if (vid) out.push(["Video", vid.spec === "oaiy" ? `curl ${base}${vid.path}${auth} -d '{"prompt":"waves at dusk"}'\ncurl ${base}${vid.path}/status` : `curl ${base}${vid.path}${auth} \\\n  -H "Content-Type: application/json" \\\n  -d '{"prompt":"waves at dusk","seconds":"4","size":"1280x720"}'\ncurl ${base}${vid.path}/VIDEO_ID\ncurl -o clip.mp4 ${base}${vid.path}/VIDEO_ID/content`]);
+  const speech = routeFor("speech");
+  if (speech) out.push(["Speech", `curl ${base}${speech.path}${auth} \\\n  -H "Content-Type: application/json" \\\n  -d '{"input":"Good morning!","voice":"nova","response_format":"wav"}' -o hello.wav`]);
   out.push(["SDKs", `from openai import OpenAI\nclient = OpenAI(base_url="${base}/v1", api_key="${cfg.gateway.api_key ? "YOUR_KEY" : "unused"}")`]);
   $("#examples").innerHTML = out.map(([t, c]) => `<h3>${t}</h3><pre class="example">${esc(c)}</pre>`).join("");
 }
@@ -2160,7 +2261,7 @@ function renderState() {
   keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="Open the result" data-job="${esc(j.id)}" tabindex="0" role="button">` : '<div class="ph"></div>'}
     <div><div class="p">${esc(j.prompt || (j.kind === "model3d" ? "3D model" : ""))}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
     <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`,
-    '<div class="empty">Nothing generated yet. Try the Playground.</div>');
+    nothingYet);
   $$("#ov-jobs img[data-job]").forEach(img => img.onclick = () => openViewer(img.dataset.job));
   const all = [...state.media.jobs, ...priv];
   const now = all.find(j => j.status === "in_progress") || all.find(j => j.status === "queued");
@@ -2217,16 +2318,17 @@ $("#egpu-start").onclick = () => api("/api/egpu/start", {method: "POST"}).then(r
 $("#egpu-stop").onclick = () => api("/api/egpu/stop", {method: "POST"}).then(refresh, e => toast(e.message, true));
 // Status lines include worker output: plain text, escaped here once.
 function statusText(j) { return esc(statusRaw(j)); }
-// A job's kind as people say it.
-function kindText(k) { return k === "model3d" ? "3D model" : k; }
+// A job's kind as people say it, at the start of a line ("video 42%" read as a word left over).
+const KIND_TEXT = {image: "Image", video: "Video", speech: "Speech", music: "Song", sound: "Sound effect", model3d: "3D model"};
+function kindText(k) { return KIND_TEXT[k] || (k ? k[0].toUpperCase() + k.slice(1) : "Media"); }
 function statusRaw(j) {
-  if (j.status === "in_progress") return `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`;
+  if (j.status === "in_progress") return `${j.progress.toFixed(0)}%${j.stage ? ", " + j.stage.replace(/_/g, " ") : ""}`;
   if (j.status === "failed") return "failed: " + (j.error || "").slice(0, 140);
   if (j.status === "completed" && j.seconds_taken) return `done in ${j.seconds_taken.toFixed(0)} s`;
   return j.status;
 }
 $("#llm-start").onclick = () => api("/api/llm/start", {method: "POST"}).then(refresh).catch(e => toast(e.message, true));
-$("#llm-stop").onclick = () => api("/api/llm/stop", {method: "POST"}).then(refresh);
+$("#llm-stop").onclick = () => api("/api/llm/stop", {method: "POST"}).then(refresh).catch(e => toast(e.message, true));
 $("#llm-restart").onclick = () => api("/api/llm/restart", {method: "POST"}).then(refresh).catch(e => toast(e.message, true));
 $("#llm-autostart").onchange = async e => {
   // Saved as it is ticked, as incognito is (Settings has the same tick, with the drafts there): the model loaded now
@@ -2239,10 +2341,10 @@ $("#llm-autostart").onchange = async e => {
     toast(saved.llm.autostart ? "The language model starts when OAIY opens" : "The language model starts at the first chat request");
   } catch (err) { e.target.checked = !e.target.checked; toast(err.message, true); }
 };
-$("#open-outputs").onclick = () => api("/api/open-outputs", {method: "POST"});
+$("#open-outputs").onclick = () => api("/api/open-outputs", {method: "POST"}).catch(e => toast(e.message, true));
 
 function renderSelects() {
-  const opts = (names, def) => names.map(n => `<option ${n === def ? "selected" : ""}>${esc(n)}</option>`).join("") || "<option value=''>None configured</option>";
+  const opts = (names, def) => names.map(n => `<option ${n === def ? "selected" : ""}>${esc(n)}</option>`).join("") || "<option value=''>No model yet (see Get models)</option>";
   const keep = id => $(id).value;
   const c = keep("#chat-model"), i = keep("#img-model"), v = keep("#vid-model");
   $("#chat-model").innerHTML = opts(cfg.llm.models.filter(m => m.enabled !== false).map(m => m.name), c || cfg.llm.default_model);
@@ -2797,6 +2899,11 @@ $("#m3d-form").onsubmit = async e => {
 
 /* ---------- gallery and viewer ---------- */
 let galleryJobs = [], galleryFilter = "all";
+// What an empty Gallery says, by its filter (each said "Generate something", Failed and In progress too).
+const nothingYet = '<div class="empty">Nothing generated yet. <button class="btn quiet" type="button" data-goto="play">Open the Playground</button></div>';
+const galleryEmpty = {all: nothingYet, image: '<div class="empty">No images in the list.</div>', video: '<div class="empty">No videos in the list.</div>',
+  speech: '<div class="empty">No speech in the list.</div>', music: '<div class="empty">No songs in the list.</div>', sound: '<div class="empty">No sound effects in the list.</div>',
+  model3d: '<div class="empty">No 3D models in the list.</div>', active: '<div class="empty">Nothing is being made right now.</div>', failed: '<div class="empty">Nothing has failed.</div>'};
 async function refreshGallery() { try { galleryJobs = keyed((await api("/api/jobs")).jobs); renderGallery(); } catch (e) { toast(e.message, true); } }
 function renderGallery(fresh) {
   if (fresh) { const byId = new Map(galleryJobs.map(j => [j.id, j])); fresh.forEach(j => byId.set(j.id, j)); galleryJobs = [...byId.values()].sort((a, b) => b.created_at - a.created_at); }
@@ -2813,8 +2920,8 @@ function renderGallery(fresh) {
       : j.kind === "sound" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13"/></svg></div>`
       : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="3D model" loading="lazy">` : `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></div>`)
       : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(j.prompt)}" loading="lazy">`;
-    return `<figure data-job="${j.id}" tabindex="0" role="button" aria-label="Open ${esc(j.kind === "model3d" ? "the 3D model" : "the result")}">${media}<figcaption><span class="p">${esc(j.kind === "model3d" ? "3D model" : j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "model3d" ? j.size : j.kind === "video" || j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
-  }, '<div class="empty">Nothing here yet. Generate something in the Playground.</div>');
+    return `<figure data-job="${j.id}" tabindex="0" role="button" aria-label="Open ${esc(j.kind === "model3d" ? "the 3D model" : "the result")}">${media}<figcaption><span class="p" title="${esc(j.prompt || "")}">${esc(j.kind === "model3d" ? "3D model" : (j.prompt || "").slice(0, 240))}</span><span>${esc(j.kind === "model3d" ? j.size : j.kind === "video" || j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
+  }, galleryEmpty[galleryFilter] || galleryEmpty.all);
   $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
 }
 $$("#gallery-filter button").forEach(b => b.onclick = () => { galleryFilter = b.dataset.f; $$("#gallery-filter button").forEach(x => x.setAttribute("aria-pressed", x === b)); renderGallery(); });
@@ -2822,7 +2929,7 @@ function openViewer(id) {
   const j = galleryJobs.find(j => j.id === id) || state?.media?.jobs?.find(j => j.id === id);
   if (!j) return;
   const file = j.files[0];
-  $("#viewer-media").innerHTML = j.status !== "completed" ? `<div class="empty" style="padding:40px">${statusText(j)}</div>`
+  $("#viewer-media").innerHTML = j.status !== "completed" ? `<div class="empty" style="padding:40px${j.status === "failed" ? ";color:var(--bad)" : ""}">${statusText(j)}</div>`
     : j.kind === "video" ? `<video src="${esc(file)}" poster="${esc(j.preview || "")}" controls autoplay loop playsinline></video>`
     : j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (file ? `<div style="padding:40px;width:100%"><audio src="${esc(file)}" controls autoplay style="width:100%"></audio>${j.settings?.lyrics ? `<pre style="white-space:pre-wrap;font-size:12px;margin-top:14px">${esc(j.settings.lyrics)}</pre>` : ""}</div>` : `<div class="empty" style="padding:40px">Done</div>`)
     : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="The picture the 3D model was made from, cut out">` : `<div class="empty" style="padding:40px">Done</div>`)
@@ -2837,8 +2944,9 @@ function openViewer(id) {
   $("#viewer-meta").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
   const others = j.files.slice(1).map((f, i) => `<a class="btn quiet" href="${esc(f)}" target="_blank" data-open>Image ${i + 2}</a>`).join("");
   const glb = j.kind === "model3d";
+  // (the result's own: open, save, its other pictures; then reuse; Remove last, apart from them)
   $("#viewer-actions").innerHTML = (file && glb ? `<a class="btn" href="${esc(file)}" download="model.glb">Download GLB</a>` : file ? `<a class="btn" href="${esc(file)}" target="_blank" data-open>Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
-    + `<button class="btn" id="viewer-reuse"${glb ? " hidden" : ""}>Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>` + others;
+    + others + `<button class="btn" id="viewer-reuse"${glb ? " hidden" : ""}>Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>`;
   $("#viewer-reuse").onclick = () => {
     const tab = j.kind === "video" ? "video" : j.kind === "speech" ? "speech" : j.kind === "music" ? "music" : j.kind === "sound" ? "sound" : "image";
     $(tab === "speech" ? "#sp-input" : tab === "music" ? "#mu-prompt" : tab === "sound" ? "#sfx-prompt" : `#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
@@ -2926,7 +3034,7 @@ async function refreshDownloads(full) {
 }
 function renderDownloads() {
   if (!dl) return;
-  if (!dlDirEdited) $("#dl-dir").value = dl.dir;
+  if (!dlDirEdited && $("#dl-dir").value !== dl.dir) { $("#dl-dir").value = dl.dir; pathEnds($("#v-get")); }
   $("#dl-free").innerHTML = dl.free != null ? `<span>${dlSize(dl.free)} free on this drive</span>` : "";
   $("#dl-token").placeholder = dl.token ? "A token is saved (type a new one to replace it)" : "hf_… (read access)";
   // (each part kept from one render to the next where it is what it was: the cards are read every second, and a
@@ -3077,7 +3185,8 @@ document.addEventListener("keydown", e => {
   const t = e.target.closest?.("figure[data-job], img[data-job]");
   if (t && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openViewer(t.dataset.job); }
 });
-$$("[data-goto]").forEach(b => b.onclick = () => show(b.dataset.goto));
+// (a button that goes to another section, there from the start or drawn later, as an empty list's is)
+document.addEventListener("click", e => { const b = e.target.closest("[data-goto]"); if (b) show(b.dataset.goto); });
 $("#dl-dir").oninput = () => { dlDirEdited = true; $("#dl-dir-save").hidden = false; forgetPlans(); renderDownloads(); };
 $("#dl-browse").onclick = () => pick({dir: true, title: "Choose the folder to save models in", start: $("#dl-dir").value}, p => { $("#dl-dir").value = p; dlDirEdited = true; $("#dl-dir-save").hidden = false; });
 $("#dl-dir-save").onclick = async () => {

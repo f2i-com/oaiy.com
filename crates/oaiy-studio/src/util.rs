@@ -101,7 +101,55 @@ pub fn random_id(prefix: &str) -> String {
     out
 }
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// A secret: `prefix` + 64 hex characters, 32 bytes of the operating system's randomness, such as the key the
+/// studio's own engines are started with. (`random_id` mixes the time, the process and a counter: fine for a job's
+/// name, not for a key another program on this computer could otherwise work out.)
+pub fn random_key(prefix: &str) -> String {
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 32];
+    if !os_random(&mut bytes) {
+        mixed_random(&mut bytes);
+    }
+    let mut out = String::with_capacity(prefix.len() + 64);
+    out.push_str(prefix);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// `buf` filled from /dev/urandom; false where it cannot be read.
+#[cfg(unix)]
+fn os_random(buf: &mut [u8]) -> bool {
+    use std::io::Read as _;
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).is_ok()
+}
+
+/// (Windows has no such file, and the standard library no call for its randomness: `mixed_random` stands in)
+#[cfg(not(unix))]
+fn os_random(_: &mut [u8]) -> bool {
+    false
+}
+
+/// `buf` filled where the system's randomness cannot be read: `random_id`'s mix of the time, the process, a counter
+/// and a stack address, hashed by the standard library's `RandomState`, whose keys the operating system's randomness
+/// seeds once per process (each one made after it a new key: every 8 bytes another hasher).
+fn mixed_random(buf: &mut [u8]) {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(7, |d| d.as_nanos() as u64);
+    let local = 0u8;
+    let seed = nanos() ^ (std::process::id() as u64) << 32 ^ COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ std::ptr::addr_of!(local) as u64;
+    for (i, chunk) in buf.chunks_mut(8).enumerate() {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(seed);
+        h.write_usize(i);
+        h.write_u64(nanos());
+        chunk.copy_from_slice(&h.finish().to_le_bytes()[..chunk.len()]);
+    }
+}
+
+const B64: &[u8; 64] =b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -254,6 +302,23 @@ mod tests {
         assert_eq!(log.since(0).len(), 3);
         assert_eq!(log.since(4).len(), 1);
         assert_eq!(log.tail(2), "line 3\nline 4");
+    }
+
+    #[test]
+    fn keys_are_32_random_bytes_in_hex_and_differ() {
+        let (a, b) = (random_key("sk-test-"), random_key("sk-test-"));
+        assert_ne!(a, b);
+        for key in [&a, &b] {
+            let hex = key.strip_prefix("sk-test-").expect("the prefix leads");
+            assert_eq!(hex.len(), 64, "{key}");
+            assert!(hex.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')), "{key}");
+        }
+        // (and where the system's randomness cannot be read: two fills differ too, and fill every byte's place)
+        let (mut x, mut y) = ([0u8; 32], [0u8; 32]);
+        mixed_random(&mut x);
+        mixed_random(&mut y);
+        assert_ne!(x, y);
+        assert!(x.chunks(8).all(|c| c != [0u8; 8]));
     }
 
     #[test]

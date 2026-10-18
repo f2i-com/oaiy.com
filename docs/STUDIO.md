@@ -89,13 +89,22 @@ it serves an API and no pages.
 ### The UI
 
 - **Layout:** the UI fills any window. Wide screens get more room; under
-  1180 px the sidebar folds to icons; under 860 px it becomes a scrolling bar
-  along the top; at phone widths forms and the route table stack.
+  1180 px the sections move to a bar along the bottom, each with its name (in
+  OAIY's window it is always there); under 700 px the bar holds four of them and
+  **More**, which unfolds the rest. At phone widths forms stack, each route takes
+  two lines, and the file picker and the viewer take the whole screen.
 - **Theme:** light and dark, following the system until you pick one (or add
   `?theme=light` to the address).
 - **Pages:**
   - Overview shows what is running now. With no models yet, it points to Get models.
   - Get models downloads ready-to-run models (see [Getting models](#getting-models)).
+  - Models lists each model on one line: its name, type and tags, then **Make
+    default**, **Enabled** and **Remove**. Its files and settings fold under it,
+    the folded line naming the file or folder it is mostly made of. A path box
+    shows the end of its path (the file's own name) where the whole does not
+    fit, and the whole path when the pointer rests on it.
+  - Logs shows what the studio and its engines print (the language model, the
+    media worker, and the eGPU's server where there is one), newest at the bottom.
   - The Gallery keeps everything generated this session, with each item's
     prompt, seed, steps and where its weights lived. Items can be reused,
     downloaded or removed.
@@ -675,8 +684,9 @@ A configuration written before that gains them once (`origins_version`);
 remove any you do not want and they stay removed. oaiy-llm-server is always started with `--local-images off`, so nothing
 reaching the gateway can have the vision model read files from this machine.
 
-`oaiy-llm-server` runs on a private loopback port with a random key and is started
-with `--watch-stdin`. The studio holds that pipe, so if the studio dies,
+`oaiy-llm-server` runs on a private loopback port with a random key (32 bytes of the
+system's randomness, passed in its environment as `OAIY_LLM_API_KEY`, not on its command
+line where `ps` would show it) and is started with `--watch-stdin`. The studio holds that pipe, so if the studio dies,
 however it ends, the server exits and returns its GPU memory.
 
 ## Configuration reference

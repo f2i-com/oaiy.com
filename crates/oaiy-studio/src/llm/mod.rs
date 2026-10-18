@@ -12,7 +12,7 @@
 pub(crate) mod egpu;
 
 use crate::config;
-use crate::util::{bool_or, int_or, num_or, random_id, str_or, LogRing};
+use crate::util::{bool_or, int_or, num_or, random_key, str_or, LogRing};
 use oaiy_engine::json::Json;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -164,8 +164,10 @@ pub fn holds_a_model(llm: &Json) -> bool {
 /// What the log says when [`holds_a_model`] is false and the engine is left stopped.
 pub const ALL_ON_EGPU: &str = "the language model runs on the eGPU: this computer's engine starts only for a request for a model of its own, or one the eGPU cannot answer";
 
-pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bool) -> Result<(Vec<String>, Vec<String>), String> {
-    arguments_for(llm, root, port, key, local_images, None)
+/// The server's command line. Its key is not on it: it goes in the environment (`OAIY_LLM_API_KEY`, see `server_command`),
+/// where another user's `ps` does not show it.
+pub fn arguments(llm: &Json, root: &Path, port: u16, local_images: bool) -> Result<(Vec<String>, Vec<String>), String> {
+    arguments_for(llm, root, port, local_images, None)
 }
 
 /// [`arguments`], with the model a request is waiting for (`first`) as the one the server loads as it starts.
@@ -174,7 +176,7 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
 /// it names an enabled model, else the default. A default that is set to run on the eGPU (macOS, `crate::llm::egpu`) is
 /// tinygrad's server's to hold, so the first model that is not is loaded here instead: a 24 GB Mac has no room to
 /// load a 27B beside the card for nothing.
-pub fn arguments_for(llm: &Json, root: &Path, port: u16, key: &str, local_images: bool, first: Option<&str>) -> Result<(Vec<String>, Vec<String>), String> {
+pub fn arguments_for(llm: &Json, root: &Path, port: u16, local_images: bool, first: Option<&str>) -> Result<(Vec<String>, Vec<String>), String> {
     let models: Vec<&Json> = llm
         .get("models")
         .and_then(Json::as_array)
@@ -243,7 +245,6 @@ pub fn arguments_for(llm: &Json, root: &Path, port: u16, key: &str, local_images
     }
     push("--host", "127.0.0.1".into());
     push("--port", port.to_string());
-    push("--api-key", key.into());
     push("--ctx", match int_or(llm, "ctx", 0) { 0 => "auto".into(), n => n.to_string() });
     push("--max-tokens", int_or(llm, "max_tokens", 8192).to_string());
     push("--temperature", num_or(llm, "temperature", 0.6).to_string());
@@ -400,10 +401,10 @@ impl Llm {
             return Ok(());
         }
         let port = free_port()?;
-        let key = random_id("sk-studio-");
+        let key = random_key("sk-studio-");
         let gateway_host = cfg.get("gateway").map_or("127.0.0.1", |g| str_or(g, "host", "127.0.0.1"));
         let loopback = gateway_host == "localhost" || gateway_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-        let (mut args, names) = arguments_for(llm, root, port, &key, loopback, first)?;
+        let (mut args, names) = arguments_for(llm, root, port, loopback, first)?;
         let webgpu_gb = llm.get("webgpu_gb").and_then(Json::as_i64).filter(|n| *n > 0).or_else(|| auto_webgpu_gb(&crate::system::System::new().gpus(), llm));
         if let Some(gb) = webgpu_gb {
             args.push("--webgpu-gb".into());
@@ -459,15 +460,8 @@ impl Llm {
     /// Start one launch: the process with piped output (read into the log) and
     /// the stdin lifeline. Returns the child and the command line shown in logs.
     fn spawn(&self, launch: &Launch, args: &[String], key: &str, root: &Path) -> Result<(Child, String), String> {
-        let mut command = oaiy_host_env::command(&launch.program);
-        command.args(args).args(["--backend", launch.backend]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).current_dir(root);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let shown: Vec<String> = args.iter().map(|a| if a == key { "<key>".into() } else { a.clone() }).collect();
-        let shown = format!("{} {} --backend {}", launch.program.display(), shown.join(" "), launch.backend);
+        let mut command = server_command(launch, args, key, root);
+        let shown = format!("{} {} --backend {}", launch.program.display(), args.join(" "), launch.backend);
         self.log.push(format!("studio: starting {shown}"));
         let mut child = command.spawn().map_err(|e| format!("{}: {e}", launch.program.display()))?;
         for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)].into_iter().flatten() {
@@ -606,6 +600,20 @@ impl Drop for Llm {
     }
 }
 
+/// The server's command: its key in its environment (`OAIY_LLM_API_KEY`, which oaiy-llm-server reads where no
+/// `--api-key` gives one), not on its command line, where any user of this computer could read it with `ps`.
+fn server_command(launch: &Launch, args: &[String], key: &str, root: &Path) -> std::process::Command {
+    let mut command = oaiy_host_env::command(&launch.program);
+    command.args(args).args(["--backend", launch.backend]).env("OAIY_LLM_API_KEY", key);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).current_dir(root);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,9 +640,21 @@ mod tests {
     #[test]
     fn a_model_ticked_to_draft_is_named_for_mtp() {
         let llm = Json::parse(br#"{"models": [{"name": "q", "path": "q.gguf", "mtp": true}, {"name": "p", "path": "p.gguf"}, {"name": "r", "path": "r.gguf", "mtp": false}]}"#).unwrap();
-        let args = arguments(&llm, Path::new("/install"), 1, "k", true).unwrap().0;
+        let args = arguments(&llm, Path::new("/install"), 1, true).unwrap().0;
         let mtp: Vec<&str> = args.windows(2).filter(|w| w[0] == "--mtp").map(|w| w[1].as_str()).collect();
         assert_eq!(mtp, ["q"]);
+    }
+
+    #[test]
+    fn the_key_goes_in_the_environment_not_on_the_command_line() {
+        let launch = Launch { program: PathBuf::from("oaiy-llm-server"), backend: "auto" };
+        let key = crate::util::random_key("sk-studio-");
+        let args = vec!["--port".to_string(), "9000".to_string()];
+        let command = server_command(&launch, &args, &key, Path::new("/install"));
+        assert!(command.get_args().all(|a| a.to_str() != Some(key.as_str())), "the key is not an argument");
+        let env: Vec<_> = command.get_envs().filter(|(k, _)| *k == "OAIY_LLM_API_KEY").collect();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].1.and_then(|v| v.to_str()), Some(key.as_str()));
     }
 
     #[test]
@@ -650,26 +670,27 @@ mod tests {
                 {{"name": "off", "path": "x.gguf", "enabled": false}}
             ]}}"#).as_bytes()).unwrap();
         let root = Path::new("/install");
-        let (args, names) = arguments(&llm, root, 9000, "secret", true).unwrap();
+        let (args, names) = arguments(&llm, root, 9000, true).unwrap();
         assert_eq!(names, ["b", "a"]);
         let joined = args.join(" ");
         assert!(joined.starts_with(&format!("--model {whole} --name b --also a=")), "{joined}");
         assert!(joined.contains(&format!("a={}", root.join("models/a.gguf").display())));
         assert!(joined.contains("--vision-projector b="));
-        for flag in ["--port 9000", "--api-key secret", "--ctx 4096", "--devices 1", "--thinking", "--no-vision", "--local-images off", "--quiet"] {
+        assert!(!joined.contains("--api-key"), "the key is not on the command line: {joined}");
+        for flag in ["--port 9000", "--ctx 4096", "--devices 1", "--thinking", "--no-vision", "--local-images off", "--quiet"] {
             assert!(joined.contains(flag), "{flag} missing from {joined}");
         }
         assert!(!joined.contains("--prompt-cache"));
         assert!(!joined.contains("--usage"), "nothing kept between runs where the prompt states are not");
         let none = Json::parse(br#"{"models": []}"#).unwrap();
-        assert!(arguments(&none, root, 1, "k", true).is_err());
+        assert!(arguments(&none, root, 1, true).is_err());
         let auto = Json::parse(br#"{"models": [{"name": "a", "path": "a.gguf"}]}"#).unwrap();
-        let joined = arguments(&auto, root, 1, "k", true).unwrap().0.join(" ");
+        let joined = arguments(&auto, root, 1, true).unwrap().0.join(" ");
         assert!(joined.contains("--ctx auto"), "{joined}");
         // LoRAs stack: the adapter folder, then each of `loras` at its own strength.
         let at = if cfg!(windows) { "C:" } else { "" };
         let stacked = Json::parse(format!(r#"{{"models": [{{"name": "q", "path": "{at}/q", "lora": "{at}/one", "loras": [{{"path": "{at}/two", "strength": 0.5}}, "{at}/three"]}}]}}"#).as_bytes()).unwrap();
-        let args = arguments(&stacked, root, 1, "k", true).unwrap().0;
+        let args = arguments(&stacked, root, 1, true).unwrap().0;
         let loras: Vec<&str> = args.windows(2).filter(|w| w[0] == "--lora").map(|w| w[1].as_str()).collect();
         assert_eq!(loras, [format!("q={at}/one"), format!("q={at}/two@0.5"), format!("q={at}/three")]);
     }
@@ -678,7 +699,7 @@ mod tests {
     fn park_gb_is_passed_only_when_it_is_configured() {
         let root = Path::new("/install");
         let park = |llm: &Json| {
-            let args = arguments(llm, root, 1, "k", true).unwrap().0;
+            let args = arguments(llm, root, 1, true).unwrap().0;
             args.windows(2).find(|w| w[0] == "--park-gb").map(|w| w[1].clone())
         };
         let parse = |llm: &str| Json::parse(llm.as_bytes()).unwrap();
@@ -740,7 +761,7 @@ mod tests {
     #[test]
     fn the_model_a_request_waits_for_is_loaded_first_and_the_egpus_are_not_offered_here() {
         let root = Path::new("/install");
-        let first = |llm: &str, want: Option<&str>| arguments_for(&Json::parse(llm.as_bytes()).unwrap(), root, 1, "k", true, want).unwrap().1;
+        let first = |llm: &str, want: Option<&str>| arguments_for(&Json::parse(llm.as_bytes()).unwrap(), root, 1, true, want).unwrap().1;
         let models = r#""models": [{"name": "big", "path": "big.gguf", "egpu": true}, {"name": "small", "path": "small.gguf"}, {"name": "tiny", "path": "tiny.gguf"}]"#;
         // The default is tinygrad's to hold: this computer's engine starts with the first model that is its own, and
         // is not offered the eGPU's (a request naming one would load it here beside the card's copy).

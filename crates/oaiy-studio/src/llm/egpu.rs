@@ -25,7 +25,7 @@
 
 use crate::config;
 use crate::llm::{Endpoint, State};
-use crate::util::{bool_or, int_or, random_id, str_or, LogRing};
+use crate::util::{bool_or, int_or, random_key, str_or, LogRing};
 use oaiy_engine::json::Json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -267,7 +267,7 @@ fn engine_arguments(llm: &Json, root: &Path, m: &Json, script: &Path, port: u16)
     crate::util::set(&mut alone, "models", Json::Arr(vec![one]));
     crate::util::set(&mut alone, "ctx", Json::Int(model_context(llm, str_or(m, "name", ""))));
     crate::util::set(&mut alone, "devices", Json::Arr(Vec::new()));
-    let (engine, _) = crate::llm::arguments_for(&alone, root, port, "", false, Some(str_or(m, "name", "")))?;
+    let (engine, _) = crate::llm::arguments_for(&alone, root, port, false, Some(str_or(m, "name", "")))?;
     let mut a = vec!["-u".to_string(), script.to_string_lossy().into_owned(), "--watch-stdin".into(), "--webgpu".into(), program.to_string_lossy().into_owned()];
     let mut it = engine.into_iter();
     while let Some(flag) = it.next() {
@@ -863,7 +863,7 @@ impl Egpu {
         let runtime = runtime.as_ref();
         let script = Self::script(root, runtime)?;
         let port = free_port()?;
-        let key = random_id("sk-egpu-");
+        let key = random_key("sk-egpu-");
         let mut args = arguments(llm, root, name, &script, port)?;
         let paused = paused && webgpu(llm);
         if paused {
