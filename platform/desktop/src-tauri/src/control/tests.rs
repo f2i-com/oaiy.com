@@ -941,7 +941,11 @@ async fn the_agent_sets_up_and_pairs_only_where_the_person_lets_it() {
                     if b.get("accept") == Some(&json!(false)) {
                         return Json(json!({ "status": "declined" }));
                     }
-                    Json(if n.fetch_add(1, Ordering::SeqCst) == 0 { json!({ "status": "pending", "code": "123 456" }) } else { json!({ "status": "approved_there", "code": "123 456" }) })
+                    Json(if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                        json!({ "status": "pending", "code": "123 456", "worker": { "name": "Rig" } })
+                    } else {
+                        json!({ "status": "approved_there", "code": "123 456", "worker": { "name": "Rig" } })
+                    })
                 }
             }),
         );
@@ -955,7 +959,8 @@ async fn the_agent_sets_up_and_pairs_only_where_the_person_lets_it() {
     assert!(confirms.lock().unwrap().iter().all(|b| b.get("accept").is_none()), "not confirmed: {:?}", confirms.lock().unwrap());
     // the person says both screens show it: confirmed, one way (not asked both)
     let r = call(&app, None, "network_pair", json!({ "pairingId": "p1", "codeConfirmed": true })).await;
-    assert!(!is_error(&r) && text(&r).contains(r#"Paired with "the computer""#), "{r}");
+    // (taken up again by its id: named as the desktop answers it, not "the computer")
+    assert!(!is_error(&r) && text(&r).contains(r#"Paired with "Rig""#), "{r}");
     let last = confirms.lock().unwrap().last().cloned().unwrap();
     assert_eq!((&last["accept"], &last["bothWays"]), (&json!(true), &json!(false)), "this side confirmed, one way: {last}");
     // the person says they differ: given up

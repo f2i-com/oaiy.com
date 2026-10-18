@@ -373,7 +373,9 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
       else next();
       return;
     }
-    if (form.dirty || current?.state !== 'done') {
+    // (saved where edited, or where a step it needs is not done yet: an optional step left as it was is not written over
+    // with what the form filled in)
+    if (form.dirty || (current?.state !== 'done' && !current?.step.optional)) {
       setBusy(true);
       setStepError(null);
       const saved = await form.save();
@@ -582,10 +584,14 @@ function SettingsStep({ record, step, onSaved, handle }: { record: PluginRecord;
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [dirty, setDirty] = useState(false);
+  /** The settings the plugin answered (and the ones changed here): only these are saved, so a setting it did not say,
+   * left as it was, keeps the plugin's own default rather than a blank or "off" the form filled in. */
+  const known = useRef<Set<string>>(new Set());
   const load = useCallback(async () => {
     try {
       const data = await pluginCommand(record, step.read?.command ?? 'settings.get');
       const bag = (at(data, step.read?.path ?? 'settings') ?? {}) as Record<string, unknown>;
+      known.current = new Set(fields.map((f) => f.key).filter((k) => bag[k] !== undefined));
       setValues(Object.fromEntries(fields.map((f) => [f.key, fieldValue(f, bag[f.key])])));
       setError(null);
     } catch (e) {
@@ -603,6 +609,7 @@ function SettingsStep({ record, step, onSaved, handle }: { record: PluginRecord;
       // (a number left blank is left as it is, not saved as 0)
       const payload = Object.fromEntries(
         fields
+          .filter((f) => known.current.has(f.key))
           .filter((f) => !(f.type === 'number' && (values[f.key] === '' || values[f.key] === undefined || values[f.key] === null)))
           .map((f) => [f.key, f.type === 'number' ? Number(values[f.key]) : values[f.key]]),
       );
@@ -629,6 +636,7 @@ function SettingsStep({ record, step, onSaved, handle }: { record: PluginRecord;
 
   if (!values) return error ? <RetryLine message={error} onRetry={() => void load()} /> : <p className="form-hint">Reading its settings…</p>;
   const set = (key: string, v: unknown) => {
+    known.current.add(key);
     setSaved(false);
     setDirty(true);
     setValues((prev) => ({ ...prev, [key]: v }));

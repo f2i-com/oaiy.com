@@ -28,7 +28,7 @@ use super::{lock, Network};
 /// Files asked about at once.
 const MAX_ASKED: usize = 256;
 /// How long the computers lending are asked which files they have, all at once, before what they said is used.
-const ASK_BUDGET: Duration = Duration::from_secs(4);
+const ASK_BUDGET: Duration = Duration::from_secs(8);
 /// A file's bytes not arriving for this long, once they started: the lender is given up on.
 const STALLED: Duration = Duration::from_secs(60);
 /// How often a transfer looks whether it is to stop, while it waits on the lender.
@@ -133,13 +133,14 @@ pub(super) async fn blob(State(net): State<Network>, Extension(caller): Extensio
     if !sha_ok(&sha) {
         return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a file is asked for by its SHA-256");
     }
-    let Ok(sending) = sends_to(&p.fingerprint).try_acquire_owned() else {
-        return refuse(StatusCode::TOO_MANY_REQUESTS, "busy", "this computer is sending that computer as many files as it sends at once");
-    };
     let found = {
         let one = checking(&sha);
         let _reading = one.lock().await;
         find(&net, &[Wanted { sha256: sha.clone(), size: q.size }], true).await
+    };
+    // (taken once the file is found and checked: the minutes of reading its SHA-256 hold no place to send)
+    let Ok(sending) = sends_to(&p.fingerprint).try_acquire_owned() else {
+        return refuse(StatusCode::TOO_MANY_REQUESTS, "busy", "this computer is sending that computer as many files as it sends at once");
     };
     let path = match found.map(|f| f.into_iter().next().flatten()) {
         Some(Some((path, true))) => path,
@@ -225,7 +226,17 @@ async fn holders(net: &Network, files: &[(String, u64)]) -> Vec<Vec<Peer>> {
             Some((p, v))
         }
     });
-    let answers = tokio::time::timeout(ASK_BUDGET + Duration::from_millis(500), futures_util::future::join_all(asks)).await.unwrap_or_default();
+    // (each answer kept as it comes, what did not come by the deadline left out: not all thrown away for one slow one)
+    let mut pending: futures_util::stream::FuturesUnordered<_> = asks.collect();
+    let deadline = tokio::time::Instant::now() + ASK_BUDGET + Duration::from_millis(500);
+    let mut answers = Vec::new();
+    loop {
+        use futures_util::StreamExt;
+        match tokio::time::timeout_at(deadline, pending.next()).await {
+            Ok(Some(a)) => answers.push(a),
+            Ok(None) | Err(_) => break,
+        }
+    }
     for (p, v) in answers.into_iter().flatten() {
         for f in v.get("files").and_then(Value::as_array).into_iter().flatten().filter(|f| f["have"] == json!(true)) {
             // (matched by SHA-256 and size, never by where in the answer it is)
@@ -279,7 +290,19 @@ pub(crate) async fn fetch(net: &Network, sha256: &str, size: u64, part: &Path, p
     let id = net.identity()?;
     let mut last = None;
     for peer in lenders {
-        match fetch_from(&id, &peer, sha256, size, part, progress, stop).await {
+        // (a computer still reading the file's SHA-256, or sending others as many files as it does at once, is asked
+        // again a few times, waiting longer each time, before the next is asked)
+        let mut wait = Duration::from_secs(2);
+        let outcome = loop {
+            match fetch_from(&id, &peer, sha256, size, part, progress, stop).await {
+                Err(e) if (e.contains("HTTP 503") || e.contains("HTTP 429")) && wait <= Duration::from_secs(32) && !stop() => {
+                    tokio::time::sleep(wait).await;
+                    wait *= 2;
+                }
+                other => break other,
+            }
+        };
+        match outcome {
             Ok(true) => return Ok(Some(peer.name)),
             Ok(false) => return Ok(None),
             Err(e) => {

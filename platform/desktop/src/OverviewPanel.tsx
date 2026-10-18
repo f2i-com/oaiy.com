@@ -239,8 +239,19 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
 
   // Failed runs since the person last looked (a run that failed last week is not news every time Overview opens).
   const failed = runtime?.runs.failed ?? 0;
-  // (fewer than seen: the history was cleared since, and counts from nothing)
-  const seen = failedSeen > failed ? 0 : failedSeen;
+  // (fewer than seen: failed runs were pruned or deleted since, the rest of them seen already; one failing after that
+  // counts as new)
+  const seen = Math.min(failedSeen, failed);
+  useEffect(() => {
+    if (runtime && failedSeen > failed) {
+      try {
+        localStorage.setItem(FAILED_SEEN, String(failed));
+      } catch {
+        /* storage can be unavailable */
+      }
+      setFailedSeen(failed);
+    }
+  }, [runtime, failed, failedSeen]);
   const newFailed = failed - seen;
   const markFailedSeen = () => {
     try {

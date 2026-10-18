@@ -16,11 +16,13 @@ export const API_BASE = DESKTOP_LAUNCH.apiBase;
 async function request<T>(
   path: string,
   init?: RequestInit,
+  /** How long to wait (ms): 15 s unless a call is known to take longer (a model's plan asks Hugging Face and the network). */
+  waitMs = 15000,
 ): Promise<T> {
   // Bound every call so a wedged OAIY Desktop handler (TCP accepted but no response)
   // can't leave the promise pending forever and stack up under the 1.5-2s pollers.
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 15000);
+  const timer = setTimeout(() => ac.abort(), waitMs);
   try {
     const resp = await fetch(`${API_BASE}${path}`, {
       headers: { 'Content-Type': 'application/json' },
@@ -28,7 +30,7 @@ async function request<T>(
       signal: ac.signal,
     }).catch((e: unknown) => {
       // (the 15 s bound: said as what happened, not as the browser's "signal is aborted without reason")
-      if (ac.signal.aborted) throw new Error('504: OAIY did not answer within 15 seconds. It may be busy: try again in a moment.');
+      if (ac.signal.aborted) throw new Error(`504: OAIY did not answer within ${Math.round(waitMs / 1000)} seconds. It may be busy: try again in a moment.`);
       throw e;
     });
     if (!resp.ok) {
@@ -2119,7 +2121,7 @@ export const engines = {
   catalog: () => request<EngineCatalog>('/api/engines/catalog'),
   downloads: () => request<{ running: boolean; downloads: EngineDownload[]; error?: string }>('/api/engines/downloads'),
   /** What getting a catalog model takes: its files here already, on this computer elsewhere, or to download. */
-  plan: (id: string) => request<EnginePlan>(`/api/engines/downloads?plan=${encodeURIComponent(id)}`),
+  plan: (id: string) => request<EnginePlan>(`/api/engines/downloads?plan=${encodeURIComponent(id)}`, undefined, 65_000),
   /** Download a catalog model into the engines' own folder (every part it needs; none this computer has already). */
   download: (id: string) =>
     request<{ running: boolean; downloads: EngineDownload[] }>('/api/engines/downloads', { method: 'POST', body: JSON.stringify({ id }) }),
@@ -2358,7 +2360,7 @@ export const network = {
   /** The workers advertised on the LAN (a primary). */
   discover: () => request<{ discovery: boolean; found: NetworkFound[] }>('/api/network/discover', { method: 'POST' }),
   /** Ask a worker to pair, by its address or as found on the LAN: the code to compare with its screen. */
-  startPairing: (target: { address?: string; nodeId?: string }) =>
+  startPairing: (target: { address?: string; nodeId?: string; bothWays?: boolean }) =>
     request<NetworkPairing>('/api/network/pairings/start', { method: 'POST', body: JSON.stringify(target) }),
   /**
    * Whether the worker's person approved (`approved_there`: then this computer's person says whether the worker showed

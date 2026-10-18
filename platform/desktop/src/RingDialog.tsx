@@ -26,8 +26,9 @@ export function secondsLeft(ring: Pick<ActiveRing, 'expiresAt'>, now: number): n
 }
 
 /**
- * `onShowing` is told whether a ring or a notice is on the screen now (and `false` when this goes): a page that lays a
- * window of its own over the dashboard (the Agent's, Flows', Engines') puts it away meanwhile, or the dialog is under it.
+ * `onShowing` is told whether a call rings on the screen now (and `false` when this goes): a page that lays a window of
+ * its own over the dashboard (the Agent's, Flows', Engines') puts it away meanwhile, or the dialog is under it. A notice
+ * (a caller asked for the owner) does not: it waits until dismissed, and the page would stay away all that while.
  */
 export default function RingDialog({ on = true, onShowing }: { on?: boolean; onShowing?: (showing: boolean) => void }) {
   const [rings, setRings] = useState<ActiveRing[]>([]);
@@ -76,8 +77,8 @@ export default function RingDialog({ on = true, onShowing }: { on?: boolean; onS
   const shown = ringing[0];
   const told = notices.filter((n) => !dismissed.includes(n.id));
 
-  // Whether anything of this is on the screen, for a page that covers the dashboard with a window of its own.
-  const showing = on && (!!shown || told.length > 0);
+  // Whether a call rings on the screen, for a page that covers the dashboard with a window of its own.
+  const showing = on && !!shown;
   const tellShowing = useRef(onShowing);
   tellShowing.current = onShowing;
   useEffect(() => {

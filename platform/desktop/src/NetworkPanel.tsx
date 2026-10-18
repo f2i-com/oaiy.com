@@ -30,6 +30,24 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
   const [found, setFound] = useState<NetworkFound[]>([]);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // The "paired by itself" notices the person has seen, remembered on this computer.
+  const [seenByItself, setSeenByItself] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('oaiy.network.byItselfSeen') ?? '[]') as string[];
+    } catch {
+      return [];
+    }
+  });
+  const dismissByItself = (key: string) =>
+    setSeenByItself((all) => {
+      const next = [...all, key].slice(-20);
+      try {
+        localStorage.setItem('oaiy.network.byItselfSeen', JSON.stringify(next));
+      } catch {
+        /* storage can be unavailable: shown again next time */
+      }
+      return next;
+    });
 
   // (each read numbered: one answered after a newer one began, or after a change was saved, is not shown)
   const reads = useRef(0);
@@ -99,14 +117,19 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
           This computer cannot lend itself right now: {status.listenError}
         </div>
       )}
-      {(status.pairedByItself ?? []).map((p) => (
-        <div className="banner banner-pending network-by-itself" key={`${p.name}:${p.at}`} role="status">
-          <span>
-            <Bot size={13} aria-hidden /> <strong>{p.name}</strong> paired with this computer by itself at{' '}
-            {new Date(p.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Unpair it below if you do not know it.
-          </span>
-        </div>
-      ))}
+      {(status.pairedByItself ?? [])
+        .filter((p) => !seenByItself.includes(`${p.name}:${p.at}`))
+        .map((p) => (
+          <div className="banner banner-pending banner-dismissable network-by-itself" key={`${p.name}:${p.at}`} role="status">
+            <span>
+              <Bot size={13} aria-hidden /> <strong>{p.name}</strong> paired with this computer by itself at{' '}
+              {new Date(p.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Unpair it below if you do not know it.
+            </span>
+            <button className="banner-dismiss" aria-label={`Dismiss: ${p.name} is known`} title="Dismiss" onClick={() => dismissByItself(`${p.name}:${p.at}`)}>
+              <X size={13} aria-hidden />
+            </button>
+          </div>
+        ))}
       <AgentMaySetUp status={status} busy={busy} onChange={change} />
       {status.lends && (
         <WorkerRequests
@@ -573,10 +596,13 @@ function FindWorkers({
     setOutcome(null);
     setApprovedThere(false);
     try {
-      const started = await network.startPairing(target);
+      // (both ways where this computer lends itself and the person leaves it ticked: used if the other pairs by itself
+      // at once, its window open; else asked again once its person approves)
+      const started = await network.startPairing({ ...target, bothWays: lends && bothWays });
       if (started.status === 'approved') {
-        // (both computers pair by themselves: paired at once, nothing to compare)
-        setOutcome({ text: `Paired with ${started.worker.name}: both computers pair by themselves.`, paired: true });
+        // (its window to pair by itself was open: paired at once, nothing to compare)
+        const back = (started as NetworkPairing & { node?: { usesThis?: boolean } }).node?.usesThis;
+        setOutcome({ text: `Paired with ${started.worker.name} at once: its window to pair by itself was open${back ? ', and it can use this computer too' : ''}.`, paired: true });
         setAddress('');
         onPaired();
       } else {
@@ -698,6 +724,14 @@ function FindWorkers({
           {starting ? <Loader2 size={14} className="spin" aria-hidden /> : <Link2 size={14} aria-hidden />} Pair
         </button>
       </form>
+      {lends && !pairing && (
+        <label className="network-both-ways">
+          <input type="checkbox" checked={bothWays} onChange={(e) => setBothWays(e.target.checked)} />
+          <span>
+            Let the computer paired with use this one too <small>(this computer lends itself: one pairing, both ways)</small>
+          </span>
+        </label>
+      )}
       <span className="form-hint">The address the other computer shows on its own Networking page, for networks where computers can’t find each other.</span>
     </section>
   );

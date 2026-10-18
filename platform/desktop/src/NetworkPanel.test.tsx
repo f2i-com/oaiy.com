@@ -117,7 +117,7 @@ describe('NetworkPanel', () => {
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await act(async () => input.closest('form')!.requestSubmit());
-    expect(api.startPairing).toHaveBeenCalledWith({ address: '192.168.1.20' });
+    expect(api.startPairing).toHaveBeenCalledWith({ address: '192.168.1.20', bothWays: false });
     expect(container.querySelector('[data-testid="network-pairing"]')!.textContent).toContain('654 321');
     api.nodes.mockResolvedValue({ nodes: [node] });
     await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
@@ -284,7 +284,7 @@ describe('NetworkPanel', () => {
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await act(async () => input.closest('form')!.requestSubmit());
-    expect(container.textContent).toContain('Paired with Rig: both computers pair by themselves');
+    expect(container.textContent).toContain('Paired with Rig at once: its window to pair by itself was open');
     expect(container.querySelector('[data-testid="network-pairing"]')).toBeNull();
   });
 

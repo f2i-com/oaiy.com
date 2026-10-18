@@ -1614,6 +1614,10 @@ async fn network_pair(d: &Desk, a: &Args<'_>) -> Result<Done, String> {
         if code.is_none() {
             code = asked.get("code").and_then(Value::as_str).map(str::to_owned);
         }
+        // (a pairing taken up again names the computer as the desktop answers it)
+        if name.is_none() {
+            name = asked.pointer("/worker/name").and_then(Value::as_str).map(str::to_owned);
+        }
         let who = name.get_or_insert_with(|| "the computer".to_string()).clone();
         let shown = code.clone().unwrap_or_default();
         match asked.get("status").and_then(Value::as_str) {

@@ -87,6 +87,8 @@ pub(crate) struct Inner {
     /// Until when this computer pairs by itself with a computer that asks so (its person or its Agent opened the
     /// window, for minutes; the first such pairing closes it): never saved, closed at a restart.
     pairing_open_until: Mutex<Option<std::time::Instant>>,
+    /// Each time the window is opened, closed or taken: a pairing that gives it back does so only in its own turn.
+    pairing_turn: std::sync::atomic::AtomicU64,
     /// The last computers paired by themselves here, `(name, when)`, for the Networking page to tell the person.
     paired_by_itself: Mutex<Vec<(String, u64)>>,
     /// Why this computer is not lending itself although set to (its listener could not start), for the page.
@@ -146,6 +148,7 @@ impl Network {
                 found: Arc::new(Mutex::new(HashMap::new())),
                 running: Mutex::new(Running::default()),
                 pairing_open_until: Mutex::new(None),
+                pairing_turn: std::sync::atomic::AtomicU64::new(0),
                 paired_by_itself: Mutex::new(Vec::new()),
                 listen_error: Mutex::new(None),
                 applying: tokio::sync::Mutex::new(()),
@@ -201,10 +204,23 @@ impl Network {
             let bind = bind_address(&settings)?;
             let mine = self.listening().is_some_and(|a| a.port() == bind.port() && bind.port() != 0);
             if !mine {
-                std::net::TcpListener::bind(bind).map_err(|e| format!("this computer cannot lend itself on {bind}: {e} (choose another port)"))?;
+                // (tried as the listener binds it, the address reusable: a port it served a moment ago, waiting out its
+                // closed connections, is not taken by another program)
+                let probe = if bind.is_ipv6() { tokio::net::TcpSocket::new_v6() } else { tokio::net::TcpSocket::new_v4() };
+                probe
+                    .and_then(|s| {
+                        s.set_reuseaddr(true)?;
+                        s.bind(bind)?;
+                        s.listen(1).map(drop)
+                    })
+                    .map_err(|e| format!("this computer cannot lend itself on {bind}: {e} (choose another port)"))?;
             }
         }
         settings.save(&self.inner.dir)?;
+        // (pairing by itself is the Agent's, while this computer lends itself: a window open is closed with either)
+        if !settings.agent || !settings.lends() {
+            self.open_pairing(0);
+        }
         *lock(&self.inner.settings) = settings;
         self.apply().await
     }
@@ -231,6 +247,7 @@ impl Network {
     pub(crate) fn open_pairing(&self, minutes: u64) -> Option<u64> {
         let mut open = lock(&self.inner.pairing_open_until);
         *open = (minutes > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(minutes.min(10) * 60));
+        self.inner.pairing_turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(open);
         self.pairing_open_until_ms()
     }
@@ -242,19 +259,25 @@ impl Network {
         Some(store::now_ms() + left.as_millis() as u64)
     }
 
-    /// Take the window to pair by itself, where it is open: closed now (one computer pairs in it), `true`.
-    pub(crate) fn take_pairing_window(&self) -> bool {
+    /// Take the window to pair by itself, where it is open: closed now (one computer pairs in it), and the turn it was
+    /// taken in, to give it back by ([`Network::give_back_pairing_window`]).
+    pub(crate) fn take_pairing_window(&self) -> Option<u64> {
         let mut open = lock(&self.inner.pairing_open_until);
         let was = open.is_some_and(|until| until > std::time::Instant::now());
         *open = None;
-        was
+        let turn = self.inner.pairing_turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        was.then_some(turn)
     }
 
-    /// Give the window back (a pairing taken in it that did not go through).
-    pub(crate) fn give_back_pairing_window(&self, until_ms: Option<u64>) {
+    /// Give the window back (a pairing taken in it that did not go through), unless it was opened or closed since.
+    pub(crate) fn give_back_pairing_window(&self, until_ms: Option<u64>, turn: u64) {
+        let mut open = lock(&self.inner.pairing_open_until);
+        if self.inner.pairing_turn.load(std::sync::atomic::Ordering::SeqCst) != turn {
+            return;
+        }
         if let Some(ms) = until_ms {
             let left = ms.saturating_sub(store::now_ms());
-            *lock(&self.inner.pairing_open_until) = Some(std::time::Instant::now() + std::time::Duration::from_millis(left));
+            *open = Some(std::time::Instant::now() + std::time::Duration::from_millis(left));
         }
     }
 
@@ -269,6 +292,9 @@ impl Network {
     /// Keep new settings that change nothing running (whether the Agent may set it up).
     pub(crate) fn keep(&self, settings: Settings) -> Result<(), String> {
         settings.save(&self.inner.dir)?;
+        if !settings.agent || !settings.lends() {
+            self.open_pairing(0);
+        }
         *lock(&self.inner.settings) = settings;
         Ok(())
     }

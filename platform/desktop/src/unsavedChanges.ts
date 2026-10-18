@@ -22,6 +22,11 @@ export function hasUnsaved(): string | null {
   return list.length === 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
 }
 
+/** Forget every page's unsaved changes (the pages went without being left: a plugin switched off). */
+export function forgetUnsaved(): void {
+  unsaved.clear();
+}
+
 /** Whether to leave: yes where nothing is unsaved, else as the person answers (and what was unsaved is forgotten then). */
 export function confirmLeaving(): boolean {
   const what = hasUnsaved();

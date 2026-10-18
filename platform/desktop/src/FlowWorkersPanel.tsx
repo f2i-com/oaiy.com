@@ -164,7 +164,7 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
               const misses = (t.misses ?? 0) + 1;
               const said = e instanceof Error ? e.message : String(e);
               return misses >= MAX_MISSES
-                ? { ...t, misses, lost: true, error: `Lost track of this run: ${node.name} did not answer (${said}). It may still be running there.` }
+                ? { ...t, misses, lost: true, ended: Date.now(), error: `Lost track of this run: ${node.name} did not answer (${said}). It may still be running there.` }
                 : { ...t, misses, error: said };
             }),
         ),
@@ -187,7 +187,7 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
     try {
       const run = await network.runFlow(node.nodeId, flow.flowId, values);
       setNow(Date.now());
-      setRuns((all) => [{ run, started: Date.now() }, ...all].slice(0, 6));
+      setRuns((all) => [{ run, started: Date.now(), ended: TERMINAL.has(run.status) ? Date.now() : undefined }, ...all].slice(0, 6));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -236,7 +236,7 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
         const state = RUN_STATE[t.run.status];
         const running = !TERMINAL.has(t.run.status) && !t.lost;
         // (this computer's clock alone: the worker's own may differ, so its finishing time is not subtracted from ours)
-        const end = running ? now : (t.ended ?? now);
+        const end = running ? now : (t.ended ?? t.started);
         const seconds = Math.max(0, Math.round((end - t.started) / 1000));
         return (
           <div className="flow-run-item" key={t.run.runId} data-testid="flow-run">

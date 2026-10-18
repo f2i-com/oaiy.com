@@ -51,7 +51,8 @@ import HoursPanel from './HoursPanel';
 import ContactsPanel from './ContactsPanel';
 import MessagesPanel from './MessagesPanel';
 import RingDialog from './RingDialog';
-import { confirmLeaving } from './unsavedChanges';
+import { confirmLeaving, forgetUnsaved, hasUnsaved } from './unsavedChanges';
+import { useToastIfAny } from './Toasts';
 import TransfersPanel from './TransfersPanel';
 import { useUnreadMessages } from './unreadMessages';
 import PluginScreenPage from './PluginScreenPage';
@@ -356,6 +357,7 @@ export default function App() {
   const isolated = DESKTOP_LAUNCH.isolated;
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
+  const toast = useToastIfAny();
   const [view, setViewNow] = useState<View>(isolated ? 'plugins' : 'overview');
   // Another page: asked first where the page open has changes not saved yet (a form's), which would go with it.
   const shownView = useRef(view);
@@ -417,6 +419,9 @@ export default function App() {
   useEffect(
     () =>
       onOpenSetup((target) => {
+        // (asked before anything changes: a person who stays has nothing of the wizard's set aside for next time; on
+        // Setup already, the wizard opens afresh, which is leaving what it holds too)
+        if (!confirmLeaving()) return;
         setSetupPlugin(target.plugin ?? null);
         setSetupStep(target.step ?? null);
         setSetupOpens((n) => n + 1);
@@ -432,6 +437,7 @@ export default function App() {
     () =>
       onNavigate((target) => {
         if (target.kind === 'setup') return openSetup({ plugin: target.pluginId, step: target.stepId });
+        if (target.view !== viewRef.current && !confirmLeaving()) return;
         if (target.contact) setContactToOpen(target.contact);
         setView(target.view as View);
       }),
@@ -584,8 +590,15 @@ export default function App() {
   // The calendar's pages are there while a plugin provides it: on one when it goes, go to Overview.
   useEffect(() => {
     const module = MODULE_VIEWS[view as BuiltinView];
-    if (module && moduleOn(modules, module) === false) setView('overview');
-  }, [view, modules]);
+    if (module && moduleOn(modules, module) === false) {
+      // (the page is gone, not left by the person: no question that could keep them on a dead page; what it held is
+      // said lost)
+      const lost = hasUnsaved();
+      forgetUnsaved();
+      setViewNow('overview');
+      if (lost) toast?.push({ kind: 'info', title: 'That page went', body: `Its plugin was switched off, and ${lost} not saved went with it.` });
+    }
+  }, [view, modules]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A plugin screen the user is on can disappear (plugin removed or turned
   // off, or its module went off): fall back to Overview rather than rendering

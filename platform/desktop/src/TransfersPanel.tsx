@@ -80,11 +80,14 @@ export default function TransfersPanel() {
 
   // Whether the form differs from what is saved, as of now: a reading that lands while the owner edits leaves the form alone.
   const editing = useRef(false);
+  // (each save counted: a reading asked before a save answers what was there before it, and is not taken)
+  const writes = useRef(0);
   const load = useCallback(
-    (live: () => boolean = () => true) =>
-      ring.settings().then(
+    (live: () => boolean = () => true) => {
+      const asked = writes.current;
+      return ring.settings().then(
         (r) => {
-          if (!live() || editing.current) return;
+          if (!live() || editing.current || asked !== writes.current) return;
           adopt(r.settings, r.features);
           setLoadProblem(r.loadProblem ?? null);
           setError(null);
@@ -94,7 +97,8 @@ export default function TransfersPanel() {
           if (isNotFound(e)) setMissing(true);
           else setError(errText(e));
         },
-      ),
+      );
+    },
     [adopt],
   );
   useEffect(() => {
@@ -126,7 +130,10 @@ export default function TransfersPanel() {
 
   const current = useMemo(() => (draft ? { ...draft, urgentPhrases: fromLines(urgentText), vipNumbers: fromLines(vipText) } : null), [draft, urgentText, vipText]);
   const dirty = !!saved && !!current && JSON.stringify(current) !== JSON.stringify(saved);
-  editing.current = dirty;
+  // (a text box with the caret in it counts as being edited too: a reading would put its text back under the caret,
+  // a trailing empty line the person just typed gone)
+  const typing = useRef(false);
+  editing.current = dirty || typing.current;
   useUnsaved('transfers', dirty, 'the transfer settings');
 
   const patch = (change: Partial<RingSettings>) => {
@@ -142,6 +149,7 @@ export default function TransfersPanel() {
 
   const save = async () => {
     if (!current || !saved) return;
+    writes.current += 1;
     setSaving(true);
     setError(null);
     try {
@@ -347,7 +355,7 @@ export default function TransfersPanel() {
         </div>
         <label className="transfers-grid">
           <span className="form-hint">Urgent phrases, one a line (used only when the setting above allows it)</span>
-          <textarea rows={3} value={urgentText} onChange={(e) => { setJustSaved(false); setUrgentText(e.target.value); }} placeholder={'gas leak\nburst pipe'} aria-label="Urgent phrases" />
+          <textarea rows={3} value={urgentText} onChange={(e) => { setJustSaved(false); setUrgentText(e.target.value); }} placeholder={'gas leak\nburst pipe'} aria-label="Urgent phrases" onFocus={() => (typing.current = true)} onBlur={() => (typing.current = false)} />
         </label>
       </section>
 
@@ -392,7 +400,7 @@ export default function TransfersPanel() {
         )}
         <label className="transfers-grid">
           <span className="form-hint">VIP numbers, one a line: they ring through quiet hours. A caller ID can be faked, so the limits above still apply to them.</span>
-          <textarea rows={3} value={vipText} onChange={(e) => { setJustSaved(false); setVipText(e.target.value); }} placeholder="0491 570 006" aria-label="VIP numbers" />
+          <textarea rows={3} value={vipText} onChange={(e) => { setJustSaved(false); setVipText(e.target.value); }} placeholder="0491 570 006" aria-label="VIP numbers" onFocus={() => (typing.current = true)} onBlur={() => (typing.current = false)} />
         </label>
       </section>
 

@@ -324,16 +324,17 @@ async fn pair_reveal(State(net): State<Network>, Extension(caller): Extension<Ca
     // (a computer that asks to pair by itself is approved at once only while this computer's person (or their Agent)
     // has a window open for it, minutes long, closed by the first such pairing: its say-so alone is anyone's on the
     // network. Past a few computers so paired, the person is asked again.)
-    let approved = auto && by_itself_room(&net) && {
+    let approved = auto && net.settings().agent && by_itself_room(&net) && {
         let until = net.pairing_open_until_ms();
-        if net.take_pairing_window() {
-            let made = matches!(decide_as(&net, &request, true, true), Ok(Some(_)));
-            if !made {
-                net.give_back_pairing_window(until);
+        match net.take_pairing_window() {
+            Some(turn) => {
+                let made = matches!(decide_as(&net, &request, true, true), Ok(Some(_)));
+                if !made {
+                    net.give_back_pairing_window(until, turn);
+                }
+                made
             }
-            made
-        } else {
-            false
+            None => false,
         }
     };
     if approved {

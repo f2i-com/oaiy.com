@@ -387,10 +387,20 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
         Ok(r) => return error(StatusCode::BAD_GATEWAY, "pairing_refused", format!("the worker refused (HTTP {})", r.status())),
         Err(e) => return error(StatusCode::BAD_GATEWAY, "unreachable", format!("{address} did not answer as an OAIY worker: {}", plain(&e))),
     };
+    // (a worker that paired by itself at once, where this side refuses the pairing after all, is told to unpair: else it
+    // would keep this computer as one that uses it, and its window would be used up for nothing)
+    let approved_there = told.get("approved") == Some(&json!(true));
+    let undo = || async {
+        if approved_there {
+            let _ = same_worker.post(url(&address, "/worker/v1/unpair")).timeout(Duration::from_secs(5)).send().await;
+        }
+    };
     let Some(theirs) = told.get("nonce").and_then(Value::as_str).filter(|n| is_nonce(n)).map(str::to_ascii_lowercase) else {
+        undo().await;
         return error(StatusCode::BAD_GATEWAY, "pairing_refused", "the worker's answer was not a pairing request");
     };
     if commitment(&id.fingerprint, &fp, &theirs) != committed {
+        undo().await;
         return error(StatusCode::BAD_GATEWAY, "pairing_refused", "the worker's answer does not match what it committed to: something on the network is in the way, so it is not paired");
     }
     let pending = Outgoing {
@@ -471,7 +481,7 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         return Json(json!({ "status": "declined" })).into_response();
     }
     if p.approved_there {
-        return if req.accept == Some(true) { paired(&net, &p, req.both_ways, false).await } else { Json(json!({ "status": "approved_there", "code": p.code })).into_response() };
+        return if req.accept == Some(true) { paired(&net, &p, req.both_ways, false).await } else { Json(json!({ "status": "approved_there", "code": p.code, "worker": { "name": p.name } })).into_response() };
     }
     let answer = match client.get(url(&p.address, &format!("/worker/v1/pair/{}", p.request_id))).timeout(Duration::from_secs(8)).send().await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
@@ -490,13 +500,13 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
                 o.approved_there = true;
                 o.at = Instant::now();
             }
-            Json(json!({ "status": "approved_there", "code": p.code })).into_response()
+            Json(json!({ "status": "approved_there", "code": p.code, "worker": { "name": p.name } })).into_response()
         }
         Some("denied") => {
             lock(&net.inner().outgoing).retain(|o| o.id != p.id);
             Json(json!({ "status": "denied" })).into_response()
         }
-        _ => Json(json!({ "status": "pending", "code": p.code })).into_response(),
+        _ => Json(json!({ "status": "pending", "code": p.code, "worker": { "name": p.name } })).into_response(),
     }
 }
 

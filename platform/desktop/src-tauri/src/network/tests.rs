@@ -742,6 +742,34 @@ async fn a_computer_lends_itself_back_only_as_they_pair() {
     }
 }
 
+/// The window to pair by itself goes with what allows it: unticking the Agent's setting, or no longer lending, closes
+/// it; and a pairing that gives back a window taken in it does not reopen one closed since.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pairing_window_closes_with_the_agent_setting_and_stays_closed() {
+    let w = node("worker-window", Role::Worker, None).await;
+    w.set(Settings { agent: true, ..w.settings() }).await.unwrap();
+    assert!(w.open_pairing(5).is_some());
+    w.keep(Settings { agent: false, ..w.settings() }).unwrap();
+    assert_eq!(w.pairing_open_until_ms(), None, "unticked: closed");
+    w.keep(Settings { agent: true, ..w.settings() }).unwrap();
+    assert!(w.open_pairing(5).is_some());
+    w.set(Settings { lends: Some(false), uses: Some(true), ..w.settings() }).await.unwrap();
+    assert_eq!(w.pairing_open_until_ms(), None, "no longer lending: closed");
+    // taken by a pairing that then does not go through, closed by the person meanwhile: given back, it stays closed
+    w.set(Settings { lends: Some(true), ..w.settings() }).await.unwrap();
+    let until = w.open_pairing(5);
+    let turn = w.take_pairing_window().expect("open");
+    w.open_pairing(0);
+    w.give_back_pairing_window(until, turn);
+    assert_eq!(w.pairing_open_until_ms(), None);
+    // not closed meanwhile: given back
+    let until = w.open_pairing(5);
+    let turn = w.take_pairing_window().expect("open");
+    w.give_back_pairing_window(until, turn);
+    assert!(w.pairing_open_until_ms().is_some());
+    w.stop();
+}
+
 /// A worker saved again while it listens (renamed) keeps its port: the listener before it has let the port go first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_saved_again_listens_on_the_same_port() {

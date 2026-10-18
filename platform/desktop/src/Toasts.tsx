@@ -109,8 +109,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     void maybeNativeNotify(t.title, t.body);
   }, [arm]);
 
-  // Held while the pointer is over a toast or it has focus (its text being read or copied), carried on after.
-  const hold = useCallback((id: number) => {
+  // Held while the pointer is over a toast or it has focus (its text being read or copied), carried on once neither
+  // holds it.
+  const holders = useRef<Map<number, Set<'pointer' | 'focus'>>>(new Map());
+  const hold = useCallback((id: number, by: 'pointer' | 'focus') => {
+    const held = holders.current.get(id) ?? new Set();
+    held.add(by);
+    holders.current.set(id, held);
     const handle = timers.current.get(id);
     const l = left.current.get(id);
     if (handle === undefined || !l) return;
@@ -118,7 +123,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     timers.current.delete(id);
     left.current.set(id, { ms: Math.max(1500, l.ms - (Date.now() - l.since)), since: Date.now() });
   }, []);
-  const release = useCallback((id: number) => {
+  const release = useCallback((id: number, by: 'pointer' | 'focus') => {
+    const held = holders.current.get(id);
+    held?.delete(by);
+    if (held?.size) return;
+    holders.current.delete(id);
     const l = left.current.get(id);
     if (l && !timers.current.has(id)) arm(id, l.ms);
   }, [arm]);
@@ -149,10 +158,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             key={t.id}
             className={`toast toast-${t.kind}`}
             role={t.kind === 'error' ? 'alert' : undefined}
-            onMouseEnter={() => hold(t.id)}
-            onMouseLeave={() => release(t.id)}
-            onFocus={() => hold(t.id)}
-            onBlur={() => release(t.id)}
+            onMouseEnter={() => hold(t.id, 'pointer')}
+            onMouseLeave={() => release(t.id, 'pointer')}
+            onFocus={() => hold(t.id, 'focus')}
+            onBlur={() => release(t.id, 'focus')}
           >
             <div className="toast-content">
               <div className="toast-title">{t.title}</div>
@@ -170,6 +179,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       </div>
     </ToastContext.Provider>
   );
+}
+
+/** The toasts where the page has them (`null` outside a ToastProvider): for the app's shell, also drawn bare. */
+export function useToastIfAny(): ToastContextValue | null {
+  return useContext(ToastContext);
 }
 
 export function useToast(): ToastContextValue {

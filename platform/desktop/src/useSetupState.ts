@@ -15,6 +15,8 @@ let snapshot: SetupState | null = null;
 /** Why the record could not be read, while it cannot (not for a desktop without the route: that has no record). */
 let failure: string | null = null;
 let inflight: Promise<SetupState | null> | null = null;
+/** Each write of the record counted: a reading asked before a write answers the record before it, and is not taken. */
+let writes = 0;
 let timer: number | undefined;
 const listeners = new Set<() => void>();
 
@@ -36,8 +38,9 @@ function fetchNow(): Promise<SetupState | null> {
     try {
       // Inside the try: a page that runs without the desktop's setup routes
       // (an older desktop, a test's stand-in API) just has no record.
+      const asked = writes;
       const got = await setupApi.get();
-      if (got && typeof got === 'object' && got.firstRun) publish(got);
+      if (got && typeof got === 'object' && got.firstRun && asked === writes) publish(got);
       return snapshot;
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e);
@@ -103,6 +106,7 @@ export function saveFirstRun(change: Partial<FirstRunState> | ((now: FirstRunSta
   const run = saving.then(async () => {
     if (!snapshot) throw new Error('Setup is not read yet: try again in a moment.');
     const { migrated: _migrated, ...now } = snapshot.firstRun;
+    writes += 1;
     const next = await setupApi.putFirstRun({ ...now, ...(typeof change === 'function' ? change(snapshot.firstRun) : change) });
     publish(next);
     return next;
@@ -113,6 +117,7 @@ export function saveFirstRun(change: Partial<FirstRunState> | ((now: FirstRunSta
 
 /** A write answered with the new record: everyone sees it at once. */
 export function setSetupState(next: SetupState): void {
+  writes += 1;
   publish(next);
 }
 
