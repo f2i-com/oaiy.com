@@ -393,6 +393,14 @@ export function DownloadProgress({ name, dl }: { name: string; dl: EngineDownloa
   );
 }
 
+/** What happens to a file of a model being got, in words. */
+function planWhy(status: EnginePlan['files'][number]['status'], from?: string | null): string {
+  if (status === 'download') return 'to download';
+  if (status === 'here') return 'in place';
+  if (status === 'network') return `from ${from ?? 'a paired computer'} (OAIY Network)`;
+  return `on this computer${from ? `: ${from}` : ''}`;
+}
+
 /**
  * What getting a model takes, before it is got: the gigabytes to download, those this computer has already (another
  * model's text encoder or VAE, a copy on another drive: used where they are, never downloaded twice), and for a
@@ -431,21 +439,30 @@ export function DownloadPlan({ plan }: { plan: EnginePlan }) {
         <details className="download-plan-parts">
           <summary>Its {plan.files.length} files</summary>
           <ul>
-            {plan.files.map((f) => (
-              <li key={f.path} className={`is-${f.status}`}>
-                <code>{short(f.path)}</code>
-                <span>{f.size ? formatBytes(f.size) : ''}</span>
-                <span className="download-plan-status">
-                  {f.status === 'download'
-                    ? 'to download'
-                    : f.status === 'here'
-                      ? 'in place'
-                      : f.status === 'network'
-                        ? `from ${f.from ?? 'a paired computer'} (OAIY Network)`
-                        : `on this computer${f.from ? `: ${f.from}` : ''}`}
-                </span>
-              </li>
-            ))}
+            {/* (its weights, text encoder and VAE by name; its small files, settings and tokenizers, in a line each by
+                what happens to them) */}
+            {plan.files
+              .filter((f) => (f.size ?? 0) >= 8e6)
+              .map((f) => (
+                <li key={f.path} className={`is-${f.status}`}>
+                  <code>{short(f.path)}</code>
+                  <span>{f.size ? formatBytes(f.size) : ''}</span>
+                  <span className="download-plan-status">{planWhy(f.status, f.from)}</span>
+                </li>
+              ))}
+            {[...new Set(plan.files.filter((f) => (f.size ?? 0) < 8e6).map((f) => f.status))].map((status) => {
+              const these = plan.files.filter((f) => (f.size ?? 0) < 8e6 && f.status === status);
+              const bytes = these.reduce((n, f) => n + (f.size ?? 0), 0);
+              return (
+                <li key={`small-${status}`} className={`is-${status}`} title={these.map((f) => f.path).join('\n')}>
+                  <code>
+                    {these.length} small file{these.length === 1 ? '' : 's'} (settings, tokenizer…)
+                  </code>
+                  <span>{bytes ? formatBytes(bytes) : ''}</span>
+                  <span className="download-plan-status">{planWhy(status)}</span>
+                </li>
+              );
+            })}
           </ul>
         </details>
       )}

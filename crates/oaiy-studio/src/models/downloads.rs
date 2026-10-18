@@ -322,6 +322,19 @@ fn marker(dir: &Path, part: &Json, id: &str) -> Option<PathBuf> {
     under(dir, str_or(part, "into", "")).ok().map(|p| p.join(format!(".oaiy-{id}.json")))
 }
 
+/// Whether the settings have a model of the catalog's `group` named `id` (as one added from the catalog is named, or a
+/// person named it): a language model's `name`, a media model's key.
+fn configured(cfg: &Json, group: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    match group {
+        "llm" => cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap_or(&[]).iter().any(|m| str_or(m, "name", "") == id),
+        "picture" => false,
+        section => cfg.get("media").and_then(|m| m.get(section)).and_then(|s| s.get("models")).and_then(|m| m.get(id)).is_some(),
+    }
+}
+
 /// Is the entry in `dir`: every part's marker written, or (downloaded some other
 /// way) everything it adds there, with no partial file beside it?
 fn installed(entry: &Json, dir: &Path) -> bool {
@@ -670,6 +683,9 @@ impl Downloads {
                 if where_ != dir {
                     o.push(("at".into(), Json::str(where_.to_string_lossy())));
                 }
+                // (a model of that name in the settings already, added from wherever its files are: said, so its card
+                // does not only offer to download it)
+                o.push(("configured".into(), Json::Bool(!have && configured(&cfg, str_or(e, "group", ""), id))));
                 o.push(("download".into(), d.map_or(Json::Null, Download::to_json)));
                 Json::Obj(o)
             })
@@ -1249,6 +1265,17 @@ fn register_in(cfg: &mut Json, e: &Json, dir: &Path) -> Result<Vec<String>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model already in the settings under the catalog's name, added from wherever its files are, is said to be so.
+    #[test]
+    fn a_model_in_the_settings_by_the_catalogs_name_is_said_to_be_there() {
+        let cfg = Json::parse(br#"{"llm":{"models":[{"name":"qwen3.5-9b"}]},"media":{"image":{"models":{"qwen-image-2.1-turbo":{}}}}}"#).unwrap();
+        assert!(configured(&cfg, "llm", "qwen3.5-9b"));
+        assert!(configured(&cfg, "image", "qwen-image-2.1-turbo"));
+        assert!(!configured(&cfg, "image", "flux-3-image-klein"));
+        assert!(!configured(&cfg, "video", "qwen-image-2.1-turbo"), "another kind's model of that name is not it");
+        assert!(!configured(&cfg, "llm", ""));
+    }
 
     #[test]
     fn globs_match_within_and_across_folders() {

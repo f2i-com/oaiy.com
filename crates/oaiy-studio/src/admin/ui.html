@@ -126,7 +126,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--gpu); outline: n
 input[type=checkbox] { accent-color: var(--gpu); width: 16px; height: 16px; }
 input[type=range] { width: 100%; accent-color: var(--gpu); }
 .check { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
-.grid-f { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(170px, 100%), 1fr)); gap: 14px; }
+.grid-f { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(210px, 100%), 1fr)); gap: 14px; }
 /* Each field of a grid is three rows of the grid itself (subgrid): its name, its box and a help line under it,
    so the boxes in a line of fields start level whatever their names wrap to, and a name sits on its box. Every
    field spans the three (a check's name is empty): one that spanned fewer would leave a row a later field
@@ -178,6 +178,9 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .item:last-child { border-bottom: 0; }
 .item-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .item-head strong { font: 600 15px var(--display); letter-spacing: .01em; }
+.item-more > summary { cursor: pointer; width: fit-content; color: var(--muted); font-size: 13px; padding: 2px 0; }
+.item-more > summary:hover { color: var(--text); }
+.item-more[open] > summary { margin-bottom: 10px; }
 .tag { font-size: 12px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--line-2); color: var(--muted); }
 .tag.gpu { color: var(--gpu); border-color: color-mix(in srgb, var(--gpu) 45%, transparent); }
 .tag.ram { color: var(--ram); border-color: color-mix(in srgb, var(--ram) 45%, transparent); }
@@ -958,8 +961,8 @@ dialog::backdrop { background: var(--backdrop); }
           <div class="f"><span class="small muted">Language model GPUs</span><div class="row" id="llm-devices"></div></div>
           <label class="f"><span>Media GPU</span><select id="media-device"></select><small class="help">Images, video, speech, music, sound effects and 3D models.</small></label>
           <label class="f"><span>When media needs the LLM's GPU</span><select id="llm-policy">
-            <option value="auto">Pause the LLM only if they share a GPU</option>
-            <option value="pause_llm">Always pause the LLM</option>
+            <option value="auto">Pause it if they share one</option>
+            <option value="pause_llm">Always pause it</option>
             <option value="coexist">Never pause (both fit)</option></select></label>
           <div class="f"><span></span><label class="check"><input type="checkbox" id="resume-llm"> Restart the LLM after media jobs</label></div>
           <label class="f"><span>Keep the picture model loaded (minutes)</span><input type="number" min="0" max="1440" step="0.5" data-bind="media.keep_minutes" data-type="numnull" placeholder="2"><small class="help">After a picture its models wait this long for the next, which then takes seconds, not a reload. A chat that needs the GPU takes it back at once. 0 = unload after each picture; empty = 2.</small></label>
@@ -1023,7 +1026,7 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
           <label class="f"><span data-mac="Conversations in memory (GB)">Conversations in RAM (GB)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"><small class="help">Flash-Next sets conversations aside there. 0 = off, empty = the server's default.</small></label>
           <label class="f"><span>Runs on</span><select data-bind="llm.backend">
-            <option value="auto">Auto: a GPU (WebGPU), else the CPU</option>
+            <option value="auto">Auto: GPU, else CPU</option>
             <option value="webgpu">WebGPU (any GPU)</option>
             <option value="cpu">CPU only</option></select></label>
           <label class="f"><span>WebGPU weights (GB)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="a card's memory less 4, a Mac's share"><small class="help">Empty = by the GPU's memory.</small></label>
@@ -1048,11 +1051,11 @@ dialog::backdrop { background: var(--backdrop); }
         </div>
         <div class="grid-f" style="margin-top:12px">
           <label class="f"><span>Card</span><select data-bind="llm.egpu.device" id="egpu-device">
-            <option value="NV">NVIDIA (tinygrad's NV)</option>
-            <option value="AMD">AMD (tinygrad's AMD)</option></select></label>
+            <option value="NV">NVIDIA</option>
+            <option value="AMD">AMD</option></select></label>
           <label class="f" title="tinygrad's own LLM server, or OAIY's engine run on the card over WebGPU through tinygrad (NVIDIA only; NVIDIA's compiler in Docker, as tinygrad's setup puts it): every model OAIY runs, and a 27B model about ten times as fast"><span>Engine on the card</span><select data-bind="llm.egpu.engine" id="egpu-engine">
-            <option value="tinygrad">tinygrad's LLM server</option>
-            <option value="webgpu">OAIY's own, over WebGPU (NVIDIA)</option></select></label>
+            <option value="tinygrad">tinygrad's server</option>
+            <option value="webgpu">OAIY's (WebGPU, NVIDIA)</option></select></label>
           <label class="f"><span>Context (tokens)</span><input type="number" min="512" step="1024" data-bind="llm.egpu.ctx" data-type="intnull" placeholder="8192"><small class="help">The card's memory for it is taken at the start.</small></label>
           <label class="f"><span>When the card is not there, answer with</span><select data-bind="llm.egpu.fallback_model" id="egpu-fallback"></select></label>
         </div>
@@ -1606,11 +1609,13 @@ function renderModels() {
       <span style="flex:1"></span>
       <label class="check"><input type="checkbox" data-menable="llm|${esc(m.name)}" ${m.enabled !== false ? "checked" : ""}> Enabled</label>
       <button class="btn quiet warn" data-remove="llm|${esc(m.name)}">Remove</button></div>
+    <details class="item-more" data-item="llm|${esc(m.name)}" ${openItem("llm", m.name, !(m.path || "").trim()) ? "open" : ""}><summary>Files and settings <span class="muted small">${esc(baseName(m.path))}</span></summary>
     <label class="check" style="margin-bottom:8px" title="Qwen3.5 and Qwen3.8 GGUFs that have a multi-token-prediction layer, and Qwen3.8-Flash-Next, on WebGPU: the layer drafts the next few tokens and the model checks them in one run. Experimental: on Qwen3.8 27B a third to two fifths faster on predictable text (lists, facts, code), a little faster on stories and about even at higher temperatures, holding about 0.3 GB more on the GPU; on Flash-Next two fifths to three fifths faster on lists, facts and code (79 to 94 tokens a second where 55 to 58) and a little faster on stories, with the same replies as without it, holding about 1 GB more."><input type="checkbox" data-mtp="${esc(m.name)}" ${m.mtp ? "checked" : ""}> Draft tokens with its MTP layer (experimental)</label>
     <div class="cols" style="gap:12px">${field("Weights", "llm", m.name, "path", m.path)}${field("Vision projector (optional)", "llm", m.name, "vision_projector", m.vision_projector)}${field("LoRA adapter folder (optional)", "llm", m.name, "lora", m.lora, {dir: true})}<label class="f"><span>LoRA strength (1 = as trained)</span><input type="number" step="0.05" min="-4" max="4" value="${esc(String(m.lora_strength ?? 1))}" data-lorastrength="${esc(m.name)}"></label></div>
     ${loraList("llm", m.name, m.loras, "More LoRAs (optional; stacked with the one above, each with a strength)")}
     <div class="f" style="margin-top:8px"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>
     ${egpuTick(m)}
+    </details>
   </div>`).join("") : '<div class="empty">No language model yet. Add a .gguf file or model folder above.</div>';
 
   const img = Object.entries(cfg.media.image.models);
@@ -1696,6 +1701,7 @@ function renderModels() {
   }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3 or LTX 2.5 .safetensors file.</div>';
 
   renderPictureTools();
+  watchOpenItems();
   $$("[data-mfield]").forEach(el => el.oninput = () => { const [s, n, k] = el.dataset.mfield.split("|"); modelObj(s, n)[k] = el.value; touch(); });
   $$("[data-mpick]").forEach(b => b.onclick = () => { const [s, n, k] = b.dataset.mpick.split("|");
     pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const miss = s === "llm" || s === "picture" ? [] : missingOf(s, modelObj(s, n)); if (s !== "llm" && s !== "picture" && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
@@ -1786,7 +1792,20 @@ function mediaItem(section, name, m, arch, miss, fields) {
     <span style="flex:1"></span>
     <label class="check"><input type="checkbox" data-menable="${section}|${esc(name)}" ${m.enabled !== false ? "checked" : ""} ${miss.length ? "disabled" : ""}> Enabled</label>
     <button class="btn quiet warn" data-remove="${section}|${esc(name)}">Remove</button></div>
-    <div class="cols" style="gap:12px">${fields}</div></div>`;
+    <details class="item-more" data-item="${section}|${esc(name)}" ${openItem(section, name, miss.length > 0) ? "open" : ""}><summary>Files and settings</summary>
+    <div class="cols" style="gap:12px">${fields}</div></details></div>`;
+}
+
+// Each model's files and settings, folded under its name (the list was pages long): the ones opened stay open across
+// redraws and visits, and one that needs a file opens by itself.
+const openItems = (() => { try { return new Set(JSON.parse(localStorage.getItem("oaiy-open-models") || "[]")); } catch { return new Set(); } })();
+function openItem(section, name, needed) { return needed || openItems.has(`${section}|${name}`); }
+function baseName(path) { return String(path || "").split(/[\\/]/).filter(Boolean).pop() || ""; }
+function watchOpenItems() {
+  $$("details[data-item]").forEach(d => d.ontoggle = () => {
+    d.open ? openItems.add(d.dataset.item) : openItems.delete(d.dataset.item);
+    try { localStorage.setItem("oaiy-open-models", JSON.stringify([...openItems])); } catch {}
+  });
 }
 
 /* ---------- memory ---------- */
@@ -1889,12 +1908,15 @@ function renderDevices() {
 function shareNote() {
   const d = cfg.media.device, pol = cfg.media.llm_policy;
   const models = cfg.llm.models.filter(m => m.enabled !== false);
-  const named = list => list.map(m => `${m.name} (GPU ${modelGpus(m).join(", ")})`).join(", ");
+  // (a few by name; more said as how many, the first named: a list of eleven was a paragraph of its own)
+  const named = list => list.length <= 3
+    ? list.map(m => `${m.name} (GPU ${modelGpus(m).join(", ")})`).join(", ")
+    : `${list.length} language models (${list.slice(0, 2).map(m => m.name).join(", ")} and ${list.length - 2} more)`;
   const shared = models.filter(m => modelGpus(m).includes(d)), free = models.filter(m => !modelGpus(m).includes(d));
   $("#share-note").textContent = pol === "coexist" ? `Media and the language models run side by side. Make sure both fit in ${macMemory() ? "the GPU's memory" : "VRAM"}.`
     : pol === "pause_llm" ? `Every media job stops the language model first; chat requests wait until the job finishes.`
     : [shared.length ? `Media jobs on GPU ${d} take turns with ${named(shared)}: it stops while a job runs, and its chat requests wait.` : `No language model uses GPU ${d}, so chat and media run at the same time.`,
-       shared.length && free.length ? `${named(free)} keep${free.length === 1 ? "s" : ""} answering while media runs.` : ""].filter(Boolean).join(" ");
+       shared.length && free.length ? `${named(free)} keep${free.length === 1 && free.length <= 3 ? "s" : ""} answering while media runs.` : ""].filter(Boolean).join(" ");
 }
 
 /* ---------- endpoints ---------- */
@@ -2916,7 +2938,15 @@ function planHtml(p) {
   if (p.free != null && taken + 1e9 > p.free) notes.push(`<span class="err">The drive has ${dlSize(p.free)} free, and this takes ${dlSize(taken)}: choose another folder, or make room.</span>`);
   if (p.ram_gb) notes.push(`It needs ${esc(p.ram_gb)} GB of this computer's memory to run.`);
   if (p.files.some(f => f.status === "elsewhere" && !f.checked)) notes.push("A file here as large as one it needs is read first, to be sure it is that file.");
-  const files = p.files.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${f.status === "download" ? "to download" : f.status === "here" ? "in place" : f.status === "network" ? "from " + esc(f.from || "") + " (OAIY Network)" : (f.copy ? "copied from " : "on this computer: ") + esc(f.from || "")}</span></li>`).join("");
+  // (its weights, text encoder and VAE by name; the small files, its configurations and tokenizers, in one line each by
+  // what happens to them: a list of 28 was mostly files of a few KB)
+  const big = p.files.filter(f => (f.size || 0) >= 8e6), small = p.files.filter(f => (f.size || 0) < 8e6);
+  const why = f => f.status === "download" ? "to download" : f.status === "here" ? "in place" : f.status === "network" ? "from " + esc(f.from || "") + " (OAIY Network)" : (f.copy ? "copied from " : "on this computer: ") + esc(f.from || "");
+  const files = big.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${why(f)}</span></li>`).join("")
+    + [...new Set(small.map(f => f.status))].map(st => {
+        const these = small.filter(f => f.status === st), bytes = these.reduce((n, f) => n + (f.size || 0), 0);
+        return `<li class="${esc(st)}"><span title="${esc(these.map(f => f.path).join("\n"))}">${these.length} small file${these.length === 1 ? "" : "s"} (settings, tokenizer…)</span><span>${bytes ? dlSize(bytes) : ""}</span><span class="why">${st === "download" ? "to download" : st === "here" ? "in place" : st === "network" ? "over OAIY Network" : "on this computer"}</span></li>`;
+      }).join("");
   return `<div class="dl-plan"><div><span>${said.join(" · ")}</span></div>${notes.map(n => `<div class="line"><span>${n}</span></div>`).join("")}${p.files.length > 1 ? `<details data-plan="${esc(p.id)}"><summary>Its ${p.files.length} files</summary><ul>${files}</ul></details>` : ""}</div>`;
 }
 // Whether a plan's list of files is open, by model: open when the plan is first shown, then as the person leaves it
@@ -2964,9 +2994,10 @@ function dlCard(m, group) {
     actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume download</button><button class="btn warn" data-dl="discard" data-id="${m.id}">Discard</button>`;
   } else {
     const p = dlPlans[m.id];
-    state = planHtml(p);
+    // (in the models already, under this name, from files kept elsewhere: said first, the plan still to be asked)
+    state = (m.configured && !p ? `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>In your models already, from files kept elsewhere</div>` : "") + planHtml(p);
     const ask = !p ? "What it needs" : p.loading ? "" : "Check again";
-    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">${getLabel(p)}</button>${ask ? `<button class="btn quiet" data-dl="plan" data-id="${m.id}" title="What it needs: its files here already, on this computer elsewhere, on a computer on the network, or to download">${ask}</button>` : ""}${p && !p.loading ? `<button class="btn quiet" data-dl="hide" data-id="${m.id}" title="Hide what it needs">Hide</button>` : ""}`;
+    actions = `${m.configured && !p ? `<button class="btn" data-goto-models>Open Models</button>` : `<button class="btn go" data-dl="start" data-id="${m.id}">${getLabel(p)}</button>`}${ask ? `<button class="btn quiet" data-dl="plan" data-id="${m.id}" title="What it needs: its files here already, on this computer elsewhere, on a computer on the network, or to download">${ask}</button>` : ""}${p && !p.loading ? `<button class="btn quiet" data-dl="hide" data-id="${m.id}" title="Hide what it needs">Hide</button>` : ""}`;
   }
   return `<article class="dl-card${m.installed ? " installed" : ""}${busy ? " busy" : ""}" data-group="${esc(m.group)}">
     <div class="dl-head"><span class="dl-icon"><svg viewBox="0 0 24 24" aria-hidden="true">${DL_ICONS[m.group] || ""}</svg></span><span class="dl-group">${esc(group)}</span>${m.recommended ? '<span class="tag good">Recommended</span>' : ""}</div>
