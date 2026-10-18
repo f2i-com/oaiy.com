@@ -177,7 +177,11 @@ async function main(): Promise<void> {
 
   // File Read outside a loop, and a file input given a value by the run.
   {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-flow-nodes-'));
+    // (a real path that no virtual root names: on Linux the temporary folder is /tmp, which a flow's path takes as
+    // OAIY's own tmp folder (resolvePath), so the file is put in the home folder there)
+    const base = path.resolve(os.tmpdir()).replace(/\\/g, '/');
+    const virtual = ['/tmp', '/oaiy', '/downloads'].some((root) => base === root || base.startsWith(`${root}/`));
+    const dir = fs.mkdtempSync(path.join(virtual ? os.homedir() : os.tmpdir(), 'oaiy-flow-nodes-'));
     const file = path.join(dir, 'notes.txt');
     fs.writeFileSync(file, 'notes ✓');
     try {
