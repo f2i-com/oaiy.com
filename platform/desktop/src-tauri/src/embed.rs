@@ -452,13 +452,26 @@ fn own_at(mine: &Url, url: &Url) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<R>, page: String, x: f64, y: f64, width: f64, height: f64, seen: Option<Seen>) -> Result<(), String> {
     let page = Page::parse(&page).ok_or_else(|| format!("no embedded page called {page}"))?;
+    let asked = HIDES.load(std::sync::atomic::Ordering::SeqCst);
     let _one = placing();
     let placed = show_at(&app, &window, page, x, y, width, height);
     if placed.is_ok() {
+        // Hidden since this was asked for (the person left the page while it was being made): put away again.
+        if HIDES.load(std::sync::atomic::Ordering::SeqCst) != asked {
+            if let Some(w) = app.get_webview(page.label()) {
+                let _ = w.hide();
+            }
+            return Ok(());
+        }
         note_placement(&app, &window, page, [x, y, width, height], seen);
     }
     placed
 }
+
+/// Each hide of the pages, counted: a page's first showing makes its webview, which takes a while, and a hide meanwhile
+/// found nothing to hide; the showing sees the count moved and hides the page it made (the editor was left over Run
+/// history otherwise).
+static HIDES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the dashboard's page saw as it measured the box (`EmbeddedPage.tsx`), for the log: its viewport in CSS
 /// pixels, how far it was scrolled, and the pixels of the screen to one of its own.
@@ -863,6 +876,7 @@ fn engines_download<R: Runtime>(webview: tauri::Webview<R>, event: tauri::webvie
 /// Hide the embedded pages (the dashboard shows one of its own).
 #[tauri::command]
 pub async fn hide_embedded<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    HIDES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     for page in Page::ALL {
         if let Some(w) = app.get_webview(page.label()) {
             w.hide().map_err(|e| e.to_string())?;
