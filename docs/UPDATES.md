@@ -52,9 +52,10 @@ uninstalled first, see [RELEASING.md](RELEASING.md#installing-a-release)), and o
 of 0.1.0 on is an update offered. No release can change that: there is no code in an older copy
 to change.
 
-Only what OAIY itself ships is updated. The engines (`oaiy-llm-server`, `oaiy-media`,
-`oaiy-voice`) are a separate channel, plugins are installed from a folder or an archive, and
-models are downloaded on use; an update of the desktop leaves all of them, and OAIY's data
+Only what OAIY itself ships is updated: with the app, the engines its installer carries
+(`resources/engines`: `oaiy-llm-server-webgpu`, `oaiy-media` and, after 0.1.7, `oaiy-voice`).
+A build of one's own put beside the program is not, plugins are installed from a folder or an
+archive, and models are downloaded on use; an update of the desktop leaves all of them, and OAIY's data
 (its data folder, `%APPDATA%\com.oaiy.app` by default, and the Agent's projects and chats in
 the window's own storage), where they are.
 
