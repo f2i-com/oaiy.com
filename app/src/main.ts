@@ -2,7 +2,7 @@ import './styles.css';
 import { Agent, type AgentEvent, type AgentOptions } from './agent/agent';
 import { planAfter } from './agent/tools';
 import type { ProviderConfig } from './agent/providers/types';
-import { HELP, internetCommand } from './commands';
+import { HELP, PHONE_HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
@@ -18,6 +18,7 @@ import { Outreach, tally, type Campaign, type OutreachKind, type OutreachPlan, t
 import { OUTREACH_TOOL_NAMES, outreachTools } from './outreachTools';
 import { confirmOutreach } from './ui/outreach';
 import { personState } from './ui/chat/outreachCard';
+import { rememberToolTitles } from './ui/chat/tools';
 import type { Turn } from './agent/protocol';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore, type FlowTool } from './desktop/flowTools';
@@ -322,6 +323,8 @@ async function main(): Promise<void> {
   };
   /** The conversation the chat shows (a person's calls and texts, a flow's tasks), by its id: null for the project's own. */
   let viewing: string | null = null;
+  /** How full each agent's context was at its last step: shown again when its conversation is. */
+  const lastContext = new WeakMap<Agent, { used: number; window: number }>();
   /**
    * A person's calls and texts are one conversation, each way answered by an
    * agent of its own, and two can work at once (a text answered during a
@@ -960,7 +963,14 @@ async function main(): Promise<void> {
         },
         event: (session, event) => {
           noteModelEvent(event);
-          if (viewing === session.thread && streams(session)) chat.event(event, session.kind);
+          if (viewing === session.thread && streams(session)) {
+            // (a part of the log that cannot be drawn does not end the call's agent's run)
+            try {
+              chat.event(event, session.kind);
+            } catch (error) {
+              console.error('the chat could not show an event', event.type, error);
+            }
+          }
           if (event.type === 'tool_result') void own.save(session).catch(() => {});
         },
       },
@@ -1360,6 +1370,12 @@ async function main(): Promise<void> {
     if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
   }
 
+  /** A message that could not be sent (its files could not be read or kept): said, and back in the box. */
+  function notSent(text: string, files: File[], error: unknown): void {
+    chat.system(`Your message was not sent: ${error instanceof Error ? error.message : String(error)}`, 'error');
+    chat.restore(text, files);
+  }
+
   async function submit(text: string, files: File[] = [], shown = false): Promise<void> {
     if (text.startsWith('/') && !files.length) {
       const [command, ...args] = text.slice(1).trim().split(/\s+/);
@@ -1395,11 +1411,16 @@ async function main(): Promise<void> {
       let images: ImagePart[] = [];
       let attachments: Attachment[] = [];
       if (files.length) {
-        const received = await receiveFiles(files);
-        images = received.images;
-        attachments = received.attachments;
-        await project.flush();
-        prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
+        try {
+          const received = await receiveFiles(files);
+          images = received.images;
+          attachments = received.attachments;
+          await project.flush();
+          prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
+        } catch (error) {
+          notSent(text, files, error);
+          return;
+        }
       }
       // A run that is starting or just ending cannot take it yet: wait, then give it to the next.
       let run: Promise<void> | null = running;
@@ -1432,26 +1453,44 @@ async function main(): Promise<void> {
         void runProject.saveChat(runAgent.savedTurns()).catch(() => {});
       }, 1500);
     };
+    // Events this run's conversation missed while another was shown (a call's): drawn again whole when it ends.
+    let missed = false;
     try {
-      await checkWindow();
       let prompt = text;
       let images: ImagePart[] = [];
       let attachments: Attachment[] = [];
       if (files.length) {
-        const received = await receiveFiles(files);
-        images = received.images;
-        attachments = received.attachments;
-        await project.flush();
-        prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
+        try {
+          const received = await receiveFiles(files);
+          images = received.images;
+          attachments = received.attachments;
+          await project.flush();
+          prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
+        } catch (error) {
+          notSent(text, files, error);
+          return;
+        }
       }
+      // The person's words first, then what is said of the model's window.
       if (!shown) chat.user(text, attachments);
+      await checkWindow();
       // The first check of a run brings the preview forward, so the person sees the app being built.
       let previewShown = false;
       await runAgent.run(prompt, (event) => {
         // A run stopped by a project switch finishes quietly: the chat now shows another project.
         noteModelEvent(event);
-        if (project !== runProject || viewing !== null) return;
-        chat.event(event);
+        if (event.type === 'context') lastContext.set(runAgent, { used: event.used, window: event.window });
+        if (project !== runProject) return;
+        if (viewing !== null) {
+          missed = true;
+          return;
+        }
+        // (a part of the log that cannot be drawn says so, and does not end the run)
+        try {
+          chat.event(event);
+        } catch (error) {
+          console.error('the chat could not show an event', event.type, error);
+        }
         if (event.type === 'tool_result' || event.type === 'compact' || event.type === 'nudge') saveSoon();
         if (event.type === 'check' && event.state === 'running' && !previewShown) {
           previewShown = true;
@@ -1461,12 +1500,25 @@ async function main(): Promise<void> {
     } finally {
       if (saveTimer) clearTimeout(saveTimer);
       controller = null;
-      if (project === runProject && viewing === null) chat.setBusy(false);
-      await runProject.flush();
-      await runProject.saveChat(runAgent.savedTurns());
-      finish();
-      currentRun = null;
-      renderSessions();
+      if (project === runProject && viewing === null) {
+        // (rows it drew as running while the person was in another conversation get their results now)
+        if (missed) {
+          chat.replay(runAgent.turns);
+          showLastContext();
+        }
+        chat.setBusy(false);
+      }
+      // The run is over whatever saving it does: a save that fails says so, and the next message is a new run.
+      try {
+        await runProject.flush();
+        await runProject.saveChat(runAgent.savedTurns());
+      } catch (error) {
+        if (project === runProject) chat.system(`The conversation could not be saved: ${error instanceof Error ? error.message : String(error)}`, 'error');
+      } finally {
+        finish();
+        currentRun = null;
+        renderSessions();
+      }
       // Outreach's lines and reports that came while it worked: in the conversation now, and a report acted on next.
       if (project === runProject) {
         for (const note of heldOutreach.lines.splice(0)) addOwnNote(note);
@@ -2039,6 +2091,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     c.refresh();
     const before = controlNames().join();
     await Promise.all((['project', 'setup', 'runner'] as const).map((session) => c.tools(session).catch(() => [])));
+    // (a tool the chat has no words of its own for reads as the desktop titles it)
+    rememberToolTitles(c.listed('project'));
     if (c === control && controlNames().join() !== before) void refreshFlowTools();
   }
 
@@ -2272,19 +2326,40 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       sessions!.seen(thread);
     } else {
       chat.replay(agent.turns);
+      showLastContext();
       chat.setBusy(!!currentRun);
     }
     renderSessions();
     chat.focus();
   }
 
+  /** The meter, as full as the project's agent's context was at its last step (when it has taken one since the page opened). */
+  function showLastContext(): void {
+    const c = lastContext.get(agent);
+    if (c) chat.showContext(c.used, c.window);
+  }
+
   /** The person's message in a phone conversation: to its call going on, or their texts' agent (a flow's: its tasks'), first in line. */
   function sessionSubmit(text: string, files: File[]): void {
     const thread = viewing ? sessions?.thread(viewing) : null;
     if (!thread || !sessions) return;
-    if (files.length) chat.system('Attach files in the project\'s own conversation; in a phone conversation, write what the agent should do.', 'error');
+    // Files are not taken here: kept in the box (with what was written), to send in the project's own conversation.
+    if (files.length) {
+      chat.system('Files are attached in the project\'s own conversation; in a phone conversation, write what the agent should do (remove the files to send this).', 'error');
+      chat.restore(text, files);
+      return;
+    }
     if (!text) return;
-    if (text.trim() === '/clear') {
+    const command = text.trim().startsWith('/') ? text.trim().slice(1).split(/\s+/)[0].toLowerCase() : null;
+    if (command === 'help' || command === '?') {
+      chat.system(PHONE_HELP);
+      return;
+    }
+    if (command !== null && command !== 'clear') {
+      chat.system(`Unknown command /${command}. ${PHONE_HELP}`, 'error');
+      return;
+    }
+    if (command === 'clear') {
       if (thread.live) {
         chat.system('Not during a call: clear this conversation once the call has ended.', 'error');
         return;
@@ -2300,7 +2375,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       return;
     }
     chat.user(text, [], thread.running);
-    void sessions.say(thread, text).then(() => renderSessions());
+    void sessions
+      .say(thread, text)
+      .then(() => renderSessions())
+      .catch((error: unknown) => chat.system(`The agent did not get that: ${error instanceof Error ? error.message : String(error)}`, 'error'));
   }
 
   function stopViewed(): void {
@@ -2526,15 +2604,20 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
             void sessions?.callEvent(event).then((session) => {
               // A call begins: show it (the person sees the conversation as it happens).
               if (session && event.type === 'call.started') {
-                selectSession(session.thread);
                 const placed = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
-                chat.system(
-                  event.resume
-                    ? `📞 ${session.title} is back with the receptionist: you handed the call back.`
-                    : placed
-                      ? `📞 ${session.title} answered the call for "${placed.name}": the agent is on it.`
-                      : `📞 ${session.title} is calling: the agent is answering.`,
-                );
+                const said = event.resume
+                  ? `📞 ${session.title} is back with the receptionist: you handed the call back.`
+                  : placed
+                    ? `📞 ${session.title} answered the call for "${placed.name}": the agent is on it.`
+                    : `📞 ${session.title} is calling: the agent is answering.`;
+                // The person is writing in another conversation: the call is said there, not put over what they write
+                // (Enter would send it to the call's agent).
+                if (chat.hasDraft() && viewing !== session.thread) {
+                  chat.systemAction(said, 'Show the call', () => selectSession(session.thread));
+                } else {
+                  selectSession(session.thread);
+                  chat.system(said);
+                }
               }
               // The owner took the call, or the receptionist could not reach them: the person sees what happened.
               if (session && event.type === 'call.handoff') chat.system(`📞 You took the call from ${session.title}.`);

@@ -522,7 +522,7 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); 
 .live-status { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
 .live-time { margin-left: auto; font-family: var(--mono); font-weight: 600; font-variant-numeric: tabular-nums; }
 .live-end { flex: none; padding: 3px 10px; border: 1px solid color-mix(in srgb, var(--err) 45%, var(--border)); border-radius: var(--r-ctl); background: var(--surface-soft); color: var(--err); font-size: 11.5px; font-weight: 600; }
-.live-end:hover:not(:disabled) { background: var(--err); border-color: var(--err); color: #fff; }
+.live-end:hover:not(:disabled) { background: var(--err); border-color: var(--err); color: var(--on-signal); }
 .live-end[hidden] { display: none; }
 
 /* One speaker's run: their avatar and name, over what they said (newest first). */
@@ -599,6 +599,11 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); 
 .msg.system.line { align-self: center; max-width: 94%; padding: 4px 12px; border-radius: 13px; background: var(--surface-soft); border: 1px solid color-mix(in srgb, var(--border) 70%, transparent); }
 .msg.system.card { padding: 10px 12px; border: 1px solid var(--border); background: var(--surface-soft); border-radius: var(--r-ctl); }
 .msg.system.card.lines pre { font: 11.5px/1.5 var(--mono); }
+/* A run's error: try the person's last message again. */
+.msg.system .retry { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 24px; margin-left: auto; padding: 0 9px; font-size: 11.5px; color: var(--accent); background: transparent; border-color: var(--border); }
+.msg.system .retry .icon { width: 12px; height: 12px; margin: 0; color: inherit; }
+.msg.system.line:has(.retry) { align-items: center; }
+.tool-result a { color: var(--accent); }
 .msg.system.error { color: var(--err); border-color: color-mix(in srgb, var(--err) 35%, var(--border)); background: var(--err-soft); }
 .msg.system.error .icon { color: var(--err); }
 /* Where a call began: its day, time and who. */
@@ -649,7 +654,8 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .tool > summary::-webkit-details-marker, .tool-group > summary::-webkit-details-marker { display: none; }
 .tool > summary:hover, .tool-group > summary:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
 .tool-icon { width: 14px; height: 14px; color: var(--muted); }
-.tool-name, .tool-group-title { flex: none; font-weight: 600; color: var(--text); white-space: nowrap; }
+/* (a long label in a narrow chat shrinks with an ellipsis rather than running past the row's edge) */
+.tool-name, .tool-group-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; color: var(--text); white-space: nowrap; }
 .tool-arg, .tool-group-names { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
 .tool-group-names { font-family: var(--sans); font-size: 12px; }
 .tool-time { flex: none; font-family: var(--mono); font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; }

@@ -18,10 +18,10 @@ import { clear, h } from './dom';
 import { icon } from './icons';
 import { confirmAction } from './modal';
 import { mediaElement, mediaKind, type Media } from './media';
-import { renderMarkdown } from './markdown';
+import { linkedText, renderMarkdown } from './markdown';
 import { SessionPicker, tabKind, tabName, type ConversationTab } from './sessionPicker';
 import { closeContactCard } from './contactCard';
-import { argLines, clip, duration, mediaPrompt, prettyResult, summarizeCall, toolIcon, toolLabel } from './chat/tools';
+import { activityText, argLines, clip, duration, mediaPrompt, prettyResult, summarizeCall, toolIcon, toolLabel } from './chat/tools';
 import {
   clock,
   conversationKind,
@@ -143,7 +143,7 @@ export class ChatPane {
   /** Beside the meter: the conversation started again (its messages gone, the context empty), asked first. The same as /clear. */
   private readonly clearButton = h('button.chat-clear', { type: 'button', title: CLEAR_TITLE, 'aria-label': 'Clear the conversation' }, icon('trash'), h('span', 'Clear')) as HTMLButtonElement;
   /** The agent's checklist for the current request, pinned above the log. */
-  private readonly planBox = h('section.plan', { 'aria-live': 'polite' });
+  private readonly planBox = h('section.plan');
   /**
    * The conversations: the project's own, and the phone's (each call and text
    * thread, and flows' tasks), in a picker that searches them.
@@ -175,6 +175,10 @@ export class ChatPane {
   private thinking: { box: HTMLElement; text: string } | null = null;
   /** A tool call being written, shown as it streams until the call is whole. */
   private draft: { box: HTMLElement; body: HTMLElement; raw: string; json: boolean } | null = null;
+  /** The tool the call being written is of, as the model named it at its start (a JSON draft does not say). */
+  private draftName = '';
+  /** The person's last message sent from the box: sent again by an error's "Try again". */
+  private lastSent: string | null = null;
   private cards = new Map<string, HTMLElement>();
   /** Sub-agent task rows, by task id (the delegate call's id, #, the task's index). */
   private taskRows = new Map<string, { row: HTMLElement; state: HTMLElement; activity: HTMLElement; report: HTMLElement }>();
@@ -308,6 +312,8 @@ export class ChatPane {
     this.input.addEventListener('paste', (e) => {
       const pasted = [...(e.clipboardData?.files ?? [])];
       if (!pasted.length) return;
+      // Text copied from a spreadsheet or a page often carries a picture of itself: the text is what was meant.
+      if (e.clipboardData?.getData('text/plain').trim()) return;
       e.preventDefault();
       // A pasted screenshot arrives as "image.png": give it a useful name.
       this.addFiles(pasted.map((f, i) => (f.name === 'image.png' ? new File([f], `pasted-${new Date().toISOString().replace(/[:.]/g, '-')}${i ? `-${i}` : ''}.png`, { type: f.type }) : f)));
@@ -371,7 +377,22 @@ export class ChatPane {
     this.input.value = '';
     this.grow();
     this.updateSend();
+    if (text && !text.startsWith('/')) this.lastSent = text;
     this.handlers.submit(text, files);
+  }
+
+  /** Whether something is written (or attached) in the box, not sent yet. */
+  hasDraft(): boolean {
+    return this.hasMessage();
+  }
+
+  /** A message that could not be sent, back in the box as it was written, its files with it. */
+  restore(text: string, files: File[] = []): void {
+    if (text && !this.input.value.trim()) this.input.value = text;
+    if (files.length) this.files.push(...files);
+    this.renderPending();
+    this.grow();
+    this.updateSend();
   }
 
   /**
@@ -405,6 +426,9 @@ export class ChatPane {
     this.busy = busy;
     // A new run: the last run's last tool is not what the agent does now.
     if (busy) this.setActivity('');
+    // While the reply streams it is not read out piece by piece: the log is read when the run is done.
+    this.log.setAttribute('aria-busy', String(busy));
+    if (!busy) this.settleRun();
     if (this.currentPlan) this.showPlan(this.currentPlan, busy);
     this.input.placeholder = busy ? 'Message the agent while it works…' : this.placeholder();
     this.element.classList.toggle('busy', busy);
@@ -740,6 +764,8 @@ export class ChatPane {
 
   clearLog(): void {
     this.meter.hidden = true;
+    // (another conversation shown, or this one started again: an error here does not send what was written there)
+    this.lastSent = null;
     this.hiddenTurns = [];
     this.way = null;
     this.taskRows.clear();
@@ -934,6 +960,11 @@ export class ChatPane {
       if (left <= 0) done(comment.value.trim());
       else tick();
     }, 1000);
+    // (the log cleared, another project or conversation shown: the countdown goes with the box, flagging nothing)
+    this.disposers.push(() => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    });
     holder.after(box);
     comment.focus();
     this.scroll();
@@ -952,9 +983,9 @@ export class ChatPane {
 
   /** A run ended (finished, or cut off): what the agent writes next is a new reply. */
   endReply(): void {
-    this.current = null;
+    this.finishReply();
     this.quiet = null;
-    this.thinking = null;
+    this.doneThinking();
   }
 
   /** The person's message: a new request, or (`during`) one sent while the agent works, which keeps its plan. */
@@ -1113,8 +1144,8 @@ export class ChatPane {
     const draft = this.draft;
     this.redraw(draft.box, () => {
       const raw = draft.raw;
-      const name = draft.json ? '' : /<function=([\w.-]+)>/.exec(raw)?.[1] ?? '';
-      if (name) draft.box.querySelector('.tool-name')!.textContent = `Writing ${toolLabel(name).toLowerCase()}…`;
+      const name = draft.json ? this.draftName : /<function=([\w.-]+)>/.exec(raw)?.[1] ?? '';
+      if (name) draft.box.querySelector('.tool-name')!.textContent = `Writing a call: ${toolLabel(name)}…`;
       draft.body.textContent = draft.json
         ? raw.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\t/g, '\t')
         : raw
@@ -1163,7 +1194,7 @@ export class ChatPane {
     // A saved reply is drawn whole, at once: the log lands at its end, and older turns drawn in
     // above what the reader sees keep it where it is, only if nothing grows after.
     if (this.replaying) {
-      target.body.innerHTML = renderMarkdown(target.text);
+      target.body.innerHTML = renderMarkdown(target.text, true);
       return;
     }
     // A long reply streams in many pieces: drawn a few times a second, not for each.
@@ -1249,10 +1280,11 @@ export class ChatPane {
     if (!pre) return;
     const full = prettyResult(content);
     const { text, more } = clip(full);
-    pre.textContent = text || '(nothing)';
+    // (an address in it, a sign-in page to open, is a link)
+    pre.replaceChildren(...linkedText(text || '(nothing)'));
     pre.parentElement?.querySelector(':scope > .tool-more')?.remove();
     if (more > 0) pre.after(h('button.tool-more', { type: 'button', onclick: (e: Event) => {
-      pre.textContent = full;
+      pre.replaceChildren(...linkedText(full));
       (e.currentTarget as HTMLElement).remove();
     } }, `Show all (${more.toLocaleString()} more characters)`));
   }
@@ -1332,8 +1364,8 @@ export class ChatPane {
     const title = group.querySelector('.tool-group-title')!;
     const names = group.querySelector('.tool-group-names')!;
     if (running) {
-      title.textContent = `Using ${cards.length} tools`;
-      names.textContent = `${running.querySelector('.tool-name')?.textContent ?? ''} ${running.querySelector('.tool-arg')?.textContent ?? ''}`.trim();
+      title.textContent = `${cards.length} tools`;
+      names.textContent = `now: ${`${running.querySelector('.tool-name')?.textContent ?? ''} ${running.querySelector('.tool-arg')?.textContent ?? ''}`.trim()}`;
     } else {
       title.textContent = `Used ${cards.length} tools`;
       const labels = [...new Set(cards.map((c) => c.querySelector('.tool-name')?.textContent ?? ''))].filter(Boolean);
@@ -1425,12 +1457,12 @@ export class ChatPane {
     const entry = this.taskRow(e.id, e.title);
     entry.row.className = `agent-task ${e.state}`;
     entry.state.textContent = e.state === 'running' ? 'working' : e.state === 'failed' ? 'not finished' : e.state;
-    if (e.activity) entry.activity.textContent = e.activity;
+    if (e.activity) entry.activity.textContent = activityText(e.activity);
     if (e.result !== undefined) {
       entry.report.textContent = e.result || '(no report)';
       entry.activity.textContent = e.state === 'done' ? 'finished' : entry.activity.textContent;
     }
-    if (e.state === 'running') this.setStatus(`sub-agent: ${e.title}: ${e.activity ?? ''}`);
+    if (e.state === 'running') this.setStatus(`Sub-agent: ${e.title}${e.activity ? `: ${activityText(e.activity)}` : ''}`);
   }
 
   /** The automatic check after the agent changed an app: a row like a tool's. */
@@ -1540,22 +1572,31 @@ export class ChatPane {
         this.toolDraft(e.text, e.start, e.index !== undefined);
         break;
       case 'tool_start':
-        this.setStatus(`writing a ${e.name} call…`);
+        this.draftName = e.name;
+        this.setStatus(`Writing a call: ${toolLabel(e.name)}…`);
         break;
-      case 'tool_call':
+      case 'tool_call': {
         this.doneThinking();
         if (this.draft) this.removeEntry(this.draft.box);
         this.draft = null;
-        this.setStatus(`running ${e.call.name}…`);
-        if (e.call.name !== 'update_plan') this.setActivity(`${e.call.name} ${summarizeCall(e.call)}`.trim());
+        this.draftName = '';
+        const doing = `${toolLabel(e.call.name, e.call.input)}${summarizeCall(e.call) ? ` · ${summarizeCall(e.call)}` : ''}`;
+        this.setStatus(`${doing}…`);
+        if (e.call.name !== 'update_plan') this.setActivity(doing);
         this.toolCard(e.call);
         break;
+      }
       case 'tool_result':
         this.setStatus('thinking…');
         this.toolResult(e.result);
         break;
       case 'status':
         this.setStatus(e.message);
+        break;
+      case 'notice':
+        // (a call's agent stopping is how a call goes, not news: said in passing there)
+        if (via === 'call') this.setStatus(e.message);
+        else this.system(e.message);
         break;
       case 'usage':
         break;
@@ -1592,13 +1633,69 @@ export class ChatPane {
         this.scroll();
         break;
       case 'done':
-        this.current = null;
+        this.finishReply();
         this.quiet = null;
         this.setActivity('');
         break;
       case 'error':
-        this.system(e.message, 'error');
+        this.runError(e.message, !via);
         break;
+    }
+  }
+
+  /** A note with something to do beside it: a call that came in while the person was writing, Show it. */
+  systemAction(text: string, label: string, run: () => void): void {
+    this.system(text);
+    const row = this.feed.lastElementChild;
+    if (!(row instanceof HTMLElement) || !row.matches('.msg.system')) return;
+    row.append(h('button.retry', { type: 'button', onclick: (ev: Event) => {
+      (ev.currentTarget as HTMLElement).remove();
+      run();
+    } }, h('span', label)));
+  }
+
+  /** A run's error, with a way to try again: the person's last message sent again (not in a phone conversation). */
+  private runError(message: string, retry: boolean): void {
+    this.system(message, 'error');
+    const again = this.lastSent;
+    if (!retry || !again || this.kind !== 'own') return;
+    const row = this.feed.lastElementChild;
+    if (!(row instanceof HTMLElement) || !row.matches('.msg.system')) return;
+    row.append(h('button.retry', { type: 'button', title: `Send "${again.length > 60 ? `${again.slice(0, 60)}…` : again}" again`, onclick: (ev: Event) => {
+      if (this.busy) return;
+      (ev.currentTarget as HTMLElement).remove();
+      this.handlers.submit(again, []);
+    } }, icon('refresh'), h('span', 'Try again')));
+  }
+
+  /** The reply being written, drawn whole (a code block it left open is closed): the next words are a new reply. */
+  private finishReply(): void {
+    const reply = this.current;
+    if (reply) reply.body.innerHTML = renderMarkdown(reply.text, true);
+    this.current = null;
+  }
+
+  /**
+   * A run is over (done, stopped or failed): what it left going stops looking busy. Its thinking is done, a tool
+   * call it was writing goes, and a row still running says it was not finished (a stopped run's last calls).
+   */
+  private settleRun(): void {
+    this.doneThinking();
+    if (this.draft) this.removeEntry(this.draft.box);
+    this.draft = null;
+    this.draftName = '';
+    this.finishReply();
+    for (const card of this.feed.querySelectorAll<HTMLElement>('details.tool.pending')) {
+      if (card.matches('.sms-out')) continue;
+      this.settle(card, true);
+      this.setResult(card, 'Not finished: the run ended before this tool answered.');
+      if (card.matches('.delegate')) {
+        for (const row of card.querySelectorAll<HTMLElement>('.agent-task.queued, .agent-task.running')) {
+          row.className = 'agent-task failed';
+          const state = row.querySelector('.task-state');
+          if (state) state.textContent = 'not finished';
+        }
+      }
     }
   }
 
@@ -1746,7 +1843,15 @@ export class ChatPane {
   private drawTurns(turns: Turn[], showPlan = true): void {
     this.replaying = true;
     try {
-      for (const turn of turns) this.drawTurn(turn);
+      for (const turn of turns) {
+        // (one turn that cannot be drawn, written by an older app or a tool's odd input, does not hide the rest)
+        try {
+          this.drawTurn(turn);
+        } catch (error) {
+          this.current = null;
+          this.add(h('div.msg.system.error.line', icon('alert'), h('pre', `A part of this conversation could not be shown: ${error instanceof Error ? error.message : String(error)}`)));
+        }
+      }
     } finally {
       this.replaying = false;
     }

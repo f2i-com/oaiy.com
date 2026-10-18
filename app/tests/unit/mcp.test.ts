@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import fixture from '../fixtures/control-tools.json';
 import type { SessionTool } from '../../src/agent/agent';
-import { summarizeCall, toolIcon, toolLabel } from '../../src/ui/chat/tools';
+import { activityText, rememberToolTitles, summarizeCall, toolIcon, toolLabel } from '../../src/ui/chat/tools';
 import { hasIcon } from '../../src/ui/icons';
 import {
   COVERED,
@@ -218,7 +218,10 @@ describe("the control tools each kind of conversation is given", () => {
       }
       // The app's flow_run stays the only one of that name; flow_delete (which the app has no tool for) comes from the desktop.
       expect(names.filter((n) => n === 'flow_run')).toHaveLength(1);
-      expect(tools.find((t) => t.spec.name === 'flow_run')!.spec.description).toBe('flow_run');
+      // (it is the app's, which takes the desktop's `node` too: OAIY Network's other computers)
+      const run = tools.find((t) => t.spec.name === 'flow_run')!;
+      expect(run.spec.description).toMatch(/^flow_run With node /);
+      expect(Object.keys((run.spec.parameters as { properties: Record<string, unknown> }).properties)).toContain('node');
       expect(names).toContain('flow_delete');
       expect(names).toEqual(expect.arrayContaining(['status', 'setup_status', 'plugin_setup_open', 'plugin_setup_status', 'setup_finish', 'agent_model_set']));
       expect(names.length).toBe(APP_OWN.length + 58 - 5);
@@ -227,6 +230,22 @@ describe("the control tools each kind of conversation is given", () => {
       expect(JSON.stringify(del.spec)).not.toMatch(/\bflows_list\b/);
       expect(JSON.stringify(del.spec)).toMatch(/\bflow_list\b/);
     }
+  });
+
+  it("the app's flow tools list and run another computer's shared flows through the desktop's, given node, and their own without", async () => {
+    const { server, tools } = await offered('project');
+    const tool = (name: string) => tools.find((t) => t.spec.name === name)!;
+    expect(await tool('flow_run').run({ id: 'logo', input: { Prompt: 'a fox' } })).toBe('flow_run ran');
+    expect(await tool('flow_run').run({ id: 'logo', node: 'w1', input: { Prompt: 'a fox' } })).toBe('flow_run done');
+    expect(await tool('flow_list').run({ node: 'w1' })).toBe('flows_list done');
+    expect(await tool('flow_list').run({})).toBe('flow_list ran');
+    const calls = server.seen.filter((x) => x.method === 'tools/call').map((x) => x.params);
+    expect(calls).toEqual([
+      { name: 'flow_run', arguments: { id: 'logo', node: 'w1', input: { Prompt: 'a fox' }, timeoutSeconds: 600 } },
+      { name: 'flows_list', arguments: { node: 'w1' } },
+    ]);
+    // flow_read and flow_write have no node on the desktop's side: as they were.
+    expect(tool('flow_read').spec.description).toBe('flow_read');
   });
 
   it('without the flow builder (no desktop tools of the app), the desktop\'s flow tools stay', async () => {
@@ -283,6 +302,35 @@ describe("the control tools each kind of conversation is given", () => {
     expect(call('model_set_default', { group: 'llm', model: 'Qwen3-8B' })).toBe('llm → Qwen3-8B');
     expect(call('agent_model_set', { source: 'chatgpt', model: 'gpt-5.5' })).toBe('ChatGPT · gpt-5.5');
     expect(call('service_install', { id: 'oaiy-voice' })).toBe('oaiy-voice');
+  });
+
+  it("OAIY Network's tools read as what the call did (its input says), and say which computer", () => {
+    const call = (name: string, input: Record<string, unknown>) => summarizeCall({ id: 'c', name, input });
+    expect(toolLabel('network_pin', { model: 'engine:image:node.w1/flux', pin: true })).toBe('Pinned a model');
+    expect(toolLabel('network_pin', { model: 'engine:image:node.w1/flux', pin: false })).toBe('Let a pinned model go');
+    expect(call('network_pin', { model: 'engine:image:node.w1/flux', pin: false })).toBe('w1/flux · let go');
+    expect(toolLabel('network_setup', { enabled: false })).toBe('Switched off OAIY Network');
+    expect(call('network_setup', { lends: true, shareModels: false, name: 'Rig' })).toBe('lends itself · keeps model files · Rig');
+    expect(toolLabel('network_approve', { id: 'r1', approve: false })).toBe('Denied a pairing request');
+    expect(call('network_approve', { id: 'r1', approve: true })).toBe('approved · r1');
+    expect(toolLabel('network_pair', { address: '192.168.1.20:17975' })).toBe('Asked to pair a computer');
+    expect(toolLabel('network_pair', { pairingId: 'p1' })).toBe('Waited for a pairing');
+    expect(call('network_pair', { pairingId: 'p1' })).toBe('waiting · p1');
+    expect(call('network_use_service', { service: 'oaiy-voice' })).toBe('oaiy-voice → this computer');
+    expect(call('network_use_service', { service: 'oaiy-voice', node: 'w1' })).toBe('oaiy-voice → w1');
+    expect(call('oaiy_network_unpair', { node: 'w1' })).toBe('w1');
+    expect(toolIcon('network_unpair')).not.toBe(toolIcon('network_status'));
+    expect(call('model_download_plan', { catalogId: 'flux-3-image-klein' })).toBe('flux-3-image-klein');
+    expect(call('flow_run', { id: 'logo', node: 'w1' })).toBe('logo on w1');
+    expect(call('flow_update', { id: 'logo', flow: {} })).toBe('logo');
+    expect(call('agent_model_set', { source: 'provider', provider: 'lmstudio', model: 'qwen' })).toBe('provider · lmstudio · qwen');
+    // (an odd input does not stop the chat drawing the call)
+    expect(call('softn_interact', { actions: [null, { click: 'Save' }] })).toBe('click "Save"');
+    // A tool the chat has no words for reads as the desktop titles it; an activity line reads in words.
+    rememberToolTitles([{ name: 'brand_new_tool', title: 'A new thing' }]);
+    expect(toolLabel('brand_new_tool')).toBe('A new thing');
+    expect(activityText('network_pair 192.168.1.20')).toBe('Asked to pair a computer 192.168.1.20');
+    expect(activityText('compacted its context (3 turns)')).toBe('compacted its context (3 turns)');
   });
 
   it('the contacts tools read in plain words, with their icons, and say whose contact', () => {

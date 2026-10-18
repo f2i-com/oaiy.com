@@ -76,3 +76,6 @@ export const HELP = `Commands:
 
 Everything runs in this tab: files live in the browser, code runs on the Zipp VM in a Web Worker,
 and nothing leaves except requests to your AI provider and what the network gate lets through.`;
+
+/** What a phone conversation's box takes: words for its agent, and /clear. */
+export const PHONE_HELP = "Here, what you write goes to this conversation's agent (the receptionist on a call, or the agent of their texts). /clear starts the conversation again once its call has ended.";

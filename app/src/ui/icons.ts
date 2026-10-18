@@ -79,6 +79,10 @@ const ICONS: Record<string, { shapes: Shape[]; fill?: boolean }> = {
   server: { shapes: [['rect', 2, 2, 20, 8, 2], ['rect', 2, 14, 20, 8, 2], ['line', 6, 6, 6.01, 6], ['line', 6, 18, 6.01, 18]] },
   plug: { shapes: [['path', 'M12 22v-5'], ['path', 'M9 8V2'], ['path', 'M15 8V2'], ['path', 'M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z']] },
   link: { shapes: [['path', 'M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7.1-7.1l-1.7 1.7'], ['path', 'M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7.1 7.1l1.7-1.7']] },
+  // Computers joined: OAIY Network.
+  network: { shapes: [['rect', 16, 16, 6, 6, 1], ['rect', 2, 16, 6, 6, 1], ['rect', 9, 2, 6, 6, 1], ['path', 'M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3'], ['path', 'M12 12V8']] },
+  // A link taken apart: a computer unpaired.
+  unlink: { shapes: [['path', 'M18.8 12.3l1.7-1.7a5 5 0 0 0-7.1-7.1l-1.7 1.7'], ['path', 'M5.2 11.7l-1.7 1.7a5 5 0 0 0 7.1 7.1l1.7-1.7'], ['line', 8, 2, 8, 5], ['line', 2, 8, 5, 8], ['line', 16, 19, 16, 22], ['line', 19, 16, 22, 16]] },
   ban: { shapes: [['circle', 12, 12, 10], ['line', 4.9, 4.9, 19.1, 19.1]] },
 };
 

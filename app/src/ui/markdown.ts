@@ -8,7 +8,7 @@ import { escapeHtml } from './dom';
  * The Copy buttons are wired by the chat (one listener for the log), not by
  * anything in this HTML.
  */
-export function renderMarkdown(source: string): string {
+export function renderMarkdown(source: string, finished = false): string {
   const parts = source.split(/```/);
   let html = '';
   parts.forEach((part, i) => {
@@ -16,7 +16,8 @@ export function renderMarkdown(source: string): string {
       const newline = part.indexOf('\n');
       const lang = newline > 0 ? part.slice(0, newline).trim() : '';
       const code = newline >= 0 ? part.slice(newline + 1) : part;
-      html += codeBlock(lang, code.replace(/\n$/, ''), i === parts.length - 1);
+      // (a block left open is still being written, unless the reply is `finished`: stopped part way, it is whole as it is)
+      html += codeBlock(lang, code.replace(/\n$/, ''), !finished && i === parts.length - 1);
       return;
     }
     html += blocks(escapeHtml(part).split('\n'));
@@ -99,8 +100,41 @@ function inline(text: string): string {
 }
 
 function emphasis(text: string): string {
-  return text
+  // Links written as links first, kept aside, then an address written bare becomes one too.
+  const links: string[] = [];
+  const kept = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label: string, url: string) => {
+    links.push(`<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+    return `\u0000${links.length - 1}\u0000`;
+  });
+  return kept
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|\W)\*([^*\s][^*]*)\*(?=\W|$)/g, '$1<em>$2</em>')
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    .replace(BARE_URL, (url) => {
+      // (the text is escaped: an address ends where a quote or a bracket written around it starts)
+      const end = url.search(/&(?:quot|#0?39|lt|gt)(?:;|$)/);
+      const link = end < 0 ? url : url.slice(0, end);
+      return `<a href="${link}" target="_blank" rel="noopener noreferrer">${link}</a>${end < 0 ? '' : url.slice(end)}`;
+    })
+    .replace(/\u0000(\d+)\u0000/g, (_, i: string) => links[Number(i)]);
+}
+
+/** An address written bare: http(s), up to a space or a tag, its last full stop or comma not part of it. */
+const BARE_URL = /https?:\/\/[^\s<>"']*[^\s<>"'.,;:!?)\]]/g;
+
+/** Text as nodes, its bare addresses as links (a tool's result, which is shown as written). */
+export function linkedText(text: string): Node[] {
+  const out: Node[] = [];
+  let at = 0;
+  for (const m of text.matchAll(BARE_URL)) {
+    if (m.index! > at) out.push(document.createTextNode(text.slice(at, m.index)));
+    const a = document.createElement('a');
+    a.href = m[0];
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = m[0];
+    out.push(a);
+    at = m.index! + m[0].length;
+  }
+  if (at < text.length) out.push(document.createTextNode(text.slice(at)));
+  return out;
 }

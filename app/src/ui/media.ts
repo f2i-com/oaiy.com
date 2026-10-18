@@ -40,6 +40,19 @@ export interface Media {
   dispose(): void;
 }
 
+/** An element that opens something when clicked, opened from the keyboard too (Tab to it, Enter or Space). */
+function openable(el: HTMLElement, label: string, open: () => void): void {
+  el.tabIndex = 0;
+  el.setAttribute('role', 'button');
+  el.setAttribute('aria-label', label);
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      open();
+    }
+  });
+}
+
 /**
  * An element that shows or plays the file. `compact` is for the chat: a
  * thumbnail for an image, a slim player for audio and video.
@@ -55,6 +68,7 @@ export function mediaElement(path: string, bytes: Uint8Array, options: { compact
     if (options.onOpen) {
       img.classList.add('clickable');
       img.addEventListener('click', options.onOpen);
+      openable(img, `Open ${name}`, options.onOpen);
     }
     element = options.compact ? h('span.media.media-thumb', img) : h('div.media.media-image', img);
   } else {
@@ -67,6 +81,7 @@ export function mediaElement(path: string, bytes: Uint8Array, options: { compact
       label.classList.add('clickable');
       label.title = `${path}: click to open`;
       label.addEventListener('click', options.onOpen);
+      openable(label, `Open ${name}`, options.onOpen);
     }
     element = h(`div.media.media-${kind}`, { class: options.compact ? 'compact' : '' }, label, player);
   }

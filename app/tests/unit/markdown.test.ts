@@ -28,4 +28,17 @@ describe("the chat's Markdown", () => {
     expect(renderMarkdown('Use `**not bold**` here')).toBe('<p>Use <code>**not bold**</code> here</p>');
     expect(renderMarkdown('## Title\n- a\n- [x] done\n3. three\n> quoted\n---')).toBe('<h4>Title</h4><ul><li>a</li><li class="task done"><span class="task-box" aria-hidden="true"></span>done</li></ul><ol start="3"><li>three</li></ol><blockquote>quoted</blockquote><hr>');
   });
+
+  it('makes an address written bare a link, ending where the sentence or a quote does', () => {
+    const html = renderMarkdown('Open https://auth.openai.com/device?code=AB&x=1, then "https://example.com/a" and [docs](https://oaiy.com).');
+    expect(html).toContain('<a href="https://auth.openai.com/device?code=AB&amp;x=1" target="_blank" rel="noopener noreferrer">https://auth.openai.com/device?code=AB&amp;x=1</a>,');
+    expect(html).toContain('&quot;<a href="https://example.com/a" target="_blank" rel="noopener noreferrer">https://example.com/a</a>&quot;');
+    expect(html).toContain('<a href="https://oaiy.com" target="_blank" rel="noopener noreferrer">docs</a>');
+    expect(html.match(/<a /g)).toHaveLength(3);
+  });
+
+  it('a code block left open is still being written, unless the reply is finished (stopped part way)', () => {
+    expect(renderMarkdown('```js\nlet a = 1;')).toContain('class="code-block writing"');
+    expect(renderMarkdown('```js\nlet a = 1;', true)).toContain('class="code-block"');
+  });
 });

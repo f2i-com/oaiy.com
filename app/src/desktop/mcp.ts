@@ -323,7 +323,46 @@ export function withControlTools(own: SessionTool[], session: ControlSession, cl
   const listed = client()?.listed(session) ?? [];
   if (!listed.length) return own;
   const taken = new Set([...builtIns, ...own.map((t) => t.spec.name)]);
-  return distinctTools([...own, ...controlSessionTools(listed, session, { client, taken, changed })]);
+  return distinctTools([...withNodeCalls(own, listed, session, client, changed), ...controlSessionTools(listed, session, { client, taken, changed })]);
+}
+
+/** The longest a flow run on another computer is waited for (the desktop's flow_run with node takes up to 600 s). */
+const NODE_RUN_SECONDS = 600;
+
+/**
+ * The app's own tools that stand in for one of the desktop's (`COVERED`) that
+ * also works on another computer (OAIY Network: its `node`), taking `node` too:
+ * with it, the call goes to the desktop's tool, which lists or runs that
+ * computer's shared flows there; without it, to the app's own, as before.
+ */
+export function withNodeCalls(own: SessionTool[], listed: ControlTool[], session: ControlSession, client: () => ControlClient | null, changed?: (tool: string) => void): SessionTool[] {
+  return own.map((tool) => {
+    const desk = listed.find((t) => COVERED[t.name] === tool.spec.name && isRecord(t.inputSchema.properties) && 'node' in t.inputSchema.properties);
+    if (!desk) return tool;
+    const node = (desk.inputSchema.properties as Record<string, unknown>).node;
+    const params = tool.spec.parameters as Record<string, unknown>;
+    const props = isRecord(params.properties) ? params.properties : {};
+    const there = tool.spec.name === 'flow_list' ? "lists the flows that computer shares" : "runs one of that computer's shared flows there, on its own models";
+    return {
+      ...tool,
+      spec: {
+        ...tool.spec,
+        description: `${tool.spec.description} With node (a paired computer's id, as network_status lists it: OAIY Network) it ${there}.`,
+        parameters: { ...params, properties: { ...props, node } },
+      },
+      run: async (input, signal) => {
+        if (typeof input.node !== 'string' || !input.node.trim()) return tool.run(input, signal);
+        const c = client();
+        if (!c) throw new Error('OAIY Desktop is not connected, so another computer cannot be reached from here');
+        const args = desk.name === 'flow_run' && typeof input.timeoutSeconds !== 'number' ? { ...input, timeoutSeconds: NODE_RUN_SECONDS } : input;
+        const result = await c.call(session, desk.name, args, signal);
+        const text = controlOutcome(result);
+        if (result.isError) throw new Error(text || `${desk.name} failed`);
+        if (!desk.readOnly) changed?.(desk.name);
+        return text || 'Done.';
+      },
+    };
+  });
 }
 
 /** Tools with names already in use dropped (the first of each name stays): no model is sent two tools of one name. */

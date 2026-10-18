@@ -35,6 +35,8 @@ export type AgentEvent =
   | { type: 'tool_call'; call: ToolCall }
   | { type: 'tool_result'; result: ToolResult }
   | { type: 'status'; message: string }
+  /** How a run ended when that is worth keeping (it was stopped, it went in circles, its reply was cut off): a note in the log, not a passing status. */
+  | { type: 'notice'; message: string }
   | { type: 'usage'; usage: Usage }
   /** How full the model's context is: the prompt about to be sent, in tokens, and the window. */
   | { type: 'context'; used: number; window: number }
@@ -1875,7 +1877,7 @@ ${this.instructions}` : ''}`;
               this.turns.push({ role: 'user', text: `[OAIY] ${REPEAT_NUDGE}`, automatic: true });
               continue;
             }
-            emit({ type: 'status', message: 'The model kept giving the same reply without doing anything, so the run stopped. Say what to do next.' });
+            emit({ type: 'notice', message: 'The model kept giving the same reply without doing anything, so the run stopped. Say what to do next.' });
             emit({ type: 'done', text: reply.text, steps: step });
             return;
           }
@@ -1892,7 +1894,7 @@ ${this.instructions}` : ''}`;
             this.turns.push({ role: 'user', text: `[OAIY] ${finish.say}`, automatic: true });
             continue;
           }
-          if (reply.truncated) emit({ type: 'status', message: 'The reply was cut off at the output limit.' });
+          if (reply.truncated) emit({ type: 'notice', message: 'The reply was cut off at the output limit.' });
           // Stopping short of the goal: ask once or twice to carry on.
           // A call this run started is going on: its result comes here by itself, and polling for it would take the engine from the call.
           const unfinished = this.unfinished(planThisRun, announcesWork(reply.text), startedCalls && !!this.options.waitingOnCall?.(), !!said);
@@ -2040,7 +2042,7 @@ ${this.instructions}` : ''}`;
       emit({ type: 'error', message: `The run reached its ${maxSteps}-step limit. Say "continue" to keep going.` });
     } catch (error) {
       if (signal?.aborted || (error instanceof AIProviderError && error.kind === 'cancelled')) {
-        emit({ type: 'status', message: 'Stopped.' });
+        emit({ type: 'notice', message: 'Stopped.' });
       } else {
         emit({ type: 'error', message: error instanceof Error ? error.message : String(error) });
       }

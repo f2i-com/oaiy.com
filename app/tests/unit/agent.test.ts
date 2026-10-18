@@ -363,7 +363,7 @@ describe('tool rules', () => {
     await agent.run('make a video', emit);
     expect(fake.bodies).toHaveLength(3);
     expect(events.filter((e) => e.type === 'nudge')).toHaveLength(2);
-    expect(events.some((e) => e.type === 'status' && /kept giving the same reply/.test(e.message))).toBe(true);
+    expect(events.some((e) => e.type === 'notice' && /kept giving the same reply/.test(e.message))).toBe(true);
     expect(events.at(-1)).toMatchObject({ type: 'done' });
   });
 

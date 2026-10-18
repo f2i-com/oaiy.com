@@ -89,13 +89,13 @@ const TOOLS: Record<string, [string, string]> = {
   engine_stop: ['Stopped the engine', 'power'],
   engine_restart: ['Restarted the engine', 'refresh'],
   ai_sources_list: ['Looked at the AI sources', 'sparkle'],
-  network_status: ['Looked at OAIY Network', 'server'],
-  network_setup: ['Set up OAIY Network', 'server'],
-  network_pair: ['Paired with another computer', 'server'],
-  network_approve: ['Answered a pairing request', 'server'],
-  network_unpair: ['Unpaired a computer', 'server'],
-  network_use_service: ["Chose another computer's service", 'server'],
-  network_pin: ['Kept a model loaded on another computer', 'server'],
+  network_status: ['Looked at OAIY Network', 'network'],
+  network_setup: ['Changed OAIY Network', 'network'],
+  network_pair: ['Asked to pair a computer', 'network'],
+  network_approve: ['Answered a pairing request', 'network'],
+  network_unpair: ['Unpaired a computer', 'unlink'],
+  network_use_service: ['Chose where a service runs', 'network'],
+  network_pin: ['Pinned a model', 'network'],
   agent_model_set: ["Chose the Agent's model", 'sparkle'],
   chatgpt_sign_in: ['Started the ChatGPT sign-in', 'user'],
   chatgpt_sign_out: ['Signed out of ChatGPT', 'user'],
@@ -136,25 +136,59 @@ const TOOLS: Record<string, [string, string]> = {
   logs_tail: ['Read a log', 'file-text'],
 };
 
-/** A tool's name in plain words ("Read", "Ran code"); a flow's own tool as its name reads. */
-export function toolLabel(name: string): string {
-  // OAIY's own tool given a prefix (another of the conversation's tools had its name) reads as itself.
-  const known = TOOLS[name]?.[0] ?? (name.startsWith('oaiy_') ? TOOLS[name.slice(5)]?.[0] : undefined);
+/** OAIY's own tool given a prefix (another of the conversation's tools had its name) is that tool. */
+const own = (name: string): string => (name.startsWith('oaiy_') && TOOLS[name.slice(5)] ? name.slice(5) : name);
+
+/** The titles OAIY Desktop gives its tools (from its MCP list): the name a tool the app does not know reads by. */
+const TITLES = new Map<string, string>();
+
+/** Keep the titles OAIY Desktop gave its tools, by name. */
+export function rememberToolTitles(tools: Iterable<{ name: string; title?: string }>): void {
+  for (const t of tools) if (t.title) TITLES.set(t.name, t.title);
+}
+
+/**
+ * A tool's name in plain words ("Read", "Ran code"); a flow's own tool as its name reads. With the call's `input`,
+ * as what it did reads (a pin let go, a request denied).
+ */
+export function toolLabel(name: string, input?: Record<string, unknown>): string {
+  const base = own(name);
+  if (input) {
+    switch (base) {
+      case 'network_setup': if (input.enabled === false) return 'Switched off OAIY Network'; break;
+      case 'network_pin': if (input.pin === false) return 'Let a pinned model go'; break;
+      case 'network_approve': return input.approve === false ? 'Denied a pairing request' : 'Approved a pairing request';
+      case 'network_pair': if (typeof input.pairingId === 'string' && !input.node && !input.address) return 'Waited for a pairing'; break;
+    }
+  }
+  const known = TOOLS[base]?.[0];
   if (known) return known;
+  const titled = TITLES.get(name) ?? TITLES.get(base);
+  if (titled) return titled;
   const words = name.replace(/[_-]+/g, ' ').trim();
   return words ? words[0].toUpperCase() + words.slice(1) : 'Tool';
 }
 
+/**
+ * What an agent is doing, as a line ("network_pair node-1"): a tool's name at its start in plain words, as the
+ * chat writes it (a sub-agent's activity, the step in progress).
+ */
+export function activityText(text: string): string {
+  const [first, ...rest] = text.split(' ');
+  if (!first || !(TOOLS[own(first)] || TITLES.has(first))) return text;
+  return [toolLabel(first), ...rest].join(' ');
+}
+
 /** A tool's icon's name. */
 export function toolIcon(name: string): string {
-  return TOOLS[name]?.[1] ?? (name.startsWith('oaiy_') ? TOOLS[name.slice(5)]?.[1] : undefined) ?? (name.startsWith('flow') ? 'flow' : name.startsWith('softn') ? 'app' : 'wrench');
+  return TOOLS[own(name)]?.[1] ?? (name.startsWith('flow') ? 'flow' : name.startsWith('softn') ? 'app' : 'wrench');
 }
 
 /** What a call worked on, in a few words: the file, the command, the search. */
 export function summarizeCall(call: ToolCall): string {
   const i = call.input;
   const s = (k: string) => (typeof i[k] === 'string' ? String(i[k]) : '');
-  switch (call.name) {
+  switch (own(call.name)) {
     case 'read_file': case 'write_file': case 'append_file': case 'edit_file': case 'delete_file': case 'list_files': return s('path') || '/';
     case 'review_frame': return `${s('path')}${i.accept === true ? ' (accept)' : ''}`;
     case 'grep': return `${s('pattern')}${s('path') ? ` in ${s('path')}` : ''}`;
@@ -166,7 +200,7 @@ export function summarizeCall(call: ToolCall): string {
     case 'present_file': case 'view_image': case 'file_info': case 'search_file': return s('path');
     case 'softn_import': return s('path');
     case 'softn_check': case 'softn_inspect': return s('app');
-    case 'softn_interact': return Array.isArray(i.actions) ? i.actions.map((a) => Object.entries(a as Record<string, unknown>).filter(([k]) => k !== 'nth').map(([k, v]) => (k === 'value' ? `"${v}"` : `${k} ${typeof v === 'string' ? `"${v}"` : v}`)).join(' ')).join(', ') : '';
+    case 'softn_interact': return Array.isArray(i.actions) ? i.actions.filter((a): a is Record<string, unknown> => !!a && typeof a === 'object').map((a) => Object.entries(a).filter(([k]) => k !== 'nth').map(([k, v]) => (k === 'value' ? `"${v}"` : `${k} ${typeof v === 'string' ? `"${v}"` : v}`)).join(' ')).join(', ') : '';
     case 'softn_docs': return s('search') ? `search: ${s('search')}` : s('topic') || s('section') || 'map';
     case 'softn_components': return Array.isArray(i.names) ? i.names.join(', ') : s('names');
     case 'softn_examples': return [s('name'), s('file'), s('install_to') && `→ ${s('install_to')}`].filter(Boolean).join(' ') || 'list';
@@ -196,8 +230,21 @@ export function summarizeCall(call: ToolCall): string {
     case 'plugin_install': return s('source').split(/[\\/]/).filter(Boolean).pop() ?? '';
     case 'models_list': return s('group');
     case 'model_set_default': return [s('group'), s('model')].filter(Boolean).join(' → ');
-    case 'model_download': return s('catalogId');
-    case 'agent_model_set': return [s('source') === 'chatgpt' ? 'ChatGPT' : s('source') === 'engine' ? 'the engine' : s('source'), s('model')].filter(Boolean).join(' · ');
+    case 'model_download': case 'model_download_plan': return s('catalogId');
+    case 'agent_model_set': return [s('source') === 'chatgpt' ? 'ChatGPT' : s('source') === 'engine' ? 'the engine' : s('source'), s('provider'), s('model')].filter(Boolean).join(' · ');
+    // OAIY Network: which computer, what changed.
+    case 'network_setup': {
+      const way = (k: string, yes: string, no: string) => (i[k] === true ? yes : i[k] === false ? no : '');
+      return [way('enabled', 'on', 'off'), way('uses', 'uses others', 'uses none'), way('lends', 'lends itself', 'lends nothing'), way('shareModels', 'shares model files', 'keeps model files'), s('name')].filter(Boolean).join(' · ');
+    }
+    case 'network_pair': return s('node') || s('address') || (s('pairingId') ? `waiting · ${s('pairingId')}` : '');
+    case 'network_approve': return [i.approve === false ? 'denied' : 'approved', s('id')].filter(Boolean).join(' · ');
+    case 'network_unpair': return s('node');
+    case 'network_use_service': return `${s('service') || 'service'} → ${s('node') || 'this computer'}`;
+    case 'network_pin': return [s('model').replace(/^engine:[\w]+:node\./, ''), i.pin === false ? 'let go' : 'kept loaded'].filter(Boolean).join(' · ');
+    case 'flows_list': return s('node') ? `on ${s('node')}` : '';
+    case 'flow_create': case 'flow_update': return s('id') || (i.flow && typeof i.flow === 'object' && typeof (i.flow as Record<string, unknown>).name === 'string' ? String((i.flow as Record<string, unknown>).name) : '');
+    case 'flow_run': return [s('id'), s('node') && `on ${s('node')}`].filter(Boolean).join(' ');
     case 'ui_open': return [s('view'), s('contact')].filter(Boolean).join(' · ');
     case 'contacts_list': return s('q');
     case 'contact_get': return s('number');
