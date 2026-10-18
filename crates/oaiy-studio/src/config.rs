@@ -327,6 +327,16 @@ pub fn load(path: &Path) -> Result<Json, String> {
     if upgraded || relaxed {
         save(path, &v)?;
     }
+    // A Hugging Face token no token could be (one saved before tokens were checked) is not used, rather than the
+    // studio not starting for it: checked strictly only when the settings are saved.
+    let bad_token = v.get("downloads").and_then(|d| d.get("hf_token")).and_then(Json::as_str).is_some_and(|t| crate::models::downloads::check_token(t.trim()).is_err());
+    if bad_token {
+        if let Some(mut d) = v.get("downloads").cloned() {
+            crate::util::set(&mut d, "hf_token", Json::str(""));
+            crate::util::set(&mut v, "downloads", d);
+        }
+        eprintln!("oaiy-studio: {}: downloads.hf_token has characters no token has, so it is not used: set it again in Get models", path.display());
+    }
     validate(&v).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(v)
 }
@@ -473,6 +483,10 @@ pub fn validate(v: &Json) -> Result<(), String> {
     }
     if v.get("privacy").is_some_and(|p| p.as_object().is_none() || p.get("incognito").is_some_and(|i| i.as_bool().is_none())) {
         return Err("privacy.incognito must be true or false".into());
+    }
+    // (the token is written into curl's configuration as it downloads, where a line break would begin an option)
+    if let Some(t) = v.get("downloads").and_then(|d| d.get("hf_token")).and_then(Json::as_str) {
+        crate::models::downloads::check_token(t.trim()).map_err(|e| format!("downloads.hf_token: {e}"))?;
     }
     if int_or(ui, "port", 0) != 0 && int_or(ui, "port", 0) == int_or(gateway, "port", 1) && str_or(ui, "host", "") == str_or(gateway, "host", "") {
         return Err("the UI and the gateway need different ports".into());
@@ -1148,6 +1162,12 @@ mod tests {
         assert_eq!(back.get("downloads").and_then(|d| d.get("hf_token")).and_then(Json::as_str), Some("hf_test_token"));
         assert_eq!(back.get("gateway").and_then(|g| g.get("api_key")).and_then(Json::as_str), Some("gateway-test-key"));
         assert_eq!(names(&dir.0), [FILE_NAME], "no temporary file is left beside it");
+        // a token no token could be, saved before tokens were checked: not used, and the studio still starts
+        *field(&mut v, &["downloads", "hf_token"]) = Json::str("hf_x\nverbose");
+        assert!(validate(&v).is_err(), "refused as it is saved");
+        save(&path, &v).unwrap();
+        let back = load(&path).unwrap();
+        assert_eq!(back.get("downloads").and_then(|d| d.get("hf_token")).and_then(Json::as_str), Some(""));
     }
 
     /// A file an older build wrote readable by everyone is replaced by a private one, not changed in place.

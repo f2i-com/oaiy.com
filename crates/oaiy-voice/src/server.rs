@@ -16,14 +16,22 @@
 //! are ready. Transcriptions run one at a time, as do spoken lines (the GPU
 //! is shared by the whole request anyway); each connection has its own
 //! thread, so `/v1/models` answers while either runs.
+//!
+//! A web page in this computer's browser can reach the server too, so it is
+//! gated as `oaiy-llm-server` is ([`http::loopback_gate`]): on a loopback
+//! address it answers only a `Host` naming loopback (DNS rebinding), and no
+//! page but this computer's own; with a key (`OAIY_VOICE_API_KEY`) every
+//! request but the probes' must carry it. Its answers allow no other origin
+//! (no `Access-Control-Allow-Origin`).
 
+use std::cell::{Cell, RefCell};
 use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use oaiy_engine::http::{self, Request};
+use oaiy_engine::http::{self, Refusal, Request};
 use oaiy_engine::json::Json;
 
 use crate::audio;
@@ -31,6 +39,28 @@ use crate::cli::Mode;
 
 /// Connections served at once; past this a client gets an immediate 503.
 const MAX_CONNECTIONS: usize = 32;
+/// Connections past [`MAX_CONNECTIONS`] kept for a probe (`GET /v1/models`, `/health`), one request each: connections
+/// left open between requests (300 s each) could fill the rest, and a supervisor whose probe went unanswered would
+/// start the server again mid-call.
+const PROBE_SLOTS: usize = 4;
+/// The routes a probe may ask for, which a key does not guard either (they tell only which models are loaded: OAIY
+/// Desktop's probe and its health check ask them without one).
+const OPEN_ROUTES: [&str; 3] = ["/", "/health", "/v1/models"];
+
+/// The largest body each route takes, refused on its head (before a byte of it is read). A transcription's: ten
+/// minutes of 16 kHz 16-bit audio (the longest heard, [`audio::MAX_SECONDS`]) in base64, 25.6 MB, with room; a spoken
+/// line's: [`MAX_INPUT`] characters of JSON. (A chunked body says nothing of its size first: it is held to
+/// `oaiy-engine`'s 64 MiB as it comes.)
+const MAX_TRANSCRIPTION_BODY: usize = 32 << 20;
+const MAX_SPEECH_BODY: usize = 1 << 20;
+const MAX_OTHER_BODY: usize = 64 << 10;
+
+/// Transcriptions whose bodies are read and decoded at once (each is some 100 MB at the most, as base64, a WAV and
+/// samples); more wait their turn before their bodies are read, and give up after [`TURN_WAIT`].
+const TRANSCRIBING: usize = 3;
+const TURN_WAIT: Duration = Duration::from_secs(60);
+/// How long a long transcription, between its passes, lets the short ones waiting for the engine go first.
+const MAKE_WAY: Duration = Duration::from_secs(30);
 
 /// A speech-to-text engine as the server uses it.
 pub trait SpeechToText: Send {
@@ -57,14 +87,19 @@ pub trait TextToSpeech: Send + Sync {
     /// Whether `voice` can be spoken in (before anything is made).
     fn check_voice(&self, voice: Option<&str>) -> Result<(), String>;
     /// Speak `text`, handing out 16-bit mono PCM at [`SPEECH_RATE`] as it is
-    /// made; `on_chunk` returning false (or `cancel` set) stops it.
-    fn speak(&self, text: &str, voice: Option<&str>, cancel: Arc<AtomicBool>, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String>;
+    /// made; `on_chunk` returning false, `gone` answering true (asked while the
+    /// line waits its turn and is made: its listener went) or `cancel` set stops it.
+    fn speak(&self, text: &str, voice: Option<&str>, cancel: Arc<AtomicBool>, gone: &dyn Fn() -> bool, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String>;
     /// Make `text` whole and keep it to be said from memory when it is asked for (a caller's greeting, made as the
     /// call settles): how like its voice it came out and its seed, where it was made. Nothing, where the engine
-    /// keeps nothing.
-    fn prepare(&self, text: &str, voice: Option<&str>) -> Result<Option<(f64, u64)>, String> {
-        let _ = (text, voice);
+    /// keeps nothing. `gone` as for [`speak`](Self::speak).
+    fn prepare(&self, text: &str, voice: Option<&str>, gone: &dyn Fn() -> bool) -> Result<Option<(f64, u64)>, String> {
+        let _ = (text, voice, gone);
         Ok(None)
+    }
+    /// Whether the engine is still there to speak (false once its thread has ended).
+    fn alive(&self) -> bool {
+        true
     }
 }
 
@@ -75,7 +110,17 @@ pub struct Server {
     /// Where it runs ("cuda:1 f16", "cpu f32"), for `/health`.
     pub device: String,
     stt: Option<SharedStt>,
+    /// The rate the speech-to-text engine takes (read once: audio is resampled to it before the engine is waited on).
+    stt_rate: usize,
     tts: Option<Arc<dyn TextToSpeech>>,
+    /// The key every request but a probe's must carry ([`OPEN_ROUTES`]), if any.
+    key: Option<String>,
+    /// Whether it listens on loopback alone: a request must then name loopback as its `Host`.
+    loopback: bool,
+    /// Turns at reading and decoding a transcription's body ([`TRANSCRIBING`]).
+    turns: Arc<Turns>,
+    /// Short transcriptions (one pass) waiting for the engine: a long one lets them go first between its passes.
+    waiting: AtomicUsize,
 }
 
 pub struct Response {
@@ -98,19 +143,118 @@ impl Response {
     }
 }
 
+/// Turns taken from a count, waited for when none is free.
+struct Turns {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+/// A turn taken from [`Turns`], given back when dropped.
+pub struct Turn(Arc<Turns>);
+
+impl Turns {
+    fn new(n: usize) -> Arc<Turns> {
+        Arc::new(Turns { free: Mutex::new(n), freed: Condvar::new() })
+    }
+
+    /// A turn, waited for up to `within`; none if none came free by then.
+    fn take(self: &Arc<Self>, within: Duration) -> Option<Turn> {
+        let until = Instant::now() + within;
+        let mut free = self.free.lock().unwrap_or_else(|p| p.into_inner());
+        while *free == 0 {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            free = self.freed.wait_timeout(free, left).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        *free -= 1;
+        Some(Turn(Arc::clone(self)))
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// A short transcription counted as waiting for the engine until it has it.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Server {
     pub fn new(mode: Mode, stt: Option<SharedStt>, stt_id: impl Into<String>, device: impl Into<String>, tts: Option<Arc<dyn TextToSpeech>>) -> Self {
-        Self { mode, stt_id: stt_id.into(), device: device.into(), stt, tts }
+        let stt_rate = stt.as_ref().map_or(16_000, |s| s.lock().unwrap_or_else(|p| p.into_inner()).sample_rate());
+        Self {
+            mode,
+            stt_id: stt_id.into(),
+            device: device.into(),
+            stt,
+            stt_rate,
+            tts,
+            key: None,
+            loopback: true,
+            turns: Turns::new(TRANSCRIBING),
+            waiting: AtomicUsize::new(0),
+        }
+    }
+
+    /// The key requests must carry (`Authorization: Bearer KEY`), none for none.
+    pub fn with_key(mut self, key: Option<String>) -> Self {
+        self.key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        self
+    }
+
+    /// A request's head, before its body is read: refused (by [`http::loopback_gate`], for its size, or on a
+    /// connection kept for probes, `probe_only`, for being no probe), or let in, with its turn at a transcription
+    /// where it is one (waited for here, before its body is read: a body waiting in the socket costs nothing).
+    pub fn admit(&self, req: &Request, probe_only: bool) -> Result<Option<Turn>, Refusal> {
+        if let Some(refused) = http::loopback_gate(self.key.as_deref(), self.loopback, req, &OPEN_ROUTES) {
+            return Err(refused);
+        }
+        let route = req.route();
+        if probe_only && !(req.method == "GET" && OPEN_ROUTES.contains(&route)) {
+            return Err(Refusal::new(503, "voice server connection limit reached", "busy"));
+        }
+        let transcription = req.method == "POST" && route == "/v1/audio/transcriptions";
+        let cap = match (req.method.as_str(), route) {
+            _ if transcription => MAX_TRANSCRIPTION_BODY,
+            ("POST", "/v1/audio/speech") => MAX_SPEECH_BODY,
+            _ => MAX_OTHER_BODY,
+        };
+        if req.header("content-length").and_then(|l| l.trim().parse::<u64>().ok()).is_some_and(|len| len > cap as u64) {
+            return Err(Refusal::new(413, &format!("the body is larger than this route takes ({cap} bytes)"), "too_large"));
+        }
+        if !(transcription && self.mode.stt()) {
+            return Ok(None);
+        }
+        match self.turns.take(TURN_WAIT) {
+            Some(turn) => Ok(Some(turn)),
+            None => Err(Refusal::new(503, "the voice server is busy with other transcriptions: try again shortly", "busy")),
+        }
     }
 
     /// Answer one request on `w`: a spoken line streams, the rest answer whole.
     /// Returns whether the connection may be kept open.
     pub fn serve(&self, req: &Request, w: &mut impl Write) -> io::Result<bool> {
+        self.serve_watched(req, w, &|| false)
+    }
+
+    /// [`serve`](Self::serve), `gone` telling whether the client has gone (asked while a spoken line waits for the
+    /// engine and is made, which then stops: the one engine is not held for a line nobody hears).
+    pub fn serve_watched(&self, req: &Request, w: &mut impl Write, gone: &dyn Fn() -> bool) -> io::Result<bool> {
         if req.method == "POST" && req.route() == "/v1/audio/speech" && self.mode.tts() {
-            return self.speech(req, w);
+            return self.speech(req, w, gone);
         }
         let r = self.handle(req);
-        http::respond(w, r.status, r.content_type, &r.body, true)?;
+        respond(w, &r, true)?;
         Ok(true)
     }
 
@@ -142,7 +286,15 @@ impl Server {
         }
     }
 
+    /// Whether the speech engine this server should have is gone (its thread ended): it answers its probes 503 then.
+    fn speech_gone(&self) -> bool {
+        self.mode.tts() && self.tts.as_ref().is_some_and(|t| !t.alive())
+    }
+
     fn models(&self) -> Response {
+        if self.speech_gone() {
+            return Response::error(503, "server_error", "the speech engine has stopped");
+        }
         let mut data = Vec::new();
         if self.mode.stt() {
             data.push(Json::obj([("id", Json::str(self.stt_id.clone())), ("object", Json::str("model")), ("owned_by", Json::str("oaiy"))]));
@@ -155,12 +307,12 @@ impl Server {
 
     fn health(&self) -> Response {
         let stt_ready = self.stt.is_some();
-        let tts_ready = self.tts.is_some();
+        let tts_ready = self.tts.as_ref().is_some_and(|t| t.alive());
         let ok = (!self.mode.stt() || stt_ready) && (!self.mode.tts() || tts_ready);
         Response::json(
-            200,
+            if self.speech_gone() { 503 } else { 200 },
             Json::obj([
-                ("status", Json::str(if ok { "ok" } else { "degraded" })),
+                ("status", Json::str(if ok { "ok" } else if self.speech_gone() { "failed" } else { "degraded" })),
                 ("mode", Json::str(self.mode.as_str())),
                 ("stt", Json::Bool(stt_ready)),
                 ("tts", Json::Bool(tts_ready)),
@@ -172,8 +324,9 @@ impl Server {
 
     /// A spoken line: checked first (a bad request costs nothing), then made.
     /// `pcm` streams from the first piece; an error before it is an error
-    /// answer, one after it ends the stream early.
-    fn speech(&self, req: &Request, w: &mut impl Write) -> io::Result<bool> {
+    /// answer, one after it cuts the stream off (no end: the client knows the
+    /// line did not end). A client that went closes the connection.
+    fn speech(&self, req: &Request, w: &mut impl Write, gone: &dyn Fn() -> bool) -> io::Result<bool> {
         let json = match Json::parse(&req.body) {
             Ok(j) => j,
             Err(e) => return answer(w, Response::bad(format!("malformed JSON: {e}"))),
@@ -193,12 +346,26 @@ impl Server {
             Some(other) => return answer(w, Response::bad(format!("only response_format \"pcm\" (streamed, 24 kHz 16-bit mono) or \"wav\" is supported, got {other:?}"))),
         };
         let Some(tts) = &self.tts else { return answer(w, Response::error(503, "server_error", "no text-to-speech model is loaded")) };
+        if !tts.alive() {
+            return answer(w, Response::error(503, "server_error", "the speech engine has stopped"));
+        }
         if let Err(e) = tts.check_voice(voice) {
             return answer(w, Response::bad(e));
         }
+        // (the client's going noted, so nothing more is written to it and its connection is closed)
+        let left = Cell::new(false);
+        let gone = || {
+            let g = gone();
+            left.set(left.get() || g);
+            g
+        };
         // ("prepare": made whole and kept, to be said from memory when asked for; nothing is said now)
         if json.get("prepare").and_then(Json::as_bool) == Some(true) {
-            return match tts.prepare(text, voice) {
+            let made = tts.prepare(text, voice, &gone);
+            if left.get() {
+                return Ok(false);
+            }
+            return match made {
                 Ok(made) => {
                     let body = match made {
                         Some((likeness, seed)) => Json::obj([("prepared", Json::Bool(true)), ("likeness", Json::Num(likeness)), ("seed", Json::Int(seed as i64))]),
@@ -213,10 +380,14 @@ impl Server {
         let started = Instant::now();
         if format == "wav" {
             let mut all: Vec<i16> = Vec::new();
-            return match tts.speak(text, voice, cancel, &mut |pcm| {
+            let spoken = tts.speak(text, voice, cancel, &gone, &mut |pcm| {
                 all.extend_from_slice(pcm);
                 true
-            }) {
+            });
+            if left.get() {
+                return Ok(false);
+            }
+            return match spoken {
                 Ok(()) => {
                     let samples: Vec<f32> = all.iter().map(|&s| s as f32 / 32_768.0).collect();
                     answer(w, Response { status: 200, content_type: "audio/wav", body: audio::write_wav(&samples, SPEECH_RATE) })
@@ -224,9 +395,9 @@ impl Server {
                 Err(e) => answer(w, Response::error(500, "server_error", format!("speech failed: {e}"))),
             };
         }
-        let (mut streaming, mut gone, mut first) = (false, false, None);
-        let result = tts.speak(text, voice, cancel, &mut |pcm| {
-            if gone {
+        let (mut streaming, mut gone_writing, mut first) = (false, false, None);
+        let result = tts.speak(text, voice, cancel, &gone, &mut |pcm| {
+            if gone_writing {
                 return false;
             }
             let sent = (|| -> io::Result<()> {
@@ -241,21 +412,20 @@ impl Server {
                 w.write_all(b"\r\n")?;
                 w.flush()
             })();
-            gone = sent.is_err();
-            !gone
+            gone_writing = sent.is_err();
+            !gone_writing
         });
-        if gone {
+        if gone_writing || left.get() {
             eprintln!("[oaiy-voice] the listener went: the line stopped");
             return Ok(false);
         }
         match (streaming, result) {
             (false, Err(e)) => answer(w, Response::error(500, "server_error", format!("speech failed: {e}"))),
             (true, Err(e)) => {
-                // Part of the line was sent: end it there (the client has what came).
+                // Part of the line was sent: the stream is cut off there, without its end, so the client sees the
+                // line did not end as it should (it has what came).
                 eprintln!("[oaiy-voice] speech failed part way: {e}");
-                w.write_all(b"0\r\n\r\n")?;
-                w.flush()?;
-                Ok(true)
+                Ok(false)
             }
             (streaming, Ok(())) => {
                 if !streaming {
@@ -271,15 +441,36 @@ impl Server {
         }
     }
 
+    /// The speech-to-text engine, waited for; a short request (`short`) counted as waiting meanwhile, so a long one
+    /// lets it in between its passes ([`Server::make_way`]).
+    fn engine<'a>(&'a self, stt: &'a SharedStt, short: bool) -> MutexGuard<'a, Box<dyn SpeechToText>> {
+        let _waiting = short.then(|| {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            Waiting(&self.waiting)
+        });
+        stt.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Between a long transcription's passes: the short ones waiting for the engine go first (for [`MAKE_WAY`] at most).
+    fn make_way(&self) {
+        let until = Instant::now() + MAKE_WAY;
+        while self.waiting.load(Ordering::SeqCst) > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn transcriptions(&self, req: &Request) -> Response {
         let content_type = req.header("content-type").unwrap_or("").to_string();
         let lower = content_type.to_ascii_lowercase();
         let (wav, format) = if lower.starts_with("multipart/form-data") {
             match audio::parse_multipart(&req.body, &content_type) {
-                Ok(form) => match form.file.clone() {
-                    Some(f) => (f, form.field("response_format").map(str::to_string)),
-                    None => return Response::bad("multipart request has no file part"),
-                },
+                Ok(mut form) => {
+                    let format = form.field("response_format").map(str::to_string);
+                    match form.file.take() {
+                        Some(f) => (f, format),
+                        None => return Response::bad("multipart request has no file part"),
+                    }
+                }
                 Err(e) => return Response::bad(e),
             }
         } else if lower.is_empty() || lower.starts_with("application/json") {
@@ -305,24 +496,34 @@ impl Server {
             Some(f) if f.eq_ignore_ascii_case("verbose_json") => "verbose_json",
             Some(other) => return Response::bad(format!("only response_format \"json\", \"text\" or \"verbose_json\" is supported, got {other:?}")),
         };
-        let wav = match audio::parse_wav(&wav) {
+        let parsed = audio::parse_wav(&wav);
+        drop(wav);
+        let wav = match parsed {
             Ok(w) => w,
             Err(e) => return Response::bad(format!("invalid WAV: {e}")),
         };
         let Some(stt) = &self.stt else { return Response::error(503, "server_error", "no speech-to-text model is loaded") };
-        let mut stt = match stt.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let rate = stt.sample_rate();
+        // (resampled before the engine is waited on: another request's transcription is not held up by it)
+        let rate = self.stt_rate;
         let samples = audio::resample(&wav.samples, wav.sample_rate as usize, rate);
+        drop(wav);
         let seconds = samples.len() as f64 / rate as f64;
         let started = Instant::now();
-        let text = match stt.transcribe(&samples) {
-            Ok(t) => t,
-            Err(e) => return Response::error(500, "server_error", format!("transcription failed: {e}")),
-        };
-        drop(stt);
+        // One pass of the model at a time, the engine let go between them, so a long recording does not hold a
+        // call's words for minutes: each pass is what the engine would have made of the whole (its own pieces).
+        let passes = crate::stt::passes(&samples, rate);
+        let mut said = Vec::with_capacity(passes.len());
+        for (i, &(a, b)) in passes.iter().enumerate() {
+            if i > 0 {
+                self.make_way();
+            }
+            let mut engine = self.engine(stt, passes.len() == 1);
+            match engine.transcribe(&samples[a..b]) {
+                Ok(t) => said.push(t),
+                Err(e) => return Response::error(500, "server_error", format!("transcription failed: {e}")),
+            }
+        }
+        let text = said.into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" ");
         eprintln!("[oaiy-voice] transcribed {seconds:.2} s in {:.0} ms: {} chars", started.elapsed().as_secs_f64() * 1e3, text.len());
         match format {
             "text" => Response { status: 200, content_type: "text/plain; charset=utf-8", body: text.into_bytes() },
@@ -332,13 +533,41 @@ impl Server {
     }
 }
 
-/// A whole answer; the connection stays open.
-fn answer<W: Write>(w: &mut W, r: Response) -> io::Result<bool> {
-    http::respond(w, r.status, r.content_type, &r.body, true).map(|_| true)
+/// A whole answer, with no `Access-Control-*` headers (`oaiy-engine`'s answers allow every origin: this server
+/// allows none but its own).
+fn respond<W: Write>(w: &mut W, r: &Response, keep_alive: bool) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+        r.status,
+        http::reason(r.status),
+        r.content_type,
+        r.body.len(),
+        if keep_alive { "keep-alive" } else { "close" }
+    );
+    w.write_all(head.as_bytes())?;
+    w.write_all(&r.body)?;
+    w.flush()
 }
 
-fn write(w: &mut TcpStream, r: &Response, keep_alive: bool) -> io::Result<()> {
-    http::respond(w, r.status, r.content_type, &r.body, keep_alive)
+/// A whole answer; the connection stays open.
+fn answer<W: Write>(w: &mut W, r: Response) -> io::Result<bool> {
+    respond(w, &r, true).map(|_| true)
+}
+
+/// Whether the client on `stream` has gone: its end closed (a read would find the end) or the connection broken. Asked
+/// between the thread's own writes only: the socket is made non-blocking for the look, which its writes share.
+fn caller_gone(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    let gone = match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted),
+    };
+    let _ = stream.set_nonblocking(false);
+    gone
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -350,29 +579,65 @@ impl Drop for Permit {
 }
 
 /// Serve until the process ends.
-pub fn run(server: Server, host: &str, port: u16) -> Result<(), String> {
+pub fn run(mut server: Server, host: &str, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind((host, port)).map_err(|e| format!("bind {host}:{port}: {e}"))?;
-    eprintln!("[oaiy-voice] listening on http://{host}:{port} ({} mode)", server.mode.as_str());
+    server.loopback = http::listens_on_loopback(host);
+    let keyed = if server.key.is_some() { ", requests need its key" } else { "" };
+    eprintln!("[oaiy-voice] listening on http://{host}:{port} ({} mode{keyed})", server.mode.as_str());
     let server = Arc::new(server);
     let connections = Arc::new(AtomicUsize::new(0));
+    let mut pause = Duration::from_millis(5);
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        if connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            connections.fetch_sub(1, Ordering::SeqCst);
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            // Out of file descriptors (EMFILE) fails every accept at once until one closes: a pause, longer each
+            // time, rather than a core spun at 100%.
+            Err(e) if !matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset) => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_secs(1));
+                continue;
+            }
+            Err(_) => continue,
+        };
+        pause = Duration::from_millis(5);
+        let open = connections.fetch_add(1, Ordering::SeqCst);
+        let permit = Permit(Arc::clone(&connections));
+        if open >= MAX_CONNECTIONS + PROBE_SLOTS {
+            drop(permit);
             let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-            let _ = write(&mut stream, &Response::error(503, "server_error", "voice server connection limit reached"), false);
+            let _ = respond(&mut stream, &Response::error(503, "server_error", "voice server connection limit reached"), false);
             continue;
         }
-        let permit = Permit(Arc::clone(&connections));
+        // (past the limit: a probe's connection, one request)
+        let probe_only = open >= MAX_CONNECTIONS;
         let server = Arc::clone(&server);
-        std::thread::spawn(move || {
+        // (a thread that cannot start drops its connection with it, rather than taking the accept loop down)
+        let started = std::thread::Builder::new().name("voice request".into()).spawn(move || {
             let _permit = permit;
-            http::serve(stream, |req, w| {
-                let keep = server.serve(req, w)?;
-                w.flush()?;
-                Ok(keep)
-            });
+            // (the connection looked at while a spoken line waits and is made: its own handle, used between writes)
+            let watch = stream.try_clone().ok();
+            let gone = || watch.as_ref().is_some_and(caller_gone);
+            let turn: RefCell<Option<Turn>> = RefCell::new(None);
+            http::serve_gated(
+                stream,
+                |req| match server.admit(req, probe_only) {
+                    Ok(t) => {
+                        *turn.borrow_mut() = t;
+                        None
+                    }
+                    Err(refused) => Some(refused),
+                },
+                |req, w| {
+                    let _turn = turn.borrow_mut().take();
+                    let keep = server.serve_watched(req, w, &gone)?;
+                    w.flush()?;
+                    Ok(keep && !probe_only)
+                },
+            );
         });
+        if let Err(e) = started {
+            eprintln!("[oaiy-voice] a connection dropped, its thread would not start: {e}");
+        }
     }
     Ok(())
 }
@@ -409,16 +674,40 @@ mod tests {
                 Some(v) => Err(format!("no voice called {v:?}")),
             }
         }
-        fn speak(&self, text: &str, _voice: Option<&str>, _cancel: Arc<AtomicBool>, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String> {
+        fn speak(&self, text: &str, _voice: Option<&str>, _cancel: Arc<AtomicBool>, gone: &dyn Fn() -> bool, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String> {
             if text == "fail" {
                 return Err("the engine broke".into());
             }
             for c in text.chars() {
-                if !on_chunk(&[c as i16]) {
+                if gone() || !on_chunk(&[c as i16]) {
                     break;
+                }
+                if c == '!' {
+                    return Err("the engine broke part way".into());
                 }
             }
             Ok(())
+        }
+    }
+
+    /// A speech engine whose thread has ended.
+    struct DeadTts;
+
+    impl TextToSpeech for DeadTts {
+        fn model(&self) -> String {
+            "qwen3-tts-test".into()
+        }
+        fn voices(&self) -> (Vec<String>, Option<String>) {
+            (Vec::new(), None)
+        }
+        fn check_voice(&self, _voice: Option<&str>) -> Result<(), String> {
+            Ok(())
+        }
+        fn speak(&self, _: &str, _: Option<&str>, _: Arc<AtomicBool>, _: &dyn Fn() -> bool, _: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String> {
+            Err("the speech engine has stopped".into())
+        }
+        fn alive(&self) -> bool {
+            false
         }
     }
 
@@ -580,5 +869,134 @@ mod tests {
         }
         let keep = server(Mode::Tts).serve(&post("/v1/audio/speech", "application/json", br#"{"input":"a long line","response_format":"pcm"}"#.to_vec()), &mut Hangs(0)).unwrap();
         assert!(!keep, "a stream cut short closes the connection");
+    }
+
+    fn head(method: &str, path: &str, headers: &[(&str, &str)]) -> Request {
+        Request::new(method, path, headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), Vec::new())
+    }
+
+    fn refused(s: &Server, req: &Request, probe_only: bool) -> Option<u16> {
+        s.admit(req, probe_only).err().map(|r| r.status)
+    }
+
+    #[test]
+    fn no_other_site_and_no_rebound_name_is_answered_and_a_key_guards_all_but_the_probes() {
+        let s = server(Mode::Both);
+        // DNS rebinding (a site's name for 127.0.0.1), another site's page
+        assert_eq!(refused(&s, &head("GET", "/v1/audio/voices", &[("Host", "evil.example:17920")]), false), Some(403));
+        assert_eq!(refused(&s, &head("POST", "/v1/audio/speech", &[("Host", "127.0.0.1:17920"), ("Origin", "https://evil.example"), ("Content-Type", "text/plain")]), false), Some(403));
+        assert_eq!(refused(&s, &head("POST", "/v1/audio/speech", &[("Host", "127.0.0.1:17920")]), false), None);
+        assert_eq!(refused(&s, &head("GET", "/v1/models", &[("Host", "localhost:17920"), ("Origin", "http://localhost:5173")]), false), None);
+        // with a key: every request but a probe's carries it
+        let keyed = server(Mode::Both).with_key(Some(" k ".into()));
+        assert_eq!(refused(&keyed, &head("GET", "/v1/audio/voices", &[("Host", "127.0.0.1")]), false), Some(401));
+        assert_eq!(refused(&keyed, &head("GET", "/v1/audio/voices", &[("Host", "127.0.0.1"), ("Authorization", "Bearer k")]), false), None);
+        for probe in ["/v1/models", "/health"] {
+            assert_eq!(refused(&keyed, &head("GET", probe, &[("Host", "127.0.0.1")]), false), None, "{probe}");
+        }
+        assert!(server(Mode::Both).with_key(Some("  ".into())).key.is_none());
+    }
+
+    #[test]
+    fn bodies_too_large_are_refused_on_their_head_and_a_probe_slot_answers_probes_alone() {
+        let s = server(Mode::Both);
+        let sized = |path: &str, len: usize| head("POST", path, &[("Host", "127.0.0.1"), ("Content-Length", &len.to_string())]);
+        assert_eq!(refused(&s, &sized("/v1/audio/speech", MAX_SPEECH_BODY + 1), false), Some(413));
+        assert_eq!(refused(&s, &sized("/v1/audio/speech", 2_000), false), None);
+        assert_eq!(refused(&s, &sized("/v1/audio/transcriptions", MAX_TRANSCRIPTION_BODY + 1), false), Some(413));
+        assert!(matches!(s.admit(&sized("/v1/audio/transcriptions", 1 << 20), false), Ok(Some(_))), "a transcription takes a turn");
+        assert_eq!(refused(&s, &sized("/v1/other", MAX_OTHER_BODY + 1), false), Some(413));
+        assert_eq!(refused(&s, &head("GET", "/v1/models", &[("Host", "127.0.0.1")]), true), None);
+        assert_eq!(refused(&s, &head("GET", "/health", &[("Host", "127.0.0.1")]), true), None);
+        assert_eq!(refused(&s, &sized("/v1/audio/speech", 20), true), Some(503));
+    }
+
+    #[test]
+    fn turns_are_waited_for_and_given_back() {
+        let turns = Turns::new(2);
+        let (a, b) = (turns.take(Duration::ZERO), turns.take(Duration::ZERO));
+        assert!(a.is_some() && b.is_some());
+        assert!(turns.take(Duration::from_millis(20)).is_none(), "none free");
+        let later = {
+            let turns = Arc::clone(&turns);
+            std::thread::spawn(move || turns.take(Duration::from_secs(5)).is_some())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        drop(a);
+        assert!(later.join().unwrap(), "a turn given back is taken by one waiting");
+        drop(b);
+    }
+
+    #[test]
+    fn answers_allow_no_other_origin() {
+        let r = served(&server(Mode::Both), &Request::new("GET", "/v1/audio/voices", vec![], vec![]));
+        assert!(r.starts_with("HTTP/1.1 200 OK\r\n") && !r.to_ascii_lowercase().contains("access-control"), "{r}");
+    }
+
+    #[test]
+    fn a_speech_engine_gone_fails_the_probes() {
+        let stt: SharedStt = Arc::new(Mutex::new(Box::new(Fake)));
+        let s = Server::new(Mode::Both, Some(stt), "parakeet-test", "cpu f32", Some(Arc::new(DeadTts) as Arc<dyn TextToSpeech>));
+        assert_eq!(s.handle(&Request::new("GET", "/v1/models", vec![], vec![])).status, 503);
+        let h = s.handle(&Request::new("GET", "/health", vec![], vec![]));
+        assert_eq!((h.status, json(&h).get("status").and_then(Json::as_str)), (503, Some("failed")));
+        assert!(served(&s, &post("/v1/audio/speech", "application/json", br#"{"input":"hi"}"#.to_vec())).starts_with("HTTP/1.1 503"));
+        // speech to text alone: no speech engine to miss
+        let stt: SharedStt = Arc::new(Mutex::new(Box::new(Fake)));
+        let only = Server::new(Mode::Stt, Some(stt), "parakeet-test", "cpu f32", None);
+        assert_eq!(only.handle(&Request::new("GET", "/health", vec![], vec![])).status, 200);
+    }
+
+    #[test]
+    fn a_stream_that_fails_part_way_is_cut_off_without_its_end() {
+        let mut out = Vec::new();
+        let keep = server(Mode::Tts).serve(&post("/v1/audio/speech", "application/json", br#"{"input":"ab!cd","response_format":"pcm"}"#.to_vec()), &mut out).unwrap();
+        let out = String::from_utf8_lossy(&out);
+        assert!(!keep, "the connection is closed");
+        assert!(out.starts_with("HTTP/1.1 200 OK") && out.ends_with("2\r\n!\0\r\n") && !out.contains("0\r\n\r\n"), "{out:?}");
+    }
+
+    #[test]
+    fn a_client_gone_before_its_line_is_made_gets_nothing_and_its_connection_closes() {
+        let s = server(Mode::Tts);
+        for format in ["wav", "pcm"] {
+            let mut out = Vec::new();
+            let body = format!(r#"{{"input":"hello","response_format":"{format}"}}"#);
+            let keep = s.serve_watched(&post("/v1/audio/speech", "application/json", body.into_bytes()), &mut out, &|| true).unwrap();
+            assert!(!keep && out.is_empty(), "{format}: {}", String::from_utf8_lossy(&out));
+        }
+    }
+
+    #[test]
+    fn a_client_that_closed_its_end_is_seen_gone_and_one_waiting_is_not() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server_end, _) = listener.accept().unwrap();
+        assert!(!caller_gone(&server_end), "waiting for its answer");
+        let mut writer = server_end.try_clone().unwrap();
+        writer.write_all(b"still blocking").unwrap();
+        drop(client);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(caller_gone(&server_end), "its end closed");
+    }
+
+    #[test]
+    fn a_long_recording_is_heard_a_pass_at_a_time_and_odd_rates_cheaply() {
+        // 200 s at 16 kHz: three passes of at most 90 s, all of it heard
+        let samples = vec![0.0f32; 200 * 16_000];
+        let passes = crate::stt::passes(&samples, 16_000);
+        assert_eq!(passes.len(), 3);
+        let wav = audio::write_wav(&samples, 16_000);
+        let r = server(Mode::Stt).handle(&post("/v1/audio/transcriptions", "application/json", format!("{{\"audio\":\"{}\"}}", b64(&wav)).into_bytes()));
+        let text = json(&r).get("text").and_then(Json::as_str).unwrap().to_string();
+        let heard: usize = text.split(" samples").filter_map(|n| n.trim().parse::<usize>().ok()).sum();
+        assert_eq!((r.status, heard, text.matches("samples").count()), (200, samples.len(), 3), "{text}");
+        // 44,101 Hz shares no factor with 16 kHz: read as 44,100, at once (a second of it, 16,001 samples at 16 kHz)
+        let odd = audio::write_wav(&vec![0.0f32; 44_101], 44_101);
+        let started = Instant::now();
+        let r = server(Mode::Stt).handle(&post("/v1/audio/transcriptions", "application/json", format!("{{\"audio\":\"{}\"}}", b64(&odd)).into_bytes()));
+        assert_eq!(json(&r).get("text").and_then(Json::as_str), Some("16001 samples"));
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 }

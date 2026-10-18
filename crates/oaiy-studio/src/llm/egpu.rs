@@ -227,6 +227,13 @@ fn environment(llm: &Json, root: &Path, runtime: Option<&Runtime>) -> Vec<(Strin
     env
 }
 
+/// Whether the card's engine runs in incognito (`privacy.incognito`, with OAIY's own engine on the card: `--incognito`
+/// is its flag). tinygrad's server keeps nothing of a request on disk (its prompt's cache is in memory) and has no such
+/// flag, which its argument parser would refuse: it is started as it is.
+pub fn private(cfg: &Json) -> bool {
+    cfg.get("llm").is_some_and(webgpu) && cfg.get("privacy").is_some_and(|p| bool_or(p, "incognito", false))
+}
+
 /// tinygrad's server's command line for `name`: the launcher, the model's file, the port and the context, then
 /// `llm.egpu.extra_args`. A model that is not one GGUF file is refused: tinygrad's server reads nothing else.
 pub fn arguments(llm: &Json, root: &Path, name: &str, script: &Path, port: u16) -> Result<Vec<String>, String> {
@@ -825,6 +832,11 @@ impl Egpu {
             let holds = g.model.as_deref() == Some(name);
             match g.state {
                 State::Starting | State::Ready if holds => return Ok(Begun::Held),
+                // (the card lent to the image worker is not taken from under its job: a start here stopped the launcher
+                // that holds it, mid-picture. Requests for a model on the card wait for it to be given back)
+                State::Starting | State::Ready if g.lent => {
+                    return Err(format!("the eGPU's card is lent to a picture, a video or a sound: {name} can be loaded there once it is given back"));
+                }
                 State::Starting | State::Ready if g.busy > 0 || g.waiting > 0 => return Ok(Begun::InUse(g.model.clone().unwrap_or_default())),
                 State::Failed if holds && !again && g.failed_at.is_some_and(|t| t.elapsed() < RETRY_AFTER) => {
                     return Err(g.error.clone().unwrap_or_else(|| "tinygrad's server failed".into()));
@@ -865,6 +877,11 @@ impl Egpu {
         let port = free_port()?;
         let key = random_key("sk-egpu-");
         let mut args = arguments(llm, root, name, &script, port)?;
+        if private(cfg) {
+            // (the engine's own arguments, which the launcher passes on: no prompt states on disk, no request log, each
+            // request forgotten, as this computer's engine runs in incognito)
+            args.push("--incognito".into());
+        }
         let paused = paused && webgpu(llm);
         if paused {
             // (before --webgpu, where the launcher reads its own flags)
@@ -1094,6 +1111,14 @@ impl Egpu {
     /// this, the engine paused from the start (with the model set to the eGPU, which loads at the first request for
     /// it). Requests for the model wait until [`Self::give_back`]. `wait`: for the requests being answered.
     pub fn lend(self: &Arc<Self>, cfg: &Json, root: &Path, wait: Duration) -> Result<String, String> {
+        self.lend_unless(cfg, root, wait, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// [`Self::lend`] for a job that may be cancelled meanwhile (`cancel`, heard each half second): the card given back
+    /// and `cancelled` answered, rather than the job waiting minutes for a card it no longer wants (the requests being
+    /// answered, the card's firmware booting) to be told then.
+    pub fn lend_unless(self: &Arc<Self>, cfg: &Json, root: &Path, wait: Duration, cancel: &std::sync::atomic::AtomicBool) -> Result<String, String> {
+        let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
         let llm = cfg.get("llm").ok_or("no llm section")?;
         if !enabled(llm) || !webgpu(llm) {
             return Err("the eGPU does not run OAIY's engine".into());
@@ -1102,14 +1127,22 @@ impl Egpu {
         let deadline = Instant::now() + wait;
         let mut g = self.lock();
         let epoch = g.epoch;
+        // (whether this lent it, and so gives it back where the job is cancelled: a card already lent, to the picture
+        // worker kept on it, stays so)
+        let mut lent_here = false;
         loop {
             if g.epoch != epoch {
                 return Err(STOPPED.into());
+            }
+            // (not the card opened, or its engine paused, for a job no longer wanted)
+            if cancelled() && !lent_here {
+                return Err("cancelled".into());
             }
             if matches!(g.state, State::Starting | State::Ready) {
                 if !g.lent {
                     g.lent = true;
                     g.resume_after = !g.paused;
+                    lent_here = true;
                 }
                 if g.busy == 0 {
                     break;
@@ -1121,6 +1154,13 @@ impl Egpu {
                 continue;
             }
             let left = deadline.saturating_duration_since(Instant::now());
+            if cancelled() {
+                drop(g);
+                if lent_here {
+                    self.give_back();
+                }
+                return Err("cancelled".into());
+            }
             if left.is_zero() {
                 drop(g);
                 self.give_back();
@@ -1143,10 +1183,10 @@ impl Egpu {
         // (opening the card takes a while the first time: its firmware boots)
         let gone = || {
             let g = self.lock();
-            g.generation != generation || !g.lent || !matches!(g.state, State::Starting | State::Ready)
+            cancelled() || g.generation != generation || !g.lent || !matches!(g.state, State::Starting | State::Ready)
         };
         match card.paused_at(Duration::from_secs(180), gone) {
-            Some(socket) => {
+            Some(socket) if !cancelled() => {
                 if let Some(since) = paused_now {
                     if card.freed_since(since, CARD_FREE_MB, Duration::from_secs(30)) == Some(false) {
                         self.log.push("studio: the card's memory was not let go within 30 s of its engine's pause; the picture starts anyway");
@@ -1154,7 +1194,13 @@ impl Egpu {
                 }
                 Ok(socket)
             }
-            None => {
+            _ if cancelled() => {
+                if lent_here {
+                    self.give_back();
+                }
+                Err("cancelled".into())
+            }
+            _ => {
                 self.give_back();
                 Err("the eGPU's launcher did not say the card was free".into())
             }
@@ -1754,6 +1800,53 @@ mod tests {
         egpu.stop();
         assert_eq!(egpu.state(), State::Stopped);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A card lent to a picture is not taken from under it by a start for another model; a job cancelled before the
+    /// card is lent opens nothing, one cancelled while the card's model answers gives the card back, and one cancelled
+    /// where the card was lent already (to the picture worker kept there) leaves it so.
+    #[test]
+    fn a_lent_card_is_kept_from_a_start_and_a_cancelled_job_lets_it_be() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cfg = llm(r#"{"llm": {"egpu": {"enabled": true, "engine": "webgpu"}, "models": [{"name": "a", "path": "a.gguf", "egpu": true}, {"name": "b", "path": "b.gguf", "egpu": true}]}}"#);
+        let root = std::env::temp_dir().join(format!("oaiy-egpu-lent-{}", std::process::id()));
+        let egpu = Arc::new(Egpu::new());
+        egpu.adopt("127.0.0.1:1", "k", "a", None);
+        egpu.lock().lent = true;
+        let err = egpu.start(&cfg, &root, "b").unwrap_err();
+        assert!(err.contains("lent"), "{err}");
+        assert_eq!((egpu.held().as_deref(), egpu.state(), egpu.is_lent()), (Some("a"), State::Ready, true), "not stopped");
+        assert!(egpu.start(&cfg, &root, "a").is_ok(), "its own model: held");
+        // the card already lent (its kept worker's): a cancelled job leaves it lent
+        let cancel = AtomicBool::new(true);
+        assert_eq!(egpu.lend_unless(&cfg, &root, Duration::from_secs(5), &cancel).unwrap_err(), "cancelled");
+        assert!(egpu.is_lent());
+        // not held: nothing opened for a cancelled job
+        egpu.stop();
+        assert_eq!(egpu.lend_unless(&cfg, &root, Duration::from_secs(5), &cancel).unwrap_err(), "cancelled");
+        assert_eq!(egpu.state(), State::Stopped);
+        // cancelled as it waits for the card's model to finish a reply: the card is given back, at once
+        egpu.adopt("127.0.0.1:1", "k", "a", None);
+        egpu.lock().busy = 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let later = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            later.store(true, Ordering::Relaxed);
+        });
+        let asked = Instant::now();
+        assert_eq!(egpu.lend_unless(&cfg, &root, Duration::from_secs(60), &cancel).unwrap_err(), "cancelled");
+        assert!(asked.elapsed() < Duration::from_secs(2), "{:?}", asked.elapsed());
+        assert!(!egpu.is_lent());
+    }
+
+    #[test]
+    fn the_cards_engine_is_incognito_as_this_computers_is_and_tinygrad_is_left_as_it_is() {
+        let with = |engine: &str, incognito: bool| llm(&format!(r#"{{"llm": {{"egpu": {{"enabled": true, "engine": "{engine}"}}}}, "privacy": {{"incognito": {incognito}}}}}"#));
+        assert!(private(&with("webgpu", true)));
+        assert!(!private(&with("webgpu", false)));
+        assert!(!private(&with("tinygrad", true)), "tinygrad's server has no --incognito");
+        assert!(!private(&llm(r#"{"llm": {"egpu": {"enabled": true, "engine": "webgpu"}}}"#)));
     }
 
     /// The launcher itself with a card on the CPU (`OAIY_EGPU_EMULATE`) and a stand-in for the engine that writes its

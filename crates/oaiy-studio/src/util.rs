@@ -228,6 +228,17 @@ impl LogRing {
         )
     }
 
+    /// The number of the last line pushed (0 before any): lines after it are numbered above it.
+    pub fn latest(&self) -> u64 {
+        self.lines.lock().unwrap_or_else(|p| p.into_inner()).0
+    }
+
+    /// Whether a line numbered above `after` that is still kept contains `needle`.
+    pub fn said_since(&self, after: u64, needle: &str) -> bool {
+        let g = self.lines.lock().unwrap_or_else(|p| p.into_inner());
+        g.1.iter().any(|(n, _, l)| *n > after && l.contains(needle))
+    }
+
     pub fn tail(&self, n: usize) -> String {
         let g = self.lines.lock().unwrap_or_else(|p| p.into_inner());
         let skip = g.1.len().saturating_sub(n);

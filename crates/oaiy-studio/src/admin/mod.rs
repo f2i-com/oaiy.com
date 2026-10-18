@@ -9,7 +9,7 @@
 use crate::api::gateway::{self, json_reply, Matched};
 use crate::util::{error_json, str_or};
 use crate::{config, models::registry, Studio};
-use oaiy_engine::http::{respond, Request};
+use oaiy_engine::http::{respond, Refusal, Request};
 use oaiy_engine::json::Json;
 use std::io;
 use std::net::TcpStream;
@@ -50,32 +50,54 @@ pub fn allowed_host(host: &str, port: u16, configured: &str) -> bool {
     ["localhost", "127.0.0.1", "::1", configured].iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
-pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16) -> io::Result<bool> {
+/// What the control port refuses on a request's head, before its body is read (`None`: served): a `Host` not of this
+/// listener, another origin's page, and -- reached other than by this computer's own loopback, where it listens beyond
+/// it -- a request without the gateway's key. `peer_loopback`: whether the connection came over loopback.
+///
+/// This computer's own clients (the app window, a second launch looking for this one) connect over loopback and name
+/// loopback as their `Host`, and are let through without the key, as on a local bind. Over loopback alone is not
+/// enough: a page of a site whose name its DNS points at this computer (DNS rebinding) connects over loopback too,
+/// names its own site, and is its own origin; listening on every interface, any `Host` passes the name check.
+pub fn gate(studio: &Studio, req: &Request, port: u16, peer_loopback: bool) -> Option<Refusal> {
+    let refuse = |status: u16, message: &str| Some(Refusal { status, body: error_json(message, "invalid_request_error", "invalid_request").to_json() });
     let cfg = studio.config();
     let ui_host = cfg.get("ui").map_or("127.0.0.1", |u| str_or(u, "host", "127.0.0.1")).to_string();
-    if !req.header("host").is_some_and(|h| allowed_host(h, port, &ui_host)) {
-        return err(w, 403, "unexpected Host header");
+    let host = req.header("host");
+    if !host.is_some_and(|h| allowed_host(h, port, &ui_host)) {
+        return refuse(403, "unexpected Host header");
     }
     if let Some(origin) = req.header("origin") {
-        let own = req.header("host").map(|h| format!("http://{h}"));
+        let own = host.map(|h| format!("http://{h}"));
         if own.as_deref() != Some(origin) {
-            return err(w, 403, "cross-origin requests are not accepted on the control port");
+            return refuse(403, "cross-origin requests are not accepted on the control port");
         }
     }
-    // Reached from another machine: the gateway key guards the controls too.
-    // This machine's own clients (the app window, a second launch looking for
-    // this one) connect over loopback and are let through, as on a local bind.
-    let exposed = !(ui_host == "localhost" || ui_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
-    let remote = exposed && !w.peer_addr().is_ok_and(|a| a.ip().is_loopback() || a.ip().to_canonical().is_loopback());
+    // Reached from another machine (or by another name): the gateway key guards the controls too.
+    let exposed = !oaiy_engine::http::listens_on_loopback(&ui_host);
+    let local = peer_loopback && host.is_some_and(oaiy_engine::http::loopback_name);
     let key = cfg.get("gateway").map_or("", |g| str_or(g, "api_key", "")).to_string();
+    let route = req.route();
+    let font = FONTS.iter().any(|(path, _)| *path == route);
+    if exposed && !local && route != "/" && !font && !key.is_empty() {
+        let given = req.query("key");
+        let keyed = oaiy_engine::http::key_matches(req.header("authorization"), &key) || given.is_some_and(|g| oaiy_engine::http::same_secret(g.as_bytes(), key.as_bytes()));
+        if !keyed {
+            return refuse(401, "this control port needs the gateway API key");
+        }
+    }
+    None
+}
+
+/// One request (its head passed [`gate`] first).
+pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    let cfg = studio.config();
+    // (a client other than this computer's own, as [`gate`] tells them: one that reached a control port listening beyond
+    // loopback by another address or name)
+    let ui_host = cfg.get("ui").map_or("127.0.0.1", |u| str_or(u, "host", "127.0.0.1"));
+    let local = w.peer_addr().is_ok_and(|a| a.ip().to_canonical().is_loopback()) && req.header("host").is_some_and(oaiy_engine::http::loopback_name);
+    let remote = !oaiy_engine::http::listens_on_loopback(ui_host) && !local;
     let route = req.route().to_string();
     let font = FONTS.iter().find(|(path, _)| *path == route).map(|(_, bytes)| *bytes);
-    if remote && route != "/" && font.is_none() && !key.is_empty() {
-        let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).map(str::trim).map(str::to_string).or_else(|| req.query("key"));
-        if given.as_deref() != Some(key.as_str()) {
-            return err(w, 401, "this control port needs the gateway API key");
-        }
-    }
     let method = req.method.as_str();
     if method == "OPTIONS" {
         respond(w, 204, "text/plain", b"", true)?;
@@ -288,6 +310,8 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
                     crate::util::set(&mut d, "dir", Json::str(dir.trim()));
                 }
                 if let Some(t) = b.get("hf_token").and_then(Json::as_str) {
+                    // (written into curl's configuration as it downloads: letters, digits, _ . and - alone)
+                    crate::models::downloads::check_token(t.trim()).map_err(|e| (400, e))?;
                     crate::util::set(&mut d, "hf_token", Json::str(t.trim()));
                 }
                 crate::util::set(next, "downloads", d);
@@ -556,6 +580,35 @@ mod tests {
         for target in crate::config::TARGETS {
             assert!(list.contains(&format!(r#"["{target}", ""#)), "{target} is not offered on the Endpoints page");
         }
+    }
+
+    /// The control port's head checks: listening on every interface, a request over loopback that names another site
+    /// (DNS rebinding: its page is its own origin) needs the key as one from another machine does; this computer's own
+    /// clients, over loopback and naming it, do not.
+    #[test]
+    fn a_rebinding_page_over_loopback_needs_the_key_where_the_controls_listen_beyond_it() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-admin-gate-{}", std::process::id()));
+        let mut cfg = config::default_json();
+        let mut ui = cfg.get("ui").unwrap().clone();
+        crate::util::set(&mut ui, "host", Json::str("0.0.0.0"));
+        crate::util::set(&mut cfg, "ui", ui);
+        let mut g = cfg.get("gateway").unwrap().clone();
+        crate::util::set(&mut g, "api_key", Json::str("sk-ui"));
+        crate::util::set(&mut cfg, "gateway", g);
+        let studio = Studio::for_test(&root, cfg);
+        let req = |path: &str, h: &[(&str, &str)]| Request::new("POST", path, h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), Vec::new());
+        let status = |r: &Request, loopback: bool| gate(&studio, r, 7860, loopback).map(|r| r.status);
+        let rebinding = req("/api/config", &[("Host", "evil.example:7860"), ("Origin", "http://evil.example:7860")]);
+        assert_eq!(status(&rebinding, true), Some(401));
+        assert_eq!(status(&req("/api/config", &[("Host", "127.0.0.1:7860")]), true), None, "this computer's own");
+        assert_eq!(status(&req("/api/config", &[("Host", "192.168.1.20:7860")]), false), Some(401), "another machine");
+        assert_eq!(status(&req("/api/config", &[("Host", "192.168.1.20:7860"), ("Authorization", "Bearer sk-ui")]), false), None);
+        assert_eq!(status(&req("/", &[("Host", "evil.example:7860")]), true), None, "the page itself");
+        assert_eq!(status(&req("/api/config", &[("Host", "127.0.0.1:7860"), ("Origin", "https://evil.example")]), true), Some(403));
+        // on loopback alone: other names are refused outright
+        let local = Studio::for_test(&root, config::default_json());
+        assert_eq!(gate(&local, &req("/api/config", &[("Host", "evil.example:7860")]), 7860, true).map(|r| r.status), Some(403));
+        assert_eq!(gate(&local, &req("/api/config", &[("Host", "localhost:7860")]), 7860, true).map(|r| r.status), None);
     }
 
     #[test]

@@ -259,7 +259,8 @@ impl Studio {
         let egpu_launch = |v: &Json| {
             let llm = v.get("llm").cloned().unwrap_or(Json::Null);
             let file = self.egpu.held().as_deref().filter(|m| egpu::assigned(&llm, m)).and_then(|m| egpu::arguments(&llm, &self.root, m, std::path::Path::new(""), 0).ok());
-            (file, llm.get("egpu").cloned())
+            // (incognito too, where the card's engine is started for it: `--incognito`, as this computer's is)
+            (file, llm.get("egpu").cloned(), egpu::private(v))
         };
         if self.egpu.state() != llm::State::Stopped && egpu_launch(&before) != egpu_launch(&next) {
             self.log.push("eGPU settings changed: stopping tinygrad's server");
@@ -311,6 +312,10 @@ impl Studio {
     /// Stop the language model and any media job, so no engine outlives the
     /// studio holding GPU memory. Waits briefly for a media worker to be killed.
     pub fn shutdown(&self) {
+        // Downloads first: one being added to the models saves the settings, and none may after this (a restore puts
+        // its settings back once the studio stops), nor may its curl outlive it (the next start's resume would run a
+        // second curl on the same partial file).
+        self.downloads.shutdown();
         self.llm.stop();
         self.egpu.stop();
         let mut cancelled = false;
@@ -498,25 +503,138 @@ fn listen(host: &str, port: u16, what: &str) -> Result<(TcpListener, Option<Stri
     Err(format!("{what}: cannot listen on {host}:{port} ({first}), nor on any other port"))
 }
 
+/// Connections served at once on each listener (each is a thread); one more is answered 503 and closed.
+const MAX_CONNECTIONS: usize = 128;
+
+/// A connection counted in a total until it is dropped (its thread ended, or never started).
+struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Serve a listener, each connection on a thread of its own, at most [`MAX_CONNECTIONS`] at once. Each request's head
+/// is gated before its body is read ([`admin::gate`], [`gateway_gate`]): a request refused is refused without the
+/// 64 MiB it may say it brings.
 fn serve(listener: TcpListener, studio: Arc<Studio>, admin: bool) {
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::spawn(move || {
+        let mut pause = Duration::from_millis(5);
         for conn in listener.incoming() {
-            let Ok(stream) = conn else { continue };
+            let mut stream = match conn {
+                Ok(stream) => stream,
+                // Out of file descriptors (EMFILE) fails every accept at once until one closes: a pause, longer each
+                // time, rather than a core spun at 100%.
+                Err(e) if !matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset) => {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_secs(1));
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            pause = Duration::from_millis(5);
+            let counted = Counted(Arc::clone(&open));
+            if open.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNECTIONS {
+                drop(counted);
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                let body = util::error_json("too many connections: try again shortly", "server_error", "busy").to_json();
+                let _ = oaiy_engine::http::respond(&mut stream, 503, "application/json", body.as_bytes(), false);
+                continue;
+            }
+            // (who is at the other end, for the control port: this computer's own clients connect over loopback)
+            let peer_loopback = stream.peer_addr().is_ok_and(|a| a.ip().to_canonical().is_loopback());
             let studio = Arc::clone(&studio);
-            std::thread::spawn(move || {
-                oaiy_engine::http::serve(stream, |req, w| {
-                    if admin {
-                        return admin::handle(&studio, req, w, port);
-                    }
-                    public(&studio, req, w)
-                });
+            let log = Arc::clone(&studio.log);
+            // (a thread that cannot start drops its connection with it, rather than taking the accept loop down)
+            let started = std::thread::Builder::new().name(if admin { "ui-request" } else { "gateway-request" }.into()).spawn(move || {
+                let _counted = counted;
+                oaiy_engine::http::serve_gated(
+                    stream,
+                    |req| if admin { admin::gate(&studio, req, port, peer_loopback) } else { gateway_gate(&studio, req) },
+                    |req, w| {
+                        if admin {
+                            return admin::handle(&studio, req, w);
+                        }
+                        public(&studio, req, w)
+                    },
+                );
             });
+            if let Err(e) = started {
+                log.push(format!("a connection was dropped: its thread would not start ({e})"));
+            }
         }
     });
 }
 
-/// The gateway listener: key check, then the route table.
+/// The names a gateway that listens on loopback answers to besides loopback's own: Docker's for this computer (a
+/// container's app reaching it at host.docker.internal), and the host of `gateway.public_url` (a proxy in front of it
+/// on this computer). A web page can be served from none of them by a site that is not this computer's.
+fn gateway_host_ok(host: &str, gateway: &Json) -> bool {
+    if oaiy_engine::http::loopback_name(host) {
+        return true;
+    }
+    // (a host's name, its port aside: `[v6]:port`, `name:port`, or a bare name or address)
+    let name = |h: &str| {
+        let h = h.trim().to_ascii_lowercase();
+        match h.strip_prefix('[') {
+            Some(rest) => rest.split(']').next().unwrap_or("").to_string(),
+            None if h.matches(':').count() == 1 => h.split(':').next().unwrap_or("").to_string(),
+            None => h,
+        }
+    };
+    let host = name(host);
+    let public = str_or(gateway, "public_url", "").trim();
+    let public = public.split_once("://").map_or(public, |(_, rest)| rest).split('/').next().unwrap_or("");
+    host == "host.docker.internal" || host == "gateway.docker.internal" || (!public.is_empty() && host == name(public))
+}
+
+/// What the gateway refuses on a request's head, before its body is read (`None`: served): on a gateway that listens
+/// on loopback only, a `Host` naming another computer without the key (DNS rebinding: a site's name pointed at
+/// 127.0.0.1, whose page then reads the pictures, videos and songs made here as its own -- a page's request to its
+/// own site carries no `Origin` to refuse); with no key, a web page of an origin not in `gateway.cors_origins`; with a
+/// key, a request without it (but for the routes that answer without one: health, discovery, and a file link's
+/// `?key=`).
+fn gateway_gate(studio: &Studio, req: &oaiy_engine::http::Request) -> Option<oaiy_engine::http::Refusal> {
+    use oaiy_engine::http::{key_matches, same_secret, Refusal};
+    let refuse = |status: u16, message: &str, kind: &str, code: &str| Some(Refusal { status, body: util::error_json(message, kind, code).to_json() });
+    let cfg = studio.config();
+    let gateway = cfg.get("gateway").cloned().unwrap_or(Json::Null);
+    let key = str_or(&gateway, "api_key", "").to_string();
+    let target = gateway::route(gateway.get("routes").and_then(Json::as_array).unwrap_or(&[]), &req.method, req.route()).map(|m| m.target);
+    let keyed = !key.is_empty()
+        && (key_matches(req.header("authorization"), &key)
+            || (target.as_deref() == Some("files") && req.query("key").is_some_and(|k| same_secret(k.as_bytes(), key.as_bytes()))));
+    if !keyed && oaiy_engine::http::listens_on_loopback(str_or(&gateway, "host", "127.0.0.1")) && req.header("host").is_some_and(|h| !gateway_host_ok(h, &gateway)) {
+        return refuse(403, "this gateway answers to its loopback address only (localhost or 127.0.0.1): set gateway.public_url for a proxy in front of it, or send the API key", "permission_error", "forbidden_host");
+    }
+    if req.method == "OPTIONS" {
+        return None;
+    }
+    // A web page the user happens to visit can reach 127.0.0.1 too. Without a key, browser requests (they carry
+    // Origin) are served only to the origins listed in gateway.cors_origins; apps and scripts send no Origin.
+    if key.is_empty() {
+        if let Some(origin) = req.header("origin") {
+            let allowed = gateway.get("cors_origins").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str)
+                .any(|o| o == "*" || o.trim_end_matches('/').eq_ignore_ascii_case(origin));
+            if !allowed {
+                return refuse(403, &format!("requests from {origin} are not allowed; add it to gateway.cors_origins, or set an API key"), "permission_error", "origin_not_allowed");
+            }
+        }
+        return None;
+    }
+    // (no route, discovery and health answer without the key: discovery says only that one is needed)
+    let open = req.method == "GET" && req.route() == "/.well-known/oaiy.json";
+    match target.as_deref() {
+        Some("health" | "discovery") | None => None,
+        Some(_) if open || keyed => None,
+        Some(_) => refuse(401, "missing or wrong API key", "authentication_error", "invalid_api_key"),
+    }
+}
+
+/// The gateway listener: the route table (its key and origins checked on the head first, by [`gateway_gate`]).
 fn public(studio: &Arc<Studio>, req: &oaiy_engine::http::Request, w: &mut std::net::TcpStream) -> std::io::Result<bool> {
     if req.method == "OPTIONS" {
         oaiy_engine::http::respond(w, 204, "text/plain", b"", true)?;
@@ -526,19 +644,7 @@ fn public(studio: &Arc<Studio>, req: &oaiy_engine::http::Request, w: &mut std::n
     let gateway = cfg.get("gateway").cloned().unwrap_or(Json::Null);
     let routes = gateway.get("routes").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default();
     let key = str_or(&gateway, "api_key", "").to_string();
-    let keyed = |req: &oaiy_engine::http::Request| key.is_empty() || req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).map(str::trim) == Some(key.as_str());
-    // A web page the user happens to visit can reach 127.0.0.1 too. Without a
-    // key, browser requests (they carry Origin) are served only to the origins
-    // listed in gateway.cors_origins; apps and scripts send no Origin.
-    if key.is_empty() {
-        if let Some(origin) = req.header("origin") {
-            let allowed = gateway.get("cors_origins").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str)
-                .any(|o| o == "*" || o.trim_end_matches('/').eq_ignore_ascii_case(origin));
-            if !allowed {
-                return gateway::json_reply(w, 403, &util::error_json(&format!("requests from {origin} are not allowed; add it to gateway.cors_origins, or set an API key"), "permission_error", "origin_not_allowed"));
-            }
-        }
-    }
+    let keyed = |req: &oaiy_engine::http::Request| key.is_empty() || oaiy_engine::http::key_matches(req.header("authorization"), &key);
     // Discovery answers without the key too, saying only that one is needed.
     if req.method == "GET" && req.route() == "/.well-known/oaiy.json" {
         return gateway::json_reply(w, 200, &discovery::document(studio, &gateway::public_base(studio, req), keyed(req)));
@@ -551,15 +657,6 @@ fn public(studio: &Arc<Studio>, req: &oaiy_engine::http::Request, w: &mut std::n
     };
     if m.target == "discovery" {
         return gateway::json_reply(w, 200, &discovery::document(studio, &gateway::public_base(studio, req), keyed(req)));
-    }
-    let key = key.as_str();
-    if !key.is_empty() && m.target != "health" {
-        let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
-        // Browsers cannot set headers on <img>/<video>: file links may carry ?key=.
-        let query_key = (m.target == "files").then(|| req.query("key")).flatten();
-        if given != Some(key) && query_key.as_deref() != Some(key) {
-            return gateway::json_reply(w, 401, &util::error_json("missing or wrong API key", "authentication_error", "invalid_api_key"));
-        }
     }
     gateway::handle(studio, req, w, m, false)
 }
@@ -811,10 +908,10 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
             idle.media.sweep();
             // (a pinned language model is never stopped for being idle)
             let minutes = idle.config().get("llm").filter(|l| !bool_or(l, "pinned", false)).map_or(0, |l| int_or(l, "idle_stop_minutes", 0));
-            // Never mid-reply: a long stream updates nothing until it ends.
-            if minutes > 0 && idle.media.chats_active() == 0 && idle.llm.state() == llm::State::Ready && idle.llm.idle_for() > Duration::from_secs(minutes as u64 * 60) {
-                idle.log.push(format!("LLM idle for {minutes} min: stopping it to free memory"));
-                idle.llm.stop();
+            // Never mid-reply: a long stream updates nothing until it ends, and holds its chat's lease (asked with the
+            // stop, under the engine's lock: a request that comes meanwhile finds it stopped and starts it again).
+            if minutes > 0 && idle.llm.stop_if_idle(Duration::from_secs(minutes as u64 * 60), || idle.media.chats_active() > 0) {
+                idle.log.push(format!("LLM idle for {minutes} min: stopped it to free memory"));
             }
             // tinygrad's server by the same rule: the card's memory back, the next request loads it again.
             if minutes > 0 && idle.egpu.stop_if_idle(Duration::from_secs(minutes as u64 * 60)) {
@@ -975,6 +1072,45 @@ mod tests {
         studio.save_config_from(saved).unwrap();
         assert_eq!(version(&studio), first + 1, "a real save moves it by one");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The gateway's head checks: a site's own name for this computer (DNS rebinding) is refused where it listens on
+    /// loopback, unless the key comes with it; another site's page without a key; a missing key on a keyed route.
+    #[test]
+    fn the_gateway_refuses_other_names_other_sites_and_a_missing_key_on_the_head() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-gateway-gate-{}", std::process::id()));
+        let studio = Studio::for_test(&root, config::default_json());
+        let req = |method: &str, path: &str, h: &[(&str, &str)]| oaiy_engine::http::Request::new(method, path, h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), Vec::new());
+        let status = |s: &Studio, r: &oaiy_engine::http::Request| gateway_gate(s, r).map(|r| r.status);
+        assert_eq!(status(&studio, &req("GET", "/v1/videos", &[("Host", "evil.example:8080")])), Some(403), "rebinding");
+        assert_eq!(status(&studio, &req("OPTIONS", "/v1/videos", &[("Host", "evil.example:8080")])), Some(403));
+        for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080", "host.docker.internal:8080"] {
+            assert_eq!(status(&studio, &req("GET", "/v1/videos", &[("Host", host)])), None, "{host}");
+        }
+        assert_eq!(status(&studio, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "https://evil.example")])), Some(403));
+        assert_eq!(status(&studio, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "https://bot.computer")])), None, "a listed origin");
+        // listening beyond loopback: any name (the key, required there for the controls, guards it)
+        let mut cfg = config::default_json();
+        let mut g = cfg.get("gateway").unwrap().clone();
+        util::set(&mut g, "host", Json::str("0.0.0.0"));
+        util::set(&mut cfg, "gateway", g.clone());
+        assert_eq!(status(&Studio::for_test(&root, cfg.clone()), &req("GET", "/v1/videos", &[("Host", "studio.lan:8080")])), None);
+        // a public_url's host is its proxy's
+        util::set(&mut g, "host", Json::str("127.0.0.1"));
+        util::set(&mut g, "public_url", Json::str("https://ai.example.org/"));
+        util::set(&mut cfg, "gateway", g.clone());
+        assert_eq!(status(&Studio::for_test(&root, cfg.clone()), &req("GET", "/v1/videos", &[("Host", "ai.example.org")])), None);
+        // a key: wanted on the head, a rebinding page has none; health and discovery answer without it
+        util::set(&mut g, "public_url", Json::str(""));
+        util::set(&mut g, "api_key", Json::str("sk-test"));
+        util::set(&mut cfg, "gateway", g);
+        let keyed = Studio::for_test(&root, cfg);
+        assert_eq!(status(&keyed, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080")])), Some(401));
+        assert_eq!(status(&keyed, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Authorization", "Bearer sk-test")])), None);
+        assert_eq!(status(&keyed, &req("POST", "/v1/chat/completions", &[("Host", "evil.example"), ("Authorization", "Bearer sk-test")])), None, "the key is enough");
+        assert_eq!(status(&keyed, &req("GET", "/v1/models", &[("Host", "evil.example")])), Some(403));
+        assert_eq!(status(&keyed, &req("GET", "/.well-known/oaiy.json", &[("Host", "127.0.0.1:8080")])), None);
+        assert_eq!(status(&keyed, &req("GET", "/", &[("Host", "127.0.0.1:8080")])), None);
     }
 
     #[test]

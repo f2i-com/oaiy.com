@@ -127,26 +127,61 @@ pub fn write_wav(samples: &[f32], rate: u32) -> Vec<u8> {
     out
 }
 
+/// The most filter taps [`resample`] makes for one rate to another, in all (its kernels, one per output phase), and
+/// for one output sample. A rate that shares no factor with the other (44,101 Hz to 16 kHz) wanted 16,000 kernels of
+/// 44,135 taps: gigabytes, and seconds of work for each second of audio.
+const MAX_KERNEL_TAPS: usize = 4 << 20;
+const MAX_TAPS: usize = 8_192;
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// [`resample`]'s filter for `from` Hz to `to` Hz: the input step, the output phases, the zeros each side and the taps.
+fn filter_size(from: usize, to: usize) -> (usize, usize, usize, usize) {
+    let g = gcd(from, to).max(1);
+    let (orig, new) = (from / g, to / g);
+    let base = orig.min(new) as f64 * 0.99;
+    let width = (6. * orig as f64 / base).ceil() as usize;
+    (orig, new, width, 2 * width + orig)
+}
+
+fn workable(from: usize, to: usize) -> bool {
+    let (_, new, _, taps) = filter_size(from, to);
+    taps <= MAX_TAPS && new.saturating_mul(taps) <= MAX_KERNEL_TAPS
+}
+
+/// The rate audio said to be at `from` Hz is resampled from: `from` itself, or where its filter would be too large
+/// (a rate sharing no factor with `to`), the nearest whole hundred (then thousand) Hz, whose filter is small. 44,101
+/// Hz is read as 44,100: a change of pitch far below hearing, and none at all for the rates recorders use. None where
+/// neither will do (a `to` of no common rate).
+pub fn workable_rate(from: usize, to: usize) -> Option<usize> {
+    if from == to || workable(from, to) {
+        return Some(from);
+    }
+    [100, 1_000].into_iter().map(|step| ((from + step / 2) / step * step).max(step)).find(|&r| r == to || workable(r, to))
+}
+
 /// torchaudio's `functional.resample` (Hann-windowed sinc, 6 zero crossings,
 /// rolloff 0.99) for one channel, `from` Hz to `to` Hz (as `oaiy-media`'s
-/// `ltx/audio.rs` has it).
+/// `ltx/audio.rs` has it). A `from` whose filter would be too large is read as
+/// the nearest rate whose is not ([`workable_rate`]); where none is, the audio
+/// is resampled by straight lines between its samples.
 pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
-    if from == to || x.is_empty() {
+    if from == to || x.is_empty() || from == 0 || to == 0 {
         return x.to_vec();
     }
-    fn gcd(a: usize, b: usize) -> usize {
-        if b == 0 {
-            a
-        } else {
-            gcd(b, a % b)
-        }
+    let Some(from) = workable_rate(from, to) else { return linear(x, from, to) };
+    if from == to {
+        return x.to_vec();
     }
-    let g = gcd(from, to);
-    let (orig, new) = (from / g, to / g);
+    let (orig, new, width, taps) = filter_size(from, to);
     let (zeros, rolloff) = (6f64, 0.99f64);
     let base = orig.min(new) as f64 * rolloff;
-    let width = (zeros * orig as f64 / base).ceil() as usize;
-    let taps = 2 * width + orig;
     // One kernel per output phase, computed in f64 and applied in f32.
     let kernels: Vec<Vec<f32>> = (0..new)
         .map(|phase| {
@@ -177,6 +212,20 @@ pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// `x` at `from` Hz to `to` Hz by straight lines between its samples (where no filter of a workable size can be made).
+fn linear(x: &[f32], from: usize, to: usize) -> Vec<f32> {
+    let n = (to as u128 * x.len() as u128).div_ceil(from as u128) as usize;
+    (0..n)
+        .map(|i| {
+            let at = i as f64 * from as f64 / to as f64;
+            let (k, f) = (at.floor() as usize, (at - at.floor()) as f32);
+            let a = x[k.min(x.len() - 1)];
+            let b = x[(k + 1).min(x.len() - 1)];
+            a + (b - a) * f
+        })
+        .collect()
 }
 
 /// Standard or URL-safe base64, padded or not, whitespace ignored; a
@@ -239,11 +288,24 @@ impl Form {
     }
 }
 
+/// The longest boundary a form may have (RFC 2046: 1 to 70 characters).
+const MAX_BOUNDARY: usize = 70;
+
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
+    if needle.is_empty() || hay.len() < needle.len() || from > hay.len() - needle.len() {
         return None;
     }
-    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+    // Compared only where the first byte matches (audio rarely has a boundary's `\r` or `-` where one could begin).
+    let first = needle[0];
+    let mut i = from;
+    while i <= hay.len() - needle.len() {
+        i += hay[i..=hay.len() - needle.len()].iter().position(|&b| b == first)?;
+        if &hay[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parse a multipart body: the part named `file` (or any part with a
@@ -255,12 +317,18 @@ pub fn parse_multipart(body: &[u8], content_type: &str) -> Result<Form, String> 
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("boundary"))
         .map(|(_, v)| v.trim().trim_matches('"').to_string())
         .ok_or("multipart request has no boundary")?;
+    if boundary.is_empty() || boundary.len() > MAX_BOUNDARY {
+        return Err(format!("a multipart boundary is 1 to {MAX_BOUNDARY} characters"));
+    }
     let delim = format!("--{boundary}").into_bytes();
     let mut form = Form::default();
     let mut at = find(body, &delim, 0).ok_or("multipart body has no boundary line")? + delim.len();
-    loop {
+    for part in 0.. {
         if body.get(at..at + 2) == Some(b"--") {
             break;
+        }
+        if part == 64 {
+            return Err("too many multipart fields".into());
         }
         // Skip the CRLF after the boundary.
         if body.get(at..at + 2) == Some(b"\r\n") {
@@ -343,6 +411,38 @@ mod tests {
             let want = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin();
             assert!((y[i] - want).abs() < 2e-3, "{i}: {} vs {want}", y[i]);
         }
+    }
+
+    #[test]
+    fn a_rate_sharing_no_factor_with_the_other_is_read_as_the_nearest_workable_one() {
+        for (from, want) in [(16_000, 16_000), (24_000, 24_000), (44_100, 44_100), (48_000, 48_000), (11_025, 11_025), (192_000, 192_000), (44_101, 44_100), (191_999, 192_000), (12_345, 12_300)] {
+            assert_eq!(workable_rate(from, 16_000), Some(want), "{from}");
+        }
+        // 44,101 Hz: a second of it, at once, and a second at 16 kHz
+        let x: Vec<f32> = (0..44_101).map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44_101.0).sin()).collect();
+        let started = std::time::Instant::now();
+        let y = resample(&x, 44_101, 16_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!((y.len() as i64 - 16_000).abs() <= 1, "{}", y.len());
+        // (the tone at the time of the input sample each output sample is read from, as 44,100 Hz has it)
+        for i in 100..15_900 {
+            let want = (2.0 * std::f64::consts::PI * 440.0 * (i as f64 * 44_100.0 / 16_000.0) / 44_101.0).sin() as f32;
+            assert!((y[i] - want).abs() < 2e-3, "{i}: {} vs {want}", y[i]);
+        }
+        // straight lines, where no filter will do
+        assert_eq!(linear(&[0.0, 1.0], 1, 2), vec![0.0, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_boundary_is_1_to_70_characters_and_found_where_it_begins() {
+        let long = "b".repeat(71);
+        assert!(parse_multipart(b"--x--", &format!("multipart/form-data; boundary={long}")).unwrap_err().contains("70"));
+        assert!(parse_multipart(b"--x--", "multipart/form-data; boundary=\"\"").is_err());
+        let ok = "b".repeat(70);
+        let body = format!("--{ok}\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nRIFF\r\n--{ok}--\r\n");
+        assert_eq!(parse_multipart(body.as_bytes(), &format!("multipart/form-data; boundary={ok}")).unwrap().file.as_deref(), Some(&b"RIFF"[..]));
+        assert_eq!(find(b"aab-aab--ab", b"--ab", 0), Some(7));
+        assert_eq!((find(b"abc", b"abcd", 0), find(b"abc", b"c", 3), find(b"abc", b"c", 2)), (None, None, Some(2)));
     }
 
     #[test]

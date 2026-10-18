@@ -13,6 +13,14 @@
  * What it cannot see: it reads the address as written. A public name that redirects to this network, and a public name that resolves to
  * a private address (`192.168.1.5.nip.io`), look public here, as do the other names a person's own DNS may point inside. The browser's
  * own question about connecting to devices on the network (Local Network Access) still gates them; see README.md.
+ *
+ * It is the one rule for addresses in shared/: shared/providers/errors.ts asks it too, in three ways that mean three things.
+ *   - isLocalHostname: this computer or its network, as wide as it can be told (a page's guard, and where a browser may ask the person).
+ *   - isPrivateNetworkHostname: where traffic stays on this computer or this network, so a key may go there over plain http. The same,
+ *     less what may cross the internet or is no one's own network: carrier-grade NAT (100.64/10, a carrier's), 0/8 and `::` (no host
+ *     to reach), an IPv4 address carried in IPv6 by a translator or a tunnel (NAT64, 6to4, Teredo go through a relay) and a name of a
+ *     single label (whatever a search domain makes of it).
+ *   - isLoopbackHostname: this computer alone (`localhost`, `*.localhost`, 127/8, `::1`), which a browser counts as secure over plain http.
  */
 
 /** IPv4 `a.b.c.d` as four numbers, or null. */
@@ -76,7 +84,11 @@ function ipv6IsLocal(g: number[]): boolean {
   }
   if (g[0] === 0x2002) return ipv4IsLocal(dotted(g[1], g[2])); // 6to4: the IPv4 address it carries
   if (g[0] === 0x2001 && g[1] === 0) return ipv4IsLocal(dotted(~g[6] & 0xffff, ~g[7] & 0xffff)); // Teredo: the client's address, kept inverted
-  // fc00::/7 (unique local), fe80::/10 (link-local)
+  return ipv6Private(g);
+}
+
+/** fc00::/7 (unique local) and fe80::/10 (link-local). */
+function ipv6Private(g: number[]): boolean {
   return (g[0] & 0xfe00) === 0xfc00 || (g[0] & 0xffc0) === 0xfe80;
 }
 
@@ -93,4 +105,45 @@ export function isLocalHostname(hostname: string): boolean {
   if (four) return ipv4IsLocal(four);
   // A name of one label is resolved by this network (a search domain, a hosts file, mDNS), not by the public DNS.
   return !host.includes('.');
+}
+
+/** A hostname as the three rules read it: lowercase, without a final dot. */
+function plain(hostname: string): string {
+  return String(hostname).toLowerCase().replace(/\.$/, '');
+}
+
+/**
+ * Whether `hostname` is one whose traffic stays on this computer or this network (see the top of this file for what is left out
+ * of isLocalHostname, and why): a key sent there over plain http is not sent across the internet. A name is read by isLocalHostname's
+ * own list of names, a name of one label aside; `192.168.1.5.evil.example` is a name, not an address.
+ */
+export function isPrivateNetworkHostname(hostname: string): boolean {
+  const host = plain(hostname);
+  if (host === '') return false;
+  if (host.includes(':') || host.startsWith('[')) {
+    const g = ipv6Groups(host);
+    if (!g) return false;
+    if (g.slice(0, 7).every((x) => x === 0)) return g[7] === 1; // `::1`, not `::`
+    if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return ipv4StaysHere(dotted(g[6], g[7])); // IPv4 written as IPv6
+    return ipv6Private(g);
+  }
+  const four = ipv4(host);
+  if (four) return ipv4StaysHere(four);
+  return isLoopbackHostname(host) || (host.includes('.') && isLocalHostname(host));
+}
+
+/** isLocalHostname's IPv4 ranges but 0/8 (no host) and 100.64/10 (carrier-grade NAT, its only range in 100/8). */
+function ipv4StaysHere(four: number[]): boolean {
+  return ipv4IsLocal(four) && four[0] !== 0 && four[0] !== 100;
+}
+
+/** Whether `hostname` is this computer alone: `localhost` and `*.localhost`, 127/8 and `::1`, which a browser counts as secure. */
+export function isLoopbackHostname(hostname: string): boolean {
+  const host = plain(hostname);
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host.includes(':') || host.startsWith('[')) {
+    const g = ipv6Groups(host);
+    return g !== null && g.slice(0, 7).every((x) => x === 0) && g[7] === 1;
+  }
+  return ipv4(host)?.[0] === 127;
 }

@@ -34,11 +34,14 @@ describe('the download offer in shared/', () => {
     assert.equal(plan.allDownloads, links.RELEASES_ALL_URL);
   });
 
-  it('still says what it said: a Mac or a phone is told what OAIY Desktop is for, and gets no button', () => {
-    for (const os of ['mac', 'ios', 'android']) {
+  it('a phone is told what OAIY Desktop is for, and gets no button; a Mac is offered the Apple-silicon disk image', () => {
+    for (const os of ['ios', 'android']) {
       const plan = shared.downloadPlan({ os, arch: 'unknown' }, 'v1.2.3');
       assert.equal(plan.primary, null, os);
-      assert.equal(plan.note, 'OAIY Desktop is for Windows and Linux. The web app works in your browser.', os);
+      assert.equal(plan.note, 'OAIY Desktop is for Windows, Linux and Mac. The web app works in your browser.', os);
     }
+    const mac = shared.downloadPlan({ os: 'mac', arch: 'unknown' }, 'v1.2.3');
+    assert.equal(mac.primary.file, 'oaiy-desktop-1.2.3-macos-arm64.dmg');
+    assert.equal(shared.downloadPlan({ os: 'mac', arch: 'x64' }, 'v1.2.3').primary, null, 'an Intel Mac');
   });
 });

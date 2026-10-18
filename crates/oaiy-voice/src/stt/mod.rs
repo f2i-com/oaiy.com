@@ -265,14 +265,13 @@ impl Transcriber {
 
     /// Transcribe mono audio at the model's sample rate, in [-1, 1].
     pub fn transcribe(&self, samples: &[f32]) -> Result<Transcript> {
-        let rate = self.sample_rate() as f64;
-        let max = (MAX_PASS_SECONDS * rate) as usize;
-        if samples.len() <= max {
+        let cuts = passes(samples, self.sample_rate());
+        if cuts.len() == 1 {
             return self.transcribe_pass(samples);
         }
         let mut tokens = Vec::new();
         let mut timings = Timings::default();
-        for (a, b) in quiet_cuts(samples, max, (CUT_SEARCH_SECONDS * rate) as usize, (0.1 * rate) as usize) {
+        for (a, b) in cuts {
             let t = self.transcribe_pass(&samples[a..b])?;
             tokens.extend(t.tokens);
             timings.audio += t.timings.audio;
@@ -306,6 +305,18 @@ impl Transcriber {
         timings.joint_trips = trips;
         Ok(Transcript { text: self.detokenize(&tokens), tokens, timings })
     }
+}
+
+/// The pieces [`Transcriber::transcribe`] makes of audio at `rate` Hz, each one pass of the model: the whole of it
+/// where it is no longer than [`MAX_PASS_SECONDS`], else pieces cut at its quiet moments ([`quiet_cuts`]). A caller
+/// may transcribe them one at a time (the server does, letting a short request in between them).
+pub fn passes(samples: &[f32], rate: usize) -> Vec<(usize, usize)> {
+    let rate = rate as f64;
+    let max = (MAX_PASS_SECONDS * rate) as usize;
+    if samples.len() <= max {
+        return vec![(0, samples.len())];
+    }
+    quiet_cuts(samples, max, (CUT_SEARCH_SECONDS * rate) as usize, (0.1 * rate) as usize)
 }
 
 /// A model's short name: the `.nemo`'s stem, or the folder of a safetensors file.

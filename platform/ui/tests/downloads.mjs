@@ -12,7 +12,8 @@
  *   - the links: for a tag, the exact names of the release's files (the version, without the v) under releases/download/<tag>/,
  *     each checked against the names .github/workflows/release.yml gives them; for a branch or no tag, a single button to the
  *     latest release saying only "Download OAIY Desktop";
- *   - a Mac or a phone is told what OAIY Desktop is for, and gets no button;
+ *   - a Mac is offered the Apple-silicon disk image (an Intel Mac, which the browser may say it is, gets none); a phone is told
+ *     what OAIY Desktop is for, and gets no button;
  *   - no link to anywhere but the project's repository, and the source makes no request.
  */
 import assert from 'node:assert/strict';
@@ -158,13 +159,38 @@ await check('built for a branch, or with no tag, the button goes to the latest r
   assert.equal(D.downloadPlan(LIN, undefined).caption, 'Linux is newer and less tested than Windows.');
 });
 
-await check('a Mac, an iPhone, an iPad and an Android device get the sentence, and no download', () => {
-  for (const os of ['mac', 'ios', 'android']) {
+await check('a Mac is offered the disk image (Apple silicon), named as the Mac build names it', () => {
+  for (const arch of ['arm', 'unknown']) {
+    const plan = D.downloadPlan({ os: 'mac', arch }, 'v0.1.6');
+    assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop for Mac', href: `${releases}/download/v0.1.6/oaiy-desktop-0.1.6-macos-arm64.dmg`, file: 'oaiy-desktop-0.1.6-macos-arm64.dmg' }, arch);
+    assert.deepEqual(plan.others, []);
+    assert.equal(plan.note, null);
+    assert.equal(plan.caption, 'Version 0.1.6. For Macs with Apple silicon (M1 or later).');
+  }
+  assert.equal(D.downloadPlan({ os: 'mac', arch: 'unknown' }, '0.1.6').primary.href, `${releases}/download/0.1.6/oaiy-desktop-0.1.6-macos-arm64.dmg`, 'the tag as pushed');
+  const bare = D.downloadPlan({ os: 'mac', arch: 'unknown' }, undefined);
+  assert.deepEqual(bare.primary, { label: 'Download OAIY Desktop', href: 'https://github.com/f2i-com/oaiy.com/releases/latest' });
+  assert.equal(bare.caption, 'For Macs with Apple silicon (M1 or later).');
+  // an Intel Mac (the browser said x86 when asked): no button, the image listed for anyone who knows better
+  for (const arch of ['x64', 'x86']) {
+    const intel = D.downloadPlan({ os: 'mac', arch }, 'v0.1.6');
+    assert.equal(intel.primary, null, arch);
+    assert.match(intel.note, /needs Apple silicon .* an Intel Mac/);
+    assert.deepEqual(intel.others.map((o) => o.file), ['oaiy-desktop-0.1.6-macos-arm64.dmg']);
+    assert.deepEqual(D.downloadPlan({ os: 'mac', arch }, undefined).others, []);
+  }
+  // the name the Mac build gives the image it adds to a release
+  const mac = path.join(UI, '..', '..', '.github', 'workflows', 'mac-build.yml');
+  if (fs.existsSync(mac)) assert.ok(fs.readFileSync(mac, 'utf8').includes('name="oaiy-desktop-$VERSION-macos-arm64.dmg"'), 'mac-build.yml uploads the image under this name');
+});
+
+await check('an iPhone, an iPad and an Android device get the sentence, and no download', () => {
+  for (const os of ['ios', 'android']) {
     for (const tag of ['v0.1.0', '0.1.0', undefined]) {
       const plan = D.downloadPlan({ os, arch: 'unknown' }, tag);
       assert.equal(plan.primary, null, `${os} ${tag}`);
       assert.deepEqual(plan.others, []);
-      assert.equal(plan.note, 'OAIY Desktop is for Windows and Linux. The web app works in your browser.');
+      assert.equal(plan.note, 'OAIY Desktop is for Windows, Linux and Mac. The web app works in your browser.');
       assert.equal(plan.allDownloads, releases);
     }
   }
@@ -203,20 +229,26 @@ await check('a 32-bit user agent on Windows ("Win32; x86") is not a 64-bit one',
   assert.equal(D.detectDevice({ userAgent: UA.linuxChrome }).arch, 'x64', 'x86_64 is not 32-bit');
 });
 
-await check('Linux that reports a touch screen, or says it is on a phone, is a phone or a tablet: Android asked for the desktop site says "Linux x86_64"', () => {
+await check('Linux with a touch screen and no mouse or touchpad, or that says it is on a phone, is a phone or a tablet: Android asked for the desktop site says "Linux x86_64"; a laptop with a touch screen is still Linux', () => {
   const desktopSite = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
-  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 5 }), 'android', 'the reviewer\'s case');
+  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 5, finePointer: false }), 'android', 'the reviewer\'s case');
   assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', mobile: true }), 'android');
-  assert.equal(os({ userAgent: desktopSite, maxTouchPoints: 5 }), 'android', 'and where the browser has no userAgentData');
-  assert.equal(os({ userAgent: UA.linuxFirefox, maxTouchPoints: 10 }), 'android');
+  assert.equal(os({ userAgent: desktopSite, maxTouchPoints: 5, finePointer: false }), 'android', 'and where the browser has no userAgentData');
+  assert.equal(os({ userAgent: UA.linuxFirefox, maxTouchPoints: 10, finePointer: false }), 'android');
+  // a laptop running Linux with a touch screen beside its touchpad, and one where the page could not ask
+  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 10, finePointer: true }), 'linux', 'a touch-screen laptop');
+  assert.equal(os({ userAgent: UA.linuxFirefox, maxTouchPoints: 10, finePointer: true }), 'linux');
+  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 10 }), 'linux', 'a touch screen alone says nothing');
   assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 0 }), 'linux');
   assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 1 }), 'linux', 'one is not a screen');
   assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', mobile: false, maxTouchPoints: 0 }), 'linux');
   // a Windows machine with a touch screen is still Windows
   assert.equal(os({ userAgent: UA.windowsChrome, uaPlatform: 'Windows', maxTouchPoints: 10 }), 'windows');
-  const plan = D.downloadPlan(D.detectDevice({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 5 }), 'v0.1.0');
+  const plan = D.downloadPlan(D.detectDevice({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 5, finePointer: false }), 'v0.1.0');
   assert.equal(plan.primary, null);
-  assert.equal(plan.note, 'OAIY Desktop is for Windows and Linux. The web app works in your browser.');
+  assert.equal(plan.note, 'OAIY Desktop is for Windows, Linux and Mac. The web app works in your browser.');
+  // Chrome on an Android phone asked for the desktop site, where nothing else tells: its processor, when the browser says it, does
+  assert.equal(D.downloadPlan(D.withHighEntropy(D.detectDevice({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 5 }), { architecture: 'arm', bitness: '64' }), 'v0.1.0').primary, null);
 });
 
 const high = (architecture, bitness) => ({ architecture, bitness });
@@ -278,10 +310,10 @@ await check('the whole path for each case: a guess, the browser\'s answer, the p
   assert.match(firefoxArm.note, NEEDS_64);
 });
 
-await check('a device that cannot be told gets the latest release, and is told the files are for Windows and Linux', () => {
+await check('a device that cannot be told gets the latest release, and is told the files are for Windows, Linux and Mac', () => {
   const plan = D.downloadPlan({ os: 'other', arch: 'unknown' }, '0.1.0');
   assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop', href: 'https://github.com/f2i-com/oaiy.com/releases/latest' });
-  assert.equal(plan.note, 'The files are for Windows and Linux.');
+  assert.equal(plan.note, 'The files are for Windows, Linux and Mac.');
 });
 
 await check('from the user agent to the link, for each browser above', () => {
@@ -290,7 +322,9 @@ await check('from the user agent to the link, for each browser above', () => {
   assert.equal(link(UA.windowsFirefox), 'oaiy-desktop-1.2.3-windows-x64-setup.exe');
   assert.equal(link(UA.ubuntuFirefox), 'oaiy-desktop-1.2.3-linux-x86_64.AppImage');
   assert.equal(link(UA.linuxArm), null);
-  assert.equal(link(UA.macSafari), null);
+  assert.equal(link(UA.macSafari), 'oaiy-desktop-1.2.3-macos-arm64.dmg');
+  assert.equal(link(UA.macChrome), 'oaiy-desktop-1.2.3-macos-arm64.dmg');
+  assert.equal(link(UA.macSafari, { maxTouchPoints: 5 }), null, 'an iPad asking for the desktop site');
   assert.equal(link(UA.iphone, { maxTouchPoints: 5 }), null);
   assert.equal(link(UA.androidPhone), null);
 });

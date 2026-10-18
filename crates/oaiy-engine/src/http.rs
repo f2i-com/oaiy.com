@@ -114,6 +114,68 @@ impl Refusal {
     }
 }
 
+/// Whether a `Host` (or an origin's host), its port aside, is this computer's loopback: `localhost` (and names under
+/// it, which browsers keep on loopback whatever DNS says) or a loopback address.
+pub fn loopback_name(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None if host.parse::<std::net::IpAddr>().is_ok() => host.as_str(),
+        None => host.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(host.as_str(), |(name, _)| name),
+    };
+    name == "localhost" || name.ends_with(".localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// Whether an `Origin` is a page served from this computer's loopback.
+pub fn loopback_origin(origin: &str) -> bool {
+    let origin = origin.trim();
+    let rest = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://"));
+    rest.is_some_and(|host| !host.contains('/') && loopback_name(host))
+}
+
+/// Whether a listener's host (`127.0.0.1`, `::1`, `localhost`) is this computer's loopback alone: what reaches it then
+/// should name loopback as its `Host` too ([`loopback_gate`]).
+pub fn listens_on_loopback(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// Whether an `Authorization` header carries `key` as a bearer token: its scheme in any case (as RFC 9110 has it), the
+/// key compared in a time that does not tell how much of it a guess had right.
+pub fn key_matches(header: Option<&str>, key: &str) -> bool {
+    let Some((scheme, given)) = header.map(str::trim).and_then(|h| h.split_once(' ')) else { return false };
+    scheme.eq_ignore_ascii_case("bearer") && same_secret(given.trim().as_bytes(), key.as_bytes())
+}
+
+/// Two secrets compared in a time that does not depend on where they first differ.
+pub fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// The gate of a server a web page in this computer's browser can reach, as `oaiy-llm-server`'s is (for
+/// [`serve_gated`]): on one that listens on loopback only (`loopback`), a `Host` naming anything else (a site's name
+/// pointed at 127.0.0.1, which a browser takes for that site's own server: DNS rebinding); with no key, a page of
+/// another site (an `Origin` not of this computer's loopback); with a key, a request without it, but on the `open`
+/// routes (a health probe's) and a preflight.
+pub fn loopback_gate(key: Option<&str>, loopback: bool, req: &Request, open: &[&str]) -> Option<Refusal> {
+    if loopback && req.header("host").is_some_and(|h| !loopback_name(h)) {
+        return Some(Refusal::new(403, "this server answers to its loopback address only (localhost or 127.0.0.1)", "forbidden_host"));
+    }
+    match key.filter(|k| !k.is_empty()) {
+        None if req.header("origin").is_some_and(|o| !loopback_origin(o)) => {
+            Some(Refusal::new(403, "this server has no API key, so it answers no web page but this computer's own", "forbidden_origin"))
+        }
+        Some(key) if req.method != "OPTIONS" && !open.contains(&req.route()) && !key_matches(req.header("authorization"), key) => {
+            Some(Refusal::new(401, "missing or wrong API key", "invalid_api_key"))
+        }
+        _ => None,
+    }
+}
+
 /// The connection's reads held to a deadline: before each read from the socket, its timeout is what is left.
 struct Within<'a> {
     r: &'a mut BufReader<TcpStream>,
@@ -664,6 +726,41 @@ mod tests {
         assert!(!reply.contains("100 Continue"), "{reply}");
         assert!(reply.contains("invalid_api_key"), "{reply}");
         assert!(!server.join().unwrap(), "the handler never ran");
+    }
+
+    #[test]
+    fn the_loopback_gate_refuses_other_hosts_other_sites_and_a_missing_key() {
+        for host in ["localhost", "localhost:8783", "127.0.0.1:1", "[::1]:80", "::1", "a.localhost:5", "[::ffff:127.0.0.1]:9"] {
+            assert!(loopback_name(host), "{host}");
+        }
+        for host in ["evil.example", "evil.example:8783", "localhost.evil.example", "192.168.1.5:80", "0.0.0.0", ""] {
+            assert!(!loopback_name(host), "{host}");
+        }
+        assert!(loopback_origin("http://localhost:5173") && loopback_origin("https://127.0.0.1") && loopback_origin("http://tauri.localhost"));
+        for origin in ["null", "https://evil.example", "http://localhost.evil.example", "file://", "http://localhost/x", "tauri://localhost"] {
+            assert!(!loopback_origin(origin), "{origin}");
+        }
+        assert!(listens_on_loopback("127.0.0.1") && listens_on_loopback("::1") && listens_on_loopback("localhost"));
+        assert!(!listens_on_loopback("0.0.0.0") && !listens_on_loopback("::") && !listens_on_loopback("192.168.1.5"));
+        let req = |method: &str, path: &str, h: &[(&str, &str)]| Request::new(method, path, h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), Vec::new());
+        let status = |r: Option<Refusal>| r.map(|r| r.status);
+        // DNS rebinding: a site's own name for 127.0.0.1
+        assert_eq!(status(loopback_gate(None, true, &req("GET", "/v1/audio/voices", &[("Host", "evil.example:8783")]), &[])), Some(403));
+        assert_eq!(status(loopback_gate(None, false, &req("GET", "/v1/audio/voices", &[("Host", "evil.example:8783")]), &[])), None);
+        // another site's page, no key
+        let page = req("POST", "/v1/audio/speech", &[("Host", "127.0.0.1:8783"), ("Origin", "https://evil.example")]);
+        assert_eq!(status(loopback_gate(None, true, &page, &[])), Some(403));
+        assert_eq!(status(loopback_gate(None, true, &req("POST", "/v1/audio/speech", &[("Host", "localhost:8783"), ("Origin", "http://localhost:3000")]), &[])), None);
+        assert_eq!(status(loopback_gate(None, true, &req("POST", "/v1/audio/speech", &[("Host", "127.0.0.1:8783")]), &[])), None);
+        // a key: wanted but on the open routes and a preflight, whatever the page
+        assert_eq!(status(loopback_gate(Some("k"), true, &page, &[])), Some(401));
+        assert_eq!(status(loopback_gate(Some("k"), true, &req("GET", "/health?x=1", &[("Host", "127.0.0.1")]), &["/health"])), None);
+        assert_eq!(status(loopback_gate(Some("k"), true, &req("OPTIONS", "/v1/audio/speech", &[("Host", "127.0.0.1")]), &[])), None);
+        let keyed = req("POST", "/v1/audio/speech", &[("Host", "127.0.0.1"), ("Origin", "https://evil.example"), ("Authorization", "bearer k")]);
+        assert_eq!(status(loopback_gate(Some("k"), true, &keyed, &[])), None);
+        assert_eq!(status(loopback_gate(Some("k2"), true, &keyed, &[])), Some(401));
+        assert_eq!(status(loopback_gate(Some(""), true, &req("GET", "/x", &[("Host", "127.0.0.1")]), &[])), None, "an empty key is none");
+        assert!(!key_matches(Some("Basic k"), "k") && !key_matches(None, "k") && key_matches(Some(" Bearer  k "), "k"));
     }
 
     #[test]

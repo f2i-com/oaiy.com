@@ -116,6 +116,8 @@ pub struct Args {
     pub ffmpeg: PathBuf,
     /// Where a model given by name is looked for.
     pub model_dirs: Vec<PathBuf>,
+    /// End when stdin reaches its end (`--watch-stdin`): a supervisor holding the other end, the server cannot outlive it.
+    pub watch_stdin: bool,
 }
 
 impl Args {
@@ -133,12 +135,16 @@ pub const USAGE: &str = "usage: oaiy-voice [--mode stt|tts|both] [--port N] [--h
                   [--stt-model-dir PATH | --model PATH] [--tts-model-dir PATH]
                   [--device auto|cpu|gpu:N] [--dtype auto|f32|tf32|f16|bf16]
                   [--voices-dir DIR] [--voice NAME|CLIP] [--ffmpeg PATH] [--model-dirs DIRS]
+                  [--watch-stdin]
        oaiy-voice transcribe --model PATH [--device ...] [--dtype ...] [--repeat N] FILE.wav...
 
 PATH is a Parakeet .nemo, a model.safetensors (with config.json and
 tokenizer.json beside it), or a folder holding either; the TTS model is a
 Qwen3-TTS Base folder. A model named without a path is looked for in the
-model folders. A voice is a clip (WAV, MP3...) in DIR, by its file name.";
+model folders. A voice is a clip (WAV, MP3...) in DIR, by its file name.
+--watch-stdin ends the server when stdin closes (a supervisor holds the
+other end). OAIY_VOICE_API_KEY, where set, is a key every request but the
+probes (/v1/models, /health) must carry as `Authorization: Bearer KEY`.";
 
 /// Parse the server's flags (`--flag value` or `--flag=value`), with the
 /// process environment for what they leave out.
@@ -165,6 +171,7 @@ pub fn parse_with_env<I: IntoIterator<Item = String>>(args: I, env: impl Fn(&str
     let mut ffmpeg = PathBuf::from("ffmpeg");
     let split = |v: &str| std::env::split_paths(v).filter(|p| !p.as_os_str().is_empty()).collect::<Vec<PathBuf>>();
     let mut model_dirs = env("OAIY_MODEL_DIRS").map(|v| split(&v)).unwrap_or_default();
+    let mut watch_stdin = false;
     let mut i = 0;
     while i < argv.len() {
         let (flag, inline) = match argv[i].split_once('=') {
@@ -197,6 +204,7 @@ pub fn parse_with_env<I: IntoIterator<Item = String>>(args: I, env: impl Fn(&str
             "--voice" => voice = Some(value()?).filter(|v| !v.trim().is_empty()),
             "--ffmpeg" => ffmpeg = PathBuf::from(value()?),
             "--model-dirs" => model_dirs = split(&value()?),
+            "--watch-stdin" => watch_stdin = true,
             // Aokie's engine choice: only Parakeet is served here.
             "--stt-engine" => {
                 let v = value()?;
@@ -210,7 +218,7 @@ pub fn parse_with_env<I: IntoIterator<Item = String>>(args: I, env: impl Fn(&str
         i += 1;
     }
     let mode = mode.unwrap_or(Mode::Both);
-    Ok(Args { mode, port: port.unwrap_or(mode.default_port()), host, stt_model, tts_model, device, dtype, voices_dir, voice, ffmpeg, model_dirs })
+    Ok(Args { mode, port: port.unwrap_or(mode.default_port()), host, stt_model, tts_model, device, dtype, voices_dir, voice, ffmpeg, model_dirs, watch_stdin })
 }
 
 #[cfg(test)]
@@ -281,5 +289,6 @@ mod tests {
         assert!(p(&["--frobnicate"]).is_err());
         assert!(p(&["--stt-engine", "whisper"]).is_err());
         assert!(p(&["--stt-engine", "parakeet"]).is_ok());
+        assert!(!a.watch_stdin && p(&["--watch-stdin"]).unwrap().watch_stdin);
     }
 }

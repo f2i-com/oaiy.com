@@ -564,3 +564,111 @@ fn media_meant_for_the_card_fall_back_here_only_when_asked() {
     assert!(!falls_back_here(&body(r#"{"media": {"keep_minutes": 30}}"#)));
     assert!(falls_back_here(&body(r#"{"media": {"fallback_here": true}}"#)));
 }
+
+/// A stand-in for the kept picture worker (`oaiy-media --serve`): before each answer a line that is not UTF-8 and more
+/// events than a pipe holds, after it a word of its own; `slow` takes 3 s.
+#[cfg(unix)]
+const FAKE_SERVE_NOISY: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+for line in sys.stdin:
+    ask = json.loads(line)
+    sys.stderr.buffer.write(b"\xff\xfe not text\n")
+    for i in range(4096):
+        sys.stderr.write(json.dumps({"note": "x" * 60}) + "\n")
+    sys.stderr.flush()
+    if ask["prompt"] == "slow":
+        time.sleep(3)
+    os.makedirs(ask["output_dir"], exist_ok=True)
+    path = os.path.join(ask["output_dir"], ask["prompt"] + ".png")
+    open(path, "wb").write(b"\x89PNG\r\n\x1a\n")
+    print(json.dumps({"data": [{"path": path}], "seconds": 0.1}), flush=True)
+    print("said after " + ask["prompt"], file=sys.stderr, flush=True)
+"#;
+
+/// The kept picture worker's pipes are read whatever comes (a line that is not UTF-8 stopped the reading, and the
+/// worker then waited on a full pipe for ever); what it said after a job's answer is not the next job's (an incognito
+/// job's words came into the log under it); and while it makes a picture, the view of what is loaded is answered at
+/// once (it waited for the picture).
+#[cfg(unix)]
+#[test]
+fn the_kept_worker_is_heard_whatever_it_says_and_seen_while_it_works() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("oaiy-media-kept-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let worker = dir.join("fake-media");
+    std::fs::write(&worker, FAKE_SERVE_NOISY).unwrap();
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut c = config::default_json();
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["media"]).unwrap(), "worker", Json::str(worker.to_string_lossy()));
+    let studio = Arc::new(crate::Studio::for_test(&dir, c));
+    let runner = Arc::clone(&studio);
+    std::thread::spawn(move || {
+        let media = Arc::clone(&runner.media);
+        media.run(&runner);
+    });
+    let out = dir.join("out");
+    let submit = |prompt: &str, scratch: Option<PathBuf>| studio.media.submit(Kind::Image, Json::obj([("prompt", Json::str(prompt)), ("output_dir", Json::str(out.to_string_lossy()))]), "turbo".into(), "1024x1024".into(), 1, 0.0, 8, scratch);
+    let done = |job: &Job| {
+        let j = studio.media.wait(&job.id, Duration::from_secs(30)).unwrap();
+        assert_eq!(j.status, "completed", "{:?}\n{}", j.error, studio.media.log.tail(20));
+    };
+    done(&submit("fox", None));
+    done(&submit("secret", Some(dir.join("scratch"))));
+    // (its last word on its way through the pipe)
+    std::thread::sleep(Duration::from_millis(300));
+    let slow = submit("slow", None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while studio.media.get(&slow.id).unwrap().status != "in_progress" {
+        assert!(std::time::Instant::now() < deadline, "the slow job never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let asked = std::time::Instant::now();
+    let kept = studio.media.kept_worker().expect("the kept worker, busy");
+    let view = crate::resources::snapshot(&studio);
+    assert!(asked.elapsed() < Duration::from_secs(1), "the view waited {:?} for the picture", asked.elapsed());
+    assert_eq!(kept.models, ["turbo"]);
+    let busy: Vec<&str> = view.get("models").and_then(Json::as_array).unwrap().iter().filter(|m| str_or(m, "kind", "") == "image").map(|m| str_or(m, "state", "")).collect();
+    assert_eq!(busy, ["in_use"], "{}", view.to_json());
+    assert_eq!(studio.media.get(&slow.id).unwrap().status, "in_progress", "the view was answered while it worked");
+    done(&slow);
+    let log = studio.media.log.tail(400);
+    assert!(!log.contains("said after secret"), "the incognito job's last word, logged as the next job's: {log}");
+    assert!(log.matches("an image worker kept for").count() == 1, "one worker for all three: {log}");
+    studio.media.end_serving(true, "the test is done");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A job cancelled while it waits for the chats on its GPU to finish is cancelled then (it waited out the chats, up to
+/// ten minutes, before it was told), and nothing is stopped for it.
+#[test]
+fn a_job_cancelled_while_it_waits_for_the_chats_ends_then() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-chat-wait-{}", std::process::id()));
+    let mut c = config::default_json();
+    crate::util::set(crate::models::registry::obj_mut(&mut c, &["media"]).unwrap(), "worker", Json::str("no-such-worker-here"));
+    let studio = Arc::new(crate::Studio::for_test(&dir, c));
+    let runner = Arc::clone(&studio);
+    std::thread::spawn(move || {
+        let media = Arc::clone(&runner.media);
+        media.run(&runner);
+    });
+    let lease = studio.media.chat_lease(true, Duration::ZERO).unwrap();
+    let job = studio.media.submit(Kind::Image, body(r#"{"prompt":"a","architecture":"sdxl"}"#), "anime".into(), "1x1".into(), 1, 0.0, 8, None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !studio.media.broker.lock().unwrap().waiting_media {
+        assert!(std::time::Instant::now() < deadline, "the job never waited for the chat");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let asked = std::time::Instant::now();
+    assert!(studio.media.cancel(&job.id));
+    let j = studio.media.wait(&job.id, Duration::from_secs(5)).unwrap();
+    assert_eq!(j.status, "cancelled", "{:?}", j.error);
+    assert!(asked.elapsed() < Duration::from_secs(3), "{:?}", asked.elapsed());
+    let b = studio.media.broker.lock().unwrap();
+    assert!(!b.media && !b.waiting_media, "the chats are not held back for it");
+    drop(b);
+    assert!(!studio.llm.paused());
+    drop(lease);
+    let _ = std::fs::remove_dir_all(&dir);
+}

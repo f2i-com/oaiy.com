@@ -7,16 +7,32 @@
 use oaiy_engine::json::Json;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Probes spawn processes, so their answers are cached this long.
 const GPU_TTL: Duration = Duration::from_secs(2);
 const RAM_TTL: Duration = Duration::from_secs(5);
+/// The longest a probe's program is waited for: nvidia-smi can hang on a driver in trouble (a card fallen off its bus),
+/// and every caller -- the resources page, a language model starting -- waited with it.
+const PROBE_WITHIN: Duration = Duration::from_secs(5);
+
+/// A probe's last answer, and whether one is being asked for now.
+#[derive(Default)]
+struct Cached {
+    value: Option<(Instant, Json)>,
+    probing: bool,
+}
+
+#[derive(Default)]
+struct Slot {
+    cached: Mutex<Cached>,
+    answered: Condvar,
+}
 
 pub struct System {
-    gpus: Mutex<Option<(Instant, Json)>>,
-    ram: Mutex<Option<(Instant, Json)>>,
+    gpus: Slot,
+    ram: Slot,
 }
 
 fn quiet(program: &str) -> Command {
@@ -32,18 +48,41 @@ fn quiet(program: &str) -> Command {
 
 impl System {
     pub fn new() -> System {
-        System { gpus: Mutex::new(None), ram: Mutex::new(None) }
+        System { gpus: Slot::default(), ram: Slot::default() }
     }
 
-    fn cached(slot: &Mutex<Option<(Instant, Json)>>, ttl: Duration, probe: impl FnOnce() -> Json) -> Json {
-        let mut g = slot.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((at, v)) = g.as_ref() {
-            if at.elapsed() < ttl {
-                return v.clone();
+    /// The probe's answer, asked again once it is `ttl` old. Asked outside the lock: while one caller waits on the
+    /// probe, the others have its last answer (and wait for it only where there is none yet).
+    fn cached(slot: &Slot, ttl: Duration, probe: impl FnOnce() -> Json) -> Json {
+        let mut g = slot.cached.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some((at, v)) = g.value.as_ref() {
+                if at.elapsed() < ttl || g.probing {
+                    return v.clone();
+                }
+            }
+            if !g.probing {
+                break;
+            }
+            g = slot.answered.wait_timeout(g, PROBE_WITHIN).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        g.probing = true;
+        drop(g);
+        /// The probe said finished however it ends (a panic too), so no caller waits on one that never answers.
+        struct Done<'a>(&'a Slot, Option<Json>);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                let mut g = self.0.cached.lock().unwrap_or_else(|p| p.into_inner());
+                g.probing = false;
+                if let Some(v) = self.1.take() {
+                    g.value = Some((Instant::now(), v));
+                }
+                self.0.answered.notify_all();
             }
         }
+        let mut done = Done(slot, None);
         let v = probe();
-        *g = Some((Instant::now(), v.clone()));
+        done.1 = Some(v.clone());
         v
     }
 
@@ -57,10 +96,9 @@ impl System {
     /// `unified`: its memory is the computer's. Empty when neither says.
     pub fn gpus(&self) -> Json {
         Self::cached(&self.gpus, GPU_TTL, || {
-            let out = quiet("nvidia-smi")
-                .args(["--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"])
-                .output();
-            let nvidia: Vec<Json> = out.map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(parse_gpu).collect()).unwrap_or_default();
+            let mut smi = quiet("nvidia-smi");
+            smi.args(["--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"]);
+            let nvidia: Vec<Json> = output_within(smi, PROBE_WITHIN).map(|o| String::from_utf8_lossy(&o).lines().filter_map(parse_gpu).collect()).unwrap_or_default();
             if !nvidia.is_empty() {
                 return Json::Arr(nvidia);
             }
@@ -80,6 +118,34 @@ impl System {
             Json::obj([("total_mb", n(total)), ("available_mb", n(available))])
         })
     }
+}
+
+/// A program's standard output, once it has ended within `within`; None where it could not start or took longer (it
+/// is killed then, its answer not waited for).
+pub(crate) fn output_within(mut command: Command, within: Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut child = command.stdout(Stdio::piped()).spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    // (read beside the wait, so a program that says much is not stopped by a full pipe)
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = out.by_ref().take(4 << 20).read_to_end(&mut bytes);
+        let _ = tx.send(bytes);
+    });
+    let until = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    rx.recv_timeout(Duration::from_secs(1)).ok()
 }
 
 fn parse_gpu(line: &str) -> Option<Json> {
@@ -147,8 +213,10 @@ fn parse_windows_adapters(text: &str) -> Vec<Json> {
 #[cfg(windows)]
 fn other_gpus() -> Vec<Json> {
     let script = "Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*' -ErrorAction SilentlyContinue | ForEach-Object { \"$($_.DriverDesc)|$($_.'HardwareInformation.qwMemorySize')|$($_.MatchingDeviceId)\" }";
-    let Ok(out) = quiet("powershell").args(["-NoProfile", "-NonInteractive", "-Command", script]).output() else { return Vec::new() };
-    parse_windows_adapters(&String::from_utf8_lossy(&out.stdout))
+    let mut command = quiet("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    let Some(out) = output_within(command, Duration::from_secs(20)) else { return Vec::new() };
+    parse_windows_adapters(&String::from_utf8_lossy(&out))
 }
 
 /// Linux: the DRM cards' PCI vendors, and an AMD card's VRAM (amdgpu's `mem_info_vram_total`). Other vendors' memory
@@ -392,6 +460,45 @@ fn roots() -> Vec<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A probe that hangs is killed at its deadline, and a program that answers is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_hangs_is_given_up_at_its_deadline() {
+        let started = Instant::now();
+        let mut hangs = Command::new("/bin/sleep");
+        hangs.arg("30");
+        assert_eq!(output_within(hangs, Duration::from_millis(200)), None);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let mut says = Command::new("/bin/echo");
+        says.arg("0, Card, 1, 2, 3, 4");
+        assert_eq!(output_within(says, Duration::from_secs(10)).as_deref(), Some(&b"0, Card, 1, 2, 3, 4\n"[..]));
+    }
+
+    /// While one caller waits on a probe, the others have its last answer at once rather than waiting with it.
+    #[test]
+    fn a_slow_probe_does_not_hold_up_the_others_who_have_its_last_answer() {
+        let slot = std::sync::Arc::new(Slot::default());
+        assert_eq!(System::cached(&slot, Duration::ZERO, || Json::Int(1)), Json::Int(1));
+        let (entered, release) = (std::sync::mpsc::channel::<()>(), std::sync::mpsc::channel::<()>());
+        let slow = {
+            let (slot, entered, release) = (std::sync::Arc::clone(&slot), entered.0, release.1);
+            std::thread::spawn(move || {
+                System::cached(&slot, Duration::ZERO, || {
+                    entered.send(()).unwrap();
+                    release.recv().unwrap();
+                    Json::Int(2)
+                })
+            })
+        };
+        entered.1.recv().unwrap();
+        let started = Instant::now();
+        assert_eq!(System::cached(&slot, Duration::ZERO, || Json::Int(3)), Json::Int(1), "the last answer, not another probe");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.0.send(()).unwrap();
+        assert_eq!(slow.join().unwrap(), Json::Int(2));
+        assert_eq!(System::cached(&slot, Duration::from_secs(60), || Json::Int(4)), Json::Int(2));
+    }
 
     /// The adapters this computer's OS lists, read for real (`--ignored --nocapture` to see them): the reader that a
     /// computer without an NVIDIA driver relies on, run where it can be checked.

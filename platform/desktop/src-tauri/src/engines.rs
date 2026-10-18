@@ -137,6 +137,20 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
         // this makes the folder it is owner-only (unix), and the studio saves the file the same.
         crate::secret_file::create_private_dir(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
     }
+    let args = oaiy_studio::Args { config: config.clone(), open: Some("none".into()), ui_port: None, port: None, start_llm: false };
+    // Asked before anything is written to the configuration: a studio already serving it holds its settings and saves
+    // them itself, one save at a time under its own lock and version, so a change written to its file beside it was
+    // put back by its next save (or put back what that save changed). What is set up below waits for a start of the
+    // desktop's own.
+    if let Some(url) = oaiy_studio::running_instance(&args) {
+        log::info!("engines: using the ones already running at {url}");
+        crate::http::set_engines_ui(&url);
+        *UI_URL.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
+        return Ok(url);
+    }
+    if m == Mode::Attach {
+        return Err("no engines are running for this configuration, and this build only uses running ones (OAIY_ENGINES=attach)".into());
+    }
     // The NVIDIA engine an older version fetched (the CUDA build, which is no more): set aside before the studio starts.
     if let Err(e) = retire_cuda_engine(&config, data_dir) {
         log::warn!("engines: {e}");
@@ -152,16 +166,6 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
             Ok(false) => {}
             Err(e) => log::warn!("engines: where their downloads go was not set: {e}"),
         }
-    }
-    let args = oaiy_studio::Args { config: config.clone(), open: Some("none".into()), ui_port: None, port: None, start_llm: false };
-    if let Some(url) = oaiy_studio::running_instance(&args) {
-        log::info!("engines: using the ones already running at {url}");
-        crate::http::set_engines_ui(&url);
-        *UI_URL.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
-        return Ok(url);
-    }
-    if m == Mode::Attach {
-        return Err("no engines are running for this configuration, and this build only uses running ones (OAIY_ENGINES=attach)".into());
     }
     let running = oaiy_studio::launch(&args, true)?;
     if let Some(runtime) = EGPU_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).clone() {

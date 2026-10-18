@@ -116,7 +116,8 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
 pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched, trusted: bool) -> io::Result<bool> {
     let method = req.method.as_str();
     // (a new media job joins the queue only where it has room: past it, try again)
-    let media = matches!(m.target.as_str(), "images" | "edits" | "videos" | "speech" | "music" | "sound" | "model3d" | "background" | "upscale");
+    // (a voice designed is a speech job too: `POST` on the voices' own route)
+    let media = matches!(m.target.as_str(), "images" | "edits" | "videos" | "speech" | "voices" | "music" | "sound" | "model3d" | "background" | "upscale");
     if media && method == "POST" && m.rest.trim_matches('/').is_empty() && studio.media.queued() >= media::MAX_QUEUED {
         return send(w, Err(fail(503, format!("the media queue is full ({} jobs waiting); try again soon", media::MAX_QUEUED))));
     }
@@ -263,7 +264,15 @@ fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json,
     };
     let auth = format!("Bearer {}", endpoint.key);
     let thinking = if egpu::thinks(llm, &asked) { "1" } else { "0" };
-    let headers = [("Authorization", auth.as_str()), ("Content-Type", "application/json"), ("X-OAIY-Thinking", thinking)];
+    let mut headers = vec![("Authorization", auth.as_str()), ("Content-Type", "application/json"), ("X-OAIY-Thinking", thinking)];
+    // (incognito as this computer's engine is told it, `proxy`: OAIY's own engine on the card reads both, and keeps an
+    // incognito session's state in memory alone; tinygrad's server reads neither)
+    if incognito_mode(studio) || incognito_header(req) {
+        headers.push(("X-OAIY-Incognito", "1"));
+    }
+    if let Some(session) = req.header("x-oaiy-session") {
+        headers.push(("X-OAIY-Session", session));
+    }
     let response = match fetch(&endpoint.addr, "POST", "/v1/chat/completions", &headers, &body, UPSTREAM_READ) {
         Ok(r) => r,
         Err(e) => {
@@ -349,7 +358,8 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     if let Some(m) = model {
         studio.llm.set_resident(m);
     }
-    studio.llm.touch();
+    // (held while it is answered: not stopped for being idle under a long reply)
+    let held = studio.llm.hold();
     let auth = format!("Bearer {}", endpoint.key);
     let ctype = req.header("content-type").unwrap_or("application/json").to_string();
     let mut headers = vec![("Authorization", auth.as_str()), ("Content-Type", ctype.as_str())];
@@ -368,7 +378,7 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
         Err(e) => return send(w, Err(fail(502, format!("the language model did not answer: {e}")))),
     };
     let result = relay(w, response);
-    studio.llm.touch();
+    drop(held);
     drop(lease);
     result
 }
@@ -669,7 +679,9 @@ fn multipart(req: &Request) -> bool {
 /// OpenAI audio.speech: speak `input` in a saved or described voice, wait,
 /// and answer with the audio itself (converted by FFmpeg as asked).
 fn speech_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    match speech_audio(studio, req) {
+    // (the connection asking, whose hanging up cancels the job: the GPU is not held for a clip nobody will take)
+    let caller = w.try_clone().ok();
+    match speech_audio(studio, req, caller.as_ref()) {
         Ok((bytes, ctype)) => {
             respond(w, 200, ctype, &bytes, true)?;
             Ok(true)
@@ -678,7 +690,7 @@ fn speech_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::
     }
 }
 
-fn speech_audio(studio: &Arc<Studio>, req: &Request) -> Result<(Vec<u8>, &'static str), Reply> {
+fn speech_audio(studio: &Arc<Studio>, req: &Request, caller: Option<&TcpStream>) -> Result<(Vec<u8>, &'static str), Reply> {
     if req.method != "POST" {
         return Err(fail(405, "use POST"));
     }
@@ -712,7 +724,7 @@ fn speech_audio(studio: &Arc<Studio>, req: &Request) -> Result<(Vec<u8>, &'stati
         let (request, model, voice, frames) = crate::media::speech::speech_request(&cfg, &studio.root, &media::day_dir(&out, "speech"), &body).map_err(drop_scratch)?;
         (studio.media.submit(Kind::Speech, request, model, voice, frames, 0.0, keep_jobs(&cfg), scratch), SPEECH_WAIT)
     };
-    let done = studio.media.wait(&job.id, wait).ok_or_else(|| fail(500, "the job disappeared"))?;
+    let done = wait_for_caller(studio, &job.id, wait, caller).ok_or_else(|| fail(500, "the job disappeared"))?;
     let finish = |studio: &Arc<Studio>| {
         if done.incognito {
             if done.finished() { studio.media.purge(&done.id) } else { studio.media.remove(&done.id); }
@@ -1030,7 +1042,10 @@ fn voices(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, rest: &str) ->
     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     match (req.method.as_str(), parts.as_slice()) {
         ("GET", []) => json_reply(w, 200, &Json::obj([("object", Json::str("list")), ("data", Json::Arr(crate::media::speech::list(&dir)))])),
-        ("POST", []) => send(w, create_voice(studio, req, &dir)),
+        ("POST", []) => {
+            let caller = w.try_clone().ok();
+            send(w, create_voice(studio, req, &dir, caller.as_ref()))
+        }
         ("GET", [name]) => match crate::media::speech::get(&dir, name) {
             Some(v) => json_reply(w, 200, &v),
             None => send(w, Err(fail(404, format!("no voice named {name}")))),
@@ -1058,7 +1073,7 @@ fn voices(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, rest: &str) ->
 /// `keep: false` (and always in incognito), hand it back instead: the voice
 /// and its sample clip, for the caller to keep and send with each request
 /// (`voice` as that object), with nothing left here.
-fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path) -> Result<Reply, Reply> {
+fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path, caller: Option<&TcpStream>) -> Result<Reply, Reply> {
     let body = parse_body(req)?;
     let incognito = incognito_mode(studio) || incognito_header(req) || body.get("incognito").and_then(Json::as_bool) == Some(true);
     let keep = match body.get("keep").and_then(Json::as_bool) {
@@ -1073,7 +1088,7 @@ fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path) -> R
     let cfg = studio.config();
     let (request, model, label) = crate::media::speech::voice_request(&cfg, &studio.root, &media::day_dir(&studio.output_root(), "voices"), &body).map_err(|e| fail(400, e))?;
     let job = studio.media.submit(Kind::Speech, request, model, format!("voice: {label}"), 1, 0.0, keep_jobs(&cfg), None);
-    let done = studio.media.wait(&job.id, SPEECH_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
+    let done = wait_for_caller(studio, &job.id, SPEECH_WAIT, caller).ok_or_else(|| fail(500, "the job disappeared"))?;
     if done.status != "completed" {
         return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.unwrap_or_else(|| format!("voice job {}", done.status))));
     }
@@ -1118,7 +1133,7 @@ fn wait_for_caller(studio: &Studio, id: &str, limit: Duration, caller: Option<&T
         }
         if caller_gone(caller) {
             studio.media.cancel(id);
-            studio.log.push(format!("image job {id} cancelled: its caller hung up"));
+            studio.log.push(format!("{} job {id} cancelled: its caller hung up", job.kind.name()));
             return studio.media.wait(id, Duration::from_secs(30));
         }
     }
@@ -2135,7 +2150,10 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", 0)))
         self.whole({"choices": [{"index": 0, "message": {"role": "assistant", "content": "from this computer"}}]})
-http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+server = http.server.HTTPServer(("127.0.0.1", port), H)
+# (as oaiy-llm-server says it once it serves: the studio takes it as ready only after hearing so from it)
+sys.stderr.write("oaiy-llm-server: serving m at http://127.0.0.1:%d/v1\n" % port); sys.stderr.flush()
+server.serve_forever()
 "#;
 
     /// Pictures on this computer's GPU with no language model there running share one kept worker; the language model

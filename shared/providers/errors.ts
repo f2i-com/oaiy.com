@@ -9,6 +9,7 @@
  * "Failed to fetch" (design 4.2, step 4), told apart, and the redaction that keeps a provider's own error text from
  * carrying a key back to a page.
  */
+import { isLocalHostname, isLoopbackHostname, isPrivateNetworkHostname } from '../capabilities/local';
 import { CLOUD_BASE, LOCAL_SERVERS } from './endpoints';
 import type { LocalServerKind, ProviderType } from './types';
 
@@ -74,45 +75,32 @@ function originOf(url: string): string {
   }
 }
 
-/** Whether a hostname is this computer — the one plain-http target an https page may call. */
+/** Whether a hostname is this computer — the one plain-http target an https page may call. (The rule is shared/capabilities/local.ts's.) */
 export function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  return host === 'localhost' || host.endsWith('.localhost') || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host);
+  return isLoopbackHostname(hostname);
 }
 
 /**
  * Whether a hostname is one whose traffic stays on this computer or this network, so that a key sent to it over plain http is not sent across
  * the internet: this computer (`localhost`, 127/8, ::1), the private ranges (10/8, 172.16/12, 192.168/16), link-local addresses
- * (169.254/16, fe80::/10), IPv6 unique-local addresses (fc00::/7), and a name ending `.local` (mDNS). Nothing else: not 100.64/10 (which
- * is shared address space, not a person's own network), not a single-label name, and not a name that only STARTS with an address
- * (`192.168.1.5.evil.example`). `hostname` is what `new URL(...).hostname` says, which is where an address written as a number, in hex or
- * in octal (`http://3232235781/`) has already been read as the dotted address it is.
+ * (169.254/16, fe80::/10), IPv6 unique-local addresses (fc00::/7), any of them written as IPv6 (`::ffff:192.168.1.5`), and a name only
+ * this network resolves (`.local`, `.lan`, `.internal`, `.home.arpa`). Nothing else: not 100.64/10 (which is shared address space, not a
+ * person's own network), not a single-label name, not an IPv4 address a translator or a tunnel carries (NAT64, 6to4, Teredo), and not a
+ * name that only STARTS with an address (`192.168.1.5.evil.example`). `hostname` is what `new URL(...).hostname` says, which is where an
+ * address written as a number, in hex or in octal (`http://3232235781/`) has already been read as the dotted address it is. The rule is
+ * shared/capabilities/local.ts's (isPrivateNetworkHostname), beside the wider one of what a page may not reach.
  */
 export function isPrivateNetworkHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (isLoopbackHost(host) || host.endsWith('.local')) return true;
-  const v4 = (a: number, b: number): boolean => a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 127;
-  const dotted = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
-  if (dotted) return v4(Number(dotted[1]), Number(dotted[2]));
-  if (!host.includes(':')) return false;
-  // An IPv4 address written into an IPv6 one (::ffff:192.168.1.5, which a URL reads as ::ffff:c0a8:105) is the IPv4 address.
-  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
-  if (mapped) {
-    const high = parseInt(mapped[1], 16);
-    return v4(high >> 8, high & 0xff);
-  }
-  return /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host);
+  return isPrivateNetworkHostname(hostname);
 }
 
-/** Whether the address is one on this computer or this network (where a browser may ask for a permission the person can give). */
+/**
+ * Whether the address is one on this computer or this network (where a browser may ask for a permission the person can give): the
+ * same rule a page's guard keeps to (shared/capabilities/local.ts's isLocalHostname), IPv6 and the names only a network resolves too.
+ */
 export function isLocalAddress(url: string): boolean {
   try {
-    const host = new URL(url).hostname.replace(/^\[|\]$/g, '');
-    if (isLoopbackHost(host) || host.endsWith('.local')) return true;
-    const m = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
-    if (!m) return false;
-    const [a, b] = [Number(m[1]), Number(m[2])];
-    return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+    return isLocalHostname(new URL(url).hostname);
   } catch {
     return false;
   }

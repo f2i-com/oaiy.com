@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device};
 use oaiy_voice::audio;
@@ -42,6 +42,9 @@ fn roomiest_gpu() -> Option<(usize, u64)> {
     free_by_smi().and_then(|rows| rows.into_iter().max_by_key(|&(_, free)| free))
 }
 
+/// How long nvidia-smi is given: a driver that hangs (a card lost, a driver mid-update) held the start for good.
+const SMI_WITHIN: Duration = Duration::from_secs(5);
+
 /// Free memory per GPU, from nvidia-smi (in its order, the PCI bus's).
 fn free_by_smi() -> Option<Vec<(usize, u64)>> {
     let mut command = std::process::Command::new("nvidia-smi");
@@ -51,12 +54,40 @@ fn free_by_smi() -> Option<Vec<(usize, u64)>> {
         // No console window for the child.
         command.creation_flags(0x0800_0000);
     }
-    let out = command.args(["--query-gpu=index,memory.free", "--format=csv,noheader,nounits"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let rows = parse_free(&String::from_utf8_lossy(&out.stdout));
+    command.args(["--query-gpu=index,memory.free", "--format=csv,noheader,nounits"]);
+    let out = output_within(&mut command, SMI_WITHIN)?;
+    let rows = parse_free(&out);
     (!rows.is_empty()).then_some(rows)
+}
+
+/// What a program prints, where it ends well within `within`; one that does not is ended (and nothing is had of it).
+fn output_within(command: &mut std::process::Command, within: Duration) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // (read beside the wait, so a program that prints more than a pipe holds is not stopped by it)
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let until = Instant::now() + within;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+            _ => break None,
+        }
+    };
+    let Some(status) = status else {
+        eprintln!("[oaiy-voice] nvidia-smi did not answer within {} s: the first GPU is used", within.as_secs());
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let text = reader.join().ok()?;
+    status.success().then_some(text)
 }
 
 /// `index, free MiB` lines, as bytes.
@@ -121,7 +152,7 @@ fn load(path: &Path, precision: Precision) -> Result<Transcriber, String> {
     Ok(t)
 }
 
-fn serve(args: Args) -> Result<(), String> {
+fn serve(args: Args, key: Option<String>) -> Result<(), String> {
     let (stt, id, device) = if args.mode.stt() {
         let path = args.stt_model.clone().ok_or("no speech-to-text model: pass --stt-model-dir (a Parakeet .nemo, a model.safetensors or a folder holding one)")?;
         let t = load(&args.find_model(&path), args.dtype)?;
@@ -134,12 +165,13 @@ fn serve(args: Args) -> Result<(), String> {
     let tts = if args.mode.tts() {
         let path = args.tts_model.clone().ok_or("no text-to-speech model: pass --tts-model-dir (a Qwen3-TTS Base folder)")?;
         let gpu = pick_gpu(args.device).ok_or("text-to-speech runs on a GPU, through WebGPU: --device cpu leaves it none (--mode stt is speech-to-text alone)")?;
-        // A voice clip with nothing written beside it is heard by this server's own ears.
+        // A voice clip with nothing written beside it is heard by this server's own ears (resampled before they are
+        // waited on).
         let transcribe = stt.clone().map(|stt| {
+            let at = stt.lock().unwrap_or_else(|p| p.into_inner()).sample_rate();
             Arc::new(move |samples: &[f32], rate: usize| {
-                let mut stt = stt.lock().unwrap_or_else(|p| p.into_inner());
-                let at = stt.sample_rate();
-                stt.transcribe(&audio::resample(samples, rate, at))
+                let samples = audio::resample(samples, rate, at);
+                stt.lock().unwrap_or_else(|p| p.into_inner()).transcribe(&samples)
             }) as Transcribe
         });
         let voices = Voices { dir: args.voices_dir.clone(), default: args.voice.clone() };
@@ -149,7 +181,27 @@ fn serve(args: Args) -> Result<(), String> {
     } else {
         None
     };
-    server::run(Server::new(args.mode, stt, id, device, tts), &args.host, args.port)
+    server::run(Server::new(args.mode, stt, id, device, tts).with_key(key), &args.host, args.port)
+}
+
+/// The key requests must carry, from `OAIY_VOICE_API_KEY` (out of sight of other users' `ps`, as a flag would not be),
+/// taken out of the environment so the programs this one starts (FFmpeg) are not handed it. Read first thing, before
+/// any thread runs.
+fn api_key() -> Option<String> {
+    let key = std::env::var("OAIY_VOICE_API_KEY").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    std::env::remove_var("OAIY_VOICE_API_KEY");
+    key
+}
+
+/// `--watch-stdin`: the server ends when stdin reaches its end (its supervisor, which holds the other end, has gone).
+fn watch_stdin() {
+    std::thread::spawn(|| {
+        let mut sink = [0u8; 256];
+        let mut stdin = std::io::stdin();
+        while std::io::Read::read(&mut stdin, &mut sink).is_ok_and(|n| n > 0) {}
+        eprintln!("[oaiy-voice] stdin closed: its supervisor has gone, so the server ends");
+        std::process::exit(0);
+    });
 }
 
 /// `transcribe --model PATH [--device D] [--dtype T] [--repeat N] FILE...`
@@ -207,11 +259,17 @@ fn main() {
     if std::env::var_os("CUDA_DEVICE_ORDER").is_none() {
         std::env::set_var("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
     }
+    let key = api_key();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = if argv.first().is_some_and(|a| a == "transcribe") {
         transcribe(argv.into_iter().skip(1).collect())
     } else {
-        cli::parse(argv).and_then(serve)
+        cli::parse(argv).and_then(|args| {
+            if args.watch_stdin {
+                watch_stdin();
+            }
+            serve(args, key)
+        })
     };
     if let Err(e) = result {
         eprintln!("[oaiy-voice] {e}");

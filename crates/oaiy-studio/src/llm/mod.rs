@@ -68,6 +68,30 @@ struct Inner {
     /// The context the loaded model was opened with, as oaiy-llm-server reported it.
     context: Option<i64>,
     command: String,
+    /// The log's last line before this start ([`LogRing::latest`]): what the process says after it is its own.
+    log_from: u64,
+    /// Requests being answered now ([`Llm::hold`]): never stopped for being idle under one.
+    held: usize,
+    /// Failures one after another (none since it was last ready), and when the last was: a request does not start a
+    /// server that failed again at once ([`retry_after`]).
+    failures: u32,
+    failed_at: Option<Instant>,
+}
+
+/// How long after a failure a request starts a server again: 5 s, doubled with each failure after it, at most 2 min.
+/// A model that cannot load (a missing file, too little memory) was loaded again for every request, each one holding
+/// the GPU and the request for the length of a load. A start asked for by name (the page's Start, a change of
+/// settings) is not held back.
+fn retry_after(failures: u32) -> Duration {
+    Duration::from_secs(5u64.saturating_mul(1 << failures.saturating_sub(1).min(5))).min(Duration::from_secs(120))
+}
+
+/// What oaiy-llm-server says once it serves, at the address it was given ("serving m at http://127.0.0.1:PORT/v1"):
+/// heard from its own output, it is that process that holds the port. The port is chosen by binding one and letting
+/// it go, and a program that took it meanwhile could answer `/health` in its place, and be sent the key and the
+/// prompts.
+fn serving_line(addr: &str) -> String {
+    format!(" at http://{addr}/v1")
 }
 
 /// One way to start the server: the program and its `--backend`.
@@ -122,10 +146,24 @@ pub fn auto_webgpu_gb(gpus: &Json, llm: &Json) -> Option<i64> {
 
 pub struct Llm {
     inner: Mutex<Inner>,
+    /// Held while a stopped server is killed and waited for, and by a start: a server is not started while the one it
+    /// replaces still holds its memory, and the state is not held meanwhile (the page's status, a request asking).
+    reap: Mutex<()>,
     changed: Condvar,
     pub log: Arc<LogRing>,
     /// Called before the server starts, whatever starts it ([`Llm::before_start`]).
     before_start: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// A request's hold on the server ([`Llm::hold`]).
+pub struct Held<'a>(&'a Llm);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.lock();
+        g.held = g.held.saturating_sub(1);
+        g.last_used = Instant::now();
+    }
 }
 
 /// Where a running server can be reached.
@@ -318,7 +356,12 @@ impl Llm {
                 resident: None,
                 context: None,
                 command: String::new(),
+                log_from: 0,
+                held: 0,
+                failures: 0,
+                failed_at: None,
             }),
+            reap: Mutex::new(()),
             changed: Condvar::new(),
             log: Arc::new(LogRing::new(2000)),
             before_start: Mutex::new(None),
@@ -345,6 +388,13 @@ impl Llm {
 
     pub fn touch(&self) {
         self.lock().last_used = Instant::now();
+    }
+
+    /// A request being answered: the server is not stopped for being idle while it is (a long reply updates nothing
+    /// until it ends), and is used as of when it ends.
+    pub fn hold(&self) -> Held<'_> {
+        self.lock().held += 1;
+        Held(self)
     }
 
     pub fn idle_for(&self) -> Duration {
@@ -396,6 +446,9 @@ impl Llm {
             f();
         }
         let mut plan = launches(llm, root);
+        // (the GPUs asked before the lock is taken: nvidia-smi can take seconds, and the page's status waited on it)
+        let webgpu_gb = llm.get("webgpu_gb").and_then(Json::as_i64).filter(|n| *n > 0).or_else(|| auto_webgpu_gb(&crate::system::System::new().gpus(), llm));
+        let _reap = self.reap.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
         if matches!(g.state, State::Starting | State::Ready) {
             return Ok(());
@@ -405,7 +458,6 @@ impl Llm {
         let gateway_host = cfg.get("gateway").map_or("127.0.0.1", |g| str_or(g, "host", "127.0.0.1"));
         let loopback = gateway_host == "localhost" || gateway_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
         let (mut args, names) = arguments_for(llm, root, port, loopback, first)?;
-        let webgpu_gb = llm.get("webgpu_gb").and_then(Json::as_i64).filter(|n| *n > 0).or_else(|| auto_webgpu_gb(&crate::system::System::new().gpus(), llm));
         if let Some(gb) = webgpu_gb {
             args.push("--webgpu-gb".into());
             args.push(gb.to_string());
@@ -415,11 +467,14 @@ impl Llm {
             args.push("--incognito".into());
         }
         let mut errors = Vec::new();
+        g.log_from = self.log.latest();
         let mut child = loop {
             if plan.is_empty() {
                 let msg = format!("could not start the LLM server: {} (build oaiy-llm-server or oaiy-llm-server-webgpu, or set llm.server)", errors.join("; "));
                 g.state = State::Failed;
                 g.error = Some(msg.clone());
+                g.failures += 1;
+                g.failed_at = Some(Instant::now());
                 self.changed.notify_all();
                 return Err(msg);
             }
@@ -467,8 +522,12 @@ impl Llm {
         for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)].into_iter().flatten() {
             let log = Arc::clone(&self.log);
             std::thread::spawn(move || {
-                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                    log.push(line);
+                // Bytes, not text: a line that is not UTF-8 (a driver's, a path's) must not end the reading, or the
+                // pipe fills and the server blocks on its next word. A line with no end is passed on in pieces.
+                let (mut reader, mut line) = (BufReader::new(pipe), Vec::new());
+                while reader.by_ref().take(16 << 10).read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                    log.push(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string());
+                    line.clear();
                 }
             });
         }
@@ -480,7 +539,7 @@ impl Llm {
     fn watch(self: Arc<Self>, generation: u64) {
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            let (addr, ready) = {
+            let (addr, ready, from) = {
                 let mut g = self.lock();
                 if g.generation != generation {
                     return;
@@ -490,22 +549,26 @@ impl Llm {
                     g.child = None;
                     g.lifeline = None;
                     g.state = State::Failed;
+                    g.failures += 1;
+                    g.failed_at = Some(Instant::now());
                     let tail = self.log.tail(12);
                     g.error = Some(format!("oaiy-llm-server exited ({status}):\n{tail}"));
                     self.log.push(format!("studio: oaiy-llm-server exited ({status})"));
                     self.changed.notify_all();
                     return;
                 }
-                (g.addr.clone(), g.state == State::Ready)
+                (g.addr.clone(), g.state == State::Ready, g.log_from)
             };
             if ready {
                 continue;
             }
-            let ok = oaiy_engine::http::fetch(&addr, "GET", "/health", &[], b"", Duration::from_secs(2)).is_ok_and(|r| r.status == 200);
+            // (its own word that it serves at this address first, then `/health`: see `serving_line`)
+            let ok = self.log.said_since(from, &serving_line(&addr)) && oaiy_engine::http::fetch(&addr, "GET", "/health", &[], b"", Duration::from_secs(2)).is_ok_and(|r| r.status == 200);
             if ok {
                 let mut g = self.lock();
                 if g.generation == generation && g.state == State::Starting {
                     g.state = State::Ready;
+                    g.failures = 0;
                     g.ready_after = g.started.map(|s| s.elapsed().as_secs_f64());
                     g.context = self.loaded_context();
                     self.log.push(format!("studio: oaiy-llm-server ready in {:.1}s", g.ready_after.unwrap_or(0.0)));
@@ -516,19 +579,48 @@ impl Llm {
     }
 
     pub fn stop(&self) {
-        let mut g = self.lock();
+        let _reap = self.reap.lock().unwrap_or_else(|p| p.into_inner());
+        let child = Self::halt(&mut self.lock());
+        self.changed.notify_all();
+        self.end(child);
+    }
+
+    /// Stop the server where it has answered nothing for `idle` and `busy` says nothing holds it (a chat's lease):
+    /// both asked under the state's lock, so a request that takes it meanwhile finds the server stopped and starts it
+    /// again, rather than having it killed under its reply. Whether it was stopped.
+    pub fn stop_if_idle(&self, idle: Duration, busy: impl FnOnce() -> bool) -> bool {
+        let _reap = self.reap.lock().unwrap_or_else(|p| p.into_inner());
+        let child = {
+            let mut g = self.lock();
+            if g.state != State::Ready || g.held > 0 || g.last_used.elapsed() <= idle || busy() {
+                return false;
+            }
+            Self::halt(&mut g)
+        };
+        self.changed.notify_all();
+        self.end(child);
+        true
+    }
+
+    /// Stopped, as the state says: its process handed back to be ended ([`Self::end`]) without the lock held.
+    fn halt(g: &mut Inner) -> Option<Child> {
         g.generation += 1;
         g.lifeline = None;
-        if let Some(mut child) = g.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-            self.log.push("studio: oaiy-llm-server stopped");
-        }
         g.state = State::Stopped;
         g.error = None;
         g.ready_after = None;
         g.resident = None;
-        self.changed.notify_all();
+        g.child.take()
+    }
+
+    /// A stopped server's process killed and waited for, the reaping lock held (no start meanwhile) but not the
+    /// state's: a process slow to die (a driver letting go of a card) held every status and request with it.
+    fn end(&self, child: Option<Child>) {
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.log.push("studio: oaiy-llm-server stopped");
+        }
     }
 
     /// The model the running server holds (None when it is not running).
@@ -545,6 +637,15 @@ impl Llm {
     /// Start if needed and wait until it serves (or fails, or `timeout` passes). A server started here loads
     /// `first`, the model the request names, as it starts.
     pub fn ensure_ready(self: &Arc<Self>, cfg: &Json, root: &Path, first: Option<&str>, timeout: Duration) -> Result<Endpoint, String> {
+        let held_back = {
+            let g = self.lock();
+            let wait = retry_after(g.failures);
+            (g.state == State::Failed).then_some(g.failed_at).flatten().map(|at| at.elapsed()).filter(|&since| since < wait).map(|since| (wait - since, g.error.clone()))
+        };
+        if let Some((left, error)) = held_back {
+            let error = error.unwrap_or_else(|| "oaiy-llm-server failed".into());
+            return Err(format!("the language model failed just now, and is started again in {} s at the next request: {error}", left.as_millis().div_ceil(1000).max(1)));
+        }
         if matches!(self.state(), State::Stopped | State::Failed) {
             self.start_for(cfg, root, first)?;
         }
@@ -552,7 +653,12 @@ impl Llm {
         let mut g = self.lock();
         loop {
             match g.state {
-                State::Ready => return Ok(Endpoint { addr: g.addr.clone(), key: g.key.clone() }),
+                State::Ready => {
+                    // (used as of now, under the lock an idle stop asks under: it is not stopped before the request is
+                    // sent, nor while it is answered, which holds it: `hold`)
+                    g.last_used = Instant::now();
+                    return Ok(Endpoint { addr: g.addr.clone(), key: g.key.clone() });
+                }
                 State::Failed => return Err(g.error.clone().unwrap_or_else(|| "oaiy-llm-server failed".into())),
                 State::Stopped => return Err("the language model was stopped".into()),
                 State::Starting => {}
@@ -756,6 +862,50 @@ mod tests {
         let err = llm.ensure_ready(&cfg, &std::env::temp_dir(), None, Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("could not start the LLM server"), "{err}");
         assert_eq!(llm.state(), State::Failed);
+        // asked again at once: not started again for each request, but said when it will be
+        let again = llm.ensure_ready(&cfg, &std::env::temp_dir(), None, Duration::from_secs(5)).unwrap_err();
+        assert!(again.contains("started again in 5 s") && again.contains("could not start the LLM server"), "{again}");
+        assert_eq!(llm.lock().failures, 1, "no second start");
+        // a start asked for by name is not held back
+        assert!(llm.start(&cfg, &std::env::temp_dir()).is_err());
+        assert_eq!(llm.lock().failures, 2);
+    }
+
+    #[test]
+    fn a_failed_server_is_tried_again_later_each_time_up_to_two_minutes() {
+        assert_eq!([1, 2, 3, 4, 6, 7, 40].map(|n| retry_after(n).as_secs()), [5, 10, 20, 40, 120, 120, 120]);
+    }
+
+    /// An idle server is stopped only where nothing holds it: a request being answered, or one the caller says (a
+    /// chat's lease), asked under the lock with the stop.
+    #[test]
+    fn an_idle_server_is_not_stopped_under_a_request() {
+        let llm = Llm::new();
+        llm.adopt("127.0.0.1:9", "k");
+        llm.lock().last_used = Instant::now() - Duration::from_secs(600);
+        let held = llm.hold();
+        assert!(!llm.stop_if_idle(Duration::from_secs(60), || false), "held by a request");
+        drop(held);
+        assert!(!llm.stop_if_idle(Duration::from_secs(60), || false), "used as of the request's end");
+        llm.lock().last_used = Instant::now() - Duration::from_secs(600);
+        assert!(!llm.stop_if_idle(Duration::from_secs(60), || true), "a chat's lease");
+        assert!(llm.stop_if_idle(Duration::from_secs(60), || false));
+        assert_eq!(llm.state(), State::Stopped);
+    }
+
+    /// A server is taken as ready only once its own output says it serves at its address: another program on the port
+    /// chosen for it, answering `/health`, is not it.
+    #[test]
+    fn readiness_is_heard_from_the_servers_own_output() {
+        let log = LogRing::new(10);
+        log.push("oaiy-llm-server: serving m at http://127.0.0.1:4100/v1");
+        let from = log.latest();
+        assert!(!log.said_since(from, &serving_line("127.0.0.1:4100")), "a line from before this start");
+        log.push("oaiy-llm-server: loading m");
+        log.push("oaiy-llm-server: serving m at http://127.0.0.1:41000/v1");
+        assert!(!log.said_since(from, &serving_line("127.0.0.1:4100")), "another port");
+        log.push("oaiy-llm-server: serving m at http://127.0.0.1:4100/v1");
+        assert!(log.said_since(from, &serving_line("127.0.0.1:4100")));
     }
 
     #[test]

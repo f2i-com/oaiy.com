@@ -3,7 +3,8 @@
  *
  * Two inputs, both known here: the browser's own account of the device (navigator.userAgentData,
  * or the user agent string where there is none) and the release the site was built for. The
- * installers' file names carry the release's version (`oaiy-desktop-<version>-windows-x64-setup.exe`),
+ * installers' file names carry the release's version (`oaiy-desktop-<version>-windows-x64-setup.exe`,
+ * `oaiy-desktop-<version>-macos-arm64.dmg`),
  * so the links are made when the site is built, from the tag the release was pushed as
  * (VITE_OAIY_RELEASE_TAG, which the release workflow's web job sets to `github.ref_name`), and the
  * site is built again for every release. The tag is `0.1.0` or `v0.1.0` (the workflow takes both, and
@@ -29,7 +30,7 @@ export type Arch = 'x64' | 'arm' | 'x86' | 'unknown';
 
 export interface Device {
   os: OsFamily;
-  /** The files are built for 64-bit Intel or AMD ('x64') alone, on Windows and on Linux. */
+  /** The files are built for 64-bit Intel or AMD ('x64') alone on Windows and on Linux, and for Apple silicon ('arm') on a Mac. */
   arch: Arch;
 }
 
@@ -42,6 +43,11 @@ export interface DeviceInput {
   maxTouchPoints?: number;
   /** navigator.userAgentData.mobile. */
   mobile?: boolean;
+  /**
+   * matchMedia('(any-pointer: fine)').matches: whether there is a mouse or a touchpad. A laptop with a touch screen has one as well,
+   * a phone or a tablet has none. Unknown (undefined), a touch screen alone says nothing.
+   */
+  finePointer?: boolean;
 }
 
 function archOf(ua: string): Arch {
@@ -58,9 +64,11 @@ export function detectDevice(input: DeviceInput = {}): Device {
   const arch = archOf(ua);
   const touch = (input.maxTouchPoints ?? 0) > 1;
   const platform = (input.uaPlatform ?? '').toLowerCase();
-  // Linux with a touch screen, or a browser that says it is on a phone, is a phone or a tablet: Chrome on Android
-  // that is asked for the desktop site says "Linux x86_64" and still reports its touch points.
-  const linux = (): Device => ({ os: touch || input.mobile === true ? 'android' : 'linux', arch });
+  // A browser that says it is on a phone, or Linux with a touch screen and no mouse or touchpad, is a phone or a tablet:
+  // Chrome on Android that is asked for the desktop site says "Linux x86_64" and still reports its touch points. A touch
+  // screen alone is not enough: a laptop running Linux may have one, beside its touchpad. (Chrome on Android asked for the
+  // desktop site, where nothing else tells, is still told apart once the browser says its processor is ARM: refineDevice.)
+  const linux = (): Device => ({ os: input.mobile === true || (touch && input.finePointer === false) ? 'android' : 'linux', arch });
 
   // The browser's own word, where it gives one: a user agent string can say anything.
   if (platform === 'windows') return { os: 'windows', arch };
@@ -159,6 +167,15 @@ export function assetNames(version: string) {
   } as const;
 }
 
+/**
+ * The Mac's disk image, for Apple silicon (no Intel Mac build is made). It is not one of release.yml's files: the Mac build
+ * (.github/workflows/mac-build.yml, `gh release upload`) adds it to a release once the release is published and Apple has
+ * notarised the image, as it has for every release from 0.1.3 on; a release just published may not have it for a while.
+ */
+export function macAssetName(version: string): string {
+  return `oaiy-desktop-${version}-macos-arm64.dmg`;
+}
+
 export interface DownloadLink {
   label: string;
   href: string;
@@ -193,8 +210,14 @@ export const UNSIGNED_NOTE = 'Not code-signed yet, so Windows will warn you.';
  */
 export const LINUX_NOTE = 'Linux is newer and less tested than Windows.';
 
+/** The Mac's disk image is built for Apple silicon alone. */
+export const MAC_NOTE = 'For Macs with Apple silicon (M1 or later).';
+
 /** The sentence for a device OAIY Desktop is not built for. */
-export const NOT_FOR_THIS_DEVICE = 'OAIY Desktop is for Windows and Linux. The web app works in your browser.';
+export const NOT_FOR_THIS_DEVICE = 'OAIY Desktop is for Windows, Linux and Mac. The web app works in your browser.';
+
+/** The sentence for a Mac the browser says has an Intel processor. */
+export const INTEL_MAC_NOTE = 'OAIY Desktop for Mac needs Apple silicon (M1 or later), and this looks like an Intel Mac. The web app works in your browser.';
 
 /** What to offer the person on `device`, for a site built for the release `tag` names. */
 export function downloadPlan(device: Device, tag?: unknown): DownloadPlan {
@@ -231,10 +254,19 @@ export function downloadPlan(device: Device, tag?: unknown): DownloadPlan {
       note,
     );
   }
-  if (device.os === 'mac' || device.os === 'ios' || device.os === 'android') return plan(null, [], NOT_FOR_THIS_DEVICE);
+  if (device.os === 'ios' || device.os === 'android') return plan(null, [], NOT_FOR_THIS_DEVICE);
+
+  // A Mac: the disk image is for Apple silicon. Every Mac's user agent says "Intel Mac OS X", so only the browser's answer
+  // about its processor (refineDevice; Chrome and Edge give one) tells an Intel Mac, which is not offered a button; a Mac
+  // that cannot be told (Safari, Firefox) is offered the image, and told what it is for.
+  if (device.os === 'mac') {
+    if (device.arch === 'x64' || device.arch === 'x86') return plan(null, release ? [link('Mac disk image (.dmg), Apple silicon', macAssetName(release.version))] : [], INTEL_MAC_NOTE);
+    if (!release) return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], null, MAC_NOTE);
+    return plan(link('Download OAIY Desktop for Mac', macAssetName(release.version)), [], null, `Version ${release.version}. ${MAC_NOTE}`);
+  }
 
   // Not a device the page can tell: the release's own page lists what there is.
-  if (device.os === 'other') return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], 'The files are for Windows and Linux.');
+  if (device.os === 'other') return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], 'The files are for Windows, Linux and Mac.');
 
   // A local build: one button to the latest release.
   if (!release) return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], null, device.os === 'windows' ? UNSIGNED_NOTE : LINUX_NOTE);

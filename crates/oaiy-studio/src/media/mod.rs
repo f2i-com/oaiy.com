@@ -235,8 +235,12 @@ struct Broker {
 struct Serving {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
-    /// Its answers (standard output's lines) and its events (standard error's), as they come; `None` once both end.
-    said: std::sync::mpsc::Receiver<Said>,
+    /// Its answers (standard output's lines) and its events (standard error's), as they come. Taken by the job it is
+    /// doing for as long as it does it ([`Media::serve_job`]), which holds none of this meanwhile: the view of what is
+    /// loaded, and a pin or an unpin, do not wait for a picture to be made.
+    said: Option<std::sync::mpsc::Receiver<Said>>,
+    /// Doing a job: one making a picture is let go after it ([`Media::let_go_local`]), and is the job's to see end.
+    busy: bool,
     /// The program and the card's socket it was started for (`local` for this computer's GPU).
     key: String,
     /// It is on this computer's GPU, not the eGPU's card.
@@ -253,6 +257,40 @@ enum Said {
     Answer(String),
     Event(String),
     Gone,
+}
+
+/// The longest answer a worker gives (a line of standard output, or a worker's whole output): past it, it is read on
+/// and let go.
+const ANSWER_LIMIT: u64 = 8 << 20;
+/// The longest event line (standard error's) passed on whole: a longer one, a progress bar redrawn in place, comes in
+/// pieces.
+const EVENT_LIMIT: u64 = 64 << 10;
+
+/// Each line of a worker's pipe to `each`, as it comes, until the pipe ends. Read as bytes, a line that is not UTF-8 (a
+/// driver's, a progress bar's) passed on as near as it can be: read as text, the first such line ended the reading,
+/// the pipe filled, and the worker waited on its next word for ever. A line longer than `longest` comes in pieces; once
+/// `each` wants no more (its listener gone) the rest is read and let go, for the same reason.
+fn each_line(pipe: impl Read, longest: u64, mut each: impl FnMut(String) -> bool) {
+    let (mut reader, mut line, mut listening) = (BufReader::new(pipe), Vec::new(), true);
+    while reader.by_ref().take(longest).read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+        if listening {
+            listening = each(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string());
+        }
+        line.clear();
+    }
+}
+
+/// What a kept worker said since it was last heard, let go: whether its answers still come (false once its standard
+/// output has ended, or where they are not to be had).
+fn drain(said: Option<&std::sync::mpsc::Receiver<Said>>) -> bool {
+    let Some(said) = said else { return false };
+    loop {
+        match said.try_recv() {
+            Ok(Said::Gone) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+        }
+    }
 }
 
 /// The media jobs that may wait in the queue: past it a request is refused (`503`, try again), not queued.
@@ -1381,7 +1419,7 @@ impl Media {
     /// job holds it, so it is not waited for here).
     pub(crate) fn reap_ended(&self) {
         let ended = match self.serving.try_lock() {
-            Ok(mut slot) => slot.as_mut().is_some_and(|s| !matches!(s.child.try_wait(), Ok(None))),
+            Ok(mut slot) => slot.as_mut().is_some_and(|s| !s.busy && !matches!(s.child.try_wait(), Ok(None))),
             Err(_) => false,
         };
         if ended {
@@ -1831,7 +1869,7 @@ impl Media {
         }
         if on_card(&cfg, job.kind, &job.request) && takes_card(job.kind, studio.egpu.is_lent(), studio.egpu.is_running()) && !job.cancel.load(Ordering::Relaxed) {
             let label = if job.incognito { "incognito job" } else { job.id.as_str() };
-            match studio.egpu.lend(&cfg, &studio.root, CARD_WAIT) {
+            match studio.egpu.lend_unless(&cfg, &studio.root, CARD_WAIT, &job.cancel) {
                 Ok(socket) => {
                     self.update(&job.id, |j| {
                         j.device = Some("egpu".into());
@@ -1870,6 +1908,8 @@ impl Media {
                         }
                     }
                 }
+                // (cancelled while it waited for the card: not made here instead)
+                Err(e) if job.cancel.load(Ordering::Relaxed) => return Err(e),
                 Err(e) if !falls_back_here(&cfg) => return Err(format!("the eGPU is not free for it: {e}")),
                 Err(e) => self.log.push(format!("{label}: the eGPU is not free for it ({e}); this computer makes it")),
             }
@@ -1881,16 +1921,23 @@ impl Media {
             // not forever. Chats on other GPUs carry on.
             b.waiting_media = true;
             let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
-            while b.chats > 0 {
+            // (and the job's cancel heard meanwhile, each half second: a job cancelled as it waited went on to stop
+            // the language model once the chats were done, and only then was told)
+            while b.chats > 0 && !job.cancel.load(Ordering::Relaxed) {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
                     self.log.push("chat requests still running after 10 minutes; starting the media job anyway");
                     break;
                 }
-                b = self.broker_changed.wait_timeout(b, left).unwrap_or_else(|p| p.into_inner()).0;
+                b = self.broker_changed.wait_timeout(b, left.min(Duration::from_millis(500))).unwrap_or_else(|p| p.into_inner()).0;
+            }
+            b.waiting_media = false;
+            if job.cancel.load(Ordering::Relaxed) {
+                // (nothing stopped for it, and the chats held back by its wait let go)
+                self.broker_changed.notify_all();
+                return Err("cancelled".into());
             }
             b.media = true;
-            b.waiting_media = false;
         }
         // The LLM stops only when the model it holds shares the media GPU.
         let pause = needs_media_gpu(&cfg, studio.llm.resident().as_deref());
@@ -1941,7 +1988,7 @@ impl Media {
         // is locked: `pins::tend` locks the pins and then the jobs, and the runner the jobs and then the kept worker)
         let pinned: Vec<String> = self.pins.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect();
         let waiting = match self.serving.try_lock() {
-            Ok(slot) => slot.as_ref().is_some_and(|s| s.local && !s.models.iter().any(|(_, m)| pinned.contains(m))),
+            Ok(slot) => slot.as_ref().is_some_and(|s| s.local && !s.busy && !s.models.iter().any(|(_, m)| pinned.contains(m))),
             Err(_) => false,
         };
         if waiting {
@@ -1953,7 +2000,12 @@ impl Media {
     /// The kept worker let go: its standard input closed (it ends, its memory on the card freed), and killed past a wait
     /// (`now`: killed at once, a job it is doing cancelled).
     pub(crate) fn end_serving(&self, now: bool, why: &str) {
-        let Some(mut s) = self.serving.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+        let Some(s) = self.serving.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+        self.end_worker(s, now, why);
+    }
+
+    /// [`Self::end_serving`] for a kept worker already taken from its place.
+    fn end_worker(&self, mut s: Serving, now: bool, why: &str) {
         for (_, model) in &s.models {
             crate::resources::event("unload", model, &s.device, why);
         }
@@ -1993,9 +2045,19 @@ impl Media {
         if let Some(held) = held {
             return Err(Self::held_by_pin(&held, job));
         }
-        if slot.as_mut().is_some_and(|s| s.key != key || !matches!(s.child.try_wait(), Ok(None))) {
+        // (what the worker said since its last answer let go unread: its last job's events after the answer, or its own
+        // while it waited. Read as this job's, they set its progress or its error, and an incognito job's words came
+        // into the log under this one's name. Its answers ended: it has gone, and another is started)
+        let why = slot.as_mut().and_then(|s| {
+            if !drain(s.said.as_ref()) || !matches!(s.child.try_wait(), Ok(None)) {
+                Some("it had ended by itself")
+            } else {
+                (s.key != key).then_some("a worker for another program or GPU is needed")
+            }
+        });
+        if let Some(why) = why {
             drop(slot);
-            self.end_serving(false, "a worker for another program or GPU is needed");
+            self.end_serving(false, why);
             slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
         }
         if slot.is_none() {
@@ -2021,28 +2083,20 @@ impl Media {
             let (out, err) = (child.stdout.take().ok_or("worker stdout missing")?, child.stderr.take().ok_or("worker stderr missing")?);
             let (to_out, to_err) = (tx.clone(), tx);
             std::thread::spawn(move || {
-                for line in BufReader::new(out).lines().map_while(Result::ok) {
-                    if to_out.send(Said::Answer(line)).is_err() {
-                        return;
-                    }
-                }
+                each_line(out, ANSWER_LIMIT, |line| to_out.send(Said::Answer(line)).is_ok());
                 let _ = to_out.send(Said::Gone);
             });
-            std::thread::spawn(move || {
-                for line in BufReader::new(err).lines().map_while(Result::ok) {
-                    if to_err.send(Said::Event(line)).is_err() {
-                        return;
-                    }
-                }
-            });
+            std::thread::spawn(move || each_line(err, EVENT_LIMIT, |line| to_err.send(Said::Event(line)).is_ok()));
             let stdin = child.stdin.take().ok_or("worker stdin missing")?;
             self.log.push(format!("{label}: an image worker kept for {place} started ({})", program.display()));
             let device = if card.is_some() { "egpu".to_string() } else { format!("gpu{}", int_or(&job.request, "device", 0)) };
-            *slot = Some(Serving { child, stdin, said, key, local: card.is_none(), idle_since: std::time::Instant::now(), models: Vec::new(), device });
+            *slot = Some(Serving { child, stdin, said: Some(said), busy: false, key, local: card.is_none(), idle_since: std::time::Instant::now(), models: Vec::new(), device });
         }
         let s = slot.as_mut().expect("a kept worker");
         // (what the worker keeps once this job has loaded its model: see `kept_beside`)
         let family = str_or(&job.request, "architecture", "qwen-image").to_string();
+        // (a model it was not keeping, which this job loads: not counted as kept if the job fails)
+        let mut loads = false;
         if !s.models.iter().any(|(f, m)| *f == family && *m == job.model) {
             if let Some((_, held)) = s.models.iter().find(|(f, m)| wanted.contains(m) && !kept_beside(f, &family)) {
                 return Err(Self::held_by_pin(held, job));
@@ -2053,7 +2107,8 @@ impl Media {
             }
             crate::resources::event("load", &job.model, &s.device, if stay.is_empty() { "a picture, in the worker kept between pictures" } else { "a picture, in the kept worker beside the models it has" });
             s.models = stay;
-            s.models.push((family, job.model.clone()));
+            s.models.push((family.clone(), job.model.clone()));
+            loads = true;
         }
         if job.incognito {
             self.log.push(format!("incognito {} job on {place} (kept worker)", job.kind.name()));
@@ -2061,18 +2116,27 @@ impl Media {
             self.log.push(format!("{}: {} job on {place}, kept worker ({} {})", job.id, job.kind.name(), job.model, str_or(&job.request, "memory", "auto")));
         }
         let sent = writeln!(s.stdin, "{}", job.request.to_json()).and_then(|_| s.stdin.flush());
-        if let Err(e) = sent {
-            drop(slot);
-            self.end_serving(true, "the request could not be sent to it");
-            return Err(format!("sending the request to the kept worker: {e}"));
-        }
+        let said = match (sent, s.said.take()) {
+            (Ok(()), Some(said)) => said,
+            (sent, _) => {
+                drop(slot);
+                self.end_serving(true, "the request could not be sent to it");
+                return Err(format!("sending the request to the kept worker: {}", sent.err().map_or("its answers were not to be had".to_string(), |e| e.to_string())));
+            }
+        };
+        // The job's answer awaited without the kept worker's lock: it is still the kept one, busy, for the view of what
+        // is loaded and the pins to see, and let go by none but the studio stopping. Its pid tells it apart from a
+        // worker started in its place meanwhile (none is: the runner starts them, and is here).
+        s.busy = true;
+        let pid = s.child.id();
+        drop(slot);
         let (id, kind, n, incognito) = (job.id.clone(), job.kind, job.n, job.incognito);
         let mut last_error = None;
         let outcome = loop {
             if job.cancel.load(Ordering::Relaxed) {
                 break Err("cancelled".to_string());
             }
-            match s.said.recv_timeout(Duration::from_millis(200)) {
+            match said.recv_timeout(Duration::from_millis(200)) {
                 Ok(Said::Answer(line)) => break Ok(line),
                 Ok(Said::Event(line)) => {
                     if let Ok(e) = Json::parse(line.as_bytes()) {
@@ -2093,19 +2157,28 @@ impl Media {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
         };
+        let mut slot = self.serving.lock().unwrap_or_else(|p| p.into_inner());
+        let mine = slot.as_ref().is_some_and(|s| s.child.id() == pid);
         let line = match outcome {
             Ok(line) => line,
             Err(e) => {
                 // (a cancelled job, or a worker gone: it is let go at once, its memory with it)
+                let taken = if mine { slot.take() } else { None };
                 drop(slot);
-                self.end_serving(true, "it failed a job");
+                if let Some(s) = taken {
+                    self.end_worker(s, true, "it failed a job");
+                }
                 if !incognito && e != "cancelled" {
                     self.log.push(format!("{label}: the kept worker failed: {e}"));
                 }
                 return Err(e);
             }
         };
-        s.idle_since = std::time::Instant::now();
+        if let Some(s) = slot.as_mut().filter(|_| mine) {
+            s.said = Some(said);
+            s.busy = false;
+            s.idle_since = std::time::Instant::now();
+        }
         let result = Json::parse(line.as_bytes()).map_err(|e| format!("invalid worker result: {e}"))?;
         if let Some(e) = result.get("error").and_then(Json::as_str) {
             if !incognito {
@@ -2114,11 +2187,20 @@ impl Media {
             if gpu_fault(e) {
                 // (its device is lost or its results are not numbers: the next picture is given a new worker, as
                 // each job was before workers were kept)
+                let taken = if mine { slot.take() } else { None };
                 drop(slot);
-                self.end_serving(true, "it ended or failed");
+                if let Some(s) = taken {
+                    self.end_worker(s, true, "it ended or failed");
+                }
+            } else if let Some(s) = slot.as_mut().filter(|_| mine && loads) {
+                // (the model this job was to load is not said to be kept: it may never have loaded, and a pin of it, so
+                // counted, would never be loaded again)
+                s.models.retain(|(f, m)| !(*f == family && *m == job.model));
+                crate::resources::event("unload", &job.model, &s.device, "its picture failed: not counted as kept");
             }
             return Err(e.to_string());
         }
+        drop(slot);
         self.log.push(format!("{label}: done in {:.1}s", num_or(&result, "seconds", 0.0)));
         Ok(result)
     }
@@ -2158,16 +2240,20 @@ impl Media {
         }
         let stdout = child.stdout.take().ok_or("worker stdout missing")?;
         let stderr = child.stderr.take().ok_or("worker stderr missing")?;
+        // (an answer past the limit read on and let go, not left in the pipe: a worker writing into a full one waits
+        // for ever, and so would its job)
         let output = std::thread::spawn(move || {
-            let mut b = Vec::new();
-            stdout.take(8 << 20).read_to_end(&mut b).map(|_| b)
+            let (mut stdout, mut b) = (stdout, Vec::new());
+            (&mut stdout).take(ANSWER_LIMIT).read_to_end(&mut b)?;
+            let over = std::io::copy(&mut stdout, &mut std::io::sink())?;
+            Ok::<_, std::io::Error>((b, over))
         });
         let (id, kind, n, incognito) = (job.id.clone(), job.kind, job.n, job.incognito);
         let errors = std::thread::scope(|s| {
             let events = s.spawn(|| {
                 let mut last_error = None;
                 let mut tail = String::new();
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                each_line(stderr, EVENT_LIMIT, |line| {
                     if let Ok(e) = Json::parse(line.as_bytes()) {
                         if let Some(msg) = e.get("error").and_then(Json::as_str) {
                             last_error = Some(msg.to_string());
@@ -2180,7 +2266,8 @@ impl Media {
                         }
                     } else if !incognito { self.log.push(format!("{id}: {line}")); }
                     tail = line.chars().take(4096).collect();
-                }
+                    true
+                });
                 last_error.unwrap_or(tail)
             });
             let status = loop {
@@ -2203,7 +2290,10 @@ impl Media {
         });
         let (status, tail) = errors;
         let status = status?;
-        let bytes = output.join().map_err(|_| "worker output reader failed")?.map_err(|e| e.to_string())?;
+        let (bytes, over) = output.join().map_err(|_| "worker output reader failed")?.map_err(|e| e.to_string())?;
+        if over > 0 && status.success() {
+            return Err(format!("the worker's answer was larger than {} MiB", ANSWER_LIMIT >> 20));
+        }
         if !status.success() {
             self.log.push(format!("{label}: worker failed{}", if job.incognito { String::new() } else { format!(": {tail}") }));
             return Err(if tail.is_empty() { format!("worker exited {status}") } else { tail });
