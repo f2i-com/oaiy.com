@@ -312,7 +312,7 @@ async function main(): Promise<void> {
     edges: [{ source: 'settings', target: 'cfg' }],
   } as WorkflowGraph;
   const vocabResult = await runFlow(vocab, {
-    inputs: { callId: 'call_72a4607b', event: { data: { from: '0421285243' } } },
+    inputs: { callId: 'call_72a4607b', event: { data: { from: '0491570157' } } },
     timeoutMs: 30_000,
   });
   check(
@@ -323,7 +323,7 @@ async function main(): Promise<void> {
   const got = vocabResult.results?.['cfg'] as Record<string, unknown> | undefined;
   check('  nodes.<id> reads an earlier node', got?.greeting === 'hi', `got ${JSON.stringify(got)}`);
   check('  inputs.<name> reads the run inputs', got?.callId === 'call_72a4607b', `got ${JSON.stringify(got?.callId)}`);
-  check('  event reads the triggering envelope', got?.from === '0421285243', `got ${JSON.stringify(got?.from)}`);
+  check('  event reads the triggering envelope', got?.from === '0491570157', `got ${JSON.stringify(got?.from)}`);
   check('  upstream reads the wired input', got?.viaUpstream === 1, `got ${JSON.stringify(got?.viaUpstream)}`);
   check('  app is declared rather than absent', got?.appKnown === true, `got ${JSON.stringify(got?.appKnown)}`);
 

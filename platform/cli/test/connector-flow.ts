@@ -222,13 +222,13 @@ async function main(): Promise<void> {
       ],
       [{ source: 'start', target: 'cmd' }],
     ),
-    { callId: 'call_af6d0b3f', from: '0421285243', settled: { turns: 3 } },
+    { callId: 'call_af6d0b3f', from: '0491570157', settled: { turns: 3 } },
   );
   await runToEnd(engine, refId);
   const refRelay = sent.find((s) => s.url.includes('/api/bridge/connectors/'));
   const refPayload = JSON.parse(refRelay?.body ?? '{}').payload ?? {};
   check('refs: a lone selector resolves to the referenced value', refPayload.callId === 'call_af6d0b3f');
-  check('refs: a template interpolates', refPayload.who === '0421285243');
+  check('refs: a template interpolates', refPayload.who === '0491570157');
   // Braces interpolate INSIDE text; a bare selector does not. Only a whole
   // string may be a selector, so prose containing a $word survives intact —
   // otherwise an SMS body would have its own text eaten.
@@ -410,14 +410,14 @@ async function main(): Promise<void> {
       ],
       [],
     ),
-    { from: '0421285243' },
+    { from: '0491570157' },
   );
   const shapedJob = await runToEnd(engine, shapedId);
   check('listing: the flow completed', shapedJob?.status === 'completed', `error=${shapedJob?.error ?? ''}`);
   const listUrl = sent.find((s) => s.url.includes('/items'))?.url ?? '';
   check(
     'listing: the phone_eq filter reached the provider as a query parameter',
-    listUrl.includes('answersPhone.phone=0421285243'),
+    listUrl.includes('answersPhone.phone=0491570157'),
     `url=${listUrl}`,
   );
   const shaped = shapedJob?.nodeOutputs?.customers as any;

@@ -849,9 +849,9 @@ mod tests {
         let sel = selectors();
         let result = json!({
             "hasTask": true,
-            "task": { "title": "Call back", "phone": "0421285243" },
+            "task": { "title": "Call back", "phone": "0491570157" },
             "hasSms": true,
-            "sms": { "to": "0421285243", "body": "Thanks!" },
+            "sms": { "to": "0491570157", "body": "Thanks!" },
             "hasCall": true,
             "responseId": "resp-1",
             "callUpdate": { "summary": "went well" }
@@ -866,7 +866,7 @@ mod tests {
             plan(&s, &sel, &submit, &scope).unwrap(),
             Planned::Submit {
                 form_id: "62c2a2cc".into(),
-                record: json!({ "title": "Call back", "phone": "0421285243" }),
+                record: json!({ "title": "Call back", "phone": "0491570157" }),
             }
         );
 
@@ -895,7 +895,7 @@ mod tests {
             Planned::Connector {
                 connector_id: "aokie".into(),
                 command: "sms.send".into(),
-                payload: json!({ "to": "0421285243", "body": "Thanks!" }),
+                payload: json!({ "to": "0491570157", "body": "Thanks!" }),
             }
         );
     }
@@ -1050,7 +1050,7 @@ mod tests {
     fn live_result() -> Value {
         json!({
             "hasTask": true, "task": { "title": "Call back" },
-            "hasSms": true, "sms": { "to": "0421285243" },
+            "hasSms": true, "sms": { "to": "0491570157" },
             "hasCall": true, "callUpdate": { "summary": "ok" }, "responseId": "resp-1"
         })
     }
@@ -1154,7 +1154,7 @@ mod tests {
         let sel = selectors();
         let event = json!({
             "name": "aokie.call.caller_id",
-            "data": { "from": "0421285243", "callId": "call_5089e2ff" }
+            "data": { "from": "0491570157", "callId": "call_5089e2ff" }
         });
         let scope = Scope {
             event: Some(&event),
@@ -1164,7 +1164,7 @@ mod tests {
         let map = json!({ "from": "$event.data.from", "callId": "$event.data.callId" });
         assert_eq!(
             build_inputs(&sel, &map, &scope),
-            json!({ "from": "0421285243", "callId": "call_5089e2ff" })
+            json!({ "from": "0491570157", "callId": "call_5089e2ff" })
         );
 
         // A name whose reference resolves to nothing is LEFT OUT rather than
@@ -1179,7 +1179,7 @@ mod tests {
         let mixed = json!({ "outcome": "sent", "to": "$event.data.from" });
         assert_eq!(
             build_inputs(&sel, &mixed, &scope),
-            json!({ "outcome": "sent", "to": "0421285243" })
+            json!({ "outcome": "sent", "to": "0491570157" })
         );
 
         // No map at all is an empty set, not a failure.

@@ -917,7 +917,7 @@ mod tests {
             desktop_connection_id: offer.payload.desktop_connection_id.clone(),
             desktop_key_thumbprint: offer.payload.desktop_endpoint_key.thumbprint.clone(),
             device_id: "phone-1".into(),
-            display_name: Some("Lance's phone".into()),
+            display_name: Some("Sam's phone".into()),
             mobile_endpoint_key: pk,
             pairing_nonce: offer.payload.nonce.clone(),
             jti: offer.payload.jti.clone(),
@@ -1039,7 +1039,7 @@ mod tests {
 
         let pending = id.receive_response(&answer(&offer, &phone)).unwrap();
         assert_eq!(pending.device_id, "phone-1");
-        assert_eq!(pending.display_name, "Lance's phone");
+        assert_eq!(pending.display_name, "Sam's phone");
         // The operator compares THIS against the phone's screen.
         assert!(pending.fingerprint.contains(':'), "{}", pending.fingerprint);
 
