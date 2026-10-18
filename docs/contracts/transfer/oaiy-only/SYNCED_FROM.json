@@ -2,7 +2,7 @@
   "what": "The Aokie commit this folder was copied from, and the digest of each file as copied (SHA-256, carriage returns folded away). Read by scripts/check-transfer-contract.mjs; rewrite it with --write-lock <commit> after a sync, never by hand.",
   "repository": "aokie",
   "folder": "docs/contracts/transfer",
-  "commit": "63b2287e038e836add7ae0271c87b4f67e976695",
+  "commit": "408bfd94358dc4d2e30ebd9b03f981077168ccc4",
   "files": {
     "SHA256SUMS": "f9c63d21a02e4aeec04ec87b1ba1bb56c8df43abb268dbd309461f12224b008e",
     "transfer-v1.caller-asked.fixture.json": "e8e77eb930e59918ba100f4c4308d05cc03cc0affc317340fcfcd7e708f80520",
