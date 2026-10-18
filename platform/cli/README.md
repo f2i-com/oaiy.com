@@ -77,7 +77,7 @@ Set `OAIY_DEBUG=1` to include the full workflow context + logs in the output.
 ### The engine
 
 Every flow — `run`, `worker`, the Desktop's background flows — runs on the
-[ZIPP](https://github.com/f2i-com/zipp.org/releases) VM (the web-python bundle of
+[ZIPP](https://github.com/f2i-com/zipp.org/releases) VM (the javascript-python engine of
 one release, verified and installed by `../scripts/fetch-zipp-release.mjs`; the
 `prebuild`/`pretest`/`pretypecheck` hooks run its `--ensure`) in a
 `worker_threads` Worker started with an empty environment. `createCliEngine`
@@ -105,8 +105,8 @@ shell too.
 ```json
 { "version": "0.2.0",
   "protocols": { "run": 1, "script": 1, "profile": 1 },
-  "engine": { "name": "zipp", "release": "v0.0.21", "version": "0.0.21", "revision": "…",
-              "variant": "javascript-python", "bundle": "zipp-wasm-0.0.21-web-python.zip",
+  "engine": { "name": "zipp", "release": "v0.0.26", "version": "0.0.26", "revision": "…",
+              "variant": "javascript-python", "bundle": "zipp-0.0.26-javascript-python.wasm",
               "wasmSha256": "…", "glueSha256": "…", "languages": ["javascript", "python"],
               "status": "ready" },
   "run": { "languages": ["javascript"], "defaultInstructionSteps": 50000000, "maxInstructionSteps": 2000000000 },
@@ -120,7 +120,7 @@ is the release the build was made from and whether the staged artifact is it NOW
 (`status`, with a `reason` when `unavailable`). `run.languages` is what a
 WORKFLOW may be written in on this host — JavaScript only, because a flow's
 logic blocks and conditions compile to JavaScript — and is deliberately not
-`engine.languages` (what the bundle could). `script.languages` is what a LEAF job
+`engine.languages` (what the engine could). `script.languages` is what a LEAF job
 may be written in: the engine's own list, because a `python-project` job runs on
 the shipped web-python engine today. The two step figures are the engine's own
 default per script entry and the ceiling `--instruction-budget` accepts, read

@@ -279,16 +279,21 @@ the reason, so an exemption can be re-checked rather than trusted forever.
 ## ZIPP engines
 
 The ZIPP engines are not committed. `scripts/fetch-zipp-release.mjs` installs
-both bundles of one zipp.org release: the JavaScript-only web bundle into
-`ui/vendor/zipp-wasm/` (the browser flow sandbox) and the web-python bundle into
+both engines of one zipp.org release (v0.0.26 or later; earlier releases
+published zip bundles, which it no longer reads): the JavaScript-only
+`zipp-<v>-javascript.wasm` into `ui/vendor/zipp-wasm/` (the browser flow
+sandbox) and `zipp-<v>-javascript-python.wasm` into
 `ui/vendor/zipp-wasm-python/` (the CLI's engine: `cli/esbuild.mjs` verifies it,
 bakes its identity in, stages it to `cli/dist/zipp/` and bundles its glue into
-the worker shell — see "CLI on ZIPP" below). Each
-bundle is verified against the release's `SHA256SUMS` and its own inner
-`SHA256SUMS`, its `BUILD-INFO.txt` must describe that variant, both must name the
-same commit, and each module must report it. Each folder records what it took in
+the worker shell — see "CLI on ZIPP" below). Each module is verified against the
+release's `SHA256SUMS`; its `zipp.meta` record must describe that variant and
+name the digest of the bindings it carries in its `zipp.glue` section (installed
+as `zipp_wasm.js`), its stack must be the variant's, both must name the same
+commit, and each must report it loaded under its own glue, which also gives
+`PROFILE.json`. The declarations and licence come from the release's embed kit,
+checked against `SHA256SUMS` and its own. Each folder records what it took in
 `SOURCE.json`. The installer uses Node built-ins only and needs Node 20.15, 22.2
-or newer (`zlib.crc32`).
+or newer (`zlib.crc32`, for the kit).
 
 ```bash
 node scripts/fetch-zipp-release.mjs                 # install the latest release
@@ -301,11 +306,12 @@ node scripts/regen-zipp-notices.mjs ../zipp.org vX.Y.Z   # regenerate the curate
 ```
 
 The installer's tests build fixture releases and stub GitHub, so they need no
-network. One case repacks the engines `ui/vendor` holds to run the real glue
-through the same checks, so install them first (`npm test` in `ui` does); outside
-CI that case is skipped, with the reason, when there are none.
+network. One case repacks the engines `ui/vendor` holds into a release to run
+the real modules and glue through the same checks and compare what they give with
+the installed files, so install them first (`npm test` in `ui` does); outside CI
+that case is skipped, with the reason, when there are none.
 
-The web-python bundle ships no notices for the Unicode data it compiles in, so
+The release ships no notices for the Unicode data the Python engine compiles in, so
 the install takes OAIY's curated copy in `ui/vendor/zipp-notices/`, whose
 `SOURCE.json` names the ZIPP release it was generated from. A newer or older
 release installs with a warning (an annotation in GitHub Actions) to check what it
@@ -316,7 +322,7 @@ compiles in and regenerate the copy; see `ui/vendor/zipp-notices/README.md`.
 for a newer release), a missing or broken one is replaced by the latest.
 `ZIPP_RELEASE=vX.Y.Z` and `ZIPP_SUMS_SHA256=<digest of SHA256SUMS>` name the
 release and its digest, and `--ensure` reinstalls unless the install is that
-release. Offline, `ZIPP_RELEASE_DIR=<folder holding SHA256SUMS and both zips>`
+release. Offline, `ZIPP_RELEASE_DIR=<folder holding SHA256SUMS, both modules and the embed kit>`
 reads a release from disk; downloads are cached in `.zipp-release/<tag>/`,
 which is such a folder. CI resolves the latest release once per run (the `zipp`
 job in `ci.yml`, `meta` in `release.yml`) and every job installs that pair, so
@@ -332,8 +338,8 @@ body the flow compiles at run time — `Function(...)`, indirect eval, the
 Desktop's app-logic wrapper — sees them too; the suite proves on both engines
 that such a `var` overwrites ZIPP's intrinsic, which is the condition the
 placement rests on. Hardened flows keep the shims inside the wrapper and a
-recovered global there stays empty. It also checks the install against its release, the bundle
-checksums for the bindings, WASM and provenance files, the live engine profile
+recovered global there stays empty. It also checks the install against its release
+(`checkInstall`: the module, its glue and the kit's files by digest), the live engine profile
 against `PROFILE.json` and `SOURCE.json`, and that the module links a memory
 maximum above the VM's heap accounting limit.
 
@@ -358,7 +364,7 @@ when a target does not support cross-origin browser requests.
 Every flow the CLI runs goes to the ZIPP VM on a `worker_threads` Worker through
 `createCliEngine` (`cli/src/engine.ts`); nothing else builds a runtime there. The
 `cli` build (`npm run build`; its `prebuild` hook runs `--ensure`) checks the
-installed web-python bundle, bakes its `SOURCE.json` identity and two figures from
+installed javascript-python engine, bakes its `SOURCE.json` identity and two figures from
 its `PROFILE.json` (`lifetimeSteps`, `maxInstructionBudgetSteps`) into the bundle
 as defines, stages `zipp_wasm_bg.wasm`, `PROFILE.json`, `SOURCE.json` and the
 notices to `cli/dist/zipp/`, and builds the two worker shells

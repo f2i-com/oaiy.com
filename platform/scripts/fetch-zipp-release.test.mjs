@@ -1,18 +1,23 @@
 /**
  * The ZIPP installs take a release only when every layer checks, for both
- * bundles: each zip against ZIPP's SHA256SUMS, each file against its bundle's
- * own, BUILD-INFO.txt and the module itself against that variant of that
- * release, and both bundles against one commit.
+ * engines: each module against ZIPP's SHA256SUMS, its zipp.meta record, its
+ * zipp.glue section and its stack, and what it reports loaded under that glue,
+ * against that variant of that release; the embed kit against SHA256SUMS and
+ * each file in it against the kit's own; and all of it against one commit.
  *
  *   node --test scripts/fetch-zipp-release.test.mjs
  *
- * Fixture releases are built in temp folders with a stand-in glue that reports
- * whatever profile a case needs, and SHA256SUMS rebuilt per case, so a case
- * trips only the refusal it is about. One case repacks the engines ui/vendor
- * holds, so the real glue and modules pass the same checks (install them
- * first; outside CI that case is skipped, saying why, when there are none).
- * Releases come from a folder (ZIPP_RELEASE_DIR) through the command line, or
- * from a stubbed fetch, in process or preloaded; nothing here reaches GitHub.
+ * Fixture releases are built in temp folders. Each module is a minimal valid
+ * WebAssembly binary (Rust's stack pointer as its first global, then the
+ * zipp.meta and zipp.glue custom sections) whose glue is a stand-in that
+ * reports whatever profile a case needs; SHA256SUMS, the kit's own and its
+ * modules.json are rebuilt per case, so a case trips only the refusal it is
+ * about. One case repacks the engines ui/vendor holds into a release, so the
+ * real glue and modules pass the same checks and give back the installed files
+ * (install them first; outside CI that case is skipped, saying why, when there
+ * are none). Releases come from a folder (ZIPP_RELEASE_DIR) through the command
+ * line, or from a stubbed fetch, in process or preloaded; nothing here reaches
+ * GitHub.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,8 +28,8 @@ import zlib from 'node:zlib';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  BUNDLE_FILES, CURATED_NOTICES, REPOSITORY, VARIANTS, VENDOR_DIR, ZippReleaseError,
-  bundleName, checkInstalls, checkInstallsOnline, ensureInstalls, installRelease, installedFiles, readCuratedNotices, removeStaleLock, resolveRelease, sha256, unzip, verifyRelease, withInstallLock, writeInstalls,
+  CURATED_NOTICES, KIT_FILES, NOTICES, REPOSITORY, VARIANTS, VENDOR_DIR, ZippReleaseError,
+  checkInstalls, checkInstallsOnline, ensureInstalls, installRelease, installedFiles, kitName, moduleName, readCuratedNotices, removeStaleLock, resolveRelease, sha256, unzip, verifyRelease, wasmCustomSections, wasmStackBytes, withInstallLock, writeInstalls,
 } from './fetch-zipp-release.mjs';
 import { noticeSources, noticesRecord, regenerate } from './regen-zipp-notices.mjs';
 
@@ -44,11 +49,13 @@ const outDir = (t) => path.join(tempDir(t, 'zipp-install-'), 'vendor');
 const escaped = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const readSource = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'SOURCE.json'), 'utf8'));
 const CURATED_RECORD = path.join(path.dirname(CURATED_NOTICES), 'SOURCE.json');
+/** A SHA256SUMS text without the line for `name`. */
+const dropLine = (text, name) => text.split('\n').filter((line) => !line.endsWith(`  ${name}`)).join('\n');
 
 /**
- * A zip as ZIPP's release job writes one: a top folder entry, then deflated
- * files (stored when `deflate` is false). `entries` are [name, bytes] pairs;
- * `flags` is every entry's general-purpose bit flag.
+ * A zip as ZIPP's release job writes one: deflated files (stored when
+ * `deflate` is false). `entries` are [name, bytes] pairs; `flags` is every
+ * entry's general-purpose bit flag.
  */
 function writeZip(entries, { deflate = true, flags = 0 } = {}) {
   const list = [...entries];
@@ -94,62 +101,167 @@ function writeZip(entries, { deflate = true, flags = 0 } = {}) {
   return Buffer.concat([...parts, directory, end]);
 }
 
-/** A module that describes itself as `profile`, standing in for the engine where what it reports is the point. */
-const standInGlue = (profile) => Buffer.from(`export function initSync() {}\nexport function zippProfile() { return ${JSON.stringify(JSON.stringify(profile))}; }\n`);
-const buildInfo = (variant, { version, commit }) => Buffer.from(`version=${version}\ncommit=${commit}\nrustc=rustc 1.92.0 (ded5c06cf 2025-12-08)\nwasm-bindgen=wasm-bindgen 0.2.126\nvariant=${variant.variant}\nlanguages=${JSON.stringify(variant.languages)}\nstack-bytes=${variant.stackBytes}\ntarget=wasm32-unknown-unknown\n`);
-const setBuildInfo = (files, key, value) => files.set('BUILD-INFO.txt', Buffer.from(files.get('BUILD-INFO.txt').toString('utf8').replace(new RegExp(`^${key}=.*$`, 'm'), `${key}=${value}`)));
-const setGlue = (files, change) => files.set('zipp_wasm.js', standInGlue(change(JSON.parse(JSON.parse(/return (".*");/.exec(files.get('zipp_wasm.js').toString('utf8'))[1])))));
-
-function fixtureFiles(variant, { version, commit }) {
-  return new Map([
-    ['zipp_wasm.js', standInGlue({ version, features: ['safe-sandbox', 'meter-only'], languages: variant.languages, source: { sha: commit } })],
-    ['zipp_wasm.d.ts', Buffer.from(`export class Engine {} // ${variant.suffix}\n`)],
-    ['zipp_wasm_bg.wasm', Buffer.from(`\0asm stand-in ${variant.suffix} module`)],
-    ['zipp_wasm_bg.wasm.d.ts', Buffer.from(`export const memory: WebAssembly.Memory; // ${variant.suffix}\n`)],
-    ['LICENSE-APACHE', Buffer.from('Apache License, Version 2.0\n')],
-    ['BUILD-INFO.txt', buildInfo(variant, { version, commit })],
-    ['PROFILE.json', Buffer.from(`${JSON.stringify({ engine: 'zipp-wasm', version, languages: variant.languages }, null, 2)}\n`)],
-    // Listed by the bundle's SHA256SUMS, never installed.
-    ['README.md', Buffer.from('# zipp-wasm\n')],
-    ['host-sdk/zipp-host.mjs', Buffer.from('export {};\n')],
-    ...(variant.needsNotices ? [['gpu-lab/LICENSE', Buffer.from('gpu-lab licence\n')], ['docs/TORCH_COMPATIBILITY.md', Buffer.from('torch\n')]] : []),
-  ]);
-}
-
-/** A bundle's files as the install in ui/vendor holds them (checked by the caller). */
-function vendorBundleFiles(variant) {
-  const dir = path.join(VENDOR_DIR, variant.folder);
-  return new Map(BUNDLE_FILES.filter((n) => n !== 'SHA256SUMS').map((n) => [n, fs.readFileSync(path.join(dir, n))]));
-}
+// ---------------------------------------------------------------------------
+// WebAssembly fixtures
+// ---------------------------------------------------------------------------
+const uleb = (n) => {
+  const out = [];
+  do {
+    let byte = n & 0x7f;
+    n = Math.floor(n / 128);
+    if (n) byte |= 0x80;
+    out.push(byte);
+  } while (n);
+  return Buffer.from(out);
+};
+/** A signed LEB128, as i32.const takes its operand: 1 MiB is 80 80 c0 00, where an unsigned one would be 80 80 40. */
+const sleb = (n) => {
+  const out = [];
+  for (;;) {
+    const byte = n & 0x7f;
+    n >>= 7;
+    const done = (n === 0 && !(byte & 0x40)) || (n === -1 && byte & 0x40);
+    out.push(done ? byte : byte | 0x80);
+    if (done) return Buffer.from(out);
+  }
+};
+const wasmSection = (id, body) => Buffer.concat([Buffer.from([id]), uleb(body.length), body]);
+const customSection = (name, payload) => wasmSection(0, Buffer.concat([uleb(Buffer.byteLength(name)), Buffer.from(name), payload]));
+const WASM_HEADER = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+/** A module with one more custom section at its end: still valid, and still carrying what it carried. */
+const appendSection = (bytes, name, payload) => Buffer.concat([bytes, customSection(name, payload)]);
 
 /**
- * A release folder holding SHA256SUMS and both bundle zips. Per variant suffix,
- * `edit` changes the bundle before its SHA256SUMS is written, `innerSums` that
- * text, `tamper` the bundle after it; `repack` packs the same files again
- * after the top-level sums are written, a valid zip whose bytes are not the
- * ones listed.
+ * A minimal valid WebAssembly module, laid out as rustc lays out what matters
+ * here: its first global is the mutable i32 stack pointer, set by `i32.const
+ * <stack>` (an i64 one when `stackType` says so), and `custom` sections follow
+ * in order.
  */
-function releaseFolder(t, { version = VERSION, commit = COMMIT, edit = {}, innerSums = {}, tamper = {}, repack, real = false } = {}) {
-  const zips = {};
-  const bundles = {};
+function wasmModule({ stack, stackType = 'i32', custom = [] }) {
+  const type = stackType === 'i32' ? [0x7f, 0x01, 0x41] : [0x7e, 0x01, 0x42];
+  const globals = Buffer.concat([uleb(1), Buffer.from(type), sleb(stack), Buffer.from([0x0b])]);
+  return Buffer.concat([WASM_HEADER, wasmSection(6, globals), ...custom.map(([name, payload]) => customSection(name, payload))]);
+}
+
+/** Glue that describes the module as `profile`, standing in for the engine where what it reports is the point. */
+const standInGlue = (profile) => Buffer.from(`export function initSync() {}\nexport function zippProfile() { return ${JSON.stringify(JSON.stringify(profile))}; }\n`);
+
+/**
+ * What a fixture module is made of, for a case to change before buildModule
+ * assembles it: its stack, its zipp.meta record (glueSha256 is filled in from
+ * the glue unless a case sets one), the profile its stand-in glue reports,
+ * `glue` (null for none), `record` (the record's bytes, null for none),
+ * `custom` sections after the two, and `bytes` to replace the lot.
+ */
+function moduleParts(variant, { version, commit }) {
+  return {
+    stack: variant.stackBytes,
+    meta: { format: 1, variant: variant.variant, version, commit, languages: variant.languages },
+    profile: { engine: 'zipp-wasm', version, features: ['safe-sandbox', 'meter-only'], languages: variant.languages, source: { sha: commit }, limits: { lifetimeSteps: 50000000, maxInstructionBudgetSteps: 2000000000 } },
+    custom: [],
+  };
+}
+function buildModule(parts) {
+  if (parts.bytes) return parts.bytes;
+  const glue = parts.glue === undefined ? standInGlue(parts.profile) : parts.glue;
+  const meta = { ...parts.meta, ...(glue && !('glueSha256' in parts.meta) ? { glueSha256: sha256(glue) } : {}) };
+  const record = parts.record === undefined ? Buffer.from(JSON.stringify(meta)) : parts.record;
+  return wasmModule({ stack: parts.stack, stackType: parts.stackType, custom: [...(record ? [['zipp.meta', record]] : []), ...(glue ? [['zipp.glue', glue]] : []), ...parts.custom] });
+}
+/** The fixture module of `variant` of the default release, changed by `edit`. */
+const rebuilt = (variant, edit = () => {}) => {
+  const parts = moduleParts(variant, { version: VERSION, commit: COMMIT });
+  edit(parts);
+  return buildModule(parts);
+};
+
+// ---------------------------------------------------------------------------
+// Release fixtures
+// ---------------------------------------------------------------------------
+const kitFolder = (version) => kitName(version).replace(/\.zip$/, '');
+/** The embed kit's files, by path inside its folder; modules.json is added once the modules exist. */
+function kitFixture({ version, commit }) {
+  return new Map([
+    ['BUILD-INFO.txt', Buffer.from(`version=${version}\ncommit=${commit}\nkit-source=${'9'.repeat(40)}\nloader=1.2.0\nhost-sdk=1.3.0\n`)],
+    ['LICENSE-APACHE', Buffer.from('Apache License, Version 2.0\n')],
+    ['zipp-engine.d.ts', Buffer.from('export class Engine {}\nexport function initSync(module: unknown): unknown;\n')],
+    // Listed by the kit's SHA256SUMS, never installed.
+    ['README.md', Buffer.from('# ZIPP WebAssembly embed kit\n')],
+    ['zipp.mjs', Buffer.from('export {};\n')],
+    ['zipp.d.ts', Buffer.from('export {};\n')],
+    ['docs/zipp-wasm.md', Buffer.from('# zipp-wasm\n')],
+    ['host-sdk/zipp-host.mjs', Buffer.from('export {};\n')],
+    ['gpu-lab/LICENSE', Buffer.from('gpu-lab licence\n')],
+  ]);
+}
+const DECOY_LITE = '5'.repeat(64);
+const modulesJson = ({ version, commit }, modules) => Buffer.from(`${JSON.stringify({
+  version,
+  commit,
+  modules: [
+    ...VARIANTS.map((v) => ({ file: moduleName(version, v), variant: v.variant, languages: v.languages, bytes: modules[v.suffix].length, sha256: sha256(modules[v.suffix]) })),
+    { file: `zipp-${version}-javascript-lite.wasm`, variant: 'lite', languages: ['javascript'], bytes: 1, sha256: DECOY_LITE },
+  ],
+}, null, 2)}\n`);
+const setBuildInfo = (files, key, value) => files.set('BUILD-INFO.txt', Buffer.from(files.get('BUILD-INFO.txt').toString('utf8').replace(new RegExp(`^${key}=.*$`, 'm'), `${key}=${value}`)));
+const setJson = (files, name, change) => {
+  const value = JSON.parse(files.get(name).toString('utf8'));
+  change(value);
+  files.set(name, Buffer.from(`${JSON.stringify(value, null, 2)}\n`));
+};
+
+/**
+ * A release folder holding SHA256SUMS, both modules and the embed kit, built
+ * from parts a case can change at each layer: `edit[suffix](parts)` a module
+ * before it is assembled; `kit(files)` the kit's files (modules.json written)
+ * before its SHA256SUMS, `kitSums(text)` that text and `tamperKit(files)` the
+ * kit after it; `kitTop` the kit's folder; `sums(text)` ZIPP's SHA256SUMS, and
+ * `tamper[suffix](bytes)` a module after that lists it; `repack` packs the kit
+ * again after it is listed, a valid zip of the same files whose bytes are not
+ * the ones listed. `real` takes the modules, declarations and licence
+ * ui/vendor holds.
+ */
+function releaseFolder(t, { version = VERSION, commit = COMMIT, edit = {}, kit: editKit, kitSums, tamperKit, kitTop = kitFolder(version), sums: editSums, tamper = {}, repack = false, real = false } = {}) {
+  const parts = {};
+  const listed = {};
   for (const variant of VARIANTS) {
-    const files = real ? vendorBundleFiles(variant) : fixtureFiles(variant, { version, commit });
-    edit[variant.suffix]?.(files);
-    let sums = `${[...files].map(([name, bytes]) => `${sha256(bytes)}  ${name}`).join('\n')}\n`;
-    if (innerSums[variant.suffix]) sums = innerSums[variant.suffix](sums);
-    files.set('SHA256SUMS', Buffer.from(sums));
-    tamper[variant.suffix]?.(files);
-    const prefix = bundleName(version, variant);
-    const entries = new Map([[`${prefix}/`, Buffer.alloc(0)], ...[...files].map(([name, bytes]) => [`${prefix}/${name}`, bytes])]);
-    zips[variant.suffix] = writeZip(entries);
-    bundles[variant.suffix] = { files, entries };
+    if (real) listed[variant.suffix] = fs.readFileSync(path.join(VENDOR_DIR, variant.folder, 'zipp_wasm_bg.wasm'));
+    else {
+      parts[variant.suffix] = moduleParts(variant, { version, commit });
+      edit[variant.suffix]?.(parts[variant.suffix]);
+      listed[variant.suffix] = buildModule(parts[variant.suffix]);
+    }
   }
-  const top = Buffer.from(`${'a'.repeat(64)}  zipp-${version}-x86_64-unknown-linux-gnu.tar.gz\n${VARIANTS.map((v) => `${sha256(zips[v.suffix])}  ${bundleName(version, v)}.zip`).join('\n')}\n`);
-  if (repack) zips[repack] = writeZip(bundles[repack].entries, { deflate: false });
+  const kitFiles = kitFixture({ version, commit });
+  if (real) for (const [installed, from] of Object.entries(KIT_FILES)) kitFiles.set(from, fs.readFileSync(path.join(VENDOR_DIR, PYTHON.folder, installed)));
+  kitFiles.set('modules.json', modulesJson({ version, commit }, listed));
+  editKit?.(kitFiles);
+  let inner = `${[...kitFiles].map(([name, bytes]) => `${sha256(bytes)}  ${name}`).join('\n')}\n`;
+  if (kitSums) inner = kitSums(inner);
+  kitFiles.set('SHA256SUMS', Buffer.from(inner));
+  tamperKit?.(kitFiles);
+  const kitEntries = new Map([...kitFiles].map(([name, bytes]) => [`${kitTop}/${name}`, bytes]));
+  let kit = writeZip(kitEntries);
+  let text = `${[
+    `${'a'.repeat(64)}  zipp-${version}-linux-x86_64`,
+    `${'b'.repeat(64)}  zipp-${version}-windows-x86_64-installer.msi`,
+    ...VARIANTS.map((v) => `${sha256(listed[v.suffix])}  ${moduleName(version, v)}`),
+    // Published beside them and never taken: the anchored names must not match these.
+    `${DECOY_LITE}  zipp-${version}-javascript-lite.wasm`,
+    `${'6'.repeat(64)}  zipp-${version}-javascript-python-base.wasm`,
+    `${'7'.repeat(64)}  zipp-${version}-torch-package.wasm`,
+    `${'8'.repeat(64)}  zipp-${version}-javascript-python.wasm.br`,
+    `${sha256(kit)}  ${kitName(version)}`,
+  ].join('\n')}\n`;
+  if (editSums) text = editSums(text);
+  const top = Buffer.from(text);
+  if (repack) kit = writeZip(kitEntries, { deflate: false });
+  const modules = Object.fromEntries(VARIANTS.map((v) => [v.suffix, tamper[v.suffix] ? tamper[v.suffix](listed[v.suffix]) : listed[v.suffix]]));
   const dir = tempDir(t, 'zipp-release-fixture-');
   fs.writeFileSync(path.join(dir, 'SHA256SUMS'), top);
-  for (const variant of VARIANTS) fs.writeFileSync(path.join(dir, `${bundleName(version, variant)}.zip`), zips[variant.suffix]);
-  return { dir, top, zips, bundles, release: `v${version}` };
+  for (const variant of VARIANTS) fs.writeFileSync(path.join(dir, moduleName(version, variant)), modules[variant.suffix]);
+  fs.writeFileSync(path.join(dir, kitName(version)), kit);
+  return { dir, top, modules, listed, kit, kitFiles, kitEntries, parts, release: `v${version}` };
 }
 
 const cleanEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(ZIPP_|CI$|GITHUB_ACTIONS$)/i.test(key)));
@@ -172,8 +284,24 @@ const editSource = (dir, change) => editText(path.join(dir, 'SOURCE.json'), (tex
   change(record);
   return `${JSON.stringify(record, null, 2)}\n`;
 });
-/** Brings an install's own SHA256SUMS line for `name` in step with the file, so only the check a case is about can trip. */
-const resum = (dir, name) => editText(path.join(dir, 'SHA256SUMS'), (text) => text.replace(new RegExp(`^[0-9a-f]{64}(  ${escaped(name)})$`, 'm'), `${sha256(fs.readFileSync(path.join(dir, name)))}$1`));
+/**
+ * Put `bytes` in place of an install's module and record it as published:
+ * its SOURCE.json digests, and both installs' RELEASE-SHA256SUMS and their
+ * digest, so only what the module itself carries can be wrong.
+ */
+function replaceModule(vendor, variant, bytes) {
+  const dir = path.join(vendor, variant.folder);
+  const { bundle } = readSource(dir);
+  fs.writeFileSync(path.join(dir, 'zipp_wasm_bg.wasm'), bytes);
+  const sums = fs.readFileSync(path.join(dir, 'RELEASE-SHA256SUMS'), 'utf8').replace(new RegExp(`^[0-9a-f]{64}(  ${escaped(bundle)})$`, 'm'), `${sha256(bytes)}$1`);
+  for (const each of VARIANTS) {
+    fs.writeFileSync(path.join(vendor, each.folder, 'RELEASE-SHA256SUMS'), sums);
+    editSource(path.join(vendor, each.folder), (s) => {
+      s.sumsSha256 = sha256(Buffer.from(sums));
+      if (each === variant) s.sha256 = s.bundleSha256 = sha256(bytes);
+    });
+  }
+}
 const serve = (responses) => {
   const calls = [];
   const fetch = async (url) => {
@@ -222,38 +350,63 @@ function fetchStub(dir, name, served) {
   return ['--import', pathToFileURL(file).href];
 }
 const releaseAsset = (name) => `${REPOSITORY}/releases/download/${TAG}/${name}`;
-/** What GitHub serves for a fixture release: its SHA256SUMS and both bundles. */
-const published = (folder) => new Map([[releaseAsset('SHA256SUMS'), folder.top], ...VARIANTS.map((v) => [releaseAsset(`${bundleName(VERSION, v)}.zip`), folder.zips[v.suffix]])]);
+/** What GitHub serves for a fixture release: its SHA256SUMS, both modules and the kit. */
+const published = (folder) => new Map([[releaseAsset('SHA256SUMS'), folder.top], ...VARIANTS.map((v) => [releaseAsset(moduleName(VERSION, v)), folder.modules[v.suffix]]), [releaseAsset(kitName(VERSION)), folder.kit]]);
 
-test('a release that checks all the way down installs both bundles as exactly their install sets, and --check passes', (t) => {
+test('a release that checks all the way down installs both engines as exactly their install sets, and --check passes', (t) => {
   const folder = releaseFolder(t);
   // No tag: the release the folder holds.
   const { out, run } = install(t, folder);
   assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
   assert.deepEqual(fs.readdirSync(out).sort(), ['zipp-wasm', 'zipp-wasm-python'], 'no stage, previous install or lock is left behind');
+  const kitFiles = Object.fromEntries(Object.entries(KIT_FILES).map(([name, from]) => [name, { from, sha256: sha256(folder.kitFiles.get(from)) }]));
   for (const variant of VARIANTS) {
     const dir = path.join(out, variant.folder);
     const record = readSource(dir);
-    const { files } = folder.bundles[variant.suffix];
-    assert.deepEqual(fs.readdirSync(dir).sort(), installedFiles(record.notices).sort(), `${variant.folder}: unshipped SHA256SUMS entries (README.md, docs/, gpu-lab/, host-sdk/) stay behind`);
-    assert.deepEqual(
-      { release: record.release, version: record.version, revision: record.revision, build: record.build, bundle: record.bundle, bundleSha256: record.bundleSha256, sumsSha256: record.sumsSha256, variant: record.variant, languages: record.languages, stackBytes: record.stackBytes, rustc: record.rustc, wasmBindgen: record.wasmBindgen, license: record.license, artifact: record.artifact, sha256: record.sha256, glueSha256: record.glueSha256, repository: record.repository },
-      { release: TAG, version: VERSION, revision: COMMIT, build: 'release', bundle: `${bundleName(VERSION, variant)}.zip`, bundleSha256: sha256(folder.zips[variant.suffix]), sumsSha256: sha256(folder.top), variant: variant.variant, languages: variant.languages, stackBytes: variant.stackBytes, rustc: 'rustc 1.92.0 (ded5c06cf 2025-12-08)', wasmBindgen: '0.2.126', license: 'Apache-2.0', artifact: 'zipp_wasm_bg.wasm', sha256: sha256(files.get('zipp_wasm_bg.wasm')), glueSha256: sha256(files.get('zipp_wasm.js')), repository: REPOSITORY },
-    );
-    assert.ok(fs.readFileSync(path.join(dir, 'RELEASE-SHA256SUMS')).equals(folder.top), 'ZIPP\'s top-level SHA256SUMS, verbatim');
-    for (const name of BUNDLE_FILES) assert.ok(fs.readFileSync(path.join(dir, name)).equals(files.get(name)), `${variant.folder}/${name} byte for byte`);
+    const module = folder.modules[variant.suffix];
+    const { profile } = folder.parts[variant.suffix];
+    const glue = standInGlue(profile);
+    // PROFILE.json is no longer published: it is what the engine reports, as the bundles wrote it.
+    const profileJson = Buffer.from(`${JSON.stringify(profile, null, 2)}\n`);
+    assert.deepEqual(fs.readdirSync(dir).sort(), installedFiles(record.notices).sort(), `${variant.folder}: nothing else the kit holds (README.md, docs/, gpu-lab/, host-sdk/, BUILD-INFO.txt, modules.json) is installed`);
+    assert.deepEqual(record, {
+      repository: REPOSITORY,
+      release: TAG,
+      version: VERSION,
+      revision: COMMIT,
+      build: 'release',
+      bundle: moduleName(VERSION, variant),
+      bundleSha256: sha256(module),
+      sumsSha256: sha256(folder.top),
+      variant: variant.variant,
+      languages: variant.languages,
+      stackBytes: variant.stackBytes,
+      license: 'Apache-2.0',
+      artifact: 'zipp_wasm_bg.wasm',
+      sha256: sha256(module),
+      glueSha256: sha256(glue),
+      profileSha256: sha256(profileJson),
+      kit: { file: kitName(VERSION), sha256: sha256(folder.kit), files: kitFiles },
+      notices: variant.needsNotices ? { file: NOTICES, source: 'oaiy-curated', sha256: sha256(fs.readFileSync(CURATED_NOTICES)) } : null,
+    }, variant.folder);
+    const expected = {
+      'zipp_wasm_bg.wasm': module,
+      'zipp_wasm.js': glue,
+      'zipp_wasm.d.ts': folder.kitFiles.get('zipp-engine.d.ts'),
+      'LICENSE-APACHE': folder.kitFiles.get('LICENSE-APACHE'),
+      'PROFILE.json': profileJson,
+      'RELEASE-SHA256SUMS': folder.top,
+    };
+    for (const [name, bytes] of Object.entries(expected)) assert.ok(fs.readFileSync(path.join(dir, name)).equals(bytes), `${variant.folder}/${name} byte for byte`);
   }
-  // Only the Python engine compiles in Unicode data; the bundle ships no notices, so the curated copy is installed and says so.
-  assert.equal(readSource(path.join(out, WEB.folder)).notices, null);
-  const notices = readSource(path.join(out, PYTHON.folder)).notices;
-  assert.deepEqual(notices, { file: 'THIRD_PARTY_LICENSES.txt', source: 'oaiy-curated', sha256: sha256(fs.readFileSync(CURATED_NOTICES)) });
-  assert.ok(fs.readFileSync(path.join(out, PYTHON.folder, 'THIRD_PARTY_LICENSES.txt')).equals(fs.readFileSync(CURATED_NOTICES)));
+  // Only the Python engine compiles in Unicode data; the release ships no notices, so the curated copy is installed and says so.
+  assert.ok(fs.readFileSync(path.join(out, PYTHON.folder, NOTICES)).equals(fs.readFileSync(CURATED_NOTICES)));
   const check = cli(['--check'], { ZIPP_OUT: out });
   assert.equal(check.status, 0, `${check.stdout}\n${check.stderr}`);
   assert.match(check.stdout, new RegExp(`ZIPP ${escaped(TAG)} \\(cccccccc\\) in .* checks\\.`));
 });
 
-test('the engines ui/vendor holds, real glue and modules, pass the same checks when repacked', async (t) => {
+test('the engines ui/vendor holds, real glue and modules, pass the same checks repacked into a release, and give back the installed files', async (t) => {
   let installed;
   try {
     installed = checkInstalls(VENDOR_DIR);
@@ -263,100 +416,144 @@ test('the engines ui/vendor holds, real glue and modules, pass the same checks w
     if (!process.env.CI) return t.skip(why);
     assert.fail(`${why}\n${error.message}`);
   }
-  const folder = releaseFolder(t, { version: installed.release.slice(1), real: true });
-  const installs = await verifyRelease({ release: installed.release, sums: folder.top, zips: folder.zips });
-  for (const { variant, source } of installs) {
+  // The installed modules as they are, a kit of the installed declarations and licence, and a SHA256SUMS of both.
+  const folder = releaseFolder(t, { version: installed.release.slice(1), commit: installed.revision, real: true });
+  const installs = await verifyRelease({ release: installed.release, sums: folder.top, modules: folder.modules, kit: folder.kit });
+  const fields = ['revision', 'version', 'bundle', 'bundleSha256', 'sha256', 'glueSha256', 'profileSha256', 'variant', 'languages', 'stackBytes', 'notices'];
+  for (const { variant, files, source } of installs) {
+    const dir = path.join(VENDOR_DIR, variant.folder);
+    // Above all PROFILE.json: what the real engine reports through its own glue is the file installed.
+    for (const name of installedFiles(source.notices).filter((n) => !['RELEASE-SHA256SUMS', 'SOURCE.json'].includes(n))) {
+      assert.ok(files.get(name).equals(fs.readFileSync(path.join(dir, name))), `${variant.folder}/${name} is what the real release gives`);
+    }
     const was = installed.sources[variant.suffix];
-    assert.deepEqual({ revision: source.revision, sha256: source.sha256, glueSha256: source.glueSha256, languages: source.languages }, { revision: was.revision, sha256: was.sha256, glueSha256: was.glueSha256, languages: was.languages }, variant.folder);
+    assert.deepEqual(Object.fromEntries(fields.map((f) => [f, source[f]])), Object.fromEntries(fields.map((f) => [f, was[f]])), variant.folder);
+    assert.deepEqual(source.kit.files, was.kit.files, `${variant.folder}: the kit's files`);
   }
 });
 
-test('notices a bundle ships itself are taken from it and recorded as the release\'s, for either bundle', (t) => {
-  const withNotices = (files) => files.set('THIRD_PARTY_LICENSES.txt', Buffer.from('ZIPP\'s own notices\n'));
-  const { out, run } = install(t, releaseFolder(t, { edit: { web: withNotices, 'web-python': withNotices } }));
+test('notices the kit ships itself are taken from it into both installs and recorded as the release\'s', (t) => {
+  const notices = Buffer.from('ZIPP\'s own notices\n');
+  const { out, run } = install(t, releaseFolder(t, { kit: (files) => files.set(NOTICES, notices) }));
   assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
-  for (const variant of VARIANTS) assert.deepEqual(readSource(path.join(out, variant.folder)).notices, { file: 'THIRD_PARTY_LICENSES.txt', source: 'zipp-release', sha256: sha256(Buffer.from('ZIPP\'s own notices\n')) });
+  for (const variant of VARIANTS) {
+    const dir = path.join(out, variant.folder);
+    const record = readSource(dir);
+    assert.deepEqual(record.notices, { file: NOTICES, source: 'zipp-release', sha256: sha256(notices) }, variant.folder);
+    assert.deepEqual(record.kit.files[NOTICES], { from: NOTICES, sha256: sha256(notices) }, `${variant.folder}: a file taken from the kit`);
+    assert.ok(fs.readFileSync(path.join(dir, NOTICES)).equals(notices));
+  }
   assert.equal(cli(['--check'], { ZIPP_OUT: out }).status, 0);
+  // Listed by the kit's SHA256SUMS, like everything else taken from it.
+  const unlisted = releaseFolder(t, { kit: (files) => files.set(NOTICES, notices), kitSums: (text) => dropLine(text, NOTICES) });
+  refused(install(t, unlisted), /THIRD_PARTY_LICENSES\.txt in zipp-1\.2\.3-wasm-embed-kit\.zip is not listed in the kit's SHA256SUMS/);
 });
 
-test('a zip that disagrees with the release\'s SHA256SUMS is refused, even one holding the very same files', async (t) => {
+test('a module or kit that disagrees with the release\'s SHA256SUMS is refused, even one carrying the very same record, glue and files', async (t) => {
   for (const variant of VARIANTS) {
-    const folder = releaseFolder(t, { repack: variant.suffix });
-    // Every file inside checks, so only ZIPP's top-level SHA256SUMS can tell.
-    const inside = unzip(folder.zips[variant.suffix]);
-    for (const [name, bytes] of folder.bundles[variant.suffix].entries) if (!name.endsWith('/')) assert.ok(inside.get(name).equals(bytes), `${name} is in the repacked zip unchanged`);
-    refused(install(t, folder), new RegExp(`${escaped(bundleName(VERSION, variant))}\\.zip has sha256 [0-9a-f]{64}; the ${escaped(TAG)} SHA256SUMS says [0-9a-f]{64}`));
-    // verifyRelease holds each zip to the SHA256SUMS itself, whoever loaded it.
-    await assert.rejects(verifyRelease({ release: TAG, sums: folder.top, zips: folder.zips }), (error) => error instanceof ZippReleaseError && error.message === `${bundleName(VERSION, variant)}.zip does not match the ${TAG} SHA256SUMS`);
+    // Still a valid module with the same record, glue and stack: only ZIPP's SHA256SUMS can tell.
+    const folder = releaseFolder(t, { tamper: { [variant.suffix]: (bytes) => appendSection(bytes, 'name', Buffer.from('built again')) } });
+    const [module, listed] = [folder.modules[variant.suffix], folder.listed[variant.suffix]];
+    for (const name of ['zipp.meta', 'zipp.glue']) assert.deepEqual(wasmCustomSections(module, name), wasmCustomSections(listed, name), `${name} is carried unchanged`);
+    assert.equal(wasmStackBytes(module), variant.stackBytes);
+    refused(install(t, folder), new RegExp(`${escaped(moduleName(VERSION, variant))} has sha256 [0-9a-f]{64}; the ${escaped(TAG)} SHA256SUMS says [0-9a-f]{64}`));
+    // verifyRelease holds each module to the SHA256SUMS itself, whoever loaded it.
+    await assert.rejects(verifyRelease({ release: TAG, sums: folder.top, modules: folder.modules, kit: folder.kit }), (error) => error instanceof ZippReleaseError && error.message === `${moduleName(VERSION, variant)} does not match the ${TAG} SHA256SUMS`);
   }
+  const repacked = releaseFolder(t, { repack: true });
+  // Every file inside checks, so only ZIPP's top-level SHA256SUMS can tell.
+  const inside = unzip(repacked.kit);
+  for (const [name, bytes] of repacked.kitEntries) assert.ok(inside.get(name).equals(bytes), `${name} is in the repacked kit unchanged`);
+  refused(install(t, repacked), /zipp-1\.2\.3-wasm-embed-kit\.zip has sha256 [0-9a-f]{64}; the v1\.2\.3 SHA256SUMS says [0-9a-f]{64}/);
+  await assert.rejects(verifyRelease({ release: TAG, sums: repacked.top, modules: repacked.modules, kit: repacked.kit }), (error) => error instanceof ZippReleaseError && error.message === `${kitName(VERSION)} does not match the ${TAG} SHA256SUMS`);
   const flipped = releaseFolder(t);
-  const file = path.join(flipped.dir, `${bundleName(VERSION, PYTHON)}.zip`);
+  const file = path.join(flipped.dir, moduleName(VERSION, PYTHON));
   const bytes = fs.readFileSync(file);
   bytes[bytes.length >> 1] ^= 0x01;
   fs.writeFileSync(file, bytes);
-  refused(install(t, flipped), /web-python\.zip has sha256 [0-9a-f]{64}; the v1\.2\.3 SHA256SUMS says/);
+  refused(install(t, flipped), /zipp-1\.2\.3-javascript-python\.wasm has sha256 [0-9a-f]{64}; the v1\.2\.3 SHA256SUMS says/);
 });
 
-test('a file that disagrees with its bundle\'s SHA256SUMS is refused', (t) => {
-  const tamper = (files) => files.set('zipp_wasm.d.ts', Buffer.concat([files.get('zipp_wasm.d.ts'), Buffer.from(' ')]));
-  refused(install(t, releaseFolder(t, { tamper: { web: tamper } })), /zipp_wasm\.d\.ts in zipp-wasm-1\.2\.3-web\.zip does not match the bundle's SHA256SUMS/);
-  refused(install(t, releaseFolder(t, { tamper: { 'web-python': tamper } })), /zipp_wasm\.d\.ts in zipp-wasm-1\.2\.3-web-python\.zip does not match the bundle's SHA256SUMS/);
+test('a kit file that disagrees with the kit\'s own SHA256SUMS is refused, whether the install takes it or not', (t) => {
+  const append = (name) => (files) => files.set(name, Buffer.concat([files.get(name), Buffer.from(' ')]));
+  refused(install(t, releaseFolder(t, { tamperKit: append('zipp-engine.d.ts') })), /zipp-engine\.d\.ts in zipp-1\.2\.3-wasm-embed-kit\.zip does not match the kit's SHA256SUMS/);
+  refused(install(t, releaseFolder(t, { tamperKit: append('LICENSE-APACHE') })), /LICENSE-APACHE in zipp-1\.2\.3-wasm-embed-kit\.zip does not match the kit's SHA256SUMS/);
+  refused(install(t, releaseFolder(t, { tamperKit: append('host-sdk/zipp-host.mjs') })), /host-sdk\/zipp-host\.mjs in zipp-1\.2\.3-wasm-embed-kit\.zip does not match the kit's SHA256SUMS/);
+  refused(install(t, releaseFolder(t, { tamperKit: (files) => files.delete('SHA256SUMS') })), /zipp-1\.2\.3-wasm-embed-kit\.zip carries no SHA256SUMS/);
 });
 
-test('a file the install takes that its bundle\'s SHA256SUMS does not list, or one it lists that the bundle lacks, is refused', (t) => {
-  const innerSums = (text) => text.split('\n').filter((line) => !line.endsWith('  LICENSE-APACHE')).join('\n');
-  refused(install(t, releaseFolder(t, { innerSums: { web: innerSums } })), /LICENSE-APACHE in zipp-wasm-1\.2\.3-web\.zip is not listed in the bundle's SHA256SUMS/);
-  const ghost = (text) => `${text}${'f'.repeat(64)}  docs/GHOST.md\n`;
-  refused(install(t, releaseFolder(t, { innerSums: { 'web-python': ghost } })), /zipp-wasm-1\.2\.3-web-python\.zip lists docs\/GHOST\.md in its SHA256SUMS but does not carry it/);
+test('a file the install reads from the kit that its SHA256SUMS does not list, one it lists that the kit lacks, or one the kit lacks, is refused', (t) => {
+  for (const name of ['zipp-engine.d.ts', 'LICENSE-APACHE', 'BUILD-INFO.txt', 'modules.json']) {
+    refused(install(t, releaseFolder(t, { kitSums: (text) => dropLine(text, name) })), new RegExp(`${escaped(name)} in zipp-1\\.2\\.3-wasm-embed-kit\\.zip is not listed in the kit's SHA256SUMS`));
+  }
+  refused(install(t, releaseFolder(t, { kitSums: (text) => `${text}${'f'.repeat(64)}  docs/GHOST.md\n` })), /zipp-1\.2\.3-wasm-embed-kit\.zip lists docs\/GHOST\.md in its SHA256SUMS but does not carry it/);
+  refused(install(t, releaseFolder(t, { kit: (files) => files.delete('zipp-engine.d.ts') })), /zipp-1\.2\.3-wasm-embed-kit\.zip has no zipp-engine\.d\.ts/);
+  // Another release's kit under this one's name, with a SHA256SUMS to match.
+  refused(install(t, releaseFolder(t, { kitTop: 'zipp-1.2.2-wasm-embed-kit' })), /zipp-1\.2\.3-wasm-embed-kit\.zip has no zipp-1\.2\.3-wasm-embed-kit\/ folder; its files are under zipp-1\.2\.2-wasm-embed-kit \(is it another release's kit\?\)/);
 });
 
-test('each bundle has to be its own variant by what BUILD-INFO.txt says, whatever the zip is called', (t) => {
-  const asWeb = (files) => {
-    setBuildInfo(files, 'variant', 'javascript');
-    setBuildInfo(files, 'languages', '["javascript"]');
-    setBuildInfo(files, 'stack-bytes', '1048576');
-  };
-  refused(install(t, releaseFolder(t, { edit: { 'web-python': asWeb } })), /variant is javascript, not javascript-python/);
-  const asPython = (files) => {
-    setBuildInfo(files, 'variant', 'javascript-python');
-    setBuildInfo(files, 'languages', '["javascript","python"]');
-    setBuildInfo(files, 'stack-bytes', '16777216');
-  };
-  refused(install(t, releaseFolder(t, { edit: { web: asPython } })), /variant is javascript-python, not javascript \(the web bundle\)/);
-  refused(install(t, releaseFolder(t, { edit: { 'web-python': (files) => setBuildInfo(files, 'stack-bytes', '1048576') } })), /BUILD-INFO\.txt stack-bytes is 1048576, not 16777216/);
-  refused(install(t, releaseFolder(t, { edit: { web: (files) => setBuildInfo(files, 'languages', '["javascript","python"]') } })), /BUILD-INFO\.txt languages are \["javascript","python"\], not \["javascript"\]/);
-  // The two zips under each other's names, with a SHA256SUMS to match: named for what it holds, not what it is called.
+test('the kit has to describe the release: BUILD-INFO.txt and modules.json name its version, the modules\' commit and both modules by their SHA256SUMS digests', (t) => {
+  const kitRefused = (kit, pattern) => refused(install(t, releaseFolder(t, { kit })), pattern);
+  const E40 = 'e'.repeat(40);
+  kitRefused((files) => setBuildInfo(files, 'version', '9.9.9'), /zipp-1\.2\.3-wasm-embed-kit\.zip is not the ZIPP v1\.2\.3 embed kit of commit c{40}:\n {2}- BUILD-INFO\.txt says version 9\.9\.9, not 1\.2\.3/);
+  kitRefused((files) => setBuildInfo(files, 'commit', E40), /BUILD-INFO\.txt commit e{40} is not the modules' commit c{40}/);
+  kitRefused((files) => setJson(files, 'modules.json', (m) => void (m.version = '9.9.9')), /modules\.json says version 9\.9\.9, not 1\.2\.3/);
+  kitRefused((files) => setJson(files, 'modules.json', (m) => void (m.commit = E40)), /modules\.json commit e{40} is not the modules' commit c{40}/);
+  kitRefused((files) => setJson(files, 'modules.json', (m) => void (m.modules.find((e) => e.file === moduleName(VERSION, PYTHON)).sha256 = 'e'.repeat(64))), /modules\.json gives zipp-1\.2\.3-javascript-python\.wasm sha256 e{64}; the v1\.2\.3 SHA256SUMS says [0-9a-f]{64}/);
+  kitRefused((files) => setJson(files, 'modules.json', (m) => void (m.modules = m.modules.filter((e) => e.file !== moduleName(VERSION, WEB)))), /modules\.json does not list zipp-1\.2\.3-javascript\.wasm$/m);
+  kitRefused((files) => setJson(files, 'modules.json', (m) => void m.modules.push({ ...m.modules[0] })), /modules\.json lists zipp-1\.2\.3-javascript\.wasm 2 times/);
+  kitRefused((files) => files.set('modules.json', Buffer.from('{ not json')), /zipp-1\.2\.3-wasm-embed-kit\.zip modules\.json is not JSON/);
+});
+
+test('each module has to be its own variant by what its zipp.meta and its stack say, whatever the file is called', (t) => {
+  const asWeb = (parts) => Object.assign(parts, { stack: WEB.stackBytes, meta: { ...parts.meta, variant: WEB.variant, languages: WEB.languages } });
+  refused(install(t, releaseFolder(t, { edit: { 'web-python': asWeb } })), /zipp-1\.2\.3-javascript-python\.wasm is not the ZIPP v1\.2\.3 javascript-python engine:[\s\S]*zipp\.meta variant is javascript, not javascript-python[\s\S]*its stack is 1048576 bytes, not 16777216/);
+  const asPython = (parts) => Object.assign(parts, { stack: PYTHON.stackBytes, meta: { ...parts.meta, variant: PYTHON.variant, languages: PYTHON.languages } });
+  refused(install(t, releaseFolder(t, { edit: { web: asPython } })), /zipp-1\.2\.3-javascript\.wasm is not the ZIPP v1\.2\.3 javascript engine:[\s\S]*zipp\.meta variant is javascript-python, not javascript$/m);
+  const each = (suffix, edit, pattern) => refused(install(t, releaseFolder(t, { edit: { [suffix]: edit } })), pattern);
+  each('web-python', (parts) => void (parts.stack = 1048576), /its stack is 1048576 bytes, not 16777216/);
+  each('web-python', (parts) => void (parts.stackType = 'i64'), /its stack is not readable \(its first global is not an i32 stack pointer\), not 16777216/);
+  each('web', (parts) => void (parts.meta.languages = ['javascript', 'python']), /zipp\.meta languages are \["javascript","python"\], not \["javascript"\]/);
+  each('web', (parts) => void (parts.meta.version = '9.9.9'), /zipp\.meta says version 9\.9\.9, not 1\.2\.3/);
+  each('web', (parts) => void (parts.meta.format = 2), /zipp\.meta format is 2, not 1/);
+  // The two modules under each other's names, with a SHA256SUMS to match: named for what it holds, not what it is called.
   const swapped = releaseFolder(t);
-  fs.writeFileSync(path.join(swapped.dir, `${bundleName(VERSION, WEB)}.zip`), swapped.zips['web-python']);
-  fs.writeFileSync(path.join(swapped.dir, `${bundleName(VERSION, PYTHON)}.zip`), swapped.zips.web);
-  fs.writeFileSync(path.join(swapped.dir, 'SHA256SUMS'), `${sha256(swapped.zips['web-python'])}  ${bundleName(VERSION, WEB)}.zip\n${sha256(swapped.zips.web)}  ${bundleName(VERSION, PYTHON)}.zip\n`);
-  refused(install(t, swapped), /zipp-wasm-1\.2\.3-web\.zip has no zipp-wasm-1\.2\.3-web\/ folder; its files are under zipp-wasm-1\.2\.3-web-python \(is it another bundle\?\)/);
+  fs.writeFileSync(path.join(swapped.dir, moduleName(VERSION, WEB)), swapped.modules['web-python']);
+  fs.writeFileSync(path.join(swapped.dir, moduleName(VERSION, PYTHON)), swapped.modules.web);
+  fs.writeFileSync(path.join(swapped.dir, 'SHA256SUMS'), `${sha256(swapped.modules['web-python'])}  ${moduleName(VERSION, WEB)}\n${sha256(swapped.modules.web)}  ${moduleName(VERSION, PYTHON)}\n${sha256(swapped.kit)}  ${kitName(VERSION)}\n`);
+  refused(install(t, swapped), /zipp-1\.2\.3-javascript\.wasm is not the ZIPP v1\.2\.3 javascript engine:[\s\S]*zipp\.meta variant is javascript-python, not javascript/);
 });
 
-test('bundles that name different commits are not one release, even when each checks on its own', (t) => {
+test('a module has to carry one zipp.meta record and one zipp.glue section, name a full commit, and carry the glue its record names', (t) => {
+  const module = (edit, suffix = 'web') => install(t, releaseFolder(t, { edit: { [suffix]: edit } }));
+  refused(module((parts) => parts.custom.push(['zipp.meta', Buffer.from(JSON.stringify(parts.meta))])), /zipp-1\.2\.3-javascript\.wasm carries 2 zipp\.meta records, not one/);
+  refused(module((parts) => void (parts.record = null)), /zipp-1\.2\.3-javascript\.wasm carries 0 zipp\.meta records, not one/);
+  refused(module((parts) => void (parts.record = Buffer.from('{ not json'))), /zipp-1\.2\.3-javascript\.wasm's zipp\.meta record is not a JSON object/);
+  refused(module((parts) => void (parts.glue = null)), /zipp-1\.2\.3-javascript\.wasm carries 0 zipp\.glue sections, not one/);
+  refused(module((parts) => parts.custom.push(['zipp.glue', standInGlue(parts.profile)])), /zipp-1\.2\.3-javascript\.wasm carries 2 zipp\.glue sections, not one/);
+  refused(module((parts) => void (parts.meta.glueSha256 = 'e'.repeat(64)), 'web-python'), /zipp-1\.2\.3-javascript-python\.wasm is not the ZIPP v1\.2\.3 javascript-python engine:\n {2}- its zipp\.glue section has sha256 [0-9a-f]{64}; zipp\.meta says glueSha256 e{64}/);
+  refused(module((parts) => void (parts.meta.commit = 'cccccccc'), 'web-python'), /zipp\.meta commit "cccccccc" is not a full 40-hex commit/);
+  refused(module((parts) => void (parts.bytes = Buffer.from('not a WebAssembly module'))), /zipp-1\.2\.3-javascript\.wasm is not a WebAssembly module/);
+});
+
+test('modules that name different commits are not one release, even when each checks on its own', (t) => {
   const other = 'd'.repeat(40);
-  const edit = { web: (files) => {
-    setBuildInfo(files, 'commit', other);
-    setGlue(files, (profile) => ({ ...profile, source: { sha: other } }));
+  const edit = { web: (parts) => {
+    parts.meta.commit = other;
+    parts.profile.source = { sha: other };
   } };
-  refused(install(t, releaseFolder(t, { edit })), new RegExp(`the ZIPP v1\\.2\\.3 bundles name different commits: web d{40}, web-python c{40}`));
+  refused(install(t, releaseFolder(t, { edit })), /the ZIPP v1\.2\.3 modules name different commits: web d{40}, web-python c{40}/);
 });
 
-test('each module has to describe itself as its variant of the release: version, languages, the safe sandbox, the commit', (t) => {
-  const saying = (suffix, change) => releaseFolder(t, { edit: { [suffix]: (files) => setGlue(files, (profile) => ({ ...profile, ...change })) } });
+test('each module, loaded under its own glue, has to describe itself as its variant of the release: version, languages, the safe sandbox, the commit', (t) => {
+  const saying = (suffix, change) => releaseFolder(t, { edit: { [suffix]: (parts) => Object.assign(parts.profile, change) } });
   refused(install(t, saying('web-python', { version: '9.9.9' })), /zippProfile\(\) version is 9\.9\.9, not 1\.2\.3/);
   refused(install(t, saying('web-python', { languages: ['javascript'] })), /zippProfile\(\) languages are \["javascript"\], not \["javascript","python"\]/);
   refused(install(t, saying('web', { languages: ['javascript', 'python'] })), /zippProfile\(\) languages are \["javascript","python"\], not \["javascript"\]/);
   refused(install(t, saying('web', { features: ['meter-only'] })), /zippProfile\(\) lacks the safe-sandbox feature/);
-  refused(install(t, saying('web', { source: { sha: 'b'.repeat(40) } })), /zippProfile\(\) source\.sha is b{40}, not the BUILD-INFO\.txt commit c{40}/);
-  const broken = releaseFolder(t, { edit: { web: (files) => files.set('zipp_wasm.js', Buffer.from('export function initSync() { throw new Error("trap"); }\n')) } });
-  refused(install(t, broken), /the zipp-wasm-1\.2\.3-web\.zip engine does not load: trap/);
-});
-
-test('a PROFILE.json of another version, or a BUILD-INFO.txt commit that is not a full commit, is refused', (t) => {
-  const edit = (files) => files.set('PROFILE.json', Buffer.from(files.get('PROFILE.json').toString('utf8').replace(`"version": "${VERSION}"`, '"version": "9.9.9"')));
-  refused(install(t, releaseFolder(t, { edit: { web: edit } })), /PROFILE\.json says version 9\.9\.9/);
-  refused(install(t, releaseFolder(t, { edit: { 'web-python': (files) => setBuildInfo(files, 'commit', 'cccccccc') } })), /not a full 40-hex commit/);
+  refused(install(t, saying('web', { source: { sha: 'b'.repeat(40) } })), /the zipp-1\.2\.3-javascript\.wasm engine does not describe itself as ZIPP v1\.2\.3 javascript:\n {2}- zippProfile\(\) source\.sha is b{40}, not the zipp\.meta commit c{40}/);
+  const broken = releaseFolder(t, { edit: { web: (parts) => void (parts.glue = Buffer.from('export function initSync() { throw new Error("trap"); }\n')) } });
+  refused(install(t, broken), /the zipp-1\.2\.3-javascript\.wasm engine does not load under its own glue: trap/);
 });
 
 test('ZIPP_SUMS_SHA256 pins the release\'s SHA256SUMS', (t) => {
@@ -366,7 +563,7 @@ test('ZIPP_SUMS_SHA256 pins the release\'s SHA256SUMS', (t) => {
   assert.equal(install(t, folder, { env: { ZIPP_SUMS_SHA256: sha256(folder.top).toUpperCase() } }).run.status, 0);
 });
 
-test('a SHA256SUMS other than ZIPP_SUMS_SHA256 is refused before either bundle is downloaded', async (t) => {
+test('a SHA256SUMS other than ZIPP_SUMS_SHA256 is refused before either module or the kit is downloaded', async (t) => {
   const folder = releaseFolder(t);
   const { calls, fetch } = serve(new Map([[`${REPOSITORY}/releases/download/${TAG}/SHA256SUMS`, folder.top]]));
   const out = outDir(t);
@@ -378,16 +575,34 @@ test('a SHA256SUMS other than ZIPP_SUMS_SHA256 is refused before either bundle i
   for (const variant of VARIANTS) assert.ok(!fs.existsSync(path.join(out, variant.folder)), `nothing is installed into ${variant.folder}`);
 });
 
-test('a folder or SHA256SUMS without both bundles is refused', (t) => {
-  for (const variant of VARIANTS) {
+test('a folder or SHA256SUMS without both modules and the kit is refused', (t) => {
+  for (const name of [...VARIANTS.map((v) => moduleName(VERSION, v)), kitName(VERSION)]) {
     const folder = releaseFolder(t);
-    fs.rmSync(path.join(folder.dir, `${bundleName(VERSION, variant)}.zip`));
-    refused(install(t, folder), new RegExp(`holds no ${escaped(bundleName(VERSION, variant))}\\.zip`));
+    fs.rmSync(path.join(folder.dir, name));
+    refused(install(t, folder), new RegExp(`holds no ${escaped(name)}$`, 'm'));
   }
-  const onlyPython = releaseFolder(t);
-  editText(path.join(onlyPython.dir, 'SHA256SUMS'), (text) => text.split('\n').filter((line) => !line.endsWith('-web.zip')).join('\n'));
-  refused(install(t, onlyPython), /does not list zipp-wasm-1\.2\.3-web\.zip/);
-  refused(install(t, releaseFolder(t), { args: ['v1.2.4'] }), /does not list zipp-wasm-1\.2\.4-web\.zip or zipp-wasm-1\.2\.4-web-python\.zip/);
+  refused(install(t, releaseFolder(t, { sums: (text) => dropLine(text, moduleName(VERSION, WEB)) })), /does not list zipp-1\.2\.3-javascript\.wasm$/m);
+  refused(install(t, releaseFolder(t, { sums: (text) => dropLine(text, kitName(VERSION)) })), /does not list zipp-1\.2\.3-wasm-embed-kit\.zip$/m);
+  refused(install(t, releaseFolder(t), { args: ['v1.2.4'] }), /does not list zipp-1\.2\.4-javascript\.wasm, zipp-1\.2\.4-javascript-python\.wasm or zipp-1\.2\.4-wasm-embed-kit\.zip/);
+});
+
+test('a release published as zip bundles, as every one before v0.0.26 was, is refused by name wherever it comes from', async (t) => {
+  const zipSums = Buffer.from(`${'1'.repeat(64)}  zipp-0.0.24-linux-x86_64\n${'2'.repeat(64)}  zipp-wasm-0.0.24-web.zip\n${'3'.repeat(64)}  zipp-wasm-0.0.24-web-python.zip\n`);
+  const named = /lists zip bundles \(zipp-wasm-0\.0\.24-web\.zip, zipp-wasm-0\.0\.24-web-python\.zip\) and no WebAssembly modules: releases before v0\.0\.26 publish zip bundles, which this installer no longer reads; install v0\.0\.26 or later/;
+  const dir = tempDir(t, 'zipp-zip-release-');
+  fs.writeFileSync(path.join(dir, 'SHA256SUMS'), zipSums);
+  for (const name of ['zipp-wasm-0.0.24-web.zip', 'zipp-wasm-0.0.24-web-python.zip']) fs.writeFileSync(path.join(dir, name), 'a zip bundle');
+  // The release a folder holds, and one named.
+  refused(install(t, { dir }), named);
+  refused(install(t, { dir }, { env: { ZIPP_RELEASE: 'v0.0.24' } }), named);
+  // The latest, and a tag, from GitHub.
+  const latestUrl = `${REPOSITORY}/releases/latest/download/SHA256SUMS`;
+  const tagUrl = `${REPOSITORY}/releases/download/v0.0.24/SHA256SUMS`;
+  const { fetch, calls } = serve(new Map([[latestUrl, zipSums], [tagUrl, zipSums]]));
+  await assert.rejects(resolveRelease({ fetch }), (error) => error instanceof ZippReleaseError && named.test(error.message));
+  await assert.rejects(resolveRelease({ tag: 'v0.0.24', fetch }), (error) => error instanceof ZippReleaseError && named.test(error.message));
+  await assert.rejects(installRelease({ vendorDir: outDir(t), latest: true, cacheDir: tempDir(t, 'zipp-cache-'), fetch, log: quiet }), named);
+  assert.ok(calls.every((url) => url.endsWith('/SHA256SUMS')), 'no bundle is downloaded');
 });
 
 test('an install replaces both whole folders, so a stale file does not survive', (t) => {
@@ -395,7 +610,8 @@ test('an install replaces both whole folders, so a stale file does not survive',
   for (const variant of VARIANTS) {
     fs.mkdirSync(path.join(out, variant.folder), { recursive: true });
     fs.writeFileSync(path.join(out, variant.folder, 'README.md'), 'a committed engine\'s readme');
-    fs.writeFileSync(path.join(out, variant.folder, 'UPSTREAM-SHA256SUMS'), 'stale');
+    // What an install of a zip bundle held and this one does not.
+    for (const name of ['BUILD-INFO.txt', 'SHA256SUMS', 'zipp_wasm_bg.wasm.d.ts']) fs.writeFileSync(path.join(out, variant.folder, name), 'from a bundle');
   }
   const { run } = install(t, releaseFolder(t), { out });
   assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
@@ -403,19 +619,26 @@ test('an install replaces both whole folders, so a stale file does not survive',
   assert.deepEqual(fs.readdirSync(out).sort(), ['zipp-wasm', 'zipp-wasm-python'], 'neither the stages nor the previous installs are left behind');
 });
 
-test('--check fails after a one-byte edit, on a file its bundle\'s SHA256SUMS does not list, and on installs of two releases', (t) => {
+test('--check fails after a one-byte edit, on an engine copied over the other, and on installs of two releases', (t) => {
   const { out, run } = install(t, releaseFolder(t));
   assert.equal(run.status, 0, run.stderr);
   const dir = path.join(out, WEB.folder);
-  const file = path.join(dir, 'zipp_wasm_bg.wasm.d.ts');
+  const file = path.join(dir, 'zipp_wasm.d.ts');
   const original = fs.readFileSync(file);
   const edited = Buffer.from(original);
   edited[0] ^= 0x01;
   fs.writeFileSync(file, edited);
-  refused({ run: cli(['--check'], { ZIPP_OUT: out }) }, /zipp-wasm does not check[\s\S]*zipp_wasm_bg\.wasm\.d\.ts does not match the bundle's SHA256SUMS/);
+  refused({ run: cli(['--check'], { ZIPP_OUT: out }) }, /zipp-wasm does not check[\s\S]*zipp_wasm\.d\.ts is not the kit's zipp-engine\.d\.ts recorded/);
   fs.writeFileSync(file, original);
-  editText(path.join(dir, 'SHA256SUMS'), (text) => text.split('\n').filter((line) => !line.endsWith('  zipp_wasm_bg.wasm.d.ts')).join('\n'));
-  refused({ run: cli(['--check'], { ZIPP_OUT: out }) }, /zipp_wasm_bg\.wasm\.d\.ts is not listed in the bundle's SHA256SUMS/);
+  // One byte of the glue the module carries: neither the module nor its glue is the one installed now.
+  const wasmFile = path.join(dir, 'zipp_wasm_bg.wasm');
+  const wasm = fs.readFileSync(wasmFile);
+  const changed = Buffer.from(wasm);
+  changed[changed.lastIndexOf('zippProfile')] ^= 0x20;
+  fs.writeFileSync(wasmFile, changed);
+  refused({ run: cli(['--check'], { ZIPP_OUT: out }) }, /zipp_wasm_bg\.wasm is not the recorded [0-9a-f]{64}[\s\S]*its zipp\.glue section has sha256 [0-9a-f]{64}; zipp\.meta says glueSha256 [0-9a-f]{64}[\s\S]*zipp_wasm\.js is not the glue zipp_wasm_bg\.wasm carries/);
+  fs.writeFileSync(wasmFile, wasm);
+  assert.equal(checkInstalls(out).release, TAG);
 
   // Each folder checks on its own; together they are not one ZIPP.
   const older = install(t, releaseFolder(t, { version: '1.2.2', commit: 'e'.repeat(40) }));
@@ -424,10 +647,10 @@ test('--check fails after a one-byte edit, on a file its bundle\'s SHA256SUMS do
   fs.rmSync(path.join(newer.out, PYTHON.folder), { recursive: true });
   fs.cpSync(path.join(older.out, PYTHON.folder), path.join(newer.out, PYTHON.folder), { recursive: true });
   refused({ run: cli(['--check'], { ZIPP_OUT: newer.out }) }, /are not one release[\s\S]*release differs: zipp-wasm v1\.2\.3, zipp-wasm-python v1\.2\.2[\s\S]*revision differs/);
-  // The python engine copied over the web one is not the web install.
+  // The Python engine copied over the JavaScript one is not the JavaScript install.
   const swapped = install(t, releaseFolder(t));
   fs.copyFileSync(path.join(swapped.out, PYTHON.folder, 'zipp_wasm_bg.wasm'), path.join(swapped.out, WEB.folder, 'zipp_wasm_bg.wasm'));
-  refused({ run: cli(['--check'], { ZIPP_OUT: swapped.out }) }, /zipp_wasm_bg\.wasm does not match the bundle's SHA256SUMS[\s\S]*zipp_wasm_bg\.wasm is not the recorded/);
+  refused({ run: cli(['--check'], { ZIPP_OUT: swapped.out }) }, /zipp_wasm_bg\.wasm is not the recorded [0-9a-f]{64}[\s\S]*zipp_wasm_bg\.wasm: zipp\.meta variant is javascript-python, not javascript[\s\S]*zipp_wasm\.js is not the glue zipp_wasm_bg\.wasm carries[\s\S]*zipp_wasm_bg\.wasm: its stack is 16777216 bytes, not 1048576/);
 });
 
 test('--check holds each install to everything its SOURCE.json records, one invariant at a time', (t) => {
@@ -436,45 +659,51 @@ test('--check holds each install to everything its SOURCE.json records, one inva
   assert.equal(checkInstalls(pristine).release, TAG);
   const E64 = 'e'.repeat(64);
   const E40 = 'e'.repeat(40);
-  const setInfo = (key, value) => (dir) => {
-    editText(path.join(dir, 'BUILD-INFO.txt'), (text) => text.replace(new RegExp(`^${key}=.*$`, 'm'), `${key}=${value}`));
-    resum(dir, 'BUILD-INFO.txt');
-  };
+  const asPublished = (variant, edit) => (dir) => replaceModule(path.dirname(dir), variant, rebuilt(variant, edit));
   const cases = [
     [PYTHON, 'ZIPP\'s SHA256SUMS edited', (dir) => fs.appendFileSync(path.join(dir, 'RELEASE-SHA256SUMS'), '\n'), /RELEASE-SHA256SUMS has sha256 [0-9a-f]{64}, not the recorded [0-9a-f]{64}/],
-    [WEB, 'a recorded bundle digest', (dir) => editSource(dir, (s) => void (s.bundleSha256 = E64)), /RELEASE-SHA256SUMS does not list zipp-wasm-1\.2\.3-web\.zip with the recorded e{64}/],
-    [WEB, 'a recorded revision', (dir) => editSource(dir, (s) => void (s.revision = E40)), /BUILD-INFO\.txt commit c{40} is not the recorded revision e{40}/],
-    [PYTHON, 'a recorded stack', (dir) => editSource(dir, (s) => void (s.stackBytes = 1048576)), /SOURCE\.json records javascript-python \["javascript","python"\] with a 1048576-byte stack, not the web-python build/],
-    [WEB, 'the web install recorded as Python', (dir) => editSource(dir, (s) => void (s.languages = ['javascript', 'python'])), /not the web build/],
+    [WEB, 'a recorded module digest', (dir) => editSource(dir, (s) => void (s.bundleSha256 = E64)), /SOURCE\.json sha256 [0-9a-f]{64} is not the bundleSha256 e{64}; the module is installed as published[\s\S]*RELEASE-SHA256SUMS does not list zipp-1\.2\.3-javascript\.wasm with the recorded e{64}/],
+    [WEB, 'a recorded revision', (dir) => editSource(dir, (s) => void (s.revision = E40)), /zipp_wasm_bg\.wasm: zipp\.meta commit c{40} is not the recorded revision e{40}/],
+    [PYTHON, 'a recorded stack', (dir) => editSource(dir, (s) => void (s.stackBytes = 1048576)), /SOURCE\.json records javascript-python \["javascript","python"\] with a 1048576-byte stack, not the javascript-python engine/],
+    [WEB, 'the JavaScript install recorded as Python', (dir) => editSource(dir, (s) => void (s.languages = ['javascript', 'python'])), /not the javascript engine/],
     [PYTHON, 'a recorded engine digest', (dir) => editSource(dir, (s) => void (s.sha256 = E64)), /zipp_wasm_bg\.wasm is not the recorded e{64}/],
-    [WEB, 'a recorded glue digest', (dir) => editSource(dir, (s) => void (s.glueSha256 = E64)), /zipp_wasm\.js is not the recorded e{64}/],
+    [WEB, 'a recorded glue digest', (dir) => editSource(dir, (s) => void (s.glueSha256 = E64)), /zipp_wasm_bg\.wasm: zipp\.meta glueSha256 [0-9a-f]{64} is not the recorded e{64}[\s\S]*zipp_wasm\.js is not the recorded e{64}/],
+    [PYTHON, 'a recorded profile digest', (dir) => editSource(dir, (s) => void (s.profileSha256 = E64)), /PROFILE\.json is not the recorded e{64}/],
+    [WEB, 'a recorded kit digest', (dir) => editSource(dir, (s) => void (s.kit.sha256 = E64)), /RELEASE-SHA256SUMS does not list zipp-1\.2\.3-wasm-embed-kit\.zip with the recorded e{64}/],
+    [PYTHON, 'another release\'s kit', (dir) => editSource(dir, (s) => void (s.kit.file = 'zipp-1.2.2-wasm-embed-kit.zip')), /SOURCE\.json kit "zipp-1\.2\.2-wasm-embed-kit\.zip" is not the release's embed kit \(zipp-1\.2\.3-wasm-embed-kit\.zip\) with its sha256/],
+    [WEB, 'a recorded kit file digest', (dir) => editSource(dir, (s) => void (s.kit.files['zipp_wasm.d.ts'].sha256 = E64)), /zipp_wasm\.d\.ts is not the kit's zipp-engine\.d\.ts recorded \(e{64}\)/],
+    [PYTHON, 'a kit file recorded as another', (dir) => editSource(dir, (s) => void (s.kit.files['LICENSE-APACHE'].from = 'README.md')), /SOURCE\.json kit\.files records LICENSE-APACHE as \{"from":"README\.md",[^}]*\}, not the kit's LICENSE-APACHE with its sha256/],
     [PYTHON, 'a recorded notices digest', (dir) => editSource(dir, (s) => void (s.notices.sha256 = E64)), /THIRD_PARTY_LICENSES\.txt is not the recorded e{64}/],
-    [PYTHON, 'notices of unknown origin', (dir) => editSource(dir, (s) => void (s.notices.source = 'elsewhere')), /SOURCE\.json notices .* are not recorded for the web-python bundle/],
+    [PYTHON, 'notices of unknown origin', (dir) => editSource(dir, (s) => void (s.notices.source = 'elsewhere')), /SOURCE\.json notices .* are not recorded for the javascript-python engine/],
     [PYTHON, 'no notices recorded', (dir) => {
       editSource(dir, (s) => void (s.notices = null));
-      fs.rmSync(path.join(dir, 'THIRD_PARTY_LICENSES.txt'));
-    }, /SOURCE\.json notices null are not recorded for the web-python bundle/],
-    [WEB, 'curated notices in the web install', (dir) => editSource(dir, (s) => void (s.notices = { file: 'THIRD_PARTY_LICENSES.txt', source: 'oaiy-curated', sha256: E64 })), /THIRD_PARTY_LICENSES\.txt is missing[\s\S]*notices .* are not recorded for the web bundle/],
-    [PYTHON, 'curated notices recorded as the release\'s', (dir) => editSource(dir, (s) => void (s.notices.source = 'zipp-release')), /THIRD_PARTY_LICENSES\.txt is not listed in the bundle's SHA256SUMS/],
+      fs.rmSync(path.join(dir, NOTICES));
+    }, /SOURCE\.json notices null are not recorded for the javascript-python engine/],
+    [WEB, 'curated notices in the JavaScript install', (dir) => editSource(dir, (s) => void (s.notices = { file: NOTICES, source: 'oaiy-curated', sha256: E64 })), /THIRD_PARTY_LICENSES\.txt is missing[\s\S]*notices .* are not recorded for the javascript engine/],
+    [PYTHON, 'curated notices recorded as the release\'s', (dir) => editSource(dir, (s) => void (s.notices.source = 'zipp-release')), /SOURCE\.json kit\.files records THIRD_PARTY_LICENSES\.txt as undefined, not the kit's THIRD_PARTY_LICENSES\.txt with its sha256/],
     [WEB, 'another repository', (dir) => editSource(dir, (s) => void (s.repository = 'https://example.com/zipp')), /SOURCE\.json repository is https:\/\/example\.com\/zipp/],
     [WEB, 'a local build', (dir) => editSource(dir, (s) => void (s.build = 'local')), /SOURCE\.json build is local, not a verified release install/],
     [PYTHON, 'a release that is not the version', (dir) => editSource(dir, (s) => void (s.release = 'v9.9.9')), /SOURCE\.json release v9\.9\.9 and version 1\.2\.3 do not agree/],
-    [PYTHON, 'the web bundle recorded', (dir) => editSource(dir, (s) => void (s.bundle = 'zipp-wasm-1.2.3-web.zip')), /SOURCE\.json bundle zipp-wasm-1\.2\.3-web\.zip is not the web-python bundle/],
-    [WEB, 'BUILD-INFO.txt of another commit', setInfo('commit', E40), /BUILD-INFO\.txt commit e{40} is not the recorded revision c{40}/],
-    [PYTHON, 'BUILD-INFO.txt of another variant', setInfo('variant', 'javascript'), /BUILD-INFO\.txt variant is javascript, not javascript-python/],
-    [WEB, 'PROFILE.json of another version', (dir) => {
+    [PYTHON, 'the JavaScript module recorded', (dir) => editSource(dir, (s) => void (s.bundle = 'zipp-1.2.3-javascript.wasm')), /SOURCE\.json bundle zipp-1\.2\.3-javascript\.wasm is not the javascript-python module \(zipp-1\.2\.3-javascript-python\.wasm\)/],
+    [WEB, 'a module of another commit, recorded as published', asPublished(WEB, (parts) => void (parts.meta.commit = E40)), /zipp_wasm_bg\.wasm: zipp\.meta commit e{40} is not the recorded revision c{40}/],
+    [PYTHON, 'a module with another stack, recorded as published', asPublished(PYTHON, (parts) => void (parts.stack = 1048576)), /zipp_wasm_bg\.wasm: its stack is 1048576 bytes, not 16777216/],
+    [WEB, 'a module with two glue sections, recorded as published', asPublished(WEB, (parts) => parts.custom.push(['zipp.glue', standInGlue(parts.profile)])), /zipp_wasm_bg\.wasm carries 2 zipp\.glue sections, not one/],
+    [WEB, 'a zipp_wasm.js that is not the module\'s glue, recorded', (dir) => {
+      fs.appendFileSync(path.join(dir, 'zipp_wasm.js'), '// and one more line\n');
+      editSource(dir, (s) => void (s.glueSha256 = sha256(fs.readFileSync(path.join(dir, 'zipp_wasm.js')))));
+    }, /zipp_wasm\.js is not the glue zipp_wasm_bg\.wasm carries \(its zipp\.glue section\)/],
+    [PYTHON, 'PROFILE.json edited', (dir) => fs.appendFileSync(path.join(dir, 'PROFILE.json'), ' '), /PROFILE\.json is not the recorded [0-9a-f]{64}, the profile the engine reported at install/],
+    [WEB, 'PROFILE.json of another version, recorded', (dir) => {
       editText(path.join(dir, 'PROFILE.json'), (text) => text.replace(`"version": "${VERSION}"`, '"version": "9.9.9"'));
-      resum(dir, 'PROFILE.json');
+      editSource(dir, (s) => void (s.profileSha256 = sha256(fs.readFileSync(path.join(dir, 'PROFILE.json')))));
     }, /PROFILE\.json says version 9\.9\.9, not 1\.2\.3/],
-    [PYTHON, 'another engine, listed', (dir) => {
-      fs.appendFileSync(path.join(dir, 'zipp_wasm_bg.wasm'), 'x');
-      resum(dir, 'zipp_wasm_bg.wasm');
-    }, /zipp_wasm_bg\.wasm is not the recorded [0-9a-f]{64}/],
+    [PYTHON, 'another engine', (dir) => fs.appendFileSync(path.join(dir, 'zipp_wasm_bg.wasm'), 'x'), /zipp_wasm_bg\.wasm is not the recorded [0-9a-f]{64}/],
     [PYTHON, 'edited notices, recorded', (dir) => {
-      fs.appendFileSync(path.join(dir, 'THIRD_PARTY_LICENSES.txt'), 'and one more\n');
-      editSource(dir, (s) => void (s.notices.sha256 = sha256(fs.readFileSync(path.join(dir, 'THIRD_PARTY_LICENSES.txt')))));
+      fs.appendFileSync(path.join(dir, NOTICES), 'and one more\n');
+      editSource(dir, (s) => void (s.notices.sha256 = sha256(fs.readFileSync(path.join(dir, NOTICES)))));
     }, /THIRD_PARTY_LICENSES\.txt is not the curated copy in /],
     [WEB, 'a stray file', (dir) => fs.writeFileSync(path.join(dir, 'README.md'), ''), /README\.md is not part of the install/],
+    [WEB, 'a file the zip bundles shipped', (dir) => fs.writeFileSync(path.join(dir, 'BUILD-INFO.txt'), 'version=1.2.3\n'), /BUILD-INFO\.txt is not part of the install/],
     [PYTHON, 'a folder', (dir) => fs.mkdirSync(path.join(dir, 'docs')), /docs is not a plain file/],
     [WEB, 'a missing file', (dir) => fs.rmSync(path.join(dir, 'LICENSE-APACHE')), /LICENSE-APACHE is missing/],
     [PYTHON, 'no SOURCE.json', (dir) => fs.rmSync(path.join(dir, 'SOURCE.json')), /holds no ZIPP install \(no SOURCE\.json\)/],
@@ -486,7 +715,7 @@ test('--check holds each install to everything its SOURCE.json records, one inva
     assert.throws(() => checkInstalls(copy), (error) => error instanceof ZippReleaseError && pattern.test(error.message), `${variant.folder}: ${what}`);
   }
   // The curated copy an install is held to is the committed one, not whatever the install says.
-  const otherCurated = path.join(tempDir(t, 'zipp-curated-'), 'THIRD_PARTY_LICENSES.txt');
+  const otherCurated = path.join(tempDir(t, 'zipp-curated-'), NOTICES);
   fs.writeFileSync(otherCurated, 'a different curated copy\n');
   assert.throws(() => checkInstalls(pristine, { curatedNotices: otherCurated }), /THIRD_PARTY_LICENSES\.txt is not the curated copy in /);
 });
@@ -505,7 +734,7 @@ test('--resolve-only names the release and its SHA256SUMS digest without install
   assert.equal(resolved.status, 0, resolved.stderr);
   assert.deepEqual(JSON.parse(resolved.stdout), { release: TAG, sumsSha256: sha256(folder.top) });
   assert.deepEqual(fs.readdirSync(tree).sort(), ['scripts', 'ui'], 'nothing was installed or cached');
-  refused({ run: copy(['--resolve-only'], { ZIPP_RELEASE_DIR: folder.dir, ZIPP_RELEASE: 'v1.2.4' }) }, /SHA256SUMS in .* does not list zipp-wasm-1\.2\.4-web\.zip/);
+  refused({ run: copy(['--resolve-only'], { ZIPP_RELEASE_DIR: folder.dir, ZIPP_RELEASE: 'v1.2.4' }) }, /SHA256SUMS in .* does not list zipp-1\.2\.4-javascript\.wasm/);
   refused({ run: copy(['--resolve-only', '--latest'], { ZIPP_RELEASE_DIR: folder.dir }) }, /ZIPP_RELEASE_DIR holds one release; leave out --latest/);
   refused({ run: copy(['--resolve-only', '--latest'], { ZIPP_RELEASE: TAG }) }, /name a release or --latest, not both/);
   refused({ run: copy(['--resolve-only', 'latest']) }, /"latest" is not a ZIPP release tag/);
@@ -528,31 +757,35 @@ test('--resolve-only names the release and its SHA256SUMS digest without install
   refused({ run: copy(['--check', '--online'], {}, fetchStub(tree, 'unpublished.mjs', new Map())) }, /releases\/download\/v1\.2\.3\/SHA256SUMS answered 404$/m);
 
   // With no tag and no folder, the latest release.
-  const latestSums = Buffer.from(`${'3'.repeat(64)}  zipp-wasm-0.0.19-web.zip\n${'4'.repeat(64)}  zipp-wasm-0.0.19-web-python.zip\n`);
-  const stub = fetchStub(tree, 'latest.mjs', new Map([[`${REPOSITORY}/releases/latest/download/SHA256SUMS`, latestSums], [`${REPOSITORY}/releases/download/v0.0.19/SHA256SUMS`, latestSums]]));
+  const latestSums = Buffer.from(`${'3'.repeat(64)}  zipp-0.0.30-javascript.wasm\n${'4'.repeat(64)}  zipp-0.0.30-javascript-python.wasm\n${'5'.repeat(64)}  zipp-0.0.30-javascript-python-base.wasm\n${'6'.repeat(64)}  zipp-0.0.30-wasm-embed-kit.zip\n`);
+  const stub = fetchStub(tree, 'latest.mjs', new Map([[`${REPOSITORY}/releases/latest/download/SHA256SUMS`, latestSums], [`${REPOSITORY}/releases/download/v0.0.30/SHA256SUMS`, latestSums]]));
   for (const args of [['--resolve-only'], ['--resolve-only', '--latest']]) {
     const latest = copy(args, {}, stub);
     assert.equal(latest.status, 0, latest.stderr);
-    assert.deepEqual(JSON.parse(latest.stdout), { release: 'v0.0.19', sumsSha256: sha256(latestSums) });
+    assert.deepEqual(JSON.parse(latest.stdout), { release: 'v0.0.30', sumsSha256: sha256(latestSums) });
   }
 });
 
-test('the latest release is taken only when its SHA256SUMS is the one under its tag', async () => {
+test('the latest release is taken only when its SHA256SUMS is the one under its tag and lists both modules and the kit', async () => {
   const latestUrl = `${REPOSITORY}/releases/latest/download/SHA256SUMS`;
-  const tagUrl = `${REPOSITORY}/releases/download/v0.0.19/SHA256SUMS`;
-  const sums = (digit) => Buffer.from(`${digit.repeat(64)}  zipp-wasm-0.0.19-web.zip\n${digit.repeat(64)}  zipp-wasm-0.0.19-web-python.zip\n`);
+  const tagUrl = `${REPOSITORY}/releases/download/v0.0.30/SHA256SUMS`;
+  const line = (digit, name) => `${digit.repeat(64)}  ${name}\n`;
+  const sums = (digit) => Buffer.from(['javascript.wasm', 'javascript-python.wasm', 'javascript-python-base.wasm', 'wasm-embed-kit.zip'].map((n) => line(digit, `zipp-0.0.30-${n}`)).join(''));
   const same = serve(new Map([[latestUrl, sums('1')], [tagUrl, sums('1')]]));
   const resolved = await resolveRelease({ fetch: same.fetch });
-  assert.equal(resolved.release, 'v0.0.19');
+  assert.equal(resolved.release, 'v0.0.30');
   assert.ok(resolved.sums.equals(sums('1')));
   assert.deepEqual(same.calls, [latestUrl, tagUrl], 'no API call: the latest redirect, then the tag\'s own asset');
   const moved = serve(new Map([[latestUrl, sums('1')], [tagUrl, sums('2')]]));
   await assert.rejects(resolveRelease({ latest: true, fetch: moved.fetch }), (error) => error instanceof ZippReleaseError && /latest release changed while it was read, so try again/.test(error.message));
-  const webOnly = serve(new Map([[latestUrl, Buffer.from(`${'1'.repeat(64)}  zipp-wasm-0.0.19-web.zip\n`)]]));
-  await assert.rejects(resolveRelease({ fetch: webOnly.fetch }), /SHA256SUMS lists 0 web-python bundles; expected exactly one/);
-  const twoReleases = serve(new Map([[latestUrl, Buffer.from(`${'1'.repeat(64)}  zipp-wasm-0.0.19-web-python.zip\n${'2'.repeat(64)}  zipp-wasm-0.0.20-web-python.zip\n`)], [tagUrl, sums('1')]]));
-  await assert.rejects(resolveRelease({ fetch: twoReleases.fetch }), /SHA256SUMS lists 2 web-python bundles; expected exactly one/);
-  await assert.rejects(resolveRelease({ latest: true, tag: 'v0.0.19', fetch: same.fetch }), /name a release or --latest, not both/);
+  // The base module is not the javascript-python one, however alike their names.
+  const noPython = serve(new Map([[latestUrl, Buffer.from(line('1', 'zipp-0.0.30-javascript.wasm') + line('1', 'zipp-0.0.30-javascript-python-base.wasm'))]]));
+  await assert.rejects(resolveRelease({ fetch: noPython.fetch }), /SHA256SUMS lists 0 javascript-python modules; expected exactly one/);
+  const twoReleases = serve(new Map([[latestUrl, Buffer.from(line('1', 'zipp-0.0.30-javascript-python.wasm') + line('2', 'zipp-0.0.31-javascript-python.wasm'))], [tagUrl, sums('1')]]));
+  await assert.rejects(resolveRelease({ fetch: twoReleases.fetch }), /SHA256SUMS lists 2 javascript-python modules; expected exactly one/);
+  const noKit = Buffer.from(line('1', 'zipp-0.0.30-javascript.wasm') + line('1', 'zipp-0.0.30-javascript-python.wasm'));
+  await assert.rejects(resolveRelease({ fetch: serve(new Map([[latestUrl, noKit], [tagUrl, noKit]])).fetch }), /the SHA256SUMS published under v0\.0\.30 does not list zipp-0\.0\.30-wasm-embed-kit\.zip$/);
+  await assert.rejects(resolveRelease({ latest: true, tag: 'v0.0.30', fetch: same.fetch }), /name a release or --latest, not both/);
 });
 
 test('--ensure leaves intact installs alone without a single request, and reinstalls ones that fail --check', async (t) => {
@@ -595,8 +828,8 @@ test('--ensure replaces installs of a release other than ZIPP_RELEASE, or from a
   assert.match(moved.stdout, /holds ZIPP v1\.2\.3, not v1\.2\.4/);
   assert.equal(checkInstalls(out).release, 'v1.2.4');
 
-  // The same release published again with other bytes beside the engines, so another SHA256SUMS.
-  const again = releaseFolder(t, { version: '1.2.4', edit: { web: (files) => files.set('README.md', Buffer.from('# zipp-wasm, published again\n')) } });
+  // The same release published again with other bytes beside the engines (a CLI binary), so another SHA256SUMS.
+  const again = releaseFolder(t, { version: '1.2.4', sums: (text) => text.replace('a'.repeat(64), 'f'.repeat(64)) });
   assert.notEqual(sha256(again.top), sha256(next.top));
   const reinstalled = cli(['--ensure'], { ZIPP_OUT: out, ZIPP_RELEASE_DIR: again.dir, ZIPP_SUMS_SHA256: sha256(again.top) });
   assert.equal(reinstalled.status, 0, reinstalled.stderr);
@@ -610,26 +843,28 @@ test('--check --online compares both installs with what the release publishes no
   const folder = releaseFolder(t);
   const { out, run } = install(t, folder);
   assert.equal(run.status, 0, run.stderr);
-  const sumsUrl = `${REPOSITORY}/releases/download/${TAG}/SHA256SUMS`;
-  const zipUrl = (variant) => `${REPOSITORY}/releases/download/${TAG}/${bundleName(VERSION, variant)}.zip`;
-  const published = new Map([[sumsUrl, folder.top], ...VARIANTS.map((v) => [zipUrl(v), folder.zips[v.suffix]])]);
-  const { fetch, calls } = serve(published);
+  const served = published(folder);
+  const { fetch, calls } = serve(served);
   assert.equal((await checkInstallsOnline(out, { fetch })).release, TAG);
-  assert.deepEqual(calls.sort(), [sumsUrl, ...VARIANTS.map(zipUrl)].sort());
+  assert.deepEqual(calls.sort(), [releaseAsset('SHA256SUMS'), ...VARIANTS.map((v) => releaseAsset(moduleName(VERSION, v))), releaseAsset(kitName(VERSION))].sort(), 'the kit once, for both installs');
 
-  // An edited file whose line in the install's own SHA256SUMS was rewritten to match passes offline ...
+  // An edited file whose recorded digest was rewritten to match passes offline ...
   const edited = install(t, folder);
-  fs.appendFileSync(path.join(edited.out, PYTHON.folder, 'zipp_wasm.d.ts'), '\n');
-  resum(path.join(edited.out, PYTHON.folder), 'zipp_wasm.d.ts');
+  const dir = path.join(edited.out, PYTHON.folder);
+  fs.appendFileSync(path.join(dir, 'zipp_wasm.d.ts'), '\n');
+  editSource(dir, (s) => void (s.kit.files['zipp_wasm.d.ts'].sha256 = sha256(fs.readFileSync(path.join(dir, 'zipp_wasm.d.ts')))));
   assert.equal(checkInstalls(edited.out).release, TAG);
   // ... and not against what the release publishes.
-  await assert.rejects(checkInstallsOnline(edited.out, { fetch }), (error) => /\n {2}- zipp-wasm-python\/SHA256SUMS is not the file in the published /.test(error.message) && /\n {2}- zipp-wasm-python\/zipp_wasm\.d\.ts is not the file in the published /.test(error.message));
+  await assert.rejects(checkInstallsOnline(edited.out, { fetch }), (error) => /\n {2}- zipp-wasm-python\/zipp_wasm\.d\.ts is not zipp-engine\.d\.ts in the published zipp-1\.2\.3-wasm-embed-kit\.zip/.test(error.message) && !/zipp-wasm\/zipp_wasm\.d\.ts/.test(error.message));
 
-  published.set(sumsUrl, Buffer.concat([folder.top, Buffer.from('\n')]));
+  served.set(releaseAsset('SHA256SUMS'), Buffer.concat([folder.top, Buffer.from('\n')]));
   await assert.rejects(checkInstallsOnline(out, { fetch }), /zipp-wasm\/RELEASE-SHA256SUMS is not the SHA256SUMS published under v1\.2\.3/);
-  published.set(sumsUrl, folder.top);
-  published.set(zipUrl(WEB), releaseFolder(t, { repack: 'web' }).zips.web);
-  await assert.rejects(checkInstallsOnline(out, { fetch }), /the published zipp-wasm-1\.2\.3-web\.zip is not the recorded [0-9a-f]{64}/);
+  served.set(releaseAsset('SHA256SUMS'), folder.top);
+  served.set(releaseAsset(moduleName(VERSION, WEB)), appendSection(folder.modules.web, 'name', Buffer.from('built again')));
+  await assert.rejects(checkInstallsOnline(out, { fetch }), /zipp-wasm\/zipp_wasm_bg\.wasm is not the published zipp-1\.2\.3-javascript\.wasm/);
+  served.set(releaseAsset(moduleName(VERSION, WEB)), folder.modules.web);
+  served.set(releaseAsset(kitName(VERSION)), releaseFolder(t, { repack: true }).kit);
+  await assert.rejects(checkInstallsOnline(out, { fetch }), /the published zipp-1\.2\.3-wasm-embed-kit\.zip is not the recorded [0-9a-f]{64}/);
 });
 
 test('installs into one folder take turns: hooks started together all succeed, and one of them installs', async (t) => {
@@ -816,12 +1051,12 @@ test('an install whose lock is no longer its own writes nothing and leaves that 
     assertHeld();
   }, { warn: quiet }), takenOver);
   assert.equal(fs.readFileSync(lock, 'utf8'), other, 'the lock another install holds is not released');
-  // Taken over while the bundles download: refused before either folder is written.
+  // Taken over while the modules download: refused before either folder is written.
   fs.rmSync(lock);
   const folder = releaseFolder(t);
   const served = published(folder);
   const fetch = async (url) => {
-    if (url.endsWith('.zip')) fs.writeFileSync(lock, other);
+    if (url.endsWith('.wasm')) fs.writeFileSync(lock, other);
     return served.has(url) ? new Response(served.get(url)) : new Response('', { status: 404 });
   };
   await assert.rejects(installRelease({ vendorDir: out, tag: TAG, cacheDir: tempDir(t, 'zipp-cache-'), fetch, log: quiet, warn: quiet }), takenOver);
@@ -862,14 +1097,14 @@ test('a folder that changes while it is checked is a refusal, and --ensure insta
 test('a swap that fails part way puts back what it had swapped: the folders never hold two releases', async (t) => {
   const older = releaseFolder(t, { version: '1.2.2', commit: 'e'.repeat(40) });
   const folder = releaseFolder(t);
-  const installs = await verifyRelease({ release: TAG, sums: folder.top, zips: folder.zips });
+  const installs = await verifyRelease({ release: TAG, sums: folder.top, modules: folder.modules, kit: folder.kit });
   const { renameSync } = fs;
-  for (const had of ['both installs', 'the web install only']) {
+  for (const had of ['both installs', 'the JavaScript install only']) {
     const { out, run } = install(t, older);
     assert.equal(run.status, 0, run.stderr);
-    if (had === 'the web install only') fs.rmSync(path.join(out, PYTHON.folder), { recursive: true });
+    if (had === 'the JavaScript install only') fs.rmSync(path.join(out, PYTHON.folder), { recursive: true });
     const before = snapshot(out);
-    // The Python stage cannot take its place after the web one has.
+    // The Python stage cannot take its place after the JavaScript one has.
     const rename = t.mock.method(fs, 'renameSync', function (from, to) {
       if (path.basename(String(to)) === PYTHON.folder && path.basename(String(from)).startsWith(`.${PYTHON.folder}.stage-`)) throw Object.assign(new Error(`EXDEV: cross-device link not permitted, rename '${from}' -> '${to}'`), { code: 'EXDEV' });
       return renameSync.call(this, from, to);
@@ -886,9 +1121,9 @@ test('what landed on disk is checked, not what was meant to land', async (t) => 
   // A disk, or a scanner, that changes one file on its way into a stage.
   t.mock.method(fs, 'writeFileSync', function (file, data, ...rest) {
     const changed = /\.stage-/.test(String(file)) && path.basename(String(file)) === 'zipp_wasm.d.ts';
-    return writeFileSync.call(this, file, changed ? Buffer.from('not what the bundle holds\n') : data, ...rest);
+    return writeFileSync.call(this, file, changed ? Buffer.from('not what the kit holds\n') : data, ...rest);
   });
-  await assert.rejects(installRelease({ vendorDir: outDir(t), releaseDir: folder.dir, log: quiet, warn: quiet }), (error) => error instanceof ZippReleaseError && /zipp-wasm does not check[\s\S]*zipp_wasm\.d\.ts does not match the bundle's SHA256SUMS/.test(error.message));
+  await assert.rejects(installRelease({ vendorDir: outDir(t), releaseDir: folder.dir, log: quiet, warn: quiet }), (error) => error instanceof ZippReleaseError && /zipp-wasm does not check[\s\S]*zipp_wasm\.d\.ts is not the kit's zipp-engine\.d\.ts recorded/.test(error.message));
 });
 
 test('installs that cannot be written are a refusal, not a stack trace', (t) => {
@@ -910,10 +1145,16 @@ test('offline, a release downloaded before is named for ZIPP_RELEASE_DIR, never 
     const release = version === VERSION ? folder : releaseFolder(t, { version });
     fs.cpSync(release.dir, path.join(cacheDir, `v${version}`), { recursive: true });
   }
+  // A newer release cached as zip bundles, by a version of this script before v0.0.26: not something it can install now.
+  const zipped = path.join(cacheDir, 'v1.2.9');
+  fs.mkdirSync(zipped);
+  fs.writeFileSync(path.join(zipped, 'SHA256SUMS'), `${'2'.repeat(64)}  zipp-wasm-1.2.9-web.zip\n${'3'.repeat(64)}  zipp-wasm-1.2.9-web-python.zip\n`);
+  for (const name of ['zipp-wasm-1.2.9-web.zip', 'zipp-wasm-1.2.9-web-python.zip']) fs.writeFileSync(path.join(zipped, name), 'a zip bundle');
   const cached = path.join(cacheDir, TAG);
   await assert.rejects(resolveRelease({ tag: 'v1.2.2', cacheDir, fetch: offline }), new RegExp(`: fetch failed; to install the v1\\.2\\.2 downloaded earlier without the network, set ZIPP_RELEASE_DIR=${escaped(path.join(cacheDir, 'v1.2.2'))}$`));
-  // With no tag, the newest one downloaded.
+  // With no tag, the newest one downloaded that can be installed.
   await assert.rejects(resolveRelease({ cacheDir, fetch: offline }), new RegExp(`set ZIPP_RELEASE_DIR=${escaped(cached)}$`));
+  await assert.rejects(resolveRelease({ tag: 'v1.2.9', cacheDir, fetch: offline }), (error) => /: fetch failed$/.test(error.message));
   // GitHub answering that there is no such release is not a network failure: no copy stands in for it.
   const missing = async () => new Response('', { status: 404 });
   await assert.rejects(resolveRelease({ tag: TAG, cacheDir, fetch: missing }), (error) => /answered 404$/.test(error.message));
@@ -948,6 +1189,26 @@ test('the zip reader takes stored and deflated entries and refuses a damaged one
   }
 });
 
+test('the WebAssembly readers find a module\'s custom sections and its stack from its bytes, and nothing in anything else', () => {
+  for (const variant of VARIANTS) {
+    const parts = moduleParts(variant, { version: VERSION, commit: COMMIT });
+    const bytes = buildModule(parts);
+    assert.ok(WebAssembly.validate(bytes), `the ${variant.variant} fixture is a valid module`);
+    assert.equal(wasmStackBytes(bytes), variant.stackBytes);
+    assert.deepEqual(wasmCustomSections(bytes, 'zipp.glue'), [standInGlue(parts.profile)]);
+    assert.deepEqual(JSON.parse(wasmCustomSections(bytes, 'zipp.meta')[0]), { ...parts.meta, glueSha256: sha256(standInGlue(parts.profile)) });
+    assert.deepEqual(wasmCustomSections(bytes, 'zipp'), [], 'a section is found by its whole name');
+  }
+  assert.deepEqual([...sleb(1048576)], [0x80, 0x80, 0xc0, 0x00], 'i32.const takes a signed LEB128');
+  const module = rebuilt(WEB);
+  assert.equal(wasmCustomSections(module.subarray(0, module.length - 3), 'zipp.glue'), null, 'a module cut short');
+  assert.equal(wasmCustomSections(Buffer.from('not a module'), 'zipp.meta'), null);
+  assert.equal(wasmStackBytes(Buffer.from('not a module')), null);
+  assert.equal(wasmStackBytes(wasmModule({ stack: -16 })), null, 'a negative stack pointer is no stack');
+  assert.equal(wasmStackBytes(wasmModule({ stack: 1048576, stackType: 'i64' })), null, 'nor is an i64 global');
+  assert.equal(wasmStackBytes(Buffer.concat([WASM_HEADER, customSection('zipp.meta', Buffer.from('{}'))])), null, 'no globals, no stack');
+});
+
 test('the curated notices must be the file their SOURCE.json records, and a release newer or older than the one they were generated from installs with a prompt to regenerate them', async (t) => {
   // In process the prompt goes to `warn` wherever this runs; the GitHub Actions form is checked through the command line below.
   const actions = process.env.GITHUB_ACTIONS;
@@ -957,7 +1218,7 @@ test('the curated notices must be the file their SOURCE.json records, and a rele
   });
   const record = JSON.parse(fs.readFileSync(CURATED_RECORD, 'utf8'));
   const dir = tempDir(t, 'zipp-curated-');
-  const curatedNotices = path.join(dir, 'THIRD_PARTY_LICENSES.txt');
+  const curatedNotices = path.join(dir, NOTICES);
   fs.copyFileSync(CURATED_NOTICES, curatedNotices);
   const recordAs = (change) => fs.writeFileSync(path.join(dir, 'SOURCE.json'), JSON.stringify({ ...record, ...change }));
   const folder = releaseFolder(t);
@@ -1005,14 +1266,14 @@ test('the curated notices regenerate from zipp.org\'s sources by one recipe, and
   const older = tempDir(t, 'zipp-notices-');
   assert.deepEqual(regenerate({ read, release: 'v0.0.20', dir: older }), []);
   const olderText = 'ZIPP engine: Apache-2.0. See the source repository for its complete notices.\n\nRustPython parser (MIT):\nMIT License\n\nCopyright (c) 2020 RustPython Team\n\n\nUnicode data:\nUNICODE LICENSE V3\n\nSPDX-License-Identifier: Unicode-3.0\n';
-  assert.equal(fs.readFileSync(path.join(older, 'THIRD_PARTY_LICENSES.txt'), 'utf8'), olderText);
+  assert.equal(fs.readFileSync(path.join(older, NOTICES), 'utf8'), olderText);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(older, 'SOURCE.json'), 'utf8')).sources, ['crates/rustpython-parser-fork/LICENSE', 'LICENSE-UNICODE']);
   const text = 'ZIPP engine: Apache-2.0. See the source repository for its complete notices.\n\nUnicode data:\nUNICODE LICENSE V3\n\nSPDX-License-Identifier: Unicode-3.0\n';
   const dir = tempDir(t, 'zipp-notices-');
-  const notices = path.join(dir, 'THIRD_PARTY_LICENSES.txt');
+  const notices = path.join(dir, NOTICES);
   assert.deepEqual(regenerate({ read, release: TAG, dir }), []);
   assert.equal(fs.readFileSync(notices, 'utf8'), text);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'SOURCE.json'), 'utf8')), { repository: REPOSITORY, release: TAG, sources: ['LICENSE-UNICODE'], file: 'THIRD_PARTY_LICENSES.txt', sha256: sha256(Buffer.from(text)) });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'SOURCE.json'), 'utf8')), { repository: REPOSITORY, release: TAG, sources: ['LICENSE-UNICODE'], file: NOTICES, sha256: sha256(Buffer.from(text)) });
   assert.deepEqual(readCuratedNotices(notices), { bytes: Buffer.from(text), release: TAG }, 'what the installer takes');
   assert.deepEqual(regenerate({ read, release: TAG, dir, check: true }), []);
   assert.deepEqual(regenerate({ read, release: 'v1.2.4', dir, check: true }), ['SOURCE.json does not record v1.2.4 and that file\'s SHA-256']);

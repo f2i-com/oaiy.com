@@ -10,15 +10,15 @@
  *   node scripts/fetch-zipp-release.mjs --resolve-only [vX.Y.Z | --latest]   print {release, sumsSha256}
  *   node scripts/fetch-zipp-release.mjs --ensure            install unless both installs check
  *
- * Both bundles come from the same release and the same SHA256SUMS:
- *   ui/vendor/zipp-wasm/         zipp-wasm-<v>-web.zip, JavaScript only: the browser flow sandbox
- *   ui/vendor/zipp-wasm-python/  zipp-wasm-<v>-web-python.zip: for the CLI, Desktop and headless server
+ * Both engines come from the same release and the same SHA256SUMS:
+ *   ui/vendor/zipp-wasm/         zipp-<v>-javascript.wasm, JavaScript only: the browser flow sandbox
+ *   ui/vendor/zipp-wasm-python/  zipp-<v>-javascript-python.wasm: for the CLI, Desktop and headless server
  *
  * Environment: ZIPP_RELEASE=vX.Y.Z names the release; ZIPP_RELEASE_DIR=<dir>
- * reads SHA256SUMS and both bundles from a folder instead of GitHub (offline;
- * with no tag, the release that folder holds); ZIPP_SUMS_SHA256 is the digest
- * the release's SHA256SUMS must have; ZIPP_OUT installs into
- * <dir>/zipp-wasm and <dir>/zipp-wasm-python instead of ui/vendor.
+ * reads SHA256SUMS, both modules and the embed kit from a folder instead of
+ * GitHub (offline; with no tag, the release that folder holds);
+ * ZIPP_SUMS_SHA256 is the digest the release's SHA256SUMS must have; ZIPP_OUT
+ * installs into <dir>/zipp-wasm and <dir>/zipp-wasm-python instead of ui/vendor.
  *
  * OAIY builds no ZIPP crate, so nothing in the repository names a release: with
  * no tag the latest is taken. CI resolves it once per run (--resolve-only) and
@@ -27,17 +27,39 @@
  * release and SHA256SUMS the environment names (if it names one), is kept
  * without a request.
  *
- * Each bundle must match ZIPP's top-level SHA256SUMS, every file taken from it
- * the bundle's own SHA256SUMS, BUILD-INFO.txt must describe that variant, both
- * bundles must name the same commit, and each module must report it. Nothing
- * is post-processed: a changed byte breaks that chain. The web-python bundle
+ * Since v0.0.26 a ZIPP release publishes each WebAssembly engine as one plain
+ * `.wasm` file that carries its own wasm-bindgen bindings in a `zipp.glue`
+ * custom section, beside a `zipp.meta` record of its format, variant, version,
+ * commit, languages and the glue's sha256. Releases before v0.0.26 published
+ * zip bundles instead, which this script no longer reads.
+ *
+ * Each install takes its module as published, byte for byte, as
+ * zipp_wasm_bg.wasm (its sha256 is its line in ZIPP's SHA256SUMS), and the
+ * module's `zipp.glue` section, byte for byte, as zipp_wasm.js: the very
+ * bindings the bundles shipped under that name, so nothing that loads an
+ * install changes. The record must name that variant of that release, its
+ * languages, a full commit and the glue's digest; the stack must be the
+ * variant's (the initial value of the module's first global, Rust's stack
+ * pointer, which starts at the top of the stack); both modules must name one
+ * commit; and loaded under its own glue each module must report the release,
+ * the safe sandbox, its languages and that commit. A release no longer
+ * publishes PROFILE.json: the install writes what the engine's zippProfile()
+ * reports, as the bundles wrote it, and records its digest.
+ *
+ * The release's embed kit, zipp-<v>-wasm-embed-kit.zip, gives both installs
+ * the engine's TypeScript declarations (its zipp-engine.d.ts, installed as
+ * zipp_wasm.d.ts) and LICENSE-APACHE. The kit must match SHA256SUMS, every file
+ * in it its own SHA256SUMS, and its BUILD-INFO.txt and modules.json must name
+ * the release, the modules' commit and each module's digest in SHA256SUMS.
+ * Nothing is post-processed: a changed byte breaks that chain. The release
  * ships no third-party notices, so the Unicode notices come from
- * ui/vendor/zipp-notices/ ('oaiy-curated') until it does. That folder's
+ * ui/vendor/zipp-notices/ ('oaiy-curated') until it does (a kit that ships a
+ * THIRD_PARTY_LICENSES.txt is taken as 'zipp-release'). That folder's
  * SOURCE.json names the release they were generated from; any other release is
  * installed with a warning to regenerate them (scripts/regen-zipp-notices.mjs).
  *
- * Node built-ins only (the zip reader is below): the CLI and Desktop CI lanes
- * run this without ui's node_modules.
+ * Node built-ins only (the zip and WebAssembly section readers are below): the
+ * CLI and Desktop CI lanes run this without ui's node_modules.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
@@ -54,17 +76,28 @@ export const CACHE_DIR = path.join(ROOT, '.zipp-release');
 
 export const NOTICES = 'THIRD_PARTY_LICENSES.txt';
 export const CURATED = 'oaiy-curated';
-/** The two bundles of a release OAIY installs. Only the Python engine redistributes third-party (Unicode) data. */
+/** The first release published as plain modules; every release before it published zip bundles. */
+export const FIRST_MODULE_RELEASE = 'v0.0.26';
+export const META_SECTION = 'zipp.meta';
+export const GLUE_SECTION = 'zipp.glue';
+export const META_FORMAT = 1;
+/**
+ * The two engines of a release OAIY installs. `module` names its release file,
+ * zipp-<v>-<module>.wasm (a file's name and its record's variant need not be
+ * one word: ZIPP's javascript-lite module records variant "lite"); `suffix` is
+ * the zip bundle each replaced ('web', 'web-python'), by which installs are
+ * still keyed. Only the Python engine redistributes third-party (Unicode) data.
+ */
 export const VARIANTS = [
-  { folder: 'zipp-wasm', suffix: 'web', variant: 'javascript', languages: ['javascript'], stackBytes: 1048576, needsNotices: false },
-  { folder: 'zipp-wasm-python', suffix: 'web-python', variant: 'javascript-python', languages: ['javascript', 'python'], stackBytes: 16777216, needsNotices: true },
+  { folder: 'zipp-wasm', suffix: 'web', module: 'javascript', variant: 'javascript', languages: ['javascript'], stackBytes: 1048576, needsNotices: false },
+  { folder: 'zipp-wasm-python', suffix: 'web-python', module: 'javascript-python', variant: 'javascript-python', languages: ['javascript', 'python'], stackBytes: 16777216, needsNotices: true },
 ];
-/** Taken from the bundle byte for byte. SHA256SUMS is the bundle's own, verbatim. */
-export const BUNDLE_FILES = ['zipp_wasm.js', 'zipp_wasm.d.ts', 'zipp_wasm_bg.wasm', 'zipp_wasm_bg.wasm.d.ts', 'LICENSE-APACHE', 'BUILD-INFO.txt', 'PROFILE.json', 'SHA256SUMS'];
-/** An install: the bundle files, ZIPP's top-level SHA256SUMS, SOURCE.json and, when recorded, the notices. */
-export const installedFiles = (notices) => [...BUNDLE_FILES, 'RELEASE-SHA256SUMS', 'SOURCE.json', ...(notices ? [NOTICES] : [])];
+/** Taken from the embed kit byte for byte, by the name each is installed as. */
+export const KIT_FILES = { 'zipp_wasm.d.ts': 'zipp-engine.d.ts', 'LICENSE-APACHE': 'LICENSE-APACHE' };
+/** An install: the module and its glue, the kit's files, the engine's profile, ZIPP's top-level SHA256SUMS, SOURCE.json and, when recorded, the notices. */
+export const installedFiles = (notices) => ['zipp_wasm_bg.wasm', 'zipp_wasm.js', ...Object.keys(KIT_FILES), 'PROFILE.json', 'RELEASE-SHA256SUMS', 'SOURCE.json', ...(notices ? [NOTICES] : [])];
 
-/** A refusal: the release, a bundle or an install is not what it has to be. */
+/** A refusal: the release, a module, the kit or an install is not what it has to be. */
 export class ZippReleaseError extends Error {}
 const refuse = (message) => {
   throw new ZippReleaseError(message);
@@ -75,17 +108,26 @@ const fail = (what, problems) => {
 
 export const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 export const isReleaseTag = (tag) => /^v\d+\.\d+\.\d+$/.test(tag ?? '');
-export const bundleName = (version, variant) => `zipp-wasm-${version}-${variant.suffix}`;
+/** A release's file for one of the engines OAIY installs. */
+export const moduleName = (version, variant) => `zipp-${version}-${variant.module}.wasm`;
+/** A release's embed kit, whose files are under the folder of the same name. */
+export const kitName = (version) => `zipp-${version}-wasm-embed-kit.zip`;
+const kitFolder = (version) => kitName(version).replace(/\.zip$/, '');
+/** What a release must publish for an install: both modules and the kit. */
+const releaseFiles = (version) => [...VARIANTS.map((v) => moduleName(version, v)), kitName(version)];
 /** Negative, zero or positive as release tag `a` is older than, the same as or newer than `b`. */
 export const compareReleases = (a, b) => {
   const [x, y] = [a, b].map((t) => t.slice(1).split('.').map(Number));
   return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
 };
 const HEX64 = /^[0-9a-f]{64}$/;
+const COMMIT = /^[0-9a-f]{40}$/;
 const rel = (p) => {
   const relative = path.relative(ROOT, p);
   return relative.startsWith('..') || path.isAbsolute(relative) ? p : relative.replaceAll('\\', '/') || '.';
 };
+/** `a`, `a or b`, `a, b or c`. */
+const either = (names) => (names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : names.join(''));
 
 /** SHA256SUMS lines are `<hex>  <name>` (or `<hex> *<name>`). */
 export function parseSums(text) {
@@ -107,24 +149,159 @@ export function parseBuildInfo(text) {
   return info;
 }
 
-function buildInfoLanguages(info) {
+// ---------------------------------------------------------------------------
+// What a module says about itself
+// ---------------------------------------------------------------------------
+
+/**
+ * A reader over `b` from `at`, never past `end`: `byte()` and `uleb()` (an
+ * unsigned LEB128) advance it, and throw past the end or on a malformed number.
+ */
+function reader(b, at, end) {
+  const r = {
+    at,
+    byte() {
+      if (r.at >= end) throw new RangeError('read past the end');
+      return b[r.at++];
+    },
+    uleb() {
+      let value = 0;
+      for (let shift = 0; ; shift += 7) {
+        if (shift > 28) throw new RangeError('malformed LEB128');
+        const byte = r.byte();
+        value += (byte & 0x7f) * 2 ** shift;
+        if (!(byte & 0x80)) return value;
+      }
+    },
+  };
+  return r;
+}
+
+/**
+ * A WebAssembly binary's sections as {id, start, end} (each payload's bounds),
+ * or null for anything that is not a version 1 module, or runs past its end.
+ * Read from the bytes; nothing is compiled, so --check can afford it.
+ */
+function wasmSections(b) {
+  if (b.length < 8 || b.readUInt32LE(0) !== 0x6d736100 || b.readUInt32LE(4) !== 1) return null;
+  const sections = [];
+  const r = reader(b, 8, b.length);
   try {
-    return JSON.parse(info.languages);
+    while (r.at < b.length) {
+      const id = r.byte();
+      const size = r.uleb();
+      if (r.at + size > b.length) return null;
+      sections.push({ id, start: r.at, end: r.at + size });
+      r.at += size;
+    }
   } catch {
-    return undefined;
+    return null;
+  }
+  return sections;
+}
+
+/**
+ * The payloads of every custom section called `name` in a WebAssembly binary,
+ * in order, or null for anything that is not one. A custom section (id 0) may
+ * appear any number of times, anywhere; ZIPP's release modules carry their
+ * `zipp.meta` record and `zipp.glue` bindings this way.
+ */
+export function wasmCustomSections(bytes, name) {
+  const b = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const sections = wasmSections(b);
+  if (!sections) return null;
+  const found = [];
+  try {
+    for (const { id, start, end } of sections) {
+      if (id !== 0) continue;
+      const r = reader(b, start, end);
+      const length = r.uleb();
+      if (r.at + length > end) return null;
+      if (b.toString('utf8', r.at, r.at + length) === name) found.push(b.subarray(r.at + length, end));
+    }
+  } catch {
+    return null;
+  }
+  return found;
+}
+
+/**
+ * The stack a WebAssembly module built by rustc was linked with, in bytes: the
+ * initial value of its first defined global, which is Rust's stack pointer.
+ * The wasm32 targets lay the stack out first and the pointer starts at its
+ * top, so that value is the stack's size (`-z stack-size`). Null when the
+ * first global is not a mutable i32 set by one constant, or for anything that
+ * is not a module.
+ */
+export function wasmStackBytes(bytes) {
+  const b = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const globals = wasmSections(b)?.find((s) => s.id === 6);
+  if (!globals) return null;
+  try {
+    const r = reader(b, globals.start, globals.end);
+    if (r.uleb() < 1) return null;
+    // i32, mutable, i32.const
+    if (r.byte() !== 0x7f || r.byte() !== 0x01 || r.byte() !== 0x41) return null;
+    // i32.const's operand is a signed LEB128: a last byte with bit 6 set is negative, never a stack.
+    let value = 0;
+    for (let shift = 0; ; shift += 7) {
+      const byte = r.byte();
+      value += (byte & 0x7f) * 2 ** shift;
+      if (!(byte & 0x80)) {
+        if (byte & 0x40 || shift > 28) return null;
+        break;
+      }
+    }
+    return r.byte() === 0x0b ? value : null;
+  } catch {
+    return null;
   }
 }
 
-/** What BUILD-INFO.txt must say, as problems; `revision` is optional. */
-function buildInfoProblems(info, variant, { version, revision }) {
+/** A module's `zipp.meta` record, parsed; `what` names the module in a refusal. */
+export function moduleMeta(bytes, what) {
+  const records = wasmCustomSections(bytes, META_SECTION);
+  if (records === null) refuse(`${what} is not a WebAssembly module`);
+  if (records.length !== 1) refuse(`${what} carries ${records.length} ${META_SECTION} records, not one`);
+  let meta;
+  try {
+    meta = JSON.parse(records[0].toString('utf8'));
+  } catch {}
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) refuse(`${what}'s ${META_SECTION} record is not a JSON object`);
+  return meta;
+}
+
+/** A module's `zipp.glue` section, the wasm-bindgen bindings it carries, which it must carry exactly once. */
+export function moduleGlue(bytes, what) {
+  const sections = wasmCustomSections(bytes, GLUE_SECTION);
+  if (sections === null) refuse(`${what} is not a WebAssembly module`);
+  if (sections.length !== 1) refuse(`${what} carries ${sections.length} ${GLUE_SECTION} sections, not one`);
+  return Buffer.from(sections[0]);
+}
+
+/**
+ * What a module's record must say to be `variant` of `version`, as problems:
+ * format 1, that variant and its languages, a full commit (the recorded
+ * `revision`, when there is one), and the digest of the glue it carries (and
+ * the recorded `glueSha256`, when there is one).
+ */
+function metaProblems(meta, glue, variant, { version, revision, glueSha256 }) {
   const problems = [];
-  if (info.version !== version) problems.push(`BUILD-INFO.txt says version ${info.version}, not ${version}`);
-  if (!/^[0-9a-f]{40}$/.test(info.commit ?? '')) problems.push(`BUILD-INFO.txt commit "${info.commit}" is not a full 40-hex commit`);
-  else if (revision !== undefined && info.commit !== revision) problems.push(`BUILD-INFO.txt commit ${info.commit} is not the recorded revision ${revision}`);
-  if (info.variant !== variant.variant) problems.push(`BUILD-INFO.txt variant is ${info.variant}, not ${variant.variant} (the ${variant.suffix} bundle)`);
-  if (!isDeepStrictEqual(buildInfoLanguages(info), variant.languages)) problems.push(`BUILD-INFO.txt languages are ${info.languages}, not ${JSON.stringify(variant.languages)}`);
-  if (Number(info['stack-bytes']) !== variant.stackBytes) problems.push(`BUILD-INFO.txt stack-bytes is ${info['stack-bytes']}, not ${variant.stackBytes}`);
+  if (meta.format !== META_FORMAT) problems.push(`${META_SECTION} format is ${JSON.stringify(meta.format)}, not ${META_FORMAT}`);
+  if (meta.version !== version) problems.push(`${META_SECTION} says version ${meta.version}, not ${version}`);
+  if (meta.variant !== variant.variant) problems.push(`${META_SECTION} variant is ${meta.variant}, not ${variant.variant}`);
+  if (!isDeepStrictEqual(meta.languages, variant.languages)) problems.push(`${META_SECTION} languages are ${JSON.stringify(meta.languages)}, not ${JSON.stringify(variant.languages)}`);
+  if (!COMMIT.test(meta.commit ?? '')) problems.push(`${META_SECTION} commit ${JSON.stringify(meta.commit)} is not a full 40-hex commit`);
+  else if (revision !== undefined && meta.commit !== revision) problems.push(`${META_SECTION} commit ${meta.commit} is not the recorded revision ${revision}`);
+  if (sha256(glue) !== meta.glueSha256) problems.push(`its ${GLUE_SECTION} section has sha256 ${sha256(glue)}; ${META_SECTION} says glueSha256 ${meta.glueSha256}`);
+  else if (glueSha256 !== undefined && meta.glueSha256 !== glueSha256) problems.push(`${META_SECTION} glueSha256 ${meta.glueSha256} is not the recorded ${glueSha256}`);
   return problems;
+}
+
+/** The stack a module was linked with, as problems: the variant's, read from its first global. */
+function stackProblems(wasm, variant) {
+  const stack = wasmStackBytes(wasm);
+  return stack === variant.stackBytes ? [] : [`its stack is ${stack === null ? 'not readable (its first global is not an i32 stack pointer)' : `${stack} bytes`}, not ${variant.stackBytes}`];
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +314,7 @@ function buildInfoProblems(info, variant, { version, revision }) {
  * sizes come from the central directory, so data descriptors need no parsing.
  */
 export function unzip(zip) {
-  if (typeof zlib.crc32 !== 'function') refuse(`reading a ZIPP bundle needs zlib.crc32, in Node 20.15, 22.2 and newer (this is ${process.version})`);
+  if (typeof zlib.crc32 !== 'function') refuse(`reading ZIPP's embed kit needs zlib.crc32, in Node 20.15, 22.2 and newer (this is ${process.version})`);
   const buf = Buffer.isBuffer(zip) ? zip : Buffer.from(zip);
   const bad = (why) => refuse(`not a readable zip: ${why}`);
   let eocd = -1;
@@ -185,15 +362,15 @@ export function unzip(zip) {
   return files;
 }
 
-/** The bundle's files, named inside its top folder. */
-function bundleEntries(zip, version, variant) {
-  const top = bundleName(version, variant);
+/** The kit's files, named inside its top folder. */
+function kitEntries(zip, version) {
+  const top = kitFolder(version);
   const all = unzip(zip);
   const files = new Map();
   for (const [name, bytes] of all) if (name.startsWith(`${top}/`)) files.set(name.slice(top.length + 1), bytes);
   if (!files.size) {
     const tops = [...new Set([...all.keys()].map((name) => name.split('/')[0]))];
-    refuse(`${top}.zip has no ${top}/ folder; its files are under ${tops.join(', ') || 'nothing'} (is it another bundle?)`);
+    refuse(`${kitName(version)} has no ${top}/ folder; its files are under ${tops.join(', ') || 'nothing'} (is it another release's kit?)`);
   }
   return files;
 }
@@ -224,23 +401,38 @@ function readReleaseFile(releaseDir, name) {
   return fs.readFileSync(file);
 }
 
-/** The one release a SHA256SUMS lists bundles of. */
+/**
+ * A SHA256SUMS of a release before v0.0.26, which lists zip bundles and no
+ * modules, is refused by name: this script cannot read what it publishes.
+ */
+function refuseZipRelease(listed, what) {
+  const bundles = [...listed.keys()].filter((name) => /^zipp-wasm-\d+\.\d+\.\d+-web(?:-python)?\.zip$/.test(name));
+  if (bundles.length) refuse(`${what} lists zip bundles (${bundles.join(', ')}) and no WebAssembly modules: releases before ${FIRST_MODULE_RELEASE} publish zip bundles, which this installer no longer reads; install ${FIRST_MODULE_RELEASE} or later`);
+}
+
+/** The one release a SHA256SUMS lists a javascript-python module of. */
 export function versionFromSums(sums) {
-  const versions = [...parseSums(sums).keys()].map((n) => /^zipp-wasm-(\d+\.\d+\.\d+)-web-python\.zip$/.exec(n)?.[1]).filter(Boolean);
-  if (versions.length !== 1) refuse(`SHA256SUMS lists ${versions.length} web-python bundles; expected exactly one`);
+  const listed = parseSums(sums);
+  const versions = [...listed.keys()].map((n) => /^zipp-(\d+\.\d+\.\d+)-javascript-python\.wasm$/.exec(n)?.[1]).filter(Boolean);
+  if (!versions.length) refuseZipRelease(listed, 'SHA256SUMS');
+  if (versions.length !== 1) refuse(`SHA256SUMS lists ${versions.length} javascript-python modules; expected exactly one`);
   return versions[0];
 }
 
-function requireBundlesListed(sums, release, where) {
+function requireFilesListed(sums, release, where) {
   const listed = parseSums(sums);
-  const missing = VARIANTS.map((v) => `${bundleName(release.slice(1), v)}.zip`).filter((name) => !listed.has(name));
-  if (missing.length) refuse(`the SHA256SUMS ${where} does not list ${missing.join(' or ')}`);
+  const version = release.slice(1);
+  const missing = releaseFiles(version).filter((name) => !listed.has(name));
+  if (!missing.length) return;
+  if (VARIANTS.every((v) => !listed.has(moduleName(version, v)))) refuseZipRelease(listed, `the SHA256SUMS ${where}`);
+  refuse(`the SHA256SUMS ${where} does not list ${either(missing)}`);
 }
 
 /** A release downloaded earlier, named for ZIPP_RELEASE_DIR when GitHub cannot be reached; never used unasked. */
 function cachedHint(error, cacheDir, tag) {
   if (!error.unreachable) return error;
-  const complete = (t) => ['SHA256SUMS', ...VARIANTS.map((v) => `${bundleName(t.slice(1), v)}.zip`)].every((n) => fs.existsSync(path.join(cacheDir, t, n)));
+  // Only a folder this script can install from: a release's modules and kit, never the zip bundles an older one cached.
+  const complete = (t) => ['SHA256SUMS', ...releaseFiles(t.slice(1))].every((n) => fs.existsSync(path.join(cacheDir, t, n)));
   let tags = [];
   try {
     tags = fs.readdirSync(cacheDir).filter((t) => isReleaseTag(t) && (!tag || t === tag) && complete(t));
@@ -252,9 +444,10 @@ function cachedHint(error, cacheDir, tag) {
 
 /**
  * The release to take and its top-level SHA256SUMS bytes, which must list both
- * bundles. A tag is taken as named; ZIPP_RELEASE_DIR with no tag is the release
- * that folder holds; otherwise the latest, whose SHA256SUMS must be byte for
- * byte the one under its own tag, so the tag recorded is the release really read.
+ * modules and the embed kit. A tag is taken as named; ZIPP_RELEASE_DIR with no
+ * tag is the release that folder holds; otherwise the latest, whose SHA256SUMS
+ * must be byte for byte the one under its own tag, so the tag recorded is the
+ * release really read.
  */
 export async function resolveRelease({ tag, latest = false, releaseDir, cacheDir = CACHE_DIR, fetch: fetchImpl = globalThis.fetch } = {}) {
   if (latest && tag) refuse('name a release or --latest, not both');
@@ -263,7 +456,7 @@ export async function resolveRelease({ tag, latest = false, releaseDir, cacheDir
     if (latest) refuse('ZIPP_RELEASE_DIR holds one release; leave out --latest');
     const sums = readReleaseFile(releaseDir, 'SHA256SUMS');
     const release = tag ?? `v${versionFromSums(sums)}`;
-    requireBundlesListed(sums, release, `in ${releaseDir}`);
+    requireFilesListed(sums, release, `in ${releaseDir}`);
     return { release, sums };
   }
   if (tag) {
@@ -273,7 +466,7 @@ export async function resolveRelease({ tag, latest = false, releaseDir, cacheDir
     } catch (error) {
       throw cachedHint(error, cacheDir, tag);
     }
-    requireBundlesListed(sums, tag, `published under ${tag}`);
+    requireFilesListed(sums, tag, `published under ${tag}`);
     return { release: tag, sums };
   }
   let latestSums;
@@ -285,32 +478,31 @@ export async function resolveRelease({ tag, latest = false, releaseDir, cacheDir
   const release = `v${versionFromSums(latestSums)}`;
   const tagged = await download(releaseUrl(release, 'SHA256SUMS'), fetchImpl);
   if (!latestSums.equals(tagged)) refuse(`the latest release's SHA256SUMS is not the one published under ${release}; the latest release changed while it was read, so try again`);
-  requireBundlesListed(tagged, release, `published under ${release}`);
+  requireFilesListed(tagged, release, `published under ${release}`);
   return { release, sums: tagged };
 }
 
-/** A bundle zip, checked against the top-level SHA256SUMS; downloads are cached per tag. */
-async function loadBundle({ release, sums, variant, releaseDir, cacheDir = CACHE_DIR, fetch: fetchImpl = globalThis.fetch }) {
-  const name = `${bundleName(release.slice(1), variant)}.zip`;
+/** A release file (a module or the kit), checked against the top-level SHA256SUMS; downloads are cached per tag. */
+async function loadReleaseFile({ release, sums, name, releaseDir, cacheDir = CACHE_DIR, fetch: fetchImpl = globalThis.fetch }) {
   const expected = parseSums(sums).get(name);
   if (!expected) refuse(`the ${release} SHA256SUMS does not list ${name}`);
-  let zip;
-  if (releaseDir) zip = readReleaseFile(releaseDir, name);
+  let bytes;
+  if (releaseDir) bytes = readReleaseFile(releaseDir, name);
   else {
     const cached = path.join(cacheDir, release, name);
-    zip = fs.existsSync(cached) ? fs.readFileSync(cached) : null;
-    if (!zip || sha256(zip) !== expected) zip = await download(releaseUrl(release, name), fetchImpl);
+    bytes = fs.existsSync(cached) ? fs.readFileSync(cached) : null;
+    if (!bytes || sha256(bytes) !== expected) bytes = await download(releaseUrl(release, name), fetchImpl);
   }
-  const actual = sha256(zip);
+  const actual = sha256(bytes);
   if (actual !== expected) refuse(`${name} has sha256 ${actual}; the ${release} SHA256SUMS says ${expected}`);
   if (!releaseDir) {
     // Best effort, and whole files only: another install may be reading the cache.
     try {
       fs.mkdirSync(path.join(cacheDir, release), { recursive: true });
-      for (const [file, bytes] of [['SHA256SUMS', sums], [name, zip]]) {
+      for (const [file, content] of [['SHA256SUMS', sums], [name, bytes]]) {
         const target = path.join(cacheDir, release, file);
         const partial = `${target}.${process.pid}-${randomBytes(4).toString('hex')}.partial`;
-        fs.writeFileSync(partial, bytes);
+        fs.writeFileSync(partial, content);
         try {
           renameWithRetry(partial, target);
         } finally {
@@ -319,7 +511,7 @@ async function loadBundle({ release, sums, variant, releaseDir, cacheDir = CACHE
       }
     } catch {}
   }
-  return zip;
+  return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,118 +536,165 @@ export function readCuratedNotices(file = CURATED_NOTICES) {
   return { bytes, release: record.release };
 }
 
-/** What a module reports about itself, from its own glue; nothing is written to disk for this. */
+/** What a module reports about itself, loaded under its own glue; nothing is written to disk for this. */
 async function engineProfile(glue, wasm) {
   // A data: URL per call: each import is a fresh module with its own instance,
-  // so the second bundle is not answered by the first.
+  // so the second engine is not answered by the first.
   const source = Buffer.concat([glue, Buffer.from(`\n// ${randomBytes(8).toString('hex')}\n`)]);
   const module = await import(`data:text/javascript;base64,${source.toString('base64')}`);
   module.initSync({ module: wasm });
   return JSON.parse(module.zippProfile());
 }
 
-/** One bundle, verified all the way down: its files to install and its SOURCE.json. */
-async function verifyBundle({ release, sums, zip, variant, curatedNotices }) {
+/** A release file must be the bytes its SHA256SUMS line names; returns that digest. */
+function listedDigest(sums, release, name, bytes) {
+  const listed = parseSums(sums).get(name);
+  if (!listed) refuse(`the ${release} SHA256SUMS does not list ${name}`);
+  if (sha256(bytes) !== listed) refuse(`${name} does not match the ${release} SHA256SUMS`);
+  return listed;
+}
+
+/**
+ * One module, verified all the way down: its line in SHA256SUMS, its record,
+ * glue and stack, and what it reports loaded under that glue. Returns what an
+ * install takes from it, PROFILE.json among them.
+ */
+async function verifyModule({ release, sums, wasm, variant }) {
   const version = release.slice(1);
-  const bundle = `${bundleName(version, variant)}.zip`;
-  const bundleSha256 = parseSums(sums).get(bundle);
-  if (!bundleSha256) refuse(`the ${release} SHA256SUMS does not list ${bundle}`);
-  if (sha256(zip) !== bundleSha256) refuse(`${bundle} does not match the ${release} SHA256SUMS`);
-
-  const entries = bundleEntries(zip, version, variant);
-  if (!entries.has('SHA256SUMS')) refuse(`${bundle} carries no SHA256SUMS`);
-  const inner = parseSums(entries.get('SHA256SUMS'));
-  // Everything the bundle lists is what it lists, and everything taken from it is listed.
-  for (const [name, digest] of inner) {
-    if (!entries.has(name)) refuse(`${bundle} lists ${name} in its SHA256SUMS but does not carry it`);
-    if (sha256(entries.get(name)) !== digest) refuse(`${name} in ${bundle} does not match the bundle's SHA256SUMS`);
-  }
-  const files = new Map();
-  for (const name of BUNDLE_FILES) {
-    if (!entries.has(name)) refuse(`${bundle} has no ${name}`);
-    if (name !== 'SHA256SUMS' && !inner.has(name)) refuse(`${name} in ${bundle} is not listed in the bundle's SHA256SUMS`);
-    files.set(name, entries.get(name));
-  }
-
-  const info = parseBuildInfo(entries.get('BUILD-INFO.txt'));
-  fail(`${bundle} is not the ZIPP ${release} ${variant.suffix} build`, buildInfoProblems(info, variant, { version }));
-  let profileFile;
-  try {
-    profileFile = JSON.parse(entries.get('PROFILE.json').toString('utf8'));
-  } catch {
-    refuse(`${bundle} PROFILE.json is not JSON`);
-  }
-  if (profileFile.version !== version) refuse(`${bundle} PROFILE.json says version ${profileFile.version}, not ${version}`);
-
-  const glue = entries.get('zipp_wasm.js');
-  const wasm = entries.get('zipp_wasm_bg.wasm');
+  const name = moduleName(version, variant);
+  const bundleSha256 = listedDigest(sums, release, name, wasm);
+  const meta = moduleMeta(wasm, name);
+  const glue = moduleGlue(wasm, name);
+  fail(`${name} is not the ZIPP ${release} ${variant.variant} engine`, [...metaProblems(meta, glue, variant, { version }), ...stackProblems(wasm, variant)]);
   let profile;
   try {
     profile = await engineProfile(glue, wasm);
   } catch (error) {
-    refuse(`the ${bundle} engine does not load: ${error.message}`);
+    refuse(`the ${name} engine does not load under its own glue: ${error.message}`);
   }
-  fail(`the ${bundle} engine does not describe itself as ZIPP ${release} ${variant.suffix}`, [
-    ...(profile.version !== version ? [`zippProfile() version is ${profile.version}, not ${version}`] : []),
-    ...(!profile.features?.includes('safe-sandbox') ? ['zippProfile() lacks the safe-sandbox feature'] : []),
-    ...(!isDeepStrictEqual(profile.languages, variant.languages) ? [`zippProfile() languages are ${JSON.stringify(profile.languages)}, not ${JSON.stringify(variant.languages)}`] : []),
-    ...(profile.source?.sha !== info.commit ? [`zippProfile() source.sha is ${profile.source?.sha}, not the BUILD-INFO.txt commit ${info.commit}`] : []),
+  fail(`the ${name} engine does not describe itself as ZIPP ${release} ${variant.variant}`, [
+    ...(profile?.version !== version ? [`zippProfile() version is ${profile?.version}, not ${version}`] : []),
+    ...(!profile?.features?.includes('safe-sandbox') ? ['zippProfile() lacks the safe-sandbox feature'] : []),
+    ...(!isDeepStrictEqual(profile?.languages, variant.languages) ? [`zippProfile() languages are ${JSON.stringify(profile?.languages)}, not ${JSON.stringify(variant.languages)}`] : []),
+    ...(profile?.source?.sha !== meta.commit ? [`zippProfile() source.sha is ${profile?.source?.sha}, not the ${META_SECTION} commit ${meta.commit}`] : []),
   ]);
-
-  let notices = null;
-  let curatedFrom;
-  if (entries.has(NOTICES)) {
-    if (!inner.has(NOTICES)) refuse(`${NOTICES} in ${bundle} is not listed in the bundle's SHA256SUMS`);
-    files.set(NOTICES, entries.get(NOTICES));
-    notices = { file: NOTICES, source: 'zipp-release', sha256: sha256(entries.get(NOTICES)) };
-  } else if (variant.needsNotices) {
-    if (!fs.existsSync(curatedNotices)) refuse(`${bundle} ships no ${NOTICES} and the curated copy ${rel(curatedNotices)} is missing`);
-    const curated = readCuratedNotices(curatedNotices);
-    files.set(NOTICES, curated.bytes);
-    notices = { file: NOTICES, source: CURATED, sha256: sha256(curated.bytes) };
-    curatedFrom = curated.release;
-  }
-  files.set('RELEASE-SHA256SUMS', sums);
-
-  const source = {
-    repository: REPOSITORY,
-    release,
-    version,
-    revision: info.commit,
-    build: 'release',
-    bundle,
-    bundleSha256,
-    sumsSha256: sha256(sums),
-    variant: info.variant,
-    languages: buildInfoLanguages(info),
-    stackBytes: Number(info['stack-bytes']),
-    rustc: info.rustc,
-    wasmBindgen: (info['wasm-bindgen'] ?? '').replace(/^wasm-bindgen\s+/, ''),
-    license: 'Apache-2.0',
-    artifact: 'zipp_wasm_bg.wasm',
-    sha256: sha256(wasm),
-    glueSha256: sha256(glue),
-    notices,
-  };
-  files.set('SOURCE.json', Buffer.from(`${JSON.stringify(source, null, 2)}\n`));
-  return { files, source, curatedFrom };
+  // As the bundles published it: what the engine reports, two-space JSON and a newline.
+  const profileJson = Buffer.from(`${JSON.stringify(profile, null, 2)}\n`);
+  return { name, bundleSha256, meta, glue, profileJson };
 }
 
 /**
- * Verify a release's SHA256SUMS and both bundles (`zips` by variant suffix)
- * and return what to install, per variant. Refuses with ZippReleaseError.
+ * The embed kit, held to the release: its zip to SHA256SUMS, every file in it
+ * to its own SHA256SUMS, its BUILD-INFO.txt and modules.json to the release and
+ * `commit`, and both modules as modules.json names them to the digests
+ * SHA256SUMS gives them. Returns the files both installs take from it, the
+ * record SOURCE.json keeps of it, and its notices, if it ever ships them.
  */
-export async function verifyRelease({ release, sums, zips, expectSumsSha256, curatedNotices = CURATED_NOTICES }) {
+function verifyKit({ release, sums, kit, commit }) {
+  const version = release.slice(1);
+  const name = kitName(version);
+  const kitSha256 = listedDigest(sums, release, name, kit);
+  const entries = kitEntries(kit, version);
+  if (!entries.has('SHA256SUMS')) refuse(`${name} carries no SHA256SUMS`);
+  const inner = parseSums(entries.get('SHA256SUMS'));
+  // Everything the kit lists is what it lists, and everything taken from it is listed.
+  for (const [file, digest] of inner) {
+    if (!entries.has(file)) refuse(`${name} lists ${file} in its SHA256SUMS but does not carry it`);
+    if (sha256(entries.get(file)) !== digest) refuse(`${file} in ${name} does not match the kit's SHA256SUMS`);
+  }
+  const taken = [...Object.entries(KIT_FILES), ...(entries.has(NOTICES) ? [[NOTICES, NOTICES]] : [])];
+  for (const file of [...taken.map(([, from]) => from), 'BUILD-INFO.txt', 'modules.json']) {
+    if (!entries.has(file)) refuse(`${name} has no ${file}`);
+    if (!inner.has(file)) refuse(`${file} in ${name} is not listed in the kit's SHA256SUMS`);
+  }
+
+  const problems = [];
+  const info = parseBuildInfo(entries.get('BUILD-INFO.txt'));
+  if (info.version !== version) problems.push(`BUILD-INFO.txt says version ${info.version}, not ${version}`);
+  if (info.commit !== commit) problems.push(`BUILD-INFO.txt commit ${info.commit} is not the modules' commit ${commit}`);
+  let modules;
+  try {
+    modules = JSON.parse(entries.get('modules.json').toString('utf8'));
+  } catch {
+    refuse(`${name} modules.json is not JSON`);
+  }
+  if (modules?.version !== version) problems.push(`modules.json says version ${modules?.version}, not ${version}`);
+  if (modules?.commit !== commit) problems.push(`modules.json commit ${modules?.commit} is not the modules' commit ${commit}`);
+  const listed = parseSums(sums);
+  const named = Array.isArray(modules?.modules) ? modules.modules : [];
+  for (const variant of VARIANTS) {
+    const file = moduleName(version, variant);
+    const matches = named.filter((m) => m?.file === file);
+    if (matches.length !== 1) problems.push(matches.length ? `modules.json lists ${file} ${matches.length} times` : `modules.json does not list ${file}`);
+    else if (matches[0].sha256 !== listed.get(file)) problems.push(`modules.json gives ${file} sha256 ${matches[0].sha256}; the ${release} SHA256SUMS says ${listed.get(file)}`);
+  }
+  fail(`${name} is not the ZIPP ${release} embed kit of commit ${commit}`, problems);
+
+  const files = new Map(Object.entries(KIT_FILES).map(([installed, from]) => [installed, entries.get(from)]));
+  const record = { file: name, sha256: kitSha256, files: Object.fromEntries(taken.map(([installed, from]) => [installed, { from, sha256: sha256(entries.get(from)) }])) };
+  return { files, record, notices: entries.get(NOTICES) ?? null };
+}
+
+/**
+ * Verify a release's SHA256SUMS, both modules (`modules` by variant suffix)
+ * and its embed kit, and return what to install, per variant. Refuses with
+ * ZippReleaseError.
+ */
+export async function verifyRelease({ release, sums, modules, kit, expectSumsSha256, curatedNotices = CURATED_NOTICES }) {
   if (!isReleaseTag(release)) refuse(`"${release}" is not a ZIPP release tag`);
   if (expectSumsSha256 && sha256(sums) !== expectSumsSha256.toLowerCase()) refuse(`the ${release} SHA256SUMS has sha256 ${sha256(sums)}; ZIPP_SUMS_SHA256 says ${expectSumsSha256}`);
-  const installs = [];
+  const version = release.slice(1);
+  const verified = [];
   for (const variant of VARIANTS) {
-    if (!zips[variant.suffix]) refuse(`no ${variant.suffix} bundle was given for ${release}`);
-    installs.push({ variant, ...(await verifyBundle({ release, sums, zip: zips[variant.suffix], variant, curatedNotices })) });
+    if (!modules?.[variant.suffix]) refuse(`no ${moduleName(version, variant)} was given for ${release}`);
+    verified.push({ variant, wasm: modules[variant.suffix], ...(await verifyModule({ release, sums, wasm: modules[variant.suffix], variant })) });
   }
-  // One release job builds both; bundles from two commits are not one ZIPP.
-  const revisions = new Set(installs.map((i) => i.source.revision));
-  if (revisions.size !== 1) refuse(`the ZIPP ${release} bundles name different commits: ${installs.map((i) => `${i.variant.suffix} ${i.source.revision}`).join(', ')}`);
+  // One release job builds both; modules from two commits are not one ZIPP.
+  if (new Set(verified.map((m) => m.meta.commit)).size !== 1) refuse(`the ZIPP ${release} modules name different commits: ${verified.map((m) => `${m.variant.suffix} ${m.meta.commit}`).join(', ')}`);
+  const commit = verified[0].meta.commit;
+  if (!kit) refuse(`no ${kitName(version)} was given for ${release}`);
+  const { files: kitFiles, record: kitRecord, notices: kitNotices } = verifyKit({ release, sums, kit, commit });
+
+  const installs = [];
+  for (const { variant, wasm, name, bundleSha256, meta, glue, profileJson } of verified) {
+    const files = new Map([['zipp_wasm_bg.wasm', wasm], ['zipp_wasm.js', glue], ...kitFiles, ['PROFILE.json', profileJson]]);
+    let notices = null;
+    let curatedFrom;
+    if (kitNotices) {
+      files.set(NOTICES, kitNotices);
+      notices = { file: NOTICES, source: 'zipp-release', sha256: sha256(kitNotices) };
+    } else if (variant.needsNotices) {
+      if (!fs.existsSync(curatedNotices)) refuse(`ZIPP ${release} ships no ${NOTICES} and the curated copy ${rel(curatedNotices)} is missing`);
+      const curated = readCuratedNotices(curatedNotices);
+      files.set(NOTICES, curated.bytes);
+      notices = { file: NOTICES, source: CURATED, sha256: sha256(curated.bytes) };
+      curatedFrom = curated.release;
+    }
+    files.set('RELEASE-SHA256SUMS', sums);
+
+    const source = {
+      repository: REPOSITORY,
+      release,
+      version,
+      revision: meta.commit,
+      build: 'release',
+      bundle: name,
+      bundleSha256,
+      sumsSha256: sha256(sums),
+      variant: meta.variant,
+      languages: meta.languages,
+      stackBytes: wasmStackBytes(wasm),
+      license: 'Apache-2.0',
+      artifact: 'zipp_wasm_bg.wasm',
+      sha256: sha256(wasm),
+      glueSha256: sha256(glue),
+      profileSha256: sha256(profileJson),
+      kit: kitRecord,
+      notices,
+    };
+    files.set('SOURCE.json', Buffer.from(`${JSON.stringify(source, null, 2)}\n`));
+    installs.push({ variant, files, source, curatedFrom });
+  }
   return installs;
 }
 
@@ -693,10 +932,13 @@ export function writeInstalls(vendorDir, installs) {
 async function installReleaseLocked({ vendorDir, tag, latest, releaseDir, cacheDir, expectSumsSha256, fetch: fetchImpl = globalThis.fetch, curatedNotices = CURATED_NOTICES, log = console.log, warn = console.warn, assertHeld = () => {} }) {
   const { release, sums } = await resolveRelease({ tag, latest, releaseDir, cacheDir, fetch: fetchImpl });
   if (expectSumsSha256 && sha256(sums) !== expectSumsSha256.toLowerCase()) refuse(`the ${release} SHA256SUMS has sha256 ${sha256(sums)}; ZIPP_SUMS_SHA256 says ${expectSumsSha256}`);
-  log(`Taking the web and web-python bundles from ZIPP ${release}${releaseDir ? ` in ${releaseDir}` : ''} ...`);
-  const zips = {};
-  for (const variant of VARIANTS) zips[variant.suffix] = await loadBundle({ release, sums, variant, releaseDir, cacheDir, fetch: fetchImpl });
-  const installs = await verifyRelease({ release, sums, zips, expectSumsSha256, curatedNotices });
+  log(`Taking the ${VARIANTS.map((v) => v.module).join(' and ')} modules and the embed kit from ZIPP ${release}${releaseDir ? ` in ${releaseDir}` : ''} ...`);
+  const version = release.slice(1);
+  const load = (name) => loadReleaseFile({ release, sums, name, releaseDir, cacheDir, fetch: fetchImpl });
+  const modules = {};
+  for (const variant of VARIANTS) modules[variant.suffix] = await load(moduleName(version, variant));
+  const kit = await load(kitName(version));
+  const installs = await verifyRelease({ release, sums, modules, kit, expectSumsSha256, curatedNotices });
   // Nothing redistributes the Python engine before O1, so drift is a prompt, not a refusal.
   // An older release can need more than the notices name, too: releases before v0.0.21 compile in RustPython.
   const curatedFrom = installs.find((i) => i.curatedFrom)?.curatedFrom;
@@ -726,12 +968,17 @@ export async function installRelease({ vendorDir = VENDOR_DIR, warn, ...options 
 // Check an install
 // ---------------------------------------------------------------------------
 
+/** The files an install takes from the kit, as [installed name, the kit's name]: its notices too when they are the release's. */
+const kitTaken = (notices) => [...Object.entries(KIT_FILES), ...(notices?.source === 'zipp-release' ? [[NOTICES, NOTICES]] : [])];
+
 /**
- * Check one install offline and return its SOURCE.json. Every installed file
- * but SOURCE.json, RELEASE-SHA256SUMS and curated notices must be listed in
- * and match the bundle's SHA256SUMS (that list also names files an install
- * does not take, which is fine); RELEASE-SHA256SUMS must be the digest
- * recorded and list the bundle; BUILD-INFO.txt must agree with SOURCE.json.
+ * Check one install offline and return its SOURCE.json; nothing is compiled.
+ * The module must be the file RELEASE-SHA256SUMS lists, byte for byte, its
+ * record (read again from the installed bytes) and stack those SOURCE.json
+ * records; zipp_wasm.js must be that module's own glue; the kit's files the
+ * digests recorded, the kit itself listed in RELEASE-SHA256SUMS;
+ * RELEASE-SHA256SUMS the digest recorded; and PROFILE.json the profile the
+ * engine reported at install.
  */
 export function checkInstall(dir, variant, { curatedNotices = CURATED_NOTICES } = {}) {
   const where = rel(dir);
@@ -779,41 +1026,61 @@ export function checkInstall(dir, variant, { curatedNotices = CURATED_NOTICES } 
   if (source.build !== 'release') problems.push(`SOURCE.json build is ${source.build}, not a verified release install`);
   if (source.repository !== REPOSITORY) problems.push(`SOURCE.json repository is ${source.repository}, not ${REPOSITORY}`);
   if (!isReleaseTag(source.release) || source.release !== `v${version}`) problems.push(`SOURCE.json release ${source.release} and version ${version} do not agree`);
-  if (!/^[0-9a-f]{40}$/.test(source.revision ?? '')) problems.push('SOURCE.json revision is not a full commit');
-  if (source.bundle !== `${bundleName(version, variant)}.zip`) problems.push(`SOURCE.json bundle ${source.bundle} is not the ${variant.suffix} bundle`);
-  for (const field of ['bundleSha256', 'sumsSha256', 'sha256', 'glueSha256']) if (!HEX64.test(source[field] ?? '')) problems.push(`SOURCE.json ${field} is not a sha256`);
+  if (!COMMIT.test(source.revision ?? '')) problems.push('SOURCE.json revision is not a full commit');
+  if (source.bundle !== moduleName(version, variant)) problems.push(`SOURCE.json bundle ${source.bundle} is not the ${variant.module} module (${moduleName(version, variant)})`);
+  for (const field of ['bundleSha256', 'sumsSha256', 'sha256', 'glueSha256', 'profileSha256']) if (!HEX64.test(source[field] ?? '')) problems.push(`SOURCE.json ${field} is not a sha256`);
+  if (source.bundleSha256 !== source.sha256) problems.push(`SOURCE.json sha256 ${source.sha256} is not the bundleSha256 ${source.bundleSha256}; the module is installed as published`);
   if (source.variant !== variant.variant || !isDeepStrictEqual(source.languages, variant.languages) || source.stackBytes !== variant.stackBytes) {
-    problems.push(`SOURCE.json records ${source.variant} ${JSON.stringify(source.languages)} with a ${source.stackBytes}-byte stack, not the ${variant.suffix} build`);
+    problems.push(`SOURCE.json records ${source.variant} ${JSON.stringify(source.languages)} with a ${source.stackBytes}-byte stack, not the ${variant.variant} engine`);
   }
   if (source.artifact !== 'zipp_wasm_bg.wasm') problems.push(`SOURCE.json artifact is ${source.artifact}`);
+  const kit = source.kit ?? {};
+  if (kit.file !== kitName(version) || !HEX64.test(kit.sha256 ?? '')) problems.push(`SOURCE.json kit ${JSON.stringify(kit.file)} is not the release's embed kit (${kitName(version)}) with its sha256`);
+  for (const [name, from] of kitTaken(notices)) {
+    const file = kit.files?.[name];
+    if (file?.from !== from || !HEX64.test(file?.sha256 ?? '')) problems.push(`SOURCE.json kit.files records ${name} as ${JSON.stringify(file)}, not the kit's ${from} with its sha256`);
+    else if (present.has(name) && sha256(present.get(name)) !== file.sha256) problems.push(`${name} is not the kit's ${from} recorded (${file.sha256})`);
+  }
   const allowedNotices = variant.needsNotices ? ['zipp-release', CURATED] : ['zipp-release'];
   if (notices === null ? variant.needsNotices : notices.file !== NOTICES || !allowedNotices.includes(notices.source) || !HEX64.test(notices.sha256 ?? '')) {
-    problems.push(`SOURCE.json notices ${JSON.stringify(source.notices)} are not recorded for the ${variant.suffix} bundle`);
+    problems.push(`SOURCE.json notices ${JSON.stringify(source.notices)} are not recorded for the ${variant.variant} engine`);
   }
 
-  const inner = present.has('SHA256SUMS') ? parseSums(present.get('SHA256SUMS')) : new Map();
-  // Shipped file to sums, never sums to files.
-  const exempt = new Set(['SOURCE.json', 'RELEASE-SHA256SUMS', 'SHA256SUMS', ...(notices?.source === CURATED ? [NOTICES] : [])]);
-  for (const [name, bytes] of present) {
-    if (exempt.has(name)) continue;
-    if (!inner.has(name)) problems.push(`${name} is not listed in the bundle's SHA256SUMS`);
-    else if (sha256(bytes) !== inner.get(name)) problems.push(`${name} does not match the bundle's SHA256SUMS`);
-  }
   if (present.has('RELEASE-SHA256SUMS')) {
     const sums = present.get('RELEASE-SHA256SUMS');
+    const listed = parseSums(sums);
     if (sha256(sums) !== source.sumsSha256) problems.push(`RELEASE-SHA256SUMS has sha256 ${sha256(sums)}, not the recorded ${source.sumsSha256}`);
-    if (parseSums(sums).get(source.bundle) !== source.bundleSha256) problems.push(`RELEASE-SHA256SUMS does not list ${source.bundle} with the recorded ${source.bundleSha256}`);
+    if (listed.get(source.bundle) !== source.bundleSha256) problems.push(`RELEASE-SHA256SUMS does not list ${source.bundle} with the recorded ${source.bundleSha256}`);
+    if (listed.get(kit.file) !== kit.sha256) problems.push(`RELEASE-SHA256SUMS does not list ${kit.file} with the recorded ${kit.sha256}`);
   }
-  if (present.has('BUILD-INFO.txt')) problems.push(...buildInfoProblems(parseBuildInfo(present.get('BUILD-INFO.txt')), variant, { version, revision: source.revision }));
+  if (present.has('zipp_wasm_bg.wasm')) {
+    const wasm = present.get('zipp_wasm_bg.wasm');
+    if (sha256(wasm) !== source.sha256) problems.push(`zipp_wasm_bg.wasm is not the recorded ${source.sha256}`);
+    let meta;
+    let glue;
+    try {
+      meta = moduleMeta(wasm, 'zipp_wasm_bg.wasm');
+      glue = moduleGlue(wasm, 'zipp_wasm_bg.wasm');
+    } catch (error) {
+      if (!(error instanceof ZippReleaseError)) throw error;
+      problems.push(error.message);
+    }
+    if (glue) {
+      problems.push(...metaProblems(meta, glue, variant, { version, revision: source.revision, glueSha256: source.glueSha256 }).map((p) => `zipp_wasm_bg.wasm: ${p}`));
+      if (present.has('zipp_wasm.js') && !glue.equals(present.get('zipp_wasm.js'))) problems.push(`zipp_wasm.js is not the glue zipp_wasm_bg.wasm carries (its ${GLUE_SECTION} section)`);
+    }
+    problems.push(...stackProblems(wasm, variant).map((p) => `zipp_wasm_bg.wasm: ${p}`));
+  }
+  if (present.has('zipp_wasm.js') && sha256(present.get('zipp_wasm.js')) !== source.glueSha256) problems.push(`zipp_wasm.js is not the recorded ${source.glueSha256}`);
   if (present.has('PROFILE.json')) {
+    const profile = present.get('PROFILE.json');
+    if (sha256(profile) !== source.profileSha256) problems.push(`PROFILE.json is not the recorded ${source.profileSha256}, the profile the engine reported at install`);
     let profileVersion;
     try {
-      profileVersion = JSON.parse(present.get('PROFILE.json').toString('utf8')).version;
+      profileVersion = JSON.parse(profile.toString('utf8')).version;
     } catch {}
     if (profileVersion !== version) problems.push(`PROFILE.json says version ${profileVersion}, not ${version}`);
   }
-  if (present.has('zipp_wasm_bg.wasm') && sha256(present.get('zipp_wasm_bg.wasm')) !== source.sha256) problems.push(`zipp_wasm_bg.wasm is not the recorded ${source.sha256}`);
-  if (present.has('zipp_wasm.js') && sha256(present.get('zipp_wasm.js')) !== source.glueSha256) problems.push(`zipp_wasm.js is not the recorded ${source.glueSha256}`);
   if (notices && present.has(NOTICES)) {
     if (sha256(present.get(NOTICES)) !== notices.sha256) problems.push(`${NOTICES} is not the recorded ${notices.sha256}`);
     else if (notices.source === CURATED && !(fs.existsSync(curatedNotices) && fs.readFileSync(curatedNotices).equals(present.get(NOTICES)))) problems.push(`${NOTICES} is not the curated copy in ${rel(curatedNotices)}`);
@@ -837,9 +1104,14 @@ export function checkInstalls(vendorDir = VENDOR_DIR, { curatedNotices } = {}) {
   return { release, revision, sumsSha256, sources };
 }
 
-/** --check, then both installs against the release as published now: ZIPP's SHA256SUMS and every file taken from each bundle. */
+/**
+ * --check, then both installs against the release as published now: ZIPP's
+ * SHA256SUMS, each module, and the kit (downloaded once) and every file taken
+ * from it.
+ */
 export async function checkInstallsOnline(vendorDir = VENDOR_DIR, { fetch: fetchImpl = globalThis.fetch, curatedNotices } = {}) {
   const installed = checkInstalls(vendorDir, { curatedNotices });
+  const { release } = installed;
   const problems = [];
   const read = (dir, name) => {
     try {
@@ -848,22 +1120,29 @@ export async function checkInstallsOnline(vendorDir = VENDOR_DIR, { fetch: fetch
       return Buffer.alloc(0);
     }
   };
-  const sums = await download(releaseUrl(installed.release, 'SHA256SUMS'), fetchImpl);
+  const sums = await download(releaseUrl(release, 'SHA256SUMS'), fetchImpl);
   for (const variant of VARIANTS) {
     const dir = path.join(vendorDir, variant.folder);
     const source = installed.sources[variant.suffix];
-    if (!sums.equals(read(dir, 'RELEASE-SHA256SUMS'))) problems.push(`${variant.folder}/RELEASE-SHA256SUMS is not the SHA256SUMS published under ${installed.release}`);
-    const zip = await download(releaseUrl(installed.release, source.bundle), fetchImpl);
-    if (sha256(zip) !== source.bundleSha256) {
-      problems.push(`the published ${source.bundle} is not the recorded ${source.bundleSha256}`);
-      continue;
-    }
-    const entries = bundleEntries(zip, source.version, variant);
-    for (const name of [...BUNDLE_FILES, ...(source.notices?.source === 'zipp-release' ? [NOTICES] : [])]) {
-      if (!entries.get(name)?.equals(read(dir, name))) problems.push(`${variant.folder}/${name} is not the file in the published ${source.bundle}`);
+    if (!sums.equals(read(dir, 'RELEASE-SHA256SUMS'))) problems.push(`${variant.folder}/RELEASE-SHA256SUMS is not the SHA256SUMS published under ${release}`);
+    const module = await download(releaseUrl(release, source.bundle), fetchImpl);
+    if (!module.equals(read(dir, 'zipp_wasm_bg.wasm'))) problems.push(`${variant.folder}/zipp_wasm_bg.wasm is not the published ${source.bundle}`);
+  }
+  // Both installs name the one kit (--check holds each to the release's kit name and its line in one SHA256SUMS).
+  const { file: kitFile } = installed.sources[VARIANTS[0].suffix].kit;
+  const kit = await download(releaseUrl(release, kitFile), fetchImpl);
+  const recorded = [...new Set(VARIANTS.map((v) => installed.sources[v.suffix].kit.sha256))].filter((digest) => digest !== sha256(kit));
+  for (const digest of recorded) problems.push(`the published ${kitFile} is not the recorded ${digest}`);
+  if (!recorded.length) {
+    const entries = kitEntries(kit, release.slice(1));
+    for (const variant of VARIANTS) {
+      const dir = path.join(vendorDir, variant.folder);
+      for (const [name, { from }] of Object.entries(installed.sources[variant.suffix].kit.files)) {
+        if (!entries.get(from)?.equals(read(dir, name))) problems.push(`${variant.folder}/${name} is not ${from} in the published ${kitFile}`);
+      }
     }
   }
-  fail(`the ZIPP installs in ${rel(vendorDir)} are not what ${installed.release} publishes`, problems);
+  fail(`the ZIPP installs in ${rel(vendorDir)} are not what ${release} publishes`, problems);
   return installed;
 }
 

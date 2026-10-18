@@ -75,10 +75,11 @@ function check(name, ok, detail = '') {
 // ---------------------------------------------------------------------------
 // 1. The installed artifact is the one the release verified.
 // ---------------------------------------------------------------------------
-// The engine is not committed: the installer takes it from a zipp.org release,
-// checked against ZIPP's SHA256SUMS and the bundle's own, and records what it
-// took in SOURCE.json. Every identity here comes from that record, never from
-// a literal, so a new ZIPP release needs no edit to this file.
+// The engine is not committed: the installer takes it from a zipp.org release
+// (from v0.0.26 one .wasm whose bindings are its zipp.glue section, and an embed
+// kit), checked against ZIPP's SHA256SUMS, and records what it took in
+// SOURCE.json. Every identity here comes from that record, never from a
+// literal, so a new ZIPP release needs no edit to this file.
 console.log(`\ninstalled artifact (${VARIANT.folder})`);
 let source;
 try {
@@ -93,15 +94,19 @@ const wasmBytes = fs.readFileSync(path.join(VENDOR, 'zipp_wasm_bg.wasm'));
 check('SOURCE.json records the .wasm beside it',
   createHash('sha256').update(wasmBytes).digest('hex') === source.sha256);
 
-const checksums = new Map(fs.readFileSync(path.join(VENDOR, 'SHA256SUMS'), 'utf8')
+// Each installed file is the one the installer recorded taking: the module is its
+// line in the release's SHA256SUMS, the glue its own record's, the declarations
+// the kit's file, the profile what the engine reported.
+const releaseSums = new Map(fs.readFileSync(path.join(VENDOR, 'RELEASE-SHA256SUMS'), 'utf8')
   .trim().split(/\r?\n/).map(line => {
-    const [digest, name] = line.trim().split(/\s+/, 2);
+    const [digest, name] = line.trim().split(/\s+\*?/, 2);
     return [name, digest];
   }));
-for (const name of ['zipp_wasm.js', 'zipp_wasm.d.ts', 'zipp_wasm_bg.wasm', 'zipp_wasm_bg.wasm.d.ts', 'PROFILE.json', 'BUILD-INFO.txt']) {
-  check(`${name} matches the release bundle's checksum`,
-    createHash('sha256').update(fs.readFileSync(path.join(VENDOR, name))).digest('hex') === checksums.get(name));
-}
+const digestOf = (name) => createHash('sha256').update(fs.readFileSync(path.join(VENDOR, name))).digest('hex');
+check('zipp_wasm_bg.wasm is the module the release\'s SHA256SUMS lists', digestOf('zipp_wasm_bg.wasm') === releaseSums.get(source.bundle));
+check('zipp_wasm.js is the bindings the module\'s record names', digestOf('zipp_wasm.js') === source.glueSha256);
+check('zipp_wasm.d.ts is the embed kit\'s', digestOf('zipp_wasm.d.ts') === source.kit?.files?.['zipp_wasm.d.ts']?.sha256);
+check('PROFILE.json is the one recorded', digestOf('PROFILE.json') === source.profileSha256);
 
 const { default: init, Engine, zippProfile } = await import(
   pathToFileURL(path.join(VENDOR, 'zipp_wasm.js')).href
