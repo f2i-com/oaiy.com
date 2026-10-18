@@ -430,25 +430,30 @@ fn at_mut<'a>(v: &'a mut Json, path: &[&str]) -> Option<&'a mut Json> {
 }
 
 /// The model `name` taken out of the section at `at` (an array of models with names, or an object of them by name),
-/// as `{name, model, index}`; the last of two by one name (the one the check refuses), and `#<i>:` names one by place.
+/// as `{name, model, index, twice}`; the last of two by one name (the one the check refuses), and `#<i>:` names one by
+/// place. `twice`: another of its name is still there (it goes back beside it all the same).
 fn take_model(v: &mut Json, at: &str, name: &str) -> Option<Json> {
     let path: Vec<&str> = at.split('.').collect();
-    match at_mut(v, &path)? {
+    let (key, index, model, twice) = match at_mut(v, &path)? {
         Json::Arr(models) => {
             let index = match name.strip_prefix('#').and_then(|r| r.split(':').next()).and_then(|i| i.parse::<usize>().ok()) {
                 Some(i) if i < models.len() => i,
                 _ => models.iter().rposition(|m| str_or(m, "name", "") == name)?,
             };
             let model = models.remove(index);
-            Some(Json::obj([("name", Json::str(str_or(&model, "name", "").to_string())), ("index", Json::Int(index as i64)), ("model", model)]))
+            let key = str_or(&model, "name", "").to_string();
+            let twice = models.iter().any(|m| str_or(m, "name", "") == key);
+            (key, index, model, twice)
         }
         Json::Obj(models) => {
             let index = models.iter().position(|(k, _)| k == name)?;
             let (key, model) = models.remove(index);
-            Some(Json::obj([("name", Json::str(key)), ("index", Json::Int(index as i64)), ("model", model)]))
+            let twice = models.iter().any(|(k, _)| *k == key);
+            (key, index, model, twice)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(Json::obj([("name", Json::str(key)), ("index", Json::Int(index as i64)), ("model", model), ("twice", Json::Bool(twice))]))
 }
 
 /// A default at `at` (`section.key`) that names a model set aside, emptied (the section's first, or none, is then
@@ -463,7 +468,8 @@ fn take_default(v: &mut Json, at: &str) -> Option<Json> {
 }
 
 /// `v` as the file keeps it: each entry set aside ([`SET_ASIDE`]) back where it was (a model in its section, where no
-/// model of its name is there now; a default where it is still empty), and the key itself gone.
+/// model of its name is there now, or one listed twice in the file is; a default where it is still empty), and the
+/// key itself gone.
 pub fn with_set_aside_restored(v: &Json) -> Json {
     let mut out = v.clone();
     let Some(Json::Arr(aside)) = v.get(SET_ASIDE).cloned() else { return out };
@@ -477,10 +483,11 @@ pub fn with_set_aside_restored(v: &Json) -> Json {
         if let Some(model) = entry.get("model") {
             let name = str_or(entry, "name", "").to_string();
             let index = entry.get("index").and_then(Json::as_i64).unwrap_or(i64::MAX).max(0) as usize;
+            let twice = bool_or(entry, "twice", false);
             let path: Vec<&str> = at.split('.').collect();
             match at_mut(&mut out, &path) {
-                Some(Json::Arr(models)) if !models.iter().any(|m| str_or(m, "name", "") == name) => models.insert(index.min(models.len()), model.clone()),
-                Some(Json::Obj(models)) if !models.iter().any(|(k, _)| *k == name) => models.insert(index.min(models.len()), (name, model.clone())),
+                Some(Json::Arr(models)) if twice || !models.iter().any(|m| str_or(m, "name", "") == name) => models.insert(index.min(models.len()), model.clone()),
+                Some(Json::Obj(models)) if twice || !models.iter().any(|(k, _)| *k == name) => models.insert(index.min(models.len()), (name, model.clone())),
                 _ => {}
             }
         } else if let (Some(value), Some((section, key))) = (entry.get("value"), at.rsplit_once('.')) {
@@ -1067,6 +1074,13 @@ mod tests {
         let saved_image = saved.get("media").and_then(|m| m.get("image")).unwrap();
         assert!(saved_image.get("models").unwrap().get("odd").is_some() && str_or(saved_image, "default_model", "") == "odd");
         assert!(saved.get("media").and_then(|m| m.get("video")).and_then(|v| v.get("models")).unwrap().get("typo").is_some());
+        // A model listed twice: the second is set aside, and the file keeps both through a save.
+        std::fs::write(&path, r#"{"llm":{"models":[{"name":"same","path":"a.gguf"},{"name":"other","path":"o.gguf"},{"name":"same","path":"b.gguf"}]}}"#).unwrap();
+        let v = load(&path).unwrap();
+        let paths = |v: &Json| -> Vec<String> { v.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().iter().map(|m| str_or(m, "path", "").to_string()).collect() };
+        assert_eq!(paths(&v), ["a.gguf", "o.gguf"]);
+        save(&path, &v).unwrap();
+        assert_eq!(paths(&Json::parse(&std::fs::read(&path).unwrap()).unwrap()), ["a.gguf", "o.gguf", "b.gguf"]);
         // Settings wrong as a whole are refused as before.
         std::fs::write(&path, r#"{"ui":{"port":70000}}"#).unwrap();
         assert!(load(&path).is_err());
