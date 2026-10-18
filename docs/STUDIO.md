@@ -172,9 +172,13 @@ licence. **Recommended** picks one of each kind to start with.
   restarts (a model partly downloaded into another folder is found there too:
   the folders downloads went to are kept in `download-dirs.json`). **Cancel**
   (and **Discard** on a model partly downloaded, or failed) deletes what the
-  download fetched: its partial files and the files it put in place, but
-  never a file another model uses (two models downloading into one folder),
-  a file that was there before, or the file a link points to. One download
+  download fetched: its partial files and the files it put in place (written
+  down beside the folder as it goes, `.oaiy-<id>.fetched.json`, so a Discard
+  after a restart knows them too), but never a file another model uses (two
+  models downloading into one folder), a file the settings' models name, a file
+  that was there before, or the file a link points to; nor while the model is
+  being added to the models. A folder written as `~/Models` is the home
+  folder's, for Download and What it needs alike. One download
   runs at a time, and the others wait their turn. A connection that stops
   sending for a minute is given up and tried again (curl's `--speed-limit`).
 - **Everything a model needs, none of it twice:** a download gets every part
@@ -641,8 +645,15 @@ and with their secrets (`downloads.hf_token`, `gateway.api_key`) said to be set
 it. A save (`PUT /api/config`) of settings read before another save (a download
 that added a model, another window, the desktop) is refused with `409`, so it
 cannot put back what that save changed: the page reads them again, puts the
-person's unsaved changes back on top, and asks them to save again. A save
-without a version is taken as it is (an older client). The API's own changes (a
+person's unsaved changes back on top, and asks them to save again. Those changes
+are put back one by one, never a whole list again: a list of models, routes,
+GPUs or pins item by item by its name, so a model added meanwhile is kept, one
+removed meanwhile does not come back, and a value the server changed inside a
+model (the desktop putting it on the eGPU) stands. The version starts from the
+time the studio started (in ms) and moves with each save that changes
+something. A save without a version is taken as it is (an older client). A
+model's `egpu_ctx` under 512 from an older studio is read as the default
+(`null`) rather than refused, and refused only when saved so. The API's own changes (a
 model added, imported or removed, a pin, a download's model added, the
 download folder or token) are made on the settings as they are, under the same
 lock as a save.

@@ -88,6 +88,12 @@ pub struct Studio {
 /// The key `GET /api/config` adds to the settings it answers: their version, sent back with a save of them.
 pub const CONFIG_VERSION: &str = "config_version";
 
+/// The settings' first version at a start: the time it started, in ms, so a page left open across a restart does
+/// not hold a version the new start counts to by chance (each start counted from 1 before).
+fn first_version() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_millis() as u64)
+}
+
 /// What a secret of the settings reads as where they are answered (the Hugging Face token, the gateway's key): the
 /// page shows it is set, and a save that sends it back keeps the secret as it was.
 pub const SECRET_KEPT: &str = "(saved)";
@@ -122,7 +128,12 @@ impl Studio {
     /// The settings as the control page reads them: their secrets said to be set ([`SECRET_KEPT`]), not said, and their
     /// version ([`CONFIG_VERSION`]), which a save of them sends back.
     pub fn config_for_page(&self) -> Json {
-        let mut cfg = self.config();
+        // (the settings and their version read together: a save writes both under the same lock, so a page never has
+        // new settings with the version before them, or the other way round)
+        let (mut cfg, version) = {
+            let held = self.config.read().unwrap_or_else(|p| p.into_inner());
+            (held.clone(), self.version.load(std::sync::atomic::Ordering::SeqCst))
+        };
         for (section, key) in SECRETS {
             if let Some(sec) = cfg.get(section).cloned() {
                 if !str_or(&sec, key, "").is_empty() {
@@ -132,7 +143,7 @@ impl Studio {
                 }
             }
         }
-        util::set(&mut cfg, CONFIG_VERSION, Json::Int(self.version.load(std::sync::atomic::Ordering::SeqCst) as i64));
+        util::set(&mut cfg, CONFIG_VERSION, Json::Int(version as i64));
         cfg
     }
 
@@ -156,8 +167,14 @@ impl Studio {
     /// Errors: `change`'s own (with its status), else the save's (400).
     pub fn update_config<T>(&self, change: impl FnOnce(&mut Json) -> Result<T, (u16, String)>) -> Result<(T, Json), (u16, String)> {
         let _one = self.saving.lock().unwrap_or_else(|p| p.into_inner());
-        let mut next = self.config();
+        let before = self.config();
+        let mut next = before.clone();
         let answer = change(&mut next)?;
+        // (nothing changed, a model unpinned that was not pinned: not saved, so the version stays, and a page that
+        // read the settings is not refused for a save that changed nothing)
+        if next == before {
+            return Ok((answer, before));
+        }
         let saved = self.save_locked(next).map_err(|e| (400, e))?;
         Ok((answer, saved))
     }
@@ -202,7 +219,12 @@ impl Studio {
             }
         }
         config::save(&self.config_path, &on_disk)?;
-        *self.config.write().unwrap_or_else(|p| p.into_inner()) = next.clone();
+        {
+            // (the version moves with the settings, under the same lock: see `config_for_page`)
+            let mut held = self.config.write().unwrap_or_else(|p| p.into_inner());
+            *held = next.clone();
+            self.version.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let listeners = |v: &Json| {
             ["ui", "gateway"].map(|k| v.get(k).map(|s| (str_or(s, "host", "").to_string(), int_or(s, "port", 0))))
         };
@@ -244,7 +266,6 @@ impl Studio {
             self.egpu.stop();
         }
         self.place_the_model(&before, &next);
-        self.version.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.log.push("configuration saved");
         Ok(next)
     }
@@ -361,7 +382,7 @@ impl Studio {
             gateway_url: RwLock::new(String::new()),
             restart_required: RwLock::new(false),
             saving: std::sync::Mutex::new(()),
-            version: std::sync::atomic::AtomicU64::new(1),
+            version: std::sync::atomic::AtomicU64::new(first_version()),
             port_overrides: (None, None),
         }
     }
@@ -698,7 +719,7 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         gateway_url: RwLock::new(String::new()),
         restart_required: RwLock::new(false),
         saving: std::sync::Mutex::new(()),
-        version: std::sync::atomic::AtomicU64::new(1),
+        version: std::sync::atomic::AtomicU64::new(first_version()),
         port_overrides: (args.ui_port, args.port),
     });
     // a media job's stages each read its device's memory: the card's (its launcher's word each second), or this
@@ -926,6 +947,33 @@ mod tests {
         studio.save_config_from(fresh).unwrap();
         assert_eq!(studio.config().get("downloads").map(|d| str_or(d, "hf_token", "").to_string()).as_deref(), Some("hf_secret"));
         assert!(studio.config().get(CONFIG_VERSION).is_none(), "the version is not a setting");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The settings' version starts from when the studio started (a page from before a restart does not match it by
+    /// chance), moves by one with each save, and not with a change that changed nothing.
+    #[test]
+    fn the_version_starts_from_the_start_and_moves_with_each_real_save_alone() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-version-moves-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let studio = Studio::for_test(&root, config::default_json());
+        let version = |s: &Studio| s.config_for_page().get(CONFIG_VERSION).and_then(Json::as_i64).unwrap();
+        let first = version(&studio);
+        assert!(first > 1_700_000_000_000, "from the time it started, in ms: {first}");
+        // a change that changes nothing is not saved: the version stays, a page that read it is not refused
+        let page = studio.config_for_page();
+        studio.update_config(|next| {
+            let same = next.clone();
+            *next = same;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(version(&studio), first);
+        let mut saved = page.clone();
+        util::set(&mut saved, "privacy", Json::obj([("incognito", Json::Bool(true))]));
+        studio.save_config_from(saved).unwrap();
+        assert_eq!(version(&studio), first + 1, "a real save moves it by one");
         let _ = std::fs::remove_dir_all(&root);
     }
 

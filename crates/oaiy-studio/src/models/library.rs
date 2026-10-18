@@ -55,7 +55,7 @@ fn too_wide(p: &Path) -> bool {
 }
 
 /// `~` at the start of a folder the person wrote, as their home folder.
-fn expand_home(s: &str) -> String {
+pub(crate) fn expand_home(s: &str) -> String {
     match (s.strip_prefix('~'), home()) {
         (Some(rest), Some(h)) if rest.is_empty() || rest.starts_with(['/', '\\']) => format!("{}{rest}", h.display()),
         _ => s.to_string(),
@@ -106,6 +106,11 @@ pub fn roots(studio_root: &Path, cfg: &Json, downloads: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// The strings in `v` that name a file or folder (with a slash), as the settings' models name their files.
+pub(crate) fn paths_named(v: &Json, out: &mut Vec<String>) {
+    collect_strings(v, out);
+}
+
 fn collect_strings(v: &Json, out: &mut Vec<String>) {
     match v {
         Json::Str(s) if s.contains('/') || s.contains('\\') => out.push(s.clone()),
@@ -119,16 +124,36 @@ fn collect_strings(v: &Json, out: &mut Vec<String>) {
 /// program's build and packages), within the limits of a look ([`MAX_VISITS`] entries, [`MAX_TIME`]); the same roots
 /// looked through again within [`SCAN_REUSED`] answer what was found then.
 pub fn scan(roots: &[PathBuf]) -> Vec<Found> {
-    struct Look {
-        out: Vec<Found>,
-        visits: usize,
-        until: Instant,
+    if let Some((r, at, found)) = LAST.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        if r == roots && at.elapsed() < SCAN_REUSED {
+            return found.clone();
+        }
     }
+    let look = look_through(roots, Instant::now() + MAX_TIME);
+    *LAST.lock().unwrap_or_else(|p| p.into_inner()) = Some((roots.to_vec(), Instant::now(), look.out.clone()));
+    look.out
+}
+
+/// One look through `roots`: what it found, how many entries it saw, and whether it ran out of time (`until`).
+struct Look {
+    out: Vec<Found>,
+    visits: usize,
+    until: Instant,
+    /// Out of time, entries or room: every folder stops at once, the ones above too (a folder's own stop let the
+    /// folders above it carry on, so the time limit stopped little).
+    done: bool,
+}
+
+fn look_through(roots: &[PathBuf], until: Instant) -> Look {
     fn walk(dir: &Path, depth: usize, look: &mut Look) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
+            if look.done {
+                return;
+            }
             look.visits += 1;
             if look.out.len() >= MAX_FILES || look.visits >= MAX_VISITS || (look.visits % 256 == 0 && Instant::now() > look.until) {
+                look.done = true;
                 return;
             }
             let p = e.path();
@@ -149,17 +174,14 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Found> {
             }
         }
     }
-    if let Some((r, at, found)) = LAST.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-        if r == roots && at.elapsed() < SCAN_REUSED {
-            return found.clone();
-        }
-    }
-    let mut look = Look { out: Vec::new(), visits: 0, until: Instant::now() + MAX_TIME };
+    let mut look = Look { out: Vec::new(), visits: 0, until, done: false };
     for r in roots {
+        if look.done {
+            break;
+        }
         walk(r, MAX_DEPTH, &mut look);
     }
-    *LAST.lock().unwrap_or_else(|p| p.into_inner()) = Some((roots.to_vec(), Instant::now(), look.out.clone()));
-    look.out
+    look
 }
 
 /// The last look through ([`scan`]): its roots, when, and what it found.
@@ -379,6 +401,26 @@ fn copy_in_pieces(from: &Path, to: &Path, progress: &mut dyn FnMut(u64), stop: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Out of time, a look through stops in every folder at once, the folders above the one it was in too: a folder
+    /// of many files below others is not looked through to its end.
+    #[test]
+    fn a_look_through_out_of_time_stops_in_every_folder() {
+        let base = std::env::temp_dir().join(format!("oaiy-library-time-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["a", "a/b", "a/b/c"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+            for i in 0..300 {
+                std::fs::write(base.join(d).join(format!("f{i}.txt")), b"x").unwrap();
+            }
+        }
+        // (already out of time: it notices at its 256th entry)
+        let look = look_through(&[base.clone()], Instant::now());
+        assert!(look.done && look.visits <= 260, "stopped at once, not in the folder alone: {} entries seen", look.visits);
+        let whole = look_through(&[base.clone()], Instant::now() + Duration::from_secs(60));
+        assert!(!whole.done && whole.visits >= 900, "{} entries seen", whole.visits);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn a_file_kept_elsewhere_is_found_by_its_size_and_sha256_and_linked_into_place() {

@@ -272,9 +272,9 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         }),
         ("POST", "/api/downloads/pause") => body(req).map_err(|e| (400, e)).map(|b| studio.downloads.pause(studio, str_or(&b, "id", ""))),
         // (`dir`: where a model is partly downloaded that no listed download says, after a restart)
-        ("POST", "/api/downloads/cancel") => body(req).map_err(|e| (400, e)).map(|b| {
+        ("POST", "/api/downloads/cancel") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);
-            studio.downloads.cancel(studio, str_or(&b, "id", ""), dir)
+            studio.downloads.cancel(studio, str_or(&b, "id", ""), dir).map_err(|e| (409, e))
         }),
         ("POST", "/api/downloads/add") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);

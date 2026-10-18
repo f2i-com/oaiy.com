@@ -320,11 +320,40 @@ pub fn load(path: &Path) -> Result<Json, String> {
     }
     let upgraded = upgraded || was_cuda;
     merge_defaults(&mut v, &default_json());
-    if upgraded {
+    let relaxed = forget_bad_egpu_ctx(&mut v);
+    if relaxed {
+        eprintln!("oaiy-studio: {}: a model's egpu_ctx under 512 tokens (an older studio's \"the default\") is the default now", path.display());
+    }
+    if upgraded || relaxed {
         save(path, &v)?;
     }
     validate(&v).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(v)
+}
+
+/// A model's `egpu_ctx` an older studio took as "the default" (0, or under 512 tokens), set to the default (`null`)
+/// as the settings are read: checked strictly only when they are saved, so settings from before do not stop the
+/// studio starting. Whether any was.
+fn forget_bad_egpu_ctx(v: &mut Json) -> bool {
+    let Some(Json::Obj(llm)) = (match v {
+        Json::Obj(f) => f.iter_mut().find(|(k, _)| k == "llm").map(|(_, l)| l),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let Some((_, Json::Arr(models))) = llm.iter_mut().find(|(k, _)| k == "models") else { return false };
+    let mut any = false;
+    for m in models.iter_mut() {
+        if let Json::Obj(fields) = m {
+            for (k, c) in fields.iter_mut() {
+                if k == "egpu_ctx" && !matches!(c, Json::Null) && !c.as_i64().is_some_and(|c| (512..=4_194_304).contains(&c)) {
+                    *c = Json::Null;
+                    any = true;
+                }
+            }
+        }
+    }
+    any
 }
 
 /// Write atomically: a new file beside it, then a rename.
@@ -772,6 +801,29 @@ pub fn program(root: &Path, value: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `egpu_ctx` an older studio took as "the default" (0, 100) does not stop the settings being read: it is the
+    /// default (null) then, and the file says so; a save of one such is still refused.
+    #[test]
+    fn an_old_egpu_ctx_under_512_is_read_as_the_default_and_refused_only_on_a_save() {
+        let dir = std::env::temp_dir().join(format!("oaiy-studio-egpu-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oaiy-studio.json");
+        std::fs::write(&path, r#"{"llm":{"models":[{"name":"a","path":"a.gguf","egpu_ctx":0},{"name":"b","path":"b.gguf","egpu_ctx":100},{"name":"c","path":"c.gguf","egpu_ctx":8192}]}}"#).unwrap();
+        let v = load(&path).unwrap();
+        let ctx = |name: &str| v.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "name", "") == name).and_then(|m| m.get("egpu_ctx")).cloned();
+        assert_eq!((ctx("a"), ctx("b"), ctx("c")), (Some(Json::Null), Some(Json::Null), Some(Json::Int(8192))));
+        let on_disk = Json::parse(&std::fs::read(&path).unwrap()).unwrap();
+        let b = on_disk.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "name", "") == "b").cloned().unwrap();
+        assert_eq!(b.get("egpu_ctx"), Some(&Json::Null), "the file says the default now");
+        let mut bad = v.clone();
+        let mut llm = bad.get("llm").cloned().unwrap();
+        crate::util::set(&mut llm, "models", Json::parse(br#"[{"name":"a","path":"a.gguf","egpu_ctx":100}]"#).unwrap());
+        crate::util::set(&mut bad, "llm", llm);
+        assert!(validate(&bad).is_err(), "a save of one is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn with(edit: impl FnOnce(&mut Json)) -> Result<(), String> {
         let mut v = default_json();

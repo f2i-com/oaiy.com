@@ -1222,27 +1222,59 @@ function setPath(o, p, v) { const ks = p.split("."); const last = ks.pop(); ks.r
 function dirty() { $("#savebar").classList.toggle("on", JSON.stringify(cfg) !== JSON.stringify(saved)); }
 function touch() { dirty(); }
 
-// What the person changed and has not saved: each value that differs from the settings as they were read, by its
-// path (an object looked into, anything else changed whole; `undefined`: taken away).
-function edits(base, mine, at = "", out = []) {
-  const obj = v => v && typeof v === "object" && !Array.isArray(v);
-  if (obj(base) && obj(mine)) {
-    for (const k of new Set([...Object.keys(base), ...Object.keys(mine)])) edits(base[k], mine[k], at ? at + "." + k : k, out);
-  } else if (JSON.stringify(base) !== JSON.stringify(mine)) out.push([at, mine]);
+// What the person changed and has not saved, to put back on the settings read again: each change by its path, a list
+// of keys (a model's name may hold a dot: "ltx-2.5"). A list whose items are each known by a name of their own (the
+// language models, the routes, a list of GPUs or pins) is compared item by item: an item added or taken away is said
+// as such, and a change inside one by the item's name, never the whole list again.
+const isObj = v => v && typeof v === "object" && !Array.isArray(v);
+function itemKey(v) {
+  if (typeof v === "string" || typeof v === "number") return "=" + v;
+  if (!isObj(v)) return null;
+  if (typeof v.name === "string") return "name:" + v.name;
+  if (typeof v.path === "string") return (typeof v.method === "string" ? v.method + " " : "") + "path:" + v.path;
+  return null;
+}
+function byKey(list) {
+  const m = new Map();
+  for (const v of list) { const k = itemKey(v); if (k === null || m.has(k)) return null; m.set(k, v); }
+  return m;
+}
+function edits(base, mine, at = [], out = []) {
+  if (isObj(base) && isObj(mine)) {
+    for (const k of new Set([...Object.keys(base), ...Object.keys(mine)])) edits(base[k], mine[k], [...at, k], out);
+  } else if (Array.isArray(base) && Array.isArray(mine) && byKey(base) && byKey(mine)) {
+    const b = byKey(base), m = byKey(mine);
+    for (const [k, v] of m) b.has(k) ? edits(b.get(k), v, [...at, {item: k}], out) : out.push({at, add: v});
+    for (const k of b.keys()) if (!m.has(k)) out.push({at, remove: k});
+  } else if (JSON.stringify(base) !== JSON.stringify(mine)) out.push({at, value: mine});
   return out;
 }
-function unsetPath(o, p) { const ks = p.split("."); const last = ks.pop(); const parent = ks.reduce((a, k) => a?.[k], o); if (parent) delete parent[last]; }
-// The settings read again (something else saved them: a download that finished, a model added, another window), with
-// what the person changed and has not saved put back on top of them, rather than thrown away.
-async function loadConfig() {
-  const mine = saved && cfg ? edits(saved, cfg) : [];
-  saved = await api("/api/config"); cfg = clone(saved);
-  for (const [p, v] of mine) {
-    // (an edit to something no longer there, a model removed meanwhile, is not made again: it would bring back a part)
-    const parent = p.split(".").slice(0, -1).join(".");
-    if (p === "config_version" || (parent && getPath(cfg, parent) === undefined)) continue;
-    v === undefined ? unsetPath(cfg, p) : setPath(cfg, p, clone(v));
+// The value at `path` in `o`: a key of an object, or an item of a list by its name ({item}); undefined where it is not.
+function valueAt(o, path) {
+  return path.reduce((a, k) => a == null ? undefined : typeof k === "string" ? a[k] : Array.isArray(a) ? a.find(v => itemKey(v) === k.item) : undefined, o);
+}
+// Make change `e` (from `edits`) again on the settings read again, `next`, where `base` is the settings it was made on.
+// Not made where what it changes is gone (a model removed meanwhile: it would come back), nor inside a list's item
+// where the server changed that very value meanwhile (its change stands: the desktop putting a model on the eGPU).
+function remake(next, base, e) {
+  if (e.add !== undefined || e.remove !== undefined) {
+    const list = valueAt(next, e.at);
+    if (!Array.isArray(list)) return;
+    if (e.add !== undefined) { if (!list.some(v => itemKey(v) === itemKey(e.add))) list.push(clone(e.add)); }
+    else { const i = list.findIndex(v => itemKey(v) === e.remove); if (i >= 0) list.splice(i, 1); }
+    return;
   }
+  const last = e.at[e.at.length - 1], parent = valueAt(next, e.at.slice(0, -1));
+  if (typeof last !== "string" || parent == null || typeof parent !== "object") return;
+  if (e.at.some(k => typeof k !== "string") && JSON.stringify(valueAt(next, e.at)) !== JSON.stringify(valueAt(base, e.at))) return;
+  e.value === undefined ? delete parent[last] : parent[last] = clone(e.value);
+}
+// The settings read again (something else saved them: a download that finished, a model added, another window, the
+// desktop), with what the person changed and has not saved put back on top of them, rather than thrown away.
+async function loadConfig() {
+  const base = saved, mine = saved && cfg ? edits(saved, cfg) : [];
+  saved = await api("/api/config"); cfg = clone(saved);
+  for (const e of mine) if (!(e.at.length === 1 && e.at[0] === "config_version")) remake(cfg, base, e);
   renderConfig(); dirty(); renderFirstRun();
 }
 async function saveConfig() {
@@ -2845,21 +2877,24 @@ addEventListener("keydown", e => {
 /* ---------- logs ---------- */
 let logSource = "studio", logAfter = 0;
 $$("#v-logs .tabs button").forEach(b => b.onclick = () => { $$("#v-logs .tabs button").forEach(x => x.setAttribute("aria-selected", x === b)); logSource = b.dataset.log; pollLogs(true); });
-// (each read says which log it is for: one answered after the tab changed is another log's, and left out; the log
-// keeps its last lines, not every line of a day)
-let logAsk = 0;
+// (each read belongs to the log as it was when it was asked: one answered after the tab changed, or the log was read
+// afresh, is another log's and left out. One read at a time, a slow one waited for rather than each dropped for the
+// next; a line already shown is not shown again. The log keeps its last lines, not every line of a day.)
+let logGen = 0, logReading = false;
 const LOG_KEPT = 2000;
 async function pollLogs(reset) {
-  if (reset) { logAfter = 0; $("#log").textContent = ""; }
-  const asked = ++logAsk, source = logSource;
+  if (reset) { logGen++; logAfter = 0; $("#log").textContent = ""; }
+  else if (logReading) return;
+  const gen = logGen, source = logSource;
+  logReading = true;
   try {
     const r = await api(`/api/logs?source=${source}&after=${logAfter}`);
-    if (asked !== logAsk || source !== logSource) return;
+    if (gen !== logGen || source !== logSource) return;
     const el = $("#log"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-    for (const l of r.lines) { el.append(new Date(l.t).toLocaleTimeString() + "  " + l.line + "\n"); logAfter = l.n; }
+    for (const l of r.lines) { if (l.n <= logAfter) continue; el.append(new Date(l.t).toLocaleTimeString() + "  " + l.line + "\n"); logAfter = l.n; }
     while (el.childNodes.length > LOG_KEPT) el.firstChild.remove();
     if (atEnd || reset) el.scrollTop = el.scrollHeight;
-  } catch {}
+  } catch {} finally { if (gen === logGen) logReading = false; }
 }
 
 

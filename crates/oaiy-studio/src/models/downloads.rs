@@ -525,10 +525,7 @@ impl Downloads {
     /// desktop's), else the studio's own.
     pub fn start(&self, studio: &Arc<Studio>, id: &str, dir: Option<PathBuf>, token: Option<String>) -> Result<Json, String> {
         let e = entry(id).ok_or_else(|| format!("no model {id} in the catalog"))?;
-        let dir = dir.filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| default_dir(studio));
-        if !dir.is_absolute() {
-            return Err("the folder to save to must be a full path".into());
-        }
+        let dir = chosen_dir(studio, dir)?;
         let mut ids: Vec<String> = strings(e.get("needs")).into_iter().filter(|n| entry(n).is_some_and(|x| !installed(x, &dir))).collect();
         ids.push(id.to_string());
         {
@@ -575,7 +572,11 @@ impl Downloads {
 
     /// Stop `id` and delete what it downloaded: its partial files, and the files it put in place, except any another
     /// model uses. `dir`: where it is partly downloaded, where no download of it is listed (after a restart).
-    pub fn cancel(&self, studio: &Studio, id: &str, dir: Option<PathBuf>) -> Json {
+    pub fn cancel(&self, studio: &Studio, id: &str, dir: Option<PathBuf>) -> Result<Json, String> {
+        // (being added to the models: its files are the model's now, not a download's to take away)
+        if self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|d| d.id == id && d.status == "adding") {
+            return Err("it is being added to your models now: remove it under Models once it is there".into());
+        }
         self.want.lock().unwrap_or_else(|p| p.into_inner()).insert(id.to_string(), Want::Cancel);
         let (active, dir) = {
             let list = self.list.lock().unwrap_or_else(|p| p.into_inner());
@@ -585,10 +586,10 @@ impl Downloads {
         if active {
             self.stop_child();
         } else {
-            self.discard(id, &dir);
+            self.discard(studio, id, &dir);
             self.update(id, |d| d.status = "cancelled");
         }
-        self.state(studio)
+        Ok(self.state(studio))
     }
 
     /// What other models use, among the files in `dir`: the files another download (listed, not cancelled) puts in
@@ -617,15 +618,27 @@ impl Downloads {
         used
     }
 
+    /// Write down beside `dir` what download `id` has put in place so far (`.oaiy-<id>.fetched.json`), so a Discard after
+    /// a restart, with no download of it listed, still knows what to take away.
+    fn keep_fetched(&self, id: &str, dir: &Path) {
+        let fetched = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
+        let _ = std::fs::write(fetched_record(dir, id), Json::Arr(fetched.iter().map(|f| Json::str(f.to_string_lossy())).collect()).to_json());
+    }
+
     /// Delete what `id` downloaded into `dir`: its partial files and the files this download put in place (a link
     /// removed is the link alone), its markers, and the folders that leaves empty; never a file another model uses.
-    fn discard(&self, id: &str, dir: &Path) {
+    fn discard(&self, studio: &Studio, id: &str, dir: &Path) {
         let used = self.used_by_others(id, dir);
-        let fetched = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
+        // (what it put in place, as listed, else as its record beside the folder says: after a restart)
+        let listed = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
+        let fetched = if listed.is_empty() { read_fetched(dir, id) } else { listed };
+        // (a file the settings name, a model or a part of one, is the settings': never removed with a download)
+        let named = settings_files(studio);
         remove_partials(id, dir, &used);
-        for f in fetched.iter().filter(|f| !used.contains(*f)) {
+        for f in fetched.iter().filter(|f| !used.contains(*f) && !named.iter().any(|n| f.starts_with(n))) {
             let _ = std::fs::remove_file(f);
         }
+        let _ = std::fs::remove_file(fetched_record(dir, id));
         if let Some(e) = entry(id) {
             for part in e.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
                 if let Some(m) = marker(dir, part, id) {
@@ -706,8 +719,9 @@ impl Downloads {
     /// the files' list (`token`: as for [`Downloads::start`]).
     pub fn plan_of(&self, studio: &Studio, id: &str, token: Option<String>, dir: Option<PathBuf>) -> Result<Json, String> {
         let e = entry(id).ok_or_else(|| format!("no model {id} in the catalog"))?;
-        // (the folder the download would go to: the one the page has in its box, saved or not, else where downloads go)
-        let dir = dir.filter(|d| d.is_absolute()).unwrap_or_else(|| default_dir(studio));
+        // (the folder the download would go to: the one the page has in its box, saved or not, else where downloads go;
+        // as Download takes it, `~` its home folder, refused where it is not a full path)
+        let dir = chosen_dir(studio, dir)?;
         let cfg = studio.config();
         let token = token_for(&cfg, token.as_deref());
         let files = plan(&cfg, e, &dir, token.as_deref())?;
@@ -896,7 +910,7 @@ impl Downloads {
                 });
             }
             Ok(Want::Cancel) => {
-                self.discard(id, &dir);
+                self.discard(studio, id, &dir);
                 studio.log.push(format!("cancelled {name}"));
                 self.update(id, |d| {
                     d.status = "cancelled";
@@ -993,6 +1007,7 @@ impl Downloads {
                             d.reused_files += 1;
                             d.fetched.push(f.dest.clone());
                         });
+                        self.keep_fetched(id, dir);
                         continue;
                     }
                 }
@@ -1082,14 +1097,16 @@ impl Downloads {
                     }
                 }
             });
+            self.keep_fetched(id, dir);
         }
-        // Each part's marker: the model is here.
+        // Each part's marker: the model is here (and what it fetched is in them: no record of its own any more).
         for p in e.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
             if let Some(m) = marker(dir, p, id) {
                 let names: Vec<Json> = files.iter().filter(|f| m.parent().is_some_and(|folder| f.dest.starts_with(folder))).map(|f| Json::str(f.dest.strip_prefix(dir).unwrap_or(&f.dest).to_string_lossy())).collect();
                 let _ = std::fs::write(&m, Json::obj([("id", Json::str(id)), ("files", Json::Arr(names))]).to_json());
             }
         }
+        let _ = std::fs::remove_file(fetched_record(dir, id));
         Ok(Want::Run)
     }
 
@@ -1172,6 +1189,49 @@ fn remove_partials(id: &str, dir: &Path, used: &std::collections::HashSet<PathBu
             }
         }
     }
+}
+
+/// The folder a download goes to, as the person wrote it (`~` their home folder), else where downloads go; refused
+/// where it is not a full path.
+fn chosen_dir(studio: &Studio, dir: Option<PathBuf>) -> Result<PathBuf, String> {
+    let dir = dir
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| PathBuf::from(library::expand_home(&d.to_string_lossy())))
+        .unwrap_or_else(|| default_dir(studio));
+    if !dir.is_absolute() {
+        return Err("the folder to save to must be a full path".into());
+    }
+    Ok(dir)
+}
+
+/// Where what download `id` put in place in `dir` is written down until it is done.
+fn fetched_record(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!(".oaiy-{id}.fetched.json"))
+}
+
+/// What download `id` put in place in `dir`, as its record says (nothing outside `dir` is taken as its).
+fn read_fetched(dir: &Path, id: &str) -> Vec<PathBuf> {
+    std::fs::read(fetched_record(dir, id))
+        .ok()
+        .and_then(|b| Json::parse(&b).ok())
+        .and_then(|j| j.as_array().map(|a| a.iter().filter_map(Json::as_str).map(PathBuf::from).filter(|p| p.starts_with(dir)).collect()))
+        .unwrap_or_default()
+}
+
+/// The files and folders the settings' models name (a model, a part of one): a download never removes them.
+fn settings_files(studio: &Studio) -> Vec<PathBuf> {
+    let cfg = studio.config();
+    let mut named = Vec::new();
+    let mut collect = |v: &Json| library::paths_named(v, &mut named);
+    if let Some(llm) = cfg.get("llm").and_then(|l| l.get("models")) {
+        collect(llm);
+    }
+    for (_, section) in cfg.get("media").and_then(Json::as_object).unwrap_or(&[]) {
+        if let Some(models) = section.get("models") {
+            collect(models);
+        }
+    }
+    named.into_iter().map(|n| config::resolve(&studio.root, &n)).filter(|p| p.components().count() > 1).collect()
 }
 
 /// Remove `dir` and the folders in it that hold nothing.
@@ -1631,12 +1691,59 @@ mod tests {
         let id = "qwen3.5-9b";
         d.list.lock().unwrap().push(Download { status: "paused", fetched: vec![fetched.clone(), linked.clone()], ..Download::new(id, &dir, None) });
         d.list.lock().unwrap().push(Download { status: "downloading", planned: vec![mine.join("theirs.gguf")], ..Download::new("moss-image-sft-q4", &dir, None) });
-        d.discard(id, &dir);
+        let studio = Studio::for_test(&root, crate::config::default_json());
+        d.discard(&studio, id, &dir);
         assert!(!fetched.exists() && !linked.exists(), "what it put in place goes");
         assert!(kept.exists(), "the file a link was made to stays");
         assert!(before.exists(), "what was here before stays");
         assert!(other_part.exists(), "another download's partial file stays");
         assert!(!own_part.exists(), "its own partial file goes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// After a restart (no download of it listed), Discard still takes away what the download put in place, as its
+    /// record beside the folder says; never a file the settings' models name (the Qwen3.5-9B GGUF a picture model's
+    /// text encoder is); and not while the download is being added to the models.
+    #[test]
+    fn a_discard_after_a_restart_knows_what_it_fetched_and_keeps_what_the_settings_use() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        let folder = dir.join("MOSS-Image-GGUF");
+        std::fs::create_dir_all(&folder).unwrap();
+        let shared = dir.join("Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf");
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        let (own, outside) = (folder.join("MOSS-Image-SFT-Q4_K_M.gguf"), root.join("elsewhere.gguf"));
+        for f in [&own, &shared, &outside] {
+            std::fs::write(f, b"weights").unwrap();
+        }
+        // the settings name the shared GGUF (the language model): it stays
+        let cfg = Json::parse(format!(r#"{{"llm":{{"models":[{{"name":"qwen3.5-9b","path":"{}"}}]}}}}"#, shared.display()).as_bytes()).unwrap();
+        let mut full = crate::config::default_json();
+        crate::util::set(&mut full, "llm", cfg.get("llm").cloned().unwrap());
+        let studio = Studio::for_test(&root, full);
+        // what a download had fetched, written down as it went (a record that names a file outside the folder is
+        // not believed)
+        let id = "moss-image-sft-q4";
+        let d = Downloads::new();
+        d.list.lock().unwrap().push(Download { status: "paused", fetched: vec![own.clone(), shared.clone(), outside.clone()], ..Download::new(id, &dir, None) });
+        d.keep_fetched(id, &dir);
+        assert!(fetched_record(&dir, id).is_file());
+        // a restart: nothing listed; Discard reads the record
+        let after = Downloads::new();
+        after.cancel(&studio, id, Some(dir.clone())).unwrap();
+        assert!(!own.exists(), "what it put in place goes");
+        assert!(shared.exists(), "a file the settings name stays");
+        assert!(outside.exists(), "nothing outside its folder is taken as its");
+        assert!(!fetched_record(&dir, id).exists(), "its record goes with it");
+        // being added to the models: not discarded
+        after.list.lock().unwrap().push(Download { status: "adding", ..Download::new(id, &dir, None) });
+        assert!(after.cancel(&studio, id, Some(dir.clone())).is_err());
+        // a folder as the person wrote it: `~` their home folder; one that is not a full path refused
+        assert!(chosen_dir(&studio, Some(PathBuf::from("models"))).is_err());
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(chosen_dir(&studio, Some(PathBuf::from("~/Models"))).unwrap(), PathBuf::from(home).join("Models"));
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
