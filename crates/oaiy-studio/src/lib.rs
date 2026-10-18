@@ -216,6 +216,13 @@ impl Studio {
                 }
             }
         }
+        // (entries set aside as the settings were read stay set aside, and in the file: a page that does not send them
+        // back does not drop them)
+        if next.get(config::SET_ASIDE).is_none() {
+            if let Some(aside) = current.get(config::SET_ASIDE) {
+                util::set(&mut next, config::SET_ASIDE, aside.clone());
+            }
+        }
         config::merge_defaults(&mut next, &config::default_json());
         config::validate(&next)?;
         let before = self.config();
@@ -921,6 +928,11 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         closed: std::sync::atomic::AtomicBool::new(false),
         listeners: std::sync::Mutex::new(Vec::new()),
     });
+    // (a model entry the check refused was set aside as the settings were read, the rest used: said where the Engines
+    // page shows the log)
+    for item in cfg.get(config::SET_ASIDE).and_then(Json::as_array).unwrap_or(&[]) {
+        studio.log.push(format!("set aside (kept in the settings file, not used until it checks): {}", str_or(item, "why", "")));
+    }
     // a media job's stages each read its device's memory: the card's (its launcher's word each second), or this
     // computer's GPU's
     let weak = Arc::downgrade(&studio);

@@ -324,7 +324,11 @@ pub fn load(path: &Path) -> Result<Json, String> {
     if relaxed {
         eprintln!("oaiy-studio: {}: a model's egpu_ctx under 512 tokens (an older studio's \"the default\") is the default now", path.display());
     }
-    if upgraded || relaxed {
+    let retired = video_families_as_they_run(&mut v);
+    for name in &retired {
+        eprintln!("oaiy-studio: {}: video model {name}: its family is ltx-2.3 now, the LTX 2.3 path it already ran on", path.display());
+    }
+    if upgraded || relaxed || !retired.is_empty() {
         save(path, &v)?;
     }
     // A Hugging Face token no token could be (one saved before tokens were checked) is not used, rather than the
@@ -337,8 +341,160 @@ pub fn load(path: &Path) -> Result<Json, String> {
         }
         eprintln!("oaiy-studio: {}: downloads.hf_token has characters no token has, so it is not used: set it again in Get models", path.display());
     }
-    validate(&v).map_err(|e| format!("{}: {e}", path.display()))?;
+    for why in set_aside_what_fails(&mut v).map_err(|e| format!("{}: {e}", path.display()))? {
+        eprintln!("oaiy-studio: {}: set aside (kept in the file, not used): {why}", path.display());
+    }
     Ok(v)
+}
+
+/// The key the settings in use keep their set-aside entries under ([`set_aside_what_fails`]): never in the file, which
+/// keeps each entry where it was ([`save`] puts them back).
+pub const SET_ASIDE: &str = "set_aside";
+
+/// Each model entry the check refuses ([`validate`]), taken out of the settings in use and kept under [`SET_ASIDE`]
+/// with why, so that one entry (a model an update no longer takes as it is, a part that went missing) does not stop
+/// every engine starting: the rest are used, and a default that named it falls back to none. Settings that are wrong
+/// as a whole (a port, a key, a section) are still refused. The file is not changed: the entry stays where it is, and
+/// is used again once it checks (fixed by hand, or an update that takes it). What was set aside, in words.
+pub fn set_aside_what_fails(v: &mut Json) -> Result<Vec<String>, String> {
+    let mut whys = Vec::new();
+    // (each pass sets one entry aside; a configuration has some tens at most)
+    for _ in 0..256 {
+        let Err(e) = validate(v) else { return Ok(whys) };
+        let Some(place) = failing_entry(v, &e) else { return Err(e) };
+        let (at, entry) = match place {
+            Failing::Model { at, name } => match take_model(v, &at, &name) {
+                Some(entry) => (at, entry),
+                None => return Err(e),
+            },
+            Failing::Default { at } => match take_default(v, &at) {
+                Some(entry) => (at, entry),
+                None => return Err(e),
+            },
+        };
+        let mut aside = match v.get(SET_ASIDE) {
+            Some(Json::Arr(list)) => list.clone(),
+            _ => Vec::new(),
+        };
+        aside.push(Json::obj([("at", Json::str(at)), ("entry", entry), ("why", Json::str(e.clone()))]));
+        crate::util::set(v, SET_ASIDE, Json::Arr(aside));
+        whys.push(e);
+    }
+    Err("too many entries fail the check to set them aside".into())
+}
+
+/// What [`validate`]'s message `e` is about, where it is one entry: a model (its section, its name), or a default
+/// naming a model that is not there.
+enum Failing {
+    Model { at: String, name: String },
+    Default { at: String },
+}
+
+fn failing_entry(v: &Json, e: &str) -> Option<Failing> {
+    // (the messages name an entry so: "<kind> model <name>[: ...| needs ...| is listed twice]", "model <name>: ...",
+    // "llm.models[<i>]...")
+    let named = |prefix: &str| -> Option<String> {
+        let rest = e.strip_prefix(prefix)?;
+        let end = rest.find([':', ' ']).unwrap_or(rest.len());
+        Some(rest[..end].to_string()).filter(|n| !n.is_empty())
+    };
+    for (prefix, at) in [("image model ", "media.image.models"), ("video model ", "media.video.models"), ("speech model ", "media.speech.models"), ("music model ", "media.music.models"), ("sound model ", "media.sound.models"), ("3D model ", "media.model3d.models")] {
+        if let Some(name) = named(prefix) {
+            return Some(Failing::Model { at: at.into(), name });
+        }
+    }
+    if let Some(name) = named("llm model ").or_else(|| named("model ")) {
+        return Some(Failing::Model { at: "llm.models".into(), name });
+    }
+    if let Some(i) = e.strip_prefix("llm.models[").and_then(|r| r.split(']').next()).and_then(|i| i.parse::<usize>().ok()) {
+        // (a name the check refuses: taken out by its place, under the name it has)
+        let name = v.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).and_then(|m| m.get(i)).map_or(String::new(), |m| format!("#{i}:{}", str_or(m, "name", "")));
+        return Some(Failing::Model { at: "llm.models".into(), name });
+    }
+    for at in ["llm.default_model", "llm.egpu.fallback_model", "media.image.default_model", "media.video.default_model", "media.speech.default_model", "media.music.default_model", "media.sound.default_model", "media.model3d.default_model"] {
+        if e.starts_with(&format!("{at} ")) {
+            return Some(Failing::Default { at: at.into() });
+        }
+    }
+    None
+}
+
+/// The object at a dotted path, to change.
+fn at_mut<'a>(v: &'a mut Json, path: &[&str]) -> Option<&'a mut Json> {
+    let mut here = v;
+    for key in path {
+        let Json::Obj(fields) = here else { return None };
+        here = &mut fields.iter_mut().find(|(k, _)| k == key)?.1;
+    }
+    Some(here)
+}
+
+/// The model `name` taken out of the section at `at` (an array of models with names, or an object of them by name),
+/// as `{name, model, index}`; the last of two by one name (the one the check refuses), and `#<i>:` names one by place.
+fn take_model(v: &mut Json, at: &str, name: &str) -> Option<Json> {
+    let path: Vec<&str> = at.split('.').collect();
+    match at_mut(v, &path)? {
+        Json::Arr(models) => {
+            let index = match name.strip_prefix('#').and_then(|r| r.split(':').next()).and_then(|i| i.parse::<usize>().ok()) {
+                Some(i) if i < models.len() => i,
+                _ => models.iter().rposition(|m| str_or(m, "name", "") == name)?,
+            };
+            let model = models.remove(index);
+            Some(Json::obj([("name", Json::str(str_or(&model, "name", "").to_string())), ("index", Json::Int(index as i64)), ("model", model)]))
+        }
+        Json::Obj(models) => {
+            let index = models.iter().position(|(k, _)| k == name)?;
+            let (key, model) = models.remove(index);
+            Some(Json::obj([("name", Json::str(key)), ("index", Json::Int(index as i64)), ("model", model)]))
+        }
+        _ => None,
+    }
+}
+
+/// A default at `at` (`section.key`) that names a model set aside, emptied (the section's first, or none, is then
+/// used), as `{value}`.
+fn take_default(v: &mut Json, at: &str) -> Option<Json> {
+    let (section, key) = at.rsplit_once('.')?;
+    let path: Vec<&str> = section.split('.').collect();
+    let Json::Obj(fields) = at_mut(v, &path)? else { return None };
+    let (_, value) = fields.iter_mut().find(|(k, _)| k == key)?;
+    let was = std::mem::replace(value, Json::str(""));
+    Some(Json::obj([("value", was)]))
+}
+
+/// `v` as the file keeps it: each entry set aside ([`SET_ASIDE`]) back where it was (a model in its section, where no
+/// model of its name is there now; a default where it is still empty), and the key itself gone.
+pub fn with_set_aside_restored(v: &Json) -> Json {
+    let mut out = v.clone();
+    let Some(Json::Arr(aside)) = v.get(SET_ASIDE).cloned() else { return out };
+    if let Json::Obj(fields) = &mut out {
+        fields.retain(|(k, _)| k != SET_ASIDE);
+    }
+    // (in the order they were set aside, backwards: each goes back to the place it had then)
+    for item in aside.iter().rev() {
+        let at = str_or(item, "at", "");
+        let Some(entry) = item.get("entry") else { continue };
+        if let Some(model) = entry.get("model") {
+            let name = str_or(entry, "name", "").to_string();
+            let index = entry.get("index").and_then(Json::as_i64).unwrap_or(i64::MAX).max(0) as usize;
+            let path: Vec<&str> = at.split('.').collect();
+            match at_mut(&mut out, &path) {
+                Some(Json::Arr(models)) if !models.iter().any(|m| str_or(m, "name", "") == name) => models.insert(index.min(models.len()), model.clone()),
+                Some(Json::Obj(models)) if !models.iter().any(|(k, _)| *k == name) => models.insert(index.min(models.len()), (name, model.clone())),
+                _ => {}
+            }
+        } else if let (Some(value), Some((section, key))) = (entry.get("value"), at.rsplit_once('.')) {
+            let path: Vec<&str> = section.split('.').collect();
+            if let Some(Json::Obj(fields)) = at_mut(&mut out, &path) {
+                if let Some((_, now)) = fields.iter_mut().find(|(k, _)| k == key) {
+                    if now.as_str() == Some("") {
+                        *now = value.clone();
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A model's `egpu_ctx` an older studio took as "the default" (0, or under 512 tokens), set to the default (`null`)
@@ -366,6 +522,29 @@ fn forget_bad_egpu_ctx(v: &mut Json) -> bool {
     any
 }
 
+/// Video models whose family is one OAIY had before the families were LTX 2.3's and 2.5's alone (723d8aa8): the only
+/// other there was an LTX 2.3 fine-tune's own name, which ran the LTX 2.3 path (the same checkpoint check, text
+/// encoder, audio VAE and start-image CRF), so such a model is `ltx-2.3`, as it ran, rather than settings that worked
+/// the day before stopping every engine at their check ("family must be one of"). A family named `ltx-` that OAIY
+/// does not know is left for the check to refuse (a slip, not an old family). The models changed, by name.
+fn video_families_as_they_run(v: &mut Json) -> Vec<String> {
+    let mut changed = Vec::new();
+    let Json::Obj(top) = v else { return changed };
+    let Some((_, Json::Obj(media))) = top.iter_mut().find(|(k, _)| k == "media") else { return changed };
+    let Some((_, Json::Obj(video))) = media.iter_mut().find(|(k, _)| k == "video") else { return changed };
+    let Some((_, Json::Obj(models))) = video.iter_mut().find(|(k, _)| k == "models") else { return changed };
+    for (name, m) in models.iter_mut() {
+        let Json::Obj(fields) = m else { continue };
+        let Some((_, family)) = fields.iter_mut().find(|(k, _)| k == "family") else { continue };
+        let retired = family.as_str().is_some_and(|f| !f.is_empty() && !VIDEO_FAMILIES.contains(&f) && !f.starts_with("ltx-"));
+        if retired {
+            *family = Json::str("ltx-2.3");
+            changed.push(name.clone());
+        }
+    }
+    changed
+}
+
 /// Write atomically: a new file beside it, then a rename.
 ///
 /// The file holds secrets (`gateway.api_key` and `downloads.hf_token`), so on unix the new file is
@@ -379,6 +558,8 @@ fn forget_bad_egpu_ctx(v: &mut Json) -> bool {
 pub fn save(path: &Path, v: &Json) -> Result<(), String> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?.to_string_lossy().into_owned();
+    // (an entry set aside as the settings were read goes back where it was: the file loses nothing for failing a check)
+    let v = &with_set_aside_restored(v);
     let (tmp, mut file) = create_private(dir, &name)?;
     let staged = file.write_all(pretty(v, 0).as_bytes()).and_then(|()| file.sync_all());
     drop(file);
@@ -836,6 +1017,59 @@ mod tests {
         crate::util::set(&mut llm, "models", Json::parse(br#"[{"name":"a","path":"a.gguf","egpu_ctx":100}]"#).unwrap());
         crate::util::set(&mut bad, "llm", llm);
         assert!(validate(&bad).is_err(), "a save of one is refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model entry the check refuses does not stop the settings being read: it is set aside (with why), the rest are
+    /// used, a default that named it is none for now, and the file keeps it where it was, with its default, through a
+    /// save. A video model of a family OAIY no longer has (an LTX 2.3 fine-tune's own name) is LTX 2.3, as it ran,
+    /// and the file says so; one named ltx- that OAIY does not know is set aside, not taken for LTX 2.3. Settings
+    /// wrong as a whole are still refused.
+    #[test]
+    fn an_entry_that_fails_its_check_is_set_aside_and_kept_and_the_rest_are_read() {
+        let dir = std::env::temp_dir().join(format!("oaiy-studio-set-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oaiy-studio.json");
+        std::fs::write(
+            &path,
+            r#"{"llm":{"default_model":"broken","models":[{"name":"good","path":"good.gguf"},{"name":"broken","path":""}]},
+                "media":{"image":{"default_model":"odd","models":{"odd":{"architecture":"nothing-known"},"fine":{"architecture":"sdxl","checkpoint":"x.safetensors","tokenizer":"t.json"}}},
+                         "video":{"models":{"tuned":{"family":"a-fine-tune","transformer":"t","text_encoder":"g.gguf","vae":"t"},"typo":{"family":"ltx-9","transformer":"t","text_encoder":"g.gguf","vae":"t"}}}}}"#,
+        )
+        .unwrap();
+        let v = load(&path).unwrap();
+        let llm_names: Vec<String> = v.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().iter().map(|m| str_or(m, "name", "").to_string()).collect();
+        assert_eq!(llm_names, ["good"]);
+        assert_eq!(str_or(v.get("llm").unwrap(), "default_model", "?"), "", "a default naming a model set aside is none for now");
+        let image = v.get("media").and_then(|m| m.get("image")).unwrap();
+        assert!(image.get("models").unwrap().get("odd").is_none() && image.get("models").unwrap().get("fine").is_some());
+        assert_eq!(str_or(image, "default_model", "?"), "");
+        let video = v.get("media").and_then(|m| m.get("video")).and_then(|v| v.get("models")).unwrap();
+        assert_eq!(video.get("tuned").map(|m| str_or(m, "family", "").to_string()).as_deref(), Some("ltx-2.3"), "an old family is LTX 2.3, as it ran");
+        assert!(video.get("typo").is_none(), "an ltx- family OAIY does not know is a slip: set aside, not taken for LTX 2.3");
+        let whys: Vec<String> = v.get(SET_ASIDE).and_then(Json::as_array).unwrap().iter().map(|a| str_or(a, "why", "").to_string()).collect();
+        assert_eq!(whys.len(), 5, "{whys:?}");
+        assert!(whys.iter().any(|w| w.starts_with("llm model broken needs a path")) && whys.iter().any(|w| w.starts_with("video model typo: family")), "{whys:?}");
+        validate(&v).unwrap();
+        // The file keeps every entry where it was (the migrated family saved as ltx-2.3), and no set-aside key.
+        let on_disk = Json::parse(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(on_disk.get(SET_ASIDE).is_none());
+        assert_eq!(on_disk.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).map(<[Json]>::len), Some(2));
+        assert_eq!(str_or(on_disk.get("media").and_then(|m| m.get("video")).and_then(|v| v.get("models")).and_then(|m| m.get("tuned")).unwrap(), "family", ""), "ltx-2.3");
+        // ... and a save of the settings in use (a page's) puts the set-aside ones back, defaults with them.
+        save(&path, &v).unwrap();
+        let saved = Json::parse(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get(SET_ASIDE).is_none());
+        let names: Vec<String> = saved.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().iter().map(|m| str_or(m, "name", "").to_string()).collect();
+        assert_eq!(names, ["good", "broken"]);
+        assert_eq!(str_or(saved.get("llm").unwrap(), "default_model", ""), "broken");
+        let saved_image = saved.get("media").and_then(|m| m.get("image")).unwrap();
+        assert!(saved_image.get("models").unwrap().get("odd").is_some() && str_or(saved_image, "default_model", "") == "odd");
+        assert!(saved.get("media").and_then(|m| m.get("video")).and_then(|v| v.get("models")).unwrap().get("typo").is_some());
+        // Settings wrong as a whole are refused as before.
+        std::fs::write(&path, r#"{"ui":{"port":70000}}"#).unwrap();
+        assert!(load(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
