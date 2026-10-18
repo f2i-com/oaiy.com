@@ -439,6 +439,34 @@ async function main(): Promise<void> {
     `status=${byName.status} error=${byName.error ?? ''} got=${JSON.stringify(byName.results?.['both'])}`
   );
 
+  // A block written before its inputs had names declares the name itself: `const picture = input2;`, input 2 being
+  // named `picture`. The name the compiler declares sat in the same block as the code, so the flow did not compile at
+  // all ("Identifier 'picture' has already been declared"). The block's own declaration wins.
+  for (const [label, code] of [
+    ['a block', 'const picture = input2;\nconst prompt = input;\n[prompt, picture]'],
+    ['an awaiting block', 'const picture = await Promise.resolve(input2);\nlet prompt = input;\n[prompt, picture]'],
+  ] as const) {
+    const own = await runFlow(
+      {
+        nodes: [
+          { id: 'p', type: 'logic_block', position: { x: 0, y: 0 }, data: { code: 'return "a cat";' } },
+          { id: 'q', type: 'logic_block', position: { x: 0, y: 100 }, data: { code: 'return 7;' } },
+          { id: 'both', type: 'logic_block', position: { x: 200, y: 0 }, data: { inputCount: 2, inputNames: ['prompt', 'picture'], code } },
+        ],
+        edges: [
+          { source: 'p', target: 'both', sourceHandle: 'output', targetHandle: 'input' },
+          { source: 'q', target: 'both', sourceHandle: 'output', targetHandle: 'input2' },
+        ],
+      } as WorkflowGraph,
+      { timeoutMs: 30_000 }
+    );
+    check(
+      `${label} that declares its own input's name compiles and runs`,
+      own.status === 'completed' && JSON.stringify(own.results?.['both']) === JSON.stringify(['a cat', 7]),
+      `status=${own.status} error=${own.error ?? ''} got=${JSON.stringify(own.results?.['both'])}`
+    );
+  }
+
   // A loop that tries until its value passes (the image flows' retries): its end collects the value wired to its
   // input, whatever order the edges are in. The loop's own link (start `loop` → end `loop`, which the editor draws)
   // used to be taken for the value when it came first: the loop collected its counter, and a stop condition reading

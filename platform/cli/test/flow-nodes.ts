@@ -7,8 +7,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { runFlow } from '../src/engine';
-import { localNetworkAllowed } from '../src/node-host/context';
+import { DATA_DIR, confineAbsolute, desktopRouteAllowed, isSecretStore, localNetworkAllowed, namesStream, resolvePath } from '../src/node-host/context';
+import { invoke } from '../src/node-host/core';
 import type { Flow, WorkflowGraph } from 'oaiy-core';
 
 let failed = 0;
@@ -206,6 +209,132 @@ async function main(): Promise<void> {
     check('a confined run reaches no other host', !localNetworkAllowed('169.254.169.254:80', env) && !localNetworkAllowed('192.168.1.2:17972', env));
     check('an unconfined run reaches all', localNetworkAllowed('127.0.0.1:8188', { OAIY_SERVER_URL: 'http://127.0.0.1:17972' } as NodeJS.ProcessEnv));
     check("the operator's way out holds", localNetworkAllowed('127.0.0.1:8188', { ...env, OAIY_HTTP_ALLOW_LOCAL: '1' }));
+  }
+
+  // The secret store by any of its names. The guard compared paths as text, so on Windows (and a Mac's default
+  // volume) `SECRETS.JSON`, `secrets.json.` and `secrets.json::$DATA` each gave a confined run every stored key.
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-secrets-'));
+    const secret = path.join(dir, 'secrets.json');
+    fs.writeFileSync(secret, '{"OPENAI_API_KEY":"sk-test"}');
+    const folds = process.platform === 'win32' || process.platform === 'darwin';
+    try {
+      check('the secret store is itself', isSecretStore(secret, secret));
+      check('a file beside it is not', !isSecretStore(path.join(dir, 'notes.json'), secret));
+      fs.linkSync(secret, path.join(dir, 'kept.txt'));
+      check('a hard link to it is it', isSecretStore(path.join(dir, 'kept.txt'), secret));
+      if (folds) check('its name in another case is it', isSecretStore(path.join(dir, 'SECRETS.JSON'), secret));
+      if (process.platform === 'win32') {
+        check('its name with a trailing dot or space is it', isSecretStore(`${secret}.`, secret) && isSecretStore(`${secret} `, secret));
+      }
+      // Not there yet (a confined run must not write it either): by name, without case where the system has none.
+      const absent = path.join(dir, 'later', 'secrets.json');
+      const other = path.join(dir, 'later', 'Secrets.Json');
+      check('a store not made yet, named in another case on Windows and a Mac', isSecretStore(other, absent, 'win32') && isSecretStore(other, absent, 'darwin'));
+      check('and on Linux, where the case is the name', !isSecretStore(other, absent, 'linux'));
+      check("on Windows a path naming a file's stream", namesStream('C:\\data\\secrets.json::$DATA', 'win32') && namesStream('C:\\data\\notes.txt:hidden', 'win32'));
+      check('and not a plain one, or elsewhere', !namesStream('C:\\data\\notes.txt', 'win32') && !namesStream('/data/a:b', 'linux'));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    const refusal = (fn: () => unknown): string => {
+      try {
+        fn();
+        return '';
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
+    };
+    const was = process.env.OAIY_FS_CONFINE;
+    process.env.OAIY_FS_CONFINE = '1';
+    try {
+      check('a confined run reads no /oaiy/secrets.json', refusal(() => resolvePath('/oaiy/secrets.json')).includes('secret store'));
+      if (folds) {
+        check('nor its name in another case', refusal(() => confineAbsolute(path.join(DATA_DIR, 'SECRETS.JSON'))).includes('secret store'));
+        check('nor that through /oaiy', refusal(() => resolvePath('/oaiy/Secrets.json')).includes('secret store'));
+      }
+      if (process.platform === 'win32') {
+        check('nor the store as a stream', refusal(() => confineAbsolute(path.join(DATA_DIR, 'secrets.json::$DATA'))).includes('stream'));
+        check('nor with a trailing dot', refusal(() => resolvePath('/oaiy/secrets.json.')).includes('secret store'));
+      }
+      check('a file of its own it still reads', refusal(() => resolvePath('/oaiy/notes.json')) === '');
+    } finally {
+      if (was === undefined) delete process.env.OAIY_FS_CONFINE;
+      else process.env.OAIY_FS_CONFINE = was;
+    }
+  }
+
+  // At the Desktop's address a confined run reaches what a flow does there (its AI, speech, connectors, Agent), not
+  // the rest of its API: a mutation with no Origin and no token passes the Desktop's guard unless it is privileged,
+  // and an HTTP Request node given `…/api/services/<id>/stop` by a text stopped that service.
+  {
+    const at = 'http://127.0.0.1:17972';
+    for (const [method, route] of [
+      ['POST', '/api/ai/v1/chat/completions'],
+      ['POST', '/api/ai/providers/oaiy-engine/v1/chat/completions'],
+      ['GET', '/api/ai/engine/services'],
+      ['POST', '/api/ai/engine/gateway/v1/images/generations'],
+      ['POST', '/api/network/nodes/abc123/v1/chat/completions'],
+      ['POST', '/api/voice/transcribe'],
+      ['POST', '/api/bridge/connectors/aokie.sms/request'],
+      ['POST', '/api/agent/tasks'],
+      ['GET', '/api/agent/tasks/t1'],
+      ['GET', '/api/services'],
+      ['HEAD', '/api/health'],
+    ]) {
+      check(`a confined run reaches ${method} ${route}`, desktopRouteAllowed(method, `${at}${route}`));
+    }
+    for (const [method, route] of [
+      ['POST', '/api/services/voice/stop'],
+      ['POST', '/api/services/voice/start'],
+      ['POST', '/api/services/ensure-by-port'],
+      ['POST', '/api/plugins/aokie/stop'],
+      ['POST', '/api/bridge/runs'],
+      ['PUT', '/api/bridge/flows/greeting'],
+      ['POST', '/api/ai/providers'],
+      ['POST', '/api/ai/providers/openai/key'],
+      ['PUT', '/api/voice/settings'],
+      ['GET', '/api/services/voice/logs'],
+      ['POST', '/api/ai/v1/../../services/voice/stop'],
+      ['POST', '/api/ai/v1/%2e%2e/%2e%2e/services/voice/stop'],
+      ['POST', '/api/ai/engine/x%2f..%2f..%2fservices'],
+    ]) {
+      check(`a confined run does not reach ${method} ${route}`, !desktopRouteAllowed(method, `${at}${route}`));
+    }
+
+    // Through the host itself: a Desktop that answers, and what reaches it.
+    const heard: string[] = [];
+    const desktop = http.createServer((req, res) => {
+      heard.push(`${req.method} ${req.url}`);
+      res.setHeader('content-type', 'application/json');
+      res.end('{"ok":true}');
+    });
+    await new Promise<void>((done) => desktop.listen(0, '127.0.0.1', done));
+    const port = (desktop.address() as AddressInfo).port;
+    const saved = { confine: process.env.OAIY_FS_CONFINE, url: process.env.OAIY_SERVER_URL };
+    process.env.OAIY_FS_CONFINE = '1';
+    process.env.OAIY_SERVER_URL = `http://127.0.0.1:${port}`;
+    try {
+      const ask = (method: string, route: string) =>
+        invoke('http_request', { url: `http://127.0.0.1:${port}${route}`, method, allow_private_networks: true }).then(
+          () => '',
+          (err: unknown) => (err instanceof Error ? err.message : String(err)),
+        );
+      check('the HTTP Request node is refused a service stop at the Desktop', (await ask('POST', '/api/services/voice/stop')).includes('refused'));
+      check('and reaches its AI gateway', (await ask('POST', '/api/ai/v1/chat/completions')) === '');
+      check('only the AI call reached the Desktop', same(heard, ['POST /api/ai/v1/chat/completions']), JSON.stringify(heard));
+      const started = (await invoke('ensure_service_ready', { service: 'voice' })) as { success: boolean; error?: string };
+      check('a confined run starts no service by its id', !started.success && /outside input/.test(started.error ?? ''), JSON.stringify(started));
+      const byPort = (await invoke('ensure_service_ready_by_port', { port: 8781 })) as { success: boolean };
+      check('nor by its port', !byPort.success && heard.length === 1, JSON.stringify(heard));
+    } finally {
+      for (const [name, value] of [['OAIY_FS_CONFINE', saved.confine], ['OAIY_SERVER_URL', saved.url]] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await new Promise((done) => desktop.close(done));
+    }
   }
 
   console.log(`flow-nodes: ${passed} passed, ${failed} failed`);

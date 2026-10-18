@@ -126,6 +126,11 @@ pub struct RunRequestBody {
     pub lineage: Option<LineageBody>,
     #[serde(default)]
     pub trigger_event: Option<String>,
+    /// Run history's Run again (the desktop's own window, as `oaiy-desktop`): the run this one runs again. Its flow,
+    /// inputs and time limit are that run's, from its record, and so is its confinement
+    /// ([`super::worker::outside_input`]): a run again of a run with outside input is confined as that run was.
+    #[serde(default)]
+    pub again: Option<String>,
 }
 
 /// Why a request was rejected before it reached the ledger.
@@ -356,6 +361,30 @@ async fn create_run(
         );
     }
     let mut req = to_run_request(&body);
+    // The window's runs are Run history's Run again, each of a run this desktop keeps: what it runs, on what, and
+    // whether confined is that run's record's to say, never the page's. The page sent the old run's input as the
+    // window's own, so a webhook's or a text's input that confinement had stopped ran again with the whole disk and
+    // network of the person.
+    let mut confined = false;
+    if body.caller.product == super::worker::DESKTOP_PRODUCT || body.again.is_some() {
+        let refuse = |message: String| bridge_error(StatusCode::BAD_REQUEST, "invalid_request", message);
+        if body.caller.product != super::worker::DESKTOP_PRODUCT {
+            return refuse(format!("again is Run history's Run again, caller.product {:?}, alone", super::worker::DESKTOP_PRODUCT));
+        }
+        let Some(again) = body.again.as_deref().filter(|a| !a.is_empty()) else {
+            return refuse(format!("caller.product {:?} runs a run again: name it in again", super::worker::DESKTOP_PRODUCT));
+        };
+        let original = { st.ledger.lock().ok().and_then(|l| l.get(again)) };
+        let Some(original) = original else {
+            return bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("unknown run {again}"));
+        };
+        if original.flow_id.is_none() || original.flow_id != body.flow_id {
+            return refuse(format!("run {again} is not a run of {:?} that this desktop keeps the flow of", body.flow_id.as_deref().unwrap_or("")));
+        }
+        req.input = original.input.clone();
+        req.timeout_ms = original.timeout_ms;
+        confined = super::worker::outside_input(&original);
+    }
     // Pictures given inline go to the engines now and the run keeps their references (its record keeps its input).
     if let Some(input) = req.input.take() {
         req.input = tokio::task::spawn_blocking(move || super::pictures::referenced(input)).await.ok();
@@ -368,7 +397,10 @@ async fn create_run(
     // which must not hold up the async runtime's own threads)
     let reserving = {
         let (ledger, req) = (st.ledger.clone(), req.clone());
-        tokio::task::spawn_blocking(move || ledger.lock().map(|mut l| l.reserve(&req)).map_err(|_| ())).await
+        tokio::task::spawn_blocking(move || {
+            ledger.lock().map(|mut l| if confined { l.reserve_confined(&req) } else { l.reserve(&req) }).map_err(|_| ())
+        })
+        .await
     };
     let outcome = match reserving {
         Ok(Ok(o)) => o,
@@ -2517,13 +2549,35 @@ mod tests {
             read(app.clone().oneshot(req.body(body.map_or_else(Body::empty, |b| Body::from(b.to_string()))).unwrap()).await.unwrap()).await
         }
 
+        /// A run kept in the ledger, as `product` asked for it.
+        fn kept_run(st: &BridgeState, product: &str, key: &str, input: Value) -> crate::bridge::ledger::RunRecord {
+            let req = RunRequest {
+                caller_product: product.into(),
+                flow_id: Some("not-a-flow".into()),
+                inline_graph: false,
+                input: Some(input),
+                timeout_ms: Some(30_000),
+                mode: "queued".into(),
+                correlation_id: "c".into(),
+                idempotency_key: key.into(),
+                lineage: Default::default(),
+                trigger_event: None,
+                caller_label: None,
+            };
+            match st.ledger.lock().unwrap().reserve(&req) {
+                ReserveOutcome::Reserved(r) => r,
+                other => panic!("{other:?}"),
+            }
+        }
+
         /// Run history's Run again is the person's, run unconfined: the name `oaiy-desktop` is taken from the desktop's own
         /// window alone (its webview's origin, on a desktop with a window), as `oaiy-agent` is from this process alone.
         #[tokio::test]
         async fn only_the_desktops_own_window_runs_as_it() {
             let (_sb, st) = release_state("own-window", Publishers::default());
-            let run = || Some(json!({"protocol": "oaiy-bridge/1", "caller": {"product": "oaiy-desktop"}, "flowId": "not-a-flow", "input": {},
-                "correlationId": "c-1", "idempotencyKey": "k-1"}));
+            let mine = kept_run(&st, "oaiy-agent", "mine", json!({}));
+            let run = || Some(json!({"protocol": "oaiy-bridge/1", "caller": {"product": "oaiy-desktop"}, "flowId": "not-a-flow",
+                "correlationId": "c-1", "idempotencyKey": "k-1", "again": mine.run_id}));
             let refused = |body: &Value| body.to_string().contains("this desktop's own window");
             let gui = crate::http::tightened_for_tests(router(st.clone()), None, true);
             // A caller with no origin is refused by the guard as before; a page on this computer's other ports is let
@@ -2533,12 +2587,67 @@ mod tests {
             let (status, body) = send(&gui, "/api/bridge/runs", &[("Origin", "http://127.0.0.1:3000")], run()).await;
             assert!(status == StatusCode::BAD_REQUEST && refused(&body), "{status} {body}");
             // The window itself: taken (the flow is then looked for).
-            let (status, body) = send(&gui, "/api/bridge/runs", &[("Origin", "tauri://localhost")], run()).await;
-            assert!(!refused(&body), "{status} {body}");
+            let (status, body) = send(&gui, "/api/bridge/runs", &[("Origin", OWN_WINDOW)], run()).await;
+            assert!(status == StatusCode::CREATED && !refused(&body), "{status} {body}");
             // A headless server has no window, and an Origin there is anyone's to send.
             let headless = crate::http::tightened_for_tests(router(st), Some("t".into()), false);
-            let (status, body) = send(&headless, "/api/bridge/runs", &[("Origin", "tauri://localhost"), ("Authorization", "Bearer t")], run()).await;
+            let (status, body) = send(&headless, "/api/bridge/runs", &[("Origin", OWN_WINDOW), ("Authorization", "Bearer t")], run()).await;
             assert!(refused(&body), "{status} {body}");
+        }
+
+        /// The desktop's own window's origin on this system (`tauri://localhost` elsewhere is an impostor's on Windows).
+        const OWN_WINDOW: &str = if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" };
+
+        /// Run again of a run with outside input (a text's, a webhook's) runs on that input, so it is confined as that run
+        /// was, whatever the page says: the server reads the run's record for its flow, input, time limit and
+        /// confinement. The page sent the input as the window's own, and the same input that confinement had stopped
+        /// reaching `~/.ssh` ran with the whole disk and network.
+        #[tokio::test]
+        async fn a_run_again_of_a_confined_run_is_confined() {
+            let (_sb, st) = release_state("again-confined", Publishers::default());
+            let outside = kept_run(&st, "oaiy-trigger:aokie", "evt", json!({ "path": "~/.ssh/id_rsa" }));
+            let mine = kept_run(&st, "oaiy-agent", "mine", json!({ "path": "notes.txt" }));
+            let gui = crate::http::tightened_for_tests(router(st.clone()), None, true);
+            let window = [("Origin", OWN_WINDOW)];
+            let again = |of: &str, key: &str, extra: Value| {
+                let mut body = json!({"protocol": "oaiy-bridge/1", "caller": {"product": "oaiy-desktop", "label": "You, from Run history"},
+                    "flowId": "not-a-flow", "mode": "async", "correlationId": key, "idempotencyKey": key, "again": of});
+                body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                Some(body)
+            };
+            let record = |id: &Value| st.ledger.lock().unwrap().get(id.as_str().unwrap()).unwrap();
+
+            let (status, body) = send(&gui, "/api/bridge/runs", &window, again(&outside.run_id, "k-1", json!({ "input": { "path": "C:/other" } }))).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let rerun = record(&body["runId"]);
+            assert!(rerun.confined && crate::bridge::worker::outside_input(&rerun), "{body}");
+            assert_eq!(rerun.caller_product, "oaiy-desktop");
+            assert_eq!(rerun.input, outside.input, "the run's own input, not the page's");
+            assert_eq!(rerun.timeout_ms, Some(30_000));
+            // A run again of that run again is confined too.
+            let (status, body) = send(&gui, "/api/bridge/runs", &window, again(&rerun.run_id, "k-2", json!({}))).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert!(record(&body["runId"]).confined);
+
+            // The person's own run runs again as theirs.
+            let (status, body) = send(&gui, "/api/bridge/runs", &window, again(&mine.run_id, "k-3", json!({}))).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let theirs = record(&body["runId"]);
+            assert!(!theirs.confined && !crate::bridge::worker::outside_input(&theirs));
+            assert_eq!(theirs.input, mine.input);
+
+            // The window's name is a run again's alone, of a run kept here, of the flow named; and a run again is the
+            // window's alone.
+            let mut plain = again(&mine.run_id, "k-4", json!({})).unwrap();
+            plain.as_object_mut().unwrap().remove("again");
+            let (status, body) = send(&gui, "/api/bridge/runs", &window, Some(plain)).await;
+            assert!(status == StatusCode::BAD_REQUEST && body.to_string().contains("name it in again"), "{status} {body}");
+            let (status, _) = send(&gui, "/api/bridge/runs", &window, again("run_gone", "k-5", json!({}))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let (status, _) = send(&gui, "/api/bridge/runs", &window, again(&mine.run_id, "k-6", json!({ "flowId": "another" }))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, body) = send(&gui, "/api/bridge/runs", &window, again(&outside.run_id, "k-7", json!({ "caller": { "product": "an-app" } }))).await;
+            assert!(status == StatusCode::BAD_REQUEST && body.to_string().contains("alone"), "{status} {body}");
         }
 
         /// A run's inputs may be pictures given inline (Image to image takes up to 10): past axum's 2 MB, the request

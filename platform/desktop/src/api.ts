@@ -1028,6 +1028,8 @@ export interface RunRecord {
   /** The run (and the first of its tree) that started this one, through a trigger's binding. */
   lineage?: { rootRunId?: string | null; parentRunId?: string | null; bindingId?: string | null; depth?: number };
   triggerEvent?: string;
+  /** Run confined whoever asked: a run again of a run with outside input. */
+  confined?: boolean;
 }
 
 /** A stored flow, by its id and name (`GET /api/bridge/flows`). */
@@ -1106,19 +1108,19 @@ export const bridge = {
       `/api/bridge/runs/${encodeURIComponent(runId)}/cancel`,
       { method: 'POST', body: '{}' },
     ),
-  /** Run a stored flow again, here, as a new run (`async`: this desktop's worker runs it): the inputs and time limit
-   *  of the run it repeats. Its own key, so it is never taken for that run's retry. */
-  runAgain: (flowId: string, input: Record<string, unknown> | null | undefined, timeoutMs?: number) => {
-    const key = `oaiy-desktop:${flowId}:${freshKey()}`;
+  /** Run a stored flow again, here, as a new run (`async`: this desktop's worker runs it). The desktop takes the inputs
+   *  and time limit from the run it repeats (`again`), and its confinement too: a run again of a run with outside input
+   *  (a text's, a webhook's) is confined as that run was. Its own key, so it is never taken for that run's retry. */
+  runAgain: (run: Pick<RunRecord, 'runId' | 'flowId'>) => {
+    const key = `oaiy-desktop:${run.flowId}:${freshKey()}`;
     return request<RunRecord>('/api/bridge/runs', {
       method: 'POST',
       body: JSON.stringify({
         protocol: 'oaiy-bridge/1',
         caller: { product: 'oaiy-desktop', label: 'You, from Run history' },
-        flowId,
-        input: input ?? {},
+        flowId: run.flowId,
+        again: run.runId,
         mode: 'async',
-        ...(timeoutMs ? { timeoutMs } : {}),
         correlationId: key,
         idempotencyKey: key,
       }),

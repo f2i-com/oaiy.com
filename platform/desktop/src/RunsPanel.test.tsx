@@ -312,9 +312,13 @@ describe('RunsPanel', () => {
       vi.stubGlobal('confirm', vi.fn().mockReturnValueOnce(false));
       await click(button('Run again'));
       expect(againMock).not.toHaveBeenCalled();
-      vi.stubGlobal('confirm', vi.fn().mockReturnValue(true));
+      const asked = vi.fn().mockReturnValue(true);
+      vi.stubGlobal('confirm', asked);
       await click(button('Run again'));
-      expect(againMock).toHaveBeenCalledWith('caller-lookup', { Name: 'Sam' }, 30000);
+      // The run, by its id: the desktop takes its inputs, time limit and confinement from its record, not from here.
+      expect(againMock).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run_a1', flowId: 'caller-lookup' }));
+      // An app's run had outside input: run again, it is held in as it was, and the question says so.
+      expect(String(asked.mock.calls[0][0])).toContain('held in as the first was');
       expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Running Look up a caller again' }));
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1600);
@@ -412,6 +416,54 @@ describe('RunsPanel', () => {
     expect(host.querySelectorAll('.run-row')).toHaveLength(260);
     expect(new Set([...host.querySelectorAll('[data-run-id]')].map((el) => el.getAttribute('data-run-id'))).size).toBe(260);
     expect(text()).not.toContain('more');
+  });
+
+  it('keeps the rows newer runs push out of the newest page, once older pages are read', async () => {
+    const run = (i: number) => ({ ...FAILED, runId: `run_${String(i + 10).padStart(4, '0')}`, reservedAt: new Date(Date.UTC(2026, 6, 30, 9, 0, 0) - i * 1000).toISOString() });
+    let all = Array.from({ length: 260 }, (_, i) => run(i));
+    runsMock.mockImplementation(async (_states: unknown, limit: number, page?: { before?: { runId: string } }) => {
+      const from = page?.before ? all.findIndex((r) => r.runId === page.before!.runId) + 1 : 0;
+      return { runs: all.slice(from, from + limit), total: all.length, byStatus: { failed: all.length }, more: from + limit < all.length };
+    });
+    await mount();
+    for (let shown = 50; shown <= 200; shown += 50) await click(button('Show 50 more'));
+    expect(host.querySelectorAll('.run-row')).toHaveLength(250);
+    // Five runs fail meanwhile: the newest page's five oldest are pushed past its end, and newer than the older pages.
+    all = [...Array.from({ length: 5 }, (_, i) => run(-1 - i)), ...all];
+    await click(host.querySelector('button[aria-label="Refresh now"]')!);
+    const ids = [...host.querySelectorAll('[data-run-id]')].map((el) => el.getAttribute('data-run-id'));
+    expect(ids).toHaveLength(255);
+    expect(new Set(ids).size).toBe(255);
+    for (const i of [195, 196, 197, 198, 199]) expect(ids).toContain(run(i).runId);
+    // In history's order still.
+    expect(ids).toEqual([...all.slice(0, 255)].map((r) => r.runId));
+  });
+
+  it('puts aside an older page that lands after a switch to another filter', async () => {
+    const run = (i: number, status: 'succeeded' | 'failed') => ({
+      ...FAILED,
+      runId: `run_${status}_${String(i).padStart(4, '0')}`,
+      status,
+      error: status === 'failed' ? FAILED.error : undefined,
+      reservedAt: new Date(Date.UTC(2026, 6, 30, 9, 0, 0) - i * 1000).toISOString(),
+    });
+    const ok = Array.from({ length: 260 }, (_, i) => run(i, 'succeeded'));
+    let land: (v: unknown) => void = () => {};
+    runsMock.mockImplementation((states: unknown, limit: number, page?: { before?: unknown }) => {
+      if (states !== 'all') return Promise.resolve({ runs: [run(0, 'failed')], total: 261, byStatus: { failed: 1, succeeded: 260 } });
+      if (page?.before) return new Promise((r) => (land = r));
+      return Promise.resolve({ runs: ok.slice(0, limit), total: 261, byStatus: { failed: 1, succeeded: 260 }, more: limit < 260 });
+    });
+    await mount();
+    await click(button('All'));
+    for (let shown = 50; shown < 200; shown += 50) await click(button('Show 50 more'));
+    expect(host.querySelectorAll('.run-row')).toHaveLength(200);
+    // Older succeeded runs are asked for; before they come, the person switches to Failed.
+    await click(button('Show 50 more'));
+    await click(button('Failed'));
+    await act(async () => land({ runs: ok.slice(200, 250), total: 261, byStatus: { failed: 1, succeeded: 260 }, more: true }));
+    const ids = [...host.querySelectorAll('[data-run-id]')].map((el) => el.getAttribute('data-run-id'));
+    expect(ids).toEqual(['run_failed_0000']);
   });
 
   it('says who asked in the caller’s own words, and opens that run’s flow in the editor', async () => {

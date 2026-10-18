@@ -49,10 +49,52 @@ export function within(root: string, rel: string): string {
   // DATA_DIR (an allowed root), so `/oaiy/secrets.json` would otherwise resolve here and leak
   // every stored API key. get_secret/store_secret read it DIRECTLY (not via this), so app-level
   // secret access is unaffected; desktop / `oaiy run` (not confined) is unchanged.
-  if (confineEnabled() && real === SECRETS_FILE) {
+  if (confineEnabled()) refuseSecretStore(real);
+  return real;
+}
+
+/**
+ * Whether `real` (an absolute path) names the secret store `secret`. By the file itself when both
+ * exist, as the same volume and file id: on Windows `SECRETS.JSON`, `secrets.json.` (Windows drops a
+ * trailing dot or space), its 8.3 short name and a hard link all open the one file, and the paths
+ * were compared as text, so each of them handed a confined run every stored key. Else by name:
+ * without case where the file system has none (Windows, and a Mac's default volume), and on Windows
+ * without the trailing dots and spaces it drops.
+ */
+export function isSecretStore(real: string, secret: string = SECRETS_FILE, platform: NodeJS.Platform = process.platform): boolean {
+  try {
+    const a = fs.statSync(real, { bigint: true });
+    const b = fs.statSync(secret, { bigint: true });
+    // (a file system without file ids answers 0 for every file: no proof of anything)
+    if (a.ino !== 0n && a.dev === b.dev && a.ino === b.ino) return true;
+  } catch {
+    /* one of them is not there: compared by name */
+  }
+  const fold = platform === 'win32' || platform === 'darwin';
+  const norm = (p: string) => {
+    const resolved = path.resolve(p);
+    const named = platform === 'win32' ? resolved.split(/[\\/]/).map((part) => part.replace(/[. ]+$/, '')).join('\\') : resolved;
+    return fold ? named.toLowerCase() : named;
+  };
+  return norm(real) === norm(secret);
+}
+
+/**
+ * Whether `real` names a stream of a file: on Windows a `:` past the drive (`C:`) does
+ * (`secrets.json::$DATA` is the file's own data, `notes.txt:hidden` another stream of it).
+ */
+export function namesStream(real: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform === 'win32' && real.indexOf(':', 2) !== -1;
+}
+
+/** A confined run's path: refused when it names a stream, or the secret store by any of its names. */
+function refuseSecretStore(real: string): void {
+  if (namesStream(real)) {
+    throw new Error(`a path naming a file's stream is not allowed: ${real}`);
+  }
+  if (isSecretStore(real)) {
     throw new Error('access to the secret store is not allowed');
   }
-  return real;
 }
 
 const ALLOWED_ROOTS = [DATA_DIR, TMP_ROOT, DOWNLOADS_DIR].map((r) => path.resolve(r));
@@ -76,9 +118,7 @@ export function confineAbsolute(p: string): string {
   const real = path.resolve(p);
   // An absolute path to the secret store (e.g. ffmpeg `-i /home/u/.oaiy/secrets.json`) is inside
   // an allowed root, so block it here too — same reason as `within`.
-  if (real === SECRETS_FILE) {
-    throw new Error('access to the secret store is not allowed');
-  }
+  refuseSecretStore(real);
   if (ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + path.sep))) {
     return real;
   }
@@ -95,8 +135,18 @@ export function confineAbsolute(p: string): string {
  * way out. An unconfined run (`oaiy run` of the person's own flow) reaches all.
  */
 export function localNetworkAllowed(hostPort: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!desktopApiConfined(env)) return true;
+  return isDesktopApi(hostPort, env);
+}
+
+/** Whether a run is confined in what it reaches on this computer (see `localNetworkAllowed`). */
+export function desktopApiConfined(env: NodeJS.ProcessEnv = process.env): boolean {
   const confined = env.OAIY_FS_CONFINE === '1' && env.OAIY_FS_ALLOW_ABSOLUTE !== '1';
-  if (!confined || env.OAIY_HTTP_ALLOW_LOCAL === '1') return true;
+  return confined && env.OAIY_HTTP_ALLOW_LOCAL !== '1';
+}
+
+/** Whether `hostPort` is the Desktop that started this run, at OAIY_SERVER_URL. */
+export function isDesktopApi(hostPort: string, env: NodeJS.ProcessEnv = process.env): boolean {
   let desktop: URL;
   try {
     desktop = new URL(env.OAIY_SERVER_URL || '');
@@ -110,6 +160,44 @@ export function localNetworkAllowed(hostPort: string, env: NodeJS.ProcessEnv = p
   const desktopPort = desktop.port || (desktop.protocol === 'https:' ? '443' : '80');
   if (port !== desktopPort) return false;
   return host.toLowerCase() === desktop.hostname.toLowerCase() || (loopback(host) && loopback(desktop.hostname));
+}
+
+/**
+ * The routes of the Desktop's API a confined run may call, with its credential or without: the AI
+ * gateway's models and chat, the engines', a paired computer's language model and media, speech to
+ * text, a plugin's connector commands, a task for the Agent, the list of services, and discovery.
+ * The rest of the API is the person's. A confined run reached all of it at the Desktop's address,
+ * the one address of this computer it may reach, and a mutation with no Origin and no token is let
+ * through there unless it is privileged: an HTTP Request node given an address by a text or a
+ * webhook could stop the voice server mid-call or start any service the person defined.
+ */
+const CONFINED_DESKTOP_ROUTES: ReadonlyArray<[methods: string | null, route: RegExp]> = [
+  [null, /^\/api\/ai\/v1\//],
+  [null, /^\/api\/ai\/providers\/[^/]+\/v1\//],
+  [null, /^\/api\/ai\/engine\//],
+  [null, /^\/api\/network\/nodes\/[^/]+\/gateway\//],
+  ['POST', /^\/api\/network\/nodes\/[^/]+\/v1\/chat\/completions$/],
+  ['POST', /^\/api\/voice\/transcribe$/],
+  ['POST', /^\/api\/bridge\/connectors\/[^/]+\/request$/],
+  ['POST', /^\/api\/agent\/tasks$/],
+  ['GET', /^\/api\/agent\/tasks\/[^/]+$/],
+  ['GET', /^\/api\/services$/],
+  ['GET', /^\/api\/health$/],
+  ['GET', /^\/api\/bridge\/capabilities$/],
+];
+
+/** Whether a confined run may call `method` `url` on the Desktop's API (`CONFINED_DESKTOP_ROUTES`). */
+export function desktopRouteAllowed(method: string, url: string): boolean {
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    return false;
+  }
+  // (`..` and `%2e%2e` are taken out by the URL parser; an encoded slash would be a segment of its own to the desktop)
+  if (/%2f|%5c/i.test(pathname)) return false;
+  const verb = method.toUpperCase() === 'HEAD' ? 'GET' : method.toUpperCase();
+  return CONFINED_DESKTOP_ROUTES.some(([methods, route]) => (methods === null || methods === verb) && route.test(pathname));
 }
 
 /** True when remote-protocol media args (ffmpeg `-i http://…`) should be blocked. */

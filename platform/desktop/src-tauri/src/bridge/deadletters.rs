@@ -38,11 +38,13 @@
 //! event redriven is offered to the guards again and refused again, rather than
 //! being forced through (an event a run caused keeps that run, `origin_run`, so
 //! the guards see the same tree). Fix the binding and redrive succeeds; don't,
-//! and it doesn't. The only thing redrive changes is the idempotency key, which
-//! gains an attempt suffix. A binding that already reserved a run for this
-//! event (when it was delivered before, or at an earlier redrive) is not offered
-//! it again: the run it reserved is the work, and running it twice would be the
-//! second email.
+//! and it doesn't. The event keeps its own idempotency key: a binding that
+//! failed never reserved under it, and the plugin delivering the event again
+//! after a redrive is then a duplicate of the run the redrive made. A binding
+//! that already ran for this event (when it was delivered before, or at an
+//! earlier redrive) is not offered it again: the entry keeps which ones ran
+//! (`ran`), since the runs themselves may be cleared from the run history, and
+//! running one twice would be the second email.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -111,6 +113,10 @@ pub struct DeadLetter {
     /// The run that caused the event (a flow's outcome), so a redrive is judged by the loop guards as the event was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_run: Option<super::ledger::LineageRef>,
+    /// The bindings that ran for this event (at an earlier delivery, or at a redrive), so a redrive never runs one of
+    /// them again: kept here, as the run history they ran in can be cleared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ran: Vec<String>,
 }
 
 fn now_ms() -> u64 {
@@ -262,10 +268,11 @@ impl DeadLetterQueue {
         reason: DeadReason,
         envelope: Value,
     ) -> DeadLetter {
-        self.record_caused(source, event, reason, envelope, None)
+        self.record_caused(source, event, reason, envelope, None, Vec::new())
     }
 
-    /// [`Self::record`] for an event a run caused, kept with that run's lineage.
+    /// [`Self::record`] for an event a run caused, kept with that run's lineage, and with the bindings that had run
+    /// for it already (`ran`).
     pub fn record_caused(
         &mut self,
         source: &str,
@@ -273,6 +280,7 @@ impl DeadLetterQueue {
         reason: DeadReason,
         envelope: Value,
         origin_run: Option<super::ledger::LineageRef>,
+        ran: Vec<String>,
     ) -> DeadLetter {
         self.seq += 1;
         let item = DeadLetter {
@@ -286,6 +294,7 @@ impl DeadLetterQueue {
             last_attempt_ms: None,
             last_outcome: None,
             origin_run,
+            ran,
         };
         self.items.push_back(item.clone());
         // Eviction is a deletion, which an append cannot express — so the rare
@@ -335,10 +344,21 @@ impl DeadLetterQueue {
     /// Count an attempt and record what it did. Kept even on success, until the
     /// caller drops it — see [`Self::remove`].
     pub fn note_attempt(&mut self, id: &str, outcome: String) -> Option<DeadLetter> {
+        self.note_redrive(id, outcome, &[])
+    }
+
+    /// [`Self::note_attempt`] for a redrive that ran some bindings and kept the entry (another still fails): those
+    /// join the ones that ran, so the next redrive does not run them again.
+    pub fn note_redrive(&mut self, id: &str, outcome: String, ran: &[String]) -> Option<DeadLetter> {
         let item = self.items.iter_mut().find(|d| d.id == id)?;
         item.attempts += 1;
         item.last_attempt_ms = Some(now_ms());
         item.last_outcome = Some(outcome);
+        for binding in ran {
+            if !item.ran.contains(binding) {
+                item.ran.push(binding.clone());
+            }
+        }
         let snapshot = item.clone();
         // An update, not a deletion: append the new version and let replay's
         // last-wins rule supersede the old line.
@@ -373,15 +393,12 @@ impl DeadLetterQueue {
         n
     }
 
-    /// The idempotency key a redrive should use: the original plus the attempt
-    /// number, so each retry is a distinct reservation.
+    /// The original key plus the attempt number: what a redrive used for its key before it kept the event's own (so a
+    /// run of an earlier build is still found under it), and the key of a redrive of an event that came with none.
     ///
-    /// Safe because a binding that reserved a run for the event (under the
-    /// original key, or an earlier attempt's) is not offered it again: the
-    /// redrive asks the ledger first (`PluginHost::redrive`). It is deliberately derived rather
-    /// than random so that redriving the same entry twice at the same attempt
-    /// count (a double-click, a retried HTTP request) still collapses to one
-    /// reservation.
+    /// It is deliberately derived rather than random so that redriving the same
+    /// entry twice at the same attempt count (a double-click, a retried HTTP
+    /// request) still collapses to one reservation.
     pub fn redrive_key(original: &str, attempt: u32) -> String {
         if original.is_empty() {
             format!("redrive-{attempt}")
@@ -477,7 +494,7 @@ mod tests {
         let origin = super::super::ledger::LineageRef { root_run_id: Some("run_1".into()), parent_run_id: Some("run_2".into()), binding_id: Some("b1".into()), depth: 2 };
         {
             let mut q = DeadLetterQueue::open(dir.path());
-            q.record_caused("flows", "flow.failed", DeadReason::NotReserved { detail: "b: x".into() }, envelope("a"), Some(origin.clone()));
+            q.record_caused("flows", "flow.failed", DeadReason::NotReserved { detail: "b: x".into() }, envelope("a"), Some(origin.clone()), Vec::new());
             q.record("aokie", "call.incoming", DeadReason::Shed, envelope("b"));
         }
         let q = DeadLetterQueue::open(dir.path());

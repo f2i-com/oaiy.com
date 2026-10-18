@@ -188,6 +188,9 @@ CASES: list[tuple[str, str, dict, bool]] = [
     ("run-request.schema.json", "an unknown mode is refused",
      {"protocol": "oaiy-bridge/1", "caller": CALLER, "flowId": "f", "correlationId": "c",
       "idempotencyKey": "k", "mode": "eventually"}, False),
+    ("run-request.schema.json", "Run history's Run again names the run it runs again",
+     {"protocol": "oaiy-bridge/1", "caller": {"product": "oaiy-desktop"}, "flowId": "f", "correlationId": "c",
+      "idempotencyKey": "k", "again": "run_1"}, True),
 
     # --- run result: a failure must carry an error ---
     ("run-result.schema.json", "a successful run",
@@ -199,6 +202,8 @@ CASES: list[tuple[str, str, dict, bool]] = [
     ("run-result.schema.json", "failed WITH a typed error is accepted",
      {"runId": "run_1", "status": "failed",
       "error": {"code": "node_failed", "message": "ComfyUI refused the prompt.", "nodeId": "img_1"}}, True),
+    ("run-result.schema.json", "a run again of a confined run says it is confined",
+     {"runId": "run_2", "status": "queued", "callerProduct": "oaiy-desktop", "confined": True}, True),
     ("run-result.schema.json", "a full desktop-runtime record validates",
      {"runId": "run_1", "status": "succeeded", "callerProduct": "oaiy-trigger:fake",
       "flowId": "hello", "correlationId": "corr_1", "idempotencyKey": "binding:b:e",

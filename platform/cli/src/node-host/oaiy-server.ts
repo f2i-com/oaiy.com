@@ -10,6 +10,7 @@
  *   OAIY_SERVER_TOKEN  bearer token (only needed for privileged routes)
  */
 import { warnIfPlaintextRemoteToken } from '../insecure-token';
+import { desktopApiConfined } from './context';
 
 const BASE = (process.env.OAIY_SERVER_URL || 'http://127.0.0.1:17972').replace(/\/+$/, '');
 const TOKEN = process.env.OAIY_SERVER_TOKEN || '';
@@ -20,6 +21,18 @@ interface EnsureResult {
   already_running: boolean;
   port?: number;
   error?: string;
+}
+
+/**
+ * A run with outside input (a text's, a webhook's: `OAIY_FS_CONFINE`) starts none of the desktop's
+ * services. It named the service by any id or port its input gave, with the desktop's credential,
+ * so an outside caller could start whatever the person defined; and it reaches no service's own port
+ * anyway, only the desktop's API (`localNetworkAllowed`), whose AI and engine routes start what they need.
+ */
+function refusedWhenConfined(): EnsureResult | null {
+  return desktopApiConfined()
+    ? { success: false, already_running: false, error: "a run with outside input does not start this desktop's services" }
+    : null;
 }
 
 async function call(method: string, path: string, body?: unknown): Promise<Response> {
@@ -77,6 +90,8 @@ export async function askAgent(args: Record<string, unknown>): Promise<Record<st
 
 /** `ensure_service_ready_by_port`: start whatever service owns `port`. */
 export async function ensureByPort(args: Record<string, unknown>): Promise<EnsureResult> {
+  const refused = refusedWhenConfined();
+  if (refused) return refused;
   const port = Number(args.port ?? 0);
   try {
     const resp = await call('POST', '/api/services/ensure-by-port', { port });
@@ -122,6 +137,8 @@ async function lookupPort(id: string): Promise<number | undefined> {
 
 /** `ensure_service_ready`: best-effort start of a service by id. */
 export async function ensureService(args: Record<string, unknown>): Promise<EnsureResult> {
+  const refused = refusedWhenConfined();
+  if (refused) return refused;
   const id = String(args.service ?? args.id ?? args.serviceId ?? '');
   if (!id) {
     return { success: false, already_running: false, error: 'ensure_service_ready: no service id' };

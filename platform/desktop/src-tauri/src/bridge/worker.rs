@@ -78,16 +78,18 @@ pub const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 pub const AGENT_PRODUCT: &str = "oaiy-agent";
 
 /// The caller product of the desktop's own window (Run history's Run again): the person at this computer, so its runs are
-/// theirs too. The bridge's route takes the name only from that window.
+/// theirs too. The bridge's route takes the name only from that window, and only for a run again of a run it keeps.
 pub const DESKTOP_PRODUCT: &str = "oaiy-desktop";
 
 /// Whether a run's input came from outside this computer's person: everything but the Agent's and the window's own runs (a plugin's
-/// event, an app or a site through the API, a provider's graph). Such a run is confined: its absolute file paths stay
+/// event, an app or a site through the API, a provider's graph), and a run again of such a run, which runs on that
+/// same input ([`RunRecord::confined`]). Such a run is confined: its absolute file paths stay
 /// in the CLI's own folders and it reaches no other address of this computer or its network than this desktop's API
 /// (see [`run_flow_cli_as`]). Before, every run here had the whole disk and network of the person, so a webhook's
-/// input given to a flow's HTTP Request or File Read node reached the cloud's metadata address or `~/.ssh`.
+/// input given to a flow's HTTP Request or File Read node reached the cloud's metadata address or `~/.ssh`; and Run
+/// history's Run again, the window's own, gave a confined run's input all of them again.
 pub fn outside_input(run: &RunRecord) -> bool {
-    run.caller_product != AGENT_PRODUCT && run.caller_product != DESKTOP_PRODUCT
+    run.confined || (run.caller_product != AGENT_PRODUCT && run.caller_product != DESKTOP_PRODUCT)
 }
 /// How often a running child is checked for exit / cancellation.
 const CHILD_POLL: Duration = Duration::from_millis(250);
@@ -1357,7 +1359,12 @@ pub fn run_flow_cli_with(
     } else {
         cmd.env("OAIY_SERVER_TOKEN", internal);
     }
-    confine_child(&mut cmd, confined, std::env::var_os("OAIY_DATA_DIR"));
+    confine_child(
+        &mut cmd,
+        confined,
+        std::env::var_os("OAIY_DATA_DIR"),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    );
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1371,8 +1378,9 @@ pub fn run_flow_cli_with(
     };
     // A flow run makes HTTP calls and writes files. Orphaned by a forced exit it
     // keeps doing both, with no ledger entry left to record it and no timeout
-    // left to stop it.
-    crate::services::job_object::adopt(child.id());
+    // left to stop it. And a job of the run's own, which ends what the run left
+    // running when this returns, however the CLI ended (see the exit below).
+    let _tree = crate::services::job_object::adopt_tree(child.id());
 
     // Drain BOTH pipes on their own threads, from the start — see
     // `drain_child` for the deadlock this prevents. The review traced the whole
@@ -1386,7 +1394,9 @@ pub fn run_flow_cli_with(
         match child.try_wait() {
             Ok(Some(status)) => {
                 // What the flow started and left running (an ffmpeg the CLI's own timeout left when it exited, a
-                // helper) ends with it: the group was ended only when this side cancelled or timed the run out.
+                // helper) ends with it: the group was ended only when this side cancelled or timed the run out. On
+                // Windows the run's own job (`_tree`) ends it as this returns: a tree kill from the CLI, which has
+                // exited, finds nothing.
                 #[cfg(unix)]
                 crate::services::registry::kill_process_tree(child.id());
                 break Some(status);
@@ -1461,18 +1471,24 @@ pub fn run_flow_cli_with(
 }
 
 /// A run's confinement, as its child's environment says it (see [`run_flow_cli_as`]). `data_dir`: this process's
-/// `OAIY_DATA_DIR`. A headless server's data folder is the CLI's own unless it is told otherwise (the child inherits the
-/// variable), and that folder holds the server's credentials, so a confined run is given a folder of its own inside
-/// it: the CLI's confinement lets a flow's absolute paths into its data folder. (An operator's own
-/// `OAIY_FS_ALLOW_ABSOLUTE` or `OAIY_HTTP_ALLOW_LOCAL` is left as it is: theirs to lift it with.)
-fn confine_child(cmd: &mut Command, confined: bool, data_dir: Option<std::ffi::OsString>) {
+/// `OAIY_DATA_DIR`; `home`: its home folder. The CLI's confinement lets a flow's absolute paths into the CLI's data
+/// folder, so a confined run is always given a folder of its own inside it, `flow-files`, and never the folder itself:
+/// a headless server's data folder is the CLI's (the child inherits the variable) and holds the server's credentials;
+/// the desktop sets no `OAIY_DATA_DIR`, and the CLI's own `~/.oaiy` holds its stored keys and whatever else the person
+/// keeps there, which a confined run read whole before. Named here rather than left to the CLI to work out, so it
+/// does not hang on how Node finds a home folder. (An operator's own `OAIY_FS_ALLOW_ABSOLUTE` or
+/// `OAIY_HTTP_ALLOW_LOCAL` is left as it is: theirs to lift it with.)
+fn confine_child(cmd: &mut Command, confined: bool, data_dir: Option<OsString>, home: Option<OsString>) {
     if !confined {
         return;
     }
     cmd.env("OAIY_FS_CONFINE", "1");
-    if let Some(dir) = data_dir.filter(|d| !d.is_empty()) {
-        cmd.env("OAIY_DATA_DIR", PathBuf::from(dir).join("flow-files"));
-    }
+    let base = data_dir
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".oaiy")))
+        .unwrap_or_else(|| std::env::temp_dir().join("oaiy"));
+    cmd.env("OAIY_DATA_DIR", base.join("flow-files"));
 }
 
 /// End a flow's process and every process it started (its group; on Windows its tree), and reap it.
@@ -1760,8 +1776,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Only the Agent's own runs are the person's; every other caller's is confined, and a confined run on a server
-    /// whose data folder the child would inherit gets a folder of its own inside it.
+    /// Only the Agent's own runs are the person's; every other caller's is confined, and so is the window's Run again
+    /// of a confined run. A confined run gets a data folder of its own inside the CLI's: a server's, whose data folder
+    /// the child would inherit, and the desktop's, which names none (the CLI's `~/.oaiy` was the run's whole root).
     #[test]
     fn runs_with_outside_input_are_confined() {
         let run = |product: &str| RunRecord { caller_product: product.into(), ..serde_json::from_value(serde_json::json!({
@@ -1769,22 +1786,29 @@ mod tests {
             "mode": "async", "reservedAt": "2026-10-18T00:00:00Z", "lineage": { "depth": 0 }
         })).unwrap() };
         assert!(!outside_input(&run(AGENT_PRODUCT)));
-        assert!(!outside_input(&run(DESKTOP_PRODUCT)), "Run history's Run again is the person's");
+        assert!(!outside_input(&run(DESKTOP_PRODUCT)), "Run history's Run again of the person's own run is the person's");
+        assert!(outside_input(&RunRecord { confined: true, ..run(DESKTOP_PRODUCT) }), "a run again of a confined run stays confined");
         for product in ["oaiy-trigger:aokie", "oaiy-flows", "formlogic", "plugin:x", "oaiy-app", "my-script"] {
             assert!(outside_input(&run(product)), "{product}");
         }
         let env_of = |cmd: &Command| cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect::<Vec<_>>();
+        let files_in = |dir: PathBuf| Some(dir.join("flow-files").to_string_lossy().into_owned());
         let mut open = Command::new("node");
-        confine_child(&mut open, false, Some("/srv/oaiy".into()));
+        confine_child(&mut open, false, Some("/srv/oaiy".into()), Some("/home/u".into()));
         assert!(env_of(&open).is_empty(), "an unconfined run is left as it was");
         let mut shut = Command::new("node");
-        confine_child(&mut shut, true, Some("/srv/oaiy".into()));
+        confine_child(&mut shut, true, Some("/srv/oaiy".into()), Some("/home/u".into()));
         let env = env_of(&shut);
         assert!(env.contains(&("OAIY_FS_CONFINE".into(), Some("1".into()))));
-        assert!(env.contains(&("OAIY_DATA_DIR".into(), Some(PathBuf::from("/srv/oaiy").join("flow-files").to_string_lossy().into_owned()))));
+        assert!(env.contains(&("OAIY_DATA_DIR".into(), files_in(PathBuf::from("/srv/oaiy")))));
         let mut desktop = Command::new("node");
-        confine_child(&mut desktop, true, None);
-        assert_eq!(env_of(&desktop), [("OAIY_FS_CONFINE".to_string(), Some("1".to_string()))]);
+        confine_child(&mut desktop, true, None, Some("/home/u".into()));
+        let env = env_of(&desktop);
+        assert!(env.contains(&("OAIY_FS_CONFINE".into(), Some("1".into()))));
+        assert!(env.contains(&("OAIY_DATA_DIR".into(), files_in(PathBuf::from("/home/u").join(".oaiy")))), "{env:?}");
+        let mut homeless = Command::new("node");
+        confine_child(&mut homeless, true, Some("".into()), None);
+        assert!(env_of(&homeless).iter().any(|(k, v)| k == "OAIY_DATA_DIR" && v.as_deref().is_some_and(|v| v.ends_with("flow-files"))));
     }
 
     #[test]

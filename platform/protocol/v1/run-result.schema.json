@@ -143,6 +143,10 @@
     "triggerEvent": {
       "type": "string",
       "maxLength": 128
+    },
+    "confined": {
+      "type": "boolean",
+      "description": "Run confined (as a run with outside input: its files and network held in) whoever asked for it: a run again of such a run. Absent means it was decided by who asked."
     }
   },
   "additionalProperties": false,

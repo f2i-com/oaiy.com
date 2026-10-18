@@ -531,21 +531,32 @@ ${captureTail('return ')}
           } else if (hasAwait) {
             // Multi-statement code with await but no return - inline directly
             // Can't use async IIFE because the runtime's await→yield replacement breaks nested functions.
+            //
+            // The block's code sits in a block of its own, inside the one that
+            // declares its names: a declaration of one of those names in the
+            // code (`const picture = input2;`, written before the input had that
+            // name) shadows it instead of being "Identifier 'picture' has
+            // already been declared", which stopped the whole flow compiling.
             code += `
   // Logic block: multi-statement with await (inline)
   ${letOrAssign}${outputVar} = null;
   {${scopedNames()}
+    {
     ${captureTail(`${outputVar} = `)};
+    }
   }
   workflow_context["${node.id}"] = ${outputVar};`;
           } else {
             // Multi-statement code without return or await - inline directly
             // Avoids IIFE for cleaner generated output and to keep parameter passing simple.
+            // (in a block of its own, as above)
             code += `
   // Logic block: multi-statement (no return, inline)
   ${letOrAssign}${outputVar} = null;
   {${scopedNames()}
+    {
     ${captureTail(`${outputVar} = `)};
+    }
   }
   workflow_context["${node.id}"] = ${outputVar};`;
           }

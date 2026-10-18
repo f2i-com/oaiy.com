@@ -70,6 +70,12 @@
       "minLength": 1,
       "maxLength": 255
     },
+    "again": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "OAIY Desktop's own window only (`caller.product` `oaiy-desktop`, Run history's Run again): the run this one runs again. Its inputs, time limit and confinement are that run's, from its record; a run again of a run with outside input is confined as that run was."
+    },
     "lineage": {
       "type": "object",
       "description": "Set when this run was triggered by another run. The loop guards depend on it, so a dispatcher must populate it.",

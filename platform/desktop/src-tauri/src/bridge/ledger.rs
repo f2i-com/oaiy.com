@@ -295,6 +295,10 @@ pub struct RunRecord {
     /// which the result may carry whole.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub caller: Option<CallerShown>,
+    /// Run confined whoever asked for it ([`crate::bridge::worker::outside_input`]): Run history's Run again of a run
+    /// with outside input, which runs on that input again ([`Ledger::reserve_confined`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub confined: bool,
 }
 
 /// The caller as a run keeps it for display: its product and its label.
@@ -629,6 +633,16 @@ impl Ledger {
     /// guard refusal would poison that key and a legitimate retry of the same
     /// logical event could never run.
     pub fn reserve(&mut self, req: &RunRequest) -> ReserveOutcome {
+        self.reserve_as(req, false)
+    }
+
+    /// [`Self::reserve`] for a run that is confined whoever asks for it ([`RunRecord::confined`]): marked so in the
+    /// same step, before any worker can claim it.
+    pub fn reserve_confined(&mut self, req: &RunRequest) -> ReserveOutcome {
+        self.reserve_as(req, true)
+    }
+
+    fn reserve_as(&mut self, req: &RunRequest, confined: bool) -> ReserveOutcome {
         // Duplicates BEFORE guards. A retried triggered request — same key, same
         // lineage, redelivered webhook — used to hit guard 3 first ("this
         // binding already handled this event") and get a Refused, which the HTTP
@@ -678,6 +692,7 @@ impl Ledger {
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .map(|l| CallerShown { product: req.caller_product.clone(), label: Some(l.chars().take(MAX_CALLER_LABEL).collect()) }),
+            confined,
         };
 
         // Note the guard is recorded on RESERVE, not on completion. A run that is

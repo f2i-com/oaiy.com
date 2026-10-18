@@ -94,6 +94,13 @@ struct Dispatched {
     dead_past_guards: Option<DeadReason>,
     /// Did any binding actually reserve a run?
     reserved: bool,
+    /// Did a binding fail for an operational reason, whether or not another reserved (`dead` is for an event nothing
+    /// came of): what a redrive keeps its entry for. And the same with the loop guards' refusals not counted, for an
+    /// entry an outcome left (recorded as `dead_past_guards` is).
+    failed: bool,
+    failed_past_guards: bool,
+    /// The bindings that ran for this event: those that reserved a run now, and those that had one for it already.
+    ran: Vec<String>,
 }
 
 /// Should this dispatch be dead-lettered?
@@ -113,7 +120,13 @@ fn dead_reason_where(results: &[DispatchOutcome], failed: impl Fn(&SkipReason) -
     {
         return None;
     }
-    let failures: Vec<String> = results
+    let failures = failures_where(results, failed);
+    (!failures.is_empty()).then(|| DeadReason::NotReserved { detail: failures.join("; ") })
+}
+
+/// The bindings among `results` that failed for a reason `failed` names, whatever the others did.
+fn failures_where(results: &[DispatchOutcome], failed: impl Fn(&SkipReason) -> bool) -> Vec<String> {
+    results
         .iter()
         .filter_map(|o| match o {
             DispatchOutcome::Skipped { binding_id, reason } if failed(reason) => {
@@ -121,8 +134,12 @@ fn dead_reason_where(results: &[DispatchOutcome], failed: impl Fn(&SkipReason) -
             }
             _ => None,
         })
-        .collect();
-    (!failures.is_empty()).then(|| DeadReason::NotReserved { detail: failures.join("; ") })
+        .collect()
+}
+
+/// A loop guard's refusal is not counted: for a run's outcome it is the loop being stopped.
+fn is_failure_past_guards(reason: &SkipReason) -> bool {
+    is_operational_failure(reason) && !matches!(reason, SkipReason::Guard(_))
 }
 
 /// The most of a run's answer its outcome event carries (`data.output`); a larger one is left out, the run keeps it.
@@ -1563,7 +1580,10 @@ impl PluginHost {
 
         let dispatched = self.dispatch_event(&event);
         if let Some(reason) = dispatched.dead {
-            self.record_dead(&event.source, &event.name, reason, envelope.clone());
+            // (with the bindings that ran for it at an earlier delivery, so a redrive never runs them again)
+            if let Ok(mut q) = self.dead.lock() {
+                q.record_caused(&event.source, &event.name, reason, envelope.clone(), None, dispatched.ran);
+            }
         }
         let outcomes = dispatched.outcomes;
 
@@ -1632,7 +1652,7 @@ impl PluginHost {
         // handles outcomes would leave one behind)
         if let Some(reason) = dispatched.dead_past_guards {
             if let Ok(mut q) = self.dead.lock() {
-                q.record_caused(&event.source, &event.name, reason, envelope.clone(), event.origin_run.clone());
+                q.record_caused(&event.source, &event.name, reason, envelope.clone(), event.origin_run.clone(), dispatched.ran);
             }
         }
         self.note_received(envelope, dispatched.outcomes);
@@ -2177,6 +2197,9 @@ impl PluginHost {
                 dead: None,
                 dead_past_guards: None,
                 reserved: false,
+                failed: false,
+                failed_past_guards: false,
+                ran: Vec::new(),
             };
         }
         let bindings: Vec<TriggerBinding> = match self.triggers.lock() {
@@ -2217,15 +2240,28 @@ impl PluginHost {
                     dead: Some(dead.clone()),
                     dead_past_guards: Some(dead),
                     reserved: false,
+                    failed: true,
+                    failed_past_guards: true,
+                    ran: Vec::new(),
                 };
             }
         };
 
         let dead = dead_reason_for(&results);
-        let dead_past_guards = dead_reason_where(&results, |r| is_operational_failure(r) && !matches!(r, SkipReason::Guard(_)));
+        let dead_past_guards = dead_reason_where(&results, is_failure_past_guards);
+        let failed = !failures_where(&results, is_operational_failure).is_empty();
+        let failed_past_guards = !failures_where(&results, is_failure_past_guards).is_empty();
         let reserved = results
             .iter()
             .any(|o| matches!(o, DispatchOutcome::Reserved { .. }));
+        let ran: Vec<String> = results
+            .iter()
+            .filter_map(|o| match o {
+                DispatchOutcome::Reserved { binding_id, .. } => Some(binding_id.clone()),
+                DispatchOutcome::Skipped { binding_id, reason: SkipReason::Duplicate } => Some(binding_id.clone()),
+                DispatchOutcome::Skipped { .. } => None,
+            })
+            .collect();
         let outcomes: Vec<String> = results
             .into_iter()
             .map(|o| match o {
@@ -2237,7 +2273,7 @@ impl PluginHost {
                 }
             })
             .collect();
-        Dispatched { outcomes, dead, dead_past_guards, reserved }
+        Dispatched { outcomes, dead, dead_past_guards, reserved, failed, failed_past_guards, ran }
     }
 
     /// Is the app on its way out? See [`ProcTable::shutting_down`].
@@ -2320,15 +2356,21 @@ impl PluginHost {
     /// Deliberately the ordinary path, guards and all: a guard-refused event is
     /// offered to the guards again and refused again rather than forced through
     /// (an event a run caused is offered with that run as its origin, as it was).
-    /// The idempotency key gains an attempt suffix, so a binding that failed can
-    /// reserve now. A binding that already reserved a run for this event, when it
-    /// was delivered before or at an earlier redrive, is NOT offered it again: an
-    /// event dead-lettered on its second delivery (its first ran one binding, the
-    /// second found that one a duplicate and another failing) was redriven to
-    /// every binding, and the one that had run ran again, under the new key: the
-    /// second email. The entry goes once nothing offered failed and something ran
-    /// (or everything had run already); while a binding still fails it stays, to
-    /// be redriven once that one is fixed.
+    /// It goes under the event's own key: a binding that failed never reserved
+    /// under it (a skip and a guard's refusal take no key), so it can reserve now,
+    /// and a later redelivery of the event is that run's duplicate, not a second
+    /// run. (A redrive used to add an attempt suffix to the key, so a redelivery
+    /// after it was a new event to the ledger and ran the binding again.) A binding
+    /// that already ran for this event, when it was delivered before or at an
+    /// earlier redrive, is NOT offered it again: the entry keeps which ones ran,
+    /// and the ledger is asked too. An event dead-lettered on its second delivery
+    /// (its first ran one binding, the second found that one a duplicate and
+    /// another failing) was redriven to every binding, and the one that had run
+    /// ran again: the second email. Kept in the entry, not only in the ledger,
+    /// because clearing finished runs (or the ledger's cap) takes those runs
+    /// away. The entry goes once nothing offered failed and something ran (or
+    /// everything had run already); while a binding still fails it stays, even
+    /// though another ran at this redrive, to be redriven once that one is fixed.
     ///
     /// Returns the dispatch outcomes, and whether any binding actually reserved.
     pub fn redrive(&self, id: &str) -> Option<(Vec<String>, bool)> {
@@ -2364,49 +2406,56 @@ impl PluginHost {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            idempotency_key: crate::bridge::DeadLetterQueue::redrive_key(
-                original_key,
-                item.attempts + 1,
-            ),
+            // (an event that came with no key is given one of the entry's own, not the empty key every such event has)
+            idempotency_key: if original_key.is_empty() {
+                crate::bridge::DeadLetterQueue::redrive_key(original_key, item.attempts + 1)
+            } else {
+                original_key.to_string()
+            },
             data: envelope.get("data").cloned().unwrap_or(Value::Null),
             origin_run: item.origin_run.clone(),
         };
 
-        // The bindings that already ran for this event: a run is kept under the key each made for it, as the event was
-        // delivered or at each redrive before this one.
+        // The bindings that already ran for this event: those the entry says ran, and those with a run kept under the
+        // key each made for it (as the event was delivered, or at a redrive of a build that added an attempt suffix).
         let keys: Vec<String> = std::iter::once(original_key.to_string())
             .chain((1..=item.attempts).map(|n| crate::bridge::DeadLetterQueue::redrive_key(original_key, n)))
             .collect();
         let product = format!("oaiy-trigger:{}", item.source);
         let ran: Vec<String> = {
             let bindings: Vec<TriggerBinding> = self.triggers.lock().map(|t| t.list().to_vec()).unwrap_or_default();
-            match self.ledger.lock() {
-                Ok(l) => bindings
-                    .iter()
-                    .filter(|b| b.event == item.event && keys.iter().any(|k| l.has_key(&product, &format!("binding:{}:{k}", b.id))))
-                    .map(|b| b.id.clone())
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
+            let ledger = self.ledger.lock().ok();
+            bindings
+                .iter()
+                .filter(|b| b.event == item.event)
+                .filter(|b| {
+                    item.ran.contains(&b.id)
+                        || ledger.as_ref().is_some_and(|l| keys.iter().any(|k| l.has_key(&product, &format!("binding:{}:{k}", b.id))))
+                })
+                .map(|b| b.id.clone())
+                .collect()
         };
         let matching = self.triggers.lock().map(|t| t.list().iter().filter(|b| b.event == item.event).count()).unwrap_or(0);
 
         // The dead reason is not recorded again: this entry already exists, and
         // recording a second one for the same event would grow the queue every
         // time someone retries a redrive that keeps failing.
-        let Dispatched { mut outcomes, reserved, dead, .. } = self.dispatch_some(&event, &|b| !ran.contains(&b.id));
+        let Dispatched { mut outcomes, reserved, failed, failed_past_guards, ran: ran_now, .. } =
+            self.dispatch_some(&event, &|b| !ran.contains(&b.id));
         for id in &ran {
             outcomes.push(format!("{id}: already ran for this event, so not run again"));
         }
         let all_ran = matching > 0 && ran.len() >= matching;
+        // (judged as the entry was recorded: an outcome's, past the loop guards)
+        let still_failing = if item.origin_run.is_some() { failed_past_guards } else { failed };
 
         if let Ok(mut q) = self.dead.lock() {
-            if dead.is_none() && (reserved || all_ran) {
+            if !still_failing && (reserved || all_ran) {
                 // Done: leaving it would have someone redriving the same event
                 // every morning.
                 q.remove(id);
             } else {
-                q.note_attempt(id, outcomes.join("; "));
+                q.note_redrive(id, outcomes.join("; "), &ran_now);
             }
         }
         Some((outcomes, reserved))
@@ -2555,6 +2604,7 @@ mod tests {
                 lineage: Default::default(),
                 trigger_event: None,
                 caller: None,
+                confined: false,
             },
         }
     }
@@ -2738,6 +2788,13 @@ mod tests {
         let mut store = TriggerStore::load(dir.join("triggers.json"));
         store.upsert(binding("kept", None)).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // (root writes into a folder whatever its mode, as in a container: nothing here refuses a save then)
+        if std::fs::write(dir.join(".probe"), b"").is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("skipped: this user writes into a folder of mode 0555 (root)");
+            return;
+        }
         let added = store.upsert(binding("not-saved", None));
         let removed = store.remove("kept");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3505,21 +3562,87 @@ mod tests {
         assert_eq!(host.ledger.lock().unwrap().len(), 1, "and creates no second run");
     }
 
+    /// A redrive runs a binding under the event's own key (the binding never reserved under it: that is why the event is
+    /// a dead letter), so the plugin delivering the same event again afterwards is a duplicate of that run. Under a key
+    /// of the redrive's own (`#redrive1`), the redelivery was a new event to the ledger and the binding ran twice.
     #[test]
-    fn a_redriven_event_does_not_collide_with_its_own_original_key() {
-        // The original reservation never happened (that is why it is a dead
-        // letter), but the key must still differ or a later legitimate event
-        // carrying the same key would be swallowed as a duplicate of the redrive.
+    fn a_redelivery_after_a_redrive_is_a_duplicate() {
         let (_sb, host) = host_with("keys", vec![binding("b1", Some("$event.data.from ==== 1"))]);
         host.process_event("aokie", envelope());
         let id = host.dead.lock().unwrap().list(1)[0].id.clone();
 
         host.triggers.lock().unwrap().upsert(binding("b1", None)).unwrap();
+        let (outcomes, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(reserved, "{outcomes:?}");
+        let run = host.ledger.lock().unwrap().recent(1, &[])[0].clone();
+        assert_eq!(run.idempotency_key, "binding:b1:evt-1");
+
+        host.process_event("aokie", envelope());
+        assert_eq!(host.ledger.lock().unwrap().len(), 1, "the event delivered again is the redriven run's duplicate");
+        assert!(host.dead.lock().unwrap().is_empty());
+    }
+
+    /// Two bindings fail for one event; the person fixes one and redrives. That one runs, and the entry stays for the
+    /// other: it went as soon as anything reserved, so the other binding never got the event.
+    #[test]
+    fn a_redrive_keeps_the_entry_while_another_binding_still_fails() {
+        let refusing = Arc::new(crate::bridge::conditions::testing::FakeHost::by_source(|_| {
+            Err(crate::bridge::conditions::testing::guest("SyntaxError: unexpected token '='"))
+        }));
+        let broken = "$event.data.from ==== 1";
+        let (_sb, host) = host_evaluating("redrive-both", vec![binding("sms", Some(broken)), binding("crm", Some(broken))], refusing);
+        host.process_event("aokie", envelope());
+        let id = host.dead.lock().unwrap().list(1)[0].id.clone();
+        assert_eq!(host.ledger.lock().unwrap().len(), 0);
+
+        host.triggers.lock().unwrap().upsert(binding("sms", None)).unwrap();
+        let (outcomes, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(reserved, "{outcomes:?}");
+        let kept = host.dead.lock().unwrap().get(&id).expect("kept: crm still fails");
+        assert_eq!(kept.ran, vec!["sms".to_string()], "the entry says sms ran");
+        assert_eq!(kept.attempts, 1);
+
+        host.triggers.lock().unwrap().upsert(binding("crm", None)).unwrap();
+        let (outcomes, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(reserved, "{outcomes:?}");
+        let runs = host.ledger.lock().unwrap().recent(10, &[]);
+        let by = |b: &str| runs.iter().filter(|r| r.lineage.binding_id.as_deref() == Some(b)).count();
+        assert_eq!((by("sms"), by("crm")), (1, 1), "{outcomes:?}");
+        assert!(host.dead.lock().unwrap().get(&id).is_none(), "every binding has run: the entry goes");
+    }
+
+    /// Which bindings ran is the entry's own record: clearing finished runs from the history (or the ledger's cap
+    /// evicting them) took away the runs the redrive asked about, and the binding that had run ran again.
+    #[test]
+    fn a_redrive_does_not_run_again_a_binding_whose_run_was_cleared() {
+        let refusing = Arc::new(crate::bridge::conditions::testing::FakeHost::by_source(|_| {
+            Err(crate::bridge::conditions::testing::guest("SyntaxError: unexpected token '='"))
+        }));
+        let broken = "$event.data.from ==== 1";
+        let (_sb, host) = host_evaluating("redrive-cleared", vec![binding("sms", Some(broken)), binding("crm", Some(broken))], refusing);
+        host.process_event("aokie", envelope());
+        let id = host.dead.lock().unwrap().list(1)[0].id.clone();
+        host.triggers.lock().unwrap().upsert(binding("sms", None)).unwrap();
         host.redrive(&id).expect("the entry exists");
 
-        let run = &host.ledger.lock().unwrap().recent(1, &[])[0];
-        assert_ne!(run.idempotency_key, "evt-1");
-        assert!(run.idempotency_key.contains("evt-1"), "{}", run.idempotency_key);
+        // sms's run ends and the person clears finished runs.
+        let sms = host.ledger.lock().unwrap().recent(1, &[])[0].clone();
+        {
+            let mut l = host.ledger.lock().unwrap();
+            assert!(matches!(l.claim(&sms.run_id, crate::bridge::ledger::Runtime::Desktop, "w"), crate::bridge::ledger::ClaimOutcome::Claimed(_)));
+            l.finish(&sms.run_id, RunStatus::Succeeded, Some(json!({ "output": "sent" })), None).unwrap();
+            assert_eq!(l.clear_history(), 1);
+            assert_eq!(l.len(), 0);
+        }
+
+        host.triggers.lock().unwrap().upsert(binding("crm", None)).unwrap();
+        let (outcomes, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(reserved, "{outcomes:?}");
+        assert!(outcomes.iter().any(|o| o.starts_with("sms: already ran")), "{outcomes:?}");
+        let runs = host.ledger.lock().unwrap().recent(10, &[]);
+        assert_eq!(runs.len(), 1, "crm alone ran: {outcomes:?}");
+        assert_eq!(runs[0].lineage.binding_id.as_deref(), Some("crm"));
+        assert!(host.dead.lock().unwrap().get(&id).is_none());
     }
 
     #[test]

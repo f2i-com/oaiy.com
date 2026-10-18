@@ -85,6 +85,11 @@ const LABEL: Record<RunStatus, string> = {
 
 const ms = (iso: string | undefined) => (iso ? Date.parse(iso) : NaN);
 
+/** Whether a run ran held in, its inputs being from outside this computer's person (a plugin's event, an app, a site;
+ *  as the desktop's `outside_input` decides): for what Run again says. The desktop decides a run again's itself, from
+ *  the run's record. */
+const ranConfined = (r: RunRecord) => !!r.confined || (r.callerProduct !== 'oaiy-agent' && r.callerProduct !== 'oaiy-desktop');
+
 /** How long it ran, from the two timestamps the ledger already stores (a running run: so far). */
 function took(rec: RunRecord, now: number): string {
   const start = ms(rec.startedAt);
@@ -229,6 +234,12 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
   const toast = useToast();
   // The latest request's number: an answer to an older one (another filter's, asked before the switch) is not shown.
   const asked = useRef(0);
+  /** Which list the older pages are of: counted up whenever they are let go (another filter, search or flow; a clear),
+   *  so an older page read for the list before is put aside rather than added to this one. */
+  const olderOf = useRef(0);
+  /** The newest page as it shows now, for the rows a refresh pushes out of it. */
+  const headShown = useRef<RunRecord[]>([]);
+  headShown.current = data?.runs ?? [];
   const alive = useRef(true);
   useEffect(() => {
     alive.current = true;
@@ -280,6 +291,22 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
     try {
       const next = narrowing ? await bridge.runs(filterOf(filter).states, want, narrowing) : await bridge.runs(filterOf(filter).states, want);
       if (mine !== asked.current) return;
+      // With older pages read past the newest, the rows newer runs push out of the newest (it holds `want` at most)
+      // go between it and them: they were older than its last row now, and newer than the older pages, so they showed
+      // nowhere. (Only those past its end: a row that left the filter within it is gone.)
+      const was = headShown.current;
+      const last = next.runs[next.runs.length - 1];
+      if (last && next.runs.length >= want) {
+        const kept = new Set(next.runs.map((r) => r.runId));
+        const pushed = was.filter((r) => !kept.has(r.runId) && newerFirst(last, r) < 0);
+        if (pushed.length) {
+          setOlder((had) => {
+            if (!had.length) return had;
+            const seen = new Set(had.map((r) => r.runId));
+            return [...pushed.filter((r) => !seen.has(r.runId)), ...had].sort(newerFirst);
+          });
+        }
+      }
       // (a search's answer is not the filter's: not kept as what the filter shows next time)
       if (!narrowing) put(`runHistory:${filter}`, next);
       noteAnchor();
@@ -324,6 +351,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
     if (was.filter === filter && was.want === want && was.searched === searched && was.flowPick === flowPick) return;
     // Another list: the older pages read for the last one are not this one's.
     if (was.filter !== filter || was.searched !== searched || was.flowPick !== flowPick) {
+      olderOf.current += 1;
       setOlder([]);
       setOlderMore(false);
     }
@@ -414,17 +442,19 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
   const readOlder = async () => {
     const last = listedRuns[listedRuns.length - 1];
     if (!last || loadingOlder) return;
+    // (the list it is read for: a page landing after a switch to another filter is not that filter's)
+    const of = olderOf.current;
     setLoadingOlder(true);
     try {
       const page = await bridge.runs(filterOf(filter).states, PAGE, { ...(narrowing ?? {}), before: { reservedAt: last.reservedAt, runId: last.runId } });
-      if (!alive.current) return;
+      if (!alive.current || of !== olderOf.current) return;
       setOlder((had) => {
         const seen = new Set(had.map((r) => r.runId));
         return [...had, ...page.runs.filter((r) => !seen.has(r.runId))];
       });
       setOlderMore(page.more ?? page.runs.length >= PAGE);
     } catch (e) {
-      setError(`Older runs could not be read: ${e instanceof Error ? e.message : String(e)}`);
+      if (of === olderOf.current) setError(`Older runs could not be read: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoadingOlder(false);
     }
@@ -455,6 +485,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
       for (const f of FILTERS) invalidate(`runHistory:${f.id}`);
       setExpanded(null);
       setHeld(null);
+      olderOf.current += 1;
       setOlder([]);
       setOlderMore(false);
       await refresh();
@@ -527,13 +558,15 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
     const name = nameOf(r);
     if (
       !confirm(
-        `Run ${name} again, with the same inputs?\n\nIt runs on this computer now, as a new run. Whatever the flow does (a message it sends, a file it writes) is done again.`,
+        ranConfined(r)
+          ? `Run ${name} again, with the same inputs?\n\nIt runs on this computer now, as a new run, held in as the first was: its inputs came from outside this computer, so it reaches only its own folders and no other address of this computer or its network. Whatever the flow does (a message it sends, a file it writes) is done again.`
+          : `Run ${name} again, with the same inputs?\n\nIt runs on this computer now, as a new run. Whatever the flow does (a message it sends, a file it writes) is done again.`,
       )
     )
       return;
     mark(r.runId, 'again');
     try {
-      const next = await bridge.runAgain(r.flowId, r.input, r.timeoutMs);
+      const next = await bridge.runAgain(r);
       toast.push({ kind: 'info', title: `Running ${name} again`, body: 'It shows under In progress until it ends, and under All after.' });
       void follow(next.runId, name);
       await latest.current();
@@ -896,6 +929,7 @@ function RunDetail({ r, name, flowKnown, who, busy, onAgain, onOpenEditor }: Pic
         <dd>
           {r.mode}
           {r.runtime ? ` · ${r.runtime}` : ''}
+          {r.confined ? ' · held in, as the run it repeats' : ''}
           {r.cancelRequested ? ' · asked to stop' : ''}
         </dd>
         <dt>Correlation</dt>

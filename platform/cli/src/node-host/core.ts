@@ -26,6 +26,9 @@ import {
   storeSecret,
   fsConfinementOn,
   localNetworkAllowed,
+  desktopApiConfined,
+  isDesktopApi,
+  desktopRouteAllowed,
 } from './context';
 import { ssrfSafeFetch } from './ssrf-guard';
 import { fetch as undiciFetch, Agent } from 'undici';
@@ -148,6 +151,11 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
       (r.allow_private_networks === true && (!fsConfinementOn() || localNetworkAllowed(hostPort))) ||
       process.env.OAIY_HTTP_ALLOW_LOCAL === '1';
     const confined = fsConfinementOn() && !allowLocal;
+    // And at the Desktop's address, only what a flow does there: its AI, speech, connectors and Agent, never the rest
+    // of its API (desktopRouteAllowed), whoever's credential the request carries.
+    if (desktopApiConfined() && isDesktopApi(hostPort) && !desktopRouteAllowed(method, url)) {
+      throw new Error(`${method} ${url} is refused: a run with outside input reaches only this desktop's AI, speech, connectors and Agent`);
+    }
     const init: RequestInit = { method, headers, body, signal: ac.signal };
     let resp: Response;
     try {
