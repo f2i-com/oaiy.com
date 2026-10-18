@@ -227,8 +227,11 @@ export class ChatPane {
     private readonly handlers: {
       submit: (text: string, files: File[]) => void;
       stop: () => void;
-      /** Run the conversation again from where a run failed (the failed request is not sent twice). */
-      retry?: () => void;
+      /**
+       * Run the conversation again from where a run failed (the failed request is not sent twice). False when it is
+       * not taken (another run is going): the button stays.
+       */
+      retry?: () => boolean;
       /** A project file's bytes, for showing it (null when it is gone). */
       file: (path: string) => Uint8Array | null;
       /** Open a project file (or, for an unpacked .softn, its app) in the workspace. */
@@ -1705,9 +1708,9 @@ export class ChatPane {
     if (!retry || this.kind !== 'own' || !this.handlers.retry) return;
     const again = this.lastSent;
     row.append(h('button.retry', { type: 'button', title: again ? `Carry on with "${again.length > 60 ? `${again.slice(0, 60)}…` : again}" from where it stopped` : 'Carry on from where it stopped', onclick: (ev: Event) => {
-      if (this.busy) return;
-      (ev.currentTarget as HTMLElement).remove();
-      this.handlers.retry?.();
+      // (taken while the failed run is still ending too: it carries on once that has)
+      const button = ev.currentTarget as HTMLElement;
+      if (this.handlers.retry?.() !== false) button.remove();
     } }, icon('refresh'), h('span', 'Try again')));
   }
 

@@ -354,9 +354,18 @@ async function main(): Promise<void> {
   const chat = new ChatPane({
     submit: (text, files) => (viewing ? sessionSubmit(text, files) : void submit(text, files)),
     stop: () => (viewing ? stopViewed() : controller?.abort()),
-    // (a run that failed carries on from where it stopped: its request is not sent again)
+    // (a run that failed carries on from where it stopped: its request is not sent again. Asked for while that run is
+    // still ending (its save, slow at times), it carries on once it has, rather than the click being lost; not while
+    // another run goes)
     retry: () => {
-      if (!viewing && !currentRun) void submit('', [], true, true);
+      if (viewing) return false;
+      const ending = currentRun && failedRun === runsStarted ? currentRun : null;
+      if (currentRun && !ending) return false;
+      void (async () => {
+        if (ending) await ending;
+        if (!viewing && !currentRun) await submit('', [], true, true);
+      })();
+      return true;
     },
     // (a phone conversation's files are the Front desk's, shown while it is)
     file: (path) => {
@@ -764,6 +773,9 @@ async function main(): Promise<void> {
 
   /** The run in progress, to wait for when it has to stop. */
   let currentRun: Promise<void> | null = null;
+  /** Runs of the project's agent started so far, and the last of them that failed with a Try again (see `retry`). */
+  let runsStarted = 0;
+  let failedRun = 0;
   /** Project switches happen one at a time. */
   let opening: Promise<unknown> = Promise.resolve();
 
@@ -1474,6 +1486,7 @@ async function main(): Promise<void> {
     const runAgent = agent;
     let finish!: () => void;
     currentRun = new Promise<void>((resolve) => (finish = resolve));
+    const runNumber = ++runsStarted;
     renderSessions();
     // The conversation is saved as it grows, so a closed tab or a crash loses little.
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1514,6 +1527,7 @@ async function main(): Promise<void> {
         noteModelEvent(event);
         if (event.type === 'context') lastContext.set(runAgent, { used: event.used, window: event.window });
         if (event.type === 'error' || event.type === 'notice') ending = event;
+        if (event.type === 'error' && event.retry === true) failedRun = runNumber;
         if (project !== runProject) return;
         if (viewing !== null) {
           missed = true;
