@@ -2164,4 +2164,6 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .download-plan-parts li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 10px; font-size: 11.5px; color: var(--muted); }
 .download-plan-parts li code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; background: transparent; padding: 0; color: var(--text); font-family: var(--font-mono); font-size: 11px; }
 .download-plan-status { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-.download-plan-parts li.is-elsewhere .download-plan-status, .download-plan-parts li.is-here .download-plan-status { color: var(--green); }
+.download-plan-parts li.is-elsewhere .download-plan-status, .download-plan-parts li.is-here .download-plan-status, .download-plan-parts li.is-network .download-plan-status { color: var(--green); }
+.network-share-models { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+.network-share-models input { flex: none; width: auto; height: auto; margin-top: 2px; accent-color: var(--primary); }

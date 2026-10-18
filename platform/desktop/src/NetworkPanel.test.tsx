@@ -288,6 +288,16 @@ describe('NetworkPanel', () => {
     expect(container.querySelector('[data-testid="network-pairing"]')).toBeNull();
   });
 
+  it('lends its model files while lending itself, until its person unticks it', async () => {
+    api.status.mockResolvedValue({ ...primary, lends: true, role: 'both', shareModels: true });
+    api.setSettings.mockResolvedValue({ ...primary, lends: true, role: 'both', shareModels: false });
+    await mount();
+    const tick = container.querySelector('.network-share-models input') as HTMLInputElement;
+    expect(tick.checked).toBe(true);
+    await act(async () => tick.click());
+    expect(api.setSettings).toHaveBeenCalledWith({ shareModels: false });
+  });
+
   it('withdraws a pairing it stops waiting for, so the worker no longer shows it', async () => {
     vi.useFakeTimers();
     api.status.mockResolvedValue(primary);

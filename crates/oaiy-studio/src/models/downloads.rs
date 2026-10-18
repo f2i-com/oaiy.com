@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 const CATALOG: &str = include_str!("catalog.json");
@@ -336,6 +336,9 @@ struct Download {
     /// The bytes and files found on this computer already, used where they are rather than downloaded.
     reused: u64,
     reused_files: usize,
+    /// The bytes fetched from the network's other computers (OAIY Network), and from which.
+    lan: u64,
+    lan_from: Vec<String>,
     /// The Hugging Face token given with it (never said back).
     token: Option<String>,
 }
@@ -356,8 +359,34 @@ impl Download {
             ("added", Json::Arr(self.added.iter().map(Json::str).collect())),
             ("reused", Json::Int(self.reused as i64)),
             ("reused_files", Json::Int(self.reused_files as i64)),
+            ("lan", Json::Int(self.lan as i64)),
+            ("lan_from", Json::Arr(self.lan_from.iter().map(Json::str).collect())),
         ])
     }
+}
+
+/// Model files on the other OAIY computers this one uses (OAIY Network), as the desktop that runs the studio reaches
+/// them (`set_peer_files`): a file wanted is fetched from one of them, over the network, before Hugging Face is
+/// asked; it is checked against its SHA-256 the same way.
+pub trait PeerFiles: Send + Sync {
+    /// For each of `files` (SHA-256, bytes), the name of a paired computer that has it (said from what it knows
+    /// already: checked when it is fetched), or `None`.
+    fn have(&self, files: &[(String, u64)]) -> Vec<Option<String>>;
+    /// Fetch `sha256` (`size` bytes) into `part`, carrying on from what `part` holds, from a paired computer that has
+    /// it: `Ok(Some(its name))` once `part` is whole, `Ok(None)` where none has it (or `stop` said to stop).
+    /// `progress` is told the bytes in `part` as it grows; `stop` is asked between pieces.
+    fn fetch(&self, sha256: &str, size: u64, part: &Path, progress: &dyn Fn(u64), stop: &dyn Fn() -> bool) -> Result<Option<String>, String>;
+}
+
+static PEER_FILES: RwLock<Option<Arc<dyn PeerFiles>>> = RwLock::new(None);
+
+/// Where model files on the network's other computers are fetched from (`None`: from Hugging Face alone).
+pub fn set_peer_files(peers: Option<Arc<dyn PeerFiles>>) {
+    *PEER_FILES.write().unwrap_or_else(|p| p.into_inner()) = peers;
+}
+
+fn peer_files() -> Option<Arc<dyn PeerFiles>> {
+    PEER_FILES.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 #[derive(Default)]
@@ -442,6 +471,8 @@ impl Downloads {
                         added: Vec::new(),
                         reused: 0,
                         reused_files: 0,
+                        lan: 0,
+                        lan_from: Vec::new(),
                         token: token.clone(),
                     }),
                 }
@@ -533,8 +564,9 @@ impl Downloads {
 
     /// What getting `id` takes, before it is got: each of its files here already (where it goes), on this computer
     /// elsewhere (another model's, another drive's: used where it is; `checked` once its SHA-256 has been read, else
-    /// read when it is got), or to download; and the bytes of each, the folder's free space, and the models it
-    /// needs that are not here yet. Asks Hugging Face for the files' list (`token`: as for [`Downloads::start`]).
+    /// read when it is got), on a computer on the network (OAIY Network: fetched from it), or to download; and the
+    /// bytes of each, the folder's free space, and the models it needs that are not here yet. Asks Hugging Face for
+    /// the files' list (`token`: as for [`Downloads::start`]).
     pub fn plan_of(&self, studio: &Studio, id: &str, token: Option<String>) -> Result<Json, String> {
         let e = entry(id).ok_or_else(|| format!("no model {id} in the catalog"))?;
         let dir = default_dir(studio);
@@ -542,24 +574,57 @@ impl Downloads {
         let token = token_for(&cfg, token.as_deref());
         let files = plan(&cfg, e, &dir, token.as_deref())?;
         let here = library::scan(&library::roots(&studio.root, &cfg, &dir));
-        let (mut at_home, mut elsewhere, mut to_fetch) = (0u64, 0u64, 0u64);
-        let listed: Vec<Json> = files
+        // Each file: in place, on this computer elsewhere, on a computer on the network, or to download.
+        let mut said: Vec<(&'static str, Option<String>, Option<bool>)> = files
             .iter()
             .map(|f| {
+                if f.size.is_some_and(|s| size_of(&f.dest) == s) {
+                    ("here", None, None)
+                } else if let Some((from, checked)) = f.size.filter(|s| *s >= library::MIN_BYTES).and_then(|s| library::likely(&studio.root, &here, s, f.sha256.as_deref())) {
+                    ("elsewhere", Some(from.to_string_lossy().into_owned()), Some(checked))
+                } else {
+                    ("download", None, None)
+                }
+            })
+            .collect();
+        if let Some(peers) = peer_files() {
+            let asked: Vec<(usize, (String, u64))> = files
+                .iter()
+                .enumerate()
+                .filter(|(i, f)| said[*i].0 == "download" && f.size.is_some_and(|s| s >= library::MIN_BYTES))
+                .filter_map(|(i, f)| Some((i, (f.sha256.clone()?, f.size?))))
+                .collect();
+            if !asked.is_empty() {
+                let answers = peers.have(&asked.iter().map(|(_, a)| a.clone()).collect::<Vec<_>>());
+                for ((i, _), who) in asked.iter().zip(answers) {
+                    if let Some(name) = who {
+                        said[*i] = ("network", Some(name), None);
+                    }
+                }
+            }
+        }
+        let (mut at_home, mut elsewhere, mut on_network, mut to_fetch) = (0u64, 0u64, 0u64, 0u64);
+        let listed: Vec<Json> = files
+            .iter()
+            .zip(&said)
+            .map(|(f, (status, from, checked))| {
                 let size = f.size.unwrap_or(0);
                 let shown = f.dest.strip_prefix(&dir).unwrap_or(&f.dest).to_string_lossy().replace('\\', "/");
-                let mut o = vec![("path", Json::str(&shown)), ("size", f.size.map_or(Json::Null, |s| Json::Int(s as i64)))];
-                if f.size.is_some_and(|s| size_of(&f.dest) == s) {
-                    at_home += size;
-                    o.push(("status", Json::str("here")));
-                } else if let Some((from, checked)) = f.size.filter(|s| *s >= library::MIN_BYTES).and_then(|s| library::likely(&studio.root, &here, s, f.sha256.as_deref())) {
-                    elsewhere += size;
-                    o.push(("status", Json::str("elsewhere")));
-                    o.push(("from", Json::str(from.to_string_lossy())));
-                    o.push(("checked", Json::Bool(checked)));
-                } else {
-                    to_fetch += size.saturating_sub(size_of(&part_path(&f.dest)));
-                    o.push(("status", Json::str("download")));
+                match *status {
+                    "here" => at_home += size,
+                    "elsewhere" => elsewhere += size,
+                    "network" => on_network += size.saturating_sub(size_of(&part_path(&f.dest))),
+                    _ => to_fetch += size.saturating_sub(size_of(&part_path(&f.dest))),
+                }
+                let mut o = vec![("path", Json::str(&shown)), ("size", f.size.map_or(Json::Null, |s| Json::Int(s as i64))), ("status", Json::str(*status))];
+                if let Some(from) = from {
+                    o.push(("from", Json::str(from)));
+                }
+                if let Some(c) = checked {
+                    o.push(("checked", Json::Bool(*c)));
+                }
+                if let Some(sha) = &f.sha256 {
+                    o.push(("sha256", Json::str(sha)));
                 }
                 Json::obj(o)
             })
@@ -574,12 +639,40 @@ impl Downloads {
             ("free", self.free_cached(&dir).map_or(Json::Null, |v| Json::Int(v as i64))),
             ("here_bytes", Json::Int(at_home as i64)),
             ("elsewhere_bytes", Json::Int(elsewhere as i64)),
+            ("network_bytes", Json::Int(on_network as i64)),
             ("download_bytes", Json::Int(to_fetch as i64)),
             ("needs", Json::Arr(needs)),
             ("files", Json::Arr(listed)),
         ]))
     }
 
+
+    /// Where this computer keeps each of `files` (SHA-256, bytes) among its model files, for another computer on the
+    /// network that wants it: `check` reads a file's SHA-256 where it is not known yet (else a file as large whose
+    /// SHA-256 is not known yet is said, `checked` false). `{files: [{sha256, size, path, checked}]}`.
+    pub fn find_files(&self, studio: &Studio, files: &[(String, u64)], check: bool) -> Json {
+        let cfg = studio.config();
+        let here = library::scan(&library::roots(&studio.root, &cfg, &default_dir(studio)));
+        let found: Vec<Json> = files
+            .iter()
+            .map(|(sha, size)| {
+                let at = if *size < library::MIN_BYTES {
+                    None
+                } else if check {
+                    library::find(&studio.root, &here, *size, sha, |_| false).map(|p| (p, true))
+                } else {
+                    library::likely(&studio.root, &here, *size, Some(sha))
+                };
+                Json::obj([
+                    ("sha256", Json::str(sha)),
+                    ("size", Json::Int(*size as i64)),
+                    ("path", at.as_ref().map_or(Json::Null, |(p, _)| Json::str(p.to_string_lossy()))),
+                    ("checked", Json::Bool(at.is_some_and(|(_, c)| c))),
+                ])
+            })
+            .collect();
+        Json::obj([("files", Json::Arr(found))])
+    }
 }
 
 impl Downloads {
@@ -734,6 +827,35 @@ impl Downloads {
                 std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
             }
             let part = part_path(&f.dest);
+            // From a computer on the network that has it (OAIY Network) before Hugging Face: the same bytes, carried on
+            // from what the partial file holds, and checked the same way below.
+            let mut from_peer = None;
+            if let (Some(size), Some(sha), Some(peers)) = (f.size.filter(|s| *s >= library::MIN_BYTES), f.sha256.as_deref(), peer_files()) {
+                if size_of(&part) != size {
+                    self.update(id, |d| d.file = format!("{shown}, from a computer on the network"));
+                    let clock = Mutex::new((size_of(&part), Instant::now()));
+                    let progress = |now: u64| {
+                        let mut c = clock.lock().unwrap_or_else(|p| p.into_inner());
+                        let dt = c.1.elapsed().as_secs_f64();
+                        if dt >= 1.0 {
+                            let rate = now.saturating_sub(c.0) as f64 / dt;
+                            self.update(id, |d| d.speed = if d.speed == 0. { rate } else { d.speed * 0.7 + rate * 0.3 });
+                            *c = (now, Instant::now());
+                        }
+                        self.update(id, |d| d.done = done + now);
+                    };
+                    match peers.fetch(sha, size, &part, &progress, &|| self.wanted(id) != Want::Run) {
+                        Ok(Some(name)) => from_peer = Some(name),
+                        Ok(None) => {}
+                        Err(err) => studio.log.push(format!("{shown}: not from the network ({err}); from Hugging Face instead")),
+                    }
+                    let want = self.wanted(id);
+                    if want != Want::Run {
+                        return Ok(want);
+                    }
+                    self.update(id, |d| d.file = shown.clone());
+                }
+            }
             // A partial file that is whole already needs only its name.
             if !f.size.is_some_and(|s| size_of(&part) == s) {
                 let want = self.curl(&cfg, id, f, &part, done)?;
@@ -762,9 +884,18 @@ impl Downloads {
                 library::remember(&studio.root, &f.dest, sha);
             }
             done += f.size.unwrap_or_else(|| size_of(&f.dest));
+            if let Some(name) = &from_peer {
+                studio.log.push(format!("{shown}: from {name}, over OAIY Network"));
+            }
             self.update(id, |d| {
                 d.done = done;
                 d.files_done += 1;
+                if let Some(name) = from_peer {
+                    d.lan += f.size.unwrap_or(0);
+                    if !d.lan_from.contains(&name) {
+                        d.lan_from.push(name);
+                    }
+                }
             });
         }
         // Each part's marker: the model is here.
@@ -1110,7 +1241,7 @@ mod tests {
             Json::parse(format!(r#"{{"id":"{id}","parts":[{{"url":"{url}","file":"text_encoder/model.safetensors","size":{size},"sha256":"{sha}","into":"{id}"}}]}}"#).as_bytes()).unwrap()
         };
         let start = |id: &str| {
-            d.list.lock().unwrap().push(Download { id: id.into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, token: None });
+            d.list.lock().unwrap().push(Download { id: id.into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, lan: 0, lan_from: Vec::new(), token: None });
         };
 
         // here already, elsewhere: used where it is, the server never asked
@@ -1140,6 +1271,75 @@ mod tests {
         assert!(err.contains("did not download whole"), "{err}");
         let three = dir.join("three/text_encoder/model.safetensors");
         assert!(!three.exists() && !part_path(&three).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A computer on the network that has one file (by its SHA-256): what it sends, and how often it was asked.
+    struct OnePeer {
+        sha: String,
+        body: Vec<u8>,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PeerFiles for OnePeer {
+        fn have(&self, files: &[(String, u64)]) -> Vec<Option<String>> {
+            files.iter().map(|(sha, _)| (*sha == self.sha).then(|| "Rig".to_string())).collect()
+        }
+        fn fetch(&self, sha256: &str, size: u64, part: &Path, progress: &dyn Fn(u64), _stop: &dyn Fn() -> bool) -> Result<Option<String>, String> {
+            if sha256 != self.sha {
+                return Ok(None);
+            }
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // (carried on from what the partial file holds)
+            let from = size_of(part) as usize;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(part).map_err(|e| e.to_string())?;
+            std::io::Write::write_all(&mut f, &self.body[from..]).map_err(|e| e.to_string())?;
+            progress(size);
+            Ok(Some("Rig".into()))
+        }
+    }
+
+    /// A file a computer on the network has is fetched from it, not from Hugging Face, carried on from a partial file,
+    /// and checked the same way: one it sends wrong is refused. Others are downloaded as before.
+    #[test]
+    fn a_file_a_computer_on_the_network_has_comes_from_it() {
+        use std::sync::atomic::Ordering;
+        let root = std::env::temp_dir().join(format!("oaiy-dl-peer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let weights: Vec<u8> = (0..library::MIN_BYTES as usize + 3).map(|i| (i * 13 % 241) as u8).collect();
+        let mut h = sha256::Sha256::new();
+        h.update(&weights);
+        let sha = h.hex();
+        let studio = Arc::new(Studio::for_test(&root, crate::config::default_json()));
+        let peer = Arc::new(OnePeer { sha: sha.clone(), body: weights.clone(), sent: Default::default() });
+        set_peer_files(Some(peer.clone()));
+        let (url, asked) = serve(weights.clone());
+        let d = Downloads::new();
+        d.list.lock().unwrap().push(Download { id: "net".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, lan: 0, lan_from: Vec::new(), token: None });
+        let e = Json::parse(format!(r#"{{"id":"net","parts":[{{"url":"{url}","file":"model.safetensors","size":{},"sha256":"{sha}","into":"net"}}]}}"#, weights.len()).as_bytes()).unwrap();
+        // half of it here already, from an earlier try
+        std::fs::create_dir_all(dir.join("net")).unwrap();
+        std::fs::write(part_path(&dir.join("net/model.safetensors")), &weights[..weights.len() / 2]).unwrap();
+        let r = d.fetch(&studio, &e, &dir);
+        set_peer_files(None);
+        assert_eq!(r.unwrap(), Want::Run);
+        assert_eq!((peer.sent.load(Ordering::SeqCst), asked.load(Ordering::SeqCst)), (1, 0), "from the computer on the network, not the internet");
+        assert_eq!(std::fs::read(dir.join("net/model.safetensors")).unwrap(), weights);
+        let net = d.list.lock().unwrap().iter().find(|x| x.id == "net").cloned().unwrap();
+        assert_eq!((net.lan, net.lan_from.clone()), (weights.len() as u64, vec!["Rig".to_string()]));
+
+        // what it sends wrong is refused, as a download would be
+        let wrong = Arc::new(OnePeer { sha: sha.clone(), body: weights.iter().map(|b| b ^ 1).collect(), sent: Default::default() });
+        set_peer_files(Some(wrong));
+        d.list.lock().unwrap().push(Download { id: "bad".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, lan: 0, lan_from: Vec::new(), token: None });
+        let bad = Json::parse(format!(r#"{{"id":"bad","parts":[{{"url":"{url}","file":"model.safetensors","size":{},"sha256":"{sha}","into":"bad"}}]}}"#, weights.len()).as_bytes()).unwrap();
+        // (the first copy is in the library: moved aside, so this one is fetched)
+        std::fs::remove_dir_all(dir.join("net")).unwrap();
+        let err = d.fetch(&studio, &bad, &dir).unwrap_err();
+        set_peer_files(None);
+        assert!(err.contains("did not download whole"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1179,7 +1379,7 @@ mod tests {
         let files = plan(&cfg, &e, &dir, None).unwrap();
         assert_eq!(files.len(), 2);
         let d = Downloads::new();
-        d.list.lock().unwrap().push(Download { id: "t".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, token: None });
+        d.list.lock().unwrap().push(Download { id: "t".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, lan: 0, lan_from: Vec::new(), token: None });
         for f in &files {
             std::fs::create_dir_all(f.dest.parent().unwrap()).unwrap();
             // Half a file first, as a pause leaves it; curl carries on from there.

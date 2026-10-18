@@ -117,10 +117,10 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                     "model": { "type": "string", "minLength": 1, "description": "An installed model of that group, by the name models_list shows, or a paired worker's by its id (network_status)." }
                 }), &["group", "model"])),
             def("model_download_plan", "What a model download takes", Read,
-                "What getting a catalog model takes, before it is got (catalogId from models_list): each of its files (weights, text encoder, VAE…) here already, on this computer elsewhere (another model's, another drive's: used where it is, never downloaded twice; checked by its SHA-256 when it is got), or to download, the gigabytes to download, the free space, the models it needs first, and whether it is gated (its licence accepted on huggingface.co and a Hugging Face token in Settings first).",
+                "What getting a catalog model takes, before it is got (catalogId from models_list): each of its files (weights, text encoder, VAE…) here already, on this computer elsewhere (another model's, another drive's: used where it is, never downloaded twice; checked by its SHA-256 when it is got), on a paired computer (OAIY Network: fetched from it over the LAN), or to download, the gigabytes to download, the free space, the models it needs first, and whether it is gated (its licence accepted on huggingface.co and a Hugging Face token in Settings first).",
                 object(json!({ "catalogId": { "type": "string", "minLength": 1, "description": "The catalog entry's id." } }), &["catalogId"])),
             def("model_download", "Download a model", Change,
-                "Start getting a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list): every part it needs (its weights, text encoder, VAE), the files this computer has already used where they are rather than downloaded again, each download checked by its SHA-256; it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: model_download_plan says what is left to fetch; check memory need first.",
+                "Start getting a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list): every part it needs (its weights, text encoder, VAE), the files this computer has already used where they are rather than downloaded again, those a paired computer has (OAIY Network) fetched from it over the LAN, each file checked by its SHA-256; it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: model_download_plan says what is left to fetch; check memory need first.",
                 object(json!({ "catalogId": { "type": "string", "minLength": 1, "description": "The catalog entry's id." } }), &["catalogId"])),
             def("engine_start", "Start the language model", Change,
                 "Start the engine's language model (the model chosen for llm). Answers its state; loading takes a while, and status shows when it is ready.",
@@ -152,7 +152,8 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                     "enabled": { "type": "boolean", "description": "OAIY Network on (true) or off. Choosing uses or lends switches it on." },
                     "uses": { "type": "boolean", "description": "This computer uses other computers." },
                     "lends": { "type": "boolean", "description": "This computer lends itself to the computers that pair with it." },
-                    "name": { "type": "string", "minLength": 1, "maxLength": 80, "description": "The name other computers see." }
+                    "name": { "type": "string", "minLength": 1, "maxLength": 80, "description": "The name other computers see." },
+                    "shareModels": { "type": "boolean", "description": "Lending itself, lend its model files too (by their SHA-256), so a computer using this one fetches them over the LAN rather than downloading them again (on unless switched off)." }
                 }), &[])),
             def("network_pair", "Pair with a computer", Change,
                 "Pair with another OAIY computer on this network that lends itself: node (one network_status lists in foundOnLan) or address (host:port, as that computer's Networking page shows it). Two computers whose people both let their Agent set up OAIY Network pair by themselves at once. Otherwise that computer's person approves the request showing the code this answers: tell the person the code and where (Setup, Networking on that computer); this call waits up to waitSeconds (default 60) and confirms this side once it is approved. Call again with pairingId to keep waiting. bothWays (default true where this computer lends itself) lets the other computer use this one too. Only where the person lets the Agent set up OAIY Network.",
@@ -569,7 +570,7 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             let id = a.req("catalogId");
             let v = d.get_within(&format!("/api/engines/downloads?plan={}", seg(id)), Duration::from_secs(90)).await?;
             let gb = |k: &str| (v.get(k).and_then(Value::as_f64).unwrap_or(0.0) / 1e9 * 10.0).round() / 10.0;
-            let (down, here, elsewhere) = (gb("downloadBytes"), gb("hereBytes"), gb("elsewhereBytes"));
+            let (down, here, elsewhere, lan) = (gb("downloadBytes"), gb("hereBytes"), gb("elsewhereBytes"), gb("networkBytes"));
             let files: Vec<Value> = arr(&v, "files")
                 .iter()
                 .map(|f| json!({ "file": f.get("path"), "gb": (f.get("size").and_then(Value::as_f64).unwrap_or(0.0) / 1e9 * 100.0).round() / 100.0, "status": f.get("status"), "from": f.get("from") }))
@@ -577,6 +578,10 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             let mut said = format!("{}: {down} GB to download", v.get("name").and_then(Value::as_str).unwrap_or(id));
             if elsewhere > 0.0 {
                 said.push_str(&format!(", {elsewhere} GB on this computer already (used where it is)"));
+            }
+            if lan > 0.0 {
+                let from: Vec<&str> = arr(&v, "files").iter().filter(|f| f["status"] == "network").filter_map(|f| f["from"].as_str()).collect();
+                said.push_str(&format!(", {lan} GB from {} over OAIY Network", from.first().copied().unwrap_or("a paired computer")));
             }
             if here > 0.0 {
                 said.push_str(&format!(", {here} GB in place"));
@@ -586,7 +591,7 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             }
             done(
                 format!("{said}."),
-                json!({ "downloadGb": down, "elsewhereGb": elsewhere, "hereGb": here, "freeGb": (v.get("free").and_then(Value::as_f64).unwrap_or(0.0) / 1e9).round(), "gated": v.get("gated"), "token": v.get("token"), "needs": v.get("needs"), "files": files }),
+                json!({ "downloadGb": down, "elsewhereGb": elsewhere, "networkGb": lan, "hereGb": here, "freeGb": (v.get("free").and_then(Value::as_f64).unwrap_or(0.0) / 1e9).round(), "gated": v.get("gated"), "token": v.get("token"), "needs": v.get("needs"), "files": files }),
             )
         }
         "model_download" => {
@@ -1405,6 +1410,10 @@ fn compact_download(d: &Value) -> Value {
     if let Some(bytes) = d.get("reused").and_then(Value::as_u64).filter(|b| *b > 0) {
         v["reusedGb"] = json!((bytes as f64 / 1e9 * 10.0).round() / 10.0);
     }
+    if let Some(bytes) = d.get("lan").and_then(Value::as_u64).filter(|b| *b > 0) {
+        v["fromNetworkGb"] = json!((bytes as f64 / 1e9 * 10.0).round() / 10.0);
+        v["fromNetwork"] = d.get("lanFrom").cloned().unwrap_or(Value::Null);
+    }
     if let Some(added) = d.get("added").and_then(Value::as_array).filter(|a| !a.is_empty()) {
         v["added"] = Value::Array(added.clone());
     }
@@ -1522,7 +1531,7 @@ async fn network_agent(d: &Desk) -> Result<Value, String> {
 async fn network_setup(d: &Desk, a: &Args<'_>) -> Result<Done, String> {
     network_agent(d).await?;
     let mut change = serde_json::Map::new();
-    for key in ["uses", "lends"] {
+    for key in ["uses", "lends", "shareModels"] {
         if let Some(v) = a.bool(key) {
             change.insert(key.into(), json!(v));
         }
@@ -1536,7 +1545,7 @@ async fn network_setup(d: &Desk, a: &Args<'_>) -> Result<Done, String> {
         change.insert("name".into(), json!(name));
     }
     if change.is_empty() {
-        return Err("Say what to change: enabled, uses, lends or name.".into());
+        return Err("Say what to change: enabled, uses, lends, shareModels or name.".into());
     }
     let v = d.put("/api/network/settings", Value::Object(change)).await?;
     let does = match (v["uses"].as_bool() == Some(true), v["lends"].as_bool() == Some(true)) {

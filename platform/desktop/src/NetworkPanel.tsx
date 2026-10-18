@@ -319,6 +319,15 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
               It lends the computers paired with it its models and GPUs, the flows it shares (<em>Let apps run it</em> in Flows) and OAIY Voice, when set up here.
             </div>
           )}
+          {status.lends && (
+            <label className="network-share-models">
+              <input type="checkbox" checked={status.shareModels !== false} disabled={busy} onChange={(e) => onChange({ shareModels: e.target.checked })} />
+              <span>
+                Share its model files: a computer using this one that gets a model this one has fetches its files from here, over your network, rather
+                than downloading them again.
+              </span>
+            </label>
+          )}
           {!status.discovery && <div>Finding computers on the network (mDNS) is off here: add them by their address.</div>}
         </div>
       )}

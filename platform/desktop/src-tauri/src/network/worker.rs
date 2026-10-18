@@ -191,17 +191,20 @@ fn routes(net: Network) -> Router {
         .route("/worker/v1/runs/:id/cancel", post(cancel_run))
         .route("/worker/v1/services/:service/*path", any(service).layer(DefaultBodyLimit::max(MEDIA_LIMIT)))
         .route("/worker/v1/voices/:name", axum::routing::put(voice_copy).layer(DefaultBodyLimit::max(VOICE_LIMIT)))
+        // (model files lent by their SHA-256, so a computer using this one need not download them again)
+        .route("/worker/v1/models/have", post(super::files::have))
+        .route("/worker/v1/models/blob/:sha256", get(super::files::blob))
         .route("/worker/v1/chat", post(chat).layer(DefaultBodyLimit::max(CHAT_LIMIT)))
         .route("/worker/v1/gateway/*path", any(gateway).layer(DefaultBodyLimit::max(MEDIA_LIMIT)))
         .with_state(net)
 }
 
-fn refuse(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+pub(super) fn refuse(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": { "code": code, "message": message.into() } }))).into_response()
 }
 
 /// The paired primary calling, if it is one (and this computer lends itself, switched on).
-fn primary_of(net: &Network, caller: &Caller) -> Option<Peer> {
+pub(super) fn primary_of(net: &Network, caller: &Caller) -> Option<Peer> {
     if !net.settings().lends() {
         return None;
     }

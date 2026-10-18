@@ -48,6 +48,10 @@ pub struct Settings {
     /// computer pairs by itself with another that has this on too, with no codes to compare (a network the person
     /// trusts: their home's or office's).
     pub agent: bool,
+    /// Lending itself, it lends its model files too (by their SHA-256), so a computer using it need not download
+    /// them again: on unless its person switches it off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_models: Option<bool>,
     /// The name other computers show for this one (the computer's own name where empty).
     pub name: String,
     /// The port a worker listens on.
@@ -58,7 +62,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { enabled: false, role: Role::Standalone, uses: None, lends: None, agent: false, name: String::new(), port: DEFAULT_PORT, bind: String::new() }
+        Settings { enabled: false, role: Role::Standalone, uses: None, lends: None, agent: false, share_models: None, name: String::new(), port: DEFAULT_PORT, bind: String::new() }
     }
 }
 
@@ -80,6 +84,11 @@ impl Settings {
     /// It lends itself now (Network on, and set so): its listener is up, and computers may ask to pair.
     pub fn lends(&self) -> bool {
         self.enabled && self.lends.unwrap_or(matches!(self.role, Role::Worker | Role::Both))
+    }
+
+    /// It lends its model files now (lending itself, and not switched off).
+    pub fn shares_models(&self) -> bool {
+        self.lends() && self.share_models != Some(false)
     }
 
     /// What it is now: none while Network is off, else using others, lending itself, or both.

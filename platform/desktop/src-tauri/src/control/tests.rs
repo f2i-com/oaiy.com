@@ -872,13 +872,14 @@ async fn a_models_plan_says_what_is_here_already_and_what_is_left_to_fetch() {
             match q.plan.as_deref() {
                 Some("flux-3-image-klein") => Json(json!({
                     "id": "flux-3-image-klein", "name": "FLUX 3 Image Klein", "gated": true, "token": false, "free": 400_000_000_000u64,
-                    "hereBytes": 0, "elsewhereBytes": 9_700_000_000u64, "downloadBytes": 10_600_000_000u64, "needs": [],
+                    "hereBytes": 0, "elsewhereBytes": 9_700_000_000u64, "networkBytes": 340_000_000u64, "downloadBytes": 10_600_000_000u64, "needs": [],
                     "files": [
                         { "path": "flux-3-image-klein/model.safetensors", "size": 10_600_000_000u64, "status": "download" },
+                        { "path": "flux-3-image-klein/ae.safetensors", "size": 340_000_000u64, "status": "network", "from": "Rig" },
                         { "path": "flux-3-image-klein/text_encoder/model.safetensors", "size": 9_700_000_000u64, "status": "elsewhere", "from": "/Volumes/T9/flux-3/text_encoder/model.safetensors", "checked": true }
                     ]
                 })),
-                _ => Json(json!({ "running": true, "downloads": [{ "id": "moss-image-sft-q4", "status": "done", "done": 9, "total": 9, "reused": 9_700_000_000u64, "reused_files": 1, "added": ["image model moss-image-sft-q4"] }] })),
+                _ => Json(json!({ "running": true, "downloads": [{ "id": "moss-image-sft-q4", "status": "done", "done": 9, "total": 9, "reused": 9_700_000_000u64, "reused_files": 1, "lan": 3_700_000_000u64, "lanFrom": ["Rig"], "added": ["image model moss-image-sft-q4"] }] })),
             }
         }),
     );
@@ -888,11 +889,14 @@ async fn a_models_plan_says_what_is_here_already_and_what_is_left_to_fetch() {
     let said = text(&r);
     assert!(said.contains("10.6 GB to download") && said.contains("9.7 GB on this computer already"), "{said}");
     assert!(said.contains("gated") && said.contains("Hugging Face token in Settings"), "{said}");
+    assert!(said.contains("0.3 GB from Rig over OAIY Network"), "{said}");
     let v = &r["structuredContent"];
-    assert_eq!(v["files"][1]["status"], "elsewhere", "{r}");
-    assert_eq!(v["files"][1]["from"], "/Volumes/T9/flux-3/text_encoder/model.safetensors", "{r}");
+    assert_eq!((&v["files"][1]["status"], &v["networkGb"]), (&json!("network"), &json!(0.3)), "{r}");
+    assert_eq!(v["files"][2]["status"], "elsewhere", "{r}");
+    assert_eq!(v["files"][2]["from"], "/Volumes/T9/flux-3/text_encoder/model.safetensors", "{r}");
     let r = call(&app, None, "model_download_status", json!({})).await;
     assert_eq!(r["structuredContent"]["downloads"][0]["reusedGb"], 9.7, "{r}");
+    assert_eq!((&r["structuredContent"]["downloads"][0]["fromNetworkGb"], &r["structuredContent"]["downloads"][0]["fromNetwork"]), (&json!(3.7), &json!(["Rig"])), "{r}");
 }
 
 /// The Agent sets OAIY Network up only where the person lets it (`agent` on the network's settings): refused otherwise.

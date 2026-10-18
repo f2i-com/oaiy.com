@@ -941,6 +941,9 @@ fn engine_download(d: &serde_json::Value) -> serde_json::Value {
         "added": d.get("added").cloned().unwrap_or_else(|| serde_json::json!([])),
         "reused": d.get("reused"),
         "reusedFiles": d.get("reused_files"),
+        // What came from the network's other computers (OAIY Network), and from which.
+        "lan": d.get("lan"),
+        "lanFrom": d.get("lan_from").cloned().unwrap_or_else(|| serde_json::json!([])),
     })
 }
 
@@ -1070,6 +1073,7 @@ pub(crate) async fn engines_plan_at(ui: Option<String>, id: &str, token: Option<
         "free": p.get("free"),
         "hereBytes": p.get("here_bytes"),
         "elsewhereBytes": p.get("elsewhere_bytes"),
+        "networkBytes": p.get("network_bytes"),
         "downloadBytes": p.get("download_bytes"),
         "needs": p.get("needs"),
         "files": files,
@@ -1789,6 +1793,9 @@ pub async fn serve(
     let network = crate::network::Network::open(&data_dir_for_auth, ai_state.clone());
     network.set_bridge(bridge_for_network.0, bridge_for_network.1);
     network.share();
+    // (the engines' downloads get model files from the computers this one uses first)
+    #[cfg(feature = "gui")]
+    crate::network::files::lend_to_engines(network.clone());
     if !isolated {
         let started = network.clone();
         tokio::spawn(async move {

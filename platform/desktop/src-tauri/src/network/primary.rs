@@ -135,6 +135,8 @@ struct SettingsChange {
     lends: Option<bool>,
     /// The person lets the Agent set up OAIY Network here, and this computer pairs by itself with another that does.
     agent: Option<bool>,
+    /// Lending itself, it lends its model files too.
+    share_models: Option<bool>,
     name: Option<String>,
     port: Option<u16>,
     bind: Option<String>,
@@ -169,6 +171,9 @@ async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsCha
     if let Some(v) = change.agent {
         s.agent = v;
     }
+    if let Some(v) = change.share_models {
+        s.share_models = Some(v);
+    }
     if let Some(v) = change.name {
         s.name = v.chars().filter(|c| !c.is_control()).take(80).collect::<String>().trim().to_string();
     }
@@ -197,8 +202,8 @@ async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsCha
         if let Err(e) = net.set(s).await {
             return error(StatusCode::BAD_REQUEST, "network_unavailable", e);
         }
-    } else if change.agent.is_some() {
-        // (whether the Agent may set it up alone: kept, nothing running started again)
+    } else if change.agent.is_some() || change.share_models.is_some() {
+        // (whether the Agent may set it up, or model files are lent, alone: kept, nothing running started again)
         if let Err(e) = net.keep(s) {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
         }
@@ -269,14 +274,14 @@ async fn resolve(address: &str, port: u16) -> Result<std::net::SocketAddr, Strin
         .ok_or_else(|| format!("{with_port} is not on the local network: OAIY Network pairs with computers on the LAN alone"))
 }
 
-fn url(address: &str, path: &str) -> String {
+pub(super) fn url(address: &str, path: &str) -> String {
     format!("https://{address}{path}")
 }
 
 static CLIENTS: Mutex<Option<HashMap<(String, String), reqwest::Client>>> = Mutex::new(None);
 
 /// The HTTP client to a paired worker: this computer's certificate presented, the worker's pinned.
-fn client_for(id: &Identity, worker_fingerprint: &str) -> Result<reqwest::Client, String> {
+pub(super) fn client_for(id: &Identity, worker_fingerprint: &str) -> Result<reqwest::Client, String> {
     let key = (id.fingerprint.clone(), worker_fingerprint.to_string());
     let mut clients = lock(&CLIENTS);
     let map = clients.get_or_insert_with(HashMap::new);

@@ -540,7 +540,7 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-plan li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 8px; font: 11px var(--code); color: var(--muted); }
 .dl-plan li > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 .dl-plan li .why { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dl-plan li.elsewhere .why, .dl-plan li.here .why { color: var(--good); }
+.dl-plan li.elsewhere .why, .dl-plan li.here .why, .dl-plan li.network .why { color: var(--good); }
 .dl-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .dl-actions .btn { padding: 6px 12px; font-size: 13px; }
 .dl-actions .btn.go { flex: 1; }
@@ -2800,8 +2800,9 @@ function planHtml(p) {
   if (p.error) return `<div class="err">${esc(p.error)}</div>`;
   const said = [`<b>${dlSize(p.download_bytes)}</b> to download`];
   if (p.elsewhere_bytes) said.push(`<span class="have">${dlSize(p.elsewhere_bytes)} on this computer already, used where it is</span>`);
+  if (p.network_bytes) said.push(`<span class="have">${dlSize(p.network_bytes)} from ${esc([...new Set(p.files.filter(f => f.status === "network").map(f => f.from))].join(", "))} over OAIY Network</span>`);
   if (p.here_bytes) said.push(`${dlSize(p.here_bytes)} in place`);
-  const files = p.files.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${f.status === "download" ? "to download" : f.status === "here" ? "in place" : "on this computer: " + esc(f.from || "")}</span></li>`).join("");
+  const files = p.files.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${f.status === "download" ? "to download" : f.status === "here" ? "in place" : f.status === "network" ? "from " + esc(f.from || "") + " (OAIY Network)" : "on this computer: " + esc(f.from || "")}</span></li>`).join("");
   return `<div class="dl-plan"><div><span>${said.join(" · ")}</span></div>${p.files.length > 1 ? `<details><summary>Its ${p.files.length} files</summary><ul>${files}</ul></details>` : ""}</div>`;
 }
 function dlCard(m, group) {
@@ -2811,7 +2812,7 @@ function dlCard(m, group) {
   let state = "", actions = "";
   if (d && d.status === "downloading") {
     const pct = d.total ? Math.min(100, d.done / d.total * 100) : 0, left = d.speed > 0 && d.total ? (d.total - d.done) / d.speed : NaN;
-    state = `<div class="meter"><div style="width:${pct}%"></div></div><div class="line"><span>${dlSize(d.done)} of ${d.total ? dlSize(d.total) : "…"}${d.reused ? " · " + dlSize(d.reused) + " found here" : ""}</span><span>${d.speed > 0 ? dlSize(d.speed) + "/s" : ""}${dur(left) ? " · " + dur(left) + " left" : ""}</span></div>${d.file ? `<div class="file" title="${esc(d.file)}">${esc(d.file)}</div>` : ""}`;
+    state = `<div class="meter"><div style="width:${pct}%"></div></div><div class="line"><span>${dlSize(d.done)} of ${d.total ? dlSize(d.total) : "…"}${d.reused ? " · " + dlSize(d.reused) + " found here" : ""}${d.lan ? " · " + dlSize(d.lan) + " from " + esc((d.lan_from || []).join(", ")) : ""}</span><span>${d.speed > 0 ? dlSize(d.speed) + "/s" : ""}${dur(left) ? " · " + dur(left) + " left" : ""}</span></div>${d.file ? `<div class="file" title="${esc(d.file)}">${esc(d.file)}</div>` : ""}`;
     actions = `<button class="btn" data-dl="pause" data-id="${m.id}">Pause</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
   } else if (d && d.status === "queued") {
     state = `<div class="line"><span>Waiting for the download before it</span></div>`;
@@ -2826,7 +2827,7 @@ function dlCard(m, group) {
     state = `<div class="err">${esc(d.error || "The download failed.")}</div>`;
     actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button>`;
   } else if (m.installed || d?.status === "done") {
-    state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>${d?.reused ? `<div class="line"><span>${dlSize(d.reused)} of it was on this computer already, used where it is</span></div>` : ""}`;
+    state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>${d?.reused ? `<div class="line"><span>${dlSize(d.reused)} of it was on this computer already, used where it is</span></div>` : ""}${d?.lan ? `<div class="line"><span>${dlSize(d.lan)} came from ${esc((d.lan_from || []).join(", "))} over OAIY Network</span></div>` : ""}`;
     actions = `<button class="btn" data-goto-models>Open Models</button><button class="btn quiet" data-dl="add" data-id="${m.id}" title="Add it to the model list again (after it was removed)">Add again</button>`;
   } else if (m.partial) {
     state = `<div class="line"><span>Partly downloaded</span></div>`;

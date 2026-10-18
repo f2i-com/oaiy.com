@@ -113,7 +113,7 @@ fn ai(engines: Option<String>) -> crate::ai::AiState {
 
 async fn node(tag: &str, role: Role, engines: Option<String>) -> Network {
     let net = Network::open_with(&temp(tag), ai(engines), false);
-    net.set(Settings { enabled: true, uses: None, lends: None, agent: false, role, name: format!("the {tag}"), port: 0, bind: "127.0.0.1".into() }).await.unwrap();
+    net.set(Settings { enabled: true, uses: None, lends: None, agent: false, share_models: None, role, name: format!("the {tag}"), port: 0, bind: "127.0.0.1".into() }).await.unwrap();
     net
 }
 
@@ -274,7 +274,7 @@ async fn a_worker_unpaired_while_off_is_told_when_it_is_back() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, still) = call(&w, "GET", "/api/network/nodes", None).await;
     assert_eq!(still["nodes"].as_array().unwrap().len(), 1, "it did not hear, being off");
-    worker.set(Settings { enabled: true, uses: None, lends: None, agent: false, role: Role::Worker, name: "the worker-untold".into(), port, bind: "127.0.0.1".into() }).await.unwrap();
+    worker.set(Settings { enabled: true, uses: None, lends: None, agent: false, share_models: None, role: Role::Worker, name: "the worker-untold".into(), port, bind: "127.0.0.1".into() }).await.unwrap();
     primary::tell_untold(&primary).await;
     let (_, told) = call(&w, "GET", "/api/network/nodes", None).await;
     assert!(told["nodes"].as_array().unwrap().is_empty(), "told once back: {told}");
@@ -421,6 +421,82 @@ async fn a_primary_runs_the_flows_a_worker_shares_there() {
     assert_eq!((&jobs[2]["mine"], &jobs[2]["flow"], &jobs[2]["runId"]), (&json!(false), &Value::Null, &Value::Null), "another caller's run, unnamed");
     let said = nodes.to_string();
     assert!(!said.contains("private prompt") && !said.contains("/Users/someone"), "{said}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A computer's engines that keep one model file (by its SHA-256 and size): where it is, said to its own desktop alone.
+async fn engines_keeping(path: PathBuf, sha: String, size: u64) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/api/library/find",
+        post(move |axum::Json(b): axum::Json<Value>| {
+            let (path, sha) = (path.clone(), sha.clone());
+            async move {
+                let files: Vec<Value> = b["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|f| {
+                        let mine = f["sha256"] == json!(sha) && f["size"] == json!(size);
+                        json!({ "sha256": f["sha256"], "size": f["size"], "path": if mine { json!(path) } else { Value::Null }, "checked": mine })
+                    })
+                    .collect();
+                axum::Json(json!({ "files": files }))
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+/// A model file a computer lends is fetched from it by the computer using it, by its SHA-256 alone, carried on from a
+/// partial file; one it does not have is not, nor by a computer not paired with it, nor once its person stops sharing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_file_a_paired_computer_has_is_fetched_from_it() {
+    use sha2::{Digest, Sha256};
+    let dir = temp("lent-files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let weights: Vec<u8> = (0..3_000_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    let path = dir.join("model.safetensors");
+    std::fs::write(&path, &weights).unwrap();
+    let sha: String = Sha256::digest(&weights).iter().map(|b| format!("{b:02x}")).collect();
+    let size = weights.len() as u64;
+    let worker = node("worker-files", Role::Worker, Some(engines_keeping(path.clone(), sha.clone(), size).await)).await;
+    let primary = node("primary-files", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let peer = primary.inner().peers().get(&node_id, Role::Worker).cloned().unwrap();
+    primary::check(&primary, &peer).await;
+
+    // who has it: the worker, for this file alone
+    let other = "ab".repeat(32);
+    let who = files::who_has(&primary, &[(sha.clone(), size), (other.clone(), size)]).await;
+    assert_eq!(who.iter().map(|p| p.as_ref().map(|p| p.node_id.clone())).collect::<Vec<_>>(), vec![Some(node_id.clone()), None]);
+    // fetched, carried on from half of it here already
+    let part = dir.join("got/model.safetensors.part");
+    std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+    std::fs::write(&part, &weights[..1_000_000]).unwrap();
+    let seen = std::sync::Mutex::new(0u64);
+    let progress = |n: u64| *seen.lock().unwrap() = n;
+    let from = files::fetch(&primary, &sha, size, &part, &progress, &|| false).await.unwrap();
+    assert_eq!(from.as_deref(), Some("the worker-files"));
+    assert_eq!(std::fs::read(&part).unwrap(), weights, "the same bytes, the first million kept");
+    assert_eq!(*seen.lock().unwrap(), size);
+    // one it does not have: none fetched
+    assert_eq!(files::fetch(&primary, &other, size, &dir.join("none.part"), &|_| {}, &|| false).await.unwrap(), None);
+
+    // a computer not paired with it is refused, by its path or not
+    let stranger = tls::client(&super::identity::Identity::generate().unwrap(), Pin::Record(Default::default())).unwrap();
+    let address = worker.listening().unwrap();
+    let r = stranger.get(format!("https://{address}/worker/v1/models/blob/{sha}?size={size}")).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+    // its person stops sharing model files: refused, and not said to have it
+    worker.set(Settings { share_models: Some(false), ..worker.settings() }).await.unwrap();
+    let peer = primary.inner().peers().get(&node_id, Role::Worker).cloned().unwrap();
+    primary::check(&primary, &peer).await;
+    assert_eq!(files::who_has(&primary, &[(sha.clone(), size)]).await, vec![None]);
     for n in [&worker, &primary] {
         n.stop();
     }
@@ -624,7 +700,7 @@ async fn a_worker_saved_again_listens_on_the_same_port() {
     let worker = node("worker-again", Role::Worker, None).await;
     let port = worker.listening().unwrap().port();
     for name in ["the worker renamed", "and again"] {
-        worker.set(Settings { enabled: true, uses: None, lends: None, agent: false, role: Role::Worker, name: name.into(), port, bind: "127.0.0.1".into() }).await.unwrap();
+        worker.set(Settings { enabled: true, uses: None, lends: None, agent: false, share_models: None, role: Role::Worker, name: name.into(), port, bind: "127.0.0.1".into() }).await.unwrap();
         assert_eq!(worker.listening().map(|a| a.port()), Some(port));
     }
     let stranger = tls::client(&super::identity::Identity::generate().unwrap(), Pin::Record(Default::default())).unwrap();
@@ -839,7 +915,7 @@ async fn off_nothing_listens_and_a_worker_is_never_reached_off_the_lan() {
     assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_address")), "{body}");
     // a worker binding a public address is refused too
     let worker = Network::open_with(&temp("bind"), ai(None), false);
-    let err = worker.set(Settings { enabled: true, uses: None, lends: None, agent: false, role: Role::Worker, name: String::new(), port: 0, bind: "8.8.8.8".into() }).await.unwrap_err();
+    let err = worker.set(Settings { enabled: true, uses: None, lends: None, agent: false, share_models: None, role: Role::Worker, name: String::new(), port: 0, bind: "8.8.8.8".into() }).await.unwrap_err();
     assert!(err.contains("not a local network address"), "{err}");
     primary.stop();
 }

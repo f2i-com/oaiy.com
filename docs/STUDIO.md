@@ -181,6 +181,11 @@ licence. **Recommended** picks one of each kind to start with.
   (the same file on one drive; a link to it on another). Every file downloaded
   is checked against that SHA-256 too, and deleted if it does not match. A
   file's SHA-256, once read, is kept beside the settings (`model-hashes.json`).
+- **From the network:** in OAIY's desktop, a file a paired computer has (OAIY
+  Network) is fetched from it over the LAN before Hugging Face is asked, and
+  checked the same way (docs/NETWORK.md, Model files over the LAN). The
+  engines find a file for such a computer by its SHA-256
+  (`POST /api/library/find {files: [{sha256, size}], check}`).
 - **What it needs:** **What it needs** on a card (and `POST /api/downloads/plan
   {id}`) says, before a download, which of its files are in place, on this
   computer elsewhere (and where), and to download, with the gigabytes of each;

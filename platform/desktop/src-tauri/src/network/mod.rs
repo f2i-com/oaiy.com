@@ -17,6 +17,7 @@ pub mod store;
 pub mod tls;
 
 mod discovery;
+pub(crate) mod files;
 pub mod machine;
 mod primary;
 mod worker;
@@ -302,6 +303,7 @@ impl Network {
             "uses": settings.uses(),
             "lends": settings.lends(),
             "agent": settings.agent,
+            "shareModels": settings.share_models != Some(false),
             "settings": settings,
             "nodeId": id.as_ref().map(|i| i.node_id.clone()),
             "name": self.display_name(),

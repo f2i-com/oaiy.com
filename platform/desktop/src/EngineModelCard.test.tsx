@@ -204,10 +204,12 @@ describe('the engine model card, with nothing chosen in Engines', () => {
       free: 400e9,
       hereBytes: 0,
       elsewhereBytes: 5.2e9,
+      networkBytes: 0.9e9,
       downloadBytes: 0.5e9,
       needs: [],
       files: [
         { path: 'Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf', size: 5.2e9, status: 'elsewhere', from: '/Volumes/T9/qwen/Qwen3.5-9B-Q4_K_M.gguf', checked: true },
+        { path: 'Qwen3.5-9B-GGUF/mmproj-F16.gguf', size: 0.9e9, status: 'network', from: 'Rig' },
         { path: 'Qwen3.5-9B-GGUF/mmproj.gguf', size: 0.5e9, status: 'download' },
       ],
     });
@@ -217,6 +219,8 @@ describe('the engine model card, with nothing chosen in Engines', () => {
     expect(plan.textContent).toContain('to download');
     expect(plan.textContent).toContain('on this computer already, used where it is');
     expect(plan.textContent).toContain('/Volumes/T9/qwen/Qwen3.5-9B-Q4_K_M.gguf');
+    expect(plan.textContent).toContain('from Rig over OAIY Network');
+    expect(plan.textContent).toContain('from Rig (OAIY Network)');
     expect(plan.textContent).toContain('is gated: accept its licence on huggingface.co, then add a Hugging Face token in Settings');
     expect(button(/^Download \(/)!.textContent).toContain('476.8 MiB');
   });

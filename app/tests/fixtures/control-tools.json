@@ -115,7 +115,7 @@
     "readOnlyHint": true,
     "title": "What a model download takes"
    },
-   "description": "What getting a catalog model takes, before it is got (catalogId from models_list): each of its files (weights, text encoder, VAE…) here already, on this computer elsewhere (another model's, another drive's: used where it is, never downloaded twice; checked by its SHA-256 when it is got), or to download, the gigabytes to download, the free space, the models it needs first, and whether it is gated (its licence accepted on huggingface.co and a Hugging Face token in Settings first).",
+   "description": "What getting a catalog model takes, before it is got (catalogId from models_list): each of its files (weights, text encoder, VAE…) here already, on this computer elsewhere (another model's, another drive's: used where it is, never downloaded twice; checked by its SHA-256 when it is got), on a paired computer (OAIY Network: fetched from it over the LAN), or to download, the gigabytes to download, the free space, the models it needs first, and whether it is gated (its licence accepted on huggingface.co and a Hugging Face token in Settings first).",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
@@ -140,7 +140,7 @@
     "readOnlyHint": false,
     "title": "Download a model"
    },
-   "description": "Start getting a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list): every part it needs (its weights, text encoder, VAE), the files this computer has already used where they are rather than downloaded again, each download checked by its SHA-256; it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: model_download_plan says what is left to fetch; check memory need first.",
+   "description": "Start getting a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list): every part it needs (its weights, text encoder, VAE), the files this computer has already used where they are rather than downloaded again, those a paired computer has (OAIY Network) fetched from it over the LAN, each file checked by its SHA-256; it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: model_download_plan says what is left to fetch; check memory need first.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
@@ -306,6 +306,10 @@
       "maxLength": 80,
       "minLength": 1,
       "type": "string"
+     },
+     "shareModels": {
+      "description": "Lending itself, lend its model files too (by their SHA-256), so a computer using this one fetches them over the LAN rather than downloading them again (on unless switched off).",
+      "type": "boolean"
      },
      "uses": {
       "description": "This computer uses other computers.",

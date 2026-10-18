@@ -77,6 +77,15 @@ pub(crate) async fn engines_get(net: &super::Network, path: &str) -> Value {
     r.json::<Value>().await.unwrap_or(Value::Null)
 }
 
+/// What this computer's engines' control page answers `body` posted to `path` with, within `wait` (`Null` where they
+/// do not answer).
+pub(crate) async fn engines_post(net: &super::Network, path: &str, body: &Value, wait: Duration) -> Value {
+    let Some(ui) = crate::ai::engine_services::local_engines_ui(&net.inner().ai) else { return Value::Null };
+    let Ok(client) = reqwest::Client::builder().timeout(wait).build() else { return Value::Null };
+    let Ok(r) = client.post(format!("{}{path}", ui.trim_end_matches('/'))).json(body).send().await else { return Value::Null };
+    r.json::<Value>().await.unwrap_or(Value::Null)
+}
+
 /// In a line, what a computer has, as it says it on the LAN before it is paired (to choose which to pair with):
 /// its GPUs and their memory, its memory, its cores, e.g. `RTX 4090 (24 GB VRAM) · 64 GB RAM · 32 cores`. Its GPUs
 /// are its engines' system reading's and those their resources name besides (an eGPU's card, by its plugin).

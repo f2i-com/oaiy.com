@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Check, CircleDashed, Cpu, Download, ExternalLink, FolderSearch, Loader2, Mic, Play, RotateCcw, SkipForward, TriangleAlert } from 'lucide-react';
+import { Check, CircleDashed, Cpu, Download, ExternalLink, FolderSearch, Loader2, Mic, Network, Play, RotateCcw, SkipForward, TriangleAlert } from 'lucide-react';
 import ChatGptConnector from './ChatGptConnector';
 import {
   engines,
@@ -383,6 +383,7 @@ export function DownloadProgress({ name, dl }: { name: string; dl: EngineDownloa
         {dl.speed ? ` · ${formatSpeed(dl.speed)}` : ''}
         {dl.filesTotal && dl.filesTotal > 1 ? ` · file ${Math.min((dl.filesDone ?? 0) + 1, dl.filesTotal)} of ${dl.filesTotal}` : ''}
         {dl.reused ? ` · ${formatBytes(dl.reused)} found on this computer` : ''}
+        {dl.lan ? ` · ${formatBytes(dl.lan)} from ${(dl.lanFrom ?? []).join(', ') || 'a paired computer'}` : ''}
       </small>
       {/* (looking for its files on this computer, or checking one: said, as it takes a while for a large file) */}
       {dl.file && /^(checking|looking)/.test(dl.file) && <small className="form-hint">{dl.file[0].toUpperCase() + dl.file.slice(1)}…</small>}
@@ -407,6 +408,11 @@ export function DownloadPlan({ plan }: { plan: EnginePlan }) {
             <Check size={12} aria-hidden /> {formatBytes(plan.elsewhereBytes)} on this computer already, used where it is
           </span>
         )}
+        {(plan.networkBytes ?? 0) > 0 && (
+          <span className="download-plan-have">
+            <Network size={12} aria-hidden /> {formatBytes(plan.networkBytes)} from {[...new Set(plan.files.filter((f) => f.status === 'network').map((f) => f.from))].join(', ')} over OAIY Network
+          </span>
+        )}
         {plan.hereBytes > 0 && <span className="download-plan-have">{formatBytes(plan.hereBytes)} in place</span>}
       </span>
       {plan.gated && !plan.token && (
@@ -428,7 +434,13 @@ export function DownloadPlan({ plan }: { plan: EnginePlan }) {
                 <code>{short(f.path)}</code>
                 <span>{f.size ? formatBytes(f.size) : ''}</span>
                 <span className="download-plan-status">
-                  {f.status === 'download' ? 'to download' : f.status === 'here' ? 'in place' : `on this computer${f.from ? `: ${f.from}` : ''}`}
+                  {f.status === 'download'
+                    ? 'to download'
+                    : f.status === 'here'
+                      ? 'in place'
+                      : f.status === 'network'
+                        ? `from ${f.from ?? 'a paired computer'} (OAIY Network)`
+                        : `on this computer${f.from ? `: ${f.from}` : ''}`}
                 </span>
               </li>
             ))}
@@ -630,7 +642,9 @@ export function EngineModelCard({
         {dl?.status === 'failed' && dl.error && <p className="card-warn">{dl.error}</p>}
         {offer.installed && (
           <p className="form-hint">
-            Downloaded{dl?.reused ? `: ${formatBytes(dl.reused)} of it was on this computer already, used where it is` : ''}. Choose it in Engines to use it.
+            Downloaded
+            {dl?.reused ? `: ${formatBytes(dl.reused)} of it was on this computer already, used where it is` : ''}
+            {dl?.lan ? `${dl?.reused ? ',' : ':'} ${formatBytes(dl.lan)} came from ${(dl.lanFrom ?? []).join(', ')} over OAIY Network` : ''}. Choose it in Engines to use it.
           </p>
         )}
         {dl?.status === 'done' && (dl.added ?? []).filter((a) => a.includes('(needs ')).map((a) => (

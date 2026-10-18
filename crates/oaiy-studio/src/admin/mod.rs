@@ -244,6 +244,23 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             let token = Some(str_or(&b, "hf_token", "").trim().to_string()).filter(|t| !t.is_empty());
             studio.downloads.start(studio, str_or(&b, "id", ""), dir, token).map_err(|e| (400, e))
         }),
+        // Where this computer keeps model files, by their SHA-256 (for another OAIY computer on the network that wants
+        // one: its desktop serves the file, never its path).
+        ("POST", "/api/library/find") => body(req).map_err(|e| (400, e)).map(|b| {
+            let files: Vec<(String, u64)> = b
+                .get("files")
+                .and_then(Json::as_array)
+                .unwrap_or(&[])
+                .iter()
+                .take(256)
+                .filter_map(|f| {
+                    let sha = str_or(f, "sha256", "").to_ascii_lowercase();
+                    let size = f.get("size").and_then(Json::as_i64).filter(|s| *s > 0)? as u64;
+                    (sha.len() == 64 && sha.bytes().all(|c| c.is_ascii_hexdigit())).then_some((sha, size))
+                })
+                .collect();
+            studio.downloads.find_files(studio, &files, b.get("check").and_then(Json::as_bool).unwrap_or(false))
+        }),
         // What getting a model takes: its files here already, on this computer elsewhere, or to download.
         ("POST", "/api/downloads/plan") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let token = Some(str_or(&b, "hf_token", "").trim().to_string()).filter(|t| !t.is_empty());

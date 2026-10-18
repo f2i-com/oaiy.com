@@ -191,6 +191,30 @@ The worker lends that service's speech routes alone (`/worker/v1/services/oaiy-v
 `/v1/audio/transcriptions`, `/v1/audio/speech`, streamed as it speaks), and no other service: one a person added
 could be anything.
 
+## Model files over the LAN
+
+A computer getting a model (Engines → Get models, Setup, the Agent's `model_download`) fetches each of its files
+that a computer it uses has from that computer, over the LAN, before Hugging Face is asked: one computer
+downloads a model, and the others on the network get it from there.
+
+- **By SHA-256, never a path:** each large file is named by the SHA-256 Hugging Face publishes for it. The computer
+  using another asks it which it has (`POST /worker/v1/models/have {files: [{sha256, size}]}`, answered from what
+  its engines know already), then fetches one (`GET /worker/v1/models/blob/:sha256?size=`, carried on from a partial
+  file with `Range`). The computer lending finds the file among its engines' model files (where downloads go, the
+  folders of the models in its settings, `downloads.library`: the engines' `POST /api/library/find`), reads its
+  SHA-256 before it sends it, and never says where it keeps it. A computer can only fetch a file whose SHA-256 it
+  knows already.
+- **Checked here too:** the file fetched is checked against its SHA-256 as a download is, and refused if it does
+  not match; a transfer stopped part-way carries on from Hugging Face (the same bytes) or from the network again.
+- **The engines ask the desktop:** the engines' downloads ask the desktop that runs them (`downloads::PeerFiles`),
+  which reaches the computers it uses over the paired, pinned mutual TLS. Engines the desktop does not run itself
+  (an `oaiy-server` attached to others) download from Hugging Face alone.
+- **What it needs says so:** a model's plan (Setup's card, Get models' *What it needs*, `model_download_plan`)
+  lists such files as from that computer (*0.3 GB from Rig over OAIY Network*), and a download says what came from
+  where (`lan`, `lan_from`).
+- **The person lending decides:** *Share its model files* (Networking, under Lend this computer; `shareModels`,
+  on while it lends) switches it off; computers not paired to use it are refused.
+
 ## Pinning
 
 A worker's model can be **pinned** from the primary's Networking page (*Pin* beside the model): it is loaded on the
@@ -222,7 +246,7 @@ restricted, as `/api/engines/` are):
 | Route | Scope | What |
 | --- | --- | --- |
 | `GET /api/network/status` | auth.read | On or off, the role, this computer's name, fingerprint and addresses |
-| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, agent, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before; `agent` alone, `defaults` or `services` restart nothing) |
+| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, agent, shareModels, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before; `agent`, `shareModels`, `defaults` or `services` alone restart nothing) |
 | `POST /api/network/discover` | auth.manage | The workers found on the LAN |
 | `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare |
 | `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it, or withdraws the request it has not answered) |

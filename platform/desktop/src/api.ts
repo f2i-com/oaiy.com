@@ -2038,6 +2038,9 @@ export interface EngineDownload {
   /** The bytes and files this computer had already, used where they are rather than downloaded. */
   reused?: number;
   reusedFiles?: number;
+  /** The bytes fetched from paired computers over the LAN (OAIY Network), and from which. */
+  lan?: number;
+  lanFrom?: string[];
 }
 
 /** What getting a catalog model takes, before it is got. */
@@ -2051,10 +2054,12 @@ export interface EnginePlan {
   hereBytes: number;
   /** On this computer already elsewhere (another model's, another drive's): used where it is. */
   elsewhereBytes: number;
+  /** On a paired computer (OAIY Network): fetched from it over the LAN. */
+  networkBytes?: number;
   downloadBytes: number;
   /** Catalog models it needs that are not here yet. */
   needs: string[];
-  files: Array<{ path: string; size?: number | null; status: 'here' | 'elsewhere' | 'download'; from?: string | null; checked?: boolean }>;
+  files: Array<{ path: string; size?: number | null; status: 'here' | 'elsewhere' | 'network' | 'download'; from?: string | null; checked?: boolean }>;
 }
 
 /** One model of the engines' catalog. */
@@ -2135,6 +2140,8 @@ export interface NetworkSettings {
   lends?: boolean;
   /** The person lets the Agent set up OAIY Network here; computers that both have it on pair by themselves. */
   agent?: boolean;
+  /** Lending itself, it lends its model files too (on unless switched off). */
+  shareModels?: boolean;
   /** The name other computers show for this one (the computer's own where empty). */
   name: string;
   /** The port a worker listens on. */
@@ -2153,6 +2160,8 @@ export interface NetworkStatus {
   lends: boolean;
   /** The person lets the Agent set up OAIY Network here (see NetworkSettings). */
   agent?: boolean;
+  /** Lending itself, it lends its model files too. */
+  shareModels?: boolean;
   settings: NetworkSettings;
   nodeId: string | null;
   name: string;
