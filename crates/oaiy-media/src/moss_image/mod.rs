@@ -562,16 +562,18 @@ mod tests {
         std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
         let gguf = dir.join("qwen.gguf");
         std::fs::write(&gguf, "GGUF").unwrap();
-        let f = fixture.to_string_lossy().into_owned();
-        let body = |encoder: &str, more: &str| Json::parse(format!(r#"{{"architecture":"moss-image","transformer":"{f}","vae":"{f}","text_encoder":"{encoder}","prompt":"a fox","output_dir":"{}"{more}}}"#, dir.join("out").display()).as_bytes()).unwrap();
-        let folder = dir.to_string_lossy().into_owned();
+        // (a path in a JSON string: a Windows one's backslashes escaped)
+        let js = |p: &std::path::Path| p.to_string_lossy().replace('\\', "\\\\");
+        let f = js(&fixture);
+        let body = |encoder: &str, more: &str| Json::parse(format!(r#"{{"architecture":"moss-image","transformer":"{f}","vae":"{f}","text_encoder":"{encoder}","prompt":"a fox","output_dir":"{}"{more}}}"#, js(&dir.join("out"))).as_bytes()).unwrap();
+        let folder = js(&dir);
         let r = Request::parse(&body(&folder, "")).unwrap();
         assert_eq!((r.tokenizer.clone(), r.width, r.height, r.steps, r.guidance, r.shift, r.skip_layers.clone(), r.negative_prompt.clone()), (Some(dir.join("tokenizer.json")), 1024, 1024, 50, 3., 5., vec![22], String::new()));
         let r = Request::parse(&body(&folder, r#","width":1184,"height":1776,"steps":30,"cfg":5,"shift":6,"uncond_skip_layers":[],"negative_prompt":"blur""#)).unwrap();
         assert_eq!((r.width, r.height, r.steps, r.guidance, r.shift, r.skip_layers.len(), r.negative_prompt.as_str()), (1184, 1776, 30, 5., 6., 0, "blur"));
         // (a GGUF's own tokenizer where none is beside it)
         std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
-        assert_eq!(Request::parse(&body(&gguf.to_string_lossy(), "")).unwrap().tokenizer, None);
+        assert_eq!(Request::parse(&body(&js(&gguf), "")).unwrap().tokenizer, None);
         assert!(Request::parse(&body(&folder, "")).is_err());
         std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
         for bad in [

@@ -131,8 +131,9 @@ fn statistics(luid: LUID, kind: D3DKMT_QUERYSTATISTICS_TYPE, index: u32) -> Opti
         query.Anonymous.QuerySegment = D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT { SegmentId: index };
     }
     // SAFETY: `query` is a live struct of the type the call takes, zeroed but for its type, adapter and index (its
-    // process handle null: the adapter's own statistics, not a process's); the call writes its QueryResult.
-    (unsafe { D3DKMTQueryStatistics(&query) } == 0).then_some(query.QueryResult)
+    // process handle null: the adapter's own statistics, not a process's); the call writes its QueryResult, so the
+    // pointer is made from the mutable place (the binding declares it *const; one from `&query` may not be written).
+    (unsafe { D3DKMTQueryStatistics(std::ptr::addr_of_mut!(query).cast_const()) } == 0).then_some(query.QueryResult)
 }
 
 /// The adapter's engines and memory segments.

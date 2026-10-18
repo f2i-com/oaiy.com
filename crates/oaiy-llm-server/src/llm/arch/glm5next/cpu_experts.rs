@@ -145,7 +145,10 @@ impl CpuExperts {
 ///
 /// The record is the three regions end to end, each padded to the model-wide
 /// maximum for that part, which is how `GgufExpertStore` lays it out.
-pub fn ffn(
+///
+/// `avx512` must be the CPU's own answer (`ggml_quants::q4_k::has_avx512`, as [`CpuExperts`] holds it): the dot
+/// products run AVX-512 on it alone, so the function is the crate's, not a caller's elsewhere to pass `true` to.
+pub(crate) fn ffn(
     record: &[u8],
     layout: &ExpertLayout,
     layer: usize,

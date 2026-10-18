@@ -428,7 +428,12 @@ impl WgpuFlux3 {
             kk: self.vec(most * d),
             all_q: self.vec(all * d),
             kv: self.vec(all * 2 * d),
-            att: self.vec(self.gpu.attention_rows_full_out_len(all, self.cfg.heads, self.cfg.head_dim, all)),
+            // (the shared blocks' attention of all the rows, and each kind's of its own in the early blocks: a kind of
+            // few rows (a short prompt's text, under 16) takes the runs' kernel, whose scratch can be longer than the
+            // output alone that all the rows' takes on the tensor cores)
+            att: self.vec(
+                sizes.iter().filter(|&&n| n > 0).map(|&n| self.gpu.attention_rows_full_out_len(n, self.cfg.heads, self.cfg.head_dim, n)).fold(self.gpu.attention_rows_full_out_len(all, self.cfg.heads, self.cfg.head_dim, all), usize::max),
+            ),
             part: self.vec(most * d),
             o: self.vec(most * d),
             fused: self.vec(most * 2 * mlp),

@@ -443,9 +443,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oaiy-flux3-request-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        // (a path in a JSON string: a Windows one's backslashes escaped)
+        let js = |p: &std::path::Path| p.to_string_lossy().replace('\\', "\\\\");
         let body = |more: &str| {
-            let f = fixture.to_string_lossy();
-            Json::parse(format!(r#"{{"architecture":"flux3-klein","transformer":"{f}","vae":"{f}","text_encoder":"{}","prompt":"a fox","output_dir":"{}"{more}}}"#, dir.display(), dir.join("out").display()).as_bytes()).unwrap()
+            let f = js(&fixture);
+            Json::parse(format!(r#"{{"architecture":"flux3-klein","transformer":"{f}","vae":"{f}","text_encoder":"{}","prompt":"a fox","output_dir":"{}"{more}}}"#, js(&dir), js(&dir.join("out"))).as_bytes()).unwrap()
         };
         let r = Request::parse(&body("")).unwrap();
         assert_eq!((r.tokenizer.clone(), r.size, r.steps, r.guidance, r.references.len()), (dir.join("tokenizer.json"), None, None, None, 0));
@@ -453,10 +455,10 @@ mod tests {
         // a GGUF of the text encoder: the tokenizer beside it
         let gguf = dir.join("encoder-Q4_K_M.gguf");
         std::fs::write(&gguf, b"GGUF").unwrap();
-        let f = fixture.to_string_lossy();
-        let one = Json::parse(format!(r#"{{"architecture":"flux3-klein","transformer":"{f}","vae":"{f}","text_encoder":"{}","prompt":"a fox","output_dir":"{}"}}"#, gguf.display(), dir.join("out").display()).as_bytes()).unwrap();
+        let f = js(&fixture);
+        let one = Json::parse(format!(r#"{{"architecture":"flux3-klein","transformer":"{f}","vae":"{f}","text_encoder":"{}","prompt":"a fox","output_dir":"{}"}}"#, js(&gguf), js(&dir.join("out"))).as_bytes()).unwrap();
         assert_eq!(Request::parse(&one).unwrap().tokenizer, dir.join("tokenizer.json"));
-        let image = fixture.to_string_lossy().into_owned();
+        let image = js(&fixture);
         let images = |n: usize| format!(r#","images":[{}]"#, vec![format!("\"{image}\""); n].join(","));
         assert_eq!(Request::parse(&body(&images(10))).unwrap().references.len(), 10);
         let loras = |list: &str| format!(r#","loras":[{list}]"#);

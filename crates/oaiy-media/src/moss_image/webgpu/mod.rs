@@ -705,8 +705,13 @@ mod tests {
         let prompt = gpu.prompt(&text, text.len() / 48)?;
         let got = gpu.predict(&latent, size[0] as usize, size[1] as usize, time[0], &prompt, &[])?;
         std::fs::remove_file(&file).ok();
+        // (the bound `a_tiny_transformer_on_webgpu_is_openmosss` holds the separate matrices to: an absolute 1e-3 was
+        // under what an RTX 5090's f16 tensor cores give, 6.3e-3 of an RMS of some 1)
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let cosine = got.iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() / (norm(&got) * norm(&want));
+        let rms = norm(&want) / (want.len() as f64).sqrt();
         let worst = got.iter().zip(&want).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0., f64::max);
-        assert!(worst < 1e-3, "{worst}");
+        assert!(cosine > 0.9999 && worst < 0.01 * rms, "cosine {cosine}, worst {worst} of {rms}");
         Ok(())
     }
 

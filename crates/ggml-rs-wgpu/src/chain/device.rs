@@ -292,8 +292,10 @@ impl DeviceChain for WgpuBackend {
     }
 
     fn attention_rows_out_len(&self, rows: usize, n_h: usize, head_dim: usize, kv_len: usize) -> usize {
-        // (one pass, tiled, or on the tensor cores, their rows padded to 32: the output alone; else its runs' parts)
-        let padded = rows.div_ceil(32) * 32 * n_h * head_dim;
+        // (one pass, tiled, or on the tensor cores, their rows padded to 64: the output alone; else its runs' parts. The
+        // grouped kernel stores its workgroups' rows whole, 64 / g of them a workgroup, so 64 where each query head has a
+        // KV head of its own: the speech codec's 325 rows were stored as 384 into room for 352)
+        let padded = rows.div_ceil(64) * 64 * n_h * head_dim;
         if attention_tiled_for(rows, head_dim) {
             padded
         } else {
