@@ -813,18 +813,6 @@
 .voice-pick strong { color: var(--text); font-size: 13px; font-weight: 620; }
 .voice-pick small { color: var(--faint); font-size: 11.5px; }
 .voice-list > li.is-chosen .voice-pick small { color: var(--primary); }
-.voice-greeting { display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 14px; }
-.voice-greeting-edit { display: flex; gap: 8px; align-items: center; }
-.voice-greeting-edit input { flex: 1; min-width: 0; }
-.voice-greeting .btn-link { text-align: left; }
-.voice-greeting-said { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 0; }
-.voice-greeting-said dt { padding-top: 1px; color: var(--muted); font-size: 12px; }
-.voice-greeting-said dd { margin: 0; color: var(--text); font-size: 13px; line-height: 1.45; }
-.voice-greeting-said small { display: block; color: var(--faint); font-size: 11.5px; }
-@media (max-width: 720px) {
-  .voice-greeting-said { grid-template-columns: minmax(0, 1fr); gap: 2px; }
-  .voice-greeting-said dd + dt { margin-top: 6px; }
-}
 .voice-add {
   display: grid;
   align-items: end;

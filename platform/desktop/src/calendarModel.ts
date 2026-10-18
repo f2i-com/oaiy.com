@@ -332,56 +332,8 @@ export const receptionistName = (s: Pick<CalendarSettings, 'receptionist'>) => s
  * means this one, never silence.
  */
 export const DEFAULT_GREETING = 'Hello, thanks for calling. How can I help you today?';
-/** The longest greeting the phone keeps, in characters (Aokie's limit). */
-export const GREETING_MAX = 1000;
-
 /** The greeting callers hear: the one set on the phone, or Aokie's own when none is. */
 export const greetingOf = (set: string | null | undefined): string => (set?.trim() ? set.trim() : DEFAULT_GREETING);
-
-/** A greeting that names the business and the receptionist, to start from: "Hello, thanks for calling Green Lawns, this is Aokie. How can I help you today?" */
-export function suggestGreeting(s: Pick<CalendarSettings, 'business' | 'receptionist'>): string {
-  const business = s.business?.trim();
-  return `Hello, thanks for calling${business ? ` ${business}` : ''}, this is ${receptionistName(s)}. How can I help you today?`;
-}
-
-/** A letter or a digit, in any language. */
-const WORD = /[\p{L}\p{N}]/u;
-
-/** The first word of a name, without the punctuation around it. */
-function firstName(name: string): string {
-  return (name.trim().split(/\s+/)[0] ?? '').replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
-}
-
-/** Whether `text` has `word` in it as a whole word, in any case. */
-const hasWord = (text: string, word: string) => text.split(/[^\p{L}\p{N}]+/u).some((w) => w.toLowerCase() === word.toLowerCase());
-
-/** `text` without a leading `word` (in any case) when it starts with it as a whole word: [the word as written, the rest]. */
-function stripWord(text: string, word: string): [string, string] | null {
-  const head = text.slice(0, word.length);
-  const rest = text.slice(word.length);
-  return head.toLowerCase() === word.toLowerCase() && !WORD.test(rest.charAt(0)) ? [head, rest] : null;
-}
-
-/**
- * The greeting said to a caller the desktop knows (a name in Contacts, or one their phone gives), by first name: kept
- * as it is when it has the name, the name put after a "Hi" or "Hello" it starts with, or else "Hi Sam! " before it.
- * The desktop's own rule (`voice::callers::personal_greeting`, which greets the call): the two are kept in step.
- */
-export function personalGreeting(greeting: string, name: string): string {
-  const first = firstName(name);
-  if (!first || !greeting.trim() || hasWord(greeting, first)) return greeting;
-  const text = greeting.trimStart();
-  for (const hello of ['hi', 'hello', 'hey', "g'day", 'g\u2019day']) {
-    const found = stripWord(text, hello);
-    if (found) {
-      const [head, rest] = found;
-      // "Hi there!" is "Hi Sam!", not "Hi Sam there!".
-      const there = rest.startsWith(' ') ? stripWord(rest.slice(1), 'there') : null;
-      return `${head} ${first}${there ? there[1] : rest}`;
-    }
-  }
-  return `Hi ${first}! ${text}`;
-}
 
 // ---- checks ------------------------------------------------------------------------
 

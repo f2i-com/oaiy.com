@@ -50,7 +50,7 @@ async function mount() {
   await act(async () =>
     root.render(
       <ToastProvider>
-        <CallVoice business="Green Lawns" />
+        <CallVoice />
       </ToastProvider>,
     ),
   );
@@ -180,106 +180,61 @@ describe('Greet after the call connects', () => {
   });
 });
 
-// What callers hear first is the phone's own `greeting` setting (Aokie's), read from it and saved to it through its
-// connector: the page showed a greeting of its own, and "Hear it" played a third, while the phone said Aokie's.
-describe('the greeting', () => {
-  /** The phone module, provided by Aokie through its connector `aokie`. */
+// "Hear it" says what callers hear first: the phone's own `greeting` setting (Aokie's, set in the Phone section under
+// Settings, Greeting & brief), read through its connector; Aokie's own when it has none or cannot be asked. The page
+// once said a greeting of its own and "Hear it" a third, while the phone said Aokie's.
+describe('the greeting a voice says', () => {
   const phone = () => ({
     body: { revision: 1, modules: [{ id: 'phone', name: 'Phone', enabled: true, builtin: true, provider: { pluginId: 'aokie', name: 'Aokie', state: 'running', connector: 'aokie', declared: true } }], contributions: {}, warnings: [] },
   });
-  let phoneGreeting: string | undefined;
-  const sent = () => calls('POST', '/api/bridge/connectors/aokie/request').map(([, init]) => JSON.parse(String(init?.body)));
+  let answer: () => Answer;
   beforeEach(() => {
-    phoneGreeting = undefined;
+    answer = () => ({ body: { ok: true, result: { ok: true, data: { settings: { greeting: 'Green Lawns, Aokie speaking.' } } } } });
     routes['GET /api/modules'] = phone;
-    routes['POST /api/bridge/connectors/aokie/request'] = (init) => {
-      const { command, payload } = JSON.parse(String(init?.body));
-      if (command === 'settings.get') return { body: { ok: true, result: { ok: true, data: { settings: phoneGreeting === undefined ? {} : { greeting: phoneGreeting } } } } };
-      if (command === 'settings.set') {
-        phoneGreeting = payload.greeting;
-        return { body: { ok: true, result: { ok: true, data: { appliesAtReconnect: [] } } } };
-      }
-      return { status: 400, body: { error: 'no such command' } };
-    };
-  });
-  async function mountWith(business = 'Green Lawns', receptionist = '') {
-    await act(async () =>
-      root.render(
-        <ToastProvider>
-          <CallVoice business={business} receptionist={receptionist} />
-        </ToastProvider>,
-      ),
-    );
-    for (let i = 0; i < 4; i++) await act(async () => {});
-  }
-  const box = () => host.querySelector<HTMLInputElement>('#call-greeting')!;
-  const said = () => [...host.querySelectorAll('.voice-greeting-said dd')].map((d) => d.textContent);
-  const button = (label: string) => [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === label);
-
-  it('says Aokie’s own greeting while the phone has none set, and how a caller it knows is greeted', async () => {
-    await mountWith();
-    expect(sent()[0]).toMatchObject({ command: 'settings.get' });
-    expect(box().value).toBe('');
-    expect(box().placeholder).toBe('Hello, thanks for calling. How can I help you today?');
-    expect(said()[0]).toContain('“Hello, thanks for calling. How can I help you today?”');
-    expect(said()[1]).toContain('“Hello Sam, thanks for calling. How can I help you today?”');
-  });
-
-  it('says the phone’s greeting, and saves a new one to the phone', async () => {
-    phoneGreeting = 'Green Lawns, Aokie speaking.';
-    await mountWith();
-    expect(box().value).toBe('Green Lawns, Aokie speaking.');
-    expect(said()[1]).toContain('“Hi Sam! Green Lawns, Aokie speaking.”');
-    expect(button('Save')!.disabled).toBe(true);
-    await act(async () => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(box(), 'Hi there, Green Lawns here.');
-      box().dispatchEvent(new Event('input', { bubbles: true }));
-    });
-    // Said as it is written, before it is saved.
-    expect(said()[1]).toContain('“Hi Sam, Green Lawns here.”');
-    await act(async () => button('Save')!.click());
-    await act(async () => {});
-    expect(sent().at(-1)).toMatchObject({ command: 'settings.set', payload: { greeting: 'Hi there, Green Lawns here.' } });
-    expect(phoneGreeting).toBe('Hi there, Green Lawns here.');
-    expect(text()).toContain('Greeting saved');
-  });
-
-  it('offers a greeting with the business’s name while the one set does not say it', async () => {
-    await mountWith('Green Lawns', 'Sam');
-    const offer = [...host.querySelectorAll('button')].find((b) => b.textContent?.startsWith('use “'))!;
-    expect(offer.textContent).toBe('use “Hello, thanks for calling Green Lawns, this is Sam. How can I help you today?”');
-    // (the receptionist is Sam: the caller it knows is someone else)
-    expect(said()[1]).toContain('“Hello Alex, thanks for calling. How can I help you today?”');
-    await act(async () => offer.click());
-    expect(box().value).toBe('Hello, thanks for calling Green Lawns, this is Sam. How can I help you today?');
-    expect([...host.querySelectorAll('button')].some((b) => b.textContent?.startsWith('use “'))).toBe(false);
-  });
-
-  it('says so when the phone cannot be asked, and shows Aokie’s own', async () => {
-    routes['POST /api/bridge/connectors/aokie/request'] = () => ({ body: { ok: true, result: { ok: false, error: { message: 'the plugin is stopped' } } } });
-    await mountWith();
-    expect(text()).toContain('The phone’s greeting could not be read: the plugin is stopped');
-    expect(box().disabled).toBe(true);
-    expect(said()[0]).toContain('“Hello, thanks for calling. How can I help you today?”');
-  });
-
-  it('“Hear it” says the greeting as it reads in the box', async () => {
-    phoneGreeting = 'Green Lawns, Aokie speaking.';
+    routes['POST /api/bridge/connectors/aokie/request'] = () => answer();
     routes['POST /api/voice/voices/Front%20desk/try'] = () => ({ body: {} });
     // jsdom plays nothing: the sample is taken as played.
     vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, 'pause').mockReturnValue(undefined);
-    await mountWith();
-    const hear = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Hear it'))!;
-    await act(async () => hear.click());
-    const tried = fetchMock.mock.calls.filter(([url, init]) => init?.method === 'POST' && String(url).endsWith('/try'));
-    expect(tried).toHaveLength(1);
-    expect(JSON.parse(String(tried[0][1]?.body))).toEqual({ text: 'Green Lawns, Aokie speaking.' });
-    expect(text()).not.toContain('Could not speak');
+  });
+  afterEach(() => {
     // Closed (it stops the sample) while jsdom's player is still stood in for.
     act(() => root.unmount());
     root = createRoot(host);
     vi.restoreAllMocks();
+  });
+  async function heard() {
+    await act(async () =>
+      root.render(
+        <ToastProvider>
+          <CallVoice />
+        </ToastProvider>,
+      ),
+    );
+    for (let i = 0; i < 4; i++) await act(async () => {});
+    const hear = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Hear it'))!;
+    await act(async () => hear.click());
+    const tried = fetchMock.mock.calls.filter(([url, init]) => init?.method === 'POST' && String(url).endsWith('/try'));
+    expect(tried).toHaveLength(1);
+    expect(text()).not.toContain('Could not speak');
+    return JSON.parse(String(tried[0][1]?.body)).text;
+  }
+
+  it('is the phone’s greeting, and the page says where it is set', async () => {
+    expect(await heard()).toBe('Green Lawns, Aokie speaking.');
+    expect(text()).toContain('set in the Phone section under Settings, Greeting & brief');
+    // (no greeting box here: one place sets it)
+    expect(host.querySelector('#call-greeting')).toBeNull();
+  });
+
+  it('is Aokie’s own while the phone has none set, or cannot be asked', async () => {
+    answer = () => ({ body: { ok: true, result: { ok: true, data: { settings: {} } } } });
+    expect(await heard()).toBe('Hello, thanks for calling. How can I help you today?');
+    act(() => root.unmount());
+    root = createRoot(host);
+    fetchMock.mockClear();
+    answer = () => ({ body: { ok: true, result: { ok: false, error: { message: 'the plugin is stopped' } } } });
+    expect(await heard()).toBe('Hello, thanks for calling. How can I help you today?');
   });
 });
 
