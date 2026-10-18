@@ -973,7 +973,7 @@ export default function App() {
             {view === 'engine-workers' && <EngineWorkersPanel onOpenNetworking={() => setView('network')} />}
             {view === 'flow-workers' && <FlowWorkersPanel onOpenNetworking={() => setView('network')} />}
             {view === 'plugins' && <PluginsPanel />}
-            {view === 'runs' && <RunsPanel />}
+            {view === 'runs' && <RunsPanel onOpenEditor={() => setView('flows')} />}
             {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}
             {view === 'hours' && <HoursPanel onOpenCalendar={() => setView('calendar')} />}
             {view === 'contacts' && <ContactsPanel open={contactToOpen} onOpened={() => setContactToOpen(null)} />}

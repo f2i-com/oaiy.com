@@ -163,6 +163,34 @@ describe('DeadLetters', () => {
     confirm.mockRestore();
   });
 
+  it('does not put a redriven entry back when a list asked before the redrive is answered after it', async () => {
+    let late: (v: unknown) => void = () => {};
+    vi.useFakeTimers();
+    try {
+      await mount();
+      // The next poll goes out, and is slow; the redrive and its own read answer first.
+      listMock.mockReturnValueOnce(new Promise((r) => (late = r)));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6100);
+      });
+      listMock.mockResolvedValue({ deadLetters: [GUARDED], total: 1 });
+      await click(button('Redrive'));
+      expect(text()).not.toContain('queue was full');
+      await act(async () => late({ deadLetters: [SHED, GUARDED], total: 2 }));
+      expect(text()).not.toContain('queue was full');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows the event as it arrived, to copy, when an entry is opened', async () => {
+    await mount();
+    expect(text()).not.toContain('The event as it arrived');
+    await click(host.querySelector('.run-head')!);
+    expect(text()).toContain('The event as it arrived');
+    expect(text()).toContain('dl_1');
+  });
+
   it('says a dismiss that failed, and keeps the last redrive said after its entry, the last, has gone', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     dismissMock.mockRejectedValue(new Error('bridge is down'));

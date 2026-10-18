@@ -999,8 +999,18 @@ export interface RunRecord {
   callerProduct: string;
   flowId?: string;
   correlationId: string;
+  idempotencyKey?: string;
+  /** The flow's named inputs, as it was asked. */
+  input?: Record<string, unknown> | null;
+  /** Its time limit (ms); none is the worker's own (two minutes). */
+  timeoutMs?: number;
   mode: string;
+  /** Asked to stop while it runs: it stays `running` until the runner notices. */
+  cancelRequested?: boolean;
   runtime?: string;
+  claimedBy?: string;
+  /** The runner's report: `output.output` is the flow's own answer, `output.results` each step's. */
+  output?: unknown;
   error?: {
     code: string;
     message: string;
@@ -1012,7 +1022,24 @@ export interface RunRecord {
   reservedAt: string;
   startedAt?: string;
   finishedAt?: string;
+  /** The run (and the first of its tree) that started this one, through a trigger's binding. */
+  lineage?: { rootRunId?: string | null; parentRunId?: string | null; bindingId?: string | null; depth?: number };
   triggerEvent?: string;
+}
+
+/** A stored flow, by its id and name (`GET /api/bridge/flows`). */
+export interface FlowName {
+  flowId: string;
+  name: string;
+}
+
+/** A key no other request has, for a run asked for from here. */
+function freshKey(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  }
 }
 
 export interface RunHistory {
@@ -1049,6 +1076,35 @@ export const bridge = {
    *  to delete a record for work still in flight. Returns how many went. */
   clearRuns: () =>
     request<{ cleared: number; total: number }>('/api/bridge/runs', { method: 'DELETE' }),
+  /** One run, as it is now. */
+  run: (runId: string) => request<RunRecord>(`/api/bridge/runs/${encodeURIComponent(runId)}`),
+  /** Stop a run: a queued one is cancelled at once (`cancelled`); a running one is asked to stop and stays
+   *  `running` (`cancelRequested`) until its runner notices. */
+  cancelRun: (runId: string) =>
+    request<{ runId: string; status: RunStatus; cancelRequested?: boolean }>(
+      `/api/bridge/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: 'POST', body: '{}' },
+    ),
+  /** Run a stored flow again, here, as a new run (`async`: this desktop's worker runs it): the inputs and time limit
+   *  of the run it repeats. Its own key, so it is never taken for that run's retry. */
+  runAgain: (flowId: string, input: Record<string, unknown> | null | undefined, timeoutMs?: number) => {
+    const key = `oaiy-desktop:${flowId}:${freshKey()}`;
+    return request<RunRecord>('/api/bridge/runs', {
+      method: 'POST',
+      body: JSON.stringify({
+        protocol: 'oaiy-bridge/1',
+        caller: { product: 'oaiy-desktop', label: 'Run history' },
+        flowId,
+        input: input ?? {},
+        mode: 'async',
+        ...(timeoutMs ? { timeoutMs } : {}),
+        correlationId: key,
+        idempotencyKey: key,
+      }),
+    });
+  },
+  /** The flows stored on this desktop, each by its id and name. */
+  flows: () => request<{ flows: FlowName[] }>('/api/bridge/flows'),
   /** Invoke a connector command on a plugin, exactly as a flow would.
    *  `idempotencyKey` is required by the gateway for the plugin's journalled
    *  (physically side-effecting) commands, so callers should always pass one. */
@@ -2409,7 +2465,8 @@ export const network = {
   run: (nodeId: string, runId: string) => request<NetworkRun>(`/api/network/nodes/${encodeURIComponent(nodeId)}/runs/${encodeURIComponent(runId)}`),
   cancelRun: (nodeId: string, runId: string) =>
     request<unknown>(`/api/network/nodes/${encodeURIComponent(nodeId)}/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
-  /** A picture a worker made, by the address a run names it at (its path on this desktop), as a Blob to show. */
+  /** A picture a run names (a worker's, or this desktop's own), by its address, read at its path on this desktop (the
+   *  address may name the desktop's port when the run was made), as a Blob to show. */
   picture: async (address: string): Promise<Blob> => {
     const path = new URL(address, API_BASE).pathname;
     const resp = await fetch(`${API_BASE}${path}`);

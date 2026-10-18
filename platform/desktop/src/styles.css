@@ -1311,29 +1311,60 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .seg > button.active { background: var(--primary-soft); color: var(--primary); }
 .seg > button:focus-visible { outline-offset: -2px; }
 
-.run-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.run-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; overflow-anchor: none; }
 .run-row {
   position: relative;
   border: 1px solid var(--border);
   border-radius: var(--r-card);
   background: var(--surface-raised, var(--surface));
-  padding: 10px 12px;
+  transition: border-color 0.14s;
 }
-.run-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
-.run-flow { font-size: 13.5px; font-weight: 600; }
-.run-meta { color: var(--faint); font-size: 12px; }
-/* Pushed right so the eye can scan a time column down the list. */
-.run-when { margin-left: auto; color: var(--faint); font-family: var(--font-mono); font-size: 11px; }
-.run-error {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  margin: 7px 0 0;
-  color: var(--danger);
-  font-size: 12.5px;
-  line-height: 1.5;
+.run-row:hover,
+.run-row.is-open { border-color: var(--strong-border); }
+.run-row.run-running { border-color: color-mix(in srgb, var(--primary) 40%, var(--border)); }
+/* One line a run: the head (a button that opens the run) and, for one in progress, its Stop. */
+.run-line { display: flex; min-width: 0; align-items: center; gap: 6px; padding-right: 10px; }
+.run-head {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  grid-template-areas: 'state name who took when chevron';
+  grid-template-columns: 96px minmax(0, 1.5fr) minmax(0, 1fr) 64px 104px 14px;
+  align-items: center;
+  gap: 4px 12px;
+  border: 0;
+  border-radius: var(--r-card);
+  background: transparent;
+  color: inherit;
+  padding: 9px 4px 9px 12px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
-.run-error code { font-size: 11px; opacity: 0.85; }
+.run-head:focus-visible { outline-offset: -2px; }
+.run-head:hover .run-flow { color: var(--primary); }
+/* (as wide as its badge: a long one, an event's, takes room from the name, never lies over it) */
+.run-state { grid-area: state; display: flex; }
+.run-name { grid-area: name; display: flex; min-width: 0; align-items: baseline; gap: 8px; }
+/* (a long name keeps its room: the id beside it gives way first) */
+.run-flow { min-width: 0; flex: 0 1 auto; overflow: hidden; color: var(--text); font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; transition: color 0.14s; }
+.run-flow-id { min-width: 0; flex: 0 1000 auto; overflow: hidden; color: var(--faint); font-family: var(--font-mono); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.run-meta { grid-area: who; min-width: 0; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.run-took { grid-area: took; color: var(--faint); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+/* Right-aligned so the eye can scan a time column down the list. */
+.run-when { grid-area: when; color: var(--faint); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.run-chevron { grid-area: chevron; color: var(--faint); transition: transform 0.16s; }
+.run-row.is-open .run-chevron { transform: rotate(180deg); }
+.run-stop { flex: none; height: 26px; }
+/* An event that produced no work: its kind's badge can be long, and it has no "took". */
+.dead-head { grid-template-areas: 'state name who when chevron'; grid-template-columns: auto minmax(0, 1.5fr) minmax(0, 1fr) 104px 14px; }
+.run-line > .btn-tiny { flex: none; height: 26px; }
+
+.run-error { margin: -2px 12px 10px; color: var(--danger); font-size: 12.5px; line-height: 1.5; }
+.run-error > p { display: flex; align-items: flex-start; gap: 6px; margin: 0; }
+.run-error.is-quiet { color: var(--muted); }
+.run-error-code { display: inline-flex; flex: none; align-items: center; gap: 6px; min-height: 18px; }
+.run-error code { font-size: 10.5px; opacity: 0.85; }
 .run-error-text { min-width: 0; overflow-wrap: anywhere; }
 /* Three lines at most; "Show all" opens the rest. */
 .run-error-text.clamped {
@@ -1343,26 +1374,67 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   -webkit-line-clamp: 3;
   line-clamp: 3;
 }
-.run-more { margin-top: 8px; }
+/* A text's "Show all": a link's weight, under the text it opens. */
+.run-text-more {
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  padding: 2px 0 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.run-text-more:hover { text-decoration: underline; }
+.run-row > .run-held { margin: -4px 12px 10px; }
+
 /* The filter and the list's buttons, together at the title's right (and together on a line of their own when narrow). */
 .run-tools { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .run-tools .seg { margin-left: 0; }
-/* "Show all" and "Details" side by side. */
-.run-more + .run-more { margin-left: 6px; }
+.btn-tiny.btn-icon-tiny { width: 28px; padding: 0; }
+/* Search and the flow picker, under the title. */
+.run-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.run-search { position: relative; display: flex; min-width: 0; flex: 1 1 280px; align-items: center; }
+.run-search > svg { position: absolute; left: 10px; color: var(--faint); pointer-events: none; }
+.run-search input { height: 32px; padding: 0 30px 0 30px; }
+.run-search input::-webkit-search-cancel-button { display: none; }
+.run-search-clear {
+  position: absolute;
+  right: 5px;
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+}
+.run-search-clear:hover { background: var(--surface-soft); color: var(--text); }
+.run-flow-pick { width: auto; min-width: 0; max-width: 100%; flex: 0 1 240px; height: 32px; }
+.run-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.run-foot .form-hint { flex: 1 1 260px; }
+
+/* An open run: what to do with it, its facts, what it was asked with and what it answered. */
+.run-body { display: flex; flex-direction: column; gap: 12px; border-top: 1px solid var(--border); padding: 11px 12px 13px; }
+.run-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .run-detail {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
-  gap: 3px 14px;
-  margin: 10px 0 0;
-  border-top: 1px solid var(--border);
-  padding-top: 9px;
+  gap: 4px 16px;
+  margin: 0;
   font-size: 12px;
 }
 .run-detail dt { color: var(--faint); }
-.run-detail dd { margin: 0; min-width: 0; }
-.run-detail code { font-family: var(--font-mono); font-size: 11.5px; word-break: break-all; }
+.run-detail dd { margin: 0; min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
+.run-detail code { font-family: var(--font-mono); font-size: 11px; word-break: break-all; }
 .run-detail-text {
   margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--canvas);
+  padding: 9px 11px;
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--font-mono);
@@ -1370,6 +1442,71 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   color: var(--muted);
   max-height: 220px;
   overflow: auto;
+}
+.run-io { display: flex; flex-direction: column; gap: 7px; border-top: 1px solid var(--border); padding-top: 11px; }
+.run-io-title { margin: 0; color: var(--faint); font-size: 10.5px; font-weight: 680; letter-spacing: 0.08em; text-transform: uppercase; }
+.run-io .flow-run-answer { border-top: 0; padding-top: 0; }
+/* Named values: a run's inputs. */
+.run-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 16px; margin: 0; font-size: 12.5px; }
+.run-field { display: contents; }
+.run-field dt { color: var(--muted); font-weight: 600; }
+.run-field dd { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 6px; margin: 0; }
+.run-empty { color: var(--faint); font-style: italic; }
+.run-inline-json { max-width: 100%; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 11px; }
+.run-text { margin: 0; color: var(--text); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.run-text.clamped {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--lines, 6);
+  line-clamp: var(--lines, 6);
+}
+/* All of a value as JSON, folded away. */
+.run-json > summary { color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.run-json > summary:hover { color: var(--text); }
+.run-json[open] > summary { margin-bottom: 7px; }
+.run-json-body { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.run-json-body pre {
+  width: 100%;
+  max-height: 320px;
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--canvas);
+  color: var(--muted);
+  padding: 9px 11px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Narrow: a run's facts on two lines, its state and flow above, who, how long and when below. */
+@media (max-width: 760px) {
+  .run-head,
+  .dead-head {
+    grid-template-areas: 'state name name chevron' 'who who took when';
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+  }
+  /* (an event's kind can be a long badge: on a line of its own) */
+  .dead-head { grid-template-areas: 'state chevron' 'name name' 'who when'; grid-template-columns: minmax(0, 1fr) auto; }
+  .run-chevron { justify-self: end; }
+  .run-meta { white-space: normal; }
+  /* (the flow's id is in its details: the name has the room) */
+  .run-flow-id { display: none; }
+  /* A row's buttons (Stop, Redrive, Dismiss) under its head, not squeezing it. */
+  .run-line { flex-wrap: wrap; row-gap: 0; }
+  .run-line > .run-head { flex-basis: 100%; }
+  .run-line > .btn-tiny { margin-bottom: 9px; }
+  .run-head + .btn-tiny { margin-left: 12px; }
+  /* The filter on a line of its own, its three on one line. */
+  .run-tools { flex: 1 1 100%; }
+  .run-tools .seg { flex: 1 1 auto; flex-wrap: nowrap; }
+  .run-tools .seg > button { flex: 1 1 auto; padding: 0 7px; }
+  .run-fields { grid-template-columns: minmax(0, 1fr); }
+  .run-field dt { margin-top: 4px; }
 }
 
 /* Deliberately quiet — a dismissed guide should be findable, not insistent. */
@@ -1698,6 +1835,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 /* The agent, the flow editor and the engines: webviews of their own, laid over this box by the app. */
 .embedded-page { flex: 1 1 auto; min-height: 0; position: relative; background: var(--canvas); }
 .embedded-problem { margin: 24px; color: var(--muted); }
+/* Under the webview while it opens (the first time, it is made): covered by the page once it is there. */
+.embedded-opening { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 0; color: var(--faint); font-size: 12.5px; }
 
 /* The Calendar, Hours & Services and the sidebar's sub-menus: calendar.css. */
 
@@ -2074,11 +2213,11 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .flow-run-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 13.5px; }
 .flow-run-head > svg { flex: none; color: var(--muted); }
 .flow-run-head .badge { margin-left: 0; }
-.flow-run-time { color: var(--faint); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+.flow-run-time { color: var(--faint); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .flow-run-inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
 .flow-run-inputs textarea { min-height: 54px; font-size: 12.5px; }
 .flow-run-answer { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
-.flow-run-pictures { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.flow-run-pictures { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 180px)); gap: 8px; }
 .flow-run-picture {
   width: 100%;
   aspect-ratio: 1;
@@ -2088,8 +2227,40 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   object-fit: cover;
 }
 .flow-run-picture.is-loading { animation: led-pulse 1.3s ease-in-out infinite; }
-.flow-run-text p { margin: 3px 0 0; color: var(--text); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; }
+/* A picture that could not be read (its file gone, or the engines off): said, not left pulsing. */
+.flow-run-picture.is-missing {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border-style: dashed;
+  color: var(--faint);
+  font-size: 11px;
+  text-align: center;
+}
+/* A picture is a button: pressed, it shows large across the row. */
+.flow-run-picture-button {
+  display: block;
+  min-width: 0;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: transparent;
+  padding: 0;
+  cursor: zoom-in;
+}
+.flow-run-picture-button:focus-visible { outline-offset: 2px; }
+.flow-run-picture-button.is-large { grid-column: 1 / -1; cursor: zoom-out; }
+.flow-run-picture-button.is-large .flow-run-picture { aspect-ratio: auto; max-height: 560px; object-fit: contain; }
+.flow-run-text { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 3px; }
+.flow-run-text p { margin: 0; color: var(--text); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; }
+/* A computer's shared flows: two to a row where there is room. */
+.flow-run-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr)); align-items: start; gap: 10px; }
+.flow-worker.is-offline .flow-run-card { opacity: 0.72; }
+.card-warn.is-quiet { color: var(--muted); }
+.flow-run-asked { flex: 1 1 120px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .flow-run-json {
+  width: 100%;
   max-height: 260px;
   overflow: auto;
   margin: 0;
@@ -2098,6 +2269,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   background: var(--canvas);
   padding: 9px 11px;
   font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* Services → On other computers: a service a worker lends (OAIY Voice), used here with a press. */
@@ -2177,7 +2350,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .network-job-what code { border: 0; background: transparent; padding: 0; color: inherit; font-family: var(--font-mono); font-size: 11px; }
 .network-job-progress { flex: none; color: var(--primary); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; }
 .flow-run-item { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); padding-top: 9px; }
-.flow-run-item-head { display: flex; align-items: center; gap: 8px; }
+.flow-run-item-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
 .flow-run-item-head .badge { margin-left: 0; }
 .flow-run-item-head .btn-tiny { margin-left: auto; height: 24px; }
 .network-found-hardware { color: var(--muted); font-size: 12px; }

@@ -77,6 +77,40 @@ describe('the box a page in its own webview is laid over', () => {
     expect(shown()).toHaveLength(1);
   });
 
+  it('hides the page again when a show is answered after the page was left', async () => {
+    // The first show makes the webview, which takes a while: the hide sent as the page was left can be answered first.
+    let answer: () => void = () => {};
+    h.invoke.mockImplementation((command: string) => (command === 'show_embedded' ? new Promise<void>((r) => (answer = r)) : Promise.resolve()));
+    try {
+      act(() => root.render(<EmbeddedPage page="flows" />));
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+      act(() => root.render(<div />));
+      const hides = () => h.invoke.mock.calls.filter(([command]) => command === 'hide_embedded').length;
+      expect(hides()).toBe(1);
+      await act(async () => answer());
+      expect(hides()).toBe(2);
+    } finally {
+      h.invoke.mockImplementation(() => Promise.resolve());
+    }
+  });
+
+  it('lays the page wanted now again when another page’s show is answered after it', async () => {
+    let answer: () => void = () => {};
+    h.invoke.mockImplementation((command: string, args?: unknown) => (command === 'show_embedded' && (args as { page: string }).page === 'flows' ? new Promise<void>((r) => (answer = r)) : Promise.resolve()));
+    try {
+      act(() => root.render(<EmbeddedPage page="flows" />));
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+      act(() => root.render(<EmbeddedPage page="agent" />));
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+      expect(shown().filter((c) => c.page === 'agent')).toHaveLength(1);
+      await act(async () => answer());
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+      expect(shown().filter((c) => c.page === 'agent')).toHaveLength(2);
+    } finally {
+      h.invoke.mockImplementation(() => Promise.resolve());
+    }
+  });
+
   it('takes the webview away while a call rings over the page, and lays it where the box is again after', async () => {
     await act(async () => root.render(<EmbeddedPage page="agent" />));
     await act(async () => { await vi.advanceTimersByTimeAsync(10); });

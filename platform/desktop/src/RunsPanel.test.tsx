@@ -9,11 +9,16 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runsMock, deadMock, clearRunsMock, pushMock } = vi.hoisted(() => ({
+const { runsMock, deadMock, clearRunsMock, pushMock, runMock, cancelMock, againMock, flowsMock, pictureMock } = vi.hoisted(() => ({
   runsMock: vi.fn(),
   deadMock: vi.fn(),
   clearRunsMock: vi.fn(),
   pushMock: vi.fn(),
+  runMock: vi.fn(),
+  cancelMock: vi.fn(),
+  againMock: vi.fn(),
+  flowsMock: vi.fn(),
+  pictureMock: vi.fn(),
 }));
 // The panel embeds DeadLetters, which polls on mount. Stubbed empty so these
 // tests are about the run list; DeadLetters.test.tsx covers the queue itself.
@@ -21,10 +26,15 @@ vi.mock('./api', () => ({
   bridge: {
     runs: runsMock,
     clearRuns: clearRunsMock,
+    run: runMock,
+    cancelRun: cancelMock,
+    runAgain: againMock,
+    flows: flowsMock,
     deadLetters: deadMock,
     redrive: vi.fn(),
     dismissDeadLetter: vi.fn(),
   },
+  network: { nodes: vi.fn().mockResolvedValue({ nodes: [] }), picture: pictureMock },
 }));
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: pushMock }) }));
 
@@ -74,6 +84,16 @@ const clearButton = () =>
 
 beforeEach(() => {
   invalidate();
+  localStorage.clear();
+  runMock.mockReset();
+  cancelMock.mockReset();
+  againMock.mockReset();
+  pictureMock.mockReset();
+  pictureMock.mockResolvedValue(new Blob(['x']));
+  flowsMock.mockReset();
+  flowsMock.mockResolvedValue({ flows: [{ flowId: 'caller-lookup', name: 'Look up a caller' }] });
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, writable: true, value: () => 'blob:picture' });
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, writable: true, value: () => {} });
   runsMock.mockReset();
   clearRunsMock.mockReset();
   clearRunsMock.mockResolvedValue({ cleared: 11, total: 1 });
@@ -152,7 +172,7 @@ describe('RunsPanel', () => {
 
   it('opens on failures, because a list of successes buries the one row you came for', async () => {
     await mount();
-    expect(runsMock).toHaveBeenCalledWith(['failed', 'timed_out', 'cancelled'], 50);
+    expect(runsMock).toHaveBeenCalledWith(['failed', 'timed_out'], 50);
     expect(text()).toContain('Failed runs');
   });
 
@@ -209,7 +229,7 @@ describe('RunsPanel', () => {
 
   it('expands to the ids and node a support conversation needs', async () => {
     await mount();
-    await click(button('Details'));
+    await click(host.querySelector('.run-head')!);
     expect(text()).toContain('run_a1');
     expect(text()).toContain('call_abc');
     expect(text()).toContain('node_3');
@@ -218,7 +238,7 @@ describe('RunsPanel', () => {
 
   it('shows how long the run took, from the timestamps already recorded', async () => {
     await mount();
-    expect(text()).toContain('3.5s');
+    expect(text()).toContain('3.5 s');
   });
 
   it('refetches with no filter when switching to All', async () => {
@@ -227,16 +247,151 @@ describe('RunsPanel', () => {
     expect(runsMock).toHaveBeenLastCalledWith('all', 50);
   });
 
-  it('counts every state the failures filter fetches, cancelled included', async () => {
+  it('counts the states the failed filter fetches, the ones Overview warns of; a cancelled run is not a failure', async () => {
     // The badge was summed from a hand-written subset while the query used
-    // FAILURE_STATES, so the tab said "Failures (2)" above five rows.
+    // FAILURE_STATES, so the tab said "Failures (2)" above five rows. Both now
+    // come from one constant, and it is the count Overview's warning gives: a
+    // cancelled run (someone stopped it) is under All.
     runsMock.mockResolvedValue({
       runs: [FAILED],
       total: 12,
       byStatus: { failed: 1, timed_out: 1, cancelled: 3, succeeded: 7 },
     });
     await mount();
-    expect(text()).toContain('Failures (5)');
+    expect(text()).toContain('Failed (2)');
+    expect(runsMock).toHaveBeenCalledWith(['failed', 'timed_out'], 50);
+    // Looked at here: Overview warns only of failures after these.
+    expect(localStorage.getItem('oaiy.overview.failedSeen')).toBe('2');
+  });
+
+  it('names a run’s flow by its name, and who asked for it in words', async () => {
+    runsMock.mockResolvedValue({
+      runs: [FAILED, { ...FAILED, runId: 'run_b', callerProduct: 'oaiy-trigger:aokie', triggerEvent: 'aokie.sms.received' }, { ...FAILED, runId: 'run_c', callerProduct: 'oaiy-app' }],
+      total: 3,
+      byStatus: { failed: 3 },
+    });
+    await mount();
+    expect(text()).toContain('Look up a caller');
+    expect(text()).toContain('FormLogic');
+    expect(text()).toContain('On aokie.sms.received');
+    expect(text()).toContain('The Agent');
+  });
+
+  it('shows what a run was asked with and what it answered, reading its pictures at this desktop alone', async () => {
+    const picture = 'http://127.0.0.1:17999/api/ai/engine/gateway/files/images/fox.png';
+    runsMock.mockResolvedValue({
+      runs: [{
+        ...FAILED,
+        status: 'succeeded',
+        error: undefined,
+        input: { Prompt: 'a fox in a circle' },
+        output: { engine: 'zipp', output: { image: picture, elsewhere: 'https://example.com/tracker.png', caption: 'A fox, drawn in one line' }, results: { make: 'done' } },
+      }],
+      total: 1,
+      byStatus: { succeeded: 1 },
+    });
+    await mount();
+    await click(button('All'));
+    await click(host.querySelector('.run-head')!);
+    expect(text()).toContain('a fox in a circle');
+    expect(text()).toContain('A fox, drawn in one line');
+    expect(text()).toContain('Each step’s result');
+    expect(pictureMock).toHaveBeenCalledWith(picture);
+    expect(pictureMock).not.toHaveBeenCalledWith('https://example.com/tracker.png');
+    expect(host.querySelector('img')!.getAttribute('src')).toBe('blob:picture');
+  });
+
+  it('runs a finished run again with its inputs, once asked, and says how it went', async () => {
+    vi.useFakeTimers();
+    try {
+      runsMock.mockResolvedValue({ runs: [{ ...FAILED, input: { Name: 'Sam' }, timeoutMs: 30000 }], total: 1, byStatus: { failed: 1 } });
+      againMock.mockResolvedValue({ ...FAILED, runId: 'run_new', status: 'queued', error: undefined });
+      runMock.mockResolvedValue({ ...FAILED, runId: 'run_new', status: 'succeeded', error: undefined });
+      await mount();
+      await click(host.querySelector('.run-head')!);
+      vi.stubGlobal('confirm', vi.fn().mockReturnValueOnce(false));
+      await click(button('Run again'));
+      expect(againMock).not.toHaveBeenCalled();
+      vi.stubGlobal('confirm', vi.fn().mockReturnValue(true));
+      await click(button('Run again'));
+      expect(againMock).toHaveBeenCalledWith('caller-lookup', { Name: 'Sam' }, 30000);
+      expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Running Look up a caller again' }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1600);
+      });
+      expect(runMock).toHaveBeenCalledWith('run_new');
+      expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Look up a caller ran again and succeeded' }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not offer to run again a run whose flow is no longer here', async () => {
+    flowsMock.mockResolvedValue({ flows: [] });
+    await mount();
+    await click(host.querySelector('.run-head')!);
+    expect(button('Run again').disabled).toBe(true);
+    expect(text()).toContain('cannot be run again');
+  });
+
+  it('cancels a queued run once asked, and stops a running one', async () => {
+    runsMock.mockResolvedValue({
+      runs: [
+        { ...FAILED, runId: 'run_q', status: 'queued', error: undefined, startedAt: undefined, finishedAt: undefined },
+        { ...FAILED, runId: 'run_r', status: 'running', error: undefined, finishedAt: undefined },
+      ],
+      total: 2,
+      byStatus: { queued: 1, running: 1 },
+    });
+    cancelMock.mockResolvedValueOnce({ runId: 'run_q', status: 'cancelled' }).mockResolvedValueOnce({ runId: 'run_r', status: 'running', cancelRequested: true });
+    await mount();
+    await click(button('In progress'));
+    await click(button('Cancel'));
+    expect(cancelMock).toHaveBeenCalledWith('run_q');
+    expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Cancelled Look up a caller' }));
+    await click(button('Stop'));
+    expect(cancelMock).toHaveBeenCalledWith('run_r');
+    expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Asked Look up a caller to stop' }));
+  });
+
+  it('searches the runs listed: a flow, an error, who asked', async () => {
+    runsMock.mockResolvedValue({
+      runs: [FAILED, { ...FAILED, runId: 'run_b', flowId: 'other', callerProduct: 'oaiy-app', error: { code: 'node_failed', message: 'The printer is out of paper.' } }],
+      total: 2,
+      byStatus: { failed: 2 },
+    });
+    await mount();
+    const search = host.querySelector<HTMLInputElement>('input[type="search"]')!;
+    const type = async (value: string) =>
+      act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(search, value);
+        search.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+    await type('printer');
+    expect(host.querySelectorAll('.run-row')).toHaveLength(1);
+    expect(text()).toContain('The printer is out of paper.');
+    // A search looks through as many runs as one answer holds.
+    expect(runsMock).toHaveBeenLastCalledWith(['failed', 'timed_out'], 200);
+    await type('nothing like this');
+    expect(text()).toContain('No run among the newest 2 failed runs matches');
+    await click(button('Clear the search'));
+    expect(host.querySelectorAll('.run-row')).toHaveLength(2);
+  });
+
+  it('keeps a run open below after it leaves the filter, until it is closed', async () => {
+    const going = { ...FAILED, runId: 'run_r', status: 'running' as const, error: undefined, finishedAt: undefined };
+    runsMock.mockResolvedValue({ runs: [going], total: 1, byStatus: { running: 1 } });
+    await mount();
+    await click(button('In progress'));
+    await click(host.querySelector('.run-head')!);
+    runsMock.mockResolvedValue({ runs: [], total: 1, byStatus: { succeeded: 1 } });
+    runMock.mockResolvedValue({ ...going, status: 'succeeded', finishedAt: '2026-07-30T09:00:04.500Z' });
+    await click(host.querySelector('button[aria-label="Refresh now"]')!);
+    await act(async () => {});
+    expect(text()).toContain('No longer among the runs in progress');
+    expect(text()).toContain('run_r');
+    await click(host.querySelector('.run-head')!);
+    expect(host.querySelectorAll('.run-row')).toHaveLength(0);
   });
 
   it('distinguishes "nothing failed" from "nothing ran"', async () => {

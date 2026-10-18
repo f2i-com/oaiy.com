@@ -111,6 +111,45 @@ describe('FlowWorkersPanel', () => {
     expect(container.textContent).toContain('Let apps run it');
   });
 
+  it('says a computer that is not answering is off, rather than that it shares nothing', async () => {
+    api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, online: false, flows: [], lastSeenMs: null, lastError: 'connection refused' }] });
+    await mount();
+    expect(container.textContent).toContain('Rig is not answering: connection refused');
+    expect(container.textContent).toContain('The flows it shares show here when it answers again');
+    expect(container.textContent).not.toContain('shares no flow yet');
+  });
+
+  it('follows a run this computer asked for there that this page did not start (the Agent’s, or from before a restart)', async () => {
+    api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, jobs: [{ kind: 'flow', flow: 'logo', runId: 'r9', status: 'running', mine: true }, { kind: 'flow', status: 'waiting', mine: false }] }] });
+    api.network.run.mockResolvedValue({ runId: 'r9', status: 'succeeded', output: { output: 'A fox, found', }, startedAt: '2026-10-18T01:00:00Z', finishedAt: '2026-10-18T01:00:12Z' });
+    await mount();
+    const card = container.querySelector('[data-testid="flow-run-card"]')!;
+    expect(card.querySelectorAll('[data-testid="flow-run"]')).toHaveLength(1);
+    expect(card.textContent).toContain('Running');
+    await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
+    expect(api.network.run).toHaveBeenCalledWith('w1', 'r9');
+    expect(card.textContent).toContain('Done');
+    expect(card.textContent).toContain('A fox, found');
+    // (its time is the worker's own: start to end there)
+    expect(card.textContent).toContain('12 s');
+  });
+
+  it('asks before stopping a run there', async () => {
+    api.network.runFlow.mockResolvedValue({ runId: 'r1', status: 'running' });
+    api.network.run.mockResolvedValue({ runId: 'r1', status: 'running' });
+    api.network.cancelRun.mockResolvedValue({});
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true);
+    await mount();
+    await act(async () => button('Run on Rig').click());
+    await act(async () => button('Stop').click());
+    expect(api.network.cancelRun).not.toHaveBeenCalled();
+    api.network.run.mockResolvedValue({ runId: 'r1', status: 'cancelled' });
+    await act(async () => button('Stop').click());
+    expect(api.network.cancelRun).toHaveBeenCalledWith('w1', 'r1');
+    expect(container.textContent).toContain('Stopped');
+    confirm.mockRestore();
+  });
+
   it('points to Networking while OAIY Network is off', async () => {
     api.network.status.mockResolvedValue({ enabled: false, role: 'standalone', uses: false, lends: false });
     await mount();

@@ -41,6 +41,7 @@ import {
 import { bindText, pollsOf, usePluginPolls, type BindContext } from './bind';
 import { PLUGIN_ICONS } from './sections';
 import { useModules } from './useModules';
+import { readFailedSeen, writeFailedSeen } from './failedSeen';
 import { pluginSetupStatus, waitingForSetup } from './setupFlow';
 import { useLiveSetup } from './useLiveSetup';
 import { useSetupState } from './useSetupState';
@@ -60,22 +61,10 @@ import { useSetupState } from './useSetupState';
 
 const POLL_MS = 4000;
 
-/** How many failed runs the person has seen (opened Run history from here, or dismissed the warning). */
-const FAILED_SEEN = 'oaiy.overview.failedSeen';
-
 /** A reason's first line, at most 200 characters (a panic's text runs on). */
 function firstLine(reason: string): string {
   const line = reason.split('\n', 1)[0].trim();
   return line.length > 200 ? `${line.slice(0, 199)}…` : line;
-}
-
-function readFailedSeen(): number {
-  try {
-    const n = Number(localStorage.getItem(FAILED_SEEN) ?? 0);
-    return Number.isFinite(n) && n > 0 ? n : 0;
-  } catch {
-    return 0;
-  }
 }
 
 export type OverviewNav =
@@ -135,6 +124,8 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [provs, setProvs] = useState<AiProviderPublic[] | null>(() => peek('providers') ?? null);
   const [apps, setApps] = useState<PairedApp[] | null>(() => peek('pairedApps') ?? null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(() => peek('runtimeStatus') ?? null);
+  // Read in this visit, not the last visit's copy: the count of failures seen is lowered only by a fresh count.
+  const runtimeFresh = useRef(false);
   const [net, setNet] = useState<NetworkStatus | null>(() => peek('networkStatus') ?? null);
   // Shown until dismissed; the rows tick themselves, so it stays honest.
   const [guideOpen, setGuideOpen] = useState<boolean>(() => shouldAutoOpen());
@@ -177,7 +168,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
     if (p.status === 'fulfilled') { setPlug(p.value.plugins); put('plugins', p.value.plugins); }
     if (a.status === 'fulfilled') { setProvs(a.value.providers); put('providers', a.value.providers); }
     if (c.status === 'fulfilled') { setApps(c.value.paired); put('pairedApps', c.value.paired); }
-    if (r.status === 'fulfilled') { setRuntime(r.value); put('runtimeStatus', r.value); }
+    if (r.status === 'fulfilled') { runtimeFresh.current = true; setRuntime(r.value); put('runtimeStatus', r.value); }
   }, []);
 
   useEffect(() => {
@@ -246,25 +237,17 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   // Failed runs since the person last looked (a run that failed last week is not news every time Overview opens).
   const failed = runtime?.runs.failed ?? 0;
   // (fewer than seen: failed runs were pruned or deleted since, the rest of them seen already; one failing after that
-  // counts as new)
+  // counts as new. Only by a count read now: the last visit's copy can be older than what Run history saw since.)
   const seen = Math.min(failedSeen, failed);
   useEffect(() => {
-    if (runtime && failedSeen > failed) {
-      try {
-        localStorage.setItem(FAILED_SEEN, String(failed));
-      } catch {
-        /* storage can be unavailable */
-      }
+    if (runtime && runtimeFresh.current && failedSeen > failed) {
+      writeFailedSeen(failed);
       setFailedSeen(failed);
     }
   }, [runtime, failed, failedSeen]);
   const newFailed = failed - seen;
   const markFailedSeen = () => {
-    try {
-      localStorage.setItem(FAILED_SEEN, String(failed));
-    } catch {
-      /* storage can be unavailable: the warning comes back next time */
-    }
+    writeFailedSeen(failed);
     setFailedSeen(failed);
   };
   const plugName = (p: PluginRecord) => p.manifest?.name ?? p.id;
