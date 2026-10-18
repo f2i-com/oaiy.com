@@ -83,7 +83,7 @@ function InputTextNode({ data }: InputTextNodeProps) {
 
   return (
     <CollapsibleNodeWrapper
-      title="Input: Text"
+      title="Text Input"
       color="green"
       icon={InputTextIcon}
       width={size.width}
@@ -96,11 +96,11 @@ function InputTextNode({ data }: InputTextNodeProps) {
     >
       {showBodyProperties && (
         <div>
-          <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Text Content</label>
+          <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Value</label>
           <textarea
             className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 resize-none focus:outline-none focus:border-green-500"
             style={{ height: textareaHeight, resize: 'none' }}
-            placeholder="Enter text..."
+            placeholder="The text it gives the flow"
             value={displayValue}
             onChange={handleChange}
             onMouseDown={(e) => e.stopPropagation()}

@@ -209,7 +209,7 @@ function MusicGenNode({ data }: MusicGenNodeProps) {
 
                     {/* Audio Preview */}
                     {data.audioPath && (
-                        <div className="flex items-center gap-2 px-2 py-1.5 bg-purple-900/20 border border-purple-800/30 rounded">
+                        <div className="flex items-center gap-2 px-2 py-1.5 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800/30 rounded">
                             <button
                                 type="button"
                                 aria-label={isPlaying ? 'Pause music' : 'Play music'}

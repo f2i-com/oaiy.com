@@ -1,7 +1,7 @@
 import { memo, useMemo } from 'react';
 import { MousePointerClick } from 'lucide-react';
 import type { Node } from '@xyflow/react';
-import { PropertyField } from 'oaiy-ui-components/nodes/fields/PropertyField';
+import { PropertyField, shouldShowProperty } from 'oaiy-ui-components/nodes/fields/PropertyField';
 import type { NodeDefinition } from 'oaiy-core';
 import { BUNDLED_MODULES, getModuleLoader } from 'oaiy-core';
 import { getCustomNodeDefinition } from '../../services/customNodeRegistry';
@@ -226,6 +226,32 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
         updateNodeData(selectedNode.id, { [fieldId]: value });
     };
 
+    // Hide the Service Preset dropdown when there are no services to pick at all — an empty picker is just noise.
+    // Count BOTH the user's saved services AND any the OAIY Desktop is currently exposing; otherwise a running
+    // companion service is unpickable for a user who hasn't saved one of their own.
+    const shown = (definition.properties || []).filter((prop) => {
+        if (prop.id !== 'service') return true;
+        return listAllServices().length > 0 || listDesktopServices().length > 0;
+    });
+    // (the advanced ones its conditions show now, as the card counts them)
+    const advancedShown = shown.filter((prop) => prop.advanced && !prop.hidden && shouldShowProperty(prop.showIf, allValues)).length;
+    const field = (prop: (typeof shown)[number]) => {
+        // Same resolution order as `allValues` above: node override → service fallback → schema default. The fallback
+        // is read-only — the user typing anything into the field calls handleFieldChange and stores the new value in
+        // node data, which then wins over the fallback on the next render.
+        const own = selectedNode.data[prop.id];
+        const displayValue = own ?? serviceFallbacks[prop.id];
+        return (
+            <PropertyField
+                key={prop.id}
+                property={prop}
+                value={displayValue}
+                onChange={handleFieldChange(prop.id)}
+                allValues={allValues}
+            />
+        );
+    };
+
     return (
         <div className={`flex flex-col ${className}`}>
             {/* Which node: its kind's colour, its kind, its name and its id. The name is the node's own, as its card
@@ -255,36 +281,18 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
                     <p className="oaiy-help faint">This node has nothing to set.</p>
                 )}
 
-                {(definition.properties || [])
-                    // Hide the Service Preset dropdown when there are no
-                    // services to pick at all — an empty picker is just noise.
-                    // Count BOTH the user's saved services AND any the OAIY
-                    // OAIY Desktop is currently exposing; otherwise a running
-                    // companion service is unpickable for a user who hasn't
-                    // saved one of their own.
-                    .filter((prop) => {
-                        if (prop.id !== 'service') return true;
-                        return listAllServices().length > 0 || listDesktopServices().length > 0;
-                    })
-                    .map((prop) => {
-                        // Same resolution order as `allValues` above: node
-                        // override → service fallback → schema default.
-                        // The fallback is read-only — the user typing
-                        // anything into the field calls handleFieldChange
-                        // and stores the new value in node data, which
-                        // then wins over the fallback on the next render.
-                        const own = selectedNode.data[prop.id];
-                        const displayValue = own ?? serviceFallbacks[prop.id];
-                        return (
-                            <PropertyField
-                                key={prop.id}
-                                property={prop}
-                                value={displayValue}
-                                onChange={handleFieldChange(prop.id)}
-                                allValues={allValues}
-                            />
-                        );
-                    })}
+                {shown.filter((prop) => !prop.advanced).map(field)}
+
+                {/* Its advanced settings folded away, as on its card: they had stood among the everyday ones (a
+                    Custom Headers box right under the AI node's service). */}
+                {advancedShown > 0 && (
+                    <details className="oaiy-prop-more">
+                        <summary>Advanced options ({advancedShown})</summary>
+                        <div className="flex flex-col gap-4 pt-3">
+                            {shown.filter((prop) => prop.advanced).map(field)}
+                        </div>
+                    </details>
+                )}
             </div>
         </div>
     );

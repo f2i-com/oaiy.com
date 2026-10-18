@@ -21,7 +21,8 @@ import {
   loadBundledModules,
   type BundledModule,
 } from 'oaiy-core';
-import { registerNodeComponent, registerComponentByName, GenericNode } from 'oaiy-ui-components';
+import { registerNodeComponent, registerComponentByName, registerNodeIconResolver, GenericNode } from 'oaiy-ui-components';
+import { nodeIconOf } from './lib/nodeIcons';
 import { createLogger } from './utils/logger';
 
 const logger = createLogger('WebModules');
@@ -284,6 +285,9 @@ async function doLoad(): Promise<WebModulesLoadSummary> {
     total: modules.length,
     errors: res.errors ?? [],
   };
+
+  // The cards draw their kind's icon from the palette's set (lib/nodeIcons.tsx).
+  registerNodeIconResolver(nodeIconOf);
 
   // Register UI components (custom where available, GenericNode fallback).
   // Any nodeType in WEB_FORCE_GENERIC_NODES bypasses its custom React

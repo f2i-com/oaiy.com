@@ -94,15 +94,25 @@ function getColorName(color: string | undefined): NodeColor {
 // GenericNode Component
 // ============================================
 
+/** What one model of each of the engine's kinds is called (the desktop's words for them, ai/engine_services.rs). */
+const ENGINE_NOUNS: Record<string, string> = {
+  image: 'picture model', video: 'video model', speech: 'speech model', music: 'music model', sound: 'sound-effect model',
+  model3d: '3D model', background: 'background-removal model', upscale: 'upscaler',
+};
+
 /** What a node is set to, in a line for its compact card: the service or model it uses, its size, the start of its
  * instructions. */
 function summaryOf(data: Record<string, unknown>): string {
   const parts: string[] = [];
   const service = typeof data.service === 'string' ? data.service.trim() : '';
   const worker = /^engine:[a-z0-9]+:node\.[A-Za-z0-9]+\/(.+)$/.exec(service);
+  // (`engine:<kind>`: whichever model of that kind is the engine's default when the flow runs, as its picker says)
+  const kind = /^engine:([a-z0-9]+)$/.exec(service)?.[1];
   if (service === 'engine:llm') parts.push('the chosen language model');
+  else if (kind) parts.push(`the default ${ENGINE_NOUNS[kind] ?? `${kind} model`}`);
   // (a paired worker's model by its name, not its node id: engine:<kind>:node.<id>/<model>)
   else if (worker) parts.push(`${worker[1]} on a paired computer`);
+  else if (service === 'voice:transcribe') parts.push('OAIY Voice');
   else if (service) parts.push(service.replace(/^engine:[a-z0-9]+:/, '').replace(/^engine:/, ''));
   else if (typeof data.model === 'string' && data.model.trim()) parts.push(data.model.trim());
   if (Number(data.width) > 0 && Number(data.height) > 0) parts.push(`${data.width}×${data.height}`);
@@ -291,7 +301,7 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
         {data.showBodyProperties !== false && visibleAdvancedCount > 0 && (
           <details className="mt-2">
             <summary className="text-xs text-slate-500 dark:text-slate-400 cursor-pointer hover:text-slate-700 dark:hover:text-slate-300">
-              Advanced Options ({visibleAdvancedCount})
+              Advanced options ({visibleAdvancedCount})
             </summary>
             <div className="flex flex-col gap-3 mt-2 pl-2 border-l border-slate-300 dark:border-slate-700">
               {advancedProperties.map((prop) => (

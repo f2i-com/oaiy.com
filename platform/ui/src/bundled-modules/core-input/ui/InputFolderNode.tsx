@@ -166,6 +166,7 @@ function InputFolderNode({ data }: InputFolderNodeProps) {
                 type="text"
                 className="nodrag nowheel flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-green-500 font-mono text-xs"
                 placeholder="/path/to/folder"
+                aria-label="Folder Path"
                 value={path}
                 onChange={handlePathChange}
                 onMouseDown={(e) => e.stopPropagation()}
@@ -173,7 +174,8 @@ function InputFolderNode({ data }: InputFolderNodeProps) {
               <button
                 onClick={handleBrowse}
                 className="nodrag px-2 py-1.5 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 rounded text-slate-700 dark:text-slate-300 transition-colors"
-                title="Browse for folder"
+                title="Pick a folder"
+                aria-label="Pick a folder"
                 onMouseDown={(e) => e.stopPropagation()}
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -189,11 +191,12 @@ function InputFolderNode({ data }: InputFolderNodeProps) {
               type="text"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-green-500 font-mono text-xs"
               placeholder="*.png, *.jpg"
+              aria-label="Include Patterns"
               value={includePatterns}
               onChange={handleIncludePatternsChange}
               onMouseDown={(e) => e.stopPropagation()}
             />
-            <p className="text-slate-500 text-[10px] mt-0.5">Comma-separated glob patterns</p>
+            <p className="text-slate-500 dark:text-slate-400 text-[10px] mt-0.5">Which files, by name: patterns separated by commas</p>
           </div>
 
           <div className="flex items-center gap-4">
@@ -209,9 +212,10 @@ function InputFolderNode({ data }: InputFolderNodeProps) {
             </label>
 
             <div className="flex items-center gap-2">
-              <label className="text-slate-600 dark:text-slate-400 text-xs">Max:</label>
+              <label className="text-slate-600 dark:text-slate-400 text-xs">Max Files</label>
               <input
                 type="number"
+                aria-label="Max Files"
                 min={1}
                 max={10000}
                 className="nodrag nowheel w-16 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-green-500 font-mono"
@@ -223,7 +227,7 @@ function InputFolderNode({ data }: InputFolderNodeProps) {
           </div>
 
           {fileCount !== undefined && (
-            <div className="flex items-center gap-2 px-2 py-1.5 bg-green-900/20 border border-green-600/30 rounded text-green-700 dark:text-green-400 text-xs">
+            <div className="flex items-center gap-2 px-2 py-1.5 bg-green-50 dark:bg-green-900/20 border border-green-600/30 rounded text-green-700 dark:text-green-400 text-xs">
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
               </svg>
@@ -231,9 +235,9 @@ function InputFolderNode({ data }: InputFolderNodeProps) {
             </div>
           )}
 
-          <div className="text-slate-500 text-[10px] border-t border-slate-300 dark:border-slate-700 pt-2 mt-1">
-            Outputs array of file objects with path, name, ext, size
-          </div>
+          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
+            Gives the list of the files it finds: each one's path, name, extension and size.
+          </p>
         </>
       )}
     </CollapsibleNodeWrapper>

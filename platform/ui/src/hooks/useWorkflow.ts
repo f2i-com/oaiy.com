@@ -207,6 +207,13 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
     if (!projectSettings) return graph;
 
     const updatedNodes = graph.nodes.map(node => {
+      // A node with a service picked (OAIY's engine, one of the desktop's or the person's own) takes its address and
+      // model from it: given the project's default endpoint here as well, that endpoint won over the service when the
+      // flow compiled, and a flow on `engine:llm` called Ollama on localhost:11434.
+      if ((node.type === 'ai_llm' || node.type === 'image_gen' || node.type === 'video_gen')
+        && typeof node.data.service === 'string' && node.data.service.trim()) {
+        return node;
+      }
       // AI LLM nodes - apply default AI settings if not configured
       if (node.type === 'ai_llm') {
         const hasEndpoint = node.data.endpoint && String(node.data.endpoint).trim();

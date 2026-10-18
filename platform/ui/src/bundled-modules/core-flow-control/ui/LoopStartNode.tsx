@@ -85,7 +85,7 @@ function LoopStartNode({ data }: LoopStartNodeProps) {
   const inputHandles = useMemo<HandleConfig[]>(() => {
     if (loopMode === 'count') {
       return [
-        { id: 'count', type: 'target', position: Position.Left, color: '!bg-amber-500', label: 'count', labelColor: 'text-amber-700 dark:text-amber-400', size: 'md' },
+        { id: 'count', type: 'target', position: Position.Left, color: '!bg-amber-500', label: 'Count', labelColor: 'text-amber-700 dark:text-amber-400', size: 'md' },
       ];
     }
     // (a loop that runs until it is stopped takes nothing in: `i` is its try's number)
@@ -137,7 +137,7 @@ function LoopStartNode({ data }: LoopStartNodeProps) {
             <input
               type="text"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-500 font-mono"
-              placeholder="main, outer..."
+              placeholder="main, outer…"
               value={data.loopName || ''}
               onChange={handleLoopNameChange}
               onMouseDown={(e) => e.stopPropagation()}

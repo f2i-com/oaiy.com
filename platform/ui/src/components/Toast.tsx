@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
 import { AlertTriangle, Check, Info, X, XCircle } from 'lucide-react';
+import { readableError } from '../lib/readableError';
 
 export type ToastType = 'success' | 'error' | 'info' | 'warning';
 
@@ -126,7 +127,8 @@ function ToastItem({ toast, onRemove }: ToastItemProps) {
       aria-live={toast.type === 'error' ? 'assertive' : 'polite'}
     >
       <Icon size={16} aria-hidden="true" />
-      <span>{toast.message}</span>
+      {/* (an error in words: a service's JSON answer by its message, lib/readableError.ts) */}
+      <span>{toast.type === 'error' ? readableError(toast.message) : toast.message}</span>
       {toast.action && (
         <button
           type="button"

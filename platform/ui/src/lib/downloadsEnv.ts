@@ -21,6 +21,8 @@ export function currentDevice(): Device {
     uaPlatform: withData.userAgentData?.platform,
     maxTouchPoints: navigator.maxTouchPoints,
     mobile: withData.userAgentData?.mobile,
+    // A mouse or a touchpad: Linux with a touch screen and one is a laptop, not Android asked for the desktop site.
+    finePointer: typeof matchMedia === 'function' ? matchMedia('(any-pointer: fine)').matches : undefined,
   });
 }
 

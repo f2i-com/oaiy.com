@@ -131,11 +131,11 @@ function VideoAppendNode({ data }: VideoAppendNodeProps) {
                     </div>
 
                     {/* Info */}
-                    <div className="flex items-start gap-2 px-2 py-1.5 bg-purple-900/20 border border-purple-800/30 rounded text-xs text-purple-700 dark:text-purple-300">
+                    <div className="flex items-start gap-2 px-2 py-1.5 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800/30 rounded text-xs text-purple-700 dark:text-purple-300">
                         <svg className="w-4 h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>
-                        <span>Use <span className="text-purple-200">videos[]</span> for array input (from loops) or connect individual videos (1→2→3→4)</span>
+                        <span>Connect a list on <strong className="font-semibold">Videos Array</strong> (a loop’s), or the videos one by one on <strong className="font-semibold">Video 1</strong> to <strong className="font-semibold">4</strong>: they are joined in that order.</span>
                     </div>
                 </>
             )}

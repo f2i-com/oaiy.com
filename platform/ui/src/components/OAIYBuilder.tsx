@@ -9,6 +9,7 @@ import {
   type Node,
   type Edge,
   type Viewport,
+  type FitViewOptions,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { createLogger } from '../utils/logger';
@@ -39,6 +40,7 @@ import { useUndoHistory } from '../hooks/useUndoHistory';
 import { isMac, shortcut } from '../lib/keys';
 import { makeIsValidConnection } from '../utils/edgeTypeValidation';
 import TypedConnectionLine from './OAIYBuilder/TypedConnectionLine';
+import UnknownNode from './OAIYBuilder/UnknownNode';
 
 // Render-invariant literals hoisted to module scope so they keep a stable
 // identity across renders (none close over render state). Recreating these
@@ -206,7 +208,8 @@ export default function OAIYBuilder({
     if (pkgNodes.length > 0) {
       logger.debug(`nodeTypes includes ${pkgNodes.length} package nodes`, { packageNodes: pkgNodes });
     }
-    return types;
+    // (a node of a kind with no component: drawn saying which kind it is, components/OAIYBuilder/UnknownNode.tsx)
+    return { ...types, default: UnknownNode };
   }, [nodeTypesVersion]);
 
   // Poll for registry changes (plugins may load after component mounts).
@@ -358,8 +361,12 @@ export default function OAIYBuilder({
     screenToFlowPosition: (position: { x: number; y: number }) => { x: number; y: number };
     getViewport: () => { x: number; y: number; zoom: number };
     setViewport: (viewport: Viewport, options?: { duration?: number }) => void;
-    fitView: (options?: { padding?: number; duration?: number; maxZoom?: number }) => void;
+    fitView: (options?: { padding?: FitViewOptions['padding']; duration?: number; maxZoom?: number }) => void;
   } | null>(null);
+  // What lies over the canvas, for fitting the flow in view clear of it: the map in its top-right corner (while it is
+  // shown), the zoom buttons in its bottom-left and the toolbar along its foot. A fraction of the canvas (0.2) put the first nodes under the map. Kept in a
+  // ref (set below, where the map's state is known) for the fits made before it.
+  const fitPaddingRef = useRef<FitViewOptions['padding']>(0.2);
 
   // Clear transitioning state once nodes are ready (after a microtask to ensure render)
   // This effect must come AFTER useWorkflow since it depends on 'nodes'
@@ -372,7 +379,7 @@ export default function OAIYBuilder({
       const rafId = requestAnimationFrame(() => {
         // Fit view to new nodes before showing
         if (reactFlowInstance.current) {
-          reactFlowInstance.current.fitView({ padding: 0.2, duration: 0, maxZoom: 1 });
+          reactFlowInstance.current.fitView({ padding: fitPaddingRef.current, duration: 0, maxZoom: 1 });
         }
         // Second RAF ensures fitView is painted before revealing
         innerRaf = requestAnimationFrame(() => {
@@ -496,7 +503,7 @@ export default function OAIYBuilder({
   const layOut = useCallback((direction: 'LR' | 'TB') => {
     autoLayout(direction);
     setContextMenu(null);
-    requestAnimationFrame(() => requestAnimationFrame(() => reactFlowInstance.current?.fitView({ padding: 0.12, duration: 300, maxZoom: 1 })));
+    requestAnimationFrame(() => requestAnimationFrame(() => reactFlowInstance.current?.fitView({ padding: fitPaddingRef.current, duration: 300, maxZoom: 1 })));
   }, [autoLayout]);
   const handleAutoLayoutHorizontal = useCallback(() => layOut('LR'), [layOut]);
   const handleAutoLayoutVertical = useCallback(() => layOut('TB'), [layOut]);
@@ -1078,6 +1085,9 @@ export default function OAIYBuilder({
 
   // Drawn over the canvas's foot: the map only while there is room beside the toolbar.
   const mapRoom = canvasWidth === 0 || canvasWidth >= 520;
+  const mapShown = mapRoom && showMiniMap;
+  fitPaddingRef.current = { top: mapShown ? '140px' : '32px', right: '32px', bottom: '88px', left: '64px' };
+  const fitViewOptions = useMemo(() => ({ padding: fitPaddingRef.current, maxZoom: 1 }), [mapShown]); // eslint-disable-line react-hooks/exhaustive-deps
   const inspectorOpen = propsOpen || logOpen;
   // The toolbar drops its words where, with them (about 530px), it would cover the zoom buttons at the canvas's
   // corner, and where a panel lies over the canvas (the toolbar moves to the side left clear, about 300px of it: with
@@ -1143,7 +1153,7 @@ export default function OAIYBuilder({
                 instance.setViewport(savedViewportRef.current, { duration: 0 });
               } else if (nodes.length > 0) {
                 // First time: fit view to show all nodes
-                instance.fitView({ padding: 0.2, duration: 0, maxZoom: 1 });
+                instance.fitView({ padding: fitPaddingRef.current, duration: 0, maxZoom: 1 });
               } else {
                 // Fitting empty bounds can zoom to the maximum before the first node exists.
                 instance.setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 0 });
@@ -1217,7 +1227,7 @@ export default function OAIYBuilder({
               </div>
             </div>
           )}
-          <Controls position="bottom-left" />
+          <Controls position="bottom-left" fitViewOptions={fitViewOptions} />
           {/* The map, while there is room for it beside the toolbar. */}
           {mapRoom && (
             <div className="oaiy-minimap">

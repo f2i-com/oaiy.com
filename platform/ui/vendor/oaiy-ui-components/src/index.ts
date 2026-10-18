@@ -27,6 +27,9 @@ export {
 
 // Shared components (used by module UI components)
 export { default as CollapsibleNodeWrapper } from './components/CollapsibleNodeWrapper.js';
+export { portTypeClass } from './components/portTypes.js';
+export { registerNodeIconResolver, resolveNodeIcon, type NodeIconResolver } from './registry/nodeIcons.js';
+export { useNodeDefinition, definitionOf } from './hooks/useNodeDefinition.js';
 export type { CollapsibleNodeWrapperProps, ValidationIssue, HandleConfig } from './components/CollapsibleNodeWrapper.js';
 
 // Hooks (used by module UI components)

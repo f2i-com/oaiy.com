@@ -248,12 +248,11 @@ await check('Linux is not promised without its caveat: the packages are newer an
   assert.match(read('desktop.html'), /Linux is newer and less tested/, 'and its description');
   // The download plan is in shared/downloads.ts (src/lib/downloads.ts re-exports it).
   assert.match(read('../../shared/downloads.ts'), /LINUX_NOTE = 'Linux is newer and less tested than Windows\.'/, 'and a Linux button');
-  // the root README says Windows and Linux, and which is better tested
+  // the root README says Windows, Linux and the Mac (Apple silicon: the disk image the Mac build adds to a release), and which is better tested
   const readme = fs.readFileSync(path.join(UI, '..', '..', 'README.md'), 'utf8');
-  assert.match(readme, /A Tauri 2 app for Windows and Linux/);
-  assert.doesNotMatch(readme, /A Tauri 2 app for Windows,/);
-  // the one sentence for devices it is not built for is still what the brief says
-  assert.match(read('../../shared/downloads.ts'), /OAIY Desktop is for Windows and Linux\. The web app works in your browser\./);
+  assert.match(readme, /A Tauri 2 app for Windows, Linux and Macs with Apple silicon \(the Windows installers are the better tested\)/);
+  // the one sentence for devices it is not built for names the systems it is built for (a Mac too, since c9c6e6c4)
+  assert.match(read('../../shared/downloads.ts'), /OAIY Desktop is for Windows, Linux and Mac\. The web app works in your browser\./);
 });
 
 await check('the comparison says the Agent runs inside OAIY Desktop, not "No": that stays true when the Agent has a web build', () => {
@@ -273,7 +272,7 @@ await check('what the pages must say plainly is there', () => {
   const desktop = read('src/landing/DesktopPage.tsx');
   // landing: what it is, what needs the desktop, what is not ready
   assert.match(landing, /AI agent and flow builder/);
-  assert.match(landing, /Windows and Linux/);
+  assert.match(landing, /Windows, Linux and Macs with Apple silicon/);
   assert.match(landing, /graphics card of any make/);
   assert.match(landing, /phone connected over Bluetooth/);
   assert.match(landing, /not published for download yet/);
@@ -285,7 +284,7 @@ await check('what the pages must say plainly is there', () => {
   // desktop: what it is now, how to install, what to expect
   for (const [what, pattern] of [
     ['the window and the tray', /A window[\s\S]*A tray icon/],
-    ['Windows and Linux', /For Windows and Linux/],
+    ['Windows, Linux and the Mac', /For Windows, Linux and Macs with Apple silicon/],
     ['SmartScreen and how to go on', /Windows protected your PC[\s\S]*More info[\s\S]*Run anyway/],
     ['not code-signed', /not code-signed yet/],
     ['the AppImage and the deb, and no rpm (a release may not have one)', /AppImage[\s\S]*apt install/],

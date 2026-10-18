@@ -211,7 +211,7 @@ function InputFileNode({ data }: InputFileNodeProps) {
 
   return (
     <CollapsibleNodeWrapper
-      title="Input: File"
+      title="File Input"
       color="emerald"
       icon={InputFileIcon}
       width={260}
@@ -242,7 +242,7 @@ function InputFileNode({ data }: InputFileNodeProps) {
             className={`
               nodrag w-full h-24 border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500
               ${isDragging
-                ? 'border-emerald-500 bg-emerald-900/30'
+                ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/30'
                 : hasFile
                   ? 'border-emerald-600 bg-slate-100 dark:bg-slate-900'
                   : 'border-slate-300 dark:border-slate-600 bg-slate-100 dark:bg-slate-900 hover:border-emerald-600'
@@ -274,7 +274,7 @@ function InputFileNode({ data }: InputFileNodeProps) {
                 <svg className="w-6 h-6 text-slate-500 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                 </svg>
-                <p className="text-slate-600 dark:text-slate-400 text-xs">Drop image/text</p>
+                <p className="text-slate-600 dark:text-slate-400 text-xs px-2 text-center">Drop a picture or a text file here, or click to choose one</p>
               </>
             )}
           </div>
@@ -290,7 +290,7 @@ function InputFileNode({ data }: InputFileNodeProps) {
       )}
 
       {error && (
-        <div className="flex items-center gap-2 px-2 py-1.5 bg-red-900/30 border border-red-600/50 rounded text-red-700 dark:text-red-400 text-xs">
+        <div role="alert" className="flex items-center gap-2 px-2 py-1.5 bg-red-50 dark:bg-red-900/30 border border-red-600/50 rounded text-red-700 dark:text-red-400 text-xs">
           <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>

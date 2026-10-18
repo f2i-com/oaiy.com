@@ -1,4 +1,6 @@
 import { memo, useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useLoadableSrc } from '../../../lib/mediaSrc';
+import { mediaUrlBlocked } from '../../../lib/localMedia';
 import { Position, useReactFlow, useNodeId } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 
@@ -151,6 +153,9 @@ function InputAudioNode({ data }: AudioInputNodeProps) {
     }, [data.filePath, data.fileName]);
 
     const hasFile = !!data.filePath;
+    const playable = useLoadableSrc(data.filePath || undefined);
+    // (a file dropped in an earlier visit was the page's own blob:, gone after a reload: no player for it)
+    const [unplayable, setUnplayable] = useState<string | null>(null);
 
     const collapsedPreview = (
         <div className="text-slate-600 dark:text-slate-400">
@@ -183,14 +188,25 @@ function InputAudioNode({ data }: AudioInputNodeProps) {
             {data.showBodyProperties !== false && (
                 <>
                     <div
+                        // (a button to the keyboard too, as File Input's: Tab to it, Enter or Space picks a file)
+                        role="button"
+                        tabIndex={0}
+                        aria-label={hasFile ? `Change the sound file (${fileName})` : 'Pick a sound file, or drop one here'}
                         onClick={handleClick}
+                        onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                void handleClick();
+                            }
+                        }}
                         onDrop={handleDrop}
                         onDragOver={handleDragOver}
                         onDragLeave={handleDragLeave}
                         className={`
-                            nodrag w-full h-24 border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition-all
+                            nodrag w-full h-24 border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500
                             ${isDragging
-                                ? 'border-teal-500 bg-teal-900/30'
+                                ? 'border-teal-500 bg-teal-50 dark:bg-teal-900/30'
                                 : hasFile
                                     ? 'border-teal-600 bg-slate-100 dark:bg-slate-900'
                                     : 'border-slate-300 dark:border-slate-600 bg-slate-100 dark:bg-slate-900 hover:border-teal-600'
@@ -216,10 +232,15 @@ function InputAudioNode({ data }: AudioInputNodeProps) {
                                 <svg className="w-6 h-6 text-slate-500 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
                                 </svg>
-                                <p className="text-slate-600 dark:text-slate-400 text-xs">Drop audio file or click</p>
+                                <p className="text-slate-600 dark:text-slate-400 text-xs px-2 text-center">Drop a sound file here, or click to choose one</p>
                             </>
                         )}
                     </div>
+
+                    {/* (the sound itself, to hear what the flow will be given) */}
+                    {hasFile && playable && playable !== unplayable && !mediaUrlBlocked(playable) && (
+                        <audio controls preload="metadata" src={playable} onError={() => setUnplayable(playable)} className="nodrag w-full h-8" aria-label={`Play ${fileName ?? 'the sound'}`} />
+                    )}
 
                     <input
                         ref={fileInputRef}
@@ -232,7 +253,7 @@ function InputAudioNode({ data }: AudioInputNodeProps) {
             )}
 
             {error && (
-                <div className="flex items-center gap-2 px-2 py-1.5 bg-red-900/30 border border-red-600/50 rounded text-red-700 dark:text-red-400 text-xs mt-2">
+                <div role="alert" className="flex items-center gap-2 px-2 py-1.5 bg-red-50 dark:bg-red-900/30 border border-red-600/50 rounded text-red-700 dark:text-red-400 text-xs mt-2">
                     <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>

@@ -9,6 +9,7 @@
  */
 
 import { memo, useCallback, useState, useEffect } from 'react';
+import { readableError } from '../../lib/readableError';
 import { ChevronDown, Clock, Copy, ListChecks, Square } from 'lucide-react';
 import { useJobQueue } from '../../contexts/JobQueueContext';
 import type { Job, JobConfig } from 'oaiy-core';
@@ -26,7 +27,7 @@ function formatValue(value: unknown, depth = 0): string {
   if (typeof value === 'string') {
     // Truncate long strings
     if (value.length > 500) {
-      return `"${value.slice(0, 500)}..." (${value.length} chars)`;
+      return `"${value.slice(0, 500)}…" (${value.length} characters)`;
     }
     return `"${value}"`;
   }
@@ -44,7 +45,7 @@ function formatValue(value: unknown, depth = 0): string {
     const keys = Object.keys(value as object);
     if (keys.length === 0) return '{}';
     if (depth > 2) return `{Object(${keys.length} keys)}`;
-    return `{${keys.slice(0, 3).join(', ')}${keys.length > 3 ? ', ...' : ''}}`;
+    return `{${keys.slice(0, 3).join(', ')}${keys.length > 3 ? ', …' : ''}}`;
   }
   return String(value);
 }
@@ -432,8 +433,8 @@ const JobItem = memo(function JobItem({ job, onAbort, onNavigate, showAbort, isE
 
       {job.status === 'failed' && job.error && (
         <div className="oaiy-banner mt-2">
-          {/* (an error wrapped on its way up says "Error: " once for each wrapping: the banner is the error, said once) */}
-          <span className="min-w-0 flex-1 break-words" title={job.error}>{job.error.replace(/^(Error:\s*)+/, '')}</span>
+          {/* (said in words: a service's JSON answer by its message, and "Error: " none times; Copy has it whole) */}
+          <span className="min-w-0 flex-1 break-words" title={job.error}>{readableError(job.error)}</span>
           <CopyLink text={job.error} label="Copy" className="shrink-0" />
         </div>
       )}

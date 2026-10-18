@@ -503,9 +503,13 @@ section('download OAIY Desktop');
           versioned === false ? others === 0 : others >= 4, `${others} links`);
       } else if (d.os === 'linux') {
         ok(`${where}: the button is the AppImage (or the latest release)`, /releases\/(latest|download\/v?\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-linux-x86_64\.AppImage)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
+      } else if (d.os === 'mac') {
+        // Safari says "Intel Mac OS X" on every Mac and gives no processor: the disk image (Apple silicon) is offered all the same.
+        ok(`${where}: the button is the Mac disk image (or the latest release)`, /releases\/(latest|download\/v?\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-macos-arm64\.dmg)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
+        ok(`${where}: it says which Macs`, /Apple silicon \(M1 or later\)/.test(text), text);
       } else {
         // The button goes to the desktop page, or on the desktop page itself (where that would go nowhere) to the web app.
-        ok(`${where}: no download, the honest sentence, and a way to the web app or the desktop page`, /OAIY Desktop is for Windows and Linux\. The web app works in your browser\./.test(text) && !/releases\/(latest|download)/.test(href) && href === (path === '/' ? 'desktop.html' : 'app.html'), `${href} | ${text}`);
+        ok(`${where}: no download, the honest sentence, and a way to the web app or the desktop page`, /OAIY Desktop is for Windows, Linux and Mac\. The web app works in your browser\./.test(text) && !/releases\/(latest|download)/.test(href) && href === (path === '/' ? 'desktop.html' : 'app.html'), `${href} | ${text}`);
       }
       ok(`${where}: "All downloads" is the releases page`, (await box.locator('a', { hasText: 'All downloads on GitHub' }).count()) >= 1
         && /github\.com\/f2i-com\/oaiy\.com\/releases$/.test((await box.locator('a', { hasText: 'All downloads on GitHub' }).first().getAttribute('href')) ?? ''));

@@ -22,7 +22,7 @@
 
 import { memo, useEffect, useMemo, useState } from 'react';
 import { Position, useStore } from '@xyflow/react';
-import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
+import { CollapsibleNodeWrapper, portTypeClass, type HandleConfig } from 'oaiy-ui-components';
 import { subscribeToDynamicOptionsInvalidation, useNodeNotice } from 'oaiy-ui-components';
 import type { ServiceInputDecl } from '../examples';
 import { describeService, resolveService as lookupService } from '../contract';
@@ -45,41 +45,6 @@ interface ServiceCallNodeProps {
 // built-in examples — so a dragged or picked one resolves on the canvas too.
 function resolveService(id?: string) {
   return id ? lookupService(id) : null;
-}
-
-// Pin-type → handle color. Mirrors the convention image_gen / video_gen
-// use so an `image` output from a generator visually matches an `image`
-// input on a service.
-function colorFor(type: ServiceInputDecl['type']): string {
-  switch (type) {
-    case 'string':
-      return '!bg-blue-500';
-    case 'image':
-      return '!bg-purple-500';
-    case 'audio':
-      return '!bg-teal-500';
-    case 'video':
-      return '!bg-orange-500';
-    case 'any':
-    default:
-      return '!bg-cyan-500';
-  }
-}
-
-function labelColorFor(type: ServiceInputDecl['type']): string {
-  switch (type) {
-    case 'string':
-      return 'text-blue-700 dark:text-blue-400';
-    case 'image':
-      return 'text-purple-700 dark:text-purple-400';
-    case 'audio':
-      return 'text-teal-700 dark:text-teal-400';
-    case 'video':
-      return 'text-orange-700 dark:text-orange-400';
-    case 'any':
-    default:
-      return 'text-cyan-700 dark:text-cyan-400';
-  }
 }
 
 const DefaultServiceIcon = (
@@ -147,9 +112,9 @@ function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
         id: inp.id,
         type: 'target' as const,
         position: Position.Left,
-        color: colorFor(inp.type),
-        label: inp.name?.toLowerCase() || inp.id,
-        labelColor: labelColorFor(inp.type),
+        // (its pin's kind as every card colours it, and its name as the service gives it)
+        color: portTypeClass(inp.type),
+        label: inp.name || inp.id,
         size: 'md' as const,
       })),
     [declaredInputs],
@@ -163,9 +128,8 @@ function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
       id: o.id,
       type: 'source' as const,
       position: Position.Right,
-      color: colorFor(o.type),
-      label: o.name?.toLowerCase() || o.id,
-      labelColor: labelColorFor(o.type),
+      color: portTypeClass(o.type),
+      label: o.name || o.id,
       size: 'md' as const,
     }));
   }, [service]);
@@ -175,8 +139,12 @@ function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
   const endpointPreview = data.endpoint || service?.endpoint || '';
   // The service's name is the card's title (or its kind, over a name of the node's own): the line under the ports
   // says where it calls. (The name and the address side by side broke the name over two lines.)
+  // (one of OAIY's own models: what it is, not the desktop's internal address it is reached at)
+  const own = service?.group === 'engine';
   const collapsedPreview = service ? (
-    endpointPreview ? (
+    own ? (
+      service.description ? <div>{service.description}</div> : null
+    ) : endpointPreview ? (
       <div className="font-mono text-[10px] text-slate-500 dark:text-slate-400" title={endpointPreview}>
         {breakable(endpointPreview.replace(/^https?:\/\//, ''))}
       </div>
@@ -190,6 +158,7 @@ function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
       title={title}
       color="cyan"
       icon={renderIcon(service?.icon)}
+      ownIcon={!!service?.icon}
       width={260}
       collapsedWidth={160}
       status={data._status}
@@ -205,8 +174,8 @@ function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
             <div className="text-slate-500 dark:text-slate-400">
               {service.description || 'Custom HTTP service.'}
             </div>
-            {endpointPreview && (
-              <div className="font-mono text-[10px] text-slate-600 dark:text-slate-500 truncate">
+            {endpointPreview && !own && (
+              <div className="font-mono text-[10px] text-slate-600 dark:text-slate-400 truncate" title={endpointPreview}>
                 {endpointPreview}
               </div>
             )}

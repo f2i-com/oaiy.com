@@ -1,6 +1,6 @@
 import { memo, useRef, useEffect, useCallback, useMemo, type ChangeEvent } from 'react';
 import { Position } from '@xyflow/react';
-import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
+import { CollapsibleNodeWrapper, portTypeClass, type HandleConfig } from 'oaiy-ui-components';
 
 interface VideoDownloaderNodeData {
     url?: string;
@@ -58,13 +58,14 @@ function VideoDownloaderNode({ data }: VideoDownloaderNodeProps) {
         </div>
     );
 
+    // (named and coloured as every card's ports: the web editor leaves this node's definition out, so the card says them)
     const inputHandles = useMemo<HandleConfig[]>(() => [
-        { id: 'url', type: 'target', position: Position.Left, color: '!bg-blue-500', size: 'lg', label: 'url' },
+        { id: 'url', type: 'target', position: Position.Left, color: portTypeClass('string'), size: 'lg', label: 'Video URL' },
     ], []);
 
     const outputHandles = useMemo<HandleConfig[]>(() => [
-        { id: 'video', type: 'source', position: Position.Right, color: '!bg-orange-500', size: 'lg', label: mode === 'video' ? 'video' : 'audio' },
-        { id: 'duration', type: 'source', position: Position.Right, color: '!bg-purple-500', size: 'sm', label: 'duration', style: { top: '70%' } },
+        { id: 'video', type: 'source', position: Position.Right, color: portTypeClass(mode === 'video' ? 'video' : 'audio'), size: 'lg', label: mode === 'video' ? 'Video' : 'Audio' },
+        { id: 'duration', type: 'source', position: Position.Right, color: portTypeClass('number'), size: 'sm', label: 'Duration' },
     ], [mode]);
 
     return (
@@ -194,7 +195,7 @@ function VideoDownloaderNode({ data }: VideoDownloaderNodeProps) {
 
                     {/* Download Result Preview */}
                     {data.filePath && (
-                        <div className="flex items-center gap-2 px-2 py-1.5 bg-orange-900/20 border border-orange-800/30 rounded">
+                        <div className="flex items-center gap-2 px-2 py-1.5 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/30 rounded">
                             <svg className="w-4 h-4 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                             </svg>

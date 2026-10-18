@@ -231,12 +231,14 @@ export interface WelcomeWizardProps {
    * OPENAI_API_KEY.
    */
   configuredKeyConstants?: string[];
+  /** In OAIY's own window: its models are among `existingServices` (group `engine`), there already. */
+  inOaiy?: boolean;
 }
 
 type Step = 1 | 2 | 3 | 4;
 
 export default function WelcomeWizard(props: WelcomeWizardProps) {
-  const { isOpen, onClose, onSaveService, onSaveApiKey, onCreateStarterFlow, existingServices, configuredKeyConstants } = props;
+  const { isOpen, onClose, onSaveService, onSaveApiKey, onCreateStarterFlow, existingServices, configuredKeyConstants, inOaiy } = props;
   const [step, setStep] = useState<Step>(1);
 
   // Form state for the service currently being configured. Starts with no
@@ -434,12 +436,16 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
   const head: Record<Step, { title: string; description: React.ReactNode; icon: React.ReactNode }> = {
     1: {
       title: 'Welcome to OAIY',
-      description: 'A visual flow builder that talks to whatever AI tools you run, local or cloud.',
+      description: inOaiy
+        ? 'Flows: steps on a canvas, run by OAIY’s own models or any AI service you add.'
+        : 'A visual flow builder that talks to whatever AI tools you run, local or cloud.',
       icon: <Sparkles size={16} />,
     },
     2: {
-      title: 'Add your AI services',
-      description: <>Connect as many as you like: local engines, or cloud APIs with your own key. Manage them later in <strong>Settings → Services</strong>.</>,
+      title: inOaiy ? 'Pick what runs it' : 'Add your AI services',
+      description: inOaiy
+        ? <>OAIY’s own models are ready to use. Add a cloud API or another local engine too if you like; manage them later in <strong>Settings → Services</strong>.</>
+        : <>Connect as many as you like: local engines, or cloud APIs with your own key. Manage them later in <strong>Settings → Services</strong>.</>,
       icon: <Plug size={16} />,
     },
     3: {
@@ -534,7 +540,7 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
       testId="welcome-wizard"
       footer={footer}
     >
-      {step === 1 && <WelcomeStep hasAnyService={existingServices.length > 0} />}
+      {step === 1 && <WelcomeStep hasAnyService={existingServices.length > 0} inOaiy={inOaiy} />}
       {step === 2 && (
         <AddServiceStep
           presets={PRESETS}
@@ -578,9 +584,11 @@ function ServiceIcon({ icon }: { icon?: string }) {
   return icon ? <span aria-hidden="true" className="shrink-0 text-base leading-none">{icon}</span> : <Plug size={15} className="shrink-0 text-content-faint" />;
 }
 
-function WelcomeStep({ hasAnyService }: { hasAnyService: boolean }) {
+function WelcomeStep({ hasAnyService, inOaiy }: { hasAnyService: boolean; inOaiy?: boolean }) {
   const steps = [
-    'Connect one or more AI services (OpenAI chat, GPT Image, Anthropic, Ollama, or any HTTP endpoint).',
+    inOaiy
+      ? 'Pick one of OAIY’s own models, or connect another AI service (OpenAI, Anthropic, Ollama, or any HTTP endpoint).'
+      : 'Connect one or more AI services (OpenAI chat, GPT Image, Anthropic, Ollama, or any HTTP endpoint).',
     'Build a starter flow you can run right away.',
     'Show you where everything lives.',
   ];
@@ -610,7 +618,7 @@ function WelcomeStep({ hasAnyService }: { hasAnyService: boolean }) {
           </li>
         ))}
       </ol>
-      {hasAnyService && (
+      {hasAnyService && !inOaiy && (
         <p className="oaiy-help faint">
           You already have services set up: add more here, or skip straight to a starter flow.
         </p>
@@ -670,7 +678,7 @@ function AddServiceStep(props: {
                   className="inline-flex items-center gap-1.5 rounded-full border border-edge-primary bg-surface-tertiary/60 py-0.5 pl-2 pr-1 text-[12px] text-content-primary"
                 >
                   <ServiceIcon icon={svc.icon} />
-                  <span className="max-w-[10rem] truncate font-medium">{svc.name}</span>
+                  <span className="max-w-[14rem] truncate font-medium" title={svc.name}>{svc.name}</span>
                   {removable ? (
                     <button
                       type="button"
@@ -680,6 +688,8 @@ function AddServiceStep(props: {
                     >
                       <X size={11} />
                     </button>
+                  ) : svc.group === 'engine' ? (
+                    <span className="oaiy-pill ok" title="One of OAIY’s own models">in OAIY</span>
                   ) : (
                     <span className="oaiy-pill ok" title="Already saved">saved</span>
                   )}

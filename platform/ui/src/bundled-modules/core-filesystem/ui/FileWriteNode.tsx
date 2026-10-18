@@ -192,7 +192,7 @@ function FileWriteNode({ data }: FileWriteNodeProps) {
 
       {/* Last Written */}
       {data._lastWrittenPath && (
-        <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-900/20 border border-teal-600/30 rounded text-teal-700 dark:text-teal-400 text-xs">
+        <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-50 dark:bg-teal-900/20 border border-teal-600/30 rounded text-teal-700 dark:text-teal-400 text-xs">
           <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
           </svg>
@@ -200,11 +200,9 @@ function FileWriteNode({ data }: FileWriteNodeProps) {
         </div>
       )}
 
-      {/* Info */}
-      <div className="text-slate-500 text-[10px] border-t border-slate-300 dark:border-slate-700 pt-2 mt-1">
-        <div>Input: content + folder (optional) + file info for templating</div>
-        <div>Output: written file path</div>
-      </div>
+      <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
+        Writes what comes in on Content (to the folder on Folder, if one is connected; Info fills the name's {'{{…}}'}), and gives the file's path.
+      </p>
     </CollapsibleNodeWrapper>
   );
 }

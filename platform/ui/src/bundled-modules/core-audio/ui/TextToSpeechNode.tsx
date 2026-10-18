@@ -381,7 +381,7 @@ function TextToSpeechNode({ data }: TextToSpeechNodeProps) {
                     </div>
 
                     {data.audioPath && (
-                        <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-900/20 border border-teal-800/30 rounded">
+                        <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800/30 rounded">
                             <button
                                 type="button"
                                 className="p-1.5 rounded bg-teal-600 hover:bg-teal-500 transition-colors"

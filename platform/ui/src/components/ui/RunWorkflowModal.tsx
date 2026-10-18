@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { definitionOf } from 'oaiy-ui-components';
 import type { Node } from '@xyflow/react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { FolderOpen, Play } from 'lucide-react';
@@ -50,10 +51,8 @@ export default function RunWorkflowModal({
     .filter(node => INPUT_NODE_TYPES.includes(node.type || ''))
     .map(node => {
       const data = node.data as Record<string, unknown>;
-      const def = data.__definition as { name?: string } | undefined;
-
-      // Get the label - use the label property, or fall back to node type name
-      const label = (data.label as string) || def?.name || node.type || 'Input';
+      // Its label, else its kind's name ("Audio Input", not the type's id "input_audio")
+      const label = (typeof data.label === 'string' && data.label.trim()) || definitionOf(node.type, data.__definition)?.name || 'Input';
 
       // Get the value based on node type
       let value = '';

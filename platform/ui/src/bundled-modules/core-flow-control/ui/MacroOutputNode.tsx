@@ -66,7 +66,8 @@ function MacroOutputNode({ data }: NodeProps) {
             position: Position.Left,
             color: typeColors[outputType] || '!bg-slate-400',
             size: 'lg',
-            label: name
+            label: name,
+            ownLabel: true
         },
     ], [outputType, name]);
 
@@ -119,11 +120,11 @@ function MacroOutputNode({ data }: NodeProps) {
                     </div>
 
                     {/* Info */}
-                    <div className="flex items-center gap-2 px-2 py-1.5 bg-violet-900/20 border border-violet-800/30 rounded text-xs text-violet-700 dark:text-violet-300">
+                    <div className="flex items-center gap-2 px-2 py-1.5 bg-violet-50 dark:bg-violet-900/20 border border-violet-200 dark:border-violet-800/30 rounded text-xs text-violet-700 dark:text-violet-300">
                         <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>
-                        <span>Defines a macro output port</span>
+                        <span>One of the macro's outputs: a port on its Macro node.</span>
                     </div>
                 </>
             )}

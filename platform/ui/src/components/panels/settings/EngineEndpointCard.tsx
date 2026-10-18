@@ -20,6 +20,7 @@ import {
 } from '../../../lib/engineEndpoint';
 import { mayLookOnLoad, startDesktopDetection, subscribeDesktopStatus, type DesktopInfo } from '../../../lib/desktopDetection';
 import { startDesktopServiceSync } from '../../../lib/desktopServices';
+import { inOaiyWindow } from '../../../lib/oaiyWindow';
 import { Card } from '../../chrome/SectionPage';
 import ConnectDesktop from '../../ConnectDesktop';
 import DownloadDesktop from '../../DownloadDesktop';
@@ -55,15 +56,30 @@ export default function EngineEndpointCard() {
   // A tab in a browser has not looked for the desktop until its person presses Connect (or has a link): neither there nor not there.
   const notAsked = !status?.checked && !mayLookOnLoad();
 
+  const pill = (
+    <span className={status?.available ? 'oaiy-pill dot ok' : 'oaiy-pill dot'}>
+      {status?.available ? `connected${status.version ? ` · v${status.version}` : ''}` : notAsked ? 'not connected' : 'not reachable'}
+    </span>
+  );
+
+  // In OAIY's own window the engine is the OAIY the window belongs to, at the address it gave the page: the field here
+  // changed nothing there (it showed the default address beside "Answering at" another one).
+  if (inOaiyWindow()) {
+    return (
+      <Card title="OAIY's engine" actions={pill}>
+        <p className="oaiy-card-text">
+          This editor is in OAIY's own window, so it uses the engine of the OAIY it is in: the one that runs flows,
+          hosts local models and drives plugins. Its address is set there, not here.
+        </p>
+        <p className="oaiy-help faint m-0">
+          {status?.available ? `Answering at ${live}.` : `Nothing answers at ${live} yet: OAIY may still be starting.`}
+        </p>
+      </Card>
+    );
+  }
+
   return (
-    <Card
-      title="OAIY's engine"
-      actions={
-        <span className={status?.available ? 'oaiy-pill dot ok' : 'oaiy-pill dot'}>
-          {status?.available ? `connected${status.version ? ` · v${status.version}` : ''}` : notAsked ? 'not connected' : 'not reachable'}
-        </span>
-      }
-    >
+    <Card title="OAIY's engine" actions={pill}>
       <p className="oaiy-card-text">
         Where this editor looks for the engine that runs flows, hosts local models and drives
         plugins. Leave it as the default when the editor and the engine are on the same machine.

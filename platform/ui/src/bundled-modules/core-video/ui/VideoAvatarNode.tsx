@@ -1,6 +1,6 @@
 import { memo, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Position, useReactFlow, useNodeId } from '@xyflow/react';
-import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
+import { CollapsibleNodeWrapper, portTypeClass, type HandleConfig } from 'oaiy-ui-components';
 
 
 interface VideoAvatarNodeData {
@@ -66,13 +66,14 @@ function VideoAvatarNode({ data }: VideoAvatarNodeProps) {
         </div>
     );
 
+    // (named and coloured as every card's ports: the web editor leaves this node's definition out, so the card says them)
     const inputHandles = useMemo<HandleConfig[]>(() => [
-        { id: 'image', type: 'target', position: Position.Left, color: '!bg-amber-500', size: 'lg', label: 'image' },
-        { id: 'audio', type: 'target', position: Position.Left, color: '!bg-teal-500', size: 'lg', label: 'audio' },
+        { id: 'image', type: 'target', position: Position.Left, color: portTypeClass('image'), size: 'lg', label: 'Image' },
+        { id: 'audio', type: 'target', position: Position.Left, color: portTypeClass('audio'), size: 'lg', label: 'Audio' },
     ], []);
 
     const outputHandles = useMemo<HandleConfig[]>(() => [
-        { id: 'video', type: 'source', position: Position.Right, color: '!bg-blue-500', size: 'lg', label: 'video' },
+        { id: 'video', type: 'source', position: Position.Right, color: portTypeClass('video'), size: 'lg', label: 'Video' },
     ], []);
 
     return (
@@ -158,11 +159,11 @@ function VideoAvatarNode({ data }: VideoAvatarNodeProps) {
                     </div>
 
                     {/* Info */}
-                    <div className="flex items-center gap-2 px-2 py-1.5 bg-purple-900/20 border border-purple-800/30 rounded text-xs text-purple-700 dark:text-purple-300">
+                    <div className="flex items-center gap-2 px-2 py-1.5 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800/30 rounded text-xs text-purple-700 dark:text-purple-300">
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                         </svg>
-                        <span>Generates lip-synced video using Ditto</span>
+                        <span>A talking video of the picture, its lips in time with the sound (Ditto).</span>
                     </div>
                 </>
             )}

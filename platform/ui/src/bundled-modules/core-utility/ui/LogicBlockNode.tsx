@@ -106,7 +106,8 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
     }
   }, [inputCount, inputNames]);
 
-  const editorHeight = Math.max(80, size.height - 180);
+  // (room for a few lines of code as it opens: 80px showed three, cut by the card's foot)
+  const editorHeight = Math.max(150, size.height - 110);
 
   // What the block does, in its compact card where its name does not say: its first comment's first clause (a block's
   // own description), else its first line. A named block's card is its name.
@@ -129,6 +130,8 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
       position: Position.Left,
       color: '!bg-blue-500',
       label: inputNames[index] || id,
+      // (a variable's name, as the code or the template uses it: kept, not the definition's "Input 2")
+      ownLabel: !!inputNames[index],
       labelColor: 'text-blue-700 dark:text-blue-400',
       size: 'md' as const,
     }));
@@ -182,6 +185,9 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
               <label className="text-slate-600 dark:text-slate-400 text-xs">Input Variables</label>
               <div className="flex gap-1">
                 <button
+                  type="button"
+                  aria-label="One variable fewer"
+                  title="One variable fewer"
                   onClick={handleRemoveInput}
                   disabled={inputCount <= 1}
                   className="w-5 h-5 flex items-center justify-center bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed rounded text-slate-700 dark:text-slate-300 text-xs"
@@ -189,6 +195,9 @@ function LogicBlockNode({ data }: LogicBlockNodeProps) {
                   −
                 </button>
                 <button
+                  type="button"
+                  aria-label="One more variable"
+                  title="One more variable"
                   onClick={handleAddInput}
                   disabled={inputCount >= LOGIC_INPUT_IDS.length}
                   className="w-5 h-5 flex items-center justify-center bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed rounded text-slate-700 dark:text-slate-300 text-xs"

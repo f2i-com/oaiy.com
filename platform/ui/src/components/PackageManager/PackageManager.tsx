@@ -272,7 +272,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
             </svg>
             <input
               type="text"
-              placeholder="Search packages..."
+              placeholder="Search packages"
               aria-label="Search packages by name, ID, or description"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}

@@ -62,7 +62,7 @@ function ConditionNode({ data }: ConditionNodeProps) {
 
   const collapsedPreview = (
     <span>
-      <span className="text-cyan-700 dark:text-cyan-400">if</span> the value {(operatorLabel.match(/\(([^)]+)\)/)?.[1] ?? operatorLabel).toLowerCase()}
+      if the value {(operatorLabel.match(/\(([^)]+)\)/)?.[1] ?? operatorLabel).toLowerCase()}
       {data.compareValue ? <span className="font-mono"> {String(data.compareValue)}</span> : null}
     </span>
   );
@@ -75,12 +75,6 @@ function ConditionNode({ data }: ConditionNodeProps) {
     { id: 'true', type: 'source', position: Position.Right, color: '!bg-green-500', label: 'true', labelColor: 'text-green-700 dark:text-green-400', size: 'md' },
     { id: 'false', type: 'source', position: Position.Right, color: '!bg-red-500', label: 'false', labelColor: 'text-red-700 dark:text-red-400', size: 'md' },
   ], []);
-
-  const titleExtra = (
-    <span className="ml-auto px-1.5 py-0.5 bg-cyan-900 text-cyan-700 dark:text-cyan-400 text-[10px] rounded">
-      IF
-    </span>
-  );
 
   return (
     <CollapsibleNodeWrapper
@@ -95,7 +89,6 @@ function ConditionNode({ data }: ConditionNodeProps) {
       collapsedPreview={collapsedPreview}
       inputHandles={inputHandles}
       outputHandles={outputHandles}
-      titleExtra={titleExtra}
     >
       {showBodyProperties && (
         <>
@@ -103,6 +96,7 @@ function ConditionNode({ data }: ConditionNodeProps) {
           <div>
             <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Operator</label>
             <select
+              aria-label="Operator"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-cyan-500"
               value={operator}
               onChange={(e: ChangeEvent<HTMLSelectElement>) => onOperatorChangeRef.current?.(e.target.value as ConditionOperator)}
@@ -119,11 +113,12 @@ function ConditionNode({ data }: ConditionNodeProps) {
           {/* Compare Value */}
           {needsCompareValue && (
             <div>
-              <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Compare To</label>
+              <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Compare Value</label>
               <input
                 type="text"
+                aria-label="Compare Value"
                 className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-cyan-500 font-mono"
-                placeholder="value to compare..."
+                placeholder="What to compare it with"
                 value={data.compareValue || ''}
                 onChange={(e: ChangeEvent<HTMLInputElement>) => onCompareValueChangeRef.current?.(e.target.value)}
                 onMouseDown={(e) => e.stopPropagation()}
@@ -133,8 +128,8 @@ function ConditionNode({ data }: ConditionNodeProps) {
         </>
       )}
 
-      <p className="text-slate-500 text-[10px]">
-        Routes to True or False output based on condition.
+      <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
+        Passes the value on at True when this holds, else at False.
       </p>
     </CollapsibleNodeWrapper>
   );

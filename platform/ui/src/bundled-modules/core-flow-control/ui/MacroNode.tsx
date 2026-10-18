@@ -105,6 +105,7 @@ function MacroNode({ data }: NodeProps) {
             color: typeColors[input.type] || '!bg-slate-400',
             size: 'lg' as const,
             label: input.name,
+            ownLabel: true,
             // Offset handles vertically if multiple
             style: macroInputs.length > 1 ? { top: `${25 + index * 25}%` } : undefined,
         }));
@@ -119,6 +120,7 @@ function MacroNode({ data }: NodeProps) {
             color: typeColors[output.type] || '!bg-slate-400',
             size: 'lg' as const,
             label: output.name,
+            ownLabel: true,
             // Offset handles vertically if multiple
             style: macroOutputs.length > 1 ? { top: `${25 + index * 25}%` } : undefined,
         }));
@@ -214,7 +216,7 @@ function MacroNode({ data }: NodeProps) {
                     )}
 
                     {/* Macro badge */}
-                    <div className="flex items-center gap-2 px-2 py-1.5 bg-violet-900/20 border border-violet-800/30 rounded text-xs text-violet-700 dark:text-violet-300">
+                    <div className="flex items-center gap-2 px-2 py-1.5 bg-violet-50 dark:bg-violet-900/20 border border-violet-200 dark:border-violet-800/30 rounded text-xs text-violet-700 dark:text-violet-300">
                         <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
                         </svg>

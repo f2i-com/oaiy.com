@@ -6,6 +6,9 @@ import { BLOCKED_MEDIA_WORDS, mediaUrlBlocked } from '../../../lib/localMedia';
 
 interface ImageSaveNodeData {
   imageUrl?: string;
+  /** Where it saves: what the run reads (compiler.ts) and Properties' File Path. */
+  path?: string;
+  /** An older card's Filename, which the run never read. */
   filename?: string;
   format?: 'png' | 'jpg' | 'webp';
   _status?: 'running' | 'completed' | 'error';
@@ -14,6 +17,7 @@ interface ImageSaveNodeData {
   onFilenameChange?: (value: string) => void;
   onFormatChange?: (value: 'png' | 'jpg' | 'webp') => void;
   onCollapsedChange?: (value: boolean) => void;
+  onChange?: (field: string, value: unknown) => void;
 }
 
 interface ImageSaveNodeProps {
@@ -38,31 +42,25 @@ function ImageSaveNode({ data }: ImageSaveNodeProps) {
     onCollapsedChangeRef.current?.(collapsed);
   }, []);
 
+  // Where it saves (`path`, what the run reads: the card's Filename was never read, and its "name" input went nowhere).
+  const path = data.path ?? '';
   const collapsedPreview = (
-    <div className="text-slate-600 dark:text-slate-400">
-      <span className="text-teal-700 dark:text-teal-400">{data.format?.toUpperCase() || 'PNG'}</span>
-      {data.filename && <span className="ml-1 text-[10px]">{data.filename}</span>}
-    </div>
+    <span className="block truncate" title={path || undefined}>
+      {data.format?.toUpperCase() || 'PNG'} · {path ? path.split(/[/\\]/).pop() : 'to your Downloads folder'}
+    </span>
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'image', type: 'target', position: Position.Left, color: '!bg-blue-500', size: 'lg', label: 'image' },
-    { id: 'filename', type: 'target', position: Position.Left, color: '!bg-amber-500', size: 'sm', label: 'name' },
+    { id: 'image', type: 'target', position: Position.Left, color: '!bg-blue-500', size: 'lg' },
   ], []);
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
     { id: 'path', type: 'source', position: Position.Right, color: '!bg-green-500', size: 'lg' },
   ], []);
 
-  const titleExtra = (
-    <span className="ml-auto px-1.5 py-0.5 bg-teal-900 text-teal-700 dark:text-teal-400 text-[10px] rounded">
-      AUTO
-    </span>
-  );
-
   return (
     <CollapsibleNodeWrapper
-      title="Save Image"
+      title="Image Save"
       color="teal"
       icon={ImageSaveIcon}
       width={288}
@@ -73,27 +71,29 @@ function ImageSaveNode({ data }: ImageSaveNodeProps) {
       collapsedPreview={collapsedPreview}
       inputHandles={inputHandles}
       outputHandles={outputHandles}
-      titleExtra={titleExtra}
     >
       {data.showBodyProperties !== false && (
         <>
-          {/* Filename */}
+          {/* Where */}
           <div>
-            <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Filename</label>
+            <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">File Path</label>
             <input
               type="text"
+              aria-label="File Path"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-teal-500"
-              placeholder="my_image"
-              value={data.filename ?? ''}
-              onChange={(e: ChangeEvent<HTMLInputElement>) => data.onFilenameChange?.(e.target.value)}
+              placeholder="Empty: your Downloads folder"
+              value={path}
+              onChange={(e: ChangeEvent<HTMLInputElement>) => data.onChange?.('path', e.target.value)}
               onMouseDown={(e) => e.stopPropagation()}
             />
+            <p className="text-slate-500 dark:text-slate-400 text-[10px] mt-0.5 mb-0">A whole path, like /Users/you/Pictures/lake.png (the format's ending is added if it has none)</p>
           </div>
 
           {/* Format Select */}
           <div>
             <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Format</label>
             <select
+              aria-label="Format"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-teal-500"
               value={data.format || 'png'}
               onChange={(e: ChangeEvent<HTMLSelectElement>) => data.onFormatChange?.(e.target.value as 'png' | 'jpg' | 'webp')}
@@ -125,18 +125,12 @@ function ImageSaveNode({ data }: ImageSaveNodeProps) {
                   className="max-w-full max-h-full object-contain rounded"
                 />
               ) : (
-                <span className="text-slate-500 text-xs italic">No image</span>
+                <span className="text-slate-500 dark:text-slate-400 text-xs italic">Its picture shows here after a run</span>
               )}
             </div>
           </div>
 
-          {/* Auto-save Info */}
-          <div className="flex items-center gap-2 px-2 py-1.5 bg-slate-100/50 dark:bg-slate-100/50 dark:bg-slate-900/50 rounded text-xs text-slate-600 dark:text-slate-400">
-            <svg className="w-4 h-4 text-teal-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            <span>Auto-saves during workflow execution</span>
-          </div>
+          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">Saves each picture that reaches it as the flow runs, and gives on where it went.</p>
         </>
       )}
     </CollapsibleNodeWrapper>

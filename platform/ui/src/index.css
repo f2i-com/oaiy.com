@@ -833,6 +833,10 @@ select:focus-visible,
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
+/* (UnknownNode.tsx: its label, if it has one, over its type) */
+.oaiy-unknown-node { display: flex; flex-direction: column; gap: 2px; padding-top: 3px; }
+.oaiy-unknown-node strong { color: rgb(var(--color-text-primary)); font-size: 12px; font-weight: 600; }
+.oaiy-unknown-node code { color: rgb(var(--color-text-tertiary)); font-family: var(--font-mono); font-size: 10.5px; overflow-wrap: anywhere; }
 .react-flow__node.react-flow__node-default.selected,
 .react-flow__node.react-flow__node-input.selected { border-color: rgb(var(--accent-primary)) !important; }
 /* (its wires' ends small dots on its edges, as a card's ports are, not the 24px rings below) */
@@ -920,6 +924,9 @@ select:focus-visible,
   opacity: 0.7;
 }
 .oaiy-node:hover .oaiy-node-toggle { opacity: 1; }
+/* (reached with Tab: the ring every other control shows) */
+.oaiy-node-toggle:focus-visible,
+.oaiy-node-body summary:focus-visible { border-radius: 6px; opacity: 1; outline: 2px solid rgb(var(--accent-primary)); outline-offset: 1px; }
 .oaiy-node-ports { padding: 5px 0; }
 .oaiy-node-port {
   position: relative;
@@ -943,6 +950,24 @@ select:focus-visible,
   overflow-wrap: anywhere;
 }
 .oaiy-node-body { display: flex; flex-direction: column; gap: 12px; border-top: 1px solid rgb(var(--color-border-secondary)); padding: 12px; }
+/* A card's fields look the same whichever card draws them: the cards made from a definition and the hand-made ones
+   had three sizes of text, four borders and a focus colour per node between them. Size, ink, border and focus ring
+   only (a field's font, padding and width stay its card's); not the code editor's own hidden textarea. */
+.oaiy-node-body :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), textarea, select):not(.monaco-editor *) {
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 6px;
+  background-color: rgb(var(--color-bg-elevated));
+  color: rgb(var(--color-text-primary));
+  font-size: 12px;
+  line-height: 1.45;
+}
+.oaiy-node-body :is(input, textarea, select):not(.monaco-editor *)::placeholder { color: rgb(var(--color-text-muted)); opacity: 1; }
+.oaiy-node-body :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), textarea, select):not(.monaco-editor *):focus {
+  border-color: rgb(var(--accent-primary));
+  outline: none;
+  box-shadow: 0 0 0 2px rgb(var(--accent-primary) / 0.22);
+}
+.oaiy-node-body :is(input, textarea, select):not(.monaco-editor *):disabled { cursor: not-allowed; opacity: 0.55; }
 /* its handles: small dots on the edge, a wider ring to aim at */
 .react-flow__handle.oaiy-port {
   width: 12px !important;
@@ -954,6 +979,16 @@ select:focus-visible,
 .react-flow__handle-left.oaiy-port { left: -6px; }
 .react-flow__handle-right.oaiy-port { right: -6px; }
 .react-flow__handle.oaiy-port::after { position: absolute; inset: -7px; border-radius: 50%; content: ''; }
+/* What a port carries (portTypeClass in oaiy-ui-components): one colour per kind of value on every card, the Macro
+   node's set, so a picture's port is pink wherever it is. Node kinds' own hues, not theme tokens (as nodeSwatches). */
+.react-flow__handle.oaiy-port.port-any { background: #94a3b8; }
+.react-flow__handle.oaiy-port.port-text { background: #10b981; }
+.react-flow__handle.oaiy-port.port-number { background: #f59e0b; }
+.react-flow__handle.oaiy-port.port-image { background: #ec4899; }
+.react-flow__handle.oaiy-port.port-video { background: #3b82f6; }
+.react-flow__handle.oaiy-port.port-audio { background: #a855f7; }
+.react-flow__handle.oaiy-port.port-file { background: #f97316; }
+.react-flow__handle.oaiy-port.port-data { background: #06b6d4; }
 /* Aimed at, and, while a wire is drawn, whether this port takes it: a ring in the accent
    under the pointer, green where the wire can be let go, red where it cannot. */
 .react-flow__handle.oaiy-port:hover { box-shadow: 0 0 0 3px rgb(var(--accent-primary) / 0.4); }
@@ -2347,6 +2382,13 @@ select,
 .oaiy-search { position: relative; display: flex; min-width: 0; align-items: center; }
 .oaiy-search > svg { position: absolute; left: 10px; color: rgb(var(--color-text-faint)); pointer-events: none; }
 .oaiy-search > .oaiy-input { padding-left: 31px; padding-right: 30px; }
+/* Properties' advanced settings, folded as on a node's card. */
+.oaiy-prop-more { border-top: 1px solid rgb(var(--color-border-secondary)); padding-top: 12px; }
+.oaiy-prop-more > summary { color: rgb(var(--color-text-tertiary)); cursor: pointer; font-size: 12px; font-weight: 600; }
+.oaiy-prop-more > summary:hover { color: rgb(var(--color-text-primary)); }
+.oaiy-prop-more > summary:focus-visible { border-radius: 4px; outline: 2px solid rgb(var(--accent-primary)); outline-offset: 2px; }
+/* (its own clear button, not the browser's as well: the two stood side by side) */
+.oaiy-search > input[type='search']::-webkit-search-cancel-button { display: none; -webkit-appearance: none; appearance: none; }
 .oaiy-search > button {
   position: absolute;
   right: 4px;
@@ -3421,6 +3463,11 @@ button.oaiy-row:focus-visible,
 }
 /* Where OAIY Desktop's dock is under the canvas, the toolbar sits that much higher. */
 body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
+/* Beside the canvas's right panel (Properties and the log), not over it: a failed run's toast covered the very lines
+   of the log that said why. (Narrower, the panel lies over the canvas and there is no room beside it.) */
+@media (min-width: 1000px) {
+  body:has(.oaiy-canvas-layer:not(.away) .oaiy-builder.right-open:not(.narrow)) .oaiy-toasts { right: 330px; }
+}
 .oaiy-toast {
   --tone: var(--accent-primary);
   display: flex;

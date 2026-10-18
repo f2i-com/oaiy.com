@@ -1,5 +1,9 @@
 import { memo, useState, useCallback, useEffect, type ReactNode } from 'react';
 import { Handle, Position, useNodeId, useStore } from '@xyflow/react';
+import type { HandleDefinition } from 'oaiy-core';
+import { useNodeDefinition } from '../hooks/useNodeDefinition';
+import { resolveNodeIcon } from '../registry/nodeIcons';
+import { portTypeClass, typeWords } from './portTypes';
 
 export interface ValidationIssue {
   field: string;
@@ -10,9 +14,15 @@ export interface HandleConfig {
   id: string;
   type: 'source' | 'target';
   position: Position;
-  color: string; // tailwind color class like 'bg-blue-500'
+  /** Its dot's colour (a Tailwind class like '!bg-blue-500'), for a port the node's definition does not have: one it
+   * has is coloured by its kind of value (`portTypeClass`). */
+  color: string;
   label?: string;
-  labelColor?: string; // tailwind text color class
+  /** The label is the port's own name, given by the person (a macro's input "prompt"): shown as it is, not the
+   * definition's word for the port. */
+  ownLabel?: boolean;
+  /** No longer shown: every port's name is in the card's own ink. */
+  labelColor?: string;
   size?: 'sm' | 'md' | 'lg'; // default md
 }
 
@@ -21,13 +31,15 @@ export interface CollapsibleNodeWrapperProps {
   title: string;
   /** Color theme for the node (tailwind color name without prefix) */
   color: 'purple' | 'green' | 'blue' | 'amber' | 'cyan' | 'pink' | 'emerald' | 'orange' | 'red' | 'slate' | 'indigo' | 'teal' | 'violet';
-  /** Icon SVG element */
+  /** Icon SVG element (the palette's icon for the node's kind wins, where the host gives one) */
   icon: ReactNode;
+  /** The icon is the card's own, not its kind's (a service's emoji on a Service Call): kept. */
+  ownIcon?: boolean;
   /** Width of the node when expanded */
   width: number;
   /** Width when collapsed (at least 200: room for its ports' names) */
   collapsedWidth?: number;
-  /** Status for visual styling */
+  /** Status for visual styling (else the node's own `_status`, as the run sets it) */
   status?: 'running' | 'completed' | 'error';
   /** Validation issues to display warning indicator */
   validationIssues?: ValidationIssue[];
@@ -57,96 +69,97 @@ export interface CollapsibleNodeWrapperProps {
   titleExtra?: ReactNode;
 }
 
+// (`text`: the kind's word over the name, 9px: the 700 ink on the light header, about 4.5:1; the 600 was about 3:1)
 const colorMap = {
   purple: {
     border: 'border-purple-400 dark:border-purple-600',
     headerBg: 'bg-purple-100 dark:bg-purple-900/50',
     iconBg: 'bg-purple-500 dark:bg-purple-600',
-    text: 'text-purple-600 dark:text-purple-400',
+    text: 'text-purple-700 dark:text-purple-400',
     hoverBg: 'hover:bg-purple-200/50 dark:hover:bg-purple-500/30',
   },
   violet: {
     border: 'border-violet-400 dark:border-violet-600',
     headerBg: 'bg-violet-100 dark:bg-violet-900/50',
     iconBg: 'bg-violet-500 dark:bg-violet-600',
-    text: 'text-violet-600 dark:text-violet-400',
+    text: 'text-violet-700 dark:text-violet-400',
     hoverBg: 'hover:bg-violet-200/50 dark:hover:bg-violet-500/30',
   },
   green: {
     border: 'border-green-400 dark:border-green-600',
     headerBg: 'bg-green-100 dark:bg-green-900/50',
     iconBg: 'bg-green-500 dark:bg-green-600',
-    text: 'text-green-600 dark:text-green-400',
+    text: 'text-green-700 dark:text-green-400',
     hoverBg: 'hover:bg-green-200/50 dark:hover:bg-green-500/30',
   },
   blue: {
     border: 'border-blue-400 dark:border-blue-600',
     headerBg: 'bg-blue-100 dark:bg-blue-900/50',
     iconBg: 'bg-blue-500 dark:bg-blue-600',
-    text: 'text-blue-600 dark:text-blue-400',
+    text: 'text-blue-700 dark:text-blue-400',
     hoverBg: 'hover:bg-blue-200/50 dark:hover:bg-blue-500/30',
   },
   amber: {
     border: 'border-amber-400 dark:border-amber-500',
     headerBg: 'bg-amber-100 dark:bg-amber-900/50',
     iconBg: 'bg-amber-500 dark:bg-amber-600',
-    text: 'text-amber-600 dark:text-amber-400',
+    text: 'text-amber-700 dark:text-amber-400',
     hoverBg: 'hover:bg-amber-200/50 dark:hover:bg-amber-500/30',
   },
   cyan: {
     border: 'border-cyan-400 dark:border-cyan-600',
     headerBg: 'bg-cyan-100 dark:bg-cyan-900/50',
     iconBg: 'bg-cyan-500 dark:bg-cyan-600',
-    text: 'text-cyan-600 dark:text-cyan-400',
+    text: 'text-cyan-700 dark:text-cyan-400',
     hoverBg: 'hover:bg-cyan-200/50 dark:hover:bg-cyan-500/30',
   },
   pink: {
     border: 'border-pink-400 dark:border-pink-600',
     headerBg: 'bg-pink-100 dark:bg-pink-900/50',
     iconBg: 'bg-pink-500 dark:bg-pink-600',
-    text: 'text-pink-600 dark:text-pink-400',
+    text: 'text-pink-700 dark:text-pink-400',
     hoverBg: 'hover:bg-pink-200/50 dark:hover:bg-pink-500/30',
   },
   emerald: {
     border: 'border-emerald-400 dark:border-emerald-600',
     headerBg: 'bg-emerald-100 dark:bg-emerald-900/50',
     iconBg: 'bg-emerald-500 dark:bg-emerald-600',
-    text: 'text-emerald-600 dark:text-emerald-400',
+    text: 'text-emerald-700 dark:text-emerald-400',
     hoverBg: 'hover:bg-emerald-200/50 dark:hover:bg-emerald-500/30',
   },
   orange: {
     border: 'border-orange-400 dark:border-orange-600',
     headerBg: 'bg-orange-100 dark:bg-orange-900/50',
     iconBg: 'bg-orange-500 dark:bg-orange-600',
-    text: 'text-orange-600 dark:text-orange-400',
+    text: 'text-orange-700 dark:text-orange-400',
     hoverBg: 'hover:bg-orange-200/50 dark:hover:bg-orange-500/30',
   },
   red: {
     border: 'border-red-400 dark:border-red-600',
     headerBg: 'bg-red-100 dark:bg-red-900/50',
     iconBg: 'bg-red-500 dark:bg-red-600',
-    text: 'text-red-600 dark:text-red-400',
+    text: 'text-red-700 dark:text-red-400',
     hoverBg: 'hover:bg-red-200/50 dark:hover:bg-red-500/30',
   },
   slate: {
     border: 'border-slate-400 dark:border-slate-600',
     headerBg: 'bg-slate-200 dark:bg-slate-700/50',
     iconBg: 'bg-slate-500 dark:bg-slate-600',
-    text: 'text-slate-600 dark:text-slate-400',
+    text: 'text-slate-700 dark:text-slate-400',
     hoverBg: 'hover:bg-slate-300/50 dark:hover:bg-slate-500/30',
   },
   indigo: {
     border: 'border-indigo-400 dark:border-indigo-600',
     headerBg: 'bg-indigo-100 dark:bg-indigo-900/50',
     iconBg: 'bg-indigo-500 dark:bg-indigo-600',
-    text: 'text-indigo-600 dark:text-indigo-400',
+    text: 'text-indigo-700 dark:text-indigo-400',
     hoverBg: 'hover:bg-indigo-200/50 dark:hover:bg-indigo-500/30',
   },
   teal: {
     border: 'border-teal-400 dark:border-teal-600',
     headerBg: 'bg-teal-100 dark:bg-teal-900/50',
     iconBg: 'bg-teal-500 dark:bg-teal-600',
-    text: 'text-teal-600 dark:text-teal-400',
+    text: 'text-teal-700 dark:text-teal-400',
     hoverBg: 'hover:bg-teal-200/50 dark:hover:bg-teal-500/30',
   },
 };
@@ -172,6 +185,15 @@ function portName(h: HandleConfig): string {
 }
 
 /**
+ * The node's definition's port for a handle: by its id, else (a card naming its one input or output its own way,
+ * Logic Block's `output`) the definition's only one of that side.
+ */
+function definedPort(h: HandleConfig, given: HandleConfig[], defined: HandleDefinition[] | undefined): HandleDefinition | undefined {
+  if (!defined?.length) return undefined;
+  return defined.find((d) => d.id === h.id) ?? (given.length === 1 && defined.length === 1 ? defined[0] : undefined);
+}
+
+/**
  * A node's card on the canvas. Compact until expanded (the default): its name (the node's own label where it has one,
  * its kind above it), its ports a row each with their names (inputs left, outputs right), and a line of what it is
  * set to; so a flow reads at a glance, how its steps feed each other, before any one is opened. Expanded, its form
@@ -180,10 +202,11 @@ function portName(h: HandleConfig): string {
 function CollapsibleNodeWrapper({
   title,
   color,
-  icon,
+  icon: givenIcon,
+  ownIcon = false,
   width,
   collapsedWidth = MIN_COLLAPSED,
-  status,
+  status: givenStatus,
   validationIssues = [],
   defaultCollapsed = true,
   isCollapsed: controlledCollapsed,
@@ -207,6 +230,16 @@ function CollapsibleNodeWrapper({
   });
   const name = label && label !== title ? label : title;
   const kind = label && label !== title ? title : '';
+  // Its run state as the run sets it (`_status`), where the card does not say it itself: a card made from its
+  // definition alone, and a few others, never showed which step was running or which one failed.
+  const dataStatus = useStore((st) => {
+    const raw = nodeId ? (st.nodeLookup.get(nodeId)?.data as { _status?: unknown } | undefined)?._status : undefined;
+    return raw === 'running' || raw === 'completed' || raw === 'error' ? raw : undefined;
+  });
+  const status = givenStatus ?? dataStatus;
+  // Its definition: the palette's icon for it, and its ports' names and kinds of value.
+  const definition = useNodeDefinition();
+  const icon = (!ownIcon && resolveNodeIcon(definition?.icon)) || givenIcon;
 
   // Support both controlled and uncontrolled modes
   const isCollapsed = controlledCollapsed !== undefined ? controlledCollapsed : internalCollapsed;
@@ -237,22 +270,37 @@ function CollapsibleNodeWrapper({
     onCollapsedChange?.(newState);
   }, [isCollapsed, onCollapsedChange]);
 
+  // A port as its definition has it (where the node's module defines it): its name ("Prompt", the palette's and
+  // Properties' word for it, not a card's own "prompt" or "desc") and its kind of value, as its dot's colour. A port
+  // the definition does not have (a template's variables, a macro's ports) keeps what its card gives it.
+  const portOf = (h: HandleConfig): { name: string; colour: string; tip: string } => {
+    const given = h.type === 'target' ? givenInputs : givenOutputs;
+    const def = definedPort(h, given, h.type === 'target' ? definition?.inputs : definition?.outputs);
+    const name = (h.ownLabel && h.label) || def?.name || portName(h);
+    return def
+      ? { name, colour: portTypeClass(def.type), tip: `${name}: ${typeWords(def.type)}` }
+      : { name, colour: h.color, tip: name };
+  };
+
   // A side's handle sits in its port's row (centred on it); a top or bottom one is spread along that edge.
-  const renderHandle = (handle: HandleConfig, index: number, total: number) => (
-    <Handle
-      // (by kind as well: a node may take in and give out a port of the same name, Image View's `image`)
-      key={`${handle.type}:${handle.id}`}
-      type={handle.type}
-      position={handle.position}
-      id={handle.id}
-      className={`oaiy-port ${handle.color}`}
-      style={handle.position === Position.Left || handle.position === Position.Right
-        ? { top: '50%', zIndex: 20 }
-        : { left: `${(currentWidth / (total + 1)) * (index + 1)}px`, zIndex: 20 }}
-      isConnectable={true}
-      title={portName(handle)}
-    />
-  );
+  const renderHandle = (handle: HandleConfig, index: number, total: number) => {
+    const port = portOf(handle);
+    return (
+      <Handle
+        // (by kind as well: a node may take in and give out a port of the same name, Image View's `image`)
+        key={`${handle.type}:${handle.id}`}
+        type={handle.type}
+        position={handle.position}
+        id={handle.id}
+        className={`oaiy-port ${port.colour}`}
+        style={handle.position === Position.Left || handle.position === Position.Right
+          ? { top: '50%', zIndex: 20 }
+          : { left: `${(currentWidth / (total + 1)) * (index + 1)}px`, zIndex: 20 }}
+        isConnectable={true}
+        title={port.tip}
+      />
+    );
+  };
 
   const issuesText = validationIssues.map((i) => `${i.field}: ${i.message}`).join('\n');
 
@@ -314,8 +362,9 @@ function CollapsibleNodeWrapper({
             {Array.from({ length: rows }).map((_, i) => (
               <div key={i} className="oaiy-node-port" style={{ minHeight: ROW }}>
                 {inputHandles[i] && renderHandle(inputHandles[i], i, inputHandles.length)}
-                <span className={inputHandles[i]?.labelColor}>{inputHandles[i] ? portName(inputHandles[i]) : ''}</span>
-                <span className={outputHandles[i]?.labelColor}>{outputHandles[i] ? portName(outputHandles[i]) : ''}</span>
+                {/* (its name in the card's own ink: the dot beside it says what kind of value it is) */}
+                <span>{inputHandles[i] ? portOf(inputHandles[i]).name : ''}</span>
+                <span>{outputHandles[i] ? portOf(outputHandles[i]).name : ''}</span>
                 {outputHandles[i] && renderHandle(outputHandles[i], i, outputHandles.length)}
               </div>
             ))}

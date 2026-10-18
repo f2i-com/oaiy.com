@@ -275,14 +275,13 @@ function TextChunkerNode({ data }: TextChunkerNodeProps) {
           )}
 
           {/* Mode-specific info */}
-          <div className="text-slate-500 text-[10px] border-t border-slate-300 dark:border-slate-700 pt-2 mt-1">
-            {isJsonMode && <div>Output: {chunkSize === 1 ? '{item, index}' : '{items[], index, count}'}</div>}
-            {isCsvMode && <div>Output: {chunkSize === 1 ? '{data, row, index}' : '{rows[], index, count}'}</div>}
-            {isLinesMode && <div>Output: {chunkSize === 1 ? '{text, index}' : '{lines[], index, count}'}</div>}
-            {isRawTextMode && <div>Output: {'{'}text, start, end, index{'}'}</div>}
-            <div className="text-slate-600 mt-1">
-              Auto-detects type from .json, .csv, .txt extensions
-            </div>
+          <div className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug">
+            {/* (each chunk's shape, as a code step reads it) */}
+            {isJsonMode && <div>Each chunk: <code>{chunkSize === 1 ? '{item, index}' : '{items[], index, count}'}</code></div>}
+            {isCsvMode && <div>Each chunk: <code>{chunkSize === 1 ? '{data, row, index}' : '{rows[], index, count}'}</code></div>}
+            {isLinesMode && <div>Each chunk: <code>{chunkSize === 1 ? '{text, index}' : '{lines[], index, count}'}</code></div>}
+            {isRawTextMode && <div>Each chunk: <code>{'{'}text, start, end, index{'}'}</code></div>}
+            <div className="mt-1">Auto picks the kind from the file’s ending (.json, .csv, .txt).</div>
           </div>
         </>
       )}

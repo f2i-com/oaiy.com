@@ -10,7 +10,7 @@
  *
  * What it says is what is true of the product today, and what is not is said
  * where it matters: the flow editor runs in a browser; the Agent, OAIY's own
- * engines and the phone receptionist are OAIY Desktop's (Windows and Linux); the
+ * engines and the phone receptionist are OAIY Desktop's (Windows, Linux and Macs with Apple silicon); the
  * engines and the Aokie plugin are not in the installer yet. The screenshots are of
  * OAIY Desktop, with demo data. Nothing on the page makes a request, looks for a
  * desktop, or asks GitHub anything (see components/DownloadDesktop.tsx).
@@ -520,7 +520,7 @@ function HowItWorks() {
   const steps = [
     { title: 'Open the flow editor', body: 'It runs in your browser, so there is nothing to install and no account to make. The first-run wizard wires a starter chat flow in three clicks.' },
     { title: 'Bring your own AI', body: 'Add Ollama, LM Studio, ComfyUI, OpenAI, Anthropic or any HTTP endpoint as a Service and test the connection in place. Keys stay on your device.' },
-    { title: 'Install OAIY Desktop for the rest', body: "For the Agent, OAIY's own models and the phone receptionist, install OAIY Desktop on Windows or Linux (Linux is newer and less tested). Flows move between the two as files." },
+    { title: 'Install OAIY Desktop for the rest', body: "For the Agent, OAIY's own models and the phone receptionist, install OAIY Desktop on Windows, Linux or a Mac with Apple silicon (Linux is newer and less tested). Flows move between the two as files." },
   ];
   return (
     <Section id="how" title="From a blank canvas to a running flow">
@@ -631,7 +631,7 @@ function Desktop() {
     <Section
       id="desktop"
       title="OAIY Desktop: all of it, on your computer"
-      sub="A window and a tray icon, for Windows and Linux (Linux is newer and less tested). The flow editor in your browser can use it too."
+      sub="A window and a tray icon, for Windows, Linux and Macs with Apple silicon (Linux is newer and less tested). The flow editor in your browser can use it too."
       tone="var(--accent-secondary)"
     >
       <div className="grid gap-8 lg:grid-cols-[1fr_1fr] lg:items-start">
@@ -667,7 +667,7 @@ function Desktop() {
               About OAIY Desktop
             </a>
             <span className="text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-              For Windows and Linux (Linux: AppImage and .deb, newer and less tested)
+              For Windows, Linux and Macs with Apple silicon (Linux: AppImage and .deb, newer and less tested)
             </span>
           </div>
         </div>

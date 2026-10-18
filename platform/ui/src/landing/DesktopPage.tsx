@@ -3,7 +3,7 @@
  *
  * What OAIY Desktop is (a window and a tray icon, with the Agent, the flow editor, OAIY's engines,
  * plugins and the receptionist), how it and the flow editor in a browser find each other, how to
- * install it on Windows and Linux and what the installer does not carry, the headless server, the
+ * install it on Windows, Linux and a Mac with Apple silicon and what the installer does not carry, the headless server, the
  * service JSON format, and a live service library of example JSON files you can download (served by
  * the PHP API from a folder — drop a file in and it shows up here).
  *
@@ -87,7 +87,7 @@ function Hero() {
             className="lp-reveal mt-5 text-sm"
             style={{ animationDelay: '300ms', color: 'rgb(var(--color-text-tertiary))' }}
           >
-            For Windows and Linux (Linux: AppImage and .deb, newer and less tested than Windows). The flow editor in your browser works on any device.
+            For Windows, Linux and Macs with Apple silicon (Linux: AppImage and .deb, newer and less tested than Windows). The flow editor in your browser works on any device.
           </p>
         </div>
         <div className="oaiy-runtime-strip" aria-label="What OAIY Desktop does">
@@ -189,7 +189,7 @@ function Install() {
     <Section
       id="install"
       title="Installing OAIY Desktop"
-      sub="For Windows and Linux; the Linux packages are newer and less tested. The installers are not code-signed yet, so Windows will warn you; how to go on is below."
+      sub="For Windows, Linux and Macs with Apple silicon; the Linux packages are newer and less tested. The Windows installers are not code-signed yet, so Windows will warn you; how to go on is below."
       tone="var(--signal-green)"
     >
       <div className="mb-4 flex flex-wrap items-start gap-3">

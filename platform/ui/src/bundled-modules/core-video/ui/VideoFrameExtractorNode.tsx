@@ -4,6 +4,9 @@ import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 
 
 interface VideoFrameExtractorNodeData {
+  /** Frames a second: what the run reads (compiler.ts), and Properties' FPS. */
+  fps?: number;
+  /** The card's own seconds between frames before it set `fps` (kept in step). */
   intervalSeconds?: number;
   startTime?: number;
   endTime?: number;
@@ -21,6 +24,7 @@ interface VideoFrameExtractorNodeData {
   onOutputFormatChange?: (value: string) => void;
   onBatchSizeChange?: (value: number) => void;
   onCollapsedChange?: (value: boolean) => void;
+  onChange?: (field: string, value: unknown) => void;
   showBodyProperties?: boolean;
 }
 
@@ -43,8 +47,10 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
   const onOutputFormatChangeRef = useRef(data.onOutputFormatChange);
   const onBatchSizeChangeRef = useRef(data.onBatchSizeChange);
   const onCollapsedChangeRef = useRef(data.onCollapsedChange);
+  const onChangeRef = useRef(data.onChange);
 
   useEffect(() => {
+    onChangeRef.current = data.onChange;
     onIntervalSecondsChangeRef.current = data.onIntervalSecondsChange;
     onStartTimeChangeRef.current = data.onStartTimeChange;
     onEndTimeChangeRef.current = data.onEndTimeChange;
@@ -61,6 +67,8 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
   const handleIntervalChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const value = parseFloat(e.target.value);
     if (!isNaN(value) && value > 0) {
+      // The run reads frames a second (`fps`): the card set only its seconds between frames, which the run ignored.
+      onChangeRef.current?.('fps', 1 / value);
       onIntervalSecondsChangeRef.current?.(value);
     }
   }, []);
@@ -97,7 +105,8 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
     }
   }, []);
 
-  const intervalSeconds = data.intervalSeconds ?? 1.0;
+  // Seconds between frames, from the frames a second the run uses (set here or in Properties).
+  const intervalSeconds = Number(data.fps) > 0 ? Math.round((1 / Number(data.fps)) * 1000) / 1000 : (data.intervalSeconds ?? 1.0);
   const startTime = data.startTime ?? 0;
   const endTime = data.endTime ?? 0;
   const maxFrames = data.maxFrames ?? 100;
@@ -105,10 +114,8 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
   const batchSize = data.batchSize ?? 0;
 
   const collapsedPreview = (
-    <div className="text-slate-600 dark:text-slate-400 text-[10px]">
-      <span className="text-orange-700 dark:text-orange-400">{intervalSeconds}s</span>
-      <span className="text-slate-500"> / </span>
-      <span className="text-orange-700 dark:text-orange-300">{maxFrames} max</span>
+    <div>
+      a frame every {intervalSeconds} s, up to {maxFrames}
     </div>
   );
 
@@ -148,6 +155,7 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
               Frame Interval (seconds)
             </label>
             <input
+              aria-label="Frame Interval (seconds)"
               type="number"
               min={0.1}
               step={0.1}
@@ -156,7 +164,7 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
               onChange={handleIntervalChange}
               onMouseDown={(e) => e.stopPropagation()}
             />
-            <p className="text-slate-500 text-[10px] mt-0.5">Extract 1 frame every N seconds</p>
+            <p className="text-slate-500 dark:text-slate-400 text-[10px] mt-0.5">One frame every this many seconds</p>
           </div>
 
           {/* Time range */}
@@ -164,6 +172,7 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
             <div>
               <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Start (s)</label>
               <input
+                aria-label="Start (s)"
                 type="number"
                 min={0}
                 step={0.1}
@@ -176,6 +185,7 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
             <div>
               <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">End (s)</label>
               <input
+                aria-label="End (s)"
                 type="number"
                 min={0}
                 step={0.1}
@@ -184,7 +194,7 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
                 onChange={handleEndTimeChange}
                 onMouseDown={(e) => e.stopPropagation()}
               />
-              <p className="text-slate-500 text-[10px] mt-0.5">0 = full video</p>
+              <p className="text-slate-500 dark:text-slate-400 text-[10px] mt-0.5">0: to the end</p>
             </div>
           </div>
 
@@ -193,6 +203,7 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
             <div>
               <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Max Frames</label>
               <input
+                aria-label="Max Frames"
                 type="number"
                 min={1}
                 max={10000}
@@ -205,6 +216,7 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
             <div>
               <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Batch Size</label>
               <input
+                aria-label="Batch Size"
                 type="number"
                 min={0}
                 max={100}
@@ -216,12 +228,13 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
               />
             </div>
           </div>
-          <p className="text-slate-500 text-[10px]">Batch: 0 = all at once, &gt;0 = process in batches</p>
+          <p className="text-slate-500 dark:text-slate-400 text-[10px] m-0">Batch Size 0 takes every frame at once; more, that many at a time (less memory).</p>
 
           {/* Output format */}
           <div>
             <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Format</label>
             <select
+              aria-label="Format"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-orange-500"
               value={outputFormat}
               onChange={handleFormatChange}
@@ -232,11 +245,7 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
             </select>
           </div>
 
-          {/* Info */}
-          <div className="text-slate-500 text-[10px] border-t border-slate-300 dark:border-slate-700 pt-2 mt-1">
-            <div>Input: video file path</div>
-            <div>Output: array of frame images</div>
-          </div>
+          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">Gives the frames as a list of pictures.</p>
         </>
       )}
     </CollapsibleNodeWrapper>

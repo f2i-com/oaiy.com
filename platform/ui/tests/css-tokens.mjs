@@ -42,9 +42,10 @@ const RUNTIME_TOKENS = new Set([
  * Tokens set on an element by a rule or an inline style rather than on a theme
  * root: --node on canvas nodes, --tone on landing-page sections (each section
  * sets the signal colour its rail, list markers and chips read), --depth on the
- * Agent's file-tree rows (tree.ts sets each row's nesting inline).
+ * Agent's file-tree rows (tree.ts sets each row's nesting inline), --lines on the
+ * dashboard's clamped run text (RunParts.tsx sets how many lines it shows inline).
  */
-const LOCAL_TOKENS = new Set(['--node', '--tone', '--depth']);
+const LOCAL_TOKENS = new Set(['--node', '--tone', '--depth', '--lines']);
 
 const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '');
 

@@ -602,7 +602,7 @@ export function PackageCreator({
                   />
                 </svg>
               )}
-              {creating ? 'Creating...' : 'Create Package'}
+              {creating ? 'Creating…' : 'Create Package'}
             </button>
           ) : (
             <button

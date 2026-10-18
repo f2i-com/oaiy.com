@@ -423,12 +423,13 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     if (data.length === 0) return [];
     const allKeys = new Set<string>();
     data.forEach(row => Object.keys(row).forEach(k => allKeys.add(k)));
-    // Put _id first, _created last, others alphabetically
+    // The record's own fields in the order it has them (as the flow wrote them: name before country), then when it was
+    // stored and its id. The id, a long UUID, came first, and pushed the fields that say what a record is off the right.
     const keys = Array.from(allKeys);
     return [
-      ...keys.filter(k => k === '_id'),
-      ...keys.filter(k => !k.startsWith('_')).sort(),
+      ...keys.filter(k => !k.startsWith('_')),
       ...keys.filter(k => k === '_created'),
+      ...keys.filter(k => k === '_id'),
     ];
   };
 
@@ -676,7 +677,12 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
                           />
                         </td>
                         {columns.map(col => (
-                          <td key={col} title={formatValue(row[col])}>
+                          <td
+                            key={col}
+                            title={formatValue(row[col])}
+                            // (numbers line up on the right, as in a spreadsheet; the id is the faint bookkeeping it is)
+                            className={typeof row[col] === 'number' ? 'text-right tabular-nums' : col.startsWith('_') ? 'text-content-faint' : undefined}
+                          >
                             {formatValue(row[col])}
                           </td>
                         ))}

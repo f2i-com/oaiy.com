@@ -511,6 +511,22 @@ function SharingToggle() {
     }
   }, [apiBase, buildHasBackend]);
 
+  // A build with no sharing server has nothing here to turn on: said in a line, not a greyed form with an empty
+  // address and an amber warning about a feature it does not have.
+  if (!buildHasBackend) {
+    return (
+      <Card title="Sharing and remote runs">
+        <p className="oaiy-card-text m-0">
+          Sharing a flow by link, and the runs other apps start from that link, go through a sharing server. This copy of
+          the editor was built without one, so they are off.
+        </p>
+        <p className="oaiy-help faint m-0">
+          For whoever builds the editor: set <code className="oaiy-code">VITE_API_BASE=https://your-host</code> when building it.
+        </p>
+      </Card>
+    );
+  }
+
   return (
     <Card title="Sharing and remote runs">
       <label className={`oaiy-check${buildHasBackend ? '' : ' disabled'}`}>

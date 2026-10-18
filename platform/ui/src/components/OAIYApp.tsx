@@ -44,6 +44,9 @@ import type { QueuedRun, RunOutcome, FlowSnapshot } from '../lib/backendDispatch
 import WelcomeWizard from './wizards/WelcomeWizard';
 import { hasCompletedWizard } from '../lib/wizardPrefs';
 import { saveService, listAllServices } from '../utils/serviceRegistry';
+import { listDesktopServices } from '../lib/desktopServices';
+import { inOaiyWindow } from '../lib/oaiyWindow';
+import { shared as sharedWithDesktop } from '../hooks/useDesktopFlows';
 import { sanitizeProjectForExport } from '../utils/ProjectIO';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
@@ -55,6 +58,18 @@ export type { LoadedPackage, ActivePackageFlow };
 
 /** Persisted collapse state for the flows rail. */
 const FLOWS_RAIL_KEY = 'oaiy.flowsRail';
+
+/**
+ * OAIY's own models a starter flow can use, in its window: the engine's language model and its default picture model,
+ * as the desktop lists them (lib/desktopServices.ts), named as a person knows them.
+ */
+function oaiyStarterServices(): CustomService[] {
+  const engine = listDesktopServices().filter((s) => s.group === 'engine' && !/:node\./.test(s.id));
+  const pick = (kind: string) => engine.find((s) => s.kind === kind && s.default) ?? engine.find((s) => s.kind === kind);
+  const named = (s: CustomService | undefined, what: string) =>
+    s ? [{ ...s, name: `OAIY's ${what}${s.model ? ` (${s.model})` : ''}` }] : [];
+  return [...named(pick('llm'), 'language model'), ...named(pick('image'), 'picture model')];
+}
 
 // Connected FlowsSidebar that accesses JobQueue context
 interface ConnectedFlowsSidebarProps extends Omit<React.ComponentProps<typeof FlowsSidebar>, 'isFlowRunning'> {
@@ -195,6 +210,7 @@ export default function OAIYApp() {
   useEffect(() => subscribeDesktopStatus(setDesktop), []);
   // What the editor can do here (lib/caps.ts): no Packages section and no dock in a tab that is not linked to a desktop.
   const caps = useCaps();
+  const savedWhere = !inOaiyWindow() ? 'Saved in this browser' : activeFlow && sharedWithDesktop(activeFlow) ? 'Saved in OAIY' : 'Saved in this window';
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
 
   // Package management hook
@@ -412,6 +428,9 @@ export default function OAIYApp() {
     skipAutoSaveRef.current = true;
     setActiveFlowId(flowId);
     setActivePackageFlow(null); // Clear package flow selection
+    // On a phone the rail lies over the canvas: the flow picked is what the person wants to see (the rail stayed
+    // open over it, and Run under it could not be pressed).
+    if (isPhone) setFlowsSidebarOpen(false);
 
     // If switching away from a macro, save any pending changes in the background
     if (activeFlowId && activeFlowId !== flowId) {
@@ -431,7 +450,7 @@ export default function OAIYApp() {
     setTimeout(() => {
       skipAutoSaveRef.current = false;
     }, 500);
-  }, [activeFlowId, project.flows, saveMacroChanges, setActiveFlowId, setActivePackageFlow]);
+  }, [activeFlowId, project.flows, saveMacroChanges, setActiveFlowId, setActivePackageFlow, isPhone]);
 
   // Debug logging for flow display issues
   if (activePackageFlow) {
@@ -709,7 +728,9 @@ export default function OAIYApp() {
           crumb={SECTION_LABEL[section]}
           theme={resolvedTheme}
           onSetTheme={followsOaiy ? undefined : setTheme}
-          savedLabel={section === 'workflows' ? (saveState === 'saved' ? 'Saved in this browser' : saveState === 'saving' ? 'Saving…' : 'Not saved: storage full') : undefined}
+          // (where it is kept: in OAIY's window a flow goes to OAIY Desktop a moment after each change, hooks/useDesktopFlows.ts,
+          // where the agent and the CLI find it; a macro, an example or one kept in the window only stays in the window)
+          savedLabel={section === 'workflows' ? (saveState === 'saved' ? savedWhere : saveState === 'saving' ? 'Saving…' : 'Not saved: storage full') : undefined}
           savedProblem={saveState === 'not-saved'}
           chips={
             section === 'workflows' ? (
@@ -1093,7 +1114,10 @@ export default function OAIYApp() {
         // Every non-built-in service the user already has. The wizard lists
         // them so a returning user can REUSE one for a starter flow instead of
         // re-creating it, and flags presets that are already configured.
-        existingServices={listAllServices().filter((s) => !s.isBuiltIn)}
+        // In OAIY's window, OAIY's own language and picture models first: they are there already, and the wizard
+        // asked for an OpenAI key or an Ollama address before it would make a starter flow.
+        existingServices={[...(inOaiyWindow() ? oaiyStarterServices() : []), ...listAllServices().filter((s) => !s.isBuiltIn)]}
+        inOaiy={inOaiyWindow()}
         // API-key constants that already hold a value, so the wizard can say
         // "already set — leave blank to reuse" for a shared key (e.g. add an
         // OpenAI chat service then GPT Image without re-typing OPENAI_API_KEY).

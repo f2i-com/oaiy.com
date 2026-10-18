@@ -142,7 +142,7 @@ function FileReadNode({ data }: FileReadNodeProps) {
 
       {/* Current File Preview */}
       {data._fileName && (
-        <div className="flex items-center gap-2 px-2 py-1.5 bg-emerald-900/20 border border-emerald-600/30 rounded text-emerald-700 dark:text-emerald-400 text-xs truncate">
+        <div className="flex items-center gap-2 px-2 py-1.5 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-600/30 rounded text-emerald-700 dark:text-emerald-400 text-xs truncate">
           <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
           </svg>
@@ -150,11 +150,10 @@ function FileReadNode({ data }: FileReadNodeProps) {
         </div>
       )}
 
-      {/* Info */}
-      <div className="text-slate-500 text-[10px] border-t border-slate-300 dark:border-slate-700 pt-2 mt-1">
-        <div>Input: file path (string or FileInfo)</div>
-        <div>Output: {readAs === 'json' ? 'parsed object/array' : readAs === 'csv' ? 'array of row objects' : readAs === 'lines' ? 'array of strings' : 'file content'}</div>
-        <div className="text-slate-600 mt-1">Large files (&gt;10MB) stream via Text Chunker</div>
+      {/* What it gives (the shape a code step reads) */}
+      <div className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug">
+        <div>Reads the file whose path comes in on Path, and gives {readAs === 'json' ? 'the object or list it holds' : readAs === 'csv' ? 'its rows, each an object' : readAs === 'lines' ? 'its lines, as a list' : readAs === 'base64' ? 'its bytes as a data: URL' : 'its text'}.</div>
+        <div className="mt-1">A file over 10 MB is better read in pieces by Text Chunker.</div>
       </div>
     </CollapsibleNodeWrapper>
   );

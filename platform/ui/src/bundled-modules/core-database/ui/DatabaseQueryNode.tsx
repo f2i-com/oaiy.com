@@ -50,9 +50,9 @@ function DatabaseQueryNode({ data }: DatabaseQueryNodeProps) {
   const collapsedPreview = (
     <div className="text-slate-600 dark:text-slate-400">
       {data.collectionName ? (
-        <span className="text-blue-700 dark:text-blue-400 font-mono text-[10px]">{data.collectionName}</span>
+        <span className="font-mono">{data.collectionName}</span>
       ) : (
-        <span className="italic text-slate-500">No name</span>
+        <span className="italic">No collection named yet</span>
       )}
     </div>
   );
@@ -82,9 +82,10 @@ function DatabaseQueryNode({ data }: DatabaseQueryNodeProps) {
       {data.showBodyProperties !== false && (
         <>
           <div>
-            <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Collection Name</label>
+            <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Collection</label>
             <input
               type="text"
+              aria-label="Collection"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-blue-500 font-mono"
               placeholder="my_data"
               value={data.collectionName || ''}
@@ -97,6 +98,7 @@ function DatabaseQueryNode({ data }: DatabaseQueryNodeProps) {
             <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Filter (JSON)</label>
             <input
               type="text"
+              aria-label="Filter (JSON)"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-blue-500 font-mono"
               placeholder='{}'
               value={data.filterJson || ''}
@@ -105,8 +107,8 @@ function DatabaseQueryNode({ data }: DatabaseQueryNodeProps) {
             />
           </div>
 
-          <p className="text-slate-500 text-[10px]">
-            Reads data from the collection. Connect a filter or use JSON.
+          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
+            Gives the records in this collection that match the filter: the one connected to Filter, else this one.
           </p>
         </>
       )}

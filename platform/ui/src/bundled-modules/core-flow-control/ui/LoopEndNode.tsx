@@ -90,7 +90,7 @@ function LoopEndNode({ data }: LoopEndNodeProps) {
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'loop', type: 'target', position: Position.Top, color: '!bg-amber-500', label: 'loop', labelColor: 'text-amber-700 dark:text-amber-400', size: 'md' },
+    { id: 'loop', type: 'target', position: Position.Top, color: '!bg-amber-500', label: 'Loop', labelColor: 'text-amber-700 dark:text-amber-400', size: 'md' },
     { id: 'input', type: 'target', position: Position.Left, color: '!bg-blue-500', size: 'lg' },
   ], []);
 
@@ -101,12 +101,12 @@ function LoopEndNode({ data }: LoopEndNodeProps) {
   const titleExtra = (
     <>
       {data.loopName && (
-        <span className="px-1.5 py-0.5 bg-amber-800 text-amber-700 dark:text-amber-300 text-[10px] rounded font-mono">
+        <span className="px-1.5 py-0.5 bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-300 text-[10px] rounded font-mono">
           {data.loopName}
         </span>
       )}
       {resultCount > 0 && (
-        <span className="ml-auto px-1.5 py-0.5 bg-amber-900 text-amber-700 dark:text-amber-400 text-[10px] rounded">
+        <span className="ml-auto px-1.5 py-0.5 bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-300 text-[10px] rounded" title="Collected on the last run">
           {resultCount}
         </span>
       )}
@@ -136,6 +136,7 @@ function LoopEndNode({ data }: LoopEndNodeProps) {
           <div>
             <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Stop When</label>
             <select
+              aria-label="Stop When"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-500"
               value={stopCondition}
               onChange={handleStopConditionChange}
@@ -155,6 +156,7 @@ function LoopEndNode({ data }: LoopEndNodeProps) {
               <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Field Name</label>
               <input
                 type="text"
+                aria-label="Field Name"
                 className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-500 font-mono"
                 placeholder="status, done, complete"
                 value={data.stopField || ''}
@@ -172,6 +174,7 @@ function LoopEndNode({ data }: LoopEndNodeProps) {
               </label>
               <input
                 type="text"
+                aria-label={stopCondition === 'json_field' ? 'Field Value' : 'Stop Value'}
                 className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-500 font-mono"
                 placeholder={stopCondition === 'json_field' ? 'true, done, complete' : 'DONE, finished, complete'}
                 value={data.stopValue || ''}
@@ -181,10 +184,10 @@ function LoopEndNode({ data }: LoopEndNodeProps) {
             </div>
           )}
 
-          <p className="text-slate-500 text-[10px]">
+          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
             {stopCondition === 'none'
-              ? 'Collects results from each iteration into an array.'
-              : 'Stops loop early when condition is met.'}
+              ? 'Collects what reaches it each round into a list.'
+              : 'Collects what reaches it each round, and stops the loop early when this holds.'}
           </p>
         </>
       )}

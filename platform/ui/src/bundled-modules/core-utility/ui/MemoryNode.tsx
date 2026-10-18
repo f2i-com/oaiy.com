@@ -3,15 +3,17 @@ import { Position } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig, type ValidationIssue } from 'oaiy-ui-components';
 
 interface MemoryNodeData {
+  /** What the run does (compiler.ts): `get` reads the key, `set` stores the input under it. */
+  operation?: string;
+  /** The card's own word for it before it set `operation` (kept in step for flows that have it). */
   mode?: 'read' | 'write';
   key?: string;
-  defaultValue?: string;
   _status?: 'running' | 'completed' | 'error';
   _collapsed?: boolean;
   onModeChange?: (value: 'read' | 'write') => void;
   onKeyChange?: (value: string) => void;
-  onDefaultValueChange?: (value: string) => void;
   onCollapsedChange?: (value: boolean) => void;
+  onChange?: (field: string, value: unknown) => void;
   showBodyProperties?: boolean;
 }
 
@@ -27,31 +29,35 @@ const MemoryIcon = (
   </svg>
 );
 
+/** Read or Write, from what the run does (`operation`), else the card's older `mode`. */
+function modeOf(data: MemoryNodeData): 'read' | 'write' {
+  if (data.operation) return ['set', 'append', 'write'].includes(data.operation) ? 'write' : 'read';
+  return data.mode === 'write' ? 'write' : 'read';
+}
+
 function MemoryNode({ data }: MemoryNodeProps) {
-  const mode = data.mode || 'read';
+  const mode = modeOf(data);
 
   const onModeChangeRef = useRef(data.onModeChange);
   const onKeyChangeRef = useRef(data.onKeyChange);
-  const onDefaultValueChangeRef = useRef(data.onDefaultValueChange);
+  const onChangeRef = useRef(data.onChange);
   const onCollapsedChangeRef = useRef(data.onCollapsedChange);
 
   useEffect(() => {
     onModeChangeRef.current = data.onModeChange;
     onKeyChangeRef.current = data.onKeyChange;
-    onDefaultValueChangeRef.current = data.onDefaultValueChange;
+    onChangeRef.current = data.onChange;
     onCollapsedChangeRef.current = data.onCollapsedChange;
   });
 
+  // The run reads `operation` (get or set): the card set only its own `mode`, so Write stored nothing.
   const handleModeChange = useCallback((newMode: 'read' | 'write') => {
+    onChangeRef.current?.('operation', newMode === 'write' ? 'set' : 'get');
     onModeChangeRef.current?.(newMode);
   }, []);
 
   const handleKeyChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
     onKeyChangeRef.current?.(e.target.value);
-  }, []);
-
-  const handleDefaultValueChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
-    onDefaultValueChangeRef.current?.(e.target.value);
   }, []);
 
   const handleCollapsedChange = useCallback((collapsed: boolean) => {
@@ -67,20 +73,15 @@ function MemoryNode({ data }: MemoryNodeProps) {
   }, [data.key]);
 
   const collapsedPreview = (
-    <div className="text-slate-600 dark:text-slate-400">
-      <span className={mode === 'read' ? 'text-cyan-700 dark:text-cyan-400' : 'text-orange-700 dark:text-orange-400'}>{mode.toUpperCase()}</span>
-      {data.key && <span className="ml-1 font-mono text-[10px]">{data.key}</span>}
-    </div>
+    <span>
+      {mode === 'read' ? 'reads' : 'stores'} {data.key ? <span className="font-mono">{data.key}</span> : 'nothing yet: give it a key'}
+    </span>
   );
 
-  const inputHandles = useMemo<HandleConfig[]>(() => {
-    if (mode === 'write') {
-      return [
-        { id: 'value', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'value', labelColor: 'text-blue-700 dark:text-blue-400', size: 'lg' },
-      ];
-    }
-    return [];
-  }, [mode]);
+  // Its input in both modes: Write stores it, and Read gives it on when nothing is stored under the key yet.
+  const inputHandles = useMemo<HandleConfig[]>(() => [
+    { id: 'value', type: 'target', position: Position.Left, color: '!bg-slate-400', size: 'lg' },
+  ], []);
 
   const outputHandles = useMemo<HandleConfig[]>(() => [
     { id: 'value', type: 'source', position: Position.Right, color: '!bg-green-500', size: 'lg' },
@@ -105,12 +106,13 @@ function MemoryNode({ data }: MemoryNodeProps) {
         <>
           {/* Mode Toggle */}
           <div>
-            <span className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Mode</span>
+            <span className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Operation</span>
             <div className="flex gap-2">
               <button
                 className={`flex-1 px-3 py-1.5 rounded text-sm font-medium transition-colors ${mode === 'read' ? 'bg-cyan-600 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-300 dark:hover:bg-slate-600'
                   }`}
                 onClick={() => handleModeChange('read')}
+                aria-pressed={mode === 'read'}
               >
                 Read
               </button>
@@ -118,6 +120,7 @@ function MemoryNode({ data }: MemoryNodeProps) {
                 className={`flex-1 px-3 py-1.5 rounded text-sm font-medium transition-colors ${mode === 'write' ? 'bg-cyan-600 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-300 dark:hover:bg-slate-600'
                   }`}
                 onClick={() => handleModeChange('write')}
+                aria-pressed={mode === 'write'}
               >
                 Write
               </button>
@@ -126,9 +129,10 @@ function MemoryNode({ data }: MemoryNodeProps) {
 
           {/* Key Input */}
           <div>
-            <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Key Name</label>
+            <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Key</label>
             <input
               type="text"
+              aria-label="Key"
               className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-cyan-500 font-mono"
               placeholder="my_variable"
               value={data.key || ''}
@@ -137,20 +141,11 @@ function MemoryNode({ data }: MemoryNodeProps) {
             />
           </div>
 
-          {/* Default Value for Read mode */}
-          {mode === 'read' && (
-            <div>
-              <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Default (if not set)</label>
-              <input
-                type="text"
-                className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-cyan-500"
-                placeholder="default value"
-                value={data.defaultValue || ''}
-                onChange={handleDefaultValueChange}
-                onMouseDown={(e) => e.stopPropagation()}
-              />
-            </div>
-          )}
+          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
+            {mode === 'read'
+              ? 'Gives what is stored under the key; nothing stored yet, it gives what comes in on Value.'
+              : 'Stores what comes in on Value under the key, kept between runs, and passes it on.'}
+          </p>
         </>
       )}
     </CollapsibleNodeWrapper>

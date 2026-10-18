@@ -69,7 +69,8 @@ export function getDefaultNodeData(type: NodeType, projectSettings?: ProjectSett
     case 'logic_block':
       return { code: '// Transform the inputs\nreturn input;', inputCount: 1, inputNames: ['input'] };
     case 'memory':
-      return { mode: 'read', key: 'myValue', defaultValue: '' };
+      // (`operation` is what the run reads: get or set)
+      return { operation: 'get', key: 'myValue' };
     case 'image_gen': {
       // Use project settings defaults if available. Falls back to
       // ComfyUI — the only image backend the web build ships with.

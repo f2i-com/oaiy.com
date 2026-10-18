@@ -37,7 +37,7 @@ export const SelectField: React.FC<SelectFieldProps> = ({
   value,
   onChange,
   options,
-  placeholder = 'Select...',
+  placeholder = 'Choose…',
   description,
   disabled = false,
   required = false,
