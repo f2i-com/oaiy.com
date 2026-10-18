@@ -6,8 +6,11 @@
  * `oaiy-llm-server-webgpu` (every model on any graphics card through WebGPU, else the CPU), is about 15 MB and
  * needs nothing a system lacks, so every installer carries it. So does the media worker, `oaiy-media` (pictures,
  * video, music, sound effects, speech and 3D models, on any graphics card through WebGPU, some 25 MB): without it an
- * installed OAIY offered image models it had nothing to make a picture with. The desktop finds them in
- * `<install>/resources/engines` (src-tauri/src/engines.rs), after a build of one's own put beside the program.
+ * installed OAIY offered image models it had nothing to make a picture with. And OAIY's voice, `oaiy-voice` (speech
+ * to text and text to speech for calls, some 15 MB), which the OAIY Voice service runs: no installer carried it, so
+ * an installed OAIY's voice said "program not found". The desktop finds the engines in `<install>/resources/engines`
+ * (src-tauri/src/engines.rs) and the voice there too (services/registry.rs, `oaiy_program`), after a build of one's
+ * own put beside the program.
  *
  * This does not build them: `cargo build` of each takes minutes, and the release workflows run it before
  * `tauri build`. It checks that each build is there, copies it, and verifies the copy against the build; a missing or
@@ -33,6 +36,11 @@ export const ENGINES = [
     name: 'oaiy-media',
     what: 'the media engine (pictures, video, music, sound and speech)',
     build: 'cargo build --release -p oaiy-media',
+  },
+  {
+    name: 'oaiy-voice',
+    what: "OAIY's voice for calls (speech to text and text to speech)",
+    build: 'cargo build --release -p oaiy-voice',
   },
 ];
 

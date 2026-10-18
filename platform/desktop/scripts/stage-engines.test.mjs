@@ -1,6 +1,6 @@
-// OAIY's engines the installer carries (stage-engines-lib.mjs), the language-model engine and the media engine: staged
-// where engines.rs looks, refused when one was not built, and wired so that `tauri build` cannot make an installer
-// without them.
+// OAIY's engines the installer carries (stage-engines-lib.mjs), the language-model engine, the media engine and the
+// voice: staged where engines.rs (and, for the voice, the services' registry) looks, refused when one was not built,
+// and wired so that `tauri build` cannot make an installer without them.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -33,8 +33,8 @@ const build = (platform, name, bytes = Buffer.from(`MZ ${name}`)) => {
 const buildAll = (platform) => ENGINES.forEach(({ name }) => build(platform, name));
 
 describe("OAIY's engines", () => {
-  it('are the language-model engine and the media engine', () => {
-    expect(ENGINES.map((e) => e.name)).toEqual(['oaiy-llm-server-webgpu', 'oaiy-media']);
+  it('are the language-model engine, the media engine and the voice', () => {
+    expect(ENGINES.map((e) => e.name)).toEqual(['oaiy-llm-server-webgpu', 'oaiy-media', 'oaiy-voice']);
     expect(ENGINE).toBe('oaiy-llm-server-webgpu');
     expect(BUILD_COMMAND).toBe(ENGINES[0].build);
   });
@@ -88,7 +88,13 @@ describe("OAIY's engines", () => {
     for (const { build: command } of ENGINES) {
       expect(release).toContain(command.replace('cargo build --release', 'cargo build --release --locked'));
     }
-    expect(mac).toContain('cargo build --release --locked -p oaiy-media');
+    // (the Mac's language-model engine is built with `tinygpu`, so its command is its own)
+    for (const { name, build: command } of ENGINES.filter((e) => e.name !== 'oaiy-llm-server-webgpu')) {
+      expect(mac).toContain(command.replace('cargo build --release', 'cargo build --release --locked'));
+      expect(release, `release.yml does not check ${name} starts`).toContain(`target/release/${name} --help > /dev/null`);
+      expect(mac, `mac-build.yml does not check ${name} starts`).toContain(`target/release/${name} --help > /dev/null`);
+    }
+    expect(mac).toContain('--features tinygpu --bin oaiy-llm-server-webgpu');
   });
 
   const git = spawnSync('git', ['--version']).status === 0;

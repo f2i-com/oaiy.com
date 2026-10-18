@@ -403,24 +403,38 @@ fn os_fix_path(s: String) -> String {
         .replace("/Scripts/pythonw.exe", "/bin/python")
 }
 
-/// A program that ships with OAIY (beside the desktop, in its `engines`
-/// folder, `OAIY_ENGINES_DIR`, or a build from the repository's release
-/// folder), as a bare service command names it: `oaiy-voice`.
+/// A program that ships with OAIY, as a bare service command names it:
+/// `oaiy-voice`. Found where [`oaiy_program_dirs`] says, in its order.
 fn oaiy_program(cmd: &str) -> Option<PathBuf> {
     if cmd.is_empty() || cmd.contains(['/', '\\', ':']) {
         return None;
     }
     let file = if cfg!(windows) && !cmd.ends_with(".exe") { format!("{cmd}.exe") } else { cmd.to_string() };
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = std::env::var_os("OAIY_ENGINES_DIR") {
-        dirs.push(PathBuf::from(dir));
-    }
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+    let dirs = oaiy_program_dirs(
+        std::env::var_os("OAIY_ENGINES_DIR").map(PathBuf::from),
+        std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
+        crate::engines::bundled().map(Path::to_path_buf),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release"),
+    );
+    dirs.into_iter().map(|d| d.join(&file)).find(|p| p.is_file()).map(|p| std::path::absolute(&p).unwrap_or(p))
+}
+
+/// Where OAIY's own programs are looked for, in the engines' order
+/// (`engines::programs_dir`): `OAIY_ENGINES_DIR`; the `engines` folder beside
+/// the desktop, then its own folder (a build of one's own put there); the
+/// engines the installer carries (`<resources>/resources/engines`); a build
+/// from the repository's release folder. Without the installer's folder an
+/// installed OAIY looked for its voice only beside itself and in the folder it
+/// was built in, which is on the machine that built it: "program not found".
+fn oaiy_program_dirs(env: Option<PathBuf>, beside: Option<PathBuf>, bundled: Option<PathBuf>, repo: PathBuf) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = env.into_iter().collect();
+    if let Some(dir) = beside {
         dirs.push(dir.join("engines"));
         dirs.push(dir);
     }
-    dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release"));
-    dirs.into_iter().map(|d| d.join(&file)).find(|p| p.is_file()).map(|p| std::path::absolute(&p).unwrap_or(p))
+    dirs.extend(bundled);
+    dirs.push(repo);
+    dirs
 }
 
 /// The standard per-user install location an installer like Ollama's `OllamaSetup.exe` drops
@@ -2895,6 +2909,22 @@ mod tests {
         let sentence = format!("port {port} is already in use{suffix} — nothing was started.");
         assert!(!sentence.contains("in use("), "missing space before the holder: {sentence}");
         assert!(!sentence.contains("  "), "double space in: {sentence}");
+    }
+
+    #[test]
+    fn oaiy_s_own_programs_are_looked_for_where_the_installer_puts_them() {
+        // An installed 0.1.7 said "spawn failed: program not found" for OAIY Voice: the folder the installer carries
+        // the engines in was not among these, only the one it was built in.
+        let p = PathBuf::from;
+        let installed = p("OAIY");
+        let bundled = installed.join("resources").join("engines");
+        assert_eq!(
+            oaiy_program_dirs(Some(p("chosen")), Some(installed.clone()), Some(bundled.clone()), p("repo")),
+            vec![p("chosen"), installed.join("engines"), installed.clone(), bundled.clone(), p("repo")],
+        );
+        // A program put beside the desktop (a build of one's own) still comes before the installer's, as an engine does.
+        assert_eq!(oaiy_program_dirs(None, Some(installed.clone()), Some(bundled.clone()), p("repo"))[2..], [bundled, p("repo")]);
+        assert_eq!(oaiy_program_dirs(None, None, None, p("repo")), vec![p("repo")]);
     }
     use super::venv_name_in;
     use std::time::{Duration, Instant};

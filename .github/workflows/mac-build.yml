@@ -249,6 +249,15 @@ jobs:
       - name: Check the media engine starts
         run: target/release/oaiy-media --help > /dev/null
 
+      # And OAIY's voice, which the OAIY Voice service runs (speech to text on the CPU through Accelerate, speech on the
+      # GPU through WebGPU): no image carried it, so an installed OAIY's voice said "program not found". Staged beside
+      # the engines; the signing job signs it with every other program in the app.
+      - name: Build OAIY's voice
+        run: cargo build --release --locked -p oaiy-voice
+
+      - name: Check the voice starts
+        run: target/release/oaiy-voice --help > /dev/null
+
       - name: Build OAIY Desktop
         working-directory: platform/desktop
         run: npm run tauri:build -- --bundles app,dmg

@@ -34,6 +34,12 @@ pub fn set_bundled(dir: PathBuf) {
     let _ = BUNDLED.set(dir);
 }
 
+/// Where the installer's engines are, once the app has said ([`set_bundled`]): OAIY's other programs it carries
+/// (`oaiy-voice`) are there too.
+pub fn bundled() -> Option<&'static Path> {
+    BUNDLED.get().map(PathBuf::as_path)
+}
+
 static MODELS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The desktop's models folder: the one its "Model files" lists and "models downloaded to" opens. The engines kept

@@ -261,6 +261,12 @@ fn main() {
     }
     let key = api_key();
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Asked for, the usage is an answer (exit 0), as `oaiy-media --help`'s is: the release checks the bundled program
+    // starts with it.
+    if argv.first().is_some_and(|a| a == "--help" || a == "-h") {
+        println!("{}", cli::USAGE);
+        return;
+    }
     let result = if argv.first().is_some_and(|a| a == "transcribe") {
         transcribe(argv.into_iter().skip(1).collect())
     } else {

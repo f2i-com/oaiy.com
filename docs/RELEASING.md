@@ -32,9 +32,12 @@ that opens on "the page is not built". It also carries the language-model engine
 WebGPU, else the CPU, about 15 MB), so the model the setup downloads runs with nothing else
 to install, and the media engine (`resources/engines/oaiy-media`: pictures, video, music,
 sound effects, speech and 3D models through WebGPU, about 25 MB), so an image model it
-downloads makes pictures; building an installer stops if either is not built
-(`platform/desktop/scripts/stage-engines.mjs`; the release workflows build both, and check
-that the media engine starts). A media worker of one's own beside the configuration (where
+downloads makes pictures, and OAIY's voice (`resources/engines/oaiy-voice`: speech to text
+and text to speech for calls, about 15 MB), which the OAIY Voice service runs (up to 0.1.7
+no installer carried it, and an installed OAIY's voice said "program not found"); building
+an installer stops if any of them is not built
+(`platform/desktop/scripts/stage-engines.mjs`; the release workflows build all three, and
+check that the media engine and the voice start). A media worker of one's own beside the configuration (where
 one had to be put before installers carried it) is passed over for the installer's;
 `media.worker` set to a path names one's own build. What OAIY needs at run time (language and
 other models, the portable Python and the Node runtime) is downloaded on first use, not

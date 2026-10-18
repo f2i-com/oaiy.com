@@ -24,6 +24,7 @@ describe('the desktop legs of the release', () => {
   const tauri = at((step) => step.name === 'Build OAIY Desktop');
   const engine = at((step) => step.name === 'Build the portable language-model engine');
   const media = at((step) => step.name === 'Build the media engine');
+  const voice = at((step) => step.name === "Build OAIY's voice");
 
   it('build the Agent and the flow editor before tauri build stages them', () => {
     assert.ok(agent >= 0 && flows >= 0 && tauri >= 0, JSON.stringify({ agent, flows, tauri }));
@@ -54,6 +55,19 @@ describe('the desktop legs of the release', () => {
     assert.ok(starts > media && starts < tauri, JSON.stringify({ starts, media, tauri }));
     const step = document.jobs.desktop.steps.find((s) => s.name === 'Check the media engine starts');
     assert.equal(step.shell, 'bash', 'the same command on Windows');
+  });
+
+  it("build OAIY's voice before tauri build stages it, and check that it starts", () => {
+    // stage-engines.mjs copies target/release/oaiy-voice beside the engines, and stops when it is missing: no installer
+    // up to 0.1.7 carried it, and an installed OAIY's voice said "spawn failed: program not found".
+    assert.ok(voice >= 0 && voice < tauri, JSON.stringify({ voice, tauri }));
+    assert.equal(desktop[voice].workingDirectory, undefined, 'the repository\'s workspace, at its root');
+    assert.equal(desktop[voice].run.trim(), 'cargo build --release --locked -p oaiy-voice');
+    const starts = at((step) => step.name === 'Check the voice starts');
+    assert.ok(starts > voice && starts < tauri, JSON.stringify({ starts, voice, tauri }));
+    const step = document.jobs.desktop.steps.find((s) => s.name === 'Check the voice starts');
+    assert.equal(step.shell, 'bash', 'the same command on Windows');
+    assert.equal(step.run.trim(), 'target/release/oaiy-voice --help > /dev/null');
   });
 
   it('build the flow editor with the release’s ZIPP, and standalone', () => {

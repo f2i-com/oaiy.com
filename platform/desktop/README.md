@@ -238,6 +238,8 @@ cd app; npm ci; npm run build:desktop; cd ..             # the Agent, and the So
 cd platform/ui; npm ci; npm run build; cd ../..          # the flow editor
 cd platform/cli; npm ci; npm run build; cd ../..         # the CLI
 cargo build --release -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu   # the portable language-model engine
+cargo build --release -p oaiy-media                      # the media engine
+cargo build --release -p oaiy-voice                      # OAIY's voice
 cd platform/desktop; npm ci; npm run tauri:build
 ```
 
@@ -249,18 +251,20 @@ installer never goes without one. Tauri keeps the `resources/` of a bundled fold
 installed OAIY finds the pages in `<install>/resources/app` and `<install>/resources/flows`,
 where `src/embed.rs` looks (`OAIY_APP_DIST` and `OAIY_FLOWS_DIST` override it). Then
 `npm run stage-engines` copies the portable language-model engine
-(`target/release/oaiy-llm-server-webgpu`) into `src-tauri/resources/engines`, and stops when
-it is not built: an installed OAIY runs the model its setup downloads on it, from
+(`target/release/oaiy-llm-server-webgpu`), the media engine (`oaiy-media`) and OAIY's voice
+(`oaiy-voice`) into `src-tauri/resources/engines`, and stops when one is not built: an
+installed OAIY runs the model its setup downloads on it, from
 `<install>/resources/engines`, unless a build of `oaiy-llm-server` is beside the program
-(`src/engines.rs`). `tauri dev`, `cargo test` and CI need none of them staged: `build.rs`
+(`src/engines.rs`), and its OAIY Voice service runs the voice from there too
+(`src/services/registry.rs`, `oaiy_program`). `tauri dev`, `cargo test` and CI need none of them staged: `build.rs`
 makes the three folders, empty, and in a debug build the pages come from their build
 folders.
 
 Output is the installers (Windows NSIS and MSI; Linux AppImage, deb and rpm, on Linux; a
 Mac's `OAIY.app` and `.dmg`, on a Mac: [docs/MAC.md](../../docs/MAC.md) says how one is made
-without a Mac at hand) under `src-tauri/target/release/bundle/`. The engines' programs are
-not in them: [docs/RELEASING.md](../../docs/RELEASING.md) says what a release contains and
-what it does not.
+without a Mac at hand) under `src-tauri/target/release/bundle/`. They carry the engines and
+the voice (above); the models are not in them: [docs/RELEASING.md](../../docs/RELEASING.md)
+says what a release contains and what it does not.
 
 **Where an install keeps `resources/`.** Windows' installer has them beside the program. A
 Linux package has the program in `/usr/bin` and the resources in `/usr/lib/OAIY` (the same
