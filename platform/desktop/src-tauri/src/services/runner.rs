@@ -86,6 +86,9 @@ pub struct SpawnConfig<'a> {
     pub args: &'a [String],
     pub env: &'a std::collections::HashMap<String, String>,
     pub cwd: Option<&'a str>,
+    /// A pipe for the child's stdin, held open in the `Child` for as long as the runner keeps it (the template's
+    /// `stdinPipe`): stopped, restarted or OAIY gone, the pipe closes. Otherwise stdin is inherited, as it always was.
+    pub stdin_pipe: bool,
 }
 
 /// Is `name` one of OAIY's own credentials: `OAIY_SERVER_TOKEN`, `OAIY_HF_TOKEN`
@@ -147,6 +150,11 @@ impl Runner {
             cmd.current_dir(d);
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if cfg.stdin_pipe {
+            // (its write end stays in the `Child`, never written to: the child sees its end only when the runner
+            // lets the `Child` go, or this process ends)
+            cmd.stdin(Stdio::piped());
+        }
         // On Windows, hide the console window for the spawned service.
         #[cfg(windows)]
         {
@@ -391,12 +399,36 @@ mod tests {
         impl Drop for Owned {fn drop(&mut self){let _=self.0.stop();}}
         let args=vec!["-e".into(),"setInterval(function(){},1000)".into()];
         let env=HashMap::new();
-        let owned=Owned(Runner::spawn(SpawnConfig{command:if cfg!(windows){"node.exe"}else{"node"},args:&args,env:&env,cwd:None}).expect("Node is required for the real process liveness fixture"));
+        let owned=Owned(Runner::spawn(SpawnConfig{command:if cfg!(windows){"node.exe"}else{"node"},args:&args,env:&env,cwd:None,stdin_pipe:false}).expect("Node is required for the real process liveness fixture"));
         assert!(owned.0.is_running());
         owned.0.child.lock().unwrap().as_mut().unwrap().kill().unwrap();
         let start=Instant::now();
         while owned.0.is_running() && start.elapsed()<Duration::from_secs(2) {std::thread::sleep(Duration::from_millis(10));}
         assert!(!owned.0.is_running());assert!(!owned.0.is_alive());
+    }
+
+    /// A child given a stdin pipe sees its stdin open for as long as the runner keeps it, and at its end once the
+    /// runner lets it go (as when OAIY ends): a service that watches its stdin ends then, and not before.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdin_pipe_stays_open_until_the_runner_lets_the_child_go() {
+        let dir = std::env::temp_dir().join(format!("oaiy-stdin-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("stdin-closed");
+        let args = vec!["-c".to_string(), format!("cat > /dev/null; echo closed > '{}'", marker.display())];
+        let env = HashMap::new();
+        let runner = Runner::spawn(SpawnConfig { command: "sh", args: &args, env: &env, cwd: None, stdin_pipe: true }).expect("spawn sh");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists(), "its stdin is open while the runner holds it");
+        assert!(runner.is_running());
+        drop(runner);
+        let until = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "the child never saw its stdin end");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -433,7 +465,7 @@ mod tests {
     /// child printed of the environment it actually received.
     fn printed_by_a_spawned_child(explicit: &HashMap<String, String>) -> Vec<LogLine> {
         let (command, args) = env_dump();
-        let runner = Runner::spawn(SpawnConfig { command: &command, args: &args, env: explicit, cwd: None })
+        let runner = Runner::spawn(SpawnConfig { command: &command, args: &args, env: explicit, cwd: None, stdin_pipe: false })
             .expect("spawn a child that prints its environment");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -507,7 +539,7 @@ mod tests {
         } else {
             ("sh".to_string(), vec!["-c".to_string(), format!("echo \"overlap is $OAIY_SCRUB_TEST_OVERLAP_TOKEN\"; echo {}", env_probe::END)])
         };
-        let runner = Runner::spawn(SpawnConfig { command: &command, args: &args, env: &explicit, cwd: None }).expect("spawn the child");
+        let runner = Runner::spawn(SpawnConfig { command: &command, args: &args, env: &explicit, cwd: None, stdin_pipe: false }).expect("spawn the child");
         let deadline = Instant::now() + Duration::from_secs(30);
         let printed = loop {
             let lines = runner.logs.snapshot(None);

@@ -1759,6 +1759,7 @@ impl Registry {
             args: &args,
             env: &env,
             cwd: cwd.as_deref().or(Some(data_dir_cwd.as_str())),
+            stdin_pipe: run_spec.stdin_pipe,
         };
 
         // Now take a mutable borrow to update status + stash the runner.
@@ -2262,6 +2263,8 @@ impl Registry {
             // searches the CWD before System32/PATH, so a planted binary in an attacker-
             // writable CWD would otherwise run during install. (Reuses the OAIY_DATA_DIR value.)
             cwd: env.get("OAIY_DATA_DIR").map(String::as_str),
+            // (an installer runs to its end: nothing watches its stdin)
+            stdin_pipe: false,
         };
 
         let runner = Runner::spawn(cfg).map_err(|e| {
@@ -2935,6 +2938,70 @@ mod tests {
         (dir, reg)
     }
 
+    /// A service that ends when its stdin closes (`oaiy-voice --watch-stdin`), started with the stdin pipe its
+    /// template asks for: up and listening on its health URL's port while OAIY runs it (its stdin is not at its end,
+    /// as an inherited one in a test or a GUI app can be), stopped and started again on its own port with a pipe of
+    /// its own, and ending by itself once its runner is let go without a kill (OAIY gone).
+    #[cfg(unix)]
+    #[test]
+    fn a_service_watching_its_stdin_runs_while_oaiy_holds_it_and_ends_after() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, mut reg) = scratch_registry("stdin-pipe");
+        let script = dir.join("fake-watching-voice");
+        std::fs::write(&script, r#"#!/usr/bin/env python3
+import http.server, os, sys, threading
+port = int(sys.argv[1])
+def watch():
+    while sys.stdin.buffer.read(256): pass
+    os._exit(0)
+threading.Thread(target=watch, daemon=True).start()
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        body = b'{"data": []}'
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+"#).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let template: ServiceTemplate = serde_json::from_value(serde_json::json!({
+            "id": "watching-voice", "name": "Watching voice", "description": "a stand-in", "category": "Speech", "defaultPort": port,
+            "run": { "command": script.to_string_lossy(), "args": ["${port}"], "env": {}, "stdinPipe": true },
+            "health": { "url": "http://127.0.0.1:${port}/v1/models", "timeoutSecs": 20 },
+        }))
+        .unwrap();
+        reg.add_template(template).unwrap();
+        // (listening is what is asked, by a connection this side closes: one the server closed would leave its port in
+        // TIME_WAIT, and the restart's check that the port is free would take that for another program)
+        let healthy = || std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(1)).is_ok();
+        let wait = |want: bool, what: &str| {
+            let until = Instant::now() + Duration::from_secs(20);
+            while healthy() != want {
+                assert!(Instant::now() < until, "{what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        reg.start("watching-voice").unwrap();
+        wait(true, "it never answered its health URL");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(healthy(), "it stays up: its stdin is held open");
+        let first = reg.services["watching-voice"].runner.as_ref().unwrap().pid;
+
+        reg.stop("watching-voice").unwrap();
+        wait(false, "stopped, it still answered");
+        reg.start("watching-voice").unwrap();
+        wait(true, "started again, it never answered");
+        let second = reg.services["watching-voice"].runner.as_ref().unwrap().pid;
+        assert_ne!(first, second, "a new process, on the port the old one let go");
+
+        // OAIY gone: nothing kills it, its stdin ends, and it ends.
+        let runner = reg.services.get_mut("watching-voice").unwrap().runner.take().unwrap();
+        drop(runner);
+        wait(false, "it outlived the runner that held its stdin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Any built-in id, so the tests do not hard-code one that could be renamed.
     fn some_service_id(reg: &Registry) -> String {
         let mut ids: Vec<String> = reg.services.keys().cloned().collect();
@@ -3462,6 +3529,7 @@ mod tests {
                 args: &args,
                 env: &env,
                 cwd: None,
+                stdin_pipe: false,
             })
             .expect("spawn a sleeper"),
         );

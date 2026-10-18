@@ -284,6 +284,41 @@ describe('OverviewPanel failure reporting', () => {
     expect(text()).not.toContain('failed since');
   });
 
+  it('judges a failure new by when it ended: one after those seen warns though the count is the same', async () => {
+    // The oldest failed runs let go (or cleared) while new ones failed: by the count alone nothing had changed.
+    localStorage.setItem('oaiy.overview.failedSeen', JSON.stringify({ count: 3, at: '2026-10-18T08:00:00.000Z' }));
+    statusMock.mockResolvedValue({ ...runtime(3), runs: { queued: 0, known: 10, failed: 3, lastFailedAt: '2026-10-18T09:30:00.000Z' } });
+    dismissGuide();
+    await mount();
+    expect(text()).toContain('More runs failed since you last looked.');
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Dismiss: these failures are seen"]')!.click());
+    expect(text()).not.toContain('failed since');
+    expect(JSON.parse(localStorage.getItem('oaiy.overview.failedSeen')!)).toEqual({ count: 3, at: '2026-10-18T09:30:00.000Z' });
+
+    // Nothing newer than what was seen: nothing to say, whatever the count did.
+    act(() => root.unmount());
+    root = createRoot(host);
+    statusMock.mockResolvedValue({ ...runtime(5), runs: { queued: 0, known: 10, failed: 5, lastFailedAt: '2026-10-18T09:30:00.000Z' } });
+    await mount();
+    expect(text()).not.toContain('failed since');
+    expect(text()).not.toContain('failed on this machine');
+
+    // A newer one, with the count to say how many.
+    act(() => root.unmount());
+    root = createRoot(host);
+    statusMock.mockResolvedValue({ ...runtime(5), runs: { queued: 0, known: 10, failed: 5, lastFailedAt: '2026-10-18T10:00:00.000Z' } });
+    await mount();
+    expect(text()).toContain('2 more runs failed since you last looked.');
+  });
+
+  it('reads a count kept before the time was', async () => {
+    localStorage.setItem('oaiy.overview.failedSeen', '2');
+    statusMock.mockResolvedValue({ ...runtime(3), runs: { queued: 0, known: 10, failed: 3, lastFailedAt: '2026-10-18T10:00:00.000Z' } });
+    dismissGuide();
+    await mount();
+    expect(text()).toContain('1 more run failed since you last looked.');
+  });
+
   it('says nothing is installed only while no service is installed either', async () => {
     dismissGuide();
     await mount();

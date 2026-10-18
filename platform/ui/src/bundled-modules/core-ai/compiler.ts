@@ -12,7 +12,7 @@ import { resolveRefsExpr } from 'oaiy-core/src/value-refs';
 // follow. When a service is picked on the AI LLM node, its endpoint / model /
 // headers / apiKeyConstant / body template fill in below explicit data.*
 // fields, replacing the per-provider hardcoded defaults.
-import { engineChatService, resolveService } from '../core-service/contract';
+import { engineChatService, resolveNodeService } from '../core-service/contract';
 
 const CoreAICompiler: ModuleCompiler = {
   name: 'AI',
@@ -90,7 +90,7 @@ const CoreAICompiler: ModuleCompiler = {
     // Falls back to project-wide `defaultAIServiceId` (Settings → Providers)
     // so new nodes inherit the user's preferred engine without configuring.
     const presetId = String(data.service || projectSettings?.defaultAIServiceId || '');
-    const preset = resolveService(presetId) ?? engineChatService(presetId);
+    const preset = resolveNodeService(presetId, data) ?? engineChatService(presetId);
     // OAIY's engine: the desktop's `oaiy-engine` provider, which needs no key
     // (the user's OpenAI key must not be sent to it) and speaks plain OpenAI
     // chat — its body template is for the Service Call node only.

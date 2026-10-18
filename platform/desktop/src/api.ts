@@ -979,7 +979,8 @@ export interface RuntimeStatus {
     engine?: { name: string | null; release: string | null; status: 'ready' | 'unavailable' | 'unknown'; reason?: string | null };
     detail?: string | null;
   };
-  runs: { queued: number; known: number; failed?: number };
+  /** `lastFailedAt`: when the newest failed or timed-out run ended (Overview judges "failed since you looked" by it). */
+  runs: { queued: number; known: number; failed?: number; lastFailedAt?: string | null };
   nodeRuntime?: NodeSnapshot | null;
   plugins: { serving: number; total: number };
 }
@@ -997,6 +998,8 @@ export interface RunRecord {
   runId: string;
   status: RunStatus;
   callerProduct: string;
+  /** Who asked, in the caller's own words (its `caller.label`), when it gave them. */
+  caller?: { product: string; label?: string };
   flowId?: string;
   correlationId: string;
   idempotencyKey?: string;
@@ -1031,6 +1034,8 @@ export interface RunRecord {
 export interface FlowName {
   flowId: string;
   name: string;
+  /** A macro of the flow editor's: a part its flows use as a node, kept for them, not a flow of its own. */
+  macro?: boolean;
 }
 
 /** A key no other request has, for a run asked for from here. */
@@ -1046,6 +1051,16 @@ export interface RunHistory {
   runs: RunRecord[];
   total: number;
   byStatus?: Partial<Record<RunStatus, number>>;
+  /** Older runs this filter and search find, past this answer (a desktop from before says nothing). */
+  more?: boolean;
+}
+
+/** Where a page of history starts, and what it is narrowed to: the runs asked before `before` (the last run of the
+ *  page before), those `q` finds (their flow, who asked, event, error, ids or inputs), one flow's. */
+export interface RunPage {
+  before?: Pick<RunRecord, 'reservedAt' | 'runId'>;
+  q?: string;
+  flowId?: string;
 }
 
 /** An event that arrived and produced no work. */
@@ -1066,12 +1081,18 @@ export const bridge = {
   status: () => request<RuntimeStatus>('/api/bridge/status'),
   /** Run history, newest first. `statuses` empty means every state — omitting
    *  the filter entirely is the worker's queued-only poll, not what a UI wants. */
-  runs: (statuses: RunStatus[] | 'all' = 'all', limit = 50) =>
-    request<RunHistory>(
+  runs: (statuses: RunStatus[] | 'all' = 'all', limit = 50, page?: RunPage) => {
+    const extra = [
+      page?.before ? `&before=${encodeURIComponent(page.before.reservedAt)}&beforeRun=${encodeURIComponent(page.before.runId)}` : '',
+      page?.q?.trim() ? `&q=${encodeURIComponent(page.q.trim())}` : '',
+      page?.flowId ? `&flowId=${encodeURIComponent(page.flowId)}` : '',
+    ].join('');
+    return request<RunHistory>(
       `/api/bridge/runs?status=${encodeURIComponent(
         statuses === 'all' ? 'all' : statuses.join(','),
-      )}&limit=${limit}`,
-    ),
+      )}&limit=${limit}${extra}`,
+    );
+  },
   /** Forget finished runs. Queued and running work is kept — the host refuses
    *  to delete a record for work still in flight. Returns how many went. */
   clearRuns: () =>
@@ -1093,7 +1114,7 @@ export const bridge = {
       method: 'POST',
       body: JSON.stringify({
         protocol: 'oaiy-bridge/1',
-        caller: { product: 'oaiy-desktop', label: 'Run history' },
+        caller: { product: 'oaiy-desktop', label: 'You, from Run history' },
         flowId,
         input: input ?? {},
         mode: 'async',
@@ -2570,6 +2591,14 @@ export type AgentIntent = 'answerWithOaiy' | 'setupWithAgent';
 /** Ask the Agent to do something only it can. Fails when the Agent's page is not made yet. */
 export function agentIntent(intent: AgentIntent): Promise<void> {
   return tauriInvoke<void>('agent_intent', { intent });
+}
+
+/**
+ * Ask the flow editor's page to open flow `flowId` (Run history's "Open the editor" on a run): handed to the page as it
+ * finishes loading when it is not made or loaded yet. The dashboard shows the editor itself.
+ */
+export function openFlowInEditor(flowId: string): Promise<void> {
+  return tauriInvoke<void>('flows_intent', { intent: 'openFlow', flowId });
 }
 
 // ----- the Agent's access to OAIY, what it changed, and its model (CONTROL_API.md §1, §2) -----

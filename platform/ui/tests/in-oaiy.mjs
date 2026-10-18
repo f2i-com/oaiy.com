@@ -47,6 +47,8 @@ fs.writeFileSync(uiStub, 'export function invalidateDynamicOptions() {}\nexport 
 await esbuild.build({
   stdin: {
     contents: `export { flowKey, fromDoc, reconcile, shared, toDoc } from './src/hooks/useDesktopFlows.ts';
+export { resolveNodeService, withNodeServices } from './src/bundled-modules/core-service/contract.ts';
+export { listenForFlowsIntents } from './src/lib/flowsIntents.ts';
 export { desktopTheme } from './src/contexts/ThemeContext.tsx';
 export { taskText } from './src/bundled-modules/core-agent/runtime.ts';
 export { shellNavItems } from './src/components/chrome/ShellChrome.tsx';
@@ -104,9 +106,32 @@ check("a desktop flow's description, tags and sharing come with it, and go back 
   for (const change of [{ description: 'Other' }, { tags: ['x'] }, { remote: false }]) assert.notEqual(flowKey(f), flowKey({ ...f, ...change }), JSON.stringify(change));
 });
 
-check("macros, demos, built-in and local-only flows stay the editor's own", () => {
+check("demos, built-in (macros among them) and local-only flows stay the editor's own; the person's macros go", () => {
   assert.equal(shared(flow()), true);
-  for (const extra of [{ isMacro: true }, { isDemo: true }, { isBuiltIn: true }, { localOnly: true }]) assert.equal(shared(flow(extra)), false, JSON.stringify(extra));
+  assert.equal(shared(flow({ isMacro: true })), true, "a macro of the person's own: the flows using it run on the desktop with it");
+  for (const extra of [{ isDemo: true }, { isBuiltIn: true }, { isMacro: true, isBuiltIn: true }, { localOnly: true }]) assert.equal(shared(flow(extra)), false, JSON.stringify(extra));
+});
+
+check('a macro goes to the desktop marked as one, and comes back one, with its inputs and outputs', () => {
+  const nodes = [
+    { id: 'mi', type: 'macro_input', data: { name: 'text', inputType: 'string' } },
+    { id: 'mo', type: 'macro_output', data: { name: 'result' } },
+  ];
+  const macro = flow({ id: 'user-macro-1', name: 'Shout', isMacro: true, graph: { nodes, edges: [] } });
+  const doc = JSON.parse(JSON.stringify(toDoc(macro)));
+  assert.equal(doc.isMacro, true);
+  assert.equal(JSON.parse(JSON.stringify(toDoc(flow()))).isMacro, undefined, 'an ordinary flow is not marked');
+  const back = fromDoc('user-macro-1', doc, '');
+  assert.equal(back.isMacro, true);
+  assert.deepEqual(back.macroMetadata.inputs.map((i) => [i.id, i.name, i.type]), [['mi', 'text', 'string']]);
+  assert.deepEqual(back.macroMetadata.outputs.map((o) => [o.id, o.name]), [['mo', 'result']]);
+  // Made a macro, or made a flow again: a change to send.
+  assert.notEqual(flowKey(macro), flowKey({ ...macro, isMacro: false }));
+  // Changed there: it stays a macro here, its inputs read again.
+  const rewritten = fromDoc('user-macro-1', { ...doc, nodes: [...nodes, { id: 'mi2', type: 'macro_input', data: { name: 'more' } }] }, '');
+  const r = reconcile(new Map([['user-macro-1', rewritten]]), [macro], new Map([['user-macro-1', flowKey(macro)]]));
+  assert.equal(r.put[0].isMacro, true);
+  assert.deepEqual(r.put[0].macroMetadata.inputs.map((i) => i.name), ['text', 'more']);
 });
 
 const named = (id, name, nodes = []) => flow({ id, name, graph: { nodes, edges: [] } });
@@ -160,6 +185,70 @@ check('a flow the desktop listed but could not send is left as it is here, not t
   const r = reconcile(new Map(), [a], new Map([['a', key(a)]]), new Set(), new Set(['a']));
   assert.deepEqual(r.remove, []);
   assert.equal(r.synced.get('a'), key(a));
+});
+
+check("a node naming the person's own service, or the desktop's, carries how to call it there, never a key", () => {
+  const { resolveNodeService, withNodeServices } = M;
+  const mine = {
+    id: 'my-rig', name: 'My rig', description: 'long words', icon: '🧩', endpoint: 'http://192.168.1.9:7000/run?key=sk-abcdefghijklmnopqrstuv', method: 'POST',
+    headers: JSON.stringify({ Authorization: 'Bearer {{apiKey}}', 'X-Api-Key': 'sk-literalkey0123456789abcdef', 'Content-Type': 'application/json', 'X-Note': 'plain' }),
+    bodyTemplate: '{"prompt": {{input}}, "token": "hf_abcdefghijklmnopqrstu"}', responseType: 'json', responsePath: 'out', apiKeyConstant: 'RIG_KEY', model: 'm1', installHint: 'pip install',
+  };
+  const companion = { id: 'companion:voice', name: 'Voice (running)', endpoint: 'http://127.0.0.1:9100/v1/audio', method: 'POST', headers: '{}', bodyTemplate: '{{inputRaw}}', responseType: 'json', responsePath: '', group: 'desktop' };
+  const lists = { custom: [mine], desktop: [companion, { id: 'engine:image:flux', name: 'Flux', group: 'engine', kind: 'image', endpoint: '/api/x', method: 'POST', headers: '{}', bodyTemplate: '', responseType: 'json', responsePath: '' }] };
+  const nodes = [
+    { id: 'a', type: 'service_call', data: { service: 'my-rig' } },
+    { id: 'b', type: 'model_3d', data: { service: 'engine:model3d', pictureService: 'companion:voice' } },
+    { id: 'c', type: 'image_gen', data: { service: 'engine:image:flux' } },
+    { id: 'd', type: 'service_call', data: { service: 'ollama-chat' } },
+    { id: 'e', type: 'service_call', data: { service: 'gone', _services: { gone: { endpoint: 'x' } } } },
+  ];
+  const kept = withNodeServices(nodes, lists);
+  const rig = kept[0].data._services['my-rig'];
+  assert.equal(rig.model, 'm1');
+  assert.equal(rig.apiKeyConstant, 'RIG_KEY', 'the constant is named, its value is not there');
+  assert.equal(rig.description, undefined);
+  assert.equal(rig.installHint, undefined);
+  assert.deepEqual(JSON.parse(rig.headers), { Authorization: 'Bearer {{apiKey}}', 'Content-Type': 'application/json', 'X-Note': 'plain' }, 'a literal key in a header is not copied');
+  assert.doesNotMatch(JSON.stringify(rig), /sk-abc|sk-literal|hf_abc/, 'no key, in any field');
+  assert.equal(kept[1].data._services['companion:voice'].endpoint, 'http://127.0.0.1:9100/v1/audio');
+  assert.equal(Object.keys(kept[1].data._services).length, 1, "OAIY's engine is looked up when the flow runs, not copied");
+  assert.equal(kept[2].data._services, undefined);
+  assert.equal(kept[3].data._services, undefined, 'a built-in example is in the code');
+  assert.equal(kept[4].data._services, undefined, 'a copy of a service no longer listed is not kept on');
+  // Where the lists are not (the CLI), the copy is what the node runs; where they are, the list's own wins.
+  assert.equal(resolveNodeService('my-rig', kept[0].data).endpoint, rig.endpoint);
+  assert.equal(resolveNodeService('my-rig', {}), null);
+  // The editor's own flow never holds the copies: they come off as the desktop's flow comes in.
+  const store = new Map([['oaiy.customServices', JSON.stringify([mine])]]);
+  globalThis.localStorage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
+  const doc = JSON.parse(JSON.stringify(toDoc(flow({ graph: { nodes: [nodes[0]], edges: [] } }))));
+  assert.ok(doc.nodes[0].data._services['my-rig'], 'saved to the desktop with it');
+  const back = fromDoc('f1', doc, '');
+  assert.equal(back.graph.nodes[0].data._services, undefined);
+  assert.equal(flowKey(back), flowKey(flow({ graph: { nodes: [nodes[0]], edges: [] } })), 'so the two sides still agree');
+  assert.equal(resolveNodeService('my-rig', {}).endpoint, mine.endpoint, "the editor's own list first");
+  delete globalThis.localStorage;
+});
+
+check("the dashboard's \"open this flow\" is taken, asked before the editor listened or after, by a flow id alone", () => {
+  const opened = [];
+  // (asked while the page was starting: waiting where the desktop left it)
+  window.__OAIY_FLOWS_INTENTS__ = [['openFlow', 'morning-greeting'], ['openFlow', 'bad id"); alert(1)'], ['closeAll', 'x']];
+  const stop = M.listenForFlowsIntents((id) => opened.push(id));
+  assert.deepEqual(opened, ['morning-greeting']);
+  assert.equal(window.__OAIY_FLOWS_INTENTS__, undefined, 'taken, not taken again');
+  window.__oaiyFlowsIntent('openFlow', 'tidy_up-2');
+  window.__oaiyFlowsIntent('openFlow', 42);
+  assert.deepEqual(opened, ['morning-greeting', 'tidy_up-2']);
+  stop();
+  assert.equal(window.__oaiyFlowsIntent, undefined);
+  // Outside OAIY's window nothing listens.
+  const given = window.__OAIY_DESKTOP__;
+  delete window.__OAIY_DESKTOP__;
+  M.listenForFlowsIntents(() => opened.push('no'));
+  assert.equal(window.__oaiyFlowsIntent, undefined);
+  window.__OAIY_DESKTOP__ = given;
 });
 
 check('"Ask the Agent" words its task from the input, the setting and the context', () => {

@@ -574,6 +574,14 @@ async fn a_read_and_a_change_go_through_the_desktops_router_and_its_gate() {
             { "id": "hello-there-2", "name": "Hello there", "description": "", "inputs": [{ "name": "in", "default": null }], "oaiyRemote": false },
         ])
     );
+    // A macro the editor keeps here for the flows that use it is said to be one, not listed as one more flow.
+    std::fs::write(sb.0.join("flows").join("user-macro-shout.json"), json!({ "name": "Shout", "isMacro": true, "nodes": [], "edges": [] }).to_string()).unwrap();
+    let r = tool("flows_list", json!({})).await;
+    let flows = r["structuredContent"]["flows"].as_array().unwrap().clone();
+    let shout = flows.iter().find(|f| f["id"] == "user-macro-shout").expect("listed");
+    assert_eq!(shout["macro"], true, "{shout}");
+    assert!(flows.iter().filter(|f| f["id"] != "user-macro-shout").all(|f| f.get("macro").is_none()), "{flows:?}");
+    std::fs::remove_file(sb.0.join("flows").join("user-macro-shout.json")).unwrap();
     let r = tool("flow_update", json!({ "id": "nope", "flow": {} })).await;
     assert!(is_error(&r) && text(&r).contains("flow_create"), "{r}");
 

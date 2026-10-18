@@ -99,7 +99,7 @@ mod tests {
     fn native_settings_and_execution_commands_cannot_bypass_http_refusals() {
         assert!(ipc_allowed("get_config"));
         for command in ["set_data_dir", "set_models_dir", "start_migration", "set_hf_token", "list_gpus",
-            "show_embedded", "agent_intent", "set_theme", "open_url", "open_path", "restart_app",
+            "show_embedded", "agent_intent", "flows_intent", "set_theme", "open_url", "open_path", "restart_app",
             "backup_restore_stage", "update_check", "update_install", "unknown"] {
             assert!(!ipc_allowed(command), "{command}");
         }

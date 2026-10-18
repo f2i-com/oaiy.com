@@ -30,7 +30,7 @@ import {
   type LucideIcon,
   Network,
 } from 'lucide-react';
-import { API_BASE, DESKTOP_LAUNCH, network as networkApi, openExternal, phone as phoneApi } from './api';
+import { API_BASE, DESKTOP_LAUNCH, network as networkApi, openExternal, openFlowInEditor, phone as phoneApi } from './api';
 import { moduleOn, useModules } from './useModules';
 import { arrangeSections, buildSections, newBadge, pluginPageOf, sectionOf as findSection, type Group, type NavSection } from './sections';
 import { useWaitingRequests } from './calendarRequests';
@@ -973,7 +973,16 @@ export default function App() {
             {view === 'engine-workers' && <EngineWorkersPanel onOpenNetworking={() => setView('network')} />}
             {view === 'flow-workers' && <FlowWorkersPanel onOpenNetworking={() => setView('network')} />}
             {view === 'plugins' && <PluginsPanel />}
-            {view === 'runs' && <RunsPanel onOpenEditor={() => setView('flows')} />}
+            {view === 'runs' && (
+              <RunsPanel
+                onOpenEditor={(flowId) => {
+                  setView('flows');
+                  // (that run's flow, opened in the editor as it shows; where there is no editor's page to tell, the
+                  // editor alone)
+                  void openFlowInEditor(flowId).catch(() => {});
+                }}
+              />
+            )}
             {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}
             {view === 'hours' && <HoursPanel onOpenCalendar={() => setView('calendar')} />}
             {view === 'contacts' && <ContactsPanel open={contactToOpen} onOpened={() => setContactToOpen(null)} />}

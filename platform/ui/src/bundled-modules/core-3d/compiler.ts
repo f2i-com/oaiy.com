@@ -5,7 +5,7 @@
  * default, `engine:model3d`) and the one that makes the picture.
  */
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
-import { contractModel, nodeContract, resolveService } from '../core-service/contract';
+import { contractModel, nodeContract, resolveNodeService } from '../core-service/contract';
 
 const Core3DCompiler: ModuleCompiler = {
   name: 'Model3D',
@@ -21,10 +21,10 @@ const Core3DCompiler: ModuleCompiler = {
     const letOrAssign = skipVarDeclaration ? '' : 'let ';
 
     const serviceId = String(data.service || 'engine:model3d');
-    const preset = resolveService(serviceId);
+    const preset = resolveNodeService(serviceId, data);
     const contract = nodeContract(serviceId, preset, 'model3d') ?? JSON.stringify(serviceId);
     const pictureId = String(data.pictureService || 'engine:image');
-    const picturePreset = resolveService(pictureId);
+    const picturePreset = resolveNodeService(pictureId, data);
     const pictureContract = nodeContract(pictureId, picturePreset, 'image') ?? JSON.stringify(pictureId);
 
     const imageVar = inputs.get('image') || 'null';

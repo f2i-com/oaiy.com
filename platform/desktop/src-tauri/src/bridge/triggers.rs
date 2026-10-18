@@ -262,6 +262,7 @@ pub fn dispatch(
             idempotency_key: format!("binding:{}:{}", b.id, event.idempotency_key),
             lineage,
             trigger_event: Some(event.name.clone()),
+            caller_label: None,
         };
 
         match ledger.reserve(&req) {

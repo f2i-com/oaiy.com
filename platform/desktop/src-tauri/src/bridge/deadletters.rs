@@ -36,10 +36,13 @@
 //! Redrive feeds the stored envelope back through the ordinary dispatch path
 //! against the *current* bindings. That matters for safety: a guard-refused
 //! event redriven is offered to the guards again and refused again, rather than
-//! being forced through. Fix the binding and redrive succeeds; don't, and it
-//! doesn't. The only thing redrive changes is the idempotency key, which gains
-//! an attempt suffix — sound precisely because a dead letter is by definition an
-//! event that reserved no run, so there is no execution to duplicate.
+//! being forced through (an event a run caused keeps that run, `origin_run`, so
+//! the guards see the same tree). Fix the binding and redrive succeeds; don't,
+//! and it doesn't. The only thing redrive changes is the idempotency key, which
+//! gains an attempt suffix. A binding that already reserved a run for this
+//! event (when it was delivered before, or at an earlier redrive) is not offered
+//! it again: the run it reserved is the work, and running it twice would be the
+//! second email.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -105,6 +108,9 @@ pub struct DeadLetter {
     /// What the most recent redrive did, in the dispatcher's words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<String>,
+    /// The run that caused the event (a flow's outcome), so a redrive is judged by the loop guards as the event was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_run: Option<super::ledger::LineageRef>,
 }
 
 fn now_ms() -> u64 {
@@ -256,6 +262,18 @@ impl DeadLetterQueue {
         reason: DeadReason,
         envelope: Value,
     ) -> DeadLetter {
+        self.record_caused(source, event, reason, envelope, None)
+    }
+
+    /// [`Self::record`] for an event a run caused, kept with that run's lineage.
+    pub fn record_caused(
+        &mut self,
+        source: &str,
+        event: &str,
+        reason: DeadReason,
+        envelope: Value,
+        origin_run: Option<super::ledger::LineageRef>,
+    ) -> DeadLetter {
         self.seq += 1;
         let item = DeadLetter {
             id: format!("dl_{}", self.seq),
@@ -267,6 +285,7 @@ impl DeadLetterQueue {
             attempts: 0,
             last_attempt_ms: None,
             last_outcome: None,
+            origin_run,
         };
         self.items.push_back(item.clone());
         // Eviction is a deletion, which an append cannot express — so the rare
@@ -357,8 +376,9 @@ impl DeadLetterQueue {
     /// The idempotency key a redrive should use: the original plus the attempt
     /// number, so each retry is a distinct reservation.
     ///
-    /// Safe because a dead letter reserved no run — there is no prior execution
-    /// under the original key to duplicate. It is deliberately derived rather
+    /// Safe because a binding that reserved a run for the event (under the
+    /// original key, or an earlier attempt's) is not offered it again: the
+    /// redrive asks the ledger first (`PluginHost::redrive`). It is deliberately derived rather
     /// than random so that redriving the same entry twice at the same attempt
     /// count (a double-click, a retried HTTP request) still collapses to one
     /// reservation.
@@ -448,6 +468,24 @@ mod tests {
         let item = &q.list(1)[0];
         assert_eq!(item.reason, DeadReason::Shed);
         assert_eq!(item.envelope["data"]["from"], "+61400000000");
+    }
+
+    /// An event a run caused keeps that run across a restart, so its redrive meets the loop guards as it did.
+    #[test]
+    fn the_run_that_caused_an_event_survives_a_restart() {
+        let dir = Dir::new("origin");
+        let origin = super::super::ledger::LineageRef { root_run_id: Some("run_1".into()), parent_run_id: Some("run_2".into()), binding_id: Some("b1".into()), depth: 2 };
+        {
+            let mut q = DeadLetterQueue::open(dir.path());
+            q.record_caused("flows", "flow.failed", DeadReason::NotReserved { detail: "b: x".into() }, envelope("a"), Some(origin.clone()));
+            q.record("aokie", "call.incoming", DeadReason::Shed, envelope("b"));
+        }
+        let q = DeadLetterQueue::open(dir.path());
+        let items = q.list(2);
+        let caused = items.iter().find(|d| d.event == "flow.failed").unwrap();
+        let kept = caused.origin_run.as_ref().expect("kept");
+        assert_eq!((kept.parent_run_id.as_deref(), kept.binding_id.as_deref(), kept.depth), (Some("run_2"), Some("b1"), 2));
+        assert!(items.iter().find(|d| d.event == "call.incoming").unwrap().origin_run.is_none());
     }
 
     #[test]

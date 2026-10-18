@@ -179,6 +179,15 @@ pub struct RunSpec {
     /// to `${dataDir}` when not set.
     #[serde(default)]
     pub cwd: Option<String>,
+
+    /// Give the service a pipe for its stdin, which OAIY holds open for as long
+    /// as it runs the service (`"stdinPipe": true`). For a service that ends when
+    /// its stdin closes (`oaiy-voice --watch-stdin`): OAIY gone, however it went
+    /// (killed, crashed), the pipe closes and the service ends with it, rather
+    /// than holding its port and the GPU for the next start. Without it a
+    /// service's stdin is OAIY's own.
+    #[serde(default)]
+    pub stdin_pipe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +281,17 @@ mod tests {
         }
         assert!(sh.contains("/oaiy-voice/.oaiy-installed\""), "the Unix installer must write the marker");
         assert!(t.autostart, "the voice is loaded before the first call");
+        // It ends with OAIY, however OAIY ends: it watches the stdin OAIY holds open for it.
+        assert!(t.run.args.iter().any(|a| a == "--watch-stdin") && t.run.stdin_pipe, "the voice server must not outlive OAIY");
+    }
+
+    /// `stdinPipe` is off unless a template asks for it: a service's stdin stays what it was.
+    #[test]
+    fn a_stdin_pipe_is_asked_for_by_name() {
+        let run: RunSpec = serde_json::from_str(r#"{ "command": "x" }"#).unwrap();
+        assert!(!run.stdin_pipe);
+        let run: RunSpec = serde_json::from_str(r#"{ "command": "x", "stdinPipe": true }"#).unwrap();
+        assert!(run.stdin_pipe);
     }
 
     use super::*;

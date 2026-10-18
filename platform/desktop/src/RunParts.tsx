@@ -94,6 +94,17 @@ export function callerText(product: string, computers?: ReadonlyMap<string, stri
   return product;
 }
 
+/**
+ * Who asked for a run, in words: the caller's own label where it gave one (kept on the run: "the Agent", an app's
+ * name for itself), else what its product is ({@link callerText}). The label is the caller's say, shown as text; the
+ * run's details show its product beside it.
+ */
+export function whoAsked(r: { callerProduct: string; caller?: { label?: string } }, computers?: ReadonlyMap<string, string>): string {
+  const label = r.caller?.label?.trim();
+  if (!label) return callerText(r.callerProduct, computers);
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
 const PICTURE_PATH = /\.(?:png|jpe?g|webp|gif)$/i;
 const PICTURE_DATA = /^data:image\/(?:png|jpe?g|webp|gif);base64,/i;
 const OWN_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);

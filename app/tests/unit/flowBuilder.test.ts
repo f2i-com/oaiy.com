@@ -79,6 +79,12 @@ describe('the agent builds flows', () => {
     expect(await tools.flow_list.run({}, signal)).toBe('greet-a-person: Greet a person');
   });
 
+  it('lists a macro as one (the desktop marks it), so it is not taken for a flow to run on its own', async () => {
+    const desktop = { flows: async () => [{ id: 'greet', name: 'Greet', macro: false }, { id: 'shout', name: 'Shout', macro: true }] } as unknown as Desktop;
+    const tools = Object.fromEntries(flowBuilderTools(() => desktop).map((t) => [t.spec.name, t]));
+    expect(await tools.flow_list.run({}, signal)).toBe('greet: Greet\nshout: Shout (macro)');
+  });
+
   it("changes a stored flow keeping what it is not given, and never writes over another flow of a like name", async () => {
     const stored: Array<[string, Record<string, unknown>]> = [];
     const saved = { name: 'Greet a person', description: 'Says hello', tags: ['demo'], oaiyRemote: true, oaiyTool: { name: 'greet', description: 'Greets' }, nodes: greeting.nodes.map((n, i) => ({ ...n, position: { x: 900 + i, y: 7 } })), edges: greeting.edges };

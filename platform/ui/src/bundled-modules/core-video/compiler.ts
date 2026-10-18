@@ -10,7 +10,7 @@ import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core';
 // and the built-in examples. A picked service's endpoint / apiFormat fill in
 // below explicit data.* fields; an engine model (or any service declaring
 // what it makes) runs as a contract through VideoFrames.generateService.
-import { contractModel, nodeContract, resolveService } from '../core-service/contract';
+import { contractModel, nodeContract, resolveNodeService } from '../core-service/contract';
 
 const CoreVideoCompiler: ModuleCompiler = {
   name: 'Video',
@@ -227,7 +227,7 @@ const CoreVideoCompiler: ModuleCompiler = {
       // the unified Services registry is the source of truth. Falls back
       // to project-wide `defaultVideoServiceId` from Settings → Providers.
       const serviceId = String(data.service || projectSettings?.defaultVideoServiceId || '');
-      const preset = resolveService(serviceId);
+      const preset = resolveNodeService(serviceId, data);
       const contract = nodeContract(serviceId, preset);
       if (contract) {
         // OAIY's engine (LTX family): a job, followed until the clip is made.

@@ -8,6 +8,8 @@ import { desktopFileBytes } from '../../core-service/contractRuntime';
 interface ImageViewNodeData {
   imageUrl?: string;
   label?: string;
+  /** The tallest the picture is shown, in pixels (its Max Height property). */
+  maxHeight?: number;
   _collapsed?: boolean;
   onLabelChange?: (value: string) => void;
   onCollapsedChange?: (value: boolean) => void;
@@ -25,10 +27,29 @@ const ImageViewIcon = (
   </svg>
 );
 
+/** The Max Height property's range and default (nodes/image_view.json). */
+const MAX_HEIGHT = { min: 50, max: 1000, default: 300 };
+/** How tall the preview is before Larger is pressed: no taller than this, nor than the Max Height. */
+const SMALL_HEIGHT = 128;
+
+/**
+ * The preview's two heights, in pixels, from the node's Max Height: as it first shows, and after Larger. The property
+ * was in the node's settings and changed nothing; the preview was 128 or 256 pixels high, whatever it said.
+ */
+export function previewHeights(maxHeight: unknown): { small: number; large: number } {
+  const n = typeof maxHeight === 'number' ? maxHeight : typeof maxHeight === 'string' && maxHeight.trim() ? Number(maxHeight) : NaN;
+  const large = Number.isFinite(n) ? Math.min(MAX_HEIGHT.max, Math.max(MAX_HEIGHT.min, Math.round(n))) : MAX_HEIGHT.default;
+  return { small: Math.min(SMALL_HEIGHT, large), large };
+}
+
 function ImageViewNode({ data }: ImageViewNodeProps) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [hasLoadError, setHasLoadError] = useState(false);
   const hasImage = data.imageUrl && data.imageUrl !== '';
+  const heights = previewHeights(data.maxHeight);
+  // (a Max Height no taller than the first view leaves nothing for Larger to show)
+  const canGrow = heights.large > heights.small;
+  const tall = isExpanded && canGrow;
   const onCollapsedChangeRef = useRef(data.onCollapsedChange);
 
   useEffect(() => {
@@ -101,7 +122,7 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
       title="Image View"
       color="indigo"
       icon={ImageViewIcon}
-      width={isExpanded ? 384 : 288}
+      width={tall ? 384 : 288}
       collapsedWidth={140}
       isCollapsed={data._collapsed}
       onCollapsedChange={handleCollapsedChange}
@@ -128,7 +149,7 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-slate-600 dark:text-slate-400 text-xs">Preview</label>
-              {hasImage && (
+              {hasImage && canGrow && (
                 <button
                   type="button"
                   onClick={() => setIsExpanded(!isExpanded)}
@@ -153,8 +174,11 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
                 </button>
               )}
             </div>
-            <div className={`w-full bg-white dark:bg-slate-900 border rounded flex items-center justify-center transition-all ${hasImage ? 'border-indigo-600' : 'border-slate-300 dark:border-slate-700'
-              } ${isExpanded ? 'h-64' : 'h-32'}`}>
+            <div
+              className={`w-full bg-white dark:bg-slate-900 border rounded flex items-center justify-center transition-all ${hasImage ? 'border-indigo-600' : 'border-slate-300 dark:border-slate-700'}`}
+              style={{ height: tall ? heights.large : heights.small }}
+              data-preview-box
+            >
               {isValidImage && !hasLoadError ? (
                 <img
                   src={shown}

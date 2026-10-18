@@ -10,7 +10,7 @@ import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module
 // and the built-in examples. A picked service's endpoint / model /
 // apiKeyConstant fill in below explicit data.* fields; an engine model (or
 // any service that declares what it makes) runs as a contract instead.
-import { contractModel, nodeContract, resolveService } from '../core-service/contract';
+import { contractModel, nodeContract, resolveNodeService } from '../core-service/contract';
 
 const CoreImageCompiler: ModuleCompiler = {
   name: 'Image',
@@ -46,7 +46,7 @@ const CoreImageCompiler: ModuleCompiler = {
           defaultImageServiceId?: string;
         } | undefined;
         const serviceId = String(data.service || projectSettings?.defaultImageServiceId || '');
-        const preset = resolveService(serviceId);
+        const preset = resolveNodeService(serviceId, data);
         // OAIY's engine (or a service declaring its output): Image.generateService.
         const contract = nodeContract(serviceId, preset);
         if (contract) {
@@ -346,7 +346,7 @@ const CoreImageCompiler: ModuleCompiler = {
         // picked for the node: the picture in, a picture (PNG data URL) out.
         const kind = nodeType === 'background_removal' ? 'background' : 'upscale';
         const serviceId = String(data.service || `engine:${kind}`);
-        const preset = resolveService(serviceId);
+        const preset = resolveNodeService(serviceId, data);
         const contract = nodeContract(serviceId, preset, 'image') ?? JSON.stringify(serviceId);
         const imageVar = inputs.get('image') || 'null';
         const scale = Number(data.scale) === 2 ? 2 : 4;

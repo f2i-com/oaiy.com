@@ -408,6 +408,48 @@ pub async fn agent_intent<R: Runtime>(app: AppHandle<R>, webview: tauri::Webview
     agent.eval(intent_script(&intent)).map_err(|e| e.to_string())
 }
 
+/// What the dashboard may ask the flow editor's page to do, by name: Run history's "Open the editor" on a run opens
+/// that run's flow (`openFlow`, with its id), not only the editor.
+const FLOWS_INTENTS: [&str; 1] = ["openFlow"];
+
+/// Whether the flow editor's page has loaded (its webview made, its document in): an intent is handed to it then;
+/// before, it waits in [`PENDING_FLOWS_INTENT`] and is handed over as the page finishes loading.
+static FLOWS_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The intent asked for while the editor's page was being made or loading (the latest only: one flow is opened).
+static PENDING_FLOWS_INTENT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Hands an intent and its flow to the editor's page: its `__oaiyFlowsIntent`, or, while the page is starting, where it
+/// looks when it starts. The id is a flow id ([`crate::bridge::FlowStore::valid_id`]: letters, digits, `-` and `_`).
+fn flows_intent_script(intent: &str, flow_id: &str) -> String {
+    format!("window.__oaiyFlowsIntent ? window.__oaiyFlowsIntent({intent:?}, {flow_id:?}) : (window.__OAIY_FLOWS_INTENTS__ = (window.__OAIY_FLOWS_INTENTS__ || []).concat([[{intent:?}, {flow_id:?}]]));")
+}
+
+/// Ask the flow editor's page to do one of `FLOWS_INTENTS` with the flow `flow_id`. The dashboard shows the editor
+/// as it asks; a page not made or not loaded yet is handed the intent as it finishes loading.
+#[tauri::command]
+pub async fn flows_intent<R: Runtime>(app: AppHandle<R>, webview: tauri::Webview<R>, intent: String, flow_id: String) -> Result<(), String> {
+    // (the dashboard's alone, as the Agent's intents are)
+    if !crate::update::gui::is_dashboard(webview.label()) {
+        log::warn!("refused a flow editor intent from the webview \"{}\"", webview.label());
+        return Err("Only OAIY's own window can do that.".to_string());
+    }
+    if !FLOWS_INTENTS.contains(&intent.as_str()) {
+        return Err(format!("no flow editor intent called {intent}"));
+    }
+    if !crate::bridge::FlowStore::valid_id(&flow_id) {
+        return Err(format!("{flow_id:?} is not a flow id"));
+    }
+    let script = flows_intent_script(&intent, &flow_id);
+    let editor = app.get_webview(Page::Flows.label());
+    match editor {
+        Some(editor) if FLOWS_LOADED.load(std::sync::atomic::Ordering::SeqCst) => editor.eval(script).map_err(|e| e.to_string()),
+        _ => {
+            *PENDING_FLOWS_INTENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(script);
+            Ok(())
+        }
+    }
+}
+
 /// The Agent's page, when it exists (hidden or shown): what the desktop asks to save its work before an update.
 pub fn agent_webview<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::Webview<R>> {
     app.get_webview(Page::Agent.label())
@@ -805,10 +847,19 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
     let made = if page == Page::Engines { made.on_download(engines_download) } else { made };
     made
         .additional_browser_args(BROWSER_ARGS)
-        // A page that (re)loads starts in the theme it was made with: tell it the one now.
-        .on_page_load(|webview, payload| {
+        // A page that (re)loads starts in the theme it was made with: tell it the one now. The flow editor's is handed
+        // the intent asked for while it loaded (a run's flow to open), and is told one at once after.
+        .on_page_load(move |webview, payload| {
+            if page == Page::Flows {
+                FLOWS_LOADED.store(payload.event() == PageLoadEvent::Finished, std::sync::atomic::Ordering::SeqCst);
+            }
             if payload.event() == PageLoadEvent::Finished {
                 let _ = webview.eval(theme_script(theme(webview.app_handle())));
+                if page == Page::Flows {
+                    if let Some(script) = PENDING_FLOWS_INTENT.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        let _ = webview.eval(script);
+                    }
+                }
             }
         })
         .on_navigation(move |url| {
@@ -998,6 +1049,19 @@ mod tests {
         assert!(desktop_script("dark", Page::Agent).contains(&format!("backupToken: {secret:?}")), "the Agent's page has it");
         assert!(!desktop_script("dark", Page::Flows).contains("backupToken") && !desktop_script("dark", Page::Flows).contains(secret));
         assert!(!desktop_script("dark", Page::Engines).contains(secret));
+    }
+
+    #[test]
+    fn the_flow_editor_is_handed_a_flow_to_open_by_its_id() {
+        assert_eq!(
+            flows_intent_script("openFlow", "morning-greeting_2"),
+            r#"window.__oaiyFlowsIntent ? window.__oaiyFlowsIntent("openFlow", "morning-greeting_2") : (window.__OAIY_FLOWS_INTENTS__ = (window.__OAIY_FLOWS_INTENTS__ || []).concat([["openFlow", "morning-greeting_2"]]));"#
+        );
+        // Only an id goes in the script: anything else is refused before one is made.
+        for bad in ["a\"); alert(1); (\"", "../x", "", "a b"] {
+            assert!(!crate::bridge::FlowStore::valid_id(bad), "{bad}");
+        }
+        assert_eq!(FLOWS_INTENTS, ["openFlow"]);
     }
 
     #[test]

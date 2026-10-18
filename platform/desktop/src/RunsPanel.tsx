@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, CircleAlert, Loader2, RefreshCw, RotateCcw, Search, Square, Trash2, Workflow, X } from 'lucide-react';
-import { bridge, network, type RunHistory, type RunRecord, type RunStatus } from './api';
+import { bridge, network, type RunHistory, type RunPage, type RunRecord, type RunStatus } from './api';
 import DeadLetters from './DeadLetters';
-import { CopyButton, Fields, JsonBlock, RunAnswer, callerText, durationText, errorText, fullWhen, whenText } from './RunParts';
-import { writeFailedSeen } from './failedSeen';
+import { CopyButton, Fields, JsonBlock, RunAnswer, durationText, errorText, fullWhen, whenText, whoAsked } from './RunParts';
+import { lastFailedOf, writeFailedSeen } from './failedSeen';
 import { useToast } from './Toasts';
 import { invalidate, peek, put } from './useCached';
 import { useVisiblePoll } from './useVisiblePoll';
@@ -23,6 +23,11 @@ export { errorText };
  * successes buries the one row anyone opened this screen to find. A row opens to
  * what the run was asked with and what it answered, and a finished run can be
  * run again, one in progress stopped.
+ *
+ * The newest runs are asked for again every few seconds; older ones are paged
+ * back through, past the 200 one answer holds (`before`, the last run shown),
+ * and a search or a flow picked is the desktop's to answer, over every run it
+ * keeps, not over the runs this page happens to have.
  */
 
 const POLL_MS = 5000;
@@ -46,6 +51,12 @@ const filterOf = (id: Filter) => FILTERS.find((f) => f.id === id)!;
 /** Rows a page, and the most one request lists (the desktop's own cap). */
 const PAGE = 50;
 const MOST = 200;
+/** How long typing rests before the desktop is asked to search. */
+const SEARCH_REST_MS = 300;
+
+/** A run's place in history, newest first (as the desktop orders it: when asked, then its id). */
+const newerFirst = (a: RunRecord, b: RunRecord) =>
+  Date.parse(b.reservedAt) - Date.parse(a.reservedAt) || b.runId.length - a.runId.length || (b.runId > a.runId ? 1 : b.runId < a.runId ? -1 : 0);
 
 /** Status → the badge class the design system already defines. */
 function badgeFor(status: RunStatus): string {
@@ -185,7 +196,7 @@ function RunError({ code, message: said, quiet = false }: { code: string; messag
 
 type Busy = 'stop' | 'again';
 
-export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void } = {}) {
+export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: string) => void } = {}) {
   const [filter, setFilter] = useState<Filter>('failures');
   // Keyed BY FILTER. One shared key meant a revisit could paint the cached
   // "all" snapshot under the "Failed runs" heading — a list of green succeeded
@@ -200,11 +211,19 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
   const [clearing, setClearing] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [limit, setLimit] = useState(PAGE);
+  /** Older runs, paged back past the newest (`before` the last shown), and whether the desktop has more. */
+  const [older, setOlder] = useState<RunRecord[]>([]);
+  const [olderMore, setOlderMore] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [query, setQuery] = useState('');
+  /** The search the desktop is asked: what was typed, once the typing rests. */
+  const [searched, setSearched] = useState('');
   /** One flow's runs alone (its id; '' every flow). */
   const [flowPick, setFlowPick] = useState('');
   const [busy, setBusy] = useState<Record<string, Busy>>({});
   const [names, setNames] = useState<ReadonlyMap<string, string> | null>(() => peek('flowNames') ?? null);
+  /** The flows that are the editor's macros, labelled as such in the flow picker. */
+  const [macros, setMacros] = useState<ReadonlySet<string>>(() => peek('flowMacros') ?? new Set());
   const [computers, setComputers] = useState<ReadonlyMap<string, string>>(() => peek('networkNames') ?? new Map());
   const [now, setNow] = useState(() => Date.now());
   const toast = useToast();
@@ -226,9 +245,16 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
       return next;
     });
 
-  // Searching or picking a flow looks through as many runs as one answer holds.
-  const narrowed = query.trim() !== '' || flowPick !== '';
-  const want = narrowed ? MOST : limit;
+  // Searching or picking a flow asks the desktop, which looks through every run it keeps.
+  useEffect(() => {
+    const next = query.trim();
+    if (next === searched) return;
+    const id = window.setTimeout(() => setSearched(next), next ? SEARCH_REST_MS : 0);
+    return () => window.clearTimeout(id);
+  }, [query, searched]);
+  const narrowed = searched !== '' || flowPick !== '';
+  const narrowing: RunPage | undefined = narrowed ? { ...(searched ? { q: searched } : {}), ...(flowPick ? { flowId: flowPick } : {}) } : undefined;
+  const want = limit;
 
   // The list keeps its place when rows arrive above the one at the top of the window (WebKit has no scroll
   // anchoring of its own; the list opts out of Chrome's, so both behave the same).
@@ -252,45 +278,60 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
   const refresh = useCallback(async () => {
     const mine = ++asked.current;
     try {
-      const next = await bridge.runs(filterOf(filter).states, want);
+      const next = narrowing ? await bridge.runs(filterOf(filter).states, want, narrowing) : await bridge.runs(filterOf(filter).states, want);
       if (mine !== asked.current) return;
-      put(`runHistory:${filter}`, next);
+      // (a search's answer is not the filter's: not kept as what the filter shows next time)
+      if (!narrowing) put(`runHistory:${filter}`, next);
       noteAnchor();
       setData(next);
       setNow(Date.now());
       setError(null);
-      // Looked at: Overview's warning is about failures since.
-      if (filter === 'failures' && next.byStatus) writeFailedSeen(countOf(next, 'failures') ?? 0);
+      // Looked at: Overview's warning is about failures since (the newest of these, and how many there are).
+      if (filter === 'failures' && !narrowing && next.byStatus) writeFailedSeen(countOf(next, 'failures') ?? 0, lastFailedOf(next.runs));
     } catch (e) {
       if (mine === asked.current) setError(`Run history could not be read: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [filter, want]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, want, searched, flowPick]);
   const latest = useRef(refresh);
   latest.current = refresh;
 
+  // The newest (asked again as they change), then the older pages read past them: each run once, in history's order.
+  const listedRuns = useMemo(() => {
+    const head = data?.runs ?? [];
+    if (!older.length) return head;
+    const inHead = new Set(head.map((r) => r.runId));
+    const last = head[head.length - 1];
+    return [...head, ...older.filter((r) => !inHead.has(r.runId) && (!last || newerFirst(last, r) < 0))];
+  }, [data, older]);
   const rows = useMemo(() => {
-    const list = data?.runs ?? [];
+    const list = listedRuns;
     if (!held || list.some((r) => r.runId === held.runId)) return list;
     // (in its place by when it was asked, as the list is ordered)
     const at = list.findIndex((r) => ms(r.reservedAt) < ms(held.reservedAt));
     return at < 0 ? [...list, held] : [...list.slice(0, at), held, ...list.slice(at)];
-  }, [data, held]);
+  }, [listedRuns, held]);
   // (a run in `queued` mode waits for a claimer elsewhere, maybe for good: it is no reason to ask more often)
   const live = rows.some((r) => r.status === 'running' || (r.status === 'queued' && r.mode !== 'queued'));
   const running = rows.some((r) => r.status === 'running');
 
   // Asked every few seconds while the window shows (not while it is hidden in the tray); more often while a run goes on.
   useVisiblePoll(() => void refresh(), live ? LIVE_POLL_MS : POLL_MS);
-  const shown = useRef({ filter, want });
+  const shown = useRef({ filter, want, searched, flowPick });
   useEffect(() => {
     const was = shown.current;
-    shown.current = { filter, want };
-    if (was.filter === filter && was.want === want) return;
+    shown.current = { filter, want, searched, flowPick };
+    if (was.filter === filter && was.want === want && was.searched === searched && was.flowPick === flowPick) return;
+    // Another list: the older pages read for the last one are not this one's.
+    if (was.filter !== filter || was.searched !== searched || was.flowPick !== flowPick) {
+      setOlder([]);
+      setOlderMore(false);
+    }
     // Repaint from THIS filter's cache the moment the filter changes, so the
     // heading and the rows can never disagree while the refetch is in flight.
     if (was.filter !== filter) setData(peek<RunHistory>(`runHistory:${filter}`) ?? null);
     void refresh();
-  }, [refresh, filter, want]);
+  }, [refresh, filter, want, searched, flowPick]);
 
   // A running run's time ticks.
   useEffect(() => {
@@ -315,7 +356,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
   // from under the person reading it.
   useEffect(() => {
     if (!expanded || !data) return;
-    if (data.runs.some((r) => r.runId === expanded)) {
+    if (listedRuns.some((r) => r.runId === expanded)) {
       setHeld(null);
       return;
     }
@@ -327,7 +368,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
     return () => {
       gone = true;
     };
-  }, [data, expanded]);
+  }, [data, listedRuns, expanded]);
 
   // The flows' names (a run names its flow by id), and the paired computers' (a run one asked for names it by its id).
   const readNames = useCallback(() => {
@@ -335,8 +376,13 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
       .then(() => bridge.flows())
       .then((r) => {
         const m = new Map(r.flows.map((f) => [f.flowId, f.name] as const));
+        const kept = new Set(r.flows.filter((f) => f.macro).map((f) => f.flowId));
         put('flowNames', m);
-        if (alive.current) setNames(m);
+        put('flowMacros', kept);
+        if (alive.current) {
+          setNames(m);
+          setMacros(kept);
+        }
       })
       .catch(() => {});
   }, []);
@@ -364,6 +410,26 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
     setHeld(null);
   };
 
+  /** Read the next page of older runs: those asked before the last one shown, as the list is narrowed. */
+  const readOlder = async () => {
+    const last = listedRuns[listedRuns.length - 1];
+    if (!last || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const page = await bridge.runs(filterOf(filter).states, PAGE, { ...(narrowing ?? {}), before: { reservedAt: last.reservedAt, runId: last.runId } });
+      if (!alive.current) return;
+      setOlder((had) => {
+        const seen = new Set(had.map((r) => r.runId));
+        return [...had, ...page.runs.filter((r) => !seen.has(r.runId))];
+      });
+      setOlderMore(page.more ?? page.runs.length >= PAGE);
+    } catch (e) {
+      setError(`Older runs could not be read: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
+
   const refreshNow = async () => {
     setRefreshing(true);
     readNames();
@@ -389,6 +455,8 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
       for (const f of FILTERS) invalidate(`runHistory:${f.id}`);
       setExpanded(null);
       setHeld(null);
+      setOlder([]);
+      setOlderMore(false);
       await refresh();
       toast.push({
         kind: 'success',
@@ -476,49 +544,33 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
     }
   };
 
-  // Search: the flow, who asked, the event, the error and the inputs, among the runs listed.
-  const needle = query.trim().toLowerCase();
-  const visible = useMemo(() => {
-    if (!needle && !flowPick) return rows;
-    return rows.filter((r) => {
-      if (flowPick && (r.flowId ?? '') !== flowPick) return false;
-      if (!needle) return true;
-      let input = '';
-      try {
-        input = r.input ? JSON.stringify(r.input).slice(0, 4000) : '';
-      } catch {
-        /* (an input that cannot be said is not searched) */
-      }
-      const hay = [
-        r.flowId ? (names?.get(r.flowId) ?? '') : '',
-        r.flowId ?? '',
-        callerText(r.callerProduct, computers),
-        r.callerProduct,
-        r.triggerEvent ?? '',
-        LABEL[r.status],
-        r.error ? `${r.error.code} ${r.error.message} ${r.error.detail ?? ''}` : '',
-        r.runId,
-        r.correlationId,
-        input,
-      ]
-        .join('\n')
-        .toLowerCase();
-      return hay.includes(needle);
-    });
-  }, [rows, needle, flowPick, names, computers]);
+  // (the search and the flow picked are the desktop's answer: what is listed is what it found)
+  const visible = rows;
 
-  // The flows among the runs listed, for the picker: by name.
+  // The flows among the runs listed, for the picker: by name, a macro of the editor's said to be one.
   const flowChoices = useMemo(() => {
     const seen = new Map<string, string>();
-    for (const r of rows) if (r.flowId && !seen.has(r.flowId)) seen.set(r.flowId, names?.get(r.flowId) ?? r.flowId);
-    if (flowPick && !seen.has(flowPick)) seen.set(flowPick, names?.get(flowPick) ?? flowPick);
+    const label = (id: string) => `${names?.get(id) ?? id}${macros.has(id) ? ' (macro)' : ''}`;
+    for (const r of rows) if (r.flowId && !seen.has(r.flowId)) seen.set(r.flowId, label(r.flowId));
+    if (flowPick && !seen.has(flowPick)) seen.set(flowPick, label(flowPick));
     return [...seen.entries()].sort((a, b) => a[1].localeCompare(b[1]));
-  }, [rows, names, flowPick]);
+  }, [rows, names, macros, flowPick]);
 
   const f = filterOf(filter);
   const total = countOf(data, filter);
-  const listed = data?.runs.length ?? 0;
-  const more = !narrowed && data !== null && total !== null && listed < total && listed >= limit && limit < MOST;
+  const listed = listedRuns.length;
+  const headListed = data?.runs.length ?? 0;
+  // More: past the older pages, as the desktop said; past the newest, as it said (or, from a desktop that does not
+  // say, as the counts tell).
+  const more = data !== null && (older.length
+    ? olderMore
+    : headListed >= limit && (data.more ?? (!narrowed && total !== null && headListed < total)));
+  const showMore = () => {
+    // (the newest grow to what one answer holds, asked again as they change; past that, older pages are read)
+    if (!older.length && limit < MOST) setLimit(Math.min(MOST, limit + PAGE));
+    else void readOlder();
+  };
+  const moreCount = !narrowed && total !== null ? Math.min(PAGE, total - listed, !older.length && limit < MOST ? MOST - limit : PAGE) : PAGE;
 
   return (
     <div className="panel">
@@ -592,7 +644,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
                 </button>
               )}
             </label>
-            {flowChoices.length > 1 && (
+            {(flowChoices.length > 1 || flowPick !== '') && (
               <select className="run-flow-pick" aria-label="Which flow" value={flowPick} onChange={(e) => setFlowPick(e.target.value)}>
                 <option value="">Every flow</option>
                 {flowChoices.map(([id, name]) => (
@@ -614,7 +666,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
           narrowed ? (
             <div className="empty-state empty-state-sm">
               <p>
-                No run among the newest {listed} {f.none} matches{needle ? ` “${query.trim()}”` : ''}
+                No {f.one} matches{searched ? ` “${searched}”` : ''}
                 {flowPick ? ` in ${names?.get(flowPick) ?? flowPick}` : ''}.
               </p>
               <button
@@ -640,7 +692,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
                 r={r}
                 name={nameOf(r)}
                 flowKnown={names === null || !r.flowId ? null : names.has(r.flowId)}
-                who={callerText(r.callerProduct, computers)}
+                who={whoAsked(r, computers)}
                 open={expanded === r.runId}
                 held={held?.runId === r.runId ? f.none : null}
                 now={now}
@@ -661,14 +713,14 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: () => void 
           <div className="run-foot">
             <span className="form-hint">
               {narrowed
-                ? `${visible.length} of the newest ${listed} ${f.none} match.`
+                ? `${visible.length} ${visible.length === 1 ? f.one : f.none} match${visible.length === 1 ? 'es' : ''}${more ? ', and older ones too' : ''}.`
                 : total !== null && listed < total
-                  ? `Showing the newest ${listed} of ${total} ${f.none}.${!more && limit >= MOST ? ` The list reaches back ${MOST}; the rest are kept, and go when finished runs are cleared.` : ''}`
+                  ? `Showing the newest ${listed} of ${total} ${f.none}.`
                   : `${listed} ${listed === 1 ? f.one : f.none}.`}
             </span>
             {more && (
-              <button className="btn-tiny" onClick={() => setLimit(Math.min(MOST, limit + PAGE))}>
-                Show {Math.min(PAGE, MOST - limit, (total ?? 0) - listed)} more
+              <button className="btn-tiny" onClick={showMore} disabled={loadingOlder}>
+                {loadingOlder ? <Loader2 size={12} className="spin" aria-hidden /> : null} Show {moreCount > 0 ? moreCount : PAGE} more
               </button>
             )}
             {narrowed && (
@@ -703,7 +755,7 @@ interface RowProps {
   onToggle: () => void;
   onStop: () => void;
   onAgain: () => void;
-  onOpenEditor?: () => void;
+  onOpenEditor?: (flowId: string) => void;
 }
 
 function RunRow({ r, name, flowKnown, who, open, held, now, busy, onToggle, onStop, onAgain, onOpenEditor }: RowProps) {
@@ -771,7 +823,7 @@ function RunDetail({ r, name, flowKnown, who, busy, onAgain, onOpenEditor }: Pic
           </button>
         )}
         {r.flowId && flowKnown && onOpenEditor && (
-          <button className="btn-tiny" onClick={onOpenEditor} title={`Open the flow editor, to open ${name} in it`}>
+          <button className="btn-tiny" onClick={() => onOpenEditor(r.flowId!)} title={`Open ${name} in the flow editor`}>
             <Workflow size={12} aria-hidden /> Open the editor
           </button>
         )}

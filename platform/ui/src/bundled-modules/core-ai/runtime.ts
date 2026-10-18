@@ -665,6 +665,34 @@ function extractJsonPath(root: unknown, path: string): unknown {
   return cur;
 }
 
+/** The text of a message's content: a string as it is, the text parts of a list of parts joined. */
+function textOf(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((p) => (p && typeof p === 'object' && (p as { type?: unknown }).type === 'text' ? String((p as { text?: unknown }).text ?? '') : ''))
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * A message's content in the shape Anthropic's Messages API takes. A string stays one. In a list of parts a picture
+ * is OpenAI's `image_url` part here (the one shape the request is built in); Anthropic refuses that shape, and takes
+ * a picture as an `image` block: its bytes (`base64`, with the type the data URL names) or its address (`url`).
+ * Any other part (text, or a block already in Anthropic's shape) goes as it is.
+ */
+function anthropicContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((part) => {
+    const p = part as { type?: unknown; image_url?: unknown };
+    if (!p || p.type !== 'image_url') return part;
+    const url = String(typeof p.image_url === 'string' ? p.image_url : ((p.image_url as { url?: unknown } | undefined)?.url ?? ''));
+    const inline = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+    if (inline) return { type: 'image', source: { type: 'base64', media_type: inline[1], data: inline[2] } };
+    return { type: 'image', source: { type: 'url', url } };
+  });
+}
+
 async function chat(
   systemPrompt: string,
   userPrompt: string,
@@ -1286,16 +1314,24 @@ async function chat(
         throw new Error(`[AI] Custom body template did not render to valid JSON: ${e instanceof Error ? e.message : String(e)}. Rendered: ${renderedBody.slice(0, 300)}`);
       }
     } else if (isAnthropic) {
-      // Anthropic Messages API format
+      // Anthropic Messages API format. The system prompt is a field of its own, not a turn: every system turn goes
+      // there, in order (a history's own, then the node's prompt with a history given as text folded in). It was the
+      // node's prompt alone, so a history given as text never reached the model, and one given as turns lost its
+      // system turns. Pictures go as Anthropic's image blocks (`anthropicContent`), not OpenAI's `image_url`.
       headers['x-api-key'] = apiKey;
       headers['anthropic-version'] = '2023-06-01';
+      const system = messages
+        .filter((m) => m.role === 'system')
+        .map((m) => textOf(m.content))
+        .filter(Boolean)
+        .join('\n\n');
       body = {
         model: model,
         max_tokens: maxTokens || 4096,
-        messages: messages.filter(m => m.role !== 'system'), // Anthropic uses system differently
+        messages: messages.filter((m) => m.role !== 'system').map((m) => ({ role: m.role, content: anthropicContent(m.content) })),
       };
-      if (systemPrompt) {
-        body.system = systemPrompt;
+      if (system) {
+        body.system = system;
       }
       if (temperature > 0) {
         body.temperature = temperature;
@@ -1444,7 +1480,11 @@ async function chat(
         content = data?.choices?.[0]?.message?.content ?? data?.response ?? data?.text ?? JSON.stringify(data);
       }
     } else if (isAnthropic) {
-      content = data.content?.[0]?.text || JSON.stringify(data);
+      // (every text block, in order: the answer can come in several, after a thinking block that has no text)
+      const texts: string[] = Array.isArray(data?.content)
+        ? data.content.filter((b: { type?: unknown; text?: unknown }) => b?.type === 'text' && typeof b.text === 'string').map((b: { text: string }) => b.text)
+        : [];
+      content = texts.join('') || JSON.stringify(data);
     } else {
       content = data.choices?.[0]?.message?.content || data.response || JSON.stringify(data);
     }

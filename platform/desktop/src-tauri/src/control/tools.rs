@@ -273,7 +273,7 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 object(json!({ "pluginId": plugin_id() }), &["pluginId"])),
             // Flows
             def("flows_list", "Flows", Read,
-                "The flows stored on this desktop: id, name, description, the inputs each takes (by name, with the value it has when none is given), and whether it is shared with apps (oaiyRemote: FormLogic and other apps may run it through the oaiy-flows connector). With node (a paired worker's node id, as network_status lists it, OAIY Network): the flows that computer shares, which flow_run with the same node runs there.",
+                "The flows stored on this desktop: id, name, description, the inputs each takes (by name, with the value it has when none is given), and whether it is shared with apps (oaiyRemote: FormLogic and other apps may run it through the oaiy-flows connector). One marked macro: true is a macro, a part the flow editor's flows use as a node (its Macro Input and Macro Output nodes are its inputs and outputs), not a flow to run on its own. With node (a paired worker's node id, as network_status lists it, OAIY Network): the flows that computer shares, which flow_run with the same node runs there.",
                 object(json!({ "node": node_id() }), &[])),
             def("flow_get", "A flow", Read,
                 "One flow's document as stored ({name, nodes, edges}). Read one before flow_create or flow_update, to follow its shape.",
@@ -829,13 +829,18 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
                 // What each takes and whether apps may run it, from its document (a copy given to the Agent as a
                 // tool, `tool-…`, is listed as it is stored).
                 let doc = d.get(&format!("/api/bridge/flows/{}", seg(id))).await.unwrap_or(Value::Null);
-                flows.push(json!({
+                let mut entry = json!({
                     "id": id,
                     "name": f.get("name"),
                     "description": doc.get("description").and_then(Value::as_str).unwrap_or(""),
                     "inputs": crate::bridge::flow_connector::inputs_of(&doc),
                     "oaiyRemote": crate::bridge::flow_connector::shared(&doc),
-                }));
+                });
+                // (a macro of the editor's, kept for the flows that use it as a node: said to be one)
+                if f.get("macro").and_then(Value::as_bool) == Some(true) {
+                    entry["macro"] = json!(true);
+                }
+                flows.push(entry);
             }
             data(json!({ "flows": flows }))
         }

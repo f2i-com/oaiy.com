@@ -1403,6 +1403,7 @@ pub fn run() {
             crate::embed::hide_embedded,
             crate::embed::set_theme,
             crate::embed::agent_intent,
+            crate::embed::flows_intent,
             crate::backup::commands::backup_create,
             crate::backup::commands::backup_restore_inspect,
             crate::backup::commands::backup_restore_stage,

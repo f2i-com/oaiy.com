@@ -226,6 +226,9 @@ pub struct RunRequest {
     /// The event name that triggered this, when it came from a binding. Part of
     /// the once-per-tree guard key.
     pub trigger_event: Option<String>,
+    /// The caller's label (`caller.label`), kept on the run for history to show as who asked. None for the runs this
+    /// desktop reserves itself (a trigger's, a paired computer's): run history words those from the product.
+    pub caller_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +290,41 @@ pub struct RunRecord {
     pub lineage: LineageRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_event: Option<String>,
+    /// Who asked, in the caller's own words (`caller.label`: "the Agent", an app's name for itself), for run history
+    /// to say rather than guess from the product. Untrusted text, shown as text. Under the schema's `caller` object,
+    /// which the result may carry whole.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub caller: Option<CallerShown>,
+}
+
+/// The caller as a run keeps it for display: its product and its label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerShown {
+    pub product: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
+}
+
+/// The most of a caller's label a run keeps (the schema's own limit).
+pub const MAX_CALLER_LABEL: usize = 200;
+
+/// Where a page of history starts: the runs asked for before this one (by when they were asked, and among runs asked
+/// in the same millisecond, by their run id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub reserved_at_ms: u64,
+    /// The last run of the page before; none: every run asked in that millisecond is before it too.
+    pub run_id: Option<String>,
+}
+
+/// A run's place in history, newest first: when it was asked, then its run id (the same millisecond's runs in the
+/// order they were made: an id is `run_<ms>_<seq in hex>`, and a longer hex number is a larger one).
+fn history_order(a: &RunRecord, b: &RunRecord) -> std::cmp::Ordering {
+    b.reserved_at_ms
+        .cmp(&a.reserved_at_ms)
+        .then_with(|| b.run_id.len().cmp(&a.run_id.len()))
+        .then_with(|| b.run_id.cmp(&a.run_id))
 }
 
 /// Result of a reservation attempt.
@@ -456,11 +494,32 @@ pub struct Ledger {
     /// On-disk durability. `None` for an in-memory ledger (tests, the default);
     /// `Some` after [`Ledger::open`].
     journal: Option<Journal>,
+    /// Where each run is told as it ends ([`Self::tell_outcomes_to`]): the plugin host, which makes the outcome an
+    /// event (`flow.succeeded` …) for the bindings that listen, with the run as its origin.
+    outcomes: Option<std::sync::mpsc::SyncSender<RunRecord>>,
 }
 
 impl Ledger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tell `to` of every run as it ends (finished, or cancelled before it started). Never waits: a full channel
+    /// drops the news (the run is recorded all the same), as this is said under the ledger's lock.
+    pub fn tell_outcomes_to(&mut self, to: std::sync::mpsc::SyncSender<RunRecord>) {
+        self.outcomes = Some(to);
+    }
+
+    fn told(&self, run: &RunRecord) {
+        if let Some(to) = &self.outcomes {
+            let _ = to.try_send(run.clone());
+        }
+    }
+
+    /// Whether a run is kept under `product`'s idempotency key `key`: what a redrive asks of each binding, which made
+    /// its run under a key of its own for the event (`binding:<id>:<event's key>`).
+    pub fn has_key(&self, product: &str, key: &str) -> bool {
+        self.by_key.get(&dedupe_key(product, key)).is_some_and(|id| self.runs.contains_key(id))
     }
 
     /// Open a durable ledger backed by a journal at `path`.
@@ -613,6 +672,12 @@ impl Ledger {
             finished_at_ms: None,
             lineage: req.lineage.clone(),
             trigger_event: req.trigger_event.clone(),
+            caller: req
+                .caller_label
+                .as_deref()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|l| CallerShown { product: req.caller_product.clone(), label: Some(l.chars().take(MAX_CALLER_LABEL).collect()) }),
         };
 
         // Note the guard is recorded on RESERVE, not on completion. A run that is
@@ -813,6 +878,7 @@ impl Ledger {
             rec.clone()
         };
         self.persist(&updated);
+        self.told(&updated);
         Ok(updated)
     }
 
@@ -848,6 +914,9 @@ impl Ledger {
             }
         };
         self.persist(&updated);
+        if status.is_terminal() {
+            self.told(&updated);
+        }
         Ok(status)
     }
 
@@ -900,9 +969,41 @@ impl Ledger {
             .filter(|r| statuses.is_empty() || statuses.contains(&r.status))
             .cloned()
             .collect();
-        q.sort_by(|a, b| b.reserved_at_ms.cmp(&a.reserved_at_ms));
+        q.sort_by(history_order);
         q.truncate(limit);
         q
+    }
+
+    /// A page of history, newest first: at most `limit` runs in `statuses` (empty: every state) that `keep` lets
+    /// through, asked before `before` when it is given, and whether more such runs are older than the page. What
+    /// [`Self::recent`] answers, past its newest: the history view pages back through all of them, and its search
+    /// asks here (`keep`) rather than among the runs it happens to have.
+    pub fn history(&self, limit: usize, statuses: &[RunStatus], before: Option<&HistoryCursor>, keep: impl Fn(&RunRecord) -> bool) -> (Vec<RunRecord>, bool) {
+        let older = |r: &RunRecord| match before {
+            None => true,
+            Some(c) => r.reserved_at_ms < c.reserved_at_ms
+                || (r.reserved_at_ms == c.reserved_at_ms
+                    && c.run_id.as_deref().is_some_and(|id| (r.run_id.len(), r.run_id.as_str()) < (id.len(), id))),
+        };
+        let mut q: Vec<&RunRecord> = self
+            .runs
+            .values()
+            .filter(|r| (statuses.is_empty() || statuses.contains(&r.status)) && older(r) && keep(r))
+            .collect();
+        q.sort_by(|a, b| history_order(a, b));
+        let more = q.len() > limit;
+        (q.into_iter().take(limit).cloned().collect(), more)
+    }
+
+    /// When the newest failed or timed-out run ended (asked, for one that never started), as epoch millis: what
+    /// Overview's warning is judged by (a failure since the person last looked), where a count went wrong once runs
+    /// were cleared or evicted. None when no such run is kept.
+    pub fn last_failed_ms(&self) -> Option<u64> {
+        self.runs
+            .values()
+            .filter(|r| matches!(r.status, RunStatus::Failed | RunStatus::TimedOut))
+            .map(|r| r.finished_at_ms.unwrap_or(r.reserved_at_ms))
+            .max()
     }
 
     /// Forget finished runs. Returns how many were removed.
@@ -1017,7 +1118,65 @@ mod tests {
             idempotency_key: key.into(),
             lineage: LineageRef::default(),
             trigger_event: None,
+            caller_label: None,
         }
+    }
+
+    /// The caller's label is kept on the run (trimmed, at most the schema's 200 characters), and survives the journal.
+    #[test]
+    fn the_callers_label_is_kept_on_the_run() {
+        let mut l = Ledger::new();
+        let long = "x".repeat(500);
+        let labelled = match l.reserve(&RunRequest { caller_label: Some("  Acme reception ".into()), ..req("a") }) {
+            ReserveOutcome::Reserved(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(labelled.caller, Some(CallerShown { product: "formlogic".into(), label: Some("Acme reception".into()) }));
+        let cut = match l.reserve(&RunRequest { caller_label: Some(long), ..req("b") }) {
+            ReserveOutcome::Reserved(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(cut.caller.unwrap().label.unwrap().chars().count(), MAX_CALLER_LABEL);
+        for blank in [None, Some("   ".to_string())] {
+            match l.reserve(&RunRequest { caller_label: blank, ..req(&format!("c{}", l.len())) }) {
+                ReserveOutcome::Reserved(r) => assert!(r.caller.is_none()),
+                other => panic!("{other:?}"),
+            }
+        }
+        // (as the journal writes and reads it: a line from before it was kept has none)
+        let wire = serde_json::to_value(&labelled).unwrap();
+        assert_eq!(wire["caller"], serde_json::json!({ "product": "formlogic", "label": "Acme reception" }));
+        let back: RunRecord = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back.caller, labelled.caller);
+        let mut old = wire;
+        old.as_object_mut().unwrap().remove("caller");
+        assert!(serde_json::from_value::<RunRecord>(old).unwrap().caller.is_none());
+    }
+
+    /// When the newest failure ended: a failed or timed-out run's end, never a cancelled or succeeded one's.
+    #[test]
+    fn the_last_failure_is_the_newest_failed_or_timed_out_run() {
+        let mut l = Ledger::new();
+        assert_eq!(l.last_failed_ms(), None);
+        let end = |l: &mut Ledger, key: &str, status: RunStatus| {
+            let id = match l.reserve(&req(key)) {
+                ReserveOutcome::Reserved(r) => r.run_id,
+                other => panic!("{other:?}"),
+            };
+            assert!(matches!(l.claim(&id, Runtime::Desktop, "w"), ClaimOutcome::Claimed(_)));
+            let error = matches!(status, RunStatus::Failed | RunStatus::TimedOut | RunStatus::Cancelled).then(|| RunError::new(RunErrorCode::NodeFailed, "no"));
+            l.finish(&id, status, None, error).unwrap().finished_at_ms.unwrap()
+        };
+        let failed = end(&mut l, "f", RunStatus::Failed);
+        assert_eq!(l.last_failed_ms(), Some(failed));
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        end(&mut l, "s", RunStatus::Succeeded);
+        end(&mut l, "x", RunStatus::Cancelled);
+        assert_eq!(l.last_failed_ms(), Some(failed), "a success or a cancel is no failure");
+        let timed = end(&mut l, "t", RunStatus::TimedOut);
+        assert_eq!(l.last_failed_ms(), Some(timed));
+        l.clear_history();
+        assert_eq!(l.last_failed_ms(), None, "cleared with them");
     }
 
     // --- durability -------------------------------------------------------
@@ -1617,6 +1776,7 @@ mod tests {
                 depth,
             },
             trigger_event: Some(event.into()),
+            caller_label: None,
         }
     }
 
@@ -1693,6 +1853,7 @@ mod tests {
         let ok = RunRequest {
             lineage: LineageRef::default(),
             trigger_event: None,
+            caller_label: None,
             ..triggered("shared-key", "root", "p", "b", "e", 0)
         };
         assert!(matches!(l.reserve(&ok), ReserveOutcome::Reserved(_)));

@@ -15,7 +15,7 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
-import { contractLiteral, isContractService, resolveService } from './contract';
+import { contractLiteral, isContractService, resolveNodeService } from './contract';
 
 function firstNonEmpty(...vals: (string | undefined | null)[]): string {
   for (const v of vals) {
@@ -38,7 +38,7 @@ const CoreServiceCompiler: ModuleCompiler = {
     const letOrAssign = skipVarDeclaration ? '' : 'let ';
 
     const presetId = (data.service as string) || '';
-    const preset = resolveService(presetId);
+    const preset = resolveNodeService(presetId, data);
     // A contract service (OAIY's engine models, a rig that declares what it
     // makes or a job to follow) runs through Service.callContract: its body
     // is rendered with missing values as null, jobs are followed, and a file

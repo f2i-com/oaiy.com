@@ -409,11 +409,14 @@ export class Desktop {
     await reply(await fetch(`${this.origin}/api/engines/defaults`, { method: 'PUT', headers: this.headers(), body: JSON.stringify({ group: 'llm', model }), signal }));
   }
 
-  /** The flows stored on the desktop. */
-  async flows(signal?: AbortSignal): Promise<Array<{ id: string; name: string }>> {
+  /** The flows stored on the desktop; `macro`: one the editor keeps as a macro (a step other flows use), as the desktop says. */
+  async flows(signal?: AbortSignal): Promise<Array<{ id: string; name: string; macro: boolean }>> {
     const body = await reply(await fetch(`${this.origin}/api/bridge/flows`, { headers: this.headers(), signal }));
     const list = isRecord(body) && Array.isArray(body.flows) ? body.flows : [];
-    return list.filter(isRecord).map((f) => ({ id: String(f.flowId ?? ''), name: String(f.name ?? f.flowId ?? '') })).filter((f) => f.id);
+    return list
+      .filter(isRecord)
+      .map((f) => ({ id: String(f.flowId ?? ''), name: String(f.name ?? f.flowId ?? ''), macro: f.macro === true }))
+      .filter((f) => f.id);
   }
 
   /** A stored flow, as it was stored. */

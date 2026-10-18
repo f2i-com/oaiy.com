@@ -153,6 +153,104 @@ export function resolveService(
   return [...custom, ...desktop, ...BUILT_IN_SERVICES].find((s) => s.id === id) ?? null;
 }
 
+/**
+ * The service `id` names for one node: as {@link resolveService} finds it, else the copy the editor put in the node
+ * when it saved the flow to OAIY Desktop (`data._services`, {@link withNodeServices}). A flow run by the desktop's
+ * bridge, a trigger or the Agent is compiled by the CLI, which has no localStorage: the person's own service and the
+ * desktop's `companion:*` ones were nowhere to be found there, and the node compiled to an empty endpoint.
+ */
+export function resolveNodeService(id: string, data: Record<string, unknown> | undefined): CustomService | null {
+  const found = resolveService(id);
+  if (found || !id) return found;
+  const kept = data?._services;
+  const copy = kept && typeof kept === 'object' && !Array.isArray(kept) ? (kept as Record<string, unknown>)[id] : null;
+  return copy && typeof copy === 'object' && typeof (copy as CustomService).endpoint === 'string' ? ({ ...(copy as CustomService), id } as CustomService) : null;
+}
+
+/** The node fields that name a service (`service`, and a 3D node's picture model). */
+const SERVICE_FIELDS = ['service', 'pictureService'] as const;
+
+/** A header whose name says it carries a credential: kept only while its value is a placeholder (`Bearer {{apiKey}}`). */
+const CREDENTIAL_HEADER = /auth|cookie|key|token|secret|passw/i;
+
+/** Text with no run of characters as long as a key (a header's value, its placeholders taken out). */
+const holdsNoKey = (text: string) => !/[A-Za-z0-9_\-.+/=]{24,}/.test(text);
+
+/** Whether a header's value may be kept: a credential's only as a placeholder, any other's only if it holds no key. */
+function headerKept(name: string, value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const bare = value.replace(/\{\{\w+\}\}/g, '');
+  if (CREDENTIAL_HEADER.test(name)) return bare !== value && holdsNoKey(bare) && bare.trim().split(/\s+/).filter(Boolean).length <= 1;
+  return holdsNoKey(bare);
+}
+
+/**
+ * What of a service a node keeps for a run elsewhere: how to call it (its address, method, body, what to read back,
+ * the model, the shape it speaks, what it makes), never a key. A header that names a credential is kept only while
+ * its value is a placeholder filled in when the flow runs (`{{apiKey}}` from the API key constant, named here and
+ * kept on this computer); the rest of what the editor shows of a service (its description, icon, install hint) is not
+ * needed to run it.
+ */
+export function serviceForNode(s: CustomService): Partial<CustomService> {
+  let headers = '{}';
+  try {
+    const parsed = JSON.parse(s.headers || '{}') as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      headers = JSON.stringify(Object.fromEntries(Object.entries(parsed as Record<string, unknown>).filter(([name, value]) => headerKept(name, value))));
+    }
+  } catch {
+    // (headers that are not JSON are not kept: they could hold anything)
+  }
+  const keep = <K extends keyof CustomService>(...keys: K[]) =>
+    Object.fromEntries(keys.filter((k) => s[k] !== undefined).map((k) => [k, s[k]])) as Partial<CustomService>;
+  return {
+    ...keep('id', 'name', 'method', 'responseType', 'responsePath', 'infoPath', 'filesUrl', 'apiKeyConstant', 'model', 'apiFormat', 'inputs', 'outputs', 'group', 'kind', 'output', 'outputFormat', 'requestFormat', 'job'),
+    endpoint: withoutKeys(s.endpoint || ''),
+    ...(s.bodyTemplate !== undefined ? { bodyTemplate: withoutKeys(s.bodyTemplate) } : {}),
+    headers,
+  };
+}
+
+/** A provider's key written into text (an address's `?key=`, a body template): taken out. */
+const KEY_SHAPED = /\b(?:sk-|sk_|rk_|hf_|gsk_|xai-|pplx-|AIza|ghp_|gho_|github_pat_|oaiypat_)[A-Za-z0-9_-]{12,}/g;
+function withoutKeys(text: string): string {
+  return text.replace(KEY_SHAPED, '');
+}
+
+/**
+ * A flow's nodes as OAIY Desktop keeps them: each node that names one of the person's own services or one of the
+ * desktop's (`companion:*`) carries what it takes to call it (`data._services`, by id), for a run the editor is not
+ * in. OAIY's own (`engine:*`, `voice:*`) are looked up when the flow runs, and the built-in examples are in the code,
+ * so neither is copied. A node whose service is not listed here is left as it is.
+ */
+export function withNodeServices<N extends { data?: unknown }>(nodes: N[], lists: { custom?: CustomService[]; desktop?: CustomService[] } = {}): N[] {
+  return nodes.map((node) => {
+    const data = node.data && typeof node.data === 'object' ? (node.data as Record<string, unknown>) : null;
+    if (!data) return node;
+    const copies: Record<string, Partial<CustomService>> = {};
+    for (const field of SERVICE_FIELDS) {
+      const id = data[field];
+      if (typeof id !== 'string' || !id || isOaiyServiceId(id)) continue;
+      const found = resolveService(id, lists);
+      if (found && !found.isBuiltIn) copies[id] = serviceForNode(found);
+    }
+    const { _services: _old, ...rest } = data;
+    void _old;
+    return Object.keys(copies).length ? { ...node, data: { ...rest, _services: copies } } : '_services' in data ? { ...node, data: rest } : node;
+  });
+}
+
+/** A flow's nodes as the editor holds them: without the services copied in for OAIY Desktop ({@link withNodeServices}). */
+export function withoutNodeServices<N extends { data?: unknown }>(nodes: N[]): N[] {
+  return nodes.map((node) => {
+    const data = node.data && typeof node.data === 'object' ? (node.data as Record<string, unknown>) : null;
+    if (!data || !('_services' in data)) return node;
+    const { _services: _gone, ...rest } = data;
+    void _gone;
+    return { ...node, data: rest };
+  });
+}
+
 /** Whether `s` runs as a contract (see the module docs). */
 export function isContractService(s: CustomService | null | undefined): s is CustomService {
   return !!s && !!(s.output || s.job || s.requestFormat === 'wav16k');

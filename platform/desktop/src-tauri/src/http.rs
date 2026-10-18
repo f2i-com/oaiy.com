@@ -1542,6 +1542,16 @@ async fn origin_guard(
 #[derive(Clone, Copy)]
 pub(crate) struct PublicView;
 
+/// Marks a request from the desktop's own window (its webview's origin, which a web page cannot send, on a desktop
+/// with a window): the person at this computer, whose flow runs are theirs (`bridge::routes::create_run`).
+#[derive(Clone, Copy)]
+pub(crate) struct OwnWindow;
+
+/// The desktop's own window's origins: the webview's on a Mac and Linux, and on Windows.
+fn is_own_window_origin(origin: &str) -> bool {
+    matches!(origin, "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost")
+}
+
 /// GET reads that name absolute paths (the data folder, every model file's, the Python runtime's and its environments')
 /// or a download's address, which no web page reads: the dashboard (OAIY's own origin), the CLI (a program, which sends
 /// no `Origin`) and a token holder do. A page the owner happens to have open, on any website, must not.
@@ -1616,6 +1626,7 @@ pub(super) fn paired_reaches(access: crate::bridge::pairing::PairingAccess, req:
 ///   not one the old guard trusts, `GET /api/bridge/flows/:id` (a flow may hold a key in a node) is a restricted read
 ///   like the flows' list, `DELETE /api/bridge/pairing` takes the privileged gate like the other pairing changes, and a
 ///   web page's `GET /api/services` is marked for the [`PublicView`].
+/// - A request from the desktop's own window is marked [`OwnWindow`].
 fn tighten(auth: &AuthConfig, mut req: Request) -> Result<Request, axum::response::Response> {
     let refuse = || (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "origin not allowed" }))).into_response();
     let m = req.method().clone();
@@ -1644,6 +1655,9 @@ fn tighten(auth: &AuthConfig, mut req: Request) -> Result<Request, axum::respons
                 req.headers_mut().remove(AUTHORIZATION);
             }
         }
+    }
+    if auth.gui_mode && origin.as_deref().is_some_and(is_own_window_origin) {
+        req.extensions_mut().insert(OwnWindow);
     }
     if !auth.gui_mode || owner || paired {
         return Ok(req);
@@ -2149,6 +2163,13 @@ pub(crate) fn cors_layer() -> CorsLayer {
 #[cfg(test)]
 pub(crate) fn guarded_for_tests(router: Router, token: Option<String>, gui_mode: bool) -> Router {
     router.layer(middleware::from_fn_with_state(AuthConfig { token, gui_mode, pairing: None }, origin_guard))
+}
+
+/// [`guarded_for_tests`] with [`tighten`] in front, as the listener has it in `legacy` mode (what marks [`OwnWindow`]).
+#[cfg(test)]
+pub(crate) fn tightened_for_tests(router: Router, token: Option<String>, gui_mode: bool) -> Router {
+    let auth = AuthConfig { token, gui_mode, pairing: None };
+    router.layer(middleware::from_fn_with_state(auth.clone(), origin_guard)).layer(middleware::from_fn_with_state(auth, tightened))
 }
 
 /// A frozen copy of the guard as it was before the access model, and the differential test that holds the live

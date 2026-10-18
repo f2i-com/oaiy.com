@@ -654,6 +654,7 @@ async fn run_flow(State(net): State<Network>, Extension(caller): Extension<Calle
         idempotency_key: format!("network:{}:{key}", primary.node_id),
         lineage: Default::default(),
         trigger_event: None,
+        caller_label: None,
     };
     let outcome = { lock(&bridge.ledger).reserve(&request) };
     match outcome {

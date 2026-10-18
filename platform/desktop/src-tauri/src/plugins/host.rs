@@ -52,7 +52,7 @@ use super::registry::{GateRefusal, PluginRegistryHandle, PluginState};
 use super::runner::{restart_delay, should_restart, HealthTracker, HealthVerdict, HEALTH_INTERVAL};
 use super::trust::LaunchRefusal;
 use crate::bridge::deadletters::{DeadLetterHandle, DeadReason};
-use crate::bridge::ledger::{LedgerHandle, LineageRef, ReserveOutcome, RunRequest, RunStatus};
+use crate::bridge::ledger::{LedgerHandle, LineageRef, ReserveOutcome, RunRecord, RunRequest, RunStatus};
 use crate::bridge::triggers::{dispatch, DispatchOutcome, Event, SkipReason, TriggerBinding};
 use crate::link::outbox::account_key;
 use crate::services::runner::LogBuffer;
@@ -89,6 +89,9 @@ struct Dispatched {
     outcomes: Vec<String>,
     /// Set when the event should have produced work and did not.
     dead: Option<DeadReason>,
+    /// The same, with the loop guards' refusals not counted: for a run's outcome, where a guard refusing is a loop
+    /// being stopped (the binding that started a run handed its outcome), not work that was lost.
+    dead_past_guards: Option<DeadReason>,
     /// Did any binding actually reserve a run?
     reserved: bool,
 }
@@ -99,6 +102,11 @@ struct Dispatched {
 /// operational reason. A binding that fired makes the event handled — the
 /// others declining is ordinary fan-out, not lost work.
 fn dead_reason_for(results: &[DispatchOutcome]) -> Option<DeadReason> {
+    dead_reason_where(results, is_operational_failure)
+}
+
+/// [`dead_reason_for`] counting only the skips `failed` names as failures.
+fn dead_reason_where(results: &[DispatchOutcome], failed: impl Fn(&SkipReason) -> bool) -> Option<DeadReason> {
     if results
         .iter()
         .any(|o| matches!(o, DispatchOutcome::Reserved { .. }))
@@ -108,13 +116,63 @@ fn dead_reason_for(results: &[DispatchOutcome]) -> Option<DeadReason> {
     let failures: Vec<String> = results
         .iter()
         .filter_map(|o| match o {
-            DispatchOutcome::Skipped { binding_id, reason } if is_operational_failure(reason) => {
+            DispatchOutcome::Skipped { binding_id, reason } if failed(reason) => {
                 Some(format!("{binding_id}: {}", reason.message()))
             }
             _ => None,
         })
         .collect();
     (!failures.is_empty()).then(|| DeadReason::NotReserved { detail: failures.join("; ") })
+}
+
+/// The most of a run's answer its outcome event carries (`data.output`); a larger one is left out, the run keeps it.
+const OUTCOME_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// A run's end as an event: `flow.succeeded`, `flow.failed`, `flow.timed_out` or `flow.cancelled`, from `flows`,
+/// with the run (its id, flow, state, error, answer) as its data and the run as its origin: the lineage the loop
+/// guards read, its tree's root (the run itself at the top of one) and the binding that started it. With the
+/// envelope it is kept as. `None` for a run that has not ended.
+pub(crate) fn outcome_event(run: &RunRecord) -> Option<(Event, Value)> {
+    if !run.status.is_terminal() {
+        return None;
+    }
+    let state = serde_json::to_value(run.status).ok()?.as_str()?.to_string();
+    let name = format!("flow.{state}");
+    let mut data = json!({
+        "runId": run.run_id,
+        "flowId": run.flow_id,
+        "status": state,
+        "callerProduct": run.caller_product,
+    });
+    if let Some(e) = &run.trigger_event {
+        data["triggerEvent"] = json!(e);
+    }
+    if let Some(e) = &run.error {
+        data["error"] = json!({ "code": e.code, "message": e.message });
+    }
+    if let Some(output) = run.output.as_ref().filter(|o| o.to_string().len() <= OUTCOME_OUTPUT_BYTES) {
+        data["output"] = output.clone();
+    }
+    let origin = LineageRef {
+        root_run_id: run.lineage.root_run_id.clone().or_else(|| Some(run.run_id.clone())),
+        parent_run_id: Some(run.run_id.clone()),
+        binding_id: run.lineage.binding_id.clone(),
+        depth: run.lineage.depth,
+    };
+    let key = format!("flow:{}:{state}", run.run_id);
+    let correlation = if run.correlation_id.is_empty() { run.run_id.clone() } else { run.correlation_id.clone() };
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let envelope = json!({
+        "schemaVersion": 1,
+        "source": "flows",
+        "name": name,
+        "correlationId": correlation,
+        "idempotencyKey": key,
+        "occurredAt": at,
+        "data": data,
+    });
+    let event = Event { name, source: "flows".into(), correlation_id: correlation, idempotency_key: key, data, origin_run: Some(origin) };
+    Some((event, envelope))
 }
 
 /// Default deadline for a forwarded connector command.
@@ -677,6 +735,22 @@ impl PluginHost {
                 );
                 drop(h);
                 outbox.wait_for_work(account.is_some());
+            });
+        }
+
+        // Outcome thread: each run that ends here, as the event of its outcome (`flow.succeeded` …), for the bindings
+        // that listen. Told by the ledger, which never waits on this: a run's end is said under its lock.
+        {
+            let (outcome_tx, outcome_rx) = sync_channel::<RunRecord>(256);
+            if let Ok(mut ledger) = host.ledger.lock() {
+                ledger.tell_outcomes_to(outcome_tx);
+            }
+            let host = Arc::downgrade(&host);
+            thread::spawn(move || {
+                while let Ok(run) = outcome_rx.recv() {
+                    let Some(host) = host.upgrade() else { break };
+                    host.process_run_outcome(&run);
+                }
             });
         }
 
@@ -1505,18 +1579,7 @@ impl PluginHost {
             log::warn!("{name} could not be kept for the linked account ({e}); the plugin will send it again");
         }
 
-        let seq = self.events.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Ok(mut ring) = self.events.ring.lock() {
-            if ring.len() >= EVENT_RING_CAPACITY {
-                ring.pop_front();
-            }
-            ring.push_back(ReceivedEvent {
-                seq,
-                received_at_ms: now_ms(),
-                envelope,
-                outcomes,
-            });
-        }
+        self.note_received(envelope, outcomes);
 
         // Ack AFTER the dispatch outcome is recorded: the ack is the plugin's
         // permission to stop re-delivering, and an event acked before its runs
@@ -1532,6 +1595,47 @@ impl PluginHost {
                 let _ = p.ack_event(&idempotency_key);
             }
         }
+    }
+
+    /// Keep an event and what dispatch did with it, for `GET /api/bridge/events`.
+    fn note_received(&self, envelope: Value, outcomes: Vec<String>) {
+        let seq = self.events.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut ring) = self.events.ring.lock() {
+            if ring.len() >= EVENT_RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(ReceivedEvent {
+                seq,
+                received_at_ms: now_ms(),
+                envelope,
+                outcomes,
+            });
+        }
+    }
+
+    /// A run that ended here, as the event of its outcome, offered to the bindings that listen for it.
+    ///
+    /// The one event a run causes on this desktop, and so the one the loop guards were written for: it carries the
+    /// run as its origin ([`outcome_event`]), so a binding is never handed the outcome of the run it started (a flow
+    /// that triggers itself), one tree fires each binding once for each event, and a chain ends at the depth cap.
+    /// Without an origin every dispatch was a root, and the guards had nothing to go on. An outcome no binding
+    /// listens for is not kept as an event (every run would push the plugins' events out of the ring for nothing), and
+    /// it never goes to the linked account, which keeps runs of its own.
+    fn process_run_outcome(&self, run: &RunRecord) {
+        let Some((event, envelope)) = outcome_event(run) else { return };
+        let listened = self.triggers.lock().map(|t| t.list().iter().any(|b| b.event == event.name)).unwrap_or(false);
+        if !listened {
+            return;
+        }
+        let dispatched = self.dispatch_event(&event);
+        // (a guard's refusal is the loop stopped, said among the outcomes: dead-lettered, every run of a flow that
+        // handles outcomes would leave one behind)
+        if let Some(reason) = dispatched.dead_past_guards {
+            if let Ok(mut q) = self.dead.lock() {
+                q.record_caused(&event.source, &event.name, reason, envelope.clone(), event.origin_run.clone());
+            }
+        }
+        self.note_received(envelope, dispatched.outcomes);
     }
 
     /// Decide conditions with `evaluator` instead of the process-wide host.
@@ -1863,6 +1967,7 @@ impl PluginHost {
             idempotency_key,
             lineage: LineageRef::default(),
             trigger_event: None,
+            caller_label: None,
         };
 
         let mut ledger = self
@@ -2060,15 +2165,22 @@ impl PluginHost {
     /// Returns the per-binding outcomes for the event ring, and — when the event
     /// should have produced work but did not — the reason to dead-letter it.
     fn dispatch_event(&self, event: &Event) -> Dispatched {
+        self.dispatch_some(event, &|_| true)
+    }
+
+    /// [`Self::dispatch_event`] over the bindings `offer` lets through: a redrive offers the event only to those that
+    /// did not run for it already.
+    fn dispatch_some(&self, event: &Event, offer: &dyn Fn(&TriggerBinding) -> bool) -> Dispatched {
         if crate::isolated::active() {
             return Dispatched {
                 outcomes: vec![crate::isolated_policy::REFUSAL.into()],
                 dead: None,
+                dead_past_guards: None,
                 reserved: false,
             };
         }
         let bindings: Vec<TriggerBinding> = match self.triggers.lock() {
-            Ok(t) => t.list().to_vec(),
+            Ok(t) => t.list().iter().filter(|b| offer(b)).cloned().collect(),
             Err(_) => Vec::new(),
         };
 
@@ -2097,17 +2209,20 @@ impl PluginHost {
             // Not a skip: dispatch never ran. Nothing can have been reserved, so
             // this is always a dead letter.
             Err(_) => {
+                let dead = DeadReason::NotReserved {
+                    detail: "the run ledger was unavailable, so nothing was dispatched".into(),
+                };
                 return Dispatched {
                     outcomes: vec!["ledger lock poisoned; nothing dispatched".into()],
-                    dead: Some(DeadReason::NotReserved {
-                        detail: "the run ledger was unavailable, so nothing was dispatched".into(),
-                    }),
+                    dead: Some(dead.clone()),
+                    dead_past_guards: Some(dead),
                     reserved: false,
-                }
+                };
             }
         };
 
         let dead = dead_reason_for(&results);
+        let dead_past_guards = dead_reason_where(&results, |r| is_operational_failure(r) && !matches!(r, SkipReason::Guard(_)));
         let reserved = results
             .iter()
             .any(|o| matches!(o, DispatchOutcome::Reserved { .. }));
@@ -2122,7 +2237,7 @@ impl PluginHost {
                 }
             })
             .collect();
-        Dispatched { outcomes, dead, reserved }
+        Dispatched { outcomes, dead, dead_past_guards, reserved }
     }
 
     /// Is the app on its way out? See [`ProcTable::shutting_down`].
@@ -2203,10 +2318,17 @@ impl PluginHost {
     /// Re-dispatch a stored dead letter against the CURRENT bindings.
     ///
     /// Deliberately the ordinary path, guards and all: a guard-refused event is
-    /// offered to the guards again and refused again rather than forced through.
-    /// The only change is the idempotency key, which gains an attempt suffix —
-    /// sound because a dead letter reserved no run, so there is nothing to
-    /// double-execute.
+    /// offered to the guards again and refused again rather than forced through
+    /// (an event a run caused is offered with that run as its origin, as it was).
+    /// The idempotency key gains an attempt suffix, so a binding that failed can
+    /// reserve now. A binding that already reserved a run for this event, when it
+    /// was delivered before or at an earlier redrive, is NOT offered it again: an
+    /// event dead-lettered on its second delivery (its first ran one binding, the
+    /// second found that one a duplicate and another failing) was redriven to
+    /// every binding, and the one that had run ran again, under the new key: the
+    /// second email. The entry goes once nothing offered failed and something ran
+    /// (or everything had run already); while a binding still fails it stays, to
+    /// be redriven once that one is fixed.
     ///
     /// Returns the dispatch outcomes, and whether any binding actually reserved.
     pub fn redrive(&self, id: &str) -> Option<(Vec<String>, bool)> {
@@ -2247,16 +2369,39 @@ impl PluginHost {
                 item.attempts + 1,
             ),
             data: envelope.get("data").cloned().unwrap_or(Value::Null),
-            origin_run: None,
+            origin_run: item.origin_run.clone(),
         };
 
-        // The dead reason is deliberately dropped: this entry already exists, and
+        // The bindings that already ran for this event: a run is kept under the key each made for it, as the event was
+        // delivered or at each redrive before this one.
+        let keys: Vec<String> = std::iter::once(original_key.to_string())
+            .chain((1..=item.attempts).map(|n| crate::bridge::DeadLetterQueue::redrive_key(original_key, n)))
+            .collect();
+        let product = format!("oaiy-trigger:{}", item.source);
+        let ran: Vec<String> = {
+            let bindings: Vec<TriggerBinding> = self.triggers.lock().map(|t| t.list().to_vec()).unwrap_or_default();
+            match self.ledger.lock() {
+                Ok(l) => bindings
+                    .iter()
+                    .filter(|b| b.event == item.event && keys.iter().any(|k| l.has_key(&product, &format!("binding:{}:{k}", b.id))))
+                    .map(|b| b.id.clone())
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let matching = self.triggers.lock().map(|t| t.list().iter().filter(|b| b.event == item.event).count()).unwrap_or(0);
+
+        // The dead reason is not recorded again: this entry already exists, and
         // recording a second one for the same event would grow the queue every
         // time someone retries a redrive that keeps failing.
-        let Dispatched { outcomes, reserved, .. } = self.dispatch_event(&event);
+        let Dispatched { mut outcomes, reserved, dead, .. } = self.dispatch_some(&event, &|b| !ran.contains(&b.id));
+        for id in &ran {
+            outcomes.push(format!("{id}: already ran for this event, so not run again"));
+        }
+        let all_ran = matching > 0 && ran.len() >= matching;
 
         if let Ok(mut q) = self.dead.lock() {
-            if reserved {
+            if dead.is_none() && (reserved || all_ran) {
                 // Done: leaving it would have someone redriving the same event
                 // every morning.
                 q.remove(id);
@@ -2409,6 +2554,7 @@ mod tests {
                 finished_at_ms: None,
                 lineage: Default::default(),
                 trigger_event: None,
+                caller: None,
             },
         }
     }
@@ -3193,6 +3339,139 @@ mod tests {
         assert_eq!(host.ledger.lock().unwrap().len(), 1);
         // Resolved entries go, or someone redrives the same event every morning.
         assert!(host.dead.lock().unwrap().get(&id).is_none());
+    }
+
+    /// An event dead-lettered on its second delivery: the first ran one binding and the other failed; the second
+    /// found the first a duplicate and the other failing still. A redrive runs the one that failed, never the one
+    /// that ran (a second email), and the entry stays until that one runs.
+    #[test]
+    fn a_redrive_runs_only_the_bindings_that_did_not_run_for_the_event() {
+        let refusing = Arc::new(crate::bridge::conditions::testing::FakeHost::by_source(|_| {
+            Err(crate::bridge::conditions::testing::guest("SyntaxError: unexpected token '='"))
+        }));
+        let (_sb, host) = host_evaluating("redrive-some", vec![binding("email", None), binding("crm", Some("$event.data.from ==== 1"))], refusing);
+        host.process_event("aokie", envelope());
+        assert_eq!(host.ledger.lock().unwrap().len(), 1, "the email went");
+        assert!(host.dead.lock().unwrap().is_empty(), "the event ran something, so it was not lost");
+        host.process_event("aokie", envelope());
+        let id = host.dead.lock().unwrap().list(1)[0].id.clone();
+
+        let (outcomes, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(!reserved, "{outcomes:?}");
+        assert_eq!(host.ledger.lock().unwrap().len(), 1, "the email is not sent again: {outcomes:?}");
+        assert!(outcomes.iter().any(|o| o.starts_with("email: already ran")), "{outcomes:?}");
+        assert!(host.dead.lock().unwrap().get(&id).is_some(), "kept: crm still fails");
+
+        host.triggers.lock().unwrap().upsert(binding("crm", None)).unwrap();
+        let (outcomes, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(reserved, "{outcomes:?}");
+        let runs = host.ledger.lock().unwrap().recent(10, &[]);
+        assert_eq!(runs.len(), 2, "crm ran, and only crm: {outcomes:?}");
+        let by = |b: &str| runs.iter().filter(|r| r.lineage.binding_id.as_deref() == Some(b)).count();
+        assert_eq!((by("email"), by("crm")), (1, 1));
+        assert!(host.dead.lock().unwrap().get(&id).is_none(), "every binding has run: the entry goes");
+    }
+
+    /// A redrive where every binding had already run runs nothing, and the entry goes.
+    #[test]
+    fn a_redrive_with_nothing_left_to_run_clears_the_entry() {
+        let (_sb, host) = host_with("redrive-none", vec![binding("email", None)]);
+        host.process_event("aokie", envelope());
+        let id = host.dead.lock().unwrap().record("aokie", "aokie.call.incoming", DeadReason::NotReserved { detail: "b: x".into() }, envelope()).id;
+        let (outcomes, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(!reserved && outcomes.iter().any(|o| o.contains("already ran")), "{outcomes:?}");
+        assert_eq!(host.ledger.lock().unwrap().len(), 1);
+        assert!(host.dead.lock().unwrap().get(&id).is_none());
+    }
+
+    /// A run's end is an event with the run as its origin: a binding on `flow.succeeded` runs its flow after another
+    /// flow succeeds, and is not handed the outcome of the run it started itself, so the flow does not trigger itself
+    /// for ever. The loop stopped is said among the event's outcomes, not left as a dead letter.
+    #[test]
+    fn a_flow_that_triggers_itself_is_stopped_by_the_loop_guards() {
+        let then = TriggerBinding { event: "flow.succeeded".into(), flow_id: "tidy".into(), ..binding("then", None) };
+        let (_sb, host) = host_with("outcomes", vec![then]);
+        let finish = |run_id: &str| {
+            let mut l = host.ledger.lock().unwrap();
+            assert!(matches!(l.claim(run_id, crate::bridge::ledger::Runtime::Desktop, "w"), crate::bridge::ledger::ClaimOutcome::Claimed(_)));
+            l.finish(run_id, RunStatus::Succeeded, Some(json!({ "output": "done" })), None).unwrap();
+        };
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < until, "{what}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let first = match host.ledger.lock().unwrap().reserve(&RunRequest {
+            caller_product: "oaiy-desktop".into(),
+            flow_id: Some("greeting".into()),
+            inline_graph: false,
+            input: None,
+            timeout_ms: None,
+            mode: "async".into(),
+            correlation_id: "c".into(),
+            idempotency_key: "direct".into(),
+            lineage: Default::default(),
+            trigger_event: None,
+            caller_label: None,
+        }) {
+            ReserveOutcome::Reserved(r) => r,
+            other => panic!("{other:?}"),
+        };
+        finish(&first.run_id);
+        wait_for("the binding ran its flow after the first succeeded", &|| host.ledger.lock().unwrap().len() == 2);
+        let tidy = host.ledger.lock().unwrap().recent(1, &[])[0].clone();
+        assert_eq!(tidy.flow_id.as_deref(), Some("tidy"));
+        assert_eq!(tidy.trigger_event.as_deref(), Some("flow.succeeded"));
+        assert_eq!(tidy.lineage.parent_run_id.as_deref(), Some(first.run_id.as_str()));
+        assert_eq!(tidy.lineage.root_run_id.as_deref(), Some(first.run_id.as_str()));
+        assert_eq!(tidy.lineage.binding_id.as_deref(), Some("then"));
+        assert_eq!(tidy.input, None);
+
+        // Its own success comes back to the same binding: refused, so the flow does not run again.
+        finish(&tidy.run_id);
+        wait_for("the second outcome was dispatched", &|| host.events_since(0, 10).len() == 2);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(host.ledger.lock().unwrap().len(), 2, "the flow did not trigger itself");
+        let events = host.events_since(0, 10);
+        assert_eq!(events[1].envelope["data"]["runId"], tidy.run_id.as_str());
+        assert!(events[1].outcomes.iter().any(|o| o.contains("loop guard") && o.contains("then")), "{:?}", events[1].outcomes);
+        assert!(host.dead.lock().unwrap().is_empty(), "a loop stopped is not lost work");
+    }
+
+    /// An outcome no binding listens for is no event: the plugins' events are not pushed out of the ring by every run.
+    #[test]
+    fn an_outcome_nobody_listens_for_is_not_kept() {
+        let (_sb, host) = host_with("unheard", vec![binding("b1", None)]);
+        let id = match host.ledger.lock().unwrap().reserve(&RunRequest { caller_product: "oaiy-desktop".into(), flow_id: Some("f".into()), inline_graph: false, input: None, timeout_ms: None, mode: "async".into(), correlation_id: "c".into(), idempotency_key: "k".into(), lineage: Default::default(), trigger_event: None, caller_label: None }) {
+            ReserveOutcome::Reserved(r) => r.run_id,
+            other => panic!("{other:?}"),
+        };
+        host.ledger.lock().unwrap().request_cancel(&id).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(host.events_since(0, 10).is_empty());
+    }
+
+    /// What a run's end says: its state as the event's name, the run as its data and origin.
+    #[test]
+    fn a_runs_outcome_names_the_run_as_its_origin() {
+        let mut run: RunRecord = serde_json::from_value(json!({
+            "runId": "run_9", "status": "failed", "callerProduct": "oaiy-trigger:aokie", "flowId": "answer", "correlationId": "call_1",
+            "idempotencyKey": "binding:b1:evt-1", "mode": "async", "reservedAt": "2026-10-18T00:00:00.000Z",
+            "lineage": { "rootRunId": "run_1", "parentRunId": "run_1", "bindingId": "b1", "depth": 2 },
+            "error": { "code": "node_failed", "message": "no" }, "triggerEvent": "aokie.call.incoming"
+        }))
+        .unwrap();
+        let (event, envelope) = outcome_event(&run).expect("an ended run");
+        assert_eq!((event.name.as_str(), event.source.as_str(), event.correlation_id.as_str()), ("flow.failed", "flows", "call_1"));
+        assert_eq!(event.idempotency_key, "flow:run_9:failed");
+        let origin = event.origin_run.unwrap();
+        assert_eq!((origin.root_run_id.as_deref(), origin.parent_run_id.as_deref(), origin.binding_id.as_deref(), origin.depth), (Some("run_1"), Some("run_9"), Some("b1"), 2));
+        assert_eq!(envelope["data"]["error"]["code"], "node_failed");
+        assert_eq!(envelope["data"]["flowId"], "answer");
+        run.status = RunStatus::Running;
+        assert!(outcome_event(&run).is_none(), "a run going on has no outcome yet");
     }
 
     #[test]

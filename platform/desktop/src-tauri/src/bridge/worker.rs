@@ -77,13 +77,17 @@ pub const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 /// person's, not an outside caller's. The bridge's route refuses the name from anyone else.
 pub const AGENT_PRODUCT: &str = "oaiy-agent";
 
-/// Whether a run's input came from outside this computer's person: everything but the Agent's own runs (a plugin's
+/// The caller product of the desktop's own window (Run history's Run again): the person at this computer, so its runs are
+/// theirs too. The bridge's route takes the name only from that window.
+pub const DESKTOP_PRODUCT: &str = "oaiy-desktop";
+
+/// Whether a run's input came from outside this computer's person: everything but the Agent's and the window's own runs (a plugin's
 /// event, an app or a site through the API, a provider's graph). Such a run is confined: its absolute file paths stay
 /// in the CLI's own folders and it reaches no other address of this computer or its network than this desktop's API
 /// (see [`run_flow_cli_as`]). Before, every run here had the whole disk and network of the person, so a webhook's
 /// input given to a flow's HTTP Request or File Read node reached the cloud's metadata address or `~/.ssh`.
 pub fn outside_input(run: &RunRecord) -> bool {
-    run.caller_product != AGENT_PRODUCT
+    run.caller_product != AGENT_PRODUCT && run.caller_product != DESKTOP_PRODUCT
 }
 /// How often a running child is checked for exit / cancellation.
 const CHILD_POLL: Duration = Duration::from_millis(250);
@@ -235,10 +239,17 @@ impl FlowStore {
 
     /// List stored flows as (id, best-effort name).
     pub fn list(&self) -> Vec<(String, Option<String>)> {
+        self.listed().into_iter().map(|f| (f.id, f.name)).collect()
+    }
+
+    /// Every stored flow, by id, with its name and whether it is a macro: a flow the editor uses as a node in others
+    /// (`isMacro`, as the editor saves one), kept here so the flows that use it run with it, and not a flow of its own
+    /// to list among the others.
+    pub fn listed(&self) -> Vec<ListedFlow> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
-        let mut out: Vec<(String, Option<String>)> = entries
+        let mut out: Vec<ListedFlow> = entries
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
@@ -247,21 +258,29 @@ impl FlowStore {
                     return None;
                 }
                 // Best-effort display name — never a parse requirement.
-                let title = std::fs::read_to_string(e.path())
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| {
-                        v.get("name")
-                            .or_else(|| v.get("title"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                Some((id, title))
+                let doc = std::fs::read_to_string(e.path()).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
+                let title = doc.as_ref().and_then(|v| {
+                    v.get("name")
+                        .or_else(|| v.get("title"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+                let is_macro = doc.as_ref().and_then(|v| v.get("isMacro")).and_then(Value::as_bool) == Some(true);
+                Some(ListedFlow { id, name: title, is_macro })
             })
             .collect();
-        out.sort();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
+}
+
+/// One stored flow, as [`FlowStore::listed`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedFlow {
+    pub id: String,
+    pub name: Option<String>,
+    /// A macro: a part other flows use, not a flow of its own.
+    pub is_macro: bool,
 }
 
 /// How the worker invokes the CLI.
@@ -1724,6 +1743,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A macro the editor keeps here (`isMacro`) is listed as one, so the lists of flows can say so; the rest are not.
+    #[test]
+    fn a_macro_is_listed_as_one() {
+        let dir = std::env::temp_dir().join(format!("oaiy-flowstore-macros-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FlowStore::new(dir.clone());
+        store.put("user-macro-shout", r#"{"name":"Shout","isMacro":true,"nodes":[],"edges":[]}"#).unwrap();
+        store.put("greeting", r#"{"name":"Greeting","nodes":[],"edges":[]}"#).unwrap();
+        store.put("odd", r#"{"name":"Odd","isMacro":"yes","nodes":[],"edges":[]}"#).unwrap();
+        let listed = store.listed();
+        let of = |id: &str| listed.iter().find(|f| f.id == id).unwrap().clone();
+        assert_eq!(of("user-macro-shout"), ListedFlow { id: "user-macro-shout".into(), name: Some("Shout".into()), is_macro: true });
+        assert!(!of("greeting").is_macro && !of("odd").is_macro, "only a flow marked true is a macro");
+        assert_eq!(store.list().len(), 3, "and the plain list still has them all");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Only the Agent's own runs are the person's; every other caller's is confined, and a confined run on a server
     /// whose data folder the child would inherit gets a folder of its own inside it.
     #[test]
@@ -1733,6 +1769,7 @@ mod tests {
             "mode": "async", "reservedAt": "2026-10-18T00:00:00Z", "lineage": { "depth": 0 }
         })).unwrap() };
         assert!(!outside_input(&run(AGENT_PRODUCT)));
+        assert!(!outside_input(&run(DESKTOP_PRODUCT)), "Run history's Run again is the person's");
         for product in ["oaiy-trigger:aokie", "oaiy-flows", "formlogic", "plugin:x", "oaiy-app", "my-script"] {
             assert!(outside_input(&run(product)), "{product}");
         }

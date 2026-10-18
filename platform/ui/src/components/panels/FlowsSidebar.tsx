@@ -26,6 +26,7 @@ import {
 import { shortcut } from '../../lib/keys';
 import type { Flow, OAIYPackageManifest } from 'oaiy-core';
 import { oaiyDesktop } from '../../lib/oaiyAgentTools';
+import { shared as keptOnDesktop } from '../../hooks/useDesktopFlows';
 import type { ExampleFlow } from '../../lib/exampleFlows';
 import ConfirmDialog from '../ui/ConfirmDialog';
 import Menu, { MenuItem } from '../ui/Menu';
@@ -265,7 +266,7 @@ export default function FlowsSidebar({
   const handleDeleteRequest = useCallback((flowId: string) => {
     const flow = flows.find(f => f.id === flowId);
     if (flow) {
-      setDeleteConfirm({ flowId, flowName: flow.name, onDesktop: !!oaiyDesktop() && !flow.isMacro && !flow.localOnly && !flow.isDemo && (flow as { untrusted?: boolean }).untrusted !== true });
+      setDeleteConfirm({ flowId, flowName: flow.name, onDesktop: !!oaiyDesktop() && keptOnDesktop(flow) });
     }
     setMenu(null);
   }, [flows]);

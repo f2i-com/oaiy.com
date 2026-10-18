@@ -16,26 +16,34 @@
  * takes that side's; changed on both, this side's goes there. Only a flow
  * deleted here (Delete) is removed there: one missing here for another reason
  * (a new project, an import, a project that could not be read) comes back.
- * A flow's name, description, tags, whether it is shared with apps, nodes and
- * edges go both ways; what else the desktop's document holds (a tool's
- * description the agent wrote) is kept as it is. Macros, demos and built-in
- * flows stay the editor's own. Outside OAIY this does nothing.
+ * A flow's name, description, tags, whether it is shared with apps, whether it
+ * is a macro, nodes and edges go both ways; what else the desktop's document
+ * holds (a tool's description the agent wrote) is kept as it is. A macro goes
+ * too (marked `isMacro`): a flow that uses one is run there with it (the
+ * desktop hands the CLI a flow's subflows and macros by id), where it failed
+ * "Subflow not found". Demos and built-in flows stay the editor's own. A node
+ * naming the person's own service, or one of the desktop's, carries what it
+ * takes to call it (`withNodeServices`): the CLI has none of the editor's lists.
+ * A flow the desktop refuses to keep is said once (`subscribeDesktopFlowUnsaved`),
+ * and tried again after the next pull. Outside OAIY this does nothing.
  */
 import { useEffect, useRef } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type { Flow, OAIYProject } from 'oaiy-core';
 import { hookFlowId, oaiyDesktop, toolFlowId } from '../lib/oaiyAgentTools';
+import { withNodeServices, withoutNodeServices } from '../bundled-modules/core-service/contract';
 
 const PULL_MS = 15_000;
 const SETTLE_MS = 1_200;
-// (`-2`: a flow's description, tags and sharing became part of what is compared)
-const SYNCED_KEY = 'oaiy-desktop-flows-synced-2';
+// (`-2`: a flow's description, tags and sharing became part of what is compared; `-3`: whether it is a macro)
+const SYNCED_KEY = 'oaiy-desktop-flows-synced-3';
 
 type Doc = {
   name?: string;
   description?: unknown;
   tags?: unknown;
   oaiyRemote?: unknown;
+  isMacro?: unknown;
   nodes?: unknown[];
   edges?: unknown[];
   oaiyTool?: unknown;
@@ -43,8 +51,8 @@ type Doc = {
 };
 
 /** What of a flow the desktop keeps: a change to any of it is sent. */
-export function flowKey(f: Pick<Flow, 'name' | 'graph' | 'description' | 'tags' | 'remote'>): string {
-  return JSON.stringify([f.name, f.description ?? '', f.tags ?? [], !!f.remote, f.graph?.nodes ?? [], f.graph?.edges ?? []]);
+export function flowKey(f: Pick<Flow, 'name' | 'graph' | 'description' | 'tags' | 'remote' | 'isMacro'>): string {
+  return JSON.stringify([f.name, f.description ?? '', f.tags ?? [], !!f.remote, !!f.isMacro, f.graph?.nodes ?? [], f.graph?.edges ?? []]);
 }
 
 /** A flow as the desktop's document of it: `doc` (as it is stored there) with this flow's part put in. */
@@ -55,31 +63,87 @@ export function toDoc(f: Flow, doc: Doc | null = null): Doc {
     description: f.description || undefined,
     tags: f.tags?.length ? f.tags : undefined,
     oaiyRemote: f.remote ? true : undefined,
-    nodes: f.graph.nodes,
+    isMacro: f.isMacro ? true : undefined,
+    nodes: withNodeServices(f.graph.nodes),
     edges: f.graph.edges,
   };
 }
 
-/** Whether a flow of the editor's goes to the desktop: not a flow from a shared link (untrusted here, it would run
- * there, the Agent's to run, unsandboxed). */
+/** Whether a flow of the editor's goes to the desktop: a macro of the person's own does (the flows using it run there
+ * with it); a built-in one does not (it comes with the editor), nor a flow from a shared link (untrusted here, it would
+ * run there, the Agent's to run, unsandboxed). */
 export function shared(f: Flow): boolean {
-  return !f.isMacro && !f.isDemo && !f.isBuiltIn && !f.localOnly && (f as { untrusted?: unknown }).untrusted !== true;
+  return !f.isDemo && !f.isBuiltIn && !f.localOnly && (f as { untrusted?: unknown }).untrusted !== true;
+}
+
+/** A macro's inputs and outputs, from its Macro Input and Macro Output nodes (what the palette shows of it). */
+export function macroMetadataOf(nodes: Flow['graph']['nodes']): NonNullable<Flow['macroMetadata']> {
+  const named = (n: Flow['graph']['nodes'][number], field: string, fallback: string) => String((n.data as Record<string, unknown> | undefined)?.[field] || fallback);
+  return {
+    inputs: nodes
+      .filter((n) => n.type === 'macro_input')
+      .map((n) => {
+        const data = (n.data ?? {}) as Record<string, unknown>;
+        return { id: n.id, name: named(n, 'name', 'input'), type: named(n, 'inputType', 'any'), required: Boolean(data.required), defaultValue: data.defaultValue ? String(data.defaultValue) : undefined };
+      }),
+    outputs: nodes.filter((n) => n.type === 'macro_output').map((n) => ({ id: n.id, name: named(n, 'name', 'output'), type: named(n, 'outputType', 'any') })),
+  };
 }
 
 /** A desktop flow as a flow of the editor's. */
 export function fromDoc(id: string, doc: Doc, now: string): Flow | null {
   if (!Array.isArray(doc.nodes)) return null;
   const tags = Array.isArray(doc.tags) ? doc.tags.filter((t): t is string => typeof t === 'string') : [];
+  // (the services copied in for the desktop are its, not the editor's: the editor reads its own lists)
+  const nodes = withoutNodeServices(doc.nodes as Flow['graph']['nodes']);
   return {
     id,
     name: doc.name || id,
     ...(typeof doc.description === 'string' && doc.description ? { description: doc.description } : {}),
     ...(tags.length ? { tags } : {}),
     ...(doc.oaiyRemote === true ? { remote: true } : {}),
+    ...(doc.isMacro === true ? { isMacro: true, macroMetadata: macroMetadataOf(nodes) } : {}),
     createdAt: now,
     updatedAt: now,
-    graph: { nodes: doc.nodes as Flow['graph']['nodes'], edges: (Array.isArray(doc.edges) ? doc.edges : []) as Flow['graph']['edges'] },
+    graph: { nodes, edges: (Array.isArray(doc.edges) ? doc.edges : []) as Flow['graph']['edges'] },
   };
+}
+
+/** What a flow the desktop did not keep is said with (`subscribeDesktopFlowUnsaved`). */
+export interface DesktopFlowUnsaved {
+  id: string;
+  name: string;
+  /** What the desktop said, or that it could not be reached. */
+  reason: string;
+}
+
+const UNSAVED_EVENT = 'oaiy:desktop-flow-unsaved';
+/** Flows said not to be kept, each said once until a save of it works. */
+const toldUnsaved = new Set<string>();
+
+function tellUnsaved(f: Flow, reason: string): void {
+  if (toldUnsaved.has(f.id)) return;
+  toldUnsaved.add(f.id);
+  try {
+    window.dispatchEvent(new CustomEvent<DesktopFlowUnsaved>(UNSAVED_EVENT, { detail: { id: f.id, name: f.name, reason } }));
+  } catch {
+    // (no CustomEvent: nothing to say it with)
+  }
+}
+
+/** Hear of a flow OAIY Desktop did not keep (OAIYApp says so); returns the way to stop. */
+export function subscribeDesktopFlowUnsaved(fn: (detail: DesktopFlowUnsaved) => void): () => void {
+  const listener = (e: Event) => fn((e as CustomEvent<DesktopFlowUnsaved>).detail);
+  window.addEventListener(UNSAVED_EVENT, listener);
+  return () => window.removeEventListener(UNSAVED_EVENT, listener);
+}
+
+/** What a refused save says: the desktop's own words, else its status. */
+async function refusal(resp: Response | null): Promise<string> {
+  if (!resp) return 'OAIY Desktop could not be reached';
+  const body = (await resp.json().catch(() => null)) as { error?: { message?: unknown } } | null;
+  const said = typeof body?.error?.message === 'string' ? body.error.message : '';
+  return said ? `OAIY Desktop said: ${said}` : `OAIY Desktop answered ${resp.status}`;
 }
 
 /** What a pull changes here: flows to add or replace, ids to remove, and the flows as the two sides now agree. */
@@ -126,7 +190,16 @@ export function reconcile(
       synced.set(id, theirKey);
     } else if (last !== theirKey && (last === undefined || myKey === last)) {
       // Changed there, not here: theirs.
-      put.push({ ...mine, name: theirs.name, description: theirs.description, tags: theirs.tags, remote: theirs.remote, graph: theirs.graph });
+      put.push({
+        ...mine,
+        name: theirs.name,
+        description: theirs.description,
+        tags: theirs.tags,
+        remote: theirs.remote,
+        isMacro: theirs.isMacro,
+        macroMetadata: theirs.isMacro ? macroMetadataOf(theirs.graph.nodes) : undefined,
+        graph: theirs.graph,
+      });
       synced.set(id, theirKey);
     }
     // Changed here (or both): the push sends this side's.
@@ -256,8 +329,12 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
           const stored = there.current.has(id) ? await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`) : null;
           const doc = stored?.ok ? ((await stored.json().catch(() => null)) as Doc | null) : null;
           const saved = await call('PUT', `/api/bridge/flows/${encodeURIComponent(id)}`, toDoc(f, doc));
-          // (not sent: tried again after the next pull, as nothing says the two agree)
-          if (!saved?.ok) continue;
+          // (not sent: said once, and tried again after the next pull, as nothing says the two agree)
+          if (!saved?.ok) {
+            tellUnsaved(f, await refusal(saved));
+            continue;
+          }
+          toldUnsaved.delete(id);
           synced.current.set(id, key);
           there.current.add(id);
           // Made a tool, or put in front of one: each copy follows the flow, keeping what it is to the agent.
@@ -265,7 +342,7 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
             if (!there.current.has(copyId)) continue;
             const copy = await call('GET', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
             const doc = copy?.ok ? ((await copy.json().catch(() => null)) as Doc | null) : null;
-            if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: f.graph.nodes, edges: f.graph.edges });
+            if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: withNodeServices(f.graph.nodes), edges: f.graph.edges });
           }
         }
         // Deleted here, by the person: removed there too (and as the agent's tool, or what goes in front of one).

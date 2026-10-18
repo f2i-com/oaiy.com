@@ -46,12 +46,13 @@ import { hasCompletedWizard } from '../lib/wizardPrefs';
 import { saveService, listAllServices } from '../utils/serviceRegistry';
 import { listDesktopServices } from '../lib/desktopServices';
 import { inOaiyWindow } from '../lib/oaiyWindow';
-import { shared as sharedWithDesktop } from '../hooks/useDesktopFlows';
+import { shared as sharedWithDesktop, subscribeDesktopFlowUnsaved } from '../hooks/useDesktopFlows';
 import { sanitizeProjectForExport } from '../utils/ProjectIO';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
 import { oaiyDesktop } from '../lib/oaiyAgentTools';
 import { takeBootNotice } from '../lib/bootNotice';
+import { listenForFlowsIntents } from '../lib/flowsIntents';
 
 // Re-export types for backward compatibility
 export type { LoadedPackage, ActivePackageFlow };
@@ -452,6 +453,25 @@ export default function OAIYApp() {
     }, 500);
   }, [activeFlowId, project.flows, saveMacroChanges, setActiveFlowId, setActivePackageFlow, isPhone]);
 
+  // In OAIY's window the dashboard opens a flow here (Run history's "Open the editor" on a run): that flow, on the
+  // canvas, once it is among the flows (one the desktop has and this side has not pulled yet comes with the next pull).
+  const [flowAsked, setFlowAsked] = useState<{ id: string; at: number } | null>(null);
+  useEffect(() => listenForFlowsIntents((id) => setFlowAsked({ id, at: Date.now() })), []);
+  useEffect(() => {
+    if (!flowAsked) return;
+    if (project.flows.some((f) => f.id === flowAsked.id)) {
+      setFlowAsked(null);
+      setSection('workflows');
+      if (activeFlowId !== flowAsked.id || activePackageFlow) void handleSelectUserFlow(flowAsked.id);
+      return;
+    }
+    const wait = window.setTimeout(() => {
+      addToast(`The flow “${flowAsked.id}” is not among this editor’s flows, so it could not be opened.`, 'error');
+      setFlowAsked(null);
+    }, Math.max(0, flowAsked.at + 20_000 - Date.now()));
+    return () => window.clearTimeout(wait);
+  }, [flowAsked, project.flows, activeFlowId, activePackageFlow, handleSelectUserFlow, addToast]);
+
   // Debug logging for flow display issues
   if (activePackageFlow) {
     logger.debug('Active package flow state', {
@@ -648,6 +668,14 @@ export default function OAIYApp() {
   // editing for hours unaware that nothing is being persisted. The
   // helper throttles to one event per session, and we pass duration
   // 0 so the toast sticks until the user dismisses it.
+  // A flow OAIY Desktop did not keep (it refused it, or could not be reached): said, rather than the person taking
+  // "Saved in OAIY" at its word. It is sent again after the next look at the desktop's flows.
+  useEffect(() => {
+    return subscribeDesktopFlowUnsaved(({ name, reason }) => {
+      addToast(`“${name}” is not saved in OAIY Desktop: ${reason.replace(/[.\s]+$/, '')}. It is kept here and sent again in a moment.`, 'error', 0);
+    });
+  }, [addToast]);
+
   useEffect(() => {
     return subscribeStorageQuota(({ area }) => {
       addToast(

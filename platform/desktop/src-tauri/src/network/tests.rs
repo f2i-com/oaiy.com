@@ -394,6 +394,7 @@ async fn a_primary_runs_the_flows_a_worker_shares_there() {
             idempotency_key: "k".into(),
             lineage: Default::default(),
             trigger_event: None,
+            caller_label: None,
         };
         match ledger.lock().unwrap().reserve(&request) {
             crate::bridge::ledger::ReserveOutcome::Reserved(r) => r.run_id,

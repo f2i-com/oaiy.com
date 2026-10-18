@@ -153,10 +153,10 @@ export function flowBuilderTools(desktop: () => Desktop | null, toolsChanged: ()
       },
     },
     {
-      spec: { name: 'flow_list', description: 'The flows stored on OAIY Desktop (the ones the flow editor shows): id and name.', parameters: { type: 'object', properties: {} } },
+      spec: { name: 'flow_list', description: 'The flows stored on OAIY Desktop (the ones the flow editor shows): id and name. A macro (a step other flows use, run as part of them) is marked so.', parameters: { type: 'object', properties: {} } },
       run: async (_input, signal) => {
         const flows = await connected(desktop).flows(signal);
-        return flows.length ? flows.map((f) => `${f.id}: ${f.name}`).join('\n') : 'No flows are stored yet.';
+        return flows.length ? flows.map((f) => `${f.id}: ${f.name}${f.macro ? ' (macro)' : ''}`).join('\n') : 'No flows are stored yet.';
       },
     },
     {

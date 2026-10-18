@@ -260,8 +260,8 @@ describe('RunsPanel', () => {
     await mount();
     expect(text()).toContain('Failed (2)');
     expect(runsMock).toHaveBeenCalledWith(['failed', 'timed_out'], 50);
-    // Looked at here: Overview warns only of failures after these.
-    expect(localStorage.getItem('oaiy.overview.failedSeen')).toBe('2');
+    // Looked at here: Overview warns only of failures after these (by when the newest ended, and how many).
+    expect(JSON.parse(localStorage.getItem('oaiy.overview.failedSeen')!)).toEqual({ count: 2, at: FAILED.finishedAt });
   });
 
   it('names a run’s flow by its name, and who asked for it in words', async () => {
@@ -354,28 +354,85 @@ describe('RunsPanel', () => {
     expect(pushMock).toHaveBeenCalledWith(expect.objectContaining({ title: 'Asked Look up a caller to stop' }));
   });
 
-  it('searches the runs listed: a flow, an error, who asked', async () => {
-    runsMock.mockResolvedValue({
-      runs: [FAILED, { ...FAILED, runId: 'run_b', flowId: 'other', callerProduct: 'oaiy-app', error: { code: 'node_failed', message: 'The printer is out of paper.' } }],
-      total: 2,
-      byStatus: { failed: 2 },
-    });
+  it('asks the desktop to search, over every run it keeps, once the typing rests', async () => {
+    const printer = { ...FAILED, runId: 'run_b', flowId: 'other', callerProduct: 'oaiy-app', error: { code: 'node_failed', message: 'The printer is out of paper.' } };
+    runsMock.mockImplementation(async (_states: unknown, _limit: unknown, page?: { q?: string }) =>
+      page?.q === 'printer'
+        ? { runs: [printer], total: 900, byStatus: { failed: 2 }, more: false }
+        : page?.q
+          ? { runs: [], total: 900, byStatus: { failed: 2 }, more: false }
+          : { runs: [FAILED, printer], total: 900, byStatus: { failed: 2 } },
+    );
     await mount();
     const search = host.querySelector<HTMLInputElement>('input[type="search"]')!;
-    const type = async (value: string) =>
-      act(async () => {
+    const type = async (value: string) => {
+      await act(async () => {
         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(search, value);
         search.dispatchEvent(new Event('input', { bubbles: true }));
       });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 350));
+      });
+    };
     await type('printer');
+    expect(runsMock).toHaveBeenLastCalledWith(['failed', 'timed_out'], 50, { q: 'printer' });
     expect(host.querySelectorAll('.run-row')).toHaveLength(1);
     expect(text()).toContain('The printer is out of paper.');
-    // A search looks through as many runs as one answer holds.
-    expect(runsMock).toHaveBeenLastCalledWith(['failed', 'timed_out'], 200);
+    expect(text()).toContain('1 failed run matches.');
     await type('nothing like this');
-    expect(text()).toContain('No run among the newest 2 failed runs matches');
+    expect(text()).toContain('No failed run matches “nothing like this”');
     await click(button('Clear the search'));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+    });
     expect(host.querySelectorAll('.run-row')).toHaveLength(2);
+    expect(runsMock).toHaveBeenLastCalledWith(['failed', 'timed_out'], 50);
+  });
+
+  it('pages back past the 200 newest, each older page from the last run shown', async () => {
+    const run = (i: number) => ({ ...FAILED, runId: `run_${String(i).padStart(4, '0')}`, reservedAt: new Date(Date.UTC(2026, 6, 30, 9, 0, 0) - i * 1000).toISOString() });
+    const all = Array.from({ length: 260 }, (_, i) => run(i));
+    runsMock.mockImplementation(async (_states: unknown, limit: number, page?: { before?: { runId: string } }) => {
+      const from = page?.before ? all.findIndex((r) => r.runId === page.before!.runId) + 1 : 0;
+      const runs = all.slice(from, from + limit);
+      return { runs, total: 260, byStatus: { failed: 260 }, more: from + limit < all.length };
+    });
+    await mount();
+    for (let shown = 50; shown < 200; shown += 50) {
+      expect(host.querySelectorAll('.run-row')).toHaveLength(shown);
+      await click(button('Show 50 more'));
+    }
+    expect(host.querySelectorAll('.run-row')).toHaveLength(200);
+    expect(runsMock).toHaveBeenLastCalledWith(['failed', 'timed_out'], 200);
+    // Past what one answer holds: from the last run shown.
+    await click(button('Show 50 more'));
+    expect(runsMock).toHaveBeenLastCalledWith(['failed', 'timed_out'], 50, { before: { reservedAt: all[199].reservedAt, runId: all[199].runId } });
+    expect(host.querySelectorAll('.run-row')).toHaveLength(250);
+    await click(button('Show 10 more'));
+    expect(host.querySelectorAll('.run-row')).toHaveLength(260);
+    expect(new Set([...host.querySelectorAll('[data-run-id]')].map((el) => el.getAttribute('data-run-id'))).size).toBe(260);
+    expect(text()).not.toContain('more');
+  });
+
+  it('says who asked in the caller’s own words, and opens that run’s flow in the editor', async () => {
+    const opened = vi.fn();
+    runsMock.mockResolvedValue({ runs: [{ ...FAILED, caller: { product: 'formlogic', label: 'acme reception' } }], total: 1, byStatus: { failed: 1 } });
+    await act(async () => {
+      root.render(<RunsPanel onOpenEditor={opened} />);
+    });
+    expect(text()).toContain('Acme reception');
+    await click(host.querySelector('.run-head')!);
+    expect(text()).toContain('formlogic');
+    await click(button('Open the editor'));
+    expect(opened).toHaveBeenCalledWith('caller-lookup');
+  });
+
+  it('says which flow in the picker is a macro', async () => {
+    flowsMock.mockResolvedValue({ flows: [{ flowId: 'caller-lookup', name: 'Look up a caller' }, { flowId: 'user-macro-1', name: 'Shout', macro: true }] });
+    runsMock.mockResolvedValue({ runs: [FAILED, { ...FAILED, runId: 'run_m', flowId: 'user-macro-1' }], total: 2, byStatus: { failed: 2 } });
+    await mount();
+    const options = [...host.querySelectorAll('select.run-flow-pick option')].map((o) => o.textContent);
+    expect(options).toEqual(['Every flow', 'Look up a caller', 'Shout (macro)']);
   });
 
   it('keeps a run open below after it leaves the filter, until it is closed', async () => {

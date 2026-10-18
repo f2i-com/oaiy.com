@@ -41,7 +41,7 @@ import {
 import { bindText, pollsOf, usePluginPolls, type BindContext } from './bind';
 import { PLUGIN_ICONS } from './sections';
 import { useModules } from './useModules';
-import { readFailedSeen, writeFailedSeen } from './failedSeen';
+import { failedSince, readFailedSeen, writeFailedSeen, type FailedSeen } from './failedSeen';
 import { pluginSetupStatus, waitingForSetup } from './setupFlow';
 import { useLiveSetup } from './useLiveSetup';
 import { useSetupState } from './useSetupState';
@@ -131,7 +131,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [guideOpen, setGuideOpen] = useState<boolean>(() => shouldAutoOpen());
   const [codexConnected, setCodexConnected] = useState(false);
   const [unavailable, setUnavailable] = useState<string[]>([]);
-  const [failedSeen, setFailedSeen] = useState<number>(readFailedSeen);
+  const [failedSeen, setFailedSeen] = useState<FailedSeen>(readFailedSeen);
   const [nodeBusy, setNodeBusy] = useState(false);
   const [nodeError, setNodeError] = useState<string | null>(null);
   const refreshing = useRef(false);
@@ -234,21 +234,24 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
     </button>
   );
 
-  // Failed runs since the person last looked (a run that failed last week is not news every time Overview opens).
+  // Failed runs since the person last looked (a run that failed last week is not news every time Overview opens):
+  // judged by when the newest of them ended (`lastFailedAt`), which a count cannot do once failed runs were cleared
+  // or the oldest let go; the count says how many more where it can.
   const failed = runtime?.runs.failed ?? 0;
-  // (fewer than seen: failed runs were pruned or deleted since, the rest of them seen already; one failing after that
-  // counts as new. Only by a count read now: the last visit's copy can be older than what Run history saw since.)
-  const seen = Math.min(failedSeen, failed);
+  const lastFailedAt = runtime?.runs.lastFailedAt ?? null;
+  // (fewer than seen: failed runs were pruned or deleted since, the rest of them seen already. Only by a count read
+  // now: the last visit's copy can be older than what Run history saw since.)
   useEffect(() => {
-    if (runtime && runtimeFresh.current && failedSeen > failed) {
+    if (runtime && runtimeFresh.current && failedSeen.count > failed) {
       writeFailedSeen(failed);
-      setFailedSeen(failed);
+      setFailedSeen(readFailedSeen());
     }
   }, [runtime, failed, failedSeen]);
-  const newFailed = failed - seen;
+  const since = failedSince(failedSeen, failed, lastFailedAt);
+  const seenAny = failedSeen.count > 0 || failedSeen.at !== null;
   const markFailedSeen = () => {
-    writeFailedSeen(failed);
-    setFailedSeen(failed);
+    writeFailedSeen(failed, lastFailedAt);
+    setFailedSeen(readFailedSeen());
   };
   const plugName = (p: PluginRecord) => p.manifest?.name ?? p.id;
 
@@ -396,12 +399,14 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           run that has ALREADY failed is not a setup step to work through. On a
           fresh install the guide is open — precisely when a failure is most
           likely and least excusable to hide. */}
-      {newFailed > 0 && (
+      {since.any && (
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>
             <TriangleAlert size={13} />{' '}
-            {seen > 0
-              ? `${newFailed} more run${newFailed === 1 ? '' : 's'} failed since you last looked.`
+            {seenAny
+              ? since.count
+                ? `${since.count} more run${since.count === 1 ? '' : 's'} failed since you last looked.`
+                : 'More runs failed since you last looked.'
               : `${failed} run${failed === 1 ? ' has' : 's have'} failed on this machine.`}
           </span>
           <span className="banner-actions">

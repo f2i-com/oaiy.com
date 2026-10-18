@@ -214,6 +214,7 @@ fn to_run_request(body: &RunRequestBody) -> RunRequest {
         idempotency_key: body.idempotency_key.clone(),
         lineage,
         trigger_event: body.trigger_event.clone(),
+        caller_label: body.caller.label.clone(),
     }
 }
 
@@ -332,6 +333,7 @@ fn from_this_process(headers: &axum::http::HeaderMap) -> bool {
 async fn create_run(
     State(st): State<BridgeState>,
     headers: axum::http::HeaderMap,
+    own_window: Option<axum::Extension<crate::http::OwnWindow>>,
     Json(body): Json<RunRequestBody>,
 ) -> axum::response::Response {
     if let Err(rej) = validate(&body) {
@@ -343,6 +345,14 @@ async fn create_run(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             format!("caller.product {:?} is this desktop's own Agent; name your app or service instead", super::worker::AGENT_PRODUCT),
+        );
+    }
+    // So are the desktop's own window's (Run history's Run again): the name is the window's alone.
+    if body.caller.product == super::worker::DESKTOP_PRODUCT && own_window.is_none() && !from_this_process(&headers) {
+        return bridge_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("caller.product {:?} is this desktop's own window; name your app or service instead", super::worker::DESKTOP_PRODUCT),
         );
     }
     let mut req = to_run_request(&body);
@@ -449,6 +459,45 @@ struct RunsQuery {
     /// queued-only behaviour that pollers depend on.
     status: Option<String>,
     limit: Option<usize>,
+    /// History only: the runs asked before this time (a run's `reservedAt`, RFC 3339), so a view pages back past its
+    /// first answer. With `beforeRun`, the run the page before ended on: the runs asked in the same millisecond that
+    /// come after it in history are on this page too, none twice.
+    before: Option<String>,
+    #[serde(rename = "beforeRun")]
+    before_run: Option<String>,
+    /// History only: the runs whose flow (by id or name), who asked, event, state, error, ids or inputs hold this text,
+    /// whatever their case. The search of run history, asked of every run kept rather than the page shown.
+    q: Option<String>,
+    /// History only: one flow's runs alone, by its id.
+    #[serde(rename = "flowId")]
+    flow_id: Option<String>,
+}
+
+/// Whether a run is one a history search for `needle` (lower case) finds: its flow's id or `flow_name`, who asked
+/// (product and label), its event, its state, its error, its run and correlation ids, and its inputs (the first 4,000
+/// characters of them, as the view searched them).
+fn run_matches(r: &crate::bridge::ledger::RunRecord, needle: &str, flow_name: Option<&str>) -> bool {
+    let input = r.input.as_ref().map(|i| i.to_string().chars().take(4000).collect::<String>()).unwrap_or_default();
+    let status = serde_json::to_value(r.status).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    let error = r.error.as_ref().map(|e| {
+        let code = serde_json::to_value(e.code).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+        format!("{code} {} {}", e.message, e.detail.as_deref().unwrap_or(""))
+    });
+    [
+        r.flow_id.as_deref().unwrap_or(""),
+        flow_name.unwrap_or(""),
+        &r.caller_product,
+        r.caller.as_ref().and_then(|c| c.label.as_deref()).unwrap_or(""),
+        r.trigger_event.as_deref().unwrap_or(""),
+        &status,
+        &status.replace('_', " "),
+        error.as_deref().unwrap_or(""),
+        &r.run_id,
+        &r.correlation_id,
+        &input,
+    ]
+    .iter()
+    .any(|field| field.to_lowercase().contains(needle))
 }
 
 /// The most rows one request will return, whatever `limit` asks for. The ledger
@@ -514,15 +563,47 @@ async fn queued_runs(
         Err(msg) => return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", msg),
     };
 
+    // History's cursor and search, read before the ledger is locked (the flows' names come off the disk).
+    let before = match q.before.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        None => None,
+        Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(at) => Some(crate::bridge::ledger::HistoryCursor {
+                reserved_at_ms: at.timestamp_millis().max(0) as u64,
+                run_id: q.before_run.clone().filter(|r| !r.is_empty()),
+            }),
+            Err(_) => return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", format!("before must be a run's reservedAt (RFC 3339), not {raw:?}")),
+        },
+    };
+    let needle = q.q.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_lowercase);
+    let flow_pick = q.flow_id.clone().filter(|f| !f.is_empty());
+    if statuses.is_none() && (before.is_some() || needle.is_some() || flow_pick.is_some()) {
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "before, q and flowId page and search history: give status too (a state, or all)".into());
+    }
+    let names: std::collections::HashMap<String, String> = if needle.is_some() {
+        st.flows.listed().into_iter().filter_map(|f| Some((f.id, f.name?))).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     match st.ledger.lock() {
         Ok(l) => {
             // No filter asked for: the original contract, oldest first, because a
             // claimer wants the longest-waiting run — not the newest.
-            let (runs, counts) = match statuses {
-                None => (l.queued(limit), None),
-                Some(s) => (l.recent(limit, &s), Some(l.status_counts())),
+            let (runs, counts, more) = match statuses {
+                None => (l.queued(limit), None, None),
+                Some(s) => {
+                    let (runs, more) = l.history(limit, &s, before.as_ref(), |r| {
+                        flow_pick.as_deref().map_or(true, |f| r.flow_id.as_deref() == Some(f))
+                            && needle.as_deref().map_or(true, |n| run_matches(r, n, r.flow_id.as_deref().and_then(|id| names.get(id)).map(String::as_str)))
+                    });
+                    (runs, Some(l.status_counts()), Some(more))
+                }
             };
             let mut body = json!({ "runs": runs, "total": l.len() });
+            if let Some(more) = more {
+                // (older runs this filter and search find, past this page: what "Show more" asks for, with `before`)
+                body["more"] = json!(more);
+            }
             if let Some(counts) = counts {
                 // Keyed by the same snake_case names the filter accepts.
                 let by_status: serde_json::Map<String, serde_json::Value> = counts
@@ -965,7 +1046,9 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
     // `failed` is carried here so Overview can point at the run history without
     // paging it — a machine where flows are quietly failing should say so on the
     // first screen rather than only on the one you have to think to open.
-    let (queued, total_runs, failed_runs) = match st.ledger.lock() {
+    // And when the newest of them ended (`lastFailedAt`): Overview tells "failed since you last looked" by it, which a
+    // count could not do once runs were cleared or the oldest let go.
+    let (queued, total_runs, failed_runs, last_failed) = match st.ledger.lock() {
         Ok(l) => {
             let counts = l.status_counts();
             let failed = counts.get(&RunStatus::Failed).copied().unwrap_or(0)
@@ -974,10 +1057,14 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
                 counts.get(&RunStatus::Queued).copied().unwrap_or(0),
                 l.len(),
                 failed,
+                l.last_failed_ms(),
             )
         }
-        Err(_) => (0, 0, 0),
+        Err(_) => (0, 0, 0, None),
     };
+    let last_failed_at = last_failed
+        .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
     let plugins: Vec<serde_json::Value> = match st.plugins.lock() {
         Ok(mut reg) => {
@@ -1042,7 +1129,7 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
                 },
             },
             "nodeRuntime": node,
-            "runs": { "queued": queued, "known": total_runs, "failed": failed_runs },
+            "runs": { "queued": queued, "known": total_runs, "failed": failed_runs, "lastFailedAt": last_failed_at },
             "plugins": { "serving": plugins_serving, "total": plugins.len(), "detail": plugins },
         })),
     )
@@ -1659,11 +1746,19 @@ async fn poll_events(
 // ------- flows -------
 
 async fn list_flows(State(st): State<BridgeState>) -> axum::response::Response {
+    // A macro is said to be one (`macro: true`): the editor keeps the person's macros here for the flows that use
+    // them, and a list of flows names it as the part it is, not as one more flow.
     let flows: Vec<serde_json::Value> = st
         .flows
-        .list()
+        .listed()
         .into_iter()
-        .map(|(id, name)| json!({ "flowId": id, "name": name.unwrap_or_else(|| id.clone()) }))
+        .map(|f| {
+            let mut entry = json!({ "flowId": f.id, "name": f.name.unwrap_or_else(|| f.id.clone()) });
+            if f.is_macro {
+                entry["macro"] = json!(true);
+            }
+            entry
+        })
         .collect();
     (StatusCode::OK, Json(json!({ "flows": flows }))).into_response()
 }
@@ -2422,6 +2517,30 @@ mod tests {
             read(app.clone().oneshot(req.body(body.map_or_else(Body::empty, |b| Body::from(b.to_string()))).unwrap()).await.unwrap()).await
         }
 
+        /// Run history's Run again is the person's, run unconfined: the name `oaiy-desktop` is taken from the desktop's own
+        /// window alone (its webview's origin, on a desktop with a window), as `oaiy-agent` is from this process alone.
+        #[tokio::test]
+        async fn only_the_desktops_own_window_runs_as_it() {
+            let (_sb, st) = release_state("own-window", Publishers::default());
+            let run = || Some(json!({"protocol": "oaiy-bridge/1", "caller": {"product": "oaiy-desktop"}, "flowId": "not-a-flow", "input": {},
+                "correlationId": "c-1", "idempotencyKey": "k-1"}));
+            let refused = |body: &Value| body.to_string().contains("this desktop's own window");
+            let gui = crate::http::tightened_for_tests(router(st.clone()), None, true);
+            // A caller with no origin is refused by the guard as before; a page on this computer's other ports is let
+            // through it, and refused the name.
+            let (status, _) = send(&gui, "/api/bridge/runs", &[], run()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let (status, body) = send(&gui, "/api/bridge/runs", &[("Origin", "http://127.0.0.1:3000")], run()).await;
+            assert!(status == StatusCode::BAD_REQUEST && refused(&body), "{status} {body}");
+            // The window itself: taken (the flow is then looked for).
+            let (status, body) = send(&gui, "/api/bridge/runs", &[("Origin", "tauri://localhost")], run()).await;
+            assert!(!refused(&body), "{status} {body}");
+            // A headless server has no window, and an Origin there is anyone's to send.
+            let headless = crate::http::tightened_for_tests(router(st), Some("t".into()), false);
+            let (status, body) = send(&headless, "/api/bridge/runs", &[("Origin", "tauri://localhost"), ("Authorization", "Bearer t")], run()).await;
+            assert!(refused(&body), "{status} {body}");
+        }
+
         /// A run's inputs may be pictures given inline (Image to image takes up to 10): past axum's 2 MB, the request
         /// is read and judged (here, a flow that does not exist), not refused for its size.
         #[tokio::test]
@@ -2695,6 +2814,109 @@ mod tests {
             rescan(&st);
             assert!(st.plugins.lock().unwrap().get("demo").unwrap().manifest.is_some());
             assert!(collect_definitions(&st).is_empty(), "nothing is offered from a package that does not verify");
+        }
+    }
+
+    // --- run history: paged, searched, and who asked --------------------------
+
+    mod run_history {
+        use super::super::*;
+        use super::trusting_a_plugin::release_state;
+        use crate::plugins::trust::Publishers;
+        use serde_json::Value;
+
+        async fn read(response: axum::response::Response) -> (StatusCode, Value) {
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 22).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        }
+
+        fn query(status: &str, limit: usize, before: Option<&Value>, q: Option<&str>, flow: Option<&str>) -> RunsQuery {
+            RunsQuery {
+                status: Some(status.into()),
+                limit: Some(limit),
+                before: before.map(|r| r["reservedAt"].as_str().unwrap().to_string()),
+                before_run: before.map(|r| r["runId"].as_str().unwrap().to_string()),
+                q: q.map(str::to_string),
+                flow_id: flow.map(str::to_string),
+            }
+        }
+
+        fn reserve(st: &BridgeState, key: &str, flow: &str, label: Option<&str>, input: Value) -> String {
+            let req = RunRequest {
+                caller_product: "formlogic".into(),
+                flow_id: Some(flow.into()),
+                inline_graph: false,
+                input: Some(input),
+                timeout_ms: None,
+                mode: "queued".into(),
+                correlation_id: format!("c-{key}"),
+                idempotency_key: key.into(),
+                lineage: Default::default(),
+                trigger_event: None,
+                caller_label: label.map(str::to_string),
+            };
+            match st.ledger.lock().unwrap().reserve(&req) {
+                crate::bridge::ledger::ReserveOutcome::Reserved(r) => r.run_id,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// History pages back past its first answer, each run once (many asked in one millisecond among them), and
+        /// says whether there is more.
+        #[tokio::test]
+        async fn history_pages_back_with_a_cursor_each_run_once() {
+            let (_sb, st) = release_state("history-pages", Publishers::default());
+            let mut made = Vec::new();
+            for i in 0..23 {
+                made.push(reserve(&st, &format!("k{i}"), "greeting", None, json!({ "n": i })));
+            }
+            let mut seen: Vec<String> = Vec::new();
+            let mut last: Option<Value> = None;
+            loop {
+                let (status, body) = read(queued_runs(State(st.clone()), axum::extract::Query(query("all", 5, last.as_ref(), None, None))).await).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let runs = body["runs"].as_array().unwrap().clone();
+                seen.extend(runs.iter().map(|r| r["runId"].as_str().unwrap().to_string()));
+                if body["more"] != true {
+                    break;
+                }
+                assert_eq!(runs.len(), 5);
+                last = runs.last().cloned();
+                assert!(seen.len() < 100, "the pages did not end");
+            }
+            let mut expect = made.clone();
+            expect.reverse();
+            assert_eq!(seen, expect, "newest first, every run once");
+            let (status, body) = read(queued_runs(State(st.clone()), axum::extract::Query(RunsQuery { before: Some("yesterday".into()), ..query("all", 5, None, None, None) })).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let (status, _) = read(queued_runs(State(st.clone()), axum::extract::Query(RunsQuery { status: None, ..query("all", 5, None, Some("x"), None) })).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "a claimer's poll is not searched");
+        }
+
+        /// The search is asked of every run kept, by the flow's name too, and one flow's runs can be had alone.
+        #[tokio::test]
+        async fn history_is_searched_on_the_desktop_past_the_newest() {
+            let (_sb, st) = release_state("history-search", Publishers::default());
+            st.flows.put("greeting", r#"{"name":"Morning greeting","nodes":[],"edges":[]}"#).unwrap();
+            let old = reserve(&st, "old", "greeting", Some("Acme reception"), json!({ "who": "Ada Lovelace" }));
+            for i in 0..250 {
+                reserve(&st, &format!("n{i}"), "other", None, json!({ "n": i }));
+            }
+            for (q, want) in [("lovelace", 1), ("MORNING", 1), ("acme", 1), ("queued", 251), ("nothing like it", 0)] {
+                let (_, body) = read(queued_runs(State(st.clone()), axum::extract::Query(query("all", 200, None, Some(q), None))).await).await;
+                let n = body["runs"].as_array().unwrap().len();
+                assert_eq!(n, want.min(200), "{q}");
+                assert_eq!(body["more"], want > 200, "{q}");
+            }
+            let (_, body) = read(queued_runs(State(st.clone()), axum::extract::Query(query("all", 50, None, None, Some("greeting")))).await).await;
+            let runs = body["runs"].as_array().unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0]["runId"], old.as_str());
+            // Who asked, in the caller's words, under the schema's caller object.
+            assert_eq!(runs[0]["caller"], json!({ "product": "formlogic", "label": "Acme reception" }));
+            let (_, body) = read(queued_runs(State(st.clone()), axum::extract::Query(query("all", 1, None, Some("n"), Some("other")))).await).await;
+            assert!(body["runs"][0].get("caller").is_none(), "a run asked with no label has none");
         }
     }
 }

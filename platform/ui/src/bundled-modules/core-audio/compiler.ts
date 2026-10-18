@@ -11,7 +11,7 @@ import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core';
 // headers / body template / response path fill in below explicit data.*
 // external* fields; an engine model (or any service declaring what it makes)
 // runs as a contract through Audio.serviceAudio / Audio.serviceTranscribe.
-import { contractModel, nodeContract, resolveService } from '../core-service/contract';
+import { contractModel, nodeContract, resolveNodeService } from '../core-service/contract';
 
 /** The values music_gen's legacy services take in `data.service` (not presets). */
 const LEGACY_MUSIC_SERVICES = new Set(['ace-step', 'heartmula']);
@@ -94,7 +94,7 @@ const CoreAudioCompiler: ModuleCompiler = {
             // explicit data.external* values — replaces the legacyServiceMap
             // hand-rolled fallback for chatterbox/qwen3 above. Falls back to
             // project-wide default TTS service (if we add that field later).
-            const preset = resolveService(String(data.service || ''));
+            const preset = resolveNodeService(String(data.service || ''), data);
             // Old saved flows wrote `data.service = "chatterbox-tts"` etc.;
             // those names don't match registry service IDs, so we only use
             // legacyServiceMap when the preset lookup misses.
@@ -245,7 +245,7 @@ const CoreAudioCompiler: ModuleCompiler = {
             // (`engine:music`, `engine:music:<model>`), a rig, a custom service.
             const pickedService = String(data.service || 'ace-step');
             if (!LEGACY_MUSIC_SERVICES.has(pickedService)) {
-                const preset = resolveService(pickedService);
+                const preset = resolveNodeService(pickedService, data);
                 const contract = nodeContract(pickedService, preset, 'audio') ?? JSON.stringify(pickedService);
                 const promptIn = inputs.get('prompt');
                 const lyricsIn = inputs.get('lyrics');
@@ -387,7 +387,7 @@ const CoreAudioCompiler: ModuleCompiler = {
             // service): the recording goes to it; only the text comes back.
             const sttService = String(data.service || '');
             if (sttService) {
-                const preset = resolveService(sttService);
+                const preset = resolveNodeService(sttService, data);
                 const contract = nodeContract(sttService, preset, 'text') ?? JSON.stringify(sttService);
                 return `
   // --- Node: ${node.id} (speech_to_text, service) ---
@@ -449,7 +449,7 @@ const CoreAudioCompiler: ModuleCompiler = {
             // OAIY's engine by default (MOSS-SoundEffect), or any service
             // picked for the node: a description in, a sound out.
             const serviceId = String(data.service || 'engine:sound');
-            const preset = resolveService(serviceId);
+            const preset = resolveNodeService(serviceId, data);
             const contract = nodeContract(serviceId, preset, 'audio') ?? JSON.stringify(serviceId);
             const promptIn = inputs.get('prompt');
             const promptLit = JSON.stringify(String(data.prompt || ''));

@@ -181,6 +181,7 @@ pub fn run(
         idempotency_key: format!("{CONNECTOR}:{key}"),
         lineage: LineageRef::default(),
         trigger_event: None,
+        caller_label: None,
     };
     let reserved = {
         let mut l = ledger.lock().map_err(|_| (500, "internal", "the run ledger is unavailable".to_string()))?;
@@ -319,6 +320,7 @@ mod tests {
             idempotency_key: "k".into(),
             lineage: LineageRef::default(),
             trigger_event: None,
+            caller_label: None,
         };
         let ReserveOutcome::Reserved(rec) = l.lock().unwrap().reserve(&request) else { panic!("not reserved") };
         let ClaimOutcome::Claimed(rec) = l.lock().unwrap().claim(&rec.run_id, Runtime::Desktop, CONNECTOR) else { panic!("not claimed") };

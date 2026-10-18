@@ -25,9 +25,11 @@
       "--model-dirs",
       "${modelDirs}",
       "--voices-dir",
-      "${dataDir}/voices"
+      "${dataDir}/voices",
+      "--watch-stdin"
     ],
-    "env": {}
+    "env": {},
+    "stdinPipe": true
   },
   "health": {
     "url": "http://127.0.0.1:${port}/v1/models",
