@@ -20,7 +20,7 @@ by hand on its own, because automatic CI is paused).
 | `SHA256SUMS.txt` | The checksum of every file above, `latest.json` and the `.sig` files included |
 | `release-evidence-web.json`, `-linux.json`, `-windows.json` | For each build: the revision, target, toolchain, digests, and the verification run that passed before anything was published |
 | `oaiy-desktop-<v>-macos-arm64.dmg`, and its `.sha256` | OAIY Desktop for an Apple-silicon Mac, signed with the Developer ID and notarised by Apple. Added after the release is published, by the Mac build ([A Mac's image](#a-macs-image)): `SHA256SUMS.txt` was written before it and does not list it, so its checksum is the file beside it. The update feed has no entry for a Mac: a newer image is installed over the app. |
-| `oaiy-egpu-plugin-<v>-macos-arm64-rtx40.zip`, and its `.sha256` | The eGPU plugin for that Mac app: an NVIDIA RTX 40 card in a Thunderbolt enclosure, with its kernels compiled ahead of time. Built on a Mac that has such a card and added by hand ([The eGPU plugin](#the-egpu-plugin)). |
+| `oaiy-egpu-plugin-<v>-macos-arm64.zip`, and its `.sha256` | The eGPU plugin for that Mac app: an NVIDIA RTX 30, 40 or 50 card in a Thunderbolt enclosure, with its kernels compiled ahead of time for each (until 0.1.6, RTX 40 only: `-rtx40.zip`). Built on a Mac that has such a card and added by hand ([The eGPU plugin](#the-egpu-plugin)). |
 
 An OAIY Desktop installer is complete by itself for what it shows. Besides the dashboard
 it carries the CLI that runs flows (`resources/cli`), the Agent (`resources/app`, opening
@@ -329,17 +329,18 @@ nvcc has compiled ([TINYGPU.md](TINYGPU.md#the-egpu-plugin-no-docker-no-compiler
 tagged commit, and added to the release by hand:
 
 ```sh
-python3 tools/tinygpu/plugin/bundle.py target/egpu-plugin-public --no-firmware --zip
-cp target/egpu-plugin-public.zip oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip
-shasum -a 256 oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip > oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip.sha256
-gh release upload v0.1.3 oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip oaiy-egpu-plugin-0.1.3-macos-arm64-rtx40.zip.sha256
+python3 tools/tinygpu/plugin/bundle.py target/egpu-plugin-public --no-firmware --zip   # --arch sm_86,sm_89,sm_120 by default
+cp target/egpu-plugin-public.zip oaiy-egpu-plugin-0.1.7-macos-arm64.zip
+shasum -a 256 oaiy-egpu-plugin-0.1.7-macos-arm64.zip > oaiy-egpu-plugin-0.1.7-macos-arm64.zip.sha256
+gh release upload v0.1.7 oaiy-egpu-plugin-0.1.7-macos-arm64.zip oaiy-egpu-plugin-0.1.7-macos-arm64.zip.sha256
 ```
 
 `--no-firmware` leaves out the two things in it that are other people's programs (NVIDIA's GSP
 firmware and tinygrad's TinyGPU app): tinygrad downloads both itself the first time it opens
 the card. Run a model on the card from the unpacked zip before it is uploaded. Its kernels are
 the ones of the engine at that commit, for the models that Mac has run: another model's are
-compiled as they are met, which needs nvcc (Docker) on the Mac that meets them.
+compiled as they are met, which needs nvcc (Docker) on the Mac that meets them. The RTX 30 and 50 cubins are compiled from the same sources as it is built (those the cache
+lacks), so building it needs nvcc too: start Docker first (`open -a Docker`; the shim is `~/.local/bin/nvcc`).
 
 To try the build without publishing, run the same workflow on a branch instead:
 `gh workflow run release.yml --ref <branch> -f version=0.1.0`. It builds everything and

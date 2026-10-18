@@ -161,7 +161,7 @@ def main():
   tinygrad(src, venv_python, out / "lib")
   card = out / "card"
   card.mkdir()
-  for f in (HERE / "plugin.py", REPO / "crates" / "oaiy-studio" / "src" / "egpu_serve.py", HERE.parent / "webgpu_server.py"):
+  for f in (HERE / "plugin.py", REPO / "crates" / "oaiy-studio" / "src" / "llm" / "egpu_serve.py", HERE.parent / "webgpu_server.py"):
     shutil.copy2(f, card / f.name)
   copy_files(HERE / "ui", out / "ui")
   if args.no_firmware: print("firmware: left out (tinygrad downloads NVIDIA's and its TinyGPU app as it first opens a card)")
