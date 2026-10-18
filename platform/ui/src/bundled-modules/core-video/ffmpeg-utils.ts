@@ -97,6 +97,9 @@ export async function concatVideos(
     const concatListPath = `${appDataDir}/temp/concat_${Date.now()}.txt`;
 
     // Build concat file content
+    // (a line break would start a directive of its own in the list)
+    const bad = inputPaths.find(p => /[\u0000-\u001f]/.test(p));
+    if (bad !== undefined) throw new Error(`A video's path has a line break or control character in it: ${JSON.stringify(bad)}`);
     const concatContent = inputPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
 
     // Write concat list

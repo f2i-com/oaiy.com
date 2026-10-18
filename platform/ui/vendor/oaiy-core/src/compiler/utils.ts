@@ -26,8 +26,10 @@ export function sanitizeId(id: string): string {
 export function escapeString(str: string): string {
   // Use JSON.stringify and strip the surrounding quotes for comprehensive escaping
   const jsonEscaped = JSON.stringify(str);
-  // Remove the surrounding quotes that JSON.stringify adds
-  return jsonEscaped.slice(1, -1);
+  // Remove the surrounding quotes that JSON.stringify adds. U+2028 and U+2029 are escaped too: JSON leaves them as
+  // they are, and to JavaScript they end a line, so one in a node's setting that a compiler writes into a `//`
+  // comment (a label, a compare value) ended the comment and the rest of the setting ran as code.
+  return jsonEscaped.slice(1, -1).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
 /**

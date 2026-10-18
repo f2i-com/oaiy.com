@@ -56,12 +56,12 @@
     "properties": [
         {
             "id": "service",
-            "name": "Service Preset",
+            "name": "Service",
             "type": "select",
             "default": "",
             "dynamicOptionsSource": "service:list:text_to_speech",
             "options": [{ "value": "engine:speech", "label": "OAIY engine · default model" }],
-            "description": "Pick a speech model or service. OAIY engine: Speaker names a saved voice (or an OpenAI voice name) and Voice Description describes one. Blank: the Mode fields below. Add models in OAIY's Engines, services in OAIY's Services or Settings → Services."
+            "description": "Which model or service speaks. OAIY's engine: Speaker names a saved voice and Voice Description describes one. Blank: the Mode fields below. Add models in OAIY's Engines, services in OAIY's Services or Settings → Services."
         },
         {
             "id": "provider",

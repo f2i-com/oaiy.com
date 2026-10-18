@@ -256,8 +256,23 @@ const CoreBrowserCompiler: ModuleCompiler = {
           // ({body}, {html}) and re-stringify any object input — JSONPath
           // and regex both need a textual representation.
           const patternOrSelector = type === 'selector' ? selector : pattern;
+          // (given a session and no content, the content is the session's page: the session itself was taken for
+          // the content before, its JSON searched, and a selector found nothing, in silence)
+          const pageOfSession = sessionInput && !inputs.get('content');
+          if (pageOfSession && type === 'selector') {
+            // A selector on a session's page is run in the page, on its own DOM: as the extraction does it
+            // (each match's text, inner HTML or attribute; one alone as itself), where there is no DOM to parse
+            // HTML into (the CLI), which answered "" for every selector.
+            const probe = `(() => { const sel = ${JSON.stringify(selector)}; const attr = ${JSON.stringify(attribute)}; ` +
+              `const r = Array.from(document.querySelectorAll(sel)).map(e => attr === 'text' ? (e.textContent || '') : attr === 'html' ? e.innerHTML : (e.getAttribute(attr) || '')); ` +
+              `return r.length === 1 ? r[0] : r; })()`;
+            code += `
+  ${letOrAssign}${outputVar} = (${sessionInput} && ${sessionInput}.id) ? await Browser.evaluateJson(${sessionInput}.id, "${escapeString(probe)}") : "";
+  workflow_context["${node.id}"] = ${outputVar};`;
+            break;
+          }
           code += `
-  let _content_${sanitizedId} = ${contentInput};
+  let _content_${sanitizedId} = ${pageOfSession ? `(${sessionInput} && ${sessionInput}.id ? await Browser.getHtml(${sessionInput}.id) : null)` : contentInput};
   if (_content_${sanitizedId} && typeof _content_${sanitizedId} === 'object' && _content_${sanitizedId}.body) {
     _content_${sanitizedId} = _content_${sanitizedId}.body;
   }
@@ -442,7 +457,9 @@ const CoreBrowserCompiler: ModuleCompiler = {
         const sessionVar = sessionInput || 'null';
         const urlExpr = urlInput ? urlInput : `"${staticUrl}"`;
         const bodyExpr = bodyInput ? bodyInput : `"${staticBody}"`;
-        const bodyType = escapeString(String(data.bodyType || 'none'));
+        // (no body type chosen, as a flow written without the editor leaves it: a body given is sent, as JSON when
+        // it is JSON, else as it is; it was dropped, a POST going out empty)
+        const bodyType = data.bodyType ? escapeString(String(data.bodyType)) : (bodyInput || staticBody ? 'auto' : 'none');
         const responseFormat = escapeString(String(data.responseFormat || 'auto'));
 
         code += `
@@ -450,22 +467,36 @@ const CoreBrowserCompiler: ModuleCompiler = {
   let _url_${sanitizedId} = ${urlExpr};
   let _body_raw_${sanitizedId} = ${bodyExpr};
   let _headers_raw_${sanitizedId} = "${headers}";
-  let _headers_${sanitizedId} = _headers_raw_${sanitizedId};
-  if (_headers_raw_${sanitizedId}.indexOf("{{") >= 0) {
-    _headers_${sanitizedId} = Utility.template(_headers_raw_${sanitizedId}, workflow_context);
+  // The headers read first, then each value's {{…}} filled in: filled into the JSON text before, a value with a quote
+  // in it made the text unreadable and every header was dropped.
+  let _hdrs_obj_${sanitizedId} = {};
+  try { _hdrs_obj_${sanitizedId} = _headers_raw_${sanitizedId} ? JSON.parse(_headers_raw_${sanitizedId}) : {}; } catch (_) { _hdrs_obj_${sanitizedId} = {}; }
+  for (const _hk_${sanitizedId} of Object.keys(_hdrs_obj_${sanitizedId})) {
+    const _hv_${sanitizedId} = String(_hdrs_obj_${sanitizedId}[_hk_${sanitizedId}]);
+    if (_hv_${sanitizedId}.indexOf("{{") >= 0) {
+      _hdrs_obj_${sanitizedId}[_hk_${sanitizedId}] = await Utility.template(_hv_${sanitizedId}, workflow_context);
+    }
   }
+  let _headers_${sanitizedId} = "";
   // Encode body + auto-set Content-Type based on bodyType.
   let _body_${sanitizedId} = _body_raw_${sanitizedId};
-  let _hdrs_obj_${sanitizedId} = {};
-  try { _hdrs_obj_${sanitizedId} = _headers_${sanitizedId} ? JSON.parse(_headers_${sanitizedId}) : {}; } catch (_) { _hdrs_obj_${sanitizedId} = {}; }
-  if ("${bodyType}" === "json") {
+  let _body_type_${sanitizedId} = "${bodyType}";
+  if (_body_type_${sanitizedId} === "auto") {
+    const _b_${sanitizedId} = _body_raw_${sanitizedId};
+    let _is_json_${sanitizedId} = _b_${sanitizedId} != null && typeof _b_${sanitizedId} === "object";
+    if (!_is_json_${sanitizedId} && typeof _b_${sanitizedId} === "string" && /^\s*[\[{]/.test(_b_${sanitizedId})) {
+      try { JSON.parse(_b_${sanitizedId}); _is_json_${sanitizedId} = true; } catch (_) { _is_json_${sanitizedId} = false; }
+    }
+    _body_type_${sanitizedId} = _is_json_${sanitizedId} ? "json" : "raw";
+  }
+  if (_body_type_${sanitizedId} === "json") {
     if (_body_raw_${sanitizedId} && typeof _body_raw_${sanitizedId} !== "string") {
       _body_${sanitizedId} = JSON.stringify(_body_raw_${sanitizedId});
     }
     if (!_hdrs_obj_${sanitizedId}["Content-Type"] && !_hdrs_obj_${sanitizedId}["content-type"]) {
       _hdrs_obj_${sanitizedId}["Content-Type"] = "application/json";
     }
-  } else if ("${bodyType}" === "form_urlencoded") {
+  } else if (_body_type_${sanitizedId} === "form_urlencoded") {
     if (_body_raw_${sanitizedId} && typeof _body_raw_${sanitizedId} === "object") {
       _body_${sanitizedId} = Object.entries(_body_raw_${sanitizedId})
         .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(String(v == null ? "" : v)))
@@ -474,7 +505,7 @@ const CoreBrowserCompiler: ModuleCompiler = {
     if (!_hdrs_obj_${sanitizedId}["Content-Type"] && !_hdrs_obj_${sanitizedId}["content-type"]) {
       _hdrs_obj_${sanitizedId}["Content-Type"] = "application/x-www-form-urlencoded";
     }
-  } else if ("${bodyType}" === "none") {
+  } else if (_body_type_${sanitizedId} === "none") {
     _body_${sanitizedId} = "";
   }
   // raw: pass through unchanged

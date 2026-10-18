@@ -47,19 +47,35 @@ pub fn shared(doc: &Value) -> bool {
     doc.get("oaiyRemote").and_then(Value::as_bool) == Some(true)
 }
 
-/// The inputs a flow takes from its caller: its text inputs, each by its label (what the run's `inputs` are keyed
-/// by), with the value it has when none is given.
+/// The inputs a flow takes from its caller: its inputs, each by its label (what the run's `inputs` are keyed by), with
+/// the value it has when none is given and, for one that is not text, its kind (`file`: content, a picture as a data
+/// URL or its address; `video`, `audio`: a path or an address; `folder`: a folder's path). Its file, video, audio and
+/// folder inputs were left out: a run could not be given them (they took only their saved value), and now can.
 pub fn inputs_of(doc: &Value) -> Vec<Value> {
     doc.get("nodes")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|n| n.get("type").and_then(Value::as_str) == Some("input_text"))
-        .map(|n| {
+        .filter_map(|n| {
+            let (kind, default_key) = match n.get("type").and_then(Value::as_str)? {
+                "input_text" => (None, "value"),
+                "input_file" => (Some("file"), "filePath"),
+                "input_video" => (Some("video"), "filePath"),
+                "input_audio" => (Some("audio"), "filePath"),
+                "input_folder" => (Some("folder"), "path"),
+                _ => return None,
+            };
             let data = n.get("data");
             let name = data.and_then(|d| d.get("label")).and_then(Value::as_str).filter(|s| !s.trim().is_empty());
             let name = name.or_else(|| n.get("id").and_then(Value::as_str)).unwrap_or("input");
-            json!({ "name": name, "default": data.and_then(|d| d.get("value")).cloned().unwrap_or(Value::Null) })
+            // (a file input with no path saved has no default, not "")
+            let saved = data.and_then(|d| d.get(default_key)).cloned().unwrap_or(Value::Null);
+            let default = if kind.is_some() && saved.as_str() == Some("") { Value::Null } else { saved };
+            let mut entry = json!({ "name": name, "default": default });
+            if let Some(kind) = kind {
+                entry["type"] = json!(kind);
+            }
+            Some(entry)
         })
         .collect()
 }
@@ -263,6 +279,25 @@ mod tests {
         assert_eq!(run(&l, &flows, None, &json!({"flowId": "apps", "inputs": [1]}), Some("k4"), &never).unwrap_err().1, "invalid_request");
         assert!(l.lock().unwrap().recent(10, &[]).is_empty(), "a refused run is never reserved");
         assert_eq!(answer(&l, &flows, None, "flow.delete", &json!({}), None).unwrap_err().1, "capability_unavailable");
+    }
+
+    /// A flow's file, video, audio and folder inputs are listed too, each with its kind and the path it has saved.
+    #[test]
+    fn every_kind_of_input_is_listed() {
+        let doc = json!({ "nodes": [
+            {"id": "t", "type": "input_text", "data": {"label": "Prompt", "value": "a cat"}},
+            {"id": "f", "type": "input_file", "data": {"label": "File", "filePath": ""}},
+            {"id": "v", "type": "input_video", "data": {"label": "Clip", "filePath": "/v.mp4"}},
+            {"id": "a", "type": "input_audio", "data": {"filePath": "/a.wav"}},
+            {"id": "d", "type": "input_folder", "data": {"path": "/notes"}},
+            {"id": "x", "type": "template", "data": {}}] });
+        assert_eq!(inputs_of(&doc), json!([
+            {"name": "Prompt", "default": "a cat"},
+            {"name": "File", "default": null, "type": "file"},
+            {"name": "Clip", "default": "/v.mp4", "type": "video"},
+            {"name": "a", "default": "/a.wav", "type": "audio"},
+            {"name": "d", "default": "/notes", "type": "folder"},
+        ]).as_array().unwrap().clone());
     }
 
     /// The answer is the flow's own (the output node's, inside the CLI's report), with its pictures' bytes.

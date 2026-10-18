@@ -17,7 +17,7 @@
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { MODULE_CLEANUP } from 'oaiy-core/src/module-types';
-import { getEngineBase } from '../../lib/engineEndpoint';
+import { desktopAccess } from '../core-service/contractRuntime';
 import { inOaiyWindow } from '../../lib/oaiyWindow';
 import {
   extractEmailsScript,
@@ -677,10 +677,13 @@ function extract(
         }
       }
       
+      // (an object found is given as its JSON, a missing one as nothing: String() made them "[object Object]" and
+      // "undefined")
+      const text = (v: unknown): string => (v === undefined || v === null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v));
       if (Array.isArray(result)) {
-        return result.map(String);
+        return result.map(text);
       }
-      return String(result);
+      return text(result);
     } catch {
       ctx.log('error', '[Browser] Invalid JSON for JSONPath extraction');
       return '';
@@ -778,6 +781,8 @@ function extract(
         return [];
       }
     }
+    // (no DOM to parse the HTML into here: said, rather than "" for every selector)
+    throw new Error('A CSS selector over HTML text needs a DOM, which this host has none of: give the node a Session instead (the selector is then run in the page)');
   }
 
   return '';
@@ -1034,14 +1039,20 @@ function requireTauri(op: string): NonNullable<RuntimeContext['tauri']> {
 // ids never cross transports, and no per-session bookkeeping is needed
 // beyond what `v2Sessions` already tracks.
 //
-// OAIY Desktop's HTTP API is at the engine address in Settings
-// (lib/engineEndpoint.ts; http://127.0.0.1:17972 unless the person changed
-// it), the same one `desktopDetection` in the app shell probes. It is read
+// OAIY Desktop's HTTP API is where OAIY's window says it is, else at the engine
+// address in Settings (lib/engineEndpoint.ts; http://127.0.0.1:17972 unless the
+// person changed it), the same one `desktopDetection` in the app shell probes. It is read
 // each time it is used, so a change is followed without a reload. The
 // Playwright server itself runs on a separate port that we discover from
 // `/api/services`.
 
-const desktopApi = (): string => getEngineBase();
+// (where OAIY's window says it is, with the credential the window gave the page: the engine address alone was
+// 127.0.0.1:17972 whatever port the desktop was on, and asked without a credential)
+const desktopApi = (): string => desktopAccess().origin;
+const desktopAuth = (): Record<string, string> => {
+  const token = desktopAccess().token;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
 
 /** Resolved base URL of OAIY Desktop's Playwright server; cached per load. */
 let companionBrowserBase: string | null = null;
@@ -1093,7 +1104,7 @@ async function resolveDesktopBrowserBase(): Promise<string> {
   try {
     const snap = await companionFetchJson<{ services?: typeof services }>(
       `${desktopApi()}/api/services`,
-      { method: 'GET' },
+      { method: 'GET', headers: desktopAuth() },
       2500
     );
     services = Array.isArray(snap?.services) ? snap.services : [];
@@ -1121,7 +1132,7 @@ async function resolveDesktopBrowserBase(): Promise<string> {
   try {
     await companionFetchJson(
       `${desktopApi()}/api/services/ensure-by-port`,
-      { method: 'POST', body: JSON.stringify({ port }) },
+      { method: 'POST', headers: desktopAuth(), body: JSON.stringify({ port }) },
       4000
     );
   } catch {
@@ -1343,7 +1354,9 @@ async function createSessionV2(config: BrowserSessionConfigV2): Promise<BrowserS
     );
     const session: BrowserSessionV2 = {
       id: legacy.id,
-      mode: 'webview',
+      // (the legacy session's own mode: it is plain HTTP where there is no webview, and a session said to be a
+      // webview sent every page to a webview that is not there: "webview_navigate is not available")
+      mode: legacy.mode === 'http' ? 'http' : 'webview',
       profile: config.profile,
       userAgent: config.userAgent,
       proxy: config.proxy,

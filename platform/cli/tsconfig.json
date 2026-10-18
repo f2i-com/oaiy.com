@@ -24,7 +24,9 @@
       "oaiy-core/modules/*": ["../ui/src/bundled-modules/*"],
       "oaiy-core/*": ["../ui/vendor/oaiy-core/*"],
       "@tauri-apps/api/core": ["./src/node-host/core.ts"],
-      "@tauri-apps/plugin-sql": ["./src/node-host/sql.ts"]
+      "@tauri-apps/plugin-sql": ["./src/node-host/sql.ts"],
+      // (the code the editor shares with the Agent, which the editor's modules import)
+      "@oaiy/shared/*": ["../../shared/*"]
     }
   },
   "include": ["src"]

@@ -14,7 +14,7 @@
 
 import type { RuntimeModule, RuntimeContext, RuntimeMethod } from 'oaiy-core/src/module-types';
 import type { CustomService } from './examples';
-import { runContract } from './contractRuntime';
+import { desktopAccess, desktopCredential, runContract } from './contractRuntime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createServiceMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -177,6 +177,12 @@ async function call(
   }
   if (apiKey && !Object.keys(headers).some((k) => k.toLowerCase() === 'authorization')) {
     headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+  // OAIY Desktop's own engine routes take its credential, as a contract service's call does (contractRuntime): the
+  // engine's language model picked here (a service, not a contract) was refused "authentication required".
+  if (!Object.keys(headers).some((k) => k.toLowerCase() === 'authorization')) {
+    const credential = desktopCredential(endpoint, desktopAccess());
+    if (credential) headers['Authorization'] = `Bearer ${credential}`;
   }
 
   // Body

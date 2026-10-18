@@ -143,20 +143,17 @@ async function execute(
         result = { success: false, error: `Unknown operation: ${operation}` };
     }
 
-    if (result.success) {
-      ctx.onNodeStatus?.(nodeId, 'completed');
-      ctx.log('success', `[Database] ${operation} completed`);
-    } else {
-      ctx.onNodeStatus?.(nodeId, 'error');
-      ctx.log('error', `[Database] ${operation} failed: ${result.error}`);
-    }
-
+    if (!result.success) throw new Error(String(result.error || `the ${operation} did not succeed`));
+    ctx.onNodeStatus?.(nodeId, 'completed');
+    ctx.log('success', `[Database] ${operation} completed`);
     return result;
   } catch (error) {
+    // A failed operation fails its step. It was answered `{ success: false }`, which a query read as no rows and an
+    // insert as done: a flow that wrote nothing went on as if it had.
     ctx.onNodeStatus?.(nodeId, 'error');
     const errMsg = error instanceof Error ? error.message : 'Unknown error';
     ctx.log('error', `[Database] ${operation} failed: ${errMsg}`);
-    return { success: false, error: errMsg };
+    throw new Error(`Database ${operation} failed: ${errMsg}`);
   }
 }
 

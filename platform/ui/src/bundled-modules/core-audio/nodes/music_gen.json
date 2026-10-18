@@ -78,6 +78,7 @@
         },
         {
             "id": "apiUrl",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "API URL",
             "type": "string",
             "default": "http://127.0.0.1:8766/generate",
@@ -111,6 +112,7 @@
         },
         {
             "id": "inferSteps",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Quality Steps",
             "type": "number",
             "default": 27,
@@ -122,6 +124,7 @@
         },
         {
             "id": "guidanceScale",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Guidance Scale",
             "type": "number",
             "default": 15.0,

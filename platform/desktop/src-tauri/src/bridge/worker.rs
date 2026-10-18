@@ -64,12 +64,34 @@ use super::ledger::{ClaimOutcome, LedgerHandle, RunError, RunErrorCode, RunRecor
 /// tight without any network cost; 500ms keeps a triggered flow feeling
 /// immediate without busy-spinning.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// Default wall-clock budget when the run specifies none.
-pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default wall-clock budget when the run specifies none: the CLI's own (`oaiy run`, 45 minutes), as the editor sets
+/// none. It was 120 s, so a run a trigger reserved (which names no budget) was killed partway through any flow longer
+/// than that: the text-to-image flow's review loop, run from a plugin's event, always timed out.
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+
+/// The longest a run may be given (a day): longer is taken as this. A budget of years overflowed the clock it was
+/// added to, which panicked the worker's thread (no run ran after it), and Node's timer, which fired at once.
+pub const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The caller product of this desktop's own Agent (its flow tools, `control::tools`): the one lane whose runs are the
+/// person's, not an outside caller's. The bridge's route refuses the name from anyone else.
+pub const AGENT_PRODUCT: &str = "oaiy-agent";
+
+/// Whether a run's input came from outside this computer's person: everything but the Agent's own runs (a plugin's
+/// event, an app or a site through the API, a provider's graph). Such a run is confined: its absolute file paths stay
+/// in the CLI's own folders and it reaches no other address of this computer or its network than this desktop's API
+/// (see [`run_flow_cli_as`]). Before, every run here had the whole disk and network of the person, so a webhook's
+/// input given to a flow's HTTP Request or File Read node reached the cloud's metadata address or `~/.ssh`.
+pub fn outside_input(run: &RunRecord) -> bool {
+    run.caller_product != AGENT_PRODUCT
+}
 /// How often a running child is checked for exit / cancellation.
 const CHILD_POLL: Duration = Duration::from_millis(250);
 /// Cap on captured child output kept for error reporting.
 const MAX_CAPTURE: usize = 16 * 1024;
+/// The most flows one run is handed (the flow, its subflows and theirs): far more than any flow runs, so a chain of
+/// references that never ends is cut, not followed.
+const MAX_PROJECT_FLOWS: usize = 200;
 
 /// The example flows OAIY ships (`platform/examples/flows`), each with the id it is stored under: in every
 /// desktop's flows once ([`FlowStore::seed_examples`]), and so in the Flows editor, for the person to run, change or
@@ -128,6 +150,42 @@ impl FlowStore {
         std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
         Ok(path)
+    }
+
+    /// The flow `id` and every stored flow it runs (its subflow and macro nodes' flows, and theirs), as one project
+    /// document the CLI reads (`{ flows: [{ id, name, graph }, …] }`, the flow first), or `None` when it runs no
+    /// other flow. The CLI was handed the flow's own file alone, so its subflows were nowhere to be found: every
+    /// subflow and macro failed here ("Subflow not found"), on every lane, while the editor ran them. A flow named
+    /// but not stored is left out (the run says which). At most [`MAX_PROJECT_FLOWS`] flows.
+    pub fn project_of(&self, id: &str) -> Option<Value> {
+        let mut order: Vec<(String, Value)> = Vec::new();
+        let mut queue = vec![id.to_string()];
+        while let Some(next) = queue.pop() {
+            if order.iter().any(|(seen, _)| *seen == next) || order.len() >= MAX_PROJECT_FLOWS {
+                continue;
+            }
+            let Some(doc) = self.get(&next).and_then(|text| serde_json::from_str::<Value>(&text).ok()) else { continue };
+            let graph = doc.get("graph").filter(|g| g.get("nodes").is_some()).unwrap_or(&doc);
+            let nodes = graph.get("nodes").and_then(Value::as_array).cloned().unwrap_or_default();
+            for node in &nodes {
+                let data = node.get("data");
+                let target = match node.get("type").and_then(Value::as_str) {
+                    Some("subflow") => data.and_then(|d| d.get("flowId")),
+                    Some("macro") => data.and_then(|d| d.get("_macroWorkflowId").filter(|v| v.as_str().is_some_and(|s| !s.is_empty())).or_else(|| d.get("macroId"))),
+                    _ => None,
+                };
+                if let Some(t) = target.and_then(Value::as_str).filter(|t| Self::valid_id(t)) {
+                    queue.push(t.to_string());
+                }
+            }
+            let entry = serde_json::json!({
+                "id": next,
+                "name": doc.get("name").and_then(Value::as_str).unwrap_or(&next),
+                "graph": { "nodes": nodes, "edges": graph.get("edges").cloned().unwrap_or(Value::Array(Vec::new())) },
+            });
+            order.push((next, entry));
+        }
+        (order.len() > 1).then(|| serde_json::json!({ "flows": order.into_iter().map(|(_, e)| e).collect::<Vec<_>>() }))
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, String> {
@@ -937,6 +995,19 @@ pub(crate) fn execute_run(
     }
     let inputs_path = scratch.join("inputs.json");
     let out_path = scratch.join("result.json");
+    // A flow that runs others is handed with them, as one project file named for the flow (the CLI takes a flow's
+    // id from its file's name).
+    let project_path = scratch.join(format!("{flow_id}.json"));
+    let flow_path = match flows.project_of(flow_id) {
+        Some(project) => {
+            if let Err(e) = std::fs::write(&project_path, project.to_string()) {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return fail(RunErrorCode::Internal, &format!("cannot write the flow and its subflows: {e}"));
+            }
+            project_path
+        }
+        None => flow_path,
+    };
     let mut inputs_body = run
         .input
         .clone()
@@ -952,10 +1023,10 @@ pub(crate) fn execute_run(
 
     let timeout = run
         .timeout_ms
-        .map(Duration::from_millis)
+        .map(|t| Duration::from_millis(t.min(MAX_TIMEOUT_MS)))
         .unwrap_or(DEFAULT_TIMEOUT);
 
-    let outcome = run_flow_cli(
+    let outcome = run_flow_cli_as(
         CliRequest {
             flow_path: &flow_path,
             inputs_path: &inputs_path,
@@ -972,6 +1043,7 @@ pub(crate) fn execute_run(
             profile_path: None,
             node,
         },
+        outside_input(run),
         // Cancellation: the flag the cancel endpoint sets. Observed from
         // here because the runner is the only thing that can stop the work.
         &|| {
@@ -1174,6 +1246,15 @@ pub enum CliOutcome {
 /// to get wrong — draining both pipes, adopting the child into the job object,
 /// dropping credentials from its environment.
 pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome {
+    // A linked provider's graph (it comes with a connector) runs on that provider's input: confined.
+    let confined = req.connector_path.is_some();
+    run_flow_cli_as(req, confined, cancelled)
+}
+
+/// [`run_flow_cli`], confined or not: a confined run (one with outside input, [`outside_input`]) is the CLI's
+/// `OAIY_FS_CONFINE` mode, as `oaiy worker` runs a queue's: absolute paths only in its own folders, ffmpeg on local
+/// files alone, and on this computer and its network no address but this desktop's API.
+pub fn run_flow_cli_as(req: CliRequest, confined: bool, cancelled: &dyn Fn() -> bool) -> CliOutcome {
     let Some(cli) = resolve_cli(
         std::env::var("OAIY_CLI").ok().as_deref(),
         bundled_cli_script,
@@ -1191,7 +1272,7 @@ pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome
         };
     };
     let node_exe = req.node.and_then(|n| n.resolve());
-    run_flow_cli_with(&cli, node_exe.as_deref(), req, cancelled)
+    run_flow_cli_with(&cli, node_exe.as_deref(), req, confined, cancelled)
 }
 
 /// [`run_flow_cli`] with the CLI and Node already chosen.
@@ -1207,6 +1288,7 @@ pub fn run_flow_cli_with(
     cli: &CliInvocation,
     node_exe: Option<&Path>,
     req: CliRequest,
+    confined: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> CliOutcome {
     if let EngineProbe::Unavailable { reason } = engine_probe(cli, node_exe) {
@@ -1256,6 +1338,7 @@ pub fn run_flow_cli_with(
     } else {
         cmd.env("OAIY_SERVER_TOKEN", internal);
     }
+    confine_child(&mut cmd, confined, std::env::var_os("OAIY_DATA_DIR"));
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1282,7 +1365,13 @@ pub fn run_flow_cli_with(
     let deadline = Instant::now() + req.timeout + Duration::from_secs(10);
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => {
+                // What the flow started and left running (an ffmpeg the CLI's own timeout left when it exited, a
+                // helper) ends with it: the group was ended only when this side cancelled or timed the run out.
+                #[cfg(unix)]
+                crate::services::registry::kill_process_tree(child.id());
+                break Some(status);
+            }
             Ok(None) => {}
             Err(_) => break None,
         }
@@ -1349,6 +1438,21 @@ pub fn run_flow_cli_with(
     CliOutcome::Failed {
         exit_code: st.code().unwrap_or(-1),
         detail: tail_of(&capture, 1500),
+    }
+}
+
+/// A run's confinement, as its child's environment says it (see [`run_flow_cli_as`]). `data_dir`: this process's
+/// `OAIY_DATA_DIR`. A headless server's data folder is the CLI's own unless it is told otherwise (the child inherits the
+/// variable), and that folder holds the server's credentials, so a confined run is given a folder of its own inside
+/// it: the CLI's confinement lets a flow's absolute paths into its data folder. (An operator's own
+/// `OAIY_FS_ALLOW_ABSOLUTE` or `OAIY_HTTP_ALLOW_LOCAL` is left as it is: theirs to lift it with.)
+fn confine_child(cmd: &mut Command, confined: bool, data_dir: Option<std::ffi::OsString>) {
+    if !confined {
+        return;
+    }
+    cmd.env("OAIY_FS_CONFINE", "1");
+    if let Some(dir) = data_dir.filter(|d| !d.is_empty()) {
+        cmd.env("OAIY_DATA_DIR", PathBuf::from(dir).join("flow-files"));
     }
 }
 
@@ -1589,6 +1693,61 @@ mod tests {
         store.seed_examples();
         assert!(store.get(id).is_none(), "an example the person deleted is not stored again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A flow that runs others is handed to the CLI with them, its own first, each once; one that runs none alone.
+    #[test]
+    fn a_flow_is_handed_with_the_subflows_and_macros_it_runs() {
+        let dir = std::env::temp_dir().join(format!("oaiy-flowstore-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FlowStore::new(dir.clone());
+        let node = |id: &str, ty: &str, data: Value| serde_json::json!({ "id": id, "type": ty, "data": data });
+        let doc = |nodes: Vec<Value>| serde_json::json!({ "name": "n", "nodes": nodes, "edges": [] }).to_string();
+        store.put("parent", &doc(vec![
+            node("a", "subflow", serde_json::json!({ "flowId": "child" })),
+            node("b", "macro", serde_json::json!({ "_macroWorkflowId": "mac" })),
+            node("c", "subflow", serde_json::json!({ "flowId": "gone" })),
+        ])).unwrap();
+        // (a macro written from the node's definition names it macroId; the child runs the parent: a loop)
+        store.put("child", &doc(vec![node("d", "macro", serde_json::json!({ "macroId": "mac2" })), node("e", "subflow", serde_json::json!({ "flowId": "parent" }))])).unwrap();
+        store.put("mac", &doc(vec![])).unwrap();
+        store.put("mac2", &doc(vec![])).unwrap();
+        store.put("alone", &doc(vec![node("x", "template", serde_json::json!({}))])).unwrap();
+        let project = store.project_of("parent").expect("a project");
+        let ids: Vec<&str> = project["flows"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap()).collect();
+        assert_eq!(ids[0], "parent", "the flow itself first");
+        let mut rest = ids[1..].to_vec();
+        rest.sort();
+        assert_eq!(rest, ["child", "mac", "mac2"], "each flow it runs once, the one not stored left out");
+        assert!(project["flows"][0]["graph"]["nodes"].is_array() && project["flows"][0]["graph"]["edges"].is_array());
+        assert!(store.project_of("alone").is_none(), "a flow that runs no other is handed as it is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the Agent's own runs are the person's; every other caller's is confined, and a confined run on a server
+    /// whose data folder the child would inherit gets a folder of its own inside it.
+    #[test]
+    fn runs_with_outside_input_are_confined() {
+        let run = |product: &str| RunRecord { caller_product: product.into(), ..serde_json::from_value(serde_json::json!({
+            "runId": "r", "status": "running", "callerProduct": "x", "correlationId": "c", "idempotencyKey": "k",
+            "mode": "async", "reservedAt": "2026-10-18T00:00:00Z", "lineage": { "depth": 0 }
+        })).unwrap() };
+        assert!(!outside_input(&run(AGENT_PRODUCT)));
+        for product in ["oaiy-trigger:aokie", "oaiy-flows", "formlogic", "plugin:x", "oaiy-app", "my-script"] {
+            assert!(outside_input(&run(product)), "{product}");
+        }
+        let env_of = |cmd: &Command| cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect::<Vec<_>>();
+        let mut open = Command::new("node");
+        confine_child(&mut open, false, Some("/srv/oaiy".into()));
+        assert!(env_of(&open).is_empty(), "an unconfined run is left as it was");
+        let mut shut = Command::new("node");
+        confine_child(&mut shut, true, Some("/srv/oaiy".into()));
+        let env = env_of(&shut);
+        assert!(env.contains(&("OAIY_FS_CONFINE".into(), Some("1".into()))));
+        assert!(env.contains(&("OAIY_DATA_DIR".into(), Some(PathBuf::from("/srv/oaiy").join("flow-files").to_string_lossy().into_owned()))));
+        let mut desktop = Command::new("node");
+        confine_child(&mut desktop, true, None);
+        assert_eq!(env_of(&desktop), [("OAIY_FS_CONFINE".to_string(), Some("1".to_string()))]);
     }
 
     #[test]
@@ -2213,6 +2372,7 @@ mod tests {
                 profile_path: None,
                 node: None,
             },
+            false,
             &|| false,
         )
     }

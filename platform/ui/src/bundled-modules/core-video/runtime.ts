@@ -443,6 +443,8 @@ async function waitForComfyUIVideo(
     // Check for abort signal before each poll
     if (ctx.abortSignal?.aborted) {
       ctx.log('info', '[VideoGen] Aborted by user');
+      // (and ComfyUI stops the video: it went on making it after the run had stopped)
+      await ctx.secureFetch(`${endpoint}/interrupt`, { method: 'POST', purpose: 'ComfyUI interrupt', signal: new AbortController().signal }).catch(() => undefined);
       throw new Error('Video generation aborted by user');
     }
 
@@ -583,16 +585,13 @@ async function uploadImageToComfyUI(
   formData.append('type', 'input');
   formData.append('overwrite', 'true');
 
-  // FormData multipart upload — bypasses ctx.fetch because the Tauri policy
-  // gateway only handles string/JSON bodies. We still gate this on the
-  // local-network permission flow by issuing a HEAD probe first; the user
-  // must have already approved this endpoint via that prompt for any other
-  // call in this workflow to have succeeded.
-  await ctx.fetch(`${endpoint}/`, { method: 'HEAD' }).catch(() => undefined);
-  ctx.log('info', `[VideoGen] Using native fetch for multipart upload to ${endpoint}/upload/image`);
-  const uploadResponse = await fetch(`${endpoint}/upload/image`, {
+  // FormData multipart upload, through the policy gateway as every other request (it carries a form's bytes now). It
+  // went around it with the host's own fetch, so the upload passed neither the local-network permission nor, on a
+  // server, the guard on where a run may reach.
+  const uploadResponse = await ctx.secureFetch(`${endpoint}/upload/image`, {
     method: 'POST',
     body: formData,
+    purpose: 'ComfyUI image upload',
   });
 
   if (!uploadResponse.ok) {
@@ -755,6 +754,11 @@ async function generateVideoWan2GP(
 
   while (Date.now() - startTime < maxPollTime) {
     await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    // (a run stopped stops waiting: this polled on for up to an hour after Stop)
+    if (ctx.abortSignal?.aborted) {
+      ctx.onNodeStatus?.(nodeId, 'error');
+      throw new Error('Video generation aborted by user');
+    }
 
     const pollResponse = await ctx.secureFetch(`${baseUrl}/job/${jobId}`, {
       purpose: 'Wan2GP job status poll',
@@ -1392,15 +1396,13 @@ async function appendVideos(
     const concatListPath = `${tempDir}/oaiy_concat_${Date.now()}.txt`;
 
     // Build concat file content - need to handle URLs vs local paths
+    // Each entry quoted as the list's format quotes (a `'` is `'\''`), a URL too: one written as it came let a
+    // quote or a line break in it (a run's input) add directives of its own to the list.
     const videoEntries: string[] = [];
     for (const video of validVideos) {
-      if (video.startsWith('http://') || video.startsWith('https://')) {
-        // For URLs, ffmpeg can use them directly
-        videoEntries.push(`file '${video}'`);
-      } else {
-        // Local file
-        videoEntries.push(`file '${video.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`);
-      }
+      if (/[\u0000-\u001f]/.test(video)) throw new Error(`A video's path or address has a line break or control character in it: ${JSON.stringify(video)}`);
+      const local = video.startsWith('http://') || video.startsWith('https://') ? video : video.replace(/\\/g, '/');
+      videoEntries.push(`file '${local.replace(/'/g, "'\\''")}'`);
     }
 
     await ctx.tauri?.invoke('plugin:oaiy-filesystem|write_file', {

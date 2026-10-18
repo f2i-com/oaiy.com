@@ -17,6 +17,11 @@ const CoreInputCompiler: ModuleCompiler = {
     const { node, inputs, outputVar, skipVarDeclaration, escapeString } = ctx;
     const data = node.data;
     const letOrAssign = skipVarDeclaration ? '' : 'let ';
+    // The value a run was given for this input, by the node's id, then its label as written (null when none): a
+    // file, video, audio or folder input took only its saved value before, so a run given another (through the API,
+    // the CLI or the Agent, which list these as the flow's inputs) used the saved one, in silence.
+    const givenLabel = escapeString(String(data.label || '').trim());
+    const given = `(__inputs["${node.id}"] != null ? __inputs["${node.id}"] : ${givenLabel ? `(__inputs["${givenLabel}"] != null ? __inputs["${givenLabel}"] : null)` : 'null'})`;
 
     let code = `
   // --- Node: ${node.id} (${nodeType}) ---`;
@@ -54,12 +59,17 @@ const CoreInputCompiler: ModuleCompiler = {
         const filePath = String(data.filePath || '');
         const fileType = String(data.fileType || '');
 
+        // The content a run was given for this input (text, or a picture as a data URL or its address), else the
+        // node's own: what it holds, or the file it names, read now.
+        code += `
+  ${letOrAssign}${outputVar} = ${given};
+  if (${outputVar} == null) {`;
+
         if (fileContent) {
           // Content already embedded (e.g., small file drag & drop)
           code += `
-  ${letOrAssign}${outputVar} = ${JSON.stringify(fileContent)};
-  console.log("[InputFile] (${node.id}) embedded content, length:", ${outputVar}.length);
-  workflow_context["${node.id}"] = ${outputVar};`;
+    ${outputVar} = ${JSON.stringify(fileContent)};
+    console.log("[InputFile] (${node.id}) embedded content, length:", ${outputVar}.length);`;
         } else if (filePath) {
           // Only file path available - read file at runtime via FileSystem
           const escapedPath = escapeString(filePath);
@@ -75,36 +85,37 @@ const CoreInputCompiler: ModuleCompiler = {
             };
             const mime = mimeMap[ext] || 'image/png';
             code += `
-  console.log("[InputFile] (${node.id}) reading image file: ${escapedPath}");
-  ${letOrAssign}${outputVar} = await FileSystem.readFile("${escapedPath}", "base64", "${node.id}");
-  console.log("[InputFile] (${node.id}) read result:", ${outputVar} ? "loaded " + ${outputVar}.length + " chars" : "null/empty");
-  if (${outputVar} && !${outputVar}.startsWith("data:")) {
-    ${outputVar} = "data:${mime};base64," + ${outputVar};
-  }
-  workflow_context["${node.id}"] = ${outputVar};`;
+    console.log("[InputFile] (${node.id}) reading image file: ${escapedPath}");
+    ${outputVar} = await FileSystem.readFile("${escapedPath}", "base64", "${node.id}");
+    console.log("[InputFile] (${node.id}) read result:", ${outputVar} ? "loaded " + ${outputVar}.length + " chars" : "null/empty");
+    if (${outputVar} && !${outputVar}.startsWith("data:")) {
+      ${outputVar} = "data:${mime};base64," + ${outputVar};
+    }`;
           } else {
             // Text/other file: read as text
             code += `
-  console.log("[InputFile] (${node.id}) reading text file: ${escapedPath}");
-  ${letOrAssign}${outputVar} = await FileSystem.readFile("${escapedPath}", "text", "${node.id}");
-  console.log("[InputFile] (${node.id}) read result:", ${outputVar} ? "loaded " + ${outputVar}.length + " chars" : "null/empty");
-  workflow_context["${node.id}"] = ${outputVar};`;
+    console.log("[InputFile] (${node.id}) reading text file: ${escapedPath}");
+    ${outputVar} = await FileSystem.readFile("${escapedPath}", "text", "${node.id}");
+    console.log("[InputFile] (${node.id}) read result:", ${outputVar} ? "loaded " + ${outputVar}.length + " chars" : "null/empty");`;
           }
         } else {
           // No content and no path - empty
           code += `
-  ${letOrAssign}${outputVar} = "";
-  console.log("[InputFile] (${node.id}) no file path or content configured");
-  workflow_context["${node.id}"] = ${outputVar};`;
+    ${outputVar} = "";
+    console.log("[InputFile] (${node.id}) no file path or content configured");`;
         }
+        code += `
+  }
+  workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }
 
       case 'input_video': {
         // Video input outputs the file path for processing by downstream nodes
         const videoPath = data.filePath || '';
+        // (a path or address a run was given for it first)
         code += `
-  ${letOrAssign}${outputVar} = ${JSON.stringify(videoPath)};
+  ${letOrAssign}${outputVar} = ${given} ?? ${JSON.stringify(videoPath)};
   workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }
@@ -121,7 +132,8 @@ const CoreInputCompiler: ModuleCompiler = {
         // anything to that handle did nothing at all. Prefer the wire when it is
         // connected and fall back to the configured value.
         const pathInput = inputs.get('path') || inputs.get('default');
-        const pathExpr = pathInput ? `(${pathInput} ?? "${path}")` : `"${path}"`;
+        // (then a folder a run was given for it, then the configured one)
+        const pathExpr = pathInput ? `(${pathInput} ?? ${given} ?? "${path}")` : `(${given} ?? "${path}")`;
 
         code += `
   ${letOrAssign}${outputVar} = await FileSystem.listFolder(${pathExpr}, ${recursive}, "${includePatterns}", ${maxFiles}, "${node.id}");
@@ -136,8 +148,9 @@ const CoreInputCompiler: ModuleCompiler = {
       case 'input_audio': {
         // Audio input outputs the file path for audio mixing
         const audioPath = data.filePath || '';
+        // (a path or address a run was given for it first)
         code += `
-  ${letOrAssign}${outputVar} = ${JSON.stringify(audioPath)};
+  ${letOrAssign}${outputVar} = ${given} ?? ${JSON.stringify(audioPath)};
   workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }

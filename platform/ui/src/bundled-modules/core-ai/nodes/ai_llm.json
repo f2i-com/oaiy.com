@@ -160,11 +160,11 @@
   "properties": [
     {
       "id": "service",
-      "name": "Service Preset",
+      "name": "Service",
       "type": "select",
       "default": "",
       "dynamicOptionsSource": "service:list:ai_llm",
-      "description": "Pick a registered service to auto-fill endpoint + model + headers (manage in Settings → Services). Inline fields below still override the preset's values. Leave blank to use the Provider dropdown defaults."
+      "description": "Which language model or service answers. Pick OAIY's engine, or a service added in OAIY's Services or Settings → Services. Blank: the Provider below."
     },
     {
       "id": "provider",

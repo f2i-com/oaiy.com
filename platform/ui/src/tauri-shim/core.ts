@@ -18,7 +18,7 @@
 
 import { pickFileViaInput, pickFolderViaInput, type OpenDialogOptions } from './dialog';
 import { triggerDownloadFromBlob } from '../lib/download';
-import { getEngineBase } from '../lib/engineEndpoint';
+import { desktopAccess } from '../bundled-modules/core-service/contractRuntime';
 import { mayAskDesktop } from '../lib/desktopDetection';
 import { secretVault } from './secretVault';
 
@@ -55,8 +55,16 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
   const method: string = (r.method ?? 'GET').toUpperCase();
   const headers: Record<string, string> = r.headers ?? {};
   let body: BodyInit | undefined;
-  if (r.body !== undefined && r.body !== null && method !== 'GET' && method !== 'HEAD') {
-    body = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
+  if (method !== 'GET' && method !== 'HEAD') {
+    if (typeof r.body_base64 === 'string') {
+      // (a form or a file, as the runtime encoded it: its bytes)
+      const bin = atob(r.body_base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      body = bytes;
+    } else if (r.body !== undefined && r.body !== null) {
+      body = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
+    }
   }
   // Bound the request so a hung endpoint can't stall the run forever. Honor a
   // per-request timeout, else a generous default (these flows call slow AI
@@ -68,11 +76,16 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
     600_000;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  // (the run's signal: a run stopped stops its request, rather than waiting on it up to the timeout)
+  const stopped = r.signal instanceof AbortSignal ? (r.signal as AbortSignal) : null;
+  if (stopped?.aborted) ctrl.abort();
+  stopped?.addEventListener('abort', () => ctrl.abort(), { once: true });
   try {
     let resp: Response;
     try {
       resp = await fetch(url, { method, headers, body, signal: ctrl.signal });
     } catch (e) {
+      if (stopped?.aborted) throw new Error('Operation aborted by user');
       // Our timeout fired (DOMException 'AbortError') — distinct from a CORS block.
       if (e instanceof DOMException && e.name === 'AbortError') {
         throw new Error(
@@ -538,7 +551,9 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
     // path which already picks Blob vs string. Keep this handler as
     // string-only for back-compat.
     const ct: 'base64' | 'utf-8' = contentType === 'base64' ? 'base64' : 'utf-8';
-    const entry: WebVfsEntry = { kind: 'string', content, contentType: ct };
+    // (base64 given as a data: URL is its base64 part: Image Save writes the picture it has, a data URL, and the
+    // file downloaded was that text, not the picture)
+    const entry: WebVfsEntry = { kind: 'string', content: ct === 'base64' ? content.replace(/^data:[^,]*;base64,/, '') : content, contentType: ct };
     webVfs.set(path, entry);
     if (isAppStatePath(path)) {
       // Internal app-state (e.g. /oaiy/user-macros.json) — persist across
@@ -862,9 +877,9 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
     already_running: false,
     error: 'Local service spawn is not available in the browser build',
   }),
-  // The OAIY Desktop (its API is at the engine address in Settings, read now,
-  // not when the page loaded: http://127.0.0.1:17972 unless the person changed
-  // it) may own this port. Ask it to
+  // The OAIY Desktop (its API is where OAIY's window says it is, else at the
+  // engine address in Settings, read now, not when the page loaded:
+  // http://127.0.0.1:17972 unless the person changed it) may own this port. Ask it to
   // start the matching service if stopped, so picking an OAIY Desktop service in a
   // flow and running it "just works" without a manual Start first (Phase 3.5).
   // Fail-safe: any error, a non-OK response, or an absent companion returns
@@ -881,9 +896,12 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 2000);
-      const r = await fetch(`${getEngineBase()}/api/services/ensure-by-port`, {
+      // (where OAIY's window says the desktop is, with the credential it gave the page: the engine address alone
+      // was 127.0.0.1:17972, another program's port when the desktop runs on one of its own)
+      const desktop = desktopAccess();
+      const r = await fetch(`${desktop.origin}/api/services/ensure-by-port`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(desktop.token ? { Authorization: `Bearer ${desktop.token}` } : {}) },
         body: JSON.stringify({ port }),
         credentials: 'omit',
         signal: ctrl.signal,

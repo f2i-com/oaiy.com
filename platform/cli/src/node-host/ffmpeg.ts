@@ -10,6 +10,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -70,6 +71,42 @@ function resolveArg(a: string): string {
   return a;
 }
 
+/** Whether the `-i` at `at` reads a concat list (`-f concat` among the options before it, after the last input). */
+function concatInput(args: string[], at: number): boolean {
+  for (let j = at - 1; j >= 0 && args[j] !== '-i'; j--) {
+    if (args[j] === '-f' && args[j + 1] === 'concat') return true;
+  }
+  return false;
+}
+
+/**
+ * A concat list's entries, checked as ffmpeg args are under confinement: each `file '…'` is a local file in the
+ * sandbox roots, with no protocol; any other directive than `file`, `duration`, `inpoint` and `outpoint` is
+ * refused. Throws on the first that is not.
+ */
+function checkConcatList(listPath: string): void {
+  let text: string;
+  try {
+    text = fs.readFileSync(listPath, 'utf-8');
+  } catch (e) {
+    throw new Error(`ffmpeg concat list could not be read: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line === 'ffconcat version 1.0') continue;
+    const m = /^(\w+)\s+(.*)$/.exec(line);
+    const directive = m?.[1] ?? line;
+    if (directive !== 'file') {
+      if (['duration', 'inpoint', 'outpoint'].includes(directive)) continue;
+      throw new Error(`ffmpeg concat list directive '${directive}' is not allowed in server mode`);
+    }
+    // `file 'a'\''b'` is a'b: the list's own quoting, undone
+    const quoted = (m?.[2] ?? '').trim();
+    const file = quoted.startsWith("'") ? quoted.replace(/^'|'$/g, '').replace(/'\\''/g, "'") : quoted;
+    resolveArg(file);
+  }
+}
+
 const mimeFor = (fmt: string): string =>
   fmt === 'png' ? 'image/png' : fmt === 'jpg' || fmt === 'jpeg' ? 'image/jpeg' : `image/${fmt}`;
 
@@ -88,11 +125,23 @@ export async function runCommand(args: Record<string, unknown>): Promise<RunComm
   // Defense-in-depth under confinement: restrict ffmpeg to local file/pipe protocols, so even a
   // protocol that slips past resolveArg's scheme check (e.g. `subfile` with comma-options, or a
   // nested/wrapper protocol) can't reach a remote/exotic source. `-protocol_whitelist` is an
-  // input option — emit it before each `-i` — and only if the caller hasn't set one.
-  if (fsConfinementOn() && !resolved.includes('-protocol_whitelist')) {
+  // input option — emit it before each `-i`. A whitelist the caller set is replaced, not kept: the
+  // video append node sets `file,http,https,tcp,tls` for its concat list, and keeping it let a list
+  // entry (a URL from the run's input) be fetched from anywhere. A concat list's own entries are
+  // files ffmpeg opens without them being args, so each is checked as an arg is.
+  if (fsConfinementOn()) {
     const guarded: string[] = [];
-    for (const a of resolved) {
-      if (a === '-i') guarded.push('-protocol_whitelist', 'file,pipe');
+    for (let i = 0; i < resolved.length; i++) {
+      const a = resolved[i];
+      if (a === '-protocol_whitelist') {
+        i++;
+        continue;
+      }
+      if (a === '-i') {
+        guarded.push('-protocol_whitelist', 'file,pipe');
+        const list = resolved[i + 1];
+        if (list !== undefined && concatInput(resolved, i)) checkConcatList(list);
+      }
       guarded.push(a);
     }
     resolved = guarded;
@@ -203,13 +252,22 @@ export async function extractVideoFrames(
   args.push('-frames:v', String(Math.min(Math.max(1, requested), maxFramesCap)));
   args.push('-y', path.join(outDir, `frame-%05d.${fmt}`));
 
-  await pexecFile(FFMPEG, args, { maxBuffer: MAX_BUF }).catch(() => {
-    /* missing/garbled input → just yield no frames */
+  // A failure is said, not answered as no frames: a missing ffmpeg, or a file it could not read, gave an empty list,
+  // and the steps after it ran on nothing as if the video had no frames.
+  let failed: string | null = null;
+  await pexecFile(FFMPEG, args, { maxBuffer: MAX_BUF }).catch((e: NodeJS.ErrnoException & { stderr?: Buffer | string }) => {
+    failed = e.code === 'ENOENT'
+      ? `ffmpeg is not installed here (looked for '${FFMPEG}'; set OAIY_FFMPEG to it)`
+      : `ffmpeg could not read the video: ${(e.stderr?.toString() || e.message || String(e)).trim().slice(0, 500)}`;
   });
 
   const files = (await fsp.readdir(outDir).catch(() => []))
     .filter((f) => f.endsWith(`.${fmt}`))
     .sort();
+  if (failed && files.length === 0) {
+    await fsp.rm(outDir, { recursive: true, force: true }).catch(() => {});
+    throw new Error(failed);
+  }
   const mime = mimeFor(fmt);
   const startT = Number(options.startTime ?? 0);
   const frames: FrameInfo[] = [];

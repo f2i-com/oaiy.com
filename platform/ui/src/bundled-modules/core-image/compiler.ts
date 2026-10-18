@@ -176,7 +176,8 @@ const CoreImageCompiler: ModuleCompiler = {
             allowBypass: true, // Optional input
           }];
         }
-        const comfySeedMode = String(data.comfySeedMode || 'random');
+        // (escaped: it is written into a string of the script)
+        const comfySeedMode = escapeString(String(data.comfySeedMode || 'random'));
         const comfyFixedSeed = data.comfyFixedSeed != null ? Number(data.comfyFixedSeed) : null;
 
         // Get image inputs from connected handles

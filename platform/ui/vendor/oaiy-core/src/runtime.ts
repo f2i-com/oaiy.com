@@ -1240,21 +1240,39 @@ export class OAIYRuntime {
       for (const [k, v] of Object.entries(h)) headers[k] = String(v);
     }
 
-    // Normalise body to a string (sufficient for the Tauri http_request
-    // command). Binary/multipart bodies aren't supported here — those
-    // workflows should go through dedicated Tauri commands.
+    // The body: text as it is; a form (FormData), a file (Blob) or bytes as the bytes a fetch would send, with the
+    // multipart boundary's content type when none is set, carried as base64; search params as a form. All but text
+    // were sent as `JSON.stringify(body)` before: a FormData as "{}", bytes as {"0":137,…}, so a picture uploaded to
+    // ComfyUI (and a recording to a speech service) never arrived.
     let body: string | undefined;
-    if (options?.body !== undefined && options.body !== null) {
-      if (typeof options.body === 'string') {
-        body = options.body;
-      } else if (typeof Blob !== 'undefined' && options.body instanceof Blob) {
-        body = await options.body.text();
+    let bodyBase64: string | undefined;
+    const raw = options?.body;
+    const hasContentType = Object.keys(headers).some((k) => k.toLowerCase() === 'content-type');
+    if (raw !== undefined && raw !== null) {
+      if (typeof raw === 'string') {
+        body = raw;
+      } else if (typeof URLSearchParams !== 'undefined' && raw instanceof URLSearchParams) {
+        body = raw.toString();
+        if (!hasContentType) headers['content-type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+      } else if (
+        (typeof FormData !== 'undefined' && raw instanceof FormData) ||
+        (typeof Blob !== 'undefined' && raw instanceof Blob) ||
+        raw instanceof ArrayBuffer ||
+        ArrayBuffer.isView(raw)
+      ) {
+        const encoded = new Response(raw as BodyInit);
+        const bytes = new Uint8Array(await encoded.arrayBuffer());
+        const type = encoded.headers.get('content-type');
+        if (type && !hasContentType) headers['content-type'] = type;
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        bodyBase64 = btoa(bin);
       } else {
-        try { body = JSON.stringify(options.body); } catch { body = String(options.body); }
+        try { body = JSON.stringify(raw); } catch { body = String(raw); }
       }
     }
 
-    const result = await this.performHttpRequest(url, method, headers, body);
+    const result = await this.performHttpRequest(url, method, headers, body, { bodyBase64, signal: options?.signal ?? undefined });
 
     // Build a minimal Response-shaped object. Headers are case-insensitive,
     // so we normalise to lower-case keys before rebuilding.
@@ -1341,7 +1359,9 @@ export class OAIYRuntime {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string
+    body?: string,
+    // (a body of bytes, as base64; and the caller's signal, which stops the request when the run is stopped)
+    extra: { bodyBase64?: string; signal?: AbortSignal } = {}
   ): Promise<{ status: number; headers: Record<string, string>; body: string; bodyIsBase64?: boolean }> {
     const isLocalNetwork = this.isLocalNetworkUrl(url);
 
@@ -1373,9 +1393,12 @@ export class OAIYRuntime {
           method,
           headers,
           body: body || null,
+          ...(extra.bodyBase64 !== undefined ? { body_base64: extra.bodyBase64 } : {}),
           follow_redirects: true,
           max_redirects: 10,
           allow_private_networks: isLocalNetwork,
+          // (the run's own signal, else the caller's: a request is stopped with its run)
+          ...((extra.signal ?? this.abortSignal) ? { signal: extra.signal ?? this.abortSignal } : {}),
         },
       })) as {
         status: number;
@@ -1414,12 +1437,17 @@ export class OAIYRuntime {
       headers,
     };
 
-    if (body) {
+    if (extra.bodyBase64 !== undefined) {
+      const bin = atob(extra.bodyBase64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      fetchOptions.body = bytes;
+    } else if (body) {
       fetchOptions.body = body;
     }
 
-    if (this.abortSignal) {
-      fetchOptions.signal = this.abortSignal;
+    if (extra.signal ?? this.abortSignal) {
+      fetchOptions.signal = extra.signal ?? this.abortSignal ?? undefined;
     }
 
     const response = await fetch(url, fetchOptions);
@@ -2029,6 +2057,7 @@ export class OAIYRuntime {
         info: (...args: unknown[]) => this.log('info', `[VM] ${formatLogArgs(args)}`),
       };
 
+      const finishParts: string[] = [];
       const host = {
         call: (kind: string, args: unknown[], callback: (res: unknown) => void) => {
           if (isDone) return;
@@ -2038,8 +2067,13 @@ export class OAIYRuntime {
             return;
           }
 
+          if (kind === '__system.finish_part') {
+            finishParts.push(String(args[0] ?? ''));
+            return;
+          }
           if (kind === '__system.finish') {
-            const raw = args[0];
+            // (an answer too large for one call came in parts before this, its last)
+            const raw = finishParts.length ? finishParts.join('') + String(args[0] ?? '') : args[0];
             let value: unknown = null;
             try { value = typeof raw === 'string' && raw ? JSON.parse(raw) : raw; } catch { value = raw; }
             finish(value);
@@ -2456,7 +2490,8 @@ ${WORKFLOW_TRAMPOLINE}`;
       return result;
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
-      const isAbort = error.includes('__ABORT__') || error.includes('aborted');
+      // (a stop is the run's signal having fired, not an error that says "aborted")
+      const isAbort = this.abortSignal?.aborted === true;
       if (!isAbort) {
         // (an error wrapped on its way up says "Error: " once for each wrapping)
         this.log('error', `Workflow Error: ${error.replace(/^(Error:\s*)+/, '')}`);

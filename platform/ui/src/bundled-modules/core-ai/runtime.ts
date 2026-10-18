@@ -6,9 +6,8 @@
  */
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
-import { getEngineBase } from '../../lib/engineEndpoint';
 import { mayAskDesktop } from '../../lib/desktopDetection';
-import { absoluteUrl, desktopFileBytes } from '../core-service/contractRuntime';
+import { absoluteUrl, desktopAccess, desktopCredential, desktopFileBytes } from '../core-service/contractRuntime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createAIMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -31,11 +30,14 @@ const MAX_ENDPOINT_LENGTH = 2048;
  *
  * Returned ONLY when the endpoint is the very server the token belongs to,
  * compared by origin — a token that travelled to a third-party AI endpoint
- * would be handing this machine's admin credential to a stranger. Absent in a
- * browser (no `process`), where the webview's own origin is what is trusted.
+ * would be handing this machine's admin credential to a stranger. In a page
+ * (no `process`), the credential the page holds for its desktop, for that
+ * desktop's engine routes only (contractRuntime's `desktopCredential`).
  */
 function localServerBearer(endpoint: string): string | null {
-  if (typeof process === 'undefined' || !process.env) return null;
+  // In a page: the desktop's own credential for its own engine routes, as the Service nodes send it. A page whose
+  // origin the desktop does not trust (a tab connected to it, a server that trusts tokens alone) was answered 403.
+  if (typeof process === 'undefined' || !process.env) return desktopCredential(endpoint, desktopAccess()) ?? null;
   const token = process.env.OAIY_SERVER_TOKEN;
   const base = process.env.OAIY_SERVER_URL;
   if (!token || !base) return null;
@@ -955,9 +957,10 @@ async function chat(
     if (portMatch) {
       const port = parseInt(portMatch[1], 10);
       try {
-        // OAIY Desktop's API is at the engine address in Settings
-        // (lib/engineEndpoint.ts; http://127.0.0.1:17972 unless the person
-        // changed it), read now so a change is followed without a reload.
+        // OAIY Desktop's API is where OAIY's window says it is, else at the
+        // engine address in Settings (desktopAccess; http://127.0.0.1:17972
+        // unless the person changed it), read now so a change is followed
+        // without a reload.
         // Plain fetch is fine — the companion sets permissive CORS.
         // Hard 2s cap: ensure-by-port returns as soon as the spawn kicks
         // off, so a healthy companion answers in <100ms. The timeout keeps
@@ -966,9 +969,11 @@ async function chat(
         // through to the direct request just like OAIY Desktop-absent case.
         const ctrl = new AbortController();
         const abortTimer = setTimeout(() => ctrl.abort(), 2000);
-        const r = await fetch(`${getEngineBase()}/api/services/ensure-by-port`, {
+        // (where OAIY's window says the desktop is, with its credential: desktopAccess)
+        const desktop = desktopAccess();
+        const r = await fetch(`${desktop.origin}/api/services/ensure-by-port`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...(desktop.token ? { Authorization: `Bearer ${desktop.token}` } : {}) },
           body: JSON.stringify({ port }),
           credentials: 'omit',
           signal: ctrl.signal,
@@ -1467,7 +1472,8 @@ async function chat(
     const errMsg = error instanceof Error ? error.message : 'Unknown error';
 
     // Check for abort
-    if (error instanceof Error && (error.name === 'AbortError' || errMsg.includes('aborted'))) {
+    // (stopped when the run was: an error that merely says "aborted", a request's own timeout, fails the step)
+    if (ctx.abortSignal?.aborted) {
       return '__ABORT__';
     }
 
@@ -1734,7 +1740,8 @@ async function request(
     ctx.onNodeStatus?.(nodeId, 'error');
     const errMsg = error instanceof Error ? error.message : 'Unknown error';
 
-    if (error instanceof Error && (error.name === 'AbortError' || errMsg.includes('aborted'))) {
+    // (stopped when the run was: an error that merely says "aborted", a request's own timeout, fails the step)
+    if (ctx.abortSignal?.aborted) {
       return '__ABORT__';
     }
 

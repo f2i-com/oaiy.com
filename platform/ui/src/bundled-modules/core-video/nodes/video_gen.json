@@ -90,12 +90,12 @@
     "properties": [
         {
             "id": "service",
-            "name": "Service Preset",
+            "name": "Service",
             "type": "select",
             "default": "",
             "dynamicOptionsSource": "service:list:video_gen",
             "options": [{ "value": "engine:video", "label": "OAIY engine · default model" }],
-            "description": "Pick a registered video-gen service (manage in Settings → Services) to auto-fill endpoint. Fields below still override the preset. Leave blank to use the inline Backend dropdown below."
+            "description": "Which model or service makes the video. Pick one of OAIY's engine's models, or a service added in OAIY's Services or Settings → Services. Blank: the Backend below."
         },
         {
             "id": "apiFormat",
@@ -110,6 +110,7 @@
         },
         {
             "id": "wan2gpModel",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Wan2GP Model",
             "type": "select",
             "default": "ltx2_22B_distilled",
@@ -129,6 +130,7 @@
         },
         {
             "id": "wan2gpDuration",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Duration (seconds)",
             "type": "number",
             "default": 5,
@@ -139,6 +141,7 @@
         },
         {
             "id": "wan2gpResolution",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Resolution",
             "type": "select",
             "default": "832x480",
@@ -182,6 +185,7 @@
         },
         {
             "id": "wan2gpSteps",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Steps",
             "type": "number",
             "default": 8,
@@ -250,6 +254,7 @@
         },
         {
             "id": "comfyFrameCount",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Frame Count",
             "type": "number",
             "default": null,
@@ -258,6 +263,7 @@
         },
         {
             "id": "comfyWidth",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Width",
             "type": "number",
             "default": null,
@@ -266,6 +272,7 @@
         },
         {
             "id": "comfyHeight",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Height",
             "type": "number",
             "default": null,
@@ -274,6 +281,7 @@
         },
         {
             "id": "comfyFrameRate",
+            "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Frame Rate",
             "type": "number",
             "default": null,

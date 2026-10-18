@@ -108,6 +108,11 @@ program
     '--profile <file>',
     'a script profile (protocol/v1/script-profile.schema.json): its preamble is placed before every flow script and its instructionSteps is the budget (not with --instruction-budget)',
   )
+  .option(
+    '--grant <permission>',
+    "a permission a .oaiy package's flow may use (network, network:local, filesystem, filesystem:read, code:execute, …; repeatable). A package is given none otherwise",
+    collect,
+  )
   .option('--quiet', 'suppress progress logs on stderr', false)
   .action(async (flowPath: string, opts: Record<string, any>) => {
     // The profile is loaded, checked and reconciled with --instruction-budget
@@ -116,8 +121,11 @@ program
     const { loadScriptProfile, resolveInstructionBudget } = await import('./zipp/profile');
     const profile = opts.profile ? loadScriptProfile(opts.profile) : undefined;
     resolveInstructionBudget(profile, opts.instructionBudget); // refuses the pair; `runFlow` resolves the figure
+    const { graph, name, flows, package: pkg } = loadFlowFile(flowPath);
+    // A package is anyone's file: confined as `oaiy worker`'s runs are (its absolute paths in the CLI's own folders,
+    // on this computer and its network nothing but OAIY_SERVER_URL), read before the engine loads.
+    if (pkg && process.env.OAIY_FS_ALLOW_ABSOLUTE !== '1') process.env.OAIY_FS_CONFINE = '1';
     const { runFlow } = await import('./engine');
-    const { graph, name, flows } = loadFlowFile(flowPath);
     const inputs = parseInputs(opts.input ?? [], opts.inputs);
     const constants = gatherConstants(opts.constant ?? [], opts.constants);
     // (an input the flow has no node for is not used: said, rather than the run using its default in silence)
@@ -141,6 +149,8 @@ program
       // headlessly — the compiler resolves those targets by id out of this list.
       availableFlows: flows,
       flowName: name,
+      flowId: name,
+      packageContext: pkg ? { packageId: pkg.id, grantedPermissions: opts.grant ?? [] } : undefined,
       timeoutMs: opts.timeout ? opts.timeout * 1000 : undefined,
       instructionBudgetSteps: opts.instructionBudget,
       profile,

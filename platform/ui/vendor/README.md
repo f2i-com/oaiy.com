@@ -62,6 +62,84 @@ From the flow-editor polish (2026-10-18), likewise:
   handle is keyed by its kind and id (`target:image`), not its id alone: Image
   View takes in and gives out `image`, two siblings with one key.
 
+From the node-by-node polish (2026-10-18, second pass), likewise:
+
+- `oaiy-ui-components/src/components/CollapsibleNodeWrapper.tsx`:
+  - a card shows its run state from the node's own `_status` when it is not
+    given one (cards made from a definition, Output, Image View and the input
+    cards never showed which step ran or failed);
+  - its icon is its kind's, from a resolver the host registers (the palette's
+    set), unless the card says the icon is its own (`ownIcon`: a service's
+    emoji);
+  - a port's name is its definition's ("Prompt", not a card's "prompt" or
+    "desc"; a handle the definition lacks keeps its label, and `ownLabel` keeps
+    a name the person gave: a macro's or a template's variables); its dot is
+    coloured by its kind of value (`portTypeClass`), and its name is in the
+    card's own ink (`labelColor` is no longer shown);
+  - the kind's word over the name is the 700 ink on the light header (the 600
+    was about 3:1).
+- `oaiy-ui-components/src/components/portTypes.ts` (new): `portTypeClass` and
+  `typeWords` (the colours are `.oaiy-port.port-*` in `ui/src/index.css`).
+- `oaiy-ui-components/src/registry/nodeIcons.ts` (new):
+  `registerNodeIconResolver` / `resolveNodeIcon` (`ui/src/bundled-web-modules.ts`
+  registers `lib/nodeIcons.tsx`).
+- `oaiy-ui-components/src/hooks/useNodeDefinition.ts` (new): `definitionOf` /
+  `useNodeDefinition`, GenericNode's lookup for any card.
+- `oaiy-ui-components/src/index.ts`: exports the above.
+- `oaiy-ui-components/src/nodes/GenericNode.tsx`: the compact card names an
+  engine kind's default ("the default picture model", not "image") and OAIY
+  Voice; "Advanced options" in sentence case.
+- `oaiy-ui-components/src/nodes/fields/SelectField.tsx`: the empty choice says
+  "Choose…".
+
+From running every way of running a flow end to end (2026-10-18; regression
+cases in `cli/test/flow-nodes.ts`), likewise:
+
+- `oaiy-core/src/runtime/BuiltinModules.ts`: `Utility.*` and `Agent.*` take
+  their arguments spread (`Agent.set(key, value)`), as host.call passes them;
+  they read `args[0]` of one array, so the Memory node and the loop's history
+  stored the key's second letter under its first.
+- `oaiy-core/src/queue/JobManager.ts`: a job's `error` is the message without
+  the `Error: ` prefixes it collects on its way up (a desktop run said
+  "Error: Error: …"); a job is `aborted` when its own signal fired, not when
+  its error's text says "aborted" (a request's own timeout).
+- `oaiy-core/src/compiler.ts`:
+  - `getSourceVar`: a macro node's output handle is that output's variable
+    (`node_<id>_out_<output>`), not the macro's whole answer.
+  - `branchTest` / `gateOnBranch`: a node wired straight to a condition's
+    `true`/`false` is on that branch whatever else is wired to it; a node after
+    branch steps runs when one of its inputs ran, or when one always runs (an
+    optional step's merge). In a loop, an iteration whose branch was not taken
+    resets the node's values (it kept the last iteration's). Every declaration
+    inside a gate becomes an assignment (`let node_X_out` was matched inside
+    `let node_X_out_result`).
+  - `orderWithLoops`: each loop is generated as one step (start, body, end)
+    in dependency order, so two loops whose nodes interleave both run.
+  - `findInnerLoopNodes`: a loop's body is what follows its start and not its
+    end, side branches included (they ran before the loop, or once after it).
+  - `generateLoopCode`: For Each over null runs no iteration and over a
+    non-array one (it threw, or ran none); a count wired in is that count, 0
+    included, capped at `MAX_WORKFLOW_LOOP_ITERATIONS`; a loop on an untaken
+    branch does not run and its results are null.
+  - `workflow_context` starts empty (only `__macro_inputs__` carried in): it
+    was the inputs object, so an input named `__output__` set the answer.
+- `oaiy-core/src/compiler/utils.ts`: `escapeString` escapes U+2028 and U+2029
+  (they end a `//` comment a compiler writes a setting into).
+- `oaiy-core/src/value-utils.ts`: `extractDeepValue` copies values whole: it
+  replaced an object of one or two keys named like `text`, `result` or `url` by
+  that key's value (`{ text, lang }` came back as the text).
+- `oaiy-core/src/runtime.ts`: `policyFetch` sends a FormData, Blob or bytes as
+  their bytes (`body_base64` to `http_request`) and search params as a form, and
+  passes the caller's signal (`performHttpRequest`'s `extra`); "Workflow Error"
+  is logged unless the run's signal fired; `__system.finish_part` collects an
+  answer sent in parts.
+- `oaiy-core/src/workflow-trampoline.ts`: an `await` of a promise or a plain
+  value resumes with that value; an answer past 1 MiB code units goes in
+  `__system.finish_part` calls before `__system.finish` (one call past the
+  4 MiB host.call limit failed the run as it ended).
+- `oaiy-core/src/zipp-executor.ts` and `oaiy-core/src/untrusted-executor.ts`:
+  `__system.finish_part`, as above.
+
 ## Re-syncing from upstream (optional)
 
 If you ever want to pull newer upstream source, re-copy `src/` from the

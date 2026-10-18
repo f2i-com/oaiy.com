@@ -14,6 +14,7 @@ import { createEngine, type CreateEngineOptions } from '../../ui/src/engine/crea
 import type { Flow, JobManager, WorkflowGraph } from 'oaiy-core';
 import type { WorkflowInputs } from 'oaiy-core';
 import { loadNodeBundledModules } from './generated/bundled-modules';
+import { localNetworkAllowed } from './node-host/context';
 import { closeAll as closeBrowserSessions } from './node-host/browser';
 import { loadZippArtifact, EngineUnavailableError } from './zipp/artifact';
 import { createZippThreadExecutor } from './zipp/thread-executor';
@@ -88,6 +89,16 @@ export interface RunOptions {
   /** Auto-allow local-network (private IP) requests. Default true for headless. */
   allowLocalNetwork?: boolean;
   flowName?: string;
+  /**
+   * The flow's id: what its database, its memory and its runs are kept under. Every run was `cli-run` before, so
+   * two flows the Desktop ran shared one database. The flow's name when not given.
+   */
+  flowId?: string;
+  /**
+   * A package's flow (`run package.oaiy`): runs as the browser runs an imported package, with only these
+   * permissions, untrusted. Absent for the person's own flow.
+   */
+  packageContext?: { packageId: string; grantedPermissions: string[] };
   /**
    * Every flow available for subflow/macro resolution, including the entry flow.
    * The compiler looks its subflow and macro targets up by id in this list, so
@@ -173,8 +184,8 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
       // never passed, so those nodes could not execute headlessly at all.
       availableFlows: opts.availableFlows,
       projectConstants: opts.constants,
-      networkPermissionHandler: async () => ({
-        allowed: opts.allowLocalNetwork !== false,
+      networkPermissionHandler: async (request) => ({
+        allowed: opts.allowLocalNetwork !== false && localNetworkAllowed(request.hostPort),
         remember: false,
       }),
       // The profile's figure when it has one, else the caller's; BOTH throws
@@ -205,7 +216,17 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
 
   try {
     const flowName = opts.flowName ?? 'cli-run';
-    const jobId = engine.submit('cli-run', flowName, graph, opts.inputs as WorkflowInputs | undefined);
+    const jobId = engine.submit(
+      opts.flowId || opts.flowName || 'cli-run',
+      flowName,
+      graph,
+      opts.inputs as WorkflowInputs | undefined,
+      1,
+      false,
+      opts.packageContext
+        ? { packageId: opts.packageContext.packageId, grantedPermissions: opts.packageContext.grantedPermissions, packageTrustLevel: 'untrusted' }
+        : undefined,
+    );
     let timedOut = false;
 
     await new Promise<void>((resolve) => {
@@ -222,6 +243,7 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
         if (job && TERMINAL.has(job.status)) finish();
       };
       const unsub = engine.onStateChange(() => check());
+      // (no longer than Node's timer can wait: one past it fires at once, and the run "timed out" as it began)
       const timer = setTimeout(() => {
         timedOut = true;
         try {
@@ -230,7 +252,7 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
           /* ignore */
         }
         finish();
-      }, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+      }, Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, 2_147_483_647));
       check(); // in case the job already finished synchronously
     });
 

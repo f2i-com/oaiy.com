@@ -20,6 +20,11 @@ export interface LoadedFlow {
    * `{ nodes, edges }` shapes, which cannot contain a resolvable reference.
    */
   flows?: Flow[];
+  /**
+   * Set for a `.oaiy` package: a distributable file, which may be anyone's. Its flow runs as an untrusted package
+   * (only the permissions granted to it on the command line, confined), never as the person's own flow.
+   */
+  package?: { id: string };
 }
 
 /** Accept the common on-disk shapes a saved flow can take. */
@@ -72,6 +77,7 @@ function loadPackage(file: string, fallbackName: string): LoadedFlow {
   const manifestRaw = get('manifest.json');
   if (!manifestRaw) throw new Error('.oaiy: no manifest.json in package');
   const manifest = parseJson(strFromU8(manifestRaw), `${file}: manifest.json`) as {
+    id?: string;
     name?: string;
     entryFlow?: string;
     nodes?: unknown[];
@@ -131,7 +137,8 @@ function loadPackage(file: string, fallbackName: string): LoadedFlow {
   // make (files under the configured roots, HTTP, the media tools) — so a
   // package is trusted with those, not with the process. Custom-node packages
   // are refused above: the CLI does not compile them.
-  return { graph, name: manifest.name || fallbackName, flows: flows.length > 0 ? flows : undefined };
+  const id = typeof manifest.id === 'string' && manifest.id ? manifest.id : manifest.name || fallbackName;
+  return { graph, name: manifest.name || fallbackName, flows: flows.length > 0 ? flows : undefined, package: { id } };
 }
 
 const INPUT_NODE_TYPES = new Set([

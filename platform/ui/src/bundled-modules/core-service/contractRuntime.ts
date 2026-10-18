@@ -92,7 +92,7 @@ export function absoluteUrl(url: string, desktop: Desktop = desktopAccess()): st
 }
 
 /** The desktop's credential, when `url` is one of its engine routes. */
-function desktopCredential(url: string, desktop: Desktop): string | null | undefined {
+export function desktopCredential(url: string, desktop: Desktop): string | null | undefined {
   let u: URL;
   try {
     u = new URL(url);
@@ -194,7 +194,8 @@ async function resolveAtRun(ctx: RuntimeContext, id: string): Promise<CustomServ
     throw new Error(
       worker && remoteModelOf(id)
         ? `${text} is not available${why}: that computer is not paired any more, or does not have the model now (OAIY → Networking). Pick another model.`
-        : `${text.charAt(0).toUpperCase()}${text.slice(1)} is not available${why}: its model is not installed in OAIY's Engines, or the engines are not running. ` +
+        // (a phrase starts the sentence with a capital, a model's id as it is written: "Moss-image-…" was no model's name)
+        : `${text.startsWith('the ') ? `T${text.slice(1)}` : text} is not available${why}: its model is not installed in OAIY's Engines, or the engines are not running. ` +
             'Pick another service, or add the model in Engines.',
     );
   }

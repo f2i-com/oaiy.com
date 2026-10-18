@@ -302,8 +302,10 @@ ${loopDebugInfo.map(d => `// ${d}`).join('\n')}
 // Input values (always defined, may be empty) - must be defined before workflow_context
 let __inputs = ${this.escapeObjectLiteral(inputs || {})};
 
-// Initialize workflow_context with __inputs to support macro inputs (__macro_inputs__)
-let workflow_context = __inputs;
+// The steps' values, by node id. Not the inputs object itself: a run given an input named \`__output__\` (or a node's
+// id) set the flow's answer, or that node's value, before any step ran. Only a macro's inputs are carried in.
+let workflow_context = {};
+if (__inputs["__macro_inputs__"] !== undefined) workflow_context["__macro_inputs__"] = __inputs["__macro_inputs__"];
 ${this.debugEnabled ? `console.log("[Workflow] Starting execution");
 console.log("[Workflow] __inputs = " + JSON.stringify(__inputs).substring(0, 500));
 console.log("[Workflow] __macro_inputs__ = " + JSON.stringify(__inputs["__macro_inputs__"] || "NOT SET").substring(0, 500));
@@ -313,35 +315,17 @@ console.log("[Workflow] Loops found: ${loopInfo.size}");` : ''}
  // let undefined = null;
 `;
 
-    // Generate code for each node in order, handling loops
-    let i = 0;
-    while (i < sortedNodes.length) {
-      const node = sortedNodes[i];
-
-      // Check if this is a loop start
-      const loop = loopInfo.get(node.id);
-      if (loop) {
-        // Before generating the loop, find and generate any nodes that are
-        // between loop_start and loop_end in sorted order but NOT in innerNodes
-        // These are external inputs to the loop that need to be evaluated first
-        const innerNodeIds = new Set(loop.innerNodes.map(n => n.id));
-        for (let j = i + 1; j < loop.endIndex; j++) {
-          const betweenNode = sortedNodes[j];
-          if (!innerNodeIds.has(betweenNode.id) && betweenNode.type !== 'loop_end') {
-            if (this.debugEnabled) console.log(`[Compiler] Generating external input node before loop: ${betweenNode.id} (${betweenNode.type})`);
-            script += this.generateNodeCode(betweenNode, validGraph, inputs);
-          }
-        }
-        // Generate loop structure
-        script += this.generateLoopCode(loop, sortedNodes, validGraph, i);
-        // Skip to after the loop end
-        i = loop.endIndex + 1;
-      } else if (node.type !== 'loop_end') {
-        // Normal node (skip loop_end as they're handled with loop_start)
-        script += this.generateNodeCode(node, validGraph, inputs);
-        i++;
-      } else {
-        i++;
+    // Generate code for each node in order, each loop as one step: its start, body and end together, after
+    // everything it reads and before everything that reads it (`orderWithLoops`). This went by the nodes' sorted
+    // order before, from a loop's start to its end, so a second loop whose start sorted inside the first's range
+    // was never generated ("node_S2_out is not defined"), and a node fed by a loop's body that did not lead to its
+    // end was generated before the loop (a binding read before it was made) or once after it.
+    for (const step of this.orderWithLoops(sortedNodes, loopInfo, validGraph)) {
+      if ('loop' in step) {
+        script += this.generateLoopCode(step.loop, sortedNodes, validGraph, step.loop.startIndex);
+      } else if (step.node.type !== 'loop_end') {
+        // (a loop_end is generated with its loop_start)
+        script += this.generateNodeCode(step.node, validGraph, inputs);
       }
     }
 
@@ -366,6 +350,54 @@ workflow_context;
     } finally {
       endTimer();
     }
+  }
+
+  /**
+   * The order steps are generated in: each node not in a loop, and each loop as one step (its start, body and end),
+   * sorted so a step comes after everything it reads. Ties keep the nodes' own sorted order.
+   */
+  private orderWithLoops(
+    sortedNodes: GraphNode[],
+    loopInfo: Map<string, { startNode: GraphNode; endNode: GraphNode; startIndex: number; endIndex: number; innerNodes: GraphNode[] }>,
+    graph: WorkflowGraph
+  ): Array<{ node: GraphNode } | { loop: { startNode: GraphNode; endNode: GraphNode; startIndex: number; endIndex: number; innerNodes: GraphNode[] } }> {
+    // The step each node belongs to: its loop's start id, or its own id.
+    const stepOf = new Map<string, string>();
+    for (const n of sortedNodes) stepOf.set(n.id, n.id);
+    for (const [startId, loop] of loopInfo) {
+      for (const n of [loop.startNode, loop.endNode, ...loop.innerNodes]) {
+        // (a node in two loops is a nested loop, which generateLoopCode refuses by name)
+        if (stepOf.get(n.id) === n.id) stepOf.set(n.id, startId);
+      }
+    }
+    const rank = new Map<string, number>();
+    sortedNodes.forEach((n, i) => {
+      const step = stepOf.get(n.id)!;
+      if (!rank.has(step)) rank.set(step, i);
+    });
+    const steps = [...rank.keys()].sort((a, b) => rank.get(a)! - rank.get(b)!);
+    const after = new Map<string, Set<string>>(steps.map(id => [id, new Set<string>()]));
+    for (const e of graph.edges) {
+      const from = stepOf.get(e.source);
+      const to = stepOf.get(e.target);
+      if (from && to && from !== to) after.get(to)!.add(from);
+    }
+    const order: string[] = [];
+    const placed = new Set<string>();
+    while (order.length < steps.length) {
+      const next = steps.find(id => !placed.has(id) && [...after.get(id)!].every(dep => placed.has(dep)));
+      if (!next) {
+        const stuck = steps.filter(id => !placed.has(id));
+        throw new Error(
+          `The flow's loops cannot be ordered: ${stuck.map(id => `'${id}'`).join(', ')} each wait on another ` +
+            `(a step that reads a loop's body also feeds that loop). Feed the loop from before it, or read its results after its end.`,
+        );
+      }
+      placed.add(next);
+      order.push(next);
+    }
+    const byId = new Map(sortedNodes.map(n => [n.id, n]));
+    return order.map(id => (loopInfo.has(id) ? { loop: loopInfo.get(id)! } : { node: byId.get(id)! }));
   }
 
   /**
@@ -433,7 +465,7 @@ workflow_context;
   }
 
   /**
-   * Find all nodes that are inside a loop (reachable from loop_start and can reach loop_end)
+   * Find all nodes that are inside a loop (reachable from loop_start, and not after loop_end)
    */
   private findInnerLoopNodes(startId: string, endId: string, graph: WorkflowGraph): Set<string> {
     // Find all nodes reachable from loop_start (forward)
@@ -455,6 +487,8 @@ workflow_context;
         break;
       }
 
+      // (not past the loop's end: what follows it is after the loop)
+      if (current === endId) continue;
       for (const edge of graph.edges) {
         if (edge.source === current && !forwardReachable.has(edge.target)) {
           forwardQueue.push(edge.target);
@@ -462,34 +496,27 @@ workflow_context;
       }
     }
 
-    // Find all nodes that can reach loop_end (backward)
-    const backwardReachable = new Set<string>();
-    const backwardQueue = [endId];
+    // What follows the loop's end, read after the loop (its results, and the last value of each step in it)
+    const afterEnd = new Set<string>();
+    const afterQueue = [endId];
     iterations = 0;
-
-    while (backwardQueue.length > 0 && iterations < MAX_GRAPH_ITERATIONS) {
+    while (afterQueue.length > 0 && iterations < MAX_GRAPH_ITERATIONS) {
       iterations++;
-      const current = backwardQueue.shift();
-      if (current === undefined || backwardReachable.has(current)) continue;
-      backwardReachable.add(current);
-
-      // Additional guard: if we've found more nodes than exist, something is wrong
-      if (backwardReachable.size > maxNodes) {
-        console.warn(`[Compiler] findInnerLoopNodes backward pass found more nodes than exist in graph`);
-        break;
-      }
-
+      const current = afterQueue.shift();
+      if (current === undefined || afterEnd.has(current)) continue;
+      afterEnd.add(current);
       for (const edge of graph.edges) {
-        if (edge.target === current && !backwardReachable.has(edge.source)) {
-          backwardQueue.push(edge.source);
-        }
+        if (edge.source === current && !afterEnd.has(edge.target)) afterQueue.push(edge.target);
       }
     }
 
-    // Inner nodes are those reachable from start AND can reach end (excluding start and end themselves)
+    // Inner nodes are those reachable from start that do not follow the end (excluding start and end themselves):
+    // those that reach the end, and a side branch of the body that does not, which runs each iteration too. Only
+    // those reaching the end were taken before, so a side branch ran before the loop (reading a value not made yet)
+    // or once after it, on the last iteration's value.
     const innerNodes = new Set<string>();
     for (const nodeId of forwardReachable) {
-      if (backwardReachable.has(nodeId) && nodeId !== startId && nodeId !== endId) {
+      if (!afterEnd.has(nodeId) && nodeId !== startId && nodeId !== endId) {
         innerNodes.add(nodeId);
       }
     }
@@ -667,7 +694,7 @@ workflow_context;
     // Allowlist loopMode + stopCondition to their known enums (default unknown to the safe value
     // the equality/switch below already falls through to). Both are interpolated RAW into a
     // generated `//` comment further down; without this, a value containing a line terminator —
-    // including U+2028/U+2029, which JSON.stringify/escapeString does NOT escape — would break
+    // including U+2028/U+2029, which JSON.stringify does NOT escape (escapeString does now) — would break
     // out of the comment and inject top-level statements into the compiled script (main-realm
     // RCE from a malicious imported/shared flow whose graph sets these node.data fields).
     const rawLoopMode = String(startNode.data.loopMode || 'count');
@@ -704,6 +731,11 @@ workflow_context;
     const indexOutputVar = `node_${this.sanitizeId(startNode.id)}_out_index`;
     const historyVar = `node_${this.sanitizeId(startNode.id)}_history`;
     const loopDoneVar = `_loop_done_${this.sanitizeId(startNode.id)}`;
+    // A loop on a branch that was not taken does not run: done before its first iteration, and its results nothing
+    // (null, as a step that did not run gives). It ran before, its body skipped, and a merge after it took its
+    // empty results over the branch that was taken.
+    const loopGate = this.branchTest(startNode.id, graph);
+    const loopSkipped = loopGate === 'true' ? 'false' : `!(${loopGate})`;
 
     // Check for dynamic inputs
     const incomingEdges = graph.edges.filter(e => e.target === startNode.id);
@@ -721,13 +753,13 @@ workflow_context;
     const countSrcNode = countEdge ? graph.nodes.find(n => n.id === countEdge.source) : undefined;
     const countSource = countEdge
       ? (countSrcNode
-          ? this.getSourceVar(countEdge.source, countSrcNode.type, countEdge.sourceHandle)
+          ? this.getSourceVar(countEdge.source, countSrcNode.type, countEdge.sourceHandle, countSrcNode.data)
           : `node_${this.sanitizeId(countEdge.source)}_out`)
       : null;
     const arraySrcNode = arrayEdge ? graph.nodes.find(n => n.id === arrayEdge.source) : undefined;
     const arraySource = arrayEdge
       ? (arraySrcNode
-          ? this.getSourceVar(arrayEdge.source, arraySrcNode.type, arrayEdge.sourceHandle)
+          ? this.getSourceVar(arrayEdge.source, arraySrcNode.type, arrayEdge.sourceHandle, arraySrcNode.data)
           : `node_${this.sanitizeId(arrayEdge.source)}_out`)
       : null;
     if (this.debugEnabled) console.log(`[Compiler] loop_start arrayEdge found: ${!!arrayEdge}, arraySource: ${arraySource}`);
@@ -785,7 +817,7 @@ workflow_context;
   let ${resultsVar} = [];
   let ${historyVar} = [];
   let _loop_aborted_${this.sanitizeId(startNode.id)} = false;
-  let ${loopDoneVar} = false;
+  let ${loopDoneVar} = ${loopSkipped};
   let ${totalProcessedVar} = 0;
   let _global_index_${this.sanitizeId(startNode.id)} = 0;
 
@@ -905,16 +937,18 @@ workflow_context;
   if (typeof ${loopArrayVar} === 'string') {
     try { ${loopArrayVar} = JSON.parse(${loopArrayVar}); } catch(e) { ${loopArrayVar} = [${loopArrayVar}]; }
   }
-  // Check if it's array-like (has length property). The 'array'/'hash' branches are legacy checks, harmless in V8.
-  if (typeof ${loopArrayVar} !== 'object' && typeof ${loopArrayVar} !== 'array' && typeof ${loopArrayVar} !== 'hash') {
-    ${loopArrayVar} = ${loopArrayVar} ? [${loopArrayVar}] : [];
+  // What is iterated: an array as it is; nothing (null: a branch not taken, a step that gave nothing) none; anything
+  // else one item. A null threw "Cannot read properties of null (reading 'length')", and an object (an LLM's JSON
+  // answer) ran no iteration at all, in silence.
+  if (!Array.isArray(${loopArrayVar})) {
+    ${loopArrayVar} = ${loopArrayVar} === null || ${loopArrayVar} === undefined || ${loopArrayVar} === '' ? [] : [${loopArrayVar}];
   }
   let ${loopCountVar} = ${loopArrayVar}.length;
   console.log("[Loop Debug] loopCount after processing:", ${loopCountVar});
   let ${resultsVar} = [];
   let ${historyVar} = [];
   let _loop_aborted_${this.sanitizeId(startNode.id)} = false;
-  let ${loopDoneVar} = false;
+  let ${loopDoneVar} = ${loopSkipped};
 
 
   for (let ${loopVar} = 0; ${loopVar} < ${loopCountVar} && !${loopDoneVar}; ${loopVar}++) {
@@ -943,7 +977,7 @@ workflow_context;
   let ${resultsVar} = [];
   let ${historyVar} = [];
   let _loop_aborted_${this.sanitizeId(startNode.id)} = false;
-  let ${loopDoneVar} = false;
+  let ${loopDoneVar} = ${loopSkipped};
 
   for (let ${loopVar} = 1; ${loopVar} <= ${loopCountVar} && !${loopDoneVar}; ${loopVar}++) {
     // Check for abort at start of each iteration
@@ -965,12 +999,15 @@ workflow_context;
     } else {
       // Count mode: iterate N times
       code += `
-  let ${loopCountVar} = ${countSource ? `parseInt(${countSource}) || ${iterations}` : iterations};
-  if (${loopCountVar} < 1) { ${loopCountVar} = ${iterations}; }
+  // A count wired in is that many times, none for 0, and no more than ${MAX_WORKFLOW_LOOP_ITERATIONS} (the property's own
+  // cap); one that is not a number is the property's. A 0 ran three times before, and a count wired in had no cap.
+  let ${loopCountVar} = ${countSource ? `parseInt(${countSource}, 10)` : iterations};
+  if (!Number.isFinite(${loopCountVar})) { ${loopCountVar} = ${iterations}; }
+  ${loopCountVar} = Math.max(0, Math.min(${loopCountVar}, ${MAX_WORKFLOW_LOOP_ITERATIONS}));
   let ${resultsVar} = [];
   let ${historyVar} = [];
   let _loop_aborted_${this.sanitizeId(startNode.id)} = false;
-  let ${loopDoneVar} = false;
+  let ${loopDoneVar} = ${loopSkipped};
 
   for (let ${loopVar} = 1; ${loopVar} <= ${loopCountVar} && !${loopDoneVar}; ${loopVar}++) {
     // Check for abort at start of each iteration
@@ -1014,7 +1051,7 @@ workflow_context;
     // Use getSourceVar to properly determine the output variable name (respects single-output nodes)
     const endSourceNode = endInputEdge ? graph.nodes.find(n => n.id === endInputEdge.source) : null;
     const resultSource = endInputEdge && endSourceNode
-      ? this.getSourceVar(endInputEdge.source, endSourceNode.type, endInputEdge.sourceHandle)
+      ? this.getSourceVar(endInputEdge.source, endSourceNode.type, endInputEdge.sourceHandle, endSourceNode.data)
       : 'null';
 
     // For history, prefer AI node output over browser control result (shows the decision, not just "clicked")
@@ -1046,7 +1083,7 @@ workflow_context;
       // Use getSourceVar to properly determine the output variable name (respects single-output nodes)
       const stopSourceNode = stopEdge ? graph.nodes.find(n => n.id === stopEdge.source) : null;
       const stopCheckSource = stopEdge && stopSourceNode
-        ? this.getSourceVar(stopEdge.source, stopSourceNode.type, stopEdge.sourceHandle)
+        ? this.getSourceVar(stopEdge.source, stopSourceNode.type, stopEdge.sourceHandle, stopSourceNode.data)
         : `_iter_result_${this.sanitizeId(startNode.id)}`;
 
       code += `
@@ -1129,6 +1166,15 @@ workflow_context;
   console.log("[Loop] (${startNode.id}) completed with " + ${resultsVar}.length + " results" + (${loopDoneVar} ? " (stop condition met)" : ""));
   console.log("[Loop] (${startNode.id}) results preview: " + JSON.stringify(${resultsVar}).substring(0, 500));
 `;
+    }
+
+    if (loopGate !== 'true') {
+      code += `
+  if (${loopSkipped}) {
+    ${resultsVar} = null;
+    delete workflow_context["${startNode.id}"];
+    delete workflow_context["${endNode.id}"];
+  }`;
     }
 
     return code;
@@ -1255,7 +1301,7 @@ workflow_context;
       }
       // Use dynamic variable resolution based on node definition
       if (sourceNode) {
-        inputVar = this.getSourceVar(edge.source, sourceNode.type, edge.sourceHandle);
+        inputVar = this.getSourceVar(edge.source, sourceNode.type, edge.sourceHandle, sourceNode.data);
       } else {
         inputVar = `node_${this.sanitizeId(edge.source)}_out`;
       }
@@ -1279,7 +1325,7 @@ workflow_context;
       const sourceNode = graph.nodes.find(n => n.id === edge.source);
       // Use dynamic variable resolution based on node definition
       const sourceVar = sourceNode
-        ? this.getSourceVar(edge.source, sourceNode.type, edge.sourceHandle)
+        ? this.getSourceVar(edge.source, sourceNode.type, edge.sourceHandle, sourceNode.data)
         : `node_${this.sanitizeId(edge.source)}_out`;
 
       // Track all inputs to this handle for potential merging
@@ -1334,6 +1380,57 @@ workflow_context;
     );
   }
   /**
+   * The expression that says whether a node runs: `true` for a node on no branch, else whether one of the branches
+   * leading to it was taken (see `gateOnBranch`). A loop's start is asked it too: a loop on an untaken branch ran.
+   */
+  private branchTest(nodeId: string, graph: WorkflowGraph): string {
+    // Reachability continues through the entire branch, not just its first
+    // node. Otherwise skipping a customer lookup still executes the following
+    // phone lookup (or write). A merge runs when ANY incoming path is active.
+    //
+    // A node wired straight to a condition's `true` or `false` is ON that
+    // branch: its other inputs do not make it run. Before, one more wire (its
+    // data, from a step before the condition) made it run always: a gate's
+    // `true` into a request's input beside that sent the request on the
+    // untaken branch too (the call.reject class above, by another drawing).
+    // A node after branch steps, not wired to the condition itself, runs when
+    // one of its inputs ran, or when it has an input that always runs: it
+    // merges an optional step (a result taking the edit's picture when there
+    // was an edit, the prompt always), reading the untaken step's value as null.
+    // Two branches into two handles of one node still merge, either way.
+    const memo = new Map<string, string>();
+    const reachable = (id: string, visiting: Set<string>): string => {
+      const cached = memo.get(id);
+      if (cached !== undefined) return cached;
+      // Loop routing is compiled separately; don't recurse around a back edge.
+      if (visiting.has(id)) return 'true';
+      const next = new Set(visiting).add(id);
+      const edges = graph.edges.filter(e => e.target === id);
+      const onBranch: string[] = [];
+      const after: string[] = [];
+      for (const e of edges) {
+        const upstream = reachable(e.source, next);
+        // (a wire from a condition that names no handle carries its first output, `true`, and so is that branch)
+        const handle = e.sourceHandle || 'true';
+        const condition = graph.nodes.find(n => n.id === e.source)?.type === 'condition'
+          && (handle === 'true' || handle === 'false');
+        if (!condition) {
+          after.push(upstream);
+          continue;
+        }
+        const branch = `workflow_context[${JSON.stringify(e.source)}] === ${handle === 'true'}`;
+        onBranch.push(upstream === 'true' ? branch : `(${upstream}) && (${branch})`);
+      }
+      const paths = onBranch.length > 0 ? onBranch : after;
+      const value = paths.length === 0 || (onBranch.length === 0 && paths.includes('true')) ? 'true'
+        : [...new Set(paths)].map(path => `(${path})`).join(' || ');
+      memo.set(id, value);
+      return value;
+    };
+    return reachable(nodeId, new Set());
+  }
+
+  /**
    * A node fed by a condition's `true`/`false` handle runs ONLY on that branch.
    *
    * Without this a condition routed nothing: it computed its result, set
@@ -1359,31 +1456,7 @@ workflow_context;
     skipVarDeclaration: boolean,
     body: string
   ): string {
-    // Reachability continues through the entire branch, not just its first
-    // node. Otherwise skipping a customer lookup still executes the following
-    // phone lookup (or write). A merge runs when ANY incoming path is active.
-    const memo = new Map<string, string>();
-    const reachable = (id: string, visiting: Set<string>): string => {
-      const cached = memo.get(id);
-      if (cached !== undefined) return cached;
-      // Loop routing is compiled separately; don't recurse around a back edge.
-      if (visiting.has(id)) return 'true';
-      const next = new Set(visiting).add(id);
-      const edges = graph.edges.filter(e => e.target === id);
-      const paths = edges.map(e => {
-        const upstream = reachable(e.source, next);
-        const condition = graph.nodes.find(n => n.id === e.source)?.type === 'condition'
-          && (e.sourceHandle === 'true' || e.sourceHandle === 'false');
-        if (!condition) return upstream;
-        const branch = `workflow_context[${JSON.stringify(e.source)}] === ${e.sourceHandle === 'true'}`;
-        return upstream === 'true' ? branch : `(${upstream}) && (${branch})`;
-      });
-      const value = paths.length === 0 || paths.includes('true') ? 'true'
-        : [...new Set(paths)].map(path => `(${path})`).join(' || ');
-      memo.set(id, value);
-      return value;
-    };
-    const test = reachable(node.id, new Set());
+    const test = this.branchTest(node.id, graph);
     if (test === 'true') return body;
     // The body declares its outputs itself when it is allowed to (the node's
     // value and any named outputs beside it: an image node's `_image` and
@@ -1393,14 +1466,29 @@ workflow_context;
     // and the body told to assign instead.
     const named = skipVarDeclaration ? [] : [...new Set([...body.matchAll(new RegExp(`\\blet (${outputVar}_\\w+)\\b`, 'g'))].map(m => m[1]))];
     const declare = skipVarDeclaration ? '' : [outputVar, ...named].map(v => `\n  let ${v} = null;`).join('');
-    const inner = skipVarDeclaration ? body : named.reduce(
-      (b, v) => b.replace(new RegExp(`\\blet ${v}\\b`), v),
-      body.replace(`let ${outputVar}`, `${outputVar}`),
+    // (each declaration made an assignment, the node's own by its whole name: replacing the text `let node_X_out`
+    // found `let node_X_out_result` first, and the node's value stayed declared inside the guard, null after it)
+    const inner = skipVarDeclaration ? body : [outputVar, ...named].reduce(
+      (b, v) => b.replace(new RegExp(`\\blet ${v}\\b`, 'g'), v),
+      body,
     );
+    // In a loop the node's variables are declared once, before it (they are not here), so an iteration whose branch
+    // was not taken kept the value of the last one that was: a loop over [3, 1, 4, 2] sorting into "big" and "small"
+    // merged big3, big3, big4, big4. Such an iteration resets them, as if the node had never run.
+    let reset = '';
+    if (skipVarDeclaration) {
+      // (what the body assigns without declaring: a `let` in it is its own, gone with its block)
+      const declaredHere = new Set([...body.matchAll(new RegExp(`\\b(?:let|const|var)\\s+(${outputVar}(?:_\\w+)?)\\b`, 'g'))].map(m => m[1]));
+      const assigned = [...new Set([...body.matchAll(new RegExp(`(?<![\\w.])(${outputVar}(?:_\\w+)?)\\s*=(?!=)`, 'g'))].map(m => m[1]))];
+      const vars = [outputVar, ...assigned.filter(v => v !== outputVar)].filter(v => !declaredHere.has(v));
+      reset = ` else {${vars.map(v => `\n    ${v} = null;`).join('')}
+    delete workflow_context[${JSON.stringify(node.id)}];
+  }`;
+    }
     return `${declare}
   // Branch gate: only runs when this condition took this path
   if (${test}) {${inner}
-  }`;
+  }${reset}`;
   }
 
   private topologicalSort(graph: WorkflowGraph): GraphNode[] {
@@ -1459,7 +1547,15 @@ workflow_context;
   /**
    * Get the full output variable name for a source node and handle
    */
-  private getSourceVar(nodeId: string, nodeType: string, sourceHandle: string | null | undefined): string {
+  private getSourceVar(nodeId: string, nodeType: string, sourceHandle: string | null | undefined, sourceData?: Record<string, unknown>): string {
+    // A macro's outputs are its macro's (the node's definition declares none): each is the variable the macro node's
+    // code declares for it, `node_<id>_out_<output id>`. Read as the node's one output before, every output handle of
+    // a macro gave the macro's whole answer, all its outputs in one object.
+    if (nodeType === 'macro' && sourceHandle) {
+      const outputs = (sourceData?._macroOutputs || sourceData?.macroOutputs) as Array<{ id?: unknown }> | undefined;
+      const out = Array.isArray(outputs) ? outputs.find((o) => o && o.id === sourceHandle) : undefined;
+      if (out) return `node_${this.sanitizeId(nodeId)}_out_${String(out.id).replace(/[^a-zA-Z0-9_]/g, '_')}`;
+    }
     const suffix = this.getOutputVarSuffix(nodeType, sourceHandle);
     if (suffix === '') {
       return `node_${this.sanitizeId(nodeId)}_out`;

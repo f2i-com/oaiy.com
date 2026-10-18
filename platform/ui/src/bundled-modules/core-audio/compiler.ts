@@ -222,16 +222,18 @@ const CoreAudioCompiler: ModuleCompiler = {
             const overwrite = Boolean(data.overwrite);
 
             // Generate code that calls the save audio function
+            // (the node's one output is the path it saved to, as it declares: it was the `{ path }` object the
+            // runtime answers, so the next step was handed an object for a path)
             let code = `
   // --- Node: ${node.id} (save_audio) ---
-  ${letOrAssign}${outputVar} = await Audio.saveAudio(
+  ${letOrAssign}${outputVar} = (await Audio.saveAudio(
     ${audioVar},
     "${filename}",
     "${directory}",
     "${format}",
     ${overwrite},
     "${node.id}"
-  );
+  )).path;
   workflow_context["${node.id}"] = ${outputVar};`;
 
             return code;
@@ -309,7 +311,8 @@ const CoreAudioCompiler: ModuleCompiler = {
             const guidanceScale = Number(data.guidanceScale) || 15.0;
 
             // HeartMuLa specific settings
-            const temperature = Number(data.temperature) || 1.0;
+            // (a number set, 0 included: 0 was taken for unset)
+            const temperature = data.temperature !== undefined && data.temperature !== null && data.temperature !== '' && Number.isFinite(Number(data.temperature)) ? Number(data.temperature) : 1.0;
             const topk = Number(data.topk) || 50;
             const cfgScale = Number(data.cfgScale) || 1.5;
 

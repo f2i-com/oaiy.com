@@ -13,6 +13,8 @@ interface BlockShape {
   topLevelReturn: boolean;
   /** The block's final statement, when it is a bare expression. */
   tail: { start: number; end: number; exprStart: number; exprEnd: number } | null;
+  /** The block's own `return`s (none inside a nested function), each with its value's span when it has one. */
+  returns: Array<{ start: number; end: number; argStart: number | null; argEnd: number | null }>;
 }
 
 /**
@@ -44,6 +46,32 @@ function analyseBlock(src: string): BlockShape | null {
     return null;
   }
 
+  // The block's own returns, by the same walk.
+  const returns: BlockShape['returns'] = [];
+  const collect = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      node.forEach(collect);
+      return;
+    }
+    const n = node as Record<string, unknown>;
+    const t = n.type;
+    if (
+      t === 'FunctionDeclaration' || t === 'FunctionExpression' || t === 'ArrowFunctionExpression' ||
+      t === 'ClassDeclaration' || t === 'ClassExpression'
+    ) return;
+    if (t === 'ReturnStatement') {
+      const arg = n.argument as { start: number; end: number } | null;
+      returns.push({ start: n.start as number, end: n.end as number, argStart: arg ? arg.start : null, argEnd: arg ? arg.end : null });
+      return;
+    }
+    for (const key of Object.keys(n)) {
+      if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+      collect(n[key]);
+    }
+  };
+  collect(ast.body);
+
   // Walk statements without descending into function or class bodies: a
   // `return` in a nested helper belongs to the helper.
   const hasReturn = (node: unknown): boolean => {
@@ -74,7 +102,7 @@ function analyseBlock(src: string): BlockShape | null {
         }
       : null;
 
-  return { topLevelReturn: hasReturn(ast.body), tail };
+  return { topLevelReturn: hasReturn(ast.body), tail, returns };
 }
 
 /**
@@ -434,22 +462,30 @@ const CoreUtilityCompiler: ModuleCompiler = {
           // needs the await→yield transform to survive function boundaries;
           // until then, awaiting blocks should keep their returns at the top
           // level.
-          const transformedCode = captureTail(`${outputVar} = `).split('\n').map((ln: string) => {
-            if (ln.trimStart().startsWith('//')) return ln;
-            return ln
-              .replace(/\breturn\s+([^;\n]+);?/g, `${outputVar} = ($1); break;`)
-              .replace(/\breturn\s*;?\s*$/, 'break;');
-          }).join('\n');
+          //
+          // When the block parses, each of its own returns is rewritten from the syntax tree instead, to
+          // `{ out = (X); break <label>; }` out of a labelled block: the line rewrite took `if (!x) return "a";`
+          // for a return of `"a"` and an unconditional break after it (the `if` then guarded the assignment
+          // alone), left a loop when a return was inside one, and cut a value at a `;` inside a string.
+          const label = `__lb_${sanitizedId}`;
+          const transformedCode = shape
+            ? rewriteBlock(userCode, shape, outputVar, label)
+            : captureTail(`${outputVar} = `).split('\n').map((ln: string) => {
+                if (ln.trimStart().startsWith('//')) return ln;
+                return ln
+                  .replace(/\breturn\s+([^;\n]+);?/g, `${outputVar} = ($1); break ${label};`)
+                  .replace(/\breturn\s*;?\s*$/, `break ${label};`);
+              }).join('\n');
 
           // The output is declared OUTSIDE the block so the code inside can
           // assign it and the rest of the script can read it.
           code += `
-  // Logic block: inline with await + return (do/while pattern)
+  // Logic block: inline with await + return (a labelled block left by its returns)
   ${letOrAssign}${outputVar} = null;
   {${scopedNames()}
-    do {
+    ${label}: {
     ${transformedCode}
-    } while (false);
+    }
   }
   workflow_context["${node.id}"] = ${outputVar};`;
         } else if (hasReturn) {
@@ -519,28 +555,30 @@ ${captureTail('return ')}
 
       case 'memory': {
         const memoryKey = escapeString(String(data.key || 'default'));
-        const operation = String(data.operation || 'get');
+        // Get, Set, Append or Clear (the node offers all four; Append and Clear did a Get), else the card's older
+        // `mode` (read or write). Through `Agent.memory`, which keeps the value in the flow's memory database, so it
+        // is there on the next run as the node's description says: `Agent.get`/`Agent.set` held it for one run.
+        const raw = String(data.operation || (data.mode === 'write' ? 'set' : 'get'));
+        const operation = ['get', 'set', 'append', 'clear'].includes(raw) ? raw : 'get';
 
-        if (operation === 'set') {
+        if (operation === 'get') {
           code += `
-  // Memory set: store value
-  console.log("[Memory] (${node.id}) === Memory Set ===");
-  console.log("[Memory] (${node.id}) key: ${memoryKey}, input type: " + (typeof ${inputVar}));
-  await Agent.set("${memoryKey}", ${inputVar});
-  ${letOrAssign}${outputVar} = ${inputVar};
+  // Memory get: the stored value, else the input
+  ${letOrAssign}${outputVar} = await Agent.memory("${memoryKey}", "get", null);
+  if (${outputVar} == null) {
+    ${outputVar} = ${inputVar};
+  }
+  workflow_context["${node.id}"] = ${outputVar};`;
+        } else if (operation === 'append') {
+          code += `
+  // Memory append: the stored list, with the input added
+  ${letOrAssign}${outputVar} = await Agent.memory("${memoryKey}", "append", ${inputVar});
   workflow_context["${node.id}"] = ${outputVar};`;
         } else {
-          // Get operation
           code += `
-  // Memory get: retrieve stored value
-  console.log("[Memory] (${node.id}) === Memory Get ===");
-  console.log("[Memory] (${node.id}) key: ${memoryKey}");
-  ${letOrAssign}${outputVar} = await Agent.get("${memoryKey}");
-  console.log("[Memory] (${node.id}) retrieved type: " + (typeof ${outputVar}));
-  if (${outputVar} == null) {
-    ${outputVar} = ${inputVar}; // Fallback to input if nothing stored
-    console.log("[Memory] (${node.id}) using fallback input");
-  }
+  // Memory ${operation}: the input stored (or the value cleared), and passed on
+  await Agent.memory("${memoryKey}", "${operation}", ${operation === 'set' ? inputVar : 'null'});
+  ${letOrAssign}${outputVar} = ${inputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
         }
         break;
@@ -574,6 +612,26 @@ ${captureTail('return ')}
   },
 };
 
+
+/**
+ * A block with `await` and returns, inlined: each of its own returns made an assignment of its value to `outputVar`
+ * and a `break` out of the block labelled `label`, and its trailing expression the assignment of its value.
+ */
+function rewriteBlock(src: string, shape: BlockShape, outputVar: string, label: string): string {
+  const edits: Array<{ start: number; end: number; text: string }> = shape.returns.map((r) => ({
+    start: r.start,
+    end: r.end,
+    text: r.argStart !== null && r.argEnd !== null
+      ? `{ ${outputVar} = (${src.slice(r.argStart, r.argEnd)}); break ${label}; }`
+      : `{ break ${label}; }`,
+  }));
+  if (shape.tail) {
+    edits.push({ start: shape.tail.start, end: shape.tail.end, text: `${outputVar} = (${src.slice(shape.tail.exprStart, shape.tail.exprEnd)});` });
+  }
+  let out = src;
+  for (const e of edits.sort((a, b) => b.start - a.start)) out = out.slice(0, e.start) + e.text + out.slice(e.end);
+  return out;
+}
 
 /** JavaScript's reserved words: never a name a block's input can be declared as. */
 const RESERVED_WORDS = new Set([

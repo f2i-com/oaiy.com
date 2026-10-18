@@ -35,7 +35,7 @@ export function isHashWithPlainPairs(obj: unknown): boolean {
 const MAX_EXTRACT_DEPTH = 50;
 
 /**
- * Recursively extract the actual value
+ * A result's value, copied: plain data, its cycles and its depth bounded.
  */
 export function extractDeepValue(val: unknown, depth: number = 0, seen: WeakSet<object> = new WeakSet()): unknown {
   if (depth > MAX_EXTRACT_DEPTH) {
@@ -67,20 +67,11 @@ export function extractDeepValue(val: unknown, depth: number = 0, seen: WeakSet<
     }
 
     const obj = val as Record<string, unknown>;
-    const keys = Object.keys(obj);
 
-    // Boxed values usually have 1-2 keys (e.g., { result: "..." }).
-    // If an object has many keys, it's likely a structural object like a workflow output map.
-    if (keys.length <= 2) {
-      const valueKeys = ['output', '__output__', 'result', 'image', 'response', 'text', 'url'];
-      for (const key of valueKeys) {
-        if (key in obj && obj[key] !== undefined) {
-          return extractDeepValue(obj[key], depth + 1, seen);
-        }
-      }
-    }
-
-    // If not unboxed, recursively extract children to ensure deeply nested boxed values are resolved
+    // An object is kept as it is, all its keys. One of one or two keys with a name like `text`, `result`, `image` or
+    // `url` used to be taken for a value the old script engine had boxed and replaced by that key's value: a step's
+    // `{ text: "hello", lang: "en" }` became "hello" in the run's results and answer, and a macro's `text` and
+    // `count` outputs lost `count`. Scripts run on plain values now; nothing is boxed.
     const unboxedObj: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
       unboxedObj[k] = extractDeepValue(v, depth + 1, seen);

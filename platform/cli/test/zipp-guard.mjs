@@ -123,7 +123,8 @@ function assertCanaryValues(results, { onZipp }) {
   // (no output at all) when it does not.
   assert.equal(results.branch, onZipp ? 'took-true' : undefined, 'the node behind the true handle');
   assert.deepEqual(results.loop_end, [10, 20, 30], 'the count loop ran three times with loop_index');
-  assert.equal(results.sub?.__output__, 'sub:2', 'the subflow ran on its own script and returned');
+  // (a subflow's value is its Output node's: it was the subflow's whole context, read here as `.__output__`)
+  assert.equal(results.sub, 'sub:2', 'the subflow ran on its own script and returned');
   assert.deepEqual(results.mac, { r: 43 }, 'the macro ran and mapped its output');
   assert.equal(results.applogic, 3, "the Desktop's (new Function('ctx', decodeURIComponent(…)))(…) shape runs");
 }

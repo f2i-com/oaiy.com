@@ -36,11 +36,14 @@ export function createAbortModule(
   };
 }
 
+// Each method takes its arguments as the compiled flow passes them (`Agent.set("key", value)`): the runtime's
+// host.call spreads them into the call. These read `args[0]` of ONE array argument before, so `Agent.set("k1", v)`
+// stored "1" (the key's second letter) under "k", and every Memory node and loop history read that back.
 export function createUtilityModule(
   deps: Pick<BuiltinModuleDependencies, 'performHttpRequest'>
 ): Record<string, (...args: any[]) => any> {
   return {
-    httpRequest: async (args: any[]) => {
+    httpRequest: async (...args: any[]) => {
       const url = String(args[0]);
       const method = String(args[1] || 'GET');
       const headersArg = args[2];
@@ -67,7 +70,7 @@ export function createUtilityModule(
         return `ERROR: ${error instanceof Error ? error.message : String(error)}`;
       }
     },
-    template: (args: any[]) => {
+    template: (...args: any[]) => {
       const template = String(args[0]);
       const context = args[1] as Record<string, unknown> || {};
       return template.replace(/\{\{(\w+)\}\}/g, (match, key) => {
@@ -82,12 +85,12 @@ export function createAgentModule(
   deps: Pick<BuiltinModuleDependencies, 'agentMemory' | 'loadPersistedMemory' | 'persistMemoryEntry' | 'deletePersistedMemoryEntry' | 'onLog'>
 ): Record<string, (...args: any[]) => any> {
   return {
-    get: async (args: any[]) => {
+    get: async (...args: any[]) => {
       const key = String(args[0]);
       const value = deps.agentMemory.get(key);
       return value === undefined ? null : value;
     },
-    set: async (args: any[]) => {
+    set: async (...args: any[]) => {
       const key = String(args[0]);
       const value = args[1];
       if (!deps.agentMemory.set(key, value as any)) {
@@ -99,7 +102,7 @@ export function createAgentModule(
       }
       return null;
     },
-    memory: async (args: any[]) => {
+    memory: async (...args: any[]) => {
       const key = String(args[0]);
       const operation = String(args[1] || 'get');
       const inputValue = args[2];

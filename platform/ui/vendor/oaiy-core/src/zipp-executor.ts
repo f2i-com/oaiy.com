@@ -168,6 +168,8 @@ const CONSOLE_LEVELS: readonly ZippConsoleLevel[] = ['log', 'warn', 'error', 'in
 
 /** Reserved `kind` values that never reach the module broker. */
 const KIND_FINISH = '__system.finish';
+/** One part of a workflow's answer too large for one call; `__system.finish` carries the last. */
+const KIND_FINISH_PART = '__system.finish_part';
 const KIND_FINISH_ERROR = '__system.finish_error';
 const KIND_CONSOLE = '__system.console';
 
@@ -453,6 +455,8 @@ export class ZippSession {
   private readonly engine: ZippEngine;
   private readonly hooks: ZippSessionHooks;
   private readonly pending: ZippHostCall[] = [];
+  /** The parts of the answer so far (KIND_FINISH_PART). */
+  private readonly finishParts: string[] = [];
   private readonly instructionBudgetSteps: number | undefined;
   private settled = false;
   private aborted = false;
@@ -547,8 +551,12 @@ export class ZippSession {
         return;
       }
 
+      if (call.kind === KIND_FINISH_PART) {
+        this.finishParts.push(call.args[0] ?? '');
+        continue;
+      }
       if (call.kind === KIND_FINISH) {
-        this.finish(parseFinishValue(call.args[0]));
+        this.finish(parseFinishValue(this.finishParts.length ? this.finishParts.join('') + (call.args[0] ?? '') : call.args[0]));
         return;
       }
       if (call.kind === KIND_FINISH_ERROR) {

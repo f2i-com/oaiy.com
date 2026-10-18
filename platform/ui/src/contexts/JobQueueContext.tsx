@@ -31,6 +31,24 @@ import { createEngine } from '../engine/createEngine';
 import { untrustedWorkerFactory, zippSandboxEnabled } from '../lib/zippPrefs';
 import { useApiBridge, type ApiBridgeCallbacks } from '../hooks/useApiBridge';
 import { createLogger } from '../utils/logger';
+import { pageHost } from '@oaiy/shared/capabilities/host';
+
+/**
+ * Whether `hostPort` is OAIY Desktop's own address as OAIY's window gave it to this page: the engines, OAIY Voice and
+ * the flows a flow reaches go through it, so asking the person whether a flow may reach it asked before every first
+ * engine call ("Let this flow reach your network? 127.0.0.1:17972"), in OAIY's own window, about OAIY.
+ */
+function isOwnDesktop(hostPort: string): boolean {
+  if (pageHost().kind !== 'oaiy-window') return false;
+  const given = (globalThis as { __OAIY_DESKTOP__?: { origin?: unknown } }).__OAIY_DESKTOP__;
+  if (!given || typeof given.origin !== 'string') return false;
+  try {
+    const u = new URL(given.origin);
+    return hostPort === `${u.hostname}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
+  } catch {
+    return false;
+  }
+}
 
 const logger = createLogger('JobQueue');
 
@@ -192,6 +210,7 @@ export function JobQueueProvider({
   const [jobManager] = useState(() => {
     // Create handler that uses refs to access current values
     const networkPermissionHandler = async (request: LocalNetworkPermissionRequest): Promise<LocalNetworkPermissionResponse> => {
+      if (isOwnDesktop(request.hostPort)) return { allowed: true, remember: false };
       const permissionCallback = onLocalNetworkPermissionRef.current;
       if (!permissionCallback) {
         // No permission handler - deny by default

@@ -262,10 +262,15 @@ export function useWorkflowExecution({
           return nds.map((node) => {
             const updates: Record<string, unknown> = {};
 
-            // Update output nodes with the result from their connected source
+            // Update output nodes with their own value: what the run gave the node (its source's handle, or the
+            // value it declares), as the CLI and the desktop report it. The source node's value was shown before,
+            // which is not the output's when the edge leaves another handle (an image node's info, a condition's
+            // false) or the node declares its own value: the editor showed one answer, a run elsewhere another.
             if (node.type === 'output') {
               const incomingEdge = currentEdges.find((e) => e.target === node.id);
-              if (incomingEdge && resultObj[incomingEdge.source] !== undefined) {
+              if (resultObj[node.id] !== undefined) {
+                updates.outputValue = resultObj[node.id];
+              } else if (incomingEdge && resultObj[incomingEdge.source] !== undefined) {
                 // Keep arrays intact — OutputNode renders them as a gallery (multi-image /
                 // multi-result, with an index selector + multi-download). Collapsing to
                 // [0] here silently dropped all but the first item. Only image_save/
@@ -294,6 +299,19 @@ export function useWorkflowExecution({
                   }
                 }
               }
+            }
+
+            // Image View shows the picture it was given (it passes it on, and reported it nowhere: its card stayed
+            // empty after a run)
+            if (node.type === 'image_view') {
+              const raw = resultObj[node.id];
+              const picture = Array.isArray(raw) ? raw[0] : raw;
+              const url = typeof picture === 'string'
+                ? picture
+                : picture && typeof picture === 'object'
+                  ? ['dataUrl', 'url', 'image', 'file'].map((k) => (picture as Record<string, unknown>)[k]).find((v): v is string => typeof v === 'string' && v !== '')
+                  : undefined;
+              if (url) updates.imageUrl = url;
             }
 
             // Update image_save nodes with result

@@ -87,11 +87,11 @@
   "properties": [
     {
       "id": "service",
-      "name": "Service Preset",
+      "name": "Service",
       "type": "select",
       "default": "",
       "dynamicOptionsSource": "service:list:image_gen",
-      "description": "Pick a registered image-gen service (manage in Settings → Services) to auto-fill endpoint + model. Fields below still override the preset. Leave blank to use the inline endpoint / API Format below."
+      "description": "Which model or service makes the picture. Pick one of OAIY's engine's models, or a service added in OAIY's Services or Settings → Services. Blank: the Endpoint and API Format below."
     },
     {
       "id": "endpoint",

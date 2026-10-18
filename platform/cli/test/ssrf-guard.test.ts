@@ -27,6 +27,12 @@ for (const ip of [
   '0.0.0.0',
   '::1',
   '::ffff:127.0.0.1', // IPv4-mapped loopback
+  '::ffff:7f00:1', // the same, as the URL parser writes it ([::ffff:127.0.0.1] becomes this)
+  '::ffff:a9fe:a9fe', // mapped metadata address
+  '::127.0.0.1', // IPv4-compatible loopback
+  '64:ff9b::a9fe:a9fe', // NAT64 of the metadata address
+  '2002:7f00:1::', // 6to4 of loopback
+  'ff02::1', // multicast
   'fc00::1',
   'fe80::1',
   'not-an-ip',
@@ -35,7 +41,7 @@ for (const ip of [
 }
 
 // Public addresses MUST be allowed.
-for (const ip of ['8.8.8.8', '1.1.1.1', '93.184.216.34', '172.32.0.1', '2001:4860:4860::8888']) {
+for (const ip of ['8.8.8.8', '1.1.1.1', '93.184.216.34', '172.32.0.1', '2001:4860:4860::8888', '::ffff:8.8.8.8', '64:ff9b::808:808', '2606:4700:4700::1111']) {
   check(`allow ${ip}`, !isBlockedIp(ip));
 }
 

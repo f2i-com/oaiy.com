@@ -47,13 +47,47 @@ function isBlockedIpv4(ip: string): boolean {
   );
 }
 
+/** An IPv6 address as its eight 16-bit groups (a trailing dotted IPv4 part read as the last two), or null. */
+function ipv6Groups(ip: string): number[] | null {
+  let text = ip;
+  const dotted = /(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
+  if (dotted) {
+    const p = dotted.slice(1).map(Number);
+    if (p.some((n) => n > 255)) return null;
+    text = `${text.slice(0, dotted.index)}${((p[0] << 8) | p[1]).toString(16)}:${((p[2] << 8) | p[3]).toString(16)}`;
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const part = (h: string) => (h === '' ? [] : h.split(':').map((x) => (/^[0-9a-f]{1,4}$/.test(x) ? parseInt(x, 16) : NaN)));
+  const head = part(halves[0]);
+  const rest = halves.length === 2 ? part(halves[1]) : [];
+  const fill = halves.length === 2 ? 8 - head.length - rest.length : 0;
+  if (fill < 0) return null;
+  const groups = [...head, ...new Array(fill).fill(0), ...rest];
+  return groups.length === 8 && groups.every((x) => Number.isInteger(x)) ? groups : null;
+}
+
 function isBlockedIpv6(ip: string): boolean {
-  const lower = ip.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
-  if (lower === '::1' || lower === '::') return true; // loopback / unspecified
-  const mapped = lower.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (mapped) return isBlockedIpv4(mapped[1]); // IPv4-mapped ::ffff:a.b.c.d
-  if (/^f[cd]/.test(lower)) return true; // fc00::/7 unique-local
-  if (/^fe[89ab]/.test(lower)) return true; // fe80::/10 link-local
+  const lower = ip.toLowerCase().replace(/^\[/, '').replace(/\]$/, '').replace(/%.*$/, '');
+  const g = ipv6Groups(lower);
+  if (!g) return true; // not one we can read → block, fail closed
+  const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  const zero = (from: number, to: number) => g.slice(from, to).every((x) => x === 0);
+  if (zero(0, 8) || (zero(0, 7) && g[7] === 1)) return true; // unspecified / loopback
+  // An IPv4 address inside one, which reaches that address: mapped (::ffff:a.b.c.d, which the URL parser writes as
+  // ::ffff:7f00:1, so the dotted form alone was not enough), the old compatible form (::a.b.c.d), NAT64
+  // (64:ff9b::a.b.c.d) and 6to4 (2002:aabb:ccdd::).
+  if (zero(0, 5) && g[5] === 0xffff) return isBlockedIpv4(v4(g[6], g[7]));
+  if (zero(0, 6)) return isBlockedIpv4(v4(g[6], g[7]));
+  if (g[0] === 0x64 && g[1] === 0xff9b && zero(2, 6)) return isBlockedIpv4(v4(g[6], g[7]));
+  if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) return true; // 64:ff9b:1::/48 local NAT64
+  if (g[0] === 0x2002) return isBlockedIpv4(v4(g[1], g[2]));
+  if ((g[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+  if ((g[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((g[0] & 0xffc0) === 0xfec0) return true; // fec0::/10 site-local (deprecated)
+  if ((g[0] & 0xff00) === 0xff00) return true; // ff00::/8 multicast
+  if (g[0] === 0x2001 && g[1] === 0x0db8) return true; // 2001:db8::/32 documentation
+  if (g[0] === 0x0100 && zero(1, 4)) return true; // 100::/64 discard
   return false;
 }
 
@@ -198,6 +232,13 @@ export async function ssrfSafeFetch(
           carriedHeaders.delete('authorization');
           carriedHeaders.delete('cookie');
           carriedHeaders.delete('proxy-authorization');
+          // and the keys services take in headers of their own (x-api-key, api-key, x-goog-api-key, xi-api-key,
+          // x-auth-token, …): carried on, the key went to whatever host the redirect named
+          const names: string[] = [];
+          carriedHeaders.forEach((_value, name) => names.push(name));
+          for (const name of names) {
+            if (/(^|-)(api-?key|key|token|secret|auth|authorization|signature|session)$/i.test(name)) carriedHeaders.delete(name);
+          }
           currentOrigin = nextOrigin;
         }
 

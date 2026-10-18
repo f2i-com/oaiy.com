@@ -136,6 +136,9 @@ pub enum RequestRejection {
     BothFlowAndGraph,
     EmptyIdempotencyKey,
     UnknownMode { got: String },
+    /// `input` that is not an object of the flow's inputs by name: it reached the CLI, which refused it, and the run
+    /// failed "CLI exit 1" (retryable) with a temporary file's path for its reason.
+    InputNotObject,
 }
 
 impl RequestRejection {
@@ -155,6 +158,9 @@ impl RequestRejection {
             }
             RequestRejection::UnknownMode { got } => {
                 format!("unknown mode {got:?}; expected sync, async or queued")
+            }
+            RequestRejection::InputNotObject => {
+                "input must be an object: each of the flow's inputs by its name (or leave it out)".into()
             }
         }
     }
@@ -180,6 +186,9 @@ pub fn validate(body: &RunRequestBody) -> Result<(), RequestRejection> {
             return Err(RequestRejection::UnknownMode { got: mode.clone() });
         }
     }
+    if body.input.as_ref().is_some_and(|i| !i.is_object() && !i.is_null()) {
+        return Err(RequestRejection::InputNotObject);
+    }
     Ok(())
 }
 
@@ -199,7 +208,7 @@ fn to_run_request(body: &RunRequestBody) -> RunRequest {
         flow_id: body.flow_id.clone(),
         inline_graph: body.graph.is_some(),
         input: body.input.clone(),
-        timeout_ms: body.timeout_ms,
+        timeout_ms: body.timeout_ms.map(|t| t.min(super::worker::MAX_TIMEOUT_MS)),
         mode: body.mode.clone().unwrap_or_else(|| "async".into()),
         correlation_id: body.correlation_id.clone(),
         idempotency_key: body.idempotency_key.clone(),
@@ -309,12 +318,32 @@ async fn capabilities(State(st): State<BridgeState>) -> impl IntoResponse {
     }))
 }
 
+/// Whether a request carries this process's own credential (the Agent's tools call the router in-process with it).
+fn from_this_process(headers: &axum::http::HeaderMap) -> bool {
+    let internal = crate::internal_token();
+    !internal.is_empty()
+        && headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|t| t.trim() == internal)
+}
+
 async fn create_run(
     State(st): State<BridgeState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<RunRequestBody>,
 ) -> axum::response::Response {
     if let Err(rej) = validate(&body) {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", rej.message());
+    }
+    // The Agent's runs are the person's and run unconfined (worker::outside_input): the name is the Agent's alone.
+    if body.caller.product == super::worker::AGENT_PRODUCT && !from_this_process(&headers) {
+        return bridge_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("caller.product {:?} is this desktop's own Agent; name your app or service instead", super::worker::AGENT_PRODUCT),
+        );
     }
     let mut req = to_run_request(&body);
     // Pictures given inline go to the engines now and the run keeps their references (its record keeps its input).
@@ -346,14 +375,22 @@ async fn create_run(
                 // trusted the contract. Poll the ledger (the worker executes on
                 // its own thread) up to the run's own budget plus scheduling
                 // slack.
-                let deadline = std::time::Instant::now()
-                    // (a run that names no budget has the worker's own, not a shorter one here: waiting 30 s for a
-                    // run allowed 120 answered "still running" for a run that went on to finish)
-                    + req.timeout_ms.map_or(super::worker::DEFAULT_TIMEOUT, std::time::Duration::from_millis)
+                // (a run that names no budget has the worker's own, not a shorter one here: waiting 30 s for a
+                // run allowed 120 answered "still running" for a run that went on to finish)
+                let budget = req.timeout_ms.map_or(super::worker::DEFAULT_TIMEOUT, std::time::Duration::from_millis)
                     + std::time::Duration::from_secs(5);
+                // Counted from when the run starts: one queued behind another (the worker runs one at a time) had
+                // spent its wait in the queue and was answered "still running", to finish a moment later. A run
+                // still queued after a whole budget is answered so too.
+                let mut deadline = std::time::Instant::now() + budget;
+                let mut started = false;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     let current = { st.ledger.lock().ok().and_then(|l| l.get(&rec.run_id)) };
+                    if !started && current.as_ref().is_some_and(|r| r.started_at_ms.is_some()) {
+                        started = true;
+                        deadline = deadline.max(std::time::Instant::now() + budget);
+                    }
                     match current {
                         Some(r) if r.status.is_terminal() => {
                             return (StatusCode::OK, Json(r)).into_response();
@@ -738,6 +775,9 @@ struct FinishBody {
     output: Option<serde_json::Value>,
     #[serde(default)]
     error: Option<crate::bridge::ledger::RunError>,
+    /// The worker finishing it: the one that claimed it (claim's own default when neither names one).
+    #[serde(default)]
+    worker: Option<String>,
 }
 
 /// Finalise a run an EXTERNAL claimer executed.
@@ -766,6 +806,13 @@ async fn finish_run(
             )
         }
     };
+    // Only the worker holding the claim finishes the run: anyone who could write runs could finish any, this
+    // desktop's own in the middle of running it, with an answer of their own.
+    let worker = body.worker.clone().unwrap_or_else(|| "oaiy-desktop".into());
+    let holder = { st.ledger.lock().ok().and_then(|l| l.get(&id)).and_then(|r| r.claimed_by) };
+    if let Some(holder) = holder.filter(|h| *h != worker) {
+        return bridge_error(StatusCode::CONFLICT, "invalid_request", format!("run {id} is claimed by {holder}, not {worker}: only its claimer finishes it"));
+    }
     // (on a blocking thread, as reserving is: finishing writes the journal and syncs it)
     let ledger = st.ledger.clone();
     let finished = tokio::task::spawn_blocking(move || ledger.lock().map(|mut l| l.finish(&id, status, body.output, body.error)).map_err(|_| ())).await;
@@ -1526,11 +1573,18 @@ async fn list_triggers(State(st): State<BridgeState>) -> axum::response::Respons
 /// dispatch decides every condition on ZIPP too, and fails closed.
 async fn upsert_trigger(
     State(st): State<BridgeState>,
-    Json(binding): Json<crate::bridge::triggers::TriggerBinding>,
+    Json(mut binding): Json<crate::bridge::triggers::TriggerBinding>,
 ) -> axum::response::Response {
     use crate::bridge::conditions::CheckOutcome;
 
     let mut warning: Option<String> = None;
+    // Stored as the next start will read it: every start rewrites a bare `event` in a condition to `event.data`
+    // (triggers::migrate_condition), so one saved bare changed meaning at the next start, the envelope becoming its
+    // data. Rewritten now, said to the caller, and the same before and after a restart.
+    if let Some(rewritten) = binding.condition.as_deref().and_then(crate::bridge::triggers::migrate_condition) {
+        warning = Some(format!("condition stored as {rewritten:?}: a bare event reads the event's data"));
+        binding.condition = Some(rewritten);
+    }
     if let Some(expr) = crate::bridge::triggers::condition_of(&binding).map(str::to_string) {
         let scripts = st.host.script_evaluator();
         let source = expr.clone();
@@ -1549,7 +1603,11 @@ async fn upsert_trigger(
                 )
             }
             CheckOutcome::Unchecked(why) => {
-                warning = Some(format!("condition not checked: {why}"))
+                let unchecked = format!("condition not checked: {why}");
+                warning = Some(match warning.take() {
+                    Some(w) => format!("{w}; {unchecked}"),
+                    None => unchecked,
+                })
             }
         }
     }
@@ -1825,7 +1883,9 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/bridge/flows", get(list_flows))
         .route(
             "/api/bridge/flows/:id",
-            axum::routing::put(put_flow).delete(delete_flow).get(get_flow),
+            // (a flow may hold pictures, in an input's value or a file input: one past axum's 2 MB was refused, a
+            // flow the editor saved never reaching the desktop)
+            axum::routing::put(put_flow).delete(delete_flow).get(get_flow).layer(axum::extract::DefaultBodyLimit::max(RUN_INPUT_LIMIT)),
         )
         .route("/api/bridge/pairing", get(list_pending_pairings).post(create_pairing))
         .route("/api/bridge/pairing/:id", get(poll_pairing))
@@ -1968,6 +2028,18 @@ mod tests {
     }
 
     #[test]
+    fn input_that_is_not_an_object_is_refused() {
+        for input in [json!("text"), json!([1, 2]), json!(3)] {
+            let mut b = valid();
+            b.input = Some(input.clone());
+            assert_eq!(validate(&b), Err(RequestRejection::InputNotObject), "{input}");
+        }
+        let mut b = valid();
+        b.input = Some(json!({ "Prompt": "x" }));
+        assert!(validate(&b).is_ok());
+    }
+
+    #[test]
     fn an_unknown_mode_is_refused() {
         let mut b = valid();
         b.mode = Some("eventually".into());
@@ -2050,6 +2122,7 @@ mod tests {
             RequestRejection::BothFlowAndGraph,
             RequestRejection::EmptyIdempotencyKey,
             RequestRejection::UnknownMode { got: "x".into() },
+            RequestRejection::InputNotObject,
         ] {
             let m = r.message();
             assert!(m.len() > 15, "too terse: {m:?}");

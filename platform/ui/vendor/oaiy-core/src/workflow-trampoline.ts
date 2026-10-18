@@ -32,11 +32,27 @@
  *
  * `__handle` is the shared resume path so both `__step` (normal) and
  * `__stepThrow` (error) drive the generator identically.
+ *
+ * An `await` of anything but a module call is the value awaited, as `await`
+ * gives it: a promise's once it settles, any other value itself. Both resumed
+ * with nothing before, so `await Promise.resolve(42)` in a logic block was
+ * `undefined`.
  */
 export const WORKFLOW_TRAMPOLINE: string = `let __gen = __run_workflow();
 function __handle(item) {
    if (item.done) {
-      host.call("__system.finish", [JSON.stringify(item.value)], function(){});
+      // (an answer past what one call carries goes in parts, the last one with finish: in one call, a flow whose
+      // steps' values passed 4 MiB together failed as it ended, its work done)
+      var __text = JSON.stringify(item.value);
+      var __at = 0;
+      if (typeof __text === 'string') {
+         while (__text.length - __at > 1048576) {
+            host.call("__system.finish_part", [__text.slice(__at, __at + 1048576)], function(){});
+            __at += 1048576;
+         }
+         __text = __text.slice(__at);
+      }
+      host.call("__system.finish", [__text], function(){});
       return;
    }
    if (item.value && item.value._kind) {
@@ -47,8 +63,10 @@ function __handle(item) {
              __step(res);
          }
       });
+   } else if (item.value && typeof item.value.then === 'function') {
+      item.value.then(function(v) { __step(v); }, function(e) { __stepThrow(e && e.message ? e.message : "" + e); });
    } else {
-      __step();
+      __step(item.value);
    }
 }
 function __step(val) {

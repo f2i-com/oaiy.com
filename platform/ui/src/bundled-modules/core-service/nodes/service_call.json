@@ -27,11 +27,11 @@
   "properties": [
     {
       "id": "service",
-      "name": "Service Preset",
+      "name": "Service",
       "type": "select",
       "default": "",
       "dynamicOptionsSource": "service:list",
-      "description": "Pick a built-in or saved service. The fields below override the preset's values."
+      "description": "Which service to call: one of OAIY's engine's models, a service of OAIY's, or one added in Settings → Services. The fields below change what it is sent."
     },
     {
       "id": "model",

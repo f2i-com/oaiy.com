@@ -417,17 +417,13 @@ async function runTtsExternal(
     const responsePath = opts.externalResponsePath || '';
     const bodyTemplate = opts.externalBodyTemplate || '{}';
 
-    // Resolve API key from OAIY Secrets if requested.
+    // The API key, from the constant named: as every node's key is (ctx.getConstant). It was asked of the secrets
+    // store through a command no module may call, so the key was always empty and the service answered 401.
     let apiKey = '';
     if (opts.externalApiKeyConstant && opts.externalApiKeyConstant.trim() !== '') {
-        try {
-            apiKey = await ctx.tauri.invoke<string>(
-                'plugin:oaiy-secrets|get_secret',
-                { name: opts.externalApiKeyConstant.trim() },
-            );
-        } catch (e) {
-            ctx.log('warn', `[TTS:external] secret '${opts.externalApiKeyConstant}' not found: ${e}`);
-        }
+        const name = opts.externalApiKeyConstant.trim();
+        apiKey = String(ctx.getConstant?.(name) ?? '');
+        if (!apiKey) ctx.log('warn', `[TTS:external] the constant '${name}' has no value (set it in the project's constants, or the CLI's --constant)`);
     }
 
     const vars: Record<string, string> = {
@@ -902,7 +898,7 @@ async function saveAudio(
     format: string,
     overwrite: boolean,
     nodeId: string
-): Promise<{ path: string }> {
+): Promise<{ path: string; url: string }> {
     ctx.log('info', `[Audio] Saving audio: ${audioPath}`);
     ctx.onNodeStatus?.(nodeId, 'running');
 
@@ -946,7 +942,9 @@ async function saveAudio(
 
         ctx.onNodeStatus?.(nodeId, 'completed');
 
-        return { path: audioUrl };
+        // The file saved, and where it plays from (a file path is what a step after it reads, and what the node says
+        // it gives: the media URL was given as the path).
+        return { path: outputPath, url: audioUrl };
     } catch (error) {
         ctx.onNodeStatus?.(nodeId, 'error');
         const errMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -1606,6 +1604,8 @@ async function appendAudio(
         // Write concat list
         let concatContent = '';
         for (const audioPath of audioPaths) {
+            // (a line break would start a directive of its own in the list)
+            if (/[\u0000-\u001f]/.test(audioPath)) throw new Error(`A recording's path has a line break or control character in it: ${JSON.stringify(audioPath)}`);
             // FFmpeg concat requires forward slashes and escaped single quotes
             const escapedPath = audioPath.replace(/\\/g, '/').replace(/'/g, "'\\''");
             concatContent += `file '${escapedPath}'\n`;

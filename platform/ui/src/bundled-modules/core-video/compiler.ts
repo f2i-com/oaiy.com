@@ -32,8 +32,10 @@ const CoreVideoCompiler: ModuleCompiler = {
       // Audio Mixer - combines video with audio track
       const videoVar = inputs.get('video') || 'null';
       const audioVar = inputs.get('audio') || 'null';
-      const videoVolume = Number(data.videoVolume) || 1.0;
-      const audioVolume = Number(data.audioVolume) || 1.0;
+      // (a volume set, 0 included: 0, the sound off, was taken for unset and played at full)
+      const volume = (v: unknown) => (v !== undefined && v !== null && v !== '' && Number.isFinite(Number(v)) ? Number(v) : 1.0);
+      const videoVolume = volume(data.videoVolume);
+      const audioVolume = volume(data.audioVolume);
       const replaceAudio = Boolean(data.replaceAudio);
       const filename = escapeString(String(data.filename || 'mixed_video'));
 
@@ -98,7 +100,9 @@ const CoreVideoCompiler: ModuleCompiler = {
       // Video Save - save video to file
       // Runtime signature: save(videoUrl, savePath, filename, format, nodeId)
       const videoVar = inputs.get('video') || inputs.get('default') || inputs.get('input') || 'null';
-      const savePath = escapeString(String(data.savePath || data.folder || ''));
+      // (the node's File Path is `path`, as its definition names it: only the older `savePath`/`folder` were read,
+      // so a path set in Properties did nothing)
+      const savePath = escapeString(String(data.path || data.savePath || data.folder || ''));
       const filename = escapeString(String(data.filename || 'output_video'));
       const format = escapeString(String(data.format || 'mp4'));
 
@@ -128,7 +132,8 @@ const CoreVideoCompiler: ModuleCompiler = {
       const endTimeProp = Number(data.endTime) || 0;
       const lastFrameOnly = data.lastFrameOnly === true;
       const intervalSeconds = fps > 0 ? 1 / fps : 1;
-      const outputFormat = String(data.outputFormat || 'jpeg');
+      // (a picture format's name, or jpeg: it is written into strings of the script, and is a file's extension)
+      const outputFormat = /^[a-z0-9]{1,8}$/i.test(String(data.outputFormat || '')) ? String(data.outputFormat) : 'jpeg';
 
       // Get dynamic inputs (override properties if connected)
       const timestampsInput = inputs.get('timestamps');
@@ -377,7 +382,8 @@ const CoreVideoCompiler: ModuleCompiler = {
         }
       }
 
-      const comfySeedMode = String(data.comfySeedMode || 'random');
+      // (escaped: it is written into a string of the script)
+      const comfySeedMode = escapeString(String(data.comfySeedMode || 'random'));
       const comfyFixedSeed = data.comfyFixedSeed != null ? Number(data.comfyFixedSeed) : null;
 
       // Get image inputs from connected handles

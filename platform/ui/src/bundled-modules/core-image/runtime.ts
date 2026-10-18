@@ -294,6 +294,8 @@ async function waitForComfyUIImage(
     // Check for abort signal before each poll
     if (ctx.abortSignal?.aborted) {
       ctx.log('info', '[ImageGen] Aborted by user');
+      // (and ComfyUI stops the picture: it went on making it, its queue held, after the run had stopped)
+      await ctx.secureFetch(`${endpoint}/interrupt`, { method: 'POST', purpose: 'ComfyUI interrupt', signal: new AbortController().signal }).catch(() => undefined);
       throw new Error('Image generation aborted by user');
     }
 
@@ -625,12 +627,11 @@ async function generateComfyUI(
               ctx.log('info', `[ImageGen] Read local file: ${source.path}`);
             }
           } catch (err) {
-            ctx.log('error', `[ImageGen] Failed to read local file: ${err}`);
-            continue;
+            // (the picture given is needed: without it the workflow's own picture was used, and the run succeeded)
+            throw new Error(`The picture for ComfyUI node ${nodeId} could not be read (${source.path}): ${err instanceof Error ? err.message : String(err)}`);
           }
         } else {
-          ctx.log('warn', `[ImageGen] No Tauri available, cannot read local file`);
-          continue;
+          throw new Error(`The picture for ComfyUI node ${nodeId} is a file (${source.path}), which cannot be read here`);
         }
       }
 
@@ -651,8 +652,8 @@ async function generateComfyUI(
             node.inputs.image_base64 = resizedData;
           }
         } catch (err) {
-          ctx.log('error', `[ImageGen] Failed to upload image: ${err}`);
-          continue;
+          // A picture that did not reach ComfyUI fails the step: the workflow ran on its own picture in its place.
+          throw new Error(`The picture for ComfyUI node ${nodeId} could not be uploaded: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     }
@@ -895,6 +896,8 @@ async function generateWan2GP(
 
   while (Date.now() - startTime < maxPollTime) {
     await delay(pollIntervalMs);
+    // (a run stopped stops waiting: this polled on for up to an hour after Stop)
+    if (ctx.abortSignal?.aborted) throw new Error('Image generation aborted by user');
 
     const pollResponse = await ctx.secureFetch(`${baseUrl}/job/${jobId}`, {
       purpose: 'Wan2GP job status poll',
@@ -1041,7 +1044,8 @@ async function generate(
     ctx.onNodeStatus?.(nodeId, 'error');
     const errMsg = error instanceof Error ? error.message : 'Unknown error';
 
-    if (error instanceof Error && (error.name === 'AbortError' || errMsg.includes('aborted'))) {
+    // (stopped when the run was: an error that merely says "aborted", a request's own timeout, fails the step)
+    if (ctx.abortSignal?.aborted) {
       return '__ABORT__';
     }
 
@@ -1172,10 +1176,11 @@ async function save(
 
         ctx.log('info', `[ImageSave] Writing to: ${finalOutputPath}`);
 
-        // Use write_file with base64 content type
+        // Use write_file with base64 content type: the picture's base64, not its data URL (whose prefix was decoded
+        // as picture bytes where the host did not strip it)
         await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|write_file', {
           path: finalOutputPath,
-          content: imageDataUrl,
+          content: imageDataUrl.replace(/^data:[^,]*;base64,/, ''),
           contentType: 'base64',
           createDirs: createDir,
         });
@@ -1253,7 +1258,8 @@ async function save(
     const errMsg = error instanceof Error ? error.message : String(error);
     const errStack = error instanceof Error ? error.stack : '';
 
-    if (error instanceof Error && (error.name === 'AbortError' || errMsg.includes('aborted'))) {
+    // (stopped when the run was: an error that merely says "aborted", a request's own timeout, fails the step)
+    if (ctx.abortSignal?.aborted) {
       return '__ABORT__';
     }
 
@@ -1261,7 +1267,8 @@ async function save(
     if (errStack) {
       ctx.log('error', `[ImageSave] Stack: ${errStack}`);
     }
-    return `Error: ${errMsg}`;
+    // (the step fails: "Error: …" was answered as the saved file's path, and the flow went on with it)
+    throw new Error(`The picture could not be saved: ${errMsg}`);
   }
 }
 
@@ -1307,12 +1314,14 @@ async function resize(
     ctx.onNodeStatus?.(nodeId, 'error');
     const errMsg = error instanceof Error ? error.message : String(error);
 
-    if (error instanceof Error && (error.name === 'AbortError' || errMsg.includes('aborted'))) {
+    // (stopped when the run was: an error that merely says "aborted", a request's own timeout, fails the step)
+    if (ctx.abortSignal?.aborted) {
       return '__ABORT__';
     }
 
     ctx.log('error', `[ImageResize] Error: ${errMsg}`);
-    return `Error: ${errMsg}`;
+    // (the step fails: "Error: …" was answered as the resized picture, and the next step was handed that text)
+    throw new Error(`The picture could not be resized: ${errMsg}`);
   }
 }
 

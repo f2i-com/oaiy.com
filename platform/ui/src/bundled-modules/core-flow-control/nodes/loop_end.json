@@ -24,7 +24,38 @@
       "description": "Array of all iteration results"
     }
   ],
-  "properties": [],
+  "properties": [
+    {
+      "id": "stopCondition",
+      "name": "Stop When",
+      "type": "select",
+      "default": "none",
+      "options": [
+        { "value": "none", "label": "Run All Iterations" },
+        { "value": "contains", "label": "Result Contains" },
+        { "value": "equals", "label": "Result Equals" },
+        { "value": "starts_with", "label": "Result Starts With" },
+        { "value": "json_field", "label": "JSON Field Equals" }
+      ],
+      "description": "Stop the loop early, after the iteration whose result says so (compared without case)"
+    },
+    {
+      "id": "stopField",
+      "name": "Field",
+      "type": "string",
+      "default": "",
+      "showIf": { "property": "stopCondition", "equals": "json_field" },
+      "description": "The field of the result's JSON to compare"
+    },
+    {
+      "id": "stopValue",
+      "name": "Value",
+      "type": "string",
+      "default": "",
+      "showIf": { "property": "stopCondition", "notEquals": "none" },
+      "description": "What the result (or its field) is compared with"
+    }
+  ],
   "compiler": {
     "template": "{{input}}",
     "customHandler": "loop_end"

@@ -5,7 +5,7 @@
   "doc": "Download media from online platforms.\n\nSupported Sites:\n• YouTube, Vimeo, Dailymotion\n• Twitter/X, TikTok, Instagram\n• 1000+ more sites via yt-dlp\n\nModes:\n• Video - full video download\n• Audio - audio track only (MP3)\n\nOptions:\n• Quality selection (best, 1080p, 720p, etc.)\n• Time range (start/end seconds)\n\nOutputs:\nFile path, duration, and video dimensions.",
   "category": "video",
   "icon": "download",
-  "color": "#F97316",
+  "color": "orange",
   "inputs": [
     {
       "id": "url",

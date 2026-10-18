@@ -18,7 +18,7 @@ genBundledModules();
 // staged artifact and the worker shell beside the test bundles in dist/.
 await buildZippAssets({ logLevel: 'warning' });
 
-const entries = ['parallel-jobs.ts', 'connector-flow.ts', 'logic-block-scope.ts', 'output-value-refs.ts', 'zipp-engine.ts'];
+const entries = ['parallel-jobs.ts', 'connector-flow.ts', 'logic-block-scope.ts', 'output-value-refs.ts', 'zipp-engine.ts', 'flow-nodes.ts'];
 let failed = false;
 for (const entry of entries) {
   const out = path.join(__dirname, '..', 'dist', `_engine_${entry.replace(/\.ts$/, '')}.mjs`);

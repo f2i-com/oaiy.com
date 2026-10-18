@@ -19,6 +19,15 @@ function escapeRegExpChars(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** The condition node's operators, the names it has had included (`greater_than`, `is_not_empty`). */
+const CONDITION_OPERATORS = new Set([
+  'contains', 'not_contains', 'equals', 'not_equals', 'starts_with', 'ends_with', 'greater', 'greater_than',
+  'less', 'less_than', 'is_empty', 'not_empty', 'is_not_empty', 'json_field', 'regex',
+]);
+
+/** The Output node's types (output.json). */
+const OUTPUT_TYPES = new Set(['text', 'json', 'image', 'audio', 'video', 'file']);
+
 const CoreFlowControlCompiler: ModuleCompiler = {
   name: 'FlowControl',
 
@@ -56,8 +65,13 @@ const CoreFlowControlCompiler: ModuleCompiler = {
       case 'condition': {
         // Condition node with true/false branches
         // Support both old property names (conditionType/conditionValue) and new ones (operator/compareValue)
-        const conditionType = String(data.operator || data.conditionType || 'contains');
-        const conditionValue = escapeString(String(data.compareValue || data.conditionValue || ''));
+        // (allowlisted: it is written into a `//` comment below, raw, where a line break in it ended the comment and
+        // the rest ran as code; an operator not listed compares as nothing does, which is false)
+        const rawConditionType = String(data.operator || data.conditionType || 'contains');
+        const conditionType = CONDITION_OPERATORS.has(rawConditionType) ? rawConditionType : 'unknown';
+        // (a compare value set, 0 included: `0` was taken for none and compared with "")
+        const setValue = (v: unknown) => v !== undefined && v !== null && v !== '';
+        const conditionValue = escapeString(String(setValue(data.compareValue) ? data.compareValue : setValue(data.conditionValue) ? data.conditionValue : ''));
         const conditionField = escapeString(String(data.conditionField || ''));
 
         // Check for expression mode first - allows direct JS expression evaluation.
@@ -231,7 +245,9 @@ const CoreFlowControlCompiler: ModuleCompiler = {
 
       case 'output': {
         const label = escapeString(String(data.label || 'Output'));
-        const outputType = String(data.outputType || 'text');
+        // (allowlisted: written into the script as a string's text, where a quote in it ended the string)
+        const rawOutputType = String(data.outputType || 'text');
+        const outputType = OUTPUT_TYPES.has(rawOutputType) ? rawOutputType : 'text';
         const isInsideLoop = ctx.isInLoop || false;
         // The flow's declared ANSWER. `data.value` is a value reference — a
         // selector, or JSON with selector strings inside — and blank passes the
@@ -290,8 +306,8 @@ const CoreFlowControlCompiler: ModuleCompiler = {
             const sourceVar = inputs.get(handleId) || (i === 0 ? inputVar : 'null');
 
             if (mapping && mapping.targetNodeId) {
-              // Explicit mapping to a specific target node
-              inputParts.push(`"${mapping.targetNodeId}": ${sourceVar}`);
+              // Explicit mapping to a specific target node (its id as a quoted key: it is the graph's own text)
+              inputParts.push(`"${escapeString(String(mapping.targetNodeId))}": ${sourceVar}`);
             } else if (i === 0) {
               // Default: for first input with no explicit mapping, use "input" as the key
               // This will be picked up by the first input node in the subflow
@@ -357,10 +373,12 @@ const CoreFlowControlCompiler: ModuleCompiler = {
 
       case 'macro': {
         // Macro node - executes a macro workflow
-        const macroWorkflowId = escapeString(String(data._macroWorkflowId || ''));
-        const macroName = escapeString(String(data._macroName || 'unnamed'));
-        const macroInputs = (data._macroInputs as Array<{ id: string; name: string }>) || [];
-        const macroOutputs = (data._macroOutputs as Array<{ id: string; name: string }>) || [];
+        // (the editor keeps the macro in `_macro*`; a flow written from the node's own definition, as the Agent writes
+        // them, names it `macroId`, `macroInputs` and `macroOutputs`: read both, or that node ran nothing, in silence)
+        const macroWorkflowId = escapeString(String(data._macroWorkflowId || data.macroId || ''));
+        const macroName = escapeString(String(data._macroName || data.macroName || 'unnamed'));
+        const macroInputs = (data._macroInputs as Array<{ id: string; name: string }>) || (data.macroInputs as Array<{ id: string; name: string }>) || [];
+        const macroOutputs = (data._macroOutputs as Array<{ id: string; name: string }>) || (data.macroOutputs as Array<{ id: string; name: string }>) || [];
 
 
         if (!macroWorkflowId) {

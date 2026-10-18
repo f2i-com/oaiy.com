@@ -105,11 +105,18 @@ self.addEventListener('message', function (ev) {
 });
 
 function runScript(script) {
+  const finishParts = [];
   const host = {
     call: function (kind, args, callback) {
+      if (kind === '__system.finish_part') {
+        finishParts.push(String(args[0] == null ? '' : args[0]));
+        return;
+      }
       if (kind === '__system.finish') {
+        // (an answer too large for one call came in parts before this, its last)
+        const raw = finishParts.length ? finishParts.join('') + String(args[0] == null ? '' : args[0]) : args[0];
         let value = null;
-        try { value = typeof args[0] === 'string' && args[0] ? JSON.parse(args[0]) : args[0]; } catch (_) { value = args[0]; }
+        try { value = typeof raw === 'string' && raw ? JSON.parse(raw) : raw; } catch (_) { value = raw; }
         self.postMessage({ type: 'finish', value: value });
         return;
       }

@@ -77,7 +77,10 @@ export async function createSession(args: Any): Promise<Any> {
   }
   const chromium = await getChromium();
   // On a server we always run headless regardless of the requested mode.
-  const browser = await chromium.launch({ headless: config.headless !== false });
+  // OAIY_BROWSER_CHANNEL=chrome (or msedge): the browser installed on this computer, where Playwright's own Chromium
+  // is not (`npx playwright install chromium` installs it).
+  const channel = process.env.OAIY_BROWSER_CHANNEL?.trim() || undefined;
+  const browser = await chromium.launch({ headless: config.headless !== false, ...(channel ? { channel } : {}) });
 
   // If anything after launch throws, close the browser so we don't leak a
   // Chromium process for every failed createSession.
@@ -86,6 +89,8 @@ export async function createSession(args: Any): Promise<Any> {
     // Worker mode: don't let attacker page JS auto-save downloads into Chromium's temp dir
     // (outside the sandbox roots) and fill the host disk — there's no download consumer anyway.
     if (fsConfinementOn()) ctxOpts.acceptDownloads = false;
+    // (a page's service worker fetches outside the context's routes, so under the guard there is none)
+    if (browserGuardOn()) ctxOpts.serviceWorkers = 'block';
     if (config.userAgent) ctxOpts.userAgent = config.userAgent;
     if (config.viewport) {
       ctxOpts.viewport = {
@@ -126,6 +131,16 @@ export async function createSession(args: Any): Promise<Any> {
           return route.continue();
         }
         return route.abort('blockedbyclient');
+      });
+      // WebSockets are not requests the route above sees: each is checked as a navigation is, and one to a private
+      // address is closed before it opens.
+      await context.routeWebSocket(/.*/, async (ws: Any) => {
+        try {
+          await assertUrlAllowed(String(ws.url()).replace(/^ws/, 'http'));
+          ws.connectToServer();
+        } catch {
+          ws.close({ code: 1008, reason: 'blocked by the run\'s network guard' });
+        }
       });
     }
     if (Array.isArray(config.cookies) && config.cookies.length) {

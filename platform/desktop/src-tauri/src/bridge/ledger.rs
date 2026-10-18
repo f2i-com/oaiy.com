@@ -434,10 +434,17 @@ impl Journal {
     }
 }
 
+/// A run's place in the uniqueness gate: its idempotency key within its caller's product. One key for every caller
+/// made the keys global: an app that chose a key another had used was handed that one's run, its input and its
+/// answer, as a duplicate of its own.
+fn dedupe_key(product: &str, key: &str) -> String {
+    format!("{product}\u{0}{key}")
+}
+
 #[derive(Default)]
 pub struct Ledger {
     runs: HashMap<String, RunRecord>,
-    /// `idempotency_key` -> `run_id`. The uniqueness gate.
+    /// [`dedupe_key`] -> `run_id`. The uniqueness gate.
     by_key: HashMap<String, String>,
     /// Run ids in reservation order, for bounded eviction of terminal runs.
     run_order: VecDeque<String>,
@@ -529,7 +536,7 @@ impl Ledger {
     /// dedupe (the record already exists — replaying it must not re-run the loop
     /// guards or mint a new id).
     fn restore(&mut self, rec: RunRecord) {
-        self.by_key.insert(rec.idempotency_key.clone(), rec.run_id.clone());
+        self.by_key.insert(dedupe_key(&rec.caller_product, &rec.idempotency_key), rec.run_id.clone());
         self.run_order.push_back(rec.run_id.clone());
         self.runs.insert(rec.run_id.clone(), rec);
     }
@@ -573,7 +580,7 @@ impl Ledger {
         // already-reserved request is by definition a Duplicate, whatever its
         // lineage says. Neither ordering consumes the key on refusal, so the
         // guard-refusal-does-not-poison-the-key property is unchanged.
-        if let Some(existing_id) = self.by_key.get(&req.idempotency_key) {
+        if let Some(existing_id) = self.by_key.get(&dedupe_key(&req.caller_product, &req.idempotency_key)) {
             if let Some(rec) = self.runs.get(existing_id) {
                 return ReserveOutcome::Duplicate(rec.clone());
             }
@@ -615,7 +622,7 @@ impl Ledger {
         self.record_fired(req);
 
         self.by_key
-            .insert(req.idempotency_key.clone(), run_id.clone());
+            .insert(dedupe_key(&req.caller_product, &req.idempotency_key), run_id.clone());
         self.run_order.push_back(run_id.clone());
         self.runs.insert(run_id, record.clone());
         self.evict_terminal_over_cap();
@@ -640,7 +647,7 @@ impl Ledger {
                 // (and a run reserved to be claimed that no one has claimed in a week: no claimer is coming for it, and
                 // kept it would hold its place for ever)
                 Some(rec) if rec.status.is_terminal() || (rec.status == RunStatus::Queued && now_ms().saturating_sub(rec.reserved_at_ms) > UNCLAIMED_MS) => {
-                    let key = rec.idempotency_key.clone();
+                    let key = dedupe_key(&rec.caller_product, &rec.idempotency_key);
                     self.runs.remove(&id);
                     // Only clear by_key if it still points at THIS run — a later
                     // reservation could in principle reuse the string.
@@ -932,8 +939,9 @@ impl Ledger {
             if let Some(rec) = self.runs.remove(id) {
                 // Only if it still points at THIS run: a later run may have
                 // taken the key over once this one reached a terminal state.
-                if self.by_key.get(&rec.idempotency_key) == Some(&rec.run_id) {
-                    self.by_key.remove(&rec.idempotency_key);
+                let key = dedupe_key(&rec.caller_product, &rec.idempotency_key);
+                if self.by_key.get(&key) == Some(&rec.run_id) {
+                    self.by_key.remove(&key);
                 }
             }
         }
@@ -1169,6 +1177,26 @@ mod tests {
     }
 
     #[test]
+    fn one_callers_key_is_not_anothers() {
+        // Two apps that pick the same key each get a run of their own, and each its own again for a repeat.
+        let mut l = Ledger::new();
+        let a = match l.reserve(&req("same")) {
+            ReserveOutcome::Reserved(r) => r,
+            o => panic!("{o:?}"),
+        };
+        let other = RunRequest { caller_product: "another-app".into(), ..req("same") };
+        let b = match l.reserve(&other) {
+            ReserveOutcome::Reserved(r) => r,
+            o => panic!("another product's key must be its own, got {o:?}"),
+        };
+        assert_ne!(a.run_id, b.run_id);
+        match l.reserve(&other) {
+            ReserveOutcome::Duplicate(r) => assert_eq!(r.run_id, b.run_id),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
     fn a_key_taken_over_by_a_live_run_is_not_dropped_with_the_old_one() {
         // Only unlink a key that still points at the run being removed. If a
         // later run took the key over, dropping it would break dedupe for work
@@ -1181,12 +1209,12 @@ mod tests {
             ReserveOutcome::Reserved(r) => r.run_id,
             o => panic!("{o:?}"),
         };
-        l.by_key.insert("shared".to_string(), live.clone());
+        l.by_key.insert(dedupe_key("formlogic", "shared"), live.clone());
 
         assert_eq!(l.clear_history(), 1);
         assert!(l.get(&old).is_none());
         assert_eq!(
-            l.by_key.get("shared"),
+            l.by_key.get(&dedupe_key("formlogic", "shared")),
             Some(&live),
             "the live run must keep the key it took over"
         );

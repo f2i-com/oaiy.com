@@ -85,6 +85,33 @@ export function confineAbsolute(p: string): string {
   throw new Error(`absolute path is outside the server fs sandbox: ${p}`);
 }
 
+/**
+ * Whether a run may reach `hostPort` on this computer or its network. A run with
+ * outside input (`oaiy worker`'s queue, the Desktop's runs for webhooks, plugins
+ * and apps: OAIY_FS_CONFINE=1) reaches only the Desktop that started it, its
+ * engines, voice and flows, at OAIY_SERVER_URL: a URL an outside caller gave
+ * could otherwise reach the cloud's metadata address, a router, or another
+ * program's port of this computer. `OAIY_HTTP_ALLOW_LOCAL=1` is the operator's
+ * way out. An unconfined run (`oaiy run` of the person's own flow) reaches all.
+ */
+export function localNetworkAllowed(hostPort: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const confined = env.OAIY_FS_CONFINE === '1' && env.OAIY_FS_ALLOW_ABSOLUTE !== '1';
+  if (!confined || env.OAIY_HTTP_ALLOW_LOCAL === '1') return true;
+  let desktop: URL;
+  try {
+    desktop = new URL(env.OAIY_SERVER_URL || '');
+  } catch {
+    return false;
+  }
+  const loopback = (h: string) => ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(h.toLowerCase());
+  const at = hostPort.lastIndexOf(':');
+  const host = at > 0 ? hostPort.slice(0, at) : hostPort;
+  const port = at > 0 ? hostPort.slice(at + 1) : '';
+  const desktopPort = desktop.port || (desktop.protocol === 'https:' ? '443' : '80');
+  if (port !== desktopPort) return false;
+  return host.toLowerCase() === desktop.hostname.toLowerCase() || (loopback(host) && loopback(desktop.hostname));
+}
+
 /** True when remote-protocol media args (ffmpeg `-i http://…`) should be blocked. */
 export function fsConfinementOn(): boolean {
   return confineEnabled();

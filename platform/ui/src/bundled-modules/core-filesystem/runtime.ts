@@ -380,10 +380,11 @@ async function writeFile(
   }
 
   // Defensive path validation - happens BEFORE any file operations to prevent
-  // writing to wrong locations on accidental upstream type errors.
+  // writing to wrong locations on accidental upstream type errors. Each fails the step: they were answered as the
+  // written file's path ('ERROR_NOT_ABSOLUTE_PATH'), and the flow went on as if the file was written.
   if (!path || typeof path !== 'string') {
     ctx.log('error', `[FileSystem] writeFile skipped: path is not a string (got ${typeof path})`);
-    return 'ERROR_INVALID_PATH';
+    throw new Error(`File Write was given no path to write to (it was ${typeof path})`);
   }
 
   // Check for common corruption patterns
@@ -399,7 +400,7 @@ async function writeFile(
       path.includes('[Module') ||
       /^(true|false)$/i.test(path)) {
     ctx.log('error', `[FileSystem] writeFile skipped: corrupted path detected: ${formatPath(path)}`);
-    return 'ERROR_CORRUPTED_PATH';
+    throw new Error(`File Write was given a path that is not one: ${formatPath(path)}`);
   }
 
   // On Windows, valid absolute paths should have a drive letter (e.g., C:)
@@ -409,7 +410,7 @@ async function writeFile(
 
   if (!hasWindowsDrive && !hasUnixRoot) {
     ctx.log('error', `[FileSystem] writeFile skipped: path is not absolute: ${formatPath(path)}`);
-    return 'ERROR_NOT_ABSOLUTE_PATH';
+    throw new Error(`File Write needs a whole path (from / or a drive letter): ${formatPath(path)}`);
   }
 
   // Validate path before proceeding (security checks)

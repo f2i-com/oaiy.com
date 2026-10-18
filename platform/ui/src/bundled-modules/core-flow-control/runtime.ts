@@ -58,6 +58,12 @@ async function execute(
 
     ctx.onNodeStatus?.(nodeId, 'completed');
     ctx.log('success', `[Subflow] Completed: ${flowId}`);
+    // The subflow's answer is what its Output node declared, as a run of that flow on its own answers. The whole
+    // context came back before: every node's working and the inputs, so a template after the subflow printed it all.
+    // (A subflow with no Output node still gives its context.)
+    if (result && typeof result === 'object' && '__output__' in (result as Record<string, unknown>)) {
+      return (result as Record<string, unknown>).__output__;
+    }
     return result;
   } catch (error) {
     callStack.pop();

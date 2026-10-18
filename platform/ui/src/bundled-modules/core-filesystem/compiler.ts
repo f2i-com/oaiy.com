@@ -61,7 +61,10 @@ const CoreFilesystemCompiler: ModuleCompiler = {
         const needsTextRead = ['json', 'csv', 'lines'].includes(readAs);
         const actualReadAs = needsTextRead ? 'text' : readAs;
 
+        // (the node's value declared here, at the flow's level: it was declared in each branch below, so outside a
+        // loop the line after them threw "node_<id>_out is not defined" and File Read never gave anything)
         code += `
+  ${letOrAssign}${outputVar} = null;
   // Get file path from input or property
   let _file_path_${sanitizedId} = ${pathInput || inputVar};
   // The 'hash' branch is a legacy check, harmless in V8.
@@ -73,16 +76,16 @@ const CoreFilesystemCompiler: ModuleCompiler = {
   _is_obj_${sanitizedId} = (typeof _file_path_${sanitizedId} === 'object' || typeof _file_path_${sanitizedId} === 'hash');
   if (_is_obj_${sanitizedId} && _file_path_${sanitizedId}.dataUrl) {
     // Already has content from file input
-    ${letOrAssign}${outputVar} = _file_path_${sanitizedId}.dataUrl;
+    ${outputVar} = _file_path_${sanitizedId}.dataUrl;
   } else {
     // Validate path before reading
     let _path_str_${sanitizedId} = "" + _file_path_${sanitizedId};
     // Skip invalid paths (not a real file path - must have : or / for Windows/Unix paths)
     if (_path_str_${sanitizedId}.length < 3 || (_path_str_${sanitizedId}.indexOf(":") < 0 && _path_str_${sanitizedId}.indexOf("/") < 0 && _path_str_${sanitizedId}.indexOf("\\\\") < 0)) {
       console.log("[FileRead] Skipping invalid path: " + _path_str_${sanitizedId});
-      ${letOrAssign}${outputVar} = null;
+      ${outputVar} = null;
     } else {
-      ${letOrAssign}${outputVar} = await FileSystem.readFile(
+      ${outputVar} = await FileSystem.readFile(
         _path_str_${sanitizedId},
         "${actualReadAs}",
         "${node.id}"
@@ -197,8 +200,7 @@ const CoreFilesystemCompiler: ModuleCompiler = {
   let _tpl_name_${sanitizedId} = "";
   let _tpl_nameWithoutExt_${sanitizedId} = "";
   let _tpl_ext_${sanitizedId} = "";
-  let _tpl_index_${sanitizedId} = ${isInLoop && loopStartId ? `node_${sanitizeId(loopStartId)}_out_index != null ? node_${sanitizeId(loopStartId)}_out_index : 0` : '0'};
-  let _source_dir_${sanitizedId} = "";`;
+  let _tpl_index_${sanitizedId} = ${isInLoop && loopStartId ? `node_${sanitizeId(loopStartId)}_out_index != null ? node_${sanitizeId(loopStartId)}_out_index : 0` : '0'};`;
 
         // Get folder from folder input handle if connected
         if (folderInput) {
@@ -236,17 +238,6 @@ const CoreFilesystemCompiler: ModuleCompiler = {
     } else {
       _tpl_nameWithoutExt_${sanitizedId} = _name_str_${sanitizedId};
     }
-  }
-
-  // Get source directory from original path (fallback if no output folder specified)
-  let _info_path_${sanitizedId} = "" + (_info_copy_${sanitizedId}.path || "");
-  let _tpl_name_str_${sanitizedId} = "" + _tpl_name_${sanitizedId};
-  if (_info_path_${sanitizedId}.length > 0 && _tpl_name_str_${sanitizedId}.length > 0) {
-    // Use indexOf to find name position
-    let _name_pos_${sanitizedId} = _info_path_${sanitizedId}.indexOf(_tpl_name_str_${sanitizedId});
-    if (_name_pos_${sanitizedId} > 0) {
-      _source_dir_${sanitizedId} = _info_path_${sanitizedId}.substring(0, _name_pos_${sanitizedId});
-    }
   }`;
         }
 
@@ -260,13 +251,6 @@ const CoreFilesystemCompiler: ModuleCompiler = {
     // FileInfo-like object
     _tpl_name_${sanitizedId} = "" + (_path_in_${sanitizedId}.name || "");
     _tpl_nameWithoutExt_${sanitizedId} = "" + (_path_in_${sanitizedId}.nameWithoutExt || "");
-    // Get source directory using indexOf instead of lastIndexOf
-    let _pi_path_str_${sanitizedId} = "" + _path_in_${sanitizedId}.path;
-    let _pi_name_str_${sanitizedId} = "" + _path_in_${sanitizedId}.name;
-    let _pi_name_pos_${sanitizedId} = _pi_path_str_${sanitizedId}.indexOf(_pi_name_str_${sanitizedId});
-    if (_pi_name_pos_${sanitizedId} > 0) {
-      _source_dir_${sanitizedId} = _pi_path_str_${sanitizedId}.substring(0, _pi_name_pos_${sanitizedId});
-    }
   } else if (typeof _path_in_${sanitizedId} === 'string') {
     // Direct path string - use as-is for output
     _output_folder_${sanitizedId} = "";
@@ -290,8 +274,10 @@ const CoreFilesystemCompiler: ModuleCompiler = {
     // Direct path was provided
     _write_path_${sanitizedId} = _final_filename_${sanitizedId};
   } else {
-    // Use output folder (from settings or folder input) or fall back to source directory
-    let _use_folder_${sanitizedId} = _output_folder_${sanitizedId} || _source_dir_${sanitizedId};
+    // The output folder (from settings or the folder input), else Downloads (below). Not the folder of the file the
+    // name came from: with the default name (its name, .txt) a flow that read notes.txt and summarised it wrote the
+    // summary over notes.txt.
+    let _use_folder_${sanitizedId} = _output_folder_${sanitizedId};
 
     // Apply filename pattern or use default
     let _out_filename_${sanitizedId} = "";

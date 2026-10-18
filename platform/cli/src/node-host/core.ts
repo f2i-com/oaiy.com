@@ -25,6 +25,7 @@ import {
   getSecret,
   storeSecret,
   fsConfinementOn,
+  localNetworkAllowed,
 } from './context';
 import { ssrfSafeFetch } from './ssrf-guard';
 import { fetch as undiciFetch, Agent } from 'undici';
@@ -97,9 +98,11 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
   if (!url) throw new Error('http_request: missing url');
   const method: string = (r.method ?? 'GET').toUpperCase();
   const headers: Record<string, string> = r.headers ?? {};
-  let body: string | undefined;
-  if (r.body !== undefined && r.body !== null && method !== 'GET' && method !== 'HEAD') {
-    body = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
+  let body: string | Uint8Array<ArrayBuffer> | undefined;
+  if (method !== 'GET' && method !== 'HEAD') {
+    // (a form or a file, as the runtime encoded it: its bytes)
+    if (typeof r.body_base64 === 'string') body = new Uint8Array(Buffer.from(r.body_base64, 'base64'));
+    else if (r.body !== undefined && r.body !== null) body = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
   }
   // Bound the request so a slow / slow-trickle endpoint can't wedge the
   // single-threaded worker for the whole 45-min job timeout. Honor a per-request
@@ -120,14 +123,30 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
     () => ac.abort(new Error(`http_request timed out after ${timeoutMs}ms`)),
     timeoutMs,
   );
+  // (the run's signal: a run stopped or timed out stops its request, rather than waiting on it up to ten minutes)
+  const stopped = r.signal instanceof AbortSignal ? (r.signal as AbortSignal) : null;
+  if (stopped?.aborted) ac.abort(new Error('Operation aborted by user'));
+  stopped?.addEventListener('abort', () => ac.abort(new Error('Operation aborted by user')), { once: true });
   try {
     // SSRF guard under `oaiy worker` (untrusted URL inputs): block private/loopback/
     // link-local/metadata targets and re-validate every redirect hop. `oaiy run` (no
     // confinement) keeps full local access for trusted local flows; the runtime's
     // policyFetch sets allow_private_networks after a granted permission, and operators
     // can opt out with OAIY_HTTP_ALLOW_LOCAL=1.
+    //
+    // A confined run's own word that a request may go to a private address (a node's "allow local network", the
+    // runtime's for a local URL it was allowed) holds for this Desktop's API alone: the address is often the run's
+    // input, an outside caller's.
+    let hostPort = '';
+    try {
+      const u = new URL(url);
+      hostPort = `${u.hostname}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
+    } catch {
+      /* the fetch below says what is wrong with it */
+    }
     const allowLocal =
-      r.allow_private_networks === true || process.env.OAIY_HTTP_ALLOW_LOCAL === '1';
+      (r.allow_private_networks === true && (!fsConfinementOn() || localNetworkAllowed(hostPort))) ||
+      process.env.OAIY_HTTP_ALLOW_LOCAL === '1';
     const confined = fsConfinementOn() && !allowLocal;
     const init: RequestInit = { method, headers, body, signal: ac.signal };
     let resp: Response;
@@ -221,7 +240,9 @@ async function writeFile(args: InvokeArgs): Promise<null> {
   ensureDir(path.dirname(p));
   const ct = a.contentType ?? 'utf-8';
   const content = String(a.content ?? '');
-  if (ct === 'base64') await fsp.writeFile(p, Buffer.from(content, 'base64'));
+  // (base64 given as a data: URL is its base64 part: Node's decoder skips the `:`, `;` and `,` and took the letters of
+  // `data:image/png;base64` for picture bytes, so every picture Image Save wrote began with nine bytes of noise)
+  if (ct === 'base64') await fsp.writeFile(p, Buffer.from(content.replace(/^data:[^,]*;base64,/, ''), 'base64'));
   else await fsp.writeFile(p, content, 'utf-8');
   return null;
 }
@@ -539,7 +560,9 @@ export async function invoke<T = unknown>(cmd: string, args?: InvokeArgs): Promi
         cmd.startsWith('plugin:oaiy-agent|') ||
         cmd.startsWith('plugin:oaiy-tts|') ||
         cmd.startsWith('plugin:oaiy-llm|') ||
-        cmd.startsWith('plugin:oaiy-diffusion|')
+        cmd.startsWith('plugin:oaiy-diffusion|') ||
+        // (an embedded webview: there is none here, and a null answer read as a session that failed for no reason)
+        cmd.startsWith('plugin:oaiy-browser|webview_')
       ) {
         return notYet(`Native capability '${cmd}'`);
       }

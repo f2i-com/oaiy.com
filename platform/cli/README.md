@@ -36,6 +36,9 @@ Requires Node ≥ 22.5 (uses the built-in `node:sqlite`).
 node bin/oaiy.mjs run flow.json
 node bin/oaiy.mjs run package.oaiy
 
+# A package is anyone's file: it runs untrusted and confined, with only the permissions granted to it.
+node bin/oaiy.mjs run package.oaiy --grant network --grant code:execute
+
 # Inputs (repeatable) and a result file; exit code is 0 on success, 1 on failure.
 node bin/oaiy.mjs run flow.json --input topic="space" --input lang=en -o result.json
 
@@ -304,11 +307,13 @@ completion with progress on stderr; the result line goes to stdout.
 | `OAIY_FFMPEG` / `OAIY_FFPROBE` | `ffmpeg` / `ffprobe` | media binaries (PATH) |
 | `OAIY_SERVER_URL` | `http://127.0.0.1:17972` | oaiy-server for managed services |
 | `OAIY_SERVER_TOKEN` | — | bearer token for oaiy-server privileged calls |
-| `OAIY_FS_CONFINE` | `1` in `worker` mode, else off | confine absolute fs paths to the data/tmp/downloads roots (for untrusted queued inputs) |
+| `OAIY_FS_CONFINE` | `1` in `worker` mode, for a `.oaiy` package, and for the Desktop's runs with outside input; else off | confine absolute fs paths to the data/tmp/downloads roots, ffmpeg to local files, and requests to this computer and its network to `OAIY_SERVER_URL` alone (for untrusted inputs) |
+| `OAIY_HTTP_ALLOW_LOCAL` | — | set `1` to let a confined run reach this computer's and its network's other addresses |
 | `OAIY_FS_ALLOW_ABSOLUTE` | — | set `1` to opt out of fs confinement on a trusted single-tenant box |
 | `OAIY_HTTP_TIMEOUT_MS` | `600000` | per-request `http_request` timeout |
 | `OAIY_SERVER_TIMEOUT_MS` | `60000` | oaiy-server delegation call timeout |
 | `OAIY_BROWSER_EVAL_TIMEOUT_MS` | `30000` | per in-page browser `evaluate` timeout |
+| `OAIY_BROWSER_CHANNEL` | — | `chrome` or `msedge`: the browser nodes use that installed browser instead of Playwright's own Chromium |
 
 > `oaiy worker` enables absolute-path FS confinement by default (untrusted queued
 > inputs); opt out on a trusted box with `OAIY_FS_ALLOW_ABSOLUTE=1`.

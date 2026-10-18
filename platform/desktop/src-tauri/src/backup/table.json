@@ -840,6 +840,7 @@
       ".install.lock": "rebuilt",
       ".lock.pid": "access",
       ".model-catalog.seed.json": "rebuilt",
+      "flow-files": "not-a-store: the CLI's own data folder for a confined flow run on a headless server (bridge/worker.rs confine_child: its flows' databases and memory, kept apart from the server's credentials), as the CLI's data folder is for a run that is not confined: the CLI's, not a store of the desktop's",
       ".oaiy-isolated.json": "not-a-store: the marker an isolated plugin-qualification launch writes in its own root folder (isolated.rs); that root is never the desktop's data folder",
       ".oaiy-isolated.lock": "not-a-store: the lock of an isolated plugin-qualification launch's own root folder (isolated.rs)",
       ".oaiy-server": "not-a-store: the folder the headless server keeps its data in, under the home folder: it is a place a data folder can be, not a store inside one",

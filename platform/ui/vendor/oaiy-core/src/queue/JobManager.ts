@@ -840,10 +840,10 @@ export class JobManager {
     } catch (error) {
       // Check if it was an abort
       const errorStr = error instanceof Error ? error.message : String(error);
-      const isAbort =
-        (error instanceof Error && error.name === 'AbortError') ||
-        errorStr.includes('__ABORT__') ||
-        errorStr.includes('aborted');
+      // A stop is the job's own signal having fired (Stop, a timeout's abort). An error that only says "aborted" (a
+      // request's own timeout: "The operation was aborted") was taken for one: the job was reported stopped by the
+      // person, and a step that returned the stop sentinel for it ended the flow early as "completed".
+      const isAbort = abortController.signal.aborted;
 
       if (isAbort) {
         job.status = 'aborted';
@@ -855,11 +855,12 @@ export class JobManager {
         });
       } else {
         job.status = 'failed';
-        job.error = errorStr;
-        metrics.increment('jobsFailed');
         // Said once: an error wrapped on its way up says "Error: " for each wrapping, and one the runtime has just
-        // logged ("Workflow Error: …", its last line) is not logged again.
+        // logged ("Workflow Error: …", its last line) is not logged again. The job's error is the message itself
+        // too: it is what a run's caller is told (the desktop's run record said "Error: Error: Subflow not found").
         const said = errorStr.replace(/^(Error:\s*)+/, '');
+        job.error = said || errorStr;
+        metrics.increment('jobsFailed');
         const last = job.logs[job.logs.length - 1];
         if (!(last && last.type === 'error' && last.message.endsWith(said))) {
           this.addJobLog(job.id, {

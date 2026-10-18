@@ -144,7 +144,8 @@ const CoreAICompiler: ModuleCompiler = {
 
     const streaming = data.streaming !== false;
     const maxTokens = Number(data.maxTokens) || 0;
-    const temperature = Number(data.temperature) || 0.7;
+    // (a number set, 0 included: 0 was taken for unset and sent as 0.7)
+    const temperature = data.temperature !== undefined && data.temperature !== null && data.temperature !== '' && Number.isFinite(Number(data.temperature)) ? Number(data.temperature) : 0.7;
     const responseFormat = escapeString(String(data.responseFormat || 'text'));
     const includeImages = data.includeImages !== false;
     const visionDetail = escapeString(String(data.visionDetail || 'auto'));
@@ -204,9 +205,11 @@ const CoreAICompiler: ModuleCompiler = {
     // If there's a connected input and no static user prompt, use the input as the user prompt
     // Otherwise, append the input to the user prompt
     const hasStaticUserPrompt = userPrompt.trim().length > 0;
+    // (an object or a list given as the prompt is sent as its JSON: as text it was "[object Object]")
+    const asText = `(typeof ${inputVar} === "object" ? JSON.stringify(${inputVar}) : ("" + ${inputVar}))`;
     const userPromptExpr = hasStaticUserPrompt
-      ? `"${userPrompt}" + (${inputVar} ? "\\n\\n" + ("" + ${inputVar}) : "")`
-      : `${inputVar} ? ("" + ${inputVar}) : ""`;
+      ? `"${userPrompt}" + (${inputVar} ? "\\n\\n" + ${asText} : "")`
+      : `${inputVar} ? ${asText} : ""`;
 
     // Build message history from the history input
     // The history can be a string (newline-separated steps) or an array of messages

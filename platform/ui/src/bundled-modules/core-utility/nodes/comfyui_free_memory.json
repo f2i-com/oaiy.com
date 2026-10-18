@@ -4,7 +4,7 @@
     "description": "Free GPU memory by unloading ComfyUI models. Use between image and video generation to prevent OOM errors. Passes through input unchanged.",
     "doc": "Release GPU memory used by ComfyUI models.\n\nWhen to Use:\n• Between image generation batches\n• Before video generation (which needs lots of VRAM)\n• When switching between different model types\n\nOptions:\n• Unload Models - removes models from GPU memory\n• Free Memory - clears cached allocations\n\nBehavior:\nPasses input through unchanged, so you can insert it into any workflow without breaking connections.\n\nNote: Requires ComfyUI server running at the specified URL.",
     "icon": "trash",
-    "color": "gray",
+    "color": "slate",
     "tags": ["utility", "comfyui", "memory", "gpu"],
     "inputs": [
         {
