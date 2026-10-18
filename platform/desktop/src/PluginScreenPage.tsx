@@ -76,6 +76,23 @@ export async function pluginOaiyStatus(): Promise<PluginOaiyStatus> {
   };
 }
 
+/** The most `GET /api/bridge/events` answers at once (the host keeps as many). */
+const EVENTS_PAGE = 500;
+
+/** Where a screen's event feed starts when it subscribes: after the newest event the host keeps, so the screen hears
+ *  only what happens from then on. (`since=0` answers from the OLDEST kept event: started there, a screen opened late
+ *  in the day had up to 500 old events replayed into it.) Paged to the end, a few pages at most. */
+export async function pluginEventsTail(signal?: AbortSignal): Promise<number> {
+  let since = 0;
+  for (let pages = 0; pages < 4; pages++) {
+    const page = await bridge.events(since, EVENTS_PAGE);
+    signal?.throwIfAborted();
+    if (page.next > since) since = page.next;
+    if (page.events.length < EVENTS_PAGE) break;
+  }
+  return since;
+}
+
 /** What a setup wizard's `screen` step hears from the screen (`PluginHost.setup`). */
 export interface SetupScreenCalls {
   /** `fraction` 0..1 or null, and a short text, shown under the step. */
@@ -745,10 +762,8 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
         case 'subscribe': {
           const [names] = args as [string[]];
           subscribed.current = Array.isArray(names) ? names : [];
-          // Start from the tail so a screen doesn't replay history on open.
-          const tail = await bridge.events(0, 1);
-          signal.throwIfAborted();
-          cursor.current = tail.next;
+          // Start from the tail so a screen doesn't replay history on open (`since=0` is the oldest kept event, not the newest).
+          cursor.current = await pluginEventsTail(signal);
           return true;
         }
         // The setup wizard's calls: only a wizard step answers them.

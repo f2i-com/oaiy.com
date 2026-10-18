@@ -1141,7 +1141,7 @@ export const bridge = {
       `/api/bridge/connectors/${encodeURIComponent(connectorId)}/request`,
       { method: 'POST', body: JSON.stringify({ command, payload, idempotencyKey }) },
     ),
-  /** Poll plugin events after `since` (0 = from the current tail). */
+  /** Poll plugin events after `since` (0 = from the oldest event still kept, not the tail: page on to `next` for the newest). */
   events: (since: number, limit = 100) =>
     request<{ events: Array<{ seq: number; envelope: Record<string, unknown> }>; next: number }>(
       `/api/bridge/events?since=${since}&limit=${limit}`,

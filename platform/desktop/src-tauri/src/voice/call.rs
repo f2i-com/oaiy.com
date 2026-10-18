@@ -70,7 +70,9 @@ pub enum CallCommand {
     /// One of Aokie's call tools (`request_appointment`, `lookup_business_data`, and, while the owner allows
     /// it and the phone said it can, `transfer_to_owner`); answers with what it returned.
     Tool { name: String, arguments: Value, reply: oneshot::Sender<Result<Value, String>> },
-    /// Say goodbye, then hang up.
+    /// Say goodbye, then hang up. Where the phone does not let the receptionist hang up (`allowFinishCall: false` in the start), the
+    /// goodbye is said as a line of its own and the call stays open for the caller to end: no `finish_call` goes to the phone (it would
+    /// refuse it, and the goodbye was said only once it accepted), and the answer says so (`callStaysOpen`).
     Finish { goodbye: String, reply: oneshot::Sender<Result<Value, String>> },
     /// Stop speaking: what plays is cut, what is queued is dropped.
     Hush,
@@ -88,8 +90,18 @@ pub enum CallCommand {
 /// What a caller is told when nobody can answer them and no request to reach the owner is going.
 pub const NO_ANSWERER_GOODBYE: &str = "Sorry, no one can take your call right now. Please try again a little later. Goodbye!";
 
+/// The goodbye said when the app gives none.
+const DEFAULT_GOODBYE: &str = "Thanks for calling. Goodbye!";
+
+/// What the agent is told of its goodbye on a phone that does not let it hang up (`allowFinishCall: false`): said, and the call goes
+/// on until the caller ends it. Not a failure, and nothing to try again.
+const LEFT_OPEN: &str = "Your goodbye is being said. This phone does not let you hang up: the call stays open until the caller hangs up. Write nothing more unless they speak again, and answer them if they do.";
+/// ...and why none is said while a request to reach the owner is going (the phone answers a `finish_call` so then, in these words).
+const TRANSFER_OPEN: &str = "A request to reach the owner is open. Do not end the call; keep the caller company until you are told how it ends.";
+
 /// End the call with `goodbye` (an apology, in place of an offer of a message that nobody could take: see [`transfer::UNREACHED_GOODBYE`]), as
-/// the app ends one: the goodbye goes to the phone as `finish_call`, is said once the phone accepts it, and the call ends after it.
+/// the app ends one: the goodbye goes to the phone as `finish_call`, is said once the phone accepts it, and the call ends after it. On a phone
+/// that does not let the receptionist hang up it is said at once all the same, and the caller ends the call (see [`CallCommand::Finish`]).
 fn end_without_offer(hub: &VoiceHub, call: &str, goodbye: &'static str) {
     let (reply, _) = oneshot::channel();
     if let Some(tx) = hub.command(call) {
@@ -649,7 +661,7 @@ async fn send_waiting(
             let _ = out_tx.send(ids.event("formlogic.realtime.tool_call", json!({"toolCallId": id, "name": name, "arguments": arguments}))).await;
         }
         Waiting::Finish { goodbye, reply } => {
-            finishing.insert(id.clone(), (if goodbye.trim().is_empty() { "Thanks for calling. Goodbye!".into() } else { goodbye }, reply));
+            finishing.insert(id.clone(), (if goodbye.trim().is_empty() { DEFAULT_GOODBYE.into() } else { goodbye }, reply));
             tools.sent_call(&id, "finish_call");
             let _ = out_tx.send(ids.event("formlogic.realtime.tool_call", json!({"toolCallId": id, "name": "finish_call", "arguments": {}}))).await;
         }
@@ -750,6 +762,11 @@ where
     if !speak_only && !outbound {
         ring.note_call(features.transfer, start.get("allowTransfer").and_then(Value::as_bool) == Some(true));
     }
+    // Whether the phone hangs up for the receptionist (`allowFinishCall`: Aokie's `agentHangup` setting, off unless the owner turns it on).
+    // A phone too old to say does, as it always did. One that does not answers every `finish_call` with a refusal, so a goodbye said only
+    // once it accepts was never said at all, this desktop's own apology to a caller nobody can take among them: it is said as a line of
+    // its own instead, and the caller hangs up (see `CallCommand::Finish`).
+    let hangs_up = start.get("allowFinishCall").and_then(Value::as_bool).unwrap_or(true);
     // The call comes back to this desktop after the owner had it: the phone says so (`resume`).
     let start_resume = start.get("resume").filter(|r| r.get("afterHandoff").and_then(Value::as_bool) == Some(true)).cloned();
     // The voice chosen for calls (a clip in the voices folder; see `voices`).
@@ -798,13 +815,21 @@ where
         let (out_tx, ids, hub, engines, epoch, speaking, current_item, voice, clock, ledger, caller, ahead) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), epoch.clone(), speaking.clone(), current_item.clone(), voice.clone(), clock.clone(), ledger.clone(), caller.clone(), ahead.clone());
         tokio::spawn(async move {
             // Close the open item: what it said, then done (Aokie holds even a cancelled item open until its exact item_done).
+            // A cut item's done says so (`cancelled`, and only then): Aokie lets go of what it still holds of it to play (it
+            // buffers up to 30 s), where a plain done is played out to its end. A Hush, or the owner taking a ring, is a cut
+            // Aokie did not ask for, and what it held would otherwise go on playing over what comes next. (An older Aokie
+            // ignores the word, and plays it out as before.)
             let close = |item: OpenItem, cut: bool| {
                 let (out_tx, ids, speaking, current_item, ledger) = (out_tx.clone(), ids.clone(), speaking.clone(), current_item.clone(), ledger.clone());
                 async move {
                     if !cut && !item.said.is_empty() {
                         let _ = out_tx.send(ids.event("formlogic.realtime.output_transcript", json!({"itemId": item.id, "transcript": item.said.join(" "), "final": true}))).await;
                     }
-                    let _ = out_tx.send(ids.event("formlogic.realtime.output_item_done", json!({"itemId": item.id}))).await;
+                    let mut done = json!({"itemId": item.id});
+                    if cut {
+                        done["cancelled"] = json!(true);
+                    }
+                    let _ = out_tx.send(ids.event("formlogic.realtime.output_item_done", done)).await;
                     // Played out, its lines are done with (a cut item's went with the cut).
                     if !cut {
                         ledger.lock().unwrap().played(&item.id);
@@ -1532,6 +1557,30 @@ where
                         }
                         // The call is ending: what was cut off is not taken up.
                         resume = None;
+                        // A phone that does not hang up for the receptionist: the goodbye is a line like any other (after the greeting, while
+                        // it waits for the line to open), nothing goes to the phone, and the call stays open for the caller to end. It is not
+                        // a goodbye that ends the call (`ending`, a line never dropped): what the caller says after it is answered. While a
+                        // request to reach the owner is going none is said, as the phone that hangs up refuses one then.
+                        if !hangs_up {
+                            let goodbye = goodbye.trim();
+                            let answer = if !begun {
+                                Err("the call has not begun".into())
+                            } else if transfer.busy() || tools.transfer_pending() {
+                                Ok(json!({"ok": false, "output": {"accepted": false, "error": "transfer_in_progress", "instruction": TRANSFER_OPEN}}))
+                            } else {
+                                let goodbye = if goodbye.is_empty() { DEFAULT_GOODBYE.to_string() } else { goodbye.to_string() };
+                                // Words of the receptionist's own: no offer of a message comes after them on its own.
+                                transfer.app_said(Instant::now());
+                                if opening.is_some() {
+                                    after_greeting.push(SpeakJob::new(goodbye, epoch.load(Ordering::SeqCst), false, None));
+                                } else {
+                                    speak(goodbye, false, None);
+                                }
+                                Ok(json!({"ok": true, "output": {"accepted": true, "callStaysOpen": true, "instruction": LEFT_OPEN}}))
+                            };
+                            let _ = reply.send(answer);
+                            continue;
+                        }
                         let waiting = Waiting::Finish { goodbye, reply };
                         // Sent at once, as ever, unless a request to reach the owner is unanswered.
                         if tools.may_send("finish_call") {
@@ -2967,6 +3016,93 @@ mod tests {
         assert!(!told.iter().any(|v| v["type"] == "call.resumed"), "{told:?}");
     }
 
+    /// Ask the call to end, as the app does, with `goodbye`: what it answers.
+    async fn finish(aokie: &Aokie, goodbye: &str) -> Result<Value, String> {
+        let (reply, answer) = oneshot::channel();
+        assert!(aokie.hub.command(&aokie.call).expect("the call is listed").send(CallCommand::Finish { goodbye: goodbye.into(), reply }).is_ok());
+        answered(answer).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_phone_that_does_not_hang_up_for_the_receptionist_hears_the_goodbye_and_the_call_stays_open() {
+        // Aokie's `agentHangup` off: it refuses every finish_call, and a goodbye said only once it accepted one was never said.
+        let mut aokie = Aokie::start(json!({"allowFinishCall": false})).await;
+        greeted(&mut aokie).await;
+        let answer = finish(&aokie, "Thanks for calling, bye!").await.expect("answered");
+        // Not a failure: said, and the call is the caller's to end.
+        assert_eq!((answer["ok"].as_bool(), answer["output"]["accepted"].as_bool(), answer["output"]["callStaysOpen"].as_bool()), (Some(true), Some(true), Some(true)), "{answer}");
+        assert!(answer["output"]["instruction"].as_str().unwrap().contains("the call stays open until the caller hangs up"), "{answer}");
+        // Said at once, as a line of its own: the phone is not asked to end the call, and nothing ends it here.
+        let sent = aokie.sent_within(secs(3)).await;
+        assert!(sent.iter().any(|v| v["type"] == "formlogic.realtime.output_item_started"), "{sent:?}");
+        assert!(!sent.iter().any(|v| v["type"] == "formlogic.realtime.tool_call" || v["type"] == "formlogic.realtime.hangup_requested"), "{sent:?}");
+        assert_eq!(aokie.speech.spoken(), [GREETING, "Thanks for calling, bye!"]);
+        let told = aokie.events_within(Duration::from_millis(100)).await;
+        assert!(!told.iter().any(|v| v["type"] == "call.ended"), "{told:?}");
+        // The caller is still there, and is answered.
+        aokie.say("Of course, what else can I help with?").await.unwrap();
+        aokie.next_item_audio(secs(5)).await.expect("the answer");
+    }
+
+    #[tokio::test]
+    async fn a_goodbye_the_phone_will_not_hang_up_after_is_still_said_after_the_greeting() {
+        let mut aokie = Aokie::start(json!({"allowFinishCall": false})).await;
+        aokie.begin(json!({}));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Asked while the greeting waits for the line to open: it is said after it, not before.
+        assert_eq!(finish(&aokie, "Bye now!").await.expect("answered")["ok"], json!(true));
+        let (at, _) = aokie.first_audio(secs(6)).await.expect("the greeting");
+        assert!(at >= Duration::from_millis(1_500), "greeted {at:?} after the call began");
+        assert!(spoken_within(&aokie, "Bye now!", secs(4)).await, "{:?}", aokie.speech.spoken());
+        assert_eq!(aokie.speech.spoken(), [GREETING, "Bye now!"]);
+    }
+
+    #[tokio::test]
+    async fn a_phone_that_hangs_up_for_the_receptionist_or_does_not_say_is_asked_to_as_ever() {
+        for fields in [json!({"allowFinishCall": true}), json!({})] {
+            let mut aokie = Aokie::start(fields.clone()).await;
+            aokie.begin(json!({"greetingDelayMs": 0}));
+            aokie.event("call.started", secs(3)).await.expect("the call started");
+            let (reply, answer) = oneshot::channel();
+            aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Finish { goodbye: "Bye now!".into(), reply }).unwrap();
+            let tool = aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("finish_call");
+            assert_eq!(tool["name"], "finish_call", "{fields}");
+            aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": aokie.call, "generation": 1, "toolCallId": tool["toolCallId"], "ok": true, "output": {"accepted": true}}));
+            assert_eq!(answered(answer).await, Ok(json!({"ok": true, "output": {"accepted": true}})), "{fields}");
+            assert!(aokie.text("formlogic.realtime.hangup_requested", secs(6)).await.is_some(), "{fields}: the goodbye ends the call");
+            assert_eq!(aokie.speech.spoken(), [GREETING, "Bye now!"], "{fields}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_nobody_can_take_hears_the_apology_on_a_phone_that_does_not_hang_up_for_the_receptionist() {
+        let mut aokie = Aokie::start(json!({"allowFinishCall": false})).await;
+        aokie.hub.set_page_answers(false);
+        greeted(&mut aokie).await;
+        aokie.hub.caller_said(&aokie.call, "Hello, anyone?", json!({}));
+        assert!(spoken_within(&aokie, NO_ANSWERER_GOODBYE, secs(3)).await, "{:?}", aokie.speech.spoken());
+        let sent = aokie.sent_within(Duration::from_millis(500)).await;
+        assert!(!sent.iter().any(|v| v["type"] == "formlogic.realtime.tool_call" || v["type"] == "formlogic.realtime.hangup_requested"), "{sent:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reply_cut_off_ends_its_item_as_cancelled_and_one_that_plays_out_does_not() {
+        let mut aokie = Aokie::start(json!({})).await;
+        let (item, first) = a_reply_playing(&mut aokie, &REPLY).await;
+        tokio::time::sleep_until((first + Duration::from_millis(400)).into()).await;
+        // The app stops it (a cut Aokie did not ask for): Aokie is to let go of what it still holds of it.
+        aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Hush).unwrap();
+        let done = aokie.text("formlogic.realtime.output_item_done", secs(3)).await.expect("the reply's end");
+        assert_eq!((done["itemId"].as_str(), done["cancelled"].as_bool()), (Some(item.as_str()), Some(true)), "{done}");
+        // The next plays out: a plain done, as ever.
+        aokie.speech.lines_last(LINE_MS);
+        aokie.say("Anything else?").await.unwrap();
+        let (next, _) = aokie.next_item_audio(secs(5)).await.expect("the next reply");
+        let done = aokie.text("formlogic.realtime.output_item_done", secs(5)).await.expect("its end");
+        assert_eq!(done["itemId"], next.as_str());
+        assert!(done.get("cancelled").is_none(), "{done}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_call_that_ends_while_the_caller_settles_says_nothing_more() {
         let mut aokie = Aokie::start(json!({})).await;
@@ -3105,9 +3241,17 @@ mod tests {
 
     /// A call whose owner set `settings` and whose phone said it can (`allow`), begun, and the app told.
     async fn transferable(settings: crate::ring::RingSettings, allow: bool) -> Aokie {
+        transferable_with(settings, allow, json!({})).await
+    }
+
+    /// ...with `more` in its start.
+    async fn transferable_with(settings: crate::ring::RingSettings, allow: bool, more: Value) -> Aokie {
         let mut fields = json!({"from": "+61491570006", "callerName": "Alex"});
         if allow {
             fields["allowTransfer"] = json!(true);
+        }
+        for (key, value) in more.as_object().cloned().unwrap_or_default() {
+            fields[key] = value;
         }
         let mut aokie = Aokie::start_with(fields, move |hub| {
             let ring = crate::ring::Ring::in_memory(settings);
@@ -3719,6 +3863,25 @@ mod tests {
         // The phone's answer to the transfer, far too late, is ignored: it neither rings nor confuses the ledger.
         aokie.send(ringing(&aokie, sent["toolCallId"].as_str().unwrap(), "assist_late", 30));
         assert!(aokie.event("call.transfer", Duration::from_millis(300)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn on_a_phone_that_does_not_hang_up_no_goodbye_is_said_while_the_owner_is_rung_and_none_is_followed_by_an_offer() {
+        let mut aokie = transferable_with(owner_settings(true), true, json!({"allowFinishCall": false})).await;
+        caller_asks(&aokie);
+        ring_the_owner(&mut aokie, "assist_1", 30).await;
+        // As the phone that hangs up answers a finish_call then: refused, and nothing said.
+        let answer = finish(&aokie, "Thanks for calling, bye!").await.expect("answered");
+        assert_eq!((answer["ok"].as_bool(), answer["output"]["error"].as_str()), (Some(false), Some("transfer_in_progress")), "{answer}");
+        assert!(!spoken_within(&aokie, "Thanks for calling, bye!", Duration::from_millis(600)).await, "{:?}", aokie.speech.spoken());
+        assert!(aokie.text("formlogic.realtime.tool_call", Duration::from_millis(200)).await.is_none());
+        // The owner declines: a goodbye now is said, and the offer of a message its clock had coming is not said after it.
+        aokie.send(outcome(&aokie, "assist_1", "declined", None));
+        aokie.event("call.transfer", secs(3)).await.expect("declined");
+        assert_eq!(finish(&aokie, "Thanks for calling, bye!").await.expect("answered")["ok"], json!(true));
+        assert!(spoken_within(&aokie, "Thanks for calling, bye!", secs(4)).await, "{:?}", aokie.speech.spoken());
+        tokio::time::sleep(quick().offer_after + Duration::from_millis(500)).await;
+        assert!(!aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "{:?}", aokie.speech.spoken());
     }
 
     #[tokio::test]

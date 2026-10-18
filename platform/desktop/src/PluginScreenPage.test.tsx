@@ -7,10 +7,10 @@
 // `data-theme` on ITS OWN document, and nothing ever crossed the frame
 // boundary, so the plugin screens rendered light under every theme.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { assembleScreenDocument, HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginFontCss, pluginNavAllowed, pluginOaiyStatus, SETUP_SCREEN_GUTTER } from './PluginScreenPage';
+import { assembleScreenDocument, HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginEventsTail, pluginFontCss, pluginNavAllowed, pluginOaiyStatus, SETUP_SCREEN_GUTTER } from './PluginScreenPage';
 import { installTestChannel, type testPorts } from './pluginScreenRpc.testTransport';
 let latestTestPorts: ReturnType<typeof testPorts>;
-import { API_BASE, engines, voices, type ModulesSnapshot } from './api';
+import { API_BASE, bridge, engines, voices, type ModulesSnapshot } from './api';
 
 describe('plugin AI source gateway routes', () => {
   it('uses the configured host API for provider selections and preserves their metadata', () => {
@@ -213,6 +213,35 @@ describe('plugin screen navigation and OAIY status', () => {
     });
     vi.spyOn(engines, 'status').mockRejectedValue(new Error('offline'));
     expect(await pluginOaiyStatus()).toEqual({ voice: { chosen: 'receptionist' }, llm: null });
+  });
+});
+
+describe('plugin screen event feed', () => {
+  afterEach(() => vi.restoreAllMocks());
+  /** A host that keeps events `first..=last` (seq numbers), and answers as `GET /api/bridge/events` does: after `since`, oldest first. */
+  const keeping = (first: number, last: number) =>
+    vi.spyOn(bridge, 'events').mockImplementation(async (since: number, limit = 100) => {
+      const events = [];
+      for (let seq = Math.max(since + 1, first); seq <= last && events.length < Math.min(limit, 500); seq++) events.push({ seq, envelope: { name: 'aokie.call.ended' } });
+      return { events, next: events.length ? events[events.length - 1].seq : since };
+    });
+
+  it('starts after the newest kept event, not the oldest, so nothing from before the screen opened is replayed', async () => {
+    const events = keeping(1201, 1700);
+    expect(await pluginEventsTail()).toBe(1700);
+    // One look reaches the end (the host keeps no more than a page), and a second confirms it.
+    expect(events.mock.calls.map(([since]) => since)).toEqual([0, 1700]);
+  });
+
+  it('starts at 0 when nothing is kept yet, so the first event is heard', async () => {
+    keeping(1, 0);
+    expect(await pluginEventsTail()).toBe(0);
+  });
+
+  it('a short page is the end', async () => {
+    const events = keeping(1, 42);
+    expect(await pluginEventsTail()).toBe(42);
+    expect(events).toHaveBeenCalledTimes(1);
   });
 });
 
