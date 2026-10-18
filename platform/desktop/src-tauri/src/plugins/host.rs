@@ -3420,6 +3420,7 @@ mod tests {
             reason: None,
             dir: PathBuf::from("."),
             manifest: None,
+            declared: None,
             legacy_capabilities: Vec::new(),
             unknown_capabilities: Vec::new(),
             user_disabled: false,

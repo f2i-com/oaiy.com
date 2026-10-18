@@ -91,14 +91,25 @@ keeps the pairing.
 
 **Letting the Agent set it up.** *Let the Agent pair and set up this computer* (Setup → Networking, saved as it is
 ticked; off until the person ticks it) lets the Agent's tools change OAIY Network: `network_setup` (on or off, uses,
-lends, name), `network_pair` (a computer found on the network or an address; it waits for the other computer's
-approval and confirms this side for the person, both ways where this computer lends itself), `network_approve`
-(a computer asking to use this one), `network_unpair`, `network_use_service` (OAIY Voice on another computer) and
-`network_pin`, beside `network_status` (which says `agentMaySetUp`, and lists the computers asking). With it off they
-refuse, and say where the person ticks it. Two computers that both have it on **pair by themselves**: the asking one
-says so in its request, the other approves it at once, and the asking one finishes at once (both ways where it lends
-itself), with no codes compared, so it is for a network the person trusts. Each card says *Paired by itself*; past
-eight computers so paired, the person is asked again. The Agent's own model on another computer
+lends, name, sharing model files, the window to pair by itself), `network_pair` (a computer found on the network or
+an address; it waits for the other computer's approval, then confirms this side only once the person says both screens
+show the same code: `codeConfirmed`, never set by the Agent itself), `network_approve` (a computer asking to use this
+one), `network_unpair`, `network_use_service` (OAIY Voice on another computer) and `network_pin`, beside
+`network_status` (which says `agentMaySetUp`, and lists the computers asking). With it off they refuse, and say where
+the person ticks it. A pairing is one way unless both ways is asked for.
+
+**Pairing by itself.** A computer whose person lets its Agent set it up asks to pair *by itself* (`auto` in its
+request). The other computer approves such a request at once only while its **window to pair by itself** is open:
+its person (or its Agent, `network_setup`'s `openPairingMinutes`; `PUT /api/network/settings {openPairingMinutes}`,
+1 to 10 minutes, 0 closes it) opened it, and the first computer paired in it closes it. Outside a window the request
+waits for the person as any other: anyone on the network can say `auto`. No codes are compared in a window, so it is
+for a network the person trusts, open only while they pair a computer of theirs. The window is not saved (closed at a
+restart); `GET /api/network/status` says until when it is open (`pairingOpenUntilMs`) and which computers paired by
+themselves lately (`pairedByItself`). Each card says *Paired by itself*; past eight computers so paired (computers, not
+pairings), the person is asked again. A computer approved to use another may say it lends itself to that one too
+(`/worker/v1/lends`, both ways) only within ten minutes of its approval, once.
+
+The Agent's own model on another computer
 is `agent_model_set` with a worker's language model, or (following *the model chosen in Engines*) a worker's
 language model made this computer's default with `model_set_default`.
 
@@ -198,9 +209,13 @@ that a computer it uses has from that computer, over the LAN, before Hugging Fac
 downloads a model, and the others on the network get it from there.
 
 - **By SHA-256, never a path:** each large file is named by the SHA-256 Hugging Face publishes for it. The computer
-  using another asks it which it has (`POST /worker/v1/models/have {files: [{sha256, size}]}`, answered from what
-  its engines know already), then fetches one (`GET /worker/v1/models/blob/:sha256?size=`, carried on from a partial
-  file with `Range`). The computer lending finds the file among its engines' model files (where downloads go, the
+  using others asks them all at once, for a few seconds, which they have (`POST /worker/v1/models/have {files:
+  [{sha256, size}]}`, answered from what their engines know already, `checked` where the SHA-256 was read, else a
+  file as large not read yet), then fetches one (`GET /worker/v1/models/blob/:sha256?size=`, carried on from a partial
+  file with `Range`), from a computer that checked it first and the next where one sends nothing or not the file. The
+  bytes sent are held to the range asked for and the file's size; a transfer that stops sending for a minute is given
+  up, and one that is paused or cancelled stops within a moment. A lender sends one computer two files at once at
+  most, and reads one file's SHA-256 once at a time; still reading it, it answers 503. The computer lending finds the file among its engines' model files (where downloads go, the
   folders of the models in its settings, `downloads.library`: the engines' `POST /api/library/find`), reads its
   SHA-256 before it sends it, and never says where it keeps it. A computer can only fetch a file whose SHA-256 it
   knows already.
@@ -246,7 +261,7 @@ restricted, as `/api/engines/` are):
 | Route | Scope | What |
 | --- | --- | --- |
 | `GET /api/network/status` | auth.read | On or off, the role, this computer's name, fingerprint and addresses |
-| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, agent, shareModels, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before; `agent`, `shareModels`, `defaults` or `services` alone restart nothing) |
+| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, agent, shareModels, openPairingMinutes, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before; `agent`, `shareModels`, `openPairingMinutes`, `defaults` or `services` alone restart nothing; a port another program has is refused before anything is kept, and a listener that cannot start leaves this computer using others, said as `listenError`) |
 | `POST /api/network/discover` | auth.manage | The workers found on the LAN |
 | `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare |
 | `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it, or withdraws the request it has not answered) |
@@ -264,8 +279,11 @@ restricted, as `/api/engines/` are):
 
 The worker (`/worker/v1/*` on its LAN port, TLS with client certificates): `health` (anyone: a name, a node id, the
 protocol), `pair` and `pair/:id` (anyone with a certificate, to ask), `unpair` (the caller's own pairing, both ways,
-or request withdrawn), and, for its paired primary only, `lends` (it lends itself to this one too: paired both ways), `capabilities`, `resources`, `pins`, `chat`, `gateway/*path`, `flows`,
-`flows/:id/runs`, `runs/:id` (and `…/cancel`), `services/oaiy-voice/*path` and `voices/:name` (a voice copied there). The gateway takes the engine's media routes and
+or request withdrawn), and, for its paired primary only, `lends` (it lends itself to this one too: paired both ways, as
+they pair), `capabilities`, `resources`, `pins`, `chat`, `gateway/*path`, `flows`, `flows/:id/runs`, `runs/:id` (and
+`…/cancel`), `services/oaiy-voice/*path`, `voices/:name` (a voice copied there, at most 16 of one computer's), and
+`models/have` and `models/blob/:sha256` (its model files, by SHA-256: eighteen routes in all). A node id is 32
+lowercase hex digits, as OAIY makes them; another is refused. The gateway takes the engine's media routes and
 files only (not its settings, logs, downloads or playground), and what it answers about itself leaves out its local
 paths and loopback addresses.
 

@@ -137,6 +137,8 @@ struct SettingsChange {
     agent: Option<bool>,
     /// Lending itself, it lends its model files too.
     share_models: Option<bool>,
+    /// Open the window to pair by itself with a computer that asks so, for this many minutes (1 to 10), or close it (0).
+    open_pairing_minutes: Option<u64>,
     name: Option<String>,
     port: Option<u16>,
     bind: Option<String>,
@@ -186,6 +188,14 @@ async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsCha
     if let Some(v) = change.bind {
         s.bind = v.trim().to_string();
     }
+    if let Some(m) = change.open_pairing_minutes {
+        if m > 10 {
+            return error(StatusCode::BAD_REQUEST, "invalid_request", "the window to pair by itself is open ten minutes at most");
+        }
+        if m > 0 && !s.lends() {
+            return error(StatusCode::CONFLICT, "not_a_worker", "switch on Lend this computer to let a computer pair with it");
+        }
+    }
     let uses = s.uses();
     if let Some(defaults) = &change.defaults {
         if let Err(e) = set_defaults(&net, defaults, uses, false).await {
@@ -217,6 +227,10 @@ async fn put_settings(State(net): State<Network>, Json(change): Json<SettingsCha
         if let Err(e) = set_services(&net, services, uses, true) {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e);
         }
+    }
+    if let Some(m) = change.open_pairing_minutes {
+        net.open_pairing(m);
+        log::info!("network: the window to pair by itself is {}", if m > 0 { format!("open for {m} min") } else { "closed".into() });
     }
     status(State(net)).await
 }
@@ -352,6 +366,9 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
     if node_id == id.node_id {
         return error(StatusCode::BAD_REQUEST, "invalid_address", "that address is this computer");
     }
+    if !super::identity::node_id_ok(node_id) {
+        return error(StatusCode::BAD_GATEWAY, "pairing_refused", "the worker's answer was not a pairing request (its node id is not one OAIY makes)");
+    }
     // The code: the worker committed to its random value above; this computer's is told now, to that same certificate,
     // and the worker's told back is held to its commitment (identity::pairing_code).
     let Some(committed) = answer.get("commitment").and_then(Value::as_str).filter(|c| is_nonce(c)).map(str::to_ascii_lowercase) else {
@@ -391,7 +408,8 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
     // (approved there at once, both computers pairing by themselves: paired here too, no person asked)
     if auto && told.get("approved") == Some(&json!(true)) {
         let code = pending.code.clone();
-        let answer = paired(&net, &pending, req.both_ways.unwrap_or(true), true).await;
+        // (both ways only where asked: a computer that paired by itself is not let use this one unasked)
+        let answer = paired(&net, &pending, req.both_ways.unwrap_or(false), true).await;
         let (parts, body) = answer.into_parts();
         let Ok(bytes) = axum::body::to_bytes(body, 1 << 22).await else { return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the pairing's answer") };
         let mut v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -498,8 +516,14 @@ async fn paired(net: &Network, p: &Outgoing, both_ways: bool, by_itself: bool) -
         paired_at_ms: now_ms(),
         by_itself,
     };
-    if let Err(e) = net.inner().peers().add(peer.clone()) {
+    // (the guard let go before anything is awaited)
+    let added = net.inner().peers().add(peer.clone());
+    if let Err(e) = added {
         lock(&net.inner().outgoing).retain(|o| o.id != p.id);
+        // (approved there, not paired here: the worker is told, so it does not keep this computer one way)
+        if let Ok(c) = net.identity().and_then(|id| client_for(&id, &p.fingerprint)) {
+            let _ = c.post(url(&p.address, "/worker/v1/unpair")).timeout(Duration::from_secs(3)).send().await;
+        }
         let (status, code) = if e == super::store::TAKEN { (StatusCode::CONFLICT, "node_id_taken") } else { (StatusCode::INTERNAL_SERVER_ERROR, "internal") };
         return error(status, code, e);
     }

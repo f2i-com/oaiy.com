@@ -84,6 +84,13 @@ pub(crate) struct Inner {
     /// Workers advertised on the LAN (mDNS), by node id.
     found: Arc<Mutex<HashMap<String, discovery::Found>>>,
     running: Mutex<Running>,
+    /// Until when this computer pairs by itself with a computer that asks so (its person or its Agent opened the
+    /// window, for minutes; the first such pairing closes it): never saved, closed at a restart.
+    pairing_open_until: Mutex<Option<std::time::Instant>>,
+    /// The last computers paired by themselves here, `(name, when)`, for the Networking page to tell the person.
+    paired_by_itself: Mutex<Vec<(String, u64)>>,
+    /// Why this computer is not lending itself although set to (its listener could not start), for the page.
+    listen_error: Mutex<Option<String>>,
     /// Settings applied one change at a time: two at once would each start a listener and an advertisement.
     applying: tokio::sync::Mutex<()>,
     /// mDNS off (tests): advertising and browsing are not started.
@@ -138,6 +145,9 @@ impl Network {
                 untold: Mutex::new(Vec::new()),
                 found: Arc::new(Mutex::new(HashMap::new())),
                 running: Mutex::new(Running::default()),
+                pairing_open_until: Mutex::new(None),
+                paired_by_itself: Mutex::new(Vec::new()),
+                listen_error: Mutex::new(None),
                 applying: tokio::sync::Mutex::new(()),
                 mdns,
             }),
@@ -185,9 +195,14 @@ impl Network {
     /// Take new settings: kept, and what runs changed to match (lending: the listener and its advertisement; using
     /// others: the heartbeat to them and browsing for them; both, both).
     pub async fn set(&self, settings: Settings) -> Result<(), String> {
-        // (an address it cannot listen on is refused before anything is kept or stopped)
+        // (an address it cannot listen on is refused before anything is kept or stopped: a port another program has is
+        // tried now, the listener's own port left to it)
         if settings.lends() {
-            bind_address(&settings)?;
+            let bind = bind_address(&settings)?;
+            let mine = self.listening().is_some_and(|a| a.port() == bind.port() && bind.port() != 0);
+            if !mine {
+                std::net::TcpListener::bind(bind).map_err(|e| format!("this computer cannot lend itself on {bind}: {e} (choose another port)"))?;
+            }
         }
         settings.save(&self.inner.dir)?;
         *lock(&self.inner.settings) = settings;
@@ -197,12 +212,58 @@ impl Network {
     /// Unpair `node_id`, both ways, and forget what was chosen of it: its models no longer this computer's defaults,
     /// its services no longer used here (this computer's own again), its last report gone.
     pub(crate) fn forget(&self, node_id: &str) -> Result<(), String> {
-        self.inner.peers().remove(node_id)?;
+        // (all of it forgotten, the rest too where one part could not be written down: that one is said)
+        let unpaired = self.inner.peers().remove(node_id);
         let _ = self.inner.defaults().drop_node(node_id);
         let _ = self.inner.services().drop_node(node_id);
         lock(&self.inner.nodes).remove(node_id);
-        worker::forget_voices(node_id);
-        Ok(())
+        // (its voice copies removed off the async threads: files)
+        let node = node_id.to_string();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(move || worker::forget_voices(&node))),
+            Err(_) => worker::forget_voices(&node),
+        }
+        unpaired.map(|_| ())
+    }
+
+    /// Open (for `minutes`, at most ten) or close (`0`) the window in which this computer pairs by itself with a
+    /// computer that asks so: until when it is open.
+    pub(crate) fn open_pairing(&self, minutes: u64) -> Option<u64> {
+        let mut open = lock(&self.inner.pairing_open_until);
+        *open = (minutes > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(minutes.min(10) * 60));
+        drop(open);
+        self.pairing_open_until_ms()
+    }
+
+    /// When the window to pair by itself closes (ms since the epoch), while it is open.
+    pub(crate) fn pairing_open_until_ms(&self) -> Option<u64> {
+        let open = (*lock(&self.inner.pairing_open_until))?;
+        let left = open.checked_duration_since(std::time::Instant::now())?;
+        Some(store::now_ms() + left.as_millis() as u64)
+    }
+
+    /// Take the window to pair by itself, where it is open: closed now (one computer pairs in it), `true`.
+    pub(crate) fn take_pairing_window(&self) -> bool {
+        let mut open = lock(&self.inner.pairing_open_until);
+        let was = open.is_some_and(|until| until > std::time::Instant::now());
+        *open = None;
+        was
+    }
+
+    /// Give the window back (a pairing taken in it that did not go through).
+    pub(crate) fn give_back_pairing_window(&self, until_ms: Option<u64>) {
+        if let Some(ms) = until_ms {
+            let left = ms.saturating_sub(store::now_ms());
+            *lock(&self.inner.pairing_open_until) = Some(std::time::Instant::now() + std::time::Duration::from_millis(left));
+        }
+    }
+
+    /// A computer paired by itself here: said on the Networking page (the last five).
+    pub(crate) fn note_paired_by_itself(&self, name: &str) {
+        let mut noted = lock(&self.inner.paired_by_itself);
+        noted.push((name.to_string(), store::now_ms()));
+        let extra = noted.len().saturating_sub(5);
+        noted.drain(..extra);
     }
 
     /// Keep new settings that change nothing running (whether the Agent may set it up).
@@ -234,16 +295,33 @@ impl Network {
                 .ok()
         };
         let mut started = None;
-        if settings.lends() {
-            let bind = bind_address(&settings)?;
-            let (addr, stop, task) = worker::listen(self.clone(), &id, bind).await?;
+        *lock(&self.inner.listen_error) = None;
+        // (a listener that cannot start leaves this computer using others as set: said on the page, not a stop)
+        let listening = if settings.lends() {
+            let started = match bind_address(&settings) {
+                Ok(bind) => worker::listen(self.clone(), &id, bind).await,
+                Err(e) => Err(e),
+            };
+            match started {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    log::warn!("network: this computer is not lending itself: {e}");
+                    *lock(&self.inner.listen_error) = Some(e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some((addr, stop, task)) = listening {
             log::info!("network: this computer lends itself, listening on {addr}");
             started = daemon();
             if let Some(d) = &started {
                 // (what it has, said with its name: from its engines where they answer within a few seconds)
                 let read = async { tokio::join!(machine::engines_get(self, "/api/system"), machine::engines_get(self, "/api/resources")) };
                 let (system, resources) = tokio::time::timeout(std::time::Duration::from_secs(5), read).await.unwrap_or((Value::Null, Value::Null));
-                if let Err(e) = discovery::advertise(d, &id, &self.display_name(), addr.port(), &machine::summary(&system, &resources)) {
+                let summary = tokio::task::spawn_blocking(move || machine::summary(&system, &resources)).await.unwrap_or_default();
+                if let Err(e) = discovery::advertise(d, &id, &self.display_name(), addr.port(), &summary) {
                     log::warn!("network: not advertised on the LAN ({e}); another computer adds it by its address");
                 }
             }
@@ -304,6 +382,9 @@ impl Network {
             "lends": settings.lends(),
             "agent": settings.agent,
             "shareModels": settings.share_models != Some(false),
+            "pairingOpenUntilMs": self.pairing_open_until_ms(),
+            "pairedByItself": lock(&self.inner.paired_by_itself).iter().map(|(name, at)| json!({ "name": name, "at": at })).collect::<Vec<_>>(),
+            "listenError": lock(&self.inner.listen_error).clone(),
             "settings": settings,
             "nodeId": id.as_ref().map(|i| i.node_id.clone()),
             "name": self.display_name(),

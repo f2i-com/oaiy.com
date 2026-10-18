@@ -648,15 +648,17 @@ async fn two_computers_can_use_each_other() {
     }
 }
 
-/// Two computers whose people both let their Agent set up OAIY Network pair by themselves: the request is approved
-/// there at once and the pairing answered paired, both ways where the asking one lends too; one whose person did not
-/// is asked as before.
+/// A computer that asks to pair by itself (its person lets its Agent set up OAIY Network) is approved at once only
+/// while the other computer's window to pair by itself is open (its person or Agent opened it, minutes long): outside
+/// it, its person is asked as for any other. The first such pairing closes the window, and is told on the other's
+/// page; past a few computers so paired, the person is asked again even with the window open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn computers_that_both_allow_it_pair_by_themselves() {
+async fn a_computer_pairs_by_itself_only_while_the_others_window_is_open() {
     let a = node("a-auto", Role::Primary, None).await;
     let b = node("b-auto", Role::Worker, Some(fake_engines().await)).await;
     a.set(Settings { lends: Some(true), agent: true, ..a.settings() }).await.unwrap();
-    // b's person has not said so yet: b asks its person as before
+    // b's Agent may set it up, but no window is open: b's person is asked as before (its say-so alone is anyone's)
+    b.set(Settings { agent: true, ..b.settings() }).await.unwrap();
     let (pa, pb) = (router(a.clone()), router(b.clone()));
     let at = json!({ "address": b.listening().unwrap().to_string() });
     let (_, started) = call(&pa, "POST", "/api/network/pairings/start", Some(at.clone())).await;
@@ -664,9 +666,16 @@ async fn computers_that_both_allow_it_pair_by_themselves() {
     let (_, waiting) = call(&pb, "GET", "/api/network/requests", None).await;
     assert_eq!(waiting["requests"].as_array().unwrap().len(), 1);
     call(&pa, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": false }))).await;
-    // both do: paired at once, both ways
-    b.set(Settings { agent: true, ..b.settings() }).await.unwrap();
-    let at = json!({ "address": b.listening().unwrap().to_string() });
+    // a window more than ten minutes long, or opened on a computer that does not lend itself, is refused
+    let (code, _) = call(&pb, "PUT", "/api/network/settings", Some(json!({ "openPairingMinutes": 11 }))).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    let (code, _) = call(&pa, "PUT", "/api/network/settings", Some(json!({ "lends": false, "openPairingMinutes": 5 }))).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(a.settings().lends(), "nothing changed by a refused request");
+    // b's person opens the window: paired at once, both ways as asked, and the window closed by it
+    let (_, opened) = call(&pb, "PUT", "/api/network/settings", Some(json!({ "openPairingMinutes": 5 }))).await;
+    assert!(opened["pairingOpenUntilMs"].as_u64().unwrap() > store::now_ms() + 4 * 60_000, "{opened}");
+    let at = json!({ "address": b.listening().unwrap().to_string(), "bothWays": true });
     let (status, paired) = call(&pa, "POST", "/api/network/pairings/start", Some(at)).await;
     assert_eq!((status, &paired["status"], &paired["auto"]), (StatusCode::OK, &json!("approved"), &json!(true)), "{paired}");
     let b_id = paired["node"]["nodeId"].as_str().unwrap().to_string();
@@ -675,21 +684,60 @@ async fn computers_that_both_allow_it_pair_by_themselves() {
     assert!(b.inner().peers().get(&a_id, Role::Primary).is_some() && b.inner().peers().get(&a_id, Role::Worker).is_some());
     let (_, waiting) = call(&pb, "GET", "/api/network/requests", None).await;
     assert!(waiting["requests"].as_array().unwrap().is_empty(), "no person asked: {waiting}");
-    // each says it was paired by itself (no codes compared), both ways
+    let (_, told) = call(&pb, "GET", "/api/network/status", None).await;
+    assert!(told["pairingOpenUntilMs"].is_null(), "closed by the pairing: {told}");
+    assert_eq!(told["pairedByItself"][0]["name"], a.display_name(), "{told}");
+    // each says it was paired by itself (no codes compared)
     assert!(a.inner().peers().list().iter().chain(b.inner().peers().list()).all(|p| p.by_itself));
     let (_, nodes) = call(&pb, "GET", "/api/network/nodes", None).await;
     assert_eq!(nodes["nodes"][0]["pairedByItself"], true, "{nodes}");
-    // past a few so paired, its person is asked again
-    let peer = b.inner().peers().get(&a_id, Role::Primary).cloned().unwrap();
-    for i in 0..8 {
-        let made = store::Peer { node_id: format!("made{i}"), fingerprint: format!("{i:064}"), ..peer.clone() };
-        b.inner().peers().add(made).unwrap();
-    }
+    // the window closed: the next computer asking so waits for the person
     let c = node("c-auto", Role::Primary, None).await;
     c.set(Settings { agent: true, ..c.settings() }).await.unwrap();
-    let (_, asked) = call(&router(c.clone()), "POST", "/api/network/pairings/start", Some(json!({ "address": b.listening().unwrap().to_string() }))).await;
-    assert_eq!(asked["status"], "pending", "{asked}");
+    let ask_c = || async { call(&router(c.clone()), "POST", "/api/network/pairings/start", Some(json!({ "address": b.listening().unwrap().to_string() }))).await.1 };
+    assert_eq!(ask_c().await["status"], "pending");
+    // past a few computers so paired (computers, not pairings), its person is asked even with the window open
+    let peer = b.inner().peers().get(&a_id, Role::Primary).cloned().unwrap();
+    for i in 0..8 {
+        let made = store::Peer { node_id: format!("{i:032x}"), fingerprint: format!("{i:064}"), ..peer.clone() };
+        b.inner().peers().add(made).unwrap();
+    }
+    call(&pb, "PUT", "/api/network/settings", Some(json!({ "openPairingMinutes": 2 }))).await;
+    assert_eq!(ask_c().await["status"], "pending");
+    let (_, still) = call(&pb, "GET", "/api/network/status", None).await;
+    assert!(still["pairingOpenUntilMs"].is_u64(), "not taken by a request it did not approve: {still}");
     for n in [&a, &b, &c] {
+        n.stop();
+    }
+}
+
+/// A computer approved to use this one says it lends itself too (`/lends`) as they pair alone: not one approved long
+/// ago, which would make this computer use it (and ask it first for model files) by saying so; once said, it stands.
+/// A node id not as OAIY makes them (what names a computer's voice copies) is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_computer_lends_itself_back_only_as_they_pair() {
+    let worker = node("worker-lends", Role::Worker, None).await;
+    let primary = node("primary-lends", Role::Primary, None).await;
+    pair(&primary, &worker).await;
+    let primary_id = primary.identity().unwrap().node_id;
+    let pinned = tls::client(&primary.identity().unwrap(), Pin::Record(Default::default())).unwrap();
+    let address = worker.listening().unwrap();
+    let lends = || pinned.post(format!("https://{address}/worker/v1/lends")).json(&json!({ "port": 40001, "name": "the primary-lends" })).send();
+    // approved eleven minutes ago: refused
+    let approved = worker.inner().peers().get(&primary_id, Role::Primary).cloned().unwrap();
+    worker.inner().peers().add(store::Peer { paired_at_ms: store::now_ms() - 11 * 60_000, ..approved.clone() }).unwrap();
+    assert_eq!(lends().await.unwrap().status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(worker.inner().peers().get(&primary_id, Role::Worker).is_none());
+    // as they pair: kept, and said again, it changes nothing
+    worker.inner().peers().add(store::Peer { paired_at_ms: store::now_ms(), ..approved }).unwrap();
+    assert_eq!(lends().await.unwrap().status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(worker.inner().peers().get(&primary_id, Role::Worker).is_some_and(|w| w.address.ends_with(":40001")));
+    assert_eq!(lends().await.unwrap().status(), reqwest::StatusCode::NO_CONTENT);
+    // a node id as OAIY does not make them
+    let stranger = tls::client(&super::identity::Identity::generate().unwrap(), Pin::Record(Default::default())).unwrap();
+    let asked = stranger.post(format!("https://{address}/worker/v1/pair")).json(&json!({ "nodeId": "ab", "name": "x" })).send().await.unwrap();
+    assert_eq!(asked.status(), reqwest::StatusCode::BAD_REQUEST);
+    for n in [&worker, &primary] {
         n.stop();
     }
 }

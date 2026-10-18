@@ -120,7 +120,7 @@ impl Host for DashboardHost {
     }
 
     fn restart(&self) {
-        crate::gui::restart_app(self.app.clone());
+        crate::gui::relaunch(self.app.clone());
     }
 }
 

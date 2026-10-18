@@ -146,6 +146,21 @@ impl GateRefusal {
     }
 }
 
+/// What a package says of itself, read from its manifest: for display alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Declared {
+    pub name: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+}
+
+impl Declared {
+    fn of(m: &PluginManifest) -> Self {
+        Declared { name: m.name.clone(), version: m.version.clone(), capabilities: m.capabilities.clone() }
+    }
+}
+
 /// One plugin as the registry sees it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,6 +175,10 @@ pub struct PluginRecord {
     /// the failure is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<PluginManifest>,
+    /// What a package that may not run says of itself (its name, version and the capabilities it asks for), for the
+    /// person deciding whether to trust it: shown in that question, never acted on (the record has no manifest).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared: Option<Declared>,
     /// Capability names rewritten from a pre-OAIY spelling, for a UI nudge.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub legacy_capabilities: Vec<(String, String)>,
@@ -204,6 +223,7 @@ impl PluginRecord {
             reason: Some("Not started yet.".into()),
             dir,
             manifest: Some(m),
+            declared: None,
             legacy_capabilities: legacy,
             unknown_capabilities: unknown,
             user_disabled: false,
@@ -222,6 +242,7 @@ impl PluginRecord {
             reason: Some(err.reason()),
             dir,
             manifest: None,
+            declared: None,
             legacy_capabilities: Vec::new(),
             unknown_capabilities: Vec::new(),
             user_disabled: false,
@@ -234,14 +255,15 @@ impl PluginRecord {
     }
 
     /// A plugin whose package may not run: listed as disabled, with why, and without a
-    /// manifest (see [`PluginRecord::trust`]).
-    fn withheld(dir: PathBuf, id: String, trust: PackageTrust) -> Self {
+    /// manifest (see [`PluginRecord::trust`]); what it says of itself (`declared`) shown.
+    fn withheld(dir: PathBuf, id: String, trust: PackageTrust, declared: Option<Declared>) -> Self {
         Self {
             id,
             state: PluginState::Disabled,
             reason: Some(format!("Not started. {}", trust.reason.as_deref().unwrap_or("Its package is not trusted."))),
             dir,
             manifest: None,
+            declared,
             legacy_capabilities: Vec::new(),
             unknown_capabilities: Vec::new(),
             user_disabled: false,
@@ -448,7 +470,7 @@ impl PluginRegistry {
                     if !trust.allows_launch() && !live {
                         // Quarantined, or unsigned and not trusted: listed with why, and
                         // with nothing of its manifest for anyone to build on.
-                        self.plugins.insert(id.clone(), PluginRecord::withheld(dir, id, trust));
+                        self.plugins.insert(id.clone(), PluginRecord::withheld(dir, id, trust, Some(Declared::of(&m))));
                         report.invalid += 1;
                         continue;
                     }
@@ -547,7 +569,8 @@ impl PluginRegistry {
     /// been refused.
     pub fn withhold(&mut self, id: &str, trust: PackageTrust) {
         let Some(existing) = self.plugins.get(id) else { return };
-        let record = PluginRecord::withheld(existing.dir.clone(), id.to_string(), trust);
+        let declared = existing.manifest.as_ref().map(Declared::of).or_else(|| existing.declared.clone());
+        let record = PluginRecord::withheld(existing.dir.clone(), id.to_string(), trust, declared);
         self.plugins.insert(id.to_string(), record);
         self.apply_disabled();
     }
@@ -1556,6 +1579,11 @@ mod tests {
         assert!(!rec.is_loadable());
         assert!(reg.autostart_ids().is_empty());
         assert!(rec.reason.as_deref().unwrap().contains("trust this exact package"));
+        // what it says of itself, for the question whether to trust it (shown, while its manifest is not kept)
+        let declared = rec.declared.as_ref().expect("its name and what it asks for");
+        assert!(rec.manifest.is_none() && !declared.name.is_empty());
+        let listed = serde_json::to_value(rec).unwrap();
+        assert!(listed.get("manifest").is_none() && listed["declared"]["name"].is_string(), "{listed}");
     }
 
     #[test]

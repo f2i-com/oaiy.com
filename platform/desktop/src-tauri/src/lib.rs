@@ -1121,8 +1121,39 @@ async fn add_engine_model(path: String) -> Result<serde_json::Value, String> {
 /// `http://localhost:17973` ("Hmmm… can't reach this page"). So in a debug build
 /// we DON'T relaunch — we leave the working window in place and tell the user to
 /// re-run the dev command to apply the change.
+///
+/// Refused while something a restart would cut is under way: the data folder being copied or moved (a restart then
+/// leaves it split between the two folders), a call, an update, an install or an engine's job (the updater's own
+/// list, `update::blockers`), so Settings says what to wait for.
 #[tauri::command]
-pub(crate) fn restart_app(app: tauri::AppHandle) {
+async fn restart_app(app: tauri::AppHandle, migration: tauri::State<'_, MigrationHandle>) -> Result<(), String> {
+    if migration.lock().map(|g| g.running).unwrap_or(true) {
+        return Err("The data folder is still being copied or moved: restart OAIY once that has finished.".into());
+    }
+    // (the updater's look at what OAIY is doing: it can ask a phone plugin, so off the async runtime's own thread)
+    let activity = app.try_state::<crate::update::UpdaterHandle>().and_then(|u| u.activity());
+    // (what a restart would cut for certain; downloads stop, as the confirmation says, and a reading OAIY cannot take
+    // does not hold back the restart that may be what mends it)
+    const WAITS_FOR: [&str; 6] = ["call", "phoneCall", "agentTask", "mediaJob", "installing", "migration"];
+    let reasons: Vec<_> = tokio::task::spawn_blocking(move || match activity {
+        Some(a) => crate::update::blockers::work_blockers(&a.read(true), "restart"),
+        None => Vec::new(),
+    })
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|b| WAITS_FOR.contains(&b.code))
+    .collect();
+    if !reasons.is_empty() {
+        let said: Vec<String> = reasons.iter().map(|b| b.message.clone()).collect();
+        return Err(format!("Restarting has to wait. {} Try again when it is finished.", said.join(" ")));
+    }
+    relaunch(app);
+    Ok(())
+}
+
+/// Relaunch the app now (the restart above, once nothing is in the way; a restore, after its own checks).
+pub(crate) fn relaunch(app: tauri::AppHandle) {
     #[cfg(debug_assertions)]
     {
         use tauri_plugin_notification::NotificationExt;

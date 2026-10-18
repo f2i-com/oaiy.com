@@ -122,6 +122,11 @@ pub fn is_nonce(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Whether `s` is a node id as [`Identity::load_or_create`] makes them: 32 lowercase hex digits.
+pub fn node_id_ok(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

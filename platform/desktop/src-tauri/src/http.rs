@@ -907,7 +907,12 @@ pub(crate) fn engines_ui() -> Option<String> {
 const ENGINES_NOT_RUNNING: &str = "The engines are not running: they start with OAIY, or run oaiy-studio.";
 
 pub(crate) async fn studio_json(ui: &str, method: reqwest::Method, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, (u16, String)> {
-    let mut req = reqwest::Client::new().request(method, format!("{ui}{path}")).timeout(std::time::Duration::from_secs(10));
+    studio_json_within(ui, method, path, body, std::time::Duration::from_secs(10)).await
+}
+
+/// As [`studio_json`], waiting `wait` for the answer (a model's plan asks Hugging Face and the computers on the network).
+pub(crate) async fn studio_json_within(ui: &str, method: reqwest::Method, path: &str, body: Option<serde_json::Value>, wait: std::time::Duration) -> Result<serde_json::Value, (u16, String)> {
+    let mut req = reqwest::Client::new().request(method, format!("{ui}{path}")).timeout(wait);
     if let Some(body) = body {
         req = req.json(&body);
     }
@@ -1057,7 +1062,7 @@ pub(crate) async fn engines_plan_at(ui: Option<String>, id: &str, token: Option<
     if let Some(t) = token {
         body["hf_token"] = serde_json::Value::String(t);
     }
-    let p = studio_json(&ui, reqwest::Method::POST, "/api/downloads/plan", Some(body)).await?;
+    let p = studio_json_within(&ui, reqwest::Method::POST, "/api/downloads/plan", Some(body), std::time::Duration::from_secs(60)).await?;
     let files: Vec<serde_json::Value> = p
         .get("files")
         .and_then(|f| f.as_array())

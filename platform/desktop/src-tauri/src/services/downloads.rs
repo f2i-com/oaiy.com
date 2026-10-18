@@ -1484,6 +1484,11 @@ fn walk_dir(root: &Path, root_base: &Path, out: &mut Vec<ModelFile>) -> std::io:
         if entry.file_type()?.is_symlink() {
             continue;
         }
+        // Hidden entries are bookkeeping, not models: a service's `.oaiy-installed`, the engines' `.oaiy-<id>.json`
+        // markers, a Mac's `.DS_Store`.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let p = entry.path();
         let meta = entry.metadata()?;
         if meta.is_dir() {
@@ -1579,6 +1584,24 @@ fn hex(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A models folder's bookkeeping (a service's installed marker, the engines' markers, a Mac's folder file) is not
+    /// listed as a model; the models are.
+    #[test]
+    fn hidden_files_are_not_listed_as_models() {
+        let root = std::env::temp_dir().join(format!("oaiy-walk-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("oaiy-voice")).unwrap();
+        std::fs::create_dir_all(root.join("Qwen3.5-9B-GGUF")).unwrap();
+        std::fs::write(root.join("oaiy-voice/.oaiy-installed"), b"x").unwrap();
+        std::fs::write(root.join(".DS_Store"), b"x").unwrap();
+        std::fs::write(root.join("Qwen3.5-9B-GGUF/.oaiy-qwen3.5-9b.json"), b"{}").unwrap();
+        std::fs::write(root.join("Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"), b"gguf").unwrap();
+        let mut out = Vec::new();
+        walk_dir(&root, &root, &mut out).unwrap();
+        assert_eq!(out.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn hf_blob_to_resolve() {

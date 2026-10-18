@@ -900,8 +900,9 @@ async fn a_models_plan_says_what_is_here_already_and_what_is_left_to_fetch() {
 }
 
 /// The Agent sets OAIY Network up only where the person lets it (`agent` on the network's settings): refused otherwise.
-/// Allowed, it pairs: at once where the other computer pairs by itself too, else waiting for that computer's person
-/// and then confirming this side, both ways where this computer lends itself.
+/// Allowed, it pairs: at once where the other computer's window to pair by itself is open, else waiting for that
+/// computer's person, and then confirming this side only on this person's word that both screens show the same code
+/// (`codeConfirmed`): never by itself. One way unless asked both.
 #[tokio::test]
 async fn the_agent_sets_up_and_pairs_only_where_the_person_lets_it() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -923,7 +924,7 @@ async fn the_agent_sets_up_and_pairs_only_where_the_person_lets_it() {
             "/api/network/pairings/start",
             axum::routing::post(|Json(b): Json<Value>| async move {
                 if b["address"] == "10.0.0.2:17975" {
-                    return Json(json!({ "status": "approved", "auto": true, "code": "111 222", "worker": { "name": "Auto" }, "node": { "nodeId": "a1" } }));
+                    return Json(json!({ "status": "approved", "auto": true, "code": "111 222", "worker": { "name": "Auto" }, "node": { "nodeId": "a1", "usesThis": false } }));
                 }
                 Json(json!({ "status": "pending", "pairingId": "p1", "code": "123 456", "worker": { "name": "Rig" } }))
             }),
@@ -935,7 +936,10 @@ async fn the_agent_sets_up_and_pairs_only_where_the_person_lets_it() {
                 async move {
                     c.lock().unwrap().push(b.clone());
                     if b.get("accept") == Some(&json!(true)) {
-                        return Json(json!({ "status": "approved", "node": { "nodeId": "w1" } }));
+                        return Json(json!({ "status": "approved", "node": { "nodeId": "w1", "usesThis": false } }));
+                    }
+                    if b.get("accept") == Some(&json!(false)) {
+                        return Json(json!({ "status": "declined" }));
                     }
                     Json(if n.fetch_add(1, Ordering::SeqCst) == 0 { json!({ "status": "pending", "code": "123 456" }) } else { json!({ "status": "approved_there", "code": "123 456" }) })
                 }
@@ -943,11 +947,24 @@ async fn the_agent_sets_up_and_pairs_only_where_the_person_lets_it() {
         );
     let (_, app) = control_with(&sb, Some(on), None);
     let r = call(&app, None, "network_pair", json!({ "address": "10.0.0.2:17975" })).await;
-    assert!(!is_error(&r) && text(&r).contains("Paired with Auto: both computers pair by themselves"), "{r}");
+    assert!(!is_error(&r) && text(&r).contains(r#"Paired with "Auto" at once"#) && !text(&r).contains("both ways"), "{r}");
+    // approved there: the code is the person's to compare, nothing confirmed here by the tool itself
     let r = call(&app, None, "network_pair", json!({ "address": "192.168.1.20:17975", "waitSeconds": 10 })).await;
-    assert!(!is_error(&r) && text(&r).contains("Paired with Rig, both ways"), "{r}");
+    assert!(!is_error(&r) && text(&r).contains("123 456") && text(&r).contains("codeConfirmed"), "{r}");
+    assert_eq!(r["structuredContent"]["status"], "confirm_code", "{r}");
+    assert!(confirms.lock().unwrap().iter().all(|b| b.get("accept").is_none()), "not confirmed: {:?}", confirms.lock().unwrap());
+    // the person says both screens show it: confirmed, one way (not asked both)
+    let r = call(&app, None, "network_pair", json!({ "pairingId": "p1", "codeConfirmed": true })).await;
+    assert!(!is_error(&r) && text(&r).contains(r#"Paired with "the computer""#), "{r}");
     let last = confirms.lock().unwrap().last().cloned().unwrap();
-    assert_eq!((&last["accept"], &last["bothWays"]), (&json!(true), &json!(true)), "this side confirmed, both ways: {last}");
+    assert_eq!((&last["accept"], &last["bothWays"]), (&json!(true), &json!(false)), "this side confirmed, one way: {last}");
+    // the person says they differ: given up
+    let r = call(&app, None, "network_pair", json!({ "pairingId": "p1", "codeConfirmed": false })).await;
+    assert!(!is_error(&r) && text(&r).contains("Given up"), "{r}");
+    assert_eq!(confirms.lock().unwrap().last().unwrap()["accept"], false);
+    // codeConfirmed with no pairing started is refused
+    let r = call(&app, None, "network_pair", json!({ "address": "192.168.1.20:17975", "codeConfirmed": true })).await;
+    assert!(is_error(&r), "{r}");
 }
 
 /// The pages the Agent may ask to be shown are the dashboard's own: every view the dashboard can be navigated to (`NAV_VIEWS` in navigate.ts) is one the

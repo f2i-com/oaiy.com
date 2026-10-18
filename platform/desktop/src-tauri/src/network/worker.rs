@@ -1,10 +1,11 @@
 //! A worker's listener on the LAN: `/worker/v1/*` over mutual TLS ([`super::tls`]).
 //!
 //! Anyone on the LAN may ask `health` (what this node is) and ask to pair (the request waits for the person here to
-//! approve it, with the code both screens show). Everything else answers a paired primary's certificate alone: this
-//! computer's capabilities (its engines' discovery and resources, private paths taken out), its language model's
-//! chat, and its engines' media routes and files. Nothing else of the computer is reachable here: no settings,
-//! plugins, Agent, files beyond what its engines made, or pairing of anything but a primary.
+//! approve it, with the code both screens show, unless the person or their Agent opened a window to pair by itself).
+//! Everything else answers a paired primary's certificate alone: this computer's capabilities (its engines' discovery
+//! and resources, private paths taken out), its language model's chat, its engines' media routes and the files they
+//! made, the flows and services its person shares, and its model files by their SHA-256 (`files`). Nothing else of the
+//! computer is reachable here: no settings, plugins, Agent, other files, or pairing of anything but a primary.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -247,10 +248,11 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     let Some(fp) = caller.fingerprint.clone() else {
         return refuse(StatusCode::UNAUTHORIZED, "no_certificate", "a primary presents its certificate to pair");
     };
-    let node_id: String = req.node_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(64).collect();
+    let node_id = req.node_id.clone();
     let name: String = req.name.chars().filter(|c| !c.is_control()).take(80).collect();
-    if node_id.is_empty() {
-        return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a node id is needed");
+    // (a node id as OAIY makes them: what names its copies here, `from-<six of it>-…`, and nothing else)
+    if !super::identity::node_id_ok(&node_id) {
+        return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a node id is 32 lowercase hex digits");
     }
     // (a node id paired here with another certificate: it would stand in for that computer)
     if net.inner().peers().taken(&node_id, &fp) {
@@ -319,12 +321,24 @@ async fn pair_reveal(State(net): State<Network>, Extension(caller): Extension<Ca
     r.code = Some(code);
     let (nonce, auto, name, request) = (r.nonce.clone(), r.auto, r.name.clone(), r.id.clone());
     drop(waiting);
-    // (both computers pair by themselves: approved here at once, no person asked; past a few so paired, the person is
-    // asked again, so no computer on the network pairs over and over)
-    let room = net.inner().peers().list().iter().filter(|p| p.by_itself).count() < MAX_BY_ITSELF;
-    let approved = auto && room && net.settings().agent && matches!(decide_as(&net, &request, true, true), Ok(Some(_)));
+    // (a computer that asks to pair by itself is approved at once only while this computer's person (or their Agent)
+    // has a window open for it, minutes long, closed by the first such pairing: its say-so alone is anyone's on the
+    // network. Past a few computers so paired, the person is asked again.)
+    let approved = auto && by_itself_room(&net) && {
+        let until = net.pairing_open_until_ms();
+        if net.take_pairing_window() {
+            let made = matches!(decide_as(&net, &request, true, true), Ok(Some(_)));
+            if !made {
+                net.give_back_pairing_window(until);
+            }
+            made
+        } else {
+            false
+        }
+    };
     if approved {
-        log::info!("network: paired with {name} by itself (both computers let their Agent set up OAIY Network)");
+        log::info!("network: paired with {name} by itself (its window to pair by itself was open here; closed now)");
+        net.note_paired_by_itself(&name);
     }
     Json(json!({ "nonce": nonce, "approved": approved })).into_response()
 }
@@ -381,6 +395,18 @@ async fn lends(State(net): State<Network>, Extension(caller): Extension<Caller>,
     if asked.port == 0 {
         return refuse(StatusCode::BAD_REQUEST, "invalid_request", "the port it listens on is needed");
     }
+    // (as they pair alone, once: a computer approved here long ago cannot make this one use it, and its downloads ask
+    // it first, by saying so)
+    if let Some(w) = net.inner().peers().get(&primary.node_id, Role::Worker) {
+        return if w.fingerprint == primary.fingerprint {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            refuse(StatusCode::CONFLICT, "node_id_taken", super::store::TAKEN)
+        };
+    }
+    if now_ms().saturating_sub(primary.paired_at_ms) > LENDS_WINDOW.as_millis() as u64 {
+        return refuse(StatusCode::FORBIDDEN, "lends_closed", "a computer lets this one use it as they pair alone: pair again, both ways");
+    }
     let name: String = asked.name.unwrap_or_default().chars().filter(|c| !c.is_control()).take(80).collect();
     let peer = Peer {
         role: Role::Worker,
@@ -399,8 +425,19 @@ async fn lends(State(net): State<Network>, Extension(caller): Extension<Caller>,
     }
 }
 
-/// The computers paired by themselves kept at once; past them, the person is asked.
+/// The computers paired by themselves kept at once (computers, not pairings: one paired both ways is one); past them,
+/// the person is asked.
 const MAX_BY_ITSELF: usize = 8;
+
+/// How long after this computer approves a computer that one may say it lends itself to this one too (both ways).
+const LENDS_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// Whether another computer may pair by itself here (fewer than [`MAX_BY_ITSELF`] so paired).
+fn by_itself_room(net: &Network) -> bool {
+    let peers = net.inner().peers();
+    let computers: std::collections::HashSet<&str> = peers.list().iter().filter(|p| p.by_itself).map(|p| p.node_id.as_str()).collect();
+    computers.len() < MAX_BY_ITSELF
+}
 
 /// The approval the person gives here (`/api/network/requests/:id/approve`): the primary is paired.
 pub(crate) fn decide(net: &Network, id: &str, approve: bool) -> Result<Option<Peer>, String> {
@@ -481,6 +518,8 @@ async fn capabilities(State(net): State<Network>, Extension(caller): Extension<C
     let reading = net.clone();
     let flows = tokio::task::spawn_blocking(move || shared_flows(&reading)["flows"].clone()).await.unwrap_or_else(|_| json!([]));
     let (resources, system, media_jobs) = tokio::join!(local_resources(&net), super::machine::engines_get(&net, "/api/system"), super::machine::engines_get(&net, "/api/jobs"));
+    // (its processor's load read off the async threads: a program the system has)
+    let machine = tokio::task::spawn_blocking(move || super::machine::machine(&system)).await.unwrap_or(Value::Null);
     Json(json!({
         "node": node,
         "discovery": discovery,
@@ -488,7 +527,7 @@ async fn capabilities(State(net): State<Network>, Extension(caller): Extension<C
         "resources": resources,
         "flows": flows,
         "services": shared_services(&net),
-        "machine": super::machine::machine(&system),
+        "machine": machine,
         "jobs": jobs(&net, &asking, &media_jobs),
     }))
     .into_response()
@@ -777,9 +816,17 @@ pub(crate) fn forget_voices(node_id: &str) {
     }
 }
 
-/// The name a primary's voice is kept under here: its own beside this computer's, never in place of one.
+/// The name a primary's voice is kept under here: its own beside this computer's, never in place of one. Within the
+/// 48 characters a voice's name has: a long one cut, with six hex digits of its whole name, so two never meet.
 pub(crate) fn copied_voice_name(primary_node: &str, voice: &str) -> String {
     let short: String = primary_node.chars().take(6).collect();
+    let voice = if voice.len() > 36 {
+        use sha2::Digest;
+        let tag: String = sha2::Sha256::digest(voice.as_bytes()).iter().take(3).map(|b| format!("{b:02x}")).collect();
+        format!("{}-{tag}", &voice[..29])
+    } else {
+        voice.to_string()
+    };
     format!("from-{short}-{voice}")
 }
 
@@ -795,7 +842,12 @@ async fn voice_copy(State(net): State<Network>, Extension(caller): Extension<Cal
     if bytes.len() > crate::voice::voices::MAX_CLIP_BYTES {
         return refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "a voice clip is 20 MB at most");
     }
-    let stored = copied_voice_name(&primary.node_id, &name);
+    // (its name as this computer keeps names, first: one that is nothing once cleaned, or that would be cut to collide
+    // with another, is refused or made distinct)
+    let Ok(voice) = crate::voice::voices::clean_name(&name) else {
+        return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a voice is named with letters, digits, - or _");
+    };
+    let stored = copied_voice_name(&primary.node_id, &voice);
     let prefix = copied_voice_name(&primary.node_id, "");
     let extension = copy.extension.unwrap_or_else(|| "wav".into());
     // (one copy at a time: two of the same voice at once, a call's greeting and its first line, replace it in turn)

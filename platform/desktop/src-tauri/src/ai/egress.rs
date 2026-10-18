@@ -133,8 +133,10 @@ fn request_url(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest:
     }
     let base = base_url.trim_end_matches('/');
     // OpenAI-compatible settings commonly include /v1 already. Keep custom
-    // proxy prefixes while adding the protocol version only once.
-    let path = if base.ends_with("/v1") {
+    // proxy prefixes while adding the protocol version only once. Google's
+    // OpenAI-compatible address (`…/v1beta/openai`) carries its own version and
+    // takes `/models` and `/chat/completions` straight under it.
+    let path = if base.ends_with("/v1") || base.ends_with("/openai") {
         path.strip_prefix("/v1/").unwrap_or(path)
     } else {
         path
@@ -289,5 +291,12 @@ mod tests {
         assert_eq!(url.path(), "/proxy/v1/models");
         let url = validate("http://127.0.0.1:18080/proxy", "/v1/models", true).unwrap();
         assert_eq!(url.path(), "/proxy/v1/models");
+        // Google Gemini's OpenAI-compatible address: its own version, no /v1 added under it
+        for base in ["https://generativelanguage.googleapis.com/v1beta/openai", "https://generativelanguage.googleapis.com/v1beta/openai/"] {
+            for endpoint in ["models", "chat/completions"] {
+                let url = request_url(base, &format!("/v1/{endpoint}"), false).unwrap();
+                assert_eq!(url.as_str(), format!("https://generativelanguage.googleapis.com/v1beta/openai/{endpoint}"));
+            }
+        }
     }
 }

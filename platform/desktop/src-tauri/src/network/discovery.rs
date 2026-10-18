@@ -71,6 +71,11 @@ pub(crate) fn browse(daemon: &mdns_sd::ServiceDaemon, found: Arc<Mutex<HashMap<S
                         let protocol = s.get_property_val_str("proto").and_then(|p| p.parse().ok()).unwrap_or(0);
                         let hardware = s.get_property_val_str("hw").map(|h| h.chars().filter(|c| !c.is_control()).take(160).collect::<String>()).filter(|h| !h.is_empty());
                         by_name.insert(s.get_fullname().to_string(), node_id.clone());
+                        // (as many names kept as workers are: one advertising thousands of names fills no memory)
+                        if by_name.len() > MAX_FOUND * 4 {
+                            let kept = found.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect::<std::collections::HashSet<_>>();
+                            by_name.retain(|_, id| kept.contains(id) || *id == node_id);
+                        }
                         let entry = Found { node_id: node_id.clone(), name, addresses, protocol, hardware, seen_ms: super::store::now_ms() };
                         let mut found = found.lock().unwrap_or_else(|p| p.into_inner());
                         // (as many as a LAN has: a computer advertising thousands of made-up workers fills no memory)

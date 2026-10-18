@@ -113,18 +113,37 @@ pub(crate) async fn set_default_at(ui: Option<String>, group: &str, model: &str)
         return Err((400, "a model is its name in the engines, as models_list shows it".into()));
     }
     let ui = ui.ok_or((409, NOT_RUNNING.to_string()))?;
-    let mut config = studio_json(&ui, reqwest::Method::GET, "/api/config", None).await?;
-    let mut at = &mut config;
-    for key in section {
-        at = at
-            .get_mut(*key)
-            .filter(|v| v.is_object())
-            .ok_or_else(|| (502, format!("the engines' configuration has no {} section", section.join("."))))?;
-    }
-    at["default_model"] = Value::String(model.to_string());
     // The engines check it: a model that is not one of the group's is refused with why.
-    studio_json(&ui, reqwest::Method::PUT, "/api/config", Some(config)).await?;
+    edit_config(&ui, |config| {
+        let mut at = config;
+        for key in section {
+            at = at
+                .get_mut(*key)
+                .filter(|v| v.is_object())
+                .ok_or_else(|| (502, format!("the engines' configuration has no {} section", section.join("."))))?;
+        }
+        at["default_model"] = Value::String(model.to_string());
+        Ok(true)
+    })
+    .await?;
     Ok(json!({ "group": group, "model": model }))
+}
+
+/// Change the engines' configuration at `ui`: read it, `change` it (`Ok(false)`: nothing to write), and write it
+/// back. The engines refuse a configuration read before another change was saved (409); then it is read and changed
+/// again, once, so neither change is lost.
+async fn edit_config(ui: &str, change: impl Fn(&mut Value) -> Result<bool, (u16, String)>) -> Result<(), (u16, String)> {
+    for attempt in 0..2 {
+        let mut config = studio_json(ui, reqwest::Method::GET, "/api/config", None).await?;
+        if !change(&mut config)? {
+            return Ok(());
+        }
+        match studio_json(ui, reqwest::Method::PUT, "/api/config", Some(config)).await {
+            Err((409, _)) if attempt == 0 => continue,
+            other => return other.map(|_| ()),
+        }
+    }
+    Ok(())
 }
 
 async fn set_default(State(control): State<Control>, Json(body): Json<DefaultBody>) -> Response {
@@ -148,23 +167,25 @@ pub(crate) async fn set_egpu_at(ui: Option<String>, model: Option<&str>) -> Resu
         return Err((400, "a model is its name in the engines, as models_list shows it".into()));
     }
     let ui = ui.ok_or((409, NOT_RUNNING.to_string()))?;
-    let mut config = studio_json(&ui, reqwest::Method::GET, "/api/config", None).await?;
-    let llm = config.get_mut("llm").filter(|v| v.is_object()).ok_or((502, "the engines' configuration has no llm section".to_string()))?;
-    let on = llm.pointer("/egpu/enabled").and_then(Value::as_bool).unwrap_or(false);
-    if model.is_some() && !on {
-        return Err((409, "the eGPU is switched off: switch it on in Engines → Settings → eGPU, where the card is set up".into()));
-    }
-    let models = llm.get_mut("models").and_then(Value::as_array_mut).ok_or((502, "the engines' configuration lists no language models".to_string()))?;
-    let name = |m: &Value| m.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-    if let Some(m) = model {
+    edit_config(&ui, |config| {
+        let llm = config.get_mut("llm").filter(|v| v.is_object()).ok_or((502, "the engines' configuration has no llm section".to_string()))?;
+        let on = llm.pointer("/egpu/enabled").and_then(Value::as_bool).unwrap_or(false);
+        if model.is_some() && !on {
+            return Err((409, "the eGPU is switched off: switch it on in Engines → Settings → eGPU, where the card is set up".into()));
+        }
+        let models = llm.get_mut("models").and_then(Value::as_array_mut).ok_or((502, "the engines' configuration lists no language models".to_string()))?;
+        let name = |m: &Value| m.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let Some(m) = model else { return Ok(false) };
         let Some(obj) = models.iter_mut().find(|x| name(x) == m).and_then(Value::as_object_mut) else {
             return Err((404, format!("the engines have no language model called {m}")));
         };
-        if obj.get("egpu") != Some(&Value::Bool(true)) {
-            obj.insert("egpu".into(), Value::Bool(true));
-            studio_json(&ui, reqwest::Method::PUT, "/api/config", Some(config)).await?;
+        if obj.get("egpu") == Some(&Value::Bool(true)) {
+            return Ok(false);
         }
-    }
+        obj.insert("egpu".into(), Value::Bool(true));
+        Ok(true)
+    })
+    .await?;
     // (loading starts now, not at the first chat: a model of 16 GB takes a minute to reach the card)
     let started = match model {
         Some(m) => studio_json(&ui, reqwest::Method::POST, "/api/egpu/start", Some(json!({ "model": m }))).await.err().map(|(_, e)| e),
