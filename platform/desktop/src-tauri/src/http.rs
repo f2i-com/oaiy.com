@@ -875,7 +875,8 @@ async fn engines_status() -> axum::response::Response {
     let Some(state) = state else {
         return Json(serde_json::json!({ "running": false, "uiUrl": ui })).into_response();
     };
-    let llm = state.get("llm").cloned().unwrap_or(serde_json::Value::Null);
+    // (the model the gateway serves: the Mac's, or the card's while the eGPU serves one)
+    let llm = crate::ai::routes::serving_llm(&state);
     let system = match reqwest::Client::new().get(format!("{ui}/api/system")).timeout(std::time::Duration::from_secs(5)).send().await {
         Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
@@ -891,6 +892,7 @@ async fn engines_status() -> axum::response::Response {
             "resident": llm.get("resident"),
             "models": llm.get("models"),
             "loadSeconds": llm.get("load_seconds"),
+            "runsOn": llm.get("runs_on"),
         },
         "gpus": system.get("gpus"),
     }))

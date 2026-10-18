@@ -94,7 +94,7 @@ pub(super) async fn resident_engine_provider(st: &AiState) -> Result<AiProvider,
     let (gateway, discovery, state) = engine_discovery_snapshot(st, true).await?;
     let source = plugin_engine_source_snapshot(&discovery, &state)?;
     if !source.completion_available
-        || state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(true) {
+        || serving_llm(&state).get("paused_for_media").and_then(Value::as_bool) == Some(true) {
         return Err("The chosen engine model is not already ready and resident.".into());
     }
     Ok(engine_provider(gateway, source.model))
@@ -109,9 +109,36 @@ async fn engine_discovery_impl(st: &AiState, require_resident: bool) -> Result<(
 }
 
 fn engine_model_resident(state: &Value, model: &str) -> bool {
+    let llm = serving_llm(state);
     !model.is_empty()
-        && state.pointer("/llm/state").and_then(Value::as_str) == Some("ready")
-        && state.pointer("/llm/resident").and_then(Value::as_str) == Some(model)
+        && llm.get("state").and_then(Value::as_str) == Some("ready")
+        && llm.get("resident").and_then(Value::as_str) == Some(model)
+}
+
+/// The engines' language model as their gateway serves it now: the Mac's (`llm`), or the card's when the eGPU serves one
+/// (enabled, ready, with a model, not lent to a picture job) and the Mac's is not ready. The engines report the two apart,
+/// and reading `llm` alone said "stopped" (and refused plugins' completions) while the card answered every chat.
+pub fn serving_llm(state: &Value) -> Value {
+    let llm = state.get("llm").cloned().unwrap_or(Value::Null);
+    if llm.get("state").and_then(Value::as_str) == Some("ready") {
+        return llm;
+    }
+    let Some(card) = state.get("egpu") else { return llm };
+    let serving = card.get("enabled").and_then(Value::as_bool) == Some(true)
+        && card.get("state").and_then(Value::as_str) == Some("ready")
+        && card.get("lent").and_then(Value::as_bool) != Some(true);
+    let Some(model) = card.get("model").and_then(Value::as_str).filter(|m| serving && !m.is_empty()) else { return llm };
+    let mut out = if llm.is_object() { llm } else { serde_json::json!({}) };
+    out["state"] = serde_json::json!("ready");
+    out["resident"] = serde_json::json!(model);
+    out["paused_for_media"] = serde_json::json!(false);
+    out["runs_on"] = serde_json::json!("eGPU");
+    for key in ["load_seconds", "context_tokens"] {
+        if let Some(v) = card.get(key) {
+            out[key] = v.clone();
+        }
+    }
+    out
 }
 
 /// Metadata for the selected local engine model. Reading this never loads it;
@@ -136,16 +163,18 @@ fn plugin_engine_source_snapshot(discovery: &Value, state: &Value) -> Result<Plu
         .and_then(|models| models.iter().find(|entry| entry.get("id").and_then(Value::as_str) == Some(model.as_str())))
         .ok_or("the selected language model is not in the engine catalogue")?;
     let files_present = selected.get("files_present");
+    // (the model the gateway serves now: the Mac's, or the card's while it serves one)
+    let llm = serving_llm(state);
     // Studio 0.1.0 omits this field. Only that absence may use its explicit
     // loaded/unpaused evidence; false, null and malformed flags remain denied.
     let legacy_ready = selected.get("loaded").and_then(Value::as_bool) == Some(true)
-        && state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(false);
+        && llm.get("paused_for_media").and_then(Value::as_bool) == Some(false);
     let files_available = match files_present {
         Some(Value::Bool(true)) => true,
         None => legacy_ready,
         _ => false,
     };
-    let paused = state.pointer("/llm/paused_for_media").and_then(Value::as_bool) == Some(true);
+    let paused = llm.get("paused_for_media").and_then(Value::as_bool) == Some(true);
     let completion_available = files_available && !paused && engine_model_resident(&state, &model);
     let unavailable_reason = if completion_available {
         None
@@ -156,7 +185,7 @@ fn plugin_engine_source_snapshot(discovery: &Value, state: &Value) -> Result<Plu
     } else if files_present.is_none() && !legacy_ready {
         Some("The legacy engine catalogue did not confirm that the selected model is loaded and unpaused. Check OAIY Engines before trying again.")
     } else {
-        Some(match state.pointer("/llm/state").and_then(Value::as_str) {
+        Some(match llm.get("state").and_then(Value::as_str) {
             Some("starting") => "The selected local model is loading. Wait until OAIY Engines shows it is ready, then read host models again.",
             Some("ready") => "A different local model is resident. Check the selected default in OAIY Engines before changing or restarting models.",
             Some("failed") => "The selected local model failed to start. Check OAIY Engines for the error before trying again.",
@@ -959,6 +988,33 @@ mod tests {
         assert_eq!(chosen_model(&json!({})), "");
         let p = engine_provider("http://127.0.0.1:8080".into(), "b".into());
         assert_eq!((p.id.as_str(), p.model.as_deref(), p.allow_local), (ENGINE_PROVIDER_ID, Some("b"), true));
+    }
+
+    /// The card serving the chosen model is the serving one beside a stopped Mac model (the engines report the two apart):
+    /// the window's status and plugins' completions saw "stopped" while the card answered every chat.
+    #[test]
+    fn the_cards_model_serves_while_the_macs_is_stopped() {
+        let discovery = json!({"defaults": {"llm": "big"}, "models": {"llm": [{"id": "big", "files_present": true}]}});
+        let state = json!({"llm": {"state": "stopped", "resident": null, "paused_for_media": false},
+            "egpu": {"enabled": true, "state": "ready", "model": "big", "lent": false, "load_seconds": 37.1}});
+        assert_eq!(serving_llm(&state)["resident"], json!("big"));
+        assert_eq!(serving_llm(&state)["runs_on"], json!("eGPU"));
+        assert!(plugin_engine_source_snapshot(&discovery, &state).unwrap().completion_available);
+        // Lent to a picture, still loading, or turned off: the Mac's model (stopped) is what serves.
+        for card in [
+            json!({"enabled": true, "state": "ready", "model": "big", "lent": true}),
+            json!({"enabled": true, "state": "starting", "model": "big"}),
+            json!({"enabled": false, "state": "ready", "model": "big"}),
+        ] {
+            let mut s = state.clone();
+            s["egpu"] = card;
+            assert_eq!(serving_llm(&s)["state"], json!("stopped"), "{s}");
+            assert!(!plugin_engine_source_snapshot(&discovery, &s).unwrap().completion_available, "{s}");
+        }
+        // A ready Mac model is the one serving, whatever the card holds.
+        let mut s = state;
+        s["llm"] = json!({"state": "ready", "resident": "small", "paused_for_media": false});
+        assert_eq!(serving_llm(&s)["resident"], json!("small"));
     }
 
     fn legacy_catalogue() -> (Value, Value) {
