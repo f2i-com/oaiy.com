@@ -249,7 +249,8 @@ fn wait_done(id: &str, wait: &AgentWait) -> Result<(DonePayload, u64, u32, PathB
         if since >= allowed {
             return Err(if s.activity { WaitError::Stalled } else { WaitError::Silent });
         }
-        let remaining = (allowed - since).min(wait.total - start.elapsed()).max(Duration::from_millis(1));
+        // (saturating: the total can run out between the check above and here, and a negative wait panicked)
+        let remaining = allowed.saturating_sub(since).min(wait.total.saturating_sub(start.elapsed())).max(Duration::from_millis(1));
         let (guard, _) = cv.wait_timeout(s, remaining.min(Duration::from_millis(250))).unwrap_or_else(|e| e.into_inner());
         s = guard;
     }

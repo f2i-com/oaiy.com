@@ -211,7 +211,7 @@ pub struct Change {
     pub formlogic: Option<Value>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Book {
     #[serde(default)]
     settings: Settings,
@@ -350,6 +350,10 @@ pub struct Calendar {
     /// Where stored flows live: a stored `business-lookup` flow answers instead of the calendar.
     flows_dir: Option<PathBuf>,
     book: Mutex<Book>,
+    /// Why the file of appointments could not be used when it was opened, where it could not.
+    problem: Option<String>,
+    /// Nothing is written over the file (it could be neither read nor put aside): a write would lose what is in it.
+    protected: bool,
 }
 
 static SHARED: OnceLock<Calendar> = OnceLock::new();
@@ -517,12 +521,48 @@ fn slug(name: &str) -> String {
     if s.is_empty() { "service".into() } else { s }
 }
 
+/// The book in `path`: none yet (no file), as read, or (a file that is not a calendar) afresh with the file put aside;
+/// with why it could not be used, and whether nothing may be written over it.
+fn load(path: &Path) -> (Book, Option<String>, bool) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Book::default(), None, false),
+        Err(e) => {
+            log::warn!("calendar: {} could not be read ({e}); nothing will be written over it", path.display());
+            return (Book::default(), Some(format!("The calendar's file could not be read ({e}), so no change can be kept until that is put right. It has not been changed.")), true);
+        }
+    };
+    let why = match serde_json::from_slice::<Book>(&bytes) {
+        Ok(book) => return (book, None, false),
+        Err(e) => e.to_string(),
+    };
+    match crate::secret_file::keep_aside(path) {
+        Ok(aside) => {
+            let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            log::warn!("calendar: {} is not usable ({why}); it is kept as {name}", path.display());
+            (Book::default(), Some(format!("The calendar's file could not be used ({why}). It is kept as {name} beside it, and the calendar starts afresh.")), false)
+        }
+        Err(e) => {
+            log::warn!("calendar: {} is not usable ({why}) and could not be put aside ({e}); nothing will be written over it", path.display());
+            (Book::default(), Some(format!("The calendar's file could not be used ({why}) and could not be put aside ({e}), so no change can be kept until that is put right. It has not been changed.")), true)
+        }
+    }
+}
+
 impl Calendar {
-    /// The calendar in `dir` (empty, with default hours, when it has none yet).
+    /// The calendar in `dir` (empty, with default hours, when it has none yet). A file that is there but cannot be
+    /// read as a calendar is never taken for an empty one, whose first change would write over every appointment in
+    /// it: it is put aside (kept beside, renamed) and the calendar starts afresh, or, where it cannot be put aside,
+    /// nothing is written over it (said in [`Calendar::problem`]).
     pub fn open(dir: &Path, flows_dir: Option<PathBuf>) -> Self {
         let path = dir.join("calendar.json");
-        let book = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Book>(&t).ok()).unwrap_or_default();
-        Self { path, flows_dir, book: Mutex::new(book) }
+        let (book, problem, protected) = load(&path);
+        Self { path, flows_dir, book: Mutex::new(book), problem, protected }
+    }
+
+    /// Why the calendar's file could not be used when it was opened, where it could not.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
     }
 
     fn save(&self, book: &Book) -> Result<(), String> {
@@ -530,15 +570,21 @@ impl Calendar {
             std::fs::create_dir_all(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
         }
         let text = serde_json::to_string_pretty(book).map_err(|e| e.to_string())?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, text).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| format!("could not save {}: {e}", self.path.display()))
+        // (written whole and synced before it takes the file's place: a power cut leaves the old file, not an empty one)
+        crate::secret_file::write(&self.path, text).map_err(|e| format!("could not save {}: {e}", self.path.display()))
     }
 
+    /// Change the book and save it; the change is kept only once it is saved (a save that fails leaves the calendar
+    /// as it was, not changed here and not on disk).
     fn with<T>(&self, change: impl FnOnce(&mut Book) -> Result<T, String>) -> Result<T, String> {
+        if self.protected {
+            return Err(self.problem.clone().unwrap_or_else(|| "the calendar's file cannot be written".into()));
+        }
         let mut book = self.book.lock().map_err(|_| "the calendar is unavailable".to_string())?;
-        let out = change(&mut book)?;
-        self.save(&book)?;
+        let mut next = book.clone();
+        let out = change(&mut next)?;
+        self.save(&next)?;
+        *book = next;
         Ok(out)
     }
 
@@ -851,6 +897,47 @@ fn weekday_index(w: Weekday) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A calendar file that is not a calendar (cut short by a power cut, written by something else) is put aside and
+    /// kept, never taken for an empty calendar whose first change writes over it; one that cannot be put aside is
+    /// not written over at all.
+    #[test]
+    fn a_calendar_file_that_cannot_be_read_is_kept_not_written_over() {
+        let dir = std::env::temp_dir().join(format!("oaiy-calendar-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("calendar.json"), b"{\"appointments\": [{\"id\": \"a1\", \"start").unwrap();
+        let cal = Calendar::open(&dir, None);
+        assert!(cal.problem().is_some_and(|p| p.contains("kept as")), "{:?}", cal.problem());
+        let kept: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != "calendar.json").collect();
+        assert_eq!(kept.len(), 1, "the bad file kept beside: {kept:?}");
+        assert!(std::fs::read(dir.join(&kept[0])).unwrap().starts_with(b"{\"appointments\""));
+        // a calendar is kept afresh from then on
+        let s = Settings { receptionist: "Sam".into(), ..cal.settings() };
+        cal.set_settings(s).unwrap();
+        assert_eq!(Calendar::open(&dir, None).settings().receptionist, "Sam");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A change that cannot be saved is not kept either: the calendar stays as it was on disk.
+    #[cfg(unix)]
+    #[test]
+    fn a_change_that_cannot_be_saved_is_not_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("oaiy-calendar-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cal = Calendar::open(&dir, None);
+        let before = cal.settings();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let s = Settings { receptionist: "Changed".into(), ..cal.settings() };
+        let tried = cal.set_settings(s);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if tried.is_err() {
+            assert_eq!(cal.settings(), before, "not changed in memory either");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_calendar_is_there_while_a_plugin_provides_it() {

@@ -106,11 +106,11 @@ pub(super) async fn read_capped_with_limit(resp: reqwest::Response, limit: u64) 
 
 /// The client for `provider`: OAIY's own engine's waits while it loads its model (see `egress::engine_client`),
 /// every other provider's the usual limits.
-fn client_for(provider: &AiProvider, streaming: bool, direct: bool) -> Result<reqwest::Client, GatewayError> {
+fn client_for(provider: &AiProvider, streaming: bool, direct: bool, target: &egress::Target) -> Result<reqwest::Client, GatewayError> {
     if provider.id == super::routes::ENGINE_PROVIDER_ID {
-        egress::engine_client(streaming)
+        egress::engine_client(streaming, target)
     } else {
-        egress::provider_client(streaming, direct)
+        egress::provider_client(streaming, direct, target)
     }
     .map_err(GatewayError::Upstream)
 }
@@ -135,15 +135,15 @@ async fn chat_buffered(provider: &AiProvider, mut body: Value, max_response_byte
     }
 
     let key = provider.api_key.clone();
-    let target = egress::validate_async(&provider.base_url, chat_path(provider.protocol), provider.allow_local).await
+    let target = egress::target(&provider.base_url, chat_path(provider.protocol), provider.allow_local).await
         .map_err(GatewayError::BadRequest)?;
     let out_body = match provider.protocol {
         Protocol::OpenAi => body,
         Protocol::Anthropic => openai_chat_to_anthropic(&body),
     };
 
-    let client = client_for(provider, false, direct)?;
-    let rb = apply_auth(with_json_body(client.post(target), &out_body)?, provider, key.as_deref());
+    let client = client_for(provider, false, direct, &target)?;
+    let rb = apply_auth(with_json_body(client.post(target.url.clone()), &out_body)?, provider, key.as_deref());
     let resp = rb
         .send()
         .await
@@ -194,10 +194,11 @@ pub async fn chat_stream(provider: &AiProvider, mut body: Value) -> Result<reqwe
         obj.insert("stream".into(), Value::Bool(true));
     }
     let key = provider.api_key.clone();
-    let target = egress::validate(&provider.base_url, "/v1/chat/completions", provider.allow_local)
+    let target = egress::target(&provider.base_url, "/v1/chat/completions", provider.allow_local)
+        .await
         .map_err(GatewayError::BadRequest)?;
-    let client = client_for(provider, true, false)?;
-    let rb = apply_auth(with_json_body(client.post(target), &body)?, provider, key.as_deref());
+    let client = client_for(provider, true, false, &target)?;
+    let rb = apply_auth(with_json_body(client.post(target.url.clone()), &body)?, provider, key.as_deref());
     let resp = rb
         .send()
         .await
@@ -223,10 +224,11 @@ pub async fn models(provider: &AiProvider) -> Result<Value, GatewayError> {
         return Ok(json!({ "object": "list", "data": data }));
     }
     let key = provider.api_key.clone();
-    let target = egress::validate(&provider.base_url, "/v1/models", provider.allow_local)
+    let target = egress::target(&provider.base_url, "/v1/models", provider.allow_local)
+        .await
         .map_err(GatewayError::BadRequest)?;
-    let client = egress::client(false).map_err(GatewayError::Upstream)?;
-    let rb = apply_auth(client.get(target), provider, key.as_deref());
+    let client = egress::client(false, &target).map_err(GatewayError::Upstream)?;
+    let rb = apply_auth(client.get(target.url.clone()), provider, key.as_deref());
     let resp = rb
         .send()
         .await
@@ -255,7 +257,8 @@ pub async fn test(provider: &AiProvider) -> Result<(), GatewayError> {
 /// A minimal authenticated Anthropic call for the reachability/auth probe.
 async fn anthropic_probe(provider: &AiProvider) -> Result<(), GatewayError> {
     let key = provider.api_key.clone();
-    let target = egress::validate(&provider.base_url, "/v1/messages", provider.allow_local)
+    let target = egress::target(&provider.base_url, "/v1/messages", provider.allow_local)
+        .await
         .map_err(GatewayError::BadRequest)?;
     let model = provider
         .model
@@ -269,8 +272,8 @@ async fn anthropic_probe(provider: &AiProvider) -> Result<(), GatewayError> {
         "max_tokens": 1,
         "messages": [{ "role": "user", "content": "ping" }],
     });
-    let client = egress::client(false).map_err(GatewayError::Upstream)?;
-    let rb = apply_auth(with_json_body(client.post(target), &body)?, provider, key.as_deref());
+    let client = egress::client(false, &target).map_err(GatewayError::Upstream)?;
+    let rb = apply_auth(with_json_body(client.post(target.url.clone()), &body)?, provider, key.as_deref());
     let resp = rb
         .send()
         .await

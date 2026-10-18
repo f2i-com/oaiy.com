@@ -381,6 +381,8 @@ impl Store {
         if key.is_some() && inner.messages.iter().filter(|m| same_caller(m) && m.state != State::Handled).count() >= PER_NUMBER_WAITING {
             return Err(Error::new(429, "caller_waiting", format!("{PER_NUMBER_WAITING} messages from this number are waiting for the owner: no more can be kept until some are handled")));
         }
+        // (as they were, for a save that fails: the handled messages let go to make room come back with it)
+        let before = inner.messages.clone();
         // Old handled messages go; if it is still full, the oldest handled one makes room, and an unhandled one never does.
         let cutoff = when - chrono::Duration::days(KEEP_HANDLED_DAYS);
         inner.messages.retain(|m| m.state != State::Handled || m.handled_at.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).is_none_or(|t| t >= cutoff));
@@ -392,7 +394,10 @@ impl Store {
                 Some(i) => {
                     inner.messages.remove(i);
                 }
-                None => return Err(Error::new(507, "withheld_full", "messages from callers who hid their number are waiting for the owner: no more of those can be kept until some are handled")),
+                None => {
+                    inner.messages = before;
+                    return Err(Error::new(507, "withheld_full", "messages from callers who hid their number are waiting for the owner: no more of those can be kept until some are handled"));
+                }
             }
         }
         if inner.messages.len() >= MAX_STORED {
@@ -401,7 +406,10 @@ impl Store {
                 Some(i) => {
                     inner.messages.remove(i);
                 }
-                None => return Err(Error::new(507, "store_full", "the owner has too many messages waiting to keep another")),
+                None => {
+                    inner.messages = before;
+                    return Err(Error::new(507, "store_full", "the owner has too many messages waiting to keep another"));
+                }
             }
         }
         let callback = clean_number(&new.callback);
@@ -427,7 +435,7 @@ impl Store {
             if inner.holds_in_memory() {
                 return Ok(message);
             }
-            inner.messages.pop();
+            inner.messages = before;
             return Err(e);
         }
         Ok(message)

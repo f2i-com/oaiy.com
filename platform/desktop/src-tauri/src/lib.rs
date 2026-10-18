@@ -307,7 +307,8 @@ fn resolved_system_exe(subdir: &str, rel_win: &str, bare: &str) -> String {
 /// /select,<path>` to highlight the file when given a file path, or just
 /// `explorer <dir>` for a directory.
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
+fn open_path(webview: tauri::Webview, path: String) -> Result<(), String> {
+    dashboard_only(&webview)?;
     let p = std::path::PathBuf::from(&path);
     if !p.exists() {
         return Err(format!("path not found: {path}"));
@@ -778,7 +779,8 @@ fn validate_local_dir_path(path: &str) -> Result<(), String> {
 /// restart) — we deliberately don't hot-swap the live registry / in-
 /// flight downloads / running service env, which would be error-prone.
 #[tauri::command]
-fn set_data_dir(app: tauri::AppHandle, path: String) -> Result<(), String> {
+fn set_data_dir(webview: tauri::Webview, app: tauri::AppHandle, path: String) -> Result<(), String> {
+    dashboard_only(&webview)?;
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return write_data_dir_override(&app, None);
@@ -799,7 +801,8 @@ fn set_data_dir(app: tauri::AppHandle, path: String) -> Result<(), String> {
 /// Applies on next launch (Downloads + the install scripts' OAIY_MODELS_DIR
 /// capture it at startup); the UI prompts to restart.
 #[tauri::command]
-fn set_models_dir(app: tauri::AppHandle, path: String) -> Result<(), String> {
+fn set_models_dir(webview: tauri::Webview, app: tauri::AppHandle, path: String) -> Result<(), String> {
+    dashboard_only(&webview)?;
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return write_models_dir_override(&app, None);
@@ -846,10 +849,12 @@ fn list_model_dirs(registry: tauri::State<RegistryHandle>) -> Vec<String> {
 /// is the primary) is a no-op / error respectively.
 #[tauri::command]
 fn add_model_dir(
+    webview: tauri::Webview,
     app: tauri::AppHandle,
     registry: tauri::State<RegistryHandle>,
     path: String,
 ) -> Result<Vec<String>, String> {
+    dashboard_only(&webview)?;
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err("path is empty".into());
@@ -880,10 +885,12 @@ fn add_model_dir(
 /// updates the live registry. Returns the updated list.
 #[tauri::command]
 fn remove_model_dir(
+    webview: tauri::Webview,
     app: tauri::AppHandle,
     registry: tauri::State<RegistryHandle>,
     path: String,
 ) -> Result<Vec<String>, String> {
+    dashboard_only(&webview)?;
     let target = model_dir_key(&path);
     let mut dirs = read_extra_model_dirs(&app);
     dirs.retain(|d| model_dir_key(d) != target);
@@ -973,11 +980,13 @@ fn list_gpus() -> Vec<GpuInfo> {
 /// `gpu`. Persists to config + applies to the live registry; takes effect on the next start.
 #[tauri::command]
 fn set_service_gpu(
+    webview: tauri::Webview,
     app: tauri::AppHandle,
     registry: tauri::State<RegistryHandle>,
     id: String,
     gpu: Option<u32>,
 ) -> Result<(), String> {
+    dashboard_only(&webview)?;
     let mut map = read_service_gpus(&app);
     match gpu {
         Some(n) => {
@@ -1095,7 +1104,8 @@ async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
 
 /// Tauri command: a native picker for a language model file (`.gguf`): its path, or None when cancelled.
 #[tauri::command]
-async fn pick_model_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
+async fn pick_model_file(webview: tauri::Webview, app: tauri::AppHandle) -> Result<Option<String>, String> {
+    dashboard_only(&webview)?;
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().set_title("Choose a language model file").add_filter("GGUF language model", &["gguf"]).pick_file(move |f| {
@@ -1108,7 +1118,8 @@ async fn pick_model_file(app: tauri::AppHandle) -> Result<Option<String>, String
 /// Tauri command: add a language model file the person already has to the engines (`engines::add_model_file`). A
 /// command of the dashboard's own window, not a route, so no page or token can point the engines at a file.
 #[tauri::command]
-async fn add_engine_model(path: String) -> Result<serde_json::Value, String> {
+async fn add_engine_model(webview: tauri::Webview, path: String) -> Result<serde_json::Value, String> {
+    dashboard_only(&webview)?;
     crate::engines::add_model_file(&path).await
 }
 
@@ -1126,8 +1137,10 @@ async fn add_engine_model(path: String) -> Result<serde_json::Value, String> {
 /// leaves it split between the two folders), a call, an update, an install or an engine's job (the updater's own
 /// list, `update::blockers`), so Settings says what to wait for.
 #[tauri::command]
-async fn restart_app(app: tauri::AppHandle, migration: tauri::State<'_, MigrationHandle>) -> Result<(), String> {
-    if migration.lock().map(|g| g.running).unwrap_or(true) {
+async fn restart_app(webview: tauri::Webview, app: tauri::AppHandle, migration: tauri::State<'_, MigrationHandle>) -> Result<(), String> {
+    dashboard_only(&webview)?;
+    // (a lock poisoned by a migration that panicked would say "running" for good: read as not running)
+    if migration.lock().map(|g| g.running).unwrap_or(false) {
         return Err("The data folder is still being copied or moved: restart OAIY once that has finished.".into());
     }
     // (the updater's look at what OAIY is doing: it can ask a phone plugin, so off the async runtime's own thread)
@@ -1187,6 +1200,18 @@ fn set_update_auto_check(webview: tauri::Webview, app: tauri::AppHandle, updater
     Ok(())
 }
 
+/// Only the dashboard's own window may change where OAIY keeps its data, its token, its folders and its services' GPUs,
+/// open a path, add a model or restart it: not the Agent's or the flow editor's webview, which run other code
+/// (`update::gui::is_dashboard`, as the update and backup commands ask).
+fn dashboard_only(webview: &tauri::Webview) -> Result<(), String> {
+    if crate::update::gui::is_dashboard(webview.label()) {
+        Ok(())
+    } else {
+        log::warn!("refused a command from the webview \"{}\"", webview.label());
+        Err("Only OAIY's own window can do that.".to_string())
+    }
+}
+
 /// The data dir the *next* launch will use — the configured override, or
 /// the OS default when none/reset. Mirrors `config_snapshot`'s `effective`.
 fn pending_data_dir(app: &tauri::AppHandle) -> PathBuf {
@@ -1209,11 +1234,13 @@ fn migration_plan(app: tauri::AppHandle, registry: tauri::State<RegistryHandle>)
 /// folder on a background thread. The UI polls `migration_status`.
 #[tauri::command]
 fn start_migration(
+    webview: tauri::Webview,
     app: tauri::AppHandle,
     registry: tauri::State<RegistryHandle>,
     migration: tauri::State<MigrationHandle>,
     mode: String,
 ) -> Result<(), String> {
+    dashboard_only(&webview)?;
     let mode = migrate::Mode::parse(&mode).ok_or("mode must be 'copy' or 'move'")?;
     let old = registry
         .lock()
@@ -1228,10 +1255,13 @@ fn start_migration(
         return Err("nothing to migrate — no pending folder change, or the old folder is empty".into());
     }
     {
-        let g = migration.lock().map_err(|_| "migration state is busy")?;
+        // (marked running here, under the lock, before the thread starts: two quick clicks both found it not running
+        // and ran two migrations over the same files)
+        let mut g = migration.lock().map_err(|_| "migration state is busy")?;
         if g.running {
             return Err("a migration is already running".into());
         }
+        g.running = true;
     }
     let handle: MigrationHandle = (*migration).clone();
     std::thread::spawn(move || migrate::run(old, new, mode, handle));
@@ -1256,10 +1286,12 @@ fn get_hf_token_status(downloads: tauri::State<DownloadsHandle>) -> bool {
 /// download picks it up without a restart.
 #[tauri::command]
 fn set_hf_token(
+    webview: tauri::Webview,
     app: tauri::AppHandle,
     downloads: tauri::State<DownloadsHandle>,
     token: String,
 ) -> Result<(), String> {
+    dashboard_only(&webview)?;
     let trimmed = token.trim();
     let value = if trimmed.is_empty() { None } else { Some(trimmed) };
     write_hf_token(&app, value)?;

@@ -169,8 +169,18 @@ fn add_in(dir: &Path, name: &str, extension: &str, clip: &[u8], words: Option<&s
 /// Remove a voice (its clip, and what was written beside it).
 pub fn remove(name: &str) -> Result<(), String> {
     let dir = dir().ok_or("the voices folder is not set up")?;
-    let name = clean_name(name)?;
-    if !list_in(dir).iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+    remove_named(dir, name)
+}
+
+/// Remove the voice `name` in `dir`: as listed (a clip put in the folder by hand keeps its own name, "Front desk"),
+/// else as a name given to [`add`] is kept ("Front-desk"). Only a clip the folder lists is removed.
+fn remove_named(dir: &Path, name: &str) -> Result<(), String> {
+    let listed = list_in(dir);
+    let name = match listed.iter().find(|c| c.name.eq_ignore_ascii_case(name.trim())) {
+        Some(c) => c.name.clone(),
+        None => clean_name(name)?,
+    };
+    if !listed.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
         return Err(format!("no voice called {name:?}"));
     }
     remove_in(dir, &name);
@@ -277,6 +287,18 @@ mod tests {
         assert!(add_in(&dir, "x", "wav", &[0; 10], None).is_err());
         assert!(add_in(&dir, "../..", "wav", &clip, None).is_err());
         assert!(add_in(&dir, "chosen", "wav", &clip, None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A clip put in the voices folder by hand, its name with a space in it, can be removed by that name.
+    #[test]
+    fn a_voice_named_by_hand_with_a_space_can_be_removed() {
+        let dir = folder("remove-spaced");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Front desk.wav"), vec![1u8; 4096]).unwrap();
+        assert!(remove_named(&dir, "Front desk").is_ok());
+        assert!(list_in(&dir).is_empty());
+        assert!(remove_named(&dir, "Front desk").is_err(), "gone");
         let _ = std::fs::remove_dir_all(dir);
     }
 

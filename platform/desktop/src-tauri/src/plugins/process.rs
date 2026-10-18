@@ -100,6 +100,22 @@ type Pending = Arc<Mutex<HashMap<RpcId, Sender<Result<Value, CallError>>>>>;
 /// Sender half of the stdin writer channel. `None` after close.
 type WriteTx = Arc<Mutex<Option<std::sync::mpsc::SyncSender<String>>>>;
 
+/// Requests of a plugin's answered at once, each on a thread of its own; past them it is told it is busy.
+const MAX_PLUGIN_REQUESTS: usize = 16;
+
+/// A line of a plugin's output as the log keeps it: cut to [`rpc::MAX_LOG_BYTES`] on a character boundary (a plugin's
+/// lines up to the protocol's 1 MiB each, a thousand of them kept, were a gigabyte a plugin).
+fn capped(text: String) -> String {
+    if text.len() <= rpc::MAX_LOG_BYTES {
+        return text;
+    }
+    let mut end = rpc::MAX_LOG_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (cut)", &text[..end])
+}
+
 pub struct PluginProcess {
     pub plugin_id: String,
     pub pid: u32,
@@ -253,6 +269,9 @@ impl PluginProcess {
 
         let logs = LogBuffer::new();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let child = Arc::new(Mutex::new(Some(child)));
+        // Requests of the plugin's being answered now, each on a thread of its own: at most MAX_PLUGIN_REQUESTS.
+        let answering = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Bounded: an unbounded channel to a wedged writer grows without limit.
         // 256 lines of headroom absorbs bursts (an event storm of acks) while a
@@ -285,7 +304,10 @@ impl PluginProcess {
                 let mut r = BufReader::new(err);
                 loop {
                     match read_line_capped(&mut r) {
-                        Ok(line) => logs_err.push("stderr", line),
+                        Ok(line) => logs_err.push("stderr", capped(line)),
+                        // (a line past the cap, a progress bar redrawn with \r: its rest skipped, and reading goes on;
+                        // stopping here filled the pipe and hung the plugin on its next write)
+                        Err(RpcError::LineTooLong { bytes }) => logs_err.push("stderr", format!("[a line of {bytes} bytes, left out]")),
                         Err(_) => break,
                     }
                 }
@@ -301,6 +323,8 @@ impl PluginProcess {
             let events = opts.events.clone();
             let requests = opts.requests.clone();
             let allowed_events: Vec<String> = manifest.events.clone();
+            let child_for_reader = child.clone();
+            let answering = answering.clone();
             thread::spawn(move || {
                 let mut r = BufReader::new(stdout);
                 loop {
@@ -315,6 +339,11 @@ impl PluginProcess {
                             // reading rather than resynchronising onto garbage.
                             logs.push("stderr", format!("[protocol] {e}"));
                             fail_all(&pending, CallError::Transport(e.to_string()));
+                            // And the plugin is stopped: alive but no longer read, every later call would wait out its
+                            // whole timeout, and the supervisor restarts only one that has exited.
+                            if let Some(c) = child_for_reader.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                                let _ = c.kill();
+                            }
                             break;
                         }
                     };
@@ -360,6 +389,18 @@ impl PluginProcess {
                             // so ordering was never part of the contract.
                             let requests = requests.clone();
                             let tx_for_replies = tx_for_replies.clone();
+                            // (a plugin asking more at once than this is told it is busy, not given a thread for each)
+                            if answering.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_PLUGIN_REQUESTS {
+                                answering.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                let reply = error_line(&id, rpc::METHOD_NOT_FOUND, "too many requests at once: try again when one is answered", Some("busy"));
+                                if let Ok(guard) = tx_for_replies.lock() {
+                                    if let Some(tx) = guard.as_ref() {
+                                        let _ = tx.try_send(reply);
+                                    }
+                                }
+                                continue;
+                            }
+                            let answering = answering.clone();
                             thread::spawn(move || {
                                 let reply = match requests(&method, params) {
                                     Ok(v) => result_line(&id, v),
@@ -375,11 +416,12 @@ impl PluginProcess {
                                         let _ = tx.try_send(reply);
                                     }
                                 }
+                                answering.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             });
                         }
                         RpcMessage::NonProtocol(text) => {
                             if !text.is_empty() {
-                                logs.push("stdout", text);
+                                logs.push("stdout", capped(text));
                             }
                         }
                     }
@@ -391,7 +433,7 @@ impl PluginProcess {
             plugin_id: manifest.id.clone(),
             pid,
             logs,
-            child: Arc::new(Mutex::new(Some(child))),
+            child,
             write_tx,
             pending,
             next_id: Arc::new(Mutex::new(1)),
@@ -729,6 +771,15 @@ pub fn validate_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_line_is_cut_on_a_character_boundary() {
+        assert_eq!(capped("short".into()), "short");
+        let long = "é".repeat(rpc::MAX_LOG_BYTES);
+        let cut = capped(long);
+        assert!(cut.ends_with("… (cut)"));
+        assert!(cut.len() <= rpc::MAX_LOG_BYTES + "… (cut)".len());
+    }
 
     const ALLOWED: &[&str] = &["aokie.call.incoming"];
 

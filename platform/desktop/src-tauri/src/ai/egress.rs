@@ -136,7 +136,8 @@ fn request_url(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest:
     // proxy prefixes while adding the protocol version only once. Google's
     // OpenAI-compatible address (`…/v1beta/openai`) carries its own version and
     // takes `/models` and `/chat/completions` straight under it.
-    let path = if base.ends_with("/v1") || base.ends_with("/openai") {
+    // (Gemini's alone: another `/openai` base, Groq's `https://api.groq.com/openai`, takes `/v1/...` under it)
+    let path = if base.ends_with("/v1") || base.ends_with("/v1beta/openai") {
         path.strip_prefix("/v1/").unwrap_or(path)
     } else {
         path
@@ -153,15 +154,14 @@ fn request_url(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest:
 
 pub fn validate(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest::Url, String> {
     let url = request_url(base_url, path, allow_local)?;
-    let host = url.host_str().unwrap(); // checked above
-
-    // Bare IP literal — check directly, no DNS.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if ip_blocked(ip, allow_local) {
-            return Err(format!("provider URL points at a disallowed address ({ip})"));
-        }
-        return Ok(url);
-    }
+    // Bare IP literal (an IPv6 one in brackets, `[::1]`, too) — check directly, no DNS.
+    let host = match url.host() {
+        Some(url::Host::Ipv4(ip)) => return if ip_blocked(IpAddr::V4(ip), allow_local) { Err(format!("provider URL points at a disallowed address ({ip})")) } else { Ok(url) },
+        Some(url::Host::Ipv6(ip)) => return if ip_blocked(IpAddr::V6(ip), allow_local) { Err(format!("provider URL points at a disallowed address ({ip})")) } else { Ok(url) },
+        Some(url::Host::Domain(d)) => d.to_string(),
+        None => return Err("provider URL has no host".into()),
+    };
+    let host = host.as_str();
 
     // Hostname — resolve and reject if ANY resolved address is internal (a name
     // resolving to several addresses can't smuggle a private one through).
@@ -189,34 +189,65 @@ pub fn validate(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest
 /// block the handler's deadline/cancel select. The resolver may complete its OS
 /// lookup in the background after cancellation, without making a provider call.
 pub(super) async fn validate_async(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest::Url, String> {
+    target(base_url, path, allow_local).await.map(|t| t.url)
+}
+
+/// A provider's address, checked: its URL, and the addresses its name resolved to when it was checked, which the
+/// call is then made to and to no other (a name that resolved to a public address at the check and to an internal one
+/// at the connection, a DNS rebinding, reaches nothing it was not checked for).
+pub struct Target {
+    pub url: reqwest::Url,
+    pinned: Option<(String, Vec<std::net::SocketAddr>)>,
+}
+
+impl Target {
+    /// `builder`, held to the addresses checked.
+    fn pin(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match &self.pinned {
+            Some((host, addrs)) => builder.resolve_to_addrs(host, addrs),
+            None => builder,
+        }
+    }
+}
+
+/// [`validate_async`], its name resolved once and kept with it ([`Target`]).
+pub(super) async fn target(base_url: &str, path: &str, allow_local: bool) -> Result<Target, String> {
     let url = request_url(base_url, path, allow_local)?;
-    let host = url.host_str().ok_or("provider URL has no host")?;
-    if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
-        if ip_blocked(ip, allow_local) { return Err("provider URL points at a disallowed address".into()); }
-        return Ok(url);
+    let host = match url.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            if ip_blocked(IpAddr::V4(ip), allow_local) { return Err("provider URL points at a disallowed address".into()); }
+            return Ok(Target { url, pinned: None });
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            if ip_blocked(IpAddr::V6(ip), allow_local) { return Err("provider URL points at a disallowed address".into()); }
+            return Ok(Target { url, pinned: None });
+        }
+        Some(url::Host::Domain(d)) => d.to_string(),
+        None => return Err("provider URL has no host".into()),
+    };
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|_| format!("cannot resolve provider host '{host}'"))?.collect();
+    if addrs.is_empty() {
+        return Err(format!("provider host '{host}' did not resolve"));
     }
-    let mut saw_any = false;
-    for address in tokio::net::lookup_host((host, url.port_or_known_default().unwrap_or(443))).await
-        .map_err(|_| "cannot resolve provider host")? {
-        saw_any = true;
-        if ip_blocked(address.ip(), allow_local) { return Err("provider host resolves to a disallowed address".into()); }
+    if let Some(bad) = addrs.iter().find(|a| ip_blocked(a.ip(), allow_local)) {
+        return Err(format!("provider host '{host}' resolves to a disallowed address ({})", bad.ip()));
     }
-    if !saw_any { return Err("provider host did not resolve".into()); }
-    Ok(url)
+    Ok(Target { url, pinned: Some((host, addrs)) })
 }
 
 /// A reqwest client for a provider call: redirects DISABLED (a 3xx must never be
 /// followed to an unvalidated host). Streaming omits the whole-request timeout so
 /// a long SSE response isn't cut off; non-streaming keeps the 120s cap.
-pub fn client(streaming: bool) -> Result<reqwest::Client, String> {
-    provider_client(streaming, false)
+pub fn client(streaming: bool, target: &Target) -> Result<reqwest::Client, String> {
+    provider_client(streaming, false, target)
 }
 
 /// Scoped local qualification calls must not inherit a proxy that can carry
 /// loopback prompts off this computer. Ordinary configured gateways keep their
 /// existing proxy behavior.
-pub(super) fn provider_client(streaming: bool, direct: bool) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
+pub(super) fn provider_client(streaming: bool, direct: bool, target: &Target) -> Result<reqwest::Client, String> {
+    let mut builder = target.pin(reqwest::Client::builder())
         .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
@@ -231,8 +262,8 @@ pub(super) fn provider_client(streaming: bool, direct: bool) -> Result<reqwest::
 }
 
 /// The client for OAIY's own engine (on this computer, so never through a proxy): see `ENGINE_WAIT`.
-pub(super) fn engine_client(streaming: bool) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
+pub(super) fn engine_client(streaming: bool, target: &Target) -> Result<reqwest::Client, String> {
+    let mut builder = target.pin(reqwest::Client::builder())
         .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
@@ -298,5 +329,24 @@ mod tests {
                 assert_eq!(url.as_str(), format!("https://generativelanguage.googleapis.com/v1beta/openai/{endpoint}"));
             }
         }
+        // Another `/openai` base, Groq's typed without /v1, takes /v1/... under it as it always did
+        let url = request_url("https://api.groq.com/openai", "/v1/models", false).unwrap();
+        assert_eq!(url.as_str(), "https://api.groq.com/openai/v1/models");
+    }
+
+    /// A provider on this computer at an IPv6 address (`http://[::1]:port`) is reached, as one at 127.0.0.1 is; a
+    /// checked target is held to what it was checked as.
+    #[tokio::test]
+    async fn an_ipv6_literal_is_checked_as_an_address_not_a_name() {
+        let url = validate("http://[::1]:18080", "/v1/models", true).unwrap();
+        assert_eq!(url.as_str(), "http://[::1]:18080/v1/models");
+        assert!(validate("https://[::1]:18080", "/v1/models", false).is_err(), "loopback refused unless local is allowed");
+        let t = target("http://[::1]:18080", "/v1/chat/completions", true).await.unwrap();
+        assert!(t.pinned.is_none(), "an address needs no name held");
+        assert!(target("http://[::1]:18080", "/v1/models", false).await.is_err());
+        let t = target("http://localhost:18080", "/v1/models", true).await.unwrap();
+        let (host, addrs) = t.pinned.as_ref().expect("a name is held to what it resolved to");
+        assert_eq!(host, "localhost");
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addrs:?}");
     }
 }

@@ -364,24 +364,33 @@ impl TriggerStore {
         // store's lock. `routes::upsert_trigger` asks ZIPP before it takes that
         // lock; a condition that reaches this point unchecked still cannot fire,
         // because dispatch fails closed on anything it cannot decide.
-        match self.bindings.iter_mut().find(|b| b.id == binding.id) {
+        // Changed in a copy and kept only once it is written: a write that failed left the change in effect here
+        // (firing) while the file said otherwise, and it was gone at the next start.
+        let mut next = self.bindings.clone();
+        match next.iter_mut().find(|b| b.id == binding.id) {
             Some(existing) => *existing = binding,
-            None => self.bindings.push(binding),
+            None => next.push(binding),
         }
-        self.persist()
+        self.persist_list(&next)?;
+        self.bindings = next;
+        Ok(())
     }
 
     pub fn remove(&mut self, id: &str) -> Result<bool, String> {
-        let before = self.bindings.len();
-        self.bindings.retain(|b| b.id != id);
-        let removed = self.bindings.len() != before;
+        let next: Vec<TriggerBinding> = self.bindings.iter().filter(|b| b.id != id).cloned().collect();
+        let removed = next.len() != self.bindings.len();
         if removed {
-            self.persist()?;
+            self.persist_list(&next)?;
+            self.bindings = next;
         }
         Ok(removed)
     }
 
     fn persist(&self) -> Result<(), String> {
+        self.persist_list(&self.bindings)
+    }
+
+    fn persist_list(&self, bindings: &[TriggerBinding]) -> Result<(), String> {
         // A migration ran but its `.bak` did not. Writing now would overwrite the
         // only copy of what the user actually wrote, so retry the backup and
         // refuse rather than lose it. Loud and recoverable beats silent.
@@ -394,7 +403,7 @@ impl TriggerStore {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        let body = serde_json::to_string_pretty(&self.bindings).map_err(|e| e.to_string())?;
+        let body = serde_json::to_string_pretty(bindings).map_err(|e| e.to_string())?;
         std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
     }
@@ -438,6 +447,9 @@ struct ProcTable {
     /// dongle it opened during init. So the handle is published here from the
     /// instant the child exists, and `stop_all` can actually stop it.
     starting_procs: HashMap<String, Arc<PluginProcess>>,
+    /// Ids being stopped: out of `running`, but the process is still being asked to exit (up to the shutdown grace,
+    /// then killed). A start waits for it: one started in that window ran beside the copy still on its way out.
+    stopping: std::collections::HashSet<String>,
     /// Crash-restart due times. In the table — NOT supervisor-local — so a
     /// manual stop() can cancel one before it fires.
     restarts: HashMap<String, Instant>,
@@ -664,7 +676,7 @@ impl PluginHost {
                     },
                 );
                 drop(h);
-                outbox.wait_for_work();
+                outbox.wait_for_work(account.is_some());
             });
         }
 
@@ -792,8 +804,19 @@ impl PluginHost {
         // same hardware (the review traced it end to end). Inserting into
         // `starting` under the same lock that reads `running` makes the second
         // caller's outcome deterministic: idempotent success.
+        // A stop still under way finishes first (its process exits, or is killed, within the shutdown grace).
+        let stop_waited_until = Instant::now() + super::runner::SHUTDOWN_GRACE + Duration::from_secs(2);
+        while self.procs.lock().map_err(|_| "process table poisoned")?.stopping.contains(id) {
+            if Instant::now() > stop_waited_until {
+                return Err(format!("{id} is still stopping: try again in a moment"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         {
             let mut t = self.procs.lock().map_err(|_| "process table poisoned")?;
+            if t.stopping.contains(id) {
+                return Err(format!("{id} is still stopping: try again in a moment"));
+            }
             if let Some(existing) = t.running.get(id) {
                 if existing.check_exited().is_none() {
                     return Ok(());
@@ -1022,11 +1045,16 @@ impl PluginHost {
                 t.stop_during_start.insert(id.to_string());
             }
             t.started_at.remove(id);
-            (t.running.remove(id), in_flight)
+            let process = t.running.remove(id);
+            if process.is_some() {
+                t.stopping.insert(id.to_string());
+            }
+            (process, in_flight)
         };
         match process {
             Some(p) => {
                 p.shutdown();
+                self.procs.lock().unwrap_or_else(|e| e.into_inner()).stopping.remove(id);
                 self.set_state(id, PluginState::Stopped, Some("Stopped by request.".into()));
                 Ok(())
             }
@@ -2550,6 +2578,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// A change that could not be written is not in effect either: kept in memory, it fired until the next start,
+    /// when the file (without it) was read again.
+    #[cfg(unix)]
+    #[test]
+    fn a_trigger_change_that_cannot_be_saved_is_not_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("oaiy-triggers-unsaved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = TriggerStore::load(dir.join("triggers.json"));
+        store.upsert(binding("kept", None)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let added = store.upsert(binding("not-saved", None));
+        let removed = store.remove("kept");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(added.is_err() && removed.is_err(), "the folder refuses writes");
+        assert_eq!(store.list().iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["kept"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn binding(id: &str, condition: Option<&str>) -> TriggerBinding {

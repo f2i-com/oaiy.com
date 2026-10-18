@@ -199,6 +199,8 @@ const GUARD_CAPACITY: usize = 8192;
 /// growth, and the keys are the caller's to choose, so a live retry loop keeps
 /// its recent runs.
 const MAX_RUNS: usize = 20_000;
+/// How long a queued run no one has claimed is kept once the ledger is over [`MAX_RUNS`]: a week.
+const UNCLAIMED_MS: u64 = 7 * 24 * 3600 * 1000;
 
 /// What a caller asks for. Mirrors `protocol/v1/run-request.schema.json`.
 #[derive(Debug, Clone)]
@@ -467,14 +469,22 @@ impl Ledger {
 
         // Replay: collect the last record per run id, then insert in reservation
         // order so the cap evicts the oldest terminal runs exactly as at runtime.
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        // (read as bytes, line by line: a torn write that cut a character in two must cost that one line, not the
+        // whole read, after which an empty ledger was compacted over every run; and a journal that cannot be read at
+        // all is an error, so nothing is written over it)
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(bytes) = bytes {
             let mut latest: HashMap<String, RunRecord> = HashMap::new();
-            for line in text.lines() {
-                let line = line.trim();
+            for line in bytes.split(|b| *b == b'\n') {
+                let line = line.trim_ascii();
                 if line.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<RunRecord>(line) {
+                match serde_json::from_slice::<RunRecord>(line) {
                     // Last line for a run id wins — that is the upsert semantics.
                     Ok(rec) => {
                         latest.insert(rec.run_id.clone(), rec);
@@ -627,7 +637,9 @@ impl Ledger {
             let Some(id) = self.run_order.pop_front() else { break };
             scanned += 1;
             match self.runs.get(&id) {
-                Some(rec) if rec.status.is_terminal() => {
+                // (and a run reserved to be claimed that no one has claimed in a week: no claimer is coming for it, and
+                // kept it would hold its place for ever)
+                Some(rec) if rec.status.is_terminal() || (rec.status == RunStatus::Queued && now_ms().saturating_sub(rec.reserved_at_ms) > UNCLAIMED_MS) => {
                     let key = rec.idempotency_key.clone();
                     self.runs.remove(&id);
                     // Only clear by_key if it still points at THIS run — a later
@@ -1023,6 +1035,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// A torn final write that cut a character in two (a run's input in Japanese, say) costs that one line, never
+    /// the whole journal: the runs before it are all still there after a reopen.
+    #[test]
+    fn a_line_torn_mid_character_does_not_lose_the_other_runs() {
+        let d = JournalDir::new("torn-utf8");
+        let run_id = {
+            let mut l = Ledger::open(d.path()).unwrap();
+            match l.reserve(&req("k1")) {
+                ReserveOutcome::Reserved(r) => r.run_id,
+                o => panic!("{o:?}"),
+            }
+        };
+        // a last line cut inside "日" (three bytes), as a power cut leaves it
+        let mut f = std::fs::OpenOptions::new().append(true).open(d.path()).unwrap();
+        std::io::Write::write_all(&mut f, b"{\"runId\":\"run_x\",\"input\":\"\xe6\x97").unwrap();
+        drop(f);
+        let l2 = Ledger::open(d.path()).unwrap();
+        assert!(l2.get(&run_id).is_some(), "the earlier run survives the torn line");
+        drop(l2);
+        // and survives again: what was compacted after the reopen is the runs, not an empty ledger
+        assert!(Ledger::open(d.path()).unwrap().get(&run_id).is_some());
     }
 
     #[test]

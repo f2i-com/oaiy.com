@@ -21,6 +21,7 @@ pub const MAX_LOG_LINES: usize = 1000;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+
 pub struct LogLine {
     pub timestamp: DateTime<Utc>,
     /// "stdout" or "stderr"
@@ -172,19 +173,13 @@ impl Runner {
         if let Some(stdout) = child.stdout.take() {
             let logs = logs.clone();
             thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().map_while(Result::ok) {
-                    logs.push("stdout", line);
-                }
+                each_line(stdout, |line| logs.push("stdout", line));
             });
         }
         if let Some(stderr) = child.stderr.take() {
             let logs = logs.clone();
             thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    logs.push("stderr", line);
-                }
+                each_line(stderr, |line| logs.push("stderr", line));
             });
         }
 
@@ -255,6 +250,27 @@ impl Runner {
             let _ = child.wait();
         }
         Ok(())
+    }
+}
+
+/// Every line a child writes, to its end: a line that is not UTF-8 (a progress bar's bytes, another code page) read
+/// as near as it can be rather than ending the reading, which left the pipe to fill and the child blocked on its next
+/// write. A line is kept to its first 4,000 characters.
+pub(crate) fn each_line(from: impl std::io::Read, mut each: impl FnMut(String)) {
+    let mut reader = BufReader::new(from);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                let line = String::from_utf8_lossy(&buf);
+                each(if line.chars().count() > 4000 { line.chars().take(4000).collect() } else { line.into_owned() });
+            }
+        }
     }
 }
 
@@ -337,6 +353,22 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
+
+    /// A child's output that is not UTF-8 (a Windows tool's code page, a progress bar's bytes) is read on, not the
+    /// end of reading: stopped, the pipe filled and the child hung. A line past the cap is cut.
+    #[test]
+    fn output_that_is_not_utf8_is_read_on_and_a_long_line_is_cut() {
+        let mut input = b"first\n\xff\xfe caf\xe9\nthird\r\n".to_vec();
+        input.extend(std::iter::repeat(b'x').take(10_000));
+        input.push(b'\n');
+        let mut lines = Vec::new();
+        each_line(&input[..], |l| lines.push(l));
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], "first");
+        assert!(lines[1].contains("caf"), "{:?}", lines[1]);
+        assert_eq!(lines[2], "third");
+        assert!(lines[3].chars().count() <= 4_100, "cut: {}", lines[3].len());
+    }
 
     #[test]
     fn scoped_service_liveness_observes_real_child_exit_before_a_supervisor_tick() {

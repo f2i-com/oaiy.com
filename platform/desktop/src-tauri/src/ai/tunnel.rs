@@ -894,8 +894,18 @@ impl AiTunnel {
                         return Ok(final_with_completion(completion));
                     }
                     // The assistant's own turn has to go back in, or the tool
-                    // replies below answer a message the model never sees.
-                    convo.push(message.clone());
+                    // replies below answer a message the model never sees. With
+                    // the calls that are answered, and only them: a call past the
+                    // limit, or one without a name, left in it has no tool reply,
+                    // and an OpenAI-style API refuses the next request (400).
+                    let mut message = message.clone();
+                    message["tool_calls"] = Value::Array(
+                        calls
+                            .iter()
+                            .map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.input.to_string() } }))
+                            .collect(),
+                    );
+                    convo.push(message);
                     calls
                 }
                 None => {

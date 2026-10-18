@@ -199,7 +199,10 @@ fn poll_once(
     let body = json!({"instanceId": instance, "status": if success && sealed.is_some() {"done"} else {"failed"},
         "resultEnvelope": sealed});
     let url = super::oauth::join(&account.base_url, &spec.complete_path.replace("{id}", &id));
-    for attempt in 0..3 {
+    // Sent again as the provider is away, longer and longer apart (a minute in all), then kept on the disk and sent at
+    // each later poll until it is taken: a flow that ran, its effects made, is not reported as never done because the
+    // provider was away for half a minute.
+    for attempt in 0..6u32 {
         if let Ok(response) = http
             .post(&url)
             .timeout(timeout)
@@ -219,11 +222,58 @@ fn poll_once(
             }
         }
         // Not taken, and not refused either: the same sealed result is sent again.
-        if attempt < 2 {
-            std::thread::sleep(Duration::from_secs(1));
+        if attempt < 5 {
+            std::thread::sleep(Duration::from_secs(1 << attempt));
         }
     }
-    Err("sealed flow completion could not be confirmed; flow will not be repeated".into())
+    keep_completion(&id, &account.base_url, &url, &body);
+    Err("sealed flow completion could not be confirmed yet: it is kept and sent again; the flow will not be repeated".into())
+}
+
+/// Where completions not taken yet are kept (`<data>/link/sealed-pending`), set when the lane starts.
+static KEPT_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Keep a sealed completion the provider has not taken, to be sent again ([`resend_kept`]). The body is sealed: no
+/// input, output or error is in it in the clear.
+fn keep_completion(id: &str, base_url: &str, url: &str, body: &Value) {
+    let Some(dir) = KEPT_DIR.get() else { return };
+    let safe: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).take(80).collect();
+    if safe.is_empty() || std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let kept = json!({ "baseUrl": base_url, "url": url, "body": body });
+    let _ = crate::secret_file::write(&dir.join(format!("{safe}.json")), kept.to_string());
+}
+
+/// Send the kept completions again: each goes once it is taken or refused for good; while the provider is away the
+/// rest wait. A week unsent, one is let go.
+fn resend_kept(http: &Client, account: &LinkedAccount, timeout: Duration) {
+    let Some(dir) = KEPT_DIR.get() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(7 * 24 * 3600)) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Some(kept) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
+        if kept["baseUrl"].as_str() != Some(account.base_url.as_str()) {
+            continue;
+        }
+        let Some(url) = kept["url"].as_str() else { continue };
+        match http.post(url).timeout(timeout).bearer_auth(&account.credential).json(&kept["body"]).send() {
+            Ok(response) => {
+                let status = response.status();
+                super::net::drain(response);
+                if status.is_success() || status.is_client_error() {
+                    let _ = std::fs::remove_file(&path);
+                } else {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
@@ -234,6 +284,7 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
 /// test that starts the loop gives it a client of its own, so that the connections
 /// of the other tests that use the lane's are not the loop's to close.
 fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
+    let _ = KEPT_DIR.set(store.data_dir().join("link").join("sealed-pending"));
     std::thread::spawn(move || {
         let identity = match E2eIdentity::load_or_create(store.data_dir()) {
             Ok(identity) => identity,
@@ -265,6 +316,8 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
                     continue;
                 }
             };
+            // (completions kept from before, the provider away when they were made: told first)
+            resend_kept(&http, &account, Duration::from_secs(15));
             let polled = std::time::Instant::now();
             let result = poll_once(
                 &http,

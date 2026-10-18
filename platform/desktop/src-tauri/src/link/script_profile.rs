@@ -300,6 +300,10 @@ fn declared_name(line: &str) -> Option<&str> {
 
 #[derive(Default)]
 struct State {
+    /// The account what is held is of ([`super::app_logic::account_key`]): another account's is never run.
+    account: Option<String>,
+    /// Counted up at each `invalidate`: a fetch that began before one (an unlink during it) does not write what it got.
+    generation: u64,
     held: Option<Arc<Profile>>,
     /// The `ETag` header exactly as the provider wrote it, quotes and all, to
     /// be echoed in `If-None-Match`. Memory only, deliberately: a validator
@@ -386,6 +390,7 @@ impl ProfileCache {
     ) -> Option<Arc<Profile>> {
         {
             let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            Self::for_account(&mut state, account, data_dir);
             if state.held.is_some() {
                 return state.held.clone();
             }
@@ -417,6 +422,7 @@ impl ProfileCache {
         let ttl = Duration::from_secs(spec.ttl_seconds);
         {
             let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            Self::for_account(&mut state, account, data_dir);
             if !state.read_disk {
                 state.read_disk = true;
                 if let Some(profile) = read_disk(data_dir) {
@@ -435,9 +441,17 @@ impl ProfileCache {
 
     /// One conditional GET, and what it does to the cache.
     fn refresh(&self, account: &LinkedAccount, spec: &ScriptProfileSpec, data_dir: &Path) {
-        let etag = self.inner.lock().unwrap_or_else(|e| e.into_inner()).etag.clone();
+        let (etag, generation) = {
+            let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (state.etag.clone(), state.generation)
+        };
         let outcome = fetch(account, spec, etag.as_deref());
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // (unlinked, or linked to another account, while it was fetched: what came is not this link's, and is neither
+        // kept nor written back to the disk the unlink cleared)
+        if state.generation != generation || state.account.as_deref().is_some_and(|a| a != super::app_logic::account_key(account)) {
+            return;
+        }
         match outcome {
             Ok(Fetched::NotModified) => {
                 // The one case with nothing to verify and nothing to write: the
@@ -507,8 +521,23 @@ impl ProfileCache {
     /// library against another's scripts.
     pub fn invalidate(&self, data_dir: &Path) {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        *state = State::default();
+        let generation = state.generation + 1;
+        *state = State { generation, ..State::default() };
         let _ = std::fs::remove_file(Self::path(data_dir));
+    }
+
+    /// What is held made `account`'s: another account's held copy (and its copy on the disk) forgotten first.
+    fn for_account(state: &mut State, account: &LinkedAccount, data_dir: &Path) {
+        let key = super::app_logic::account_key(account);
+        match state.account.as_deref() {
+            Some(held) if held == key => {}
+            Some(_) => {
+                let generation = state.generation + 1;
+                *state = State { generation, account: Some(key), ..State::default() };
+                let _ = std::fs::remove_file(Self::path(data_dir));
+            }
+            None => state.account = Some(key),
+        }
     }
 }
 

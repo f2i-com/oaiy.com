@@ -106,6 +106,8 @@ async fn overview(Query(r): Query<Range>) -> Response {
         "settings": settings,
         "appointments": cal.list(from, to),
         "now": local_now().format("%Y-%m-%dT%H:%M").to_string(),
+        // (why the calendar's file could not be used when it was opened, where it could not)
+        "problem": cal.problem(),
     }))
     .into_response()
 }
@@ -175,7 +177,9 @@ async fn remove(Path(id): Path<String>) -> Response {
     };
     match cal.remove(&id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => fail(StatusCode::NOT_FOUND, "no_appointment", &e),
+        Err(e) if e.starts_with("no appointment") => fail(StatusCode::NOT_FOUND, "no_appointment", &e),
+        // (it could not be saved: not a missing appointment, which a person would take for already gone)
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, "not_saved", &e),
     }
 }
 

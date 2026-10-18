@@ -142,7 +142,17 @@ impl DeadLetterQueue {
     /// torn write is much better than losing the queue.
     pub fn open(path: PathBuf) -> Self {
         let mut q = Self::new();
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        // (read as bytes, line by line: a torn write that cut a character in two costs that one line, not the whole
+        // read; a file that cannot be read at all is left as it is, never written over by an empty queue)
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                eprintln!("[deadletters] {} could not be read ({e}); kept in memory only until restart", path.display());
+                return q;
+            }
+        };
+        if let Some(bytes) = bytes {
             // LAST WRITE PER ID WINS — the same upsert semantics the run
             // ledger's journal replays with, and what makes appending an update
             // (a redrive attempt) sound: the newer line supersedes the older
@@ -151,8 +161,8 @@ impl DeadLetterQueue {
             let mut order: Vec<String> = Vec::new();
             let mut latest: std::collections::HashMap<String, DeadLetter> =
                 std::collections::HashMap::new();
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                if let Ok(item) = serde_json::from_str::<DeadLetter>(line) {
+            for line in bytes.split(|b| *b == b'\n').map(<[u8]>::trim_ascii).filter(|l| !l.is_empty()) {
+                if let Ok(item) = serde_json::from_slice::<DeadLetter>(line) {
                     q.seq = q.seq.max(seq_of(&item.id));
                     if !latest.contains_key(&item.id) {
                         order.push(item.id.clone());

@@ -753,6 +753,21 @@ fn restorable_names(manifest: &Manifest) -> BTreeSet<String> {
     manifest.entries.iter().filter(|e| matches!(rules::standing_of_backup_entry(&e.name), Ok(Some(_)))).map(|e| e.name.clone()).collect()
 }
 
+/// Whether there is room to decrypt `file` beside the data (its plain copy is about as large as it is), asked before
+/// any of it is decrypted rather than found out by a disk filled part way.
+fn room_to_open(data_dir: &Path, file: &Path, opts: &RestoreOptions) -> Result<()> {
+    let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let needed = size.saturating_add(MARGIN);
+    let free = (opts.free_space)(data_dir);
+    if free < needed {
+        return Err(BackupError::new(
+            ErrorKind::NoSpace,
+            format!("There is not enough free space to open this backup: about {} MB is needed and {} MB is free.", needed >> 20, free >> 20),
+        ));
+    }
+    Ok(())
+}
+
 /// Step 1: decrypt and check the backup, and say what restoring would do. Changes nothing.
 pub fn inspect(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<Preview> {
     inspect_bound(data_dir, file, passphrase, opts).map(|(preview, _)| preview)
@@ -761,6 +776,7 @@ pub fn inspect(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOpt
 /// Step 1, with what is needed to hold step 2 to it (see [`Inspection`]).
 pub fn inspect_bound(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<(Preview, Inspection)> {
     opts.busy.refuse_if_busy("checking a backup")?;
+    room_to_open(data_dir, file, opts)?;
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
     let budget = opts.budget();
     let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
@@ -794,6 +810,7 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
     // quiet app is what a restore does to the app: looking at a backup (a second of computing and up to a gigabyte of memory),
     // making a backup, and the restart that applies one (it ends a call).
     let budget = opts.budget();
+    room_to_open(data_dir, file, opts)?;
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
     let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
     if let Some(seen) = looked_at {
@@ -850,10 +867,10 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
         }
     }
     let total: u64 = selected.iter().map(|e| e.size).sum();
-    let plain_len = std::fs::metadata(&verified.plain).map(|m| m.len()).unwrap_or(0);
-    // (The Agent's archive is copied out of the backup to be read, and rebuilt: two more of its size at the most.)
+    // (The Agent's archive is copied out of the backup to be read, and rebuilt: two more of its size at the most. The
+    // decrypted backup is on the drive already, so the free space read now has it counted; it is not counted again.)
     let agent_size = selected.iter().find(|e| e.name == AGENT_ENTRY).map(|e| e.size).unwrap_or(0);
-    let needed = total.saturating_add(plain_len).saturating_add(agent_size).saturating_add(MARGIN);
+    let needed = total.saturating_add(agent_size).saturating_add(MARGIN);
     let free = (opts.free_space)(data_dir);
     if free < needed {
         return Err(BackupError::new(

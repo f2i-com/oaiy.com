@@ -536,6 +536,11 @@ impl PluginRegistry {
         if !dir.join("data").is_dir() || !dir.join(PACKAGE_MANIFEST_FILE).is_file() {
             return;
         }
+        // (a move that failed is not tried again at every scan: each try hashes the whole package first, which for a
+        // package of gigabytes, polled every few seconds, kept a core busy; it is tried again after a restart)
+        if self.migration_warned.contains(id) {
+            return;
+        }
         if !self.trust.legacy_data_may_move(dir, id) {
             return;
         }

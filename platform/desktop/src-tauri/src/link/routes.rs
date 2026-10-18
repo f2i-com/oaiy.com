@@ -100,23 +100,30 @@ pub fn open_in_browser(url: &str) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::process::Command::new("rundll32.exe")
+        reap(std::process::Command::new("rundll32.exe")
             .args(["url.dll,FileProtocolHandler", url])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
-            .map_err(|e| format!("could not open the browser: {e}"))?;
+            .map_err(|e| format!("could not open the browser: {e}"))?);
     }
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
+    reap(std::process::Command::new("open")
         .arg(url)
         .spawn()
-        .map_err(|e| format!("could not open the browser: {e}"))?;
+        .map_err(|e| format!("could not open the browser: {e}"))?);
     #[cfg(target_os = "linux")]
-    oaiy_host_env::command("xdg-open")
+    reap(oaiy_host_env::command("xdg-open")
         .arg(url)
         .spawn()
-        .map_err(|e| format!("could not open the browser: {e}"))?;
+        .map_err(|e| format!("could not open the browser: {e}"))?);
     Ok(())
+}
+
+/// Wait for a helper that opens the browser, on a thread of its own: never waited for, each was left a zombie.
+fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 #[cfg(test)]

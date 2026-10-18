@@ -178,7 +178,11 @@ pub fn run(old: PathBuf, new: PathBuf, mode: Mode, progress: MigrationHandle) {
                     if let Some(parent) = dst.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::copy(&src, &dst)?;
+                    // Copied beside its name, then renamed into place: a copy cut short (the disk full, the app
+                    // quit) is never taken for the file by a later run, which skips what exists.
+                    let part = part_path(&dst);
+                    std::fs::copy(&src, &part)?;
+                    std::fs::rename(&part, &dst)?;
                 }
                 if mode == Mode::Move {
                     // Delete the source ONLY when this run created the
@@ -236,8 +240,21 @@ fn prune_empty_dirs(root: &Path) {
     }
 }
 
+/// Where a file is copied before it takes its name: beside it, `<name>.part`.
+fn part_path(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".part");
+    dst.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_file_is_copied_beside_its_place_first() {
+        let part = super::part_path(std::path::Path::new("/data/models/m.gguf"));
+        assert_eq!(part, std::path::Path::new("/data/models/m.gguf.part"));
+    }
     use super::*;
 
     fn write(p: &Path, bytes: &[u8]) {

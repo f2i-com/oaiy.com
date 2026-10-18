@@ -425,10 +425,12 @@ pub fn evaluate_conditions(
 
 /// The Rust grammar's reading, as a [`Verdict`] — for the shadow log only.
 fn rust_shadow(expr: &str, event: &Event) -> Verdict {
-    match eval_condition(expr, event) {
-        Ok(true) => Verdict::True,
-        Ok(false) => Verdict::False,
-        Err(why) => Verdict::Unknown(why),
+    // (a condition this reader cannot read is unknown, never the end of the one thread plugin events run on)
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_condition(expr, event))) {
+        Ok(Ok(true)) => Verdict::True,
+        Ok(Ok(false)) => Verdict::False,
+        Ok(Err(why)) => Verdict::Unknown(why),
+        Err(_) => Verdict::Unknown("the condition could not be read".into()),
     }
 }
 
@@ -714,7 +716,9 @@ fn split_top(expr: &str, sep: &str) -> Vec<String> {
             Some(q) if b == q => quote = None,
             Some(_) => {}
             None if b == b'\'' || b == b'"' => quote = Some(b),
-            None if expr[i..].starts_with(sep) => {
+            // (compared as bytes: `expr[i..]` panics where `i` falls inside a multi-byte character, as in
+            // `event.data.größe`; `sep` is ASCII, so a match starts and ends on a character's boundary)
+            None if bytes[i..].starts_with(sep.as_bytes()) => {
                 parts.push(expr[start..i].to_string());
                 i += sep.len();
                 start = i;
@@ -771,6 +775,19 @@ fn operand(text: &str, event: &Event) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A condition with letters past ASCII outside quotes (a field named in German, a template string) is read, or
+    /// said unreadable: never a panic on the thread every plugin event runs on.
+    #[test]
+    fn a_condition_with_non_ascii_text_outside_quotes_does_not_panic() {
+        let e = event();
+        for expr in ["event.data.größe === 1", "event.data.größe === 1 && event.data.known === true", "`José` === event.data.flowId || event.data.known === true"] {
+            let _ = eval_condition(expr, &e);
+            let _ = rust_shadow(expr, &e);
+        }
+        assert_eq!(split_top("ä && b", "&&"), vec!["ä ".to_string(), " b".to_string()]);
+        assert_eq!(split_top("'x && y' && z", "&&"), vec!["'x && y' ".to_string(), " z".to_string()]);
+    }
 
     // --- fixtures ---------------------------------------------------------
 

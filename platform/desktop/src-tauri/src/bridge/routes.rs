@@ -325,18 +325,15 @@ async fn create_run(
     // the async fn's state — even one already drop()ed — makes the future !Send
     // and the whole route fail to compile as a handler. The guard must
     // provably end before the first await.
-    let outcome = {
-        let mut ledger = match st.ledger.lock() {
-            Ok(l) => l,
-            Err(_) => {
-                return bridge_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    "run ledger lock poisoned".into(),
-                )
-            }
-        };
-        ledger.reserve(&req)
+    // (on a blocking thread: reserving writes the journal and syncs it to disk, and now and then rewrites it whole,
+    // which must not hold up the async runtime's own threads)
+    let reserving = {
+        let (ledger, req) = (st.ledger.clone(), req.clone());
+        tokio::task::spawn_blocking(move || ledger.lock().map(|mut l| l.reserve(&req)).map_err(|_| ())).await
+    };
+    let outcome = match reserving {
+        Ok(Ok(o)) => o,
+        _ => return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "run ledger lock poisoned".into()),
     };
 
     match outcome {
@@ -350,7 +347,9 @@ async fn create_run(
                 // its own thread) up to the run's own budget plus scheduling
                 // slack.
                 let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(req.timeout_ms.unwrap_or(30_000))
+                    // (a run that names no budget has the worker's own, not a shorter one here: waiting 30 s for a
+                    // run allowed 120 answered "still running" for a run that went on to finish)
+                    + req.timeout_ms.map_or(super::worker::DEFAULT_TIMEOUT, std::time::Duration::from_millis)
                     + std::time::Duration::from_secs(5);
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -767,13 +766,13 @@ async fn finish_run(
             )
         }
     };
-    let mut ledger = match st.ledger.lock() {
-        Ok(l) => l,
-        Err(_) => {
-            return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "run ledger lock poisoned".into())
-        }
+    // (on a blocking thread, as reserving is: finishing writes the journal and syncs it)
+    let ledger = st.ledger.clone();
+    let finished = tokio::task::spawn_blocking(move || ledger.lock().map(|mut l| l.finish(&id, status, body.output, body.error)).map_err(|_| ())).await;
+    let Ok(Ok(finished)) = finished else {
+        return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "run ledger lock poisoned".into());
     };
-    match ledger.finish(&id, status, body.output, body.error) {
+    match finished {
         Ok(rec) => (StatusCode::OK, Json(rec)).into_response(),
         // The ledger's refusals here are all conflicts: already terminal, a
         // failure with no error, an unknown run. 409 tells the claimer its view
@@ -1135,15 +1134,14 @@ async fn install_plugin(
         }
     };
 
-    // A running plugin holds its executable open, so replacing it would fail
-    // mid-way. Stop it first if this install targets an id we already run.
+    // A running plugin holds its executable open, so replacing it would fail mid-way (or, on a Mac, leave it running
+    // from a folder taken away under it). The install stops the plugin it replaces once the package is unpacked and
+    // its id known, a folder's or an archive's alike.
     let host = st.host.clone();
     let installed = tokio::task::spawn_blocking(move || {
-        // Peek at the id before copying, so we only stop what we are replacing.
-        if let Ok(id) = crate::plugins::install::peek_id(&source) {
-            let _ = host.stop(&id);
-        }
-        crate::plugins::install::install_from_path(&source, &root, &trust)
+        crate::plugins::install::install_from_path_stopping(&source, &root, &trust, |id| {
+            let _ = host.stop(id);
+        })
     })
     .await;
 

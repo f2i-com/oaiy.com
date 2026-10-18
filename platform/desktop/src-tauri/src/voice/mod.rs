@@ -834,7 +834,12 @@ async fn say(State(hub): State<VoiceHub>, Path(id): Path<String>, Json(body): Js
     if tx.send(CallCommand::Say { text: body.text, hold: body.hold, reply }).is_err() {
         return no_call(&id);
     }
-    answer(rx.await.unwrap_or_else(|_| Err("the call ended".into())).map(|item| if item.is_empty() { json!({"skipped": true}) } else { json!({"itemId": item}) }))
+    // (bounded: a call that stopped answering without ending does not hold this request, and its caller, for ever)
+    let said = match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+        Ok(r) => r.unwrap_or_else(|_| Err("the call ended".into())),
+        Err(_) => Err("the call did not answer within two minutes".into()),
+    };
+    answer(said.map(|item| if item.is_empty() { json!({"skipped": true}) } else { json!({"itemId": item}) }))
 }
 
 /// A request to reach the owner that the app's route has sent for `call` and not yet been answered: held while the route waits.

@@ -193,10 +193,13 @@ impl Engines {
         });
         let resp = t.http.post(format!("{}/v1/audio/transcriptions", t.base)).json(&body).timeout(Duration::from_secs(60)).send().await.map_err(|e| format!("speech-to-text: {e}"))?;
         let status = resp.status();
-        let value: serde_json::Value = resp.json().await.map_err(|e| format!("speech-to-text answer: {e}"))?;
+        // (the status first: a failure's answer is often not JSON, and reading it as JSON hid the HTTP error behind a
+        // parse error)
         if !status.is_success() {
-            return Err(format!("speech-to-text: HTTP {status}: {value}"));
+            let said = resp.text().await.unwrap_or_default();
+            return Err(format!("speech-to-text: HTTP {status}: {}", said.chars().take(400).collect::<String>()));
         }
+        let value: serde_json::Value = resp.json().await.map_err(|e| format!("speech-to-text answer: {e}"))?;
         Ok(value.get("text").and_then(|t| t.as_str()).unwrap_or("").trim().to_string())
     }
 

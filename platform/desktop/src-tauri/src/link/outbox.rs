@@ -319,10 +319,11 @@ impl Outbox {
         }
     }
 
-    /// Sleep until an event is queued, a retry is due, or `IDLE` passes.
-    pub fn wait_for_work(&self) {
+    /// Sleep until an event is queued, a retry is due, or `IDLE` passes. `linked`: an account is linked to send to;
+    /// with none, what is queued waits for one (it is not looked at 20 times a second meanwhile).
+    pub fn wait_for_work(&self, linked: bool) {
         let s = self.lock();
-        let wait = match (s.queued.is_empty(), s.retry_at) {
+        let wait = match (s.queued.is_empty() || !linked, s.retry_at) {
             (false, Some(t)) => t.saturating_duration_since(Instant::now()).min(IDLE).max(Duration::from_millis(50)),
             (false, None) => Duration::from_millis(50),
             (true, _) => IDLE,

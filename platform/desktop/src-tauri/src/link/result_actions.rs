@@ -495,10 +495,11 @@ pub fn build_inputs(sel: &SelectorSpec, input_map: &Value, scope: &Scope) -> Val
 /// be tested without a network or a plugin — the part most worth testing is
 /// which actions run, in what order, and what happens when one fails.
 pub trait Perform {
-    /// Create a record; returns its id when the provider reports one.
-    fn submit(&self, form_id: &str, record: &Value) -> Result<Option<String>, String>;
-    /// Update a record.
-    fn update(&self, form_id: &str, record_id: &str, record: &Value) -> Result<(), String>;
+    /// Create a record; returns its id when the provider reports one. Under a key that makes a retry harmless (the
+    /// same for the same run's same action: a provider that saw it already does not write the record twice).
+    fn submit(&self, form_id: &str, record: &Value, idempotency_key: &str) -> Result<Option<String>, String>;
+    /// Update a record, under a key as for `submit`.
+    fn update(&self, form_id: &str, record_id: &str, record: &Value, idempotency_key: &str) -> Result<(), String>;
     /// Say something at this machine.
     fn notify(&self, message: &str);
     /// Call a plugin connector, under a key that makes a retry harmless.
@@ -534,12 +535,12 @@ pub fn perform_all(
     for (index, action) in planned {
         let outcome = match &action {
             Planned::Skipped => Ok(()),
-            Planned::Submit { form_id, record } => doer.submit(form_id, record).map(|_| ()),
+            Planned::Submit { form_id, record } => doer.submit(form_id, record, &action_key(run_key, index)).map(|_| ()),
             Planned::Update {
                 form_id,
                 record_id,
                 record,
-            } => doer.update(form_id, record_id, record),
+            } => doer.update(form_id, record_id, record, &action_key(run_key, index)),
             Planned::Notify { message } => {
                 doer.notify(message);
                 Ok(())
@@ -617,7 +618,7 @@ impl Live<'_> {
 }
 
 impl Perform for Live<'_> {
-    fn submit(&self, form_id: &str, record: &Value) -> Result<Option<String>, String> {
+    fn submit(&self, form_id: &str, record: &Value, idempotency_key: &str) -> Result<Option<String>, String> {
         let url = super::oauth::join(
             &self.account.base_url,
             &self.spec.submit_path.replace("{formId}", form_id),
@@ -625,6 +626,7 @@ impl Perform for Live<'_> {
         let resp = Self::client()?
             .post(&url)
             .bearer_auth(&self.account.credential)
+            .header("Idempotency-Key", idempotency_key)
             .json(&json!({ &self.spec.fields.record: record }))
             .send()
             .map_err(|e| format!("could not reach the provider to write the record: {e}"))?;
@@ -640,7 +642,7 @@ impl Perform for Live<'_> {
             .map(str::to_string))
     }
 
-    fn update(&self, form_id: &str, record_id: &str, record: &Value) -> Result<(), String> {
+    fn update(&self, form_id: &str, record_id: &str, record: &Value, idempotency_key: &str) -> Result<(), String> {
         let url = super::oauth::join(
             &self.account.base_url,
             &self
@@ -652,6 +654,7 @@ impl Perform for Live<'_> {
         let resp = Self::client()?
             .put(&url)
             .bearer_auth(&self.account.credential)
+            .header("Idempotency-Key", idempotency_key)
             .json(&json!({ &self.spec.fields.record: record }))
             .send()
             .map_err(|e| format!("could not reach the provider to update the record: {e}"))?;
@@ -987,18 +990,21 @@ mod tests {
     struct Spy {
         done: std::cell::RefCell<Vec<String>>,
         keys: std::cell::RefCell<Vec<String>>,
+        record_keys: std::cell::RefCell<Vec<String>>,
         fail: Vec<&'static str>,
     }
 
     impl Perform for Spy {
-        fn submit(&self, form_id: &str, _record: &Value) -> Result<Option<String>, String> {
+        fn submit(&self, form_id: &str, _record: &Value, idempotency_key: &str) -> Result<Option<String>, String> {
             self.done.borrow_mut().push(format!("submit:{form_id}"));
+            self.record_keys.borrow_mut().push(idempotency_key.to_string());
             if self.fail.contains(&"submit") {
                 return Err("the form is gone".into());
             }
             Ok(Some("new-1".into()))
         }
-        fn update(&self, form_id: &str, record_id: &str, _record: &Value) -> Result<(), String> {
+        fn update(&self, form_id: &str, record_id: &str, _record: &Value, idempotency_key: &str) -> Result<(), String> {
+            self.record_keys.borrow_mut().push(idempotency_key.to_string());
             self.done
                 .borrow_mut()
                 .push(format!("update:{form_id}/{record_id}"));
@@ -1083,6 +1089,9 @@ mod tests {
         };
         let errors = perform_all(&s, &sel, &live_actions(), &scope, "flow:b1:call_x:ended:v1", &spy);
         assert_eq!(spy.done.borrow().len(), 4, "every action still ran");
+        // (a record written or updated goes under its run's and its place's key too: a requeued run writes it once)
+        assert!(spy.record_keys.borrow().iter().all(|k| k.starts_with("flow:b1:call_x:ended:v1:action")), "{:?}", spy.record_keys.borrow());
+        assert!(!spy.record_keys.borrow().is_empty());
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("the form is gone"), "{:?}", errors);
     }

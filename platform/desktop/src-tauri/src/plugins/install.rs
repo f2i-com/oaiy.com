@@ -281,11 +281,8 @@ pub fn in_progress() -> bool {
 
 /// Read just the plugin id from a source, WITHOUT installing it.
 ///
-/// The caller needs this before copying: replacing a plugin means removing the
-/// old directory, and on Windows a running plugin pins its own executable — so
-/// the host has to stop that id first. Only the directory case is cheap enough
-/// to peek; for an archive the caller simply skips the pre-stop and gets a clear
-/// "stop it first" error if the plugin is running.
+/// For a folder (an archive's id is known only once it is unpacked: see
+/// [`install_from_path_stopping`], which stops the plugin it replaces whatever the package).
 pub fn peek_id(source: &Path) -> Result<String, String> {
     if !source.is_dir() {
         return Err("not a directory".into());
@@ -302,6 +299,13 @@ pub fn peek_id(source: &Path) -> Result<String, String> {
 ///
 /// A signed package that does not verify under `trust` is an error, not an install.
 pub fn install_from_path(source: &Path, plugins_root: &Path, trust: &TrustService) -> Result<Installed, String> {
+    install_from_path_stopping(source, plugins_root, trust, |_| {})
+}
+
+/// [`install_from_path`], calling `stop` with the package's plugin id once it is staged and verified and before
+/// anything replaces the installed one: an archive's id is only known once it is unpacked, and a plugin left running
+/// from a folder taken away under it keeps its process (and the devices it holds) while a newer one shows as running.
+pub fn install_from_path_stopping(source: &Path, plugins_root: &Path, trust: &TrustService, stop: impl FnOnce(&str)) -> Result<Installed, String> {
     let _installing = InstallGuard::enter();
     if !source.exists() {
         return Err(format!("{} does not exist", source.display()));
@@ -349,6 +353,9 @@ pub fn install_from_path(source: &Path, plugins_root: &Path, trust: &TrustServic
         }
         let dest = plugins_root.join(&manifest.id);
         let replaced = dest.exists();
+        if replaced {
+            stop(&manifest.id);
+        }
         let backup = plugins_root.join(format!(".backup-{}-{}", manifest.id, uuid::Uuid::new_v4()));
         if replaced {
             // Preserve every old byte until the validated replacement is live.
@@ -486,6 +493,31 @@ mod tests {
         let out = install_from_path(&src, &root, &dev_trust(&base)).unwrap();
         assert!(out.replaced);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A ZIP installed over a plugin stops that plugin first (its id is only known once the ZIP is unpacked), and a
+    /// first install stops nothing.
+    #[test]
+    fn an_archive_installed_over_a_plugin_stops_it_first() {
+        use std::io::Write;
+        let base = tmp("zip-stop");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        let archive = base.join("plugin.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        for name in ["manifest.json", "x.exe"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(&std::fs::read(src.join(name)).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        let mut stopped: Vec<String> = Vec::new();
+        install_from_path_stopping(&archive, &root, &dev_trust(&base), |id| stopped.push(id.to_string())).unwrap();
+        assert!(stopped.is_empty(), "nothing to stop on a first install");
+        let out = install_from_path_stopping(&archive, &root, &dev_trust(&base), |id| stopped.push(id.to_string())).unwrap();
+        assert!(out.replaced);
+        assert_eq!(stopped, vec!["demo".to_string()]);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

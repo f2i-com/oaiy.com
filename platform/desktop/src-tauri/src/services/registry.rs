@@ -527,6 +527,9 @@ pub struct Registry {
     /// What each `templates/*.json` looked like last time we read it, keyed by
     /// path. See [`Registry::reload_new_templates`].
     template_probes: HashMap<PathBuf, TemplateProbe>,
+    /// Ids being uninstalled: their files are removed outside the lock ([`Registry::begin_uninstall`]), and nothing
+    /// starts, installs or deletes them meanwhile.
+    uninstalling: std::collections::HashSet<String>,
 }
 
 /// Read the explicit start-with-the-app list from a data dir.
@@ -896,6 +899,7 @@ impl Registry {
             autostart,
             template_errors,
             template_probes: HashMap::new(),
+            uninstalling: Default::default(),
         };
         registry.forget_retired_services();
         Ok(registry)
@@ -918,6 +922,7 @@ impl Registry {
             autostart: std::collections::HashSet::new(),
             template_errors: Vec::new(),
             template_probes: HashMap::new(),
+            uninstalling: Default::default(),
         }
     }
 
@@ -1054,60 +1059,32 @@ impl Registry {
     /// dir. Every path is guarded to stay inside a managed root and to contain
     /// no `..`. The service must be stopped. Returns the count removed.
     pub fn uninstall(&mut self, id: &str) -> Result<usize, String> {
-        let (status, spec, port) = {
+        let paths = self.begin_uninstall(id)?;
+        let removed = remove_uninstall_paths(&paths);
+        self.finish_uninstall(id, removed);
+        Ok(removed)
+    }
+
+    /// An uninstall's checks, and the paths it removes, resolved: the removal ([`remove_uninstall_paths`]) needs no
+    /// lock, and a venv of gigabytes removed under the registry's held every services poll, start and stop for as long.
+    /// The service is held from starting, installing or being deleted until [`Self::finish_uninstall`].
+    pub fn begin_uninstall(&mut self, id: &str) -> Result<Vec<String>, String> {
+        if self.uninstalling.contains(id) {
+            return Err("it is being uninstalled already".into());
+        }
+        let (status, spec, port, alive) = {
             let svc = self.services.get(id).ok_or("unknown service")?;
-            (svc.status, svc.template.uninstall.clone(), svc.port)
+            (svc.status, svc.template.uninstall.clone(), svc.port, process_alive(svc))
         };
-        if matches!(status, ServiceStatus::Running | ServiceStatus::Starting) {
-            return Err("stop the service before uninstalling it".into());
+        // (installing too: its installer would be left running, writing into what is removed; and a process alive
+        // under an Errored status holds the files open)
+        if matches!(status, ServiceStatus::Running | ServiceStatus::Starting | ServiceStatus::Installing) || alive {
+            return Err(if status == ServiceStatus::Installing { "wait for the install to finish (or cancel it) before uninstalling".into() } else { "stop the service before uninstalling it".into() });
         }
         let spec: UninstallSpec = spec.ok_or("this service has no uninstall defined")?;
 
-        // Glob-aware single-segment removal (prefix*suffix on the file name).
-        fn remove_matching(resolved: &str) -> usize {
-            let p = Path::new(resolved);
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if fname.contains('*') {
-                let dir = p.parent().unwrap_or_else(|| Path::new("."));
-                let (pre, suf) = fname.split_once('*').unwrap_or((fname, ""));
-                // A bare `*` (empty prefix AND suffix) matches EVERY entry in the
-                // dir — refuse it so an over-broad spec can't wipe a whole dir.
-                if pre.is_empty() && suf.is_empty() {
-                    return 0;
-                }
-                let mut n = 0;
-                if let Ok(rd) = std::fs::read_dir(dir) {
-                    for e in rd.flatten() {
-                        let nm = e.file_name();
-                        let nm = nm.to_str().unwrap_or("");
-                        if nm.len() >= pre.len() + suf.len()
-                            && nm.starts_with(pre)
-                            && nm.ends_with(suf)
-                        {
-                            let t = e.path();
-                            let ok = if t.is_dir() {
-                                std::fs::remove_dir_all(&t).is_ok()
-                            } else {
-                                std::fs::remove_file(&t).is_ok()
-                            };
-                            if ok {
-                                n += 1;
-                            }
-                        }
-                    }
-                }
-                n
-            } else if p.is_dir() {
-                usize::from(std::fs::remove_dir_all(p).is_ok())
-            } else if p.is_file() {
-                usize::from(std::fs::remove_file(p).is_ok())
-            } else {
-                0
-            }
-        }
-
         let ctx = self.ctx(port);
-        let mut removed = 0usize;
+        let mut paths = Vec::new();
         for raw in &spec.paths {
             let resolved = os_fix_path(substitute(raw, &ctx));
             if resolved.split(['/', '\\']).any(|c| c == "..") {
@@ -1135,14 +1112,20 @@ impl Registry {
                 log::warn!("uninstall {id}: refusing root-level glob: {resolved}");
                 continue;
             }
-            removed += remove_matching(&resolved);
+            paths.push(resolved);
         }
+        self.uninstalling.insert(id.to_string());
+        Ok(paths)
+    }
+
+    /// The end of an uninstall [`Self::begin_uninstall`] began, its files removed.
+    pub fn finish_uninstall(&mut self, id: &str, removed: usize) {
+        self.uninstalling.remove(id);
         if let Some(svc) = self.services.get_mut(id) {
             svc.set_status(ServiceStatus::Stopped, None);
             svc.error = None;
         }
         log::info!("uninstall {id}: removed {removed} item(s)");
-        Ok(removed)
     }
 
     /// Whether the service's run executable exists on disk. Mirrors start()'s resolution: a
@@ -1681,6 +1664,9 @@ impl Registry {
     /// doesn't exist or the spawn fails. Currently a no-op when the
     /// service is already Running.
     pub fn start(&mut self, id: &str) -> Result<(), String> {
+        if self.uninstalling.contains(id) {
+            return Err(format!("{id}: it is being uninstalled"));
+        }
         // Extract everything we need under a read-only borrow first so
         // we can call `self.ctx(...)` (which also borrows `self`) without
         // hitting the borrow checker. `RunSpec.clone()` is cheap — small
@@ -1875,7 +1861,10 @@ impl Registry {
             .map(|s| (s.template.name.clone(), s.status))
             .unwrap_or((String::new(), ServiceStatus::Stopped));
 
-        if status == ServiceStatus::Running {
+        // (alive though not Running: still loading past its health grace, Errored for that alone; restarting it would
+        // throw the load away each time and it would never come up, so it is left to finish)
+        let alive = self.services.get(&id).is_some_and(process_alive);
+        if status == ServiceStatus::Running || (alive && matches!(status, ServiceStatus::Errored | ServiceStatus::Starting)) {
             return EnsureByPortResult {
                 found: true,
                 already_running: true,
@@ -2155,6 +2144,9 @@ impl Registry {
     /// see "Downloading…" + "Extracting…" lines tick by — same UX as
     /// running the .ps1 in a console themselves.
     pub fn install_streaming(&mut self, id: &str) -> Result<(), String> {
+        if self.uninstalling.contains(id) {
+            return Err("it is being uninstalled: wait for that to finish".into());
+        }
         let script = self.install_script(id)?;
 
         // Block double-installs, and refuse to install over a LIVE service —
@@ -2300,12 +2292,13 @@ impl Registry {
             return Err("service id must be lowercase letters/digits/dash/underscore (1–64 chars)".into());
         }
         if let Some(existing) = self.services.get(&template.id) {
-            if existing.status == ServiceStatus::Running
-                || existing.status == ServiceStatus::Installing
-            {
+            // (its process alive whatever its status says, an Errored service still loading: replaced under it, the
+            // process would be orphaned, holding its port and GPU memory)
+            if matches!(existing.status, ServiceStatus::Running | ServiceStatus::Installing | ServiceStatus::Starting) || process_alive(existing) {
                 return Err(format!(
-                    "service {} is {:?}; stop it before editing",
-                    template.id, existing.status
+                    "service {} is {}; stop it before editing",
+                    template.id,
+                    status_words(existing)
                 ));
             }
         }
@@ -2495,11 +2488,12 @@ impl Registry {
 
     /// Remove a template + its on-disk JSON. Refuses if Running.
     pub fn delete_template(&mut self, id: &str) -> Result<(), String> {
+        if self.uninstalling.contains(id) {
+            return Err(format!("service {id} is being uninstalled; wait for that to finish"));
+        }
         if let Some(svc) = self.services.get(id) {
-            if svc.status == ServiceStatus::Running
-                || svc.status == ServiceStatus::Installing
-            {
-                return Err(format!("service {id} is {:?}; stop it first", svc.status));
+            if matches!(svc.status, ServiceStatus::Running | ServiceStatus::Installing | ServiceStatus::Starting) || process_alive(svc) {
+                return Err(format!("service {id} is {}; stop it first", status_words(svc)));
             }
         } else {
             return Err("unknown service".into());
@@ -2548,7 +2542,7 @@ pub(crate) fn kill_process_tree(pid: u32) {
         // renderer under Playwright) can't linger and keep a port bound — matching
         // the forceful `taskkill /T /F` on Windows. Detached (no .wait()) so app
         // exit / a held Registry lock never blocks on the grace sleep.
-        let _ = oaiy_host_env::command("sh")
+        let killer = oaiy_host_env::command("sh")
             .args([
                 "-c",
                 &format!("kill -TERM -{pid} 2>/dev/null; sleep 2; kill -KILL -{pid} 2>/dev/null"),
@@ -2557,6 +2551,60 @@ pub(crate) fn kill_process_tree(pid: u32) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
+        // (waited for on a thread of its own, not here: never waited for, each was left a zombie for as long as OAIY ran)
+        if let Ok(mut killer) = killer {
+            std::thread::spawn(move || {
+                let _ = killer.wait();
+            });
+        }
+    }
+}
+
+/// Remove an uninstall's paths ([`Registry::begin_uninstall`] resolved and checked them), without the registry's
+/// lock: the number of items removed. Glob-aware single-segment removal (prefix*suffix on the file name).
+pub fn remove_uninstall_paths(paths: &[String]) -> usize {
+    paths.iter().map(|p| remove_matching(p)).sum()
+}
+
+fn remove_matching(resolved: &str) -> usize {
+    let p = Path::new(resolved);
+    let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if fname.contains('*') {
+        let dir = p.parent().unwrap_or_else(|| Path::new("."));
+        let (pre, suf) = fname.split_once('*').unwrap_or((fname, ""));
+        // A bare `*` (empty prefix AND suffix) matches EVERY entry in the
+        // dir — refuse it so an over-broad spec can't wipe a whole dir.
+        if pre.is_empty() && suf.is_empty() {
+            return 0;
+        }
+        let mut n = 0;
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let nm = e.file_name();
+                let nm = nm.to_str().unwrap_or("");
+                if nm.len() >= pre.len() + suf.len()
+                    && nm.starts_with(pre)
+                    && nm.ends_with(suf)
+                {
+                    let t = e.path();
+                    let ok = if t.is_dir() {
+                        std::fs::remove_dir_all(&t).is_ok()
+                    } else {
+                        std::fs::remove_file(&t).is_ok()
+                    };
+                    if ok {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    } else if p.is_dir() {
+        usize::from(std::fs::remove_dir_all(p).is_ok())
+    } else if p.is_file() {
+        usize::from(std::fs::remove_file(p).is_ok())
+    } else {
+        0
     }
 }
 
@@ -2669,6 +2717,23 @@ fn wait_exited_bounded(grace: Duration, mut exited: impl FnMut() -> bool) -> boo
             return false;
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Whether a service's process is alive, whatever its status says.
+fn process_alive(svc: &ServiceRuntime) -> bool {
+    svc.runner.as_ref().is_some_and(|r| r.is_alive())
+}
+
+/// A service's state in words, for a refusal: "running", "installing", or alive though it errored.
+fn status_words(svc: &ServiceRuntime) -> &'static str {
+    match svc.status {
+        ServiceStatus::Running => "running",
+        ServiceStatus::Installing => "installing",
+        ServiceStatus::Starting => "starting",
+        _ if process_alive(svc) => "still running (it reported an error but its process is alive)",
+        ServiceStatus::Errored => "errored",
+        ServiceStatus::Stopped => "stopped",
     }
 }
 
@@ -2934,6 +2999,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reg.boot_start_ids(), vec![id]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While an uninstall removes its files (outside the lock), the service is not started, installed or deleted;
+    /// once it is done, it may be again.
+    #[test]
+    fn a_service_being_uninstalled_is_held_until_it_is_done() {
+        let (dir, mut reg) = scratch_registry("uninstalling");
+        let id = reg.services.values().find(|s| s.template.uninstall.is_some()).map(|s| s.template.id.clone()).expect("a built-in service with an uninstall");
+        let paths = reg.begin_uninstall(&id).expect("a stopped service uninstalls");
+        assert!(paths.iter().all(|p| !p.contains("..")));
+        assert!(reg.begin_uninstall(&id).is_err(), "one uninstall at a time");
+        assert!(reg.start(&id).unwrap_err().contains("being uninstalled"));
+        assert!(reg.install_streaming(&id).unwrap_err().contains("being uninstalled"));
+        assert!(reg.delete_template(&id).unwrap_err().contains("being uninstalled"));
+        let removed = remove_uninstall_paths(&paths);
+        reg.finish_uninstall(&id, removed);
+        assert_eq!(reg.services[&id].status, ServiceStatus::Stopped);
+        assert!(reg.begin_uninstall(&id).is_ok(), "released");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

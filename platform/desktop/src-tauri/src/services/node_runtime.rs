@@ -342,6 +342,10 @@ fn install_node_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
     logs.push("stdout", format!("downloading {url}"));
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
+        // (a host that does not answer is given up on in half a minute, and the whole download in half an hour: the
+        // blocking client's own default, 30 s for all of it, would cut a slow download, and none waits for ever)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(30 * 60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let mut resp = client.get(&url).send().map_err(|e| format!("download request: {e}"))?;
@@ -418,17 +422,51 @@ fn extract_tar_gz_stripped(archive: &Path, dest: &Path) -> Result<(), String> {
             return Err(format!("archive entry {:?} escapes the package", path.display()));
         }
         let Some(rel) = strip_first(&path) else { continue };
-        let out = dest.join(rel);
-        if entry.header().entry_type().is_dir() {
+        let out = dest.join(&rel);
+        // A link (Node's own `bin/npm` is one) points within the package: one to an absolute path, or climbing out of
+        // it, would let a later entry be written through it, outside the folder.
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            let target = entry.link_name().map_err(|e| format!("link target: {e}"))?.map(|t| t.into_owned()).unwrap_or_default();
+            let from = if kind.is_hard_link() { strip_first(&target).unwrap_or_default() } else { rel.parent().unwrap_or(Path::new("")).join(&target) };
+            if target.is_absolute() || !stays_inside(&from) {
+                return Err(format!("archive entry {:?} links outside the package", path.display()));
+            }
+        }
+        if kind.is_dir() {
             std::fs::create_dir_all(&out).map_err(|e| format!("mkdir: {e}"))?;
             continue;
         }
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+            // (written where its folder really is: under the package, not through a link out of it)
+            let (real_parent, real_dest) = (std::fs::canonicalize(parent).map_err(|e| format!("{}: {e}", parent.display()))?, std::fs::canonicalize(dest).map_err(|e| format!("{}: {e}", dest.display()))?);
+            if !real_parent.starts_with(&real_dest) {
+                return Err(format!("archive entry {:?} would be written outside the package", path.display()));
+            }
         }
         entry.unpack(&out).map_err(|e| format!("unpack {}: {e}", out.display()))?;
     }
     Ok(())
+}
+
+/// Whether a relative path, its `..` taken as it goes, stays within where it starts.
+fn stays_inside(path: &Path) -> bool {
+    let mut depth = 0i32;
+    for c in path.components() {
+        match c {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn extract_zip_stripped(archive: &Path, dest: &Path) -> Result<(), String> {
@@ -466,6 +504,50 @@ mod tests {
         let minimum = requirement.strip_prefix(">=").expect("review the Node installer when the dependency's engine range changes");
         let version = |v: &str| v.split('.').map(|part| part.parse::<u32>().unwrap()).collect::<Vec<_>>();
         assert!(version(NODE_VERSION) >= version(minimum), "managed Node {NODE_VERSION} does not satisfy undici's {requirement}");
+    }
+
+    /// A link within the package (Node's `bin/npm`) is unpacked; one out of it, and a file written through it, is
+    /// refused before anything lands outside.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_package_is_refused() {
+        let root = std::env::temp_dir().join(format!("oaiy-node-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = |name: &str, links: &[(&str, &str)], files: &[&str]| {
+            let path = root.join(name);
+            let gz = flate2::write::GzEncoder::new(std::fs::File::create(&path).unwrap(), flate2::Compression::fast());
+            let mut b = tar::Builder::new(gz);
+            for (at, to) in links {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Symlink);
+                h.set_size(0);
+                h.set_mode(0o777);
+                b.append_link(&mut h, at, to).unwrap();
+            }
+            for f in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(2);
+                h.set_mode(0o644);
+                b.append_data(&mut h, f, &b"hi"[..]).unwrap();
+            }
+            b.into_inner().unwrap().finish().unwrap();
+            path
+        };
+        let good = archive("good.tar.gz", &[("node-v1/bin/npm", "../lib/npm-cli.js")], &["node-v1/lib/npm-cli.js"]);
+        let dest = root.join("good");
+        std::fs::create_dir_all(&dest).unwrap();
+        extract_tar_gz_stripped(&good, &dest).unwrap();
+        assert!(std::fs::symlink_metadata(dest.join("bin/npm")).unwrap().file_type().is_symlink());
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let bad = archive("bad.tar.gz", &[("node-v1/escape", outside.to_str().unwrap()), ("node-v1/up", "../../outside")], &[]);
+        let dest = root.join("bad");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = extract_tar_gz_stripped(&bad, &dest).unwrap_err();
+        assert!(err.contains("links outside the package"), "{err}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing landed outside");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

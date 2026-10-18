@@ -243,6 +243,11 @@ const CUT_WAIT: Duration = Duration::from_millis(500);
 
 /// A new item waits while the caller speaks (and their words are heard), this long at most.
 const HOLD_MAX: Duration = Duration::from_millis(3_000);
+/// How long a call's stream may carry nothing at all (a live line sends its silence too) before it is taken for one the
+/// phone left without closing.
+const STREAM_QUIET: Duration = Duration::from_secs(90);
+/// How long one frame may take to go to the phone before the stream is taken for one it no longer reads.
+const SEND_WAIT: Duration = Duration::from_secs(30);
 
 /// How the caller stands, for the speaker: speaking, or their last words not
 /// yet in (they may drop what waits to be said). Each utterance that ends is
@@ -713,11 +718,13 @@ where
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
     let writer = tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
-            if sink.send(m).await.is_err() {
+            // (a phone that no longer reads its stream, without closing it, is given up on rather than waited on for
+            // ever: the call is over on this side then)
+            if !matches!(tokio::time::timeout(SEND_WAIT, sink.send(m)).await, Ok(Ok(()))) {
                 break;
             }
         }
-        let _ = sink.close().await;
+        let _ = tokio::time::timeout(SEND_WAIT, sink.close()).await;
     });
     let mut ready = json!({"destinationOrigin": DESTINATION});
     if allow_transfer {
@@ -1035,6 +1042,9 @@ where
     };
     // Frames taken from the stream to see whether a stop is already there (see `stop_already_here`), and not yet read.
     let mut backlog: VecDeque<Frame<E>> = VecDeque::new();
+    // When the stream last carried anything (audio, silence among it, or a message): one quiet for longer than a call
+    // ever is, once it has begun, has been left by the phone without being closed.
+    let mut heard_at = Instant::now();
     let reason: String = loop {
         // A request to reach the owner that the phone has not answered: the caller's silence is counted from when it was sent, and not from an
         // answer that may take long or never come.
@@ -1044,6 +1054,7 @@ where
         tokio::select! {
             message = next_frame(&mut backlog, &mut stream) => {
                 let Some(Ok(message)) = message else { break "the stream closed".into() };
+                heard_at = Instant::now();
                 match message {
                     Message::Text(text) => {
                         let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
@@ -1518,6 +1529,10 @@ where
             }
             // The greeting's settle, or its latest: look again (an hour on while nothing waits; it is not polled then).
             _ = tokio::time::sleep_until(opening.map_or_else(|| Instant::now() + Duration::from_secs(3600), |o| o.next_look(Instant::now())).into()), if opening.is_some() => {}
+            // A call whose stream has carried nothing at all, not even the silence a live line sends, for longer than any
+            // pause on a call: the phone left it without closing it. It ends here, rather than being counted as live for
+            // ever (which holds updates and the plugins' voice back).
+            _ = tokio::time::sleep_until((heard_at + STREAM_QUIET).into()), if begun => break "the stream went quiet".into(),
             // A request to reach the owner: its clocks. They do not wait for the phone, the app or the model.
             _ = tokio::time::sleep_until(watch.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if watch.is_some() => {
                 // A transfer request the phone never answered: it is answered as unavailable, and what waited behind it goes.
@@ -1608,6 +1623,10 @@ where
             }
         }
     };
+    // What is queued to be said is let go now (the speaker drops the lines of an older epoch), not once the transcriber
+    // has finished, which can take as long as its last transcription: after the call ends, or is handed to the owner,
+    // nothing more is said on it.
+    epoch.fetch_add(1, Ordering::SeqCst);
 
     // Whether this session still carried the call as it ended: one that another session has taken the call from (the phone opened a second stream for
     // a call that was still live) ends alone. It does not end the call, hand it to the owner, tell the app it ended or end what rings for it: the call

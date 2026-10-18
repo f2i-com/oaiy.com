@@ -65,7 +65,7 @@ use super::ledger::{ClaimOutcome, LedgerHandle, RunError, RunErrorCode, RunRecor
 /// immediate without busy-spinning.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Default wall-clock budget when the run specifies none.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often a running child is checked for exit / cancellation.
 const CHILD_POLL: Duration = Duration::from_millis(250);
 /// Cap on captured child output kept for error reporting.
@@ -929,8 +929,10 @@ pub(crate) fn execute_run(
     // Inputs travel by file, not argv: values can be large, can contain
     // quoting hazards, and argv is visible to every process lister on the
     // machine — inputs may hold user data.
-    let scratch = std::env::temp_dir().join(format!("oaiy-run-{}", run.run_id));
-    if let Err(e) = std::fs::create_dir_all(&scratch) {
+    // (a name no one can know beforehand, and made new: a folder already there, which another user of this computer
+    // could have made to read or change a run's inputs, is refused rather than used)
+    let scratch = std::env::temp_dir().join(format!("oaiy-run-{}-{}", run.run_id, uuid::Uuid::new_v4().simple()));
+    if let Err(e) = make_private_dir(&scratch) {
         return fail(RunErrorCode::Internal, &format!("cannot create scratch dir: {e}"));
     }
     let inputs_path = scratch.join("inputs.json");
@@ -1225,6 +1227,13 @@ pub fn run_flow_cli_with(
     let mut cmd = cli_command(cli, node_exe);
     cmd.args(cli_args(&req));
     harden_child(&mut cmd);
+    // A group of its own, so a run that times out or is cancelled ends with everything it started (an ffmpeg, a
+    // helper), not just the CLI, leaving them running.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     // Tell the child where THIS desktop's API is.
     //
     // A connector node that chats, calls a plugin connector or touches a
@@ -1278,13 +1287,11 @@ pub fn run_flow_cli_with(
             Err(_) => break None,
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            end_tree(&mut child);
             break None;
         }
         if cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            end_tree(&mut child);
             return CliOutcome::Cancelled;
         }
         thread::sleep(CHILD_POLL);
@@ -1343,6 +1350,24 @@ pub fn run_flow_cli_with(
         exit_code: st.code().unwrap_or(-1),
         detail: tail_of(&capture, 1500),
     }
+}
+
+/// End a flow's process and every process it started (its group; on Windows its tree), and reap it.
+fn end_tree(child: &mut std::process::Child) {
+    crate::services::registry::kill_process_tree(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A folder only this user can open, made new (an existing one is an error).
+fn make_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
 }
 
 /// Read the CLI's result payload as what it says it is. Pure, so every arm is

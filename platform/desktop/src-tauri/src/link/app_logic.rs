@@ -274,12 +274,25 @@ pub struct Catalog {
 
 #[derive(Default)]
 struct CatalogState {
+    /// The account the scripts below are of ([`account_key`]): another account's are never run, nor fallen back on.
+    account: Option<String>,
     fetched: Option<(Instant, Vec<AppEntry>)>,
     /// When a failed fetch may be tried again. Without it a provider that is
     /// down costs every single event a full HTTP timeout ON THE EVENT THREAD,
     /// which backs the queue up until events are shed — and a shed event is one
     /// whose records are never written at all.
     retry_at: Option<Instant>,
+}
+
+/// Which account a link is, for what is kept of it: its connector, address and account id (else a digest of its
+/// credential, never the credential itself).
+pub(crate) fn account_key(account: &LinkedAccount) -> String {
+    use sha2::{Digest, Sha256};
+    let who = match &account.account_id {
+        Some(id) if !id.is_empty() => id.clone(),
+        _ => Sha256::digest(account.credential.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect(),
+    };
+    format!("{}|{}|{who}", account.connector_id, account.base_url)
 }
 
 impl Default for Catalog {
@@ -300,8 +313,13 @@ impl Catalog {
         account: &LinkedAccount,
         spec: &AppLogicSpec,
     ) -> Result<Vec<AppEntry>, String> {
+        let key = account_key(account);
         {
-            let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // (linked to another account since: what was kept was the other one's)
+            if state.account.as_deref() != Some(key.as_str()) {
+                *state = CatalogState { account: Some(key.clone()), ..CatalogState::default() };
+            }
             if let Some((at, apps)) = state.fetched.as_ref() {
                 if at.elapsed() < CATALOG_TTL {
                     return Ok(apps.clone());
@@ -328,12 +346,15 @@ impl Catalog {
         match fetch(account, spec) {
             Ok(apps) => {
                 let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                state.fetched = Some((Instant::now(), apps.clone()));
-                state.retry_at = None;
+                // (the account changed while this was fetched: kept for the account it was fetched for)
+                *state = CatalogState { account: Some(key), fetched: Some((Instant::now(), apps.clone())), retry_at: None };
                 Ok(apps)
             }
             Err(e) => {
                 let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if state.account.as_deref() != Some(key.as_str()) {
+                    *state = CatalogState { account: Some(key), ..CatalogState::default() };
+                }
                 state.retry_at = Some(Instant::now() + FETCH_RETRY_AFTER);
                 match state.fetched.as_ref() {
                     // Never silently: running yesterday's scripts because the

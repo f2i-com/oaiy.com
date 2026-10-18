@@ -943,6 +943,7 @@
       "roster.json": "companion",
       "routes.json": "relay-link",
       "script-profile.json": "link-state",
+      "sealed-pending": "link-state",
       "scripts": "rebuilt",
       "services-autostart.json": "autostart",
       "services-running.json": "rebuilt",

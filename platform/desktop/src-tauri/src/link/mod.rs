@@ -1113,6 +1113,8 @@ impl LinkStore {
         // keeping this one would run one account's helpers inside another's
         // scripts, which is worse than having none.
         script_profile::ProfileCache::global().invalidate(&self.data_dir);
+        // And the run outcomes kept for it: another account must not be sent them, and nothing else clears them.
+        flow_runner::forget_pending();
         self.status()
     }
 
@@ -1285,6 +1287,8 @@ pub fn start_link(
             })
         })();
 
+        // (Cancel pressed while the code was exchanged: the person asked not to link, so nothing is kept)
+        let outcome = outcome.and_then(|account| if cancel.load(std::sync::atomic::Ordering::SeqCst) { Err("cancelled".to_string()) } else { Ok(account) });
         match outcome {
             Ok(account) => match for_thread.persist(&account) {
                 Ok(()) => {

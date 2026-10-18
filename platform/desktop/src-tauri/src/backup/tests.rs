@@ -4760,6 +4760,8 @@ fn make_with_disk(data: &Path, dest: &Path, script: &[u64], agent: Option<&dyn A
     let mut o = CreateOptions::new(data, dest, PASS);
     o.cost = Cost::Fixed(8);
     o.free_space = scripted_free;
+    // (each folder its own drive, as the script reads the space of each in turn)
+    o.same_drive = |_, _| false;
     o.agent = agent;
     o.agent_wait = create::short_wait();
     let made = create(&o);
@@ -4786,6 +4788,27 @@ fn the_drive_holding_the_data_must_have_three_and_a_fifth_times_the_data_and_a_m
     }
     // Exactly enough is enough.
     make_with_disk(&data.0, &out.0.join("b.oaiybackup"), &[create::data_drive_needed(planned)], None).expect("3.2 times and the margin is enough");
+}
+
+/// Where the backup goes on the drive that holds the data, the two needs are counted together: room for each alone is
+/// not enough.
+#[test]
+fn a_backup_made_on_the_data_drive_needs_room_for_both_on_it() {
+    let data = TempDir::new("space-same");
+    realistic(&data.0, "A");
+    let planned: u64 = rules::plan(&data.0, false).items.iter().map(|i| i.size).sum();
+    let out = TempDir::new("space-same-out");
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // room for the data drive's need alone, not for the backup on top of it
+    FREE_SCRIPT.with(|s| *s.borrow_mut() = [create::data_drive_needed(planned) + 1].into_iter().collect());
+    let mut o = CreateOptions::new(&data.0, out.0.join("a.oaiybackup"), PASS);
+    o.cost = Cost::Fixed(8);
+    o.free_space = scripted_free;
+    o.same_drive = |_, _| true;
+    let err = create(&o).unwrap_err();
+    FREE_SCRIPT.with(|s| s.borrow_mut().clear());
+    assert_eq!(err.kind, ErrorKind::NoSpace);
+    assert!(err.message.contains("where the backup goes too"), "{}", err.message);
 }
 
 #[test]

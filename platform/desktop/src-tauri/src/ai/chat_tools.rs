@@ -194,11 +194,15 @@ pub fn parse_prompted(reply: &str, tools: &[Tool]) -> Option<ToolCall> {
     if !tools.iter().any(|t| t.name == name) {
         return None;
     }
+    // Prompt-only replies carry no call id, so one is made: the name and a
+    // number of its own. The browser matches an approval to its proposal by
+    // it, so it is never the same twice: one id per name, "prompted-x", let a
+    // late Approve of a call that had timed out authorise a later call to the
+    // same tool with other input.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(ToolCall {
-        // Prompt-only replies carry no call id, so one is derived from the
-        // name. It only has to be stable within the turn for the browser to
-        // match a result frame to its proposal.
-        id: format!("prompted-{name}"),
+        id: format!("prompted-{name}-{n}"),
         name: name.to_string(),
         input: parsed
             .get("input")
@@ -548,6 +552,10 @@ mod tests {
         .expect("the taught shape must parse");
         assert_eq!(call.name, "create_form");
         assert_eq!(call.input["title"], "Contact");
+        // Each prompted call its own id: an approval for one (late, after it timed out) is never taken for the next
+        let again = parse_prompted("```tool_call\n{\"tool\":\"create_form\",\"input\":{\"title\":\"Other\"}}\n```", &tools()).unwrap();
+        assert_ne!(call.id, again.id);
+        assert!(again.id.starts_with("prompted-create_form-"), "{}", again.id);
 
         // Everything else is the ANSWER, never a guessed call — guessing would
         // run something in the user's account the model never asked for.

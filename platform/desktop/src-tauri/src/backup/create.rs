@@ -55,6 +55,8 @@ pub struct CreateOptions<'a> {
     pub agent_wait: AgentWait,
     pub(crate) cost: Cost,
     pub(crate) free_space: fn(&Path) -> u64,
+    /// Whether two folders are on one drive (their needs are then counted together).
+    pub(crate) same_drive: fn(&Path, &Path) -> bool,
 }
 
 impl<'a> CreateOptions<'a> {
@@ -71,6 +73,7 @@ impl<'a> CreateOptions<'a> {
             agent_wait: AgentWait::default(),
             cost: Cost::Default,
             free_space,
+            same_drive,
         }
     }
 }
@@ -140,6 +143,33 @@ pub(crate) fn sweep_output(data_dir: &Path) -> bool {
     removed
 }
 
+/// What the data drive and the backup's folder each need, counted together where they are one drive (each check alone
+/// passed where the two together did not fit).
+fn need_on(opts: &CreateOptions<'_>, dest_dir: &Path, data_needs: u64, dest_needs: u64) -> Result<()> {
+    if (opts.same_drive)(opts.data_dir, dest_dir) {
+        return need((opts.free_space)(opts.data_dir), data_needs.saturating_add(dest_needs), "on the drive OAIY keeps its data on, where the backup goes too");
+    }
+    need((opts.free_space)(opts.data_dir), data_needs, "on the drive OAIY keeps its data on")?;
+    need((opts.free_space)(dest_dir), dest_needs, "in the folder chosen for the backup")
+}
+
+/// Whether two folders are on one drive (where it cannot be told, they are taken to be apart, as before).
+fn same_drive(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let root = |p: &Path| std::fs::canonicalize(p).ok().and_then(|p| p.components().next().map(|c| c.as_os_str().to_ascii_lowercase()));
+        matches!((root(a), root(b)), (Some(x), Some(y)) if x == y)
+    }
+}
+
 fn need(free: u64, needed: u64, what: &str) -> Result<()> {
     if free < needed {
         return Err(BackupError::new(
@@ -187,8 +217,7 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     state::set_phase(Phase::Collecting, "Copying your files");
     let plan = rules::plan(opts.data_dir, opts.include_keys);
     let planned: u64 = plan.items.iter().map(|i| i.size).sum();
-    need((opts.free_space)(opts.data_dir), data_drive_needed(planned), "on the drive OAIY keeps its data on")?;
-    need((opts.free_space)(&dest_dir), planned + MARGIN, "in the folder chosen for the backup")?;
+    need_on(opts, &dest_dir, data_drive_needed(planned), planned + MARGIN)?;
 
     // The staged plaintext lives in here and is removed when this function ends, however it ends.
     let cleanup = TempFolder::new(&scratch_dir(opts.data_dir))?;
@@ -322,10 +351,18 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     state::set_phase(Phase::Packing, "Packing the backup");
     let zip_path = run_dir.join("backup.zip");
     container::write_zip(&zip_path, &manifest.to_json(), &sources)?;
+    // (the copies the ZIP was made from are not needed past here: let go before encrypting and checking, which need
+    // the room again)
+    let _ = std::fs::remove_dir_all(&tree);
     let staged_len = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
-    need((opts.free_space)(&dest_dir), staged_len + MARGIN, "in the folder chosen for the backup")?;
-    // The copy that is decrypted again to check the file is as big as the ZIP.
-    need((opts.free_space)(opts.data_dir), staged_len.saturating_add(MARGIN), "on the drive OAIY keeps its data on")?;
+    // The copy that is decrypted again to check the file is as big as the ZIP (the backup's folder asked first, as
+    // the file is written there first).
+    if (opts.same_drive)(opts.data_dir, &dest_dir) {
+        need((opts.free_space)(opts.data_dir), (staged_len + MARGIN).saturating_add(staged_len.saturating_add(MARGIN)), "on the drive OAIY keeps its data on, where the backup goes too")?;
+    } else {
+        need((opts.free_space)(&dest_dir), staged_len + MARGIN, "in the folder chosen for the backup")?;
+        need((opts.free_space)(opts.data_dir), staged_len.saturating_add(MARGIN), "on the drive OAIY keeps its data on")?;
+    }
 
     state::set_phase(Phase::Encrypting, "Encrypting the backup with your passphrase");
     let tmp = dest_dir.join(format!(".{}.{}.tmp", dest.file_name().and_then(|n| n.to_str()).unwrap_or("backup"), random_id()));

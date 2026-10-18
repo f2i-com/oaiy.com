@@ -367,11 +367,10 @@ async fn delete_service(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let result = state
-        .registry
-        .lock()
-        .map_err(|_| "registry mutex poisoned".to_string())
-        .and_then(|mut reg| reg.delete_template(&id));
+    let registry = state.registry.clone();
+    let result = tokio::task::spawn_blocking(move || registry.lock().map_err(|_| "registry mutex poisoned".to_string()).and_then(|mut reg| reg.delete_template(&id)))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
     match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err400(&e),
@@ -385,11 +384,17 @@ async fn uninstall_service(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let result = state
-        .registry
-        .lock()
-        .map_err(|_| "registry mutex poisoned".to_string())
-        .and_then(|mut reg| reg.uninstall(&id));
+    // (removing a venv of gigabytes takes a while: on a blocking thread, not one of the runtime's, and without the
+    // registry's lock, which every services poll waits on)
+    let registry = state.registry.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let paths = registry.lock().map_err(|_| "registry mutex poisoned".to_string())?.begin_uninstall(&id)?;
+        let removed = crate::services::registry::remove_uninstall_paths(&paths);
+        registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner).finish_uninstall(&id, removed);
+        Ok(removed)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
     match result {
         Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "removed": n }))).into_response(),
         Err(e) => err400(&e),

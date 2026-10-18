@@ -173,6 +173,25 @@ struct Transport {
 /// Starts an app-server for a `CODEX_HOME`.
 type Connect = Arc<dyn Fn(&Path) -> Result<Transport, CodexError> + Send + Sync>;
 
+/// Read Codex's stderr to its end, its lines kept for the log (cut to a few hundred characters each): kept from filling.
+fn drain_stderr(stderr: std::process::ChildStderr) {
+    let mut reader = BufReader::new(stderr);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim_end();
+                if !text.is_empty() {
+                    log::debug!("codex: {}", text.chars().take(400).collect::<String>());
+                }
+            }
+        }
+    }
+}
+
 /// The real app-server: the `codex` CLI, in `app-server` mode, on stdio.
 fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     // The ChatGPT credential file the child writes lives in here, so where this
@@ -202,6 +221,11 @@ fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     crate::services::job_object::adopt(child.id());
     let stdin: ChildStdin = child.stdin.take().ok_or_else(|| CodexError::Unavailable("no stdin".into()))?;
     let stdout = child.stdout.take().ok_or_else(|| CodexError::Unavailable("no stdout".into()))?;
+    // Its stderr is read as it comes, to the end: a pipe nobody reads fills (64 KB) and the agent blocks writing to it,
+    // answering nothing more while it still looks alive.
+    if let Some(stderr) = child.stderr.take() {
+        let _ = std::thread::Builder::new().name("codex-stderr".into()).spawn(move || drain_stderr(stderr));
+    }
     Ok(Transport { to_server: Box::new(stdin), from_server: Box::new(stdout), child: Some(child) })
 }
 
@@ -223,7 +247,7 @@ struct Routes {
 /// thread's notifications, so a long turn holds up nobody else's.
 struct Session {
     child: Mutex<Option<Child>>,
-    stdin: Mutex<Box<dyn Write + Send>>,
+    stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     next_id: AtomicI64,
     routes: Arc<Mutex<Routes>>,
 }
@@ -233,11 +257,18 @@ impl Session {
         let Transport { to_server, from_server, child } = transport;
         let routes: Arc<Mutex<Routes>> = Arc::default();
         let reading = routes.clone();
+        let stdin: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(to_server));
+        let answering = stdin.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(from_server).lines() {
                 let Ok(line) = line else { break };
                 let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else { continue };
-                deliver(&reading, msg);
+                // (a request of the app-server's is answered at once, refused: it waits for an answer otherwise)
+                if let Some(reply) = deliver(&reading, msg) {
+                    let mut w = lock(&answering);
+                    let _ = writeln!(w, "{reply}");
+                    let _ = w.flush();
+                }
             }
             // The app-server is gone. Dropping every waiter's sender wakes it
             // now, with an error, rather than when its timeout runs out.
@@ -246,7 +277,7 @@ impl Session {
             routes.replies.clear();
             routes.threads.clear();
         });
-        Session { child: Mutex::new(child), stdin: Mutex::new(to_server), next_id: AtomicI64::new(0), routes }
+        Session { child: Mutex::new(child), stdin, next_id: AtomicI64::new(0), routes }
     }
 
     fn write(&self, msg: Value) -> Result<(), CodexError> {
@@ -314,8 +345,9 @@ impl Session {
         // arrive unheard.
         let listener = self.listen(&thread_id)?;
         let mut turn = request.turn.clone();
-        turn["threadId"] = Value::String(thread_id);
-        self.call("turn/start", turn, TURN_TIMEOUT)?;
+        turn["threadId"] = Value::String(thread_id.clone());
+        let started = self.call("turn/start", turn, TURN_TIMEOUT)?;
+        let turn_id = started.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
 
         // Collect the agent's message from this thread's notifications, each
         // taken off the channel exactly once (see `fold_turn_notes`).
@@ -324,11 +356,19 @@ impl Session {
         loop {
             let note = match listener.notes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(note) => note,
-                // Out of time: whatever arrived is the answer, as it always was.
-                Err(RecvTimeoutError::Timeout) => break,
+                // Out of time: the turn is stopped there (else it runs on, and the next turn overlaps it), and what came
+                // of it is not an answer: a reply cut off mid-sentence read as a whole one.
+                Err(RecvTimeoutError::Timeout) => {
+                    self.interrupt(&thread_id, turn_id.as_deref());
+                    return Err(CodexError::Rpc(format!("ChatGPT did not finish its answer within {} s", TURN_TIMEOUT.as_secs())));
+                }
                 // The app-server died mid-turn: this is not an answer.
                 Err(RecvTimeoutError::Disconnected) => return Err(exited()),
             };
+            // (a turn that failed says why: it is not "no output")
+            if let Some(why) = turn_failure(&note) {
+                return Err(CodexError::Rpc(why));
+            }
             let before = out.len();
             let done = fold_turn_notes(&mut out, std::slice::from_ref(&note));
             // Whatever this note appended, verbatim — so a streaming caller
@@ -345,6 +385,16 @@ impl Session {
             return Err(CodexError::Rpc("codex returned no output for this turn".into()));
         }
         Ok(out)
+    }
+
+    /// Ask the app-server to stop a turn, not waiting for its answer (dropped when it comes: nobody waits on it).
+    fn interrupt(&self, thread_id: &str, turn_id: Option<&str>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut params = json!({ "threadId": thread_id });
+        if let Some(t) = turn_id {
+            params["turnId"] = Value::String(t.to_string());
+        }
+        let _ = self.write(json!({ "jsonrpc": "2.0", "id": id, "method": "turn/interrupt", "params": params }));
     }
 
     /// The app-server is still there to answer.
@@ -377,23 +427,26 @@ impl Drop for ThreadListener<'_> {
     }
 }
 
-/// Hands one message from the app-server to whoever is waiting for it.
+/// Hands one message from the app-server to whoever is waiting for it; a request of the app-server's is answered
+/// (the answer returned, to be written back).
 ///
 /// Never blocks: every channel is unbounded, so a turn slow to read its own
 /// notifications cannot hold up another's.
-fn deliver(routes: &Mutex<Routes>, msg: Value) {
+fn deliver(routes: &Mutex<Routes>, msg: Value) -> Option<Value> {
+    // A server→client REQUEST (an approval, a tool call). We expose no tools, so refusing is the correct answer, and
+    // it is said: unanswered, the child waits on it and the turn stalls.
+    if msg.get("method").is_some() && msg.get("id").is_some_and(|id| !id.is_null()) {
+        return Some(json!({ "jsonrpc": "2.0", "id": msg["id"], "error": { "code": -32601, "message": "OAIY answers no requests of the app-server's" } }));
+    }
     let mut routes = lock(routes);
     match msg.get("id").and_then(Value::as_i64) {
         // A reply to something we asked. One whose caller gave up has no
         // waiter any more, and is dropped.
-        Some(id) if msg.get("method").is_none() => {
+        Some(id) => {
             if let Some(waiter) = routes.replies.remove(&id) {
                 let _ = waiter.send(msg);
             }
         }
-        // A server→client REQUEST. We expose no tools, so refusing is
-        // the correct answer (and prevents the child from stalling).
-        Some(_) => {}
         // A notification, to the turn on its thread. One for no thread
         // (account news, rate limits) or for a thread nobody is reading any
         // more is dropped.
@@ -404,6 +457,7 @@ fn deliver(routes: &Mutex<Routes>, msg: Value) {
             }
         }
     }
+    None
 }
 
 fn exited() -> CodexError {
@@ -1098,6 +1152,19 @@ fn fold_turn_notes(out: &mut String, notes: &[Value]) -> bool {
     done
 }
 
+/// Why a turn failed, where a note says it did (`turn/completed` with a failed turn, or an `error` notification).
+fn turn_failure(note: &Value) -> Option<String> {
+    let p = note.get("params").unwrap_or(&Value::Null);
+    let message = |v: &Value| v.pointer("/error/message").or_else(|| v.get("message")).and_then(Value::as_str).map(str::to_owned);
+    match note.get("method").and_then(Value::as_str)? {
+        "turn/completed" if p.pointer("/turn/status").and_then(Value::as_str) == Some("failed") => {
+            Some(p.get("turn").and_then(message).map_or_else(|| "ChatGPT could not answer this turn".to_string(), |m| format!("ChatGPT could not answer: {m}")))
+        }
+        "error" if p.get("willRetry").and_then(Value::as_bool) != Some(true) => Some(message(p).map_or_else(|| "ChatGPT could not answer this turn".to_string(), |m| format!("ChatGPT could not answer: {m}"))),
+        _ => None,
+    }
+}
+
 /// The thread id out of a `thread/start` result.
 ///
 /// It arrives NESTED, as `{"thread": {"id": …}}`. Reading a flat `threadId`
@@ -1233,6 +1300,35 @@ fn arguments_of(call: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request of the app-server's (an approval, a tool call) is answered, refused, with its own id: unanswered,
+    /// the turn waited on it to the deadline. A notification or a reply is handed on, and nothing is written back.
+    #[test]
+    fn a_request_of_the_app_servers_is_answered_and_a_notification_is_not() {
+        let routes = Mutex::new(Routes { replies: HashMap::new(), threads: HashMap::new(), closed: false });
+        let answer = deliver(&routes, json!({ "jsonrpc": "2.0", "id": 7, "method": "item/commandExecution/requestApproval", "params": {} })).expect("answered");
+        assert_eq!(answer["id"], 7);
+        assert_eq!(answer["error"]["code"], -32601);
+        let (tx, rx) = std::sync::mpsc::channel();
+        lock(&routes).threads.insert("t1".into(), tx);
+        assert!(deliver(&routes, json!({ "method": "item/agentMessage/delta", "params": { "threadId": "t1", "delta": "hi" } })).is_none());
+        assert_eq!(rx.try_recv().unwrap()["params"]["delta"], "hi");
+        let (tx, rx) = std::sync::mpsc::channel();
+        lock(&routes).replies.insert(3, tx);
+        assert!(deliver(&routes, json!({ "id": 3, "result": {} })).is_none());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// A turn that failed is said to have, at once, not waited out to the deadline as if it were still answering.
+    #[test]
+    fn a_failed_turn_is_known_by_its_notes() {
+        let failed = json!({ "method": "turn/completed", "params": { "turn": { "status": "failed", "error": { "message": "usage limit reached" } } } });
+        assert_eq!(turn_failure(&failed).as_deref(), Some("ChatGPT could not answer: usage limit reached"));
+        assert!(turn_failure(&json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } })).is_none());
+        assert!(turn_failure(&json!({ "method": "error", "params": { "error": { "message": "reconnecting" }, "willRetry": true } })).is_none(), "one it will try again is not the end");
+        assert_eq!(turn_failure(&json!({ "method": "error", "params": { "error": { "message": "stream lost" } } })).as_deref(), Some("ChatGPT could not answer: stream lost"));
+        assert!(turn_failure(&json!({ "method": "item/agentMessage/delta", "params": {} })).is_none());
+    }
 
     #[test]
     fn the_child_is_given_the_allow_lists_variables_by_their_names_as_the_system_reads_them() {

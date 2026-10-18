@@ -1166,6 +1166,17 @@ struct PendingCompletion {
     kept_at: String,
 }
 
+/// Forget the outcomes kept for the provider (the account is unlinked: they are its, and no other account takes them).
+pub(crate) fn forget_pending() {
+    if let Some(dir) = PENDING_DIR.get() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 fn pending_file(dir: &Path, run_id: &str) -> PathBuf {
     let safe: String = run_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     dir.join(format!("{safe}.json"))
@@ -1186,6 +1197,7 @@ fn keep_pending(dir: &Path, account: &LinkedAccount, run_id: &str, url: &str, bo
 /// provider says it is final already (409) or no longer there to finish (404,
 /// 410). While the provider cannot be reached the rest wait for the next try.
 fn resend_pending(dir: &Path, account: &LinkedAccount) {
+    const PENDING_KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 3600);
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let Ok(http) = HTTP.get() else { return };
     for entry in entries.flatten() {
@@ -1199,12 +1211,26 @@ fn resend_pending(dir: &Path, account: &LinkedAccount) {
         if kept.base_url != account.base_url {
             continue;
         }
+        // (kept a week and still not taken: the run is long over on the provider's side, and it is let go)
+        if entry.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > PENDING_KEPT_FOR) {
+            log::warn!("flow run {}: its outcome could not be reported in a week; let go", kept.run_id);
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
         match http.patch(&kept.url).timeout(RESEND_TIMEOUT).bearer_auth(&account.credential).json(&kept.body).send() {
             Ok(resp) if resp.status().is_success() || matches!(resp.status().as_u16(), 404 | 409 | 410) => {
                 let status = resp.status().as_u16();
                 super::net::drain(resp);
                 log::info!("flow run {}: its kept outcome was reported (HTTP {status})", kept.run_id);
                 let _ = std::fs::remove_file(&path);
+            }
+            // Refused for what it is (malformed, too large, not accepted), not for the moment: it will never be taken,
+            // and kept in the queue it held back every outcome after it. Set aside, said once.
+            Ok(resp) if matches!(resp.status().as_u16(), 400 | 413 | 422) => {
+                let status = resp.status().as_u16();
+                super::net::drain(resp);
+                log::warn!("flow run {}: the provider refuses its outcome for good (HTTP {status}); set aside as .refused", kept.run_id);
+                let _ = std::fs::rename(&path, path.with_extension("refused"));
             }
             Ok(resp) => {
                 let status = resp.status().as_u16();

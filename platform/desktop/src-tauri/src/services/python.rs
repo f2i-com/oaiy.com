@@ -20,7 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -457,6 +457,10 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
     logs.push("stdout", format!("downloading {url}"));
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
+        // (a host that does not answer is given up on in half a minute, and the whole download in half an hour: the
+        // blocking client's own default, 30 s for all of it, would cut a slow download, and none waits for ever)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(30 * 60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let mut resp = client
@@ -750,17 +754,13 @@ fn run_logged(program: &Path, args: &[String], logs: &LogBuffer) -> i32 {
     if let Some(out) = child.stdout.take() {
         let l = logs.clone();
         handles.push(std::thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                l.push("stdout", line);
-            }
+            super::runner::each_line(out, |line| l.push("stdout", line));
         }));
     }
     if let Some(err) = child.stderr.take() {
         let l = logs.clone();
         handles.push(std::thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                l.push("stderr", line);
-            }
+            super::runner::each_line(err, |line| l.push("stderr", line));
         }));
     }
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);

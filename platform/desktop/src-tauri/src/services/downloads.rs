@@ -220,6 +220,22 @@ fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// A download's host resolved and checked, for the client to be held to (`None` for an address, which needs none).
+async fn pin_download_host(url: &str) -> Result<Option<(String, Vec<std::net::SocketAddr>)>, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "invalid download URL".to_string())?;
+    let Some(url::Host::Domain(host)) = parsed.host() else { return Ok(None) };
+    let host = host.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| format!("cannot resolve download host '{host}': {e}"))?.collect();
+    if addrs.is_empty() {
+        return Err(format!("download host '{host}' did not resolve"));
+    }
+    if let Some(bad) = addrs.iter().find(|a| is_disallowed_ip(a.ip())) {
+        return Err(format!("download host '{host}' resolves to a disallowed address ({})", bad.ip()));
+    }
+    Ok(Some((host, addrs)))
+}
+
 /// SSRF guard for a model-download URL: require https + reject a host that IS (or resolves to)
 /// an internal/special address. Runs synchronously in start() BEFORE any task is spawned, so a
 /// hostile URL fails fast (Err -> 400) and never becomes an internal-port-scan oracle (the
@@ -229,14 +245,14 @@ fn validate_download_url(url: &str) -> Result<(), String> {
     if parsed.scheme() != "https" {
         return Err("download URL must use https".into());
     }
-    let host = parsed.host_str().ok_or("download URL has no host")?;
-    // Bare IP literal — check directly (no DNS).
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_disallowed_ip(ip) {
-            return Err(format!("download URL points at a disallowed address ({ip})"));
-        }
-        return Ok(());
-    }
+    // Bare IP literal (an IPv6 one in brackets too) — check directly (no DNS).
+    let host = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => return if is_disallowed_ip(std::net::IpAddr::V4(ip)) { Err(format!("download URL points at a disallowed address ({ip})")) } else { Ok(()) },
+        Some(url::Host::Ipv6(ip)) => return if is_disallowed_ip(std::net::IpAddr::V6(ip)) { Err(format!("download URL points at a disallowed address ({ip})")) } else { Ok(()) },
+        Some(url::Host::Domain(d)) => d.to_string(),
+        None => return Err("download URL has no host".into()),
+    };
+    let host = host.as_str();
     // Hostname — resolve + reject if ANY resolved address is internal (covers a DNS name that
     // points at an internal IP). Brief blocking lookup; start() is user-initiated, not hot.
     use std::net::ToSocketAddrs;
@@ -931,8 +947,30 @@ async fn run_download(
 
     update(Box::new(|p| p.status = DownloadStatus::Active));
 
-    let client = match reqwest::Client::builder()
+    // The name resolved again now, every address checked, and the client held to those: the check in start() and the
+    // connection here each asked the resolver, and a name that answered a public address then and an internal one now
+    // (a DNS rebinding) would have reached it.
+    let pinned = match pin_download_host(&url).await {
+        Ok(p) => p,
+        Err(e) => {
+            update(Box::new(move |p| {
+                p.status = DownloadStatus::Failed;
+                p.error = Some(e);
+                p.finished_at = Some(Utc::now());
+            }));
+            return;
+        }
+    };
+    let mut builder = reqwest::Client::builder();
+    if let Some((host, addrs)) = &pinned {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    let client = match builder
         .user_agent(format!("oaiy-desktop/{}", env!("CARGO_PKG_VERSION")))
+        // (a host that does not answer, or a connection that stops sending, given up on rather than held as Active at
+        // 0 B/s for ever: a resume carries on from what arrived)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
         // Re-validate every redirect hop: a public host (incl. the HF resolve URL) may 302 to a
         // CDN, but it must stay https and must not point at an internal literal IP (defense over
         // the start() guard, which only sees the original URL). DNS-name hops are followed and

@@ -72,12 +72,15 @@ pub struct Readings {
     pub installing: Vec<String>,
     /// The data folder being moved.
     pub migrating: bool,
+    /// A backup or a restore running (an update waits for it: a restart ends it, and the next start clears away
+    /// what it had made so far).
+    pub backing_up: bool,
 }
 
 impl Default for Readings {
     /// A quiet app with no phone plugin.
     fn default() -> Readings {
-        Readings { hub_calls: 0, phone: LineState::NoPlugin, agent_tasks: 0, downloads: 0, engines: EnginesState::Known { media: 0, downloads: 0 }, installing: Vec::new(), migrating: false }
+        Readings { hub_calls: 0, phone: LineState::NoPlugin, agent_tasks: 0, downloads: 0, engines: EnginesState::Known { media: 0, downloads: 0 }, installing: Vec::new(), migrating: false, backing_up: false }
     }
 }
 
@@ -111,6 +114,10 @@ pub fn compute(readings: Option<&Readings>, uptime: Duration) -> Vec<Blocker> {
         return vec![Blocker::new("starting", "OAIY is still starting up. Try again in a minute.")];
     };
     let mut out = work_blockers(r, "restart");
+    // (not among the work a backup itself waits for: it is the backup)
+    if r.backing_up {
+        out.push(Blocker::new("backup", "A backup or a restore is running."));
+    }
     if uptime < MIN_UPTIME {
         let left = (MIN_UPTIME - uptime).as_secs().max(1);
         out.push(Blocker::new("starting", format!("OAIY started less than {} minutes ago; it can update in {left} seconds.", MIN_UPTIME.as_secs() / 60)));
@@ -220,6 +227,7 @@ impl Activity for Probes {
             engines: self.engines.as_ref().map_or(EnginesState::Known { media: 0, downloads: 0 }, |f| f(fresh)),
             installing,
             migrating: self.migration.as_ref().is_some_and(|f| f()),
+            backing_up: crate::backup::state::in_use(),
         }
     }
 
@@ -331,6 +339,15 @@ mod tests {
 
     fn unknown(why: &str) -> LineState {
         LineState::Unknown { plugin: "Aokie Phone Bridge".into(), why: why.into() }
+    }
+
+    /// A backup or a restore running holds an update (a restart would end it, and the next start clear away what it
+    /// had made); it is not among the work a backup itself waits for.
+    #[test]
+    fn a_backup_running_holds_an_update() {
+        let r = Readings { backing_up: true, ..Default::default() };
+        assert_eq!(compute(Some(&r), LONG).iter().map(|b| b.code).collect::<Vec<_>>(), ["backup"]);
+        assert!(work_blockers(&r, "start a backup or a restore").is_empty());
     }
 
     #[test]
