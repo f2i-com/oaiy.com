@@ -7,5 +7,10 @@
 	     computer) is the one place the window listens. -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>OAIY uses the microphone when you answer or make a phone call at this computer.</string>
+	<!-- No App Nap: OAIY answers calls, runs its engines' gateway and downloads, and lends itself to the computers on
+	     the network while its window is hidden, and macOS naps an app with no window showing (its threads at the
+	     background priority, its disk reads throttled: a model file's SHA-256 read at a tenth of the speed). -->
+	<key>NSAppSleepDisabled</key>
+	<true/>
 </dict>
 </plist>

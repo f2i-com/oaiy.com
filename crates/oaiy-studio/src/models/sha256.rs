@@ -134,6 +134,17 @@ mod tests {
         println!("{:.0} MB/s", data.len() as f64 / 1e6 / started.elapsed().as_secs_f64());
     }
 
+    /// A file read through as the engines do: OAIY_TEST_SHA_FILE=<path> cargo test --release -p oaiy-studio sha256_file_speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn sha256_file_speed() {
+        let Ok(path) = std::env::var("OAIY_TEST_SHA_FILE") else { return };
+        let started = std::time::Instant::now();
+        let sha = file(Path::new(&path), |_| false).unwrap().unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        println!("{sha} {:.0} MB/s", size as f64 / 1e6 / started.elapsed().as_secs_f64());
+    }
+
     #[test]
     fn digests_match_the_standard_vectors_in_pieces_or_whole() {
         assert_eq!(of(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
