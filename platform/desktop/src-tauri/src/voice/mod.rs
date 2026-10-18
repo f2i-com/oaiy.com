@@ -987,13 +987,29 @@ fn the_gateway_is_served_unless_turned_off() {
     assert!(!gateway_wanted_by("0"));
 }
 
-/// Serve the gateway on 127.0.0.1:17872 until the process ends (a port in use is logged, not fatal).
+/// The port the gateway listens on: 17872, or the one `OAIY_VOICE_GATEWAY` names (a second OAIY tried beside the
+/// desktop, with a stand-in phone of its own, serves its gateway there and leaves the desktop's port alone).
+fn gateway_port_by(setting: &str) -> u16 {
+    setting.trim().parse::<u16>().ok().filter(|p| *p != 0).unwrap_or(GATEWAY_PORT)
+}
+
+#[cfg(test)]
+#[test]
+fn the_gateway_port_is_the_desktops_unless_one_is_named() {
+    assert_eq!(gateway_port_by(""), GATEWAY_PORT);
+    assert_eq!(gateway_port_by("on"), GATEWAY_PORT);
+    assert_eq!(gateway_port_by(" 18171 "), 18_171);
+    assert!(gateway_wanted_by("18171"));
+}
+
+/// Serve the gateway on 127.0.0.1:17872 (or `OAIY_VOICE_GATEWAY`'s port) until the process ends (a port in use is
+/// logged, not fatal).
 pub async fn serve_gateway(hub: VoiceHub, chat: Router) {
     if !gateway_wanted() {
         log::info!("OAIY voice gateway off (OAIY_VOICE_GATEWAY=off): calls cannot reach this OAIY");
         return;
     }
-    let addr = SocketAddr::from(([127, 0, 0, 1], GATEWAY_PORT));
+    let addr = SocketAddr::from(([127, 0, 0, 1], gateway_port_by(&std::env::var("OAIY_VOICE_GATEWAY").unwrap_or_default())));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
             log::info!("OAIY voice gateway listening on http://{addr}");

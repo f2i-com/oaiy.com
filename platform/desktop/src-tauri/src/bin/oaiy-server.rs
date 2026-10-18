@@ -43,7 +43,8 @@
 //!                       the AI gateway's engine provider and the control API's
 //!                       engine tools read and relay them          [none]
 //!   OAIY_VOICE_GATEWAY   `off`: do not serve the voice gateway (17872), for a server
-//!                       tried beside the desktop, whose calls use it [on]
+//!                       tried beside the desktop, whose calls use it; a port
+//!                       number: serve it there instead (a stand-in phone's) [on]
 //!   OAIY_PLUGIN_SOURCES  a folder of plugin folders the setup wizard's catalog
 //!                       offers to install from (<dir>/<plugin id>) [none]
 //!   OAIY_ACCESS_MODE     `legacy` (every route that existed before the access model is judged

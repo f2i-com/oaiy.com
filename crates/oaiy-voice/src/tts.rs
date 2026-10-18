@@ -178,6 +178,74 @@ impl Kept {
 /// How often a line waiting for the engine, or being made whole, asks whether its listener is still there.
 pub const WATCH_EVERY: Duration = Duration::from_millis(200);
 
+/// The lines requests wait to say, and the making after a line's first that a prepare has going ([`Speaker::prepare`]).
+/// A request to say a line being prepared waits for its first making, which is heard for its likeness; not for the
+/// ones after it: they are not made whole for it, and one going is stopped, so the request makes the line as it is
+/// said, with the seed that making had (a caller's greeting, due while it was being prepared, waited for every making:
+/// two or three of them, each as long as the line takes to make).
+#[derive(Default)]
+struct Asked {
+    lines: Vec<Line>,
+    /// The lines being prepared, or waiting to be: one asked for again meanwhile is not made twice.
+    preparing: Vec<Line>,
+    /// The making going on after a line's first, and its stop (the prepare's own).
+    retry: Option<(Line, Arc<AtomicBool>)>,
+}
+
+impl Asked {
+    fn wants(&self, line: &Line) -> bool {
+        self.lines.contains(line)
+    }
+}
+
+/// A request's wait to say a line, let go when dropped.
+struct Asking<'a> {
+    asked: &'a Mutex<Asked>,
+    line: Line,
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        let mut asked = self.asked.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(at) = asked.lines.iter().position(|l| l == &self.line) {
+            asked.lines.remove(at);
+        }
+    }
+}
+
+/// A prepare of a line, let go when dropped.
+struct Preparing<'a> {
+    asked: &'a Mutex<Asked>,
+    line: Line,
+}
+
+impl Drop for Preparing<'_> {
+    fn drop(&mut self) {
+        self.asked.lock().unwrap_or_else(|p| p.into_inner()).preparing.retain(|l| l != &self.line);
+    }
+}
+
+/// `line` is to be prepared: None where it is being prepared already (a second prepare queued behind the first, and a
+/// request to say the line behind both, would wait for each).
+fn preparing<'a>(asked: &'a Mutex<Asked>, line: &Line) -> Option<Preparing<'a>> {
+    let mut a = asked.lock().unwrap_or_else(|p| p.into_inner());
+    if a.preparing.contains(line) {
+        return None;
+    }
+    a.preparing.push(line.clone());
+    Some(Preparing { asked, line: line.clone() })
+}
+
+/// A request is to say `line`: a making after its first, going on for a prepare, is stopped.
+fn ask<'a>(asked: &'a Mutex<Asked>, line: &Line) -> Asking<'a> {
+    let mut a = asked.lock().unwrap_or_else(|p| p.into_inner());
+    a.lines.push(line.clone());
+    if let Some((_, stop)) = a.retry.as_ref().filter(|(l, _)| l == line) {
+        stop.store(true, Ordering::Relaxed);
+    }
+    Asking { asked, line: line.clone() }
+}
+
 /// The engine, on its thread.
 pub struct Speaker {
     jobs: mpsc::Sender<Job>,
@@ -185,6 +253,8 @@ pub struct Speaker {
     pub device: String,
     pub voices: Voices,
     remembered: Arc<Mutex<Kept>>,
+    /// Lines being asked for, which a prepare of them makes way for ([`Asked`]).
+    asked: Arc<Mutex<Asked>>,
     /// Whether the engine's thread is still there ([`EngineGone`]).
     alive: Arc<AtomicBool>,
 }
@@ -232,15 +302,17 @@ impl Speaker {
         let gpu = setup.gpu;
         let remembered = Arc::new(Mutex::new(Kept::default()));
         let kept = Arc::clone(&remembered);
+        let asked: Arc<Mutex<Asked>> = Arc::default();
+        let engine_asked = Arc::clone(&asked);
         let alive = Arc::new(AtomicBool::new(true));
         let gone = EngineGone(Arc::clone(&alive));
         std::thread::Builder::new()
             .name("oaiy-voice tts".into())
-            .spawn(move || engine(setup, inbox, ready_tx, kept, gone))
+            .spawn(move || engine(setup, inbox, ready_tx, kept, engine_asked, gone))
             .map_err(|e| format!("the speech thread: {e}"))?;
         let loaded = ready.recv().map_err(|_| "the speech engine stopped while loading".to_string())??;
         eprintln!("[oaiy-voice] {loaded}");
-        Ok(Self { jobs, model, device: format!("webgpu:{gpu}"), voices, remembered, alive })
+        Ok(Self { jobs, model, device: format!("webgpu:{gpu}"), voices, remembered, asked, alive })
     }
 
     /// The line `text` in `voice` is, where it is short enough to keep.
@@ -266,13 +338,18 @@ impl Speaker {
     /// Make `text` in `voice` whole and keep it, said by no one: a caller's greeting, made as the call settles, is
     /// then said from memory when it is due. Each making is heard for how like its voice it sounds, and made again
     /// with the next seed where it is not ([`LIKENESS`], [`PREPARE_TRIES`]); the most like it is kept. A line too long
-    /// to keep, or kept already, is nothing to do.
+    /// to keep, or kept already, is nothing to do; one asked to be said after its first making is said as it is made
+    /// ([`Asked`]), and nothing more is made for it here.
     /// `gone`, asked every [`WATCH_EVERY`] while it waits, true stops it (its asker went).
     pub fn prepare(&self, text: &str, voice: Option<&str>, gone: &dyn Fn() -> bool) -> Result<Option<Spoken>, String> {
         let Some(line) = self.line(text, voice) else { return Ok(None) };
         if self.recall(&line).is_some() {
             return Ok(None);
         }
+        let Some(_preparing) = preparing(&self.asked, &line) else {
+            eprintln!("[oaiy-voice] a line asked to be prepared is being prepared already");
+            return Ok(None);
+        };
         let (chunks, _pcm) = mpsc::channel();
         let (done, result) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -361,7 +438,7 @@ impl crate::server::TextToSpeech for Speaker {
     }
 
     fn prepare(&self, text: &str, voice: Option<&str>, gone: &dyn Fn() -> bool) -> Result<Option<(f64, u64)>, String> {
-        Ok(Speaker::prepare(self, text, voice, gone)?.map(|s| (s.likeness.unwrap_or(0.), s.seed)))
+        Ok(Speaker::prepare(self, text, voice, gone)?.filter(|s| !s.cancelled).map(|s| (s.likeness.unwrap_or(0.), s.seed)))
     }
 
     fn speak(&self, text: &str, voice: Option<&str>, cancel: Arc<AtomicBool>, gone: &dyn Fn() -> bool, on_chunk: &mut dyn FnMut(&[i16]) -> bool) -> Result<(), String> {
@@ -375,6 +452,8 @@ impl crate::server::TextToSpeech for Speaker {
             eprintln!("[oaiy-voice] {:.2} s of speech from memory (said before)", pcm.len() as f64 / 24_000.);
             return Ok(());
         }
+        // (a prepare of this line makes way for it after its first making: see `Asked`)
+        let _asking = line.as_ref().map(|l| ask(&self.asked, l));
         let mut heard: Option<Vec<i16>> = line.is_some().then(Vec::new);
         // (the line's own stop, which the listener's going sets too: the engine may have made all of it before then,
         // and its pieces still waiting are let go unheard, so its "not cancelled" is not that the line was heard whole)
@@ -409,7 +488,7 @@ impl crate::server::TextToSpeech for Speaker {
 }
 
 /// The engine's thread: load, then speak each job in turn. Once loaded, its end ends the process (`gone`).
-fn engine(setup: Setup, inbox: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<String, String>>, kept: Arc<Mutex<Kept>>, gone: EngineGone) {
+fn engine(setup: Setup, inbox: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<String, String>>, kept: Arc<Mutex<Kept>>, asked: Arc<Mutex<Asked>>, gone: EngineGone) {
     let started = Instant::now();
     let loaded = Tts::load(&setup.model_dir, setup.gpu).map_err(|e| format!("{}: {e}", setup.model_dir.display()));
     let mut tts = match loaded {
@@ -455,33 +534,7 @@ fn engine(setup: Setup, inbox: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<S
         let first_seed = job.line.as_ref().and_then(|l| kept.lock().unwrap_or_else(|p| p.into_inner()).seed(l)).unwrap_or(0);
         let result = setup.voices.clip(job.voice.as_deref()).and_then(|clip| voices.voice(&mut tts, &clip)).and_then(|voice| {
             if job.prepare {
-                // Made whole and heard, again with the next seed where it is not like its voice; the most like it kept.
-                let mut best: Option<(f64, u64, Vec<i16>, oaiy_tts::SpeakReport)> = None;
-                for seed in first_seed..first_seed + PREPARE_TRIES {
-                    tts.options.sampling.seed = seed;
-                    let mut pcm: Vec<i16> = Vec::new();
-                    let made = tts.speak(&job.text, &voice, &job.cancel, |piece| pcm.extend_from_slice(piece));
-                    tts.options.sampling.seed = 0;
-                    let report = made.map_err(|e| e.to_string())?;
-                    // (its asker went: what was made of it is cut short, and kept would be said so every time)
-                    if job.cancel.load(Ordering::Relaxed) {
-                        return Err(LEFT.to_string());
-                    }
-                    let like = tts.likeness(&pcm, &voice).map_err(|e| e.to_string())?;
-                    eprintln!("[oaiy-voice] prepared a line with seed {seed}: likeness {like:.3}");
-                    if best.as_ref().is_none_or(|b| like > b.0) {
-                        best = Some((like, seed, pcm, report));
-                    }
-                    if like >= LIKENESS {
-                        break;
-                    }
-                }
-                let (like, seed, pcm, report) = best.ok_or("nothing was made")?;
-                if let Some(line) = job.line.clone() {
-                    remember(&kept, line.clone(), pcm);
-                    kept.lock().unwrap_or_else(|p| p.into_inner()).set_seed(line, seed);
-                }
-                return Ok(Spoken { audio_seconds: report.audio_seconds, first_chunk_seconds: None, total_seconds: report.total_seconds, cancelled: false, likeness: Some(like), seed });
+                return prepare_line(&job, first_seed, &kept, &asked, &mut Engine { tts: &mut tts, voice: &voice });
             }
             let chunks = job.chunks.clone();
             let cancel = Arc::clone(&job.cancel);
@@ -521,6 +574,93 @@ fn still_wanted(job: Job) -> Option<Job> {
 
 /// What a line being prepared answers when its asker went before it was made.
 const LEFT: &str = "its asker went before it was made";
+
+/// What makes a line being prepared: the engine, or a stand-in (tests).
+trait Making {
+    /// The line made whole with `seed`'s sampling (stopped where `cancel` is set): its audio, its length and the time it took, in seconds.
+    fn make(&mut self, text: &str, seed: u64, cancel: &AtomicBool) -> Result<(Vec<i16>, f64, f64), String>;
+    /// How like its voice `pcm` sounds.
+    fn likeness(&mut self, pcm: &[i16]) -> Result<f64, String>;
+}
+
+/// The engine, making lines in one voice.
+struct Engine<'a> {
+    tts: &'a mut Tts,
+    voice: &'a Voice,
+}
+
+impl Making for Engine<'_> {
+    fn make(&mut self, text: &str, seed: u64, cancel: &AtomicBool) -> Result<(Vec<i16>, f64, f64), String> {
+        self.tts.options.sampling.seed = seed;
+        let mut pcm: Vec<i16> = Vec::new();
+        let made = self.tts.speak(text, self.voice, cancel, |piece| pcm.extend_from_slice(piece));
+        self.tts.options.sampling.seed = 0;
+        let report = made.map_err(|e| e.to_string())?;
+        Ok((pcm, report.audio_seconds, report.total_seconds))
+    }
+
+    fn likeness(&mut self, pcm: &[i16]) -> Result<f64, String> {
+        self.tts.likeness(pcm, self.voice).map_err(|e| e.to_string())
+    }
+}
+
+/// A line made whole and heard, again with the next seed where it is not like its voice; the most like it kept
+/// ([`Speaker::prepare`]). A line asked to be said meanwhile waits for the first making only ([`Asked`]): after it, this
+/// makes way (nothing kept, and the seed it would have made next is the request's). Nothing is made of a line kept since
+/// it was asked for. Answers [`Spoken::nothing`] where nothing was kept.
+fn prepare_line(job: &Job, first_seed: u64, kept: &Mutex<Kept>, asked: &Mutex<Asked>, making: &mut dyn Making) -> Result<Spoken, String> {
+    // (a making after the first is over: whether its line was asked for meanwhile)
+    let retry_over = |asked: &Mutex<Asked>| -> bool {
+        let mut a = asked.lock().unwrap_or_else(|p| p.into_inner());
+        a.retry = None;
+        job.line.as_ref().is_some_and(|l| a.wants(l))
+    };
+    if job.line.as_ref().is_some_and(|l| recall(kept, l).is_some()) {
+        return Ok(Spoken::nothing());
+    }
+    let mut best: Option<(f64, u64, Vec<i16>, f64, f64)> = None;
+    for seed in first_seed..first_seed + PREPARE_TRIES {
+        let retry = seed > first_seed;
+        if let (true, Some(line)) = (retry, &job.line) {
+            let mut a = asked.lock().unwrap_or_else(|p| p.into_inner());
+            if a.wants(line) {
+                eprintln!("[oaiy-voice] a line being prepared was asked for: it is said as it is made, with seed {seed}");
+                return Ok(Spoken::nothing());
+            }
+            a.retry = Some((line.clone(), Arc::clone(&job.cancel)));
+        }
+        let made = making.make(&job.text, seed, &job.cancel);
+        let made_way = retry && retry_over(asked);
+        // (its asker went: what was made of it is cut short, and kept would be said so every time; or it was stopped
+        // for a request to say it)
+        if job.cancel.load(Ordering::Relaxed) {
+            if made_way {
+                eprintln!("[oaiy-voice] a line being prepared was asked for: its making stopped, it is said as it is made, with seed {seed}");
+                return Ok(Spoken::nothing());
+            }
+            return Err(LEFT.to_string());
+        }
+        let (pcm, audio_seconds, total_seconds) = made?;
+        let like = making.likeness(&pcm)?;
+        eprintln!("[oaiy-voice] prepared a line with seed {seed} in {total_seconds:.2} s: likeness {like:.3}");
+        if best.as_ref().is_none_or(|b| like > b.0) {
+            best = Some((like, seed, pcm, audio_seconds, total_seconds));
+        }
+        if like >= LIKENESS {
+            break;
+        }
+        // Unlike its voice: made with the next seed from now on, here or by a request to say it.
+        if let Some(line) = &job.line {
+            kept.lock().unwrap_or_else(|p| p.into_inner()).set_seed(line.clone(), seed + 1);
+        }
+    }
+    let (like, seed, pcm, audio_seconds, total_seconds) = best.ok_or("nothing was made")?;
+    if let Some(line) = job.line.clone() {
+        remember(kept, line.clone(), pcm);
+        kept.lock().unwrap_or_else(|p| p.into_inner()).set_seed(line, seed);
+    }
+    Ok(Spoken { audio_seconds, first_chunk_seconds: None, total_seconds, cancelled: false, likeness: Some(like), seed })
+}
 
 impl Spoken {
     /// A line not made (its listener went before its turn).
@@ -601,7 +741,7 @@ mod tests {
     fn a_short_line_said_once_is_kept_and_a_changed_clip_is_a_new_voice() {
         let dir = folder("kept", &[("phone.wav", "RIFF")]);
         let (jobs, _inbox) = mpsc::channel();
-        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Arc::default(), alive: Arc::new(AtomicBool::new(true)) };
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Arc::default(), asked: Arc::default(), alive: Arc::new(AtomicBool::new(true)) };
         let okay = speaker.line(" Okay — ", None).expect("a short line");
         assert!(speaker.recall(&okay).is_none(), "nothing said yet");
         speaker.remember(okay.clone(), vec![1, 2, 3]);
@@ -636,7 +776,7 @@ mod tests {
                 let _ = job.done.send(Ok(Spoken { audio_seconds: 0.0005, first_chunk_seconds: Some(0.0), total_seconds: 0.0, cancelled: false, likeness: Some(0.99), seed: 0 }));
             }
         });
-        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Arc::default(), alive: Arc::new(AtomicBool::new(true)) };
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Arc::default(), asked: Arc::default(), alive: Arc::new(AtomicBool::new(true)) };
         // the caller hangs up after the first piece: it is not kept as the line, to be said cut short next time
         let mut heard = Vec::new();
         speaker.speak("Okay —", None, Arc::new(AtomicBool::new(false)), &|| false, &mut |pcm| {
@@ -681,7 +821,7 @@ mod tests {
                 let _ = job.done.send(Ok(Spoken { audio_seconds: 0.0002, first_chunk_seconds: Some(0.0), total_seconds: 0.0, cancelled: false, likeness: Some(likeness), seed }));
             }
         });
-        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: kept, alive: Arc::new(AtomicBool::new(true)) };
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: kept, asked: Arc::default(), alive: Arc::new(AtomicBool::new(true)) };
         let greeting = "Hello Jeff, thanks for calling.";
         speaker.speak(greeting, None, Arc::new(AtomicBool::new(false)), &|| false, &mut |_| true).unwrap();
         assert!(speaker.recall(&speaker.line(greeting, None).unwrap()).is_none(), "unlike its voice: not kept");
@@ -692,6 +832,99 @@ mod tests {
         speaker.speak(greeting, None, Arc::new(AtomicBool::new(false)), &|| false, &mut |_| true).unwrap();
         assert_eq!(seeds.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A stand-in for the engine making a line being prepared: each making's likeness by its seed, a making with the
+    /// seed `slow` going on until it is stopped, and each making told as it starts.
+    struct StandIn {
+        likes: Vec<f64>,
+        made: Vec<u64>,
+        slow: Option<u64>,
+        started: Option<mpsc::Sender<u64>>,
+    }
+
+    impl Making for StandIn {
+        fn make(&mut self, _text: &str, seed: u64, cancel: &AtomicBool) -> Result<(Vec<i16>, f64, f64), String> {
+            self.made.push(seed);
+            if let Some(started) = &self.started {
+                let _ = started.send(seed);
+            }
+            while self.slow == Some(seed) && !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok((vec![seed as i16 + 1; 4], 0.0002, 0.0))
+        }
+
+        fn likeness(&mut self, pcm: &[i16]) -> Result<f64, String> {
+            Ok(self.likes[pcm[0] as usize - 1])
+        }
+    }
+
+    fn prepare_job(line: &Line) -> Job {
+        let (chunks, _) = mpsc::channel();
+        let (done, _) = mpsc::channel();
+        Job { text: line.text.clone(), voice: None, cancel: Arc::default(), chunks, done, line: Some(line.clone()), prepare: true }
+    }
+
+    /// A greeting being prepared, due before it is: the request to say it waits for its first making (heard for its
+    /// likeness), and not for the makings after it. They used to be made whole first: two or three of them, each as long
+    /// as the line takes to make, before the caller heard a word.
+    #[test]
+    fn a_line_asked_for_while_it_is_prepared_waits_for_its_first_making_only() {
+        let line = Line { clip: PathBuf::from("phone.wav"), stamp: (None, 4), text: "Hello Jeff, thanks for calling.".into() };
+        let unlike_then_like = || StandIn { likes: vec![0.95, 0.99, 0.99], made: Vec::new(), slow: None, started: None };
+        // Asked for by no one: made again until it is like its voice, and kept so, with its seed.
+        let (kept, asked) = (Mutex::new(Kept::default()), Mutex::new(Asked::default()));
+        let mut engine = unlike_then_like();
+        let spoken = prepare_line(&prepare_job(&line), 0, &kept, &asked, &mut engine).unwrap();
+        assert_eq!((engine.made.clone(), spoken.seed, spoken.cancelled), (vec![0, 1], 1, false));
+        assert_eq!(recall(&kept, &line).as_deref(), Some(&vec![2i16; 4]));
+        assert_eq!(kept.lock().unwrap().seed(&line), Some(1));
+        // Kept already: nothing is made.
+        let mut again = unlike_then_like();
+        assert!(prepare_line(&prepare_job(&line), 1, &kept, &asked, &mut again).unwrap().cancelled);
+        assert!(again.made.is_empty());
+
+        // Asked for during its first making: that one is made whole and heard; unlike its voice, nothing more is made
+        // here, and the request makes it with the next seed as it is said.
+        let (kept, asked) = (Mutex::new(Kept::default()), Mutex::new(Asked::default()));
+        let mut engine = unlike_then_like();
+        let asking = ask(&asked, &line);
+        assert!(prepare_line(&prepare_job(&line), 0, &kept, &asked, &mut engine).unwrap().cancelled, "made way");
+        assert_eq!(engine.made, vec![0]);
+        assert!(recall(&kept, &line).is_none(), "unlike its voice: not kept");
+        assert_eq!(kept.lock().unwrap().seed(&line), Some(1), "the request makes it with the next seed");
+        drop(asking);
+        assert!(asked.lock().unwrap().lines.is_empty());
+        // ...and like its voice, it is kept, and the request says it from memory.
+        let (kept, asked) = (Mutex::new(Kept::default()), Mutex::new(Asked::default()));
+        let mut like = StandIn { likes: vec![0.99], made: Vec::new(), slow: None, started: None };
+        let _asking = ask(&asked, &line);
+        assert!(!prepare_line(&prepare_job(&line), 0, &kept, &asked, &mut like).unwrap().cancelled);
+        assert!(recall(&kept, &line).is_some());
+
+        // Asked for while a making after the first goes on: it is stopped, and the request makes the line with its seed.
+        let (kept, asked) = (Mutex::new(Kept::default()), Mutex::new(Asked::default()));
+        let (started, starts) = mpsc::channel();
+        let mut engine = StandIn { likes: vec![0.95, 0.99, 0.99], made: Vec::new(), slow: Some(1), started: Some(started) };
+        let job = prepare_job(&line);
+        std::thread::scope(|s| {
+            let making = s.spawn(|| prepare_line(&job, 0, &kept, &asked, &mut engine));
+            assert_eq!(starts.recv_timeout(Duration::from_secs(5)), Ok(0));
+            assert_eq!(starts.recv_timeout(Duration::from_secs(5)), Ok(1));
+            let _asking = ask(&asked, &line);
+            assert!(making.join().unwrap().unwrap().cancelled, "made way");
+        });
+        assert_eq!(engine.made, vec![0, 1]);
+        assert!(recall(&kept, &line).is_none());
+        assert_eq!(kept.lock().unwrap().seed(&line), Some(1));
+        assert!(asked.lock().unwrap().retry.is_none());
+
+        // Asked to be prepared while it is: not made twice.
+        let first = preparing(&asked, &line).expect("the first");
+        assert!(preparing(&asked, &line).is_none(), "being prepared already");
+        drop(first);
+        assert!(preparing(&asked, &line).is_some(), "the first is over");
     }
 
     #[test]
@@ -728,7 +961,7 @@ mod tests {
                 let _ = job.done.send(Ok(Spoken::nothing()));
             }
         });
-        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Arc::default(), alive: Arc::new(AtomicBool::new(true)) };
+        let speaker = Speaker { jobs, model: "m".into(), device: "webgpu:0".into(), voices: Voices { dir: Some(dir.clone()), default: Some("phone".into()) }, remembered: Arc::default(), asked: Arc::default(), alive: Arc::new(AtomicBool::new(true)) };
         let cancel = Arc::new(AtomicBool::new(false));
         let mut heard = 0;
         let spoken = speaker.say("Nobody hears this.", None, Arc::clone(&cancel), &|| true, &mut |_| {

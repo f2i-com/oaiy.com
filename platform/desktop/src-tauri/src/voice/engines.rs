@@ -206,7 +206,8 @@ impl Engines {
     /// Have `text` made whole and kept by the speech server, to be said from memory when it is asked for: a caller's
     /// greeting, while the line settles. The server makes it again with another seed where it does not sound like its
     /// voice (one line in twenty or so does not, and a greeting so made was the same at every call).
-    pub async fn prepare(&self, text: &str, voice: Option<&str>) -> Result<(), String> {
+    /// Answers with what the server said of it (`prepared`, and where it was made, its `likeness` and `seed`).
+    pub async fn prepare(&self, text: &str, voice: Option<&str>) -> Result<serde_json::Value, String> {
         let t = self.target(TTS_SERVICE).await?;
         let mut body = serde_json::json!({ "input": text, "response_format": "pcm", "prepare": true });
         if let Some(v) = voice {
@@ -217,7 +218,7 @@ impl Engines {
             self.forget_copies(&t, resp.status());
             return Err(format!("text-to-speech: HTTP {}", resp.status()));
         }
-        Ok(())
+        Ok(resp.json().await.unwrap_or(serde_json::Value::Null))
     }
 
     /// Speak `text`: its audio at the wire rate, chunk by chunk as it is made,

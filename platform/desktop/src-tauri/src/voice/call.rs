@@ -349,6 +349,47 @@ impl Opening {
     }
 }
 
+/// The greeting being made ahead ([`Engines::prepare`]): its words, and the request, let go once the greeting has been
+/// said or the call is over (the speech server sees its asker go, and stops making it).
+type Ahead = Arc<Mutex<Option<(String, tokio::task::AbortHandle)>>>;
+
+/// Have `text`, the greeting, made ahead, unless it is being made already: one made ahead with other words is let go
+/// first. (Two in the speech server's queue, the greeting waited for both.)
+fn make_ahead(ahead: &Ahead, engines: &Engines, voice: Option<&str>, text: &str, clock: &Clock, call: &str) {
+    let mut slot = ahead.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().is_some_and(|(said, _)| said == text) {
+        return;
+    }
+    if let Some((_, old)) = slot.take() {
+        old.abort();
+    }
+    let (engines, voice, words, clock, call, asked) = (engines.clone(), voice.map(str::to_string), text.to_string(), clock.clone(), call.to_string(), Instant::now());
+    let task = tokio::spawn(async move {
+        match engines.prepare(&words, voice.as_deref()).await {
+            Ok(made) => log::info!("voice: {call}: the greeting was made ahead in {} ms, {} ms into the call ({made})", asked.elapsed().as_millis(), clock.ms(Instant::now())),
+            Err(e) => log::warn!("voice: {call}: the greeting was not made ahead ({} ms into the call): {e}", clock.ms(Instant::now())),
+        }
+    });
+    *slot = Some((text.to_string(), task.abort_handle()));
+}
+
+/// The greeting made ahead is let go: it was said, or will not be.
+fn let_go(ahead: &Ahead) {
+    if let Some((_, task)) = ahead.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        task.abort();
+    }
+}
+
+/// Who a call is with: the number and the phone's name for them (the plugin's events, else the start's), and the name
+/// they are greeted by (the one kept for their number, else the phone's where it is a person's).
+fn who_rang(hub: &VoiceHub, call: &str, start_from: &str, start_name: &str) -> (String, String, String) {
+    let (from, name) = hub.caller_of(call).unwrap_or_default();
+    let from = if from.trim().is_empty() { start_from.to_string() } else { from };
+    let name = if name.trim().is_empty() { start_name.to_string() } else { name };
+    let known = super::callers::name_of(&from).or_else(|| super::callers::looks_like_name(&name).then(|| name.trim().to_string())).unwrap_or_default();
+    (from, name, known)
+}
+
 /// How long a call's greeting waits after it begins: as the begin or start
 /// event asks (`greetingDelayMs`: a phone that knows its line may say), else
 /// as set on this desktop (`configured`); kept to 0 to 5 s.
@@ -737,13 +778,24 @@ where
     let speaking = Arc::new(Mutex::new(Speaking::default()));
     let current_item: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let clock = Clock::default();
+    // The greeting, made ahead from the start: the phone opens the session before it answers, and the greeting is
+    // made while it answers and the line settles (made again at the begin only where its words changed).
+    let ahead: Ahead = Arc::default();
+    if !speak_only && (outbound || !greeting_delay(&json!({}), &start, voices::greeting_delay_ms()).is_zero()) {
+        let (_, _, known) = who_rang(&hub, &ids.call, &start_from, &start_name);
+        let resumed = start_resume.is_some() || hub.in_handoff(&ids.call);
+        let text = if resumed { greeting.clone() } else { super::callers::personal_greeting(&greeting, &known) };
+        if !text.trim().is_empty() {
+            make_ahead(&ahead, &engines, voice.as_deref(), &text, &clock, &ids.call);
+        }
+    }
     // What the speaker has been given and not yet played out (see `Ledger`).
     let ledger = Arc::new(Mutex::new(Ledger::default()));
     // Whether the caller speaks, or their words are being heard: a new item waits (see `Caller`).
     let caller = Arc::new(Caller::default());
     let (speak_tx, mut speak_rx) = mpsc::unbounded_channel::<Speak>();
     let speaker = {
-        let (out_tx, ids, hub, engines, epoch, speaking, current_item, voice, clock, ledger, caller) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), epoch.clone(), speaking.clone(), current_item.clone(), voice.clone(), clock.clone(), ledger.clone(), caller.clone());
+        let (out_tx, ids, hub, engines, epoch, speaking, current_item, voice, clock, ledger, caller, ahead) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), epoch.clone(), speaking.clone(), current_item.clone(), voice.clone(), clock.clone(), ledger.clone(), caller.clone(), ahead.clone());
         tokio::spawn(async move {
             // Close the open item: what it said, then done (Aokie holds even a cancelled item open until its exact item_done).
             let close = |item: OpenItem, cut: bool| {
@@ -823,6 +875,8 @@ where
                 }
                 ledger.lock().unwrap().began(job.job, &item.id);
                 let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<i16>>(64);
+                // (the greeting's way to the phone, for the log: asked of the speech server, its first audio, its first frame sent)
+                let (asked, mut first_heard, mut first_sent) = (Instant::now(), None::<Instant>, None::<Instant>);
                 let synth = {
                     let (engines, text, voice) = (engines.clone(), job.text.clone(), voice.clone());
                     tokio::spawn(async move { engines.speak(&text, voice.as_deref(), &pcm_tx).await })
@@ -840,6 +894,7 @@ where
                                 cut = true;
                                 break;
                             }
+                            first_heard.get_or_insert_with(Instant::now);
                             if holding {
                                 held.extend_from_slice(&samples);
                                 if held.len() < PREROLL_SAMPLES {
@@ -861,6 +916,7 @@ where
                     // At most a second per frame (Aokie takes up to two).
                     for chunk in samples.chunks(WIRE_RATE as usize) {
                         let _ = out_tx.send(Message::Binary(audio::bytes(chunk))).await;
+                        first_sent.get_or_insert_with(Instant::now);
                         let first = item.first_pcm.is_none();
                         let from = item.sent(chunk.len(), Instant::now());
                         heard_from.get_or_insert(from);
@@ -871,6 +927,12 @@ where
                 }
                 drop(pcm_rx);
                 let spoken = synth.await.unwrap_or_else(|e| Err(e.to_string()));
+                if job.greeting {
+                    // Said: what is still being made of it ahead is let go (it held the speech server as the caller answered it).
+                    let_go(&ahead);
+                    let after = |t: Option<Instant>| t.map_or_else(|| "never".to_string(), |t| format!("{} ms", t.saturating_duration_since(asked).as_millis()));
+                    log::info!("voice: {}: the greeting, asked for {} ms into the call: its first audio {} later, its first frame to the phone {} later", ids.call, clock.ms(asked), after(first_heard), after(first_sent));
+                }
                 cut |= job.epoch != epoch.load(Ordering::SeqCst);
                 if let Err(e) = &spoken {
                     hub.emit(json!({"type": "call.error", "callId": ids.call, "message": e}));
@@ -1076,9 +1138,7 @@ where
                                 if let Some(i) = v.get("instructions").and_then(Value::as_str).filter(|i| !i.trim().is_empty()) {
                                     instructions = i.to_string();
                                 }
-                                let (from, name) = hub.caller_of(&ids.call).unwrap_or_default();
-                                let from = if from.trim().is_empty() { start_from.clone() } else { from };
-                                let name = if name.trim().is_empty() { start_name.clone() } else { name };
+                                let (from, name, known) = who_rang(&hub, &ids.call, &start_from, &start_name);
                                 // This desktop's own record of who rang (a message is kept with it, never with what the model says).
                                 hub.note_call(&ids.call, &from, &name);
                                 // The owner had this call and hands it back: the phone says so, and so does the desktop's own record.
@@ -1094,7 +1154,6 @@ where
                                 super::contacts::saw(&from);
                                 // Greeted by name when we know it: the name kept for their number, else the phone's.
                                 // (Not a caller who was handed back: they were greeted, and the line they hear is the phone's.)
-                                let known = super::callers::name_of(&from).or_else(|| super::callers::looks_like_name(&name).then(|| name.trim().to_string())).unwrap_or_default();
                                 if resume.is_none() {
                                     greeting = super::callers::personal_greeting(&greeting, &known);
                                 }
@@ -1122,17 +1181,14 @@ where
                                     // Said once the line is open: now, if the call asks for no wait.
                                     let delay = greeting_delay(&v, &start, voices::greeting_delay_ms());
                                     opening = Opening::after(Instant::now(), outbound, delay);
+                                    log::info!("voice: {}: the call began; its greeting waits {} ms for the line", ids.call, if opening.is_some() { delay.as_millis() } else { 0 });
                                     if opening.is_none() {
+                                        let_go(&ahead);
                                         speak(greeting.clone(), true, None);
                                     } else {
-                                        // Made while the line settles, and kept by the speech server (made again where it does
-                                        // not sound like the voice): said from memory, at once, when it is due.
-                                        let (engines, voice, text) = (engines.clone(), voice.clone(), greeting.clone());
-                                        tokio::spawn(async move {
-                                            if let Err(e) = engines.prepare(&text, voice.as_deref()).await {
-                                                log::warn!("voice: the greeting was not made ahead: {e}");
-                                            }
-                                        });
+                                        // Made while the line settles (from the start, unless its words changed), and kept by the speech
+                                        // server (made again where it does not sound like the voice): said from memory when it is due.
+                                        make_ahead(&ahead, &engines, voice.as_deref(), &greeting, &clock, &ids.call);
                                     }
                                 }
                             }
@@ -1627,6 +1683,8 @@ where
     // has finished, which can take as long as its last transcription: after the call ends, or is handed to the owner,
     // nothing more is said on it.
     epoch.fetch_add(1, Ordering::SeqCst);
+    // Nor made: a greeting still being made ahead is let go.
+    let_go(&ahead);
 
     // Whether this session still carried the call as it ended: one that another session has taken the call from (the phone opened a second stream for
     // a call that was still live) ends alone. It does not end the call, hand it to the owner, tell the app it ended or end what rings for it: the call
@@ -2505,6 +2563,27 @@ mod tests {
         let ahead = said.saturating_sub(prepared[0].1.duration_since(aokie.begun));
         assert!(ahead > Duration::from_millis(1_000), "made {ahead:?} before it was said");
         assert_eq!(aokie.speech.spoken(), vec!["Thanks for calling."], "and said");
+    }
+
+    /// The phone opens the session before it answers: the greeting is made from then (the time a greeting took to make
+    /// was the time the caller waited past the settle), and not again at the begin; one whose words the begin changed
+    /// is made with them, the first let go.
+    #[tokio::test]
+    async fn the_greeting_is_made_ahead_from_the_start_and_again_only_with_other_words() {
+        let prepared = |aokie: &Aokie| aokie.speech.prepared.lock().unwrap().iter().map(|(text, _)| text.clone()).collect::<Vec<_>>();
+        let mut aokie = Aokie::start(json!({"greeting": "Thanks for calling."})).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(prepared(&aokie), vec!["Thanks for calling."], "made as the session opened, before it began");
+        aokie.begin(json!({}));
+        aokie.first_audio(secs(6)).await.expect("the greeting");
+        assert_eq!(prepared(&aokie), vec!["Thanks for calling."], "not made again at the begin");
+
+        let mut aokie = Aokie::start(json!({"greeting": "Thanks for calling."})).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        aokie.begin(json!({"greeting": "Thanks for calling OAIY."}));
+        aokie.first_audio(secs(6)).await.expect("the greeting");
+        assert_eq!(prepared(&aokie), vec!["Thanks for calling.", "Thanks for calling OAIY."]);
+        assert_eq!(aokie.speech.spoken(), vec!["Thanks for calling OAIY."]);
     }
 
     /// A line streamed as the engine streams it (80 ms pieces, twice as fast as real time) reaches Aokie as a first
