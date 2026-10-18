@@ -427,6 +427,10 @@ fn with_the_linked_providers_origin_trusted_the_two_guards_still_answer_alike() 
     assert!(statuses.get(&200).copied().unwrap_or(0) > 500 && statuses.get(&403).copied().unwrap_or(0) > 500, "{statuses:?}");
 }
 
+/// The desktop's own webview's origin on this system: `http://tauri.localhost` on Windows, where `tauri://localhost` is
+/// another page's (an impostor's), and `tauri://localhost` on a Mac and Linux.
+const OWN_WEBVIEW: &str = if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" };
+
 #[tokio::test]
 async fn the_matrix_would_notice_a_guard_that_answered_differently() {
     // The differential test is only worth something if it fails when the live guard drifts. A guard that lets
@@ -436,8 +440,8 @@ async fn the_matrix_would_notice_a_guard_that_answered_differently() {
     let gui = live(true, Some(STATIC_TOKEN), pairing.clone());
     let headless = frozen(false, Some(STATIC_TOKEN), pairing);
     let (method, path) = (Method::POST, "/api/services");
-    let a = ask(&gui, &method, path, None, Some("tauri://localhost")).await;
-    let b = ask(&headless, &method, path, None, Some("tauri://localhost")).await;
+    let a = ask(&gui, &method, path, None, Some(OWN_WEBVIEW)).await;
+    let b = ask(&headless, &method, path, None, Some(OWN_WEBVIEW)).await;
     assert_ne!(
         a, b,
         "a guard in another mode answers differently, and the comparison sees it"
@@ -527,7 +531,7 @@ async fn the_old_guards_bodies_and_statuses_are_still_what_they_were() {
         &Method::POST,
         "/api/services",
         None,
-        Some("tauri://localhost"),
+        Some(OWN_WEBVIEW),
     )
     .await;
     assert_eq!(
