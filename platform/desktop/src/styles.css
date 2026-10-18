@@ -2180,3 +2180,6 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .network-window span { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .network-window.is-open { border-style: solid; border-color: color-mix(in srgb, var(--amber) 45%, var(--border)); background: color-mix(in srgb, var(--amber) 8%, transparent); color: var(--text); }
 .network-by-itself span { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* A dismissable banner with actions: its words take the room, its buttons sit together at the right. */
+.banner-dismissable > span:first-child { flex: 1 1 auto; min-width: 0; }
+.banner-dismissable > .banner-actions { display: inline-flex; flex: none; align-items: center; gap: 6px; margin-left: auto; }
