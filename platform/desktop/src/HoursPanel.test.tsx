@@ -175,7 +175,6 @@ describe('saving', () => {
     expect(bar()).toBeNull();
     await act(async () => type(host.querySelector<HTMLInputElement>('.hours-business-name')!, 'Green Lawns & Gardens'));
     expect(bar()?.textContent).toContain('Unsaved changes');
-    expect(text()).toContain('Callers hear: “Thanks for calling Green Lawns & Gardens, this is Aokie. How can I help?”');
     await act(async () => button('Discard').click());
     expect(bar()).toBeNull();
     expect(host.querySelector<HTMLInputElement>('.hours-business-name')!.value).toBe('Green Lawns');
@@ -204,7 +203,6 @@ describe('saving', () => {
 
 describe('the business card', () => {
   const receptionist = () => host.querySelector<HTMLInputElement>('.hours-receptionist-name')!;
-  const greeting = () => host.querySelector('.hours-greeting')?.textContent;
 
   it('has the receptionist’s name beside the business’s: Aokie until it is given one', async () => {
     await mount();
@@ -214,23 +212,17 @@ describe('the business card', () => {
     expect(receptionist().placeholder).toBe('Aokie');
     expect(card.textContent).toContain('What the receptionist calls itself on calls and texts.');
     expect(document.getElementById(receptionist().getAttribute('aria-describedby')!)?.textContent).toContain('calls itself');
-    expect(greeting()).toBe('Callers hear: “Thanks for calling Green Lawns, this is Aokie. How can I help?”');
+    // No greeting of its own here: what callers hear is the phone's, with how the phone sounds (CallVoice.test).
+    expect(card.textContent).not.toContain('Callers hear');
   });
 
   it('says the name as it is typed, and saves it with the page’s Save', async () => {
     const onSaved = await mount();
     await act(async () => type(receptionist(), 'Sam'));
-    expect(greeting()).toBe('Callers hear: “Thanks for calling Green Lawns, this is Sam. How can I help?”');
     expect(bar()?.textContent).toContain('Unsaved changes');
     await act(async () => button('Save changes').click());
     expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({ business: 'Green Lawns', receptionist: 'Sam' }));
     expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ receptionist: 'Sam' }));
-    // With no business named yet, the greeting still says who answers.
-    await act(async () => type(host.querySelector<HTMLInputElement>('.hours-business-name')!, ''));
-    expect(greeting()).toBe('Callers hear: “Thanks for calling, this is Sam. How can I help?”');
-    // Emptied, it is Aokie again.
-    await act(async () => type(receptionist(), '  '));
-    expect(greeting()).toBe('Callers hear: “Thanks for calling, this is Aokie. How can I help?”');
   });
 
   it('a name longer than 40 characters is said where it is and in the save bar, and is not sent', async () => {
@@ -252,7 +244,6 @@ describe('the business card', () => {
   it('shows a name set elsewhere (by the Agent), and the setup wizard’s step has the field too', async () => {
     await mount({ settings: { ...SETTINGS(), receptionist: 'Sam' } });
     expect(receptionist().value).toBe('Sam');
-    expect(greeting()).toContain('this is Sam.');
     act(() => root.unmount());
     root = createRoot(host);
 

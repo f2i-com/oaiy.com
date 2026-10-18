@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { ArrowDown, ArrowUp, CalendarDays, Coffee, Copy, Plus, Trash2, Undo2, Volume2, X } from 'lucide-react';
-import { calendar, isNotFound, optional, voices, type CalendarService, type CalendarSettings, type CalendarSpan, type VoiceClip } from './api';
+import { bridge, calendar, isNotFound, optional, voices, type CalendarService, type CalendarSettings, type CalendarSpan, type VoiceClip } from './api';
 import {
   DAY_NAMES,
+  DEFAULT_GREETING,
   DEFAULT_RECEPTIONIST,
+  GREETING_MAX,
   DURATIONS,
   STEPS,
   checkSettings,
@@ -13,9 +15,11 @@ import {
   receptionistName,
   sameHoursWeekdays,
   sameSettings,
-  sayGreeting,
+  greetingOf,
+  personalGreeting,
   sayHours,
   sayMinutes,
+  suggestGreeting,
   withBreak,
   ymd,
 } from './calendarModel';
@@ -253,7 +257,6 @@ export function SettingsForm({
             )}
           </label>
         </div>
-        <p className="form-hint hours-greeting">Callers hear: “{sayGreeting(s)}”</p>
       </section>
 
       <section className="hours-card hours-open" aria-labelledby="hours-open-title">
@@ -586,6 +589,53 @@ export function CallVoice({ business, receptionist = '' }: { business: string; r
   const player = useRef<HTMLAudioElement | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const fail = (title: string, e: unknown) => toast.push({ kind: 'error', title, body: errText(e) });
+  // The greeting is the phone's own setting (Aokie's `greeting`): what it says is read from it and saved to it, so this
+  // page and the phone never say different things. The phone's connector is the phone module's provider's.
+  // (`undefined` while the modules are not known yet, '' when the phone's provider names no connector)
+  const modules = useModules();
+  const connector = modules ? (modules.modules.find((m) => m.id === 'phone')?.provider?.connector ?? '') : undefined;
+  /** The greeting set on the phone ('' for Aokie's own): `undefined` until read, `null` when the phone could not be asked. */
+  const [greeting, setGreeting] = useState<string | null | undefined>(undefined);
+  const [draft, setDraft] = useState('');
+  const [greetingProblem, setGreetingProblem] = useState<string | null>(null);
+  const [savingGreeting, setSavingGreeting] = useState(false);
+
+  const readGreeting = useCallback(async () => {
+    if (connector === undefined) return;
+    if (!connector) {
+      setGreeting(null);
+      setGreetingProblem(null);
+      return;
+    }
+    try {
+      const data = (await phoneCommand(connector, 'settings.get')) as { settings?: Record<string, unknown> } | undefined;
+      const set = typeof data?.settings?.greeting === 'string' ? data.settings.greeting.trim() : '';
+      setGreeting(set);
+      setDraft(set);
+      setGreetingProblem(null);
+    } catch (e) {
+      setGreeting(null);
+      setGreetingProblem(errText(e));
+    }
+  }, [connector]);
+  useEffect(() => void readGreeting(), [readGreeting]);
+
+  const saveGreeting = async () => {
+    if (!connector) return;
+    const next = draft.trim();
+    setSavingGreeting(true);
+    try {
+      // (blank is Aokie's own greeting, never silence)
+      await phoneCommand(connector, 'settings.set', { greeting: next });
+      setGreeting(next);
+      setDraft(next);
+      toast.push({ kind: 'success', title: 'Greeting saved', body: 'The next call is answered with it.' });
+    } catch (e) {
+      fail('Greeting not saved', e);
+    } finally {
+      setSavingGreeting(false);
+    }
+  };
 
   const load = useCallback(async () => {
     let delayMs: number | undefined;
@@ -612,7 +662,8 @@ export function CallVoice({ business, receptionist = '' }: { business: string; r
   const hear = async (voice: string) => {
     setSpeaking(voice);
     try {
-      const blob = await voices.hear(voice, `Hi, thanks for calling${business.trim() ? ` ${business.trim()}` : ''}, this is ${receptionistName({ receptionist })}. How can I help you today?`);
+      // What callers hear first, as it reads in the box now (the phone's, or the one being written).
+      const blob = await voices.hear(voice, greetingOf(draft));
       player.current?.pause();
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
@@ -670,6 +721,17 @@ export function CallVoice({ business, receptionist = '' }: { business: string; r
         </h3>
         <span className="hours-now">Changes here apply at once</span>
       </div>
+      <CallGreeting
+        greeting={greeting}
+        draft={draft}
+        problem={greetingProblem}
+        saving={savingGreeting}
+        suggestion={business.trim() ? suggestGreeting({ business, receptionist }) : null}
+        knownName={receptionistName({ receptionist }).toLowerCase() === 'sam' ? 'Alex' : 'Sam'}
+        onDraft={setDraft}
+        onSave={() => void saveGreeting()}
+        onRetry={() => void readGreeting()}
+      />
       <p className="form-hint">
         The voice callers hear. It is copied, on this computer, from a short clip: 5 to 30 seconds of one person speaking clearly, as an MP3 or WAV.
       </p>
@@ -746,6 +808,104 @@ export function CallVoice({ business, receptionist = '' }: { business: string; r
 }
 
 const isMs = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/** One of the phone's commands, through the gated route the plugin's own screens use (as Setup's `pluginCommand`), its envelope taken off. */
+async function phoneCommand(connector: string, command: string, payload?: unknown): Promise<unknown> {
+  const key = `greeting-${command}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const res = await bridge.connectorRequest(connector, command, payload, key);
+  if (res.ok === false) throw new Error('The desktop could not ask the phone.');
+  const r = res.result as { ok?: boolean; data?: unknown; error?: unknown } | undefined;
+  if (r?.ok === false) {
+    const why = typeof r.error === 'object' && r.error ? (r.error as { message?: unknown }).message : r.error;
+    throw new Error(String(why ?? 'The phone could not do that.'));
+  }
+  return r && typeof r === 'object' && 'data' in r ? r.data : r;
+}
+
+/**
+ * What callers hear first: the phone's greeting, written here and saved to the phone, and how it reads to a caller the
+ * phone does not know and to one it does (greeted by first name, as the desktop greets the call). Blank is Aokie's own.
+ */
+function CallGreeting({
+  greeting,
+  draft,
+  problem,
+  saving,
+  suggestion,
+  knownName,
+  onDraft,
+  onSave,
+  onRetry,
+}: {
+  greeting: string | null | undefined;
+  draft: string;
+  problem: string | null;
+  saving: boolean;
+  /** A greeting naming the business and the receptionist, offered while the one written does not name the business. */
+  suggestion: string | null;
+  /** The first name the "caller it knows" line is said with. */
+  knownName: string;
+  onDraft: (text: string) => void;
+  onSave: () => void;
+  onRetry: () => void;
+}) {
+  const said = greetingOf(draft);
+  const readable = typeof greeting === 'string';
+  const changed = readable && draft.trim() !== greeting;
+  const business = suggestion ? suggestion.replace(/^Hello, thanks for calling /, '').split(',')[0] : '';
+  const offer = readable && suggestion && business && !draft.toLowerCase().includes(business.toLowerCase()) ? suggestion : null;
+  return (
+    <div className="voice-greeting">
+      <label className="form-row" htmlFor="call-greeting">
+        <span>What callers hear first</span>
+      </label>
+      <div className="voice-greeting-edit">
+        <input
+          id="call-greeting"
+          value={draft}
+          maxLength={GREETING_MAX}
+          placeholder={DEFAULT_GREETING}
+          disabled={!readable || saving}
+          aria-describedby="call-greeting-said"
+          onChange={(e) => onDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && changed) onSave();
+          }}
+        />
+        <button type="button" className="btn btn-primary" disabled={!changed || saving} onClick={onSave}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+      {greeting === null && (
+        <p className="form-hint voice-greeting-problem" role="status">
+          {problem ? `The phone’s greeting could not be read: ${problem}` : 'The phone does not say what it greets callers with.'} Shown is Aokie’s own.{' '}
+          {problem && (
+            <button type="button" className="btn-link" onClick={onRetry}>
+              Try again
+            </button>
+          )}
+        </p>
+      )}
+      <dl id="call-greeting-said" className="voice-greeting-said">
+        <dt>New callers hear</dt>
+        <dd>“{said}”</dd>
+        <dt>Callers it knows hear</dt>
+        <dd>
+          “{personalGreeting(said, knownName)}”
+          <small>By first name: the one in Contacts, or the one their phone shows.</small>
+        </dd>
+      </dl>
+      {offer && (
+        <p className="form-hint">
+          To say your business’s name:{' '}
+          <button type="button" className="btn-link" onClick={() => onDraft(offer)}>
+            use “{offer}”
+          </button>
+        </p>
+      )}
+    </div>
+  );
+}
 
 /** The most the desktop keeps (`greetingDelayMs`), and the slider's step. */
 const MAX_GREETING_DELAY_MS = 5000;

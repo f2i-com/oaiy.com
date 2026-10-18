@@ -17,7 +17,10 @@ import {
   receptionistName,
   sameHoursWeekdays,
   sameSettings,
-  sayGreeting,
+  suggestGreeting,
+  greetingOf,
+  personalGreeting,
+  DEFAULT_GREETING,
   sayHours,
   sayMinutes,
   sayRange,
@@ -233,9 +236,32 @@ describe('who answers', () => {
     expect(receptionistName(settings({ receptionist: ' Sam ' }))).toBe('Sam');
   });
 
-  it('the greeting says the business and the receptionist, or only the receptionist', () => {
-    expect(sayGreeting(settings())).toBe('Thanks for calling Green Lawns, this is Aokie. How can I help?');
-    expect(sayGreeting(settings({ business: ' ', receptionist: 'Sam' }))).toBe('Thanks for calling, this is Sam. How can I help?');
+  it('a greeting to start from says the business and the receptionist, or only the receptionist', () => {
+    expect(suggestGreeting(settings())).toBe('Hello, thanks for calling Green Lawns, this is Aokie. How can I help you today?');
+    expect(suggestGreeting(settings({ business: ' ', receptionist: 'Sam' }))).toBe('Hello, thanks for calling, this is Sam. How can I help you today?');
+  });
+
+  it('callers hear the greeting set on the phone, or Aokie’s own when none is', () => {
+    expect(greetingOf('Green Lawns, Sam speaking.')).toBe('Green Lawns, Sam speaking.');
+    expect(greetingOf('  ')).toBe(DEFAULT_GREETING);
+    expect(greetingOf(undefined)).toBe('Hello, thanks for calling. How can I help you today?');
+  });
+
+  // The same cases as the desktop's `voice::callers` tests: the call is greeted by that rule, the page says it by this one.
+  it('a caller the desktop knows is greeted by first name, as the desktop greets the call', () => {
+    expect(personalGreeting('Hi! Thanks for calling', 'Liam Smith')).toBe('Hi Liam! Thanks for calling');
+    expect(personalGreeting('Hello, thanks for calling', 'Liam')).toBe('Hello Liam, thanks for calling');
+    expect(personalGreeting('hey there, how can I help?', 'Liam')).toBe('hey Liam, how can I help?');
+    expect(personalGreeting("G'day! OAIY here.", 'Liam')).toBe("G'day Liam! OAIY here.");
+    expect(personalGreeting('Hi', 'Liam')).toBe('Hi Liam');
+    expect(personalGreeting('Thanks for calling OAIY.', 'Liam')).toBe('Hi Liam! Thanks for calling OAIY.');
+    expect(personalGreeting('Hiya, OAIY here.', 'Liam')).toBe('Hi Liam! Hiya, OAIY here.');
+    expect(personalGreeting('Thanks for calling, hello!', 'Liam')).toBe('Hi Liam! Thanks for calling, hello!');
+    expect(personalGreeting('Hi Liam, thanks for calling', 'Liam Smith')).toBe('Hi Liam, thanks for calling');
+    expect(personalGreeting('Welcome back, liam!', 'Liam')).toBe('Welcome back, liam!');
+    expect(personalGreeting('Hi! Thanks for calling', '')).toBe('Hi! Thanks for calling');
+    expect(personalGreeting('', 'Liam')).toBe('');
+    expect(personalGreeting(DEFAULT_GREETING, 'Zoë')).toBe('Hello Zoë, thanks for calling. How can I help you today?');
   });
 
   it('a name of more than 40 characters is a problem, listed first as the card is first', () => {
