@@ -26,7 +26,7 @@ describe("the chat's Markdown", () => {
 
   it('keeps inline code as it is, and draws headings, lists, quotes and rules', () => {
     expect(renderMarkdown('Use `**not bold**` here')).toBe('<p>Use <code>**not bold**</code> here</p>');
-    expect(renderMarkdown('## Title\n- a\n- [x] done\n3. three\n> quoted\n---')).toBe('<h4>Title</h4><ul><li>a</li><li class="task done"><span class="task-box" aria-hidden="true"></span>done</li></ul><ol start="3"><li>three</li></ol><blockquote>quoted</blockquote><hr>');
+    expect(renderMarkdown('## Title\n- a\n- [x] done\n3. three\n> quoted\n---')).toBe('<h4>Title</h4><ul><li>a</li><li class="task done"><span class="task-box" role="img" aria-label="done"></span>done</li></ul><ol start="3"><li>three</li></ol><blockquote>quoted</blockquote><hr>');
   });
 
   it('makes an address written bare a link, ending where the sentence or a quote does', () => {

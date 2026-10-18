@@ -154,7 +154,8 @@ export class Vfs {
 
   isText(path: string): boolean {
     try {
-      decoder.decode(this.readBytes(path).subarray(0, 8192));
+      // (streamed: a character its first 8 KB cuts in two is not taken for binary)
+      new TextDecoder('utf-8', { fatal: true }).decode(this.readBytes(path).subarray(0, 8192), { stream: true });
       return true;
     } catch {
       return false;
@@ -292,6 +293,8 @@ export class Vfs {
     const b = normalizePath(to);
     const node = this.node(a);
     if (!node) throw new VfsError('ENOENT', `no such file or directory, '/${a}'`);
+    // (the whole project is not copied into a folder of itself: `/` would be "into itself" of everything)
+    if (a === '') throw new VfsError('EINVAL', "cannot copy '/': copy the folders or files in it");
     if (b === a || b.startsWith(`${a}/`)) throw new VfsError('EINVAL', `cannot copy '/${a}' into itself`);
     if (node.kind === 'file') {
       this.writeFile(`/${b}`, node.data.slice(), { parents: false });

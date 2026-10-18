@@ -685,8 +685,9 @@ export class Preview {
     };
     window.addEventListener('message', onMessage);
     setTimeout(() => {
-      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
+      // (taken off whatever came of it: a render that replaced this frame before it was ready left it listening)
       window.removeEventListener('message', onMessage);
+      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
       this.setStatus('the model did not load', 'error');
       this.settle({ ok: false, errors: ['the 3D model preview did not finish loading within 30 s'] });
     }, 30_000);
@@ -745,8 +746,8 @@ export class Preview {
     };
     window.addEventListener('message', onMessage);
     setTimeout(() => {
-      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
       window.removeEventListener('message', onMessage);
+      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
       this.setStatus('the page did not load', 'error');
       this.settle({ ok: false, errors: ['the page preview did not finish loading within 20 s'] });
     }, 20_000);
@@ -841,8 +842,8 @@ export class Preview {
     };
     window.addEventListener('message', onMessage);
     setTimeout(() => {
-      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
       window.removeEventListener('message', onMessage);
+      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
       this.setStatus('the preview runtime did not start', 'error');
       this.settle({ ok: false, errors: ['the SoftN preview runtime did not start within 20 s'] });
     }, 20_000);

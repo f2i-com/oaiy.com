@@ -595,6 +595,34 @@ describe("following the desktop's events", () => {
     follower.stop();
   });
 
+  it('hears a desktop that restarted (its events numbered from 0 again), and one bad event does not take the rest', async () => {
+    let ring = [event(1), event(2), event(3)];
+    let down = false;
+    const seen: number[] = [];
+    const desktop = {
+      events: async (since: number) => {
+        if (down) throw new Error('OAIY Desktop did not answer');
+        return ringOf(ring).events(since);
+      },
+    };
+    const follower = new DesktopEvents(() => desktop as unknown as Desktop, (e) => {
+      if (e.seq === 4) throw new Error('could not handle it');
+      seen.push(e.seq);
+    }, () => {}, 60_000);
+    await follower.tick();
+    ring.push(event(4), event(5));
+    await follower.tick();
+    expect(seen).toEqual([5]);
+    // the desktop goes away and comes back numbering from 1
+    down = true;
+    await follower.tick();
+    ring = [event(1), event(2)];
+    down = false;
+    await follower.tick();
+    expect(seen).toEqual([5, 1, 2]);
+    follower.stop();
+  });
+
   it('says when the desktop cannot be reached, and when it can again', async () => {
     const said: string[] = [];
     let down = true;
@@ -693,6 +721,56 @@ describe('lanes', () => {
     expect(order).not.toContain('end [OAIY] Your flow "Nightly" as');
     release();
     await task;
+  });
+});
+
+describe('a task stopped, and the list of conversations', () => {
+  it("a flow's task that is stopped fails at once (the flow is not left waiting), and the next task gets its own answer", async () => {
+    const store = fakeProject();
+    let runs = 0;
+    const makeAgent = () =>
+      ({
+        turns: [] as Turn[],
+        run: async (_prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal) => {
+          // the first run works until it is stopped; the next answers
+          if (runs++ === 0) await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+          else emit({ type: 'done', text: 'second answer', steps: 1 } as AgentEvent);
+        },
+        interject: () => false,
+        takeUnread: () => [],
+        savedTurns: () => [],
+        warm: async () => {},
+        reset: () => {},
+      }) as unknown as Agent;
+    const sessions = new Sessions(store.project as never, makeAgent, () => ({ answer: false, calls: false, instructions: '', callInstructions: '' }) as MessageSettings, () => null, { changed: () => {}, event: () => {} });
+    const first = sessions.task('Nightly', 'Summarise the day');
+    await new Promise((r) => setTimeout(r, 10));
+    sessions.stop(sessions.list.find((s) => s.kind === 'task')!);
+    await expect(first).rejects.toThrow('the task was stopped');
+    await settled(sessions);
+    expect(await sessions.task('Nightly', 'Summarise the day')).toBe('second answer');
+  });
+
+  it('writes the list one write at a time, the asks that came while one waited sharing the next', async () => {
+    const store = fakeProject();
+    let writing = 0;
+    let most = 0;
+    let writes = 0;
+    store.project.saveSessions = async () => {
+      writing++;
+      writes++;
+      most = Math.max(most, writing);
+      await new Promise((r) => setTimeout(r, 5));
+      writing--;
+    };
+    const sessions = new Sessions(store.project as never, () => ({}) as Agent, () => ({ answer: false, calls: false, instructions: '', callInstructions: '' }) as MessageSettings, () => null, { changed: () => {}, event: () => {} });
+    const save = (sessions as unknown as { saveIndex(): Promise<void> }).saveIndex.bind(sessions);
+    const first = save();
+    await new Promise((r) => setTimeout(r, 1));
+    await Promise.all([first, save(), save(), save()]);
+    expect(most).toBe(1);
+    // the first, and one more for the three that came while it was being written
+    expect(writes).toBe(2);
   });
 });
 

@@ -476,6 +476,11 @@ export class Desktop {
     return run;
   }
 
+  /** Stop a run of a flow (one waited on past its time). */
+  async cancelRun(runId: string): Promise<void> {
+    await fetch(`${this.origin}/api/bridge/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST', headers: this.headers(), body: '{}' }).catch(() => {});
+  }
+
   /** The plugins, and whether each runs. */
   async plugins(signal?: AbortSignal): Promise<Array<{ id: string; state: string }>> {
     const body = await reply(await fetch(`${this.origin}/api/plugins`, { headers: this.headers(), signal }));

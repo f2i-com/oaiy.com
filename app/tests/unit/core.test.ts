@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { NetGate, normalizeHost } from '../../src/gate/netgate';
+import { internetCommand } from '../../src/commands';
 import { Vfs, normalizePath } from '../../src/vfs/vfs';
 import { globRegex, relativeTo } from '../../src/sandbox/host';
 
@@ -26,6 +27,17 @@ describe('the network gate', () => {
     expect(status.allowed).toBe(2);
     expect(status.blocked).toBe(4);
     expect(status.recentBlocked.at(-1)).toEqual({ host: 'docs.rs', via: 't' });
+  });
+
+  it("/internet says when nothing was changed: no host to allow, or none of the given on a list", () => {
+    const gate = new NetGate();
+    gate.setMode('blocked');
+    expect(internetCommand(gate, ['allow', '://'])).toContain('Nothing was changed');
+    // the gate stays closed for a host that was not one
+    expect(gate.mode).toBe('blocked');
+    expect(internetCommand(gate, ['allow', 'docs.rs', '://'])).toContain('allowed docs.rs (the gate was closed; it now lets through only the allowed hosts) (not host names, left out: ://)');
+    expect(internetCommand(gate, ['forget', 'nowhere.example'])).toContain('nowhere.example is not on the allow or deny list: nothing was changed');
+    expect(internetCommand(gate, ['forget', 'docs.rs', 'nowhere.example'])).toContain('forgot docs.rs (not on either list: nowhere.example)');
   });
 });
 

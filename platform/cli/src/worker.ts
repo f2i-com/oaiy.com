@@ -6,7 +6,7 @@
  * a box with no browser open.
  */
 import { runFlow } from './engine';
-import type { WorkflowGraph } from 'oaiy-core';
+import type { Flow, WorkflowGraph } from 'oaiy-core';
 
 interface QueuedRun {
   id: number;
@@ -96,6 +96,15 @@ function extractGraph(flowJson: unknown): WorkflowGraph {
   throw new Error('could not find a {nodes, edges} graph in the flow_json');
 }
 
+/** The flows a stored flow_json carries beside its entry one (a project's), for its subflow and macro nodes to
+ * resolve by id: without them those nodes fall through, a wrong output reported as a success. */
+function extractFlows(flowJson: unknown): Flow[] | undefined {
+  const f = flowJson as Record<string, any>;
+  if (!Array.isArray(f?.flows)) return undefined;
+  const flows = f.flows.filter((x: any) => x && typeof x.id === 'string' && Array.isArray(x?.graph?.nodes)) as Flow[];
+  return flows.length > 0 ? flows : undefined;
+}
+
 export interface WorkerOptions {
   backend: string;
   hashEdit: string;
@@ -117,6 +126,7 @@ export async function runWorker(opts: WorkerOptions): Promise<{ fatal: boolean }
     throw new Error('flow is password-encrypted; the CLI worker does not support encrypted flows yet');
   }
   const graph = extractGraph(flow.flow_json);
+  const availableFlows = extractFlows(flow.flow_json);
   const flowName = flow.title || 'queued-run';
   log(`listening on ${base} · flow ${opts.hashEdit} (${graph.nodes.length} nodes)`);
 
@@ -191,6 +201,7 @@ export async function runWorker(opts: WorkerOptions): Promise<{ fatal: boolean }
         const res = await runFlow(graph, {
           inputs: next.inputs || {},
           constants: opts.constants,
+          availableFlows,
           flowName,
           // Untrusted queue inputs: deny local-network access by default on the engine's
           // policyFetch path (the Node host independently SSRF-guards direct http_request).

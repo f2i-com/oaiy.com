@@ -18,6 +18,7 @@
  */
 import type { SessionTool } from '../agent/agent';
 import type { ToolSpec } from '../agent/protocol';
+import type { Vfs } from '../vfs/vfs';
 
 /** Who is asking, as `X-OAIY-Session` names it: the kind of conversation. */
 export type ControlSession = 'project' | 'setup' | 'runner' | 'call' | 'sms' | 'task';
@@ -45,6 +46,8 @@ export interface ControlResult {
   text: string;
   isError: boolean;
   structured?: unknown;
+  /** Pictures it answered with (a flow run's), as MCP image content. */
+  images?: Array<{ mimeType: string; data: string }>;
 }
 
 export class ControlError extends Error {
@@ -220,7 +223,8 @@ export class ControlClient {
     const result = await this.request(session, 'tools/call', { name, arguments: args }, signal);
     const content = Array.isArray(result.content) ? result.content.filter(isRecord) : [];
     const text = content.filter((c) => c.type === 'text' && typeof c.text === 'string').map((c) => String(c.text)).join('\n');
-    return { text, isError: result.isError === true, ...(result.structuredContent !== undefined ? { structured: result.structuredContent } : {}) };
+    const images = content.filter((c) => c.type === 'image' && typeof c.data === 'string' && typeof c.mimeType === 'string').map((c) => ({ mimeType: String(c.mimeType), data: String(c.data) }));
+    return { text, isError: result.isError === true, ...(result.structuredContent !== undefined ? { structured: result.structuredContent } : {}), ...(images.length ? { images } : {}) };
   }
 }
 
@@ -319,11 +323,11 @@ export function controlSessionTools(tools: ControlTool[], session: ControlSessio
  * name reaches the model twice. With none listed for this kind (no desktop, an
  * older one, a call, a text or a flow's task) `own` comes back as it is.
  */
-export function withControlTools(own: SessionTool[], session: ControlSession, client: () => ControlClient | null, builtIns: Iterable<string>, changed?: (tool: string) => void): SessionTool[] {
+export function withControlTools(own: SessionTool[], session: ControlSession, client: () => ControlClient | null, builtIns: Iterable<string>, changed?: (tool: string) => void, files?: () => Vfs | null): SessionTool[] {
   const listed = client()?.listed(session) ?? [];
   if (!listed.length) return own;
   const taken = new Set([...builtIns, ...own.map((t) => t.spec.name)]);
-  return distinctTools([...withNodeCalls(own, listed, session, client, changed), ...controlSessionTools(listed, session, { client, taken, changed })]);
+  return distinctTools([...withNodeCalls(own, listed, session, client, changed, files), ...controlSessionTools(listed, session, { client, taken, changed })]);
 }
 
 /** The longest a flow run on another computer is waited for (the desktop's flow_run with node takes up to 600 s). */
@@ -335,7 +339,7 @@ const NODE_RUN_SECONDS = 600;
  * with it, the call goes to the desktop's tool, which lists or runs that
  * computer's shared flows there; without it, to the app's own, as before.
  */
-export function withNodeCalls(own: SessionTool[], listed: ControlTool[], session: ControlSession, client: () => ControlClient | null, changed?: (tool: string) => void): SessionTool[] {
+export function withNodeCalls(own: SessionTool[], listed: ControlTool[], session: ControlSession, client: () => ControlClient | null, changed?: (tool: string) => void, files?: () => Vfs | null): SessionTool[] {
   return own.map((tool) => {
     const desk = listed.find((t) => COVERED[t.name] === tool.spec.name && isRecord(t.inputSchema.properties) && 'node' in t.inputSchema.properties);
     if (!desk) return tool;
@@ -359,10 +363,38 @@ export function withNodeCalls(own: SessionTool[], listed: ControlTool[], session
         const text = controlOutcome(result);
         if (result.isError) throw new Error(text || `${desk.name} failed`);
         if (!desk.readOnly) changed?.(desk.name);
-        return text || 'Done.';
+        if (desk.name !== 'flow_run') return text || 'Done.';
+        // A run there that failed is an error, as one here is; one that succeeded has its pictures kept in the
+        // project, as one here has (the desktop hands them over as pictures, not addresses).
+        const status = isRecord(result.structured) ? String(result.structured.status ?? '') : '';
+        if (status && status !== 'succeeded' && status !== 'queued' && status !== 'running') throw new Error(text || `the flow ${status}`);
+        const vfs = files?.();
+        if (status !== 'succeeded' || !vfs || !result.images?.length) return text || 'Done.';
+        const saved = keepPictures(vfs, String(input.id ?? 'flow'), result.images);
+        return `${text}\n\nSaved in the project: ${saved.join(', ')} (look at a picture with view_image; show it to the person with present_file)`;
       },
     };
   });
+}
+
+const PICTURE_TYPES: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
+
+/** A run's pictures kept in the project under `flows/<flow>/`, each under a name of its own: their paths. */
+function keepPictures(vfs: Vfs, flow: string, images: Array<{ mimeType: string; data: string }>): string[] {
+  const name = flow.replace(/[^A-Za-z0-9_-]+/g, '_') || 'flow';
+  const saved: string[] = [];
+  for (const image of images) {
+    const ext = PICTURE_TYPES[image.mimeType.toLowerCase()];
+    if (!ext) continue;
+    let path = `flows/${name}/${name}-${saved.length + 1}.${ext}`;
+    for (let n = 2; vfs.exists(`/${path}`); n++) path = `flows/${name}/${name}-${saved.length + 1}-${n}.${ext}`;
+    const bin = atob(image.data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    vfs.writeFile(`/${path}`, bytes, { parents: true });
+    saved.push(path);
+  }
+  return saved;
 }
 
 /** Tools with names already in use dropped (the first of each name stays): no model is sent two tools of one name. */

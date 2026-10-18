@@ -83,9 +83,18 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
       code.hidden = false;
       status.textContent = 'In OAIY Desktop, approve the pairing request that shows this code:';
       const until = Date.now() + 5 * 60_000;
+      let missed = 0;
       while (!abort.signal.aborted && Date.now() < until) {
         await new Promise((r) => setTimeout(r, 1500));
-        const now = await pairingStatus(DESKTOP_ORIGIN, request.pairingId);
+        // (a look that did not get through is tried again: the desktop busy for a moment does not end the pairing)
+        let now: Awaited<ReturnType<typeof pairingStatus>>;
+        try {
+          now = await pairingStatus(DESKTOP_ORIGIN, request.pairingId);
+          missed = 0;
+        } catch (error) {
+          if (++missed >= 5) throw error;
+          continue;
+        }
         if (now.status === 'approved' && now.token) {
           desktop = { origin: DESKTOP_ORIGIN, token: now.token };
           options.paired(desktop);
@@ -99,7 +108,13 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
           return;
         }
       }
+      // (not approved in time: said, rather than the code left showing as if it were still waited on)
+      if (!abort.signal.aborted) {
+        code.hidden = true;
+        status.textContent = 'The pairing was not approved within 5 minutes: try again.';
+      }
     } catch (error) {
+      code.hidden = true;
       status.textContent = `Could not pair: ${(error as Error).message}`;
     } finally {
       pair.disabled = false;
@@ -200,10 +215,11 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
   const callBackLine = h('input', { value: options.messages.callBackLine, placeholder: DEFAULT_CALL_BACK_LINE }) as HTMLInputElement;
   const waiting = (options.callbacks ?? []).filter((c) => c.state === 'waiting' || c.state === 'calling');
   const settled = (options.callbacks ?? []).filter((c) => c.state === 'done' || c.state === 'dropped').slice(-5).reverse();
-  const when = (ms: number) => new Date(ms).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+  // (with the day of the month: a call missed last week is not read as this week's; numbers written as people write them)
+  const when = (ms: number) => new Date(ms).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
   const callbackList = h('ul.phone-callbacks',
-    ...waiting.map((c) => h('li', `${c.number}: missed ${when(c.missedAt)}, ${c.state === 'calling' ? 'ringing them now' : c.tries ? `tried ${c.tries}×, next ${when(c.nextAt)}` : 'to call back'}${c.note ? ` (${c.note})` : ''}`)),
-    ...settled.map((c) => h('li.muted', `${c.number}: missed ${when(c.missedAt)}. ${c.note ?? ''}`)),
+    ...waiting.map((c) => h('li', `${displayNumber(c.number)}: missed ${when(c.missedAt)}, ${c.state === 'calling' ? 'ringing them now' : c.tries ? `tried ${c.tries}×, next ${when(c.nextAt)}` : 'to call back'}${c.note ? ` (${c.note})` : ''}`)),
+    ...settled.map((c) => h('li.muted', `${displayNumber(c.number)}: missed ${when(c.missedAt)}. ${c.note ?? ''}`)),
   );
   callbackList.hidden = !waiting.length && !settled.length;
 

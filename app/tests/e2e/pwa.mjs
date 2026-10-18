@@ -482,7 +482,7 @@ try {
   await check('Reload asks first when the page would object to leaving (the agent is at work), and staying sends nothing', async () => {
     // A provider, and a question that the model keeps answering: the agent is at work.
     await page.bringToFront();
-    await page.click('button[title="AI providers"]');
+    await page.click('button.settings-button');
     await page.waitForSelector('dialog.settings[open]');
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click());
     await page.select('dialog.settings select', 'local-other');

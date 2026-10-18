@@ -44,11 +44,21 @@ function siblingFlows(data: any): Flow[] | undefined {
   return flows.length > 0 ? flows : undefined;
 }
 
+/** Parse `text` as JSON, a failure naming the file it came from (`what`): "Unexpected token } in JSON at position
+ * 812" alone did not say which of the flow, --inputs or --constants it was. */
+function parseJson(text: string, what: string): any {
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`${what} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 export function loadFlowFile(file: string): LoadedFlow {
   const ext = path.extname(file).toLowerCase();
   const name = path.basename(file, ext);
   if (ext === '.oaiy') return loadPackage(file, name);
-  const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  const data = parseJson(fs.readFileSync(file, 'utf-8'), file);
   return { graph: normalizeGraph(data), name, flows: siblingFlows(data) };
 }
 
@@ -61,10 +71,14 @@ function loadPackage(file: string, fallbackName: string): LoadedFlow {
 
   const manifestRaw = get('manifest.json');
   if (!manifestRaw) throw new Error('.oaiy: no manifest.json in package');
-  const manifest = JSON.parse(strFromU8(manifestRaw)) as {
+  const manifest = parseJson(strFromU8(manifestRaw), `${file}: manifest.json`) as {
     name?: string;
     entryFlow?: string;
     nodes?: unknown[];
+    /** The package's other flows (paths in it), which its subflow nodes run. */
+    flows?: unknown[];
+    /** Its macros (paths in it), which its macro nodes expand. */
+    macros?: unknown[];
   };
 
   // The CLI doesn't yet compile custom/package node modules, and the engine
@@ -92,8 +106,22 @@ function loadPackage(file: string, fallbackName: string): LoadedFlow {
   const flowRaw = get(entryPath);
   if (!flowRaw) throw new Error(`.oaiy: entryFlow '${entryPath}' not found in package`);
 
-  const flowData = JSON.parse(strFromU8(flowRaw));
+  const flowData = parseJson(strFromU8(flowRaw), `${file}: ${entryPath}`);
   const graph = normalizeGraph(flowData);
+  // Every flow and macro the package carries, for its subflow and macro nodes to resolve by id: loading the entry
+  // flow alone left them nothing to resolve, and an unresolved node falls through (a wrong output as a success).
+  const flows: Flow[] = [...(siblingFlows(flowData) ?? [])];
+  for (const list of [manifest.flows, manifest.macros]) {
+    for (const item of Array.isArray(list) ? list : []) {
+      const at = typeof item === 'string' ? item : typeof (item as any)?.path === 'string' ? (item as any).path : null;
+      if (!at || at === entryPath) continue;
+      const raw = get(at);
+      if (!raw) throw new Error(`.oaiy: '${at}', listed in the manifest, is not in the package`);
+      const data = parseJson(strFromU8(raw), `${file}: ${at}`);
+      const one = Array.isArray(data?.flows) ? siblingFlows(data) ?? [] : data && typeof data.id === 'string' && Array.isArray(data?.graph?.nodes) ? [data as Flow] : [];
+      for (const f of one) if (!flows.some((x) => x.id === f.id)) flows.push(f);
+    }
+  }
   // A .oaiy is a DISTRIBUTABLE artifact and may be untrusted. Its code nodes run
   // where every flow the CLI runs does: on the ZIPP VM in a worker thread with an
   // empty environment (src/engine.ts, createCliEngine), where `process`,
@@ -103,7 +131,7 @@ function loadPackage(file: string, fallbackName: string): LoadedFlow {
   // make (files under the configured roots, HTTP, the media tools) — so a
   // package is trusted with those, not with the process. Custom-node packages
   // are refused above: the CLI does not compile them.
-  return { graph, name: manifest.name || fallbackName };
+  return { graph, name: manifest.name || fallbackName, flows: flows.length > 0 ? flows : undefined };
 }
 
 const INPUT_NODE_TYPES = new Set([
@@ -138,7 +166,7 @@ function splitKv(kv: string, flag: string): [string, string] {
  * `{"0":1,"1":2}`, `{...5}` → `{}`) and fail opaquely at run time — fail loud instead.
  */
 function parseJsonObjectFile(file: string, flag: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  const parsed: unknown = parseJson(fs.readFileSync(file, 'utf-8'), `${flag} ${file}`);
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(
       `${flag} ${file}: expected a JSON object like {"KEY":"value"}, got ${Array.isArray(parsed) ? 'an array' : typeof parsed}`,
@@ -175,4 +203,40 @@ export function gatherConstants(inlineKv: string[], constantsFile?: string): Rec
     out[k] = v;
   }
   return out;
+}
+
+/**
+ * What is wrong with a flow's shape, in words (nothing: it checks): node ids missing or used twice, edges whose ends
+ * are not nodes, nodes with no type. `validate` used to parse only, so an edge to a node that is not there said "ok".
+ */
+export function structureProblems(graph: WorkflowGraph): string[] {
+  const problems: string[] = [];
+  const ids = new Set<string>();
+  for (const [i, n] of graph.nodes.entries()) {
+    if (!n || typeof n.id !== 'string' || !n.id) {
+      problems.push(`node ${i + 1} has no id`);
+      continue;
+    }
+    if (ids.has(n.id)) problems.push(`node id '${n.id}' is used twice`);
+    ids.add(n.id);
+    if (typeof n.type !== 'string' || !n.type) problems.push(`node '${n.id}' has no type`);
+  }
+  for (const [i, e] of graph.edges.entries()) {
+    const label = typeof e?.id === 'string' && e.id ? `edge '${e.id}'` : `edge ${i + 1}`;
+    if (!ids.has(e?.source as string)) problems.push(`${label} comes from '${String(e?.source)}', which is not a node`);
+    if (!ids.has(e?.target as string)) problems.push(`${label} goes to '${String(e?.target)}', which is not a node`);
+  }
+  return problems;
+}
+
+/** The keys of `inputs` that no input node of `graph` has, by its id or its label. */
+export function unknownInputs(graph: WorkflowGraph, inputs: Record<string, unknown>): string[] {
+  const known = new Set<string>();
+  for (const i of discoverInputs(graph)) {
+    known.add(i.id);
+    if (i.label) known.add(i.label);
+  }
+  // (a flow with no input nodes takes its inputs some other way: nothing to warn about)
+  if (known.size === 0) return [];
+  return Object.keys(inputs).filter((k) => !known.has(k));
 }

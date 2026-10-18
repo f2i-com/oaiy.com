@@ -105,4 +105,18 @@ describe("flows in front of the agent's tools", () => {
     expect(vfs.exists('plan.md')).toBe(false);
     expect(runs.map((r) => r.id)).toEqual(['moveTo', 'fetcher']);
   });
+
+  it('a before-flow that does not answer in time is stopped, and holds the tool back', async () => {
+    const cancelled: string[] = [];
+    const desktop = {
+      flows: async () => [{ id: 'guard', name: 'guard' }],
+      flow: async () => guard,
+      runFlow: async () => ({ status: 'running', runId: 'run-7' }),
+      cancelRun: async (id: string) => void cancelled.push(id),
+    } as unknown as Desktop;
+    const [hook] = flowToolHooks((await readFlowStore(desktop)).hooks, () => desktop);
+    const said = await hook.run({ name: 'write_file', input: { path: 'a.txt', content: 'x' } }, new AbortController().signal);
+    expect(cancelled).toEqual(['run-7']);
+    expect(beforeVerdict(said).stop).toContain('did not answer within 2 minutes');
+  });
 });

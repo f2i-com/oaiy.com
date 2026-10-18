@@ -29,6 +29,9 @@ const script = [
   { text: 'Wrote note B in notes/b.txt.' },
   { calls: [{ name: 'update_plan', input: { goal: 'Two notes', items: [{ text: 'Note A', status: 'done' }, { text: 'Note B', status: 'done' }, { text: 'Read them over', status: 'done' }] } }] },
   { text: 'Both notes are written.' },
+  // "Say hello.": the provider fails once (a server error, not retried by itself), then answers when asked again.
+  { fail: 503 },
+  { text: 'Hello again: it worked the second time.' },
 ];
 function sse(step, n) {
   const events = [];
@@ -58,6 +61,11 @@ const model = createHttpServer((req, res) => {
   req.on('end', () => {
     requests.push(JSON.parse(body));
     const step = script[requests.length - 1] ?? { text: 'out of script' };
+    if (step.fail) {
+      res.statusCode = step.fail;
+      res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({ error: { message: 'the model is loading' } }));
+    }
     res.setHeader('content-type', 'text/event-stream');
     res.end(sse(step, requests.length));
   });
@@ -119,7 +127,7 @@ try {
   });
 
   await check('an AI provider is set up in Settings', async () => {
-    await page.click('button[title="AI providers"]');
+    await page.click('button.settings-button');
     await page.waitForSelector('dialog.settings[open]');
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click());
     await page.select('dialog.settings select', 'local-other');
@@ -170,6 +178,20 @@ try {
     expect(plan.finished && plan.count === '3/3', JSON.stringify(plan));
     if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT });
     expect((await terminal(page, 'cat notes/a.txt notes/b.txt', 'AB')).includes('AB'), 'the notes are not there');
+  });
+
+  await check('a run the provider failed offers Try again, which carries on without sending the request twice', async () => {
+    const before = requests.length;
+    await page.type('.chat-input', 'Say hello.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => [...document.querySelectorAll('.chat-log button.retry')].some((b) => b.textContent.includes('Try again')), { timeout: 30_000 }).catch(async () => {
+      throw new Error(`no Try again button:\n${(await page.$eval('.chat-log', (e) => e.textContent)).slice(-400)}`);
+    });
+    await page.evaluate(() => [...document.querySelectorAll('.chat-log button.retry')].find((b) => b.textContent.includes('Try again')).click());
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('it worked the second time'), { timeout: 30_000 });
+    expect(requests.length === before + 2, `requests: ${requests.length - before}`);
+    const asked = JSON.stringify(requests.at(-1).messages).split('Say hello.').length - 1;
+    expect(asked === 1, `the request was sent ${asked} times in the retried conversation`);
   });
 
   await check('the internet chip toggles the gate off and on', async () => {

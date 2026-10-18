@@ -19,6 +19,15 @@ export function readView(vfs: Vfs, hidden: (key: string) => boolean = isOutreach
   const refuse = (path: string): never => {
     throw new VfsError('EINVAL', `'/${key(path)}' is private to the runner: it cannot be changed from here`);
   };
+  // (a folder that holds hidden paths, the root among them, is not copied, moved or removed whole from here: a copy
+  // of `/` showed the outreach results under another name, and removing it took them)
+  const holdsHidden = (path: string): boolean => {
+    const k = key(path);
+    if (hidden(k)) return true;
+    const stat = vfs.stat(path);
+    if (stat?.type !== 'dir') return false;
+    return vfs.walk(path, { includeIgnored: true, limit: Number.MAX_SAFE_INTEGER }).entries.some((e) => hidden(e.path));
+  };
   const view: Partial<Record<keyof Vfs, unknown>> = {
     exists: (path: string) => !hidden(key(path)) && vfs.exists(path),
     stat: (path: string): Stat | null => (hidden(key(path)) ? null : vfs.stat(path)),
@@ -40,9 +49,9 @@ export function readView(vfs: Vfs, hidden: (key: string) => boolean = isOutreach
     files: () => vfs.files().filter(([path]) => !hidden(path)),
     writeFile: (path: string, data: string | Uint8Array, options?: { parents?: boolean; append?: boolean }) => (hidden(key(path)) ? refuse(path) : vfs.writeFile(path, data, options)),
     mkdir: (path: string, recursive?: boolean) => (hidden(key(path)) ? refuse(path) : vfs.mkdir(path, recursive)),
-    remove: (path: string, recursive?: boolean) => (hidden(key(path)) ? refuse(path) : vfs.remove(path, recursive)),
-    rename: (from: string, to: string) => (hidden(key(from)) ? refuse(from) : hidden(key(to)) ? refuse(to) : vfs.rename(from, to)),
-    copy: (from: string, to: string) => (hidden(key(from)) ? gone(from) : hidden(key(to)) ? refuse(to) : vfs.copy(from, to)),
+    remove: (path: string, recursive?: boolean) => (holdsHidden(path) ? refuse(path) : vfs.remove(path, recursive)),
+    rename: (from: string, to: string) => (holdsHidden(from) ? refuse(from) : hidden(key(to)) ? refuse(to) : vfs.rename(from, to)),
+    copy: (from: string, to: string) => (hidden(key(from)) ? gone(from) : holdsHidden(from) ? refuse(from) : hidden(key(to)) ? refuse(to) : vfs.copy(from, to)),
     load: () => {
       throw new VfsError('EINVAL', 'the files cannot be replaced from here');
     },

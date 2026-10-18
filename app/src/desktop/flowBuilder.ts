@@ -164,7 +164,8 @@ export function flowBuilderTools(desktop: () => Desktop | null, toolsChanged: ()
       run: async (input, signal) => {
         const doc = await connected(desktop).flow(String(input.id), signal);
         if (!isRecord(doc)) return 'No such flow.';
-        const nodes = Array.isArray(doc.nodes) ? doc.nodes.filter(isRecord).map((n) => ({ id: n.id, type: n.type, data: n.data })) : [];
+        // (with where each node is in the editor, so writing it back keeps the layout the person made)
+        const nodes = Array.isArray(doc.nodes) ? doc.nodes.filter(isRecord).map((n) => ({ id: n.id, type: n.type, data: n.data, ...(isRecord(n.position) ? { position: n.position } : {}) })) : [];
         return JSON.stringify({ name: doc.name, ...(doc.oaiyTool ? { tool: doc.oaiyTool } : {}), nodes, edges: doc.edges }, null, 1);
       },
     },
@@ -172,12 +173,12 @@ export function flowBuilderTools(desktop: () => Desktop | null, toolsChanged: ()
       spec: {
         name: 'flow_write',
         description:
-          'Write a flow to OAIY Desktop (made, or replaced when the id exists): it then opens in the flow editor, and flow_run runs it. Nodes are {id, type, data} (data holds the node\'s settings by their ids; an input node\'s data.label names its input); edges are {source, sourceHandle, target, targetHandle}, the handles being the node types\' output and input ids. It is checked against the node types first. Give tool {name, description} to make it one of your tools.',
+          'Write a flow to OAIY Desktop (made; or, given the id of one, changed: what you do not pass, its description, tags, sharing, tool and node positions, is kept): it then opens in the flow editor, and flow_run runs it. Nodes are {id, type, data} (data holds the node\'s settings by their ids; an input node\'s data.label names its input); edges are {source, sourceHandle, target, targetHandle}, the handles being the node types\' output and input ids. It is checked against the node types first. Give tool {name, description} to make it one of your tools.',
         parameters: {
           type: 'object',
           required: ['name', 'nodes', 'edges'],
           properties: {
-            id: { type: 'string', description: 'Its id (default: from the name)' },
+            id: { type: 'string', description: "Its id, to change a stored flow (default: a new id from the name, never another flow's)" },
             name: { type: 'string' },
             nodes: { type: 'array', items: { type: 'object' } },
             edges: { type: 'array', items: { type: 'object' } },
@@ -192,9 +193,25 @@ export function flowBuilderTools(desktop: () => Desktop | null, toolsChanged: ()
         const problems = checkFlow(nodes, edges);
         if (problems.length) throw new Error(`the flow was not written:\n- ${problems.join('\n- ')}`);
         const name = String(input.name);
-        const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : slug(name);
+        const d = connected(desktop);
+        const given = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : null;
+        // A flow of its own: an id made from its name that a flow of another name has gets a number (one of this
+        // name is this flow, written again).
+        const listed = await d.flows(signal);
+        const stored = new Set(listed.map((f) => f.id));
+        let id = given ?? slug(name);
+        if (!given) for (let n = 2; listed.some((f) => f.id === id && f.name !== name); n++) id = `${slug(name)}-${n}`;
+        // A flow written again keeps what it is not given: its description, tags, sharing, tool and hooks, and where
+        // its nodes were in the editor.
+        const before = stored.has(id) ? await d.flow(id, signal).catch(() => null) : null;
+        const kept: Record<string, unknown> = isRecord(before) ? { ...before } : {};
+        const placed = new Map<string, { x: number; y: number }>();
+        for (const n of Array.isArray(kept.nodes) ? kept.nodes.filter(isRecord) : []) {
+          if (typeof n.id === 'string' && isRecord(n.position)) placed.set(n.id, n.position as { x: number; y: number });
+        }
+        const laid = nodes.map((n) => (n.position || !placed.has(n.id) ? n : { ...n, position: placed.get(n.id)! }));
         const tool = isRecord(input.tool) && typeof input.tool.name === 'string' ? { name: input.tool.name, description: String(input.tool.description ?? '') } : null;
-        await connected(desktop).putFlow(id, { name, ...(tool ? { oaiyTool: tool } : {}), nodes: layOut(nameTemplateInputs(nodes, edges), edges), edges }, signal);
+        await d.putFlow(id, { ...kept, name, ...(tool ? { oaiyTool: tool } : {}), nodes: layOut(nameTemplateInputs(laid, edges), edges), edges }, signal);
         const inputs = nodes.filter((n) => n.type.startsWith('input_')).map((n) => String(n.data.label ?? n.id));
         // A tool: it is the agent's from its next step.
         if (tool) await toolsChanged().catch(() => {});

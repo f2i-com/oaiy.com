@@ -234,7 +234,7 @@ try {
     expect(!log.includes('Welcome! Set up an AI provider'), 'the welcome still asks for a provider');
     const chip = await page.$eval('button[title="AI provider"]', (b) => b.textContent);
     expect(chip === 'OAIY · qwen3.8-27b', chip);
-    await page.click('button[title="AI providers"]');
+    await page.click('button.settings-button');
     await page.waitForSelector('dialog.settings[open]');
     const media = await page.$eval('.media-settings', (s) => ({ text: s.textContent, inputs: [...s.querySelectorAll('input')].map((i) => i.value) }));
     expect(media.text.includes(`oaiy-studio 0.1.0 at ${new URL(oaiyUrl).origin} (images, video, speech, music, sound effects and 3D models)`), media.text);

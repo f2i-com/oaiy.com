@@ -78,7 +78,8 @@ function blocks(lines: string[]): string {
     if (kind) {
       const item = bullet?.[1] ?? numbered![2];
       const task = /^\[([ xX])\] (.*)$/.exec(item);
-      html += task ? `<li class="task${task[1] === ' ' ? '' : ' done'}"><span class="task-box" aria-hidden="true"></span>${inline(task[2])}</li>` : `<li>${inline(item)}</li>`;
+      // (a task's box is said, done or not, to a screen reader as to the eye)
+      html += task ? `<li class="task${task[1] === ' ' ? '' : ' done'}"><span class="task-box" role="img" aria-label="${task[1] === ' ' ? 'to do' : 'done'}"></span>${inline(task[2])}</li>` : `<li>${inline(item)}</li>`;
       continue;
     }
     const heading = /^(#{1,4}) (.*)$/.exec(raw);

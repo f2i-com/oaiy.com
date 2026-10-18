@@ -12,7 +12,14 @@ import { EMPTY_MEDIA, OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities
 import { newId } from '../vfs/projects';
 import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { clear, h } from './dom';
+import { confirmAction } from './modal';
 import { findOaiyTitle, oaiyFoundWords, oaiyStateOf, pairedTabWords } from './linkWords';
+
+/** Say `text` in a form's note: as a warning (`warn`), or as what was found or done. */
+function say(note: HTMLElement, text: string, warn = false): void {
+  note.textContent = text;
+  note.classList.toggle('warn', warn);
+}
 
 export interface SettingsResult {
   providers: ProviderConfig[];
@@ -141,7 +148,13 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       const kind = h('select', { onchange: () => {
         const k = KINDS.find((x) => x.value === kind.value)!;
         // A key is for the service it came from: never send it to another one.
-        if (k.type !== p.type || k.serverKind !== p.serverKind) p.apiKey = '';
+        if (k.type !== p.type || k.serverKind !== p.serverKind) {
+          p.apiKey = '';
+          // (what the other kind's server said of itself is not this one's: an OAIY that follows its Engines' model
+          // sends no model, and another server answers that with an error)
+          delete p.followEngine;
+          delete p.detectedContext;
+        }
         p.type = k.type;
         p.serverKind = k.serverKind;
         p.baseUrl = defaultBaseUrl(k.type, k.serverKind);
@@ -188,7 +201,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         custom.hidden = !!p.followEngine || known || (!p.modelId && listed.length > 0);
       };
       const loadModels = async (quiet: boolean) => {
-        if (!quiet) note.textContent = 'Asking the server for its models…';
+        if (!quiet) say(note, 'Asking the server for its models…');
         try {
           const found = await listModels(p);
           modelCache.set(cacheKey(p), found);
@@ -196,8 +209,8 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           fillModels(found);
           note.textContent = found.length ? `${found.length} model${found.length === 1 ? '' : 's'} available.` : 'The server listed no models; type one under Other.';
         } catch (error) {
-          if (editing === p && !quiet) note.textContent = (error as Error).message;
-          else if (editing === p) note.textContent = `Could not list models yet: ${(error as Error).message}`;
+          if (editing === p && !quiet) say(note, (error as Error).message, true);
+          else if (editing === p) say(note, `Could not list models yet: ${(error as Error).message}`, true);
         }
       };
       const fetchModels = h('button', { onclick: () => void loadModels(false) }, 'List models');
@@ -221,7 +234,13 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           return;
         }
         windowNote.textContent = 'Asking the server…';
-        const found = await detectContextWindow(p);
+        let found: Awaited<ReturnType<typeof detectContextWindow>>;
+        try {
+          found = await detectContextWindow(p);
+        } catch (error) {
+          windowNote.textContent = (error as Error).message;
+          return;
+        }
         if (found?.guess) {
           windowNote.textContent = `The model is not loaded yet, so its size is not known (Ollama usually loads at ${formatTokens(found.tokens)}). It is read again after the model's first reply; or type the size.`;
           return;
@@ -233,9 +252,9 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       } }, 'Detect');
       showWindow();
       const test = h('button', { onclick: async () => {
-        note.textContent = 'Testing…';
+        say(note, 'Testing…');
         const result = await testProvider(p);
-        note.textContent = result.ok ? (result.replied ? `Works: ${p.modelId} answered.` : 'The server answers; choose a model to finish.') : result.message;
+        say(note, result.ok ? (result.replied ? `Works: ${p.modelId} answered.` : 'The server answers; choose a model to finish.') : result.message, !result.ok);
       } }, 'Test');
       const remove = h('button.danger', { onclick: () => {
         providers = providers.filter((x) => x !== p);
@@ -306,7 +325,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       const oaiyState = oaiyStateOf({ own: looksOnLoad(pageHost()), desktop: context.pairedDesktop ?? null, discovered: media.discovered?.origin, withKey: !!media.apiKey, typed: media.baseUrl });
       const pairedWords = pairedTabWords(oaiyState);
       const find = h('button', { title: findOaiyTitle(oaiyState), onclick: async () => {
-        note.textContent = 'Looking for OAIY…';
+        say(note, 'Looking for OAIY…');
         let where = OAIY_ORIGIN;
         try {
           if (media.baseUrl) where = originOf(media.baseUrl);
@@ -315,7 +334,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         }
         const found = await discoverOaiy(where, media.apiKey).catch((error: unknown) => ({ state: 'absent' as const, origin: where, message: (error as Error).message }));
         if (found.state !== 'found') {
-          note.textContent = found.message;
+          say(note, found.message, true);
           return;
         }
         media = mergeDiscovered(media, found.media);
@@ -339,10 +358,10 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       } }, 'Forget OAIY');
       const listButton = h('button', { title: 'Ask the server which image and video models it has', onclick: async () => {
         if (!media.baseUrl) {
-          note.textContent = 'Give the address first.';
+          say(note, 'Give the address first.', true);
           return;
         }
-        note.textContent = 'Asking the server for its models…';
+        say(note, 'Asking the server for its models…');
         try {
           const found = await listMediaModels(media);
           media.imageModels = found.image.map((id) => media.imageModels.find((m) => m.id === id) ?? { id });
@@ -360,7 +379,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           renderMedia();
           (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `${found.image.length} image, ${found.video.length} video, ${found.speech.length} speech, ${found.music.length} music, ${found.sound.length} sound effects and ${found.model3d.length} 3D models.`;
         } catch (error) {
-          note.textContent = (error as Error).message;
+          say(note, (error as Error).message, true);
         }
       } }, 'List models');
       const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
@@ -409,12 +428,23 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         })(), ' tokens of context (at most the model\'s window)'),
       ),
       mediaSection,
-      h('div.dialog-buttons', h('button', { onclick: () => close(null) }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent, media }) }, 'Save')),
+      h('div.dialog-buttons', h('button', { onclick: () => void leave() }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent, media }) }, 'Save')),
     );
+    // (closed without saving, Escape or Cancel: asked first where something was changed, a key just typed among it)
+    let startedAs = '';
+    const leave = async (): Promise<void> => {
+      if (JSON.stringify({ providers, activeId, agent, media }) !== startedAs && !(await confirmAction({ title: 'Close without saving?', message: 'The changes made here are not saved.', ok: 'Close without saving', danger: true }))) return;
+      close(null);
+    };
     document.body.append(dialog);
     renderList();
     renderForm();
+    // (as the form shows it, once drawn)
+    startedAs = JSON.stringify({ providers, activeId, agent, media });
     dialog.showModal();
-    dialog.addEventListener('cancel', () => close(null));
+    dialog.addEventListener('cancel', (e) => {
+      e.preventDefault();
+      void leave();
+    });
   });
 }

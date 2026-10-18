@@ -223,6 +223,8 @@ export class ChatPane {
     private readonly handlers: {
       submit: (text: string, files: File[]) => void;
       stop: () => void;
+      /** Run the conversation again from where a run failed (the failed request is not sent twice). */
+      retry?: () => void;
       /** A project file's bytes, for showing it (null when it is gone). */
       file: (path: string) => Uint8Array | null;
       /** Open a project file (or, for an unpacked .softn, its app) in the workspace. */
@@ -312,8 +314,10 @@ export class ChatPane {
     this.input.addEventListener('paste', (e) => {
       const pasted = [...(e.clipboardData?.files ?? [])];
       if (!pasted.length) return;
-      // Text copied from a spreadsheet or a page often carries a picture of itself: the text is what was meant.
-      if (e.clipboardData?.getData('text/plain').trim()) return;
+      // Text copied from a spreadsheet or a page often carries a picture of itself (with its HTML): the text is what
+      // was meant. Files copied in Finder carry their names as text, and no HTML: the files are.
+      const types = [...(e.clipboardData?.types ?? [])];
+      if (e.clipboardData?.getData('text/plain').trim() && types.includes('text/html')) return;
       e.preventDefault();
       // A pasted screenshot arrives as "image.png": give it a useful name.
       this.addFiles(pasted.map((f, i) => (f.name === 'image.png' ? new File([f], `pasted-${new Date().toISOString().replace(/[:.]/g, '-')}${i ? `-${i}` : ''}.png`, { type: f.type }) : f)));
@@ -1159,11 +1163,14 @@ export class ChatPane {
   }
 
   /** A message from the app itself (commands, errors, notices): a short one as a quiet line, a long one as a card. */
-  system(text: string, kind: 'info' | 'error' = 'info'): void {
-    this.current = null;
+  system(text: string, kind: 'info' | 'error' = 'info'): HTMLElement {
+    // (a reply being written ends here: drawn whole, a code block it left open closed)
+    this.finishReply();
     const short = !text.includes('\n') && text.length <= 110;
-    this.add(h('div.msg.system', { class: `${kind} ${short ? 'line' : 'card'}${text.includes('\n') ? ' lines' : ''}` }, icon(kind === 'error' ? 'alert' : 'info'), h('pre', text)));
+    const row = h('div.msg.system', { class: `${kind} ${short ? 'line' : 'card'}${text.includes('\n') ? ' lines' : ''}` }, icon(kind === 'error' ? 'alert' : 'info'), h('pre', text));
+    this.add(row);
     this.scroll();
+    return row;
   }
 
   /** Run `draw` soon (see STREAM_REDRAW_MS), once for however many calls for the same box came before it ran (each box is drawn: a replayed conversation has many). */
@@ -1242,7 +1249,7 @@ export class ChatPane {
         { title: `${call.name}${summarizeCall(call) ? `: ${summarizeCall(call)}` : ''}` },
         h('span.tool-status', { role: 'img', 'aria-label': 'running' }),
         icon(toolIcon(call.name), 'tool-icon'),
-        h('span.tool-name', toolLabel(call.name)),
+        h('span.tool-name', toolLabel(call.name, call.input)),
         h('span.tool-arg', summarizeCall(call)),
         h('span.tool-time'),
         ...(prompt ? [h('span.tool-prompt', { title: prompt }, prompt)] : []),
@@ -1638,40 +1645,44 @@ export class ChatPane {
         this.setActivity('');
         break;
       case 'error':
-        this.runError(e.message, !via);
+        this.runError(e.message, !via && e.retry === true);
         break;
     }
   }
 
   /** A note with something to do beside it: a call that came in while the person was writing, Show it. */
   systemAction(text: string, label: string, run: () => void): void {
-    this.system(text);
-    const row = this.feed.lastElementChild;
-    if (!(row instanceof HTMLElement) || !row.matches('.msg.system')) return;
+    const row = this.system(text);
     row.append(h('button.retry', { type: 'button', onclick: (ev: Event) => {
       (ev.currentTarget as HTMLElement).remove();
       run();
     } }, h('span', label)));
   }
 
-  /** A run's error, with a way to try again: the person's last message sent again (not in a phone conversation). */
+  /**
+   * A run's error, with a way to try again where trying again can help (the model or its connection failed, not a
+   * step limit or a check): the run carried on from where it stopped, its request not sent twice. Not in a phone
+   * conversation.
+   */
   private runError(message: string, retry: boolean): void {
-    this.system(message, 'error');
+    const row = this.system(message, 'error');
+    if (!retry || this.kind !== 'own' || !this.handlers.retry) return;
     const again = this.lastSent;
-    if (!retry || !again || this.kind !== 'own') return;
-    const row = this.feed.lastElementChild;
-    if (!(row instanceof HTMLElement) || !row.matches('.msg.system')) return;
-    row.append(h('button.retry', { type: 'button', title: `Send "${again.length > 60 ? `${again.slice(0, 60)}…` : again}" again`, onclick: (ev: Event) => {
+    row.append(h('button.retry', { type: 'button', title: again ? `Carry on with "${again.length > 60 ? `${again.slice(0, 60)}…` : again}" from where it stopped` : 'Carry on from where it stopped', onclick: (ev: Event) => {
       if (this.busy) return;
       (ev.currentTarget as HTMLElement).remove();
-      this.handlers.submit(again, []);
+      this.handlers.retry?.();
     } }, icon('refresh'), h('span', 'Try again')));
   }
 
   /** The reply being written, drawn whole (a code block it left open is closed): the next words are a new reply. */
   private finishReply(): void {
     const reply = this.current;
-    if (reply) reply.body.innerHTML = renderMarkdown(reply.text, true);
+    if (reply) {
+      // (a redraw still queued for it would draw it unfinished again, its code block open)
+      this.redraws.delete(reply.box);
+      reply.body.innerHTML = renderMarkdown(reply.text, true);
+    }
     this.current = null;
   }
 

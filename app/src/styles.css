@@ -92,7 +92,7 @@
   --on-accent: #fff;
   --ok: #218450;
   --warn: #9c6a08;
-  --err: #e94b3c;
+  --err: #c43a2c;
   --cyan: #1675b9;
   --magenta: #c2410c;
   --on-signal: #fff;
@@ -126,7 +126,7 @@
   --syn-keyword: #6d28d9;
   --syn-string: #1f7a4c;
   --syn-number: #b45309;
-  --syn-comment: #8a847a;
+  --syn-comment: #6f6a62;
   --syn-function: #1d4ed8;
   --syn-type: #0e7490;
   --syn-property: #9d174d;
@@ -779,7 +779,9 @@ dialog h2 { margin: 0 0 4px; }
 .model-picker { display: flex; gap: 6px; }
 .model-picker select { flex: 1; min-width: 0; }
 .model-picker input { flex: 1; min-width: 0; }
-.form-note { font-size: 12.5px; color: var(--warn); white-space: pre-wrap; }
+.form-note { font-size: 12.5px; color: var(--muted); white-space: pre-wrap; }
+/* (a note that warns says so: one that reports what was found or done is not coloured as a warning) */
+.form-note.warn { color: var(--warn); }
 
 /* ---------- any screen: tablets and phones ---------- */
 #app { height: 100dvh; }
@@ -980,10 +982,11 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 @media (max-width: 420px) {
   .template-start .template-grid { grid-template-columns: 1fr; }
 }
-/* A short window: tighter, and the explanation gives way to the form. */
+/* A short window: tighter, and the explanation gives way to the form (a dialog with a form: a question whose only
+   words are its explanation keeps them). */
 @media (max-height: 560px) {
   .modal-head { padding-top: 12px; padding-bottom: 8px; }
-  .modal-head .modal-message { display: none; }
+  .modal-head:has(+ .modal-body:not(:empty)) .modal-message { display: none; }
   .modal-body { gap: 10px; }
   footer.dialog-buttons { padding-top: 8px; padding-bottom: 10px; }
   .where-hint { display: none; }

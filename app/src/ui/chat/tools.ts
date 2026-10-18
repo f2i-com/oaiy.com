@@ -158,7 +158,11 @@ export function toolLabel(name: string, input?: Record<string, unknown>): string
       case 'network_setup': if (input.enabled === false) return 'Switched off OAIY Network'; break;
       case 'network_pin': if (input.pin === false) return 'Let a pinned model go'; break;
       case 'network_approve': return input.approve === false ? 'Denied a pairing request' : 'Approved a pairing request';
-      case 'network_pair': if (typeof input.pairingId === 'string' && !input.node && !input.address) return 'Waited for a pairing'; break;
+      case 'network_pair':
+        if (input.codeConfirmed === true) return 'Confirmed a pairing code';
+        if (input.codeConfirmed === false) return 'Gave up a pairing';
+        if (typeof input.pairingId === 'string' && !input.node && !input.address) return 'Waited for a pairing';
+        break;
     }
   }
   const known = TOOLS[base]?.[0];

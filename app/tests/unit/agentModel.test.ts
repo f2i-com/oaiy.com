@@ -276,7 +276,8 @@ describe('signed out of ChatGPT (428)', () => {
     await agent.run('Set up my business phone', (e) => events.push(e));
     expect(fake.bodies).toHaveLength(1);
     expect(fake.urls[0]).toContain('/api/ai/providers/openai-codex-agent/v1/chat/completions');
-    expect(events.filter((e) => e.type === 'error')).toEqual([{ type: 'error', message: CHATGPT_SIGN_IN }]);
+    // (offered again once signed in: Try again carries on from it)
+    expect(events.filter((e) => e.type === 'error')).toEqual([{ type: 'error', message: CHATGPT_SIGN_IN, retry: true }]);
   });
 });
 
@@ -295,7 +296,7 @@ describe('what must be ready before a run', () => {
     });
     await agent.run('hello', (e) => events.push(e));
     expect(fake.bodies).toHaveLength(0);
-    expect(events).toEqual([{ type: 'error', message: CHATGPT_SIGN_IN }]);
+    expect(events).toEqual([{ type: 'error', message: CHATGPT_SIGN_IN, retry: true }]);
     // Never "has no model chosen": the model is looked up before, or the sign-in is asked for.
     expect(JSON.stringify(events)).not.toMatch(/no model chosen/);
   });

@@ -85,7 +85,12 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
   if (!model || provider.type === 'anthropic') return null;
   const endpoints = providerEndpoints(provider);
   const headers = providerHeaders(provider);
-  const origin = new URL(endpoints.chat).origin;
+  let origin: string;
+  try {
+    origin = new URL(endpoints.chat).origin;
+  } catch {
+    throw new Error('The address must start with http:// or https://');
+  }
   const attempts: Array<() => Promise<{ tokens: number; how: string; guess?: boolean } | null>> = [];
   const isOllama = provider.serverKind === 'ollama' || /:11434$/.test(origin);
   if (isOllama) {

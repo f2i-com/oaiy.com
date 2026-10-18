@@ -2829,6 +2829,9 @@ export class Sessions {
   stop(session: Session): void {
     session.controller?.abort();
     session.waiting = [];
+    // (a flow waiting on a task this stops is told so, rather than left waiting; and an orphaned answer is not taken
+    // by the next task asked in the same words)
+    for (const answer of session.answers?.splice(0) ?? []) answer.settle('', 'the task was stopped before the agent answered');
     // Taken out in place: a lane being pumped goes on with the same array, and what is added to it later is run.
     for (const lane of [this.queue, this.callQueue]) {
       const at = lane.indexOf(session);
@@ -2888,7 +2891,26 @@ export class Sessions {
     this.list.sort((a, b) => b.lastAt - a.lastAt);
   }
 
-  private async saveIndex(): Promise<void> {
+  /** The list's last write (settled either way), and the write asked for after it that has not started yet. */
+  private indexChain: Promise<void> = Promise.resolve();
+  private indexNext: Promise<void> | null = null;
+
+  /**
+   * Write the list of conversations: one write at a time (two at once can fail, or land older last), each with the
+   * list as it is when it starts, so the asks that came while one waited share the next.
+   */
+  private saveIndex(): Promise<void> {
+    if (this.indexNext) return this.indexNext;
+    const next = this.indexChain.then(() => {
+      this.indexNext = null;
+      return this.writeIndex();
+    });
+    this.indexNext = next;
+    this.indexChain = next.catch(() => {});
+    return next;
+  }
+
+  private async writeIndex(): Promise<void> {
     await this.project.saveSessions(this.list.map(({ id, kind, key, title, lastAt, unread, handles, thread, hidden, vouched }) => ({ id, kind, key, title, lastAt, unread, ...(handles?.length ? { handles } : {}), thread, ...(hidden ? { hidden } : {}), ...(vouched ? { vouched } : {}) })));
   }
 }
@@ -2902,6 +2924,8 @@ export class DesktopEvents {
   private since: number | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
+  /** The desktop did not answer at the last look: it may have restarted since, its events numbered from 0 again. */
+  private lapsed = false;
   /** The last problem reaching the desktop (cleared when it answers). */
   problem = '';
 
@@ -2929,6 +2953,12 @@ export class DesktopEvents {
     this.timer = null;
   }
 
+  /** Start over at the stream's end (another desktop paired: its events are numbered its own way). */
+  forget(): void {
+    this.since = null;
+    this.lapsed = false;
+  }
+
   /** Look now (a test, or right after pairing). */
   async tick(): Promise<void> {
     if (this.timer) clearTimeout(this.timer);
@@ -2952,9 +2982,29 @@ export class DesktopEvents {
           }
           this.since = since;
         } else {
-          const { events, next } = await desktop.events(this.since);
-          this.since = next;
-          for (const e of events) await this.handle(e);
+          // Back after the desktop did not answer: a desktop that restarted numbers its events from 0 again, and
+          // asking for those after the last one seen here would hear nothing until it passed that number. Its
+          // events (fewer than a page) all came after it restarted: new here.
+          if (this.lapsed) {
+            this.lapsed = false;
+            let latest = 0;
+            for (let pages = 0; pages < 10; pages++) {
+              const page = await desktop.events(latest);
+              if (!page.events.length || page.next <= latest) break;
+              latest = page.next;
+            }
+            if (latest < this.since) this.since = 0;
+          }
+          const { events } = await desktop.events(this.since);
+          // (each handled on its own: one that fails does not take the rest of its page with it)
+          for (const e of events) {
+            try {
+              await this.handle(e);
+            } catch (error) {
+              console.error('a desktop event could not be handled', e.name, error);
+            }
+            this.since = Math.max(this.since ?? 0, e.seq);
+          }
         }
         if (this.problem) {
           this.problem = '';
@@ -2962,6 +3012,7 @@ export class DesktopEvents {
         }
       } catch (error) {
         const message = (error as Error).message || 'OAIY Desktop did not answer';
+        this.lapsed = true;
         if (message !== this.problem) {
           this.problem = message;
           this.status(message);

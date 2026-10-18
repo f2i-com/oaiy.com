@@ -78,4 +78,24 @@ describe('the agent builds flows', () => {
     expect(await tools.flow_run.run({ id: 'greet-a-person', input: { person: 'Sam' } }, signal)).toBe('Hello Sam!');
     expect(await tools.flow_list.run({}, signal)).toBe('greet-a-person: Greet a person');
   });
+
+  it("changes a stored flow keeping what it is not given, and never writes over another flow of a like name", async () => {
+    const stored: Array<[string, Record<string, unknown>]> = [];
+    const saved = { name: 'Greet a person', description: 'Says hello', tags: ['demo'], oaiyRemote: true, oaiyTool: { name: 'greet', description: 'Greets' }, nodes: greeting.nodes.map((n, i) => ({ ...n, position: { x: 900 + i, y: 7 } })), edges: greeting.edges };
+    const desktop = {
+      putFlow: async (id: string, doc: Record<string, unknown>) => void stored.push([id, doc]),
+      flows: async () => [{ id: 'greet-a-person', name: 'Greet a person' }, { id: 'greet', name: 'Greet' }],
+      flow: async (id: string) => (id === 'greet-a-person' ? saved : { name: 'Greet', nodes: [], edges: [] }),
+    } as unknown as Desktop;
+    const tools = Object.fromEntries(flowBuilderTools(() => desktop).map((t) => [t.spec.name, t]));
+    await tools.flow_write.run({ id: 'greet-a-person', name: 'Greet a person', ...greeting }, signal);
+    const [, doc] = stored[0];
+    expect(doc).toMatchObject({ description: 'Says hello', tags: ['demo'], oaiyRemote: true, oaiyTool: { name: 'greet', description: 'Greets' } });
+    expect((doc.nodes as Array<{ position: { x: number } }>)[0].position.x).toBe(900);
+    // the read gives the positions back
+    expect(await tools.flow_read.run({ id: 'greet-a-person' }, signal)).toContain('"position"');
+    // "Greet!" makes "greet", which another flow ("Greet") has: a number of its own
+    const out = await tools.flow_write.run({ name: 'Greet!', ...greeting }, signal);
+    expect(out).toContain('Wrote flow greet-2 ');
+  });
 });

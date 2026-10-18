@@ -173,7 +173,7 @@ try {
   });
 
   await check('the agent reads the guide, edits the page and checks it', async () => {
-    await page.click('button[title="AI providers"]');
+    await page.click('button.settings-button');
     await page.waitForSelector('dialog.settings[open]');
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click());
     await page.select('dialog.settings select', 'local-other');

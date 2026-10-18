@@ -75,6 +75,9 @@ export function showContactCard(host: HTMLElement, anchor: HTMLElement, load: ()
   };
   const key = (e: KeyboardEvent) => {
     if (e.key === 'Escape') {
+      // (this Escape is the card's: it does not also stop the agent or close what is under it)
+      e.preventDefault();
+      e.stopPropagation();
       close();
       anchor.focus();
     }
@@ -91,6 +94,8 @@ export function showContactCard(host: HTMLElement, anchor: HTMLElement, load: ()
   anchor.setAttribute('aria-expanded', 'true');
   document.addEventListener('pointerdown', away, true);
   document.addEventListener('keydown', key, true);
+  // (the keyboard is taken to the card, as to a dialog, and the reader reads it)
+  card.focus({ preventScroll: true });
   void load().then(
     (data) => {
       if (!card.isConnected) return;

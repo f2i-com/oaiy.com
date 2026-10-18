@@ -339,10 +339,13 @@ export class OpenProject {
     this.timer = setTimeout(() => void this.flush(), 300);
   }
 
-  /** Whether changes are waiting to be written. */
+  /** Whether changes are waiting to be written, or being written now. */
   get dirty(): boolean {
-    return this.pending.size > 0 || this.timer !== null;
+    return this.pending.size > 0 || this.timer !== null || this.writing > 0;
   }
+
+  /** Batches handed to the disk that have not landed yet (a flush empties `pending` before they do). */
+  private writing = 0;
 
   private retries = 0;
   private lastErrorAt = 0;
@@ -356,8 +359,14 @@ export class OpenProject {
     const batch = [...this.pending.values()];
     this.pending.clear();
     if (!batch.length) return this.flushing;
+    this.writing++;
     this.flushing = this.flushing.then(async () => {
-      const failed = await this.write(batch);
+      let failed: Awaited<ReturnType<typeof this.write>>;
+      try {
+        failed = await this.write(batch);
+      } finally {
+        this.writing--;
+      }
       if (!failed.length) {
         this.retries = 0;
         return;

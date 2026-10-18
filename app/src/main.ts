@@ -47,7 +47,7 @@ import { clear, h } from './ui/dom';
 import { EditorPane } from './ui/editor';
 import { oaiyProvider, openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
-import { Preview } from './preview/preview';
+import { Preview, type PreviewTarget } from './preview/preview';
 import { findPages, isPagePath } from './preview/page';
 import { isModelPath } from './preview/model';
 import { exampleBundle, exampleCatalogue, warmKnowledge } from './softn/knowledge';
@@ -279,7 +279,7 @@ async function main(): Promise<void> {
    * first and keep their names; no name reaches the model twice. With none
    * listed (no desktop, or an older one), the tools are exactly as they were.
    */
-  const withControl = (kind: AgentKind, own: SessionTool[]): SessionTool[] => withControlTools(own, kind, () => control, builtInToolNames, controlChanged);
+  const withControl = (kind: AgentKind, own: SessionTool[]): SessionTool[] => withControlTools(own, kind, () => control, builtInToolNames, controlChanged, () => project.vfs);
   /** A change the Agent made to OAIY that this page follows: the Agent's own model, or the ChatGPT sign-in. */
   const controlChanged = (tool: string): void => {
     if (tool === 'agent_model_set' || tool === 'chatgpt_sign_in' || tool === 'chatgpt_sign_out') {
@@ -354,9 +354,14 @@ async function main(): Promise<void> {
   const chat = new ChatPane({
     submit: (text, files) => (viewing ? sessionSubmit(text, files) : void submit(text, files)),
     stop: () => (viewing ? stopViewed() : controller?.abort()),
+    // (a run that failed carries on from where it stopped: its request is not sent again)
+    retry: () => {
+      if (!viewing && !currentRun) void submit('', [], true, true);
+    },
+    // (a phone conversation's files are the Front desk's, shown while it is)
     file: (path) => {
       try {
-        return project.vfs.readBytes(`/${path}`);
+        return (shownFiles ?? project).vfs.readBytes(`/${path}`);
       } catch {
         return null;
       }
@@ -479,16 +484,22 @@ async function main(): Promise<void> {
   };
 
   const projectSelect = h('select.project-select', { title: 'Project' });
+  /** The way the gate was on before the chip switched it off, to switch it on again the same way. */
+  let gateOnMode: typeof gate.mode = gate.mode === 'blocked' ? 'open' : gate.mode;
   // The chip is the gate's switch: on (open) ⇄ off (blocked). Allowlists and
   // per-host rules stay with /internet.
   const gateChip = h('button.chip.toggle', {
     title: 'Network gate: click to turn the sandbox\'s internet access on or off (/internet for allow/deny lists and status)',
     role: 'switch',
     onclick: () => {
-      gate.setMode(gate.mode === 'blocked' ? 'open' : 'blocked');
+      // (switched back on as it was: an allowlist stays an allowlist, not the whole internet)
+      if (gate.mode !== 'blocked') gateOnMode = gate.mode;
+      gate.setMode(gate.mode === 'blocked' ? gateOnMode : 'blocked');
       chat.system(gate.mode === 'blocked'
         ? 'Internet off: sandboxed code and web_fetch cannot reach any host. Your AI provider still works.'
-        : 'Internet on: sandboxed code and web_fetch may reach any host not on the deny list.');
+        : gate.mode === 'open'
+          ? 'Internet on: sandboxed code and web_fetch may reach any host not on the deny list.'
+          : 'Internet on, to the allowed hosts only (/internet lists them).');
     },
   });
   const providerChip = h('button.chip.model', { title: 'AI provider', onclick: () => void editSettings() });
@@ -694,8 +705,8 @@ async function main(): Promise<void> {
       const egpu = engineFound?.llm.egpu;
       const chosen = agentProvider('project')?.modelId === model;
       if (!chosen || Date.now() > until) return;
-      if (egpu?.model === model && egpu.state === 'ready') return chat.system(`${model} is loaded on the eGPU.`);
-      if (egpu?.model === model && egpu.state === 'failed') return chat.system(`${model} did not load on the eGPU: Engines → Logs says why.`, 'error');
+      if (egpu?.model === model && egpu.state === 'ready') return void chat.system(`${model} is loaded on the eGPU.`);
+      if (egpu?.model === model && egpu.state === 'failed') return void chat.system(`${model} did not load on the eGPU: Engines → Logs says why.`, 'error');
       // (not begun within half a minute: it loads with the next message instead, as the engines' log says)
       if (egpu?.state !== 'starting' && Date.now() - begun > 30_000) return;
       await new Promise((r) => setTimeout(r, 3000));
@@ -1238,10 +1249,23 @@ async function main(): Promise<void> {
     chat.system(`Opened "${imported.name}": ${imported.files.length} files.${imported.skipped.length ? ` Skipped ${imported.skipped.length} (dependency/build folders or over the size limit): ${imported.skipped.slice(0, 8).join(', ')}${imported.skipped.length > 8 ? ', …' : ''}` : ''}`);
   };
 
-  const fileInput = (accept: string, directory: boolean, onFiles: (files: FileList) => void) => {
+  /** Bring files or a folder in as a project, saying while it reads them, and saying why where it could not. */
+  const importing = async (read: () => Promise<Imported | null>) => {
+    const note = chat.system('Importing…');
+    try {
+      await newProjectFrom(await read());
+    } catch (error) {
+      if ((error as Error)?.name === 'AbortError') return;
+      chat.system(`The import did not work: ${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      note.remove();
+    }
+  };
+
+  const fileInput = (accept: string, directory: boolean, onFiles: (files: FileList) => void | Promise<void>) => {
     const input = h('input', { type: 'file', accept, style: 'display:none' });
     if (directory) input.setAttribute('webkitdirectory', '');
-    input.addEventListener('change', () => input.files && onFiles(input.files));
+    input.addEventListener('change', () => void (input.files && onFiles(input.files)));
     document.body.append(input);
     input.click();
     setTimeout(() => input.remove(), 60_000);
@@ -1354,14 +1378,15 @@ async function main(): Promise<void> {
 
   /** A file (or an unpacked .softn's app) clicked in the chat. */
   function openFromChat(path: string, app?: string): void {
-    if (app !== undefined && project.vfs.exists(`/${app}`)) {
+    const place = shownFiles ?? project;
+    if (app !== undefined && place.vfs.exists(`/${app}`)) {
       preview.setApp(app);
       showPane('preview');
       if (window.matchMedia('(max-width: 900px)').matches) showView('preview');
       return;
     }
-    if (!project.vfs.exists(`/${path}`)) {
-      chat.system(`${path} is no longer in the project.`, 'error');
+    if (!place.vfs.exists(`/${path}`)) {
+      chat.system(`${path} is no longer in ${place === frontDesk ? 'the Front desk' : 'the project'}.`, 'error');
       return;
     }
     showPane('editor');
@@ -1376,8 +1401,8 @@ async function main(): Promise<void> {
     chat.restore(text, files);
   }
 
-  async function submit(text: string, files: File[] = [], shown = false): Promise<void> {
-    if (text.startsWith('/') && !files.length) {
+  async function submit(text: string, files: File[] = [], shown = false, again = false): Promise<void> {
+    if (!again && text.startsWith('/') && !files.length) {
       const [command, ...args] = text.slice(1).trim().split(/\s+/);
       switch (command.toLowerCase()) {
         case 'internet': case 'net':
@@ -1389,6 +1414,8 @@ async function main(): Promise<void> {
             return;
           }
           agent.reset();
+          // (the meter of the conversation before is not this one's)
+          lastContext.delete(agent);
           chat.clearLog();
           await project.saveChat([]);
           chat.system('New conversation. The project\'s files are unchanged.');
@@ -1453,8 +1480,10 @@ async function main(): Promise<void> {
         void runProject.saveChat(runAgent.savedTurns()).catch(() => {});
       }, 1500);
     };
-    // Events this run's conversation missed while another was shown (a call's): drawn again whole when it ends.
+    // Events this run's conversation missed while another was shown (a call's): drawn again whole when it ends. Its
+    // last error or notice is kept, as the turns drawn again do not hold it (and its Try again goes with it).
     let missed = false;
+    let ending: AgentEvent | null = null;
     try {
       let prompt = text;
       let images: ImagePart[] = [];
@@ -1480,6 +1509,7 @@ async function main(): Promise<void> {
         // A run stopped by a project switch finishes quietly: the chat now shows another project.
         noteModelEvent(event);
         if (event.type === 'context') lastContext.set(runAgent, { used: event.used, window: event.window });
+        if (event.type === 'error' || event.type === 'notice') ending = event;
         if (project !== runProject) return;
         if (viewing !== null) {
           missed = true;
@@ -1496,7 +1526,7 @@ async function main(): Promise<void> {
           previewShown = true;
           if (!window.matchMedia('(max-width: 900px)').matches) showPane('preview');
         }
-      }, controller.signal, images, attachments);
+      }, controller.signal, images, attachments, again);
     } finally {
       if (saveTimer) clearTimeout(saveTimer);
       controller = null;
@@ -1505,6 +1535,13 @@ async function main(): Promise<void> {
         if (missed) {
           chat.replay(runAgent.turns);
           showLastContext();
+          if (ending) {
+            try {
+              chat.event(ending);
+            } catch {
+              /* drawn or not, the run is over */
+            }
+          }
         }
         chat.setBusy(false);
       }
@@ -1766,10 +1803,10 @@ A project can hold several apps, each in its own folder (any folder whose manife
       if (name) await openProject(await createProject(name));
     } }, 'New'),
     h('button', { title: 'Open a folder from this computer (a copy is kept in the browser)', onclick: async () => {
-      if (canPickFolder()) await newProjectFrom(await importFolder());
-      else fileInput('', true, async (files) => newProjectFrom(await importFileList(files)));
+      if (canPickFolder()) await importing(() => importFolder());
+      else fileInput('', true, (files) => importing(() => importFileList(files)));
     } }, 'Open folder…'),
-    h('button', { title: 'Import a .zip as a new project', onclick: () => fileInput('.zip,application/zip', false, async (files) => newProjectFrom(await importZip(files[0]))) }, 'Import .zip'),
+    h('button', { title: 'Import a .zip as a new project', onclick: () => fileInput('.zip,application/zip', false, (files) => importing(() => importZip(files[0]))) }, 'Import .zip'),
     h('button', { title: 'Download this project as a .zip', onclick: async () => {
       downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), exportFiles());
     } }, 'Export .zip'),
@@ -1806,7 +1843,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     gateChip,
     providerChip,
     modelPick,
-    h('button.settings-button', { title: 'AI providers', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),
+    h('button.settings-button', { title: 'Settings: AI providers, the agent, and images, video and audio', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),
   );
   projectSelect.addEventListener('change', async () => {
     const meta = projectSelect.value === FRONT_DESK.id ? frontDesk.meta : (await listProjects()).find((m) => m.id === projectSelect.value);
@@ -2286,6 +2323,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   /** Show a conversation: the project's own (null), or a text-message thread. */
   /** The place whose files the panels show: the open project, or the front desk. */
   let shownFiles: OpenProject | null = null;
+  /** How each place's files were left in the panels, to show them so again. */
+  const placeViews = new WeakMap<OpenProject, { tree: FileTree['shown']; open: string | null; preview: PreviewTarget | null }>();
 
   /**
    * Show a place's files in the tree, the editor, the terminal and the preview:
@@ -2294,13 +2333,21 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
    */
   function showFiles(place: OpenProject): void {
     if (shownFiles === place) return;
-    if (shownFiles) editor.flush();
+    if (shownFiles) {
+      editor.flush();
+      // (as it was left: the file open, the folders open and what was previewed, when it is shown again)
+      placeViews.set(shownFiles, { tree: tree.shown, open: editor.openPath, preview: preview.target });
+    }
     shownFiles = place;
     unsubscribe?.();
-    tree.setVfs(place.vfs);
+    const was = placeViews.get(place);
+    tree.setVfs(place.vfs, was?.tree);
     editor.setVfs(place.vfs);
+    if (was?.open && place.vfs.exists(was.open)) editor.open(was.open);
     terminal.setVfs(place.vfs);
     preview.setVfs(place.vfs);
+    const target = was?.preview;
+    if (target && (target.kind === 'app' ? !target.root || place.vfs.exists(`/${target.root}`) : place.vfs.exists(`/${target.path}`))) preview.show(target);
     tree.setPlace(place === frontDesk ? frontDesk.meta.name : null);
     unsubscribe = place.vfs.onChange((change) => {
       tree.refresh();
@@ -2362,6 +2409,11 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     if (command === 'clear') {
       if (thread.live) {
         chat.system('Not during a call: clear this conversation once the call has ended.', 'error');
+        return;
+      }
+      // (a run going on would save what it wrote into the conversation cleared: stopped first, as the project's is)
+      if (thread.running) {
+        chat.system('The agent is working here: stop it first, then start this conversation again.', 'error');
         return;
       }
       for (const lane of thread.lanes) {
@@ -2741,6 +2793,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         desktop = d ? new Desktop(d.origin, d.token) : null;
         void saveDesktop(d);
         desktopEvents.stop();
+        desktopEvents.forget();
         // Another desktop (or none): its own control API, and its own choice of the Agent's model.
         control = desktop && canDo('control') ? new ControlClient(desktop.origin, desktop.token) : null;
         codexDefault = null;
@@ -2764,7 +2817,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         void sessions?.textArrived(TEST_NUMBER, 'Test', body).then((session) => selectSession(session.thread));
       },
       // The phone refusing who is answered (a pattern it cannot read, or the phone gone) is said, and the rest is still saved.
-      screening: desktop && phoneOn() ? { load: readScreening, save: (s) => saveScreening(s).catch((e: unknown) => chat.system(`The phone did not take who is answered: ${(e as Error).message}`, 'error')) } : undefined,
+      screening: desktop && phoneOn() ? { load: readScreening, save: (s) => saveScreening(s).catch((e: unknown) => void chat.system(`The phone did not take who is answered: ${(e as Error).message}`, 'error')) } : undefined,
       callbacks: phoneOn() ? callbacks?.list : undefined,
     });
     if (saved) {
@@ -2876,6 +2929,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   const saveNow = () => {
     editor.flush();
     void project.flush();
+    // (the Front desk's brief and knowledge too, written to while another project is open)
+    if (frontDesk && frontDesk !== project) void frontDesk.flush();
     void project.saveChat(agent.savedTurns()).catch(() => {});
   };
   document.addEventListener('visibilitychange', () => {
@@ -2890,6 +2945,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         controller?.abort();
         editor.flush();
         await project.flush();
+        if (frontDesk && frontDesk !== project) await frontDesk.flush();
         await project.saveChat(agent.savedTurns());
       } finally {
         await (window as unknown as { __TAURI_INTERNALS__?: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__?.invoke('ready_to_quit');
@@ -2899,7 +2955,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   window.addEventListener('beforeunload', (e) => {
     saveNow();
     // Not when the person just agreed to leave (chose Reload for an update, which asked them, pwa/leaveGuard.ts).
-    if ((controller || project.dirty) && !agreedToLeave()) e.preventDefault();
+    if ((controller || project.dirty || (frontDesk && frontDesk.dirty)) && !agreedToLeave()) e.preventDefault();
   });
   chat.focus();
   // The SoftN reference loads on first use; fetch it now so it is cached for offline use.

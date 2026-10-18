@@ -115,6 +115,59 @@ try {
   assert.ok(timed.elapsed < 10_000, `the abort took ${timed.elapsed} ms`);
   assert.doesNotMatch(timed.stderr, /Assertion failed/);
   console.log(`PASS: --timeout aborts the run (${timed.elapsed} ms) and the worker thread does not outlive the process`);
+
+  // --- 5. --timeout ends the process while an HTTP request still waits -------
+  // The request has a timer of its own (minutes); the result is written at the
+  // timeout and the process ends then, not when that request gives up.
+  const http = await import('node:http');
+  const silent = http.createServer(() => { /* never answers */ });
+  silent.listen(0, '127.0.0.1');
+  await once(silent, 'listening');
+  try {
+    const waiting = await writeFlow('waiting.json', `return await Utility.httpRequest('http://localhost:${silent.address().port}/', 'GET', {});`);
+    const hung = await run(waiting, ['--timeout', '2'], {}, 30_000);
+    assert.equal(hung.signal, null, `CLI was still running long after its timeout: ${hung.stderr}`);
+    assert.equal(hung.code, 1);
+    assert.equal(JSON.parse(hung.stdout).errorCode, 'timeout');
+    assert.ok(hung.elapsed < 9_000, `the process ended ${hung.elapsed} ms after starting`);
+    console.log(`PASS: a timed-out run waiting on HTTP still ends the process (${hung.elapsed} ms)`);
+  } finally {
+    silent.closeAllConnections?.();
+    await new Promise((resolve) => silent.close(resolve));
+  }
+
+  // --- 6. Options before the flow, a typo'd input, and validate's checks -----
+  const cliRaw = async (args) => {
+    const child = spawn(process.execPath, [cli, ...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    const [code] = await once(child, 'close');
+    return { code, stdout, stderr };
+  };
+  const echo = path.join(dir, 'echo.json');
+  await fs.writeFile(echo, JSON.stringify({
+    nodes: [
+      { id: 'in', type: 'input_text', position: { x: 0, y: 0 }, data: { label: 'Prompt', value: 'default' } },
+      { id: 'out', type: 'output', position: { x: 200, y: 0 }, data: { value: '$nodes.in' } },
+    ],
+    edges: [{ id: 'e', source: 'in', target: 'out' }],
+  }));
+  const before = await cliRaw(['run', '--input', 'Prompt=hi', '--input', 'Promtp=typo', echo, '--quiet']);
+  assert.equal(before.code, 0, `--input before the flow's path: ${before.stderr}`);
+  assert.match(before.stderr, /--input 'Promtp' matches no input/);
+  assert.doesNotMatch(before.stderr, /\[OAIYRuntime\]|\[Workflow\]/, '--quiet keeps the engine quiet');
+  const broken = path.join(dir, 'broken.json');
+  await fs.writeFile(broken, JSON.stringify({ nodes: [{ id: 'a', type: 'output', position: { x: 0, y: 0 }, data: {} }], edges: [{ id: 'e', source: 'a', target: 'gone' }] }));
+  const checked = await cliRaw(['validate', broken]);
+  assert.equal(checked.code, 1);
+  assert.match(checked.stderr, /edge 'e' goes to 'gone', which is not a node/);
+  const bad = path.join(dir, 'bad.json');
+  await fs.writeFile(bad, '{ "nodes": [ }');
+  const unread = await cliRaw(['validate', bad]);
+  assert.equal(unread.code, 1);
+  assert.match(unread.stderr, new RegExp(`${bad.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is not valid JSON`));
+  console.log('PASS: options go before the flow, a typo\'d input is said, --quiet is quiet, and validate checks edges and names the file');
 } finally {
   await fs.rm(dir, { recursive: true, force: true });
 }

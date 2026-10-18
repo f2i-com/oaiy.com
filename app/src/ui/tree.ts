@@ -48,10 +48,15 @@ export class FileTree {
     this.place.title = place ? `The ${place.toLowerCase()}'s files: what the phone's agent reads` : '';
   }
 
-  setVfs(vfs: Vfs): void {
+  /** The folders open and the file chosen: given back to `setVfs` when these files are shown again. */
+  get shown(): { expanded: string[]; selected: string | null } {
+    return { expanded: [...this.expanded], selected: this.selected };
+  }
+
+  setVfs(vfs: Vfs, shown?: { expanded: string[]; selected: string | null }): void {
     this.vfs = vfs;
-    this.expanded = new Set(['']);
-    this.selected = null;
+    this.expanded = new Set(['', ...(shown?.expanded ?? [])]);
+    this.selected = shown?.selected ?? null;
     this.render();
   }
 
@@ -116,9 +121,18 @@ export class FileTree {
 
   private async rename(path: string): Promise<void> {
     const name = await askText({ title: 'Rename', message: 'A path from the project root: change the folder part to move it.', label: 'New path', value: path.slice(1), ok: 'Rename' });
-    if (!name || `/${name.replace(/^\/+/, '')}` === path) return;
+    const to = `/${name?.replace(/^\/+/, '').replace(/\/+$/, '') ?? ''}`;
+    if (!name || to === path || to === '/') return;
     try {
-      this.vfs.rename(path, `/${name.replace(/^\/+/, '')}`);
+      // (not over a file or folder that is there: a rename does not overwrite or merge)
+      if (this.vfs.exists(to)) {
+        this.onNotice(`${to} is there already: choose another name, or delete that one first.`);
+        return;
+      }
+      // (into a folder that is not there yet: made, as the path asks)
+      const parent = to.slice(0, to.lastIndexOf('/'));
+      if (parent && !this.vfs.exists(parent)) this.vfs.mkdir(parent, true);
+      this.vfs.rename(path, to);
     } catch (error) {
       this.onNotice((error as Error).message);
     }

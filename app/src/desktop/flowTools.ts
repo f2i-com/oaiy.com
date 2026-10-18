@@ -133,7 +133,12 @@ export async function keepFlowFiles(
     const data = /^data:([a-z]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(text);
     if (data && MEDIA_TYPES[data[1].toLowerCase()]) {
       path = place(`${tool}-${saved.length + 1}.${MEDIA_TYPES[data[1].toLowerCase()]}`);
-      vfs.writeFile(`/${path}`, dataBytes(data[2].replace(/\s+/g, '')), { parents: true });
+      try {
+        vfs.writeFile(`/${path}`, dataBytes(data[2].replace(/\s+/g, '')), { parents: true });
+      } catch {
+        // (a picture that could not be kept is said to be one, not lost with the flow's other answers)
+        return text.length > 200 ? `${text.slice(0, 200)}… (a picture the project could not keep)` : text;
+      }
     } else if (/^https?:\/\//i.test(text)) {
       let name = '';
       try {
@@ -142,10 +147,19 @@ export async function keepFlowFiles(
         return text;
       }
       if (!/\.(png|jpe?g|webp|gif|mp4|webm|mp3|wav|ogg|flac)$/i.test(name)) return text;
-      const bytes = await fetchFile(text);
+      // (a file the desktop does not give, or the project cannot keep, stays an address: the rest of what the flow
+      // made is kept, and the tool's answer is not lost for one file)
+      const bytes = await fetchFile(text).catch((error: unknown) => {
+        if ((error as Error)?.name === 'AbortError') throw error;
+        return null;
+      });
       if (!bytes) return text;
       path = place(name);
-      vfs.writeFile(`/${path}`, bytes, { parents: true });
+      try {
+        vfs.writeFile(`/${path}`, bytes, { parents: true });
+      } catch {
+        return text;
+      }
     }
     if (!path) return text;
     saved.push(path);
@@ -251,7 +265,16 @@ export function flowToolHooks(hooks: FlowHook[], desktop: () => Desktop | null):
     run: async (call, signal) => {
       const d = desktop();
       if (!d) throw new Error('OAIY Desktop is not connected, so the flow cannot run');
-      return runOutcome(await d.runFlow(hook.id, hookInputs(hook, call), 120_000, signal));
+      const result = await d.runFlow(hook.id, hookInputs(hook, call), 120_000, signal);
+      const status = String(result.status ?? '');
+      // A flow that did not answer in time is stopped, and a guard that did not answer holds the tool back (it was
+      // read as a note, and the tool it guards went ahead).
+      if (status === 'queued' || status === 'running') {
+        if (typeof result.runId === 'string') await d.cancelRun(result.runId);
+        if (hook.mode === 'before') return `stop: the flow "${hook.flowName}" in front of ${hook.tool} did not answer within 2 minutes, so ${hook.tool} was not run`;
+        throw new Error(`the flow "${hook.flowName}" did not answer within 2 minutes`);
+      }
+      return runOutcome(result);
     },
   }));
 }

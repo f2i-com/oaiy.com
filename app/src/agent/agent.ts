@@ -51,7 +51,8 @@ export type AgentEvent =
   /** The automatic check of a SoftN app after the agent changed it: running, then its outcome. */
   | { type: 'check'; id: string; root: string; state: 'running' | 'ok' | 'failed'; text?: string }
   | { type: 'done'; text: string; steps: number }
-  | { type: 'error'; message: string };
+  /** `retry`: the model or its connection failed, and carrying on from where the run stopped may get past it. */
+  | { type: 'error'; message: string; retry?: boolean };
 
 /** Model requests one run may make: enough to see a big plan through. */
 export const MAX_STEPS = 200;
@@ -1040,8 +1041,13 @@ ${this.instructions}` : ''}`;
     emit: (e: AgentEvent) => void,
     signal?: AbortSignal,
   ): Promise<{ ok: boolean; text: string; files: string[] }> {
+    const files = new Set<string>();
     const child = new Agent({
       ...this.options,
+      // (every file it wrote, whichever tool wrote it: code it ran, a picture it made, as well as write_file's)
+      vfs: trackedVfs(this.options.vfs, (path) => {
+        if (path && this.options.vfs.stat(`/${path}`)?.type !== 'dir') files.add(path);
+      }),
       provider: () => provider,
       tools: this.tools.filter((t) => !MAIN_AGENT_ONLY.has(t.name)),
       guides: [...this.loadedGuides()],
@@ -1051,7 +1057,6 @@ ${this.instructions}` : ''}`;
       subAgents: undefined,
     });
     const calls = new Map<string, ToolCall>();
-    const files = new Set<string>();
     let final = '';
     let failure = '';
     const goal = this.plan?.goal ? `\n\n(The main agent's goal, for context: ${this.plan.goal})` : '';
@@ -1060,9 +1065,6 @@ ${this.instructions}` : ''}`;
         calls.set(e.call.id, e.call);
         const arg = ['path', 'command', 'pattern', 'app', 'url'].map((k) => e.call.input[k]).find((v) => typeof v === 'string') as string | undefined;
         activity(`${e.call.name}${arg ? ` ${arg.split('\n')[0].slice(0, 80)}` : ''}`);
-      } else if (e.type === 'tool_result') {
-        const c = calls.get(e.result.id);
-        if (c && !e.result.isError && /^(write_file|append_file|edit_file|delete_file)$/.test(c.name) && typeof c.input.path === 'string') files.add(c.input.path.replace(/^\/+/, ''));
       } else if (e.type === 'check') {
         emit(e);
       } else if (e.type === 'compact') {
@@ -1778,12 +1780,16 @@ ${this.instructions}` : ''}`;
     return true;
   }
 
-  async run(prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal, images: ImagePart[] = [], attachments: Attachment[] = []): Promise<void> {
+  /**
+   * Run the agent on `prompt`. With `again`, carry on from the conversation as it is instead (a run that failed: its
+   * request is in the turns already, and is not sent twice).
+   */
+  async run(prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal, images: ImagePart[] = [], attachments: Attachment[] = [], again = false): Promise<void> {
     if (this.options.prepare) {
       try {
         await this.options.prepare(signal);
       } catch (error) {
-        if (!signal?.aborted) emit({ type: 'error', message: error instanceof Error ? error.message : String(error) });
+        if (!signal?.aborted) emit({ type: 'error', message: error instanceof Error ? error.message : String(error), retry: true });
         return;
       }
     }
@@ -1795,12 +1801,14 @@ ${this.instructions}` : ''}`;
     this.running = true;
     this.toolContext.signal = signal;
     this.toolContext.progress = (message) => emit({ type: 'status', message });
-    const first = this.turns.length === 0;
-    const text = first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt;
-    const guides = this.guidesFor(prompt);
-    this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
-    const carry = this.carryOver();
-    if (carry) this.turns.push({ role: 'user', text: `[OAIY] ${carry}`, automatic: true });
+    if (!again || this.turns.length === 0) {
+      const first = this.turns.length === 0;
+      const text = first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt;
+      const guides = this.guidesFor(prompt);
+      this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
+      const carry = this.carryOver();
+      if (carry) this.turns.push({ role: 'user', text: `[OAIY] ${carry}`, automatic: true });
+    }
     let failures = 0;
     let lastFailure = '';
     // What each step changes, by the index of the call that changed it.
@@ -2044,7 +2052,7 @@ ${this.instructions}` : ''}`;
       if (signal?.aborted || (error instanceof AIProviderError && error.kind === 'cancelled')) {
         emit({ type: 'notice', message: 'Stopped.' });
       } else {
-        emit({ type: 'error', message: error instanceof Error ? error.message : String(error) });
+        emit({ type: 'error', message: error instanceof Error ? error.message : String(error), retry: true });
       }
       // A turn left waiting for tool results cannot be sent again: keep the results
       // that came in (their changes happened) and mark the rest as not run.

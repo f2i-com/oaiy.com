@@ -9,7 +9,7 @@
 import { Command, InvalidArgumentError } from 'commander';
 import fs from 'node:fs';
 import { version } from '../package.json';
-import { loadFlowFile, discoverInputs, parseInputs, gatherConstants } from './flow-io';
+import { loadFlowFile, discoverInputs, parseInputs, gatherConstants, structureProblems, unknownInputs } from './flow-io';
 import { registerManageCommands } from './manage';
 // Node builtins only (see its imports), so a `--help` still costs nothing.
 import { EngineUnavailableError } from './zipp/artifact';
@@ -28,8 +28,17 @@ for (const stream of [process.stdout, process.stderr]) {
 // stderr so only our explicit result lands on stdout. console.warn/error keep
 // their stderr destination. (The engine itself is lazy-imported in run/worker,
 // so management commands stay lightweight.)
+// `--quiet` (on `run`) silences that chatter too: it is looked for before commander parses, because the engine
+// registers its modules (and logs each) as soon as it is imported. Warnings and errors still reach stderr.
+const quiet = process.argv.slice(2).includes('--quiet');
 for (const m of ['log', 'info', 'debug'] as const) {
-  console[m] = (...args: unknown[]) => console.error(...args);
+  console[m] = quiet ? () => {} : (...args: unknown[]) => console.error(...args);
+}
+
+/** A repeatable single-value option's values, in order: `--input a=1 --input b=2`. A variadic `<kv...>` took the
+ * flow's path that followed it as one more value (`oaiy run --input K=v flow.json` said "missing argument 'flow'"). */
+function collect(value: string, previous: string[] = []): string[] {
+  return [...previous, value];
 }
 
 /**
@@ -63,20 +72,21 @@ program
 program
   .command('run')
   .description('Execute a flow and print or save its outputs')
-  .argument('<flow>', 'path to a .json flow')
-  .option('--input <kv...>', 'flow input as KEY=value (repeatable)')
+  .argument('<flow>', 'path to a .json flow, or a .oaiy package')
+  .option('--input <kv>', 'flow input as KEY=value (repeatable)', collect)
   .option('--inputs <file>', 'JSON file of inputs (merged under --input)')
-  .option('--constant <kv...>', 'constant KEY=value (e.g. OPENAI_API_KEY=...) (repeatable)')
+  .option('--constant <kv>', 'constant KEY=value (e.g. OPENAI_API_KEY=...) (repeatable)', collect)
   .option('--constants <file>', 'JSON file of constants')
   .option(
     '--connector <file>',
     'JSON connector config from a linked provider; its node types are registered before the run',
   )
   .option('-o, --out <file>', 'write result JSON to a file (default: stdout)')
-  .option('--timeout <seconds>', 'run timeout in seconds', (v) => {
-    const n = parseInt(v, 10);
-    if (!Number.isFinite(n) || n <= 0) {
-      throw new InvalidArgumentError('--timeout must be a positive integer (seconds)');
+  .option('--timeout <seconds>', 'run timeout in seconds (default 2700: 45 minutes)', (v) => {
+    // (a whole number of seconds: "1.5" was taken as 1)
+    const n = /^\d+$/.test(v.trim()) ? Number(v.trim()) : NaN;
+    if (!Number.isSafeInteger(n) || n <= 0) {
+      throw new InvalidArgumentError('--timeout must be a positive whole number of seconds');
     }
     return n;
   })
@@ -110,6 +120,10 @@ program
     const { graph, name, flows } = loadFlowFile(flowPath);
     const inputs = parseInputs(opts.input ?? [], opts.inputs);
     const constants = gatherConstants(opts.constant ?? [], opts.constants);
+    // (an input the flow has no node for is not used: said, rather than the run using its default in silence)
+    for (const key of unknownInputs(graph, inputs)) {
+      process.stderr.write(`oaiy: warning: --input '${key}' matches no input of '${name}' (see \`oaiy inputs ${flowPath}\`)\n`);
+    }
 
     if (!opts.quiet) {
       process.stderr.write(`oaiy: running '${name}' (${graph.nodes.length} nodes)…\n`);
@@ -162,15 +176,21 @@ program
     if (!opts.quiet && !res.success) {
       process.stderr.write(`oaiy: run ${res.status}${res.error ? ` — ${res.error}` : ''}\n`);
     }
-    // Let pending socket close callbacks finish before Node tears down libuv.
-    // Forced exit after an HTTP flow can crash on Windows despite a successful result.
-    process.exitCode = res.success ? 0 : 1;
+    const code = res.success ? 0 : 1;
+    // A run that timed out has its result written (stdout and stderr are blocking): what it was waiting on (an HTTP
+    // request with a timer of its own, ffmpeg) is not, and would keep the process alive past the timeout, a cron
+    // job hanging and the Desktop killing it without reading the result. So it ends now.
+    if (res.errorCode === 'timeout') process.exit(code);
+    // Otherwise let pending socket close callbacks finish before Node tears down libuv (forced exit after an HTTP
+    // flow can crash on Windows despite a successful result), but no longer than a few seconds for one left open.
+    process.exitCode = code;
+    setTimeout(() => process.exit(code), 5000).unref();
   });
 
 program
   .command('inputs')
   .description('List the inputs a flow expects')
-  .argument('<flow>', 'path to a .json flow')
+  .argument('<flow>', 'path to a .json flow, or a .oaiy package')
   .action((flowPath: string) => {
     const { graph } = loadFlowFile(flowPath);
     process.stdout.write(JSON.stringify(discoverInputs(graph), null, 2) + '\n');
@@ -179,9 +199,15 @@ program
 program
   .command('validate')
   .description('Parse a flow and check its structure (no execution)')
-  .argument('<flow>', 'path to a .json flow')
+  .argument('<flow>', 'path to a .json flow, or a .oaiy package')
   .action((flowPath: string) => {
     const { graph, name } = loadFlowFile(flowPath);
+    const problems = structureProblems(graph);
+    if (problems.length) {
+      process.stderr.write(`oaiy: '${name}' does not check:\n${problems.map((p) => `  - ${p}`).join('\n')}\n`);
+      process.exitCode = 1;
+      return;
+    }
     process.stdout.write(
       `ok: '${name}' parsed — ${graph.nodes.length} nodes, ${graph.edges.length} edges\n`,
     );
@@ -190,11 +216,8 @@ program
 program
   .command('capabilities')
   .description('Report what this build is and can run: version, run protocol, engine identity and health')
-  .option('--json', 'machine-readable JSON on stdout (the only form today)', false)
-  .action(async (opts: Record<string, any>) => {
-    if (!opts.json) {
-      throw new Error('capabilities: pass --json (the report has no other form yet)');
-    }
+  .option('--json', 'machine-readable JSON on stdout (the default; the flag is kept for scripts that pass it)', true)
+  .action(async () => {
     // src/capabilities imports the artifact check only, never the engine, so
     // a probe costs a hash and a compile of the staged .wasm — not a runtime.
     const { capabilities } = await import('./capabilities');
@@ -234,7 +257,7 @@ program
   .description('Drive an oaiy-api run queue from a server (long-poll + execute + report)')
   .requiredOption('--backend <url>', 'oaiy-api base URL, e.g. http://localhost:8080')
   .requiredOption('--flow <hashEdit>', 'the flow edit-hash to listen on')
-  .option('--constant <kv...>', 'constant KEY=value (repeatable)')
+  .option('--constant <kv>', 'constant KEY=value (repeatable)', collect)
   .option('--constants <file>', 'JSON file of constants')
   .option('--once', 'process at most one queued run, then exit', false)
   .action(async (opts: Record<string, any>) => {

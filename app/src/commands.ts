@@ -40,23 +40,32 @@ export function internetCommand(gate: NetGate, args: string[]): string {
       break;
     case 'allow': case 'add': case 'permit': {
       if (!hosts.length) return 'usage: /internet allow <host> [host…]';
-      const added = hosts.map((h) => gate.allowHost(h)).filter(Boolean);
+      const tried = hosts.map((h) => ({ given: h, host: gate.allowHost(h) }));
+      const added = tried.flatMap((t) => (t.host ? [t.host] : []));
+      const bad = tried.filter((t) => !t.host).map((t) => t.given);
+      // (nothing allowed, nothing changed: the gate is not opened for a mistyped host)
+      if (!added.length) return `Not a host name: ${hosts.join(', ')}. Nothing was changed.`;
       if (gate.mode === 'blocked') {
         gate.setMode('allowlist');
         note = ' (the gate was closed; it now lets through only the allowed hosts)';
       }
-      note = `allowed ${added.join(', ')}${note}`;
+      note = `allowed ${added.join(', ')}${note}${bad.length ? ` (not host names, left out: ${bad.join(', ')})` : ''}`;
       break;
     }
     case 'deny': case 'ban': {
       if (!hosts.length) return 'usage: /internet deny <host> [host…]';
-      note = `denied ${hosts.map((h) => gate.denyHost(h)).filter(Boolean).join(', ')}`;
+      const tried = hosts.map((h) => ({ given: h, host: gate.denyHost(h) }));
+      const denied = tried.flatMap((t) => (t.host ? [t.host] : []));
+      const bad = tried.filter((t) => !t.host).map((t) => t.given);
+      if (!denied.length) return `Not a host name: ${hosts.join(', ')}. Nothing was changed.`;
+      note = `denied ${denied.join(', ')}${bad.length ? ` (not host names, left out: ${bad.join(', ')})` : ''}`;
       break;
     }
     case 'forget': case 'remove': case 'rm': {
       if (!hosts.length) return 'usage: /internet forget <host> [host…]';
-      for (const h of hosts) gate.forgetHost(h);
-      note = `forgot ${hosts.join(', ')}`;
+      const forgot = hosts.filter((h) => gate.forgetHost(h));
+      const unknown = hosts.filter((h) => !forgot.includes(h));
+      note = forgot.length ? `forgot ${forgot.join(', ')}${unknown.length ? ` (not on either list: ${unknown.join(', ')})` : ''}` : `${unknown.join(', ')} ${unknown.length === 1 ? 'is' : 'are'} not on the allow or deny list: nothing was changed`;
       break;
     }
     default: {

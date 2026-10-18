@@ -97,6 +97,14 @@ describe("flows as the agent's tools", () => {
     expect(asked).toEqual([file, 'https://example.com/cat.png']);
     // a second run's picture of the same name does not overwrite the first
     expect((await keepFlowFiles({ image: file }, 'make_and_check_image', fetchFile, vfs)).saved).toEqual(['flows/make_and_check_image/fox-2.png']);
+    // one file the desktop does not give (gone, or the connection dropped) stays an address; the rest are kept
+    const failing = async (url: string) => {
+      if (url.endsWith('gone.png')) throw new Error('404 not found');
+      return fetchFile(url);
+    };
+    const gone = file.replace('fox.png', 'gone.png');
+    const mixed = await keepFlowFiles({ a: gone, b: file }, 'make_and_check_image', failing, vfs);
+    expect(mixed.value).toEqual({ a: gone, b: 'flows/make_and_check_image/fox-3.png' });
   });
 
   it("sends the desktop's token only for the engine's files on the desktop", async () => {

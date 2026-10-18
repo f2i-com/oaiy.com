@@ -150,7 +150,7 @@ try {
   await page.goto(base);
   await page.waitForSelector('.tree-row', { timeout: 60_000 });
   // A provider pointed at the scripted model.
-  await page.click('button[title="AI providers"]');
+  await page.click('button.settings-button');
   await page.waitForSelector('dialog.settings[open]');
   await page.evaluate((url) => {
     [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click();

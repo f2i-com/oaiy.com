@@ -92,12 +92,18 @@ async function waitServiceInstall(id: string): Promise<void> {
 
 async function waitDownload(id: string): Promise<void> {
   let lastPct = -1;
+  let unseen = 0;
   for (let i = 0; i < 14400; i++) {
     await sleep(2000);
     const raw = await server.models.downloads();
     const list = Array.isArray(raw) ? raw : raw?.downloads || [];
     const dl = list.find((d: any) => d.id === id);
-    if (!dl) continue;
+    if (!dl) {
+      // (a download the server never lists, or no longer does, is not waited on for hours)
+      if (++unseen >= 30) throw new ServerError(`download '${id}' is not listed by the server: it may have been removed or never started`);
+      continue;
+    }
+    unseen = 0;
     if (dl.bytesTotal) {
       const pct = Math.floor((dl.bytesDownloaded / dl.bytesTotal) * 100);
       if (pct !== lastPct) {
@@ -160,7 +166,7 @@ export function registerManageCommands(program: Command): void {
     .command('create')
     .description('Create (or reuse) a venv and pip-install requirements')
     .argument('<name>', 'venv name')
-    .option('--req <pkg...>', 'a pip requirement (repeatable), e.g. --req torch --req diffusers')
+    .option('--req <pkg>', 'a pip requirement (repeatable), e.g. --req torch --req diffusers', (v: string, prev: string[] = []) => [...prev, v])
     .action(
       action(async (name: string, opts: any) => {
         const reqs: string[] = opts.req ?? [];
@@ -347,6 +353,6 @@ export function registerManageCommands(program: Command): void {
 
   // --- server ---------------------------------------------------------------
   const srv = program.command('server').description('Query the oaiy-server itself');
-  srv.command('health').action(action(async () => { out(JSON.stringify(await server.health())); }));
-  srv.command('config').action(action(async () => { out(JSON.stringify(await server.config(), null, 2)); }));
+  srv.command('health').description("Whether oaiy-server answers, and its version").action(action(async () => { out(JSON.stringify(await server.health())); }));
+  srv.command('config').description("oaiy-server's configuration, as JSON").action(action(async () => { out(JSON.stringify(await server.config(), null, 2)); }));
 }

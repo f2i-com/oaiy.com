@@ -76,8 +76,28 @@ export class EditorPane {
 
   setVfs(vfs: Vfs): void {
     this.flush();
+    this.keepMine();
     this.vfs = vfs;
     this.close();
+  }
+
+  /**
+   * Leaving a file whose changes clash with what was written meanwhile (the conflict bar up, not answered): the
+   * person's text is kept beside it, as `name.mine.ext`, rather than dropped with the editor.
+   */
+  private keepMine(): void {
+    if (!this.conflict || !this.dirty || !this.view || !this.path) return;
+    const at = this.path.lastIndexOf('.');
+    const slash = this.path.lastIndexOf('/');
+    const [stem, ext] = at > slash + 1 ? [this.path.slice(0, at), this.path.slice(at)] : [this.path, ''];
+    let target = `${stem}.mine${ext}`;
+    for (let n = 2; this.vfs.exists(target); n++) target = `${stem}.mine-${n}${ext}`;
+    try {
+      this.vfs.writeFile(target, this.view.state.doc.toString(), { parents: true });
+    } catch {
+      /* the project cannot take it: nothing more to do as the file is left */
+    }
+    this.dirty = false;
   }
 
   /** The header for a file (or none): its icon, its path as a breadcrumb, and how its saving stands. */
@@ -167,6 +187,7 @@ export class EditorPane {
 
   open(path: string, options: { source?: boolean } = {}): void {
     this.flush();
+    this.keepMine();
     this.conflict = false;
     this.conflictBar.hidden = true;
     if (mediaKind(path) && !options.source) {
@@ -174,7 +195,17 @@ export class EditorPane {
       return;
     }
     this.dropMedia();
-    if (!this.vfs.isText(path)) {
+    // (read first: a file that looked like text in its first 8 KB and is not after must not leave the old file's text
+    // on show under its name, to be saved over it at the next keystroke)
+    let doc: string | null = null;
+    if (this.vfs.isText(path)) {
+      try {
+        doc = this.vfs.readText(path);
+      } catch {
+        doc = null;
+      }
+    }
+    if (doc === null) {
       this.path = null;
       this.view?.destroy();
       this.view = null;
@@ -187,7 +218,6 @@ export class EditorPane {
     this.path = path;
     this.dirty = false;
     this.header(path);
-    const doc = this.vfs.readText(path);
     const state = EditorState.create({
       doc,
       extensions: [
@@ -291,6 +321,7 @@ export class EditorPane {
   }
 
   close(): void {
+    this.keepMine();
     this.conflict = false;
     this.conflictBar.hidden = true;
     this.dropMedia();
