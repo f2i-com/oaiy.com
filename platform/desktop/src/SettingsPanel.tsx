@@ -248,19 +248,11 @@ export default function SettingsPanel() {
     [toast],
   );
 
-  const runMigration = useCallback(
-    async (mode: 'copy' | 'move') => {
-      if (migInFlightRef.current) return;
+  // Follow a copy or move of the data folder until it finishes: one started here, or one still running when
+  // Settings is opened again.
+  const watchMigration = useCallback(
+    (mode: string) => {
       migInFlightRef.current = true;
-      setError(null);
-      try {
-        await appConfig.startMigration(mode);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-        migInFlightRef.current = false;
-        return;
-      }
-      // Poll status until the background copy/move finishes.
       if (pollRef.current !== null) window.clearInterval(pollRef.current);
       pollRef.current = window.setInterval(async () => {
         try {
@@ -295,6 +287,45 @@ export default function SettingsPanel() {
     },
     [toast],
   );
+
+  const runMigration = useCallback(
+    async (mode: 'copy' | 'move') => {
+      if (migInFlightRef.current) return;
+      migInFlightRef.current = true;
+      setError(null);
+      try {
+        await appConfig.startMigration(mode);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        migInFlightRef.current = false;
+        return;
+      }
+      watchMigration(mode);
+    },
+    [watchMigration],
+  );
+
+  // A copy or move still running from before Settings was opened: shown and followed, not offered again.
+  useEffect(() => {
+    let gone = false;
+    appConfig
+      .migrationStatus()
+      .then((s) => {
+        if (gone || !s.running) return;
+        setMig(s);
+        watchMigration(s.mode);
+      })
+      .catch(() => {});
+    return () => {
+      gone = true;
+    };
+  }, [watchMigration]);
+
+  // Restart, saying why where it has to wait (a call, the data folder still being copied or moved).
+  const restartNow = () => {
+    if (!confirm('Restart now? Any running services and in-progress downloads will be stopped.')) return;
+    appConfig.restart().catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+  };
 
   const applyDir = useCallback(
     async (path: string) => {
@@ -504,17 +535,7 @@ export default function SettingsPanel() {
                 <br />
                 Restart OAIY to start using the new folder.
                 <div className="form-actions" style={{ marginTop: 8 }}>
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => {
-                      if (
-                        confirm(
-                          'Restart now? Any running services and in-progress downloads will be stopped.',
-                        )
-                      )
-                        appConfig.restart();
-                    }}
-                  >
+                  <button className="btn btn-primary" disabled={!!mig?.running} title={mig?.running ? 'Wait for the copy or move to finish' : undefined} onClick={restartNow}>
                     Restart now
                   </button>
                 </div>
@@ -660,17 +681,7 @@ export default function SettingsPanel() {
                 <br />
                 Restart OAIY to start saving models there.
                 <div className="form-actions" style={{ marginTop: 8 }}>
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => {
-                      if (
-                        confirm(
-                          'Restart now? Any running services and in-progress downloads will be stopped.',
-                        )
-                      )
-                        appConfig.restart();
-                    }}
-                  >
+                  <button className="btn btn-primary" disabled={!!mig?.running} title={mig?.running ? 'Wait for the copy or move to finish' : undefined} onClick={restartNow}>
                     Restart now
                   </button>
                 </div>

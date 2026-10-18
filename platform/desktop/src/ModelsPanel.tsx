@@ -29,7 +29,7 @@ const PAGE = 200;
  *
  * Polls both lists every 1.5s so progress bars tick smoothly.
  */
-export default function ModelsPanel() {
+export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => void } = {}) {
   // Seeded like the other panels: this painted an empty model library on every
   // visit while a 1.5s poll re-fetched what it already had a moment earlier.
   // How many rows this panel is currently showing. Grows on "Show more"
@@ -175,6 +175,19 @@ export default function ModelsPanel() {
           Couldn't reach OAIY API: {error}
         </div>
       )}
+      {/* What this page is for, beside the engines' own Get models (which most people want) */}
+      <div className="banner banner-pending models-what">
+        <span>
+          To add a model to OAIY’s own engines, use <strong>Engines → Get models</strong>: it gets every part a model needs (its text encoder,
+          VAE…), none of them twice, and adds it ready to use. This page downloads single files for other programs, such as a llama.cpp server
+          you run yourself.
+        </span>
+        {onOpenEngines && (
+          <button className="btn-tiny" onClick={onOpenEngines}>
+            Open Engines
+          </button>
+        )}
+      </div>
       {snapshot && (
         <div className="datadir-note datadir-row">
           <span>

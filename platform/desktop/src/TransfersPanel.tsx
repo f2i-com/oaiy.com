@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Loader2, TriangleAlert } from 'lucide-react';
 import { companion, isNotFound, ring, type CompanionApproved, type RingFeatures, type RingPreview, type RingSettings } from './api';
+import { useUnsaved } from './unsavedChanges';
 import { openSetup } from './useSetupState';
 import { useVisiblePoll } from './useVisiblePoll';
 
@@ -31,6 +32,25 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const lines = (list: string[]) => list.join('\n');
 const fromLines = (text: string) => text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 
+/**
+ * What `next` changes of `saved`: the settings that differ, `quietHours` and `limits` member by member (the desktop
+ * keeps the others as they are), so a setting a paired program changed meanwhile is not put back.
+ */
+export function changedFrom<T extends object>(saved: object, next: T): Partial<T> {
+  const out: Record<string, unknown> = {};
+  const was = saved as Record<string, unknown>;
+  for (const [key, value] of Object.entries(next)) {
+    const before = was[key];
+    if (value && typeof value === 'object' && !Array.isArray(value) && before && typeof before === 'object' && !Array.isArray(before)) {
+      const inner = Object.fromEntries(Object.entries(value).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify((before as Record<string, unknown>)[k])));
+      if (Object.keys(inner).length) out[key] = inner;
+    } else if (JSON.stringify(value) !== JSON.stringify(before)) {
+      out[key] = value;
+    }
+  }
+  return out as Partial<T>;
+}
+
 export default function TransfersPanel() {
   const [saved, setSaved] = useState<RingSettings | null>(null);
   const [draft, setDraft] = useState<RingSettings | null>(null);
@@ -42,6 +62,8 @@ export default function TransfersPanel() {
   const [saving, setSaving] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
   const [devices, setDevices] = useState<CompanionApproved[] | null>(null);
+  /** Why the approved Companions could not be read, when they could not (not the same as none approved). */
+  const [devicesError, setDevicesError] = useState<string | null>(null);
   /** What a caller who asks for you would get now, from the desktop's own policy. */
   const [preview, setPreview] = useState<RingPreview | null>(null);
   /** The urgent phrases and VIP numbers are typed as lines: kept as typed until saved. */
@@ -56,24 +78,32 @@ export default function TransfersPanel() {
     setVipText(lines(s.vipNumbers));
   }, []);
 
+  // Whether the form differs from what is saved, as of now: a reading that lands while the owner edits leaves the form alone.
+  const editing = useRef(false);
+  const load = useCallback(
+    (live: () => boolean = () => true) =>
+      ring.settings().then(
+        (r) => {
+          if (!live() || editing.current) return;
+          adopt(r.settings, r.features);
+          setLoadProblem(r.loadProblem ?? null);
+          setError(null);
+        },
+        (e) => {
+          if (!live()) return;
+          if (isNotFound(e)) setMissing(true);
+          else setError(errText(e));
+        },
+      ),
+    [adopt],
+  );
   useEffect(() => {
     let live = true;
-    ring.settings().then(
-      (r) => {
-        if (!live) return;
-        adopt(r.settings, r.features);
-        setLoadProblem(r.loadProblem ?? null);
-      },
-      (e) => {
-        if (!live) return;
-        if (isNotFound(e)) setMissing(true);
-        else setError(errText(e));
-      },
-    );
+    void load(() => live);
     return () => {
       live = false;
     };
-  }, [adopt]);
+  }, [load]);
 
   const look = useCallback(() => {
     ring.preview().then(setPreview, () => setPreview(null));
@@ -81,16 +111,23 @@ export default function TransfersPanel() {
 
   // The devices that may take a call: the Companions approved for the phone. And what a caller would get now, which changes as the owner
   // comes and goes and as the phone plugin calls.
+  // And, while nothing is being changed here, the settings as saved: a paired program may change them too.
   useVisiblePoll(() => {
     companion.status('aokie').then(
-      (s) => setDevices(s.approvedMobiles ?? []),
-      () => setDevices([]),
+      (s) => {
+        setDevices(s.approvedMobiles ?? []);
+        setDevicesError(null);
+      },
+      (e) => setDevicesError(errText(e)),
     );
     look();
+    if (saved) void load();
   }, 20_000);
 
   const current = useMemo(() => (draft ? { ...draft, urgentPhrases: fromLines(urgentText), vipNumbers: fromLines(vipText) } : null), [draft, urgentText, vipText]);
   const dirty = !!saved && !!current && JSON.stringify(current) !== JSON.stringify(saved);
+  editing.current = dirty;
+  useUnsaved('transfers', dirty, 'the transfer settings');
 
   const patch = (change: Partial<RingSettings>) => {
     setJustSaved(false);
@@ -104,11 +141,11 @@ export default function TransfersPanel() {
   };
 
   const save = async () => {
-    if (!current) return;
+    if (!current || !saved) return;
     setSaving(true);
     setError(null);
     try {
-      const r = await ring.save({
+      const r = await ring.save(changedFrom(saved, {
         enabled: current.enabled,
         takeMessages: current.enabled ? true : current.takeMessages,
         initiative: current.initiative,
@@ -127,7 +164,8 @@ export default function TransfersPanel() {
         },
         windowsCompanions: current.windowsCompanions,
         excludedDevices: current.excludedDevices,
-      });
+      }));
+      editing.current = false;
       adopt(r.settings, r.features);
       setJustSaved(true);
       look();
@@ -148,7 +186,16 @@ export default function TransfersPanel() {
   if (!current) {
     return (
       <div className="panel transfers-page">
-        {error ? <p className="form-error" role="alert">Could not read the settings: {error}</p> : <p className="form-hint">Loading…</p>}
+        {error ? (
+          <>
+            <p className="form-error" role="alert">Could not read the settings: {error}</p>
+            <button type="button" className="button secondary" onClick={() => void load()}>
+              Try again
+            </button>
+          </>
+        ) : (
+          <p className="form-hint">Loading…</p>
+        )}
       </div>
     );
   }
@@ -380,7 +427,11 @@ export default function TransfersPanel() {
           Companion that is the Windows app on this computer: it rings only while you are at the computer. A phone stays unticked, and rings by the Phones setting above. Say
           which never to ring.
         </p>
-        {devices === null ? (
+        {devicesError && devices === null ? (
+          <p className="form-error" role="alert">
+            Could not read the approved Companions: {devicesError}
+          </p>
+        ) : devices === null ? (
           <p className="form-hint">Looking…</p>
         ) : devices.length === 0 ? (
           <p className="form-hint">No Companion is approved yet: pair one on the Phone page. Until then the receptionist takes a message.</p>

@@ -85,7 +85,8 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
         {phoneOn && (
           <button className="overview-tile" onClick={() => onNavigate('agent')} title="Calls and texts are answered by the agent">
             <Phone size={16} aria-hidden />
-            <strong className={phoneState?.connected ? 'ok' : 'warn'}>{phoneState === null ? '—' : phoneState.onCall ? 'On a call' : phoneState.connected ? 'Connected' : 'Not connected'}</strong>
+            {/* (not amber while it is still asked: only "Not connected" is a warning) */}
+            <strong className={phoneState === null ? undefined : phoneState.connected ? 'ok' : 'warn'}>{phoneState === null ? '—' : phoneState.onCall ? 'On a call' : phoneState.connected ? 'Connected' : 'Not connected'}</strong>
             <small>The phone</small>
           </button>
         )}

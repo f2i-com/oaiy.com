@@ -4,6 +4,12 @@ import { bridge, type RunHistory, type RunRecord, type RunStatus } from './api';
 import DeadLetters from './DeadLetters';
 import { useToast } from './Toasts';
 import { invalidate, peek, put } from './useCached';
+import { useVisiblePoll } from './useVisiblePoll';
+
+/** A run's error as said: the runtime wraps one already beginning "Error:" in another ("Error: Error: Image Gen: …"). */
+export function errorText(message: string): string {
+  return message.replace(/^(\s*Error:\s*)+/i, '');
+}
 
 /**
  * Run history — what happened, and why it failed.
@@ -99,7 +105,8 @@ function noFailuresMessage(data: RunHistory): string {
  * buries the rows below it. The toggle shows only when the three lines hide
  * something; the full text is also the tooltip.
  */
-function RunError({ code, message }: { code: string; message: string }) {
+function RunError({ code, message: said }: { code: string; message: string }) {
+  const message = errorText(said);
   const [all, setAll] = useState(false);
   const [clipped, setClipped] = useState(false);
   const textRef = useRef<HTMLSpanElement>(null);
@@ -120,7 +127,10 @@ function RunError({ code, message }: { code: string; message: string }) {
   return (
     <>
       <p className="run-error">
-        <CircleAlert size={13} /> <code>{code}</code>{' '}
+        {/* (the icon and the code on the first line's height, beside the message's first line) */}
+        <span style={{ display: 'inline-flex', flex: 'none', alignItems: 'center', gap: 6, minHeight: 18 }}>
+          <CircleAlert size={13} aria-hidden /> <code>{code}</code>
+        </span>{' '}
         <span
           ref={textRef}
           className={all ? 'run-error-text' : 'run-error-text clamped'}
@@ -152,25 +162,34 @@ export default function RunsPanel() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
   const toast = useToast();
+  // The latest request's number: an answer to an older one (another filter's, asked before the switch) is not shown.
+  const asked = useRef(0);
 
   const refresh = useCallback(async () => {
+    const mine = ++asked.current;
     try {
       const next = await bridge.runs(filter === 'failures' ? FAILURE_STATES : 'all', 50);
-      setData(next);
       put(`runHistory:${filter}`, next);
+      if (mine !== asked.current) return;
+      setData(next);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (mine === asked.current) setError(e instanceof Error ? e.message : String(e));
     }
   }, [filter]);
 
+  // Asked every few seconds while the window shows (not while it is hidden in the tray).
+  useVisiblePoll(() => void refresh(), POLL_MS);
+  const first = useRef(true);
   useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
     // Repaint from THIS filter's cache the moment the filter changes, so the
     // heading and the rows can never disagree while the refetch is in flight.
     setData(peek<RunHistory>(`runHistory:${filter}`) ?? null);
     void refresh();
-    const id = window.setInterval(() => void refresh(), POLL_MS);
-    return () => window.clearInterval(id);
   }, [refresh, filter]);
 
   const clear = async () => {

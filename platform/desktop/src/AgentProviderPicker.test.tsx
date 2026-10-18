@@ -108,7 +108,8 @@ describe('choosing an AI provider for the Agent', () => {
     expect(m.models).toHaveBeenCalledWith('lm-studio');
     expect(onPick).toHaveBeenLastCalledWith({ provider: 'lm-studio', model: 'qwen3.5-9b', name: 'LM Studio' });
     expect(select('Provider').value).toBe('lm-studio');
-    expect(Array.from(select('Model').options).map((o) => o.value)).toEqual(['qwen3.5-9b', 'gemma-4-e4b']);
+    // (its models, to choose another; the placeholder stands until the page it is on saves the choice)
+    expect(Array.from(select('Model').options).map((o) => o.value).filter(Boolean)).toEqual(['qwen3.5-9b', 'gemma-4-e4b']);
   });
 
   it('asks an API provider for its key, keeps it with the desktop, and not on the open web', async () => {
@@ -150,10 +151,24 @@ describe('choosing an AI provider for the Agent', () => {
     const alert = host.querySelector('[role="alert"]')!;
     expect(alert.textContent).toContain('LM Studio did not answer at http://localhost:1234/v1: is its server running, with a model loaded?');
     expect(onPick).not.toHaveBeenCalled();
-    m.models.mockResolvedValue(['qwen3.5-9b']);
+    m.models.mockResolvedValue(['nomic-embed-text', 'qwen3.5-9b']);
     await click(button(/Try again/));
-    expect(onPick).toHaveBeenLastCalledWith({ provider: 'lm-studio', model: 'qwen3.5-9b', name: 'LM Studio' });
     expect(host.querySelector('[role="alert"]')).toBeNull();
+    // A provider merely looked at does not change the Agent's model: the person chooses one (its first may embed).
+    expect(onPick).not.toHaveBeenCalled();
+    expect(select('Model').value).toBe('');
+    await change(select('Model'), 'qwen3.5-9b');
+    expect(onPick).toHaveBeenLastCalledWith({ provider: 'lm-studio', model: 'qwen3.5-9b', name: 'LM Studio' });
+  });
+
+  it('keeps what a provider set up before had when its preset is added again: its model and its other uses', async () => {
+    saved = [provider({ id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', allowLocal: false, model: 'gpt-5.5', capabilities: ['chat', 'transcription'] })];
+    m.models.mockResolvedValue(['gpt-5.5']);
+    await render();
+    await change(select('Provider'), 'preset:openai');
+    await change(input('API key'), 'sk-new');
+    await click(button(/Connect/));
+    expect(m.upsert).toHaveBeenCalledWith(expect.objectContaining({ id: 'openai', model: 'gpt-5.5', capabilities: ['chat', 'transcription'], enabled: true }));
   });
 
   it('gives another OpenAI-compatible server an id of its own, named by its address', async () => {

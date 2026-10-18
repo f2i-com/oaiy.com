@@ -5,7 +5,7 @@ import ChatGptConnector from './ChatGptConnector';
 import { bridge, nodeRuntime, type AgentModelSource, type CodexStatus, type EngineCatalog, type EngineRecommendation } from './api';
 import { AgentMaySwitch, type ControlSwitch } from './AgentAccess';
 import { aiChoices, localModelLine, type FirstRunStep, type ModelLine } from './setupFlow';
-import { EngineModelCard, StepHeader, usePoll } from './SetupParts';
+import { EngineModelCard, errorText, StepHeader, usePoll } from './SetupParts';
 
 /**
  * The first-run wizard's essentials: welcome, the Agent's AI (on this
@@ -17,6 +17,7 @@ import { EngineModelCard, StepHeader, usePoll } from './SetupParts';
 export function WelcomeStep({ kicker }: { kicker: string }) {
   const [runtime] = usePoll(() => bridge.status(), 5000);
   const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
   const node = runtime?.nodeRuntime;
   const parts: Array<{ icon: ReactNode; title: string; text: string }> = [
     { icon: <Sparkles size={17} />, title: 'Your AI', text: 'What the Agent thinks with: a language model on this computer, your ChatGPT account, or a provider such as LM Studio.' },
@@ -54,13 +55,22 @@ export function WelcomeStep({ kicker }: { kicker: string }) {
               disabled={installing || node.installing}
               onClick={() => {
                 setInstalling(true);
-                void nodeRuntime.install().finally(() => setInstalling(false));
+                setInstallError(null);
+                void nodeRuntime
+                  .install()
+                  .catch((e: unknown) => setInstallError(`Node was not installed: ${errorText(e)}`))
+                  .finally(() => setInstalling(false));
               }}
             >
               {node.installing || installing ? 'Installing Node…' : `Install Node ${node.installsVersion}`}
             </button>
           )}
         </div>
+      )}
+      {installError && (
+        <p className="card-warn" role="alert">
+          {installError}
+        </p>
       )}
       <p className="setup-trust">
         <ShieldCheck size={13} /> OAIY runs on this computer. Keys, conversations and recordings are kept on this device.

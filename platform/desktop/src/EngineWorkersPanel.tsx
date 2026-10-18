@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, Laptop, Loader2, Network, RotateCcw, Server, Star, TriangleAlert } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { engines, network, type NetworkModel, type NetworkNode, type NetworkStatus } from './api';
-import { Device, KIND, STATE, deviceName } from './NetworkPanel';
+import { Device, KIND, MachineTiles, Queue, STATE, deviceName } from './NetworkPanel';
 
 /**
  * Engines → Other computers: the models of the workers paired over OAIY Network (docs/NETWORK.md), by computer, and
@@ -17,9 +17,13 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
+  // (each read numbered: one answered after a newer one began, or after a default was chosen, is not shown)
+  const reads = useRef(0);
   const refresh = useCallback(async () => {
+    const seq = ++reads.current;
     try {
       const s = await network.status();
+      if (seq !== reads.current) return;
       setStatus(s);
       setError(null);
       if (!s.uses) {
@@ -27,9 +31,12 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
         return;
       }
       const [n, c] = await Promise.all([network.nodes(), engines.catalog().catch(() => null)]);
+      if (seq !== reads.current) return;
       setNodes(n.nodes.filter((x) => x.uses ?? x.role === 'worker'));
-      setLocal(c?.defaults ?? {});
+      // (this computer's own defaults kept as last read where the engines did not answer, not shown as none)
+      if (c?.defaults) setLocal(c.defaults);
     } catch (e) {
+      if (seq !== reads.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
@@ -42,6 +49,7 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
   const choose = async (kind: string, id: string | null) => {
     setBusy(`${kind}:${id ?? ''}`);
     setError(null);
+    reads.current++;
     try {
       setStatus(await network.setDefault(kind, id));
       await refresh();
@@ -104,7 +112,7 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
           or a paired computer’s you choose below. Choosing a default in the Engines tab makes this computer’s own the default again.
         </p>
         {kinds.length === 0 ? (
-          <p className="form-hint">{nodes.length === 0 ? 'No worker is paired yet.' : 'The paired computers have not said which models they have yet.'}</p>
+          <p className="form-hint">{nodes.length === 0 ? 'A paired computer’s models can be chosen here once one is paired (below).' : 'The paired computers have not said which models they have yet.'}</p>
         ) : (
           <div className="engine-defaults">
             {kinds.map((kind) => {
@@ -175,13 +183,15 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
                 <TriangleAlert size={13} aria-hidden /> {n.lastError}
               </div>
             )}
-            {n.devices.length > 0 && (
+            {(n.devices.length > 0 || n.machine) && (
               <div className="network-devices engine-worker-devices">
+                {n.machine && <MachineTiles m={n.machine} live={n.online} />}
                 {n.devices.map((d) => (
-                  <Device key={d.id} d={d} live={n.online} />
+                  <Device key={d.id} d={d} live={n.online} temperature={n.machine?.gpus?.find((g) => g.name === d.name)?.temperature} />
                 ))}
               </div>
             )}
+            {n.online && n.jobs && <Queue jobs={n.jobs} />}
             {kinds
               .filter((kind) => n.models.some((m) => m.kind === kind))
               .map((kind) => (
@@ -206,7 +216,7 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
                             </span>
                           ) : (
                             <button
-                              className="btn-tiny network-pin"
+                              className="btn-tiny"
                               disabled={busy !== null}
                               title={`Use it for every ${(KIND[kind] ?? kind).toLowerCase()} job that uses the default`}
                               onClick={() => void choose(kind, m.id)}

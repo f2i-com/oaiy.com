@@ -51,6 +51,7 @@ import HoursPanel from './HoursPanel';
 import ContactsPanel from './ContactsPanel';
 import MessagesPanel from './MessagesPanel';
 import RingDialog from './RingDialog';
+import { confirmLeaving } from './unsavedChanges';
 import TransfersPanel from './TransfersPanel';
 import { useUnreadMessages } from './unreadMessages';
 import PluginScreenPage from './PluginScreenPage';
@@ -355,7 +356,15 @@ export default function App() {
   const isolated = DESKTOP_LAUNCH.isolated;
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
-  const [view, setView] = useState<View>(isolated ? 'plugins' : 'overview');
+  const [view, setViewNow] = useState<View>(isolated ? 'plugins' : 'overview');
+  // Another page: asked first where the page open has changes not saved yet (a form's), which would go with it.
+  const shownView = useRef(view);
+  shownView.current = view;
+  const setView = useCallback((next: View | ((current: View) => View)) => {
+    const to = typeof next === 'function' ? next(shownView.current) : next;
+    if (to !== shownView.current && !confirmLeaving()) return;
+    setViewNow(to);
+  }, []);
   /** The phone and the calendar are there while a plugin provides them (Aokie, the AI Receptionist). `null` until known. */
   const modules = useModules();
   const phoneOn = !isolated && moduleOn(modules, 'phone');
@@ -537,6 +546,9 @@ export default function App() {
     };
   }, [isolated]);
 
+  // A call ringing for the owner (RingDialog showing): a page in a webview is taken away meanwhile, as it would cover it.
+  const [ringShowing, setRingShowing] = useState(false);
+
   // A call going on now: the Agent's nav entry says so (the Agent page shows the call itself).
   // Asked only while there is a phone.
   const [onCall, setOnCall] = useState(false);
@@ -547,6 +559,8 @@ export default function App() {
     }
     let cancelled = false;
     const look = async () => {
+      // (the window hidden in the tray: nothing to show the badge on, asked again when it is shown)
+      if (document.hidden) return;
       try {
         const calls = await phoneApi.calls();
         if (!cancelled) setOnCall(calls.length > 0);
@@ -556,9 +570,14 @@ export default function App() {
     };
     look();
     const id = window.setInterval(look, 2000);
+    const shown = () => {
+      if (!document.hidden) void look();
+    };
+    document.addEventListener('visibilitychange', shown);
     return () => {
       cancelled = true;
       window.clearInterval(id);
+      document.removeEventListener('visibilitychange', shown);
     };
   }, [phoneOn]);
 
@@ -654,8 +673,19 @@ export default function App() {
     const Icon = s.icon;
     const active = section?.id === s.id;
     const calling = s.id === 'agent' && onCall;
-    const badge = newBadge(s, seen) ?? (s.id === 'network' && netWaiting > 0 ? String(netWaiting) : null);
+    const badge = newBadge(s, seen);
     if (s.sub) return navSub(s, calling);
+    // What waits on this page: the Calendar's requests and the new messages (a page of its own when no plugin's
+    // section holds it), and the computers asking to pair with this one. A count, which stays in the narrow sidebar.
+    const count = s.id === 'network' ? netWaiting : s.tabs.reduce((n, t) => n + countOf(t.view), 0);
+    const counted =
+      count === 0
+        ? null
+        : s.id === 'network'
+          ? `${count} computer${count === 1 ? '' : 's'} asking to pair`
+          : s.tabs.some((t) => t.view === 'messages')
+            ? `${count} new message${count === 1 ? '' : 's'}`
+            : `${count} request${count === 1 ? '' : 's'} waiting`;
     return (
       <button
         type="button"
@@ -667,14 +697,16 @@ export default function App() {
            aria-hidden, which would leave the button with no accessible name at
            all — so name it explicitly. The name stays the section's even on a
            call (scripts find the Agent by it); the call is said in its description. */
-        aria-label={s.label}
+        aria-label={counted ? `${s.label}, ${counted}` : s.label}
         aria-describedby={calling ? 'nav-on-call' : undefined}
         title={
           calling
             ? 'Agent: on a call now. Open it to see the call.'
-            : s.pluginName
-              ? `${s.label}, from the ${s.pluginName} plugin`
-              : s.label
+            : counted
+              ? `${s.label}: ${counted}`
+              : s.pluginName
+                ? `${s.label}, from the ${s.pluginName} plugin`
+                : s.label
         }
         onClick={() => openSection(s)}
       >
@@ -685,7 +717,8 @@ export default function App() {
             On call
           </em>
         )}
-        {badge && <em className="nav-badge">{badge}</em>}
+        {badge && count === 0 && <em className="nav-badge">{badge}</em>}
+        {count > 0 && <em className="nav-count">{count}</em>}
       </button>
     );
   };
@@ -787,7 +820,7 @@ export default function App() {
         Skip to dashboard
       </a>
       {/* A caller wants to speak to you: over everything, while the receptionist is trying to reach you. */}
-      <RingDialog on={phoneOn === true} />
+      <RingDialog on={phoneOn === true} onShowing={setRingShowing} />
 
       <aside className="sidebar">
         <div className="brand">
@@ -880,8 +913,17 @@ export default function App() {
             </div>
           )}
           {tabbed && <SectionTabs section={tabbed} view={view} onSelect={(v) => setView(v)} />}
-          {/* A page in a webview of its own: the desktop lays it over this box. */}
-          {embedded && <EmbeddedPage page={view as 'agent' | 'flows' | 'engines'} />}
+          {/* Asked wherever the person is, above a page in a webview too (which is laid below them), and kept
+              across pages rather than asked again at each. */}
+          {!isolated && (
+            <div className="view-prompts">
+              <PairingPrompt />
+              {view !== 'network' && <NetworkPairingPrompt waiting={netWaiting} onOpen={() => setView('network')} />}
+            </div>
+          )}
+          {/* A page in a webview of its own: the desktop lays it over this box (and takes it away while a call rings,
+              whose dialog it would cover). */}
+          {embedded && <EmbeddedPage page={view as 'agent' | 'flows' | 'engines'} covered={ringShowing} />}
           {/* Keyed so React remounts the scroller on a view change — otherwise
               the next view opens at the previous one's scroll offset. `revisit`
               suppresses the entrance animation the second time you open a panel,
@@ -899,8 +941,6 @@ export default function App() {
                 <button type="button" className="btn btn-primary" onClick={() => setView('plugins')}>Open Plugins</button>
               </div>
             ) : <>
-            {!isolated && <PairingPrompt />}
-            {!isolated && view !== 'network' && <NetworkPairingPrompt waiting={netWaiting} onOpen={() => setView('network')} />}
             {view === 'overview' && (
               <OverviewPanel
                 onNavigate={(v) => setView(v)}
@@ -929,7 +969,7 @@ export default function App() {
               />
             )}
             {view === 'transfers' && <TransfersPanel />}
-            {view === 'models' && <ModelsPanel />}
+            {view === 'models' && <ModelsPanel onOpenEngines={() => setView('engines')} />}
             {view === 'providers' && <AiProvidersPanel />}
             {view === 'connections' && <ConnectionsPanel />}
             {view === 'python' && <PythonPanel />}

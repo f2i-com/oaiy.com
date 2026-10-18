@@ -79,6 +79,8 @@ export default function PluginsPanel() {
   /** Path to a plugin folder or .tar.gz to install. */
   const [installSource, setInstallSource] = useState('');
   const [installing, setInstalling] = useState(false);
+  /** Why the last install failed (its own: the list's poll clears the host's error, not this). */
+  const [installError, setInstallError] = useState<string | null>(null);
   /** Action surfaces the installed plugins contribute. */
   const [definitions, setDefinitions] = useState<ServiceDefinition[]>(() => peek('definitions') ?? []);
   // Track state per plugin so we toast on a transition (crash, came up),
@@ -172,6 +174,7 @@ export default function PluginsPanel() {
     const source = installSource.trim();
     if (!source) return;
     setInstalling(true);
+    setInstallError(null);
     try {
       const out = await plugins.install(source);
       // A new plugin with a setup wizard: its wizard opens now. An update whose
@@ -198,7 +201,7 @@ export default function PluginsPanel() {
       await Promise.all([refresh(), refetchSetup()]);
       if (opensSetup) openSetup({ plugin: out.id });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setInstallError(e instanceof Error ? e.message : String(e));
     } finally {
       setInstalling(false);
     }
@@ -218,9 +221,12 @@ export default function PluginsPanel() {
 
   const trustPlugin = useCallback(
     async (p: PluginRecord) => {
-      const name = p.manifest?.name ?? p.id;
-      const declaresAi = p.manifest?.capabilities?.includes('oaiy.ai.complete') === true;
-      const declaresVoice = p.manifest?.capabilities?.includes('oaiy.voice.session') === true;
+      // (a package not trusted yet has no manifest here: what it says of itself is shown instead, never acted on)
+      const declared = declaredOf(p);
+      const name = p.manifest?.name ?? declared?.name ?? p.id;
+      const capabilities = p.manifest?.capabilities ?? declared?.capabilities ?? [];
+      const declaresAi = capabilities.includes('oaiy.ai.complete');
+      const declaresVoice = capabilities.includes('oaiy.voice.session');
       if (
         !confirm(
           `Trust the "${name}" plugin?\n\nIt is not signed, so OAIY cannot tell who made it. Trusting it lets it run as native code with your permissions. ` +
@@ -286,7 +292,10 @@ export default function PluginsPanel() {
                 type="text"
                 placeholder={PLUGIN_PATH_EXAMPLE}
                 value={installSource}
-                onChange={(e) => setInstallSource(e.target.value)}
+                onChange={(e) => {
+                  setInstallSource(e.target.value);
+                  setInstallError(null);
+                }}
               />
               {isTauri() && (
                 <button
@@ -303,6 +312,11 @@ export default function PluginsPanel() {
             Installing a plugin installs native code this app will run. Only install plugins you
             trust. Re-installing over an existing plugin updates it in place.
           </p>
+          {installError && (
+            <div className="card-warn" role="alert">
+              <TriangleAlert size={13} aria-hidden /> It was not installed: {installError}
+            </div>
+          )}
           <div className="form-actions">
             <button
               className="btn btn-primary"
@@ -359,7 +373,8 @@ export default function PluginsPanel() {
             <h3 className="section-title">Services from plugins</h3>
           </div>
           {definitions.map((d) => (
-            <div key={d.id} className="service-card service-card-running">
+            // (coloured as the plugin that offers it stands: running, stopped, crashed)
+            <div key={d.id} className={`service-card service-card-${cardStatus(list.find((p) => p.id === d.pluginId)?.state ?? 'stopped')}`}>
               <div className="card-head">
                 <Boxes size={14} aria-hidden />
                 <strong className="card-title">{d.name}</strong>
@@ -445,7 +460,7 @@ function PluginCard({
     <div className={`service-card service-card-${waiting ? 'starting' : cardStatus(p.state)}`}>
       <div className="card-head">
         <CircleDot size={14} aria-hidden />
-        <strong className="card-title">{p.manifest?.name ?? p.id}</strong>
+        <strong className="card-title">{p.manifest?.name ?? declaredOf(p)?.name ?? p.id}</strong>
         <span className={waiting ? 'badge badge-pending' : badgeClass(p.state)}>{waiting ? 'needs setup' : p.state}</span>
         {p.manifest?.version && (
           <span className="card-note">v{p.manifest.version}</span>
@@ -563,7 +578,7 @@ function PluginCard({
         </button>
 
         {loadable && (
-          <button className="btn btn-ghost" onClick={onToggleEnabled}>
+          <button className="btn btn-ghost" onClick={onToggleEnabled} disabled={pending}>
             {p.userDisabled ? 'Enable' : 'Disable'}
           </button>
         )}
@@ -579,6 +594,11 @@ function PluginCard({
       </div>
     </div>
   );
+}
+
+/** What a package that may not run says of itself (its name, version and capabilities): shown, never acted on. */
+function declaredOf(p: PluginRecord): { name: string; version: string; capabilities: string[] } | undefined {
+  return p.declared;
 }
 
 /** Map a plugin state onto a `service-card-<x>` class the CSS already colours. */

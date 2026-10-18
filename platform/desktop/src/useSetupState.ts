@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { setup as setupApi, type SetupState } from './api';
+import { setup as setupApi, type FirstRunState, type SetupState } from './api';
 
 /**
  * The setup wizard's record on the desktop (`GET /api/setup`), shared by every
@@ -12,12 +12,21 @@ import { setup as setupApi, type SetupState } from './api';
 const POLL_MS = 5000;
 
 let snapshot: SetupState | null = null;
+/** Why the record could not be read, while it cannot (not for a desktop without the route: that has no record). */
+let failure: string | null = null;
 let inflight: Promise<SetupState | null> | null = null;
 let timer: number | undefined;
 const listeners = new Set<() => void>();
 
 function publish(next: SetupState): void {
   snapshot = next;
+  failure = null;
+  for (const l of listeners) l();
+}
+
+function fail(why: string | null): void {
+  if (failure === why) return;
+  failure = why;
   for (const l of listeners) l();
 }
 
@@ -30,7 +39,9 @@ function fetchNow(): Promise<SetupState | null> {
       const got = await setupApi.get();
       if (got && typeof got === 'object' && got.firstRun) publish(got);
       return snapshot;
-    } catch {
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      fail(/^404\b/.test(why) ? null : why.replace(/^\d{3}: /, ''));
       return snapshot;
     } finally {
       inflight = null;
@@ -71,9 +82,33 @@ export function useSetupState(): SetupState | null {
   return useSyncExternalStore(subscribe, () => snapshot);
 }
 
+/** Why the record could not be read, while it cannot and none was read before (`null` otherwise). */
+export function useSetupError(): string | null {
+  return useSyncExternalStore(subscribe, () => (snapshot ? null : failure));
+}
+
 /** Ask again now. */
 export function refetchSetup(): Promise<SetupState | null> {
   return fetchNow();
+}
+
+let saving: Promise<unknown> = Promise.resolve();
+
+/**
+ * Change the first-run part of the record: one change after another, each on
+ * the newest record (a change worked out from it, such as a plugin ticked, is
+ * given as a function of it), so two quick changes never undo each other.
+ */
+export function saveFirstRun(change: Partial<FirstRunState> | ((now: FirstRunState) => Partial<FirstRunState>)): Promise<SetupState> {
+  const run = saving.then(async () => {
+    if (!snapshot) throw new Error('Setup is not read yet: try again in a moment.');
+    const { migrated: _migrated, ...now } = snapshot.firstRun;
+    const next = await setupApi.putFirstRun({ ...now, ...(typeof change === 'function' ? change(snapshot.firstRun) : change) });
+    publish(next);
+    return next;
+  });
+  saving = run.catch(() => undefined);
+  return run;
 }
 
 /** A write answered with the new record: everyone sees it at once. */
@@ -84,7 +119,9 @@ export function setSetupState(next: SetupState): void {
 /** For tests: forget the record. */
 export function resetSetupState(): void {
   snapshot = null;
+  failure = null;
   inflight = null;
+  saving = Promise.resolve();
 }
 
 // ---------------------------------------------------------------------------

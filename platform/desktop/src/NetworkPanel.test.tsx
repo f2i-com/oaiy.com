@@ -288,6 +288,20 @@ describe('NetworkPanel', () => {
     expect(container.querySelector('[data-testid="network-pairing"]')).toBeNull();
   });
 
+  it('opens pairing by itself for five minutes where the Agent may set it up, and says who paired so', async () => {
+    const lending = { ...primary, lends: true, role: 'both', agent: true, pairingOpenUntilMs: null, pairedByItself: [{ name: 'Laptop', at: Date.now() }] };
+    api.status.mockResolvedValue(lending);
+    api.setSettings.mockResolvedValue({ ...lending, pairingOpenUntilMs: Date.now() + 5 * 60_000 });
+    await mount();
+    expect(container.textContent).toContain('Laptop paired with this computer by itself');
+    const window_ = () => container.querySelector('[data-testid="network-window"]')!;
+    expect(window_().textContent).toContain('Closed');
+    api.status.mockResolvedValue({ ...lending, pairingOpenUntilMs: Date.now() + 5 * 60_000 });
+    await act(async () => (window_().querySelector('button') as HTMLButtonElement).click());
+    expect(api.setSettings).toHaveBeenCalledWith({ openPairingMinutes: 5 });
+    expect(window_().textContent).toContain('Pairing by itself is open until');
+  });
+
   it('lends its model files while lending itself, until its person unticks it', async () => {
     api.status.mockResolvedValue({ ...primary, lends: true, role: 'both', shareModels: true });
     api.setSettings.mockResolvedValue({ ...primary, lends: true, role: 'both', shareModels: false });

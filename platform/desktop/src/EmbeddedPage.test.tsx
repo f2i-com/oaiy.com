@@ -76,4 +76,19 @@ describe('the box a page in its own webview is laid over', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(shown()).toHaveLength(1);
   });
+
+  it('takes the webview away while a call rings over the page, and lays it where the box is again after', async () => {
+    await act(async () => root.render(<EmbeddedPage page="agent" />));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    expect(h.invoke).toHaveBeenLastCalledWith('show_embedded', expect.objectContaining({ page: 'agent' }));
+    h.invoke.mockClear();
+    await act(async () => root.render(<EmbeddedPage page="agent" covered />));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(h.invoke.mock.calls.map((c) => c[0])).toContain('hide_embedded');
+    expect(h.invoke.mock.calls.map((c) => c[0])).not.toContain('show_embedded');
+    h.invoke.mockClear();
+    await act(async () => root.render(<EmbeddedPage page="agent" />));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    expect(h.invoke).toHaveBeenLastCalledWith('show_embedded', expect.objectContaining({ page: 'agent', x: 222, y: 124 }));
+  });
 });

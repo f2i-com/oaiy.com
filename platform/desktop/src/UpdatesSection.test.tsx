@@ -225,7 +225,9 @@ describe('About and updates', () => {
   it('shows a failure in plain words, with the step that failed, and can try the download again', async () => {
     await mount(status({ state: 'failed', latestVersion: '0.2.0', failedDuring: 'download', error: 'The downloaded update does not match its signature, so it was thrown away. It may be damaged, or not made by OAIY.' }));
     const alert = host.querySelector('[role="alert"]');
-    expect(alert?.textContent).toContain('The update was not downloaded.');
+    // the step that failed said once (the state line), and why under it
+    expect(host.querySelector('.update-state')?.textContent).toContain('The update was not downloaded.');
+    expect(host.textContent!.split('The update was not downloaded.').length - 1).toBe(1);
     expect(alert?.textContent).toContain('does not match its signature');
     expect(button('Restart to update')).toBeUndefined();
     expect(button('Download manually')).toBeTruthy();
@@ -236,13 +238,14 @@ describe('About and updates', () => {
 
   it('shows a failed check as such, and a failed install', async () => {
     await mount(status({ state: 'failed', failedDuring: 'check', error: 'Could not reach the update server. Check the internet connection and try again.' }));
-    expect(host.querySelector('[role="alert"]')?.textContent).toContain('OAIY could not check for updates.');
+    expect(host.querySelector('.update-state')?.textContent).toContain('OAIY could not check for updates.');
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Could not reach the update server');
     expect(button('Try downloading again')).toBeUndefined();
     await act(async () => root.unmount());
     root = createRoot(host);
     invalidate();
     await mount(status({ state: 'failed', latestVersion: '0.2.0', failedDuring: 'install', error: 'The update could not be installed: the installer could not be started (no permission). OAIY started again what it had stopped, and is running as before.' }));
-    expect(host.querySelector('[role="alert"]')?.textContent).toContain('The update was not installed.');
+    expect(host.querySelector('.update-state')?.textContent).toContain('The update was not installed.');
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('running as before');
   });
 

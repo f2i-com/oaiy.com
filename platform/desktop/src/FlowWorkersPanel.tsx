@@ -34,12 +34,15 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
   if (!status.uses || nodes.length === 0) {
     return (
       <div className="panel" data-testid="flow-workers">
+        {error && <div className="banner banner-err">{error}</div>}
         <section className="model-section">
           <div className="section-title-row">
             <h3 className="section-title">Flows on other computers</h3>
           </div>
           <p className="form-hint">
-            {status.uses
+            {status.uses && error
+              ? 'The computers paired with this one could not be read just now: it tries again in a few seconds.'
+              : status.uses
               ? 'No computer is paired to be used yet. Pair one in Setup → Networking, and the flows it shares show here, to run on it from this computer.'
               : status.lends
                 ? 'This computer lends itself (OAIY Network): the flows it shares run here when a paired computer asks. Switch on Use other computers too to run other computers’ flows from here.'
@@ -101,6 +104,22 @@ interface Tracked {
   run: NetworkRun;
   started: number;
   error?: string | null;
+  /** Asks in a row that went unanswered: past a few, the run is let go (said so) rather than asked about forever. */
+  misses?: number;
+  /** Let go: no longer asked about. */
+  lost?: boolean;
+  /** When this computer saw it end. */
+  ended?: number;
+}
+
+/** Each flow card's runs, kept while the page is away (another tab), so a run going on there is still followed. */
+const followed = new Map<string, Tracked[]>();
+/** Asks in a row that went unanswered before a run is let go. */
+const MAX_MISSES = 8;
+
+/** Forget the runs followed (tests start from none). */
+export function forgetFollowedRuns() {
+  followed.clear();
 }
 
 /**
@@ -111,12 +130,19 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(flow.inputs.map((i) => [i.name, typeof i.default === 'string' ? i.default : i.default == null ? '' : JSON.stringify(i.default)])),
   );
-  const [runs, setRuns] = useState<Tracked[]>([]);
+  const card = `${node.nodeId}/${flow.flowId}`;
+  const [runs, setRunsState] = useState<Tracked[]>(() => followed.get(card) ?? []);
+  const setRuns = (next: Tracked[] | ((all: Tracked[]) => Tracked[])) =>
+    setRunsState((all) => {
+      const value = typeof next === 'function' ? next(all) : next;
+      followed.set(card, value);
+      return value;
+    });
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [now, setNow] = useState(Date.now());
   const timer = useRef<number | undefined>(undefined);
-  const going = runs.filter((t) => !TERMINAL.has(t.run.status));
+  const going = runs.filter((t) => !TERMINAL.has(t.run.status) && !t.lost);
 
   // While any runs: each asked every second and a half, and the time each has taken ticks.
   useEffect(() => {
@@ -124,18 +150,31 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
     let stopped = false;
     const tick = async () => {
       setNow(Date.now());
+      // (the window hidden: asked again once it is shown, not meanwhile)
+      if (document.hidden) {
+        timer.current = window.setTimeout(tick, 1500);
+        return;
+      }
       const next = await Promise.all(
         going.map((t) =>
           network
             .run(node.nodeId, t.run.runId)
-            .then((run) => ({ ...t, run, error: null }))
-            .catch((e: unknown) => ({ ...t, error: e instanceof Error ? e.message : String(e) })),
+            .then((run): Tracked => ({ ...t, run, error: null, misses: 0, ended: TERMINAL.has(run.status) ? Date.now() : undefined }))
+            .catch((e: unknown): Tracked => {
+              const misses = (t.misses ?? 0) + 1;
+              const said = e instanceof Error ? e.message : String(e);
+              return misses >= MAX_MISSES
+                ? { ...t, misses, lost: true, error: `Lost track of this run: ${node.name} did not answer (${said}). It may still be running there.` }
+                : { ...t, misses, error: said };
+            }),
         ),
       );
       if (stopped) return;
       setRuns((all) => all.map((t) => next.find((n) => n.run.runId === t.run.runId) ?? t));
     };
-    timer.current = window.setTimeout(tick, 1500);
+    // (a run not answering is asked less often, up to every 10 s)
+    const misses = Math.max(0, ...going.map((t) => t.misses ?? 0));
+    timer.current = window.setTimeout(tick, Math.min(10_000, 1500 * 2 ** misses));
     return () => {
       stopped = true;
       window.clearTimeout(timer.current);
@@ -159,7 +198,7 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
     try {
       await network.cancelRun(node.nodeId, t.run.runId);
       const run = await network.run(node.nodeId, t.run.runId);
-      setRuns((all) => all.map((x) => (x.run.runId === run.runId ? { ...x, run } : x)));
+      setRuns((all) => all.map((x) => (x.run.runId === run.runId ? { ...x, run, ended: TERMINAL.has(run.status) ? Date.now() : undefined } : x)));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -195,8 +234,9 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
       )}
       {runs.map((t, i) => {
         const state = RUN_STATE[t.run.status];
-        const running = !TERMINAL.has(t.run.status);
-        const end = t.run.finishedAt ? Date.parse(t.run.finishedAt) : running ? now : t.started;
+        const running = !TERMINAL.has(t.run.status) && !t.lost;
+        // (this computer's clock alone: the worker's own may differ, so its finishing time is not subtracted from ours)
+        const end = running ? now : (t.ended ?? now);
         const seconds = Math.max(0, Math.round((end - t.started) / 1000));
         return (
           <div className="flow-run-item" key={t.run.runId} data-testid="flow-run">

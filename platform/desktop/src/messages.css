@@ -7,6 +7,9 @@
 .panel.messages-page,
 .panel.transfers-page { max-width: 980px; gap: 14px; }
 
+/* What could not be read or done, beside the form or list it is about. */
+.form-error { margin: 0; color: var(--danger); font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
+
 /* ---- the toolbar: which messages, and a search ----------------------------------------- */
 
 .messages-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; }
@@ -14,7 +17,7 @@
 .messages-search > svg { position: absolute; left: 11px; color: var(--faint); pointer-events: none; }
 .messages-search input { height: 34px; width: 100%; padding-left: 32px; font-size: 13px; }
 
-.messages-notice { margin: 0; border: 1px solid var(--warn, #b7791f); border-radius: var(--r-card); padding: 8px 12px; font-size: 12.5px; line-height: 1.45; }
+.messages-notice { margin: 0; border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--border)); border-radius: var(--r-card); background: var(--amber-soft); padding: 8px 12px; font-size: 12.5px; line-height: 1.45; }
 .messages-empty { display: flex; align-items: center; gap: 12px; padding: 22px 6px; color: var(--muted); }
 .messages-empty p { margin: 0; max-width: 60ch; font-size: 13.5px; line-height: 1.5; }
 
@@ -60,7 +63,7 @@
 .transfers-devices { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .transfers-devices li { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; border: 1px solid var(--border); border-radius: var(--r-card); padding: 8px 12px; }
 .transfers-devices li strong { font-size: 13px; }
-.transfers-saved { display: inline-flex; align-items: center; gap: 5px; color: var(--success, #2f9e63); font-size: 12.5px; }
+.transfers-saved { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 12.5px; }
 
 /* ---- the ring dialog: a caller wants to speak to the owner ----------------------------- */
 
@@ -94,5 +97,5 @@
 .ring-notice { background: var(--surface, #1f2933); border: 1px solid var(--border); border-radius: var(--r-card); padding: 10px 12px; font-size: 12.5px; line-height: 1.45; box-shadow: 0 6px 24px color-mix(in srgb, #000 30%, transparent); }
 .ring-notice p { margin: 0 0 4px; }
 .ring-notice-actions { display: flex; gap: 8px; margin-top: 6px; }
-.transfers-warning { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 6px 10px; border: 1px solid var(--warn, #b7791f); border-radius: var(--r-card); padding: 8px 12px; font-size: 12.5px; line-height: 1.45; }
+.transfers-warning { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 6px 10px; border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--border)); background: var(--amber-soft); border-radius: var(--r-card); padding: 8px 12px; font-size: 12.5px; line-height: 1.45; }
 .transfers-warning span { flex: 1 1 260px; }

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Inbox, RotateCw, X } from 'lucide-react';
 import { bridge, type DeadLetter } from './api';
+import { useVisiblePoll } from './useVisiblePoll';
 
 /**
  * Events that arrived and produced no work.
@@ -24,7 +25,8 @@ function when(ms: number): string {
 
 export default function DeadLetters() {
   const [items, setItems] = useState<DeadLetter[] | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  /** What is being asked about which entry: Redrive says "Redriving…" for a redrive alone. */
+  const [busy, setBusy] = useState<{ id: string; action: 'redrive' | 'dismiss' } | null>(null);
   // Section-level, not per row: a successful redrive REMOVES its row, so a note
   // pinned to it would vanish with the thing it was confirming.
   const [note, setNote] = useState<string | null>(null);
@@ -38,14 +40,11 @@ export default function DeadLetters() {
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-    const id = window.setInterval(() => void refresh(), POLL_MS);
-    return () => window.clearInterval(id);
-  }, [refresh]);
+  // (not while the window is hidden in the tray)
+  useVisiblePoll(() => void refresh(), POLL_MS);
 
   const redrive = async (item: DeadLetter) => {
-    setBusy(item.id);
+    setBusy({ id: item.id, action: 'redrive' });
     setNote(null);
     try {
       const r = await bridge.redrive(item.id);
@@ -67,17 +66,34 @@ export default function DeadLetters() {
   };
 
   const dismiss = async (item: DeadLetter) => {
-    setBusy(item.id);
+    if (!window.confirm(`Dismiss ${item.event}? It is taken off this list and never run.`)) return;
+    setBusy({ id: item.id, action: 'dismiss' });
+    setNote(null);
     try {
       await bridge.dismissDeadLetter(item.id);
       await refresh();
+    } catch (e) {
+      setNote(`${item.event} could not be dismissed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy(null);
     }
   };
 
-  // Nothing here is the normal state — an empty section would be noise.
-  if (items === null || items.length === 0) return null;
+  // Nothing here is the normal state — an empty section would be noise; but what the last redrive did stays said
+  // after its entry has gone.
+  if (items === null || (items.length === 0 && !note)) return null;
+  if (items.length === 0) {
+    return (
+      <section className="service-section">
+        <div className="datadir-note">
+          <span>{note}</span>
+          <button className="btn-tiny" onClick={() => setNote(null)}>
+            <X size={13} /> Close
+          </button>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="service-section">
@@ -118,11 +134,11 @@ export default function DeadLetters() {
             )}
 
             <div className="form-actions">
-              <button className="btn-tiny" disabled={busy === d.id} onClick={() => void redrive(d)}>
-                <RotateCw size={13} /> {busy === d.id ? 'Redriving…' : 'Redrive'}
+              <button className="btn-tiny" disabled={busy?.id === d.id} onClick={() => void redrive(d)}>
+                <RotateCw size={13} /> {busy?.id === d.id && busy.action === 'redrive' ? 'Redriving…' : 'Redrive'}
               </button>
-              <button className="btn-tiny" disabled={busy === d.id} onClick={() => void dismiss(d)}>
-                <X size={13} /> Dismiss
+              <button className="btn-tiny" disabled={busy?.id === d.id} onClick={() => void dismiss(d)}>
+                <X size={13} /> {busy?.id === d.id && busy.action === 'dismiss' ? 'Dismissing…' : 'Dismiss'}
               </button>
             </div>
           </li>

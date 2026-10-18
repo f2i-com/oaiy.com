@@ -175,3 +175,24 @@ describe('Settings → Agent with the routes', () => {
     expect(m.prefsSet).toHaveBeenLastCalledWith({ model: { source: 'engine' } });
   });
 });
+
+describe('Settings → Agent when a read fails', () => {
+  it('says the Agent’s settings and its changes could not be read, and reads them again when asked', async () => {
+    m.prefsGet.mockRejectedValueOnce(new Error('500: the desktop is busy'));
+    m.log.mockRejectedValueOnce(new Error('500: the log is busy'));
+    await render();
+    const model = section('The Agent’s model');
+    expect(model.textContent).toContain('The Agent’s settings could not be read: the desktop is busy');
+    expect(model.textContent).not.toContain('Checking…');
+    const log = section('What the Agent changed');
+    expect(log.textContent).toContain('What the Agent changed could not be read: the log is busy');
+    m.prefsGet.mockResolvedValue({ model: { source: 'engine' } });
+    await act(async () => model.querySelector<HTMLButtonElement>('.setup-retry button')!.click());
+    await settle();
+    expect(section('The Agent’s model').textContent).not.toContain('could not be read');
+    m.log.mockResolvedValue([]);
+    await act(async () => section('What the Agent changed').querySelector<HTMLButtonElement>('.setup-retry button')!.click());
+    await settle();
+    expect(section('What the Agent changed').textContent).toContain('Nothing yet');
+  });
+});

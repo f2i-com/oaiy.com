@@ -14,8 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const {
   relayStatusMock, setRelayMock, clearRelayMock,
   linkStatusMock, linkStartMock, unlinkMock, removeCopiesMock, cancelLinkMock,
-  pendingMock, pairedMock, pushMock,
+  pendingMock, pairedMock, pushMock, approveMock, openExternalMock,
 } = vi.hoisted(() => ({
+  approveMock: vi.fn(),
+  openExternalMock: vi.fn(),
   relayStatusMock: vi.fn(),
   setRelayMock: vi.fn(),
   clearRelayMock: vi.fn(),
@@ -30,6 +32,7 @@ const {
 }));
 
 vi.mock('./api', () => ({
+  openExternal: openExternalMock,
   companion: {
     relayStatus: relayStatusMock,
     setRelay: setRelayMock,
@@ -45,7 +48,7 @@ vi.mock('./api', () => ({
   pairing: {
     pending: pendingMock,
     paired: pairedMock,
-    approve: vi.fn(),
+    approve: approveMock,
     deny: vi.fn(),
     revoke: vi.fn(),
   },
@@ -756,5 +759,40 @@ describe('ConnectionsPanel · Companion relay', () => {
     });
     await mount();
     expect(container.textContent).toContain('reconnect');
+  });
+});
+
+describe('ConnectionsPanel · Connected apps', () => {
+  it('says what a connected app can do beside the list, and nothing about the list before it is read', async () => {
+    pairedMock.mockReturnValue(new Promise(() => {}));
+    await mount();
+    expect(container.textContent).toContain('A connected app can run flows and call plugins on this machine');
+    expect(container.textContent).toContain('Reading the connected apps');
+    expect(container.textContent).not.toContain('Nothing is connected');
+  });
+
+  it('keeps the answer to an Approve on screen past the next reading of the list', async () => {
+    pendingMock.mockResolvedValue({ pending: [{ pairingId: 'p1', product: 'Acme', code: 'ABCD', label: null, origin: null }] });
+    approveMock.mockRejectedValue(new Error('The request expired: ask the app to connect again.'));
+    await mount();
+    await click('Approve');
+    expect(container.textContent).toContain('The request expired');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(7000);
+    });
+    expect(container.textContent).toContain('The request expired');
+  });
+
+  it('opens the approval page in the computer’s browser, not in the app’s window', async () => {
+    linkStatusMock.mockResolvedValue({
+      linked: false,
+      attempt: { phase: 'awaitingBrowser', authorizeUrl: 'https://acme.example/authorize?x=1' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    const a = container.querySelector<HTMLAnchorElement>('a[href^="https://acme.example/authorize"]')!;
+    expect(a.target).toBe('');
+    await act(async () => a.click());
+    expect(openExternalMock).toHaveBeenCalledWith('https://acme.example/authorize?x=1');
   });
 });

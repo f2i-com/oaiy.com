@@ -363,7 +363,8 @@ describe('without the AI Receptionist', () => {
     });
     await settle();
     expect(nav().querySelector('.nav-sub')).toBeNull();
-    expect(nav().querySelector('button[aria-label="Calendar"]')).not.toBeNull();
+    // (named with what waits there too, "Calendar, 1 request waiting", as a page of its own now says it)
+    expect(nav().querySelector('button[aria-label^="Calendar"]')).not.toBeNull();
     await go('hours');
     expect(title()).toBe('Calendar');
     expect([...host.querySelectorAll('.section-tabs [role="tab"]')].map((t) => t.textContent)).toEqual(['Calendar', 'Hours & Services']);

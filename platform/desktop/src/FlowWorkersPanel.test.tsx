@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const api = vi.hoisted(() => ({ network: { status: vi.fn(), nodes: vi.fn(), runFlow: vi.fn(), run: vi.fn(), cancelRun: vi.fn(), picture: vi.fn() } }));
 vi.mock('./api', () => api);
 vi.mock('./useVisiblePoll', () => ({ useVisiblePoll: () => {} }));
-import FlowWorkersPanel from './FlowWorkersPanel';
+import FlowWorkersPanel, { forgetFollowedRuns } from './FlowWorkersPanel';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -14,6 +14,7 @@ const rig = { nodeId: 'w1', name: 'Rig', role: 'worker', online: true, devices: 
 const picture = 'http://127.0.0.1:17972/api/network/nodes/w1/gateway/files/images/a.png';
 
 beforeEach(() => {
+  forgetFollowedRuns();
   vi.clearAllMocks();
   vi.useFakeTimers();
   api.network.status.mockResolvedValue({ enabled: true, role: 'primary', uses: true, lends: false });
@@ -80,6 +81,27 @@ describe('FlowWorkersPanel', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
     expect(api.network.run).toHaveBeenCalledWith('w1', 'r1');
     expect(api.network.run).toHaveBeenCalledWith('w1', 'r2');
+  });
+
+  it('still follows a run after the page was left and opened again, and lets go of one that stops answering', async () => {
+    api.network.runFlow.mockResolvedValue({ runId: 'r1', status: 'running' });
+    api.network.run.mockRejectedValue(new Error('503: Rig did not answer'));
+    await mount();
+    await act(async () => button('Run on Rig').click());
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await mount();
+    const card = () => container.querySelector('[data-testid="flow-run-card"]')!;
+    expect(card().querySelectorAll('[data-testid="flow-run"]').length).toBe(1);
+    expect(card().textContent).toContain('Running');
+    // asked less and less often, then let go, saying so
+    for (let i = 0; i < 12; i++) await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(card().textContent).toContain('Lost track of this run');
+    const asked = api.network.run.mock.calls.length;
+    expect(asked).toBeLessThanOrEqual(8);
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(api.network.run.mock.calls.length).toBe(asked);
+    expect(card().querySelector('button[title="Stop"], .flow-run-item-head .btn-tiny')).toBeNull();
   });
 
   it('says how a computer shares a flow, where a worker shares none', async () => {

@@ -19,6 +19,8 @@ const h = vi.hoisted(() => ({
   backupInspect: vi.fn(),
   backupUndo: vi.fn(),
   appConfigGet: vi.fn(),
+  migrationStatus: vi.fn(),
+  restart: vi.fn(),
 }));
 
 vi.mock('./api', async (importOriginal) => {
@@ -48,6 +50,8 @@ vi.mock('./api', async (importOriginal) => {
       logPath: () => Promise.resolve(null),
       getHfTokenStatus: () => Promise.resolve(false),
       migrationPlan: () => Promise.reject(new Error('none')),
+      migrationStatus: (...a: unknown[]) => h.migrationStatus(...a),
+      restart: (...a: unknown[]) => h.restart(...a),
     },
     setup: { ...real.setup, get: () => Promise.reject(new Error('no setup record in this test')) },
   };
@@ -116,6 +120,8 @@ const button = (label: string) => Array.from(host.querySelectorAll('button')).fi
 beforeEach(() => {
   vi.clearAllMocks();
   invalidate();
+  h.migrationStatus.mockResolvedValue({ running: false, mode: '', filesTotal: 0, filesDone: 0, bytesTotal: 0, bytesDone: 0, current: '', done: false, error: null });
+  h.restart.mockResolvedValue(undefined);
   h.appConfigGet.mockResolvedValue({
     activeDir: 'C:/data',
     defaultDir: 'C:/data',
@@ -198,5 +204,53 @@ describe('Settings holds both About and updates and Backup and restore', () => {
     expect(text()).toContain('A restore is ready');
     expect(button('Restart to update')).toBeTruthy();
     expect(button('Restart to finish restoring')).toBeTruthy();
+  });
+});
+
+/** Let what the panel asked for answer (a few turns of the event loop). */
+async function settle() {
+  for (let i = 0; i < 6; i++) {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  }
+}
+
+describe('restarting for a new data folder', () => {
+  const pending = {
+    activeDir: 'C:/data',
+    defaultDir: 'C:/data',
+    configuredDir: 'D:/oaiy',
+    isCustom: false,
+    restartRequired: true,
+    modelsActiveDir: 'C:/data/models',
+    modelsDefaultDir: 'C:/data/models',
+    modelsConfiguredDir: null,
+    modelsIsCustom: false,
+    modelsRestartRequired: false,
+  };
+
+  it('waits for a copy or move still running when Settings is opened again, and does not restart under it', async () => {
+    h.appConfigGet.mockResolvedValue(pending);
+    h.migrationStatus.mockResolvedValue({ running: true, mode: 'move', filesTotal: 10, filesDone: 3, bytesTotal: 100, bytesDone: 30, current: 'models/a.gguf', done: false, error: null });
+    await mount();
+    await settle();
+    expect(h.migrationStatus).toHaveBeenCalled();
+    expect(button('Restart now')?.disabled).toBe(true);
+  });
+
+  it('says why a restart has to wait', async () => {
+    h.appConfigGet.mockResolvedValue(pending);
+    h.restart.mockRejectedValue(new Error('Restarting has to wait. A phone call is live. Try again when it is finished.'));
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await mount();
+    await settle();
+    await act(async () => {
+      button('Restart now')!.click();
+    });
+    await settle();
+    expect(h.restart).toHaveBeenCalled();
+    expect(text()).toContain('Restarting has to wait. A phone call is live.');
+    confirm.mockRestore();
   });
 });

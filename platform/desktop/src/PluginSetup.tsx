@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
 import { Bot, Check, ExternalLink, Loader2, PhoneForwarded, Play, RotateCcw, ShieldCheck, TriangleAlert } from 'lucide-react';
 import {
   agentIntent,
@@ -191,6 +191,8 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
 
   const [busy, setBusy] = useState(false);
   const [stepError, setStepError] = useState<string | null>(null);
+  // A settings step's form: whether it has edits not saved, and its Save (Next saves it before moving on).
+  const settingsForm = useRef<SettingsFormHandle | null>(null);
   const [progress, setProgress] = useState<{ fraction: number | null; text: string } | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   useEffect(() => {
@@ -288,7 +290,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
           <>
             {head}
             <PluginRunNote record={record} onStarted={() => void refreshPlugins()} />
-            <SettingsStep key={s.id} record={record} step={s} onSaved={() => mark(s.id)} />
+            <SettingsStep key={s.id} record={record} step={s} onSaved={() => mark(s.id)} handle={settingsForm} />
           </>
         );
         break;
@@ -349,6 +351,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
     }
   }
 
+  const isSettings = current?.step.kind === 'settings';
   const status = stepError ? (
     <span className="card-warn">{stepError}</span>
   ) : current?.state === 'done' ? (
@@ -358,8 +361,27 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   ) : current?.step.optional ? (
     'Optional'
   ) : current ? (
-    current.step.kind === 'permissions' ? 'Accept to go on' : 'Waiting for this step'
+    current.step.kind === 'permissions' ? 'Accept to go on' : isSettings ? 'Save to go on' : 'Waiting for this step'
   ) : null;
+
+  /** A settings step: its edits saved (and a required one recorded done by saving) before moving on. */
+  const saveAndGo = async () => {
+    // (asked at the click: the form tells its state once it has drawn)
+    const form = settingsForm.current;
+    if (!form) {
+      if (current && !canMoveOn(current)) setStepError('Its settings are not read yet: try again in a moment.');
+      else next();
+      return;
+    }
+    if (form.dirty || current?.state !== 'done') {
+      setBusy(true);
+      setStepError(null);
+      const saved = await form.save();
+      setBusy(false);
+      if (!saved) return;
+    }
+    next();
+  };
 
   const acceptAndGo = async () => {
     setBusy(true);
@@ -390,9 +412,25 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
             : undefined
       }
       skipLabel={current && canSkip(current) ? 'Skip' : 'Set it up later'}
-      onNext={current ? (current.step.kind === 'permissions' && current.state !== 'done' ? () => void acceptAndGo() : next) : undefined}
-      nextLabel={current?.step.kind === 'permissions' && current.state !== 'done' ? 'Accept and continue' : isLast ? 'Finish' : 'Next'}
-      nextDisabled={!current || (current.step.kind !== 'permissions' && !canMoveOn(current))}
+      onNext={
+        current
+          ? current.step.kind === 'permissions' && current.state !== 'done'
+            ? () => void acceptAndGo()
+            : isSettings
+              ? () => void saveAndGo()
+              : next
+          : undefined
+      }
+      nextLabel={
+        current?.step.kind === 'permissions' && current.state !== 'done'
+          ? 'Accept and continue'
+          : isSettings && current?.state !== 'done' && !current?.step.optional
+            ? 'Save and continue'
+            : isLast
+              ? 'Finish'
+              : 'Next'
+      }
+      nextDisabled={!current || (current.step.kind !== 'permissions' && !isSettings && !canMoveOn(current))}
       busy={busy}
     />
   );
@@ -529,12 +567,21 @@ function fieldValue(field: SettingsField, raw: unknown): unknown {
   return raw ?? '';
 }
 
-function SettingsStep({ record, step, onSaved }: { record: PluginRecord; step: DeclaredStep; onSaved: () => Promise<void> }) {
+/** A settings step's form, as the wizard's Next reaches it. */
+interface SettingsFormHandle {
+  /** Edits not saved yet. */
+  dirty: boolean;
+  /** Save: `true` once saved. */
+  save: () => Promise<boolean>;
+}
+
+function SettingsStep({ record, step, onSaved, handle }: { record: PluginRecord; step: DeclaredStep; onSaved: () => Promise<void>; handle?: MutableRefObject<SettingsFormHandle | null> }) {
   const fields = step.fields ?? [];
   const [values, setValues] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const load = useCallback(async () => {
     try {
       const data = await pluginCommand(record, step.read?.command ?? 'settings.get');
@@ -548,25 +595,42 @@ function SettingsStep({ record, step, onSaved }: { record: PluginRecord; step: D
   }, [record.id, step.id]);
   useEffect(() => void load(), [load]);
 
-  const save = async () => {
-    if (!values) return;
+  const save = async (): Promise<boolean> => {
+    if (!values) return false;
     setSaving(true);
     setError(null);
     try {
-      const payload = Object.fromEntries(fields.map((f) => [f.key, f.type === 'number' ? Number(values[f.key]) : values[f.key]]));
+      // (a number left blank is left as it is, not saved as 0)
+      const payload = Object.fromEntries(
+        fields
+          .filter((f) => !(f.type === 'number' && (values[f.key] === '' || values[f.key] === undefined || values[f.key] === null)))
+          .map((f) => [f.key, f.type === 'number' ? Number(values[f.key]) : values[f.key]]),
+      );
       await pluginCommand(record, step.write?.command ?? 'settings.set', payload);
       await onSaved();
       setSaved(true);
+      setDirty(false);
+      return true;
     } catch (e) {
       setError(`Not saved: ${errorText(e)}`);
+      return false;
     } finally {
       setSaving(false);
     }
   };
+  // The wizard's Next saves this form first (a ref: it asks at the click, for what is in the form then).
+  useEffect(() => {
+    if (!handle) return;
+    handle.current = values ? { dirty, save } : null;
+    return () => {
+      handle.current = null;
+    };
+  });
 
   if (!values) return error ? <RetryLine message={error} onRetry={() => void load()} /> : <p className="form-hint">Reading its settings…</p>;
   const set = (key: string, v: unknown) => {
     setSaved(false);
+    setDirty(true);
     setValues((prev) => ({ ...prev, [key]: v }));
   };
   return (
@@ -667,8 +731,9 @@ function AnswerWithOaiyStep({
       })) as { appliesAtReconnect?: string[]; blocked?: string } | undefined;
       // Where calls go is read when the plugin starts: it says so, and a restart applies it.
       setRestart(out?.appliesAtReconnect?.length ? out.appliesAtReconnect : null);
-      if (out?.blocked) setRouteError(`Saved, but ${name} is paused: ${out.blocked}`);
+      // (read first: reading clears the line, and this one is to stay)
       await read();
+      if (out?.blocked) setRouteError(`Saved, but ${name} is paused: ${out.blocked}`);
     } catch (e) {
       setRouteError(errorText(e));
     } finally {

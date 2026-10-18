@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
-import { Check, ChevronRight, CircleDashed, ListChecks, PartyPopper, X } from 'lucide-react';
-import { engines } from './api';
+import { Check, ChevronRight, CircleDashed, ListChecks, PartyPopper, TriangleAlert, X } from 'lucide-react';
+import { agentPreferences, engines, link } from './api';
 import {
   deriveSetupSteps,
   setupComplete,
@@ -9,10 +9,10 @@ import {
   type StepId,
   type StepTarget,
 } from './setupGuide';
-import { firstRunProgress, firstRunSteps, pluginsNeedingSetup, readSetup } from './setupFlow';
-import { usePoll } from './SetupParts';
+import { chosenModel, firstRunProgress, firstRunSteps, pluginsNeedingSetup, readSetup } from './setupFlow';
+import { answered, RetryLine, usePoll } from './SetupParts';
 import { useLiveSetup } from './useLiveSetup';
-import { openSetup, useSetupState } from './useSetupState';
+import { openSetup, refetchSetup, useSetupError, useSetupState } from './useSetupState';
 
 /**
  * The Overview's setup card: a compact "Continue setup" while the first-run
@@ -29,32 +29,45 @@ interface Props extends SetupInput {
   onNavigate: (target: StepTarget) => void;
   onDismiss: () => void;
   actions?: Partial<Record<StepId, ReactNode>>;
+  /** The plugins found set up by their live checks, where the page asks them already (else asked here). */
+  live?: Record<string, boolean | null | undefined>;
 }
 
-export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...state }: Props) {
+export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: liveFromPage, ...state }: Props) {
   const setup = useSetupState();
-  // The model chosen in Engines counts for the engine step (asked now and then; the card is small).
-  const [catalog] = usePoll(() => engines.catalog(), 15000, !!setup && !setup.firstRun.finished);
+  const setupError = useSetupError();
+  const unfinished = !!setup && !setup.firstRun.finished;
+  // What the wizard reads for its steps (asked now and then; the card is small): the model chosen in Engines, the
+  // Agent's model (a provider counts for "Your AI"), and a linked account (for "Connect an app").
+  const [catalog] = usePoll(() => engines.catalog(), 15000);
+  const [prefsAnswer, , prefsError] = usePoll(() => agentPreferences.get().then((v) => ({ v })), 15000, unfinished);
+  const [linked] = usePoll(() => link.status().then((l) => l.linked), 30000, unfinished);
   // A plugin set up by hand counts as set up once its steps' checks all pass (no nudge while they are asked).
-  const live = useLiveSetup(state.plugins, setup);
-  const checks = deriveSetupSteps(state);
+  const ownLive = useLiveSetup(liveFromPage ? null : state.plugins, setup);
+  const live = liveFromPage ?? ownLive;
+  const checks = deriveSetupSteps({ ...state, engineModel: state.engineModel ?? !!chosenModel(catalog, 'llm') });
   const guide = setupProgress(checks);
   const complete = setupComplete(checks);
+  // (the checks known: what they read has answered, so a check is not called failing while it is asked)
+  const known = state.runtime !== null && state.providers !== null && state.services !== null && catalog !== null;
+  const failing = setup?.firstRun.finished && known ? checks.filter((s) => !s.done && !s.optional) : [];
   const nudges = pluginsNeedingSetup(state.plugins, setup, live);
-  const firstRun = setup && !setup.firstRun.finished ? firstRunSteps({ state: setup, plugins: state.plugins, catalog, guide: state, live }) : null;
+  const firstRun = unfinished
+    ? firstRunSteps({ state: setup, plugins: state.plugins, catalog, guide: state, live, prefs: answered(prefsAnswer, prefsError), linked: linked === true })
+    : null;
   const progress = firstRun ? firstRunProgress(firstRun) : null;
-  const nextUp = firstRun?.find((s) => s.state === 'todo' && s.id !== 'welcome' && s.id !== 'handoff') ?? firstRun?.find((s) => s.id === 'handoff' && s.state === 'todo');
+  const nextUp = firstRun?.find((s) => s.state === 'todo' && s.id !== 'welcome' && s.id !== 'handoff' && s.id !== 'done') ?? firstRun?.find((s) => s.id === 'handoff' && s.state === 'todo');
 
   const title = firstRun
     ? `Continue setup · ${progress!.done} of ${progress!.total}`
     : nudges.length
       ? 'Finish setting up'
-      : setup
-        ? 'You’re set up'
-        : complete
+      : failing.length
+        ? 'Something needs a look'
+        : setup || complete
           ? 'You’re set up'
           : `Getting started · ${guide.done} of ${guide.total}`;
-  const settled = !firstRun && !nudges.length && (setup ? true : complete);
+  const settled = !firstRun && !nudges.length && !failing.length && (setup ? true : complete);
 
   return (
     <section className={settled ? 'service-section setup-guide is-complete' : 'service-section setup-guide'}>
@@ -105,7 +118,16 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...sta
           <PartyPopper size={13} /> {setup ? 'Setup is finished.' : 'The runtime is ready and your flows have a model.'} Run it again from Settings any time.
         </p>
       )}
-      {!setup && !complete && (
+      {/* Finished once, and something it set up is not true any more: said here, not inside the collapsed list. */}
+      {failing.length > 0 && (
+        <ul className="setup-list">
+          {failing.map((s) => (
+            <CheckRow key={s.id} step={s} action={actions?.[s.id]} onNavigate={onNavigate} alarm />
+          ))}
+        </ul>
+      )}
+      {!setup && setupError && <RetryLine message={`Setup could not be read: ${setupError}`} onRetry={() => void refetchSetup()} />}
+      {!setup && !setupError && !complete && (
         <div className="form-actions">
           <button className="btn btn-primary" onClick={() => openSetup()}>
             Open setup <ChevronRight size={14} />
@@ -117,32 +139,39 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...sta
         <summary>View all setup checks</summary>
         <ul className="setup-list">
           {checks.map((s) => (
-            <li key={s.id} className={s.done ? 'setup-step is-done' : 'setup-step'}>
-              <span className="setup-mark" aria-hidden>
-                {s.done ? <Check size={14} /> : <CircleDashed size={14} />}
-              </span>
-              <span className="setup-body">
-                <strong>
-                  {s.title}
-                  {s.optional && <em className="setup-optional">optional</em>}
-                </strong>
-                <small>{s.blocker ?? s.detail}</small>
-              </span>
-              {!s.done &&
-                (actions?.[s.id] ?? (
-                  <button className="btn-tiny" onClick={() => onNavigate(s.target)}>
-                    {s.cta} <ChevronRight size={12} />
-                  </button>
-                ))}
-              {s.done && (
-                <span className="setup-done-label" aria-label={`${s.title} — done`}>
-                  done
-                </span>
-              )}
-            </li>
+            <CheckRow key={s.id} step={s} action={actions?.[s.id]} onNavigate={onNavigate} />
           ))}
         </ul>
       </details>
     </section>
+  );
+}
+
+/** One setup check: done, or what is missing and the way to it. */
+function CheckRow({ step: s, action, onNavigate, alarm }: { step: ReturnType<typeof deriveSetupSteps>[number]; action?: ReactNode; onNavigate: (target: StepTarget) => void; alarm?: boolean }) {
+  return (
+    <li className={s.done ? 'setup-step is-done' : 'setup-step'}>
+      <span className="setup-mark" aria-hidden>
+        {s.done ? <Check size={14} /> : alarm ? <TriangleAlert size={14} /> : <CircleDashed size={14} />}
+      </span>
+      <span className="setup-body">
+        <strong>
+          {s.title}
+          {s.optional && <em className="setup-optional">optional</em>}
+        </strong>
+        <small>{s.blocker ?? s.detail}</small>
+      </span>
+      {!s.done &&
+        (action ?? (
+          <button className="btn-tiny" onClick={() => onNavigate(s.target)}>
+            {s.cta} <ChevronRight size={12} />
+          </button>
+        ))}
+      {s.done && (
+        <span className="setup-done-label" aria-label={`${s.title} — done`}>
+          done
+        </span>
+      )}
+    </li>
   );
 }

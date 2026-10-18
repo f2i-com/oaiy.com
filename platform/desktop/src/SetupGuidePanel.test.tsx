@@ -8,16 +8,22 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const setupState = vi.hoisted(() => ({ value: null as unknown }));
+const setupState = vi.hoisted(() => ({ value: null as unknown, error: null as string | null }));
 const openSetup = vi.hoisted(() => vi.fn());
+const refetchSetup = vi.hoisted(() => vi.fn());
+const catalogMock = vi.hoisted(() => vi.fn());
 vi.mock('./useSetupState', () => ({
   useSetupState: () => setupState.value,
+  useSetupError: () => setupState.error,
+  refetchSetup: (...a: unknown[]) => refetchSetup(...a),
   openSetup: (...a: unknown[]) => openSetup(...a),
 }));
-// No desktop in a test: the engines' catalog is not there.
+// No desktop in a test: the engines' catalog is not there unless a test says so.
 vi.mock('./api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./api')>()),
-  engines: { catalog: vi.fn().mockRejectedValue(new Error('no engines')) },
+  engines: { catalog: (...a: unknown[]) => catalogMock(...a) },
+  agentPreferences: { get: vi.fn().mockResolvedValue(null) },
+  link: { status: vi.fn().mockResolvedValue({ linked: false }) },
 }));
 
 import SetupGuidePanel from './SetupGuidePanel';
@@ -71,7 +77,10 @@ const button = (label: string) => Array.from(host.querySelectorAll('button')).fi
 
 beforeEach(() => {
   setupState.value = null;
+  setupState.error = null;
   openSetup.mockReset();
+  refetchSetup.mockReset();
+  catalogMock.mockReset().mockRejectedValue(new Error('no engines'));
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -136,6 +145,31 @@ describe('the setup card', () => {
     expect(openSetup).toHaveBeenCalled();
     render({ runtime: READY, providers: [{ id: 'p', enabled: true, hasKey: true, allowLocal: false } as never] });
     expect(host.textContent).toContain('You’re set up');
+  });
+
+  it('says what needs a look once setup is finished and something it set up is not true any more', async () => {
+    setupState.value = record(true);
+    // A language model chosen in Engines counts as the flows' model; the runtime is broken.
+    catalogMock.mockResolvedValue({ running: true, defaults: { llm: 'qwen3.5-9b' } });
+    await act(async () => {
+      root.render(<SetupGuidePanel {...input} onNavigate={vi.fn()} onDismiss={vi.fn()} />);
+    });
+    await act(async () => {});
+    expect(host.querySelector('.section-title')?.textContent).toBe('Something needs a look');
+    expect(host.querySelector('.setup-guide')!.className).not.toContain('is-complete');
+    expect(host.textContent).not.toContain('Setup is finished.');
+    // Outside the collapsed list: the runtime alone (the model is chosen in Engines).
+    const outside = Array.from(host.querySelectorAll('.setup-guide > .setup-list .setup-step')).map((li) => li.querySelector('strong')?.textContent);
+    expect(outside).toEqual(['Get the flow runtime ready']);
+  });
+
+  it('says setup could not be read, with a way to ask again, rather than a wizard that never loads', () => {
+    setupState.error = 'the desktop is busy';
+    render();
+    expect(host.textContent).toContain('Setup could not be read: the desktop is busy');
+    expect(button('Open setup')).toBeUndefined();
+    act(() => button('Try again')!.click());
+    expect(refetchSetup).toHaveBeenCalled();
   });
 
   it('reports dismissal to its caller', () => {

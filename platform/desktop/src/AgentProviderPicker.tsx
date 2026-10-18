@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Loader2, Plug, RotateCcw } from 'lucide-react';
-import { aiProviders, type AiProviderPublic } from './api';
+import { aiProviders, type AiCapability, type AiProviderPublic } from './api';
 import { errorText } from './SetupParts';
 
 /**
@@ -111,17 +111,22 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
   const preset = current.startsWith(PRESET) ? PROVIDER_PRESETS.find((p) => `${PRESET}${p.id}` === current) ?? null : null;
   const provider = preset ? null : usable.find((p) => p.id === current) ?? null;
 
-  /** Ask `p` for its models; with them, pick the model to start on. */
+  /**
+   * Ask `p` for its models. The model the Agent is on, or the one `p` was set up with, stays chosen; after Connect
+   * (`pickFirst`) its first is chosen too. Otherwise the person chooses one: a provider merely looked at does not
+   * change the Agent's model (its first listed may be an embedding model).
+   */
   const loadModels = useCallback(
-    async (p: AiProviderPublic) => {
+    async (p: AiProviderPublic, pickFirst = false) => {
       setBusy(true);
       setError(null);
       try {
         const list = await aiProviders.models(p.id);
         setModels({ id: p.id, list });
-        const model = startingModel(list, value?.provider === p.id ? value.model : null, p.model);
+        const on = value?.provider === p.id ? value.model : null;
+        const model = pickFirst ? startingModel(list, on, p.model) : on && list.includes(on) ? on : p.model && list.includes(p.model) ? p.model : null;
         if (model) onPick({ provider: p.id, model, name: p.name });
-        else setError(`${p.name} lists no models: load or download one there first.`);
+        else if (list.length === 0) setError(`${p.name} lists no models: load or download one there first.`);
       } catch (e) {
         const local = p.allowLocal || looksLocal(p.baseUrl);
         setModels(null);
@@ -166,17 +171,30 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
     setError(null);
     try {
       const taken = (providers ?? []).map((p) => p.id);
-      // A preset added again replaces its own entry; another server gets a free id.
+      // A preset added again updates its own entry (its address, and on); another server gets a free id.
       const id = preset.id === 'openai-compatible' ? freeId(preset.id, taken) : preset.id;
       const name = preset.id === 'openai-compatible' ? (() => { try { return new URL(url).host; } catch { return preset.name; } })() : preset.name;
-      await aiProviders.upsert({ id, name, protocol: 'openai', baseUrl: url, capabilities: ['chat'], enabled: true, allowLocal: looksLocal(url) || url.startsWith('http:') });
+      // (what the entry had is kept: its name, model and what else it is used for, pictures or speech, beside chat)
+      const existing = (providers ?? []).find((p) => p.id === id);
+      const capabilities: AiCapability[] = existing && existing.capabilities.length > 0 ? [...new Set<AiCapability>([...existing.capabilities, 'chat'])] : ['chat'];
+      await aiProviders.upsert({
+        id,
+        name: existing?.name ?? name,
+        ...(existing?.category ? { category: existing.category } : {}),
+        protocol: 'openai',
+        baseUrl: url,
+        ...(existing?.model ? { model: existing.model } : {}),
+        capabilities,
+        enabled: true,
+        allowLocal: looksLocal(url) || url.startsWith('http:'),
+      });
       if (key.trim()) await aiProviders.setKey(id, key.trim());
       const list = (await aiProviders.list()).providers;
       setProviders(list);
       setSelected(id);
       setKey('');
       const saved = list.find((p) => p.id === id);
-      if (saved) await loadModels(saved);
+      if (saved) await loadModels(saved, true);
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -241,10 +259,16 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
           {models?.id === provider.id && models.list.length > 0 ? (
             <select
               aria-label="Model"
-              value={value?.provider === provider.id ? value.model : ''}
+              value={value?.provider === provider.id && models.list.includes(value.model) ? value.model : ''}
               disabled={off}
-              onChange={(e) => onPick({ provider: provider.id, model: e.target.value, name: provider.name })}
+              onChange={(e) => e.target.value && onPick({ provider: provider.id, model: e.target.value, name: provider.name })}
             >
+              {/* (none chosen from this provider yet: the person picks one) */}
+              {!(value?.provider === provider.id && models.list.includes(value.model)) && (
+                <option value="" disabled>
+                  Choose a model…
+                </option>
+              )}
               {models.list.map((m) => (
                 <option key={m} value={m}>
                   {m}

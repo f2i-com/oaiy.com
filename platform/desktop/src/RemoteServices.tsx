@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, Loader2, RotateCcw, Server } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { network, type NetworkNode, type NetworkStatus } from './api';
@@ -26,11 +26,16 @@ export default function RemoteServices() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // (each read numbered: one answered after a newer one began, or after a choice was saved, is not shown)
+  const reads = useRef(0);
   const refresh = useCallback(async () => {
+    const seq = ++reads.current;
     try {
       const s = await network.status();
+      const listed = s.uses ? (await network.nodes()).nodes.filter((n) => (n.uses ?? n.role === 'worker') && (n.services ?? []).length > 0) : [];
+      if (seq !== reads.current) return;
       setStatus(s);
-      setNodes(s.uses ? (await network.nodes()).nodes.filter((n) => (n.uses ?? n.role === 'worker') && (n.services ?? []).length > 0) : []);
+      setNodes(listed);
     } catch {
       /* an older desktop, or Network not answering: nothing to show */
     }
@@ -43,6 +48,7 @@ export default function RemoteServices() {
   const use = async (service: string, nodeId: string | null) => {
     setBusy(`${service}:${nodeId ?? ''}`);
     setError(null);
+    reads.current++;
     try {
       setStatus(await network.useService(service, nodeId));
     } catch (e) {
@@ -87,7 +93,12 @@ export default function RemoteServices() {
                   {busy === `${svc.id}:` ? <Loader2 size={12} className="spin" aria-hidden /> : <RotateCcw size={12} aria-hidden />} Use this computer’s
                 </button>
               ) : (
-                <button className="btn btn-secondary btn-tiny" disabled={busy !== null || !svc.installed} onClick={() => void use(svc.id, n.nodeId)}>
+                <button
+                  className="btn btn-secondary btn-tiny"
+                  disabled={busy !== null || !svc.installed || !n.online}
+                  title={!n.online ? `${n.name} is offline: it can be chosen once it answers again` : undefined}
+                  onClick={() => void use(svc.id, n.nodeId)}
+                >
                   {busy === `${svc.id}:${n.nodeId}` ? <Loader2 size={12} className="spin" aria-hidden /> : null} Use it here
                 </button>
               )}

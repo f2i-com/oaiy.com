@@ -39,6 +39,8 @@ export interface SetupStep {
 
 export interface SetupInput {
   codexConnected?: boolean;
+  /** A language model is chosen in Engines (OAIY's own engines run it). */
+  engineModel?: boolean;
   runtime: RuntimeStatus | null;
   providers: AiProviderPublic[] | null;
   services: ServiceSnapshot[] | null;
@@ -62,7 +64,7 @@ export function deriveSetupSteps(input: SetupInput): SetupStep[] {
   const { runtime, providers, services, plugins, connected } = input;
 
   const runtimeReady = runtime?.ready === true;
-  const aiReady = input.codexConnected === true || (providers ?? []).some(providerReady) || hasLocalModel(services);
+  const aiReady = input.codexConnected === true || input.engineModel === true || (providers ?? []).some(providerReady) || hasLocalModel(services);
   const pluginRunning = (plugins ?? []).some((p) => p.state === 'running');
   const anyConnected = (connected ?? []).length > 0;
 
@@ -82,7 +84,7 @@ export function deriveSetupSteps(input: SetupInput): SetupStep[] {
       id: 'ai',
       title: 'Give your flows a model',
       detail:
-        'Sign in with ChatGPT, add a provider key, or run a local model — whichever you prefer.',
+        'Choose a model in Engines, sign in with ChatGPT, or add a provider key — whichever you prefer.',
       done: aiReady,
       target: 'providers',
       cta: 'Set up AI',

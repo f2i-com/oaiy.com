@@ -109,9 +109,9 @@ export default function LogsViewer({ load, title, onClose }: Props) {
         {lines.length === 0 && !error && (
           <div className="logs-empty">No output yet.</div>
         )}
-        {lines.map((line, i) => (
+        {keyed(lines).map(([key, line]) => (
           <div
-            key={`${line.timestamp}-${i}`}
+            key={key}
             className={`logs-line logs-line-${line.stream}`}
           >
             <span className="logs-time">
@@ -123,4 +123,19 @@ export default function LogsViewer({ load, title, onClose }: Props) {
       </div>
     </div>
   );
+}
+
+/**
+ * Each line with a key of its own that stays the same as the tail moves on (its time, stream and words, and how many
+ * such lines came before it): a line already shown keeps its row, so selected text stays selected and the log does
+ * not announce it again.
+ */
+function keyed<L extends { timestamp: string | number; stream: string; text: string }>(lines: L[]): [string, L][] {
+  const seen = new Map<string, number>();
+  return lines.map((line) => {
+    const base = `${line.timestamp}|${line.stream}|${line.text}`;
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    return [`${base}|${n}`, line];
+  });
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { AudioLines, Bot, Check, Copy, Laptop, Link2, Loader2, Pin, PinOff, Server, TriangleAlert, Unplug, Workflow, X, type LucideIcon } from 'lucide-react';
+import { AudioLines, Bot, Check, Copy, Unlock, Laptop, Link2, Loader2, Pin, PinOff, Server, TriangleAlert, Unplug, Workflow, X, type LucideIcon } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import {
   network,
@@ -31,9 +31,13 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // (each read numbered: one answered after a newer one began, or after a change was saved, is not shown)
+  const reads = useRef(0);
   const refresh = useCallback(async () => {
+    const seq = ++reads.current;
     try {
       const s = await network.status();
+      if (seq !== reads.current) return;
       setStatus(s);
       setError(null);
       if (!s.uses && !s.lends) {
@@ -47,10 +51,12 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
         s.lends ? network.requests() : Promise.resolve({ requests: [] }),
         s.uses ? network.discover() : Promise.resolve({ discovery: false, found: [] }),
       ]);
+      if (seq !== reads.current) return;
       setNodes(n.nodes);
       setRequests(r.requests);
       setFound(f.found);
     } catch (e) {
+      if (seq !== reads.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
@@ -63,6 +69,8 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
   const change = async (next: Parameters<typeof network.setSettings>[0]) => {
     setBusy(true);
     setActionError(null);
+    // (a read under way began before the change: what it answers is the settings before, not shown)
+    reads.current++;
     try {
       setStatus(await network.setSettings(next));
       await refresh();
@@ -86,6 +94,19 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
       {error && <div className="banner banner-err">{error}</div>}
       {actionError && <div className="banner banner-err" role="alert">{actionError}</div>}
       <ThisComputer status={status} busy={busy} onChange={change} />
+      {status.listenError && (
+        <div className="banner banner-err" role="alert">
+          This computer cannot lend itself right now: {status.listenError}
+        </div>
+      )}
+      {(status.pairedByItself ?? []).map((p) => (
+        <div className="banner banner-pending network-by-itself" key={`${p.name}:${p.at}`} role="status">
+          <span>
+            <Bot size={13} aria-hidden /> <strong>{p.name}</strong> paired with this computer by itself at{' '}
+            {new Date(p.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Unpair it below if you do not know it.
+          </span>
+        </div>
+      ))}
       <AgentMaySetUp status={status} busy={busy} onChange={change} />
       {status.lends && (
         <WorkerRequests
@@ -352,13 +373,49 @@ function AgentMaySetUp({ status, busy, onChange }: { status: NetworkStatus; busy
           </strong>
           <small>
             The Agent can switch OAIY Network on, pair this computer with others, and choose which of their models, flows and OAIY Voice it uses, when you
-            ask it to. Two computers that both have this on pair by themselves, with no codes to compare: tick it only on a network you trust, your home’s
-            or office’s.
+            ask it to. A code it is shown is still yours to compare. A computer pairs with this one by itself, with no codes, only while you (or the
+            Agent here) open pairing below, for a few minutes: on a network you trust, your home’s or office’s.
           </small>
         </span>
       </label>
+      {on && status.lends && <PairingWindow status={status} busy={busy} onChange={onChange} />}
     </section>
   );
+}
+
+/** Pairing by itself, open for a few minutes at a time: a computer that asks meanwhile, its Agent setting it up too,
+ * is paired with no codes compared, and the window closes after the first. */
+function PairingWindow({ status, busy, onChange }: { status: NetworkStatus; busy: boolean; onChange: (c: Parameters<typeof network.setSettings>[0]) => void }) {
+  const until = status.pairingOpenUntilMs ?? 0;
+  const open = until > Date.now();
+  return (
+    <div className={`network-window${open ? ' is-open' : ''}`} data-testid="network-window">
+      {open ? (
+        <>
+          <span>
+            <Unlock size={13} aria-hidden /> Pairing by itself is open until{' '}
+            <strong>{new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong>: the first computer to ask is paired.
+          </span>
+          <button className="btn-tiny" disabled={busy} onClick={() => onChange({ openPairingMinutes: 0 })}>
+            Close
+          </button>
+        </>
+      ) : (
+        <>
+          <span>Closed: computers asking to pair wait for you to compare codes.</span>
+          <button className="btn-tiny" disabled={busy} onClick={() => onChange({ openPairingMinutes: 5 })}>
+            <Unlock size={12} aria-hidden /> Allow pairing by itself for 5 minutes
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Whether a pairing error says the other computer was not reached (rather than that it expired, declined or
+ * differs in version). */
+function unreachable(error: string): boolean {
+  return /not reach|unreachable|refused|timed? ?out|did not answer|no route|connect|resolve|network is/i.test(error) && !/expired|declin|denied|version/i.test(error);
 }
 
 /** The six digits both screens show, large enough to compare at a glance. */
@@ -543,11 +600,12 @@ function FindWorkers({
       {error && (
         <div className="banner banner-err" role="alert">
           <div>{error}</div>
-          <ul className="network-checklist">
+          {/* (what to check where the other computer was not reached: not for a pairing that expired or was declined) */}
+          {unreachable(error) && <ul className="network-checklist">
             <li>On the other computer, Setup → Networking has Lend this computer switched on, and shows the address to type here.</li>
             <li>Both computers are on the same network (not a guest Wi-Fi that keeps devices apart).</li>
             <li>The worker’s firewall lets OAIY in (macOS asks the first time; Windows may need “Allow”).</li>
-          </ul>
+          </ul>}
         </div>
       )}
       {outcome && <div className={`banner ${outcome.paired ? 'banner-ok' : 'banner-pending'}`}>{outcome.text}</div>}
@@ -779,7 +837,7 @@ export function Device({ d, live, temperature }: { d: NetworkDevice; live: boole
 }
 
 /** A worker's processor and memory, as tiles beside its GPUs. */
-function MachineTiles({ m, live }: { m: NetworkMachine; live: boolean }) {
+export function MachineTiles({ m, live }: { m: NetworkMachine; live: boolean }) {
   const cpu = m.cpu;
   const ram = m.ram;
   const total = typeof ram?.total_mb === 'number' && ram.total_mb > 0 ? ram.total_mb : null;
@@ -816,7 +874,7 @@ function MachineTiles({ m, live }: { m: NetworkMachine; live: boolean }) {
 const JOB_KIND: Record<string, string> = { image: 'a picture', video: 'a video', speech: 'speech', music: 'music', sound: 'a sound', model3d: 'a 3D model', picture: 'a picture edit', flow: 'a flow run' };
 
 /** A worker's queue: what it is making now and what waits, in the order it runs them. */
-function Queue({ jobs }: { jobs: NetworkJob[] }) {
+export function Queue({ jobs }: { jobs: NetworkJob[] }) {
   if (jobs.length === 0) return <div className="network-queue-empty">Nothing running or waiting.</div>;
   const waiting = jobs.filter((j) => j.status === 'waiting').length;
   return (

@@ -283,6 +283,30 @@ describe('RunsPanel', () => {
     expect(text()).not.toContain('run_ok');
   });
 
+  it('says a run’s error once, not wrapped in "Error: Error:"', async () => {
+    runsMock.mockResolvedValue({
+      runs: [{ ...FAILED, error: { ...FAILED.error, message: 'Error: Error: Image Gen: HTTP 503 — Rig did not answer' } }],
+      total: 1,
+      byStatus: { failed: 1 },
+    });
+    await mount();
+    expect(text()).toContain('Image Gen: HTTP 503 — Rig did not answer');
+    expect(text()).not.toContain('Error: Image Gen');
+  });
+
+  it('shows the answer to the filter last asked for, an older answer landing late put aside', async () => {
+    // The failures fetch answers only after the switch to All has been answered.
+    let late: (v: unknown) => void = () => {};
+    runsMock.mockReturnValueOnce(new Promise((r) => (late = r)));
+    await mount();
+    runsMock.mockResolvedValue({ runs: [{ ...FAILED, runId: 'run_ok', status: 'succeeded', error: undefined }], total: 12, byStatus: { succeeded: 12 } });
+    await act(async () => button('All').click());
+    await act(async () => {});
+    expect(text()).toContain('All runs');
+    await act(async () => late({ runs: [FAILED], total: 12, byStatus: { failed: 1 } }));
+    expect(text()).not.toContain('Ollama is not running.');
+  });
+
   it('surfaces a fetch failure instead of pretending there is no history', async () => {
     runsMock.mockRejectedValue(new Error('bridge is down'));
     await mount();

@@ -87,13 +87,16 @@
 
 /* ---- the steps, and the pane -------------------------------------------- */
 
-.setup-body {
+/* (not `.setup-body`: that is a setup check's row on the Overview, whose bold line is a flex row) */
+.setup-layout {
   display: grid;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   grid-template-columns: 240px minmax(0, 1fr);
   gap: 16px;
 }
+.setup-layout small { color: var(--muted); font-size: 12px; line-height: 1.5; }
 
 .setup-rail {
   position: sticky;
@@ -300,6 +303,7 @@
 .setup-model-option > input[type='radio'] { flex: none; width: 15px; height: 15px; margin: 2px 0 0; cursor: pointer; }
 .setup-model-option.is-selected { border-style: solid; border-color: color-mix(in srgb, var(--primary) 55%, var(--strong-border)); }
 .setup-model-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+.setup-model-text strong { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
 .setup-model-text strong .badge { margin-left: 0; }
 .setup-model-text strong .badge-pending::before { animation: none; }
 .setup-own-model { display: flex; max-width: 560px; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 10px; }
@@ -705,11 +709,22 @@ input[type='checkbox'].switch:focus-visible { box-shadow: 0 0 0 3px var(--primar
 .agent-change-text small { color: var(--faint); font-size: 12px; }
 .agent-changes time { flex: none; margin-top: 2px; color: var(--faint); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
 
+/* ---- the Overview, beside its setup card ------------------------------------------- */
+
+/* A banner's actions together at its right edge (See why, Dismiss). */
+.banner-actions { display: inline-flex; flex: none; align-items: center; gap: 6px; }
+/* A fix's button with what went wrong under it. */
+.overview-fix { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.overview-fix .card-warn { max-width: 320px; text-align: right; }
+/* A plugin's tile with nothing to open: not a button, so it does not lift on hover. */
+.overview-tile.overview-tile-static { cursor: default; }
+.overview-tile.overview-tile-static:hover { border-color: var(--border); transform: none; }
+
 /* ---- narrow windows ------------------------------------------------------------ */
 
 /* The steps become a strip above the pane. */
 @media (max-width: 1020px) {
-  .setup-body { grid-template-columns: minmax(0, 1fr); }
+  .setup-layout { grid-template-columns: minmax(0, 1fr); }
   .setup-rail { position: static; overflow-x: auto; padding: 6px; scrollbar-width: thin; }
   .setup-rail ol { flex-direction: row; gap: 4px; }
   .setup-rail-item::after { display: none; }

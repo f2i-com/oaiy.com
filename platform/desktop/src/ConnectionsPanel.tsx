@@ -3,6 +3,7 @@ import { Check, Cloud, Link2, Radio, ShieldCheck, TriangleAlert, X } from 'lucid
 import {
   companion,
   link as linkApi,
+  openExternal,
   pairing,
   type CompanionRelayStatus,
   type LinkStatus,
@@ -41,6 +42,11 @@ export default function ConnectionsPanel() {
   const [pending, setPending] = useState<PendingPairing[]>(() => peek('pendingPairings') ?? []);
   const [paired, setPaired] = useState<PairedApp[]>(() => peek('pairedApps') ?? []);
   const [error, setError] = useState<string | null>(null);
+  // What an Approve, Deny or Revoke the person just pressed answered: its own, so the list's next poll (which clears
+  // `error` once it reads again) does not wipe it a moment later.
+  const [actionError, setActionError] = useState<string | null>(null);
+  // The list has been read (here, or before and kept): until then "Nothing is connected" would not be known.
+  const [loaded, setLoaded] = useState(() => peek('pairedApps') != null);
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const [relay, setRelay] = useState<CompanionRelayStatus | null>(() => peek('companionRelay') ?? null);
   const [relayForm, setRelayForm] = useState({ baseUrl: '', token: '', appId: '' });
@@ -94,6 +100,7 @@ export default function ConnectionsPanel() {
       setPaired(a.paired ?? []);
       put('pendingPairings', p.pending ?? []);
       put('pairedApps', a.paired ?? []);
+      setLoaded(true);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -248,12 +255,13 @@ export default function ConnectionsPanel() {
   const act = useCallback(
     async (id: string, fn: () => Promise<unknown>, done: string) => {
       setBusy((s) => new Set(s).add(id));
+      setActionError(null);
       try {
         await fn();
         await refresh();
         toast.push({ kind: 'success', title: done });
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setActionError(e instanceof Error ? e.message : String(e));
       } finally {
         setBusy((s) => {
           const n = new Set(s);
@@ -282,6 +290,14 @@ export default function ConnectionsPanel() {
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>{error}</span>
           <button className="banner-dismiss" onClick={() => setError(null)} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      )}
+      {actionError && (
+        <div className="banner banner-err banner-dismissable" role="alert">
+          <span>{actionError}</span>
+          <button className="banner-dismiss" onClick={() => setActionError(null)} aria-label="Dismiss">
             ×
           </button>
         </div>
@@ -336,7 +352,13 @@ export default function ConnectionsPanel() {
         <div className="section-title-row">
           <h3 className="section-title">Connected apps</h3>
         </div>
-        {paired.length === 0 ? (
+        <p className="form-hint">
+          <TriangleAlert size={12} aria-hidden /> A connected app can run flows and call plugins on this machine. Revoking takes effect
+          immediately.
+        </p>
+        {!loaded ? (
+          <p className="form-hint">{error ? 'The connected apps could not be read.' : 'Reading the connected apps…'}</p>
+        ) : paired.length === 0 ? (
           <p className="form-hint">
             Nothing is connected. When an app asks for access it appears here with a code to check
             before you approve it.
@@ -435,7 +457,15 @@ export default function ConnectionsPanel() {
             >
               <span>
                 No tab opened?{' '}
-                <a href={account.attempt.authorizeUrl} target="_blank" rel="noreferrer">
+                {/* (in the OS's browser: a target=_blank link does nothing in the app's window) */}
+                <a
+                  href={account.attempt.authorizeUrl}
+                  rel="noreferrer"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    openExternal(e.currentTarget.href);
+                  }}
+                >
                   Open the approval page
                 </a>
               </span>
@@ -712,12 +742,6 @@ export default function ConnectionsPanel() {
         </form>
       </section>
 
-      <div className="datadir-note">
-        <span>
-          <TriangleAlert size={13} /> A connected app can run flows and call plugins on this machine.
-          Revoking takes effect immediately.
-        </span>
-      </div>
     </div>
   );
 }

@@ -17,7 +17,7 @@ import {
 import { AgentMaySwitch, useControlSettings } from './AgentAccess';
 import { codexModelOptions, describeChange, localModelLine, newestFirst } from './setupFlow';
 import { modelLineText } from './SetupEssentials';
-import { answered, errorText, usePoll } from './SetupParts';
+import { answered, errorText, RetryLine, usePoll } from './SetupParts';
 
 /**
  * Settings → Agent: what the Agent may change in OAIY (the switch), the model
@@ -121,7 +121,12 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
       </div>
       <p className="form-hint">What the Agent thinks with, in chats and when it sets up OAIY. Phone calls keep their own fast route.</p>
       {prefs === undefined ? (
-        <p className="form-hint">Checking…</p>
+        // (a read that failed says so, with another try: not "Checking…" for ever)
+        prefsError ? (
+          <RetryLine message={`The Agent’s settings could not be read: ${prefsError}`} onRetry={() => void refreshPrefs()} />
+        ) : (
+          <p className="form-hint">Checking…</p>
+        )
       ) : (
         <div className="ai-choices is-compact" role="radiogroup" aria-label="The Agent’s model">
           <div className={`ai-choice${source === 'engine' ? ' is-selected' : ''}`}>
@@ -278,7 +283,11 @@ function ChangeLogSection() {
         </button>
       </div>
       {entries === undefined ? (
-        <p className="form-hint">Checking…</p>
+        error ? (
+          <RetryLine message={`What the Agent changed could not be read: ${error}`} onRetry={() => void refresh()} />
+        ) : (
+          <p className="form-hint">Checking…</p>
+        )
       ) : list.length === 0 ? (
         <p className="form-hint">Nothing yet. Each change the Agent makes to OAIY shows here, newest first.</p>
       ) : (

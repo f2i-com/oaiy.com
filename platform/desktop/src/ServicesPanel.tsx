@@ -78,11 +78,12 @@ export default function ServicesPanel() {
               body: `port ${svc.port}`,
             });
           } else if (svc.status === 'stopped' && prev === 'installing') {
-            toast.push({
-              kind: 'success',
-              title: `${svc.name} installed`,
-              body: 'Click Start to launch it.',
-            });
+            // (an install stopped part-way, cancelled or failed, ends stopped too, with what happened as its error)
+            toast.push(
+              svc.error
+                ? { kind: 'info', title: `${svc.name} was not installed`, body: svc.error }
+                : { kind: 'success', title: `${svc.name} installed`, body: 'Click Start to launch it.' },
+            );
           }
         }
         seen.set(svc.id, svc.status);
@@ -817,7 +818,7 @@ function ServiceCard({
               Reinstall
             </button>
           ) : null}
-          <button onClick={onToggle} className="btn btn-ghost">
+          <button onClick={onToggle} className="btn btn-ghost" aria-expanded={expanded}>
             {expanded ? 'Hide logs' : 'Logs'}
           </button>
           <button
@@ -833,10 +834,10 @@ function ServiceCard({
               pending || service.status === 'running' || service.status === 'installing'
             }
             className="btn btn-ghost btn-danger"
-            title="Delete this service template (stop it first)"
-            aria-label="Delete service template"
+            title={`Remove ${service.name} from Services, its template too (Uninstall removes only its installed files). Stop it first.`}
+            aria-label={`Remove ${service.name} from Services`}
           >
-            <Trash2 size={14} aria-hidden />
+            <Trash2 size={14} aria-hidden /> Remove
           </button>
         </div>
       </div>
@@ -860,5 +861,14 @@ function StatusBadge({ status }: { status: ServiceStatus }) {
         : status === 'installing' || status === 'starting'
           ? 'badge-pending'
           : 'badge-neutral';
-  return <span className={`badge ${cls}`}>{status}</span>;
+  return <span className={`badge ${cls}`}>{STATUS_WORD[status] ?? status}</span>;
 }
+
+/** A service's state as the person reads it. */
+const STATUS_WORD: Partial<Record<ServiceStatus, string>> = {
+  running: 'Running',
+  stopped: 'Stopped',
+  installing: 'Installing',
+  starting: 'Starting',
+  errored: 'Error',
+};

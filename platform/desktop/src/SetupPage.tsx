@@ -38,7 +38,7 @@ import { answered, errorText, RetryLine, StepFooter, StepHeader, usePoll, Wizard
 import { useToast } from './Toasts';
 import { useLiveSetup } from './useLiveSetup';
 import { refetchModules } from './useModules';
-import { setSetupState, useSetupState } from './useSetupState';
+import { refetchSetup, saveFirstRun, useSetupError, useSetupState } from './useSetupState';
 
 /**
  * The setup page: the first-run wizard, or one plugin's own wizard.
@@ -75,6 +75,7 @@ export default function SetupPage({ pluginId, step, onExit, onNavigate }: Props)
 function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: string | null; onExit: () => void; onNavigate: (view: SetupNav) => void }) {
   const toast = useToast();
   const state = useSetupState();
+  const setupError = useSetupError();
   const [plugins, refreshPlugins] = usePoll(() => pluginsApi.list().then((s) => s.plugins), 3000);
   const [catalog, refreshCatalog, catalogError] = usePoll(() => engines.catalog(), 3000);
   const [codexStatus, refreshCodex] = usePoll(() => codex.status(), 5000);
@@ -87,9 +88,9 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
   const codexOn = codexStatus?.connected === true;
   const prefs = answered(prefsAnswer, prefsError);
 
-  // The recommendation, or (a desktop without it) local if Engines has a model chosen.
+  // The recommendation, or (a desktop without it, or one that cannot work it out now) local if Engines has a model chosen.
   const recommendation = answered(recAnswer, recError);
-  const rec = recommendation ? recommendation : recommendation === null && (catalog || catalogError) ? recommendationOrFallback(null, catalog, codexOn) : null;
+  const rec = recommendation ? recommendation : (recommendation === null || recError) && (catalog || catalogError) ? recommendationOrFallback(null, catalog, codexOn) : null;
 
   /** "Set up the rest myself" was chosen (or a navigation, or the record's place, is in the rest). */
   const asked = initialStep ? currentStepId(initialStep) : null;
@@ -121,15 +122,10 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /** Save the first-run part of the record (its place, skips, choices). */
-  const save = useCallback(
-    async (change: Partial<FirstRunState>) => {
-      if (!state) return;
-      const { migrated: _migrated, ...base } = state.firstRun;
-      setSetupState(await setupApi.putFirstRun({ ...base, ...change }));
-    },
-    [state],
-  );
+  /** Save the first-run part of the record (its place, skips, choices): on the newest record, one save after another. */
+  const save = useCallback(async (change: Partial<FirstRunState> | ((now: FirstRunState) => Partial<FirstRunState>)) => {
+    await saveFirstRun(change);
+  }, []);
 
   const goTo = (id: string) => {
     if (inTheRest(id)) setRest(true);
@@ -142,10 +138,10 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
     if (target) goTo(target.id);
   };
   const skip = () => {
-    const skipped = [...new Set([...(state?.firstRun.skipped ?? []).map(currentStepId), current.id])];
+    const skippedId = current.id;
     const target = steps[Math.min(steps.length - 1, index + 1)];
     setCurrentId(target.id);
-    void save({ skipped, position: target.id }).catch((e) => setError(errorText(e)));
+    void save((now) => ({ skipped: [...new Set([...now.skipped.map(currentStepId), skippedId])], position: target.id })).catch((e) => setError(errorText(e)));
   };
   const finish = async () => {
     setBusy(true);
@@ -162,6 +158,8 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
 
   /** The Agent's model follows the choice made here (a desktop that keeps none has nothing to set). */
   const commitAi = async (source: AgentModelSource) => {
+    // (not read, or not readable now: nothing is decided on a guess)
+    if (prefs === undefined) throw new Error(prefsError ? `its settings could not be read (${prefsError}): try again` : 'its settings are still being read: try again in a moment');
     if (!prefs) return;
     if (source === 'provider') {
       const pick = providerPick;
@@ -194,17 +192,29 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
       setBusy(false);
       return;
     }
-    setBusy(false);
-    toast.push({ kind: 'success', title: 'The essentials are set up', body: 'The Agent takes it from here. Setup is in Settings whenever you want it again.' });
     onNavigate('agent');
-    void askAgent('setupWithAgent');
+    const asked = await askAgent('setupWithAgent');
+    setBusy(false);
+    if (asked) {
+      toast.push({ kind: 'success', title: 'The essentials are set up', body: 'The Agent takes it from here. Setup is in Settings whenever you want it again.' });
+    } else {
+      // (the Agent page did not take the request: the person asks it themselves)
+      toast.push({
+        kind: 'error',
+        title: 'The Agent did not start setting up OAIY',
+        body: 'Ask it to “set up OAIY” in a new chat, or run setup again from Settings.',
+        timeoutMs: 0,
+      });
+    }
   };
 
   const toggleChosen = async (id: string, on: boolean) => {
-    const chosen = new Set(state?.firstRun.chosenPlugins ?? []);
-    if (on) chosen.add(id);
-    else chosen.delete(id);
-    await save({ chosenPlugins: [...chosen] }).catch((e) => setError(errorText(e)));
+    await save((now) => {
+      const chosen = new Set(now.chosenPlugins);
+      if (on) chosen.add(id);
+      else chosen.delete(id);
+      return { chosenPlugins: [...chosen] };
+    }).catch((e) => setError(errorText(e)));
   };
 
   const installed = async (id: string) => {
@@ -215,7 +225,11 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
   if (!state || !current) {
     return (
       <div className="setup-page">
-        <p className="form-hint">Loading setup…</p>
+        {!state && setupError ? (
+          <RetryLine message={`Setup could not be read: ${setupError}`} onRetry={() => void refetchSetup()} />
+        ) : (
+          <p className="form-hint">Loading setup…</p>
+        )}
       </div>
     );
   }
@@ -237,21 +251,26 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
       break;
     case 'ai': {
       const chosenReady = choice === 'engine' ? line.kind === 'chosen' : choice === 'chatgpt' ? codexOn : choice === 'provider' ? !!providerPick : false;
+      // (the Agent's settings not readable now: said, with a way to ask again, rather than a choice missing)
+      const prefsLine = prefs === undefined && prefsError ? <RetryLine message={`The Agent’s settings could not be read: ${prefsError}`} onRetry={() => void refreshPrefs()} /> : null;
       content = (
-        <YourAiStep
-          kicker={kicker}
-          state={current.state}
-          rec={rec}
-          catalog={catalog}
-          codex={codexStatus}
-          choice={choice}
-          onChoose={setAiChoice}
-          onCatalogChanged={() => void refreshCatalog()}
-          onSignedIn={signedIn}
-          onOpenEngines={() => onNavigate('engines')}
-          providerPick={providerPick}
-          onProviderPick={prefs ? setPicked : undefined}
-        />
+        <>
+          {prefsLine}
+          <YourAiStep
+            kicker={kicker}
+            state={current.state}
+            rec={rec}
+            catalog={catalog}
+            codex={codexStatus}
+            choice={choice}
+            onChoose={setAiChoice}
+            onCatalogChanged={() => void refreshCatalog()}
+            onSignedIn={signedIn}
+            onOpenEngines={() => onNavigate('engines')}
+            providerPick={providerPick}
+            onProviderPick={prefs ? setPicked : undefined}
+          />
+        </>
       );
       const waiting =
         choice === 'chatgpt' ? 'Sign in with ChatGPT to use it' : choice === 'provider' ? 'Connect a provider and choose its model' : 'Waiting for a language model in Engines';
@@ -434,7 +453,11 @@ function PluginsStep({
           );
         })}
       </div>
-      <FolderInstall title="Install a plugin from a folder" hint="A plugin folder, .zip or .tar.gz on this computer. Installing a plugin installs code this computer runs: install only plugins you trust." onInstalled={installedNow} />
+      <FolderInstall
+        title="Install a plugin from a folder"
+        hint={`A plugin folder, .zip or .tar.gz on this computer${isTauri() ? ' (Browse picks a folder: type or paste the path of a .zip or .tar.gz)' : ''}. Installing a plugin installs code this computer runs: install only plugins you trust.`}
+        onInstalled={installedNow}
+      />
     </div>
   );
 }
@@ -541,7 +564,7 @@ function FolderInstall({
     <div className={compact ? 'setup-folder is-compact' : 'setup-folder'}>
       {title && <h3 className="section-title">{title}</h3>}
       <div className="setup-folder-row">
-        <input type="text" placeholder="C:\path\to\plugin" value={path} aria-label="Plugin folder" onChange={(e) => setPath(e.target.value)} />
+        <input type="text" placeholder="The plugin’s folder, .zip or .tar.gz" value={path} aria-label="Plugin folder, .zip or .tar.gz" onChange={(e) => setPath(e.target.value)} />
         {isTauri() && (
           <button type="button" className="btn" onClick={() => void browse()}>
             <FolderOpen size={14} /> Browse

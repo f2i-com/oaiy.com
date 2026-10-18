@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useVisiblePoll } from './useVisiblePoll';
 import { Check, X, Link2 } from 'lucide-react';
 import { pairing, type PendingPairing } from './api';
 import { useToast } from './Toasts';
@@ -39,11 +40,8 @@ export default function PairingPrompt() {
     }
   }, []);
 
-  useEffect(() => {
-    refresh();
-    const id = window.setInterval(refresh, POLL_MS);
-    return () => window.clearInterval(id);
-  }, [refresh]);
+  // (asked while the window shows, and at once when it is shown again: none while it is hidden in the tray)
+  useVisiblePoll(() => void refresh(), POLL_MS);
 
   const act = useCallback(
     async (id: string, fn: () => Promise<unknown>, done: string) => {

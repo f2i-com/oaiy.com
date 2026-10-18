@@ -132,11 +132,29 @@ describe('DeadLetters', () => {
     expect(text()).toContain('bridge is down');
   });
 
-  it('dismisses an entry the user decides does not matter', async () => {
+  it('dismisses an entry the user decides does not matter, once they say so', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true);
     await mount();
+    await click(button('Dismiss'));
+    expect(dismissMock).not.toHaveBeenCalled();
     listMock.mockResolvedValue({ deadLetters: [GUARDED], total: 1 });
     await click(button('Dismiss'));
     expect(dismissMock).toHaveBeenCalledWith('dl_1');
     expect(text()).not.toContain('queue was full');
+    confirm.mockRestore();
+  });
+
+  it('says a dismiss that failed, and keeps the last redrive said after its entry, the last, has gone', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    dismissMock.mockRejectedValue(new Error('bridge is down'));
+    await mount();
+    await click(button('Dismiss'));
+    expect(text()).toContain('aokie.call.incoming could not be dismissed: bridge is down');
+    listMock.mockResolvedValue({ deadLetters: [], total: 0 });
+    await click(button('Redrive'));
+    expect(text()).toContain('Redrive reserved a run for aokie.call.incoming.');
+    await click(button('Close'));
+    expect(host.innerHTML).toBe('');
+    confirm.mockRestore();
   });
 });

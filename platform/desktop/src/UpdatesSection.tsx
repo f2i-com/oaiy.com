@@ -179,9 +179,9 @@ export default function UpdatesSection() {
         </div>
       )}
 
+      {/* (what failed is said in the line above; this says why) */}
       {shownError && (
         <div className="banner banner-err" role="alert">
-          {s.failedDuring && s.state === 'failed' ? `${FAILED[s.failedDuring]} ` : ''}
           {shownError}
         </div>
       )}

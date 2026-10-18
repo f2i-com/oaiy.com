@@ -2167,3 +2167,16 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .download-plan-parts li.is-elsewhere .download-plan-status, .download-plan-parts li.is-here .download-plan-status, .download-plan-parts li.is-network .download-plan-status { color: var(--green); }
 .network-share-models { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
 .network-share-models input { flex: none; width: auto; height: auto; margin-top: 2px; accent-color: var(--primary); }
+
+/* Pairing requests, asked above whatever page is open (a page in a webview too, laid below them): spaced as a
+   page's own content, and nothing at all while none is asking. */
+.view-prompts { flex: none; max-height: 45vh; overflow-y: auto; padding: 12px var(--page-pad-x) 0; }
+.view-prompts:empty, .view-prompts:not(:has(*)) { display: none; }
+.view-prompts .pairing-wrap { margin-bottom: 12px; }
+.models-what { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.models-what .btn-tiny { flex: none; }
+/* Networking: pairing by itself, open for a few minutes at a time. */
+.network-window { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 10px; padding: 8px 10px; border: 1px dashed var(--border); border-radius: 8px; color: var(--muted); font-size: 12px; }
+.network-window span { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.network-window.is-open { border-style: solid; border-color: color-mix(in srgb, var(--amber) 45%, var(--border)); background: color-mix(in srgb, var(--amber) 8%, transparent); color: var(--text); }
+.network-by-itself span { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }

@@ -21,6 +21,9 @@ import { useToast } from './Toasts';
  * template that needs torch can point at the same one — saves multi-GB
  * vs each service installing its own copy.
  */
+/** The finished Python job last told of (its kind, target and end), for the whole session: told once, not at each visit. */
+let toldFinished: string | null = null;
+
 export default function PythonPanel() {
   // Seeded like the other panels: this blocked first paint on every visit,
   // even though the previous answer was still perfectly good.
@@ -36,9 +39,6 @@ export default function PythonPanel() {
   const [newReqs, setNewReqs] = useState('');
 
   const toast = useToast();
-  // Track the previous job ID + finishedAt so we fire the "done" toast
-  // exactly once on a job completing, not on every poll while finished.
-  const seenFinishedRef = useRef<string | null>(null);
   // Track which job we've already auto-opened the logs for, so a manual
   // "Hide logs" isn't undone on the next poll. Keyed per job.
   const autoOpenedJobRef = useRef<string | null>(null);
@@ -56,8 +56,11 @@ export default function PythonPanel() {
       const job = next.currentJob;
       if (job?.finishedAt) {
         const key = `${job.kind}:${job.target}:${job.finishedAt}`;
-        if (seenFinishedRef.current !== key) {
-          seenFinishedRef.current = key;
+        // (once per job for the whole session, not again at each visit to this page; a job that ended long before
+        // this page was first opened is not news)
+        const recent = Date.now() - Date.parse(job.finishedAt) < 2 * 60_000;
+        if (toldFinished !== key && (toldFinished !== null || recent)) {
+          toldFinished = key;
           const ok = job.exitCode === 0 && !job.error;
           const verbed =
             job.kind === 'installruntime' ? 'Python install' : `Venv "${job.target}"`;
@@ -67,6 +70,8 @@ export default function PythonPanel() {
             body: job.error ?? undefined,
             timeoutMs: ok ? 5000 : 8000,
           });
+        } else {
+          toldFinished = key;
         }
       }
       setSnapshot(next);

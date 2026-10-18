@@ -112,11 +112,14 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
 
   // Not installed → say so plainly rather than showing a button that can't work.
   if (status && !status.available) {
+    // (`bare`: inside a choice that names ChatGPT already, so no heading of its own)
     return (
-      <section className="service-section">
-        <div className="section-title-row">
-          <h3 className="section-title">ChatGPT</h3>
-        </div>
+      <section className={bare ? 'chatgpt-connector is-bare' : 'service-section'}>
+        {!bare && (
+          <div className="section-title-row">
+            <h3 className="section-title">ChatGPT</h3>
+          </div>
+        )}
         <p className="form-hint">
           Sign in with a ChatGPT account instead of an API key. This needs the{' '}
           <code>codex</code> CLI on this machine

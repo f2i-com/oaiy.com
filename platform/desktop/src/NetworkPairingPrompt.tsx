@@ -31,7 +31,10 @@ export default function NetworkPairingPrompt({ waiting, onOpen }: { waiting: num
       return;
     }
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 4000);
+    // (not while the window is hidden in the tray: the count that brings it here is asked meanwhile)
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void refresh();
+    }, 4000);
     return () => window.clearInterval(timer);
   }, [waiting, refresh]);
 

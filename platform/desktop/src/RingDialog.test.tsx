@@ -62,7 +62,7 @@ const click = async (el: Element) => {
   await act(async () => (el as HTMLElement).click());
   await settle();
 };
-async function mount(props: { on?: boolean } = {}) {
+async function mount(props: { on?: boolean; onShowing?: (showing: boolean) => void } = {}) {
   await act(async () => root.render(<RingDialog {...props} />));
   await settle();
 }
@@ -84,6 +84,34 @@ afterEach(async () => {
 });
 
 describe('the ring dialog', () => {
+  it('keeps Tab inside it once the owner moves into it, Esc is Not now, and it says when it is showing', async () => {
+    const showing = vi.fn();
+    const before = document.createElement('button');
+    document.body.appendChild(before);
+    before.focus();
+    serve({});
+    await mount({ onShowing: showing });
+    expect(showing).toHaveBeenLastCalledWith(true);
+    expect(document.activeElement).toBe(before);
+    const decline = button('Decline and take a message');
+    decline.focus();
+    const dialog = host.querySelector('.ring-dialog')!;
+    // Tab from the last button comes back to the first; Shift+Tab from the first goes to the last
+    button('Not now').focus();
+    await act(async () => { dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true })); });
+    expect(document.activeElement).toBe(decline);
+    await act(async () => { dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true })); });
+    expect(document.activeElement).toBe(button('Not now'));
+    // Esc puts it away, the devices ringing on; the focus goes back where it was
+    await act(async () => { dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+    await settle();
+    expect(host.querySelector('.ring-dialog')).toBeNull();
+    expect(api.respond).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(before);
+    expect(showing).toHaveBeenLastCalledWith(false);
+    before.remove();
+  });
+
   it('shows nothing while nobody is being rung for', async () => {
     await mount();
     expect(host.querySelector('.ring-dialog')).toBeNull();

@@ -267,6 +267,45 @@ describe('OverviewPanel failure reporting', () => {
     await mount();
     expect(text()).toContain('1 run has failed');
   });
+
+  it('says no more once seen, and only what failed since then', async () => {
+    dismissGuide();
+    await mount();
+    await act(async () => button('See why')!.click());
+    expect(onNavigate).toHaveBeenCalledWith('runs');
+    expect(text()).not.toContain('failed on this machine');
+    // Seen across visits: a run failed since is what it says.
+    act(() => root.unmount());
+    root = createRoot(host);
+    statusMock.mockResolvedValue(runtime(4));
+    await mount();
+    expect(text()).toContain('1 more run failed since you last looked');
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Dismiss: these failures are seen"]')!.click());
+    expect(text()).not.toContain('failed since');
+  });
+
+  it('says nothing is installed only while no service is installed either', async () => {
+    dismissGuide();
+    await mount();
+    expect(text()).toContain('Nothing installed yet.');
+    act(() => root.unmount());
+    root = createRoot(host);
+    servicesMock.mockResolvedValue({ services: [{ id: 'oaiy-voice', name: 'OAIY Voice', status: 'stopped' }], dataDir: 'C:\\d' });
+    await mount();
+    expect(text()).toContain('0/1');
+    expect(text()).not.toContain('Nothing installed yet.');
+  });
+
+  it('says why Node did not install, and lets it be tried again', async () => {
+    dismissGuide();
+    statusMock.mockResolvedValue({ ...runtime(0), ready: false, nodeRuntime: { available: false, installing: false, installsVersion: '24.19.0', source: null }, flowRuntime: { cliResolved: false, cliKind: 'missing', detail: 'Node is not installed.' } });
+    nodeInstallMock.mockRejectedValue(new Error('502: the download was refused'));
+    await mount();
+    await act(async () => button('Install Node 24.19.0')!.click());
+    await act(async () => {});
+    expect(text()).toContain('Node was not installed: the download was refused');
+    expect(button('Install Node 24.19.0')!.disabled).toBe(false);
+  });
 });
 
 describe("Plugins' own cards", () => {
@@ -502,7 +541,7 @@ describe('A plugin waiting for its setup', () => {
     pluginsMock.mockResolvedValue({ plugins: [aokie('unhealthy')] });
     await mount();
     await settle();
-    expect(alarms()).not.toContain('aokie');
+    expect(alarms()).not.toContain('Aokie');
     expect(alarms()).toContain('runs have failed'); // the page's other alarms still show
   });
 
@@ -511,6 +550,9 @@ describe('A plugin waiting for its setup', () => {
     pluginsMock.mockResolvedValue({ plugins: [aokie('unhealthy')] });
     await mount();
     await settle();
-    expect(alarms()).toContain('Plugin "aokie" is unhealthy.');
+    // By its name, what is wrong, and the way to it.
+    expect(alarms()).toContain('Aokie Phone Bridge has a problem');
+    await act(async () => button('Open Plugins')!.click());
+    expect(onNavigate).toHaveBeenCalledWith('plugins');
   });
 });

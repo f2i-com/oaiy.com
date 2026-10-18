@@ -20,6 +20,7 @@ import {
   ymd,
 } from './calendarModel';
 import { useToast } from './Toasts';
+import { useUnsaved } from './unsavedChanges';
 import { moduleOn, useModules } from './useModules';
 import { useVisiblePoll } from './useVisiblePoll';
 
@@ -108,6 +109,8 @@ export function SettingsForm({
   const [justSaved, setJustSaved] = useState(false);
   const root = useRef<HTMLDivElement | null>(null);
   const dirty = !sameSettings(s, base);
+  // (leaving the page asks first while something here is not saved)
+  useUnsaved('hours', dirty, 'the business hours');
   const problems = useMemo(() => checkSettings(s), [s]);
   const invalid = problems.list.length > 0;
 
@@ -563,6 +566,8 @@ export function CallVoice({ business, receptionist = '' }: { business: string; r
   const [list, setList] = useState<VoiceClip[]>([]);
   const [chosen, setChosen] = useState<string | null>(null);
   const [speaking, setSpeaking] = useState<string | null>(null);
+  /** The voice whose Remove was pressed: asked again in its row before it is deleted. */
+  const [confirming, setConfirming] = useState<string | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState('');
   const [words, setWords] = useState('');
@@ -601,12 +606,18 @@ export function CallVoice({ business, receptionist = '' }: { business: string; r
     try {
       const blob = await voices.hear(voice, `Hi, thanks for calling${business.trim() ? ` ${business.trim()}` : ''}, this is ${receptionistName({ receptionist })}. How can I help you today?`);
       player.current?.pause();
-      const audio = new Audio(URL.createObjectURL(blob));
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
       player.current = audio;
+      // "Speaking…" until it has been said (or stopped), and the clip let go then.
+      const done = () => {
+        URL.revokeObjectURL(url);
+        if (player.current === audio) setSpeaking(null);
+      };
+      for (const ev of ['ended', 'pause', 'error']) audio.addEventListener(ev, done, { once: true });
       await audio.play();
     } catch (e) {
       fail('Could not speak', e);
-    } finally {
       setSpeaking(null);
     }
   };
@@ -672,16 +683,34 @@ export function CallVoice({ business, receptionist = '' }: { business: string; r
               <button type="button" className="btn btn-ghost" disabled={speaking !== null} onClick={() => void hear(v.name)}>
                 <Volume2 size={14} /> {speaking === v.name ? 'Speaking…' : 'Hear it'}
               </button>
-              <button
-                type="button"
-                className="icon-button"
-                disabled={list.length < 2}
-                title={list.length < 2 ? 'The phone needs one voice' : 'Remove this voice'}
-                aria-label={`Remove ${v.name}`}
-                onClick={() => void remove(v.name)}
-              >
-                <Trash2 size={14} />
-              </button>
+              {confirming === v.name ? (
+                <span role="group" aria-label={`Remove ${v.name}?`} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <button
+                    type="button"
+                    className="btn-tiny btn-danger"
+                    onClick={() => {
+                      setConfirming(null);
+                      void remove(v.name);
+                    }}
+                  >
+                    <Trash2 size={13} /> Remove
+                  </button>
+                  <button type="button" className="btn-tiny" onClick={() => setConfirming(null)}>
+                    Keep
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="icon-button"
+                  disabled={list.length < 2}
+                  title={list.length < 2 ? 'The phone needs one voice' : 'Remove this voice'}
+                  aria-label={`Remove ${v.name}`}
+                  onClick={() => setConfirming(v.name)}
+                >
+                  <Trash2 size={14} />
+                </button>
+              )}
             </li>
           ))
         )}

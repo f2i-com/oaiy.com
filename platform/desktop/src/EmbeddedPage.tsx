@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { isTauri, tauriInvoke } from './api';
 
-const NAME = { agent: 'The agent', flows: 'The flow editor', engines: 'The engines' } as const;
+const NAME = { agent: 'The Agent', flows: 'The flow editor', engines: 'Engines' } as const;
 
 /** How often the box is looked at for having moved without a change of size. */
 const MOVED_CHECK_MS = 300;
@@ -19,13 +19,18 @@ function where(r: DOMRect): string {
  * says so whenever it moves or changes size. A section's tab strip sits above
  * the box, so the webview never covers it.
  */
-export default function EmbeddedPage({ page }: { page: 'agent' | 'flows' | 'engines' }) {
+export default function EmbeddedPage({ page, covered = false }: { page: 'agent' | 'flows' | 'engines'; covered?: boolean }) {
   const box = useRef<HTMLDivElement>(null);
-  const [problem, setProblem] = useState<string | null>(isTauri() ? null : `${NAME[page]} shows here in the OAIY app.`);
+  const [problem, setProblem] = useState<string | null>(isTauri() ? null : `${NAME[page]} opens here in OAIY's own window, not in a browser.`);
 
   useEffect(() => {
     const el = box.current;
     if (!el || !isTauri()) return;
+    // (something the webview would cover is showing, a call ringing: taken away until it is gone)
+    if (covered) {
+      void tauriInvoke('hide_embedded').catch(() => {});
+      return;
+    }
     let frame = 0;
     let told = '';
     const place = () => {
@@ -59,7 +64,7 @@ export default function EmbeddedPage({ page }: { page: 'agent' | 'flows' | 'engi
       window.removeEventListener('resize', place);
       void tauriInvoke('hide_embedded').catch(() => {});
     };
-  }, [page]);
+  }, [page, covered]);
 
   return (
     <div ref={box} className="embedded-page" aria-label={NAME[page]}>

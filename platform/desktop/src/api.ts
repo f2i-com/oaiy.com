@@ -26,6 +26,10 @@ async function request<T>(
       headers: { 'Content-Type': 'application/json' },
       ...init,
       signal: ac.signal,
+    }).catch((e: unknown) => {
+      // (the 15 s bound: said as what happened, not as the browser's "signal is aborted without reason")
+      if (ac.signal.aborted) throw new Error('504: OAIY did not answer within 15 seconds. It may be busy: try again in a moment.');
+      throw e;
     });
     if (!resp.ok) {
       // Try to surface the API's error message — falls back to status text.
@@ -401,6 +405,8 @@ export interface PackageTrust {
 export interface PluginRecord {
   id: string;
   state: PluginState;
+  /** What a plugin held back (not trusted yet) says it is, for showing alone: its name, version and capabilities. */
+  declared?: { name: string; version: string; capabilities: string[] };
   /** Present for every state that is not `running`. */
   reason?: string;
   dir: string;
@@ -2142,6 +2148,8 @@ export interface NetworkSettings {
   agent?: boolean;
   /** Lending itself, it lends its model files too (on unless switched off). */
   shareModels?: boolean;
+  /** Open pairing by itself for this many minutes (1..10; 0 closes it): a computer asking meanwhile pairs with no codes. */
+  openPairingMinutes?: number;
   /** The name other computers show for this one (the computer's own where empty). */
   name: string;
   /** The port a worker listens on. */
@@ -2162,6 +2170,12 @@ export interface NetworkStatus {
   agent?: boolean;
   /** Lending itself, it lends its model files too. */
   shareModels?: boolean;
+  /** Pairing by itself open until (ms since the epoch), or none. */
+  pairingOpenUntilMs?: number | null;
+  /** The computers that paired with this one by itself lately, and when (ms). */
+  pairedByItself?: { name: string; at: number }[];
+  /** Why this computer cannot lend itself now (its port taken), where it cannot. */
+  listenError?: string | null;
   settings: NetworkSettings;
   nodeId: string | null;
   name: string;

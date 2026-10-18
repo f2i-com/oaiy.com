@@ -175,6 +175,39 @@ describe('first run, on a desktop without the new routes', () => {
     expect(invoke).toHaveBeenCalledWith('agent_intent', { intent: 'setupWithAgent' });
   });
 
+  it('says so when the Agent does not take the request, rather than that it took it from here', async () => {
+    m.setupGet.mockResolvedValue(record({ position: 'handoff' }));
+    // (outside the desktop's window the Agent page cannot be asked)
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    await render();
+    await click(button('Continue with the Agent'));
+    expect(onNavigate).toHaveBeenCalledWith('agent');
+    expect(m.push).toHaveBeenCalledWith(expect.objectContaining({ kind: 'error', title: 'The Agent did not start setting up OAIY' }));
+    expect(m.push).not.toHaveBeenCalledWith(expect.objectContaining({ title: 'The essentials are set up' }));
+  });
+
+  it('keeps every plugin ticked quickly, each on the newest record', async () => {
+    m.setupGet.mockResolvedValue(record({ position: 'plugins' }));
+    let release: () => void = () => {};
+    // The first save waits: the second is sent after it, on what it answered.
+    m.putFirstRun.mockImplementationOnce(
+      (fr: FirstRunState) => new Promise((resolve) => (release = () => resolve({ firstRun: fr, plugins: {} }))),
+    );
+    const { saveFirstRun } = await import('./useSetupState');
+    await render();
+    const first = saveFirstRun((now) => ({ chosenPlugins: [...now.chosenPlugins, 'a'] }));
+    const second = saveFirstRun((now) => ({ chosenPlugins: [...now.chosenPlugins, 'b'] }));
+    await settle();
+    // (the first is out, the second waits for it)
+    expect(m.putFirstRun).toHaveBeenCalledTimes(1);
+    release();
+    await act(async () => {
+      await first;
+      await second;
+    });
+    expect(m.putFirstRun).toHaveBeenLastCalledWith(expect.objectContaining({ chosenPlugins: ['a', 'b'] }));
+  });
+
   it('“Set up the rest myself” opens the full flow at Plugins, and keeps it on the way back', async () => {
     m.setupGet.mockResolvedValue(record({ position: 'handoff' }));
     await render();
@@ -219,14 +252,34 @@ describe('first run, with the desktop’s new routes', () => {
     expect(choices()[2].textContent).toContain('An AI provider');
     expect(host.querySelector('.ai-choices.is-trio')).toBeTruthy();
     await click(choices()[2].querySelector('input'));
-    // The picker below: LM Studio, set up already, on the model it lists.
+    // The picker below: LM Studio, set up already, with the models it lists; one is chosen by the person (a provider
+    // merely looked at does not change the Agent's model).
     expect(host.querySelector('.ai-provider')).toBeTruthy();
     expect(m.providerModels).toHaveBeenCalledWith('lm-studio');
+    expect(button('Next')!.disabled).toBe(true);
+    const model = host.querySelector<HTMLSelectElement>('select[aria-label="Model"]')!;
+    await act(async () => {
+      model.value = 'qwen3.5-9b';
+      model.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await settle();
     expect(choices()[2].textContent).toContain('LM Studio · qwen3.5-9b');
     expect(button('Next')!.disabled).toBe(false);
     await click(button('Next'));
     expect(m.prefsSet).toHaveBeenCalledWith({ model: { source: 'provider', provider: 'lm-studio', model: 'qwen3.5-9b' } });
     expect(heading()).toBe('The Agent');
+  });
+
+  it('says when the Agent’s settings cannot be read, asks again, and saves nothing on a guess', async () => {
+    m.setupGet.mockResolvedValue(record({ position: 'ai' }));
+    m.catalog.mockResolvedValue(catalog('Picked-In-Engines'));
+    m.prefsGet.mockRejectedValueOnce(new Error('500: the desktop is busy'));
+    await render();
+    expect(host.textContent).toContain('The Agent’s settings could not be read: the desktop is busy');
+    // (not taken for an older desktop: no "can't choose" and nothing saved; Retry asks again)
+    await click(Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('Try again')));
+    expect(host.textContent).not.toContain('could not be read');
+    expect(m.prefsGet).toHaveBeenCalledTimes(2);
   });
 
   it('orders by the recommendation, says why, and sets the Agent to ChatGPT on Next', async () => {

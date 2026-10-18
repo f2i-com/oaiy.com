@@ -163,7 +163,8 @@ describe('Transfers', () => {
     await mount();
     await click(box('Take messages'));
     await click(saveButton());
-    expect(api.save.mock.calls[0][0]).toMatchObject({ enabled: false, takeMessages: true });
+    // (only what changed is sent: transfers stay as they are, off)
+    expect(api.save.mock.calls[0][0]).toEqual({ takeMessages: true });
   });
 
   it('saves how it rings, the urgent phrases and VIPs as lines, and quiet hours by day', async () => {
@@ -183,8 +184,41 @@ describe('Transfers', () => {
     await click(saveButton());
     const sent = api.save.mock.calls[0][0];
     expect(sent).toMatchObject({ ringSeconds: 55, phoneRing: 'always', urgentPhrases: ['gas leak', 'burst pipe'], vipNumbers: ['0491 570 006'] });
-    expect(sent.quietHours).toEqual({ enabled: true, start: '21:00', end: '07:00', days: 0b0111110, allowUrgent: false, allowVip: true });
-    expect(sent.limits).toEqual({ perCall: 2, gapSeconds: 60, perCallerHour: 3, globalHour: 10 });
+    // quiet hours member by member, and nothing of what was not changed (the limits): a paired program's change stays
+    expect(sent.quietHours).toEqual({ enabled: true, days: 0b0111110 });
+    expect(sent.limits).toBeUndefined();
+    expect(sent.enabled).toBeUndefined();
+  });
+
+  it('reads the settings again while nothing is changed here, and keeps the form while something is', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
+    try {
+      await mount();
+      const reads = api.settings.mock.calls.length;
+      await act(async () => {
+        vi.advanceTimersByTime(20_100);
+      });
+      expect(api.settings.mock.calls.length).toBeGreaterThan(reads);
+      // a change being made: a reading that lands keeps it
+      await click(box('Take messages'));
+      await act(async () => {
+        vi.advanceTimersByTime(20_100);
+      });
+      await act(async () => {});
+      expect(box('Take messages').checked).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('offers to try again when the settings could not be read, and says why the Companions could not be', async () => {
+    api.settings.mockRejectedValueOnce(new Error('desktop busy'));
+    api.status.mockRejectedValue(new Error('phone plugin stopped'));
+    await mount();
+    expect(text()).toContain('Could not read the settings: desktop busy');
+    await click([...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Try again'))!);
+    expect(text()).toContain('Could not read the approved Companions: phone plugin stopped');
+    expect(text()).not.toContain('No Companion is approved yet');
   });
 
   it('lists the approved Companions: one is this computer’s, one is never rung', async () => {

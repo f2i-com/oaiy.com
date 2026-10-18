@@ -245,7 +245,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
                   )}
                   {confirming === m.id ? (
                     <>
-                      <button type="button" className="btn-tiny danger" disabled={busyIds.has(m.id)} onClick={() => void remove(m.id)}>
+                      <button type="button" className="btn-tiny btn-danger" disabled={busyIds.has(m.id)} onClick={() => void remove(m.id)}>
                         <Trash2 size={12} /> Delete it
                       </button>
                       <button type="button" className="btn-tiny" onClick={() => setConfirming(null)} aria-label="Keep it">

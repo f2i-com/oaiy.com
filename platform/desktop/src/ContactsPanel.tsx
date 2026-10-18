@@ -15,6 +15,7 @@ import {
   skipReason,
 } from './contactsModel';
 import { useToast } from './Toasts';
+import { useUnsaved } from './unsavedChanges';
 import { useVisiblePoll } from './useVisiblePoll';
 
 /**
@@ -42,6 +43,8 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
   const [side, setSide] = useState<Side | null>(null);
   /** The open contact has changes not saved: another is not opened over them. */
   const [dirty, setDirty] = useState(false);
+  // (leaving the page asks first while the open contact has changes not saved)
+  useUnsaved('contacts', dirty, 'the contact you are editing');
   const [nudge, setNudge] = useState(0);
   const [exporting, setExporting] = useState(false);
 

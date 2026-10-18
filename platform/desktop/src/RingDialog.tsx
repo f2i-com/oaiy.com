@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Phone, PhoneOff } from 'lucide-react';
 import { ring as api, type ActiveRing, type RingAction, type RingNotice } from './api';
 import { readableNumber } from './contactsModel';
@@ -25,7 +25,11 @@ export function secondsLeft(ring: Pick<ActiveRing, 'expiresAt'>, now: number): n
   return Math.max(0, Math.ceil((ring.expiresAt - now) / 1000));
 }
 
-export default function RingDialog({ on = true }: { on?: boolean }) {
+/**
+ * `onShowing` is told whether a ring or a notice is on the screen now (and `false` when this goes): a page that lays a
+ * window of its own over the dashboard (the Agent's, Flows', Engines') puts it away meanwhile, or the dialog is under it.
+ */
+export default function RingDialog({ on = true, onShowing }: { on?: boolean; onShowing?: (showing: boolean) => void }) {
   const [rings, setRings] = useState<ActiveRing[]>([]);
   /** Callers who asked for the owner when no device was set up to take a transfer: told, and dismissed by the owner. */
   const [notices, setNotices] = useState<RingNotice[]>([]);
@@ -70,6 +74,32 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   const now = Date.now() + offset.current;
   const ringing = rings.filter((r) => r.expiresAt > now && !putAway.includes(r.id));
   const shown = ringing[0];
+  const told = notices.filter((n) => !dismissed.includes(n.id));
+
+  // Whether anything of this is on the screen, for a page that covers the dashboard with a window of its own.
+  const showing = on && (!!shown || told.length > 0);
+  const tellShowing = useRef(onShowing);
+  tellShowing.current = onShowing;
+  useEffect(() => {
+    tellShowing.current?.(showing);
+  }, [showing]);
+  useEffect(() => () => tellShowing.current?.(false), []);
+
+  // The dialog never takes the focus (a stray Enter while the owner types elsewhere must not decline a call); once they
+  // move into it, Tab stays inside it and Esc is Not now, and when it goes the focus is back where it was before it rang.
+  const dialog = useRef<HTMLDivElement>(null);
+  const before = useRef<Element | null>(null);
+  const focusId = shown?.id;
+  useEffect(() => {
+    if (focusId) {
+      if (!before.current) before.current = document.activeElement;
+      return;
+    }
+    const back = before.current;
+    before.current = null;
+    const lost = !document.activeElement || document.activeElement === document.body;
+    if (lost && back instanceof HTMLElement && back.isConnected) back.focus();
+  }, [focusId]);
 
   // What went wrong is about the ring it happened on: another caller's ring, or none, does not inherit it.
   const shownId = shown?.id;
@@ -96,7 +126,6 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
     }
   };
 
-  const told = notices.filter((n) => !dismissed.includes(n.id));
   const dismiss = (id: string) => {
     setDismissed((ids) => [...ids.slice(-20), id]);
     void api.dismissNotice(id).catch(() => {
@@ -134,11 +163,34 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   const who = shown.callerName || readableNumber(shown.callerNumber) || 'A caller who hid their number';
   const said = shown.said.filter((s) => s.trim()).slice(-2);
   const note = shown.note;
+  const putAwayShown = () => setPutAway((ids) => [...ids.slice(-20), shown.id]);
+  const keys = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      putAwayShown();
+      return;
+    }
+    if (e.key !== 'Tab' || !dialog.current) return;
+    const stops = Array.from(dialog.current.querySelectorAll<HTMLElement>('button:not(:disabled), [href], [tabindex]:not([tabindex="-1"])'));
+    if (!stops.length) return;
+    const first = stops[0];
+    const last = stops[stops.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    } else if (!dialog.current.contains(document.activeElement)) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
   return (
     <>
     {noticeStack}
     <div className="ring-overlay">
-      <div className="ring-dialog" role="alertdialog" aria-modal="true" aria-labelledby="ring-title" aria-describedby="ring-who">
+      <div ref={dialog} className="ring-dialog" role="alertdialog" aria-modal="true" aria-labelledby="ring-title" aria-describedby="ring-who" onKeyDown={keys}>
         <h2 id="ring-title">
           <Phone size={16} aria-hidden /> A caller wants to speak to you
         </h2>
@@ -167,7 +219,7 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
           <button type="button" className="button secondary" disabled={busy?.ring === shown.id || shown.stopping || shown.taken} onClick={() => void act('decline')}>
             <PhoneOff size={14} /> Decline and take a message
           </button>
-          <button type="button" className="button secondary" onClick={() => setPutAway((ids) => [...ids.slice(-20), shown.id])}>
+          <button type="button" className="button secondary" onClick={putAwayShown}>
             Not now
           </button>
         </div>

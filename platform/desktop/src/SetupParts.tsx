@@ -36,7 +36,8 @@ export function usePoll<T>(load: () => Promise<T>, ms: number, enabled = true): 
       setValue(await loadRef.current());
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // (said as the person reads it: "the desktop is busy", not "500: the desktop is busy")
+      setError(errorText(e));
     }
   }, []);
   useEffect(() => {
@@ -52,12 +53,13 @@ export function usePoll<T>(load: () => Promise<T>, ms: number, enabled = true): 
 
 /**
  * What a route a desktop may not have said, polled as `{ v }` so an answer of
- * `null` (a 404: an older desktop) differs from not asked yet: `undefined`
- * while asking, else its answer, `null` for a missing route or a failure.
+ * `null` (a 404, which the client answers as `null`: an older desktop) differs
+ * from not known yet: its answer, `null` for a missing route, `undefined` while
+ * asking or after a failure (its error says why; nothing is decided on it, and
+ * the next poll asks again).
  */
-export function answered<T>(value: { v: T | null } | null, error: string | null): T | null | undefined {
-  if (value) return value.v;
-  return error ? null : undefined;
+export function answered<T>(value: { v: T | null } | null, _error: string | null): T | null | undefined {
+  return value ? value.v : undefined;
 }
 
 export function errorText(e: unknown): string {
@@ -217,7 +219,7 @@ export function WizardFrame({
           </button>
         </div>
       </div>
-      <div className="setup-body">
+      <div className="setup-layout">
         <StepRail items={rail} current={current} onPick={onPick} label={railLabel} />
         <div className="setup-main">
           <section className={flush ? 'setup-pane is-flush' : 'setup-pane'}>{children}</section>

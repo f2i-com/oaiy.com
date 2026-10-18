@@ -18,6 +18,7 @@ import { PluginAiSession } from './pluginAi';
 import { PluginVoiceSession, type VoiceView } from './pluginVoice';
 import { PluginVoiceControls } from './PluginVoiceControls';
 import { PluginScreenDocument } from './pluginScreenRpc';
+import { useVisiblePoll } from './useVisiblePoll';
 
 /**
  * Host for a plugin-contributed screen.
@@ -553,6 +554,26 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
     };
   }, [pluginId, attempt]);
 
+  // How the plugin stands, read again while the page shows (a plugin started from Plugins, or that stopped, says so
+  // here without a reload; the frame is not touched).
+  useVisiblePoll(() => {
+    const generation = snapshotGeneration.current;
+    const sequence = ++snapshotSequence.current;
+    plugins
+      .list()
+      .then((snap) => {
+        if (generation !== snapshotGeneration.current || sequence !== snapshotSequence.current) return;
+        const current = snap.plugins.find((p) => p.id === pluginId) ?? null;
+        setRuntimeStatus((previous) => {
+          if (!current) return null;
+          return previous?.state === current.state && previous?.reason === current.reason ? previous : { state: current.state, reason: current.reason };
+        });
+      })
+      .catch(() => {
+        /* a missed reading: the next one says */
+      });
+  }, 4000);
+
   const screen = useMemo(() => {
     const ui = (record?.manifest as unknown as { ui?: { nav?: UiNav[]; screens?: UiScreen[] } } | undefined)?.ui;
     if (!ui) return null;
@@ -934,7 +955,9 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
                 wrong — and often the screen itself is where the fix lives. */}
             {currentStatus.state === 'unhealthy'
               ? '. The screen still works — you may be able to resolve this here.'
-              : '. Start it from Plugins before using this screen.'}
+              : currentStatus.state === 'starting'
+                ? '. It is ready in a moment.'
+                : '. Start it from Plugins before using this screen.'}
           </span>
         </div>
       )}

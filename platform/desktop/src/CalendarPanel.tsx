@@ -113,19 +113,32 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
     [mode, today, week],
   );
 
+  // The latest request's number: paging quickly through weeks, an older week's answer landing late is not shown.
+  const asked = useRef(0);
   const refresh = useCallback(async () => {
+    const mine = ++asked.current;
     try {
       const got = await calendar.get(from, to);
+      if (mine !== asked.current) return;
       setSettings(got.settings);
       setAppointments(got.appointments);
       setError(null);
     } catch (e) {
-      setError(errText(e));
+      if (mine === asked.current) setError(errText(e));
     }
-    setSync(await calendar.syncStatus().catch(() => null));
+    const synced = await calendar.syncStatus().catch(() => null);
+    if (mine === asked.current) setSync(synced);
   }, [from, to]);
 
-  useEffect(() => void refresh(), [refresh]);
+  // (asked at once when the week or the view changes; the poll's own first ask is the first load)
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    void refresh();
+  }, [refresh]);
   useVisiblePoll(() => void refresh(), POLL_MS);
   useEffect(() => {
     const id = window.setInterval(() => setNow(new Date()), 60_000);

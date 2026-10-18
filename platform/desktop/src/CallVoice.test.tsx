@@ -204,4 +204,43 @@ describe('hearing a voice', () => {
     root = createRoot(host);
     vi.restoreAllMocks();
   });
+
+  it('asks again in the voice’s row before it removes it', async () => {
+    const OTHER = { name: 'Night line', file: 'night.wav', bytes: 120_000, written: true };
+    routes['GET /api/voice/voices'] = () => ({ body: { voices: [VOICE, OTHER], chosen: 'Front desk' } });
+    routes['DELETE /api/voice/voices/Night%20line'] = () => ({ body: { chosen: 'Front desk' } });
+    await mount();
+    const button = (label: string) => [...host.querySelectorAll('button')].find((b) => (b.getAttribute('aria-label') ?? b.textContent?.trim()) === label)!;
+    await act(async () => button('Remove Night line').click());
+    expect(calls('DELETE', '/api/voice/voices/Night%20line')).toHaveLength(0);
+    await act(async () => button('Keep').click());
+    expect(text()).toContain('Night line');
+    await act(async () => button('Remove Night line').click());
+    await act(async () => button('Remove').click());
+    await act(async () => {});
+    expect(calls('DELETE', '/api/voice/voices/Night%20line')).toHaveLength(1);
+    expect(text()).not.toContain('Night line');
+  });
+
+  it('says “Speaking…” until the sample has been said, and lets the clip go then', async () => {
+    routes['POST /api/voice/voices/Front%20desk/try'] = () => ({ body: {} });
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockReturnValue(undefined);
+    const revoke = vi.spyOn(URL, 'revokeObjectURL');
+    await mount();
+    const hear = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Hear it'))!;
+    await act(async () => hear.click());
+    expect(text()).toContain('Speaking…');
+    expect(revoke).not.toHaveBeenCalled();
+    // the player says it has ended
+    const audio = vi.mocked(HTMLMediaElement.prototype.play).mock.contexts[0] as HTMLAudioElement;
+    await act(async () => {
+      audio.dispatchEvent(new Event('ended'));
+    });
+    expect(text()).not.toContain('Speaking…');
+    expect(revoke).toHaveBeenCalledTimes(1);
+    act(() => root.unmount());
+    root = createRoot(host);
+    vi.restoreAllMocks();
+  });
 });

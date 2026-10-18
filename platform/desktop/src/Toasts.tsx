@@ -63,7 +63,7 @@ export interface Toast {
   kind: ToastKind;
   title: string;
   body?: string;
-  /** Auto-dismiss after this many ms. 0 = sticky. Default 5000. */
+  /** Auto-dismiss after this many ms. 0 = sticky. Default 5000, an error's 12000 (long enough to read what went wrong). */
   timeoutMs?: number;
 }
 
@@ -82,25 +82,46 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   // (no stray dismiss firing after the provider is gone).
   const timers = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
 
+  /** How long each toast still has (ms), for one paused under the pointer or focus and picked up again after. */
+  const left = useRef<Map<number, { ms: number; since: number }>>(new Map());
+
   const dismiss = useCallback((id: number) => {
     const handle = timers.current.get(id);
     if (handle !== undefined) {
       clearTimeout(handle);
       timers.current.delete(id);
     }
+    left.current.delete(id);
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+
+  const arm = useCallback((id: number, ms: number) => {
+    left.current.set(id, { ms, since: Date.now() });
+    timers.current.set(id, setTimeout(() => dismiss(id), ms));
+  }, [dismiss]);
 
   const push = useCallback((toast: Omit<Toast, 'id'>) => {
     const t: Toast = { ...toast, id: nextId++ };
     setToasts((prev) => [...prev, t]);
-    const timeout = toast.timeoutMs ?? 5000;
-    if (timeout > 0) {
-      timers.current.set(t.id, setTimeout(() => dismiss(t.id), timeout));
-    }
+    const timeout = toast.timeoutMs ?? (toast.kind === 'error' ? 12000 : 5000);
+    if (timeout > 0) arm(t.id, timeout);
     // Mirror to a native OS notification when the window is backgrounded.
     void maybeNativeNotify(t.title, t.body);
-  }, [dismiss]);
+  }, [arm]);
+
+  // Held while the pointer is over a toast or it has focus (its text being read or copied), carried on after.
+  const hold = useCallback((id: number) => {
+    const handle = timers.current.get(id);
+    const l = left.current.get(id);
+    if (handle === undefined || !l) return;
+    clearTimeout(handle);
+    timers.current.delete(id);
+    left.current.set(id, { ms: Math.max(1500, l.ms - (Date.now() - l.since)), since: Date.now() });
+  }, []);
+  const release = useCallback((id: number) => {
+    const l = left.current.get(id);
+    if (l && !timers.current.has(id)) arm(id, l.ms);
+  }, [arm]);
 
   // Cancel any pending auto-dismiss timers when the provider unmounts.
   useEffect(() => {
@@ -128,6 +149,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             key={t.id}
             className={`toast toast-${t.kind}`}
             role={t.kind === 'error' ? 'alert' : undefined}
+            onMouseEnter={() => hold(t.id)}
+            onMouseLeave={() => release(t.id)}
+            onFocus={() => hold(t.id)}
+            onBlur={() => release(t.id)}
           >
             <div className="toast-content">
               <div className="toast-title">{t.title}</div>
@@ -136,7 +161,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <button
               className="toast-close"
               onClick={() => dismiss(t.id)}
-              aria-label="dismiss"
+              aria-label="Dismiss"
             >
               ✕
             </button>

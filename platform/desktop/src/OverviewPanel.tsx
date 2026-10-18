@@ -7,10 +7,12 @@ import {
   Network,
   Package,
   Plug,
+  RotateCcw,
   Server,
   ShieldCheck,
   Sparkles,
   TriangleAlert,
+  X,
 } from 'lucide-react';
 import { peek, put } from './useCached';
 import SetupGuidePanel from './SetupGuidePanel';
@@ -57,6 +59,18 @@ import { useSetupState } from './useSetupState';
  */
 
 const POLL_MS = 4000;
+
+/** How many failed runs the person has seen (opened Run history from here, or dismissed the warning). */
+const FAILED_SEEN = 'oaiy.overview.failedSeen';
+
+function readFailedSeen(): number {
+  try {
+    const n = Number(localStorage.getItem(FAILED_SEEN) ?? 0);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
 
 export type OverviewNav =
   | 'agent'
@@ -120,6 +134,9 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [guideOpen, setGuideOpen] = useState<boolean>(() => shouldAutoOpen());
   const [codexConnected, setCodexConnected] = useState(false);
   const [unavailable, setUnavailable] = useState<string[]>([]);
+  const [failedSeen, setFailedSeen] = useState<number>(readFailedSeen);
+  const [nodeBusy, setNodeBusy] = useState(false);
+  const [nodeError, setNodeError] = useState<string | null>(null);
   const refreshing = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -191,21 +208,54 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   // The one-click Node fix — offered wherever the runtime is reported broken.
   const installNode =
     runtime?.nodeRuntime && !runtime.nodeRuntime.available ? (
-      <button
-        className="btn-tiny"
-        disabled={runtime.nodeRuntime.installing}
-        onClick={() => void nodeRuntime.install().then(refresh).catch(() => {})}
-      >
-        {runtime.nodeRuntime.installing
-          ? 'Installing Node…'
-          : `Install Node ${runtime.nodeRuntime.installsVersion}`}
-      </button>
+      <span className="overview-fix">
+        <button
+          className="btn-tiny"
+          disabled={nodeBusy || runtime.nodeRuntime.installing}
+          onClick={() => {
+            setNodeBusy(true);
+            setNodeError(null);
+            void nodeRuntime
+              .install()
+              .then(refresh)
+              .catch((e: unknown) => setNodeError(`Node was not installed: ${e instanceof Error ? e.message.replace(/^\d{3}: /, '') : String(e)}`))
+              .finally(() => setNodeBusy(false));
+          }}
+        >
+          {nodeBusy || runtime.nodeRuntime.installing
+            ? 'Installing Node…'
+            : `Install Node ${runtime.nodeRuntime.installsVersion}`}
+        </button>
+        {nodeError && <small className="card-warn" role="alert">{nodeError}</small>}
+      </span>
     ) : null;
+  // The runtime's own step: Node installed in one click where that is what is missing, else read again (what is wrong
+  // with it is said in the step; no other page fixes it).
+  const runtimeFix = installNode ?? (
+    <button className="btn-tiny" onClick={() => void refresh()}>
+      <RotateCcw size={12} /> Check again
+    </button>
+  );
+
+  // Failed runs since the person last looked (a run that failed last week is not news every time Overview opens).
+  const failed = runtime?.runs.failed ?? 0;
+  // (fewer than seen: the history was cleared since, and counts from nothing)
+  const seen = failedSeen > failed ? 0 : failedSeen;
+  const newFailed = failed - seen;
+  const markFailedSeen = () => {
+    try {
+      localStorage.setItem(FAILED_SEEN, String(failed));
+    } catch {
+      /* storage can be unavailable: the warning comes back next time */
+    }
+    setFailedSeen(failed);
+  };
+  const plugName = (p: PluginRecord) => p.manifest?.name ?? p.id;
 
   return (
     <div className="panel">
       {unavailable.length > 0 && (
-        <div className="banner banner-err" role="status">
+        <div className="banner banner-err banner-dismissable" role="status">
           <span>Couldn't refresh {unavailable.join(', ')}. Showing last known values where available.</span>
           <button className="btn" onClick={() => void refresh()}>Refresh status</button>
         </div>
@@ -220,8 +270,9 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           services={svc}
           plugins={plug}
           connected={apps}
-          actions={installNode ? { runtime: installNode } : undefined}
-          onNavigate={(t: StepTarget) => onNavigate(t === 'overview' ? 'services' : t)}
+          live={live}
+          actions={{ runtime: runtimeFix }}
+          onNavigate={(t: StepTarget) => onNavigate(t === 'overview' ? 'runs' : t)}
           onDismiss={() => {
             dismissGuide();
             setGuideOpen(false);
@@ -341,27 +392,42 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           run that has ALREADY failed is not a setup step to work through. On a
           fresh install the guide is open — precisely when a failure is most
           likely and least excusable to hide. */}
-      {(runtime?.runs.failed ?? 0) > 0 && (
-        <div className="banner banner-err" role="alert">
+      {newFailed > 0 && (
+        <div className="banner banner-err banner-dismissable" role="alert">
           <span>
-            <TriangleAlert size={13} /> {runtime!.runs.failed} run
-            {runtime!.runs.failed === 1 ? ' has' : 's have'} failed on this machine.
+            <TriangleAlert size={13} />{' '}
+            {seen > 0
+              ? `${newFailed} more run${newFailed === 1 ? '' : 's'} failed since you last looked.`
+              : `${failed} run${failed === 1 ? ' has' : 's have'} failed on this machine.`}
           </span>
-          <button className="btn-tiny" onClick={() => onNavigate('runs')}>
-            <History size={13} /> See why
-          </button>
+          <span className="banner-actions">
+            <button
+              className="btn-tiny"
+              onClick={() => {
+                markFailedSeen();
+                onNavigate('runs');
+              }}
+            >
+              <History size={13} /> See why
+            </button>
+            <button className="banner-dismiss" aria-label="Dismiss: these failures are seen" title="Dismiss" onClick={markFailedSeen}>
+              <X size={13} />
+            </button>
+          </span>
         </div>
       )}
 
       {crashedPlug.length > 0 && (
-        <div className="banner banner-err" role="alert">
+        <div className="banner banner-err banner-dismissable" role="alert">
           <span>
             <TriangleAlert size={13} />{' '}
             {crashedPlug.length === 1
-              ? `Plugin "${crashedPlug[0].id}" is ${crashedPlug[0].state}.`
-              : `${crashedPlug.length} plugins need attention.`}{' '}
-            {crashedPlug[0].reason ?? ''}
+              ? `${plugName(crashedPlug[0])} has ${crashedPlug[0].state === 'crashed' ? 'stopped' : 'a problem'}${crashedPlug[0].reason ? `: ${crashedPlug[0].reason}` : '.'}`
+              : `${crashedPlug.length} plugins need attention: ${crashedPlug.map(plugName).join(', ')}.`}
           </span>
+          <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
+            <Plug size={13} /> Open Plugins
+          </button>
         </div>
       )}
 
@@ -399,7 +465,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
                 {net.lends && net.waiting > 0
                   ? 'To pair with this computer'
                   : net.uses
-                    ? `Of ${net.using ?? net.paired} paired computer${(net.using ?? net.paired) === 1 ? '' : 's'} to use`
+                    ? `Of ${net.using ?? net.paired} paired computer${(net.using ?? net.paired) === 1 ? '' : 's'}`
                     : (net.usedBy ?? net.paired) === 1
                       ? 'Computer using this one'
                       : 'Computers using this one'}
@@ -502,12 +568,13 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
         </div>
       )}
 
-      {plug !== null && plug.length === 0 && cards.length === 0 && (
+      {/* Only while nothing at all is installed: a service counts too (its tile above already shows it). */}
+      {plug !== null && plug.length === 0 && svc !== null && svc.length === 0 && cards.length === 0 && (
         <div className="empty-state">
           <Package size={22} style={{ opacity: 0.5 }} />
           <p>Nothing installed yet.</p>
           <p style={{ fontSize: 13, opacity: 0.7 }}>
-            Install a local service or a plugin and it shows up here.
+            Install a plugin, such as the phone, or a local service, and what it brings shows up here.
           </p>
         </div>
       )}
