@@ -356,14 +356,14 @@ a setting undoes:
 3. **The token is the `cli` preset, which is less than a server without the web login let it reach.** The web build's
    access mode is `scoped`, and it refuses `legacy`. The token holds `system.read`, `logs.read`, `services.read` and
    `.control`, `models.read` and `.write`, `plugins.read` and `.control`, `flows.read` and `.write`, `runs.read` and
-   `.write`, `ai.read`, `ai.use` and `events.read`: what the CLI and a bridge client do. **113 routes that a server without the web login let a token reach
+   `.write`, `ai.read`, `ai.use` and `events.read`: what the CLI and a bridge client do. **126 routes that a server without the web login let a token reach
    answer it `403 insufficient_scope`**, by the scope they ask for: `services.define` (defining,
    uninstalling and exporting services), `runtimes.install` and `plugins.install` (Python and Node installs, installing,
    removing and trusting a plugin: native code), `ai.admin` (provider keys and the ChatGPT login), `connectors.use`,
    `speech.use`, `calls.read`, `calls.write`, `calls.manage` and `calls.settings` (voice calls, voices, callers, the
    messages callers leave, the transfer settings), `calendar.*`, `contacts.*`,
    `agent.*` (tasks, events, leases, preferences), `setup.*` (the setup wizard and its catalog), `control.read` and
-   `control.admin` (the MCP endpoint, the control settings and log), `link.*` (the account link), `auth.*` (pairings),
+   `control.admin` (the MCP endpoint, the control settings and log), `link.*` (the account link), `auth.*` (pairings, and OAIY Network's settings and pairings),
    `companion.*` (the phone relay). `oaiy-server check` and the start's log say so, with the count, for any web-build
    install that sets a token. The list is pinned to the route table by a test (`auth::login_tests`).
 

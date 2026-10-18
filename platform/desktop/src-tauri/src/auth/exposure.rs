@@ -370,7 +370,7 @@ pub fn mode_from_env(value: Option<&str>, web_login: bool) -> Result<AccessMode,
 /// The routes that existed before the access model, which a server without the web login let a token reach and which the
 /// `cli` preset (what `OAIY_SERVER_TOKEN` is on the web build) cannot: `403 insufficient_scope`. The README lists them
 /// (The headless server on the web build), `auth::login_tests` pins this number and these scopes to the route table.
-pub const TOKEN_ONLY_LOSES_ROUTES: usize = 113;
+pub const TOKEN_ONLY_LOSES_ROUTES: usize = 126;
 /// The scopes those routes ask for, in order.
 pub const TOKEN_ONLY_LOSES_SCOPES: [&str; 29] = [
     "agent.read",
@@ -407,7 +407,7 @@ pub const TOKEN_ONLY_LOSES_SCOPES: [&str; 29] = [
 /// One line for `check` and the start's log: what `OAIY_SERVER_TOKEN` is on the web build, and what it is not.
 fn token_only_warning() -> String {
     format!(
-        "OAIY_SERVER_TOKEN is the `cli` preset on this build (it has the web login, whose access mode is `scoped`), which is less than a server without the web login let a token reach: {TOKEN_ONLY_LOSES_ROUTES} routes answer it `403 insufficient_scope` (voice calls and voices, the calendar, contacts, the Agent's tasks and preferences, setup, the control settings and log, the account link, pairings, the companion relay, AI provider keys, and defining services or installing runtimes and plugins). There is no setting that brings the old behaviour back: run `oaiy-server auth init` and make the tokens those routes need with `oaiy-server auth token create --preset cli --scope <scope>` (`--preset cli-admin` adds the installs). Until the owner exists the server is in setup-only mode: a caller with no credential is told `setup_required` everywhere but health and the login routes, and your token is judged as it is everywhere else"
+        "OAIY_SERVER_TOKEN is the `cli` preset on this build (it has the web login, whose access mode is `scoped`), which is less than a server without the web login let a token reach: {TOKEN_ONLY_LOSES_ROUTES} routes answer it `403 insufficient_scope` (voice calls and voices, the calendar, contacts, the Agent's tasks and preferences, setup, the control settings and log, the account link, pairings and OAIY Network, the companion relay, AI provider keys, and defining services or installing runtimes and plugins). There is no setting that brings the old behaviour back: run `oaiy-server auth init` and make the tokens those routes need with `oaiy-server auth token create --preset cli --scope <scope>` (`--preset cli-admin` adds the installs). Until the owner exists the server is in setup-only mode: a caller with no credential is told `setup_required` everywhere but health and the login routes, and your token is judged as it is everywhere else"
     )
 }
 
