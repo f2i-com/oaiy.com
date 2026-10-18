@@ -69,6 +69,9 @@ pub(crate) struct Inner {
     peers: Mutex<Peers>,
     /// A worker's pairing requests, waiting for the person to approve them here.
     incoming: Mutex<Vec<worker::Incoming>>,
+    /// The pairing codes made here lately (a primary told its random value), when and for which address: a computer
+    /// asking again and again for a code of its choosing is held to a few tries.
+    pairing_tries: Mutex<Vec<(std::time::Instant, std::net::IpAddr)>>,
     /// A primary's pairings in progress, waiting for the worker's approval.
     outgoing: Mutex<Vec<primary::Outgoing>>,
     /// What a primary last heard from each paired worker.
@@ -89,8 +92,9 @@ pub(crate) struct Inner {
     pairing_open_until: Mutex<Option<std::time::Instant>>,
     /// Each time the window is opened, closed or taken: a pairing that gives it back does so only in its own turn.
     pairing_turn: std::sync::atomic::AtomicU64,
-    /// The last computers paired by themselves here, `(name, when)`, for the Networking page to tell the person.
-    paired_by_itself: Mutex<Vec<(String, u64)>>,
+    /// The last computers paired by themselves here, `(name, when, code)`, for the Networking page to tell the person
+    /// (with the code, which the other computer's person compares before it pairs on its side).
+    paired_by_itself: Mutex<Vec<(String, u64, String)>>,
     /// Why this computer is not lending itself although set to (its listener could not start), for the page.
     listen_error: Mutex<Option<String>>,
     /// Settings applied one change at a time: two at once would each start a listener and an advertisement.
@@ -142,6 +146,7 @@ impl Network {
                 ai,
                 identity: Mutex::new(None),
                 incoming: Mutex::new(Vec::new()),
+                pairing_tries: Mutex::new(Vec::new()),
                 outgoing: Mutex::new(Vec::new()),
                 nodes: Mutex::new(HashMap::new()),
                 untold: Mutex::new(Vec::new()),
@@ -204,14 +209,17 @@ impl Network {
             let bind = bind_address(&settings)?;
             let mine = self.listening().is_some_and(|a| a.port() == bind.port() && bind.port() != 0);
             if !mine {
-                // (tried as the listener binds it, the address reusable: a port it served a moment ago, waiting out its
-                // closed connections, is not taken by another program)
+                // (tried as the listener binds it: the address reusable off Windows, so a port it served a moment ago,
+                // waiting out its closed connections, is not taken by another program; never on Windows, where that
+                // would bind a port another program holds that lets it be reused too, and the listener, which does not,
+                // would then fail. Bound alone, never listening: the probe takes no connection meant for that program.)
                 let probe = if bind.is_ipv6() { tokio::net::TcpSocket::new_v6() } else { tokio::net::TcpSocket::new_v4() };
                 probe
                     .and_then(|s| {
-                        s.set_reuseaddr(true)?;
-                        s.bind(bind)?;
-                        s.listen(1).map(drop)
+                        if !cfg!(windows) {
+                            s.set_reuseaddr(true)?;
+                        }
+                        s.bind(bind)
                     })
                     .map_err(|e| format!("this computer cannot lend itself on {bind}: {e} (choose another port)"))?;
             }
@@ -229,15 +237,18 @@ impl Network {
     /// its services no longer used here (this computer's own again), its last report gone.
     pub(crate) fn forget(&self, node_id: &str) -> Result<(), String> {
         // (all of it forgotten, the rest too where one part could not be written down: that one is said)
+        // (its voice copies are kept under its certificate, as one that used this computer: read before it goes)
+        let used_this = self.inner.peers().get(node_id, Role::Primary).map(|p| p.fingerprint.clone());
         let unpaired = self.inner.peers().remove(node_id);
         let _ = self.inner.defaults().drop_node(node_id);
         let _ = self.inner.services().drop_node(node_id);
         lock(&self.inner.nodes).remove(node_id);
         // (its voice copies removed off the async threads: files)
-        let node = node_id.to_string();
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => drop(rt.spawn_blocking(move || worker::forget_voices(&node))),
-            Err(_) => worker::forget_voices(&node),
+        if let Some(fingerprint) = used_this {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => drop(rt.spawn_blocking(move || worker::forget_voices(&fingerprint))),
+                Err(_) => worker::forget_voices(&fingerprint),
+            }
         }
         unpaired.map(|_| ())
     }
@@ -281,10 +292,11 @@ impl Network {
         }
     }
 
-    /// A computer paired by itself here: said on the Networking page (the last five).
-    pub(crate) fn note_paired_by_itself(&self, name: &str) {
+    /// A computer paired by itself here: said on the Networking page (the last five), with the code its person compares
+    /// before that computer pairs on its side.
+    pub(crate) fn note_paired_by_itself(&self, name: &str, code: &str) {
         let mut noted = lock(&self.inner.paired_by_itself);
-        noted.push((name.to_string(), store::now_ms()));
+        noted.push((name.to_string(), store::now_ms(), code.to_string()));
         let extra = noted.len().saturating_sub(5);
         noted.drain(..extra);
     }
@@ -409,7 +421,7 @@ impl Network {
             "agent": settings.agent,
             "shareModels": settings.share_models != Some(false),
             "pairingOpenUntilMs": self.pairing_open_until_ms(),
-            "pairedByItself": lock(&self.inner.paired_by_itself).iter().map(|(name, at)| json!({ "name": name, "at": at })).collect::<Vec<_>>(),
+            "pairedByItself": lock(&self.inner.paired_by_itself).iter().map(|(name, at, code)| json!({ "name": name, "at": at, "code": code })).collect::<Vec<_>>(),
             "listenError": lock(&self.inner.listen_error).clone(),
             "settings": settings,
             "nodeId": id.as_ref().map(|i| i.node_id.clone()),
@@ -499,10 +511,18 @@ fn hostname() -> String {
     NAME.get_or_init(|| {
         std::env::var("OAIY_NETWORK_NAME")
             .ok()
-            .or_else(|| std::process::Command::new("hostname").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()))
+            .or_else(system_name)
             .map(|s| s.trim().trim_end_matches(".local").to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "This computer".to_string())
     })
     .clone()
+}
+
+/// The name the system gives this computer, `hostname`'s answer, asked with no console window (the app's window has
+/// no console, so Windows would flash a new one at every launch). Not Windows' `COMPUTERNAME`: that is the older
+/// NetBIOS name, upper-case and cut to 15 characters, and computers would show another name than before.
+fn system_name() -> Option<String> {
+    use crate::HiddenCommand as _;
+    std::process::Command::new("hostname").pipe_hidden().output().ok().and_then(|o| String::from_utf8(o.stdout).ok())
 }

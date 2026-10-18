@@ -41,6 +41,13 @@ pub(crate) fn advertise(daemon: &mdns_sd::ServiceDaemon, id: &Identity, name: &s
     daemon.register(info).map_err(|e| e.to_string())
 }
 
+/// A worker's addresses as found, `ip:port`, the one to pair with first: on the local network, each once, IPv4 first
+/// (the addresses come in no order), with no loopback address (that would be this computer) and no IPv6 link-local
+/// one, which is reached only with its interface named, and that is not kept here.
+pub(crate) fn reachable(ips: impl Iterator<Item = std::net::IpAddr>, port: u16) -> Vec<String> {
+    super::typeable(ips.filter(|ip| tls::local_address(*ip)).collect()).into_iter().map(|ip| std::net::SocketAddr::new(ip, port).to_string()).collect()
+}
+
 /// Browse for workers on `daemon`, keeping what is found (and dropping what leaves) in `found`.
 pub(crate) fn browse(daemon: &mdns_sd::ServiceDaemon, found: Arc<Mutex<HashMap<String, Found>>>) -> Result<(), String> {
     let events = daemon.browse(SERVICE).map_err(|e| e.to_string())?;
@@ -57,13 +64,7 @@ pub(crate) fn browse(daemon: &mdns_sd::ServiceDaemon, found: Arc<Mutex<HashMap<S
                             continue;
                         }
                         let port = s.get_port();
-                        let addresses: Vec<String> = s
-                            .get_addresses()
-                            .iter()
-                            .map(|a| a.to_ip_addr())
-                            .filter(|ip| tls::local_address(*ip))
-                            .map(|ip| std::net::SocketAddr::new(ip, port).to_string())
-                            .collect();
+                        let addresses = reachable(s.get_addresses().iter().map(|a| a.to_ip_addr()), port);
                         if addresses.is_empty() {
                             continue;
                         }

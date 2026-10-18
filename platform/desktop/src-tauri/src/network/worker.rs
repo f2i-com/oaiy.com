@@ -28,6 +28,15 @@ use super::{lock, tls, Network, PROTOCOL};
 const WAITING_PER_ADDRESS: usize = 2;
 const MAX_WAITING: usize = 8;
 const REQUEST_TTL: Duration = Duration::from_secs(5 * 60);
+/// Pairing codes made here (each time a primary tells its random value, a new code) in any minute and within a request's
+/// five minutes: for one address, and in all. A computer in the middle of a first contact, asking again and again until
+/// the code here is the one the other screen shows, would need about a million tries; it is held to a few, so the codes
+/// agree by chance one time in tens of thousands at most. (Addresses can be made up on a LAN: the cap in all is the one
+/// that holds. Past it, pairing here waits a few minutes.)
+const TRIES_A_MINUTE_PER_ADDRESS: usize = 5;
+const TRIES_PER_ADDRESS: usize = 10;
+const TRIES_A_MINUTE: usize = 10;
+const TRIES: usize = 20;
 /// Connections served at once; of those, still in their TLS handshake from one address, and of computers not paired
 /// here (asking `health` or to pair: one request each) in all and from one address. A computer on the LAN holding
 /// connections open takes a share of them, and the paired primary the rest.
@@ -40,6 +49,11 @@ const STRANGERS_PER_ADDRESS: usize = 4;
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const HEAD: Duration = Duration::from_secs(15);
 const IDLE: Duration = Duration::from_secs(120);
+/// How long a computer not paired here has for its request's body after its head, and how large the body may be (a
+/// pairing request is a few hundred bytes): read whole before any route sees it, so a body that trickles in holds no
+/// stranger's slot for long, and one a route would read before refusing the stranger takes no memory.
+const STRANGER_BODY: Duration = Duration::from_millis(if cfg!(test) { 3_000 } else { 15_000 });
+const STRANGER_BODY_LIMIT: usize = 64 << 10;
 const CHAT_LIMIT: usize = 16 << 20;
 const MEDIA_LIMIT: usize = 96 << 20;
 /// A voice clip copied here, base64 in JSON (a clip is 20 MB at most).
@@ -59,6 +73,9 @@ pub(crate) struct Incoming {
     pub code: Option<String>,
     /// The asking computer pairs by itself (see [`PairRequest`]).
     pub auto: bool,
+    /// The codes made for its address lately, this one with them ([`take_try`]): more than one, and the person here is
+    /// told that each try showed a new code.
+    pub tries: usize,
     pub status: Status,
     pub at: Instant,
 }
@@ -116,6 +133,8 @@ pub(crate) async fn listen(net: Network, id: &Identity, bind: SocketAddr) -> Res
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let acceptor = tokio_rustls::TlsAcceptor::from(tls::server_config(id)?);
     let app = routes(net.clone());
+    // (a computer not paired here: its request's body read whole first, within its time and size)
+    let stranger_app = app.clone().layer(axum::middleware::from_fn(stranger_body));
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let strangers = Arc::new(tokio::sync::Semaphore::new(MAX_STRANGERS));
@@ -140,7 +159,7 @@ pub(crate) async fn listen(net: Network, id: &Identity, bind: SocketAddr) -> Res
             }
             let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
             let Some(shaking) = handshaking.take(peer.ip(), HANDSHAKES_PER_ADDRESS) else { continue };
-            let (acceptor, app, net, strangers, stranger_from, mut stopped) = (acceptor.clone(), app.clone(), net.clone(), strangers.clone(), stranger_from.clone(), stopped.clone());
+            let (acceptor, app, stranger_app, net, strangers, stranger_from, mut stopped) = (acceptor.clone(), app.clone(), stranger_app.clone(), net.clone(), strangers.clone(), stranger_from.clone(), stopped.clone());
             tokio::spawn(async move {
                 let _slot = slot;
                 let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE, acceptor.accept(tcp)).await else { return };
@@ -156,6 +175,7 @@ pub(crate) async fn listen(net: Network, id: &Identity, bind: SocketAddr) -> Res
                     let Some(counted) = stranger_from.take(peer.ip(), STRANGERS_PER_ADDRESS) else { return };
                     Some((permit, counted))
                 };
+                let app = if paired { app } else { stranger_app };
                 let svc = hyper_util::service::TowerToHyperService::new(app.layer(Extension(caller)));
                 let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
                 if !paired {
@@ -204,6 +224,17 @@ pub(super) fn refuse(status: StatusCode, code: &str, message: impl Into<String>)
     (status, Json(json!({ "error": { "code": code, "message": message.into() } }))).into_response()
 }
 
+/// A computer not paired here: its request's body read whole before any route sees it, within [`STRANGER_BODY`] and
+/// [`STRANGER_BODY_LIMIT`] (the head has its own deadline, `HEAD`).
+async fn stranger_body(req: Request, next: axum::middleware::Next) -> Response {
+    let (parts, body) = req.into_parts();
+    match tokio::time::timeout(STRANGER_BODY, axum::body::to_bytes(body, STRANGER_BODY_LIMIT)).await {
+        Ok(Ok(bytes)) => next.run(Request::from_parts(parts, Body::from(bytes))).await,
+        Ok(Err(_)) => refuse(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "a computer not paired here sends a small request (asking to pair) and nothing larger"),
+        Err(_) => refuse(StatusCode::REQUEST_TIMEOUT, "too_slow", "the request's body did not arrive in time"),
+    }
+}
+
 /// The paired primary calling, if it is one (and this computer lends itself, switched on).
 pub(super) fn primary_of(net: &Network, caller: &Caller) -> Option<Peer> {
     if !net.settings().lends() {
@@ -250,7 +281,7 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     };
     let node_id = req.node_id.clone();
     let name: String = req.name.chars().filter(|c| !c.is_control()).take(80).collect();
-    // (a node id as OAIY makes them: what names its copies here, `from-<six of it>-…`, and nothing else)
+    // (a node id as OAIY makes them, and nothing else)
     if !super::identity::node_id_ok(&node_id) {
         return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a node id is 32 lowercase hex digits");
     }
@@ -266,6 +297,8 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     };
     let address = caller.addr.ip().to_string();
     let mut waiting = lock(&net.inner().incoming);
+    // (an earlier request of the same certificate is replaced, never silently: a code made for it counts among its
+    // address's tries ([`take_try`]), which bound how many codes it sees and which the person here is shown)
     waiting.retain(|r| r.at.elapsed() < REQUEST_TTL && r.fingerprint != fp);
     let pending = waiting.iter().filter(|r| r.status == Status::Pending);
     if pending.clone().count() >= MAX_WAITING || pending.filter(|r| r.address == address).count() >= WAITING_PER_ADDRESS {
@@ -278,6 +311,7 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
         nonce: worker_nonce,
         code: None,
         auto: req.auto,
+        tries: 0,
         fingerprint: fp,
         address,
         status: Status::Pending,
@@ -316,9 +350,14 @@ async fn pair_reveal(State(net): State<Network>, Extension(caller): Extension<Ca
     if r.code.is_some() {
         return refuse(StatusCode::CONFLICT, "already_told", "this pairing request has its code already");
     }
+    // (and asked again, a new request each time, it is held to a few tries: each is a new code)
+    let Some(tries) = take_try(&net, caller.addr.ip()) else {
+        return refuse(StatusCode::TOO_MANY_REQUESTS, "too_many_tries", "too many pairing codes were made here in the last few minutes: wait a few minutes, then pair again");
+    };
     let code = pairing_code(&r.fingerprint, &me.fingerprint, &req.nonce.to_ascii_lowercase(), &r.nonce);
-    log::info!("network: {} ({}) asks to pair; code {code}", r.name, r.address);
-    r.code = Some(code);
+    log::info!("network: {} ({}) asks to pair; code {code} (try {tries} from there lately)", r.name, r.address);
+    r.code = Some(code.clone());
+    r.tries = tries;
     let (nonce, auto, name, request) = (r.nonce.clone(), r.auto, r.name.clone(), r.id.clone());
     drop(waiting);
     // (a computer that asks to pair by itself is approved at once only while this computer's person (or their Agent)
@@ -339,9 +378,26 @@ async fn pair_reveal(State(net): State<Network>, Extension(caller): Extension<Ca
     };
     if approved {
         log::info!("network: paired with {name} by itself (its window to pair by itself was open here; closed now)");
-        net.note_paired_by_itself(&name);
+        net.note_paired_by_itself(&name, &code);
     }
     Json(json!({ "nonce": nonce, "approved": approved })).into_response()
+}
+
+/// One more pairing code made for address `ip`, where its tries and everyone's leave room ([`TRIES`] and the others):
+/// how many it has had within a request's time, this one with them. The tries are kept with when they were made, so
+/// the oldest leave the count as they age.
+pub(crate) fn take_try(net: &Network, ip: std::net::IpAddr) -> Option<usize> {
+    let mut tries = lock(&net.inner().pairing_tries);
+    tries.retain(|(at, _)| at.elapsed() < REQUEST_TTL);
+    let minute = |at: &Instant| at.elapsed() < Duration::from_secs(60);
+    let (all, all_minute) = (tries.len(), tries.iter().filter(|(at, _)| minute(at)).count());
+    let (mine, mine_minute) = (tries.iter().filter(|(_, a)| *a == ip).count(), tries.iter().filter(|(at, a)| *a == ip && minute(at)).count());
+    if all >= TRIES || all_minute >= TRIES_A_MINUTE || mine >= TRIES_PER_ADDRESS || mine_minute >= TRIES_A_MINUTE_PER_ADDRESS {
+        log::warn!("network: a pairing code refused for {ip}: {mine} made for it and {all} in all in the last few minutes");
+        return None;
+    }
+    tries.push((Instant::now(), ip));
+    Some(mine + 1)
 }
 
 /// `GET /worker/v1/pair/:id`: the request's answer, to the certificate that asked alone.
@@ -485,6 +541,8 @@ pub(crate) fn waiting(net: &Network) -> Vec<Value> {
             "code": r.code,
             "fingerprint": super::identity::short(&r.fingerprint),
             "secondsLeft": REQUEST_TTL.saturating_sub(r.at.elapsed()).as_secs(),
+            // (the codes made for its address lately: more than one, each try showed a new code)
+            "tries": r.tries,
         }))
         .collect()
 }
@@ -811,25 +869,32 @@ struct VoiceCopy {
 /// The voices of one computer kept here for its calls, at most.
 const MAX_VOICE_COPIES: usize = 16;
 
-/// The copies of a computer's voices kept here for its calls removed (it is unpaired).
-pub(crate) fn forget_voices(node_id: &str) {
-    for clip in crate::voice::voices::copies(&copied_voice_name(node_id, "")) {
+/// The copies of a computer's voices kept here for its calls removed (it is unpaired): by its certificate's fingerprint.
+pub(crate) fn forget_voices(primary_fingerprint: &str) {
+    for clip in crate::voice::voices::copies(&copied_voice_name(primary_fingerprint, "")) {
         let _ = crate::voice::voices::remove(&clip.name);
     }
 }
 
-/// The name a primary's voice is kept under here: its own beside this computer's, never in place of one. Within the
-/// 48 characters a voice's name has: a long one cut, with six hex digits of its whole name, so two never meet.
-pub(crate) fn copied_voice_name(primary_node: &str, voice: &str) -> String {
-    let short: String = primary_node.chars().take(6).collect();
-    let voice = if voice.len() > 36 {
+/// The hex digits of a primary's certificate fingerprint its voices are kept under here: 64 bits, which no computer can
+/// make its own certificate match (it chooses its node id outright, and could try certificates for six digits of one).
+const VOICE_KEY: usize = 16;
+
+/// The name a primary's voice is kept under here (`from-<its key>-<name>`): its own beside this computer's, never in
+/// place of one, and never another primary's, as it is named by the primary's certificate. Within the 48 characters a
+/// voice's name has: a long one cut, with six hex digits of its whole name, so two never meet.
+pub(crate) fn copied_voice_name(primary_fingerprint: &str, voice: &str) -> String {
+    let key: String = primary_fingerprint.chars().take(VOICE_KEY).collect();
+    // (what "from-", the key and the "-" after it leave)
+    let room = 48 - 6 - VOICE_KEY;
+    let voice = if voice.len() > room {
         use sha2::Digest;
         let tag: String = sha2::Sha256::digest(voice.as_bytes()).iter().take(3).map(|b| format!("{b:02x}")).collect();
-        format!("{}-{tag}", &voice[..29])
+        format!("{}-{tag}", &voice[..room - 7])
     } else {
         voice.to_string()
     };
-    format!("from-{short}-{voice}")
+    format!("from-{key}-{voice}")
 }
 
 /// `PUT /worker/v1/voices/:name` `{clip, extension?, words?}`: the voice its primary answers calls in, copied here
@@ -849,8 +914,8 @@ async fn voice_copy(State(net): State<Network>, Extension(caller): Extension<Cal
     let Ok(voice) = crate::voice::voices::clean_name(&name) else {
         return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a voice is named with letters, digits, - or _");
     };
-    let stored = copied_voice_name(&primary.node_id, &voice);
-    let prefix = copied_voice_name(&primary.node_id, "");
+    let stored = copied_voice_name(&primary.fingerprint, &voice);
+    let prefix = copied_voice_name(&primary.fingerprint, "");
     let extension = copy.extension.unwrap_or_else(|| "wav".into());
     // (one copy at a time: two of the same voice at once, a call's greeting and its first line, replace it in turn)
     static COPYING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

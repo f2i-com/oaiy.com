@@ -40,8 +40,10 @@ fn reply(status: StatusCode, body: Value) -> Response {
 /// What the server tells a client when it starts: who is asking decides which tools there are.
 const INSTRUCTIONS: &str = "OAIY's control tools: read how OAIY is set up (status first) and change it (models, engines, AI sources, services, plugins and their settings, flows, the calendar, the FormLogic link, setup). Which tools are offered depends on the X-OAIY-Session header: project and setup get all of them, runner only the read tools, call, sms and task none. A change tool refuses while the person has switched off 'Let the Agent change OAIY' (status shows agentMayChange); ask them to switch it on in Settings → Agent. Every change is logged for the person to see.";
 
-pub(crate) async fn handle(State(control): State<Control>, headers: HeaderMap, body: Bytes) -> Response {
+pub(crate) async fn handle(State(control): State<Control>, paired: Option<axum::Extension<crate::http::PairedGrant>>, headers: HeaderMap, body: Bytes) -> Response {
     let session = Session::from_header(headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok()));
+    // (asked with a paired page's token, not as this computer's own: its tools are held to that page's grant)
+    let paired = paired.map(|axum::Extension(crate::http::PairedGrant(access))| access);
     let message: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return reply(StatusCode::BAD_REQUEST, error_body(Value::Null, PARSE_ERROR, format!("the body is not JSON: {e}"))),
@@ -75,7 +77,7 @@ pub(crate) async fn handle(State(control): State<Control>, headers: HeaderMap, b
         }
         return reply(StatusCode::BAD_REQUEST, error_body(id, INVALID_REQUEST, "a request needs a method"));
     };
-    let body = match dispatch(&control, session, method, obj.get("params")).await {
+    let body = match dispatch(&control, session, paired, method, obj.get("params")).await {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => error_body(id, code, message),
     };
@@ -91,7 +93,7 @@ fn params_object(params: Option<&Value>) -> Result<Map<String, Value>, (i64, Str
     }
 }
 
-pub(crate) async fn dispatch(control: &Control, session: Session, method: &str, params: Option<&Value>) -> Result<Value, (i64, String)> {
+pub(crate) async fn dispatch(control: &Control, session: Session, paired: Option<crate::bridge::pairing::PairingAccess>, method: &str, params: Option<&Value>) -> Result<Value, (i64, String)> {
     match method {
         "initialize" => {
             let p = params_object(params)?;
@@ -118,7 +120,7 @@ pub(crate) async fn dispatch(control: &Control, session: Session, method: &str, 
                 return Err((INVALID_PARAMS, format!("cursor must be a string, not {c}")));
             }
             // Every tool fits one page: there is no next cursor.
-            Ok(json!({ "tools": tools::list(session) }))
+            Ok(json!({ "tools": tools::list(session, paired) }))
         }
         "tools/call" => {
             let p = params_object(params)?;
@@ -132,7 +134,7 @@ pub(crate) async fn dispatch(control: &Control, session: Session, method: &str, 
                 Some(Value::Object(o)) => o.clone(),
                 Some(other) => return Err((INVALID_PARAMS, format!("arguments must be an object, not {other}"))),
             };
-            Ok(tools::call(control, session, &name, args).await)
+            Ok(tools::call(control, session, paired, &name, args).await)
         }
         other => Err((METHOD_NOT_FOUND, format!("method not found: {other}"))),
     }

@@ -312,13 +312,12 @@ pub(super) fn client_for(id: &Identity, worker_fingerprint: &str) -> Result<reqw
 struct PairStart {
     address: Option<String>,
     node_id: Option<String>,
-    /// Where both computers pair by themselves (see [`Settings::agent`]): let the other use this one too.
-    #[serde(default)]
-    both_ways: Option<bool>,
 }
 
 /// `POST /api/network/pairings/start` `{address}` (or `{nodeId}` of a worker found on the LAN): ask the worker to pair.
-/// Answers the code to compare with the worker's screen, where its person approves.
+/// Answers the code to compare with the worker's screen, where its person approves (`pending`), or where it approved at
+/// once, its window to pair by itself open (`approved_there`): either way it is paired here only by `pair_confirm`, once
+/// this computer's person says the worker showed the same code.
 async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> Response {
     if !net.settings().uses() {
         return error(StatusCode::CONFLICT, "not_a_primary", "switch on Use other computers to pair with one");
@@ -329,6 +328,7 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
     };
     let typed = match (&req.address, &req.node_id) {
         (Some(a), _) if !a.trim().is_empty() => a.trim().to_string(),
+        // (its first address: IPv4 where it has one, never an IPv6 link-local one, see discovery::reachable)
         (_, Some(n)) => match lock(&net.inner().found).get(n).and_then(|f| f.addresses.first().cloned()) {
             Some(a) => a,
             None => return error(StatusCode::NOT_FOUND, "not_found", "that worker is no longer seen on the LAN: type its address"),
@@ -344,8 +344,8 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
         Ok(c) => c,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
     };
-    // (this computer pairs by itself where its person lets its Agent set up OAIY Network: the other approves at once
-    // where it does too)
+    // (this computer asks to pair by itself where its person lets its Agent set up OAIY Network: the other approves at
+    // once where its window to pair by itself is open; this side still pairs only once the codes are compared)
     let auto = net.settings().agent;
     let body = json!({ "nodeId": id.node_id, "name": net.display_name(), "protocol": PROTOCOL, "auto": auto });
     let answer = match client.post(url(&address, "/worker/v1/pair")).json(&body).timeout(Duration::from_secs(10)).send().await {
@@ -384,7 +384,12 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
     };
     let told = match same_worker.post(url(&address, &format!("/worker/v1/pair/{request_id}"))).json(&json!({ "nonce": mine })).timeout(Duration::from_secs(10)).send().await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
-        Ok(r) => return error(StatusCode::BAD_GATEWAY, "pairing_refused", format!("the worker refused (HTTP {})", r.status())),
+        // (its reason passed on: too many codes made there lately, say, and to wait a few minutes)
+        Ok(r) => {
+            let status = r.status();
+            let why = r.json::<Value>().await.ok().and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+            return error(StatusCode::BAD_GATEWAY, "pairing_refused", format!("the worker refused (HTTP {status}){}", if why.is_empty() { String::new() } else { format!(": {why}") }));
+        }
         Err(e) => return error(StatusCode::BAD_GATEWAY, "unreachable", format!("{address} did not answer as an OAIY worker: {}", plain(&e))),
     };
     // (a worker that paired by itself at once, where this side refuses the pairing after all, is told to unpair: else it
@@ -403,6 +408,9 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
         undo().await;
         return error(StatusCode::BAD_GATEWAY, "pairing_refused", "the worker's answer does not match what it committed to: something on the network is in the way, so it is not paired");
     }
+    // (approved there at once, its window to pair by itself open: it says so, as anyone answering for it could, so this
+    // side still pairs only once its person says the other computer shows the same code (`pair_confirm`), which it does
+    // with the computers it paired by itself. Given up or run out here, it is told to forget this computer.)
     let pending = Outgoing {
         id: uuid::Uuid::new_v4().simple().to_string(),
         address,
@@ -412,29 +420,14 @@ async fn pair_start(State(net): State<Network>, Json(req): Json<PairStart>) -> R
         code: pairing_code(&id.fingerprint, &fp, &mine, &theirs),
         fingerprint: fp,
         at: Instant::now(),
-        approved_there: false,
+        approved_there,
     };
     let worker_json = json!({ "nodeId": pending.node_id, "name": pending.name, "address": pending.address, "fingerprint": short(&pending.fingerprint) });
-    // (approved there at once, both computers pairing by themselves: paired here too, no person asked)
-    if auto && told.get("approved") == Some(&json!(true)) {
-        let code = pending.code.clone();
-        // (both ways only where asked: a computer that paired by itself is not let use this one unasked)
-        let answer = paired(&net, &pending, req.both_ways.unwrap_or(false), true).await;
-        let (parts, body) = answer.into_parts();
-        let Ok(bytes) = axum::body::to_bytes(body, 1 << 22).await else { return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the pairing's answer") };
-        let mut v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        if parts.status.is_success() {
-            v["code"] = json!(code);
-            v["worker"] = worker_json;
-            v["auto"] = json!(true);
-        }
-        return (parts.status, Json(v)).into_response();
-    }
     let out = json!({
         "pairingId": pending.id,
         "code": pending.code,
         "worker": worker_json,
-        "status": "pending",
+        "status": if approved_there { "approved_there" } else { "pending" },
     });
     let mut outgoing = lock(&net.inner().outgoing);
     outgoing.retain(|o| o.at.elapsed() < PAIRING_TTL && o.node_id != pending.node_id);
@@ -481,7 +474,7 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         return Json(json!({ "status": "declined" })).into_response();
     }
     if p.approved_there {
-        return if req.accept == Some(true) { paired(&net, &p, req.both_ways, false).await } else { Json(json!({ "status": "approved_there", "code": p.code, "worker": { "name": p.name } })).into_response() };
+        return if req.accept == Some(true) { paired(&net, &p, req.both_ways).await } else { Json(json!({ "status": "approved_there", "code": p.code, "worker": { "name": p.name } })).into_response() };
     }
     let answer = match client.get(url(&p.address, &format!("/worker/v1/pair/{}", p.request_id))).timeout(Duration::from_secs(8)).send().await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
@@ -493,7 +486,7 @@ async fn pair_confirm(State(net): State<Network>, Json(req): Json<PairConfirm>) 
         Err(e) => return error(StatusCode::BAD_GATEWAY, "unreachable", format!("the worker did not answer: {}", plain(&e))),
     };
     match answer.get("status").and_then(Value::as_str) {
-        Some("approved") if req.accept == Some(true) => paired(&net, &p, req.both_ways, false).await,
+        Some("approved") if req.accept == Some(true) => paired(&net, &p, req.both_ways).await,
         Some("approved") => {
             // (the person here has five more minutes to say the codes matched)
             if let Some(o) = lock(&net.inner().outgoing).iter_mut().find(|o| o.id == p.id) {
@@ -516,7 +509,7 @@ fn paired_already(net: &Network, p: &Outgoing) -> bool {
 }
 
 /// The worker of pairing `p`, approved on both screens: paired here, its certificate pinned, its models asked for.
-async fn paired(net: &Network, p: &Outgoing, both_ways: bool, by_itself: bool) -> Response {
+async fn paired(net: &Network, p: &Outgoing, both_ways: bool) -> Response {
     let peer = Peer {
         node_id: p.node_id.clone(),
         name: p.name.clone(),
@@ -524,7 +517,8 @@ async fn paired(net: &Network, p: &Outgoing, both_ways: bool, by_itself: bool) -
         fingerprint: p.fingerprint.clone(),
         address: p.address.clone(),
         paired_at_ms: now_ms(),
-        by_itself,
+        // (its code compared here, always: never paired by itself on this side)
+        by_itself: false,
     };
     // (the guard let go before anything is awaited)
     let added = net.inner().peers().add(peer.clone());

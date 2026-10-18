@@ -123,11 +123,18 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
       )}
       {(status.pairedByItself ?? [])
         .filter((p) => !seenByItself.includes(`${p.name}:${p.at}`))
-        .map((p) => (
+        .map((p: { name: string; at: number; code?: string }) => (
           <div className="banner banner-pending banner-dismissable network-by-itself" key={`${p.name}:${p.at}`} role="status">
             <span>
-              <Bot size={13} aria-hidden /> <strong>{p.name}</strong> paired with this computer by itself {pairedWhen(p.at)}. Unpair it below if you
-              do not know it.
+              <Bot size={13} aria-hidden /> <strong>{p.name}</strong> paired with this computer by itself {pairedWhen(p.at)}
+              {p.code ? (
+                <>
+                  , showing code <strong>{p.code}</strong>: {p.name} asks its person whether this computer shows the same code. Unpair it below if
+                  you do not know it, or if the codes differ.
+                </>
+              ) : (
+                <>. Unpair it below if you do not know it.</>
+              )}
             </span>
             <button className="banner-dismiss" aria-label={`Dismiss: ${p.name} is known`} title="Dismiss" onClick={() => dismissByItself(`${p.name}:${p.at}`)}>
               <X size={13} aria-hidden />
@@ -385,8 +392,9 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
 
 /**
  * Whether the person lets the Agent set up OAIY Network here: its tools then switch Network on, pair and unpair, and
- * choose which other computers' models, flows and OAIY Voice this one uses; and two computers that both have it on pair
- * by themselves, with no codes to compare. Saved as it is ticked.
+ * choose which other computers' models, flows and OAIY Voice this one uses; and a computer with it on pairs by itself
+ * with one that asks so while its window is open, comparing no code itself (the one that asked still compares it before
+ * it pairs). Saved as it is ticked.
  */
 function AgentMaySetUp({ status, busy, onChange }: { status: NetworkStatus; busy: boolean; onChange: (c: Parameters<typeof network.setSettings>[0]) => void }) {
   const on = status.agent === true;
@@ -402,7 +410,7 @@ function AgentMaySetUp({ status, busy, onChange }: { status: NetworkStatus; busy
             The Agent can switch OAIY Network on, pair this computer with others, and choose which of their models, flows and OAIY Voice it uses, when you
             ask it to. A code it is shown is still yours to compare.
             {status.lends
-              ? ' A computer pairs with this one by itself, with no codes, only while you (or the Agent here) open pairing below, for a few minutes: on a network you trust, your home’s or office’s.'
+              ? ' A computer pairs with this one by itself, with no code compared here (its own person still compares it), only while you (or the Agent here) open pairing below, for a few minutes: on a network you trust, your home’s or office’s.'
               : ' Another computer can pair with this one by itself only while this one lends itself (Lend this computer, above).'}
           </small>
         </span>
@@ -456,6 +464,20 @@ export function PairingCode({ code }: { code: string }) {
   );
 }
 
+/**
+ * A request whose address asked again and again, each time with a new code (a computer in the way trying for a code
+ * that matches the other screen's): said beside its code. Nothing for a request asked once.
+ */
+export function PairingTries({ request }: { request: NetworkRequest & { tries?: number } }) {
+  if ((request.tries ?? 0) <= 1) return null;
+  return (
+    <div className="card-warn" data-testid="network-request-tries">
+      <TriangleAlert size={13} aria-hidden /> Asked {request.tries} times from {request.address} in the last few minutes, each time with a new code. If
+      you did not start it again yourself, deny it.
+    </div>
+  );
+}
+
 function WorkerRequests({ requests, onDecide }: { requests: NetworkRequest[]; onDecide: (id: string, approve: boolean) => Promise<void> }) {
   const [deciding, setDeciding] = useState<string | null>(null);
   const decide = async (id: string, approve: boolean) => {
@@ -488,6 +510,7 @@ function WorkerRequests({ requests, onDecide }: { requests: NetworkRequest[]; on
               <div className="form-hint">
                 Approve only if {r.name}’s screen shows this same code. Certificate {r.fingerprint} · expires in {Math.max(1, Math.ceil(r.secondsLeft / 60))} min.
               </div>
+              <PairingTries request={r} />
               <div className="pairing-actions">
                 <button className="btn btn-primary" disabled={deciding !== null} onClick={() => void decide(r.id, true)}>
                   <Check size={14} aria-hidden /> Approve
@@ -611,18 +634,12 @@ function FindWorkers({
     setOutcome(null);
     setApprovedThere(false);
     try {
-      // (both ways where this computer lends itself and the person leaves it ticked: used if the other pairs by itself
-      // at once, its window open; else asked again once its person approves)
+      // (both ways where this computer lends itself and the person leaves it ticked: asked again once the other approves)
       const started = await network.startPairing({ ...target, bothWays: lends && bothWays });
-      if (started.status === 'approved') {
-        // (its window to pair by itself was open: paired at once, nothing to compare)
-        const back = (started as NetworkPairing & { node?: { usesThis?: boolean } }).node?.usesThis;
-        setOutcome({ text: `Paired with ${started.worker.name} at once: its window to pair by itself was open${back ? ', and it can use this computer too' : ''}.`, paired: true });
-        setAddress('');
-        onPaired();
-      } else {
-        setPairing(started);
-      }
+      // (approved there at once, its window to pair by itself open: still paired here only once this person says it
+      // shows the same code, which it does with the computers it paired by itself)
+      setApprovedThere(started.status === 'approved_there');
+      setPairing(started);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1035,7 +1052,7 @@ function PairedComputers({
                   {paired && <span className="network-way">{uses ? 'This computer uses it' : 'This computer can use it (Use other computers is off)'}</span>}
                   {usesThis && <span className="network-way">{lends ? 'Uses this computer' : 'Can use this computer (Lend this computer is off)'}</span>}
                   {n.pairedByItself && (
-                    <span className="network-way network-way-auto" title="Both computers let their Agent set up OAIY Network, so they paired with no codes compared. Unpair it if you do not know it.">
+                    <span className="network-way network-way-auto" title="It asked to pair by itself while this computer's window to pair by itself was open, so no code was compared here. Unpair it if you do not know it.">
                       <Bot size={11} aria-hidden /> Paired by itself
                     </span>
                   )}

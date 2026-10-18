@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Check, Link2, Network, X } from 'lucide-react';
 import { network, type NetworkRequest } from './api';
-import { PairingCode } from './NetworkPanel';
+import { PairingCode, PairingTries } from './NetworkPanel';
 import { useToast } from './Toasts';
 
 /**
@@ -63,6 +63,7 @@ export default function NetworkPairingPrompt({ waiting, onOpen }: { waiting: num
           </div>
           <PairingCode code={r.code} />
           <div className="form-hint">Approve only if {r.name}’s screen shows this same code. It expires in {Math.max(1, Math.ceil(r.secondsLeft / 60))} min.</div>
+          <PairingTries request={r} />
           <div className="pairing-actions">
             <button className="btn btn-primary" disabled={busy !== null} onClick={() => void decide(r, true)}>
               <Check size={14} aria-hidden /> Approve

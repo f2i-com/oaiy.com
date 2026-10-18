@@ -1547,6 +1547,13 @@ pub(crate) struct PublicView;
 #[derive(Clone, Copy)]
 pub(crate) struct OwnWindow;
 
+/// A paired app's grant, on a request that came with its token ([`tighten`] marks it, so `/api/mcp` offers that page
+/// less), or on a request the Agent's tools make in-process for such a caller (`control::tools::Desk` marks it; no
+/// request from outside can carry an extension): that one, though it carries this process's own credential, changes
+/// only what the grant reaches ([`access_guard`]), as if the page had asked itself.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PairedGrant(pub crate::bridge::pairing::PairingAccess);
+
 /// The desktop's own window's origins: the webview's on a Mac and Linux, and on Windows.
 fn is_own_window_origin(origin: &str) -> bool {
     matches!(origin, "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost")
@@ -1650,7 +1657,10 @@ fn tighten(auth: &AuthConfig, mut req: Request) -> Result<Request, axum::respons
         let grant = p.lock().map(|mut mgr| mgr.grant_for(b, origin.as_deref())).unwrap_or(crate::bridge::pairing::Grant::Unknown);
         match grant {
             crate::bridge::pairing::Grant::Unknown => {}
-            crate::bridge::pairing::Grant::Paired(access) if paired_reaches(access, &req) => paired = true,
+            crate::bridge::pairing::Grant::Paired(access) if paired_reaches(access, &req) => {
+                paired = true;
+                req.extensions_mut().insert(PairedGrant(access));
+            }
             _ => {
                 req.headers_mut().remove(AUTHORIZATION);
             }
@@ -1707,6 +1717,14 @@ async fn access_guard(
     mut req: Request,
     next: Next,
 ) -> axum::response::Response {
+    // (made in-process by the Agent's tools for a page paired with OAIY: what it changes is held to what that page's
+    // grant reaches, as if it had asked itself; its reads are the tools' own)
+    if let Some(PairedGrant(access)) = req.extensions().get::<PairedGrant>().copied() {
+        if !matches!(*req.method(), Method::GET | Method::HEAD) && !paired_reaches(access, &req) {
+            let why = "not for a page paired with OAIY: the person does this in OAIY's own window";
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": why }))).into_response();
+        }
+    }
     if req.uri().path() == "/api/health" {
         req.extensions_mut().insert(s.guard.health_extras());
     }
@@ -3295,6 +3313,63 @@ mod tightened_tests {
         assert_eq!(ask(&app, "PUT", "/api/network/settings", &from).await.0, 403);
         assert_eq!(ask(&app, "GET", "/api/bridge/pairing", &from).await.0, 403);
         assert_eq!(ask(&app, "DELETE", "/api/bridge/pairing", &from).await.0, 403);
+    }
+
+    /// The Agent's tools reached with a paired page's token (the Agent in a browser tab) act for that page: its request to
+    /// `/api/mcp` is marked with its grant, so it is offered less; and what the tools change for it, though they call in
+    /// with this process's own credential, is held to what its grant reaches (their reads are their own). OAIY's own
+    /// window's, unmarked, keep everything.
+    #[tokio::test]
+    async fn the_agents_tools_for_a_paired_page_change_only_what_its_grant_reaches() {
+        use crate::http::PairedGrant;
+        let p = pairing();
+        let token = grant(&p, Some("https://agent.example"), PairingAccess::Agent);
+        let dir = std::env::temp_dir().join(format!("oaiy-tightened-paired-tools-{}", uuid::Uuid::new_v4().simple()));
+        let control = crate::control::Control::with_navigator(&dir, None);
+        let unused = std::env::temp_dir().join("oaiy-tightened-nothing-is-made-here");
+        let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, true, None, &|_| None).expect("a legacy guard");
+        let state = AccessState { legacy: AuthConfig { token: None, gui_mode: true, pairing: Some(p) }, guard };
+        let app = Router::new()
+            .route("/api/plugins/install", post(ok))
+            .route("/api/bridge/connectors/:id/request", post(ok))
+            .route("/api/bridge/pairing", get(ok))
+            .merge(crate::control::router(control.clone()))
+            .layer(middleware::from_fn_with_state(state, access_guard));
+        control.set_router(app.clone());
+        let internal = format!("Bearer {}", crate::internal_token());
+        let in_process = |method: &str, path: &str, grant: Option<PairingAccess>| {
+            let mut req = Request::builder().method(method).uri(path).header("authorization", internal.as_str()).body(Body::empty()).unwrap();
+            if let Some(g) = grant {
+                req.extensions_mut().insert(PairedGrant(g));
+            }
+            let app = app.clone();
+            async move { app.oneshot(req).await.unwrap().status().as_u16() }
+        };
+        // for the paired page: no plugin installed; a plugin's command, as its grant has it; a read, the tools' own
+        assert_eq!(in_process("POST", "/api/plugins/install", Some(PairingAccess::Agent)).await, 403);
+        assert_eq!(in_process("POST", "/api/bridge/connectors/x/request", Some(PairingAccess::Agent)).await, 200);
+        assert_eq!(in_process("GET", "/api/bridge/pairing", Some(PairingAccess::Agent)).await, 200);
+        // for this computer's own: as before
+        assert_eq!(in_process("POST", "/api/plugins/install", None).await, 200);
+        // the page's own request to the tools is marked: plugin_install is not among those offered it
+        let list = |bearer: String, origin: Option<&'static str>| {
+            let mut req = Request::builder().method("POST").uri("/api/mcp").header("authorization", bearer).header("content-type", "application/json");
+            if let Some(o) = origin {
+                req = req.header("origin", o);
+            }
+            let req = req.body(Body::from(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string())).unwrap();
+            let app = app.clone();
+            async move {
+                let resp = app.oneshot(req).await.unwrap();
+                let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 22).await.unwrap()).unwrap();
+                v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+            }
+        };
+        let paged = list(format!("Bearer {token}"), Some("https://agent.example")).await;
+        assert!(!paged.is_empty() && !paged.iter().any(|t| t == "plugin_install" || t == "network_approve"), "{paged:?}");
+        let own = list(internal.clone(), None).await;
+        assert!(own.iter().any(|t| t == "plugin_install") && own.len() > paged.len(), "{own:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

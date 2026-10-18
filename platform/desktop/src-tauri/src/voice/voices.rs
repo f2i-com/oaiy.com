@@ -82,10 +82,11 @@ fn list_in(dir: &Path) -> Vec<VoiceClip> {
     clips
 }
 
-/// Whether `name` is a copy of another computer's voice, kept here for its calls (OAIY Network: `from-<id>-<name>`):
+/// Whether `name` is a copy of another computer's voice, kept here for its calls (OAIY Network: `from-<id>-<name>`,
+/// the id sixteen hex digits of that computer's certificate, or six of its node id as copies were first named):
 /// spoken in when that computer asks, never this computer's own.
 pub fn is_copy(name: &str) -> bool {
-    name.strip_prefix("from-").and_then(|rest| rest.split_once('-')).is_some_and(|(id, voice)| id.len() == 6 && id.chars().all(|c| c.is_ascii_alphanumeric()) && !voice.is_empty())
+    name.strip_prefix("from-").and_then(|rest| rest.split_once('-')).is_some_and(|(id, voice)| matches!(id.len(), 6 | 16) && id.chars().all(|c| c.is_ascii_alphanumeric()) && !voice.is_empty())
 }
 
 /// The voices, by name (this computer's own: not the copies kept for another computer's calls).
@@ -313,6 +314,8 @@ mod tests {
         assert_eq!(list_in(&dir).len(), 2);
         assert_eq!(chosen_in(&dir).as_deref(), Some("receptionist"));
         assert!(is_copy("from-a1b2c3-front-desk") && !is_copy("from-mum") && !is_copy("from-a1b2c-x") && !is_copy("receptionist"));
+        // (named by sixteen hex digits of that computer's certificate, as OAIY Network copies them now)
+        assert!(is_copy("from-a1b2c3d4e5f60718-front-desk") && !is_copy("from-a1b2c3d4e5f6071-x"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -99,6 +99,17 @@ describe('NetworkPanel', () => {
     await act(async () => button('Approve').click());
     expect(api.approve).toHaveBeenCalledWith('r1');
     expect(api.deny).not.toHaveBeenCalled();
+    // (asked once: nothing more said)
+    expect(container.querySelector('[data-testid="network-request-tries"]')).toBeNull();
+  });
+
+  it("says when a request's address asked again and again, each time with a new code", async () => {
+    api.status.mockResolvedValue(worker);
+    api.requests.mockResolvedValue({ requests: [{ id: 'r2', nodeId: 'p1', name: 'Mac mini', address: '192.168.1.5', code: '123 456', fingerprint: 'aaaa', secondsLeft: 280, tries: 4 }] });
+    await mount();
+    const tries = container.querySelector('[data-testid="network-request-tries"]')!;
+    expect(tries.textContent).toContain('Asked 4 times from 192.168.1.5');
+    expect(tries.textContent).toContain('deny it');
   });
 
   it('on a primary, pairs by address showing the code, the worker approving and then this side', async () => {
@@ -268,10 +279,10 @@ describe('NetworkPanel', () => {
     expect(card.textContent).toContain('Uses this computer');
   });
 
-  it('lets the Agent set it up with a tick, saved at once, and pairs at once where both computers pair by themselves', async () => {
+  it('lets the Agent set it up with a tick, saved at once, and asks this side for the code where the other approved by itself', async () => {
     api.status.mockResolvedValue(primary);
     api.setSettings.mockResolvedValue({ ...primary, agent: true });
-    api.startPairing.mockResolvedValue({ status: 'approved', code: '111 222', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.20:17975', fingerprint: '1111' } });
+    api.startPairing.mockResolvedValue({ pairingId: 'x', status: 'approved_there', code: '111 222', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.20:17975', fingerprint: '1111' } });
     await mount();
     const tick = container.querySelector('[data-testid="network-agent"] input') as HTMLInputElement;
     expect(tick.checked).toBe(false);
@@ -284,16 +295,22 @@ describe('NetworkPanel', () => {
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await act(async () => input.closest('form')!.requestSubmit());
-    expect(container.textContent).toContain('Paired with Rig at once: its window to pair by itself was open');
-    expect(container.querySelector('[data-testid="network-pairing"]')).toBeNull();
+    // (approved there at once, as anyone answering for it could say: paired here only on this side's word)
+    const card = container.querySelector('[data-testid="network-pairing"]')!;
+    expect(card.textContent).toContain('111 222');
+    expect(card.textContent).toContain('Did its screen show this same code?');
+    expect(container.textContent).not.toContain('Paired with Rig');
+    expect(api.confirmPairing).not.toHaveBeenCalled();
   });
 
-  it('opens pairing by itself for five minutes where the Agent may set it up, and says who paired so', async () => {
-    const lending = { ...primary, lends: true, role: 'both', agent: true, pairingOpenUntilMs: null, pairedByItself: [{ name: 'Laptop', at: Date.now() }] };
+  it('opens pairing by itself for five minutes where the Agent may set it up, and says who paired so, with the code', async () => {
+    const lending = { ...primary, lends: true, role: 'both', agent: true, pairingOpenUntilMs: null, pairedByItself: [{ name: 'Laptop', at: Date.now(), code: '345 678' }] };
     api.status.mockResolvedValue(lending);
     api.setSettings.mockResolvedValue({ ...lending, pairingOpenUntilMs: Date.now() + 5 * 60_000 });
     await mount();
     expect(container.textContent).toContain('Laptop paired with this computer by itself');
+    // (the code the computer that asked compares before it pairs on its side)
+    expect(container.querySelector('.network-by-itself')!.textContent).toContain('345 678');
     const window_ = () => container.querySelector('[data-testid="network-window"]')!;
     expect(window_().textContent).toContain('Closed');
     api.status.mockResolvedValue({ ...lending, pairingOpenUntilMs: Date.now() + 5 * 60_000 });

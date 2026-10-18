@@ -15,7 +15,7 @@ This is the design record; [Setting it up](#setting-it-up) and [What is not done
 | Where inference runs | On the worker that has the model, by its own engines (the Studio), as it would locally | No model weights move; each machine's engine knows its own GPU (the Mac's eGPU path included) |
 | How requests travel | Through the primary: a client calls the primary's existing routes, the primary calls the worker | Flows, the Agent and apps never see a LAN address or a worker credential |
 | Discovery | mDNS/DNS-SD (`_oaiy-worker._tcp.local.`) advertising a name, a node id, a port and in a line what the computer has (`hw`: its GPUs with their VRAM, memory and cores), and a manual address | Standard and LAN-local; multicast is often blocked, so an address always works too. Discovery grants nothing; what a computer has helps choose which to pair with (no paths, models or keys) |
-| Trust | Pairing: each node's own key and self-signed certificate; a 6-digit code from both certificates and a fresh random value from each side, the worker's committed to before it learns the primary's, shown on both screens; approval on the worker, then on the primary (the person says the worker showed the same code); each pins the other's certificate | A numeric comparison with committed random values defeats a man in the middle on the first contact, as Bluetooth's does, with no shared secret to type or leak: a computer in the middle learns each side's value only after its own is fixed, so it cannot make the two screens agree (one time in a million). Asking both sides means a computer answering for the worker cannot pair itself by approving its own request |
+| Trust | Pairing: each node's own key and self-signed certificate; a 6-digit code from both certificates and a fresh random value from each side, the worker's committed to before it learns the primary's, shown on both screens; approval on the worker, then on the primary (the person says the worker showed the same code), always, even where the worker approved by itself; each pins the other's certificate; a worker makes only a few codes in a few minutes | A numeric comparison with committed random values defeats a man in the middle on the first contact, as Bluetooth's does, with no shared secret to type or leak: a computer in the middle learns each side's value only after its own is fixed, so it cannot make the two screens agree (one time in a million), and asking again and again for a new code gets it a few tries, not a million. Asking both sides means a computer answering for the worker cannot pair itself by approving its own request |
 | Transport | Mutual TLS (rustls) with the pinned certificates, both directions, after pairing | Encrypted and authenticated at the connection, so no bearer token crosses the LAN in the clear |
 | Node ids | A computer's node id is its own say, so one already paired here under another certificate is refused, either way (`409 node_id_taken`; `Peers::add`) | A computer approved only to use this one cannot name itself as one this computer uses, and take its place, its defaults and its OAIY Voice |
 | Model identity | A remote model is `engine:<kind>:node.<nodeId>/<model>`; the worker's own name kept beside it | Never mistaken for a local model of the same name; a flow that names one shows it offline rather than switching |
@@ -43,10 +43,14 @@ WORKER   worker listener (/worker/v1/*) ─ its own Studio (gateway + resources)
   value (`POST /worker/v1/pair/:id`, once), the worker tells its own back, and the primary checks it against the
   commitment. The code is six digits of the SHA-256 of both fingerprints and both values, so both screens show the
   same code only when each computer sees the other's real certificate. Protocol 2 (OAIY Network's first release
-  paired with protocol 1: update both computers).
+  paired with protocol 1: update both computers). Each value told is a new code, so a worker makes few: five a minute
+  and ten in five minutes for one address, and ten a minute and twenty in five minutes in all (`429 too_many_tries`;
+  pairing there waits a few minutes). A request asked again from its address says so on its card (*Asked 4 times from
+  … each time with a new code*).
 - **Worker connections**: 64 at once; of those, 16 at most in their TLS handshake from one address, and 16 from
   computers not paired with it (four from one address), each carrying one request (`health`, pairing) with 15 s for
-  its head. A LAN computer holding connections open cannot keep the paired primary out.
+  its head and 15 s more for its body, of 64 KB at most (`408`, `413`). A LAN computer holding connections open cannot
+  keep the paired primary out.
 - **Peers** (`network/peers.json`): each paired node's id, name, role, certificate fingerprint, last address and when
   it was paired; revoking removes it, and a revoked node's connections are refused at once.
 - **Worker listener**: on a worker, `/worker/v1/*` over TLS on the LAN, bound only while it is enabled. Before pairing
@@ -69,7 +73,9 @@ models while it uses another's OAIY Voice, say.
    Allow OAIY through the computer's firewall for that port if it asks.
 2. **On the computer that uses it**: switch on *Use other computers*. Computers lending themselves show under *Add a
    computer to use* (found by mDNS); where computers cannot find each other (Wi-Fi client isolation, VLANs, a
-   firewall), type the address the other computer's page shows.
+   firewall), type the address the other computer's page shows. Looking for them listens for mDNS on UDP port 5353,
+   so Windows Firewall may ask to allow OAIY here too, though this computer lends nothing; refused, pairing by
+   address still works.
 3. Press **Pair**. This computer shows a six-digit code; the other's Networking page (or a prompt on whichever page
    it is on) shows the same code under *Asking to use this computer*. Approve it there only if the codes match. This
    computer then asks whether the other showed the same code: *Yes, pair* pairs them; *No* pairs nothing and the
@@ -92,9 +98,11 @@ keeps the pairing.
 **Letting the Agent set it up.** *Let the Agent pair and set up this computer* (Setup → Networking, saved as it is
 ticked; off until the person ticks it) lets the Agent's tools change OAIY Network: `network_setup` (on or off, uses,
 lends, name, sharing model files, the window to pair by itself), `network_pair` (a computer found on the network or
-an address; it waits for the other computer's approval, then confirms this side only once the person says both screens
-show the same code: `codeConfirmed`, never set by the Agent itself), `network_approve` (a computer asking to use this
-one), `network_unpair`, `network_use_service` (OAIY Voice on another computer) and `network_pin`, beside
+an address; it waits for the other computer's approval, or that computer's window approves it at once, then confirms
+this side only once the person says both screens show the same code: `codeConfirmed`, never set by the Agent
+itself), `network_approve` (denies a computer asking to use this one; approving it is the person's own, on this
+computer's screen, so with `approve: true` it says where and approves nothing), `network_unpair`,
+`network_use_service` (OAIY Voice on another computer) and `network_pin`, beside
 `network_status` (which says `agentMaySetUp`, and lists the computers asking). With it off they refuse, and say where
 the person ticks it. A pairing is one way unless both ways is asked for.
 
@@ -102,12 +110,16 @@ the person ticks it. A pairing is one way unless both ways is asked for.
 request). The other computer approves such a request at once only while its **window to pair by itself** is open:
 its person (or its Agent, `network_setup`'s `openPairingMinutes`; `PUT /api/network/settings {openPairingMinutes}`,
 1 to 10 minutes, 0 closes it) opened it, and the first computer paired in it closes it. Outside a window the request
-waits for the person as any other: anyone on the network can say `auto`. No codes are compared in a window, so it is
-for a network the person trusts, open only while they pair a computer of theirs. The window is not saved (closed at a
-restart); `GET /api/network/status` says until when it is open (`pairingOpenUntilMs`) and which computers paired by
-themselves lately (`pairedByItself`). Each card says *Paired by itself*; past eight computers so paired (computers, not
-pairings), the person is asked again. A computer approved to use another may say it lends itself to that one too
-(`/worker/v1/lends`, both ways) only within ten minutes of its approval, once.
+waits for the person as any other: anyone on the network can say `auto`. No code is compared on the computer whose
+window is open, so it is for a network the person trusts, open only while they pair a computer of theirs. The
+computer that asked still pairs only once its person says the other showed the same code (`approved_there`, then
+*Yes, pair*): anyone answering for the other could say it approved. The other shows that code with the computers it
+paired by itself (*… paired with this computer by itself, showing code …*), and one the asking side refuses, or never
+answers, is undone there. The window is not saved (closed at a restart); `GET /api/network/status` says until when it
+is open (`pairingOpenUntilMs`) and which computers paired by themselves lately, with their codes (`pairedByItself`).
+Their cards say *Paired by itself*; past eight computers so paired (computers, not pairings), the person is asked
+again. A computer approved to use another may say it lends itself to that one too (`/worker/v1/lends`, both ways)
+only within ten minutes of its approval, once.
 
 The Agent's own model on another computer
 is `agent_model_set` with a worker's language model, or (following *the model chosen in Engines*) a worker's
@@ -194,7 +206,8 @@ A worker lends its primary **OAIY Voice** when it is set up there: **Services �
 computer connected to the phone stays the primary: its calls, the transcription route (`/api/voice/transcribe`, the
 flow editor's speech-to-text and the Agent's listening) then send their speech-to-text and speech to the worker,
 which starts its OAIY Voice when asked. A call's voice is copied to the worker the first time it is used there (kept
-there as `from-<primary>-<name>`, beside the worker's own voices). A plugin's setup that asks for OAIY Voice counts
+there as `from-<primary>-<name>`, beside the worker's own voices, `<primary>` being sixteen hex digits of the primary's
+certificate, which no other computer can take as its own, as it could a node id). A plugin's setup that asks for OAIY Voice counts
 the worker's. Set with `PUT /api/network/settings` `{"services": {"oaiy-voice": "<nodeId>"}}` (`null` gives it back),
 listed in `GET /api/network/status` as `services`.
 
@@ -263,7 +276,7 @@ restricted, as `/api/engines/` are):
 | `GET /api/network/status` | auth.read | On or off, the role, this computer's name, fingerprint and addresses |
 | `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, agent, shareModels, openPairingMinutes, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before; `agent`, `shareModels`, `openPairingMinutes`, `defaults` or `services` alone restart nothing; a port another program has is refused before anything is kept, and a listener that cannot start leaves this computer using others, said as `listenError`) |
 | `POST /api/network/discover` | auth.manage | The workers found on the LAN |
-| `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare |
+| `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare (`pending`, or `approved_there` where the worker's window approved it at once; paired only by `confirm`) |
 | `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it, or withdraws the request it has not answered) |
 | `GET /api/network/requests` | auth.read | On a worker: primaries asking to pair, each with its code |
 | `POST /api/network/requests/:id/approve`, `…/deny` | auth.manage, auth.revoke | The worker's person decides |

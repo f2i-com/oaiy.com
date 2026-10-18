@@ -261,6 +261,167 @@ async fn the_pairing_code_comes_from_a_value_committed_to_first() {
     worker.stop();
 }
 
+/// Each time a primary tells its random value a new code is made. Asked again and again (a computer in the middle trying
+/// for the code the other screen shows), one address is held to a few codes a minute and a few more within a request's
+/// time, and every address together to a few more, whatever addresses they claim. A request replaced by a new one
+/// from the same computer counts, and the person sees how many tries its address had.
+#[tokio::test]
+async fn pairing_codes_are_held_to_a_few_tries() {
+    use super::identity::{nonce, Identity};
+    let worker = node("worker-tries", Role::Worker, None).await;
+    let w = router(worker.clone());
+    let me = Identity::generate().unwrap();
+    let asking = tls::client(&me, Pin::Record(Default::default())).unwrap();
+    let at = |path: &str| format!("https://{}{path}", worker.listening().unwrap());
+    let try_once = || async {
+        let asked: Value = asking.post(at("/worker/v1/pair")).json(&json!({ "nodeId": me.node_id, "name": "a primary" })).send().await.unwrap().json().await.unwrap();
+        asking.post(at(&format!("/worker/v1/pair/{}", asked["requestId"].as_str().unwrap()))).json(&json!({ "nonce": nonce().unwrap() })).send().await.unwrap().status()
+    };
+    // (the tries made so far, made older)
+    let age = |secs: u64| {
+        for t in lock(&worker.inner().pairing_tries).iter_mut() {
+            t.0 = t.0.checked_sub(std::time::Duration::from_secs(secs)).unwrap();
+        }
+    };
+    for _ in 0..5 {
+        assert!(try_once().await.is_success());
+    }
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    assert_eq!(waiting["requests"].as_array().unwrap().len(), 1, "each new request replaced the one before: {waiting}");
+    assert_eq!(waiting["requests"][0]["tries"], 5, "and the person is told how many codes its address had: {waiting}");
+    assert_eq!(try_once().await, reqwest::StatusCode::TOO_MANY_REQUESTS, "a sixth within the minute");
+    // a minute on, a few more, up to ten for one address within a request's time
+    age(90);
+    for _ in 0..5 {
+        assert!(try_once().await.is_success());
+    }
+    age(90);
+    assert_eq!(try_once().await, reqwest::StatusCode::TOO_MANY_REQUESTS, "ten for one address");
+    // (a primary asking from there now is told why, and to wait)
+    let primary = node("primary-tries", Role::Primary, None).await;
+    let (status, refused) = call(&router(primary.clone()), "POST", "/api/network/pairings/start", Some(json!({ "address": worker.listening().unwrap().to_string() }))).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap_or_default().contains("wait a few minutes"), "{refused}");
+    primary.stop();
+    // every address together: ten a minute, and twenty within a request's time
+    let claimed = |i: u8| std::net::IpAddr::from([192, 168, 7, i]);
+    for i in 0..10 {
+        assert_eq!(worker::take_try(&worker, claimed(i)), Some(1), "{i}");
+    }
+    assert_eq!(worker::take_try(&worker, claimed(100)), None, "ten in all within the minute, from whatever addresses");
+    age(61);
+    assert_eq!(worker::take_try(&worker, claimed(200)), None, "twenty in all within a request's time");
+    // a request's time on, they no longer count
+    age(5 * 60);
+    assert_eq!(worker::take_try(&worker, claimed(1)), Some(1));
+    worker.stop();
+}
+
+/// A computer not paired here sends its request's body whole, soon and small: one that trickles in is answered and let
+/// go within moments, and a large one is refused before any route reads it (a voice copy's route takes 32 MB from the
+/// paired primary, read before the route says the caller is not it).
+#[tokio::test]
+async fn a_strangers_request_body_is_small_and_soon() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let worker = node("worker-body", Role::Worker, None).await;
+    let address = worker.listening().unwrap();
+    let id = super::identity::Identity::generate().unwrap();
+    let stranger = tls::client(&id, Pin::Record(Default::default())).unwrap();
+    let r = stranger.put(format!("https://{address}/worker/v1/voices/x")).json(&json!({ "clip": "A".repeat(1 << 20) })).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    // (a small one reaches its route as before)
+    let r = stranger.post(format!("https://{address}/worker/v1/pair")).json(&json!({ "nodeId": "ab", "name": "x" })).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    // a body that never comes: answered, and the connection let go, within the stranger's time
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls::client_config(&id, Pin::Record(Default::default())).unwrap()));
+    let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut conn = connector.connect(rustls::pki_types::ServerName::try_from("oaiy-node.invalid").unwrap(), tcp).await.unwrap();
+    conn.write_all(b"POST /worker/v1/pair HTTP/1.1\r\nhost: worker\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{").await.unwrap();
+    let started = std::time::Instant::now();
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), conn.read_to_end(&mut answer)).await;
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "let go in {:?}", started.elapsed());
+    worker.stop();
+}
+
+/// A primary's voices are copied to a worker under its certificate (sixteen hex digits of it), not its node id, which
+/// is its own say: another primary cannot name itself to share their names, replace them, or have them removed with it.
+/// They are removed when it is unpaired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_primarys_voice_copies_are_kept_under_its_certificate() {
+    // (two certificates whose fingerprints share their first six digits: their copies never meet)
+    let (a, b) = (format!("ab12cd{}", "0".repeat(58)), format!("ab12cd{}", "1".repeat(58)));
+    let (for_a, for_b) = (worker::copied_voice_name(&a, "front-desk"), worker::copied_voice_name(&b, "front-desk"));
+    assert_ne!(for_a, for_b);
+    assert!(!for_a.starts_with(&worker::copied_voice_name(&b, "")) && crate::voice::voices::is_copy(&for_a), "{for_a}");
+    // (within a voice's 48 characters: a long name cut, with a tag of its whole name)
+    let long = worker::copied_voice_name(&a, &"x".repeat(40));
+    assert!(long.len() <= 48 && crate::voice::voices::clean_name(&long).as_deref() == Ok(long.as_str()), "{long}");
+    assert_ne!(long, worker::copied_voice_name(&a, &format!("{}y", "x".repeat(39))));
+    // a paired primary's copy, named so, and removed when it is unpaired
+    crate::voice::voices::init(&temp("voices-copies"));
+    let worker = node("worker-copies", Role::Worker, None).await;
+    let primary = node("primary-copies", Role::Primary, None).await;
+    pair(&primary, &worker).await;
+    let me = primary.identity().unwrap();
+    let pinned = tls::client(&me, Pin::Record(Default::default())).unwrap();
+    let clip = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, vec![7u8; 2048]);
+    let r: Value = pinned.put(format!("https://{}/worker/v1/voices/copy-test", worker.listening().unwrap())).json(&json!({ "clip": clip, "extension": "wav" })).send().await.unwrap().json().await.unwrap();
+    let kept = format!("from-{}-copy-test", &me.fingerprint[..16]);
+    assert_eq!(r["voice"], kept, "{r}");
+    let of_it = || crate::voice::voices::copies(&worker::copied_voice_name(&me.fingerprint, "")).iter().any(|c| c.name == kept);
+    assert!(of_it());
+    call(&router(worker.clone()), "DELETE", &format!("/api/network/nodes/{}", me.node_id), None).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while of_it() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!of_it(), "its copies go with it");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A computer found on the LAN is paired at an address that reaches it: IPv4 first (the addresses come in no order),
+/// and never an IPv6 link-local one, which needs its interface named.
+#[test]
+fn a_found_computer_is_paired_at_an_address_that_reaches_it() {
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    let found = discovery::reachable([ip("fe80::bcc6:4eff:febc:20b2"), ip("fd85:2144:420d::7ebf"), ip("192.168.2.147"), ip("8.8.8.8"), ip("10.0.0.4")].into_iter(), 17975);
+    assert_eq!(found, ["192.168.2.147:17975", "10.0.0.4:17975", "[fd85:2144:420d::7ebf]:17975"]);
+    assert!(discovery::reachable([ip("fe80::1")].into_iter(), 17975).is_empty(), "link-local alone: not kept");
+}
+
+/// A port another program holds is refused before anything is kept, as the listener would find it: on Windows too,
+/// where a probe that let the address be reused would bind it beside a program that lets it be reused as well (and the
+/// listener, which does not, would then fail).
+#[tokio::test]
+async fn a_port_another_program_holds_is_refused_before_anything_is_kept() {
+    for reusable in [true, false] {
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.set_reuseaddr(reusable).unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let held = held.listen(8).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let net = Network::open_with(&temp("held"), ai(None), false);
+        let err = net.set(Settings { enabled: true, uses: None, lends: None, agent: false, share_models: None, role: Role::Worker, name: String::new(), port, bind: "127.0.0.1".into() }).await.unwrap_err();
+        assert!(err.contains("cannot lend itself"), "held reusable {reusable}: {err}");
+        assert!(!net.settings().enabled && net.listening().is_none(), "nothing kept or started");
+        drop(held);
+    }
+}
+
+/// This computer's name, where none is set, is the system's own, as `hostname` gives it (asked with no console window,
+/// which Windows would otherwise open for it at every launch).
+#[cfg(windows)]
+#[test]
+fn this_computers_name_is_the_systems_own() {
+    let name = system_name().map(|n| n.trim().to_string()).unwrap_or_default();
+    assert!(!name.is_empty() && !name.contains('\n'), "{name:?}");
+}
+
 /// A worker unpaired at the primary while it was off is told once it answers again, and stops accepting the primary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_unpaired_while_off_is_told_when_it_is_back() {
@@ -652,7 +813,8 @@ async fn two_computers_can_use_each_other() {
 /// A computer that asks to pair by itself (its person lets its Agent set up OAIY Network) is approved at once only
 /// while the other computer's window to pair by itself is open (its person or Agent opened it, minutes long): outside
 /// it, its person is asked as for any other. The first such pairing closes the window, and is told on the other's
-/// page; past a few computers so paired, the person is asked again even with the window open.
+/// page with its code; the computer that asked pairs on its side only once its person says the codes match. Past a few
+/// computers so paired, the person is asked again even with the window open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_computer_pairs_by_itself_only_while_the_others_window_is_open() {
     let a = node("a-auto", Role::Primary, None).await;
@@ -673,23 +835,34 @@ async fn a_computer_pairs_by_itself_only_while_the_others_window_is_open() {
     let (code, _) = call(&pa, "PUT", "/api/network/settings", Some(json!({ "lends": false, "openPairingMinutes": 5 }))).await;
     assert_eq!(code, StatusCode::CONFLICT);
     assert!(a.settings().lends(), "nothing changed by a refused request");
-    // b's person opens the window: paired at once, both ways as asked, and the window closed by it
+    // b's person opens the window: approved there at once, and the window closed by it
     let (_, opened) = call(&pb, "PUT", "/api/network/settings", Some(json!({ "openPairingMinutes": 5 }))).await;
     assert!(opened["pairingOpenUntilMs"].as_u64().unwrap() > store::now_ms() + 4 * 60_000, "{opened}");
-    let at = json!({ "address": b.listening().unwrap().to_string(), "bothWays": true });
-    let (status, paired) = call(&pa, "POST", "/api/network/pairings/start", Some(at)).await;
-    assert_eq!((status, &paired["status"], &paired["auto"]), (StatusCode::OK, &json!("approved"), &json!(true)), "{paired}");
-    let b_id = paired["node"]["nodeId"].as_str().unwrap().to_string();
+    let at = json!({ "address": b.listening().unwrap().to_string() });
+    let (status, started) = call(&pa, "POST", "/api/network/pairings/start", Some(at)).await;
+    assert_eq!((status, &started["status"]), (StatusCode::OK, &json!("approved_there")), "{started}");
+    let b_id = started["worker"]["nodeId"].as_str().unwrap().to_string();
     let a_id = a.identity().unwrap().node_id;
-    assert!(a.inner().peers().get(&b_id, Role::Worker).is_some() && a.inner().peers().get(&b_id, Role::Primary).is_some());
-    assert!(b.inner().peers().get(&a_id, Role::Primary).is_some() && b.inner().peers().get(&a_id, Role::Worker).is_some());
+    assert!(b.inner().peers().get(&a_id, Role::Primary).is_some(), "paired on b's side by itself");
     let (_, waiting) = call(&pb, "GET", "/api/network/requests", None).await;
-    assert!(waiting["requests"].as_array().unwrap().is_empty(), "no person asked: {waiting}");
+    assert!(waiting["requests"].as_array().unwrap().is_empty(), "no person asked there: {waiting}");
     let (_, told) = call(&pb, "GET", "/api/network/status", None).await;
     assert!(told["pairingOpenUntilMs"].is_null(), "closed by the pairing: {told}");
     assert_eq!(told["pairedByItself"][0]["name"], a.display_name(), "{told}");
-    // each says it was paired by itself (no codes compared)
-    assert!(a.inner().peers().list().iter().chain(b.inner().peers().list()).all(|p| p.by_itself));
+    // (b shows the code with the computer it paired by itself, for a's person to compare)
+    assert_eq!(told["pairedByItself"][0]["code"], started["code"], "{told}");
+    // a's side pairs only on its person's word that b shows the same code, whatever b answered: anyone answering for b
+    // could say it approved
+    assert!(a.inner().peers().get(&b_id, Role::Worker).is_none(), "not paired on a's side before its person says the codes match");
+    let (_, asked) = call(&pa, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"] }))).await;
+    assert_eq!(asked["status"], "approved_there", "{asked}");
+    let (_, paired) = call(&pa, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": true, "bothWays": true }))).await;
+    assert_eq!(paired["status"], "approved", "{paired}");
+    assert!(a.inner().peers().get(&b_id, Role::Worker).is_some() && a.inner().peers().get(&b_id, Role::Primary).is_some());
+    assert!(b.inner().peers().get(&a_id, Role::Primary).is_some() && b.inner().peers().get(&a_id, Role::Worker).is_some());
+    // b says it was paired by itself (it compared no code); a compared it
+    assert!(b.inner().peers().get(&a_id, Role::Primary).is_some_and(|p| p.by_itself));
+    assert!(a.inner().peers().get(&b_id, Role::Worker).is_some_and(|p| !p.by_itself));
     let (_, nodes) = call(&pb, "GET", "/api/network/nodes", None).await;
     assert_eq!(nodes["nodes"][0]["pairedByItself"], true, "{nodes}");
     // the window closed: the next computer asking so waits for the person
