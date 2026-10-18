@@ -335,7 +335,9 @@ pub fn browse(path: Option<&str>) -> Result<Json, String> {
         if (name.starts_with('.') && name != ".venv") || name.starts_with('$') {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
+        // (a link read as what it links to: a model file put in place by a link is as large as that file, and a
+        // linked folder opens)
+        let Ok(meta) = std::fs::metadata(&p).or_else(|_| entry.metadata()) else { continue };
         if meta.is_dir() {
             dirs.push((name.to_ascii_lowercase(), entry_json(&p, &name, true, 0)));
         } else {

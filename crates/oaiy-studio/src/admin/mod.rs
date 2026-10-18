@@ -114,18 +114,20 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             let base = studio.state().get("gateway_url").and_then(Json::as_str).unwrap_or("").to_string();
             Ok(crate::api::discovery::document(studio, &base, true))
         }
-        ("GET", "/api/config") => Ok(cfg.clone()),
-        ("PUT" | "POST", "/api/config") => body(req).map_err(|e| (400, e)).and_then(|v| studio.set_config(v).map_err(|e| (400, e))),
-        ("POST", "/api/config/reset-routes") => {
-            let mut next = cfg.clone();
-            let defaults = config::default_json();
-            if let (Some(g), Some(routes)) = (next.get("gateway").cloned(), defaults.get("gateway").and_then(|g| g.get("routes")).cloned()) {
-                let mut g = g;
-                crate::util::set(&mut g, "routes", routes);
-                crate::util::set(&mut next, "gateway", g);
-            }
-            studio.set_config(next).map_err(|e| (400, e))
-        }
+        // (the settings with their version, which a save of them sends back, and their secrets said to be set, not said)
+        ("GET", "/api/config") => Ok(studio.config_for_page()),
+        ("PUT" | "POST", "/api/config") => body(req).map_err(|e| (400, e)).and_then(|v| studio.save_config_from(v)).map(|_| studio.config_for_page()),
+        ("POST", "/api/config/reset-routes") => studio
+            .update_config(|next| {
+                let defaults = config::default_json();
+                if let (Some(g), Some(routes)) = (next.get("gateway").cloned(), defaults.get("gateway").and_then(|g| g.get("routes")).cloned()) {
+                    let mut g = g;
+                    crate::util::set(&mut g, "routes", routes);
+                    crate::util::set(next, "gateway", g);
+                }
+                Ok(())
+            })
+            .map(|_| studio.config_for_page()),
         ("GET", "/api/jobs") => {
             let root = studio.output_root();
             Ok(Json::obj([("jobs", Json::Arr(studio.media.list().iter().map(|j| j.to_json(&root)).collect()))]))
@@ -199,30 +201,30 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             if model.is_empty() || model.len() > 200 || model.contains(['/', '\\']) || model.contains("..") {
                 return Err((400, "model must be a model's name, as /v1/discovery lists it".into()));
             }
-            // (one pin or unpin at a time, each on the settings as they are now: two at once would each keep its own
-            // change and lose the other's)
-            static PINNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let _one_at_a_time = PINNING.lock().unwrap_or_else(|p| p.into_inner());
-            let cfg = studio.config();
-            let next = if str_or(&b, "kind", "image") == "llm" {
-                let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
-                if crate::llm::default_model(&llm) != model {
-                    return Err((409, format!("{model} is not the language model chosen in Engines: choose it first, then pin it")));
+            // (each pin or unpin on the settings as they are now, under the save's lock: two at once, or a pin beside
+            // another save, would each keep its own change and lose the other's)
+            let kind = str_or(&b, "kind", "image").to_string();
+            let changed = studio.update_config(|next| {
+                if kind == "llm" {
+                    let mut section = next.get("llm").cloned().unwrap_or(Json::Null);
+                    if crate::llm::default_model(&section) != model {
+                        return Err((409, format!("{model} is not the language model chosen in Engines: choose it first, then pin it")));
+                    }
+                    crate::util::set(&mut section, "pinned", Json::Bool(pin));
+                    crate::util::set(next, "llm", section);
+                    return Ok(true);
                 }
-                let mut next = cfg.clone();
-                let mut section = llm;
-                crate::util::set(&mut section, "pinned", Json::Bool(pin));
-                crate::util::set(&mut next, "llm", section);
-                next
-            } else {
                 if pin {
-                    crate::media::pins::check(&cfg, &model).map_err(|e| (409, e))?;
-                } else if !crate::media::pins::pinned(&cfg).contains(&model) {
-                    return Ok(crate::resources::snapshot(studio));
+                    crate::media::pins::check(next, &model).map_err(|e| (409, e))?;
+                } else if !crate::media::pins::pinned(next).contains(&model) {
+                    return Ok(false);
                 }
-                crate::media::pins::with(&cfg, &model, pin)
-            };
-            studio.set_config(next).map_err(|e| (400, e))?;
+                *next = crate::media::pins::with(next, &model, pin);
+                Ok(true)
+            })?;
+            if !changed.0 {
+                return Ok(crate::resources::snapshot(studio));
+            }
             if !pin {
                 // (a loading it was waiting for is not wanted any more; the job id read, then the pins let go, before
                 // the queue is locked to cancel it)
@@ -262,28 +264,35 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             studio.downloads.find_files(studio, &files, b.get("check").and_then(Json::as_bool).unwrap_or(false))
         }),
         // What getting a model takes: its files here already, on this computer elsewhere, or to download.
+        // (`dir`: the folder it would go to, as the page has it, saved or not)
         ("POST", "/api/downloads/plan") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let token = Some(str_or(&b, "hf_token", "").trim().to_string()).filter(|t| !t.is_empty());
-            studio.downloads.plan_of(studio, str_or(&b, "id", ""), token).map_err(|e| (400, e))
+            let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);
+            studio.downloads.plan_of(studio, str_or(&b, "id", ""), token, dir).map_err(|e| (400, e))
         }),
         ("POST", "/api/downloads/pause") => body(req).map_err(|e| (400, e)).map(|b| studio.downloads.pause(studio, str_or(&b, "id", ""))),
-        ("POST", "/api/downloads/cancel") => body(req).map_err(|e| (400, e)).map(|b| studio.downloads.cancel(studio, str_or(&b, "id", ""))),
+        // (`dir`: where a model is partly downloaded that no listed download says, after a restart)
+        ("POST", "/api/downloads/cancel") => body(req).map_err(|e| (400, e)).map(|b| {
+            let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);
+            studio.downloads.cancel(studio, str_or(&b, "id", ""), dir)
+        }),
         ("POST", "/api/downloads/add") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);
             studio.downloads.add_again(studio, str_or(&b, "id", ""), dir).map_err(|e| (400, e))
         }),
         // Where downloads go, and the Hugging Face token for gated models (never sent back).
         ("POST", "/api/downloads/settings") => body(req).map_err(|e| (400, e)).and_then(|b| {
-            let mut next = cfg.clone();
-            let mut d = next.get("downloads").cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
-            if let Some(dir) = b.get("dir").and_then(Json::as_str) {
-                crate::util::set(&mut d, "dir", Json::str(dir.trim()));
-            }
-            if let Some(t) = b.get("hf_token").and_then(Json::as_str) {
-                crate::util::set(&mut d, "hf_token", Json::str(t.trim()));
-            }
-            crate::util::set(&mut next, "downloads", d);
-            studio.set_config(next).map_err(|e| (400, e))?;
+            studio.update_config(|next| {
+                let mut d = next.get("downloads").cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
+                if let Some(dir) = b.get("dir").and_then(Json::as_str) {
+                    crate::util::set(&mut d, "dir", Json::str(dir.trim()));
+                }
+                if let Some(t) = b.get("hf_token").and_then(Json::as_str) {
+                    crate::util::set(&mut d, "hf_token", Json::str(t.trim()));
+                }
+                crate::util::set(next, "downloads", d);
+                Ok(())
+            })?;
             Ok(studio.downloads.state(studio))
         }),
         ("GET", "/api/browse") => crate::system::browse(req.query("path").as_deref()).map_err(|e| (400, e)),
@@ -297,10 +306,9 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
                 (Some(s), Some(m)) => Some((s.to_string(), m.to_string())),
                 _ => None,
             };
-            let mut next = cfg.clone();
-            let (added, detected) = registry::add(&mut next, &path, b.get("name").and_then(Json::as_str), target.as_ref().map(|(s, m)| (s.as_str(), m.as_str())))
-                .map_err(|e| (400, e))?;
-            studio.set_config(next).map_err(|e| (400, e))?;
+            let ((added, detected), _) = studio.update_config(|next| {
+                registry::add(next, &path, b.get("name").and_then(Json::as_str), target.as_ref().map(|(s, m)| (s.as_str(), m.as_str()))).map_err(|e| (400, e))
+            })?;
             studio.log.push(format!("added {} ({}) as {} model {}", path.display(), detected.summary, added.section, added.name));
             Ok(Json::obj([
                 ("section", Json::str(added.section)),
@@ -312,16 +320,13 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         }),
         ("POST", "/api/models/import") => body(req).map_err(|e| (400, e)).and_then(|doc| {
             let replace = req.query("mode").as_deref() == Some("replace");
-            let mut next = cfg.clone();
-            let report = registry::import(&mut next, &doc, replace, &studio.root).map_err(|e| (400, e))?;
-            studio.set_config(next).map_err(|e| (400, e))?;
+            let (report, _) = studio.update_config(|next| registry::import(next, &doc, replace, &studio.root).map_err(|e| (400, e)))?;
             studio.log.push(format!("imported models ({})", if replace { "replaced" } else { "merged" }));
             Ok(report)
         }),
         ("POST", "/api/models/remove") => body(req).map_err(|e| (400, e)).and_then(|b| {
-            let mut next = cfg.clone();
-            remove_model(&mut next, str_or(&b, "section", ""), str_or(&b, "name", "")).map_err(|e| (400, e))?;
-            studio.set_config(next).map_err(|e| (400, e))
+            studio.update_config(|next| remove_model(next, str_or(&b, "section", ""), str_or(&b, "name", "")).map_err(|e| (400, e)))?;
+            Ok(studio.config_for_page())
         }),
         ("POST", r) if r.strip_prefix("/api/jobs/").and_then(|x| x.strip_suffix("/cancel")).is_some_and(|id| !id.is_empty()) => {
             let id = r.strip_prefix("/api/jobs/").and_then(|x| x.strip_suffix("/cancel")).unwrap_or_default();
@@ -346,15 +351,14 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
                 if done.status != "completed" {
                     return;
                 }
-                let mut next = s.config();
-                let set_it = crate::models::registry::obj_mut(&mut next, &["media", "music", "models", &name]).map(|m| {
-                    crate::util::set(m, "language_model", crate::models::detect::path_json(&out));
+                let set_it = s.update_config(|next| {
+                    crate::models::registry::obj_mut(next, &["media", "music", "models", &name])
+                        .map(|m| crate::util::set(m, "language_model", crate::models::detect::path_json(&out)))
+                        .ok_or((404, "it is no longer in the settings".to_string()))
                 });
-                if set_it.is_some() {
-                    match s.set_config(next) {
-                        Ok(_) => s.log.push(format!("music model {name} now uses {}", out.display())),
-                        Err(e) => s.log.push(format!("music model {name}: could not use {}: {e}", out.display())),
-                    }
+                match set_it {
+                    Ok(_) => s.log.push(format!("music model {name} now uses {}", out.display())),
+                    Err((_, e)) => s.log.push(format!("music model {name}: could not use {}: {e}", out.display())),
                 }
             });
             Ok(reply)

@@ -169,33 +169,56 @@ licence. **Recommended** picks one of each kind to start with.
   drive's free space. A download that would not fit is refused before it starts.
 - **Pause and resume:** **Pause** stops a download and keeps the partial file
   (`NAME.part`). **Resume** carries on from there, also after the studio
-  restarts. **Cancel** deletes the partial file. One download runs at a time,
-  and the others wait their turn.
+  restarts (a model partly downloaded into another folder is found there too:
+  the folders downloads went to are kept in `download-dirs.json`). **Cancel**
+  (and **Discard** on a model partly downloaded, or failed) deletes what the
+  download fetched: its partial files and the files it put in place, but
+  never a file another model uses (two models downloading into one folder),
+  a file that was there before, or the file a link points to. One download
+  runs at a time, and the others wait their turn. A connection that stops
+  sending for a minute is given up and tried again (curl's `--speed-limit`).
 - **Everything a model needs, none of it twice:** a download gets every part
   the model needs (its weights, text encoder, VAE, tokenizer). A file this
   computer has already (another model's text encoder or VAE, a copy on another
   drive) is used where it is, not downloaded again: the studio looks through
   where downloads go, the folder of every model and part in its settings, and
-  `downloads.library` (more folders), for a file as large whose SHA-256 is the
-  one Hugging Face publishes for it, and links it into the new model's folder
-  (the same file on one drive; a link to it on another). Every file downloaded
-  is checked against that SHA-256 too, and deleted if it does not match. A
-  file's SHA-256, once read, is kept beside the settings (`model-hashes.json`).
+  `downloads.library` (more folders; `~` is the home folder), for a file as
+  large whose SHA-256 is the one Hugging Face publishes for it, and links it
+  into the new model's folder (the same file on one drive; a link to it on
+  another; where neither can be made, Windows across drives, a copy, counted
+  in the free space and made in pieces that Pause and Cancel stop). A model's
+  folder is looked through, never a whole drive or the home folder it sits in,
+  within a limit (100,000 entries or 5 seconds; a program's `node_modules` or
+  `target` skipped). Every file downloaded is checked against that SHA-256
+  too, and deleted if it does not match; a file in place that is known to be
+  another (its SHA-256 read before, and not the one wanted) is fetched again.
+  A file's SHA-256, once read, is kept beside the settings
+  (`model-hashes.json`, written beside itself and then put in its place).
 - **From the network:** in OAIY's desktop, a file a paired computer has (OAIY
   Network) is fetched from it over the LAN before Hugging Face is asked, and
-  checked the same way (docs/NETWORK.md, Model files over the LAN). The
+  checked the same way (docs/NETWORK.md, Model files over the LAN); one that is
+  not the file is fetched from Hugging Face in the same download instead. The
   engines find a file for such a computer by its SHA-256
   (`POST /api/library/find {files: [{sha256, size}], check}`).
 - **What it needs:** **What it needs** on a card (and `POST /api/downloads/plan
-  {id}`) says, before a download, which of its files are in place, on this
-  computer elsewhere (and where), and to download, with the gigabytes of each;
-  the desktop's Setup and the Agent's `model_download_plan` show the same.
+  {id, dir}`, `dir` the folder in the box, saved or not) says, before a
+  download, which of its files are in place, on this computer elsewhere (and
+  where, and whether copied), on a paired computer, or to download, with the
+  gigabytes of each, the models it needs first, the drive's free space against
+  what it takes, and the memory it needs to run; its list of files stays open
+  (or closed) as the person leaves it, and **Check again** and **Hide** are
+  beside it. Download then says what it does ("Download 10.6 GB", "Get it",
+  "Add it (all here)"). The desktop's Setup and the Agent's
+  `model_download_plan` show the same.
 - **Gated models:** FLUX 3 Image Klein, LTX 2.5 and DINOv3 (for Pixal3D) ask
   you to accept their licence on huggingface.co first. Accept it while signed
   in, create an access token (read) at huggingface.co/settings/tokens, and save
   it in OAIY's Settings (the desktop sends it with each download it starts) or
-  on this page. The page's token stays in the configuration file
-  (`downloads.hf_token`); the `HF_TOKEN` environment variable works too.
+  on this page (an empty box removes the saved token, asked first). The page's
+  token stays in the configuration file (`downloads.hf_token`), and is never
+  answered by the control port; the `HF_TOKEN` environment variable works too.
+  curl is given it on its standard input (`--config -`), never on its command
+  line, which any program on the computer can read.
 - **When it finishes:** the files are added as the Models page's **Add**
   would, parts attaching to their model: a part missing from the files added
   is taken from the files that came with it first, then from another model of
@@ -612,6 +635,18 @@ which programs the studio runs, so:
   another machine needs that key. The page takes it once as `?key=`, or asks for
   it. Connections from this machine itself (loopback) need no key.
 
+`GET /api/config` answers the settings with their version (`config_version`)
+and with their secrets (`downloads.hf_token`, `gateway.api_key`) said to be set
+(`"(saved)"`), never said; a save that sends a secret back as it was read keeps
+it. A save (`PUT /api/config`) of settings read before another save (a download
+that added a model, another window, the desktop) is refused with `409`, so it
+cannot put back what that save changed: the page reads them again, puts the
+person's unsaved changes back on top, and asks them to save again. A save
+without a version is taken as it is (an older client). The API's own changes (a
+model added, imported or removed, a pin, a download's model added, the
+download folder or token) are made on the settings as they are, under the same
+lock as a save.
+
 `POST /api/open-file {url}` opens one of the outputs (`/files/…`) in this computer's own viewer: the gallery's
 **Open** in OAIY's window, which opens no windows of its own. It answers a client on this computer alone.
 
@@ -641,7 +676,8 @@ sections are:
 - `ui`: `host`, `port`, `open` (`app` | `browser` | `none`).
 - `gateway`: `host`, `port`, `api_key`, `public_url`, `cors_origins`, `routes`.
 - `privacy`: `incognito`.
-- `downloads`: `dir` (where Get models saves; default `models`), `hf_token`, `curl`, `library` (more folders to look for model files in, so none is downloaded twice).
+- `downloads`: `dir` (where Get models saves; default `models`), `hf_token`, `curl`, `library` (more folders to look for model files in, so none is downloaded twice; `~` the home folder).
+- `media.picture`: `background` (BiRefNet's folder) and `upscaler` (Real-ESRGAN's `.pth`), shown under Models, Picture tools.
 - `llm`: `server`, `server_webgpu`, `backend`, `webgpu_gb`, `models` (`[{name, path, vision_projector?, lora?, lora_strength?, devices?, enabled}]`;
   a model's `devices` are its own GPUs, for one too big for the LLM's, such as
   Qwen3.8-Flash-Next: see [FLASHNEXT.md](FLASHNEXT.md)),

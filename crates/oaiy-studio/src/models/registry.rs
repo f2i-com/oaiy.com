@@ -68,12 +68,12 @@ fn add_route_if_absent(cfg: &mut Json, target: &str) {
     }
 }
 
-/// Files near `path` (its folder, the parent's, and their subfolders, a few
-/// levels) for which `accept` finds a part. Header reads only; bounded.
-fn nearby(path: &Path, accept: impl Fn(&Path, &Detected) -> bool) -> Option<PathBuf> {
+/// Files near `path` (its folder, and `levels - 1` folders above it, and the
+/// folders in each) for which `accept` finds a part. Header reads only; bounded.
+fn nearby(path: &Path, levels: usize, accept: impl Fn(&Path, &Detected) -> bool) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut at = if path.is_dir() { Some(path.to_path_buf()) } else { path.parent().map(Path::to_path_buf) };
-    for _ in 0..3 {
+    for _ in 0..levels {
         let Some(d) = at else { break };
         at = d.parent().map(Path::to_path_buf);
         dirs.push(d);
@@ -123,14 +123,15 @@ fn field_of(d: &Detected, key: &str) -> Option<Json> {
     d.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
-/// The part named by `missing` for a new entry: from the files near the picked one first (what came with it: a
-/// downloaded model's own VAE and text encoder), then from another configured model of the same kind.
+/// The part named by `missing` for a new entry: from the picked one's own folder first (what came with it: a
+/// downloaded model's own VAE and text encoder), then from another configured model of the same kind, then from the
+/// folders above it (where another downloaded model's part may be a different release's).
 fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Path) -> Option<Json> {
     let arch = str_or(entry, "architecture", "");
     let family = str_or(entry, "family", "");
     // LTX 2.3 and its fine-tunes share Gemma 3; LTX 2.5 has its own encoder.
     let same_group = |f: &str| (f == "ltx-2.5") == (family == "ltx-2.5");
-    if let Some(v) = companion_nearby(section, &arch, family, missing, picked) {
+    if let Some(v) = companion_nearby(section, &arch, family, missing, picked, 1) {
         return Some(v);
     }
     for (_, other) in get(cfg, &["media", section, "models"]).map(|m| m.members().collect::<Vec<_>>()).unwrap_or_default() {
@@ -142,11 +143,11 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
             return Some(v.clone());
         }
     }
-    None
+    companion_nearby(section, &arch, family, missing, picked, 3)
 }
 
-/// The part named by `missing` among the files near `picked`.
-fn companion_nearby(section: &str, arch: &str, family: &str, missing: &str, picked: &Path) -> Option<Json> {
+/// The part named by `missing` among the files near `picked` (`levels`: its folder alone, or more above it).
+fn companion_nearby(section: &str, arch: &str, family: &str, missing: &str, picked: &Path, levels: usize) -> Option<Json> {
     let want: &dyn Fn(&Detected) -> bool = match (section, missing) {
         ("image", "base") => &|d| d.format == "diffusers" && field_of(d, "base").is_some(),
         ("image", "tokenizer") if arch == "flux2-klein-4b" => &|d| d.kind() == "klein_tokenizer",
@@ -164,7 +165,7 @@ fn companion_nearby(section: &str, arch: &str, family: &str, missing: &str, pick
         ("video", "text_encoder") => &|d| d.kind() == "video_text_encoder" && !d.summary.contains("2.5"),
         _ => return None,
     };
-    let found = nearby(picked, |_, d| want(d))?;
+    let found = nearby(picked, levels, |_, d| want(d))?;
     let d = detect::detect(&found).ok()?;
     let key = if missing == "base" { "base" } else { missing };
     field_of(&d, key).or_else(|| Some(Json::str(found.to_string_lossy())))
@@ -350,7 +351,7 @@ fn model3d_nearby(picked: &Path, key: &str) -> Option<Json> {
         "matte" => "model3d_matte",
         _ => "model3d_upscaler",
     };
-    let found = nearby(picked, |_, d| d.kind() == kind)?;
+    let found = nearby(picked, 3, |_, d| d.kind() == kind)?;
     field_of(&detect::detect(&found).ok()?, key)
 }
 

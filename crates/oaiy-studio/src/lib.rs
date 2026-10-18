@@ -78,9 +78,22 @@ pub struct Studio {
     restart_required: RwLock<bool>,
     /// One save at a time, so the file and memory never disagree.
     saving: std::sync::Mutex<()>,
+    /// Counted up at each save: a page that saves settings it read before another save is refused
+    /// ([`CONFIG_VERSION`]), rather than putting back what that save changed.
+    version: std::sync::atomic::AtomicU64,
     /// `--ui-port` / `--port`: in effect, never written to the file.
     port_overrides: (Option<u16>, Option<u16>),
 }
+
+/// The key `GET /api/config` adds to the settings it answers: their version, sent back with a save of them.
+pub const CONFIG_VERSION: &str = "config_version";
+
+/// What a secret of the settings reads as where they are answered (the Hugging Face token, the gateway's key): the
+/// page shows it is set, and a save that sends it back keeps the secret as it was.
+pub const SECRET_KEPT: &str = "(saved)";
+
+/// The secrets of the settings, by section and key: never answered, kept by a save that does not change them.
+const SECRETS: [(&str, &str); 2] = [("downloads", "hf_token"), ("gateway", "api_key")];
 
 impl Studio {
     pub fn config(&self) -> Json {
@@ -106,10 +119,73 @@ impl Studio {
         config::resolve(&self.root, cfg.get("media").map_or("outputs", |m| str_or(m, "output_dir", "outputs")))
     }
 
+    /// The settings as the control page reads them: their secrets said to be set ([`SECRET_KEPT`]), not said, and their
+    /// version ([`CONFIG_VERSION`]), which a save of them sends back.
+    pub fn config_for_page(&self) -> Json {
+        let mut cfg = self.config();
+        for (section, key) in SECRETS {
+            if let Some(sec) = cfg.get(section).cloned() {
+                if !str_or(&sec, key, "").is_empty() {
+                    let mut sec = sec;
+                    util::set(&mut sec, key, Json::str(SECRET_KEPT));
+                    util::set(&mut cfg, section, sec);
+                }
+            }
+        }
+        util::set(&mut cfg, CONFIG_VERSION, Json::Int(self.version.load(std::sync::atomic::Ordering::SeqCst) as i64));
+        cfg
+    }
+
+    /// Save settings the control page (or another client) read and changed: refused where they were read before
+    /// another save (their [`CONFIG_VERSION`] not the settings' now: read again, the change made on those), so one
+    /// does not put back what another changed; settings sent without a version are saved as they are (an older
+    /// client).
+    pub fn save_config_from(&self, next: Json) -> Result<Json, (u16, String)> {
+        let _one = self.saving.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(read) = next.get(CONFIG_VERSION).and_then(Json::as_i64) {
+            let now = self.version.load(std::sync::atomic::Ordering::SeqCst) as i64;
+            if read != now {
+                return Err((409, "the settings were changed since this page read them (a download, another window, or the desktop): they are read again; make the change once more".into()));
+            }
+        }
+        self.save_locked(next).map_err(|e| (400, e))
+    }
+
+    /// Change the settings as they are now, under the save's lock: `change` sees them as saved (no other change
+    /// between its reading and this save), and what it answers is answered with the saved settings.
+    /// Errors: `change`'s own (with its status), else the save's (400).
+    pub fn update_config<T>(&self, change: impl FnOnce(&mut Json) -> Result<T, (u16, String)>) -> Result<(T, Json), (u16, String)> {
+        let _one = self.saving.lock().unwrap_or_else(|p| p.into_inner());
+        let mut next = self.config();
+        let answer = change(&mut next)?;
+        let saved = self.save_locked(next).map_err(|e| (400, e))?;
+        Ok((answer, saved))
+    }
+
     /// Validate, save and apply a new configuration. A running LLM restarts when
     /// its settings changed; listener changes wait for the next start.
-    pub fn set_config(&self, mut next: Json) -> Result<Json, String> {
+    pub fn set_config(&self, next: Json) -> Result<Json, String> {
         let _one = self.saving.lock().unwrap_or_else(|p| p.into_inner());
+        self.save_locked(next)
+    }
+
+    /// [`Studio::set_config`], the save's lock held.
+    fn save_locked(&self, mut next: Json) -> Result<Json, String> {
+        // (the version and the secrets as the page reads them are not settings: a secret sent back as it was read
+        // is the secret as it is)
+        if let Json::Obj(fields) = &mut next {
+            fields.retain(|(k, _)| k != CONFIG_VERSION);
+        }
+        let current = self.config();
+        for (section, key) in SECRETS {
+            if next.get(section).is_some_and(|s| str_or(s, key, "") == SECRET_KEPT) {
+                let kept = current.get(section).map_or("", |s| str_or(s, key, "")).to_string();
+                if let Some(mut sec) = next.get(section).cloned() {
+                    util::set(&mut sec, key, Json::str(kept));
+                    util::set(&mut next, section, sec);
+                }
+            }
+        }
         config::merge_defaults(&mut next, &config::default_json());
         config::validate(&next)?;
         let before = self.config();
@@ -168,6 +244,7 @@ impl Studio {
             self.egpu.stop();
         }
         self.place_the_model(&before, &next);
+        self.version.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.log.push("configuration saved");
         Ok(next)
     }
@@ -284,6 +361,7 @@ impl Studio {
             gateway_url: RwLock::new(String::new()),
             restart_required: RwLock::new(false),
             saving: std::sync::Mutex::new(()),
+            version: std::sync::atomic::AtomicU64::new(1),
             port_overrides: (None, None),
         }
     }
@@ -620,6 +698,7 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         gateway_url: RwLock::new(String::new()),
         restart_required: RwLock::new(false),
         saving: std::sync::Mutex::new(()),
+        version: std::sync::atomic::AtomicU64::new(1),
         port_overrides: (args.ui_port, args.port),
     });
     // a media job's stages each read its device's memory: the card's (its launcher's word each second), or this
@@ -814,6 +893,41 @@ pub fn console(studio: &Arc<Studio>, ui_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control page reads the settings with their version and without their secrets; a save of settings read
+    /// before another save is refused, rather than putting back what that save changed; a secret sent back as it was
+    /// read is kept.
+    #[test]
+    fn settings_read_before_another_save_are_refused_and_secrets_are_never_answered() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut cfg = config::default_json();
+        let mut d = Json::obj(Vec::<(&str, Json)>::new());
+        util::set(&mut d, "hf_token", Json::str("hf_secret"));
+        util::set(&mut cfg, "downloads", d);
+        let studio = Studio::for_test(&root, cfg);
+        let page = studio.config_for_page();
+        assert!(!page.to_json().contains("hf_secret"), "the token is not answered");
+        assert_eq!(page.get("downloads").map(|d| str_or(d, "hf_token", "").to_string()).as_deref(), Some(SECRET_KEPT));
+        // another save meanwhile (a download added a model): the page's save of what it read is refused
+        studio.update_config(|next| {
+            util::set(next, "note", Json::str("a download's"));
+            Ok(())
+        })
+        .unwrap();
+        let mut stale = page.clone();
+        util::set(&mut stale, "privacy", Json::obj([("incognito", Json::Bool(true))]));
+        assert_eq!(studio.save_config_from(stale).map(|_| ()).unwrap_err().0, 409);
+        assert_eq!(studio.config().get("note").and_then(Json::as_str), Some("a download's"), "nothing put back");
+        // read again, saved: the token sent back as it was read is the token as it is
+        let mut fresh = studio.config_for_page();
+        util::set(&mut fresh, "privacy", Json::obj([("incognito", Json::Bool(true))]));
+        studio.save_config_from(fresh).unwrap();
+        assert_eq!(studio.config().get("downloads").map(|d| str_or(d, "hf_token", "").to_string()).as_deref(), Some("hf_secret"));
+        assert!(studio.config().get(CONFIG_VERSION).is_none(), "the version is not a setting");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_port_another_program_holds_is_listened_beside_and_said() {

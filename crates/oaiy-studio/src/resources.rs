@@ -45,23 +45,52 @@ pub fn events(after_ms: i64) -> Vec<Json> {
     EVENTS.lock().unwrap_or_else(|p| p.into_inner()).iter().filter(|e| e.get("at_ms").and_then(Json::as_i64).unwrap_or(0) > after_ms).cloned().collect()
 }
 
-/// The megabytes a model's files hold: a file's size, or a folder's files' (a few levels down), its weights' alone.
-fn size_mb(path: &str) -> Option<i64> {
-    fn walk(p: &Path, depth: usize) -> u64 {
+/// The weight files a model's path holds: a file (all of a split GGUF's shards, `-00001-of-00003.gguf`), or a folder's
+/// files (a few levels down), its weights' alone, each with its bytes.
+fn weight_files(path: &str, into: &mut std::collections::HashMap<std::path::PathBuf, u64>) {
+    fn weights(p: &Path) -> bool {
+        p.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "safetensors" | "gguf" | "bin" | "pth"))
+    }
+    fn walk(p: &Path, depth: usize, into: &mut std::collections::HashMap<std::path::PathBuf, u64>) {
         match std::fs::metadata(p) {
             Ok(m) if m.is_file() => {
-                let weights = p.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "safetensors" | "gguf" | "bin" | "pth"));
-                if weights { m.len() } else { 0 }
+                if weights(p) {
+                    into.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()), m.len());
+                }
             }
-            Ok(m) if m.is_dir() && depth > 0 => std::fs::read_dir(p).map_or(0, |rd| rd.flatten().map(|e| walk(&e.path(), depth - 1)).sum()),
-            _ => 0,
+            Ok(m) if m.is_dir() && depth > 0 => {
+                for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+                    walk(&e.path(), depth - 1, into);
+                }
+            }
+            _ => {}
         }
     }
-    let path = path.trim();
-    if path.is_empty() {
-        return None;
+    let path = Path::new(path.trim());
+    if path.as_os_str().is_empty() {
+        return;
     }
-    let bytes = walk(Path::new(path), 3);
+    walk(path, 3, into);
+    // (the first shard of a split GGUF named: its others are beside it)
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Some((stem, rest)) = name.rsplit_once("-of-").and_then(|(head, tail)| head.rsplit_once('-').map(|(stem, _)| (stem.to_string(), tail.to_string()))) {
+        let siblings = std::fs::read_dir(path.parent().unwrap_or(Path::new("."))).into_iter().flatten().flatten();
+        for e in siblings {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(&format!("{stem}-")) && n.ends_with(&format!("-of-{rest}")) {
+                walk(&e.path(), 0, into);
+            }
+        }
+    }
+}
+
+/// The megabytes of weights `paths` hold, each file counted once (a pipeline folder and its transformer inside it).
+fn size_mb(paths: &[&str]) -> Option<i64> {
+    let mut files = std::collections::HashMap::new();
+    for p in paths {
+        weight_files(p, &mut files);
+    }
+    let bytes: u64 = files.values().sum();
     (bytes > 0).then_some((bytes >> 20) as i64)
 }
 
@@ -83,15 +112,14 @@ pub fn rss_mb(pid: u32) -> Option<i64> {
 fn model_mb(cfg: &Json, section: &str, name: &str) -> Option<i64> {
     if section == "llm" {
         let m = cfg.get("llm")?.get("models")?.as_array()?.iter().find(|m| str_or(m, "name", "") == name)?;
-        return size_mb(str_or(m, "path", ""));
+        return size_mb(&[str_or(m, "path", "")]);
     }
     let m = cfg.get("media")?.get(section)?.get("models")?.get(name)?;
-    let parts: Vec<i64> = ["transformer", "text_encoder", "vae", "distill", "base", "checkpoint", "path", "safetensors_transformer"]
+    let parts: Vec<&str> = ["transformer", "text_encoder", "vae", "distill", "base", "checkpoint", "path", "safetensors_transformer"]
         .iter()
         .filter_map(|k| m.get(k).and_then(Json::as_str))
-        .filter_map(size_mb)
         .collect();
-    (!parts.is_empty()).then(|| parts.iter().sum())
+    size_mb(&parts)
 }
 
 /// Everything loaded, where, and what is using it: `{devices, models, queue, policy, events}`.
@@ -237,9 +265,18 @@ mod tests {
         std::fs::write(d.join("a.safetensors"), vec![0u8; 3 << 20]).unwrap();
         std::fs::write(d.join("sub").join("b.gguf"), vec![0u8; 2 << 20]).unwrap();
         std::fs::write(d.join("README.md"), vec![0u8; 5 << 20]).unwrap();
-        assert_eq!(size_mb(d.to_str().unwrap()), Some(5));
-        assert_eq!(size_mb(d.join("a.safetensors").to_str().unwrap()), Some(3));
-        assert_eq!(size_mb(""), None);
+        assert_eq!(size_mb(&[d.to_str().unwrap()]), Some(5));
+        assert_eq!(size_mb(&[d.join("a.safetensors").to_str().unwrap()]), Some(3));
+        assert_eq!(size_mb(&[""]), None);
+        // (a pipeline folder and its transformer inside it: each file once)
+        assert_eq!(size_mb(&[d.to_str().unwrap(), d.join("a.safetensors").to_str().unwrap()]), Some(5));
+        // (a split GGUF named by its first shard: all of its shards)
+        let split = d.join("split");
+        std::fs::create_dir_all(&split).unwrap();
+        for i in 1..=3 {
+            std::fs::write(split.join(format!("m-0000{i}-of-00003.gguf")), vec![0u8; 1 << 20]).unwrap();
+        }
+        assert_eq!(size_mb(&[split.join("m-00001-of-00003.gguf").to_str().unwrap()]), Some(3));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

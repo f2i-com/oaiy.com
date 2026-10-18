@@ -512,10 +512,13 @@ pub fn validate(v: &Json) -> Result<(), String> {
     if !llm.get("devices").and_then(Json::as_array).is_some_and(|d| d.iter().all(|d| d.as_i64().is_some_and(|d| (0..64).contains(&d)))) {
         return Err("llm.devices must be a list of GPU indices".into());
     }
-    // A model's own GPUs (it runs there instead of on llm.devices).
+    // A model's own GPUs (it runs there instead of on llm.devices), and its own context on the eGPU.
     for m in llm.get("models").and_then(Json::as_array).unwrap_or(&[]) {
         if m.get("devices").is_some_and(|d| !matches!(d, Json::Null) && !d.as_array().is_some_and(|d| d.iter().all(|d| d.as_i64().is_some_and(|d| (0..64).contains(&d))))) {
             return Err(format!("model {}: devices must be a list of GPU indices", str_or(m, "name", "")));
+        }
+        if m.get("egpu_ctx").is_some_and(|c| !matches!(c, Json::Null) && !c.as_i64().is_some_and(|c| (512..=4_194_304).contains(&c))) {
+            return Err(format!("model {}: egpu_ctx must be a whole number of tokens, 512 or more", str_or(m, "name", "")));
         }
     }
     // The eGPU through tinygrad's server (`crate::llm::egpu`, a Mac's): the section is optional, and read on a Mac only.

@@ -22,7 +22,7 @@
   --bg: #080d18; --panel: #0e1422; --panel-2: #131c2d; --line: #202a3c; --line-2: #33425c;
   --text: #f4f7ff; --muted: #98a6bd; --faint: #8592ab;
   --ssd: #f2b84b; --ram: #35d4e8; --shared: #35d4e8; --gpu: #7167ff; --bad: #ff6e78; --good: #45d6a2; --magenta: #e76bf3; --azure: #4d8bff;
-  --well: #060a13; --well-text: #c9d3e6; --media-bg: #05080f; --on-accent: #FFFFFF; --on-tier: #0b0f19; --backdrop: rgba(3, 6, 12, .6);
+  --well: #060a13; --well-text: #c9d3e6; --media-bg: #05080f; --on-accent: #FFFFFF; --on-tier: #0b0f19; --backdrop: rgba(3, 6, 12, .6); --go: #6457f2; /* (the main button's: white on it reads at 5:1, on --gpu at 4.1) */
   --rail-w: 216px; --dock-h: 0px; --pad: clamp(16px, 2.6vw, 44px);
   --display: "Public Sans", "Bahnschrift", "Segoe UI Variable Display", system-ui, sans-serif;
   --body: "Public Sans", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -37,7 +37,7 @@
   --bg: #f8f5ee; --panel: #fffefa; --panel-2: #f3f0e9; --line: #cec8be; --line-2: #9f998f;
   --text: #171717; --muted: #68645e; --faint: #6f6a63;
   --ssd: #9c6a08; --ram: #1675b9; --shared: #7ab6dd; --gpu: #2457e6; --bad: #e94b3c; --good: #218450; --magenta: #c2410c; --azure: #1675b9;
-  --well: #f1ede5; --well-text: #2a2723; --media-bg: #ebe7de; --on-accent: #FFFFFF; --on-tier: #FFFFFF; --backdrop: rgba(40, 34, 26, .35);
+  --well: #f1ede5; --well-text: #2a2723; --media-bg: #ebe7de; --on-accent: #FFFFFF; --on-tier: #FFFFFF; --backdrop: rgba(40, 34, 26, .35); --go: var(--gpu);
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme=dark]) {
@@ -45,7 +45,7 @@
     --bg: #f8f5ee; --panel: #fffefa; --panel-2: #f3f0e9; --line: #cec8be; --line-2: #9f998f;
     --text: #171717; --muted: #68645e; --faint: #6f6a63;
     --ssd: #9c6a08; --ram: #1675b9; --shared: #7ab6dd; --gpu: #2457e6; --bad: #e94b3c; --good: #218450; --magenta: #c2410c; --azure: #1675b9;
-    --well: #f1ede5; --well-text: #2a2723; --media-bg: #ebe7de; --on-accent: #FFFFFF; --on-tier: #FFFFFF; --backdrop: rgba(40, 34, 26, .35);
+    --well: #f1ede5; --well-text: #2a2723; --media-bg: #ebe7de; --on-accent: #FFFFFF; --on-tier: #FFFFFF; --backdrop: rgba(40, 34, 26, .35); --go: var(--gpu);
   }
 }
 @font-face { font-family: "Public Sans"; src: url("/fonts/public-sans.woff2") format("woff2"); font-weight: 300 700; font-display: swap; }
@@ -108,7 +108,7 @@ section.view { display: none; } section.view.on { display: block; }
 .btn:hover { border-color: var(--muted); }
 a.btn { color: inherit; text-decoration: none; display: inline-block; }
 .btn:disabled { opacity: .45; cursor: default; }
-.btn.go { background: var(--gpu); border-color: var(--gpu); color: var(--on-accent); font-weight: 600; }
+.btn.go { background: var(--go, var(--gpu)); border-color: var(--go, var(--gpu)); color: var(--on-accent); font-weight: 600; }
 .btn.go:hover { filter: brightness(1.08); }
 .btn.warn { color: var(--bad); }
 .btn.quiet { background: transparent; border-color: transparent; color: var(--muted); padding: 5px 8px; }
@@ -359,9 +359,9 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 #sp-form .scroll > * { min-width: 0; }
 #mu-form .scroll > * { min-width: 0; }
 #vid-speak-row, #vid-file-row { display: grid; gap: 14px; }
-.controls textarea.lyrics { min-height: 150px; font: 13px/1.5 var(--mono, ui-monospace, monospace); }
+.controls textarea.lyrics { min-height: 150px; font: 13px/1.5 var(--code, ui-monospace, monospace); }
 .sp-item details { font-size: 12px; color: var(--muted); }
-.sp-item details pre { white-space: pre-wrap; margin: 6px 0 0; font: 12px/1.5 var(--mono, ui-monospace, monospace); color: var(--text); }
+.sp-item details pre { white-space: pre-wrap; margin: 6px 0 0; font: 12px/1.5 var(--code, ui-monospace, monospace); color: var(--text); }
 .quant-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 figure .audio-card { display: grid; place-items: center; aspect-ratio: 4 / 3; background: var(--panel-2); color: var(--muted); }
 figure .audio-card svg { width: 40px; height: 40px; stroke: currentColor; fill: none; stroke-width: 1.4; }
@@ -510,6 +510,11 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-card { --accent: var(--gpu); position: relative; display: grid; grid-template-rows: auto auto 1fr auto auto; gap: 10px; padding: 16px 16px 14px; border: 1px solid var(--line); border-radius: calc(var(--r) + 2px); background: var(--panel); overflow: hidden; transition: border-color .15s, transform .15s; }
 .dl-card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--accent); opacity: .85; }
 .dl-card:hover { border-color: var(--line-2); }
+/* (a card as wide as its column, whatever a chip or a line in it holds: a long licence ends in an ellipsis) */
+.dl-card, .dl-card > div { min-width: 0; }
+.dl-body { display: grid; gap: 8px; align-content: start; grid-template-columns: minmax(0, 1fr); }
+.pathfield-row { display: flex; align-items: flex-end; gap: 8px; } .pathfield-row > .f { flex: 1; min-width: 0; }
+.dl-gated span { min-width: 0; }
 .dl-card[data-group=image] { --accent: var(--ram); } .dl-card[data-group=video] { --accent: var(--ssd); }
 .dl-card[data-group=speech], .dl-card[data-group=music], .dl-card[data-group=sound] { --accent: var(--magenta); }
 .dl-card[data-group=model3d] { --accent: var(--azure); } .dl-card[data-group=picture] { --accent: var(--good); }
@@ -522,7 +527,7 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-name { font: 600 16px/1.25 var(--display); letter-spacing: .01em; margin: 0; }
 .dl-about { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
 .dl-facts { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; }
-.dl-facts span { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+.dl-facts span { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--panel-2); color: var(--muted); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .dl-facts span b { color: var(--text); font-weight: 600; }
 .dl-gated { display: flex; gap: 6px; align-items: flex-start; font-size: 12px; color: var(--ssd); }
 .dl-gated svg { width: 14px; height: 14px; flex: none; margin-top: 1px; stroke: currentColor; fill: none; stroke-width: 2; }
@@ -639,7 +644,7 @@ dialog::backdrop { background: var(--backdrop); }
               <div><textarea id="chat-system" rows="4" placeholder="Optional instructions sent before the conversation, e.g. You are a concise assistant."></textarea></div></details>
             <button class="btn quiet" id="chat-clear">New chat</button>
           </div>
-          <div class="msgs" id="msgs" aria-live="polite"></div>
+          <div class="msgs" id="msgs" aria-live="polite" aria-busy="false"></div>
           <div class="composer2">
             <div class="box">
               <textarea id="chat-input" rows="1" placeholder="Message the model"></textarea>
@@ -900,7 +905,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block">
         <div class="spread"><h2 data-jump="Your list">Your model list</h2><div class="row">
           <a class="btn" id="export-models" href="/api/models/export" download="oaiy-models.json">Export models</a>
-          <label class="btn" style="cursor:pointer">Import models<input type="file" id="import-models" accept="application/json,.json" hidden></label></div></div>
+          <button class="btn" type="button" id="import-models-btn">Import models</button><input type="file" id="import-models" accept="application/json,.json" hidden></div></div>
         <p class="muted small" style="margin:0 0 14px">Export saves every model (language, image, video, speech, music, sound effect and 3D) with its parts, LoRAs, settings, defaults and memory settings to a JSON file. Import it on this machine or another: models merge by name, or replace the whole list. Paths that do not exist there come in switched off and are listed.</p>
         <div class="model-search">
           <input type="search" id="model-search" placeholder="Search your models: a name, a type, a file or a folder" aria-label="Search your models" autocomplete="off" spellcheck="false">
@@ -914,6 +919,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block"><div class="spread"><h2 data-jump="Music">Music models</h2><span class="muted small">Served on /v1/audio/music, and on /v1/audio/speech by name</span></div><div class="list" id="m-music"></div></div>
       <div class="block"><div class="spread"><h2 data-jump="Sound effects">Sound effect models</h2><span class="muted small">Served on /v1/audio/sound_effects</span></div><div class="list" id="m-sound"></div></div>
       <div class="block"><div class="spread"><h2 data-jump="3D">3D models</h2><span class="muted small">Served on /v1/3d/models</span></div><div class="list" id="m-model3d"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Picture tools">Picture tools</h2><span class="muted small">Served on /v1/images/background and /v1/images/upscale</span></div><div class="list" id="m-picture"></div></div>
     </section>
 
     <!-- Get models -->
@@ -930,7 +936,7 @@ dialog::backdrop { background: var(--backdrop); }
           <span class="muted small" id="dl-token-note">Create one at huggingface.co/settings/tokens. It stays on this machine.</span>
         </label>
       </div>
-      <div class="dl-queue" id="dl-queue" aria-live="polite"></div>
+      <div class="dl-queue" id="dl-queue"></div>
       <div class="chips" id="dl-groups" role="toolbar" aria-label="Show"></div>
       <div class="dl-grid" id="dl-grid"></div>
     </section>
@@ -1097,7 +1103,7 @@ dialog::backdrop { background: var(--backdrop); }
         <button role="tab" aria-selected="false" data-log="media">Media</button>
         <button role="tab" aria-selected="false" data-log="egpu" id="log-egpu" hidden>eGPU</button>
       </div>
-      <div class="log" id="log" tabindex="0" aria-live="polite"></div>
+      <div class="log" id="log" tabindex="0" role="log" aria-live="off" aria-label="Log"></div>
     </section>
   </main>
 </div>
@@ -1167,7 +1173,7 @@ async function api(path, opts = {}) {
   const text = await r.text();
   let data; try { data = JSON.parse(text); } catch { data = text; }
   if (r.status === 401) needKey();
-  if (!r.ok) throw new Error(data?.error?.message || text || r.statusText);
+  if (!r.ok) { const e = new Error(data?.error?.message || text || r.statusText); e.status = r.status; throw e; }
   return data;
 }
 // A question with buttons (and optionally a text box). Resolves to the chosen
@@ -1178,11 +1184,17 @@ function ask({title, text = "", input = null, buttons}) {
     $("#ask-title").textContent = title; $("#ask-text").textContent = text;
     box.hidden = !input; box.value = "";
     if (input) { box.type = input.type || "text"; box.placeholder = input.placeholder || ""; }
-    $("#ask-buttons").innerHTML = buttons.map((b, i) => `<button class="btn ${b.kind || ""}" value="${b.value === null ? "cancel" : i}">${esc(b.label)}</button>`).join("");
+    // (a button that dismisses does not submit: Enter in the text box gives the main button, the "go" one, else the
+    // first that does something and removes nothing; with no box, the focus is on the main button, else on the one
+    // that dismisses, never on one that removes)
+    const main = [buttons.findIndex(b => b.kind === "go"), buttons.findIndex(b => b.value !== null && b.kind !== "warn"), buttons.findIndex(b => b.value !== null)].find(i => i >= 0) ?? -1;
+    $("#ask-buttons").innerHTML = buttons.map((b, i) => `<button class="btn ${b.kind || ""}" ${b.value === null ? 'type="button" data-cancel' : ""} value="${b.value === null ? "cancel" : i}">${esc(b.label)}</button>`).join("");
+    $$("#ask-buttons [data-cancel]").forEach(b => b.onclick = () => d.close("cancel"));
+    box.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); if (main >= 0) d.close(String(main)); } };
     d.returnValue = "";
     d.onclose = () => { const i = d.returnValue; done(i === "" || i === "cancel" ? null : {value: buttons[+i].value, text: box.value}); };
     d.showModal();
-    (input ? box : $("#ask-buttons .go") || $("#ask-buttons button:last-child")).focus();
+    (input ? box : $("#ask-buttons .go") || $("#ask-buttons [data-cancel]") || $("#ask-buttons button")).focus();
   });
 }
 let keyAsked = false;
@@ -1207,10 +1219,44 @@ function setPath(o, p, v) { const ks = p.split("."); const last = ks.pop(); ks.r
 function dirty() { $("#savebar").classList.toggle("on", JSON.stringify(cfg) !== JSON.stringify(saved)); }
 function touch() { dirty(); }
 
-async function loadConfig() { saved = await api("/api/config"); cfg = clone(saved); renderConfig(); dirty(); renderFirstRun(); }
+// What the person changed and has not saved: each value that differs from the settings as they were read, by its
+// path (an object looked into, anything else changed whole; `undefined`: taken away).
+function edits(base, mine, at = "", out = []) {
+  const obj = v => v && typeof v === "object" && !Array.isArray(v);
+  if (obj(base) && obj(mine)) {
+    for (const k of new Set([...Object.keys(base), ...Object.keys(mine)])) edits(base[k], mine[k], at ? at + "." + k : k, out);
+  } else if (JSON.stringify(base) !== JSON.stringify(mine)) out.push([at, mine]);
+  return out;
+}
+function unsetPath(o, p) { const ks = p.split("."); const last = ks.pop(); const parent = ks.reduce((a, k) => a?.[k], o); if (parent) delete parent[last]; }
+// The settings read again (something else saved them: a download that finished, a model added, another window), with
+// what the person changed and has not saved put back on top of them, rather than thrown away.
+async function loadConfig() {
+  const mine = saved && cfg ? edits(saved, cfg) : [];
+  saved = await api("/api/config"); cfg = clone(saved);
+  for (const [p, v] of mine) {
+    // (an edit to something no longer there, a model removed meanwhile, is not made again: it would bring back a part)
+    const parent = p.split(".").slice(0, -1).join(".");
+    if (p === "config_version" || (parent && getPath(cfg, parent) === undefined)) continue;
+    v === undefined ? unsetPath(cfg, p) : setPath(cfg, p, clone(v));
+  }
+  renderConfig(); dirty(); renderFirstRun();
+}
 async function saveConfig() {
   try { saved = await api("/api/config", {method: "PUT", body: cfg}); cfg = clone(saved); renderConfig(); dirty(); toast("Saved"); refresh(); }
-  catch (e) { toast(e.message, true); }
+  catch (e) {
+    // (saved meanwhile by something else: read again, the person's changes kept on top, for them to save again)
+    if (e.status === 409) { await loadConfig().catch(() => {}); toast("The settings changed meanwhile: they are read again with your changes kept. Save again.", true); }
+    else toast(e.message, true);
+  }
+}
+// One setting saved as it is changed (a tick), on the settings as they are saved: tried once more on them read
+// again where something else saved them meanwhile.
+async function saveOne(change) {
+  const put = () => { const next = clone(saved); change(next); return api("/api/config", {method: "PUT", body: next}); };
+  try { saved = await put(); }
+  catch (e) { if (e.status !== 409) throw e; await loadConfig(); saved = await put(); }
+  return saved;
 }
 $("#save").onclick = saveConfig;
 $("#discard").onclick = () => { cfg = clone(saved); renderConfig(); dirty(); };
@@ -1225,14 +1271,15 @@ $("#incognito").onchange = async e => {
     if (!r) { e.target.checked = !e.target.checked; return; }
   }
   try {
-    const next = clone(saved); next.privacy = {...(next.privacy || {}), incognito: e.target.checked};
-    saved = await api("/api/config", {method: "PUT", body: next});
-    cfg.privacy = clone(saved.privacy);
+    const on = e.target.checked;
+    await saveOne(next => { next.privacy = {...(next.privacy || {}), incognito: on}; });
+    cfg.privacy = clone(saved.privacy); cfg.config_version = saved.config_version;
     document.body.classList.toggle("incognito", !!saved.privacy.incognito);
     toast(saved.privacy.incognito ? "Incognito on: nothing about requests is kept" : "Incognito off");
     dirty(); refresh();
   } catch (err) { e.target.checked = !e.target.checked; toast(err.message, true); }
 };
+$("#import-models-btn").onclick = () => $("#import-models").click();
 $("#import-models").onchange = async e => {
   const f = e.target.files[0]; e.target.value = ""; if (!f) return;
   let doc; try { doc = JSON.parse(await f.text()); } catch { return toast("That file is not JSON", true); }
@@ -1269,6 +1316,8 @@ function applyTheme(t) {
   applyTheme(t);
   window.__oaiySetTheme = (mode) => { if (mode === "light" || mode === "dark") applyTheme(mode); };
 })();
+// (the system's theme changing while the page follows it: the button says the other one again)
+matchMedia("(prefers-color-scheme: light)").addEventListener?.("change", () => applyTheme(document.documentElement.dataset.theme || ""));
 $("#theme").onclick = () => {
   const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : !matchMedia("(prefers-color-scheme: light)").matches;
   const next = dark ? "light" : "dark";
@@ -1383,10 +1432,13 @@ function renderConfig() {
 /* ---------- file picker ---------- */
 let pickCb = null, pickSel = null, pickDir = "";
 function lastDir() { try { return localStorage.getItem("studio-dir") || ""; } catch { return ""; } }
+// (`pickDirOnly`: a folder is asked for, such as where models are saved: files are shown, not chosen)
+let pickDirOnly = false;
 async function pick(opts, cb) {
-  pickCb = cb; pickSel = null;
+  pickCb = cb; pickSel = null; pickDirOnly = !!opts.dir;
   $("#pick-title").textContent = opts.title || "Choose a model file";
   $("#pick-folder").hidden = false;
+  $("#pick-ok").hidden = pickDirOnly;
   $("#picker").showModal();
   await browse(opts.start || lastDir());
 }
@@ -1396,7 +1448,7 @@ async function browse(path) {
   catch (e) { toast(e.message, true); if (path) return browse(""); return; }
   pickDir = listing.path; pickSel = null;
   try { if (pickDir) localStorage.setItem("studio-dir", pickDir); } catch {}
-  $("#pick-path").value = pickDir; $("#pick-sel").textContent = pickDir ? "Pick a file, or use this folder" : "Pick a drive";
+  $("#pick-path").value = pickDir; $("#pick-sel").textContent = !pickDir ? "Pick a drive" : pickDirOnly ? "Open a folder, then use it" : "Pick a file, or use this folder";
   $("#pick-ok").disabled = true; $("#pick-up").disabled = !pickDir; $("#pick-folder").disabled = !pickDir;
   $("#pick-up").dataset.parent = listing.parent ?? "";
   const list = $("#pick-list");
@@ -1405,18 +1457,20 @@ async function browse(path) {
     const b = document.createElement("button");
     b.className = e.dir ? "dir" : "file"; b.setAttribute("role", "option");
     b.innerHTML = `<span class="ic" aria-hidden="true">${e.dir ? "▸" : "◦"}</span><span>${esc(e.name)}</span><span class="sz">${e.dir ? "" : fmtSize(e.size)}</span>`;
+    if (!e.dir && pickDirOnly) b.disabled = true;
     b.onclick = () => {
       if (e.dir) return browse(e.path);
+      if (pickDirOnly) return;
       $$("#pick-list button").forEach(x => x.setAttribute("aria-selected", x === b));
       pickSel = e.path; $("#pick-sel").textContent = e.name; $("#pick-ok").disabled = false;
     };
-    b.ondblclick = () => { if (!e.dir) finishPick(e.path); };
+    b.ondblclick = () => { if (!e.dir && !pickDirOnly) finishPick(e.path); };
     list.append(b);
   }
 }
 function fmtSize(n) { return n >= 1073741824 ? (n / 1073741824).toFixed(1) + " GB" : n >= 1048576 ? (n / 1048576).toFixed(0) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB"; }
 function finishPick(path) { $("#picker").close(); const cb = pickCb; pickCb = null; cb && cb(path); }
-$("#pick-ok").onclick = () => pickSel && finishPick(pickSel);
+$("#pick-ok").onclick = () => pickSel && !pickDirOnly && finishPick(pickSel);
 $("#pick-folder").onclick = () => pickDir && finishPick(pickDir);
 $("#pick-close").onclick = () => $("#picker").close();
 $("#pick-up").onclick = () => browse($("#pick-up").dataset.parent);
@@ -1427,16 +1481,23 @@ $("#pick-path").onkeydown = e => { if (e.key === "Enter") browse($("#pick-path")
 const kindName = {llm: "Language model", image: "Image model", video: "Video model", vision_projector: "Vision projector", adapter: "LoRA adapter", image_base: "Qwen Image base folder",
   text_encoder: "Image text encoder", video_text_encoder: "Video text encoder", vae: "VAE", audio_vae: "Audio VAE", tokenizer: "Gemma tokenizer", clip_tokenizer: "CLIP tokenizer", ffmpeg: "FFmpeg", sound_model: "Sound effect model", speech_breeze: "Speech model",
   model3d: "3D model", model3d_dino: "3D model part: DINOv3", model3d_naf: "3D model part: NAF",
-  model3d_matte: "3D model part: BiRefNet (background removal)", model3d_upscaler: "3D model part: Real-ESRGAN (upscaler)"};
+  model3d_matte: "3D model part: BiRefNet (background removal)", model3d_upscaler: "3D model part: Real-ESRGAN (upscaler)",
+  flux2_vae: "FLUX.2 VAE", flux3_text_encoder: "FLUX 3 text encoder (Qwen3-VL)", flux3_lora: "FLUX 3 LoRA", klein_text_encoder: "FLUX.2 Klein text encoder",
+  klein_tokenizer: "FLUX.2 Klein tokenizer", klein_lora: "FLUX.2 Klein LoRA", moss_text_encoder: "MOSS-Image text encoder (Qwen3.5-9B)", moss_tokenizer: "MOSS-Image tokenizer",
+  moss_vae: "MOSS-Image VAE", moss_distill: "MOSS-Image distillation", music_lm: "Music model's language model", music_model: "Music model",
+  speech_design: "Speech model (its VoiceDesign half)", speech_base: "Speech model (its Base half)"};
+// (kinds the Check calls a part, which are a model of their own when added: a new one, or the half one lacks)
+const NEW_MODEL = {speech_design: "speech", speech_base: "speech", speech_breeze: "speech", music_model: "music", sound_model: "sound effect", model3d: "3D"};
 async function detectPath() {
   const path = $("#add-path").value.trim(); if (!path) return;
   const out = $("#add-result");
   try {
     const d = await api("/api/detect", {method: "POST", body: {path}});
-    const where = d.section === "component" ? "Attaches to the model that needs it" : `Adds to ${d.section === "llm" ? "chat" : d.section + "s"}`;
+    const made = NEW_MODEL[d.kind];
+    const where = made ? `Adds a ${made} model (or completes one that lacks it)` : d.section === "component" ? "Attaches to the model that needs it" : `Adds to ${d.section === "llm" ? "chat" : d.section + "s"}`;
     out.innerHTML = `<div class="detected ${d.section}"><strong>${esc(kindName[d.kind] || d.kind)}</strong><span>${esc(d.summary)}</span>
       <span class="muted small">${where}${d.missing.length ? ". It also needs: " + d.missing.map(esc).join(", ") + " (found automatically when possible)" : ""}</span>
-      <div class="row" style="margin-top:6px"><input type="text" id="add-name" placeholder="Name (optional)" style="max-width:240px" ${d.section === "component" ? "hidden" : ""}><button class="btn go" id="add-go">Add ${d.section === "component" ? "part" : "model"}</button></div></div>`;
+      <div class="row" style="margin-top:6px"><input type="text" id="add-name" placeholder="Name (optional)" aria-label="Name (optional)" style="max-width:240px" ${d.section === "component" && !made ? "hidden" : ""}><button class="btn go" id="add-go">Add ${d.section === "component" && !made ? "part" : "model"}</button></div></div>`;
     $("#add-go").onclick = () => addModel(path, $("#add-name")?.value);
   } catch (e) { out.innerHTML = `<div class="detected"><strong>Not recognised</strong><span class="muted">${esc(e.message)}</span></div>`; }
 }
@@ -1481,7 +1542,17 @@ function modelLoras(section, name) {
 }
 function modelObj(section, name) {
   if (section === "llm") return cfg.llm.models.find(m => m.name === name);
+  // (the picture tools are one of each, under their section itself: background removal and upscaling)
+  if (section === "picture") return cfg.media.picture ??= {enabled: true, background: "", upscaler: ""};
   return cfg.media[section].models[name];
+}
+// The picture tools (Get models' BiRefNet and Real-ESRGAN, or the person's own): each a path, changed, cleared, or
+// added by Browse, as a model's part is.
+function renderPictureTools() {
+  const p = cfg.media.picture || {};
+  const tools = [["background", "Background removal (BiRefNet: its folder)", true], ["upscaler", "Upscaling (Real-ESRGAN: its .pth or folder)", false]];
+  $("#m-picture").innerHTML = `<div class="item">${tools.map(([key, label, dir]) => `<div class="pathfield-row">${field(label, "picture", "tools", key, p[key], {dir})}${p[key] ? `<button class="btn quiet warn" type="button" data-ptool-clear="${key}">Remove</button>` : ""}</div>`).join("")}</div>`;
+  $$("[data-ptool-clear]").forEach(b => b.onclick = () => { cfg.media.picture[b.dataset.ptoolClear] = ""; renderModels(); touch(); });
 }
 function missingOf(section, m) {
   const empty = k => !(m[k] || "").trim();
@@ -1517,7 +1588,7 @@ function egpuTick(m) {
   return `<div class="row" style="margin-top:8px; gap:10px; align-items:center">
     <label class="check" title="${gguf ? `Chats with this model are answered by ${who}. When the card is not there, this Mac's GPU answers (Settings says with which model).` : "tinygrad's server reads GGUF files only."}"><input type="checkbox" data-egpu="${esc(m.name)}" ${m.egpu ? "checked" : ""} ${gguf || m.egpu ? "" : "disabled"}> On the eGPU (${own ? "WebGPU" : "tinygrad"}), when the card is there</label>
     ${held ? `<span class="tag gpu">${held}</span>` : ""}${m.egpu && !egpuOn() ? '<span class="muted small">The eGPU is switched off under Settings.</span>' : ""}
-    ${m.egpu && own ? `<label class="f" style="margin:0" title="The context this model is started with on the card: empty is the eGPU's (Settings). A model whose attention cache can be this Mac's past what the card holds (Qwen3.8-Flash-Next's) can be given far more, up to 262,144; one whose cache must all be on the card (a dense 27B) fills a 24 GB card at 32,768."><span class="small">Context on the eGPU</span><input type="number" min="512" step="1024" style="width:110px" data-egpuctx="${esc(m.name)}" value="${m.egpu_ctx ?? ""}" placeholder="${cfg?.llm?.egpu?.ctx ?? 8192}"></label>` : ""}</div>`;
+    ${m.egpu && own ? `<label class="f" style="margin:0" title="The context this model is started with on the card: empty is the eGPU's (Settings). A model whose attention cache can be this Mac's past what the card holds (Qwen3.8-Flash-Next's) can be given far more, up to 262,144; one whose cache must all be on the card (a dense 27B) fills a 24 GB card at 32,768."><span class="small">Context on the eGPU</span><input type="number" min="512" step="1024" style="width:110px" data-egpuctx="${esc(m.name)}" value="${esc(m.egpu_ctx ?? "")}" placeholder="${esc(cfg?.llm?.egpu?.ctx ?? 8192)}"></label>` : ""}</div>`;
 }
 // The models that can stand in for one on the eGPU: this Mac's own, the same model first.
 function renderEgpuFallback() {
@@ -1624,9 +1695,10 @@ function renderModels() {
     return mediaItem("video", name, m, (m.family || name).toUpperCase(), miss, fields);
   }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3 or LTX 2.5 .safetensors file.</div>';
 
+  renderPictureTools();
   $$("[data-mfield]").forEach(el => el.oninput = () => { const [s, n, k] = el.dataset.mfield.split("|"); modelObj(s, n)[k] = el.value; touch(); });
   $$("[data-mpick]").forEach(b => b.onclick = () => { const [s, n, k] = b.dataset.mpick.split("|");
-    pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const miss = s === "llm" ? [] : missingOf(s, modelObj(s, n)); if (s !== "llm" && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
+    pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const miss = s === "llm" || s === "picture" ? [] : missingOf(s, modelObj(s, n)); if (s !== "llm" && s !== "picture" && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
   $$("[data-mgpu]").forEach(el => el.onchange = () => {
     const [name] = el.dataset.mgpu.split("|"), m = modelObj("llm", name);
     const picked = $$("[data-mgpu]").filter(i => i.checked && i.dataset.mgpu.split("|")[0] === name).map(i => +i.dataset.mgpu.split("|")[1]);
@@ -1840,7 +1912,7 @@ function renderRoutes() {
 }
 $("#route-add").onclick = () => { cfg.gateway.routes.push({path: "/custom/path", method: "POST", target: "chat", spec: "openai", enabled: true}); renderRoutes(); touch(); };
 $("#routes-reset").onclick = async () => { if (!await ask({title: "Restore the default routes?", text: "Your route table is replaced with the defaults. Custom paths are lost.", buttons: [{label: "Cancel", value: null}, {label: "Restore defaults", value: "ok", kind: "warn"}]})) return; try { saved = await api("/api/config/reset-routes", {method: "POST"}); cfg = clone(saved); renderConfig(); dirty(); toast("Routes restored"); } catch (e) { toast(e.message, true); } };
-function routeFor(target) { return cfg.gateway.routes.find(r => r.target === target && r.enabled !== false); }
+function routeFor(target) { return cfg?.gateway?.routes?.find(r => r.target === target && r.enabled !== false); }
 function renderExamples() {
   const base = state?.gateway_url || `http://127.0.0.1:${cfg.gateway.port}`;
   const auth = cfg.gateway.api_key ? ` \\\n  -H "Authorization: Bearer ${cfg.gateway.api_key.replace(/./g, "•")}"` : "";
@@ -2026,11 +2098,12 @@ function renderState() {
   const active = state.media.jobs.find(j => j.status === "in_progress") || priv.find(j => j.status === "in_progress");
   $("#foot-media").className = "dot " + (active ? "starting" : ""); $("#foot-media-text").textContent = active ? `${kindText(active.kind)} ${active.progress.toFixed(0)}%` : "Media idle";
   const ep = [["Chat", routeFor("chat")], ["Images", routeFor("images")], ["Videos", routeFor("videos")]].filter(([, r]) => r);
-  $("#ov-endpoints").innerHTML = ep.map(([n, r]) => `<div class="endpoint"><span class="muted">${n}</span><code>${esc(state.gateway_url + r.path)}</code><button class="btn quiet" data-copy="${esc(state.gateway_url + r.path)}">Copy</button></div>`).join("")
+  const endpoints = ep.map(([n, r]) => `<div class="endpoint"><span class="muted">${n}</span><code>${esc(state.gateway_url + r.path)}</code><button class="btn quiet" data-copy="${esc(state.gateway_url + r.path)}">Copy</button></div>`).join("")
     + `<div class="endpoint"><span class="muted">Base URL</span><code>${esc(state.gateway_url)}/v1</code><button class="btn quiet" data-copy="${esc(state.gateway_url)}/v1">Copy</button></div>`;
-  $$("[data-copy]").forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")));
+  // (written again only when it changes: read every 1.5 s, it would take a selection or the keyboard's place away)
+  if ($("#ov-endpoints").dataset.was !== endpoints) { $("#ov-endpoints").innerHTML = endpoints; $("#ov-endpoints").dataset.was = endpoints; }
   const jobs = state.media.jobs.slice(0, 8);
-  keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="" data-job="${esc(j.id)}">` : '<div class="ph"></div>'}
+  keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="Open the result" data-job="${esc(j.id)}" tabindex="0" role="button">` : '<div class="ph"></div>'}
     <div><div class="p">${esc(j.prompt || (j.kind === "model3d" ? "3D model" : ""))}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
     <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`,
     '<div class="empty">Nothing generated yet. Try the Playground.</div>');
@@ -2105,9 +2178,9 @@ $("#llm-autostart").onchange = async e => {
   // Saved as it is ticked, as incognito is (Settings has the same tick, with the drafts there): the model loaded now
   // stays loaded.
   try {
-    const next = clone(saved); next.llm.autostart = e.target.checked;
-    saved = await api("/api/config", {method: "PUT", body: next});
-    cfg.llm.autostart = saved.llm.autostart;
+    const on = e.target.checked;
+    await saveOne(next => { next.llm.autostart = on; });
+    cfg.llm.autostart = saved.llm.autostart; cfg.config_version = saved.config_version;
     bindFields(); dirty();
     toast(saved.llm.autostart ? "The language model starts when OAIY opens" : "The language model starts at the first chat request");
   } catch (err) { e.target.checked = !e.target.checked; toast(err.message, true); }
@@ -2165,7 +2238,9 @@ function renderReply(el, content) {
   body.innerHTML = html;
   $$(".copy", body).forEach(b => b.onclick = () => navigator.clipboard.writeText(new DOMParser().parseFromString(blocks[+b.dataset.code], "text/html").documentElement.textContent).then(() => toast("Copied")));
 }
-let chatLog = [], chatAbort = null;
+// (`chatGen`: which conversation this is; a reply that ends after New chat is the conversation before's, and puts
+// nothing into the new one)
+let chatLog = [], chatAbort = null, chatGen = 0;
 const autoGrow = () => { const t = $("#chat-input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, innerHeight * .38) + "px"; };
 $("#chat-input").addEventListener("input", autoGrow);
 function addMsg(role, text = "") {
@@ -2179,9 +2254,12 @@ async function sendChat() {
   const text = $("#chat-input").value.trim(); if (!text) return;
   $("#chat-input").value = ""; autoGrow(); $("#chat-send").disabled = true;
   chatAbort = new AbortController(); $("#chat-stop").hidden = false;
+  // (a screen reader hears the reply once it is whole, not each time it grows)
+  $("#msgs").setAttribute("aria-busy", "true");
+  const gen = chatGen, ours = () => gen === chatGen;
   chatLog.push({role: "user", content: text}); const sent = addMsg("user", text);
   // A turn that produced nothing leaves the conversation; its bubble says so.
-  const unsend = () => { chatLog.pop(); sent.classList.add("unsent"); sent.title = "Not part of the conversation: the model did not answer it"; if (!$("#chat-input").value) { $("#chat-input").value = text; autoGrow(); } };
+  const unsend = () => { if (!ours()) return; chatLog.pop(); sent.classList.add("unsent"); sent.title = "Not part of the conversation: the model did not answer it"; if (!$("#chat-input").value) { $("#chat-input").value = text; autoGrow(); } };
   const el = addMsg("assistant"), body = $(".body", el), think = $(".think", el), meta = $(".meta", el);
   meta.textContent = state?.llm?.state === "ready" ? "Thinking..." : "Loading the model (the first reply takes longer)...";
   const t0 = performance.now(); let content = "", reasoning = "", tokens = 0, drawn = 0;
@@ -2214,15 +2292,17 @@ async function sendChat() {
     renderReply(el, content);
     const secs = (performance.now() - t0) / 1000;
     meta.textContent = `${secs.toFixed(1)} s, about ${(tokens / secs).toFixed(1)} chunks/s`;
-    chatLog.push({role: "assistant", content});
+    if (ours()) chatLog.push({role: "assistant", content});
   } catch (e) {
-    if (e.name === "AbortError") {
+    if (!ours()) {
+      // (New chat while it answered: the reply belongs to the conversation that is gone)
+    } else if (e.name === "AbortError") {
       renderReply(el, content);
       meta.textContent = "Stopped.";
       if (content) chatLog.push({role: "assistant", content}); else unsend();
     } else { meta.textContent = ""; body.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`; unsend(); }
   }
-  chatAbort = null; $("#chat-stop").hidden = true;
+  chatAbort = null; $("#chat-stop").hidden = true; $("#msgs").setAttribute("aria-busy", "false");
   $("#chat-send").disabled = false; refresh();
 }
 $("#chat-send").onclick = sendChat;
@@ -2235,7 +2315,7 @@ function chatEmpty() {
   $$("#chat-empty .suggest button").forEach(b => b.onclick = () => { $("#chat-input").value = b.textContent; autoGrow(); $("#chat-input").focus(); });
 }
 chatEmpty();
-$("#chat-clear").onclick = () => { chatAbort?.abort(); chatLog = []; chatEmpty(); $("#chat-input").focus(); };
+$("#chat-clear").onclick = () => { chatGen++; chatAbort?.abort(); chatLog = []; chatEmpty(); $("#chat-input").focus(); };
 
 /* ---------- image & video ---------- */
 const readAsDataUrl = f => new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(f); });
@@ -2350,12 +2430,28 @@ function progress(k, text, pct) {
   bar.hidden = false; $(`#${k}-progress-text`).textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
 let imgJobId = null, vidJobId = null;
-function watchJob(kind) {
+// The job a request of this page's made, found once and then followed: one of `kind` that was not there before the
+// request, with its prompt where the list says it (another app's job of the same kind is not this one, nor is its
+// Cancel this one's).
+const allJobs = () => [...(state?.media?.jobs || []), ...(state?.media?.private || [])];
+function ourJob(kind, prompt) {
+  const before = new Set(allJobs().map(j => j.id));
+  let id = null;
+  return () => {
+    const jobs = allJobs();
+    // (its prompt as the job says it, its start compared: a job may keep it trimmed)
+    const same = j => j.prompt === undefined || !prompt || String(j.prompt).trim().slice(0, 60) === String(prompt).trim().slice(0, 60);
+    if (!id) id = jobs.find(j => j.kind === kind && !before.has(j.id) && same(j))?.id || null;
+    return id ? jobs.find(j => j.id === id) : null;
+  };
+}
+function watchJob(kind, prompt) {
   // The synchronous image call gives no progress; the job list does (and the
   // progress-only list of incognito jobs).
+  const mine = ourJob(kind, prompt);
   const tick = setInterval(() => {
-    const j = [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.kind === kind && (j.status === "in_progress" || j.status === "queued"));
-    if (j) { imgJobId = j.id; progress("img", j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`, j.progress); }
+    const j = mine();
+    if (j && (j.status === "in_progress" || j.status === "queued")) { imgJobId = j.id; progress("img", j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`, j.progress); }
   }, 700);
   return () => { clearInterval(tick); progress("img", null); imgJobId = null; };
 }
@@ -2371,7 +2467,7 @@ $("#img-form").onsubmit = async e => {
   if ($("#img-steps").value) body.steps = +$("#img-steps").value;
   if ($("#img-seed").value) body.seed = +$("#img-seed").value;
   if ($("#img-neg").value) body.negative_prompt = $("#img-neg").value;
-  $("#img-go").disabled = true; progress("img", "Starting", 1); const stop = watchJob("image");
+  $("#img-go").disabled = true; progress("img", "Starting", 1); const stop = watchJob("image", body.prompt);
   try {
     const r = await api(refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
     stageAdd("img", r.data.map(d => ({url: fileUrl(d.url), prompt: body.prompt, expires: expiry("img")})));
@@ -2460,10 +2556,11 @@ function spProgress(text, pct) {
   if (text === null) { bar.hidden = true; return; }
   bar.hidden = false; $("#sp-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
-function watchSpeech() {
+function watchSpeech(input) {
+  const mine = ourJob("speech", input);
   const tick = setInterval(() => {
-    const j = [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.kind === "speech" && (j.status === "in_progress" || j.status === "queued"));
-    if (j) { spJobId = j.id; spProgress(j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`, j.progress); }
+    const j = mine();
+    if (j && (j.status === "in_progress" || j.status === "queued")) { spJobId = j.id; spProgress(j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`, j.progress); }
   }, 700);
   return () => { clearInterval(tick); spProgress(null); spJobId = null; };
 }
@@ -2497,7 +2594,7 @@ $("#sp-form").onsubmit = async e => {
     if (!$("#sp-desc").value.trim()) return toast("Describe the voice first, or pick one", true);
     body.instructions = $("#sp-desc").value.trim();
   } else body.voice = voice;
-  $("#sp-go").disabled = true; spProgress("Starting", 1); const stop = watchSpeech();
+  $("#sp-go").disabled = true; spProgress("Starting", 1); const stop = watchSpeech(body.input);
   try {
     const r = await fetch("/api/play/speech", {method: "POST", headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-OAIY-Incognito": "1"} : {}), body: JSON.stringify(body)});
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j?.error?.message || r.statusText); }
@@ -2662,7 +2759,7 @@ function renderGallery(fresh) {
       : j.kind === "sound" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13"/></svg></div>`
       : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="3D model" loading="lazy">` : `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></div>`)
       : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(j.prompt)}" loading="lazy">`;
-    return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.kind === "model3d" ? "3D model" : j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "model3d" ? j.size : j.kind === "video" || j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
+    return `<figure data-job="${j.id}" tabindex="0" role="button" aria-label="Open ${esc(j.kind === "model3d" ? "the 3D model" : "the result")}">${media}<figcaption><span class="p">${esc(j.kind === "model3d" ? "3D model" : j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "model3d" ? j.size : j.kind === "video" || j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
   }, '<div class="empty">Nothing here yet. Generate something in the Playground.</div>');
   $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
 }
@@ -2714,7 +2811,6 @@ async function renderCompanion() {
   const route = cfg && routeFor("discovery");
   const urls = [route ? base + route.path : null, base + "/.well-known/oaiy.json"].filter(Boolean);
   $("#disc-urls").innerHTML = urls.map(u => `<div class="endpoint"><span class="muted">Discovery</span><code>${esc(u)}</code><button class="btn quiet" data-copy="${esc(u)}">Copy</button></div>`).join("");
-  $$("#disc-urls [data-copy]").forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")));
   try { $("#disc-json").textContent = JSON.stringify(await api("/api/discovery"), null, 2); } catch (e) { $("#disc-json").textContent = e.message; }
 }
 $("#disc-refresh").onclick = renderCompanion;
@@ -2727,12 +2823,19 @@ addEventListener("keydown", e => {
 /* ---------- logs ---------- */
 let logSource = "studio", logAfter = 0;
 $$("#v-logs .tabs button").forEach(b => b.onclick = () => { $$("#v-logs .tabs button").forEach(x => x.setAttribute("aria-selected", x === b)); logSource = b.dataset.log; pollLogs(true); });
+// (each read says which log it is for: one answered after the tab changed is another log's, and left out; the log
+// keeps its last lines, not every line of a day)
+let logAsk = 0;
+const LOG_KEPT = 2000;
 async function pollLogs(reset) {
   if (reset) { logAfter = 0; $("#log").textContent = ""; }
+  const asked = ++logAsk, source = logSource;
   try {
-    const r = await api(`/api/logs?source=${logSource}&after=${logAfter}`);
+    const r = await api(`/api/logs?source=${source}&after=${logAfter}`);
+    if (asked !== logAsk || source !== logSource) return;
     const el = $("#log"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
     for (const l of r.lines) { el.append(new Date(l.t).toLocaleTimeString() + "  " + l.line + "\n"); logAfter = l.n; }
+    while (el.childNodes.length > LOG_KEPT) el.firstChild.remove();
     if (atEnd || reset) el.scrollTop = el.scrollHeight;
   } catch {}
 }
@@ -2750,7 +2853,7 @@ const DL_ICONS = {
   model3d: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/>',
   picture: '<path d="M4 20l7-7M14 4l6 6M12 6l6 6-8 8H4v-6z"/>'
 };
-const dlSize = n => n >= 1e12 ? (n / 1e12).toFixed(1) + " TB" : n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : n >= 1e6 ? (n / 1e6).toFixed(0) + " MB" : Math.max(1, Math.round(n / 1e3)) + " KB";
+const dlSize = n => !n ? "nothing" : n >= 1e12 ? (n / 1e12).toFixed(1) + " TB" : n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : n >= 1e6 ? (n / 1e6).toFixed(0) + " MB" : Math.max(1, Math.round(n / 1e3)) + " KB";
 const dur = s => !isFinite(s) || s <= 0 ? "" : s < 90 ? Math.round(s) + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
 const dlBusy = d => d && ["queued", "downloading", "adding"].includes(d.status);
 async function refreshDownloads(full) {
@@ -2759,7 +2862,7 @@ async function refreshDownloads(full) {
   // A model finished: the model list changed on the studio's side.
   for (const m of dl.models) {
     if (m.download?.status === "done" && !dlLastDone.has(m.id)) {
-      dlLastDone.add(m.id);
+      dlLastDone.add(m.id); forgetPlans(m.id);
       if (full !== "first") { toast(`${m.name} is ready: ${(m.download.added || []).join(", ") || "added"}`); loadConfig(); }
     }
   }
@@ -2769,20 +2872,21 @@ function renderDownloads() {
   if (!dlDirEdited) $("#dl-dir").value = dl.dir;
   $("#dl-free").innerHTML = dl.free != null ? `<span>${dlSize(dl.free)} free on this drive</span>` : "";
   $("#dl-token").placeholder = dl.token ? "A token is saved (type a new one to replace it)" : "hf_… (read access)";
+  // (each part kept from one render to the next where it is what it was: the cards are read every second, and a
+  // card written whole each time closed its open list of files, took the keyboard's place away, and lost a click)
   const groups = [{id: "recommended", name: "Recommended"}, {id: "all", name: "All"}, ...dl.groups];
-  $("#dl-groups").innerHTML = groups.map(g => `<button aria-pressed="${g.id === dlGroup}" data-group="${esc(g.id)}">${esc(g.name)}</button>`).join("");
-  $$("#dl-groups button").forEach(b => b.onclick = () => { dlGroup = b.dataset.group; renderDownloads(); });
+  keepRows($("#dl-groups"), groups, g => `<button aria-pressed="${g.id === dlGroup}" data-group="${esc(g.id)}">${esc(g.name)}</button>`, "");
   const groupName = Object.fromEntries(dl.groups.map(g => [g.id, g.name]));
   const shown = dl.models.filter(m => dlGroup === "all" || (dlGroup === "recommended" ? m.recommended : m.group === dlGroup));
-  $("#dl-grid").innerHTML = shown.map(m => dlCard(m, groupName[m.group] || m.group)).join("") || '<div class="empty">Nothing here.</div>';
-  $$("#dl-grid [data-dl]").forEach(b => b.onclick = () => dlAct(b.dataset.dl, b.dataset.id));
+  keepRows($("#dl-grid"), shown, m => dlCard(m, groupName[m.group] || m.group), '<div class="empty">Nothing here.</div>');
+  restorePlanLists();
   // The queue: what is downloading, waiting or paused.
   const active = dl.models.filter(m => m.download && ["queued", "downloading", "adding", "paused"].includes(m.download.status));
-  $("#dl-queue").innerHTML = active.map(m => {
+  keepRows($("#dl-queue"), active, m => {
     const d = m.download, pct = d.total ? Math.min(100, d.done / d.total * 100) : 0;
     const what = d.status === "queued" ? "Waiting its turn" : d.status === "paused" ? "Paused" : d.status === "adding" ? "Adding to your models" : `${pct.toFixed(0)}%`;
     return `<div class="dl-q"><strong>${esc(m.name)}</strong><div class="meter"><div style="width:${pct}%;background:var(--gpu)"></div></div><span class="muted">${what}</span></div>`;
-  }).join("");
+  }, "");
   const n = dl.models.filter(m => dlBusy(m.download)).length;
   $("#get-count").hidden = !n; $("#get-count").textContent = n;
 }
@@ -2790,24 +2894,50 @@ function renderDownloads() {
 const dlPlans = {};
 async function dlPlan(id) {
   dlPlans[id] = {loading: true}; renderDownloads();
-  try { dlPlans[id] = await api("/api/downloads/plan", {method: "POST", body: {id}}); }
+  // (for the folder in the box, saved or not: the one a download would go to now)
+  try { dlPlans[id] = await api("/api/downloads/plan", {method: "POST", body: {id, dir: $("#dl-dir").value.trim()}}); }
   catch (e) { dlPlans[id] = {error: e.message}; }
   renderDownloads();
 }
+// (a plan said is out of date once the folder or the token changes, or the model's download moves on)
+function forgetPlans(id) { for (const k of Object.keys(dlPlans)) if (!id || k === id) delete dlPlans[k]; }
 function planHtml(p) {
   if (!p) return "";
   if (p.loading) return `<div class="line"><span>Looking at its files…</span></div>`;
   if (p.error) return `<div class="err">${esc(p.error)}</div>`;
   const said = [`<b>${dlSize(p.download_bytes)}</b> to download`];
-  if (p.elsewhere_bytes) said.push(`<span class="have">${dlSize(p.elsewhere_bytes)} on this computer already, used where it is</span>`);
+  if (p.elsewhere_bytes) said.push(`<span class="have">${dlSize(p.elsewhere_bytes)} on this computer already, used where it is${p.copy_bytes ? ` (${dlSize(p.copy_bytes)} of it copied: no link can be made across drives here)` : ""}</span>`);
   if (p.network_bytes) said.push(`<span class="have">${dlSize(p.network_bytes)} from ${esc([...new Set(p.files.filter(f => f.status === "network").map(f => f.from))].join(", "))} over OAIY Network</span>`);
   if (p.here_bytes) said.push(`${dlSize(p.here_bytes)} in place`);
-  const files = p.files.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${f.status === "download" ? "to download" : f.status === "here" ? "in place" : f.status === "network" ? "from " + esc(f.from || "") + " (OAIY Network)" : "on this computer: " + esc(f.from || "")}</span></li>`).join("");
-  return `<div class="dl-plan"><div><span>${said.join(" · ")}</span></div>${p.files.length > 1 ? `<details><summary>Its ${p.files.length} files</summary><ul>${files}</ul></details>` : ""}</div>`;
+  const notes = [];
+  const names = (p.needs || []).map(n => dl?.models.find(m => m.id === n)?.name || n);
+  if (names.length) notes.push(`It needs ${esc(names.join(" and "))} too, which ${names.length > 1 ? "are" : "is"} downloaded first.`);
+  const taken = (p.download_bytes || 0) + (p.network_bytes || 0) + (p.copy_bytes || 0);
+  if (p.free != null && taken + 1e9 > p.free) notes.push(`<span class="err">The drive has ${dlSize(p.free)} free, and this takes ${dlSize(taken)}: choose another folder, or make room.</span>`);
+  if (p.ram_gb) notes.push(`It needs ${esc(p.ram_gb)} GB of this computer's memory to run.`);
+  if (p.files.some(f => f.status === "elsewhere" && !f.checked)) notes.push("A file here as large as one it needs is read first, to be sure it is that file.");
+  const files = p.files.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${f.status === "download" ? "to download" : f.status === "here" ? "in place" : f.status === "network" ? "from " + esc(f.from || "") + " (OAIY Network)" : (f.copy ? "copied from " : "on this computer: ") + esc(f.from || "")}</span></li>`).join("");
+  return `<div class="dl-plan"><div><span>${said.join(" · ")}</span></div>${notes.map(n => `<div class="line"><span>${n}</span></div>`).join("")}${p.files.length > 1 ? `<details data-plan="${esc(p.id)}"><summary>Its ${p.files.length} files</summary><ul>${files}</ul></details>` : ""}</div>`;
+}
+// Whether a plan's list of files is open, by model: open when the plan is first shown, then as the person leaves it
+// (the cards are read every second; a card drawn again for another reason opens or closes its list as it was).
+const dlPlanOpen = {};
+document.addEventListener("toggle", e => { const d = e.target; if (d?.matches?.("details[data-plan]")) dlPlanOpen[d.dataset.plan] = d.open; }, true);
+function restorePlanLists() {
+  for (const d of $$("#dl-grid details[data-plan]")) if (!d.dataset.kept) { d.open = dlPlanOpen[d.dataset.plan] !== false; d.dataset.kept = "1"; }
+}
+// What Download says it does, once the plan is known: what comes from the internet, else from a computer on the
+// network, else that all of it is here (and only then).
+function getLabel(p) {
+  if (!p || p.loading || p.error || p.download_bytes == null) return "Download";
+  if (p.download_bytes) return "Download " + dlSize(p.download_bytes);
+  if (p.network_bytes) return "Get it (" + dlSize(p.network_bytes) + " over the network)";
+  if ((p.needs || []).length || p.files.some(f => f.status === "elsewhere" && !f.checked)) return "Get it";
+  return "Add it (all here)";
 }
 function dlCard(m, group) {
   const d = m.download, busy = dlBusy(d);
-  const facts = [`<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`, `<span>GPU <b>${m.vram_gb} GB+</b></span>`, `<span>${esc(m.license)}</span>`];
+  const facts = [`<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`, `<span>GPU <b>${m.vram_gb} GB+</b></span>`, `<span title="${esc(m.license)}">${esc(m.license)}</span>`];
   const gated = m.gated ? `<div class="dl-gated"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg><span>Its licence is accepted on huggingface.co first, then a token is saved here${dl.token ? " (one is saved)" : ""}.</span></div>` : "";
   let state = "", actions = "";
   if (d && d.status === "downloading") {
@@ -2825,51 +2955,77 @@ function dlCard(m, group) {
     actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
   } else if (d && d.status === "failed") {
     state = `<div class="err">${esc(d.error || "The download failed.")}</div>`;
-    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button>`;
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button><button class="btn warn" data-dl="discard" data-id="${m.id}">Discard</button>`;
   } else if (m.installed || d?.status === "done") {
     state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>${d?.reused ? `<div class="line"><span>${dlSize(d.reused)} of it was on this computer already, used where it is</span></div>` : ""}${d?.lan ? `<div class="line"><span>${dlSize(d.lan)} came from ${esc((d.lan_from || []).join(", "))} over OAIY Network</span></div>` : ""}`;
     actions = `<button class="btn" data-goto-models>Open Models</button><button class="btn quiet" data-dl="add" data-id="${m.id}" title="Add it to the model list again (after it was removed)">Add again</button>`;
   } else if (m.partial) {
-    state = `<div class="line"><span>Partly downloaded</span></div>`;
-    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume download</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Discard</button>`;
+    state = `<div class="line"><span>Partly downloaded${m.at ? " in " + esc(m.at) : ""}</span></div>`;
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume download</button><button class="btn warn" data-dl="discard" data-id="${m.id}">Discard</button>`;
   } else {
     const p = dlPlans[m.id];
     state = planHtml(p);
-    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">${p && p.download_bytes != null ? (p.download_bytes ? "Download " + dlSize(p.download_bytes) : "Add it (all here)") : "Download"}</button>${p ? "" : `<button class="btn quiet" data-dl="plan" data-id="${m.id}" title="What it needs: its files here already, on this computer elsewhere, or to download">What it needs</button>`}`;
+    const ask = !p ? "What it needs" : p.loading ? "" : "Check again";
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">${getLabel(p)}</button>${ask ? `<button class="btn quiet" data-dl="plan" data-id="${m.id}" title="What it needs: its files here already, on this computer elsewhere, on a computer on the network, or to download">${ask}</button>` : ""}${p && !p.loading ? `<button class="btn quiet" data-dl="hide" data-id="${m.id}" title="Hide what it needs">Hide</button>` : ""}`;
   }
   return `<article class="dl-card${m.installed ? " installed" : ""}${busy ? " busy" : ""}" data-group="${esc(m.group)}">
     <div class="dl-head"><span class="dl-icon"><svg viewBox="0 0 24 24" aria-hidden="true">${DL_ICONS[m.group] || ""}</svg></span><span class="dl-group">${esc(group)}</span>${m.recommended ? '<span class="tag good">Recommended</span>' : ""}</div>
     <h3 class="dl-name">${esc(m.name)}</h3>
-    <div style="display:grid;gap:8px;align-content:start"><p class="dl-about">${esc(m.about)}</p><div class="dl-facts">${facts.join("")}</div>${gated}</div>
+    <div class="dl-body"><p class="dl-about">${esc(m.about)}</p><div class="dl-facts">${facts.join("")}</div>${gated}</div>
     <div class="dl-state">${state}</div>
     <div class="dl-actions">${actions}</div>
   </article>`;
 }
 async function dlAct(what, id) {
   if (what === "plan") return dlPlan(id);
+  if (what === "hide") { forgetPlans(id); delete dlPlanOpen[id]; return renderDownloads(); }
+  const m = dl?.models.find(x => x.id === id);
   try {
     const body = {id};
-    if (what === "start" || what === "add") body.dir = $("#dl-dir").value.trim();
-    if (what === "cancel") {
-      const r = await ask({title: "Cancel this download?", text: "What is downloaded so far is deleted.", buttons: [{label: "Keep it", value: null}, {label: "Cancel download", value: "ok", kind: "warn"}]});
+    // (a model partly downloaded in a folder downloads went to before: resumed, or discarded, there)
+    if (what === "start" || what === "add") body.dir = m?.at && m.partial ? m.at : $("#dl-dir").value.trim();
+    if (what === "cancel" || what === "discard") {
+      if (m?.at) body.dir = m.at;
+      const r = await ask(what === "cancel"
+        ? {title: "Cancel this download?", text: "What it downloaded is deleted. Files other models use, and files that were here before, are kept.", buttons: [{label: "Keep it", value: null}, {label: "Cancel download", value: "ok", kind: "warn"}]}
+        : {title: "Discard what is downloaded?", text: "The parts of it downloaded so far are deleted. Files other models use are kept.", buttons: [{label: "Keep them", value: null}, {label: "Discard", value: "ok", kind: "warn"}]});
       if (!r) return;
     }
-    dl = await api(what === "start" ? "/api/downloads" : `/api/downloads/${what}`, {method: "POST", body});
+    const answer = await api(what === "start" ? "/api/downloads" : `/api/downloads/${what === "discard" ? "cancel" : what}`, {method: "POST", body});
+    forgetPlans(id);
+    // (Add again answers what it added, not the downloads)
     if (what === "add") { toast("Added again"); await loadConfig(); await refreshDownloads(); return; }
+    dl = answer;
     renderDownloads();
   } catch (e) { toast(e.message, true); }
 }
-$("#dl-grid").addEventListener("click", e => { if (e.target.closest("[data-goto-models]")) show("models"); });
+$("#dl-grid").addEventListener("click", e => {
+  if (e.target.closest("[data-goto-models]")) return show("models");
+  const b = e.target.closest("[data-dl]");
+  if (b) dlAct(b.dataset.dl, b.dataset.id);
+});
+$("#dl-groups").addEventListener("click", e => { const b = e.target.closest("[data-group]"); if (b) { dlGroup = b.dataset.group; renderDownloads(); } });
+document.addEventListener("click", e => { const b = e.target.closest("[data-copy]"); if (b) navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")); });
+// (a result opened from the keyboard too: Enter or Space on a gallery picture or an Overview thumbnail)
+document.addEventListener("keydown", e => {
+  const t = e.target.closest?.("figure[data-job], img[data-job]");
+  if (t && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openViewer(t.dataset.job); }
+});
 $$("[data-goto]").forEach(b => b.onclick = () => show(b.dataset.goto));
-$("#dl-dir").oninput = () => { dlDirEdited = true; $("#dl-dir-save").hidden = false; };
+$("#dl-dir").oninput = () => { dlDirEdited = true; $("#dl-dir-save").hidden = false; forgetPlans(); renderDownloads(); };
 $("#dl-browse").onclick = () => pick({dir: true, title: "Choose the folder to save models in", start: $("#dl-dir").value}, p => { $("#dl-dir").value = p; dlDirEdited = true; $("#dl-dir-save").hidden = false; });
 $("#dl-dir-save").onclick = async () => {
-  try { dl = await api("/api/downloads/settings", {method: "POST", body: {dir: $("#dl-dir").value.trim()}}); dlDirEdited = false; $("#dl-dir-save").hidden = true; toast("New downloads go to " + dl.dir); await loadConfig(); renderDownloads(); }
+  try { dl = await api("/api/downloads/settings", {method: "POST", body: {dir: $("#dl-dir").value.trim()}}); forgetPlans(); dlDirEdited = false; $("#dl-dir-save").hidden = true; toast("New downloads go to " + dl.dir); await loadConfig(); renderDownloads(); }
   catch (e) { toast(e.message, true); }
 };
 $("#dl-token-save").onclick = async () => {
   const t = $("#dl-token").value.trim();
-  try { dl = await api("/api/downloads/settings", {method: "POST", body: {hf_token: t}}); $("#dl-token").value = ""; toast(t ? "Token saved" : "Token removed"); await loadConfig(); renderDownloads(); }
+  // (an empty box removes the saved token: asked first; with none saved there is nothing to do)
+  if (!t) {
+    if (!dl?.token) return toast("Type a Hugging Face token (read access) to save it", true);
+    if (!await ask({title: "Remove the saved token?", text: "Gated models (their licence accepted on huggingface.co) cannot be downloaded without one.", buttons: [{label: "Keep it", value: null}, {label: "Remove", value: "ok", kind: "warn"}]})) return;
+  }
+  try { dl = await api("/api/downloads/settings", {method: "POST", body: {hf_token: t}}); forgetPlans(); $("#dl-token").value = ""; toast(t ? "Token saved" : "Token removed"); await loadConfig(); renderDownloads(); }
   catch (e) { toast(e.message, true); }
 };
 function renderFirstRun() {
@@ -2880,7 +3036,10 @@ function renderFirstRun() {
 
 /* ---------- polling ---------- */
 async function refresh() {
-  try { state = await api("/api/state"); keyed(state.media.jobs); renderState(); } catch (e) { $("#foot-llm-text").textContent = "Studio unreachable"; }
+  // (unreachable is said where the studio did not answer, not where the page could not draw what it answered)
+  try { state = await api("/api/state"); } catch (e) { $("#foot-llm-text").textContent = "Studio unreachable"; return; }
+  // (a part of the page that could not be drawn is said in the console, and the rest of the page goes on)
+  try { keyed(state.media.jobs); renderState(); } catch (e) { console.error(e); }
   // (the eGPU's memory and load are the state's: shown as they come)
   if (sys && state?.egpu?.usage && $("#v-overview").classList.contains("on")) renderHardware();
 }

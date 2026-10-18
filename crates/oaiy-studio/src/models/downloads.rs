@@ -146,45 +146,80 @@ fn percent_encode(path: &str) -> String {
     out
 }
 
-/// Runs curl to completion, returning its stdout (text).
-fn curl_text(cfg: &Json, url: &str, auth: Option<&str>, head: bool) -> Result<String, String> {
+const NO_CURL: &str = "OAIY downloads models with the curl program, which Windows 10 and later, macOS and Linux include";
+
+/// The Hugging Face token said to curl on its standard input (`--config -`), never on its command line, which any
+/// program on the computer can read in the list of processes: what to write to curl once it is started.
+fn token_to_curl(c: &mut Command, token: Option<&str>) -> Option<String> {
+    let t = token?;
+    c.args(["--config", "-"]).stdin(Stdio::piped());
+    Some(format!("header = \"Authorization: Bearer {}\"\n", t.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
+/// Give a started curl what [`token_to_curl`] asked to be written to it.
+fn feed(child: &mut Child, said: Option<String>) {
+    use std::io::Write;
+    if let (Some(text), Some(mut stdin)) = (said, child.stdin.take()) {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+}
+
+/// Runs curl to completion, returning its stdout (text). `gated`: the model's licence is accepted first (said so
+/// where Hugging Face refuses).
+fn curl_text(cfg: &Json, url: &str, auth: Option<&str>, head: bool, gated: bool) -> Result<String, String> {
     let mut c = command(&curl_program(cfg));
     c.args(["-sS", "-L", "--fail", "--connect-timeout", "30", "--max-time", "120", "-H", "User-Agent: oaiy-studio"]);
     if head {
         c.arg("-I");
     }
-    if let Some(t) = auth {
-        c.args(["-H", &format!("Authorization: Bearer {t}")]);
-    }
-    c.arg(url);
-    let out = c.output().map_err(|e| format!("could not run curl ({e}): OAIY downloads models with the curl program, which Windows 10 and later, macOS and Linux include"))?;
+    let said = token_to_curl(&mut c, auth);
+    c.arg(url).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("could not run curl ({e}): {NO_CURL}"))?;
+    feed(&mut child, said);
+    let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
-        return Err(curl_error(&String::from_utf8_lossy(&out.stderr), url));
+        return Err(curl_error(&String::from_utf8_lossy(&out.stderr), url, gated));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// curl's complaint, in words a person can act on.
-fn curl_error(stderr: &str, url: &str) -> String {
+/// The HTTP status curl's `--fail` said it was refused with ("The requested URL returned error: 403").
+fn refused_with(stderr: &str) -> Option<u16> {
+    let at = stderr.find("returned error: ")? + "returned error: ".len();
+    stderr[at..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+}
+
+/// curl's complaint, in words a person can act on. `gated`: the model's licence is accepted on huggingface.co first.
+fn curl_error(stderr: &str, url: &str, gated: bool) -> String {
     let e = stderr.trim();
     let repo = url.strip_prefix("https://huggingface.co/").map(|r| r.trim_start_matches("api/models/")).and_then(|r| {
         let mut p = r.split('/');
         Some(format!("{}/{}", p.next()?, p.next()?))
     });
-    if e.contains("401") || e.contains("403") {
-        return match repo {
-            Some(r) => format!("{r} is gated: sign in on huggingface.co, accept its licence at https://huggingface.co/{r}, then add a Hugging Face access token (read) in OAIY's Settings or on Get models"),
-            None => format!("{url} refused the download ({e})"),
-        };
+    let host = url.split('/').take(3).collect::<Vec<_>>().join("/");
+    // (curl's own error number, `curl: (28) …`: not any number in what it said, which may be a time or a size)
+    let code = |n: u32| e.contains(&format!("curl: ({n})"));
+    match refused_with(e) {
+        Some(401 | 403) if gated => {
+            return match repo {
+                Some(r) => format!("{r} is gated: sign in on huggingface.co, accept its licence at https://huggingface.co/{r}, then add a Hugging Face access token (read) in OAIY's Settings or on Get models"),
+                None => format!("{url} refused the download: its licence is accepted first, with a Hugging Face token"),
+            };
+        }
+        Some(401) => return format!("{host} asked for a sign-in (HTTP 401): the model may be private; a Hugging Face token (read) in OAIY's Settings or on Get models may let it download"),
+        Some(403) => return format!("{host} refused the download (HTTP 403): its download link may have expired; try again"),
+        Some(404) => return format!("{url} was not found (the catalog may be older than the model's page)"),
+        Some(n) => return format!("{host} answered HTTP {n}: try again later"),
+        None => {}
     }
-    if e.contains("404") {
-        return format!("{url} was not found (the catalog may be older than the model's page)");
-    }
-    if e.contains("(23)") || e.to_ascii_lowercase().contains("no space") {
+    if code(23) || e.to_ascii_lowercase().contains("no space") {
         return "writing the file failed: is the disk full?".into();
     }
-    if e.contains("(6)") || e.contains("(7)") || e.contains("(28)") || e.contains("(35)") {
-        return format!("could not reach {} ({e}); check the internet connection", url.split('/').take(3).collect::<Vec<_>>().join("/"));
+    if code(28) {
+        return format!("{host} stopped sending (curl timed out): resume the download to carry on");
+    }
+    if code(6) || code(7) || code(35) {
+        return format!("could not reach {host} ({e}); check the internet connection");
     }
     if e.is_empty() {
         "curl failed".into()
@@ -201,7 +236,8 @@ fn plan(cfg: &Json, entry: &Json, dir: &Path, token: Option<&str>) -> Result<Vec
         let repo = str_or(part, "repo", "");
         if !repo.is_empty() {
             let rev = str_or(part, "revision", "main");
-            let list = curl_text(cfg, &format!("https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true"), token, false)?;
+            let gated = entry.get("gated").and_then(Json::as_bool).unwrap_or(false);
+            let list = curl_text(cfg, &format!("https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=true"), token, false, gated)?;
             let tree = Json::parse(list.as_bytes()).map_err(|e| format!("{repo}: the file list did not read ({e})"))?;
             let (include, exclude) = (strings(part.get("include")), strings(part.get("exclude")));
             for f in tree.as_array().unwrap_or(&[]) {
@@ -237,7 +273,7 @@ fn plan(cfg: &Json, entry: &Json, dir: &Path, token: Option<&str>) -> Result<Vec
 }
 
 fn head_size(cfg: &Json, url: &str) -> Option<u64> {
-    let headers = curl_text(cfg, url, None, true).ok()?;
+    let headers = curl_text(cfg, url, None, true, false).ok()?;
     headers.lines().filter_map(|l| l.split_once(':')).filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).filter_map(|(_, v)| v.trim().parse().ok()).last()
 }
 
@@ -270,6 +306,15 @@ pub fn free_space(dir: &Path) -> Option<u64> {
         let text = String::from_utf8_lossy(&out.stdout);
         let kb: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
         Some(kb * 1024)
+    }
+}
+
+/// Whether planned file `f` is in place: as large as it should be, and not a file whose SHA-256 is known to be another
+/// file's (one as large, but not it, is fetched again).
+fn in_place(studio_root: &Path, f: &Planned) -> bool {
+    match f.size {
+        Some(s) => size_of(&f.dest) == s && !f.sha256.as_deref().is_some_and(|want| library::known(studio_root, &f.dest).is_some_and(|h| h != want)),
+        None => f.dest.is_file(),
     }
 }
 
@@ -341,9 +386,36 @@ struct Download {
     lan_from: Vec<String>,
     /// The Hugging Face token given with it (never said back).
     token: Option<String>,
+    /// Where each of its files goes (a file another download wants is not deleted with this one), and the files this
+    /// download put there (deleted with it when it is cancelled, unless another model uses them).
+    planned: Vec<PathBuf>,
+    fetched: Vec<PathBuf>,
 }
 
 impl Download {
+    fn new(id: &str, dir: &Path, token: Option<String>) -> Download {
+        Download {
+            id: id.to_string(),
+            dir: dir.to_path_buf(),
+            status: "queued",
+            done: 0,
+            total: 0,
+            file: String::new(),
+            files_done: 0,
+            files_total: 0,
+            speed: 0.,
+            error: None,
+            added: Vec::new(),
+            reused: 0,
+            reused_files: 0,
+            lan: 0,
+            lan_from: Vec::new(),
+            token,
+            planned: Vec::new(),
+            fetched: Vec::new(),
+        }
+    }
+
     fn to_json(&self) -> Json {
         Json::obj([
             ("id", Json::str(&self.id)),
@@ -393,8 +465,9 @@ fn peer_files() -> Option<Arc<dyn PeerFiles>> {
 pub struct Downloads {
     list: Mutex<Vec<Download>>,
     want: Mutex<HashMap<String, Want>>,
-    /// The curl fetching a file now.
+    /// The curl fetching a file now, and whether it was stopped here (a pause), not failed.
     child: Mutex<Option<Child>>,
+    stopped: Mutex<bool>,
     wake: Condvar,
     worker: Mutex<bool>,
     free: Mutex<Option<(PathBuf, Instant, Option<u64>)>>,
@@ -418,6 +491,7 @@ impl Downloads {
 
     fn stop_child(&self) {
         if let Some(c) = self.child.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            *self.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
             let _ = c.kill();
         }
     }
@@ -457,26 +531,13 @@ impl Downloads {
                         d.dir = dir.clone();
                         d.token = token.clone().or(d.token.take());
                     }
-                    None => list.push(Download {
-                        id: id.clone(),
-                        dir: dir.clone(),
-                        status: "queued",
-                        done: 0,
-                        total: 0,
-                        file: String::new(),
-                        files_done: 0,
-                        files_total: 0,
-                        speed: 0.,
-                        error: None,
-                        added: Vec::new(),
-                        reused: 0,
-                        reused_files: 0,
-                        lan: 0,
-                        lan_from: Vec::new(),
-                        token: token.clone(),
-                    }),
+                    None => list.push(Download::new(id, &dir, token.clone())),
                 }
             }
+        }
+        // (a folder other than where downloads go, kept: what is partly downloaded there is found after a restart)
+        if dir != default_dir(studio) {
+            remember_dir(studio, &dir);
         }
         self.ensure_worker(studio);
         self.wake.notify_all();
@@ -499,21 +560,74 @@ impl Downloads {
         self.state(studio)
     }
 
-    /// Stop `id` and delete its partial files.
-    pub fn cancel(&self, studio: &Studio, id: &str) -> Json {
+    /// Stop `id` and delete what it downloaded: its partial files, and the files it put in place, except any another
+    /// model uses. `dir`: where it is partly downloaded, where no download of it is listed (after a restart).
+    pub fn cancel(&self, studio: &Studio, id: &str, dir: Option<PathBuf>) -> Json {
         self.want.lock().unwrap_or_else(|p| p.into_inner()).insert(id.to_string(), Want::Cancel);
         let (active, dir) = {
             let list = self.list.lock().unwrap_or_else(|p| p.into_inner());
             let d = list.iter().find(|d| d.id == id);
-            (d.is_some_and(|d| d.status == "downloading"), d.map(|d| d.dir.clone()).unwrap_or_else(|| default_dir(studio)))
+            (d.is_some_and(|d| d.status == "downloading"), d.map(|d| d.dir.clone()).or(dir).unwrap_or_else(|| default_dir(studio)))
         };
         if active {
             self.stop_child();
         } else {
-            remove_partials(id, &dir);
+            self.discard(id, &dir);
             self.update(id, |d| d.status = "cancelled");
         }
         self.state(studio)
+    }
+
+    /// What other models use, among the files in `dir`: the files another download (listed, not cancelled) puts in
+    /// place, and those another downloaded model's markers list.
+    fn used_by_others(&self, id: &str, dir: &Path) -> std::collections::HashSet<PathBuf> {
+        let mut used: std::collections::HashSet<PathBuf> = self
+            .list
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|d| d.id != id && d.status != "cancelled")
+            .flat_map(|d| d.planned.iter().cloned())
+            .collect();
+        for other in entries().iter().filter(|e| str_or(e, "id", "") != id) {
+            let oid = str_or(other, "id", "");
+            for part in other.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
+                let Some(m) = marker(dir, part, oid).filter(|m| m.is_file()) else { continue };
+                let listed = std::fs::read(&m).ok().and_then(|b| Json::parse(&b).ok());
+                for f in listed.as_ref().and_then(|l| l.get("files")).and_then(Json::as_array).unwrap_or(&[]) {
+                    if let Some(rel) = f.as_str() {
+                        used.insert(under(dir, &rel.replace('\\', "/")).unwrap_or_else(|_| dir.join(rel)));
+                    }
+                }
+            }
+        }
+        used
+    }
+
+    /// Delete what `id` downloaded into `dir`: its partial files and the files this download put in place (a link
+    /// removed is the link alone), its markers, and the folders that leaves empty; never a file another model uses.
+    fn discard(&self, id: &str, dir: &Path) {
+        let used = self.used_by_others(id, dir);
+        let fetched = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
+        remove_partials(id, dir, &used);
+        for f in fetched.iter().filter(|f| !used.contains(*f)) {
+            let _ = std::fs::remove_file(f);
+        }
+        if let Some(e) = entry(id) {
+            for part in e.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
+                if let Some(m) = marker(dir, part, id) {
+                    let _ = std::fs::remove_file(&m);
+                }
+                if let Ok(folder) = under(dir, str_or(part, "into", "")) {
+                    remove_empty(&folder);
+                }
+            }
+        }
+        self.update(id, |d| {
+            d.fetched.clear();
+            d.done = 0;
+        });
+        library::forget_scan();
     }
 
     /// Add a downloaded model to the model list again.
@@ -533,6 +647,7 @@ impl Downloads {
         let dir = default_dir(studio);
         let cfg = studio.config();
         let list = self.list.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let elsewhere = remembered_dirs(studio);
         let models: Vec<Json> = entries()
             .iter()
             .map(|e| {
@@ -543,12 +658,18 @@ impl Downloads {
                 };
                 o.retain(|(k, _)| k != "parts" && k != "add");
                 let d = list.iter().find(|d| d.id == id);
-                let where_ = d.map(|d| d.dir.clone()).unwrap_or_else(|| dir.clone());
+                // (with no download of it listed, where it is: where downloads go, else a folder they went to before)
+                let where_ = d.map(|d| d.dir.clone()).unwrap_or_else(|| {
+                    std::iter::once(dir.clone()).chain(elsewhere.iter().cloned()).find(|f| installed(e, f) || partial(e, f)).unwrap_or_else(|| dir.clone())
+                });
                 let have = installed(e, &where_);
                 o.push(("installed".into(), Json::Bool(have)));
                 // (a model all of whose parts are done is installed, not partly downloaded: each part's marker is
                 // what says a part is done)
                 o.push(("partial".into(), Json::Bool(d.is_none() && !have && partial(e, &where_))));
+                if where_ != dir {
+                    o.push(("at".into(), Json::str(where_.to_string_lossy())));
+                }
                 o.push(("download".into(), d.map_or(Json::Null, Download::to_json)));
                 Json::Obj(o)
             })
@@ -567,9 +688,10 @@ impl Downloads {
     /// read when it is got), on a computer on the network (OAIY Network: fetched from it), or to download; and the
     /// bytes of each, the folder's free space, and the models it needs that are not here yet. Asks Hugging Face for
     /// the files' list (`token`: as for [`Downloads::start`]).
-    pub fn plan_of(&self, studio: &Studio, id: &str, token: Option<String>) -> Result<Json, String> {
+    pub fn plan_of(&self, studio: &Studio, id: &str, token: Option<String>, dir: Option<PathBuf>) -> Result<Json, String> {
         let e = entry(id).ok_or_else(|| format!("no model {id} in the catalog"))?;
-        let dir = default_dir(studio);
+        // (the folder the download would go to: the one the page has in its box, saved or not, else where downloads go)
+        let dir = dir.filter(|d| d.is_absolute()).unwrap_or_else(|| default_dir(studio));
         let cfg = studio.config();
         let token = token_for(&cfg, token.as_deref());
         let files = plan(&cfg, e, &dir, token.as_deref())?;
@@ -578,9 +700,9 @@ impl Downloads {
         let mut said: Vec<(&'static str, Option<String>, Option<bool>)> = files
             .iter()
             .map(|f| {
-                if f.size.is_some_and(|s| size_of(&f.dest) == s) {
+                if in_place(&studio.root, f) {
                     ("here", None, None)
-                } else if let Some((from, checked)) = f.size.filter(|s| *s >= library::MIN_BYTES).and_then(|s| library::likely(&studio.root, &here, s, f.sha256.as_deref())) {
+                } else if let Some((from, checked)) = f.size.filter(|s| *s >= library::MIN_BYTES).zip(f.sha256.as_deref()).and_then(|(s, sha)| library::likely(&studio.root, &here, s, sha)) {
                     ("elsewhere", Some(from.to_string_lossy().into_owned()), Some(checked))
                 } else {
                     ("download", None, None)
@@ -603,18 +725,23 @@ impl Downloads {
                 }
             }
         }
-        let (mut at_home, mut elsewhere, mut on_network, mut to_fetch) = (0u64, 0u64, 0u64, 0u64);
+        let (mut at_home, mut elsewhere, mut on_network, mut to_fetch, mut copied) = (0u64, 0u64, 0u64, 0u64, 0u64);
         let listed: Vec<Json> = files
             .iter()
             .zip(&said)
             .map(|(f, (status, from, checked))| {
                 let size = f.size.unwrap_or(0);
                 let shown = f.dest.strip_prefix(&dir).unwrap_or(&f.dest).to_string_lossy().replace('\\', "/");
+                // (a file here put in place by a copy, where no link can be made: it takes its room again)
+                let copy = *status == "elsewhere" && from.as_deref().is_some_and(|from| library::needs_copy(Path::new(from), &f.dest));
                 match *status {
                     "here" => at_home += size,
                     "elsewhere" => elsewhere += size,
                     "network" => on_network += size.saturating_sub(size_of(&part_path(&f.dest))),
                     _ => to_fetch += size.saturating_sub(size_of(&part_path(&f.dest))),
+                }
+                if copy {
+                    copied += size;
                 }
                 let mut o = vec![("path", Json::str(&shown)), ("size", f.size.map_or(Json::Null, |s| Json::Int(s as i64))), ("status", Json::str(*status))];
                 if let Some(from) = from {
@@ -622,6 +749,9 @@ impl Downloads {
                 }
                 if let Some(c) = checked {
                     o.push(("checked", Json::Bool(*c)));
+                }
+                if copy {
+                    o.push(("copy", Json::Bool(true)));
                 }
                 if let Some(sha) = &f.sha256 {
                     o.push(("sha256", Json::str(sha)));
@@ -641,6 +771,10 @@ impl Downloads {
             ("elsewhere_bytes", Json::Int(elsewhere as i64)),
             ("network_bytes", Json::Int(on_network as i64)),
             ("download_bytes", Json::Int(to_fetch as i64)),
+            ("copy_bytes", Json::Int(copied as i64)),
+            // (what it asks of the computer, from the catalog: the GPU memory, and the computer's own where it says)
+            ("vram_gb", e.get("vram_gb").cloned().unwrap_or(Json::Null)),
+            ("ram_gb", e.get("ram_gb").cloned().unwrap_or(Json::Null)),
             ("needs", Json::Arr(needs)),
             ("files", Json::Arr(listed)),
         ]))
@@ -661,7 +795,7 @@ impl Downloads {
                 } else if check {
                     library::find(&studio.root, &here, *size, sha, |_| false).map(|p| (p, true))
                 } else {
-                    library::likely(&studio.root, &here, *size, Some(sha))
+                    library::likely(&studio.root, &here, *size, sha)
                 };
                 Json::obj([
                     ("sha256", Json::str(sha)),
@@ -693,7 +827,18 @@ impl Downloads {
                     list = studio.downloads.wake.wait(list).unwrap_or_else(|p| p.into_inner());
                 }
             };
-            studio.downloads.run(&studio, &next);
+            // (a download that panics, on a file that could not be read, fails alone: the next still run)
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| studio.downloads.run(&studio, &next)));
+            if ran.is_err() {
+                if let Some(mut c) = studio.downloads.child.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    let _ = c.kill();
+                }
+                studio.downloads.update(&next, |d| {
+                    d.status = "failed";
+                    d.error = Some("the download stopped on an error of the studio's own: try again".into());
+                    d.speed = 0.;
+                });
+            }
         });
     }
 
@@ -735,7 +880,7 @@ impl Downloads {
                 });
             }
             Ok(Want::Cancel) => {
-                remove_partials(id, &dir);
+                self.discard(id, &dir);
                 studio.log.push(format!("cancelled {name}"));
                 self.update(id, |d| {
                     d.status = "cancelled";
@@ -754,24 +899,31 @@ impl Downloads {
         }
     }
 
-    /// Every file of the entry into `dir`: one this computer has already used where it is, the others downloaded and
-    /// checked; stops early when paused or cancelled.
+    /// Every file of the entry into `dir`: one this computer has already used where it is, one a computer on the
+    /// network has fetched from it, the others downloaded; each checked; stops early when paused or cancelled.
     fn fetch(&self, studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Want, String> {
         let id = str_or(e, "id", "");
+        let gated = e.get("gated").and_then(Json::as_bool).unwrap_or(false);
         let cfg = studio.config();
         let given = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).and_then(|d| d.token.clone());
         let files = plan(&cfg, e, dir, token_for(&cfg, given.as_deref()).as_deref())?;
+        self.update(id, |d| d.planned = files.iter().map(|f| f.dest.clone()).collect());
         let total: u64 = files.iter().filter_map(|f| f.size).sum();
-        let have = |f: &Planned| f.size.is_some_and(|s| size_of(&f.dest) == s) || (f.size.is_none() && f.dest.is_file());
+        let have = |f: &Planned| in_place(&studio.root, f);
         let mut done: u64 = files.iter().filter(|f| have(f)).filter_map(|f| f.size).sum();
         let partials: u64 = files.iter().filter(|f| !have(f)).map(|f| size_of(&part_path(&f.dest))).sum();
-        // (the model files on this computer, looked through once: a file wanted that is one of them is not fetched)
+        // (the model files on this computer, looked through once: a file wanted that is one of them is not fetched,
+        // and takes no room again unless it has to be copied)
         self.update(id, |d| d.file = "looking for its files on this computer".into());
         let here = library::scan(&library::roots(&studio.root, &cfg, dir));
         let found_here: u64 = files
             .iter()
             .filter(|f| !have(f))
-            .filter_map(|f| f.size.filter(|s| *s >= library::MIN_BYTES && library::likely(&studio.root, &here, *s, f.sha256.as_deref()).is_some()))
+            .filter_map(|f| {
+                let (size, sha) = (f.size.filter(|s| *s >= library::MIN_BYTES)?, f.sha256.as_deref()?);
+                let (from, _) = library::likely(&studio.root, &here, size, sha)?;
+                (!library::needs_copy(&from, &f.dest)).then_some(size)
+            })
             .sum();
         if let Some(free) = free_space(dir) {
             let need = total.saturating_sub(done + partials + found_here);
@@ -785,6 +937,7 @@ impl Downloads {
             d.files_total = files.len();
             d.files_done = files.iter().filter(|f| have(f)).count();
         });
+        let stop = || self.wanted(id) != Want::Run;
         for f in &files {
             if have(f) {
                 continue;
@@ -798,25 +951,31 @@ impl Downloads {
             if let (Some(size), Some(sha)) = (f.size.filter(|s| *s >= library::MIN_BYTES), f.sha256.as_deref()) {
                 if here.iter().any(|h| h.size == size) {
                     self.update(id, |d| d.file = format!("checking the copy of {shown} on this computer"));
-                    let found = library::find(&studio.root, &here, size, sha, |_| self.wanted(id) != Want::Run);
+                    let found = library::find(&studio.root, &here, size, sha, |_| stop());
                     let want = self.wanted(id);
                     if want != Want::Run {
                         return Ok(want);
                     }
                     if let Some(from) = found.filter(|from| *from != f.dest) {
-                        let how = library::place(&from, &f.dest)?;
+                        let base = done;
+                        let mut copying = |n: u64| self.update(id, |d| d.done = base + n);
+                        let Some(how) = library::place(&from, &f.dest, &mut copying, &stop)? else { return Ok(self.wanted(id)) };
                         let said = match how {
                             library::Placed::Linked => "uses the file at",
                             library::Placed::Pointed => "links to the file at",
                             library::Placed::Copied => "copied the file at",
                         };
                         studio.log.push(format!("{shown}: on this computer already; {said} {}", from.display()));
+                        // (known by its SHA-256 where it is now too: not read again)
+                        library::remember(&studio.root, &f.dest, sha);
+                        library::forget_scan();
                         done += size;
                         self.update(id, |d| {
                             d.done = done;
                             d.files_done += 1;
                             d.reused += size;
                             d.reused_files += 1;
+                            d.fetched.push(f.dest.clone());
                         });
                         continue;
                     }
@@ -844,7 +1003,7 @@ impl Downloads {
                         }
                         self.update(id, |d| d.done = done + now);
                     };
-                    match peers.fetch(sha, size, &part, &progress, &|| self.wanted(id) != Want::Run) {
+                    match peers.fetch(sha, size, &part, &progress, &stop) {
                         Ok(Some(name)) => from_peer = Some(name),
                         Ok(None) => {}
                         Err(err) => studio.log.push(format!("{shown}: not from the network ({err}); from Hugging Face instead")),
@@ -856,33 +1015,42 @@ impl Downloads {
                     self.update(id, |d| d.file = shown.clone());
                 }
             }
-            // A partial file that is whole already needs only its name.
-            if !f.size.is_some_and(|s| size_of(&part) == s) {
-                let want = self.curl(&cfg, id, f, &part, done)?;
-                if want != Want::Run {
-                    return Ok(want);
+            loop {
+                // A partial file that is whole already needs only its name.
+                if !f.size.is_some_and(|s| size_of(&part) == s) {
+                    let want = self.curl(&cfg, id, f, &part, done, gated)?;
+                    if want != Want::Run {
+                        return Ok(want);
+                    }
                 }
-            }
-            if let Some(s) = f.size {
-                let got = size_of(&part);
-                if got != s {
-                    return Err(format!("{shown}: got {got} bytes of {s}; resume the download to try again"));
+                if let Some(s) = f.size {
+                    let got = size_of(&part);
+                    if got != s {
+                        return Err(format!("{shown}: got {got} bytes of {s}; resume the download to try again"));
+                    }
                 }
-            }
-            // Checked whole against the SHA-256 Hugging Face publishes for it.
-            if let Some(sha) = &f.sha256 {
+                // Checked whole against the SHA-256 Hugging Face publishes for it.
+                let Some(sha) = &f.sha256 else { break };
                 self.update(id, |d| d.file = format!("checking {shown}"));
-                let read = sha256::file(&part, |_| self.wanted(id) != Want::Run).map_err(|e| format!("{shown}: {e}"))?;
+                let read = sha256::file(&part, |_| stop()).map_err(|e| format!("{shown}: {e}"))?;
                 let Some(got) = read else { return Ok(self.wanted(id)) };
-                if got != *sha {
-                    let _ = std::fs::remove_file(&part);
-                    return Err(format!("{shown} did not download whole (its SHA-256 is not the one Hugging Face publishes): it was deleted; resume the download to fetch it again"));
+                if got == *sha {
+                    break;
                 }
+                let _ = std::fs::remove_file(&part);
+                // (what a computer on the network sent was not the file: from Hugging Face now, in this same run, and
+                // not from that computer again)
+                if let Some(name) = from_peer.take() {
+                    studio.log.push(format!("{shown} from {name} was not the file (its SHA-256 is not the one Hugging Face publishes): from Hugging Face instead"));
+                    continue;
+                }
+                return Err(format!("{shown} did not download whole (its SHA-256 is not the one Hugging Face publishes): it was deleted; resume the download to fetch it again"));
             }
             std::fs::rename(&part, &f.dest).map_err(|e| format!("{}: {e}", f.dest.display()))?;
             if let Some(sha) = &f.sha256 {
                 library::remember(&studio.root, &f.dest, sha);
             }
+            library::forget_scan();
             done += f.size.unwrap_or_else(|| size_of(&f.dest));
             if let Some(name) = &from_peer {
                 studio.log.push(format!("{shown}: from {name}, over OAIY Network"));
@@ -890,6 +1058,7 @@ impl Downloads {
             self.update(id, |d| {
                 d.done = done;
                 d.files_done += 1;
+                d.fetched.push(f.dest.clone());
                 if let Some(name) = from_peer {
                     d.lan += f.size.unwrap_or(0);
                     if !d.lan_from.contains(&name) {
@@ -909,64 +1078,73 @@ impl Downloads {
     }
 
     /// One file with curl into `part`, resuming it; progress as it grows.
-    fn curl(&self, cfg: &Json, id: &str, f: &Planned, part: &Path, done_before: u64) -> Result<Want, String> {
-        let mut c = command(&curl_program(cfg));
-        c.args(["-sS", "-L", "--fail", "--retry", "3", "--retry-delay", "2", "--connect-timeout", "30", "-C", "-", "-H", "User-Agent: oaiy-studio", "-o"]).arg(part);
-        let given = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).and_then(|d| d.token.clone());
-        if let (true, Some(t)) = (f.hub, token_for(cfg, given.as_deref())) {
-            c.args(["-H", &format!("Authorization: Bearer {t}")]);
-        }
-        c.arg(&f.url).stdout(Stdio::null()).stderr(Stdio::piped());
-        let child = c.spawn().map_err(|e| format!("could not run curl ({e}): OAIY downloads models with the curl program, which Windows 10 and later, macOS and Linux include"))?;
-        *self.child.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
-        let (mut last, mut at) = (size_of(part), Instant::now());
-        let status = loop {
-            std::thread::sleep(Duration::from_millis(400));
-            let exited = {
-                let mut guard = self.child.lock().unwrap_or_else(|p| p.into_inner());
-                let c = guard.as_mut().expect("the running curl");
-                c.try_wait().map_err(|e| e.to_string())?
+    fn curl(&self, cfg: &Json, id: &str, f: &Planned, part: &Path, done_before: u64, gated: bool) -> Result<Want, String> {
+        loop {
+            let mut c = command(&curl_program(cfg));
+            // (a connection that stops sending is given up after a minute below 1 KB/s, and `--retry` tries again,
+            // rather than waiting on it for ever)
+            c.args(["-sS", "-L", "--fail", "--retry", "3", "--retry-delay", "2", "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "60", "-C", "-", "-H", "User-Agent: oaiy-studio", "-o"]).arg(part);
+            let given = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).and_then(|d| d.token.clone());
+            let said = token_to_curl(&mut c, token_for(cfg, given.as_deref()).as_deref().filter(|_| f.hub));
+            c.arg(&f.url).stdout(Stdio::null()).stderr(Stdio::piped());
+            let mut child = c.spawn().map_err(|e| format!("could not run curl ({e}): {NO_CURL}"))?;
+            feed(&mut child, said);
+            *self.stopped.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            *self.child.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
+            let (mut last, mut at) = (size_of(part), Instant::now());
+            let status = loop {
+                std::thread::sleep(Duration::from_millis(400));
+                let exited = {
+                    let mut guard = self.child.lock().unwrap_or_else(|p| p.into_inner());
+                    let c = guard.as_mut().expect("the running curl");
+                    c.try_wait().map_err(|e| e.to_string())?
+                };
+                let now = size_of(part);
+                let dt = at.elapsed().as_secs_f64();
+                if dt >= 1.0 {
+                    let rate = (now.saturating_sub(last)) as f64 / dt;
+                    self.update(id, |d| d.speed = if d.speed == 0. { rate } else { d.speed * 0.7 + rate * 0.3 });
+                    (last, at) = (now, Instant::now());
+                }
+                self.update(id, |d| d.done = done_before + now);
+                if let Some(status) = exited {
+                    break status;
+                }
+                if self.wanted(id) != Want::Run {
+                    self.stop_child();
+                }
             };
-            let now = size_of(part);
-            let dt = at.elapsed().as_secs_f64();
-            if dt >= 1.0 {
-                let rate = (now.saturating_sub(last)) as f64 / dt;
-                self.update(id, |d| d.speed = if d.speed == 0. { rate } else { d.speed * 0.7 + rate * 0.3 });
-                (last, at) = (now, Instant::now());
+            let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner()).take().expect("the running curl");
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut err);
             }
-            self.update(id, |d| d.done = done_before + now);
-            if let Some(status) = exited {
-                break status;
+            let want = self.wanted(id);
+            if want != Want::Run {
+                return Ok(want);
             }
-            if self.wanted(id) != Want::Run {
-                self.stop_child();
+            // (stopped here, a pause, and resumed before it was seen: carried on, not a failure)
+            if !status.success() && std::mem::take(&mut *self.stopped.lock().unwrap_or_else(|p| p.into_inner())) {
+                continue;
             }
-        };
-        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner()).take().expect("the running curl");
-        let mut err = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            let _ = s.read_to_string(&mut err);
+            if !status.success() {
+                return Err(curl_error(&err, &f.url, gated));
+            }
+            return Ok(Want::Run);
         }
-        let want = self.wanted(id);
-        if want != Want::Run {
-            return Ok(want);
-        }
-        if !status.success() {
-            return Err(curl_error(&err, &f.url));
-        }
-        Ok(Want::Run)
     }
 }
 
-/// Deletes the partial files of `id`'s parts in `dir`.
-fn remove_partials(id: &str, dir: &Path) {
-    fn walk(p: &Path, depth: usize) {
+/// Deletes the partial files of `id`'s parts in `dir`, except one of a file another model uses (`used`: two models
+/// downloading into one folder, the language model and the picture model that has it as its text encoder).
+fn remove_partials(id: &str, dir: &Path, used: &std::collections::HashSet<PathBuf>) {
+    fn walk(p: &Path, depth: usize, used: &std::collections::HashSet<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(p) else { return };
         for e in rd.flatten() {
             let q = e.path();
             if q.is_dir() && depth > 0 {
-                walk(&q, depth - 1);
-            } else if q.extension().is_some_and(|x| x == "part") {
+                walk(&q, depth - 1, used);
+            } else if q.extension().is_some_and(|x| x == "part") && !used.contains(&q.with_extension("")) {
                 let _ = std::fs::remove_file(&q);
             }
         }
@@ -974,11 +1152,43 @@ fn remove_partials(id: &str, dir: &Path) {
     if let Some(e) = entry(id) {
         for p in e.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
             if let Ok(folder) = under(dir, str_or(p, "into", "")) {
-                walk(&folder, 4);
+                walk(&folder, 4, used);
             }
         }
     }
 }
+
+/// Remove `dir` and the folders in it that hold nothing.
+fn remove_empty(dir: &Path) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty(&e.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// The folders downloads went to besides the one they go to now (`download-dirs.json` beside the settings): what is
+/// partly downloaded there is found after a restart.
+fn remembered_dirs(studio: &Studio) -> Vec<PathBuf> {
+    std::fs::read(studio.root.join(DIRS_FILE))
+        .ok()
+        .and_then(|b| Json::parse(&b).ok())
+        .and_then(|j| j.as_array().map(|a| a.iter().filter_map(Json::as_str).map(PathBuf::from).collect()))
+        .unwrap_or_default()
+}
+
+fn remember_dir(studio: &Studio, dir: &Path) {
+    let mut dirs = remembered_dirs(studio);
+    dirs.retain(|d| d != dir);
+    dirs.insert(0, dir.to_path_buf());
+    dirs.truncate(8);
+    let _ = std::fs::write(studio.root.join(DIRS_FILE), Json::Arr(dirs.iter().map(|d| Json::str(d.to_string_lossy())).collect()).to_json());
+}
+
+const DIRS_FILE: &str = "download-dirs.json";
 
 /// A model-list section in words.
 fn section_name(section: &str) -> &str {
@@ -997,7 +1207,11 @@ fn section_name(section: &str) -> &str {
 /// Adds what the entry names to the model list, as the Models page's Add does: the first a model, each after it added
 /// to that model (a part of it: a GGUF's vision projector, a Qwen Image model's base, text encoder and vision tower).
 fn register(studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Vec<String>, String> {
-    let mut cfg = studio.config();
+    // (on the settings as they are now, under the save's lock: a save beside it neither loses this nor is lost)
+    studio.update_config(|cfg| register_in(cfg, e, dir).map_err(|e| (400, e))).map(|(added, _)| added).map_err(|(_, e)| e)
+}
+
+fn register_in(cfg: &mut Json, e: &Json, dir: &Path) -> Result<Vec<String>, String> {
     let mut added = Vec::new();
     let mut first: Option<(&'static str, String)> = None;
     for rel in strings(e.get("add")) {
@@ -1008,7 +1222,7 @@ fn register(studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Vec<String>, S
             n == "model" || n.starts_with("model-0") || n.starts_with("diffusion_pytorch_model")
         });
         let name = generic.then(|| str_or(e, "id", "").to_string());
-        let result = registry::add(&mut cfg, &path, name.as_deref(), first.as_ref().map(|(s, n)| (*s, n.as_str())));
+        let result = registry::add(cfg, &path, name.as_deref(), first.as_ref().map(|(s, n)| (*s, n.as_str())));
         if let (Ok((a, _)), None) = (&result, &first) {
             first = Some((a.section, a.name.clone()));
         }
@@ -1029,7 +1243,6 @@ fn register(studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Vec<String>, S
             Err(err) => return Err(format!("{}: {err}", path.display())),
         }
     }
-    studio.set_config(cfg)?;
     Ok(added)
 }
 
@@ -1183,10 +1396,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The Hugging Face token reaches curl on its standard input, never on its command line (which any program on the
+    /// computer can read).
+    #[test]
+    fn the_token_is_not_on_curls_command_line() {
+        let mut c = Command::new("curl");
+        let said = token_to_curl(&mut c, Some("hf_secret")).unwrap();
+        let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["--config", "-"]);
+        assert!(!args.iter().any(|a| a.contains("hf_secret")));
+        assert_eq!(said, "header = \"Authorization: Bearer hf_secret\"\n");
+        assert!(token_to_curl(&mut Command::new("curl"), None).is_none());
+    }
+
     #[test]
     fn gated_and_missing_files_are_explained() {
-        assert!(curl_error("curl: (22) The requested URL returned error: 401", "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/resolve/main/model.safetensors").contains("accept its licence at https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m"));
-        assert!(curl_error("curl: (22) The requested URL returned error: 404", "https://huggingface.co/a/b/resolve/main/x").contains("not found"));
+        assert!(curl_error("curl: (22) The requested URL returned error: 401", "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/resolve/main/model.safetensors", true).contains("accept its licence at https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m"));
+        assert!(curl_error("curl: (22) The requested URL returned error: 404", "https://huggingface.co/a/b/resolve/main/x", false).contains("not found"));
+        // (a number in what curl said is not a status: a timeout of 120403 ms is not a refusal)
+        let slow = curl_error("curl: (28) Operation timed out after 120403 milliseconds with 0 bytes received", "https://huggingface.co/a/b/resolve/main/x", true);
+        assert!(slow.contains("stopped sending") && !slow.contains("gated"), "{slow}");
+        // (a model that is not gated, refused: its link expired, not a licence to accept)
+        let expired = curl_error("curl: (22) The requested URL returned error: 403", "https://cdn-lfs.hf.co/x", false);
+        assert!(expired.contains("expired") && !expired.contains("gated"), "{expired}");
     }
 
     /// A file served once per request, from a listener of its own (as Hugging Face's CDN would): how many were asked.
@@ -1241,7 +1473,7 @@ mod tests {
             Json::parse(format!(r#"{{"id":"{id}","parts":[{{"url":"{url}","file":"text_encoder/model.safetensors","size":{size},"sha256":"{sha}","into":"{id}"}}]}}"#).as_bytes()).unwrap()
         };
         let start = |id: &str| {
-            d.list.lock().unwrap().push(Download { id: id.into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, lan: 0, lan_from: Vec::new(), token: None });
+            d.list.lock().unwrap().push(Download { status: "downloading", ..Download::new(id, &dir, None) });
         };
 
         // here already, elsewhere: used where it is, the server never asked
@@ -1317,7 +1549,7 @@ mod tests {
         set_peer_files(Some(peer.clone()));
         let (url, asked) = serve(weights.clone());
         let d = Downloads::new();
-        d.list.lock().unwrap().push(Download { id: "net".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, lan: 0, lan_from: Vec::new(), token: None });
+        d.list.lock().unwrap().push(Download { status: "downloading", ..Download::new("net", &dir, None) });
         let e = Json::parse(format!(r#"{{"id":"net","parts":[{{"url":"{url}","file":"model.safetensors","size":{},"sha256":"{sha}","into":"net"}}]}}"#, weights.len()).as_bytes()).unwrap();
         // half of it here already, from an earlier try
         std::fs::create_dir_all(dir.join("net")).unwrap();
@@ -1330,16 +1562,54 @@ mod tests {
         let net = d.list.lock().unwrap().iter().find(|x| x.id == "net").cloned().unwrap();
         assert_eq!((net.lan, net.lan_from.clone()), (weights.len() as u64, vec!["Rig".to_string()]));
 
-        // what it sends wrong is refused, as a download would be
+        // what it sends wrong is refused, and the file fetched from Hugging Face in the same run instead
         let wrong = Arc::new(OnePeer { sha: sha.clone(), body: weights.iter().map(|b| b ^ 1).collect(), sent: Default::default() });
-        set_peer_files(Some(wrong));
-        d.list.lock().unwrap().push(Download { id: "bad".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, lan: 0, lan_from: Vec::new(), token: None });
+        set_peer_files(Some(wrong.clone()));
+        d.list.lock().unwrap().push(Download { status: "downloading", ..Download::new("bad", &dir, None) });
         let bad = Json::parse(format!(r#"{{"id":"bad","parts":[{{"url":"{url}","file":"model.safetensors","size":{},"sha256":"{sha}","into":"bad"}}]}}"#, weights.len()).as_bytes()).unwrap();
         // (the first copy is in the library: moved aside, so this one is fetched)
         std::fs::remove_dir_all(dir.join("net")).unwrap();
-        let err = d.fetch(&studio, &bad, &dir).unwrap_err();
+        library::forget_scan();
+        let r = d.fetch(&studio, &bad, &dir);
         set_peer_files(None);
-        assert!(err.contains("did not download whole"), "{err}");
+        assert_eq!(r.unwrap(), Want::Run);
+        assert_eq!((wrong.sent.load(Ordering::SeqCst), asked.load(Ordering::SeqCst)), (1, 1), "asked of the computer once, then of the internet");
+        assert_eq!(std::fs::read(dir.join("bad/model.safetensors")).unwrap(), weights);
+        let bad = d.list.lock().unwrap().iter().find(|x| x.id == "bad").cloned().unwrap();
+        assert_eq!(bad.lan, 0, "nothing counted as from the network");
+        assert!(studio.log.since(0).to_json().contains("was not the file"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Cancelled, a download deletes what it put in place and its partial files: never a file another model uses,
+    /// one this computer had before, or the file a link points to.
+    #[test]
+    fn a_cancelled_download_takes_away_what_it_fetched_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        let kept = root.join("drive/kept.safetensors");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, b"weights kept elsewhere").unwrap();
+        let mine = dir.join("Qwen3.5-9B-GGUF");
+        std::fs::create_dir_all(&mine).unwrap();
+        let (fetched, linked, before, other_part, own_part) = (mine.join("mine.gguf"), mine.join("linked.gguf"), mine.join("before.gguf"), mine.join("theirs.gguf.part"), mine.join("mine2.gguf.part"));
+        std::fs::write(&fetched, b"downloaded").unwrap();
+        std::fs::hard_link(&kept, &linked).unwrap();
+        std::fs::write(&before, b"was here").unwrap();
+        std::fs::write(&other_part, b"half").unwrap();
+        std::fs::write(&own_part, b"half").unwrap();
+        let d = Downloads::new();
+        // this model (its catalog folder `Qwen3.5-9B-GGUF`), and another downloading into the same folder
+        let id = "qwen3.5-9b";
+        d.list.lock().unwrap().push(Download { status: "paused", fetched: vec![fetched.clone(), linked.clone()], ..Download::new(id, &dir, None) });
+        d.list.lock().unwrap().push(Download { status: "downloading", planned: vec![mine.join("theirs.gguf")], ..Download::new("moss-image-sft-q4", &dir, None) });
+        d.discard(id, &dir);
+        assert!(!fetched.exists() && !linked.exists(), "what it put in place goes");
+        assert!(kept.exists(), "the file a link was made to stays");
+        assert!(before.exists(), "what was here before stays");
+        assert!(other_part.exists(), "another download's partial file stays");
+        assert!(!own_part.exists(), "its own partial file goes");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1354,7 +1624,7 @@ mod tests {
         let studio = Studio::for_test(path.parent().unwrap(), cfg);
         for id in std::env::var("OAIY_TEST_PLANS").unwrap_or_else(|_| "qwen3.5-9b,moss-image-sft-q4,flux-3-image-klein".into()).split(',') {
             let started = Instant::now();
-            match studio.downloads.plan_of(&studio, id, None) {
+            match studio.downloads.plan_of(&studio, id, None, None) {
                 Ok(p) => {
                     let gb = |k: &str| p.get(k).and_then(Json::as_i64).unwrap_or(0) as f64 / 1e9;
                     println!("{id}: {:.2} GB to download, {:.2} GB elsewhere here, {:.2} GB in place ({:.1} s)", gb("download_bytes"), gb("elsewhere_bytes"), gb("here_bytes"), started.elapsed().as_secs_f64());
@@ -1379,16 +1649,16 @@ mod tests {
         let files = plan(&cfg, &e, &dir, None).unwrap();
         assert_eq!(files.len(), 2);
         let d = Downloads::new();
-        d.list.lock().unwrap().push(Download { id: "t".into(), dir: dir.clone(), status: "downloading", done: 0, total: 0, file: String::new(), files_done: 0, files_total: 0, speed: 0., error: None, added: Vec::new(), reused: 0, reused_files: 0, lan: 0, lan_from: Vec::new(), token: None });
+        d.list.lock().unwrap().push(Download { status: "downloading", ..Download::new("t", &dir, None) });
         for f in &files {
             std::fs::create_dir_all(f.dest.parent().unwrap()).unwrap();
             // Half a file first, as a pause leaves it; curl carries on from there.
             if let Some(s) = f.size {
-                let whole = curl_text(&cfg, &f.url, None, false).unwrap();
+                let whole = curl_text(&cfg, &f.url, None, false, false).unwrap();
                 assert_eq!(whole.len() as u64, s);
                 std::fs::write(part_path(&f.dest), &whole.as_bytes()[..(s / 2) as usize]).unwrap();
             }
-            assert_eq!(d.curl(&cfg, "t", f, &part_path(&f.dest), 0).unwrap(), Want::Run);
+            assert_eq!(d.curl(&cfg, "t", f, &part_path(&f.dest), 0, false).unwrap(), Want::Run);
             assert_eq!(Some(size_of(&part_path(&f.dest))), f.size);
         }
         std::fs::remove_dir_all(dir).unwrap();
