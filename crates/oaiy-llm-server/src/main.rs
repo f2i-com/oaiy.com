@@ -53,7 +53,9 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        item again and again, in a tool call too), and stop one that goes on
                        all the same (default on)
   --expert-trace FILE  write JSONL token/layer/expert/precision routing records
-  --api-key KEY        require `Authorization: Bearer KEY` (else OAIY_LLM_API_KEY)
+  --api-key KEY        require `Authorization: Bearer KEY` (else OAIY_LLM_API_KEY).
+                       Without one, requests from web pages of other sites (an
+                       Origin not of this computer's loopback) are refused
   --thinking           reason before answering unless a request says otherwise
                        (default: answer directly; requests turn reasoning on with
                        reasoning_effort, or thinking: {type: enabled})
@@ -96,6 +98,7 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only
+                       with an API key, off otherwise
   --quiet              no per-request log
   --incognito          keep nothing of any request: no prompt states on disk, no
                        request log, and each request's state is dropped when it
@@ -317,6 +320,8 @@ fn watch_stdin() {
         let mut sink = [0u8; 256];
         let mut stdin = std::io::stdin();
         while std::io::Read::read(&mut stdin, &mut sink).is_ok_and(|n| n > 0) {}
+        // (an exit runs no destructors: a media worker would go on holding the GPU)
+        oaiy_llm_server::media::stop_workers();
         std::process::exit(0);
     });
 }

@@ -34,7 +34,7 @@ use crate::dsv41::vision;
 use oaiy_engine::json::Json;
 
 use crate::engines::job::{Event, Finish, Job, JobImage, Sampling};
-use oaiy_engine::http::{respond, Request, Stream};
+use oaiy_engine::http::{respond, Refusal, Request, Stream};
 
 pub struct Config {
     pub model_name: String,
@@ -96,6 +96,8 @@ pub struct Server {
     /// The configured context cap (0: each model's own), for `/v1/models`. What a
     /// model actually allows is in its own `Config` once it is loaded.
     pub ctx: usize,
+    /// Whether it listens on loopback only: a request then has to name loopback as its `Host` (see [`Server::gate`]).
+    pub loopback: bool,
 }
 
 struct ApiError {
@@ -157,13 +159,26 @@ fn client_alive(s: &TcpStream) -> bool {
 
 /// The next event from the model, keeping the connection alive meanwhile:
 /// `None` when the model side is gone. A client that has left cancels the
-/// job (and `gone` is set).
-fn next_event(rx: &mpsc::Receiver<Event>, sse: &mut Option<Stream>, peer: Option<&TcpStream>, cancel: &AtomicBool, gone: &mut bool) -> Option<Event> {
+/// job (and `gone` is set). An event stream's client is found gone at a send;
+/// a whole reply's is looked at every [`KEEPALIVE`] (`checked`: when it last
+/// was) whether events come or not, as a reply whose tokens keep coming never
+/// waits long enough for the timeout below.
+fn next_event(rx: &mpsc::Receiver<Event>, sse: &mut Option<Stream>, peer: Option<&TcpStream>, cancel: &AtomicBool, gone: &mut bool, checked: &mut Instant) -> Option<Event> {
     loop {
         match rx.recv_timeout(KEEPALIVE) {
-            Ok(ev) => return Some(ev),
+            Ok(ev) => {
+                if sse.is_none() && !*gone && checked.elapsed() >= KEEPALIVE {
+                    *checked = Instant::now();
+                    if !peer.is_none_or(client_alive) {
+                        cancel.store(true, Ordering::Relaxed);
+                        *gone = true;
+                    }
+                }
+                return Some(ev);
+            }
             Err(RecvTimeoutError::Disconnected) => return None,
             Err(RecvTimeoutError::Timeout) => {
+                *checked = Instant::now();
                 let alive = match sse.as_mut() {
                     Some(s) => s.send(b": keepalive\n\n").is_ok(),
                     None => peer.is_none_or(client_alive),
@@ -175,6 +190,40 @@ fn next_event(rx: &mpsc::Receiver<Event>, sse: &mut Option<Stream>, peer: Option
             }
         }
     }
+}
+
+/// Whether an `Authorization` header carries `key`: its scheme in any case (as RFC 9110 has it), the key compared in a
+/// time that does not tell how much of it a guess had right.
+fn key_matches(header: Option<&str>, key: &str) -> bool {
+    let Some((scheme, given)) = header.map(str::trim).and_then(|h| h.split_once(' ')) else { return false };
+    scheme.eq_ignore_ascii_case("bearer") && same_secret(given.trim().as_bytes(), key.as_bytes())
+}
+
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// Whether a `Host` (or an origin's host), its port aside, is this computer's loopback: `localhost` (and names under
+/// it, which browsers keep on loopback whatever DNS says) or a loopback address.
+fn loopback_name(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None if host.parse::<std::net::IpAddr>().is_ok() => host.as_str(),
+        None => host.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(host.as_str(), |(name, _)| name),
+    };
+    name == "localhost" || name.ends_with(".localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether an `Origin` is a page served from this computer's loopback.
+fn loopback_origin(origin: &str) -> bool {
+    let origin = origin.trim();
+    let rest = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://"));
+    rest.is_some_and(|host| !host.contains('/') && loopback_name(host))
 }
 
 fn json_response(w: &mut TcpStream, status: u16, v: &Json) -> io::Result<bool> {
@@ -190,7 +239,34 @@ fn error_response(w: &mut TcpStream, e: &ApiError) -> io::Result<bool> {
     json_response(w, e.status, &v)
 }
 
+/// A request refused on its head, before its body is read: a wrong or missing key; on a server with no key, a page of
+/// another site (an `Origin` not of this computer's loopback: such a server answers whoever reaches it, and a page in a
+/// browser can); and on one that listens on loopback only, a `Host` naming anything else (a site's name pointed at
+/// 127.0.0.1, which a browser takes for that site's own server).
+fn gate(key: Option<&str>, loopback: bool, req: &Request) -> Option<Refusal> {
+    if loopback && req.header("host").is_some_and(|h| !loopback_name(h)) {
+        return Some(Refusal::new(403, "this server answers to its loopback address only (localhost or 127.0.0.1)", "forbidden_host"));
+    }
+    let path = req.route();
+    match key {
+        None if req.header("origin").is_some_and(|o| !loopback_origin(o)) => Some(Refusal::new(
+            403,
+            "this server has no API key, so it answers no web page but this computer's own; start it with --api-key to serve others",
+            "forbidden_origin",
+        )),
+        Some(key) if req.method != "OPTIONS" && path != "/health" && path != "/" && !key_matches(req.header("authorization"), key) => {
+            Some(Refusal::new(401, "missing or wrong API key", "invalid_api_key"))
+        }
+        _ => None,
+    }
+}
+
 impl Server {
+    /// [`gate`]'s answer for this server.
+    pub fn gate(&self, req: &Request) -> Option<Refusal> {
+        gate(self.api_key.as_deref(), self.loopback, req)
+    }
+
     /// One request; returns whether the connection may stay open.
     pub fn handle(&self, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         if req.method == "OPTIONS" {
@@ -202,8 +278,7 @@ impl Server {
             return json_response(w, 200, &Json::obj([("status", Json::str("ok"))]));
         }
         if let Some(key) = &self.api_key {
-            let ok = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).is_some_and(|v| v.trim() == key);
-            if !ok {
+            if !key_matches(req.header("authorization"), key) {
                 return error_response(w, &ApiError { status: 401, message: "missing or wrong API key".into(), code: "invalid_api_key" });
             }
         }
@@ -242,6 +317,8 @@ impl Server {
         };
         match result {
             Ok(keep) => Ok(keep),
+            // the reply had begun, or the client had gone: nothing more can be said on this connection
+            Err(e) if e.status == 0 => Ok(false),
             Err(e) => error_response(w, &e),
         }
     }
@@ -555,16 +632,27 @@ impl Server {
         // The end of an incognito session: what the model holds of it is wiped
         // (a model that is not loaded holds nothing, and is not loaded for this).
         if let Some(session) = body.get("oaiy_forget_session").and_then(Json::as_str) {
-            if let Some(name) = self.models.loaded() {
-                let a = self.models.activate(Some(&name)).map_err(bad)?;
+            // (the model loaded now, never one loaded for this: a model unloaded since took the session's state with it)
+            let mut wiped = true;
+            if let Some(a) = self.models.live() {
                 let (tx, rx) = mpsc::channel();
                 let job = Job { tools: Vec::new(), tool_precision: false, observer_context: String::new(), prompt: Vec::new(), images: Vec::new(), max_tokens: 0, think_budget: None,
                     sampling: Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 0, repeat_penalty: 1.0, repeat_last_n: 0, presence_penalty: 0.0, frequency_penalty: 0.0 },
                     cancel: Arc::new(AtomicBool::new(false)), events: tx, forget: true, session: Some(session.to_owned()), wipe: true };
                 a.jobs.send(job).map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
-                let _ = rx.recv_timeout(std::time::Duration::from_secs(120));
+                // Still busy after two minutes: the wipe waits its turn, and the reply says it has not happened yet.
+                wiped = !matches!(rx.recv_timeout(std::time::Duration::from_secs(120)), Err(RecvTimeoutError::Timeout));
             }
-            return json_response(w, 200, &Json::obj([("object", Json::str("oaiy.session.forgotten")), ("session", Json::str(session))])).map_err(|e| ApiError { status: 500, message: e.to_string(), code: "server_error" });
+            let reply = if wiped {
+                Json::obj([("object", Json::str("oaiy.session.forgotten")), ("session", Json::str(session))])
+            } else {
+                Json::obj([
+                    ("object", Json::str("oaiy.session.forgetting")),
+                    ("session", Json::str(session)),
+                    ("message", Json::str("the model is busy: it wipes the session when it has finished what it is doing")),
+                ])
+            };
+            return json_response(w, if wiped { 200 } else { 202 }, &reply).map_err(closed);
         }
         observer_review_policy(&body)?;
         if body.get("oaiy_file_write_yield").is_some_and(|v| !matches!(v, Json::Bool(_))) {
@@ -601,6 +689,7 @@ impl Server {
         let session = req.header("x-oaiy-session").map(str::to_owned).or_else(|| body.get("oaiy_session").and_then(Json::as_str).map(str::to_owned))
             .map(|s| s.trim().to_owned()).filter(|s| !s.is_empty() && s.len() <= 128);
         let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body), body.get("tools").and_then(Json::as_array).unwrap_or(&[]).to_vec(), forget, session)?;
+        let _stop = StopOnReturn(&cancel);
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
@@ -624,9 +713,9 @@ impl Server {
         };
 
         let mut sse = if stream {
-            let mut s = Stream::start(w, "text/event-stream").map_err(io_err)?;
+            let mut s = Stream::start(w, "text/event-stream").map_err(closed)?;
             let first = chunk(Json::obj([("role", Json::str("assistant")), ("content", Json::str(""))]), None);
-            s.send(format!("data: {}\n\n", first.to_json()).as_bytes()).map_err(io_err)?;
+            s.send(format!("data: {}\n\n", first.to_json()).as_bytes()).map_err(closed)?;
             Some(s)
         } else {
             None
@@ -670,43 +759,44 @@ impl Server {
         let mut last_preview = Instant::now() - PREVIEW_EVERY;
         let mut live_tool_preview = false;
         let mut tool_shown = 0usize;
-        while let Some(ev) = next_event(&rx, &mut sse, peer.as_ref(), &cancel, &mut gone) {
+        let mut checked = Instant::now();
+        while let Some(ev) = next_event(&rx, &mut sse, peer.as_ref(), &cancel, &mut gone, &mut checked) {
             match ev {
                 Event::ReasoningPreview(text) => {
                     if let Some(s) = sse.as_mut() {
                         let c = Json::obj([("oaiy_reasoning_preview",Json::str(text))]);
-                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() { cancel.store(true,Ordering::Relaxed); }
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() { cancel.store(true,Ordering::Relaxed); gone = true; }
                     }
                 }
                 Event::ObserverDelta {text,thinking,start} => {
                     if let Some(s)=sse.as_mut() {
                         let c=Json::obj([("oaiy_observer_delta",Json::obj([("text",Json::str(text)),("thinking",Json::Bool(thinking)),("start",Json::Bool(start))]))]);
-                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed); gone = true;}
                     }
                 }
                 Event::ContentPreview(text) => {
                     if let Some(s) = sse.as_mut() {
                         let c=Json::obj([("oaiy_content_preview",Json::str(text))]);
-                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed); gone = true;}
                     }
                 }
                 Event::ToolPreview {text,start} => {
                     live_tool_preview=true;
                     if let Some(s) = sse.as_mut() {
                         let c=Json::obj([("oaiy_tool_preview",Json::obj([("text",Json::str(text)),("start",Json::Bool(start))]))]);
-                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed); gone = true;}
                     }
                 }
                 Event::ObserverProgress {action,comment} => {
                     if let Some(s) = sse.as_mut() {
                         let c = Json::obj([("oaiy_observer_progress",Json::obj([("action",Json::str(action)),("comment",Json::str(comment))]))]);
-                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed); gone = true;}
                     }
                 }
                 Event::Observer(comment) => {
                     if let Some(s) = sse.as_mut() {
                         let c = Json::obj([("oaiy_observer", Json::str(comment))]);
-                        if s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err() { cancel.store(true, Ordering::Relaxed); }
+                        if s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err() { cancel.store(true, Ordering::Relaxed); gone = true; }
                     }
                 }
                 Event::CacheReuse { cached: c, source, common } => {
@@ -732,8 +822,11 @@ impl Server {
                                 ]),
                             ));
                         }
-                        // a client that has gone shows up at the next text
-                        let _ = s.send(format!("data: {}\n\n", c.to_json()).as_bytes());
+                        // a client gone while the prompt goes in (minutes of it) stops it
+                        if s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err() {
+                            cancel.store(true, Ordering::Relaxed);
+                            gone = true;
+                        }
                     }
                 }
                 Event::Prefilled { cached: c } => { cached = c; prefilled_at = Some(Instant::now()); },
@@ -756,7 +849,10 @@ impl Server {
                                 ]),
                             ));
                         }
-                        let _ = s.send(format!("data: {}\n\n", c.to_json()).as_bytes());
+                        if s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err() {
+                            cancel.store(true, Ordering::Relaxed);
+                            gone = true;
+                        }
                     }
                 }
                 Event::Text(t) => {
@@ -778,7 +874,7 @@ impl Server {
                         let draft=parser.tool_draft();
                         if let Some(s)=sse.as_mut() {
                             let c=Json::obj([("oaiy_tool_preview",Json::obj([("text",Json::str(&draft[tool_shown..])),("start",Json::Bool(tool_shown==0))]))]);
-                            if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                            if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed); gone = true;}
                         }
                         tool_shown=draft.len();
                     }
@@ -804,7 +900,10 @@ impl Server {
                                     ]),
                                 ));
                             }
-                            let _ = s.send(format!("data: {}\n\n", c.to_json()).as_bytes());
+                            if s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err() {
+                                cancel.store(true, Ordering::Relaxed);
+                                gone = true;
+                            }
                         }
                     }
                 }
@@ -847,7 +946,7 @@ impl Server {
             content.push_str(&tail);
             if let Some(s) = sse.as_mut() {
                 let c = chunk(Json::obj([("content", Json::str(&tail))]), None);
-                let _ = s.send(format!("data: {}\n\n", c.to_json()).as_bytes());
+                gone |= s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err();
             }
         }
         let calls = if stop.hit { Vec::new() } else { calls };
@@ -896,9 +995,9 @@ impl Server {
                     let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(TOOL_CONTRACT_CODE) { TOOL_CONTRACT_CODE } else if e.contains(crate::guards::repetition::CODE) { crate::guards::repetition::CODE } else if e.contains(crate::guards::observer::CODE) { crate::guards::observer::CODE } else { "server_error" }))]))]));
                 } else {
                     if !tool_calls.is_empty() {
-                        send(chunk(Json::obj([("tool_calls", Json::Arr(tool_calls))]), None)).map_err(io_err)?;
+                        send(chunk(Json::obj([("tool_calls", Json::Arr(tool_calls))]), None)).map_err(closed)?;
                     }
-                    send(chunk(Json::obj::<&str>([]), Some(reason))).map_err(io_err)?;
+                    send(chunk(Json::obj::<&str>([]), Some(reason))).map_err(closed)?;
                     if include_usage {
                         let mut u = chunk(Json::obj::<&str>([]), None);
                         if let Json::Obj(fields) = &mut u {
@@ -909,11 +1008,11 @@ impl Server {
                             }
                             fields.push(("usage".into(), usage));
                         }
-                        send(u).map_err(io_err)?;
+                        send(u).map_err(closed)?;
                     }
                 }
-                s.send(b"data: [DONE]\n\n").map_err(io_err)?;
-                s.finish().map_err(io_err)?;
+                s.send(b"data: [DONE]\n\n").map_err(closed)?;
+                s.finish().map_err(closed)?;
                 Ok(true)
             }
             None => {
@@ -959,7 +1058,7 @@ impl Server {
                     ),
                     ("usage", usage),
                 ]);
-                json_response(w, 200, &v).map_err(io_err)
+                json_response(w, 200, &v).map_err(closed)
             }
         }
     }
@@ -982,6 +1081,7 @@ impl Server {
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let forget = self.forget(req, &body);
         let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false, String::new(), Vec::new(), forget, None)?;
+        let _stop = StopOnReturn(&cancel);
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();
@@ -1001,11 +1101,12 @@ impl Server {
                 ),
             ])
         };
-        let mut sse = if stream { Some(Stream::start(w, "text/event-stream").map_err(io_err)?) } else { None };
+        let mut sse = if stream { Some(Stream::start(w, "text/event-stream").map_err(closed)?) } else { None };
         let mut stop = StopFilter::new(stops);
         let (mut all, mut finish, mut n) = (String::new(), Finish::Stop, 0usize);
         let mut gone = false;
-        while let Some(ev) = next_event(&rx, &mut sse, peer.as_ref(), &cancel, &mut gone) {
+        let mut checked = Instant::now();
+        while let Some(ev) = next_event(&rx, &mut sse, peer.as_ref(), &cancel, &mut gone, &mut checked) {
             match ev {
                 Event::Text(t) if !stop.hit => {
                     let (out, hit) = stop.push(&t);
@@ -1025,7 +1126,15 @@ impl Server {
                     n = completion_tokens;
                     break;
                 }
-                Event::Error(e) => return Err(ApiError { status: 500, message: e, code: "server_error" }),
+                Event::Error(e) => {
+                    let Some(mut s) = sse.take() else { return Err(ApiError { status: 500, message: e, code: "server_error" }) };
+                    // The stream has begun: the error goes in it, as a chat's does, and the stream ends.
+                    let error = Json::obj([("error", Json::obj([("message", Json::str(&e)), ("type", Json::str("server_error")), ("code", Json::str("server_error"))]))]);
+                    let _ = s.send(format!("data: {}\n\n", error.to_json()).as_bytes());
+                    let _ = s.send(b"data: [DONE]\n\n");
+                    let _ = s.finish();
+                    return Ok(false);
+                }
                 _ => {}
             }
         }
@@ -1038,11 +1147,11 @@ impl Server {
         match sse.as_mut() {
             Some(s) => {
                 if !tail.is_empty() {
-                    s.send(format!("data: {}\n\n", chunk(&tail, None).to_json()).as_bytes()).map_err(io_err)?;
+                    s.send(format!("data: {}\n\n", chunk(&tail, None).to_json()).as_bytes()).map_err(closed)?;
                 }
-                s.send(format!("data: {}\n\n", chunk("", Some(reason)).to_json()).as_bytes()).map_err(io_err)?;
-                s.send(b"data: [DONE]\n\n").map_err(io_err)?;
-                sse.take().expect("some").finish().map_err(io_err)?;
+                s.send(format!("data: {}\n\n", chunk("", Some(reason)).to_json()).as_bytes()).map_err(closed)?;
+                s.send(b"data: [DONE]\n\n").map_err(closed)?;
+                sse.take().expect("some").finish().map_err(closed)?;
                 Ok(true)
             }
             None => {
@@ -1062,14 +1171,26 @@ impl Server {
                         ]),
                     ));
                 }
-                json_response(w, 200, &v).map_err(io_err)
+                json_response(w, 200, &v).map_err(closed)
             }
         }
     }
 }
 
-fn io_err(e: io::Error) -> ApiError {
-    ApiError { status: 500, message: format!("i/o: {e}"), code: "io" }
+/// A write to the client failed, or a stream had begun: there is no answering on this connection any more (status 0,
+/// which [`Server::handle`] closes it on rather than writing an error into it).
+fn closed(_: io::Error) -> ApiError {
+    ApiError { status: 0, message: String::new(), code: "closed" }
+}
+
+/// Stops the request's job when its handler returns, however it does: an engine goes on with a reply nobody reads
+/// until it is told to (its events' receiver dropped does not), and a reply already ended is not changed by it.
+struct StopOnReturn<'a>(&'a AtomicBool);
+
+impl Drop for StopOnReturn<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Cuts the reply at the first stop string, holding back any tail that
@@ -1122,6 +1243,60 @@ impl StopFilter {
         } else {
             std::mem::take(&mut self.held)
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn req(method: &str, path: &str, headers: &[(&str, &str)]) -> Request {
+        Request::new(method, path, headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), Vec::new())
+    }
+
+    #[test]
+    fn a_key_is_read_in_any_case_of_its_scheme_and_only_whole() {
+        assert!(key_matches(Some("Bearer sk-1"), "sk-1"));
+        assert!(key_matches(Some("bearer  sk-1 "), "sk-1"));
+        assert!(key_matches(Some("BEARER sk-1"), "sk-1"));
+        for wrong in [None, Some("Bearer sk-12"), Some("Bearer sk-"), Some("Basic sk-1"), Some("sk-1"), Some("Bearer ")] {
+            assert!(!key_matches(wrong, "sk-1"), "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn loopback_is_localhost_and_the_loopback_addresses_with_or_without_a_port() {
+        for host in ["localhost", "LOCALHOST:8000", "127.0.0.1", "127.0.0.1:8000", "[::1]:8000", "::1", "oaiy.localhost:80", "127.9.9.9"] {
+            assert!(loopback_name(host), "{host}");
+        }
+        for host in ["evil.example", "evil.example:8000", "192.168.1.4:8000", "localhost.evil.example", "[::2]:80", ""] {
+            assert!(!loopback_name(host), "{host}");
+        }
+        assert!(loopback_origin("http://localhost:5173") && loopback_origin("https://127.0.0.1"));
+        for origin in ["null", "https://evil.example", "http://localhost.evil.example", "file://", "http://localhost/x", "chrome-extension://abc"] {
+            assert!(!loopback_origin(origin), "{origin}");
+        }
+    }
+
+    #[test]
+    fn a_server_without_a_key_answers_no_other_sites_page_and_one_on_loopback_no_other_host() {
+        let page = req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8000"), ("Origin", "https://evil.example")]);
+        assert_eq!(gate(None, true, &page).map(|r| r.status), Some(403));
+        let preflight = req("OPTIONS", "/v1/chat/completions", &[("Host", "127.0.0.1:8000"), ("Origin", "https://evil.example")]);
+        assert_eq!(gate(None, true, &preflight).map(|r| r.status), Some(403));
+        let rebound = req("GET", "/v1/models", &[("Host", "evil.example:8000")]);
+        assert_eq!(gate(None, true, &rebound).map(|r| r.status), Some(403));
+        assert!(gate(None, false, &rebound).is_none(), "a server on the network answers any name");
+        let harness = req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8000")]);
+        assert!(gate(None, true, &harness).is_none());
+        let own = req("POST", "/v1/chat/completions", &[("Host", "localhost:8000"), ("Origin", "http://localhost:3000")]);
+        assert!(gate(None, true, &own).is_none());
+        // with a key, the key decides, and a page of any site with it is served
+        assert_eq!(gate(Some("k"), true, &page).map(|r| r.status), Some(401));
+        let keyed = req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8000"), ("Origin", "https://evil.example"), ("Authorization", "Bearer k")]);
+        assert!(gate(Some("k"), true, &keyed).is_none());
+        assert!(gate(Some("k"), true, &preflight).is_none());
+        assert!(gate(Some("k"), true, &req("GET", "/health", &[])).is_none());
     }
 }
 

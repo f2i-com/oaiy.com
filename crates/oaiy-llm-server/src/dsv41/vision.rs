@@ -213,7 +213,34 @@ fn url_bytes(url: &str, local_files: bool) -> Result<Vec<u8>> {
     let path = url.strip_prefix("file://").unwrap_or(url);
     // file:///C:/x on Windows
     let path = if cfg!(windows) && path.len() > 2 && path.starts_with('/') && path.as_bytes()[2] == b':' { &path[1..] } else { path };
-    Ok(std::fs::read(path)?)
+    local_image(std::path::Path::new(path))
+}
+
+/// The most of a picture read from a file: as a reference picture of a media job may be.
+const LOCAL_IMAGE_MAX: u64 = 32 << 20;
+
+/// A picture's file, as a media job's reference pictures are taken: an absolute path to a regular file of at most
+/// [`LOCAL_IMAGE_MAX`]. Read whole, `/dev/zero` filled the memory and a FIFO held the request's thread for good.
+fn local_image(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    if !path.is_absolute() {
+        return Err(Error::Arg("a local image needs an absolute path".into()));
+    }
+    let regular = |m: &std::fs::Metadata| m.is_file() && m.len() <= LOCAL_IMAGE_MAX;
+    // (looked at before it is opened: opening a FIFO waits for a writer)
+    if !regular(&std::fs::metadata(path)?) {
+        return Err(Error::Arg(format!("a local image must be a regular file of at most {} MiB", LOCAL_IMAGE_MAX >> 20)));
+    }
+    let file = std::fs::File::open(path)?;
+    if !regular(&file.metadata()?) {
+        return Err(Error::Arg(format!("a local image must be a regular file of at most {} MiB", LOCAL_IMAGE_MAX >> 20)));
+    }
+    let mut bytes = Vec::new();
+    file.take(LOCAL_IMAGE_MAX + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LOCAL_IMAGE_MAX {
+        return Err(Error::Arg(format!("a local image must be a regular file of at most {} MiB", LOCAL_IMAGE_MAX >> 20)));
+    }
+    Ok(bytes)
 }
 
 /// Base64 (standard or URL-safe alphabet, padding optional, whitespace
@@ -654,6 +681,24 @@ mod tests {
         assert_eq!(&u[9..18], &[100., 101., 102., 104., 105., 106., 108., 109., 110.]);
         // the block right of it holds column 3 only
         assert_eq!(&u[18..27], &[3., 0., 0., 7., 0., 0., 11., 0., 0.]);
+    }
+
+    #[test]
+    fn a_local_image_is_an_absolute_regular_file_of_a_bounded_size() {
+        let dir = std::env::temp_dir().join(format!("oaiy-local-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.png");
+        std::fs::write(&small, b"picture").unwrap();
+        let big = dir.join("big.png");
+        std::fs::File::create(&big).unwrap().set_len(LOCAL_IMAGE_MAX + 1).unwrap();
+        let url = |p: &std::path::Path| oaiy_engine::json::Json::obj([("url", oaiy_engine::json::Json::str(p.to_string_lossy()))]);
+        assert_eq!(image_bytes(&url(&small), true).unwrap(), b"picture");
+        assert!(matches!(image_bytes(&url(&big), true), Err(Error::Arg(_))));
+        assert!(matches!(image_bytes(&url(&dir), true), Err(Error::Arg(_))));
+        assert!(matches!(image_bytes(&url(std::path::Path::new("small.png")), true), Err(Error::Arg(_))));
+        #[cfg(unix)]
+        assert!(matches!(image_bytes(&url(std::path::Path::new("/dev/zero")), true), Err(Error::Arg(_))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

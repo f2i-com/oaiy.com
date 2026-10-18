@@ -8,10 +8,16 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Largest request body accepted (images arrive inline as base64).
 pub const MAX_BODY: usize = 64 << 20;
+
+/// How long a request's line and headers may take to arrive once its first byte has, and its body besides that at
+/// [`BODY_RATE`] at the least. Each read alone waits [`IDLE`], so without them a client sending a byte now and then held
+/// its thread for as long as it liked.
+const HEAD_WITHIN: Duration = Duration::from_secs(30);
+const BODY_RATE: usize = 128 << 10;
 
 pub struct Request {
     pub method: String,
@@ -84,7 +90,76 @@ pub enum ReadError {
     Closed,
     /// A malformed request: answer 400 and close.
     Bad(String),
+    /// Refused on its head by the server's gate ([`serve_gated`]): answer it and close, its body unread.
+    Refused(Refusal),
     Io,
+}
+
+/// A request refused on its head alone, before its body is read (a missing key, a page of another site): its
+/// status and JSON body.
+pub struct Refusal {
+    pub status: u16,
+    pub body: String,
+}
+
+impl Refusal {
+    /// A refusal in the shape OpenAI clients read (`{"error": {"message", "type", "code"}}`).
+    pub fn new(status: u16, message: &str, code: &str) -> Refusal {
+        let error = crate::json::Json::obj([
+            ("message", crate::json::Json::str(message)),
+            ("type", crate::json::Json::str("invalid_request_error")),
+            ("code", crate::json::Json::str(code)),
+        ]);
+        Refusal { status, body: crate::json::Json::obj([("error", error)]).to_json() }
+    }
+}
+
+/// The connection's reads held to a deadline: before each read from the socket, its timeout is what is left.
+struct Within<'a> {
+    r: &'a mut BufReader<TcpStream>,
+    until: Instant,
+}
+
+impl Within<'_> {
+    fn arm(&self) -> io::Result<()> {
+        if !self.r.buffer().is_empty() {
+            return Ok(());
+        }
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "the request took too long to arrive"));
+        }
+        self.r.get_ref().set_read_timeout(Some(left))
+    }
+}
+
+impl Read for Within<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm()?;
+        self.r.read(buf)
+    }
+}
+
+impl BufRead for Within<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.arm()?;
+        self.r.fill_buf()
+    }
+    fn consume(&mut self, n: usize) {
+        self.r.consume(n)
+    }
+}
+
+/// `len` bytes of body, the buffer grown as they arrive: a `Content-Length` (or a chunk's size) is only a claim, and
+/// 64 MiB made ready for each claim was 64 MiB a connection before a byte of it came.
+fn read_exactly(r: &mut impl BufRead, body: &mut Vec<u8>, len: usize) -> Result<(), ReadError> {
+    let at = body.len();
+    body.reserve(len.min(1 << 20));
+    r.take(len as u64).read_to_end(body)?;
+    if body.len() - at < len {
+        return Err(ReadError::Io); // closed inside the body
+    }
+    Ok(())
 }
 
 impl From<io::Error> for ReadError {
@@ -141,9 +216,7 @@ fn chunked_body(r: &mut impl BufRead, limit: usize) -> Result<Vec<u8>, ReadError
         if size > limit.saturating_sub(body.len()) {
             return Err(ReadError::Bad("body too large".into()));
         }
-        let at = body.len();
-        body.resize(at + size, 0);
-        r.read_exact(&mut body[at..])?;
+        read_exactly(r, &mut body, size)?;
         line(r)?; // the CRLF after the chunk
     }
 }
@@ -151,6 +224,25 @@ fn chunked_body(r: &mut impl BufRead, limit: usize) -> Result<Vec<u8>, ReadError
 /// Read one request. `writer` receives the `100 Continue` interim response
 /// when the client asks for it.
 pub fn read_request(r: &mut BufReader<TcpStream>, writer: &mut TcpStream) -> Result<Request, ReadError> {
+    read_gated(r, writer, &mut |_| None)
+}
+
+/// [`read_request`], `gate` asked about the request's head (its body still empty) before a `100 Continue` is sent or
+/// a byte of the body read. The socket's read timeout waits for the request to begin (the idle time between requests);
+/// once it has, the rest has [`HEAD_WITHIN`] and its body's time at [`BODY_RATE`], and the timeout is as it was after.
+fn read_gated(r: &mut BufReader<TcpStream>, writer: &mut TcpStream, gate: &mut dyn FnMut(&Request) -> Option<Refusal>) -> Result<Request, ReadError> {
+    if r.fill_buf()?.is_empty() {
+        return Err(ReadError::Closed);
+    }
+    let before = r.get_ref().read_timeout().ok().flatten();
+    let got = read_begun(r, writer, gate);
+    let _ = r.get_ref().set_read_timeout(before);
+    got
+}
+
+fn read_begun(r: &mut BufReader<TcpStream>, writer: &mut TcpStream, gate: &mut dyn FnMut(&Request) -> Option<Refusal>) -> Result<Request, ReadError> {
+    let mut r = Within { r, until: Instant::now() + HEAD_WITHIN };
+    let r = &mut r;
     let mut first = line(r)?;
     while first.is_empty() {
         first = line(r)?; // tolerate stray blank lines between requests
@@ -162,21 +254,33 @@ pub fn read_request(r: &mut BufReader<TcpStream>, writer: &mut TcpStream) -> Res
     };
     let headers = headers(r)?;
     let mut req = Request { method, path, headers, body: Vec::new() };
+    if let Some(refused) = gate(&req) {
+        return Err(ReadError::Refused(refused));
+    }
+    let chunked = req.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let len = match req.header("content-length") {
+        Some(len) if !chunked => {
+            let len: usize = len.parse().map_err(|_| ReadError::Bad("bad Content-Length".into()))?;
+            if len > MAX_BODY {
+                return Err(ReadError::Bad("request body too large".into()));
+            }
+            Some(len)
+        }
+        _ => None,
+    };
     if req.header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
         writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
     }
-    if req.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+    // (a chunked body says nothing of its size first: it has the time the largest would)
+    let body_secs = if chunked { MAX_BODY } else { len.unwrap_or(0) } / BODY_RATE;
+    r.until = Instant::now() + HEAD_WITHIN + Duration::from_secs(body_secs as u64);
+    if chunked {
         req.body = chunked_body(r, MAX_BODY).map_err(|e| match e {
             ReadError::Bad(_) => ReadError::Bad("request body too large".into()),
             e => e,
         })?;
-    } else if let Some(len) = req.header("content-length") {
-        let len: usize = len.parse().map_err(|_| ReadError::Bad("bad Content-Length".into()))?;
-        if len > MAX_BODY {
-            return Err(ReadError::Bad("request body too large".into()));
-        }
-        req.body.resize(len, 0);
-        r.read_exact(&mut req.body)?;
+    } else if let Some(len) = len {
+        read_exactly(r, &mut req.body, len)?;
     }
     Ok(req)
 }
@@ -288,23 +392,33 @@ impl<'a> Stream<'a> {
     }
 }
 
-/// Serve one connection: read requests and hand each to `handle` until the
-/// client closes or asks to. `handle` returns whether the connection may be
-/// kept open.
 /// How long a connection may sit idle between requests, and how long a write
 /// may wait on a client that stopped reading (a stalled event-stream reader
 /// must not hold its request -- and whatever that request holds -- forever).
 const IDLE: std::time::Duration = std::time::Duration::from_secs(300);
 const WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(120);
 
-pub fn serve(stream: TcpStream, mut handle: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>) {
+/// Serve one connection: read requests and hand each to `handle` until the
+/// client closes or asks to. `handle` returns whether the connection may be
+/// kept open.
+pub fn serve(stream: TcpStream, handle: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>) {
+    serve_gated(stream, |_| None, handle)
+}
+
+/// [`serve`], `gate` asked about each request's head first (its body still empty): a refusal is answered at once and
+/// the connection closed, without reading -- or waiting on -- a body that may be large, or slow.
+pub fn serve_gated(
+    stream: TcpStream,
+    mut gate: impl FnMut(&Request) -> Option<Refusal>,
+    mut handle: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>,
+) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(IDLE));
     let _ = stream.set_write_timeout(Some(WRITE_STALL));
     let Ok(mut writer) = stream.try_clone() else { return };
     let mut reader = BufReader::new(stream);
     loop {
-        match read_request(&mut reader, &mut writer) {
+        match read_gated(&mut reader, &mut writer, &mut gate) {
             Ok(req) => {
                 let keep = req.keep_alive();
                 match handle(&req, &mut writer) {
@@ -317,9 +431,23 @@ pub fn serve(stream: TcpStream, mut handle: impl FnMut(&Request, &mut TcpStream)
                 let _ = respond(&mut writer, 400, "application/json", body.as_bytes(), false);
                 return;
             }
+            Err(ReadError::Refused(r)) => {
+                let _ = respond(&mut writer, r.status, "application/json", r.body.as_bytes(), false);
+                linger(&mut reader, &writer);
+                return;
+            }
             Err(_) => return,
         }
     }
+}
+
+/// After a refusal sent with the body still coming: the rest of what is on its way (a little of it, briefly) read and
+/// dropped before closing, as closing on unread bytes resets the connection, which can lose the refusal before the
+/// client reads it.
+fn linger(reader: &mut BufReader<TcpStream>, writer: &TcpStream) {
+    let _ = writer.shutdown(std::net::Shutdown::Write);
+    let mut r = Within { r: reader, until: Instant::now() + Duration::from_secs(2) };
+    let _ = io::copy(&mut (&mut r).take(1 << 20), &mut io::sink());
 }
 
 /// A response being read by [`fetch`]: the status and headers are in; the body
@@ -481,6 +609,73 @@ mod tests {
         let body = b"5\r\nhello\r\nfffffffffffffffd\r\nxx\r\n0\r\n\r\n";
         let mut r = BufReader::new(&body[..]);
         assert!(matches!(chunked_body(&mut r, 1 << 20), Err(ReadError::Bad(_))));
+    }
+
+    #[test]
+    fn a_trickled_request_is_held_to_its_deadline_not_each_read_to_its_own() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            // a byte every 50 ms, never a whole line
+            for _ in 0..40 {
+                if c.write_all(b"G").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = BufReader::new(stream);
+        let started = Instant::now();
+        let mut r = Within { r: &mut reader, until: Instant::now() + Duration::from_millis(300) };
+        let got = line(&mut r);
+        assert!(matches!(got, Err(ReadError::Io)), "the line should time out");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        drop(reader);
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn a_gate_refuses_on_the_head_before_any_body_is_asked_for() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut handled = false;
+            serve_gated(
+                stream,
+                |req| (req.header("authorization") != Some("Bearer k")).then(|| Refusal::new(401, "missing or wrong API key", "invalid_api_key")),
+                |_, _| {
+                    handled = true;
+                    Ok(false)
+                },
+            );
+            handled
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // 64 MiB claimed, and waiting to be told to send it
+        c.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 67108864\r\nExpect: 100-continue\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        c.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 401 "), "{reply}");
+        assert!(!reply.contains("100 Continue"), "{reply}");
+        assert!(reply.contains("invalid_api_key"), "{reply}");
+        assert!(!server.join().unwrap(), "the handler never ran");
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_length_is_an_error_and_a_whole_one_arrives() {
+        let mut short = BufReader::new(&b"hello"[..]);
+        let mut body = Vec::new();
+        assert!(matches!(read_exactly(&mut short, &mut body, 64 << 20), Err(ReadError::Io)));
+        assert!(body.capacity() <= 2 << 20, "{}", body.capacity());
+        let mut whole = BufReader::new(&b"hello world"[..]);
+        let mut body = b">".to_vec();
+        assert!(read_exactly(&mut whole, &mut body, 5).is_ok());
+        assert_eq!(body, b">hello");
     }
 
     #[test]

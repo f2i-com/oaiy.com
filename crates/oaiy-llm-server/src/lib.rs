@@ -175,8 +175,8 @@ pub struct Options {
     pub cpu_threads: Option<usize>,
     /// Load the vision tower.
     pub vision: bool,
-    /// Let requests name image files on this machine (default: when
-    /// listening on loopback only).
+    /// Let requests name image files on this machine (default: when listening
+    /// on loopback only and holding a key, see [`Options::local_images_or_default`]).
     pub local_images: Option<bool>,
     /// No per-request log.
     pub quiet: bool,
@@ -302,6 +302,38 @@ impl Default for Options {
     }
 }
 
+impl Options {
+    /// Whether requests may name image files on this machine: as asked, else only on a server that listens on
+    /// loopback and has a key. One with no key answers whatever reaches it, a web page's request too, and the files
+    /// a picture's description tells of (or a missing one's error) are this computer's.
+    pub(crate) fn local_images_or_default(&self, loopback: bool) -> bool {
+        self.local_images.unwrap_or(loopback && self.api_key.is_some())
+    }
+}
+
+/// Connections served at once (each is a thread); one more is answered 503 and closed.
+const MAX_CONNECTIONS: usize = 128;
+
+/// A connection counted in a total until it is dropped (its thread ended, or never started).
+struct Counted(Arc<AtomicUsize>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A request counted under way until it ends, a handler's panic too: one counted for ever kept a host from ever
+/// seeing the server idle, to stop it.
+struct Underway<'a>(&'a Activity);
+
+impl Drop for Underway<'_> {
+    fn drop(&mut self) {
+        self.0.last.store(self.0.now(), Ordering::Relaxed);
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A server whose model thread and accept loop run in the background.
 pub struct Running {
     addr: SocketAddr,
@@ -393,7 +425,7 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
     let request_log = !o.quiet && !o.silent && !o.incognito;
     let ctx = o.ctx;
     let api_key = o.api_key.clone();
-    let local_images = o.local_images.unwrap_or(loopback);
+    let local_images = o.local_images_or_default(loopback);
     // The model actually being served, which is the one `--start` names when it
     // names one -- reporting `--model`'s name while another is loaded is how the
     // wrong model gets blamed for the wait.
@@ -435,25 +467,49 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
         local_images,
         incognito,
         ctx,
+        loopback,
     });
     log(format!("serving {default_name} at http://{addr}/v1"));
     let activity = Arc::new(Activity { active: AtomicUsize::new(0), last: AtomicU64::new(0), epoch: Instant::now() });
     let requests = Arc::clone(&activity);
+    let open = Arc::new(AtomicUsize::new(0));
     let accepting = move |listener: TcpListener| {
-        let (server, requests) = (Arc::clone(&server), Arc::clone(&requests));
+        let (server, requests, open) = (Arc::clone(&server), Arc::clone(&requests), Arc::clone(&open));
         move || {
+            let mut pause = Duration::from_millis(5);
             for conn in listener.incoming() {
-                let Ok(stream) = conn else { continue };
+                let mut stream = match conn {
+                    Ok(stream) => stream,
+                    // Out of file descriptors (EMFILE) fails every accept at once until one closes: a pause, longer
+                    // each time, rather than a core spun at 100%.
+                    Err(e) if !matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset) => {
+                        std::thread::sleep(pause);
+                        pause = (pause * 2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                pause = Duration::from_millis(5);
+                let counted = Counted(Arc::clone(&open));
+                if open.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    drop(counted);
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    let body = br#"{"error":{"message":"too many connections: try again shortly","type":"server_error","code":"busy"}}"#;
+                    let _ = oaiy_engine::http::respond(&mut stream, 503, "application/json", body, false);
+                    continue;
+                }
                 let server = Arc::clone(&server);
                 let requests = Arc::clone(&requests);
                 let peer = stream.peer_addr().map(|p| p.to_string()).unwrap_or_default();
-                std::thread::spawn(move || {
-                    oaiy_engine::http::serve(stream, |req, w| {
+                // (a thread that cannot start drops its connection with it, rather than taking the accept loop down)
+                let started = std::thread::Builder::new().name("request".into()).spawn(move || {
+                    let _counted = counted;
+                    oaiy_engine::http::serve_gated(stream, |req| server.gate(req), |req, w| {
                         let t = Instant::now();
                         requests.active.fetch_add(1, Ordering::Relaxed);
+                        let underway = Underway(&requests);
                         let keep = server.handle(req, w);
-                        requests.last.store(requests.now(), Ordering::Relaxed);
-                        requests.active.fetch_sub(1, Ordering::Relaxed);
+                        drop(underway);
                         // A body can ask for incognito too; only a body that
                         // mentions it is parsed again to find out.
                         let private = api::incognito_request(req, None)
@@ -464,6 +520,9 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
                         keep
                     });
                 });
+                if let (Err(e), false) = (started, silent) {
+                    eprintln!("oaiy-llm-server: a connection dropped, its thread would not start: {e}");
+                }
             }
         }
     };

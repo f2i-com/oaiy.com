@@ -190,6 +190,39 @@ fn prune_others(dir: &Path, fingerprint: u64, most: u64) -> usize {
     gone
 }
 
+/// How long a state being written may go untouched before it is taken for one a process left (killed, or crashed,
+/// while writing it): a writer adds to its file all the while.
+const ABANDONED: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A state being written: its file's name with this process's id in it, so that two servers sharing the folder never
+/// write the same one.
+fn writing(path: &Path) -> PathBuf {
+    path.with_extension(format!("{}.tmp", std::process::id()))
+}
+
+/// The states left half written in `dir` (a temporary file of [`writing`]'s, or of the name before it, untouched for
+/// [`ABANDONED`]) deleted: nothing would ever finish them, and no budget counted them. How many went.
+fn sweep_abandoned(dir: &Path) -> usize {
+    let Ok(items) = fs::read_dir(dir) else { return 0 };
+    let ours = |name: &str| -> bool {
+        let Some(stem) = name.strip_suffix(".tmp") else { return false };
+        let (stem, pid) = stem.split_once('.').unwrap_or((stem, "0"));
+        let hex = |s: &str| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        pid.bytes().all(|b| b.is_ascii_digit()) && stem.split_once('-').is_some_and(|(a, b)| hex(a) && hex(b))
+    };
+    let mut gone = 0;
+    for item in items.flatten() {
+        if !item.file_name().to_str().is_some_and(ours) {
+            continue;
+        }
+        let stale = item.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= ABANDONED);
+        if stale && fs::remove_file(item.path()).is_ok() {
+            gone += 1;
+        }
+    }
+    gone
+}
+
 impl<S: PromptState> DiskCache<S> {
     /// Open (or make) the directory and index this model's entries. This model's states from before its
     /// [`namespace`] moved on are deleted: they are wrong, and as another namespace's no budget would ever take them.
@@ -198,6 +231,10 @@ impl<S: PromptState> DiskCache<S> {
     pub fn open(dir: &Path, fingerprint: u64, budget_bytes: u64) -> oaiy_engine::Result<DiskCache<S>> {
         let (before, fingerprint) = (fingerprint, namespace(fingerprint));
         fs::create_dir_all(dir)?;
+        let abandoned = sweep_abandoned(dir);
+        if abandoned > 0 {
+            eprintln!("oaiy-llm-server: {abandoned} half-written prompt states deleted from {}", dir.display());
+        }
         let pruned = prune_others(dir, fingerprint, budget_bytes.saturating_mul(FOLDER_BUDGETS));
         if pruned > 0 {
             eprintln!("oaiy-llm-server: {pruned} prompt states of other models deleted from {}, the longest unused first (the folder holds {} GB at most)", dir.display(), budget_bytes.saturating_mul(FOLDER_BUDGETS) / 1_000_000_000);
@@ -226,7 +263,7 @@ impl<S: PromptState> DiskCache<S> {
                 for job in jobs {
                     match job {
                         Job::Write { path, header, snap, ready } => {
-                            let tmp = path.with_extension("tmp");
+                            let tmp = writing(&path);
                             let wrote = File::create(&tmp).and_then(|mut f| {
                                 f.write_all(&header)?;
                                 snap.write_to(&mut f)
@@ -447,6 +484,29 @@ mod publication_tests {
         let e = file(5, 1, 900);
         let _ = DiskCache::<State>::open(&dir, 1, 500).unwrap();
         assert!(!e.exists() && d.exists() && mine.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_a_process_left_half_written_goes_and_one_being_written_stays() {
+        let dir = directory("abandoned");
+        let named = |name: &str, age_secs: u64| {
+            let path = dir.join(name);
+            let f = File::create(&path).unwrap();
+            f.set_len(100).unwrap();
+            f.set_modified(SystemTime::now() - std::time::Duration::from_secs(age_secs)).unwrap();
+            path
+        };
+        let old = named("00000000000000aa-00000000000000bb.tmp", 3600);
+        let old_pid = named("00000000000000aa-00000000000000cc.4242.tmp", 3600);
+        let fresh = named("00000000000000aa-00000000000000dd.4243.tmp", 5);
+        let theirs = named("notes.tmp", 3600);
+        let _ = DiskCache::<State>::open(&dir, 1, 10000).unwrap();
+        assert!(!old.exists() && !old_pid.exists(), "abandoned states go");
+        assert!(fresh.exists(), "one still being written stays");
+        assert!(theirs.exists(), "nothing but states is touched");
+        let state = dir.join("00000000000000aa-00000000000000ee.oaiystate");
+        assert!(writing(&state).to_string_lossy().ends_with(&format!("00000000000000aa-00000000000000ee.{}.tmp", std::process::id())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

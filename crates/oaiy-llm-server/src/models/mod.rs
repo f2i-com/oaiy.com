@@ -540,7 +540,11 @@ pub struct Models {
     default_name: String,
     opts: Options,
     loopback: bool,
+    /// The loaded model: held only to look or to swap, never through a load or an unload, so asking which is loaded
+    /// (and a request for it) does not wait on a switch.
     live: Mutex<Option<Live>>,
+    /// Held through a switch, unload and load: one at a time.
+    switch: Mutex<()>,
     timings: Mutex<std::collections::BTreeMap<String, oaiy_engine::json::Json>>,
 }
 
@@ -598,6 +602,7 @@ impl Models {
             opts,
             loopback,
             live: Mutex::new(None),
+            switch: Mutex::new(()),
             timings: Mutex::new(Default::default()),
         })
     }
@@ -667,6 +672,17 @@ impl Models {
             .map(|l| l.name.clone())
     }
 
+    /// The loaded model, if one is: never loading one.
+    pub fn live(&self) -> Option<Active> {
+        self.live_as(None)
+    }
+
+    /// The loaded model if it is `name` (any, for none).
+    fn live_as(&self, name: Option<&str>) -> Option<Active> {
+        let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        live.as_ref().filter(|l| name.is_none_or(|n| l.name == n)).map(|l| Active { jobs: l.jobs.clone(), cfg: Arc::clone(&l.cfg), flavour: Arc::clone(&l.flavour) })
+    }
+
     /// Make `want` the running model and hand back what a request needs.
     ///
     /// Already running: this is a lock and three clones. Otherwise the current
@@ -674,25 +690,32 @@ impl Models {
     /// models are never resident together.
     pub fn activate(&self, want: Option<&str>) -> std::result::Result<Active, String> {
         if let Some(want)=want {if !self.specs.iter().any(|s|s.name==want){return Err(format!("no configured model called {want}"));}}
-        let route = self.image_route.lock().unwrap_or_else(|p|p.into_inner());
         // During image work all chat turns stay on the controller. The media
         // supervisor clears this route after its worker has released memory.
-        self.activate_inner(route.as_deref().or(want))
+        let target = || self.image_route.lock().unwrap_or_else(|p|p.into_inner()).clone().or(want.map(str::to_owned));
+        if let Some(a) = self.live_as(Some(target().as_deref().unwrap_or(&self.default_name))) {
+            return Ok(a);
+        }
+        let _switching = self.switch.lock().unwrap_or_else(|p| p.into_inner());
+        // Asked again: image work may have begun while another switch ran.
+        self.activate_inner(target().as_deref())
     }
 
     pub fn image_config(&self) -> Option<&crate::media::Config> { self.image_config.as_ref() }
 
     pub fn begin_images(&self) -> std::result::Result<(), String> {
         let cfg=self.image_config.as_ref().ok_or("image generation is not configured")?;
-        let mut route=self.image_route.lock().unwrap_or_else(|p|p.into_inner());
-        // Only publish the route after a successful unload-and-load handoff.
+        // Only publish the route after a successful unload-and-load handoff, no other switch between the two (a
+        // switch reads the route under this lock).
+        let _switching = self.switch.lock().unwrap_or_else(|p| p.into_inner());
         drop(self.activate_inner(Some(&cfg.controller_name))?);
-        *route=Some(cfg.controller_name.clone());
+        *self.image_route.lock().unwrap_or_else(|p|p.into_inner())=Some(cfg.controller_name.clone());
         Ok(())
     }
 
     pub fn release_images(&self) { *self.image_route.lock().unwrap_or_else(|p|p.into_inner())=None; }
 
+    /// [`Self::activate`]'s switch, `switch` held.
     fn activate_inner(&self, want: Option<&str>) -> std::result::Result<Active, String> {
         let want = want.unwrap_or(&self.default_name);
         let spec = self
@@ -707,21 +730,16 @@ impl Models {
             })?
             .clone();
 
-        let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(l) = live.as_ref() {
-            if l.name == spec.name {
-                return Ok(Active {
-                    jobs: l.jobs.clone(),
-                    cfg: Arc::clone(&l.cfg),
-                    flavour: Arc::clone(&l.flavour),
-                });
-            }
+        if let Some(a) = self.live_as(Some(&spec.name)) {
+            return Ok(a);
         }
 
         // Unload first. Dropping the sender ends the engine's `for job in jobs`
         // loop; joining waits for the model to be dropped with the thread, which
-        // is what frees the VRAM and the expert cache.
-        if let Some(l) = live.take() {
+        // is what frees the VRAM and the expert cache. (Nothing is loaded
+        // meanwhile, as `/v1/models` then says.)
+        let old = self.live.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(l) = old {
             self.say(format!("unloading {}", l.name));
             drop(l.jobs);
             let _ = l.thread.join();
@@ -767,7 +785,7 @@ impl Models {
             cfg: Arc::clone(&next.cfg),
             flavour: Arc::clone(&next.flavour),
         };
-        *live = Some(next);
+        *self.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(next);
         Ok(active)
     }
 
@@ -829,7 +847,7 @@ impl Models {
             gemma_vision: None,
             glm_vision: None,
             image_token_id: 0,
-            local_images: o.local_images.unwrap_or(self.loopback),
+            local_images: o.local_images_or_default(self.loopback),
         }
     }
 

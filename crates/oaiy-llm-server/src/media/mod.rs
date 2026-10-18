@@ -8,10 +8,10 @@ use oaiy_engine::json::Json;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::Duration,
 };
@@ -155,22 +155,47 @@ struct Job {
     error: Option<String>,
     cancel: Arc<AtomicBool>,
 }
-struct Worker(std::process::Child);
-impl std::ops::Deref for Worker {
-    type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+/// A media worker process, stopped (and reaped) when this is dropped, and listed in [`WORKERS`] meanwhile.
+struct Worker(Arc<Mutex<Child>>);
+
+/// The media workers running now, where [`stop_workers`] reaches them.
+static WORKERS: Mutex<Vec<Weak<Mutex<Child>>>> = Mutex::new(Vec::new());
+
+impl Worker {
+    fn running(child: Child) -> Worker {
+        let child = Arc::new(Mutex::new(child));
+        let mut all = WORKERS.lock().unwrap_or_else(|p| p.into_inner());
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(&child));
+        Worker(child)
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut Child) -> T) -> T {
+        f(&mut self.0.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn stop(&self) -> std::io::Result<std::process::ExitStatus> {
+        self.with(|c| {
+            let _ = c.kill();
+            c.wait()
+        })
     }
 }
-impl std::ops::DerefMut for Worker {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+
 impl Drop for Worker {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.stop();
+    }
+}
+
+/// Stop every media worker running: for an exit that runs no destructors (`process::exit`, as `--watch-stdin` exits
+/// when its supervisor has gone), which would leave a worker holding the GPU on its own.
+pub fn stop_workers() {
+    let all: Vec<_> = WORKERS.lock().unwrap_or_else(|p| p.into_inner()).iter().filter_map(Weak::upgrade).collect();
+    for child in all {
+        let mut child = child.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 pub struct Images {
@@ -192,7 +217,16 @@ impl Images {
             .is_some_and(|j| matches!(j.state.as_str(), "queued" | "running" | "cancelling"))
     }
     pub fn status(&self) -> Json {
-        let job = self.job.lock().unwrap_or_else(|p| p.into_inner());
+        // The job copied out first: what the configuration offers is read from its files, which a progress update
+        // (and a submit, and a cancel) must not wait behind.
+        let job = self.job.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|j| Json::obj([
+            ("id", Json::Int(j.id as i64)),
+            ("kind", Json::str(j.kind)),
+            ("state", Json::str(&j.state)),
+            ("progress", j.progress.clone()),
+            ("result", j.result.clone()),
+            ("error", j.error.as_ref().map_or(Json::Null, Json::str)),
+        ]));
         let config = self.models.image_config();
         let capabilities = config.map(Config::capabilities).unwrap_or(Json::Null);
         Json::obj([
@@ -207,19 +241,7 @@ impl Images {
                 "controller_model",
                 config.map_or(Json::Null, |c| Json::str(&c.controller_name)),
             ),
-            (
-                "job",
-                job.as_ref().map_or(Json::Null, |j| {
-                    Json::obj([
-                        ("id", Json::Int(j.id as i64)),
-                        ("kind", Json::str(j.kind)),
-                        ("state", Json::str(&j.state)),
-                        ("progress", j.progress.clone()),
-                        ("result", j.result.clone()),
-                        ("error", j.error.as_ref().map_or(Json::Null, Json::str)),
-                    ])
-                }),
-            ),
+            ("job", job.unwrap_or(Json::Null)),
         ])
     }
     pub fn cancel(&self) {
@@ -364,15 +386,13 @@ impl Images {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let mut child = Worker(
-            command
-                .spawn()
-                .map_err(|e| format!("starting native diffusion worker: {e}"))?,
-        );
+        let mut spawned = command
+            .spawn()
+            .map_err(|e| format!("starting native diffusion worker: {e}"))?;
+        let (input, stdout, stderr) = (spawned.stdin.take(), spawned.stdout.take(), spawned.stderr.take());
+        let child = Worker::running(spawned);
         let payload = request.to_json();
-        let sent = child
-            .stdin
-            .take()
+        let sent = input
             .ok_or("worker stdin missing")
             .and_then(|mut input| {
                 input
@@ -380,12 +400,11 @@ impl Images {
                     .map_err(|_| "writing worker request failed")
             });
         if let Err(e) = sent {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.stop();
             return Err(e.into());
         }
-        let stdout = child.stdout.take().ok_or("worker stdout missing")?;
-        let stderr = child.stderr.take().ok_or("worker stderr missing")?;
+        let stdout = stdout.ok_or("worker stdout missing")?;
+        let stderr = stderr.ok_or("worker stderr missing")?;
         let output = std::thread::spawn(move || {
             let mut bytes = Vec::new();
             stdout
@@ -413,15 +432,13 @@ impl Images {
         }
         let status = loop {
             if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                break child.wait().map_err(|e| e.to_string());
+                break child.stop().map_err(|e| e.to_string());
             }
-            match child.try_wait() {
+            match child.with(Child::try_wait) {
                 Ok(Some(s)) => break Ok(s),
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                 Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = child.stop();
                     break Err(e.to_string());
                 }
             }
