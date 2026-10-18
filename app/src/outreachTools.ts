@@ -88,7 +88,7 @@ export function outreachTools(deps: OutreachToolDeps): SessionTool[] {
               },
             },
             openingLine: { type: 'string', description: 'Calls: the exact first words when they answer, saying who is calling. {name}, {first_name}, {receptionist}, {business} and their fields are filled in.' },
-            textTemplate: { type: 'string', description: 'Texts: the first message, saying who it is from, filled in the same way.' },
+            textTemplate: { type: 'string', description: 'Texts: the first message, saying who it is from, filled in the same way. At most 600 bytes once filled in (a plain letter is one byte; an accented letter or an emoji 2 to 4).' },
             voicemail: { type: 'string', enum: ['no_message', 'leave_message'], description: 'Calls: on a voicemail, hang up (default) or leave voicemailMessage' },
             voicemailMessage: { type: 'string' },
             retries: { type: 'object', properties: { times: { type: 'number' }, gapMinutes: { type: 'number' } }, description: 'Calls: tries after the first (default 2, 60 minutes apart)' },

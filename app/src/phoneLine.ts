@@ -5,7 +5,9 @@
  * waiting, a dial of another's), and the calm minute after any call ends all
  * keep the line busy. Aokie itself refuses a dial while a call is in progress;
  * this keeps the app from asking while one is ringing, or starting before it
- * is known.
+ * is known. A caller waiting keeps it busy only while the call they knocked
+ * on goes on, and a few minutes at most: Aokie says nothing more of a knock
+ * that is answered under a new id, or that its screening turned away.
  */
 import type { DesktopEvent } from './desktop/bridge';
 
@@ -15,6 +17,8 @@ export const CALM_MS = 60_000;
 const PLACED_LOST_MS = 10 * 60_000;
 /** A call of another's never heard to end: let go after this long. */
 const FOREIGN_LOST_MS = 2 * 60 * 60_000;
+/** A caller waiting (call waiting) never heard of again: let go after this long (the network gives up on a knock in a minute or two). */
+export const WAITING_LOST_MS = 3 * 60_000;
 
 export type LineUser = 'callback' | 'outreach';
 
@@ -23,6 +27,8 @@ export class PhoneLine {
   placed: { by: LineUser; callId?: string; operationId?: string; at: number } | null = null;
   /** Calls on the line that are not ours, by their id, with when they were seen. */
   private foreign = new Map<string, number>();
+  /** Callers waiting (call waiting), by their id: the call they knocked on, and when. */
+  private waiting = new Map<string, { on: string; at: number }>();
   /** No dial before this (ms): the calm after a call. */
   calmAt = 0;
 
@@ -33,12 +39,15 @@ export class PhoneLine {
     switch (e.name) {
       case 'aokie.call.incoming': {
         const call = id(d.callId) || e.correlationId;
-        if (call) this.foreign.set(call, now);
+        if (!call) break;
+        // (A caller waiting who is taken rings in under the id they waited with: a call of their own now.)
+        this.waiting.delete(call);
+        this.foreign.set(call, now);
         break;
       }
       case 'aokie.call.waiting': {
         const call = id(d.waitingCallId);
-        if (call) this.foreign.set(call, now);
+        if (call) this.waiting.set(call, { on: id(d.callId) || e.correlationId, at: now });
         break;
       }
       case 'aokie.call.outbound.dialing': {
@@ -51,6 +60,9 @@ export class PhoneLine {
       case 'aokie.call.ended': {
         const call = id(d.callId) || e.correlationId;
         this.foreign.delete(call);
+        // Those waiting on it go with it: one who rings on rings in anew (aokie.call.incoming); one who gave up is no one.
+        this.waiting.delete(call);
+        for (const [knock, w] of this.waiting) if (w.on === call) this.waiting.delete(knock);
         if (this.placed && this.placed.callId === call) this.placed = null;
         this.calmAt = Math.max(this.calmAt, now + CALM_MS);
         break;
@@ -69,7 +81,8 @@ export class PhoneLine {
   idle(now: number, liveCall: boolean): boolean {
     if (this.placed && now - this.placed.at > PLACED_LOST_MS) this.placed = null;
     for (const [call, at] of this.foreign) if (now - at > FOREIGN_LOST_MS) this.foreign.delete(call);
-    return !this.placed && !this.foreign.size && !liveCall && now >= this.calmAt;
+    for (const [call, w] of this.waiting) if (now - w.at > WAITING_LOST_MS) this.waiting.delete(call);
+    return !this.placed && !this.foreign.size && !this.waiting.size && !liveCall && now >= this.calmAt;
   }
 
   /** The app is about to dial. */

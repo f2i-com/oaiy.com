@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DesktopEvent } from '../../src/desktop/bridge';
-import { CALM_MS, PhoneLine } from '../../src/phoneLine';
+import { CALM_MS, PhoneLine, WAITING_LOST_MS } from '../../src/phoneLine';
 import { Callbacks, type Callback } from '../../src/callbacks';
 import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
 import type { Desktop } from '../../src/desktop/bridge';
@@ -25,14 +25,35 @@ describe("the phone's one line", () => {
   it('a call coming in, or one waiting, keeps it busy until it ends; so does a live call here', () => {
     const line = new PhoneLine();
     const t = 5_000_000;
-    line.event(ev('aokie.call.incoming', { from: '+61400000001' }, 'call_in'), t);
+    line.event(ev('aokie.call.incoming', { from: '+61491570156' }, 'call_in'), t);
     expect(line.idle(t + CALM_MS * 5, false)).toBe(false);
-    line.event(ev('aokie.call.waiting', { callId: 'call_in', waitingCallId: 'call_w' }), t + 1000);
+    line.event(ev('aokie.call.waiting', { callId: 'call_in', from: '+61491570157', waitingCallId: 'call_w' }, 'call_in'), t + 1000);
+    // Taken: they ring in under the id they waited with, a call of their own, busy until it ends.
+    line.event(ev('aokie.call.incoming', { callId: 'call_w', from: '+61491570157' }, 'call_w'), t + 1500);
     line.event(ev('aokie.call.ended', { callId: 'call_in' }), t + 2000);
-    expect(line.idle(t + 2000 + CALM_MS, false)).toBe(false);
+    expect(line.idle(t + 2000 + WAITING_LOST_MS + CALM_MS, false)).toBe(false);
     line.event(ev('aokie.call.ended', { callId: 'call_w' }), t + 3000);
     expect(line.idle(t + 3000 + CALM_MS, false)).toBe(true);
     expect(line.idle(t + 3000 + CALM_MS, true)).toBe(false);
+  });
+
+  it('a caller waiting goes with the call they knocked on (Aokie says no more of a knock taken under a new id, or screened)', () => {
+    const line = new PhoneLine();
+    const t = 7_000_000;
+    line.event(ev('aokie.call.incoming', { callId: 'call_in', from: '+61491570156' }, 'call_in'), t);
+    line.event(ev('aokie.call.waiting', { callId: 'call_in', from: '+61491570157', waitingCallId: 'call_w' }, 'call_in'), t + 1000);
+    line.event(ev('aokie.call.ended', { callId: 'call_in' }), t + 2000);
+    expect(line.idle(t + 2000 + CALM_MS, false)).toBe(true);
+  });
+
+  it('a caller waiting never heard of again is let go after a few minutes, not hours', () => {
+    const line = new PhoneLine();
+    const t = 9_000_000;
+    // The call they knocked on was never seen here (the page opened during it).
+    line.event(ev('aokie.call.waiting', { callId: 'call_old', from: '', waitingCallId: 'call_w' }, 'call_old'), t);
+    expect(line.idle(t + CALM_MS, false)).toBe(false);
+    expect(line.idle(t + WAITING_LOST_MS - 1, false)).toBe(false);
+    expect(line.idle(t + WAITING_LOST_MS + 1, false)).toBe(true);
   });
 
   it("another's dial (a call back's) is not ours, and blocks until it ends", () => {

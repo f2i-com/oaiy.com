@@ -510,18 +510,24 @@ describe('text-message conversations', () => {
     expect(fake.bodies).toHaveLength(3);
   });
 
-  it('refuses an empty or overlong reply, and says when the desktop is gone', async () => {
+  it('refuses an empty or overlong reply (the phone sends 600 bytes, not letters), and says how long it is', async () => {
     fakeProvider('openai', [
       { calls: [{ name: 'send_text_message', input: { body: '' } }] },
-      { calls: [{ name: 'send_text_message', input: { body: 'x'.repeat(1700) } }] },
-      { text: 'gave up' },
+      { calls: [{ name: 'send_text_message', input: { body: 'x'.repeat(601) } }] },
+      // 301 letters, but 602 bytes.
+      { calls: [{ name: 'send_text_message', input: { body: 'é'.repeat(301) } }] },
+      { calls: [{ name: 'send_text_message', input: { body: 'x'.repeat(600) } }] },
+      { text: 'sent' },
     ]);
-    const { sessions, events } = setup({ answer: true, instructions: '' });
-    await sessions.textArrived('+61400000003', '', 'hi');
+    const { sessions, events, desktop } = setup({ answer: true, instructions: '' });
+    await sessions.textArrived('+61491570156', 'Sam', 'hi');
     await settled(sessions);
     const errors = events.filter((e) => e.event.type === 'tool_result').map((e) => (e.event as Extract<AgentEvent, { type: 'tool_result' }>).result.content);
     expect(errors[0]).toContain('body is empty');
-    expect(errors[1]).toContain('keep it under 1600');
+    expect(errors[1]).toContain('Not sent: Texts can be up to 600 bytes; this one is 601');
+    expect(errors[2]).toContain('Texts can be up to 600 bytes; this one is 602');
+    expect(errors[2]).toContain('Shorten it and send it again.');
+    expect(desktop.commands.map((c) => String(c.payload.body).length)).toEqual([600]);
   });
 
   it('keeps its conversations: a new page loads them back', async () => {
@@ -543,17 +549,41 @@ describe('text-message conversations', () => {
 });
 
 describe('a text the phone delivers again', () => {
-  it("is not answered twice: the phone's handle says it is the same text", async () => {
+  const received = (seq: number, idempotencyKey: string, data: Record<string, unknown>): DesktopEvent => ({ seq, name: 'aokie.sms.received', source: 'aokie', correlationId: `c${seq}`, idempotencyKey, occurredAt: '', data: { from: '+61491570156', name: 'Sam', ...data } });
+
+  it('is not answered twice: it comes again under its own key', async () => {
     fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Hi!' } }] }, { text: 'done' }]);
     const { sessions, desktop, store } = setup({ answer: true, instructions: '' });
-    const hello = { seq: 1, name: 'aokie.sms.received', source: 'aokie', correlationId: 'c1', idempotencyKey: 'k1', occurredAt: '', data: { from: '+61491570006', name: 'Liam', body: 'Hello', handle: '040000000000002F' } };
-    await sessions.desktopEvent(hello);
+    const key = 'aokie:sms_001122334455_040000000000002F:sms.received:v1';
+    await sessions.desktopEvent(received(1, key, { body: 'Hello', handle: '040000000000002F' }));
     await settled(sessions);
-    // The phone reconnects and delivers it again, under a new correlation.
-    expect(await sessions.desktopEvent({ ...hello, seq: 7, correlationId: 'c7', idempotencyKey: 'k7' })).toBeNull();
+    // The phone reconnects and delivers it again.
+    expect(await sessions.desktopEvent(received(7, key, { body: 'Hello', handle: '040000000000002F' }))).toBeNull();
     await settled(sessions);
     expect(desktop.commands).toHaveLength(1);
-    expect(store.index[0].handles).toEqual(['040000000000002F']);
+    expect(store.index[0].handles).toEqual([key]);
+  });
+
+  it("a new text under a handle the phone used before (Android gives a deleted text's to a new one) is a new text, under its own key", async () => {
+    fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Hi Sam!' } }] }, { text: 'done' }, { calls: [{ name: 'send_text_message', input: { body: 'Saturday is fine.' } }] }, { text: 'done' }]);
+    const { sessions, desktop } = setup({ answer: true, instructions: '' });
+    await sessions.desktopEvent(received(1, 'aokie:sms_001122334455_2F:sms.received:v1', { body: 'Hello', handle: '2F' }));
+    await settled(sessions);
+    const again = await sessions.desktopEvent(received(2, 'aokie:sms_001122334455_2F:sms.received.9a3c51e07f2b4d68:v1', { body: 'Can I come Saturday?', handle: '2F' }));
+    expect(again).not.toBeNull();
+    await settled(sessions);
+    expect(desktop.commands.map((c) => c.payload.body)).toEqual(['Hi Sam!', 'Saturday is fine.']);
+  });
+
+  it('with no key, its handle says it is the same text; with neither, nothing does, and an empty handle keeps nothing out', async () => {
+    fakeProvider('openai', [{ text: 'noted' }, { text: 'noted' }, { text: 'noted' }]);
+    const { sessions, store } = setup({ answer: false, instructions: '' });
+    expect(await sessions.desktopEvent(received(1, '', { body: 'Hello', handle: '2F' }))).not.toBeNull();
+    expect(await sessions.desktopEvent(received(2, '', { body: 'Hello', handle: '2F' }))).toBeNull();
+    expect(await sessions.desktopEvent(received(3, '', { body: 'One', handle: '' }))).not.toBeNull();
+    expect(await sessions.desktopEvent(received(4, '', { body: 'Two', handle: '  ' }))).not.toBeNull();
+    expect(await sessions.desktopEvent(received(5, '', { body: 'Two' }))).not.toBeNull();
+    expect(store.index[0].handles).toEqual(['2F']);
   });
 });
 

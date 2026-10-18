@@ -370,6 +370,41 @@ describe('a phone call answered by the agent', () => {
     expect(calls).toEqual([['finish', 'call_g', 'Thanks, bye!']]);
   });
 
+  it("on a phone that does not let the receptionist hang up, the goodbye is said and the call goes on: the agent is told so, and the caller's next words are answered", async () => {
+    const LEFT_OPEN = 'Your goodbye is being said. This phone does not let you hang up: the call stays open until the caller hangs up. Write nothing more unless they speak again, and answer them if they do.';
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'end_call', input: { goodbye: 'Thanks, Sam. Bye!' } }] },
+      // Written after end_call, while the caller speaks again: not said in that run (the goodbye was its last word).
+      { text: 'Done.', hold: { at: 0, until: held } },
+      { text: 'Sure, we open at eight on Saturday.' },
+    ]);
+    const { sessions, calls, desktop } = setup();
+    desktop.finishCall = async (callId: string, goodbye: string) => {
+      calls.push(['finish', callId, goodbye]);
+      return { ok: true, output: { accepted: true, callStaysOpen: true, instruction: LEFT_OPEN } };
+    };
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_open', from: '+61491570156', name: 'Sam' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_open', text: "That's all, thanks." });
+    for (let i = 0; i < 100 && fake.bodies.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toEqual([['finish', 'call_open', 'Thanks, Sam. Bye!']]);
+    // The agent reads the desktop's words, not "then the call ends".
+    const result = JSON.stringify(call!.agent.turns.find((t) => t.role === 'tool'));
+    expect(result).toContain(LEFT_OPEN);
+    expect(result).not.toContain('then the call ends');
+    // The caller is still there, and speaks again: the call goes on, and they are answered aloud.
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_open', text: 'Oh, what time do you open on Saturday?' });
+    release();
+    await settled(sessions);
+    expect(call!.callId).toBe('call_open');
+    expect(calls).toEqual([
+      ['finish', 'call_open', 'Thanks, Sam. Bye!'],
+      ['say', 'call_open', 'Sure, we open at eight on Saturday.'],
+    ]);
+    expect(fake.bodies).toHaveLength(3);
+  });
+
   it('a reply that speaks and ends the call says one goodbye: its own words, then the phone hangs up after them', async () => {
     // Live 29 Sept 2026: "You're very welcome, Liam." then end_call's "You're welcome, Liam, have a great day!".
     const fake = fakeProvider('openai', [

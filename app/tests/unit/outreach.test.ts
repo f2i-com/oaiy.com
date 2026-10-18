@@ -6,7 +6,7 @@ import { PhoneLine } from '../../src/phoneLine';
 import { Vfs } from '../../src/vfs/vfs';
 import {
   AFTER_CALL_MS, DIAL_LOST_MS, OUTREACH_AFTER_CALL, Outreach, SMS_ACK_MS, TEXT_GAP_MS, csvCell, fill, mdCell, planOutreach,
-  resultsCsv, resultsMarkdown, type Campaign, type DoNotContact, type PhoneRules,
+  resultsCsv, resultsMarkdown, textTooLong, type Campaign, type DoNotContact, type PhoneRules,
 } from '../../src/outreach';
 
 beforeAll(() => setLocalCountry('AU'));
@@ -62,10 +62,15 @@ function rig(o: { screening?: Screening | null; rules?: Partial<PhoneRules>; ref
     saveDoNotContact: async (list: DoNotContact[]) => void (dnc = [...list]),
   };
   const commands: Array<{ command: string; payload: Record<string, unknown>; key: string }> = [];
-  const state = { refuse: o.refuse ?? '', dialN: 0 };
+  const state = { refuse: o.refuse ?? '', refuseText: '', beforeRefusal: null as null | ((payload: Record<string, unknown>) => Promise<void>), dialN: 0 };
   const desktop = {
     command: async (_c: string, command: string, payload: Record<string, unknown>, key: string) => {
       if (state.refuse && command === 'call.dial') throw new Error(state.refuse);
+      if (state.refuseText && command === 'sms.send') {
+        // What Aokie sends of a refusal as it answers it (aokie.sms.failed, refused), when the test wants it first.
+        await state.beforeRefusal?.(payload);
+        throw new Error(state.refuseText);
+      }
       commands.push({ command, payload, key });
       if (command === 'call.dial') {
         state.dialN++;
@@ -198,6 +203,20 @@ describe('planning an outreach', () => {
     expect(fill('Hi {first_name}, your {Service}', { name: 'Jane Smith', fields: { service: 'mow' } })).toEqual({ text: 'Hi Jane, your mow', missing: [] });
   });
 
+  it("a text longer than the phone sends (600 bytes, not letters) is refused, saying how long it is, so it can be shortened", () => {
+    const ctx = { identity: GREEN, screening: null, doNotContact: [], inTextCampaign: () => null, slugs: new Set<string>() };
+    const people = [{ name: 'Sam', number: '0491 570 156' }];
+    const plain = `Hi {first_name}, it's Aokie from Greenleaf Lawns. ${'a'.repeat(550)}`;
+    expect(new TextEncoder().encode(fill(plain, { name: 'Sam', fields: {} }).text).length).toBeLessThanOrEqual(600);
+    expect(typeof planOutreach({ ...TEXTS, textTemplate: plain, people }, ctx)).toBe('object');
+    // As many letters, but each "é" two bytes: over.
+    const accented = `Hi {first_name}, it's Aokie from Greenleaf Lawns. ${'é'.repeat(550)}`;
+    const bytes = new TextEncoder().encode(fill(accented, { name: 'Sam', fields: {} }).text).length;
+    expect(planOutreach({ ...TEXTS, textTemplate: accented, people }, ctx)).toBe(`Texts can be up to 600 bytes; the one for Sam is ${bytes} (a plain letter or digit is one byte; an accented letter, a letter of another alphabet or an emoji is 2 to 4). Shorten the textTemplate.`);
+    expect(textTooLong('x'.repeat(600))).toBe('');
+    expect(textTooLong('🙂'.repeat(151))).toMatch(/^Texts can be up to 600 bytes; this one is 604 /);
+  });
+
   it('a text campaign leaves out someone still waiting on a reply to another', async () => {
     const r = rig();
     await r.start(TEXTS);
@@ -213,7 +232,7 @@ describe('calling down a list', () => {
     const r = rig();
     const c = await r.start(CALLS);
     await r.outreach.tick();
-    expect(r.dials()).toEqual([{ command: 'call.dial', key: `oaiy:outreach:${c.id}:p1:1`, payload: { number: '+61412345678', openingLine: "Hi Jane, it's Greenleaf Lawns about your lawn mow on Fri 2 Oct 10:30. Have you got a minute?", purpose: expect.stringContaining('Confirm Friday bookings: Confirm') } }]);
+    expect(r.dials()).toEqual([{ command: 'call.dial', key: expect.stringMatching(new RegExp(`^oaiy:outreach:${c.id}:p1:1\\.[0-9a-f]{8}$`)), payload: { number: '+61412345678', openingLine: "Hi Jane, it's Greenleaf Lawns about your lawn mow on Fri 2 Oct 10:30. Have you got a minute?", purpose: expect.stringContaining('Confirm Friday bookings: Confirm') } }]);
     // The line is ours until it ends: no second dial.
     r.later(30_000);
     await r.outreach.tick();
@@ -294,6 +313,42 @@ describe('calling down a list', () => {
     await r.outreach.event(ev('aokie.hardware.error', { code: 'control_failed', action: 'call.dial', operationId: 'op_1' }));
     expect(c.people[0]).toMatchObject({ state: 'queued', tries: 0, nextAt: T0 + 60_000 });
   });
+
+  it('a try given back rings again under a key of its own: Aokie answers a key it has seen with that dial, and never rings', async () => {
+    const r = rig();
+    const c = await r.start({ ...CALLS, people: [{ name: 'Sam', number: '0491 570 156', fields: { service: 'lawn mow', appointment: 'Fri 2 Oct 10:30' } }] });
+    const again = async () => {
+      r.later(CALM);
+      r.line.calmAt = 0;
+      await r.outreach.tick();
+    };
+    await r.outreach.tick();
+    // The radio could not place it (a call came in first).
+    await r.outreach.event(ev('aokie.hardware.error', { code: 'control_failed', action: 'call.dial', operationId: 'op_1' }));
+    r.line.placed = null;
+    await again();
+    // The phone ended the dial itself (OAIY's voice did not start).
+    await r.endOnLine('call_2', 'no_answer', 'cancelled');
+    await again();
+    // The phone went away during the call.
+    await r.endOnLine('call_3', 'completed', 'device_lost');
+    await again();
+    // They asked to be rung back later.
+    await r.outreach.forCall('call_4', '+61491570156')!.resultTool().run({ outcome: 'callback_requested', summary: 'Busy, call at 3.', callBackAt: '2026-09-29 15:00' });
+    await r.endOnLine('call_4', 'completed');
+    expect(c.people[0]).toMatchObject({ state: 'waiting', tries: 0 });
+    r.at(new Date(2026, 8, 29, 15, 0).getTime());
+    await again();
+    const keys = r.dials().map((d) => d.key);
+    expect(keys).toHaveLength(5);
+    // Each "try 1", each its own key.
+    expect(keys.every((k) => k.startsWith(`oaiy:outreach:${c.id}:p1:1.`))).toBe(true);
+    expect(new Set(keys).size).toBe(5);
+    // The key is kept with the dial (saved before it goes): after a reload, the same dial is the same key.
+    const reloaded = new Outreach(r.deps);
+    await reloaded.load();
+    expect(reloaded.campaigns[0].people[0].attempt?.key).toBe(keys.at(-1));
+  });
 });
 
 describe('how each call ends', () => {
@@ -308,7 +363,7 @@ describe('how each call ends', () => {
     expect(r.dials()).toHaveLength(1);
     r.later(11 * MIN);
     await r.outreach.tick();
-    expect(r.dials().map((d) => d.key.split(':').at(-1))).toEqual(['1', '2']);
+    expect(r.dials().map((d) => d.key.split(':').at(-1)!.split('.')[0])).toEqual(['1', '2']);
     await r.endOnLine('call_2', 'no_answer');
     expect(c.people[0]).toMatchObject({ state: 'done', outcome: 'no_answer', tries: 2 });
     expect(r.posted.at(-1)).toBe('[OAIY] Outreach "Confirm Friday bookings" · Jane Smith: no answer. (1 of 1)');
@@ -506,11 +561,14 @@ describe('texting down a list', () => {
   it('a text the phone refused for its number is not a working number; another failure is tried once more', async () => {
     const r = rig();
     const c = await r.start(TEXTS);
-    await r.outreach.tick();
-    r.later(TEXT_GAP_MS);
+    // Refused as it is asked (the command's error), and told as an event too: one refusal.
+    r.state.refuseText = 'recipient: not a number';
     await r.outreach.tick();
     await r.outreach.event(ev('aokie.sms.failed', { messageId: `oaiy-out.${c.id}.p1.1`, reason: 'recipient: not a number', refused: true }));
     expect(c.people[0]).toMatchObject({ state: 'done', outcome: 'invalid_number' });
+    r.state.refuseText = '';
+    r.later(TEXT_GAP_MS);
+    await r.outreach.tick();
     await r.outreach.event(ev('aokie.sms.failed', { messageId: `oaiy-out.${c.id}.p2.1`, reason: 'MAS PUT failed' }));
     expect(c.people[1]).toMatchObject({ state: 'queued', nextAt: r.now() + 5 * MIN });
     r.later(5 * MIN);
@@ -529,6 +587,61 @@ describe('texting down a list', () => {
     r.later(60 * MIN);
     await r.outreach.tick();
     expect(r.commands.filter((x) => x.command === 'sms.send')).toHaveLength(1);
+  });
+
+  it('a refused text counts once: its command error and its refused event are the one refusal, either way round', async () => {
+    const sam = [{ name: 'Sam', number: '0491 570 156' }];
+    for (const eventFirst of [false, true]) {
+      const r = rig();
+      const c = await r.start({ ...TEXTS, people: sam });
+      const refused = (n: number) => ev('aokie.sms.failed', { messageId: `oaiy-out.${c.id}.p1.${n}`, to: '+61491570156', reason: 'sms.send refused: no phone is connected', refused: true });
+      r.state.refuseText = 'sms.send refused: no phone is connected';
+      if (eventFirst) r.state.beforeRefusal = async (payload) => void (await r.outreach.event(refused(Number(String(payload.messageId).split('.').at(-1)))));
+      await r.outreach.tick();
+      if (!eventFirst) await r.outreach.event(refused(1));
+      // Tried once more, after five minutes.
+      expect(c.people[0]).toMatchObject({ state: 'queued', nextAt: T0 + 5 * MIN, attempt: { failedOnce: true } });
+      r.later(5 * MIN);
+      await r.outreach.tick();
+      if (!eventFirst) await r.outreach.event(refused(2));
+      expect(c.people[0]).toMatchObject({ state: 'done', outcome: 'unreachable', tries: 2 });
+    }
+  });
+
+  it('a text the phone may have sent (its outcome unknown) is never sent again: it waits for their reply, and says it may not have gone', async () => {
+    const r = rig();
+    const c = await r.start({ ...TEXTS, people: [{ name: 'Sam', number: '0491 570 156' }] });
+    await r.outreach.tick();
+    await r.outreach.event(ev('aokie.sms.failed', { messageId: `oaiy-out.${c.id}.p1.1`, to: '+61491570156', reason: 'the phone went away with the text', outcomeUnknown: true }));
+    expect(c.people[0]).toMatchObject({ state: 'awaiting_reply', unconfirmed: true, tries: 1, summary: 'The phone never said the text went: it may have, so it was not sent again.' });
+    r.later(60 * MIN);
+    await r.outreach.tick();
+    expect(r.commands.filter((x) => x.command === 'sms.send')).toHaveLength(1);
+    expect(r.outreach.status(c.id)).toContain('Sam: awaiting reply. The phone never said their text went.');
+    // It went after all: no doubt left.
+    await r.outreach.event(ev('aokie.sms.sent', { messageId: `oaiy-out.${c.id}.p1.1`, to: '+61491570156' }));
+    expect(c.people[0].unconfirmed).toBeUndefined();
+    expect(c.people[0].summary).toBeUndefined();
+    expect(r.outreach.status(c.id)).not.toContain('never said');
+  });
+
+  it('a text whose sending the phone cannot answer for (its command in doubt) is not sent again either', async () => {
+    const r = rig();
+    const c = await r.start({ ...TEXTS, people: [{ name: 'Sam', number: '0491 570 156' }] });
+    r.state.refuseText = 'the radio did not answer the sms.send request in time; it may still carry it out, so the outcome is unknown; requestId "x" stays reserved: a retry under it is refused, not repeated';
+    await r.outreach.tick();
+    expect(c.people[0]).toMatchObject({ state: 'awaiting_reply', unconfirmed: true, tries: 1 });
+    expect(r.texted.at(-1)?.note).toMatch(/you texted them \([^)]*\) \(the phone could not say it went\): "Hi Sam, Greenleaf Lawns here/);
+    r.state.refuseText = '';
+    r.later(60 * MIN);
+    await r.outreach.tick();
+    expect(r.commands.filter((x) => x.command === 'sms.send')).toHaveLength(0);
+    // No reply by the deadline: no reply, and the results say the text may not have gone.
+    r.later(24 * 60 * MIN);
+    await r.outreach.tick();
+    expect(c.people[0]).toMatchObject({ state: 'done', outcome: 'no_reply' });
+    expect(r.posted.at(-1)).toContain('Sam: no reply. The phone never said their text went.');
+    expect(resultsMarkdown(c)).toContain('The phone never said the text went: it may have, so it was not sent again.');
   });
 
   it('STOP is read by code: they are opted out and on the list, and nothing is sent back', async () => {

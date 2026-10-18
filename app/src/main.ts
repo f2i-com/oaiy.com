@@ -2298,6 +2298,11 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     } else if (!(await confirmAction({ title: `Block ${who}?`, message: 'The receptionist will not answer their calls or texts, and will not ring or text them. What they send is still kept here. Unblock them with the same button, or in Phone, Who is answered.', ok: 'Block', danger: true }))) return;
     // Off the list: every entry that is this number, however it was written there.
     const next = on ? entries.filter((entry) => !isBlocked(number, entry)) : [...entries, number];
+    // The phone keeps up to 4000 characters of blocked numbers; dropping old ones to make room would quietly unblock someone.
+    if (!on && next.join(', ').length > 4000) {
+      chat.system(`The phone's blocked list is full, so ${who} is not blocked. Remove numbers you no longer need in Phone, Who is answered, then try again.`, 'error');
+      return;
+    }
     try {
       await saveScreening({ ...screening, blockedNumbers: next.join(', ') });
     } catch (error) {

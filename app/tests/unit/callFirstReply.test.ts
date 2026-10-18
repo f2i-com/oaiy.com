@@ -282,6 +282,33 @@ describe('the engine reads a call before it is answered', () => {
     expect(sent).toHaveLength(before);
   });
 
+  it('a ring whose number comes after it (aokie.call.caller_id) is warmed then, and a call only once', async () => {
+    const sent = engine(() => ({ text: 'Hi Sam.' }));
+    const { sessions } = world();
+    await sessions.load();
+    const SAM = '+61491570156';
+    const callerId = (callId: string, from: string): DesktopEvent => ({ seq: 2, name: 'aokie.call.caller_id', source: 'aokie', correlationId: callId, idempotencyKey: '', occurredAt: new Date().toISOString(), data: { callId, from, at: '' } });
+    // The phone answered before it said who rang: the ring has no number, and there is nothing to warm yet.
+    await sessions.desktopEvent(incoming({ callId: 'call_s', from: '' }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sent).toHaveLength(0);
+    await sessions.desktopEvent(callerId('call_s', SAM));
+    await until(() => sent.length === 1);
+    expect(sent[0].body.max_tokens).toBe(WARM_TOKENS);
+    // Its number told again (the warm done by now) warms nothing more.
+    await new Promise((r) => setTimeout(r, 50));
+    await sessions.desktopEvent(callerId('call_s', SAM));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sent).toHaveLength(1);
+    // A ring that had its number is warmed by it, not again by the caller_id after it.
+    await sessions.desktopEvent(incoming({ callId: 'call_t', from: TOM }));
+    await until(() => sent.length === 2);
+    await new Promise((r) => setTimeout(r, 50));
+    await sessions.desktopEvent(callerId('call_t', TOM));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sent).toHaveLength(2);
+  });
+
   it("as an outreach dial goes out: warmed as the dial is made, with the call's own tools (record_result, a silent end_call)", async () => {
     const { sessions, outreach, log } = world();
     const sent = engine(() => ({ text: 'Hi.' }));

@@ -400,7 +400,7 @@ try {
     await until('the first dial', () => dials().length === 1);
     expect(commands.some((c) => c.command === 'settings.set' && c.payload.outboundEnabled === true), 'outbound calling was not turned on');
     const d = dials()[0];
-    expect(d.payload.number === '+61412345678' && d.payload.openingLine === "Hi Jane, it's Greenleaf Lawns about your lawn mow on Fri 2 Oct 10:30. Have you got a minute?" && /:p1:1$/.test(d.key), JSON.stringify(d));
+    expect(d.payload.number === '+61412345678' && d.payload.openingLine === "Hi Jane, it's Greenleaf Lawns about your lawn mow on Fri 2 Oct 10:30. Have you got a minute?" && /:p1:1\.[0-9a-f]{8}$/.test(d.key), JSON.stringify(d));
     await page.waitForFunction(() => /Started: I will work through the list/.test(document.querySelector('.chat-log')?.textContent ?? ''), { timeout: 10_000 });
     await page.waitForFunction(() => !document.querySelector('.chip.outreach')?.hidden, { timeout: 10_000 });
     const chip = await page.$eval('.chip.outreach', (el) => el.textContent);
@@ -445,7 +445,7 @@ try {
   await check('#2 does not answer: rung again after the gap, with the next key; #3 is a voicemail, hung up on without a word', async () => {
     await tick(page, 61_000);
     await until('the second dial', () => dials().length === 2);
-    expect(dials()[1].payload.number === '+61413000111' && /:p2:1$/.test(dials()[1].key), JSON.stringify(dials()[1]));
+    expect(dials()[1].payload.number === '+61413000111' && /:p2:1\.[0-9a-f]{8}$/.test(dials()[1].key), JSON.stringify(dials()[1]));
     bridge('aokie.call.ringing', { at: new Date().toISOString() }, 'call_2');
     bridge('aokie.call.ended', { callId: 'call_2', outcome: 'no_answer', reason: 'no_answer', direction: 'outbound' }, 'call_2');
     await until('Bob waits for a retry', async () => (await campaigns(page))[0]?.people[1]?.state === 'waiting');
@@ -500,7 +500,7 @@ try {
   await check('the retries: #2 rung again (key :2) and not answered, #3 a voicemail again; then the report reaches the runner, with the results in the Front desk', async () => {
     await tick(page, 31 * 60_000);
     await until('the retry of #2', () => dials().length === 4);
-    expect(dials()[3].payload.number === '+61413000111' && /:p2:2$/.test(dials()[3].key), JSON.stringify(dials()[3]));
+    expect(dials()[3].payload.number === '+61413000111' && /:p2:2\.[0-9a-f]{8}$/.test(dials()[3].key), JSON.stringify(dials()[3]));
     bridge('aokie.call.ended', { callId: 'call_4', outcome: 'no_answer', reason: 'no_answer', direction: 'outbound' }, 'call_4');
     await until('Bob done', async () => (await campaigns(page))[0]?.people[1]?.state === 'done');
     await tick(page, 61_000);
@@ -583,7 +583,7 @@ try {
     await tick(page, 61_000);
     await wait(800);
     expect(dials().length === before, `rung again: ${JSON.stringify(dials().slice(before))}`);
-    expect(/:p1:1$/.test(hal.key), hal.key);
+    expect(/:p1:1\.[0-9a-f]{8}$/.test(hal.key), hal.key);
     await until('the Hal report', () => reports.some((r) => /Hal check" is finished/.test(r)), 20_000);
   });
 

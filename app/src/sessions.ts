@@ -20,7 +20,7 @@ import { isHidden, isPersonNumber, localCountry, phoneKey, samePerson } from './
 import type { MessageSettings } from './settings';
 import { MAX_FACTS, regroup, threadId, threadOrder, type Way } from './threads';
 import type { CallerNote, OpenProject, SessionInfo } from './vfs/projects';
-import { OUTREACH_AFTER_CALL, type OutreachLink, type OutreachSessions } from './outreach';
+import { OUTREACH_AFTER_CALL, TEXT_MAX_BYTES, textTooLong, type OutreachLink, type OutreachSessions } from './outreach';
 import { CONTACT_FRESH_MS, TEXT_CONTACT_WAIT_MS, contactKey, mirrorContact, moveFacts, refused, sameFact, unionFacts, type ContactsApi } from './contacts';
 import { NO_IDENTITY, identityInstructions, type Identity } from './identity';
 
@@ -82,6 +82,11 @@ export interface Session extends SessionInfo {
   unsaid?: string[];
   /** The words of the reply that calls end_call, held back to be its goodbye (so no second goodbye is said). */
   parting?: string;
+  /**
+   * end_call's goodbye was said on a phone that does not hang up for the receptionist: the call goes on until the caller
+   * ends it. Nothing more is said in that run; what the caller says after it is a run of its own, answered aloud.
+   */
+  leftOpen?: boolean;
   /** The outreach this call or text thread is part of: the person we rang (or who rang in from a list), with its objective and record_result. */
   outreach?: OutreachLink;
   /** This outreach call's agent was told once to record the result before ending the call. */
@@ -643,6 +648,9 @@ export function namesATime(turns: Turn[]): boolean {
 /** What a call's agent is told when it promised a booking without requesting it. */
 const BOOKING_NUDGE = "[OAIY] You said you would book it, but nothing is recorded: request_appointment was not called, or it was refused (its answer says why). Call it now, or, where its answer says something must be checked with the caller first, ask them that. Then tell them it is requested.";
 
+/** What end_call answers on a phone that does not hang up for the receptionist, when the desktop gives no words of its own. */
+const LEFT_OPEN = 'Your goodbye is being said. This phone does not let you hang up: the call stays open until the caller hangs up. Write nothing more unless they speak again, and answer them if they do.';
+
 /** How long a tool may run on a call before a short line is said, and the line. */
 const HOLD_AFTER_MS = 2_000;
 const HOLD_LINE = 'One moment, let me check.';
@@ -976,6 +984,8 @@ export class Sessions {
   private keptElsewhere = new WeakSet<Turn>();
   /** The warm going on for a call not begun yet (see warmCall). */
   private warming: { key: string; callId?: string; controller: AbortController } | null = null;
+  /** The last calls ringing in that were warmed: each once, by its ring or by its number coming after (`desktopEvent`). */
+  private warmedRings = new Set<string>();
   /** Hold words said so far: the next is the next in HOLD_WORDS. */
   private holdWords = 0;
   /** How long after the caller's words a hold word waits (HOLD_WORD_AFTER_MS; a test makes it short). */
@@ -1597,6 +1607,13 @@ export class Sessions {
           session.speech?.hush();
           const r = await desktop.finishCall(callId, goodbye);
           if (!r.ok) return `Could not end the call: ${outcome(r)}`;
+          // A phone that does not let the receptionist hang up (Aokie's allowFinishCall off): the goodbye is said and the call
+          // stays open until the caller ends it. Not over: what they say after it is answered, as the desktop tells the agent.
+          const output = r.output && typeof r.output === 'object' ? (r.output as Record<string, unknown>) : {};
+          if (output.callStaysOpen === true) {
+            session.leftOpen = true;
+            return typeof output.instruction === 'string' && output.instruction.trim() ? output.instruction.trim() : LEFT_OPEN;
+          }
           return parting && given && parting !== given
             ? `The words you wrote ("${parting}") are the goodbye, so "${given}" was not said (one goodbye, not two). The call ends once they have played. Write nothing more.`
             : 'The goodbye is being said, then the call ends. Write nothing more.';
@@ -1907,6 +1924,7 @@ export class Sessions {
         session.transferRequest = undefined;
         session.handingOver = false;
         session.handoff = undefined;
+        session.leftOpen = undefined;
       }
       if (typeof event.instructions === 'string') session.brief = event.instructions;
       session.lastAt = Date.now();
@@ -2279,13 +2297,15 @@ export class Sessions {
     return {
       spec: {
         name: 'send_text_message',
-        description: `Send a text message (SMS) to ${session.title || session.key} from the phone: your reply in this conversation. Short plain text, no markdown.`,
+        description: `Send a text message (SMS) to ${session.title || session.key} from the phone: your reply in this conversation. Short plain text, no markdown, ${TEXT_MAX_BYTES} bytes at most (a plain letter is one byte; an accented letter or an emoji 2 to 4).`,
         parameters: { type: 'object', required: ['body'], properties: { body: { type: 'string', description: 'The message, as they will read it' } } },
       },
       run: async (input, signal) => {
         const body = String(input.body ?? '').trim();
         if (!body) throw new Error('body is empty: write the message to send');
-        if (body.length > 1600) throw new Error(`the message is ${body.length} characters: keep it under 1600 (a text message is read on a phone)`);
+        // The phone sends a text as one message, and refuses one longer than its bytes allow.
+        const long = textTooLong(body);
+        if (long) throw new Error(`Not sent: ${long} Shorten it and send it again.`);
         // One text at a time: a model that answers one message with two texts in a row sends its reply twice over.
         // After something else (their next message, the person's, another tool's answer) it may text again.
         if (session.justTexted) throw new Error('Not sent: your text to them went a moment ago, and nothing has happened since. One reply at a time: say it all in one message. Anything more waits for their next message. Do not try again.');
@@ -2502,11 +2522,22 @@ export class Sessions {
    */
   async desktopEvent(event: DesktopEvent, now = Date.now()): Promise<Session | null> {
     const call = String(event.data.callId ?? '') || event.correlationId;
-    if (event.name === 'aokie.call.incoming') {
+    if (event.name === 'aokie.call.incoming' || event.name === 'aokie.call.caller_id') {
+      // The ring often comes before the phone has said who it is (an empty `from`): `caller_id` brings the number
+      // then, once a call. The call is warmed by the first of them that has it, and once.
+      const from = String(event.data.from ?? '');
+      if (isHidden(from) || (call && this.warmedRings.has(call))) return null;
       // (Not one heard of late, as when the desktop was out of reach a while: it has been answered or missed by now.)
       const at = Date.parse(event.occurredAt);
       // (Nor a blocked number's: the phone hangs up on it. Nor one it is not to answer while it keeps to its allowed numbers.)
-      if (this.answersCalls() && !(now - at > RING_FRESH_MS) && !isBlocked(String(event.data.from ?? ''), this.blocked) && isAllowed(String(event.data.from ?? ''), this.allowed, 'call')) this.warmCall({ number: String(event.data.from ?? ''), name: String(event.data.name ?? ''), ...(call ? { callId: call } : {}) });
+      if (this.answersCalls() && !(now - at > RING_FRESH_MS) && !isBlocked(from, this.blocked) && isAllowed(from, this.allowed, 'call')) {
+        if (call) {
+          this.warmedRings.add(call);
+          // The last few are enough: a call's number comes within seconds of its ring.
+          if (this.warmedRings.size > 20) this.warmedRings.delete(this.warmedRings.values().next().value!);
+        }
+        this.warmCall({ number: from, name: String(event.data.name ?? ''), ...(call ? { callId: call } : {}) });
+      }
       return null;
     }
     if (event.name === 'aokie.call.ended') {
@@ -2517,15 +2548,17 @@ export class Sessions {
     const from = String(event.data.from ?? '');
     const body = String(event.data.body ?? '');
     if (!from || !body) return null;
-    // A text the phone delivers again (it does, when it reconnects) is not a new one.
-    const handle = String(event.data.handle ?? '');
-    if (handle) {
+    // A text the phone delivers again (it does, when it reconnects) is not a new one: it comes again under its key. Not
+    // known by the phone's handle alone: Android gives a deleted text's handle to a new one, which Aokie sends under a key
+    // of its own. The handle only when the event has no key; with neither, nothing tells it from a new one, so it is one.
+    const seen = String(event.idempotencyKey ?? '').trim() || String(event.data.handle ?? '').trim();
+    if (seen) {
       const existing = this.list.find((s) => s.kind === 'sms' && this.isPerson(s, phoneKey(from) || from));
-      if (existing?.handles?.includes(handle)) return null;
+      if (existing?.handles?.includes(seen)) return null;
     }
     const session = await this.textArrived(from, String(event.data.name ?? ''), body);
-    if (handle) {
-      session.handles = [...(session.handles ?? []), handle].slice(-100);
+    if (seen) {
+      session.handles = [...(session.handles ?? []), seen].slice(-100);
       await this.saveIndex();
     }
     return session;
@@ -2643,8 +2676,9 @@ export class Sessions {
 
   /** A message for a lane: to its running agent, or its next run. */
   private deliver(session: Session, text: string, first = false): void {
-    // A flow's task is its own run (its answer is what that run says), never added to another.
-    if (session.kind !== 'task' && session.running && session.agent.interject(text)) {
+    // A flow's task is its own run (its answer is what that run says), never added to another. Nor is what comes after a
+    // goodbye on a call left open (see leftOpen): that run says nothing more, and this is answered aloud.
+    if (session.kind !== 'task' && session.running && !session.leftOpen && session.agent.interject(text)) {
       // Read by the run going on: no hold word of a run of its own.
       session.heardAt = undefined;
       // Something new to answer: a text may go to them again.
@@ -2688,8 +2722,9 @@ export class Sessions {
     // When the caller's words this run answers ended: a hold word follows them if nothing is said soon.
     const heardAt = session.heardAt;
     session.heardAt = undefined;
-    // A run answers something new: its first text goes.
+    // A run answers something new: its first text goes, and its words are said (a call left open after a goodbye too).
     session.justTexted = false;
+    session.leftOpen = undefined;
     session.answering = prompt;
     this.hooks.changed();
     // A text thread's agent reads the person's contact as it is now: a moment's wait at most (a text can

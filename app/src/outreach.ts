@@ -45,6 +45,8 @@ export interface CollectField {
 export interface Attempt {
   n: number;
   at: number;
+  /** A dial's idempotency key: its own (see dialKey), kept with it, so this dial sent again is the same dial. */
+  key?: string;
   callId?: string;
   operationId?: string;
   /** The voice call's own id, when the desktop's differs from the phone's. */
@@ -256,6 +258,8 @@ export const DIAL_LOST_MS = 10 * 60_000;
 export const SMS_ACK_MS = 10 * 60_000;
 /** Between texts. */
 export const TEXT_GAP_MS = 20_000;
+/** The longest text the phone sends: Aokie sends one as a single Bluetooth packet and refuses a longer one (bytes as UTF-8, not letters). */
+export const TEXT_MAX_BYTES = 600;
 export const TEXTS_PER_HOUR = 40;
 export const TEXTS_PER_DAY = 200;
 /** How long the result may take after a call dropped before it is "unclear". */
@@ -275,6 +279,10 @@ const FINAL: ReadonlySet<PersonState> = new Set(['done', 'skipped']);
 const STOP_WORDS = /^\s*(stop( all)?|unsubscribe|opt ?out|remove me)\s*[.!]*\s*$/i;
 /** The pretend number: nothing is sent to it (texts only). */
 const TEST = 'test';
+/** The phone's word that it had a text and cannot say what came of it: it may have gone. */
+const IN_DOUBT = /outcome is unknown|completion is unknown/i;
+/** A text the phone had and could not say what came of (see mayHaveGone), in the results. */
+const MAY_HAVE_GONE = 'The phone never said the text went: it may have, so it was not sent again.';
 
 // ---- words ----------------------------------------------------------------------
 
@@ -286,6 +294,13 @@ export function slugify(name: string): string {
 
 export function firstName(name: string): string {
   return name.trim().split(/\s+/)[0] ?? '';
+}
+
+/** Why a text is too long for the phone to send ('' when it is not), in words the agent can shorten it by. */
+export function textTooLong(body: string, which = 'this one'): string {
+  const bytes = new TextEncoder().encode(body).length;
+  if (bytes <= TEXT_MAX_BYTES) return '';
+  return `Texts can be up to ${TEXT_MAX_BYTES} bytes; ${which} is ${bytes} (a plain letter or digit is one byte; an accented letter, a letter of another alphabet or an emoji is 2 to 4).`;
 }
 
 /**
@@ -486,7 +501,6 @@ export function planOutreach(input: Record<string, unknown>, ctx: PlanContext): 
   if (!people.length) return `No one left to ${kind === 'call' ? 'call' : 'text'}: ${skipped.map((s) => `${s.name || s.number}: ${s.why}`).join('; ') || 'the list is empty'}.`;
   // Every placeholder has a value for every person, and each filled message fits.
   const template = kind === 'call' ? openingLine : textTemplate;
-  const limit = kind === 'call' ? 500 : 1600;
   const what = kind === 'call' ? 'opening line' : 'text';
   const noBusiness = (missing: string[]) => missing.some((m) => m.toLowerCase() === 'business');
   const businessUnset = "{business} has no value: the business's name is not set in OAIY yet (your person sets it in Hours & Services). Say {receptionist} alone for now, or ask your person to set it.";
@@ -495,7 +509,10 @@ export function planOutreach(input: Record<string, unknown>, ctx: PlanContext): 
     const who = p.name || displayNumber(p.number);
     if (noBusiness(filled.missing)) return businessUnset;
     if (filled.missing.length) return `{${filled.missing[0]}} has no value for ${who}: give it in their fields (or their name), or leave it out of the ${what}.`;
-    if (filled.text.length > limit) return `The ${what} for ${who} is ${filled.text.length} characters: keep it under ${limit}.`;
+    if (kind === 'call' && filled.text.length > 500) return `The ${what} for ${who} is ${filled.text.length} characters: keep it under 500.`;
+    // A text goes as one message, which the phone keeps to its bytes.
+    const long = kind === 'text' ? textTooLong(filled.text, `the one for ${who}`) : '';
+    if (long) return `${long} Shorten the textTemplate.`;
     // Customers hear who is calling (the receptionist, for the business), never the app's own words.
     const wrong = speaksAs(filled.text, ctx.identity, what);
     if (wrong) return wrong;
@@ -583,7 +600,9 @@ export function tally(c: Campaign): { done: number; total: number; by: Partial<R
 /** One person, as a line: who, how it went, their answers. */
 export function personLine(c: Campaign, p: Person): string {
   const answers = c.collect.filter((f) => p.answers[f.key] !== undefined).map((f) => `${f.key}: ${answerText(p.answers[f.key])}`).join('; ');
-  return `${p.name || displayNumber(p.number)}: ${outcomeWords(p.outcome) || p.state.replace(/_/g, ' ')}${p.late ? ' (late reply)' : ''}.${answers ? ` ${answers}.` : ''}`;
+  // Nothing back from them, and the phone never said their text went: it may not have.
+  const doubt = p.unconfirmed && (p.state === 'awaiting_reply' || p.outcome === 'no_reply') ? ' The phone never said their text went.' : '';
+  return `${p.name || displayNumber(p.number)}: ${outcomeWords(p.outcome) || p.state.replace(/_/g, ' ')}${p.late ? ' (late reply)' : ''}.${answers ? ` ${answers}.` : ''}${doubt}`;
 }
 
 /** The report for the conversation that started it: the counts, the results, and what to do now. */
@@ -692,6 +711,16 @@ export function readWhenAt(text: unknown): number | null {
 }
 
 // ---- the engine -------------------------------------------------------------------
+
+/**
+ * A dial's idempotency key: one of its own, never another dial's. Aokie answers a key it has seen with what it did then
+ * (and refuses it with another payload), so a try given back (the radio could not place it, the phone went away, the
+ * call back they asked for) that went under the key of the dial before it would never ring. Made once, with the dial,
+ * and kept with it (saved before it goes): the same dial sent again after a reload is the same key, and harmless.
+ */
+function dialKey(c: Campaign, p: Person, n: number): string {
+  return `oaiy:outreach:${c.id}:${p.id}:${n}.${crypto.randomUUID().slice(0, 8)}`;
+}
 
 export class Outreach {
   campaigns: Campaign[] = [];
@@ -918,11 +947,7 @@ export class Outreach {
         continue;
       }
       if (p.state === 'sending' && now - a.at > SMS_ACK_MS) {
-        // Never sent again: that could text them twice.
-        p.state = 'awaiting_reply';
-        p.unconfirmed = true;
-        a.sentAt ??= a.at;
-        this.history(p, 'the phone never said the text went (it is not sent again)', now);
+        this.mayHaveGone(p, 'the phone never said the text went', now);
         touched = true;
       }
       if (p.state === 'awaiting_reply' && c.replyDeadlineHours && now - (a.sentAt ?? a.at) > c.replyDeadlineHours * 60 * 60_000) {
@@ -1022,7 +1047,8 @@ export class Outreach {
     const line = this.deps.line;
     line.take('outreach', now);
     p.state = 'dialling';
-    p.attempt = { n, at: now };
+    const key = dialKey(c, p, n);
+    p.attempt = { n, at: now, key };
     this.setWaiting(c, '');
     await this.save(c);
     this.changed();
@@ -1033,7 +1059,7 @@ export class Outreach {
         number: p.number,
         openingLine: fill(c.openingLine, p, this.identityOf(c)).text,
         purpose: `${c.name}: ${c.objective}`.slice(0, 300),
-      }, `oaiy:outreach:${c.id}:${p.id}:${n}`)) as Record<string, unknown> | null;
+      }, key)) as Record<string, unknown> | null;
       const callId = typeof reply?.callId === 'string' ? reply.callId : '';
       const operationId = typeof reply?.operationId === 'string' ? reply.operationId : '';
       p.attempt.callId = callId || undefined;
@@ -1159,21 +1185,45 @@ export class Outreach {
         p.attempt.sentAt = now;
       } else await desktop.command('aokie', 'sms.send', { to: p.number, body, messageId }, `oaiy:outreach-sms:${messageId}`);
       this.history(p, 'texted', now);
-      const note = `[OAIY] Outreach "${c.name}": you texted them (${when(now)}): "${body}". Their replies come here.`;
-      const thread = await this.deps.sessions()?.openText(p.number, p.name, note).catch(() => undefined);
-      if (thread) p.thread = thread;
+      await this.noteText(c, p, body, now);
     } catch (error) {
       const message = (error as Error).message;
-      this.history(p, `the phone could not text them: ${message}`, now);
-      if (/recipient|number|invalid/i.test(message)) this.settlePerson(c, p, 'invalid_number', now);
-      else if (!p.attempt.failedOnce) {
-        p.state = 'queued';
-        p.nextAt = now + 5 * 60_000;
-        p.attempt = { ...p.attempt, failedOnce: true };
-      } else this.settlePerson(c, p, 'unreachable', now);
+      if (IN_DOUBT.test(message)) {
+        // The phone had it and cannot say what came of it: it may have gone, so it is never sent again.
+        this.mayHaveGone(p, `the phone could not say whether the text went: ${message}`, now);
+        await this.noteText(c, p, body, now, ' (the phone could not say it went)');
+      } else {
+        this.history(p, `the phone could not text them: ${message}`, now);
+        if (/recipient|number|invalid/i.test(message)) this.settlePerson(c, p, 'invalid_number', now);
+        else if (!p.attempt.failedOnce) {
+          p.state = 'queued';
+          p.nextAt = now + 5 * 60_000;
+          p.attempt = { ...p.attempt, failedOnce: true };
+        } else this.settlePerson(c, p, 'unreachable', now);
+      }
     }
     await this.save(c);
     this.changed();
+  }
+
+  /** What was texted, as a note in their conversation: their replies come there. */
+  private async noteText(c: Campaign, p: Person, body: string, now: number, doubt = ''): Promise<void> {
+    const note = `[OAIY] Outreach "${c.name}": you texted them (${when(now)})${doubt}: "${body}". Their replies come here.`;
+    const thread = await this.deps.sessions()?.openText(p.number, p.name, note).catch(() => undefined);
+    if (thread) p.thread = thread;
+  }
+
+  /**
+   * A text the phone had and never said went (or said it cannot know): it may have gone, so it is never sent again, as
+   * that could text them twice. Their reply is waited for as for one that went, and the results say it may not have.
+   */
+  private mayHaveGone(p: Person, what: string, now: number): void {
+    const a = p.attempt!;
+    p.state = 'awaiting_reply';
+    p.unconfirmed = true;
+    a.sentAt ??= a.at;
+    p.summary ??= MAY_HAVE_GONE;
+    this.history(p, `${what} (it is not sent again)`, now);
   }
 
   // ---- what the phone says ------------------------------------------------------------
@@ -1237,23 +1287,36 @@ export class Outreach {
       case 'aokie.sms.sent': {
         const message = id(d.messageId);
         const hit = message ? this.byAttempt((a) => a.messageId === message) : null;
-        if (!hit || hit.p.state !== 'sending') return;
+        // (Also one taken as maybe gone: it went after all.)
+        if (!hit || !(hit.p.state === 'sending' || (hit.p.state === 'awaiting_reply' && hit.p.unconfirmed))) return;
         hit.p.state = 'awaiting_reply';
         hit.p.attempt!.sentAt = now;
+        if (hit.p.unconfirmed) {
+          hit.p.unconfirmed = undefined;
+          if (hit.p.summary === MAY_HAVE_GONE) hit.p.summary = undefined;
+        }
         this.history(hit.p, 'the phone sent it', now);
         await this.save(hit.c);
         this.changed();
         return;
       }
       case 'aokie.sms.failed': {
+        // A refusal (the phone never had it) is also sms.send's own error, which send() counted: not a second failure.
+        if (d.refused === true) return;
         const message = id(d.messageId);
         const hit = message ? this.byAttempt((a) => a.messageId === message) : null;
         if (!hit || FINAL.has(hit.p.state)) return;
         const { c, p } = hit;
         const reason = id(d.reason);
+        if (d.outcomeUnknown === true) {
+          // The phone had it and cannot say whether it went: never sent again under a new id (they could get it twice).
+          this.mayHaveGone(p, `the phone could not say whether the text went: ${reason || 'no reason given'}`, now);
+          await this.save(c);
+          this.changed();
+          return;
+        }
         this.history(p, `the text failed: ${reason || 'no reason given'}`, now);
-        if (d.refused === true && /number|recipient/i.test(reason)) this.settlePerson(c, p, 'invalid_number', now);
-        else if (!p.attempt!.failedOnce) {
+        if (!p.attempt!.failedOnce) {
           p.state = 'queued';
           p.nextAt = now + 5 * 60_000;
           p.attempt = { ...p.attempt!, failedOnce: true };
