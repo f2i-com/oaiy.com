@@ -539,9 +539,14 @@ fn decide_as(net: &Network, id: &str, approve: bool, by_itself: bool) -> Result<
         paired_at_ms: now_ms(),
         by_itself,
     };
+    // (a primary paired here already, asking again: its pairing stands whatever its person says this time)
+    let paired_before = net.inner().peers().list().iter().any(|p| p.role == Role::Primary && p.fingerprint == peer.fingerprint);
     net.inner().peers().add(peer.clone())?;
     r.status = Status::Approved;
     drop(waiting);
+    if paired_before {
+        return Ok(Some(peer));
+    }
     // (paired on this side, until the primary is heard from: its person still says yes there, and a primary that stops
     // or restarts first never does, so the approval is undone here in time, even with nothing else coming from it)
     lock(&net.inner().unconfirmed).insert(peer.fingerprint.clone(), (peer.node_id.clone(), Instant::now()));
@@ -656,6 +661,12 @@ async fn capabilities(State(net): State<Network>, Extension(caller): Extension<C
         Ok(Err(e)) => (Value::Null, json!(said_here(&net, &e))),
         Err(_) => (Value::Null, json!(format!("{}'s engines did not answer within {} s", net.display_name(), ENGINES_WAIT.as_secs()))),
     };
+    // (a reading not in within its time is said so, `late`, and the primary keeps what it heard of it last: an empty
+    // one in its place took this computer's shared flows and GPUs off its card there for a heartbeat)
+    let late: Vec<&str> = [("flows", flows.is_err()), ("resources", resources.is_err()), ("machine", system.is_err()), ("jobs", media_jobs.is_err())]
+        .into_iter()
+        .filter_map(|(part, timed_out)| timed_out.then_some(part))
+        .collect();
     let flows = flows.ok().and_then(Result::ok).unwrap_or_else(|| json!([]));
     let (resources, system, media_jobs) = (resources.unwrap_or(Value::Null), system.unwrap_or(Value::Null), media_jobs.unwrap_or(Value::Null));
     // (its processor's load read off the async threads: a program the system has)
@@ -669,6 +680,7 @@ async fn capabilities(State(net): State<Network>, Extension(caller): Extension<C
         "services": shared_services(&net),
         "machine": machine,
         "jobs": jobs(&net, &asking, &media_jobs),
+        "late": late,
     }))
     .into_response()
 }
@@ -801,6 +813,12 @@ async fn run_flow(State(net): State<Network>, Extension(caller): Extension<Calle
             log::info!("network: {} runs {id} here ({})", primary.name, rec.run_id);
             run_answer(StatusCode::CREATED, &rec, base.as_deref())
         }
+        // (a key is one run of one flow: asked with it for another flow, the run of the first was answered as this one's)
+        crate::bridge::ledger::ReserveOutcome::Duplicate(rec) if rec.flow_id.as_deref() != Some(id.as_str()) => refuse(
+            StatusCode::CONFLICT,
+            "key_in_use",
+            format!("the key {key} is a run of another flow on {} ({}): ask with another key, or with none", net.display_name(), rec.flow_id.as_deref().unwrap_or("a flow")),
+        ),
         crate::bridge::ledger::ReserveOutcome::Duplicate(rec) => run_answer(StatusCode::OK, &rec, base.as_deref()),
         crate::bridge::ledger::ReserveOutcome::Refused { reason } => refuse(StatusCode::UNPROCESSABLE_ENTITY, "invalid_request", format!("refused by a loop guard: {reason}")),
     }

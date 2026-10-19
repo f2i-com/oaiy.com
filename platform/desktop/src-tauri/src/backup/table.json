@@ -841,6 +841,8 @@
       ".lock.pid": "access",
       ".model-catalog.seed.json": "rebuilt",
       "flow-files": "not-a-store: the CLI's own data folder for a confined flow run, on a headless server and on the desktop (bridge/worker.rs confine_child: its flows' databases and memory, kept apart from the server's credentials), as the CLI's data folder is for a run that is not confined: the CLI's, not a store of the desktop's",
+      "Contents": "not-a-store: the folder inside a Mac app bundle (OAIY.app/Contents), looked at by the updater to know the app it would replace (update/kind.rs); the app's, never in the data folder",
+      "Info.plist": "not-a-store: the file inside a Mac app bundle that says it is one (OAIY.app/Contents/Info.plist), looked at by the updater before it replaces the app (update/kind.rs); the app's, never in the data folder",
       ".oaiy-isolated.json": "not-a-store: the marker an isolated plugin-qualification launch writes in its own root folder (isolated.rs); that root is never the desktop's data folder",
       ".oaiy-isolated.lock": "not-a-store: the lock of an isolated plugin-qualification launch's own root folder (isolated.rs)",
       ".oaiy": "not-a-store: the CLI's own folder under the home folder, where a confined flow run's flow-files is made when OAIY_DATA_DIR is not set (bridge/worker.rs confine_child): the CLI's, not a store of the desktop's",

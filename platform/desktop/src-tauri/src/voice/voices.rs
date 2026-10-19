@@ -142,16 +142,23 @@ pub fn choose(name: &str) -> Result<String, String> {
     Ok(clip.name)
 }
 
-/// [`add`], for a voice of this computer's own (the Voices page): not one named as the copies of another computer's are
-/// (`from-…`), which would be hidden among them, or take one's place.
+/// [`add`], for a voice of this computer's own (the Voices page): not one whose name begins with `from-`, as the copies
+/// of another computer's voices do, nor one kept under a name that reads as a copy's ("from a1b2c3 desk", kept as
+/// `from-a1b2c3-desk`), which would be hidden among them, or take one's place. "From Mum" is a name of one's own.
 pub fn add_own(name: &str, extension: &str, clip: &[u8], words: Option<&str>) -> Result<VoiceClip, String> {
     let dir = dir().ok_or("the voices folder is not set up")?;
     add_own_in(dir, name, extension, clip, words)
 }
 
 fn add_own_in(dir: &Path, name: &str, extension: &str, clip: &[u8], words: Option<&str>) -> Result<VoiceClip, String> {
-    if clean_name(name)?.to_ascii_lowercase().starts_with("from-") {
-        return Err("a voice's name cannot begin with \"from\": that is how the copies of another computer's voices are named here".into());
+    let kept = clean_name(name)?;
+    // (the prefix as it was typed, in any case: a space after "from" is kept as a `-`, and "From Mum" is no copy's name)
+    if name.trim().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("from-")) {
+        return Err("a voice's name cannot begin with \"from-\": that is how the copies of another computer's voices are named here".into());
+    }
+    // (a copy's name in any case: on a Mac's disk "From-A1B2C3-desk" is the copy's file)
+    if is_copy(&kept.to_ascii_lowercase()) {
+        return Err(format!("a voice kept as {kept} would be taken for a copy of another computer's voice (from-<computer>-<name>): choose another name"));
     }
     add_in(dir, name, extension, clip, words)
 }
@@ -337,22 +344,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A voice of one's own is not named as the copies are: "from london office" was hidden as one, and a name
-    /// like a copy's would take a copy's place.
+    /// A voice of one's own is not named as the copies are: one beginning with `from-` would be hidden among them, and
+    /// a name kept like a copy's would take a copy's place. A name that begins with the word "from" is one's own.
     #[test]
     fn a_voice_of_ones_own_may_not_be_named_as_a_copy_is() {
         let dir = folder("own-names");
         seed(&dir).unwrap();
         let clip = vec![1u8; 4096];
-        for name in ["from london office", "From-a1b2c3-front-desk", " from-x "] {
+        for name in ["From-a1b2c3-front-desk", " from-x ", "FROM-mum"] {
             let err = add_own_in(&dir, name, "wav", &clip, None).unwrap_err();
-            assert!(err.contains("cannot begin with \"from\""), "{name}: {err}");
+            assert!(err.contains("cannot begin with \"from-\""), "{name}: {err}");
+        }
+        for name in ["from a1b2c3 front desk", "From A1B2C3 desk"] {
+            let err = add_own_in(&dir, name, "wav", &clip, None).unwrap_err();
+            assert!(err.contains("taken for a copy"), "{name}: {err}");
         }
         assert_eq!(list_in(&dir).len(), 1, "nothing was kept");
-        // Another name, "from" inside it, is kept and listed as one's own.
-        let kept = add_own_in(&dir, "calls from london", "wav", &clip, None).unwrap();
-        assert_eq!(kept.name, "calls-from-london");
-        assert!(!is_copy(&kept.name));
+        // "From Mum", and another name with "from" in it, are kept and listed as one's own.
+        for (name, kept_as) in [("From Mum", "From-Mum"), ("from london office", "from-london-office"), ("calls from london", "calls-from-london")] {
+            let kept = add_own_in(&dir, name, "wav", &clip, None).unwrap();
+            assert_eq!(kept.name, kept_as);
+            assert!(!is_copy(&kept.name) && list_in(&dir).iter().any(|c| c.name == kept_as), "{name}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

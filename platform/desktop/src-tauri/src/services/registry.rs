@@ -48,7 +48,7 @@ fn allowed_origins_env(has_windows: bool, on_windows: bool) -> String {
 const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     // OAIY's own voice for calls (speech-to-text and text-to-speech in one
     // resident process on the GPU). Its program ships with OAIY (see
-    // `oaiy_program`).
+    // `oaiy_program_dirs`).
     //
     // It is the only one. The Aokie receptionist's own ears and voice
     // (`aokie-stt`, `aokie-tts`) were listed beside it and were not what calls
@@ -403,24 +403,21 @@ fn os_fix_path(s: String) -> String {
         .replace("/Scripts/pythonw.exe", "/bin/python")
 }
 
-/// A program that ships with OAIY, as a bare service command names it:
-/// `oaiy-voice`. Found where [`oaiy_program_dirs`] says, in its order.
-fn oaiy_program(cmd: &str) -> Option<PathBuf> {
-    let dirs = oaiy_program_dirs(
-        std::env::var_os("OAIY_ENGINES_DIR").map(PathBuf::from),
-        std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
-        installer_engines(),
-    );
-    program_in(cmd, dirs)
+/// The folder the desktop's own program is in.
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
-/// The same program built in the repository's release folder, the folder this
-/// desktop was built from. It is looked for after `<data>/bin`, not with
-/// [`oaiy_program`]: that folder is on the machine that built OAIY, and a build
-/// left there long ago would otherwise beat the copy someone put in the bin
-/// folder on purpose.
-fn repo_program(cmd: &str) -> Option<PathBuf> {
-    program_in(cmd, [Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release")])
+/// The folders searched after `<data>/bin`, in order: the desktop's own folder
+/// (a program put beside a build of one's own), then the repository's release
+/// folder, the folder this desktop was built from. Not with
+/// [`oaiy_program_dirs`]: the desktop's folder is `/usr/bin` for a .deb or
+/// .rpm install, where every bare command (`python3`) is found, and was then
+/// taken before the bin folder's and called OAIY's own in the log; and the
+/// release folder is on the machine that built OAIY, where a build left there
+/// long ago would beat the copy someone put in the bin folder on purpose.
+fn later_program_dirs(beside: Option<PathBuf>) -> Vec<PathBuf> {
+    beside.into_iter().chain([Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release")]).collect()
 }
 
 fn program_in(cmd: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
@@ -432,13 +429,13 @@ fn program_in(cmd: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<Path
 }
 
 /// Which program a bare service command runs, of those found for it: OAIY's own
-/// (from [`oaiy_program`]) first, then a copy in `<data>/bin`, then a build in
-/// the repository's release folder. OAIY's own comes before the bin folder
+/// (in [`oaiy_program_dirs`]) first, then a copy in `<data>/bin`, then one in
+/// [`later_program_dirs`] (`later`). OAIY's own comes before the bin folder
 /// because the documented Mac recipe used to copy `oaiy-voice` there, and that
 /// copy outlives every update: an old one beat the installer's voice and
 /// exited 1 on a flag the newer desktop passes it. The second value says, when
 /// both OAIY's own and a bin copy are there, which is used, for the log.
-fn pick_program(own: Option<PathBuf>, in_bin: Option<PathBuf>, repo: Option<PathBuf>) -> (Option<PathBuf>, Option<String>) {
+fn pick_program(own: Option<PathBuf>, in_bin: Option<PathBuf>, later: Option<PathBuf>) -> (Option<PathBuf>, Option<String>) {
     match (own, in_bin) {
         (Some(own), Some(bin)) => {
             let note = format!(
@@ -450,8 +447,16 @@ fn pick_program(own: Option<PathBuf>, in_bin: Option<PathBuf>, repo: Option<Path
         }
         (Some(own), None) => (Some(own), None),
         (None, Some(bin)) => (Some(bin), None),
-        (None, None) => (repo, None),
+        (None, None) => (later, None),
     }
+}
+
+/// The program a bare command `raw` names, as [`pick_program`] chooses it from
+/// OAIY's own folders (`own`), `bin` and the folders after it (`later`).
+fn bare_program_in(raw: &str, own: Vec<PathBuf>, bin: &Path, later: Vec<PathBuf>) -> (Option<PathBuf>, Option<String>) {
+    let bin = bin.join(raw);
+    let in_bin = [bin.with_extension("exe"), bin].into_iter().find(|p| p.exists());
+    pick_program(program_in(raw, own), in_bin, program_in(raw, later))
 }
 
 /// The engines folder the installer carries, once the app has said where
@@ -466,20 +471,17 @@ fn installer_engines() -> Option<PathBuf> {
     None
 }
 
-/// Where OAIY's own programs are looked for, in the engines' order
-/// (`engines::programs_dir`): `OAIY_ENGINES_DIR`; the `engines` folder beside
-/// the desktop, then its own folder (a build of one's own put there); the
-/// engines the installer carries (`<resources>/resources/engines`). Without the
-/// installer's folder an installed OAIY looked for its voice only beside itself
-/// and in the folder it was built in, which is on the machine that built it:
-/// "program not found". (That folder, the repository's release build, is
-/// [`repo_program`], looked in last.)
+/// Where OAIY's own programs are looked for, ahead of `<data>/bin`:
+/// `OAIY_ENGINES_DIR`; the `engines` folder beside the desktop; the engines the
+/// installer carries (`<resources>/resources/engines`, where a Mac's bundle, a
+/// Windows install and a .deb or .rpm keep OAIY Voice). Without the installer's
+/// folder an installed OAIY looked for its voice only beside itself and in the
+/// folder it was built in, which is on the machine that built it: "program not
+/// found". The desktop's own folder is not one of these: it is searched after
+/// the bin folder ([`later_program_dirs`]).
 fn oaiy_program_dirs(env: Option<PathBuf>, beside: Option<PathBuf>, bundled: Option<PathBuf>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = env.into_iter().collect();
-    if let Some(dir) = beside {
-        dirs.push(dir.join("engines"));
-        dirs.push(dir);
-    }
+    dirs.extend(beside.map(|dir| dir.join("engines")));
     dirs.extend(bundled);
     dirs
 }
@@ -1225,13 +1227,13 @@ impl Registry {
     }
 
     /// The program a bare run command names, as [`pick_program`] chooses it from
-    /// OAIY's own folders, `<data>/bin` and the repository's build, with its note
-    /// for the log when a bin copy is passed over. None when none of them has it
-    /// (PATH and the per-user programs folder are the caller's to try).
+    /// OAIY's own folders, `<data>/bin`, the desktop's folder and the
+    /// repository's build, with its note for the log when a bin copy is passed
+    /// over. None when none of them has it (PATH and the per-user programs
+    /// folder are the caller's to try).
     fn bare_program(&self, raw: &str) -> (Option<PathBuf>, Option<String>) {
-        let bin = self.data_dir.join("bin").join(raw);
-        let in_bin = [bin.with_extension("exe"), bin].into_iter().find(|p| p.exists());
-        pick_program(oaiy_program(raw), in_bin, repo_program(raw))
+        let own = oaiy_program_dirs(std::env::var_os("OAIY_ENGINES_DIR").map(PathBuf::from), exe_dir(), installer_engines());
+        bare_program_in(raw, own, &self.data_dir.join("bin"), later_program_dirs(exe_dir()))
     }
 
     /// The resolved path of a service's install-completion marker, if it declares one.
@@ -1796,8 +1798,8 @@ impl Registry {
         let resolved_cmd = if raw_cmd.contains(std::path::is_separator) {
             raw_cmd
         } else {
-            // OAIY's own program, else ${binDir}'s, else the repository's build
-            // (see pick_program for why in that order).
+            // OAIY's own program, else ${binDir}'s, else the desktop's folder's or
+            // the repository's build (see pick_program for why in that order).
             let (program, passed_over) = self.bare_program(&raw_cmd);
             if let Some(note) = passed_over {
                 log::warn!("{id}: {note}");
@@ -2976,11 +2978,48 @@ mod tests {
         let bundled = installed.join("resources").join("engines");
         assert_eq!(
             oaiy_program_dirs(Some(p("chosen")), Some(installed.clone()), Some(bundled.clone())),
-            vec![p("chosen"), installed.join("engines"), installed.clone(), bundled.clone()],
+            vec![p("chosen"), installed.join("engines"), bundled.clone()],
         );
-        // A program put beside the desktop (a build of one's own) still comes before the installer's, as an engine does.
-        assert_eq!(oaiy_program_dirs(None, Some(installed.clone()), Some(bundled.clone()))[2..], [bundled]);
         assert!(oaiy_program_dirs(None, None, None).is_empty());
+        // The desktop's own folder is looked in after the bin folder, before the repository's build.
+        let later = later_program_dirs(Some(installed.clone()));
+        assert_eq!(later[0], installed);
+        assert!(later.len() == 2 && later[1].ends_with("target/release"), "{later:?}");
+    }
+
+    /// A .deb or .rpm puts the desktop in /usr/bin, beside every program the system has: a bare command (`python3`) in
+    /// `<data>/bin` is that one, not the system's, and only OAIY's own folders come before the bin folder.
+    #[test]
+    fn the_folder_beside_the_desktop_comes_after_the_bin_folder() {
+        let dir = std::env::temp_dir().join(format!("oaiy-program-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (usr_bin, bin, engines, bundled) = (dir.join("usr-bin"), dir.join("data-bin"), dir.join("usr-bin").join("engines"), dir.join("resources-engines"));
+        for d in [&usr_bin, &bin, &engines, &bundled] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let put = |d: &Path, name: &str| {
+            let file = d.join(if cfg!(windows) { format!("{name}.exe") } else { name.to_string() });
+            std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+            std::path::absolute(&file).unwrap()
+        };
+        let own = || oaiy_program_dirs(None, Some(usr_bin.clone()), Some(bundled.clone()));
+        let later = || later_program_dirs(Some(usr_bin.clone()));
+        // the system's program beside the desktop, and one in the bin folder: the bin folder's, and no note
+        put(&usr_bin, "python3");
+        let in_bin = put(&bin, "python3");
+        assert_eq!(bare_program_in("python3", own(), &bin, later()), (Some(in_bin), None));
+        // beside the desktop alone: found there still, after the rest
+        let beside = put(&usr_bin, "ffmpeg");
+        assert_eq!(bare_program_in("ffmpeg", own(), &bin, later()), (Some(beside), None));
+        // OAIY's own (the installer's engines, or the engines folder beside the desktop) before the bin folder's copy
+        let voice = put(&bundled, "oaiy-voice");
+        put(&bin, "oaiy-voice");
+        let (used, note) = bare_program_in("oaiy-voice", own(), &bin, later());
+        assert_eq!(used, Some(voice));
+        assert!(note.is_some(), "the bin copy passed over is said");
+        let engine = put(&engines, "oaiy-voice");
+        assert_eq!(bare_program_in("oaiy-voice", own(), &bin, later()).0, Some(engine));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

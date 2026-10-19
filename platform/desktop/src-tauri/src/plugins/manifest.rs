@@ -641,10 +641,14 @@ fn read_manifest_bytes(path: &Path) -> Result<Vec<u8>, ManifestError> {
 
 /// Is `wanted` (a manifest's `minDesktopVersion`) newer than `have`?
 /// `Err` when either is not a semantic version.
+///
+/// A desktop whose version has a pre-release part is held to the release it names, as the updater holds it
+/// (`update::version`): a release is always `N.N.N`, so `0.1.9-mac.3` is a build of one's own made after 0.1.9, with
+/// all of 0.1.9 in it. Semver puts it below 0.1.9, and a plugin that needs 0.1.9 was refused there.
 pub fn needs_newer_desktop(wanted: &str, have: &str) -> Result<bool, String> {
     let w = parse_semver(wanted).ok_or_else(|| format!("{wanted:?} is not a version like 1.2.3"))?;
-    let h = parse_semver(have).ok_or_else(|| format!("this desktop's version {have:?} is not a version like 1.2.3"))?;
-    Ok(semver_cmp(&w, &h) == std::cmp::Ordering::Greater)
+    let (major, minor, patch, _) = parse_semver(have).ok_or_else(|| format!("this desktop's version {have:?} is not a version like 1.2.3"))?;
+    Ok(semver_cmp(&w, &(major, minor, patch, Vec::new())) == std::cmp::Ordering::Greater)
 }
 
 impl PluginManifest {
@@ -716,6 +720,9 @@ impl PluginManifest {
                 "id {:?} must be lowercase letters, digits and hyphens, starting with a letter",
                 self.id
             )));
+        }
+        if RESERVED_IDS.contains(&self.id.as_str()) {
+            return Err(ManifestError::Invalid(format!("id {:?} is the desktop's own (the source of its events): choose another", self.id)));
         }
         if self.name.trim().is_empty() {
             return Err(ManifestError::Invalid("name is empty".into()));
@@ -1299,6 +1306,10 @@ fn canonical_capability(cap: &str) -> &str {
     cap
 }
 
+/// The sources of the desktop's own events, which no plugin may take as its id (a plugin's events carry its id as their
+/// source): `flows`, a run's end (`plugins::host::outcome_event`), whose redrive reads that run's answer again.
+pub const RESERVED_IDS: [&str; 1] = ["flows"];
+
 fn is_valid_id(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
@@ -1363,6 +1374,20 @@ mod tests {
             "events": ["aokie.call.incoming", "aokie.call.ended"],
             "commands": { "journalled": ["call.dial", "sms.send"] }
         })
+    }
+
+    /// A plugin cannot take the source of the desktop's own events as its id: its events would come from `flows`, as
+    /// a run's end does.
+    #[test]
+    fn a_plugin_may_not_be_named_as_the_desktops_own_events_are() {
+        let mut body = base();
+        body["id"] = serde_json::json!("flows");
+        body["events"] = serde_json::json!([]);
+        let d = write_manifest(&body);
+        let err = PluginManifest::load(d.path()).unwrap_err();
+        assert!(matches!(err, ManifestError::Invalid(_)) && err.reason().contains("the desktop's own"), "{err:?}");
+        body["id"] = serde_json::json!("flows-helper");
+        assert!(PluginManifest::load(write_manifest(&body).path()).is_ok(), "another name with flows in it");
     }
 
     #[test]
@@ -2269,12 +2294,26 @@ mod tests {
         assert!(newer("0.10.0", "0.9.0"), "numerically, not as text");
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0-beta", "0.1.0"), "a pre-release is below its release");
-        assert!(newer("0.1.0", "0.1.0-rc.1"));
-        assert!(newer("1.0.0-rc.10", "1.0.0-rc.9"));
-        assert!(newer("1.0.0-beta", "1.0.0-alpha"));
-        assert!(newer("1.0.0-alpha.1", "1.0.0-alpha"));
+        assert!(newer("1.0.0-rc.10", "0.9.0") && !newer("1.0.0-rc.10", "1.0.0"));
+        assert!(newer("1.0.1-beta", "1.0.0") && !newer("1.0.0-alpha.1", "1.0.0"));
         assert!(!newer("1.0.0+later", "1.0.0"), "build metadata does not count");
         assert!(needs_newer_desktop("1.x.0", "0.1.0").is_err());
+    }
+
+    /// A desktop built here after a release (`0.1.9-mac.3`) has all of that release in it: a plugin that needs 0.1.9
+    /// runs there, one that needs 0.1.10 does not, as the updater reads such a version.
+    #[test]
+    fn a_desktop_built_after_a_release_is_held_to_that_release() {
+        let newer = |a: &str, b: &str| needs_newer_desktop(a, b).unwrap();
+        for have in ["0.1.9-mac.3", "0.1.9-mac.44", "0.1.9-beta.1", "0.1.9-mac.3+abc"] {
+            assert!(!newer("0.1.9", have), "{have}");
+            assert!(!newer("0.1.8", have), "{have}");
+            assert!(!newer("0.1.9-rc.1", have), "{have}");
+            assert!(!newer("0.1.9-mac.9", have), "{have}: another build of the same release");
+            assert!(newer("0.1.10", have), "{have}");
+            assert!(newer("0.2.0", have), "{have}");
+        }
+        assert!(needs_newer_desktop("0.1.9", "0.1.9-").is_err());
     }
 
     /// Minimal scratch directory helper, so these tests need no dev-dependency.

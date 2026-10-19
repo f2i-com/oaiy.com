@@ -884,17 +884,38 @@ async fn pin_change(net: &Network, node_id: &str, model: &str, kind: &str, pin: 
 /// `POST /api/network/nodes/:id/v1/chat/completions`: an OpenAI chat request for the worker's language model, its
 /// answer streamed back as the worker streams it (a cancelled request closes the worker's stream with it). One naming
 /// a model that computer no longer runs is refused there (`409 model_unavailable`), unless that computer's language
-/// model is this computer's default: then it is whichever it runs, and the chat is answered by the one it runs now (as
-/// the engine's own chats are, [`chat_on_worker`]), so the Agent, which reads its model once a minute, does not fail
-/// for a minute after the model was changed there.
+/// model is this computer's default and the chat names the model it ran when it was made so, or the one it ran just
+/// before the one it runs now ([`follows_default`]): then it is whichever it runs, and the chat is answered by the one it
+/// runs now (as the engine's own chats are, [`chat_on_worker`]), so the Agent, which reads its model once a minute, does
+/// not fail for a minute after the model was changed there.
 async fn node_chat(State(net): State<Network>, Path(node_id): Path<String>, body: axum::body::Bytes) -> Response {
-    let body = if follows_default(&net, &node_id) { without_model(body) } else { body };
+    let named = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_owned));
+    let body = match named {
+        Some(named) if follows_default(&net, &node_id, &named).await => without_model(body),
+        _ => body,
+    };
     chat_on(&net, &node_id, body).await
 }
 
-/// Whether `node_id`'s language model is this computer's default in effect, whichever that computer runs.
-fn follows_default(net: &Network, node_id: &str) -> bool {
-    default_chat_entry_of(net, None).is_some_and(|e| e["nodeId"].as_str() == Some(node_id))
+/// Whether a chat naming `named` on `node_id` is one for this computer's default: that computer's language model is
+/// the default in effect (this computer's own not chosen again since, `in_effect`), and `named` (a model's name, or its
+/// id) is the model it ran when it was made the default, or the one it ran last before the one it runs now
+/// (`llmBefore`, kept by the heartbeat), which the Agent may still name for a minute. A chat naming another of its
+/// models (a flow's step naming one that reads pictures, say) is sent as it is, and refused there where that model
+/// does not run, rather than answered by whichever does.
+async fn follows_default(net: &Network, node_id: &str, named: &str) -> bool {
+    let Some(chosen) = net.inner().defaults().get("llm").cloned() else { return false };
+    if chosen.node_id() != node_id {
+        return false;
+    }
+    let named = named.trim().rsplit_once('/').map_or(named.trim(), |(_, m)| m);
+    let stored = chosen.id.rsplit_once('/').map_or("", |(_, m)| m);
+    let before = lock(&net.inner().nodes).get(node_id).and_then(|s| s.capabilities.as_ref()?.get("llmBefore")?.as_str().map(str::to_owned));
+    if named != stored && before.as_deref() != Some(named) {
+        return false;
+    }
+    let local = local_default(&crate::ai::engine_services::local_catalogue(&net.inner().ai).await, "llm");
+    default_chat_entry_of(net, local.as_deref()).is_some_and(|e| e["nodeId"].as_str() == Some(node_id))
 }
 
 /// A chat request without the model it names (one that is not a JSON object is sent as it is, and refused there).
@@ -1017,8 +1038,8 @@ pub struct ServiceTarget {
     pub node_name: String,
     /// The worker's certificate: what the copies of voices kept there are kept for.
     pub fingerprint: String,
-    /// The heartbeat found it not answering (it was asked since this computer started): a call's speech goes to this
-    /// computer's own OAIY Voice meanwhile, where it has one (`voice::engines`).
+    /// The heartbeat found it not answering (it was asked since this computer started): it is asked once more, briefly,
+    /// before speech goes to this computer's own OAIY Voice, where it has one (`voice::engines`).
     pub offline: bool,
 }
 
@@ -1116,17 +1137,26 @@ fn defaults_json(net: &Network) -> Value {
             .map(|(kind, d)| {
                 let node = d.node_id().to_string();
                 let name = peers.iter().find(|p| p.node_id == node).map(|p| p.name.clone()).unwrap_or_default();
-                let model = d.id.rsplit_once('/').map_or("", |(_, m)| m).to_string();
-                // (in effect: the catalogue marks it its kind's default; else this computer's own stands in until it is,
-                // and why: that computer not heard from since this one started, its engines not answering since, or the
-                // model no longer one of its)
-                let effect = in_effect(net, &kind, &remote, None).is_some();
-                let waiting = (!effect).then(|| match nodes.get(&node).and_then(|s| s.capabilities.as_ref()) {
-                    None => "not_heard",
-                    Some(c) if c.get("discovery").is_none_or(Value::is_null) => "engines_down",
-                    Some(_) => "model_gone",
-                });
-                (kind, json!({ "id": d.id, "nodeId": node, "nodeName": name, "model": model, "insteadOf": d.instead_of, "inEffect": effect, "waiting": waiting }))
+                // (in effect: the catalogue marks it its kind's default, and its id and model are that entry's, a
+                // language model's whichever that computer runs now, not the one it ran when it was chosen; else this
+                // computer's own stands in until it is, and why: that computer not heard from since this one started,
+                // its engines not answering, or the model no longer one of its. Its engines not answering since they
+                // were heard, it is in effect still, and what uses it is told they do not answer: `engines_down` too)
+                let entry = in_effect(net, &kind, &remote, None);
+                let effect = entry.is_some();
+                let (id, model) = match &entry {
+                    Some(e) => (e["id"].as_str().unwrap_or(&d.id).to_string(), e["model"].as_str().unwrap_or("").to_string()),
+                    None => (d.id.clone(), d.id.rsplit_once('/').map_or("", |(_, m)| m).to_string()),
+                };
+                let caps = nodes.get(&node).and_then(|s| s.capabilities.as_ref());
+                let engines_down = caps.is_some_and(|c| c.get("enginesDown") == Some(&json!(true)) || c.get("discovery").is_none_or(Value::is_null));
+                let waiting = match caps {
+                    None if !effect => Some("not_heard"),
+                    Some(_) if engines_down => Some("engines_down"),
+                    Some(_) if !effect => Some("model_gone"),
+                    _ => None,
+                };
+                (kind, json!({ "id": id, "nodeId": node, "nodeName": name, "model": model, "insteadOf": d.instead_of, "inEffect": effect, "waiting": waiting }))
             })
             .collect(),
     )
@@ -1288,7 +1318,8 @@ fn terminal(status: &str) -> bool {
 /// `POST /api/network/nodes/:id/flows/:flow/runs` `{input?, timeoutMs?, wait?, key?}`: one of the worker's shared
 /// flows, run there by its own runner and engines. This computer's pictures in `input` are sent inline (the worker
 /// cannot read this computer's addresses); the pictures the run makes are named at this computer's route for the
-/// worker. Answered at once with the run (follow it at `…/runs/:run`), or with `wait` once it has finished.
+/// worker. Answered at once with the run (follow it at `…/runs/:run`), or with `wait` once it has finished, each
+/// answer with the `key` it runs under.
 async fn node_run_flow(State(net): State<Network>, Path((node_id, flow)): Path<(String, String)>, headers: axum::http::HeaderMap, Json(asked): Json<RunFlow>) -> Response {
     if !flow_id(&flow) {
         return error(StatusCode::BAD_REQUEST, "invalid_request", "a flow's id is letters, digits, - and _");
@@ -1314,9 +1345,10 @@ async fn node_run_flow(State(net): State<Network>, Path((node_id, flow)): Path<(
         Ok(r) => r,
         Err(e) => return run_lost(StatusCode::SERVICE_UNAVAILABLE, "node_offline", went_offline(&net, &peer, &e), &key, None),
     };
-    if !asked.wait || !started.status().is_success() {
+    if !started.status().is_success() {
         return worker::passthrough(started);
     }
+    let answered = StatusCode::from_u16(started.status().as_u16()).unwrap_or(StatusCode::OK);
     let mut run: Value = match started.json().await {
         Ok(v) => v,
         Err(e) => return run_lost(StatusCode::BAD_GATEWAY, "upstream_error", format!("{}'s answer could not be read: {e}", peer.name), &key, None),
@@ -1324,13 +1356,17 @@ async fn node_run_flow(State(net): State<Network>, Path((node_id, flow)): Path<(
     let Some(run_id) = run["runId"].as_str().map(str::to_owned) else {
         return run_lost(StatusCode::BAD_GATEWAY, "upstream_error", format!("{} answered no run", peer.name), &key, None);
     };
+    // (every answer with its key, the one made here where none was given: asked again with it, the same run is followed)
+    if !asked.wait {
+        return (answered, Json(keyed(run, &key))).into_response();
+    }
     let deadline = Instant::now() + Duration::from_millis(asked.timeout_ms.unwrap_or(10 * 60 * 1000).min(60 * 60 * 1000)) + Duration::from_secs(10);
     // (a poll that goes unanswered, a Wi-Fi blip or a busy moment there, is asked again, a little later each time: the
     // run is given up here only after a few in a row, and then with its id, to follow it or ask again with its key)
     let mut misses = 0;
     while !terminal(run["status"].as_str().unwrap_or("")) {
         if Instant::now() >= deadline {
-            return (StatusCode::ACCEPTED, Json(run)).into_response();
+            return (StatusCode::ACCEPTED, Json(keyed(run, &key))).into_response();
         }
         tokio::time::sleep(RUN_POLL * (1 + misses)).await;
         let missed = match with_base(client.get(url(&peer.address, &format!("/worker/v1/runs/{run_id}")))).timeout(Duration::from_secs(15)).send().await {
@@ -1354,7 +1390,15 @@ async fn node_run_flow(State(net): State<Network>, Path((node_id, flow)): Path<(
             return run_lost(status, code, message, &key, Some(&run));
         }
     }
-    Json(run).into_response()
+    Json(keyed(run, &key)).into_response()
+}
+
+/// A run's answer with the key it runs under (`key`).
+fn keyed(mut run: Value, key: &str) -> Value {
+    if let Some(o) = run.as_object_mut() {
+        o.insert("key".into(), json!(key));
+    }
+    run
 }
 
 /// How often a run on a worker is asked how it is (each miss in a row waits once more as long), and how many polls
@@ -1488,6 +1532,10 @@ pub(crate) async fn check(net: &Network, peer: &Peer) {
                         caps["enginesDown"] = json!(true);
                     }
                 }
+                if let Some(last) = &s.capabilities {
+                    keep_late(&mut caps, last);
+                    keep_llm_before(&mut caps, last);
+                }
                 *s = NodeState { online: true, last_seen_ms: now_ms(), last_error: None, capabilities: Some(caps) };
                 return;
             }
@@ -1500,6 +1548,52 @@ pub(crate) async fn check(net: &Network, peer: &Peer) {
     let s = nodes.entry(peer.node_id.clone()).or_default();
     s.online = false;
     s.last_error = last_error;
+}
+
+/// The parts of a worker's answer it could not read in time (`late`: its shared flows, its engines' resources, its
+/// GPUs and memory, its media jobs), as last heard: empty in its answer, they replaced what was heard before, and its
+/// shared flows and GPUs went off its card for a heartbeat. Its processor's load and its flow runs, read there each
+/// time, are as it answered.
+fn keep_late(caps: &mut Value, last: &Value) {
+    let late: Vec<String> = caps.get("late").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+    for part in late {
+        match part.as_str() {
+            "flows" | "resources" => {
+                if let Some(kept) = last.get(&part) {
+                    caps[part.as_str()] = kept.clone();
+                }
+            }
+            "machine" => {
+                for field in ["ram", "gpus"] {
+                    if let (Some(kept), Some(machine)) = (last.pointer(&format!("/machine/{field}")), caps.get_mut("machine").and_then(Value::as_object_mut)) {
+                        machine.insert(field.to_string(), kept.clone());
+                    }
+                }
+            }
+            "jobs" => {
+                let is_run = |j: &&Value| j["kind"] == "flow";
+                let media = last.get("jobs").and_then(Value::as_array).into_iter().flatten().filter(|j| !is_run(j)).cloned();
+                let runs: Vec<Value> = caps.get("jobs").and_then(Value::as_array).into_iter().flatten().filter(is_run).cloned().collect();
+                caps["jobs"] = Value::Array(media.chain(runs).collect());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The language model a worker ran before the one it runs now, kept from the heartbeat that heard it change
+/// (`llmBefore`): the Agent reads its model once a minute, and a chat it sends meanwhile names that one
+/// ([`follows_default`]).
+fn keep_llm_before(caps: &mut Value, last: &Value) {
+    let chosen = |c: &Value| c.pointer("/discovery/defaults/llm").and_then(Value::as_str).map(str::to_owned);
+    match (chosen(last), chosen(caps)) {
+        (Some(then), Some(now)) if then != now => caps["llmBefore"] = json!(then),
+        _ => {
+            if let Some(before) = last.get("llmBefore") {
+                caps["llmBefore"] = before.clone();
+            }
+        }
+    }
 }
 
 /// A remote model's id: never the same as a local one, and naming its node (`engine:image:node.<id>/<model>`).

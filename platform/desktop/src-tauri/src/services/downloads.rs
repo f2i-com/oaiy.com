@@ -262,17 +262,51 @@ async fn checked_addrs(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr
 /// What a download's client asks for every name it connects to: the first host's is pinned beforehand
 /// ([`pin_download_host`]), and this answers the rest, a redirect's to another host (a CDN), checked as the first was.
 /// Only the first was: a redirect to a name that resolved to an internal address was followed, and connected to.
-struct CheckedResolver;
+/// The client's proxies (`proxies`, [`proxy_hosts`]) are asked through it too, by name, and are not checked.
+struct CheckedResolver {
+    /// The names of the proxies the client goes through, lower-case.
+    proxies: Vec<String>,
+}
 
 impl reqwest::dns::Resolve for CheckedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let proxy = self.proxies.iter().any(|p| *p == host.trim_end_matches('.').to_ascii_lowercase());
         Box::pin(async move {
             // (port 0: the connector sets the URL's own on each address)
-            let addrs = checked_addrs(&host, 0).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let addrs = if proxy { proxy_addrs(&host).await } else { checked_addrs(&host, 0).await };
+            let addrs = addrs.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
+}
+
+/// A proxy's name resolved, its addresses as they are: a proxy on the office network (`proxy.corp`, at a 10.x
+/// address) or on this computer (`localhost:3128`) is where the person sends every request, a download's with them.
+/// Checked as a download's host is, every model download through one failed ("resolves to a disallowed address").
+async fn proxy_addrs(host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0)).await.map_err(|e| format!("cannot resolve the proxy '{host}': {e}"))?.collect();
+    if addrs.is_empty() {
+        return Err(format!("the proxy '{host}' did not resolve"));
+    }
+    Ok(addrs)
+}
+
+/// The names of the proxies a download of `url` goes through, lower-case, as `matcher` (the client's own) sends it
+/// and a redirect to another https host (the probe, unless `NO_PROXY` names it too). A download's client reads its
+/// proxies as [`hyper_util`]'s matcher does (`Matcher::from_system`, what reqwest's own system proxy is): `ALL_PROXY`,
+/// `HTTPS_PROXY` and `HTTP_PROXY`, each lower-case too, `NO_PROXY`, and in the window's build the system's own proxy
+/// settings (a Mac's, Windows'). A proxy at an address is connected to with no name to resolve.
+fn proxy_hosts(matcher: &hyper_util::client::proxy::matcher::Matcher, url: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for dst in [url, "https://another-host.invalid/"] {
+        let Ok(uri) = dst.parse::<hyper::Uri>() else { continue };
+        let Some(host) = matcher.intercept(&uri).and_then(|i| i.uri().host().map(|h| h.trim_end_matches('.').to_ascii_lowercase())) else { continue };
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 /// A download's host resolved and checked, for the client to be held to (`None` for an address, which needs none).
@@ -1011,8 +1045,10 @@ async fn run_download(
             return;
         }
     };
-    // (every other name it connects to, a redirect's, resolved and checked as the first host was)
-    let mut builder = reqwest::Client::builder().dns_resolver(std::sync::Arc::new(CheckedResolver));
+    // (every other name it connects to, a redirect's, resolved and checked as the first host was; the proxies it goes
+    // through, read as reqwest reads them for this client, resolved unchecked)
+    let proxies = proxy_hosts(&hyper_util::client::proxy::matcher::Matcher::from_system(), &url);
+    let mut builder = reqwest::Client::builder().dns_resolver(std::sync::Arc::new(CheckedResolver { proxies }));
     if let Some((host, addrs)) = &pinned {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -1947,7 +1983,7 @@ mod tests {
     async fn a_name_a_redirect_names_is_resolved_and_checked() {
         use reqwest::dns::Resolve as _;
         for name in ["localhost", "files.localhost"] {
-            let err = match CheckedResolver.resolve(name.parse().unwrap()).await {
+            let err = match (CheckedResolver { proxies: Vec::new() }).resolve(name.parse().unwrap()).await {
                 Ok(_) => panic!("{name} was resolved"),
                 Err(e) => e.to_string(),
             };
@@ -1958,6 +1994,53 @@ mod tests {
         let err = checked_addrs("127.0.0.1", 0).await.unwrap_err();
         assert!(err.contains("disallowed address (127.0.0.1)"), "{err}");
         assert!(checked_addrs("1.1.1.1", 443).await.is_ok_and(|a| a == ["1.1.1.1:443".parse().unwrap()]));
+    }
+
+    /// A download through a proxy on the office network or on this computer (`HTTPS_PROXY=http://localhost:3128`)
+    /// reaches the proxy: reqwest asks the client's resolver for the proxy's name, and it was refused as a download's
+    /// host is. The proxies are read as reqwest reads them, and only their names go unchecked.
+    #[tokio::test]
+    async fn a_download_reaches_a_proxy_on_this_computer_or_the_lan() {
+        use hyper_util::client::proxy::matcher::Matcher;
+        use reqwest::dns::Resolve as _;
+        let corp = Matcher::builder().https("http://Proxy.Corp.example.:8080").build();
+        assert_eq!(proxy_hosts(&corp, "https://huggingface.co/x"), ["proxy.corp.example"]);
+        // (NO_PROXY naming the download's host: a redirect to another still goes through the proxy)
+        let not_hf = Matcher::builder().all("http://proxy.corp.example:8080").no("huggingface.co").build();
+        assert_eq!(proxy_hosts(&not_hf, "https://huggingface.co/x"), ["proxy.corp.example"]);
+        assert!(proxy_hosts(&Matcher::builder().build(), "https://huggingface.co/x").is_empty(), "no proxy");
+        assert!(proxy_hosts(&Matcher::builder().http("http://proxy.corp.example:8080").build(), "https://huggingface.co/x").is_empty(), "an http one is not an https download's");
+        // the proxy's name resolved as it is; any other name still checked
+        let resolver = CheckedResolver { proxies: vec!["localhost".into()] };
+        assert!(resolver.resolve("localhost".parse().unwrap()).await.is_ok(), "the proxy on this computer");
+        let err = match resolver.resolve("files.localhost".parse().unwrap()).await {
+            Ok(_) => panic!("a download's host on this computer was resolved"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("is this computer"), "{err}");
+        // and through reqwest's own way to a proxy: its CONNECT reaches one on this computer, by name
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let heard = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut asked = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !asked.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                asked.extend_from_slice(&buf[..n]);
+            }
+            let _ = socket.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n").await;
+            String::from_utf8_lossy(&asked).lines().next().unwrap_or_default().to_string()
+        });
+        let proxies = proxy_hosts(&Matcher::builder().https(proxy.as_str()).build(), "https://models.example/x");
+        let client = reqwest::Client::builder().dns_resolver(std::sync::Arc::new(CheckedResolver { proxies })).proxy(reqwest::Proxy::https(&proxy).unwrap()).build().unwrap();
+        assert!(client.get("https://models.example/x").send().await.is_err(), "the proxy said no");
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), heard).await.expect("the proxy was reached").unwrap();
+        assert!(line.starts_with("CONNECT models.example:443"), "{line}");
     }
 
     #[test]

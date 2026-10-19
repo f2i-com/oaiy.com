@@ -579,14 +579,29 @@ fn bind_address(settings: &Settings) -> Result<std::net::SocketAddr, String> {
 /// adapters that are up (Windows lists those that are down, or not there, with their last address too), the one its
 /// default route leaves by first, where the system says which.
 fn lan_addresses(port: u16) -> Vec<String> {
-    let all = if_addrs::get_if_addrs().unwrap_or_default();
-    let up: Vec<std::net::IpAddr> = all.iter().filter(|i| i.is_oper_up()).map(|i| i.ip()).collect();
-    // (none said to be up: a system that does not say, and its addresses as they are)
-    let ips = if up.is_empty() { all.iter().map(|i| i.ip()).collect() } else { up };
-    typeable(ips, default_route_address())
+    let adapters: Vec<Adapter> = if_addrs::get_if_addrs().unwrap_or_default().iter().map(|i| Adapter { ip: i.ip(), up: i.is_oper_up(), point_to_point: i.is_p2p() }).collect();
+    offered(&adapters, default_route_address())
         .into_iter()
         .map(|ip| std::net::SocketAddr::new(ip, port).to_string())
         .collect()
+}
+
+/// One of this computer's addresses, as its adapter is: up, and a point-to-point link (a VPN's tunnel, `utun` on a Mac).
+struct Adapter {
+    ip: std::net::IpAddr,
+    up: bool,
+    point_to_point: bool,
+}
+
+/// The addresses offered of `adapters`, as [`typeable`] orders them (`first`, the default route's, first): those that
+/// are up, where the system says so, and none of a point-to-point link's. A VPN that sends all traffic through it is
+/// where the default route leaves by, and its address was offered first, though no computer on the LAN reaches it.
+fn offered(adapters: &[Adapter], first: Option<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
+    let lan: Vec<&Adapter> = adapters.iter().filter(|a| !a.point_to_point).collect();
+    let up: Vec<std::net::IpAddr> = lan.iter().filter(|a| a.up).map(|a| a.ip).collect();
+    // (none said to be up: a system that does not say, and its addresses as they are)
+    let ips = if up.is_empty() { lan.iter().map(|a| a.ip).collect() } else { up };
+    typeable(ips, first)
 }
 
 /// The address this computer's default route leaves by, the one other computers on its network most likely reach

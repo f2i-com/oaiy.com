@@ -16,55 +16,121 @@ use super::*;
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot really";
 
+/// What a test changes of a fake engine host as it runs ([`fake_engines_with`]).
+#[derive(Default)]
+struct Fake {
+    /// Its engines not answering (no gateway yet).
+    down: std::sync::atomic::AtomicBool,
+    /// Its resources, system and jobs answered past the worker's wait for them.
+    slow: std::sync::atomic::AtomicBool,
+    /// The language model chosen in its Engines (`tiny-llm` where none is set).
+    llm: std::sync::Mutex<Option<String>>,
+}
+
+impl Fake {
+    fn is(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set(flag: &std::sync::atomic::AtomicBool, on: bool) {
+        flag.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn llm(&self) -> String {
+        self.llm.lock().unwrap().clone().unwrap_or_else(|| "tiny-llm".into())
+    }
+
+    /// A reading answered: at once, or past the worker's wait for it while `slow`.
+    async fn reading(&self, v: Value) -> axum::Json<Value> {
+        if Self::is(&self.slow) {
+            tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+        }
+        axum::Json(v)
+    }
+}
+
 /// A fake engine host (the Studio): its control port's state and resources, and its gateway under `/gw`.
 async fn fake_engines() -> String {
+    fake_engines_with().await.0
+}
+
+/// As [`fake_engines`], with what a test changes of it as it runs.
+async fn fake_engines_with() -> (String, std::sync::Arc<Fake>) {
+    let fake = std::sync::Arc::new(Fake::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let gw = format!("{base}/gw");
     let file = format!("{gw}/files/images/2026-10-18/x/image-0001.png");
     let app = Router::new()
         .route("/api/state", get({
-            let gw = gw.clone();
-            move || async move { axum::Json(json!({ "gateway_url": gw })) }
+            let (gw, fake) = (gw.clone(), fake.clone());
+            move || {
+                let (gw, fake) = (gw.clone(), fake.clone());
+                async move { axum::Json(if Fake::is(&fake.down) { json!({}) } else { json!({ "gateway_url": gw }) }) }
+            }
         }))
-        .route("/api/resources", get(|| async {
-            axum::Json(json!({
-                "devices": [{"id": "egpu", "name": "NV card (eGPU)", "unified": false, "memory_total_mb": 24564, "memory_used_mb": 9000}],
-                "models": [{"model": "tiny-image", "kind": "image", "device": "egpu", "state": "kept", "pinned": false}],
-                "queue": {"running": null, "queued": 0},
-                "policy": {"llm_pinned": true},
-                "events": [{"event": "load", "model": "tiny-image", "why": "a picture"}],
-            }))
+        .route("/api/resources", get({
+            let fake = fake.clone();
+            move || {
+                let fake = fake.clone();
+                async move {
+                    fake.reading(json!({
+                        "devices": [{"id": "egpu", "name": "NV card (eGPU)", "unified": false, "memory_total_mb": 24564, "memory_used_mb": 9000}],
+                        "models": [{"model": "tiny-image", "kind": "image", "device": "egpu", "state": "kept", "pinned": false}],
+                        "queue": {"running": null, "queued": 0},
+                        "policy": {"llm_pinned": true},
+                        "events": [{"event": "load", "model": "tiny-image", "why": "a picture"}],
+                    }))
+                    .await
+                }
+            }
         }))
-        .route("/api/system", get(|| async {
-            axum::Json(json!({ "gpus": [{"name": "NV card (eGPU)", "memory_total_mb": 24564, "temperature": 58}], "ram": {"total_mb": 65536, "available_mb": 40000} }))
+        .route("/api/system", get({
+            let fake = fake.clone();
+            move || {
+                let fake = fake.clone();
+                async move { fake.reading(json!({ "gpus": [{"name": "NV card (eGPU)", "memory_total_mb": 24564, "temperature": 58}], "ram": {"total_mb": 65536, "available_mb": 40000} })).await }
+            }
         }))
         // (a picture being made and one waiting, each with what it was asked to make: never shared)
-        .route("/api/jobs", get(|| async {
-            axum::Json(json!({ "jobs": [
-                {"id": "j1", "kind": "image", "model": "tiny-image", "status": "in_progress", "progress": 40, "prompt": "a private prompt", "files": ["/Users/someone/out.png"]},
-                {"id": "j2", "kind": "image", "model": "tiny-image", "status": "queued", "prompt": "another private prompt"},
-                {"id": "j0", "kind": "image", "model": "tiny-image", "status": "completed", "prompt": "done"},
-            ]}))
+        .route("/api/jobs", get({
+            let fake = fake.clone();
+            move || {
+                let fake = fake.clone();
+                async move {
+                    fake.reading(json!({ "jobs": [
+                        {"id": "j1", "kind": "image", "model": "tiny-image", "status": "in_progress", "progress": 40, "prompt": "a private prompt", "files": ["/Users/someone/out.png"]},
+                        {"id": "j2", "kind": "image", "model": "tiny-image", "status": "queued", "prompt": "another private prompt"},
+                        {"id": "j0", "kind": "image", "model": "tiny-image", "status": "completed", "prompt": "done"},
+                    ]}))
+                    .await
+                }
+            }
         }))
         // (pins: what reached the engines echoed back, and one they cannot keep refused with their reason)
         .route("/api/resources/pins", post(|body: String| async move { pinned(&body, true) }))
         .route("/api/resources/unpin", post(|body: String| async move { pinned(&body, false) }))
-        .route("/gw/v1/discovery", get(|| async {
-            axum::Json(json!({
-                "base_url": "http://127.0.0.1:8080",
-                "endpoints": [
-                    {"name": "chat", "path": "/v1/chat/completions", "spec": "openai", "url": "http://127.0.0.1:8080/v1/chat/completions"},
-                    {"name": "images", "path": "/v1/images/generations", "spec": "openai"},
-                    {"name": "files", "path": "/files", "spec": "openai"},
-                ],
-                "models": {
-                    "llm": [{"id": "tiny-llm", "default": true, "files_present": true}],
-                    "image": [{"id": "tiny-image", "default": true, "files_present": true}, {"id": "gone", "files_present": false, "missing_files": ["/Users/someone/secret/model.gguf"]}],
-                },
-                "defaults": {"llm": "tiny-llm", "image": "tiny-image"},
-                "llm": {"state": "ready", "context_tokens": 32768},
-            }))
+        .route("/gw/v1/discovery", get({
+            let fake = fake.clone();
+            move || {
+                let llm = fake.llm();
+                async move {
+                    axum::Json(json!({
+                        "base_url": "http://127.0.0.1:8080",
+                        "endpoints": [
+                            {"name": "chat", "path": "/v1/chat/completions", "spec": "openai", "url": "http://127.0.0.1:8080/v1/chat/completions"},
+                            {"name": "images", "path": "/v1/images/generations", "spec": "openai"},
+                            {"name": "files", "path": "/files", "spec": "openai"},
+                        ],
+                        "models": {
+                            "llm": [{"id": llm, "default": true, "files_present": true}],
+                            "image": [{"id": "tiny-image", "default": true, "files_present": true}, {"id": "gone", "files_present": false, "missing_files": ["/Users/someone/secret/model.gguf"]}],
+                        },
+                        "defaults": {"llm": llm, "image": "tiny-image"},
+                        "llm": {"state": "ready", "context_tokens": 32768},
+                    }))
+                }
+            }
         }))
         .route("/gw/v1/images/generations", post({
             let file = file.clone();
@@ -81,7 +147,7 @@ async fn fake_engines() -> String {
             ([("content-type", "text/event-stream")], chunks)
         }));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    (base, fake)
 }
 
 /// The fake engines' answer to a pin or an unpin: refused for `too-big`, else the resources with what they were asked.
@@ -767,19 +833,34 @@ async fn a_primary_uses_oaiy_voice_on_a_worker() {
         let r = lent.client.get(format!("{}{path}", lent.root)).send().await.unwrap();
         assert_eq!(r.status().as_u16(), code, "{path}");
     }
-    // that computer not answering (the heartbeat found it so, or asked now), this computer's own answers meanwhile
+    // the heartbeat found that computer not answering once, and it answers when asked again: heard there still
     let own = set_up(&primary);
+    let registry = primary.inner().ai.registry.clone();
+    let running_here = || registry.lock().unwrap().running_service_lease("oaiy-voice").is_some();
     quiet(&primary);
     lock(&primary.inner().nodes).get_mut(&node_id).unwrap().online = false;
-    let offline = primary::service_target_of(&primary, "oaiy-voice").unwrap();
-    assert!(offline.offline);
-    let here = crate::voice::engines::Engines::via_or_here(offline, primary.inner().ai.registry.clone());
-    assert_eq!(here.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {own}"), "heard here");
+    let flagged = primary::service_target_of(&primary, "oaiy-voice").unwrap();
+    assert!(flagged.offline);
+    let asked = crate::voice::engines::Engines::via_or_here(flagged, registry.clone());
+    assert_eq!(asked.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {port}"), "asked once more, it answered");
+    assert!(!running_here(), "this computer's own was not started for a missed heartbeat");
     lock(&primary.inner().nodes).get_mut(&node_id).unwrap().online = true;
-    let answering = crate::voice::engines::Engines::via_or_here(primary::service_target_of(&primary, "oaiy-voice").unwrap(), primary.inner().ai.registry.clone());
-    assert_eq!(answering.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {port}"), "on the worker again once it answers");
+    // a call keeps the computer its speech was first heard on: that computer gone in the middle of it, its next line is
+    // not heard, at once, rather than waiting on this computer's own starting cold with the caller on the line
+    let there = primary::service_target_of(&primary, "oaiy-voice").unwrap();
+    let a_call = crate::voice::engines::Engines::via_or_here(there.clone(), registry.clone()).for_call();
+    assert_eq!(a_call.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {port}"), "the call's first line, there");
     worker.stop();
+    let asked_at = std::time::Instant::now();
+    assert!(a_call.transcribe_wav(vec![0u8; 3200]).await.is_err(), "not heard here mid-call");
+    assert!(asked_at.elapsed() < std::time::Duration::from_secs(15) && !running_here(), "nothing started here for it");
+    // asked now and not answering, outside a call (a transcription): this computer's own is started and answers
+    let answering = crate::voice::engines::Engines::via_or_here(there.clone(), registry.clone());
     assert_eq!(answering.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {own}"), "asked now and not answering: heard here");
+    // running here now, the call goes on with this computer's own, and a call that begins now begins here
+    assert_eq!(a_call.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {own}"), "the rest of the call, here");
+    let next_call = crate::voice::engines::Engines::via_or_here(there, registry.clone()).for_call();
+    assert_eq!(next_call.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {own}"));
     // a service the worker has not set up is not chosen; unpairing gives this computer's own back
     let (status, _) = call(&p, "PUT", "/api/network/settings", Some(json!({ "services": { "oaiy-voice": "nobody" } }))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1247,6 +1328,19 @@ fn the_addresses_shown_are_the_ones_a_person_can_type() {
     assert_eq!(typeable(ips, Some(ip("8.8.8.8"))), vec![ip("192.168.2.147"), ip("10.0.0.4"), ip("fd85:2144:420d::7ebf")], "one not typeable is not put first");
 }
 
+/// With a VPN that sends all traffic through it, the default route leaves by its tunnel, a point-to-point link: its
+/// address is not offered (no computer on the LAN reaches it), first or at all, and the Wi-Fi's is.
+#[test]
+fn a_vpns_tunnel_is_not_offered() {
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    let adapter = |a: &str, up: bool, point_to_point: bool| Adapter { ip: ip(a), up, point_to_point };
+    let adapters = [adapter("127.0.0.1", true, false), adapter("192.168.2.147", true, false), adapter("10.8.0.2", true, true), adapter("10.0.0.4", false, false)];
+    assert_eq!(offered(&adapters, Some(ip("10.8.0.2"))), vec![ip("192.168.2.147")]);
+    // (no adapter said to be up: each as it is, the tunnel's still not)
+    let unsaid = [adapter("192.168.2.147", false, false), adapter("10.8.0.2", false, true)];
+    assert_eq!(offered(&unsaid, None), vec![ip("192.168.2.147")]);
+}
+
 /// A connection a paired primary keeps open to a worker (its streamed chat, a call's speech, a run followed): one
 /// request on it, answered whole (`GET` with no body), its status line.
 async fn ask_on<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(conn: &mut S, path: &str) -> std::io::Result<String> {
@@ -1303,12 +1397,13 @@ async fn saving_settings_keeps_the_connections_of_the_computers_using_it() {
     }
 }
 
-/// A worker's language model as this computer's default is whichever it runs: a chat naming the one it ran before
-/// (the Agent reads its model once a minute) is answered by the one it runs now. Not the default, the chat is refused,
-/// saying what that computer runs now and how to follow it.
+/// A worker's language model as this computer's default is whichever it runs: a chat naming the one it ran when it was
+/// made the default (the Agent reads its model once a minute) is answered by the one it runs now. Not the default, the
+/// chat is refused, saying what that computer runs now and how to follow it.
 #[tokio::test]
 async fn a_chat_on_the_default_follows_the_model_the_worker_runs_now() {
-    let worker = node("worker-follows", Role::Worker, Some(fake_engines().await)).await;
+    let (engines, fake) = fake_engines_with().await;
+    let worker = node("worker-follows", Role::Worker, Some(engines)).await;
     let primary = node("primary-follows", Role::Primary, None).await;
     let node_id = pair(&primary, &worker).await;
     let p = router(primary.clone());
@@ -1320,7 +1415,11 @@ async fn a_chat_on_the_default_follows_the_model_the_worker_runs_now() {
     assert!(said.contains("the worker-follows runs tiny-llm now, not an-older-llm") && said.contains("this computer's default"), "{said}");
     let (status, _) = call(&p, "PUT", "/api/network/settings", Some(json!({ "defaults": { "llm": format!("engine:llm:node.{node_id}/tiny-llm") } }))).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, v) = call(&p, "POST", &chat, Some(asked)).await;
+    // (its person chooses another there)
+    quiet(&primary);
+    *fake.llm.lock().unwrap() = Some("mini-llm".into());
+    primary::check(&primary, &primary.inner().peers().get(&node_id, Role::Worker).cloned().unwrap()).await;
+    let (status, v) = call(&p, "POST", &chat, Some(json!({ "model": "tiny-llm", "stream": true, "messages": [{"role": "user", "content": "hi"}] }))).await;
     assert_eq!(status, StatusCode::OK, "{v}");
     assert!(v.as_str().unwrap_or_default().contains("Hel"), "answered by the model it runs now: {v}");
     for n in [&worker, &primary] {
@@ -1328,28 +1427,119 @@ async fn a_chat_on_the_default_follows_the_model_the_worker_runs_now() {
     }
 }
 
+/// A worker's language model as this computer's default is the one it runs now, in the status too: the other computer
+/// switching from one model to another, the Overview said the first. A chat naming the model it ran when chosen, or the
+/// one it ran before the one it runs now (the Agent's for a minute), is answered by the one it runs; a chat naming
+/// another of its models (a flow's step naming one) is not, and nor is any once this computer's own is chosen again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_language_model_follows_the_worker_and_only_its_own_chats_do() {
+    let (engines, fake) = fake_engines_with().await;
+    let worker = node("worker-switches", Role::Worker, Some(engines)).await;
+    let (own_engines, own) = fake_engines_with().await;
+    let primary = node("primary-switches", Role::Primary, Some(own_engines)).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let (status, v) = call(&p, "PUT", "/api/network/settings", Some(json!({ "defaults": { "llm": format!("engine:llm:node.{node_id}/tiny-llm") } }))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    quiet(&primary);
+    let peer = primary.inner().peers().get(&node_id, Role::Worker).cloned().unwrap();
+    let chat = format!("/api/network/nodes/{node_id}/v1/chat/completions");
+    let ask = |model: &str| json!({ "model": model, "stream": true, "messages": [{"role": "user", "content": "hi"}] });
+    let llm_default = || async { call(&p, "GET", "/api/network/status", None).await.1["defaults"]["llm"].clone() };
+    // that computer switches to another model: the status says the one it runs
+    *fake.llm.lock().unwrap() = Some("mini-llm".into());
+    primary::check(&primary, &peer).await;
+    let d = llm_default().await;
+    assert_eq!((&d["model"], &d["id"], &d["inEffect"]), (&json!("mini-llm"), &json!(format!("engine:llm:node.{node_id}/mini-llm")), &json!(true)), "{d}");
+    // the model it ran when chosen: answered by the one it runs
+    let (status, v) = call(&p, "POST", &chat, Some(ask("tiny-llm"))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    // another of its models, named by a flow's step: refused there, not answered by another
+    let (status, v) = call(&p, "POST", &chat, Some(ask("sees-pictures"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    // it switches again: the one it ran just before (what the Agent names for a minute) is answered too
+    *fake.llm.lock().unwrap() = Some("third-llm".into());
+    primary::check(&primary, &peer).await;
+    assert_eq!(llm_default().await["model"], "third-llm");
+    for named in ["mini-llm", "tiny-llm", &format!("engine:llm:node.{node_id}/mini-llm")] {
+        let (status, v) = call(&p, "POST", &chat, Some(ask(named))).await;
+        assert_eq!(status, StatusCode::OK, "{named}: {v}");
+    }
+    // this computer's own chosen again since (its engines' model changed): the chat goes as it was asked, and is refused
+    *own.llm.lock().unwrap() = Some("own-other".into());
+    let (status, v) = call(&p, "POST", &chat, Some(ask("tiny-llm"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert!(primary.inner().defaults().get("llm").is_none(), "this computer's own is the default again");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// What a worker could not read in time for its heartbeat's answer (its resources, GPUs and media jobs, its engines
+/// busy) is kept as last heard, not shown empty on its card until the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_a_worker_reads_too_late_is_kept_as_last_heard() {
+    let (engines, fake) = fake_engines_with().await;
+    let worker = node("worker-late", Role::Worker, Some(engines)).await;
+    let primary = node("primary-late", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    quiet(&primary);
+    let peer = primary.inner().peers().get(&node_id, Role::Worker).cloned().unwrap();
+    primary::check(&primary, &peer).await;
+    let card = || async { call(&p, "GET", "/api/network/nodes", None).await.1["nodes"][0].clone() };
+    let before = card().await;
+    assert_eq!((before["devices"].as_array().unwrap().len(), before["jobs"].as_array().unwrap().len(), before["machine"]["gpus"].as_array().unwrap().len()), (1, 2, 1), "{before}");
+    Fake::set(&fake.slow, true);
+    primary::check(&primary, &peer).await;
+    Fake::set(&fake.slow, false);
+    let late = lock(&primary.inner().nodes).get(&node_id).and_then(|s| s.capabilities.clone()).unwrap();
+    assert_eq!(late["late"], json!(["resources", "machine", "jobs"]), "said late by the worker");
+    let after = card().await;
+    for field in ["devices", "jobs", "queue"] {
+        assert_eq!(after[field], before[field], "{field}: {after}");
+    }
+    assert_eq!((&after["machine"]["gpus"], &after["machine"]["ram"]), (&before["machine"]["gpus"], &before["machine"]["ram"]));
+    assert_eq!(after["online"], true);
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
 /// A default on a worker says whether it is in effect, and why not where it is not: that computer not heard from since
-/// this one started (it was asleep), its engines not answering since, or the model no longer one of its.
+/// this one started (it was asleep), its engines not answering, or the model no longer one of its. Its engines not
+/// answering since they were heard, it is in effect still (what uses it is told so), and says so.
 #[tokio::test]
 async fn a_default_on_a_worker_says_whether_it_is_in_effect_and_why_not() {
-    let worker = node("worker-waits", Role::Worker, Some(fake_engines().await)).await;
+    let (engines, fake) = fake_engines_with().await;
+    let worker = node("worker-waits", Role::Worker, Some(engines)).await;
     let primary = node("primary-waits", Role::Primary, None).await;
     let node_id = pair(&primary, &worker).await;
     let p = router(primary.clone());
     let (_, v) = call(&p, "PUT", "/api/network/settings", Some(json!({ "defaults": { "image": format!("engine:image:node.{node_id}/tiny-image") } }))).await;
     assert_eq!((&v["defaults"]["image"]["inEffect"], &v["defaults"]["image"]["waiting"]), (&json!(true), &Value::Null), "{v}");
     quiet(&primary);
+    let peer = primary.inner().peers().get(&node_id, Role::Worker).cloned().unwrap();
     let heard = lock(&primary.inner().nodes).get(&node_id).cloned().unwrap();
     let waiting = || async { call(&p, "GET", "/api/network/status", None).await.1["defaults"]["image"].clone() };
     // (this computer restarted, that one asleep: nothing heard of it yet)
     lock(&primary.inner().nodes).clear();
     let d = waiting().await;
     assert_eq!((&d["inEffect"], &d["waiting"], &d["nodeName"]), (&json!(false), &json!("not_heard"), &json!("the worker-waits")), "{d}");
-    // (heard, its engines not answering since)
-    let mut down = heard.clone();
-    down.capabilities.as_mut().unwrap()["discovery"] = Value::Null;
-    lock(&primary.inner().nodes).insert(node_id.clone(), down);
-    assert_eq!(waiting().await["waiting"], "engines_down");
+    // (heard, its engines not answering since this computer started: this computer's own stands in)
+    Fake::set(&fake.down, true);
+    primary::check(&primary, &peer).await;
+    let d = waiting().await;
+    assert_eq!((&d["inEffect"], &d["waiting"]), (&json!(false), &json!("engines_down")), "{d}");
+    // (heard with its engines, then its engines not answering, as a heartbeat finds it: in effect still, and said)
+    Fake::set(&fake.down, false);
+    primary::check(&primary, &peer).await;
+    assert_eq!((&waiting().await["inEffect"], &waiting().await["waiting"]), (&json!(true), &Value::Null));
+    Fake::set(&fake.down, true);
+    primary::check(&primary, &peer).await;
+    let d = waiting().await;
+    assert_eq!((&d["inEffect"], &d["waiting"]), (&json!(true), &json!("engines_down")), "{d}");
+    Fake::set(&fake.down, false);
     // (heard, the model gone from it)
     let mut gone = heard.clone();
     gone.capabilities.as_mut().unwrap()["discovery"]["models"]["image"] = json!([]);
@@ -1421,6 +1611,35 @@ async fn an_approval_never_confirmed_by_the_primary_is_undone_on_the_worker() {
     age(&worker);
     worker::drop_unconfirmed(&worker);
     assert_eq!(call(&w, "GET", "/api/network/nodes", None).await.1["nodes"].as_array().unwrap().len(), 1, "a primary heard from stands");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A primary paired here already that asks to pair again, its person then saying no there (paired already, it sends
+/// nothing), keeps its pairing: the second approval is not undone with it, as one never confirmed is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_approval_of_a_primary_paired_already_is_not_undone() {
+    let worker = node("worker-again", Role::Worker, Some(fake_engines().await)).await;
+    let primary = node("primary-again", Role::Primary, None).await;
+    pair(&primary, &worker).await;
+    // (its heartbeat stopped, as one that does not use this computer now: nothing is heard from it from here on)
+    quiet(&primary);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    lock(&worker.inner().unconfirmed).clear();
+    let (p, w) = (router(primary.clone()), router(worker.clone()));
+    let (_, started) = call(&p, "POST", "/api/network/pairings/start", Some(json!({ "address": worker.listening().unwrap().to_string() }))).await;
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    call(&w, "POST", &format!("/api/network/requests/{}/approve", waiting["requests"][0]["id"].as_str().unwrap()), None).await;
+    let (_, there) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"] }))).await;
+    assert_eq!(there["status"], "approved_there");
+    let (_, no) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": false }))).await;
+    assert_eq!(no["status"], "declined");
+    for (_, at) in lock(&worker.inner().unconfirmed).values_mut() {
+        *at = at.checked_sub(worker::UNCONFIRMED + std::time::Duration::from_secs(1)).unwrap();
+    }
+    worker::drop_unconfirmed(&worker);
+    assert_eq!(call(&w, "GET", "/api/network/nodes", None).await.1["nodes"].as_array().unwrap().len(), 1, "the pairing of before stands");
     for n in [&worker, &primary] {
         n.stop();
     }
@@ -1504,18 +1723,25 @@ async fn a_run_waited_for_on_a_worker_is_not_lost_or_run_twice() {
     let worker = node("worker-runs", Role::Worker, Some(fake_engines().await)).await;
     let flows = std::sync::Arc::new(crate::bridge::worker::FlowStore::new(temp("flows-runs")));
     flows.put("logo", &json!({ "name": "Make a logo", "oaiyRemote": true, "nodes": [] }).to_string()).unwrap();
+    flows.put("poster", &json!({ "name": "Make a poster", "oaiyRemote": true, "nodes": [] }).to_string()).unwrap();
     let ledger = crate::bridge::ledger::new_handle();
     worker.set_bridge(ledger.clone(), flows);
     let primary = node("primary-runs", Role::Primary, None).await;
     let node_id = pair(&primary, &worker).await;
     let p = router(primary.clone());
     let runs = format!("/api/network/nodes/{node_id}/flows/logo/runs");
-    // the same key twice: one run
+    // the same key twice: one run, each answer with its key
     let (_, first) = call(&p, "POST", &runs, Some(json!({ "key": "k-1" }))).await;
     let (status, again) = call(&p, "POST", &runs, Some(json!({ "key": "k-1" }))).await;
     assert_eq!((status, &again["runId"]), (StatusCode::OK, &first["runId"]), "{again}");
+    assert_eq!((&first["key"], &again["key"]), (&json!("k-1"), &json!("k-1")));
     let (_, other) = call(&p, "POST", &runs, Some(json!({}))).await;
     assert_ne!(other["runId"], first["runId"]);
+    assert!(other["key"].as_str().is_some_and(|k| !k.is_empty() && k != "k-1"), "the key made for it: {other}");
+    // a key of one flow's run, asked with for another: refused, not that run answered as the other's
+    let (status, reused) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/flows/poster/runs"), Some(json!({ "key": "k-1" }))).await;
+    assert_eq!((status, &reused["error"]["code"]), (StatusCode::CONFLICT, &json!("key_in_use")), "{reused}");
+    assert!(reused["error"]["message"].as_str().unwrap().contains("another flow"), "{reused}");
     // waited for: that computer goes for a moment, the run finishes there meanwhile, and it is answered once back
     let port = worker.listening().unwrap().port();
     let waiting = {
@@ -1535,6 +1761,7 @@ async fn a_run_waited_for_on_a_worker_is_not_lost_or_run_twice() {
     worker.set(Settings { port, ..worker.settings() }).await.unwrap();
     let (status, done) = waiting.await.unwrap();
     assert_eq!((status, &done["status"], &done["runId"]), (StatusCode::OK, &json!("succeeded"), &json!(run_id)), "{done}");
+    assert_eq!(done["key"], "k-2", "{done}");
     // gone for good: given up after a few misses, the error keeping the run's id and its key
     let waiting = {
         let p = p.clone();

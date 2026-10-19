@@ -70,8 +70,10 @@ models while it uses another's OAIY Voice, say.
 
 1. **On the computer that lends** (its GPUs, models, shared flows or OAIY Voice): switch on *Lend this computer*. It
    listens on port 17975 (change it there), only on LAN addresses, and shows the addresses another computer can type:
-   those of its adapters that are up, the one its default route leaves by first (Windows lists adapters that are down,
-   and virtual ones, in adapter order). Allow OAIY through the computer's firewall for that port if it asks; a Mac
+   those of its adapters that are up, the one its default route leaves by first, and none of a VPN's tunnel (a
+   point-to-point link: with all traffic sent through it, it is where the default route leaves by, and no computer on
+   the LAN reaches it). Windows lists adapters that are down, and virtual ones, in adapter order. Allow OAIY through
+   the computer's firewall for that port if it asks; a Mac
    asks once whether OAIY may find and connect to devices on the local network (`NSLocalNetworkUsageDescription` in
    the app's Info.plist says why): allow it. Saving the page again (a new name, *Use other computers* switched on or
    off) keeps the listener and the connections of the computers using it; only another port or address, or *Lend this
@@ -174,10 +176,12 @@ there (its engines' discovery, `llm.context_tokens`; null before they say), whic
   default on a worker that is offline says so when it is used; one not heard from since this computer started
   leaves this computer's own in place until it is. Set with `PUT /api/network/settings`
   `{"defaults": {"image": "engine:image:node.<id>/<model>"}}` (`null` gives it back), listed in `GET
-  /api/network/status` as `defaults`, each with `inEffect` (the catalogue marks it its kind's default) and, where it
-  is not, why it waits (`waiting`: `not_heard`, that computer not heard from since this one started; `engines_down`,
-  its engines not answering since; `model_gone`, the model no longer one of its); the Agent's `model_set_default`
-  takes a worker's model's id too.
+  /api/network/status` as `defaults`, each with its `id` and `model` as in effect (a language model's, the one that
+  computer runs now, not the one it ran when chosen), `inEffect` (the catalogue marks it its kind's default) and, where
+  it is not, why it waits (`waiting`: `not_heard`, that computer not heard from since this one started; `engines_down`,
+  its engines not answering; `model_gone`, the model no longer one of its). Its engines not answering since they were
+  heard, it is in effect still (`inEffect` true, `waiting` `engines_down`): what uses it is told so, and nothing runs in
+  its place. The Agent's `model_set_default` takes a worker's model's id too.
 - **Any client of this desktop** reaches a worker's media routes at `/api/network/nodes/<id>/gateway/v1/…` and its
   chat at `/api/network/nodes/<id>/v1/chat/completions` (streamed as the worker streams it), with the desktop's own
   credentials (scope `ai.use`).
@@ -191,16 +195,21 @@ or has waiting (a flow's id and run id for the asking computer's own runs alone)
 page shows them on each paired computer's card (*Processor*, *Memory (RAM)*, each GPU's *VRAM*, *Queue: 1 running,
 2 waiting*), and the Agent's `network_status` as `cpu`, `ramMb`, `gpus` and `queue`. A worker answers its heartbeat
 within five seconds whatever its engines do (each reading asked at once, within that), and the primary waits eight:
-a busy worker shows its engines slow (`enginesError`), not itself offline. A worker runs its jobs one
+a busy worker shows its engines slow (`enginesError`), not itself offline. A reading not in within that time is named
+in its answer (`late`: `flows`, `resources`, `machine`, `jobs`), and the primary keeps what it heard of it last (its
+shared flows, its GPUs and memory, its media jobs) rather than showing them empty until the next heartbeat. A
+worker runs its jobs one
 after another in its own queue; Flows → *On other computers* queues another run of a flow while one runs
 (*Queue another on …*), each followed and stopped on its own.
 
 A model that is offline, or a worker that refuses, answers `503 node_offline` naming the worker and why
 (*connection refused at …*, *could not connect to …*, *Rig is not paired with the computer asking*): nothing falls
 back to another model. A chat naming a language model the worker no longer runs (its person chose another) is
-answered by the one it runs now where that worker's language model is this computer's default (it is whichever it
-runs: the Agent, which reads its model once a minute, does not fail meanwhile); otherwise it is `409
-model_unavailable`, naming the one it runs and how to follow it (*Rig runs gemma now, not qwen (its language model
+answered by the one it runs now where that worker's language model is this computer's default and the chat names the
+model it ran when it was made the default, or the one it ran just before the one it runs now (it is whichever it runs:
+the Agent, which reads its model once a minute, does not fail meanwhile); a chat naming another of its models (a flow
+step's) is not answered by another. Otherwise it is `409 model_unavailable`, naming the one it runs and how to
+follow it (*Rig runs gemma now, not qwen (its language model
 was changed there): choose Rig's gemma instead, or make Rig's language model this computer's default*). A media answer names its files at the primary's route for the
 worker, as the caller reached the primary (`http://<host>/api/network/nodes/<id>/gateway/files/…`).
 
@@ -216,12 +225,14 @@ models and GPUs:
   primary, and its words.
 - **The Agent**: `flows_list` with `node` lists a worker's shared flows, and `flow_run` with `node` runs one there
   (waiting for it by default, its pictures handed to the Agent as images). Each such run has a key: asked once more
-  with it where the worker did not answer before the run started, and given with an error that lost track of it, so
-  `flow_run` again with that `key` follows the same run rather than running the flow twice.
+  with it where the worker did not answer before the run started, and given with its answer (its words and its data,
+  `key`) and with an error that lost track of it, so `flow_run` again with that `key` follows the same run (one not
+  finished when it answered, or not waited for) rather than running the flow twice.
 - **Routes**: `GET /api/network/nodes/:id/flows`, `POST /api/network/nodes/:id/flows/:flow/runs`
-  (`{input?, timeoutMs?, wait?, key?}`: answered at once with the run, or with `wait` once it has finished),
-  `GET /api/network/nodes/:id/runs/:run`, `POST /api/network/nodes/:id/runs/:run/cancel`. The same `key` is the same
-  run (a key is made where none is given). Waiting, the primary asks again through a few polls that go unanswered
+  (`{input?, timeoutMs?, wait?, key?}`: answered at once with the run, or with `wait` once it has finished, each
+  answer with its `key`), `GET /api/network/nodes/:id/runs/:run`, `POST /api/network/nodes/:id/runs/:run/cancel`. The
+  same `key` is the same run of the same flow (a key is made where none is given); one asked with for another flow is
+  refused (`409 key_in_use`). Waiting, the primary asks again through a few polls that go unanswered
   (a Wi-Fi blip, a busy moment), a little later each time; past four in a row it answers the error with the run's
   `runId`, its last state (`run`) and its `key`, to follow it or ask again with the key.
 
@@ -239,13 +250,18 @@ flow editor's speech-to-text and the Agent's listening) then send their speech-t
 which starts its OAIY Voice when asked. A call's voice is copied to the worker the first time it is used there (kept
 there as `from-<primary>-<name>`, beside the worker's own voices, `<primary>` being sixteen hex digits of the primary's
 certificate, which no other computer can take as its own, as it could a node id; a voice added by hand may not begin
-with `from-`, and a name is a copy only where `<primary>` is hex digits). A plugin's setup that asks for OAIY Voice counts
+with `from-`, in any case, nor be kept under a name that reads as a copy's, and a name is a copy only where
+`<primary>` is hex digits: "From Mum" is a voice of one's own). A plugin's setup that asks for OAIY Voice counts
 the worker's. Set with `PUT /api/network/settings` `{"services": {"oaiy-voice": "<nodeId>"}}` (`null` gives it back),
 listed in `GET /api/network/status` as `services` (each with `heard`, whether that computer has been heard from since
-this one started, and `online`). While that computer does not answer (its heartbeat found it so, or it does not
-answer now, twice), a call, a transcription or the Agent's listening is heard and spoken by this computer's own
-OAIY Voice where it is set up here, said in the log (*voice: Rig is not answering …; this computer's own OAIY Voice
-answers meanwhile*, once a minute at most), and by the worker's again once it answers.
+this one started, and `online`). That computer found not answering by its heartbeat is asked once more, for a
+moment; while it does not answer (then, or now, twice), a transcription or the Agent's listening is heard and spoken by
+this computer's own OAIY Voice where it is set up here (started if need be), said in the log (*voice: Rig does not
+answer …; this computer's own OAIY Voice answers meanwhile*, once a minute at most), and by the worker's again once it
+answers. A call keeps the computer its speech is first heard on, as it begins (this computer's own may be started
+then), for all of its lines: that computer not answering in the middle of a call, the call goes on with this
+computer's own only where that is running already, and stays with it to the end; else that line is not heard, and the
+worker is asked again at the next. Nothing is started cold in the middle of a call.
 
 The worker lends that service's speech routes alone (`/worker/v1/services/oaiy-voice/…`: its models and voices,
 `/v1/audio/transcriptions`, `/v1/audio/speech`, streamed as it speaks), and no other service: one a person added

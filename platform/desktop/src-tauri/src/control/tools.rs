@@ -292,14 +292,14 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                     "flow": { "type": "object", "description": "The flow's whole new document." }
                 }), &["id", "flow"])),
             def("flow_run", "Run a flow", Change,
-                "Run a stored flow with an optional input (an object, each input by the name flows_list gives). By default waits for it (up to timeoutSeconds, 60) and answers its status and output, and the pictures its answer names as images; with wait false, answers the run at once. With node (OAIY Network), one of the flows that paired computer shares, run there by its own runner and models; each such run has a key, and where this computer loses track of it (that computer stops answering for a while), the error gives the key: call flow_run again with the same node, id and key to follow that run rather than start another.",
+                "Run a stored flow with an optional input (an object, each input by the name flows_list gives). By default waits for it (up to timeoutSeconds, 60) and answers its status and output, and the pictures its answer names as images; with wait false, answers the run at once. With node (OAIY Network), one of the flows that paired computer shares, run there by its own runner and models; each such run has a key, given with its answer (and with an error that lost track of it, where that computer stops answering for a while): call flow_run again with the same node, id and key to follow that run (one not finished yet, or not waited for) rather than start another. A key is one run of one flow.",
                 object(json!({
                     "id": flow_id(),
                     "node": node_id(),
                     "input": { "description": "The flow's input." },
                     "wait": { "type": "boolean", "description": "Wait for the result (default true)." },
                     "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600, "description": "How long the run may take (default 60)." },
-                    "key": { "type": "string", "minLength": 1, "maxLength": 200, "description": "With node: the key a flow_run on that computer answered with its error, to follow the same run (never start another)." }
+                    "key": { "type": "string", "minLength": 1, "maxLength": 200, "description": "With node: the key a flow_run on that computer answered with (or with its error), to follow the same run (never start another)." }
                 }), &["id"])),
             def("flow_delete", "Delete a flow", Remove,
                 "Delete a stored flow.",
@@ -2288,7 +2288,18 @@ async fn flow_run_on(d: &Desk, id: &str, node: &str, key: Option<&str>, input: O
         // (a run that never started, refused there as it was asked: the key would not help)
         return Err(if reply.body.get("key").is_some() { follow(why) } else { why });
     }
-    run_answer(d, id, &reply.body).await
+    // (the key in every answer, its words and its data: a run not finished when this answer came, waited on until the
+    // time given or not waited on at all, is followed with it, never started again)
+    let mut done = run_answer(d, id, &reply.body).await?;
+    let finished = matches!(reply.body["status"].as_str(), Some("succeeded" | "failed" | "timed_out" | "cancelled"));
+    done.summary = if finished {
+        format!("{} It ran on {node} under the key \"{key}\".", done.summary)
+    } else {
+        format!("{} Call flow_run again with node {node}, id {id} and key \"{key}\" to follow it: that key answers the same run, never another.", done.summary)
+    };
+    done.data["node"] = json!(node);
+    done.data["key"] = json!(key);
+    Ok(done)
 }
 
 /// A run's record as the Agent is told it: its status, output and error, and the pictures it names as images.
@@ -2512,6 +2523,15 @@ mod flow_run_tests {
         assert_eq!(answer.data["runId"], "r1", "{}", answer.data);
         let keys = asked.lock().unwrap().clone();
         assert!(keys.len() == 2 && keys[0] == keys[1] && keys[0].as_str().unwrap().starts_with("agent-"), "asked again with the same key: {keys:?}");
+        assert_eq!(answer.data["key"], keys[0], "the key made here is in the answer");
+        assert!(answer.summary.contains(keys[0].as_str().unwrap()), "{}", answer.summary);
+        // not finished when it answered (wait false, or its time up): the key the tool made up is given, to follow it
+        let running = json!({ "runId": "r3", "status": "running" });
+        let (router, asked) = runs_route(vec![(StatusCode::ACCEPTED, running)]);
+        let answer = flow_run_on(&Desk { router, paired: None }, "logo", "w1", None, None, false, 5).await.unwrap();
+        let key = asked.lock().unwrap()[0].as_str().unwrap().to_string();
+        assert_eq!((answer.data["runId"].as_str(), answer.data["key"].as_str(), answer.data["node"].as_str()), (Some("r3"), Some(key.as_str()), Some("w1")));
+        assert!(answer.summary.contains(&format!("key \"{key}\" to follow it")), "{}", answer.summary);
         // lost track of after it started: the error says the key to follow it with, and that key is the one given
         let lost = json!({ "error": { "code": "node_offline", "message": "Rig did not answer; run r2 may still be running there" }, "runId": "r2", "key": "k-9" });
         let (router, asked) = runs_route(vec![(StatusCode::SERVICE_UNAVAILABLE, lost)]);
@@ -2524,5 +2544,10 @@ mod flow_run_tests {
         let (router, _) = runs_route(vec![(StatusCode::NOT_FOUND, refused)]);
         let e = flow_run_on(&Desk { router, paired: None }, "logo", "w1", None, None, true, 5).await.err().unwrap();
         assert_eq!(e, "Rig shares no flow logo");
+        // a key of another flow's run there: refused as asked, said as it is
+        let reused = json!({ "error": { "code": "key_in_use", "message": "the key k-9 is a run of another flow on Rig (logo): ask with another key, or with none" } });
+        let (router, _) = runs_route(vec![(StatusCode::CONFLICT, reused)]);
+        let e = flow_run_on(&Desk { router, paired: None }, "poster", "w1", Some("k-9"), None, true, 5).await.err().unwrap();
+        assert!(e.starts_with("the key k-9 is a run of another flow"), "{e}");
     }
 }

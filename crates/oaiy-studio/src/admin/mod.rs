@@ -520,12 +520,14 @@ pub(crate) fn llm_start(studio: &Arc<Studio>, cfg: &Json) -> Result<(), String> 
     egpu_start(studio, cfg, default)
 }
 
-/// What a pin or an unpin of a language model other than the one chosen in Engines (`chosen`) is answered: only that
-/// one is pinned (`llm.pinned`). An unpin was told to choose the model first and then pin it, the opposite of what it
-/// asked.
+/// What a pin or an unpin of a language model other than the one chosen in Engines (`chosen`, empty where none is) is
+/// answered: only that one is pinned (`llm.pinned`). An unpin was told to choose the model first and then pin it, the
+/// opposite of what it asked.
 fn not_the_chosen_model(model: &str, chosen: &str, pin: bool) -> String {
     if pin {
         format!("{model} is not the language model chosen in Engines: choose it first, then pin it")
+    } else if chosen.is_empty() {
+        format!("{model} is not pinned: only the language model chosen in Engines can be, and none is chosen")
     } else {
         format!("{model} is not pinned: only the language model chosen in Engines can be, which is {chosen}")
     }
@@ -647,6 +649,8 @@ mod tests {
         assert!(not_the_chosen_model("big", "small", true).contains("choose it first, then pin it"));
         let unpin = not_the_chosen_model("big", "small", false);
         assert_eq!(unpin, "big is not pinned: only the language model chosen in Engines can be, which is small");
+        // (none chosen: the sentence ends, not on "which is ")
+        assert_eq!(not_the_chosen_model("big", "", false), "big is not pinned: only the language model chosen in Engines can be, and none is chosen");
     }
 
     #[test]

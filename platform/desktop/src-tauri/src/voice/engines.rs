@@ -22,6 +22,8 @@ pub const WIRE_RATE: u32 = 24_000;
 pub const STT_RATE: u32 = 16_000;
 /// How long a starting service may take to answer (it loads its model first).
 const START_WAIT: Duration = Duration::from_secs(180);
+/// How long a worker the heartbeat found not answering is given to answer when asked once more.
+const ASKED_AGAIN: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct Engines {
@@ -34,6 +36,16 @@ pub struct Engines {
     copied: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// A worker's speech used whatever the network's settings say (tests).
     pinned: Option<crate::network::ServiceTarget>,
+    /// A call's own ([`Engines::for_call`]): where its speech was first heard, kept for the rest of the call.
+    call: Option<std::sync::Arc<tokio::sync::Mutex<Option<Chosen>>>>,
+}
+
+/// Where a call's speech is heard and spoken, chosen as the call begins: a worker's, as it was reached then, or this
+/// computer's own.
+#[derive(Clone)]
+enum Chosen {
+    There(crate::network::ServiceTarget),
+    Here,
 }
 
 /// Where a speech service answers: the client that reaches it and its address, this computer's own or a paired
@@ -44,48 +56,91 @@ struct Target {
     remote: Option<crate::network::ServiceTarget>,
 }
 
+impl Target {
+    /// A worker's.
+    fn on(remote: crate::network::ServiceTarget) -> Self {
+        Self { http: remote.client.clone(), base: remote.base.clone(), remote: Some(remote) }
+    }
+}
+
 impl Engines {
     pub fn new(registry: RegistryHandle) -> Self {
-        Self { registry: Some(registry), http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: None }
+        Self { registry: Some(registry), http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: None, call: None }
     }
 
     /// Speech on a paired worker, whatever the network's settings say (tests).
     pub fn via(remote: crate::network::ServiceTarget) -> Self {
-        Self { registry: None, http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: Some(remote) }
+        Self { registry: None, http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: Some(remote), call: None }
     }
 
     /// Speech on a paired worker, this computer's own (`registry`'s) answering where the worker does not (tests).
     #[cfg(test)]
     pub(crate) fn via_or_here(remote: crate::network::ServiceTarget, registry: RegistryHandle) -> Self {
-        Self { registry: Some(registry), http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: Some(remote) }
+        Self { registry: Some(registry), http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: Some(remote), call: None }
     }
 
     /// Speech at fixed addresses (tests, or a voice server run by hand).
     pub fn at(stt: &str, tts: &str) -> Self {
-        Self { registry: None, http: reqwest::Client::new(), fixed: Some((stt.to_string(), tts.to_string())), copied: Default::default(), pinned: None }
+        Self { registry: None, http: reqwest::Client::new(), fixed: Some((stt.to_string(), tts.to_string())), copied: Default::default(), pinned: None, call: None }
+    }
+
+    /// The same speech for one call: where its speech is first heard (as the call begins) is kept for the rest of it,
+    /// and each of its lines goes there. A line went wherever the network said then: one heartbeat missed sent the next
+    /// to this computer's own OAIY Voice, which could be starting cold for minutes in the middle of the call, and the
+    /// heartbeat after it sent the lines back, in another voice.
+    pub fn for_call(&self) -> Self {
+        Self { call: Some(Default::default()), ..self.clone() }
     }
 
     /// Where a speech service answers now: a paired worker's chosen in place of this computer's (OAIY Network, Services
     /// → Other computers), else this computer's own, started if it is not running; either waited on until it answers.
-    /// That computer not answering (the heartbeat found it so, or it does not answer now), a call goes on with this
-    /// computer's own OAIY Voice where it is set up here, and says so in the log; the other is used again once it answers.
+    /// That computer not answering (asked now: once more, briefly, where the heartbeat found it not answering), this
+    /// computer's own OAIY Voice answers where it is set up here, said in the log. A call's is chosen once
+    /// ([`Engines::for_call`]): its other lines go where its first did, and that worker no longer answering in the
+    /// middle of it, they go to this computer's own only where that runs already (not started then, with the caller
+    /// waiting), and stay there; elsewhere the line is not heard, and the worker is asked again at the next.
     async fn target(&self, id: &'static str) -> Result<Target, String> {
-        let remote = match &self.pinned {
-            Some(r) => Some(r.clone()),
-            None if self.fixed.is_none() && self.registry.is_some() => crate::network::service_target(id),
-            None => None,
+        let Some(call) = &self.call else { return self.choose(id).await.map(|(t, _)| t) };
+        let mut chosen = call.lock().await;
+        let remote = match chosen.clone() {
+            None => {
+                let (target, choice) = self.choose(id).await?;
+                *chosen = Some(choice);
+                return Ok(target);
+            }
+            Some(Chosen::Here) => {
+                drop(chosen);
+                return Ok(Target { http: self.http.clone(), base: self.base(id).await?, remote: None });
+            }
+            Some(Chosen::There(remote)) => remote,
         };
-        if let Some(remote) = remote {
-            let unanswered = if remote.offline && self.installed_here(id) {
-                format!("{} is not answering (its last heartbeat)", remote.node_name)
-            } else {
-                match self.reach(id, &remote).await {
-                    Ok(()) => return Ok(Target { http: remote.client.clone(), base: remote.base.clone(), remote: Some(remote) }),
-                    Err((e, true)) if self.installed_here(id) => e,
-                    Err((e, _)) => return Err(e),
-                }
-            };
-            // (said once a minute at most: a call asks for each line)
+        drop(chosen);
+        // (the heartbeat's word on it now: one found not answering is asked once, briefly)
+        let offline = self.remote_now(id).is_some_and(|now| now.fingerprint == remote.fingerprint && now.offline);
+        match self.reach(id, &remote, offline).await {
+            Ok(()) => Ok(Target::on(remote)),
+            Err((e, true)) => {
+                let Some(base) = self.running_here(id).await else { return Err(e) };
+                *call.lock().await = Some(Chosen::Here);
+                log::warn!("voice: {e}; this computer's own OAIY Voice, running already, answers for the rest of the call");
+                Ok(Target { http: self.http.clone(), base, remote: None })
+            }
+            Err((e, false)) => Err(e),
+        }
+    }
+
+    /// Where a speech service answers, chosen now ([`Engines::target`]), and what was chosen.
+    async fn choose(&self, id: &'static str) -> Result<(Target, Chosen), String> {
+        let Some(remote) = self.remote_now(id) else {
+            return Ok((Target { http: self.http.clone(), base: self.base(id).await?, remote: None }, Chosen::Here));
+        };
+        let unanswered = match self.reach(id, &remote, remote.offline).await {
+            Ok(()) => return Ok((Target::on(remote.clone()), Chosen::There(remote))),
+            Err((e, true)) if self.installed_here(id) => e,
+            Err((e, _)) => return Err(e),
+        };
+        // (said once a minute at most: a call asks for each line)
+        {
             static SAID: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
             let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
             if said.is_none_or(|at| at.elapsed() > Duration::from_secs(60)) {
@@ -93,25 +148,44 @@ impl Engines {
                 log::warn!("voice: {unanswered}; this computer's own OAIY Voice answers meanwhile");
             }
         }
-        Ok(Target { http: self.http.clone(), base: self.base(id).await?, remote: None })
+        Ok((Target { http: self.http.clone(), base: self.base(id).await?, remote: None }, Chosen::Here))
+    }
+
+    /// The worker whose service `id` is used in place of this computer's, as the network says now (or as pinned).
+    fn remote_now(&self, id: &'static str) -> Option<crate::network::ServiceTarget> {
+        match &self.pinned {
+            Some(r) => Some(r.clone()),
+            None if self.fixed.is_none() && self.registry.is_some() => crate::network::service_target(id),
+            None => None,
+        }
+    }
+
+    /// This computer's own service `id`'s address where it runs and answers now, nothing started.
+    async fn running_here(&self, id: &'static str) -> Option<String> {
+        let port = self.registry.as_ref()?.lock().ok()?.running_service_lease(id)?.port;
+        let base = format!("http://127.0.0.1:{port}");
+        let r = self.http.get(format!("{base}/v1/models")).timeout(ASKED_AGAIN).send().await.ok()?;
+        r.status().is_success().then_some(base)
     }
 
     /// A worker's speech service, asked until it answers (it starts there when asked): why not, and whether that is
-    /// the worker itself not answering (`true`), not its service.
-    async fn reach(&self, id: &'static str, remote: &crate::network::ServiceTarget) -> Result<(), (String, bool)> {
+    /// the worker itself not answering (`true`), not its service. `briefly`: the heartbeat found it not answering, and
+    /// it is asked once, for a moment ([`ASKED_AGAIN`]).
+    async fn reach(&self, id: &'static str, remote: &crate::network::ServiceTarget, briefly: bool) -> Result<(), (String, bool)> {
         let started = Instant::now();
         let mut unreachable = 0;
+        let (tries, wait) = if briefly { (1, ASKED_AGAIN) } else { (2, Duration::from_secs(5)) };
         loop {
-            match remote.client.get(format!("{}/v1/models", remote.base)).timeout(Duration::from_secs(5)).send().await {
+            match remote.client.get(format!("{}/v1/models", remote.base)).timeout(wait).send().await {
                 Ok(r) if r.status().is_success() => return Ok(()),
                 Ok(r) if !matches!(r.status().as_u16(), 503 | 502) => {
                     return Err((format!("{id} on {}: HTTP {}: {}", remote.node_name, r.status(), r.text().await.unwrap_or_default()), false));
                 }
                 // (the worker itself not answering, not its service starting: said at once, not waited on for each
-                // line of a call; asked a second time for a moment's dropout)
+                // line of a call; asked a second time for a moment's dropout, where the heartbeat heard it last)
                 Err(e) => {
                     unreachable += 1;
-                    if unreachable >= 2 {
+                    if unreachable >= tries {
                         return Err((format!("{} does not answer ({id} is used there): {e}", remote.node_name), true));
                     }
                     tokio::time::sleep(Duration::from_millis(700)).await;

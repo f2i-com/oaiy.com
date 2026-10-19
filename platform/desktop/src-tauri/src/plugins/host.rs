@@ -208,13 +208,15 @@ fn stored_outcome(mut envelope: Value) -> Value {
 
 /// What a redrive dispatches as a kept outcome's data: the whole of it again, read from the run its envelope names
 /// (`ledger`), as it was dispatched the first time. `None` for an envelope that is no outcome, or whose run is no
-/// longer kept: then the kept data is all there is.
-fn outcome_data_again(ledger: &crate::bridge::ledger::Ledger, source: &str, envelope: &Value) -> Option<Value> {
-    if source != "flows" {
+/// longer kept: then the kept data is all there is. An outcome is the event the run's end made, named as its state
+/// (`flow.succeeded`), from `flows` (which no plugin may be: `manifest::RESERVED_IDS`): another event whose data names
+/// a run was handed that run's answer and error at its redrive.
+fn outcome_data_again(ledger: &crate::bridge::ledger::Ledger, source: &str, event: &str, envelope: &Value) -> Option<Value> {
+    if source != "flows" || !event.starts_with("flow.") {
         return None;
     }
     let run = ledger.get(envelope.get("data")?.get("runId")?.as_str()?)?;
-    outcome_event(&run).map(|(event, _)| event.data)
+    outcome_event(&run).filter(|(outcome, _)| outcome.name == event).map(|(outcome, _)| outcome.data)
 }
 
 /// Default deadline for a forwarded connector command.
@@ -2461,7 +2463,7 @@ impl PluginHost {
                 .ledger
                 .lock()
                 .ok()
-                .and_then(|l| outcome_data_again(&l, &item.source, envelope))
+                .and_then(|l| outcome_data_again(&l, &item.source, &item.event, envelope))
                 .or_else(|| envelope.get("data").cloned())
                 .unwrap_or(Value::Null),
             origin_run: item.origin_run.clone(),
@@ -3623,6 +3625,25 @@ mod tests {
         let tidy = host.ledger.lock().unwrap().recent(1, &[])[0].clone();
         assert_eq!(tidy.flow_id.as_deref(), Some("tidy"));
         assert_eq!(tidy.input.as_ref().map(|i| i["said"].clone()), Some(json!({ "note": "a fictional caller's note" })), "the redrive read the answer from the run");
+    }
+
+    /// A redrive reads a run's answer again only for that run's own outcome: an event from `flows` named as the run's
+    /// end. Another event whose data names the run (a plugin's, or one from `flows` under another name) keeps its data.
+    #[test]
+    fn only_a_runs_own_outcome_is_given_its_answer_again() {
+        let mut ledger = crate::bridge::ledger::Ledger::new();
+        let run = match ledger.reserve(&RunRequest { caller_product: "oaiy-desktop".into(), flow_id: Some("greeting".into()), inline_graph: false, input: None, timeout_ms: None, mode: "async".into(), correlation_id: "c".into(), idempotency_key: "k-again".into(), lineage: Default::default(), trigger_event: None, caller_label: None }) {
+            ReserveOutcome::Reserved(r) => r.run_id,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(ledger.claim(&run, crate::bridge::ledger::Runtime::Desktop, "w"), crate::bridge::ledger::ClaimOutcome::Claimed(_)));
+        ledger.finish(&run, RunStatus::Succeeded, Some(json!({ "note": "a fictional answer" })), None).unwrap();
+        let kept = json!({ "data": { "runId": run, "status": "succeeded" } });
+        let again = outcome_data_again(&ledger, "flows", "flow.succeeded", &kept).expect("the run's own outcome");
+        assert_eq!(again["output"], json!({ "note": "a fictional answer" }));
+        assert!(outcome_data_again(&ledger, "flows", "flow.failed", &kept).is_none(), "not that run's end");
+        assert!(outcome_data_again(&ledger, "flows", "flows.anything", &kept).is_none(), "not an outcome's name");
+        assert!(outcome_data_again(&ledger, "aokie", "flow.succeeded", &kept).is_none(), "not from flows");
     }
 
     #[test]

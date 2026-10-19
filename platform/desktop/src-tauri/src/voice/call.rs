@@ -731,6 +731,8 @@ where
     Si: Sink<Message> + Unpin + Send + 'static,
     St: Stream<Item = Result<Message, E>> + Unpin,
 {
+    // (the call's speech where it is first heard, for all of its lines: `Engines::for_call`)
+    let engines = engines.for_call();
     // The start, before anything else.
     let (ids, start) = loop {
         match stream.next().await {
