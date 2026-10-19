@@ -876,7 +876,10 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
             false
         })
         .on_new_window(move |url, _features| {
-            if own(page, &url) {
+            // (a paired computer's result the engines' Playground opens, `/api/play/node/…`, is shown by the system's
+            // browser on this computer, as this computer's own outputs are through /api/open-file: never a bare window
+            // of the app's own with no way back)
+            if own(page, &url) && !url.path().starts_with("/api/play/node/") {
                 return NewWindowResponse::Allow;
             }
             open_outside(&for_windows, &url);

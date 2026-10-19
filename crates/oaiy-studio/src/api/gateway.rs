@@ -2294,6 +2294,8 @@ open(log, "a").write("ended\n")
     #[test]
     fn pictures_are_timed_released_retried_and_turned_away_when_the_queue_is_full() {
         use std::os::unix::fs::PermissionsExt;
+        // (the retry event looked for below is in the process's event log, which another test fills)
+        let _events = crate::resources::EVENTS_TESTED.lock().unwrap_or_else(|e| e.into_inner());
         let dir = fake_dir("scheduler");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

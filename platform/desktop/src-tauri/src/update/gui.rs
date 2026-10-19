@@ -431,6 +431,9 @@ pub(crate) fn flush_agent(app: &AppHandle, updater: &UpdaterHandle) {
 struct EnginesPart {
     app: AppHandle,
     started_here: Mutex<bool>,
+    /// Stopped for an update: the eGPU's server is waited for until it has let the card go (25 s at most), so the
+    /// OAIY that starts next finds the card free. A quit waits a few seconds alone (the studio's own shutdown).
+    for_update: bool,
 }
 
 impl Part for EnginesPart {
@@ -441,6 +444,9 @@ impl Part for EnginesPart {
     fn stop(&self) -> Result<(), String> {
         *self.started_here.lock().unwrap_or_else(|e| e.into_inner()) = crate::engines::started_here();
         crate::engines::stop();
+        if self.for_update && !oaiy_studio::await_egpu_let_go() {
+            log::warn!("update: the eGPU's server had not let the card go within 25 s; the OAIY that starts next may wait for it");
+        }
         Ok(())
     }
 
@@ -563,7 +569,7 @@ impl Part for ServicesPart {
 fn parts_for(app: &AppHandle, remember_for_relaunch: bool) -> Vec<Box<dyn Part>> {
     let registry = app.try_state::<RegistryHandle>().map(|r| r.inner().clone());
     vec![
-        Box::new(EnginesPart { app: app.clone(), started_here: Mutex::new(false) }),
+        Box::new(EnginesPart { app: app.clone(), started_here: Mutex::new(false), for_update: remember_for_relaunch }),
         Box::new(ScriptHostPart),
         Box::new(PluginsPart { host: app.try_state::<Arc<PluginHost>>().map(|h| h.inner().clone()), was_running: Mutex::new(Vec::new()) }),
         Box::new(ServicesPart { registry, was_running: Mutex::new(Vec::new()), remember_for_relaunch }),

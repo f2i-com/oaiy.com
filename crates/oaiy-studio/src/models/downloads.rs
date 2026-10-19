@@ -199,7 +199,7 @@ fn curl_text(cfg: &Json, url: &str, auth: Option<&str>, headers: Option<&str>, g
     feed(&mut child, said);
     let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
-        return Err(curl_error(&String::from_utf8_lossy(&out.stderr), url, gated));
+        return Err(curl_error(&String::from_utf8_lossy(&out.stderr), url, gated, auth.is_some()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -286,8 +286,9 @@ fn refused_with(stderr: &str) -> Option<u16> {
     stderr[at..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
 }
 
-/// curl's complaint, in words a person can act on. `gated`: the model's licence is accepted on huggingface.co first.
-fn curl_error(stderr: &str, url: &str, gated: bool) -> String {
+/// curl's complaint, in words a person can act on. `gated`: the model's licence is accepted on huggingface.co first;
+/// `token_sent`: a Hugging Face token went with the request (one is saved, or was given for it).
+fn curl_error(stderr: &str, url: &str, gated: bool, token_sent: bool) -> String {
     let e = stderr.trim();
     let repo = url.strip_prefix("https://huggingface.co/").map(|r| r.trim_start_matches("api/models/")).and_then(|r| {
         let mut p = r.split('/');
@@ -297,10 +298,18 @@ fn curl_error(stderr: &str, url: &str, gated: bool) -> String {
     // (curl's own error number, `curl: (28) …`: not any number in what it said, which may be a time or a size)
     let code = |n: u32| e.contains(&format!("curl: ({n})"));
     match refused_with(e) {
+        // (with a token sent, it is the token's account that has not accepted the licence, or a token that is not
+        // valid: "add a token" said to someone who has one saved sent them looking for what they had done)
+        Some(401 | 403) if gated && token_sent => {
+            return match repo {
+                Some(r) => format!("{r} is gated, and Hugging Face refused the saved token for it: accept its licence at https://huggingface.co/{r} signed in as the account the token is from (or save a token, read access, of an account that has accepted it), then try again"),
+                None => format!("{url} refused the download with the saved Hugging Face token: accept the model's licence with the token's account, then try again"),
+            };
+        }
         Some(401 | 403) if gated => {
             return match repo {
-                Some(r) => format!("{r} is gated: sign in on huggingface.co, accept its licence at https://huggingface.co/{r}, then add a Hugging Face access token (read) in OAIY's Settings or on Get models"),
-                None => format!("{url} refused the download: its licence is accepted first, with a Hugging Face token"),
+                Some(r) => format!("{r} is gated: accept its licence at https://huggingface.co/{r} (signed in on huggingface.co), then save a Hugging Face access token (read) on Get models or in OAIY's Settings, and try again"),
+                None => format!("{url} refused the download: accept its licence on huggingface.co, then save a Hugging Face token (read) on Get models, and try again"),
             };
         }
         Some(401) => return format!("{host} asked for a sign-in (HTTP 401): the model may be private; a Hugging Face token (read) in OAIY's Settings or on Get models may let it download"),
@@ -568,6 +577,78 @@ pub fn set_peer_files(peers: Option<Arc<dyn PeerFiles>>) {
 
 fn peer_files() -> Option<Arc<dyn PeerFiles>> {
     PEER_FILES.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// A model of another OAIY computer this one uses (OAIY Network), as [`PeerModels::models`] says it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerModel {
+    /// The computer's id, which [`PeerModels::forward`] is told, and its name.
+    pub node_id: String,
+    pub node_name: String,
+    /// What it makes, as the discovery document's lists name it: `llm`, `image`, `video`, `speech`, `music`, `sound`,
+    /// `model3d`, `background` or `upscale`.
+    pub kind: String,
+    /// Its name on that computer.
+    pub model: String,
+    /// Its route on that computer's gateway (`/v1/images/generations`), or empty where it is not known; a language
+    /// model's is the chat route.
+    pub path: String,
+    /// Whether that computer answers now with its engines up, and whether it answers at all (its engines aside).
+    pub ready: bool,
+    pub node_online: bool,
+    /// The context a language model runs with there, where that computer says it.
+    pub context_tokens: Option<i64>,
+    /// Whether it is the default of its kind for OAIY's own requests here (the desktop's chat route, the Agent, a flow),
+    /// in place of this computer's own. This studio's gateway and its Playground answer with this computer's own
+    /// model unless a request names this one on its computer.
+    pub default: bool,
+}
+
+/// A request for a model of another computer ([`PeerModels::forward`]): the method, the route on that computer's
+/// gateway and its query (with its `?`, or empty), the body and what it is, the bytes asked for (`Range`), and `base`,
+/// the address its answers name their files at (this studio's route for that computer: the files are fetched through
+/// it).
+pub struct PeerRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: &'a str,
+    pub content_type: Option<&'a str>,
+    pub range: Option<&'a str>,
+    pub base: Option<&'a str>,
+    pub body: Vec<u8>,
+}
+
+/// That computer's answer: its status and type, the headers that say what its body is (its length, the bytes sent of
+/// a range, a file's name), and the body as it arrives. Dropping the body ends the answer there: a client that leaves
+/// cancels the request on that computer as it would here.
+pub struct PeerReply {
+    pub status: u16,
+    pub content_type: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Box<dyn Read + Send>,
+}
+
+/// The models of the other OAIY computers this one uses (OAIY Network), as the desktop that runs the studio reaches
+/// them (`set_peer_models`): the Playground offers them beside this computer's own, and sends a request for one to its
+/// computer through the desktop (`/api/play/node/…`). They are never in the discovery document: the desktop makes its
+/// catalogue from it, and a computer that lends its engines would pass them on.
+pub trait PeerModels: Send + Sync {
+    /// Each paired computer's models, as last heard from it.
+    fn models(&self) -> Vec<PeerModel>;
+    /// `req` sent to the computer `node`: a chat to its language model, anything else to its engines' media routes and
+    /// their files. `Err` where it could not be sent at all; a refusal there, or that computer not answering, is a reply.
+    fn forward(&self, node: &str, req: PeerRequest) -> Result<PeerReply, String>;
+}
+
+static PEER_MODELS: RwLock<Option<Arc<dyn PeerModels>>> = RwLock::new(None);
+
+/// Where the models of the network's other computers are listed and reached (`None`: this computer's own alone).
+pub fn set_peer_models(peers: Option<Arc<dyn PeerModels>>) {
+    *PEER_MODELS.write().unwrap_or_else(|p| p.into_inner()) = peers;
+}
+
+pub(crate) fn peer_models() -> Option<Arc<dyn PeerModels>> {
+    PEER_MODELS.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 #[derive(Default)]
@@ -879,7 +960,14 @@ impl Downloads {
                     Json::Obj(f) => f.clone(),
                     _ => Vec::new(),
                 };
+                // (a gated model's page, where its licence is accepted: its first part's repository)
+                let licence = e.get("gated").and_then(Json::as_bool).unwrap_or(false).then(|| {
+                    e.get("parts").and_then(Json::as_array).and_then(|p| p.iter().map(|p| str_or(p, "repo", "")).find(|r| !r.is_empty())).map(|r| format!("https://huggingface.co/{r}"))
+                }).flatten();
                 o.retain(|(k, _)| k != "parts" && k != "add");
+                if let Some(url) = licence {
+                    o.push(("licence_url".into(), Json::str(url)));
+                }
                 let d = list.iter().find(|d| d.id == id);
                 // (with no download of it listed, where it is: where downloads go, else a folder they went to before)
                 let where_ = d.map(|d| d.dir.clone()).unwrap_or_else(|| {
@@ -1353,7 +1441,9 @@ impl Downloads {
             // rather than waiting on it for ever)
             c.args(["-sS", "-L", "--fail", "--retry", "3", "--retry-delay", "2", "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "60", "-C", "-", "-H", "User-Agent: oaiy-studio", "-o"]).arg(part);
             let given = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).and_then(|d| d.token.clone());
-            let said = token_to_curl(&mut c, token_for(cfg, given.as_deref())?.as_deref().filter(|_| f.hub));
+            let token = token_for(cfg, given.as_deref())?.filter(|_| f.hub);
+            let token_sent = token.is_some();
+            let said = token_to_curl(&mut c, token.as_deref());
             c.arg(&f.url).stdout(Stdio::null()).stderr(Stdio::piped());
             let mut child = c.spawn().map_err(|e| format!("could not run curl ({e}): {NO_CURL}"))?;
             feed(&mut child, said);
@@ -1396,7 +1486,7 @@ impl Downloads {
                 continue;
             }
             if !status.success() {
-                return Err(curl_error(&err, &f.url, gated));
+                return Err(curl_error(&err, &f.url, gated, token_sent));
             }
             return Ok(Want::Run);
         }
@@ -1737,13 +1827,17 @@ mod tests {
 
     #[test]
     fn gated_and_missing_files_are_explained() {
-        assert!(curl_error("curl: (22) The requested URL returned error: 401", "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/resolve/main/model.safetensors", true).contains("accept its licence at https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m"));
-        assert!(curl_error("curl: (22) The requested URL returned error: 404", "https://huggingface.co/a/b/resolve/main/x", false).contains("not found"));
+        let gated = curl_error("curl: (22) The requested URL returned error: 401", "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/resolve/main/model.safetensors", true, false);
+        assert!(gated.contains("accept its licence at https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m") && gated.contains("save a Hugging Face access token"), "{gated}");
+        // (a token saved, and refused: not told to add one)
+        let refused = curl_error("curl: (22) The requested URL returned error: 403", "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/resolve/main/model.safetensors", true, true);
+        assert!(refused.contains("refused the saved token") && refused.contains("accept its licence at https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m") && !refused.contains("save a Hugging Face access token"), "{refused}");
+        assert!(curl_error("curl: (22) The requested URL returned error: 404", "https://huggingface.co/a/b/resolve/main/x", false, false).contains("not found"));
         // (a number in what curl said is not a status: a timeout of 120403 ms is not a refusal)
-        let slow = curl_error("curl: (28) Operation timed out after 120403 milliseconds with 0 bytes received", "https://huggingface.co/a/b/resolve/main/x", true);
+        let slow = curl_error("curl: (28) Operation timed out after 120403 milliseconds with 0 bytes received", "https://huggingface.co/a/b/resolve/main/x", true, false);
         assert!(slow.contains("stopped sending") && !slow.contains("gated"), "{slow}");
         // (a model that is not gated, refused: its link expired, not a licence to accept)
-        let expired = curl_error("curl: (22) The requested URL returned error: 403", "https://cdn-lfs.hf.co/x", false);
+        let expired = curl_error("curl: (22) The requested URL returned error: 403", "https://cdn-lfs.hf.co/x", false, true);
         assert!(expired.contains("expired") && !expired.contains("gated"), "{expired}");
     }
 

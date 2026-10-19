@@ -201,6 +201,9 @@ pub fn holds_a_model(llm: &Json) -> bool {
     !crate::llm::egpu::enabled(llm) || !crate::llm::egpu::assigned(llm, &default_model(llm))
 }
 
+/// What a start, or a request, is told where no language model is set up (none, or none switched on).
+pub const NO_MODEL: &str = "There is no language model yet: get one under Get models, or add a model file under Models.";
+
 /// What the log says when [`holds_a_model`] is false and the engine is left stopped.
 pub const ALL_ON_EGPU: &str = "the language model runs on the eGPU: this computer's engine starts only for a request for a model of its own, or one the eGPU cannot answer";
 
@@ -237,7 +240,7 @@ pub fn arguments_for(llm: &Json, root: &Path, port: u16, local_images: bool, fir
         .filter(|m| bool_or(m, "enabled", true))
         .collect();
     if models.is_empty() {
-        return Err("no language model configured: add a GGUF (or EXL3/DeepSeek folder) under Models".into());
+        return Err(NO_MODEL.into());
     }
     let default = str_or(llm, "default_model", "");
     let named = |name: &str| models.iter().position(|m| str_or(m, "name", "") == name);

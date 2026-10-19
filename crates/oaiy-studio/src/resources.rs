@@ -29,6 +29,11 @@ const EVENTS_KEPT: usize = 200;
 
 static EVENTS: Mutex<VecDeque<Json>> = Mutex::new(VecDeque::new());
 
+/// Held by the tests that read the events or fill them (the log is the process's, and the test threads share it): one
+/// that pushes more than [`EVENTS_KEPT`] would let go of the event another is looking for.
+#[cfg(test)]
+pub(crate) static EVENTS_TESTED: Mutex<()> = Mutex::new(());
+
 /// A model loaded or let go: `what` (`load`, `unload`, `evict`, `lend`, `give_back`, `retry`, `release`), the model, its
 /// device (`egpu`, `gpu{n}`), and why.
 pub fn event(what: &str, model: &str, device: &str, why: &str) {
@@ -244,6 +249,7 @@ mod tests {
 
     #[test]
     fn events_are_kept_in_order_and_the_oldest_let_go() {
+        let _alone = EVENTS_TESTED.lock().unwrap_or_else(|e| e.into_inner());
         let before = events(0).len();
         event("load", "m", "egpu", "a test");
         let all = events(0);

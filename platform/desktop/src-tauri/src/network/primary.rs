@@ -1217,47 +1217,59 @@ pub(crate) async fn choose_default_of(net: &Network, kind: &str, id: Option<&str
 /// `/api/network/nodes/:id/gateway/<path>`: the worker's engines' media routes (a picture, a song, a video's job)
 /// and the files they made, as this desktop's own gateway route serves its own.
 async fn node_gateway(State(net): State<Network>, Path((node_id, path)): Path<(String, String)>, req: Request) -> Response {
-    let (peer, client) = match worker_of(&net, &node_id) {
-        Ok(w) => w,
-        Err(r) => return r,
-    };
     let method = req.method().as_str().to_ascii_uppercase();
-    let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
-        return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", method);
-    };
-    if !matches!(method.as_str(), "GET" | "POST" | "DELETE") {
-        return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", format!("{method} is not forwarded"));
-    }
-    // (a path that stays below the worker's gateway: `../pins` would be another of its routes)
-    if !crate::ai::engine_services::plain_path(&path) {
-        return error(StatusCode::BAD_REQUEST, "bad_path", "not one of that computer's media routes");
-    }
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    let headers = req.headers().clone();
+    let mut headers = axum::http::HeaderMap::new();
+    for name in ["content-type", "range"] {
+        if let Some(v) = req.headers().get(name) {
+            headers.insert(name, v.clone());
+        }
+    }
+    // (the worker names its files at this desktop's route for it, as its caller reached it, not at its own loopback)
+    if let Some(base) = base_for(req.headers(), &node_id).and_then(|b| axum::http::HeaderValue::from_str(&b).ok()) {
+        headers.insert("x-oaiy-base", base);
+    }
     let body = match axum::body::to_bytes(req.into_body(), MEDIA_LIMIT).await {
         Ok(b) => b,
         Err(e) => return error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", e.to_string()),
     };
+    gateway_on(&net, &node_id, &method, &path, &query, &headers, body).await
+}
+
+/// A request for a worker's engines' media routes and their files ([`node_gateway`]'s, and the engines' Playground's
+/// through this desktop): `path` below its gateway (`v1/images/generations`), `query` with its `?` (or empty), and the
+/// headers sent on with it (its type, a range, `x-oaiy-base`: where the worker names the files it made).
+pub(crate) async fn gateway_on(net: &Network, node_id: &str, method: &str, path: &str, query: &str, headers: &axum::http::HeaderMap, body: axum::body::Bytes) -> Response {
+    let (peer, client) = match worker_of(net, node_id) {
+        Ok(w) => w,
+        Err(r) => return r,
+    };
+    let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", method.to_string());
+    };
+    if !matches!(method, "GET" | "POST" | "DELETE") {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", format!("{method} is not forwarded"));
+    }
+    // (a path that stays below the worker's gateway: `../pins` would be another of its routes)
+    if !crate::ai::engine_services::plain_path(path) {
+        return error(StatusCode::BAD_REQUEST, "bad_path", "not one of that computer's media routes");
+    }
     // (and the URL keeps it: one its parser would fold is refused, not sent somewhere else)
-    let Some(target) = crate::ai::engine_services::exact_url(&url(&peer.address, ""), &format!("/worker/v1/gateway/{path}"), &query) else {
+    let Some(target) = crate::ai::engine_services::exact_url(&url(&peer.address, ""), &format!("/worker/v1/gateway/{path}"), query) else {
         return error(StatusCode::BAD_REQUEST, "bad_path", "not one of that computer's media routes");
     };
     let mut call = client.request(m, target);
-    for name in ["content-type", "range"] {
+    for name in ["content-type", "range", "x-oaiy-base"] {
         if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
             call = call.header(name, v);
         }
-    }
-    // (the worker names its files at this desktop's route for it, as its caller reached it, not at its own loopback)
-    if let Some(base) = base_for(&headers, &node_id) {
-        call = call.header("x-oaiy-base", base);
     }
     if !body.is_empty() {
         call = call.body(body);
     }
     match call.send().await {
         Ok(r) => worker::passthrough(r),
-        Err(e) => offline(&net, &peer, &e),
+        Err(e) => offline(net, &peer, &e),
     }
 }
 

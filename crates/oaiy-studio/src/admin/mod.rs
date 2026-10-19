@@ -114,6 +114,15 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Res
     if let Some(rel) = route.strip_prefix("/files/") {
         return gateway::files(studio, req, w, rel);
     }
+    if let Some(rest) = route.strip_prefix("/api/play/node/") {
+        // A paired computer's model (OAIY Network), asked for by this computer's own window alone: what it makes is
+        // shown on this screen, and the desktop that reaches the other computer is this one's.
+        if remote {
+            return err(w, 403, "another computer's models are used from this computer's own window alone");
+        }
+        let peers = crate::downloads::peer_models();
+        return crate::api::peers::handle(studio, req, w, rest, peers.as_deref());
+    }
     if let Some(rest) = route.strip_prefix("/api/play/") {
         // The playground: every target, no key, local references allowed.
         let (target, sub) = rest.split_once('/').map_or((rest, String::new()), |(t, s)| (t, format!("/{s}")));
@@ -121,6 +130,11 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Res
             "chat" | "completions" | "models" | "images" | "edits" | "videos" | "speech" | "voices" | "music" | "sound" | "model3d" | "health" => target,
             _ => return err(w, 404, "unknown playground target"),
         };
+        if matches!(target, "chat" | "completions") {
+            if let Some(why) = not_a_model_here(&cfg, &req.body) {
+                return err(w, 404, &why);
+            }
+        }
         let m = Matched { target: target.into(), spec: "openai".into(), rest: sub };
         return gateway::handle(studio, req, w, m, true);
     }
@@ -184,9 +198,15 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Res
             let asked = body(req).ok().and_then(|b| b.get("model").and_then(Json::as_str).map(str::to_owned));
             egpu_start(studio, &cfg, asked).map(|_| studio.egpu.status(&llm)).map_err(|e| (400, e))
         }
+        // (not under a picture, a video or a sound being made on the lent card, whose worker is on the socket that
+        // server holds: it stops as the job gives the card back, and the answer says so)
         ("POST", "/api/egpu/stop") => {
-            studio.egpu.stop();
-            Ok(studio.egpu.status(cfg.get("llm").unwrap_or(&Json::Null)))
+            let stopped = studio.egpu.stop_unless_lent(crate::llm::egpu::Deferred::Unwanted);
+            let mut status = studio.egpu.status(cfg.get("llm").unwrap_or(&Json::Null));
+            if !stopped {
+                crate::util::set(&mut status, "note", Json::str(EGPU_STOPS_AFTER_THE_JOB));
+            }
+            Ok(status)
         }
         // What is loaded on each GPU, what is using it, and what loaded and let it go (`crate::resources`); memory
         // freed by hand: the picture worker and the lent card (`pictures`), the language models unless pinned
@@ -422,6 +442,26 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Res
     }
 }
 
+/// What a Stop of the eGPU's server asked for while the card is lent to a media job is answered.
+const EGPU_STOPS_AFTER_THE_JOB: &str = "The card is making a picture, a video or a sound: its server stops as soon as that job ends.";
+
+/// Why a Playground chat that names `model` is not answered here: a language model this computer does not have, or
+/// has switched off. The gateway answers such a request with its default model (for an app that names a model of its
+/// own); the Playground names this computer's models and the paired computers', and a paired computer's model named
+/// here was answered by this computer's own without a word.
+fn not_a_model_here(cfg: &Json, body: &[u8]) -> Option<String> {
+    let asked = Json::parse(body).ok()?.get("model")?.as_str()?.trim().to_string();
+    if asked.is_empty() || crate::media::resolve_model(cfg, Some(&asked)).as_deref() == Some(asked.as_str()) {
+        return None;
+    }
+    let listed = cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).is_some_and(|m| m.iter().any(|m| str_or(m, "name", "") == asked));
+    Some(if listed {
+        format!("{asked} is switched off under Models: switch it on to chat with it here")
+    } else {
+        format!("{asked} is not a language model of this computer: pick one of its own, or a paired computer's from that computer's group in the menu")
+    })
+}
+
 /// The part of an output's address after `/files/` (as the page has it: alone, or after this server's address), its
 /// query or fragment left off.
 fn output_path(url: &str) -> Option<String> {
@@ -642,6 +682,53 @@ mod tests {
         assert!(!allowed_host("localhost", 7860, "127.0.0.1"));
         assert!(allowed_host("192.168.1.20:7860", 7860, "0.0.0.0"));
         assert!(!allowed_host("192.168.1.20:9999", 7860, "0.0.0.0"));
+    }
+
+    /// A Playground chat naming a model this computer does not have (a paired computer's, by its name) is refused and
+    /// says why, rather than answered by this computer's default; one naming none, or one of its own, goes ahead.
+    #[test]
+    fn a_playground_chat_for_a_model_not_here_says_so() {
+        let mut cfg = config::default_json();
+        let mut llm = cfg.get("llm").unwrap().clone();
+        crate::util::set(&mut llm, "models", Json::parse(br#"[{"name":"small","path":"small.gguf"},{"name":"off","path":"off.gguf","enabled":false}]"#).unwrap());
+        crate::util::set(&mut cfg, "llm", llm);
+        assert_eq!(not_a_model_here(&cfg, br#"{"model":"small","messages":[]}"#), None);
+        assert_eq!(not_a_model_here(&cfg, br#"{"messages":[]}"#), None);
+        assert_eq!(not_a_model_here(&cfg, b"not json"), None, "left to the gateway, which says what is wrong with it");
+        assert!(not_a_model_here(&cfg, br#"{"model":"qwen3.8-27b"}"#).unwrap().contains("not a language model of this computer"));
+        assert!(not_a_model_here(&cfg, br#"{"model":"off"}"#).unwrap().contains("switched off"));
+    }
+
+    /// The route to a paired computer's models answers this computer's own window alone: listening on every interface,
+    /// a request that reached the control port by another name is refused before anything is sent.
+    #[test]
+    fn a_paired_computer_s_models_are_for_this_computer_s_window_alone() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-admin-node-{}", std::process::id()));
+        let mut cfg = config::default_json();
+        let mut ui = cfg.get("ui").unwrap().clone();
+        crate::util::set(&mut ui, "host", Json::str("0.0.0.0"));
+        crate::util::set(&mut cfg, "ui", ui);
+        let studio = Arc::new(Studio::for_test(&root, cfg));
+        let answer = |host: &str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                let mut c = TcpStream::connect(addr).unwrap();
+                let mut all = String::new();
+                let _ = std::io::Read::read_to_string(&mut c, &mut all);
+                all
+            });
+            let (mut w, _) = listener.accept().unwrap();
+            let req = Request::new("POST", "/api/play/node/abc123/chat", vec![("Host".into(), host.into())], b"{}".to_vec());
+            let _ = handle(&studio, &req, &mut w);
+            drop(w);
+            client.join().unwrap()
+        };
+        let other = answer("192.168.1.20:7860");
+        assert!(other.starts_with("HTTP/1.1 403") && other.contains("this computer's own window alone"), "{other}");
+        // (this computer's own, with no desktop to reach the others through: told so, not refused as another's)
+        let own = answer("127.0.0.1:7860");
+        assert!(!own.starts_with("HTTP/1.1 403"), "{own}");
     }
 
     #[test]

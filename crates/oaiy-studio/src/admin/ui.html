@@ -52,6 +52,8 @@
 @font-face { font-family: "JetBrains Mono"; src: url("/fonts/jetbrains-mono.woff2") format("woff2"); font-weight: 400 700; font-display: swap; }
 /* In OAIY's window its sidebar has the name and the theme: this page's rail keeps to its sections. */
 .in-oaiy .brand, .in-oaiy .theme-toggle { display: none; }
+/* (a choice about opening the page in a window of its own, said in OAIY's own window, where it is not one) */
+.in-oaiy .not-in-oaiy { display: none !important; }
 * { box-sizing: border-box; }
 /* `hidden` wins over any display rule (icon buttons, overlays, cards). */
 [hidden] { display: none !important; }
@@ -74,6 +76,9 @@ a { color: var(--gpu); }
 .sections button { all: unset; cursor: pointer; position: relative; padding: 8px 10px; border-radius: var(--r); color: var(--muted); display: flex; gap: 10px; align-items: center; white-space: nowrap; }
 .sections button svg { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .sections button .count { margin-left: auto; font: 600 11px var(--display); color: var(--on-accent); background: var(--gpu); border-radius: 9px; padding: 0 6px; }
+/* (a download that failed: a dot of its own on Get models, beside or in place of the count) */
+.sections button .fail-dot { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex: none; }
+.sections button .count:not([hidden]) + .fail-dot { margin-left: 4px; }
 .sections button:hover { color: var(--text); background: var(--panel); }
 .sections button[aria-current="page"] { color: var(--text); background: var(--panel-2); }
 .sections button[aria-current="page"] svg { color: var(--gpu); }
@@ -416,6 +421,13 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .quant-row select { width: auto; flex: 0 1 320px; min-width: 0; }
 figure .audio-card { display: grid; place-items: center; aspect-ratio: 4 / 3; background: var(--panel-2); color: var(--muted); }
 figure .audio-card svg { width: 40px; height: 40px; stroke: currentColor; fill: none; stroke-width: 1.4; }
+/* (a sound's thumbnail in Recent media: what it is, as the Gallery's card says it) */
+.job .ph.icon { display: grid; place-items: center; color: var(--muted); cursor: pointer; }
+.job .ph.icon svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.5; }
+/* the language model's card: an engine's error in one line, what it said folded under it */
+.llm-said summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 6px; }
+.llm-said pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--code); background: var(--well); color: var(--well-text); border: 1px solid var(--line); border-radius: var(--r); padding: 10px 12px; margin: 8px 0 0; max-height: 260px; overflow: auto; }
+#llm-detail .row { margin-top: 10px; }
 @media (max-width: 1080px) {
   .bench { grid-template-columns: minmax(0, 1fr); height: auto; }
   .controls { grid-template-rows: auto auto; }
@@ -439,6 +451,8 @@ figure .audio-card svg { width: 40px; height: 40px; stroke: currentColor; fill: 
 .toasts { position: fixed; right: 20px; top: 20px; display: grid; gap: 8px; z-index: 20; max-width: calc(100vw - 40px); }
 .toast { background: var(--panel-2); border: 1px solid var(--line-2); border-left: 3px solid var(--good); padding: 10px 14px; border-radius: var(--r); max-width: 420px; white-space: pre-wrap; box-shadow: 0 6px 24px rgba(0, 0, 0, .18); }
 .toast.err { border-left-color: var(--bad); }
+/* (along the bottom, the status pills are at the top right: the toasts start under them, not over them) */
+.dock .toasts { top: 58px; }
 dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 0; width: min(760px, 94vw); max-height: 92vh; }
 dialog.wide { width: min(1200px, 96vw); }
 dialog::backdrop { background: var(--backdrop); }
@@ -493,6 +507,7 @@ dialog::backdrop { background: var(--backdrop); }
 .dock .sections.in-more:not(.open) .more svg { color: var(--gpu); }
 .dock .sections button[aria-current="page"]::before { left: 26%; right: 26%; top: -5px; bottom: auto; width: auto; height: 2px; border-radius: 0 0 2px 2px; }
 .dock .sections button .count { position: absolute; top: 1px; left: calc(50% + 5px); margin: 0; }
+.dock .sections button .fail-dot { position: absolute; top: 5px; left: calc(50% - 17px); margin: 0; }
 .dock .sections button[data-first] { margin: 0 0 0 13px; }
 .dock .sections button[data-first]::after { content: ""; position: absolute; left: -8px; top: 24%; bottom: 24%; width: 1px; background: var(--line-2); }
 /* A short window: the playground keeps its height for the work. */
@@ -508,7 +523,7 @@ dialog::backdrop { background: var(--backdrop); }
   .dock .sections.open { padding-top: 10px; border-radius: 14px 14px 0 0; }
   .dock .sections.open button[aria-current="page"]::before { content: none; }
   /* A count on a section More holds (downloads running) shows on More while it is folded. */
-  .dock .sections:not(.open):has(button[data-more] .count:not([hidden])) .more::after { content: ""; position: absolute; top: 5px; left: calc(50% + 9px); width: 8px; height: 8px; border-radius: 50%; background: var(--gpu); }
+  .dock .sections:not(.open):has(button[data-more] .count:not([hidden]), button[data-more] .fail-dot:not([hidden])) .more::after { content: ""; position: absolute; top: 5px; left: calc(50% + 9px); width: 8px; height: 8px; border-radius: 50%; background: var(--gpu); }
 }
 @media (max-width: 860px) {
   .hw-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
@@ -563,8 +578,13 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-free .meter { width: 120px; height: 6px; }
 .dl-queue { display: grid; gap: 8px; margin-bottom: 20px; }
 .dl-queue:empty { display: none; }
-.dl-q { display: grid; grid-template-columns: minmax(0, 220px) minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); font-size: 13px; }
+.dl-q { display: grid; grid-template-columns: minmax(0, 220px) minmax(0, 1fr) 15em; gap: 14px; align-items: center; padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); font-size: 13px; }
 .dl-q strong { font: 600 13px var(--display); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* (each row's bar the same length: what it says beside it has a column of its own width, not its words') */
+.dl-q > span { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dl-q.failed { border-color: color-mix(in srgb, var(--bad) 55%, transparent); background: color-mix(in srgb, var(--bad) 7%, var(--panel)); }
+.dl-q.failed > span { color: var(--bad); }
+@media (max-width: 560px) { .dl-q { grid-template-columns: minmax(0, 1fr) auto; } .dl-q .meter { grid-column: 1 / -1; grid-row: 2; } }
 .dl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 14px; }
 .dl-card { --accent: var(--gpu); position: relative; display: grid; grid-template-rows: auto auto 1fr auto auto; gap: 10px; padding: 16px 16px 14px; border: 1px solid var(--line); border-radius: calc(var(--r) + 2px); background: var(--panel); overflow: hidden; transition: border-color .15s, transform .15s; }
 .dl-card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--accent); opacity: .85; }
@@ -596,6 +616,7 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-state .line { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); }
 .dl-state .file { font: 11px var(--code); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dl-state .err { color: var(--bad); white-space: pre-wrap; }
+.dl-gated a { color: inherit; }
 .dl-state .ok { color: var(--good); display: flex; align-items: flex-start; gap: 6px; }
 .dl-state .ok svg { flex: none; margin-top: 1px; }
 .dl-plan { display: grid; gap: 4px; }
@@ -627,7 +648,7 @@ dialog::backdrop { background: var(--backdrop); }
       <button data-view="play" title="Playground"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4l14 8-14 8z"/></svg><span class="label">Playground</span></button>
       <button data-view="gallery" title="Gallery"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg><span class="label">Gallery</span><span class="count" id="gallery-count" hidden></span></button>
       <button data-view="models" title="Models" data-first><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg><span class="label">Models</span></button>
-      <button data-view="get" title="Get models" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="label">Get models</span><span class="count" id="get-count" hidden></span></button>
+      <button data-view="get" title="Get models" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="label">Get models</span><span class="count" id="get-count" hidden></span><span class="fail-dot" id="get-failed" hidden></span></button>
       <button data-view="memory" title="Memory" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="15" width="18" height="4" rx="1"/></svg><span class="label">Memory</span></button>
       <button data-view="endpoints" title="Endpoints" data-first data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span class="label">Endpoints</span></button>
       <button data-view="settings" title="Settings" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span class="label">Settings</span></button>
@@ -635,7 +656,7 @@ dialog::backdrop { background: var(--backdrop); }
       <button class="more" id="sections-more" title="All sections" aria-expanded="false" aria-controls="sections"><svg class="i-more" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg><svg class="i-less" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span class="label">More</span></button>
     </nav>
     <div class="rail-foot">
-      <div class="row"><span class="dot" id="foot-llm"></span><span id="foot-llm-text">LLM stopped</span></div>
+      <div class="row"><span class="dot" id="foot-llm"></span><span id="foot-llm-text">Loads on use</span></div>
       <div class="row"><span class="dot" id="foot-media"></span><span id="foot-media-text">Media idle</span></div>
       <label class="incog" title="Incognito: keep nothing about any request (no prompt cache, no history, media deleted after delivery)"><input type="checkbox" id="incognito"><span class="label">Incognito</span></label>
       <button class="btn quiet theme-toggle" id="theme" title="Switch between light and dark"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:1.7"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg><span class="label" id="theme-label">Theme</span></button>
@@ -661,7 +682,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block cols">
         <div>
           <div class="spread"><h2>Language model</h2><span id="llm-tag"></span></div>
-          <p class="muted" id="llm-detail" style="margin:0 0 14px">Not running.</p>
+          <div class="muted" id="llm-detail" style="margin:0 0 14px">Not running.</div>
           <div class="row">
             <button class="btn go" id="llm-start">Start</button>
             <button class="btn" id="llm-restart">Restart</button>
@@ -730,12 +751,12 @@ dialog::backdrop { background: var(--backdrop); }
               <details><summary>More options</summary>
                 <div class="grid-f" style="grid-template-columns:1fr">
                   <label class="f"><span>Steps</span><input type="number" id="img-steps" min="2" max="100" placeholder="auto"><small class="help">Empty = the model's default.</small></label>
-                  <label class="f"><span>Negative prompt (SDXL)</span><input type="text" id="img-neg" placeholder="blurry, low quality"></label>
+                  <label class="f" id="img-neg-row"><span>Negative prompt</span><input type="text" id="img-neg" placeholder="blurry, low quality"></label>
                 </div>
               </details>
               <input type="file" id="img-refs" accept="image/png,image/jpeg,image/webp" multiple hidden>
-              <div class="dropzone" id="img-drop" tabindex="0" role="button" aria-label="Drop up to 3 images here to edit them, or click to choose (Qwen Image)">
-                <span id="img-drop-label">Drop up to 3 images here to edit them, or click to choose (Qwen Image)</span>
+              <div class="dropzone" id="img-drop" tabindex="0" role="button" aria-label="Drop up to 3 images here to edit them, or click to choose">
+                <span id="img-drop-label">Drop up to 3 images here to edit them, or click to choose</span>
                 <div class="thumbs" id="img-ref-preview"></div>
               </div>
               <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="img-tier"></div></div>
@@ -941,7 +962,7 @@ dialog::backdrop { background: var(--backdrop); }
       <p class="lede">Recent results from this session (incognito requests are never listed). Click one for its prompt and settings, or to reuse the prompt.</p>
       <div class="chips" id="gallery-filter">
         <button data-f="all" aria-pressed="true">All</button><button data-f="image" aria-pressed="false">Images</button>
-        <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="music" aria-pressed="false">Music</button><button data-f="sound" aria-pressed="false">Sound</button><button data-f="model3d" aria-pressed="false">3D</button><button data-f="active" aria-pressed="false">In progress</button>
+        <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="music" aria-pressed="false">Music</button><button data-f="sound" aria-pressed="false">Sound effects</button><button data-f="model3d" aria-pressed="false">3D</button><button data-f="picture" aria-pressed="false">Picture tools</button><button data-f="active" aria-pressed="false">In progress</button>
         <button data-f="failed" aria-pressed="false">Failed</button>
       </div>
       <div class="gallery" id="gallery"></div>
@@ -950,7 +971,7 @@ dialog::backdrop { background: var(--backdrop); }
     <!-- Models -->
     <section class="view" id="v-models" data-jump>
       <h1>Models</h1>
-      <p class="lede">Pick a file or folder and the studio reads its headers to work out what it is. Language models go to chat, image models to images, video models to videos. Parts such as projectors, adapters, encoders and tokenizers attach to the model that needs them.</p>
+      <p class="lede">Pick a file or folder and OAIY reads its headers to work out what it is. Language models go to chat, image models to images, video models to videos. Parts such as projectors, adapters, encoders and tokenizers attach to the model that needs them.</p>
       <div class="dl-empty-hint" id="models-first-run" hidden><p><strong>Nothing to add yet?</strong> Get models downloads ready-to-run models and adds them here.</p><button class="btn go" data-goto="get">Get models</button></div>
       <div class="block">
         <h2 data-jump="Add">Add a model</h2>
@@ -968,7 +989,7 @@ dialog::backdrop { background: var(--backdrop); }
         <div class="spread"><h2 data-jump="Your list">Your model list</h2><div class="row">
           <a class="btn" id="export-models" href="/api/models/export" download="oaiy-models.json">Export models</a>
           <button class="btn" type="button" id="import-models-btn">Import models</button><input type="file" id="import-models" accept="application/json,.json" hidden></div></div>
-        <p class="muted small" style="margin:0 0 14px">Export saves every model (language, image, video, speech, music, sound effect and 3D) with its parts, LoRAs, settings, defaults and memory settings to a JSON file. Import it on this machine or another: models merge by name, or replace the whole list. Paths that do not exist there come in switched off and are listed.</p>
+        <p class="muted small" style="margin:0 0 14px">Export saves every model (language, image, video, speech, music, sound effect and 3D) with its parts, LoRAs, settings, defaults and memory settings to a JSON file. Import it on this computer or another: models merge by name, or replace the whole list. Paths that do not exist there come in switched off and are listed.</p>
         <div class="model-search">
           <input type="search" id="model-search" placeholder="Search your models: a name, a type, a file or a folder" aria-label="Search your models" autocomplete="off" spellcheck="false">
           <span class="muted small" id="model-search-count"></span>
@@ -995,7 +1016,7 @@ dialog::backdrop { background: var(--backdrop); }
         </label>
         <label class="f"><span>Hugging Face token <span class="muted small">(only for models whose licence you accept first)</span></span>
           <div class="pathfield"><input type="password" id="dl-token" autocomplete="off" placeholder="hf_… (read access)" aria-label="Hugging Face token"><button class="btn" id="dl-token-save">Save</button></div>
-          <span class="muted small" id="dl-token-note">Create one at huggingface.co/settings/tokens. It stays on this machine.</span>
+          <span class="muted small" id="dl-token-note">Create one at huggingface.co/settings/tokens. It stays on this computer.</span>
         </label>
       </div>
       <div class="dl-queue" id="dl-queue"></div>
@@ -1019,11 +1040,11 @@ dialog::backdrop { background: var(--backdrop); }
             <option value="custom">Custom</option></select></label>
           <div class="f"><span class="small muted">Language model GPUs</span><div class="row" id="llm-devices"></div></div>
           <label class="f"><span>Media GPU</span><select id="media-device"></select><small class="help">Images, video, speech, music, sound effects and 3D models.</small></label>
-          <label class="f"><span>When media needs the LLM's GPU</span><select id="llm-policy">
+          <label class="f"><span>When media needs the language model's GPU</span><select id="llm-policy">
             <option value="auto">Pause it if they share one</option>
             <option value="pause_llm">Always pause it</option>
             <option value="coexist">Never pause (both fit)</option></select></label>
-          <div class="f"><span></span><label class="check"><input type="checkbox" id="resume-llm"> Restart the LLM after media jobs</label></div>
+          <div class="f"><span></span><label class="check"><input type="checkbox" id="resume-llm"> Load the language model again after media jobs</label></div>
           <label class="f"><span>Keep the picture model loaded (minutes)</span><input type="number" min="0" max="1440" step="0.5" data-bind="media.keep_minutes" data-type="numnull" placeholder="2"><small class="help">After a picture its models wait this long for the next, which then takes seconds, not a reload. A chat that needs the GPU takes it back at once. 0 = unload after each picture; empty = 2.</small></label>
         </div>
         <p class="muted small" id="share-note"></p>
@@ -1054,7 +1075,7 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Allowed web origins</span><textarea data-bind="gateway.cors_origins" data-type="lines" rows="3" placeholder="http://localhost:3000"></textarea><small class="help">One per line, * for any.</small></label>
         </div>
         <p class="muted small">Web pages can reach this port too, so without an API key, browser requests are refused unless their origin is listed. Apps, scripts and SDKs outside a browser are unaffected.</p>
-        <p class="muted small">Use 0.0.0.0 to serve your network, and set an API key when you do. Address changes apply the next time the studio starts.</p>
+        <p class="muted small">Use 0.0.0.0 to serve your network, and set an API key when you do. Address changes apply the next time OAIY's engines start.</p>
       </div>
       <div class="block">
         <div class="spread"><h2>Routes</h2><div class="row"><button class="btn quiet" id="routes-reset">Restore defaults</button><button class="btn" id="route-add">Add route</button></div></div>
@@ -1102,9 +1123,10 @@ dialog::backdrop { background: var(--backdrop); }
       </div>
       <!-- A Mac's eGPU through tinygrad's server: shown where the engines offer it (macOS) -->
       <div class="block" id="egpu-block" hidden>
-        <div class="spread"><h2>eGPU through tinygrad</h2><span id="egpu-tag"></span></div>
-        <p class="muted small" style="margin-top:0">macOS has no driver for a graphics card in a Thunderbolt enclosure, so OAIY's own engine cannot see one. tinygrad can, through its TinyGPU app. With that set up, a model ticked "On the eGPU" under Models is answered by tinygrad's server on the card, and by this Mac's own GPU whenever the card is not there. It holds one model at a time, reads GGUF files, and answers chats: a request with a picture goes to this Mac's engine.</p>
-        <div class="grid-f" style="grid-template-columns:1fr">
+        <div class="spread"><h2>eGPU</h2><span id="egpu-tag"></span></div>
+        <p class="muted small" style="margin-top:0" id="egpu-about">macOS has no driver for a graphics card in a Thunderbolt enclosure. tinygrad reaches one through its TinyGPU app, and with that set up, a model ticked "On the eGPU" under Models is answered on the card, and by this Mac's own GPU whenever the card is not there.</p>
+        <p class="muted small" id="egpu-provided" hidden></p>
+        <div class="grid-f" style="grid-template-columns:1fr" id="egpu-python-fields">
           <label class="f"><span>Python that has tinygrad</span><div class="pathfield"><input type="text" data-bind="llm.egpu.python" placeholder="/opt/homebrew/bin/python3"><button class="btn" type="button" data-pick="llm.egpu.python">Browse</button></div><small class="help">Empty = look for one.</small></label>
           <label class="f"><span>tinygrad folder</span><div class="pathfield"><input type="text" data-bind="llm.egpu.tinygrad" placeholder="/Users/you/tinygrad"><button class="btn" type="button" data-pick="llm.egpu.tinygrad" data-dir="1">Browse</button></div><small class="help">A checkout that is not installed; else empty.</small></label>
         </div>
@@ -1121,7 +1143,7 @@ dialog::backdrop { background: var(--backdrop); }
         <div class="row" style="margin-top:4px; gap:10px 22px">
           <label class="check"><input type="checkbox" data-bind="llm.egpu.enabled"> Use the eGPU</label>
           <label class="check" title="With OAIY's own engine on the card: a Qwen Image picture is made on the card, its language model paused meanwhile (the card's memory is the picture's) and loaded again after. Pictures made while it is off, or while the card is not there, are made on this Mac."><input type="checkbox" data-bind="llm.egpu.images" id="egpu-images"> Make pictures on it too</label>
-          <label class="check" title="With OAIY's own engine on the card: video, music, sound effects, speech and 3D models are made on the card, its language model paused meanwhile and loaded again after. Made while it is off, or while the card is not there, they are made on this Mac."><input type="checkbox" data-bind="llm.egpu.media" id="egpu-media"> Make video, music, sound and speech on it too</label>
+          <label class="check" title="With OAIY's own engine on the card: video, music, sound effects, speech and 3D models are made on the card, its language model paused meanwhile and loaded again after. Made while it is off, or while the card is not there, they are made on this Mac."><input type="checkbox" data-bind="llm.egpu.media" id="egpu-media"> Make video, music, sound effects, speech and 3D models on it too</label>
         </div>
         <p class="muted small" id="egpu-detail" style="white-space:pre-wrap; margin:14px 0 10px"></p>
         <div class="row">
@@ -1134,12 +1156,12 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block">
         <h2>Programs and folders</h2>
         <div class="grid-f" style="grid-template-columns:1fr">
-          <label class="f"><span>oaiy-llm-server</span><div class="pathfield"><input type="text" data-bind="llm.server"><button class="btn" type="button" data-pick="llm.server">Browse</button></div></label>
-          <label class="f"><span>oaiy-llm-server-webgpu</span><div class="pathfield"><input type="text" data-bind="llm.server_webgpu"><button class="btn" type="button" data-pick="llm.server_webgpu">Browse</button></div><small class="help">The same server's other name: used when the one above is not there.</small></label>
-          <label class="f"><span>oaiy-media</span><div class="pathfield"><input type="text" data-bind="media.worker"><button class="btn" type="button" data-pick="media.worker">Browse</button></div></label>
+          <label class="f"><span>Language model engine</span><div class="pathfield"><input type="text" data-bind="llm.server"><button class="btn" type="button" data-pick="llm.server">Browse</button></div><small class="help">The program that runs the language models (oaiy-llm-server, the one beside the engines unless a path is given).</small></label>
+          <label class="f"><span>Language model engine, its other name</span><div class="pathfield"><input type="text" data-bind="llm.server_webgpu"><button class="btn" type="button" data-pick="llm.server_webgpu">Browse</button></div><small class="help">Used when the one above is not there (oaiy-llm-server-webgpu).</small></label>
+          <label class="f"><span>Media engine</span><div class="pathfield"><input type="text" data-bind="media.worker"><button class="btn" type="button" data-pick="media.worker">Browse</button></div><small class="help">The program that makes pictures, video, speech, music, sound effects and 3D models (oaiy-media).</small></label>
           <label class="f"><span>FFmpeg</span><div class="pathfield"><input type="text" data-bind="media.video.ffmpeg"><button class="btn" type="button" data-pick="media.video.ffmpeg">Browse</button></div></label>
           <label class="f"><span>Output folder</span><div class="pathfield"><input type="text" data-bind="media.output_dir"><button class="btn" type="button" data-pick="media.output_dir" data-dir="1">Browse</button></div></label>
-          <label class="f"><span>Extra oaiy-llm-server arguments</span><textarea data-bind="llm.extra_args" data-type="lines" rows="2"></textarea><small class="help">One per line.</small></label>
+          <label class="f"><span>Extra language model engine arguments</span><textarea data-bind="llm.extra_args" data-type="lines" rows="2"></textarea><small class="help">One per line.</small></label>
         </div>
       </div>
       <div class="block">
@@ -1147,7 +1169,7 @@ dialog::backdrop { background: var(--backdrop); }
         <div class="grid-f">
           <label class="f"><span>Video frame rate</span><input type="number" data-bind="media.video.fps" data-type="int"></label>
           <label class="f"><span>Jobs kept in the list</span><input type="number" data-bind="media.keep_jobs" data-type="int"></label>
-          <label class="f"><span>Open the UI as</span><select data-bind="ui.open"><option value="app">App window</option><option value="browser">Browser tab</option><option value="none">Nothing (console)</option></select></label>
+          <label class="f not-in-oaiy"><span>Open the UI as</span><select data-bind="ui.open"><option value="app">App window</option><option value="browser">Browser tab</option><option value="none">Nothing (console)</option></select></label>
         </div>
         <div class="row" style="margin-top:14px; gap:10px 22px">
           <label class="check"><input type="checkbox" data-bind="media.image.enabled"> Image generation</label>
@@ -1160,9 +1182,9 @@ dialog::backdrop { background: var(--backdrop); }
     <!-- Logs -->
     <section class="view" id="v-logs">
       <h1>Logs</h1>
-      <p class="lede">What the studio and its engines print, newest at the bottom.</p>
+      <p class="lede">What OAIY's engines print, newest at the bottom.</p>
       <div class="tabs" role="tablist">
-        <button role="tab" aria-selected="true" data-log="studio">Studio</button>
+        <button role="tab" aria-selected="true" data-log="studio">Engines</button>
         <button role="tab" aria-selected="false" data-log="llm">Language model</button>
         <button role="tab" aria-selected="false" data-log="media">Media</button>
         <button role="tab" aria-selected="false" data-log="egpu" id="log-egpu" hidden>eGPU</button>
@@ -1265,7 +1287,7 @@ function ask({title, text = "", input = null, buttons}) {
 let keyAsked = false;
 async function needKey() {
   if (keyAsked) return; keyAsked = true;
-  const r = await ask({title: "Enter the API key", text: "This studio is reachable from other machines, so its controls need the gateway's API key.",
+  const r = await ask({title: "Enter the API key", text: "OAIY's engines here are reachable from other computers, so their controls need the gateway's API key.",
     input: {type: "password", placeholder: "API key"}, buttons: [{label: "Unlock", value: "ok", kind: "go"}]});
   if (r?.text.trim()) { try { sessionStorage.setItem("studio-key", r.text.trim()); } catch {} location.reload(); }
   keyAsked = false;
@@ -1678,7 +1700,13 @@ function lastResidency(name) {
   const j = state?.media?.jobs?.find(j => j.model === name && j.residency && j.residency !== null);
   if (!j) return "";
   const r = j.residency.transformer || j.residency;
-  if (r.gpu_blocks !== undefined) return `<span class="tag gpu">${r.gpu_blocks} GPU</span><span class="tag ram">${r.ram_blocks} ${macMemory() ? "memory" : "RAM"}</span><span class="tag ssd">${r.ssd_blocks} SSD</span>`;
+  // (where its blocks were for its last job, in words: "32 GPU · 0 memory · 0 SSD" had no unit, and said the ones
+  // that were nowhere)
+  if (r.gpu_blocks !== undefined) {
+    const total = (r.gpu_blocks || 0) + (r.ram_blocks || 0) + (r.ssd_blocks || 0);
+    const at = [[r.gpu_blocks, "gpu", "on the GPU"], [r.ram_blocks, "ram", macMemory() ? "in memory" : "in RAM"], [r.ssd_blocks, "ssd", "read from the SSD"]].filter(([n]) => n > 0);
+    return at.map(([n, cls, where], i) => `<span class="tag ${cls}" title="Where its blocks were for its last job">${i ? `${n} ${where}` : `${n === total && total > 1 ? "All " : ""}${n} block${n === 1 ? "" : "s"} ${where}`}</span>`).join("");
+  }
   if (r.mode) return `<span class="tag ${r.mode === "resident" ? "gpu" : "ram"}">${r.mode === "resident" ? "All on GPU" : "Staged"}</span>`;
   return "";
 }
@@ -1692,11 +1720,18 @@ function egpuTick(m) {
   const own = cfg?.llm?.egpu?.engine === "webgpu";
   const gguf = own || /\.gguf$/i.test((m.path || "").trim());
   const who = own ? "OAIY's engine on the eGPU (over WebGPU)" : "tinygrad's server on the eGPU";
-  const held = state.egpu.model === m.name ? {ready: "Loaded on the eGPU", starting: "Loading on the eGPU"}[state.egpu.state] : "";
   return `<div class="row" style="gap:10px; align-items:center">
     <label class="check" title="${gguf ? `Chats with this model are answered by ${who}. When the card is not there, this Mac's GPU answers (Settings says with which model).` : "tinygrad's server reads GGUF files only."}"><input type="checkbox" data-egpu="${esc(m.name)}" ${m.egpu ? "checked" : ""} ${gguf || m.egpu ? "" : "disabled"}> On the eGPU (${own ? "WebGPU" : "tinygrad"}), when the card is there</label>
-    ${held ? `<span class="tag gpu">${held}</span>` : ""}${m.egpu && !egpuOn() ? '<span class="muted small">The eGPU is switched off under Settings.</span>' : ""}
+    ${m.egpu && !egpuOn() ? '<span class="muted small">The eGPU is switched off under Settings.</span>' : ""}
     ${m.egpu && own ? `<label class="f" style="margin:0" title="The context this model is started with on the card: empty is the eGPU's (Settings). A model whose attention cache can be this Mac's past what the card holds (Qwen3.8-Flash-Next's) can be given far more, up to 262,144; one whose cache must all be on the card (a dense 27B) fills a 24 GB card at 32,768."><span class="small">Context on the eGPU</span><input type="number" min="512" step="1024" style="width:110px" data-egpuctx="${esc(m.name)}" value="${esc(m.egpu_ctx ?? "")}" placeholder="${esc(cfg?.llm?.egpu?.ctx ?? 8192)}"></label>` : ""}</div>`;
+}
+// Where a language model runs, for its row's head: on the eGPU where it is set to (and it is on), and what the card
+// is doing with it now.
+function whereLlm(m) {
+  if (!(m.egpu && egpuOn())) return state?.llm?.resident === m.name && state.llm.state === "ready" ? '<span class="tag gpu">Loaded</span>' : "";
+  const e = state?.egpu || {};
+  const now = e.model !== m.name ? "" : e.lent ? "Paused for media on the eGPU" : e.paused ? "Paused on the eGPU" : {ready: "Loaded on the eGPU", starting: "Loading on the eGPU", failed: "Not answering on the eGPU"}[e.state] || "";
+  return now ? `<span class="tag ${e.state === "failed" ? "bad" : "gpu"}">${now}</span>` : '<span class="tag gpu" title="Its chats are answered on the eGPU when the card is there">On the eGPU</span>';
 }
 // The models that can stand in for one on the eGPU: this Mac's own, the same model first.
 function renderEgpuFallback() {
@@ -1709,15 +1744,15 @@ function renderModels() {
   const llm = cfg.llm.models;
   $("#m-llm").innerHTML = llm.length ? llm.map(m => `<div class="item">
     <div class="item-head"><strong>${esc(m.name)}</strong>
-      ${isDefaultLlm(m) ? '<span class="tag good">Default</span>' : ""}
-      ${state?.llm?.resident === m.name && state.llm.state === "ready" ? '<span class="tag gpu">Loaded</span>' : ""}
+      ${isDefaultLlm(m) ? defaultLlmTag() : ""}
+      ${whereLlm(m)}
       <span class="item-acts">${isDefaultLlm(m) ? "" : `<button class="btn quiet" data-default="llm|${esc(m.name)}">Make default</button>`}
       <label class="check"><input type="checkbox" data-menable="llm|${esc(m.name)}" ${m.enabled !== false ? "checked" : ""}> Enabled</label>
       <button class="btn quiet warn" data-remove="llm|${esc(m.name)}">Remove</button></span></div>
     <details class="item-more" data-item="llm|${esc(m.name)}" ${openItem("llm", m.name, !(m.path || "").trim()) ? "open" : ""}>${itemSummary(m.path)}
     <div class="cols" style="gap:12px">${field("Weights", "llm", m.name, "path", m.path)}${field("Vision projector (optional)", "llm", m.name, "vision_projector", m.vision_projector)}${field("LoRA adapter folder (optional)", "llm", m.name, "lora", m.lora, {dir: true})}<label class="f"><span>LoRA strength (1 = as trained)</span><input type="number" step="0.05" min="-4" max="4" value="${esc(String(m.lora_strength ?? 1))}" data-lorastrength="${esc(m.name)}"></label></div>
     ${loraList("llm", m.name, m.loras, "More LoRAs (optional; stacked with the one above, each with a strength)")}
-    <div class="f"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>
+    ${m.egpu && egpuOn() ? "" : `<div class="f"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>`}
     <label class="check" title="Qwen3.5 and Qwen3.8 GGUFs that have a multi-token-prediction layer, and Qwen3.8-Flash-Next, on WebGPU: the layer drafts the next few tokens and the model checks them in one run. Experimental: on Qwen3.8 27B a third to two fifths faster on predictable text (lists, facts, code), a little faster on stories and about even at higher temperatures, holding about 0.3 GB more on the GPU; on Flash-Next two fifths to three fifths faster on lists, facts and code (79 to 94 tokens a second where 55 to 58) and a little faster on stories, with the same replies as without it, holding about 1 GB more."><input type="checkbox" data-mtp="${esc(m.name)}" ${m.mtp ? "checked" : ""}> Draft tokens with its MTP layer (experimental)</label>
     ${egpuTick(m)}
     </details>
@@ -1802,7 +1837,7 @@ function renderModels() {
       .filter(k => k !== "tokenizer" || m.family !== "ltx-2.5")
       .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json", audio_vae: "Audio VAE (optional, for sound)"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("")
       + `<label class="f"><span>Negative prompt (optional: what its videos should not show, unless a request says otherwise)</span><input type="text" value="${esc(m.negative_prompt || "")}" data-mfield="video|${esc(name)}|negative_prompt" placeholder="watermark, text, logo, subtitles"></label>`;
-    return mediaItem("video", name, m, (m.family || name).toUpperCase(), miss, fields);
+    return mediaItem("video", name, m, familyName(m.family || name), miss, fields);
   }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3 or LTX 2.5 .safetensors file.</div>';
 
   renderPictureTools();
@@ -1838,6 +1873,14 @@ function renderModels() {
   $$("[data-lora-add]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.loraAdd.split("|");
     pick({dir: !!b.dataset.dir, title: b.dataset.dir ? "Choose a LoRA folder (with adapter_config.json, or a Flash-Next .gguf LoRA)" : "Choose a LoRA (.safetensors)"}, p => { modelLoras(s, n).push({path: p, strength: 1}); renderModels(); touch(); }); });
   $$("[data-menable]").forEach(el => el.onchange = () => { const [s, n] = el.dataset.menable.split("|"); modelObj(s, n).enabled = el.checked; touch(); });
+  $$("[data-pin]").forEach(el => el.onchange = async () => {
+    const model = el.dataset.pin, pin = el.checked;
+    try {
+      await api(pin ? "/api/resources/pins" : "/api/resources/unpin", {method: "POST", body: {model, kind: "image"}});
+      toast(pin ? `${model} is kept loaded: it loads now, and stays loaded` : `${model} is let go as any other picture model again`);
+      await loadConfig(); refresh();
+    } catch (e) { el.checked = !pin; toast(e.message, true); }
+  });
   $$("[data-default]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.default.split("|"); if (s === "llm") cfg.llm.default_model = n; else cfg.media[s].default_model = n; renderModels(); renderSelects(); touch(); });
   $$("[data-remove]").forEach(b => b.onclick = async () => { const [section, name] = b.dataset.remove.split("|");
     if (!await ask({title: `Remove ${name}?`, text: "It leaves the model list; the files stay on disk.", buttons: [{label: "Cancel", value: null}, {label: "Remove", value: "ok", kind: "warn"}]})) return;
@@ -1897,16 +1940,52 @@ $("#model-search").onkeydown = e => {
   // (its first field, the one to change, without scrolling it away again)
   $("input[type=text], input[type=number], select", item)?.focus({preventScroll: true});
 };
+// A picture model's pin, as the studio says it stands (`state.pins`): loaded, loading, or why it could not be.
+function pinTag(name) {
+  const p = (state?.pins || []).find(p => p.model === name);
+  if (!p) return "";
+  if (p.state === "ready") return '<span class="tag good" title="Kept loaded in the picture worker">Kept loaded</span>';
+  if (p.state === "failed") return `<span class="tag bad" title="${esc(p.error || "")}">Could not be kept loaded</span>`;
+  return '<span class="tag gpu">Loading to keep it loaded</span>';
+}
+function renderPinTags() {
+  $$("[data-pin-tag]").forEach(el => { const html = pinTag(el.dataset.pinTag); if (el.innerHTML !== html) el.innerHTML = html; });
+}
+// A part a model lacks, as its row says it ("Needs text_encoder" was the setting's own name).
+const PART_NAMES = {transformer: "its transformer", text_encoder: "its text encoder", vae: "its VAE", tokenizer: "its tokenizer", checkpoint: "its checkpoint",
+  base: "its base folder", safetensors_transformer: "its transformer", path: "its folder", dino: "DINOv3", naf: "the NAF weights", design: "its VoiceDesign folder"};
+const partName = k => PART_NAMES[k] || k.replace(/_/g, " ");
+// A video model's family as people write it ("LTX-2.5" came from the setting's name made upper case).
+function familyName(f) {
+  const s = String(f || "");
+  return /^ltx-?\d/i.test(s) ? "LTX " + s.replace(/^ltx-?/i, "") : s;
+}
 function mediaItem(section, name, m, arch, miss, fields) {
   const isDefault = cfg.media[section].default_model === name;
+  // (a picture model kept loaded in the picture worker, `media.pinned`: saved as it is ticked, as the pins' own route
+  // saves it)
+  const pinnable = section === "image" && !miss.length && m.enabled !== false;
+  const pinned = (saved?.media?.pinned || []).includes(name);
   return `<div class="item"><div class="item-head"><strong>${esc(name)}</strong><span class="tag">${esc(arch)}</span>
     ${isDefault ? '<span class="tag good">Default</span>' : ""}
-    ${miss.length ? `<span class="tag bad">Needs ${miss.map(esc).join(", ")}</span>` : lastResidency(name)}
+    ${miss.length ? `<span class="tag bad">Needs ${miss.map(k => esc(partName(k))).join(", ")}</span>` : lastResidency(name)}
+    ${section === "image" ? `<span data-pin-tag="${esc(name)}">${pinTag(name)}</span>` : ""}
     <span class="item-acts">${isDefault ? "" : `<button class="btn quiet" data-default="${section}|${esc(name)}">Make default</button>`}
+    ${pinnable || pinned ? `<label class="check" title="Kept loaded in the picture worker on its GPU, whatever the keep time: the next picture takes seconds. Other jobs that need that GPU wait, or are refused, until it is let go."><input type="checkbox" data-pin="${esc(name)}" ${pinned ? "checked" : ""}> Keep loaded</label>` : ""}
     <label class="check" ${miss.length ? 'title="It can be switched on once it has the files it needs"' : ""}><input type="checkbox" data-menable="${section}|${esc(name)}" ${m.enabled !== false ? "checked" : ""} ${miss.length ? "disabled" : ""}> Enabled</label>
     <button class="btn quiet warn" data-remove="${section}|${esc(name)}">Remove</button></span></div>
     <details class="item-more" data-item="${section}|${esc(name)}" ${openItem(section, name, miss.length > 0) ? "open" : ""}>${itemSummary(mainFile(section, m))}
     <div class="cols" style="gap:12px">${fields}</div></details></div>`;
+}
+// The paired computer's language model that is OAIY's default for its chats in place of this computer's (OAIY
+// Network), where one is: its entry in `state.peers`.
+function pairedDefault(kind = "llm") { return (state?.peers || []).find(p => p.kind === kind && p.default) || null; }
+// This computer's default language model's tag: its gateway's and the Playground's default, and OAIY's own chats'
+// too unless a paired computer's model is theirs.
+function defaultLlmTag() {
+  const p = pairedDefault();
+  return p ? `<span class="tag good" title="This computer's gateway (${esc(state?.gateway_url || "")}) and the Playground answer with it. OAIY's own chats (its chat route and the Agent) use ${esc(p.model)} on ${esc(p.node_name)} (OAIY Network).">Default here</span>`
+    : '<span class="tag good">Default</span>';
 }
 // The language model the others are measured against: the one named default, else the first.
 function isDefaultLlm(m) { return cfg.llm.default_model === m.name || (!cfg.llm.default_model && cfg.llm.models[0] === m); }
@@ -2035,16 +2114,18 @@ function renderDevices() {
 }
 function shareNote() {
   const d = cfg.media.device, pol = cfg.media.llm_policy;
-  const models = cfg.llm.models.filter(m => m.enabled !== false);
+  // (a model on the eGPU is the card's, not GPU d's: counted apart)
+  const all = cfg.llm.models.filter(m => m.enabled !== false), card = all.filter(m => m.egpu && egpuOn()), models = all.filter(m => !card.includes(m));
   // (a few by name; more said as how many, the first named: a list of eleven was a paragraph of its own)
-  const named = list => list.length <= 3
-    ? list.map(m => `${m.name} (GPU ${modelGpus(m).join(", ")})`).join(", ")
+  const named = (list, gpus = true) => list.length <= 3
+    ? list.map(m => gpus ? `${m.name} (GPU ${modelGpus(m).join(", ")})` : m.name).join(", ")
     : `${list.length} language models (${list.slice(0, 2).map(m => m.name).join(", ")} and ${list.length - 2} more)`;
   const shared = models.filter(m => modelGpus(m).includes(d)), free = models.filter(m => !modelGpus(m).includes(d));
-  $("#share-note").textContent = pol === "coexist" ? `Media and the language models run side by side. Make sure both fit in ${macMemory() ? "the GPU's memory" : "VRAM"}.`
-    : pol === "pause_llm" ? `Every media job stops the language model first; chat requests wait until the job finishes.`
-    : [shared.length ? `Media jobs on GPU ${d} take turns with ${named(shared)}: it stops while a job runs, and its chat requests wait.` : `No language model uses GPU ${d}, so chat and media run at the same time.`,
-       shared.length && free.length ? `${named(free)} keep${free.length === 1 && free.length <= 3 ? "s" : ""} answering while media runs.` : ""].filter(Boolean).join(" ");
+  const onCard = card.length ? `${named(card, false)} ${card.length === 1 ? "runs" : "run"} on the eGPU, not on GPU ${d}${cardMakes().length ? ", and media made on the card pauses " + (card.length === 1 ? "it" : "them") + " there instead" : ""}.` : "";
+  $("#share-note").textContent = pol === "coexist" ? [`Media and the language models run side by side. Make sure both fit in ${macMemory() ? "the GPU's memory" : "VRAM"}.`, onCard].filter(Boolean).join(" ")
+    : pol === "pause_llm" ? [`Every media job stops the language model first; chat requests wait until the job finishes.`, onCard].filter(Boolean).join(" ")
+    : [shared.length ? `Media jobs on GPU ${d} take turns with ${named(shared)}: ${shared.length === 1 ? "it stops while a job runs, and its chat requests wait" : "they stop while a job runs, and their chat requests wait"}.` : `No language model uses GPU ${d}, so chat and media run at the same time.`,
+       shared.length && free.length ? `${named(free)} ${free.length === 1 ? "keeps" : "keep"} answering while media runs.` : "", onCard].filter(Boolean).join(" ");
 }
 
 /* ---------- endpoints ---------- */
@@ -2129,6 +2210,27 @@ function macWords() {
   put($("#mem-lede"), !mac ? $("#mem-lede")?.dataset.pc
     : `Choose where weights live for each kind of job. This Mac's GPU holds weights in its share of the unified memory: blocks it holds run fastest, blocks kept in the rest of memory are copied to it each pass, and streaming from the SSD saves memory.${card ? " A job the eGPU makes holds its GPU part in the card's own VRAM, and copies the rest across Thunderbolt." : ""} The output is identical either way; only speed and memory use change.`);
 }
+// The media kinds this computer has a model of, switched on (the picture tools among them).
+function mediaKinds() {
+  const m = cfg?.media || {};
+  const has = k => Object.values(m[k]?.models || {}).some(x => x.enabled !== false);
+  return [...["image", "video", "speech", "music", "sound", "model3d"].filter(has), ...(m.picture?.background || m.picture?.upscaler ? ["picture"] : [])];
+}
+// The ones the eGPU's card makes (OAIY's own engine on it, the eGPU switched on): pictures where it makes them
+// (`llm.egpu.images`), the others where it makes media (`llm.egpu.media`), each on unless switched off.
+function cardMakes() {
+  const e = cfg?.llm?.egpu;
+  if (!egpuOn() || e?.engine !== "webgpu") return [];
+  return mediaKinds().filter(k => k === "image" ? e.images !== false : e.media !== false);
+}
+// Kinds of media as a GPU's row says what it runs: "media" for all this computer has, else each by name.
+function mediaWords(kinds) {
+  if (!kinds.length) return "";
+  if (kinds.length === mediaKinds().length) return "media";
+  const words = {image: "pictures", video: "video", speech: "speech", music: "music", sound: "sound effects", model3d: "3D models", picture: "picture tools"};
+  const list = kinds.map(k => words[k]);
+  return list.length > 1 ? list.slice(0, -1).join(", ") + " and " + list[list.length - 1] : list[0];
+}
 function renderHardware() {
   const hw = $("#hw"), rows = [];
   const ram = sys?.ram;
@@ -2154,7 +2256,10 @@ function renderHardware() {
     const roles = [];
     const resident = cfg && state?.llm?.resident ? cfg.llm.models.find(m => m.name === state.llm.resident) : null;
     if (cfg && state?.llm?.state === "ready" && modelGpus(resident).includes(g.index)) roles.push("LLM");
-    if (cfg && cfg.media.device === g.index) roles.push("media");
+    // (media where a media model is, and not what the eGPU's card makes: a first run said "Runs media" with none, and a
+    // Mac whose pictures are the card's said its own GPU made them)
+    const card = cardMakes(), here = mediaKinds().filter(k => !card.includes(k));
+    if (cfg && cfg.media.device === g.index && here.length) roles.push(mediaWords(here));
     const label = `<div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>`;
     const does = roles.length ? "Runs " + roles.join(" and ") : "";
     if (g.unified) {
@@ -2181,12 +2286,17 @@ function renderHardware() {
   const e = state?.egpu;
   if (e?.available && e.enabled) {
     const own = e.engine === "webgpu", by = own ? "OAIY's engine" : "tinygrad", u = e.usage;
-    const does = e.lent ? [`Lent to a media job`, e.model ? `${esc(e.model)} paused` : ""]
-      : e.paused ? [`${esc(e.model || "The language model")} paused`, ""]
-      : e.state === "ready" ? [`Runs ${esc(e.model || "")}`, `through ${by}`]
-      : e.state === "starting" ? [`Loading ${esc(e.model || "")}`, own ? "" : "its first start compiles kernels: minutes"]
-      : e.state === "failed" ? ["Not answering", "this computer's GPU answers instead"]
-      : ["Not started", e.models?.length ? "starts on the first request" : "no model is set to it (Models)"];
+    // (what it makes for media, where it does: said beside what its language model is doing)
+    const makes = mediaWords(cardMakes()), and = makes ? ` · makes ${makes}` : "";
+    // (this computer's engine answers while the card does not, unless it failed too)
+    const here = state.llm?.state === "failed" ? "this computer's engine failed too" : "this computer's GPU answers instead";
+    // (what it does, then an aside after a dot, as the GPUs' rows say theirs)
+    const does = e.lent ? [`Lent to a media job`, e.model ? `· ${esc(e.model)} paused` : ""]
+      : e.paused ? [`${esc(e.model || "The language model")} paused`, and]
+      : e.state === "ready" ? [`Runs ${esc(e.model || "")}`, `through ${by}${and}`]
+      : e.state === "starting" ? [`Loading ${esc(e.model || "")}`, own ? and : "· its first start compiles kernels: minutes"]
+      : e.state === "failed" ? ["Not answering", "· " + here]
+      : ["Not started", (e.models?.length ? "· starts on the first request" : "· no model is set to it (Models)") + and];
     const label = `<div class="label">eGPU<small>${e.device === "AMD" ? "AMD" : "NVIDIA"} card, ${by}</small></div>`;
     if (u?.memory_total_mb) {
       const used = u.memory_used_mb || 0, kept = u.memory_cached_mb || 0, total = u.memory_total_mb;
@@ -2194,9 +2304,11 @@ function renderHardware() {
       rows.push(meterRow(label, [memMeter(used, total, `Video memory: ${gb(used)} GB of ${gb(total)} GB in use${kept >= 1024 ? `, and ${gb(kept)} GB of buffers let go kept for reuse (lighter)` : ""}`, kept, "VRAM"),
         loadMeter(u.load, "Compute load: the share of the last second the card spent running kernels")], does));
     } else {
+      // (no meter of what nothing says: tinygrad's server says nothing of the card's memory, and a bar full while it
+      // was ready read as a card full)
       rows.push(`<div class="hw-row">${label}
-        <div class="meter"><div style="width:${e.state === "ready" && !own ? 100 : 0}%;background:var(--gpu)"></div></div>
-        <div class="num small">${does[0]}<br><span class="muted">${does[1]}</span></div></div>`);
+        <div class="small">${does[0]} <span class="muted">${does[1]}</span></div>
+        <div></div></div>`);
     }
   }
   if (ram?.total_mb && !unified.length) {
@@ -2223,19 +2335,31 @@ function renderState() {
   const standingIn = allOnCard && (own.state === "ready" || own.state === "starting");
   const onCard = allOnCard && !standingIn;
   const l = onCard ? card : own;
-  // (the card lent to a picture or a video in the making: its engine is paused, and its server is the job's too)
-  const lent = onCard && !!(card.lent || card.paused);
-  const label = lent ? "Paused" : {stopped: "Stopped", starting: "Loading", ready: "Ready", failed: "Failed"}[l.state];
-  $("#llm-tag").innerHTML = `<span class="tag ${lent ? "" : l.state === "ready" ? "good" : l.state === "failed" ? "bad" : ""}">${label}</span>`;
-  $("#llm-detail").textContent = onCard
-    ? (lent ? `Paused on the eGPU while a media job uses the card${l.model ? `: ${l.model} comes back after it` : ""}.`
-      : l.state === "ready" ? `Serving ${l.model || ""} on the eGPU${l.runs_on ? ` (${l.runs_on})` : ""}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
-      : l.state === "starting" ? `Loading ${l.model || ""} on the eGPU...` : l.state === "failed" ? l.error
+  // (the card lent to a picture or a video in the making: its engine is paused, and its server is the job's too, so
+  // its buttons wait for the job. Paused alone, since a picture with the card given back, it loads again at the next
+  // chat or with Start)
+  const lent = onCard && !!card.lent, paused = onCard && !lent && !!card.paused;
+  // (no language model here at all: nothing to start, and the card says where to get one)
+  const set = saved || cfg, none = !!set && !(set.llm?.models || []).some(m => m.enabled !== false) && l.state === "stopped";
+  const label = none ? "No model" : lent || paused ? "Paused" : {stopped: "Loads on use", starting: "Loading", ready: "Model ready", failed: "Failed"}[l.state];
+  $("#llm-tag").innerHTML = `<span class="tag ${lent || paused ? "" : l.state === "ready" ? "good" : l.state === "failed" ? "bad" : ""}">${label}</span>`;
+  const said = none ? `No language model yet. Get one under Get models, or add a model file under Models.<div class="row"><button class="btn go" type="button" data-goto="get">Get models</button></div>`
+    : onCard
+    ? (lent ? esc(`Paused on the eGPU while a media job uses the card${l.model ? `: ${l.model} comes back after it` : ""}.`)
+      : paused ? esc(`${l.model || "Its model"} is paused on the eGPU since a picture: it loads again at the next chat, or now with Start.`)
+      : l.state === "ready" ? esc(`Serving ${l.model || ""} on the eGPU${l.runs_on ? ` (${l.runs_on})` : ""}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`)
+      : l.state === "starting" ? esc(`Loading ${l.model || ""} on the eGPU…`) : l.state === "failed" ? errorHtml(l.error, "egpu")
       : "Not running. It starts on the eGPU at the first chat request.")
-    : l.state === "ready" ? `Serving ${l.resident || l.models[0] || ""} on ${l.runs_on || "the GPU"}${l.models.length > 1 ? ` (one model at a time; ${l.models.length - 1} more it loads in its place when asked)` : ""}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
-    : l.state === "starting" ? `Loading ${l.models[0] || ""}...` : l.state === "failed" ? l.error : l.paused_for_media ? "Paused while a media job uses its GPU." : "Not running. It starts on the first chat request.";
-  $("#llm-start").disabled = lent || l.state === "ready" || l.state === "starting";
-  $("#llm-restart").disabled = lent || l.state !== "ready";
+    : l.state === "ready" ? esc(`Serving ${l.resident || l.models[0] || ""} on ${l.runs_on || "the GPU"}${l.models.length > 1 ? ` (one model at a time; ${l.models.length - 1} more it loads in its place when asked)` : ""}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`)
+    : l.state === "starting" ? esc(`Loading ${l.resident || l.models[0] || ""}…`) : l.state === "failed" ? errorHtml(l.error, "llm") : l.paused_for_media ? "Paused while a media job uses its GPU." : "Not running. It starts on the first chat request.";
+  // (a paired computer's model chosen as the default, in Engines' Other computers: OAIY's own chats use it, this
+  // computer's gateway and Playground do not)
+  const p = pairedDefault();
+  const away = p ? `<p class="small" style="margin:10px 0 0">${esc(`OAIY's chats on the engine (the Agent, flows and OAIY's chat route) use ${p.model} on ${p.node_name} (OAIY Network)${p.node_online ? "" : ", which is not answering now"}. This computer's gateway (${state.gateway_url}) and the Playground here answer with this computer's own model, unless that one is picked.`)}</p>` : "";
+  // (written again only when it changes: an error's details opened would close at each read)
+  if ($("#llm-detail").dataset.was !== said + away) { $("#llm-detail").innerHTML = said + away; $("#llm-detail").dataset.was = said + away; }
+  $("#llm-start").disabled = none || lent || (!paused && (l.state === "ready" || l.state === "starting"));
+  $("#llm-restart").disabled = none || lent || (l.state !== "ready" && !paused);
   $("#llm-stop").disabled = lent || l.state === "stopped";
   if (saved) {
     const models = saved.llm.models.filter(m => m.enabled !== false);
@@ -2244,33 +2368,37 @@ function renderState() {
     $("#llm-autostart-what").textContent = first ? `· loads ${first.name}${allOnCard ? " on the eGPU" : ""}` : "";
   }
   macWords();
-  $("#llm-note").textContent = state.restart_required ? "Listener changes apply after the studio restarts."
-    : standingIn ? "Every model is set to run on the eGPU: this computer's engine is standing in for it. Stop stops both."
-    : onCard && own.state === "failed" ? `This computer's engine could not stand in for the eGPU earlier (${own.error || "it failed to start"}).` : "";
-  $("#foot-llm").className = "dot " + l.state; $("#foot-llm-text").textContent = "LLM " + label.toLowerCase();
+  $("#llm-note").textContent = state.restart_required ? "Address changes apply once OAIY's engines start again."
+    : standingIn ? "The default model runs on the eGPU: this computer's engine is standing in for it while the card does not answer. Stop stops both."
+    : onCard && own.state === "failed" ? `This computer's engine could not stand in for the eGPU earlier: ${errorSummary(own.error || "it failed to start").replace(/^The /, "the ")}` : "";
+  $("#foot-llm").className = "dot " + (lent || paused || none ? "" : l.state); $("#foot-llm-text").textContent = label;
+  if (JSON.stringify(state.peers || []) !== peersSeen) { peersSeen = JSON.stringify(state.peers || []); if (cfg) { renderSelects(); renderModels(); } }
+  renderPinTags();
   renderEgpu();
   const priv = state.media.private || [];
   const active = state.media.jobs.find(j => j.status === "in_progress") || priv.find(j => j.status === "in_progress");
   $("#foot-media").className = "dot " + (active ? "starting" : ""); $("#foot-media-text").textContent = active ? `${kindText(active.kind)} ${active.progress.toFixed(0)}%` : "Media idle";
   const ep = [["Chat", routeFor("chat")], ["Images", routeFor("images")], ["Videos", routeFor("videos")]].filter(([, r]) => r);
+
   const endpoints = ep.map(([n, r]) => `<div class="endpoint"><span class="muted">${n}</span><code>${esc(state.gateway_url + r.path)}</code><button class="btn quiet" data-copy="${esc(state.gateway_url + r.path)}">Copy</button></div>`).join("")
     + `<div class="endpoint"><span class="muted">Base URL</span><code>${esc(state.gateway_url)}/v1</code><button class="btn quiet" data-copy="${esc(state.gateway_url)}/v1">Copy</button></div>`;
   // (written again only when it changes: read every 1.5 s, it would take a selection or the keyboard's place away)
   if ($("#ov-endpoints").dataset.was !== endpoints) { $("#ov-endpoints").innerHTML = endpoints; $("#ov-endpoints").dataset.was = endpoints; }
   const jobs = state.media.jobs.slice(0, 8);
-  keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="Open the result" data-job="${esc(j.id)}" tabindex="0" role="button">` : '<div class="ph"></div>'}
-    <div><div class="p">${esc(j.prompt || (j.kind === "model3d" ? "3D model" : ""))}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
-    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`,
+  keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="Open the result" data-job="${esc(j.id)}" tabindex="0" role="button">`
+      : AUDIO_ICONS[j.kind] && j.files[0] ? `<div class="ph icon" data-job="${esc(j.id)}" tabindex="0" role="button" aria-label="Open the result"><svg viewBox="0 0 24 24" aria-hidden="true">${AUDIO_ICONS[j.kind]}</svg></div>` : '<div class="ph"></div>'}
+    <div><div class="p">${esc(jobTitle(j))}</div><div class="muted small">${[esc(j.model), esc(jobSize(j)), statusText(j)].filter(Boolean).join(", ")}</div></div>
+    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank" data-open>Open</a>` : ""}</div></div>`,
     nothingYet);
-  $$("#ov-jobs img[data-job]").forEach(img => img.onclick = () => openViewer(img.dataset.job));
+  $$("#ov-jobs [data-job]").forEach(el => el.onclick = () => openViewer(el.dataset.job));
   const all = [...state.media.jobs, ...priv];
   const now = all.find(j => j.status === "in_progress") || all.find(j => j.status === "queued");
   $("#now-block").hidden = !now;
   if (now) {
     const active = now, hidden = !("prompt" in now);
-    $("#now").innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(active.prompt || (active.kind === "model3d" ? "3D model" : ""))}</div>
+    $("#now").innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(jobTitle(active))}</div>
       <div class="meter"><div style="width:${active.progress}%;background:var(--gpu)"></div></div>
-      <div class="muted small" style="margin-top:6px">${hidden ? esc(kindText(active.kind)) : `${esc(kindText(active.kind))} on ${esc(active.model)}, ${esc(active.size)}`}: ${statusText(active)}</div></div>
+      <div class="muted small" style="margin-top:6px">${hidden ? esc(kindText(active.kind)) : `${esc(kindText(active.kind))} on ${[esc(active.model), esc(jobSize(active))].filter(Boolean).join(", ")}`}: ${statusText(active)}</div></div>
       <button class="btn warn" data-cancel="${active.id}">Cancel</button></div>`;
   }
   const busy = all.filter(j => j.status === "in_progress" || j.status === "queued").length;
@@ -2280,7 +2408,7 @@ function renderState() {
   $("#cfg-path").textContent = "Configuration: " + state.config_path;
 }
 // The eGPU's block under Settings: there where the engines offer it (a Mac), with what tinygrad's server is doing.
-let egpuOfferedBefore = null;
+let egpuOfferedBefore = null, peersSeen = "[]";
 function renderEgpu() {
   const e = state?.egpu, block = $("#egpu-block");
   block.hidden = !e?.available;
@@ -2288,18 +2416,35 @@ function renderEgpu() {
   if (egpuOfferedBefore !== !!e?.available && cfg) { egpuOfferedBefore = !!e?.available; renderModels(); }
   if (!e?.available) return;
   const label = !e.enabled ? "Off" : e.lent ? "Making media" : e.paused ? "Paused" : {stopped: "Not started", starting: "Loading", ready: "Ready", failed: "Not answering"}[e.state];
-  $("#egpu-tag").innerHTML = `<span class="tag ${e.enabled && e.state === "ready" ? "good" : e.enabled && e.state === "failed" ? "bad" : ""}">${label}</span>`;
+  $("#egpu-tag").innerHTML = `<span class="tag ${e.enabled && e.state === "ready" && !e.lent && !e.paused ? "good" : e.enabled && e.state === "failed" ? "bad" : ""}">${label}</span>`;
+  // (what runs on the card, as the engine chosen for it is: OAIY's own reads pictures and any model OAIY runs, and
+  // makes media; tinygrad's server reads GGUF files and text alone)
+  const own = (cfg?.llm?.egpu?.engine || e.engine) === "webgpu";
+  const about = own
+    ? "macOS has no driver for a graphics card in a Thunderbolt enclosure. tinygrad reaches one through its TinyGPU app, and OAIY's own engine runs on it over WebGPU: a model ticked \"On the eGPU\" under Models is answered on the card, pictures in chats included, and by this Mac's own GPU whenever the card is not there. The ticks below make media on the card too, its language model paused meanwhile."
+    : "macOS has no driver for a graphics card in a Thunderbolt enclosure. tinygrad reaches one through its TinyGPU app, and with that set up, a model ticked \"On the eGPU\" under Models is answered by tinygrad's server on the card, and by this Mac's own GPU whenever the card is not there. It holds one model at a time, reads GGUF files, and answers chats: a request with a picture goes to this Mac's engine.";
+  if ($("#egpu-about").textContent !== about) $("#egpu-about").textContent = about;
+  // (the Python and tinygrad the card runs on are the eGPU plugin's where it provides them: the settings' fields for
+  // them do nothing then)
+  $("#egpu-python-fields").hidden = !!e.provided_by;
+  $("#egpu-provided").hidden = !e.provided_by;
+  $("#egpu-provided").textContent = e.provided_by ? `The card's Python and tinygrad are provided by: ${e.provided_by}. The settings' own are not used meanwhile.` : "";
+  $("#egpu-images").closest("label").hidden = !own; $("#egpu-media").closest("label").hidden = !own;
   const set = e.models?.length ? "" : " No model is set to it yet: tick one under Models.";
+  // (this computer's engine answers while the card does not, unless it failed too)
+  const here = state.llm?.state === "failed" ? `This computer's engine failed too: ${errorSummary(state.llm.error || "it did not start").replace(/^The /, "the ")}` : "This computer's GPU answers meanwhile.";
   $("#egpu-detail").textContent = !e.enabled ? "Switched off: every model runs on this computer's own GPU."
-    : e.lent ? `The card is making a picture, a video or a sound: ${e.model || "its model"} is paused, and chats with it wait for the card.`
-    : e.paused ? `The card is held with ${e.model || "its model"} paused (after a picture): the next chat with it loads it again.`
+    : e.lent ? `The card is making a picture, a video or a sound: ${e.model || "its model"} is paused, and chats with it wait for the card. Start and Stop wait for the job.`
+    : e.paused ? `The card is held with ${e.model || "its model"} paused (after a picture): the next chat with it loads it again, or Start does now.`
     : e.state === "ready" ? `Serving ${e.model}${e.runs_on ? " on " + e.runs_on : ""}, up to ${e.context_tokens} tokens of context. Loaded in ${e.load_seconds?.toFixed(1)} s, idle ${e.idle_seconds} s.`
-    : e.state === "starting" ? `Loading ${e.model || ""}. tinygrad compiles its kernels the first time a model starts, which takes minutes; requests wait for it.`
-    : e.state === "failed" ? `${e.error || "tinygrad's server failed."}\n\nThis computer's GPU answers meanwhile.${e.retry_seconds ? ` It is tried again in ${e.retry_seconds} s, or now with Start.` : ""}`
+    : e.state === "starting" ? `Loading ${e.model || ""}.${own ? "" : " tinygrad compiles its kernels the first time a model starts, which takes minutes;"} Requests wait for it.`
+    : e.state === "failed" ? `${e.error || "The card's server failed."}\n\n${here}${e.retry_seconds ? ` It is tried again in ${e.retry_seconds} s, or now with Start.` : ""}`
     : "Not running. It starts on the first chat with a model set to it." + set;
-  $("#egpu-start").disabled = !e.enabled || !e.models?.length || e.state === "starting";
+  // (neither while the card is lent to a media job: its server is the job's then. Start while it serves has nothing to
+  // do; paused, it loads the model again)
+  $("#egpu-start").disabled = !e.enabled || !e.models?.length || e.lent || e.state === "starting" || (e.state === "ready" && !e.paused);
   $("#log-egpu").hidden = !e.available;
-  $("#egpu-stop").disabled = e.state === "stopped";
+  $("#egpu-stop").disabled = e.lent || e.state === "stopped";
 }
 $("#egpu-check").onclick = async () => {
   const out = $("#egpu-check-out");
@@ -2315,12 +2460,42 @@ $("#egpu-check").onclick = async () => {
   } catch (e) { out.textContent = e.message; }
 };
 $("#egpu-start").onclick = () => api("/api/egpu/start", {method: "POST"}).then(refresh, e => { toast(e.message, true); refresh(); });
-$("#egpu-stop").onclick = () => api("/api/egpu/stop", {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#egpu-stop").onclick = () => api("/api/egpu/stop", {method: "POST"}).then(s => { if (s?.note) toast(s.note); refresh(); }, e => toast(e.message, true));
 // Status lines include worker output: plain text, escaped here once.
 function statusText(j) { return esc(statusRaw(j)); }
 // A job's kind as people say it, at the start of a line ("video 42%" read as a word left over).
 const KIND_TEXT = {image: "Image", video: "Video", speech: "Speech", music: "Song", sound: "Sound effect", model3d: "3D model"};
 function kindText(k) { return KIND_TEXT[k] || (k ? k[0].toUpperCase() + k.slice(1) : "Media"); }
+// A job's line in the lists: its prompt, else what it is (a 3D model, a picture tool's result).
+function jobTitle(j) { return j.prompt || (j.kind === "model3d" ? "3D model" : j.kind === "picture" ? pictureTitle(j) : kindText(j.kind)); }
+// What a picture tool did, by its model (`media::picture`): BiRefNet removes a background, Real-ESRGAN enlarges.
+function pictureTitle(j) { return /birefnet/i.test(j.model || "") ? "Background removed" : /esrgan/i.test(j.model || "") ? "Picture enlarged" : "Picture tool"; }
+// Its size as a list says it: a picture's, a sound's length, a picture tool's scale; nothing where it has none.
+function jobSize(j) {
+  if (["speech", "music", "sound"].includes(j.kind)) return j.seconds ? j.seconds.toFixed(1) + " s" : "";
+  if (j.kind === "video") return [j.size, j.seconds ? j.seconds.toFixed(1) + " s" : ""].filter(Boolean).join(", ");
+  if (j.kind === "picture") return /birefnet/i.test(j.model || "") ? "" : j.size || "";
+  return j.size || "";
+}
+// The pictures a sound's thumbnail is drawn with.
+const AUDIO_ICONS = {speech: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/>', music: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  sound: '<path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13"/>'};
+// An engine's error as the card shows it: what happened in one line (how it ended, and its last word), what it said
+// folded under that, and its log a press away.
+function errorHtml(error, log) {
+  const lines = String(error || "").split("\n").map(s => s.trim()).filter(Boolean);
+  return `<span style="color:var(--bad)">${esc(errorSummary(error))}</span>${lines.length > 1 ? `<details class="llm-said"><summary>What it said</summary><pre>${esc(lines.slice(1).join("\n"))}</pre></details>` : ""}
+    <div class="row"><button class="btn" type="button" data-log-open="${log}">Open the log</button></div>`;
+}
+// An engine's error in one line: how it ended ("oaiy-llm-server exited (exit status: 101):" said as the engine that
+// stopped), and its last word where that is short, the panic or the reason.
+function errorSummary(error) {
+  const lines = String(error || "It stopped without saying why.").split("\n").map(s => s.trim()).filter(Boolean);
+  const first = lines[0].replace(/:$/, ""), last = lines.length > 1 ? lines[lines.length - 1] : "";
+  const ended = first.match(/^(oaiy-llm-server|tinygrad's server) exited \((.*)\)$/);
+  const head = ended ? `${ended[1] === "oaiy-llm-server" ? "The language model's engine" : "tinygrad's server"} stopped (${ended[2]})` : first;
+  return last && last.length <= 140 ? `${head}: ${last.replace(/[.:]$/, "")}.` : head.replace(/\.?$/, ".");
+}
 function statusRaw(j) {
   if (j.status === "in_progress") return `${j.progress.toFixed(0)}%${j.stage ? ", " + j.stage.replace(/_/g, " ") : ""}`;
   if (j.status === "failed") return "failed: " + (j.error || "").slice(0, 140);
@@ -2343,24 +2518,70 @@ $("#llm-autostart").onchange = async e => {
 };
 $("#open-outputs").onclick = () => api("/api/open-outputs", {method: "POST"}).catch(e => toast(e.message, true));
 
+// A paired computer's models of `kind` (OAIY Network, `state.peers`): a group of options for each computer, after this
+// computer's own. Each option's value names the computer and the model (two computers may have a model of one name).
+function peerGroups(kind, kept) {
+  const nodes = new Map();
+  for (const p of state?.peers || []) {
+    if (p.kind !== kind) continue;
+    if (!nodes.has(p.node_id)) nodes.set(p.node_id, {name: p.node_name, online: p.node_online, list: []});
+    nodes.get(p.node_id).list.push(p);
+  }
+  return [...nodes].map(([id, n]) => `<optgroup label="${esc(`On ${n.name} (OAIY Network${n.online ? "" : ", offline"})`)}">${n.list.map(p => {
+    const value = `node:${id}:${p.model}`;
+    return `<option value="${esc(value)}" data-node="${esc(id)}" data-node-name="${esc(n.name)}" data-model="${esc(p.model)}" ${value === kept ? "selected" : ""}>${esc(p.model)} · ${esc(n.name)}${!p.ready && n.online ? " (its engines are not answering)" : ""}</option>`;
+  }).join("")}</optgroup>`).join("");
+}
+// The model a Playground menu has chosen: this computer's (by its name), or a paired computer's (and which).
+function chosen(sel) {
+  const o = $(sel).selectedOptions[0];
+  return o?.dataset.node ? {node: o.dataset.node, nodeName: o.dataset.nodeName, model: o.dataset.model} : {node: null, model: $(sel).value || undefined};
+}
+// Where a Playground request goes: this computer's own route for `target`, or the paired computer's, through here.
+const playUrl = (c, target) => c.node ? `/api/play/node/${encodeURIComponent(c.node)}/${target}` : `/api/play/${target}`;
 function renderSelects() {
-  const opts = (names, def) => names.map(n => `<option ${n === def ? "selected" : ""}>${esc(n)}</option>`).join("") || "<option value=''>No model yet (see Get models)</option>";
+  // (this computer's models under a group of their own where a paired computer's are offered too)
+  const opts = (kind, names, def, kept) => {
+    const own = names.map(n => `<option ${n === (kept || def) ? "selected" : ""}>${esc(n)}</option>`).join(""), peers = peerGroups(kind, kept);
+    if (!own && !peers) return "<option value=''>No model yet (see Get models)</option>";
+    return (own && peers ? `<optgroup label="On this computer">${own}</optgroup>` : own) + peers;
+  };
   const keep = id => $(id).value;
+  const on = section => Object.keys(section?.models || {}).filter(n => section.models[n].enabled !== false);
   const c = keep("#chat-model"), i = keep("#img-model"), v = keep("#vid-model");
-  $("#chat-model").innerHTML = opts(cfg.llm.models.filter(m => m.enabled !== false).map(m => m.name), c || cfg.llm.default_model);
-  $("#img-model").innerHTML = opts(Object.keys(cfg.media.image.models).filter(n => cfg.media.image.models[n].enabled !== false), i || cfg.media.image.default_model);
-  $("#vid-model").innerHTML = opts(Object.keys(cfg.media.video.models).filter(n => cfg.media.video.models[n].enabled !== false), v || cfg.media.video.default_model);
-  const spm = cfg.media.speech?.models || {}, sv = keep("#sp-model");
-  $("#sp-model").innerHTML = opts(Object.keys(spm).filter(n => spm[n].enabled !== false), sv || cfg.media.speech?.default_model);
-  const mum = cfg.media.music?.models || {}, mv = keep("#mu-model");
-  $("#mu-model").innerHTML = opts(Object.keys(mum).filter(n => mum[n].enabled !== false), mv || cfg.media.music?.default_model);
-  const sfm = cfg.media.sound?.models || {}, sfv = keep("#sfx-model");
-  $("#sfx-model").innerHTML = opts(Object.keys(sfm).filter(n => sfm[n].enabled !== false), sfv || cfg.media.sound?.default_model);
-  const m3m = cfg.media.model3d?.models || {}, m3v = keep("#m3d-model");
-  $("#m3d-model").innerHTML = opts(Object.keys(m3m).filter(n => m3m[n].enabled !== false), m3v || cfg.media.model3d?.default_model);
+  $("#chat-model").innerHTML = opts("llm", cfg.llm.models.filter(m => m.enabled !== false).map(m => m.name), cfg.llm.default_model, c);
+  $("#img-model").innerHTML = opts("image", on(cfg.media.image), cfg.media.image.default_model, i);
+  $("#vid-model").innerHTML = opts("video", on(cfg.media.video), cfg.media.video.default_model, v);
+  $("#sp-model").innerHTML = opts("speech", on(cfg.media.speech), cfg.media.speech?.default_model, keep("#sp-model"));
+  $("#mu-model").innerHTML = opts("music", on(cfg.media.music), cfg.media.music?.default_model, keep("#mu-model"));
+  $("#sfx-model").innerHTML = opts("sound", on(cfg.media.sound), cfg.media.sound?.default_model, keep("#sfx-model"));
+  $("#m3d-model").innerHTML = opts("model3d", on(cfg.media.model3d), cfg.media.model3d?.default_model, keep("#m3d-model"));
   segment($("#img-tier"), imgTier ||= cfg.media.image.memory || "auto", t => imgTier = t);
   segment($("#vid-tier"), vidTier ||= cfg.media.video.memory || "auto", t => vidTier = t);
-  renderSound();
+  renderSound(); renderImageHints();
+  if ($("#chat-empty")) chatEmpty();
+}
+// What the Image tab offers for the model chosen, as its family takes it (`media::image_request`): pictures to edit,
+// and how many, and a negative prompt. A paired computer's model's family is that computer's to know: offered, and
+// that computer says where it does not take one.
+const IMAGE_FAMILIES = {"qwen-image": {refs: 3, negative: false}, "flux3-klein": {refs: 10, negative: false}, "flux2-klein-4b": {refs: 0, negative: false}, sdxl: {refs: 0, negative: true}, "moss-image": {refs: 0, negative: true}};
+function imageTakes() {
+  const c = chosen("#img-model");
+  const m = c.node ? null : cfg?.media?.image?.models?.[c.model];
+  if (!m) return {refs: 3, negative: true, paired: !!c.node};
+  const f = IMAGE_FAMILIES[m.architecture || "qwen-image"] || {refs: 3, negative: false};
+  // (MOSS-Image's distillation makes its pictures without a negative branch)
+  return {refs: f.refs, negative: f.negative && !(m.architecture === "moss-image" && (m.distill || "").trim()), paired: false};
+}
+function renderImageHints() {
+  const t = imageTakes();
+  $("#img-drop").hidden = !t.refs;
+  if (!t.refs && $("#img-refs").files.length) clearImgRefs();
+  const words = `Drop up to ${t.refs} image${t.refs === 1 ? "" : "s"} here to edit them, or click to choose${t.paired ? " (where that computer's model edits pictures)" : ""}`;
+  $("#img-drop").setAttribute("aria-label", words);
+  if (!$("#img-refs").files.length) $("#img-drop-label").textContent = words;
+  $("#img-neg-row").hidden = !t.negative;
+  $("#img-empty span").textContent = t.refs ? "Write a prompt and generate. Drop in pictures to edit them instead." : "Write a prompt and generate.";
 }
 let imgTier = "", vidTier = "";
 
@@ -2402,12 +2623,16 @@ $("#chat-input").addEventListener("input", autoGrow);
 function addMsg(role, text = "") {
   $("#chat-empty")?.remove();
   const el = document.createElement("div"); el.className = "msg " + role;
-  el.innerHTML = role === "user" ? esc(text) : `<div class="who">${esc($("#chat-model").value || "Assistant")}</div><div class="think" hidden></div><div class="body"></div><div class="meta"></div><div class="actions"><button class="btn quiet copy-msg">Copy reply</button></div>`;
+  const c = chosen("#chat-model");
+  el.innerHTML = role === "user" ? esc(text) : `<div class="who">${esc(c.node ? `${c.model} · ${c.nodeName}` : c.model || "Assistant")}</div><div class="think" hidden></div><div class="body"></div><div class="meta"></div><div class="actions"><button class="btn quiet copy-msg">Copy reply</button></div>`;
   $("#msgs").append(el); el.scrollIntoView({block: "end"}); return el;
 }
 async function sendChat() {
   if (chatAbort) return; // one reply at a time; Enter must not start a second
   const text = $("#chat-input").value.trim(); if (!text) return;
+  // (no language model here, nor a paired computer's: nothing to send it to, and the conversation says where to get one)
+  if (!$("#chat-model").value) { chatEmpty(); return toast("There is no language model to answer yet: get one under Get models", true); }
+  const c = chosen("#chat-model");
   $("#chat-input").value = ""; autoGrow(); $("#chat-send").disabled = true;
   chatAbort = new AbortController(); $("#chat-stop").hidden = false;
   // (a screen reader hears the reply once it is whole, not each time it grows)
@@ -2417,14 +2642,14 @@ async function sendChat() {
   // A turn that produced nothing leaves the conversation; its bubble says so.
   const unsend = () => { if (!ours()) return; chatLog.pop(); sent.classList.add("unsent"); sent.title = "Not part of the conversation: the model did not answer it"; if (!$("#chat-input").value) { $("#chat-input").value = text; autoGrow(); } };
   const el = addMsg("assistant"), body = $(".body", el), think = $(".think", el), meta = $(".meta", el);
-  meta.textContent = state?.llm?.state === "ready" ? "Thinking..." : "Loading the model (the first reply takes longer)...";
-  const t0 = performance.now(); let content = "", reasoning = "", tokens = 0, drawn = 0;
+  meta.textContent = c.node ? `Asking ${c.nodeName}…` : state?.llm?.state === "ready" ? "Thinking…" : "Loading the model (the first reply takes longer)…";
+  const t0 = performance.now(); let content = "", reasoning = "", tokens = 0, drawn = 0, written = 0;
   $(".copy-msg", el).onclick = () => navigator.clipboard.writeText(content).then(() => toast("Copied"));
   const system = $("#chat-system").value.trim();
   const messages = system ? [{role: "system", content: system}, ...chatLog] : chatLog;
   try {
-    const r = await fetch("/api/play/chat", {method: "POST", signal: chatAbort.signal, headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-OAIY-Incognito": "1"} : {}),
-      body: JSON.stringify({model: $("#chat-model").value || undefined, messages, stream: true, ...($("#chat-think").checked ? {reasoning_effort: "medium"} : {})})});
+    const r = await fetch(playUrl(c, "chat"), {method: "POST", signal: chatAbort.signal, headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-OAIY-Incognito": "1"} : {}),
+      body: JSON.stringify({model: c.model, messages, stream: true, stream_options: {include_usage: true}, ...($("#chat-think").checked ? {reasoning_effort: "medium"} : {})})});
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e?.error?.message || r.statusText); }
     const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
     for (;;) {
@@ -2438,6 +2663,7 @@ async function sendChat() {
           const data = line.slice(5).trim(); if (data === "[DONE]") continue;
           let j; try { j = JSON.parse(data); } catch { continue; }
           if (j.oaiy_progress) meta.textContent = `Reading the prompt: ${j.oaiy_progress.prompt_done} / ${j.oaiy_progress.prompt_total} tokens`;
+          if (j.usage?.completion_tokens) written = j.usage.completion_tokens;
           const d = j.choices?.[0]?.delta; if (!d) continue;
           if (d.reasoning_content) { reasoning += d.reasoning_content; think.hidden = false; think.textContent = reasoning; }
           if (d.content) { content += d.content; tokens++; if (performance.now() - drawn > 60) { renderReply(el, content); drawn = performance.now(); } }
@@ -2447,7 +2673,8 @@ async function sendChat() {
     }
     renderReply(el, content);
     const secs = (performance.now() - t0) / 1000;
-    meta.textContent = `${secs.toFixed(1)} s, about ${(tokens / secs).toFixed(1)} chunks/s`;
+    // (its speed in tokens where the reply says how many it wrote; the pieces of a stream are not tokens)
+    meta.textContent = written ? `${secs.toFixed(1)} s, ${written} tokens, about ${(written / secs).toFixed(1)} a second` : `${secs.toFixed(1)} s`;
     if (ours()) chatLog.push({role: "assistant", content});
   } catch (e) {
     if (!ours()) {
@@ -2466,10 +2693,19 @@ $("#chat-stop").onclick = () => chatAbort?.abort();
 $("#chat-input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } };
 const SUGGESTIONS = ["Explain how mixture-of-experts models save memory, briefly.", "Write a haiku about a lighthouse in fog.", "Give me three dinner ideas using rice and eggs.", "Summarise the plot of Hamlet in four sentences."];
 function chatEmpty() {
-  $("#msgs").innerHTML = `<div class="chat-empty" id="chat-empty"><h2>Start a conversation</h2><span>The model loads on the first message, so the first reply takes longer.</span>
+  // (with no language model, here or on a paired computer, nothing would answer: said, with where to get one)
+  if (cfg && !$("#chat-model").value) {
+    $("#msgs").innerHTML = `<div class="chat-empty" id="chat-empty"><h2>No language model yet</h2><span>Get models downloads a ready-to-run chat model and sets it up; then chat with it here.</span>
+      <button class="btn go" type="button" data-goto="get">Get models</button></div>`;
+    return;
+  }
+  const c = cfg ? chosen("#chat-model") : {node: null};
+  const loads = c.node ? `Answered on ${c.nodeName}, over OAIY Network.` : state?.llm?.state === "ready" ? "" : "The model loads on the first message, so the first reply takes longer.";
+  $("#msgs").innerHTML = `<div class="chat-empty" id="chat-empty"><h2>Start a conversation</h2>${loads ? `<span>${esc(loads)}</span>` : ""}
     <div class="suggest">${SUGGESTIONS.map(t => `<button type="button">${esc(t)}</button>`).join("")}</div></div>`;
   $$("#chat-empty .suggest button").forEach(b => b.onclick = () => { $("#chat-input").value = b.textContent; autoGrow(); $("#chat-input").focus(); });
 }
+$("#chat-model").addEventListener("change", () => { if ($("#chat-empty")) chatEmpty(); });
 chatEmpty();
 $("#chat-clear").onclick = () => { chatGen++; chatAbort?.abort(); chatLog = []; chatEmpty(); $("#chat-input").focus(); };
 
@@ -2499,14 +2735,16 @@ renderShapes("img"); renderShapes("vid");
 // Reference images: drop, paste or pick; previews in the zone.
 function dropzone(k, input, max) {
   const zone = $(`#${k}-drop`), label = $(`#${k}-drop-label`), initial = label.textContent;
+  // (a limit of its own, or the chosen model's: FLUX 3 takes ten pictures, Qwen Image three)
+  const most = () => typeof max === "function" ? max() : max;
   const show = () => {
-    const files = [...input.files].slice(0, max);
+    const files = [...input.files].slice(0, most());
     $$(`#${k}-ref-preview img`).forEach(i => URL.revokeObjectURL(i.src));
     $(`#${k}-ref-preview`).innerHTML = files.map(f => `<img src="${URL.createObjectURL(f)}" alt="${esc(f.name)}">`).join("");
-    label.textContent = files.length ? `${files.length} image${files.length > 1 ? "s" : ""} (click to change, or drop others)` : initial;
+    label.textContent = files.length ? `${files.length} image${files.length > 1 ? "s" : ""} (click to change, or drop others)` : zone.getAttribute("aria-label") || initial;
     if (k === "img") $("#img-go").textContent = files.length ? "Edit" : "Generate";
   };
-  const take = list => { const dt = new DataTransfer(); [...list].filter(f => f.type.startsWith("image/")).slice(0, max).forEach(f => dt.items.add(f)); input.files = dt.files; show(); };
+  const take = list => { const dt = new DataTransfer(); [...list].filter(f => f.type.startsWith("image/")).slice(0, most()).forEach(f => dt.items.add(f)); input.files = dt.files; show(); };
   zone.onclick = () => input.click();
   zone.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } };
   input.onchange = show;
@@ -2516,7 +2754,7 @@ function dropzone(k, input, max) {
   zone.oncontextmenu = e => { if (input.files.length) { e.preventDefault(); input.value = ""; show(); } };
   return () => { input.value = ""; show(); };
 }
-const clearImgRefs = dropzone("img", $("#img-refs"), 3);
+const clearImgRefs = dropzone("img", $("#img-refs"), () => imageTakes().refs || 3);
 const clearVidRef = dropzone("vid", $("#vid-image"), 1);
 const clearVidEnd = dropzone("vend", $("#vid-end-image"), 1);
 dropzone("m3d", $("#m3d-image"), 1);
@@ -2551,6 +2789,7 @@ function soundCapable() {
 }
 function renderSound() { $("#vid-sound-row").hidden = !soundCapable(); renderSoundtrack(); }
 $("#vid-model").addEventListener("change", renderSound);
+$("#img-model").addEventListener("change", renderImageHints);
 ["img", "vid"].forEach(k => $(`#${k}-prompt`).addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $(`#${k}-form`).requestSubmit(); } }));
 
 // The stage shows one result large; the strip keeps this session's.
@@ -2561,7 +2800,7 @@ function stageShow(k, item) {
   $(".expiry", stage)?.remove(); $(".gone", stage)?.remove();
   const media = item.video ? `<video class="shown" src="${esc(item.url)}" poster="${esc(item.poster || "")}" controls autoplay loop playsinline></video>` : `<img class="shown" src="${esc(item.url)}" alt="${esc(item.prompt)}">`;
   if (item.expires) stage.insertAdjacentHTML("afterbegin", `<div class="expiry">Incognito: deleted at ${new Date(item.expires).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}. Save it to keep it.</div>`);
-  stage.insertAdjacentHTML("afterbegin", media + `<div class="actions"><a class="btn" href="${esc(item.url)}" target="_blank">Open</a><a class="btn" href="${esc(item.url)}" download>Save</a><button class="btn" type="button" data-reuse>Reuse prompt</button></div>`);
+  stage.insertAdjacentHTML("afterbegin", media + `<div class="actions"><a class="btn" href="${esc(item.url)}" target="_blank" data-open>Open</a><a class="btn" href="${esc(item.url)}" download>Save</a><button class="btn" type="button" data-reuse>Reuse prompt</button></div>`);
   $("[data-reuse]", stage).onclick = () => { $(`#${k}-prompt`).value = item.prompt; $(`#${k}-prompt`).focus(); };
   $(".shown", stage).onerror = () => {
     $$(".shown, .actions, .expiry", stage).forEach(x => x.remove());
@@ -2585,7 +2824,8 @@ function progress(k, text, pct) {
   if (text === null) { bar.hidden = true; return; }
   bar.hidden = false; $(`#${k}-progress-text`).textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
-let imgJobId = null, vidJobId = null;
+// (`vidRoute`: a paired computer's videos route where the clip being made is that computer's job, cancelled there)
+let imgJobId = null, vidJobId = null, vidRoute = null;
 // The job a request of this page's made, found once and then followed: one of `kind` that was not there before the
 // request, with its prompt where the list says it (another app's job of the same kind is not this one, nor is its
 // Cancel this one's).
@@ -2612,27 +2852,32 @@ function watchJob(kind, prompt) {
   return () => { clearInterval(tick); progress("img", null); imgJobId = null; };
 }
 $("#img-cancel").onclick = () => imgJobId && api(`/api/jobs/${imgJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
-$("#vid-cancel").onclick = () => vidJobId && api(`/api/jobs/${vidJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#vid-cancel").onclick = () => vidJobId && api(vidRoute ? `${vidRoute}/${vidJobId}` : `/api/jobs/${vidJobId}/cancel`, {method: vidRoute ? "DELETE" : "POST"}).then(refresh, e => toast(e.message, true));
 // Incognito results are deleted this long after they finish (see media.rs).
 const expiry = kind => saved?.privacy?.incognito ? Date.now() + (kind === "vid" ? 30 : 10) * 60000 : 0;
 $("#img-form").onsubmit = async e => {
   e.preventDefault();
-  const body = {prompt: $("#img-prompt").value, model: $("#img-model").value || undefined, size: $("#img-size").value, n: +$("#img-n").value || 1, memory: imgTier, response_format: "url"};
-  const refs = [...$("#img-refs").files].slice(0, 3);
+  const c = chosen("#img-model");
+  const body = {prompt: $("#img-prompt").value, model: c.model, size: $("#img-size").value, n: +$("#img-n").value || 1, memory: imgTier, response_format: "url"};
+  const refs = $("#img-drop").hidden ? [] : [...$("#img-refs").files].slice(0, imageTakes().refs || 3);
   if (refs.length) body.images = await Promise.all(refs.map(async f => ({image_url: await readAsDataUrl(f)})));
   if ($("#img-steps").value) body.steps = +$("#img-steps").value;
   if ($("#img-seed").value) body.seed = +$("#img-seed").value;
-  if ($("#img-neg").value) body.negative_prompt = $("#img-neg").value;
-  $("#img-go").disabled = true; progress("img", "Starting", 1); const stop = watchJob("image", body.prompt);
+  if ($("#img-neg").value && !$("#img-neg-row").hidden) body.negative_prompt = $("#img-neg").value;
+  // (a paired computer's picture is made there, its progress that computer's: said, with no Cancel for a job it names)
+  $("#img-go").disabled = true; progress("img", c.node ? `Making it on ${c.nodeName}…` : "Starting", c.node ? 5 : 1); $("#img-cancel").hidden = !!c.node;
+  const stop = c.node ? () => { progress("img", null); $("#img-cancel").hidden = false; } : watchJob("image", body.prompt);
   try {
-    const r = await api(refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
+    // (an edit on a paired computer is a picture request with its pictures in it, as its picture route takes it)
+    const r = await api(c.node ? playUrl(c, "images") : refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
     stageAdd("img", r.data.map(d => ({url: fileUrl(d.url), prompt: body.prompt, expires: expiry("img")})));
   } catch (err) { toast(err.message, true); }
   stop(); $("#img-go").disabled = false; refresh();
 };
 $("#vid-form").onsubmit = async e => {
   e.preventDefault();
-  const body = {prompt: $("#vid-prompt").value, model: $("#vid-model").value || undefined, size: $("#vid-size").value, memory: vidTier};
+  const c = chosen("#vid-model");
+  const body = {prompt: $("#vid-prompt").value, model: c.model, size: $("#vid-size").value, memory: vidTier};
   if ($("#vid-secs").value) body.seconds = $("#vid-secs").value;
   if ($("#vid-seed").value) body.seed = +$("#vid-seed").value;
   const mode = soundCapable() ? $("#vid-soundtrack").value : "none";
@@ -2657,21 +2902,23 @@ $("#vid-form").onsubmit = async e => {
   const f = $("#vid-image").files[0]; if (f) body.input_reference = {image_url: await readAsDataUrl(f)};
   const fe = $("#vid-end-image").files[0]; if (fe) body.end_image = {image_url: await readAsDataUrl(fe)};
   $("#vid-go").disabled = true; progress("vid", "Starting", 1);
+  // (a paired computer's clip is that computer's job: followed by its own polls, not this computer's list)
+  const route = playUrl(c, "videos");
   try {
-    let v = await api("/api/play/videos", {method: "POST", body});
-    vidJobId = v.id;
+    let v = await api(route, {method: "POST", body});
+    vidJobId = v.id; vidRoute = c.node ? route : null;
     while (v.status === "queued" || v.status === "in_progress") {
-      const j = state?.media?.jobs?.find(j => j.id === v.id);
-      progress("vid", v.status === "queued" ? "Waiting for the GPU" : `${v.progress}%` + (j ? ", " + j.stage.replace(/_/g, " ") : ""), v.progress);
+      const j = c.node ? null : state?.media?.jobs?.find(j => j.id === v.id);
+      progress("vid", v.status === "queued" ? (c.node ? `Waiting for ${c.nodeName}'s GPU` : "Waiting for the GPU") : `${v.progress}%` + (j ? ", " + j.stage.replace(/_/g, " ") : c.node ? ` on ${c.nodeName}` : ""), v.progress);
       await new Promise(r => setTimeout(r, 1500));
-      v = await api("/api/play/videos/" + v.id);
+      v = await api(`${route}/${v.id}`);
     }
     if (v.status !== "completed") throw new Error(v.error?.message || "the video failed");
     await refresh();
-    const j = state.media.jobs.find(j => j.id === v.id);
-    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`/api/play/videos/${v.id}/content`), poster: j?.preview, prompt: body.prompt, video: true, expires: expiry("vid")}]);
+    const j = c.node ? null : state.media.jobs.find(j => j.id === v.id);
+    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`${route}/${v.id}/content`), poster: j?.preview, prompt: body.prompt, video: true, expires: c.node ? 0 : expiry("vid")}]);
   } catch (err) { toast(err.message, true); }
-  vidJobId = null; progress("vid", null); $("#vid-go").disabled = false;
+  vidJobId = null; vidRoute = null; progress("vid", null); $("#vid-go").disabled = false;
 };
 
 /* ---------- speech ---------- */
@@ -2745,32 +2992,36 @@ $("#sp-form").onsubmit = async e => {
   e.preventDefault();
   const voice = $("#sp-voice").value, describe = voice === "__describe";
   const seed = $("#sp-seed").value ? +$("#sp-seed").value : Math.floor(Math.random() * 2e9);
-  const body = {model: $("#sp-model").value || undefined, input: $("#sp-input").value, language: $("#sp-lang").value, speed: +$("#sp-speed").value || 1, seed, response_format: "wav"};
+  const c = chosen("#sp-model");
+  const body = {model: c.model, input: $("#sp-input").value, language: $("#sp-lang").value, speed: +$("#sp-speed").value || 1, seed, response_format: "wav"};
   if (describe) {
     if (!$("#sp-desc").value.trim()) return toast("Describe the voice first, or pick one", true);
     body.instructions = $("#sp-desc").value.trim();
   } else body.voice = voice;
-  $("#sp-go").disabled = true; spProgress("Starting", 1); const stop = watchSpeech(body.input);
+  $("#sp-go").disabled = true; spProgress(c.node ? `Speaking on ${c.nodeName}…` : "Starting", c.node ? 5 : 1); $("#sp-cancel").hidden = !!c.node;
+  const stop = c.node ? () => { spProgress(null); $("#sp-cancel").hidden = false; } : watchSpeech(body.input);
   try {
-    const r = await fetch("/api/play/speech", {method: "POST", headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-OAIY-Incognito": "1"} : {}), body: JSON.stringify(body)});
+    const r = await fetch(playUrl(c, "speech"), {method: "POST", headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-OAIY-Incognito": "1"} : {}), body: JSON.stringify(body)});
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j?.error?.message || r.statusText); }
     const url = URL.createObjectURL(await r.blob());
-    const spoken = describe && body.speed === 1 ? {description: body.instructions, input: body.input, language: body.language, seed, model: body.model} : null;
-    addSpeech(body.input, url, describe ? "Described voice" : voice, spoken);
+    // (a voice is saved on this computer, by its own speech model: not offered for a paired computer's)
+    const spoken = describe && body.speed === 1 && !c.node ? {description: body.instructions, input: body.input, language: body.language, seed, model: body.model} : null;
+    addSpeech(body.input, url, (describe ? "Described voice" : voice) + (c.node ? ` · ${c.nodeName}` : ""), spoken);
   } catch (err) { toast(err.message, true); }
   stop(); $("#sp-go").disabled = false; refresh();
 };
 
 /* ---------- music ---------- */
 const MUSIC_STAGES = {loading_music_model: "Loading the model", composing: "Writing the song", loading_renderer: "Loading the renderer", rendering: "Rendering the audio"};
-let muJobId = null;
+// (the route its job is followed on: this computer's, or a paired computer's through here)
+let muJobId = null, muRoute = "/api/play/music";
 function muProgress(text, pct) {
   const bar = $("#mu-progress");
   if (text === null) { bar.hidden = true; return; }
   bar.hidden = false; $("#mu-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
 $("#mu-instrumental").onchange = () => { $("#mu-lyrics").disabled = $("#mu-instrumental").checked; };
-$("#mu-cancel").onclick = () => muJobId && api(`/api/play/music/${muJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#mu-cancel").onclick = () => muJobId && api(`${muRoute}/${muJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
 function addSong(song, url) {
   $("#mu-empty").hidden = true; $("#mu-results").hidden = false;
   const el = document.createElement("div"); el.className = "sp-item";
@@ -2785,37 +3036,39 @@ $("#mu-form").onsubmit = async e => {
   const instrumental = $("#mu-instrumental").checked, lyrics = $("#mu-lyrics").value.trim();
   if (!instrumental && !lyrics) return toast("Add lyrics, or tick Instrumental", true);
   const seed = $("#mu-seed").value ? +$("#mu-seed").value : Math.floor(Math.random() * 2e9);
-  const body = {model: $("#mu-model").value || undefined, prompt: $("#mu-prompt").value.trim(), duration: +$("#mu-seconds").value || 60, seed, steps: +$("#mu-steps").value || 30};
+  const c = chosen("#mu-model");
+  const body = {model: c.model, prompt: $("#mu-prompt").value.trim(), duration: +$("#mu-seconds").value || 60, seed, steps: +$("#mu-steps").value || 30};
   if (instrumental) body.instrumental = true; else body.lyrics = lyrics;
   $("#mu-go").disabled = true; muProgress("Starting", 1);
   const headers = Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-OAIY-Incognito": "1"} : {});
   try {
-    const r = await fetch("/api/play/music", {method: "POST", headers, body: JSON.stringify(body)});
+    muRoute = playUrl(c, "music");
+    const r = await fetch(muRoute, {method: "POST", headers, body: JSON.stringify(body)});
     let job = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(job?.error?.message || r.statusText);
     muJobId = job.id;
     while (job.status === "queued" || job.status === "in_progress") {
       await new Promise(ok => setTimeout(ok, 1000));
-      job = await api(`/api/play/music/${job.id}`);
-      const live = [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.id === job.id);
+      job = await api(`${muRoute}/${job.id}`);
+      const live = c.node ? job : [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.id === job.id);
       const stage = live?.stage && MUSIC_STAGES[live.stage];
-      muProgress(job.status === "queued" ? "Waiting for the GPU" : `${job.progress}%${stage ? ", " + stage.toLowerCase() : ""}`, job.progress);
+      muProgress(job.status === "queued" ? (c.node ? `Waiting for ${c.nodeName}'s GPU` : "Waiting for the GPU") : `${job.progress}%${stage ? ", " + stage.toLowerCase() : c.node ? " on " + c.nodeName : ""}`, job.progress);
     }
     if (job.status !== "completed") throw new Error(job.error?.message || `The song ${job.status}`);
-    addSong(job, fileUrl(`/api/play/music/${job.id}/content`));
+    addSong(job, fileUrl(`${muRoute}/${job.id}/content`));
   } catch (err) { toast(err.message, true); }
   muJobId = null; muProgress(null); $("#mu-go").disabled = false; refresh();
 };
 
 /* ---------- sound effects ---------- */
 const SOUND_STAGES = {encoding_prompt: "Reading the description", loading_sound_model: "Loading the model", generating_sound: "Generating", decoding_sound: "Decoding the audio"};
-let sfxJobId = null;
+let sfxJobId = null, sfxRoute = "/api/play/sound";
 function sfxProgress(text, pct) {
   const bar = $("#sfx-progress");
   if (text === null) { bar.hidden = true; return; }
   bar.hidden = false; $("#sfx-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
-$("#sfx-cancel").onclick = () => sfxJobId && api(`/api/play/sound/${sfxJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#sfx-cancel").onclick = () => sfxJobId && api(`${sfxRoute}/${sfxJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
 $("#sfx-prompt").onkeydown = e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#sfx-form").requestSubmit(); } };
 function addSound(effect, url) {
   $("#sfx-empty").hidden = true; $("#sfx-results").hidden = false;
@@ -2827,23 +3080,25 @@ function addSound(effect, url) {
 $("#sfx-form").onsubmit = async e => {
   e.preventDefault();
   const seed = $("#sfx-seed").value ? +$("#sfx-seed").value : Math.floor(Math.random() * 2e9);
-  const body = {model: $("#sfx-model").value || undefined, prompt: $("#sfx-prompt").value.trim(), seconds: +$("#sfx-seconds").value || 10, seed, steps: +$("#sfx-steps").value || 100};
+  const c = chosen("#sfx-model");
+  const body = {model: c.model, prompt: $("#sfx-prompt").value.trim(), seconds: +$("#sfx-seconds").value || 10, seed, steps: +$("#sfx-steps").value || 100};
   $("#sfx-go").disabled = true; sfxProgress("Starting", 1);
   const headers = Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-OAIY-Incognito": "1"} : {});
   try {
-    const r = await fetch("/api/play/sound", {method: "POST", headers, body: JSON.stringify(body)});
+    sfxRoute = playUrl(c, "sound");
+    const r = await fetch(sfxRoute, {method: "POST", headers, body: JSON.stringify(body)});
     let job = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(job?.error?.message || r.statusText);
     sfxJobId = job.id;
     while (job.status === "queued" || job.status === "in_progress") {
       await new Promise(ok => setTimeout(ok, 1000));
-      job = await api(`/api/play/sound/${job.id}`);
-      const live = [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.id === job.id);
+      job = await api(`${sfxRoute}/${job.id}`);
+      const live = c.node ? job : [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.id === job.id);
       const stage = live?.stage && SOUND_STAGES[live.stage];
-      sfxProgress(job.status === "queued" ? "Waiting for the GPU" : `${job.progress}%${stage ? ", " + stage.toLowerCase() : ""}`, job.progress);
+      sfxProgress(job.status === "queued" ? (c.node ? `Waiting for ${c.nodeName}'s GPU` : "Waiting for the GPU") : `${job.progress}%${stage ? ", " + stage.toLowerCase() : c.node ? " on " + c.nodeName : ""}`, job.progress);
     }
     if (job.status !== "completed") throw new Error(job.error?.message || `The sound effect ${job.status}`);
-    addSound(job, fileUrl(`/api/play/sound/${job.id}/content`));
+    addSound(job, fileUrl(`${sfxRoute}/${job.id}/content`));
   } catch (err) { toast(err.message, true); }
   sfxJobId = null; sfxProgress(null); $("#sfx-go").disabled = false; refresh();
 };
@@ -2851,17 +3106,17 @@ $("#sfx-form").onsubmit = async e => {
 /* ---------- 3D models ---------- */
 const M3D_STAGES = {preparing_image: "Cutting out the object", encoding_image: "Reading the picture", making_structure: "Making the structure", making_shape: "Making the shape",
   making_texture: "Making the texture", decoding: "Decoding", meshing: "Making the mesh"};
-let m3dJobId = null;
+let m3dJobId = null, m3dRoute = "/api/play/model3d";
 function m3dProgress(text, pct) {
   const bar = $("#m3d-progress");
   if (text === null) { bar.hidden = true; return; }
   bar.hidden = false; $("#m3d-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
-$("#m3d-cancel").onclick = () => m3dJobId && api(`/api/play/model3d/${m3dJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#m3d-cancel").onclick = () => m3dJobId && api(`${m3dRoute}/${m3dJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
 // A finished model: the picture as it was cut out, its numbers, and the GLB.
-function addModel3d(job) {
+function addModel3d(job, route = "/api/play/model3d") {
   $("#m3d-empty").hidden = true; $("#m3d-results").hidden = false;
-  const input = fileUrl(`/api/play/model3d/${job.id}/input`), glb = fileUrl(`/api/play/model3d/${job.id}/content`);
+  const input = fileUrl(`${route}/${job.id}/input`), glb = fileUrl(`${route}/${job.id}/content`);
   const rows = [["Faces", job.faces?.toLocaleString()], ["Vertices", job.vertices?.toLocaleString()], ["Size", job.bytes ? fmtSize(job.bytes) : null],
     ["Took", job.seconds_taken ? job.seconds_taken.toFixed(0) + " s" : null], ["Resolution", job.resolution], ["Seed", job.seed],
     ["Background", job.matte === "alpha" ? "the picture's own transparency" : job.matte === "birefnet" ? "removed (BiRefNet)" : job.matte === "background" ? "cut away" : null],
@@ -2880,19 +3135,21 @@ $("#m3d-form").onsubmit = async e => {
   $("#m3d-go").disabled = true; m3dProgress("Starting", 1);
   const headers = Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-OAIY-Incognito": "1"} : {});
   try {
-    const body = {model: $("#m3d-model").value || undefined, image: await readAsDataUrl(f), resolution: +$("#m3d-resolution").value || 1024, faces: +$("#m3d-faces").value || 200000, seed};
-    const r = await fetch("/api/play/model3d", {method: "POST", headers, body: JSON.stringify(body)});
+    const c = chosen("#m3d-model");
+    const body = {model: c.model, image: await readAsDataUrl(f), resolution: +$("#m3d-resolution").value || 1024, faces: +$("#m3d-faces").value || 200000, seed};
+    m3dRoute = playUrl(c, "model3d");
+    const r = await fetch(m3dRoute, {method: "POST", headers, body: JSON.stringify(body)});
     let job = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(job?.error?.message || r.statusText);
     m3dJobId = job.id;
     while (job.status === "queued" || job.status === "in_progress") {
       await new Promise(ok => setTimeout(ok, 1000));
-      job = await api(`/api/play/model3d/${job.id}`);
+      job = await api(`${m3dRoute}/${job.id}`);
       const stage = M3D_STAGES[job.stage];
-      m3dProgress(job.status === "queued" ? "Waiting for the GPU" : `${job.progress}%${stage ? ", " + stage.toLowerCase() : ""}`, job.progress);
+      m3dProgress(job.status === "queued" ? (c.node ? `Waiting for ${c.nodeName}'s GPU` : "Waiting for the GPU") : `${job.progress}%${stage ? ", " + stage.toLowerCase() : c.node ? " on " + c.nodeName : ""}`, job.progress);
     }
     if (job.status !== "completed") throw new Error(job.error?.message || `The 3D model ${job.status}`);
-    addModel3d(job);
+    addModel3d(job, m3dRoute);
   } catch (err) { toast(err.message, true); }
   m3dJobId = null; m3dProgress(null); $("#m3d-go").disabled = false; refresh();
 };
@@ -2903,11 +3160,11 @@ let galleryJobs = [], galleryFilter = "all";
 const nothingYet = '<div class="empty">Nothing generated yet. <button class="btn quiet" type="button" data-goto="play">Open the Playground</button></div>';
 const galleryEmpty = {all: nothingYet, image: '<div class="empty">No images in the list.</div>', video: '<div class="empty">No videos in the list.</div>',
   speech: '<div class="empty">No speech in the list.</div>', music: '<div class="empty">No songs in the list.</div>', sound: '<div class="empty">No sound effects in the list.</div>',
-  model3d: '<div class="empty">No 3D models in the list.</div>', active: '<div class="empty">Nothing is being made right now.</div>', failed: '<div class="empty">Nothing has failed.</div>'};
+  model3d: '<div class="empty">No 3D models in the list.</div>', picture: '<div class="empty">No picture tool results in the list.</div>', active: '<div class="empty">Nothing is being made right now.</div>', failed: '<div class="empty">Nothing has failed.</div>'};
 async function refreshGallery() { try { galleryJobs = keyed((await api("/api/jobs")).jobs); renderGallery(); } catch (e) { toast(e.message, true); } }
 function renderGallery(fresh) {
   if (fresh) { const byId = new Map(galleryJobs.map(j => [j.id, j])); fresh.forEach(j => byId.set(j.id, j)); galleryJobs = [...byId.values()].sort((a, b) => b.created_at - a.created_at); }
-  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech", music: j => j.kind === "music", sound: j => j.kind === "sound", model3d: j => j.kind === "model3d",
+  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech", music: j => j.kind === "music", sound: j => j.kind === "sound", model3d: j => j.kind === "model3d", picture: j => j.kind === "picture",
     active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed"}[galleryFilter];
   const items = galleryJobs.filter(pick);
   keepRows($("#gallery"), items, j => {
@@ -2919,8 +3176,8 @@ function renderGallery(fresh) {
       : j.kind === "music" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`
       : j.kind === "sound" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13"/></svg></div>`
       : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="3D model" loading="lazy">` : `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></div>`)
-      : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(j.prompt)}" loading="lazy">`;
-    return `<figure data-job="${j.id}" tabindex="0" role="button" aria-label="Open ${esc(j.kind === "model3d" ? "the 3D model" : "the result")}">${media}<figcaption><span class="p" title="${esc(j.prompt || "")}">${esc(j.kind === "model3d" ? "3D model" : (j.prompt || "").slice(0, 240))}</span><span>${esc(j.kind === "model3d" ? j.size : j.kind === "video" || j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
+      : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(jobTitle(j))}" loading="lazy">`;
+    return `<figure data-job="${j.id}" tabindex="0" role="button" aria-label="Open ${esc(j.kind === "model3d" ? "the 3D model" : "the result")}">${media}<figcaption><span class="p" title="${esc(j.prompt || "")}">${esc(j.kind === "model3d" ? "3D model" : jobTitle(j).slice(0, 240))}</span><span>${esc(j.kind === "image" && j.files.length > 1 ? j.files.length + " images" : jobSize(j))}</span></figcaption></figure>`;
   }, galleryEmpty[galleryFilter] || galleryEmpty.all);
   $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
 }
@@ -2934,10 +3191,10 @@ function openViewer(id) {
     : j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (file ? `<div style="padding:40px;width:100%"><audio src="${esc(file)}" controls autoplay style="width:100%"></audio>${j.settings?.lyrics ? `<pre style="white-space:pre-wrap;font-size:12px;margin-top:14px">${esc(j.settings.lyrics)}</pre>` : ""}</div>` : `<div class="empty" style="padding:40px">Done</div>`)
     : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="The picture the 3D model was made from, cut out">` : `<div class="empty" style="padding:40px">Done</div>`)
     : `<img src="${esc(file)}" alt="${esc(j.prompt)}">`;
-  $("#viewer-title").textContent = j.kind === "model3d" ? "3D model" : j.kind === "video" ? "Video" : j.kind === "speech" ? "Speech" : j.kind === "music" ? "Song" : j.kind === "sound" ? "Sound effect" : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
-  $("#viewer-prompt").textContent = j.prompt;
+  $("#viewer-title").textContent = j.kind === "model3d" ? "3D model" : j.kind === "video" ? "Video" : j.kind === "speech" ? "Speech" : j.kind === "music" ? "Song" : j.kind === "sound" ? "Sound effect" : j.kind === "picture" ? pictureTitle(j) : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
+  $("#viewer-prompt").textContent = j.prompt; $("#viewer-prompt").hidden = !j.prompt;
   const st = j.settings || {}, r = j.residency?.transformer || j.residency;
-  const rows = [["Model", j.model], ["Size", j.size], ["Seed", st.seed], ["Steps", st.steps], ["Memory", st.memory],
+  const rows = [["Model", j.model], ["Size", j.kind === "picture" ? jobSize(j) : ["speech", "music", "sound"].includes(j.kind) ? null : j.size], ["Seed", st.seed], ["Steps", st.steps], ["Memory", st.memory],
     ["Placement", r && r.gpu_blocks !== undefined ? `${r.gpu_blocks} GPU, ${r.ram_blocks} ${macMemory() ? "memory" : "RAM"}, ${r.ssd_blocks} SSD blocks` : r?.mode],
     ["Length", (j.kind === "video" || j.kind === "music" || j.kind === "sound") && j.seconds ? j.seconds.toFixed(1) + " s" : null], ["Took", j.seconds_taken ? j.seconds_taken.toFixed(1) + " s" : null],
     ["Created", new Date(j.created_at * 1000).toLocaleString()], ["Status", j.status], ["Error", j.error]].filter(([, v]) => v !== null && v !== undefined && v !== "");
@@ -2946,7 +3203,7 @@ function openViewer(id) {
   const glb = j.kind === "model3d";
   // (the result's own: open, save, its other pictures; then reuse; Remove last, apart from them)
   $("#viewer-actions").innerHTML = (file && glb ? `<a class="btn" href="${esc(file)}" download="model.glb">Download GLB</a>` : file ? `<a class="btn" href="${esc(file)}" target="_blank" data-open>Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
-    + others + `<button class="btn" id="viewer-reuse"${glb ? " hidden" : ""}>Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>`;
+    + others + `<button class="btn" id="viewer-reuse"${glb || !j.prompt ? " hidden" : ""}>Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>`;
   $("#viewer-reuse").onclick = () => {
     const tab = j.kind === "video" ? "video" : j.kind === "speech" ? "speech" : j.kind === "music" ? "music" : j.kind === "sound" ? "sound" : "image";
     $(tab === "speech" ? "#sp-input" : tab === "music" ? "#mu-prompt" : tab === "sound" ? "#sfx-prompt" : `#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
@@ -2958,14 +3215,28 @@ function openViewer(id) {
     try { await api(`/api/jobs/${j.id}`, {method: "DELETE"}); } catch (e) { return toast(e.message, true); }
     galleryJobs = galleryJobs.filter(x => x.id !== j.id); $("#viewer").close(); renderGallery(); refresh();
   };
-  // In OAIY's window, which opens no other windows, an output opens in this computer's own viewer.
-  if (window.__OAIY_DESKTOP__) $$("#viewer-actions a[data-open]").forEach(a => a.onclick = e => {
-    e.preventDefault();
-    api("/api/open-file", {method: "POST", body: {url: a.getAttribute("href")}}).catch(err => toast(err.message, true));
-  });
   $("#viewer").showModal();
 }
 $("#viewer-close").onclick = () => $("#viewer").close();
+// In OAIY's window, which opens no other windows, an output's Open (the viewer's, a Recent media row's, a result's in the
+// Playground) opens it in this computer's own viewer. The page knows it is there by `in-oaiy`, set before its first
+// paint (`?in=oaiy`): the desktop's own pages' flag is theirs alone, and this one never had it. A paired computer's
+// result, fetched through here, is not an output of this computer's: it opens as a link does.
+document.addEventListener("click", e => {
+  const a = e.target.closest?.("a[data-open]");
+  if (!a || !document.documentElement.classList.contains("in-oaiy")) return;
+  const href = a.getAttribute("href") || "";
+  if (!/^(https?:\/\/[^/]+)?\/files\//.test(href)) return;
+  e.preventDefault();
+  api("/api/open-file", {method: "POST", body: {url: href}}).catch(err => toast(err.message, true));
+});
+// (an engine's error on the Overview: its log, on the Logs page)
+document.addEventListener("click", e => {
+  const b = e.target.closest?.("[data-log-open]");
+  if (!b) return;
+  show("logs");
+  $(`#v-logs .tabs button[data-log="${b.dataset.logOpen}"]`)?.click();
+});
 $("#viewer").addEventListener("close", () => { $("#viewer-media").innerHTML = ""; });
 
 async function renderCompanion() {
@@ -3045,15 +3316,16 @@ function renderDownloads() {
   const shown = dl.models.filter(m => dlGroup === "all" || (dlGroup === "recommended" ? m.recommended : m.group === dlGroup));
   keepRows($("#dl-grid"), shown, m => dlCard(m, groupName[m.group] || m.group), '<div class="empty">Nothing here.</div>');
   restorePlanLists();
-  // The queue: what is downloading, waiting or paused.
-  const active = dl.models.filter(m => m.download && ["queued", "downloading", "adding", "paused"].includes(m.download.status));
+  // The queue: what is downloading, waiting or paused, and what failed (in red, its first words: the card says the rest).
+  const active = dl.models.filter(m => m.download && ["queued", "downloading", "adding", "paused", "failed"].includes(m.download.status));
   keepRows($("#dl-queue"), active, m => {
     const d = m.download, pct = d.total ? Math.min(100, d.done / d.total * 100) : 0;
-    const what = d.status === "queued" ? "Waiting its turn" : d.status === "paused" ? "Paused" : d.status === "adding" ? "Adding to your models" : `${pct.toFixed(0)}%`;
-    return `<div class="dl-q"><strong>${esc(m.name)}</strong><div class="meter"><div style="width:${pct}%;background:var(--gpu)"></div></div><span class="muted">${what}</span></div>`;
+    const what = d.status === "queued" ? "Waiting its turn" : d.status === "paused" ? "Paused" : d.status === "adding" ? "Adding to your models" : d.status === "failed" ? (/ is gated/.test(d.error || "") ? "Failed: its licence is to be accepted" : "Failed: " + (d.error || "see its card").split(": ")[0]) : `${pct.toFixed(0)}%`;
+    return `<div class="dl-q${d.status === "failed" ? " failed" : ""}"><strong>${esc(m.name)}</strong><div class="meter"><div style="width:${pct}%;background:var(${d.status === "failed" ? "--bad" : "--gpu"})"></div></div><span class="${d.status === "failed" ? "" : "muted"}" title="${esc(d.error || "")}">${esc(what)}</span></div>`;
   }, "");
-  const n = dl.models.filter(m => dlBusy(m.download)).length;
+  const n = dl.models.filter(m => dlBusy(m.download)).length, failed = dl.models.filter(m => m.download?.status === "failed").length;
   $("#get-count").hidden = !n; $("#get-count").textContent = n;
+  $("#get-failed").hidden = !failed; $("#get-failed").title = failed ? `${failed} download${failed === 1 ? "" : "s"} failed` : "";
 }
 // What getting a model takes, asked for when the person wants to know (it asks Hugging Face for the files' list).
 const dlPlans = {};
@@ -3070,7 +3342,7 @@ function planHtml(p) {
   if (!p) return "";
   if (p.loading) return `<div class="line"><span>Looking at its files…</span></div>`;
   if (p.error) return `<div class="err">${esc(p.error)}</div>`;
-  const said = [`<b>${dlSize(p.download_bytes)}</b> to download`];
+  const said = [p.download_bytes ? `<b>${dlSize(p.download_bytes)}</b> to download` : "Nothing to download"];
   if (p.elsewhere_bytes) said.push(`<span class="have">${dlSize(p.elsewhere_bytes)} on this computer already, used where it is${p.copy_bytes ? ` (${dlSize(p.copy_bytes)} of it copied: no link can be made across drives here)` : ""}</span>`);
   if (p.network_bytes) said.push(`<span class="have">${dlSize(p.network_bytes)} from ${esc([...new Set(p.files.filter(f => f.status === "network").map(f => f.from))].join(", "))} over OAIY Network</span>`);
   if (p.here_bytes) said.push(`${dlSize(p.here_bytes)} in place`);
@@ -3110,8 +3382,14 @@ function getLabel(p) {
 }
 function dlCard(m, group) {
   const d = m.download, busy = dlBusy(d);
-  const facts = [`<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`, `<span>GPU <b>${m.vram_gb} GB+</b></span>`, `<span title="${esc(m.license)}">${esc(m.license)}</span>`];
-  const gated = m.gated ? `<div class="dl-gated"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg><span>Its licence is accepted on huggingface.co first, then a token is saved here${dl.token ? " (one is saved)" : ""}.</span></div>` : "";
+  // (a Mac's GPU has no memory of its own: what a model needs of it is the GPU's share of the unified memory)
+  const need = macMemory() ? `<span title="Of this Mac's unified memory, for its GPU">Memory <b>${m.vram_gb} GB+</b></span>` : `<span title="The GPU's own memory (VRAM)">GPU <b>${m.vram_gb} GB+</b></span>`;
+  const facts = [`<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`, need, `<span title="${esc(m.license)}">${esc(m.license)}</span>`];
+  // (what to do, before the download: said as done, "is accepted … then a token is saved", it read as done already)
+  const page = m.licence_url ? `<a href="${esc(m.licence_url)}" target="_blank" rel="noopener">its page on huggingface.co</a>` : "its page on huggingface.co";
+  const gated = m.gated ? `<div class="dl-gated"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg><span>${dl.token
+      ? `Accept its licence on ${page}, signed in as the account your saved token is from, before you download it.`
+      : `Accept its licence on ${page} (signed in), then save a Hugging Face token (read access) above, before you download it.`}</span></div>` : "";
   let state = "", actions = "";
   if (d && d.status === "downloading") {
     const pct = d.total ? Math.min(100, d.done / d.total * 100) : 0, left = d.speed > 0 && d.total ? (d.total - d.done) / d.speed : NaN;
@@ -3127,7 +3405,9 @@ function dlCard(m, group) {
     state = `<div class="meter"><div style="width:${pct}%;opacity:.5"></div></div><div class="line"><span>Paused at ${dlSize(d.done)}${d.total ? " of " + dlSize(d.total) : ""}</span></div>`;
     actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
   } else if (d && d.status === "failed") {
-    state = `<div class="err">${esc(d.error || "The download failed.")}</div>`;
+    // (how far it got, and the room left where it goes: a full drive is the usual reason)
+    const got = !d.total ? "" : d.done ? `${dlSize(d.done)} of ${dlSize(d.total)} downloaded` : `None of its ${dlSize(d.total)} downloaded yet`, room = dl.free != null ? `${dlSize(dl.free)} free on this drive` : "";
+    state = `<div class="err">${esc(d.error || "The download failed.")}</div>${got || room ? `<div class="line"><span>${[got, room].filter(Boolean).join(" · ")}</span></div>` : ""}`;
     actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button><button class="btn warn" data-dl="discard" data-id="${m.id}">Discard</button>`;
   } else if (m.installed || d?.status === "done") {
     state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>${d?.reused ? `<div class="line"><span>${dlSize(d.reused)} of it was on this computer already, used where it is</span></div>` : ""}${d?.lan ? `<div class="line"><span>${dlSize(d.lan)} came from ${esc((d.lan_from || []).join(", "))} over OAIY Network</span></div>` : ""}`;
@@ -3182,7 +3462,7 @@ $("#dl-groups").addEventListener("click", e => { const b = e.target.closest("[da
 document.addEventListener("click", e => { const b = e.target.closest("[data-copy]"); if (b) navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")); });
 // (a result opened from the keyboard too: Enter or Space on a gallery picture or an Overview thumbnail)
 document.addEventListener("keydown", e => {
-  const t = e.target.closest?.("figure[data-job], img[data-job]");
+  const t = e.target.closest?.("figure[data-job], img[data-job], .ph[data-job]");
   if (t && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openViewer(t.dataset.job); }
 });
 // (a button that goes to another section, there from the start or drawn later, as an empty list's is)
@@ -3212,7 +3492,7 @@ function renderFirstRun() {
 /* ---------- polling ---------- */
 async function refresh() {
   // (unreachable is said where the studio did not answer, not where the page could not draw what it answered)
-  try { state = await api("/api/state"); } catch (e) { $("#foot-llm-text").textContent = "Studio unreachable"; return; }
+  try { state = await api("/api/state"); } catch (e) { $("#foot-llm-text").textContent = "OAIY's engines are not answering"; return; }
   // (a part of the page that could not be drawn is said in the console, and the rest of the page goes on)
   try { keyed(state.media.jobs); renderState(); } catch (e) { console.error(e); }
   // (the eGPU's memory and load are the state's: shown as they come)

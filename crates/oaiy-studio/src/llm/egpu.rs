@@ -343,6 +343,18 @@ pub fn has_picture(body: &Json) -> bool {
     body.get("messages").and_then(Json::as_array).unwrap_or(&[]).iter().flat_map(parts).any(|p| str_or(&p, "type", "text") != "text")
 }
 
+/// Why the card's server is to stop as the card is given back, a stop asked for while it was lent
+/// ([`Egpu::stop_unless_lent`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Deferred {
+    /// Its launch changed (the eGPU's settings, its model's file): the server that holds the card is not the one the
+    /// settings start now, and it goes whatever is asked of it after.
+    Changed,
+    /// It is not wanted now: a default model chosen on this computer, a Stop by hand. A start for the model it holds,
+    /// asked for after (the card's model chosen as the default again), keeps it: the card is given back to it.
+    Unwanted,
+}
+
 /// Why a model set to the eGPU is not answered there now.
 #[derive(Debug, PartialEq)]
 pub enum Unready {
@@ -398,8 +410,9 @@ struct Inner {
     /// The card's Python, tinygrad and launcher from a provider ([`Egpu::provide`]); None: the settings'.
     runtime: Option<Runtime>,
     /// A stop asked for while the card was lent (a change of the eGPU's settings, a default model chosen on this
-    /// computer): done as the card is given back ([`Egpu::stop_unless_lent`]), not under the picture worker on its socket.
-    stop_when_given_back: bool,
+    /// computer, a Stop by hand), and why: done as the card is given back ([`Egpu::stop_unless_lent`]), not under the
+    /// picture worker on its socket; one that is not wanted any more by then is not ([`Deferred`]).
+    stop_when_given_back: Option<Deferred>,
     /// Stopped for good, as the studio stops ([`Egpu::close`]): no server is started on the card again.
     closed: bool,
 }
@@ -419,24 +432,33 @@ pub struct Egpu {
 }
 
 /// How long a start waits for a stopped server to let the card go: a stop that takes longer kills it at 20 s.
-const GONE_WAIT: Duration = Duration::from_secs(25);
+pub(crate) const GONE_WAIT: Duration = Duration::from_secs(25);
 
 /// What the card's start is told once the studio has stopped ([`Egpu::close`]).
 const CLOSED: &str = "the studio is stopping: no server is started on the eGPU again";
 
 /// The count of the card's servers stopped and not gone yet ([`Egpu::going`]), one for the whole process: there is
-/// one card, whichever studio stopped its server. A test's Egpu counts its own, for tests run side by side, and one's
-/// stopped stand-in (killed only after 20 s) would hold up every other's start.
+/// one card, whichever studio stopped its server.
 fn stopping_servers() -> Arc<(Mutex<usize>, Condvar)> {
-    #[cfg(not(test))]
-    {
-        static GOING: std::sync::OnceLock<Arc<(Mutex<usize>, Condvar)>> = std::sync::OnceLock::new();
-        Arc::clone(GOING.get_or_init(Arc::default))
+    static GOING: std::sync::OnceLock<Arc<(Mutex<usize>, Condvar)>> = std::sync::OnceLock::new();
+    Arc::clone(GOING.get_or_init(Arc::default))
+}
+
+/// Wait (`wait` at most) until every server of the card this process stopped has let it go, whichever studio stopped
+/// it: for OAIY Desktop's update, as it hands off to the installer once its engines have stopped (`crate::Studio::shutdown`
+/// waits a few seconds alone). Whether they had.
+pub fn await_let_go(wait: Duration) -> bool {
+    let (count, gone) = &*stopping_servers();
+    let deadline = Instant::now() + wait;
+    let mut n = count.lock().unwrap_or_else(|p| p.into_inner());
+    while *n > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        n = gone.wait_timeout(n, left).unwrap_or_else(|p| p.into_inner()).0;
     }
-    #[cfg(test)]
-    {
-        Arc::default()
-    }
+    true
 }
 
 /// A request being answered by tinygrad's server: while one is held, the model is not swapped.
@@ -612,7 +634,9 @@ fn free_port() -> Result<u16, String> {
 
 impl Egpu {
     pub fn new() -> Egpu {
-        Self::counting_on(stopping_servers())
+        // (a test's Egpu counts its own, for tests run side by side: one's stopped stand-in, killed only after 20 s,
+        // would hold up every other's start. The test of the count itself counts on the process's)
+        Self::counting_on(if cfg!(test) { Arc::default() } else { stopping_servers() })
     }
 
     /// An Egpu whose stopped servers are counted on `going` ([`stopping_servers`] but in tests).
@@ -644,7 +668,7 @@ impl Egpu {
                 wanted: false,
                 pin_holder: None,
                 runtime: None,
-                stop_when_given_back: false,
+                stop_when_given_back: None,
                 closed: false,
             }),
             changed: Condvar::new(),
@@ -659,7 +683,7 @@ impl Egpu {
     }
 
     /// Wait (`wait` at most) until every stopped server has let the card go.
-    fn wait_gone(&self, wait: Duration) -> Result<(), String> {
+    pub(crate) fn wait_gone(&self, wait: Duration) -> Result<(), String> {
         let (count, gone) = &*self.going;
         let deadline = Instant::now() + wait;
         let mut n = count.lock().unwrap_or_else(|p| p.into_inner());
@@ -889,7 +913,22 @@ impl Egpu {
             }
             let holds = g.model.as_deref() == Some(name);
             match g.state {
-                State::Starting | State::Ready if holds => return Ok(Begun::Held),
+                State::Starting | State::Ready if holds => {
+                    if g.lent {
+                        // (its model asked for again while the card is lent, after a stop that did not want it any
+                        // more: it is wanted now, and is given the card back rather than stopped then)
+                        if g.stop_when_given_back == Some(Deferred::Unwanted) {
+                            g.stop_when_given_back = None;
+                            self.log.push(format!("studio: {name} is wanted on the card again: its server is not stopped as the card is given back"));
+                        }
+                    } else if g.paused {
+                        // (an engine paused since a picture, its card free: started is loaded again, now)
+                        self.resume(&mut g);
+                        drop(g);
+                        self.changed.notify_all();
+                    }
+                    return Ok(Begun::Held);
+                }
                 // (the card lent to the image worker is not taken from under its job: a start here stopped the launcher
                 // that holds it, mid-picture. Requests for a model on the card wait for it to be given back)
                 State::Starting | State::Ready if g.lent => {
@@ -1107,7 +1146,7 @@ impl Egpu {
         g.paused = false;
         g.resume_after = false;
         g.wanted = false;
-        g.stop_when_given_back = false;
+        g.stop_when_given_back = None;
     }
 
     /// The card's Python, tinygrad and launcher from a provider (OAIY Desktop's eGPU plugin), in place of the
@@ -1154,10 +1193,13 @@ impl Egpu {
     /// model chosen on this computer): the lent card's server is the one whose socket a pinned picture model's worker
     /// is on, and stopping it took the card from under that worker. (The model is not on the card meanwhile: its
     /// engine is paused while the card is lent.)
-    pub fn stop_unless_lent(&self) -> bool {
+    pub fn stop_unless_lent(&self, why: Deferred) -> bool {
         let mut g = self.lock();
         if g.lent {
-            g.stop_when_given_back = true;
+            // (a change of its launch stays asked for, whatever is asked after it)
+            if g.stop_when_given_back != Some(Deferred::Changed) {
+                g.stop_when_given_back = Some(why);
+            }
             return false;
         }
         g.epoch += 1;
@@ -1179,11 +1221,12 @@ impl Egpu {
         self.changed.notify_all();
     }
 
-    /// Wait ([`GONE_WAIT`] at most) for the servers stopped to have let the card go, as the studio stops for good:
-    /// `egpu_serve.py` takes up to 15 s to, and a stop returns at once. An update's hand-off came before that, and the
-    /// OAIY it started found tinygrad's lock still taken. Whether they had.
-    pub fn await_gone(&self) -> bool {
-        match self.wait_gone(GONE_WAIT) {
+    /// Wait (`wait` at most) for the servers stopped to have let the card go, as the studio stops for good:
+    /// `egpu_serve.py` takes up to 15 s to, and a stop returns at once. Whether they had. An ordinary quit waits a few
+    /// seconds of that (its server lets the card go by itself as OAIY ends); an update's hand-off waits for all of it
+    /// ([`await_let_go`]), or the OAIY it started found tinygrad's lock still taken.
+    pub fn await_gone(&self, wait: Duration) -> bool {
+        match self.wait_gone(wait) {
             Ok(()) => true,
             Err(e) => {
                 self.log.push(format!("studio: {e}"));
@@ -1320,7 +1363,7 @@ impl Egpu {
         g.wanted = false;
         g.pin_holder = None;
         g.last_used = Instant::now();
-        if g.stop_when_given_back {
+        if g.stop_when_given_back.is_some() {
             // (the stop asked for while it was lent: the server goes now, and the next request starts it as the
             // settings are)
             self.log.push("studio: the card is given back: tinygrad's server stops, as the settings asked while it was lent");
@@ -1528,8 +1571,8 @@ impl Egpu {
             ("error", g.error.as_ref().map_or(Json::Null, Json::str)),
             ("model", g.model.as_ref().map_or(Json::Null, Json::str)),
             ("models", Json::Arr(models(llm).iter().map(Json::str).collect())),
-            // every enabled model is set to it (and it is on): "the language model" is then its server's, for the
-            // page's own card of that name
+            // the default model is set to it (and it is on): "the language model" is then its server's, for the page's
+            // own card of that name (this computer's engine holds none ahead of time; its other models still run here)
             ("holds_all", Json::Bool(!crate::llm::holds_a_model(llm))),
             ("device", Json::str(match str_or(egpu, "device", "NV").trim() { "" => "NV", d => d })),
             // (the engine's own once it has loaded the model: the card may hold the cache for fewer positions than asked)
@@ -1624,15 +1667,21 @@ mod tests {
     }
 
     /// The count of servers stopped and not gone is the process's, not one Egpu's: the engines restarted in OAIY
-    /// Desktop's own process are a new studio with a new Egpu, which waited for none of the old one's servers.
+    /// Desktop's own process are a new studio with a new Egpu, which waited for none of the old one's servers. The
+    /// process's own count, as a studio's Egpu has it outside the tests (the only test that counts on it).
     #[test]
     fn a_new_egpu_waits_for_the_servers_another_stopped() {
-        let shared: Arc<(Mutex<usize>, Condvar)> = Arc::default();
-        let (old, new) = (Egpu::counting_on(Arc::clone(&shared)), Egpu::counting_on(shared));
+        let (old, new) = (Egpu::counting_on(stopping_servers()), Egpu::counting_on(stopping_servers()));
+        assert!(Arc::ptr_eq(&old.going, &new.going), "one count for the process");
         old.adopt_watching("127.0.0.1:1", "k", "big");
         old.stop();
         assert!(new.wait_gone(Duration::from_secs(10)).is_ok());
         assert!(old.log.tail(10).contains("tinygrad's server stopped"), "the new one's start waited for the old one's server: {}", old.log.tail(10));
+        // and the update's wait, which no studio is left to ask, waits on the same
+        old.adopt_watching("127.0.0.1:1", "k", "big");
+        old.stop();
+        assert!(await_let_go(Duration::from_secs(10)));
+        assert!(old.log.tail(10).matches("tinygrad's server stopped").count() >= 2, "{}", old.log.tail(10));
     }
 
     /// Stopped for good, as the studio stops: its server let go of the card before the stop returns (an update's
@@ -1642,7 +1691,7 @@ mod tests {
         let egpu = Arc::new(Egpu::new());
         egpu.adopt_watching("127.0.0.1:1", "k", "m");
         egpu.close();
-        assert!(egpu.await_gone());
+        assert!(egpu.await_gone(GONE_WAIT));
         assert!(egpu.log.tail(10).contains("tinygrad's server stopped"), "{}", egpu.log.tail(10));
         let cfg = Json::parse(br#"{"llm": {"egpu": {"enabled": true}, "models": [{"name": "m", "path": "m.gguf", "egpu": true}]}}"#).unwrap();
         let err = egpu.start(&cfg, Path::new("/install"), "m").unwrap_err();
@@ -1657,15 +1706,15 @@ mod tests {
         let egpu = Egpu::new();
         egpu.adopt_watching("127.0.0.1:1", "k", "m");
         egpu.lent_for_test();
-        assert!(!egpu.stop_unless_lent(), "not stopped under the lent card");
+        assert!(!egpu.stop_unless_lent(Deferred::Unwanted), "not stopped under the lent card");
         assert_eq!(egpu.state(), State::Ready);
         assert!(egpu.is_lent());
         egpu.give_back();
         assert_eq!(egpu.state(), State::Stopped, "stopped as it is given back");
-        assert!(egpu.await_gone());
+        assert!(egpu.await_gone(GONE_WAIT));
         // Not lent: stopped at once, as ever.
         egpu.adopt_watching("127.0.0.1:1", "k", "m");
-        assert!(egpu.stop_unless_lent());
+        assert!(egpu.stop_unless_lent(Deferred::Changed));
         assert_eq!(egpu.state(), State::Stopped);
         // And a card lent and given back with no stop asked for keeps its server.
         egpu.adopt_watching("127.0.0.1:1", "k", "m");
@@ -1673,7 +1722,47 @@ mod tests {
         egpu.give_back();
         assert_eq!(egpu.state(), State::Ready);
         egpu.stop();
-        assert!(egpu.await_gone());
+        assert!(egpu.await_gone(GONE_WAIT));
+    }
+
+    /// A stop deferred while the card is lent is decided again by what is asked after it: the card's model chosen as
+    /// the default again (a start for the model it holds) keeps the server as the card is given back, where the
+    /// default chosen on this computer meanwhile had asked for it to stop. A change of its launch stops it whatever.
+    #[test]
+    fn a_stop_deferred_while_lent_is_not_done_once_the_card_s_model_is_wanted_again() {
+        let egpu = Arc::new(Egpu::new());
+        let cfg = Json::parse(br#"{"llm": {"egpu": {"enabled": true, "engine": "webgpu"}, "models": [{"name": "m", "path": "m.gguf", "egpu": true}]}}"#).unwrap();
+        egpu.adopt_watching("127.0.0.1:1", "k", "m");
+        egpu.lent_for_test();
+        // a picture on the lent card; a default chosen on this computer; the card's model chosen again
+        assert!(!egpu.stop_unless_lent(Deferred::Unwanted));
+        egpu.start(&cfg, Path::new("/install"), "m").unwrap();
+        egpu.give_back();
+        assert_eq!(egpu.state(), State::Ready, "kept: its model is the default again");
+        // A change of its launch, then the same start: stopped as it is given back all the same.
+        egpu.lent_for_test();
+        assert!(!egpu.stop_unless_lent(Deferred::Changed));
+        assert!(!egpu.stop_unless_lent(Deferred::Unwanted), "a later stop does not make the change one a start undoes");
+        egpu.start(&cfg, Path::new("/install"), "m").unwrap();
+        egpu.give_back();
+        assert_eq!(egpu.state(), State::Stopped);
+        assert!(egpu.await_gone(GONE_WAIT));
+    }
+
+    /// An engine on the card paused since a picture (the card given back, not lent) is started by Start: its model
+    /// loads again now, not only at the next chat.
+    #[test]
+    fn a_paused_engine_is_started_again_by_start() {
+        let egpu = Arc::new(Egpu::new());
+        let cfg = Json::parse(br#"{"llm": {"egpu": {"enabled": true, "engine": "webgpu"}, "models": [{"name": "m", "path": "m.gguf", "egpu": true}]}}"#).unwrap();
+        egpu.adopt_watching("127.0.0.1:1", "k", "m");
+        egpu.lock().paused = true;
+        egpu.start(&cfg, Path::new("/install"), "m").unwrap();
+        let g = egpu.lock();
+        assert!(!g.paused && g.state == State::Starting, "resumed, its model loading");
+        drop(g);
+        egpu.stop();
+        assert!(egpu.await_gone(GONE_WAIT));
     }
 
     fn provided(scripts: &Path) -> Runtime {

@@ -423,6 +423,181 @@ pub fn lend_to_engines(net: Network) {
             self.rt.block_on(task).map_err(|e| e.to_string())?
         }
     }
+    /// The models of the computers this one uses, for the engines' Playground: listed as this desktop's catalogue has
+    /// them, and each request sent as this desktop's own routes for them send it (a chat to the worker's language model,
+    /// anything else to its engines' media routes and files).
+    struct Peers {
+        net: Network,
+        rt: tokio::runtime::Handle,
+    }
+    impl oaiy_studio::downloads::PeerModels for Peers {
+        fn models(&self) -> Vec<oaiy_studio::downloads::PeerModel> {
+            // (each kind's default on a worker marked as the catalogue marks it, this computer's own aside)
+            let mut list = super::primary::remote_services_of(&self.net);
+            super::primary::apply_defaults_of(&self.net, &mut list);
+            list.iter().filter_map(peer_model).collect()
+        }
+        fn forward(&self, node: &str, req: oaiy_studio::downloads::PeerRequest) -> Result<oaiy_studio::downloads::PeerReply, String> {
+            let body = axum::body::Bytes::from(req.body);
+            // (on the engines' own thread: the request runs on the desktop's runtime, and its body is read from here)
+            let answer = if req.method == "POST" && req.path == CHAT_PATH {
+                self.rt.block_on(super::primary::chat_on(&self.net, node, body))
+            } else {
+                let mut headers = axum::http::HeaderMap::new();
+                for (name, value) in [("content-type", req.content_type), ("range", req.range), ("x-oaiy-base", req.base)] {
+                    if let Some(v) = value.and_then(|v| axum::http::HeaderValue::from_str(v).ok()) {
+                        headers.insert(name, v);
+                    }
+                }
+                self.rt.block_on(super::primary::gateway_on(&self.net, node, req.method, req.path.trim_start_matches('/'), req.query, &headers, body))
+            };
+            let a = answer_of(&self.rt, answer);
+            Ok(oaiy_studio::downloads::PeerReply { status: a.status, content_type: a.content_type, headers: a.headers, body: Box::new(a.body) })
+        }
+    }
     let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
-    oaiy_studio::downloads::set_peer_files(Some(std::sync::Arc::new(Lan { net, rt })));
+    oaiy_studio::downloads::set_peer_files(Some(std::sync::Arc::new(Lan { net: net.clone(), rt: rt.clone() })));
+    oaiy_studio::downloads::set_peer_models(Some(std::sync::Arc::new(Peers { net, rt })));
+}
+
+/// A worker's model as the engines' Playground lists it, from this desktop's catalogue entry for it: its route there
+/// below the worker's gateway (a language model's: the chat route, which [`lend_to_engines`]'s hook sends to the
+/// worker's chat).
+#[cfg(feature = "gui")]
+fn peer_model(e: &Value) -> Option<oaiy_studio::downloads::PeerModel> {
+    let node = e["nodeId"].as_str()?.to_string();
+    let kind = e["kind"].as_str()?.to_string();
+    let gateway = format!("/api/network/nodes/{node}/gateway");
+    let path = if kind == "llm" { CHAT_PATH.to_string() } else { e["endpoint"].as_str().and_then(|p| p.strip_prefix(&gateway)).unwrap_or("").to_string() };
+    Some(oaiy_studio::downloads::PeerModel {
+        node_name: e["nodeName"].as_str().unwrap_or(&node).to_string(),
+        node_id: node,
+        kind,
+        model: e["model"].as_str()?.to_string(),
+        path,
+        ready: e["ready"] == json!(true),
+        node_online: e["nodeOnline"] == json!(true),
+        context_tokens: e["contextTokens"].as_i64(),
+        default: e["default"] == json!(true),
+    })
+}
+
+/// The route the engines' Playground names a worker's language model's chats by.
+#[cfg(feature = "gui")]
+const CHAT_PATH: &str = "/v1/chat/completions";
+
+/// Pieces of an answer's body held for its reader at once: past them, the worker's stream waits for the reader.
+const PIECES: usize = 8;
+
+/// An answer of this desktop's routes (a worker's, passed through) as a thread that is not the runtime's reads it (the
+/// engines'): its status, its type, the headers that say what its body is, and the body as it arrives.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) struct Answer {
+    pub status: u16,
+    pub content_type: String,
+    pub headers: Vec<(String, String)>,
+    pub body: BodyReader,
+}
+
+/// An answer's body, read as it arrives: its pieces come through a channel of a few ([`PIECES`]), so a slow reader holds
+/// the worker's stream back rather than the answer piling up here. Dropped, the channel closes, and the task reading
+/// the answer ends at once, dropping it: the worker's connection closes, which ends the request there (a chat stops
+/// being written; a song being made is not waited on).
+pub(crate) struct BodyReader {
+    rx: tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, String>>,
+    piece: axum::body::Bytes,
+}
+
+impl std::io::Read for BodyReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.piece.is_empty() {
+            // (a tokio channel, not std's: the task that fills it awaits room in it rather than holding one of the
+            // runtime's threads while this reader is slow)
+            match self.rx.blocking_recv() {
+                Some(Ok(piece)) => self.piece = piece,
+                Some(Err(e)) => return Err(std::io::Error::other(e)),
+                None => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.piece.len());
+        out[..n].copy_from_slice(&self.piece[..n]);
+        self.piece = self.piece.slice(n..);
+        Ok(n)
+    }
+}
+
+/// `answer` for a reader on another thread ([`Answer`]): its body read on `rt` until it ends, or its reader is gone.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn answer_of(rt: &tokio::runtime::Handle, answer: Response) -> Answer {
+    use futures_util::StreamExt;
+    let (parts, body) = answer.into_parts();
+    let header = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let content_type = header("content-type").unwrap_or_else(|| "application/octet-stream".into());
+    let headers = ["content-length", "content-range", "accept-ranges", "content-disposition", "x-sample-rate", "cache-control"]
+        .iter()
+        .filter_map(|name| header(name).map(|v| (name.to_string(), v)))
+        .collect();
+    let (tx, rx) = tokio::sync::mpsc::channel(PIECES);
+    rt.spawn(async move {
+        let mut stream = body.into_data_stream();
+        loop {
+            let piece = tokio::select! {
+                piece = stream.next() => piece,
+                // (the reader gone, while the worker is quiet between pieces: not kept until its next one)
+                _ = tx.closed() => return,
+            };
+            let Some(piece) = piece else { return };
+            let failed = piece.is_err();
+            if tx.send(piece.map_err(|e| e.to_string())).await.is_err() || failed {
+                return;
+            }
+        }
+    });
+    Answer { status: parts.status.as_u16(), content_type, headers, body: BodyReader { rx, piece: axum::body::Bytes::new() } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// An answer whose body comes in pieces, as a worker's chat stream does: each piece read as it comes, from a thread
+    /// that is not the runtime's, with the answer's status, type and length.
+    #[test]
+    fn an_answer_is_read_as_it_arrives() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|piece| (piece, rx)) });
+        let answer = Response::builder().status(206).header("content-type", "text/event-stream").header("content-range", "bytes 0-9/10").body(axum::body::Body::from_stream(stream)).unwrap();
+        let mut a = answer_of(rt.handle(), answer);
+        assert_eq!((a.status, a.content_type.as_str()), (206, "text/event-stream"));
+        assert!(a.headers.contains(&("content-range".into(), "bytes 0-9/10".into())), "{:?}", a.headers);
+        let sender = tx.clone();
+        rt.spawn(async move {
+            sender.send(Ok(axum::body::Bytes::from_static(b"data: one\n\n"))).await.unwrap();
+        });
+        let mut piece = [0u8; 64];
+        let n = a.body.read(&mut piece).unwrap();
+        assert_eq!(&piece[..n], b"data: one\n\n", "the first piece, before the answer is whole");
+        rt.block_on(tx.send(Ok(axum::body::Bytes::from_static(b"data: [DONE]\n\n")))).unwrap();
+        drop(tx);
+        let mut rest = String::new();
+        a.body.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "data: [DONE]\n\n", "and the rest, to its end");
+    }
+
+    /// A reader that goes (the engines' client left) ends the answer at once: the worker's stream is let go while it
+    /// is quiet, not only at its next piece, and its connection closes with it.
+    #[test]
+    fn a_reader_that_goes_ends_the_answer() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|piece| (piece, rx)) });
+        let answer = Response::builder().status(200).body(axum::body::Body::from_stream(stream)).unwrap();
+        let a = answer_of(rt.handle(), answer);
+        rt.block_on(tx.send(Ok(axum::body::Bytes::from_static(b"piece")))).unwrap();
+        drop(a);
+        let closed = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), tx.closed()).await });
+        assert!(closed.is_ok(), "the worker's stream is still held");
+    }
 }

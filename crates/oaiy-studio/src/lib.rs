@@ -93,6 +93,17 @@ pub struct Studio {
     listeners: std::sync::Mutex<Vec<(std::net::SocketAddr, std::thread::JoinHandle<()>)>>,
 }
 
+/// How long a studio that stops waits for the eGPU's server to let the card go ([`Studio::shutdown`]): an ordinary quit
+/// does not wait for the whole of it.
+const QUIT_WAIT: Duration = Duration::from_secs(3);
+
+/// Wait (25 s at most) for the eGPU's servers this process stopped to have let the card go, whichever studio stopped
+/// them: for OAIY Desktop's update, after its engines' stop and before it hands off to the installer
+/// ([`Studio::shutdown`] waits a few seconds alone). Whether they had.
+pub fn await_egpu_let_go() -> bool {
+    egpu::await_let_go(egpu::GONE_WAIT)
+}
+
 /// The key `GET /api/config` adds to the settings it answers: their version, sent back with a save of them.
 pub const CONFIG_VERSION: &str = "config_version";
 
@@ -286,8 +297,8 @@ impl Studio {
             (file, llm.get("egpu").cloned(), egpu::private(v))
         };
         if self.egpu.state() != llm::State::Stopped && egpu_launch(&before) != egpu_launch(&next) {
-            // (not under a picture worker on the lent card: then as it is given back)
-            if self.egpu.stop_unless_lent() {
+            // (not under a picture worker on the lent card: then as it is given back, whatever is asked after)
+            if self.egpu.stop_unless_lent(egpu::Deferred::Changed) {
                 self.log.push("eGPU settings changed: stopping tinygrad's server");
             } else {
                 self.log.push("eGPU settings changed: tinygrad's server stops once the card is given back (it is lent to a picture worker)");
@@ -325,8 +336,8 @@ impl Studio {
         if !on_card && self.egpu.state() != llm::State::Stopped {
             // (not while the card is lent, a picture worker on the socket its server holds, a pinned model's or one kept
             // for the next picture: its engine is paused then, its model not on the card, and the server stops as the
-            // card is given back)
-            if self.egpu.stop_unless_lent() {
+            // card is given back, unless the card's model is chosen again meanwhile)
+            if self.egpu.stop_unless_lent(egpu::Deferred::Unwanted) {
                 self.log.push(format!("{default} runs on this computer: the eGPU lets go of its model"));
             } else {
                 self.log.push(format!("{default} runs on this computer: the eGPU lets go of its model once the card is given back (it is lent to a picture worker)"));
@@ -387,10 +398,11 @@ impl Studio {
         // The worker kept for pictures, waiting for the next: no job, so nothing above ends it, and an update would
         // find its program still running (on Windows the installer cannot replace it).
         self.media.end_serving(false, "the studio is stopping");
-        // The card's server let go of the card before this returns (up to 25 s; it is killed at 20): an update hands
-        // off once this returns, and the OAIY it started found tinygrad's lock still taken.
-        if !self.egpu.await_gone() {
-            self.log.push("studio: the eGPU's server had not let the card go as the studio stopped");
+        // The card's server let go of the card, a few seconds of it: an ordinary quit waited up to 25 s for it, and the
+        // server lets the card go by itself as OAIY ends (its lifeline closes). An update waits for the rest before it
+        // hands off ([`await_egpu_let_go`]): the OAIY it started found tinygrad's lock still taken.
+        if !self.egpu.await_gone(QUIT_WAIT) {
+            self.log.push("studio: the eGPU's server was still letting the card go as the studio stopped");
         }
         self.log.push("studio stopped");
     }
@@ -435,6 +447,10 @@ impl Studio {
             ("media_pauses_llm", Json::Bool(media::pauses_llm(&self.config()))),
             ("llm", self.llm.status()),
             ("egpu", self.egpu.status(self.config().get("llm").unwrap_or(&Json::Null))),
+            // the paired computers' models (OAIY Network), for the Playground and for what is OAIY's default
+            ("peers", api::peers::models_json(downloads::peer_models().as_deref())),
+            // the picture models kept loaded, and where each stands (`media::pins`)
+            ("pins", media::pins::snapshot(&self.config(), &self.media)),
             ("media", Json::obj([
                 ("busy", Json::Bool(self.media.busy())),
                 ("jobs", Json::Arr(self.media.list().iter().take(60).map(|j| j.to_json(&root)).collect())),
