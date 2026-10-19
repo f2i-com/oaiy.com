@@ -1828,6 +1828,16 @@ impl Media {
                         let held = self.holds_pinned_where(&studio.config(), Some(true));
                         studio.egpu.set_pin_holder(held.clone());
                         if held.is_some() || self.lingers(keep_for(&studio.config())) && !studio.egpu.wanted() {
+                            // (a language model of this computer's that a job here paused comes back meanwhile: the
+                            // card is not its GPU, and a pinned model's worker keeps the card for as long as it is
+                            // pinned, which left it stopped all that time. Not beside a picture worker kept here, which
+                            // is let go first once the card is given back)
+                            if studio.llm.paused() && !self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.local) {
+                                drop(jobs);
+                                self.resume_llm(studio);
+                                jobs = self.lock();
+                                continue;
+                            }
                             jobs = self.queue_signal.wait_timeout(jobs, Duration::from_secs(1)).unwrap_or_else(|p| p.into_inner()).0;
                             continue;
                         }
@@ -2066,10 +2076,13 @@ impl Media {
     }
 
     /// Whether the card is kept for another job: the kept worker has waited less than `keep` for another picture, or a
-    /// job of a worker of its own ended on the card less than that ago.
+    /// job of a worker of its own ended on the card less than that ago. Neither once a release is asked for: `!releasing`
+    /// was read with the first alone (`&&` binds before `||`), so a release after a video, music or a sound effect
+    /// kept the card for the keep time all the same.
     fn lingers(&self, keep: Duration) -> bool {
-        !self.releasing.load(Ordering::Relaxed) && self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < keep)
-            || self.card_used.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() < keep)
+        !self.releasing.load(Ordering::Relaxed)
+            && (self.serving.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.idle_since.elapsed() < keep)
+                || self.card_used.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() < keep))
     }
 
     /// Whether the picture worker kept on this computer's GPU waits for another picture: it has waited less than

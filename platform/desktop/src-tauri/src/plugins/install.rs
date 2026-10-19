@@ -359,9 +359,11 @@ pub fn install_from_path_stopping(source: &Path, plugins_root: &Path, trust: &Tr
         let backup = plugins_root.join(format!(".backup-{}-{}", manifest.id, uuid::Uuid::new_v4()));
         if replaced {
             // Preserve every old byte until the validated replacement is live.
+            // (the plugin was stopped just now, by `stop`, so "stop it first" asked for what had been done: what still
+            // holds the folder is something else, a file of it open in another program, or the folder's permissions)
             std::fs::rename(&dest, &backup).map_err(|e| {
                 format!(
-                    "cannot replace the existing {:?} plugin — stop it first ({e})",
+                    "cannot replace the existing {:?} plugin: its folder could not be moved aside ({e}). It may be open in another program",
                     manifest.id
                 )
             })?;
@@ -404,7 +406,7 @@ pub fn uninstall(id: &str, plugins_root: &Path) -> Result<(), String> {
         return Err(format!("no plugin {id:?} is installed"));
     }
     std::fs::remove_dir_all(&dir)
-        .map_err(|e| format!("cannot remove the {id:?} plugin — stop it first ({e})"))?;
+        .map_err(|e| format!("cannot remove the {id:?} plugin: its folder could not be removed ({e}). It may be open in another program"))?;
     // The writable dir lives outside the bundle now, so removing the bundle no
     // longer takes it along. Delete it explicitly: a plugin's state outliving
     // its uninstall surprises people, and Aokie's includes phone pairing keys.

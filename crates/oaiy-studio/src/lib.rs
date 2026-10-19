@@ -286,8 +286,12 @@ impl Studio {
             (file, llm.get("egpu").cloned(), egpu::private(v))
         };
         if self.egpu.state() != llm::State::Stopped && egpu_launch(&before) != egpu_launch(&next) {
-            self.log.push("eGPU settings changed: stopping tinygrad's server");
-            self.egpu.stop();
+            // (not under a picture worker on the lent card: then as it is given back)
+            if self.egpu.stop_unless_lent() {
+                self.log.push("eGPU settings changed: stopping tinygrad's server");
+            } else {
+                self.log.push("eGPU settings changed: tinygrad's server stops once the card is given back (it is lent to a picture worker)");
+            }
         }
         self.place_the_model(&before, &next);
         self.log.push("configuration saved");
@@ -319,8 +323,14 @@ impl Studio {
             self.llm.stop();
         }
         if !on_card && self.egpu.state() != llm::State::Stopped {
-            self.log.push(format!("{default} runs on this computer: the eGPU lets go of its model"));
-            self.egpu.stop();
+            // (not while the card is lent, a picture worker on the socket its server holds, a pinned model's or one kept
+            // for the next picture: its engine is paused then, its model not on the card, and the server stops as the
+            // card is given back)
+            if self.egpu.stop_unless_lent() {
+                self.log.push(format!("{default} runs on this computer: the eGPU lets go of its model"));
+            } else {
+                self.log.push(format!("{default} runs on this computer: the eGPU lets go of its model once the card is given back (it is lent to a picture worker)"));
+            }
         }
         // (the load begun beside the save, which it does not hold up: the card's waits for a server it replaces to
         // be gone, up to 25 s)
@@ -361,7 +371,8 @@ impl Studio {
         // its settings back once the studio stops), nor may its curl outlive it (the next start's resume would run a
         // second curl on the same partial file).
         self.downloads.shutdown();
-        self.egpu.stop();
+        // (for good: no server is started on the card after this, and its last is waited for below)
+        self.egpu.close();
         // (every job, incognito ones too: a pin's loading is one, and the list the page shows has none of them)
         let cancelled = self.media.cancel_all();
         if cancelled {
@@ -376,6 +387,11 @@ impl Studio {
         // The worker kept for pictures, waiting for the next: no job, so nothing above ends it, and an update would
         // find its program still running (on Windows the installer cannot replace it).
         self.media.end_serving(false, "the studio is stopping");
+        // The card's server let go of the card before this returns (up to 25 s; it is killed at 20): an update hands
+        // off once this returns, and the OAIY it started found tinygrad's lock still taken.
+        if !self.egpu.await_gone() {
+            self.log.push("studio: the eGPU's server had not let the card go as the studio stopped");
+        }
         self.log.push("studio stopped");
     }
 

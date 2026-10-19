@@ -220,19 +220,68 @@ fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// A download's host resolved and checked, for the client to be held to (`None` for an address, which needs none).
-async fn pin_download_host(url: &str) -> Result<Option<(String, Vec<std::net::SocketAddr>)>, String> {
-    let parsed = url::Url::parse(url).map_err(|_| "invalid download URL".to_string())?;
-    let Some(url::Host::Domain(host)) = parsed.host() else { return Ok(None) };
-    let host = host.to_string();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| format!("cannot resolve download host '{host}': {e}"))?.collect();
+/// A name for this computer itself, which a download must not reach whatever it resolves to: `localhost` and the
+/// names under it (RFC 6761 keeps them for loopback), with or without the root's dot.
+fn is_loopback_name(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
+
+/// Why a redirect to `url` is refused, if it is: it must stay https, and its host must not be an internal address
+/// or a loopback name. Read from the parsed host, not its text: `host_str` gives an IPv6 address in brackets
+/// (`[::1]`), which no address parse reads, so a redirect to one went through as if it were a name.
+fn redirect_refusal(url: &url::Url) -> Option<&'static str> {
+    if url.scheme() != "https" {
+        return Some("redirect to a non-https URL");
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) if is_disallowed_ip(std::net::IpAddr::V4(ip)) => Some("redirect to a disallowed internal address"),
+        Some(url::Host::Ipv6(ip)) if is_disallowed_ip(std::net::IpAddr::V6(ip)) => Some("redirect to a disallowed internal address"),
+        Some(url::Host::Domain(d)) if is_loopback_name(d) => Some("redirect to this computer (a loopback name)"),
+        None => Some("redirect to a URL with no host"),
+        _ => None,
+    }
+}
+
+/// `host` resolved, every address checked: refused where it is a loopback name or any address it answers is
+/// internal ([`is_disallowed_ip`]). `port` is the one the addresses carry (0: the caller sets it).
+async fn checked_addrs(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
+    if is_loopback_name(host) {
+        return Err(format!("download host '{host}' is this computer"));
+    }
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port)).await.map_err(|e| format!("cannot resolve download host '{host}': {e}"))?.collect();
     if addrs.is_empty() {
         return Err(format!("download host '{host}' did not resolve"));
     }
     if let Some(bad) = addrs.iter().find(|a| is_disallowed_ip(a.ip())) {
         return Err(format!("download host '{host}' resolves to a disallowed address ({})", bad.ip()));
     }
+    Ok(addrs)
+}
+
+/// What a download's client asks for every name it connects to: the first host's is pinned beforehand
+/// ([`pin_download_host`]), and this answers the rest, a redirect's to another host (a CDN), checked as the first was.
+/// Only the first was: a redirect to a name that resolved to an internal address was followed, and connected to.
+struct CheckedResolver;
+
+impl reqwest::dns::Resolve for CheckedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // (port 0: the connector sets the URL's own on each address)
+            let addrs = checked_addrs(&host, 0).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// A download's host resolved and checked, for the client to be held to (`None` for an address, which needs none).
+async fn pin_download_host(url: &str) -> Result<Option<(String, Vec<std::net::SocketAddr>)>, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "invalid download URL".to_string())?;
+    let Some(url::Host::Domain(host)) = parsed.host() else { return Ok(None) };
+    let host = host.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs = checked_addrs(&host, port).await?;
     Ok(Some((host, addrs)))
 }
 
@@ -249,6 +298,7 @@ fn validate_download_url(url: &str) -> Result<(), String> {
     let host = match parsed.host() {
         Some(url::Host::Ipv4(ip)) => return if is_disallowed_ip(std::net::IpAddr::V4(ip)) { Err(format!("download URL points at a disallowed address ({ip})")) } else { Ok(()) },
         Some(url::Host::Ipv6(ip)) => return if is_disallowed_ip(std::net::IpAddr::V6(ip)) { Err(format!("download URL points at a disallowed address ({ip})")) } else { Ok(()) },
+        Some(url::Host::Domain(d)) if is_loopback_name(d) => return Err(format!("download URL points at this computer ({d})")),
         Some(url::Host::Domain(d)) => d.to_string(),
         None => return Err("download URL has no host".into()),
     };
@@ -961,7 +1011,8 @@ async fn run_download(
             return;
         }
     };
-    let mut builder = reqwest::Client::builder();
+    // (every other name it connects to, a redirect's, resolved and checked as the first host was)
+    let mut builder = reqwest::Client::builder().dns_resolver(std::sync::Arc::new(CheckedResolver));
     if let Some((host, addrs)) = &pinned {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -972,24 +1023,15 @@ async fn run_download(
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(120))
         // Re-validate every redirect hop: a public host (incl. the HF resolve URL) may 302 to a
-        // CDN, but it must stay https and must not point at an internal literal IP (defense over
-        // the start() guard, which only sees the original URL). DNS-name hops are followed and
-        // re-checked by the OS at connect (a rebind-to-internal across the hop is the residual).
+        // CDN, but it must stay https and must not point at an internal address or a loopback
+        // name (defense over the start() guard, which only sees the original URL). A DNS-name
+        // hop is resolved by `CheckedResolver`, which refuses a name that answers an internal one.
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 10 {
                 return attempt.stop();
             }
-            if attempt.url().scheme() != "https" {
-                return attempt.error("redirect to a non-https URL");
-            }
-            if let Some(ip) = attempt
-                .url()
-                .host_str()
-                .and_then(|h| h.parse::<std::net::IpAddr>().ok())
-            {
-                if is_disallowed_ip(ip) {
-                    return attempt.error("redirect to a disallowed internal address");
-                }
+            if let Some(why) = redirect_refusal(attempt.url()) {
+                return attempt.error(why);
             }
             attempt.follow()
         }))
@@ -1872,6 +1914,50 @@ mod tests {
         assert!(validate_download_url("https://[::1]/x").is_err());
         assert!(validate_download_url("https://10.0.0.5:8080/x").is_err());
         assert!(validate_download_url("https://1.1.1.1/model.gguf").is_ok()); // public IP literal
+        assert!(validate_download_url("https://localhost/x").is_err());
+        assert!(validate_download_url("https://models.localhost./x").is_err());
+    }
+
+    /// Every redirect hop is checked on its parsed host: an IPv6 address read from `host_str` (`[::1]`) parsed as
+    /// none and went through, and a loopback name was followed. Each is refused; a CDN's name is followed.
+    #[test]
+    fn a_redirect_to_this_computer_is_refused_however_it_is_written() {
+        let refused = |u: &str| redirect_refusal(&url::Url::parse(u).unwrap());
+        for to in [
+            "https://[::1]/model.gguf",
+            "https://[::ffff:127.0.0.1]/model.gguf",
+            "https://[fe80::1]:8443/x",
+            "https://127.0.0.1/x",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://localhost/x",
+            "https://LOCALHOST./x",
+            "https://api.localhost:8080/x",
+        ] {
+            assert!(refused(to).is_some(), "{to} was followed");
+        }
+        assert_eq!(refused("http://cdn-lfs.huggingface.co/x"), Some("redirect to a non-https URL"));
+        for to in ["https://cdn-lfs.huggingface.co/repos/x", "https://[2606:4700:4700::1111]/x", "https://1.1.1.1/x", "https://localhost.example.com/x"] {
+            assert_eq!(refused(to), None, "{to} was refused");
+        }
+    }
+
+    /// The resolver a download's client asks for every name past the first refuses a loopback name before it is
+    /// looked up, and a name that answers an internal address: a redirect to either was connected to.
+    #[tokio::test]
+    async fn a_name_a_redirect_names_is_resolved_and_checked() {
+        use reqwest::dns::Resolve as _;
+        for name in ["localhost", "files.localhost"] {
+            let err = match CheckedResolver.resolve(name.parse().unwrap()).await {
+                Ok(_) => panic!("{name} was resolved"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("is this computer"), "{err}");
+        }
+        // An address the system resolver gives back for a name is checked too (an IP literal resolves to itself,
+        // with no lookup on the network).
+        let err = checked_addrs("127.0.0.1", 0).await.unwrap_err();
+        assert!(err.contains("disallowed address (127.0.0.1)"), "{err}");
+        assert!(checked_addrs("1.1.1.1", 443).await.is_ok_and(|a| a == ["1.1.1.1:443".parse().unwrap()]));
     }
 
     #[test]

@@ -996,3 +996,50 @@ fn a_gpu_fault_holds_the_pins_until_a_person_pins_again() {
     until("the runner to end", || runner.is_finished());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A release lets the card go after a video, music or a sound effect as after a picture: `!releasing` was read with the
+/// kept worker's wait alone, so a job of a worker of its own on the card kept it for the keep time all the same.
+#[test]
+fn a_release_lets_the_card_go_after_any_job_on_it() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-release-{}", std::process::id()));
+    let studio = quiet_studio(&dir, |_| {});
+    let keep = Duration::from_secs(600);
+    assert!(!studio.media.lingers(keep), "nothing has used the card");
+    *studio.media.card_used.lock().unwrap() = Some(std::time::Instant::now());
+    assert!(studio.media.lingers(keep), "a clip just made on the card keeps it for the next");
+    studio.media.release_now();
+    assert!(!studio.media.lingers(keep), "a release lets it go");
+    // A kept picture worker likewise.
+    let _said = stand_in(&studio, &[("moss-image", "moss")]);
+    assert!(!studio.media.lingers(keep));
+    studio.media.releasing.store(false, Ordering::Relaxed);
+    assert!(studio.media.lingers(keep));
+    studio.media.end_serving(true, "the test is done");
+    studio.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// This computer's language model, paused by a job here, comes back while the card stays lent (a clip just made there,
+/// or a pinned picture model's worker keeping it): the runner's lent branch went on waiting, and the model came back
+/// only once the card was given back, or never while a pin kept it.
+#[test]
+fn a_language_model_media_paused_comes_back_while_the_card_is_lent() {
+    let dir = std::env::temp_dir().join(format!("oaiy-media-lent-resume-{}", std::process::id()));
+    let studio = quiet_studio(&dir, |_| {});
+    studio.egpu.lent_for_test();
+    *studio.media.card_used.lock().unwrap() = Some(std::time::Instant::now());
+    studio.llm.set_paused(true);
+    let runner = {
+        let studio = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let media = Arc::clone(&studio.media);
+            media.run(&studio);
+        })
+    };
+    until("the paused language model to be brought back", || !studio.llm.paused());
+    assert!(studio.media.log.tail(50).contains("restarting the LLM after media jobs"), "{}", studio.media.log.tail(20));
+    assert!(studio.egpu.is_lent(), "the card is kept for its keep time as before");
+    studio.shutdown();
+    until("the runner to end", || runner.is_finished());
+    let _ = std::fs::remove_dir_all(&dir);
+}

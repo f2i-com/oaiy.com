@@ -406,17 +406,52 @@ fn os_fix_path(s: String) -> String {
 /// A program that ships with OAIY, as a bare service command names it:
 /// `oaiy-voice`. Found where [`oaiy_program_dirs`] says, in its order.
 fn oaiy_program(cmd: &str) -> Option<PathBuf> {
-    if cmd.is_empty() || cmd.contains(['/', '\\', ':']) {
-        return None;
-    }
-    let file = if cfg!(windows) && !cmd.ends_with(".exe") { format!("{cmd}.exe") } else { cmd.to_string() };
     let dirs = oaiy_program_dirs(
         std::env::var_os("OAIY_ENGINES_DIR").map(PathBuf::from),
         std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
         installer_engines(),
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release"),
     );
+    program_in(cmd, dirs)
+}
+
+/// The same program built in the repository's release folder, the folder this
+/// desktop was built from. It is looked for after `<data>/bin`, not with
+/// [`oaiy_program`]: that folder is on the machine that built OAIY, and a build
+/// left there long ago would otherwise beat the copy someone put in the bin
+/// folder on purpose.
+fn repo_program(cmd: &str) -> Option<PathBuf> {
+    program_in(cmd, [Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release")])
+}
+
+fn program_in(cmd: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    if cmd.is_empty() || cmd.contains(['/', '\\', ':']) {
+        return None;
+    }
+    let file = if cfg!(windows) && !cmd.ends_with(".exe") { format!("{cmd}.exe") } else { cmd.to_string() };
     dirs.into_iter().map(|d| d.join(&file)).find(|p| p.is_file()).map(|p| std::path::absolute(&p).unwrap_or(p))
+}
+
+/// Which program a bare service command runs, of those found for it: OAIY's own
+/// (from [`oaiy_program`]) first, then a copy in `<data>/bin`, then a build in
+/// the repository's release folder. OAIY's own comes before the bin folder
+/// because the documented Mac recipe used to copy `oaiy-voice` there, and that
+/// copy outlives every update: an old one beat the installer's voice and
+/// exited 1 on a flag the newer desktop passes it. The second value says, when
+/// both OAIY's own and a bin copy are there, which is used, for the log.
+fn pick_program(own: Option<PathBuf>, in_bin: Option<PathBuf>, repo: Option<PathBuf>) -> (Option<PathBuf>, Option<String>) {
+    match (own, in_bin) {
+        (Some(own), Some(bin)) => {
+            let note = format!(
+                "{} is not used: OAIY's own {} is, which comes with this OAIY (remove the copy in the bin folder to silence this)",
+                bin.display(),
+                own.display()
+            );
+            (Some(own), Some(note))
+        }
+        (Some(own), None) => (Some(own), None),
+        (None, Some(bin)) => (Some(bin), None),
+        (None, None) => (repo, None),
+    }
 }
 
 /// The engines folder the installer carries, once the app has said where
@@ -434,18 +469,18 @@ fn installer_engines() -> Option<PathBuf> {
 /// Where OAIY's own programs are looked for, in the engines' order
 /// (`engines::programs_dir`): `OAIY_ENGINES_DIR`; the `engines` folder beside
 /// the desktop, then its own folder (a build of one's own put there); the
-/// engines the installer carries (`<resources>/resources/engines`); a build
-/// from the repository's release folder. Without the installer's folder an
-/// installed OAIY looked for its voice only beside itself and in the folder it
-/// was built in, which is on the machine that built it: "program not found".
-fn oaiy_program_dirs(env: Option<PathBuf>, beside: Option<PathBuf>, bundled: Option<PathBuf>, repo: PathBuf) -> Vec<PathBuf> {
+/// engines the installer carries (`<resources>/resources/engines`). Without the
+/// installer's folder an installed OAIY looked for its voice only beside itself
+/// and in the folder it was built in, which is on the machine that built it:
+/// "program not found". (That folder, the repository's release build, is
+/// [`repo_program`], looked in last.)
+fn oaiy_program_dirs(env: Option<PathBuf>, beside: Option<PathBuf>, bundled: Option<PathBuf>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = env.into_iter().collect();
     if let Some(dir) = beside {
         dirs.push(dir.join("engines"));
         dirs.push(dir);
     }
     dirs.extend(bundled);
-    dirs.push(repo);
     dirs
 }
 
@@ -1178,8 +1213,7 @@ impl Registry {
             }
             return Path::new(&raw).exists();
         }
-        let bin = self.data_dir.join("bin").join(&raw);
-        if bin.with_extension("exe").exists() || bin.exists() {
+        if self.bare_program(&raw).0.is_some() {
             return true;
         }
         std::env::var("PATH").is_ok_and(|path| {
@@ -1187,8 +1221,17 @@ impl Registry {
                 let p = dir.join(&raw);
                 p.exists() || p.with_extension("exe").exists()
             })
-        }) || oaiy_program(&raw).is_some()
-            || user_programs_exe(&raw).is_some()
+        }) || user_programs_exe(&raw).is_some()
+    }
+
+    /// The program a bare run command names, as [`pick_program`] chooses it from
+    /// OAIY's own folders, `<data>/bin` and the repository's build, with its note
+    /// for the log when a bin copy is passed over. None when none of them has it
+    /// (PATH and the per-user programs folder are the caller's to try).
+    fn bare_program(&self, raw: &str) -> (Option<PathBuf>, Option<String>) {
+        let bin = self.data_dir.join("bin").join(raw);
+        let in_bin = [bin.with_extension("exe"), bin].into_iter().find(|p| p.exists());
+        pick_program(oaiy_program(raw), in_bin, repo_program(raw))
     }
 
     /// The resolved path of a service's install-completion marker, if it declares one.
@@ -1753,16 +1796,17 @@ impl Registry {
         let resolved_cmd = if raw_cmd.contains(std::path::is_separator) {
             raw_cmd
         } else {
-            let bin_dir = self.data_dir.join("bin").join(&raw_cmd);
-            let candidates = [bin_dir.with_extension("exe"), bin_dir.clone()];
-            candidates
-                .iter()
-                .find(|p| p.exists())
+            // OAIY's own program, else ${binDir}'s, else the repository's build
+            // (see pick_program for why in that order).
+            let (program, passed_over) = self.bare_program(&raw_cmd);
+            if let Some(note) = passed_over {
+                log::warn!("{id}: {note}");
+            }
+            program
                 .map(|p| p.display().to_string())
                 // Resolve a just-installed system tool to its real path so the
                 // spawn doesn't fall back to the bare name + OAIY Desktop's stale PATH (which
                 // wouldn't find it until a restart) and Error out.
-                .or_else(|| oaiy_program(&raw_cmd).map(|p| p.display().to_string()))
                 .or_else(|| user_programs_exe(&raw_cmd).map(|p| p.display().to_string()))
                 .unwrap_or(raw_cmd)
         };
@@ -2931,12 +2975,44 @@ mod tests {
         let installed = p("OAIY");
         let bundled = installed.join("resources").join("engines");
         assert_eq!(
-            oaiy_program_dirs(Some(p("chosen")), Some(installed.clone()), Some(bundled.clone()), p("repo")),
-            vec![p("chosen"), installed.join("engines"), installed.clone(), bundled.clone(), p("repo")],
+            oaiy_program_dirs(Some(p("chosen")), Some(installed.clone()), Some(bundled.clone())),
+            vec![p("chosen"), installed.join("engines"), installed.clone(), bundled.clone()],
         );
         // A program put beside the desktop (a build of one's own) still comes before the installer's, as an engine does.
-        assert_eq!(oaiy_program_dirs(None, Some(installed.clone()), Some(bundled.clone()), p("repo"))[2..], [bundled, p("repo")]);
-        assert_eq!(oaiy_program_dirs(None, None, None, p("repo")), vec![p("repo")]);
+        assert_eq!(oaiy_program_dirs(None, Some(installed.clone()), Some(bundled.clone()))[2..], [bundled]);
+        assert!(oaiy_program_dirs(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn oaiy_s_own_voice_beats_an_old_copy_in_the_bin_folder() {
+        // The Mac recipe put oaiy-voice in <data>/bin, and that copy beat the installer's after every update: an old
+        // one exited 1 on --watch-stdin. OAIY's own is used now, and the log says the copy is not.
+        let p = PathBuf::from;
+        let (own, bin, repo) = (p("OAIY/resources/engines/oaiy-voice"), p("data/bin/oaiy-voice"), p("repo/oaiy-voice"));
+        let (used, note) = pick_program(Some(own.clone()), Some(bin.clone()), Some(repo.clone()));
+        assert_eq!(used, Some(own.clone()));
+        let note = note.expect("a bin copy passed over is said in the log");
+        assert!(note.contains(&bin.display().to_string()) && note.contains(&own.display().to_string()), "{note}");
+        // With no OAIY of its own (an OAIY whose installer carries no voice), the bin copy is the one, and it still
+        // comes before a build left in the repository's release folder.
+        assert_eq!(pick_program(None, Some(bin.clone()), Some(repo.clone())), (Some(bin), None));
+        assert_eq!(pick_program(None, None, Some(repo.clone())), (Some(repo), None));
+        assert_eq!(pick_program(Some(own.clone()), None, None), (Some(own), None));
+        assert_eq!(pick_program(None, None, None), (None, None));
+    }
+
+    #[test]
+    fn a_bare_program_in_the_bin_folder_is_found_when_oaiy_has_none() {
+        // The registry's own lookup, against a real <data>/bin: a name OAIY carries no program for is found there.
+        let dir = std::env::temp_dir().join(format!("oaiy-bare-program-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new()).expect("a fresh temp dir is writable");
+        let name = "oaiy-test-helper-not-shipped";
+        let file = dir.join("bin").join(name);
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        assert_eq!(reg.bare_program(name), (Some(file), None));
+        assert_eq!(reg.bare_program("oaiy-test-helper-absent"), (None, None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
     use super::venv_name_in;
     use std::time::{Duration, Instant};

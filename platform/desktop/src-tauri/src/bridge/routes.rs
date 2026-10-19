@@ -1302,17 +1302,25 @@ async fn install_plugin(
 
     // A running plugin holds its executable open, so replacing it would fail mid-way (or, on a Mac, leave it running
     // from a folder taken away under it). The install stops the plugin it replaces once the package is unpacked and
-    // its id known, a folder's or an archive's alike.
+    // its id known, a folder's or an archive's alike, and starts it again after: the new one, or the old one put back
+    // where the swap failed. Left stopped, an update of the phone plugin ended its calls until someone pressed Start,
+    // under a toast that said "Updated".
     let host = st.host.clone();
     let installed = tokio::task::spawn_blocking(move || {
-        crate::plugins::install::install_from_path_stopping(&source, &root, &trust, |id| {
+        let mut was_running = None;
+        let installed = crate::plugins::install::install_from_path_stopping(&source, &root, &trust, |id| {
+            if host.running_ids().iter().any(|r| r == id) {
+                was_running = Some(id.to_string());
+            }
             let _ = host.stop(id);
-        })
+        });
+        let again = was_running.map(|id| start_again(&host, &id, &installed));
+        (installed, again)
     })
     .await;
 
     match installed {
-        Ok(Ok(out)) => {
+        Ok((Ok(out), again)) => {
             // Pick the new plugin up immediately rather than on the next poll.
             let mut setup = None;
             if let Ok(mut reg) = st.plugins.lock() {
@@ -1321,11 +1329,40 @@ async fn install_plugin(
                 setup = reg.get(&out.id).and_then(crate::setup::declared).cloned();
             }
             crate::modules::poke();
-            (StatusCode::OK, Json(install_reply(&out, setup.as_ref()))).into_response()
+            let mut reply = install_reply(&out, setup.as_ref());
+            match again {
+                Some(Ok(())) => reply["restarted"] = json!(true),
+                Some(Err(why)) => reply["notRestarted"] = json!(why),
+                None => {}
+            }
+            (StatusCode::OK, Json(reply)).into_response()
         }
-        Ok(Err(e)) => bridge_error(StatusCode::BAD_REQUEST, "invalid_request", e),
+        Ok((Err(e), again)) => bridge_error(StatusCode::BAD_REQUEST, "invalid_request", match again {
+            Some(Ok(())) => format!("{e}; the plugin was started again as it was"),
+            Some(Err(why)) => format!("{e}; and {why}"),
+            None => e,
+        }),
         Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
+}
+
+/// A plugin an install stopped (`id`, which was running), started again: the new package where it was installed,
+/// else the one it replaced, which the install put back. Not a new package that may not run yet (unsigned, in a
+/// release build, and not trusted by the person): that is said, and the person trusts it first. The start
+/// verifies the package again from its bytes whichever it is ([`crate::plugins::PluginHost::start`]). Why it was not
+/// started, where it was not.
+fn start_again(
+    host: &std::sync::Arc<crate::plugins::PluginHost>,
+    id: &str,
+    installed: &Result<crate::plugins::install::Installed, String>,
+) -> Result<(), String> {
+    if let Ok(out) = installed {
+        if !out.trust.allows_launch() {
+            let why = out.trust.reason.as_deref().unwrap_or("it is not trusted to run").trim_end_matches('.');
+            return Err(format!("{id} was not started again: its new package does not run until you trust it in Plugins ({why})"));
+        }
+    }
+    host.start(id).map_err(|e| format!("{id} was not started again: {e}"))
 }
 
 /// What an install answers: the plugin installed, and when it declares a
@@ -2715,6 +2752,80 @@ mod tests {
             assert_eq!(trust_of(&st, "other"), Some(crate::plugins::TrustState::Unsigned), "the id in the body was not read");
             let trusted = std::fs::read_to_string(sb.0.join("plugins").join("trusted-plugins.json")).unwrap();
             assert!(trusted.contains("\"demo\"") && !trusted.contains("\"other\"") && !trusted.contains("elsewhere"), "{trusted}");
+        }
+
+        /// A plugin that answers its handshake and ends at its stop, in a shell script, as version `version`: a
+        /// package to install from `<sandbox>/<from>`, or (`from` "plugins/<id>") the install itself.
+        #[cfg(unix)]
+        fn shell_plugin(sb: &Sandbox, from: &str, id: &str, version: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            const PLUGIN_SH: &str = r#"#!/bin/sh
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+while IFS= read -r line; do
+  case "$line" in *plugin.shutdown*) exit 0;; esac
+done
+"#;
+            let dir = sb.0.join(from);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.sh"), PLUGIN_SH).unwrap();
+            std::fs::set_permissions(dir.join("plugin.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let manifest = json!({
+                "schemaVersion": 3, "id": id, "name": format!("{id} plugin"), "version": version,
+                "pluginApiVersion": 1, "entry": { "kind": "process", "command": "plugin.sh" },
+                "capabilities": [], "connectors": [], "events": [],
+            });
+            std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+            dir
+        }
+
+        #[cfg(unix)]
+        async fn install(st: &BridgeState, source: &std::path::Path) -> (StatusCode, Value) {
+            read(install_plugin(State(st.clone()), Json(InstallBody { source: source.display().to_string() })).await).await
+        }
+
+        /// Updating a running plugin starts the new one: the install stopped it to swap the folder and left it stopped,
+        /// under a toast that said "Updated". One that was not running is not started by an update.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_update_starts_again_the_plugin_it_stopped() {
+            let (sb, st) = state_under("update-restart", TrustPolicy::developer(), Publishers::default());
+            shell_plugin(&sb, "plugins/probe", "probe", "0.1.0");
+            st.host.start("probe").expect("the old one starts");
+            let newer = shell_plugin(&sb, "newer", "probe", "0.2.0");
+            let (status, reply) = install(&st, &newer).await;
+            assert_eq!(status, StatusCode::OK, "{reply}");
+            assert_eq!((reply["replaced"].as_bool(), reply["restarted"].as_bool()), (Some(true), Some(true)), "{reply}");
+            assert_eq!(st.host.running_ids(), vec!["probe".to_string()]);
+            let version = st.plugins.lock().unwrap().get("probe").and_then(|r| r.manifest.as_ref().map(|m| m.version.clone()));
+            assert_eq!(version.as_deref(), Some("0.2.0"), "the new one runs");
+
+            st.host.stop("probe").unwrap();
+            let (status, reply) = install(&st, &shell_plugin(&sb, "newest", "probe", "0.3.0")).await;
+            assert_eq!(status, StatusCode::OK, "{reply}");
+            assert!(reply.get("restarted").is_none() && reply.get("notRestarted").is_none(), "{reply}");
+            assert!(st.host.running_ids().is_empty(), "a plugin that was stopped stays stopped");
+        }
+
+        /// A new package that is not trusted to run (unsigned, in a release build) is not started in its place, and
+        /// the reply says why: the person trusts it first.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_update_that_is_not_trusted_is_installed_and_not_started_and_says_so() {
+            let (sb, st) = release_state("update-untrusted", Publishers::default());
+            shell_plugin(&sb, "plugins/probe", "probe", "0.1.0");
+            read(trust_plugin(State(st.clone()), Path("probe".into())).await).await;
+            st.host.start("probe").expect("the trusted one starts");
+            let newer = shell_plugin(&sb, "newer", "probe", "0.2.0");
+            let (status, reply) = install(&st, &newer).await;
+            assert_eq!(status, StatusCode::OK, "{reply}");
+            assert_eq!(reply["trust"]["state"], "unsigned");
+            assert!(reply.get("restarted").is_none(), "{reply}");
+            let why = reply["notRestarted"].as_str().unwrap_or_default();
+            assert!(why.starts_with("probe was not started again: its new package does not run until you trust it in Plugins ("), "{reply}");
+            assert!(!why.contains(".)"), "{why}");
+            assert!(st.host.running_ids().is_empty(), "the untrusted package was not started");
         }
 
         #[tokio::test]

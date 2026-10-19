@@ -723,7 +723,7 @@ struct NewVoice {
 
 async fn voice_add(Query(q): Query<NewVoice>, body: axum::body::Bytes) -> axum::response::Response {
     let extension = q.file.rsplit('.').next().unwrap_or("").to_string();
-    match voices::add(&q.name, &extension, &body, q.words.as_deref()) {
+    match voices::add_own(&q.name, &extension, &body, q.words.as_deref()) {
         Ok(v) => {
             if q.choose.unwrap_or(false) {
                 let _ = voices::choose(&v.name);
@@ -988,9 +988,11 @@ fn the_gateway_is_served_unless_turned_off() {
 }
 
 /// The port the gateway listens on: 17872, or the one `OAIY_VOICE_GATEWAY` names (a second OAIY tried beside the
-/// desktop, with a stand-in phone of its own, serves its gateway there and leaves the desktop's port alone).
+/// desktop, with a stand-in phone of its own, serves its gateway there and leaves the desktop's port alone). A port is
+/// a number from 1024 up: below that it is the switch's word, `1` its on as `0` is its off, and `OAIY_VOICE_GATEWAY=1`
+/// had the gateway try to listen on port 1.
 fn gateway_port_by(setting: &str) -> u16 {
-    setting.trim().parse::<u16>().ok().filter(|p| *p != 0).unwrap_or(GATEWAY_PORT)
+    setting.trim().parse::<u16>().ok().filter(|p| *p >= 1024).unwrap_or(GATEWAY_PORT)
 }
 
 #[cfg(test)]
@@ -1000,6 +1002,11 @@ fn the_gateway_port_is_the_desktops_unless_one_is_named() {
     assert_eq!(gateway_port_by("on"), GATEWAY_PORT);
     assert_eq!(gateway_port_by(" 18171 "), 18_171);
     assert!(gateway_wanted_by("18171"));
+    // On, as a switch says it: the desktop's port, not port 1.
+    assert!(gateway_wanted_by("1"));
+    assert_eq!(gateway_port_by("1"), GATEWAY_PORT);
+    assert_eq!(gateway_port_by("80"), GATEWAY_PORT);
+    assert_eq!(gateway_port_by("1024"), 1024);
 }
 
 /// Serve the gateway on 127.0.0.1:17872 (or `OAIY_VOICE_GATEWAY`'s port) until the process ends (a port in use is

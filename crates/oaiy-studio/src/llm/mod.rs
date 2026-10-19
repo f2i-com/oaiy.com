@@ -204,6 +204,15 @@ pub fn holds_a_model(llm: &Json) -> bool {
 /// What the log says when [`holds_a_model`] is false and the engine is left stopped.
 pub const ALL_ON_EGPU: &str = "the language model runs on the eGPU: this computer's engine starts only for a request for a model of its own, or one the eGPU cannot answer";
 
+/// What a request for `name` is told by a running server that was started without it, which runs `models`
+/// ([`Llm::ensure_ready`]).
+fn not_started_with(name: &str, models: &[String]) -> String {
+    format!(
+        "{name} is not loaded on this computer: its engine runs {} and was started without {name}, and it is not restarted for one request (one model is loaded at a time, and that would unload the one it holds)",
+        models.join(", ")
+    )
+}
+
 /// What a start of the language model is told once the studio has stopped ([`Llm::close`]).
 const CLOSED: &str = "the studio is stopping: the language model is not started again";
 
@@ -433,6 +442,15 @@ impl Llm {
         g.state = State::Ready;
     }
 
+    /// [`Llm::adopt`], started with `models` (the first one held), as a real start records them.
+    #[cfg(test)]
+    pub(crate) fn adopt_serving(&self, addr: &str, key: &str, models: &[&str]) {
+        self.adopt(addr, key);
+        let mut g = self.lock();
+        g.models = models.iter().map(|m| m.to_string()).collect();
+        g.resident = g.models.first().cloned();
+    }
+
     /// Start the server for `cfg` (the whole configuration) unless it runs.
     pub fn start(self: &Arc<Self>, cfg: &Json, root: &Path) -> Result<(), String> {
         self.start_for(cfg, root, None)
@@ -656,13 +674,30 @@ impl Llm {
         matches!(g.state, State::Starting | State::Ready).then(|| g.resident.clone()).flatten()
     }
 
-    /// A request is about to switch the server to `name`.
+    /// A request is about to switch the server to `name`. Not one the server was started without: it does not load
+    /// that, and the status said the eGPU's model was loaded here while this computer's own answered.
     pub fn set_resident(&self, name: String) {
-        self.lock().resident = Some(name);
+        let mut g = self.lock();
+        if g.models.is_empty() || g.models.contains(&name) {
+            g.resident = Some(name);
+        }
+    }
+
+    /// Whether the server runs, started without `name` ([`Llm::ensure_ready`] refuses a request that names it).
+    pub fn lacks(&self, name: &str) -> bool {
+        let g = self.lock();
+        matches!(g.state, State::Starting | State::Ready) && !g.models.is_empty() && !g.models.iter().any(|m| m == name)
     }
 
     /// Start if needed and wait until it serves (or fails, or `timeout` passes). A server started here loads
     /// `first`, the model the request names, as it starts.
+    ///
+    /// A server already running that was started without `first` is not restarted for it: it answers an error
+    /// instead ([`not_started_with`]). Such a model is one set to run on the eGPU, whose server holds it, asked for
+    /// while the card does not answer (gone, or lent to a pin) and this computer's engine runs a model of its own. Sent
+    /// on, the request had a 400 from the engine for a model it does not know, and the status said that model was the
+    /// one loaded here. Restarting with it would unload the model this engine holds, under whatever it is answering,
+    /// for one request: one model is loaded at a time, and the one here is the one chosen to be here.
     pub fn ensure_ready(self: &Arc<Self>, cfg: &Json, root: &Path, first: Option<&str>, timeout: Duration) -> Result<Endpoint, String> {
         let held_back = {
             let g = self.lock();
@@ -678,6 +713,9 @@ impl Llm {
         }
         let deadline = Instant::now() + timeout;
         let mut g = self.lock();
+        if let Some(name) = first.filter(|n| matches!(g.state, State::Starting | State::Ready) && !g.models.is_empty() && !g.models.iter().any(|m| m == *n)) {
+            return Err(not_started_with(name, &g.models));
+        }
         loop {
             match g.state {
                 State::Ready => {
@@ -896,6 +934,23 @@ mod tests {
         // a start asked for by name is not held back
         assert!(llm.start(&cfg, &std::env::temp_dir()).is_err());
         assert_eq!(llm.lock().failures, 2);
+    }
+
+    /// A running server started without the model a request names (the eGPU's, the card gone or lent) answers an
+    /// error, and is not said to hold that model: it went to the engine, which answered 400, and the status said the
+    /// model was loaded here.
+    #[test]
+    fn a_running_server_without_the_model_asked_for_says_so() {
+        let llm = Arc::new(Llm::new());
+        llm.adopt_serving("127.0.0.1:9", "k", &["small", "tiny"]);
+        let cfg = Json::parse(br#"{"llm": {"models": [{"name": "big", "path": "big.gguf", "egpu": true}, {"name": "small", "path": "small.gguf"}]}}"#).unwrap();
+        let err = llm.ensure_ready(&cfg, &std::env::temp_dir(), Some("big"), Duration::from_secs(1)).unwrap_err();
+        assert!(err.contains("big is not loaded on this computer") && err.contains("small, tiny"), "{err}");
+        assert_eq!(llm.state(), State::Ready, "the engine is left running its own model");
+        assert_eq!(llm.resident().as_deref(), Some("small"));
+        // A model it was started with, or none named, is answered as ever.
+        assert!(llm.ensure_ready(&cfg, &std::env::temp_dir(), Some("tiny"), Duration::from_secs(1)).is_ok());
+        assert!(llm.ensure_ready(&cfg, &std::env::temp_dir(), None, Duration::from_secs(1)).is_ok());
     }
 
     #[test]

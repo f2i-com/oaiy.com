@@ -84,9 +84,11 @@ fn list_in(dir: &Path) -> Vec<VoiceClip> {
 
 /// Whether `name` is a copy of another computer's voice, kept here for its calls (OAIY Network: `from-<id>-<name>`,
 /// the id sixteen hex digits of that computer's certificate, or six of its node id as copies were first named):
-/// spoken in when that computer asks, never this computer's own.
+/// spoken in when that computer asks, never this computer's own. Hex digits only: any six letters were read as an id,
+/// and a voice named "from london office" was taken for a copy and hidden. (A name of one's own that begins so is
+/// refused: [`add_own`].)
 pub fn is_copy(name: &str) -> bool {
-    name.strip_prefix("from-").and_then(|rest| rest.split_once('-')).is_some_and(|(id, voice)| matches!(id.len(), 6 | 16) && id.chars().all(|c| c.is_ascii_alphanumeric()) && !voice.is_empty())
+    name.strip_prefix("from-").and_then(|rest| rest.split_once('-')).is_some_and(|(id, voice)| matches!(id.len(), 6 | 16) && id.chars().all(|c| c.is_ascii_hexdigit()) && !voice.is_empty())
 }
 
 /// The voices, by name (this computer's own: not the copies kept for another computer's calls).
@@ -138,6 +140,20 @@ pub fn choose(name: &str) -> Result<String, String> {
     let clip = list_in(dir).into_iter().find(|c| c.name.eq_ignore_ascii_case(name.trim())).ok_or_else(|| format!("no voice called {name:?}"))?;
     std::fs::write(dir.join("chosen"), &clip.name).map_err(|e| e.to_string())?;
     Ok(clip.name)
+}
+
+/// [`add`], for a voice of this computer's own (the Voices page): not one named as the copies of another computer's are
+/// (`from-…`), which would be hidden among them, or take one's place.
+pub fn add_own(name: &str, extension: &str, clip: &[u8], words: Option<&str>) -> Result<VoiceClip, String> {
+    let dir = dir().ok_or("the voices folder is not set up")?;
+    add_own_in(dir, name, extension, clip, words)
+}
+
+fn add_own_in(dir: &Path, name: &str, extension: &str, clip: &[u8], words: Option<&str>) -> Result<VoiceClip, String> {
+    if clean_name(name)?.to_ascii_lowercase().starts_with("from-") {
+        return Err("a voice's name cannot begin with \"from\": that is how the copies of another computer's voices are named here".into());
+    }
+    add_in(dir, name, extension, clip, words)
 }
 
 /// Keep a clip as the voice `name` (replacing one of that name), and what it says when given.
@@ -316,6 +332,27 @@ mod tests {
         assert!(is_copy("from-a1b2c3-front-desk") && !is_copy("from-mum") && !is_copy("from-a1b2c-x") && !is_copy("receptionist"));
         // (named by sixteen hex digits of that computer's certificate, as OAIY Network copies them now)
         assert!(is_copy("from-a1b2c3d4e5f60718-front-desk") && !is_copy("from-a1b2c3d4e5f6071-x"));
+        // A voice of one's own whose name begins with "from" and a six-letter word is not a copy.
+        assert!(!is_copy("from-london-office") && !is_copy("from-sydney-desk1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A voice of one's own is not named as the copies are: "from london office" was hidden as one, and a name
+    /// like a copy's would take a copy's place.
+    #[test]
+    fn a_voice_of_ones_own_may_not_be_named_as_a_copy_is() {
+        let dir = folder("own-names");
+        seed(&dir).unwrap();
+        let clip = vec![1u8; 4096];
+        for name in ["from london office", "From-a1b2c3-front-desk", " from-x "] {
+            let err = add_own_in(&dir, name, "wav", &clip, None).unwrap_err();
+            assert!(err.contains("cannot begin with \"from\""), "{name}: {err}");
+        }
+        assert_eq!(list_in(&dir).len(), 1, "nothing was kept");
+        // Another name, "from" inside it, is kept and listed as one's own.
+        let kept = add_own_in(&dir, "calls from london", "wav", &clip, None).unwrap();
+        assert_eq!(kept.name, "calls-from-london");
+        assert!(!is_copy(&kept.name));
         let _ = std::fs::remove_dir_all(dir);
     }
 

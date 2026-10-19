@@ -147,8 +147,13 @@ const OUTCOME_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// A run's end as an event: `flow.succeeded`, `flow.failed`, `flow.timed_out` or `flow.cancelled`, from `flows`,
 /// with the run (its id, flow, state, error, answer) as its data and the run as its origin: the lineage the loop
-/// guards read, its tree's root (the run itself at the top of one) and the binding that started it. With the
-/// envelope it is kept as. `None` for a run that has not ended.
+/// guards read, its tree's root (the run itself at the top of one) and the binding that started it. `None` for a run
+/// that has not ended.
+///
+/// With the envelope it is kept as (the events' ring, a dead letter), whose data is the run's id and state alone
+/// ([`stored_outcome`]): the bindings it is dispatched to map its answer and error into their flows, but whoever
+/// may read events (`events.read`) is not one who may read runs (`runs.read`), and the kept copy handed them up to
+/// 64 KiB of a run's answer and its error. A redrive reads the rest from the run again.
 pub(crate) fn outcome_event(run: &RunRecord) -> Option<(Event, Value)> {
     if !run.status.is_terminal() {
         return None;
@@ -189,7 +194,27 @@ pub(crate) fn outcome_event(run: &RunRecord) -> Option<(Event, Value)> {
         "data": data,
     });
     let event = Event { name, source: "flows".into(), correlation_id: correlation, idempotency_key: key, data, origin_run: Some(origin) };
-    Some((event, envelope))
+    Some((event, stored_outcome(envelope)))
+}
+
+/// An outcome's envelope as it is kept: its data the run's id and state, nothing of what the run answered or the
+/// error it ended with ([`outcome_event`]).
+fn stored_outcome(mut envelope: Value) -> Value {
+    let data = &envelope["data"];
+    let kept = json!({ "runId": data["runId"].clone(), "status": data["status"].clone() });
+    envelope["data"] = kept;
+    envelope
+}
+
+/// What a redrive dispatches as a kept outcome's data: the whole of it again, read from the run its envelope names
+/// (`ledger`), as it was dispatched the first time. `None` for an envelope that is no outcome, or whose run is no
+/// longer kept: then the kept data is all there is.
+fn outcome_data_again(ledger: &crate::bridge::ledger::Ledger, source: &str, envelope: &Value) -> Option<Value> {
+    if source != "flows" {
+        return None;
+    }
+    let run = ledger.get(envelope.get("data")?.get("runId")?.as_str()?)?;
+    outcome_event(&run).map(|(event, _)| event.data)
 }
 
 /// Default deadline for a forwarded connector command.
@@ -522,9 +547,11 @@ struct ProcTable {
     /// dongle it opened during init. So the handle is published here from the
     /// instant the child exists, and `stop_all` can actually stop it.
     starting_procs: HashMap<String, Arc<PluginProcess>>,
-    /// Ids being stopped: out of `running`, but the process is still being asked to exit (up to the shutdown grace,
-    /// then killed). A start waits for it: one started in that window ran beside the copy still on its way out.
-    stopping: std::collections::HashSet<String>,
+    /// Plugins being stopped: out of `running`, but the process is still being asked to exit (up to the shutdown
+    /// grace, then killed). A start waits for it: one started in that window ran beside the copy still on its way out.
+    /// And `stop_all` ends it: kept only as an id, a Quit during that grace returned before the stop had killed it,
+    /// and the process outlived OAIY holding its hardware.
+    stopping: HashMap<String, Arc<PluginProcess>>,
     /// Crash-restart due times. In the table — NOT supervisor-local — so a
     /// manual stop() can cancel one before it fires.
     restarts: HashMap<String, Instant>,
@@ -897,7 +924,7 @@ impl PluginHost {
         // caller's outcome deterministic: idempotent success.
         // A stop still under way finishes first (its process exits, or is killed, within the shutdown grace).
         let stop_waited_until = Instant::now() + super::runner::SHUTDOWN_GRACE + Duration::from_secs(2);
-        while self.procs.lock().map_err(|_| "process table poisoned")?.stopping.contains(id) {
+        while self.procs.lock().map_err(|_| "process table poisoned")?.stopping.contains_key(id) {
             if Instant::now() > stop_waited_until {
                 return Err(format!("{id} is still stopping: try again in a moment"));
             }
@@ -905,7 +932,7 @@ impl PluginHost {
         }
         {
             let mut t = self.procs.lock().map_err(|_| "process table poisoned")?;
-            if t.stopping.contains(id) {
+            if t.stopping.contains_key(id) {
                 return Err(format!("{id} is still stopping: try again in a moment"));
             }
             if let Some(existing) = t.running.get(id) {
@@ -1137,8 +1164,8 @@ impl PluginHost {
             }
             t.started_at.remove(id);
             let process = t.running.remove(id);
-            if process.is_some() {
-                t.stopping.insert(id.to_string());
+            if let Some(p) = &process {
+                t.stopping.insert(id.to_string(), Arc::clone(p));
             }
             (process, in_flight)
         };
@@ -1182,7 +1209,8 @@ impl PluginHost {
 
     /// Stop everything. Called on app exit so no child outlives the host.
     pub fn stop_all(&self) {
-        let (drained, in_flight): (Vec<(String, Arc<PluginProcess>)>, Vec<(String, Arc<PluginProcess>)>) =
+        type Procs = Vec<(String, Arc<PluginProcess>)>;
+        let (drained, in_flight, being_stopped): (Procs, Procs, Procs) =
             match self.procs.lock() {
                 Ok(mut t) => {
                     // Nothing new may spawn, no restart may fire, and any
@@ -1194,7 +1222,9 @@ impl PluginHost {
                         t.stop_during_start.insert(id);
                     }
                     t.started_at.clear();
-                    (t.running.drain().collect(), t.starting_procs.drain().collect())
+                    // (left in `stopping`, which its stop takes it out of: a start meanwhile still waits for it)
+                    let stopping = t.stopping.iter().map(|(id, p)| (id.clone(), Arc::clone(p))).collect();
+                    (t.running.drain().collect(), t.starting_procs.drain().collect(), stopping)
                 }
                 Err(_) => return,
             };
@@ -1221,6 +1251,18 @@ impl PluginHost {
             // so it has no state to flush.
             p.kill();
             self.set_state(&id, PluginState::Stopped, Some("OAIY Desktop is exiting.".into()));
+        }
+        // Plugins a stop is still under way for, on another thread: it asked each to exit and kills it past the grace,
+        // but this process exits as soon as this returns. So each is waited for as long as that stop would take, and
+        // killed here if it is still there.
+        for (_id, p) in being_stopped {
+            let until = Instant::now() + super::runner::SHUTDOWN_GRACE + Duration::from_secs(1);
+            while p.check_exited().is_none() && Instant::now() < until {
+                thread::sleep(Duration::from_millis(100));
+            }
+            if p.check_exited().is_none() {
+                p.kill();
+            }
         }
     }
 
@@ -2088,10 +2130,12 @@ impl PluginHost {
                     continue;
                 }
                 trackers.remove(&id);
-                let reason = match code {
+                // (one OAIY ended itself, for a line over the protocol's limit, says so: "killed or crashed" sent
+                // the person looking for a crash)
+                let reason = process.ended_by_host().unwrap_or_else(|| match code {
                     Some(c) => format!("Exited with code {c}."),
                     None => "Exited (killed or crashed with no code).".into(),
-                };
+                });
                 let attempts = self
                     .registry
                     .lock()
@@ -2412,7 +2456,14 @@ impl PluginHost {
             } else {
                 original_key.to_string()
             },
-            data: envelope.get("data").cloned().unwrap_or(Value::Null),
+            // (a run's outcome is kept with its id and state alone: its answer and error are read from the run again)
+            data: self
+                .ledger
+                .lock()
+                .ok()
+                .and_then(|l| outcome_data_again(&l, &item.source, envelope))
+                .or_else(|| envelope.get("data").cloned())
+                .unwrap_or(Value::Null),
             origin_run: item.origin_run.clone(),
         };
 
@@ -3525,10 +3576,53 @@ mod tests {
         assert_eq!(event.idempotency_key, "flow:run_9:failed");
         let origin = event.origin_run.unwrap();
         assert_eq!((origin.root_run_id.as_deref(), origin.parent_run_id.as_deref(), origin.binding_id.as_deref(), origin.depth), (Some("run_1"), Some("run_9"), Some("b1"), 2));
-        assert_eq!(envelope["data"]["error"]["code"], "node_failed");
-        assert_eq!(envelope["data"]["flowId"], "answer");
+        // Its bindings are handed the run (its flow, its error); the copy kept for whoever reads events, its id and
+        // state alone.
+        assert_eq!(event.data["error"]["code"], "node_failed");
+        assert_eq!(event.data["flowId"], "answer");
+        assert_eq!(envelope["data"], json!({ "runId": "run_9", "status": "failed" }));
+        assert_eq!(envelope["name"], "flow.failed");
         run.status = RunStatus::Running;
         assert!(outcome_event(&run).is_none(), "a run going on has no outcome yet");
+    }
+
+    /// A run's answer and error reach the bindings that listen for its outcome, but not the copies kept of it, which
+    /// whoever may read events reads (the ring) and the dead letters keep: their data is the run's id and state. A
+    /// redrive hands the binding the whole outcome again, from the run.
+    #[test]
+    fn a_kept_outcome_holds_the_run_id_alone_and_a_redrive_reads_the_rest_from_the_run() {
+        let refusing = Arc::new(crate::bridge::conditions::testing::FakeHost::by_source(|_| {
+            Err(crate::bridge::conditions::testing::guest("SyntaxError: unexpected token '='"))
+        }));
+        let mut then = TriggerBinding { event: "flow.succeeded".into(), flow_id: "tidy".into(), ..binding("then", Some("$event.data.output ==== 1")) };
+        then.input_map.insert("said".into(), "$event.data.output".into());
+        let (_sb, host) = host_evaluating("kept-outcome", vec![then.clone()], refusing);
+        let first = match host.ledger.lock().unwrap().reserve(&RunRequest { caller_product: "oaiy-desktop".into(), flow_id: Some("greeting".into()), inline_graph: false, input: None, timeout_ms: None, mode: "async".into(), correlation_id: "c".into(), idempotency_key: "direct".into(), lineage: Default::default(), trigger_event: None, caller_label: None }) {
+            ReserveOutcome::Reserved(r) => r,
+            other => panic!("{other:?}"),
+        };
+        {
+            let mut l = host.ledger.lock().unwrap();
+            assert!(matches!(l.claim(&first.run_id, crate::bridge::ledger::Runtime::Desktop, "w"), crate::bridge::ledger::ClaimOutcome::Claimed(_)));
+            l.finish(&first.run_id, RunStatus::Succeeded, Some(json!({ "note": "a fictional caller's note" })), None).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        while host.dead.lock().unwrap().is_empty() {
+            assert!(Instant::now() < until, "the outcome's binding failed and was kept");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let kept = json!({ "runId": first.run_id, "status": "succeeded" });
+        let dead = host.dead.lock().unwrap().list(1)[0].clone();
+        assert_eq!(dead.envelope["data"], kept, "the dead letter keeps no answer");
+        assert_eq!(host.events_since(0, 10)[0].envelope["data"], kept, "nor does the events' ring");
+
+        then.condition = None;
+        host.triggers.lock().unwrap().upsert(then).unwrap();
+        let (outcomes, reserved) = host.redrive(&dead.id).expect("the entry exists");
+        assert!(reserved, "{outcomes:?}");
+        let tidy = host.ledger.lock().unwrap().recent(1, &[])[0].clone();
+        assert_eq!(tidy.flow_id.as_deref(), Some("tidy"));
+        assert_eq!(tidy.input.as_ref().map(|i| i["said"].clone()), Some(json!({ "note": "a fictional caller's note" })), "the redrive read the answer from the run");
     }
 
     #[test]
@@ -3839,6 +3933,43 @@ mod tests {
         host.stop_all();
         let err = host.start("aokie").unwrap_err();
         assert!(err.contains("shutting down"), "{err}");
+    }
+
+    /// A Quit while a plugin is being stopped (in its shutdown grace, out of `running`) still ends it: `stop_all`
+    /// returned at once, and the plugin outlived OAIY until the stop's own kill, or for good where OAIY had gone.
+    #[cfg(unix)]
+    #[test]
+    fn quitting_while_a_plugin_is_being_stopped_still_ends_it() {
+        use std::os::unix::fs::PermissionsExt;
+        // Answers the handshake, then ignores everything, its stop and the end of its input too.
+        const PLUGIN_SH: &str = r#"#!/bin/sh
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+while IFS= read -r line; do :; done
+sleep 300
+"#;
+        let (sb, host, _trust) = trusting_host("quit-stopping", TrustPolicy::developer(), Publishers::default());
+        let dir = sb.0.join("plugins").join("probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.sh"), PLUGIN_SH).unwrap();
+        std::fs::set_permissions(dir.join("plugin.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("manifest.json"), plugin_manifest("probe", "plugin.sh")).unwrap();
+        host.start("probe").expect("the stand-in starts");
+        let process = Arc::clone(host.procs.lock().unwrap().running.get("probe").expect("running"));
+
+        let stopping = {
+            let host = Arc::clone(&host);
+            thread::spawn(move || host.stop("probe"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !host.procs.lock().unwrap().stopping.contains_key("probe") {
+            assert!(Instant::now() < deadline, "the stop never began");
+            thread::sleep(Duration::from_millis(10));
+        }
+        host.stop_all();
+        assert!(process.check_exited().is_some(), "the plugin being stopped outlived the Quit");
+        stopping.join().unwrap().unwrap();
     }
 
     #[test]

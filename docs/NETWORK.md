@@ -238,7 +238,8 @@ computer connected to the phone stays the primary: its calls, the transcription 
 flow editor's speech-to-text and the Agent's listening) then send their speech-to-text and speech to the worker,
 which starts its OAIY Voice when asked. A call's voice is copied to the worker the first time it is used there (kept
 there as `from-<primary>-<name>`, beside the worker's own voices, `<primary>` being sixteen hex digits of the primary's
-certificate, which no other computer can take as its own, as it could a node id). A plugin's setup that asks for OAIY Voice counts
+certificate, which no other computer can take as its own, as it could a node id; a voice added by hand may not begin
+with `from-`, and a name is a copy only where `<primary>` is hex digits). A plugin's setup that asks for OAIY Voice counts
 the worker's. Set with `PUT /api/network/settings` `{"services": {"oaiy-voice": "<nodeId>"}}` (`null` gives it back),
 listed in `GET /api/network/status` as `services` (each with `heard`, whether that computer has been heard from since
 this one started, and `online`). While that computer does not answer (its heartbeat found it so, or it does not

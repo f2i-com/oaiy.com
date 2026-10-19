@@ -135,6 +135,21 @@ pub struct PluginProcess {
     write_tx: WriteTx,
     pending: Pending,
     next_id: Arc<Mutex<i64>>,
+    /// Why OAIY ended the process itself, where it did ([`Self::ended_by_host`]): its output could not be read on
+    /// (a line over the protocol's limit). The supervisor said "killed or crashed" of it, which is neither.
+    ended_by_host: Arc<Mutex<Option<String>>>,
+}
+
+/// What the plugin's state says of a process ended for its output: a line over the protocol's limit, or one that
+/// could not be read.
+fn ended_for(e: &RpcError) -> String {
+    match e {
+        RpcError::LineTooLong { bytes } => format!(
+            "Stopped by OAIY Desktop: it wrote a line of {bytes} bytes, over the {} MiB a line of the plugin protocol may be.",
+            rpc::MAX_LINE_BYTES / (1024 * 1024)
+        ),
+        other => format!("Stopped by OAIY Desktop: its output could not be read ({other})."),
+    }
 }
 
 /// Does a launch move a legacy `<plugin>/data` folder out of a package in this state?
@@ -272,6 +287,7 @@ impl PluginProcess {
         let child = Arc::new(Mutex::new(Some(child)));
         // Requests of the plugin's being answered now, each on a thread of its own: at most MAX_PLUGIN_REQUESTS.
         let answering = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ended_by_host: Arc<Mutex<Option<String>>> = Arc::default();
 
         // Bounded: an unbounded channel to a wedged writer grows without limit.
         // 256 lines of headroom absorbs bursts (an event storm of acks) while a
@@ -325,6 +341,7 @@ impl PluginProcess {
             let allowed_events: Vec<String> = manifest.events.clone();
             let child_for_reader = child.clone();
             let answering = answering.clone();
+            let ended_by_host = ended_by_host.clone();
             thread::spawn(move || {
                 let mut r = BufReader::new(stdout);
                 loop {
@@ -340,8 +357,12 @@ impl PluginProcess {
                             logs.push("stderr", format!("[protocol] {e}"));
                             fail_all(&pending, CallError::Transport(e.to_string()));
                             // And the plugin is stopped: alive but no longer read, every later call would wait out its
-                            // whole timeout, and the supervisor restarts only one that has exited.
+                            // whole timeout, and the supervisor restarts only one that has exited. Its whole tree, as
+                            // `PluginProcess::kill` ends it: the direct child alone is a shim's, whose helpers lived on
+                            // (under pid 1) holding the plugin's hardware.
+                            *ended_by_host.lock().unwrap_or_else(|p| p.into_inner()) = Some(ended_for(&e));
                             if let Some(c) = child_for_reader.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                                crate::services::registry::kill_process_tree(c.id());
                                 let _ = c.kill();
                             }
                             break;
@@ -437,7 +458,14 @@ impl PluginProcess {
             write_tx,
             pending,
             next_id: Arc::new(Mutex::new(1)),
+            ended_by_host,
         })
+    }
+
+    /// Why OAIY ended the process itself, where it did (its output could not be read on); None for an exit of its own,
+    /// a stop or a kill.
+    pub fn ended_by_host(&self) -> Option<String> {
+        self.ended_by_host.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Send a request and wait for its reply.
@@ -1251,6 +1279,94 @@ process.stdin.on("data", (chunk) => {
             );
             assert!(!env.contains_key("OPENAI_API_KEY"));
             assert!(env.contains_key("OAIY_PLUGIN_ID"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unix: a plugin that breaks the protocol (a line over its limit) is ended with
+    // the helpers it started, as a kill ends it. Asked of `ps`, so a Mac runs it too.
+    #[cfg(unix)]
+    mod protocol_error {
+        use super::super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        /// Starts a helper of its own, says where both are, then writes a line over
+        /// the protocol's limit and reads on, so nothing but a kill ends it.
+        const PLUGIN_SH: &str = r#"#!/bin/sh
+sleep 300 &
+echo $! > "$OAIY_PLUGIN_DATA_DIR/helper.pid"
+echo $$ > "$OAIY_PLUGIN_DATA_DIR/plugin.pid"
+head -c 1100000 /dev/zero | tr '\0' x
+echo
+while IFS= read -r line; do :; done
+sleep 300
+"#;
+
+        /// Running, as `ps` says (a zombie only waits to be reaped).
+        fn alive(pid: u32) -> bool {
+            std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .is_some_and(|stat| !stat.is_empty() && !stat.starts_with('Z'))
+        }
+
+        #[test]
+        fn a_plugin_over_the_line_limit_is_ended_with_its_helpers() {
+            let root = std::env::temp_dir().join(format!("oaiy-plugline-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let dir = root.join("plugins").join("fake");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("plugin.sh"), PLUGIN_SH).unwrap();
+            fs::set_permissions(dir.join("plugin.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(
+                dir.join("manifest.json"),
+                serde_json::json!({
+                    "schemaVersion": 3, "id": "fake", "name": "Fake plugin", "version": "0.0.1",
+                    "pluginApiVersion": 1,
+                    "entry": { "kind": "process", "command": "plugin.sh" },
+                    "capabilities": [], "connectors": [], "events": [],
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let manifest = PluginManifest::load(&dir).unwrap();
+            let p = PluginProcess::spawn(SpawnOptions {
+                desktop_version: "0.1.0".into(),
+                dev_mode: false,
+                permit: LaunchPermit::unchecked_for_tests(&dir, manifest),
+                events: Arc::new(|_name, _payload| {}),
+                requests: Arc::new(|_method, _params| Ok(serde_json::json!({}))),
+            })
+            .expect("spawn the plugin");
+            let pid = |name: &str| {
+                let file = plugin_data_dir(&dir).join(name);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(pid) = fs::read_to_string(&file).ok().and_then(|t| t.trim().parse::<u32>().ok()) {
+                        return pid;
+                    }
+                    assert!(Instant::now() < deadline, "the plugin never wrote {name}");
+                    thread::sleep(Duration::from_millis(20));
+                }
+            };
+            let (plugin, helper) = (pid("plugin.pid"), pid("helper.pid"));
+            assert_eq!(plugin, p.pid);
+            // Its line is refused, and it and its helper are ended: the helper lived on when only the plugin was.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while (p.check_exited().is_none() || alive(helper)) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert!(p.check_exited().is_some(), "the plugin was ended");
+            assert!(!alive(helper), "the helper the plugin started outlived it");
+            // And its state says why, not "killed or crashed".
+            let why = p.ended_by_host().expect("ended by OAIY, and said so");
+            assert!(why.contains("over the 1 MiB a line of the plugin protocol may be"), "{why}");
+            drop(p);
+            let _ = fs::remove_dir_all(&root);
         }
     }
 

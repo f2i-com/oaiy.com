@@ -303,6 +303,15 @@ fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json,
     Some(result)
 }
 
+/// Why this computer's engine did not answer a request, said for the eGPU's model where it was one (`card_away`):
+/// the card did not answer it, and no model is named to stand in for it, which is what would answer it here.
+fn egpu_model_here(card_away: Option<&str>, why: String) -> String {
+    match card_away {
+        Some(name) => format!("{name} runs on the eGPU, which does not answer this request (the card gone, or kept by a pinned picture model, or a request its server does not take), and no model is named to answer in its place (Engines, eGPU: \"When the card is not there, answer with\"). {why}"),
+        None => why,
+    }
+}
+
 /// A request's body with another `model` (the one that answers on this computer for a model the eGPU does not).
 fn with_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
     let mut v = Json::parse(body).ok().filter(|v| v.as_object().is_some())?;
@@ -327,11 +336,15 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     // not running loads its default model first); one on other GPUs goes ahead.
     let requested = Json::parse(&req.body).ok().and_then(|b| b.get("model").and_then(Json::as_str).map(str::to_owned));
     let mut model = media::resolve_model(&cfg, requested.as_deref());
+    // (the request names this model itself, not the default it was given for no name or a name not configured)
+    let named = requested.is_some() && requested == model;
     // A model set to run on the eGPU (a Mac's, through tinygrad's server): its chats are answered there while that
     // server answers. Otherwise, and for what that server does not do, this computer's engine answers, with the
     // model named to stand in for it where one is.
     let mut body = std::borrow::Cow::Borrowed(&req.body[..]);
     let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+    // (the eGPU's model, asked for here with no other to stand in for it: what an error here says first)
+    let mut card_away = None;
     if let Some(name) = model.clone().filter(|m| crate::llm::egpu::assigned(&llm, m)) {
         if upstream == "/v1/chat/completions" {
             if let Some(answered) = egpu_chat(studio, req, w, &cfg, &name) {
@@ -344,6 +357,8 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
                 body = std::borrow::Cow::Owned(rewritten);
                 model = Some(stands_in);
             }
+        } else {
+            card_away = Some(name);
         }
     }
     let exclusive = media::needs_media_gpu(&cfg, model.as_deref()) || (!studio.llm.is_running() && media::needs_media_gpu(&cfg, None));
@@ -351,9 +366,13 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
         Ok(l) => l,
         Err(e) => return send(w, Err(fail(503, e))),
     };
-    let endpoint = match studio.llm.ensure_ready(&cfg, &studio.root, model.as_deref(), LOAD_WAIT) {
+    // A request that names no model is answered by the model this computer's engine holds where it holds another than
+    // the default (the eGPU's, which does not answer), as it was; one that names a model it was started without is
+    // refused there, and says why (`Llm::ensure_ready`).
+    let first = model.as_deref().filter(|m| named || !studio.llm.lacks(m));
+    let endpoint = match studio.llm.ensure_ready(&cfg, &studio.root, first, LOAD_WAIT) {
         Ok(e) => e,
-        Err(e) => return send(w, Err(fail(503, e))),
+        Err(e) => return send(w, Err(fail(503, egpu_model_here(card_away.as_deref(), e)))),
     };
     if let Some(m) = model {
         studio.llm.set_resident(m);
@@ -1662,6 +1681,33 @@ mod tests {
             // The next requests go straight to this computer's engine until it is tried again, and the log says it once.
             assert_eq!(chat(&studio, r#"{"model": "big", "messages": []}"#).0, 200);
             assert_eq!(studio.log.tail(10).matches("the eGPU does not answer").count(), 1);
+        }
+    }
+
+    /// The card gone (or kept by a pinned picture model), no model named to stand in, and this computer's engine
+    /// running a model of its own, started without the card's: the request was sent there, the engine answered 400 for
+    /// a model it does not know, and the status said the card's model was loaded here. It is answered 503, saying why.
+    #[test]
+    fn the_egpus_model_is_not_sent_to_an_engine_here_that_was_started_without_it() {
+        let root = std::env::temp_dir();
+        let studio = egpu_studio(&root, "");
+        let engine = StandIn::new(ENGINE_SAYS);
+        studio.llm.adopt_serving(&engine.addr, "sk-studio-test", &["small"]);
+        let gone = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().to_string() };
+        studio.egpu.adopt(&gone, "sk-egpu-test", "big", None);
+        let (status, _, body) = chat(&studio, r#"{"model": "big", "messages": [{"role": "user", "content": "hi"}]}"#);
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("big runs on the eGPU") && body.contains("big is not loaded on this computer") && body.contains("runs small"), "{body}");
+        assert!(engine.requests().is_empty(), "this computer's engine was not asked");
+        assert_eq!(studio.llm.resident().as_deref(), Some("small"), "nor said to hold the card's model");
+        // Its own model is answered there as ever.
+        assert_eq!(chat(&studio, r#"{"model": "small", "messages": []}"#).0, 200);
+        // A request that names no model (the default, the first: the card's), or one not configured, is answered by
+        // the model it holds, as it was, and the status does not say the card's model is loaded here.
+        for unnamed in [r#"{"messages": [{"role": "user", "content": "hi"}]}"#, r#"{"model": "gpt-4o", "messages": []}"#] {
+            let (status, _, body) = chat(&studio, unnamed);
+            assert_eq!(status, 200, "{unnamed}: {body}");
+            assert_eq!(studio.llm.resident().as_deref(), Some("small"), "{unnamed}");
         }
     }
 

@@ -302,7 +302,7 @@ server put on a network needs it. It is configured by environment variables, amo
 | `OAIY_PUBLIC_URL`, `OAIY_TRUSTED_PROXIES` | none | `https://<host>` of the dashboard when a reverse proxy is in front, and the proxy's address or network (required with a bind beyond loopback) |
 | `OAIY_SERVER_TOKEN` | none | a bearer token for its protected routes: 32 to 256 characters, no common pattern (a guard against the obvious, not a strength meter: `openssl rand -base64 32`); one that has one stops the server (exit 78) |
 | `OAIY_ENGINES_UI` | none | an `oaiy-studio` control port to relay (`http://127.0.0.1:7860`) |
-| `OAIY_VOICE_GATEWAY` | on | `off` leaves 17872 alone, for a server run beside a desktop |
+| `OAIY_VOICE_GATEWAY` | on | `off` (or `0`, `false`) leaves 17872 alone, for a server run beside a desktop; a port from 1024 up serves the gateway there; anything else (`on`, `1`) is on, at 17872 |
 | `OAIY_PLUGIN_SOURCES` | none | a folder of plugin folders the setup catalog offers |
 | `OAIY_MODELS_DIR`, `OAIY_HF_TOKEN` | | where downloads go, and a Hugging Face token |
 

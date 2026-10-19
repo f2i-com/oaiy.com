@@ -378,11 +378,18 @@ fn make_ahead(ahead: &Ahead, engines: &Engines, voice: Option<&str>, text: &str,
     let (engines, voice, words, clock, call, asked) = (engines.clone(), voice.map(str::to_string), text.to_string(), clock.clone(), call.to_string(), Instant::now());
     let task = tokio::spawn(async move {
         match engines.prepare(&words, voice.as_deref()).await {
-            Ok(made) => log::info!("voice: {call}: the greeting was made ahead in {} ms, {} ms into the call ({made})", asked.elapsed().as_millis(), clock.ms(Instant::now())),
+            Ok(made) if was_made_ahead(&made) => log::info!("voice: {call}: the greeting was made ahead in {} ms, {} ms into the call ({made})", asked.elapsed().as_millis(), clock.ms(Instant::now())),
+            Ok(made) => log::info!("voice: {call}: the greeting was not made ahead: the speech server keeps none, and makes it as it is said ({made})"),
             Err(e) => log::warn!("voice: {call}: the greeting was not made ahead ({} ms into the call): {e}", clock.ms(Instant::now())),
         }
     });
     *slot = Some((text.to_string(), task.abort_handle()));
+}
+
+/// Whether the speech server says it made a line ahead (`prepared`): one whose engine keeps nothing answers
+/// `{"prepared": false}`, and the log said "made ahead" of it all the same.
+fn was_made_ahead(made: &serde_json::Value) -> bool {
+    made.get("prepared").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 /// The greeting made ahead is let go: it was said, or will not be.
@@ -772,18 +779,32 @@ where
     // The voice chosen for calls (a clip in the voices folder; see `voices`).
     let voice: Option<String> = super::voices::chosen();
 
-    // Everything we send goes through one writer.
+    // Everything we send goes through one writer. It ends before the call only where the phone is no longer read
+    // to, and says why: the call's loop ends with it (`writer` is one of its branches). It went unnoticed there, and a
+    // phone that stopped reading kept a call open that nobody could hear.
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
+        let mut why = None;
         while let Some(m) = out_rx.recv().await {
             // (a phone that no longer reads its stream, without closing it, is given up on rather than waited on for
             // ever: the call is over on this side then)
-            if !matches!(tokio::time::timeout(SEND_WAIT, sink.send(m)).await, Ok(Ok(()))) {
-                break;
+            match tokio::time::timeout(SEND_WAIT, sink.send(m)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    why = Some(String::from("the call's stream to the phone could not be written to"));
+                    break;
+                }
+                Err(_) => {
+                    why = Some(format!("the phone read nothing more of the call's stream for {} s", SEND_WAIT.as_secs()));
+                    break;
+                }
             }
         }
         let _ = tokio::time::timeout(SEND_WAIT, sink.close()).await;
+        why
     });
+    // (the writer's end, once the loop has seen it: not awaited a second time)
+    let mut writer_ended = false;
     let mut ready = json!({"destinationOrigin": DESTINATION});
     if allow_transfer {
         ready["features"] = json!([transfer::FEATURE]);
@@ -1132,6 +1153,10 @@ where
     // When the stream last carried anything (audio, silence among it, or a message): one quiet for longer than a call
     // ever is, once it has begun, has been left by the phone without being closed.
     let mut heard_at = Instant::now();
+    // On a phone that does not hang up for the receptionist: the caller has been told nobody can take the call (the
+    // apology, or the goodbye in place of an offer of a message). Said once: the call stays open after it, and each
+    // "Hello?" the caller said into it had it said again.
+    let mut told_nobody_answers = false;
     let reason: String = loop {
         // A request to reach the owner that the phone has not answered: the caller's silence is counted from when it was sent, and not from an
         // answer that may take long or never come.
@@ -1139,6 +1164,11 @@ where
         // The next moment one of the transfer's clocks has something to do: a caller is not left in silence.
         let watch = [transfer.next_deadline(), tools.next_expiry(timing.tool_answer)].into_iter().flatten().min();
         tokio::select! {
+            // The phone no longer reads what is sent to it: nothing said reaches the caller, so the call is over here.
+            ended = &mut writer => {
+                writer_ended = true;
+                break ended.ok().flatten().unwrap_or_else(|| "the call's stream to the phone ended".into());
+            }
             message = next_frame(&mut backlog, &mut stream) => {
                 let Some(Ok(message)) = message else { break "the stream closed".into() };
                 heard_at = Instant::now();
@@ -1465,7 +1495,11 @@ where
                         match transfer.answer_caller(Instant::now()) {
                             // (No page answers, or this would not have been asked: nobody can take a message, so it is not offered.)
                             Some(line) => match transfer::goodbye_for_offer(line) {
-                                Some(goodbye) => end_without_offer(&hub, &ids.call, goodbye),
+                                Some(_) if told_nobody_answers => {}
+                                Some(goodbye) => {
+                                    told_nobody_answers = !hangs_up;
+                                    end_without_offer(&hub, &ids.call, goodbye);
+                                }
                                 None => {
                                     speak(line.to_string(), false, None);
                                 }
@@ -1473,7 +1507,10 @@ where
                             // A request is going (it rings, or an owner device has it, or it is asked for and the phone has not answered yet, or it waits
                             // behind another tool): the caller is spoken to by its clocks, and never hung up on for want of a page.
                             None if transfer.busy() || tools.transfer_pending() => {}
+                            // Told already, on a phone that leaves the call open for the caller to end: not again.
+                            None if told_nobody_answers => {}
                             None => {
+                                told_nobody_answers = !hangs_up;
                                 let (reply, _) = oneshot::channel();
                                 if let Some(tx) = hub.command(&ids.call) {
                                     let _ = tx.send(CallCommand::Finish { goodbye: NO_ANSWERER_GOODBYE.into(), reply });
@@ -1779,7 +1816,9 @@ where
     epoch.fetch_add(1, Ordering::SeqCst);
     let _ = speaker.await;
     drop(out_tx);
-    let _ = writer.await;
+    if !writer_ended {
+        let _ = writer.await;
+    }
 }
 
 #[cfg(test)]
@@ -1811,6 +1850,15 @@ mod tests {
             }
             Pin::new(&mut this.inner).poll_next(cx)
         }
+    }
+
+    /// "Made ahead" is logged only where the speech server says it made the line: one that keeps nothing answers
+    /// `prepared: false`.
+    #[test]
+    fn a_greeting_is_made_ahead_only_where_the_server_says_it_was() {
+        assert!(was_made_ahead(&json!({"prepared": true, "likeness": 0.98, "seed": 7})));
+        assert!(!was_made_ahead(&json!({"prepared": false})));
+        assert!(!was_made_ahead(&Value::Null), "an answer that is not the server's word");
     }
 
     #[test]
@@ -2658,6 +2706,50 @@ mod tests {
         }
     }
 
+    /// A phone that stops reading the call's stream (it no longer takes what is sent, without closing it) ends the
+    /// call here, and the app is told why: the writer gave up on it and the call's loop never noticed, a call open
+    /// with nobody to hear it. (A send that fails is the same end as one that waits out `SEND_WAIT`, sooner.)
+    #[tokio::test]
+    async fn a_phone_that_stops_reading_ends_the_call() {
+        let speech = SpeechServer::new();
+        let at = speech.serve().await;
+        let hub = VoiceHub::new(Engines::at(&at, &at), |_| None);
+        let mut events = hub.inner.events.subscribe();
+        let call = format!("call_{}", next_item("test"));
+        let (to_desktop, from_aokie) = mpsc::unbounded_channel::<Message>();
+        let stream = futures_util::stream::unfold(from_aokie, |mut rx| async move { rx.recv().await.map(|m| (Ok::<_, std::convert::Infallible>(m), rx)) });
+        let reading = Arc::new(AtomicBool::new(true));
+        let (seen_tx, mut seen) = mpsc::unbounded_channel::<Message>();
+        let sink = futures_util::sink::unfold((seen_tx, reading.clone()), |(tx, reading), m: Message| async move {
+            if !reading.load(Ordering::SeqCst) {
+                return Err("the phone stopped reading");
+            }
+            let _ = tx.send(m);
+            Ok((tx, reading))
+        });
+        let session = tokio::spawn(run_on(Box::pin(sink), Box::pin(stream), hub.clone(), Engines::at(&at, &at)));
+        let start = json!({"type": "formlogic.realtime.start", "callId": call, "generation": 1, "destinationOrigin": DESTINATION, "sampleRate": WIRE_RATE, "greeting": GREETING, "direction": "inbound"});
+        to_desktop.send(Message::Text(start.to_string())).unwrap();
+        let ready = tokio::time::timeout(secs(5), seen.recv()).await.ok().flatten();
+        assert!(matches!(&ready, Some(Message::Text(t)) if t.contains("formlogic.realtime.ready")), "not ready: {ready:?}");
+        // The phone stops reading; the next thing sent (the answer to a ping) is not taken.
+        reading.store(false, Ordering::SeqCst);
+        to_desktop.send(Message::Ping(vec![1])).unwrap();
+        let until = Instant::now() + secs(10);
+        let ended = loop {
+            match tokio::time::timeout(until.saturating_duration_since(Instant::now()), events.recv()).await {
+                Ok(Ok(v)) if v["type"] == "call.ended" => break v,
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                other => panic!("the call was not ended: {other:?}"),
+            }
+        };
+        assert_eq!(ended["callId"], call.as_str());
+        assert_eq!(ended["reason"], "the call's stream to the phone could not be written to");
+        tokio::time::timeout(secs(10), session).await.expect("the session ended").unwrap();
+        // (the stream itself was never closed: the phone's side is still there)
+        drop(to_desktop);
+    }
+
     #[tokio::test]
     async fn a_call_that_ends_before_the_greeting_says_nothing() {
         let mut aokie = Aokie::start(json!({})).await;
@@ -3083,6 +3175,12 @@ mod tests {
         assert!(spoken_within(&aokie, NO_ANSWERER_GOODBYE, secs(3)).await, "{:?}", aokie.speech.spoken());
         let sent = aokie.sent_within(Duration::from_millis(500)).await;
         assert!(!sent.iter().any(|v| v["type"] == "formlogic.realtime.tool_call" || v["type"] == "formlogic.realtime.hangup_requested"), "{sent:?}");
+        // The call stays open, and the caller says "Hello?" into it, twice: the apology is not said again.
+        aokie.hub.caller_said(&aokie.call, "Hello?", json!({}));
+        aokie.hub.caller_said(&aokie.call, "Hello? Is anyone there?", json!({}));
+        aokie.sent_within(Duration::from_millis(1_500)).await;
+        let apologies = aokie.speech.spoken().iter().filter(|s| s.as_str() == NO_ANSWERER_GOODBYE).count();
+        assert_eq!(apologies, 1, "{:?}", aokie.speech.spoken());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -464,7 +464,10 @@ a release matter here:
   program of one's own beside itself, in an `engines` folder there, or where
   `OAIY_ENGINES_DIR` points, and prefers a language-model engine or a voice there to the
   one the installer carries (not a media engine: the installer's is taken over a copy
-  there, and `media.worker` set to a path names one's own build).
+  there, and `media.worker` set to a path names one's own build). A copy of `oaiy-voice` in
+  `<data>/bin` (the Mac recipe for 0.1.7 and before put one there) is run only where none of
+  those folders has one; an OAIY that finds both runs its own and says in its log that the
+  copy is not used.
   (There is no CUDA engine any more: every engine's GPU is WebGPU's. The CUDA code stands
   on the branch `backup/cuda-support-2026-10-08`.)
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or

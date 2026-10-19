@@ -237,9 +237,13 @@ is whether macOS attaches a driver of its own to the dongle, which the probe and
 `sh tools/mac/doctor.sh` show (the section on a USB Bluetooth dongle), and whether call
 audio keeps time over libusb there, which only a call can show.
 
-**OAIY Voice runs on a Mac.** No installer carries its server, `oaiy-voice` (see
-[RELEASING.md](RELEASING.md#what-is-not-in-a-release)): `sh tools/mac/build.sh --voice` builds it, and its last
-lines say to copy it into `~/Library/Application Support/com.oaiy.app/bin`, where the service runs it from. The
+**OAIY Voice runs on a Mac.** The installers after 0.1.7 carry its server, `oaiy-voice` (see
+[RELEASING.md](RELEASING.md#what-a-release-contains)), and the service runs that one. `sh tools/mac/build.sh --voice`
+builds it; an OAIY started from a terminal with `OAIY_ENGINES_DIR` set to the build's release folder runs that build
+(and the engines built there). Only an OAIY that carries no voice of its own (0.1.7 and before) runs a copy put in
+`~/Library/Application Support/com.oaiy.app/bin`, as the build's last lines say. One that carries a voice passes such a
+copy over and says so in its log: the recipe used to put one there, and an old copy beat the installer's voice after every
+update, then stopped at once on a flag the newer desktop gives it. The
 service's **Install** fetches its models with `install-oaiy-voice.sh` (Parakeet TDT 0.6B v2 and Qwen3-TTS 0.6B
 Base, about 4.3 GB, each large file checked against its SHA-256), as `install-oaiy-voice.ps1` does on Windows; an
 app built before 11 October 2026 has only the Windows script and says "no install script for oaiy-voice on unix".

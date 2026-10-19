@@ -229,8 +229,9 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Res
             let changed = studio.update_config(|next| {
                 if kind == "llm" {
                     let mut section = next.get("llm").cloned().unwrap_or(Json::Null);
-                    if crate::llm::default_model(&section) != model {
-                        return Err((409, format!("{model} is not the language model chosen in Engines: choose it first, then pin it")));
+                    let chosen = crate::llm::default_model(&section);
+                    if chosen != model {
+                        return Err((409, not_the_chosen_model(&model, &chosen, pin)));
                     }
                     crate::util::set(&mut section, "pinned", Json::Bool(pin));
                     crate::util::set(next, "llm", section);
@@ -519,6 +520,17 @@ pub(crate) fn llm_start(studio: &Arc<Studio>, cfg: &Json) -> Result<(), String> 
     egpu_start(studio, cfg, default)
 }
 
+/// What a pin or an unpin of a language model other than the one chosen in Engines (`chosen`) is answered: only that
+/// one is pinned (`llm.pinned`). An unpin was told to choose the model first and then pin it, the opposite of what it
+/// asked.
+fn not_the_chosen_model(model: &str, chosen: &str, pin: bool) -> String {
+    if pin {
+        format!("{model} is not the language model chosen in Engines: choose it first, then pin it")
+    } else {
+        format!("{model} is not pinned: only the language model chosen in Engines can be, which is {chosen}")
+    }
+}
+
 /// The card's Stop: this computer's engine stopped, and where the default model is set to run on the eGPU, the card's
 /// server too, which is where the model then is: a Stop that left it loaded there stopped nothing. Not while
 /// the card is lent to a picture or a video in the making, whose worker is on the socket that server holds: the
@@ -628,6 +640,13 @@ mod tests {
         assert!(!allowed_host("localhost", 7860, "127.0.0.1"));
         assert!(allowed_host("192.168.1.20:7860", 7860, "0.0.0.0"));
         assert!(!allowed_host("192.168.1.20:9999", 7860, "0.0.0.0"));
+    }
+
+    #[test]
+    fn a_pin_and_an_unpin_of_another_language_model_are_told_apart() {
+        assert!(not_the_chosen_model("big", "small", true).contains("choose it first, then pin it"));
+        let unpin = not_the_chosen_model("big", "small", false);
+        assert_eq!(unpin, "big is not pinned: only the language model chosen in Engines can be, which is small");
     }
 
     #[test]

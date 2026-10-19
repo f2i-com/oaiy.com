@@ -98,7 +98,8 @@ pub struct DeadLetter {
     /// Event name, e.g. `aokie.call.incoming`.
     pub event: String,
     pub reason: DeadReason,
-    /// The whole envelope, because redrive has to reconstruct the event exactly.
+    /// The whole envelope, because redrive has to reconstruct the event exactly. (But a run's outcome, kept with
+    /// its run's id and state alone: a redrive reads the rest from the run, `plugins::host::outcome_event`.)
     pub envelope: Value,
     pub recorded_at_ms: u64,
     /// Redrive attempts so far. Also what makes each retry's idempotency key
