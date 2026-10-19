@@ -27,7 +27,7 @@
         {
           "id": "qwen3-4b-q4_k_m",
           "name": "Qwen3 4B (Q4_K_M)",
-          "description": "Strong small general model with a thinking mode. ~2.3 GB.",
+          "description": "Strong small general model with a thinking mode. ~2.5 GB.",
           "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
           "filename": "Qwen3-4B-Q4_K_M.gguf",
           "subdir": "llm",
@@ -36,7 +36,7 @@
         {
           "id": "qwen2.5-coder-7b-q4_k_m",
           "name": "Qwen2.5-Coder 7B (Q4_K_M)",
-          "description": "Best-in-class open coding model at this size. ~4.4 GB, fits in 8 GB VRAM.",
+          "description": "Best-in-class open coding model at this size. ~4.7 GB, fits in 8 GB VRAM.",
           "url": "https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
           "filename": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
           "subdir": "llm",
@@ -45,7 +45,7 @@
         {
           "id": "llama-3.1-8b-q4_k_m",
           "name": "Llama 3.1 8B Instruct (Q4_K_M)",
-          "description": "Meta's tuned 8B chat model — a reliable general-purpose default. ~4.6 GB.",
+          "description": "Meta's tuned 8B chat model — a reliable general-purpose default. ~4.9 GB.",
           "url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
           "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
           "subdir": "llm",
@@ -54,7 +54,7 @@
         {
           "id": "gemma-3-12b-q4_k_m",
           "name": "Gemma 3 12B IT (Q4_K_M)",
-          "description": "Larger Gemma 3 for stronger reasoning. ~6.8 GB — wants 12 GB+ VRAM.",
+          "description": "Larger Gemma 3 for stronger reasoning. ~7.3 GB — wants 12 GB+ VRAM.",
           "url": "https://huggingface.co/bartowski/google_gemma-3-12b-it-GGUF/resolve/main/google_gemma-3-12b-it-Q4_K_M.gguf",
           "filename": "google_gemma-3-12b-it-Q4_K_M.gguf",
           "subdir": "llm",
@@ -70,7 +70,7 @@
         {
           "id": "nomic-embed-text-v1.5",
           "name": "Nomic Embed Text v1.5 (F16)",
-          "description": "Open 768-d embedding model with long context. ~0.26 GB.",
+          "description": "Open 768-d embedding model with long context. ~0.27 GB.",
           "url": "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.f16.gguf",
           "filename": "nomic-embed-text-v1.5.f16.gguf",
           "subdir": "embed",
