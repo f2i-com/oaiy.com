@@ -117,11 +117,31 @@ export function outreachNoteElement(note: Exclude<OutreachNote, { kind: 'texted'
       ...note.lines.map((l) => h('div.outreach-line', icon(/^Paused:/.test(l.text) ? 'alert' : 'phone'), h('span.outreach-line-name', `${l.name} ·`), h('span.outreach-line-text', l.text))),
     );
   }
+  const afterwards = reportAfterwards(note.afterwards);
   return h(
     'div.outreach-report',
     h('div.outreach-report-head', icon('check'), h('span', note.head)),
-    ...note.lines.map((l) => h('p', l)),
+    ...note.lines.map((l) => h('p', reportLine(l))),
     ...(note.answers ? [h('details', { open: true }, h('summary', 'Their answers, as recorded'), h('pre', note.answers))] : []),
-    ...(note.afterwards ? [h('p', note.afterwards)] : []),
+    ...(afterwards ? [h('p', afterwards)] : []),
   );
+}
+
+/**
+ * A line of the report as the person reads it: where the results are, without what the model is told to do with them
+ * (outreach.ts reportText writes the report for the model, which acts on it).
+ */
+export function reportLine(line: string): string {
+  return line
+    .replace(/, not in this project: to keep them here, write them into a file of this project with outreach_results \(id [^)]*\)\.$/, '.')
+    .replace(/; outreach_results gives them as data\.$/, '.');
+}
+
+/** The report's last line as the person reads it: what they asked for afterwards (the agent does it now), or nothing. */
+export function reportAfterwards(text: string): string {
+  const asked = /^What your person asked for afterwards: "([\s\S]*)"\. Do that now/.exec(text);
+  if (asked) return `What you asked for afterwards: "${asked[1]}". The agent does it now.`;
+  // (the model is asked to tell the person how it went: it does, in its reply)
+  if (/^Tell your person how it went/.test(text)) return '';
+  return text;
 }

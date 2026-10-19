@@ -197,6 +197,71 @@ try {
     expect(r.report.stdout === want, `stdout: ${JSON.stringify(r.report.stdout)} stderr: ${r.report.stderr}`);
   });
 
+  await check('exit, return, break and continue keep what the command line printed before them', async () => {
+    const cases = [
+      ['test -f config.json || { echo "config.json is missing"; exit 1; }', 'config.json is missing\n', 1],
+      ['echo a; exit 2; echo never', 'a\n', 2],
+      ['f() { echo in-f; exit 4; }; echo before; f; echo after', 'before\nin-f\n', 4],
+      ['(echo sub; exit 5); echo "after $?"', 'sub\nafter 5\n', 0],
+      ['echo hi | { cat; exit 3; }; echo "after $?"', 'hi\nafter 3\n', 0],
+      ['x=$(echo val; exit 6); echo "x=$x"', 'x=val\n', 0],
+      ['f() { echo hi; return 3; }; f; echo "rc=$?"', 'hi\nrc=3\n', 0],
+      ['for i in 1 2 3; do echo $i; if [ $i = 2 ]; then break; fi; done', '1\n2\n', 0],
+      ['for i in 1 2; do echo a$i; continue; echo never; done', 'a1\na2\n', 0],
+      ['for i in 1 2; do for j in x y; do echo $i$j; break 2; done; done; echo done', '1x\ndone\n', 0],
+      ['set -e; echo a; { echo b; false; }; echo never', 'a\nb\n', 1],
+      ["trap 'echo bye' EXIT; echo hi; exit 1", 'hi\nbye\n', 1],
+    ];
+    const got = await page.evaluate(async (all) => {
+      const out = [];
+      for (const [command] of all) out.push((await window.__bot.shell(command)).report);
+      out.push((await window.__bot.shell('{ echo into-file; exit 7; } > exit-out.txt; echo never; ')).report);
+      out.push((await window.__bot.shell('cat exit-out.txt')).report.stdout);
+      return out;
+    }, cases);
+    cases.forEach(([command, stdout, code], i) => {
+      expect(got[i].stdout === stdout && got[i].exit_code === code, `${command}: ${JSON.stringify(got[i])}`);
+    });
+    const [redirected, file] = got.slice(cases.length);
+    expect(redirected.stdout === '' && redirected.exit_code === 7 && file === 'into-file\n', `an exit's output follows its redirection: ${JSON.stringify(redirected)} ${JSON.stringify(file)}`);
+  });
+
+  await check('stdout and stderr keep the order they were written in, and a file not read is named by its command', async () => {
+    const r = await page.evaluate(async () => {
+      const bot = window.__bot;
+      bot.vfs.writeFile('/present.txt', 'here\n');
+      const one = async (c) => (await bot.shell(c)).report;
+      return {
+        mixed: await one('echo one; cat nothing-here.txt; echo "rc=$?"'),
+        merged: await one('{ echo one; ls /nope; echo two; } 2>&1'),
+        cats: await one('cat present.txt nothing.txt'),
+        head: await one('head nothing.txt'),
+        grep: await one('grep x nothing.txt'),
+        dir: await one('mkdir -p adir; cat adir'),
+        python: await one('python nothing.py'),
+        node: await one('node nothing.js'),
+      };
+    });
+    const all = JSON.stringify(r);
+    const pieces = (rep) => {
+      const shown = [];
+      let i = 0;
+      let j = 0;
+      for (const [fd, n] of rep.order) {
+        shown.push(fd === 1 ? rep.stdout.slice(i, (i += n)) : `!${rep.stderr.slice(j, (j += n))}`);
+      }
+      return shown;
+    };
+    expect(JSON.stringify(pieces(r.mixed)) === JSON.stringify(['one\n', '!cat: nothing-here.txt: No such file or directory\n', 'rc=1\n']), `order: ${JSON.stringify(r.mixed)}`);
+    expect(r.merged.stdout === "one\nls: cannot access '/nope': No such file or directory\ntwo\n" && r.merged.stderr === '', `2>&1: ${JSON.stringify(r.merged)}`);
+    expect(r.cats.stdout === 'here\n' && r.cats.stderr === 'cat: nothing.txt: No such file or directory\n' && r.cats.exit_code === 1, all);
+    expect(r.head.stderr === 'head: nothing.txt: No such file or directory\n', all);
+    expect(r.grep.stderr === 'grep: nothing.txt: No such file or directory\n' && r.grep.exit_code === 2, all);
+    expect(r.dir.stderr === 'cat: adir: Is a directory\n', all);
+    expect(r.python.stderr === "python: can't open file 'nothing.py': [Errno 2] No such file or directory\n" && r.python.exit_code === 2, all);
+    expect(r.node.stderr.startsWith("node: cannot find module 'nothing.js'") && r.node.exit_code === 1, all);
+  });
+
   await check('the shell tools: checksums, jq, diff | patch, tar/zip/gzip round trips', async () => {
     const script = [
       'printf abc | sha256sum',

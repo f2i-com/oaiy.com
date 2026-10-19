@@ -85,6 +85,12 @@ function kindOf(p: ProviderConfig): string {
   return p.type;
 }
 
+/** A media service as the dialog says it: OAIY's engines in words (their service is called oaiy-studio), another by its own name. */
+export function serviceWords(service: string, version: string): string {
+  if (/^oaiy/i.test(service)) return `OAIY's engines${version ? ` (version ${version})` : ''}`;
+  return `${service}${version ? ` ${version}` : ''}`;
+}
+
 /** What the OAIY kind's help says in OAIY's own window: it reaches OAIY as it is, so nothing about letting a site in. */
 const OAIY_HELP_IN_WINDOW = 'OAIY serves chat, images and video. Settings → Images, video and audio uses the same server.';
 
@@ -105,7 +111,8 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     const modelCache = new Map<string, ModelInfo[]>();
     const cacheKey = (p: ProviderConfig) => `${p.type}|${p.baseUrl ?? ''}|${p.apiKey ? p.apiKey.slice(-6) : ''}`;
 
-    const dialog = h('dialog.settings');
+    // (named by its heading, as a screen reader says it when it opens)
+    const dialog = h('dialog.settings', { 'aria-labelledby': 'settings-title' });
     const list = h('div.provider-list');
     const form = h('div.provider-form');
     const close = (result: SettingsResult | null) => {
@@ -114,34 +121,50 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       resolve(result);
     };
 
-    const renderList = () => {
+    /**
+     * The providers, a row each: a radio for the one the Agent uses, and a button that opens it in the form beside the
+     * list (two controls, each with its own name, not a button with a radio inside). The rows are drawn again on every
+     * change, so the control that was used is given focus again in the new ones (`focus`): a provider's button, or Add.
+     */
+    const renderList = (focus?: ProviderConfig | 'add') => {
       clear(list);
       for (const p of providers) {
+        const label = p.name || '(unnamed)';
+        const open = h(
+          'button.provider-pick',
+          { type: 'button', 'aria-pressed': String(p === editing), title: `Show ${label} in the form`, onclick: () => { editing = p; renderList(p); renderForm(); } },
+          h('span', label),
+          h('span.muted', p.modelId ? ` — ${p.modelId}` : ' — no model'),
+        ) as HTMLButtonElement;
         list.append(
           h(
             'div.provider-row',
-            { class: p === editing ? 'selected' : '', role: 'button', tabindex: 0, 'aria-pressed': String(p === editing), onclick: () => { editing = p; renderList(); renderForm(); }, onkeydown: (e: KeyboardEvent) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); editing = p; renderList(); renderForm(); } } },
-            h('input', { type: 'radio', name: 'active', checked: p.id === activeId, title: 'Use this one', onclick: (e: Event) => { e.stopPropagation(); activeId = p.id; } }),
-            h('span', p.name || '(unnamed)'),
-            h('span.muted', p.modelId ? ` — ${p.modelId}` : ' — no model'),
+            // (a click beside the name opens it too, as the whole row did)
+            { class: p === editing ? 'selected' : '', onclick: (e: Event) => { if (e.target === e.currentTarget) open.click(); } },
+            h('input', { type: 'radio', name: 'active', checked: p.id === activeId, title: 'Use this one', 'aria-label': `The Agent uses ${label}`, onchange: () => { activeId = p.id; } }),
+            open,
           ),
         );
+        if (focus === p) open.focus();
       }
-      list.append(
-        h('button', {
-          onclick: () => {
-            const p: ProviderConfig = { id: newId(), type: 'local', serverKind: 'ollama', name: 'Ollama', apiKey: '', baseUrl: LOCAL_SERVERS.ollama.baseUrl };
-            providers.push(p);
-            editing = p;
-            activeId ??= p.id;
-            renderList();
-            renderForm();
-          },
-        }, '+ Add a provider'),
-      );
+      const add = h('button', {
+        type: 'button',
+        onclick: () => {
+          const p: ProviderConfig = { id: newId(), type: 'local', serverKind: 'ollama', name: 'Ollama', apiKey: '', baseUrl: LOCAL_SERVERS.ollama.baseUrl };
+          providers.push(p);
+          editing = p;
+          activeId ??= p.id;
+          renderList();
+          // (the new provider's form, from its first field: what kind of server it is)
+          renderForm(true);
+        },
+      }, '+ Add a provider') as HTMLButtonElement;
+      list.append(add);
+      if (focus === 'add') add.focus();
     };
 
-    const renderForm = () => {
+    /** The form for the provider being edited; `focusKind`, with focus on its first field (a provider just added, or its kind just changed). */
+    const renderForm = (focusKind = false) => {
       clear(form);
       const p = editing;
       if (!p) {
@@ -164,7 +187,8 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         p.baseUrl = defaultBaseUrl(k.type, k.serverKind);
         if (!p.name || KINDS.some((x) => x.label.startsWith(p.name))) p.name = k.label.replace(/ \(.*$/, '');
         renderList();
-        renderForm();
+        // (drawn again for the new kind, with focus where it was)
+        renderForm(true);
       } }, ...KINDS.map((k) => h('option', { value: k.value, selected: kindOf(p) === k.value }, k.label)));
       const name = h('input', { value: p.name, oninput: () => { p.name = name.value; renderList(); } });
       const base = h('input', { value: p.baseUrl ?? '', placeholder: defaultBaseUrl(p.type, p.serverKind), oninput: () => { p.baseUrl = base.value.trim() || undefined; } });
@@ -207,7 +231,8 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       const loadModels = async (quiet: boolean) => {
         if (!quiet) say(note, 'Asking the server for its models…');
         try {
-          const found = await listModels(p);
+          // (in OAIY's own window an OAIY that does not answer is not answering: nothing about CORS)
+          const found = await listModels(p, { ownWindow: pageHost().kind === 'oaiy-window' });
           modelCache.set(cacheKey(p), found);
           if (editing !== p) return;
           fillModels(found);
@@ -261,10 +286,12 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         say(note, result.ok ? (result.replied ? `Works: ${p.modelId} answered.` : 'The server answers; choose a model to finish.') : result.message, !result.ok);
       } }, 'Test');
       const remove = h('button.danger', { onclick: () => {
+        const at = providers.indexOf(p);
         providers = providers.filter((x) => x !== p);
         if (activeId === p.id) activeId = providers[0]?.id ?? null;
-        editing = providers[0] ?? null;
-        renderList();
+        // (the row that took its place, or the one before it, is shown and has focus; with none left, Add has)
+        editing = providers[Math.min(at, providers.length - 1)] ?? null;
+        renderList(editing ?? 'add');
         renderForm();
       } }, 'Remove');
       // (in OAIY's own window OAIY answers this page as it is: its gateway's list of sites is not for it)
@@ -289,6 +316,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         help ? h('p.muted', help) : '',
         note,
       );
+      if (focusKind) kind.focus();
     };
 
     // Images, video and audio: OAIY (found by its discovery document) or any OpenAI-spec media service.
@@ -298,7 +326,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       const note = h('div.form-note');
       const abilities = mediaAbilities(media);
       const status = media.discovered
-        ? `${media.discovered.service} ${media.discovered.version} at ${media.discovered.origin}`
+        ? `${serviceWords(media.discovered.service, media.discovered.version)} at ${media.discovered.origin}`
         : media.baseUrl ? 'set up by hand' : 'not set up';
       // What was found when this was drawn: typing another address drops it, and typing the address that was found again gives it back.
       const found = { discovered: media.discovered, endpoints: media.endpoints };
@@ -352,8 +380,10 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           renderList();
         }
         renderMedia();
+        // (OAIY's engines are several, another service one)
+        const they = /^oaiy/i.test(found.service) ? ['they', 'They are'] : ['it', 'It is'];
         (mediaSection.querySelector('.form-note') as HTMLElement).textContent =
-          `Found ${found.service} ${found.version}: it can make ${mediaAbilities(media) || 'nothing yet'}.${chat ? ' It is in the AI providers too, for chat.' : ''}`;
+          `Found ${serviceWords(found.service, found.version)}: ${they[0]} can make ${mediaAbilities(media) || 'nothing yet'}.${chat ? ` ${they[1]} in the AI providers too, for chat.` : ''}`;
       } }, 'Find OAIY');
       // Shown while an OAIY is found: this page asks it at that address each time it opens, with the key below (if there is one).
       const forget = h('button', { title: 'Forget the OAIY that was found: its address, what it said and the key. This page stops asking it when it opens (once you press Save).', onclick: () => {
@@ -413,7 +443,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
 
     // (Settings, as the gear says: its sections are the AI providers, the agent, and images, video and audio)
     dialog.append(
-      h('h2', 'Settings'),
+      h('h2', { id: 'settings-title' }, 'Settings'),
       h('strong.settings-section', 'AI providers'),
       ...(context.agentElsewhere
         ? [h('p.agent-elsewhere', `The Agent runs on ${context.agentElsewhere}, as chosen in OAIY's Settings → Agent: change it there. The providers below are this page's own; the Agent uses them when it runs on OAIY's engine.`)]

@@ -2,6 +2,7 @@
  * Slash commands typed into the chat: `/internet` (`/net`) drives the network
  * gate, `/clear` starts a new conversation, `/help` lists them.
  */
+import { pageHost } from '@oaiy/shared/capabilities/host';
 import { parseMode, type NetGate } from './gate/netgate';
 
 export const INTERNET_USAGE =
@@ -28,10 +29,15 @@ export function internetStatus(gate: NetGate): string {
   return lines.join('\n');
 }
 
+/** What a host that is not one is told: it is named, with how a host is written, and nothing was changed. */
+const notHosts = (given: string[]): string =>
+  `Not a host name: ${given.join(', ')}. Nothing was changed. A host is written like example.com, *.example.com or 192.168.1.20.`;
+
 /** Run `/internet …`; returns the text to show. */
 export function internetCommand(gate: NetGate, args: string[]): string {
   const action = args[0]?.toLowerCase();
-  const hosts = args.slice(1);
+  // (hosts may be given with commas between them too: "allow a.com, b.com" is two)
+  const hosts = args.slice(1).flatMap((a) => a.split(',')).map((a) => a.trim()).filter(Boolean);
   let note = '';
   if (!action || action === 'status' || action === '?') return `${internetStatus(gate)}\n${INTERNET_USAGE}`;
   switch (action) {
@@ -44,7 +50,7 @@ export function internetCommand(gate: NetGate, args: string[]): string {
       const added = tried.flatMap((t) => (t.host ? [t.host] : []));
       const bad = tried.filter((t) => !t.host).map((t) => t.given);
       // (nothing allowed, nothing changed: the gate is not opened for a mistyped host)
-      if (!added.length) return `Not a host name: ${hosts.join(', ')}. Nothing was changed.`;
+      if (!added.length) return notHosts(hosts);
       if (gate.mode === 'blocked') {
         gate.setMode('allowlist');
         note = ' (the gate was closed; it now lets through only the allowed hosts)';
@@ -57,7 +63,7 @@ export function internetCommand(gate: NetGate, args: string[]): string {
       const tried = hosts.map((h) => ({ given: h, host: gate.denyHost(h) }));
       const denied = tried.flatMap((t) => (t.host ? [t.host] : []));
       const bad = tried.filter((t) => !t.host).map((t) => t.given);
-      if (!denied.length) return `Not a host name: ${hosts.join(', ')}. Nothing was changed.`;
+      if (!denied.length) return notHosts(hosts);
       note = `denied ${denied.join(', ')}${bad.length ? ` (not host names, left out: ${bad.join(', ')})` : ''}`;
       break;
     }
@@ -72,19 +78,34 @@ export function internetCommand(gate: NetGate, args: string[]): string {
       const mode = parseMode(action);
       if (!mode) return INTERNET_USAGE;
       gate.setMode(mode);
-      if (mode === 'allowlist') for (const h of hosts) gate.allowHost(h);
+      // (the hosts given with it are allowed, and one that is not a host is said, not dropped without a word)
+      const bad = mode === 'allowlist' ? hosts.filter((h) => !gate.allowHost(h)) : [];
+      if (bad.length) note = `not host names, left out: ${bad.join(', ')}`;
     }
   }
   return note ? `${note}\n${internetStatus(gate)}` : internetStatus(gate);
 }
 
-export const HELP = `Commands:
+/**
+ * What /help says: the commands, and where everything runs. In OAIY's own window that is the window, on this
+ * computer, not "this tab"; and the Agent's model is OAIY's, not necessarily an AI provider of the person's.
+ */
+export function helpText(inOaiy: boolean): string {
+  return `Commands:
   /internet … (/net)   the network gate: on | off | allowlist | allow <host> | deny <host> | forget <host> | reset | status
+  /softn …             SoftN apps: new | import | export | check | preview | apps (/softn alone says what each does)
   /clear               start a new conversation (the project's files stay)
   /help                this list
 
-Everything runs in this tab: files live in the browser, code runs on the Zipp VM in a Web Worker,
-and nothing leaves except requests to your AI provider and what the network gate lets through.`;
+${inOaiy
+    ? `Everything runs in this window, on this computer: files are kept in it, code runs on the Zipp VM in a Web Worker,
+and nothing leaves except requests to the Agent's model and what the network gate lets through.`
+    : `Everything runs in this tab: files live in the browser, code runs on the Zipp VM in a Web Worker,
+and nothing leaves except requests to your AI provider and what the network gate lets through.`}`;
+}
+
+/** /help, for the window this page is in. */
+export const HELP = helpText(pageHost().kind === 'oaiy-window');
 
 /** What a phone conversation's box takes: words for its agent, and /clear. */
 export const PHONE_HELP = "Here, what you write goes to this conversation's agent (the receptionist on a call, or the agent of their texts). /clear starts the conversation again once its call has ended.";

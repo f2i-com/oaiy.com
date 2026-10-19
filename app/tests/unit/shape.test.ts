@@ -62,3 +62,60 @@ describe("OAIY's Engines choose the model", () => {
     expect(fake.bodies[1].model).toBe('Qwen3.8-Flash-Next');
   });
 });
+
+describe('a reply the person stopped', () => {
+  it('is kept as far as it got, and the model is told it was stopped, so the next request is not joined to it', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const fake = fakeProvider('openai', [{ text: 'Here is the first half of the plan, and', hold: { at: 20, until: held } }, { text: 'Sure.' }]);
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...OPENAI, baseUrl: 'https://example.test/v1' }), projectSummary: () => 'p', keepStopped: true });
+    const stop = new AbortController();
+    const events: AgentEvent[] = [];
+    await agent.run('Write a long plan', (e) => {
+      events.push(e);
+      if (e.type === 'text' && !stop.signal.aborted) setTimeout(() => stop.abort(), 20);
+    }, stop.signal);
+    release();
+    expect(events.some((e) => e.type === 'notice' && e.message === 'Stopped.')).toBe(true);
+    expect(agent.turns.map((t) => t.role)).toEqual(['user', 'assistant', 'user']);
+    expect((agent.turns[1] as Extract<Turn, { role: 'assistant' }>).text).toBe('Here is the first ha');
+    await agent.run('Just say hi instead', () => {});
+    const sent = (fake.bodies[1].messages as Array<{ role: string; content: unknown }>).filter((m) => m.role !== 'system');
+    const text = (m: { content: unknown }) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+    expect(sent.map((m) => m.role)).toEqual(['user', 'assistant', 'user']);
+    expect(text(sent[0])).toContain('Write a long plan');
+    expect(text(sent[0])).not.toContain('Just say hi');
+    expect(text(sent[1])).toBe('Here is the first ha');
+    expect(text(sent[2])).toMatch(/^\[OAIY\] The person stopped this reply[\s\S]*Just say hi instead/);
+  });
+
+  it('stopped before it wrote anything, is still a request the model is told was stopped', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const fake = fakeProvider('openai', [{ text: 'Never shown', hold: { at: 0, until: held } }, { text: 'Sure.' }]);
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...OPENAI, baseUrl: 'https://example.test/v1' }), projectSummary: () => 'p', keepStopped: true });
+    const stop = new AbortController();
+    await agent.run('First request', (e) => {
+      if (e.type === 'prompt') setTimeout(() => stop.abort(), 30);
+    }, stop.signal);
+    release();
+    expect(agent.turns.map((t) => t.role)).toEqual(['user', 'user']);
+    await agent.run('Second request', () => {});
+    const sent = (fake.bodies[1].messages as Array<{ role: string; content: unknown }>).filter((m) => m.role !== 'system');
+    const text = (m: { content: unknown }) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+    expect(text(sent[0])).toMatch(/First request[\s\S]*\[OAIY\] The person stopped this reply[\s\S]*Second request/);
+  });
+
+  it('on the phone (no keepStopped), nothing is added: its sessions keep what the caller heard', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    fakeProvider('openai', [{ text: 'We are open from nine.', hold: { at: 10, until: held } }]);
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...OPENAI, baseUrl: 'https://example.test/v1' }), projectSummary: () => 'p', conversation: true });
+    const stop = new AbortController();
+    await agent.run('When are you open?', (e) => {
+      if (e.type === 'text' && !stop.signal.aborted) setTimeout(() => stop.abort(), 20);
+    }, stop.signal);
+    release();
+    expect(agent.turns.map((t) => t.role)).toEqual(['user']);
+  });
+});

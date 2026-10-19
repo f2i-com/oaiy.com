@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NetGate } from '../../src/gate/netgate';
 import { runInSandbox } from '../../src/sandbox/runner';
-import { TerminalPane } from '../../src/ui/terminal';
+import { TerminalPane, inOrder } from '../../src/ui/terminal';
 import { Vfs } from '../../src/vfs/vfs';
 
 // DOM rendering uses EventTargets and sandbox I/O is mocked. TerminalPane
@@ -230,5 +230,59 @@ describe('terminal ordinary Enter compatibility', () => {
     expect(vi.mocked(runInSandbox).mock.calls[0][0]).toMatchObject({ source: 'echo ready', lang: 'shell' });
     expect(input.value).toBe('');
     expect(enter.defaultPrevented).toBe(false);
+  });
+});
+
+describe('terminal output', () => {
+  it('puts stdout and stderr in the order the shell wrote them', () => {
+    expect(inOrder({ stdout: 'one\nrc=1\n', stderr: 'cat: x: No such file or directory\n', order: [[1, 4], [2, 34], [1, 5]] })).toEqual([
+      { text: 'one\n', err: false },
+      { text: 'cat: x: No such file or directory\n', err: true },
+      { text: 'rc=1\n', err: false },
+    ]);
+    // An older shell's report (no order) is its stdout, then its stderr; what an order cut short does not reach comes after.
+    expect(inOrder({ stdout: 'a\n', stderr: 'b\n' })).toEqual([{ text: 'a\n', err: false }, { text: 'b\n', err: true }]);
+    expect(inOrder({ stdout: 'abc', stderr: 'xyz', order: [[2, 1], [1, 1]] })).toEqual([
+      { text: 'x', err: true },
+      { text: 'abc', err: false },
+      { text: 'yz', err: true },
+    ]);
+  });
+
+  it('draws a command\'s output in that order, its errors marked', async () => {
+    vi.mocked(runInSandbox).mockResolvedValueOnce({ result: { shell: { cwd: '/', env: {}, stdout: 'one\nrc=1\n', stderr: 'oops\n', order: [[1, 4], [2, 5], [1, 5]] } } } as unknown as typeof outcome);
+    const { input, output, run } = terminal();
+    input.value = 'echo one; cat x; echo rc=$?';
+    input.dispatchEvent(new KeyboardEventStub('Enter'));
+    await run.mock.results[0].value;
+    const drawn = output.children.slice(-3) as Array<InstanceType<typeof ElementStub>>;
+    expect(drawn.map((piece) => [piece.textContent, piece.className])).toEqual([['one\n', ''], ['oops\n', 'term-err'], ['rc=1\n', '']]);
+  });
+
+  it('says how to stop a running command, and its Stop button stops it as Ctrl+C does', async () => {
+    let signal: AbortSignal | undefined;
+    let finish!: (result: typeof outcome) => void;
+    vi.mocked(runInSandbox).mockImplementationOnce((_request, _host, options) => {
+      signal = options?.signal;
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    const pane = new TerminalPane(new Vfs(), {} as NetGate);
+    const element = pane.element as unknown as InstanceType<typeof ElementStub>;
+    const input = element.find('term-input')!;
+    const stop = element.find('term-stop')!;
+    const output = element.find('term-out')!;
+    input.value = 'python -c "while True: pass"';
+    input.dispatchEvent(new KeyboardEventStub('Enter'));
+    await Promise.resolve();
+    expect((stop as unknown as { hidden: boolean }).hidden).toBe(false);
+    expect((input as unknown as { placeholder: string }).placeholder).toMatch(/Ctrl\+C stops it/);
+
+    stop.dispatchEvent(new Event('click'));
+    expect(signal?.aborted).toBe(true);
+    expect(output.textContent).toContain('^C');
+    finish(outcome);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect((stop as unknown as { hidden: boolean }).hidden).toBe(true);
+    expect((input as unknown as { placeholder: string }).placeholder).toMatch(/^ls, grep/);
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { NetGate, normalizeHost } from '../../src/gate/netgate';
-import { internetCommand } from '../../src/commands';
+import { NetGate, gateHost, normalizeHost } from '../../src/gate/netgate';
+import { helpText, internetCommand } from '../../src/commands';
 import { Vfs, normalizePath } from '../../src/vfs/vfs';
 import { globRegex, relativeTo } from '../../src/sandbox/host';
 
@@ -38,6 +38,40 @@ describe('the network gate', () => {
     expect(internetCommand(gate, ['allow', 'docs.rs', '://'])).toContain('allowed docs.rs (the gate was closed; it now lets through only the allowed hosts) (not host names, left out: ://)');
     expect(internetCommand(gate, ['forget', 'nowhere.example'])).toContain('nowhere.example is not on the allow or deny list: nothing was changed');
     expect(internetCommand(gate, ['forget', 'docs.rs', 'nowhere.example'])).toContain('forgot docs.rs (not on either list: nowhere.example)');
+  });
+
+  it('keeps only what is a host: names, *.wildcards, IPv4 and IPv6 addresses, and a name in another script as the browser writes it', () => {
+    expect(gateHost('Docs.RS')).toBe('docs.rs');
+    expect(gateHost('*.github.com')).toBe('github.com');
+    expect(gateHost('https://api.example.com:8443/v1')).toBe('api.example.com');
+    expect(gateHost('localhost')).toBe('localhost');
+    expect(gateHost('192.168.1.20')).toBe('192.168.1.20');
+    expect(gateHost('[::1]:8080')).toBe('::1');
+    expect(gateHost('bücher.example')).toBe('xn--bcher-kva.example');
+    for (const bad of ['foo,bar', 'hello world', '*', '!!!', '-bad.example', 'a..b', '999.1.1.1', '1.2.3', 'x'.repeat(64) + '.example', '']) expect(gateHost(bad), bad).toBeNull();
+  });
+
+  it('/internet allow splits hosts on commas, refuses one that is not a host by name, and changes nothing for none', () => {
+    const gate = new NetGate();
+    expect(internetCommand(gate, ['allow', 'a.example,', 'b.example,c.example'])).toContain('allowed a.example, b.example, c.example');
+    expect(gate.getSettings().allow).toEqual(['a.example', 'b.example', 'c.example']);
+    const refused = internetCommand(gate, ['allow', 'foo!,bar!', '*']);
+    expect(refused).toBe('Not a host name: foo!, bar!, *. Nothing was changed. A host is written like example.com, *.example.com or 192.168.1.20.');
+    expect(internetCommand(gate, ['deny', 'evil.example,', 'not!a!host'])).toContain('denied evil.example (not host names, left out: not!a!host)');
+    expect(internetCommand(gate, ['deny', 'no!pe'])).toContain('Not a host name: no!pe.');
+    // (the hosts given with allowlist are allowed, and one that is not a host is said)
+    expect(internetCommand(gate, ['allowlist', 'docs.rs,', '%%'])).toContain('not host names, left out: %%');
+    expect(gate.mode).toBe('allowlist');
+    expect(gate.getSettings().allow).toContain('docs.rs');
+  });
+});
+
+describe('/help', () => {
+  it('lists /softn, and says where everything runs: a tab, or OAIY’s window', () => {
+    expect(helpText(false)).toContain('/softn …');
+    expect(helpText(false)).toContain('Everything runs in this tab');
+    expect(helpText(true)).toContain('Everything runs in this window, on this computer');
+    expect(helpText(true)).not.toContain('this tab');
   });
 });
 

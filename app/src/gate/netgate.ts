@@ -52,6 +52,33 @@ export function normalizeHost(raw: string): string {
   return host.replace(/^\*\./, '').replace(/\.$/, '');
 }
 
+/** A label of a host name: letters, digits, hyphens (not at either end) and, as some real hosts have, underscores. */
+const LABEL = /^(?!-)[a-z0-9_-]{1,63}(?<!-)$/;
+
+/**
+ * `raw` as the gate's lists keep a host (normalizeHost), or null when it is not one: a host name (`example.com`, `localhost`, one
+ * written in another script, kept as the browser writes it), an IPv4 address or an IPv6 one. `*.example.com` is `example.com`,
+ * which covers its subdomains anyway; a name with a comma, a space, a `*` left in it or nothing at all is refused.
+ */
+export function gateHost(raw: string): string | null {
+  let host = normalizeHost(raw);
+  if (!host || host.length > 253) return null;
+  if (host.includes(':')) return /^[0-9a-f:.]+$/.test(host) && (host.match(/:/g) ?? []).length >= 2 ? host : null;
+  // (a name in another script, as the browser sends it: bücher.example is xn--bcher-kva.example)
+  if (/[^\x00-\x7f]/.test(host)) {
+    try {
+      host = new URL(`http://${host}/`).hostname;
+    } catch {
+      return null;
+    }
+  }
+  const labels = host.split('.');
+  if (!labels.every((l) => LABEL.test(l))) return null;
+  // (no top-level domain is all digits: a name that ends in one is an IPv4 address, four numbers each up to 255)
+  if (/^\d+$/.test(labels[labels.length - 1])) return labels.length === 4 && labels.every((l) => /^\d{1,3}$/.test(l) && Number(l) <= 255) ? host : null;
+  return host;
+}
+
 function hostMatches(host: string, entry: string): boolean {
   return entry !== '' && (host === entry || host.endsWith(`.${entry}`));
 }
@@ -98,8 +125,9 @@ export class NetGate {
     this.changed();
   }
 
+  /** Put a host on the allow list (and off the deny list): the host as kept, or null when `raw` is not one (gateHost). */
   allowHost(raw: string): string | null {
-    const host = normalizeHost(raw);
+    const host = gateHost(raw);
     if (!host) return null;
     this.settings.deny = this.settings.deny.filter((h) => h !== host);
     if (!this.settings.allow.includes(host)) this.settings.allow = [...this.settings.allow, host].sort();
@@ -107,8 +135,9 @@ export class NetGate {
     return host;
   }
 
+  /** Put a host on the deny list (and off the allow list): the host as kept, or null when `raw` is not one. */
   denyHost(raw: string): string | null {
-    const host = normalizeHost(raw);
+    const host = gateHost(raw);
     if (!host) return null;
     this.settings.allow = this.settings.allow.filter((h) => h !== host);
     if (!this.settings.deny.includes(host)) this.settings.deny = [...this.settings.deny, host].sort();

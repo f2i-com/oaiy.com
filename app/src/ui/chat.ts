@@ -21,13 +21,14 @@ import { mediaElement, mediaKind, type Media } from './media';
 import { linkedText, renderMarkdown } from './markdown';
 import { SessionPicker, tabKind, tabName, type ConversationTab } from './sessionPicker';
 import { closeContactCard } from './contactCard';
-import { activityText, argLines, clip, duration, mediaPrompt, prettyResult, summarizeCall, toolIcon, toolLabel } from './chat/tools';
+import { activityText, argLines, clip, duration, mediaPrompt, prettyResult, summarizeCall, toolDoing, toolIcon, toolLabel } from './chat/tools';
 import {
   clock,
   conversationKind,
   dayLabel,
   formatNumber,
   initials,
+  noteForPeople,
   parseCallEnd,
   parseCallStart,
   parseFlowAsk,
@@ -131,19 +132,27 @@ const OWN_ICON: Record<OwnKind, string> = { project: 'sparkle', runner: 'compass
 
 export class ChatPane {
   readonly element = h('section.chat');
-  private readonly log = h('div.chat-log', { role: 'log', 'aria-live': 'polite', 'aria-relevant': 'additions' });
+  /**
+   * The log is not read out as it changes (a streamed reply is drawn again many times a second, and would be read out
+   * piece by piece, or not at all while a run kept it busy): what a screen reader hears is said by `announcer`.
+   */
+  private readonly log = h('div.chat-log', { role: 'log', 'aria-live': 'off', 'aria-label': 'Conversation' });
+  /** What a screen reader is told as the conversation goes: a reply once it is written, the app's notes, the other end's words. */
+  private readonly announcer = h('div.sr-only', { 'aria-live': 'polite', 'aria-atomic': 'true' });
   private readonly input = h('textarea.chat-input', { rows: 1, placeholder: 'Ask OAIY…', 'aria-label': 'Message the agent', title: 'Enter sends; Shift+Enter starts a new line' }) as HTMLTextAreaElement;
   private readonly send = h('button.send-button', { type: 'button' }) as HTMLButtonElement;
   private readonly attachButton = h('button.attach', { type: 'button', title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, icon('paperclip'));
   private readonly picker = h('input', { type: 'file', multiple: true, style: 'display:none' });
   private readonly pending = h('div.attachments');
   private files: File[] = [];
-  private readonly status = h('div.chat-status', { role: 'status', 'aria-live': 'polite' });
+  /** What the agent is doing now, at the end of the log; said to a screen reader by `statusSaid`, outside the log. */
+  private readonly status = h('div.chat-status', { 'aria-hidden': 'true' });
+  private readonly statusSaid = h('div.sr-only', { role: 'status' });
   private readonly hint = h('span.composer-hint');
   /** How full the model's context is. */
   private readonly meterFill = h('span.context-fill');
   private readonly meterText = h('span.context-text');
-  private readonly meter = h('span.context-meter', { title: 'How much of the model\'s context the conversation uses. Older turns are summarized before it fills up.' }, h('span.context-bar', this.meterFill), this.meterText);
+  private readonly meter = h('span.context-meter', { title: "How much of the model's context the last step used, as the model counted it: its prompt (the conversation, the instructions and the tools' descriptions) and its reply. Older turns are summarized before it fills up." }, h('span.context-bar', this.meterFill), this.meterText);
   /** Beside the meter: the conversation started again (its messages gone, the context empty), asked first. The same as /clear. */
   private readonly clearButton = h('button.chat-clear', { type: 'button', title: CLEAR_TITLE, 'aria-label': 'Clear the conversation' }, icon('trash'), h('span', 'Clear')) as HTMLButtonElement;
   /** The agent's checklist for the current request, pinned above the log. */
@@ -162,7 +171,11 @@ export class ChatPane {
   private readonly blockButton = h('button.convo-block', { type: 'button', hidden: true, 'aria-pressed': 'false' }, icon('ban'), h('span', 'Block'));
   /** A call going on now, in the conversation shown: how long it has run, and a button that ends it. */
   private readonly liveBar = h('div.call-live', { hidden: true });
+  /** Said once as the strip shows, and again only when who or how changes: the time beside it is not read out each second. */
   private readonly liveStatus = h('div.live-status', { role: 'status' });
+  private readonly liveLabel = h('span.live-label');
+  private readonly liveName = h('span.live-name');
+  private readonly liveTime = h('span.live-time', { title: 'How long the call has run', 'aria-hidden': 'true' });
   private readonly liveEnd = h('button.live-end', { type: 'button', title: 'Hang up on this call (asked first)' }, 'End call');
   private liveTimer: ReturnType<typeof setInterval> | null = null;
   /** The person's choice to show or hide the steps; null follows the run (hidden once finished). */
@@ -253,7 +266,9 @@ export class ChatPane {
     this.log.append(this.feed);
     this.feed.append(this.status);
     this.sessionTabs.append(this.sessionPicker.element, this.contactButton, this.blockButton);
-    this.liveBar.append(this.liveStatus, this.liveEnd);
+    // (the time beside the region, not in it: only who, and whether it is live or with the person, is said)
+    this.liveStatus.append(h('span.live-dot', { 'aria-hidden': 'true' }), this.liveLabel, this.liveName);
+    this.liveBar.append(this.liveStatus, this.liveTime, this.liveEnd);
     this.liveEnd.hidden = !this.handlers.hangUp;
     this.liveEnd.addEventListener('click', () => this.handlers.hangUp?.());
     this.contactButton.addEventListener('click', () => {
@@ -305,6 +320,8 @@ export class ChatPane {
       h('div.chat-log-wrap', this.log, this.toLatest),
       h('div.chat-compose', composer),
       this.picker,
+      this.statusSaid,
+      this.announcer,
     );
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
@@ -409,6 +426,27 @@ export class ChatPane {
     return this.hasMessage();
   }
 
+  /**
+   * What is written and attached in the box, taken out of it (null when there is nothing): the message box is every
+   * conversation's, so what was written for one is kept for it while another is shown (see putDraft).
+   */
+  takeDraft(): { text: string; files: File[] } | null {
+    const draft = this.hasMessage() ? { text: this.input.value, files: this.files } : null;
+    this.input.value = '';
+    this.files = [];
+    this.renderPending();
+    this.grow();
+    return draft;
+  }
+
+  /** A conversation's draft back in the box as it was left (an empty box, for one with none). */
+  putDraft(draft: { text: string; files: File[] } | null): void {
+    this.input.value = draft?.text ?? '';
+    this.files = [...(draft?.files ?? [])];
+    this.renderPending();
+    this.grow();
+  }
+
   /** A message that could not be sent, back in the box as it was written, its files with it. */
   restore(text: string, files: File[] = []): void {
     if (text && !this.input.value.trim()) this.input.value = text;
@@ -424,9 +462,12 @@ export class ChatPane {
    */
   private async askToClear(): Promise<void> {
     if (this.busy) return;
+    // (a phone conversation's texts went out to the person: they stay sent)
     const yes = await confirmAction({
       title: 'Clear this conversation?',
-      message: 'Its messages are removed and the model starts with an empty context. Files in the project, and texts already sent, stay as they are.',
+      message: this.kind === 'own'
+        ? "Its messages are removed and the model starts with an empty context. The project's files stay as they are."
+        : 'Its messages are removed here, and its agents start with an empty context. Texts already sent stay sent, and the Front desk\'s files stay as they are.',
       ok: 'Clear',
       danger: true,
     });
@@ -449,8 +490,6 @@ export class ChatPane {
     this.busy = busy;
     // A new run: the last run's last tool is not what the agent does now.
     if (busy) this.setActivity('');
-    // While the reply streams it is not read out piece by piece: the log is read when the run is done.
-    this.log.setAttribute('aria-busy', String(busy));
     if (!busy) this.settleRun();
     if (this.currentPlan) this.showPlan(this.currentPlan, busy);
     this.input.placeholder = busy ? 'Message the agent while it works…' : this.placeholder();
@@ -490,8 +529,25 @@ export class ChatPane {
   }
 
   setStatus(text: string): void {
-    // (said again with each piece of a streamed reply: the line is redrawn only when its words change)
-    if (this.status.textContent !== text) this.status.textContent = text;
+    // (said again with each piece of a streamed reply: the line is redrawn, and said, only when its words change)
+    if (this.status.textContent === text) return;
+    this.status.textContent = text;
+    this.statusSaid.textContent = text;
+  }
+
+  /** Tell a screen reader `text` (politely: after what it is reading). Said again when it is the same words. */
+  private announce(text: string): void {
+    const said = text.replace(/\s+/g, ' ').trim();
+    if (!said) return;
+    this.announcer.textContent = '';
+    requestAnimationFrame(() => {
+      this.announcer.textContent = said.length > 1200 ? `${said.slice(0, 1200)}… (the rest is in the conversation)` : said;
+    });
+  }
+
+  /** Open the list of conversations (the header's chip, with several calls going on, asks which to show). */
+  openConversations(): void {
+    this.sessionPicker.open();
   }
 
   /**
@@ -644,7 +700,7 @@ export class ChatPane {
       this.to = to;
       if (!this.busy) this.input.placeholder = this.placeholder();
     }
-    this.showLive(!!shown?.live, shown ? tabName(shown) : '');
+    this.showLive(!!shown?.live, shown ? tabName(shown) : '', !!shown?.withYou);
   }
 
   /** Name the agent's runs as the conversation calls it (the runner's is known only once the conversations are listed). */
@@ -658,8 +714,11 @@ export class ChatPane {
     return this.kind === 'own' ? OWN_ICON[this.own] : 'sparkle';
   }
 
-  /** The strip over a call going on now: a pulsing dot, who, and how long. */
-  private showLive(live: boolean, name: string): void {
+  /**
+   * The strip over a call going on now: a pulsing dot, who, and how long; "With you" while the person has the call
+   * (it was put through to them), when End call is theirs to do on their phone and is not offered here.
+   */
+  private showLive(live: boolean, name: string, withYou = false): void {
     // The call shown has ended: what its agent writes now is not said.
     if (this.live && !live) this.callOver = 'ended';
     if (live !== this.live && !this.busy) {
@@ -668,14 +727,23 @@ export class ChatPane {
     }
     this.live = live;
     this.liveBar.hidden = !live;
+    this.liveBar.classList.toggle('with-you', live && withYou);
     if (this.liveTimer) clearInterval(this.liveTimer);
     this.liveTimer = null;
-    if (!live) return;
-    // (Only what it says is drawn again each second: the End call button stays, under the pointer.)
+    if (!live) {
+      // (emptied, so the strip is said again when a call shows next)
+      this.liveLabel.textContent = this.liveName.textContent = '';
+      return;
+    }
+    const label = withYou ? 'With you' : 'Live call';
+    const who = this.callName !== 'Caller' ? this.callName : name;
+    if (this.liveLabel.textContent !== label) this.liveLabel.textContent = label;
+    if (this.liveName.textContent !== who) this.liveName.textContent = who;
+    this.liveBar.title = withYou ? `You have the call with ${who}: hang up on your phone, or hand it back to the receptionist there` : '';
+    this.liveEnd.hidden = !this.handlers.hangUp || withYou;
+    // (only the time is drawn again each second: the End call button stays, under the pointer, and nothing is read out)
     const tick = () => {
-      clear(this.liveStatus);
-      const time = this.callStartAt ? clock(Date.now() - this.callStartAt) : '';
-      this.liveStatus.append(h('span.live-dot', { 'aria-hidden': 'true' }), h('span.live-label', 'Live call'), h('span.live-name', this.callName !== 'Caller' ? this.callName : name), h('span.live-time', { title: 'How long the call has run' }, time));
+      this.liveTime.textContent = this.callStartAt ? clock(Date.now() - this.callStartAt) : '';
     };
     tick();
     this.liveTimer = setInterval(tick, 1000);
@@ -791,6 +859,7 @@ export class ChatPane {
     this.meter.hidden = true;
     // (another conversation shown, or this one started again: an error here does not send what was written there)
     this.lastSent = null;
+    this.lastPrompt = null;
     this.hiddenTurns = [];
     this.way = null;
     this.taskRows.clear();
@@ -1050,8 +1119,10 @@ export class ChatPane {
           this.way = 'call';
           // They speak: the call goes on (a goodbye refused, or spoken over), and its agent is heard.
           this.callOver = false;
-          // A live call: the caller's time tells when the call began (the note that began it says only its minute).
-          if (!this.replaying && part.atMs !== undefined) this.callStartAt = Date.now() - part.atMs;
+          // A live call whose start is not known (a conversation kept before turns had times): the caller's time tells
+          // when it began. (Known, it is kept: the phone's clock starts again when the call is handed back.)
+          if (!this.replaying && part.atMs !== undefined && this.callStartAt === null) this.callStartAt = Date.now() - part.atMs;
+          if (!this.replaying) this.announce(`${this.callName}: ${part.text}`);
           const tags: HTMLElement[] = [];
           const said = part.during ? `, as the agent said "${part.during}"` : '';
           if (part.backchannel) tags.push(h('span.msg-tag.backchannel', { title: `An acknowledgement said over the agent${said}: it talked on` }, 'backchannel'));
@@ -1067,6 +1138,7 @@ export class ChatPane {
           if (this.way !== 'sms') this.wayDivider('sms', this.replaying ? this.drawingAt : Date.now());
           this.way = 'sms';
           this.add(h('div.msg.incoming.texter', h('div.msg-body', part.text || ' ')), 'texter', part.name ?? formatNumber(part.number));
+          if (!this.replaying) this.announce(`Text from ${part.name ?? formatNumber(part.number)}: ${part.text}`);
           break;
         case 'flow':
           this.add(h('div.msg.incoming.flow-ask', h('div.msg-body', part.text || ' ')), 'flow', part.flow);
@@ -1118,13 +1190,27 @@ export class ChatPane {
     this.add(box, 'you');
   }
 
-  /** A note from OAIY in a conversation (a lookup's answer, the runner's direction): quiet, and set apart. */
+  /**
+   * A note from OAIY in a conversation (a lookup's answer, the runner's direction, what came of a transfer): quiet, set
+   * apart, and in words for the person (the instructions it carries for the model are not shown). The owner's time with
+   * the call and its handing back are one line: "You took the call · handed back after 1:35".
+   */
   private note(text: string): void {
     this.current = null;
-    const [first, ...rest] = text.split('\n');
-    this.add(rest.length
+    const [first, ...rest] = noteForPeople(text).split('\n');
+    const back = /^You handed the call back after (.+?)\.$/.exec(first);
+    const last = this.lastEntry(this.sink ?? this.feed);
+    if (back && !rest.length && last instanceof HTMLElement && last.dataset.note === 'took') {
+      last.dataset.note = '';
+      last.lastElementChild!.textContent = `You took the call · handed back after ${back[1]}`;
+      return;
+    }
+    const row = rest.length
       ? h('details.msg.oaiy-note', h('summary', icon('info'), h('span', first)), h('pre', rest.join('\n')))
-      : h('div.msg.oaiy-note', icon('info'), h('span', first)));
+      : h('div.msg.oaiy-note', icon('info'), h('span', first));
+    if (first === 'You took the call.') row.dataset.note = 'took';
+    this.add(row);
+    if (!this.replaying) this.announce(first);
   }
 
   /** The model's thinking stays shown once the reply moves on: it says why the model did what it did. */
@@ -1142,17 +1228,24 @@ export class ChatPane {
     return box;
   }
 
+  /** The last step's prompt, whose line takes the model's own count of it when the model answers. */
+  private lastPrompt: { said: HTMLElement; messages: string } | null = null;
+
   /** What the model was sent for this step: folded, and written out only when opened (it is long). */
   private promptView(e: { system: string; turns: Turn[]; tools: string[] }): void {
     this.current = null;
     const chars = e.system.length + e.turns.reduce((n, t) => n + (t.role === 'user' ? t.text.length : t.role === 'assistant' ? t.text.length + JSON.stringify(t.calls).length : t.results.reduce((m, r) => m + r.content.length, 0)), 0);
     const pre = h('pre');
+    const messages = `Prompt · ${e.turns.length} message${e.turns.length === 1 ? '' : 's'}`;
+    // (an estimate of its words, until the model's own count comes with its answer: see `usage`, which the meter shows too)
+    const said = h('span', { title: "An estimate from the prompt's words, without the tools' descriptions: the model's own count replaces it when it answers" }, `${messages} · about ${formatTokens(Math.round(chars / 4))} tokens of text`);
     const box = h(
       'details.prompt-view',
       { title: 'What the model was sent for this step (click to read it)' },
-      h('summary', icon('file-text'), h('span', `Prompt · ${e.turns.length} message${e.turns.length === 1 ? '' : 's'} · about ${formatTokens(Math.round(chars / 4))} tokens`)),
+      h('summary', icon('file-text'), said),
       pre,
     );
+    this.lastPrompt = { said, messages };
     box.addEventListener('toggle', () => {
       if ((box as HTMLDetailsElement).open && !pre.textContent) pre.textContent = promptText(e);
     });
@@ -1182,7 +1275,7 @@ export class ChatPane {
     this.redraw(draft.box, () => {
       const raw = draft.raw;
       const name = draft.json ? this.draftName : /<function=([\w.-]+)>/.exec(raw)?.[1] ?? '';
-      if (name) draft.box.querySelector('.tool-name')!.textContent = `Writing a call: ${toolLabel(name)}…`;
+      if (name) draft.box.querySelector('.tool-name')!.textContent = `${toolDoing(name)}…`;
       draft.body.textContent = draft.json
         ? raw.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\t/g, '\t')
         : raw
@@ -1202,8 +1295,10 @@ export class ChatPane {
     const short = !text.includes('\n') && text.length <= 110;
     // (a note that begins with a mark of its own, 📞 or 🕶, needs no other beside it)
     const mark = kind === 'error' || !/^\p{Extended_Pictographic}/u.test(text) ? [icon(kind === 'error' ? 'alert' : 'info')] : [];
-    const row = h('div.msg.system', { class: `${kind} ${short ? 'line' : 'card'}${text.includes('\n') ? ' lines' : ''}` }, ...mark, h('pre', text));
+    // (an error is said at once, by its own role; a note is said after what is being read)
+    const row = h('div.msg.system', { class: `${kind} ${short ? 'line' : 'card'}${text.includes('\n') ? ' lines' : ''}`, ...(kind === 'error' ? { role: 'alert' } : {}) }, ...mark, h('pre', text));
     this.add(row);
+    if (kind !== 'error') this.announce(text);
     this.scroll();
     return row;
   }
@@ -1620,14 +1715,15 @@ export class ChatPane {
         break;
       case 'tool_start':
         this.draftName = e.name;
-        this.setStatus(`Writing a call: ${toolLabel(e.name)}…`);
+        this.setStatus(`${toolDoing(e.name)}…`);
         break;
       case 'tool_call': {
         this.doneThinking();
         if (this.draft) this.removeEntry(this.draft.box);
         this.draft = null;
         this.draftName = '';
-        const doing = `${toolLabel(e.call.name, e.call.input)}${summarizeCall(e.call) ? ` · ${summarizeCall(e.call)}` : ''}`;
+        // (what it does now, as it runs: the row says what it did once it has)
+        const doing = `${toolDoing(e.call.name, e.call.input)}${summarizeCall(e.call) ? ` · ${summarizeCall(e.call)}` : ''}`;
         this.setStatus(`${doing}…`);
         if (e.call.name !== 'update_plan') this.setActivity(doing);
         this.toolCard(e.call);
@@ -1646,6 +1742,12 @@ export class ChatPane {
         else this.system(e.message);
         break;
       case 'usage':
+        // The model's count of the prompt it was sent (its tools' descriptions with it): what the meter counts too.
+        if (this.lastPrompt && e.usage.inputTokens > 0) {
+          this.lastPrompt.said.textContent = `${this.lastPrompt.messages} · ${formatTokens(e.usage.inputTokens)} tokens, as the model counted them`;
+          this.lastPrompt.said.title = "The model's own count of what it was sent: the conversation, the instructions and the tools' descriptions";
+          this.lastPrompt = null;
+        }
         break;
       case 'check':
         this.checkCard(e);
@@ -1676,7 +1778,11 @@ export class ChatPane {
         break;
       case 'nudge':
         this.current = null;
-        this.add(h('div.msg.nudge', icon('refresh'), h('span', `Not finished yet, so the agent carries on: ${e.message}`)), 'agent');
+        // (the people's words for the push, not the model's; one that has none of its own reads as before)
+        {
+          const said = noteForPeople(e.message);
+          this.add(h('div.msg.nudge', icon('refresh'), h('span', said !== e.message || /^It (gave|said)/.test(said) ? said : `Not finished yet, so the agent carries on: ${said}`)), 'agent');
+        }
         this.scroll();
         break;
       case 'done':
@@ -1727,6 +1833,8 @@ export class ChatPane {
       // (a redraw still queued for it would draw it unfinished again, its code block open)
       this.redraws.delete(reply.box);
       reply.body.innerHTML = renderMarkdown(reply.text, true);
+      // Written whole: said once (not as it streamed).
+      if (!this.replaying && !this.sink) this.announce(`${this.agentName()}: ${reply.body.textContent ?? ''}`);
     }
     this.current = null;
   }
@@ -1775,7 +1883,8 @@ export class ChatPane {
       const start = t.role === 'user' && t.automatic ? parseCallStart(t.text) : null;
       if (start) {
         this.callName = callerName(start.name);
-        this.callStartAt = start.at?.getTime() ?? null;
+        // (the turn's own time, to the millisecond; the note says only the minute, from a conversation kept before turns had times)
+        this.callStartAt = t.at ?? start.at?.getTime() ?? null;
       }
     }
     if (!this.busy) this.input.placeholder = this.placeholder();
@@ -1895,6 +2004,54 @@ export class ChatPane {
     }
   }
 
+  /**
+   * A note OAIY wrote into the conversation for the model (a call's start or end, what came of a transfer, a push to
+   * carry on), drawn as what happened: in a phone conversation as a quiet note, in the person's own as the agent's.
+   */
+  private automaticTurn(text: string): void {
+    this.current = null;
+    const start = parseCallStart(text);
+    if (start) {
+      this.callStart(start);
+      return;
+    }
+    const ended = parseCallEnd(text);
+    if (ended !== null) {
+      this.add(h('div.call-end', h('span.call-end-pill', icon('phone-off'), h('span', ended ? `The call ended: ${ended}` : 'The call ended'))));
+      this.callOver = 'ended';
+      if (!this.replaying) this.announce(ended ? `The call ended: ${ended}` : 'The call ended.');
+      return;
+    }
+    if (this.kind === 'call' || this.kind === 'sms') {
+      this.note(text);
+      return;
+    }
+    this.add(h('div.msg.nudge', icon('refresh'), h('span', noteForPeople(text).split('\n')[0])), 'agent');
+  }
+
+  /**
+   * A note OAIY wrote into the conversation shown outside a run (the call ended, the owner took the call or handed it
+   * back): drawn as it comes, not only when the conversation is drawn again. A call that ended as its reply was being
+   * written: that reply, cut off, reads as not said.
+   */
+  noteTurn(turn: Turn): void {
+    if (turn.role !== 'user') return;
+    // (the reply being written is the call's while the call shown is live: the call streams here first)
+    let cut: typeof this.quiet = null;
+    if (this.current && this.live && parseCallEnd(turn.text) !== null) {
+      const reply = this.current;
+      this.redraws.delete(reply.box);
+      this.current = null;
+      this.removeEntry(reply.box);
+      this.quietText(reply.text, 'Not said: the call ended as it was written');
+      cut = this.quiet;
+    }
+    this.automaticTurn(turn.text);
+    // (what the stopped run still writes goes on in that note, above the call's end)
+    if (cut) this.quiet = cut;
+    this.scroll();
+  }
+
   /** Draw turns in the order they came (each after the ones before). */
   private drawTurns(turns: Turn[], showPlan = true): void {
     this.replaying = true;
@@ -1927,19 +2084,7 @@ export class ChatPane {
       return;
     }
     if (turn.role === 'user' && turn.automatic) {
-      this.current = null;
-      const start = parseCallStart(turn.text);
-      if (start) {
-        this.callStart(start);
-        return;
-      }
-      const ended = parseCallEnd(turn.text);
-      if (ended !== null) {
-        this.add(h('div.call-end', h('span.call-end-pill', icon('phone-off'), h('span', ended ? `The call ended: ${ended}` : 'The call ended'))));
-        this.callOver = 'ended';
-        return;
-      }
-      this.add(h('div.msg.nudge', icon('refresh'), h('span', turn.text.replace(/^\[(?:OAIY|bot\.computer)\] /, '').split('\n')[0])), 'agent');
+      this.automaticTurn(turn.text);
       return;
     }
     if (turn.role === 'user') {

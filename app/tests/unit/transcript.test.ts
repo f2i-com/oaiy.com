@@ -203,3 +203,62 @@ describe('what outreach writes into a conversation, read back', () => {
     expect(parseOutreachNote('[OAIY] Outreach "X" · a\nsomething else')).toBeNull();
   });
 });
+
+describe("OAIY's notes to a model, as the person reads them", () => {
+  it('say what happened on a call, never what the model is told to do', async () => {
+    const { TRANSFER_NOTES, unsaidNote, BOOKING_NUDGE } = await import('../../src/sessions');
+    const { OUTREACH_AFTER_CALL } = await import('../../src/outreach');
+    const { noteForPeople } = await import('../../src/ui/chat/transcript');
+    expect(noteForPeople(TRANSFER_NOTES.accepted)).toBe('You accepted: the call is being put through to you.');
+    expect(noteForPeople(TRANSFER_NOTES.handoff)).toBe('You took the call.');
+    expect(noteForPeople(TRANSFER_NOTES.back('1:35'))).toBe('You handed the call back after 1:35.');
+    expect(noteForPeople(TRANSFER_NOTES.declined)).toBe('You could not take the call: the receptionist offers to take a message.');
+    expect(noteForPeople(TRANSFER_NOTES.declinedWith('Back at three'))).toBe('You could not take the call, and left them a message: "Back at three"');
+    expect(noteForPeople(TRANSFER_NOTES.nobody)).toBe('Nobody took the call: the receptionist offers to take a message.');
+    expect(noteForPeople(TRANSFER_NOTES.cancelled)).toBe('The transfer was withdrawn: the receptionist offers to take a message.');
+    expect(noteForPeople(TRANSFER_NOTES.replaced('Putting you through now.', 'One moment please.'))).toBe('Not said: "Putting you through now." (nobody had taken the call). The caller heard "One moment please.".');
+    expect(noteForPeople(unsaidNote(['We are open', 'until five.']))).toBe('Not said (the caller spoke first): "We are open until five."');
+    expect(noteForPeople(BOOKING_NUDGE)).toMatch(/^The receptionist said it would book it/);
+    expect(noteForPeople(OUTREACH_AFTER_CALL)).toMatch(/^The call ended before its result was recorded/);
+    expect(noteForPeople('[OAIY] A note from the runner (the main agent your person talks to): Tell callers we are closed Monday.')).toBe('From the runner: Tell callers we are closed Monday.');
+    expect(noteForPeople('[OAIY] The answer to your lookup "open Sunday?":\nNo, closed on Sundays.')).toBe('Looked up "open Sunday?"\nNo, closed on Sundays.');
+    for (const note of [TRANSFER_NOTES.accepted, TRANSFER_NOTES.handoff, TRANSFER_NOTES.back('0:42'), TRANSFER_NOTES.declined, TRANSFER_NOTES.nobody]) {
+      expect(noteForPeople(note)).not.toMatch(/Say nothing|do not greet|Offer to take|take_message|\[OAIY\]/i);
+    }
+  });
+
+  it("say what the agent was pushed to do in the person's own conversation, and a stopped reply", async () => {
+    const { REPEAT_NUDGE, START_NUDGE, CALLS_GOING_NUDGE, STOPPED_NOTE } = await import('../../src/agent/agent');
+    const { noteForPeople } = await import('../../src/ui/chat/transcript');
+    expect(noteForPeople(STOPPED_NOTE)).toBe('You stopped this reply.');
+    expect(noteForPeople(`[OAIY] ${REPEAT_NUDGE}`)).toBe('It gave the same reply again without doing anything; asked for a tool call.');
+    expect(noteForPeople(`[OAIY] ${START_NUDGE}`)).toBe('It said what it would do without starting; asked to start.');
+    expect(noteForPeople(`[OAIY] ${CALLS_GOING_NUDGE}`)).toBe('The calls it started are going on: asked to say what it started.');
+    expect(noteForPeople('Your plan still has 2 open steps: 2. "Write the page", 3. "Check it". Carry on with step 2 "Write the page": work on it until it is done, then mark it done')).toBe('Not finished yet, so the agent carries on: 2 plan steps open, step 2 "Write the page" next.');
+    expect(noteForPeople('The last automatic check of notes/ still reports errors:\nui/main.ui: bad tag')).toBe('Not finished yet, so the agent carries on: the last check of notes/ still reports errors.');
+    // (one it does not know reads as it is)
+    expect(noteForPeople('[OAIY] Something new happened.')).toBe('Something new happened.');
+  });
+
+  it("an outreach report's lines for the person: where the results are, and nothing the model is told to do", async () => {
+    const { reportLine, reportAfterwards } = await import('../../src/ui/chat/outreachCard');
+    expect(reportLine('Results: /outreach/x.md (and .csv, .json) in the Front desk, not in this project: to keep them here, write them into a file of this project with outreach_results (id out-1).')).toBe('Results: /outreach/x.md (and .csv, .json) in the Front desk.');
+    expect(reportLine('Results: /outreach/x.md (and .csv, .json); outreach_results gives them as data.')).toBe('Results: /outreach/x.md (and .csv, .json).');
+    expect(reportAfterwards('What your person asked for afterwards: "Text me the list". Do that now with your tools; anything else, suggest it and wait for them.')).toBe('What you asked for afterwards: "Text me the list". The agent does it now.');
+    expect(reportAfterwards('Tell your person how it went, in a few lines; suggest what to do next and wait for them.')).toBe('');
+  });
+});
+
+describe('a call being written, in words of what is being done', () => {
+  it('reads in the present ("Writing", "Running code"), where the row says what it did', async () => {
+    const { toolDoing, toolLabel } = await import('../../src/ui/chat/tools');
+    expect(toolLabel('write_file')).toBe('Wrote');
+    expect(toolDoing('write_file')).toBe('Writing');
+    expect(toolDoing('code_run')).toBe('Running code');
+    expect(toolDoing('grep')).toBe('Searching for');
+    expect(toolDoing('generate_image')).toBe('Making a picture');
+    expect(toolDoing('phone_conversations')).toBe('Using phone conversations');
+    expect(toolDoing('softn_examples')).toBe('Using SoftN examples');
+    expect(toolDoing('delegate')).toBe('Using sub-agents');
+  });
+});

@@ -81,17 +81,23 @@ export function isSoftnProject(vfs: Vfs): boolean {
   return findApps(vfs).length > 0;
 }
 
-/** The app a request means: the one named, or the only one there is. */
+/** `text` as a sentence starts: its first letter a capital. */
+const sentence = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
+
+/**
+ * The app a request means: the one named, or the only one there is. Why there is none is a sentence of its own, as the
+ * chat shows it after /softn or Export .softn (and a tool's error says it).
+ */
 export function resolveApp(vfs: Vfs, requested?: unknown): { ok: true; root: string } | { ok: false; reason: string } {
   const apps = findApps(vfs);
   if (typeof requested === 'string' && requested.trim()) {
     const root = appKey(requested.replace(/\/manifest\.json$/i, ''));
     if (isSoftnApp(vfs, root)) return { ok: true, root };
-    return { ok: false, reason: `${appLabel(root)} is not a SoftN app (it needs a manifest.json whose "main" is a .ui page). Apps here: ${apps.length ? apps.map(appLabel).join(', ') : 'none'}` };
+    return { ok: false, reason: sentence(`${appLabel(root)} is not a SoftN app (it needs a manifest.json whose "main" is a .ui page). Apps here: ${apps.length ? apps.map(appLabel).join(', ') : 'none'}`) };
   }
   if (apps.length === 1) return { ok: true, root: apps[0] };
-  if (!apps.length) return { ok: false, reason: 'there is no SoftN app in this project yet (a folder whose manifest.json has a "main" .ui page)' };
-  return { ok: false, reason: `this project has several SoftN apps; say which with \`app\`: ${apps.map(appLabel).join(', ')}` };
+  if (!apps.length) return { ok: false, reason: 'There is no SoftN app in this project yet (a folder whose manifest.json has a "main" .ui page)' };
+  return { ok: false, reason: `This project has several SoftN apps; say which with \`app\`: ${apps.map(appLabel).join(', ')}` };
 }
 
 /** Python logic or JavaScript logic: one app is one or the other. */

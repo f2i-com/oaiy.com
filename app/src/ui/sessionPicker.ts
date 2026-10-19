@@ -29,6 +29,8 @@ export interface ConversationTab {
   lastAt?: number;
   /** On a call now. */
   live?: boolean;
+  /** On a call that is the person's now (put through to them): the receptionist is not on it. */
+  withYou?: boolean;
   /** A person's: the ways they have been in touch (calls, texts), and the latest. */
   ways?: Array<'call' | 'sms'>;
   lastWay?: 'call' | 'sms';
@@ -85,13 +87,14 @@ function waysText(ways: Array<'call' | 'sms'>): string {
 /** The line under a conversation's name: its number and kind, or what it is. */
 export function conversationDetail(tab: ConversationTab, forButton = false): string {
   const kind = tabKind(tab);
-  if (tab.live) return 'On a call now';
+  if (tab.live) return tab.withYou ? 'With you now' : 'On a call now';
   if (tab.working && !forButton) return 'Working…';
   const name = tabName(tab);
   const key = tab.key ?? '';
   if ((kind === 'sms' || kind === 'person') && key === TEST) return 'Test conversation: replies are shown, not sent';
   if ((kind === 'call' || kind === 'sms' || kind === 'person') && key) {
-    const number = key !== name && !tab.hidden && /\d{4,}/.test(key) ? formatNumber(key) : '';
+    // (a name that is their number, as it is read, is not followed by the number again)
+    const number = key !== name && formatNumber(key) !== name && !tab.hidden && /\d{4,}/.test(key) ? formatNumber(key) : '';
     const ways = kind === 'person' ? tab.outreach || waysText(tab.ways ?? []) : kind === 'call' ? 'Calls' : 'Text messages';
     // Someone the receptionist does not answer: said first, so a silence is not taken for a fault.
     const what = kind === 'person' && tab.quiet ? `${tab.quiet} · ${ways}` : ways;
@@ -144,6 +147,11 @@ export class SessionPicker {
     this.combo.set(items, active ?? OWN);
   }
 
+  /** The list opened, to choose a conversation from (focus in its search). */
+  open(): void {
+    this.combo.open();
+  }
+
   /** The button: the conversation shown, who with, and how many others (with their unread count). */
   private buttonContent(current: ComboItem | null): Array<Node | string> {
     const tab = this.tabs.find((t) => (t.id ?? OWN) === current?.id) ?? this.tabs[0];
@@ -157,10 +165,10 @@ export class SessionPicker {
       h(
         'span.convo-text',
         // (the name in a box of its own, so a long one ends in an ellipsis before the Live tag and the working dot)
-        h('span.convo-name', { class: tab.working || tab.live ? 'working' : '' }, h('span.convo-title', name), ...(tab.live ? [h('span.convo-live', 'Live')] : [])),
+        h('span.convo-name', { class: tab.working || tab.live ? 'working' : '' }, h('span.convo-title', name), ...(tab.live ? [h('span.convo-live', tab.withYou ? 'With you' : 'Live')] : [])),
         h('span.convo-detail', conversationDetail(tab, true)),
       ),
-      h('span.convo-more', `${others.length} other${others.length === 1 ? '' : 's'}`),
+      h('span.convo-more', h('span.convo-more-long', `${others.length} other${others.length === 1 ? '' : 's'}`), h('span.convo-more-short', { 'aria-hidden': 'true' }, `+${others.length}`)),
       ...(unread ? [h('span.convo-unread', { 'aria-label': `${unread} unread elsewhere` }, String(unread))] : []),
     ];
   }

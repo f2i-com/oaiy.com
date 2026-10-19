@@ -1,7 +1,8 @@
 /**
  * The editor pane: CodeMirror over one open file. Typing writes back into the
  * project (debounced); a change the agent makes to the open file reloads it
- * unless there are unsaved keystrokes.
+ * unless there are unsaved keystrokes. A file renamed or moved (in the tree,
+ * by the agent or in the terminal) stays open where it went.
  */
 import { css } from '@codemirror/lang-css';
 import { html } from '@codemirror/lang-html';
@@ -11,7 +12,7 @@ import { markdown } from '@codemirror/lang-markdown';
 import { python } from '@codemirror/lang-python';
 import { Compartment, EditorState, type Extension } from '@codemirror/state';
 import { EditorView, basicSetup } from 'codemirror';
-import type { Vfs } from '../vfs/vfs';
+import type { Vfs, VfsChange } from '../vfs/vfs';
 import { clear, h } from './dom';
 import { editorLook } from './editorTheme';
 import { fileIcon, icon } from './icons';
@@ -35,6 +36,18 @@ function languageFor(path: string): Extension[] {
     case 'css': case 'scss': return [css()];
     default: return [];
   }
+}
+
+/** What a screen reader calls the editor: the file it holds. */
+function nameFor(path: string): Extension {
+  return EditorView.contentAttributes.of({ 'aria-label': `Editing ${path.replace(/^\/+/, '')}` });
+}
+
+/** Whether two files' bytes are the same. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 /** What the header says about the open file's saving. */
@@ -67,6 +80,21 @@ export class EditorPane {
   private media: Media | null = null;
   /** The editor's colours, which follow the page's light or dark. */
   private readonly look = new Compartment();
+  /** The open file's language, and the name it is read out by: both of its path, which a rename changes. */
+  private readonly language = new Compartment();
+  private readonly name = new Compartment();
+  /** The open file was followed to where it was renamed or moved: the tree shows it there. */
+  onMove: (path: string) => void = () => {};
+  /** The open file's bytes as last read or saved: a copy of it, moved, holds the same. */
+  private known: Uint8Array | null = null;
+  /**
+   * Files written just now (in this task) besides the open one. A file moved is copied to where it goes and then
+   * removed, in one go: when the open file is removed, its copy is among these.
+   */
+  private written: string[] = [];
+  private writtenTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A rename or move the tree is making now (see move): the open file, or a folder it is in, followed exactly. */
+  private moving: { from: string; to: string } | null = null;
 
   constructor(private vfs: Vfs) {
     this.conflictBar.hidden = true;
@@ -171,6 +199,7 @@ export class EditorPane {
     if (!media) return;
     this.media = media;
     this.mediaPath = path;
+    this.known = bytes;
     this.header(path, 'media', formatBytes(bytes.byteLength));
     const info = h('span.media-info', formatBytes(bytes.byteLength));
     const bar = h('div.media-bar', info);
@@ -222,6 +251,7 @@ export class EditorPane {
     }
     this.path = path;
     this.dirty = false;
+    this.known = this.vfs.readBytes(path);
     this.header(path);
     const state = EditorState.create({
       doc,
@@ -229,7 +259,8 @@ export class EditorPane {
         basicSetup,
         this.look.of(editorLook(theme())),
         EditorView.lineWrapping,
-        ...languageFor(path),
+        this.language.of(languageFor(path)),
+        this.name.of(nameFor(path)),
         EditorView.updateListener.of((update) => {
           if (!update.docChanged || this.applying) return;
           this.dirty = true;
@@ -254,14 +285,38 @@ export class EditorPane {
     try {
       this.vfs.writeFile(this.path, this.view.state.doc.toString(), { parents: true });
       this.dirty = false;
+      this.known = this.vfs.readBytes(this.path);
       this.setState('saved');
     } catch (error) {
       this.setState('error', (error as Error).message);
     }
   }
 
-  /** The project changed underneath: reload or close the open file. */
-  externalChange(path: string | null): void {
+  /**
+   * A rename or move of `from` to `to` (the open file, or a folder it is in, or neither), made by `run`: what is typed
+   * is saved first, and the open file stays open where it goes, whatever it holds.
+   */
+  move(from: string, to: string, run: () => void): void {
+    this.flush();
+    this.moving = { from, to };
+    try {
+      run();
+    } finally {
+      this.moving = null;
+    }
+  }
+
+  /** The project changed underneath: reload the open file, follow it where it was moved, or close it. */
+  externalChange(change: VfsChange): void {
+    const path = change.type === 'reset' ? null : change.path;
+    if (change.type === 'write') this.wrote(change.path);
+    if (change.type === 'remove') {
+      const to = this.movedTo(change.path);
+      if (to) {
+        this.follow(to);
+        return;
+      }
+    }
     if (this.mediaPath && (path === null || `/${path}` === this.mediaPath)) {
       if (this.vfs.exists(this.mediaPath)) this.showMedia(this.mediaPath);
       else this.close();
@@ -279,9 +334,62 @@ export class EditorPane {
       this.showConflict();
       return;
     }
+    this.known = this.vfs.readBytes(this.path);
     this.applying = true;
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
     this.applying = false;
+  }
+
+  /** A file written besides the open one, kept until this task is over (see `written`). */
+  private wrote(key: string): void {
+    const open = this.path ?? this.mediaPath;
+    if (!open || `/${key}` === open) return;
+    // (a burst of hundreds, an upload or an import, is not kept whole: a move is of one file, or a folder's)
+    if (this.written.length < 2000) this.written.push(`/${key}`);
+    this.writtenTimer ??= setTimeout(() => {
+      this.written = [];
+      this.writtenTimer = null;
+    }, 0);
+  }
+
+  /**
+   * Where the open file went, as `key` is removed: null when it was not moved (it was deleted, or `key` is another
+   * file). A move the tree makes says where; the agent's or the terminal's is found by the copy written just before,
+   * which holds what the file held (an empty file only under its own name: any new file is empty).
+   */
+  private movedTo(key: string): string | null {
+    const open = this.path ?? this.mediaPath;
+    if (!open || `/${key}` !== open) return null;
+    if (this.moving) {
+      const { from, to } = this.moving;
+      if (open !== from && !open.startsWith(`${from}/`)) return null;
+      const next = `${to}${open.slice(from.length)}`;
+      return this.vfs.stat(next)?.type === 'file' ? next : null;
+    }
+    const known = this.known;
+    if (!known) return null;
+    const leaf = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+    const copies = this.written.filter((p) => {
+      try {
+        return this.vfs.stat(p)?.type === 'file' && sameBytes(this.vfs.readBytes(p), known);
+      } catch {
+        return false;
+      }
+    });
+    return copies.find((p) => leaf(p) === leaf(open)) ?? (known.byteLength ? copies[0] ?? null : null);
+  }
+
+  /** The open file was renamed or moved to `to`: it stays open there, as it was (what is typed is saved there). */
+  private follow(to: string): void {
+    if (this.mediaPath) {
+      this.showMedia(to);
+      this.onMove(to);
+      return;
+    }
+    this.path = to;
+    this.header(to, this.conflict ? 'conflict' : this.dirty ? 'saving' : 'clean');
+    this.view?.dispatch({ effects: [this.language.reconfigure(languageFor(to)), this.name.reconfigure(nameFor(to))] });
+    this.onMove(to);
   }
 
   private showConflict(): void {
@@ -313,6 +421,7 @@ export class EditorPane {
     this.dirty = false;
     this.setState('clean');
     const text = this.vfs.exists(this.path) ? this.vfs.readText(this.path) : '';
+    this.known = this.vfs.exists(this.path) ? this.vfs.readBytes(this.path) : null;
     this.applying = true;
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
     this.applying = false;
@@ -334,6 +443,7 @@ export class EditorPane {
     this.view = null;
     this.path = null;
     this.dirty = false;
+    this.known = null;
     this.showEmpty();
   }
 }

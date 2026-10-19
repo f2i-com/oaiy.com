@@ -5,7 +5,7 @@
  * go into it), Left to close it (or go to its folder), Home and End, Enter to
  * open, F2 to rename, Delete to delete.
  */
-import { IGNORED_DIRS, type Vfs } from '../vfs/vfs';
+import { IGNORED_DIRS, normalizePath, type Vfs } from '../vfs/vfs';
 import { clear, h } from './dom';
 import { fileIcon, icon } from './icons';
 import { askText, confirmAction } from './modal';
@@ -16,6 +16,11 @@ export class FileTree {
   private expanded = new Set<string>(['']);
   private selected: string | null = null;
   private renderQueued = false;
+  /**
+   * A rename or move made here goes through this, so the editor can save what is typed into the file first and keep
+   * it open where it goes (main.ts gives it the editor's). On its own it just makes the move.
+   */
+  moving: (from: string, to: string, move: () => void) => void = (_from, _to, move) => move();
   /** Whose files these are, when they are not the open project's (the Front desk's). */
   private readonly place = h('div.tree-place', { hidden: true });
   private readonly title = h('div.pane-title.tree-head', h('span.pane-kicker', 'Files'));
@@ -91,18 +96,34 @@ export class FileTree {
     return slash < 0 ? '' : key.slice(0, slash);
   }
 
+  /**
+   * Where a new file or folder named `value` goes: in the folder chosen (`dir`), or, for a name that starts with "/",
+   * from the project root. ".." goes up a folder, as it does in the terminal.
+   */
+  private newPath(dir: string, value: string): string {
+    return `/${normalizePath(value.trim(), `/${dir}`)}`;
+  }
+
   private async create(kind: 'file' | 'dir'): Promise<void> {
     const dir = this.targetDir();
     const name = await askText({
       title: kind === 'file' ? 'New file' : 'New folder',
-      message: `In ${dir ? `/${dir}/` : 'the project root'}.`,
+      message: dir ? `In /${dir}/. A name that starts with / goes from the project root instead.` : 'At the project root.',
       label: kind === 'file' ? 'File name' : 'Folder name',
-      placeholder: kind === 'file' ? 'e.g. src/index.js' : 'e.g. assets',
+      placeholder: kind === 'file'
+        ? dir ? 'e.g. quote.js, or /notes/todo.md from the root' : 'e.g. index.js, or src/quote.js'
+        : dir ? 'e.g. assets, or /docs from the root' : 'e.g. assets',
       ok: 'Create',
-      validate: (value) => (this.vfs.exists(`/${dir ? `${dir}/` : ''}${value.replace(/^\/+/, '')}`) ? `${value} already exists.` : null),
+      validate: (value) => {
+        // (a name ending in "/" names a folder: a file of that name, or one called "notes" for "notes/", is not what was meant)
+        if (kind === 'file' && value.endsWith('/')) return `"${value}" ends with /, which names a folder: make it with New folder, or name a file in it (${value}todo.md).`;
+        const path = this.newPath(dir, value);
+        if (path === '/') return 'That is the project root: give it a name.';
+        return this.vfs.exists(path) ? `${path} already exists.` : null;
+      },
     });
     if (!name) return;
-    const path = `/${dir ? `${dir}/` : ''}${name.replace(/^\/+/, '')}`;
+    const path = this.newPath(dir, name);
     try {
       if (this.vfs.exists(path)) throw new Error(`${path} already exists`);
       if (kind === 'file') {
@@ -132,7 +153,10 @@ export class FileTree {
       // (into a folder that is not there yet: made, as the path asks)
       const parent = to.slice(0, to.lastIndexOf('/'));
       if (parent && !this.vfs.exists(parent)) this.vfs.mkdir(parent, true);
-      this.vfs.rename(path, to);
+      this.moving(path, to, () => this.vfs.rename(path, to));
+      // What was chosen in the tree stays chosen where it went, its folders opened.
+      const chosen = this.selected;
+      if (chosen === path || chosen?.startsWith(`${path}/`)) this.select(`${to}${chosen.slice(path.length)}`);
     } catch (error) {
       this.onNotice((error as Error).message);
     }
@@ -184,6 +208,9 @@ export class FileTree {
             style: `--depth:${depth}`,
             title: path,
             role: 'treeitem',
+            // (read as its name alone: its Rename and Delete buttons are for the pointer, and F2 and Delete do the same)
+            'aria-label': entry.name,
+            'aria-keyshortcuts': 'F2 Delete',
             tabindex: -1,
             'aria-level': depth + 1,
             'aria-selected': String(this.selected === path),
@@ -236,6 +263,7 @@ export class FileTree {
           h('span.name', entry.name),
           h(
             'span.row-actions',
+            { 'aria-hidden': 'true' },
             h('button.icon', { type: 'button', tabindex: -1, title: 'Rename', 'aria-label': `Rename ${entry.name}`, onclick: (e: Event) => { e.stopPropagation(); void this.rename(path); } }, icon('pencil')),
             h('button.icon', { type: 'button', tabindex: -1, title: 'Delete', 'aria-label': `Delete ${entry.name}`, onclick: (e: Event) => { e.stopPropagation(); void this.remove(path); } }, icon('trash')),
           ),

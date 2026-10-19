@@ -53,6 +53,18 @@ export interface ErrorContext {
    * and the list an app is given shows it no more than the host.
    */
   omitAddressPath?: boolean;
+  /**
+   * The provider's own name (LM Studio, ChatGPT, a paired computer's), said for a local server or another OpenAI-compatible one in place
+   * of "The local server" or "The server", which do not say which. OAIY's engine is called that whatever its name.
+   */
+  name?: string;
+  /**
+   * The call was made from OAIY's own window, which OAIY lets in: a failure to reach OAIY there is never CORS. Its engines (serverKind
+   * `oaiy`) are not answering, or, for one of OAIY Desktop's own routes (`viaDesktop`), OAIY itself is not.
+   */
+  ownWindow?: boolean;
+  /** The address is one of OAIY Desktop's own routes: ChatGPT, one of its AI providers, a paired computer's model. */
+  viaDesktop?: boolean;
 }
 
 function isLocalType(type: ProviderType): boolean {
@@ -128,9 +140,19 @@ const PROVIDER_LABEL: Record<ProviderType, string> = {
   custom: 'The server',
 };
 
+/**
+ * Who answered, as a sentence starts with it: OAIY's engine, a local or other server by its own name where it has one, else what kind
+ * of provider it is. (Anthropic and OpenAI are named by their kind: a name typed for one of them is the person's label, not theirs.)
+ */
+function whoAnswered(context: ErrorContext): string {
+  if (context.serverKind === 'oaiy') return 'OAIY’s engine';
+  const name = context.name?.trim();
+  return name && isLocalType(context.type) ? name : PROVIDER_LABEL[context.type];
+}
+
 /** What went wrong, in words, with what to do about it. */
 export function describeConnectionError(kind: ConnectionErrorKind, context: ErrorContext, status?: number): string {
-  const who = PROVIDER_LABEL[context.type];
+  const who = whoAnswered(context);
   const detail = context.detail ? ` The provider said: “${context.detail}”` : '';
   const local = isLocalType(context.type);
   switch (kind) {
@@ -155,7 +177,17 @@ export function describeConnectionError(kind: ConnectionErrorKind, context: Erro
     case 'mixed-content':
       return `This page is served over HTTPS, and browsers block it from calling a plain http:// address that is not on this computer (${hostOf(context.url)}). For a server on this computer use http://localhost or http://127.0.0.1; for one elsewhere, put it behind HTTPS.`;
     case 'network': {
-      if (!local) return `Studio could not reach ${hostOf(context.url)}. Check the internet connection, and whether an extension, proxy or firewall is blocking it.`;
+      // (OAIY lets its own window in: nothing there is about CORS, or about a list of sites to add this page to)
+      if (context.ownWindow && context.serverKind === 'oaiy') {
+        return `OAIY’s engines are not answering (${originOf(context.url)}). Start them in OAIY’s Engines page, or wait while they start, then try again.`;
+      }
+      // (OAIY Desktop's routes take the page it is paired with: what is wrong is OAIY, not a server's CORS settings)
+      if (context.viaDesktop) {
+        return context.ownWindow
+          ? `OAIY is not answering for ${who} (${originOf(context.url)}). Check that OAIY is running, then try again.`
+          : `OAIY Desktop is not answering for ${who} at ${originOf(context.url)}. Check that it is running and that this page is still paired with it (the desktop chip at the top), then try again.`;
+      }
+      if (!local) return `This page could not reach ${hostOf(context.url)}. Check the internet connection, and whether an extension, proxy or firewall is blocking it.`;
       const page = context.pageOrigin ?? 'this site';
       const fix = context.serverKind === 'lmstudio'
         ? 'In LM Studio, open the Developer tab, start the server, and switch on “Enable CORS”.'
@@ -164,7 +196,7 @@ export function describeConnectionError(kind: ConnectionErrorKind, context: Erro
           : context.serverKind === 'other'
           ? `Allow requests from ${page} in the server’s CORS settings.`
           : `For Ollama, quit it and start it again with OLLAMA_ORIGINS set to include ${page} (for example OLLAMA_ORIGINS="${page}" ollama serve). LM Studio has an “Enable CORS” switch in its server settings.`;
-      return `Studio could not reach ${originOf(context.url)}. Either the server is not running there, or it is blocking requests from this page (CORS). ${fix}`;
+      return `This page could not reach ${originOf(context.url)}. Either the server is not running there, or it is blocking requests from this page (CORS). ${fix}`;
     }
     case 'invalid-response':
       return `${who} answered, but not with a model list. Check that the address points at an OpenAI-compatible API${local ? ' (usually ending in /v1)' : ''}.`;

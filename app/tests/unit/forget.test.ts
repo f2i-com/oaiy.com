@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { EMPTY_MEDIA, type MediaSettings } from '../../src/agent/media';
-import { addressOf, forgetOaiy } from '../../src/ui/settings';
+import { addressOf, forgetOaiy, serviceWords } from '../../src/ui/settings';
 
 const FOUND = 'http://192.168.1.20:8080';
 
@@ -50,5 +50,12 @@ describe('forgetting an OAIY that was found', () => {
     expect(addressOf('http://192.168.1.20:9090', FOUND)).toBe(false);
     expect(addressOf('not an address', FOUND)).toBe(false);
     expect(addressOf('http://', FOUND)).toBe(false);
+  });
+});
+
+describe('the media service, as Settings says it', () => {
+  it("is OAIY's engines in words (their service is oaiy-studio), and another service by its own name", () => {
+    expect(serviceWords('oaiy-studio', '0.1.7')).toBe("OAIY's engines (version 0.1.7)");
+    expect(serviceWords('my-media', '2.0')).toBe('my-media 2.0');
   });
 });

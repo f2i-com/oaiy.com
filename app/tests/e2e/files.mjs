@@ -287,6 +287,117 @@ try {
     expect(!!(await page.$('.msg.presented audio')), 'the presented file is gone after the reload');
     if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT });
   });
+
+  const row = (title) => page.evaluate((t) => [...document.querySelectorAll('.tree-row')].some((r) => r.title === t), title);
+  const clickRow = (title) => page.evaluate((t) => [...document.querySelectorAll('.tree-row')].find((r) => r.title === t)?.click(), title);
+  const editorTitle = () => page.$eval('.editor-title', (e) => e.textContent);
+  const ask = async (button, text) => {
+    await page.click(`button[title="${button}"]`);
+    await page.waitForSelector('dialog.modal[open] input');
+    const asked = await page.$eval('dialog.modal[open]', (d) => ({ message: d.querySelector('.modal-message')?.textContent ?? '', placeholder: d.querySelector('input').placeholder }));
+    await page.type('dialog.modal[open] input', text);
+    await page.keyboard.press('Enter');
+    await new Promise((r) => setTimeout(r, 300));
+    return asked;
+  };
+  const term = async (command) => {
+    await page.click('.term-input');
+    await page.type('.term-input', command);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !document.querySelector('.term-prompt')?.classList.contains('busy'), { timeout: 30_000 });
+  };
+
+  await check('a new file goes in the folder chosen, or from the root with a leading "/"; a file name ending in "/" is refused', async () => {
+    await clickRow('/uploads');
+    const inFolder = await ask('New file', 'notes.md');
+    expect(/In \/uploads\/\. A name that starts with \/ goes from the project root/.test(inFolder.message) && /from the root/.test(inFolder.placeholder), JSON.stringify(inFolder));
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/uploads/notes.md', { timeout: 10_000 });
+    // (the file chosen now is in uploads/: a name from the root goes to the root, not to uploads/uploads/)
+    await ask('New file', '/top.md');
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/top.md', { timeout: 10_000 });
+    await ask('New file', 'later/');
+    const refused = await page.$eval('dialog.modal[open] .modal-error', (e) => e.textContent).catch(() => '');
+    expect(/ends with \/, which names a folder/.test(refused), `no refusal: ${refused}`);
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal'));
+    expect(!(await row('/later')) && !(await row('/uploads/later')), 'a file called "later" was made');
+    await ask('New folder', '/docs/');
+    expect(await row('/docs'), 'no folder /docs');
+  });
+
+  await check('the open file renamed or moved (in the tree, or in the terminal) stays open where it went, what was typed saved', async () => {
+    await clickRow('/top.md');
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/top.md');
+    await page.click('.cm-content');
+    await page.keyboard.type('# Top\n');
+    // Renamed in the tree, into a folder: typing not saved yet is saved first, and the file stays open there.
+    await page.evaluate(() => [...document.querySelectorAll('.tree-row')].find((r) => r.title === '/top.md').focus());
+    await page.keyboard.press('F2');
+    await page.waitForSelector('dialog.modal[open] input');
+    await page.evaluate(() => (document.querySelector('dialog.modal[open] input').value = ''));
+    await page.type('dialog.modal[open] input', 'docs/renamed.md');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/docs/renamed.md', { timeout: 10_000 }).catch(async () => {
+      throw new Error(`editor: ${await editorTitle()}`);
+    });
+    // (the tree is drawn again at the next frame)
+    await page.waitForFunction(() => document.querySelector('.tree-row.selected')?.title === '/docs/renamed.md', { timeout: 5000 }).catch(() => {});
+    const shown = await page.evaluate(() => ({
+      selected: [...document.querySelectorAll('.tree-row.selected')].map((r) => r.title),
+      label: document.querySelector('.cm-content')?.getAttribute('aria-label'),
+    }));
+    expect(JSON.stringify(shown.selected) === '["/docs/renamed.md"]' && shown.label === 'Editing docs/renamed.md', JSON.stringify(shown));
+    // The folder it is in renamed: still open, at its new path.
+    await page.evaluate(() => [...document.querySelectorAll('.tree-row')].find((r) => r.title === '/docs').focus());
+    await page.keyboard.press('F2');
+    await page.waitForSelector('dialog.modal[open] input');
+    await page.evaluate(() => (document.querySelector('dialog.modal[open] input').value = ''));
+    await page.type('dialog.modal[open] input', 'papers');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/papers/renamed.md', { timeout: 10_000 }).catch(async () => {
+      throw new Error(`editor after the folder's rename: ${await editorTitle()}`);
+    });
+    // Typed, then moved in the terminal straight after: the typing lands in the file where it went.
+    await page.click('.cm-content');
+    await page.keyboard.press('End');
+    await page.keyboard.type('moved by mv\n');
+    await term('mv papers/renamed.md final.md');
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/final.md', { timeout: 10_000 }).catch(async () => {
+      throw new Error(`editor after mv: ${await editorTitle()}`);
+    });
+    await new Promise((r) => setTimeout(r, 800));
+    await term('cat final.md; ls papers');
+    const out = await page.$eval('.term-out', (e) => e.textContent);
+    expect(out.includes('# Top') && out.includes('moved by mv') && !(await row('/top.md')), `terminal: ${out.slice(-300)}`);
+    if (process.env.SHOT_DIR) await page.screenshot({ path: join(process.env.SHOT_DIR, 'files-open-file-moved.png') });
+    // The file deleted, not moved: the editor closes.
+    await term('rm final.md');
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === 'No file open', { timeout: 10_000 });
+  });
+
+  await check("the tree's rows are read by their names, without their Rename and Delete buttons", async () => {
+    const rows = await page.$$eval('.tree-row', (els) => els.slice(0, 3).map((r) => ({ label: r.getAttribute('aria-label'), name: r.querySelector('.name').textContent, hidden: r.querySelector('.row-actions')?.getAttribute('aria-hidden'), keys: r.getAttribute('aria-keyshortcuts') })));
+    expect(rows.length && rows.every((r) => r.label === r.name && r.hidden === 'true' && r.keys === 'F2 Delete'), JSON.stringify(rows));
+  });
+
+  await check('importing the same zip twice numbers the second project: "site (2)"', async () => {
+    const zip = join(dir, 'site.zip');
+    writeFileSync(zip, zipSync({ 'index.html': enc('<h1>Site</h1>\n'), 'style.css': enc('h1 { color: green }\n') }));
+    const importZip = async () => {
+      await page.click('button.menu-toggle');
+      const [chooser] = await Promise.all([
+        page.waitForFileChooser(),
+        page.evaluate(() => [...document.querySelectorAll('#project-menu button')].find((b) => b.textContent === 'Import .zip').click()),
+      ]);
+      await chooser.accept([zip]);
+    };
+    await importZip();
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Opened "site": 2 files.'), { timeout: 30_000 });
+    await importZip();
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Opened "site (2)" (a project called "site" is here already): 2 files.'), { timeout: 30_000 });
+    const names = await page.$$eval('.project-select option', (o) => o.map((x) => x.textContent));
+    expect(names.includes('site') && names.includes('site (2)'), `projects: ${names}`);
+  });
 } finally {
   await browser.close();
   await server.close();

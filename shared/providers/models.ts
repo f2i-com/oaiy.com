@@ -63,6 +63,8 @@ export interface ListModelsOptions {
    */
   providerText?: 'include' | 'omit';
   scrub?: (text: string) => string;
+  /** The page is OAIY's own window, which OAIY lets in: a server of OAIY's that does not answer is not answering, never refusing the page. */
+  ownWindow?: boolean;
 }
 
 const LIST_TIMEOUT_MS = 15_000;
@@ -208,7 +210,7 @@ interface ListTarget {
 
 async function listFrom(target: ListTarget, options: ListModelsOptions): Promise<ModelInfo[]> {
   const { endpoints, headers } = target;
-  const context = { type: target.type, serverKind: target.serverKind };
+  const context = { type: target.type, serverKind: target.serverKind, ...(options.ownWindow ? { ownWindow: true } : {}) };
 
   if (target.type === 'anthropic') {
     const all: ModelInfo[] = [];

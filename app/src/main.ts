@@ -172,6 +172,34 @@ const PICK_SETTLES_MS = 30_000;
  */
 const ENGINE_TOOLS = new Set(['model_set_default', 'engine_start', 'engine_stop', 'engine_restart', 'network_setup', 'network_pair', 'network_approve', 'network_unpair', 'network_use_service']);
 
+/**
+ * Tabs (a role=tablist of role=tab buttons): the one `on` says is selected, and the only one Tab stops at (the arrow
+ * keys move to the others: see arrowTabs).
+ */
+function selectTab(list: HTMLElement, on: (tab: HTMLButtonElement) => boolean): void {
+  for (const tab of list.querySelectorAll<HTMLButtonElement>('[role="tab"]')) {
+    const selected = on(tab);
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+}
+
+/** The arrow keys (and Home and End) choose the tab beside the one focused, as a tablist's do. */
+function arrowTabs(list: HTMLElement): void {
+  list.addEventListener('keydown', (e) => {
+    const all = Array.from(list.querySelectorAll<HTMLButtonElement>('[role="tab"]')).filter((t) => t.getClientRects().length > 0);
+    const at = all.indexOf(document.activeElement as HTMLButtonElement);
+    if (at < 0) return;
+    const to = e.key === 'ArrowRight' ? at + 1 : e.key === 'ArrowLeft' ? at - 1 : e.key === 'Home' ? 0 : e.key === 'End' ? all.length - 1 : null;
+    if (to === null) return;
+    e.preventDefault();
+    const tab = all[(to + all.length) % all.length];
+    tab.focus();
+    tab.click();
+  });
+}
+
 async function main(): Promise<void> {
   const app = document.getElementById('app')!;
   if (!crossOriginIsolated && (await registerServiceWorker())) {
@@ -232,15 +260,22 @@ async function main(): Promise<void> {
   /** The last read of them (the welcome waits for it: with none here, a paired computer's may be the one to use). */
   let networkRead: Promise<void> = Promise.resolve();
   /**
-   * A model just chosen in the model menu, as the desktop will say it (and when): the desktop takes a moment to say a
-   * paired computer's choice (it is settled over OAIY Network after it answers), and a read before then is not taken
-   * for a change (the menu snapped back, and the choice was said twice).
+   * A model just chosen in the model menu, as the desktop will say it, what the Agent ran on before it, and when: the
+   * desktop takes a moment to say a paired computer's choice (it is settled over OAIY Network after it answers), and a
+   * read before then that still says the model from before is not taken for a change (the menu snapped back, and the
+   * choice was said twice). Any other answer is a real change (the Agent set to ChatGPT meanwhile), and is taken.
    */
-  let picked: { model: AgentModel; at: number } | null = null;
+  let picked: { model: AgentModel; before: AgentModel; at: number } | null = null;
   /** This Mac's model, chosen here and loading on the Mac (not on the eGPU): the menu says so until it is loaded. */
   let macLoading: string | null = null;
   /** OAIY's discovery document as last read: its engine's language models and its eGPU, for the header's pickers. */
   let engineFound: Extract<Discovery, { state: 'found' }> | null = null;
+  /**
+   * OAIY's engines did not answer when last looked at (stopped, or not started yet): the model menu says so, rather
+   * than what their discovery document said while they ran. Looked at again until they answer (see lookAtEngine).
+   */
+  let engineAway = false;
+  let engineLook: ReturnType<typeof setTimeout> | undefined;
   /** Codex's own default model, once looked up (for a ChatGPT choice that names none). */
   let codexDefault: string | null = null;
   /** Why ChatGPT cannot be used now, for the model chip ('' when nothing is known against it). */
@@ -311,11 +346,14 @@ async function main(): Promise<void> {
    * (the menu offers their models, and the engine's may be one of theirs).
    */
   const controlChanged = (tool: string): void => {
+    // (a change made now is what the desktop says next, not a read from before a choice in the menu: see `picked`)
+    if (tool === 'agent_model_set' || tool === 'chatgpt_sign_in' || tool === 'chatgpt_sign_out' || ENGINE_TOOLS.has(tool)) picked = null;
     if (tool === 'agent_model_set' || tool === 'chatgpt_sign_in' || tool === 'chatgpt_sign_out') {
       codexDefault = null;
       void followAgentModel();
     }
-    if (ENGINE_TOOLS.has(tool)) void followEngineChange(tool !== 'engine_stop');
+    // (only a start loads a model, or a change of the model while the engine runs one: see followEngineChange)
+    if (ENGINE_TOOLS.has(tool)) void followEngineChange(tool === 'engine_start' || tool === 'engine_restart' ? 'started' : tool === 'engine_stop' ? 'stopped' : 'changed');
     // The business's name (or the receptionist's) may have changed with the calendar's settings.
     if (tool === 'calendar_settings_set') void identity.refresh();
   };
@@ -336,15 +374,36 @@ async function main(): Promise<void> {
   /**
    * A run of a conversation of `kind` failed on its provider's answer. A paired computer asked for a model it does not
    * run now answers 409 `model_unavailable` (its model was switched there, and this page had not read the change): the
-   * Agent's model and the paired computers' are read again at once, so a Try again goes to the model it runs now.
+   * Agent's model and the paired computers' are read again at once, so a Try again goes to the model it runs now. OAIY's
+   * engine not answering at all is looked at again, so the model menu says it is not answering rather than "ready".
    */
   const followFailure = (kind: () => AgentKind) => (error: unknown): void => {
+    if (error instanceof AIProviderError && error.kind === 'network' && agentProvider(kind())?.serverKind === 'oaiy') void lookAtEngine();
     if (!(error instanceof AIProviderError) || error.status !== 409 || error.code !== 'model_unavailable') return;
     if (!agentProvider(kind())?.id.startsWith('oaiy-worker-')) return;
     // (what was just chosen in the menu is not waited for: the computer has said what it runs)
     picked = null;
     void followAgentModel(5000, true, true);
   };
+  /**
+   * OAIY's engines looked at again where a call to them, or a look, got no answer. They answer: followed as ever (which
+   * says they are back). They do not: the model menu says so, and they are looked at again every few seconds until they
+   * do, so the menu is right again as soon as they are started, not a minute later.
+   */
+  async function lookAtEngine(): Promise<void> {
+    const origin = engineFound?.origin;
+    if (!origin) return;
+    clearTimeout(engineLook);
+    const found = await discoverOaiy(origin, media.apiKey, undefined, 3000).catch(() => null);
+    if (found?.state === 'found') return followEngine(found);
+    // (one that answers but will not let this page in is not away: it says so when it is asked)
+    if ((found && found.state !== 'absent') || engineFound?.origin !== origin) return;
+    if (!engineAway) {
+      engineAway = true;
+      renderChips();
+    }
+    engineLook = setTimeout(() => void lookAtEngine(), 10_000);
+  }
   /** What a conversation of `kind` is told besides its own instructions: about OAIY's tools, when it has them. */
   const controlInstructions = (kind: AgentKind): string => (kind === 'setup' ? SETUP_INSTRUCTIONS : control?.listed(kind).length ? controlNote(kind) : '');
   /**
@@ -455,6 +514,9 @@ async function main(): Promise<void> {
     hangUp: () => void endShownCall(),
   });
 
+  /** Who a conversation's lane is with, as the chat says it: their name, or (none yet) their number as it is read. */
+  const sessionName = (s: Session): string => (s.title === s.key && !s.hidden ? displayNumber(s.key) : s.title);
+
   /**
    * End the call going on in the conversation shown (its live strip's End call): asked first. The phone hangs up,
    * and a call that is over already, whose end never came here, is closed (Sessions.hangUp).
@@ -462,7 +524,7 @@ async function main(): Promise<void> {
   async function endShownCall(): Promise<void> {
     const live = viewing ? sessions?.list.find((s) => s.thread === viewing && s.callId) : undefined;
     if (!live || !sessions) return;
-    const who = live.title === live.key && !live.hidden ? displayNumber(live.key) : live.title;
+    const who = sessionName(live);
     if (!(await confirmAction({ title: `End the call with ${who}?`, message: 'The phone hangs up on them. A call that is over already (its end never reached this page) is closed here.', ok: 'End call', danger: true }))) return;
     try {
       const how = await sessions.hangUp(live);
@@ -538,6 +600,10 @@ async function main(): Promise<void> {
   const editor = new EditorPane(null as unknown as Vfs);
   // Closing a file lets the tree go of it too.
   editor.onClose = () => tree.select(null);
+  // A rename or move in the tree saves what is typed into the file first. The open file stays open where it went (moved
+  // by the agent or in the terminal too), and the tree opens its folders to it.
+  tree.moving = (from, to, move) => editor.move(from, to, move);
+  editor.onMove = (path) => tree.select(path);
   const terminal = new TerminalPane(null as unknown as Vfs, gate);
   const preview = new Preview(null as unknown as Vfs, () => project?.meta.id ?? 'none');
   // An error while the person uses the app or page: one click asks the agent to fix it.
@@ -579,10 +645,12 @@ async function main(): Promise<void> {
   // choosing it in Engines (the one model loaded, on a Mac's eGPU or on the Mac, as Engines sets it). See renderPickers.
   const modelPick = h('select.chip.model.pick', { hidden: true, 'aria-label': "The model OAIY's engine runs", onchange: () => void pickModel(modelPick.value) }) as HTMLSelectElement;
   const phoneChip = h('button.chip.toggle.phone', { title: 'Phone: OAIY Desktop, Aokie and text messages', onclick: () => void openPhone() });
-  // A call going on now: who with, and a click shows it.
+  // A call going on now: who with, and a click shows it (the one it names); with several, how many, and a click lists them.
+  let callChipFor: string | null = null;
   const callChip = h('button.chip.on-call', { hidden: true, onclick: () => {
-    const live = sessions?.list.find((s) => s.callId);
-    if (live) selectSession(live.thread);
+    showView('agent');
+    if (callChipFor) selectSession(callChipFor);
+    else chat.openConversations();
   } }) as HTMLButtonElement;
   // An outreach going on (or its report waiting): how far it has got, and a click opens the conversation that started it.
   const outreachChip = h('button.chip.outreach', { hidden: true, onclick: () => void openOutreachOrigin() }) as HTMLButtonElement;
@@ -695,9 +763,11 @@ async function main(): Promise<void> {
 
   /**
    * Where `m` is, said after its name in the model menu, on a Mac whose eGPU is switched on: the eGPU or this Mac (as
-   * Engines sets each model), and for the chosen one how its loading goes. With no eGPU, nothing.
+   * Engines sets each model), and for the chosen one how its loading goes. With no eGPU, nothing. Whatever the card or
+   * the Mac said, the chosen one says the engines are not answering while they do not (engineAway).
    */
   function modelPlace(found: OaiyFound, m: LlmModel, chosen: boolean): { text: string; state?: ModelState } {
+    if (chosen && engineAway) return { text: ' · not answering', state: 'offline' };
     if (!cardOn(found)) return { text: '' };
     if (!m.egpu) {
       if (!chosen) return { text: ' · Mac' };
@@ -784,7 +854,8 @@ async function main(): Promise<void> {
           ? "The model OAIY's engine runs, as chosen in Engines: the Agent, the phone's agents and flows use it. Choosing another here chooses it there, and it loads now."
           : `The model this page asks OAIY for (set in Settings, not following Engines). Choosing one here chooses it in Engines too.`)
       + (found && cardOn(found) ? ' Each of this Mac’s runs on the eGPU or on this Mac, as Engines sets it; one is loaded at a time, and choosing another lets the eGPU, or this Mac, go of the one it held.' : '')
-      + (networkModels.length ? " A paired computer's model runs on that computer (Setup → Networking)." : '');
+      + (networkModels.length ? " A paired computer's model runs on that computer (Setup → Networking)." : '')
+      + (engineAway && !onWorker ? " OAIY's engines are not answering now: start them in OAIY's Engines page." : '');
   }
 
   /** The paired computers' language models, read again from the desktop (OAIY Network): the menu offers them. */
@@ -816,7 +887,7 @@ async function main(): Promise<void> {
    * the desktop's answer, a moment later, is no change to say (see `picked`).
    */
   function settle(next: AgentModel): void {
-    picked = { model: next, at: Date.now() };
+    picked = { model: next, before: agentModel, at: Date.now() };
     if (!sameModel(next, agentModel)) {
       agentModel = next;
       codexDefault = null;
@@ -897,6 +968,13 @@ async function main(): Promise<void> {
     if (desktop && chose) void watchLoad(model);
   }
 
+  /** Whether OAIY's engine runs a language model now, or is loading one (on this Mac, or on its eGPU). */
+  function llmRunning(found: OaiyFound | null): boolean {
+    if (!found) return false;
+    const egpu = found.llm.egpu;
+    return found.llm.details.some((m) => m.loaded) || (cardOn(found) && !!egpu.model && (egpu.state === 'ready' || egpu.state === 'starting'));
+  }
+
   /** Whether OAIY's engine holds `model` now, ready where it runs (on the eGPU, or in this Mac's memory). */
   function loadedNow(model: string): boolean {
     const found = engineFound;
@@ -956,12 +1034,16 @@ async function main(): Promise<void> {
    * one, chose where a service runs): the engine is read again, and the Agent's model, quietly (the tool's result says
    * what changed), with the paired computers' models. A model the engine loads now is watched until it is loaded. A
    * paired computer's model chosen is settled by the desktop a moment after it answers, so that is read again then.
+   * A model loads only when the engine was started (`started`), or its model changed while it ran a language model
+   * (OAIY loads the new one then, and not on a change while it runs none): nothing else is said to be loading.
    */
-  async function followEngineChange(loading: boolean): Promise<void> {
+  async function followEngineChange(how: 'started' | 'stopped' | 'changed'): Promise<void> {
+    const wasRunning = llmRunning(engineFound);
     await Promise.all([refreshEngine(), followAgentModel(5000, true, false)]);
     await networkRead;
     const model = agentProvider('project')?.modelId;
-    if (loading && desktop && model && engineFound?.llm.details.some((m) => m.id === model) && !loadedNow(model)) void watchLoad(model);
+    const loads = how === 'started' || (how === 'changed' && wasRunning);
+    if (loads && desktop && model && engineFound?.llm.details.some((m) => m.id === model) && !loadedNow(model)) void watchLoad(model);
     setTimeout(() => void followAgentModel(5000, true, false), 8000);
   }
   gate.onChange(() => {
@@ -1100,6 +1182,9 @@ async function main(): Promise<void> {
         // "Set up OAIY" is a conversation: the Agent stops to ask, or to let the person do a step on screen,
         // and is not pushed on by an open plan meanwhile.
         conversation: kind() === 'setup',
+        // The person's own conversation: a reply they stopped is kept as far as it got, and the model told it was
+        // stopped (a phone conversation's agents keep what the caller heard of a reply cut off, sessions.ts).
+        keepStopped: given === undefined,
         projectSummary: () => summarizeProject(place().meta, place().vfs, gate),
         ...(withPreview ? { preview } : {}),
         compactAt: () => agentSettings.compactAt,
@@ -1222,6 +1307,15 @@ async function main(): Promise<void> {
             chat.insertTurns(session.agent.turns.slice(drawnTo.get(session) ?? 0).filter((t) => t.role !== 'user'));
           }
           drawnTo.set(session, session.agent.turns.length);
+        },
+        // A note written outside a run (the call ended, the owner took it or handed it back): drawn as it comes.
+        noted: (session, turn) => {
+          if (viewing !== session.thread) return;
+          try {
+            chat.noteTurn(turn);
+          } catch (error) {
+            console.error('the chat could not show a note', error);
+          }
         },
         // The phone greets a caller by the name its agents know (a cleared name is forgotten there too).
         named: (note) => {
@@ -1443,6 +1537,8 @@ async function main(): Promise<void> {
       await project.saveChat(agent.savedTurns());
       unsubscribe?.();
     }
+    // (what was written for the conversation left stays with it: see drafts)
+    const was = draftKey();
     project = meta.id === FRONT_DESK.id ? frontDesk : await OpenProject.open(meta);
     if (project !== frontDesk) project.onError = notice;
     // The Front desk is not renamed or deleted, nor is "Set up OAIY" (its conversation starts again with /clear).
@@ -1458,6 +1554,9 @@ async function main(): Promise<void> {
     agent.plan = planAfter(agent.turns);
     // The phone's conversations stay in the front desk: the project's own conversation shows.
     viewing = null;
+    swapDraft(was);
+    // (an incognito project's draft goes with it)
+    if (leaving) drafts.delete(`project:${leaving}`);
     announce();
     // The first project is open: the page is usable from here on.
     header.inert = false;
@@ -1477,7 +1576,7 @@ async function main(): Promise<void> {
     // incognito stays on until it is turned off.
     await saveLastProject(meta.id);
     if (meta.incognito) {
-      chat.system(`🕶 Incognito is on${reopening ? ', as it was before the app was refreshed or restarted' : ''}. This project, its conversation and every picture, clip and sound made in it are kept only in this app's temporary storage, until you press Clear or turn incognito off, and OAIY is told to keep nothing of its requests. Export it (Export .zip, or Export to folder) to keep anything.`);
+      chat.system(`🕶 Incognito is on${reopening ? ', as it was before the app was refreshed or restarted' : ''}. This project, its conversation and every picture, clip and sound made in it are kept only in this app's temporary storage, until you choose Clear incognito in the project menu (⋯) or turn incognito off, and OAIY is told to keep nothing of its requests. (The conversation's own Clear empties only the conversation.) Export it (Export .zip, or Export to folder) to keep anything.`);
     } else {
       lastKept = meta.id;
       if (meta.id !== FRONT_DESK.id) lastOwn = meta.id;
@@ -1498,13 +1597,29 @@ async function main(): Promise<void> {
     renderOutreachChip();
   };
 
+  /**
+   * A project name no project has yet: the same zip or folder imported again is "greenleaf-site (2)", then (3), so the
+   * project menu tells them apart.
+   */
+  const freeProjectName = async (name: string): Promise<string> => {
+    const taken = new Set((await listProjects()).map((m) => m.name.toLowerCase()));
+    if (!taken.has(name.toLowerCase())) return name;
+    // (a name numbered already counts on from it: "greenleaf-site (2)" again is "greenleaf-site (3)")
+    const stem = name.replace(/ \(\d+\)$/, '');
+    let n = 2;
+    while (taken.has(`${stem} (${n})`.toLowerCase())) n++;
+    return `${stem} (${n})`;
+  };
+
   const newProjectFrom = async (imported: Imported | null) => {
     if (!imported || !(await mayLeaveRun())) return;
-    const meta = await createProject(imported.name);
+    const name = await freeProjectName(imported.name);
+    const meta = await createProject(name);
     await openProject(meta);
     project.vfs.load(imported.files);
     await project.flush();
-    chat.system(`Opened "${imported.name}": ${imported.files.length} files.${imported.skipped.length ? ` Skipped ${imported.skipped.length} (dependency/build folders or over the size limit): ${imported.skipped.slice(0, 8).join(', ')}${imported.skipped.length > 8 ? ', …' : ''}` : ''}`);
+    const again = name !== imported.name ? ` (a project called "${imported.name}" is here already)` : '';
+    chat.system(`Opened "${name}"${again}: ${imported.files.length} files.${imported.skipped.length ? ` Skipped ${imported.skipped.length} (dependency/build folders or over the size limit): ${imported.skipped.slice(0, 8).join(', ')}${imported.skipped.length > 8 ? ', …' : ''}` : ''}`);
   };
 
   /** Bring files or a folder in as a project, saying while it reads them, and saying why where it could not. */
@@ -2001,8 +2116,9 @@ A project can hold several apps, each in its own folder (any folder whose manife
     incognitoButton.classList.toggle('on', on);
     incognitoButton.setAttribute('aria-checked', String(on));
     incognitoChip.hidden = !on;
-    deleteButton.textContent = on ? 'Clear' : 'Delete';
-    deleteButton.title = on ? 'Clear this incognito project: delete everything in it and start a fresh one (incognito stays on)' : 'Delete this project from the browser';
+    // (named apart from the conversation's own Clear, which empties only the conversation)
+    deleteButton.textContent = on ? 'Clear incognito' : 'Delete';
+    deleteButton.title = on ? 'Clear this incognito project: delete everything in it (files, media and the conversation) and start a fresh one (incognito stays on)' : 'Delete this project from the browser';
     document.body.classList.toggle('incognito', on);
   }
   /** True while the app reopens the project it had open. */
@@ -2037,7 +2153,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     if (project === frontDesk || project.meta.id === SETUP_PROJECT.id) return;
     if (project.meta.incognito) {
       if (controller && !(await confirmAction({ title: 'Stop the agent?', message: 'The agent is still working. Clearing stops it and deletes what it made.', ok: 'Stop and clear' }))) return;
-      if (!(await confirmAction({ title: 'Clear incognito?', message: 'Everything in this incognito project is deleted now: its files, pictures, clips and sounds, and the conversation. Incognito stays on, with a fresh empty project. Export it first to keep anything.', ok: 'Clear', danger: true }))) return;
+      if (!(await confirmAction({ title: 'Clear incognito?', message: 'Everything in this incognito project is deleted now: its files, pictures, clips and sounds, and the conversation. Incognito stays on, with a fresh empty project. Export it first to keep anything.', ok: 'Clear incognito', danger: true }))) return;
       // The new project opens first; opening it deletes the one left.
       await openProject(await createProject('Incognito', true));
       return;
@@ -2173,15 +2289,24 @@ A project can hold several apps, each in its own folder (any folder whose manife
   });
 
   // The center shows the editor or the app preview, with the terminal below.
+  // Editor and Preview: tabs, the one shown selected (the arrow keys move between them, as tabs' do).
   const centerTabs = h(
     'div.center-tabs',
-    h('button', { 'data-pane': 'editor', onclick: () => showPane('editor') }, 'Editor'),
-    h('button', { 'data-pane': 'preview', onclick: () => showPane('preview') }, 'Preview'),
+    { role: 'tablist', 'aria-label': 'Editor or preview' },
+    h('button', { role: 'tab', 'data-pane': 'editor', id: 'pane-tab-editor', 'aria-controls': 'pane-editor', onclick: () => showPane('editor') }, 'Editor'),
+    h('button', { role: 'tab', 'data-pane': 'preview', id: 'pane-tab-preview', 'aria-controls': 'pane-preview', onclick: () => showPane('preview') }, 'Preview'),
   );
+  arrowTabs(centerTabs);
+  editor.element.id = 'pane-editor';
+  editor.element.setAttribute('role', 'tabpanel');
+  editor.element.setAttribute('aria-labelledby', 'pane-tab-editor');
+  preview.element.id = 'pane-preview';
+  preview.element.setAttribute('role', 'tabpanel');
+  preview.element.setAttribute('aria-labelledby', 'pane-tab-preview');
   const center = h('div.center', centerTabs, h('div.center-main', editor.element, preview.element), terminal.element);
   function showPane(pane: 'editor' | 'preview'): void {
     center.dataset.pane = pane;
-    for (const b of centerTabs.querySelectorAll('button')) b.classList.toggle('active', b.dataset.pane === pane);
+    selectTab(centerTabs, (b) => b.dataset.pane === pane);
     preview.setVisible(pane === 'preview' || workspace?.dataset.view === 'preview');
     if (window.matchMedia('(max-width: 900px)').matches && workspace && workspace.dataset.view !== 'agent') showView(pane);
   }
@@ -2189,13 +2314,14 @@ A project can hold several apps, each in its own folder (any folder whose manife
   // On a narrow screen one pane shows at a time, chosen from a tab bar.
   const workspace = h('main.workspace', tree.element, center, chat.element);
   const views = [['files', 'Files'], ['editor', 'Editor'], ['preview', 'Preview'], ['terminal', 'Terminal'], ['agent', 'Agent']] as const;
-  const tabs = h('nav.tabs', ...views.map(([view, label]) => h('button', { 'data-view': view, onclick: () => showView(view) }, label)));
+  const tabs = h('nav.tabs', { role: 'tablist', 'aria-label': 'Panes' }, ...views.map(([view, label]) => h('button', { role: 'tab', 'data-view': view, onclick: () => showView(view) }, label)));
+  arrowTabs(tabs);
   function showView(view: (typeof views)[number][0]): void {
     workspace.dataset.view = view;
-    for (const b of tabs.querySelectorAll('button')) b.classList.toggle('active', b.dataset.view === view);
+    selectTab(tabs, (b) => b.dataset.view === view);
     if (view === 'editor' || view === 'preview') {
       center.dataset.pane = view;
-      for (const b of centerTabs.querySelectorAll('button')) b.classList.toggle('active', b.dataset.pane === view);
+      selectTab(centerTabs, (b) => b.dataset.pane === view);
     }
     showPreview();
     if (view === 'agent') chat.focus();
@@ -2219,7 +2345,10 @@ A project can hold several apps, each in its own folder (any folder whose manife
     if (to && !actions.contains(to) && to !== menuToggle) closeMenu();
   });
   clear(app);
-  app.append(header, workspace, tabs);
+  // (in OAIY's window the narrow layout's pane switcher is at the top, under the bar: it comes there for the keyboard too;
+  // in a browser it is the phone's tab bar at the bottom, after the panes)
+  if (IN_OAIY) app.append(header, tabs, workspace);
+  else app.append(header, workspace, tabs);
   renderChips();
 
   // Nothing is clickable until the first project is open.
@@ -2347,6 +2476,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
    */
   function followEngine(found: Extract<Discovery, { state: 'found' }>): void {
     engineFound = found;
+    // (they answered: not away, and not looked at again for that)
+    engineAway = false;
+    clearTimeout(engineLook);
     let changed = false;
     for (const p of providers) {
       let origin = '';
@@ -2384,6 +2516,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       if (!origin) return;
       return discoverOaiy(origin, media.apiKey, undefined, 3000).then((found) => {
         if (found.state === 'found') followEngine(found);
+        // (stopped since: the menu says they are not answering, and they are looked at until they do)
+        else if (found.state === 'absent' && found.origin === engineFound?.origin && !engineAway) void lookAtEngine();
       });
     }).catch(() => {});
   }, 60_000);
@@ -2407,8 +2541,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     const next = await readAgentModel(d, AbortSignal.timeout(waitMs));
     if (!next || d !== desktop) return;
-    // (a model just chosen in the menu that the desktop has not settled yet: its answer is from before the choice)
-    if (picked && !sameModel(next, picked.model) && Date.now() - picked.at < PICK_SETTLES_MS) return;
+    // (a model just chosen in the menu that the desktop has not settled yet: its answer is the model from before the
+    // choice, and is not taken; any other is a change made since, and is)
+    if (picked && Date.now() - picked.at < PICK_SETTLES_MS && sameModel(next, picked.before) && !sameModel(next, picked.model)) return;
     picked = null;
     agentModelAt = Date.now();
     const was = agentModel;
@@ -2520,18 +2655,31 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
 
   // ---- The phone: OAIY Desktop, its events, and the text-message conversations ----
 
+  /** Who a conversation is with, as the chat says it: their name, or (none yet) their number as it is read. */
+  const threadName = (t: Thread): string => (t.kind === 'person' && t.title === t.key && !t.hidden ? displayNumber(t.key) : t.title);
+  /** A call that is the person's now: put through to them (or being), so the receptionist is not on it. */
+  const handedOver = (t: Thread): boolean => !!t.live && (!!t.live.handoff || !!t.live.handingOver);
+
   function renderSessions(): void {
     if (!sessions || !project) return;
     // Calls and texts are the phone's: hidden (and kept) while there is none. Flows' tasks always show.
     // A person's calls and texts: one conversation. Calls and texts show while there is a phone; flows' tasks always.
     const shownThreads = sessions.threads().filter((t) => sessionShown(t.kind, modules));
-    const live = phoneOn() ? shownThreads.find((t) => t.live) : undefined;
-    callChip.hidden = !live;
-    if (live) {
-      // Someone with no name yet: their number, as it is read.
-      const who = live.title === live.key && !live.hidden ? displayNumber(live.key) : live.title;
-      callChip.textContent = `On a call · ${who}`;
-      callChip.title = viewing === live.id ? `On a call with ${who}: shown here` : `On a call with ${who}: click to show it`;
+    // (the chip's words and what it opens come from the same calls)
+    const calls = phoneOn() ? shownThreads.filter((t) => t.live) : [];
+    callChip.hidden = !calls.length;
+    callChipFor = calls.length === 1 ? calls[0].id : null;
+    if (calls.length === 1) {
+      const live = calls[0];
+      const who = threadName(live);
+      const withYou = handedOver(live);
+      callChip.textContent = `${withYou ? 'With you' : 'On a call'} · ${who}`;
+      callChip.dataset.state = withYou ? 'with-you' : 'live';
+      callChip.title = `${withYou ? `You have the call with ${who}` : `On a call with ${who}`}: ${viewing === live.id ? 'shown here' : 'click to show it'}`;
+    } else if (calls.length > 1) {
+      callChip.textContent = `${calls.length} calls`;
+      callChip.dataset.state = 'live';
+      callChip.title = `${calls.length} calls going on now (${calls.map(threadName).join(', ')}): click to choose one`;
     }
     const settingUp = project.meta.id === SETUP_PROJECT.id;
     chat.setSessions([
@@ -2553,6 +2701,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
           key: t.key,
           lastAt: t.lastAt,
           live: !!t.live,
+          ...(t.live && handedOver(t) ? { withYou: true } : {}),
           ways: t.ways,
           ...(t.lastWay ? { lastWay: t.lastWay } : {}),
           ...(t.kind === 'person' ? { to: t.live || t.hidden ? ('call' as const) : ('sms' as const) } : {}),
@@ -2560,7 +2709,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
           ...(listed ? { outreach: `Outreach · ${personState(listed.c, listed.p).words}` } : {}),
           ...(quiet.blocked ? { blocked: true } : {}),
           ...(quiet.why ? { quiet: quiet.why } : {}),
-          status: t.live ? (listed ? `On a call now · Outreach · ${listed.c.name}` : 'On a call now') : t.running ? 'Working…' : onList || `${quiet.why ? `${quiet.why} · ` : ''}${what} · ${since(t.lastAt)}`,
+          status: t.live ? (handedOver(t) ? 'With you now' : listed ? `On a call now · Outreach · ${listed.c.name}` : 'On a call now') : t.running ? 'Working…' : onList || `${quiet.why ? `${quiet.why} · ` : ''}${what} · ${since(t.lastAt)}`,
           label: t.key === TEST_NUMBER ? '💬 Test' : `${t.kind === 'task' ? '🔀' : t.lastWay === 'sms' ? '💬' : '📞'} ${t.title}`,
           title: t.kind === 'task' ? `The tasks your flow "${t.title}" gives the agent` : `${t.live ? 'On a call with' : `${what} with`} ${t.title}${t.title !== t.key && !t.hidden ? ` (${displayNumber(t.key)})` : ''}${listed ? `, on the outreach "${listed.c.name}"` : ''}`,
           unread: t.id === viewing ? 0 : t.unread,
@@ -2683,6 +2832,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const what = thread.kind === 'task' ? `the tasks from the flow "${thread.title}"` : `the ${thread.ways.length === 2 ? 'calls and texts' : thread.ways[0] === 'call' ? 'calls' : 'text messages'} with ${thread.title}`;
     if (!(await confirmAction({ title: 'Remove this conversation?', message: `Its record of ${what} is deleted from this project. If they call or text again, a new one starts.`, ok: 'Remove', danger: true }))) return;
     if (viewing === thread.id) selectSession(null);
+    // (what was written for it, and not sent, goes with it)
+    drafts.delete(`thread:${thread.id}`);
     await sessions!.remove(thread);
     renderSessions();
   }
@@ -2721,7 +2872,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     tree.setPlace(place === frontDesk ? frontDesk.meta.name : null);
     unsubscribe = place.vfs.onChange((change) => {
       tree.refresh();
-      editor.externalChange('path' in change ? change.path : null);
+      editor.externalChange(change);
       preview.changed('path' in change ? change.path : null);
     });
   }
@@ -2731,7 +2882,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const found = id ? sessions?.thread(id) : null;
     // A person's calls and texts are not shown while there is no phone.
     const thread = found && sessionShown(found.kind, modules) ? found : null;
+    const was = draftKey();
     viewing = thread ? thread.id : null;
+    swapDraft(was);
     streaming = null;
     drawnTo.clear();
     buffered.clear();
@@ -2748,6 +2901,24 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     renderSessions();
     chat.focus();
+  }
+
+  /**
+   * What the person wrote in each conversation and has not sent, kept while another is shown (by draftKey): the message
+   * box is every conversation's, and what was written for the project's agent must not go to a call's.
+   */
+  const drafts = new Map<string, { text: string; files: File[] }>();
+  /** The conversation the message box writes to now: the open project's own, or a phone conversation (by its id). */
+  const draftKey = (): string => (viewing ? `thread:${viewing}` : `project:${project?.meta.id ?? ''}`);
+  /** Another conversation is shown than `was`: what was written for that one is kept for it, and this one's put back. */
+  function swapDraft(was: string): void {
+    const now = draftKey();
+    if (now === was) return;
+    const draft = chat.takeDraft();
+    if (draft) drafts.set(was, draft);
+    else drafts.delete(was);
+    chat.putDraft(drafts.get(now) ?? null);
+    drafts.delete(now);
   }
 
   /** The meter, as full as the project's agent's context was at its last step (when it has taken one since the page opened). */
@@ -3025,28 +3196,34 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
             if (!holdsCalls && event.type !== 'call.ended' && event.type !== 'hello' && event.type !== 'voice.features') return;
             void sessions?.callEvent(event).then((session) => {
               // A call begins: show it (the person sees the conversation as it happens).
+              // (someone with no name yet goes by their number as it is read, as everywhere else)
+              const who = session ? sessionName(session) : '';
               if (session && event.type === 'call.started') {
                 const placed = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
                 const said = event.resume
-                  ? `📞 ${session.title} is back with the receptionist: you handed the call back.`
+                  ? `📞 ${who} is back with the receptionist: you handed the call back.`
                   : placed
-                    ? `📞 ${session.title} answered the call for "${placed.name}": the agent is on it.`
-                    : `📞 ${session.title} is calling: the agent is answering.`;
+                    ? `📞 ${who} answered the call for "${placed.name}": the receptionist is on it.`
+                    : `📞 ${who} is calling: the receptionist is answering.`;
                 // The person is writing in another conversation: the call is said there, not put over what they write
                 // (Enter would send it to the call's agent).
                 if (chat.hasDraft() && viewing !== session.thread) {
                   chat.systemAction(said, 'Show the call', () => selectSession(session.thread));
                 } else {
                   selectSession(session.thread);
-                  chat.system(said);
+                  // (a call handed back says so in its own note, "You took the call · handed back after 1:35")
+                  if (!event.resume) chat.system(said);
                 }
               }
-              // The owner took the call, or the receptionist could not reach them: the person sees what happened.
-              if (session && event.type === 'call.handoff') chat.system(`📞 You took the call from ${session.title}.`);
+              // The owner took the call, or the receptionist could not reach them: the person sees what happened. Where the
+              // call is shown, its own note says that the owner took it (or accepted): said here only in another conversation.
+              const notShown = !!session && viewing !== session.thread;
+              if (session && event.type === 'call.handoff' && notShown) chat.system(`📞 You took the call from ${who}.`);
               if (session && event.type === 'call.transfer') {
                 const how: Record<string, string> = { accepted: 'accepted: the call is being connected to you', declined: 'declined', expired: 'ran out with nobody answering', unavailable: 'could not connect', cancelled: 'cancelled' };
                 const said = how[String(event.outcome)];
-                if (said) chat.system(`📞 The receptionist tried to reach you for ${session.title}: ${said}.`);
+                if (said && (event.outcome !== 'accepted' || notShown)) chat.system(`📞 The receptionist tried to reach you for ${who}: ${said}.`);
+                renderSessions();
               }
             });
           }, abort.signal);

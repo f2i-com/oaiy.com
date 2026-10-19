@@ -14,6 +14,42 @@ import { icon } from './icons';
 /** Where this browser remembers the terminal folded. */
 const FOLDED = 'oaiy.terminal.folded';
 
+/** What the input says to type, and, while a command runs, how to stop it. */
+const READY = 'ls, grep -rn TODO ., python script.py, help…';
+const BUSY = 'Running: Ctrl+C stops it. A command typed now runs next.';
+
+/** The shell's report, with the order its stdout and stderr were written in (runs of [fd, length], oldest first). */
+type ShellReport = { stdout: string; stderr: string; order?: Array<[number, number]> };
+
+/**
+ * The shell's output as it was written: stdout and stderr in turn, as the report's order says (an error between two
+ * lines of output shows between them), each piece marked with the stream it came on. Without an order, stdout then
+ * stderr; anything the order does not reach (cut short) comes after it.
+ */
+export function inOrder(report: ShellReport): Array<{ text: string; err: boolean }> {
+  const pieces: Array<{ text: string; err: boolean }> = [];
+  const put = (text: string, err: boolean) => {
+    if (!text) return;
+    const last = pieces.at(-1);
+    if (last && last.err === err) last.text += text;
+    else pieces.push({ text, err });
+  };
+  let out = 0;
+  let err = 0;
+  for (const [fd, n] of report.order ?? []) {
+    if (fd === 2) {
+      put(report.stderr.slice(err, err + n), true);
+      err += n;
+    } else {
+      put(report.stdout.slice(out, out + n), false);
+      out += n;
+    }
+  }
+  put(report.stdout.slice(out), false);
+  put(report.stderr.slice(err), true);
+  return pieces;
+}
+
 function remembered(): boolean {
   try {
     return localStorage.getItem(FOLDED) === '1';
@@ -32,10 +68,13 @@ function remember(folded: boolean): void {
 
 export class TerminalPane {
   readonly element = h('section.terminal');
-  private readonly out = h('pre.term-out');
+  // (a log: what each command prints is read out as it comes, not the whole of it again)
+  private readonly out = h('pre.term-out', { role: 'log', 'aria-label': 'Terminal output' });
   private readonly cwdLabel = h('span.term-cwd', '/');
   private readonly prompt = h('span.term-prompt', { 'aria-hidden': 'true' }, this.cwdLabel, h('span.term-sigil', '$'));
-  private readonly input = h('input.term-input', { spellcheck: false, autocomplete: 'off', 'aria-label': 'Terminal command', placeholder: 'ls, grep -rn TODO ., python script.py, help…' });
+  private readonly input = h('input.term-input', { spellcheck: false, autocomplete: 'off', 'aria-label': 'Terminal command', placeholder: READY }) as HTMLInputElement;
+  /** While a command runs: stops it, as Ctrl+C in the input does (shown so the way to stop it is seen). */
+  private readonly stopButton = h('button.term-stop', { type: 'button', hidden: true, title: 'Stop the command that is running (Ctrl+C)' }, 'Stop', h('kbd', 'Ctrl+C')) as HTMLButtonElement;
   private readonly toggle = h('button.term-toggle', { type: 'button' }) as HTMLButtonElement;
   private readonly where = h('span.term-where');
   private cwd = '/';
@@ -65,7 +104,11 @@ export class TerminalPane {
       e.stopPropagation();
       this.fold(!this.element.classList.contains('folded'));
     });
-    this.element.append(head, this.out, h('div.term-line', this.prompt, this.input));
+    this.element.append(head, this.out, h('div.term-line', this.prompt, this.input, this.stopButton));
+    this.stopButton.addEventListener('click', () => {
+      this.interrupt();
+      this.input.focus();
+    });
     this.fold(remembered(), false);
     this.input.addEventListener('keydown', (e) => {
       // Let the input method finish composing, including legacy IME events.
@@ -83,13 +126,27 @@ export class TerminalPane {
         this.out.textContent = '';
         e.preventDefault();
       } else if (e.key === 'c' && e.ctrlKey && !this.input.value.slice(this.input.selectionStart ?? 0, this.input.selectionEnd ?? 0) && this.running) {
-        this.queue = [];
-        this.stop?.abort();
-        this.write('^C\n', 'term-err');
+        this.interrupt();
         e.preventDefault();
       }
     });
     this.write('Type `help` to see what the shell can do.\n');
+  }
+
+  /** Stop the command that is running, and the ones typed to run after it (Ctrl+C, or the Stop button). */
+  private interrupt(): void {
+    if (!this.running) return;
+    this.queue = [];
+    this.stop?.abort();
+    this.write('^C\n', 'term-err');
+  }
+
+  /** Whether a command runs: the prompt pulses, and the input and the Stop button say how to stop it. */
+  private setRunning(running: boolean): void {
+    this.running = running;
+    this.prompt.classList.toggle('busy', running);
+    this.stopButton.hidden = !running;
+    this.input.placeholder = running ? BUSY : READY;
   }
 
   /** Fold the terminal down to its header, or open it (and remember which, for this browser). */
@@ -141,8 +198,7 @@ export class TerminalPane {
       this.out.textContent = '';
       return;
     }
-    this.running = true;
-    this.prompt.classList.add('busy');
+    this.setRunning(true);
     this.stop = new AbortController();
     try {
       const host = new SandboxHost(this.vfs, this.gate, 'terminal', 60_000);
@@ -153,18 +209,17 @@ export class TerminalPane {
       if (shell && !outcome.result?.error) {
         this.cwd = shell.cwd;
         this.env = shell.env;
-        if (shell.stdout) this.write(shell.stdout);
-        if (shell.stderr) this.write(shell.stderr, 'term-err');
+        for (const piece of inOrder(shell)) this.write(piece.text, piece.err ? 'term-err' : undefined);
       } else {
         const { stdout, stderr } = summarize(outcome);
         if (stdout) this.write(stdout);
-        this.write(stderr || 'the command did not finish\n', 'term-err');
+        // (stopped with Ctrl+C or Stop: the ^C says so, not "sandbox failed")
+        if (!this.stop.signal.aborted) this.write(stderr || 'the command did not finish\n', 'term-err');
       }
     } catch (error) {
-      this.write(`${(error as Error).message}\n`, 'term-err');
+      if (!this.stop?.signal.aborted) this.write(`${(error as Error).message}\n`, 'term-err');
     } finally {
-      this.running = false;
-      this.prompt.classList.remove('busy');
+      this.setRunning(false);
       this.showPrompt();
       this.stop = null;
       // Back to the prompt only when the person was typing in the terminal, not somewhere else meanwhile.

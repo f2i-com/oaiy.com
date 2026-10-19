@@ -239,7 +239,8 @@ try {
     await page.click('button.settings-button');
     await page.waitForSelector('dialog.settings[open]');
     const media = await page.$eval('.media-settings', (s) => ({ text: s.textContent, inputs: [...s.querySelectorAll('input')].map((i) => i.value) }));
-    expect(media.text.includes(`oaiy-studio 0.1.0 at ${new URL(oaiyUrl).origin} (images, video, speech, music, sound effects and 3D models)`), media.text);
+    // (OAIY's engines in words, not their service's name)
+    expect(media.text.includes(`OAIY's engines (version 0.1.0) at ${new URL(oaiyUrl).origin} (images, video, speech, music, sound effects and 3D models)`) && !media.text.includes('oaiy-studio'), media.text);
     expect(media.inputs.includes('pixal3d'), JSON.stringify(media.inputs));
     expect(media.inputs.includes(`${oaiyUrl}/v1`) && media.inputs.includes('qwen-image-turbo-q4') && media.inputs.includes('ltx-2.3'), JSON.stringify(media.inputs));
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Cancel').click());

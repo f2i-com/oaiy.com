@@ -322,6 +322,9 @@ try {
     liveCalls = ['live-1'];
     voice({ type: 'call.started', callId: 'live-1', from: '0491570006', name: '', greeting: 'Hi, thanks for calling Greenline Gardens. How can I help?' });
     await page.waitForFunction(() => !document.querySelector('.call-live')?.hidden, { timeout: 10_000 });
+    // (its clock starts at the call's own start, not up to a minute high from the note's minute)
+    const clock = await page.$eval('.call-live .live-time', (e) => e.textContent);
+    expect(/^0:0[0-2]$/.test(clock), `the clock began at ${clock}`);
     await wait(600);
     voice({ type: 'call.caller', callId: 'live-1', text: 'Hi, can you come Tuesday at ten?', startMs: 3_100, endMs: 5_400 });
     for (let i = 0; i < 100 && !held.length; i++) await wait(100);
@@ -358,6 +361,32 @@ try {
     const s = await logState(page);
     expect(s.fromBottom <= 2, JSON.stringify(s));
   });
+  await check('the live strip is said once: who, and that it is live, in a status region that does not change each second; its clock, outside it, runs', async () => {
+    const seen = await page.evaluate(async () => {
+      const region = document.querySelector('.call-live [role="status"]');
+      let changes = 0;
+      const watch = new MutationObserver((m) => (changes += m.length));
+      watch.observe(region, { childList: true, subtree: true, characterData: true });
+      const first = document.querySelector('.call-live .live-time').textContent;
+      await new Promise((r) => setTimeout(r, 2200));
+      watch.disconnect();
+      const time = document.querySelector('.call-live .live-time');
+      return { changes, region: region.textContent, timeInRegion: !!region.querySelector('.live-time'), first, now: time.textContent, hidden: time.getAttribute('aria-hidden') };
+    });
+    expect(seen.changes === 0 && /Live call/.test(seen.region) && /Liam/.test(seen.region) && !seen.timeInRegion && seen.hidden === 'true' && seen.first !== seen.now, JSON.stringify(seen));
+  });
+
+  await check('the log is not read out as it streams: a reply is said once, whole, errors are alerts, and the agent at work is said outside the log', async () => {
+    const a = await page.evaluate(() => ({
+      live: document.querySelector('.chat-log').getAttribute('aria-live'),
+      busy: document.querySelector('.chat-log').getAttribute('aria-busy'),
+      said: [...document.querySelectorAll('.chat .sr-only[aria-live="polite"]')].map((e) => e.textContent),
+      status: !!document.querySelector('.chat > .sr-only[role="status"]'),
+      inLog: !!document.querySelector('.chat-log [role="status"], .chat-log [aria-live="polite"]'),
+    }));
+    expect(a.live === 'off' && a.busy === null && a.said.some((t) => /Receptionist: Done, Liam\. Anything else\?/.test(t)) && a.status && !a.inLog, JSON.stringify(a));
+  });
+
   // The call going on, the text that came during it, and the call's words after it.
   await shoot(page, 'live', async () => {
     await page.evaluate(() => {
@@ -401,12 +430,13 @@ try {
   });
   await shoot(page, 'unsaid');
 
+  const endsBefore = await page.evaluate(() => document.querySelectorAll('.chat-feed .call-end').length);
   voice({ type: 'call.ended', callId: 'live-1' });
   liveCalls = [];
   await wait(800);
-  await check('the call ends: the live header goes, the conversation stays one', async () => {
-    const state = await page.evaluate(() => ({ live: !document.querySelector('.call-live')?.hidden }));
-    expect(!state.live, JSON.stringify(state));
+  await check('the call ends: the live header goes, "The call ended" is drawn as it comes (the conversation shown all along), and the conversation stays one', async () => {
+    const state = await page.evaluate(() => ({ live: !document.querySelector('.call-live')?.hidden, ends: document.querySelectorAll('.chat-feed .call-end').length, last: [...document.querySelectorAll('.chat-feed .call-end')].at(-1)?.textContent.trim() }));
+    expect(!state.live && state.ends === endsBefore + 1 && state.last === 'The call ended', JSON.stringify({ ...state, endsBefore }));
     await openPicker(page);
     const liam = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Liam'));
     expect(liam.length === 1 && /Calls and texts/.test(liam[0].detail), JSON.stringify(liam));
@@ -451,10 +481,79 @@ try {
     await page.click('.call-live .live-end');
     await page.waitForSelector('dialog.modal[open] button.primary');
     const asked = await page.$eval('dialog.modal[open]', (d) => d.textContent);
+    // (a question whose yes hangs up starts on Cancel: Enter alone does not end the call)
+    const focused = await page.evaluate(() => document.activeElement?.textContent);
+    expect(focused === 'Cancel', `focus on ${focused}`);
     await page.click('dialog.modal button.primary');
     await page.waitForFunction(() => document.querySelector('.call-live')?.hidden, { timeout: 10_000 });
     const chip = await page.evaluate(() => document.querySelector('.chip.on-call')?.hidden);
     expect(/End the call with Liam/.test(asked) && chip === true && hangups.length === 0, JSON.stringify({ asked, chip, hangups }));
+  });
+
+  await check("a draft stays with its conversation: a call that comes while the person writes is offered, the call's box is empty and Enter there sends nothing of it, and the draft is back when they return", async () => {
+    await openPicker(page);
+    await page.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.dataset.kind === 'runner')?.click());
+    await wait(500);
+    await page.focus('.chat-input');
+    await page.keyboard.type('Please update the brief for Tuesday');
+    const asks = asked.length;
+    liveCalls = ['live-4'];
+    voice({ type: 'call.started', callId: 'live-4', from: '0491570006', name: '' });
+    await page.waitForFunction(() => [...document.querySelectorAll('.chat-feed .msg.system button.retry')].some((b) => b.textContent === 'Show the call'), { timeout: 10_000 });
+    const before = await page.evaluate(() => document.querySelector('.chat-input').value);
+    await page.evaluate(() => [...document.querySelectorAll('.chat-feed .msg.system button.retry')].find((b) => b.textContent === 'Show the call').click());
+    await page.waitForFunction(() => !document.querySelector('.call-live')?.hidden, { timeout: 10_000 });
+    const inCall = await page.evaluate(() => document.querySelector('.chat-input').value);
+    await page.focus('.chat-input');
+    await page.keyboard.press('Enter');
+    await wait(600);
+    const toCall = asked.length - asks;
+    const logHas = await page.evaluate(() => document.querySelector('.chat-log').textContent.includes('Please update the brief'));
+    await openPicker(page);
+    await page.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.dataset.kind === 'runner')?.click());
+    await wait(500);
+    const back = await page.evaluate(() => document.querySelector('.chat-input').value);
+    expect(before === 'Please update the brief for Tuesday' && inCall === '' && toCall === 0 && !logHas && back === 'Please update the brief for Tuesday', JSON.stringify({ before, inCall, toCall, logHas, back }));
+    // (emptied again, for what comes next)
+    await page.evaluate(() => {
+      const box = document.querySelector('.chat-input');
+      box.value = '';
+      box.dispatchEvent(new Event('input'));
+    });
+  });
+
+  await check('two calls at once: the chip says "2 calls" and lists them; the one put through to the person says "With you", with no End call, and its notes are in words for people', async () => {
+    liveCalls = ['live-4', 'live-5'];
+    voice({ type: 'call.started', callId: 'live-5', from: '+61400333444', name: '' });
+    await page.waitForFunction(() => document.querySelector('.chip.on-call')?.textContent === '2 calls', { timeout: 10_000 });
+    await page.click('.chip.on-call');
+    await wait(300);
+    const listed = await page.evaluate(() => ({ open: document.querySelector('.chat .combo-button')?.getAttribute('aria-expanded'), live: [...document.querySelectorAll('.chat .combo-option')].filter((o) => /On a call now/.test(o.textContent)).length, numbers: [...document.querySelectorAll('.chat .combo-option')].map((o) => o.textContent).filter((t) => /0400 333 444/.test(t)) }));
+    // (someone with no name goes by their number as it is read, said once)
+    expect(listed.open === 'true' && listed.live === 2 && listed.numbers.length === 1 && listed.numbers[0].split('0400 333 444').length === 2, JSON.stringify(listed));
+    await page.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.querySelector('.combo-name')?.textContent.startsWith('Liam'))?.click());
+    await wait(500);
+    voice({ type: 'call.transfer', callId: 'live-4', outcome: 'accepted', requestId: 'r1' });
+    voice({ type: 'call.handoff', callId: 'live-4', reason: 'accepted' });
+    await page.waitForFunction(() => /With you/i.test(document.querySelector('.call-live')?.textContent ?? ''), { timeout: 10_000 });
+    await wait(300);
+    const handed = await page.evaluate(() => ({
+      end: !document.querySelector('.call-live .live-end').hidden,
+      notes: [...document.querySelectorAll('.chat-feed .msg.oaiy-note')].map((n) => n.textContent.trim()).slice(-2),
+      detail: document.querySelector('.chat .combo-button .convo-detail')?.textContent,
+      system: [...document.querySelectorAll('.chat-feed .msg.system')].map((n) => n.textContent).filter((t) => /took the call|accepted/.test(t)),
+    }));
+    expect(!handed.end && handed.detail === 'With you now' && handed.notes.join('|') === 'You accepted: the call is being put through to you.|You took the call.' && !handed.system.length, JSON.stringify(handed));
+    await shoot(page, 'with-you');
+    voice({ type: 'call.started', callId: 'live-4', from: '0491570006', name: '', resume: { afterHandoff: true, handoffSeconds: 95 } });
+    await page.waitForFunction(() => /Live call/i.test(document.querySelector('.call-live')?.textContent ?? ''), { timeout: 10_000 });
+    await wait(400);
+    const back = await page.evaluate(() => ({ end: !document.querySelector('.call-live .live-end').hidden, notes: [...document.querySelectorAll('.chat-feed .msg.oaiy-note')].map((n) => n.textContent.trim()), log: document.querySelector('.chat-log').textContent }));
+    expect(back.end && back.notes.includes('You took the call · handed back after 1:35') && !/Say nothing more|do not greet|\[OAIY\]/.test(back.log), JSON.stringify(back));
+    liveCalls = [];
+    voice({ type: 'call.ended', callId: 'live-5' });
+    voice({ type: 'call.ended', callId: 'live-4' });
+    await page.waitForFunction(() => document.querySelector('.chip.on-call')?.hidden, { timeout: 10_000 });
   });
 
   await check('the page raised no errors', async () => {

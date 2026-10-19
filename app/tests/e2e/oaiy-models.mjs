@@ -21,9 +21,10 @@ if (!executablePath) {
 
 // What the engines have: the model chosen in Engines, the one the card holds and how its loading goes (it is ready
 // at the second look after a start), and the one this Mac's engine holds (one chosen is held from the second look
-// after the choice). The 27B is set to the eGPU, the 9B to the Mac.
+// after the choice). The 27B is set to the eGPU, the 9B to the Mac. `idle`: they run no language model, and a model
+// chosen then is only chosen (as OAIY's studio does: it loads one on a change only while it runs one).
 const ON_CARD = 'qwen3.8-27b';
-const engines = { default: 'qwen3.8-27b', card: 'qwen3.8-27b', state: 'ready', looks: 0, mac: null, macPending: null, macLooks: 0 };
+const engines = { default: 'qwen3.8-27b', card: 'qwen3.8-27b', state: 'ready', looks: 0, mac: null, macPending: null, macLooks: 0, down: false, idle: false };
 const chats = [];
 const asked = [];
 // The paired computer (OAIY Network) and its language model, by the id the desktop's catalogue gives it; `chosen`: the
@@ -93,6 +94,8 @@ const lastUser = (ask) => {
 };
 
 const oaiy = createHttpServer(async (req, res) => {
+  // (the engines stopped: nothing answers, as a closed port does not)
+  if (engines.down) return req.socket.destroy();
   cors(res);
   if (req.method === 'OPTIONS') return res.end();
   const body = await read(req);
@@ -170,7 +173,8 @@ const desktop = createHttpServer(async (req, res) => {
     if (m.method === 'initialize') return reply(res, 200, { jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'oaiy', version: '0.1.0' } } });
     if (m.method === 'tools/list') return reply(res, 200, { jsonrpc: '2.0', id: m.id, result: { tools: CONTROL_TOOLS } });
     if (m.method === 'tools/call' && m.params.name === 'model_set_default') {
-      chooseHere(m.params.arguments.model);
+      if (engines.idle) engines.default = m.params.arguments.model;
+      else chooseHere(m.params.arguments.model);
       return reply(res, 200, { jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: `The engine's llm model is now ${m.params.arguments.model}.` }], isError: false } });
     }
     return reply(res, 200, { jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'no such method' } });
@@ -388,6 +392,65 @@ try {
     await wait(300);
     expect(asked.length === before, `asked ${JSON.stringify(asked.slice(before))}`);
     expect(await page.evaluate(() => window.__modelOption.isConnected), "the menu's options were made again");
+  });
+
+  await check('a change made in OAIY just after a choice in the menu is taken (the Agent set to another provider), not held off as an answer from before the choice', async () => {
+    // (the paired computer's model chosen here, which the desktop says only 20 s later)
+    network.lag = 20_000;
+    const said = (await log()).split("OAIY's engine now runs").length;
+    await page.select('select.model.pick', remoteId(network.model));
+    await page.waitForFunction((n) => document.querySelector('.chat-log')?.textContent.split("OAIY's engine now runs").length > n, { timeout: 10_000 }, said);
+    // ...and, meanwhile, the Agent set to LM Studio in OAIY: the desktop says so at its next look
+    network.prefs = { model: { source: 'provider', provider: 'lm-studio', model: 'qwen-coder-30b' }, providerName: 'LM Studio' };
+    await backToFront();
+    await page.waitForFunction(() => document.querySelector('button.chip.model:not([hidden])')?.textContent === 'LM Studio · qwen-coder-30b', { timeout: 10_000 }).catch(async (e) => {
+      throw new Error(`${e.message}\nchip: ${await page.$eval('button.chip.model', (b) => `${b.hidden ? '(hidden) ' : ''}${b.textContent}`)}; menu: ${JSON.stringify(await menu('model'))}`);
+    });
+    // (back on this Mac's model, the engine's own)
+    Object.assign(network, { prefs: null, chosen: false, lag: 0 });
+    await backToFront();
+    await page.waitForFunction(() => !document.querySelector('select.model.pick')?.hidden, { timeout: 10_000 });
+    await shown(page, 'qwen3.5-9b · Mac · ready');
+  });
+
+  await check("the Agent choosing a model while OAIY's engines run none: the menu says it is chosen, not loading (nothing loads)", async () => {
+    Object.assign(engines, { idle: true, default: 'qwen3.8-27b', card: null, state: 'stopped', mac: null, macPending: null });
+    await backToFront();
+    await shown(page, 'qwen3.8-27b · eGPU · not loaded');
+    await send(page, 'Use the smaller model from now on.');
+    await page.waitForFunction(() => (document.querySelector('.chat-log')?.textContent.match(/Done: the engine runs the smaller model now\./g) ?? []).length >= 2, { timeout: 30_000 });
+    await shown(page, 'qwen3.5-9b · Mac · not loaded');
+    const seen = new Set();
+    for (let i = 0; i < 20; i++) {
+      seen.add((await menu('model')).shown);
+      await wait(200);
+    }
+    expect(![...seen].some((t) => /loading/.test(t)), JSON.stringify([...seen]));
+    // (the engines run a model again: this Mac's, chosen; held from the second look)
+    engines.idle = false;
+    chooseHere('qwen3.5-9b');
+    await backToFront();
+    await backToFront();
+    await shown(page, 'qwen3.5-9b · Mac · ready');
+  });
+
+  await check("OAIY's engines stopped: the run says they are not answering (no CORS advice, OAIY not Studio), the menu says so, and it is ready again once they answer", async () => {
+    engines.down = true;
+    await send(page, 'Are you still there?');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('engines are not answering'), { timeout: 30_000 }).catch(async (e) => {
+      throw new Error(`${e.message}\nlog: ${(await log()).slice(-500)}`);
+    });
+    const text = await log();
+    const said = text.slice(text.lastIndexOf('engines are not answering') - 8, text.lastIndexOf('engines are not answering') + 160);
+    expect(said.includes(`OAIY’s engines are not answering (${oaiyUrl}). Start them in OAIY’s Engines page`) && !/CORS|cors_origins|Studio/.test(said), said);
+    await shown(page, 'qwen3.5-9b · not answering');
+    const m = await menu('model');
+    expect(m.state === 'offline', JSON.stringify(m));
+    expect((await page.$eval('select.model.pick', (s) => s.title)).includes("OAIY's engines are not answering now"), 'the menu does not say why');
+    // (looked at again every few seconds: ready once they answer, without waiting for the minute's look)
+    engines.down = false;
+    await shown(page, 'qwen3.5-9b · Mac · ready');
+    expect((await menu('model')).state === 'ready', JSON.stringify(await menu('model')));
   });
 
   await check("on one of OAIY's AI providers, chosen in OAIY's Settings → Agent: the chip and Settings say that is where it is chosen", async () => {

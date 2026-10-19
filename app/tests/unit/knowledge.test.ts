@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { runTool } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
 import { checkEvents, componentEvents } from '../../src/softn/knowledge';
-import { findApps, handlersIn } from '../../src/softn/softn';
+import { findApps, handlersIn, resolveApp } from '../../src/softn/softn';
 import { Vfs } from '../../src/vfs/vfs';
 
 const ctx = () => ({ vfs: new Vfs(), gate: new NetGate(), reads: new Map(), shell: { cwd: '/', env: {} } });
@@ -125,3 +125,15 @@ describe('handlers on components that do not take them', () => {
   });
 });
 
+
+describe('which app a request means', () => {
+  it('says why there is none as a sentence of its own (the chat shows it after /softn and Export .softn)', () => {
+    const vfs = new Vfs();
+    const none = resolveApp(vfs);
+    expect(!none.ok && none.reason).toMatch(/^There is no SoftN app in this project yet/);
+    const named = resolveApp(vfs, '');
+    expect(!named.ok && named.reason).toMatch(/^There is no SoftN app/);
+    const root = resolveApp(vfs, '/');
+    expect(!root.ok && root.reason).toMatch(/^The project root is not a SoftN app/);
+  });
+});

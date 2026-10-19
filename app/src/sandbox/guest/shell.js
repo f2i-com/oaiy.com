@@ -29,6 +29,7 @@
 
   class ShellExit { constructor(code) { this.code = code; } }
   class LoopCtl { constructor(kind, n) { this.kind = kind; this.n = n || 1; } }
+  class ReturnCtl { constructor(code) { this.code = code; } }
   class ShellError extends Error {}
 
   /* ---------------- state ---------------- */
@@ -44,6 +45,8 @@
     dirstack: [],
     traps: {},
     optpos: 1,
+    // The command running now, as it was called.
+    cmd: "",
   };
 
   /* ---------------- paths ---------------- */
@@ -750,7 +753,9 @@
   function runSub(src) {
     const saved = { cwd: state.cwd, env: Object.assign({}, state.env) };
     try {
-      const r = runSource(src, "");
+      let r;
+      // $(...) is a subshell: an exit in it ends only it, with what it printed.
+      try { r = runSource(src, ""); } catch (e) { if (e instanceof ShellExit) r = carried(e, e.code); else throw e; }
       if (r.err) stderrSink.push(r.err);
       return r.out;
     } finally { state.cwd = saved.cwd; state.env = saved.env; }
@@ -922,6 +927,43 @@
   /* ---------------- execution ---------------- */
   function R(out, err, code) { return { out: out || "", err: err || "", code: code || 0 }; }
 
+  // The order a result's stdout and stderr were written in, as runs of [fd, length], oldest first, so the terminal
+  // (and 2>&1) shows an error where it came rather than after all the output. One command's own result is its stdout,
+  // then its stderr; a list, a loop or a branch keeps the order of the commands in it.
+  function seqOf(r) { return r.seq || [[1, r.out.length], [2, r.err.length]]; }
+  function pushRun(seq, fd, n) {
+    if (!n) return;
+    const last = seq[seq.length - 1];
+    if (last && last[0] === fd) last[1] += n; else seq.push([fd, n]);
+  }
+  // What a list, a loop or a branch has written so far: each command's result is added after the ones before it.
+  function Acc() { return { out: "", err: "", seq: [], code: 0 }; }
+  function add(acc, r) {
+    acc.out += r.out || ""; acc.err += r.err || "";
+    for (const s of seqOf({ out: r.out || "", err: r.err || "", seq: r.seq })) pushRun(acc.seq, s[0], s[1]);
+    return acc;
+  }
+  function withSeq(r, seq) { r.seq = seq; return r; }
+  function accResult(acc, code) { return withSeq(R(acc.out, acc.err, code), acc.seq); }
+  // Both streams as one, in the order they were written (2>&1, and the terminal).
+  function interleave(r) {
+    let out = "", i = 0, j = 0;
+    for (const [fd, n] of seqOf(r)) {
+      if (fd === 1) { out += r.out.slice(i, i + n); i += n; } else { out += r.err.slice(j, j + n); j += n; }
+    }
+    return out + r.out.slice(i) + r.err.slice(j);
+  }
+  // exit, return, break and continue leave the commands they are in by throwing: each level they pass through puts what
+  // its own commands wrote so far in front of what they carry, so `echo a; exit 1` still prints "a".
+  function carry(e, acc) {
+    if (!(e instanceof ShellExit || e instanceof LoopCtl || e instanceof ReturnCtl)) return e;
+    const all = add(add(Acc(), acc), { out: e.out || "", err: e.err || "", seq: e.seq });
+    e.out = all.out; e.err = all.err; e.seq = all.seq;
+    return e;
+  }
+  // What an exit (or a return, a break) carried, as a result.
+  function carried(e, code) { return withSeq(R(e.out, e.err, code), seqOf({ out: e.out || "", err: e.err || "", seq: e.seq })); }
+
   function applyRedirs(redirs, stdin) {
     // Returns {stdin, outFile, errFile, outAppend, errAppend, errToOut, outToErr}.
     const r = { stdin: stdin, out: null, err: null, outAppend: false, errAppend: false, errToOut: false, outToErr: false };
@@ -952,9 +994,10 @@
     return r;
   }
   function finishRedirs(r, res) {
-    let out = res.out, err = res.err;
-    if (r.errToOut) { out += err; err = ""; }
-    if (r.outToErr) { err += out; out = ""; }
+    let out = res.out, err = res.err, seq = seqOf(res);
+    // (2>&1 and >&2 merge the streams in the order they were written)
+    if (r.errToOut) { out = interleave(res); err = ""; seq = [[1, out.length]]; }
+    if (r.outToErr) { err = interleave({ out: out, err: err, seq: seq }); out = ""; seq = [[2, err.length]]; }
     if (r.out !== null) {
       // A binary result (gzip -c) holds one byte per character: write the bytes.
       if (r.out !== DEVNULL && res.binary && !r.errToOut) {
@@ -967,58 +1010,80 @@
         call("fs.writeb64", resolve(r.out), bytes.toBase64());
       } else if (r.out !== DEVNULL) (r.outAppend ? fs.append : fs.write)(r.out, out);
       out = "";
+      seq = seq.filter((s) => s[0] !== 1);
     }
     if (r.err !== null) {
       if (r.err !== DEVNULL) (r.errAppend ? fs.append : fs.write)(r.err, err);
       err = "";
+      seq = seq.filter((s) => s[0] !== 2);
     }
-    return R(out, err, res.code);
+    return withSeq(R(out, err, res.code), seq);
   }
 
   function runList(list, stdin) {
-    let out = "", err = "", code = 0;
-    for (const item of list.items) {
-      const r = runAndOr(item, stdin);
-      out += r.out; err += r.err; code = r.code;
-      state.last = code;
-      if (state.errexit && code !== 0 && !item.rest.length) throw Object.assign(new ShellExit(code), { out: out, err: err });
-      if (out.length > MAX_STREAM * 2 || err.length > MAX_STREAM * 2) break;
-    }
-    return R(out, err, code);
+    const acc = Acc();
+    let code = 0;
+    try {
+      for (const item of list.items) {
+        const r = runAndOr(item, stdin);
+        add(acc, r); code = r.code;
+        state.last = code;
+        if (state.errexit && code !== 0 && !item.rest.length) throw new ShellExit(code);
+        if (acc.out.length > MAX_STREAM * 2 || acc.err.length > MAX_STREAM * 2) break;
+      }
+    } catch (e) { throw carry(e, acc); }
+    return accResult(acc, code);
   }
   function runAndOr(node, stdin) {
+    const acc = Acc();
     let r = runPipeline(node.first, stdin);
-    let out = r.out, err = r.err, code = r.code;
+    add(acc, r);
+    let code = r.code;
     state.last = code;
-    for (const step of node.rest) {
-      if ((step.op === "&&" && code !== 0) || (step.op === "||" && code === 0)) continue;
-      r = runPipeline(step.p, stdin);
-      out += r.out; err += r.err; code = r.code;
-      state.last = code;
-    }
-    return R(out, err, code);
+    try {
+      for (const step of node.rest) {
+        if ((step.op === "&&" && code !== 0) || (step.op === "||" && code === 0)) continue;
+        r = runPipeline(step.p, stdin);
+        add(acc, r); code = r.code;
+        state.last = code;
+      }
+    } catch (e) { throw carry(e, acc); }
+    return accResult(acc, code);
   }
   function runPipeline(node, stdin) {
-    let data = stdin, err = "", code = 0;
-    for (let n = 0; n < node.cmds.length; n++) {
-      const r = runCommand(node.cmds[n], data);
-      data = r.out; err += r.err; code = r.code;
+    let data = stdin, code = 0;
+    const acc = Acc();
+    const last = node.cmds.length - 1;
+    for (let n = 0; n <= last; n++) {
+      let r;
+      try { r = runCommand(node.cmds[n], data); }
+      catch (e) {
+        // Each command of a pipeline is a subshell of its own: an exit there ends only that command.
+        if (last > 0 && e instanceof ShellExit) r = carried(e, e.code);
+        else throw carry(e, acc);
+      }
+      // (what an earlier command printed goes down the pipe; what it said on stderr is shown)
+      if (n < last) { add(acc, R("", r.err)); data = r.out; }
+      else add(acc, r);
+      code = r.code;
     }
     if (node.neg) code = code === 0 ? 1 : 0;
-    return R(data, err, code);
+    return accResult(acc, code);
   }
   function runCommand(node, stdin) {
     if (++state.depth > 200) { state.depth--; throw new ShellError("maximum nesting depth reached"); }
+    let r = null;
+    const mark = stderrSink.length;
     try {
       if (node.t === "funcdef") { functions[node.name] = node.body; return R(); }
-      const r = applyRedirs(node.redirs, stdin);
+      r = applyRedirs(node.redirs, stdin);
       let res;
       switch (node.t) {
         case "simple": res = runSimple(node, r.stdin); break;
         case "subshell": {
           const saved = { cwd: state.cwd, env: Object.assign({}, state.env) };
           try { res = runList(node.body, r.stdin); }
-          catch (e) { if (e instanceof ShellExit) res = R(e.out, e.err, e.code); else throw e; }
+          catch (e) { if (e instanceof ShellExit) res = carried(e, e.code); else throw e; }
           finally { state.cwd = saved.cwd; state.env = saved.env; }
           break;
         }
@@ -1031,65 +1096,82 @@
         case "cfor": res = runCfor(node, r.stdin); break;
         default: throw new ShellError("unsupported construct " + node.t);
       }
-      return finishRedirs(r, res);
+      res = finishRedirs(r, res);
+      // What a $(...) in this command's words said on stderr comes before the command's own output.
+      return mark < stderrSink.length ? accResult(add(add(Acc(), R("", stderrSink.splice(mark).join(""))), res), res.code) : res;
+    } catch (e) {
+      // What an exit carries out of `{ ...; exit 1; } > file` goes where the command's output goes.
+      if (r && (e instanceof ShellExit || e instanceof LoopCtl || e instanceof ReturnCtl)) {
+        const done = finishRedirs(r, carried(e, 0));
+        e.out = done.out; e.err = done.err; e.seq = done.seq;
+      }
+      throw e;
     } finally { state.depth--; }
   }
   function runIf(node, stdin) {
-    let out = "", err = "";
-    for (const cl of node.clauses) {
-      const c = runList(cl.cond, stdin); out += c.out; err += c.err;
-      if (c.code === 0) { const b = runList(cl.body, stdin); return R(out + b.out, err + b.err, b.code); }
-    }
-    if (node.orelse) { const b = runList(node.orelse, stdin); return R(out + b.out, err + b.err, b.code); }
-    return R(out, err, 0);
+    const acc = Acc();
+    try {
+      for (const cl of node.clauses) {
+        const c = runList(cl.cond, stdin); add(acc, c);
+        if (c.code === 0) { const b = runList(cl.body, stdin); return accResult(add(acc, b), b.code); }
+      }
+      if (node.orelse) { const b = runList(node.orelse, stdin); return accResult(add(acc, b), b.code); }
+    } catch (e) { throw carry(e, acc); }
+    return accResult(acc, 0);
   }
   function loopBody(body, stdin, acc) {
-    try { const r = runList(body, stdin); acc.out += r.out; acc.err += r.err; acc.code = r.code; return null; }
+    try { const r = runList(body, stdin); add(acc, r); acc.code = r.code; return null; }
     catch (e) {
-      if (e instanceof LoopCtl) { if (e.n > 1) { e.n--; throw e; } return e.kind; }
-      throw e;
+      if (e instanceof LoopCtl) {
+        // What the body wrote before the break (or the continue) is kept.
+        add(acc, carried(e, 0));
+        if (e.n > 1) { e.n--; e.out = acc.out; e.err = acc.err; e.seq = acc.seq; throw e; }
+        return e.kind;
+      }
+      throw carry(e, acc);
     }
   }
   function runFor(node, stdin) {
     const items = node.words === null ? positional.slice() : expandWords(node.words);
-    const acc = { out: "", err: "", code: 0 };
+    const acc = Acc();
     for (const item of items) {
       state.env[node.name] = item;
       const ctl = loopBody(node.body, stdin, acc);
       if (ctl === "break") break;
       if (acc.out.length > MAX_STREAM * 2) break;
     }
-    return R(acc.out, acc.err, acc.code);
+    return accResult(acc, acc.code);
   }
   function runCfor(node, stdin) {
-    const acc = { out: "", err: "", code: 0 };
+    const acc = Acc();
     if (node.init.trim()) arith(node.init);
     let guard = 0;
     for (;;) {
       if (node.cond.trim() && Number(arith(node.cond)) === 0) break;
-      if (++guard > 100000) { acc.err += "sandbox-sh: loop stopped after 100000 iterations\n"; acc.code = 1; break; }
+      if (++guard > 100000) { add(acc, R("", "sandbox-sh: loop stopped after 100000 iterations\n")); acc.code = 1; break; }
       const ctl = loopBody(node.body, stdin, acc);
       if (ctl === "break") break;
       if (node.step.trim()) arith(node.step);
       if (acc.out.length > MAX_STREAM * 2) break;
     }
-    return R(acc.out, acc.err, acc.code);
+    return accResult(acc, acc.code);
   }
   function runWhile(node, stdin) {
-    const acc = { out: "", err: "", code: 0 };
+    const acc = Acc();
     let guard = 0;
     // `while read line` consumes stdin line by line.
     const feed = { text: stdin };
     for (;;) {
-      if (++guard > 100000) { acc.err += "sandbox-sh: loop stopped after 100000 iterations\n"; acc.code = 1; break; }
-      const c = runListWithFeed(node.cond, feed);
-      acc.out += c.out; acc.err += c.err;
+      if (++guard > 100000) { add(acc, R("", "sandbox-sh: loop stopped after 100000 iterations\n")); acc.code = 1; break; }
+      let c;
+      try { c = runListWithFeed(node.cond, feed); } catch (e) { throw carry(e, acc); }
+      add(acc, c);
       if ((c.code === 0) === node.until) break;
       const ctl = loopBody(node.body, "", acc);
       if (ctl === "break") break;
       if (acc.out.length > MAX_STREAM * 2) break;
     }
-    return R(acc.out, acc.err, acc.code);
+    return accResult(acc, acc.code);
   }
   let readFeed = null;
   function runListWithFeed(list, feed) {
@@ -1131,7 +1213,7 @@
     if (Object.prototype.hasOwnProperty.call(functions, name)) {
       const saved = positional; positional = argv.slice(1);
       try { return runCommand(functions[name], stdin); }
-      catch (e) { if (e instanceof ReturnCtl) return R("", "", e.code); throw e; }
+      catch (e) { if (e instanceof ReturnCtl) return carried(e, e.code); throw e; }
       finally { positional = saved; }
     }
     const fn = Object.prototype.hasOwnProperty.call(builtins, name) ? builtins[name] : null;
@@ -1139,6 +1221,9 @@
       if (/^\.{0,2}\//.test(name) || /\.(sh|js|mjs|cjs|py)$/.test(name)) return runScriptFile(name, argv.slice(1), stdin);
       return R("", "sandbox-sh: " + name + ": command not found (this is OAIY's shell; run `help` for the commands it has)\n", 127);
     }
+    // (the command's name, for the files it cannot read: "cat: notes.txt: No such file or directory")
+    const outer = state.cmd;
+    state.cmd = name;
     try {
       const r = fn(argv.slice(1), stdin);
       return r || R();
@@ -1146,10 +1231,8 @@
       if (e instanceof ShellExit || e instanceof LoopCtl || e instanceof ReturnCtl) throw e;
       if (e instanceof ShellError) return R("", name + ": " + e.message + "\n", 2);
       return R("", name + ": " + errText(e) + "\n", 1);
-    }
+    } finally { state.cmd = outer; }
   }
-  class ReturnCtl { constructor(code) { this.code = code; } }
-
   function runSource(src, stdin) {
     let tree;
     try { tree = parse(src); } catch (e) { return R("", "sandbox-sh: " + errText(e) + "\n", 2); }
@@ -1161,7 +1244,7 @@
     if (/\.(js|mjs|cjs)$/.test(lower)) return runExternal("js", { file: file }, args, stdin);
     if (/\.py$/.test(lower)) return runExternal("python", { file: file }, args, stdin);
     let text;
-    try { text = fs.read(file); } catch (e) { return R("", "sandbox-sh: " + file + ": " + errText(e) + "\n", 127); }
+    try { text = fs.read(file); } catch (e) { return R("", "sandbox-sh: " + file + ": " + fileErr(e) + "\n", 127); }
     const first = text.split("\n")[0];
     if (/^#!.*\b(node|nodejs|deno|bun)\b/.test(first)) return runExternal("js", { file: file }, args, stdin);
     if (/^#!.*\bpython/.test(first)) return runExternal("python", { file: file }, args, stdin);
@@ -1171,12 +1254,23 @@
     const saved = { cwd: state.cwd, env: Object.assign({}, state.env), pos: positional, errexit: state.errexit };
     positional = args;
     try { return runSource(text, stdin); }
-    catch (e) { if (e instanceof ShellExit) return R(e.out, e.err, e.code); throw e; }
+    catch (e) { if (e instanceof ShellExit) return carried(e, e.code); throw e; }
     finally { state.cwd = saved.cwd; state.env = saved.env; positional = saved.pos; state.errexit = saved.errexit; }
   }
   function runExternal(lang, what, args, stdin) {
     const request = { lang: lang, argv: args, stdin: stdin || "", cwd: state.cwd, env: state.env };
-    if (what.file !== undefined) request.file = resolve(what.file);
+    if (what.file !== undefined) {
+      // A script that is not there is said as python and node say it, named by the command.
+      const st = fs.stat(what.file);
+      const who = state.cmd || (lang === "js" ? "node" : "python");
+      if (!st || st.type === "dir") {
+        const why = st ? "Is a directory" : "No such file or directory";
+        return lang === "python"
+          ? R("", who + ": can't open file '" + what.file + "': [Errno " + (st ? 21 : 2) + "] " + why + "\n", 2)
+          : R("", who + ": cannot find module '" + what.file + "': " + why + "\n", 1);
+      }
+      request.file = resolve(what.file);
+    }
     if (what.source !== undefined) request.source = what.source;
     const r = callJson("proc.run", request);
     return R(r.stdout, r.stderr, r.exit_code);
@@ -1214,14 +1308,21 @@
     for (; i < args.length; i++) rest.push(args[i]);
     return { f: flags, a: rest };
   }
+  // A file that cannot be read, as a shell says it: "No such file or directory" rather than the host's ENOENT.
+  function fileErr(e) {
+    const text = errText(e);
+    const m = /^(ENOENT|EISDIR|ENOTDIR):/.exec(text);
+    return m ? { ENOENT: "No such file or directory", EISDIR: "Is a directory", ENOTDIR: "Not a directory" }[m[1]] : text;
+  }
   function inputsOf(files, stdin, cb) {
-    // cb(text, name) for each input; returns aggregated errors.
+    // cb(text, name) for each input; returns aggregated errors, each named by the command that could not read it.
     let err = "", code = 0;
     if (!files.length) files = ["-"];
+    const who = state.cmd ? state.cmd + ": " : "";
     for (const f of files) {
       if (f === "-") { cb(stdin || "", "(standard input)"); continue; }
       try { cb(fs.read(f), f); }
-      catch (e) { err += f + ": " + errText(e) + "\n"; code = 1; }
+      catch (e) { if (e instanceof ShellExit || e instanceof LoopCtl || e instanceof ReturnCtl) throw e; err += who + f + ": " + fileErr(e) + "\n"; code = 1; }
     }
     return { err: err, code: code };
   }
@@ -2532,7 +2633,7 @@
   B("sh bash zsh", (args, stdin) => {
     const o = opts(args, { withValue: "c", stopAtOperand: true });
     if (o.f.c !== undefined) return runNestedShell(o.f.c, o.a, stdin);
-    if (o.a.length) { let text; try { text = fs.read(o.a[0]); } catch (e) { return R("", "sh: " + o.a[0] + ": " + errText(e) + "\n", 127); } return runNestedShell(text, o.a.slice(1), stdin); }
+    if (o.a.length) { let text; try { text = fs.read(o.a[0]); } catch (e) { return R("", "sh: " + o.a[0] + ": " + fileErr(e) + "\n", 127); } return runNestedShell(text, o.a.slice(1), stdin); }
     if (stdin) return runNestedShell(stdin, [], "");
     return R();
   }, "sh|bash FILE | -c 'commands'");
@@ -2665,19 +2766,27 @@
   ), "help");
 
   /* ---------------- run ---------------- */
+  // How the command line ended, from what it threw: an exit (with what was printed before it), a return or a break
+  // outside a function or a loop, or an error.
+  function ended(e) {
+    if (e instanceof ShellExit || e instanceof ReturnCtl) return carried(e, e.code);
+    if (e instanceof LoopCtl) return carried(e, 0);
+    return R("", "sandbox-sh: " + errText(e) + "\n", 2);
+  }
   let result;
   try {
     const src = String(input.command || "");
-    const r = runSource(src, typeof input.stdin === "string" ? input.stdin : "");
-    result = r;
-    if (state.traps.EXIT) { const t = runSource(state.traps.EXIT, ""); result = R(result.out + t.out, result.err + t.err, result.code); }
-  } catch (e) {
-    if (e instanceof ShellExit) result = R(e.out || "", e.err || "", e.code);
-    else if (e instanceof LoopCtl) result = R("", "", 0);
-    else if (e instanceof ReturnCtl) result = R("", "", e.code);
-    else result = R("", "sandbox-sh: " + errText(e) + "\n", 2);
+    result = runSource(src, typeof input.stdin === "string" ? input.stdin : "");
+  } catch (e) { result = ended(e); }
+  // The EXIT trap runs as the shell ends, after an exit too.
+  if (state.traps.EXIT) {
+    let t;
+    try { t = runSource(state.traps.EXIT, ""); } catch (e) { t = ended(e); }
+    result = accResult(add(add(Acc(), result), t), result.code);
   }
+  // (what $(...) said on stderr outside any command is said first, as it came before the output)
   const extraErr = stderrSink.join("");
+  const all = add(add(Acc(), R("", extraErr)), result);
   const cap = (s) => (s.length > MAX_STREAM ? s.slice(0, MAX_STREAM) + "\n[output truncated at " + MAX_STREAM + " characters]\n" : s);
-  return JSON.stringify({ stdout: cap(result.out), stderr: cap(extraErr + result.err), exit_code: result.code, cwd: state.cwd, env: state.env });
+  return JSON.stringify({ stdout: cap(all.out), stderr: cap(all.err), order: all.seq, exit_code: result.code, cwd: state.cwd, env: state.env });
 })();

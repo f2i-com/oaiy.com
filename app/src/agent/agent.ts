@@ -130,11 +130,13 @@ const MAX_KEPT_THINKING = 20_000;
  */
 export const WARM_TOKENS = 32;
 /** For the same reply twice, with nothing done in between. */
-const REPEAT_NUDGE = 'You gave the same reply again, and still no tool has run. Do not reply in words: your next reply must be a tool call (update_plan for a task, or the first tool the work needs).';
+export const REPEAT_NUDGE = 'You gave the same reply again, and still no tool has run. Do not reply in words: your next reply must be a tool call (update_plan for a task, or the first tool the work needs).';
 /** For a reply that only announced the work. */
-const START_NUDGE = 'You said what you will do, but no tool has run yet, so nothing has started. Start now: call update_plan with the plan (for a task with several steps), then the first step\'s tools. Do not describe the work again; do it.';
+export const START_NUDGE = 'You said what you will do, but no tool has run yet, so nothing has started. Start now: call update_plan with the plan (for a task with several steps), then the first step\'s tools. Do not describe the work again; do it.';
 /** For a run that started calls, which are going on, and whose reply had no words: its plan is not pushed on (the result comes by itself), but the person is told. */
-const CALLS_GOING_NUDGE = 'Your last reply had no words. The calls you started are going on, and their results come to you by themselves when they end, so do not check on them. Say in a sentence what you started and what happens next.';
+export const CALLS_GOING_NUDGE = 'Your last reply had no words. The calls you started are going on, and their results come to you by themselves when they end, so do not check on them. Say in a sentence what you started and what happens next.';
+/** What the model is told after a reply the person stopped (see AgentOptions.keepStopped). */
+export const STOPPED_NOTE = '[OAIY] The person stopped this reply before it was finished.';
 
 /**
  * Whether a reply announces work it is about to do ("I'll…", "Let me…",
@@ -345,6 +347,12 @@ export interface AgentOptions {
    * answer, so it is never asked to start work or carry on (on a call those asks were spoken aloud).
    */
   conversation?: boolean;
+  /**
+   * A run stopped as the model wrote its reply (the person pressed Stop, or left the project): what it had written is
+   * kept as its reply, and a note says it was stopped, so the next request is not read as part of the stopped one.
+   * Not on the phone, where a reply cut off is kept as far as the caller heard it (sessions.ts).
+   */
+  keepStopped?: boolean;
   /**
    * What must be ready before a run's first request (the ChatGPT model the
    * Agent runs on, looked up; OAIY Desktop's control tools, listed). A failure
@@ -1464,6 +1472,7 @@ ${this.instructions}` : ''}`;
     for (let attempt = 0; attempt < 4; attempt++) {
       const b = this.budget(provider);
       const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
+      this.streamed = '';
       try {
         const finish = this.options.finish;
         const tools = finish && this.finishing ? this.tools.filter((t) => t.name === finish.tool) : this.tools;
@@ -1473,7 +1482,10 @@ ${this.instructions}` : ''}`;
           signal,
           reasoning: this.writingScript() ? 'high' : this.options.reasoning,
           sink: {
-            text: (delta) => emit({ type: 'text', delta }),
+            text: (delta) => {
+              this.streamed += delta;
+              emit({ type: 'text', delta });
+            },
             thinking: (delta) => emit({ type: 'thinking', delta }),
             toolStart: (index, _id, name) => emit({ type: 'tool_start', index, name }),
             toolArgs: (index, delta) => emit({ type: 'tool_draft', text: delta, start: false, index }),
@@ -1658,6 +1670,8 @@ ${this.instructions}` : ''}`;
     return true;
   }
 
+  /** What the model has written of the reply it is writing now ('' between requests): kept if the run is stopped. */
+  private streamed = '';
   /** Messages the user sent while a run was going, for the model's next step (`note`: how it reads, when not the usual way). */
   private inbox: Array<{ text: string; images: ImagePart[]; attachments: Attachment[]; note?: string }> = [];
   /** Sub-agents working for this one now (a delegated task, a picture's review), with how the user's messages read to each. */
@@ -1866,6 +1880,7 @@ ${this.instructions}` : ''}`;
         }
         await this.fit(provider, emit, signal);
         const reply = await this.request(provider, emit, signal);
+        this.streamed = '';
         emit({ type: 'usage', usage: reply.usage });
         this.turns.push({ role: 'assistant', text: reply.text, calls: reply.calls, anthropicContent: provider.type === 'anthropic' ? reply.anthropicContent : undefined, ...(reply.thinking ? { thinking: reply.thinking.length > MAX_KEPT_THINKING ? `${reply.thinking.slice(0, MAX_KEPT_THINKING)} […]` : reply.thinking } : {}) });
         if (!reply.calls.length) {
@@ -2070,7 +2085,14 @@ ${this.instructions}` : ''}`;
       if (last?.role === 'assistant' && last.calls.length) {
         const done = new Map(stepResults.map((r) => [r.id, r]));
         this.turns.push({ role: 'tool', results: last.calls.map((c) => done.get(c.id) ?? { id: c.id, name: c.name, content: 'Error: the run stopped before this tool ran', isError: true }) });
+      } else if (this.options.keepStopped && signal?.aborted && (last?.role === 'user' || last?.role === 'tool')) {
+        // Stopped as it answered: what it wrote stays its reply, and it is told the reply was stopped (else the next
+        // request would be joined to this one, as one message, and answered as if this one were still to do).
+        const written = this.streamed.trim();
+        if (written) this.turns.push({ role: 'assistant', text: written, calls: [] });
+        this.turns.push({ role: 'user', text: STOPPED_NOTE, automatic: true });
       }
+      this.streamed = '';
     } finally {
       unwatch();
       this.running = false;

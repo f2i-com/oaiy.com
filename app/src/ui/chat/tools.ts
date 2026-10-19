@@ -195,6 +195,33 @@ export function toolLabel(name: string, input?: Record<string, unknown>): string
   return words ? words[0].toUpperCase() + words.slice(1) : 'Tool';
 }
 
+/** The words the labels begin with, as what is being done ("Wrote" → "Writing"), for a call still being written or running. */
+const DOING: Record<string, string> = {
+  Added: 'Adding', Answered: 'Answering', Approved: 'Approving', Asked: 'Asking', Booked: 'Booking', Changed: 'Changing',
+  Checked: 'Checking', Chose: 'Choosing', Confirmed: 'Confirming', Cut: 'Cutting', Deleted: 'Deleting', Denied: 'Denying',
+  Edited: 'Editing', Ended: 'Ending', Enlarged: 'Enlarging', Fetched: 'Fetching', Finished: 'Finishing', Forgot: 'Forgetting',
+  Found: 'Finding', Gave: 'Giving', Inspected: 'Inspecting', Installed: 'Installing', Let: 'Letting', Listed: 'Listing',
+  Looked: 'Looking', Made: 'Making', Marked: 'Marking', Paused: 'Pausing', Pinned: 'Pinning', Put: 'Putting', Ran: 'Running',
+  Read: 'Reading', Recorded: 'Recording', Remembered: 'Remembering', Removed: 'Removing', Requested: 'Requesting',
+  Restarted: 'Restarting', Resumed: 'Resuming', Reviewed: 'Reviewing', Searched: 'Searching', Sent: 'Sending', Set: 'Setting',
+  Showed: 'Showing', Signed: 'Signing', Split: 'Splitting', Started: 'Starting', Stopped: 'Stopping', Switched: 'Switching',
+  Synced: 'Syncing', Texted: 'Texting', Told: 'Telling', Took: 'Taking', Transcribed: 'Transcribing', Unpacked: 'Unpacking',
+  Unpaired: 'Unpairing', Updated: 'Updating', Used: 'Using', Waited: 'Waiting', Wrote: 'Writing',
+};
+
+/**
+ * A tool's name as what is being done ("Writing", "Running code", "Using phone conversations"): for a call being
+ * written, or running, where toolLabel says what it did once it has.
+ */
+export function toolDoing(name: string, input?: Record<string, unknown>): string {
+  const label = toolLabel(name, input);
+  const [first, ...rest] = label.split(' ');
+  const doing = DOING[first];
+  if (doing) return [doing, ...rest].join(' ');
+  // (a label that names the tool, not what it did: "Phone conversations", a flow's own tool)
+  return `Using ${/^\p{Lu}[\p{Ll}-]*$/u.test(first) ? label[0].toLowerCase() + label.slice(1) : label}`;
+}
+
 /**
  * What an agent is doing, as a line ("network_pair node-1"): a tool's name at its start in plain words, as the
  * chat writes it (a sub-agent's activity, the step in progress).

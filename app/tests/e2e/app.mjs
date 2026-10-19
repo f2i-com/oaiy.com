@@ -35,6 +35,9 @@ const script = [
   // "Fail once more.": fails; the next message is answered, and the first one's Try again is gone with it.
   { fail: 503 },
   { text: 'The next one is answered.' },
+  // "Write a long essay.": its reply begins, then waits (the person presses Stop); "Just say hi." is a request of its own.
+  { text: 'Here is the first part of the essay', hold: true },
+  { text: 'Hi.' },
 ];
 function sse(step, n) {
   const events = [];
@@ -70,6 +73,8 @@ const model = createHttpServer((req, res) => {
       return res.end(JSON.stringify({ error: { message: 'the model is loading' } }));
     }
     res.setHeader('content-type', 'text/event-stream');
+    // (the reply's words so far, and no end: the page stops it)
+    if (step.hold) return res.write(sse({ text: step.text }, requests.length).split('data: {"choices":[{"index":0,"delta":{},"finish_reason"')[0]);
     res.end(sse(step, requests.length));
   });
 });
@@ -141,7 +146,24 @@ try {
     await page.click('button.settings-button');
     await page.waitForSelector('dialog.settings[open]');
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click());
+    // (the dialog is named; the new provider's form has focus, from its first field; its row is a radio and a button
+    // beside it, each with its own name, not a button with a radio inside)
+    const added = await page.evaluate(() => {
+      const d = document.querySelector('dialog.settings');
+      const row = d.querySelector('.provider-row.selected');
+      return {
+        name: document.getElementById(d.getAttribute('aria-labelledby') ?? '')?.textContent,
+        focus: document.activeElement === d.querySelector('.provider-form select'),
+        radio: row?.querySelector(':scope > input[type=radio]')?.getAttribute('aria-label'),
+        button: row?.querySelector(':scope > button.provider-pick')?.getAttribute('aria-pressed'),
+        nested: !!row?.querySelector('button input'),
+        role: row?.getAttribute('role'),
+      };
+    });
+    expect(added.name === 'Settings' && added.focus && added.radio === 'The Agent uses Ollama' && added.button === 'true' && !added.nested && !added.role, JSON.stringify(added));
     await page.select('dialog.settings select', 'local-other');
+    // (the form is drawn again for the kind chosen, with focus where it was)
+    expect(await page.evaluate(() => document.activeElement === document.querySelector('dialog.settings .provider-form select')), 'focus left the Kind field');
     await page.evaluate((url) => {
       const input = [...document.querySelectorAll('dialog.settings label')].find((l) => l.firstChild.textContent === 'Address').querySelector('input');
       input.value = url;
@@ -219,6 +241,50 @@ try {
     expect(requests.length === before + 2, `requests: ${requests.length - before}`);
   });
 
+  await check('a reply the person stopped is kept as far as it got, and the next message is a request of its own: the model is told the first was stopped', async () => {
+    const before = requests.length;
+    await page.type('.chat-input', 'Write a long essay.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('first part of the essay'), { timeout: 30_000 });
+    await page.click('.send-button[data-mode="stop"]');
+    await page.waitForFunction(() => [...document.querySelectorAll('.chat-log .msg.system')].some((m) => m.textContent.includes('Stopped.')) && !document.querySelector('.chat.busy'), { timeout: 30_000 });
+    await page.type('.chat-input', 'Just say hi.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Hi.') && !document.querySelector('.chat.busy'), { timeout: 30_000 });
+    expect(requests.length === before + 2, `requests: ${requests.length - before}`);
+    const text = (m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+    const sent = requests.at(-1).messages.filter((m) => m.role !== 'system');
+    const essay = sent.findIndex((m) => m.role === 'user' && text(m).includes('Write a long essay.'));
+    const hi = sent.findIndex((m) => m.role === 'user' && text(m).includes('Just say hi.'));
+    expect(essay >= 0 && hi > essay && !text(sent[essay]).includes('Just say hi.'), JSON.stringify(sent.slice(-3)));
+    expect(sent[essay + 1]?.role === 'assistant' && text(sent[essay + 1]).includes('first part of the essay'), JSON.stringify(sent.slice(-3)));
+    expect(/\[OAIY\] The person stopped this reply[\s\S]*Just say hi\./.test(text(sent[hi])), text(sent[hi]));
+  });
+
+  await check('Editor and Preview are tabs: the one shown is selected, the only tab stop, and the arrow keys move between them', async () => {
+    const tabs = () => page.evaluate(() => ({ list: document.querySelector('.center-tabs').getAttribute('role'), tabs: [...document.querySelectorAll('.center-tabs [role="tab"]')].map((t) => `${t.textContent}:${t.getAttribute('aria-selected')}:${t.tabIndex}`) }));
+    await page.click('.center-tabs [data-pane="editor"]');
+    const first = await tabs();
+    expect(first.list === 'tablist' && first.tabs.join(',') === 'Editor:true:0,Preview:false:-1', JSON.stringify(first));
+    await page.focus('.center-tabs [data-pane="editor"]');
+    await page.keyboard.press('ArrowRight');
+    const moved = await tabs();
+    expect(moved.tabs.join(',') === 'Editor:false:-1,Preview:true:0' && (await page.evaluate(() => document.activeElement?.dataset.pane)) === 'preview', JSON.stringify(moved));
+    await page.keyboard.press('ArrowLeft');
+    expect((await tabs()).tabs[0] === 'Editor:true:0', 'back to the editor');
+  });
+
+  await check('a dialog opened from the project menu gives focus back to the ⋯ button when it closes (its item is gone with the menu)', async () => {
+    await page.focus('button.menu-toggle');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('header.topbar')?.classList.contains('menu-open'));
+    await page.evaluate(() => [...document.querySelectorAll('.actions button')].find((b) => b.textContent === 'Rename').click());
+    await page.waitForSelector('dialog.modal[open] input');
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal[open]'));
+    expect((await page.evaluate(() => document.activeElement?.className)) === 'menu-toggle', 'focus was lost');
+  });
+
   await check('the project menu works from the keyboard: it opens with focus on its first item, the arrows move, Escape closes it', async () => {
     await page.focus('button.menu-toggle');
     await page.keyboard.press('Enter');
@@ -292,6 +358,9 @@ try {
     await page.type('.term-input', 'python -c "while True: pass"');
     await page.keyboard.press('Enter');
     await new Promise((r) => setTimeout(r, 1500));
+    // While it runs, the terminal says how to stop it: a Stop button, and the input's words.
+    const busy = await page.evaluate(() => ({ stop: !document.querySelector('.term-stop').hidden && document.querySelector('.term-stop').getClientRects().length > 0, placeholder: document.querySelector('.term-input').placeholder, log: document.querySelector('.term-out').getAttribute('role') }));
+    expect(busy.stop && /Ctrl\+C stops it/.test(busy.placeholder) && busy.log === 'log', `while running: ${JSON.stringify(busy)}`);
     const started = Date.now();
     await page.keyboard.down('Control');
     await page.keyboard.press('c');
@@ -299,6 +368,15 @@ try {
     await page.waitForFunction(() => !document.querySelector('.term-prompt')?.classList.contains('busy'), { timeout: 20_000 });
     expect(Date.now() - started < 15_000, `took ${Date.now() - started} ms`);
     expect((await page.$eval('.term-out', (e) => e.textContent)).includes('^C'), 'no ^C shown');
+    expect(await page.$eval('.term-stop', (b) => b.hidden), 'the Stop button stayed after the command ended');
+  });
+
+  await check('the terminal shows an error where it came, named by its command, and an exit keeps what was printed', async () => {
+    const out = await terminal(page, 'echo one; cat nothing-here.txt; echo "rc=$?"; test -f config.json || { echo "config.json is missing"; exit 1; }', 'rc=1');
+    const tail = out.slice(out.lastIndexOf('$ echo one;'));
+    expect(/\none\ncat: nothing-here\.txt: No such file or directory\nrc=1\nconfig\.json is missing\n$/.test(tail), `the terminal showed: ${JSON.stringify(tail)}`);
+    const err = await page.$$eval('.term-out .term-err', (spans) => spans.map((s) => s.textContent).at(-1));
+    expect(err === 'cat: nothing-here.txt: No such file or directory\n', `the error is not marked as one: ${JSON.stringify(err)}`);
   });
 
   await check('the same project open in two tabs is flagged in both', async () => {
@@ -323,6 +401,9 @@ try {
     await phone.waitForFunction(() => document.querySelector('.tree')?.checkVisibility());
     await phone.evaluate(() => [...document.querySelectorAll('.tree-row')].find((r) => r.textContent.includes('hello.py')).click());
     await phone.waitForFunction(() => document.querySelector('nav.tabs button.active')?.dataset.view === 'editor' && document.querySelector('.editor-title')?.textContent === '/hello.py');
+    // (its buttons are tabs: the pane shown is the one selected)
+    const bar = await phone.evaluate(() => ({ role: document.querySelector('nav.tabs').getAttribute('role'), selected: [...document.querySelectorAll('nav.tabs [role="tab"][aria-selected="true"]')].map((t) => t.dataset.view) }));
+    expect(bar.role === 'tablist' && bar.selected.join() === 'editor', JSON.stringify(bar));
     await phone.tap('.menu-toggle');
     await phone.waitForFunction(() => document.querySelector('.actions')?.checkVisibility());
     const width = await phone.evaluate(() => document.documentElement.scrollWidth);

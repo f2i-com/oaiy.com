@@ -2,11 +2,13 @@
  * Adapted from softn.com (apps/softn-studio/src/lib/aiProvider.ts),
  * Copyright f2i-com, licensed under the Apache License, Version 2.0.
  */
+import { pageHost } from '@oaiy/shared/capabilities/host';
 import { incognitoHeaderFor } from '../../privacy';
 import { CHATGPT_SIGN_IN, signInNeeded } from './chatgpt';
 import type { ProviderConfig, ChatMessage } from './types';
 import {
   describeConnectionError,
+  type ErrorContext,
   isBlockedMixedContent,
   kindForStatus,
   listModels,
@@ -362,6 +364,23 @@ function parseJSONBody(text: string): Record<string, unknown> {
 }
 
 /**
+ * What a failed call to `provider` is said with: its kind and its own name, whether the page is OAIY's own window, and
+ * whether the address is one of OAIY Desktop's routes (ChatGPT, its AI providers and a paired computer's model, whose
+ * providers desktop/agentModel.ts makes with these ids). OAIY's window reaches OAIY as it is, so a call there that never
+ * got an answer means OAIY is not answering, never that it refused the page.
+ */
+function errorContext(provider: ProviderConfig, url: string): ErrorContext {
+  return {
+    type: provider.type,
+    serverKind: provider.serverKind,
+    url,
+    name: provider.name,
+    ownWindow: pageHost().kind === 'oaiy-window',
+    viaDesktop: /^oaiy-(chatgpt|provider-|worker-)/.test(provider.id),
+  };
+}
+
+/**
  * The request both of the above make. `idle`: the clock restarts whenever
  * `touch` is called (a stream reports each chunk), instead of timing the
  * whole reply.
@@ -378,7 +397,7 @@ async function providerRequest<T>(
   // An OAIY provider is told when the open project is incognito.
   const headers = { ...providerHeaders(provider, true), ...incognitoHeaderFor(url) };
   if (typeof window !== 'undefined' && isBlockedMixedContent(url, window.location.protocol)) {
-    throw new AIProviderError('network', describeConnectionError('mixed-content', { type: provider.type, serverKind: provider.serverKind, url }));
+    throw new AIProviderError('network', describeConnectionError('mixed-content', errorContext(provider, url)));
   }
 
   // One signal for the fetch, aborted by whichever comes first: the caller
@@ -429,7 +448,7 @@ async function providerRequest<T>(
       if (signInNeeded(text)) throw new AIProviderError('http', CHATGPT_SIGN_IN, { status: resp.status, detail: detail ?? text });
       throw new AIProviderError(
         'http',
-        describeConnectionError(kindForStatus(resp.status), { type: provider.type, serverKind: provider.serverKind, url, detail }, resp.status),
+        describeConnectionError(kindForStatus(resp.status), { ...errorContext(provider, url), detail }, resp.status),
         { status: resp.status, detail: detail ?? text, code: providerCode(text) },
       );
     }
@@ -444,7 +463,7 @@ async function providerRequest<T>(
     }
     if (err instanceof AIProviderError) throw err;
     const pageOrigin = typeof window !== 'undefined' ? window.location.origin : undefined;
-    throw new AIProviderError('network', describeConnectionError('network', { type: provider.type, serverKind: provider.serverKind, url, pageOrigin }));
+    throw new AIProviderError('network', describeConnectionError('network', { ...errorContext(provider, url), pageOrigin }));
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener('abort', onCallerAbort);
@@ -519,7 +538,7 @@ export async function testProvider(
 ): Promise<ProviderTestResult> {
   let models: ModelInfo[] | null = null;
   try {
-    models = await listModels(provider, { signal: options.signal });
+    models = await listModels(provider, { signal: options.signal, ownWindow: pageHost().kind === 'oaiy-window' });
   } catch (err) {
     const error = err instanceof ProviderConnectionError ? err : null;
     // A local server may serve chat without a model list; the reply below

@@ -222,6 +222,48 @@ export function parseOutreachNote(text: string): OutreachNote | null {
   return { kind: 'lines', lines };
 }
 
+/**
+ * OAIY's notes to a model (sessions.ts, outreach.ts, agent.ts), each as the person reads it in their conversation: what
+ * happened, in a short line, never the instructions the note gives the model ("Say nothing more"). Each is matched by
+ * the words it begins with, `[OAIY] ` taken off; one this does not know is shown as it is.
+ */
+const NOTES_FOR_PEOPLE: Array<[RegExp, (m: RegExpExecArray) => string]> = [
+  // The person's own conversation: a reply they stopped, and the agent pushed on (as the live chat says it).
+  [/^The person stopped this reply/, () => 'You stopped this reply.'],
+  [/^You gave the same reply again/, () => 'It gave the same reply again without doing anything; asked for a tool call.'],
+  [/^You said what you will do, but no tool has run yet/, () => 'It said what it would do without starting; asked to start.'],
+  [/^You said what you would do next, then stopped before doing it/, () => 'Not finished yet, so the agent carries on: it said what it would do next, and was asked to do it.'],
+  [/^Your plan still has (\d+) open steps?: [\s\S]*?Carry on with step (\d+) "([^"]*)"/, (m) => `Not finished yet, so the agent carries on: ${m[1]} plan step${m[1] === '1' ? '' : 's'} open, step ${m[2]} "${m[3]}" next.`],
+  [/^Your plan from before(?: \("([^"]*)"\))? still has (\d+) open steps?/, (m) => `The plan from before${m[1] ? ` ("${m[1]}")` : ''} has ${m[2]} open step${m[2] === '1' ? '' : 's'}: the agent goes on with it if this is about that work.`],
+  [/^The last automatic check of (.+?) still reports errors/, (m) => `Not finished yet, so the agent carries on: the last check of ${m[1]} still reports errors.`],
+  [/^The flagged (\S+) is not fixed yet/, (m) => `Not finished yet, so the agent carries on: the flagged ${m[1]} is not fixed yet.`],
+  [/^Your last reply had no words\. The calls you started are going on/, () => 'The calls it started are going on: asked to say what it started.'],
+  // A call: what came of reaching the owner (the person), and of the owner having the call.
+  [/^The owner has accepted and the call is being connected/, () => 'You accepted: the call is being put through to you.'],
+  [/^The owner cannot take the call now and left this message for the caller[^:]*: "([\s\S]*)"\. Then offer/, (m) => `You could not take the call, and left them a message: "${m[1]}"`],
+  [/^The owner cannot take the call now\./, () => 'You could not take the call: the receptionist offers to take a message.'],
+  [/^Nobody could take the call\./, () => 'Nobody took the call: the receptionist offers to take a message.'],
+  [/^The transfer request was withdrawn/, () => 'The transfer was withdrawn: the receptionist offers to take a message.'],
+  [/^The owner took the call\./, () => 'You took the call.'],
+  [/^The owner handed the call back after (\S+?)\./, (m) => `You handed the call back after ${m[1]}.`],
+  [/^Your line "([\s\S]*)" was not said: nobody has accepted the call[\s\S]*?The caller heard "([\s\S]*)" instead\./, (m) => `Not said: "${m[1]}" (nobody had taken the call). The caller heard "${m[2]}".`],
+  [/^Not said: the caller spoke before you could say "([\s\S]*)", so it was dropped/, (m) => `Not said (the caller spoke first): "${m[1]}"`],
+  [/^You said you would book it, but nothing is recorded/, () => 'The receptionist said it would book it without asking for the booking: reminded to.'],
+  [/^The call ended before you recorded the result/, () => "The call ended before its result was recorded: the receptionist records it from what was said."],
+  [/^A note from the runner \(the main agent your person talks to\): ([\s\S]*)/, (m) => `From the runner: ${m[1]}`],
+  [/^The answer to your lookup "([^"\n]*)":\n?([\s\S]*)/, (m) => `Looked up "${m[1]}"${m[2] ? `\n${m[2]}` : ''}`],
+];
+
+/** A note of OAIY's to a model (`[OAIY] …`, or without it), as the person reads it: see NOTES_FOR_PEOPLE. */
+export function noteForPeople(text: string): string {
+  const note = text.replace(/^\[(?:OAIY|bot\.computer)\]\s*/, '');
+  for (const [pattern, words] of NOTES_FOR_PEOPLE) {
+    const m = pattern.exec(note);
+    if (m) return words(m);
+  }
+  return note;
+}
+
 /** `[OAIY] 📞 The call ended.` (or `…ended: why.`): the reason, '' for none; null when it is not one. */
 export function parseCallEnd(text: string): string | null {
   const m = /^\[OAIY\] 📞 The call ended(?:: ([\s\S]*?))?\.?$/.exec(text.trim());

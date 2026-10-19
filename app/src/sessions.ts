@@ -182,6 +182,11 @@ export interface SessionHooks {
   event: (session: Session, event: AgentEvent) => void;
   /** A run ended (finished, failed or cut off): what comes next is a new reply. */
   finished?: (session: Session) => void;
+  /**
+   * A note of OAIY's was written into a conversation outside a run (the call ended, the owner took it or handed it
+   * back, the runner passed something on): drawn as it comes where that conversation is shown.
+   */
+  noted?: (session: Session, turn: Turn) => void;
   /** What is known about a person changed (the phone greets them by name). */
   named?: (note: CallerNote) => void;
   /** Aokie's call screening now: a number on its blocked list is not answered or texted either (null: the phone cannot be asked). */
@@ -646,7 +651,7 @@ export function namesATime(turns: Turn[]): boolean {
 }
 
 /** What a call's agent is told when it promised a booking without requesting it. */
-const BOOKING_NUDGE = "[OAIY] You said you would book it, but nothing is recorded: request_appointment was not called, or it was refused (its answer says why). Call it now, or, where its answer says something must be checked with the caller first, ask them that. Then tell them it is requested.";
+export const BOOKING_NUDGE = "[OAIY] You said you would book it, but nothing is recorded: request_appointment was not called, or it was refused (its answer says why). Call it now, or, where its answer says something must be checked with the caller first, ask them that. Then tell them it is requested.";
 
 /** What end_call answers on a phone that does not hang up for the receptionist, when the desktop gives no words of its own. */
 const LEFT_OPEN = 'Your goodbye is being said. This phone does not let you hang up: the call stays open until the caller hangs up. Write nothing more unless they speak again, and answer them if they do.';
@@ -1520,7 +1525,7 @@ export class Sessions {
       this.deliver(session, text, true);
       return now ? 'Passed on: it acts on it now.' : 'Passed on: it reads it at its next step.';
     }
-    session.agent.turns.push({ role: 'user', text, automatic: true, at: Date.now() });
+    this.addNote(session, text);
     await this.save(session);
     this.hooks.changed();
     return 'Passed on: it reads it before its next reply.';
@@ -1769,8 +1774,10 @@ export class Sessions {
       session.handingOver = true;
       session.speech?.hush();
       this.stop(session);
-      session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.accepted, automatic: true, at: Date.now() });
+      this.addNote(session, TRANSFER_NOTES.accepted);
       void this.save(session).catch(() => {});
+      // (the call is the owner's now: its conversation says so)
+      this.hooks.changed();
       return;
     }
     if (outcome === 'cancelled') {
@@ -2099,7 +2106,7 @@ export class Sessions {
         session.callerSpeaking = false;
         session.speech?.hush();
         this.stop(session);
-        session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.handoff, automatic: true, at: Date.now() });
+        this.addNote(session, TRANSFER_NOTES.handoff);
         await this.save(session);
         this.hooks.changed();
         break;
@@ -2141,7 +2148,7 @@ export class Sessions {
     // times that mean nothing on the new one.
     session.clockZero = Date.now();
     session.played = [];
-    session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.back(callClock(seconds * 1000)), automatic: true, at: Date.now() });
+    this.addNote(session, TRANSFER_NOTES.back(callClock(seconds * 1000)));
     await this.save(session);
     this.hooks.changed();
     return session;
@@ -2178,6 +2185,13 @@ export class Sessions {
     return 'ended';
   }
 
+  /** A note of OAIY's into `session`'s conversation, outside a run: kept, and drawn as it comes where it is shown (hooks.noted). */
+  private addNote(session: Session, text: string): void {
+    const turn: Turn = { role: 'user', text, automatic: true, at: Date.now() };
+    session.agent.turns.push(turn);
+    this.hooks.noted?.(session, turn);
+  }
+
   /** The call `session` is on has ended: it stops speaking and working, and its conversation says so (and why, when it failed). */
   private async endCall(session: Session, reason = ''): Promise<void> {
     if (session.callId) this.noteEnded(session.callId, session);
@@ -2194,7 +2208,7 @@ export class Sessions {
     session.callId = undefined;
     // A call that failed (the phone's voice link broke, say) says why: the person sees it in the call's record.
     const failed = /fail|error|lost/i.test(reason) ? reason.trim() : '';
-    session.agent.turns.push({ role: 'user', text: failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.', automatic: true, at: Date.now() });
+    this.addNote(session, failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.');
     await this.save(session);
     // An outreach call that ended before its result was recorded: its agent records it now, from what was said (nothing is spoken).
     const link = session.outreach;
@@ -2218,7 +2232,7 @@ export class Sessions {
     return {
       openText: async (number, name, note) => {
         const session = await this.conversationWith(number, name, 'sms');
-        session.agent.turns.push({ role: 'user', text: note, automatic: true, at: Date.now() });
+        this.addNote(session, note);
         session.lastAt = Date.now();
         this.sort();
         await this.save(session);
