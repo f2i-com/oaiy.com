@@ -70,115 +70,26 @@ export interface CollapsibleNodeWrapperProps {
   titleExtra?: ReactNode;
 }
 
-// (`text`: the kind's word over the name, 9px: the 700 ink on the light header, about 4.5:1; the 600 was about 3:1)
-const colorMap = {
-  purple: {
-    border: 'border-purple-400 dark:border-purple-600',
-    headerBg: 'bg-purple-100 dark:bg-purple-900/50',
-    iconBg: 'bg-purple-500 dark:bg-purple-600',
-    text: 'text-purple-700 dark:text-purple-400',
-    hoverBg: 'hover:bg-purple-200/50 dark:hover:bg-purple-500/30',
-  },
-  violet: {
-    border: 'border-violet-400 dark:border-violet-600',
-    headerBg: 'bg-violet-100 dark:bg-violet-900/50',
-    iconBg: 'bg-violet-500 dark:bg-violet-600',
-    text: 'text-violet-700 dark:text-violet-400',
-    hoverBg: 'hover:bg-violet-200/50 dark:hover:bg-violet-500/30',
-  },
-  green: {
-    border: 'border-green-400 dark:border-green-600',
-    headerBg: 'bg-green-100 dark:bg-green-900/50',
-    iconBg: 'bg-green-500 dark:bg-green-600',
-    text: 'text-green-700 dark:text-green-400',
-    hoverBg: 'hover:bg-green-200/50 dark:hover:bg-green-500/30',
-  },
-  blue: {
-    border: 'border-blue-400 dark:border-blue-600',
-    headerBg: 'bg-blue-100 dark:bg-blue-900/50',
-    iconBg: 'bg-blue-500 dark:bg-blue-600',
-    text: 'text-blue-700 dark:text-blue-400',
-    hoverBg: 'hover:bg-blue-200/50 dark:hover:bg-blue-500/30',
-  },
-  amber: {
-    border: 'border-amber-400 dark:border-amber-500',
-    headerBg: 'bg-amber-100 dark:bg-amber-900/50',
-    iconBg: 'bg-amber-500 dark:bg-amber-600',
-    text: 'text-amber-700 dark:text-amber-400',
-    hoverBg: 'hover:bg-amber-200/50 dark:hover:bg-amber-500/30',
-  },
-  cyan: {
-    border: 'border-cyan-400 dark:border-cyan-600',
-    headerBg: 'bg-cyan-100 dark:bg-cyan-900/50',
-    iconBg: 'bg-cyan-500 dark:bg-cyan-600',
-    text: 'text-cyan-700 dark:text-cyan-400',
-    hoverBg: 'hover:bg-cyan-200/50 dark:hover:bg-cyan-500/30',
-  },
-  pink: {
-    border: 'border-pink-400 dark:border-pink-600',
-    headerBg: 'bg-pink-100 dark:bg-pink-900/50',
-    iconBg: 'bg-pink-500 dark:bg-pink-600',
-    text: 'text-pink-700 dark:text-pink-400',
-    hoverBg: 'hover:bg-pink-200/50 dark:hover:bg-pink-500/30',
-  },
-  emerald: {
-    border: 'border-emerald-400 dark:border-emerald-600',
-    headerBg: 'bg-emerald-100 dark:bg-emerald-900/50',
-    iconBg: 'bg-emerald-500 dark:bg-emerald-600',
-    text: 'text-emerald-700 dark:text-emerald-400',
-    hoverBg: 'hover:bg-emerald-200/50 dark:hover:bg-emerald-500/30',
-  },
-  orange: {
-    border: 'border-orange-400 dark:border-orange-600',
-    headerBg: 'bg-orange-100 dark:bg-orange-900/50',
-    iconBg: 'bg-orange-500 dark:bg-orange-600',
-    text: 'text-orange-700 dark:text-orange-400',
-    hoverBg: 'hover:bg-orange-200/50 dark:hover:bg-orange-500/30',
-  },
-  red: {
-    border: 'border-red-400 dark:border-red-600',
-    headerBg: 'bg-red-100 dark:bg-red-900/50',
-    iconBg: 'bg-red-500 dark:bg-red-600',
-    text: 'text-red-700 dark:text-red-400',
-    hoverBg: 'hover:bg-red-200/50 dark:hover:bg-red-500/30',
-  },
-  slate: {
-    border: 'border-slate-400 dark:border-slate-600',
-    headerBg: 'bg-slate-200 dark:bg-slate-700/50',
-    iconBg: 'bg-slate-500 dark:bg-slate-600',
-    text: 'text-slate-700 dark:text-slate-400',
-    hoverBg: 'hover:bg-slate-300/50 dark:hover:bg-slate-500/30',
-  },
-  indigo: {
-    border: 'border-indigo-400 dark:border-indigo-600',
-    headerBg: 'bg-indigo-100 dark:bg-indigo-900/50',
-    iconBg: 'bg-indigo-500 dark:bg-indigo-600',
-    text: 'text-indigo-700 dark:text-indigo-400',
-    hoverBg: 'hover:bg-indigo-200/50 dark:hover:bg-indigo-500/30',
-  },
-  teal: {
-    border: 'border-teal-400 dark:border-teal-600',
-    headerBg: 'bg-teal-100 dark:bg-teal-900/50',
-    iconBg: 'bg-teal-500 dark:bg-teal-600',
-    text: 'text-teal-700 dark:text-teal-400',
-    hoverBg: 'hover:bg-teal-200/50 dark:hover:bg-teal-500/30',
-  },
-};
+// The node kind's colour: `kind-<colour>` on the card, which gives it `--kind` (the hue) and `--kind-ink` (its words:
+// the 400 on the dark canvas, the 700 on paper, 4.5:1 or more on the card) in ui/src/index.css. The card is the
+// editor's own surface with a hairline of the kind's colour, its icon a tinted tile and its kind's word in that ink:
+// a flow of five kinds read as five saturated boxes, and the palette drew the same kinds another way.
+const KINDS = new Set(['purple', 'violet', 'green', 'blue', 'amber', 'cyan', 'pink', 'emerald', 'orange', 'red', 'slate', 'indigo', 'teal']);
 
 // A port's row: its handle sits in it, so the card can be as tall as its name and summary need.
 const ROW = 22;
 // (a collapsed card at least this wide: room for its ports' names side by side)
 const MIN_COLLAPSED = 232;
 
-// Run status → visible pill + screen-reader text. Semantic status hues (not the
-// customizable accent): amber=running, green=completed, red=error, and a neutral
-// grey for stopped (Stop found it running: nothing of its own went wrong), each
-// with a dark variant so it reads on both the cream and dark canvas.
+// Run status → a dot (a pill with its word on an expanded card) + screen-reader text, in the editor's state colours
+// (`.oaiy-node-status.<status>` in ui/src/index.css): the accent while it runs (as the card's ring, the rail's and the
+// queue's "running"), green when done, the danger colour on an error, and a neutral grey when stopped (Stop found it
+// running: nothing of its own went wrong).
 const STATUS_META = {
-  running: { label: 'Running', pill: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300', dot: 'bg-amber-500' },
-  completed: { label: 'Completed', pill: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300', dot: 'bg-green-500' },
-  error: { label: 'Error', pill: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300', dot: 'bg-red-500' },
-  stopped: { label: 'Stopped', pill: 'bg-slate-200 text-slate-700 dark:bg-slate-700/60 dark:text-slate-200', dot: 'bg-slate-400' },
+  running: { label: 'Running' },
+  completed: { label: 'Completed' },
+  error: { label: 'Error' },
+  stopped: { label: 'Stopped' },
 } as const;
 
 /** A port's name as its row shows it: its label, else its id (a node's one output, `output`, as "out"). */
@@ -253,7 +164,7 @@ function CollapsibleNodeWrapper({
   // Support both controlled and uncontrolled modes
   const isCollapsed = controlledCollapsed !== undefined ? controlledCollapsed : internalCollapsed;
 
-  const colors = colorMap[color] ?? colorMap.slate;
+  const kindClass = `kind-${KINDS.has(color) ? color : 'slate'}`;
   const hasIssues = validationIssues.length > 0;
   const statusClass = status ? `node-${status}` : '';
   const currentWidth = isCollapsed ? Math.max(collapsedWidth, MIN_COLLAPSED) : Math.max(width, MIN_COLLAPSED);
@@ -314,16 +225,17 @@ function CollapsibleNodeWrapper({
   const issuesText = validationIssues.map((i) => `${i.field}: ${i.message}`).join('\n');
 
   return (
+    // (`group`: the hand-made cards' resize handles show on the card's hover, `group-hover:`; with no group they never did)
     <div
-      className={`oaiy-node ${colors.border} ${statusClass} ${isCollapsed ? 'collapsed' : 'expanded'} ${className}`}
+      className={`oaiy-node group ${kindClass} ${statusClass} ${isCollapsed ? 'collapsed' : 'expanded'} ${className}`}
       style={{ width: currentWidth }}
     >
       <div className="oaiy-node-card">
         {/* Header: the kind, the name, its state; double-click (or the chevron) opens it */}
-        <div className={`oaiy-node-head ${colors.headerBg}`} onDoubleClick={toggleCollapse}>
-          <div className={`oaiy-node-icon ${colors.iconBg}`}>{icon}</div>
+        <div className="oaiy-node-head" onDoubleClick={toggleCollapse}>
+          <div className="oaiy-node-icon">{icon}</div>
           <div className="oaiy-node-names">
-            {kind && <span className={`oaiy-node-kind ${colors.text}`}>{kind}</span>}
+            {kind && <span className="oaiy-node-kind">{kind}</span>}
             <span className="oaiy-node-name" title={name}>{name}</span>
           </div>
           {titleExtra && !isCollapsed && <div className="flex items-center gap-1">{titleExtra}</div>}
@@ -332,10 +244,10 @@ function CollapsibleNodeWrapper({
               role="status"
               aria-live="polite"
               title={STATUS_META[status].label}
-              className={`flex items-center gap-1 flex-shrink-0 ${isCollapsed ? '' : 'px-1.5 py-0.5 rounded-full ' + STATUS_META[status].pill}`}
+              className={`oaiy-node-status ${status}${isCollapsed ? '' : ' pill'}`}
             >
-              <span aria-hidden="true" className={`w-1.5 h-1.5 rounded-full ${STATUS_META[status].dot} ${status === 'running' ? 'animate-pulse' : ''}`} />
-              {!isCollapsed && <span className="text-[10px] font-medium leading-none">{STATUS_META[status].label}</span>}
+              <span aria-hidden="true" className={`oaiy-node-status-dot${status === 'running' ? ' animate-pulse' : ''}`} />
+              {!isCollapsed && <span>{STATUS_META[status].label}</span>}
               <span className="sr-only">{`Status: ${STATUS_META[status].label}`}</span>
             </div>
           )}
@@ -350,17 +262,17 @@ function CollapsibleNodeWrapper({
             <div
               role="img"
               aria-label={`Validation ${validationIssues.length === 1 ? 'issue' : 'issues'}: ${issuesText.replace(/\n/g, '; ')}`}
-              className="w-4 h-4 bg-amber-500 rounded-full flex items-center justify-center flex-shrink-0"
+              className="oaiy-node-warn"
               title={issuesText}
             >
-              <svg aria-hidden="true" className="w-2.5 h-2.5 text-slate-900" fill="currentColor" viewBox="0 0 20 20">
+              <svg aria-hidden="true" fill="currentColor" viewBox="0 0 20 20">
                 <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
               </svg>
             </div>
           )}
           <button
             type="button"
-            className={`nodrag oaiy-node-toggle ${colors.hoverBg}`}
+            className="nodrag oaiy-node-toggle"
             onClick={toggleCollapse}
             title={isCollapsed ? 'Show its settings' : 'Make it compact'}
             aria-label={isCollapsed ? `Expand ${name} node` : `Collapse ${name} node`}

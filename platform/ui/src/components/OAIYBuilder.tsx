@@ -60,7 +60,9 @@ const CONNECTION_LINE_STYLE = { stroke: 'rgb(var(--accent-primary))', strokeWidt
 const PRO_OPTIONS = { hideAttribution: true } as const;
 // A small map, so it leaves the toolbar its room at the canvas's foot.
 const MINIMAP_STYLE = { width: 168, height: 112 } as const;
-const BACKGROUND_STYLE = { backgroundColor: 'rgb(var(--bg-primary))', color: 'rgb(var(--bg-tertiary))' } as const;
+// The canvas's dots in the dashboard's --dot (the background tint's tertiary was all but the paper's own colour: no
+// grid on the light canvas at all).
+const BACKGROUND_STYLE = { backgroundColor: 'rgb(var(--bg-primary))', color: 'rgb(var(--dot))' } as const;
 
 // Shared (non-per-node) dependencies that get spread into every node's data
 // object. Used as the per-id data cache's invalidation key — if any of these
@@ -1357,7 +1359,8 @@ export default function OAIYBuilder({
                   >
                     <X size={12} />
                   </button>
-                  <MiniMap nodeColor={miniMapNodeColor} style={MINIMAP_STYLE} />
+                  {/* (the part in view framed: index.css colours the frame) */}
+                  <MiniMap nodeColor={miniMapNodeColor} style={MINIMAP_STYLE} maskStrokeWidth={1.5} />
                 </>
               ) : (
                 <button type="button" onClick={() => setShowMiniMap(true)} className="oaiy-map-toggle" title="Show the map">

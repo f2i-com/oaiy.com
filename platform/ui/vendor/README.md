@@ -183,6 +183,27 @@ From a hands-on review of the flow editor (2026-10-19; cases in
   warned in the console on every page with a dropdown.
 - `oaiy-ui-components/src/index.ts`: exports the above.
 
+From a visual polish of the flow editor (2026-10-19, after the dashboard's
+sidebar redesign), likewise:
+
+- `oaiy-ui-components/src/components/CollapsibleNodeWrapper.tsx`:
+  - a card's kind colour is a class, `kind-<colour>` (the colours it knows,
+    `KINDS`; any other is `slate`), not the Tailwind border, header, icon,
+    word and hover classes per colour (`colorMap`, gone): `ui/src/index.css`
+    gives each kind `--kind` and `--kind-ink`, and draws the card on the
+    editor's surface with a hairline of that colour, a faint wash on its
+    header, its icon a tinted tile and its kind's word in that ink. Five kinds
+    were five saturated boxes; the palette drew the same kinds another way.
+  - its run state is `.oaiy-node-status <status>` (a dot, a pill with its word
+    on an expanded card), coloured in `ui/src/index.css` from the theme's
+    tokens: the accent while it runs (it was amber, inside an accent ring), not
+    `STATUS_META`'s Tailwind classes, which now hold only the words.
+  - a failed check (`validationIssues`) is marked as a notice is
+    (`oaiy-node-warn`), not a Tailwind amber dot of its own.
+  - the card is a Tailwind `group`: the hand-made cards' resize handles
+    (`group-hover:opacity-100`) show while the card is hovered; with no group
+    around them they never showed at all.
+
 ## Re-syncing from upstream (optional)
 
 If you ever want to pull newer upstream source, re-copy `src/` from the

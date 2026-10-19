@@ -1,4 +1,5 @@
 import { memo } from 'react';
+import { X } from 'lucide-react';
 import {
   BaseEdge,
   EdgeLabelRenderer,
@@ -39,15 +40,10 @@ function SelectableEdge({
     setEdges((edges) => edges.filter((edge) => edge.id !== id));
   };
 
-  // Colors based on selection state — driven by the theme tokens so edges
-  // track light/dark and the user's customizable accent. These are CSS custom
-  // properties, so they must be applied via `style` (SVG attributes don't
-  // resolve var()); selected uses the brand accent, idle uses muted text tones.
+  // Its colour by state, in index.css (`.react-flow__edge-path.lit` / `.picked`, `.oaiy-edge-arrow`): the theme's
+  // tokens and the accent, and a hover that shows (an inline stroke outranked the stylesheet's hover).
   const lit = selected || nodeSelected;
-  const strokeColor = lit
-    ? 'rgb(var(--accent-primary))'
-    : 'rgb(var(--color-text-tertiary) / 0.75)';
-  const strokeWidth = selected ? 3 : lit ? 2.25 : 1.75;
+  const state = selected ? 'picked' : lit ? 'lit' : '';
 
   return (
     <>
@@ -62,10 +58,7 @@ function SelectableEdge({
           orient="auto"
           markerUnits="userSpaceOnUse"
         >
-          <path
-            d="M1,1 L8,4.5 L1,8 L2.5,4.5 Z"
-            style={{ fill: strokeColor }}
-          />
+          <path d="M1,1 L8,4.5 L1,8 L2.5,4.5 Z" className={`oaiy-edge-arrow ${state}`} />
         </marker>
       </defs>
       {/* Invisible wider path for easier clicking */}
@@ -83,10 +76,7 @@ function SelectableEdge({
         id={id}
         path={edgePath}
         markerEnd={`url(#arrow-${id})`}
-        style={{
-          stroke: strokeColor,
-          strokeWidth: strokeWidth,
-        }}
+        className={state}
       />
       {/* Delete button when selected */}
       {selected && (
@@ -99,11 +89,9 @@ function SelectableEdge({
             }}
             className="nodrag nopan"
           >
-            <button
-              onClick={handleDelete}
-              className="bg-red-600 hover:bg-red-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs cursor-pointer shadow-lg border border-red-400 transition-colors"
-            >
-              ×
+            {/* (named: its one glyph was its name to a screen reader) */}
+            <button type="button" onClick={handleDelete} className="oaiy-edge-delete" aria-label="Delete this wire" title="Delete this wire">
+              <X size={12} strokeWidth={2.5} aria-hidden="true" />
             </button>
           </div>
         </EdgeLabelRenderer>

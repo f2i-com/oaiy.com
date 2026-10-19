@@ -42,14 +42,15 @@
   gap: 5px;
   height: 26px;
   padding: 0 10px;
-  border: 1px solid rgb(var(--accent-primary));
+  border: 1px solid rgb(var(--accent-primary) / 0.7);
   border-radius: 7px;
   background: rgb(var(--accent-primary) / 0.12);
-  color: rgb(var(--accent-primary));
+  color: rgb(var(--accent-hover));
   font-size: 12px;
   font-weight: 650;
+  transition: background 0.12s, border-color 0.12s;
 }
-.oaiy-sections-new:hover { background: rgb(var(--accent-primary) / 0.2); }
+.oaiy-sections-new:hover { border-color: rgb(var(--accent-primary)); background: rgb(var(--accent-primary) / 0.2); }
 .oaiy-sections-tabs {
   display: flex;
   min-width: 0;
@@ -63,16 +64,21 @@
 .oaiy-sections-tabs > button {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   height: 22px;
   padding: 0 9px;
   border-radius: 6px;
   color: rgb(var(--color-text-secondary));
   font-size: 12px;
   font-weight: 600;
+  transition: background 0.14s, color 0.14s;
 }
-.oaiy-sections-tabs > button:hover { color: rgb(var(--color-text-primary)); background: rgb(var(--color-bg-tertiary, var(--color-bg-secondary))); }
-.oaiy-sections-tabs > button.active { color: rgb(var(--accent-primary)); background: rgb(var(--accent-primary) / 0.12); }
+.oaiy-sections-tabs > button > svg { flex: none; color: rgb(var(--color-text-faint)); transition: color 0.14s; }
+.oaiy-sections-tabs > button:hover { color: rgb(var(--color-text-primary)); background: rgb(var(--color-bg-tertiary) / 0.7); }
+.oaiy-sections-tabs > button:hover > svg { color: rgb(var(--color-text-primary)); }
+/* The open one as the dashboard's tabs mark it: a tint, its words at full strength, its icon in the accent. */
+.oaiy-sections-tabs > button.active { color: rgb(var(--color-text-primary)); background: rgb(var(--accent-primary) / 0.14); }
+.oaiy-sections-tabs > button.active > svg { color: rgb(var(--accent-primary)); }
 /* Narrow: the tabs keep their icons, and say their names in their titles. */
 @media (max-width: 900px) {
   .oaiy-sections-tabs > button > span { display: none; }
@@ -191,6 +197,8 @@
   --shadow-lg: 0 18px 50px rgb(0 0 0 / 0.28);
   /* A card on a page: the dashboard's --shadow-card. */
   --shadow-card: 0 10px 26px rgb(0 0 0 / 0.1);
+  /* A node's card on the canvas, and what floats over it (the toolbar, the zoom buttons): the dashboard's --shadow-node. */
+  --shadow-node: 0 1px 2px rgb(0 0 0 / 0.18), 0 10px 28px rgb(0 0 0 / 0.17);
   --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.3);
   --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.3);
 }
@@ -268,6 +276,7 @@
   --shadow-md: 2px 2px 0 rgb(50 42 30 / 0.045);
   --shadow-lg: 6px 6px 0 rgb(28 24 18 / 0.13);
   --shadow-card: 2px 2px 0 rgb(50 42 30 / 0.045);
+  --shadow-node: 2px 2px 0 rgb(50 42 30 / 0.06);
   --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.18);
   --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.22);
 }
@@ -314,6 +323,7 @@
   --shadow-md: 0 10px 26px rgb(0 0 0 / 0.18), 0 2px 4px -2px rgb(0 0 0 / 0.3);
   --shadow-lg: 0 18px 50px rgb(0 0 0 / 0.28);
   --shadow-card: 0 10px 26px rgb(0 0 0 / 0.1);
+  --shadow-node: 0 1px 2px rgb(0 0 0 / 0.18), 0 10px 28px rgb(0 0 0 / 0.17);
   --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.3);
   --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.3);
 }
@@ -375,6 +385,36 @@ select:focus-visible,
   outline: 2px solid transparent;
   outline-offset: 2px;
   box-shadow: 0 0 0 2px rgb(var(--color-bg-elevated)), 0 0 0 5px rgb(var(--accent-primary));
+}
+
+/* Words in the accent: on Prism Lab's dark surfaces the accent itself is about 4.4:1, so words take its lighter hover
+   ink, as the dashboard's --primary-text (Paper Circuit's accent is already ink-weight). */
+:root:not(.light) .text-accent { color: rgb(var(--accent-hover)); }
+
+/* A field shows its focus as the dashboard's fields do: its frame in the accent and a soft ring round it, not the
+   buttons' offset ring (on a field that drew its own ring as well, the two stood one round the other). At the global
+   rule's weight, so a component's own field rules still win. */
+:where(:root.oaiy-app) :is(input, textarea, select):where(:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file], [type=button], [type=submit], .monaco-editor *)):focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: 0;
+  border-color: rgb(var(--accent-primary));
+  box-shadow: 0 0 0 3px rgb(var(--accent-primary) / 0.2);
+}
+
+/* A menu field: one chevron of the theme's own, in its muted ink (the system's differs between WebKit and Chrome, and
+   ignored the field's colours), as the dashboard's. Only the image and the room for it: each field keeps its colours. */
+:root.oaiy-app select:not([multiple]):not([size]) {
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2398a6bd' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-position: right 10px center;
+  background-repeat: no-repeat;
+  background-size: 10px 6px;
+  padding-right: 28px;
+  text-overflow: ellipsis;
+}
+:root.oaiy-app.light select:not([multiple]):not([size]) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2368645e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 /* Focus within for custom components */
@@ -804,9 +844,11 @@ select:focus-visible,
   outline: none !important;
 }
 
-.react-flow__node.selected>div {
-  box-shadow: 0 0 0 2px rgb(var(--accent-primary));
-  border-radius: var(--radius-lg);
+/* Picked: a ring in the accent just outside the card (an outline, so the card keeps its own shadow, and a run's
+   state, a ring on the card itself, still shows on a picked card: a failed node that was selected showed no red). */
+.react-flow__node.selected:not(.react-flow__node-default, .react-flow__node-input) > div {
+  outline: 2px solid rgb(var(--accent-primary));
+  outline-offset: 2px;
 }
 
 /* A node of a kind this editor does not have (a plugin's that is not installed, a desktop
@@ -876,41 +918,56 @@ select:focus-visible,
 }
 
 /* A node's card (CollapsibleNodeWrapper): compact until expanded; its name in full, its ports a row each with their
-   handles in them, a short line of what it is set to. Nothing is cut: the card grows to what it says. */
+   handles in them, a short line of what it is set to. Nothing is cut: the card grows to what it says.
+
+   Drawn as the dashboard draws a card: the editor's own surface, a hairline frame, the --shadow-node shadow. The
+   node kind's colour (`kind-<colour>`, below) is a hairline in the frame, a faint wash on the header, the icon's tinted
+   tile and the kind's word: a flow of five kinds read as five saturated boxes, each header a block of colour. A run's
+   state is a ring inside the selection's (the accent, outside it), so a failed card that is selected still says so. */
 .oaiy-node {
+  --kind: 100 116 139;
+  --kind-ink: 148 163 184;
   position: relative;
-  border-width: 1px;
-  border-style: solid;
-  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, rgb(var(--kind)) 28%, rgb(var(--color-border-primary)));
+  border-radius: var(--r-card);
   background: rgb(var(--color-bg-secondary));
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.12), 0 8px 22px rgb(0 0 0 / 0.14);
-  transition: box-shadow 0.15s;
+  box-shadow: var(--shadow-node);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-.oaiy-node:hover { box-shadow: 0 1px 2px rgb(0 0 0 / 0.14), 0 10px 28px rgb(0 0 0 / 0.2); }
-.oaiy-node-card { border-radius: 11px; }
+:root.light .oaiy-node { border-color: color-mix(in srgb, rgb(var(--kind)) 34%, rgb(var(--color-border-primary))); }
+/* (:root: over the light theme's frame) */
+:root .oaiy-node:hover { border-color: color-mix(in srgb, rgb(var(--kind)) 48%, rgb(var(--color-border-strong))); }
+.oaiy-node-card { border-radius: calc(var(--r-card) - 1px); }
 .oaiy-node-head {
   display: flex;
-  min-height: 40px;
+  min-height: 38px;
   align-items: flex-start;
-  gap: 9px;
+  gap: 8px;
   border-bottom: 1px solid rgb(var(--color-border-secondary));
-  border-radius: 11px 11px 0 0;
-  padding: 8px 6px 8px 10px;
+  border-radius: calc(var(--r-card) - 1px) calc(var(--r-card) - 1px) 0 0;
+  background: rgb(var(--kind) / 0.08);
+  padding: 7px 5px 7px 9px;
   user-select: none;
 }
-.oaiy-node.collapsed .oaiy-node-head { border-bottom-color: rgb(var(--color-border-secondary) / 0.6); }
-/* (white on the card's header, on its kind's colour; the palette's icons are in their kind's colour, below) */
-.oaiy-node-icon { display: grid; width: 24px; height: 24px; flex: none; place-items: center; border-radius: 7px; }
-.oaiy-node-head > .oaiy-node-icon { color: #fff; }
-.oaiy-node-icon svg { width: 13px; height: 13px; }
-/* What the host says of the node (its model offline or not installed): a mark in the header, a line on the folded
-   card, the whole notice on the expanded one. */
+:root.light .oaiy-node-head { border-bottom-color: rgb(var(--color-border-secondary) / 0.8); background: rgb(var(--kind) / 0.06); }
+/* The kind's icon, a tinted tile, as in the palette. */
+.oaiy-node-icon { display: grid; width: 24px; height: 24px; flex: none; place-items: center; border-radius: var(--r-sm); }
+.oaiy-node-head > .oaiy-node-icon {
+  border: 1px solid rgb(var(--kind) / 0.34);
+  background: rgb(var(--kind) / 0.16);
+  color: rgb(var(--kind-ink));
+}
+:root.light .oaiy-node-head > .oaiy-node-icon { background: rgb(var(--kind) / 0.11); }
+.oaiy-node-icon svg { width: 13px; height: 13px; color: inherit; }
+/* What the host says of the node (its model offline or not installed), and a check it fails: a mark in the header, a
+   line on the folded card, the whole notice on the expanded one. */
 .oaiy-node-warn {
   display: grid;
   width: 18px;
   height: 18px;
   flex: none;
   place-items: center;
+  margin-top: 3px;
   border-radius: 999px;
   background: rgb(245 158 11);
   color: rgb(23 23 23);
@@ -925,18 +982,29 @@ select:focus-visible,
   line-height: 1.35;
 }
 .oaiy-node-notice.expanded {
-  margin: 0 0 10px;
-  border: 1px solid rgb(245 158 11 / 0.6);
-  border-radius: 6px;
-  background: rgb(245 158 11 / 0.1);
+  margin: 0;
+  border: 1px solid rgb(var(--signal-amber) / 0.4);
+  border-left: 2px solid rgb(245 158 11);
+  border-radius: var(--r-sm);
+  background: rgb(var(--signal-amber) / 0.08);
   padding: 6px 8px;
 }
-.oaiy-node-names { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; padding-top: 1px; }
-.oaiy-node-kind { font-size: 9px; font-weight: 700; letter-spacing: 0.07em; line-height: 1.2; text-transform: uppercase; }
+.oaiy-node-names { display: flex; min-width: 0; flex: 1; flex-direction: column; justify-content: center; gap: 1px; min-height: 24px; }
+/* The kind over the node's own name: the dashboard's small mono capitals, in the kind's ink. */
+.oaiy-node-kind {
+  color: rgb(var(--kind-ink));
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  line-height: 1.25;
+  text-transform: uppercase;
+}
 .oaiy-node-name {
   color: rgb(var(--color-text-primary));
   font-size: 12.5px;
-  font-weight: 600;
+  font-weight: 620;
+  letter-spacing: -0.005em;
   line-height: 1.3;
   overflow-wrap: anywhere;
 }
@@ -946,25 +1014,57 @@ select:focus-visible,
   height: 22px;
   flex: none;
   place-items: center;
+  margin-top: 1px;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--r-sm);
   background: transparent;
   color: rgb(var(--color-text-faint));
   cursor: pointer;
-  opacity: 0.7;
+  opacity: 0.75;
+  transition: background 0.12s, color 0.12s, opacity 0.12s;
 }
 .oaiy-node:hover .oaiy-node-toggle { opacity: 1; }
+.oaiy-node-toggle:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
 /* (reached with Tab: the ring every other control shows) */
 .oaiy-node-toggle:focus-visible,
-.oaiy-node-body summary:focus-visible { border-radius: 6px; opacity: 1; outline: 2px solid rgb(var(--accent-primary)); outline-offset: 1px; }
-.oaiy-node-ports { padding: 5px 0; }
+.oaiy-node-body summary:focus-visible { border-radius: var(--r-sm); opacity: 1; outline: 2px solid rgb(var(--accent-primary)); outline-offset: 1px; box-shadow: none; }
+/* Its run state in the header: a dot (folded), a pill with its word (expanded). */
+.oaiy-node-status {
+  --tone: var(--color-text-faint);
+  --tone-ink: var(--color-text-secondary);
+  display: inline-flex;
+  height: 24px;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: rgb(var(--tone-ink));
+}
+.oaiy-node-status.running { --tone: var(--accent-primary); --tone-ink: var(--accent-hover); }
+.oaiy-node-status.completed { --tone: var(--signal-green); --tone-ink: var(--signal-green); }
+.oaiy-node-status.error { --tone: var(--signal-danger); --tone-ink: var(--signal-danger-ink); }
+:root.light .oaiy-node-status { color: color-mix(in srgb, rgb(var(--tone-ink)) 80%, black); }
+.oaiy-node-status-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: rgb(var(--tone)); box-shadow: 0 0 0 3px rgb(var(--tone) / 0.16); }
+.oaiy-node-status.pill {
+  height: 20px;
+  margin-top: 2px;
+  border: 1px solid rgb(var(--tone) / 0.32);
+  border-radius: 999px;
+  background: rgb(var(--tone) / 0.1);
+  padding: 0 7px 0 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+}
+.oaiy-node-status.pill .oaiy-node-status-dot { width: 6px; height: 6px; box-shadow: none; }
+.oaiy-node-ports { padding: 6px 0; }
 .oaiy-node-port {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 14px;
+  padding: 0 13px;
   color: rgb(var(--color-text-secondary));
   font-size: 11px;
   line-height: 1.25;
@@ -972,43 +1072,54 @@ select:focus-visible,
 .oaiy-node-port > span { overflow-wrap: anywhere; }
 .oaiy-node-port > span:last-of-type { text-align: right; }
 .oaiy-node-preview {
-  border-top: 1px solid rgb(var(--color-border-secondary) / 0.6);
+  border-top: 1px solid rgb(var(--color-border-secondary) / 0.7);
   padding: 7px 12px 9px;
   color: rgb(var(--color-text-faint));
   font-size: 11px;
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
-.oaiy-node-body { display: flex; flex-direction: column; gap: 12px; border-top: 1px solid rgb(var(--color-border-secondary)); padding: 12px; }
+.oaiy-node-body { display: flex; flex-direction: column; gap: 11px; border-top: 1px solid rgb(var(--color-border-secondary)); padding: 11px 12px 12px; }
 /* A card's fields look the same whichever card draws them: the cards made from a definition and the hand-made ones
    had three sizes of text, four borders and a focus colour per node between them. Size, ink, border and focus ring
    only (a field's font, padding and width stay its card's); not the code editor's own hidden textarea. */
 .oaiy-node-body :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), textarea, select):not(.monaco-editor *) {
   border: 1px solid rgb(var(--color-border-primary));
-  border-radius: 6px;
-  background-color: rgb(var(--color-bg-elevated));
+  border-radius: var(--r-sm);
+  background-color: rgb(var(--color-bg-tertiary) / 0.6);
   color: rgb(var(--color-text-primary));
   font-size: 12px;
   line-height: 1.45;
+  transition: border-color 0.12s, box-shadow 0.12s;
 }
-.oaiy-node-body :is(input, textarea, select):not(.monaco-editor *)::placeholder { color: rgb(var(--color-text-muted)); opacity: 1; }
+:root.light .oaiy-node-body :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), textarea, select):not(.monaco-editor *) { background-color: rgb(var(--color-bg-elevated)); }
+.oaiy-node-body :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), textarea, select):not(.monaco-editor *):hover:not(:focus):not(:disabled) { border-color: rgb(var(--color-border-strong)); }
+.oaiy-node-body :is(input, textarea, select):not(.monaco-editor *)::placeholder { color: rgb(var(--color-text-faint)); opacity: 1; }
 .oaiy-node-body :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), textarea, select):not(.monaco-editor *):focus {
   border-color: rgb(var(--accent-primary));
   outline: none;
   box-shadow: 0 0 0 2px rgb(var(--accent-primary) / 0.22);
 }
 .oaiy-node-body :is(input, textarea, select):not(.monaco-editor *):disabled { cursor: not-allowed; opacity: 0.55; }
+/* Its fields' names and help, one voice on every card (the cards set them in four greys and three sizes). */
+.oaiy-node-body label { color: rgb(var(--color-text-secondary)); font-size: 11px; font-weight: 600; letter-spacing: 0.005em; }
+.oaiy-node-body .text-\[10px\] { color: rgb(var(--color-text-faint)); font-size: 10.5px; line-height: 1.4; }
+.oaiy-node-body details > summary { color: rgb(var(--color-text-faint)); font-size: 11px; font-weight: 600; }
+.oaiy-node-body details > summary:hover { color: rgb(var(--color-text-primary)); }
 /* its handles: small dots on the edge, a wider ring to aim at */
 .react-flow__handle.oaiy-port {
-  width: 12px !important;
-  height: 12px !important;
-  min-width: 12px !important;
-  min-height: 12px !important;
+  width: 10px !important;
+  height: 10px !important;
+  min-width: 10px !important;
+  min-height: 10px !important;
   border: 2px solid rgb(var(--color-bg-secondary));
+  transition: box-shadow 0.12s;
 }
-.react-flow__handle-left.oaiy-port { left: -6px; }
-.react-flow__handle-right.oaiy-port { right: -6px; }
-.react-flow__handle.oaiy-port::after { position: absolute; inset: -7px; border-radius: 50%; content: ''; }
+.react-flow__handle-left.oaiy-port { left: -5px; }
+.react-flow__handle-right.oaiy-port { right: -5px; }
+.react-flow__handle-top.oaiy-port { top: -5px; }
+.react-flow__handle-bottom.oaiy-port { bottom: -5px; }
+.react-flow__handle.oaiy-port::after { position: absolute; inset: -8px; border-radius: 50%; content: ''; }
 /* What a port carries (portTypeClass in oaiy-ui-components): one colour per kind of value on every card, the Macro
    node's set, so a picture's port is pink wherever it is. Node kinds' own hues, not theme tokens (as nodeSwatches). */
 .react-flow__handle.oaiy-port.port-any { background: #94a3b8; }
@@ -1025,59 +1136,108 @@ select:focus-visible,
 .react-flow__handle.oaiy-port.connectingto { box-shadow: 0 0 0 4px rgb(var(--signal-danger) / 0.45); }
 .react-flow__handle.oaiy-port.connectingto.valid { box-shadow: 0 0 0 4px rgb(var(--signal-green) / 0.5); }
 
-/* Edge styles */
+/* The kinds' colours: the hue (the 500), and its ink (the 400 on the dark card, the 700 on paper: 4.5:1 or more). */
+.kind-purple { --kind: 168 85 247; --kind-ink: 192 132 252; }
+.kind-violet { --kind: 139 92 246; --kind-ink: 167 139 250; }
+.kind-indigo { --kind: 99 102 241; --kind-ink: 129 140 248; }
+.kind-blue { --kind: 59 130 246; --kind-ink: 96 165 250; }
+.kind-cyan { --kind: 6 182 212; --kind-ink: 34 211 238; }
+.kind-teal { --kind: 20 184 166; --kind-ink: 45 212 191; }
+.kind-emerald { --kind: 16 185 129; --kind-ink: 52 211 153; }
+.kind-green { --kind: 34 197 94; --kind-ink: 74 222 128; }
+.kind-lime { --kind: 132 204 22; --kind-ink: 163 230 53; }
+.kind-amber { --kind: 245 158 11; --kind-ink: 251 191 36; }
+.kind-orange { --kind: 249 115 22; --kind-ink: 251 146 60; }
+.kind-red { --kind: 239 68 68; --kind-ink: 248 113 113; }
+.kind-pink { --kind: 236 72 153; --kind-ink: 244 114 182; }
+.kind-slate,
+.kind-gray { --kind: 100 116 139; --kind-ink: 148 163 184; }
+:root.light .kind-purple { --kind-ink: 126 34 206; }
+:root.light .kind-violet { --kind-ink: 109 40 217; }
+:root.light .kind-indigo { --kind-ink: 67 56 202; }
+:root.light .kind-blue { --kind-ink: 29 78 216; }
+:root.light .kind-cyan { --kind-ink: 14 116 144; }
+:root.light .kind-teal { --kind-ink: 15 118 110; }
+:root.light .kind-emerald { --kind-ink: 4 120 87; }
+:root.light .kind-green { --kind-ink: 21 128 61; }
+:root.light .kind-lime { --kind-ink: 77 124 15; }
+:root.light .kind-amber { --kind-ink: 180 83 9; }
+:root.light .kind-orange { --kind-ink: 194 65 12; }
+:root.light .kind-red { --kind-ink: 185 28 28; }
+:root.light .kind-pink { --kind-ink: 190 24 93; }
+:root.light .kind-slate,
+:root.light .kind-gray { --kind-ink: 51 65 85; }
+
+/* Wires (edges/SelectableEdge.tsx): a quiet line in the faint ink; the accent on a picked node's wires, and on the
+   wire picked (heavier). Its arrowhead in the same colour. */
 .react-flow__edge {
   pointer-events: all;
   cursor: pointer;
 }
-
 .react-flow__edge-path {
-  stroke: rgb(var(--color-text-muted));
-  stroke-width: 2;
+  stroke: rgb(var(--color-text-faint) / 0.6);
+  stroke-width: 1.6;
   pointer-events: stroke;
-  transition: stroke var(--transition-fast), stroke-width var(--transition-fast);
+  transition: stroke 0.14s, stroke-width 0.14s;
 }
-
-.react-flow__edge.selected .react-flow__edge-path {
-  stroke: rgb(var(--accent-primary));
-  stroke-width: 3;
+.react-flow__edge:hover .react-flow__edge-path { stroke: rgb(var(--color-text-secondary)); stroke-width: 2; }
+.react-flow__edge-path.lit { stroke: rgb(var(--accent-primary) / 0.85); stroke-width: 2; }
+.react-flow__edge.selected .react-flow__edge-path,
+.react-flow__edge-path.picked { stroke: rgb(var(--accent-primary)); stroke-width: 2.5; }
+.react-flow__edge:hover .react-flow__edge-path.lit,
+.react-flow__edge:hover .react-flow__edge-path.picked { stroke: rgb(var(--accent-hover)); }
+.oaiy-edge-arrow { fill: rgb(var(--color-text-faint) / 0.75); transition: fill 0.14s; }
+.react-flow__edge:hover .oaiy-edge-arrow { fill: rgb(var(--color-text-secondary)); }
+.oaiy-edge-arrow.lit,
+.oaiy-edge-arrow.picked { fill: rgb(var(--accent-primary)); }
+/* The picked wire's delete button, on its middle. */
+.oaiy-edge-delete {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid rgb(var(--signal-danger) / 0.5);
+  border-radius: 999px;
+  background: rgb(var(--color-bg-secondary));
+  box-shadow: var(--shadow-node);
+  color: rgb(var(--signal-danger-ink));
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
 }
-
-.react-flow__edge:hover .react-flow__edge-path {
-  stroke: rgb(var(--color-text-secondary));
-  stroke-width: 3;
-}
-
-.react-flow__edge.selected:hover .react-flow__edge-path {
-  stroke: rgb(var(--accent-hover));
-}
+.oaiy-edge-delete:hover { border-color: rgb(var(--signal-danger)); background: color-mix(in srgb, rgb(var(--signal-danger)) 14%, rgb(var(--color-bg-secondary))); }
 
 /* ============================================
    CUSTOM SCROLLBAR
    ============================================ */
 
+/* The dashboard's: a slim thumb in the strong border, the faint ink under the pointer, on no track (10px of room with
+   3px of it clear on each side, so the thumb is 4px and easy to catch). */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 10px;
+  height: 10px;
 }
 
-::-webkit-scrollbar-track {
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
   background-color: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background-color: rgb(var(--color-text-muted) / 0.4);
-  border-radius: var(--radius-full);
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background: rgb(var(--color-border-strong));
+  background-clip: content-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background-color: rgb(var(--color-text-muted) / 0.65);
+  background: rgb(var(--color-text-faint));
+  background-clip: content-box;
 }
 
 /* Firefox scrollbar */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgb(var(--color-text-muted) / 0.4) transparent;
+  scrollbar-color: rgb(var(--color-border-strong)) transparent;
 }
 
 /* ============================================
@@ -1118,48 +1278,38 @@ select,
    NODE STATUS ANIMATIONS
    ============================================ */
 
-@keyframes pulse-glow {
-
-  0%,
-  100% {
-    box-shadow: 0 0 5px 0 rgb(var(--accent-primary) / 0.5),
-      0 0 20px 0 rgb(var(--accent-primary) / 0.3);
-  }
-
-  50% {
-    box-shadow: 0 0 10px 2px rgb(var(--accent-primary) / 0.8),
-      0 0 40px 5px rgb(var(--accent-primary) / 0.4);
-  }
+/* Running: the frame in the accent and a ring that breathes, softly (a glow 40px wide pulsed around it). */
+@keyframes node-breathe {
+  0%, 100% { box-shadow: var(--shadow-node), 0 0 0 3px rgb(var(--accent-primary) / 0.22); }
+  50% { box-shadow: var(--shadow-node), 0 0 0 5px rgb(var(--accent-primary) / 0.08); }
 }
 
+/* Done: a green ring that fades (its dot in the header stays). */
 @keyframes success-flash {
-  0% {
-    box-shadow: 0 0 20px 5px rgba(34, 197, 94, 0.8);
-  }
-
-  100% {
-    box-shadow: none;
-  }
+  0% { box-shadow: var(--shadow-node), 0 0 0 4px rgb(var(--signal-green) / 0.45); }
+  100% { box-shadow: var(--shadow-node), 0 0 0 4px rgb(var(--signal-green) / 0); }
 }
 
-.node-running {
-  animation: pulse-glow 1.5s ease-in-out infinite;
-  border-color: rgb(var(--accent-primary)) !important;
+:root .oaiy-node.node-running {
+  border-color: rgb(var(--accent-primary));
+  animation: node-breathe 1.6s ease-in-out infinite;
 }
 
-.node-completed {
-  animation: success-flash 0.5s ease-out forwards;
+:root .oaiy-node.node-completed {
+  animation: success-flash 0.6s ease-out forwards;
 }
 
-.node-error {
-  box-shadow: 0 0 15px 3px rgba(239, 68, 68, 0.6);
-  border-color: rgb(239 68 68) !important;
+/* Failed: the frame and a ring in the danger colour, the header's wash too. (`:root`: over the light theme's frame.) */
+:root .oaiy-node.node-error {
+  border-color: rgb(var(--signal-danger));
+  box-shadow: var(--shadow-node), 0 0 0 3px rgb(var(--signal-danger) / 0.2);
 }
+:root .oaiy-node.node-error .oaiy-node-head { background: rgb(var(--signal-danger) / 0.08); }
 
 /* Stopped where the run was stopped: no failure of its own, so no red. */
-.node-stopped {
-  border-style: dashed !important;
-  border-color: rgb(var(--color-text-faint)) !important;
+:root .oaiy-node.node-stopped {
+  border-style: dashed;
+  border-color: rgb(var(--color-text-faint));
 }
 
 /* ============================================
@@ -1572,7 +1722,10 @@ select,
 }
 .oaiy-skip:focus { transform: translateY(0); }
 
-/* ---------- sidebar ---------- */
+/* ---------- sidebar ----------
+   A browser tab's own sidebar (OAIY's window has OAIY's beside the editor), drawn as the dashboard's (sidebar.css):
+   compact rows whose icons are faint until hovered, the open section a tinted row with its icon in the accent and a
+   short bar at its edge, the type's sizes and the 8px radii. */
 
 .oaiy-sidebar {
   z-index: 10;
@@ -1581,91 +1734,107 @@ select,
   flex-direction: column;
   border-right: 1px solid rgb(var(--color-border-primary));
   background: rgb(var(--color-bg-secondary));
-  padding: 25px 14px 16px;
+  padding: 20px 10px 12px;
 }
 
-.oaiy-brand { padding: 0 12px; }
+.oaiy-brand { padding: 0 10px; }
 .oaiy-brand > strong {
   display: block;
-  font-size: 34px;
-  font-weight: 650;
-  letter-spacing: 0.11em;
+  font-size: 28px;
+  font-weight: 680;
+  letter-spacing: 0.13em;
   line-height: 1;
 }
 .oaiy-brand > span {
   display: block;
-  margin-top: 8px;
+  margin-top: 6px;
   color: rgb(var(--color-text-secondary));
-  font-size: 12px;
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
 }
 .oaiy-brand > small {
   display: block;
-  margin-top: 11px;
-  color: rgb(var(--color-text-tertiary));
+  margin-top: 8px;
+  color: rgb(var(--color-text-faint));
   font-size: 11px;
 }
 
 .oaiy-new {
   display: flex;
   width: 100%;
-  height: 42px;
+  height: 36px;
   align-items: center;
-  gap: 9px;
-  margin-top: 28px;
+  gap: 10px;
+  margin-top: 20px;
   border: 1px solid rgb(var(--color-border-strong));
-  border-radius: 9px;
+  border-radius: 8px;
   background: transparent;
   color: rgb(var(--color-text-primary));
-  padding: 0 11px;
-  font-size: 12px;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 560;
   text-align: left;
-  transition: border-color 0.14s, background 0.14s;
+  transition: border-color 0.12s, background 0.12s;
 }
 .oaiy-new { cursor: pointer; }
+.oaiy-new > svg { flex: none; color: rgb(var(--accent-primary)); }
 .oaiy-new:hover {
   border-color: rgb(var(--accent-primary));
-  background: rgb(var(--accent-primary) / 0.14);
+  background: rgb(var(--accent-primary) / 0.12);
 }
 .oaiy-new > span { flex: 1; min-width: 0; }
 
 
-.oaiy-nav { display: flex; flex-direction: column; gap: 4px; margin-top: 18px; }
+.oaiy-nav { display: flex; flex-direction: column; gap: 1px; margin-top: 14px; }
 .oaiy-nav button,
 .oaiy-settings-btn {
   position: relative;
   display: flex;
   width: 100%;
-  min-height: 43px;
+  min-height: 34px;
   align-items: center;
-  gap: 13px;
+  gap: 10px;
   border: 0;
   border-radius: 8px;
   background: transparent;
   color: rgb(var(--color-text-secondary));
-  padding: 0 12px;
+  padding: 0 10px;
   font-size: 13px;
+  font-weight: 520;
   text-align: left;
   cursor: pointer;
-  transition: background 0.14s, color 0.14s;
+  transition: background 0.12s, color 0.12s;
 }
+.oaiy-nav button > svg,
+.oaiy-settings-btn > svg { width: 17px; height: 17px; flex: none; color: rgb(var(--color-text-faint)); transition: color 0.12s; }
 .oaiy-nav button:hover,
 .oaiy-settings-btn:hover {
   background: rgb(var(--color-bg-tertiary) / 0.7);
   color: rgb(var(--color-text-primary));
 }
+.oaiy-nav button:hover > svg,
+.oaiy-settings-btn:hover > svg { color: rgb(var(--color-text-primary)); }
+.oaiy-nav button:focus-visible,
+.oaiy-settings-btn:focus-visible { outline: 2px solid rgb(var(--accent-primary)); outline-offset: -2px; box-shadow: none; }
+/* The section that is open: a tinted row, its icon in the accent, and a short bar at its edge. */
 .oaiy-nav button.active,
 .oaiy-settings-btn.active {
-  background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent) border-box;
+  background: rgb(var(--accent-primary) / 0.14);
   color: rgb(var(--color-text-primary));
+  font-weight: 620;
 }
+:root.light .oaiy-nav button.active,
+:root.light .oaiy-settings-btn.active { background: rgb(var(--accent-primary) / 0.1); }
+.oaiy-nav button.active > svg,
+.oaiy-settings-btn.active > svg { color: rgb(var(--accent-primary)); }
 .oaiy-nav button.active::before,
 .oaiy-settings-btn.active::before {
   position: absolute;
-  top: 9px;
-  bottom: 9px;
+  top: 8px;
+  bottom: 8px;
   left: 0;
-  width: 2px;
-  border-radius: 4px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
   background: rgb(var(--accent-primary));
   content: '';
 }
@@ -1686,6 +1855,7 @@ select,
   font-style: normal;
   font-weight: 700;
 }
+.oaiy-nav button > .oaiy-tab-count { margin-left: auto; }
 
 .oaiy-fill { flex: 1; }
 
@@ -1694,20 +1864,21 @@ select,
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 12px 0;
+  margin: 12px 0 10px;
   border: 1px solid rgb(var(--color-border-primary));
-  border-radius: 9px;
-  background: rgb(var(--color-bg-tertiary) / 0.7);
-  padding: 11px;
+  border-radius: var(--r-ctl);
+  background: rgb(var(--color-bg-tertiary) / 0.6);
+  padding: 10px;
 }
 .oaiy-engine > svg { flex: none; color: rgb(var(--signal-green)); }
-.oaiy-engine.off > svg { color: rgb(var(--color-text-tertiary)); }
+.oaiy-engine.off > svg { color: rgb(var(--color-text-faint)); }
 .oaiy-engine > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.oaiy-engine strong { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+.oaiy-engine strong { font-size: 10.5px; font-weight: 680; letter-spacing: 0.08em; text-transform: uppercase; }
 .oaiy-engine small {
   overflow: hidden;
-  color: rgb(var(--color-text-tertiary));
-  font-size: 9px;
+  color: rgb(var(--color-text-faint));
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1728,8 +1899,9 @@ select,
 
 .oaiy-engine-get {
   display: block;
-  margin: -4px 0 12px;
-  color: rgb(var(--color-text-tertiary));
+  margin: -4px 0 10px;
+  padding: 0 2px;
+  color: rgb(var(--color-text-faint));
   font-size: 11px;
   line-height: 1.45;
 }
@@ -1743,10 +1915,11 @@ select,
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 11px 12px 0;
-  color: rgb(var(--color-text-tertiary));
-  font-size: 10px;
+  padding: 10px 10px 0;
+  color: rgb(var(--color-text-faint));
+  font-size: 11px;
 }
+.oaiy-trust > svg { flex: none; }
 
 /* ---------- workspace ---------- */
 
@@ -1772,15 +1945,18 @@ select,
   backdrop-filter: blur(18px);
 }
 .oaiy-title { min-width: 0; }
+/* Where the page is (OAIY › Flows): the dashboard's small mono capitals, in the faint ink (the tertiary was about
+   4.5:1 at 9px). */
 .oaiy-title > span {
   display: flex;
   align-items: center;
   gap: 6px;
   margin-bottom: 5px;
-  color: rgb(var(--color-text-tertiary));
-  font-size: 9px;
+  color: rgb(var(--color-text-faint));
+  font-family: var(--font-mono);
+  font-size: 9.5px;
   font-weight: 650;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 .oaiy-title > div { display: flex; min-width: 0; align-items: center; gap: 9px; }
@@ -1837,8 +2013,9 @@ select,
   border-radius: 999px;
   background: rgb(var(--color-bg-tertiary) / 0.7);
   color: rgb(var(--color-text-secondary));
-  padding: 3px 7px;
-  font-size: 9px;
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   font-style: normal;
   white-space: nowrap;
 }
@@ -1850,15 +2027,15 @@ select,
 .oaiy-chip.accent {
   border-color: rgb(var(--accent-primary) / 0.35);
   background: rgb(var(--accent-primary) / 0.14);
-  color: rgb(var(--accent-primary));
+  color: rgb(var(--accent-hover));
 }
 .oaiy-saved {
   display: inline-flex;
   flex: none;
   align-items: center;
   gap: 5px;
-  color: rgb(var(--color-text-tertiary));
-  font-size: 10px;
+  color: rgb(var(--color-text-faint));
+  font-size: 11px;
   white-space: nowrap;
 }
 .oaiy-saved svg { color: rgb(var(--signal-green)); }
@@ -1932,9 +2109,10 @@ select,
   cursor: pointer;
   transition: background 0.14s, color 0.14s;
 }
+/* (the tertiary surface: the elevated one is the topbar's and the panels' own, so a hover there showed nothing) */
 .oaiy-icon-btn:hover,
 .oaiy-icon-btn.active {
-  background: rgb(var(--color-bg-elevated));
+  background: rgb(var(--color-bg-tertiary));
   color: rgb(var(--color-text-primary));
 }
 .oaiy-icon-btn.on {
@@ -1979,7 +2157,7 @@ select,
   z-index: 9;
   display: grid;
   min-width: 0;
-  min-height: 64px;
+  min-height: 56px;
   grid-template-columns: auto minmax(200px, 1fr) auto auto auto;
   align-items: center;
   gap: 9px;
@@ -2009,18 +2187,19 @@ select,
   background: rgb(var(--color-text-tertiary));
   box-shadow: 0 0 0 4px rgb(var(--color-text-tertiary) / 0.12);
 }
-.oaiy-dock > button > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.oaiy-dock > button strong { font-size: 9px; }
-.oaiy-dock > button small { color: rgb(var(--color-text-tertiary)); font-size: 8px; }
+/* (its words at the editor's smallest sizes: they were 8 and 9px) */
+.oaiy-dock > button > span { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.oaiy-dock > button strong { font-size: 11.5px; font-weight: 620; }
+.oaiy-dock > button small { color: rgb(var(--color-text-faint)); font-size: 10.5px; }
 .oaiy-dock > button:hover { color: rgb(var(--color-text-primary)); }
 .oaiy-dock > button:hover small { color: rgb(var(--color-text-secondary)); }
 .oaiy-dock-url {
   display: flex;
   min-width: 0;
-  height: 35px;
+  height: 34px;
   align-items: center;
   border: 1px solid rgb(var(--color-border-primary));
-  border-radius: 7px;
+  border-radius: var(--r-ctl);
   background: rgb(var(--color-bg-tertiary) / 0.7);
   padding-left: 11px;
 }
@@ -2030,7 +2209,7 @@ select,
   flex: 1;
   color: rgb(var(--color-text-secondary));
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2041,9 +2220,10 @@ select,
   border: 1px solid rgb(var(--accent-primary) / 0.35);
   border-radius: 999px;
   background: rgb(var(--accent-primary) / 0.14);
-  color: rgb(var(--accent-primary));
-  padding: 5px 7px;
-  font-size: 8px;
+  color: rgb(var(--accent-hover));
+  padding: 4px 9px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   font-style: normal;
   white-space: nowrap;
 }
@@ -2052,19 +2232,11 @@ select,
   background: rgb(var(--signal-green) / 0.12);
   color: rgb(var(--signal-green));
 }
-.oaiy-dock > button:last-child { color: rgb(var(--color-text-secondary)); font-size: 9px; }
+.oaiy-dock > button:last-child { color: rgb(var(--color-text-secondary)); font-size: 12px; font-weight: 600; }
 
 /* ---------- react-flow, in the prototype's voice ---------- */
 
-.oaiy-canvas-wrap .react-flow__edge-path {
-  stroke: rgb(var(--color-border-strong));
-  stroke-width: 1.7;
-}
-.oaiy-canvas-wrap .react-flow__edge.selected .react-flow__edge-path,
-.oaiy-canvas-wrap .react-flow__edge:hover .react-flow__edge-path {
-  stroke: rgb(var(--accent-primary));
-  stroke-width: 2.25;
-}
+/* (the wires are drawn above, with their states) */
 .oaiy-canvas-wrap .react-flow__edge.animated .react-flow__edge-path {
   stroke-width: 2.25;
   filter: drop-shadow(0 0 4px currentColor);
@@ -2075,30 +2247,44 @@ select,
   stroke: rgb(var(--color-border-primary));
   stroke-width: 0.5;
 }
+/* The zoom buttons: the toolbar's surface and voice, a column of small icon buttons whose icons brighten on hover. */
 .oaiy-canvas-wrap .react-flow__controls {
   overflow: hidden;
   border: 1px solid rgb(var(--color-border-primary)) !important;
-  border-radius: 8px !important;
-  background: rgb(var(--color-bg-secondary)) !important;
-  box-shadow: var(--shadow-lg) !important;
+  border-radius: var(--r-ctl) !important;
+  background: rgb(var(--color-bg-secondary) / 0.94) !important;
+  box-shadow: var(--shadow-node) !important;
+  padding: 2px;
+  backdrop-filter: blur(12px);
 }
 .oaiy-canvas-wrap .react-flow__controls button {
-  width: 30px !important;
-  height: 30px !important;
-  border-bottom-color: rgb(var(--color-border-primary)) !important;
-  background: rgb(var(--color-bg-secondary)) !important;
-  fill: rgb(var(--color-text-secondary)) !important;
+  width: 28px !important;
+  height: 28px !important;
+  border: 0 !important;
+  border-radius: var(--r-sm);
+  background: transparent !important;
+  color: rgb(var(--color-text-faint)) !important;
+  padding: 0;
+  transition: background 0.12s, color 0.12s;
 }
+.oaiy-canvas-wrap .react-flow__controls button + button { margin-top: 1px; }
+.oaiy-canvas-wrap .react-flow__controls button svg { max-width: 11px; max-height: 11px; fill: currentColor !important; }
+.oaiy-canvas-wrap .react-flow__controls button:hover:not(:disabled) { background: rgb(var(--color-bg-tertiary)) !important; color: rgb(var(--color-text-primary)) !important; }
+.oaiy-canvas-wrap .react-flow__controls button:disabled { opacity: 0.4; }
+.oaiy-canvas-wrap .react-flow__controls button:focus-visible { outline: 2px solid transparent; box-shadow: inset 0 0 0 2px rgb(var(--accent-primary) / 0.65); }
+/* The map: a small framed card; the part of the flow in view clear, the rest under a veil, its frame in the accent. */
 .oaiy-canvas-wrap .react-flow__minimap {
+  --xy-minimap-mask-stroke-color: rgb(var(--accent-primary) / 0.45);
   overflow: hidden;
   border: 1px solid rgb(var(--color-border-primary)) !important;
-  border-radius: 8px !important;
-  background: rgb(var(--color-bg-secondary)) !important;
-  box-shadow: var(--shadow-lg) !important;
+  border-radius: var(--r-ctl) !important;
+  background: rgb(var(--color-bg-secondary) / 0.94) !important;
+  box-shadow: var(--shadow-node) !important;
 }
 .oaiy-canvas-wrap .react-flow__minimap-mask {
-  fill: rgb(var(--color-bg-primary) / 0.78);
+  fill: rgb(var(--color-bg-canvas) / 0.72);
 }
+:root.light .oaiy-canvas-wrap .react-flow__minimap-mask { fill: rgb(var(--color-text-primary) / 0.05); }
 .oaiy-canvas-wrap .react-flow__minimap-node {
   fill: rgb(var(--accent-primary) / 0.55);
   stroke: none;
@@ -2418,11 +2604,85 @@ select,
 .oaiy-search { position: relative; display: flex; min-width: 0; align-items: center; }
 .oaiy-search > svg { position: absolute; left: 10px; color: rgb(var(--color-text-faint)); pointer-events: none; }
 .oaiy-search > .oaiy-input { padding-left: 31px; padding-right: 30px; }
-/* Properties' advanced settings, folded as on a node's card. */
+/* ---------- Properties: the picked node's settings ----------
+   Which node (its kind's colour as a rail, its kind in the dashboard's small mono capitals, its name, its id), then
+   its fields as the editor's other forms draw theirs: a small-capital label, a 32px field on the soft surface, the
+   line of help under it in the faint ink. The fields set their own Tailwind sizes (oaiy-ui-components' fields), which
+   these outrank: they had a 12px label, a 30px field and 10px help, unlike every form beside them. */
+.oaiy-props-head { display: flex; align-items: stretch; gap: 11px; border-bottom: 1px solid rgb(var(--color-border-secondary)); padding: 12px 14px 12px 14px; }
+.oaiy-props-swatch { width: 3px; flex: none; margin: 2px 0; border-radius: 3px; }
+.oaiy-props-kind {
+  overflow: hidden;
+  color: rgb(var(--color-text-faint));
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.oaiy-props-id { overflow: hidden; color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.oaiy-props-fields { display: flex; flex-direction: column; gap: 15px; padding: 14px; }
+.oaiy-props-fields.more { padding: 12px 0 0; }
+.oaiy-props-fields > div,
+.oaiy-props-fields.more > div { gap: 6px; }
+.oaiy-props label:not(:has(input[type=checkbox], input[type=radio])) {
+  color: rgb(var(--color-text-faint));
+  font-size: 10.5px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.oaiy-props label:has(input[type=checkbox], input[type=radio]) > span { color: rgb(var(--color-text-primary)); font-size: 12.5px; font-weight: 520; }
+.oaiy-props :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), select):not(.oaiy-prop-name) {
+  min-height: 32px;
+  border-radius: var(--r-ctl);
+  padding-top: 0;
+  padding-bottom: 0;
+  padding-left: 10px;
+  font-size: 12.5px;
+}
+.oaiy-props :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), select, textarea):not(.oaiy-prop-name) {
+  border-color: rgb(var(--color-border-primary));
+  background-color: rgb(var(--color-bg-tertiary) / 0.7);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.oaiy-props textarea { border-radius: var(--r-ctl); padding: 7px 10px; font-size: 12.5px; line-height: 1.5; }
+.oaiy-props textarea.font-mono { font-size: 11.5px; }
+.oaiy-props :is(input:not([type=checkbox], [type=radio], [type=range], [type=color], [type=file]), select, textarea):not(.oaiy-prop-name):hover:not(:focus):not(:disabled) { border-color: rgb(var(--color-border-strong)); }
+.oaiy-props :is(input, select, textarea):not(.oaiy-prop-name):focus { border-color: rgb(var(--accent-primary)); box-shadow: 0 0 0 3px rgb(var(--accent-primary) / 0.2); outline: none; }
+.oaiy-props .text-\[10px\] { color: rgb(var(--color-text-faint)); font-size: 11px; line-height: 1.45; }
+.oaiy-props :is(input, textarea):not(.oaiy-prop-name)::placeholder { color: rgb(var(--color-text-faint)); opacity: 1; }
+.oaiy-props .oaiy-note { margin: 0; }
+/* Its advanced settings, folded as on a node's card: a heading with a turning chevron, under a hairline. */
 .oaiy-prop-more { border-top: 1px solid rgb(var(--color-border-secondary)); padding-top: 12px; }
-.oaiy-prop-more > summary { color: rgb(var(--color-text-tertiary)); cursor: pointer; font-size: 12px; font-weight: 600; }
+.oaiy-prop-more > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: rgb(var(--color-text-secondary));
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  list-style: none;
+  transition: color 0.12s;
+}
+.oaiy-prop-more > summary::-webkit-details-marker { display: none; }
+.oaiy-prop-more > summary::before {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  margin: 0 3px 0 1px;
+  border-right: 1.5px solid rgb(var(--color-text-faint));
+  border-bottom: 1.5px solid rgb(var(--color-text-faint));
+  content: '';
+  transform: rotate(-45deg);
+  transition: transform 0.14s;
+}
+.oaiy-prop-more[open] > summary::before { transform: rotate(45deg) translate(-1px, -1px); }
 .oaiy-prop-more > summary:hover { color: rgb(var(--color-text-primary)); }
-.oaiy-prop-more > summary:focus-visible { border-radius: 4px; outline: 2px solid rgb(var(--accent-primary)); outline-offset: 2px; }
+.oaiy-prop-more > summary:focus-visible { border-radius: 4px; outline: 2px solid rgb(var(--accent-primary)); outline-offset: 2px; box-shadow: none; }
 /* (its own clear button, not the browser's as well: the two stood side by side) */
 .oaiy-search > input[type='search']::-webkit-search-cancel-button { display: none; -webkit-appearance: none; appearance: none; }
 .oaiy-search > button {
@@ -2461,6 +2721,8 @@ select,
   white-space: nowrap;
 }
 .oaiy-pill.dot::before { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; content: ''; }
+/* On paper a pill's words are its colour deepened a little: green and cyan on their own tint were about 4.1:1. */
+:root.light .oaiy-pill { color: color-mix(in srgb, rgb(var(--tone)) 80%, black); }
 .oaiy-pill.ok { --tone: var(--signal-green); }
 .oaiy-pill.err { --tone: var(--signal-danger-ink); }
 .oaiy-pill.warn { --tone: var(--signal-amber); }
@@ -2543,22 +2805,28 @@ select,
   cursor: pointer;
   transition: background 0.14s, color 0.14s;
 }
-.oaiy-seg > button > svg { flex: none; opacity: 0.85; }
+.oaiy-seg > button > svg { flex: none; color: rgb(var(--color-text-faint)); transition: color 0.14s; }
 .oaiy-seg > button > small { color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 10px; font-weight: 500; }
 .oaiy-seg > button:hover { background: rgb(var(--color-bg-tertiary) / 0.7); color: rgb(var(--color-text-primary)); }
+.oaiy-seg > button:hover > svg { color: rgb(var(--color-text-primary)); }
+/* The one picked as the dashboard's tabs mark it: a tint, its words at full strength, its icon (and count) in the accent. */
 .oaiy-seg > button.active,
-.oaiy-seg > button[aria-selected='true'] { background: rgb(var(--accent-primary) / 0.12); color: rgb(var(--accent-primary)); }
+.oaiy-seg > button[aria-selected='true'] { background: rgb(var(--accent-primary) / 0.14); color: rgb(var(--color-text-primary)); }
+:root.light .oaiy-seg > button.active,
+:root.light .oaiy-seg > button[aria-selected='true'] { background: rgb(var(--accent-primary) / 0.1); }
+.oaiy-seg > button.active > svg,
+.oaiy-seg > button[aria-selected='true'] > svg { color: rgb(var(--accent-primary)); }
 .oaiy-seg > button.active > small,
-.oaiy-seg > button[aria-selected='true'] > small { color: inherit; opacity: 0.75; }
+.oaiy-seg > button[aria-selected='true'] > small { color: rgb(var(--accent-hover)); }
 :root:not(.light) .oaiy-seg > button.active,
-:root:not(.light) .oaiy-seg > button[aria-selected='true'] { box-shadow: inset 0 0 0 1px rgb(var(--accent-primary) / 0.3); }
+:root:not(.light) .oaiy-seg > button[aria-selected='true'] { box-shadow: inset 0 0 0 1px rgb(var(--accent-primary) / 0.26); }
 .oaiy-seg > button:focus-visible { outline-offset: -2px; }
 
 /* The editor's sections in OAIY's window: the same segmented control. */
 .oaiy-sections-tabs { border-radius: calc(var(--r-ctl) + 2px); background: rgb(var(--color-bg-canvas)); padding: 3px; }
 .oaiy-sections-tabs > button { height: 26px; border-radius: var(--r-sm); padding: 0 11px; }
-.oaiy-sections-tabs > button.active { background: rgb(var(--accent-primary) / 0.12); }
-:root:not(.light) .oaiy-sections-tabs > button.active { box-shadow: inset 0 0 0 1px rgb(var(--accent-primary) / 0.3); }
+:root.light .oaiy-sections-tabs > button.active { background: rgb(var(--accent-primary) / 0.1); }
+:root:not(.light) .oaiy-sections-tabs > button.active { box-shadow: inset 0 0 0 1px rgb(var(--accent-primary) / 0.26); }
 .oaiy-sections-new { height: 28px; border-radius: var(--r-ctl); padding: 0 11px; }
 
 /* ---------- a section as a page ---------- */
@@ -2598,7 +2866,7 @@ select,
 }
 .oaiy-page-titles { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .oaiy-kicker {
-  color: rgb(var(--accent-primary));
+  color: rgb(var(--accent-hover));
   font-size: 10px;
   font-weight: 720;
   letter-spacing: 0.13em;
@@ -2633,32 +2901,34 @@ select,
 /* A section with pages of its own: the dashboard's sidebar voice, beside the page. */
 .oaiy-subnav {
   display: flex;
-  width: 204px;
+  width: 200px;
   flex: none;
   flex-direction: column;
-  gap: 3px;
+  gap: 1px;
   border-right: 1px solid rgb(var(--color-border-primary));
   background: rgb(var(--color-bg-secondary));
-  padding: 16px 10px;
+  padding: 14px 10px;
   overflow-y: auto;
 }
+/* Its pages as the dashboard's sidebar draws its sections: compact rows, faint icons that brighten on hover. */
 .oaiy-subnav > button {
   position: relative;
   display: flex;
-  min-height: 38px;
+  min-height: 34px;
   align-items: center;
-  gap: 11px;
+  gap: 10px;
   border: 0;
-  border-radius: var(--r-ctl);
+  border-radius: 8px;
   background: transparent;
   color: rgb(var(--color-text-secondary));
-  padding: 0 12px;
+  padding: 0 10px;
   font-size: 13px;
+  font-weight: 520;
   text-align: left;
   cursor: pointer;
-  transition: background 0.14s, color 0.14s;
+  transition: background 0.12s, color 0.12s;
 }
-.oaiy-subnav > button > svg { flex: none; }
+.oaiy-subnav > button > svg { width: 16px; height: 16px; flex: none; color: rgb(var(--color-text-faint)); transition: color 0.12s; }
 .oaiy-subnav > button > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .oaiy-subnav > button > em {
   flex: none;
@@ -2672,14 +2942,16 @@ select,
   font-weight: 600;
 }
 .oaiy-subnav > button:hover { background: rgb(var(--color-bg-tertiary) / 0.7); color: rgb(var(--color-text-primary)); }
-.oaiy-subnav > button.active { background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent) border-box; color: rgb(var(--color-text-primary)); }
+.oaiy-subnav > button:hover > svg { color: rgb(var(--color-text-primary)); }
+.oaiy-subnav > button.active { background: rgb(var(--accent-primary) / 0.14); color: rgb(var(--color-text-primary)); font-weight: 620; }
+:root.light .oaiy-subnav > button.active { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-subnav > button.active::before {
   position: absolute;
-  top: 9px;
-  bottom: 9px;
+  top: 8px;
+  bottom: 8px;
   left: 0;
-  width: 2px;
-  border-radius: 4px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
   background: rgb(var(--accent-primary));
   content: '';
 }
@@ -2699,7 +2971,7 @@ select,
   }
   .oaiy-subnav > button { min-height: 32px; flex: none; gap: 7px; padding: 0 10px; }
   .oaiy-subnav > button > span { overflow: visible; }
-  .oaiy-subnav > button.active::before { top: auto; right: 10px; bottom: -8px; left: 10px; width: auto; height: 2px; }
+  .oaiy-subnav > button.active::before { top: auto; right: 10px; bottom: -8px; left: 10px; width: auto; height: 2px; border-radius: 2px; }
   .oaiy-page-head { padding: 14px 16px 12px; }
   .oaiy-page-body { padding: 0 16px 24px; }
 }
@@ -2720,6 +2992,7 @@ select,
 .oaiy-card.flush { gap: 0; padding: 0; overflow: hidden; }
 .oaiy-card.flush > .oaiy-card-head { padding: 12px 16px; border-bottom: 1px solid rgb(var(--color-border-secondary)); }
 .oaiy-card-head { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+/* A card's title as the dashboard's section titles: a short accent dash, 13px (no glow under the dash: calmer). */
 .oaiy-card-title {
   display: flex;
   min-width: 0;
@@ -2727,19 +3000,19 @@ select,
   gap: 9px;
   margin: 0;
   color: rgb(var(--color-text-primary));
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 650;
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
+  line-height: 1.35;
 }
 .oaiy-card-title::before {
-  width: 14px;
+  width: 12px;
   height: 2px;
   flex: none;
   border-radius: 2px;
   background: rgb(var(--accent-primary));
   content: '';
 }
-:root:not(.light) .oaiy-card-title::before { box-shadow: 0 0 8px rgb(var(--accent-primary)); }
 .oaiy-card-count { color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
 .oaiy-card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .oaiy-card-text { margin: 0; color: rgb(var(--color-text-secondary)); font-size: 12.5px; line-height: 1.55; }
@@ -2774,14 +3047,15 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
   gap: 6px;
   border: 1px dashed rgb(var(--color-border-primary));
   border-radius: var(--r-ctl);
+  background: rgb(var(--color-bg-tertiary) / 0.3);
   color: rgb(var(--color-text-secondary));
   padding: 24px 18px;
   text-align: center;
 }
-.oaiy-empty > svg { color: rgb(var(--color-text-faint)); }
+.oaiy-empty > svg { margin-bottom: 2px; color: rgb(var(--color-text-faint)); }
 .oaiy-empty-title { margin: 0; color: rgb(var(--color-text-primary)); font-size: 13px; font-weight: 600; }
 .oaiy-empty-text { margin: 0; max-width: 420px; color: rgb(var(--color-text-faint)); font-size: 12px; line-height: 1.55; }
-.oaiy-empty.bare { border: 0; }
+.oaiy-empty.bare { border: 0; background: transparent; }
 
 /* The older empty-state classes, in the same voice. */
 .empty-state { color: rgb(var(--color-text-secondary)); }
@@ -2845,7 +3119,8 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-dialog-titles { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; padding-top: 1px; }
 .oaiy-dialog-titles h2 { margin: 0; font-size: 15px; font-weight: 640; letter-spacing: -0.01em; line-height: 1.35; }
 .oaiy-dialog-titles p { margin: 0; color: rgb(var(--color-text-secondary)); font-size: 12.5px; line-height: 1.5; }
-.oaiy-dialog-head > .oaiy-icon-btn { margin: -4px 0 0 auto; }
+.oaiy-dialog-head > .oaiy-icon-btn { margin: -4px 0 0 auto; color: rgb(var(--color-text-faint)); }
+.oaiy-dialog-head > .oaiy-icon-btn:hover { color: rgb(var(--color-text-primary)); }
 .oaiy-dialog-body {
   display: flex;
   min-height: 0;
@@ -2906,8 +3181,9 @@ button.oaiy-row:focus-visible,
   max-height: calc(100vh - 16px);
   overflow-y: auto;
   flex-direction: column;
+  gap: 1px;
   border: 1px solid rgb(var(--color-border-strong));
-  border-radius: var(--r-ctl);
+  border-radius: calc(var(--r-ctl) + 2px);
   background: rgb(var(--color-bg-secondary));
   box-shadow: var(--shadow-lg);
   padding: 4px;
@@ -2921,20 +3197,27 @@ button.oaiy-row:focus-visible,
   border-radius: var(--r-sm);
   background: transparent;
   color: rgb(var(--color-text-primary));
-  padding: 8px 10px;
+  padding: 7px 10px;
   font-size: 12.5px;
+  font-weight: 520;
   text-align: left;
   cursor: pointer;
+  transition: background 0.1s;
 }
-.oaiy-menu > button > svg { flex: none; margin-top: 1px; color: rgb(var(--color-text-secondary)); }
+/* (its icon faint until the item is pointed at, as the dashboard's sidebar) */
+.oaiy-menu > button > svg { flex: none; margin-top: 2px; color: rgb(var(--color-text-faint)); transition: color 0.1s; }
 .oaiy-menu > button > span { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
-.oaiy-menu > button small { color: rgb(var(--color-text-faint)); font-size: 11.5px; line-height: 1.4; }
+.oaiy-menu > button small { color: rgb(var(--color-text-faint)); font-size: 11.5px; font-weight: 400; line-height: 1.4; }
 .oaiy-menu > button:hover,
 .oaiy-menu > button:focus-visible { background: rgb(var(--accent-primary) / 0.1); outline: 0; }
+.oaiy-menu > button:hover > svg,
+.oaiy-menu > button:focus-visible > svg { color: rgb(var(--accent-primary)); }
 .oaiy-menu > button:disabled { cursor: not-allowed; opacity: 0.45; }
 .oaiy-menu > button:disabled:hover { background: transparent; }
 .oaiy-menu > button.danger { color: rgb(var(--signal-danger-ink)); }
 .oaiy-menu > button.danger > svg { color: currentColor; }
+.oaiy-menu > button.danger:hover,
+.oaiy-menu > button.danger:focus-visible { background: rgb(var(--signal-danger) / 0.1); }
 .oaiy-menu > hr { margin: 4px 2px; border: 0; border-top: 1px solid rgb(var(--color-border-secondary)); }
 
 /* ---------- the flows rail ---------- */
@@ -2947,41 +3230,44 @@ button.oaiy-row:focus-visible,
   border-right: 1px solid rgb(var(--color-border-primary));
   background: rgb(var(--color-bg-secondary));
 }
-.oaiy-rail-head { display: flex; flex: none; flex-direction: column; gap: 10px; padding: 14px 12px 12px; border-bottom: 1px solid rgb(var(--color-border-secondary)); }
-.oaiy-rail-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.oaiy-rail-head { display: flex; flex: none; flex-direction: column; gap: 10px; padding: 12px 10px 11px; border-bottom: 1px solid rgb(var(--color-border-secondary)); }
+.oaiy-rail-title { display: flex; min-height: 26px; align-items: center; justify-content: space-between; gap: 8px; padding-left: 2px; }
 .oaiy-rail-title h2 { margin: 0; color: rgb(var(--color-text-primary)); font-size: 13px; font-weight: 650; letter-spacing: 0.01em; }
 .oaiy-rail-title h2 small { margin-left: 6px; color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
 .oaiy-rail .oaiy-seg { display: flex; }
-.oaiy-rail-list { min-height: 0; flex: 1; overflow-y: auto; padding: 8px; }
-.oaiy-rail-list ul { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.oaiy-rail-list { min-height: 0; flex: 1; overflow-y: auto; padding: 8px 10px; }
+.oaiy-rail-list ul { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0; list-style: none; }
+/* A flow, as the dashboard's sidebar draws a section: a compact row, its icon faint until hovered; the open one tinted,
+   its icon in the accent and a short bar at its edge. */
 .oaiy-flow-item {
   position: relative;
   display: flex;
   min-width: 0;
-  height: 34px;
+  height: 32px;
   align-items: center;
   gap: 9px;
   border: 1px solid transparent;
-  border-radius: var(--r-ctl);
+  border-radius: 8px;
   color: rgb(var(--color-text-secondary));
-  padding: 0 6px 0 10px;
+  padding: 0 4px 0 10px;
   font-size: 13px;
+  font-weight: 520;
   cursor: pointer;
-  transition: background 0.14s, color 0.14s;
+  transition: background 0.12s, color 0.12s;
 }
-.oaiy-flow-item > svg { flex: none; color: rgb(var(--color-text-faint)); }
+.oaiy-flow-item > svg { width: 15px; height: 15px; flex: none; color: rgb(var(--color-text-faint)); transition: color 0.12s; }
 .oaiy-flow-item > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .oaiy-flow-item:hover { background: rgb(var(--color-bg-tertiary) / 0.7); color: rgb(var(--color-text-primary)); }
-/* (the gradient laid over the border box as well: from the padding box it repeated into the
-   transparent border, a hairline of accent down the row's right edge) */
-.oaiy-flow-item.active { background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent) border-box; color: rgb(var(--color-text-primary)); }
+.oaiy-flow-item:hover > svg { color: rgb(var(--color-text-primary)); }
+.oaiy-flow-item.active { background: rgb(var(--accent-primary) / 0.14); color: rgb(var(--color-text-primary)); font-weight: 600; }
+:root.light .oaiy-flow-item.active { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-flow-item.active::before {
   position: absolute;
   top: 8px;
   bottom: 8px;
-  left: 0;
-  width: 2px;
-  border-radius: 4px;
+  left: -1px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
   background: rgb(var(--accent-primary));
   content: '';
 }
@@ -3006,16 +3292,17 @@ button.oaiy-row:focus-visible,
 .oaiy-flow-item.active .oaiy-flow-more,
 .oaiy-flow-item .oaiy-flow-more:focus-visible { opacity: 1; }
 .oaiy-flow-item .oaiy-flow-more:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
-.oaiy-flow-rename { height: 34px; }
+.oaiy-flow-rename { height: 32px; }
 /* A flow's name over its description, and what the rail shows beside them. */
-.oaiy-flow-item.has-desc { height: auto; min-height: 34px; padding-top: 5px; padding-bottom: 5px; }
+.oaiy-flow-item.has-desc { height: auto; min-height: 32px; padding-top: 5px; padding-bottom: 5px; }
 .oaiy-flow-item > .oaiy-flow-text { display: flex; flex-direction: column; gap: 1px; }
 .oaiy-flow-text > span,
 .oaiy-flow-text > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.oaiy-flow-text > small { color: rgb(var(--color-text-faint)); font-size: 11px; line-height: 1.35; }
+.oaiy-flow-text > small { color: rgb(var(--color-text-faint)); font-size: 11px; font-weight: 400; line-height: 1.35; }
 .oaiy-flow-item > .oaiy-flow-shared { flex: none; color: rgb(var(--signal-green)); }
 .oaiy-flow-item.example > svg { color: rgb(var(--signal-amber)); }
-.oaiy-flow-item .oaiy-flow-add { display: inline-flex; flex: none; align-items: center; gap: 3px; color: rgb(var(--accent-primary)); font-size: 11.5px; font-weight: 600; }
+.oaiy-flow-item .oaiy-flow-add { display: inline-flex; flex: none; align-items: center; gap: 3px; border-radius: var(--r-sm); color: rgb(var(--accent-hover)); padding: 2px 6px; font-size: 11.5px; font-weight: 600; transition: background 0.12s; }
+.oaiy-flow-item:hover .oaiy-flow-add { background: rgb(var(--accent-primary) / 0.12); }
 .oaiy-rail-tools { display: flex; align-items: center; gap: 2px; }
 /* The flows' order, in words beside its arrows. */
 .oaiy-sort-btn {
@@ -3044,26 +3331,31 @@ button.oaiy-row:focus-visible,
   padding: 1px 9px;
   font-size: 11px;
   cursor: pointer;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
 }
-.oaiy-tags > button:hover { color: rgb(var(--color-text-primary)); }
+.oaiy-tags > button:hover { border-color: rgb(var(--color-border-strong)); color: rgb(var(--color-text-primary)); }
 .oaiy-tags > button[aria-pressed='true'] { border-color: rgb(var(--accent-primary) / 0.6); background: rgb(var(--accent-primary) / 0.14); color: rgb(var(--color-text-primary)); }
 /* A group under the list (the examples), its heading a toggle. */
-.oaiy-rail-group { margin-top: 12px; }
+.oaiy-rail-group { margin-top: 14px; }
+/* A group's heading: the dashboard's group labels, small mono capitals. */
 .oaiy-rail-group-head {
   display: flex;
   width: 100%;
   align-items: center;
   gap: 6px;
   border: 0;
+  border-radius: var(--r-sm);
   background: transparent;
   color: rgb(var(--color-text-faint));
-  padding: 4px 6px 6px;
-  font-size: 11px;
+  padding: 4px 6px 5px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
   font-weight: 650;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   cursor: pointer;
 }
+.oaiy-rail-group-head > svg { flex: none; transition: transform 0.14s; }
 .oaiy-rail-group-head:hover { color: rgb(var(--color-text-primary)); }
 .oaiy-rail-group-head small { font-family: var(--font-mono); font-weight: 500; letter-spacing: 0; }
 .oaiy-rail-section { border-bottom: 1px solid rgb(var(--color-border-secondary)); }
@@ -3145,12 +3437,12 @@ button.oaiy-row:focus-visible,
 .oaiy-side.right { width: 312px; border-left: 1px solid rgb(var(--color-border-primary)); }
 .oaiy-side-head {
   display: flex;
-  min-height: 44px;
+  min-height: 42px;
   flex: none;
   align-items: center;
   gap: 8px;
   border-bottom: 1px solid rgb(var(--color-border-secondary));
-  padding: 0 8px 0 14px;
+  padding: 0 7px 0 14px;
 }
 .oaiy-side-head h2 {
   display: flex;
@@ -3160,16 +3452,21 @@ button.oaiy-row:focus-visible,
   gap: 8px;
   margin: 0;
   color: rgb(var(--color-text-primary));
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 650;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.01em;
 }
 .oaiy-side-head h2::before { width: 12px; height: 2px; flex: none; border-radius: 2px; background: rgb(var(--accent-primary)); content: ''; }
 .oaiy-side-head h2 small { color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
 .oaiy-side-tools { display: flex; flex: none; align-items: center; gap: 2px; }
+/* The panels' own small buttons (expand, collapse, close): faint until hovered, as the dashboard's icons. */
+.oaiy-side-tools > .oaiy-icon-btn { width: 28px; height: 28px; color: rgb(var(--color-text-faint)); }
+.oaiy-side-tools > .oaiy-icon-btn:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
+.oaiy-side-tools > .btn-sm { height: 26px; padding: 0 9px; font-size: 11.5px; }
 .oaiy-side-sub { display: flex; flex: none; flex-direction: column; gap: 8px; border-bottom: 1px solid rgb(var(--color-border-secondary)); padding: 10px 12px; }
+.oaiy-side-sub .oaiy-search > .oaiy-input { height: 32px; }
 .oaiy-side-body { min-height: 0; flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; }
-.oaiy-side-foot { flex: none; border-top: 1px solid rgb(var(--color-border-secondary)); color: rgb(var(--color-text-faint)); padding: 7px 12px; font-size: 11px; }
+.oaiy-side-foot { flex: none; border-top: 1px solid rgb(var(--color-border-secondary)); color: rgb(var(--color-text-faint)); padding: 8px 14px; font-size: 11px; line-height: 1.4; }
 .oaiy-side-split { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; }
 .oaiy-side-split > section { display: flex; min-height: 0; flex-direction: column; }
 .oaiy-side-split > section.grow { flex: 1 1 auto; }
@@ -3258,63 +3555,72 @@ button.oaiy-row:focus-visible,
 .oaiy-palette-hint strong { display: block; margin-bottom: 2px; color: rgb(var(--color-text-primary)); font-size: 12.5px; font-weight: 600; }
 .oaiy-palette-hint > div { display: flex; flex-wrap: wrap; gap: 6px; }
 .oaiy-palette-hint.after { border: 0; padding: 0 4px; }
+/* A category's heading: the dashboard's group labels, small mono capitals, its count at the end. */
 .oaiy-cat > button {
   display: flex;
   width: 100%;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   border: 0;
   background: transparent;
-  color: rgb(var(--color-text-secondary));
-  padding: 9px 14px 7px;
+  color: rgb(var(--color-text-faint));
+  padding: 10px 14px 5px;
   text-align: left;
   cursor: pointer;
+  transition: color 0.12s;
 }
+.oaiy-cat:first-child > button { padding-top: 6px; }
 .oaiy-cat > button > svg { flex: none; transition: transform 0.14s; }
 .oaiy-cat > button[aria-expanded='true'] > svg:first-child { transform: rotate(90deg); }
 .oaiy-cat > button > span {
   min-width: 0;
   flex: 1;
   overflow: hidden;
-  font-size: 10.5px;
-  font-weight: 680;
-  letter-spacing: 0.08em;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
   text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
 }
-.oaiy-cat > button > small { color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 10.5px; }
+.oaiy-cat > button > small { color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 10px; }
 .oaiy-cat > button:hover { color: rgb(var(--color-text-primary)); }
 .oaiy-cat.pkg > button { color: rgb(var(--signal-magenta)); }
-.oaiy-cat > ul { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0 8px 6px; list-style: none; }
+.oaiy-cat > ul { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0 8px 4px; list-style: none; }
+/* A node to add: a compact row, the kind's icon a tinted tile (as on its card), its name over one line of what it does. */
 .oaiy-node-item {
   display: flex;
   min-width: 0;
   align-items: center;
   gap: 10px;
   border: 1px solid transparent;
-  border-radius: var(--r-ctl);
-  padding: 6px 8px;
+  border-radius: 8px;
+  padding: 5px 7px;
   cursor: grab;
   user-select: none;
   transition: background 0.12s, border-color 0.12s;
 }
-.oaiy-node-item:hover { border-color: rgb(var(--color-border-primary)); background: rgb(var(--color-bg-tertiary) / 0.7); }
+.oaiy-node-item:hover { background: rgb(var(--color-bg-tertiary) / 0.7); }
 .oaiy-node-item:active { cursor: grabbing; }
 .oaiy-node-item:focus-visible { outline: 2px solid rgb(var(--accent-primary)); outline-offset: -2px; }
 .oaiy-node-item > .oaiy-node-icon {
   position: relative;
   display: grid;
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   flex: none;
   place-items: center;
-  /* Width and style only: the colour is the node kind's (a utility class). */
+  /* Width and style only, and the frame at a third of the icon's colour: the colour is the node kind's (a utility
+     class); the kind's full colour round every icon made the list a column of bright boxes. */
   border-width: 1px;
   border-style: solid;
+  border-color: color-mix(in srgb, currentColor 32%, transparent);
   border-radius: var(--r-sm);
+  transition: border-color 0.12s;
 }
-.oaiy-node-item > .oaiy-node-icon svg { width: 15px; height: 15px; }
+.oaiy-node-item:hover > .oaiy-node-icon { border-color: color-mix(in srgb, currentColor 60%, transparent); }
+.oaiy-node-item > .oaiy-node-icon svg { width: 14px; height: 14px; }
 .oaiy-node-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
 .oaiy-node-text strong { overflow: hidden; color: rgb(var(--color-text-primary)); font-size: 12.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .oaiy-node-text small { overflow: hidden; color: rgb(var(--color-text-faint)); font-size: 11px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
@@ -3352,12 +3658,35 @@ button.oaiy-row:focus-visible,
   pointer-events: none;
 }
 
-/* The log's lines. */
-.oaiy-log { min-height: 0; flex: 1 1 auto; overflow-y: auto; padding: 8px 10px; font-family: var(--font-mono); font-size: 11px; line-height: 1.5; }
-.oaiy-log-line { display: flex; align-items: flex-start; gap: 7px; padding: 2px 0; }
-.oaiy-log-line time { flex: none; color: rgb(var(--color-text-faint)); }
-.oaiy-log-line > .oaiy-pill { padding: 0 6px; font-size: 9px; line-height: 1.6; }
+/* The log's lines: three columns (when, from where, what), the time and the source quiet and of one width so the
+   messages line up; a line's level in its message's ink, an error's line on a faint red band with a rail. The source
+   was a bordered, tinted pill on every line: a column of badges louder than what they said. */
+.oaiy-log { min-height: 0; flex: 1 1 auto; overflow-y: auto; padding: 6px 6px 10px; font-family: var(--font-mono); font-size: 11px; line-height: 1.5; }
+.oaiy-log-line {
+  display: grid;
+  grid-template-columns: auto 34px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  border-left: 2px solid transparent;
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  padding: 2px 6px 2px 4px;
+}
+.oaiy-log-line:hover { background: rgb(var(--color-bg-tertiary) / 0.55); }
+.oaiy-log-line time { flex: none; color: rgb(var(--color-text-faint)); font-size: 10.5px; font-feature-settings: 'tnum'; }
+.oaiy-log-line > .oaiy-pill {
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: rgb(var(--tone) / 0.1);
+  padding: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 15px;
+}
+.oaiy-log-line > .oaiy-pill.accent { color: rgb(var(--accent-hover)); }
 .oaiy-log-line > span:last-child { min-width: 0; color: rgb(var(--color-text-secondary)); white-space: pre-wrap; word-break: break-word; }
+.oaiy-log-line.error { border-left-color: rgb(var(--signal-danger)); background: rgb(var(--signal-danger) / 0.07); }
 .oaiy-log-line.error > span:last-child { color: rgb(var(--signal-danger-ink)); }
 .oaiy-log-line.success > span:last-child,
 .oaiy-log-line.output > span:last-child { color: rgb(var(--signal-green)); }
@@ -3372,21 +3701,23 @@ button.oaiy-row:focus-visible,
   left: 50%;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
   transform: translateX(-50%);
   border: 1px solid rgb(var(--color-border-primary));
-  border-radius: calc(var(--r-card) + 3px);
-  background: rgb(var(--color-bg-secondary) / 0.96);
-  box-shadow: var(--shadow-lg);
-  padding: 5px;
+  border-radius: calc(var(--r-card) + 2px);
+  background: rgb(var(--color-bg-secondary) / 0.94);
+  /* (a float over the canvas, not a dialog: the large shadow was a 6px block of ink under it on paper) */
+  box-shadow: var(--shadow-md);
+  padding: 4px;
   backdrop-filter: blur(14px);
 }
-.oaiy-toolbar > .sep { width: 1px; height: 22px; margin: 0 3px; background: rgb(var(--color-border-primary)); }
+.oaiy-toolbar > .sep { width: 1px; height: 20px; margin: 0 4px; background: rgb(var(--color-border-primary)); }
+/* A tool: the dashboard's tabs' voice, its icon faint until hovered; one that is on, tinted with its icon in the accent. */
 .oaiy-tool {
   position: relative;
   display: inline-flex;
-  height: 34px;
-  min-width: 34px;
+  height: 32px;
+  min-width: 32px;
   align-items: center;
   justify-content: center;
   gap: 6px;
@@ -3394,15 +3725,21 @@ button.oaiy-row:focus-visible,
   border-radius: var(--r-ctl);
   background: transparent;
   color: rgb(var(--color-text-secondary));
-  padding: 0 9px;
+  padding: 0 10px;
   font-size: 12.5px;
   font-weight: 600;
   white-space: nowrap;
   cursor: pointer;
-  transition: background 0.14s, color 0.14s, border-color 0.14s;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
 }
+.oaiy-tool > svg { flex: none; color: rgb(var(--color-text-faint)); transition: color 0.12s; }
 .oaiy-tool:hover:not(:disabled) { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
-.oaiy-tool.on { border-color: rgb(var(--accent-primary) / 0.3); background: rgb(var(--accent-primary) / 0.12); color: rgb(var(--accent-primary)); }
+.oaiy-tool:hover:not(:disabled) > svg { color: rgb(var(--color-text-primary)); }
+.oaiy-tool.on { background: rgb(var(--accent-primary) / 0.14); color: rgb(var(--color-text-primary)); }
+:root.light .oaiy-tool.on { background: rgb(var(--accent-primary) / 0.1); }
+:root:not(.light) .oaiy-tool.on { border-color: rgb(var(--accent-primary) / 0.26); }
+.oaiy-tool.on > svg,
+.oaiy-tool.on:hover:not(:disabled) > svg { color: rgb(var(--accent-primary)); }
 .oaiy-tool:disabled { cursor: not-allowed; opacity: 0.45; }
 .oaiy-tool > em {
   position: absolute;
@@ -3421,16 +3758,11 @@ button.oaiy-row:focus-visible,
   line-height: 16px;
   text-align: center;
 }
-.oaiy-toolbar .btn { height: 34px; }
+.oaiy-toolbar .btn { height: 32px; }
 .oaiy-toolbar .oaiy-pill { margin: 0 4px; }
 @media (width < 760px) {
   .oaiy-tool > span { display: none; }
 }
-.oaiy-canvas-wrap .react-flow__controls { border-radius: var(--r-ctl) !important; box-shadow: var(--shadow-card) !important; }
-.oaiy-canvas-wrap .react-flow__controls button { border-bottom: 1px solid rgb(var(--color-border-secondary)) !important; }
-.oaiy-canvas-wrap .react-flow__controls button:hover { background: rgb(var(--color-bg-tertiary)) !important; }
-.oaiy-canvas-wrap .react-flow__controls button svg { fill: rgb(var(--color-text-secondary)) !important; }
-.oaiy-canvas-wrap .react-flow__minimap { border-radius: var(--r-ctl) !important; box-shadow: var(--shadow-card) !important; }
 /* Top right, clear of the toolbar and the zoom controls at the canvas's foot. */
 .oaiy-minimap { position: absolute; z-index: 10; top: 12px; right: 12px; }
 .oaiy-minimap .react-flow__minimap { position: relative !important; margin: 0 !important; }
@@ -3439,11 +3771,18 @@ button.oaiy-row:focus-visible,
   z-index: 2;
   top: 4px;
   right: 4px;
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   border: 1px solid rgb(var(--color-border-primary));
+  border-radius: var(--r-sm);
   background: rgb(var(--color-bg-secondary));
+  color: rgb(var(--color-text-faint));
+  opacity: 0.8;
 }
+.oaiy-minimap:hover > .oaiy-icon-btn,
+.oaiy-minimap > .oaiy-icon-btn:focus-visible { opacity: 1; }
+.oaiy-minimap > .oaiy-icon-btn:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
+/* (as the zoom buttons: the toolbar's surface, its icon faint until hovered) */
 .oaiy-map-toggle {
   display: inline-flex;
   height: 30px;
@@ -3451,15 +3790,19 @@ button.oaiy-row:focus-visible,
   gap: 6px;
   border: 1px solid rgb(var(--color-border-primary));
   border-radius: var(--r-ctl);
-  background: rgb(var(--color-bg-secondary));
-  box-shadow: var(--shadow-card);
+  background: rgb(var(--color-bg-secondary) / 0.94);
+  box-shadow: var(--shadow-node);
   color: rgb(var(--color-text-secondary));
   padding: 0 10px;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  backdrop-filter: blur(12px);
+  transition: background 0.12s, color 0.12s;
 }
-.oaiy-map-toggle:hover { color: rgb(var(--color-text-primary)); }
+.oaiy-map-toggle > svg { color: rgb(var(--color-text-faint)); transition: color 0.12s; }
+.oaiy-map-toggle:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
+.oaiy-map-toggle:hover > svg { color: rgb(var(--color-text-primary)); }
 .oaiy-canvas-hint {
   position: absolute;
   z-index: 5;
@@ -3471,16 +3814,18 @@ button.oaiy-row:focus-visible,
   user-select: none;
 }
 .oaiy-canvas-hint.static { position: static; pointer-events: auto; }
+/* Nothing on the canvas yet: the dashboard's empty state, an icon, a line at the words' full strength and what to do. */
 .oaiy-canvas-hint > div { display: flex; max-width: 300px; flex-direction: column; align-items: center; gap: 6px; text-align: center; }
-.oaiy-canvas-hint p { margin: 0; color: rgb(var(--color-text-secondary)); font-size: 13px; font-weight: 600; }
+.oaiy-canvas-hint p { margin: 4px 0 0; color: rgb(var(--color-text-primary)); font-size: 13px; font-weight: 600; }
 .oaiy-canvas-hint small { color: rgb(var(--color-text-faint)); font-size: 12px; line-height: 1.5; }
 .oaiy-canvas-hint i {
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 40px;
+  height: 40px;
   place-items: center;
   border: 1px dashed rgb(var(--color-border-strong));
-  border-radius: var(--r-ctl);
+  border-radius: var(--r-card);
+  background: rgb(var(--color-bg-secondary) / 0.7);
   color: rgb(var(--color-text-faint));
 }
 .oaiy-canvas-busy {
@@ -3556,17 +3901,19 @@ body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  border: 1px solid rgb(var(--tone) / 0.35);
+  /* (the dashboard's toast: a hairline with a little of its colour, the colour itself a rail at its left) */
+  border: 1px solid color-mix(in srgb, rgb(var(--tone)) 28%, rgb(var(--color-border-primary)));
   border-left: 3px solid rgb(var(--tone));
   border-radius: var(--r-card);
   background: rgb(var(--color-bg-secondary));
   box-shadow: var(--shadow-lg);
   color: rgb(var(--color-text-primary));
-  padding: 10px 10px 10px 12px;
+  padding: 10px 10px 11px 13px;
   font-size: 12.5px;
   line-height: 1.5;
   pointer-events: auto;
 }
+:root.light .oaiy-toast { box-shadow: 0 14px 34px rgb(50 42 30 / 0.11); }
 .oaiy-toast > svg { flex: none; margin-top: 2px; color: rgb(var(--tone)); }
 .oaiy-toast > span { min-width: 0; flex: 1; word-break: break-word; }
 .oaiy-toast > button {
@@ -3585,14 +3932,15 @@ body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
 /* A toast's action ("Show log"): a word button, not the square dismiss. */
 .oaiy-toast > button.oaiy-toast-action {
   width: auto;
-  height: 22px;
-  padding: 0 8px;
+  height: 24px;
+  padding: 0 9px;
   border: 1px solid rgb(var(--tone) / 0.45);
   color: rgb(var(--color-text-primary));
   font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
 }
+.oaiy-toast > button.oaiy-toast-action:hover { border-color: rgb(var(--tone)); background: rgb(var(--tone) / 0.12); }
 .oaiy-toast.success { --tone: var(--signal-green); }
 .oaiy-toast.error { --tone: var(--signal-danger); }
 .oaiy-toast.warning { --tone: var(--signal-amber); }

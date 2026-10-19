@@ -257,14 +257,14 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
     };
 
     return (
-        <div className={`flex flex-col ${className}`}>
+        <div className={`oaiy-props flex flex-col ${className}`}>
             {/* Which node: its kind's colour, its kind, its name and its id. The name is the node's own, as its card
                 shows it ("Write the picture prompt" over "Service Call"), and is set here; left empty, the card shows
                 the kind. An input's or an output's name is also what the flow's inputs and results are called. */}
-            <div className="flex items-start gap-2.5 border-b border-edge-secondary px-3.5 py-3">
-                <span className={`mt-0.5 h-11 w-1.5 shrink-0 rounded-full ${SWATCH_CLASS[definition.color || 'slate'] ?? SWATCH_CLASS.slate}`} />
+            <div className="oaiy-props-head">
+                <span className={`oaiy-props-swatch ${SWATCH_CLASS[definition.color || 'slate'] ?? SWATCH_CLASS.slate}`} />
                 <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                    <span className="truncate text-[10px] font-bold uppercase tracking-[0.07em] text-content-faint">{definition.name}</span>
+                    <span className="oaiy-props-kind">{definition.name}</span>
                     <input
                         type="text"
                         className="oaiy-prop-name"
@@ -275,12 +275,12 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
                         title="The node's name, as its card shows it"
                         spellCheck={false}
                     />
-                    <div className="truncate font-mono text-[11px] text-content-faint">{selectedNode.id}</div>
+                    <div className="oaiy-props-id">{selectedNode.id}</div>
                 </div>
             </div>
 
             {/* The node's settings. */}
-            <div className="flex flex-col gap-4 p-3.5">
+            <div className="oaiy-props-fields">
                 {notice && (
                     <div role="status" className="oaiy-note warn">
                         <p className="m-0">{notice}</p>
@@ -297,7 +297,7 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
                 {advancedShown > 0 && (
                     <details className="oaiy-prop-more">
                         <summary>Advanced options ({advancedShown})</summary>
-                        <div className="flex flex-col gap-4 pt-3">
+                        <div className="oaiy-props-fields more">
                             {shown.filter((prop) => prop.advanced).map(field)}
                         </div>
                     </details>
