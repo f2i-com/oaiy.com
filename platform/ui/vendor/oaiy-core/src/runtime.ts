@@ -2210,9 +2210,13 @@ export class OAIYRuntime {
       const hardenedShadows = isHardened ? HARDENED_SHADOW_PREAMBLE : '';
       const strictPreamble = isHardened ? `'use strict';\n` : '';
 
+      // `__oaiyStep(<node id>)`, which the compiler puts before each step: on ZIPP, the step tells the session it is
+      // starting (zipp-executor.ts's `ZIPP_STEP_OPERATION`), so one stopped by the engine's own budget is named and
+      // its card marked; on every other engine, nothing.
       const fullScript = `
 ${strictPreamble}${this.getModulesShim()}
 ${hardenedShadows}
+var __oaiyStep = typeof __oaiyStepAt === 'function' ? __oaiyStepAt : function () {};
 function* __run_workflow() {
    let __res = null;
    try {
@@ -2511,6 +2515,14 @@ ${WORKFLOW_TRAMPOLINE}`;
       if (marked.nodeId) {
         this.onNodeStatus?.(marked.nodeId, 'error');
         error = marked.message.replace(/\s*\(in <script>\)\s*$/, '');
+        // A step the engine stopped for running past its budget (zipp-executor.ts names it) says nothing of which step
+        // it was: its name goes first, as a step's own failure has it ("Logic Block 'Tidy the text': …").
+        if (/exceeded its (?:instruction|memory) budget/.test(error)) {
+          const node = graph.nodes.find((n) => n.id === marked.nodeId);
+          const kind = (node && this.moduleRegistry?.getNodeDefinition(node.type)?.name) || node?.type;
+          const label = typeof node?.data?.label === 'string' ? node.data.label.trim() : '';
+          if (kind) error = `${label ? `${kind} '${label}'` : kind}: ${error}`;
+        }
         e = new Error(error);
       }
       // (a stop is the run's signal having fired, not an error that says "aborted")

@@ -204,6 +204,31 @@ sidebar redesign), likewise:
     (`group-hover:opacity-100`) show while the card is hovered; with no group
     around them they never showed at all.
 
+From fixing the last two behaviours that polish left (2026-10-19; cases in
+`ui/tests/flow-editor-review.mjs` and `ui/tests/zipp-executor.mjs`), likewise:
+
+- A step the ZIPP engine stops for running past its instruction or memory
+  budget (a Logic Block's `while (true)`) fails the run as that step's failure:
+  named, and its node marked, as a step's own throw is. The engine disposes
+  itself on a ceiling, so nothing the step did can be read back afterwards; each
+  step says it is starting, synchronously, before its code runs:
+  - `oaiy-core/src/compiler.ts` (`generateNodeCode`): each step begins with
+    `__oaiyStep("<node id>");` (inside its branch gate).
+  - `oaiy-core/src/runtime.ts`: the script's wrapper defines `__oaiyStep`
+    (ZIPP's `__oaiyStepAt` where there is one, else nothing); `runWorkflow`
+    puts the stopped step's name before a ceiling's message ("Logic Block
+    'Spin': RangeError: script exceeded its instruction budget"), as a step's
+    own failure has it.
+  - `oaiy-core/src/zipp-executor.ts`: `ZippSession` installs an app bridge
+    and grants one synchronous operation, `app.oaiy.step`
+    (`ZIPP_STEP_OPERATION`), which records the node id (a `SAFE_NODE_TOKEN`)
+    and answers nothing; `buildZippScript` captures the engine's bridge for it
+    at program top level (`STEP_MARK_PRELUDE`, `__oaiyStepAt`) before a trusted
+    flow's `var __zippHostCall = undefined`, so the flow still reads that name
+    as `undefined`. A ceiling (`lastErrorKind()` `resource`, or the budget's
+    message) fails with `[oaiy-node:<id>] ` before its message; one at the top
+    level is no longer called "Zipp failed to compile the workflow".
+
 ## Re-syncing from upstream (optional)
 
 If you ever want to pull newer upstream source, re-copy `src/` from the

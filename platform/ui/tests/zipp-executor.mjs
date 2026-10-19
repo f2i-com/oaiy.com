@@ -202,6 +202,7 @@ var postMessage = undefined; var addEventListener = undefined; var close = undef
     : '';
   return `${hardened ? `'use strict';\n` : ''}${modulesShim(shim)}
 ${shadow}
+var __oaiyStep = typeof __oaiyStepAt === 'function' ? __oaiyStepAt : function () {};
 function* __run_workflow() {
    let __res = null;
    try {
@@ -671,6 +672,66 @@ console.log('\ninstruction budget (host-set)');
   check('renewal restores the host\'s size, not the default: a later over-budget step still stops',
     !!restored.error && /budget/i.test(restored.error) && restored.logs.join('|') === 'log:s1',
     restored.error ?? JSON.stringify(restored.value));
+}
+
+// ---------------------------------------------------------------------------
+// 6c. A step stopped by a ceiling is named.
+// ---------------------------------------------------------------------------
+// The engine disposes itself when a step runs past its budget: nothing the step
+// did after it began (a queued host call, a console line, a global) can be read
+// back. So each step says it is starting, synchronously, through the one
+// `host.callSync` operation the session grants (`ZIPP_STEP_OPERATION`), and the
+// ceiling's message names it (`[oaiy-node:<id>] `), for the runtime to mark its
+// node. At the top level (the flow's first step, run while the engine starts it)
+// and on a re-entry, trusted and hardened; a guest's own throw is not named by
+// it, and the flow's program still reads `__zippHostCall` as undefined.
+console.log('\nstep marks name the step a ceiling stopped');
+for (const hardened of [false, true]) {
+  const mode = hardened ? 'hardened' : 'trusted';
+  const top = await runFlow(
+    `       let workflow_context = {};
+       __oaiyStep("first-step");
+       let i = 0;
+       while (true) { i++; }`,
+    { broker: okBroker, hardened, instructionBudgetSteps: 2_000_000 },
+  );
+  check(`${mode}: a step stopped at the top level is named, and not called a compile error`,
+    /^\[oaiy-node:first-step\] RangeError: script exceeded its instruction budget$/.test(top.error ?? ''), top.error);
+  const later = await runFlow(
+    `       let workflow_context = {};
+       __oaiyStep("ask");
+       yield Utility.httpRequest("x");
+       __oaiyStep("spin-7");
+       let i = 0;
+       while (true) { i++; }`,
+    { broker: okBroker, hardened, instructionBudgetSteps: 2_000_000 },
+  );
+  check(`${mode}: a step stopped on a re-entry is named, the last that said it was starting`,
+    /^\[oaiy-node:spin-7\] RangeError: script exceeded its instruction budget$/.test(later.error ?? ''), later.error);
+  const thrown = await runFlow(
+    `       let workflow_context = {};
+       __oaiyStep("spin-7");
+       yield Utility.httpRequest("x");
+       throw new Error("its own");`,
+    { broker: okBroker, hardened },
+  );
+  check(`${mode}: a guest's own throw is not named by the marks`, /its own/.test(thrown.error ?? '') && !/oaiy-node/.test(thrown.error ?? ''), thrown.error);
+  const unforged = await runFlow(
+    `       let workflow_context = {};
+       __oaiyStep("not a node id, it has spaces");
+       let i = 0;
+       while (true) { i++; }`,
+    { broker: okBroker, hardened, instructionBudgetSteps: 2_000_000 },
+  );
+  check(`${mode}: a mark that is no node id names nothing`, !/oaiy-node/.test(unforged.error ?? '') && /budget/.test(unforged.error ?? ''), unforged.error);
+  const probe = await runFlow(
+    `       let workflow_context = {};
+       __oaiyStep("a");
+       yield Utility.httpRequest("x");
+       workflow_context.bridge = typeof __zippHostCall;`,
+    { broker: okBroker, hardened },
+  );
+  check(`${mode}: the flow still reads __zippHostCall as undefined, and runs to its end`, !probe.error && probe.value?.bridge === 'undefined', probe.error ?? JSON.stringify(probe.value));
 }
 
 // ---------------------------------------------------------------------------

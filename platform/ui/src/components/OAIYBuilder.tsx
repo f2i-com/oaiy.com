@@ -15,7 +15,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import { createLogger } from '../utils/logger';
 import { isCanvasTarget } from '../lib/canvasTarget';
-import { clearBelow } from '../lib/respace';
+import { Respacer } from '../lib/respace';
 
 const logger = createLogger('OAIYBuilder');
 
@@ -369,8 +369,14 @@ export default function OAIYBuilder({
   /** Opens the log (set below, where the panels are). */
   const showLogRef = useRef<(() => void) | null>(null);
 
-  // A card that grows while a run fills it in, or just after (its results arrive as it ends), keeps clear of the cards
-  // below it: they move down (lib/respace.ts). Not a card opened or folded by hand, nor one measured as the flow opens.
+  // Cards kept clear of one another as they grow (lib/respace.ts): while a run fills them in, or just after (its results
+  // arrive as it ends), and when they are opened, one by its chevron or all at once (Expand), and for a moment after (a
+  // code editor in one loads, and it grows again). Folded again (one, or Compact), the cards they pushed go back. Not a
+  // card measured as the flow opens, nor one that changes size by itself at another time.
+  //
+  // Every card measured in one go is taken at once, each against where the others are by then. The push was only made
+  // during a run, card by card against where every card had been before any of them moved, and only downwards: Expand
+  // left the cards of a flow of several columns over one another and over the next column until Tidy was pressed.
   const growthUntilRef = useRef(0);
   useEffect(() => {
     if (isRunning) growthUntilRef.current = Number.POSITIVE_INFINITY;
@@ -378,25 +384,17 @@ export default function OAIYBuilder({
   }, [isRunning]);
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
+  const respacerRef = useRef<Respacer | null>(null);
   const handleNodesChange = useCallback((changes: NodeChange[]) => {
     onNodesChange(changes);
-    if (Date.now() > growthUntilRef.current) return;
-    for (const change of changes) {
-      if (change.type !== 'dimensions' || !change.dimensions) continue;
-      const before = nodesRef.current.find((n) => n.id === change.id)?.measured?.height;
-      if (!before || change.dimensions.height <= before + 4) continue;
-      const cards = nodesRef.current
-        .filter((n) => !n.parentId)
-        .map((n) => ({
-          id: n.id,
-          x: n.position.x,
-          y: n.position.y,
-          width: n.id === change.id ? change.dimensions!.width : n.measured?.width ?? 0,
-          height: n.id === change.id ? change.dimensions!.height : n.measured?.height ?? 0,
-        }));
-      const moves = clearBelow(cards, change.id, before);
-      if (moves.size) setNodes((nds) => nds.map((n) => (moves.has(n.id) ? { ...n, position: { ...n.position, y: moves.get(n.id)! } } : n)));
-    }
+    const sizes = new Map<string, { width: number; height: number }>();
+    for (const change of changes) if (change.type === 'dimensions' && change.dimensions) sizes.set(change.id, change.dimensions);
+    if (!sizes.size) return;
+    const respacer = (respacerRef.current ??= new Respacer());
+    const now = Date.now();
+    const cards = nodesRef.current.map((n) => ({ id: n.id, parentId: n.parentId, position: n.position, measured: n.measured, folded: (n.data as { _collapsed?: boolean })._collapsed !== false }));
+    const moves = respacer.measured(cards, sizes, now, now <= growthUntilRef.current);
+    if (moves.size) setNodes((nds) => nds.map((n) => (moves.has(n.id) ? { ...n, position: { ...moves.get(n.id)! } } : n)));
   }, [onNodesChange, setNodes]);
 
   // Calculate selected nodes for multi-selection display

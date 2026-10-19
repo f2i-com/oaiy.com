@@ -19,6 +19,14 @@
  * - A toast says a step's error without its HTTP status (lib/readableError.ts).
  * - An example on the models this computer has (lib/exampleFlows.ts), and cards
  *   kept clear of one a run made taller (lib/respace.ts).
+ * - Cards kept clear of each other when they are opened, one or all at once
+ *   (Expand), across columns as well as down them, and given their places back
+ *   when folded (Compact); a card moved by hand stays where it was put
+ *   (lib/respace.ts's Respacer, which OAIYBuilder runs on each measurement).
+ * - A step the ZIPP engine stops for running past its instruction budget (a
+ *   Logic Block's `while (true)`) fails the run as that step's failure: named,
+ *   and its node marked, as a step's own throw is (the step marks in
+ *   oaiy-core's compiler, runtime and zipp-executor.ts). Run on the real engine.
  *
  * The modules are TypeScript with aliases only the bundler resolves, so they are
  * bundled for Node with esbuild (as flow-services.mjs does).
@@ -94,7 +102,9 @@ export { isCanvasTarget } from './src/lib/canvasTarget.ts';
 export { parseImportedProject, parseJsonFile } from './src/utils/ProjectIO.ts';
 export { toastError, readableError } from './src/lib/readableError.ts';
 export { withModelsHere, exampleFrom, flowFromExample } from './src/lib/exampleFlows.ts';
-export { clearBelow } from './src/lib/respace.ts';
+export { clearBelow, clearGrown, Respacer } from './src/lib/respace.ts';
+export { serveZippWorkflow } from './vendor/oaiy-core/src/zipp-worker-loop.ts';
+export { OAIYCompiler } from 'oaiy-core';
 export { takeNodeMark, nodeErrorPrefix } from './vendor/oaiy-core/src/node-errors.ts';
 export { JobManager, registerBundledModules, getModuleLoader, loadBundledModules } from 'oaiy-core';
 ${MODS.map((m, i) => `import manifest${i} from './src/bundled-modules/${m}/module.json';
@@ -342,6 +352,185 @@ await check('a card that grew pushes the cards below it in its column down, and 
   assert.equal(M.clearBelow(cards, 'view', 200).size, 0, 'it did not grow');
   assert.equal(M.clearBelow([{ id: 'view', x: 0, y: 0, width: 230, height: 120 }, { id: 'far', x: 0, y: 400, width: 230, height: 90 }], 'view', 100).size, 0, 'still clear');
 });
+
+// A flow of three columns, as Tidy lays one out (dagre centres a column's cards), its cards compact; open, every card
+// is wider and taller. (Sizes as React Flow measures them.)
+const LAID = { a: [0, 100], b: [322, 0], c: [322, 186], d: [644, 0], e: [644, 136] };
+const FOLDED = { a: [232, 150], b: [232, 150], c: [232, 100], d: [232, 100], e: [232, 100] };
+const OPEN = { a: [300, 400], b: [320, 450], c: [280, 300], d: [260, 250], e: [232, 200] };
+/** The canvas: each card where it is, its size when last measured, folded or not. */
+const canvas = () => Object.keys(LAID).map((id) => ({ id, position: { x: LAID[id][0], y: LAID[id][1] }, measured: undefined, folded: true }));
+const sizesOf = (table, ids = Object.keys(table)) => new Map(ids.map((id) => [id, { width: table[id][0], height: table[id][1] }]));
+/** One measurement: the respacer's moves applied, and each card's new size kept, as React Flow does. */
+const measure = (r, cards, sizes, now, running = false) => {
+  const moves = r.measured(cards, sizes, now, running);
+  for (const c of cards) {
+    if (moves.has(c.id)) c.position = { ...moves.get(c.id) };
+    if (sizes.has(c.id)) c.measured = { ...sizes.get(c.id) };
+  }
+  return moves;
+};
+const overlapping = (cards) => {
+  const out = [];
+  for (const a of cards) for (const b of cards) {
+    if (a.id >= b.id) continue;
+    const ox = Math.min(a.position.x + a.measured.width, b.position.x + b.measured.width) - Math.max(a.position.x, b.position.x);
+    const oy = Math.min(a.position.y + a.measured.height, b.position.y + b.measured.height) - Math.max(a.position.y, b.position.y);
+    if (ox > 1 && oy > 1) out.push(`${a.id}×${b.id}`);
+  }
+  return out;
+};
+const where = (cards) => Object.fromEntries(cards.map((c) => [c.id, [Math.round(c.position.x), Math.round(c.position.y)]]));
+
+await check('Expand: every card opened at once, outside a run, keeps clear of the others, across columns and down them', () => {
+  const r = new M.Respacer();
+  const cards = canvas();
+  assert.equal(measure(r, cards, sizesOf(FOLDED), 1).size, 0, 'measured as the flow opens: nothing moves');
+  assert.deepEqual(overlapping(cards), []);
+  for (const c of cards) c.folded = false;
+  const moves = measure(r, cards, sizesOf(OPEN), 100);
+  assert.ok(moves.size > 0, 'cards moved to make room');
+  assert.deepEqual(overlapping(cards), [], JSON.stringify(where(cards)));
+  for (const c of cards) assert.ok(c.position.x >= LAID[c.id][0] && c.position.y >= LAID[c.id][1], `${c.id} moved only right or down`);
+  // (the column stays a column: what was below what is still below it, what was beside still beside)
+  assert.ok(where(cards).c[1] > where(cards).b[1] && where(cards).d[0] > where(cards).b[0]);
+});
+
+await check('Compact after Expand gives every card its place back; one card opened and folded likewise', () => {
+  const r = new M.Respacer();
+  const cards = canvas();
+  measure(r, cards, sizesOf(FOLDED), 1);
+  for (const c of cards) c.folded = false;
+  measure(r, cards, sizesOf(OPEN), 100);
+  for (const c of cards) c.folded = true;
+  measure(r, cards, sizesOf(FOLDED), 200);
+  assert.deepEqual(where(cards), LAID, 'no gap the opening made is left');
+  // one card, by its chevron
+  cards.find((c) => c.id === 'b').folded = false;
+  measure(r, cards, sizesOf(OPEN, ['b']), 300);
+  assert.deepEqual(overlapping(cards), [], JSON.stringify(where(cards)));
+  assert.notDeepEqual(where(cards), LAID, 'its neighbours made room');
+  cards.find((c) => c.id === 'b').folded = true;
+  measure(r, cards, sizesOf(FOLDED, ['b']), 400);
+  assert.deepEqual(where(cards), LAID);
+});
+
+await check('a card moved by hand after Expand stays where it was put when the cards are folded again', () => {
+  const r = new M.Respacer();
+  const cards = canvas();
+  measure(r, cards, sizesOf(FOLDED), 1);
+  for (const c of cards) c.folded = false;
+  measure(r, cards, sizesOf(OPEN), 100);
+  const e = cards.find((c) => c.id === 'e');
+  e.position = { x: 2000, y: 900 };
+  for (const c of cards) c.folded = true;
+  measure(r, cards, sizesOf(FOLDED), 200);
+  assert.deepEqual(where(cards).e, [2000, 900], 'where the person put it');
+  for (const id of ['a', 'b', 'c', 'd']) assert.deepEqual(where(cards)[id], LAID[id], `${id} back`);
+});
+
+await check('a card that grows by itself outside a run moves nothing; in a run it pushes, and shrinking gives nothing back', () => {
+  const r = new M.Respacer();
+  const cards = canvas();
+  measure(r, cards, sizesOf(FOLDED), 1);
+  // a picture arriving in a folded card, at no particular time: the flow is left as it is
+  assert.equal(measure(r, cards, new Map([['b', { width: 232, height: 260 }]]), 10_000).size, 0);
+  const r2 = new M.Respacer();
+  const run = canvas();
+  measure(r2, run, sizesOf(FOLDED), 1);
+  const pushed = measure(r2, run, new Map([['b', { width: 232, height: 260 }]]), 50, true);
+  assert.deepEqual([...pushed.keys()], ['c'], 'during a run, the card below it');
+  assert.deepEqual(overlapping(run), []);
+  assert.equal(measure(r2, run, new Map([['b', { width: 232, height: 150 }]]), 60, true).size, 0, 'its result cleared: nothing comes back up');
+});
+
+await check('cards of one column that grow in the same measurement are taken together, each where the others left it', () => {
+  // (each was pushed against where every card had been before any moved: the lower ones went over one another)
+  const r = new M.Respacer();
+  const cards = [0, 1, 2, 3].map((i) => ({ id: `n${i}`, position: { x: 0, y: i * 130 }, measured: undefined, folded: true }));
+  measure(r, cards, new Map(cards.map((c) => [c.id, { width: 232, height: 100 }])), 1);
+  for (const c of cards) c.folded = false;
+  measure(r, cards, new Map(cards.map((c, i) => [c.id, { width: 232, height: 220 + i * 40 }])), 100);
+  assert.deepEqual(overlapping(cards), [], JSON.stringify(where(cards)));
+  const ys = cards.map((c) => c.position.y);
+  assert.deepEqual(ys, [...ys].sort((p, q) => p - q), 'still in their order');
+});
+
+// ---------------------------------------------------------------------------
+// A step stopped by the ZIPP engine's own budget, on the real engine.
+// ---------------------------------------------------------------------------
+
+const ZIPP = path.join(UI, 'vendor', 'zipp-wasm');
+if (!fs.existsSync(path.join(ZIPP, 'zipp_wasm_bg.wasm'))) {
+  failures.push('the ZIPP engine is not installed (node ../scripts/fetch-zipp-release.mjs --ensure)');
+} else {
+  const { default: initZipp, Engine: ZippEngine } = await import(pathToFileURL(path.join(ZIPP, 'zipp_wasm.js')).href);
+  await initZipp({ module_or_path: fs.readFileSync(path.join(ZIPP, 'zipp_wasm_bg.wasm')) });
+  /** The ZIPP worker, in this thread: the same loop as ui's Worker and the CLI's, over a pair of queues. */
+  const onZipp = () => {
+    const listeners = { message: [], error: [], messageerror: [] };
+    let toWorker = () => {};
+    M.serveZippWorkflow(
+      { post: (msg) => setTimeout(() => listeners.message.forEach((fn) => fn({ data: msg }))), onMessage: (cb) => { toWorker = cb; } },
+      () => new ZippEngine(),
+      // (a small budget, as the CLI may set one, so a runaway stops at once)
+      { instructionBudgetSteps: 2_000_000 },
+    );
+    return { worker: { addEventListener: (type, fn) => listeners[type].push(fn), postMessage: (msg) => setTimeout(() => toWorker(msg)) }, cleanup: () => {} };
+  };
+  const onZippEngine = new M.JobManager({ moduleRegistry: loader, scriptExecutor: onZipp });
+  /** A graph on ZIPP: its job's status, error, failed node and node statuses. */
+  const runOnZipp = async (graph) => {
+    const statuses = [];
+    const off = onZippEngine.onNodeStatus((_job, nodeId, status) => statuses.push(`${nodeId}:${status}`));
+    const id = onZippEngine.submit('review-zipp', 'Review', graph);
+    await new Promise((resolve) => {
+      const done = () => ['completed', 'failed', 'aborted'].includes(onZippEngine.getJob(id)?.status);
+      if (done()) return resolve();
+      const stop = onZippEngine.onStateChange(() => { if (done()) { stop(); resolve(); } });
+    });
+    off();
+    const job = onZippEngine.getJob(id);
+    return { status: job.status, error: String(job.error ?? ''), failed: job.failedNodeId, statuses, logs: job.logs.map((l) => l.message), value: job.nodeOutputs?.blk };
+  };
+  const block = (code, label = 'Spin') => ({ id: 'blk', type: 'logic_block', position: { x: 200, y: 0 }, data: { code, label } });
+  const text = { id: 'in', type: 'input_text', position: { x: 0, y: 0 }, data: { value: 'lighthouse' } };
+  const wire = { id: 'e1', source: 'in', sourceHandle: 'text', target: 'blk', targetHandle: 'input' };
+
+  await check('on ZIPP, a Logic Block that runs past its budget fails the run as its own failure, named, its node marked', async () => {
+    const r = await runOnZipp({ nodes: [text, block('let i = 0;\nwhile (true) { i++; }')], edges: [wire] });
+    assert.equal(r.status, 'failed');
+    assert.match(r.error, /^Logic Block 'Spin': RangeError: script exceeded its instruction budget$/);
+    assert.ok(r.statuses.includes('blk:error'), String(r.statuses));
+    assert.equal(r.failed, 'blk', 'the job says which, for the canvas and the run history');
+    assert.ok(r.logs.some((l) => l === "The flow failed: Logic Block 'Spin': RangeError: script exceeded its instruction budget"), r.logs.join('\n'));
+    assert.ok(!r.logs.some((l) => /oaiy-node:/.test(l)), 'the mark is not said');
+  });
+
+  await check('on ZIPP, the same as the flow\'s first step, stopped while the engine starts the flow', async () => {
+    const r = await runOnZipp({ nodes: [block('while (true) {}', '')], edges: [] });
+    assert.equal(r.status, 'failed');
+    assert.match(r.error, /^Logic Block: RangeError: script exceeded its instruction budget$/, 'not "Zipp failed to compile the workflow"');
+    assert.equal(r.failed, 'blk');
+  });
+
+  await check('on ZIPP, a block\'s own throw is still marked, and a flow that finishes is untouched', async () => {
+    const thrown = await runOnZipp({ nodes: [text, block('throw new Error("nope")')], edges: [wire] });
+    assert.equal(thrown.error, "Logic Block 'Spin': nope");
+    assert.equal(thrown.failed, 'blk');
+    const fine = await runOnZipp({ nodes: [text, block('return input + "!"')], edges: [wire] });
+    assert.equal(fine.status, 'completed', fine.error);
+    assert.equal(fine.value, 'lighthouse!');
+  });
+
+  await check('every step of a compiled flow says it is starting, any kind of node, not only a Logic Block', () => {
+    const compiler = new M.OAIYCompiler();
+    compiler.setModuleRegistry(loader);
+    const script = compiler.compile({ nodes: [text, block('return input'), { id: 'out', type: 'output', position: { x: 400, y: 0 }, data: { label: 'Result' } }], edges: [wire, { id: 'e2', source: 'blk', sourceHandle: 'output', target: 'out', targetHandle: 'result' }] });
+    for (const id of ['in', 'blk', 'out']) assert.ok(script.includes(`__oaiyStep("${id}");`), id);
+  });
+  onZippEngine.destroy?.();
+}
 
 engine.destroy?.();
 console.log(`\n${pass} passed, ${failures.length} failed`);

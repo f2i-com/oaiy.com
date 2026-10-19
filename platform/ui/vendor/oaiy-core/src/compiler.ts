@@ -1360,7 +1360,11 @@ workflow_context;
     // Compile using module compiler
     const moduleCompilerResult = this.tryModuleCompiler(node, inputsMap, outputVar, skipVarDeclaration, !!loopStartId, loopStartId);
     if (moduleCompilerResult !== null) {
-      return this.gateOnBranch(node, graph, outputVar, skipVarDeclaration, moduleCompilerResult);
+      // Each step says it is starting (`__oaiyStep`, the runtime's): on ZIPP a step the engine stops for running past
+      // its budget, which no `catch` of the step's can see, is then named and its card marked. (The id is
+      // `SAFE_NODE_TOKEN`, checked above, so it is a safe string literal.)
+      const marked = `\n  __oaiyStep(${JSON.stringify(node.id)});${moduleCompilerResult}`;
+      return this.gateOnBranch(node, graph, outputVar, skipVarDeclaration, marked);
     }
 
     // No module compiler handled this node.

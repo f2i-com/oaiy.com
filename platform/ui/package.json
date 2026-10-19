@@ -40,6 +40,7 @@
     "test:downloads": "node tests/downloads.mjs",
     "test:site": "node tests/site-assets.mjs",
     "test:node-fixes": "node tests/node-fixes.mjs",
+    "pretest:flow-editor-review": "node ../scripts/fetch-zipp-release.mjs --ensure",
     "test:flow-editor-review": "node tests/flow-editor-review.mjs"
   },
   "dependencies": {

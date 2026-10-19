@@ -88,7 +88,39 @@ export interface ZippEngine {
   setInstructionBudget?(steps: number): boolean;
   takeOutput(): unknown;
   dispose(): void;
+  /** The object behind the guest's `host.callSync`, and the operations granted it (`app.<kind>`): before `initScript`. */
+  setAppBridge?(bridge: { call(kind: string, args: string[]): unknown }): void;
+  setSyncHostCapabilities?(operations: string[]): void;
+  /** What the last error a method threw was: `resource` for one of the engine's own ceilings. */
+  lastErrorKind?(): string;
 }
+
+/**
+ * Which step of the flow is running, as the session knows it (`ZippSession.step`).
+ *
+ * The engine stops a step that runs past its instruction or memory budget by itself, and then disposes the engine:
+ * nothing the step said after it began can be read back, no queued host call, no console line, no global. A Logic
+ * Block that ran out of budget failed the run without its card being marked: its own `catch`, which marks it, never
+ * runs for a ceiling. So each step says it is starting, synchronously, before its code runs (the compiler's
+ * `__oaiyStep(<node id>)`, through this): one granted `host.callSync` operation that only records the id, answered
+ * at once, with nothing to give back. A ceiling then fails the run naming that node, as a step's own failure does
+ * (`[oaiy-node:<id>] `, oaiy-core's node-errors.ts: kept in step by hand, as this file is imported by Node tests
+ * without the bundler), and the runtime marks its card.
+ *
+ * The capture happens at program top level, before a trusted flow's `var __zippHostCall = undefined` takes the bridge
+ * away from everything after it: the closure holds it for this one operation alone, and the flow's program and any
+ * body compiled at run time still read `__zippHostCall` as `undefined`.
+ */
+export const ZIPP_STEP_OPERATION = 'oaiy.step';
+const STEP_MARK_PRELUDE = `var __oaiyStepAt = (function (bridge) {
+  return function (id) {
+    if (typeof bridge !== 'function') return;
+    try { bridge("app.${ZIPP_STEP_OPERATION}", String(id)); } catch (e) { /* not granted here: no mark */ }
+  };
+})(typeof __zippHostCall === 'function' ? __zippHostCall : undefined);
+`;
+/** A node id as the compiler allows one (`SAFE_NODE_TOKEN`), and no longer than one can be. */
+const STEP_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
 
 /**
  * Two of the engine's own limits, mirrored here because `oaiy-core` cannot
@@ -203,10 +235,12 @@ export function buildZippScript(fullScript: string, hardened: boolean, opts: { p
   // `var __zippHostCall = undefined` below shadows it for the flow's program
   // and for nothing else: a body compiled at run time runs at global scope and
   // still reached the bridge, along with the `__z*` queue internals beside it.
-  // It is capability-denied today — the embedder never calls
-  // `setSyncHostCapabilities`, so a call comes back as a guest-catchable
-  // "unknown host call" — which makes this a misleading affordance now and a
-  // boundary the day any host installs a sync capability.
+  // One operation is granted through it, `app.oaiy.step` (a step saying it is
+  // starting, `ZIPP_STEP_OPERATION`), and only `STEP_MARK_PRELUDE`'s closure,
+  // which captures the bridge before this shadow, makes it; anything else
+  // comes back as a guest-catchable "synchronous host capability denied" —
+  // which makes the name a misleading affordance now, and a boundary for any
+  // operation granted later.
   //
   // Shadowing it at top level was GATED before it shipped, exactly as the
   // shims were: on v0.0.19, on both installs, an ordinary `host.call` round
@@ -223,7 +257,7 @@ export function buildZippScript(fullScript: string, hardened: boolean, opts: { p
   }
   const preamble = opts.preamble ? `${opts.preamble}\n` : '';
 
-  return `${topLevelShims}${preamble}var __oaiyConsole = {};
+  return `${STEP_MARK_PRELUDE}${topLevelShims}${preamble}var __oaiyConsole = {};
 (function () {
   var levels = ${JSON.stringify(CONSOLE_LEVELS)};
   for (var i = 0; i < levels.length; i++) {
@@ -240,8 +274,8 @@ export function buildZippScript(fullScript: string, hardened: boolean, opts: { p
   }
 })();
 (function (host, console) {
-${strict}// Zipp's synchronous host bridge. It is capability-denied by default (the
-// embedder never calls setSyncHostCapabilities), so this only removes a
+${strict}// Zipp's synchronous host bridge. Every operation but the step mark (which
+// reaches it through its own closure, above) is capability-denied, so this only removes a
 // misleading affordance — but an untrusted script has no business seeing it.
 // This copy covers the flow's OWN program in both modes; for a trusted flow
 // there is a second, top-level one (see topLevelShims) that covers a body
@@ -460,6 +494,8 @@ export class ZippSession {
   private readonly instructionBudgetSteps: number | undefined;
   private settled = false;
   private aborted = false;
+  /** The step running, as its `__oaiyStep` said (see `ZIPP_STEP_OPERATION`): the node a ceiling stopped. */
+  private step: string | null = null;
 
   constructor(engine: ZippEngine, hooks: ZippSessionHooks, opts: ZippSessionOptions = {}) {
     this.engine = engine;
@@ -498,10 +534,28 @@ export class ZippSession {
       }
     }
 
+    // Each step says it is starting (see `ZIPP_STEP_OPERATION`): granted before `initScript`, as the engine requires.
+    // An engine without the bridge runs as before, its ceilings naming no node.
+    if (typeof this.engine.setAppBridge === 'function' && typeof this.engine.setSyncHostCapabilities === 'function') {
+      try {
+        this.engine.setAppBridge({
+          call: (kind: string, args: string[]) => {
+            const id = String(args?.[0] ?? '');
+            if (kind === ZIPP_STEP_OPERATION && STEP_ID.test(id)) this.step = id;
+            return null;
+          },
+        });
+        this.engine.setSyncHostCapabilities([`app.${ZIPP_STEP_OPERATION}`]);
+      } catch {
+        // (a build that refuses the grant runs without the marks)
+      }
+    }
+
     try {
       this.engine.initScript(script);
     } catch (e) {
-      this.fail(`Zipp failed to compile the workflow: ${errText(e)}`);
+      // (a step that ran past a ceiling at the top level is that step's failure, not a compile error)
+      this.fail(this.isCeiling(e) ? this.ceiling(e) : `Zipp failed to compile the workflow: ${errText(e)}`);
       return;
     }
 
@@ -527,8 +581,26 @@ export class ZippSession {
       // handling stays: a trap is always possible in principle, and treating
       // one as anything other than terminal would be a way to keep using a
       // poisoned Engine.
-      this.fail(errText(e));
+      //
+      // A ceiling names the step that ran into it (see `ZIPP_STEP_OPERATION`); the engine is disposed by then.
+      this.fail(this.isCeiling(e) ? this.ceiling(e) : errText(e));
     }
+  }
+
+  /** Whether `e` is one of the engine's own ceilings (the instruction or memory budget), not the guest's throw. */
+  private isCeiling(e: unknown): boolean {
+    try {
+      if (typeof this.engine.lastErrorKind === 'function' && this.engine.lastErrorKind() === 'resource') return true;
+    } catch {
+      // (a disposed engine may not say)
+    }
+    return /exceeded its (?:instruction|memory) budget/.test(errText(e));
+  }
+
+  /** A ceiling's message, naming the step it stopped (`[oaiy-node:<id>] `) when one had said it was running. */
+  private ceiling(e: unknown): string {
+    const message = errText(e);
+    return this.step && !/^(?:Error:\s*)*\[oaiy-node:/.test(message) ? `[oaiy-node:${this.step}] ${message}` : message;
   }
 
   /** Stop servicing calls. The Worker terminates itself right after. */
