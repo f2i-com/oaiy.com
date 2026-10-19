@@ -16,6 +16,17 @@ import {
 import { Check, Copy, Download, FolderOpen, Trash2 } from 'lucide-react';
 import { useToast } from './Toasts';
 import { ask } from './ask';
+import LoadError from './LoadError';
+
+/** A download's state in words, as its badge and its button say it. */
+const DOWNLOAD_WORDS: Record<DownloadStatus, string> = {
+  queued: 'Waiting…',
+  active: 'Downloading…',
+  paused: 'Paused',
+  completed: 'Done',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+};
 
 /** Rows added per "Show more". The panel polls, so every row on screen is
  * re-rendered each tick — a whole library at once is what makes it stutter. */
@@ -171,11 +182,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
 
   return (
     <div className="panel">
-      {error && (
-        <div className="banner banner-err">
-          Couldn't reach OAIY: {error}
-        </div>
-      )}
+      {error && <LoadError what="The model files" error={error} onRetry={refresh} />}
       {/* What this page is for, beside the engines' own Get models (which most people want) */}
       <div className="banner banner-pending models-what">
         <span>
@@ -232,7 +239,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
         <form className="dl-form" onSubmit={onSubmit}>
           <label className="form-row">
             <span>URL</span>
-            <input
+            <input className="is-mono"
               type="text"
               placeholder="https://huggingface.co/..  or  https://example.com/model.gguf"
               value={url}
@@ -242,7 +249,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
           <div className="form-row-pair">
             <label className="form-row">
               <span>Filename (optional)</span>
-              <input
+              <input className="is-mono"
                 type="text"
                 placeholder="auto from URL"
                 value={filename}
@@ -251,7 +258,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
             </label>
             <label className="form-row">
               <span>Subfolder (optional)</span>
-              <input
+              <input className="is-mono"
                 type="text"
                 placeholder="e.g. llm, diffusion"
                 value={subdir}
@@ -288,10 +295,6 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
         <section className="model-section">
           <div className="section-title-row">
             <h3 className="section-title">Quick add</h3>
-            <span className="form-hint">
-              From <code className="path-code-small">model-catalog.json</code> —
-              edit it to add your own
-            </span>
           </div>
           {catalog.catalog.categories.map((cat) => (
             <div key={cat.id} className="catalog-category">
@@ -320,7 +323,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
                         </button>
                       ) : active ? (
                         <button className="btn btn-ghost" disabled>
-                          {active.status}…
+                          {DOWNLOAD_WORDS[active.status]}
                         </button>
                       ) : (
                         <button
@@ -533,5 +536,5 @@ function DownloadStatusBadge({ status }: { status: DownloadStatus }) {
         : status === 'paused'
           ? 'badge-neutral'
           : 'badge-pending';
-  return <span className={`badge ${cls}`}>{status}</span>;
+  return <span className={`badge ${cls}`}>{DOWNLOAD_WORDS[status] ?? status}</span>;
 }

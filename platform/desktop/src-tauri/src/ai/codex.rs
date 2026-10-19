@@ -192,6 +192,19 @@ fn drain_stderr(stderr: std::process::ChildStderr) {
     }
 }
 
+/// What the person is told when Codex is not on this computer at all: said for them, not as the system's
+/// "No such file or directory (os error 2)". The settings show it with how to install Codex.
+pub const NOT_INSTALLED: &str = "The Codex app isn't installed on this computer.";
+
+/// Why the `codex` CLI could not be run: not installed, in words; anything else as the system said it.
+fn cannot_run(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        NOT_INSTALLED.to_string()
+    } else {
+        format!("cannot run the codex CLI: {e}")
+    }
+}
+
 /// The real app-server: the `codex` CLI, in `app-server` mode, on stdio.
 fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     // The ChatGPT credential file the child writes lives in here, so where this
@@ -211,9 +224,7 @@ fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     cmd.env("CODEX_HOME", codex_home);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| CodexError::Unavailable(format!("cannot run the codex CLI: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| CodexError::Unavailable(cannot_run(&e)))?;
     // On Windows this child is `cmd /c codex`, so killing the tracked pid
     // reaps the shell and leaves the real agent running with a live
     // CODEX_HOME session. Job membership is inherited, so the whole tree
@@ -1300,6 +1311,16 @@ fn arguments_of(call: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex not installed is said in words, not as the system's "No such file or directory (os error 2)"; any
+    /// other failure to run it keeps the system's words.
+    #[test]
+    fn codex_not_installed_is_said_in_words() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(cannot_run(&missing), NOT_INSTALLED);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(cannot_run(&denied).starts_with("cannot run the codex CLI: "), "{}", cannot_run(&denied));
+    }
 
     /// A request of the app-server's (an approval, a tool call) is answered, refused, with its own id: unanswered,
     /// the turn waited on it to the deadline. A notification or a reply is handed on, and nothing is written back.

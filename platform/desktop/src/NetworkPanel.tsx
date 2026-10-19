@@ -18,9 +18,60 @@ import {
   type NetworkStatus,
 } from './api';
 import { hostOS } from './platform';
+import LoadError from './LoadError';
 
 /** How many answers in a row a pairing may miss (two seconds apart) before this screen gives it up. */
 const PAIRING_MISSES = 5;
+
+/**
+ * What each pairing under way was asked for, both ways or one, by its id, kept for this session: the page may be left
+ * while a pairing waits (it is shown again on return), and what was asked comes back with it, for its tick and for
+ * saying, once it is paired, that it came about one way only.
+ */
+const ASKED_KEY = 'oaiy.network.bothWaysAsked';
+/** A pairing's outcome that came after the page was left: said when the page opens again, once. */
+const OUTCOME_KEY = 'oaiy.network.pairingOutcome';
+
+type PairingOutcome = { text: string; paired: boolean; oneWay?: boolean };
+
+function readAsked(): Record<string, boolean> {
+  try {
+    const got: unknown = JSON.parse(sessionStorage.getItem(ASKED_KEY) ?? '{}');
+    return got && typeof got === 'object' && !Array.isArray(got) ? (got as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
+}
+/** Whether pairing `id` was asked for both ways (`undefined`: not known here). */
+function askedFor(id: string | undefined): boolean | undefined {
+  const asked = id ? readAsked()[id] : undefined;
+  return typeof asked === 'boolean' ? asked : undefined;
+}
+function rememberAsked(id: string, bothWays: boolean) {
+  try {
+    // (the last few only: a pairing lasts minutes, and an old one's answer is never asked again)
+    const kept = Object.entries({ ...readAsked(), [id]: bothWays }).slice(-10);
+    sessionStorage.setItem(ASKED_KEY, JSON.stringify(Object.fromEntries(kept)));
+  } catch {
+    /* storage can be unavailable: a page left meanwhile ticks both ways again, as it did */
+  }
+}
+function storedOutcome(): PairingOutcome | null {
+  try {
+    const got = JSON.parse(sessionStorage.getItem(OUTCOME_KEY) ?? 'null') as PairingOutcome | null;
+    return got && typeof got.text === 'string' ? got : null;
+  } catch {
+    return null;
+  }
+}
+function storeOutcome(outcome: PairingOutcome | null) {
+  try {
+    if (outcome) sessionStorage.setItem(OUTCOME_KEY, JSON.stringify(outcome));
+    else sessionStorage.removeItem(OUTCOME_KEY);
+  } catch {
+    /* storage can be unavailable: the outcome is not said again */
+  }
+}
 
 /**
  * Setup → Networking: OAIY Network (docs/NETWORK.md). This computer's place on the network (off, a primary that uses
@@ -106,17 +157,25 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
     }
   };
 
+  // (not read yet: what went wrong, with a way to ask again, rather than a page with nothing on it)
   if (!status) {
     return (
       <div className="panel">
-        {error ? <div className="banner banner-err">{error}</div> : <div className="empty-state">Loading…</div>}
+        {error ? (
+          <>
+            <LoadError error={error} what="OAIY Network’s status" onRetry={refresh} />
+            <div className="empty-state">This computer’s place on OAIY Network, and the computers paired with it, show here once it can be read.</div>
+          </>
+        ) : (
+          <div className="empty-state">Loading…</div>
+        )}
       </div>
     );
   }
 
   return (
     <div className="panel" data-testid="network-panel">
-      {error && <div className="banner banner-err">{error}</div>}
+      {error && <LoadError error={error} what="OAIY Network’s status" onRetry={refresh} />}
       {actionError && <div className="banner banner-err" role="alert">{actionError}</div>}
       <ThisComputer status={status} busy={busy} onChange={change} />
       {status.listenError && (
@@ -552,20 +611,32 @@ function FindWorkers({
   onPaired: () => void;
 }) {
   const [address, setAddress] = useState('');
-  /** Paired both ways at once: the other computer may use this one too. */
-  const [bothWays, setBothWays] = useState(true);
+  /** Paired both ways at once: the other computer may use this one too (a pairing shown again keeps what was asked). */
+  const [bothWays, setBothWays] = useState(() => askedFor(inProgress?.[0]?.pairingId) ?? true);
   const [pairing, setPairing] = useState<NetworkPairing | null>(() => inProgress?.[0] ?? null);
   /** The worker approved: this side's person says whether it showed the same code. */
   const [approvedThere, setApprovedThere] = useState(() => inProgress?.[0]?.status === 'approved_there');
-  const [outcome, setOutcome] = useState<{ text: string; paired: boolean; oneWay?: boolean } | null>(null);
+  // (an outcome that came while the page was left is said now, and then no more)
+  const [outcome, setOutcomeNow] = useState<PairingOutcome | null>(storedOutcome);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const timer = useRef<number | undefined>(undefined);
-  /** The pairing under way was asked for both ways (said once it is paired, when the other way did not come about). */
-  const askedBothWays = useRef(false);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    storeOutcome(null);
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  /** Say how a pairing ended: here, or, where the page was left before the answer came, when it is opened again. */
+  const setOutcome = (next: PairingOutcome | null) => {
+    if (mounted.current) setOutcomeNow(next);
+    else storeOutcome(next);
+  };
   /** What a pairing that went through says: paired; or paired one way only, and why, where both ways was asked for. */
-  const paired = (name: string, r: { bothWays?: boolean; bothWaysError?: string | null }) =>
-    askedBothWays.current && r.bothWays === false
+  const paired = (pairingId: string, name: string, r: { bothWays?: boolean; bothWaysError?: string | null }): PairingOutcome =>
+    askedFor(pairingId) === true && r.bothWays === false
       ? {
           text: `Paired with ${name}, one way only: this computer uses ${name}, but ${name} cannot use this one${r.bothWaysError ? `: ${r.bothWaysError.replace(/\.$/, '')}` : ''}. To let it, pair again from ${name}’s Networking page.`,
           paired: true,
@@ -597,7 +668,7 @@ function FindWorkers({
         setPairing(null);
         setOutcome(
           r.status === 'approved'
-            ? paired(r.node?.name ?? pairing.worker.name, r)
+            ? paired(pairing.pairingId, r.node?.name ?? pairing.worker.name, r)
             : r.status === 'denied'
               ? { text: `${pairing.worker.name} declined the pairing.`, paired: false }
               : { text: 'The pairing request expired: start again.', paired: false },
@@ -631,13 +702,13 @@ function FindWorkers({
     setError(null);
     setPairing(null);
     setApprovedThere(false);
-    askedBothWays.current = accept && lends && bothWays;
+    rememberAsked(pairing.pairingId, accept && lends && bothWays);
     try {
       const r = await network.confirmPairing(pairing.pairingId, accept, accept && lends && bothWays);
       if (r.status === 'approved') setAddress('');
       setOutcome(
         r.status === 'approved'
-          ? paired(r.node?.name ?? pairing.worker.name, r)
+          ? paired(pairing.pairingId, r.node?.name ?? pairing.worker.name, r)
           : waiting
             ? null
             : { text: 'Not paired: the codes did not match.', paired: false },
@@ -656,8 +727,8 @@ function FindWorkers({
     setApprovedThere(false);
     try {
       // (both ways where this computer lends itself and the person leaves it ticked: asked again once the other approves)
-      askedBothWays.current = lends && bothWays;
       const started = await network.startPairing({ ...target, bothWays: lends && bothWays });
+      rememberAsked(started.pairingId, lends && bothWays);
       // (approved there at once, its window to pair by itself open: still paired here only once this person says it
       // shows the same code, which it does with the computers it paired by itself)
       setApprovedThere(started.status === 'approved_there');
@@ -782,7 +853,7 @@ function FindWorkers({
       >
         <label className="form-row">
           <span>{discovery ? 'Or add one by its address' : 'Add one by its address'}</span>
-          <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder="192.168.1.20:17975" disabled={starting || !!pairing} aria-label="The other computer’s address" />
+          <input className="is-mono" value={address} onChange={(e) => setAddress(e.target.value)} placeholder="192.168.1.20:17975" disabled={starting || !!pairing} aria-label="The other computer’s address" />
         </label>
         <button className="btn btn-primary" type="submit" disabled={starting || !!pairing || !address.trim()}>
           {starting ? <Loader2 size={14} className="spin" aria-hidden /> : <Link2 size={14} aria-hidden />} Pair
@@ -842,12 +913,32 @@ export function notInEffect(d: NetworkDefault | undefined, name: string): string
   return `Not in effect: ${why}; this computer’s own model runs meanwhile.`;
 }
 
-/** A model's mark as its kind's default here: "Default", or "Default, not in effect" with why (Engines → Other computers). */
+/**
+ * A default on a paired computer that is still in effect while that computer's engines are not answering: nothing of
+ * this computer's runs in its place, so what uses it fails until they answer again. In a sentence; null otherwise.
+ */
+export function defaultDown(d: NetworkDefault | undefined, name: string): string | null {
+  if (!d || d.inEffect === false || d.waiting !== 'engines_down') return null;
+  const who = d.nodeName || name || 'the paired computer';
+  // (a language model's are chats; a picture model's and the rest, whatever asks for one)
+  const chats = /^engine:llm:/.test(d.id);
+  return `${who}’s engines aren’t answering: ${chats ? 'chats that use it fail' : 'what uses it fails'} until they do.`;
+}
+
+/**
+ * A model's mark as its kind's default here: "Default"; "Default, not in effect" with why; or "Default, not answering"
+ * where it is still the default and its computer's engines are down (Engines → Other computers).
+ */
 export function DefaultChip({ d, name, size = 12 }: { d: NetworkDefault | undefined; name: string; size?: number }) {
   const waiting = notInEffect(d, name);
+  const down = defaultDown(d, name);
   return waiting ? (
     <span className="engine-default-chip is-waiting" title={waiting}>
       <TriangleAlert size={size} aria-hidden /> Default, not in effect
+    </span>
+  ) : down ? (
+    <span className="engine-default-chip is-waiting" title={down}>
+      <TriangleAlert size={size} aria-hidden /> Default, not answering
     </span>
   ) : (
     <span className="engine-default-chip" title="This computer's default of its kind (Engines → Other computers)">
@@ -1136,6 +1227,15 @@ function PairedComputers({
                     <TriangleAlert size={13} aria-hidden /> Its engines: {n.enginesError}
                   </div>
                 )}
+                {/* (a default of this computer's on it, still in effect while its engines do not answer: said on its card
+                    too, as its models may not be listed meanwhile) */}
+                {Object.values(defaults ?? {})
+                  .filter((d) => d.nodeId === n.nodeId && defaultDown(d, n.name))
+                  .map((d) => (
+                    <div className="card-warn" key={d.id} data-testid="network-default-down">
+                      <TriangleAlert size={13} aria-hidden /> {d.model} is this computer’s default. {defaultDown(d, n.name)}
+                    </div>
+                  ))}
                 <div className={stale ? 'network-stale' : undefined} hidden={!worker}>
                   {stale && n.lastSeenMs && <div className="network-stale-note">Last report {ago(n.lastSeenMs)}</div>}
                   {(n.devices.length > 0 || n.machine) && (

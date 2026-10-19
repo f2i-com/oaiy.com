@@ -98,7 +98,9 @@ describe('Transfers', () => {
   it('says plainly that consent is not signed on this computer, whether transfers are on or off', async () => {
     await mount();
     const warning = () => host.querySelector('[data-testid=consent-not-signed]');
-    expect(warning()?.textContent).toBe('Consent is not signed on this computer: a plugin could flip a scope. Keep this off unless you trust every plugin you have installed.');
+    expect(warning()?.textContent).toBe('The permission you give for taking calls is not protected on this computer, so another plugin you installed could change it. Keep this off unless you trust every plugin you have installed.');
+    // (in a person's words: not the words of the code that keeps it)
+    expect(warning()?.textContent).not.toMatch(/signed|scope/);
     // It sits with the switch it is about, before it.
     const switchRow = box('Transfer calls to me').closest('label')!;
     expect(warning()!.compareDocumentPosition(switchRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();

@@ -271,7 +271,9 @@ describe('the AI Receptionist’s sub-menu', () => {
     const { markUnsaved, forgetUnsaved } = await import('./unsavedChanges');
     await go('hours');
     markUnsaved('hours-test', true, 'the business hours');
-    const confirm = vi.fn(() => false);
+    // What the dialog plugin's broken `confirm` gave back: a Promise, which is truthy. The old code went ahead on it, as
+    // if the person had said yes; ask() awaits the answer and takes only a real `true`, so this is a no.
+    const confirm = vi.fn((_question: string): unknown => Promise.resolve(false));
     vi.stubGlobal('confirm', confirm);
     try {
       await go('calendar');

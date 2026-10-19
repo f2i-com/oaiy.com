@@ -6,9 +6,10 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { modulesMock, phoneStatus, phoneCalls, calendarGet, calendarSync, networkStatus, enginesStatus } = vi.hoisted(() => ({
+const { modulesMock, phoneStatus, phoneCalls, calendarGet, calendarSync, networkStatus, enginesStatus, enginesCatalog } = vi.hoisted(() => ({
   networkStatus: vi.fn(),
   enginesStatus: vi.fn(),
+  enginesCatalog: vi.fn(),
   modulesMock: vi.fn(),
   phoneStatus: vi.fn(),
   phoneCalls: vi.fn(),
@@ -20,7 +21,7 @@ vi.mock('./api', () => ({
   modules: { list: (...a: unknown[]) => modulesMock(...a) },
   phone: { status: (...a: unknown[]) => phoneStatus(...a), calls: (...a: unknown[]) => phoneCalls(...a) },
   calendar: { get: (...a: unknown[]) => calendarGet(...a), syncStatus: (...a: unknown[]) => calendarSync(...a) },
-  engines: { status: (...a: unknown[]) => enginesStatus(...a) },
+  engines: { status: (...a: unknown[]) => enginesStatus(...a), catalog: (...a: unknown[]) => enginesCatalog(...a) },
   network: { status: (...a: unknown[]) => networkStatus(...a) },
   link: { status: vi.fn().mockResolvedValue({ linked: false, attempt: { phase: 'idle' }, available: [] }) },
 }));
@@ -62,6 +63,7 @@ beforeEach(() => {
   calendarSync.mockResolvedValue({ linked: false, state: 'unlinked' });
   networkStatus.mockRejectedValue(new Error('no network'));
   enginesStatus.mockResolvedValue({ running: false });
+  enginesCatalog.mockResolvedValue({ running: true, models: [] });
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -128,6 +130,58 @@ describe('the language model’s tile', () => {
     expect(tile().textContent).toBe('On Desktopqwen3.8-flash-next · paired computer');
     await act(async () => (tile() as HTMLButtonElement).click());
     expect(onNavigate).toHaveBeenCalledWith('engine-workers');
+  });
+
+  it('names the model the paired computer runs now, as the desktop says it (`model`), not one its id names', async () => {
+    modulesMock.mockResolvedValue(snapshot(false, false));
+    networkStatus.mockResolvedValue({
+      enabled: true,
+      uses: true,
+      defaults: { llm: { ...desktop, id: 'engine:llm:node.w1/qwen3.5-9b', insteadOf: 'minicpm-v-4.7', model: 'qwen3.8-flash-next', inEffect: true, waiting: null } },
+    });
+    await mount();
+    expect(tile().textContent).toBe('On Desktopqwen3.8-flash-next · paired computer');
+    expect(tile().textContent).not.toContain('qwen3.5-9b');
+  });
+
+  it('does not call a paired default ready while its computer’s engines are not answering', async () => {
+    modulesMock.mockResolvedValue(snapshot(false, false));
+    networkStatus.mockResolvedValue({ enabled: true, uses: true, defaults: { llm: { ...desktop, inEffect: true, waiting: 'engines_down' } } });
+    await mount();
+    expect(tile().textContent).toBe('Not answeringqwen3.8-flash-next · on Desktop');
+    expect(tile().querySelector('strong')?.className).toBe('warn');
+    expect(tile().getAttribute('title')).toContain('Desktop’s engines aren’t answering');
+  });
+
+  it('names a model by its name in the engines’ catalogue, read once and again only when the model changes', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      modulesMock.mockResolvedValue(snapshot(false, false));
+      enginesStatus.mockResolvedValue({ running: true, llm: { state: 'ready', resident: 'minicpm-v-4.7' } });
+      enginesCatalog.mockResolvedValue({ running: true, models: [{ id: 'minicpm-v-4.7', name: 'MiniCPM-V 4.7' }, { id: 'qwen3.5-9b', name: 'Qwen3.5 9B' }] });
+      await mount();
+      await act(async () => {});
+      const llmTile = () => Array.from(host.querySelectorAll('.overview-tile')).find((t) => t.textContent?.includes('Model ready'))!;
+      expect(llmTile().textContent).toBe('Model readyMiniCPM-V 4.7');
+      const asked = enginesCatalog.mock.calls.length;
+      expect(asked).toBeGreaterThan(0);
+      // The next poll, the same model: the catalogue is not asked again.
+      await act(async () => {
+        vi.advanceTimersByTime(10_000);
+      });
+      await act(async () => {});
+      expect(enginesCatalog.mock.calls.length).toBe(asked);
+      // Another model: asked again, and named.
+      enginesStatus.mockResolvedValue({ running: true, llm: { state: 'ready', resident: 'qwen3.5-9b' } });
+      await act(async () => {
+        vi.advanceTimersByTime(10_000);
+      });
+      await act(async () => {});
+      expect(enginesCatalog.mock.calls.length).toBe(asked + 1);
+      expect(llmTile().textContent).toBe('Model readyQwen3.5 9B');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('names this computer’s own while the paired computer’s is not in effect', async () => {

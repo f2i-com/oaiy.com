@@ -2,8 +2,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { ChevronDown, CircleAlert, Loader2, RefreshCw, RotateCcw, Search, Square, Trash2, Workflow, X } from 'lucide-react';
 import { bridge, network, type RunHistory, type RunPage, type RunRecord, type RunStatus } from './api';
 import DeadLetters from './DeadLetters';
+import LoadError, { loadErrorText } from './LoadError';
 import { ask } from './ask';
-import { CopyButton, Fields, JsonBlock, RunAnswer, durationText, errorText, fullWhen, whenText, whoAsked } from './RunParts';
+import { CopyButton, Fields, JsonBlock, RunAnswer, durationText, errorText, eventWords, fullWhen, whenText, whoAsked } from './RunParts';
 import { lastFailedOf, writeFailedSeen } from './failedSeen';
 import { useToast } from './Toasts';
 import { invalidate, peek, put } from './useCached';
@@ -161,7 +162,7 @@ function errorReport(r: RunRecord): string {
  * something; the full text is also the tooltip. A cancelled run's reason is said
  * quietly: nothing went wrong.
  */
-function RunError({ code, message: said, quiet = false }: { code: string; message: string; quiet?: boolean }) {
+function RunError({ message: said, quiet = false }: { message: string; quiet?: boolean }) {
   const message = errorText(said);
   const [all, setAll] = useState(false);
   const [clipped, setClipped] = useState(false);
@@ -183,9 +184,10 @@ function RunError({ code, message: said, quiet = false }: { code: string; messag
   return (
     <div className={quiet ? 'run-error is-quiet' : 'run-error'}>
       <p>
-        {/* (the icon and the code on the first line's height, beside the message's first line) */}
+        {/* (the icon on the first line's height, beside the message's first line; the error's code is in the run's
+            details, where its id and the rest are) */}
         <span className="run-error-code">
-          <CircleAlert size={13} aria-hidden /> <code>{code}</code>
+          <CircleAlert size={13} aria-hidden />
         </span>{' '}
         <span ref={textRef} className={all ? 'run-error-text' : 'run-error-text clamped'} title={clipped && !all ? message : undefined}>
           {message}
@@ -211,6 +213,8 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
   // about the list being wrong.
   const [data, setData] = useState<RunHistory | null>(() => peek(`runHistory:${filter}`) ?? null);
   const [error, setError] = useState<string | null>(null);
+  /** The error is a read of the list (asked again with "Try again"), not a clear that was refused. */
+  const [readFailed, setReadFailed] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
   /** The run open below, kept in the list after it left the filter (a run in progress that ended), until closed. */
   const [held, setHeld] = useState<RunRecord | null>(null);
@@ -317,7 +321,10 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
       // Looked at: Overview's warning is about failures since (the newest of these, and how many there are).
       if (filter === 'failures' && !narrowing && next.byStatus) writeFailedSeen(countOf(next, 'failures') ?? 0, lastFailedOf(next.runs));
     } catch (e) {
-      if (mine === asked.current) setError(`Run history could not be read: ${e instanceof Error ? e.message : String(e)}`);
+      if (mine === asked.current) {
+        setError(loadErrorText(e instanceof Error ? e.message : String(e), 'Run history'));
+        setReadFailed(true);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter, want, searched, flowPick]);
@@ -455,7 +462,10 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
       });
       setOlderMore(page.more ?? page.runs.length >= PAGE);
     } catch (e) {
-      if (of === olderOf.current) setError(`Older runs could not be read: ${e instanceof Error ? e.message : String(e)}`);
+      if (of === olderOf.current) {
+        setError(loadErrorText(e instanceof Error ? e.message : String(e), 'Older runs'));
+        setReadFailed(true);
+      }
     } finally {
       setLoadingOlder(false);
     }
@@ -496,6 +506,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
       });
     } catch (e) {
       setError(`Finished runs could not be cleared: ${e instanceof Error ? e.message : String(e)}`);
+      setReadFailed(false);
     } finally {
       setClearing(false);
     }
@@ -608,16 +619,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
 
   return (
     <div className="panel">
-      {error && (
-        <div className="banner banner-err" role="alert">
-          ⚠ {error}
-          {data ? ' Showing what was read last.' : ''}
-        </div>
-      )}
-
-      {/* Above the run list: an event that never became a run is a worse
-          failure than a run that failed, because nothing recorded it tried. */}
-      <DeadLetters />
+      {error && <LoadError error={`${error}${data && readFailed ? ' Showing what was read last.' : ''}`} onRetry={readFailed ? refreshNow : undefined} />}
 
       <section className="service-section run-history">
         <div className="section-title-row">
@@ -771,6 +773,10 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
           </div>
         )}
       </section>
+
+      {/* Below the runs, where it is no longer the first thing the page says: an event that never became a run. It is
+          there only while there is one. */}
+      <DeadLetters />
     </div>
   );
 }
@@ -808,9 +814,9 @@ function RunRow({ r, name, flowKnown, who, open, held, now, busy, onToggle, onSt
             <strong className="run-flow">{name}</strong>
             {r.flowId && name !== r.flowId && <span className="run-flow-id">{r.flowId}</span>}
           </span>
-          {/* (a trigger's run says its event: which trigger it was is in its details) */}
+          {/* (a trigger's run says its event, in words: the event's name, and which trigger it was, are in its details) */}
           <span className="run-meta" title={r.triggerEvent ? `${who}: ${r.triggerEvent}` : who}>
-            {r.triggerEvent ? (r.callerProduct.startsWith('oaiy-trigger:') ? `On ${r.triggerEvent}` : `${who} · ${r.triggerEvent}`) : who}
+            {r.triggerEvent ? (r.callerProduct.startsWith('oaiy-trigger:') ? `When ${eventWords(r.triggerEvent)}` : `${who} · when ${eventWords(r.triggerEvent)}`) : who}
           </span>
           <span className="run-took">{time}</span>
           <time className="run-when" dateTime={r.reservedAt} title={`Asked ${fullWhen(r.reservedAt)}`}>
@@ -828,7 +834,7 @@ function RunRow({ r, name, flowKnown, who, open, held, now, busy, onToggle, onSt
 
       {/* The reason, on the row, unexpanded. Making someone click to
           find out why a run failed is the problem this panel fixes. */}
-      {r.error && <RunError code={r.error.code} message={r.error.message} quiet={r.status === 'cancelled'} />}
+      {r.error && <RunError message={r.error.message} quiet={r.status === 'cancelled'} />}
       {held && <p className="run-held form-hint">No longer among the {held}: it {LABEL[r.status]}. It stays here while it is open.</p>}
 
       {open && <RunDetail r={r} name={name} flowKnown={flowKnown} who={who} busy={busy} onAgain={onAgain} onOpenEditor={onOpenEditor} />}
@@ -937,6 +943,14 @@ function RunDetail({ r, name, flowKnown, who, busy, onAgain, onOpenEditor }: Pic
         <dd>
           <code>{r.correlationId}</code>
         </dd>
+        {r.error?.code && (
+          <>
+            <dt>Error</dt>
+            <dd>
+              <code>{r.error.code}</code>
+            </dd>
+          </>
+        )}
         {r.error?.nodeId && (
           <>
             <dt>Failed at</dt>

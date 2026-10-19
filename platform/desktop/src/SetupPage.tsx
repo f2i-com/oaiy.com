@@ -22,6 +22,8 @@ import PluginWizard from './PluginSetup';
 import type { PluginNavTarget } from './PluginScreenPage';
 import {
   aiReady,
+  catalogNote,
+  chosenNotInstalled,
   currentStepId,
   firstRunPosition,
   firstRunProgress,
@@ -31,6 +33,7 @@ import {
   localModelLine,
   readSetup,
   recommendationOrFallback,
+  withCodexAsItIs,
   type FirstRunStep,
 } from './setupFlow';
 import { AgentStep, HandoffStep, modelLineText, WelcomeStep, YourAiStep } from './SetupEssentials';
@@ -90,7 +93,9 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
 
   // The recommendation, or (a desktop without it, or one that cannot work it out now) local if Engines has a model chosen.
   const recommendation = answered(recAnswer, recError);
-  const rec = recommendation ? recommendation : (recommendation === null || recError) && (catalog || catalogError) ? recommendationOrFallback(null, catalog, codexOn) : null;
+  const given = recommendation ? recommendation : (recommendation === null || recError) && (catalog || catalogError) ? recommendationOrFallback(null, catalog, codexOn) : null;
+  // (never ChatGPT where Codex is not installed: a first-timer was handed its sign-in, failing, with Next held)
+  const rec = given && withCodexAsItIs(given, codexStatus);
 
   /** "Set up the rest myself" was chosen (or a navigation, or the record's place, is in the rest). */
   const asked = initialStep ? currentStepId(initialStep) : null;
@@ -118,6 +123,12 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
   }, [currentId, state, steps, asked]);
   const index = Math.max(0, steps.findIndex((s) => s.id === currentId));
   const current = steps[index];
+  // The plugins OAIY knows how to install: asked while the Plugins step shows (and Done, which names any not installed).
+  const [pluginCatalog, refreshPluginCatalog, pluginCatalogError] = usePoll(
+    () => setupApi.catalog().then((c) => c.plugins),
+    10000,
+    current?.id === 'plugins' || current?.id === 'done',
+  );
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -273,7 +284,11 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
         </>
       );
       const waiting =
-        choice === 'chatgpt' ? 'Sign in with ChatGPT to use it' : choice === 'provider' ? 'Connect a provider and choose its model' : 'Waiting for a language model in Engines';
+        choice === 'chatgpt'
+          ? codexStatus?.available === false
+            ? 'Install the Codex app to use ChatGPT'
+            : 'Sign in with ChatGPT to use it'
+          : choice === 'provider' ? 'Connect a provider and choose its model' : 'Waiting for a language model in Engines';
       footer = (
         <StepFooter
           onBack={() => go(index - 1)}
@@ -329,13 +344,19 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
       );
       break;
     }
-    case 'plugins':
+    case 'plugins': {
+      const chosen = state.firstRun.chosenPlugins;
+      // (a ticked plugin not installed has no setup to follow: Next waits, and says why, rather than drop it unsaid)
+      const missing = chosenNotInstalled(chosen, plugins, pluginCatalog);
       content = (
         <PluginsStep
           kicker={kicker}
           state={current.state}
-          chosen={state.firstRun.chosenPlugins}
+          chosen={chosen}
           plugins={plugins}
+          catalog={pluginCatalog}
+          catalogError={pluginCatalogError}
+          onRefreshCatalog={() => void refreshPluginCatalog()}
           onToggle={(id, on) => void toggleChosen(id, on)}
           onInstalled={(id) => void installed(id)}
         />
@@ -343,17 +364,27 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
       footer = (
         <StepFooter
           onBack={() => go(index - 1)}
-          status={status ?? (state.firstRun.chosenPlugins.length ? `${state.firstRun.chosenPlugins.length} chosen` : 'None chosen: plugins can be added any time')}
-          onNext={() => (state.firstRun.chosenPlugins.length ? nextStep() : skip())}
+          status={
+            error ? (
+              status
+            ) : missing.length ? (
+              <span className="card-warn">{`${missing.join(' and ')} ${missing.length === 1 ? 'is' : 'are'} ticked but not installed: install ${missing.length === 1 ? 'it' : 'them'}, or untick ${missing.length === 1 ? 'it' : 'them'}, to go on.`}</span>
+            ) : (
+              status ?? (chosen.length ? `${chosen.length} chosen` : 'None chosen: plugins can be added any time')
+            )
+          }
+          onNext={() => (chosen.length ? nextStep() : skip())}
+          nextDisabled={missing.length > 0}
         />
       );
       break;
+    }
     case 'connect':
       content = <ConnectStep kicker={kicker} state={current.state} paired={paired} linked={linked === true} onNavigate={onNavigate} />;
       footer = <StepFooter onBack={() => go(index - 1)} status={status} onSkip={current.state === 'done' ? undefined : skip} onNext={nextStep} />;
       break;
     case 'done':
-      content = <DoneStep kicker={kicker} steps={steps} onPick={(i) => go(i)} />;
+      content = <DoneStep kicker={kicker} steps={steps} notInstalled={chosenNotInstalled(state.firstRun.chosenPlugins, plugins, pluginCatalog)} onPick={(i) => go(i)} />;
       footer = <StepFooter onBack={() => go(index - 1)} status={status} onNext={() => void finish()} nextLabel="Finish setup" busy={busy} />;
       break;
     default:
@@ -379,8 +410,8 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
       title="Set up OAIY"
       subtitle={
         inRest
-          ? 'Your AI and the Agent, then your plugins, their devices and your apps, step by step. Leave any time: setup keeps its place.'
-          : 'The essentials: your AI, and what the Agent may do. Then the Agent sets up the rest with you. Leave any time: setup keeps its place.'
+          ? 'Your AI, the Agent, then your plugins and apps, step by step. Leave any time: setup keeps its place.'
+          : 'Choose your AI and what the Agent may do; then the Agent sets up the rest with you. Leave any time: setup keeps its place.'
       }
       progress={progress}
       rail={steps.map((s) => ({ id: s.id, title: s.title, hint: s.hint, state: s.state, optional: s.optional }))}
@@ -405,6 +436,9 @@ function PluginsStep({
   state,
   chosen,
   plugins,
+  catalog,
+  catalogError,
+  onRefreshCatalog,
   onToggle,
   onInstalled,
 }: {
@@ -412,15 +446,19 @@ function PluginsStep({
   state: FirstRunStep['state'];
   chosen: string[];
   plugins: PluginRecord[] | null;
+  catalog: CatalogPlugin[] | null;
+  catalogError: string | null;
+  onRefreshCatalog: () => void;
   onToggle: (id: string, on: boolean) => void;
   onInstalled: (id: string) => void;
 }) {
-  const [catalog, refreshCatalog, catalogError] = usePoll(() => setupApi.catalog().then((c) => c.plugins), 10000);
   const others = (plugins ?? []).filter((p) => !(catalog ?? []).some((c) => c.id === p.id));
-  const installedNow = async (id: string) => {
-    await refreshCatalog();
+  const installedNow = (id: string) => {
+    onRefreshCatalog();
     onInstalled(id);
   };
+  // One install box at a time: a ticked plugin's own, while it is not installed; else one for any other plugin, closed.
+  const ownBoxOpen = (catalog ?? []).some((c) => chosen.includes(c.id) && !c.installed && !plugins?.some((p) => p.id === c.id));
   return (
     <div className="setup-plugins">
       <StepHeader
@@ -429,7 +467,7 @@ function PluginsStep({
         state={state}
         description="Plugins bring devices and services to OAIY, such as your business phone. Tick the ones to set up: each one's own setup follows, step by step."
       />
-      {catalogError && !catalog && <RetryLine message={`The plugin list could not be read: ${catalogError}`} onRetry={() => void refreshCatalog()} />}
+      {catalogError && !catalog && <RetryLine message={`The plugin list could not be read: ${catalogError}`} onRetry={onRefreshCatalog} />}
       <div className="setup-plugin-list">
         {(catalog ?? []).map((c) => (
           <CatalogCard key={c.id} entry={c} record={plugins?.find((p) => p.id === c.id) ?? null} chosen={chosen.includes(c.id)} onToggle={onToggle} onInstalled={installedNow} />
@@ -453,11 +491,15 @@ function PluginsStep({
           );
         })}
       </div>
-      <FolderInstall
-        title="Install a plugin from a folder"
-        hint={`A plugin folder, .zip or .tar.gz on this computer${isTauri() ? ' (Browse picks a folder: type or paste the path of a .zip or .tar.gz)' : ''}. Installing a plugin installs code this computer runs: install only plugins you trust.`}
-        onInstalled={installedNow}
-      />
+      {!ownBoxOpen && (
+        <details className="setup-other-plugin">
+          <summary>Another plugin, from a folder on this computer</summary>
+          <FolderInstall
+            hint={`A plugin folder, .zip or .tar.gz on this computer${isTauri() ? ' (Browse picks a folder: type or paste the path of a .zip or .tar.gz)' : ''}. Installing a plugin installs code this computer runs: install only plugins you trust.`}
+            onInstalled={installedNow}
+          />
+        </details>
+      )}
     </div>
   );
 }
@@ -507,7 +549,7 @@ function CatalogCard({
           </div>
         )}
         {!installed && chosen && (
-          <FolderInstall compact initial={entry.source.path ?? ''} hint={entry.source.path ? `Found on this computer.` : entry.source.note} onInstalled={onInstalled} expectId={entry.id} />
+          <FolderInstall compact initial={entry.source.path ?? ''} hint={entry.source.path ? `Found on this computer.` : catalogNote(entry.source)} onInstalled={onInstalled} expectId={entry.id} />
         )}
         {!installed && !chosen && <small className="form-hint">Tick it to install it{entry.source.path ? ' (found on this computer)' : ' from its folder'}.</small>}
       </div>
@@ -628,7 +670,7 @@ function ConnectStep({ kicker, state, paired, linked, onNavigate }: { kicker: st
   );
 }
 
-function DoneStep({ kicker, steps, onPick }: { kicker: string; steps: FirstRunStep[]; onPick: (i: number) => void }) {
+function DoneStep({ kicker, steps, notInstalled, onPick }: { kicker: string; steps: FirstRunStep[]; notInstalled: string[]; onPick: (i: number) => void }) {
   const counted = steps.filter((s) => s.id !== 'done' && s.id !== 'welcome' && s.id !== 'handoff');
   const left = counted.filter((s) => s.state !== 'done');
   return (
@@ -646,7 +688,17 @@ function DoneStep({ kicker, steps, onPick }: { kicker: string; steps: FirstRunSt
             </span>
             <span>
               <strong>{s.title}</strong>
-              <small>{s.state === 'done' ? 'Done' : s.state === 'skipped' ? 'Skipped for now' : s.optional ? 'Optional, not done' : 'Not done yet'}</small>
+              <small>
+                {s.state === 'done'
+                  ? 'Done'
+                  : s.id === 'plugins' && notInstalled.length
+                    ? `Ticked but not installed: ${notInstalled.join(' and ')}`
+                    : s.state === 'skipped'
+                      ? 'Skipped for now'
+                      : s.optional
+                        ? 'Optional, not done'
+                        : 'Not done yet'}
+              </small>
             </span>
             {s.state !== 'done' && (
               <button type="button" className="btn-tiny" onClick={() => onPick(steps.indexOf(s))}>

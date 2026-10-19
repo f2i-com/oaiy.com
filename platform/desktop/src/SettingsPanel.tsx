@@ -802,7 +802,7 @@ export default function SettingsPanel() {
         >
           <label className="form-row">
             <span>{hfTokenSet ? 'Replace token' : 'Token'}</span>
-            <input
+            <input className="is-mono"
               type="password"
               placeholder="hf_..."
               autoComplete="off"

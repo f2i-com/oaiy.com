@@ -347,26 +347,41 @@ struct Recommend {
 /// longer holds the question up: status is answered beside it.)
 const SIGN_IN_BUDGET: Duration = Duration::from_secs(5);
 
-/// The last answer, for when the budget runs out.
+/// The last answers, for when the budget runs out: whether ChatGPT is signed
+/// in, and whether the Codex app is there at all (taken as there until it is
+/// found not to be: a Codex slow to start is there).
 static LAST_SIGNED_IN: AtomicBool = AtomicBool::new(false);
+static LAST_AVAILABLE: AtomicBool = AtomicBool::new(true);
 
 async fn recommendation(State(st): State<Recommend>) -> Response {
     let codex = st.codex.clone();
     let asking = tokio::task::spawn_blocking(move || {
-        let signed_in = codex.status().connected;
-        LAST_SIGNED_IN.store(signed_in, Ordering::Release);
-        signed_in
+        let status = codex.status();
+        LAST_SIGNED_IN.store(status.connected, Ordering::Release);
+        LAST_AVAILABLE.store(status.available, Ordering::Release);
+        (status.available, status.connected)
     });
-    let signed_in = async move {
+    let codex_now = async move {
         match tokio::time::timeout(SIGN_IN_BUDGET, asking).await {
-            Ok(Ok(signed_in)) => signed_in,
+            Ok(Ok(now)) => now,
             // Still asking (it finishes on its own and is remembered): the last answer.
-            _ => LAST_SIGNED_IN.load(Ordering::Acquire),
+            _ => (LAST_AVAILABLE.load(Ordering::Acquire), LAST_SIGNED_IN.load(Ordering::Acquire)),
         }
     };
-    let (mut answer, signed_in) = tokio::join!(recommendation_at(crate::http::engines_ui(), &st.data_dir), signed_in);
-    answer["chatgpt"] = json!({ "signedIn": signed_in });
-    Json(answer).into_response()
+    let (answer, (available, signed_in)) = tokio::join!(recommendation_at(crate::http::engines_ui(), &st.data_dir), codex_now);
+    Json(with_codex(answer, available, signed_in)).into_response()
+}
+
+/// The recommendation with what Codex said: whether ChatGPT is signed in, and
+/// whether the Codex app it signs in through is installed at all. Where it is
+/// not, ChatGPT is not what to recommend (a first-timer was handed a sign-in
+/// that could not work): the engine is, its `local.ok` saying whether it fits.
+fn with_codex(mut answer: Value, available: bool, signed_in: bool) -> Value {
+    answer["chatgpt"] = json!({ "signedIn": signed_in, "available": available });
+    if !available && answer["recommend"] == "chatgpt" {
+        answer["recommend"] = json!("engine");
+    }
+    answer
 }
 
 /// What this computer can run the Agent on, from the engines at `ui` (none:
@@ -764,6 +779,20 @@ mod tests {
         let reason = v["local"]["reason"].as_str().unwrap();
         assert!(reason.contains("needs 16 GB") && reason.contains("RTX 3060") && reason.contains("12 GB"), "{reason}");
         server.abort();
+    }
+
+    #[test]
+    fn chatgpt_is_not_recommended_where_codex_is_not_installed() {
+        let small = json!({ "recommend": "chatgpt", "local": { "ok": false } });
+        let v = with_codex(small.clone(), false, false);
+        assert_eq!(v["recommend"], "engine", "{v}");
+        assert_eq!(v["local"]["ok"], false, "the engine is first, and still said not to fit");
+        assert_eq!(v["chatgpt"], json!({ "signedIn": false, "available": false }));
+        // Codex there: as the hardware says.
+        let v = with_codex(small, true, true);
+        assert_eq!((v["recommend"].as_str(), &v["chatgpt"]), (Some("chatgpt"), &json!({ "signedIn": true, "available": true })));
+        // The engine recommended stays so either way.
+        assert_eq!(with_codex(json!({ "recommend": "engine", "local": { "ok": true } }), false, false)["recommend"], "engine");
     }
 
     #[tokio::test]

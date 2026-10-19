@@ -107,7 +107,9 @@ describe('the engine model card, with nothing chosen in Engines', () => {
     expect(options()[2].textContent).toContain('needs 20 GB of GPU memory · more than your GPU’s 16 GB');
     // Not the image model: another group's.
     expect(host.textContent).not.toContain('Z Image');
-    expect(button(/^Download/)!.textContent).toContain('Download (5.7 GB)');
+    // Under the list, naming the model it gets.
+    expect(button(/^Download/)!.textContent!.trim()).toBe('Download Qwen3.5 9B (5.7 GB)');
+    expect(button(/^Download/)!.closest('.setup-offer')).toBeTruthy();
   });
 
   it('downloads the one chosen', async () => {
@@ -222,6 +224,6 @@ describe('the engine model card, with nothing chosen in Engines', () => {
     expect(plan.textContent).toContain('from Rig over OAIY Network');
     expect(plan.textContent).toContain('from Rig (OAIY Network)');
     expect(plan.textContent).toContain('is gated: accept its licence on huggingface.co, then add a Hugging Face token in Settings');
-    expect(button(/^Download \(/)!.textContent).toContain('476.8 MiB');
+    expect(button(/^Download Qwen3\.5 9B \(/)!.textContent).toContain('500.0 MB');
   });
 });

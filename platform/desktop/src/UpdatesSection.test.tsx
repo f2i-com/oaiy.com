@@ -140,12 +140,13 @@ describe('About and updates', () => {
   });
 
   it('shows the progress of a download in bytes and percent, and just the bytes when the size is not known', async () => {
-    const mib = 1024 * 1024;
-    await mount(status({ state: 'downloading', latestVersion: '0.2.0', progress: { downloaded: 24 * mib, total: 96 * mib } }));
-    expect(text()).toContain('24.0 MiB of 96.0 MiB (25%)');
+    // (in decimal units, as every size people see in OAIY is)
+    const mb = 1e6;
+    await mount(status({ state: 'downloading', latestVersion: '0.2.0', progress: { downloaded: 24 * mb, total: 96 * mb } }));
+    expect(text()).toContain('24.0 MB of 96.0 MB (25%)');
     expect(host.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('25');
-    expect(describeProgress({ downloaded: 5 * mib, total: null })).toBe('5.0 MiB');
-    expect(describeProgress({ downloaded: 200 * mib, total: 100 * mib })).toContain('(100%)');
+    expect(describeProgress({ downloaded: 5 * mb, total: null })).toBe('5.0 MB');
+    expect(describeProgress({ downloaded: 200 * mb, total: 100 * mb })).toContain('(100%)');
     expect(button('Check for updates')?.disabled).toBe(true);
   });
 
@@ -394,11 +395,43 @@ describe('About and updates', () => {
     expect(host.querySelector('.update-wait')?.textContent).toBe('You can check again in 25 s.');
   });
 
-  it('says so when the status cannot be read at all', async () => {
-    h.status.mockRejectedValue(new Error('Failed to fetch'));
+  it('stops counting down at 0, rather than drawing the page again every second after', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+    try {
+      const started = vi.spyOn(window, 'setInterval');
+      const stopped = vi.spyOn(window, 'clearInterval');
+      await mount(status({ state: 'upToDate', latestVersion: '0.1.0', lastCheckedAt: '2026-10-01T03:00:00Z', nextCheckIn: 2 }));
+      const countdown = started.mock.results[started.mock.calls.findIndex((c) => c[1] === 1000)]?.value;
+      expect(countdown).toBeDefined();
+      await act(async () => {
+        vi.advanceTimersByTime(2100);
+      });
+      expect(stopped).toHaveBeenCalledWith(countdown);
+      expect(button('Check for updates')?.disabled).toBe(false);
+      expect(host.querySelector('.update-wait')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('says so when the status cannot be read at all, with a way to ask again', async () => {
+    h.status.mockRejectedValue(new Error('the desktop is busy'));
     await act(async () => {
       root.render(<UpdatesSection />);
     });
-    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Could not read the update status');
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('The update status could not be read: the desktop is busy');
+    h.status.mockResolvedValue(status({ state: 'upToDate', latestVersion: '0.1.0' }));
+    await click(button('Try again'));
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    expect(text()).toContain('OAIY is up to date.');
+  });
+
+  it('says OAIY is not answering on its own when nothing answered at all', async () => {
+    const { ApiError, NOT_ANSWERING } = await import('./api');
+    h.status.mockRejectedValue(new ApiError(0, NOT_ANSWERING));
+    await act(async () => {
+      root.render(<UpdatesSection />);
+    });
+    expect(host.querySelector('[role="alert"]')?.textContent?.trim()).toBe(`${NOT_ANSWERING} Try again`);
   });
 });

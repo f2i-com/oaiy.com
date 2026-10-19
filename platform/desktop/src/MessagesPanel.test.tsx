@@ -15,6 +15,7 @@ vi.mock('./api', async (importOriginal) => {
 
 import MessagesPanel, { SEEN_AFTER_MS, matchesMessage, whoOf } from './MessagesPanel';
 import { ToastProvider } from './Toasts';
+import { useUnreadMessages } from './unreadMessages';
 
 const message = (m: Partial<CallerMessage> & Pick<CallerMessage, 'id'>): CallerMessage => ({
   at: '2026-09-30T02:15:03Z',
@@ -101,6 +102,27 @@ describe('Messages', () => {
     expect(whoOf(message({ id: 'x', from: '', name: '' }))).toBe('A caller who hid their number');
     expect(card('msg_a').textContent).toContain('Wants a call back');
     expect(text()).not.toContain('They did not say who.');
+  });
+
+  it('counts on To do what the sidebar counts: the new messages, so the two numbers agree', async () => {
+    function Sidebar() {
+      return <span data-testid="sidebar-count">{useUnreadMessages(true)}</span>;
+    }
+    await act(async () => {
+      root.render(
+        <ToastProvider>
+          <Sidebar />
+          <MessagesPanel onOpenContact={contactOpened} />
+        </ToastProvider>,
+      );
+    });
+    await settle();
+    // One new (Sam's), one seen and not handled (Alex's): both are to do, and one is new.
+    expect(ids()).toEqual(['msg_b', 'msg_a']);
+    const tabCount = host.querySelector('.seg-tabs .nav-count')!;
+    expect(tabCount.textContent).toBe('1');
+    expect(tabCount.getAttribute('aria-label')).toBe('1 new');
+    expect(host.querySelector('[data-testid="sidebar-count"]')!.textContent).toBe('1');
   });
 
   it('says it is loading, with a real ellipsis, until the list has come', async () => {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
-import { Bot, Check, ExternalLink, Loader2, PhoneForwarded, Play, RotateCcw, ShieldCheck, TriangleAlert } from 'lucide-react';
+import { Bot, Check, ExternalLink, Loader2, PhoneForwarded, RotateCcw, ShieldCheck, TriangleAlert } from 'lucide-react';
 import {
   agentIntent,
   bridge,
@@ -17,6 +17,8 @@ import {
 } from './api';
 import { SettingsForm } from './HoursPanel';
 import PluginScreenPage, { type PluginNavTarget, type SetupScreenCalls } from './PluginScreenPage';
+import PluginRunNote, { trustQuestion } from './PluginRunNote';
+import { ask } from './ask';
 import {
   canMoveOn,
   canSkip,
@@ -292,7 +294,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
         content = (
           <>
             {head}
-            <PluginRunNote record={record} onStarted={() => void refreshPlugins()} />
+            <PluginRunNote record={record} place="step" onChanged={() => void refreshPlugins()} />
             <SettingsStep key={s.id} record={record} step={s} onSaved={() => mark(s.id)} handle={settingsForm} />
           </>
         );
@@ -327,7 +329,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
         content = (
           <div className="setup-screen-step">
             <StepHeader kicker={kicker} title={s.title} description={s.description} state={current.state} aside={status} />
-            <PluginRunNote record={record} onStarted={() => void refreshPlugins()} />
+            <PluginRunNote record={record} place="step" onChanged={() => void refreshPlugins()} />
             <PluginScreenPage
               pluginId={pluginId}
               screenId={s.screen}
@@ -342,7 +344,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
         content = (
           <>
             {head}
-            {s.action === 'phone.answerWithOaiy' && <PluginRunNote record={record} onStarted={() => void refreshPlugins()} />}
+            {s.action === 'phone.answerWithOaiy' && <PluginRunNote record={record} place="step" onChanged={() => void refreshPlugins()} />}
             {s.action === 'phone.answerWithOaiy' ? (
               <AnswerWithOaiyStep record={record} step={s} onRoute={(on) => setHost((h) => (h[s.id] === on ? h : { ...h, [s.id]: on }))} onRecorded={() => mark(s.id)} onNavigate={onNavigate} />
             ) : (
@@ -355,6 +357,9 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   }
 
   const isSettings = current?.step.kind === 'settings';
+  // A package nobody signed does not run until the person trusts it: on its first step, trusting it is the main action,
+  // asked first, with accepting what it may do (else every step after waits on a plugin that cannot start).
+  const unsigned = record?.trust?.state === 'unsigned';
   const status = stepError ? (
     <span className="card-warn">{stepError}</span>
   ) : current?.state === 'done' ? (
@@ -364,7 +369,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   ) : current?.step.optional ? (
     'Optional'
   ) : current ? (
-    current.step.kind === 'permissions' ? 'Accept to go on' : isSettings ? 'Save to go on' : 'Waiting for this step'
+    current.step.kind === 'permissions' ? (unsigned ? 'Trust it to go on' : 'Accept to go on') : isSettings ? 'Save to go on' : 'Waiting for this step'
   ) : null;
 
   /** A settings step: its edits saved (and a required one recorded done by saving) before moving on. */
@@ -389,9 +394,16 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   };
 
   const acceptAndGo = async () => {
+    if (unsigned && record && !(await ask(trustQuestion(record)))) return;
     setBusy(true);
     setStepError(null);
     try {
+      if (unsigned && record) {
+        await pluginsApi.trust(record.id);
+        // (started now: what it was trusted for; one that does not start says why in the step that needs it)
+        await pluginsApi.start(record.id).catch(() => undefined);
+        void refreshPlugins();
+      }
       await mark('permissions');
       await loadDetail();
     } catch (e) {
@@ -431,7 +443,9 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
       }
       nextLabel={
         current?.step.kind === 'permissions' && current.state !== 'done'
-          ? 'Accept and continue'
+          ? unsigned
+            ? 'Trust it and continue'
+            : 'Accept and continue'
           : isSettings && current?.state !== 'done' && !current?.step.optional
             ? 'Save and continue'
             : isLast
@@ -464,7 +478,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   return (
     <WizardFrame
       title={declared?.title ?? `Set up ${name}`}
-      subtitle={record ? <>From the {name} plugin{record.manifest?.version ? `, v${record.manifest.version}` : ''}. Each step checks itself once it is true.</> : undefined}
+      subtitle={record ? `From the ${name} plugin${record.manifest?.version ? `, v${record.manifest.version}` : ''}. Each step checks itself once it is true.` : undefined}
       progress={{ done: steps.filter((x) => x.state === 'done').length, total: steps.length }}
       rail={rail}
       current={index}
@@ -476,46 +490,6 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
     >
       {content}
     </WizardFrame>
-  );
-}
-
-/**
- * The plugin is not running, so a step that talks to it waits: said once, with
- * a way to start it. A plugin that restarts mid-step (a driver install) shows
- * here as starting; the step is not failed and its screen is not reloaded.
- */
-function PluginRunNote({ record, onStarted }: { record: PluginRecord; onStarted: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  if (record.state === 'running' || record.state === 'unhealthy') return null;
-  const name = record.manifest?.name ?? record.id;
-  const reason = (record.reason ?? '').trim().replace(/\.+$/, '');
-  const starting = record.state === 'starting';
-  const start = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await pluginsApi.start(record.id);
-      onStarted();
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <div className="setup-run-note" role="status">
-      <TriangleAlert size={13} aria-hidden />
-      <span>
-        {starting ? `${name} is starting…` : `${name} is not running${reason ? ` (${reason})` : ''}.`} This step talks to it, and carries on once it runs.
-        {error && <small>{error}</small>}
-      </span>
-      {!starting && !record.userDisabled && (
-        <button type="button" className="btn-tiny" disabled={busy} onClick={() => void start()}>
-          {busy ? <Loader2 size={12} className="spin" /> : <Play size={12} />} Start it
-        </button>
-      )}
-    </div>
   );
 }
 
@@ -554,17 +528,25 @@ function PermissionsStep({ detail, record, accepted }: { detail: SetupPluginDeta
           ))}
         </ul>
       )}
-      {(detail.legacyCapabilities?.length ?? 0) > 0 && (
-        <p className="card-meta">Uses older names for some of these: {detail.legacyCapabilities!.map(([from]) => from).join(', ')}.</p>
-      )}
       {(detail.unknownCapabilities?.length ?? 0) > 0 && (
         <p className="card-meta card-warn">
           <TriangleAlert size={12} /> It also asks for {detail.unknownCapabilities!.join(', ')}, which this OAIY does not provide, so it will not get them.
         </p>
       )}
-      <p className="card-meta">
-        {record.manifest?.publisher ? `Published by ${record.manifest.publisher}. ` : ''}Installing a plugin installs code this computer runs: set up only plugins you trust.
-      </p>
+      {/* Who made it, only where a signature says so: an unsigned manifest can name anyone. */}
+      {record.trust?.state === 'verified' ? (
+        <p className="card-meta">
+          {record.trust.publisher ? `Published by ${record.trust.publisher}, signed and checked. ` : 'Signed and checked. '}Installing a plugin installs code this computer
+          runs: set up only plugins you trust.
+        </p>
+      ) : record.trust?.state === 'unsigned' ? (
+        <p className="card-meta card-warn">
+          <TriangleAlert size={12} /> It is not signed, so OAIY cannot tell who made it, and it does not run until you trust it. Trust only a plugin you built yourself or got
+          from someone you trust.
+        </p>
+      ) : (
+        <p className="card-meta">Installing a plugin installs code this computer runs: set up only plugins you trust.</p>
+      )}
     </div>
   );
 }

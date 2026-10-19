@@ -4,7 +4,7 @@ import { AgentProviderPicker, type ProviderPick } from './AgentProviderPicker';
 import ChatGptConnector from './ChatGptConnector';
 import { bridge, nodeRuntime, type AgentModelSource, type AgentPreferences, type CodexStatus, type EngineCatalog, type EngineRecommendation } from './api';
 import { AgentMaySwitch, type ControlSwitch } from './AgentAccess';
-import { aiChoices, localModelLine, type FirstRunStep, type ModelLine } from './setupFlow';
+import { aiChoices, isRecommended, localModelLine, type FirstRunStep, type ModelLine } from './setupFlow';
 import { EngineModelCard, errorText, StepHeader, usePoll } from './SetupParts';
 
 /**
@@ -73,7 +73,7 @@ export function WelcomeStep({ kicker }: { kicker: string }) {
         </p>
       )}
       <p className="setup-trust">
-        <ShieldCheck size={13} /> OAIY runs on this computer. Keys, conversations and recordings are kept on this device.
+        <ShieldCheck size={13} /> OAIY runs on this computer. Keys, conversations and recordings are kept on it.
       </p>
     </div>
   );
@@ -142,6 +142,10 @@ export function YourAiStep({
 }) {
   const line = localModelLine(rec, catalog);
   const gpus = rec?.local.gpus ?? [];
+  // Why it is (or is not) recommended, where that adds to the line naming the model: with a model chosen, it only says
+  // so again. And the GPUs on their own line where the reason does not name them already.
+  const reason = line.kind === 'chosen' ? null : rec?.local.reason ?? null;
+  const gpuLine = gpus.length > 0 && !(reason && gpus.every((g) => reason.includes(g.name)));
   const head = (
     <StepHeader
       kicker={kicker}
@@ -161,7 +165,7 @@ export function YourAiStep({
   // Both choices side by side, the recommended one first; what the chosen one needs goes below them both.
   const option = (source: AgentModelSource): ReactNode => {
     const selected = choice === source;
-    const recommended = rec.recommend === source;
+    const recommended = isRecommended(rec, source);
     if (source === 'provider') {
       return (
         <label key={source} className={`ai-choice ai-choice-head${selected ? ' is-selected' : ''}`}>
@@ -209,8 +213,8 @@ export function YourAiStep({
           </small>
           {/* The model it would use; while it is chosen, the card below offers the download instead. */}
           {local && (line.kind === 'chosen' || !selected) && <small className="ai-choice-fact">{modelLineText(line)}</small>}
-          {local && rec.local.reason && <small className="ai-choice-fact">{rec.local.reason}</small>}
-          {local && gpus.length > 0 && <small className="setup-mono">{gpus.map((g) => `${g.name} · ${g.totalGb} GB`).join('  ·  ')}</small>}
+          {local && reason && <small className="ai-choice-fact">{reason}</small>}
+          {local && gpuLine && <small className="setup-mono">{gpus.map((g) => `${g.name} · ${g.totalGb} GB`).join('  ·  ')}</small>}
           {!local && codex?.connected && <small className="ai-choice-fact">Signed in{codex.email ? ` as ${codex.email}` : ''}.</small>}
         </span>
       </label>

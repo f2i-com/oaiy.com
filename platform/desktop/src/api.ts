@@ -26,6 +26,17 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * What a request says when OAIY did not answer at all (its local API is stopped, or still starting): the browser's own
+ * "Failed to fetch" said for a person. Such an `ApiError` has the status 0.
+ */
+export const NOT_ANSWERING = 'OAIY isn’t answering. It may still be starting, or it has stopped.';
+
+/** A request that got no answer from OAIY at all (`NOT_ANSWERING`), as against one OAIY answered with an error. */
+export function isNotAnswering(e: unknown): boolean {
+  return e instanceof ApiError ? e.status === 0 : (e instanceof Error ? e.message : String(e)) === NOT_ANSWERING;
+}
+
 /** What OAIY said when the body says nothing: the status's own words, with its number. */
 const statusWords = (resp: Response) => (resp.statusText ? `${resp.statusText} (${resp.status})` : `OAIY answered with an error (${resp.status}).`);
 
@@ -57,6 +68,8 @@ async function request<T>(
     }).catch((e: unknown) => {
       // (the 15 s bound: said as what happened, not as the browser's "signal is aborted without reason")
       if (ac.signal.aborted) throw new ApiError(504, `OAIY did not answer within ${Math.round(waitMs / 1000)} seconds. It may be busy: try again in a moment.`);
+      // (nothing answered at all, which the browser says as a bare "Failed to fetch": said for a person, the status 0)
+      if (e instanceof TypeError) throw new ApiError(0, NOT_ANSWERING);
       throw e;
     });
     if (!resp.ok) {
@@ -1353,12 +1366,16 @@ export const updates = {
 
 // ----- formatting helpers used by multiple components -----
 
+/**
+ * A size as people see one on a download page or a drive: decimal units (1 GB is 1,000,000,000 bytes), as the
+ * engines' catalogue gives its sizes. One download said "6.1 GB" there and "5.68 GiB" beside it.
+ */
 export function formatBytes(n: number | null | undefined): string {
   if (n == null) return '—';
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  if (n < 1000) return `${n} B`;
+  if (n < 1e6) return `${(n / 1e3).toFixed(1)} kB`;
+  if (n < 1e9) return `${(n / 1e6).toFixed(1)} MB`;
+  return `${(n / 1e9).toFixed(1)} GB`;
 }
 
 export function formatTimestamp(iso: string | null | undefined): string {
@@ -2613,8 +2630,9 @@ export interface CatalogPlugin {
   description?: string;
   provides?: string[];
   needs?: string;
-  /** Installed from a folder on this machine; `path` is where one was found (null: the person chooses). */
-  source: { kind: 'folder'; note?: string; path: string | null };
+  /** Installed from a folder on this machine; `path` is where one was found (null: the person chooses). `note` says
+   *  where to get it, and `notes` says it for each system (`macos`, `windows`, `linux`) where that differs. */
+  source: { kind: 'folder'; note?: string; notes?: Partial<Record<'macos' | 'windows' | 'linux', string>>; path: string | null };
   installed: boolean;
   installedVersion: string | null;
 }
@@ -2776,7 +2794,8 @@ export interface EngineRecommendation {
     chosen?: string | null;
     suggested?: SuggestedModel | null;
   };
-  chatgpt: { signedIn: boolean };
+  /** `available`: false where the Codex app ChatGPT signs in through is not installed (an older desktop leaves it out). */
+  chatgpt: { signedIn: boolean; available?: boolean };
 }
 
 /** `null`: this desktop does not recommend yet (the wizard falls back to "local if Engines has a model chosen"). */

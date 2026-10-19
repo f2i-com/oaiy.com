@@ -94,6 +94,34 @@ export function callerText(product: string, computers?: ReadonlyMap<string, stri
   return product;
 }
 
+/** Events plugins send, by their last two parts, in words: what happened. */
+const EVENT_WORDS: Record<string, string> = {
+  'call.incoming': 'a call came in',
+  'call.ringing': 'the phone rang',
+  'call.started': 'a call started',
+  'call.answered': 'a call was answered',
+  'call.ended': 'a call ended',
+  'call.rejected': 'a call was turned down',
+  'sms.received': 'a text arrived',
+  'sms.sent': 'a text was sent',
+  'sms.failed': 'a text could not be sent',
+  'appointment.requested': 'an appointment was asked for',
+  'flow.succeeded': 'a flow finished',
+  'flow.failed': 'a flow failed',
+};
+
+/**
+ * An event in words, as what happened: "a call ended" for `aokie.call.ended` (or `call.ended`). One not known here is
+ * its name in words, without the plugin's part ("phone pairing started"). The name itself stays in the details.
+ */
+export function eventWords(event: string): string {
+  const parts = event.split('.').filter(Boolean);
+  const known = EVENT_WORDS[parts.slice(-2).join('.')];
+  if (known) return known;
+  const words = (parts.length > 2 ? parts.slice(1) : parts).join(' ').replace(/[_-]+/g, ' ').trim();
+  return words || event;
+}
+
 /**
  * Who asked for a run, in words: the caller's own label where it gave one (kept on the run: "the Agent", an app's
  * name for itself), else what its product is ({@link callerText}). The label is the caller's say, shown as text; the

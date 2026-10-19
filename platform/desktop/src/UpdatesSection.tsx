@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Download, ExternalLink, RefreshCw, RotateCw } from 'lucide-react';
 import { formatBytes, formatTimestamp, openExternal, updates, type UpdateStatus } from './api';
 import { ask } from './ask';
+import LoadError from './LoadError';
 import ReleaseNotes from './ReleaseNotes';
 import { useUpdateStatus } from './useUpdateStatus';
 
@@ -20,7 +21,7 @@ import { useUpdateStatus } from './useUpdateStatus';
  * and neither claims the copy is up to date nor sends the person to a page with nothing for it.
  */
 
-/** "12.3 MiB of 96.0 MiB (13%)", or just what has come when the total is not known. */
+/** "12.3 MB of 96.0 MB (13%)", or just what has come when the total is not known. */
 export function describeProgress(progress: NonNullable<UpdateStatus['progress']>): string {
   if (progress.total && progress.total > 0) {
     const percent = Math.min(100, Math.floor((progress.downloaded / progress.total) * 100));
@@ -115,8 +116,13 @@ export default function UpdatesSection() {
     setCheckAllowedAt(nextCheckIn != null ? Date.now() + nextCheckIn * 1000 : null);
   }, [nextCheckIn, s]);
   useEffect(() => {
-    if (checkAllowedAt === null) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    if (checkAllowedAt === null || Date.now() >= checkAllowedAt) return;
+    const id = window.setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      // (at 0 it stops: the countdown has nothing more to say, and the page is not drawn again every second for nothing)
+      if (t >= checkAllowedAt) window.clearInterval(id);
+    }, 1000);
     return () => window.clearInterval(id);
   }, [checkAllowedAt]);
   const waitToCheck = checkAllowedAt !== null ? Math.ceil((checkAllowedAt - now) / 1000) : 0;
@@ -136,7 +142,7 @@ export default function UpdatesSection() {
       <section className="model-section" aria-label="About and updates">
         <h3 className="section-title">About and updates</h3>
         {readError ? (
-          <div className="banner banner-err" role="alert">Could not read the update status: {readError}</div>
+          <LoadError error={readError} what="The update status" onRetry={refresh} />
         ) : (
           <div className="empty-state empty-state-sm">Loading…</div>
         )}

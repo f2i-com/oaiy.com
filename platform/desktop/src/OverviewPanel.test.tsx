@@ -29,6 +29,9 @@ const backupStatusMock = vi.hoisted(() => vi.fn());
 const setupGetMock = vi.hoisted(() => vi.fn());
 const setupCheckMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
+  // (no answer at all from OAIY, as request() says it: the status 0)
+  NOT_ANSWERING: 'OAIY isn’t answering. It may still be starting, or it has stopped.',
+  isNotAnswering: (e: unknown) => (e as { status?: number })?.status === 0,
   // The update banner: nothing to install unless a test says so.
   updates: { status: (...a: unknown[]) => updateStatusMock(...a) },
   backup: { status: (...a: unknown[]) => backupStatusMock(...a) },
@@ -187,9 +190,21 @@ describe('OverviewPanel failure reporting', () => {
     servicesMock.mockRejectedValueOnce(new Error('offline'));
     await mount();
     expect(text()).toContain("Couldn't refresh services");
-    await act(async () => button('Refresh status')!.click());
+    await act(async () => button('Try again')!.click());
     expect(text()).not.toContain("Couldn't refresh services");
     expect(servicesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('says only that OAIY is not answering where no read got an answer, with a way to ask again', async () => {
+    const down = Object.assign(new Error('OAIY isn’t answering. It may still be starting, or it has stopped.'), { status: 0 });
+    for (const m of [servicesMock, pluginsMock, providersMock, pairedMock, statusMock]) m.mockRejectedValueOnce(down);
+    await mount();
+    const banner = host.querySelector('.load-error')!;
+    expect(banner.textContent).toContain('OAIY isn’t answering. It may still be starting, or it has stopped.');
+    expect(banner.textContent).not.toContain("Couldn't refresh");
+    expect(text()).not.toContain('Failed to fetch');
+    await act(async () => button('Try again')!.click());
+    expect(host.querySelector('.load-error')).toBeNull();
   });
   it('reports failed runs even while the setup guide is open', async () => {
     reopenGuide(); // guide auto-opens, as on a fresh install
@@ -408,7 +423,20 @@ describe("Plugins' own cards", () => {
     expect(onOpenPluginScreen).toHaveBeenCalledTimes(2);
   });
 
-  it("shows an em dash while its poll fails, and a stopped plugin's reason rather than its old health", async () => {
+  it('shows an em dash while the poll of a running plugin fails', async () => {
+    dismissGuide();
+    pluginsMock.mockResolvedValue(aokie('running'));
+    modulesMock.mockResolvedValue(withCards());
+    connectorMock.mockRejectedValue(new Error('busy'));
+    await mount();
+    await settle();
+    const tile = host.querySelector<HTMLButtonElement>('button[aria-label^="Waiting to send"]')!;
+    expect(tile.getAttribute('aria-label')).toBe('Waiting to send: not known');
+    expect(tile.textContent).toContain('—');
+    expect(host.querySelector('.overview-status-value')!.textContent).toBe('—');
+  });
+
+  it("says a stopped plugin's cards are not running, with its reason rather than its old health, and the way to Plugins", async () => {
     dismissGuide();
     pluginsMock.mockResolvedValue(aokie('crashed', { reason: 'It stopped: the dongle was unplugged.' }));
     modulesMock.mockResolvedValue(withCards());
@@ -417,9 +445,30 @@ describe("Plugins' own cards", () => {
     await settle();
     expect(text()).not.toContain('Phone connected');
     expect(text()).toContain('It stopped: the dongle was unplugged.');
+    // Its tile and its status row: "Not running", not a bare dash, and both go to Plugins, where it is started.
     const tile = host.querySelector<HTMLButtonElement>('button[aria-label^="Waiting to send"]')!;
-    expect(tile.getAttribute('aria-label')).toBe('Waiting to send: not known');
-    expect(tile.textContent).toContain('—');
+    expect(tile.getAttribute('aria-label')).toBe('Waiting to send: Not running');
+    expect(tile.textContent).not.toContain('—');
+    const row = host.querySelector('.overview-status')!;
+    expect(row.querySelector('.overview-status-value')!.textContent).toBe('Not running');
+    // (what it said while it ran is old news: the detail is not shown either)
+    expect(row.textContent).not.toContain('The Bluetooth adapter');
+    await act(async () => row.querySelector<HTMLButtonElement>('button')!.click());
+    expect(onNavigate).toHaveBeenLastCalledWith('plugins');
+    expect(row.querySelector('button')!.textContent).toContain('Open Plugins');
+    await act(async () => tile.click());
+    expect(onNavigate).toHaveBeenCalledTimes(2);
+    expect(onOpenPluginScreen).not.toHaveBeenCalled();
+  });
+
+  it('says a plugin starting is starting, on its status row', async () => {
+    dismissGuide();
+    pluginsMock.mockResolvedValue(aokie('starting'));
+    modulesMock.mockResolvedValue(withCards());
+    connectorMock.mockRejectedValue(new Error('not running'));
+    await mount();
+    await settle();
+    expect(host.querySelector('.overview-status-value')!.textContent).toBe('Starting…');
   });
 
   it('shows no plugin cards when the desktop contributes none', async () => {
@@ -575,6 +624,8 @@ describe('the Overview on a fresh install, and with a plugin waiting to be trust
     expect(tiles).toContain('None yetServices');
     expect(tiles).toContain('None yetPlugins');
     expect(tiles).toContain('None yetAI providers');
+    // (the connected apps too: every empty tile says it the same way, not "0" beside three "None yet")
+    expect(tiles).toContain('None yetConnected apps');
     expect(text()).not.toContain('0/0');
   });
 

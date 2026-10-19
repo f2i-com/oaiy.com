@@ -38,6 +38,7 @@ vi.mock('./api', () => ({
     setServiceGpu: vi.fn(),
   },
   openExternal: vi.fn(),
+  NOT_ANSWERING: 'OAIY isn’t answering. It may still be starting, or it has stopped.',
 }));
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: pushMock }) }));
 vi.mock('./LogsViewer', () => ({ default: () => null }));
@@ -103,6 +104,21 @@ describe('ServicesPanel loading', () => {
 
     expect(text()).not.toContain('Loading services');
     expect(text()).toContain('Playwright Browser');
+  });
+
+  it('says the services could not be read, with a way to ask again, and OAIY not answering as that alone', async () => {
+    listMock.mockRejectedValueOnce(new Error('the services file is damaged'));
+    await mount();
+    expect(host.querySelector('.load-error')!.textContent).toContain('The services could not be read: the services file is damaged');
+    const again = Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('Try again'))!;
+    await act(async () => again.click());
+    expect(listMock).toHaveBeenCalledTimes(2);
+    expect(host.querySelector('.load-error')).toBeNull();
+    act(() => root.unmount());
+    root = createRoot(host);
+    listMock.mockRejectedValueOnce(new Error('OAIY isn’t answering. It may still be starting, or it has stopped.'));
+    await mount();
+    expect(host.querySelector('.load-error')!.textContent?.trim()).toBe('OAIY isn’t answering. It may still be starting, or it has stopped. Try again');
   });
 
   it('still shows the loading state on a genuinely cold start', async () => {

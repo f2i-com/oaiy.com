@@ -173,7 +173,7 @@ export default function ConnectionsPanel() {
     const name = account?.connectorName ?? 'this account';
     if (
       !(await ask(
-        `Disconnect ${name}?\n\nThis forgets the key on this computer only — it does not revoke it at the provider. Remove this desktop there too if you want the key to stop working.`,
+        `Disconnect ${name}?\n\nThis forgets the key on this computer only — it does not revoke it at the provider. Remove this computer there too if you want the key to stop working.`,
       ))
     )
       return;
@@ -647,7 +647,7 @@ export default function ConnectionsPanel() {
             </label>
             <label className="form-row">
               <span>Address</span>
-              <input
+              <input className="is-mono"
                 type="text"
                 placeholder="https://provider.example"
                 value={accountForm.baseUrl}
@@ -721,7 +721,7 @@ export default function ConnectionsPanel() {
         <form className="dl-form" style={{ marginTop: 12 }} onSubmit={(e) => void saveRelay(e)}>
           <label className="form-row">
             <span>Relay address</span>
-            <input
+            <input className="is-mono"
               type="text"
               placeholder="https://formlogic.com/api/v1"
               value={relayForm.baseUrl}
@@ -732,7 +732,7 @@ export default function ConnectionsPanel() {
             <span>Access key</span>
             {/* type=password so a shoulder or a screen share doesn't catch it.
                 It is never read back — the server returns only whether one is held. */}
-            <input
+            <input className="is-mono"
               type="password"
               placeholder="the key your relay issued this computer"
               value={relayForm.token}

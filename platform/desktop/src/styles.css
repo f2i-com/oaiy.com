@@ -70,6 +70,9 @@
   --primary: #7167ff;
   --primary-2: #4d8bff;
   --primary-soft: rgba(113, 103, 255, 0.14);
+  /* The primary as text on its own soft tint (an open tab, a badge, a "New" flag, an initial): #7167ff is 3.5-4.1:1
+     there, under the 4.5:1 floor; this lighter one is 4.9:1 or more. */
+  --primary-text: #948cff;
   --cyan: #35d4e8;
   --cyan-soft: rgba(53, 212, 232, 0.12);
   --magenta: #e76bf3;
@@ -124,6 +127,7 @@
   --primary: #2457e6;
   --primary-2: #2457e6;
   --primary-soft: rgba(36, 87, 230, 0.1);
+  --primary-text: #2457e6;
   --cyan: #1675b9;
   --cyan-soft: rgba(36, 87, 230, 0.08);
   --magenta: #ef5e4c;
@@ -132,8 +136,10 @@
   --green-soft: rgba(33, 132, 80, 0.1);
   --amber: #9c6a08;
   --amber-soft: rgba(245, 181, 44, 0.14);
-  --danger: #e94b3c;
-  --danger-soft: rgba(233, 75, 60, 0.08);
+  /* Darker than the prototype's #e94b3c (3.1-3.8:1 on paper): still red, and 4.5:1 or more on paper and on its own
+     soft tint, as error text is read, not glanced at. */
+  --danger: #bd3020;
+  --danger-soft: rgba(189, 48, 32, 0.08);
 
   --dot: #d7d1c7;
   --focus: #2457e6;
@@ -442,7 +448,7 @@ kbd {
 }
 .seg-tabs > button > svg { flex: none; opacity: 0.85; }
 .seg-tabs > button:hover { background: var(--surface-soft); color: var(--text); }
-.seg-tabs > button.active { background: var(--primary-soft); color: var(--primary); }
+.seg-tabs > button.active { background: var(--primary-soft); color: var(--primary-text); }
 :root:not([data-theme='light']) .seg-tabs > button.active {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent);
 }
@@ -672,6 +678,13 @@ kbd {
   color: var(--text);
 }
 .btn-tiny:disabled { cursor: not-allowed; opacity: 0.45; }
+/* One look for a button that deletes or removes, at either size and on every page: the danger colour on its soft
+   tint, at rest as well as under the pointer (a row's Delete looked like any other chip until hovered). */
+.btn-tiny.btn-danger {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+  background: var(--danger-soft);
+  color: var(--danger);
+}
 .btn-tiny.btn-danger:hover:not(:disabled) {
   border-color: var(--danger);
   background: var(--danger-soft);
@@ -787,7 +800,7 @@ code {
 .badge-pending {
   border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
   background: var(--primary-soft);
-  color: var(--primary);
+  color: var(--primary-text);
 }
 .badge-pending::before {
   background: var(--primary);
@@ -911,6 +924,12 @@ code {
 .empty-state p { margin: 0; }
 .empty-state p + p { color: var(--faint); font-size: 12px; }
 .empty-state > svg { color: var(--faint); }
+/* No plugins yet: the ones OAIY knows, a card each, under the empty state's words. */
+.plugin-catalog-list { display: flex; width: 100%; max-width: 560px; flex-direction: column; gap: 10px; margin: 8px 0 0; padding: 0; list-style: none; text-align: left; }
+.plugin-catalog-list li { display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--border); border-radius: var(--r-ctl); background: var(--surface-soft); color: var(--text); padding: 10px 12px; }
+.plugin-catalog-list li > span { color: var(--muted); line-height: 1.5; }
+.plugin-catalog-list li small { color: var(--faint); font-size: 11.5px; line-height: 1.5; }
+.plugin-catalog-found { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 
 /* A plugin's or a provider's card: the same parts as a service card. */
 .card-head { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px 10px; }
@@ -1185,7 +1204,9 @@ select:focus,
 textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
 input:disabled,
 select:disabled { cursor: not-allowed; opacity: 0.5; }
-.form-row input { font-family: var(--font-mono); }
+/* Monospace only where the text is a path, an address or a key (`is-mono`): a name, a number or a phrase reads in the
+   body's type, as everywhere else. */
+input.is-mono { font-family: var(--font-mono); }
 
 .form-row-pair { display: flex; flex-wrap: wrap; gap: 10px; }
 
@@ -1260,7 +1281,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   padding: 1px 6px;
   border-radius: 999px;
   background: var(--primary-soft, var(--surface-raised));
-  color: var(--primary);
+  color: var(--primary-text);
   font-size: 9.5px;
   font-style: normal;
   font-weight: 650;
@@ -1704,13 +1725,15 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 
 /* ---------------------------------------------------------------------------
  * TOASTS — rendered OUTSIDE .app-shell, hence tokens live on :root.
+ * At the top right, over the top bar's own few buttons: at the bottom they
+ * covered the actions pages keep there (the setup wizard's Next, a save bar).
  * ------------------------------------------------------------------------- */
 
 .toast-stack {
   position: fixed;
   z-index: 9999;
+  top: 14px;
   right: 20px;
-  bottom: 70px;
   display: flex;
   max-width: 380px;
   flex-direction: column;
@@ -1732,7 +1755,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   animation: toast-in 0.24s cubic-bezier(0.2, 0.9, 0.2, 1);
 }
 @keyframes toast-in {
-  from { opacity: 0; transform: translateY(12px) scale(0.98); }
+  from { opacity: 0; transform: translateY(-12px) scale(0.98); }
   to { opacity: 1; transform: none; }
 }
 
@@ -1839,7 +1862,10 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 25%, transparent);
 }
 .pairing-head { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 14px; margin-bottom: 6px; overflow-wrap: anywhere; }
-.pairing-body { display: flex; flex-direction: column; gap: 4px; font-size: 13px; opacity: 0.85; }
+/* Who asks and for what in the muted colour; the code to compare at full strength (it was faded with the rest). */
+.pairing-body { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 13px; }
+.pairing-body b,
+.pairing-body .pairing-code { color: var(--text); }
 .pairing-code code {
   font-size: 15px; letter-spacing: 2px; font-weight: 600;
   padding: 1px 6px; border-radius: var(--r-sm);

@@ -400,7 +400,7 @@ export default function AiProvidersPanel() {
 
             <label className="form-row">
               <span>Base URL</span>
-              <input
+              <input className="is-mono"
                 type="text"
                 placeholder={DEFAULT_BASE[form.protocol]}
                 value={form.baseUrl}
@@ -411,7 +411,7 @@ export default function AiProvidersPanel() {
 
             <label className="form-row">
               <span>API key</span>
-              <input
+              <input className="is-mono"
                 type="password"
                 autoComplete="off"
                 placeholder={editingId ? '••••••••' : 'sk-…'}
@@ -467,7 +467,7 @@ export default function AiProvidersPanel() {
           <p>No AI providers configured.</p>
           <p>
             Use <strong>Add provider</strong> above to give your flows a cloud (or local) chat
-            model. The key stays on this device — flows reach the provider through OAIY, never with
+            model. The key stays on this computer — flows reach the provider through OAIY, never with
             the key in the browser.
           </p>
         </div>

@@ -128,7 +128,9 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
     () => (list ?? []).filter((m) => (filter === 'all' ? true : filter === 'handled' ? m.state === 'handled' : m.state !== 'handled')).filter((m) => matchesMessage(m, q)),
     [list, filter, q],
   );
-  const todo = (list ?? []).filter((m) => m.state !== 'handled').length;
+  // The count on "To do" is what the sidebar counts: the new messages, not looked at yet (a seen one not handled is in
+  // To do as well, but counted in neither, so the two numbers always agree).
+  const fresh = (list ?? []).filter((m) => m.state === 'new').length;
 
   // A new message is seen once it has been ON SCREEN a few seconds: one that the open tab or the search hides is not on screen, and is not seen.
   const onScreenNew = useMemo(() => shown.filter((m) => m.state === 'new').map((m) => m.id).join(','), [shown]);
@@ -176,7 +178,11 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
           {FILTERS.map(([id, label]) => (
             <button type="button" role="tab" key={id} aria-selected={filter === id} className={filter === id ? 'active' : undefined} onClick={() => setFilter(id)}>
               {label}
-              {id === 'open' && todo > 0 && <em className="nav-count">{todo}</em>}
+              {id === 'open' && fresh > 0 && (
+                <em className="nav-count" title={`${fresh} new`} aria-label={`${fresh} new`}>
+                  {fresh}
+                </em>
+              )}
             </button>
           ))}
         </div>
@@ -264,8 +270,8 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
                       </button>
                     </>
                   ) : (
-                    <button type="button" className="btn-tiny" onClick={() => setConfirming(m.id)} aria-label={`Delete the message from ${whoOf(m)}`} title="Delete">
-                      <Trash2 size={12} />
+                    <button type="button" className="btn-tiny btn-danger" onClick={() => setConfirming(m.id)} aria-label={`Delete the message from ${whoOf(m)}`}>
+                      <Trash2 size={12} /> Delete
                     </button>
                   )}
                 </span>

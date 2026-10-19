@@ -18,6 +18,8 @@ import {
   isTauri,
   plugins,
   openInExplorer,
+  setup as setupApi,
+  type CatalogPlugin,
   type PluginRecord,
   type PluginState,
   type PluginsSnapshot,
@@ -34,6 +36,9 @@ import { ask } from './ask';
 import { useVisiblePoll } from './useVisiblePoll';
 import LogsViewer from './LogsViewer';
 import PackageTrustBadge from './PackageTrustBadge';
+import LoadError from './LoadError';
+import { trustQuestion } from './PluginRunNote';
+import { catalogNote } from './setupFlow';
 
 /** An example of the path the install box takes, as this system writes one (it said C:\path\to\my-plugin on Linux too). */
 const PLUGIN_PATH_EXAMPLE = /Windows/.test(navigator.userAgent) ? 'C:\\path\\to\\my-plugin' : '/path/to/my-plugin';
@@ -245,19 +250,9 @@ export default function PluginsPanel() {
       // (a package not trusted yet has no manifest here: what it says of itself is shown instead, never acted on)
       const declared = declaredOf(p);
       const name = p.manifest?.name ?? declared?.name ?? p.id;
-      const capabilities = p.manifest?.capabilities ?? declared?.capabilities ?? [];
-      const declaresAi = capabilities.includes('oaiy.ai.complete');
-      const declaresVoice = capabilities.includes('oaiy.voice.session');
-      if (
-        !(await ask(
-          `Trust the "${name}" plugin?\n\nIt is not signed, so OAIY cannot tell who made it. Trusting it lets it run as native code with your permissions. ` +
-            'The trust is for this exact package only: if any of its files change, you are asked again.\n\n' +
-            (declaresAi ? 'This package declares AI completion access to your configured providers. Trusting it enables that access.\n\n' : '') +
-            (declaresVoice ? 'This package declares local voice session access. Trusting it permits ready local speech; microphone capture still requires explicit consent in each session and native microphone permission.\n\n' : '') +
-            'Only trust a plugin you built yourself or got from someone you trust.',
-        ))
-      )
-        return;
+      const declaresAi = (p.manifest?.capabilities ?? declared?.capabilities ?? []).includes('oaiy.ai.complete');
+      // (the same question a plugin's setup asks: PluginRunNote)
+      if (!(await ask(trustQuestion(p)))) return;
       await runAction(p.id, `${name} was not trusted`, async () => {
         await plugins.trust(p.id);
         const running = p.state === 'running' || p.state === 'unhealthy' || p.state === 'starting';
@@ -269,14 +264,7 @@ export default function PluginsPanel() {
 
   return (
     <div className="panel">
-      {error && (
-        <div className="banner banner-err banner-dismissable">
-          <span>Couldn't reach the plugin host: {error}</span>
-          <button className="banner-dismiss" onClick={() => setError(null)} aria-label="Dismiss">
-            ×
-          </button>
-        </div>
-      )}
+      {error && <LoadError what="The plugins" error={error} onRetry={refresh} />}
 
       {snapshot && (
         <div className="datadir-note datadir-row">
@@ -309,7 +297,7 @@ export default function PluginsPanel() {
           <label className="form-row">
             <span>Plugin folder, .zip or .tar.gz on this computer</span>
             <span className="setup-folder-row">
-              <input
+              <input className="is-mono"
                 type="text"
                 placeholder={PLUGIN_PATH_EXAMPLE}
                 value={installSource}
@@ -351,17 +339,10 @@ export default function PluginsPanel() {
       </section>
 
       {!snapshot ? (
-        <div className="empty-state">Loading plugins…</div>
+        // (not read, and the banner above says why: no "Loading" under it that never ends)
+        !error && <div className="empty-state">Loading plugins…</div>
       ) : list.length === 0 ? (
-        <div className="empty-state">
-          <Plug size={22} style={{ opacity: 0.5 }} />
-          <p>No plugins installed.</p>
-          <p style={{ fontSize: 13, opacity: 0.7 }}>
-            A plugin is a folder with a <code>manifest.json</code> and an executable, placed in the
-            plugins directory above. It runs supervised and speaks the Bridge Protocol, contributing
-            connectors and events to your flows.
-          </p>
-        </div>
+        <PluginCatalog onInstall={(path) => setInstallSource(path)} />
       ) : (
         <section className="service-section">
           {list.map((p) => {
@@ -533,14 +514,8 @@ function PluginCard({
         </div>
       )}
 
-      {/* Legacy + unknown capabilities are surfaced, not hidden: a plugin using a
-          pre-OAIY name, or asking for something OAIY has no equivalent for, is a
-          real fact an operator wants before a mystery denial. */}
-      {p.legacyCapabilities && p.legacyCapabilities.length > 0 && (
-        <p className="card-meta">
-          Uses legacy capability names: {p.legacyCapabilities.map(([o]) => o).join(', ')}
-        </p>
-      )}
+      {/* Something it asks for that OAIY has no equivalent for is said, before a mystery denial. (The names it used
+          before OAIY's own, which OAIY maps, are not: nothing for the person to do about them.) */}
       {p.unknownCapabilities && p.unknownCapabilities.length > 0 && (
         <p className="card-meta card-warn">
           <TriangleAlert size={12} /> Asks for {p.unknownCapabilities.join(', ')}, which this OAIY
@@ -622,6 +597,48 @@ function PluginCard({
           <Trash2 size={14} /> Remove
         </button>
       </div>
+    </div>
+  );
+}
+
+/**
+ * No plugins yet: the ones OAIY knows how to install (the bundled catalogue), what each brings and needs, and where
+ * to get it, as said for this computer. One found on this computer is put in the install box above with a press.
+ */
+function PluginCatalog({ onInstall }: { onInstall: (path: string) => void }) {
+  const [catalog, setCatalog] = useState<CatalogPlugin[] | null>(null);
+  useEffect(() => {
+    setupApi
+      .catalog()
+      .then((c) => setCatalog(c.plugins))
+      .catch(() => setCatalog([]));
+  }, []);
+  return (
+    <div className="empty-state plugin-catalog">
+      <Plug size={22} style={{ opacity: 0.5 }} />
+      <p>No plugins installed yet.</p>
+      <p className="form-hint">Plugins bring devices and services to OAIY, such as your business phone and its calendar.{catalog && catalog.length > 0 ? ' These are the ones OAIY knows:' : ''}</p>
+      {catalog && catalog.length > 0 && (
+        <ul className="plugin-catalog-list">
+          {catalog.map((c) => (
+            <li key={c.id}>
+              <strong>{c.name}</strong>
+              {c.description && <span>{c.description}</span>}
+              {c.needs && <small>Needs: {c.needs}</small>}
+              {c.source.path ? (
+                <span className="plugin-catalog-found">
+                  <small>Found on this computer.</small>
+                  <button type="button" className="btn-tiny btn-primary" onClick={() => onInstall(c.source.path!)}>
+                    Use this folder
+                  </button>
+                </span>
+              ) : (
+                catalogNote(c.source) && <small>{catalogNote(c.source)}</small>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

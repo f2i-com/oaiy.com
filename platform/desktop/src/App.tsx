@@ -30,7 +30,7 @@ import {
   type LucideIcon,
   Network,
 } from 'lucide-react';
-import { API_BASE, DESKTOP_LAUNCH, network as networkApi, openExternal, openFlowInEditor, phone as phoneApi } from './api';
+import { API_BASE, DESKTOP_LAUNCH, NOT_ANSWERING, network as networkApi, openExternal, openFlowInEditor, phone as phoneApi } from './api';
 import { moduleOn, useModules } from './useModules';
 import { arrangeSections, buildSections, newBadge, pluginPageOf, sectionOf as findSection, type Group, type NavSection } from './sections';
 import { useWaitingRequests } from './calendarRequests';
@@ -63,6 +63,7 @@ import EmbeddedPage from './EmbeddedPage';
 import SetupPage from './SetupPage';
 import AgentSettingsPanel from './AgentSettingsPanel';
 import { onNavigate } from './navigate';
+import { SetupHeading } from './SetupParts';
 import { carryGuideDismissal, guideDismissed, onOpenSetup, openSetup, useSetupState } from './useSetupState';
 
 /**
@@ -222,11 +223,11 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   python: { tab: 'Python', icon: HardDrive, copy: 'A bundled Python and reusable venvs, so no system Python is needed.' },
   network: { tab: 'Networking', icon: Network, copy: 'Other OAIY computers on your network: pair them, and use their GPUs and models from here.' },
   connections: { tab: 'Connections', icon: ShieldCheck, copy: 'Apps and accounts allowed to run flows and call plugins on this computer.' },
-  providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this device.' },
+  providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this computer.' },
   plugins: { tab: 'Plugins', icon: Puzzle, copy: 'Supervised extensions that add connectors and events to your flows.' },
   settings: { tab: 'Settings', icon: Settings2, copy: 'Updates to OAIY, where it keeps its data and models, and your Hugging Face token.' },
   'agent-settings': { tab: 'Agent', icon: Bot, copy: 'What the Agent may change in OAIY, the model it thinks with, and every change it made.' },
-  setup: { tab: 'Setup', icon: ListChecks, copy: 'Your AI and the Agent; then the Agent, or you step by step, sets up the rest.' },
+  setup: { tab: 'Setup', icon: ListChecks, copy: 'Choose your AI and what the Agent may do. Leave any time: setup keeps its place.' },
 };
 
 /** A built-in page's tab name and icon (a plugin page's come from its contribution). */
@@ -298,12 +299,23 @@ function onSidebarKey(e: KeyboardEvent<HTMLElement>, setOpen: (id: string, open:
       return focus(items[0]);
     case 'End':
       return focus(items[items.length - 1]);
-    case 'ArrowRight':
+    case 'ArrowRight': {
       if (!parent) return;
       e.preventDefault();
+      const first = nav.querySelector<HTMLButtonElement>(`button[data-child-of="${parent}"]`);
+      // The narrow sidebar (icons only) has no chevron, and shows a sub-menu's pages only while one of them is open:
+      // there, right opens its first page, which shows them, and steps onto it once it shows.
+      const narrow = !here?.parentElement?.querySelector('.nav-toggle')?.getClientRects().length;
+      if (narrow && first && first.getClientRects().length === 0) {
+        setOpen(parent, true);
+        first.click();
+        focusOnceShown(first);
+        return;
+      }
       if (!isOpen(parent)) setOpen(parent, true);
-      else requestAnimationFrame(() => nav.querySelector<HTMLButtonElement>(`button[data-child-of="${parent}"]`)?.focus());
+      else requestAnimationFrame(() => first?.focus());
       return;
+    }
     case 'ArrowLeft':
       if (parent && isOpen(parent)) {
         e.preventDefault();
@@ -311,6 +323,14 @@ function onSidebarKey(e: KeyboardEvent<HTMLElement>, setOpen: (id: string, open:
       } else if (childOf) focus(nav.querySelector<HTMLButtonElement>(`button[data-parent="${childOf}"]`));
       return;
   }
+}
+
+/** Focus `el` once it shows (a page opening re-draws the sidebar): tried for a few frames, then given up. */
+function focusOnceShown(el: HTMLElement, frames = 10) {
+  requestAnimationFrame(() => {
+    if (el.isConnected && el.getClientRects().length > 0) el.focus();
+    else if (frames > 1) focusOnceShown(el, frames - 1);
+  });
 }
 
 /** A section's pages as tabs (its own, then any a plugin adds): the dashboard's segmented control, keyboard-driven with the arrow keys. */
@@ -418,6 +438,11 @@ export default function App() {
   const [setupStep, setSetupStep] = useState<string | null>(null);
   const [setupOpens, setSetupOpens] = useState(0);
   const [setupReturn, setSetupReturn] = useState<View>('overview');
+  /** The heading the setup page's wizard gave (the top bar names it), for the wizard open now (its key). */
+  const setupKey = `${setupPlugin ?? 'first-run'}:${setupOpens}`;
+  const [setupHeading, setSetupHeading] = useState<{ key: string; title: string; subtitle?: string } | null>(null);
+  const putSetupHeading = useCallback((h: { title: string; subtitle?: string }) => setSetupHeading({ key: setupKey, ...h }), [setupKey]);
+  const shownSetupHeading = setupHeading?.key === setupKey ? setupHeading : null;
   /** The contact the Agent asked to show (its key), until Contacts has opened it. */
   const [contactToOpen, setContactToOpen] = useState<string | null>(null);
   const viewRef = useRef<View>(view);
@@ -510,7 +535,8 @@ export default function App() {
         setHealth(body);
         setHealthError(null);
       } catch (e) {
-        setHealthError(e instanceof Error ? e.message : String(e));
+        // (nothing answered: said as the pages say it, not as the browser's "Failed to fetch")
+        setHealthError(e instanceof TypeError ? NOT_ANSWERING : e instanceof Error ? e.message : String(e));
         setHealth(null);
       }
     };
@@ -682,10 +708,12 @@ export default function App() {
       }
     : view === 'setup'
       ? {
-          // The page names what is being set up; the header says what setup is.
-          kicker: 'Setup',
-          title: 'Setup',
-          copy: setupPlugin ? 'A plugin’s own setup: what it may do, what it needs, and its device, step by step.' : PAGE.setup.copy,
+          // One heading: the wizard's own ("Set up OAIY", a plugin's), which it gives here; no kicker over it.
+          kicker: '',
+          title: shownSetupHeading?.title ?? (setupPlugin ? 'Set up a plugin' : 'Set up OAIY'),
+          copy:
+            shownSetupHeading?.subtitle ??
+            (setupPlugin ? 'A plugin’s own setup: what it may do, what it needs, and its device, step by step.' : PAGE.setup.copy),
         }
       : {
         kicker: section?.group ?? 'Home',
@@ -897,7 +925,7 @@ export default function App() {
       <main id="main" className="workspace" tabIndex={-1}>
         <header className={tabbed ? 'topbar has-tabs' : 'topbar'}>
           <div className="top-title">
-            <span className="top-kicker">{header.kicker}</span>
+            {header.kicker && <span className="top-kicker">{header.kicker}</span>}
             <h1>{header.title}</h1>
             <p title={header.copy}>{header.copy}</p>
           </div>
@@ -948,7 +976,9 @@ export default function App() {
               across pages rather than asked again at each. */}
           {!isolated && (
             <div className="view-prompts">
-              <PairingPrompt />
+              {/* (not on the page that lists the same requests under "Waiting for you", as Networking's are not on
+                  Networking: each request asked once) */}
+              {view !== 'connections' && <PairingPrompt />}
               {view !== 'network' && <NetworkPairingPrompt waiting={netWaiting} onOpen={() => setView('network')} />}
             </div>
           )}
@@ -1016,13 +1046,15 @@ export default function App() {
             {view === 'settings' && <SettingsPanel />}
             {view === 'agent-settings' && <AgentSettingsPanel onOpenEngines={() => setView('engines')} />}
             {view === 'setup' && (
-              <SetupPage
-                key={`${setupPlugin ?? 'first-run'}:${setupOpens}`}
-                pluginId={setupPlugin}
-                step={setupStep}
-                onExit={() => setView(setupReturn === 'setup' ? 'overview' : setupReturn)}
-                onNavigate={(v) => setView(v)}
-              />
+              <SetupHeading.Provider value={putSetupHeading}>
+                <SetupPage
+                  key={setupKey}
+                  pluginId={setupPlugin}
+                  step={setupStep}
+                  onExit={() => setView(setupReturn === 'setup' ? 'overview' : setupReturn)}
+                  onNavigate={(v) => setView(v)}
+                />
+              </SetupHeading.Provider>
             )}
             </>}
           </div>
@@ -1060,7 +1092,7 @@ export default function App() {
             </button>
           </div>
           <em className="dock-trust">
-            <LockKeyhole size={12} /> Keys stay on this device
+            <LockKeyhole size={12} /> Keys stay on this computer
           </em>
         </footer>
       </main>

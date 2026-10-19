@@ -20,6 +20,7 @@ import {
   ymd,
 } from './calendarModel';
 import { useToast } from './Toasts';
+import LoadError from './LoadError';
 import { useUnsaved } from './unsavedChanges';
 import { moduleOn, useModules } from './useModules';
 import { useVisiblePoll } from './useVisiblePoll';
@@ -66,7 +67,7 @@ export default function HoursPanel({
 
   return (
     <div className="panel hours-page">
-      {error && <div className="banner banner-err">The business settings could not be read: {error}</div>}
+      {error && <LoadError error={error} what="The business settings" onRetry={load} />}
       {settings ? (
         <SettingsForm
           settings={settings}

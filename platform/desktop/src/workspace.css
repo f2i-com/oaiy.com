@@ -50,7 +50,8 @@
    them to the screen with its theme), so its cards line up with the header. */
 .content-page.page-fill:has(> .panel > .plugin-screen) { padding: 0; scrollbar-gutter: auto; }
 .content-page.page-fill:has(> .panel > .plugin-screen) > .panel { gap: 0; }
-.content-page.page-fill:has(> .panel > .plugin-screen) > .panel > .banner { margin: var(--page-pad-t) var(--page-pad-x) 0; }
+.content-page.page-fill:has(> .panel > .plugin-screen) > .panel > .banner,
+.content-page.page-fill:has(> .panel > .plugin-screen) > .panel > .setup-run-note { margin: var(--page-pad-t) var(--page-pad-x) 0; }
 .form-row, .form-row-pair, .service-card { min-width: 0; }
 input, select, textarea { max-width: 100%; }
 @media (max-width: 1240px) { .sidebar .nav-badge { display: none; } }
@@ -68,3 +69,7 @@ input, select, textarea { max-width: 100%; }
   .section-tabs { padding: 0 10px 8px; }
   .seg-tabs > button > span { display: none; }
 }
+
+/* Settings → Backup: when the last backup was made, at the top of the section. */
+.backup-last { display: flex; align-items: center; gap: 6px; margin: 2px 0 8px; color: var(--text); font-size: 13px; font-weight: 560; }
+.backup-last svg { flex: none; color: var(--muted); }

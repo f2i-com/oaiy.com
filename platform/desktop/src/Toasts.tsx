@@ -10,7 +10,7 @@ import {
  * Tiny in-app toast system — zero dependencies, no portal gymnastics.
  * One context provider at the app root; any descendant calls
  * `useToast().push({ ... })` to surface a transient notification in the
- * bottom-right corner.
+ * top-right corner.
  *
  * Native OS notifications: OAIY Desktop is tray-resident, so most of the
  * time its window is hidden — an in-app toast no one can see is useless

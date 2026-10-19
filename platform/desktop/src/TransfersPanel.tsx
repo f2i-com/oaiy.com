@@ -20,7 +20,7 @@ import { useVisiblePoll } from './useVisiblePoll';
  * Passing a call to you needs the phone's consent for taking calls, and on this computer that consent is not signed: a plugin that
  * can reach it could change what it allows. So the switch below is best kept off unless every installed plugin is trusted.
  */
-export const CONSENT_NOT_SIGNED = 'Consent is not signed on this computer: a plugin could flip a scope. Keep this off unless you trust every plugin you have installed.';
+export const CONSENT_NOT_SIGNED = 'The permission you give for taking calls is not protected on this computer, so another plugin you installed could change it. Keep this off unless you trust every plugin you have installed.';
 
 /** These settings are reached over OAIY's local address, which a program that OAIY has paired (or that has an administrator's token) can use as well as this window. */
 export const PAIRED_APP_CAN_CHANGE = 'A program on this computer that OAIY has paired can also change these settings, and turn transfers on. Pair only programs you trust.';

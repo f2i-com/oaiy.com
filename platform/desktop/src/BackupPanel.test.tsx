@@ -35,7 +35,7 @@ vi.mock('./api', () => ({
   openInExplorer: (...a: unknown[]) => h.open(...a),
 }));
 
-import { BackupSection, RESTORE_TIMEOUT_MS, agoWords, askForBackup, undoConfirmText } from './BackupPanel';
+import { BackupSection, RESTORE_TIMEOUT_MS, agoWords, askForBackup, sectionBackupLine, undoConfirmText } from './BackupPanel';
 import type { BackupCreateResult, BackupStatus, RestoreClass, RestorePreview, ReviewItem, StagedRestore } from './api';
 import { isInvisible } from './visibleText';
 
@@ -377,10 +377,11 @@ describe('making a backup', () => {
   it('shows progress while it runs, from the desktop’s status, and disables the fields', async () => {
     let finish!: (r: BackupCreateResult) => void;
     h.create.mockReturnValue(new Promise<BackupCreateResult>((r) => (finish = r)));
-    h.status.mockResolvedValue(status({ running: { phase: 'encrypting', label: 'Encrypting the backup' } }));
     await mount();
     await typeBoth(PASS);
+    h.status.mockResolvedValue(status({ running: { phase: 'encrypting', label: 'Encrypting the backup' } }));
     await click(buttonWith('Create backup'));
+    expect(h.create).toHaveBeenCalledTimes(1);
     expect(host.querySelector('[role="progressbar"]')).not.toBeNull();
     expect(text()).toContain('Encrypting the backup');
     expect(input('Backup passphrase').disabled).toBe(true);
@@ -389,6 +390,53 @@ describe('making a backup', () => {
     await flush();
     expect(host.querySelector('[role="progressbar"]')).toBeNull();
     expect(text()).toContain('Backup created');
+  });
+});
+
+describe('a backup made elsewhere, or before the page was left', () => {
+  it('says at the top when the last backup was made, and how big it was', async () => {
+    h.status.mockResolvedValue(status({ lastBackupAt: new Date().toISOString(), lastBackupOk: true, lastBackupSize: 4096 }));
+    await mount();
+    const line = host.querySelector('[data-testid="backup-last"]')!;
+    expect(line.textContent).toContain('Last backup: today');
+    expect(line.textContent).toContain('4096 bytes');
+  });
+
+  it('says so when there has been none, and nothing at the top while a restore waits for a restart (its banner says it)', async () => {
+    await mount();
+    expect(host.querySelector('[data-testid="backup-last"]')?.textContent).toContain('You have not made a backup yet.');
+    expect(sectionBackupLine(status({ pendingRestore: pendingOf() }))).toBeNull();
+  });
+
+  it('a failed one is made again here, not "from Settings"', () => {
+    const line = sectionBackupLine(status({ lastBackupOk: false }))!;
+    expect(line).toContain('did not finish');
+    expect(line).not.toContain('from Settings');
+  });
+
+  it('a backup the desktop says is running (the Agent’s, or this page’s own before Settings was left) shows its progress and keeps Create off', async () => {
+    h.status.mockResolvedValue(status({ running: { phase: 'encrypting', label: 'Encrypting the backup' } }));
+    await mount();
+    expect(host.querySelector('[role="progressbar"]')).not.toBeNull();
+    expect(text()).toContain('Encrypting the backup');
+    expect(input('Backup passphrase').disabled).toBe(true);
+    expect(buttonWith('Create backup')!.disabled).toBe(true);
+    expect(h.create).not.toHaveBeenCalled();
+  });
+
+  it('lets a backup be made again once the desktop says the running one has finished', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    h.status.mockResolvedValue(status({ running: { phase: 'encrypting', label: 'Encrypting the backup' } }));
+    await mount();
+    expect(buttonWith('Create backup')!.disabled).toBe(true);
+    h.status.mockResolvedValue(status({ lastBackupAt: new Date().toISOString(), lastBackupOk: true }));
+    await act(async () => {
+      vi.advanceTimersByTime(800);
+    });
+    await flush();
+    expect(host.querySelector('[role="progressbar"]')).toBeNull();
+    await typeBoth(PASS);
+    expect(buttonWith('Create backup')!.disabled).toBe(false);
   });
 });
 

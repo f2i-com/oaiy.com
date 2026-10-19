@@ -84,32 +84,43 @@ describe('DeadLetters', () => {
     expect(host.innerHTML).toBe('');
   });
 
-  it('says which of the two ways an event was lost', async () => {
+  it('says which of the two ways an event was lost, in plain words, the codes kept for its details', async () => {
     await mount();
-    expect(text()).toContain('dropped');
-    expect(text()).toContain('queue was full');
-    expect(text()).toContain('not run');
+    expect(text()).toContain('Events that did not start a flow (2)');
+    expect(text()).toContain('set aside');
+    expect(text()).toContain('Too many events came at once');
+    expect(text()).toContain('no flow ran');
+    // What happened, in words: not the event's name, and none of the jargon the list used to lead with.
+    expect(text()).toContain('A call came in');
+    expect(text()).toContain('A flow finished');
+    for (const word of ['aokie.call.incoming', 'redrive', 'Redrive', 'binding', 'loop guard', 'dispatch']) expect(text()).not.toContain(word);
+    // Opened, an entry has the event's name and why OAIY recorded it.
+    await click(host.querySelectorAll('.run-head')[1]);
+    expect(text()).toContain('flow.succeeded');
     expect(text()).toContain('a loop guard refused it: depth 17');
   });
 
-  it('shows prior attempts, so a repeatedly-failing entry is obvious', async () => {
+  it('shows prior attempts, so a repeatedly-failing entry is obvious, and what the last one did in its details', async () => {
     await mount();
-    expect(text()).toContain('2 redrives');
-    expect(text()).toContain('Last redrive:');
+    expect(text()).toContain('tried again 2 times');
+    expect(text()).not.toContain('skipped — a loop guard');
+    await click(host.querySelectorAll('.run-head')[1]);
+    expect(text()).toContain('What that did');
+    expect(text()).toContain('b1: skipped — a loop guard refused it: depth 17');
   });
 
   it('refetches after a successful redrive, so the entry goes away', async () => {
     await mount();
     listMock.mockResolvedValue({ deadLetters: [GUARDED], total: 1 });
-    await click(button('Redrive'));
+    await click(button('Try again'));
 
     expect(redriveMock).toHaveBeenCalledWith('dl_1');
     // Names the event: the row it belonged to is gone, so the note has to
     // stand on its own.
-    expect(text()).toContain('Redrive reserved a run for aokie.call.incoming.');
+    expect(text()).toContain('“A call came in” started a flow');
     // The backend drops a redriven entry; the panel must reflect that rather
     // than leaving a row someone redrives again tomorrow.
-    expect(text()).not.toContain('queue was full');
+    expect(text()).not.toContain('Too many events came at once');
   });
 
   it('reports a redrive that legitimately failed again, with the reason', async () => {
@@ -118,17 +129,17 @@ describe('DeadLetters', () => {
       outcomes: ['b1: skipped — a loop guard refused it: depth 17'],
     });
     await mount();
-    await click(button('Redrive'));
+    await click(button('Try again'));
     // Not an error — the guard doing its job. Saying "failed" would send
     // someone hunting for a bug that isn't there.
-    expect(text()).toContain('is still not running');
+    expect(text()).toContain('still did not start a flow');
     expect(text()).toContain('loop guard refused');
   });
 
   it('surfaces a redrive that actually errored', async () => {
     redriveMock.mockRejectedValue(new Error('bridge is down'));
     await mount();
-    await click(button('Redrive'));
+    await click(button('Try again'));
     expect(text()).toContain('bridge is down');
   });
 
@@ -140,7 +151,7 @@ describe('DeadLetters', () => {
     listMock.mockResolvedValue({ deadLetters: [GUARDED], total: 1 });
     await click(button('Dismiss'));
     expect(dismissMock).toHaveBeenCalledWith('dl_1');
-    expect(text()).not.toContain('queue was full');
+    expect(text()).not.toContain('Too many events came at once');
     confirm.mockRestore();
   });
 
@@ -151,15 +162,15 @@ describe('DeadLetters', () => {
     redriveMock.mockReturnValue(new Promise((r) => (release = r)));
     await mount();
     // The newest hundred are listed; the heading says how many there are in all.
-    expect(text()).toContain('Events that produced no work (2 of 140)');
+    expect(text()).toContain('Events that did not start a flow (2 of 140)');
     const rows = () => [...host.querySelectorAll('.run-row')];
     const inRow = (i: number, label: string) => [...rows()[i].querySelectorAll('button')].find((b) => b.textContent?.includes(label))!;
-    await click(inRow(0, 'Redrive'));
+    await click(inRow(0, 'Try again'));
     await click(inRow(1, 'Dismiss'));
     // The second's answer frees the second alone: the first, still being redriven, cannot be pressed again.
-    expect(inRow(0, 'Redriving…').disabled).toBe(true);
+    expect(inRow(0, 'Trying again…').disabled).toBe(true);
     await act(async () => release({ reserved: true, outcomes: [] }));
-    expect(inRow(0, 'Redrive').disabled).toBe(false);
+    expect(inRow(0, 'Try again').disabled).toBe(false);
     confirm.mockRestore();
   });
 
@@ -174,10 +185,10 @@ describe('DeadLetters', () => {
         await vi.advanceTimersByTimeAsync(6100);
       });
       listMock.mockResolvedValue({ deadLetters: [GUARDED], total: 1 });
-      await click(button('Redrive'));
-      expect(text()).not.toContain('queue was full');
+      await click(button('Try again'));
+      expect(text()).not.toContain('Too many events came at once');
       await act(async () => late({ deadLetters: [SHED, GUARDED], total: 2 }));
-      expect(text()).not.toContain('queue was full');
+      expect(text()).not.toContain('Too many events came at once');
     } finally {
       vi.useRealTimers();
     }
@@ -196,10 +207,10 @@ describe('DeadLetters', () => {
     dismissMock.mockRejectedValue(new Error('bridge is down'));
     await mount();
     await click(button('Dismiss'));
-    expect(text()).toContain('aokie.call.incoming could not be dismissed: bridge is down');
+    expect(text()).toContain('“A call came in” could not be dismissed: bridge is down');
     listMock.mockResolvedValue({ deadLetters: [], total: 0 });
-    await click(button('Redrive'));
-    expect(text()).toContain('Redrive reserved a run for aokie.call.incoming.');
+    await click(button('Try again'));
+    expect(text()).toContain('“A call came in” started a flow');
     await click(button('Close'));
     expect(host.innerHTML).toBe('');
     confirm.mockRestore();

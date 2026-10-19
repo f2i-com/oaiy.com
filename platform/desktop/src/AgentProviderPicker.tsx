@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Loader2, Plug, RotateCcw } from 'lucide-react';
-import { aiProviders, type AiCapability, type AiProviderPublic } from './api';
+import { aiProviders, type AiCapability, type AiProviderInput, type AiProviderPublic } from './api';
 import { errorText } from './SetupParts';
 
 /**
@@ -81,6 +81,32 @@ export function startingModel(models: string[], chosen: string | null | undefine
   return models[0] ?? null;
 }
 
+/**
+ * Why a provider did not answer, for a person: what to check, and what it said where it said something in words (a
+ * key refused, say); never the HTTP client's own "error sending request for url (…)" or a socket's error.
+ */
+export function didNotAnswer(name: string, url: string, local: boolean, e: unknown): string {
+  const said = errorText(e).replace(/\s*\(?\bfor url \([^)]*\)\)?/gi, '').trim();
+  const plumbing = /error sending request|connection refused|connect(ion)? error|tcp connect|os error|dns error|timed out|did not answer within|isn’t answering|request failed/i.test(said);
+  const why = local ? ': is its server running, with a model loaded?' : ': check the address and the key.';
+  return `${name} did not answer at ${url}${why}${plumbing || !said ? '' : ` It said: ${said.length > 160 ? `${said.slice(0, 157)}…` : said}`}`;
+}
+
+/** A saved provider as it was, to put back. */
+function inputOf(p: AiProviderPublic): AiProviderInput {
+  return {
+    id: p.id,
+    name: p.name,
+    ...(p.category ? { category: p.category } : {}),
+    protocol: p.protocol,
+    baseUrl: p.baseUrl,
+    ...(p.model ? { model: p.model } : {}),
+    capabilities: p.capabilities,
+    enabled: p.enabled,
+    allowLocal: p.allowLocal,
+  };
+}
+
 const PRESET = 'preset:';
 
 export function AgentProviderPicker({ value, onPick, disabled }: { value: ProviderPick | null; onPick: (pick: ProviderPick) => void; disabled?: boolean }) {
@@ -94,6 +120,8 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [models, setModels] = useState<{ id: string; list: string[] } | null>(null);
+  /** A provider set up already, its address being changed here (it did not answer at the one it has). */
+  const [editing, setEditing] = useState<string | null>(null);
 
   const loadList = useCallback(async () => {
     try {
@@ -107,9 +135,12 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
     void loadList();
   }, [loadList]);
 
+  // The presets to add one from: not one set up already (it is listed above, once), but any other OpenAI-compatible
+  // server, which is added under an id of its own.
+  const presets = PROVIDER_PRESETS.filter((p) => p.id === 'openai-compatible' || !usable.some((u) => u.id === p.id));
   // What the select shows: the choice made here, else the one the Agent is on, else the first provider, else LM Studio.
-  const current = selected ?? (value && usable.some((p) => p.id === value.provider) ? value.provider : usable[0]?.id ?? `${PRESET}lm-studio`);
-  const preset = current.startsWith(PRESET) ? PROVIDER_PRESETS.find((p) => `${PRESET}${p.id}` === current) ?? null : null;
+  const current = selected ?? (value && usable.some((p) => p.id === value.provider) ? value.provider : usable[0]?.id ?? `${PRESET}${presets[0].id}`);
+  const preset = current.startsWith(PRESET) ? presets.find((p) => `${PRESET}${p.id}` === current) ?? null : null;
   const provider = preset ? null : usable.find((p) => p.id === current) ?? null;
 
   /**
@@ -129,9 +160,8 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
         if (model) onPick({ provider: p.id, model, name: p.name });
         else if (list.length === 0) setError(`${p.name} lists no models: load or download one there first.`);
       } catch (e) {
-        const local = p.allowLocal || looksLocal(p.baseUrl);
         setModels(null);
-        setError(`${p.name} did not answer at ${p.baseUrl}${local ? ': is its server running, with a model loaded?' : ': check the address and the key.'} (${errorText(e)})`);
+        setError(didNotAnswer(p.name, p.baseUrl, p.allowLocal || looksLocal(p.baseUrl), e));
       } finally {
         setBusy(false);
       }
@@ -151,12 +181,74 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
     setSelected(id);
     setError(null);
     setModels(null);
+    setEditing(null);
     const p = id.startsWith(PRESET) ? PROVIDER_PRESETS.find((x) => `${PRESET}${x.id}` === id) : null;
     setBaseUrl(p ? null : '');
     setKey('');
   };
 
-  /** Save the preset as a provider (with its key), then ask it for its models. */
+  /**
+   * Save a provider at `url` (with its key), and ask it for its models: kept only if it answers. One that does not is
+   * not left behind, its address gone from the form: a new entry is taken out again, one set up before is put back as
+   * it was, and the form stays as typed, with why.
+   */
+  const connectAt = async (id: string, name: string, url: string, keyNow: string) => {
+    setBusy(true);
+    setError(null);
+    // (what the entry had is kept: its name, model and what else it is used for, pictures or speech, beside chat)
+    const existing = (providers ?? []).find((p) => p.id === id);
+    const capabilities: AiCapability[] = existing && existing.capabilities.length > 0 ? [...new Set<AiCapability>([...existing.capabilities, 'chat'])] : ['chat'];
+    const local = looksLocal(url) || url.startsWith('http:');
+    try {
+      await aiProviders.upsert({
+        id,
+        name: existing?.name ?? name,
+        ...(existing?.category ? { category: existing.category } : {}),
+        protocol: 'openai',
+        baseUrl: url,
+        ...(existing?.model ? { model: existing.model } : {}),
+        capabilities,
+        enabled: true,
+        allowLocal: local,
+      });
+      if (keyNow) await aiProviders.setKey(id, keyNow);
+    } catch (e) {
+      setError(errorText(e));
+      setBusy(false);
+      return;
+    }
+    let list: string[];
+    try {
+      list = await aiProviders.models(id);
+    } catch (e) {
+      // (put back as it was: a new one out, an old one at its old address)
+      await (existing ? aiProviders.upsert(inputOf(existing)) : aiProviders.delete(id)).catch(() => undefined);
+      setError(didNotAnswer(existing?.name ?? name, url, local, e));
+      setBusy(false);
+      return;
+    }
+    try {
+      const saved = (await aiProviders.list()).providers;
+      setProviders(saved);
+      setSelected(id);
+      setEditing(null);
+      setKey('');
+      setBaseUrl(null);
+      const p = saved.find((x) => x.id === id);
+      setModels({ id, list });
+      if (p) {
+        const model = startingModel(list, value?.provider === id ? value.model : null, p.model);
+        if (model) onPick({ provider: id, model, name: p.name });
+        else if (list.length === 0) setError(`${p.name} lists no models: load or download one there first.`);
+      }
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Add the preset as a provider, once it answers. */
   const connect = async () => {
     if (!preset) return;
     const url = (baseUrl ?? preset.baseUrl).trim();
@@ -168,39 +260,22 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
       setError(`Enter your ${preset.name} API key.`);
       return;
     }
-    setBusy(true);
-    setError(null);
-    try {
-      const taken = (providers ?? []).map((p) => p.id);
-      // A preset added again updates its own entry (its address, and on); another server gets a free id.
-      const id = preset.id === 'openai-compatible' ? freeId(preset.id, taken) : preset.id;
-      const name = preset.id === 'openai-compatible' ? (() => { try { return new URL(url).host; } catch { return preset.name; } })() : preset.name;
-      // (what the entry had is kept: its name, model and what else it is used for, pictures or speech, beside chat)
-      const existing = (providers ?? []).find((p) => p.id === id);
-      const capabilities: AiCapability[] = existing && existing.capabilities.length > 0 ? [...new Set<AiCapability>([...existing.capabilities, 'chat'])] : ['chat'];
-      await aiProviders.upsert({
-        id,
-        name: existing?.name ?? name,
-        ...(existing?.category ? { category: existing.category } : {}),
-        protocol: 'openai',
-        baseUrl: url,
-        ...(existing?.model ? { model: existing.model } : {}),
-        capabilities,
-        enabled: true,
-        allowLocal: looksLocal(url) || url.startsWith('http:'),
-      });
-      if (key.trim()) await aiProviders.setKey(id, key.trim());
-      const list = (await aiProviders.list()).providers;
-      setProviders(list);
-      setSelected(id);
-      setKey('');
-      const saved = list.find((p) => p.id === id);
-      if (saved) await loadModels(saved, true);
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setBusy(false);
+    const taken = (providers ?? []).map((p) => p.id);
+    // A preset not listed above updates its own entry (one switched off, say); another server gets a free id.
+    const id = preset.id === 'openai-compatible' ? freeId(preset.id, taken) : preset.id;
+    const name = preset.id === 'openai-compatible' ? (() => { try { return new URL(url).host; } catch { return preset.name; } })() : preset.name;
+    await connectAt(id, name, url, key.trim());
+  };
+
+  /** A provider set up already, at the address typed here (its key too, where one is typed), once it answers there. */
+  const reconnect = async () => {
+    if (!provider) return;
+    const url = (baseUrl ?? provider.baseUrl).trim();
+    if (!url) {
+      setError('Enter the server’s address (it ends in /v1).');
+      return;
     }
+    await connectAt(provider.id, provider.name, url, key.trim());
   };
 
   const off = disabled || busy;
@@ -219,7 +294,7 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
             </optgroup>
           )}
           <optgroup label="Add one">
-            {PROVIDER_PRESETS.map((p) => (
+            {presets.map((p) => (
               <option key={p.id} value={`${PRESET}${p.id}`}>
                 {p.name}
               </option>
@@ -239,12 +314,12 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
           <small className="form-hint">{preset.help}</small>
           <label className="form-row">
             <span>Address</span>
-            <input type="text" aria-label="Address" placeholder="http://localhost:8000/v1" value={baseUrl ?? preset.baseUrl} disabled={off} onChange={(e) => setBaseUrl(e.target.value)} />
+            <input type="text" className="is-mono" aria-label="Address" placeholder="http://localhost:8000/v1" value={baseUrl ?? preset.baseUrl} disabled={off} onChange={(e) => setBaseUrl(e.target.value)} />
           </label>
           {preset.key !== 'none' && (
             <label className="form-row">
               <span>API key{preset.key === 'optional' ? ' (if the server asks for one)' : ''}</span>
-              <input type="password" aria-label="API key" autoComplete="off" value={key} disabled={off} onChange={(e) => setKey(e.target.value)} />
+              <input type="password" className="is-mono" aria-label="API key" autoComplete="off" value={key} disabled={off} onChange={(e) => setKey(e.target.value)} />
             </label>
           )}
           <div className="form-actions">
@@ -288,8 +363,51 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
             <button type="button" className="btn-tiny" disabled={off} onClick={() => void loadModels(provider)}>
               <RotateCcw size={12} /> Try again
             </button>
+          )}{' '}
+          {provider && editing !== provider.id && (
+            <button
+              type="button"
+              className="btn-tiny"
+              disabled={off}
+              onClick={() => {
+                setEditing(provider.id);
+                setBaseUrl(null);
+                setKey('');
+              }}
+            >
+              Change its address
+            </button>
           )}
         </p>
+      )}
+      {/* A provider set up already that did not answer: its address (and key) changed here, kept once it answers. */}
+      {provider && editing === provider.id && (
+        <form
+          className="agent-provider-add"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void reconnect();
+          }}
+        >
+          <label className="form-row">
+            <span>Address</span>
+            <input type="text" className="is-mono" aria-label="Address" value={baseUrl ?? provider.baseUrl} disabled={off} onChange={(e) => setBaseUrl(e.target.value)} />
+          </label>
+          {!(provider.allowLocal || looksLocal(provider.baseUrl)) && (
+            <label className="form-row">
+              <span>API key{provider.hasKey ? ' (empty: keep the one saved)' : ''}</span>
+              <input type="password" className="is-mono" aria-label="API key" autoComplete="off" value={key} disabled={off} onChange={(e) => setKey(e.target.value)} />
+            </label>
+          )}
+          <div className="form-actions">
+            <button type="submit" className="btn btn-primary" disabled={off}>
+              {busy ? <Loader2 size={14} className="spin" /> : <Plug size={14} />} Connect
+            </button>
+            <button type="button" className="btn btn-ghost" disabled={off} onClick={() => setEditing(null)}>
+              Cancel
+            </button>
+          </div>
+        </form>
       )}
       <small className="form-hint">The Agent works OAIY with tool calls: choose a model that supports them (most recent Qwen, Llama, Mistral, GPT and Gemini models do).</small>
     </div>

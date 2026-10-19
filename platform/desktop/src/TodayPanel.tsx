@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useState } from 'react';
 import { CalendarClock, Cloud, CloudOff, Cpu, Inbox, Network, Phone } from 'lucide-react';
-import { calendar, engines, link, network, phone, type Appointment, type CalendarSync, type EnginesStatus, type LinkStatus, type NetworkDefault } from './api';
+import { calendar, engines, link, network, phone, type Appointment, type CalendarSync, type EngineCatalog, type EnginesStatus, type LinkStatus, type NetworkDefault } from './api';
+import { modelName } from './setupFlow';
 import { describeSync } from './syncStatus';
 import { moduleOn, useModules } from './useModules';
 
 /**
  * Today, at the top of Overview: whether the phone is connected (and a call
  * live), whether the language model is loaded (or which paired computer's it
- * is, where the engine's default is one's: Engines → Other computers), the next appointments, the
+ * is, where the engine's default is one's: Engines → Other computers; the
+ * model it runs now, as the desktop says it), each by its name in the engines'
+ * catalogue, the next appointments, the
  * requests waiting for someone to confirm them, and, when linked, how this
  * desktop stands with FormLogic (everything here works without it). Each tile
  * opens its page. The phone's tile and the calendar's are there (and asked
@@ -36,6 +39,8 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
   const [model, setModel] = useState<EnginesStatus | null>(null);
   /** The engine's default language model where it is a paired computer's, and in effect (OAIY Network). */
   const [onPaired, setOnPaired] = useState<NetworkDefault | null>(null);
+  /** The engines' catalogue, for a model's name ("Qwen3.5 9B" rather than "qwen3.5-9b"). */
+  const [catalog, setCatalog] = useState<Pick<EngineCatalog, 'models'> | null>(null);
   const [upcoming, setUpcoming] = useState<Appointment[] | null>(null);
   /** The requests waiting to be confirmed: from today on, one earlier today still waiting too (as the sidebar counts them). */
   const [waiting, setWaiting] = useState<Appointment[] | null>(null);
@@ -61,6 +66,7 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
     ]);
     setPhoneState(p.status === 'fulfilled' ? { connected: p.value.connected, onCall: calls.status === 'fulfilled' && calls.value.length > 0 } : null);
     setModel(e.status === 'fulfilled' ? e.value : null);
+    // (`model` is the model the paired computer runs now, as the desktop says it: nothing older, nothing worked out here)
     const llm = n.status === 'fulfilled' && n.value?.uses ? n.value.defaults?.llm : undefined;
     setOnPaired(llm && llm.inEffect !== false ? llm : null);
     if (cal.status === 'fulfilled') {
@@ -80,6 +86,23 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
     }, POLL_MS);
     return () => window.clearInterval(id);
   }, [refresh]);
+
+  // The catalogue is read once there is a model to name, and again when the model named changes: not at every poll.
+  const resident = model?.llm?.resident ?? null;
+  const pairedModel = onPaired?.model ?? null;
+  useEffect(() => {
+    if (!resident && !pairedModel) return;
+    let gone = false;
+    engines.catalog().then(
+      (c) => !gone && setCatalog(c),
+      () => {
+        /* (no catalogue: the model's id is said as it is) */
+      },
+    );
+    return () => {
+      gone = true;
+    };
+  }, [resident, pairedModel]);
 
   const requests = waiting ?? [];
   const next = (upcoming ?? []).find((a) => a.status === 'confirmed') ?? upcoming?.[0];
@@ -101,20 +124,35 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
           </button>
         )}
         {onPaired ? (
-          <button
-            className="overview-tile"
-            onClick={() => onNavigate('engine-workers')}
-            title={`The engine’s default language model is ${onPaired.model} on ${onPaired.nodeName} (Engines → Other computers)`}
-          >
-            <Network size={16} aria-hidden />
-            <strong>On {onPaired.nodeName || 'a paired computer'}</strong>
-            <small>{onPaired.model} · paired computer</small>
-          </button>
+          // (in effect while that computer's engines are not answering: nothing runs in its place, so it is not ready)
+          onPaired.waiting === 'engines_down' ? (
+            <button
+              className="overview-tile"
+              onClick={() => onNavigate('engine-workers')}
+              title={`${onPaired.nodeName || 'The paired computer'}’s engines aren’t answering: chats that use ${modelName(catalog, onPaired.model)} fail until they do (Engines → Other computers)`}
+            >
+              <Network size={16} aria-hidden />
+              <strong className="warn">Not answering</strong>
+              <small>
+                {modelName(catalog, onPaired.model)} · on {onPaired.nodeName || 'a paired computer'}
+              </small>
+            </button>
+          ) : (
+            <button
+              className="overview-tile"
+              onClick={() => onNavigate('engine-workers')}
+              title={`The engine’s default language model is ${modelName(catalog, onPaired.model)} on ${onPaired.nodeName} (Engines → Other computers)`}
+            >
+              <Network size={16} aria-hidden />
+              <strong>On {onPaired.nodeName || 'a paired computer'}</strong>
+              <small>{modelName(catalog, onPaired.model)} · paired computer</small>
+            </button>
+          )
         ) : (
-          <button className="overview-tile" onClick={() => onNavigate('engines')} title={llm?.resident ? `${llm.resident}: ${llm.state}` : 'The engines'}>
+          <button className="overview-tile" onClick={() => onNavigate('engines')} title={llm?.resident ? `${modelName(catalog, llm.resident)}: ${llm.state}` : 'The engines'}>
             <Cpu size={16} aria-hidden />
             <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
-            <small>{llm?.resident ?? 'Language model'}</small>
+            <small>{modelName(catalog, llm?.resident) ?? 'Language model'}</small>
           </button>
         )}
         {calendarOn && (

@@ -2,12 +2,13 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { list, toast } = vi.hoisted(() => ({ list: vi.fn(), toast: { push: vi.fn() } }));
+const { list, start, trust, ask, toast } = vi.hoisted(() => ({ list: vi.fn(), start: vi.fn(), trust: vi.fn(), ask: vi.fn(), toast: { push: vi.fn() } }));
 vi.mock('./api', () => ({
   API_BASE: 'http://127.0.0.1:17972',
-  plugins: { list }, bridge: {}, companion: {},
+  plugins: { list, start, trust }, bridge: {}, companion: {},
 }));
 vi.mock('./Toasts', () => ({ useToast: () => toast }));
+vi.mock('./ask', () => ({ ask }));
 
 import PluginScreenPage from './PluginScreenPage';
 import { testMessageEvent, testPorts } from './pluginScreenRpc.testTransport';
@@ -30,6 +31,9 @@ let fetchAssets: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   list.mockReset();
+  start.mockReset().mockResolvedValue(undefined);
+  trust.mockReset().mockResolvedValue({});
+  ask.mockReset();
   list.mockResolvedValue({ plugins: [plugin('unhealthy', 'LLM was unavailable')] });
   fetchAssets = vi.fn().mockResolvedValue({ ok: true, text: async () => '<div id="transcript"></div>' });
   vi.stubGlobal('fetch', fetchAssets);
@@ -91,5 +95,33 @@ describe('plugin screen runtime status', () => {
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(container.querySelector('iframe')).toBe(frame);
     expect(assetFetches()).toBe(1);
+  });
+
+  it('says a plugin that is not running in words, with the button that starts it, not a trip to Plugins', async () => {
+    list.mockResolvedValue({ plugins: [plugin('installed', 'Not started yet.')] });
+    await mount();
+    const note = container.querySelector('.setup-run-note')!;
+    expect(note.textContent).toContain('Aokie is not running. This screen works once it runs.');
+    expect(note.textContent).not.toContain('installed');
+    expect(note.textContent).not.toContain('..');
+    expect(note.textContent).not.toContain('from Plugins');
+    list.mockResolvedValue({ plugins: [plugin('running')] });
+    await act(async () => note.querySelector<HTMLButtonElement>('button')!.click());
+    expect(start).toHaveBeenCalledWith('aokie');
+    // (read again at once: the note goes as it runs)
+    expect(container.querySelector('.setup-run-note')).toBeNull();
+  });
+
+  it('offers to trust a plugin nobody signed, as the one thing that gets it running', async () => {
+    list.mockResolvedValue({ plugins: [{ ...plugin('stopped', 'Not started. Not signed, and you have not trusted it yet.'), trust: { state: 'unsigned', reason: 'Not signed, and you have not trusted it yet.' } }] });
+    ask.mockResolvedValue(true);
+    await mount();
+    const note = container.querySelector('.setup-run-note')!;
+    expect(note.textContent).toContain('Aokie is not signed, and you have not trusted it yet, so it does not run.');
+    const button = note.querySelector<HTMLButtonElement>('button')!;
+    expect(button.textContent).toContain('Trust this plugin');
+    await act(async () => button.click());
+    expect(trust).toHaveBeenCalledWith('aokie');
+    expect(start).toHaveBeenCalledWith('aokie');
   });
 });

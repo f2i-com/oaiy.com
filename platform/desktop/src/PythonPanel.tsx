@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FolderOpen } from 'lucide-react';
+import { FolderOpen, Trash2 } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { peek, put } from './useCached';
 import {
@@ -11,6 +11,7 @@ import {
 } from './api';
 import LogsViewer from './LogsViewer';
 import { useToast } from './Toasts';
+import LoadError from './LoadError';
 import { ask } from './ask';
 
 /**
@@ -138,7 +139,7 @@ export default function PythonPanel() {
     return (
       <div className="panel">
         {error ? (
-          <div className="banner banner-err">{error}</div>
+          <LoadError error={error} what="Python on this computer" onRetry={refresh} />
         ) : (
           <div className="empty-state">Loading…</div>
         )}
@@ -150,11 +151,7 @@ export default function PythonPanel() {
 
   return (
     <div className="panel">
-      {error && (
-        <div className="banner banner-err">
-          <span>⚠ Couldn't reach OAIY: {error}</span>
-        </div>
-      )}
+      {error && <LoadError error={error} what="Python on this computer" onRetry={refresh} />}
       {actionError && (
         <div className="banner banner-err banner-dismissable">
           <span>⚠ {actionError}</span>
@@ -314,7 +311,7 @@ export default function PythonPanel() {
                 <FolderOpen size={13} /> Open
               </button>
               <button
-                className="btn btn-ghost btn-danger"
+                className="btn btn-danger"
                 onClick={() => {
                   let msg = `Delete venv ${v.name}? This removes ${formatBytes(v.sizeBytes)} from disk.`;
                   if (v.boundServices.length > 0) {
@@ -326,7 +323,7 @@ export default function PythonPanel() {
                 }}
                 disabled={jobActive}
               >
-                Delete
+                <Trash2 size={13} /> Delete
               </button>
             </div>
           </div>

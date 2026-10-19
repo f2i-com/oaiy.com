@@ -15,6 +15,7 @@ import {
   skipReason,
 } from './contactsModel';
 import { useToast } from './Toasts';
+import LoadError from './LoadError';
 import { useUnsaved } from './unsavedChanges';
 import { useVisiblePoll } from './useVisiblePoll';
 
@@ -144,7 +145,7 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
 
   return (
     <div className={`panel contacts-page${side ? ' has-side' : ''}`}>
-      {error && <div className="banner banner-err">The contacts could not be read: {error}</div>}
+      {error && <LoadError error={error} what="The contacts" onRetry={load} />}
       {missing ? (
         <div className="banner banner-pending">
           This OAIY does not keep contacts yet. Update OAIY to name the people who ring, keep notes for the receptionist, and see what it remembered.
@@ -528,7 +529,7 @@ function ContactEditor({
               </div>
             </div>
           ) : (
-            <button type="button" className="btn-link contact-delete" onClick={() => setConfirming(true)}>
+            <button type="button" className="btn-tiny btn-danger contact-delete" onClick={() => setConfirming(true)}>
               <Trash2 size={13} /> Delete contact
             </button>
           )}

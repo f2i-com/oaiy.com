@@ -16,9 +16,9 @@ const api = vi.hoisted(() => ({
   pin: vi.fn(),
   unpin: vi.fn(),
 }));
-vi.mock('./api', () => ({ network: api }));
+vi.mock('./api', () => ({ network: api, NOT_ANSWERING: 'OAIY isn’t answering. It may still be starting, or it has stopped.' }));
 vi.mock('./useVisiblePoll', () => ({ useVisiblePoll: () => {} }));
-import NetworkPanel from './NetworkPanel';
+import NetworkPanel, { defaultDown, notInEffect } from './NetworkPanel';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -56,6 +56,7 @@ const node = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  sessionStorage.clear();
   api.nodes.mockResolvedValue({ nodes: [] });
   api.requests.mockResolvedValue({ requests: [] });
   api.discover.mockResolvedValue({ discovery: true, found: [] });
@@ -504,5 +505,106 @@ describe('NetworkPanel', () => {
     const chip = container.querySelector('[data-testid="network-node"] .engine-default-chip')!;
     expect(chip.textContent?.trim()).toBe('Default, not in effect');
     expect(chip.getAttribute('title')).toBe('Not in effect: Rig’s engines are not running; this computer’s own model runs meanwhile.');
+  });
+
+  it('says a default still in effect whose computer’s engines are not answering fails meanwhile, on its chip and its card', async () => {
+    api.status.mockResolvedValue({ ...primary, defaults: { image: { id: 'engine:image:node.w1/flux', nodeId: 'w1', nodeName: 'Rig', model: 'flux', inEffect: true, waiting: 'engines_down' } } });
+    api.nodes.mockResolvedValue({ nodes: [node] });
+    await mount();
+    const card = container.querySelector('[data-testid="network-node"]')!;
+    const chip = card.querySelector('.engine-default-chip')!;
+    expect(chip.textContent?.trim()).toBe('Default, not answering');
+    expect(chip.getAttribute('title')).toBe('Rig’s engines aren’t answering: what uses it fails until they do.');
+    // (not "not in effect": nothing of this computer's runs in its place)
+    expect(card.textContent).not.toContain('not in effect');
+    expect(card.querySelector('[data-testid="network-default-down"]')!.textContent?.trim()).toBe('flux is this computer’s default. Rig’s engines aren’t answering: what uses it fails until they do.');
+  });
+
+  it('says a language model default whose computer’s engines are not answering fails chats meanwhile', () => {
+    const d = { id: 'engine:llm:node.w1/qwen3.5-9b', nodeId: 'w1', nodeName: 'Rig', model: 'qwen3.5-9b', inEffect: true, waiting: 'engines_down' as const };
+    expect(defaultDown(d, 'Rig')).toBe('Rig’s engines aren’t answering: chats that use it fail until they do.');
+    // Not in effect, engines down keeps its old meaning: this computer's own model runs meanwhile.
+    expect(defaultDown({ ...d, inEffect: false }, 'Rig')).toBeNull();
+    expect(notInEffect({ ...d, inEffect: false }, 'Rig')).toBe('Not in effect: Rig’s engines are not running; this computer’s own model runs meanwhile.');
+    expect(notInEffect(d, 'Rig')).toBeNull();
+  });
+
+  it('says nothing more of a default in effect whose computer answers', async () => {
+    api.status.mockResolvedValue({ ...primary, defaults: { image: { id: 'engine:image:node.w1/flux', nodeId: 'w1', nodeName: 'Rig', model: 'flux', inEffect: true, waiting: null } } });
+    api.nodes.mockResolvedValue({ nodes: [node] });
+    await mount();
+    expect(container.querySelector('[data-testid="network-node"] .engine-default-chip')!.textContent?.trim()).toBe('Default');
+    expect(container.querySelector('[data-testid="network-default-down"]')).toBeNull();
+  });
+
+  it('keeps a pairing’s both-ways choice when the page is left and opened again while it waits', async () => {
+    const both = { ...primary, uses: true, lends: true, role: 'both', listening: '0.0.0.0:17975', addresses: ['192.168.1.20:17975'] };
+    const waiting = { pairingId: 'p7', code: '123 456', status: 'approved_there', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.21:17975', fingerprint: '1111' } };
+    api.status.mockResolvedValue(both);
+    api.startPairing.mockResolvedValue(waiting);
+    await mount();
+    const input = container.querySelector('input[aria-label="The other computer’s address"]') as HTMLInputElement;
+    await act(async () => {
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      set.call(input, '192.168.1.21');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    // One way only: unticked before pairing.
+    await act(async () => (container.querySelector('.network-both-ways input') as HTMLInputElement).click());
+    await act(async () => input.closest('form')!.requestSubmit());
+    expect(api.startPairing).toHaveBeenCalledWith({ address: '192.168.1.21', bothWays: false });
+    // Left, and opened again: the pairing is shown again with its tick as it was, and answered as it was asked.
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    api.status.mockResolvedValue({ ...both, pairings: [waiting] });
+    api.confirmPairing.mockResolvedValue({ status: 'approved', node, bothWays: false, bothWaysError: null });
+    await mount();
+    expect((container.querySelector('.network-both-ways input') as HTMLInputElement).checked).toBe(false);
+    api.status.mockResolvedValue(both);
+    await act(async () => button('Yes, pair').click());
+    expect(api.confirmPairing).toHaveBeenLastCalledWith('p7', true, false);
+    // (one way was what was asked: plainly paired)
+    expect(Array.from(container.querySelectorAll('.banner')).find((b) => b.textContent?.startsWith('Paired with'))!.textContent).toBe('Paired with Rig.');
+  });
+
+  it('says a pairing ended one way only when the page is opened again, where the answer came after it was left', async () => {
+    const both = { ...primary, uses: true, lends: true, role: 'both', listening: '0.0.0.0:17975', addresses: ['192.168.1.20:17975'] };
+    api.status.mockResolvedValue({ ...both, pairings: [{ pairingId: 'x', code: '654 321', status: 'approved_there', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.21:17975', fingerprint: '1111' } }] });
+    let answer!: (v: unknown) => void;
+    api.confirmPairing.mockReturnValue(new Promise((done) => (answer = done)));
+    await mount();
+    api.status.mockResolvedValue(both);
+    await act(async () => button('Yes, pair').click());
+    expect(api.confirmPairing).toHaveBeenLastCalledWith('x', true, true);
+    // Left before the answer came; it comes; the page is opened again.
+    await act(async () => root.unmount());
+    await act(async () => answer({ status: 'approved', node, bothWays: false, bothWaysError: 'Rig could not reach this computer.' }));
+    root = createRoot(container);
+    await mount();
+    const said = () => Array.from(container.querySelectorAll('.banner')).find((b) => b.textContent?.startsWith('Paired with'));
+    expect(said()!.textContent).toBe('Paired with Rig, one way only: this computer uses Rig, but Rig cannot use this one: Rig could not reach this computer. To let it, pair again from Rig’s Networking page.');
+    // Said once: not again the next time.
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await mount();
+    expect(said()).toBeUndefined();
+  });
+
+  it('says OAIY is not answering, with a way to ask again, rather than a page with nothing on it', async () => {
+    api.status.mockRejectedValueOnce(new Error('OAIY isn’t answering. It may still be starting, or it has stopped.'));
+    await mount();
+    const banner = container.querySelector('.load-error')!;
+    expect(banner.textContent).toContain('OAIY isn’t answering. It may still be starting, or it has stopped.');
+    expect(banner.textContent).not.toContain('could not be read');
+    api.status.mockResolvedValue(off);
+    await act(async () => button('Try again').click());
+    expect(container.querySelector('.load-error')).toBeNull();
+    expect(container.querySelector('[data-testid="network-panel"]')).not.toBeNull();
+  });
+
+  it('says what could not be read when OAIY answered with an error', async () => {
+    api.status.mockRejectedValueOnce(new Error('the network settings file is damaged'));
+    await mount();
+    expect(container.querySelector('.load-error')!.textContent).toContain('OAIY Network’s status could not be read: the network settings file is damaged');
   });
 });

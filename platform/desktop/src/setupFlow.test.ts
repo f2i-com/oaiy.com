@@ -23,6 +23,11 @@ import {
   initialAiChoice,
   inTheRest,
   localModelLine,
+  catalogNote,
+  chosenNotInstalled,
+  isRecommended,
+  modelName,
+  withCodexAsItIs,
   newestFirst,
   pluginNeedsSetup,
   pluginSetupStatus,
@@ -451,6 +456,57 @@ describe('your AI: on this computer, or ChatGPT', () => {
     // No catalog: the recommendation's suggestion; nothing at all: none.
     expect(localModelLine(rec({ local: { ok: false, suggested: { id: 'suggested-id', name: 'Suggested Model', vramGb: 12 } } }), null)).toEqual({ kind: 'recommended', name: 'Suggested Model', detail: 'needs 12 GB of GPU memory' });
     expect(localModelLine(null, null)).toEqual({ kind: 'none', name: null, detail: null });
+  });
+});
+
+describe('a model by its name, Codex as it is, and the plugins ticked', () => {
+  const named: EngineCatalog = { running: true, models: [{ id: 'qwen3.5-9b', group: 'llm', name: 'Qwen3.5 9B', recommended: true, needs: [], installed: true, partial: false, download: null }], defaults: { llm: 'qwen3.5-9b' } };
+
+  it('names a model by the catalogue’s name where it has one, else by its id', () => {
+    expect(modelName(named, 'qwen3.5-9b')).toBe('Qwen3.5 9B');
+    expect(modelName(named, 'my-own-file')).toBe('my-own-file');
+    expect(modelName(null, 'qwen3.5-9b')).toBe('qwen3.5-9b');
+    expect(modelName(named, null)).toBeNull();
+    // The line naming the model Engines chose, in the wizard, the hand-off and Settings → Agent.
+    expect(localModelLine(null, named)).toEqual({ kind: 'chosen', name: 'Qwen3.5 9B', detail: null });
+  });
+
+  it('never recommends ChatGPT where Codex is not installed, and marks the engine recommended only where it fits', () => {
+    const rec = (recommend: 'engine' | 'chatgpt', ok: boolean, available?: boolean): EngineRecommendation => ({
+      recommend,
+      local: { ok, reason: null, gpus: [], chosen: null, suggested: null },
+      chatgpt: { signedIn: false, ...(available === undefined ? {} : { available }) },
+    });
+    // The desktop says so, or Codex's own status does (an older desktop's recommendation does not).
+    expect(withCodexAsItIs(rec('chatgpt', false, false), null).recommend).toBe('engine');
+    expect(withCodexAsItIs(rec('chatgpt', false), { available: false }).recommend).toBe('engine');
+    expect(withCodexAsItIs(rec('chatgpt', false), { available: true }).recommend).toBe('chatgpt');
+    expect(withCodexAsItIs(rec('chatgpt', false), null).recommend).toBe('chatgpt');
+    // First, and chosen to begin with, but not marked recommended when it does not fit.
+    const now = withCodexAsItIs(rec('chatgpt', false, false), null);
+    expect(initialAiChoice(now, null, null)).toBe('engine');
+    expect(aiChoices(now)).toEqual(['engine', 'chatgpt']);
+    expect(isRecommended(now, 'engine')).toBe(false);
+    expect(isRecommended(now, 'chatgpt')).toBe(false);
+    expect(isRecommended(rec('engine', true), 'engine')).toBe(true);
+    expect(isRecommended(rec('chatgpt', false), 'chatgpt')).toBe(true);
+  });
+
+  it('says which plugins are ticked but not installed, by name; nothing while the plugins are not read', () => {
+    const catalog = [{ id: 'aokie', name: 'AI Receptionist', source: { kind: 'folder' as const, path: null }, installed: false, installedVersion: null }];
+    expect(chosenNotInstalled(['aokie'], [], catalog)).toEqual(['AI Receptionist']);
+    expect(chosenNotInstalled(['aokie', 'other'], [], null)).toEqual(['aokie', 'other']);
+    expect(chosenNotInstalled(['aokie'], [{ id: 'aokie' } as PluginRecord], catalog)).toEqual([]);
+    expect(chosenNotInstalled(['aokie'], null, catalog)).toEqual([]);
+    expect(chosenNotInstalled([], [], catalog)).toEqual([]);
+  });
+
+  it('says where to get a catalogue plugin for this kind of computer, else in the one note for all', () => {
+    const source = { kind: 'folder' as const, path: null, note: 'For all.', notes: { macos: 'For the Mac.', windows: 'For Windows.' } };
+    expect(catalogNote(source, 'macos')).toBe('For the Mac.');
+    expect(catalogNote(source, 'windows')).toBe('For Windows.');
+    expect(catalogNote(source, 'linux')).toBe('For all.');
+    expect(catalogNote(source, 'other')).toBe('For all.');
   });
 });
 

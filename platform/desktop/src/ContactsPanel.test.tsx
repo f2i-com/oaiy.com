@@ -165,6 +165,17 @@ describe('the list', () => {
     expect(host.querySelector('.contacts-toolbar')).toBeNull();
     expect(host.querySelector('.banner-err')).toBeNull();
   });
+
+  it('says the contacts could not be read, with a way to ask again', async () => {
+    const people = api.list.getMockImplementation();
+    api.list.mockRejectedValueOnce(new Error('the contacts file is damaged'));
+    await mount();
+    expect(host.querySelector('.load-error')!.textContent).toContain('The contacts could not be read: the contacts file is damaged');
+    if (people) api.list.mockImplementation(people);
+    await click(button('Try again'));
+    expect(host.querySelector('.load-error')).toBeNull();
+    expect(rowNames()).toContain('Liam');
+  });
 });
 
 describe('one person', () => {

@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Loader2, Network, Play, Server, Square, TriangleAlert } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { ask } from './ask';
-import { network, type NetworkFlow, type NetworkNode, type NetworkRun, type NetworkStatus } from './api';
+import { network, statusOf, type NetworkFlow, type NetworkNode, type NetworkRun, type NetworkStatus } from './api';
+import LoadError from './LoadError';
 import { RunAnswer, durationText, errorText, fullWhen, whenText } from './RunParts';
 import { ago } from './NetworkPanel';
 
@@ -37,7 +38,7 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
     return (
       <div className="panel">
         {error ? (
-          <div className="banner banner-err">{error}</div>
+          <LoadError error={error} what="The other computers" onRetry={refresh} />
         ) : (
           <div className="empty-state empty-state-sm">
             <Loader2 size={16} className="spin" aria-hidden />
@@ -50,7 +51,7 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
   if (!status.uses || nodes.length === 0) {
     return (
       <div className="panel" data-testid="flow-workers">
-        {error && <div className="banner banner-err">{error}</div>}
+        {error && <LoadError error={error} what="The other computers" onRetry={refresh} />}
         <section className="model-section">
           <div className="section-title-row">
             <h3 className="section-title">Flows on other computers</h3>
@@ -76,7 +77,7 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
 
   return (
     <div className="panel" data-testid="flow-workers">
-      {error && <div className="banner banner-err">{error}</div>}
+      {error && <LoadError error={error} what="The other computers" onRetry={refresh} />}
       <p className="form-hint">
         A paired computer’s shared flows run there, on its own models and GPUs, and their answers come back here. A computer shares a flow with{' '}
         <em>Let apps run it</em> in its Flows editor.
@@ -171,6 +172,16 @@ const KEPT = 6;
 /** Forget the runs followed (tests start from none). */
 export function forgetFollowedRuns() {
   followed.clear();
+}
+
+/**
+ * Why a run was not started, in words. A key (one run of one flow) already used for a run of another flow there is
+ * said as that, not as the worker's sentence about it.
+ */
+export function startError(e: unknown, node: string): string {
+  const said = e instanceof Error ? e.message : String(e);
+  if (statusOf(e) === 409 && /\bkey\b/i.test(said) && /another flow/i.test(said)) return `That key is already used for another flow on ${node}: run it without one, or with another.`;
+  return said;
 }
 
 const defaultText = (value: unknown) => (typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value));
@@ -268,7 +279,7 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
       // (the worker's queue, read meanwhile, may have named it already: once here, as started here)
       setRuns((all) => [{ run, started: Date.now(), ended: TERMINAL.has(run.status) ? Date.now() : undefined }, ...all.filter((t) => t.run.runId !== run.runId)].slice(0, KEPT));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(startError(e, node.name));
     } finally {
       setStarting(false);
     }

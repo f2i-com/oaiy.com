@@ -2,7 +2,11 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const api = vi.hoisted(() => ({ network: { status: vi.fn(), nodes: vi.fn(), runFlow: vi.fn(), run: vi.fn(), cancelRun: vi.fn(), picture: vi.fn() } }));
+const api = vi.hoisted(() => ({
+  network: { status: vi.fn(), nodes: vi.fn(), runFlow: vi.fn(), run: vi.fn(), cancelRun: vi.fn(), picture: vi.fn() },
+  NOT_ANSWERING: 'OAIY isn’t answering. It may still be starting, or it has stopped.',
+  statusOf: (e: unknown) => (e && typeof e === 'object' && 'status' in e ? (e as { status: number }).status : null),
+}));
 vi.mock('./api', () => api);
 vi.mock('./useVisiblePoll', () => ({ useVisiblePoll: () => {} }));
 import FlowWorkersPanel, { forgetFollowedRuns } from './FlowWorkersPanel';
@@ -156,6 +160,24 @@ describe('FlowWorkersPanel', () => {
     expect(api.network.cancelRun).toHaveBeenCalledWith('w1', 'r1');
     expect(container.textContent).toContain('Stopped');
     confirm.mockRestore();
+  });
+
+  it('says the paired computers could not be read, with a way to ask again', async () => {
+    api.network.status.mockRejectedValueOnce(new Error('the network service is starting'));
+    await mount();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('The other computers could not be read: the network service is starting');
+    await act(async () => button('Try again').click());
+    await act(async () => {});
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.textContent).toContain('Make a logo');
+  });
+
+  it('says a key already used for another flow there in words', async () => {
+    api.network.runFlow.mockRejectedValue(Object.assign(new Error('the key k-9 is a run of another flow on Rig (poster): ask with another key, or with none'), { status: 409 }));
+    await mount();
+    await act(async () => button('Run on Rig').click());
+    await act(async () => {});
+    expect(container.querySelector('.flow-run-card [role="alert"]')?.textContent?.trim()).toBe('That key is already used for another flow on Rig: run it without one, or with another.');
   });
 
   it('points to Networking while OAIY Network is off', async () => {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Check, CircleDashed, Cpu, Download, ExternalLink, FolderSearch, Loader2, Mic, Network, Play, RotateCcw, SkipForward, TriangleAlert } from 'lucide-react';
 import ChatGptConnector from './ChatGptConnector';
 import {
@@ -14,7 +14,7 @@ import {
   type EnginePlan,
   type ServiceSnapshot,
 } from './api';
-import { chosenModel, groupModels, recommendedModel, type StepState } from './setupFlow';
+import { chosenModel, groupModels, modelName, recommendedModel, type StepState } from './setupFlow';
 
 /**
  * The setup wizard's shared parts: its frame (the step list, the pane, Back /
@@ -172,7 +172,14 @@ export function StepFooter({
   );
 }
 
-/** The whole wizard: a heading with progress, the steps, and the pane with its footer. */
+/**
+ * Where the setup page's heading goes: the dashboard's top bar, which names every page (App provides it), so the page
+ * has one heading and not the top bar's "Setup" over the wizard's "Set up OAIY". Without it (a test, or a wizard drawn
+ * somewhere else) the wizard heads itself.
+ */
+export const SetupHeading = createContext<((heading: { title: string; subtitle?: string }) => void) | null>(null);
+
+/** The whole wizard: its heading (in the top bar), its progress, the steps, and the pane with its footer. */
 export function WizardFrame({
   title,
   subtitle,
@@ -187,7 +194,7 @@ export function WizardFrame({
   footer,
 }: {
   title: string;
-  subtitle?: ReactNode;
+  subtitle?: string;
   progress: { done: number; total: number };
   rail: RailItem[];
   current: number;
@@ -200,18 +207,29 @@ export function WizardFrame({
   footer?: ReactNode;
 }) {
   const pct = progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
+  const putHeading = useContext(SetupHeading);
+  useEffect(() => putHeading?.({ title, subtitle }), [putHeading, title, subtitle]);
   return (
     <div className="setup-page">
-      <div className="setup-hero">
-        <div className="setup-hero-text">
-          <h1>{title}</h1>
-          {subtitle && <p>{subtitle}</p>}
-        </div>
+      <div className={putHeading ? 'setup-hero is-bare' : 'setup-hero'}>
+        {!putHeading && (
+          <div className="setup-hero-text">
+            <h1>{title}</h1>
+            {subtitle && <p>{subtitle}</p>}
+          </div>
+        )}
         <div className="setup-hero-side">
-          <span className="setup-progress-label">
-            {progress.done} of {progress.total} done
-          </span>
-          <span className="setup-progress" role="progressbar" aria-label="Setup progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
+          {/* (a bar, not a second count: the step says where it is, "Step 2 of 4") */}
+          <span
+            className="setup-progress"
+            role="progressbar"
+            aria-label="Setup progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={pct}
+            aria-valuetext={`${progress.done} of ${progress.total} done`}
+            title={`${progress.done} of ${progress.total} done`}
+          >
             <i style={{ width: `${pct}%` }} />
           </span>
           <button type="button" className="btn btn-ghost setup-leave" onClick={onLeave} title="Leave setup: it keeps its place">
@@ -614,10 +632,10 @@ export function EngineModelCard({
     body = (
       <>
         <span className="setup-chosen">
-          <span className="badge badge-ok">Chosen in Engines</span> <strong>{chosen}</strong>
+          <span className="badge badge-ok">Chosen in Engines</span> <strong title={chosen}>{modelName(catalog, chosen)}</strong>
         </span>
         {added && added.name === chosen && !added.tools && (
-          <p className="card-warn setup-chat-only">The Agent chats with {chosen} but cannot use its tools with it: they need a Qwen3.5 or GLM model.</p>
+          <p className="card-warn setup-chat-only">The Agent chats with {modelName(catalog, chosen)} but cannot use its tools with it: they need a Qwen3.5 or GLM model.</p>
         )}
       </>
     );
@@ -657,6 +675,21 @@ export function EngineModelCard({
         {plan && planFor === plan.id && <DownloadPlan plan={plan} />}
         {!plan && planError && <p className="card-warn">{planError}</p>}
         {!plan && !planError && planFor && offer.gated && <p className="form-hint">It is gated: its licence is accepted on huggingface.co first, with a Hugging Face token in Settings.</p>}
+        {/* Under the list, naming the model it gets: beside the card it lined up with whichever model sat in the middle. */}
+        {!offer.installed && !(dl && ACTIVE.has(dl.status)) && (
+          <div className="setup-offer-action">
+            <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void download()}>
+              {busy ? <Loader2 size={14} className="spin" /> : <Download size={14} />}{' '}
+              {dl?.status === 'failed'
+                ? `Download ${offer.name} again`
+                : plan && planFor === plan.id
+                  ? plan.downloadBytes > 0
+                    ? `Download ${offer.name} (${formatBytes(plan.downloadBytes)})`
+                    : `Add ${offer.name} (all here)`
+                  : `Download ${offer.name}${offer.sizeGb ? ` (${offer.sizeGb} GB)` : ''}`}
+            </button>
+          </div>
+        )}
         {dl && ACTIVE.has(dl.status) && <DownloadProgress name={offer.name} dl={dl} />}
         {dl?.status === 'failed' && dl.error && <p className="card-warn">{dl.error}</p>}
         {offer.installed && (
@@ -674,13 +707,6 @@ export function EngineModelCard({
         {ownFile && <OwnModelFile onAdded={addedFile} />}
       </div>
     );
-    if (!offer.installed && !(dl && ACTIVE.has(dl.status)))
-      action = (
-        <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void download()}>
-          {busy ? <Loader2 size={14} className="spin" /> : <Download size={14} />}{' '}
-          {dl?.status === 'failed' ? 'Try again' : plan && planFor === plan.id ? (plan.downloadBytes > 0 ? `Download (${formatBytes(plan.downloadBytes)})` : 'Add it (all here)') : `Download${offer.sizeGb ? ` (${offer.sizeGb} GB)` : ''}`}
-        </button>
-      );
   }
   if (catalog && (chosen || !catalog.running || offer?.installed || !offer))
     action = (

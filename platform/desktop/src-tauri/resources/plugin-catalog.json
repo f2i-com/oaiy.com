@@ -11,7 +11,12 @@
       "needs": "A Bluetooth USB adapter, and the phone to pair with it.",
       "source": {
         "kind": "folder",
-        "note": "Aokie is not published for download yet. Install it from its plugin folder: an unpacked Aokie release (aokie-plugin-windows-<version>.zip, or -macos-arm64- or -linux-x86_64- on those systems), or the bundle folder a build of the Aokie repository makes.",
+        "note": "The AI Receptionist cannot be downloaded from here yet. If you have its plugin from Aokie, unzip it and choose the folder it makes.",
+        "notes": {
+          "macos": "The AI Receptionist cannot be downloaded from here yet. If you have its plugin for the Mac from Aokie (a .zip with \"macos\" in its name), unzip it and choose the folder it makes.",
+          "windows": "The AI Receptionist cannot be downloaded from here yet. If you have its plugin for Windows from Aokie (a .zip with \"windows\" in its name), unzip it and choose the folder it makes.",
+          "linux": "The AI Receptionist cannot be downloaded from here yet. If you have its plugin for Linux from Aokie (a .zip with \"linux\" in its name), unzip it and choose the folder it makes."
+        },
         "lookIn": [
           "{exeDir}/plugins/aokie",
           "{sources}/aokie",

@@ -16,6 +16,9 @@ import { ask } from './ask';
 
 const POLL_MS = 3000;
 
+/** Codex is not on this computer at all, as the desktop says it (ai/codex.rs `NOT_INSTALLED`, or an older "not installed"). */
+const NOT_INSTALLED = /isn['’]t installed|not installed/i;
+
 interface Props {
   /** A sign-in started here has finished: the account is connected. */
   onConnected?: (status: CodexStatus) => void;
@@ -119,8 +122,10 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
     }
   };
 
-  // Not installed → say so plainly rather than showing a button that can't work.
+  // Not installed → say so plainly rather than showing a button that can't work. (What the system said, "No such file
+  // or directory (os error 2)", is for no one: only a failure other than "not there" is shown as it came.)
   if (status && !status.available) {
+    const missing = !status.detail || NOT_INSTALLED.test(status.detail);
     // (`bare`: inside a choice that names ChatGPT already, so no heading of its own)
     return (
       <section className={bare ? 'chatgpt-connector is-bare' : 'service-section'}>
@@ -130,14 +135,18 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
           </div>
         )}
         <p className="form-hint">
-          Sign in with a ChatGPT account instead of an API key. This needs the{' '}
-          <code>codex</code> CLI on this computer
-          {status.detail ? ` — ${status.detail}` : ''}.
+          <strong>{missing ? 'The Codex app isn’t installed on this computer.' : 'The Codex app could not be started on this computer.'}</strong> ChatGPT signs
+          in through it, so it comes first.
         </p>
-        <ol className="setup-instructions"><li>Follow the official Codex CLI installation guide.</li><li>Restart OAIY if the CLI is not detected, then check again.</li><li>Sign in here. OAIY uses a separate Codex sign-in for this connection.</li></ol>
+        {!missing && <p className="card-warn">{status.detail}</p>}
+        <ol className="setup-instructions">
+          <li>Install Codex with OpenAI’s guide (the button below).</li>
+          <li>Come back here and choose Check again. If it is still not found, quit and reopen OAIY.</li>
+          <li>Sign in here. OAIY keeps a Codex sign-in of its own for this.</li>
+        </ol>
         <div className="form-actions">
-          <button className="btn" onClick={() => openExternal('https://developers.openai.com/codex/cli/')}>
-            Codex installation guide <ExternalLink size={13} />
+          <button className="btn btn-primary" onClick={() => openExternal('https://developers.openai.com/codex/cli/')}>
+            How to install Codex <ExternalLink size={13} />
           </button>
           <button className="btn" onClick={() => void refresh()}>
             Check again

@@ -130,14 +130,14 @@ describe('first run, on a desktop without the new routes', () => {
     expect(choices()[1].textContent).toContain('The catalog recommends Catalog LLM (5.7 GB download · needs 8 GB of GPU memory).');
     // ChatGPT chosen: its sign-in below both; not signed in, so Next waits and Skip is offered.
     expect(host.textContent).toContain('Sign in with ChatGPT');
-    expect(host.textContent).not.toContain('Download (5.7 GB)');
+    expect(host.textContent).not.toContain('Download Catalog LLM (5.7 GB)');
     expect(button('Next')!.disabled).toBe(true);
     expect(button('Skip')).toBeTruthy();
     // The other one stays choosable: local shows the engine step's card, the download offer.
     await click(choices()[1].querySelector('input'));
     expect(host.querySelector('.ai-choice.is-selected')!.textContent).toContain('On this computer');
     expect(host.querySelector('.setup-reqs')!.textContent).toContain('The catalog recommends:');
-    expect(host.querySelector('.setup-reqs')!.textContent).toContain('Download (5.7 GB)');
+    expect(host.querySelector('.setup-reqs')!.textContent).toContain('Download Catalog LLM (5.7 GB)');
   });
 
   it('puts local first when Engines has a model chosen, and names it', async () => {
@@ -306,5 +306,68 @@ describe('first run, with the desktop’s new routes', () => {
     await click(button('Next'));
     expect(heading()).toBe('Continue with the Agent');
     expect(host.textContent).toContain('Off: it will tell you what to do instead of doing it.');
+  });
+});
+
+describe('first run, as a first-timer meets it', () => {
+  beforeEach(() => {
+    m.prefsGet.mockResolvedValue({ model: { source: 'engine' } });
+    m.controlGet.mockResolvedValue({ agentMayChange: true });
+  });
+
+  it('names the model Engines chose by its catalogue name, and says it once', async () => {
+    m.catalog.mockResolvedValue(catalog('catalog-llm'));
+    m.recommendation.mockResolvedValue({
+      recommend: 'engine',
+      local: { ok: true, reason: 'A language model is chosen in Engines: catalog-llm.', gpus: [{ name: 'Apple M5 Pro', totalGb: 24, freeGb: 20 }], chosen: 'catalog-llm', suggested: null },
+      chatgpt: { signedIn: false, available: true },
+    });
+    m.setupGet.mockResolvedValue(record({ position: 'ai' }));
+    await render();
+    const local = choices()[0];
+    expect(local.textContent).toContain('Uses Catalog LLM, chosen in Engines.');
+    expect(local.textContent).not.toContain('catalog-llm');
+    expect(local.textContent).not.toContain('A language model is chosen in Engines');
+    expect(host.querySelector('.setup-chosen strong')!.textContent).toBe('Catalog LLM');
+  });
+
+  it('neither recommends nor opens on ChatGPT where Codex is not installed, and says so in words', async () => {
+    // (a desktop that recommends ChatGPT for a GPU too small, and does not say whether Codex is there)
+    m.recommendation.mockResolvedValue({
+      recommend: 'chatgpt',
+      local: { ok: false, reason: 'The largest GPU has 6 GB; the recommended model needs 8 GB.', gpus: [], chosen: null, suggested: null },
+      chatgpt: { signedIn: false },
+    });
+    m.codexStatus.mockResolvedValue({ available: false, connected: false, detail: "The Codex app isn't installed on this computer." });
+    m.setupGet.mockResolvedValue(record({ position: 'ai' }));
+    await render();
+    expect(choices()[0].textContent).toContain('On this computer');
+    expect(host.querySelector('.ai-choice.is-selected')!.textContent).toContain('On this computer');
+    expect(host.querySelectorAll('.ai-choice .badge-pending')).toHaveLength(0);
+    await click(choices()[1].querySelector('input'));
+    expect(host.textContent).toContain('The Codex app isn’t installed on this computer.');
+    expect(host.textContent).not.toContain('os error');
+  });
+
+  it('holds Next while a ticked plugin is not installed, says why, and shows one install box', async () => {
+    m.catalog.mockResolvedValue(catalog('catalog-llm'));
+    const aokie = { id: 'aokie', name: 'AI Receptionist', source: { kind: 'folder', path: null, note: 'For all.', notes: { macos: 'For the Mac.', windows: 'For Windows.', linux: 'For Linux.' } }, installed: false, installedVersion: null };
+    const { setup } = await import('./api');
+    vi.mocked(setup.catalog).mockResolvedValue({ plugins: [aokie] } as Awaited<ReturnType<typeof setup.catalog>>);
+    m.setupGet.mockResolvedValue(record({ position: 'plugins', chosenPlugins: ['aokie'] }));
+    await render();
+    expect(heading()).toBe('Plugins');
+    expect(button('Next')!.disabled).toBe(true);
+    expect(host.querySelector('.setup-foot-status')!.textContent).toBe('AI Receptionist is ticked but not installed: install it, or untick it, to go on.');
+    // Its own install box, and not a second one for any other plugin meanwhile.
+    expect(host.querySelectorAll('.setup-folder')).toHaveLength(1);
+    expect(host.querySelector('.setup-other-plugin')).toBeNull();
+    // Unticked: Next goes on, and the other box is there, closed.
+    await click(host.querySelector('.setup-plugin-tick input'));
+    m.setupGet.mockResolvedValue(record({ position: 'plugins', chosenPlugins: [] }));
+    await settle();
+    expect(button('Next')!.disabled).toBe(false);
+    expect(host.querySelector('.setup-other-plugin')).toBeTruthy();
+    expect(host.querySelector<HTMLDetailsElement>('.setup-other-plugin')!.open).toBe(false);
   });
 });

@@ -19,6 +19,7 @@ import { PluginVoiceSession, type VoiceView } from './pluginVoice';
 import { PluginVoiceControls } from './PluginVoiceControls';
 import { PluginScreenDocument } from './pluginScreenRpc';
 import { useVisiblePoll } from './useVisiblePoll';
+import PluginRunNote from './PluginRunNote';
 
 /**
  * Host for a plugin-contributed screen.
@@ -500,6 +501,24 @@ export function assembleScreenDocument(parts: ScreenParts): string {
   );
 }
 
+/** How the plugin stands, apart from its manifest: what the page's note says and the button it offers go by it. */
+type RuntimeStatus = Pick<PluginRecord, 'state' | 'reason' | 'trust' | 'userDisabled'>;
+
+function runtimeOf(p: PluginRecord): RuntimeStatus {
+  return { state: p.state, reason: p.reason, trust: p.trust, userDisabled: p.userDisabled };
+}
+
+/** The same as it was (a reading that changes nothing keeps the object, so nothing re-renders for it). */
+function sameRuntime(previous: RuntimeStatus | null | undefined, now: PluginRecord): boolean {
+  return (
+    !!previous &&
+    previous.state === now.state &&
+    previous.reason === now.reason &&
+    previous.trust?.state === now.trust?.state &&
+    previous.userDisabled === now.userDisabled
+  );
+}
+
 export default function PluginScreenPage(props: Props) {
   // Changing screens discards the old document, pending RPCs and event cursor.
   // A setup step is a fresh document per step.
@@ -530,7 +549,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   const [voiceView, setVoiceView] = useState<VoiceView | null>(null);
   // The manifest selects and assembles the iframe once. Runtime status changes
   // separately so a health refresh cannot remount a call console or transcript.
-  const [runtimeStatus, setRuntimeStatus] = useState<Pick<PluginRecord, 'state' | 'reason'> | null>();
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>();
   const snapshotGeneration = useRef(0);
   const snapshotSequence = useRef(0);
   const [doc, setDoc] = useState<{ html: string; nonce: string } | null>(null);
@@ -559,7 +578,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
         if (!cancelled) {
           const initial = snap.plugins.find((p) => p.id === pluginId) ?? null;
           setRecord(initial);
-          setRuntimeStatus(initial ? { state: initial.state, reason: initial.reason } : null);
+          setRuntimeStatus(initial ? runtimeOf(initial) : null);
         }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -572,24 +591,25 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   }, [pluginId, attempt]);
 
   // How the plugin stands, read again while the page shows (a plugin started from Plugins, or that stopped, says so
-  // here without a reload; the frame is not touched).
-  useVisiblePoll(() => {
+  // here without a reload; the frame is not touched), and at once after its button here started or trusted it.
+  const refreshStatus = useCallback(() => {
     const generation = snapshotGeneration.current;
     const sequence = ++snapshotSequence.current;
-    plugins
+    return plugins
       .list()
       .then((snap) => {
         if (generation !== snapshotGeneration.current || sequence !== snapshotSequence.current) return;
         const current = snap.plugins.find((p) => p.id === pluginId) ?? null;
         setRuntimeStatus((previous) => {
           if (!current) return null;
-          return previous?.state === current.state && previous?.reason === current.reason ? previous : { state: current.state, reason: current.reason };
+          return sameRuntime(previous, current) ? previous! : runtimeOf(current);
         });
       })
       .catch(() => {
         /* a missed reading: the next one says */
       });
-  }, 4000);
+  }, [pluginId]);
+  useVisiblePoll(() => void refreshStatus(), 4000);
 
   const screen = useMemo(() => {
     const ui = (record?.manifest as unknown as { ui?: { nav?: UiNav[]; screens?: UiScreen[] } } | undefined)?.ui;
@@ -644,7 +664,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
         setDoc({ nonce, html: assembleScreenDocument({ body, css, fonts, scripts: sources, dark, gutter: pageGutter(), setup: setupContext, documentNonce: nonce }) });
         setError(null);
       } catch (e) {
-        if (!cancelled) setError(controller.signal.aborted ? 'Loading took too long. Check the desktop connection and try again.' : e instanceof Error ? e.message : String(e));
+        if (!cancelled) setError(controller.signal.aborted ? 'Loading took too long. Check that OAIY is running on this computer, and try again.' : e instanceof Error ? e.message : String(e));
       } finally {
         window.clearTimeout(timer);
       }
@@ -688,8 +708,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           if (generation === snapshotGeneration.current && sequence === snapshotSequence.current) {
             setRuntimeStatus((previous) => {
               if (!current) return null;
-              return previous?.state === current.state && previous?.reason === current.reason
-                ? previous : { state: current.state, reason: current.reason };
+              return sameRuntime(previous, current) ? previous! : runtimeOf(current);
             });
           }
           return current;
@@ -960,21 +979,19 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
       ) : setup ? // A wizard step keeps going while the plugin restarts (a driver
         // install restarts it): the wizard says how the plugin stands, and
         // the frame is never reloaded for it.
-        null : currentStatus.state !== 'running' && (
+        null : currentStatus.state === 'unhealthy' ? (
+        // An unhealthy plugin is RUNNING and still answers commands (health is a coarse signal), so telling the user
+        // to start it would be wrong — and often the screen itself is where the fix lives.
         <div className="banner banner-err" role="alert">
           <span>
-            <TriangleAlert size={13} /> “{record.manifest?.name ?? record.id}” is {currentStatus.state}
-            {currentStatus.reason ? ` — ${currentStatus.reason}` : ''}
-            {/* An unhealthy plugin is RUNNING and still answers commands (health
-                is a coarse signal), so telling the user to start it would be
-                wrong — and often the screen itself is where the fix lives. */}
-            {currentStatus.state === 'unhealthy'
-              ? '. The screen still works — you may be able to resolve this here.'
-              : currentStatus.state === 'starting'
-                ? '. It is ready in a moment.'
-                : '. Start it from Plugins before using this screen.'}
+            <TriangleAlert size={13} /> {record.manifest?.name ?? record.id} is not well
+            {currentStatus.reason ? `: ${currentStatus.reason.trim().replace(/\.+$/, '')}` : ''}. The screen still works, and you may be able to put it right here.
           </span>
         </div>
+      ) : (
+        // Not running: said as the wizard says it, with the button that gets it running (Start it; Trust this plugin
+        // first for one not signed), not a word for its state and a trip to Plugins.
+        <PluginRunNote record={{ ...record, ...currentStatus }} place="screen" onChanged={() => void refreshStatus()} />
       )}
       <PluginVoiceControls view={voiceView} session={voiceSession.current} pluginName={record.manifest?.name ?? record.id} />
       {documentRevoked && <div className="banner banner-err" role="alert">This plugin document navigated or closed. Its voice permission and pending deliveries were revoked. Reopen the screen from OAIY to continue; actions already sent may still finish.</div>}

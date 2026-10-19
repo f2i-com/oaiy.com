@@ -55,12 +55,8 @@
   line-height: 1.55;
 }
 .setup-hero-side { display: flex; align-items: center; gap: 12px; }
-.setup-progress-label {
-  color: var(--faint);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  white-space: nowrap;
-}
+/* Its heading in the top bar: the progress and "Continue later" alone, at the right. */
+.setup-hero.is-bare { justify-content: flex-end; }
 
 .setup-progress {
   position: relative;
@@ -297,6 +293,7 @@
 .setup-offer-card small { color: var(--muted); font-size: 12px; line-height: 1.5; }
 .setup-offer-card small.setup-mono { color: var(--faint); font-size: 11.5px; }
 .setup-retry { flex-wrap: wrap; margin: 0; }
+.setup-offer-action { display: flex; flex-wrap: wrap; gap: 8px; }
 /* The models to choose from when nothing is chosen in Engines: one card each, the chosen one marked. */
 .setup-model-list { display: flex; max-width: 560px; flex-direction: column; gap: 6px; }
 .setup-model-option { flex-direction: row; align-items: flex-start; gap: 10px; max-width: none; cursor: pointer; }
@@ -399,6 +396,10 @@ details.setup-more-source > summary:hover { color: var(--text); }
 .setup-chip.is-need { border-style: dashed; }
 
 .setup-folder { display: flex; flex-direction: column; gap: 8px; }
+/* Any other plugin's install box: closed until asked for, so a step shows one install box at a time. */
+.setup-other-plugin { margin-top: 4px; }
+.setup-other-plugin > summary { color: var(--muted); font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.setup-other-plugin[open] > summary { margin-bottom: 8px; }
 .setup-folder.is-compact { margin-top: 8px; }
 .setup-folder-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .setup-folder-row input { min-width: 0; flex: 1 1 240px; font-family: var(--font-mono); }

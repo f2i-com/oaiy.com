@@ -7,14 +7,14 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const m = vi.hoisted(() => ({ list: vi.fn(), upsert: vi.fn(), setKey: vi.fn(), models: vi.fn() }));
+const m = vi.hoisted(() => ({ list: vi.fn(), upsert: vi.fn(), setKey: vi.fn(), models: vi.fn(), remove: vi.fn() }));
 
 vi.mock('./api', async (importOriginal) => {
   const real = await importOriginal<typeof import('./api')>();
-  return { ...real, aiProviders: { ...real.aiProviders, list: m.list, upsert: m.upsert, setKey: m.setKey, models: m.models } };
+  return { ...real, aiProviders: { ...real.aiProviders, list: m.list, upsert: m.upsert, setKey: m.setKey, models: m.models, delete: m.remove } };
 });
 
-import { AgentProviderPicker, agentCapable, freeId, looksLocal, startingModel, type ProviderPick } from './AgentProviderPicker';
+import { AgentProviderPicker, agentCapable, didNotAnswer, freeId, looksLocal, startingModel, type ProviderPick } from './AgentProviderPicker';
 import type { AiProviderPublic } from './api';
 
 const provider = (over: Partial<AiProviderPublic>): AiProviderPublic => ({
@@ -75,6 +75,9 @@ beforeEach(() => {
     return { id: input.id };
   });
   m.setKey.mockResolvedValue(undefined);
+  m.remove.mockImplementation(async (id: string) => {
+    saved = saved.filter((p) => p.id !== id);
+  });
   onPick.mockReset();
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -175,7 +178,8 @@ describe('choosing an AI provider for the Agent', () => {
   });
 
   it('keeps what a provider set up before had when its preset is added again: its model and its other uses', async () => {
-    saved = [provider({ id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', allowLocal: false, model: 'gpt-5.5', capabilities: ['chat', 'transcription'] })];
+    // (switched off in AI providers: not one the Agent can use, so its preset is offered, and updates its entry)
+    saved = [provider({ id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', allowLocal: false, model: 'gpt-5.5', capabilities: ['chat', 'transcription'], enabled: false })];
     m.models.mockResolvedValue(['gpt-5.5']);
     await render();
     await change(select('Provider'), 'preset:openai');
@@ -192,6 +196,60 @@ describe('choosing an AI provider for the Agent', () => {
     await change(input('Address'), 'http://gpu-box.lan:8000/v1');
     await click(button(/Connect/));
     expect(m.upsert).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'openai-compatible-2', name: 'gpu-box.lan:8000', allowLocal: true }));
+  });
+});
+
+describe('a provider that does not answer', () => {
+  it('is not kept: a new one is taken out again, and its address stays in the form to change', async () => {
+    m.models.mockRejectedValueOnce(new Error('502: error sending request for url (http://localhost:1234/v1/models)'));
+    await render();
+    await click(button(/Connect/));
+    const alert = host.querySelector('[role="alert"]')!;
+    expect(alert.textContent).toContain('LM Studio did not answer at http://localhost:1234/v1: is its server running, with a model loaded?');
+    // (the HTTP client's own words are for no one)
+    expect(alert.textContent).not.toContain('error sending request');
+    expect(m.remove).toHaveBeenCalledWith('lm-studio');
+    expect(saved).toEqual([]);
+    expect(onPick).not.toHaveBeenCalled();
+    // Still the preset, its address to change and connect again.
+    expect(select('Provider').value).toBe('preset:lm-studio');
+    await change(input('Address'), 'http://localhost:1235/v1');
+    m.models.mockResolvedValue(['qwen3.5-9b']);
+    await click(button(/Connect/));
+    expect(m.upsert).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'lm-studio', baseUrl: 'http://localhost:1235/v1' }));
+    expect(onPick).toHaveBeenLastCalledWith({ provider: 'lm-studio', model: 'qwen3.5-9b', name: 'LM Studio' });
+    // Set up now: listed once, under the providers set up, and no longer offered to add.
+    const options = Array.from(select('Provider').querySelectorAll('option')).map((o) => o.textContent);
+    expect(options.filter((o) => o === 'LM Studio')).toHaveLength(1);
+    expect(select('Provider').value).toBe('lm-studio');
+  });
+
+  it('set up before: put back as it was when the address typed does not answer either, and kept at one that does', async () => {
+    saved = [provider({ id: 'lm-studio', name: 'LM Studio', model: 'old' })];
+    m.models.mockRejectedValueOnce(new Error('502: request failed: connection refused'));
+    await render();
+    await click(button(/Change its address/));
+    expect(input('Address').value).toBe('http://localhost:1234/v1');
+    await change(input('Address'), 'http://192.168.1.20:1234/v1');
+    m.models.mockRejectedValueOnce(new Error('502: request failed: connection refused'));
+    await click(button(/^Connect/));
+    expect(m.upsert).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'lm-studio', baseUrl: 'http://localhost:1234/v1', model: 'old' }));
+    expect(saved[0].baseUrl).toBe('http://localhost:1234/v1');
+    expect(host.querySelector('[role="alert"]')!.textContent).toContain('LM Studio did not answer at http://192.168.1.20:1234/v1');
+    m.models.mockResolvedValue(['qwen3.5-9b']);
+    await click(button(/^Connect/));
+    expect(saved[0].baseUrl).toBe('http://192.168.1.20:1234/v1');
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    expect(input('Address')).toBeNull();
+  });
+
+  it('says what it said in words, where it said something (a key refused), and never a socket’s error', () => {
+    expect(didNotAnswer('OpenAI', 'https://api.openai.com/v1', false, new Error('502: the provider answered 401: Incorrect API key provided'))).toBe(
+      'OpenAI did not answer at https://api.openai.com/v1: check the address and the key. It said: the provider answered 401: Incorrect API key provided',
+    );
+    expect(didNotAnswer('Ollama', 'http://localhost:11434/v1', true, new Error('502: error sending request for url (http://localhost:11434/v1/models)'))).toBe(
+      'Ollama did not answer at http://localhost:11434/v1: is its server running, with a model loaded?',
+    );
   });
 });
 

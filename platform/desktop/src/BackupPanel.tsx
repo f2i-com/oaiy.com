@@ -124,6 +124,20 @@ export function describeLastBackup(status: BackupStatus, now: Date | number = ne
   return { text: `Last backup: ${ago}`, nudge: false, kind: 'recent' };
 }
 
+/**
+ * The same, at the top of Settings' backup section: when the last backup was made, and how big it was. Nothing for a
+ * restore that waits for a restart (its own banner says so), and "from Settings" is not said where Settings is.
+ */
+export function sectionBackupLine(status: BackupStatus, now: Date | number = new Date()): string | null {
+  const line = describeLastBackup(status, now);
+  if (line.kind === 'pending') return null;
+  if (line.kind === 'failed') return 'The last backup did not finish. Make one again below: it takes a minute.';
+  if (line.kind === 'never') return line.text;
+  const facts = [status.lastBackupAt ? formatTimestamp(status.lastBackupAt) : '', status.lastBackupSize ? formatBytes(status.lastBackupSize) : ''].filter(Boolean).join(', ');
+  if (line.kind === 'stale') return facts ? `${line.text} The last one was made ${facts}.` : line.text;
+  return facts ? `${line.text} (${facts}).` : `${line.text}.`;
+}
+
 /** Said on the window when the Overview asks for the backup section (Settings may be open already). */
 const BACKUP_ASKED = 'oaiy:backup-asked';
 /** What the Overview asked for and Settings has not shown yet: the section, or the section with its passphrase field. */
@@ -348,16 +362,21 @@ export function BackupSection() {
     }
   }, []);
 
+  // A backup being made: this page's own, or one the desktop says is running (one the Agent started, or this page's
+  // own after Settings was left and opened again, when the page no longer knows it started one). Either way, another
+  // waits for it.
+  const making = creating || !!status?.running;
+
   // The status: every few seconds, and quickly while a backup is being made.
   useEffect(() => {
     void refresh();
-    const id = window.setInterval(() => void refresh(), creating ? RUNNING_POLL_MS : IDLE_POLL_MS);
+    const id = window.setInterval(() => void refresh(), making ? RUNNING_POLL_MS : IDLE_POLL_MS);
     return () => window.clearInterval(id);
-  }, [refresh, creating]);
+  }, [refresh, making]);
 
   const tooShort = length(passphrase) > 0 && length(passphrase) < MIN_PASSPHRASE;
   const mismatch = length(again) > 0 && passphrase !== again;
-  const canCreate = length(passphrase) >= MIN_PASSPHRASE && passphrase === again && !creating;
+  const canCreate = length(passphrase) >= MIN_PASSPHRASE && passphrase === again && !making;
 
   const create = async () => {
     if (!canCreate) return;
@@ -510,11 +529,17 @@ export function BackupSection() {
 
   const pending = status?.pendingRestore ?? null;
   const last = status?.lastRestore ?? null;
-  const working = creating || checking || staging;
+  const working = making || checking || staging;
+  const lastLine = status ? sectionBackupLine(status) : null;
 
   return (
     <section className="model-section backup-section" aria-label="Backup and restore" ref={sectionRef}>
       <h3 className="section-title">Backup and restore</h3>
+      {lastLine && (
+        <p className="backup-last" role="status" data-testid="backup-last">
+          <Archive size={14} aria-hidden /> {lastLine}
+        </p>
+      )}
       <p className="form-hint">
         A backup is one encrypted file with your contacts, calendar, conversations, flows, triggers, settings and
         plugin data. Plugin data is backed up plugin by plugin, with PINs, keys and sealed values left out. Keep the
@@ -643,7 +668,7 @@ export function BackupSection() {
             ref={passphraseRef}
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
-            disabled={creating}
+            disabled={making}
           />
         </label>
         <label className="form-row">
@@ -654,7 +679,7 @@ export function BackupSection() {
             aria-label="Backup passphrase again"
             value={again}
             onChange={(e) => setAgain(e.target.value)}
-            disabled={creating}
+            disabled={making}
           />
         </label>
         {tooShort && <p className="form-hint">Use at least {MIN_PASSPHRASE} characters.</p>}
@@ -664,7 +689,7 @@ export function BackupSection() {
             type="checkbox"
             checked={includeKeys}
             onChange={(e) => setIncludeKeys(e.target.checked)}
-            disabled={creating}
+            disabled={making}
           />
           <span>Include my API provider keys</span>
         </label>
@@ -685,7 +710,7 @@ export function BackupSection() {
         </div>
       </form>
 
-      {creating && (
+      {making && (
         <div role="status" aria-live="polite">
           <div className="progress-bar" role="progressbar" aria-label="Backup progress" style={{ margin: '8px 0' }}>
             <div className="progress-fill progress-indet" style={{ width: '40%' }} />

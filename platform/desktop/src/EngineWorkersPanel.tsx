@@ -2,21 +2,28 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Laptop, Loader2, Network, RotateCcw, Server, Star, TriangleAlert } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { engines, network, type NetworkModel, type NetworkNode, type NetworkStatus } from './api';
-import { DefaultChip, Device, KIND, MachineTiles, Queue, STATE, ago, deviceName, notInEffect } from './NetworkPanel';
+import { DefaultChip, Device, KIND, MachineTiles, Queue, STATE, ago, defaultDown, deviceName, notInEffect } from './NetworkPanel';
+import LoadError from './LoadError';
 
 /**
  * Engines → Other computers: the models of the workers paired over OAIY Network (docs/NETWORK.md), by computer, and
- * which of them is this computer's engine default of its kind in place of its own: what Flows' "Default … model", the
- * engine's chats and the Agent on the model chosen in Engines then use. "Use this computer's", beside a default, makes
- * this computer's own the default again. A default is not in effect while the paired computer cannot run it (the
- * desktop says why: not heard from since this computer started, its engines down, the model gone there), and this
- * computer's own runs meanwhile; a computer that is offline cannot be made the default until it answers again.
+ * which of them is this computer's engine default of its kind in place of its own: what OAIY's own routes then use
+ * (the Agent on the model chosen in Engines, Flows' "Default … model", the desktop's engine route). The Engines
+ * page's own gateway (port 8080) and its Playground are not among them: they answer with this computer's own model
+ * unless a paired one is picked there. "Use this computer's", beside a default, makes this computer's own the default
+ * again. A default is not in effect while the paired computer cannot run it (the desktop says why: not heard from
+ * since this computer started, its engines down, the model gone there), and this computer's own runs meanwhile; one
+ * still in effect while its computer's engines are not answering is said too, as nothing runs in its place then. A
+ * computer that is offline cannot be made the default until it answers again.
  */
 export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetworking: () => void }) {
   const [status, setStatus] = useState<NetworkStatus | null>(null);
   const [nodes, setNodes] = useState<NetworkNode[]>([]);
   const [local, setLocal] = useState<Record<string, string | null>>({});
+  /** Why the paired computers could not be read (a "Try again" asks again). */
   const [error, setError] = useState<string | null>(null);
+  /** Why a default was not changed. */
+  const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   // (each read numbered: one answered after a newer one began, or after a default was chosen, is not shown)
@@ -50,20 +57,20 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
 
   const choose = async (kind: string, id: string | null) => {
     setBusy(`${kind}:${id ?? ''}`);
-    setError(null);
+    setActionError(null);
     reads.current++;
     try {
       setStatus(await network.setDefault(kind, id));
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setActionError(`The default was not changed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy(null);
     }
   };
 
   if (!status) {
-    return <div className="panel">{error ? <div className="banner banner-err">{error}</div> : <div className="empty-state">Loading…</div>}</div>;
+    return <div className="panel">{error ? <LoadError error={error} what="The other computers" onRetry={refresh} /> : <div className="empty-state">Loading…</div>}</div>;
   }
 
   if (!status.uses) {
@@ -100,18 +107,21 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
 
   return (
     <div className="panel" data-testid="engine-workers">
-      {error && (
+      {error && <LoadError error={error} what="The other computers" onRetry={refresh} />}
+      {actionError && (
         <div className="banner banner-err" role="alert">
-          {error}
+          {actionError}
         </div>
       )}
       <section className="model-section">
         <div className="section-title-row">
           <h3 className="section-title">Defaults</h3>
         </div>
-        <p className="form-hint">
-          The model of each kind that Flows’ “Default … model”, the engine’s chats and the Agent (on the model chosen in Engines) use: this computer’s own,
-          or a paired computer’s you choose below. “Use this computer’s”, beside a default, makes this computer’s own the default again.
+        <p className="form-hint" data-testid="defaults-what">
+          The model of each kind that OAIY’s own work uses: the Agent (on the model chosen in Engines), Flows’ “Default … model” and the desktop’s engine
+          route. It is this computer’s own, or a paired computer’s you choose below. The Engines page’s gateway (port 8080) and its Playground answer
+          with this computer’s own model unless a paired one is picked there. “Use this computer’s”, beside a default, makes this computer’s own the
+          default again.
         </p>
         {kinds.length === 0 ? (
           <p className="form-hint">{nodes.length === 0 ? 'A paired computer’s models can be chosen here once one is paired (below).' : 'The paired computers have not said which models they have yet.'}</p>
@@ -120,10 +130,10 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
             {kinds.map((kind) => {
               const d = defaults[kind];
               const node = d && nodes.find((n) => n.nodeId === d.nodeId);
-              // (a worker's language model: whichever it runs now)
-              const shown = d && kind === 'llm' ? (node?.models.find((m) => m.kind === 'llm')?.model ?? d.model) : d?.model;
               // (the desktop says whether it is in effect, and why not; an older one does not, and what is known here is said)
               const waiting = notInEffect(d, node?.name ?? '');
+              // (in effect, but its computer's engines are not answering: nothing runs in its place)
+              const down = defaultDown(d, node?.name ?? '');
               const said = d?.inEffect !== undefined;
               return (
                 <div className="engine-default" key={kind} data-testid="engine-default">
@@ -131,15 +141,21 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
                   {d ? (
                     <span className="engine-default-which">
                       <Server size={14} aria-hidden />
-                      <code>{shown}</code>
+                      {/* (the model the paired computer runs now: the desktop says it, a worker's language model too) */}
+                      <code>{d.model}</code>
                       <span className="network-where">on {d.nodeName || 'a paired computer'}</span>
                       {waiting && (
                         <span className="engine-default-warn" data-testid="engine-default-waiting">
                           <TriangleAlert size={12} aria-hidden /> {waiting}
                         </span>
                       )}
+                      {down && (
+                        <span className="engine-default-warn" data-testid="engine-default-down">
+                          <TriangleAlert size={12} aria-hidden /> {down}
+                        </span>
+                      )}
                       {/* (in effect, its computer offline: what uses it is told so, and nothing runs in its place) */}
-                      {!waiting && node && !node.online && (
+                      {!waiting && !down && node && !node.online && (
                         <span className="engine-default-warn">
                           <TriangleAlert size={12} aria-hidden /> offline: what uses it says so, nothing runs in its place
                         </span>

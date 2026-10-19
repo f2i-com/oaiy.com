@@ -1,6 +1,7 @@
 import type {
   AgentModelSource,
   AgentPreferences,
+  CatalogPlugin,
   CheckOutcome,
   CodexModel,
   ControlLogEntry,
@@ -18,6 +19,7 @@ import type {
   SuggestedModel,
 } from './api';
 import type { SetupInput } from './setupGuide';
+import { hostOS, type HostOS } from './platform';
 
 /**
  * The setup wizard's steps and their state, worked out from live data.
@@ -248,6 +250,17 @@ export function chosenModel(catalog: EngineCatalog | null, group: string): strin
   return catalog?.defaults?.[defaultsKey(group)] ?? null;
 }
 
+/**
+ * A model as people read it: its name in the engines' catalogue ("Qwen3.5 9B") where the catalogue has its id
+ * ("qwen3.5-9b"), else the id as it is (a model file of the person's own has no other name).
+ */
+export function modelName(catalog: Pick<EngineCatalog, 'models'> | null | undefined, id: string): string;
+export function modelName(catalog: Pick<EngineCatalog, 'models'> | null | undefined, id: string | null | undefined): string | null;
+export function modelName(catalog: Pick<EngineCatalog, 'models'> | null | undefined, id: string | null | undefined): string | null {
+  if (!id) return id ?? null;
+  return catalog?.models?.find((m) => m.id === id)?.name || id;
+}
+
 export type Met = boolean | null;
 
 /** Is `req` met now? `null` while it cannot be told (not read yet). */
@@ -466,6 +479,23 @@ export function firstRunSteps(input: FirstRunInput): FirstRunStep[] {
 }
 
 /**
+ * The plugins ticked in the Plugins step that are not installed yet, by their catalogue names (else their ids): the
+ * step waits for them, as a ticked plugin that is not there has no setup to follow and would be dropped unsaid.
+ * None while the plugins are not read yet.
+ */
+export function chosenNotInstalled(chosen: string[], plugins: PluginRecord[] | null, catalog: CatalogPlugin[] | null): string[] {
+  if (!plugins) return [];
+  return chosen
+    .filter((id) => !plugins.some((p) => p.id === id) && !catalog?.find((c) => c.id === id)?.installed)
+    .map((id) => catalog?.find((c) => c.id === id)?.name ?? id);
+}
+
+/** Where to get a catalogue plugin, as said for this kind of computer (else the catalogue's one note for all). */
+export function catalogNote(source: CatalogPlugin['source'], os: HostOS = hostOS()): string | undefined {
+  return (os === 'other' ? undefined : source.notes?.[os]) ?? source.note;
+}
+
+/**
  * The step to open on: the one recorded (by its current name), while it is
  * still a step; else the first not done (from Plugins on, when the record's
  * place was in the rest, such as a plugin no longer chosen).
@@ -505,6 +535,21 @@ export function recommendationOrFallback(rec: EngineRecommendation | null, catal
 }
 
 /**
+ * The recommendation as it stands on this computer: ChatGPT is never recommended (nor chosen to begin with) where the
+ * Codex app it signs in through is not installed, as the desktop says or Codex's own status does. The engine is first
+ * then, and marked recommended only where it fits (`local.ok`).
+ */
+export function withCodexAsItIs(rec: EngineRecommendation, codex: { available?: boolean } | null | undefined): EngineRecommendation {
+  const noCodex = rec.chatgpt.available === false || codex?.available === false;
+  return noCodex && rec.recommend === 'chatgpt' ? { ...rec, recommend: 'engine' } : rec;
+}
+
+/** Is `source` the one to mark recommended? The engine only where it fits, now that it can be first without fitting. */
+export function isRecommended(rec: EngineRecommendation, source: AgentModelSource): boolean {
+  return rec.recommend === source && (source !== 'engine' || rec.local.ok);
+}
+
+/**
  * The choices, the recommended one first (the other stays there to choose); an
  * AI provider last, on a desktop that can keep it as the Agent's model.
  */
@@ -536,7 +581,8 @@ export interface ModelLine {
  */
 export function localModelLine(rec: EngineRecommendation | null, catalog: EngineCatalog | null): ModelLine {
   const chosen = chosenModel(catalog, 'llm') ?? rec?.local.chosen ?? null;
-  if (chosen) return { kind: 'chosen', name: chosen, detail: null };
+  // (by its catalogue name, "Qwen3.5 9B", not its id)
+  if (chosen) return { kind: 'chosen', name: modelName(catalog, chosen), detail: null };
   const offer: SuggestedModel | null = recommendedModel(catalog, 'llm') ?? rec?.local.suggested ?? null;
   if (!offer) return { kind: 'none', name: null, detail: null };
   const detail = [offer.sizeGb ? `${offer.sizeGb} GB download` : null, offer.vramGb ? `needs ${offer.vramGb} GB of GPU memory` : null].filter(Boolean).join(' · ');

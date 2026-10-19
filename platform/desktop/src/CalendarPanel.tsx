@@ -30,6 +30,7 @@ import {
 import { refetchRequests, useWaitingRequests } from './calendarRequests';
 import { describeSync } from './syncStatus';
 import { useToast } from './Toasts';
+import LoadError from './LoadError';
 import { ask } from './ask';
 import { moduleOn, useModules } from './useModules';
 import { useVisiblePoll } from './useVisiblePoll';
@@ -297,7 +298,7 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
 
   return (
     <div className={`panel cal-page${side ? ' has-side' : ''}`}>
-      {error && <div className="banner banner-err">The calendar could not be read: {error}</div>}
+      {error && <LoadError error={error} what="The calendar" onRetry={refresh} />}
       {sync?.linked && (sync.problems?.length ?? 0) > 0 && (
         <div className="banner banner-err" role="status">
           FormLogic would not take {sync.problems!.length === 1 ? 'an appointment' : plural(sync.problems!.length, 'appointment')}:{' '}

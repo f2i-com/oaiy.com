@@ -48,4 +48,22 @@ describe('the ChatGPT sign-in', () => {
     expect(onConnected).toHaveBeenCalledWith(expect.objectContaining({ connected: true, email: 'owner@example.com' }));
     expect(host.textContent).toContain('owner@example.com');
   });
+
+  it('says the Codex app is not installed in words, with what to do, never the system’s error', async () => {
+    m.status.mockResolvedValue({ available: false, connected: false, detail: "The Codex app isn't installed on this computer." });
+    await act(async () => root.render(<ChatGptConnector bare />));
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(host.textContent).toContain('The Codex app isn’t installed on this computer.');
+    expect(host.textContent).toContain('Install Codex with OpenAI’s guide');
+    expect(host.textContent).not.toContain('os error');
+    expect(Array.from(host.querySelectorAll('button')).map((b) => b.textContent?.trim())).toEqual(['How to install Codex', 'Check again']);
+  });
+
+  it('shows another reason Codex cannot start as it came', async () => {
+    m.status.mockResolvedValue({ available: false, connected: false, detail: 'cannot run the codex CLI: Permission denied (os error 13)' });
+    await act(async () => root.render(<ChatGptConnector bare />));
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(host.textContent).toContain('The Codex app could not be started on this computer.');
+    expect(host.textContent).toContain('Permission denied (os error 13)');
+  });
 });

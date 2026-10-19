@@ -15,6 +15,7 @@ import {
 import { Download, FolderOpen, Plus, Trash2, Upload } from 'lucide-react';
 import LogsViewer from './LogsViewer';
 import { useToast } from './Toasts';
+import LoadError from './LoadError';
 import { ask } from './ask';
 import { peek, put } from './useCached';
 
@@ -203,11 +204,7 @@ export default function ServicesPanel() {
 
   return (
     <div className="panel">
-      {error && (
-        <div className="banner banner-err">
-          Couldn't reach OAIY: {error}
-        </div>
-      )}
+      {error && <LoadError error={error} what="The services" onRetry={refresh} />}
       {actionError && (
         <div className="banner banner-err banner-dismissable">
           <span>⚠ {actionError}</span>
@@ -467,7 +464,7 @@ function AddServiceForm({ onCancel, onSaved, onError }: AddFormProps) {
       </div>
       <label className="form-row">
         <span>Command (executable or path)</span>
-        <input
+        <input className="is-mono"
           type="text"
           placeholder="python or C:\\path\\to\\app.exe"
           value={command}
@@ -489,7 +486,7 @@ function AddServiceForm({ onCancel, onSaved, onError }: AddFormProps) {
       </label>
       <label className="form-row">
         <span>Health-check URL (optional)</span>
-        <input
+        <input className="is-mono"
           type="text"
           placeholder="http://127.0.0.1:${port}/health"
           value={healthUrl}

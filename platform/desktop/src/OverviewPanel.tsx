@@ -22,11 +22,14 @@ import { BackupLine } from './BackupPanel';
 import TodayPanel from './TodayPanel';
 import { dismissGuide, reopenGuide, shouldAutoOpen } from './setupGuide';
 import type { StepTarget } from './setupGuide';
+import LoadError from './LoadError';
 import {
   aiProviders,
   codex,
   bridge,
+  isNotAnswering,
   network,
+  NOT_ANSWERING,
   nodeRuntime,
   type NetworkStatus,
   type RuntimeStatus,
@@ -133,6 +136,8 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [guideOpen, setGuideOpen] = useState<boolean>(() => shouldAutoOpen());
   const [codexConnected, setCodexConnected] = useState(false);
   const [unavailable, setUnavailable] = useState<string[]>([]);
+  /** Every read that failed got no answer at all: OAIY's local API is not answering, said as that alone. */
+  const [notAnswering, setNotAnswering] = useState(false);
   const [failedSeen, setFailedSeen] = useState<FailedSeen>(readFailedSeen);
   const [nodeBusy, setNodeBusy] = useState(false);
   const [nodeError, setNodeError] = useState<string | null>(null);
@@ -156,7 +161,9 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
     refreshing.current = false;
     setCodexConnected(cx.status === 'fulfilled' && cx.value.connected);
     const labels = ['services', 'plugins', 'AI providers', 'connections', 'runtime'];
-    setUnavailable([s, p, a, c, r].flatMap((result, index) => result.status === 'rejected' ? [labels[index]] : []));
+    const failed = [s, p, a, c, r].flatMap((result, index) => (result.status === 'rejected' ? [{ label: labels[index], reason: result.reason as unknown }] : []));
+    setUnavailable(failed.map((f) => f.label));
+    setNotAnswering(failed.length > 0 && failed.every((f) => isNotAnswering(f.reason)));
     if (s.status === 'fulfilled') {
       setSvc(s.value.services);
       put('services', s.value.services);
@@ -258,18 +265,23 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
     setFailedSeen(readFailedSeen());
   };
   const plugName = (p: PluginRecord) => p.manifest?.name ?? p.declared?.name ?? p.id;
+  /**
+   * A card whose plugin is not running: said in place of its value (whatever it last answered is old news, and a bare
+   * "—" read as nothing known), with the way to Plugins, where it is started. Null while it runs, or is not known yet.
+   */
+  const notRunning = (card: OverviewContribution): string | null => {
+    const plugin = pluginById.get(card.pluginId);
+    if (!plugin || plugin.state === 'running' || plugin.state === 'unhealthy') return null;
+    return plugin.state === 'starting' ? 'Starting…' : 'Not running';
+  };
 
   return (
     <div className="panel">
       {unavailable.length > 0 && (
-        <div className="banner banner-err banner-dismissable" role="status">
-          <span>Couldn't refresh {unavailable.join(', ')}. Showing last known values where available.</span>
-          <span className="banner-actions">
-            <button className="btn-tiny" onClick={() => void refresh()}>
-              <RotateCcw size={12} /> Refresh status
-            </button>
-          </span>
-        </div>
+        <LoadError
+          error={notAnswering ? NOT_ANSWERING : `Couldn't refresh ${unavailable.join(', ')}. Showing last known values where available.`}
+          onRetry={refresh}
+        />
       )}
       <UpdateBanner onOpenSettings={() => onNavigate('settings')} />
       <TodayPanel onNavigate={onNavigate} />
@@ -346,8 +358,9 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
         <div className="overview-status-list">
           {statuses.map((card) => {
             const Icon = cardIcon(card.icon);
-            const value = bindText(card.bind.value ?? card.bind.headline, ctx(card));
-            const detail = bindText(card.bind.detail ?? card.bind.body, ctx(card));
+            const stopped = notRunning(card);
+            const value = stopped ?? bindText(card.bind.value ?? card.bind.headline, ctx(card));
+            const detail = stopped ? null : bindText(card.bind.detail ?? card.bind.body, ctx(card));
             const target = card.view ?? card.cta?.view;
             return (
               <div key={`${card.pluginId}-${card.id}`} className="overview-status">
@@ -355,10 +368,16 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
                 <strong>{card.title}</strong>
                 <span className="overview-status-value">{value ?? '—'}</span>
                 {detail && <small>{detail}</small>}
-                {target && (
-                  <button className="btn-tiny" onClick={() => openView(target)}>
-                    {card.cta?.label ?? 'Open'} <ChevronRight size={12} />
+                {stopped ? (
+                  <button className="btn-tiny" onClick={() => onNavigate('plugins')} title={`Start the ${card.pluginName} plugin in Plugins`}>
+                    Open Plugins <ChevronRight size={12} />
                   </button>
+                ) : (
+                  target && (
+                    <button className="btn-tiny" onClick={() => openView(target)}>
+                      {card.cta?.label ?? 'Open'} <ChevronRight size={12} />
+                    </button>
+                  )
                 )}
               </div>
             );
@@ -375,7 +394,8 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           <div className="overview-grid">
             {tiles.map((card) => {
               const Icon = cardIcon(card.icon);
-              const value = bindText(card.bind.value ?? card.bind.headline, ctx(card));
+              const stopped = notRunning(card);
+              const value = stopped ?? bindText(card.bind.value ?? card.bind.headline, ctx(card));
               const inside = (
                 <>
                   <Icon size={16} aria-hidden />
@@ -385,6 +405,13 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               );
               const key = `${card.pluginId}-${card.id}`;
               const label = `${card.title}: ${value ?? 'not known'}`;
+              // (its plugin not running: to Plugins, where it is started, rather than to a page that cannot answer)
+              if (stopped)
+                return (
+                  <button key={key} className="overview-tile" aria-label={label} title={`From the ${card.pluginName} plugin, which is not running: open Plugins to start it`} onClick={() => onNavigate('plugins')}>
+                    {inside}
+                  </button>
+                );
               return card.view ? (
                 <button key={key} className="overview-tile" aria-label={label} title={`From the ${card.pluginName} plugin`} onClick={() => openView(card.view!)}>
                   {inside}
@@ -478,7 +505,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           </button>
           <button className="overview-tile" onClick={() => onNavigate('connections')}>
             <ShieldCheck size={16} aria-hidden />
-            <strong>{apps === null ? '—' : apps.length}</strong>
+            <strong>{apps === null ? '—' : apps.length === 0 ? 'None yet' : apps.length}</strong>
             <small>Connected apps</small>
           </button>
           {/* OAIY Network, once it is switched on: the workers answering (a primary), or whom this one lends to */}

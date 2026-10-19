@@ -67,7 +67,7 @@
   border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
   border-radius: 50%;
   background: var(--primary-soft);
-  color: var(--primary);
+  color: var(--primary-text);
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.03em;
@@ -149,7 +149,7 @@
 .fact-list .btn-tiny { flex: none; }
 
 .contact-danger { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 12px; }
-.contact-delete { color: var(--danger); }
+.contact-delete { align-self: flex-start; }
 .contact-confirm {
   display: flex;
   flex-direction: column;

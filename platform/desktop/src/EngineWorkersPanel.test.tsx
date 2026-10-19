@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const api = vi.hoisted(() => ({
   network: { status: vi.fn(), nodes: vi.fn(), setDefault: vi.fn() },
   engines: { catalog: vi.fn() },
+  NOT_ANSWERING: 'OAIY isn’t answering. It may still be starting, or it has stopped.',
 }));
 vi.mock('./api', () => api);
 vi.mock('./useVisiblePoll', () => ({ useVisiblePoll: () => {} }));
@@ -71,11 +72,12 @@ describe('EngineWorkersPanel', () => {
   });
 
   it("shows a worker's model as the default (its language model, whichever it runs now), and gives it back to this computer", async () => {
+    // (the desktop says the model the paired computer runs now: `model` is it, for a language model too)
     api.network.status.mockResolvedValue({
       ...primary,
       defaults: {
         image: { id: 'engine:image:node.w1/moss', nodeId: 'w1', nodeName: 'Rig', model: 'moss' },
-        llm: { id: 'engine:llm:node.w1/old-llm', nodeId: 'w1', nodeName: 'Rig', model: 'old-llm' },
+        llm: { id: 'engine:llm:node.w1/qwen', nodeId: 'w1', nodeName: 'Rig', model: 'qwen' },
       },
     });
     api.network.setDefault.mockResolvedValue(primary);
@@ -125,6 +127,60 @@ describe('EngineWorkersPanel', () => {
     const moss = Array.from(rows('engine-worker')[0].querySelectorAll('.network-model')).find((r) => r.textContent?.includes('moss'))!;
     expect(moss.querySelector('.engine-default-chip')?.textContent?.trim()).toBe('Default, not in effect');
     expect(moss.querySelector('.engine-default-chip')?.getAttribute('title')).toBe(said);
+  });
+
+  it('names the default by the model the desktop says it is, not one this page works out', async () => {
+    api.network.status.mockResolvedValue({
+      ...primary,
+      defaults: { llm: { id: 'engine:llm:node.w1/qwen-next', nodeId: 'w1', nodeName: 'Rig', model: 'qwen-next', inEffect: true } },
+    });
+    await mount();
+    const text = rows('engine-default').find((r) => r.textContent?.includes('on Rig'))!;
+    expect(text.querySelector('code')?.textContent).toBe('qwen-next');
+  });
+
+  it('says a default still in effect whose computer’s engines are not answering fails meanwhile, rather than nothing', async () => {
+    api.network.status.mockResolvedValue({
+      ...primary,
+      defaults: { image: { id: 'engine:image:node.w1/moss', nodeId: 'w1', nodeName: 'Rig', model: 'moss', inEffect: true, waiting: 'engines_down' } },
+    });
+    await mount();
+    const picture = rows('engine-default').find((r) => r.textContent?.includes('moss'))!;
+    expect(picture.querySelector('[data-testid="engine-default-down"]')?.textContent?.trim()).toBe('Rig’s engines aren’t answering: what uses it fails until they do.');
+    expect(picture.querySelector('[data-testid="engine-default-waiting"]')).toBeNull();
+    expect(picture.textContent).not.toContain('Not in effect');
+  });
+
+  it('says exactly what uses a default: OAIY’s own routes, not the Engines page’s gateway or its Playground', async () => {
+    api.network.status.mockResolvedValue(primary);
+    await mount();
+    const said = container.querySelector('[data-testid="defaults-what"]')!.textContent!.replace(/\s+/g, ' ');
+    expect(said).toContain('the Agent (on the model chosen in Engines), Flows’ “Default … model” and the desktop’s engine route');
+    expect(said).toContain('The Engines page’s gateway (port 8080) and its Playground answer with this computer’s own model unless a paired one is picked there.');
+    expect(said).not.toContain('engine’s chats');
+  });
+
+  it('says the paired computers could not be read, with a way to ask again', async () => {
+    api.network.status.mockRejectedValueOnce(new Error('the network service is starting'));
+    await mount();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('The other computers could not be read: the network service is starting');
+    api.network.status.mockResolvedValue(primary);
+    await act(async () => Array.from(container.querySelectorAll('button')).find((b) => b.textContent?.includes('Try again'))!.click());
+    await act(async () => {});
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(rows('engine-default').length).toBeGreaterThan(0);
+  });
+
+  it('says a default that was not changed, apart from what could not be read', async () => {
+    api.network.status.mockResolvedValue(primary);
+    api.network.setDefault.mockRejectedValue(new Error('Rig refused it'));
+    await mount();
+    const moss = Array.from(rows('engine-worker')[0].querySelectorAll('.network-model')).find((r) => r.textContent?.includes('moss'))!;
+    await act(async () => moss.querySelector('button')!.click());
+    await act(async () => {});
+    const alert = container.querySelector('[role="alert"]')!;
+    expect(alert.textContent).toBe('The default was not changed: Rig refused it');
+    expect(alert.querySelector('button')).toBeNull();
   });
 
   it('says nothing of the kind for a default in effect', async () => {

@@ -35,6 +35,7 @@ vi.mock('./api', () => ({
     dismissDeadLetter: vi.fn(),
   },
   network: { nodes: vi.fn().mockResolvedValue({ nodes: [] }), picture: pictureMock },
+  NOT_ANSWERING: 'OAIY isn’t answering. It may still be starting, or it has stopped.',
 }));
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: pushMock }) }));
 
@@ -176,12 +177,39 @@ describe('RunsPanel', () => {
     expect(text()).toContain('Failed runs');
   });
 
-  it('puts the reason on the row, not behind a click', async () => {
+  it('puts the reason on the row, not behind a click, and its code in the details', async () => {
     await mount();
-    expect(text()).toContain('capability_unavailable');
     expect(text()).toContain('Ollama is not running.');
-    // The run id is detail, so it stays collapsed until asked for.
+    // The run id and the error's code are detail, so they stay collapsed until asked for.
     expect(text()).not.toContain('run_a1');
+    expect(text()).not.toContain('capability_unavailable');
+    await click(host.querySelector('.run-head')!);
+    expect(text()).toContain('capability_unavailable');
+  });
+
+  it('lists the events that started no flow below the runs, not above them', async () => {
+    deadMock.mockResolvedValue({
+      deadLetters: [{ id: 'dl_1', source: 'aokie', event: 'aokie.sms.received', reason: { kind: 'not_reserved' }, envelope: {}, recordedAtMs: 1_785_000_000_000, attempts: 0 }],
+      total: 1,
+    });
+    await mount();
+    await act(async () => {});
+    const heads = [...host.querySelectorAll('h3')].map((h) => h.textContent ?? '');
+    const runs = heads.findIndex((t) => t.includes('Failed runs'));
+    const events = heads.findIndex((t) => t.includes('Events that did not start a flow'));
+    expect(runs).toBeGreaterThanOrEqual(0);
+    expect(events).toBeGreaterThan(runs);
+  });
+
+  it('says a list that could not be read once, with a way to ask again', async () => {
+    runsMock.mockRejectedValue(new Error('the bridge is restarting'));
+    await mount();
+    const banner = host.querySelector('.load-error')!;
+    expect(banner.textContent).toContain('Run history could not be read: the bridge is restarting');
+    runsMock.mockResolvedValue({ runs: [FAILED], total: 1, byStatus: { failed: 1 } });
+    await click([...banner.querySelectorAll('button')].find((b) => b.textContent?.includes('Try again'))!);
+    expect(host.querySelector('.load-error')).toBeNull();
+    expect(text()).toContain('Ollama is not running.');
   });
 
   it('offers no "Show all" when the reason fits in three lines', async () => {
@@ -273,7 +301,9 @@ describe('RunsPanel', () => {
     await mount();
     expect(text()).toContain('Look up a caller');
     expect(text()).toContain('FormLogic');
-    expect(text()).toContain('On aokie.sms.received');
+    // (a trigger's run says its event in words; the event's name is in its details)
+    expect(text()).toContain('When a text arrived');
+    expect(text()).not.toContain('aokie.sms.received');
     expect(text()).toContain('The Agent');
   });
 

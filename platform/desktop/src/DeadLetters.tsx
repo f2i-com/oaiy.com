@@ -1,37 +1,56 @@
 import { useCallback, useRef, useState } from 'react';
 import { ChevronDown, Inbox, Loader2, RotateCw, X } from 'lucide-react';
 import { bridge, type DeadLetter } from './api';
-import { JsonBlock, fullWhen, whenText } from './RunParts';
+import { JsonBlock, eventWords, fullWhen, whenText } from './RunParts';
 import { useVisiblePoll } from './useVisiblePoll';
 import { ask } from './ask';
 
 /**
- * Events that arrived and produced no work.
+ * Events that arrived and produced no work: "Events that did not start a
+ * flow", under the run history.
  *
  * Two things put an event here: the host shed it under a flood (the queue is
  * bounded on purpose), or every binding that matched failed to fire for an
  * operational reason. Both used to be invisible — one logged to a ring that was
  * itself overwriting, the other forgotten on restart.
  *
- * Redrive re-dispatches against the CURRENT bindings rather than replaying a
- * decision, so fixing the binding and redriving works, and a loop-guard refusal
- * is refused again rather than forced through.
+ * "Try again" (a redrive) re-dispatches against the CURRENT bindings rather
+ * than replaying a decision, so fixing the binding and trying again works, and
+ * a loop-guard refusal is refused again rather than forced through.
+ *
+ * The page says it in plain words: what happened, and what to do. The codes
+ * (the event's name, why OAIY recorded it, the last try's outcome) are in an
+ * entry's details.
  */
 
 const POLL_MS = 6000;
 
+/** Why an event started nothing, in a badge. */
 const KIND: Record<DeadLetter['reason']['kind'], string> = {
-  shed: 'dropped',
-  not_reserved: 'not run',
+  shed: 'set aside',
+  not_reserved: 'no flow ran',
   not_delivered: 'not sent to the linked account',
+};
+
+/** Why, in a sentence (the reason OAIY recorded is in the details). */
+const WHY: Record<DeadLetter['reason']['kind'], string> = {
+  shed: 'Too many events came at once, so this one was set aside before any flow saw it.',
+  not_reserved: 'No flow started for it: none is set to start on it, or the one that is was held back (flows that start each other are stopped after a few rounds).',
+  not_delivered: 'It was not sent on to your linked FormLogic account.',
+};
+
+/** An event in words, with a capital: "A call ended". */
+const said = (d: DeadLetter) => {
+  const w = eventWords(d.event);
+  return w.charAt(0).toUpperCase() + w.slice(1);
 };
 
 export default function DeadLetters() {
   const [items, setItems] = useState<DeadLetter[] | null>(null);
   /** How many there are in all: the list holds the newest hundred. */
   const [total, setTotal] = useState(0);
-  /** What is being asked about each entry, by its id: Redrive says "Redriving…" for a redrive alone. One entry's
-   *  answer frees that entry only, so another's slow redrive cannot be pressed again meanwhile. */
+  /** What is being asked about each entry, by its id: "Try again" says "Trying again…" for a redrive alone. One
+   *  entry's answer frees that entry only, so another's slow redrive cannot be pressed again meanwhile. */
   const [busy, setBusy] = useState<Record<string, 'redrive' | 'dismiss'>>({});
   const mark = (id: string, action: 'redrive' | 'dismiss' | null) =>
     setBusy((prev) => {
@@ -72,9 +91,9 @@ export default function DeadLetters() {
       setNote(
         r.reserved
           ? item.reason.kind === 'not_delivered'
-            ? `${item.event} is waiting to be sent to the linked account again.`
-            : `Redrive reserved a run for ${item.event}.`
-          : `${item.event} is still not running — ${r.outcomes.join('; ') || 'no binding matched'}`,
+            ? `“${said(item)}” is waiting to be sent to the linked account again.`
+            : `“${said(item)}” started a flow: it is in the run history.`
+          : `“${said(item)}” still did not start a flow. OAIY recorded: ${r.outcomes.join('; ') || 'no flow is set to start on it'}.`,
       );
       await refresh();
     } catch (e) {
@@ -85,14 +104,14 @@ export default function DeadLetters() {
   };
 
   const dismiss = async (item: DeadLetter) => {
-    if (!(await ask(`Dismiss ${item.event}? It is taken off this list and never run.`))) return;
+    if (!(await ask(`Dismiss “${said(item)}”? It is taken off this list and never run.`))) return;
     mark(item.id, 'dismiss');
     setNote(null);
     try {
       await bridge.dismissDeadLetter(item.id);
       await refresh();
     } catch (e) {
-      setNote(`${item.event} could not be dismissed: ${e instanceof Error ? e.message : String(e)}`);
+      setNote(`“${said(item)}” could not be dismissed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       mark(item.id, null);
     }
@@ -119,12 +138,12 @@ export default function DeadLetters() {
     <section className="service-section">
       <div className="section-title-row">
         <h3 className="section-title">
-          <Inbox size={14} /> Events that produced no work ({total > items.length ? `${items.length} of ${total}` : items.length})
+          <Inbox size={14} /> Events that did not start a flow ({total > items.length ? `${items.length} of ${total}` : items.length})
         </h3>
       </div>
       <p className="form-hint">
-        These arrived but never became a run. Fix the binding, then redrive — loop
-        guards still apply, so a redrive can legitimately fail again.
+        These came from your plugins, but no flow ran for them. Check the flow that should start on each one (its
+        trigger, in the editor), then try again. Trying again can still start nothing, for the same reason.
       </p>
       {noteLine}
 
@@ -139,19 +158,19 @@ export default function DeadLetters() {
                     <span className="badge badge-err">{KIND[d.reason.kind] ?? d.reason.kind}</span>
                   </span>
                   <span className="run-name">
-                    <strong className="run-flow">{d.event}</strong>
+                    <strong className="run-flow">{said(d)}</strong>
                   </span>
                   <span className="run-meta">
-                    {d.source}
-                    {d.attempts > 0 ? ` · ${d.attempts} redrive${d.attempts === 1 ? '' : 's'}` : ''}
+                    From {d.source}
+                    {d.attempts > 0 ? ` · tried again ${d.attempts === 1 ? 'once' : `${d.attempts} times`}` : ''}
                   </span>
                   <time className="run-when" title={fullWhen(d.recordedAtMs)}>
                     {whenText(d.recordedAtMs, now)}
                   </time>
                   <ChevronDown size={14} className="run-chevron" aria-hidden />
                 </button>
-                <button className="btn-tiny" disabled={!!busy[d.id]} onClick={() => void redrive(d)}>
-                  {busy[d.id] === 'redrive' ? <Loader2 size={13} className="spin" /> : <RotateCw size={13} />} {busy[d.id] === 'redrive' ? 'Redriving…' : 'Redrive'}
+                <button className="btn-tiny" disabled={!!busy[d.id]} onClick={() => void redrive(d)} title="Hand it to the flows again, as they are set up now">
+                  {busy[d.id] === 'redrive' ? <Loader2 size={13} className="spin" /> : <RotateCw size={13} />} {busy[d.id] === 'redrive' ? 'Trying again…' : 'Try again'}
                 </button>
                 <button className="btn-tiny" disabled={!!busy[d.id]} onClick={() => void dismiss(d)}>
                   <X size={13} /> {busy[d.id] === 'dismiss' ? 'Dismissing…' : 'Dismiss'}
@@ -160,25 +179,39 @@ export default function DeadLetters() {
 
               <div className="run-error">
                 <p>
-                  <span className="run-error-text">
-                    {d.reason.kind === 'shed'
-                      ? 'The host event queue was full, so this was dropped before dispatch.'
-                      : (d.reason.detail ?? 'No binding reserved a run.')}
-                  </span>
+                  <span className="run-error-text">{WHY[d.reason.kind] ?? 'No flow started for it.'}</span>
                 </p>
               </div>
-
-              {d.lastOutcome && <p className="run-held form-hint">Last redrive: {d.lastOutcome}</p>}
 
               {shown && (
                 <div className="run-body" id={`dead-${d.id}`}>
                   <dl className="run-detail">
+                    <dt>Event</dt>
+                    <dd>
+                      <code>{d.event}</code>
+                    </dd>
                     <dt>Arrived</dt>
                     <dd>{fullWhen(d.recordedAtMs)}</dd>
+                    {d.reason.detail && (
+                      <>
+                        <dt>Why, as recorded</dt>
+                        <dd>
+                          <code>{d.reason.detail}</code>
+                        </dd>
+                      </>
+                    )}
                     {d.lastAttemptMs && (
                       <>
-                        <dt>Last redrive</dt>
+                        <dt>Last tried again</dt>
                         <dd>{fullWhen(d.lastAttemptMs)}</dd>
+                      </>
+                    )}
+                    {d.lastOutcome && (
+                      <>
+                        <dt>What that did</dt>
+                        <dd>
+                          <code>{d.lastOutcome}</code>
+                        </dd>
                       </>
                     )}
                     <dt>From</dt>
