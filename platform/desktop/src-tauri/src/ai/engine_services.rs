@@ -106,7 +106,7 @@ const KINDS: [Kind; 8] = [
         response_path: "",
         output: "video",
         format: "mp4",
-        job: Some(Job { status: "/{id}", content: "/{id}/content", fallback: None, cancel: None }),
+        job: Some(Job { status: "/{id}", content: "/{id}/content", fallback: None, cancel: Some("/{id}/cancel") }),
         inputs: &[("prompt", "Prompt", "string"), ("image", "Start picture", "image")],
     },
     Kind {
@@ -514,6 +514,15 @@ async fn forward_to(gateway: &str, discovery: &Value, path: String, req: Request
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_kind_made_as_a_job_can_be_cancelled() {
+        // (a flow's Stop cancels what it started: a video it could not cancel went on rendering, the GPU held, after the
+        // flow said it had stopped)
+        for kind in KINDS.iter().filter(|k| k.job.is_some()) {
+            assert!(kind.job.as_ref().is_some_and(|j| j.cancel == Some("/{id}/cancel")), "{} has no cancel route", kind.kind);
+        }
+    }
 
     /// The gateway path a request to this desktop's gateway route names.
     fn gateway_path(req: &Request) -> String {

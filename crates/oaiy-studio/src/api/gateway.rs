@@ -1379,6 +1379,11 @@ fn videos_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method:
             let deleted = studio.media.remove(id);
             send(w, Ok(Reply { status: if deleted { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("object", Json::str("video.deleted")), ("deleted", Json::Bool(deleted))]) }))
         }
+        // (as a song's or a sound's: the render stops and the GPU is let go; a flow's Stop sends it)
+        ("POST", [id, "cancel"]) => {
+            let cancelled = video(id).is_some() && studio.media.cancel(id);
+            send(w, Ok(Reply { status: if cancelled { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("cancelled", Json::Bool(cancelled))]) }))
+        }
         ("GET", [id, "content"]) => {
             let Some(job) = video(id) else { return send(w, Err(fail(404, "no such video"))) };
             if job.status != "completed" {
