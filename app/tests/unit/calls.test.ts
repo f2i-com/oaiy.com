@@ -532,9 +532,10 @@ describe('a phone call answered by the agent', () => {
     expect(names).not.toContain('update_plan');
   });
 
-  it('an appointment request goes to the phone, and its answer back to the agent', async () => {
+  it('an appointment request goes to the phone with only its five fields, and its answer back to the agent', async () => {
     fakeProvider('openai', [
-      { calls: [{ name: 'request_appointment', input: { callerName: 'Sam', service: 'Haircut', date: '2026-10-03', time: '10:00', agreementPhrase: 'yes ten works' } }] },
+      // (a field the model added, which the phone's tool would refuse the whole request for, is left out)
+      { calls: [{ name: 'request_appointment', input: { callerName: 'Sam', service: 'Haircut', date: '2026-10-03', time: '10:00', agreementPhrase: 'yes ten works', phone: '0491 570 156' } }] },
       (body) => {
         expect(JSON.stringify(body.messages)).toContain('requested');
         return { text: 'I have noted a request for Saturday at ten; staff will confirm it.' };

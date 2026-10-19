@@ -1642,7 +1642,12 @@ export class Sessions {
         },
         run: async (input) => {
           const { desktop, callId } = live();
-          return outcome(await desktop.callTool(callId, 'request_appointment', input));
+          // Only the five fields the phone's tool takes: it refuses a request with any other (a note, a phone number a
+          // model added), and the caller would wait out a retry for it.
+          const request = Object.fromEntries(
+            ['callerName', 'service', 'date', 'time', 'agreementPhrase'].filter((k) => input[k] !== undefined).map((k) => [k, input[k]]),
+          );
+          return outcome(await desktop.callTool(callId, 'request_appointment', request));
         },
       },
       {
