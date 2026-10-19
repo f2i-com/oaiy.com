@@ -247,30 +247,6 @@ a:hover { text-decoration: underline; text-underline-offset: 2px; }
   color: var(--text);
 }
 
-.sidebar {
-  z-index: 10;
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  border-right: 1px solid var(--border);
-  background: var(--sidebar);
-  padding: 25px 14px 16px;
-}
-
-.brand { padding: 0 12px; }
-.brand > strong {
-  display: block;
-  font-size: 34px;
-  font-weight: 650;
-  letter-spacing: 0.11em;
-  line-height: 1;
-}
-.brand > span {
-  display: block;
-  margin-top: 8px;
-  color: var(--muted);
-  font-size: 12px;
-}
 kbd {
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
@@ -281,56 +257,6 @@ kbd {
   font-size: 9px;
 }
 
-.sidebar nav {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  margin-top: 26px;
-}
-.sidebar nav button,
-.sidebar .settings {
-  position: relative;
-  display: flex;
-  width: 100%;
-  min-height: 43px;
-  align-items: center;
-  gap: 13px;
-  border: 0;
-  border-radius: var(--r-ctl);
-  background: transparent;
-  color: var(--muted);
-  padding: 0 12px;
-  font-size: 13px;
-  text-align: left;
-  transition: background 0.14s, color 0.14s;
-}
-.sidebar nav button:hover,
-.sidebar .settings:hover { background: var(--surface-soft); color: var(--text); }
-.sidebar nav button.active,
-.sidebar .settings.active {
-  background: linear-gradient(90deg, var(--primary-soft), transparent);
-  color: var(--text);
-}
-.sidebar nav button.active::before,
-.sidebar .settings.active::before {
-  position: absolute;
-  top: 9px;
-  bottom: 9px;
-  left: 0;
-  width: 2px;
-  border-radius: 4px;
-  background: var(--primary);
-  content: '';
-}
-.sidebar nav button > span,
-.sidebar .settings > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.sidebar-fill { flex: 1; }
 
 @keyframes led-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
@@ -1789,16 +1715,6 @@ input.is-mono { font-family: var(--font-mono); }
 
 @media (max-width: 1240px) {
   .app-shell { grid-template-columns: 74px minmax(0, 1fr); }
-  .sidebar { align-items: center; padding-right: 10px; padding-left: 10px; }
-  .brand { padding: 0; text-align: center; }
-  .brand > strong { font-size: 19px; letter-spacing: 0.05em; }
-  .brand > span,
-  .sidebar nav button > span,
-  .sidebar .settings > span { display: none; }
-  .sidebar nav,
-  .sidebar .settings { width: 43px; }
-  .sidebar nav button,
-  .sidebar .settings { justify-content: center; padding: 0; }
   .topbar, .section-tabs, .endpoint-dock { padding-left: 24px; }
   :root { --page-pad-t: 22px; --page-pad-x: 24px; --page-pad-b: 36px; }
 }
@@ -1895,24 +1811,7 @@ input.is-mono { font-family: var(--font-mono); }
 /* Under the webview while it opens (the first time, it is made): covered by the page once it is there. */
 .embedded-opening { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 0; color: var(--faint); font-size: 12.5px; }
 
-/* The Calendar, Hours & Services and the sidebar's sub-menus: calendar.css. */
-
-/* The sidebar's group labels. */
-.sidebar nav .nav-group {
-  display: block;
-  margin: 16px 0 4px;
-  padding: 0 12px;
-  color: var(--faint);
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  font-weight: 650;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-.sidebar nav .nav-group:first-child { margin-top: 2px; }
-@media (max-width: 1240px) {
-  .sidebar nav .nav-group { visibility: hidden; height: 6px; margin: 6px 0 0; }
-}
+/* The Calendar and Hours & Services: calendar.css. The sidebar, its groups and sub-menus: sidebar.css. */
 
 /* Overview's Today tiles: a state in colour, on one line. */
 .today-grid .overview-tile strong.ok { color: var(--green); }

@@ -902,8 +902,6 @@ export default function App() {
           })}
         </nav>
 
-        <div className="sidebar-fill" />
-
         <button
           className={section?.id === SETTINGS.id ? 'settings active' : 'settings'}
           type="button"

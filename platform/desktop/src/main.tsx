@@ -7,6 +7,7 @@ import './styles.css';
 import './workspace.css';
 import './setup.css';
 import './calendar.css';
+import './sidebar.css';
 import './contacts.css';
 import './messages.css';
 

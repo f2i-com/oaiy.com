@@ -1,0 +1,297 @@
+/* ============================================================================
+ * THE SIDEBAR — all of it here: the brand, the sections and their groups, the
+ * sub-menus (the AI Receptionist's pages), the counts, Settings, and the
+ * narrow (icons only) sidebar. Built from the dashboard's tokens (styles.css),
+ * so Prism Lab and Paper Circuit both follow.
+ *
+ * The brand stays at the top and Settings at the bottom; only the sections
+ * between them scroll, and only in a window too short for them. The rows are
+ * compact (34px, 30px for a sub-menu's pages) so the sections of a usual
+ * window, a plugin's among them, fit with no scrollbar at all.
+ * ========================================================================== */
+
+.sidebar {
+  z-index: 10;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  background: var(--sidebar);
+  padding: 20px 10px 10px;
+}
+
+/* ---- the brand: fixed at the top ----------------------------------------------- */
+
+.brand {
+  flex: none;
+  padding: 0 10px 16px;
+}
+.brand > strong {
+  display: block;
+  font-size: 28px;
+  font-weight: 680;
+  letter-spacing: 0.13em;
+  line-height: 1;
+}
+.brand > span {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
+}
+
+/* ---- the sections: the one part that scrolls (only when it must) --------------- */
+
+.sidebar nav {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 1px;
+  /* (room for the focus ring, and for a scrollbar that only shows on a short window) */
+  margin: 0 -4px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 4px 8px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  /* (a window so short that they scroll: the last row fades into Settings, so there is plainly more) */
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+}
+.sidebar nav::-webkit-scrollbar { width: 6px; }
+.sidebar nav::-webkit-scrollbar-thumb { border-radius: 6px; background: var(--border); }
+.sidebar nav::-webkit-scrollbar-track { background: transparent; }
+
+/* A section, and Settings: one compact row each. */
+.sidebar nav button,
+.sidebar .settings {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-height: 34px;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 520;
+  text-align: left;
+  transition: background 0.12s, color 0.12s;
+}
+.sidebar nav button > svg,
+.sidebar .settings > svg {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  color: var(--faint);
+  transition: color 0.12s;
+}
+.sidebar nav button > span,
+.sidebar .settings > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sidebar nav button:hover,
+.sidebar .settings:hover { background: var(--surface-soft); color: var(--text); }
+.sidebar nav button:hover > svg,
+.sidebar .settings:hover > svg { color: var(--text); }
+.sidebar nav button:focus-visible,
+.sidebar .settings:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+
+/* The page that is open: a tinted row, its icon in the primary colour, and a short bar at its edge. */
+.sidebar nav button.active,
+.sidebar .settings.active {
+  background: var(--primary-soft);
+  color: var(--text);
+  font-weight: 620;
+}
+.sidebar nav button.active > svg,
+.sidebar .settings.active > svg { color: var(--primary); }
+.sidebar nav button.active::before,
+.sidebar .settings.active::before {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--primary);
+  content: '';
+}
+
+/* A plugin's section (its name may be long) and one with a badge keep to one line; the button's title has it whole. */
+.sidebar nav button:has(> .nav-badge) { padding-right: 8px; }
+.sidebar nav button > .nav-badge { flex: none; padding: 1px 5px; letter-spacing: 0.02em; }
+
+/* ---- the groups' labels ---------------------------------------------------------- */
+
+.sidebar nav .nav-group {
+  display: block;
+  flex: none;
+  margin: 14px 0 3px;
+  padding: 0 10px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.sidebar nav .nav-group:first-child { margin-top: 2px; }
+
+/* ---- a sub-menu (the AI Receptionist's pages) ----------------------------------------- */
+
+.sidebar nav .nav-sub { display: flex; flex: none; flex-direction: column; gap: 1px; }
+.sidebar nav .nav-sub-head { position: relative; display: flex; align-items: center; }
+.sidebar nav .nav-sub-head > .nav-parent { padding-right: 30px; }
+.sidebar nav .nav-sub-head > .nav-parent > .nav-count { margin-left: 2px; }
+.sidebar nav .nav-toggle {
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  min-height: 0;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--faint);
+  padding: 0;
+  transform: translateY(-50%);
+}
+.sidebar nav .nav-toggle > svg { width: 15px; height: 15px; transition: transform 0.16s ease; }
+.sidebar nav .nav-toggle:hover { background: var(--surface-raised); color: var(--text); }
+.sidebar nav .nav-sub:not(.is-expanded) .nav-toggle > svg { transform: rotate(-90deg); }
+/* Open, with one of its pages on: the page is marked, its entry only brightens. */
+.sidebar nav .nav-sub.is-expanded .nav-parent.active { background: transparent; color: var(--text); font-weight: 620; }
+.sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: none; }
+
+.sidebar nav .nav-children {
+  display: none;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0 0 4px 18px;
+  border-left: 1px solid var(--border);
+  padding-left: 8px;
+}
+.sidebar nav .nav-sub.is-expanded .nav-children { display: flex; }
+.sidebar nav .nav-children > .nav-child { min-height: 30px; gap: 9px; padding: 0 9px; font-size: 12.5px; }
+.sidebar nav .nav-children > .nav-child > svg { width: 15px; height: 15px; }
+/* The mark sits on the rail the pages hang from. */
+.sidebar nav .nav-children > .nav-child.active::before { top: 7px; bottom: 7px; left: -9px; border-radius: 3px; }
+
+/* A count of what waits (requests, new messages): amber, like a request. */
+.nav-count {
+  display: inline-block;
+  min-width: 18px;
+  height: 18px;
+  flex: none;
+  margin-left: auto;
+  border-radius: 999px;
+  background: var(--amber);
+  color: var(--surface-solid);
+  padding: 0 5px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+.nav-sub.is-expanded .nav-count-parent,
+.nav-sub.is-expanded .nav-badge-parent { display: none; }
+
+/* ---- Settings: fixed at the bottom ------------------------------------------------ */
+
+.sidebar .settings {
+  margin-top: 6px;
+}
+.sidebar .settings::after {
+  position: absolute;
+  top: -4px;
+  right: 6px;
+  left: 6px;
+  height: 1px;
+  background: var(--border);
+  content: '';
+}
+
+/* ---- a short window: tighter still, so the sections fit there too ------------------ */
+
+@media (max-height: 760px) and (min-width: 761px) {
+  .sidebar { padding-top: 16px; }
+  .brand { padding-bottom: 12px; }
+  .brand > strong { font-size: 24px; }
+  .brand > span { margin-top: 4px; font-size: 11px; }
+  .sidebar nav button, .sidebar .settings { min-height: 31px; }
+  .sidebar nav button.active::before, .sidebar .settings.active::before { top: 7px; bottom: 7px; }
+  .sidebar nav .nav-children > .nav-child { min-height: 28px; }
+  .sidebar nav .nav-group { margin: 10px 0 2px; }
+}
+
+/* ---- the narrow sidebar (icons only) ------------------------------------------------ */
+
+@media (max-width: 1240px) {
+  .sidebar { align-items: center; padding: 18px 8px 10px; }
+  .brand { padding: 0 0 12px; text-align: center; }
+  .brand > strong { font-size: 17px; letter-spacing: 0.06em; }
+  .brand > span,
+  .sidebar nav button > span,
+  .sidebar .settings > span { display: none; }
+  .sidebar nav { width: 54px; align-items: center; margin: 0 -6px; padding: 2px 6px 8px; }
+  .sidebar .settings { width: 42px; }
+  .sidebar nav button,
+  .sidebar .settings { width: 42px; min-height: 38px; justify-content: center; padding: 0; }
+  .sidebar nav button > svg,
+  .sidebar .settings > svg { width: 18px; height: 18px; }
+  /* (a group's label is a short line between its icons and the ones above) */
+  .sidebar nav .nav-group { width: 22px; height: 1px; margin: 8px 0 7px; overflow: hidden; background: var(--border); padding: 0; color: transparent; font-size: 0; }
+  .sidebar nav .nav-group:first-child { margin-top: 2px; }
+  .sidebar .nav-badge { display: none; }
+  /* A sub-menu's pages show, as icons under their entry, while one of them is open. No chevron. */
+  .sidebar nav .nav-toggle { display: none; }
+  .sidebar nav .nav-sub-head > .nav-parent { padding-right: 0; }
+  .sidebar nav .nav-sub { align-items: center; }
+  .sidebar nav .nav-sub.is-expanded .nav-children,
+  .sidebar nav .nav-children {
+    display: none;
+    margin: 2px 0 4px;
+    border-left: 0;
+    border-radius: 10px;
+    background: var(--surface-soft);
+    padding: 3px;
+  }
+  .sidebar nav .nav-sub.has-active .nav-children { display: flex; }
+  .sidebar nav .nav-children > .nav-child { width: 36px; min-height: 32px; justify-content: center; padding: 0; }
+  .sidebar nav .nav-children > .nav-child.active::before { left: 0; }
+  .sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: block; }
+  /* (the sidebar's: a count elsewhere, a Messages tab's, stays beside its word) */
+  .sidebar .nav-count {
+    position: absolute;
+    top: 2px;
+    right: 0;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 3px;
+    font-size: 9px;
+    line-height: 15px;
+  }
+  .nav-sub.is-expanded .nav-count-parent { display: inline-block; }
+  .nav-sub.has-active .nav-count-parent { display: none; }
+}
+
+@media (max-width: 480px) {
+  .brand > strong { font-size: 15px; letter-spacing: 0.03em; }
+  .sidebar { padding: 18px 6px 12px; }
+}

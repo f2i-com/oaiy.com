@@ -1,108 +1,13 @@
 /* ============================================================================
- * THE AI RECEPTIONIST'S PAGES — the sidebar's sub-menus, the Calendar and
- * Hours & Services. Built from the dashboard's tokens (styles.css), so they
- * follow Prism Lab and Paper Circuit like every page, and fit a 760px window.
+ * THE AI RECEPTIONIST'S PAGES — the Calendar and Hours & Services (the
+ * sidebar's sub-menu that lists them is in sidebar.css). Built from the
+ * dashboard's tokens (styles.css), so they follow Prism Lab and Paper Circuit
+ * like every page, and fit a 760px window.
  * Colours of an appointment: confirmed in the primary blue, a request in amber
  * (waiting on you), done in green, cancelled or declined in grey.
  * ========================================================================== */
 
-/* ---- the sidebar's sub-menus ---------------------------------------------------- */
-
-.sidebar nav .nav-sub { display: flex; flex-direction: column; gap: 2px; }
-.sidebar nav .nav-sub-head { position: relative; display: flex; align-items: center; }
-.sidebar nav .nav-sub-head > .nav-parent { gap: 11px; padding-right: 28px; }
-.sidebar nav .nav-sub-head > .nav-parent > .nav-count { margin-left: 2px; }
-/* One line, whatever else is in it (the name whole in its title). */
-.sidebar nav .nav-sub-head > .nav-parent > span { white-space: nowrap; }
-.sidebar nav .nav-toggle {
-  position: absolute;
-  top: 50%;
-  right: 2px;
-  display: grid;
-  width: 24px;
-  height: 26px;
-  min-height: 0;
-  place-items: center;
-  border-radius: var(--r-sm);
-  color: var(--faint);
-  padding: 0;
-  transform: translateY(-50%);
-}
-.sidebar nav .nav-toggle:hover { background: var(--surface-raised); color: var(--text); }
-.sidebar nav .nav-toggle > svg { transition: transform 0.16s ease; }
-.sidebar nav .nav-sub:not(.is-expanded) .nav-toggle > svg { transform: rotate(-90deg); }
-/* Open, with one of its pages on: the page is marked, the entry only brightens. */
-.sidebar nav .nav-sub.is-expanded .nav-parent.active { background: transparent; color: var(--text); font-weight: 600; }
-.sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: none; }
-.sidebar nav .nav-sub.is-expanded .nav-parent.active > svg { color: var(--primary); }
-
-.sidebar nav .nav-children {
-  display: none;
-  flex-direction: column;
-  gap: 1px;
-  margin: 0 0 4px 21px;
-  border-left: 1px solid var(--border);
-  padding-left: 10px;
-}
-.sidebar nav .nav-sub.is-expanded .nav-children { display: flex; }
-.sidebar nav .nav-children > .nav-child { min-height: 34px; gap: 10px; padding: 0 10px; font-size: 12.5px; }
-.sidebar nav .nav-children > .nav-child > svg { flex: none; opacity: 0.85; }
-/* The mark sits on the rail the pages hang from. */
-.sidebar nav .nav-children > .nav-child.active::before { top: 8px; bottom: 8px; left: -11px; }
-
-/* A count of what waits (requests): amber, like a request. */
-.nav-count {
-  display: inline-block;
-  min-width: 18px;
-  height: 18px;
-  flex: none;
-  margin-left: auto;
-  border-radius: 999px;
-  background: var(--amber);
-  color: var(--surface-solid);
-  padding: 0 5px;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  font-style: normal;
-  font-weight: 700;
-  line-height: 18px;
-  text-align: center;
-}
-.nav-sub.is-expanded .nav-count-parent,
-.nav-sub.is-expanded .nav-badge-parent { display: none; }
-
-/* The narrow sidebar (icons only): a sub-menu's pages show, as icons under
-   their entry, while one of them is open. The chevron is not there. */
-@media (max-width: 1240px) {
-  .sidebar nav .nav-toggle { display: none; }
-  .sidebar nav .nav-sub-head > .nav-parent { padding-right: 0; }
-  .sidebar nav .nav-sub.is-expanded .nav-children,
-  .sidebar nav .nav-children {
-    display: none;
-    margin: 2px 0 4px;
-    border-left: 0;
-    border-radius: var(--r-ctl);
-    background: var(--surface-soft);
-    padding: 3px 0;
-  }
-  .sidebar nav .nav-sub.has-active .nav-children { display: flex; }
-  .sidebar nav .nav-children > .nav-child { min-height: 36px; justify-content: center; padding: 0; }
-  .sidebar nav .nav-children > .nav-child.active::before { left: 0; }
-  .sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: block; }
-  /* (the sidebar's: a count elsewhere, a Messages tab's, stays beside its word) */
-  .sidebar .nav-count {
-    position: absolute;
-    top: 3px;
-    right: 1px;
-    min-width: 15px;
-    height: 15px;
-    padding: 0 3px;
-    font-size: 9px;
-    line-height: 15px;
-  }
-  .nav-sub.is-expanded .nav-count-parent { display: inline-block; }
-  .nav-sub.has-active .nav-count-parent { display: none; }
-}
+/* The sidebar's sub-menus and counts: sidebar.css. */
 
 /* ---- shared -------------------------------------------------------------------------- */
 

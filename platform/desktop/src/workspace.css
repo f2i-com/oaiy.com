@@ -1,23 +1,6 @@
 /* Shared desktop refinements: comfortable controls, readable status and panels
    that fit smaller windows. Theme colours remain shared with plugin screens. */
 .app-shell { height: 100dvh; }
-.sidebar { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-.sidebar nav button, .sidebar .settings { min-height: 42px; }
-/* A window under 760px tall (a pointer's, not a phone's): the sidebar tightens so all of it shows without scrolling. */
-@media (max-height: 760px) and (min-width: 761px) {
-  .sidebar { padding-top: 18px; padding-bottom: 12px; }
-  .sidebar nav { gap: 2px; margin-top: 16px; }
-  .sidebar nav button, .sidebar .settings { min-height: 36px; }
-  .sidebar nav button.active::before, .sidebar .settings.active::before { top: 8px; bottom: 8px; }
-  .sidebar nav .nav-group { margin: 10px 0 2px; }
-}
-.sidebar nav button[title*=", from the"] > span { white-space: normal; line-height: 1.3; }
-/* With a badge ("New") the label keeps to one line: the badge sits closer and
-   smaller, so "AI Receptionist" and its badge fit a 1440px window's sidebar; a
-   longer name ends in an ellipsis (its button's title has it whole). */
-.sidebar nav button:has(> .nav-badge) { gap: 10px; padding-right: 8px; }
-.sidebar nav button:has(> .nav-badge) > span { white-space: nowrap; line-height: normal; }
-.sidebar nav button > .nav-badge { flex: none; padding: 1px 5px; letter-spacing: 0.02em; }
 .content-page { overscroll-behavior: contain; scrollbar-gutter: stable; }
 .panel { width: 100%; max-width: 1160px; gap: 18px; }
 /* Five tiles a row at most, each a fifth of the row: a section with fewer keeps its tiles tile-sized (one alone is
@@ -54,7 +37,6 @@
 .content-page.page-fill:has(> .panel > .plugin-screen) > .panel > .setup-run-note { margin: var(--page-pad-t) var(--page-pad-x) 0; }
 .form-row, .form-row-pair, .service-card { min-width: 0; }
 input, select, textarea { max-width: 100%; }
-@media (max-width: 1240px) { .sidebar .nav-badge { display: none; } }
 @media (max-width: 760px) {
   .overview-tile { padding: 16px; }
   .btn, .btn-tiny, .icon-button { min-height: 44px; }
@@ -63,8 +45,6 @@ input, select, textarea { max-width: 100%; }
 }
 @media (max-width: 480px) {
   .app-shell { grid-template-columns: 58px minmax(0, 1fr); }
-  .brand > strong { font-size: 15px; letter-spacing: 0.03em; }
-  .sidebar { padding: 18px 6px 12px; }
   :root { --page-pad-t: 16px; --page-pad-x: 10px; --page-pad-b: 24px; }
   .section-tabs { padding: 0 10px 8px; }
   .seg-tabs > button > span { display: none; }
