@@ -17,11 +17,11 @@ by hand on its own, because automatic CI is paused).
 | `oaiy-server-<v>-windows-x64.zip`, `oaiy-server-<v>-linux-x86_64.tar.gz` | The headless server: the same local API with no window, for a host the CLI or a web app drives. It has no Agent or flow editor to show. |
 | `oaiy-cli-<v>.tar.gz` | The CLI alone, for a product that embeds it |
 | `oaiy-web-<v>.zip`, `oaiy-web-<v>.tar.gz` | The flow editor's site (landing page, `/app.html`, `/desktop.html`), for any static host, built for this release: its download buttons name this release's files (see [The web site](#the-web-site)) |
-| `SHA256SUMS.txt` | The checksum of every file above, `latest.json` and the `.sig` files included |
+| `SHA256SUMS.txt` | The checksum of every file above, `latest.json` and the `.sig` files included, as the release job wrote it. The Mac update makes it again with the Mac's image, packed app and its `.sig` added and `latest.json`'s new digest ([A Mac's update](#a-macs-update)). The files below that are added by hand, or that carry a `.sha256` of their own, are not in it: the eGPU plugin's zip, and the `.sha256` files themselves (each holds one of the digests above and nothing else). |
 | `release-evidence-web.json`, `-linux.json`, `-windows.json` | For each build: the revision, target, toolchain, digests, and the verification run that passed before anything was published |
 | `oaiy-desktop-<v>-macos-arm64.dmg`, and its `.sha256` | OAIY Desktop for an Apple-silicon Mac, signed with the Developer ID and notarised by Apple. Added after the release is published, by the Mac build ([A Mac's image](#a-macs-image)), with its checksum beside it; `SHA256SUMS.txt` lists it once the Mac update has run. |
-| `oaiy-desktop-<v>-macos-arm64.app.tar.gz`, its `.sig` and its `.sha256` | What an installed OAIY on a Mac updates itself from: the app out of that image, packed, and its signature made with the updater key. Added by the Mac update ([A Mac's update](#a-macs-update)), which also puts the Mac in `latest.json` and replaces `SHA256SUMS.txt` with one that lists the image and these. |
-| `oaiy-egpu-plugin-<v>-macos-arm64.zip`, and its `.sha256` | The eGPU plugin for that Mac app: an NVIDIA RTX 30, 40 or 50 card in a Thunderbolt enclosure, with its kernels compiled ahead of time for each (until 0.1.6, RTX 40 only: `-rtx40.zip`). Built on a Mac that has such a card and added by hand ([The eGPU plugin](#the-egpu-plugin)). |
+| `oaiy-desktop-<v>-macos-arm64.app.tar.gz`, its `.sig` and its `.sha256` | What an installed OAIY on a Mac updates itself from: the app out of that image, packed, and its signature made with the updater key. Added by the Mac update ([A Mac's update](#a-macs-update)), which also puts the Mac in `latest.json` and replaces `SHA256SUMS.txt` with one that lists the image, the packed app and its `.sig`. |
+| `oaiy-egpu-plugin-<v>-macos-arm64.zip`, and its `.sha256` | The eGPU plugin for that Mac app: an NVIDIA RTX 30, 40 or 50 card in a Thunderbolt enclosure, with its kernels compiled ahead of time for each (until 0.1.6, RTX 40 only: `-rtx40.zip`). Built on a Mac that has such a card and added by hand ([The eGPU plugin](#the-egpu-plugin)), with its checksum in its `.sha256` and not in `SHA256SUMS.txt`. |
 
 An OAIY Desktop installer is complete by itself for what it shows. Besides the dashboard
 it carries the CLI that runs flows (`resources/cli`), the Agent (`resources/app`, opening
@@ -344,12 +344,38 @@ after release.yml's and the Mac build's). Its jobs:
 2. `sign` (the `release` environment): that archive, held to the digest `pack` recorded, signed
    with `tauri signer sign` under the name `OAIY_<v>_aarch64.app.tar.gz` (the desktop holds a
    signature to its version by that name).
-3. `publish`: the archive, its `.sig` and its `.sha256` are added to the release (nothing
-   replaced), then `latest.json` and `SHA256SUMS.txt` are replaced:
-   `platform/scripts/add-mac-update.mjs` adds the `darwin-aarch64` entry to the published feed,
-   checked against the public key in `tauri.conf.json` and the signed name, with every other entry
-   kept exactly, and puts the feed's new checksum, the image's and the two new files' in the
-   checksums. The feed is read back from the release.
+3. `publish`: `platform/scripts/add-mac-update.mjs` adds the `darwin-aarch64` entry to the
+   published feed, checked against the public key in `tauri.conf.json` and the signed name, with
+   every other entry kept exactly, and puts the feed's new checksum, the image's and those of the
+   packed app and its `.sig` in the checksums. All of it, with the feed and checksums it replaces,
+   is kept as the run's artifact `mac-update-release` (30 days) before anything is put on the
+   release. Then the archive, its `.sig` and its `.sha256` are added (nothing replaced), and the
+   new feed and checksums go up beside the old as `latest.pending.json` and
+   `SHA256SUMS.pending.txt`; each old one is then removed and its new one renamed to its name
+   (the API's rename of an asset), so `latest.json` is missing only between those two calls, and
+   an upload that fails leaves the old feed where it was. The feed and checksums are read back
+   from the release, and must agree.
+
+What a run does is decided by the release's FEED (`add-mac-update.mjs --plan`, the first step
+of `pack`), not by which files it has:
+
+- a feed that lists the Mac already: the release has its Mac update, and is left alone (the run
+  fails before anything is made);
+- a feed without it, on a release where an earlier run uploaded the packed app (and its `.sig`)
+  and then failed: those are reused, since a file on a release is never replaced and a new pack
+  is not the same bytes. The `.sig` must verify against the key in `tauri.conf.json` and the app
+  in the archive must still be the app of the image (the same checks as a new pack), and `sign`
+  does not run, so there is nothing to approve; with the archive and no `.sig` it is signed as a
+  new one would be;
+- `latest.pending.json` or `SHA256SUMS.pending.txt` left by a run cut short in its swap: the run
+  only finishes the swap (nothing is packed or signed). If the rename itself keeps failing, the
+  run says the one command that finishes it by hand.
+
+So a run that failed is run again, the same way. A packed app that is wrong (the plan refuses a
+`.sig` or a `.sha256` with no archive beside it, and the checks refuse an archive that is not the
+image's app) is made again by deleting the three Mac files from the release first; a release whose
+feed lists the Mac already needs that feed put back without its `darwin-aarch64` entry too (the
+artifact `mac-update-release` of the run that made it has the one it replaced).
 
 If it could not be started (the Mac build's summary says so), or failed, run it by hand once
 the image is on the release:
@@ -359,9 +385,7 @@ gh workflow run mac-update.yml --ref v0.1.9 -f release=v0.1.9
 ```
 
 It must run on the tag (the environment `release` gives the key to tags alone), so it can be run
-only for a release tagged after the workflow was added: 0.1.8 and earlier have no Mac update. A
-release that has its Mac update already is left alone: the run fails before anything is made.
-To make it again, delete the release's `.app.tar.gz`, `.sig` and `.sha256` first.
+only for a release tagged after the workflow was added: 0.1.8 and earlier have no Mac update.
 
 ### The eGPU plugin
 
@@ -495,8 +519,10 @@ a release matter here:
 
 A release is `N.N.N` (a tag of `N.N.N` or `vN.N.N`, no suffix such as `-beta`, and no
 leading zero in a number: Cargo refuses `0.09.0`, so `meta` does too), and not
-below `0.1.0`. The desktop's version is the one stamped from the tag, and it refuses a
-plugin whose manifest asks for a newer desktop. Aokie's manifest asks for 0.1.0, so an
+below `0.1.0`. A version with a suffix is never a release, and the desktop takes one it runs as a
+build made on top of the release it names (`0.1.9-mac.3`, a Mac built by hand after 0.1.9): it
+offers it only a release newer than 0.1.9 (UPDATES.md). The desktop's version is the one
+stamped from the tag, and it refuses a plugin whose manifest asks for a newer desktop. Aokie's manifest asks for 0.1.0, so an
 installer stamped `0.0.x` could not run Aokie; the `meta` job stops a tag below 0.1.0, and
 a manual run of a lower version, with that reason. `0.0.1` to `0.0.6` were the releases of
 the previous OAIY, before the merge.

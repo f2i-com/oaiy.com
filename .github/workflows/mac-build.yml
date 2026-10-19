@@ -28,9 +28,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to stamp, above the last release (0.1.2 is out: 0.1.3-mac.1)'
+        description: "Version to stamp: a release's own (0.1.9, with release below), or a test build named after the last release (0.1.8 is out: 0.1.8-mac.1), which updates itself only to a release after 0.1.8"
         required: true
-        default: '0.1.3-mac.1'
+        default: '0.1.8-mac.1'
       what:
         description: 'all: the image (and its signing) and the engine asked one question on the GPU. engine: no image, and a long prompt to the engine too (an hour). webkit: only what WebKit isolates a page for.'
         type: choice
@@ -557,4 +557,6 @@ jobs:
             echo "The Mac update for $RELEASE is started: approve its signing (the release environment) on its run's page." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning::the Mac update could not be started: run it by hand (Actions, Mac update, Use workflow from: Tags, $RELEASE)"
+            # (the summary too, where the run's outcome is read: a warning alone is easy to miss on a green run)
+            echo "**The Mac update for $RELEASE could not be started.** Run it by hand: Actions, Mac update, Use workflow from: Tags, $RELEASE (or \`gh workflow run mac-update.yml --ref $RELEASE -f release=$RELEASE\`)." >> "$GITHUB_STEP_SUMMARY"
           fi

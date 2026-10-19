@@ -15,7 +15,19 @@
 //! - a Mac app still in its disk image, on another disk, or in the copy macOS opens an app from when it
 //!   was opened where it was downloaded (App Translocation): the updater moves the app through the
 //!   Mac's temporary folder, which only works on the disk that folder is on, and the other two are
-//!   read-only. It would fail half way through, so it is not offered.
+//!   read-only. It would fail half way through, so it is not offered;
+//! - a Mac app at a path with a quote, a backslash or a control character in it: where the updater cannot move the app
+//!   itself, it asks macOS for an administrator's password by an AppleScript it writes the path into unescaped, which such a
+//!   character breaks (a `"` or a `\` stops the script from compiling, and the plugin then panics; a `'` changes the shell
+//!   command inside it, which removes the app as root).
+//!
+//! On a Mac two more are looked at on disk, as the status is read and so before anything is stopped
+//! ([`mac_install_problem`]): the app must still be where it was opened (tauri keeps the path the program started from,
+//! which the updater replaces), and this Mac user must be able to move it (it and the folder it is in). The updater can
+//! replace an app the user cannot move only by that AppleScript: a password dialog that waits for as long as nobody answers,
+//! with OAIY stopped and its calls down meanwhile, and then `rm -rf` of the old app before the new one is moved in, as root,
+//! so a move that fails leaves no app at all. OAIY does not go that way: it says so up front and points to the disk image,
+//! where Finder asks for the password itself while OAIY keeps running.
 //!
 //! The kind of install is the bundle type the bundler stamps into the program (`tauri::utils::platform::bundle_type`);
 //! it is read in `update::gui` and given here by name. On a Mac the bundler stamps nothing and tauri says `app` for every
@@ -85,6 +97,9 @@ pub fn app_bundle_of(exe: &Path) -> Option<&Path> {
 /// under `/Volumes` is a disk image or another disk; one with an `AppTranslocation` folder is the read-only copy macOS
 /// opens an app from when it was opened where it was downloaded.
 pub fn mac_app_problem(app: &Path) -> Option<String> {
+    if !path_fits_the_updaters_script(app) {
+        return Some(PATH_WITH_QUOTES.to_string());
+    }
     let parts: Vec<_> = app.components().collect();
     if parts.iter().any(|c| matches!(c, Component::Normal(n) if *n == "AppTranslocation")) {
         return Some("This copy of OAIY was opened where it was downloaded, which macOS does from a read-only copy, so it cannot update itself. Drag OAIY to Applications, open it from there, and check again.".to_string());
@@ -93,6 +108,66 @@ pub fn mac_app_problem(app: &Path) -> Option<String> {
         return Some("This copy of OAIY is on a disk image or another disk, so it cannot update itself (an update is put in place through the Mac's own disk). Drag OAIY to Applications, open it from there, and check again.".to_string());
     }
     None
+}
+
+/// Why an app at a path with a quote, a backslash or a control character in it is not updated (see the module's docs).
+const PATH_WITH_QUOTES: &str = "This copy of OAIY is at a path with a quote, a backslash or a control character in it, which the updater cannot take, so it cannot update itself. Drag OAIY to Applications, open it from there, and check again.";
+
+/// Whether the updater plugin's AppleScript can take `path` as it writes it (between `'` inside a `"` string, unescaped):
+/// text with no `'`, `"`, `\` or control character. A path that is not text is refused too (the plugin would write
+/// another one in its place).
+pub fn path_fits_the_updaters_script(path: &Path) -> bool {
+    path.to_str().is_some_and(|text| !text.chars().any(|c| matches!(c, '\'' | '"' | '\\') || c.is_control()))
+}
+
+/// Why the Mac app at `app` (whose program is `exe`) cannot be replaced as the disk has it now, or None when it can: it must
+/// still be where it was opened, and this user must be able to move it and to write in the folder it is in, which is what
+/// the updater does with it (it moves it aside to `temp`, the Mac's temporary folder, whose path is held to the same rule
+/// as the app's). Asked as the status is read, so before anything is stopped (see the module's docs for why a folder this
+/// user cannot change is refused rather than left to macOS's password dialog).
+#[cfg(unix)]
+pub fn mac_install_problem(exe: &Path, app: &Path, temp: &Path) -> Option<String> {
+    if !exe.is_file() || !app.join("Contents").join("Info.plist").is_file() {
+        return Some("OAIY was moved since it was opened: quit it and open it again.".to_string());
+    }
+    if !path_fits_the_updaters_script(temp) {
+        return Some("The Mac's temporary folder has a quote, a backslash or a control character in its path, which the updater cannot take, so OAIY cannot update itself. Install the newer version from the disk image on the releases page.".to_string());
+    }
+    let folder = app.parent().unwrap_or(Path::new("/"));
+    let refuse = |what: String| Some(format!("This Mac user cannot change {what}, so OAIY cannot update itself there: macOS would have to ask for an administrator's password while OAIY is stopped. Install the newer version from the disk image on the releases page, or move OAIY to a folder of your own, open it from there, and check again."));
+    if !may_write(folder) {
+        return refuse(format!("the folder OAIY is in ({})", folder.display()));
+    }
+    // Moving a folder to another one rewrites its `..`, so the app itself must be this user's to write as well; and in a
+    // folder with the sticky bit (as /tmp has) only the owner of the app or of the folder may move it.
+    let own = owned_by_this_user(app);
+    if !may_write(app) || (is_sticky(folder) && !own && !owned_by_this_user(folder)) {
+        let whose = if own { "" } else { " (it belongs to another user)" };
+        return refuse(format!("{} in {}{whose}", app.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(), folder.display()));
+    }
+    None
+}
+
+/// Whether this process may write in `dir` and look into it (access(2): its owner, its group, its access list).
+#[cfg(unix)]
+fn may_write(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return false };
+    // SAFETY: a valid C string, read by access(2) and not kept.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+#[cfg(unix)]
+fn is_sticky(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o1000 != 0)
+}
+
+#[cfg(unix)]
+fn owned_by_this_user(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid(2) cannot fail and touches nothing.
+    std::fs::metadata(path).is_ok_and(|m| m.uid() == unsafe { libc::getuid() })
 }
 
 #[cfg(test)]
@@ -180,6 +255,101 @@ mod tests {
     }
 
     #[test]
+    fn a_mac_app_at_a_path_the_updaters_script_cannot_take_cannot_update_itself() {
+        for exe in [
+            "/Users/sam/Sam's Apps/OAIY.app/Contents/MacOS/oaiy-desktop",
+            "/Users/sam/\"Apps\"/OAIY.app/Contents/MacOS/oaiy-desktop",
+            "/Users/sam/Apps\\Old/OAIY.app/Contents/MacOS/oaiy-desktop",
+            "/Users/sam/Apps\nOld/OAIY.app/Contents/MacOS/oaiy-desktop",
+            "/Applications/OAIY's.app/Contents/MacOS/oaiy-desktop",
+        ] {
+            let why = manual_at("macos", "aarch64", Some("app"), Some(exe));
+            assert!(why.contains("a quote, a backslash or a control character") && why.contains("Applications"), "{exe:?}: {why}");
+        }
+        // Spaces, letters of other languages and the shell's other signs are written between the quotes as they are.
+        for exe in ["/Users/sam/My Apps (2)/OAIY.app/Contents/MacOS/oaiy-desktop", "/Users/zoë/Programme/OAIY.app/Contents/MacOS/oaiy-desktop", "/Users/sam/$HOME & `x`/OAIY.app/Contents/MacOS/oaiy-desktop"] {
+            assert_eq!(auto_update_for("macos", "aarch64", Some("app"), Some(Path::new(exe))), AutoUpdate::Yes, "{exe}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!path_fits_the_updaters_script(Path::new(std::ffi::OsStr::from_bytes(b"/Users/sam/\xff/OAIY.app"))), "a path that is not text");
+        }
+    }
+
+    /// An app bundle as an install leaves it, in a folder of its own under the temporary folder: (that folder, the app, its program).
+    #[cfg(unix)]
+    fn installed_app(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let folder = std::env::temp_dir().join(format!("oaiy-kind-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let app = folder.join("OAIY.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), "<plist/>").unwrap();
+        std::fs::write(app.join("Contents/MacOS/oaiy-desktop"), "program").unwrap();
+        let exe = app.join("Contents/MacOS/oaiy-desktop");
+        (folder, app, exe)
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_app_this_user_can_move_from_where_it_was_opened_can_be_replaced() {
+        let (folder, app, exe) = installed_app("fine");
+        assert_eq!(mac_install_problem(&exe, &app, &std::env::temp_dir()), None);
+        // A folder with the sticky bit is fine when the app is this user's.
+        set_mode(&folder, 0o1777);
+        assert_eq!(mac_install_problem(&exe, &app, &std::env::temp_dir()), None);
+        set_mode(&folder, 0o755);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_app_moved_since_it_was_opened_is_said_to_be_before_anything_is_stopped() {
+        let (folder, app, exe) = installed_app("moved");
+        std::fs::rename(&app, folder.join("Elsewhere.app")).unwrap();
+        assert_eq!(mac_install_problem(&exe, &app, &std::env::temp_dir()).as_deref(), Some("OAIY was moved since it was opened: quit it and open it again."));
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_app_this_user_cannot_move_is_not_updated_and_the_disk_image_is_named_instead() {
+        // (root may write anywhere: access(2) says yes to it whatever the modes)
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+        let (folder, app, exe) = installed_app("locked");
+        // The folder it is in (/Applications for a user who is not an administrator).
+        set_mode(&folder, 0o555);
+        let why = mac_install_problem(&exe, &app, &std::env::temp_dir()).expect("a folder this user cannot write in");
+        set_mode(&folder, 0o755);
+        assert!(why.starts_with(&format!("This Mac user cannot change the folder OAIY is in ({})", folder.display())), "{why}");
+        assert!(why.contains("administrator's password") && why.contains("disk image on the releases page"), "{why}");
+        // The app itself (moving it to another folder rewrites its `..`).
+        set_mode(&app, 0o555);
+        let why = mac_install_problem(&exe, &app, &std::env::temp_dir()).expect("an app this user cannot write in");
+        set_mode(&app, 0o755);
+        assert!(why.starts_with(&format!("This Mac user cannot change OAIY.app in {}, so", folder.display())), "{why}");
+        assert!(why.ends_with('.'));
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_folder_the_updaters_script_cannot_take_is_refused_too() {
+        let (folder, app, exe) = installed_app("temp");
+        let why = mac_install_problem(&exe, &app, Path::new("/private/var/folders/x1/Sam's/T/")).expect("a quote in the temporary folder");
+        assert!(why.contains("temporary folder") && why.contains("disk image"), "{why}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
     fn a_platform_with_no_release_is_manual_whatever_the_install() {
         for (os, arch, bundle) in [("macos", "x86_64", Some("app")), ("windows", "aarch64", Some("nsis")), ("linux", "aarch64", Some("appimage")), ("freebsd", "x86_64", None)] {
             let why = manual_at(os, arch, bundle, Some("/Applications/OAIY.app/Contents/MacOS/oaiy-desktop"));
@@ -211,6 +381,7 @@ mod tests {
             ("macos", "aarch64", Some("app"), None),
             ("macos", "aarch64", Some("app"), Some("/Volumes/OAIY/OAIY.app/Contents/MacOS/oaiy-desktop")),
             ("macos", "aarch64", Some("app"), Some("/private/var/folders/x/T/AppTranslocation/1/d/OAIY.app/Contents/MacOS/oaiy-desktop")),
+            ("macos", "aarch64", Some("app"), Some("/Users/sam/Sam's Apps/OAIY.app/Contents/MacOS/oaiy-desktop")),
             ("windows", "x86_64", Some("other"), None),
         ] {
             let why = manual_at(os, arch, bundle, exe);

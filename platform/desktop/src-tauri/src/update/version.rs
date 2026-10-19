@@ -6,11 +6,19 @@
 //! A lower or equal version is never one, so a feed that names an older release (or the same
 //! one) offers nothing, and a garbage version offers nothing either.
 //!
-//! Versions are semver: `0.10.0` is above `0.9.0` (numbers, not text), and a pre-release is
-//! below its release (`0.1.0-beta.1` is below `0.1.0`) and ordered as semver orders them
-//! (`alpha` < `alpha.1` < `beta` < `beta.2` < `beta.11` < `rc.1` < the release). Build metadata
-//! (`+abc`) does not count: `0.1.0+7` is the same version as `0.1.0`. A leading `v` is
+//! Versions are semver: `0.10.0` is above `0.9.0` (numbers, not text), and a release a feed names
+//! that is a pre-release is below its release (`0.1.0-beta.1` is below `0.1.0`) and ordered as semver
+//! orders them (`alpha` < `alpha.1` < `beta` < `beta.2` < `beta.11` < `rc.1` < the release). Build
+//! metadata (`+abc`) does not count: `0.1.0+7` is the same version as `0.1.0`. A leading `v` is
 //! accepted, because tags carry one.
+//!
+//! The RUNNING version is the one exception to semver. A release is always `N.N.N` (the release
+//! workflow refuses a tag with a suffix), so a running version with a pre-release part is never a
+//! release: it is a build of one's own, made on top of the release it names (a Mac built here is
+//! `0.1.9-mac.3`, from the code after 0.1.9). Semver puts `0.1.9-mac.3` below `0.1.9`, which would
+//! offer it 0.1.9 and put the older code in place of the newer. So such a build is offered only a
+//! release newer than its base ([`base_of_build`]): `0.1.10`, and not `0.1.9`. The rule is the same
+//! on every platform, because it is about the version and not the install.
 
 use semver::Version;
 
@@ -34,9 +42,17 @@ pub fn is_newer(current: &str, candidate: &str) -> bool {
     }
 }
 
-/// [`is_newer`] for versions already read (the updater plugin's comparator).
+/// The release a running build with a pre-release part was made on top of: `0.1.9` for `0.1.9-mac.3`. None for a
+/// release (`0.1.9`), which is its own base.
+pub fn base_of_build(running: &Version) -> Option<Version> {
+    (!running.pre.is_empty()).then(|| Version::new(running.major, running.minor, running.patch))
+}
+
+/// [`is_newer`] for versions already read (the updater plugin's comparator). A running build of one's own is held to its
+/// base, so that the release it was made on top of is not newer than it (see the module's docs).
 pub fn is_newer_version(current: &Version, candidate: &Version) -> bool {
-    precedence(candidate) > precedence(current)
+    let floor = base_of_build(current).unwrap_or_else(|| precedence(current));
+    precedence(candidate) > floor
 }
 
 #[cfg(test)]
@@ -79,25 +95,43 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_release_is_below_its_release() {
+    fn a_pre_release_in_the_feed_is_below_its_release() {
         // The running build is the release: the beta of it is older, not an update.
         assert!(!is_newer("0.1.0", "0.1.0-beta.1"));
         assert!(!is_newer("0.1.0", "0.1.0-rc.1"));
-        // A running beta is updated to its release.
-        assert!(is_newer("0.1.0-beta.1", "0.1.0"));
         // ...and a pre-release of a HIGHER version is above the lower release.
         assert!(is_newer("0.1.0", "0.2.0-beta.1"));
         assert!(!is_newer("0.2.0", "0.2.0-beta.1"));
     }
 
     #[test]
-    fn pre_releases_are_ordered_as_semver_orders_them() {
-        let chain = ["0.1.0-alpha", "0.1.0-alpha.1", "0.1.0-alpha.beta", "0.1.0-beta", "0.1.0-beta.2", "0.1.0-beta.11", "0.1.0-rc.1", "0.1.0"];
-        for (i, lower) in chain.iter().enumerate() {
-            for (j, higher) in chain.iter().enumerate() {
-                assert_eq!(is_newer(lower, higher), j > i, "{lower} -> {higher}");
+    fn pre_releases_in_the_feed_are_ordered_as_semver_orders_them() {
+        // Against a running release, a candidate is newer exactly when semver puts it above.
+        let chain = ["0.0.9", "0.1.0-alpha", "0.1.0-alpha.1", "0.1.0-alpha.beta", "0.1.0-beta", "0.1.0-beta.2", "0.1.0-beta.11", "0.1.0-rc.1", "0.1.0", "0.1.1-rc.1", "0.1.1"];
+        for (i, running) in chain.iter().enumerate().filter(|(_, v)| !v.contains('-')) {
+            for (j, candidate) in chain.iter().enumerate() {
+                assert_eq!(is_newer(running, candidate), j > i, "{running} -> {candidate}");
             }
         }
+    }
+
+    #[test]
+    fn a_running_build_of_ones_own_is_offered_only_a_release_newer_than_the_one_it_was_built_on() {
+        // A Mac built here after 0.1.9 is 0.1.9-mac.3: 0.1.9 is older code than it, not an update, on any platform.
+        for running in ["0.1.9-mac.3", "0.1.9-mac.1", "v0.1.9-mac.44", "0.1.9-beta.1", "0.1.9-mac.3+abc"] {
+            assert!(!is_newer(running, "0.1.9"), "{running}");
+            assert!(!is_newer(running, "0.1.8"), "{running}");
+            assert!(!is_newer(running, "0.1.9-rc.1"), "{running}");
+            assert!(!is_newer(running, "0.1.9-mac.9"), "{running}: another build of the same base is not a release either");
+            assert!(is_newer(running, "0.1.10"), "{running}");
+            assert!(is_newer(running, "0.2.0"), "{running}");
+            assert!(is_newer(running, "0.1.10-rc.1"), "{running}: above the base, so above the build");
+        }
+        assert_eq!(base_of_build(&parse("0.1.9-mac.3").unwrap()), Some(Version::new(0, 1, 9)));
+        assert_eq!(base_of_build(&parse("0.1.9+7").unwrap()), None, "build metadata is not a pre-release part");
+        assert_eq!(base_of_build(&parse("0.1.9").unwrap()), None);
+        // A release is held to semver exactly as before.
+        assert!(is_newer("0.1.9", "0.1.10") && !is_newer("0.1.9", "0.1.9") && !is_newer("0.1.10", "0.1.9"));
     }
 
     #[test]

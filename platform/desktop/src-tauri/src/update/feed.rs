@@ -386,6 +386,21 @@ mod tests {
     }
 
     #[test]
+    fn a_local_build_is_not_offered_the_release_it_was_made_on_on_any_platform() {
+        // 0.2.0-mac.3 (or any build of one's own named after 0.2.0) holds newer code than 0.2.0: the feed offers it nothing.
+        let mut value = feed_json();
+        value["platforms"]["darwin-aarch64"] = json!({ "signature": SIG, "url": "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/oaiy-desktop-0.2.0-macos-arm64.app.tar.gz" });
+        let feed = parse_json(&value).unwrap();
+        for platform in [Some("windows-x86_64"), Some("linux-x86_64"), Some("darwin-aarch64")] {
+            for running in ["0.2.0-mac.3", "0.2.0-mac.1", "0.2.0-beta.1"] {
+                assert_eq!(evaluate(&feed, running, platform), Verdict::UpToDate { latest: "0.2.0".into() }, "{running} on {platform:?}");
+            }
+            // ...and one made on an older release is offered it, as a release would be.
+            assert!(matches!(evaluate(&feed, "0.1.9-mac.3", platform), Verdict::Available(_)), "{platform:?}");
+        }
+    }
+
+    #[test]
     fn a_higher_version_with_no_installer_for_an_unknown_platform_is_no_update_for_it() {
         let feed = parse_json(&feed_json()).unwrap();
         assert_eq!(evaluate(&feed, "0.1.0", None), Verdict::NoUpdateForPlatform { latest: "0.2.0".into() });

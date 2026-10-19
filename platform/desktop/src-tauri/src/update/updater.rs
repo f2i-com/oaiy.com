@@ -7,8 +7,13 @@
 //! ```text
 //!  idle / upToDate / failed ──check──▶ checking ──▶ upToDate | available | idle (no build for this platform) | failed
 //!  available ──download──▶ downloading ──▶ ready | failed
-//!  ready ──install (no blockers)──▶ installing ──▶ (the app exits, or) failed
+//!  ready ──install (no blockers)──▶ installing ──▶ (the app exits, or) failed | ready (nothing on disk was changed)
+//!  ready ──check──▶ checking ──▶ ready (the same version, or a newer one with no build for this platform yet) | the above
 //! ```
+//!
+//! A download is kept whenever it can still be installed: a check that finds a newer release with no entry for this platform
+//! yet (a Mac's comes a little after the release) leaves it ready, and so does an install whose hand-off failed before it
+//! changed anything on disk (it is `ready` again, with the reason as its error).
 //!
 //! Nothing here touches the network or the disk beyond the feed read in [`super::check`]; the GUI
 //! build adds the download and the hand-off to the installer around it (`update::gui`).
@@ -19,6 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use semver::Version;
 use serde::Serialize;
 
 use super::blockers::{self, Activity, Blocker};
@@ -108,8 +114,13 @@ pub struct Status {
     pub error: Option<String>,
     pub failed_during: Option<Stage>,
     pub progress: Option<Progress>,
-    /// Something to say beside the state (no release for this platform, say).
+    /// Something to say beside the state: no release for this platform, a Mac's update that is not out yet, a newer
+    /// release whose Mac update is not out while the one downloaded can be installed, or a build of one's own that is
+    /// not offered the release it was made on.
     pub note: Option<String>,
+    /// The page the note sends a person to (the releases page, where the disk image is), for a link beside it. None: the
+    /// note asks nothing to be done there (or there is no note).
+    pub note_link: Option<&'static str>,
     /// This build can download and install an update itself.
     pub can_auto_update: bool,
     /// When it cannot, why: the window shows it beside the link to the releases page.
@@ -190,6 +201,7 @@ struct Inner {
     stage: Option<Stage>,
     progress: Option<Progress>,
     note: Option<String>,
+    note_link: Option<&'static str>,
     last_check_started: Option<Instant>,
     /// The release a download would fetch.
     release: Option<Release>,
@@ -199,7 +211,7 @@ struct Inner {
 
 impl Inner {
     fn new() -> Inner {
-        Inner { state: State::Idle, latest: None, notes: None, published_at: None, last_checked_at: None, error: None, stage: None, progress: None, note: None, last_check_started: None, release: None, package: None }
+        Inner { state: State::Idle, latest: None, notes: None, published_at: None, last_checked_at: None, error: None, stage: None, progress: None, note: None, note_link: None, last_check_started: None, release: None, package: None }
     }
 }
 
@@ -342,6 +354,7 @@ impl Updater {
             failed_during: if inner.error.is_some() { inner.stage } else { None },
             progress: inner.progress,
             note: inner.note.clone(),
+            note_link: inner.note.as_ref().and(inner.note_link),
             can_auto_update,
             manual_reason: match auto {
                 AutoUpdate::Yes => None,
@@ -384,19 +397,33 @@ impl Updater {
             Ok(Verdict::UpToDate { latest }) => {
                 inner.package = None;
                 inner.release = None;
+                inner.note = local_build_note(&self.current, &latest);
+                inner.note_link = None;
                 inner.latest = Some(latest);
                 inner.notes = None;
                 inner.published_at = None;
-                inner.note = None;
                 inner.error = None;
                 inner.stage = None;
                 inner.progress = None;
                 inner.state = State::UpToDate;
             }
+            // A download that is ready stays while it is still newer than this version: on a Mac a newer release is in the
+            // feed a little before its Mac entry is, which is no reason to throw away (and fetch again) the one that is ready.
+            // Its version, notes and date stay what the status shows, since they are what "Restart to update" installs.
+            Ok(Verdict::NoUpdateForPlatform { latest }) if inner.package.as_ref().is_some_and(|p| super::version::is_newer(&self.current, p.version())) => {
+                let ready = inner.package.as_ref().map(|p| p.version().to_string()).unwrap_or_default();
+                inner.note = Some(newer_not_out_note(&latest, &ready, platform));
+                inner.note_link = Some(RELEASES_URL);
+                inner.error = None;
+                inner.stage = None;
+                inner.progress = None;
+                inner.state = State::Ready;
+            }
             Ok(Verdict::NoUpdateForPlatform { latest }) => {
                 inner.package = None;
                 inner.release = None;
                 inner.note = Some(no_update_note(&latest, platform));
+                inner.note_link = Some(RELEASES_URL);
                 inner.latest = Some(latest);
                 inner.notes = None;
                 inner.published_at = None;
@@ -417,6 +444,7 @@ impl Updater {
                 inner.published_at = release.published_at.clone();
                 inner.release = Some(release);
                 inner.note = None;
+                inner.note_link = None;
                 inner.error = None;
                 inner.stage = None;
                 inner.state = if same { State::Ready } else { State::Available };
@@ -539,6 +567,17 @@ impl Updater {
         inner.state = State::Failed;
     }
 
+    /// The install did not happen, and nothing on disk was changed (what was stopped has been started again): back to `ready`
+    /// with the download, and the reason shown beside it, so that pressing "Restart to update" again tries again without
+    /// fetching about a hundred megabytes once more.
+    pub fn fail_install_keeping(&self, message: String, package: VerifiedPackage) {
+        let mut inner = self.lock();
+        inner.package = Some(package);
+        inner.error = Some(message);
+        inner.stage = Some(Stage::Install);
+        inner.state = State::Ready;
+    }
+
     /// `fail_install`, but only when the update is still `installing` (whatever ended the install by itself has already said how).
     pub fn fail_install_if_installing(&self, message: String) {
         let installing = self.lock().state == State::Installing;
@@ -587,13 +626,32 @@ impl Updater {
 
 /// What a feed with a newer version and no entry for this platform means, in words. On a Mac the entry is added a little
 /// after the release (the Mac update workflow packs the app out of the notarised image, which is made after the release),
-/// so it is a matter of time there; elsewhere the release job writes every platform's entry or none.
+/// so it is a matter of time there; elsewhere the release job writes every platform's entry or none. Both send a person to
+/// the releases page, which the status names beside the note (`note_link`).
 fn no_update_note(latest: &str, platform: Option<&str>) -> String {
     if platform == Some("darwin-aarch64") {
         format!("A newer version ({latest}) exists, and its update for a Mac is not out yet (it comes a little after the release). Check again later, or install it from the disk image on the releases page.")
     } else {
         format!("A newer version ({latest}) exists, but there is no release of it for this platform. Look on the releases page.")
     }
+}
+
+/// The same, said while a download of an older (but still newer than this) version is ready: that one can be installed now.
+fn newer_not_out_note(latest: &str, ready: &str, platform: Option<&str>) -> String {
+    if platform == Some("darwin-aarch64") {
+        format!("Version {latest} is out too, and its update for a Mac is not out yet: {ready}, which is downloaded, can be installed now, or check again later for {latest} (it is also on the releases page as a disk image).")
+    } else {
+        format!("Version {latest} is out too, but there is no release of it for this platform: {ready}, which is downloaded, can be installed now.")
+    }
+}
+
+/// Why a build of one's own is not offered the release the feed names, when that release is the one it was made on: it is
+/// older code than the build (see `super::version`). None for a release, and for a feed that names another version.
+fn local_build_note(current: &str, latest: &str) -> Option<String> {
+    let base = super::version::base_of_build(&super::version::parse(current).ok()?)?;
+    let latest = super::version::parse(latest).ok()?;
+    (Version::new(latest.major, latest.minor, latest.patch) == base && latest.pre.is_empty())
+        .then(|| format!("This is a local build of {base} ({current}), so {base} itself is not offered as an update: only a release newer than {base} is."))
 }
 #[cfg(test)]
 pub(crate) mod tests {
@@ -691,14 +749,85 @@ pub(crate) mod tests {
         assert_eq!(s.state, State::Idle);
         assert!(s.error.is_none());
         assert!(s.note.unwrap().contains("no release of it for this platform"));
+        assert_eq!(s.note_link, Some(RELEASES_URL), "the note sends a person to the releases page, and the window links it");
         assert_eq!(s.latest_version.as_deref(), Some("0.2.0"));
         // A Mac's entry comes a little after the release: that is said, not that there is no release for it.
         u.set_platform_key(Some("darwin-aarch64"));
         let later = now + MIN_CHECK_INTERVAL;
         u.begin_check(later).unwrap();
         u.finish_check(Ok(Verdict::NoUpdateForPlatform { latest: "0.2.0".into() }));
-        let note = u.status_at(later).note.unwrap();
+        let s = u.status_at(later);
+        let note = s.note.unwrap();
         assert!(note.contains("for a Mac is not out yet") && note.contains("disk image"), "{note}");
+        assert_eq!(s.note_link, Some(RELEASES_URL));
+    }
+
+    #[test]
+    fn a_ready_download_stays_when_a_newer_release_comes_before_its_mac_entry() {
+        let (u, _, now) = ready();
+        u.set_platform_key(Some("darwin-aarch64"));
+        // 0.3.0 is in the feed, its Mac entry not yet: 0.2.0, downloaded, is still newer than this 0.1.0.
+        u.begin_check(now + MIN_CHECK_INTERVAL).unwrap();
+        u.finish_check(Ok(Verdict::NoUpdateForPlatform { latest: "0.3.0".into() }));
+        let s = u.status_at(now);
+        assert_eq!(s.state, State::Ready);
+        // What the status shows is what "Restart to update" installs.
+        assert_eq!((s.latest_version.as_deref(), s.notes.as_deref()), (Some("0.2.0"), Some("Notes for 0.2.0.")));
+        let note = s.note.unwrap();
+        assert!(note.contains("0.3.0") && note.contains("for a Mac is not out yet") && note.contains("0.2.0, which is downloaded, can be installed now"), "{note}");
+        assert_eq!(s.note_link, Some(RELEASES_URL));
+        assert_eq!(u.begin_install(now).unwrap().version(), "0.2.0");
+        // Once the Mac's entry for 0.3.0 is in, that is the update, and the older download goes.
+        let (u, _, now) = ready();
+        u.set_platform_key(Some("darwin-aarch64"));
+        u.begin_check(now + MIN_CHECK_INTERVAL).unwrap();
+        u.finish_check(Ok(Verdict::NoUpdateForPlatform { latest: "0.3.0".into() }));
+        u.begin_check(now + MIN_CHECK_INTERVAL * 2).unwrap();
+        u.finish_check(Ok(Verdict::Available(release("0.3.0"))));
+        let s = u.status_at(now);
+        assert_eq!((s.state, s.latest_version.as_deref(), s.note, s.note_link), (State::Available, Some("0.3.0"), None, None));
+        // Elsewhere it is the same rule, in that platform's words.
+        let (u, _, now) = ready();
+        u.set_platform_key(Some("linux-x86_64"));
+        u.begin_check(now + MIN_CHECK_INTERVAL).unwrap();
+        u.finish_check(Ok(Verdict::NoUpdateForPlatform { latest: "0.3.0".into() }));
+        let s = u.status_at(now);
+        assert_eq!(s.state, State::Ready);
+        assert!(s.note.unwrap().contains("no release of it for this platform"));
+    }
+
+    #[test]
+    fn a_local_build_is_told_why_the_release_it_was_made_on_is_not_offered() {
+        let now = Instant::now();
+        let u = Updater::new("0.1.9-mac.3", FeedSource::production(), now);
+        u.set_platform(Arc::new(Auto));
+        u.begin_check(now).unwrap();
+        u.finish_check(Ok(feed::evaluate(&feed_for("0.1.9"), "0.1.9-mac.3", Some("darwin-aarch64"))));
+        let s = u.status_at(now);
+        assert_eq!((s.state, s.latest_version.as_deref(), s.note_link), (State::UpToDate, Some("0.1.9"), None));
+        assert_eq!(s.note.as_deref(), Some("This is a local build of 0.1.9 (0.1.9-mac.3), so 0.1.9 itself is not offered as an update: only a release newer than 0.1.9 is."));
+        // An older feed is simply up to date, and a newer release is offered as to any other copy.
+        u.begin_check(now + MIN_CHECK_INTERVAL).unwrap();
+        u.finish_check(Ok(feed::evaluate(&feed_for("0.1.8"), "0.1.9-mac.3", Some("darwin-aarch64"))));
+        assert_eq!((u.status_at(now).state, u.status_at(now).note), (State::UpToDate, None));
+        u.begin_check(now + MIN_CHECK_INTERVAL * 2).unwrap();
+        u.finish_check(Ok(feed::evaluate(&feed_for("0.1.10"), "0.1.9-mac.3", Some("darwin-aarch64"))));
+        assert_eq!(u.status_at(now).state, State::Available);
+        // A release says nothing of the kind.
+        assert_eq!(local_build_note("0.1.9", "0.1.9"), None);
+        assert_eq!(local_build_note("0.1.9-mac.3", "0.1.9+7").as_deref().map(|n| n.starts_with("This is a local build of 0.1.9")), Some(true));
+    }
+
+    /// A feed for `version` with an entry for every platform (the Mac's included).
+    fn feed_for(version: &str) -> feed::Feed {
+        let entry = |name: &str| format!(r#"{{"signature": "c2ln", "url": "https://github.com/f2i-com/oaiy.com/releases/download/v{version}/{name}"}}"#);
+        let text = format!(
+            r#"{{"version": "{version}", "platforms": {{"windows-x86_64": {}, "linux-x86_64": {}, "darwin-aarch64": {}}}}}"#,
+            entry(&format!("oaiy-desktop-{version}-windows-x64-setup.exe")),
+            entry(&format!("oaiy-desktop-{version}-linux-x86_64.AppImage")),
+            entry(&format!("oaiy-desktop-{version}-macos-arm64.app.tar.gz"))
+        );
+        feed::parse(text.as_bytes()).unwrap()
     }
 
     #[test]
@@ -973,7 +1102,7 @@ pub(crate) mod tests {
     fn the_status_serialises_as_camel_case_names_the_window_reads() {
         let (u, _, now) = available();
         let json = serde_json::to_value(u.status_at(now)).unwrap();
-        for key in ["state", "currentVersion", "channel", "latestVersion", "notes", "publishedAt", "lastCheckedAt", "canAutoUpdate", "blockers", "manualUrl", "autoCheck"] {
+        for key in ["state", "currentVersion", "channel", "latestVersion", "notes", "publishedAt", "lastCheckedAt", "canAutoUpdate", "blockers", "manualUrl", "autoCheck", "note", "noteLink"] {
             assert!(json.get(key).is_some(), "{key} in {json}");
         }
         assert_eq!(json["state"], "available");

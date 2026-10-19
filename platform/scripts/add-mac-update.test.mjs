@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { addMacEntry, imageName, updateSums } from './add-mac-update.mjs';
+import { addMacEntry, checkMacFiles, imageName, PENDING, planMacUpdate, updateSums } from './add-mac-update.mjs';
 import { FeedError, macAsset } from './make-latest-json.mjs';
 import { makeKeys, sign } from './minisign.testing.mjs';
 
@@ -184,6 +184,80 @@ describe('the checksums', () => {
   });
 });
 
+describe('what a run does to the release as it is (--plan)', () => {
+  const IMAGE = imageName(VERSION);
+  /** The files of a release as the release job and the Mac build leave it, before any Mac update ran. */
+  const published_files = ['latest.json', 'SHA256SUMS.txt', IMAGE, `${IMAGE}.sha256`, `oaiy-desktop-${VERSION}-windows-x64-setup.exe`, `oaiy-desktop-${VERSION}-linux-x86_64.AppImage`];
+  const withMac = () => {
+    const feed = published();
+    feed.platforms['darwin-aarch64'] = { signature: 'c2ln', url: `https://github.com/f2i-com/oaiy.com/releases/download/v${VERSION}/${ASSET}` };
+    return feed;
+  };
+  /** The plan for a release with `assets`, whose latest.json is `given.feed` (the published one unless said) and latest.pending.json `given.pendingFeed`. */
+  const plan = (assets, given = {}) => planMacUpdate({ version: VERSION, assets, feed: 'feed' in given ? given.feed : published(), pendingFeed: given.pendingFeed });
+
+  it('makes the update of a release that has none, swapping in the new feed and checksums', () => {
+    assert.deepEqual(plan(published_files), { mode: 'make', reuseApp: false, reuseSig: false, swap: ['latest.json', 'SHA256SUMS.txt'] });
+  });
+
+  it('reuses the packed app and its .sig an earlier run uploaded before it failed, so this one can finish', () => {
+    assert.deepEqual(plan([...published_files, ASSET, `${ASSET}.sig`, `${ASSET}.sha256`]), { mode: 'make', reuseApp: true, reuseSig: true, swap: ['latest.json', 'SHA256SUMS.txt'] });
+    // Cut short between the two uploads: the archive is reused, and signed in this run.
+    assert.deepEqual(plan([...published_files, ASSET]), { mode: 'make', reuseApp: true, reuseSig: false, swap: ['latest.json', 'SHA256SUMS.txt'] });
+    // Pending files an earlier run uploaded and never swapped in are made again (the workflow removes them first).
+    assert.equal(plan([...published_files, ASSET, PENDING['latest.json'], PENDING['SHA256SUMS.txt']]).mode, 'make');
+  });
+
+  it('finishes a swap an earlier run was cut short in, from the feed in place or the new one waiting', () => {
+    // The feed is in place, the checksums are not.
+    assert.deepEqual(plan([...published_files, ASSET, `${ASSET}.sig`, PENDING['SHA256SUMS.txt']], { feed: withMac() }), { mode: 'finish', reuseApp: false, reuseSig: false, swap: ['SHA256SUMS.txt'] });
+    // Cut between removing the old feed and renaming the new one: the release has no latest.json, and the new one waits.
+    const between = [...published_files.filter((name) => name !== 'latest.json'), ASSET, `${ASSET}.sig`, PENDING['latest.json'], PENDING['SHA256SUMS.txt']];
+    assert.deepEqual(plan(between, { feed: undefined, pendingFeed: withMac() }), { mode: 'finish', reuseApp: false, reuseSig: false, swap: ['latest.json', 'SHA256SUMS.txt'] });
+  });
+
+  it('leaves alone a release whose feed lists the Mac already, whatever files it has', () => {
+    assert.throws(() => plan([...published_files, ASSET, `${ASSET}.sig`, `${ASSET}.sha256`], { feed: withMac() }), /lists darwin-aarch64 already: 0\.1\.9 has its Mac update, and nothing is replaced/);
+    // (the guard is the feed, not the files: a release whose Mac files were deleted still has its Mac entry)
+    assert.throws(() => plan(published_files, { feed: withMac() }), /has its Mac update/);
+  });
+
+  it('refuses a release in a state no run leaves, and one that is not ready for its Mac update yet', () => {
+    assert.throws(() => plan([...published_files, `${ASSET}.sig`]), /has oaiy-desktop-0\.1\.9-macos-arm64\.app\.tar\.gz\.sig but not .*which no run leaves: delete it/);
+    assert.throws(() => plan([...published_files, `${ASSET}.sha256`]), /\.sha256 but not/);
+    assert.throws(() => plan(published_files.filter((name) => name !== `${IMAGE}.sha256`)), /run mac-build\.yml with release=v0\.1\.9 first/);
+    assert.throws(() => plan(published_files.filter((name) => name !== 'latest.json'), { feed: undefined }), /has no latest\.json/);
+    assert.throws(() => plan([...published_files.filter((name) => name !== 'latest.json'), PENDING['latest.json']], { feed: undefined, pendingFeed: published() }), /put the release job's latest\.json back/);
+    assert.throws(() => plan(published_files.filter((name) => name !== 'SHA256SUMS.txt')), /no SHA256SUMS\.txt/);
+    assert.throws(() => plan(published_files, { feed: published('0.1.8') }), /for version "0\.1\.8", not 0\.1\.9/);
+    assert.throws(() => plan(published_files, { feed: undefined }), /latest\.json is not a JSON object/);
+    assert.throws(() => planMacUpdate({ version: '0.1', assets: published_files, feed: published() }), /not a version/);
+  });
+
+  it('puts the new files up under names that keep their extension, so each keeps its content type when renamed', () => {
+    for (const [name, pending] of Object.entries(PENDING)) {
+      assert.equal(path.extname(pending), path.extname(name));
+      assert.notEqual(pending, name);
+    }
+    assert.deepEqual(Object.keys(PENDING), ['latest.json', 'SHA256SUMS.txt']);
+  });
+});
+
+describe('the Mac files an earlier run left on the release (--check)', () => {
+  it('pass when they verify against the key and were made for this version', () => {
+    const dir = macDir();
+    assert.equal(checkMacFiles({ dir, version: VERSION, pubkey: keys.pubkey }), fs.readFileSync(path.join(dir, `${ASSET}.sig`), 'utf8').trim());
+  });
+
+  it('are refused when another key signed them, they were made for another version, or the archive changed', () => {
+    assert.throws(() => checkMacFiles({ dir: macDir({ withKeys: makeKeys(9) }), version: VERSION, pubkey: keys.pubkey }), /does not verify against the public key/);
+    assert.throws(() => checkMacFiles({ dir: macDir({ signedAs: 'OAIY_0.1.8_aarch64.app.tar.gz' }), version: VERSION, pubkey: keys.pubkey }), /not version 0\.1\.9/);
+    const dir = macDir();
+    fs.appendFileSync(path.join(dir, ASSET), '!');
+    assert.throws(() => checkMacFiles({ dir, version: VERSION, pubkey: keys.pubkey }), /does not verify/);
+  });
+});
+
 describe('as the Mac update workflow runs it', () => {
   function inputs(feed = published()) {
     const dir = path.join(root, `run-${++counter}`);
@@ -224,6 +298,31 @@ describe('as the Mac update workflow runs it', () => {
     assert.match(run(base).stderr, /usage/);
     assert.match(run([...base, '--image-sha256', IMAGE_SHA, '--clobber', 'yes']).stderr, /unexpected argument "--clobber"/);
     assert.match(run([...base, '--image-sha256', 'abc']).stderr, /not the disk image's sha256 digest/);
+  });
+
+  it('--plan writes what it decided as lines for $GITHUB_OUTPUT, and says why when there is nothing to do', () => {
+    const release = inputs();
+    const assets = path.join(release, 'assets.txt');
+    fs.writeFileSync(assets, `${['latest.json', 'SHA256SUMS.txt', imageName(VERSION), `${imageName(VERSION)}.sha256`, ASSET, `${ASSET}.sig`].join('\n')}\n`);
+    const result = run(['--plan', '--version', VERSION, '--assets', assets, '--feed', path.join(release, 'latest.json')]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'mode=make\nreuse_app=true\nreuse_sig=true\nswap=latest.json SHA256SUMS.txt\n');
+    const feed = published();
+    feed.platforms['darwin-aarch64'] = { signature: 'c2ln', url: 'https://example.invalid/' };
+    fs.writeFileSync(path.join(release, 'latest.json'), feedText(feed));
+    const done = run(['--plan', '--version', VERSION, '--assets', assets, '--feed', path.join(release, 'latest.json')]);
+    assert.equal(done.status, 1);
+    assert.match(done.stderr, /::error::nothing was done to the release: the release's feed lists darwin-aarch64 already/);
+    assert.match(run(['--plan', '--check', '--version', VERSION]).stderr, /two runs/);
+  });
+
+  it('--check passes the files an earlier run uploaded, and refuses ones the key in tauri.conf.json did not sign', () => {
+    const good = run(['--check', '--dir', macDir(), '--version', VERSION]);
+    assert.equal(good.status, 0, good.stderr);
+    assert.match(good.stdout, /^OK: oaiy-desktop-0\.1\.9-macos-arm64\.app\.tar\.gz and its \.sig/);
+    const refused = run(['--check', '--dir', macDir(), '--version', VERSION, '--conf', conf]);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /::error::the Mac files on the release are NOT reused: .*does not verify against the public key in tauri\.conf\.json/);
   });
 
   it('accepts the packed app the Tauri CLI really signed, against the key that signed it (testdata/mac-app.bin)', () => {

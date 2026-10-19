@@ -3190,6 +3190,7 @@ dependencies = [
  "hyper-util",
  "if-addrs",
  "image",
+ "libc",
  "log",
  "mdns-sd",
  "minisign-verify",

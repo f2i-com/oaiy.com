@@ -22,7 +22,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 
 use super::blockers::Probes;
 use super::feed::{check_asset_url, Release};
-use super::install::{self, Outcome, Part, Steps};
+use super::install::{self, HandOffError, Outcome, Part, Steps};
 use super::kind;
 use super::target::Target;
 use super::updater::{AutoUpdate, BoxFuture, CheckRefusal, Platform, Status, UpdaterHandle};
@@ -86,10 +86,6 @@ fn explain(error: &tauri_plugin_updater::Error) -> String {
         E::Reqwest(_) | E::Network(_) => "The download failed. Check the internet connection and try again.".to_string(),
         E::TargetNotFound(_) | E::TargetsNotFound(_) => "The update information has no release for this kind of install, so nothing was fetched.".to_string(),
         E::InvalidUpdaterFormat | E::BinaryNotFoundInArchive => "The downloaded file is not an installer, so it was refused.".to_string(),
-        // (on a Mac: the app's folder is not the person's to change, and macOS's request for an administrator was turned down)
-        E::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            "The update was not installed: OAIY may not change the folder it is installed in. On a Mac, macOS asks for an administrator's password to do it; try again and give it, or download the newer version from the releases page.".to_string()
-        }
         other => format!("The update failed ({other})."),
     }
 }
@@ -152,7 +148,17 @@ impl Platform for GuiPlatform {
         // replaces is the bundle around it.
         let exe = tauri::utils::platform::current_exe().ok();
         let bundle = kind::bundle_name(tauri::utils::platform::bundle_type(), exe.as_deref());
-        kind::auto_update_for(std::env::consts::OS, std::env::consts::ARCH, bundle, exe.as_deref())
+        let auto = kind::auto_update_for(std::env::consts::OS, std::env::consts::ARCH, bundle, exe.as_deref());
+        // On a Mac, what the disk says now as well: the app is still where it was opened, and this user can move it. This is
+        // asked with every status, and by the install's first step before anything is stopped (Updater::begin_install).
+        #[cfg(target_os = "macos")]
+        if auto == AutoUpdate::Yes {
+            let problem = exe.as_deref().and_then(|exe| kind::app_bundle_of(exe).and_then(|app| kind::mac_install_problem(exe, app, &std::env::temp_dir())));
+            if let Some(why) = problem {
+                return AutoUpdate::No(why);
+            }
+        }
+        auto
     }
 
     /// The feed named a newer release for this platform: get the plugin's handle on it, and make sure it is the
@@ -305,10 +311,83 @@ fn run_install(app: &AppHandle, updater: &UpdaterHandle, update: Update) -> Outc
         // The last look, before anything is written or started: the bytes that were verified are for the version the update
         // handle names and this platform's kind of installer, and start the way that kind of file does.
         package.check_for_hand_off(&update.version, Target::current())?;
-        update.install(package.bytes()).map_err(|e| explain(&e))
+        // What the installer replaces, as it was: a failure that leaves it so keeps the download (install::HandOffError).
+        let before = replaced_identity();
+        update.install(package.bytes()).map_err(|e| {
+            let unchanged = cfg!(windows) || (before.is_some() && replaced_identity() == before);
+            let (kind, reason) = failure_reason(&e);
+            HandOffError { message: hand_off_sentence(Target::current(), &replaced_path(), kind, &reason, unchanged), keep_download: unchanged }
+        })
     };
     let clock = std::time::Instant::now;
     install::perform(updater, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock })
+}
+
+/// What the installer replaces, as the plugin finds it: the app bundle on a Mac (the program's path taken two folders up), and
+/// on Linux the AppImage the environment names (APPIMAGE, as tauri reads it: the program itself is inside the AppImage's
+/// mount). Empty where it cannot be told.
+fn replaced_path() -> std::path::PathBuf {
+    let Ok(exe) = tauri::utils::platform::current_exe() else { return std::path::PathBuf::new() };
+    if cfg!(target_os = "macos") {
+        return kind::app_bundle_of(&exe).map(|app| app.to_path_buf()).unwrap_or_default();
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = tauri::Env::default().appimage {
+        return appimage.into();
+    }
+    exe
+}
+
+/// What the installer replaces, as the disk has it now: the device and inode of it and of the program in it, so that one put
+/// in its place, or a program removed from it, is not taken for it. None when it cannot be read, and on Windows, where the
+/// hand-off replaces nothing itself (it starts the installer, and a failure to start it leaves the install as it was).
+fn replaced_identity() -> Option<Vec<(u64, u64)>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let exe = tauri::utils::platform::current_exe().ok()?;
+        [replaced_path(), exe].iter().map(|path| std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))).collect()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// What went wrong in a hand-off, in a few words with no sentence or parenthesis of their own (an I/O error's text without its
+/// "(os error 13)"), and the kind of I/O error it was.
+fn failure_reason(error: &tauri_plugin_updater::Error) -> (Option<std::io::ErrorKind>, String) {
+    match error {
+        tauri_plugin_updater::Error::Io(e) => (Some(e.kind()), plain_reason(&e.to_string())),
+        other => (None, plain_reason(&other.to_string())),
+    }
+}
+
+fn plain_reason(text: &str) -> String {
+    let text = text.find(" (os error ").map_or(text, |at| &text[..at]);
+    let text = text.trim().trim_end_matches('.').replace(['(', ')'], "");
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => "no reason was given".to_string(),
+    }
+}
+
+/// A failed hand-off in one sentence for this platform (`install::failed` adds what OAIY did about it): `replaced` is what the
+/// installer was to replace, and `unchanged` whether it is still as it was. A Mac's says what macOS or the move did, in the
+/// words of the app, since there is no installer there: the updater moves the old app aside and the new one into its place.
+fn hand_off_sentence(target: Option<Target>, replaced: &std::path::Path, kind: Option<std::io::ErrorKind>, reason: &str, unchanged: bool) -> String {
+    let replaced = replaced.display();
+    match target {
+        Some(Target::MacApp) if unchanged && kind == Some(std::io::ErrorKind::PermissionDenied) => {
+            format!("macOS did not let OAIY replace {replaced} with the new version ({reason}), so it is as it was.")
+        }
+        Some(Target::MacApp) if unchanged => format!("OAIY could not put the new version in place of {replaced} ({reason}), so it is as it was."),
+        Some(Target::MacApp) => format!("OAIY could not put the new version in place of {replaced} ({reason}), and the app there may no longer be whole: install OAIY again from the disk image on the releases page."),
+        Some(Target::LinuxAppImage) if unchanged => format!("The update could not be installed: the AppImage {replaced} could not be replaced ({reason}), so it is as it was."),
+        Some(Target::LinuxAppImage) => format!("The update could not be installed: the AppImage {replaced} could not be replaced ({reason}), and it may no longer be whole: download it again from the releases page."),
+        _ => format!("The update could not be installed: the installer could not be started ({reason})."),
+    }
 }
 
 // ---- the agent page's flush ---------------------------------------------------------------------
@@ -759,6 +838,33 @@ mod tests {
         // A nonce is only ever quoted data: a hostile one cannot break out of the string.
         let hostile = flush_script("\"); alert(1); (\"");
         assert!(hostile.contains(r#"nonce: "\"); alert(1); (\"""#), "{hostile}");
+    }
+
+    #[test]
+    fn a_macs_failed_hand_off_is_one_plain_sentence_with_no_installer_in_it() {
+        use std::io::ErrorKind;
+        let app = std::path::Path::new("/Applications/OAIY.app");
+        let declined = std::io::Error::new(ErrorKind::PermissionDenied, "Failed to move the new app into place");
+        let (kind, reason) = failure_reason(&tauri_plugin_updater::Error::Io(declined));
+        let refused = hand_off_sentence(Some(Target::MacApp), app, kind, &reason, true);
+        assert_eq!(refused, "macOS did not let OAIY replace /Applications/OAIY.app with the new version (failed to move the new app into place), so it is as it was.");
+        let full = std::io::Error::from_raw_os_error(28);
+        let (kind, reason) = failure_reason(&tauri_plugin_updater::Error::Io(full));
+        assert!(!reason.contains("os error") && !reason.contains('('), "{reason}");
+        for unchanged in [true, false] {
+            for sentence in [hand_off_sentence(Some(Target::MacApp), app, kind, &reason, unchanged), refused.clone()] {
+                assert!(!sentence.to_lowercase().contains("installer"), "{sentence}");
+                assert!(!sentence.contains(". ") && sentence.ends_with('.'), "one sentence: {sentence}");
+                assert_eq!((sentence.matches('(').count(), sentence.matches(')').count()), (1, 1), "nothing nested: {sentence}");
+                assert!(!sentence.contains("The update was not installed"), "the window's heading says that already: {sentence}");
+            }
+        }
+        assert!(hand_off_sentence(Some(Target::MacApp), app, kind, &reason, false).contains("disk image on the releases page"));
+        // The other two say what they always did, in one sentence each.
+        assert_eq!(hand_off_sentence(Some(Target::WindowsSetup), std::path::Path::new(""), None, "the system cannot find the file specified", true), "The update could not be installed: the installer could not be started (the system cannot find the file specified).");
+        assert!(hand_off_sentence(Some(Target::LinuxAppImage), std::path::Path::new("/home/sam/OAIY.AppImage"), kind, &reason, true).contains("the AppImage /home/sam/OAIY.AppImage could not be replaced"));
+        assert_eq!(plain_reason(""), "no reason was given");
+        assert_eq!(plain_reason("Permission denied (os error 13)"), "permission denied");
     }
 
     #[test]

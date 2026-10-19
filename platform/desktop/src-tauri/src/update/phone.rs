@@ -628,7 +628,7 @@ mod process_tests {
         }
         let part = Part(stopped.clone());
         let parts: Vec<&dyn crate::update::install::Part> = vec![&part];
-        let hand_off = |_: &crate::update::VerifiedPackage| -> Result<(), String> { panic!("the installer must not be started") };
+        let hand_off = |_: &crate::update::VerifiedPackage| -> Result<(), crate::update::install::HandOffError> { panic!("the installer must not be started") };
         // The uptime the Fake gave the helper does not apply to the real probes: the clock is an hour after the start.
         let clock = move || now;
         let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock });
@@ -971,7 +971,7 @@ mod process_tests {
         let engines = StandIn { name: "the engines", log: log.clone(), on_stop: Some(Box::new(move || behave(&dir2, board(Some(call()))))), holds_calls: false };
         let plugins = StandIn { name: "the plugins", log: log.clone(), on_stop: None, holds_calls: true };
         let parts: Vec<&dyn crate::update::install::Part> = vec![&engines, &plugins];
-        let hand_off = |_: &crate::update::VerifiedPackage| -> Result<(), String> { panic!("the installer must not be started") };
+        let hand_off = |_: &crate::update::VerifiedPackage| -> Result<(), crate::update::install::HandOffError> { panic!("the installer must not be started") };
         let (flush, clock) = (|| {}, move || now);
         let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock });
         match outcome {

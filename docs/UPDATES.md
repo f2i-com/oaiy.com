@@ -29,7 +29,9 @@ button.** In order:
 Nothing installs by itself, at any hour. A restart takes a minute or so (the model and the
 voice load again), and OAIY answers no call or text meanwhile: the decision to press the
 button, and when, is the owner's. A download waits in memory until then; restarting OAIY
-first forgets it and it is downloaded again.
+first forgets it and it is downloaded again. A check meanwhile keeps it while it can still be
+installed: a newer release that has no entry for this platform yet (a Mac's comes a little after
+the release, below) leaves the download ready, and the note beside it says the newer one is coming.
 
 ## What can update itself
 
@@ -39,8 +41,11 @@ first forgets it and it is downloaded again.
 | Linux, the AppImage | Yes. The AppImage file is replaced and OAIY restarts. |
 | Windows, the MSI (machine-wide) | **No: a manual download.** The MSI is another kind of install of the same product; the update is the NSIS installer, and running it over an MSI install would leave two. Settings says so and links the releases page. |
 | Linux, `.deb` or `.rpm` | No: a manual download, for the same reason (the feed carries the AppImage). |
-| macOS (Apple silicon), the app from the release's disk image, in Applications or another folder of the Mac's own disk | Yes, from the first release after 0.1.8 on (below). The app is replaced where it is and OAIY restarts. If that folder is not the person's to change, macOS asks for an administrator's password first. |
+| macOS (Apple silicon), the app from the release's disk image, in Applications or another folder of the Mac's own disk | Yes, from the first release after 0.1.8 on (below). The app is replaced where it is and OAIY restarts. |
+| macOS, the app in a folder this Mac user cannot change (Applications, for a user who is not an administrator), or an app that belongs to another user | No: Settings says so, before anything is downloaded or stopped, and names the disk image instead (Finder asks for the administrator's password there, while OAIY keeps running). The updater could replace it only by asking macOS for an administrator's password with OAIY already stopped, its calls down for as long as the dialog is open, and then, as root, removing the old app before it moves the new one in. |
 | macOS, the app still in its disk image, on another disk, or opened where it was downloaded | No, until it is dragged to Applications and opened from there: the update is put in place through the Mac's own disk, and the other two are read-only. Settings says which. |
+| macOS, an app moved since it was opened, or at a path with a quote, a backslash or a control character in it | No. A moved app: quit OAIY and open it again (the updater replaces the app at the path it was opened from). Such a path: move OAIY to Applications (the updater writes the path into a script that those characters break). |
+| A build of one's own (a version with a suffix: `0.1.9-mac.3`, built on top of 0.1.9) | Only to a release newer than the one it was built on (0.1.10, not 0.1.9): a release is always `N.N.N`, so a suffix means the code after that release, and 0.1.9 would put older code in its place. Settings says so ("This is a local build of 0.1.9"). The same on every platform. |
 | A development build (`tauri dev`, `cargo run`) | No: there is no installed copy to replace. |
 | An Intel Mac | No release is built. |
 | The headless `oaiy-server` | No: it **only reports** that a newer release exists (see below). |
@@ -64,7 +69,8 @@ offered its updates like the others.
 before the Mac's image exists; the image is made and notarised afterwards, and the Mac update
 workflow then packs the app out of it, signs it and adds the Mac to the feed
 ([RELEASING.md](RELEASING.md#a-macs-update)). Until it has, a Mac that checks finds the newer
-version and "no release of it for this platform"; a check later finds the update.
+version and is told that its update for a Mac is not out yet, with the releases page beside it
+for the disk image; a check later finds the update.
 
 Only what OAIY itself ships is updated: with the app, the engines its installer carries
 (`resources/engines`: `oaiy-llm-server-webgpu`, `oaiy-media` and, after 0.1.7, `oaiy-voice`).
@@ -149,7 +155,10 @@ save, and ends its turn, as quitting does.
 
 ## The install, in order
 
-1. The update and the blockers (nothing is touched if either is wrong).
+1. The update and the blockers (nothing is touched if either is wrong). On a Mac this is also
+   where the disk is looked at: the app must still be where it was opened, and this Mac user must
+   be able to move it and to change the folder it is in. Anything else is refused here, with
+   OAIY still running as it was (the status has said it since the last time it was read).
 2. The Agent page is asked to save its work (it saves its projects and chat, and reports back
    to the local API); it has five seconds, and the install goes on if it does not answer.
 3. The blockers again.
@@ -165,13 +174,21 @@ save, and ends its turn, as quitting does.
    on screen until the mouse passes over it: OAIY does not remove it before the installer is
    started, so that a failed start leaves OAIY as it was). On Linux the AppImage is replaced
    and OAIY restarts through its normal exit. On a Mac the archive is unpacked into the Mac's
-   temporary folder, the app is moved aside, the new one is moved into its place (behind an
-   administrator's password when the folder asks for one) and the old one removed, and OAIY
-   restarts through its normal exit, starting the program the new app names.
+   temporary folder, the app is moved aside, the new one is moved into its place and the old one
+   removed, and OAIY restarts through its normal exit, starting the program the new app names.
+   (Should macOS still refuse the move for a reason step 1 could not see, a protection of its
+   own, say, the updater plugin asks for an administrator's password at this point; step 1 is
+   there so that this is not the usual way.)
 
 If a part will not stop, or the installer cannot be STARTED, everything that was stopped is
 started again (last stopped, first started) and the update is shown as **failed**, with the
-reason in words. OAIY is then running as before. That is all "put back" means. On Windows the
+reason in words. OAIY is then running as before. That is all "put back" means. When the hand-off
+failed before it changed anything on disk (the Windows installer could not be started; on a
+Mac or Linux, the app or the AppImage is the same file it was, by its inode), the download is
+kept: the update is back to **ready** with the reason beside it, and "Restart to update" tries
+again without fetching it again. A Mac's reason is one sentence in the words of the app
+("macOS did not let OAIY replace /Applications/OAIY.app with the new version …, so it is as it
+was."), since a Mac has no installer. On Windows the
 hand-off starts the installer and the process ends at once, so OAIY never learns how the installer
 went: an installer that starts and then fails, or a version that installs and does not work, is
 NOT undone (there is no rollback yet: see "Not yet"). Put back is also what follows a panic (an internal error) anywhere
@@ -233,8 +250,10 @@ the installer it starts would inherit that and be killed with it.
   macOS does not ask before the new version opens.
 - **The feed.** At most 256 KiB, counted as it arrives; https only, redirects too (GitHub
   sends the request through two); every field checked; a version that is lower or equal is
-  never an update, and neither is one that is not a version. A platform the feed has nothing
-  for is "no update for this platform", not an error.
+  never an update, and neither is one that is not a version. A running version with a suffix
+  (`0.1.9-mac.3`, a build of one's own) is held to the release it was built on: only a release
+  above 0.1.9 is newer than it (`update::version`, which the plugin is given as its comparator
+  too). A platform the feed has nothing for is "no update for this platform", not an error.
 - **The updater plugin's own reads.** The plugin reads the feed a second time, and downloads the
   installer, with a client of its own. It follows redirects by the same rule as OAIY's own read
   (only to https, at most five: OAIY gives the plugin's client that policy). What it cannot be

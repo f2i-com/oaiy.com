@@ -18,7 +18,9 @@
 //!    installer and exits this process, so nothing after it runs.
 //!
 //! A part that will not stop, or a hand-off that fails, restarts the parts already stopped (last
-//! stopped, first started) and the update is `failed`, with the reason in words.
+//! stopped, first started) and the update is `failed`, with the reason in words. A hand-off that
+//! failed before it changed anything on disk keeps the download ([`HandOffError::keep_download`]): the
+//! update is back to `ready` with the reason beside it, so trying again does not fetch it again.
 //!
 //! So does a PANIC anywhere after the install began (in the flush, a part's stop, the hand-off): the
 //! sequence holds an [`Unwind`] guard, which on the way out of a panic starts again what was stopped
@@ -65,9 +67,27 @@ pub struct Steps<'a> {
     /// Everything the app runs, in the order quitting stops it.
     pub parts: &'a [&'a dyn Part],
     /// Give the installer the verified bytes. On Windows it starts the installer and exits this process.
-    pub hand_off: &'a dyn Fn(&VerifiedPackage) -> Result<(), String>,
+    pub hand_off: &'a dyn Fn(&VerifiedPackage) -> Result<(), HandOffError>,
     /// The time (for how long the app has been up), so a test can set it.
     pub clock: &'a dyn Fn() -> Instant,
+}
+
+/// Why the installer did not take over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandOffError {
+    /// What happened, in one sentence for a person (it is shown as it is, with what OAIY did about it after it).
+    pub message: String,
+    /// Nothing on disk was changed and the download was not at fault, so it is kept: "Restart to update" tries again
+    /// with it, without fetching it again.
+    pub keep_download: bool,
+}
+
+/// A hand-off that stopped at the last look at the package (`VerifiedPackage::check_for_hand_off`): the download does not
+/// fit the update it was taken for, so it is not kept.
+impl From<String> for HandOffError {
+    fn from(why: String) -> HandOffError {
+        HandOffError { message: format!("The update could not be installed: {why}."), keep_download: false }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -113,7 +133,7 @@ pub fn perform(updater: &Updater, steps: &Steps) -> Outcome {
         unwind.stopped.push(*part);
         if let Err(e) = part.stop() {
             unwind.done = true;
-            return failed(updater, &unwind.stopped, format!("{} would not stop ({e})", part.name()));
+            return failed(updater, &unwind.stopped, format!("The update could not be installed: {} would not stop ({e}).", part.name()), None);
         }
     }
     // 5. The installer takes over.
@@ -122,7 +142,10 @@ pub fn perform(updater: &Updater, steps: &Steps) -> Outcome {
     unwind.done = true;
     match handed {
         Ok(()) => Outcome::HandedOff,
-        Err(e) => failed(updater, &unwind.stopped, format!("the installer could not be started ({e})")),
+        Err(e) => {
+            let keep = e.keep_download.then_some(package);
+            failed(updater, &unwind.stopped, e.message, keep)
+        }
     }
 }
 
@@ -140,7 +163,7 @@ impl Drop for Unwind<'_> {
     fn drop(&mut self) {
         if !self.done {
             log::error!("update: the install stopped unexpectedly; starting again what was stopped");
-            failed(self.updater, &self.stopped, "it stopped unexpectedly, because of an internal error".to_string());
+            failed(self.updater, &self.stopped, "The update could not be installed: it stopped unexpectedly, because of an internal error.".to_string(), None);
         }
     }
 }
@@ -180,10 +203,11 @@ fn put_back(updater: &Updater, package: VerifiedPackage, stopped: &[&dyn Part], 
     Outcome::Failed { message, restarted, not_restarted }
 }
 
-/// Start what was stopped again, last stopped first, and record the failure.
-fn failed(updater: &Updater, stopped: &[&dyn Part], why: String) -> Outcome {
+/// Start what was stopped again, last stopped first, and record the failure: `what` is the sentence that says what went wrong,
+/// and `keep` the download when the failure changed nothing on disk (the update is then `ready` again with it).
+fn failed(updater: &Updater, stopped: &[&dyn Part], what: String, keep: Option<VerifiedPackage>) -> Outcome {
     let (restarted, not_restarted) = start_again(stopped);
-    let mut message = format!("The update could not be installed: {why}.");
+    let mut message = what;
     if not_restarted.is_empty() {
         message.push_str(" OAIY started again what it had stopped, and is running as before.");
     } else {
@@ -191,7 +215,14 @@ fn failed(updater: &Updater, stopped: &[&dyn Part], why: String) -> Outcome {
         message.push_str(&format!(" OAIY could not start {} again: quit OAIY from its tray icon and open it again.", names.join(" and ")));
     }
     log::warn!("update: {message}");
-    updater.fail_install(message.clone());
+    match keep {
+        // (Only while everything runs again: an OAIY that has to be opened again forgets the download either way.)
+        Some(package) if not_restarted.is_empty() => {
+            message.push_str(" The download is kept: Restart to update tries again.");
+            updater.fail_install_keeping(message.clone(), package);
+        }
+        _ => updater.fail_install(message.clone()),
+    }
     Outcome::Failed { message, restarted, not_restarted }
 }
 
@@ -252,12 +283,24 @@ mod tests {
         ["engines", "script host", "plugins", "services"].into_iter().map(|n| Fakepart::new(n, log)).collect()
     }
 
+    /// A hand-off that failed after it had begun to change what is on disk (the download is not kept).
+    fn no_permission() -> HandOffError {
+        HandOffError { message: "The update could not be installed: the installer could not be started (no permission).".into(), keep_download: false }
+    }
+
     fn run(u: &Updater, now: Instant, parts: &[Fakepart], log: &Log, flush: impl Fn() + 'static, hand_off_fails: bool) -> Outcome {
+        run_failing_with(u, now, parts, log, flush, hand_off_fails.then(no_permission))
+    }
+
+    fn run_failing_with(u: &Updater, now: Instant, parts: &[Fakepart], log: &Log, flush: impl Fn() + 'static, failure: Option<HandOffError>) -> Outcome {
         let refs: Vec<&dyn Part> = parts.iter().map(|p| p as &dyn Part).collect();
         let hand_log = log.clone();
         let hand_off = move |package: &VerifiedPackage| {
             hand_log.lock().unwrap().push(format!("hand off {} bytes", package.len()));
-            if hand_off_fails { Err("no permission".to_string()) } else { Ok(()) }
+            match &failure {
+                Some(failure) => Err(failure.clone()),
+                None => Ok(()),
+            }
         };
         let clock = move || now;
         perform(u, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock })
@@ -351,6 +394,53 @@ mod tests {
         let s = u.status_at(now);
         assert_eq!(s.state, State::Failed);
         assert!(s.error.unwrap().contains("could not be installed"));
+    }
+
+    #[test]
+    fn a_hand_off_that_changed_nothing_on_disk_keeps_the_download_and_is_ready_again_with_the_reason() {
+        let (u, _, now) = ready();
+        let log: Log = Log::default();
+        let parts = parts(&log);
+        let refused = HandOffError { message: "macOS did not let OAIY replace /Applications/OAIY.app, so it is as it was.".into(), keep_download: true };
+        match run_failing_with(&u, now, &parts, &log, || {}, Some(refused)) {
+            Outcome::Failed { message, restarted, not_restarted } => {
+                assert_eq!(restarted, ["services", "plugins", "script host", "engines"]);
+                assert!(not_restarted.is_empty());
+                assert_eq!(message, "macOS did not let OAIY replace /Applications/OAIY.app, so it is as it was. OAIY started again what it had stopped, and is running as before. The download is kept: Restart to update tries again.");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Ready, with the reason beside it, and the same download: the button tries again without fetching it again.
+        let s = u.status_at(now);
+        assert_eq!((s.state, s.failed_during), (State::Ready, Some(super::super::updater::Stage::Install)));
+        assert!(s.error.unwrap().starts_with("macOS did not let OAIY replace"));
+        assert_eq!(u.begin_install(now).unwrap().bytes(), package("0.2.0").bytes());
+        assert!(u.status_at(now).error.is_none(), "a new try starts with no old reason");
+    }
+
+    #[test]
+    fn a_kept_download_is_dropped_all_the_same_when_something_could_not_be_started_again() {
+        // OAIY has to be opened again then, which forgets the download anyway: the update says failed, not ready.
+        let (u, _, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        parts[3].fail_start = true;
+        let kept = HandOffError { message: "OAIY could not put the new version in place.".into(), keep_download: true };
+        assert!(matches!(run_failing_with(&u, now, &parts, &log, || {}, Some(kept)), Outcome::Failed { .. }));
+        assert_eq!(u.status_at(now).state, State::Failed);
+        assert_eq!(u.begin_install(now), Err(InstallRefusal::NotReady));
+    }
+
+    #[test]
+    fn a_package_that_does_not_fit_its_update_at_the_last_look_is_not_kept() {
+        let refused: HandOffError = "the downloaded update is for version 0.2.0, not 0.3.0".to_string().into();
+        assert_eq!(refused, HandOffError { message: "The update could not be installed: the downloaded update is for version 0.2.0, not 0.3.0.".into(), keep_download: false });
+        let (u, _, now) = ready();
+        let log: Log = Log::default();
+        let parts = parts(&log);
+        run_failing_with(&u, now, &parts, &log, || {}, Some(refused));
+        assert_eq!(u.status_at(now).state, State::Failed);
+        assert_eq!(u.begin_install(now), Err(InstallRefusal::NotReady));
     }
 
     #[test]

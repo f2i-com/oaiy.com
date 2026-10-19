@@ -17,8 +17,9 @@
 #   oaiy-desktop-<v>-macos-arm64.app.tar.gz.sha256   its checksum
 #   latest.json                                      REPLACED: the same feed with a darwin-aarch64 entry added, every
 #                                                    other entry as it was (platform/scripts/add-mac-update.mjs)
-#   SHA256SUMS.txt                                   REPLACED: latest.json's new checksum, and the image and the two
-#                                                    files above added, so it is true again
+#   SHA256SUMS.txt                                   REPLACED: latest.json's new checksum, and the image, the packed
+#                                                    app and its .sig added, so it is true again (the .sha256 files hold
+#                                                    the same digests, and are not listed)
 #
 # Three jobs, each given only what it needs. `pack` runs on a Mac with no secret: it takes the image by its exact name,
 # holds it to its checksum (the release's .sha256 and GitHub's own digest), has Gatekeeper say it and the app in it
@@ -26,8 +27,19 @@
 # that the app is still valid and notarised when it comes out. `sign` runs in the `release` environment (the updater
 # key; tags only, a reviewer approves), as release.yml's `sign` job does, and signs that archive, held to the digest
 # `pack` recorded, and nothing else. `publish` adds the files, then the feed: the feed never names a file the release
-# does not have yet. It replaces no Mac file a release has already: a second run for the same release fails, and the
-# release is left as it was.
+# does not have yet.
+#
+# Replacing the feed is the one moment every installed OAIY can see, so it is made as short as it can be: the new feed and
+# checksums go up beside the old under temporary names (latest.pending.json, SHA256SUMS.pending.txt), and then each old one
+# is removed and the new one renamed to its name, two API calls, so the feed is missing between them and not for the length
+# of an upload (and not for good when an upload fails, as `gh release upload --clobber`, which removes first, would leave
+# it). Everything the run puts on the release is kept as the run's artifact first, with the feed and checksums it replaces.
+#
+# What the release has decides what a run does (add-mac-update.mjs --plan): its FEED, not its files. A release whose feed
+# lists the Mac already is left alone, and the run fails before anything is made. A run that failed part way is finished
+# by running it again: a packed app and its .sig that it uploaded are reused when they verify against the key (they cannot
+# be replaced, and a new pack is not the same bytes), so the image is checked and the app compared again, and nothing is
+# signed unless the .sig is not there yet; and a swap it was cut short in is completed.
 #
 # A copy of OAIY 0.1.8 or earlier never reads the Mac's entry (it does not update itself on a Mac at all): a Mac
 # updates itself from the first release made after the one that taught it how, onwards.
@@ -58,8 +70,18 @@ jobs:
     timeout-minutes: 30
     outputs:
       version: ${{ steps.release.outputs.version }}
+      mode: ${{ steps.plan.outputs.mode }}
+      reuse_sig: ${{ steps.plan.outputs.reuse_sig }}
+      swap: ${{ steps.plan.outputs.swap }}
       sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
       - name: The release, and this run on its tag
         id: release
         env:
@@ -76,15 +98,37 @@ jobs:
           draft="$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" || { echo "::error::there is no release $RELEASE"; exit 1; }
           [ "$draft" = false ] || { echo "::error::the release $RELEASE is a draft"; exit 1; }
           version="${RELEASE#v}"
-          names="$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
-          grep -qxF "oaiy-desktop-$version-macos-arm64.dmg" <<< "$names" || { echo "::error::the release $RELEASE has no oaiy-desktop-$version-macos-arm64.dmg yet: run mac-build.yml with release=$RELEASE first"; exit 1; }
-          grep -qxF "latest.json" <<< "$names" || { echo "::error::the release $RELEASE has no latest.json"; exit 1; }
-          if grep -qxF "oaiy-desktop-$version-macos-arm64.app.tar.gz" <<< "$names"; then
-            echo "::error::the release $RELEASE has its Mac update already: nothing is replaced (delete its .app.tar.gz, .sig and .sha256 to make them again)"; exit 1
-          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # From the release's feed (and the files an earlier run may have left): make the Mac's update, reusing what such a run
+      # uploaded, or finish the swap it was cut short in, or nothing at all when the feed lists the Mac already.
+      - name: What this run does to the release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          dir="mac-update/release"
+          mkdir -p "$dir"
+          gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$dir/assets.txt"
+          plan=(--plan --version "$VERSION" --assets "$dir/assets.txt")
+          if grep -qxF latest.json "$dir/assets.txt"; then
+            gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D "$dir" -p latest.json
+            plan+=(--feed "$dir/latest.json")
+          fi
+          if grep -qxF latest.pending.json "$dir/assets.txt"; then
+            gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D "$dir" -p latest.pending.json
+            plan+=(--pending-feed "$dir/latest.pending.json")
+          fi
+          said="$(node platform/scripts/add-mac-update.mjs "${plan[@]}")"
+          echo "$said"
+          grep -qxE 'mode=(make|finish)' <<< "$said" || { echo "::error::add-mac-update.mjs --plan named no mode"; exit 1; }
+          echo "$said" >> "$GITHUB_OUTPUT"
+
       - name: The image, held to its checksum
+        if: steps.plan.outputs.mode == 'make'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ inputs.release }}
@@ -106,6 +150,7 @@ jobs:
 
       # What macOS says of the image and the app, and the app's version: the one the release is.
       - name: The app, notarised and of this version
+        if: steps.plan.outputs.mode == 'make'
         env:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
@@ -126,19 +171,47 @@ jobs:
           xcrun stapler validate "$app"
           echo "APP=$app" >> "$GITHUB_ENV"
 
+      # A packed app (and its .sig) that an earlier run of this release put on it and then failed: it cannot be replaced,
+      # so it is what this run checks and the feed names. Its .sig is held to the key every installed OAIY carries before
+      # it is trusted, and the app in it is checked below as a new pack would be.
+      - name: The Mac files an earlier run left on the release
+        if: steps.plan.outputs.mode == 'make' && steps.plan.outputs.reuse_app == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          VERSION: ${{ steps.release.outputs.version }}
+          REUSE_SIG: ${{ steps.plan.outputs.reuse_sig }}
+        run: |
+          set -euo pipefail
+          asset="oaiy-desktop-$VERSION-macos-arm64.app.tar.gz"
+          reused="mac-update/reused"
+          mkdir -p "$reused" mac-update/packed mac-update/signature
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D "$reused" -p "$asset"
+          if [ "$REUSE_SIG" = true ]; then
+            gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D "$reused" -p "$asset.sig"
+            node platform/scripts/add-mac-update.mjs --check --dir "$reused" --version "$VERSION" --conf platform/desktop/src-tauri/tauri.conf.json
+            cp "$reused/$asset.sig" mac-update/signature/
+          fi
+          cp "$reused/$asset" mac-update/packed/
+          echo "Reusing the release's $asset$([ "$REUSE_SIG" = true ] && echo ' and its .sig')" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Pack it as the updater unpacks it
         id: pack
+        if: steps.plan.outputs.mode == 'make'
         env:
           VERSION: ${{ steps.release.outputs.version }}
+          REUSE_APP: ${{ steps.plan.outputs.reuse_app }}
         run: |
           set -euo pipefail
           asset="oaiy-desktop-$VERSION-macos-arm64.app.tar.gz"
           out="mac-update/packed"
           mkdir -p "$out"
-          # The app at the top, and nothing of the Mac's own beside its files: no extended attributes, no ._ files
-          # (COPYFILE_DISABLE), no ACLs or flags. The updater unpacks every entry as a file of the app, so a ._ file
-          # would be one more file in a sealed bundle, and the app would no longer start.
-          COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls --no-fflags -czf "$out/$asset" -C "$(dirname "$APP")" OAIY.app
+          if [ "$REUSE_APP" != true ]; then
+            # The app at the top, and nothing of the Mac's own beside its files: no extended attributes, no ._ files
+            # (COPYFILE_DISABLE), no ACLs or flags. The updater unpacks every entry as a file of the app, so a ._ file
+            # would be one more file in a sealed bundle, and the app would no longer start.
+            COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls --no-fflags -czf "$out/$asset" -C "$(dirname "$APP")" OAIY.app
+          fi
           # tauri-plugin-updater 2.12 (update::gui) drops every entry's first part and unpacks the rest into one folder,
           # which it then puts where the app was. The same here, then what macOS says of the result.
           check="$RUNNER_TEMP/unpacked"
@@ -176,7 +249,15 @@ jobs:
           said="$(spctl --assess --type execute -vv "$check/OAIY.app" 2>&1)"
           grep -qx 'source=Notarized Developer ID' <<< "$said" || { echo "$said"; echo "::error::the app as the updater unpacks it is not accepted as notarised"; exit 1; }
           xcrun stapler validate "$check/OAIY.app"
-          diff -r "$APP" "$check/OAIY.app"
+          if [ "$REUSE_APP" = true ]; then
+            # The app the earlier run packed had its ticket stapled then (Contents/CodeResources), and one fetched again
+            # need not be the same bytes: that file alone may differ from the app just stapled here.
+            ticket="Files $APP/Contents/CodeResources and $check/OAIY.app/Contents/CodeResources differ"
+            differ="$(diff -rq "$APP" "$check/OAIY.app" | grep -vxF "$ticket" || true)"
+            [ -z "$differ" ] || { echo "$differ"; echo "::error::the release's $asset is not the app of its image: delete it (and its .sig and .sha256), then run this again"; exit 1; }
+          else
+            diff -r "$APP" "$check/OAIY.app"
+          fi
           ls -l "$out"
           sha="$(shasum -a 256 "$out/$asset" | cut -d' ' -f1)"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
@@ -184,18 +265,30 @@ jobs:
           echo "sha256 \`$sha\`, from the image \`$IMAGE_SHA256\`: unpacked as the updater does, it is the notarised app" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.plan.outputs.mode == 'make'
         with:
           name: mac-update
           path: mac-update/packed/
+          if-no-files-found: error
+          retention-days: 7
+      # The reused .sig, under the name the signing job gives its own (which does not run then): nothing new is signed.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.plan.outputs.mode == 'make' && steps.plan.outputs.reuse_sig == 'true'
+        with:
+          name: mac-update-signature
+          path: mac-update/signature/
           if-no-files-found: error
           retention-days: 7
 
   # ---------------------------------------------------------------- signing
   # The updater key, as release.yml's `sign` job uses it: in the `release` environment (tags only, a reviewer approves),
   # with the Tauri CLI from the desktop app's lockfile and no install scripts, signing what `pack` made and nothing else.
+  # Not run (and so not approved) when there is nothing to sign: a run that finishes an earlier one's swap, or reuses the
+  # .sig that run uploaded.
   sign:
     name: Sign the Mac update
     needs: pack
+    if: needs.pack.outputs.mode == 'make' && needs.pack.outputs.reuse_sig != 'true'
     runs-on: ubuntu-latest
     environment: release
     timeout-minutes: 15
@@ -265,10 +358,13 @@ jobs:
   # ---------------------------------------------------------------- release
   # The files, then the feed. The feed is read back from the release and the Mac's entry added to it by a script with
   # tests, which checks the signature against the key in tauri.conf.json (the key every installed OAIY carries) and what
-  # it was made for, and keeps every other entry exactly; the checksums are made true again beside it.
+  # it was made for, and keeps every other entry exactly; the checksums are made true again beside it. Then the two are
+  # swapped in (see the top of this file), and read back as a Mac reads them.
   publish:
     name: Add the Mac update to the release
     needs: [pack, sign]
+    # (sign is skipped when this run reuses a .sig or only finishes a swap)
+    if: ${{ !cancelled() && needs.pack.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -281,15 +377,18 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.pack.outputs.mode == 'make'
         with:
           name: mac-update
           path: mac-update/files
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: needs.pack.outputs.mode == 'make'
         with:
           name: mac-update-signature
           path: mac-update/files
 
       - name: The feed with the Mac in it, and the checksums
+        if: needs.pack.outputs.mode == 'make'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ inputs.release }}
@@ -310,8 +409,26 @@ jobs:
             --image-sha256 "$(cut -d' ' -f1 "release/$image.sha256")" --out mac-update/new
           diff release/latest.json mac-update/new/latest.json || true
           diff release/SHA256SUMS.txt mac-update/new/SHA256SUMS.txt || true
+          # Under the names they go up as first, beside the release's own.
+          mkdir -p mac-update/pending
+          cp mac-update/new/latest.json mac-update/pending/latest.pending.json
+          cp mac-update/new/SHA256SUMS.txt mac-update/pending/SHA256SUMS.pending.txt
 
-      - name: Add them to the release
+      # Kept before anything is put on the release: if the run stops half way, what it was putting there (and what it was
+      # replacing) is here to finish it by hand.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.pack.outputs.mode == 'make'
+        with:
+          name: mac-update-release
+          path: |
+            mac-update/files/
+            mac-update/new/
+            release/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Add the Mac's files to the release
+        if: needs.pack.outputs.mode == 'make'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ inputs.release }}
@@ -319,17 +436,85 @@ jobs:
         run: |
           set -euo pipefail
           asset="oaiy-desktop-$VERSION-macos-arm64.app.tar.gz"
-          # The Mac's files first, with no --clobber (a file a release has already is never replaced), and the feed that
-          # names them after: a Mac never reads an entry for a file that is not there.
           files="mac-update/files"
-          gh release upload "$RELEASE" "$files/$asset" "$files/$asset.sig" "$files/$asset.sha256" --repo "$GITHUB_REPOSITORY"
-          gh release upload "$RELEASE" mac-update/new/latest.json mac-update/new/SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
-          # Read back as a Mac reads it.
+          # With no --clobber (a file a release has already is never replaced), and before the feed that names them: a Mac
+          # never reads an entry for a file that is not there. One an earlier run uploaded stays, and must be this run's.
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE" --jq '.assets[] | "\(.name)\t\(.digest)"' > mac-update/on-release.tsv
+          for name in "$asset" "$asset.sig" "$asset.sha256"; do
+            ours="sha256:$(sha256sum "$files/$name" | cut -d' ' -f1)"
+            theirs="$(awk -F'\t' -v n="$name" '$1 == n { print $2 }' mac-update/on-release.tsv)"
+            if [ -z "$theirs" ]; then
+              gh release upload "$RELEASE" "$files/$name" --repo "$GITHUB_REPOSITORY"
+            elif [ "$theirs" = "$ours" ]; then
+              echo "$name is on the release already, the same file"
+            else
+              echo "::error::the release's $name ($theirs) is not this run's ($ours): delete the Mac's .app.tar.gz, .sig and .sha256 from the release, then run this again"; exit 1
+            fi
+          done
+
+      - name: Put the new feed and checksums up beside the old
+        if: needs.pack.outputs.mode == 'make'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          # (one an earlier run put up and never swapped in is made again: only this workflow writes these names)
+          for pending in latest.pending.json SHA256SUMS.pending.txt; do
+            id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE" --jq ".assets[] | select(.name == \"$pending\") | .id")"
+            [ -z "$id" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
+          done
+          gh release upload "$RELEASE" mac-update/pending/latest.pending.json mac-update/pending/SHA256SUMS.pending.txt --repo "$GITHUB_REPOSITORY"
+
+      # Each old one removed and its new one renamed to its name: between the two calls the release has no such file, and
+      # that is the only moment it has none. The rename is tried again a few times; if it still fails, running this
+      # workflow again finishes it (it sees the pending file, and only renames).
+      - name: Swap them in
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          SWAP: ${{ needs.pack.outputs.swap }}
+        run: |
+          set -euo pipefail
+          asset_id() { gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE" --jq ".assets[] | select(.name == \"$1\") | .id"; }
+          for name in $SWAP; do
+            case "$name" in
+              latest.json) pending=latest.pending.json ;;
+              SHA256SUMS.txt) pending=SHA256SUMS.pending.txt ;;
+              *) echo "::error::the pack job named $name to swap in, which is not one this workflow replaces"; exit 1 ;;
+            esac
+            new="$(asset_id "$pending")"
+            [ -n "$new" ] || { echo "::error::the release has no $pending to put in place of $name"; exit 1; }
+            old="$(asset_id "$name")"
+            [ -z "$old" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+            renamed=no
+            for wait in 0 2 5 10 20; do
+              sleep "$wait"
+              if gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/assets/$new" -f name="$name" > /dev/null; then renamed=yes; break; fi
+            done
+            [ "$renamed" = yes ] || { echo "::error::$name is not on the release: its new copy is there as $pending. Run this workflow again on $RELEASE, which renames it, or: gh api -X PATCH repos/$GITHUB_REPOSITORY/releases/assets/$new -f name=$name"; exit 1; }
+            echo "$name swapped in"
+          done
+
+      - name: Read it back as a Mac reads it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          MODE: ${{ needs.pack.outputs.mode }}
+        run: |
+          set -euo pipefail
           back="mac-update/back"
           mkdir -p "$back"
-          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D "$back" -p latest.json
-          cmp "$back/latest.json" mac-update/new/latest.json
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D "$back" -p latest.json -p SHA256SUMS.txt
+          if [ "$MODE" = make ]; then
+            cmp "$back/latest.json" mac-update/new/latest.json
+            cmp "$back/SHA256SUMS.txt" mac-update/new/SHA256SUMS.txt
+          fi
           listed="$(node -p 'Object.keys(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).platforms).join(", ")' "$back/latest.json")"
           [[ "$listed" == *darwin-aarch64* ]] || { echo "::error::the feed on the release does not list the Mac: $listed"; exit 1; }
+          feed="$(sha256sum "$back/latest.json" | cut -d' ' -f1)"
+          grep -qxF "$feed  latest.json" "$back/SHA256SUMS.txt" || { echo "::error::SHA256SUMS.txt on the release does not give latest.json its digest ($feed)"; exit 1; }
+          left="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE" --jq '.assets[] | select(.name == "latest.pending.json" or .name == "SHA256SUMS.pending.txt") | .name')"
+          [ -z "$left" ] || { echo "::error::the release still has $left"; exit 1; }
           echo "## The Mac update is on $RELEASE" >> "$GITHUB_STEP_SUMMARY"
-          echo "latest.json lists $listed" >> "$GITHUB_STEP_SUMMARY"
+          echo "latest.json lists $listed$([ "$MODE" = finish ] && echo ' (this run finished the swap an earlier one was cut short in)')" >> "$GITHUB_STEP_SUMMARY"
