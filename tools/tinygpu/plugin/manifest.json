@@ -2,7 +2,7 @@
   "schemaVersion": 4,
   "id": "egpu",
   "name": "eGPU",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "OAIY",
   "description": "An NVIDIA card in a Thunderbolt enclosure for OAIY's engines on a Mac, through tinygrad's TinyGPU driver: its own Python, tinygrad, the card's server and its kernels compiled ahead of time for the RTX 30, 40 and 50 series, so neither Docker nor a compiler is needed. Its setup installs the TinyGPU driver and finds the card; for another card, or a newer model, it sets up NVIDIA's compiler in Docker and makes the kernels.",
   "pluginApiVersion": 1,

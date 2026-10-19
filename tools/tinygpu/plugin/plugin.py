@@ -16,7 +16,8 @@ What takes long runs on a thread of its own, one at a time, and `setup.status` s
 
     connector egpu: card.runtime        -> {python, pythonpath, scripts, kernels, firmware, pack, tinygrad, driver, version}
                     card.status         -> the same, and whether the card can be used ({ready, why, state, detail})
-                    setup.status        -> {driver, card, docker, compiler, pack, missing, job, steps}
+                    setup.status        -> {driver, card, docker, compiler, pack, missing, job, steps, checked}
+                                           ({refresh: true}: the card and Docker looked at again now, not as kept)
                     driver.install      -> TinyGPU.app put in /Applications and its driver asked of macOS (a job)
                     driver.openSettings -> System Settings at Login Items & Extensions, where the driver is allowed
                     docker.download     -> Docker Desktop's download page, in the browser
@@ -28,15 +29,20 @@ What takes long runs on a thread of its own, one at a time, and `setup.status` s
 A card whose architecture the pack has no kernels for (it carries the RTX 30, 40 and 50 series': sm_86, sm_89, sm_120)
 gets them made from the pack's sources (card/kernels/sources.zip) into the card's server's cache, by the compiler: by
 itself, once the compiler is set up and the card is there (a watcher looks every minute), or from the setup.
+
+What the card and Docker were found to be is kept (`Kept`), and kept on disk for the plugin's next start: the page is
+answered at once with the last look, while a newer one runs on a thread of its own. Docker's engine is asked on its own
+socket with a short wait: Docker Desktop open with its engine not answering held each `docker info` for its whole
+8 s, every look.
 """
 from __future__ import annotations
 
-import collections, hashlib, json, os, pathlib, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request, zipfile
+import collections, hashlib, json, os, pathlib, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 CARD = pathlib.Path(__file__).resolve().parent
 ROOT = CARD.parent
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 HOME = pathlib.Path.home()
 # (where OAIY keeps this plugin's own files: what it downloads, never its folder, which is trusted by its digest)
 DATA = pathlib.Path(os.environ.get("OAIY_PLUGIN_DATA_DIR") or HOME / "Library" / "Application Support" / "com.oaiy.app" / "plugin-data" / "egpu")
@@ -97,6 +103,83 @@ def quiet(argv: list, timeout: float, env: dict | None = None) -> subprocess.Com
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError) as e:
         return subprocess.CompletedProcess(argv, 127, "", str(e))
+
+
+KEPT_FILE = DATA / "checks.json"
+
+
+class Kept:
+    """What a slow look found (the card's, system_profiler's; Docker's), kept. A look newer than `fresh` seconds is
+    answered as it is; an older one is answered too, while a new look runs on a thread of its own, so the page never
+    waits on one. With none yet, or asked to look `now`, the look is waited for. `seen` is when it was looked at (the
+    page says how long ago); a look kept from the plugin's last run is answered once, and looked at again."""
+
+    def __init__(self, name: str, fresh: float, look):
+        self.name, self.fresh, self.look = name, fresh, look
+        # (`at` on the monotonic clock, whose start is any: an old look's is -inf, not 0)
+        self.value, self.at, self.seen = None, float("-inf"), None
+        self.lock = threading.Lock()
+        self.looking = None
+
+    def busy(self) -> bool:
+        return self.looking is not None and self.looking.is_alive()
+
+    def stale(self):
+        """Looked at again at its next asking (as that asking is answered): after what may have changed it."""
+        with self.lock:
+            self.at = float("-inf")
+
+    def seed(self, value, seen: float):
+        with self.lock:
+            if self.value is None:
+                self.value, self.at, self.seen = value, float("-inf"), seen
+
+    def _look(self):
+        value = self.look()
+        with self.lock:
+            self.value, self.at, self.seen = value, time.monotonic(), time.time()
+        keep_looks()
+        return value
+
+    def _look_quietly(self):
+        try:
+            self._look()
+        except Exception:  # (the kept look stays; the next asking looks again)
+            pass
+
+    def get(self, now: bool = False):
+        with self.lock:
+            value = self.value
+            if value is not None and not now:
+                if time.monotonic() - self.at >= self.fresh and not self.busy():
+                    self.looking = threading.Thread(target=self._look_quietly, name=f"egpu-look-{self.name}", daemon=True)
+                    self.looking.start()
+                return value
+        return self._look()
+
+
+def keep_looks():
+    """The card's and Docker's last looks, for the plugin's next start (written whole, then put in place)."""
+    try:
+        looks = {k.name: {"value": k.value, "seen": k.seen} for k in (_card, _docker) if k.value is not None}
+        KEPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        part = KEPT_FILE.with_name(f"{KEPT_FILE.name}.{os.getpid()}.{threading.get_ident()}.part")
+        part.write_text(json.dumps(looks))
+        part.replace(KEPT_FILE)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def kept_looks():
+    """The looks kept by the plugin's last run, each answered once (as old) and looked at again."""
+    try:
+        looks = json.loads(KEPT_FILE.read_text())
+    except (OSError, ValueError):
+        return
+    for k in (_card, _docker):
+        look = looks.get(k.name) if isinstance(looks, dict) else None
+        if isinstance(look, dict) and isinstance(look.get("value"), dict) and isinstance(look.get("seen"), (int, float)):
+            k.seed(look["value"], float(look["seen"]))
 
 
 def driver() -> dict:
@@ -160,14 +243,14 @@ def per_card(pack: dict) -> int:
     return pack.get("sources") or pack.get("kernels", 0)
 
 
-_seen_card = [0.0, None]
+def card(now: bool = False) -> dict:
+    """The NVIDIA card macOS sees on the PCI bus, its link, and its architecture by its device id: as kept (`Kept`,
+    10 s fresh: system_profiler can take a second or two), or looked at `now`."""
+    return _card.get(now)
 
 
-def card() -> dict:
-    """The NVIDIA card macOS sees on the PCI bus (system_profiler's, kept 8 s: it takes a second or two), its link,
-    and its architecture by its device id."""
-    if _seen_card[1] is not None and time.monotonic() - _seen_card[0] < 8:
-        return _seen_card[1]
+def look_card() -> dict:
+    """system_profiler's NVIDIA card, its link, and its architecture by its device id."""
     items = []
     def walk(x):
         if isinstance(x, dict):
@@ -204,7 +287,6 @@ def card() -> dict:
             "width": g.get("sppci_link-width", ""),
             "slot": g.get("sppci_slot_name", ""),
         }
-    _seen_card[:] = [time.monotonic(), found]
     return found
 
 
@@ -221,13 +303,81 @@ def docker_env() -> dict:
     return dict(os.environ, PATH=os.pathsep.join([os.environ.get("PATH", "/usr/bin:/bin"), *(d for d in DOCKER_BINS if os.path.isdir(d))]))
 
 
-def docker() -> dict:
+def docker_socket() -> str | None:
+    """The Docker engine's socket, as Docker's own program finds it: DOCKER_HOST, else the context in use (Docker
+    Desktop's desktop-linux: ~/.docker/run/docker.sock), else Docker's own place. None for an engine elsewhere (TCP,
+    SSH), which only Docker's program asks."""
+    host = os.environ.get("DOCKER_HOST")
+    if not host:
+        name = os.environ.get("DOCKER_CONTEXT")
+        if not name:
+            try:
+                name = json.loads((HOME / ".docker" / "config.json").read_text()).get("currentContext")
+            except (OSError, ValueError, AttributeError):
+                name = None
+        if name and name != "default":
+            meta = HOME / ".docker" / "contexts" / "meta" / hashlib.sha256(name.encode()).hexdigest() / "meta.json"
+            try:
+                host = json.loads(meta.read_text())["Endpoints"]["docker"]["Host"]
+            except (OSError, ValueError, KeyError, TypeError):
+                host = None
+    if host:
+        return host[len("unix://"):] if host.startswith("unix://") else None
+    desktop = HOME / ".docker" / "run" / "docker.sock"
+    return str(desktop) if desktop.exists() else "/var/run/docker.sock"
+
+
+def engine(sock: str, path: str) -> int | str | None:
+    """The HTTP status Docker's engine answers `GET path` with, on its socket: "silent" where it took the call and said
+    nothing within a second and a half (Docker Desktop open, its engine not answering), None where nothing listens."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(0.3)
+        s.connect(sock)
+    except OSError:
+        s.close()
+        return None
+    try:
+        s.settimeout(1.5)
+        s.sendall(f"GET {path} HTTP/1.0\r\nHost: docker\r\n\r\n".encode())
+        said = b""
+        while b"\r\n" not in said and len(said) < 4096:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            said += chunk
+    except socket.timeout:
+        return "silent"
+    except OSError:
+        return None
+    finally:
+        s.close()
+    first = said.split(b"\r\n", 1)[0].split()
+    return int(first[1]) if len(first) > 1 and first[1].isdigit() else None
+
+
+def docker(now: bool = False) -> dict:
+    """Docker's engine, and NVIDIA's compiler's image in it: as kept (`Kept`, 15 s fresh), or looked at `now`."""
+    return _docker.get(now)
+
+
+def look_docker() -> dict:
     cli = docker_cli()
-    running = image = False
-    if cli:
+    running = image = stalled = False
+    sock = docker_socket()
+    if sock is not None:
+        ping = engine(sock, "/_ping")
+        running, stalled = ping == 200, ping == "silent"
+        image = running and engine(sock, f"/images/{IMAGE}/json") == 200
+    elif cli:
+        # (an engine elsewhere: Docker's own program asks it)
         running = bool(quiet([cli, "info", "--format", "{{.ServerVersion}}"], 8, docker_env()).stdout.strip())
         image = running and quiet([cli, "image", "inspect", "--format", "{{.Id}}", IMAGE], 8, docker_env()).returncode == 0
-    return {"app": os.path.isdir("/Applications/Docker.app"), "cli": cli, "running": running, "image": image}
+    return {"app": os.path.isdir("/Applications/Docker.app"), "cli": cli, "running": running, "image": image, "stalled": stalled}
+
+
+_card = Kept("card", 10, look_card)
+_docker = Kept("docker", 15, look_docker)
 
 
 CHECKED = DATA / "compiler.json"
@@ -333,6 +483,9 @@ def start(name: str, work) -> dict:
             job.say(f"failed: {e}")
         finally:
             job.finished = time.time()
+            # (what it did is looked at again as the page next asks)
+            _card.stale()
+            _docker.stale()
 
     threading.Thread(target=run, name=f"egpu-{name}", daemon=True).start()
     return {"started": True, "job": job.view()}
@@ -450,12 +603,12 @@ def install_compiler(job: Job):
 
 def docker_running(job: Job):
     """Docker Desktop started where it is not running, and waited for (four minutes at most)."""
-    if docker()["running"]:
+    if docker(now=True)["running"]:
         return
     job.step = "Starting Docker Desktop"
     quiet(["/usr/bin/open", "-a", "Docker"], 20)
     deadline = time.monotonic() + 240
-    while not docker()["running"]:
+    while not docker(now=True)["running"]:
         if time.monotonic() > deadline:
             raise RuntimeError("Docker Desktop did not start in 4 minutes: start it, then try again")
         time.sleep(3)
@@ -475,7 +628,7 @@ def make_kernels(job: Job):
     server's cache (each cubin named as the server names it, its source beside it), where the pack has none for it:
     NVIDIA's compiler set up first where it is not, Docker started where the compiler is its shim. Six at a time (each a
     second or so in Docker); what the cache has already is kept. Recorded for this pack (`made_record`) when all are."""
-    c = card()
+    c = card(now=True)
     pack = runtime()["pack"] or {}
     k = kernels(c, pack)
     arch = k["arch"]
@@ -546,12 +699,14 @@ def watch_once(tried: set) -> bool:
         return False
     pack = runtime()["pack"] or {}
     k = kernels(c, pack)
-    compiler_set_up = find_nvcc() is not None and bool(shutil.which("nvcc") or compiler(docker())["built"])
     key = (k["arch"], pack.get("built"))
-    if k["arch"] and k["inPack"] is False and not k["ready"] and k["canMake"] and compiler_set_up and key not in tried:
-        tried.add(key)
-        return start("kernels", make_kernels)["started"]
-    return False
+    if not (k["arch"] and k["inPack"] is False and not k["ready"] and k["canMake"]) or key in tried:
+        return False
+    # (Docker asked only for a card that needs the compiler: one the pack carries kernels for never does)
+    if find_nvcc() is None or not (shutil.which("nvcc") or compiler(docker())["built"]):
+        return False
+    tried.add(key)
+    return start("kernels", make_kernels)["started"]
 
 
 def watch():
@@ -567,16 +722,24 @@ def watch():
         time.sleep(60)
 
 
-def setup_status() -> dict:
+_looks = ThreadPoolExecutor(max_workers=2, thread_name_prefix="egpu-status")
+
+
+def setup_status(payload: dict | None = None) -> dict:
+    """The setup's parts as kept (the card and Docker looked at again on threads of their own where their looks are
+    old), or, with `refresh`, all looked at now. `checked` says when the oldest look was, and whether newer ones run."""
+    refresh = bool(isinstance(payload, dict) and payload.get("refresh"))
+    # (the two looks side by side: when both wait, the page waits for the slower, not the two)
+    looked_card, looked_docker = _looks.submit(card, refresh), _looks.submit(docker, refresh)
     r = runtime()
-    c = card()
+    c, d = dict(looked_card.result()), looked_docker.result()
     pack = r["pack"] or {}
     k = kernels(c, pack) if c.get("found") else {"arch": recorded_arch(), "inPack": None, "made": None, "ready": False, "sources": per_card(pack), "canMake": False}
     if c.get("found"):
         c["covered"] = k["ready"]
-    d = docker()
     comp = compiler(d)
     job = _job[0].view() if _job[0] is not None else None
+    seen = [k.seen for k in (_card, _docker) if k.seen is not None]
     return {
         "driver": r["driver"],
         "card": c,
@@ -590,6 +753,8 @@ def setup_status() -> dict:
         "version": VERSION,
         # (the wizard's steps: each done when this says so)
         "steps": {"driver": r["driver"]["enabled"], "card": bool(c.get("found") and c.get("up")), "kernels": k["ready"], "compiler": comp["ready"]},
+        # (the oldest look's time, in ms since 1970, and whether newer looks run now)
+        "checked": {"at": round(min(seen) * 1000) if seen else None, "looking": _card.busy() or _docker.busy()},
     }
 
 
@@ -608,20 +773,28 @@ def opened(target: list) -> dict:
     return {"opened": r.returncode == 0, "error": (r.stderr or "").strip() or None}
 
 
+def docker_started() -> dict:
+    said = opened(["-a", "Docker"])
+    _docker.stale()
+    return said
+
+
+# (each given the command's payload, an object or None)
 COMMANDS = {
-    "card.runtime": runtime,
-    "card.status": status,
+    "card.runtime": lambda p: runtime(),
+    "card.status": lambda p: status(),
     "setup.status": setup_status,
-    "driver.install": lambda: start("driver", install_driver),
-    "driver.openSettings": lambda: opened([EXTENSIONS_SETTINGS]),
-    "docker.download": lambda: opened([DOCKER_PAGE]),
-    "docker.start": lambda: opened(["-a", "Docker"]),
-    "compiler.install": lambda: start("compiler", install_compiler),
-    "kernels.make": lambda: start("kernels", make_kernels),
+    "driver.install": lambda p: start("driver", install_driver),
+    "driver.openSettings": lambda p: opened([EXTENSIONS_SETTINGS]),
+    "docker.download": lambda p: opened([DOCKER_PAGE]),
+    "docker.start": lambda p: docker_started(),
+    "compiler.install": lambda p: start("compiler", install_compiler),
+    "kernels.make": lambda p: start("kernels", make_kernels),
 }
 
 
 def main():
+    kept_looks()
     threading.Thread(target=watch, name="egpu-watch", daemon=True).start()
     for line in sys.stdin:
         line = line.strip()
@@ -644,8 +817,9 @@ def main():
         elif method == "connector.request":
             command = params.get("command")
             if command in COMMANDS:
+                payload = params.get("payload")
                 try:
-                    reply(message_id, {"ok": True, "data": COMMANDS[command]()})
+                    reply(message_id, {"ok": True, "data": COMMANDS[command](payload if isinstance(payload, dict) else None)})
                 except Exception as e:
                     reply(message_id, {"ok": False, "error": {"code": "failed", "message": f"{command}: {e}"}})
             else:

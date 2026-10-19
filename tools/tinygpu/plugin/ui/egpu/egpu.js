@@ -192,7 +192,11 @@
     if (k.ready) {
       pill('eg-compiler-pill', 'ok', 'Ready');
       body = '<p>' + (k.native ? 'nvcc is on this Mac\'s PATH.' : 'nvcc in <span class="eg-path">~/.local/bin</span> runs NVIDIA\'s compiler in Docker.') + '</p>';
-      if (!k.native && !d.running) {
+      if (!k.native && d.stalled) {
+        // (open, so Start would do nothing)
+        body += '<p class="eg-hint is-warn">Docker Desktop is open, but its engine is not answering. Quit Docker Desktop and open it again ' +
+          'when a model needs a kernel the plugin does not carry; until then it need not run.</p>';
+      } else if (!k.native && !d.running) {
         body += '<p class="eg-hint is-warn">Docker Desktop is not running now. It only needs to be when a model needs a kernel the plugin does not carry.</p>';
         actions = button('docker.start', 'Start Docker', false);
       }
@@ -204,8 +208,9 @@
       var needed = (s.kernels || {}).inPack === false;
       pill('eg-compiler-pill', job || needed ? 'warn' : '', job ? 'Setting up' : needed ? 'Needed' : 'Optional');
       body = why + '<p>Set up builds tinygrad\'s compiler image in Docker (about 2 GB to download, a few minutes) and puts nvcc in <span class="eg-path">~/.local/bin</span>' +
-        (d.running ? '.' : '. Docker Desktop starts first.') + '</p>';
-      actions = button('compiler.install', job ? 'Setting up…' : 'Set up the compiler', true, !!job) + (d.running ? '' : button('docker.start', 'Start Docker', false));
+        (d.running ? '.' : d.stalled ? '.' : '. Docker Desktop starts first.') + '</p>' +
+        (d.stalled ? '<p class="eg-hint is-warn">Docker Desktop is open, but its engine is not answering: quit Docker Desktop and open it again first.</p>' : '');
+      actions = button('compiler.install', job ? 'Setting up…' : 'Set up the compiler', true, !!job) + (d.running || d.stalled ? '' : button('docker.start', 'Start Docker', false));
     }
     setHtml($('eg-compiler-body'), body);
     setHtml($('eg-compiler-actions'), actions);
@@ -252,6 +257,7 @@
     var steps = s.steps || {};
     var ready = steps.driver && steps.card && steps.kernels;
     pill('eg-overall', ready ? 'ok' : 'warn', ready ? 'Ready' : 'Setup needed');
+    renderChecked(s);
     $('eg-foot').textContent = 'eGPU plugin ' + (s.version || '') + ' · tinygrad ' + String(s.tinygrad || '?').slice(0, 9) + ' · ' +
       ((s.pack || {}).kernels || 0).toLocaleString() + ' kernels each for ' + (((s.pack || {}).archs || []).join(', ') || 'no card');
     if (SETUP && view && !doneSaid && steps[view]) {
@@ -270,13 +276,58 @@
     pill('eg-overall', 'err', 'Not running');
   }
 
+  // ---- when it was looked at, and Refresh --------------------------------------------------------------------------
+  // The plugin keeps its last look at the card and Docker (and keeps it for its next start), and answers with it at
+  // once, looking again on its own where it is old; Refresh has it look at everything now.
+
+  var refreshing = false;
+
+  function ago(ms) {
+    var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 5) return 'just now';
+    if (s < 60) return s + ' s ago';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + ' min ago';
+    var h = Math.floor(m / 60);
+    return h < 24 ? h + ' h ago' : 'on ' + new Date(ms).toLocaleString();
+  }
+
+  function renderChecked(s) {
+    var c = (s && s.checked) || {};
+    // (while Refresh looks, its button says so; this keeps when the shown look was)
+    var text = c.at ? 'Checked ' + ago(c.at) + (c.looking && !refreshing ? ' · updating' : '') : '';
+    if ($('eg-checked').textContent !== text) $('eg-checked').textContent = text;
+  }
+
+  function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    var b = $('eg-refresh');
+    b.disabled = true;
+    b.classList.add('is-busy');
+    b.querySelector('span').textContent = 'Checking…';
+    renderChecked(state);
+    clearTimeout(timer);
+    Promise.resolve(HOST.command('setup.status', { refresh: true }))
+      .then(render, renderError)
+      .then(function () {
+        refreshing = false;
+        b.disabled = false;
+        b.classList.remove('is-busy');
+        b.querySelector('span').textContent = 'Refresh';
+        renderChecked(state);
+        schedule();
+      });
+  }
+
   // ---- polling: every 3 s, every second while a job runs, not while hidden ----------------------------------------
 
   var timer = null;
   var inFlight = false;
 
   function poll() {
-    if (inFlight) return;
+    // (a refresh's answer is the newer: a poll's, kept, could land after it)
+    if (inFlight || refreshing) return;
     inFlight = true;
     Promise.resolve(HOST.command('setup.status'))
       .then(render, renderError)
@@ -309,6 +360,10 @@
   };
 
   document.addEventListener('click', function (ev) {
+    if (ev.target && ev.target.closest && ev.target.closest('#eg-refresh')) {
+      refresh();
+      return;
+    }
     var nav = ev.target && ev.target.closest ? ev.target.closest('button[data-nav]') : null;
     if (nav && typeof HOST.navigate === 'function') {
       Promise.resolve(HOST.navigate(nav.getAttribute('data-nav'))).catch(function () {});

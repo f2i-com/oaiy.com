@@ -137,7 +137,18 @@ done when the plugin's `setup.status` says so (the wizard asks every few seconds
    ended a pack's compiles halfway, every call at once.
 
 What takes long runs on a thread of the plugin's own, one job at a time, and the page shows its step and what it said.
-Nothing is written in the plugin's folder (it is trusted by its digest). Checked on 16 October 2026 on this Mac: the
+Nothing is written in the plugin's folder (it is trusted by its digest).
+
+**Its looks, kept** (0.2.1). The card's look (`system_profiler`) and Docker's are kept, and kept on disk for the
+plugin's next start (`checks.json` in its data folder): `setup.status` answers at once with them, and where one is
+older than 10 s (the card) or 15 s (Docker), or a job has ended since, it is looked at again on a thread of its own, so
+neither the page nor the wizard waits on one. The page says when the shown look was ("Checked 2 min ago · updating"),
+and its **Refresh** has everything looked at now (`setup.status {refresh: true}`, the two looks side by side). Docker's
+engine is asked on its own socket (DOCKER_HOST, else the context in use, else `~/.docker/run/docker.sock`), a third of a
+second to connect and a second and a half to answer; an engine elsewhere (TCP, SSH) is asked by Docker's own program.
+Before, each look ran `docker info`, and Docker Desktop open with its engine not answering held it its whole 8 s, every
+few seconds while the page was open, with the plugin's other commands waiting behind it; the page now opens in about
+20 ms. The watcher no longer asks Docker for a card the pack carries kernels for. Checked on 16 October 2026 on this Mac: the
 compiler's job (Docker started, its image from Docker's cache, the shim, `nvcc --version`) in 6 s; the card's server,
 its PATH `/usr/bin:/bin`, compiled a kernel through the shim; the driver's job, the driver allowed already, changed
 nothing; the page in WebKit, light and dark, in each state and as the wizard's steps. A card's kernels for another

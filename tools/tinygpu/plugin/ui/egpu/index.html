@@ -7,7 +7,16 @@
         NVIDIA's compiler is optional: the plugin already carries the kernels OAIY's models use.
       </p>
     </div>
-    <span class="eg-pill" id="eg-overall"><i></i><b>Checking…</b></span>
+    <div class="eg-head-side">
+      <div class="eg-head-row">
+        <span class="eg-pill" id="eg-overall"><i></i><b>Checking…</b></span>
+        <button type="button" class="eg-button eg-refresh" id="eg-refresh" title="Look at the driver, the card and Docker again now">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          <span>Refresh</span>
+        </button>
+      </div>
+      <span class="eg-checked" id="eg-checked"></span>
+    </div>
   </header>
 
   <section class="eg-card" id="eg-driver" data-view="driver" aria-labelledby="eg-driver-title">

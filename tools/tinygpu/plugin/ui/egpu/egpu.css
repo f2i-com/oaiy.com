@@ -85,6 +85,60 @@ button { font: inherit; cursor: pointer; }
   gap: 16px;
 }
 
+.eg-head-side {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.eg-head-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Refresh: a quiet button beside the overall state, its arrow turning while it looks. */
+.eg-button.eg-refresh {
+  min-height: 30px;
+  gap: 6px;
+  border-color: var(--border);
+  background: transparent;
+  color: var(--muted);
+  padding: 0 10px 0 9px;
+}
+
+.eg-button.eg-refresh:hover:not(:disabled) { color: var(--text); }
+
+.eg-button.eg-refresh:disabled { cursor: progress; opacity: 1; }
+
+.eg-refresh svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.eg-refresh.is-busy svg { animation: eg-turn 0.9s linear infinite; }
+
+@keyframes eg-turn { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .eg-refresh.is-busy svg { animation: none; }
+}
+
+.eg-checked {
+  min-height: 15px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
 .eg-head h1 {
   margin: 0 0 4px;
   font-size: 19px;
@@ -304,6 +358,7 @@ html.eg-setup .eg-step { display: none; }
 
 @media (max-width: 560px) {
   .eg-head { flex-direction: column; }
+  .eg-head-side { align-items: flex-start; }
   .eg-facts { grid-template-columns: 1fr; }
   .eg-facts dt { margin-top: 4px; }
 }
