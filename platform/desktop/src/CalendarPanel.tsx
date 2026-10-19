@@ -30,6 +30,7 @@ import {
 import { refetchRequests, useWaitingRequests } from './calendarRequests';
 import { describeSync } from './syncStatus';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 import { moduleOn, useModules } from './useModules';
 import { useVisiblePoll } from './useVisiblePoll';
 
@@ -261,7 +262,7 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
   };
 
   const remove = async (a: Appointment) => {
-    if (!window.confirm('Delete this appointment? Cancelling it keeps a record; deleting does not.')) return;
+    if (!(await ask('Delete this appointment? Cancelling it keeps a record; deleting does not.'))) return;
     try {
       await calendar.remove(a.id);
       toast.push({ kind: 'success', title: 'Deleted', body: `${a.service || 'Appointment'}, ${sayWhen(a.start)}` });

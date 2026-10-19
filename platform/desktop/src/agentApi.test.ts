@@ -13,6 +13,9 @@ import {
   engineRecommendation,
   logEntries,
   optional,
+  ApiError,
+  isNotFound,
+  statusOf,
   type ControlLogEntry,
   type EngineRecommendation,
 } from './api';
@@ -78,7 +81,7 @@ describe('the control API client', () => {
 
   it('any other failure still throws', async () => {
     routes['GET /api/control/settings'] = { status: 500, body: { error: 'control.json could not be read' } };
-    await expect(control.settings()).rejects.toThrow('500: control.json could not be read');
+    await expect(control.settings()).rejects.toMatchObject({ status: 500, message: 'control.json could not be read' });
   });
 
   it('reads the log newest first, asking for 100 by default', async () => {
@@ -128,6 +131,34 @@ describe('the Agent’s model', () => {
     expect(await optional(Promise.resolve(3))).toBe(3);
     expect(await optional(Promise.reject(new Error('404: gone')))).toBeNull();
     await expect(optional(Promise.reject(new Error('502: upstream')))).rejects.toThrow('502');
+    // (the form request() throws now: the status beside the words, not in them)
+    expect(await optional(Promise.reject(new ApiError(404, 'no such route')))).toBeNull();
+    await expect(optional(Promise.reject(new ApiError(502, 'upstream')))).rejects.toMatchObject({ status: 502, message: 'upstream' });
+  });
+});
+
+describe('an error OAIY answers with', () => {
+  it('says what OAIY said, without its HTTP status, and keeps the status beside it', async () => {
+    routes['GET /api/control/settings'] = { status: 409, body: { error: { code: 'busy', message: 'A restore is waiting for a restart.' } } };
+    const e = await control.settings().catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ApiError);
+    expect((e as ApiError).message).toBe('A restore is waiting for a restart.');
+    expect(statusOf(e)).toBe(409);
+    expect(isNotFound(e)).toBe(false);
+  });
+
+  it('where the body says nothing, says the status’s own words with its number', async () => {
+    routes['GET /api/control/log?limit=100'] = { status: 503 };
+    await expect(control.log()).rejects.toMatchObject({ status: 503, message: 'OAIY answered with an error (503).' });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('busy', { status: 503, statusText: 'Service Unavailable' })));
+    await expect(control.log()).rejects.toMatchObject({ status: 503, message: 'Service Unavailable (503)' });
+  });
+
+  it('tells a 404 in either form, and an error without a status', () => {
+    expect(isNotFound(new ApiError(404, 'no such route'))).toBe(true);
+    expect(isNotFound(new Error('404: Not Found'))).toBe(true);
+    expect(statusOf(new Error('connection refused'))).toBeNull();
+    expect(statusOf('404')).toBeNull();
   });
 });
 

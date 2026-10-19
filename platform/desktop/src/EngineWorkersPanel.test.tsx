@@ -108,4 +108,54 @@ describe('EngineWorkersPanel', () => {
     expect(rows('engine-default')[1].textContent).toContain('offline');
     expect(rows('engine-worker')[0].textContent).toContain('connection refused');
   });
+
+  it.each([
+    ['not_heard', 'Not in effect: Rig has not been heard from since this computer started; this computer’s own model runs meanwhile.'],
+    ['engines_down', 'Not in effect: Rig’s engines are not running; this computer’s own model runs meanwhile.'],
+    ['model_gone', 'Not in effect: Rig no longer has this model; this computer’s own model runs meanwhile.'],
+  ])('says a default the paired computer cannot run now is not in effect (%s), and why', async (waiting, said) => {
+    api.network.status.mockResolvedValue({
+      ...primary,
+      defaults: { image: { id: 'engine:image:node.w1/moss', nodeId: 'w1', nodeName: 'Rig', model: 'moss', inEffect: false, waiting } },
+    });
+    await mount();
+    const picture = rows('engine-default').find((r) => r.textContent?.includes('moss'))!;
+    expect(picture.querySelector('[data-testid="engine-default-waiting"]')?.textContent?.trim()).toBe(said);
+    // (beside the model on its computer too: not a plain "Default")
+    const moss = Array.from(rows('engine-worker')[0].querySelectorAll('.network-model')).find((r) => r.textContent?.includes('moss'))!;
+    expect(moss.querySelector('.engine-default-chip')?.textContent?.trim()).toBe('Default, not in effect');
+    expect(moss.querySelector('.engine-default-chip')?.getAttribute('title')).toBe(said);
+  });
+
+  it('says nothing of the kind for a default in effect', async () => {
+    api.network.status.mockResolvedValue({ ...primary, defaults: { image: { id: 'engine:image:node.w1/moss', nodeId: 'w1', nodeName: 'Rig', model: 'moss', inEffect: true, waiting: null } } });
+    await mount();
+    expect(container.querySelector('[data-testid="engine-default-waiting"]')).toBeNull();
+    expect(container.textContent).not.toContain('no longer has this model');
+    expect(container.querySelector('.network-model.is-default .engine-default-chip')?.textContent?.trim()).toBe('Default');
+  });
+
+  it('cannot make an offline computer’s model the default, and says so', async () => {
+    api.network.status.mockResolvedValue(primary);
+    api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, online: false, lastError: 'connection refused (os error 61)', lastSeenMs: Date.now() - 3 * 3_600_000 }] });
+    await mount();
+    const worker = rows('engine-worker')[0];
+    const make = Array.from(worker.querySelectorAll('button')).filter((b) => b.textContent?.includes('Make default'));
+    expect(make.length).toBeGreaterThan(0);
+    for (const b of make) {
+      expect(b.disabled).toBe(true);
+      expect(b.title).toBe('Rig is offline: it can be made the default once it answers again');
+    }
+    expect(worker.querySelector('.card-warn')?.textContent?.trim()).toBe('connection refused (os error 61). Last heard from 3 h ago.');
+  });
+
+  it('points to “Use this computer’s” to make this computer’s own the default again, and calls the computers paired', async () => {
+    api.network.status.mockResolvedValue(primary);
+    api.network.nodes.mockResolvedValue({ nodes: [] });
+    await mount();
+    expect(container.textContent).toContain('“Use this computer’s”, beside a default, makes this computer’s own the default again.');
+    expect(container.textContent).not.toContain('Choosing a default in the Engines tab');
+    expect(container.textContent).toContain('Paired computers');
+    expect(container.textContent).not.toMatch(/worker/i);
+  });
 });

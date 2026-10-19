@@ -51,7 +51,7 @@ import HoursPanel from './HoursPanel';
 import ContactsPanel from './ContactsPanel';
 import MessagesPanel from './MessagesPanel';
 import RingDialog from './RingDialog';
-import { confirmLeaving, forgetUnsaved, hasUnsaved } from './unsavedChanges';
+import { forgetUnsaved, hasUnsaved, whenLeaving } from './unsavedChanges';
 import { useToastIfAny } from './Toasts';
 import TransfersPanel from './TransfersPanel';
 import { useUnreadMessages } from './unreadMessages';
@@ -168,7 +168,7 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   overview: {
     tab: 'Overview',
     icon: LayoutDashboard,
-    copy: 'Today on this machine: the phone, the model, your appointments, and anything that needs you.',
+    copy: 'Today on this computer: the phone, the model, your appointments, and anything that needs you.',
   },
   agent: {
     tab: 'Agent',
@@ -176,7 +176,7 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
     copy: 'Your projects, and the agent that works in them and answers your texts and calls.',
   },
   flows: { tab: 'Editor', icon: Workflow, copy: 'Build flows, run them, and give the agent new tools.' },
-  runs: { tab: 'Run history', icon: History, copy: 'Every flow this machine has run, and why any of them failed.' },
+  runs: { tab: 'Run history', icon: History, copy: 'Every flow this computer has run, and why any of them failed.' },
   calendar: {
     tab: 'Calendar',
     icon: CalendarDays,
@@ -205,7 +205,7 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   engines: {
     tab: 'Engines',
     icon: Cpu,
-    copy: 'The language, picture, video, speech, music and 3D models this machine runs, and their endpoints.',
+    copy: 'The language, picture, video, speech, music and 3D models this computer runs, and their endpoints.',
   },
   'flow-workers': {
     tab: 'On other computers',
@@ -215,13 +215,13 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   'engine-workers': {
     tab: 'Other computers',
     icon: Network,
-    copy: 'The models of the computers paired over OAIY Network, and which of them this machine uses by default.',
+    copy: 'The models of the computers paired over OAIY Network, and which of them this computer uses by default.',
   },
   models: { tab: 'Model files', icon: Package, copy: 'Download weights from Hugging Face and manage what is on disk.' },
-  services: { tab: 'Services', icon: Server, copy: 'Start, stop and install the local AI services this machine offers OAIY.' },
+  services: { tab: 'Services', icon: Server, copy: 'Start, stop and install the local AI services this computer offers OAIY.' },
   python: { tab: 'Python', icon: HardDrive, copy: 'A bundled Python and reusable venvs, so no system Python is needed.' },
   network: { tab: 'Networking', icon: Network, copy: 'Other OAIY computers on your network: pair them, and use their GPUs and models from here.' },
-  connections: { tab: 'Connections', icon: ShieldCheck, copy: 'Apps and accounts allowed to run flows and call plugins on this machine.' },
+  connections: { tab: 'Connections', icon: ShieldCheck, copy: 'Apps and accounts allowed to run flows and call plugins on this computer.' },
   providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this device.' },
   plugins: { tab: 'Plugins', icon: Puzzle, copy: 'Supervised extensions that add connectors and events to your flows.' },
   settings: { tab: 'Settings', icon: Settings2, copy: 'Updates to OAIY, where it keeps its data and models, and your Hugging Face token.' },
@@ -364,8 +364,8 @@ export default function App() {
   shownView.current = view;
   const setView = useCallback((next: View | ((current: View) => View)) => {
     const to = typeof next === 'function' ? next(shownView.current) : next;
-    if (to !== shownView.current && !confirmLeaving()) return;
-    setViewNow(to);
+    if (to === shownView.current) setViewNow(to);
+    else whenLeaving(() => setViewNow(to));
   }, []);
   /** The phone and the calendar are there while a plugin provides them (Aokie, the AI Receptionist). `null` until known. */
   const modules = useModules();
@@ -381,6 +381,15 @@ export default function App() {
     () => arrangeSections(buildSections([...SECTIONS, SETTINGS], modules?.contributions?.sections, pageTab), modules, MODULE_SECTIONS, SUB_MENU_ORDER),
     [modules],
   );
+  /** The phone's own page, a plugin's (Aokie's, "Phone" under "AI Receptionist"), and where it is in words: where the
+   *  phone's greeting is set (Hours & Services points to it). */
+  const phonePage = useMemo(() => {
+    for (const s of sections) {
+      const t = s.tabs.find((x) => x.page?.module === 'phone');
+      if (t) return { view: t.view, where: s.label.trim() === t.label.trim() ? t.label : `${s.label} → ${t.label}` };
+    }
+    return null;
+  }, [sections]);
   /** The requests waiting to be confirmed: the Calendar's count in the sidebar. */
   const waiting = useWaitingRequests(calendarOn === true);
   /** The messages callers left that nobody has looked at: the Messages page's count. */
@@ -421,12 +430,13 @@ export default function App() {
       onOpenSetup((target) => {
         // (asked before anything changes: a person who stays has nothing of the wizard's set aside for next time; on
         // Setup already, the wizard opens afresh, which is leaving what it holds too)
-        if (!confirmLeaving()) return;
-        setSetupPlugin(target.plugin ?? null);
-        setSetupStep(target.step ?? null);
-        setSetupOpens((n) => n + 1);
-        if (viewRef.current !== 'setup') setSetupReturn(viewRef.current);
-        setView('setup');
+        whenLeaving(() => {
+          setSetupPlugin(target.plugin ?? null);
+          setSetupStep(target.step ?? null);
+          setSetupOpens((n) => n + 1);
+          if (viewRef.current !== 'setup') setSetupReturn(viewRef.current);
+          setView('setup');
+        });
       }),
     [],
   );
@@ -437,9 +447,12 @@ export default function App() {
     () =>
       onNavigate((target) => {
         if (target.kind === 'setup') return openSetup({ plugin: target.pluginId, step: target.stepId });
-        if (target.view !== viewRef.current && !confirmLeaving()) return;
-        if (target.contact) setContactToOpen(target.contact);
-        setView(target.view as View);
+        const go = () => {
+          if (target.contact) setContactToOpen(target.contact);
+          setView(target.view as View);
+        };
+        if (target.view === viewRef.current) go();
+        else whenLeaving(go);
       }),
     [],
   );
@@ -984,7 +997,7 @@ export default function App() {
               />
             )}
             {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}
-            {view === 'hours' && <HoursPanel onOpenCalendar={() => setView('calendar')} />}
+            {view === 'hours' && <HoursPanel onOpenCalendar={() => setView('calendar')} phonePage={phonePage && { where: phonePage.where, open: () => setView(phonePage.view as View) }} />}
             {view === 'contacts' && <ContactsPanel open={contactToOpen} onOpened={() => setContactToOpen(null)} />}
             {view === 'messages' && (
               <MessagesPanel
@@ -1019,7 +1032,7 @@ export default function App() {
           <button
             type="button"
             className="dock-status"
-            title={healthError ?? 'The services this machine runs'}
+            title={healthError ?? 'The services this computer runs'}
             onClick={() => setView('services')}
           >
             <i />

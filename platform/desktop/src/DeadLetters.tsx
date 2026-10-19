@@ -3,6 +3,7 @@ import { ChevronDown, Inbox, Loader2, RotateCw, X } from 'lucide-react';
 import { bridge, type DeadLetter } from './api';
 import { JsonBlock, fullWhen, whenText } from './RunParts';
 import { useVisiblePoll } from './useVisiblePoll';
+import { ask } from './ask';
 
 /**
  * Events that arrived and produced no work.
@@ -84,7 +85,7 @@ export default function DeadLetters() {
   };
 
   const dismiss = async (item: DeadLetter) => {
-    if (!window.confirm(`Dismiss ${item.event}? It is taken off this list and never run.`)) return;
+    if (!(await ask(`Dismiss ${item.event}? It is taken off this list and never run.`))) return;
     mark(item.id, 'dismiss');
     setNote(null);
     try {

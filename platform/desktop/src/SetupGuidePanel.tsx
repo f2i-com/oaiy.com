@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
-import { Check, ChevronRight, CircleDashed, ListChecks, PartyPopper, TriangleAlert, X } from 'lucide-react';
-import { agentPreferences, engines, link } from './api';
+import { Check, ChevronRight, CircleDashed, ListChecks, PartyPopper, ShieldAlert, TriangleAlert, X } from 'lucide-react';
+import { agentPreferences, engines, link, type PluginRecord } from './api';
 import {
   deriveSetupSteps,
   setupComplete,
@@ -52,6 +52,7 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: 
   const known = state.runtime !== null && state.providers !== null && state.services !== null && catalog !== null;
   const failing = setup?.firstRun.finished && known ? checks.filter((s) => !s.done && !s.optional) : [];
   const nudges = pluginsNeedingSetup(state.plugins, setup, live);
+  const untrusted = waitingForTrust(state.plugins);
   const firstRun = unfinished
     ? firstRunSteps({ state: setup, plugins: state.plugins, catalog, guide: state, live, prefs: answered(prefsAnswer, prefsError), linked: linked === true })
     : null;
@@ -62,12 +63,12 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: 
     ? `Continue setup · ${progress!.done} of ${progress!.total}`
     : nudges.length
       ? 'Finish setting up'
-      : failing.length
+      : failing.length || untrusted.length
         ? 'Something needs a look'
         : setup || complete
           ? 'You’re set up'
           : `Getting started · ${guide.done} of ${guide.total}`;
-  const settled = !firstRun && !nudges.length && !failing.length && (setup ? true : complete);
+  const settled = !firstRun && !nudges.length && !failing.length && !untrusted.length && (setup ? true : complete);
 
   return (
     <section className={settled ? 'service-section setup-guide is-complete' : 'service-section setup-guide'}>
@@ -113,6 +114,21 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: 
         </div>
       ))}
 
+      {untrusted.map((p) => (
+        <div key={p.id} className="setup-nudge" data-testid="plugin-waiting-for-trust">
+          <ShieldAlert size={14} aria-hidden />
+          <span>
+            <span>
+              <strong>{p.manifest?.name ?? p.declared?.name ?? p.id}</strong> is waiting for you to trust it
+            </span>
+            <small>It is not signed, so it does not start until you trust it in Plugins.</small>
+          </span>
+          <button className="btn btn-secondary" onClick={() => onNavigate('plugins')}>
+            Open Plugins
+          </button>
+        </div>
+      ))}
+
       {settled && (
         <p className="form-hint">
           <PartyPopper size={13} /> {setup ? 'Setup is finished.' : 'The runtime is ready and your flows have a model.'} Run it again from Settings any time.
@@ -145,6 +161,14 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: 
       </details>
     </section>
   );
+}
+
+/**
+ * The plugins the host holds back until the person trusts them: unsigned, not running (one a developer build lets run
+ * is not waiting), and not turned off by the person.
+ */
+export function waitingForTrust(plugins: PluginRecord[] | null | undefined): PluginRecord[] {
+  return (plugins ?? []).filter((p) => p.trust?.state === 'unsigned' && !p.userDisabled && !['running', 'starting', 'unhealthy'].includes(p.state));
 }
 
 /** One setup check: done, or what is missing and the way to it. */

@@ -20,6 +20,7 @@ import {
 } from './api';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 import ChatGptConnector from './ChatGptConnector';
 
 /**
@@ -278,11 +279,11 @@ export default function AiProvidersPanel() {
     [refresh, toast],
   );
 
-  const removeProvider = (p: AiProviderPublic) => {
+  const removeProvider = async (p: AiProviderPublic) => {
     if (
-      !confirm(
+      !(await ask(
         `Remove the “${p.name}” provider?${p.hasKey ? ' Its stored API key is deleted with it.' : ''}`,
-      )
+      ))
     )
       return;
     // If the form is showing this provider, drop it — otherwise saving would
@@ -291,8 +292,8 @@ export default function AiProvidersPanel() {
     void runAction(p.id, 'remove', () => aiProviders.delete(p.id), `Removed “${p.name}”`);
   };
 
-  const clearKey = (p: AiProviderPublic) => {
-    if (!confirm(`Clear the stored API key for “${p.name}”? You'll have to paste it again.`)) return;
+  const clearKey = async (p: AiProviderPublic) => {
+    if (!(await ask(`Clear the stored API key for “${p.name}”? You'll have to paste it again.`))) return;
     void runAction(p.id, 'clear the key for', () => aiProviders.setKey(p.id, null), `Cleared the key for “${p.name}”`);
   };
 
@@ -540,7 +541,7 @@ export default function AiProvidersPanel() {
                       className="btn btn-ghost"
                       disabled={working}
                       aria-label={`Clear the stored API key for ${p.name}`}
-                      onClick={() => clearKey(p)}
+                      onClick={() => void clearKey(p)}
                     >
                       <X size={14} /> Clear key
                     </button>
@@ -549,7 +550,7 @@ export default function AiProvidersPanel() {
                     className="btn btn-ghost btn-danger"
                     disabled={working}
                     aria-label={`Remove ${p.name}`}
-                    onClick={() => removeProvider(p)}
+                    onClick={() => void removeProvider(p)}
                   >
                     {action === 'remove' ? <Loader2 size={14} className="spin" /> : <Trash2 size={14} />} Remove
                   </button>

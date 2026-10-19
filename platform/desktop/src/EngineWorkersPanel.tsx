@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Check, Laptop, Loader2, Network, RotateCcw, Server, Star, TriangleAlert } from 'lucide-react';
+import { Laptop, Loader2, Network, RotateCcw, Server, Star, TriangleAlert } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { engines, network, type NetworkModel, type NetworkNode, type NetworkStatus } from './api';
-import { Device, KIND, MachineTiles, Queue, STATE, deviceName } from './NetworkPanel';
+import { DefaultChip, Device, KIND, MachineTiles, Queue, STATE, ago, deviceName, notInEffect } from './NetworkPanel';
 
 /**
  * Engines → Other computers: the models of the workers paired over OAIY Network (docs/NETWORK.md), by computer, and
  * which of them is this computer's engine default of its kind in place of its own: what Flows' "Default … model", the
- * engine's chats and the Agent on the model chosen in Engines then use. Choosing a default in the Engines tab makes
- * this computer's own the default again.
+ * engine's chats and the Agent on the model chosen in Engines then use. "Use this computer's", beside a default, makes
+ * this computer's own the default again. A default is not in effect while the paired computer cannot run it (the
+ * desktop says why: not heard from since this computer started, its engines down, the model gone there), and this
+ * computer's own runs meanwhile; a computer that is offline cannot be made the default until it answers again.
  */
 export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetworking: () => void }) {
   const [status, setStatus] = useState<NetworkStatus | null>(null);
@@ -109,7 +111,7 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
         </div>
         <p className="form-hint">
           The model of each kind that Flows’ “Default … model”, the engine’s chats and the Agent (on the model chosen in Engines) use: this computer’s own,
-          or a paired computer’s you choose below. Choosing a default in the Engines tab makes this computer’s own the default again.
+          or a paired computer’s you choose below. “Use this computer’s”, beside a default, makes this computer’s own the default again.
         </p>
         {kinds.length === 0 ? (
           <p className="form-hint">{nodes.length === 0 ? 'A paired computer’s models can be chosen here once one is paired (below).' : 'The paired computers have not said which models they have yet.'}</p>
@@ -120,6 +122,9 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
               const node = d && nodes.find((n) => n.nodeId === d.nodeId);
               // (a worker's language model: whichever it runs now)
               const shown = d && kind === 'llm' ? (node?.models.find((m) => m.kind === 'llm')?.model ?? d.model) : d?.model;
+              // (the desktop says whether it is in effect, and why not; an older one does not, and what is known here is said)
+              const waiting = notInEffect(d, node?.name ?? '');
+              const said = d?.inEffect !== undefined;
               return (
                 <div className="engine-default" key={kind} data-testid="engine-default">
                   <span className="network-kind">{KIND[kind] ?? kind}</span>
@@ -128,12 +133,18 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
                       <Server size={14} aria-hidden />
                       <code>{shown}</code>
                       <span className="network-where">on {d.nodeName || 'a paired computer'}</span>
-                      {node && !node.online && (
+                      {waiting && (
+                        <span className="engine-default-warn" data-testid="engine-default-waiting">
+                          <TriangleAlert size={12} aria-hidden /> {waiting}
+                        </span>
+                      )}
+                      {/* (in effect, its computer offline: what uses it is told so, and nothing runs in its place) */}
+                      {!waiting && node && !node.online && (
                         <span className="engine-default-warn">
                           <TriangleAlert size={12} aria-hidden /> offline: what uses it says so, nothing runs in its place
                         </span>
                       )}
-                      {node?.online && kind !== 'llm' && !node.models.some((m) => m.id === d.id) && (
+                      {!said && node?.online && kind !== 'llm' && !node.models.some((m) => m.id === d.id) && (
                         <span className="engine-default-warn">
                           <TriangleAlert size={12} aria-hidden /> {d.nodeName || 'it'} no longer has this model
                         </span>
@@ -161,9 +172,9 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
       {nodes.length === 0 ? (
         <section className="model-section">
           <div className="section-title-row">
-            <h3 className="section-title">Workers</h3>
+            <h3 className="section-title">Paired computers</h3>
           </div>
-          <p className="form-hint">No worker is paired yet: pair one in Setup → Networking, and its models show here.</p>
+          <p className="form-hint">No computer is paired to be used yet: pair one in Setup → Networking, and its models show here.</p>
           <div className="form-actions">
             <button className="btn btn-secondary" onClick={onOpenNetworking}>
               <Network size={14} aria-hidden /> Open Networking
@@ -178,9 +189,9 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
                 {n.name} <span className={`badge ${n.online ? 'badge-ok' : 'badge-err'}`}>{n.online ? 'Online' : 'Offline'}</span>
               </h3>
             </div>
-            {!n.online && n.lastError && (
+            {!n.online && (n.lastError || n.lastSeenMs) && (
               <div className="card-warn">
-                <TriangleAlert size={13} aria-hidden /> {n.lastError}
+                <TriangleAlert size={13} aria-hidden /> {offlineLine(n)}
               </div>
             )}
             {(n.devices.length > 0 || n.machine) && (
@@ -211,14 +222,16 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
                             {where && n.online && <span className="network-where">on {where}</span>}
                           </span>
                           {chosen ? (
-                            <span className="engine-default-chip">
-                              <Check size={12} aria-hidden /> Default
-                            </span>
+                            <DefaultChip d={defaults[kind]} name={n.name} />
                           ) : (
                             <button
                               className="btn-tiny"
-                              disabled={busy !== null}
-                              title={`Use it for every ${(KIND[kind] ?? kind).toLowerCase()} job that uses the default`}
+                              disabled={busy !== null || !n.online}
+                              title={
+                                n.online
+                                  ? `Use it for every ${(KIND[kind] ?? kind).toLowerCase()} job that uses the default`
+                                  : `${n.name} is offline: it can be made the default once it answers again`
+                              }
                               onClick={() => void choose(kind, m.id)}
                             >
                               {busy === `${kind}:${m.id}` ? <Loader2 size={12} className="spin" aria-hidden /> : <Star size={12} aria-hidden />} Make default
@@ -234,6 +247,13 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
       )}
     </div>
   );
+}
+
+/** Why a paired computer is offline, in a line: what went wrong when it was last asked, and when it last answered. */
+function offlineLine(n: NetworkNode): string {
+  const seen = n.lastSeenMs ? `Last heard from ${ago(n.lastSeenMs)}` : null;
+  const error = n.lastError?.replace(/\.$/, '');
+  return seen && error ? `${error}. ${seen}.` : `${error ?? seen}.`;
 }
 
 /** Kinds as the Engines tab lists them. */

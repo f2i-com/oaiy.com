@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
-import { CalendarClock, Cloud, CloudOff, Cpu, Inbox, Phone } from 'lucide-react';
-import { calendar, engines, link, phone, type Appointment, type CalendarSync, type EnginesStatus, type LinkStatus } from './api';
+import { CalendarClock, Cloud, CloudOff, Cpu, Inbox, Network, Phone } from 'lucide-react';
+import { calendar, engines, link, network, phone, type Appointment, type CalendarSync, type EnginesStatus, type LinkStatus, type NetworkDefault } from './api';
 import { describeSync } from './syncStatus';
 import { moduleOn, useModules } from './useModules';
 
 /**
  * Today, at the top of Overview: whether the phone is connected (and a call
- * live), whether the language model is loaded, the next appointments, the
+ * live), whether the language model is loaded (or which paired computer's it
+ * is, where the engine's default is one's: Engines → Other computers), the next appointments, the
  * requests waiting for someone to confirm them, and, when linked, how this
  * desktop stands with FormLogic (everything here works without it). Each tile
  * opens its page. The phone's tile and the calendar's are there (and asked
@@ -30,9 +31,11 @@ function sayWhen(start: string): { day: string; clock: string } {
   return { day: d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }).replace(',', ''), clock };
 }
 
-export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' | 'calendar' | 'engines' | 'connections') => void }) {
+export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' | 'calendar' | 'engines' | 'engine-workers' | 'connections') => void }) {
   const [phoneState, setPhoneState] = useState<{ connected: boolean; onCall: boolean } | null>(null);
   const [model, setModel] = useState<EnginesStatus | null>(null);
+  /** The engine's default language model where it is a paired computer's, and in effect (OAIY Network). */
+  const [onPaired, setOnPaired] = useState<NetworkDefault | null>(null);
   const [upcoming, setUpcoming] = useState<Appointment[] | null>(null);
   /** The requests waiting to be confirmed: from today on, one earlier today still waiting too (as the sidebar counts them). */
   const [waiting, setWaiting] = useState<Appointment[] | null>(null);
@@ -46,16 +49,20 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
   const refresh = useCallback(async () => {
     const off = Promise.reject(new Error('off'));
     off.catch(() => {});
-    const [p, calls, e, cal, s, l] = await Promise.allSettled([
+    const [p, calls, e, cal, s, l, n] = await Promise.allSettled([
       phoneOn ? phone.status() : off,
       phoneOn ? phone.calls() : off,
       engines.status(),
       calendarOn ? calendar.get(ymd(new Date())) : off,
       calendarOn ? calendar.syncStatus() : off,
       link.status(),
+      // (OAIY Network's status: an older desktop, or a test's, may have none)
+      (async () => network.status())(),
     ]);
     setPhoneState(p.status === 'fulfilled' ? { connected: p.value.connected, onCall: calls.status === 'fulfilled' && calls.value.length > 0 } : null);
     setModel(e.status === 'fulfilled' ? e.value : null);
+    const llm = n.status === 'fulfilled' && n.value?.uses ? n.value.defaults?.llm : undefined;
+    setOnPaired(llm && llm.inEffect !== false ? llm : null);
     if (cal.status === 'fulfilled') {
       const now = `${ymd(new Date())}T${pad(new Date().getHours())}:${pad(new Date().getMinutes())}`;
       setUpcoming(cal.value.appointments.filter((a) => (a.status === 'confirmed' || a.status === 'requested') && a.start >= now));
@@ -93,11 +100,23 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
             <small>The phone</small>
           </button>
         )}
-        <button className="overview-tile" onClick={() => onNavigate('engines')} title={llm?.resident ? `${llm.resident}: ${llm.state}` : 'The engines'}>
-          <Cpu size={16} aria-hidden />
-          <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
-          <small>{llm?.resident ?? 'Language model'}</small>
-        </button>
+        {onPaired ? (
+          <button
+            className="overview-tile"
+            onClick={() => onNavigate('engine-workers')}
+            title={`The engine’s default language model is ${onPaired.model} on ${onPaired.nodeName} (Engines → Other computers)`}
+          >
+            <Network size={16} aria-hidden />
+            <strong>On {onPaired.nodeName || 'a paired computer'}</strong>
+            <small>{onPaired.model} · paired computer</small>
+          </button>
+        ) : (
+          <button className="overview-tile" onClick={() => onNavigate('engines')} title={llm?.resident ? `${llm.resident}: ${llm.state}` : 'The engines'}>
+            <Cpu size={16} aria-hidden />
+            <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
+            <small>{llm?.resident ?? 'Language model'}</small>
+          </button>
+        )}
         {calendarOn && (
           <>
             <button className="overview-tile" onClick={() => onNavigate('calendar')} title="The next appointment">

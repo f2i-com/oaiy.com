@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { ask } from './ask';
 
 /**
  * Pages with changes not saved yet: a page says so while its form differs from what is saved (and that it has none
@@ -28,12 +29,23 @@ export function forgetUnsaved(): void {
 }
 
 /** Whether to leave: yes where nothing is unsaved, else as the person answers (and what was unsaved is forgotten then). */
-export function confirmLeaving(): boolean {
+export async function confirmLeaving(): Promise<boolean> {
   const what = hasUnsaved();
   if (!what) return true;
-  if (!window.confirm(`Leave without saving ${what}? Your changes are not saved yet.`)) return false;
+  if (!(await ask(`Leave without saving ${what}? Your changes are not saved yet.`))) return false;
   unsaved.clear();
   return true;
+}
+
+/** Do `leave` at once where nothing is unsaved, else once the person says to leave without saving (and not otherwise). */
+export function whenLeaving(leave: () => void): void {
+  if (!hasUnsaved()) {
+    leave();
+    return;
+  }
+  void confirmLeaving().then((yes) => {
+    if (yes) leave();
+  });
 }
 
 /** A page's form, said unsaved while `dirty`, and saved when the page goes (its changes go with it). */

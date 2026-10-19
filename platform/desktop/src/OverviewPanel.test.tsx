@@ -235,7 +235,7 @@ describe('OverviewPanel failure reporting', () => {
       },
     });
     await mount();
-    expect(text()).toContain('Flows cannot run on this machine');
+    expect(text()).toContain('Flows cannot run on this computer');
     expect(text()).toContain('zipp_wasm_bg.wasm is missing');
     expect(text()).toContain('Reinstall OAIY Desktop');
   });
@@ -258,7 +258,7 @@ describe('OverviewPanel failure reporting', () => {
     dismissGuide();
     await mount();
     // A permanent "0 failed" line is noise that trains people to ignore the row.
-    expect(text()).not.toContain('failed on this machine');
+    expect(text()).not.toContain('failed on this computer');
   });
 
   it('uses singular wording for one failure', async () => {
@@ -273,7 +273,7 @@ describe('OverviewPanel failure reporting', () => {
     await mount();
     await act(async () => button('See why')!.click());
     expect(onNavigate).toHaveBeenCalledWith('runs');
-    expect(text()).not.toContain('failed on this machine');
+    expect(text()).not.toContain('failed on this computer');
     // Seen across visits: a run failed since is what it says.
     act(() => root.unmount());
     root = createRoot(host);
@@ -301,7 +301,7 @@ describe('OverviewPanel failure reporting', () => {
     statusMock.mockResolvedValue({ ...runtime(5), runs: { queued: 0, known: 10, failed: 5, lastFailedAt: '2026-10-18T09:30:00.000Z' } });
     await mount();
     expect(text()).not.toContain('failed since');
-    expect(text()).not.toContain('failed on this machine');
+    expect(text()).not.toContain('failed on this computer');
 
     // A newer one, with the count to say how many.
     act(() => root.unmount());
@@ -526,7 +526,12 @@ describe('the Overview line about backups', () => {
     backupStatusMock.mockResolvedValue(backupStatus({ lastBackupAt: new Date(Date.now() - 3 * 86_400_000).toISOString() }));
     await mount();
     expect(text()).toContain('Last backup: 3 days ago');
+    // (asking Settings for its backup section first: it scrolls there and puts the cursor in the passphrase, BackupPanel.test)
+    const asked = vi.fn();
+    window.addEventListener('oaiy:backup-asked', asked);
     await act(async () => button('Back up')!.click());
+    window.removeEventListener('oaiy:backup-asked', asked);
+    expect(asked).toHaveBeenCalledTimes(1);
     expect(onNavigate).toHaveBeenCalledWith('settings');
   });
 
@@ -557,7 +562,36 @@ describe('the Overview line about backups', () => {
     await mount();
     expect(backupStatusMock).toHaveBeenCalled();
     expect(text()).not.toContain('backup');
-    expect(text()).toContain('This machine');
+    expect(text()).toContain('This computer');
+  });
+});
+
+describe('the Overview on a fresh install, and with a plugin waiting to be trusted', () => {
+  it('says “None yet” rather than 0/0 where nothing is installed', async () => {
+    dismissGuide();
+    providersMock.mockResolvedValue({ providers: [] });
+    await mount();
+    const tiles = Array.from(host.querySelectorAll('.overview-tile')).map((t) => t.textContent);
+    expect(tiles).toContain('None yetServices');
+    expect(tiles).toContain('None yetPlugins');
+    expect(tiles).toContain('None yetAI providers');
+    expect(text()).not.toContain('0/0');
+  });
+
+  it('says a plugin waits to be trusted, under Next steps, with the way to Plugins', async () => {
+    dismissGuide();
+    pluginsMock.mockResolvedValue({
+      plugins: [
+        { id: 'egpu', state: 'installed', dir: 'x', userDisabled: false, restartAttempts: 0, manifest: { name: 'eGPU', version: '0.2.0' }, trust: { state: 'unsigned' } },
+      ],
+    });
+    await mount();
+    const row = host.querySelector('[data-testid="plugin-waiting-for-trust"]')!;
+    expect(row.textContent).toContain('eGPU is waiting for you to trust it');
+    // (not "No plugin is running — Start one": it cannot be started yet)
+    expect(text()).not.toContain('Start one');
+    await act(async () => (row.querySelector('button') as HTMLButtonElement).click());
+    expect(onNavigate).toHaveBeenCalledWith('plugins');
   });
 });
 

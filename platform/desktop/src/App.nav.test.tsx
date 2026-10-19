@@ -257,6 +257,35 @@ describe('the AI Receptionist’s sub-menu', () => {
     expect(text()).toContain('Plugin screen receptionist');
   });
 
+  it('points Hours & Services to the phone’s own page for its greeting, by where it is in the sidebar', async () => {
+    await go('hours');
+    expect(text()).toContain('set on AI Receptionist → Phone, in its Settings tab (Greeting & brief)');
+    const open = Array.from(host.querySelectorAll('button')).find((b) => b.textContent === 'Open AI Receptionist → Phone')!;
+    await act(async () => open.click());
+    await settle();
+    expect(title()).toBe('Phone');
+    expect(text()).toContain('Plugin screen receptionist');
+  });
+
+  it('asks before leaving a page with changes not saved, and stays on a no (the answer is awaited)', async () => {
+    const { markUnsaved, forgetUnsaved } = await import('./unsavedChanges');
+    await go('hours');
+    markUnsaved('hours-test', true, 'the business hours');
+    const confirm = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirm);
+    try {
+      await go('calendar');
+      expect(confirm).toHaveBeenCalledWith('Leave without saving the business hours? Your changes are not saved yet.');
+      expect(title()).toBe('Hours & Services');
+      confirm.mockReturnValue(true);
+      await go('calendar');
+      expect(title()).toBe('Calendar');
+    } finally {
+      forgetUnsaved();
+      vi.stubGlobal('confirm', () => true);
+    }
+  });
+
   it('lands `contacts` on Contacts, and the Agent’s contact key opens that person', async () => {
     await go('contacts');
     expect(title()).toBe('Contacts');

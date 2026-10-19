@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { Bot, Check, Cpu, MessageSquare, Plug, Puzzle, ShieldCheck, Sparkles, TriangleAlert } from 'lucide-react';
 import { AgentProviderPicker, type ProviderPick } from './AgentProviderPicker';
 import ChatGptConnector from './ChatGptConnector';
-import { bridge, nodeRuntime, type AgentModelSource, type CodexStatus, type EngineCatalog, type EngineRecommendation } from './api';
+import { bridge, nodeRuntime, type AgentModelSource, type AgentPreferences, type CodexStatus, type EngineCatalog, type EngineRecommendation } from './api';
 import { AgentMaySwitch, type ControlSwitch } from './AgentAccess';
 import { aiChoices, localModelLine, type FirstRunStep, type ModelLine } from './setupFlow';
 import { EngineModelCard, errorText, StepHeader, usePoll } from './SetupParts';
@@ -77,6 +77,30 @@ export function WelcomeStep({ kicker }: { kicker: string }) {
       </p>
     </div>
   );
+}
+
+/** The engine's default language model where it is a paired computer's (OAIY Network): which, and on which computer. */
+export interface PairedModel {
+  id: string;
+  model: string;
+  computer: string;
+}
+
+/**
+ * The paired computer's language model the Agent runs on, where it is on the engine with no model of its own named and
+ * the engine's default is a paired computer's (the desktop says which, beside the preference); null otherwise.
+ */
+export function pairedDefault(prefs: AgentPreferences | null | undefined): PairedModel | null {
+  if (!prefs?.engineDefault || prefs.model.source !== 'engine' || prefs.model.model) return null;
+  const id = prefs.engineDefault;
+  // (`engine:llm:node.<nodeId>/<model>`: the model is what follows the computer's id)
+  const slash = id.indexOf('/');
+  return { id, model: slash >= 0 ? id.slice(slash + 1) : id, computer: prefs.engineDefaultName || 'a paired computer' };
+}
+
+/** That model, in a line. */
+export function pairedModelText(p: PairedModel): string {
+  return `Uses ${p.model} on ${p.computer} (Engines → Other computers).`;
 }
 
 /** The local model, in a line: what Engines has chosen, or the catalog's recommended one. */

@@ -51,4 +51,29 @@ describe('RemoteServices', () => {
     await mount();
     expect(container.textContent).toBe('');
   });
+
+  it('keeps a service in use on a computer not heard from since this one started, with the way back to this computer’s own', async () => {
+    // (as the desktop lists it: in use here, not heard of since it started)
+    api.network.status.mockResolvedValue({ enabled: true, role: 'primary', uses: true, services: { 'oaiy-voice': { nodeId: 'w1', nodeName: 'Rig', heard: false, online: false } } });
+    api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, online: false, services: [{ id: 'oaiy-voice', name: 'OAIY Voice', installed: false, status: null, heard: false }] }] });
+    api.network.useService.mockResolvedValue({ enabled: true, role: 'primary', uses: true, services: {} });
+    await mount();
+    const row = container.querySelector('[data-testid="remote-service"]')!;
+    expect(row.textContent).toContain('Not heard from yet');
+    expect(row.textContent).toContain('In use here');
+    expect(row.textContent).toContain('Rig has not been heard from since this computer started.');
+    await act(async () => button('Use this computer').click());
+    expect(api.network.useService).toHaveBeenCalledWith('oaiy-voice', null);
+  });
+
+  it('keeps one in use on a computer that lists no services at all (an older desktop’s answer)', async () => {
+    api.network.status.mockResolvedValue({ enabled: true, role: 'primary', uses: true, services: { 'oaiy-voice': { nodeId: 'w1', nodeName: 'Rig' } } });
+    api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, online: false, services: [] }] });
+    await mount();
+    const row = container.querySelector('[data-testid="remote-service"]')!;
+    expect(row.textContent).toContain('OAIY Voice');
+    expect(row.textContent).toContain('on Rig');
+    expect(row.textContent).toContain('Offline');
+    expect(button('Use this computer')).toBeTruthy();
+  });
 });

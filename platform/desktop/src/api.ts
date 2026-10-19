@@ -13,6 +13,32 @@ import { desktopLaunch } from './nativeLaunch';
 export const DESKTOP_LAUNCH = desktopLaunch(typeof window === 'undefined' ? undefined : window);
 export const API_BASE = DESKTOP_LAUNCH.apiBase;
 
+/**
+ * A request OAIY answered with an error: its message is what OAIY said, in words for a person (shown as it is), and
+ * the HTTP status is kept beside it for the code that tells a missing route (404) or a refusal (409) from the rest.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+/** What OAIY said when the body says nothing: the status's own words, with its number. */
+const statusWords = (resp: Response) => (resp.statusText ? `${resp.statusText} (${resp.status})` : `OAIY answered with an error (${resp.status}).`);
+
+/**
+ * An error's HTTP status: an `ApiError`'s, or the number at the start of a message in the older form ("404: …", as a
+ * test or a caller of its own may still throw); null where it has none.
+ */
+export function statusOf(e: unknown): number | null {
+  if (e instanceof ApiError) return e.status;
+  const m = e instanceof Error ? /^(\d{3}): /.exec(e.message) : null;
+  return m ? Number(m[1]) : null;
+}
+
 async function request<T>(
   path: string,
   init?: RequestInit,
@@ -30,12 +56,12 @@ async function request<T>(
       signal: ac.signal,
     }).catch((e: unknown) => {
       // (the 15 s bound: said as what happened, not as the browser's "signal is aborted without reason")
-      if (ac.signal.aborted) throw new Error(`504: OAIY did not answer within ${Math.round(waitMs / 1000)} seconds. It may be busy: try again in a moment.`);
+      if (ac.signal.aborted) throw new ApiError(504, `OAIY did not answer within ${Math.round(waitMs / 1000)} seconds. It may be busy: try again in a moment.`);
       throw e;
     });
     if (!resp.ok) {
       // Try to surface the API's error message — falls back to status text.
-      let detail = resp.statusText;
+      let detail = statusWords(resp);
       try {
         const body = await resp.json();
         // Two error shapes in this API: the plain `{ error: "msg" }` the
@@ -46,7 +72,7 @@ async function request<T>(
       } catch {
         /* not JSON — ignore */
       }
-      throw new Error(`${resp.status}: ${detail}`);
+      throw new ApiError(resp.status, detail);
     }
     // Empty body → no JSON to parse. Covers 204 No Content AND 202 Accepted
     // (fire-and-forget endpoints like /api/python/install return an empty
@@ -624,7 +650,7 @@ export const modules = {
         signal: ac.signal,
       });
       if (resp.status === 304) return null;
-      if (!resp.ok) throw new Error(`${resp.status}: ${resp.statusText}`);
+      if (!resp.ok) throw new ApiError(resp.status, statusWords(resp));
       return { snapshot: (await resp.json()) as ModulesSnapshot, etag: resp.headers.get('ETag') };
     } finally {
       clearTimeout(timer);
@@ -904,7 +930,17 @@ export const plugins = {
    *  `setup` is there when the plugin declares a setup wizard; `trust` is what its
    *  package was found to be (a signed package that fails is not installed at all). */
   install: (source: string) =>
-    request<{ id: string; name: string; version: string; replaced: boolean; trust?: PackageTrust; setup?: { version: number; title: string } }>(
+    request<{
+      id: string;
+      name: string;
+      version: string;
+      replaced: boolean;
+      trust?: PackageTrust;
+      setup?: { version: number; title: string };
+      /** An update of a plugin that was running: started again, or not, and why not (the new package not trusted, say). */
+      restarted?: boolean;
+      notRestarted?: string;
+    }>(
       '/api/plugins/install',
       { method: 'POST', body: JSON.stringify({ source }) },
     ),
@@ -1274,12 +1310,18 @@ export interface UpdateStatus {
   notes: string | null;
   publishedAt: string | null;
   lastCheckedAt: string | null;
-  /** The last thing that went wrong, in words for a person. */
+  /** The last thing that went wrong, in words for a person. An install that failed and changed nothing keeps its
+   *  download: `ready` again, with this error and `failedDuring: 'install'`. */
   error: string | null;
   failedDuring: 'check' | 'download' | 'install' | null;
   progress: { downloaded: number; total: number | null } | null;
-  /** Something to say beside the state (no release for this platform, say). */
+  /** Something to say beside the state: no release for this platform, a Mac's update not out yet, a newer release whose
+   *  update for this computer is not out while the one downloaded can be installed, a local build not offered its own
+   *  release (beside `upToDate`). */
   note: string | null;
+  /** The page the note sends a person to (the releases page, where a Mac's disk image is); null where the note asks
+   *  nothing to be done there (a local build's), or there is no note. */
+  noteLink?: string | null;
   /** This copy can download and install an update itself. */
   canAutoUpdate: boolean;
   /** When it cannot, why. */
@@ -1830,7 +1872,7 @@ export const voices = {
       });
       if (!resp.ok) {
         const body = await resp.json().catch(() => null);
-        throw new Error(body?.error?.message ?? `${resp.status}: ${resp.statusText}`);
+        throw new ApiError(resp.status, body?.error?.message ?? statusWords(resp));
       }
       return await resp.blob();
     } finally {
@@ -1937,7 +1979,7 @@ export const contacts = {
       const resp = await fetch(`${API_BASE}/api/contacts/export.csv`, { signal: ac.signal });
       if (!resp.ok) {
         const body = await resp.json().catch(() => null);
-        throw new Error(`${resp.status}: ${body?.error?.message ?? resp.statusText}`);
+        throw new ApiError(resp.status, body?.error?.message ?? statusWords(resp));
       }
       return new Blob([await resp.arrayBuffer()], { type: 'text/csv;charset=utf-8' });
     } finally {
@@ -2290,8 +2332,9 @@ export interface NetworkStatus {
   online?: number;
   /** A primary's pairings in progress (the code it is showing), so a page opened again shows them. */
   pairings?: NetworkPairing[];
-  /** A primary's services used on a worker in place of its own (`oaiy-voice`), by service. */
-  services?: Record<string, { nodeId: string; nodeName: string }>;
+  /** A primary's services used on a worker in place of its own (`oaiy-voice`), by service: `heard: false` while that
+   *  computer has not been heard from since this one started (a desktop older than the field leaves it out). */
+  services?: Record<string, { nodeId: string; nodeName: string; heard?: boolean; online?: boolean }>;
 }
 
 /** A flow a worker shares (Let apps run it there), run there from this computer. */
@@ -2341,7 +2384,10 @@ export interface NetworkService {
   id: string;
   name: string;
   installed: boolean;
-  status: string;
+  /** Running, stopped…, as it last said (null for one in use here that it has not listed since this computer started). */
+  status: string | null;
+  /** Listed by that computer since this one started; false for one in use here it has not been heard from about. */
+  heard?: boolean;
 }
 
 /** A paired worker's model chosen as this computer's engine default of its kind (Engines → Other computers). */
@@ -2353,6 +2399,11 @@ export interface NetworkDefault {
   model: string;
   /** This computer's own default of the kind when it was chosen (one chosen in Engines since takes its place again). */
   insteadOf?: string | null;
+  /** Whether it is in effect now: false while the paired computer cannot run it, and this computer's own runs meanwhile
+   *  (a desktop older than this field leaves it out). */
+  inEffect?: boolean;
+  /** Why it is not in effect: not heard from since this computer started, its engines down, or the model gone there. */
+  waiting?: 'not_heard' | 'engines_down' | 'model_gone' | null;
 }
 
 export interface NetworkFound {
@@ -2454,7 +2505,14 @@ export const network = {
    * the same code, `accept`, and only with `true` is it paired here too).
    */
   confirmPairing: (pairingId: string, accept?: boolean, bothWays?: boolean) =>
-    request<{ status: 'pending' | 'approved_there' | 'approved' | 'denied' | 'declined' | 'expired'; code?: string; node?: NetworkNode }>(
+    request<{
+      status: 'pending' | 'approved_there' | 'approved' | 'denied' | 'declined' | 'expired';
+      code?: string;
+      node?: NetworkNode;
+      /** Asked for both ways: whether the other computer may use this one too now, and why not where it may not. */
+      bothWays?: boolean;
+      bothWaysError?: string | null;
+    }>(
       '/api/network/pairings/confirm',
       { method: 'POST', body: JSON.stringify(accept === undefined ? { pairingId } : { pairingId, accept, ...(bothWays ? { bothWays } : {}) }) },
     ),
@@ -2493,7 +2551,7 @@ export const network = {
   picture: async (address: string): Promise<Blob> => {
     const path = new URL(address, API_BASE).pathname;
     const resp = await fetch(`${API_BASE}${path}`);
-    if (!resp.ok) throw new Error(`${resp.status}: ${resp.statusText}`);
+    if (!resp.ok) throw new ApiError(resp.status, statusWords(resp));
     return resp.blob();
   },
 };
@@ -2607,7 +2665,7 @@ export function openFlowInEditor(flowId: string): Promise<void> {
 
 /** A 404 from `request()`: a route this desktop does not have (an older desktop). */
 export function isNotFound(e: unknown): boolean {
-  return e instanceof Error && /^404: /.test(e.message);
+  return statusOf(e) === 404;
 }
 
 /** A route this desktop may not have yet: `null` on a 404, its answer otherwise (any other failure still throws). */
@@ -2680,6 +2738,11 @@ export interface AgentPreferences {
   model: AgentModelPreference;
   /** The provider's name, beside a `provider` choice (the desktop's answer only). */
   providerName?: string;
+  /** On the engine with no model named, where the engine's default language model is a paired computer's (OAIY
+   *  Network, Engines → Other computers): its id (`engine:llm:node.<nodeId>/<model>`), which the Agent runs on as the
+   *  engine's chats do, and that computer's name (the desktop's answer only). */
+  engineDefault?: string;
+  engineDefaultName?: string;
 }
 
 export const agentPreferences = {

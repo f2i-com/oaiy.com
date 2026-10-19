@@ -239,6 +239,33 @@ describe('restarting for a new data folder', () => {
     expect(button('Restart now')?.disabled).toBe(true);
   });
 
+  it('restarts only on a yes (the question is awaited, not taken as one)', async () => {
+    h.appConfigGet.mockResolvedValue(pending);
+    h.restart.mockResolvedValue(undefined);
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    await mount();
+    await settle();
+    await act(async () => {
+      button('Restart now')!.click();
+    });
+    await settle();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(h.restart).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+
+  it('writes its path examples as this system does, not Windows drive letters everywhere', async () => {
+    const { pathExamples } = await import('./platform');
+    h.appConfigGet.mockResolvedValue(pending);
+    await mount();
+    await settle();
+    const placeholders = Array.from(host.querySelectorAll<HTMLInputElement>('.folder-change input')).map((i) => i.placeholder);
+    const ex = pathExamples();
+    expect(placeholders).toEqual([`Paste a path, e.g. ${ex.data}`, `Paste a path, e.g. ${ex.models}`, `Paste a path, e.g. ${ex.extra}`]);
+    // (jsdom names no Windows: no drive letter)
+    expect(placeholders.join(' ')).not.toMatch(/[A-Z]:\\/);
+  });
+
   it('says why a restart has to wait', async () => {
     h.appConfigGet.mockResolvedValue(pending);
     h.restart.mockRejectedValue(new Error('Restarting has to wait. A phone call is live. Try again when it is finished.'));

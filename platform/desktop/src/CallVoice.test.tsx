@@ -222,7 +222,9 @@ describe('the greeting a voice says', () => {
 
   it('is the phone’s greeting, and the page says where it is set', async () => {
     expect(await heard()).toBe('Green Lawns, Aokie speaking.');
-    expect(text()).toContain('set in the Phone section under Settings, Greeting & brief');
+    // (where the phone's page is not known here, said in words: the page with it says where, CallVoice's own test below)
+    expect(text()).toContain('set on the phone’s own page, in its Settings tab (Greeting & brief)');
+    expect(text()).not.toContain('Phone section under Settings');
     // (no greeting box here: one place sets it)
     expect(host.querySelector('#call-greeting')).toBeNull();
   });
@@ -277,5 +279,47 @@ describe('hearing a voice', () => {
     act(() => root.unmount());
     root = createRoot(host);
     vi.restoreAllMocks();
+  });
+});
+
+describe('where the greeting is set, and a voice’s name', () => {
+  it('names the phone’s own page, and opens it', async () => {
+    const open = vi.fn();
+    await act(async () =>
+      root.render(
+        <ToastProvider>
+          <CallVoice phonePage={{ where: 'AI Receptionist → Phone', open }} />
+        </ToastProvider>,
+      ),
+    );
+    await act(async () => {});
+    expect(text()).toContain('set on AI Receptionist → Phone, in its Settings tab (Greeting & brief)');
+    const link = [...host.querySelectorAll('button')].find((b) => b.textContent === 'Open AI Receptionist → Phone')!;
+    await act(async () => link.click());
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it('will not add a voice named as another computer’s copies are (“from-…”), and says why', async () => {
+    await mount();
+    const nameBox = [...host.querySelectorAll('input')].find((i) => i.placeholder === 'Front desk')!;
+    const add = () => [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Add and use it'))!;
+    const fileBox = host.querySelector<HTMLInputElement>('input[type="file"]')!;
+    Object.defineProperty(fileBox, 'files', { value: [new File(['RIFF'], 'clip.wav', { type: 'audio/wav' })], configurable: true });
+    await act(async () => fileBox.dispatchEvent(new Event('change', { bubbles: true })));
+    expect(add().disabled).toBe(false);
+    for (const name of ['from-office', 'From london office']) {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(nameBox, name);
+        nameBox.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      expect(add().disabled).toBe(true);
+      expect(text()).toContain('A name beginning with “from-” is how copies of another computer’s voices are named here');
+    }
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(nameBox, 'Calls from London');
+      nameBox.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(add().disabled).toBe(false);
+    expect(text()).not.toContain('beginning with “from-”');
   });
 });

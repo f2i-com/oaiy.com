@@ -11,10 +11,15 @@ import {
 } from './api';
 import { FolderOpen, FolderSearch, ListChecks, RotateCcw, X } from 'lucide-react';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 import UpdatesSection from './UpdatesSection';
 
 import { BackupSection } from './BackupPanel';
+import { pathExamples } from './platform';
 import { forgetGuideDismissal, openSetup, setSetupState, useSetupState } from './useSetupState';
+
+/** The path boxes' examples, as this system writes a path: a drive letter on Windows, a volume on a Mac. */
+const EXAMPLE = pathExamples();
 
 /**
  * Changing a folder, in one row: paste a path and use it, or choose one.
@@ -322,8 +327,8 @@ export default function SettingsPanel() {
   }, [watchMigration]);
 
   // Restart, saying why where it has to wait (a call, the data folder still being copied or moved).
-  const restartNow = () => {
-    if (!confirm('Restart now? Any running services and in-progress downloads will be stopped.')) return;
+  const restartNow = async () => {
+    if (!(await ask('Restart now? Any running services and in-progress downloads will be stopped.'))) return;
     appConfig.restart().catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
   };
 
@@ -535,7 +540,7 @@ export default function SettingsPanel() {
                 <br />
                 Restart OAIY to start using the new folder.
                 <div className="form-actions" style={{ marginTop: 8 }}>
-                  <button className="btn btn-primary" disabled={!!mig?.running} title={mig?.running ? 'Wait for the copy or move to finish' : undefined} onClick={restartNow}>
+                  <button className="btn btn-primary" disabled={!!mig?.running} title={mig?.running ? 'Wait for the copy or move to finish' : undefined} onClick={() => void restartNow()}>
                     Restart now
                   </button>
                 </div>
@@ -556,7 +561,7 @@ export default function SettingsPanel() {
 
         <FolderChange
           label="Use another folder"
-          placeholder="Paste a path, e.g. D:\OAIY"
+          placeholder={`Paste a path, e.g. ${EXAMPLE.data}`}
           value={manualPath}
           busy={busy}
           setLabel="Use this path"
@@ -657,7 +662,7 @@ export default function SettingsPanel() {
           installer's <code className="path-code">OAIY_MODELS_DIR</code> points
           here too. Defaults to a <code className="path-code">models</code>{' '}
           subfolder of the data folder; point it at a big drive (e.g.{' '}
-          <code className="path-code">E:\models</code>) to keep your library
+          <code className="path-code">{EXAMPLE.models}</code>) to keep your library
           separate. Files already on disk are reused, not re-downloaded.
         </p>
 
@@ -683,7 +688,7 @@ export default function SettingsPanel() {
                 <br />
                 Restart OAIY to start saving models there.
                 <div className="form-actions" style={{ marginTop: 8 }}>
-                  <button className="btn btn-primary" disabled={!!mig?.running} title={mig?.running ? 'Wait for the copy or move to finish' : undefined} onClick={restartNow}>
+                  <button className="btn btn-primary" disabled={!!mig?.running} title={mig?.running ? 'Wait for the copy or move to finish' : undefined} onClick={() => void restartNow()}>
                     Restart now
                   </button>
                 </div>
@@ -703,7 +708,7 @@ export default function SettingsPanel() {
 
         <FolderChange
           label="Use another folder"
-          placeholder="Paste a path, e.g. E:\models"
+          placeholder={`Paste a path, e.g. ${EXAMPLE.models}`}
           value={modelsManualPath}
           busy={modelsBusy}
           setLabel="Use this path"
@@ -724,7 +729,7 @@ export default function SettingsPanel() {
         <p className="form-hint">
           Extra folders to scan for weights, on top of the models folder above.
           Point a service at a library you already have on another drive (e.g.{' '}
-          <code className="path-code">E:\ckpts</code>) without moving anything —
+          <code className="path-code">{EXAMPLE.extra}</code>) without moving anything —
           nothing is downloaded or written here. Services that support it (a
           template can read the list as <code className="path-code">{'${modelDirs}'}</code>)
           search all of these for their checkpoints. Applies the next time a
@@ -756,7 +761,7 @@ export default function SettingsPanel() {
 
         <FolderChange
           label="Add a folder"
-          placeholder="Paste a path, e.g. E:\ckpts"
+          placeholder={`Paste a path, e.g. ${EXAMPLE.extra}`}
           value={extraManualPath}
           busy={extraBusy}
           setLabel="Add this path"

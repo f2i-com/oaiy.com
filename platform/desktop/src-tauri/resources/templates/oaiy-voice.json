@@ -1,7 +1,7 @@
 {
   "id": "oaiy-voice",
   "name": "OAIY Voice",
-  "description": "OAIY's own voice for calls, in Rust: Parakeet speech-to-text on the CPU and Qwen3-TTS speech on the GPU with the most free memory (any make, through WebGPU), which streams as it is made, in a voice cloned from a short clip (an MP3 or WAV, chosen on the Calendar page). Served locally over the OpenAI /v1/audio/transcriptions and /v1/audio/speech APIs. Uses the models already in your model folders, or downloads them (~4.3 GB, checksum-verified).",
+  "description": "OAIY's own voice for calls: it hears callers and speaks the replies, here on this computer. The voice callers hear is chosen in Hours & Services, under How the phone sounds. Its models (about 4.3 GB) come from your model folders, or download once.",
   "category": "Speech",
   "defaultPort": 8783,
   "install": {

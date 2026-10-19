@@ -285,6 +285,105 @@ describe('About and updates', () => {
     expect(host.querySelector<HTMLInputElement>('.update-auto input')?.checked).toBe(false);
   });
 
+  it('inside OAIY’s window, asks with the dialog plugin’s own message dialog, and installs only on OK', async () => {
+    // (the window's confirm is the plugin's there, an async one whose Promise reads as yes: it must not be what is asked)
+    const confirm = vi.fn(() => Promise.resolve(false));
+    vi.stubGlobal('confirm', confirm);
+    const invoke = vi.fn().mockResolvedValueOnce('Cancel').mockResolvedValueOnce('Ok');
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = { invoke };
+    try {
+      await mount(status({ state: 'ready', latestVersion: '0.2.0' }));
+      h.install.mockResolvedValue(undefined);
+      await click(button('Restart to update'));
+      expect(invoke).toHaveBeenCalledWith('plugin:dialog|message', expect.objectContaining({ buttons: 'OkCancel', message: expect.stringContaining('Restart OAIY to install 0.2.0?') }), undefined);
+      expect(h.install).not.toHaveBeenCalled();
+      await click(button('Restart to update'));
+      expect(h.install).toHaveBeenCalledTimes(1);
+      expect(confirm).not.toHaveBeenCalled();
+    } finally {
+      delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
+  });
+
+  it('shows the release’s notes as text with links, not as raw Markdown', async () => {
+    await mount(status({ state: 'available', latestVersion: '0.2.0', notes: '## OAIY 0.2.0\n\n- **Calls**: sooner ([#9](https://github.com/f2i-com/oaiy.com/pull/9))' }));
+    const notes = host.querySelector('.update-notes')!;
+    expect(notes.tagName).toBe('DIV');
+    expect(notes.textContent).not.toContain('##');
+    expect(notes.querySelector('li strong')?.textContent).toBe('Calls');
+    await click(notes.querySelector('a') as unknown as HTMLButtonElement);
+    expect(h.openExternal).toHaveBeenCalledWith('https://github.com/f2i-com/oaiy.com/pull/9');
+  });
+
+  it('offers the releases page where the note sends the person there (a Mac’s update not out yet)', async () => {
+    const note = 'A newer version (0.2.0) exists, and its update for a Mac is not out yet (it comes a little after the release). Check again later, or install it from the disk image on the releases page.';
+    await mount(status({ state: 'idle', latestVersion: '0.2.0', lastCheckedAt: '2026-10-01T03:00:00Z', note, noteLink: RELEASES }));
+    expect(host.querySelector('.update-state')?.textContent).toBe(note);
+    await click(button('Releases page'));
+    expect(h.openExternal).toHaveBeenCalledWith(RELEASES);
+    // (a note that asks nothing to be done there has no link: no button)
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    invalidate();
+    await mount(status({ state: 'idle', latestVersion: '0.2.0', note, noteLink: null }));
+    expect(button('Releases page')).toBeUndefined();
+    expect(button('Download manually')).toBeUndefined();
+  });
+
+  it('says a local build’s note beside “up to date”, with no button for it', async () => {
+    const note = 'This is a local build of 0.1.9 (0.1.9-mac.3), so 0.1.9 itself is not offered as an update: only a release newer than 0.1.9 is.';
+    await mount(status({ state: 'upToDate', currentVersion: '0.1.9-mac.3', latestVersion: '0.1.9', lastCheckedAt: '2026-10-01T03:00:00Z', note, noteLink: null }));
+    expect(text()).toContain('OAIY is up to date.');
+    expect(host.querySelector('.update-note')?.textContent).toBe(note);
+    expect(button('Releases page')).toBeUndefined();
+  });
+
+  it('where there is no release for this kind of computer, claims no “up to date” and offers no page with nothing for it', async () => {
+    const manualReason = 'There is no release of OAIY for this kind of computer, so it cannot update itself. Look on the releases page.';
+    await mount(status({ state: 'upToDate', latestVersion: '0.1.0', lastCheckedAt: '2026-10-01T03:00:00Z', canAutoUpdate: false, manualReason, note: 'A newer version (0.2.0) exists, but there is no release of it for this platform. Look on the releases page.', noteLink: RELEASES }));
+    expect(text()).not.toContain('up to date');
+    expect(text()).toContain('There are no updates of OAIY for this kind of computer.');
+    expect(text()).not.toContain('Look on the releases page');
+    expect(text()).not.toContain('Latest version');
+    expect(button('Download manually')).toBeUndefined();
+    expect(button('Releases page')).toBeUndefined();
+  });
+
+  it('after an install that failed and kept its download, says so and offers “Try again”', async () => {
+    const error = 'The installer could not start: Operation not permitted (os error 1). OAIY was started again as it was. The download is kept: Restart to update tries again.';
+    await mount(status({ state: 'ready', latestVersion: '0.2.0', failedDuring: 'install', error }));
+    expect(host.querySelector('.update-state')?.textContent).toBe('The update was not installed.');
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('The download is kept');
+    expect(button('Restart to update')).toBeUndefined();
+    h.install.mockResolvedValue(undefined);
+    await click(button('Try again'));
+    expect(h.install).toHaveBeenCalledTimes(1);
+    expect(h.download).not.toHaveBeenCalled();
+  });
+
+  it('after an install that failed and did not keep its download, “Try again” downloads it again', async () => {
+    await mount(status({ state: 'failed', latestVersion: '0.2.0', failedDuring: 'install', error: 'The new app could not be put in place.' }));
+    expect(button('Try downloading again')).toBeUndefined();
+    h.download.mockResolvedValue(status({ state: 'downloading', latestVersion: '0.2.0', progress: { downloaded: 0, total: null } }));
+    await click(button('Try again'));
+    expect(h.download).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers no restart where this copy cannot install as it is now, and says why', async () => {
+    const manualReason = 'OAIY was moved since it was opened: quit it and open it again.';
+    await mount(status({ state: 'ready', latestVersion: '0.2.0', canAutoUpdate: false, manualReason }));
+    expect(button('Restart to update')).toBeUndefined();
+    expect(text()).toContain(manualReason);
+    expect(text()).toContain('cannot install it as it is now');
+    expect(button('Download manually')).toBeTruthy();
+  });
+
+  it('says in words, not only on hover, when a check can be made again', async () => {
+    await mount(status({ state: 'upToDate', latestVersion: '0.1.0', lastCheckedAt: '2026-10-01T03:00:00Z', nextCheckIn: 25 }));
+    expect(button('Check for updates')?.disabled).toBe(true);
+    expect(host.querySelector('.update-wait')?.textContent).toBe('You can check again in 25 s.');
+  });
+
   it('says so when the status cannot be read at all', async () => {
     h.status.mockRejectedValue(new Error('Failed to fetch'));
     await act(async () => {

@@ -9,13 +9,14 @@ import {
   Plug,
   RotateCcw,
   Server,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   TriangleAlert,
   X,
 } from 'lucide-react';
 import { peek, put } from './useCached';
-import SetupGuidePanel from './SetupGuidePanel';
+import SetupGuidePanel, { waitingForTrust } from './SetupGuidePanel';
 import UpdateBanner from './UpdateBanner';
 import { BackupLine } from './BackupPanel';
 import TodayPanel from './TodayPanel';
@@ -71,6 +72,7 @@ export type OverviewNav =
   | 'agent'
   | 'calendar'
   | 'engines'
+  | 'engine-workers'
   | 'services'
   | 'plugins'
   | 'runs'
@@ -186,6 +188,8 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const crashedPlug = (plug ?? []).filter(
     (p) => p.state === 'crashed' || (p.state === 'unhealthy' && !waitingForSetup(p, pluginSetupStatus(p, setupState, live))),
   );
+  // An unsigned plugin the host holds back until the person trusts it: said under Next steps (the guide says it too).
+  const untrusted = waitingForTrust(plug);
   const readyProv = (provs ?? []).filter((p) => p.enabled && (p.hasKey || p.allowLocal)).length + (codexConnected ? 1 : 0);
   // The plugins' own cards, as the desktop serves them (none from a plugin turned off, or for a module that is off).
   const modules = useModules();
@@ -253,7 +257,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
     writeFailedSeen(failed, lastFailedAt);
     setFailedSeen(readFailedSeen());
   };
-  const plugName = (p: PluginRecord) => p.manifest?.name ?? p.id;
+  const plugName = (p: PluginRecord) => p.manifest?.name ?? p.declared?.name ?? p.id;
 
   return (
     <div className="panel">
@@ -407,7 +411,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               ? since.count
                 ? `${since.count} more run${since.count === 1 ? '' : 's'} failed since you last looked.`
                 : 'More runs failed since you last looked.'
-              : `${failed} run${failed === 1 ? ' has' : 's have'} failed on this machine.`}
+              : `${failed} run${failed === 1 ? ' has' : 's have'} failed on this computer.`}
           </span>
           <span className="banner-actions">
             <button
@@ -454,23 +458,23 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
 
       <section className="service-section">
         <div className="section-title-row">
-          <h3 className="section-title">This machine</h3>
+          <h3 className="section-title">This computer</h3>
         </div>
         <div className="overview-grid">
           <button className="overview-tile" onClick={() => onNavigate('services')}>
             <Server size={16} aria-hidden />
-            <strong>{svc === null ? '—' : `${runningSvc}/${svc.length}`}</strong>
-            <small>Services running</small>
+            <strong>{svc === null ? '—' : svc.length === 0 ? 'None yet' : `${runningSvc}/${svc.length}`}</strong>
+            <small>{svc !== null && svc.length === 0 ? 'Services' : 'Services running'}</small>
           </button>
           <button className="overview-tile" onClick={() => onNavigate('plugins')}>
             <Plug size={16} aria-hidden />
-            <strong>{plug === null ? '—' : `${runningPlug}/${plug.length}`}</strong>
-            <small>Plugins running</small>
+            <strong>{plug === null ? '—' : plug.length === 0 ? 'None yet' : `${runningPlug}/${plug.length}`}</strong>
+            <small>{plug !== null && plug.length === 0 ? 'Plugins' : 'Plugins running'}</small>
           </button>
           <button className="overview-tile" onClick={() => onNavigate('providers')}>
             <Sparkles size={16} aria-hidden />
-            <strong>{provs === null ? '—' : `${readyProv}/${provs.length + (codexConnected ? 1 : 0)}`}</strong>
-            <small>AI providers ready</small>
+            <strong>{provs === null ? '—' : provs.length + (codexConnected ? 1 : 0) === 0 ? 'None yet' : `${readyProv}/${provs.length + (codexConnected ? 1 : 0)}`}</strong>
+            <small>{provs !== null && provs.length + (codexConnected ? 1 : 0) === 0 ? 'AI providers' : 'AI providers ready'}</small>
           </button>
           <button className="overview-tile" onClick={() => onNavigate('connections')}>
             <ShieldCheck size={16} aria-hidden />
@@ -511,7 +515,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           {runtime && !runtime.ready && (
             <div className="datadir-note datadir-row">
               <span>
-                <TriangleAlert size={13} /> Flows cannot run on this machine —{' '}
+                <TriangleAlert size={13} /> Flows cannot run on this computer —{' '}
                 {runtime.flowRuntime.detail ?? 'the OAIY runtime is unavailable.'}
               </span>
               {/* When the only thing missing is Node, fixing it is one click —
@@ -535,7 +539,17 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </button>
             </div>
           )}
-          {plug !== null && plug.length > 0 && runningPlug === 0 && (
+          {untrusted.map((p) => (
+            <div className="datadir-note datadir-row" key={p.id} data-testid="plugin-waiting-for-trust">
+              <span>
+                <ShieldAlert size={13} /> {plugName(p)} is waiting for you to trust it: it is not signed, so it does not start until you do.
+              </span>
+              <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
+                <Plug size={13} /> Open Plugins
+              </button>
+            </div>
+          ))}
+          {plug !== null && plug.length > 0 && runningPlug === 0 && untrusted.length < plug.length && (
             <div className="datadir-note datadir-row">
               <span>No plugin is running — their connectors are unavailable to flows.</span>
               <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
@@ -568,6 +582,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             svc !== null &&
             readyProv > 0 &&
             crashedPlug.length === 0 &&
+            untrusted.length === 0 &&
             (plug.length === 0 || runningPlug > 0) && (
               <div className="datadir-note datadir-row">
                 <span>

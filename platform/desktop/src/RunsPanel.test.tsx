@@ -513,7 +513,7 @@ describe('RunsPanel', () => {
     runsMock.mockResolvedValue({ runs: [], total: 0, byStatus: {} });
     root = createRoot(host);
     await mount();
-    expect(text()).toContain('No flow has run on this machine yet');
+    expect(text()).toContain('No flow has run on this computer yet');
   });
 
   it('does not call a queued run finished', async () => {

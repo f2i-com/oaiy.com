@@ -12,6 +12,7 @@ import {
   type StagedRestore,
 } from './api';
 import { visibleText } from './visibleText';
+import { ask } from './ask';
 
 /**
  * Backup and restore: one encrypted file with the person's OAIY setup, made and read back here.
@@ -123,6 +124,20 @@ export function describeLastBackup(status: BackupStatus, now: Date | number = ne
   return { text: `Last backup: ${ago}`, nudge: false, kind: 'recent' };
 }
 
+/** Said on the window when the Overview asks for the backup section (Settings may be open already). */
+const BACKUP_ASKED = 'oaiy:backup-asked';
+/** What the Overview asked for and Settings has not shown yet: the section, or the section with its passphrase field. */
+let backupAsked: 'passphrase' | 'section' | null = null;
+
+/**
+ * Ask Settings for its backup section, before opening it: it scrolls there as it opens, and puts the cursor in the
+ * passphrase field for a backup to make (not for a restore waiting for a restart, which the section's top says).
+ */
+export function askForBackup(where: 'passphrase' | 'section'): void {
+  backupAsked = where;
+  window.dispatchEvent(new Event(BACKUP_ASKED));
+}
+
 /**
  * The Overview's one line about backups. It asks for the status once, on its own, so the
  * Overview's poll is not touched; when the desktop cannot answer it shows nothing.
@@ -146,11 +161,15 @@ export function BackupLine({ onOpenSettings }: { onOpenSettings: () => void }) {
   if (!status) return null;
   const line = describeLastBackup(status);
   const label = line.kind === 'pending' ? 'Open Settings' : line.nudge ? 'Back up now' : 'Back up';
+  const open = () => {
+    askForBackup(line.kind === 'pending' ? 'section' : 'passphrase');
+    onOpenSettings();
+  };
   if (line.nudge) {
     return (
       <div className="datadir-note datadir-row" role="status" data-kind={line.kind} style={{ marginTop: 8 }}>
         <span>{line.text}</span>
-        <button className="btn-tiny" onClick={onOpenSettings}>
+        <button className="btn-tiny" onClick={open}>
           <Archive size={13} /> {label}
         </button>
       </div>
@@ -161,7 +180,7 @@ export function BackupLine({ onOpenSettings }: { onOpenSettings: () => void }) {
       <Archive size={14} aria-hidden />
       <strong>{line.kind === 'pending' ? 'Backup' : line.text}</strong>
       {line.kind === 'pending' && <small>{line.text}</small>}
-      <button className="btn-tiny" onClick={onOpenSettings}>
+      <button className="btn-tiny" onClick={open}>
         {label}
       </button>
     </div>
@@ -289,6 +308,29 @@ export function BackupSection() {
     mounted.current = true;
     return () => {
       mounted.current = false;
+    };
+  }, []);
+
+  // Asked for from the Overview: shown, and the passphrase field ready for a backup to make.
+  const sectionRef = useRef<HTMLElement>(null);
+  const passphraseRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const timers: number[] = [];
+    const show = () => {
+      const want = backupAsked;
+      backupAsked = null;
+      if (!want) return;
+      const place = () => sectionRef.current?.scrollIntoView?.({ block: 'start' });
+      place();
+      if (want === 'passphrase') passphraseRef.current?.focus({ preventScroll: true });
+      // (what is above it, the updates' status, may still be loading and push it down: placed again once it has)
+      timers.push(window.setTimeout(place, 350), window.setTimeout(place, 1000));
+    };
+    show();
+    window.addEventListener(BACKUP_ASKED, show);
+    return () => {
+      window.removeEventListener(BACKUP_ASKED, show);
+      timers.forEach((t) => window.clearTimeout(t));
     };
   }, []);
 
@@ -450,7 +492,7 @@ export function BackupSection() {
   };
 
   const undo = async () => {
-    if (!confirm(undoConfirmText(status?.undoKind ?? null))) return;
+    if (!(await ask(undoConfirmText(status?.undoKind ?? null)))) return;
     setPendingBusy(true);
     setUndoError(null);
     let staged: PendingRestore | undefined;
@@ -471,7 +513,7 @@ export function BackupSection() {
   const working = creating || checking || staging;
 
   return (
-    <section className="model-section" aria-label="Backup and restore">
+    <section className="model-section backup-section" aria-label="Backup and restore" ref={sectionRef}>
       <h3 className="section-title">Backup and restore</h3>
       <p className="form-hint">
         A backup is one encrypted file with your contacts, calendar, conversations, flows, triggers, settings and
@@ -598,6 +640,7 @@ export function BackupSection() {
             type="password"
             autoComplete="new-password"
             aria-label="Backup passphrase"
+            ref={passphraseRef}
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
             disabled={creating}

@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Download, ExternalLink, RefreshCw, RotateCw } from 'lucide-react';
 import { formatBytes, formatTimestamp, openExternal, updates, type UpdateStatus } from './api';
+import { ask } from './ask';
+import ReleaseNotes from './ReleaseNotes';
 import { useUpdateStatus } from './useUpdateStatus';
 
 /**
@@ -8,10 +10,14 @@ import { useUpdateStatus } from './useUpdateStatus';
  * of getting it: Check, Download (which also checks the signature), then "Restart to update",
  * which is off while anything is in the way (a call, a task, a download, a media job, an
  * install, an app that only just started) and names each of those beside it. Nothing installs
- * by itself: the owner presses the button.
+ * by itself: the owner presses the button. An install that failed and changed nothing keeps its
+ * download, and the same button says "Try again".
  *
- * Where a copy cannot update itself (an MSI install, macOS, a build that was not installed from
- * a release) it says why and offers the releases page instead.
+ * Where a copy cannot update itself (an MSI install, a Mac app still in its disk image or on another
+ * disk, the headless server, a build that was not installed from a release) it says why and offers
+ * the releases page instead; so does a newer release whose update for this computer is not out yet.
+ * Where there is no release of OAIY for this kind of computer at all (an Intel Mac), it says that,
+ * and neither claims the copy is up to date nor sends the person to a page with nothing for it.
  */
 
 /** "12.3 MiB of 96.0 MiB (13%)", or just what has come when the total is not known. */
@@ -34,8 +40,18 @@ function shortDate(iso: string | null): string {
   return iso ? new Date(iso).toLocaleDateString() : '';
 }
 
+/**
+ * No release of OAIY is built for this kind of computer (an Intel Mac): it gets no updates, and the releases page
+ * has nothing for it. Known by the desktop's own words for it, the only sign the status carries.
+ */
+export function noReleaseHere(s: Pick<UpdateStatus, 'canAutoUpdate' | 'manualReason'>): boolean {
+  return !s.canAutoUpdate && /no release of OAIY for this kind of computer/i.test(s.manualReason ?? '');
+}
+
 /** What the state means, in a sentence. */
 function stateLine(s: UpdateStatus): string {
+  // (the feed's version is the one for other computers: "up to date" would not be true here)
+  if (noReleaseHere(s) && (s.state === 'upToDate' || s.state === 'idle')) return 'There are no updates of OAIY for this kind of computer.';
   switch (s.state) {
     case 'checking':
       return 'Looking for a newer version…';
@@ -46,7 +62,11 @@ function stateLine(s: UpdateStatus): string {
     case 'downloading':
       return `Downloading version ${s.latestVersion}…`;
     case 'ready':
-      return `Version ${s.latestVersion} is downloaded and its signature is checked. Restart OAIY to install it.`;
+      // (an install that failed and changed nothing keeps its download: said as the failure, Restart to update tries again)
+      if (s.failedDuring === 'install' && s.error) return FAILED.install;
+      return s.canAutoUpdate
+        ? `Version ${s.latestVersion} is downloaded and its signature is checked. Restart OAIY to install it.`
+        : `Version ${s.latestVersion} is downloaded, but this copy cannot install it as it is now.`;
     case 'installing':
       return 'Installing… OAIY is closing and will open again by itself.';
     case 'failed':
@@ -78,13 +98,28 @@ export default function UpdatesSection() {
     }
   };
 
-  const restart = () => {
+  const restart = async () => {
     if (!s) return;
-    const ok = confirm(
+    const ok = await ask(
       `Restart OAIY to install ${s.latestVersion}? OAIY closes and opens again, which takes a minute or so. It will not answer calls or texts until it is back.`,
     );
-    if (ok) void run('install', () => updates.install());
+    if (ok) await run('install', () => updates.install());
   };
+
+  // A check made a moment ago: when the next is allowed, counted down here between the status's reads.
+  const [checkAllowedAt, setCheckAllowedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const nextCheckIn = s?.nextCheckIn ?? null;
+  useEffect(() => {
+    setNow(Date.now());
+    setCheckAllowedAt(nextCheckIn != null ? Date.now() + nextCheckIn * 1000 : null);
+  }, [nextCheckIn, s]);
+  useEffect(() => {
+    if (checkAllowedAt === null) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [checkAllowedAt]);
+  const waitToCheck = checkAllowedAt !== null ? Math.ceil((checkAllowedAt - now) / 1000) : 0;
 
   const setAutoCheck = async (enabled: boolean) => {
     setActionError(null);
@@ -112,7 +147,16 @@ export default function UpdatesSection() {
   const moving = s.state === 'checking' || s.state === 'downloading' || s.state === 'installing';
   const blocked = s.blockers.length > 0;
   const canDownload = s.canAutoUpdate && !!s.latestVersion && (s.state === 'available' || (s.state === 'failed' && (s.failedDuring === 'download' || s.failedDuring === 'install')));
-  const showManual = !s.canAutoUpdate || s.state === 'failed';
+  // (a copy that cannot install as it is now, a Mac app moved or in a folder it may not change, keeps its download but
+  // offers no restart: why is said below it)
+  const canRestart = s.state === 'ready' && s.canAutoUpdate;
+  const retrying = s.failedDuring === 'install' && !!s.error;
+  const nowhere = noReleaseHere(s);
+  // The releases page: where this copy cannot update itself, and after a failure ("Download manually"); and where the note
+  // sends the person there (a Mac's update not out yet: its disk image is there), as the desktop says with `noteLink`.
+  // Never where there is nothing for this computer there.
+  const manualUrl = nowhere ? null : !s.canAutoUpdate || s.state === 'failed' || retrying ? s.manualUrl : null;
+  const noteUrl = nowhere || manualUrl ? null : (s.note && s.noteLink) || null;
   const shownError = actionError ?? s.error;
 
   return (
@@ -140,7 +184,8 @@ export default function UpdatesSection() {
           <span className="settings-label">Last checked</span>
           <div className="settings-value">{s.lastCheckedAt ? formatTimestamp(s.lastCheckedAt) : 'Not checked yet'}</div>
         </div>
-        {s.latestVersion && (
+        {/* (the feed's version is for other kinds of computer where there is none for this one: not shown as this one's) */}
+        {s.latestVersion && !noReleaseHere(s) && (
           <div className="settings-row">
             <span className="settings-label">Latest version</span>
             <div className="settings-value">
@@ -152,6 +197,9 @@ export default function UpdatesSection() {
       </div>
 
       <p className="update-state" role="status" aria-live="polite">{stateLine(s)}</p>
+      {/* (idle says its note as the state; beside any other state it is said under it: a local build, a newer release whose
+          update for this computer is not out while the one downloaded can be installed) */}
+      {s.note && s.state !== 'idle' && !nowhere && <p className="form-hint update-note">{s.note}</p>}
 
       {s.state === 'downloading' && s.progress && (
         <div className="update-progress">
@@ -175,7 +223,7 @@ export default function UpdatesSection() {
       {s.notes && (s.state === 'available' || s.state === 'downloading' || s.state === 'ready') && (
         <div className="update-notes-block">
           <span className="settings-label">What is new</span>
-          <pre className="update-notes">{s.notes}</pre>
+          <ReleaseNotes text={s.notes} />
         </div>
       )}
 
@@ -191,38 +239,50 @@ export default function UpdatesSection() {
           {shownError}
         </div>
       )}
-      {!s.canAutoUpdate && s.manualReason && <p className="form-hint">{s.manualReason}</p>}
+      {!s.canAutoUpdate && s.manualReason && !nowhere && <p className="form-hint">{s.manualReason}</p>}
+      {nowhere && <p className="form-hint">OAIY’s releases are not built for this kind of computer, so it gets no updates here, and the releases page has nothing for it.</p>}
 
       <div className="form-actions">
         <button
           type="button"
           className="btn btn-secondary"
-          disabled={busy !== null || moving || s.nextCheckIn != null}
-          title={s.nextCheckIn != null ? `OAIY checked a moment ago. You can check again in ${s.nextCheckIn} second${s.nextCheckIn === 1 ? '' : 's'}.` : undefined}
+          disabled={busy !== null || moving || waitToCheck > 0}
+          title={waitToCheck > 0 ? `OAIY checked a moment ago. You can check again in ${waitToCheck} second${waitToCheck === 1 ? '' : 's'}.` : undefined}
           onClick={() => void run('check', () => updates.check())}
         >
           <RefreshCw size={14} /> Check for updates
         </button>
         {canDownload && (
           <button type="button" className="btn btn-primary" disabled={busy !== null || moving} onClick={() => void run('download', () => updates.download())}>
-            <Download size={14} /> {s.state === 'failed' ? 'Try downloading again' : `Download ${s.latestVersion}`}
+            <Download size={14} />{' '}
+            {s.state !== 'failed' ? `Download ${s.latestVersion}` : s.failedDuring === 'install' ? 'Try again' : 'Try downloading again'}
           </button>
         )}
-        {s.state === 'ready' && (
-          <button type="button" className="btn btn-primary" disabled={blocked || busy !== null} onClick={restart}>
-            <RotateCw size={14} /> Restart to update
+        {canRestart && (
+          <button type="button" className="btn btn-primary" disabled={blocked || busy !== null} onClick={() => void restart()}>
+            <RotateCw size={14} /> {retrying ? 'Try again' : 'Restart to update'}
           </button>
         )}
-        {showManual && (
-          <button type="button" className="btn btn-ghost" onClick={() => openExternal(s.manualUrl)}>
+        {manualUrl && (
+          <button type="button" className="btn btn-ghost" onClick={() => openExternal(manualUrl)}>
             <ExternalLink size={14} /> Download manually
           </button>
         )}
+        {noteUrl && (
+          <button type="button" className="btn btn-ghost" onClick={() => openExternal(noteUrl)}>
+            <ExternalLink size={14} /> Releases page
+          </button>
+        )}
+        {waitToCheck > 0 && !moving && (
+          <span className="form-hint update-wait" role="status">
+            You can check again in {waitToCheck} s.
+          </span>
+        )}
       </div>
 
-      {s.state === 'ready' && blocked && (
+      {canRestart && blocked && (
         <div className="update-blockers-block">
-          <span className="settings-label">Restart to update is off because</span>
+          <span className="settings-label">{retrying ? 'Try again' : 'Restart to update'} is off because</span>
           <ul className="update-blockers" aria-label="Why OAIY cannot restart now">
             {s.blockers.map((b) => (
               <li key={b.code}>{b.message}</li>

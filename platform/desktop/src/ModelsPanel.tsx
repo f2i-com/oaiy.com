@@ -15,6 +15,7 @@ import {
 } from './api';
 import { Check, Copy, Download, FolderOpen, Trash2 } from 'lucide-react';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 
 /** Rows added per "Show more". The panel polls, so every row on screen is
  * re-rendered each tick — a whole library at once is what makes it stutter. */
@@ -406,11 +407,11 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
               </button>
               <button
                 className="btn-tiny btn-danger"
-                onClick={() => {
-                  if (confirm(`Delete ${m.name}?`)) {
-                    onAction(() => models.delete(m.name));
-                  }
-                }}
+                onClick={() =>
+                  void ask(`Delete ${m.name}?`).then((yes) => {
+                    if (yes) onAction(() => models.delete(m.name));
+                  })
+                }
               >
                 <Trash2 size={13} /> Delete
               </button>
@@ -509,14 +510,11 @@ function DownloadRow({ dl, onPause, onResume, onCancel }: RowProps) {
           onCancel && (
             <button
               className="btn-tiny btn-danger"
-              onClick={() => {
-                if (
-                  confirm(
-                    `Cancel the download of ${dl.filename}? Partial data will be discarded.`,
-                  )
-                )
-                  onCancel();
-              }}
+              onClick={() =>
+                void ask(`Cancel the download of ${dl.filename}? Partial data will be discarded.`).then((yes) => {
+                  if (yes) onCancel();
+                })
+              }
             >
               Cancel
             </button>

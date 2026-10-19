@@ -140,7 +140,7 @@ describe('an unsigned plugin in a release build', () => {
     });
     await settle();
     expect(m.push).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'error', title: 'Action failed for "aokie"', body: expect.stringContaining('symbolic link') }),
+      expect.objectContaining({ kind: 'error', title: 'aokie was not trusted', body: expect.stringContaining('symbolic link') }),
     );
     expect(button('Trust this plugin')).toBeDefined();
   });
@@ -254,5 +254,67 @@ describe('installing a plugin that will not start until it is trusted', () => {
     expect(m.push).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'Installed Aokie Phone Bridge v0.1.0', body: 'It is not signed, so it will not start until you trust it.' }),
     );
+  });
+});
+
+describe('an unsigned plugin whose manifest is read', () => {
+  // (the host reads its manifest, so the card could start it: the start would be refused, 409, until it is trusted)
+  const egpu: PluginRecord = {
+    id: 'egpu', state: 'installed', dir: 'C:/plugins/egpu', userDisabled: false, restartAttempts: 0,
+    reason: 'Not started: this package is not signed, and you have not trusted it yet.',
+    manifest: { name: 'eGPU', version: '0.2.0' },
+    trust: UNSIGNED,
+  };
+
+  it('cannot be started, and trusting it is the card’s main button, first', async () => {
+    await render([egpu]);
+    const start = button('Start')!;
+    expect(start.disabled).toBe(true);
+    expect(start.className).not.toContain('btn-primary');
+    const actions = Array.from(host.querySelectorAll('.card-actions button'));
+    expect(actions[0].textContent).toContain('Trust this plugin');
+    expect(actions[0].className).toContain('btn-primary');
+    expect(actions.filter((b) => b.textContent?.includes('Trust this plugin'))).toHaveLength(1);
+  });
+
+  it('names the plugin, not its id, when an action fails, and says what OAIY said without its HTTP status', async () => {
+    const { ApiError } = await import('./api');
+    await render([{ ...egpu, trust: { state: 'unsigned-dev', reason: 'Not signed.' } }]);
+    m.start.mockRejectedValue(new ApiError(409, 'eGPU needs its setup first.'));
+    await act(async () => {
+      button('Start')!.click();
+    });
+    await settle();
+    expect(m.push).toHaveBeenCalledWith(expect.objectContaining({ kind: 'error', title: 'eGPU did not start', body: 'eGPU needs its setup first.' }));
+  });
+});
+
+describe('updating a plugin that was running', () => {
+  async function install(reply: Record<string, unknown>) {
+    await render([]);
+    m.install.mockResolvedValue({ id: 'aokie', name: 'Aokie Phone Bridge', version: '0.2.0', replaced: true, trust: { state: 'verified', publisher: 'Aokie', keyId: 'k' }, ...reply });
+    const input = host.querySelector('input[type="text"]') as HTMLInputElement;
+    await act(async () => {
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      set.call(input, '/Users/sam/aokie-0.2.0.zip');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => {
+      button('Install')!.click();
+    });
+    await settle();
+  }
+
+  it('says it was started again', async () => {
+    await install({ restarted: true });
+    expect(m.push).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Updated Aokie Phone Bridge to v0.2.0 and started it again', body: 'It runs the new version now.' }));
+  });
+
+  it('says it was not started again, and why, never a plain “Updated”', async () => {
+    await install({ notRestarted: 'the new package is not signed, and you have not trusted it yet' });
+    expect(m.push).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Updated Aokie Phone Bridge to v0.2.0. It was not started again', body: 'The new package is not signed, and you have not trusted it yet.' }),
+    );
+    expect(m.push).not.toHaveBeenCalledWith(expect.objectContaining({ title: 'Updated Aokie Phone Bridge to v0.2.0' }));
   });
 });

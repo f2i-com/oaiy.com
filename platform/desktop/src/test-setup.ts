@@ -8,4 +8,6 @@ import { vi } from 'vitest';
 // and returns undefined, which reads as Cancel — so every destructive-action
 // test would pass for the wrong reason. Default to "user confirmed"; a test that
 // cares overrides with vi.spyOn(window, 'confirm').mockReturnValue(false).
+// The dashboard asks through ask() (ask.ts), which outside OAIY's window (here)
+// is this confirm; inside it, the dialog plugin's message command (ask.test.ts).
 vi.stubGlobal('confirm', () => true);

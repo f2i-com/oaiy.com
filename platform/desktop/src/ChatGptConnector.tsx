@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Copy, ExternalLink, Loader2, LogOut, MessageSquare } from 'lucide-react';
 import { codex, openExternal, type CodexLogin, type CodexStatus } from './api';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 
 /**
  * The ChatGPT connector — sign in with a ChatGPT account instead of pasting an
@@ -100,7 +101,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
   };
 
   const signOut = async () => {
-    if (!confirm('Sign out of ChatGPT? Flows using it will stop working until you sign in again.'))
+    if (!(await ask('Sign out of ChatGPT? Flows using it will stop working until you sign in again.')))
       return;
     setBusy(true);
     try {
@@ -130,7 +131,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
         )}
         <p className="form-hint">
           Sign in with a ChatGPT account instead of an API key. This needs the{' '}
-          <code>codex</code> CLI on this machine
+          <code>codex</code> CLI on this computer
           {status.detail ? ` — ${status.detail}` : ''}.
         </p>
         <ol className="setup-instructions"><li>Follow the official Codex CLI installation guide.</li><li>Restart OAIY if the CLI is not detected, then check again.</li><li>Sign in here. OAIY uses a separate Codex sign-in for this connection.</li></ol>
@@ -164,7 +165,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
       {!bare && (
         <p className="form-hint">
           Use an eligible ChatGPT account instead of an API key. Your account limits apply. The sign-in is owned by the{' '}
-          <code>codex</code> agent running on this machine — OAIY never receives or stores a token.
+          <code>codex</code> agent running on this computer — OAIY never receives or stores a token.
         </p>
       )}
 

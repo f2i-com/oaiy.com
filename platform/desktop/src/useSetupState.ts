@@ -44,7 +44,9 @@ function fetchNow(): Promise<SetupState | null> {
       return snapshot;
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e);
-      fail(/^404\b/.test(why) ? null : why.replace(/^\d{3}: /, ''));
+      // (a 404, as an `ApiError` says it, or a message in the older "404: …" form: a desktop without the route)
+      const missing = (e as { status?: unknown } | null)?.status === 404 || /^404\b/.test(why);
+      fail(missing ? null : why.replace(/^\d{3}: /, ''));
       return snapshot;
     } finally {
       inflight = null;

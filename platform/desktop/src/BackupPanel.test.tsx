@@ -35,7 +35,7 @@ vi.mock('./api', () => ({
   openInExplorer: (...a: unknown[]) => h.open(...a),
 }));
 
-import { BackupSection, RESTORE_TIMEOUT_MS, agoWords, undoConfirmText } from './BackupPanel';
+import { BackupSection, RESTORE_TIMEOUT_MS, agoWords, askForBackup, undoConfirmText } from './BackupPanel';
 import type { BackupCreateResult, BackupStatus, RestoreClass, RestorePreview, ReviewItem, StagedRestore } from './api';
 import { isInvisible } from './visibleText';
 
@@ -207,6 +207,41 @@ describe('the words a person reads first', () => {
     expect(text()).toContain('Hugging Face');
     expect(text()).toContain('are never in a backup');
     expect(text()).toContain('with PINs, keys and sealed values left out');
+  });
+});
+
+describe('asked for from the Overview', () => {
+  it('scrolls to the section and puts the cursor in the passphrase field, once', async () => {
+    const scrolled = vi.fn();
+    Element.prototype.scrollIntoView = scrolled;
+    try {
+      askForBackup('passphrase');
+      await mount();
+      expect(scrolled).toHaveBeenCalledWith({ block: 'start' });
+      expect(document.activeElement?.getAttribute('aria-label')).toBe('Backup passphrase');
+      // (opened again by hand: no scroll, the question was answered)
+      scrolled.mockClear();
+      act(() => root.unmount());
+      root = createRoot(host);
+      await mount();
+      expect(scrolled).not.toHaveBeenCalled();
+    } finally {
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
+  it('for a restore waiting for a restart, shows the section without taking the cursor', async () => {
+    const scrolled = vi.fn();
+    Element.prototype.scrollIntoView = scrolled;
+    try {
+      await mount();
+      (document.activeElement as HTMLElement | null)?.blur?.();
+      act(() => askForBackup('section'));
+      expect(scrolled).toHaveBeenCalled();
+      expect(document.activeElement?.getAttribute('aria-label')).not.toBe('Backup passphrase');
+    } finally {
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
   });
 });
 

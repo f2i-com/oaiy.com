@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Loader2, Network, Play, Server, Square, TriangleAlert } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
+import { ask } from './ask';
 import { network, type NetworkFlow, type NetworkNode, type NetworkRun, type NetworkStatus } from './api';
 import { RunAnswer, durationText, errorText, fullWhen, whenText } from './RunParts';
+import { ago } from './NetworkPanel';
 
 /**
  * Flows → On other computers: the flows the computers paired over OAIY Network share (Let apps run it there), each
@@ -105,8 +107,10 @@ export default function FlowWorkersPanel({ onOpenNetworking }: { onOpenNetworkin
             </div>
             {!n.online && (
               <p className="form-hint">
-                {n.name} is not answering{n.lastSeenMs ? ` (last seen ${whenText(n.lastSeenMs).replace(/^just now$/, 'a moment ago')})` : ''}
-                {n.lastError ? `: ${n.lastError}` : '.'} {flows.length === 0 ? 'The flows it shares show here when it answers again.' : 'Its flows run again once it answers.'}
+                {/* (as Networking says it: "Last report 3 h ago", each sentence ended) */}
+                {n.name} is not answering{n.lastSeenMs ? ` (last report ${ago(n.lastSeenMs)})` : ''}
+                {n.lastError ? `: ${n.lastError.replace(/[.\s]+$/, '')}.` : '.'}{' '}
+                {flows.length === 0 ? 'The flows it shares show here when it answers again.' : 'Its flows run again once it answers.'}
               </p>
             )}
             {flows.length === 0 ? (
@@ -270,7 +274,7 @@ function FlowCard({ node, flow }: { node: NetworkNode; flow: NetworkFlow }) {
     }
   };
   const stop = async (t: Tracked) => {
-    if (!window.confirm(`Stop this run of ${flow.name} on ${node.name}?\n\nWhat it has done there so far stays done.`)) return;
+    if (!(await ask(`Stop this run of ${flow.name} on ${node.name}?\n\nWhat it has done there so far stays done.`))) return;
     setStopping((s) => ({ ...s, [t.run.runId]: true }));
     try {
       await network.cancelRun(node.nodeId, t.run.runId);

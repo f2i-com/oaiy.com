@@ -677,6 +677,19 @@ kbd {
   background: var(--danger-soft);
   color: var(--danger);
 }
+/* A tiny primary is still a primary: white on the primary colour, whatever the muted chip above says. */
+.btn-tiny.btn-primary,
+.btn-tiny.btn-primary:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--primary) 80%, white);
+  background: linear-gradient(115deg, var(--primary), var(--primary-2));
+  color: #fff;
+}
+:root[data-theme='light'] .btn-tiny.btn-primary,
+:root[data-theme='light'] .btn-tiny.btn-primary:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--primary);
+}
+.btn-tiny.btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
 
 .row-actions,
 .service-actions,
@@ -821,7 +834,9 @@ code {
   background: var(--primary-soft);
   color: var(--primary);
 }
-.banner-pending .path-code { color: var(--primary); }
+/* (in the dark theme the violet on its own tint is about 4:1: mixed toward the text, the banner and its close mark read) */
+:root:not([data-theme='light']) .banner-pending { color: color-mix(in srgb, var(--primary) 68%, var(--text)); }
+.banner-pending .path-code { color: inherit; }
 /* An icon in a banner's words sits on their line. */
 .banner > span > svg:first-child { vertical-align: -2px; }
 .banner-dismissable {
@@ -839,10 +854,10 @@ code {
   padding: 0 3px;
   font-size: 16px;
   line-height: 1;
-  opacity: 0.65;
-  transition: opacity 0.12s, background 0.12s;
+  transition: background 0.12s;
 }
-.banner-dismiss:hover { opacity: 1; background: color-mix(in srgb, currentColor 12%, transparent); }
+/* (in the banner's own colour, not faded: a close mark a person must find, as legible as the banner's words) */
+.banner-dismiss:hover { background: color-mix(in srgb, currentColor 12%, transparent); }
 .banner-dismiss:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; opacity: 1; }
 
 /* Settings, About and updates; and the Overview banner that says a newer OAIY exists. */
@@ -851,18 +866,31 @@ code {
 .update-notes-block, .update-blockers-block { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
 .update-notes {
   margin: 0;
-  max-height: 160px;
+  max-height: 220px;
   overflow: auto;
-  padding: 8px 10px;
+  padding: 8px 12px;
   border: 1px solid var(--border);
   border-radius: var(--r-ctl);
   background: var(--canvas);
   color: var(--muted);
-  font: inherit;
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-word;
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
+/* The release's notes as written (ReleaseNotes): headings, paragraphs and lists, tight as a note is. */
+.update-notes > p { margin: 0 0 6px; }
+.update-notes > ul, .update-notes > ol { margin: 0 0 6px; padding-left: 18px; }
+.update-notes > :last-child { margin-bottom: 0; }
+.update-notes-heading { color: var(--text); font-size: 12.5px; font-weight: 650; }
+.update-notes-heading.is-top { font-size: 13px; }
+.update-notes > .update-notes-heading:not(:first-child) { margin-top: 8px; }
+.update-notes strong { color: var(--text); font-weight: 650; }
+.update-notes code { padding: 0 4px; font-size: 11.5px; }
+.update-notes a { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
+:root:not([data-theme='light']) .update-notes a { color: color-mix(in srgb, var(--primary) 55%, var(--text)); }
+.update-wait { align-self: center; }
+/* Settings, Backup and restore: scrolled to from the Overview, a little room above it, its frame in view. */
+.backup-section { scroll-margin-top: 24px; }
 .update-blockers { margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .update-auto { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--muted); }
 .update-banner { margin-bottom: 4px; }
@@ -1267,8 +1295,11 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .setup-step .setup-mark { display: flex; margin-top: 1px; color: var(--muted); }
 .setup-step.is-done .setup-mark { color: var(--green); }
 /* Done rows recede rather than disappear — the list should still read as a
-   whole so the user can see how far they have come. */
-.setup-step.is-done { opacity: 0.62; }
+   whole so the user can see how far they have come. They recede by their
+   frame and their title's weight, not by fading: faded, their words fell
+   under a readable contrast. */
+.setup-step.is-done { border-style: dashed; background: transparent; }
+.setup-step.is-done .setup-body strong { color: var(--muted); font-weight: 560; }
 .setup-body { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
 .setup-body strong { font-size: 13.5px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
 .setup-body small { color: var(--muted); font-size: 12px; line-height: 1.5; }
@@ -2051,8 +2082,9 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .network-node .card-warn { margin-top: 8px; font-size: 12px; overflow-wrap: anywhere; }
 .network-node .card-warn > svg { flex: none; }
 .network-busy { margin-top: 8px; color: var(--primary); font-size: 12px; }
-.network-stale .network-devices,
-.network-stale .network-models { opacity: 0.6; }
+/* What an offline computer last said: its meters faded and its tiles' frames dashed, its words left readable. */
+.network-stale .network-meter { opacity: 0.45; }
+.network-stale .network-device { border-style: dashed; background: transparent; }
 .network-stale-note { margin-top: 10px; color: var(--faint); font-size: 11.5px; }
 .network-stale-note + .network-devices { margin-top: 6px; }
 .network-devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; margin-top: 12px; }
@@ -2142,11 +2174,17 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border));
   border-radius: 999px;
   background: var(--primary-soft);
-  color: var(--primary);
+  /* (the primary mixed toward the text: violet on its own tint is under 4:1 in the dark theme) */
+  color: color-mix(in srgb, var(--primary) 68%, var(--text));
   padding: 1px 8px;
   font-size: 10.5px;
   font-weight: 650;
   white-space: nowrap;
+}
+.engine-default-chip.is-waiting {
+  border-color: color-mix(in srgb, var(--amber) 45%, var(--border));
+  background: var(--amber-soft);
+  color: var(--amber);
 }
 .network-model .engine-default-chip { margin-left: auto; }
 .network-model-name .engine-default-chip { margin-left: 0; }
@@ -2198,6 +2236,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 
 /* What to check when a worker does not answer. */
 .network-checklist { margin: 6px 0 0; padding-left: 18px; color: var(--muted); }
+/* Lending: what the computer using this one needs to reach it. */
+.network-reach { color: var(--muted); font-size: 12px; }
 .network-checklist li { margin-top: 2px; }
 
 /* Flows → On other computers: a worker's shared flow, its inputs, Run, and its run as it goes. */
@@ -2288,7 +2328,10 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .remote-service-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
 .remote-service-name { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; font-size: 13px; }
 .remote-service-name .badge { margin-left: 0; }
+/* Settings → Agent: the engine's default on a paired computer, and the way back to this computer's own. */
+.agent-paired-default { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin-top: 8px; }
 .remote-service small { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.remote-service small.remote-service-why { color: var(--amber); }
 .remote-service > .btn-tiny { flex: none; }
 
 /* A worker's flows it shares and services it lends, under its models, each with where to use them. */

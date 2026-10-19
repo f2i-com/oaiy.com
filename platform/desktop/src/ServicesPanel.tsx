@@ -15,6 +15,7 @@ import {
 import { Download, FolderOpen, Plus, Trash2, Upload } from 'lucide-react';
 import LogsViewer from './LogsViewer';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 import { peek, put } from './useCached';
 
 /**
@@ -265,9 +266,9 @@ export default function ServicesPanel() {
               onStart={() => runAction(() => services.start(svc.id), svc.id)}
               onStop={() => runAction(() => services.stop(svc.id), svc.id)}
               onInstall={() => runAction(() => services.install(svc.id), svc.id)}
-              onUninstall={() => {
+              onUninstall={async () => {
                 if (
-                  confirm(
+                  await ask(
                     `Uninstall "${svc.name}"? This removes its installed files (binaries) so you can reinstall cleanly. Your models and flows are not touched.`,
                   )
                 ) {
@@ -284,9 +285,9 @@ export default function ServicesPanel() {
               onCancelInstall={() => runAction(() => services.cancelInstall(svc.id), svc.id)}
               onRepair={() => runAction(() => services.repair(svc.id), svc.id)}
               onExport={() => exportPackage(svc.id, svc.name)}
-              onDelete={() => {
+              onDelete={async () => {
                 if (
-                  confirm(
+                  await ask(
                     `Remove the "${svc.name}" service template? The on-disk JSON will be deleted too.`,
                   )
                 ) {

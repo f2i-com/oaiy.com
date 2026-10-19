@@ -16,13 +16,14 @@ import {
 } from './api';
 import { AgentMaySwitch, useControlSettings } from './AgentAccess';
 import { codexModelOptions, describeChange, localModelLine, newestFirst } from './setupFlow';
-import { modelLineText } from './SetupEssentials';
+import { modelLineText, pairedDefault, pairedModelText } from './SetupEssentials';
 import { answered, errorText, RetryLine, usePoll } from './SetupParts';
 
 /**
  * Settings → Agent: what the Agent may change in OAIY (the switch), the model
  * it thinks with (the engine's, ChatGPT with a model from Codex's catalogue, an
- * AI provider's, or a paired worker's language model over OAIY Network), and
+ * AI provider's, or a paired computer's language model over OAIY Network: its
+ * own choice, or the engine's default where that is a paired computer's), and
  * every change it made through the MCP API, newest first.
  *
  * Each part reads a route a desktop may not have yet; without it, the part
@@ -54,14 +55,16 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
   // (a paired worker's language models, OAIY Network: offered where there are any)
   const [nodes] = usePoll(() => network.nodes().catch(() => null), 15000);
   const workerModels = (nodes?.nodes ?? [])
-    .filter((n) => n.role === 'worker')
+    .filter((n) => n.uses ?? n.role === 'worker')
     .flatMap((n) => n.models.filter((m) => m.kind === 'llm').map((m) => ({ id: m.id, label: `${m.model} · ${n.name}${n.online ? '' : ' (offline)'}` })));
   const [picked, setPicked] = useState<AgentModelSource | 'worker' | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const onWorker = prefs?.model.source === 'engine' && !!prefs.model.model?.startsWith('engine:llm:node.') ? prefs.model.model : null;
-  const source = picked ?? (onWorker ? 'worker' : prefs?.model.source) ?? 'engine';
+  // (on the engine, whose default language model is a paired computer's, Engines → Other computers: the Agent runs there)
+  const paired = onWorker ? null : pairedDefault(prefs);
+  const source = picked ?? (onWorker || paired ? 'worker' : prefs?.model.source) ?? 'engine';
   const line = localModelLine(rec, catalog);
   const onProvider = prefs?.model.source === 'provider' && prefs.model.provider && prefs.model.model ? prefs.model : null;
   const providerPick: ProviderPick | null = onProvider ? { provider: onProvider.provider!, model: onProvider.model!, name: prefs?.providerName ?? onProvider.provider! } : null;
@@ -96,11 +99,30 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
     }
   };
 
+  /** This computer's own language model the engine's default again: the paired computer's is let go of (as "Use this
+   *  computer's" does in Engines → Other computers), for the engine's chats and flows as well as the Agent. */
+  const takeDefaultBack = async () => {
+    setSaving(true);
+    setSaved(false);
+    setError(null);
+    try {
+      await network.setDefault('llm', null);
+      await refreshPrefs();
+      setSaved(true);
+    } catch (e) {
+      setError(`Not changed: ${errorText(e)}`);
+      setPicked(null);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const choose = (next: AgentModelSource | 'worker') => {
     setPicked(next);
     // ChatGPT is set once it is signed in (the Agent could not answer with it before); a provider or a worker's model once
-    // one is chosen.
-    if (next === 'engine' && (prefs?.model.source !== 'engine' || onWorker)) void save({ model: { source: 'engine' } }, true);
+    // one is chosen. This computer, while the engine's default is a paired computer's, takes the engine's default back.
+    if (next === 'engine' && paired && prefs?.model.source === 'engine') void takeDefaultBack();
+    else if (next === 'engine' && (prefs?.model.source !== 'engine' || onWorker)) void save({ model: { source: 'engine' } }, true);
     if (next === 'chatgpt' && connected && prefs?.model.source !== 'chatgpt') void save({ model: { source: 'chatgpt' } }, true);
   };
 
@@ -145,7 +167,10 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
                 </span>
                 <span className="ai-choice-text">
                   <strong>On this computer</strong>
-                  <small className="ai-choice-fact">{modelLineText(line)}</small>
+                  <small className="ai-choice-fact">
+                    {modelLineText(line)}
+                    {paired && ' Choosing it makes this computer’s own model the engine’s default again.'}
+                  </small>
                 </span>
               </label>
               <button type="button" className="btn-tiny" onClick={onOpenEngines}>
@@ -222,7 +247,7 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
               </div>
             )}
           </div>
-          {(workerModels.length > 0 || onWorker) && (
+          {(workerModels.length > 0 || onWorker || paired) && (
             <div className={`ai-choice${source === 'worker' ? ' is-selected' : ''}`}>
               <label className="ai-choice-head">
                 <input type="radio" name="agent-model" checked={source === 'worker'} disabled={saving} onChange={() => choose('worker')} />
@@ -232,7 +257,11 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
                 <span className="ai-choice-text">
                   <strong>On a paired computer</strong>
                   <small className="ai-choice-fact">
-                    {onWorker ? workerModels.find((m) => m.id === onWorker)?.label ?? onWorker : 'A worker’s language model, over OAIY Network (Setup → Networking).'}
+                    {onWorker
+                      ? (workerModels.find((m) => m.id === onWorker)?.label ?? onWorker)
+                      : paired
+                        ? pairedModelText(paired)
+                        : 'A paired computer’s language model, over OAIY Network (Setup → Networking).'}
                   </small>
                 </span>
               </label>
@@ -240,7 +269,7 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
                 <div className="ai-choice-body">
                   <select
                     aria-label="A paired computer's language model"
-                    value={onWorker ?? ''}
+                    value={onWorker ?? paired?.id ?? ''}
                     disabled={saving}
                     onChange={(e) => e.target.value && void save({ model: { source: 'engine', model: e.target.value } })}
                   >
@@ -250,7 +279,18 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
                         {m.label}
                       </option>
                     ))}
+                    {paired && !workerModels.some((m) => m.id === paired.id) && <option value={paired.id}>{`${paired.model} · ${paired.computer}`}</option>}
                   </select>
+                  {paired && (
+                    <div className="agent-paired-default" data-testid="agent-paired-default">
+                      <small className="form-hint">
+                        It is the engine’s default language model, chosen in Engines → Other computers, so the engine’s chats and flows use it too.
+                      </small>
+                      <button type="button" className="btn-tiny" disabled={saving} onClick={() => void takeDefaultBack()}>
+                        <Cpu size={12} aria-hidden /> Use this computer’s model again
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

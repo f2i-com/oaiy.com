@@ -119,6 +119,14 @@ describe('FlowWorkersPanel', () => {
     expect(container.textContent).not.toContain('shares no flow yet');
   });
 
+  it('ends each sentence about an offline computer, and says when it was last heard from as Networking does', async () => {
+    api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, online: false, flows: [], lastSeenMs: Date.now() - 3 * 3_600_000, lastError: 'connection refused (os error 61)' }] });
+    await mount();
+    expect(container.querySelector('[data-testid="flow-worker"] .form-hint')?.textContent).toBe(
+      'Rig is not answering (last report 3 h ago): connection refused (os error 61). The flows it shares show here when it answers again.',
+    );
+  });
+
   it('follows a run this computer asked for there that this page did not start (the Agent’s, or from before a restart)', async () => {
     api.network.nodes.mockResolvedValue({ nodes: [{ ...rig, jobs: [{ kind: 'flow', flow: 'logo', runId: 'r9', status: 'running', mine: true }, { kind: 'flow', status: 'waiting', mine: false }] }] });
     api.network.run.mockResolvedValue({ runId: 'r9', status: 'succeeded', output: { output: 'A fox, found', }, startedAt: '2026-10-18T01:00:00Z', finishedAt: '2026-10-18T01:00:12Z' });

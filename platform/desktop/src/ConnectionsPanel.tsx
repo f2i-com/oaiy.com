@@ -12,6 +12,7 @@ import {
 } from './api';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 import { accessName, pairingFrom, pairingGrants } from './pairingWords';
 import { agoWords } from './BackupPanel';
 import { useVisiblePoll } from './useVisiblePoll';
@@ -171,9 +172,9 @@ export default function ConnectionsPanel() {
   const unlink = async () => {
     const name = account?.connectorName ?? 'this account';
     if (
-      !confirm(
-        `Disconnect ${name}?\n\nThis forgets the key on this machine only — it does not revoke it at the provider. Remove this desktop there too if you want the key to stop working.`,
-      )
+      !(await ask(
+        `Disconnect ${name}?\n\nThis forgets the key on this computer only — it does not revoke it at the provider. Remove this desktop there too if you want the key to stop working.`,
+      ))
     )
       return;
     setAccountError(null);
@@ -248,9 +249,9 @@ export default function ConnectionsPanel() {
 
   const disconnectRelay = async () => {
     if (
-      !confirm(
+      !(await ask(
         'Disconnect the Companion relay? Phones already approved stay approved, but they will not be able to join a call until a relay is set again.',
-      )
+      ))
     )
       return;
     setRelayError(null);
@@ -288,12 +289,12 @@ export default function ConnectionsPanel() {
     [refresh, toast],
   );
 
-  const revoke = (app: PairedApp) => {
+  const revoke = async (app: PairedApp) => {
     const name = app.label ?? app.product;
     if (
-      !confirm(
+      !(await ask(
         `Revoke access for “${name}”? Its token stops working immediately and it will have to pair again.`,
-      )
+      ))
     )
       return;
     void act(app.id, () => pairing.revoke(app.id), `Revoked ${name}`);
@@ -399,7 +400,7 @@ export default function ConnectionsPanel() {
                   aria-label={`Revoke access for ${app.label ?? app.product}${
                     app.origin ? ` at ${app.origin}` : ''
                   }`}
-                  onClick={() => revoke(app)}
+                  onClick={() => void revoke(app)}
                 >
                   Revoke
                 </button>
@@ -555,7 +556,7 @@ export default function ConnectionsPanel() {
                     </small>
                   ))}
                 {/* The other lane, and the one that fails more confusingly.
-                    Checking in only tells the provider this machine is HERE;
+                    Checking in only tells the provider this computer is HERE;
                     everything it then asks for travels the command lane, and a
                     lane that is failing says so nowhere but on the provider's
                     own page — as "no desktop picked it up in time", which reads
@@ -685,7 +686,7 @@ export default function ConnectionsPanel() {
           <h3 className="section-title">Companion relay</h3>
         </div>
         <p className="form-hint">
-          Where this machine gets permission for a phone to join a call. The relay carries
+          Where this computer gets permission for a phone to join a call. The relay carries
           signalling only — call audio goes phone-to-desktop and the relay never hears it.
           FormLogic can act as one, or point this at your own deployment.
         </p>
@@ -733,7 +734,7 @@ export default function ConnectionsPanel() {
                 It is never read back — the server returns only whether one is held. */}
             <input
               type="password"
-              placeholder="the key your relay issued this machine"
+              placeholder="the key your relay issued this computer"
               value={relayForm.token}
               onChange={(e) => setRelayForm((f) => ({ ...f, token: e.target.value }))}
             />

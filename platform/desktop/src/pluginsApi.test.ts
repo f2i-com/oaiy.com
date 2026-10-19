@@ -59,6 +59,7 @@ describe('plugins.trust', () => {
       status: 409,
       body: { error: { code: 'invalid_request', message: 'aokie carries a signature (package-manifest.json). A signed package is judged by its signature alone, so it cannot be trusted by hand.' } },
     };
-    await expect(plugins.trust('aokie')).rejects.toThrow(/409: aokie carries a signature.*cannot be trusted by hand/);
+    // (the desktop's words alone, the status kept beside them for code that tells a refusal apart)
+    await expect(plugins.trust('aokie')).rejects.toMatchObject({ status: 409, message: expect.stringMatching(/^aokie carries a signature.*cannot be trusted by hand/) });
   });
 });

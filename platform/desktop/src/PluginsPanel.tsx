@@ -30,6 +30,7 @@ import { useLiveSetup } from './useLiveSetup';
 import { openSetup, refetchSetup, useSetupState } from './useSetupState';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 import { useVisiblePoll } from './useVisiblePoll';
 import LogsViewer from './LogsViewer';
 import PackageTrustBadge from './PackageTrustBadge';
@@ -143,8 +144,9 @@ export default function PluginsPanel() {
   // (not while the window is hidden in the tray)
   useVisiblePoll(() => void refresh(), POLL_MS);
 
+  /** Do `fn` for plugin `id`; `failed` is what a toast says when it does not work ("eGPU did not start"). */
   const runAction = useCallback(
-    async (id: string, fn: () => Promise<unknown>) => {
+    async (id: string, failed: string, fn: () => Promise<unknown>) => {
       setPending((s) => new Set(s).add(id));
       try {
         await fn();
@@ -154,7 +156,7 @@ export default function PluginsPanel() {
       } catch (e) {
         toast.push({
           kind: 'error',
-          title: `Action failed for "${id}"`,
+          title: failed,
           body: e instanceof Error ? e.message : String(e),
         });
       } finally {
@@ -189,20 +191,31 @@ export default function PluginsPanel() {
       const needsTrust = out.trust?.state === 'unsigned';
       // (a signature that does not check out: it never starts, so nothing here says to start it)
       const quarantined = out.trust?.state === 'quarantined';
+      // An update of a plugin that was running: started again with the new package, or not, and why.
+      const notRestarted = out.replaced && out.notRestarted ? out.notRestarted : null;
+      const restarted = out.replaced && out.restarted === true;
       toast.push({
-        kind: quarantined ? 'error' : 'success',
+        kind: quarantined ? 'error' : notRestarted ? 'info' : 'success',
         title: out.replaced
-          ? `Updated ${out.name} to v${out.version}`
+          ? notRestarted
+            ? `Updated ${out.name} to v${out.version}. It was not started again`
+            : restarted
+              ? `Updated ${out.name} to v${out.version} and started it again`
+              : `Updated ${out.name} to v${out.version}`
           : `Installed ${out.name} v${out.version}`,
-        body: quarantined
-          ? 'Its signature does not check out, so it will not start. Install a copy from its publisher.'
-          : needsTrust
-            ? 'It is not signed, so it will not start until you trust it.'
-            : opensSetup
-              ? 'Its setup opens now.'
-              : out.setup
-                ? 'If its setup has something new, its card says so.'
-                : 'Click Start to run it.',
+        body: notRestarted
+          ? `${notRestarted.charAt(0).toUpperCase()}${notRestarted.slice(1).replace(/\.$/, '')}.`
+          : quarantined
+            ? 'Its signature does not check out, so it will not start. Install a copy from its publisher.'
+            : needsTrust
+              ? 'It is not signed, so it will not start until you trust it.'
+              : opensSetup
+                ? 'Its setup opens now.'
+                : out.setup
+                  ? 'If its setup has something new, its card says so.'
+                  : restarted
+                    ? 'It runs the new version now.'
+                    : 'Click Start to run it.',
       });
       setInstallSource('');
       void refetchModules();
@@ -217,9 +230,9 @@ export default function PluginsPanel() {
 
   const uninstallPlugin = useCallback(
     async (p: PluginRecord) => {
-      const name = p.manifest?.name ?? p.id;
-      if (!confirm(`Remove the “${name}” plugin? Its files are deleted from this machine.`)) return;
-      await runAction(p.id, async () => {
+      const name = p.manifest?.name ?? declaredOf(p)?.name ?? p.id;
+      if (!(await ask(`Remove the “${name}” plugin? Its files are deleted from this computer.`))) return;
+      await runAction(p.id, `${name} was not removed`, async () => {
         await plugins.uninstall(p.id);
         toast.push({ kind: 'success', title: `Removed ${name}` });
       });
@@ -236,16 +249,16 @@ export default function PluginsPanel() {
       const declaresAi = capabilities.includes('oaiy.ai.complete');
       const declaresVoice = capabilities.includes('oaiy.voice.session');
       if (
-        !confirm(
+        !(await ask(
           `Trust the "${name}" plugin?\n\nIt is not signed, so OAIY cannot tell who made it. Trusting it lets it run as native code with your permissions. ` +
             'The trust is for this exact package only: if any of its files change, you are asked again.\n\n' +
             (declaresAi ? 'This package declares AI completion access to your configured providers. Trusting it enables that access.\n\n' : '') +
             (declaresVoice ? 'This package declares local voice session access. Trusting it permits ready local speech; microphone capture still requires explicit consent in each session and native microphone permission.\n\n' : '') +
             'Only trust a plugin you built yourself or got from someone you trust.',
-        )
+        ))
       )
         return;
-      await runAction(p.id, async () => {
+      await runAction(p.id, `${name} was not trusted`, async () => {
         await plugins.trust(p.id);
         const running = p.state === 'running' || p.state === 'unhealthy' || p.state === 'starting';
         toast.push({ kind: 'success', title: `Trusted ${name}`, body: running ? (declaresAi ? 'Return to the plugin and read its host models again.' : 'The plugin is already running.') : 'Click Start to run it.' });
@@ -294,7 +307,7 @@ export default function PluginsPanel() {
           }}
         >
           <label className="form-row">
-            <span>Plugin folder, .zip or .tar.gz on this machine</span>
+            <span>Plugin folder, .zip or .tar.gz on this computer</span>
             <span className="setup-folder-row">
               <input
                 type="text"
@@ -351,24 +364,27 @@ export default function PluginsPanel() {
         </div>
       ) : (
         <section className="service-section">
-          {list.map((p) => (
-            <PluginCard
-              key={p.id}
-              plugin={p}
-              setupTitle={readSetup(p)?.title ?? null}
-              setupStatus={p.userDisabled ? 'none' : pluginSetupStatus(p, setupState, live)}
-              onSetup={() => openSetup({ plugin: p.id })}
-              pending={pending.has(p.id)}
-              onStart={() => runAction(p.id, () => plugins.start(p.id))}
-              onStop={() => runAction(p.id, () => plugins.stop(p.id))}
-              onToggleEnabled={() =>
-                runAction(p.id, () => plugins.setEnabled(p.id, p.userDisabled))
-              }
-              onViewLogs={() => setLogsFor(p.id)}
-              onTrust={() => void trustPlugin(p)}
-              onUninstall={() => void uninstallPlugin(p)}
-            />
-          ))}
+          {list.map((p) => {
+            const name = p.manifest?.name ?? declaredOf(p)?.name ?? p.id;
+            return (
+              <PluginCard
+                key={p.id}
+                plugin={p}
+                setupTitle={readSetup(p)?.title ?? null}
+                setupStatus={p.userDisabled ? 'none' : pluginSetupStatus(p, setupState, live)}
+                onSetup={() => openSetup({ plugin: p.id })}
+                pending={pending.has(p.id)}
+                onStart={() => runAction(p.id, `${name} did not start`, () => plugins.start(p.id))}
+                onStop={() => runAction(p.id, `${name} did not stop`, () => plugins.stop(p.id))}
+                onToggleEnabled={() =>
+                  runAction(p.id, `${name} was not ${p.userDisabled ? 'enabled' : 'disabled'}`, () => plugins.setEnabled(p.id, p.userDisabled))
+                }
+                onViewLogs={() => setLogsFor(p.id)}
+                onTrust={() => void trustPlugin(p)}
+                onUninstall={() => void uninstallPlugin(p)}
+              />
+            );
+          })}
         </section>
       )}
 
@@ -405,7 +421,7 @@ export default function PluginsPanel() {
 
       {logsFor && (
         <LogsViewer
-          title={`${logsFor} — logs`}
+          title={`${nameOf(list.find((p) => p.id === logsFor)) ?? logsFor} — logs`}
           onClose={() => setLogsFor(null)}
           load={async () => (await plugins.logs(logsFor, 300)).lines}
         />
@@ -538,6 +554,12 @@ function PluginCard({
       {unsignedDev && p.manifest?.capabilities?.includes('oaiy.voice.session') && <p className="card-meta">Its local voice access requires you to trust this exact package. Microphone capture needs explicit consent in each session.</p>}
 
       <div className="card-actions">
+        {/* A package the host holds back until it is trusted: trusting it is the next step, so it comes first. */}
+        {unsigned && !pending && !running && (
+          <button className="btn btn-primary" onClick={onTrust} title="Let this exact package run. A change to any of its files asks again.">
+            <ShieldCheck size={14} /> Trust this plugin
+          </button>
+        )}
         {pending ? (
           <button className="btn btn-secondary" disabled>
             <Loader2 size={14} className="spin" /> Working…
@@ -548,9 +570,9 @@ function PluginCard({
           </button>
         ) : (
           <button
-            className="btn btn-primary"
+            className={heldBack ? 'btn btn-secondary' : 'btn btn-primary'}
             onClick={onStart}
-            disabled={!loadable || p.userDisabled}
+            disabled={!loadable || p.userDisabled || heldBack}
             title={
               quarantined
                 ? 'This package failed its signature check, so it will not start.'
@@ -569,7 +591,7 @@ function PluginCard({
 
         {/* Only for a package nobody signed, including one allowed to run in development. A package
             that carries a signature is verified or quarantined by that signature alone. */}
-        {canTrust && !pending && (
+        {canTrust && !pending && !(unsigned && !running) && (
           <button className="btn btn-secondary" onClick={onTrust} title="Let this exact package run. A change to any of its files asks again.">
             <ShieldCheck size={14} /> Trust this plugin
           </button>
@@ -602,6 +624,11 @@ function PluginCard({
       </div>
     </div>
   );
+}
+
+/** A plugin's name as a person knows it: its manifest's, else what it says of itself, else its id. */
+function nameOf(p: PluginRecord | undefined): string | undefined {
+  return p ? (p.manifest?.name ?? declaredOf(p)?.name ?? p.id) : undefined;
 }
 
 /** What a package that may not run says of itself (its name, version and capabilities): shown, never acted on. */

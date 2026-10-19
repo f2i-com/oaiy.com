@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { ChevronDown, CircleAlert, Loader2, RefreshCw, RotateCcw, Search, Square, Trash2, Workflow, X } from 'lucide-react';
 import { bridge, network, type RunHistory, type RunPage, type RunRecord, type RunStatus } from './api';
 import DeadLetters from './DeadLetters';
+import { ask } from './ask';
 import { CopyButton, Fields, JsonBlock, RunAnswer, durationText, errorText, fullWhen, whenText, whoAsked } from './RunParts';
 import { lastFailedOf, writeFailedSeen } from './failedSeen';
 import { useToast } from './Toasts';
@@ -116,7 +117,7 @@ const allClean = (n: number) =>
   n === 1 ? 'Nothing has failed — the one recorded run finished cleanly.' : `Nothing has failed — all ${n} recorded runs finished cleanly.`;
 
 function noFailuresMessage(data: RunHistory): string {
-  if (data.total === 0) return 'No flow has run on this machine yet.';
+  if (data.total === 0) return 'No flow has run on this computer yet.';
   const counts = data.byStatus;
   // A response (or a cached snapshot) without byStatus leaves total as the only
   // number there is; saying 0 would be a worse answer than the old overcount.
@@ -472,9 +473,9 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
     // not obvious — a consumer retrying an old idempotency key gets a fresh
     // run instead of the recorded result, so identical work can run again.
     if (
-      !confirm(
+      !(await ask(
         'Clear finished runs from this history?\n\nQueued and running work is kept. This cannot be undone, and an app that retries a request from before the clear will run it again rather than get the old result.',
-      )
+      ))
     )
       return;
     setClearing(true);
@@ -504,11 +505,11 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
     const name = nameOf(r);
     const queued = r.status === 'queued';
     if (
-      !confirm(
+      !(await ask(
         queued
           ? `Cancel this run of ${name}?\n\nIt has not started: it is taken off the queue and never runs.`
           : `Stop this run of ${name}?\n\nIt is asked to stop now. What it has done so far stays done.`,
-      )
+      ))
     )
       return;
     mark(r.runId, 'stop');
@@ -557,11 +558,11 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
     if (!r.flowId) return;
     const name = nameOf(r);
     if (
-      !confirm(
+      !(await ask(
         ranConfined(r)
           ? `Run ${name} again, with the same inputs?\n\nIt runs on this computer now, as a new run, held in as the first was: its inputs came from outside this computer, so it reaches only its own folders and no other address of this computer or its network. Whatever the flow does (a message it sends, a file it writes) is done again.`
           : `Run ${name} again, with the same inputs?\n\nIt runs on this computer now, as a new run. Whatever the flow does (a message it sends, a file it writes) is done again.`,
-      )
+      ))
     )
       return;
     mark(r.runId, 'again');
@@ -714,7 +715,7 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
             </div>
           ) : (
             <div className="empty-state">
-              {filter === 'failures' ? noFailuresMessage(data) : filter === 'going' ? 'Nothing is running or waiting to run.' : 'No flow has run on this machine yet.'}
+              {filter === 'failures' ? noFailuresMessage(data) : filter === 'going' ? 'Nothing is running or waiting to run.' : 'No flow has run on this computer yet.'}
             </div>
           )
         ) : (

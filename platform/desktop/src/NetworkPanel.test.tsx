@@ -121,7 +121,7 @@ describe('NetworkPanel', () => {
       .mockResolvedValueOnce({ status: 'approved_there', code: '654 321' })
       .mockResolvedValueOnce({ status: 'approved', node });
     await mount();
-    const input = container.querySelector('input[aria-label="Worker address"]') as HTMLInputElement;
+    const input = container.querySelector('input[aria-label="The other computer’s address"]') as HTMLInputElement;
     await act(async () => {
       const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
       set.call(input, '192.168.1.20');
@@ -268,7 +268,7 @@ describe('NetworkPanel', () => {
     await mount();
     const tick = container.querySelector('.network-both-ways input') as HTMLInputElement;
     expect(tick.checked).toBe(true);
-    expect(container.querySelector('.network-both-ways')!.textContent).toContain('Let Rig use this computer too');
+    expect(container.querySelector('.network-both-ways')!.textContent).toContain('Also let Rig use this computer (one pairing, both ways)');
     api.status.mockResolvedValue(both);
     api.nodes.mockResolvedValue({ nodes: [{ ...node, uses: true, usesThis: true }] });
     await act(async () => button('Yes, pair').click());
@@ -288,7 +288,7 @@ describe('NetworkPanel', () => {
     expect(tick.checked).toBe(false);
     await act(async () => tick.click());
     expect(api.setSettings).toHaveBeenCalledWith({ agent: true });
-    const input = container.querySelector('input[aria-label="Worker address"]') as HTMLInputElement;
+    const input = container.querySelector('input[aria-label="The other computer’s address"]') as HTMLInputElement;
     await act(async () => {
       const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
       set.call(input, '192.168.1.20');
@@ -335,7 +335,7 @@ describe('NetworkPanel', () => {
     api.startPairing.mockResolvedValue({ pairingId: 'x', code: '654 321', status: 'pending', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.20:17975', fingerprint: '1111' } });
     api.confirmPairing.mockResolvedValue({ status: 'declined' });
     await mount();
-    const input = container.querySelector('input[aria-label="Worker address"]') as HTMLInputElement;
+    const input = container.querySelector('input[aria-label="The other computer’s address"]') as HTMLInputElement;
     await act(async () => {
       const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
       set.call(input, '192.168.1.20');
@@ -389,5 +389,120 @@ describe('NetworkPanel', () => {
     await act(async () => button('Unpair').click());
     expect(api.unpair).toHaveBeenCalledWith('w1');
     confirm.mockRestore();
+  });
+
+  it('says so when a pairing asked for both ways came about one way only, and why', async () => {
+    const both = { ...primary, uses: true, lends: true, role: 'both', listening: '0.0.0.0:17975', addresses: ['192.168.1.20:17975'] };
+    api.status.mockResolvedValue({ ...both, pairings: [{ pairingId: 'x', code: '654 321', status: 'approved_there', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.21:17975', fingerprint: '1111' } }] });
+    api.confirmPairing.mockResolvedValue({ status: 'approved', node, bothWays: false, bothWaysError: 'Rig could not reach this computer at 192.168.1.20:17975 (connection timed out).' });
+    await mount();
+    api.status.mockResolvedValue(both);
+    await act(async () => button('Yes, pair').click());
+    const said = Array.from(container.querySelectorAll('.banner')).find((b) => b.textContent?.startsWith('Paired with'))!;
+    expect(said.textContent).toBe(
+      'Paired with Rig, one way only: this computer uses Rig, but Rig cannot use this one: Rig could not reach this computer at 192.168.1.20:17975 (connection timed out). To let it, pair again from Rig’s Networking page.',
+    );
+    expect(said.className).not.toContain('banner-ok');
+  });
+
+  it('says plainly “Paired” where both ways came about, or was not asked for', async () => {
+    const both = { ...primary, uses: true, lends: true, role: 'both', listening: '0.0.0.0:17975', addresses: ['192.168.1.20:17975'] };
+    api.status.mockResolvedValue({ ...both, pairings: [{ pairingId: 'x', code: '654 321', status: 'approved_there', worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.21:17975', fingerprint: '1111' } }] });
+    api.confirmPairing.mockResolvedValue({ status: 'approved', node, bothWays: true, bothWaysError: null });
+    await mount();
+    api.status.mockResolvedValue(both);
+    await act(async () => button('Yes, pair').click());
+    const said = Array.from(container.querySelectorAll('.banner')).find((b) => b.textContent?.startsWith('Paired with'))!;
+    expect(said.textContent).toBe('Paired with Rig.');
+    expect(said.className).toContain('banner-ok');
+  });
+
+  it('offers both ways before pairing in plain words', async () => {
+    api.status.mockResolvedValue({ ...primary, lends: true, role: 'both', listening: '0.0.0.0:17975', addresses: ['192.168.1.20:17975'] });
+    await mount();
+    expect(container.querySelector('.network-both-ways')!.textContent).toBe('Also let the computer you pair with use this one (one pairing, both ways)');
+    expect(container.querySelector('input[aria-label="The other computer’s address"]')).not.toBeNull();
+    expect(container.textContent).not.toMatch(/\bworker/i);
+  });
+
+  it('where the other computer was not reached, lists what to check, this Mac’s Local Network permission on a Mac', async () => {
+    const agent = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15');
+    try {
+      api.status.mockResolvedValue(primary);
+      api.startPairing.mockRejectedValue(new Error('Could not reach 192.168.1.99:17975: connection refused (os error 61)'));
+      await mount();
+      const input = container.querySelector('input[aria-label="The other computer’s address"]') as HTMLInputElement;
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, '192.168.1.99:17975');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await act(async () => (container.querySelector('form.network-add button[type="submit"]') as HTMLButtonElement).click());
+      const items = Array.from(container.querySelectorAll('.network-checklist li')).map((li) => li.textContent);
+      expect(items).toHaveLength(4);
+      expect(items[2]).toContain('on Windows the network must be set as Private, or the firewall must allow OAIY on Public networks');
+      expect(items[3]).toBe('This Mac lets OAIY reach the local network: System Settings → Privacy & Security → Local Network, with OAIY switched on.');
+      agent.mockReturnValue('Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
+      await act(async () => root.render(<NetworkPanel key="again" />));
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(container.querySelector('input[aria-label="The other computer’s address"]'), '192.168.1.99:17975');
+        container.querySelector('input[aria-label="The other computer’s address"]')!.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await act(async () => (container.querySelector('form.network-add button[type="submit"]') as HTMLButtonElement).click());
+      expect(container.querySelectorAll('.network-checklist li')).toHaveLength(3);
+    } finally {
+      agent.mockRestore();
+    }
+  });
+
+  it('lending, says the other computer must reach this one, and on Windows that the network must be Private', async () => {
+    const agent = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
+    try {
+      api.status.mockResolvedValue(worker);
+      await mount();
+      const reach = container.querySelector('[data-testid="network-reach"]')!.textContent;
+      expect(reach).toContain('must reach it at one of these addresses, on port 17975');
+      expect(reach).toContain('the network must be set as Private, or the firewall must allow OAIY on Public networks');
+    } finally {
+      agent.mockRestore();
+    }
+  });
+
+  it('says what is not known of an offline computer rather than guessing it', async () => {
+    api.status.mockResolvedValue(primary);
+    api.nodes.mockResolvedValue({
+      nodes: [{ ...node, online: false, lastError: 'connection refused', devices: [{ id: 'gpu0', name: 'RTX 3090', memory_total_mb: 24576, memory_used_mb: null }], models: [{ id: 'engine:image:node.w1/moss', kind: 'image', model: 'moss', state: 'not loaded', device: null, pinned: false }] }],
+    });
+    await mount();
+    const card = container.querySelector('[data-testid="network-node"]')!;
+    expect(card.querySelector('.network-device-figure')?.textContent).toBe('24.0 GB VRAM, in use not known while it is offline');
+    expect(card.textContent).toContain('Which models are loaded on it is not known while it is offline.');
+    expect(card.textContent).not.toContain('No model is loaded on it now.');
+    expect(card.textContent).not.toContain('?');
+  });
+
+  it('offers “Use here” only for a service not in use here already', async () => {
+    const voice = { id: 'oaiy-voice', name: 'OAIY Voice', installed: true, status: 'running' };
+    api.nodes.mockResolvedValue({ nodes: [{ ...node, services: [voice] }] });
+    api.status.mockResolvedValue({ ...primary, services: {} });
+    const onNavigate = vi.fn();
+    await act(async () => root.render(<NetworkPanel onNavigate={onNavigate} />));
+    await act(async () => {});
+    expect(button('Use here')).toBeTruthy();
+    api.status.mockResolvedValue({ ...primary, services: { 'oaiy-voice': { nodeId: 'w1', nodeName: 'Rig' } } });
+    await act(async () => root.render(<NetworkPanel key="used" onNavigate={onNavigate} />));
+    await act(async () => {});
+    expect(container.textContent).toContain('OAIY Voice (in use here)');
+    expect(button('Use here')).toBeUndefined();
+    await act(async () => button('Open Services').click());
+    expect(onNavigate).toHaveBeenCalledWith('services');
+  });
+
+  it('marks a default its computer cannot run now as not in effect, with why', async () => {
+    api.status.mockResolvedValue({ ...primary, defaults: { image: { id: 'engine:image:node.w1/flux', nodeId: 'w1', nodeName: 'Rig', model: 'flux', inEffect: false, waiting: 'engines_down' } } });
+    api.nodes.mockResolvedValue({ nodes: [node] });
+    await mount();
+    const chip = container.querySelector('[data-testid="network-node"] .engine-default-chip')!;
+    expect(chip.textContent?.trim()).toBe('Default, not in effect');
+    expect(chip.getAttribute('title')).toBe('Not in effect: Rig’s engines are not running; this computer’s own model runs meanwhile.');
   });
 });

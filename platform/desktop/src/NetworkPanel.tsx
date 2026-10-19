@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { AudioLines, Bot, Check, Copy, Unlock, Laptop, Link2, Loader2, Pin, PinOff, Server, TriangleAlert, Unplug, Workflow, X, type LucideIcon } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
+import { ask } from './ask';
 import {
   isNotFound,
   network,
+  type NetworkDefault,
   type NetworkDevice,
   type NetworkJob,
   type NetworkMachine,
@@ -15,6 +17,7 @@ import {
   type NetworkRole,
   type NetworkStatus,
 } from './api';
+import { hostOS } from './platform';
 
 /** How many answers in a row a pairing may miss (two seconds apart) before this screen gives it up. */
 const PAIRING_MISSES = 5;
@@ -167,7 +170,7 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
           onNavigate={onNavigate}
           onChanged={refresh}
           onUnpair={async (n) => {
-            if (!window.confirm(`Unpair ${n.name}? Neither can use the other until you pair them again.`)) return;
+            if (!(await ask(`Unpair ${n.name}? Neither can use the other until you pair them again.`))) return;
             setActionError(null);
             try {
               await network.unpair(n.nodeId);
@@ -369,6 +372,12 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
             ) : (
               <div className="network-invalid">Not listening: switch it on again, or choose another port.</div>
             ))}
+          {status.lends && status.listening && (
+            <div className="network-reach" data-testid="network-reach">
+              The computer that uses this one must reach it at one of these addresses, on port {status.settings.port}.
+              {hostOS() === 'windows' && ' On Windows, the network must be set as Private, or the firewall must allow OAIY on Public networks.'}
+            </div>
+          )}
           {status.lends && (
             <div>
               It lends the computers paired with it its models and GPUs, the flows it shares (<em>Let apps run it</em> in Flows) and OAIY Voice, when set up here.
@@ -548,10 +557,21 @@ function FindWorkers({
   const [pairing, setPairing] = useState<NetworkPairing | null>(() => inProgress?.[0] ?? null);
   /** The worker approved: this side's person says whether it showed the same code. */
   const [approvedThere, setApprovedThere] = useState(() => inProgress?.[0]?.status === 'approved_there');
-  const [outcome, setOutcome] = useState<{ text: string; paired: boolean } | null>(null);
+  const [outcome, setOutcome] = useState<{ text: string; paired: boolean; oneWay?: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const timer = useRef<number | undefined>(undefined);
+  /** The pairing under way was asked for both ways (said once it is paired, when the other way did not come about). */
+  const askedBothWays = useRef(false);
+  /** What a pairing that went through says: paired; or paired one way only, and why, where both ways was asked for. */
+  const paired = (name: string, r: { bothWays?: boolean; bothWaysError?: string | null }) =>
+    askedBothWays.current && r.bothWays === false
+      ? {
+          text: `Paired with ${name}, one way only: this computer uses ${name}, but ${name} cannot use this one${r.bothWaysError ? `: ${r.bothWaysError.replace(/\.$/, '')}` : ''}. To let it, pair again from ${name}’s Networking page.`,
+          paired: true,
+          oneWay: true,
+        }
+      : { text: `Paired with ${name}.`, paired: true };
 
   // While a pairing waits for the worker's approval, ask every two seconds.
   useEffect(() => {
@@ -577,7 +597,7 @@ function FindWorkers({
         setPairing(null);
         setOutcome(
           r.status === 'approved'
-            ? { text: `Paired with ${r.node?.name ?? pairing.worker.name}.`, paired: true }
+            ? paired(r.node?.name ?? pairing.worker.name, r)
             : r.status === 'denied'
               ? { text: `${pairing.worker.name} declined the pairing.`, paired: false }
               : { text: 'The pairing request expired: start again.', paired: false },
@@ -611,12 +631,13 @@ function FindWorkers({
     setError(null);
     setPairing(null);
     setApprovedThere(false);
+    askedBothWays.current = accept && lends && bothWays;
     try {
       const r = await network.confirmPairing(pairing.pairingId, accept, accept && lends && bothWays);
       if (r.status === 'approved') setAddress('');
       setOutcome(
         r.status === 'approved'
-          ? { text: `Paired with ${r.node?.name ?? pairing.worker.name}.`, paired: true }
+          ? paired(r.node?.name ?? pairing.worker.name, r)
           : waiting
             ? null
             : { text: 'Not paired: the codes did not match.', paired: false },
@@ -635,6 +656,7 @@ function FindWorkers({
     setApprovedThere(false);
     try {
       // (both ways where this computer lends itself and the person leaves it ticked: asked again once the other approves)
+      askedBothWays.current = lends && bothWays;
       const started = await network.startPairing({ ...target, bothWays: lends && bothWays });
       // (approved there at once, its window to pair by itself open: still paired here only once this person says it
       // shows the same code, which it does with the computers it paired by itself)
@@ -662,11 +684,21 @@ function FindWorkers({
           {unreachable(error) && <ul className="network-checklist">
             <li>On the other computer, Setup → Networking has Lend this computer switched on, and shows the address to type here.</li>
             <li>Both computers are on the same network (not a guest Wi-Fi that keeps devices apart).</li>
-            <li>The worker’s firewall lets OAIY in (macOS asks the first time; Windows may need “Allow”).</li>
+            <li>
+              The other computer’s firewall lets OAIY in: a Mac asks the first time; on Windows the network must be set as Private, or the firewall
+              must allow OAIY on Public networks.
+            </li>
+            {hostOS() === 'macos' && (
+              <li>This Mac lets OAIY reach the local network: System Settings → Privacy &amp; Security → Local Network, with OAIY switched on.</li>
+            )}
           </ul>}
         </div>
       )}
-      {outcome && <div className={`banner ${outcome.paired ? 'banner-ok' : 'banner-pending'}`}>{outcome.text}</div>}
+      {outcome && (
+        <div className={`banner ${outcome.paired && !outcome.oneWay ? 'banner-ok' : 'banner-pending'}`} role="status">
+          {outcome.text}
+        </div>
+      )}
       {pairing && (
         <div className="pairing-card pairing-pending network-pairing" data-testid="network-pairing">
           <div className="pairing-head">
@@ -696,7 +728,7 @@ function FindWorkers({
             <label className="network-both-ways">
               <input type="checkbox" checked={bothWays} onChange={(e) => setBothWays(e.target.checked)} />
               <span>
-                Let {pairing.worker.name} use this computer too <small>(this computer lends itself: one pairing, both ways)</small>
+                Also let {pairing.worker.name} use this computer <small>(one pairing, both ways)</small>
               </span>
             </label>
           )}
@@ -750,7 +782,7 @@ function FindWorkers({
       >
         <label className="form-row">
           <span>{discovery ? 'Or add one by its address' : 'Add one by its address'}</span>
-          <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder="192.168.1.20:17975" disabled={starting || !!pairing} aria-label="Worker address" />
+          <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder="192.168.1.20:17975" disabled={starting || !!pairing} aria-label="The other computer’s address" />
         </label>
         <button className="btn btn-primary" type="submit" disabled={starting || !!pairing || !address.trim()}>
           {starting ? <Loader2 size={14} className="spin" aria-hidden /> : <Link2 size={14} aria-hidden />} Pair
@@ -760,7 +792,7 @@ function FindWorkers({
         <label className="network-both-ways">
           <input type="checkbox" checked={bothWays} onChange={(e) => setBothWays(e.target.checked)} />
           <span>
-            Let the computer paired with use this one too <small>(this computer lends itself: one pairing, both ways)</small>
+            Also let the computer you pair with use this one <small>(one pairing, both ways)</small>
           </span>
         </label>
       )}
@@ -794,6 +826,35 @@ export const STATE: Record<string, { label: string; tone: 'ok' | 'busy' | 'idle'
   'not loaded': { label: 'Not loaded', tone: 'off' },
 };
 const PIN_STATE: Record<string, string> = { warming: 'Pinned · loading', ready: 'Pinned', failed: 'Pinned · could not load', waiting: 'Pinned · waiting to load' };
+
+/** Why a default on a paired computer is not in effect now, in a sentence; null where it is (or the desktop does not say). */
+export function notInEffect(d: NetworkDefault | undefined, name: string): string | null {
+  if (!d || d.inEffect !== false) return null;
+  const who = d.nodeName || name || 'the paired computer';
+  const why =
+    d.waiting === 'not_heard'
+      ? `${who} has not been heard from since this computer started`
+      : d.waiting === 'engines_down'
+        ? `${who}’s engines are not running`
+        : d.waiting === 'model_gone'
+          ? `${who} no longer has this model`
+          : `${who} cannot run it now`;
+  return `Not in effect: ${why}; this computer’s own model runs meanwhile.`;
+}
+
+/** A model's mark as its kind's default here: "Default", or "Default, not in effect" with why (Engines → Other computers). */
+export function DefaultChip({ d, name, size = 12 }: { d: NetworkDefault | undefined; name: string; size?: number }) {
+  const waiting = notInEffect(d, name);
+  return waiting ? (
+    <span className="engine-default-chip is-waiting" title={waiting}>
+      <TriangleAlert size={size} aria-hidden /> Default, not in effect
+    </span>
+  ) : (
+    <span className="engine-default-chip" title="This computer's default of its kind (Engines → Other computers)">
+      <Check size={size} aria-hidden /> Default
+    </span>
+  );
+}
 
 /** A worker's models: the pinned and loaded ones, then the rest it can load, folded away. Each can be pinned there. */
 function NodeModels({ node, onChanged, defaults }: { node: NetworkNode; onChanged: () => void; defaults: NetworkStatus['defaults'] }) {
@@ -829,11 +890,7 @@ function NodeModels({ node, onChanged, defaults }: { node: NetworkNode; onChange
           <code>{m.model}</code>
           {node.online && (m.state !== 'not loaded' || m.pinned) && <span className={`network-state network-state-${state.tone}`}>{state.label}</span>}
           {where && <span className="network-where">on {where}</span>}
-          {isDefault(m) && (
-            <span className="engine-default-chip" title="This computer's default of its kind (Engines → Other computers)">
-              <Check size={11} aria-hidden /> Default
-            </span>
-          )}
+          {isDefault(m) && <DefaultChip d={defaults?.[m.kind]} name={node.name} size={11} />}
           {m.pinned && (
             <span className={`network-pinned${pinState === 'failed' ? ' is-failed' : ''}`}>
               <Pin size={11} aria-hidden /> {PIN_STATE[pinState] ?? 'Pinned'}
@@ -845,7 +902,7 @@ function NodeModels({ node, onChanged, defaults }: { node: NetworkNode; onChange
           <button
             className={`btn-tiny network-pin${m.pinned ? ' is-pinned' : ''}`}
             disabled={busy !== null}
-            title={m.pinned ? 'Let it go as any other model again' : 'Keep it loaded on this worker, and load it again when the worker restarts'}
+            title={m.pinned ? 'Let it go as any other model again' : `Keep it loaded on ${node.name}, and load it again when ${node.name} restarts`}
             onClick={() => void toggle(m)}
           >
             {busy === m.id ? <Loader2 size={12} className="spin" aria-hidden /> : m.pinned ? <PinOff size={12} aria-hidden /> : <Pin size={12} aria-hidden />}
@@ -863,7 +920,11 @@ function NodeModels({ node, onChanged, defaults }: { node: NetworkNode; onChange
           <TriangleAlert size={13} aria-hidden /> {error}
         </div>
       )}
-      {loaded.length > 0 ? loaded.map(row) : <div className="form-hint">No model is loaded on it now.</div>}
+      {loaded.length > 0 ? (
+        loaded.map(row)
+      ) : (
+        <div className="form-hint">{node.online ? 'No model is loaded on it now.' : 'Which models are loaded on it is not known while it is offline.'}</div>
+      )}
       {rest.length > 0 && (
         <details className="network-more">
           <summary>{rest.length} more it can load</summary>
@@ -896,7 +957,11 @@ export function Device({ d, live, temperature }: { d: NetworkDevice; live: boole
         <div className={`network-meter-fill${share !== null && share > 85 ? ' is-full' : ''}`} style={{ width: `${share ?? 0}%` }} />
       </div>
       <div className="network-device-figure">
-        {total ? `${used !== null ? gb(used) : '?'} of ${gb(total)} GB ${d.unified ? 'shared memory' : 'VRAM'} in use` : 'memory unknown'}
+        {!total
+          ? 'memory unknown'
+          : used !== null
+            ? `${gb(used)} of ${gb(total)} GB ${d.unified ? 'shared memory' : 'VRAM'} in use`
+            : `${gb(total)} GB ${d.unified ? 'shared memory' : 'VRAM'}, ${live ? 'in use not known' : 'in use not known while it is offline'}`}
       </div>
     </div>
   );
@@ -971,8 +1036,8 @@ function pairedWhen(at: number): string {
   return d.toDateString() === new Date().toDateString() ? `at ${time}` : `on ${d.toLocaleDateString([], { day: 'numeric', month: 'short' })} at ${time}`;
 }
 
-/** How long ago, in a person's words. */
-function ago(ms: number): string {
+/** How long ago, in a person's words ("3 min ago", "2 h ago", then the date). */
+export function ago(ms: number): string {
   const minutes = Math.round((Date.now() - ms) / 60000);
   if (minutes < 1) return 'just now';
   if (minutes < 60) return `${minutes} min ago`;
@@ -1103,9 +1168,11 @@ function PairedComputers({
                         <span className="network-extra-what">
                           {(n.services ?? []).map((x) => `${x.name}${services?.[x.id]?.nodeId === n.nodeId ? ' (in use here)' : x.installed ? '' : ' (not set up there)'}`).join(', ')}
                         </span>
+                        {/* (each one in use here already: Services is where it is given back, not where it is used again) */}
                         {onNavigate && (
                           <button className="btn-tiny" onClick={() => onNavigate('services')}>
-                            <AudioLines size={12} aria-hidden /> Use here
+                            <AudioLines size={12} aria-hidden />{' '}
+                            {(n.services ?? []).every((x) => services?.[x.id]?.nodeId === n.nodeId || !x.installed) ? 'Open Services' : 'Use here'}
                           </button>
                         )}
                       </div>
@@ -1119,8 +1186,8 @@ function PairedComputers({
       )}
       {uses && nodes.some((n) => n.uses ?? n.role === 'worker') && (
         <p className="form-hint">
-          A worker’s models are listed in Flows’ model menus, named with the worker, and run on the worker; Engines → Other computers makes one this
-          computer’s default of its kind.
+          A paired computer’s models are listed in Flows’ model menus, named with the computer, and run there; Engines → Other computers makes one
+          this computer’s default of its kind.
         </p>
       )}
     </section>

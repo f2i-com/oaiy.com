@@ -17,6 +17,7 @@ const m = vi.hoisted(() => ({
   codexStatus: vi.fn(),
   codexModels: vi.fn(),
   nodes: vi.fn(),
+  setDefault: vi.fn(),
 }));
 
 vi.mock('./api', async (importOriginal) => {
@@ -29,7 +30,7 @@ vi.mock('./api', async (importOriginal) => {
     engines: { ...real.engines, catalog: m.catalog },
     codex: { ...real.codex, status: m.codexStatus },
     codexModels: m.codexModels,
-    network: { ...real.network, nodes: m.nodes },
+    network: { ...real.network, nodes: m.nodes, setDefault: m.setDefault },
   };
 });
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: vi.fn() }) }));
@@ -149,6 +150,41 @@ describe('Settings → Agent with the routes', () => {
     });
     await settle();
     expect(m.prefsSet).toHaveBeenCalledWith({ model: { source: 'engine', model: 'engine:llm:node.w1/qwen' } });
+  });
+
+  it('names the paired computer’s model the engine’s default is, as the choice in use, and makes this computer’s own the default again', async () => {
+    // (the engine's default is a paired computer's, Engines → Other computers: the desktop says which beside the preference)
+    m.prefsGet.mockResolvedValue({ model: { source: 'engine' }, engineDefault: 'engine:llm:node.w1/qwen3.8-flash-next', engineDefaultName: 'Desktop' });
+    m.nodes.mockResolvedValue({ nodes: [{ nodeId: 'w1', name: 'Desktop', role: 'worker', online: true, models: [{ id: 'engine:llm:node.w1/qwen3.8-flash-next', kind: 'llm', model: 'qwen3.8-flash-next' }] }] });
+    m.setDefault.mockResolvedValue({});
+    await render();
+    const choices = Array.from(section('The Agent’s model').querySelectorAll('.ai-choice'));
+    const paired = choices.find((c) => c.textContent?.includes('On a paired computer'))!;
+    expect(paired.className).toContain('is-selected');
+    expect(paired.querySelector<HTMLInputElement>('input[type="radio"]')!.checked).toBe(true);
+    expect(paired.textContent).toContain('Uses qwen3.8-flash-next on Desktop (Engines → Other computers).');
+    expect(paired.querySelector('select')!.value).toBe('engine:llm:node.w1/qwen3.8-flash-next');
+    // (not "On this computer … Picked-In-Engines" as if that were in use)
+    const local = choices.find((c) => c.textContent?.includes('On this computer'))!;
+    expect(local.className).not.toContain('is-selected');
+    expect(local.textContent).toContain('Choosing it makes this computer’s own model the engine’s default again.');
+    const back = Array.from(paired.querySelectorAll('button')).find((b) => b.textContent?.includes('Use this computer’s model again'))!;
+    m.prefsGet.mockResolvedValue({ model: { source: 'engine' } });
+    await act(async () => back.click());
+    await settle();
+    expect(m.setDefault).toHaveBeenCalledWith('llm', null);
+    expect(m.prefsSet).not.toHaveBeenCalled();
+  });
+
+  it('choosing “On this computer” while the engine’s default is a paired computer’s takes the default back', async () => {
+    m.prefsGet.mockResolvedValue({ model: { source: 'engine' }, engineDefault: 'engine:llm:node.w1/qwen', engineDefaultName: 'Rig' });
+    m.setDefault.mockResolvedValue({});
+    await render();
+    const local = Array.from(section('The Agent’s model').querySelectorAll('.ai-choice')).find((c) => c.textContent?.includes('On this computer'))!;
+    await act(async () => local.querySelector<HTMLInputElement>('input[type="radio"]')!.click());
+    await settle();
+    expect(m.setDefault).toHaveBeenCalledWith('llm', null);
+    expect(m.prefsSet).not.toHaveBeenCalled();
   });
 
   it('picks the ChatGPT model from Codex’s catalogue, or goes back to the engine', async () => {

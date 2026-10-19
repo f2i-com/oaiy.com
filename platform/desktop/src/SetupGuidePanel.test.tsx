@@ -163,6 +163,31 @@ describe('the setup card', () => {
     expect(outside).toEqual(['Get the flow runtime ready']);
   });
 
+  it('says a plugin waits to be trusted under “Something needs a look”, with the way to Plugins', async () => {
+    setupState.value = record(true);
+    catalogMock.mockResolvedValue({ running: true, defaults: { llm: 'qwen3.5-9b' } });
+    const egpu: PluginRecord = {
+      id: 'egpu', state: 'installed', dir: 'x', userDisabled: false, restartAttempts: 0,
+      manifest: { name: 'eGPU', version: '0.2.0' } as PluginRecord['manifest'],
+      trust: { state: 'unsigned', reason: 'The package carries no signature.' },
+    };
+    const onNavigate = vi.fn();
+    await act(async () => {
+      root.render(<SetupGuidePanel {...input} runtime={READY} plugins={[egpu]} onNavigate={onNavigate} onDismiss={vi.fn()} />);
+    });
+    await act(async () => {});
+    expect(host.querySelector('.section-title')?.textContent).toBe('Something needs a look');
+    const row = host.querySelector('[data-testid="plugin-waiting-for-trust"]')!;
+    expect(row.textContent).toContain('eGPU is waiting for you to trust it');
+    act(() => (row.querySelector('button') as HTMLButtonElement).click());
+    expect(onNavigate).toHaveBeenCalledWith('plugins');
+    // (one turned off by the person, or running in a developer build, is not waiting)
+    await act(async () => {
+      root.render(<SetupGuidePanel {...input} runtime={READY} plugins={[{ ...egpu, userDisabled: true }, { ...egpu, id: 'dev', state: 'running', trust: { state: 'unsigned-dev' } }]} onNavigate={onNavigate} onDismiss={vi.fn()} />);
+    });
+    expect(host.querySelector('[data-testid="plugin-waiting-for-trust"]')).toBeNull();
+  });
+
   it('says setup could not be read, with a way to ask again, rather than a wizard that never loads', () => {
     setupState.error = 'the desktop is busy';
     render();

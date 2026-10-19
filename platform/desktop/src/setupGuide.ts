@@ -114,7 +114,7 @@ export function deriveSetupSteps(input: SetupInput): SetupStep[] {
     {
       id: 'connect',
       title: 'Connect an app',
-      detail: 'Let a site like FormLogic run flows on this machine. It asks; you approve.',
+      detail: 'Let a site like FormLogic run flows on this computer. It asks; you approve.',
       done: anyConnected,
       optional: true,
       target: 'connections',

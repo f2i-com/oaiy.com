@@ -34,7 +34,14 @@ import { useVisiblePoll } from './useVisiblePoll';
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-export default function HoursPanel({ onOpenCalendar }: { onOpenCalendar?: () => void }) {
+export default function HoursPanel({
+  onOpenCalendar,
+  phonePage,
+}: {
+  onOpenCalendar?: () => void;
+  /** The phone's own page (the plugin's, under its section: "AI Receptionist → Phone"), where its greeting is set. */
+  phonePage?: { where: string; open: () => void } | null;
+}) {
   const phoneOn = moduleOn(useModules(), 'phone') === true;
   const toast = useToast();
   const [settings, setSettings] = useState<CalendarSettings | null>(null);
@@ -68,7 +75,7 @@ export default function HoursPanel({ onOpenCalendar }: { onOpenCalendar?: () => 
             setSettings(s);
             toast.push({ kind: 'success', title: 'Saved', body: 'The receptionist offers these hours and services from now on.' });
           }}
-          after={phoneOn ? <CallVoice /> : null}
+          after={phoneOn ? <CallVoice phonePage={phonePage} /> : null}
           onOpenCalendar={onOpenCalendar}
         />
       ) : (
@@ -568,7 +575,7 @@ export function SettingsForm({
  * how long the greeting waits after a call connects. Changes here apply at
  * once (not with the form's Save).
  */
-export function CallVoice() {
+export function CallVoice({ phonePage }: { phonePage?: { where: string; open: () => void } | null } = {}) {
   const toast = useToast();
   const [list, setList] = useState<VoiceClip[]>([]);
   const [chosen, setChosen] = useState<string | null>(null);
@@ -665,8 +672,10 @@ export function CallVoice() {
       fail('Not removed', e);
     }
   };
+  // (the name it would be kept under, the clip's own where none is typed: one beginning "from-" is refused by the desktop)
+  const reserved = copyName(name.trim() || (file ? file.name.replace(/\.[^.]+$/, '') : ''));
   const add = async () => {
-    if (!file) return;
+    if (!file || reserved) return;
     setAdding(true);
     try {
       const r = await voices.add(name.trim() || file.name.replace(/\.[^.]+$/, ''), file, words, true);
@@ -693,7 +702,16 @@ export function CallVoice() {
       </div>
       <p className="form-hint">
         The voice callers hear. It is copied, on this computer, from a short clip: 5 to 30 seconds of one person speaking clearly, as an MP3 or WAV.
-        “Hear it” says the phone’s greeting, which is set in the Phone section under Settings, Greeting &amp; brief.
+        “Hear it” says the phone’s greeting, which is set on {phonePage ? <strong>{phonePage.where}</strong> : 'the phone’s own page'}, in its
+        Settings tab (Greeting &amp; brief).
+        {phonePage && (
+          <>
+            {' '}
+            <button type="button" className="btn-link" onClick={phonePage.open}>
+              Open {phonePage.where}
+            </button>
+          </>
+        )}
       </p>
       <ul className="voice-list" role="radiogroup" aria-label="The voice on calls">
         {!loaded ? (
@@ -752,13 +770,23 @@ export function CallVoice() {
         </label>
         <label className="form-row">
           <span>Its name</span>
-          <input value={name} placeholder={file ? file.name.replace(/\.[^.]+$/, '') : 'Front desk'} onChange={(e) => setName(e.target.value)} />
+          <input
+            value={name}
+            placeholder={file ? file.name.replace(/\.[^.]+$/, '') : 'Front desk'}
+            onChange={(e) => setName(e.target.value)}
+            aria-invalid={reserved}
+          />
+          {reserved && (
+            <small className="hours-error" role="alert">
+              A name beginning with “from-” is how copies of another computer’s voices are named here: choose another.
+            </small>
+          )}
         </label>
         <label className="form-row voice-words">
           <span>What it says (optional)</span>
           <input value={words} placeholder="Heard from the clip when left empty" onChange={(e) => setWords(e.target.value)} />
         </label>
-        <button type="button" className="btn btn-primary" disabled={!file || adding} onClick={() => void add()}>
+        <button type="button" className="btn btn-primary" disabled={!file || adding || reserved} onClick={() => void add()}>
           <Plus size={14} /> {adding ? 'Adding…' : 'Add and use it'}
         </button>
       </div>
@@ -768,6 +796,15 @@ export function CallVoice() {
 }
 
 const isMs = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/**
+ * Whether a voice of this computer's own would be named as the copies of another computer's voices are ("from-…"),
+ * which the desktop refuses: the name as it keeps it, spaces made dashes and other characters left out.
+ */
+export function copyName(name: string): boolean {
+  const kept = name.trim().replace(/\s/g, '-').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48).replace(/^-+|-+$/g, '');
+  return /^from-/i.test(kept);
+}
 
 /** One of the phone's commands, through the gated route the plugin's own screens use (as Setup's `pluginCommand`), its envelope taken off. */
 async function phoneCommand(connector: string, command: string, payload?: unknown): Promise<unknown> {

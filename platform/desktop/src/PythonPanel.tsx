@@ -11,6 +11,7 @@ import {
 } from './api';
 import LogsViewer from './LogsViewer';
 import { useToast } from './Toasts';
+import { ask } from './ask';
 
 /**
  * Python panel — install the bundled runtime, manage reusable venvs.
@@ -319,9 +320,9 @@ export default function PythonPanel() {
                   if (v.boundServices.length > 0) {
                     msg += ' This will break: ' + v.boundServices.join(', ') + '.';
                   }
-                  if (confirm(msg)) {
-                    runAction(() => python.deleteVenv(v.name));
-                  }
+                  void ask(msg).then((yes) => {
+                    if (yes) runAction(() => python.deleteVenv(v.name));
+                  });
                 }}
                 disabled={jobActive}
               >
