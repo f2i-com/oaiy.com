@@ -171,7 +171,7 @@ fn signed_version(trusted_comment: &str) -> Option<&str> {
 ///   underscore-separated part of it): [`Target::signed_name_fits`]. This is what a downgrade meets, since the older
 ///   installer's signature names the older version;
 /// - the bytes must start the way that kind of file does ([`Target::looks_like`]: `MZ` for the Windows setup, `\x7fELF` for the
-///   AppImage), so that a file of the wrong kind cannot come through under the right name;
+///   AppImage, gzip's `\x1f\x8b` for the Mac's packed app), so that a file of the wrong kind cannot come through under the right name;
 /// - a `version:` field, when there is one, must be the announced version, whatever `require_signed_version` says;
 ///   with that on, a signature without one is refused.
 pub fn verify_package(bytes: Vec<u8>, signature: &str, pubkey: &str, expected: &Expected) -> Result<VerifiedPackage, VerifyError> {
@@ -187,7 +187,8 @@ pub fn verify_package(bytes: Vec<u8>, signature: &str, pubkey: &str, expected: &
         NameProblem::NotThisVersion => VerifyError::SignedFileNotThisVersion { file: file.to_string(), announced: expected.version.to_string() },
     })?;
     // The signature can be right for a name and the bytes still not the kind of file that name says (the signer signed what it was
-    // given): the updater on Windows runs whatever it is handed, and the one on Linux writes it over the AppImage.
+    // given): the updater on Windows runs whatever it is handed, the one on Linux writes it over the AppImage, and the Mac's unpacks
+    // it in place of the app.
     if !expected.target.looks_like(&bytes) {
         return Err(VerifyError::NotThisKindOfFile { expected: expected.target.what() });
     }
@@ -261,11 +262,12 @@ pub(crate) mod testing {
         comment_for(Target::WindowsSetup, version)
     }
 
-    /// The same for either installer.
+    /// The same for any installer (the Mac's under the name the Mac update workflow signs it as).
     pub fn comment_for(target: Target, version: &str) -> String {
         let file = match target {
             Target::WindowsSetup => format!("OAIY_{version}_x64-setup.exe"),
             Target::LinuxAppImage => format!("OAIY_{version}_amd64.AppImage"),
+            Target::MacApp => format!("OAIY_{version}_aarch64.app.tar.gz"),
         };
         format!("timestamp:1790000000\tfile:{file}")
     }
@@ -281,9 +283,11 @@ mod tests {
     use super::testing::{comment, comment_for, comment_with_version, Keys};
     use super::*;
 
-    /// Stand-ins that start the way a Windows executable and a Linux executable do (an update checks that much of what it is given).
+    /// Stand-ins that start the way a Windows executable, a Linux executable and a gzip file do (an update checks that much of
+    /// what it is given).
     const INSTALLER: &[u8] = b"MZ pretend this is a 100 MB installer";
     const APPIMAGE: &[u8] = b"\x7fELF pretend this is a 100 MB AppImage";
+    const MAC_APP: &[u8] = b"\x1f\x8b pretend this is the 80 MB packed Mac app";
 
     fn setup(version: &str) -> Expected<'_> {
         Expected::new(version, Target::WindowsSetup)
@@ -388,6 +392,30 @@ mod tests {
     }
 
     #[test]
+    fn the_macs_packed_app_verifies_for_a_mac_and_for_nothing_else_and_nothing_else_for_a_mac() {
+        let keys = Keys::new(7);
+        let mac = keys.sign(MAC_APP, &comment_for(Target::MacApp, "0.2.0"));
+        let package = accepted(&keys, MAC_APP, &mac, &Expected::new("0.2.0", Target::MacApp)).unwrap();
+        assert_eq!((package.target(), package.version(), package.bytes()), (Target::MacApp, "0.2.0", MAC_APP));
+        assert!(matches!(accepted(&keys, MAC_APP, &mac, &Expected::new("9.9.9", Target::MacApp)), Err(VerifyError::SignedFileNotThisVersion { .. })));
+        for other in [Target::WindowsSetup, Target::LinuxAppImage] {
+            assert!(matches!(accepted(&keys, MAC_APP, &mac, &Expected::new("0.2.0", other)), Err(VerifyError::SignedFileNotThisKind { .. })), "{other:?}");
+        }
+        let windows = keys.sign(INSTALLER, &comment_for(Target::WindowsSetup, "0.2.0"));
+        assert!(matches!(accepted(&keys, INSTALLER, &windows, &Expected::new("0.2.0", Target::MacApp)), Err(VerifyError::SignedFileNotThisKind { .. })));
+        // The bundler's own name for the archive carries no version, so a signature made for it is no release's.
+        let unversioned = keys.sign(MAC_APP, "timestamp:1790000000\tfile:OAIY.app.tar.gz");
+        assert!(matches!(accepted(&keys, MAC_APP, &unversioned, &Expected::new("0.2.0", Target::MacApp)), Err(VerifyError::SignedFileNotThisVersion { .. })));
+        // The release's other archives (the CLI's, the server's) are not the packed app, whatever their bytes.
+        for file in ["oaiy-cli-0.2.0.tar.gz", "oaiy-server-0.2.0-linux-x86_64.tar.gz", "OAIY_0.2.0_aarch64.dmg"] {
+            let sig = keys.sign(MAC_APP, &format!("timestamp:1790000000\tfile:{file}"));
+            assert!(matches!(accepted(&keys, MAC_APP, &sig, &Expected::new("0.2.0", Target::MacApp)), Err(VerifyError::SignedFileNotThisKind { .. })), "{file}");
+        }
+        let message = accepted(&keys, MAC_APP, &mac, &setup("0.2.0")).unwrap_err().to_string();
+        assert!(message.contains("OAIY_0.2.0_aarch64.app.tar.gz") && message.contains("Windows installer"), "{message}");
+    }
+
+    #[test]
     fn the_appimage_is_held_to_its_ending_and_its_version_and_nothing_more() {
         // The AppImage's name has changed between Tauri versions (amd64, x86_64, no architecture), so only these two are looked at.
         let keys = Keys::new(7);
@@ -403,7 +431,7 @@ mod tests {
         // Signed by the right key, under the right name, for the right version: but the file is not that kind of installer
         // (the signer signed what it was given, or a mix-up put the wrong file under the right name).
         let keys = Keys::new(7);
-        let wrong: [(Target, &[u8]); 7] = [
+        let wrong: [(Target, &[u8]); 11] = [
             (Target::WindowsSetup, APPIMAGE),
             (Target::WindowsSetup, b"<html>404</html>"),
             (Target::WindowsSetup, b"M"),
@@ -411,6 +439,10 @@ mod tests {
             (Target::LinuxAppImage, INSTALLER),
             (Target::LinuxAppImage, b"#!/bin/sh\nrm -rf ~\n"),
             (Target::LinuxAppImage, b"\x7fEL"),
+            (Target::MacApp, INSTALLER),
+            (Target::MacApp, b"PK\x03\x04 a zip"),
+            (Target::MacApp, b"\x1f"),
+            (Target::MacApp, b"\xcf\xfa\xed\xfe a bare Mach-O program"),
         ];
         for (target, bytes) in wrong {
             let sig = keys.sign(bytes, &comment_for(target, "0.2.0"));
@@ -425,8 +457,12 @@ mod tests {
         let keys = Keys::new(7);
         let windows = accepted(&keys, INSTALLER, &keys.sign(INSTALLER, &comment("0.2.0")), &setup("0.2.0")).unwrap();
         let linux = accepted(&keys, APPIMAGE, &keys.sign(APPIMAGE, &comment_for(Target::LinuxAppImage, "0.2.0")), &Expected::new("0.2.0", Target::LinuxAppImage)).unwrap();
+        let mac = accepted(&keys, MAC_APP, &keys.sign(MAC_APP, &comment_for(Target::MacApp, "0.2.0")), &Expected::new("0.2.0", Target::MacApp)).unwrap();
         assert_eq!(windows.check_for_hand_off("0.2.0", Some(Target::WindowsSetup)), Ok(()));
         assert_eq!(linux.check_for_hand_off("0.2.0", Some(Target::LinuxAppImage)), Ok(()));
+        assert_eq!(mac.check_for_hand_off("0.2.0", Some(Target::MacApp)), Ok(()));
+        assert!(mac.check_for_hand_off("0.2.0", Some(Target::LinuxAppImage)).unwrap_err().contains("Mac app"));
+        assert!(linux.check_for_hand_off("0.2.0", Some(Target::MacApp)).is_err());
         // The update handle is for another version than the bytes were verified for.
         let other = windows.check_for_hand_off("0.3.0", Some(Target::WindowsSetup)).unwrap_err();
         assert!(other.contains("0.2.0") && other.contains("0.3.0"), "{other}");
@@ -437,7 +473,7 @@ mod tests {
         assert!(mixed.contains("Windows installer") && mixed.contains("Linux AppImage"), "{mixed}");
         assert!(linux.check_for_hand_off("0.2.0", Some(Target::WindowsSetup)).is_err());
         // Bytes that no longer start the way that kind of file does (built in place: the fields are private to this module).
-        for (target, bytes) in [(Target::WindowsSetup, &b"<html>"[..]), (Target::WindowsSetup, APPIMAGE), (Target::LinuxAppImage, INSTALLER), (Target::LinuxAppImage, b"")] {
+        for (target, bytes) in [(Target::WindowsSetup, &b"<html>"[..]), (Target::WindowsSetup, APPIMAGE), (Target::LinuxAppImage, INSTALLER), (Target::LinuxAppImage, b""), (Target::MacApp, APPIMAGE)] {
             let altered = VerifiedPackage { version: "0.2.0".into(), target, bytes: bytes.to_vec() };
             assert!(altered.check_for_hand_off("0.2.0", Some(target)).unwrap_err().contains("does not start like"), "{target:?} {bytes:?}");
         }
@@ -484,13 +520,15 @@ mod tests {
         }
     }
 
-    // A real installer's signature: two stand-in files (an `MZ` file and an ELF one, 3000 bytes each, not installers) signed by
-    // `tauri signer sign` (the Tauri CLI this repository uses, 2.11) under the names the bundler gives an installer, with a
-    // throwaway key. See testdata/README.txt.
+    // A real installer's signature: three stand-in files (an `MZ` file, an ELF one and a gzip one, 3000 bytes each, not installers)
+    // signed by `tauri signer sign` (the Tauri CLI this repository uses, 2.11) under the names each installer is signed under, with
+    // a throwaway key. See testdata/README.txt.
     const WINDOWS_PAYLOAD: &[u8] = include_bytes!("testdata/windows-setup.bin");
     const WINDOWS_SIGNATURE: &str = include_str!("testdata/windows-setup.bin.sig");
     const LINUX_PAYLOAD: &[u8] = include_bytes!("testdata/linux-appimage.bin");
     const LINUX_SIGNATURE: &str = include_str!("testdata/linux-appimage.bin.sig");
+    const MAC_PAYLOAD: &[u8] = include_bytes!("testdata/mac-app.bin");
+    const MAC_SIGNATURE: &str = include_str!("testdata/mac-app.bin.sig");
     const REAL_PUBKEY: &str = include_str!("testdata/throwaway.key.pub");
 
     // Payloads that are not signed under their own names are not made here: see the real ones below.
@@ -498,6 +536,7 @@ mod tests {
         let (payload, signature) = match target {
             Target::WindowsSetup => (WINDOWS_PAYLOAD, WINDOWS_SIGNATURE),
             Target::LinuxAppImage => (LINUX_PAYLOAD, LINUX_SIGNATURE),
+            Target::MacApp => (MAC_PAYLOAD, MAC_SIGNATURE),
         };
         verify_package(payload.to_vec(), signature.trim(), REAL_PUBKEY.trim(), &Expected::new(version, target))
     }
@@ -515,6 +554,10 @@ mod tests {
         assert!(parsed.trusted_comment().starts_with("timestamp:") && parsed.trusted_comment().ends_with("\tfile:OAIY_0.1.0_x64-setup.exe"), "{}", parsed.trusted_comment());
         let parsed = Signature::decode(&decode_text(LINUX_SIGNATURE.trim()).unwrap()).unwrap();
         assert!(parsed.trusted_comment().ends_with("\tfile:OAIY_0.1.0_amd64.AppImage"), "{}", parsed.trusted_comment());
+        let mac = real(Target::MacApp, "0.1.0").expect("the Mac's packed app too");
+        assert_eq!((mac.bytes(), mac.target()), (MAC_PAYLOAD, Target::MacApp));
+        let parsed = Signature::decode(&decode_text(MAC_SIGNATURE.trim()).unwrap()).unwrap();
+        assert!(parsed.trusted_comment().ends_with("\tfile:OAIY_0.1.0_aarch64.app.tar.gz"), "{}", parsed.trusted_comment());
         for at in [0, WINDOWS_PAYLOAD.len() / 2, WINDOWS_PAYLOAD.len() - 1] {
             let mut changed = WINDOWS_PAYLOAD.to_vec();
             changed[at] ^= 1;
@@ -534,11 +577,16 @@ mod tests {
         for announced in ["9.9.9", "0.2.0", "0.1.1", "1.0.0", "0.1.0-rc.1"] {
             assert!(matches!(real(Target::WindowsSetup, announced), Err(VerifyError::SignedFileNotThisVersion { .. })), "{announced}");
             assert!(matches!(real(Target::LinuxAppImage, announced), Err(VerifyError::SignedFileNotThisVersion { .. })), "{announced}");
+            assert!(matches!(real(Target::MacApp, announced), Err(VerifyError::SignedFileNotThisVersion { .. })), "{announced}");
         }
         // The Windows setup and its real signature, where the AppImage belongs.
         let mixed = verify_package(WINDOWS_PAYLOAD.to_vec(), WINDOWS_SIGNATURE.trim(), REAL_PUBKEY.trim(), &Expected::new("0.1.0", Target::LinuxAppImage));
         assert!(matches!(mixed, Err(VerifyError::SignedFileNotThisKind { .. })), "{mixed:?}");
         let mixed = verify_package(LINUX_PAYLOAD.to_vec(), LINUX_SIGNATURE.trim(), REAL_PUBKEY.trim(), &Expected::new("0.1.0", Target::WindowsSetup));
+        assert!(matches!(mixed, Err(VerifyError::SignedFileNotThisKind { .. })), "{mixed:?}");
+        let mixed = verify_package(MAC_PAYLOAD.to_vec(), MAC_SIGNATURE.trim(), REAL_PUBKEY.trim(), &Expected::new("0.1.0", Target::LinuxAppImage));
+        assert!(matches!(mixed, Err(VerifyError::SignedFileNotThisKind { .. })), "{mixed:?}");
+        let mixed = verify_package(LINUX_PAYLOAD.to_vec(), LINUX_SIGNATURE.trim(), REAL_PUBKEY.trim(), &Expected::new("0.1.0", Target::MacApp));
         assert!(matches!(mixed, Err(VerifyError::SignedFileNotThisKind { .. })), "{mixed:?}");
     }
 
@@ -556,7 +604,7 @@ mod tests {
     /// The pipeline's real output, verified the way an installed OAIY verifies a download: an installer made by `tauri build`
     /// with the updater artifacts on (or signed with `tauri signer sign`), the `.sig` beside it, and the public key of the key
     /// that signed it. Run on purpose, with the paths in the environment (it needs an installer, so it is not part of a plain
-    /// `cargo test`). A `.AppImage` is taken as the Linux installer, anything else as the Windows one:
+    /// `cargo test`). A `.AppImage` is taken as the Linux installer, an `.app.tar.gz` as the Mac's, anything else as the Windows one:
     ///
     /// ```text
     /// OAIY_TEST_INSTALLER=<...-setup.exe> OAIY_TEST_PUBKEY_FILE=<key>.pub OAIY_TEST_VERSION=0.1.0 \
@@ -568,7 +616,13 @@ mod tests {
         let installer = std::env::var("OAIY_TEST_INSTALLER").expect("OAIY_TEST_INSTALLER is the path of the setup.exe");
         let pubkey_file = std::env::var("OAIY_TEST_PUBKEY_FILE").expect("OAIY_TEST_PUBKEY_FILE is the path of the .pub file");
         let version = std::env::var("OAIY_TEST_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
-        let target = if installer.ends_with(".AppImage") { Target::LinuxAppImage } else { Target::WindowsSetup };
+        let target = if installer.ends_with(".AppImage") {
+            Target::LinuxAppImage
+        } else if installer.ends_with(".app.tar.gz") {
+            Target::MacApp
+        } else {
+            Target::WindowsSetup
+        };
         let pubkey = std::fs::read_to_string(&pubkey_file).unwrap().trim().to_string();
         let signature = std::fs::read_to_string(format!("{installer}.sig")).expect("the .sig beside the installer");
         let bytes = std::fs::read(&installer).unwrap();

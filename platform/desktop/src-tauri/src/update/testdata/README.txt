@@ -6,6 +6,10 @@ windows-setup.bin.sig   its signature, made by `tauri signer sign` (the Tauri CL
 linux-appimage.bin      3000 bytes that start like a Linux executable (ELF) and are not an AppImage,
                         signed as OAIY_0.1.0_amd64.AppImage
 linux-appimage.bin.sig  its signature
+mac-app.bin             3000 bytes that start like a gzip file (\x1f\x8b) and are not an archive,
+                        signed as OAIY_0.1.0_aarch64.app.tar.gz (the name the Mac update workflow signs the
+                        packed app under)
+mac-app.bin.sig         its signature
 throwaway.key.pub       the public key of a THROWAWAY key, made for these files. Its private half was
                         deleted the moment they were signed. It is not the key OAIY's updates are signed
                         with (that one is in tauri.conf.json, plugins.updater.pubkey).
@@ -22,6 +26,7 @@ make-latest-json.test.mjs) verify these signatures: what they accept is what an 
 To make them again: `npx tauri signer generate -w <a folder outside every repository>`, put the two payloads under
 their bundler names beside it, put the password in TAURI_SIGNING_PRIVATE_KEY_PASSWORD (not on a command line)
 and `npx tauri signer sign -f <the key> <file>` for each, copy the payloads and the .sig files here under the names above with the new .pub, and delete the private key.
+(Last made 2026-10-19 with tauri-cli 2.11.2, when the Mac's file was added: all three are signed by the one key.)
 
 aokie-manifest.json     a COPY of the manifest of the phone plugin OAIY is used with (aokie.com,
                         crates/aokie-plugin/manifest.json, at cb298dd). update/phone.rs runs it through the

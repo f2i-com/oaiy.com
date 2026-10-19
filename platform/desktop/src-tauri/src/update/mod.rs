@@ -17,8 +17,8 @@
 //!   only thing that can be installed (it also holds the signature to the announced version, by the
 //!   name of the file it was made for);
 //! - [`target`]: which kind of installer each platform takes;
-//! - [`kind`]: whether this install can replace itself (the NSIS setup.exe and the AppImage can; an MSI, a
-//!   .deb, an .rpm and a development build cannot);
+//! - [`kind`]: whether this install can replace itself (the NSIS setup.exe, the AppImage and a Mac's app in a
+//!   folder of its own disk can; an MSI, a .deb, an .rpm and a development build cannot);
 //! - [`blockers`]: what stops an install, in words;
 //! - [`updater`]: the state everything above feeds, and the moves between states;
 //! - [`install`]: the safe order of an install, and the stop it shares with quitting;

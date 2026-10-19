@@ -1,26 +1,34 @@
 //! What an update installs on each platform: which file, under what name, starting how.
 //!
-//! Two installs can update themselves (see [`super::kind`]), and each has exactly one kind of installer:
+//! Three installs can update themselves (see [`super::kind`]), and each has exactly one kind of installer:
 //!
-//! | platform key | installer | the release asset | the bundler's name for it | starts with |
+//! | platform key | installer | the release asset | the name it is signed under | starts with |
 //! |---|---|---|---|---|
 //! | `windows-x86_64` | the NSIS setup | `oaiy-desktop-<v>-windows-x64-setup.exe` | `OAIY_<v>_x64-setup.exe` | `MZ` |
 //! | `linux-x86_64` | the AppImage | `oaiy-desktop-<v>-linux-x86_64.AppImage` | `OAIY_<v>_amd64.AppImage` | `\x7fELF` |
+//! | `darwin-aarch64` | the Mac app, packed | `oaiy-desktop-<v>-macos-arm64.app.tar.gz` | `OAIY_<v>_aarch64.app.tar.gz` | `\x1f\x8b` (gzip) |
 //!
-//! The Windows updater runs whatever it is given as an installer and the Linux updater writes whatever it is given over the
-//! AppImage, so an installer of the wrong kind (a `setup.exe` where the AppImage belongs, a file that is neither) is not
-//! a failed update: it is a program that will not start, put where the working one was. Three checks keep the kinds apart,
+//! The first two are signed under the names the Tauri bundler gives them. The Mac's is not the bundler's: the archive is
+//! made from the signed, notarised app of the release's disk image (`.github/workflows/mac-update.yml`), and the bundler's
+//! own name for one, `OAIY.app.tar.gz`, carries no version, which the signature has to (see [`Target::signed_name_fits`]).
+//!
+//! The Windows updater runs whatever it is given as an installer, the Linux updater writes whatever it is given over the
+//! AppImage, and the Mac's unpacks whatever archive it is given in place of the app, so an installer of the wrong kind (a
+//! `setup.exe` where the AppImage belongs, a file that is neither) is not a failed update: it is a program that will not
+//! start, put where the working one was. Three checks keep the kinds apart,
 //! each on its own: the address must be this platform's asset by its exact name ([`Target::asset_name`], see
 //! `feed::check_asset_url`), the name the signature was made for must be an installer of this kind for the announced
 //! version ([`Target::signed_name_fits`]), and the bytes must start the way such a file does ([`Target::looks_like`]).
 
-/// The two things an update can install.
+/// The three things an update can install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// The NSIS `setup.exe` (Windows, x86_64).
     WindowsSetup,
     /// The AppImage (Linux, x86_64).
     LinuxAppImage,
+    /// The app, `OAIY.app`, as a gzipped tar with the app at its top (macOS, Apple silicon).
+    MacApp,
 }
 
 /// Why a name a signature was made for does not fit.
@@ -33,11 +41,12 @@ pub enum NameProblem {
 }
 
 impl Target {
-    /// The installer for the feed's platform key (`windows-x86_64`, `linux-x86_64`), or None.
+    /// The installer for the feed's platform key (`windows-x86_64`, `linux-x86_64`, `darwin-aarch64`), or None.
     pub fn for_platform_key(key: &str) -> Option<Target> {
         match key {
             "windows-x86_64" => Some(Target::WindowsSetup),
             "linux-x86_64" => Some(Target::LinuxAppImage),
+            "darwin-aarch64" => Some(Target::MacApp),
             _ => None,
         }
     }
@@ -52,22 +61,26 @@ impl Target {
         match self {
             Target::WindowsSetup => "windows-x86_64",
             Target::LinuxAppImage => "linux-x86_64",
+            Target::MacApp => "darwin-aarch64",
         }
     }
 
-    /// The name the release job gives the asset (exact: no other name is this platform's installer).
+    /// The name the release job gives the asset (exact: no other name is this platform's installer). The Mac's is given by the
+    /// Mac update workflow, beside the disk image it is made from.
     pub fn asset_name(self, version: &str) -> String {
         match self {
             Target::WindowsSetup => format!("oaiy-desktop-{version}-windows-x64-setup.exe"),
             Target::LinuxAppImage => format!("oaiy-desktop-{version}-linux-x86_64.AppImage"),
+            Target::MacApp => format!("oaiy-desktop-{version}-macos-arm64.app.tar.gz"),
         }
     }
 
-    /// How the name of such a file ends (the bundler's, and the release's).
+    /// How the name of such a file ends (the signed name's, and the release's).
     pub fn file_suffix(self) -> &'static str {
         match self {
             Target::WindowsSetup => "-setup.exe",
             Target::LinuxAppImage => ".AppImage",
+            Target::MacApp => ".app.tar.gz",
         }
     }
 
@@ -76,14 +89,17 @@ impl Target {
         match self {
             Target::WindowsSetup => "the Windows installer (a setup.exe)",
             Target::LinuxAppImage => "the Linux AppImage",
+            Target::MacApp => "the Mac app (an .app.tar.gz)",
         }
     }
 
-    /// The first bytes of such a file: `MZ` (a Windows executable), `\x7fELF` (a Linux executable, which an AppImage is).
+    /// The first bytes of such a file: `MZ` (a Windows executable), `\x7fELF` (a Linux executable, which an AppImage is),
+    /// `\x1f\x8b` (gzip, which the Mac's packed app is).
     pub fn magic(self) -> &'static [u8] {
         match self {
             Target::WindowsSetup => b"MZ",
             Target::LinuxAppImage => b"\x7fELF",
+            Target::MacApp => b"\x1f\x8b",
         }
     }
 
@@ -93,7 +109,7 @@ impl Target {
     }
 
     /// Whether the file name a signature says it was made for (the `file:` of its trusted comment: the Tauri CLI writes the
-    /// name of the file it signed, `OAIY_0.2.0_x64-setup.exe`) is a file of this kind for `version`.
+    /// name of the file it signed, `OAIY_0.2.0_x64-setup.exe`, `OAIY_0.2.0_aarch64.app.tar.gz`) is a file of this kind for `version`.
     ///
     /// Only two things of the name are looked at, on every platform: it ends the way this kind of file's name does, and the
     /// version is one whole part of it. The parts are what the underscores separate, which is how the bundler names its
@@ -121,10 +137,12 @@ mod tests {
     fn each_platform_key_has_its_own_kind_of_installer_and_nothing_else_has_one() {
         assert_eq!(Target::for_platform_key("windows-x86_64"), Some(Target::WindowsSetup));
         assert_eq!(Target::for_platform_key("linux-x86_64"), Some(Target::LinuxAppImage));
-        for key in ["darwin-aarch64", "windows-aarch64", "linux-aarch64", "windows-x86_64-msi", "Windows-x86_64", ""] {
+        assert_eq!(Target::for_platform_key("darwin-aarch64"), Some(Target::MacApp));
+        // An Intel Mac has no release, and the updater plugin's bundle-type spelling of a key is not the feed's.
+        for key in ["darwin-x86_64", "darwin-aarch64-app", "macos-aarch64", "windows-aarch64", "linux-aarch64", "windows-x86_64-msi", "Windows-x86_64", ""] {
             assert_eq!(Target::for_platform_key(key), None, "{key}");
         }
-        for target in [Target::WindowsSetup, Target::LinuxAppImage] {
+        for target in [Target::WindowsSetup, Target::LinuxAppImage, Target::MacApp] {
             assert_eq!(Target::for_platform_key(target.platform_key()), Some(target));
         }
     }
@@ -137,16 +155,27 @@ mod tests {
         let workflow = include_str!("../../../../../.github/workflows/release.yml").replace("\r\n", "\n");
         assert!(workflow.contains("\"$out/oaiy-desktop-$VERSION-windows-x64-setup.exe\""), "release.yml names the Windows asset differently");
         assert!(workflow.contains("\"$out/oaiy-desktop-$VERSION-linux-x86_64.AppImage\""), "release.yml names the Linux asset differently");
+        // The Mac's is made by mac-update.yml, beside the release's disk image, and signed under a name that carries the version.
+        assert_eq!(Target::MacApp.asset_name("0.2.0"), "oaiy-desktop-0.2.0-macos-arm64.app.tar.gz");
+        let mac = include_str!("../../../../../.github/workflows/mac-update.yml").replace("\r\n", "\n");
+        assert!(mac.contains("asset=\"oaiy-desktop-$VERSION-macos-arm64.app.tar.gz\""), "mac-update.yml names the Mac asset differently");
+        assert!(mac.contains("signed_as=\"OAIY_${VERSION}_aarch64.app.tar.gz\""), "mac-update.yml signs the Mac archive under another name");
+        assert_eq!(Target::MacApp.signed_name_fits("OAIY_0.2.0_aarch64.app.tar.gz", "0.2.0"), Ok(()));
     }
 
     #[test]
-    fn a_setup_starts_with_mz_and_an_appimage_with_elf_and_neither_is_the_other() {
+    fn a_setup_starts_with_mz_an_appimage_with_elf_and_the_macs_archive_with_gzip_and_none_is_another() {
         let exe = b"MZ\x90\x00\x03\x00\x00\x00";
         let elf = b"\x7fELF\x02\x01\x01\x00";
-        assert!(Target::WindowsSetup.looks_like(exe) && !Target::WindowsSetup.looks_like(elf));
-        assert!(Target::LinuxAppImage.looks_like(elf) && !Target::LinuxAppImage.looks_like(exe));
-        for junk in [&b""[..], b"M", b"Z", b"\x7fEL", b"<html>", b"PK\x03\x04", b"#!/bin/sh\n"] {
-            assert!(!Target::WindowsSetup.looks_like(junk) && !Target::LinuxAppImage.looks_like(junk), "{junk:?}");
+        let gz = b"\x1f\x8b\x08\x00\x00\x00\x00\x00";
+        assert!(Target::WindowsSetup.looks_like(exe) && !Target::WindowsSetup.looks_like(elf) && !Target::WindowsSetup.looks_like(gz));
+        assert!(Target::LinuxAppImage.looks_like(elf) && !Target::LinuxAppImage.looks_like(exe) && !Target::LinuxAppImage.looks_like(gz));
+        assert!(Target::MacApp.looks_like(gz) && !Target::MacApp.looks_like(exe) && !Target::MacApp.looks_like(elf));
+        // (a zip, a bare Mach-O, a disk image's start: not the packed app)
+        for junk in [&b""[..], b"M", b"Z", b"\x7fEL", b"\x1f", b"<html>", b"PK\x03\x04", b"#!/bin/sh\n", b"\xcf\xfa\xed\xfe", b"koly"] {
+            for target in [Target::WindowsSetup, Target::LinuxAppImage, Target::MacApp] {
+                assert!(!target.looks_like(junk), "{target:?} {junk:?}");
+            }
         }
     }
 
@@ -158,6 +187,23 @@ mod tests {
         for name in ["OAIY_0.1.0_x86_64.AppImage", "oaiy_0.1.0.AppImage", "0.1.0_.AppImage"] {
             assert_eq!(Target::LinuxAppImage.signed_name_fits(name, "0.1.0"), Ok(()), "{name}");
         }
+        assert_eq!(Target::MacApp.signed_name_fits("OAIY_0.1.0_aarch64.app.tar.gz", "0.1.0"), Ok(()));
+    }
+
+    #[test]
+    fn the_macs_archive_is_signed_under_a_name_with_its_version_and_the_bundlers_own_name_has_none() {
+        // The Tauri bundler calls its archive OAIY.app.tar.gz: signed under that name, no release could be told from another.
+        assert_eq!(Target::MacApp.signed_name_fits("OAIY.app.tar.gz", "0.1.0"), Err(NameProblem::NotThisVersion));
+        for name in ["OAIY_0.1.5_aarch64.app.tar.gz", "OAIY_10.1.0_aarch64.app.tar.gz", "OAIY_0.1.0-rc.1_aarch64.app.tar.gz", "OAIY-0.1.0-aarch64.app.tar.gz"] {
+            assert_eq!(Target::MacApp.signed_name_fits(name, "0.1.0"), Err(NameProblem::NotThisVersion), "{name}");
+        }
+        // Another archive of the release (the CLI, the server, the web site) or a disk image is not the packed app.
+        for name in ["oaiy-cli-0.1.0.tar.gz", "oaiy-server-0.1.0-linux-x86_64.tar.gz", "OAIY_0.1.0_aarch64.tar.gz", "OAIY_0.1.0_aarch64.dmg", "OAIY_0.1.0_aarch64.app.zip", "OAIY_0.1.0_aarch64.app.tar.gz.sig", "OAIY_0.1.0_x64-setup.exe", "OAIY_0.1.0_amd64.AppImage", "dir/OAIY_0.1.0_aarch64.app.tar.gz"] {
+            assert_eq!(Target::MacApp.signed_name_fits(name, "0.1.0"), Err(NameProblem::NotThisKind), "{name}");
+        }
+        // ...and the Mac's archive is neither of the others.
+        assert_eq!(Target::WindowsSetup.signed_name_fits("OAIY_0.1.0_aarch64.app.tar.gz", "0.1.0"), Err(NameProblem::NotThisKind));
+        assert_eq!(Target::LinuxAppImage.signed_name_fits("OAIY_0.1.0_aarch64.app.tar.gz", "0.1.0"), Err(NameProblem::NotThisKind));
     }
 
     #[test]

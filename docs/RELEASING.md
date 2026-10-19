@@ -13,13 +13,14 @@ by hand on its own, because automatic CI is paused).
 | `oaiy-desktop-<v>-windows-x64-setup.exe`, `oaiy-desktop-<v>-windows-x64.msi` | OAIY Desktop for Windows. The setup.exe is what OAIY updates itself with; the MSI is a manual download. |
 | `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-linux-amd64.deb`, and `-linux-x86_64.rpm` when the build made one (the workflow copies it only if it is there, so a release may have none) | OAIY Desktop for Linux. The AppImage can update itself; the deb and rpm are manual downloads. |
 | `oaiy-desktop-<v>-windows-x64-setup.exe.sig`, `oaiy-desktop-<v>-linux-x86_64.AppImage.sig` | The signature of each installer an update can install, made with the updater key. |
-| `latest.json` | The update feed: the version, the notes, the date, and for `windows-x86_64` and `linux-x86_64` the installer's URL and signature. OAIY Desktop reads it from `releases/latest/download/latest.json`. |
+| `latest.json` | The update feed: the version, the notes, the date, and for `windows-x86_64` and `linux-x86_64` the installer's URL and signature (and `darwin-aarch64` once the Mac update has run: [A Mac's update](#a-macs-update)). OAIY Desktop reads it from `releases/latest/download/latest.json`. |
 | `oaiy-server-<v>-windows-x64.zip`, `oaiy-server-<v>-linux-x86_64.tar.gz` | The headless server: the same local API with no window, for a host the CLI or a web app drives. It has no Agent or flow editor to show. |
 | `oaiy-cli-<v>.tar.gz` | The CLI alone, for a product that embeds it |
 | `oaiy-web-<v>.zip`, `oaiy-web-<v>.tar.gz` | The flow editor's site (landing page, `/app.html`, `/desktop.html`), for any static host, built for this release: its download buttons name this release's files (see [The web site](#the-web-site)) |
 | `SHA256SUMS.txt` | The checksum of every file above, `latest.json` and the `.sig` files included |
 | `release-evidence-web.json`, `-linux.json`, `-windows.json` | For each build: the revision, target, toolchain, digests, and the verification run that passed before anything was published |
-| `oaiy-desktop-<v>-macos-arm64.dmg`, and its `.sha256` | OAIY Desktop for an Apple-silicon Mac, signed with the Developer ID and notarised by Apple. Added after the release is published, by the Mac build ([A Mac's image](#a-macs-image)): `SHA256SUMS.txt` was written before it and does not list it, so its checksum is the file beside it. The update feed has no entry for a Mac: a newer image is installed over the app. |
+| `oaiy-desktop-<v>-macos-arm64.dmg`, and its `.sha256` | OAIY Desktop for an Apple-silicon Mac, signed with the Developer ID and notarised by Apple. Added after the release is published, by the Mac build ([A Mac's image](#a-macs-image)), with its checksum beside it; `SHA256SUMS.txt` lists it once the Mac update has run. |
+| `oaiy-desktop-<v>-macos-arm64.app.tar.gz`, its `.sig` and its `.sha256` | What an installed OAIY on a Mac updates itself from: the app out of that image, packed, and its signature made with the updater key. Added by the Mac update ([A Mac's update](#a-macs-update)), which also puts the Mac in `latest.json` and replaces `SHA256SUMS.txt` with one that lists the image and these. |
 | `oaiy-egpu-plugin-<v>-macos-arm64.zip`, and its `.sha256` | The eGPU plugin for that Mac app: an NVIDIA RTX 30, 40 or 50 card in a Thunderbolt enclosure, with its kernels compiled ahead of time for each (until 0.1.6, RTX 40 only: `-rtx40.zip`). Built on a Mac that has such a card and added by hand ([The eGPU plugin](#the-egpu-plugin)). |
 
 An OAIY Desktop installer is complete by itself for what it shows. Besides the dashboard
@@ -66,7 +67,9 @@ What keeps the key from everything that does not need it:
   CLI is installed from the desktop app's lockfile with no install scripts (`npm ci
   --ignore-scripts`: `@tauri-apps/cli` has none, and its Linux binding is an optional package
   the lockfile pins; only esbuild's and fsevents' scripts are skipped, and this job needs
-  neither), and nothing of the project is built or run there.
+  neither), and nothing of the project is built or run there. The Mac update
+  (`mac-update.yml`) has a `sign` job of its own made the same way, in the same environment,
+  which signs only the Mac's packed app that its `pack` job made ([A Mac's update](#a-macs-update)).
 - **It signs only what the desktop builds made.** It downloads the two desktop artifacts by their
   exact names (`desktop-windows`, `desktop-linux`), each into a folder of its own, and signs an
   installer only if its sha256 is the one that leg recorded as a JOB OUTPUT of the build ("Record the
@@ -325,6 +328,41 @@ rule (as the environment `release` has them) and run the workflow on the tag.
 The image's engine is built with the feature `tinygpu` as well, so it is the engine an NVIDIA
 card in an enclosure is given ([TINYGPU.md](TINYGPU.md)).
 
+### A Mac's update
+
+`publish` then starts the Mac update (`.github/workflows/mac-update.yml`) on the release's tag,
+which makes what an installed OAIY on a Mac updates itself from. **Its job `sign` waits for the
+owner's approval** (the environment `release`, the updater key: a third approval for a release,
+after release.yml's and the Mac build's). Its jobs:
+
+1. `pack` (a Mac, no secret): the release's image by its exact name, held to its `.sha256` and to
+   GitHub's own digest of it; Gatekeeper must say the image and the app in it are notarised, and
+   the app's version must be the release's; the app's ticket is stapled to it; it is packed as
+   `oaiy-desktop-<v>-macos-arm64.app.tar.gz` (the app at the top, no extended attributes or `._`
+   files); and the archive is unpacked the way the updater unpacks it, and the result has to be the
+   same app, valid and accepted as notarised.
+2. `sign` (the `release` environment): that archive, held to the digest `pack` recorded, signed
+   with `tauri signer sign` under the name `OAIY_<v>_aarch64.app.tar.gz` (the desktop holds a
+   signature to its version by that name).
+3. `publish`: the archive, its `.sig` and its `.sha256` are added to the release (nothing
+   replaced), then `latest.json` and `SHA256SUMS.txt` are replaced:
+   `platform/scripts/add-mac-update.mjs` adds the `darwin-aarch64` entry to the published feed,
+   checked against the public key in `tauri.conf.json` and the signed name, with every other entry
+   kept exactly, and puts the feed's new checksum, the image's and the two new files' in the
+   checksums. The feed is read back from the release.
+
+If it could not be started (the Mac build's summary says so), or failed, run it by hand once
+the image is on the release:
+
+```sh
+gh workflow run mac-update.yml --ref v0.1.9 -f release=v0.1.9
+```
+
+It must run on the tag (the environment `release` gives the key to tags alone), so it can be run
+only for a release tagged after the workflow was added: 0.1.8 and earlier have no Mac update. A
+release that has its Mac update already is left alone: the run fails before anything is made.
+To make it again, delete the release's `.app.tar.gz`, `.sig` and `.sha256` first.
+
 ### The eGPU plugin
 
 Built on a Mac with the card, because its kernels are the ones that card's server has seen and
@@ -408,9 +446,10 @@ a release matter here:
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or
   an archive, and no release of OAIY contains it.
 - **A Mac build, from the release's own workflow.** `release.yml` builds for Windows and
-  Linux, and the update feed has no entry for a Mac. The Mac's image is made by
-  `mac-build.yml`, signed with the Developer ID and notarised, and added to the published
-  release as one more file ([A Mac's image](#a-macs-image)). Releases up to 0.1.2 have none.
+  Linux. The Mac's image is made by `mac-build.yml`, signed with the Developer ID and
+  notarised, and added to the published release ([A Mac's image](#a-macs-image)), and the Mac
+  joins the update feed after that ([A Mac's update](#a-macs-update)). Releases up to 0.1.2
+  have no image, and up to 0.1.8 no Mac update.
 - **Windows code signing.** The installers are not signed with a certificate
   (Authenticode), so Windows SmartScreen warns on a download (below). The update signature
   above is another thing: OAIY checks it, Windows does not.

@@ -4,7 +4,10 @@
 # It builds what the release workflow's `desktop` job builds, step for step, on a macOS runner, because a .dmg can
 # only be made on a Mac: the bundler needs macOS's own tools. The run uploads the disk image and the headless server
 # for a Mac as its artifacts. It pushes no tag and makes no release; told a published release's tag (the input
-# `release`), its last job adds the signed, notarised image to that release, and that is all it ever publishes.
+# `release`), its last job adds the signed, notarised image to that release, and that is all it ever publishes. That
+# job then starts the Mac update workflow (mac-update.yml) on the release's tag, which makes the file an installed OAIY
+# on a Mac updates itself from out of that image and adds the Mac to the release's update feed; its signing waits for
+# the owner's approval as the release's does.
 #
 # The build signs the app ad hoc (tauri.conf.json, bundle.macOS.signingIdentity "-"): a signature an Apple-silicon
 # Mac will run, with no Apple Developer ID behind it, which macOS asks about before it opens it the first time
@@ -497,7 +500,9 @@ jobs:
   # it and does not list it). Only when the run names the release: the image must be the one the job above signed
   # (its digest, that job's own word), notarised, of the release's version, and built from the commit the release's
   # tag names. It replaces nothing: a release that has the image already is left as it is, and the job fails.
-  # The one job here that may write, and it runs none of the project's code: it has no checkout.
+  # The one job here that may write, and it runs none of the project's code: it has no checkout. Last, it starts the
+  # Mac update (mac-update.yml) on the release's tag: a run the GitHub token may start (a workflow_dispatch), and
+  # whose signing job the owner approves in the `release` environment.
   publish:
     name: Add the signed image to the release
     needs: sign
@@ -506,6 +511,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -538,3 +544,17 @@ jobs:
           gh release upload "$RELEASE" "signed/$name" "signed/$name.sha256" --repo "$GITHUB_REPOSITORY"
           echo "## $name added to $RELEASE" >> "$GITHUB_STEP_SUMMARY"
           echo "sha256 \`$got\`: signed with the Developer ID, notarised by Apple, built from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      # The image is on the release whatever happens here: a Mac update that cannot be started is said, and is started
+      # by hand (Actions, Mac update, on the tag).
+      - name: Start the Mac update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          if gh workflow run mac-update.yml --repo "$GITHUB_REPOSITORY" --ref "$RELEASE" -f release="$RELEASE"; then
+            echo "The Mac update for $RELEASE is started: approve its signing (the release environment) on its run's page." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::the Mac update could not be started: run it by hand (Actions, Mac update, Use workflow from: Tags, $RELEASE)"
+          fi

@@ -377,6 +377,7 @@ impl Updater {
 
     /// A check ended: `outcome` is what the feed said, or why it could not be read.
     pub fn finish_check(&self, outcome: Result<Verdict, String>) {
+        let platform = *self.platform_key.read().unwrap_or_else(|e| e.into_inner());
         let mut inner = self.lock();
         inner.last_checked_at = Some(Utc::now());
         match outcome {
@@ -395,7 +396,7 @@ impl Updater {
             Ok(Verdict::NoUpdateForPlatform { latest }) => {
                 inner.package = None;
                 inner.release = None;
-                inner.note = Some(format!("A newer version ({latest}) exists, but there is no release of it for this platform. Look on the releases page."));
+                inner.note = Some(no_update_note(&latest, platform));
                 inner.latest = Some(latest);
                 inner.notes = None;
                 inner.published_at = None;
@@ -583,6 +584,17 @@ impl Updater {
     }
 }
 
+
+/// What a feed with a newer version and no entry for this platform means, in words. On a Mac the entry is added a little
+/// after the release (the Mac update workflow packs the app out of the notarised image, which is made after the release),
+/// so it is a matter of time there; elsewhere the release job writes every platform's entry or none.
+fn no_update_note(latest: &str, platform: Option<&str>) -> String {
+    if platform == Some("darwin-aarch64") {
+        format!("A newer version ({latest}) exists, and its update for a Mac is not out yet (it comes a little after the release). Check again later, or install it from the disk image on the releases page.")
+    } else {
+        format!("A newer version ({latest}) exists, but there is no release of it for this platform. Look on the releases page.")
+    }
+}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::blockers::fake::Fake;
@@ -671,6 +683,8 @@ pub(crate) mod tests {
     #[test]
     fn a_platform_with_no_release_is_idle_with_a_note_and_not_an_error() {
         let (u, _, now) = updater();
+        // (whatever computer the test runs on: a Mac's note is its own, below)
+        u.set_platform_key(Some("windows-x86_64"));
         u.begin_check(now).unwrap();
         u.finish_check(Ok(Verdict::NoUpdateForPlatform { latest: "0.2.0".into() }));
         let s = u.status_at(now);
@@ -678,6 +692,13 @@ pub(crate) mod tests {
         assert!(s.error.is_none());
         assert!(s.note.unwrap().contains("no release of it for this platform"));
         assert_eq!(s.latest_version.as_deref(), Some("0.2.0"));
+        // A Mac's entry comes a little after the release: that is said, not that there is no release for it.
+        u.set_platform_key(Some("darwin-aarch64"));
+        let later = now + MIN_CHECK_INTERVAL;
+        u.begin_check(later).unwrap();
+        u.finish_check(Ok(Verdict::NoUpdateForPlatform { latest: "0.2.0".into() }));
+        let note = u.status_at(later).note.unwrap();
+        assert!(note.contains("for a Mac is not out yet") && note.contains("disk image"), "{note}");
     }
 
     #[test]

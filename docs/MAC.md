@@ -5,7 +5,8 @@ weights on the chip's GPU, in the Mac's own (unified) memory, what does not fit 
 chip's CPU, read from the drive as it is needed. A graphics card in a Thunderbolt enclosure
 is a second place a model can run, through tinygrad's server.
 
-**Where this stands.** No release is built for macOS ([Updates](UPDATES.md)). The app can
+**Where this stands.** Releases carry a signed, notarised disk image for an Apple-silicon Mac,
+and from the first release after 0.1.8 the app updates itself ([Updates](UPDATES.md)). The app can
 be made as a disk image without a Mac at hand (below), or built on the Mac. Nothing on this
 page has been run on a Mac that a person sits at: the app has been built, started and used
 on GitHub's Mac runner, and that is all. What has been checked, and how, is at the end of
@@ -59,8 +60,11 @@ add a model's `.gguf` under **Engines** and it runs. Flows run on Node, which th
 folder the first time, at a press of **Install Node** on the Overview (from nodejs.org:
 that once, it needs the network). Pictures, video, music and speech are another program
 (`oaiy-media`), which the app carries beside it. The app's data is in
-`~/Library/Application Support/com.oaiy.app`. It does not update itself on a Mac: a newer
-image is installed over it.
+`~/Library/Application Support/com.oaiy.app`. Up to 0.1.8 it does not update itself on a Mac:
+a newer image is installed over it. From the first release after 0.1.8, an app in Applications (or
+another folder of the Mac's own disk) updates itself from Settings, as on Windows and Linux; one
+still in the disk image, on another disk, or opened where it was downloaded does not until it is
+dragged to Applications ([Updates](UPDATES.md#what-can-update-itself)).
 
 **The phone plugin (Aokie)** is made the same way, in Aokie's repository: **Actions**,
 **Unix bundles**, **Run workflow** gives `aokie-plugin-macos-arm64.tar.gz`. In OAIY, under

@@ -46,11 +46,12 @@ export const WITH_PATHS = ['path', 'cache-dependency-path', 'workspaces', 'files
 /**
  * Made in the checkout's root by the jobs themselves: what they collect, download, unpack, sign and describe. The
  * second line is the Mac build's (mac-build.yml): what its engine said, the app's pictures, the image the build made
- * and the signed one.
+ * and the signed one; the third the Mac update's (mac-update.yml), which keeps all it makes in one folder.
  */
 export const SCRATCH = [
   'release', 'artifacts', 'signatures', 'headless-dist', 'headless-verified', 'notes.md', 'cli-asset-summary.json',
   'engine-said', 'screens', 'built', 'signed',
+  'mac-update',
 ];
 
 /** Named in any folder: build output and installed dependencies. */

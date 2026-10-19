@@ -787,7 +787,7 @@ silently, so they get slower rather than failing.
 **Not run on a Mac yet.** The engine, its server and the studio type-check for
 `aarch64-apple-darwin` from Windows (`cargo check --target aarch64-apple-darwin
 -p ggml-rs-wgpu -p oaiy-llm-server -p oaiy-studio`); nothing below has been
-measured on one, and no release is built for macOS. [MAC.md](MAC.md) has the
+measured on one. (Releases carry a notarised image for Apple silicon since 0.1.3.) [MAC.md](MAC.md) has the
 steps to build OAIY on a Mac, and what an RTX 5090 held to an Apple GPU's
 limits ran on 2026-10-10.
 

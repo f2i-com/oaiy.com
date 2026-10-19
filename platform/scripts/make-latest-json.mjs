@@ -12,6 +12,9 @@
 //   windows-x86_64   oaiy-desktop-<v>-windows-x64-setup.exe      (the NSIS installer; never the MSI)
 //   linux-x86_64     oaiy-desktop-<v>-linux-x86_64.AppImage
 //
+// (A Mac's, darwin-aarch64, is added to the published feed later by add-mac-update.mjs, in the Mac update
+// workflow, because the release job runs before the notarised Mac image exists: see macAsset.)
+//
 // each next to its `<name>.sig` in --dir. The signature in the feed is the CONTENT of
 // that file (the updater checks the download against it with the public key in
 // tauri.conf.json), and the url is where the release publishes the asset:
@@ -69,6 +72,14 @@ export function platformAssets(version) {
   ];
 }
 
+/**
+ * The Mac's entry, which the release job does not write (add-mac-update.mjs adds it to the published feed): the app out of the
+ * release's notarised image, packed, and signed under a name that carries the version (the bundler's own, OAIY.app.tar.gz, has none).
+ */
+export function macAsset(version) {
+  return { key: 'darwin-aarch64', asset: `oaiy-desktop-${version}-macos-arm64.app.tar.gz`, suffix: '.app.tar.gz', signedName: `OAIY_${version}_aarch64.app.tar.gz`, what: 'the Mac app (an .app.tar.gz)' };
+}
+
 /** The `file:` field of a trusted comment (tab-separated key:value pairs), or undefined when it is not there exactly once. */
 export function signedFileOf(trustedComment) {
   const found = String(trustedComment ?? '').split('\t').filter((field) => field.startsWith('file:')).map((field) => field.slice('file:'.length));
@@ -113,7 +124,7 @@ export function readSignature(file, what) {
 }
 
 /** The installer against its signature, with the public key the desktop carries. */
-function checkAgainstKey(installer, asset, signature, pubkey) {
+export function checkAgainstKey(installer, asset, signature, pubkey) {
   let result;
   try {
     result = verifyMinisign(fs.readFileSync(installer), signature, pubkey);

@@ -86,6 +86,10 @@ fn explain(error: &tauri_plugin_updater::Error) -> String {
         E::Reqwest(_) | E::Network(_) => "The download failed. Check the internet connection and try again.".to_string(),
         E::TargetNotFound(_) | E::TargetsNotFound(_) => "The update information has no release for this kind of install, so nothing was fetched.".to_string(),
         E::InvalidUpdaterFormat | E::BinaryNotFoundInArchive => "The downloaded file is not an installer, so it was refused.".to_string(),
+        // (on a Mac: the app's folder is not the person's to change, and macOS's request for an administrator was turned down)
+        E::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            "The update was not installed: OAIY may not change the folder it is installed in. On a Mac, macOS asks for an administrator's password to do it; try again and give it, or download the newer version from the releases page.".to_string()
+        }
         other => format!("The update failed ({other})."),
     }
 }
@@ -144,7 +148,11 @@ impl GuiPlatform {
 
 impl Platform for GuiPlatform {
     fn auto_update(&self) -> AutoUpdate {
-        kind::auto_update_for(std::env::consts::OS, std::env::consts::ARCH, kind::bundle_name(tauri::utils::platform::bundle_type()))
+        // The program's path as the updater plugin reads it (the one it started as, its links resolved): on a Mac the app it
+        // replaces is the bundle around it.
+        let exe = tauri::utils::platform::current_exe().ok();
+        let bundle = kind::bundle_name(tauri::utils::platform::bundle_type(), exe.as_deref());
+        kind::auto_update_for(std::env::consts::OS, std::env::consts::ARCH, bundle, exe.as_deref())
     }
 
     /// The feed named a newer release for this platform: get the plugin's handle on it, and make sure it is the
@@ -276,9 +284,11 @@ pub async fn update_install(webview: Webview, app: AppHandle, updater: tauri::St
     match outcome {
         Outcome::HandedOff => {
             // Windows never gets here: the plugin started the installer and ended this process. On Linux the AppImage
-            // was replaced, so start it, by the normal restart: its exit lets the single-instance plugin let go of its
-            // name (it does so on the exit event), which the new process needs. That exit stops everything a second time;
-            // the services part sees to it that this does not empty the note the hand-off wrote (settle_note).
+            // was replaced, and on a Mac the app (the old one moved aside and removed, the new one unpacked in its place),
+            // so start it, by the normal restart: its exit lets the single-instance plugin let go of its name (it does so
+            // on the exit event), which the new process needs. On a Mac tauri starts the program the new app's Info.plist
+            // names, in the same place. That exit stops everything a second time; the services part sees to it that this
+            // does not empty the note the hand-off wrote (settle_note).
             app.request_restart();
             Ok(())
         }

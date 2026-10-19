@@ -39,8 +39,10 @@ first forgets it and it is downloaded again.
 | Linux, the AppImage | Yes. The AppImage file is replaced and OAIY restarts. |
 | Windows, the MSI (machine-wide) | **No: a manual download.** The MSI is another kind of install of the same product; the update is the NSIS installer, and running it over an MSI install would leave two. Settings says so and links the releases page. |
 | Linux, `.deb` or `.rpm` | No: a manual download, for the same reason (the feed carries the AppImage). |
+| macOS (Apple silicon), the app from the release's disk image, in Applications or another folder of the Mac's own disk | Yes, from the first release after 0.1.8 on (below). The app is replaced where it is and OAIY restarts. If that folder is not the person's to change, macOS asks for an administrator's password first. |
+| macOS, the app still in its disk image, on another disk, or opened where it was downloaded | No, until it is dragged to Applications and opened from there: the update is put in place through the Mac's own disk, and the other two are read-only. Settings says which. |
 | A development build (`tauri dev`, `cargo run`) | No: there is no installed copy to replace. |
-| macOS | No release is built. |
+| An Intel Mac | No release is built. |
 | The headless `oaiy-server` | No: it **only reports** that a newer release exists (see below). |
 
 **The first release that carries the updater has to be installed by hand, by everyone.** Only a
@@ -51,6 +53,18 @@ everyone (the setup.exe on Windows, the AppImage on Linux; an install of 0.0.x h
 uninstalled first, see [RELEASING.md](RELEASING.md#installing-a-release)), and only from the copy
 of 0.1.0 on is an update offered. No release can change that: there is no code in an older copy
 to change.
+
+**The same holds on a Mac, from a later release.** OAIY 0.1.8 and every earlier copy for a Mac
+cannot update itself (they say "There is no release of OAIY for this kind of computer"), whatever
+a feed says. The first release after 0.1.8 is installed from its disk image by hand, over the
+app (drag it to Applications and replace it; the data stays), and from that copy on a Mac is
+offered its updates like the others.
+
+**A Mac's update comes a little after the release.** The release's own workflow writes the feed
+before the Mac's image exists; the image is made and notarised afterwards, and the Mac update
+workflow then packs the app out of it, signs it and adds the Mac to the feed
+([RELEASING.md](RELEASING.md#a-macs-update)). Until it has, a Mac that checks finds the newer
+version and "no release of it for this platform"; a check later finds the update.
 
 Only what OAIY itself ships is updated: with the app, the engines its installer carries
 (`resources/engines`: `oaiy-llm-server-webgpu`, `oaiy-media` and, after 0.1.7, `oaiy-voice`).
@@ -150,7 +164,10 @@ save, and ends its turn, as quitting does.
    this process; the installer replaces OAIY and opens it again (the old tray icon may stay
    on screen until the mouse passes over it: OAIY does not remove it before the installer is
    started, so that a failed start leaves OAIY as it was). On Linux the AppImage is replaced
-   and OAIY restarts through its normal exit.
+   and OAIY restarts through its normal exit. On a Mac the archive is unpacked into the Mac's
+   temporary folder, the app is moved aside, the new one is moved into its place (behind an
+   administrator's password when the folder asks for one) and the old one removed, and OAIY
+   restarts through its normal exit, starting the program the new app names.
 
 If a part will not stop, or the installer cannot be STARTED, everything that was stopped is
 started again (last stopped, first started) and the update is shown as **failed**, with the
@@ -183,29 +200,37 @@ the installer it starts would inherit that and be killed with it.
   the file the signature was made for. The Tauri CLI writes it into the signature
   (`file:OAIY_0.1.0_x64-setup.exe`) and the key's signature covers it, so it cannot be edited.
   OAIY refuses the download unless that name (1) ends the way this platform's installer does,
-  `-setup.exe` on Windows and `.AppImage` on Linux, and (2) has the announced version as one
+  `-setup.exe` on Windows, `.AppImage` on Linux and `.app.tar.gz` on a Mac, and (2) has the announced version as one
   whole part of it: the parts are what the underscores of the bundler's names separate, so
   `0.1.0` is not found in `10.1.0`, `0.1.05` or `0.1.0-rc.1`. Nothing else of the name is
   looked at, on either platform: not the product name, not the architecture (the AppImage's
   name has changed between Tauri versions, and neither adds to what stops a downgrade). The
   release job signs the installers under the bundler's names (`OAIY_<v>_x64-setup.exe`,
-  `OAIY_<v>_amd64.AppImage`) and makes the same check from each `.sig` before it publishes.
+  `OAIY_<v>_amd64.AppImage`) and makes the same check from each `.sig` before it publishes. The
+  Mac update workflow signs the Mac's under `OAIY_<v>_aarch64.app.tar.gz`, not the bundler's name
+  for such an archive (`OAIY.app.tar.gz`, which has no version), and makes the same check.
 - **The address.** The installer must be this project's release asset on `github.com`, over
   https, under the tag `v<version>` (or `<version>`), and named EXACTLY as the release job
   names this platform's installer: `oaiy-desktop-<version>-windows-x64-setup.exe` on Windows,
-  `oaiy-desktop-<version>-linux-x86_64.AppImage` on Linux, with `<version>` the one the feed
-  announced. No other file of the release is taken, and not the other platform's: a Linux
+  `oaiy-desktop-<version>-linux-x86_64.AppImage` on Linux, `oaiy-desktop-<version>-macos-arm64.app.tar.gz`
+  on a Mac, with `<version>` the one the feed announced. No other file of the release is taken, and not the other platform's: a Linux
   entry that pointed at the Windows setup would otherwise pass every other check and be written
   over the AppImage. That keeps a feed from sending OAIY elsewhere; it is not what ties the
   bytes to their version (a release can hold any file under any name), which the signature
   does (above).
 - **What the file is.** The bytes must start the way this platform's installer does: `MZ` for
-  the Windows setup, `\x7fELF` for the AppImage. The updater on Windows runs whatever it is
-  given and the one on Linux writes it over the AppImage without looking, so a file of the
-  wrong kind is not a failed update but a program that will not start, put where the working
-  one was. The kind is checked when the download is verified, and again right before the
+  the Windows setup, `\x7fELF` for the AppImage, gzip's `\x1f\x8b` for the Mac's packed app. The
+  updater on Windows runs whatever it is given, the one on Linux writes it over the AppImage
+  without looking, and the Mac's unpacks it in the app's place, so a file of the wrong kind is not
+  a failed update but a program that will not start, put where the working one was. The kind is checked when the download is verified, and again right before the
   installer is handed the bytes, together with the version and the platform (`update::verify`,
   `check_for_hand_off`).
+- **On a Mac, what macOS checks.** The packed app is the app out of the release's notarised disk
+  image, with its notarisation ticket stapled to it. Before it is signed, the Mac update workflow
+  unpacks it the way the updater does and has Gatekeeper accept the result as notarised by Apple
+  (the archive carries no extended attributes or `._` files, which would break the app's sealed
+  signature). An update OAIY downloads itself is not marked as downloaded from the internet, so
+  macOS does not ask before the new version opens.
 - **The feed.** At most 256 KiB, counted as it arrives; https only, redirects too (GitHub
   sends the request through two); every field checked; a version that is lower or equal is
   never an update, and neither is one that is not a version. A platform the feed has nothing
@@ -289,8 +314,9 @@ others: the two secrets of the `release` GitHub environment (`TAURI_SIGNING_PRIV
 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`); an offline copy in the owner's password manager; and,
 until the owner deletes them, the two files on the machine that made the key
 (`C:\Users\<you>\.oaiy-signing`, outside every repository, with a README). Not in a repository,
-not in an artifact, not in a log. The environment's secrets are read by one job, `sign`, which only signs the two
-installers, on a tag, in a protected environment (RELEASING.md); the builds are given none. A
+not in an artifact, not in a log. The environment's secrets are read by two jobs, each called `sign`, on a tag, in a
+protected environment (RELEASING.md): release.yml's, which only signs the two installers, and mac-update.yml's, which
+only signs the Mac's packed app. The builds are given none. A
 release without the secrets fails in that job, and a release whose signatures do not verify
 against the public key in `tauri.conf.json` (the secrets belong to another key) stops before it
 is published.
@@ -340,5 +366,8 @@ OAIY would accept. Rotate it, and tell people to install the new release by hand
   signature was made for"). OAIY already refuses a signature whose `version:` field, if it has
   one, is not the announced version. Should a later CLI write the field, check a built
   signature for it, then turn this on.
-- **A beta channel**, **Authenticode signing**, **macOS**, updates of the engines and of
+- **A beta channel**, **Authenticode signing**, **an Intel Mac**, updates of the engines and of
   plugins.
+- **A Mac update from the release's own workflow.** The Mac's entry is added to the feed after the
+  release is published, by a run of its own (above). Building the Mac's image in `release.yml`
+  would make one feed at once, but needs the environment `mac-signing` to take runs on tags.

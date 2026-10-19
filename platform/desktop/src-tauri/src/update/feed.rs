@@ -3,11 +3,14 @@
 //! ```json
 //! { "version": "0.2.0", "notes": "...", "pub_date": "2026-10-01T02:03:04Z",
 //!   "platforms": { "windows-x86_64": { "signature": "...", "url": "https://..." },
-//!                  "linux-x86_64":   { "signature": "...", "url": "https://..." } } }
+//!                  "linux-x86_64":   { "signature": "...", "url": "https://..." },
+//!                  "darwin-aarch64": { "signature": "...", "url": "https://..." } } }
 //! ```
 //!
 //! It is written by `platform/scripts/make-latest-json.mjs` in the release job and served from
-//! the release (`releases/latest/download/latest.json`). What is read here is UNTRUSTED text:
+//! the release (`releases/latest/download/latest.json`). The Mac's entry is added to it later, by
+//! `platform/scripts/add-mac-update.mjs` in the Mac update workflow, once the release's notarised disk
+//! image exists: until then a Mac finds a newer version and no update for it. What is read here is UNTRUSTED text:
 //! it is capped in size before it is parsed, every field is checked, and nothing in it is acted
 //! on until it has been through [`evaluate`]. (The installer it points at is trusted only after
 //! its signature verifies: see [`super::verify`].)
@@ -124,11 +127,13 @@ fn describe(error: &serde_json::Error) -> String {
     }
 }
 
-/// The feed's key for a platform (`windows-x86_64`, `linux-x86_64`), or None: no release is built for it.
+/// The feed's key for a platform (`windows-x86_64`, `linux-x86_64`, `darwin-aarch64`: the updater plugin's spelling), or
+/// None: no release is built for it (an Intel Mac among them).
 pub fn platform_key(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("windows", "x86_64") => Some("windows-x86_64"),
         ("linux", "x86_64") => Some("linux-x86_64"),
+        ("macos", "aarch64") => Some("darwin-aarch64"),
         _ => None,
     }
 }
@@ -149,7 +154,8 @@ fn asset_path_prefix() -> String {
 /// Whether `url` is the installer of release `version` of this project on GitHub for `target`: over https, on github.com,
 /// with nothing to redirect the eye (no credentials, no other port, no query), under the release's tag (`v0.2.0` or
 /// `0.2.0`) and named EXACTLY as the release job names this platform's installer ([`Target::asset_name`]:
-/// `oaiy-desktop-0.2.0-windows-x64-setup.exe` for the Windows setup, `oaiy-desktop-0.2.0-linux-x86_64.AppImage` for the AppImage).
+/// `oaiy-desktop-0.2.0-windows-x64-setup.exe` for the Windows setup, `oaiy-desktop-0.2.0-linux-x86_64.AppImage` for the AppImage,
+/// `oaiy-desktop-0.2.0-macos-arm64.app.tar.gz` for the Mac app).
 ///
 /// Doors beside the signature. A feed that names another host is refused before anything is fetched from it. The file has
 /// to be this platform's installer and no other file of the release (the Windows setup where the AppImage belongs would
@@ -340,7 +346,8 @@ mod tests {
     fn platform_keys_are_the_feeds_and_an_unknown_platform_has_none() {
         assert_eq!(platform_key("windows", "x86_64"), Some("windows-x86_64"));
         assert_eq!(platform_key("linux", "x86_64"), Some("linux-x86_64"));
-        for (os, arch) in [("macos", "aarch64"), ("macos", "x86_64"), ("windows", "aarch64"), ("linux", "aarch64"), ("freebsd", "x86_64"), ("", "")] {
+        assert_eq!(platform_key("macos", "aarch64"), Some("darwin-aarch64"));
+        for (os, arch) in [("macos", "x86_64"), ("darwin", "aarch64"), ("windows", "aarch64"), ("linux", "aarch64"), ("freebsd", "x86_64"), ("", "")] {
             assert_eq!(platform_key(os, arch), None, "{os}-{arch}");
         }
     }
@@ -382,11 +389,21 @@ mod tests {
     fn a_higher_version_with_no_installer_for_an_unknown_platform_is_no_update_for_it() {
         let feed = parse_json(&feed_json()).unwrap();
         assert_eq!(evaluate(&feed, "0.1.0", None), Verdict::NoUpdateForPlatform { latest: "0.2.0".into() });
+        // A Mac, before the Mac update workflow has added its entry to the release's feed (or for a release made without one).
         assert_eq!(evaluate(&feed, "0.1.0", Some("darwin-aarch64")), Verdict::NoUpdateForPlatform { latest: "0.2.0".into() });
+        // ...and once it has.
+        let mut value = feed_json();
+        value["platforms"]["darwin-aarch64"] = json!({ "signature": SIG, "url": "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/oaiy-desktop-0.2.0-macos-arm64.app.tar.gz" });
+        let feed = parse_json(&value).unwrap();
+        match evaluate(&feed, "0.1.0", Some("darwin-aarch64")) {
+            Verdict::Available(release) => assert!(release.url.ends_with("-macos-arm64.app.tar.gz"), "{}", release.url),
+            other => panic!("{other:?}"),
+        }
     }
 
     const WINDOWS: Target = Target::WindowsSetup;
     const LINUX: Target = Target::LinuxAppImage;
+    const MAC: Target = Target::MacApp;
 
     #[test]
     fn an_installer_may_only_come_from_this_projects_releases_on_github_over_https() {
@@ -437,9 +454,14 @@ mod tests {
     #[test]
     fn each_platform_takes_its_own_installer_by_its_exact_name_and_no_other_file_of_the_release() {
         let base = "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/";
-        let (setup, appimage) = ("oaiy-desktop-0.2.0-windows-x64-setup.exe", "oaiy-desktop-0.2.0-linux-x86_64.AppImage");
+        let (setup, appimage, mac) = ("oaiy-desktop-0.2.0-windows-x64-setup.exe", "oaiy-desktop-0.2.0-linux-x86_64.AppImage", "oaiy-desktop-0.2.0-macos-arm64.app.tar.gz");
         assert!(check_asset_url(&format!("{base}{setup}"), "0.2.0", WINDOWS).is_ok());
         assert!(check_asset_url(&format!("{base}{appimage}"), "0.2.0", LINUX).is_ok());
+        assert!(check_asset_url(&format!("{base}{mac}"), "0.2.0", MAC).is_ok());
+        // Each platform's installer where another's belongs.
+        for (file, not_for) in [(setup, MAC), (appimage, MAC), (mac, WINDOWS), (mac, LINUX)] {
+            assert!(check_asset_url(&format!("{base}{file}"), "0.2.0", not_for).is_err(), "{file} as {not_for:?}");
+        }
         // A Linux entry pointing at the Windows setup, and a Windows entry pointing at the AppImage: each is a genuine asset of the release.
         let mixed = check_asset_url(&format!("{base}{setup}"), "0.2.0", LINUX).unwrap_err();
         assert!(mixed.contains("Linux AppImage") && mixed.contains("refused"), "{mixed}");
@@ -459,10 +481,17 @@ mod tests {
             "oaiy-desktop-0.2.0-.AppImage",
             "oaiy-server-0.2.0-linux-x86_64.tar.gz",
             "OAIY_0.2.0_x64-setup.exe",
+            "oaiy-desktop-0.2.0-macos-arm64.dmg",
+            "oaiy-desktop-0.2.0-macos-arm64.app.tar.gz.sig",
+            "oaiy-desktop-0.2.0-macos-arm64.app.tar.gz.sha256",
+            "oaiy-desktop-0.2.0-macos-x64.app.tar.gz",
+            "oaiy-egpu-plugin-0.2.0-macos-arm64.zip",
+            "OAIY_0.2.0_aarch64.app.tar.gz",
+            "OAIY.app.tar.gz",
             "latest.json",
             "SHA256SUMS.txt",
         ] {
-            for target in [WINDOWS, LINUX] {
+            for target in [WINDOWS, LINUX, MAC] {
                 assert!(check_asset_url(&format!("{base}{other}"), "0.2.0", target).is_err(), "{other} as {target:?}");
             }
         }

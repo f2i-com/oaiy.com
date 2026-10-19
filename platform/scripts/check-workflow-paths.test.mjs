@@ -410,7 +410,7 @@ describe('the command', () => {
   it('passes the repository’s workflows, and says how many paths it read', () => {
     const r = run();
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /^check-workflow-paths: \d+ paths in 3 workflows \(ci\.yml, mac-build\.yml, release\.yml\) all exist or are made by the build/);
+    assert.match(r.stdout, /^check-workflow-paths: \d+ paths in 4 workflows \(ci\.yml, mac-build\.yml, mac-update\.yml, release\.yml\) all exist or are made by the build/);
   });
 
   it('fails a workflow with a wrong path, one line for each, naming the file and the line', () => {

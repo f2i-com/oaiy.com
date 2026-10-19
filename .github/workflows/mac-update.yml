@@ -1,0 +1,335 @@
+# Mac update: what an installed OAIY on a Mac updates itself from, added to a release that is already published.
+#
+# A manual run on the release's TAG (Actions, "Mac update", Run workflow, Use workflow from: Tags, v0.1.9, and the same
+# tag as the input), and the one mac-build.yml's `publish` job starts once it has added the notarised image to the
+# release. A release's own workflow (release.yml) builds Windows and Linux and writes the update feed, latest.json,
+# before a Mac image exists; the image is made and notarised later, by mac-build.yml, where the Developer ID is. This
+# run takes that image and adds the Mac to the release's feed:
+#
+#   oaiy-desktop-<v>-macos-arm64.app.tar.gz          the app out of the release's image, its notarisation ticket stapled
+#                                                    to it, packed the way the updater unpacks it (the app at the top of
+#                                                    a gzipped tar, no extended attributes and no ._ files, which would
+#                                                    break its sealed signature)
+#   oaiy-desktop-<v>-macos-arm64.app.tar.gz.sig      its minisign signature, made with the updater key, for the name
+#                                                    OAIY_<v>_aarch64.app.tar.gz (the desktop holds a signature to its
+#                                                    version by the name it was made for; the bundler's own name for
+#                                                    the archive, OAIY.app.tar.gz, has no version)
+#   oaiy-desktop-<v>-macos-arm64.app.tar.gz.sha256   its checksum
+#   latest.json                                      REPLACED: the same feed with a darwin-aarch64 entry added, every
+#                                                    other entry as it was (platform/scripts/add-mac-update.mjs)
+#   SHA256SUMS.txt                                   REPLACED: latest.json's new checksum, and the image and the two
+#                                                    files above added, so it is true again
+#
+# Three jobs, each given only what it needs. `pack` runs on a Mac with no secret: it takes the image by its exact name,
+# holds it to its checksum (the release's .sha256 and GitHub's own digest), has Gatekeeper say it and the app in it
+# are notarised and of the release's version, packs the app, and unpacks the archive the way the updater does to see
+# that the app is still valid and notarised when it comes out. `sign` runs in the `release` environment (the updater
+# key; tags only, a reviewer approves), as release.yml's `sign` job does, and signs that archive, held to the digest
+# `pack` recorded, and nothing else. `publish` adds the files, then the feed: the feed never names a file the release
+# does not have yet. It replaces no Mac file a release has already: a second run for the same release fails, and the
+# release is left as it was.
+#
+# A copy of OAIY 0.1.8 or earlier never reads the Mac's entry (it does not update itself on a Mac at all): a Mac
+# updates itself from the first release made after the one that taught it how, onwards.
+name: Mac update
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "A published release's tag (v0.1.9) whose notarised image is attached. Run this on that tag (Use workflow from: Tags)."
+        required: true
+
+# Nothing may write by default; `publish` says so for itself.
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-update-${{ inputs.release }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  pack:
+    name: Pack the notarised app
+    runs-on: macos-15
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    steps:
+      - name: The release, and this run on its tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          tag='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$RELEASE" =~ $tag ]] || { echo "::error::'$RELEASE' is not a release's tag (v0.1.9)"; exit 1; }
+          # The updater key is given only to a run on a release's tag (the release environment's rule), so the run must be on this one.
+          [ "$GITHUB_REF" = "refs/tags/$RELEASE" ] || { echo "::error::run this on the tag $RELEASE (Use workflow from: Tags, $RELEASE), not on $GITHUB_REF"; exit 1; }
+          tagged="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE" --jq .sha)"
+          [ "$tagged" = "$GITHUB_SHA" ] || { echo "::error::$RELEASE is commit $tagged, and this run is on $GITHUB_SHA"; exit 1; }
+          draft="$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" || { echo "::error::there is no release $RELEASE"; exit 1; }
+          [ "$draft" = false ] || { echo "::error::the release $RELEASE is a draft"; exit 1; }
+          version="${RELEASE#v}"
+          names="$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          grep -qxF "oaiy-desktop-$version-macos-arm64.dmg" <<< "$names" || { echo "::error::the release $RELEASE has no oaiy-desktop-$version-macos-arm64.dmg yet: run mac-build.yml with release=$RELEASE first"; exit 1; }
+          grep -qxF "latest.json" <<< "$names" || { echo "::error::the release $RELEASE has no latest.json"; exit 1; }
+          if grep -qxF "oaiy-desktop-$version-macos-arm64.app.tar.gz" <<< "$names"; then
+            echo "::error::the release $RELEASE has its Mac update already: nothing is replaced (delete its .app.tar.gz, .sig and .sha256 to make them again)"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: The image, held to its checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          image="oaiy-desktop-$VERSION-macos-arm64.dmg"
+          dir="mac-update/image"
+          mkdir -p "$dir"
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D "$dir" -p "$image" -p "$image.sha256"
+          [ "$(ls "$dir" | wc -l | tr -d ' ')" = 2 ] || { echo "::error::expected the image and its .sha256, found: $(ls "$dir")"; exit 1; }
+          got="$(shasum -a 256 "$dir/$image" | cut -d' ' -f1)"
+          said="$(cut -d' ' -f1 "$dir/$image.sha256")"
+          github="$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json assets --jq ".assets[] | select(.name == \"$image\") | .digest")"
+          [ "$got" = "$said" ] || { echo "::error::$image is $got and its .sha256 says $said"; exit 1; }
+          [ "sha256:$got" = "$github" ] || { echo "::error::$image is $got and GitHub's digest of it is $github"; exit 1; }
+          echo "IMAGE=$dir/$image" >> "$GITHUB_ENV"
+          echo "IMAGE_SHA256=$got" >> "$GITHUB_ENV"
+
+      # What macOS says of the image and the app, and the app's version: the one the release is.
+      - name: The app, notarised and of this version
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          notarised() { grep -qx 'source=Notarized Developer ID' <<< "$1" || { echo "$1"; echo "::error::$2 is not notarised (Gatekeeper says the above)"; exit 1; }; }
+          notarised "$(spctl --assess --type open --context context:primary-signature -vv "$IMAGE" 2>&1)" "the image"
+          mount="$RUNNER_TEMP/image"; stage="$RUNNER_TEMP/stage"; mkdir -p "$stage"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$IMAGE" > /dev/null
+          ditto "$mount/OAIY.app" "$stage/OAIY.app"
+          hdiutil detach "$mount" > /dev/null
+          app="$stage/OAIY.app"
+          shown="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
+          [ "$shown" = "$VERSION" ] || { echo "::error::the app in the image is version $shown, not $VERSION"; exit 1; }
+          codesign --verify --deep --strict "$app"
+          notarised "$(spctl --assess --type execute -vv "$app" 2>&1)" "the app in the image"
+          # The ticket in the app itself (the image's is stapled to the image): an app that is moved out of its image keeps it.
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          echo "APP=$app" >> "$GITHUB_ENV"
+
+      - name: Pack it as the updater unpacks it
+        id: pack
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          asset="oaiy-desktop-$VERSION-macos-arm64.app.tar.gz"
+          out="mac-update/packed"
+          mkdir -p "$out"
+          # The app at the top, and nothing of the Mac's own beside its files: no extended attributes, no ._ files
+          # (COPYFILE_DISABLE), no ACLs or flags. The updater unpacks every entry as a file of the app, so a ._ file
+          # would be one more file in a sealed bundle, and the app would no longer start.
+          COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls --no-fflags -czf "$out/$asset" -C "$(dirname "$APP")" OAIY.app
+          # tauri-plugin-updater 2.12 (update::gui) drops every entry's first part and unpacks the rest into one folder,
+          # which it then puts where the app was. The same here, then what macOS says of the result.
+          check="$RUNNER_TEMP/unpacked"
+          python3 -I - "$out/$asset" "$check/OAIY.app" <<'EOF'
+          import os, sys, tarfile
+          from pathlib import PurePosixPath
+          archive, dest = sys.argv[1], sys.argv[2]
+          os.makedirs(dest)
+          tops = set()
+          with tarfile.open(archive, "r:gz") as tar:
+              for m in tar:
+                  parts = PurePosixPath(m.name).parts
+                  if PurePosixPath(m.name).is_absolute() or ".." in parts:
+                      sys.exit(f"::error::the archive has an entry outside the app: {m.name}")
+                  if any(p.startswith("._") for p in parts):
+                      sys.exit(f"::error::the archive has a ._ file, which would break the app's signature: {m.name}")
+                  tops.add(parts[0])
+                  target = os.path.join(dest, *parts[1:])
+                  if m.isdir():
+                      os.makedirs(target, exist_ok=True)
+                  elif m.isfile():
+                      os.makedirs(os.path.dirname(target), exist_ok=True)
+                      with tar.extractfile(m) as src, open(target, "wb") as out:
+                          while chunk := src.read(1 << 20):
+                              out.write(chunk)
+                      os.chmod(target, m.mode & 0o777)
+                  elif m.issym():
+                      os.symlink(m.linkname, target)
+                  else:
+                      sys.exit(f"::error::the archive has an entry of a kind the updater does not unpack: {m.name}")
+          if tops != {"OAIY.app"}:
+              sys.exit(f"::error::the archive's top is {sorted(tops)}, not OAIY.app")
+          EOF
+          codesign --verify --deep --strict --verbose=2 "$check/OAIY.app"
+          said="$(spctl --assess --type execute -vv "$check/OAIY.app" 2>&1)"
+          grep -qx 'source=Notarized Developer ID' <<< "$said" || { echo "$said"; echo "::error::the app as the updater unpacks it is not accepted as notarised"; exit 1; }
+          xcrun stapler validate "$check/OAIY.app"
+          diff -r "$APP" "$check/OAIY.app"
+          ls -l "$out"
+          sha="$(shasum -a 256 "$out/$asset" | cut -d' ' -f1)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "## $asset" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha256 \`$sha\`, from the image \`$IMAGE_SHA256\`: unpacked as the updater does, it is the notarised app" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mac-update
+          path: mac-update/packed/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------- signing
+  # The updater key, as release.yml's `sign` job uses it: in the `release` environment (tags only, a reviewer approves),
+  # with the Tauri CLI from the desktop app's lockfile and no install scripts, signing what `pack` made and nothing else.
+  sign:
+    name: Sign the Mac update
+    needs: pack
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mac-update
+          path: artifacts/mac
+
+      - name: Install the Tauri CLI
+        working-directory: platform/desktop
+        run: npm ci --ignore-scripts
+
+      - name: Sign the packed app
+        shell: bash
+        env:
+          VERSION: ${{ needs.pack.outputs.version }}
+          PACKED_SHA256: ${{ needs.pack.outputs.sha256 }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # (A secret set from a file can end in a newline, which the Tauri CLI refuses: see release.yml's sign job.)
+          key="$TAURI_SIGNING_PRIVATE_KEY"
+          while [[ "$key" == *$'\n' || "$key" == *$'\r' ]]; do key="${key%$'\n'}"; key="${key%$'\r'}"; done
+          password="$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          while [[ "$password" == *$'\n' || "$password" == *$'\r' ]]; do password="${password%$'\n'}"; password="${password%$'\r'}"; done
+          missing=""
+          [[ -n "$key" ]] || missing="TAURI_SIGNING_PRIVATE_KEY"
+          [[ -n "$password" ]] || missing="${missing:+$missing and }TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          if [[ -n "$missing" ]]; then
+            echo "::error::the secret $missing is not set in the release environment (Settings, Environments, release). See docs/RELEASING.md, The updater key."
+            exit 1
+          fi
+          export TAURI_SIGNING_PRIVATE_KEY="$key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$password"
+          asset="oaiy-desktop-$VERSION-macos-arm64.app.tar.gz"
+          signed_as="OAIY_${VERSION}_aarch64.app.tar.gz"
+          dir="$GITHUB_WORKSPACE/artifacts/mac"; work="$RUNNER_TEMP/signing"; out="$GITHUB_WORKSPACE/signatures"
+          mkdir -p "$work" "$out"
+          [[ "$PACKED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::the pack job recorded no digest, so nothing is signed"; exit 1; }
+          [[ -s "$dir/$asset" ]] || { echo "::error::$asset is not in the pack job's artifact"; exit 1; }
+          actual="$(sha256sum "$dir/$asset" | cut -d' ' -f1)"
+          [[ "$actual" == "$PACKED_SHA256" ]] || { echo "::error::$asset is $actual, and the pack job recorded $PACKED_SHA256"; exit 1; }
+          extra="$(find "$dir" -type f ! -name "$asset")"
+          [[ -z "$extra" ]] || { echo "::error::the pack job's artifact holds ${extra%%$'\n'*} beside $asset: nothing but the packed app is signed"; exit 1; }
+          cp "$dir/$asset" "$work/$signed_as"
+          "$GITHUB_WORKSPACE/platform/desktop/node_modules/.bin/tauri" signer sign "$work/$signed_as" >/dev/null
+          [[ -s "$work/$signed_as.sig" ]] || { echo "::error::tauri signer sign made no signature for $asset"; exit 1; }
+          cp "$work/$signed_as.sig" "$out/$asset.sig"
+          ls -l "$out"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mac-update-signature
+          path: signatures/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------- release
+  # The files, then the feed. The feed is read back from the release and the Mac's entry added to it by a script with
+  # tests, which checks the signature against the key in tauri.conf.json (the key every installed OAIY carries) and what
+  # it was made for, and keeps every other entry exactly; the checksums are made true again beside it.
+  publish:
+    name: Add the Mac update to the release
+    needs: [pack, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mac-update
+          path: mac-update/files
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mac-update-signature
+          path: mac-update/files
+
+      - name: The feed with the Mac in it, and the checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          VERSION: ${{ needs.pack.outputs.version }}
+          PACKED_SHA256: ${{ needs.pack.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          asset="oaiy-desktop-$VERSION-macos-arm64.app.tar.gz"
+          image="oaiy-desktop-$VERSION-macos-arm64.dmg"
+          files="mac-update/files"
+          got="$(sha256sum "$files/$asset" | cut -d' ' -f1)"
+          [ "$got" = "$PACKED_SHA256" ] || { echo "::error::$asset is $got, and the pack job recorded $PACKED_SHA256"; exit 1; }
+          ( cd "$files" && sha256sum "$asset" > "$asset.sha256" && cat "$asset.sha256" )
+          mkdir -p release
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D release -p latest.json -p SHA256SUMS.txt -p "$image.sha256"
+          node platform/scripts/add-mac-update.mjs --feed release/latest.json --sums release/SHA256SUMS.txt --dir "$files" \
+            --version "$VERSION" --tag "$RELEASE" --repo "$GITHUB_REPOSITORY" --conf platform/desktop/src-tauri/tauri.conf.json \
+            --image-sha256 "$(cut -d' ' -f1 "release/$image.sha256")" --out mac-update/new
+          diff release/latest.json mac-update/new/latest.json || true
+          diff release/SHA256SUMS.txt mac-update/new/SHA256SUMS.txt || true
+
+      - name: Add them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          VERSION: ${{ needs.pack.outputs.version }}
+        run: |
+          set -euo pipefail
+          asset="oaiy-desktop-$VERSION-macos-arm64.app.tar.gz"
+          # The Mac's files first, with no --clobber (a file a release has already is never replaced), and the feed that
+          # names them after: a Mac never reads an entry for a file that is not there.
+          files="mac-update/files"
+          gh release upload "$RELEASE" "$files/$asset" "$files/$asset.sig" "$files/$asset.sha256" --repo "$GITHUB_REPOSITORY"
+          gh release upload "$RELEASE" mac-update/new/latest.json mac-update/new/SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+          # Read back as a Mac reads it.
+          back="mac-update/back"
+          mkdir -p "$back"
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -D "$back" -p latest.json
+          cmp "$back/latest.json" mac-update/new/latest.json
+          listed="$(node -p 'Object.keys(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).platforms).join(", ")' "$back/latest.json")"
+          [[ "$listed" == *darwin-aarch64* ]] || { echo "::error::the feed on the release does not list the Mac: $listed"; exit 1; }
+          echo "## The Mac update is on $RELEASE" >> "$GITHUB_STEP_SUMMARY"
+          echo "latest.json lists $listed" >> "$GITHUB_STEP_SUMMARY"

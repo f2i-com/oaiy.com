@@ -26,8 +26,11 @@
 #                                            SHA256SUMS and oaiy-cli.json (= `oaiy capabilities --json`)
 #   SHA256SUMS.txt                           covers every file above, latest.json and the .sig files too
 #
+# A Mac's files join the release after it is published: the notarised image (mac-build.yml), then what a Mac
+# updates itself from, with the Mac's entry added to latest.json and SHA256SUMS.txt made again (mac-update.yml).
+#
 # The two installers an update can install (the NSIS setup.exe and the AppImage) are signed
-# with the updater key in ONE place: the `sign` job. It runs on a tag only, in the `release`
+# with the updater key in ONE place here: the `sign` job (mac-update.yml signs the Mac's the same way). It runs on a tag only, in the `release`
 # environment that holds the secrets TAURI_SIGNING_PRIVATE_KEY and
 # TAURI_SIGNING_PRIVATE_KEY_PASSWORD (docs/RELEASING.md, The updater key), after the
 # verification gate and every build have passed. The builds are unsigned and no step that
@@ -799,7 +802,8 @@ jobs:
           - Windows: \`oaiy-desktop-$VERSION-windows-x64-setup.exe\` (installer) or the \`.msi\`
           - Linux: \`.AppImage\` (portable), \`.deb\` (Debian/Ubuntu) or \`.rpm\` (Fedora/RHEL)
           - OAIY Desktop looks here for a newer version (\`latest.json\`, with the \`.sig\` signatures of
-            the setup.exe and the AppImage) and installs one only when you press the button in Settings.
+            the setup.exe and the AppImage, and of the Mac's \`.app.tar.gz\` once it is added) and installs one
+            only when you press the button in Settings.
             The \`.msi\`, \`.deb\` and \`.rpm\` are not updated from inside OAIY: download a newer one.
 
           **oaiy-server** — the same local API with no window, tray or GTK, for a Linux or
