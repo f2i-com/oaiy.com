@@ -11,7 +11,7 @@ interface VideoAvatarNodeData {
     guidanceScale?: number;
     numInferenceSteps?: number;
     videoPath?: string;
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onCollapsedChange?: (value: boolean) => void;

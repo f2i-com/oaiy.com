@@ -91,20 +91,26 @@ const CoreImageCompiler: ModuleCompiler = {
   }`;
           break;
         }
+        // A service picked on the node is what it runs on: its own Backend, Endpoint, Model and key fields show only
+        // while Service is blank, and are read only then (hidden, the ComfyUI address every node was given when
+        // added won over a service of the person's own).
+        const own: Record<string, unknown> = String(data.service ?? '').trim() === ''
+          ? data
+          : { ...data, endpoint: undefined, apiFormat: undefined, model: undefined, apiKeyConstant: undefined };
         const endpoint = escapeString(String(
-          data.endpoint || preset?.endpoint || projectSettings?.defaultImageEndpoint || ''
+          own.endpoint || preset?.endpoint || projectSettings?.defaultImageEndpoint || ''
         ));
         const apiFormat = escapeString(String(
-          data.apiFormat || preset?.apiFormat || 'openai'
+          own.apiFormat || preset?.apiFormat || 'openai'
         ));
         // For wan2gp, use wan2gpModel; otherwise use generic model field
         const model = escapeString(String(
           apiFormat === 'wan2gp'
-            ? (data.wan2gpModel || data.model || preset?.model || 'qwen')
-            : (data.model || preset?.model || '')
+            ? (data.wan2gpModel || own.model || preset?.model || 'qwen')
+            : (own.model || preset?.model || '')
         ));
         const apiKeyConstant = escapeString(String(
-          data.apiKeyConstant
+          own.apiKeyConstant
             || preset?.apiKeyConstant
             || projectSettings?.defaultImageApiKeyConstant
             || 'OPENAI_API_KEY'

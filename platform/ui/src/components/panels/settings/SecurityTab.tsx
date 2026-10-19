@@ -73,7 +73,7 @@ export default function SecurityTab({ settings, onUpdateSettings, onShowToast }:
         </label>
         <p className="oaiy-note warn m-0">
           <strong>Use with care.</strong> This turns off the check that stops a flow you did not write
-          from reaching the services on your own machine and network.
+          from reaching the services on your own computer and network.
         </p>
       </Card>
 

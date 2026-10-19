@@ -7,7 +7,7 @@ interface TemplateNodeData {
   template?: string;
   inputCount?: number;
   inputNames?: string[];
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onTemplateChange?: (value: string) => void;
   onInputCountChange?: (value: number) => void;

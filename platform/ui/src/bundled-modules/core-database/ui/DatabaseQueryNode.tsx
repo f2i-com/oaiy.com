@@ -6,7 +6,7 @@ import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 interface DatabaseQueryNodeData {
   collectionName?: string;
   filterJson?: string;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   showBodyProperties?: boolean;
   onCollectionNameChange?: (value: string) => void;

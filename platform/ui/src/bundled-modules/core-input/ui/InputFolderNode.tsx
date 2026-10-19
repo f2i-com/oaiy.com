@@ -9,7 +9,7 @@ interface InputFolderNodeData {
   excludePatterns?: string;
   maxFiles?: number;
   _fileCount?: number;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   showBodyProperties?: boolean;
   onPathChange?: (value: string) => void;

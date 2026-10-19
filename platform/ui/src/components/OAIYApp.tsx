@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { EXAMPLE_FLOWS, flowFromExample } from '../lib/exampleFlows';
+import { EXAMPLE_FLOWS, flowFromExample, withModelsHere } from '../lib/exampleFlows';
+import { currentAvailabilityEnv } from '../lib/availabilityEnv';
 import { shortcut } from '../lib/keys';
 import OAIYBuilder from './OAIYBuilder';
 import FlowsSidebar from './panels/FlowsSidebar';
@@ -46,7 +47,8 @@ import { hasCompletedWizard } from '../lib/wizardPrefs';
 import { saveService, listAllServices } from '../utils/serviceRegistry';
 import { listDesktopServices } from '../lib/desktopServices';
 import { inOaiyWindow } from '../lib/oaiyWindow';
-import { shared as sharedWithDesktop, subscribeDesktopFlowUnsaved } from '../hooks/useDesktopFlows';
+import { desktopSaveState, shared as sharedWithDesktop, subscribeDesktopFlowUnsaved, subscribeDesktopSaveState, type DesktopSaveState } from '../hooks/useDesktopFlows';
+import { savedLabelOf } from '../lib/savedLabel';
 import { sanitizeProjectForExport } from '../utils/ProjectIO';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
@@ -211,7 +213,14 @@ export default function OAIYApp() {
   useEffect(() => subscribeDesktopStatus(setDesktop), []);
   // What the editor can do here (lib/caps.ts): no Packages section and no dock in a tab that is not linked to a desktop.
   const caps = useCaps();
-  const savedWhere = !inOaiyWindow() ? 'Saved in this browser' : activeFlow && sharedWithDesktop(activeFlow) ? 'Saved in OAIY' : 'Saved in this window';
+  // The open flow's copy on OAIY Desktop (in OAIY's window): what the header says follows the save, not the window.
+  const [desktopState, setDesktopState] = useState<DesktopSaveState>(() => desktopSaveState(activeFlow?.id));
+  useEffect(() => {
+    const update = () => setDesktopState(desktopSaveState(activeFlow?.id));
+    update();
+    return subscribeDesktopSaveState(update);
+  }, [activeFlow?.id]);
+  const saved = savedLabelOf({ inOaiy: inOaiyWindow(), shared: !!activeFlow && sharedWithDesktop(activeFlow), storage: saveState, desktop: desktopState });
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
 
   // Package management hook
@@ -672,14 +681,14 @@ export default function OAIYApp() {
   // "Saved in OAIY" at its word. It is sent again after the next look at the desktop's flows.
   useEffect(() => {
     return subscribeDesktopFlowUnsaved(({ name, reason }) => {
-      addToast(`“${name}” is not saved in OAIY Desktop: ${reason.replace(/[.\s]+$/, '')}. It is kept here and sent again in a moment.`, 'error', 0);
+      addToast(`“${name}” is not saved in OAIY yet: ${reason.replace(/[.\s]+$/, '')}. It is kept here and sent again in a moment.`, 'error', 0);
     });
   }, [addToast]);
 
   useEffect(() => {
     return subscribeStorageQuota(({ area }) => {
       addToast(
-        `Browser storage is full (autosave hit its quota while saving ${area}). Recent edits may not survive a refresh — export the project (Ctrl/⌘+S), then delete flows you no longer need to make room.`,
+        `Browser storage is full (autosave hit its quota while saving ${area}). Recent edits may not survive a refresh — export the project (Projects → Export this project), then delete flows you no longer need to make room.`,
         'warning',
         0,
       );
@@ -696,7 +705,7 @@ export default function OAIYApp() {
   };
   // The rail lists flows: it is there for the canvas and a flow's data.
   const railSection = section === 'workflows' || section === 'data';
-  const SECTION_LABEL: Record<EditorSection, string> = { workflows: 'Workflows', data: 'Data', queue: 'Queue', packages: 'Packages', settings: 'Settings' };
+  const SECTION_LABEL: Record<EditorSection, string> = { workflows: 'Flows', data: 'Data', queue: 'Queue', packages: 'Packages', settings: 'Settings' };
 
   return (
     <JobQueueProvider
@@ -758,8 +767,8 @@ export default function OAIYApp() {
           onSetTheme={followsOaiy ? undefined : setTheme}
           // (where it is kept: in OAIY's window a flow goes to OAIY Desktop a moment after each change, hooks/useDesktopFlows.ts,
           // where the agent and the CLI find it; a macro, an example or one kept in the window only stays in the window)
-          savedLabel={section === 'workflows' ? (saveState === 'saved' ? savedWhere : saveState === 'saving' ? 'Saving…' : 'Not saved: storage full') : undefined}
-          savedProblem={saveState === 'not-saved'}
+          savedLabel={section === 'workflows' ? saved.label : undefined}
+          savedProblem={saved.problem}
           chips={
             section === 'workflows' ? (
               <>
@@ -818,12 +827,13 @@ export default function OAIYApp() {
                   exportProject();
                   addToast(`Project "${project.name}" exported as JSON`, 'success');
                 }}
+                onNewProject={() => setShowNewProjectDialog(true)}
                 projectName={project.name}
                 onShowToast={addToast}
               />
               <ShellIconAction
                 label="Open the welcome wizard"
-                title={'Welcome wizard / help\n\nShortcuts:\n  Ctrl/\u2318 + S \u2014 Export project as JSON\n  Ctrl/\u2318 + N \u2014 New project'}
+                title={'Welcome wizard / help\n\nShortcuts:\n  Ctrl/\u2318 + S \u2014 Save now\n  Ctrl/\u2318 + N \u2014 New flow\n  Ctrl/\u2318 + B \u2014 Show or hide the flows\n  Ctrl/\u2318 + Z, Shift + Ctrl/\u2318 + Z \u2014 Undo, redo\n  Ctrl/\u2318 + A, C, V \u2014 Select all, copy, paste nodes\n  Delete \u2014 Delete the selected nodes'}
                 onClick={() => setWizardOpen(true)}
               >
                 <HelpCircle size={16} />
@@ -893,7 +903,18 @@ export default function OAIYApp() {
               onSetFlowLocalOnly={setFlowLocalOnly}
               onSetFlowRemote={(flowId, remote) => updateFlow(flowId, { remote })}
               examples={EXAMPLE_FLOWS}
-              onAddExample={(example) => addFlow(flowFromExample(example))}
+              onAddExample={(example) => {
+                // (on the models this computer has: a step whose model is not here takes the default of its kind)
+                const { flow, swapped } = withModelsHere(flowFromExample(example), currentAvailabilityEnv());
+                addFlow(flow);
+                if (swapped.length) {
+                  addToast(
+                    `${swapped.map((w) => `“${w.step}” uses the default ${w.kind}`).join('; ')}: the model the example was made with is not on this computer.`,
+                    'info',
+                    8000,
+                  );
+                }
+              }}
               onSaveAsMacro={handleSaveAsMacro}
               onEditMacro={handleEditMacro}
               onSaveMacro={handleSaveMacroChanges}
@@ -953,7 +974,7 @@ export default function OAIYApp() {
                 <h2 className="m-0 text-[15px] font-semibold text-content-primary">That flow is not in the package</h2>
                 <p className="oaiy-card-text">
                   The package has no flow "{activePackageFlow.flowId}".
-                  {activePackage ? ` "${activePackage.manifest.name}" has ${activePackage.flows.length} flow(s).` : ''}
+                  {activePackage ? ` "${activePackage.manifest.name}" has ${activePackage.flows.length} flow${activePackage.flows.length === 1 ? '' : 's'}.` : ''}
                 </p>
                 <div className="flex justify-center gap-2">
                   <button
@@ -1001,6 +1022,8 @@ export default function OAIYApp() {
               active={section === 'workflows'}
               onShowToast={addToast}
               onLoadPackage={handleLoadPackage}
+              onAddService={() => openSettings('services')}
+              onOpenWizard={() => setWizardOpen(true)}
             />
           ) : (
             <div className="bg-dotgrid grid h-full w-full place-items-center p-6">
@@ -1097,7 +1120,7 @@ export default function OAIYApp() {
       <ConfirmDialog
         isOpen={showNewProjectDialog}
         title="Start a new project?"
-        message={`This replaces "${project.name}" with a new, empty project: its flows are gone from here unless you export it first (Projects → Export).${oaiyDesktop() ? ' The flows OAIY Desktop keeps are not deleted: they come back into the new project.' : ''}`}
+        message={`This replaces "${project.name}" with a new, empty project: its flows are gone from here unless you export it first (Projects → Export this project).${oaiyDesktop() ? ' The flows OAIY Desktop keeps are not deleted: they come back into the new project.' : ''}`}
         confirmLabel="Create New"
         cancelLabel="Cancel"
         variant="warning"

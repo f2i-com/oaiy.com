@@ -543,7 +543,7 @@ function QueuePanel({ onNavigateToFlow }: QueuePanelProps) {
       title="Queue"
       description={
         inOaiy
-          ? "Flows this editor is running, waiting to run, and has run since it opened. Every run on this machine is in OAIY's Run history."
+          ? "Flows this editor is running, waiting to run, and has run since it opened. Every run on this computer is in OAIY's Run history."
           : 'Flows this editor is running, waiting to run, and has run since it opened.'
       }
       actions={
@@ -608,7 +608,7 @@ function QueuePanel({ onNavigateToFlow }: QueuePanelProps) {
 
       <Card title="How flows run">
         <p className="oaiy-card-text">
-          One at a time keeps a flow's models and services to itself; several at once finishes a batch sooner when the machine can take it.
+          One at a time keeps a flow's models and services to itself; several at once finishes a batch sooner when the computer can take it.
         </p>
         <QueueConfig config={config} onChange={setConfig} />
       </Card>

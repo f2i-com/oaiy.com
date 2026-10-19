@@ -14,6 +14,7 @@ import type {
 import { getModuleLoader } from 'oaiy-core';
 import { triggerDownloadFromBlob } from '../lib/download';
 import { withoutRunOutputs } from './runOutputs';
+import { withoutProviderSeeds } from './NodeDefaults';
 import {
   defaultLLMEndpoints,
   defaultImageGenEndpoints,
@@ -357,12 +358,29 @@ const ensureUniqueFlowIds = <T extends { id?: string }>(flows: T[]): T[] => {
  * Parse and validate an imported project file
  * Returns merged project with defaults for any missing fields
  */
-export const parseImportedProject = (content: string): ExportedProject => {
-  const imported = JSON.parse(content) as ExportedProject;
+/**
+ * A file's text as JSON, or an error that says what the file is not, in words ("This file isn't an OAIY project (it
+ * isn't valid JSON)"), not the parser's ("Unexpected token 'h', "hello" is not valid JSON").
+ */
+export function parseJsonFile(content: string, what: 'project' | 'flow'): unknown {
+  try {
+    return JSON.parse(content);
+  } catch {
+    throw new Error(`This file isn't an OAIY ${what} (it isn't valid JSON).`);
+  }
+}
 
-  // Validate basic structure
-  if (!imported.flows || !Array.isArray(imported.flows)) {
-    throw new Error('Invalid project: missing flows array');
+export const parseImportedProject = (content: string): ExportedProject => {
+  const imported = parseJsonFile(content, 'project') as ExportedProject;
+
+  // Validate basic structure: a project has flows (a flow file has nodes, and is added with Import flows)
+  if (!imported || typeof imported !== 'object' || !Array.isArray(imported.flows)) {
+    const flow = !!imported && typeof imported === 'object' && Array.isArray((imported as { nodes?: unknown }).nodes);
+    throw new Error(
+      flow
+        ? "This file is a flow, not a project: add it with Import flows… instead."
+        : "This file isn't an OAIY project (it has no flows).",
+    );
   }
 
   // Merge with defaults for any missing fields
@@ -378,7 +396,7 @@ export const parseImportedProject = (content: string): ExportedProject => {
         ...f,
         graph:
           f && f.graph && Array.isArray(f.graph.nodes) && Array.isArray(f.graph.edges)
-            ? { ...f.graph, nodes: withoutRunOutputs(f.graph.nodes) }
+            ? { ...f.graph, nodes: withoutProviderSeeds(withoutRunOutputs(f.graph.nodes)) }
             : { nodes: [], edges: [] },
       }))
     ),

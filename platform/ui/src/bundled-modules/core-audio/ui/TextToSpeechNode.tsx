@@ -37,7 +37,7 @@ interface TextToSpeechNodeData {
     filename?: string;
 
     audioPath?: string;
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
 

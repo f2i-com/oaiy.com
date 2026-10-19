@@ -8,7 +8,7 @@ type ConditionOperator = 'equals' | 'not_equals' | 'contains' | 'not_contains' |
 interface ConditionNodeData {
   operator?: ConditionOperator;
   compareValue?: string;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onOperatorChange?: (value: ConditionOperator) => void;
   onCompareValueChange?: (value: string) => void;

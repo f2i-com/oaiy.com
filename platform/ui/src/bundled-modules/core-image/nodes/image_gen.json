@@ -1,7 +1,7 @@
 {
   "id": "image_gen",
   "name": "Image Gen",
-  "description": "Generate images using ComfyUI or other local image APIs.",
+  "description": "Make a picture from a prompt, or edit the pictures it is given: with OAIY's engine (its default picture model, or one you pick) or a service you add.",
   "doc": "Generate AI images from text prompts.\n\nSupported APIs:\n• ComfyUI (Stable Diffusion, FLUX, etc.)\n• Any OpenAI-compatible image API (set the endpoint per node)\n\nFeatures:\n• Custom dimensions (width/height)\n• Negative prompts to avoid unwanted elements\n• Image-to-image with input images\n• Input image size limits for API compatibility\n\nTip: Set default API settings in Project Settings to avoid configuring each node.",
   "icon": "image",
   "color": "pink",

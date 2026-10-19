@@ -5,7 +5,7 @@ import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 interface MacroOutputNodeData {
     name?: string;
     outputType?: string;
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onCollapsedChange?: (value: boolean) => void;

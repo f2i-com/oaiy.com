@@ -11,7 +11,7 @@ interface ImageSaveNodeData {
   /** An older card's Filename, which the run never read. */
   filename?: string;
   format?: 'png' | 'jpg' | 'webp';
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   showBodyProperties?: boolean;
   onFilenameChange?: (value: string) => void;

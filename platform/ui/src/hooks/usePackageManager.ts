@@ -19,9 +19,10 @@ import type {
   PackageNodeModule,
 } from 'oaiy-core';
 import { createLogger } from '../utils/logger';
-import { registerImportedServices } from '../utils/ProjectIO';
+import { parseJsonFile, registerImportedServices } from '../utils/ProjectIO';
 import { rewriteFlowRefs } from '../lib/flowIds';
 import { withoutRunOutputs } from '../utils/runOutputs';
+import { withoutProviderSeeds } from '../utils/NodeDefaults';
 
 const logger = createLogger('PackageManager');
 
@@ -133,6 +134,9 @@ export function applyDefaultProviders(graph: WorkflowGraph, settings: ProjectSet
     // intended target on import — unlike the image_gen branch below).
     if (node.type === 'ai_llm') {
       const d = node.data as Record<string, unknown>;
+      // (one on a service runs on it: the provider's fields are not filled in, and Ollama's left from when it was added
+      // are left out, utils/NodeDefaults.ts)
+      if (typeof d.service === 'string' && d.service.trim()) return withoutProviderSeeds([node])[0];
       const keep = (v: unknown, fallback: string) =>
         (typeof v === 'string' && v.trim()) ? v : fallback;
       return {
@@ -447,7 +451,9 @@ export function usePackageManager(options: UsePackageManagerOptions) {
           readAs: 'text',
         });
 
-        const jsonData = JSON.parse(fileResult.content);
+        const parsed = parseJsonFile(fileResult.content, 'flow');
+        if (!parsed || typeof parsed !== 'object') throw new Error("This file isn't an OAIY flow (it has no nodes and edges).");
+        const jsonData = parsed as Record<string, any>;
         const fileName = path.split(/[/\\]/).pop()?.replace('.json', '') || 'Imported Flow';
 
         // Re-register any embedded services BEFORE the flow gets created
@@ -494,7 +500,7 @@ export function usePackageManager(options: UsePackageManagerOptions) {
 
         // Validate we found valid flows
         if (flowsToImport.length === 0) {
-          onShowToast('Invalid file: no valid flow data found. Expected nodes and edges arrays.', 'error');
+          onShowToast("This file isn't an OAIY flow (it has no nodes and edges).", 'error');
           return;
         }
 
@@ -547,8 +553,9 @@ export function usePackageManager(options: UsePackageManagerOptions) {
       // Otherwise, load as a .oaiy package
       await handleLoadPackageFromPath(path);
     } catch (err) {
-      logger.error('Failed to load file', { error: err });
-      onShowToast(`Failed to load file: ${err}`, 'error');
+      logger.warn('Failed to load file', { error: err });
+      // (its message, which says what the file is not, without the "Error: " a thrown error is written with)
+      onShowToast(err instanceof Error ? err.message : `The file could not be loaded: ${String(err)}`, 'error');
     }
   }, [handleLoadPackageFromPath, createFlow, updateFlow, onShowToast, getSettings]);
 

@@ -67,7 +67,7 @@ interface ImageGenNodeData {
   comfyFixedSeed?: number | null;
   // Dynamic image inputs
   imageInputCount?: number;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   showBodyProperties?: boolean;
   onEndpointChange?: (value: string) => void;

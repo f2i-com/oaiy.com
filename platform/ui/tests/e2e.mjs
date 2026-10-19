@@ -261,9 +261,9 @@ for (const theme of ['dark', 'light']) {
 
     ok('boots with a clean console', errors.length === 0, errors.slice(0, 2).join(' | '));
     ok('app shell renders', (await page.locator('.app-shell').count()) === 1);
-    // Workflows, Data, Queue; Settings sits at the foot of the rail. A tab that is not linked to OAIY Desktop has no Packages (loading a
+    // Flows, Data, Queue; Settings sits at the foot of the rail. A tab that is not linked to OAIY Desktop has no Packages (loading a
     // package uses the desktop's own commands, which only OAIY's window has) and no endpoint dock (it shows the desktop's engine).
-    ok('sidebar has the primary nav a tab can use: Workflows, Data, Queue', (await page.locator('.oaiy-nav button').count()) === 3);
+    ok('sidebar has the primary nav a tab can use: Flows, Data, Queue', (await page.locator('.oaiy-nav button').count()) === 3);
     ok('there is no Packages section in a tab', (await page.locator('.oaiy-nav button[aria-label="Packages"]').count()) === 0);
     ok('Settings is in the rail too', (await page.locator('.oaiy-settings-btn').count()) === 1);
     ok('there is no endpoint dock in a tab that is not linked to a desktop', (await page.locator('.oaiy-dock').count()) === 0);
@@ -306,6 +306,32 @@ for (const theme of ['dark', 'light']) {
       ok('nor Ask the Agent', !/Ask the Agent/.test(await found('Ask the')));
       ok('nor Folder Input', !/Folder Input/.test(await found('Folder')));
       await search.fill('');
+      // With no service added (the wizard skipped), the Services category says where AI nodes come from, and offers the way.
+      const services = (await page.locator('[data-testid="node-palette"] .oaiy-palette-hint').textContent()) ?? '';
+      ok('the palette of a tab with no service says to add one to get AI nodes', /Add an AI service to get AI nodes/.test(services), services.slice(0, 120));
+    }
+
+    // ⌘A and ⌘V are the canvas's after a click on an empty part of it (the builder has the focus then, not the canvas).
+    {
+      const add = page.locator('[data-testid="node-palette"] [aria-label="Add Text Input node"]');
+      await page.locator('[data-testid="node-palette"] input[placeholder="Search nodes"]').fill('Text Input');
+      await page.waitForTimeout(300);
+      await add.first().click();
+      await add.first().click();
+      await page.locator('[data-testid="node-palette"] input[placeholder="Search nodes"]').fill('');
+      await page.waitForTimeout(400);
+      const pane = await page.locator('.react-flow__pane').boundingBox();
+      await page.mouse.click(pane.x + pane.width - 40, pane.y + pane.height / 2);
+      await page.keyboard.press('ControlOrMeta+a');
+      await page.waitForTimeout(300);
+      ok('⌘A on an empty part of the canvas selects every node', (await page.locator('.react-flow__node.selected').count()) === 2,
+        `${await page.locator('.react-flow__node.selected').count()} selected`);
+      await page.keyboard.press('ControlOrMeta+c');
+      await page.mouse.click(pane.x + pane.width - 40, pane.y + 40);
+      await page.keyboard.press('ControlOrMeta+v');
+      await page.waitForTimeout(500);
+      ok('and ⌘V after another click there pastes them', (await page.locator('.react-flow__node').count()) === 4,
+        `${await page.locator('.react-flow__node').count()} nodes`);
     }
     const propsButton = page.locator('.oaiy-toolbar button[aria-label$="the properties"]');
     ok('the canvas toolbar offers the properties', (await propsButton.count()) === 1);
@@ -335,7 +361,7 @@ for (const theme of ['dark', 'light']) {
     await page.waitForTimeout(500);
     ok('the Data page of a tab says what it holds is kept for the session only',
       /Kept for this session only/.test((await page.locator('[data-testid="data-page"]').textContent()) ?? ''));
-    await page.locator('.oaiy-nav button[aria-label="Workflows"]').click();
+    await page.locator('.oaiy-nav button[aria-label="Flows"]').click();
     await page.waitForTimeout(300);
 
     // regression: the accent must be applied consistently, not half-default

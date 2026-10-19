@@ -2,6 +2,7 @@ import { memo, useMemo } from 'react';
 import { MousePointerClick } from 'lucide-react';
 import type { Node } from '@xyflow/react';
 import { PropertyField, shouldShowProperty } from 'oaiy-ui-components/nodes/fields/PropertyField';
+import { useNodeNotice } from 'oaiy-ui-components';
 import type { NodeDefinition } from 'oaiy-core';
 import { BUNDLED_MODULES, getModuleLoader } from 'oaiy-core';
 import { getCustomNodeDefinition } from '../../services/customNodeRegistry';
@@ -102,6 +103,9 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
         }
         return values;
     }, [definition, selectedNode, serviceFallbacks]);
+
+    // What the node's card says of it (its model offline or not installed), said here too, above its settings.
+    const notice = useNodeNotice(selectedNode?.type, (selectedNode?.data ?? {}) as Record<string, unknown>);
 
     // If no node selected, say how to pick one.
     if (!selectedNode) {
@@ -277,6 +281,11 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
 
             {/* The node's settings. */}
             <div className="flex flex-col gap-4 p-3.5">
+                {notice && (
+                    <div role="status" className="oaiy-note warn">
+                        <p className="m-0">{notice}</p>
+                    </div>
+                )}
                 {(!definition.properties || definition.properties.length === 0) && (
                     <p className="oaiy-help faint">This node has nothing to set.</p>
                 )}

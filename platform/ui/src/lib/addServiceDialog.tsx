@@ -101,11 +101,11 @@ function AddServiceDialog({ nodeType, choose }: { nodeType: string; choose?: (se
             <>
               <li>
                 <strong>A model for OAIY's engine</strong> (pictures, video, speech, music, sound effects, 3D): add it in
-                OAIY → <strong>Engines</strong>. Once its files are here it is listed under “OAIY engine”.
+                OAIY → <strong>Engines</strong>. Once its files are here it is listed under “This computer”.
               </li>
               <li>
                 <strong>Your own Python rig or local server</strong> (ComfyUI, anything with an HTTP API): add it in
-                OAIY → <strong>Services</strong>. Once installed it is listed under “Your services”; its template's{' '}
+                OAIY → <strong>Services</strong>. Once installed it is listed under “OAIY Services”; its template's{' '}
                 <code className="oaiy-code">node</code> block says how a node calls it.
               </li>
             </>

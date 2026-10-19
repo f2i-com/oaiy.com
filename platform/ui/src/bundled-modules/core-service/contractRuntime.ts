@@ -374,9 +374,15 @@ async function followJob(ctx: RuntimeContext, service: CustomService, started: u
   const id = String(extractPath(started, job.idPath) ?? '');
   if (!id) throw new Error(`${label}: the service started no job (no ${job.idPath} in its answer)`);
   const at = (u: string) => absoluteUrl(u.replace(/\{id\}/g, encodeURIComponent(id)));
-  // (sent without the run's abort signal: on Stop that signal has fired, and the cancel went with it unsent)
+  // (sent without the run's abort signal: on Stop that signal has fired, and the cancel went with it unsent). A job
+  // with no way to cancel it (OAIY's video jobs have none yet) goes on where it runs: on Stop, said so, rather than
+  // the person taking the stop for the end of it.
   const cancel = () => {
-    if (job.cancelUrl) void send({ ...ctx, abortSignal: undefined }, at(job.cancelUrl), 'POST', { 'Content-Type': 'application/json' }, '{}').catch(() => {});
+    if (job.cancelUrl) {
+      void send({ ...ctx, abortSignal: undefined }, at(job.cancelUrl), 'POST', { 'Content-Type': 'application/json' }, '{}').catch(() => {});
+    } else if (ctx.abortSignal?.aborted) {
+      ctx.log('warn', `[${label}] Stopped here; ${stillMade(service)}`);
+    }
   };
   ctx.log('info', `[${label}] job ${id} started`);
   const began = Date.now();
@@ -424,6 +430,17 @@ async function followJob(ctx: RuntimeContext, service: CustomService, started: u
       ctx.log('info', `[${label}] ${Math.round(progress)}%`);
     }
   }
+}
+
+/** What goes on after a stop, for a job that cannot be cancelled: "the video is still being made in OAIY". */
+function stillMade(service: CustomService): string {
+  const what = service.output === 'video' ? 'the video'
+    : service.output === 'image' ? 'the picture'
+    : service.output === 'model3d' ? 'the 3D model'
+    : service.output === 'audio' ? (service.kind === 'music' ? 'the music' : service.kind === 'speech' ? 'the speech' : 'the sound')
+    : 'what it makes';
+  const where = service.group === 'engine' ? (service.nodeName ? `on ${service.nodeName}` : 'in OAIY') : `by ${service.name || 'the service'}`;
+  return `${what} is still being made ${where}`;
 }
 
 async function jobContent(ctx: RuntimeContext, service: CustomService, id: string, label: string): Promise<{ bytes: Uint8Array; mime: string | null }> {

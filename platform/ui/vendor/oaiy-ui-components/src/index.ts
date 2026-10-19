@@ -42,7 +42,11 @@ export {
 } from './hooks/useDynamicOptions.js';
 export {
   useNodeNotice,
+  useNodeNoticeDetail,
   getNodeNotice,
+  getNodeNoticeDetail,
   registerNodeNoticeProvider,
+  type NodeNotice,
   type NodeNoticeProvider,
 } from './hooks/useNodeNotice.js';
+export { registerServiceDescriber, describeServiceId, type ServiceDescriber } from './registry/serviceNames.js';

@@ -7,7 +7,7 @@ interface FileReadNodeData {
   readAs?: 'text' | 'base64' | 'json' | 'csv' | 'lines';
   csvHasHeader?: boolean;
   _fileName?: string;  // Current file name for preview
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onReadAsChange?: (value: string) => void;
   onCsvHasHeaderChange?: (value: boolean) => void;

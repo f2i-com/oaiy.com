@@ -31,7 +31,7 @@ interface ServiceCallNodeData {
   service?: string;
   endpoint?: string;
   _collapsed?: boolean;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   onCollapsedChange?: (collapsed: boolean) => void;
 }
 
@@ -188,12 +188,15 @@ function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
             )}
           </>
         ) : missing ? (
-          <div
-            role="status"
-            className="rounded border border-amber-500/60 bg-amber-50 dark:bg-amber-900/30 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:text-amber-100"
-          >
-            {notice || `The service “${data.service}” is not available here. Pick another in the Properties panel.`}
-          </div>
+          // (the host's notice, where it has one, is the card wrapper's, above this)
+          notice ? null : (
+            <div
+              role="status"
+              className="rounded border border-amber-500/60 bg-amber-50 dark:bg-amber-900/30 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:text-amber-100"
+            >
+              {`The service “${data.service}” is not available here. Pick another in the Properties panel.`}
+            </div>
+          )
         ) : (
           <div className="text-slate-600 dark:text-slate-400 italic">
             No service selected — pick one in the Properties panel or drop a

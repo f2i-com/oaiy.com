@@ -26,6 +26,7 @@ import {
   type ProjectConstant,
   type LocalNetworkPermissionRequest,
   type LocalNetworkPermissionResponse,
+  type NodeStatus,
 } from 'oaiy-core';
 import { createEngine } from '../engine/createEngine';
 import { untrustedWorkerFactory, zippSandboxEnabled } from '../lib/zippPrefs';
@@ -506,7 +507,7 @@ export function useJobLogs(jobId: string | null): LogEntry[] {
  */
 export function useJobNodeStatus(
   jobId: string | null,
-  onStatus: (nodeId: string, status: 'running' | 'completed' | 'error') => void
+  onStatus: (nodeId: string, status: NodeStatus) => void
 ) {
   const { jobManager } = useJobQueue();
   const onStatusRef = useRef(onStatus);

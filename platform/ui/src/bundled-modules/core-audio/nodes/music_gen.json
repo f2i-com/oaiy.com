@@ -1,7 +1,7 @@
 {
     "id": "music_gen",
     "name": "Music Gen",
-    "description": "Generate music from a description and optional lyrics: with OAIY's engine (service engine:music), a service you add, or an ACE-Step / HeartMuLa server at API URL.",
+    "description": "Make music from a description, and lyrics if given: with OAIY's engine, a service you add, or an ACE-Step or HeartMuLa server at an API URL.",
     "doc": "Generate AI music from text prompts using ACE-Step.\n\nPrompt Tips:\n• Include genre: pop, rock, electronic, jazz\n• Specify mood: energetic, calm, melancholic\n• Add instruments: piano, guitar, synth\n• Describe vocals: male/female, soft, powerful\n\nLyrics Format:\n[verse] First verse lyrics here\n[chorus] Catchy chorus lyrics\n[bridge] Bridge section\n\nSettings:\n• Duration: 10-240 seconds\n• Quality Steps: higher = better but slower\n• Seed: use same seed for reproducible results\n\nService: `OAIY engine` uses the music model set up in OAIY's Engines (songs with vocals; no lyrics makes an instrumental). Your own services (a Python rig in OAIY → Services, or a custom HTTP service) are sent `{{prompt}}`, `{{lyrics}}`, `{{duration}}`, `{{instrumental}}` and `{{seed}}`. `ACE-Step` / `HeartMuLa` call that server at API URL (default: localhost:8766).",
     "icon": "music",
     "color": "purple",

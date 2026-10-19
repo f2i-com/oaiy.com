@@ -30,7 +30,7 @@ interface LogicBlockNodeData {
   code?: string;
   inputCount?: number;
   inputNames?: string[];
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   /** The block's own name, where the flow gives it one. */
   label?: string;

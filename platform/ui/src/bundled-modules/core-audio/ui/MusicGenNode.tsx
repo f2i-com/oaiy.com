@@ -17,7 +17,7 @@ interface MusicGenNodeData {
     filename?: string;
     audioPath?: string;
     service?: 'ace-step' | 'heartmula';
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onChange?: (field: string, value: unknown) => void;

@@ -82,7 +82,7 @@ export default function EngineEndpointCard() {
     <Card title="OAIY's engine" actions={pill}>
       <p className="oaiy-card-text">
         Where this editor looks for the engine that runs flows, hosts local models and drives
-        plugins. Leave it as the default when the editor and the engine are on the same machine.
+        plugins. Leave it as the default when the editor and the engine are on the same computer.
       </p>
 
       <form
@@ -139,7 +139,7 @@ export default function EngineEndpointCard() {
         /* A correct address against a loopback-only server fails exactly like a
            typo, so say which one to check. */
         <p className="oaiy-note warn m-0">
-          This is another machine. OAIY Desktop only answers the network when you turn that on in
+          This is another computer. OAIY Desktop only answers the network when you turn that on in
           its own settings, and it will ask you to approve this browser the first time it connects.
         </p>
       )}

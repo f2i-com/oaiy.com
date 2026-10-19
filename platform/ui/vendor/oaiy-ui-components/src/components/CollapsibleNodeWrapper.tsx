@@ -2,6 +2,7 @@ import { memo, useState, useCallback, useEffect, type ReactNode } from 'react';
 import { Handle, Position, useNodeId, useStore } from '@xyflow/react';
 import type { HandleDefinition } from 'oaiy-core';
 import { useNodeDefinition } from '../hooks/useNodeDefinition';
+import { useNodeNoticeDetail } from '../hooks/useNodeNotice';
 import { resolveNodeIcon } from '../registry/nodeIcons';
 import { portTypeClass, typeWords } from './portTypes';
 
@@ -39,8 +40,8 @@ export interface CollapsibleNodeWrapperProps {
   width: number;
   /** Width when collapsed (at least 200: room for its ports' names) */
   collapsedWidth?: number;
-  /** Status for visual styling (else the node's own `_status`, as the run sets it) */
-  status?: 'running' | 'completed' | 'error';
+  /** Status for visual styling (else the node's own `_status`, as the run sets it; `stopped`: where Stop found it) */
+  status?: 'running' | 'completed' | 'error' | 'stopped';
   /** Validation issues to display warning indicator */
   validationIssues?: ValidationIssue[];
   /** Whether the node starts collapsed (it does: compact until expanded) */
@@ -170,12 +171,14 @@ const ROW = 22;
 const MIN_COLLAPSED = 232;
 
 // Run status → visible pill + screen-reader text. Semantic status hues (not the
-// customizable accent): amber=running, green=completed, red=error, each with a
-// dark variant so it reads on both the cream and dark canvas.
+// customizable accent): amber=running, green=completed, red=error, and a neutral
+// grey for stopped (Stop found it running: nothing of its own went wrong), each
+// with a dark variant so it reads on both the cream and dark canvas.
 const STATUS_META = {
   running: { label: 'Running', pill: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300', dot: 'bg-amber-500' },
   completed: { label: 'Completed', pill: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300', dot: 'bg-green-500' },
   error: { label: 'Error', pill: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300', dot: 'bg-red-500' },
+  stopped: { label: 'Stopped', pill: 'bg-slate-200 text-slate-700 dark:bg-slate-700/60 dark:text-slate-200', dot: 'bg-slate-400' },
 } as const;
 
 /** A port's name as its row shows it: its label, else its id (a node's one output, `output`, as "out"). */
@@ -234,9 +237,15 @@ function CollapsibleNodeWrapper({
   // definition alone, and a few others, never showed which step was running or which one failed.
   const dataStatus = useStore((st) => {
     const raw = nodeId ? (st.nodeLookup.get(nodeId)?.data as { _status?: unknown } | undefined)?._status : undefined;
-    return raw === 'running' || raw === 'completed' || raw === 'error' ? raw : undefined;
+    return raw === 'running' || raw === 'completed' || raw === 'error' || raw === 'stopped' ? raw : undefined;
   });
   const status = givenStatus ?? dataStatus;
+  // What the host says of the node (the model it uses is offline or not installed): a warning mark on the card,
+  // folded or not, a short line on the folded card and the whole notice on the expanded one. It was on the expanded
+  // card alone, so a flow of folded cards showed nothing wrong until it ran.
+  const nodeType = useStore((st) => (nodeId ? st.nodeLookup.get(nodeId)?.type : undefined));
+  const nodeData = useStore((st) => (nodeId ? (st.nodeLookup.get(nodeId)?.data as Record<string, unknown> | undefined) : undefined));
+  const notice = useNodeNoticeDetail(nodeType, nodeData);
   // Its definition: the palette's icon for it, and its ports' names and kinds of value.
   const definition = useNodeDefinition();
   const icon = (!ownIcon && resolveNodeIcon(definition?.icon)) || givenIcon;
@@ -330,6 +339,13 @@ function CollapsibleNodeWrapper({
               <span className="sr-only">{`Status: ${STATUS_META[status].label}`}</span>
             </div>
           )}
+          {notice && (
+            <div role="img" aria-label={`Warning: ${notice.text}`} className="oaiy-node-warn" title={notice.text}>
+              <svg aria-hidden="true" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+              </svg>
+            </div>
+          )}
           {hasIssues && (
             <div
               role="img"
@@ -372,9 +388,15 @@ function CollapsibleNodeWrapper({
         )}
 
         {isCollapsed ? (
-          collapsedPreview && <div className="oaiy-node-preview">{collapsedPreview}</div>
+          <>
+            {notice && <div className="oaiy-node-notice" title={notice.text}>{notice.short}</div>}
+            {collapsedPreview && <div className="oaiy-node-preview">{collapsedPreview}</div>}
+          </>
         ) : (
-          <div className="oaiy-node-body">{children}</div>
+          <div className="oaiy-node-body">
+            {notice && <div role="status" className="oaiy-node-notice expanded">{notice.text}</div>}
+            {children}
+          </div>
         )}
       </div>
 

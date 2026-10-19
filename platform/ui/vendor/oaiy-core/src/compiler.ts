@@ -2,6 +2,7 @@
 import type { WorkflowGraph, GraphNode, NodeType, Flow, WorkflowInputs, ProjectSettings } from './types.js';
 import type { ModuleRegistry, ModuleCompilerContext, NodeInstance } from './module-types.js';
 import { CycleDetectedError, InvalidLoopError } from './errors.js';
+import { isNodeCompileError } from './node-errors.js';
 import { MAX_GRAPH_ITERATIONS, MAX_WORKFLOW_LOOP_ITERATIONS } from './constants.js';
 import { metrics } from './metrics.js';
 import {
@@ -964,7 +965,7 @@ workflow_context;
 
     let ${loopItemVar} = ${loopArrayVar}[${loopVar}];
     console.log("[Loop] (${startNode.id}) iteration: " + (${loopVar} + 1) + " of " + ${loopCountVar});
-    console.log("[Loop] (${startNode.id}) item type: " + typeof ${loopItemVar} + ", preview: " + JSON.stringify(${loopItemVar}).substring(0, 300));
+    console.debug("[Loop] (${startNode.id}) item type: " + typeof ${loopItemVar} + ", preview: " + JSON.stringify(${loopItemVar}).substring(0, 300));
 
     // Current item, index, and history available to inner nodes
     ${itemOutputVar} = ${loopItemVar};
@@ -1033,8 +1034,8 @@ workflow_context;
     code += `
     // Create history string for template substitution (empty on first iteration)
     let ${historyStrVar} = ${historyVar}.length > 0 ? ${historyVar}.join("\\n") : "(no previous actions)";
-    console.log("[Loop] (${startNode.id}) history array length: " + ${historyVar}.length);
-    console.log("[Loop] (${startNode.id}) history string length: " + ${historyStrVar}.length);
+    console.debug("[Loop] (${startNode.id}) history array length: " + ${historyVar}.length);
+    console.debug("[Loop] (${startNode.id}) history string length: " + ${historyStrVar}.length);
 `;
 
     // Generate code for all inner nodes
@@ -1089,7 +1090,7 @@ workflow_context;
       code += `
     // Check stop condition: ${stopCondition}
     let _check_val_${this.sanitizeId(startNode.id)} = ${stopCheckSource};
-    console.log("[Stop condition] checking value: " + _check_val_${this.sanitizeId(startNode.id)} + " for: ${stopValue}");`;
+    console.debug("[Stop condition] checking value: " + _check_val_${this.sanitizeId(startNode.id)} + " for: ${stopValue}");`;
 
       // Convert stop value to lowercase for case-insensitive comparison
       const stopValueLower = stopValue.toLowerCase();
@@ -1164,7 +1165,7 @@ workflow_context;
   workflow_context["${startNode.id}"] = ${loopCountVar};
   workflow_context["${endNode.id}"] = ${resultsVar};
   console.log("[Loop] (${startNode.id}) completed with " + ${resultsVar}.length + " results" + (${loopDoneVar} ? " (stop condition met)" : ""));
-  console.log("[Loop] (${startNode.id}) results preview: " + JSON.stringify(${resultsVar}).substring(0, 500));
+  console.debug("[Loop] (${startNode.id}) results preview: " + JSON.stringify(${resultsVar}).substring(0, 500));
 `;
     }
 
@@ -1274,6 +1275,9 @@ workflow_context;
       // the flow compiled, ran, and reported success — the worst failure mode a
       // data pipeline has, and invisible unless you had devtools open, since the
       // compiler has no log callback wired to the job log or the UI.
+      // A message the module wrote for the person, naming the node (a Logic Block whose code does not parse), is
+      // passed on as it is: the runtime marks that node failed.
+      if (isNodeCompileError(e)) throw e;
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[Compiler] Module compiler error for ${node.type}:`, e);
       throw new Error(

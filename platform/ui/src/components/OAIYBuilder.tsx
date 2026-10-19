@@ -7,12 +7,15 @@ import {
   MiniMap,
   ConnectionMode,
   type Node,
+  type NodeChange,
   type Edge,
   type Viewport,
   type FitViewOptions,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { createLogger } from '../utils/logger';
+import { isCanvasTarget } from '../lib/canvasTarget';
+import { clearBelow } from '../lib/respace';
 
 const logger = createLogger('OAIYBuilder');
 
@@ -98,10 +101,16 @@ const miniMapNodeColor = (node: Node): string => {
  *
  * Under COMPACT_WIDTH the panels start closed and only one side is open at a
  * time; under NARROW_WIDTH a panel lies over the canvas's edge instead of
- * pushing it, so the canvas keeps its width.
+ * pushing it, so the canvas keeps its width. Under PALETTE_DOCK_WIDTH (about a
+ * 1500px window beside the flows rail) the palette alone lies over the canvas's
+ * left edge: docked, it took 300 of the canvas's pixels and moved the flow
+ * each time it opened.
  */
 const COMPACT_WIDTH = 1100;
 const NARROW_WIDTH = 640;
+const PALETTE_DOCK_WIDTH = 1250;
+/** The palette's width (`.oaiy-side`), over the canvas where it lies over it. */
+const PALETTE_WIDTH = 300;
 /** A first guess before the builder is measured (it is, before the first paint). */
 const isCompactNow = (): boolean => typeof window !== 'undefined' && window.innerWidth < 1240;
 
@@ -149,7 +158,7 @@ interface OAIYBuilderProps {
    */
   active?: boolean;
   // Toast notifications
-  onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, action?: { label: string; onClick: () => void }) => void;
+  onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, action?: { label: string; onClick: () => void }, key?: string) => void;
   // Package mode props
   packageMode?: {
     manifest: OAIYPackageManifest;
@@ -173,6 +182,10 @@ interface OAIYBuilderProps {
   // Package nodes for the node palette
   activePackageId?: string | null;
   packageNodes?: PackageNodeInfo[];
+  /** Settings → Services (the palette's Services category offers it). */
+  onAddService?: () => void;
+  /** The welcome wizard (likewise, where no service is set up yet). */
+  onOpenWizard?: () => void;
 }
 
 export default function OAIYBuilder({
@@ -199,6 +212,8 @@ export default function OAIYBuilder({
   onReloadPackage,
   activePackageId,
   packageNodes,
+  onAddService,
+  onOpenWizard,
 }: OAIYBuilderProps = {}) {
   // Dynamic node types from registry - updated when plugins register new components
   const [nodeTypesVersion, setNodeTypesVersion] = useState(() => getRegistryVersion());
@@ -352,6 +367,36 @@ export default function OAIYBuilder({
   /** Opens the log (set below, where the panels are). */
   const showLogRef = useRef<(() => void) | null>(null);
 
+  // A card that grows while a run fills it in, or just after (its results arrive as it ends), keeps clear of the cards
+  // below it: they move down (lib/respace.ts). Not a card opened or folded by hand, nor one measured as the flow opens.
+  const growthUntilRef = useRef(0);
+  useEffect(() => {
+    if (isRunning) growthUntilRef.current = Number.POSITIVE_INFINITY;
+    else if (growthUntilRef.current === Number.POSITIVE_INFINITY) growthUntilRef.current = Date.now() + 4000;
+  }, [isRunning]);
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const handleNodesChange = useCallback((changes: NodeChange[]) => {
+    onNodesChange(changes);
+    if (Date.now() > growthUntilRef.current) return;
+    for (const change of changes) {
+      if (change.type !== 'dimensions' || !change.dimensions) continue;
+      const before = nodesRef.current.find((n) => n.id === change.id)?.measured?.height;
+      if (!before || change.dimensions.height <= before + 4) continue;
+      const cards = nodesRef.current
+        .filter((n) => !n.parentId)
+        .map((n) => ({
+          id: n.id,
+          x: n.position.x,
+          y: n.position.y,
+          width: n.id === change.id ? change.dimensions!.width : n.measured?.width ?? 0,
+          height: n.id === change.id ? change.dimensions!.height : n.measured?.height ?? 0,
+        }));
+      const moves = clearBelow(cards, change.id, before);
+      if (moves.size) setNodes((nds) => nds.map((n) => (moves.has(n.id) ? { ...n, position: { ...n.position, y: moves.get(n.id)! } } : n)));
+    }
+  }, [onNodesChange, setNodes]);
+
   // Calculate selected nodes for multi-selection display
   const selectedNodes = useMemo(() => nodes.filter(n => n.selected), [nodes]);
 
@@ -361,12 +406,38 @@ export default function OAIYBuilder({
     screenToFlowPosition: (position: { x: number; y: number }) => { x: number; y: number };
     getViewport: () => { x: number; y: number; zoom: number };
     setViewport: (viewport: Viewport, options?: { duration?: number }) => void;
-    fitView: (options?: { padding?: FitViewOptions['padding']; duration?: number; maxZoom?: number }) => void;
+    fitView: (options?: { padding?: FitViewOptions['padding']; duration?: number; maxZoom?: number; nodes?: Array<{ id: string }> }) => void;
   } | null>(null);
   // What lies over the canvas, for fitting the flow in view clear of it: the map in its top-right corner (while it is
   // shown), the zoom buttons in its bottom-left and the toolbar along its foot. A fraction of the canvas (0.2) put the first nodes under the map. Kept in a
   // ref (set below, where the map's state is known) for the fits made before it.
   const fitPaddingRef = useRef<FitViewOptions['padding']>(0.2);
+  /** How much of the canvas's left edge the palette lies over (set below, where that is known). */
+  const overRef = useRef(0);
+
+  // A flow as it opens: all of it in view, where that is at a size its cards can be read; a flow too wide for that
+  // (an example of a dozen steps in a row) from its start, as many of its first steps as fit at that size (the map,
+  // and Fit View, show the rest). The whole of it was a strip of thumbnails nothing on could be read.
+  const fitOnOpen = useCallback((instance: NonNullable<typeof reactFlowInstance.current>) => {
+    const READABLE_ZOOM = 0.6;
+    const all = nodesRef.current.filter((n) => !n.parentId);
+    const width = reactFlowWrapper.current?.clientWidth ?? 0;
+    const pad = fitPaddingRef.current;
+    const sides = typeof pad === 'object' && pad ? parseFloat(String((pad as { left?: unknown }).left ?? 0)) + parseFloat(String((pad as { right?: unknown }).right ?? 0)) : 0;
+    if (all.length > 1 && width > 0) {
+      const right = (n: Node) => n.position.x + (n.measured?.width ?? 230);
+      const start = Math.min(...all.map((n) => n.position.x));
+      const span = (width - (Number.isFinite(sides) ? sides : 0)) / READABLE_ZOOM;
+      if (Math.max(...all.map(right)) - start > span) {
+        const first = all.filter((n) => right(n) <= start + span);
+        if (first.length) {
+          instance.fitView({ padding: pad, duration: 0, maxZoom: 1, nodes: first.map((n) => ({ id: n.id })) });
+          return;
+        }
+      }
+    }
+    instance.fitView({ padding: pad, duration: 0, maxZoom: 1 });
+  }, []);
 
   // Clear transitioning state once nodes are ready (after a microtask to ensure render)
   // This effect must come AFTER useWorkflow since it depends on 'nodes'
@@ -379,7 +450,7 @@ export default function OAIYBuilder({
       const rafId = requestAnimationFrame(() => {
         // Fit view to new nodes before showing
         if (reactFlowInstance.current) {
-          reactFlowInstance.current.fitView({ padding: fitPaddingRef.current, duration: 0, maxZoom: 1 });
+          fitOnOpen(reactFlowInstance.current);
         }
         // Second RAF ensures fitView is painted before revealing
         innerRaf = requestAnimationFrame(() => {
@@ -393,20 +464,24 @@ export default function OAIYBuilder({
         cancelAnimationFrame(innerRaf);
       };
     }
-  }, [flowTransitioning, nodes, finishFlowTransition]);
+  }, [flowTransitioning, nodes, finishFlowTransition, fitOnOpen]);
 
   // The canvas's two side panels, one family: the node palette on the left,
   // and the inspector on the right (the selected node's properties above the
-  // execution log). On a wide window they are docked and remember whether
-  // they were open. Below the xl width (1240px: Tailwind's xl and the shell's
-  // rail rule) they start closed and only one side is open at a time, so the
-  // canvas keeps its room; under 760px a panel lies over the canvas's edge.
-  // The toolbar at the foot of the canvas opens and closes all three.
+  // execution log). On a wide window they are docked and the inspector
+  // remembers whether it was open; the palette opens with an empty flow, and a
+  // flow with nodes opens without it. Below the xl width (1240px: Tailwind's xl
+  // and the shell's rail rule) they start closed and only one side is open at
+  // a time, so the canvas keeps its room; under 760px a panel lies over the
+  // canvas's edge. The toolbar at the foot of the canvas opens and closes all
+  // three.
   const builderRef = useRef<HTMLDivElement>(null);
   const [builderWidth, setBuilderWidth] = useState(0);
   const compact = builderWidth > 0 ? builderWidth < COMPACT_WIDTH : isCompactNow();
   const narrow = builderWidth > 0 && builderWidth < NARROW_WIDTH;
-  const [paletteOpen, setPaletteOpen] = useState<boolean>(() => !isCompactNow() && !loadBoolPref('oaiy.ui.paletteCollapsed', false));
+  // (the palette over the canvas's left edge, the rest docked)
+  const paletteOver = !narrow && builderWidth > 0 && builderWidth < PALETTE_DOCK_WIDTH;
+  const [paletteOpen, setPaletteOpen] = useState<boolean>(() => !isCompactNow() && (initialGraph?.nodes?.length ?? 0) === 0);
   const [propsOpen, setPropsOpen] = useState<boolean>(() => !isCompactNow() && loadBoolPref('oaiy.ui.propertiesVisible', true));
   const [logOpen, setLogOpen] = useState<boolean>(() => !isCompactNow() && loadBoolPref('oaiy.ui.logPanelVisible', true));
   // Measured before the first paint: a compact builder opens with its panels
@@ -418,9 +493,11 @@ export default function OAIYBuilder({
     setBuilderWidth(w);
     if (w > 0) {
       const wide = w >= COMPACT_WIDTH;
-      // An empty flow's first step is a node, so it opens with the palette.
+      // An empty flow's first step is a node, so it opens with the palette; one with nodes (an example added, a flow
+      // opened) opens with the canvas to see it by (beside the flows rail and the inspector, the palette left it about
+      // 530 pixels in OAIY's window, an example a thumbnail). The palette is a click away on the toolbar.
       const empty = nodes.length === 0;
-      setPaletteOpen(empty || (wide && !loadBoolPref('oaiy.ui.paletteCollapsed', false)));
+      setPaletteOpen(empty);
       setPropsOpen(wide && loadBoolPref('oaiy.ui.propertiesVisible', true));
       setLogOpen(wide && loadBoolPref('oaiy.ui.logPanelVisible', true));
     }
@@ -440,11 +517,7 @@ export default function OAIYBuilder({
   }, [compact]);
   const setPalette = useCallback((open: boolean) => {
     setPaletteOpen(open);
-    if (compact) {
-      if (open) { setPropsOpen(false); setLogOpen(false); }
-    } else {
-      saveBoolPref('oaiy.ui.paletteCollapsed', !open);
-    }
+    if (compact && open) { setPropsOpen(false); setLogOpen(false); }
   }, [compact]);
   const setProps = useCallback((open: boolean) => {
     setPropsOpen(open);
@@ -892,9 +965,11 @@ export default function OAIYBuilder({
         // directly. Subtracting the viewport translation again (a screen-pixel value
         // from a flow coordinate) misplaced every palette-click node after any pan —
         // matching the correct pattern already used by handleAddNodeAtPosition/Macro.
+        // (the middle of the canvas seen: beside the palette, where it lies over the canvas's left edge)
         const bounds = reactFlowWrapper.current?.getBoundingClientRect();
+        const over = overRef.current;
         const position = reactFlowInstance.current.screenToFlowPosition({
-          x: bounds ? bounds.left + bounds.width / 2 : window.innerWidth / 2,
+          x: bounds ? bounds.left + over + (bounds.width - over) / 2 : window.innerWidth / 2,
           y: bounds ? bounds.top + bounds.height / 2 : window.innerHeight / 2,
         });
         const k = (clickAddOffsetRef.current++ % 8) * 36;
@@ -938,9 +1013,11 @@ export default function OAIYBuilder({
       };
 
       if (reactFlowInstance.current) {
+        // (the middle of the canvas seen: beside the palette, where it lies over the canvas's left edge)
         const bounds = reactFlowWrapper.current?.getBoundingClientRect();
+        const over = overRef.current;
         const position = reactFlowInstance.current.screenToFlowPosition({
-          x: bounds ? bounds.left + bounds.width / 2 : window.innerWidth / 2,
+          x: bounds ? bounds.left + over + (bounds.width - over) / 2 : window.innerWidth / 2,
           y: bounds ? bounds.top + bounds.height / 2 : window.innerHeight / 2,
         });
         addNode('macro' as NodeType, { x: position.x - 128, y: position.y - 64 }, extraData);
@@ -1003,9 +1080,10 @@ export default function OAIYBuilder({
         return;
       }
 
-      // Copy, paste and select all are the canvas's on the canvas alone: text selected in the Log or the
-      // Properties panel copies as text, as anywhere else.
-      const onCanvas = !!target.closest('.react-flow');
+      // Copy, paste and select all are the canvas's on the canvas alone (the builder itself counts: it has the focus
+      // after a click on an empty part of the canvas): text selected in the Log or the Properties panel copies as
+      // text, as anywhere else.
+      const onCanvas = isCanvasTarget(target, event.currentTarget);
       const textSelected = (window.getSelection()?.toString() ?? '').length > 0;
       if ((event.ctrlKey || event.metaKey) && ['c', 'v', 'a'].includes(event.key) && (!onCanvas || textSelected)) {
         return;
@@ -1083,21 +1161,52 @@ export default function OAIYBuilder({
     return () => ro.disconnect();
   }, []);
 
+  // The toolbar's width, and where the zoom buttons end (from the canvas's left): where the two meet, the zoom buttons
+  // stand above the toolbar instead of under it (a narrow canvas, the palette open beside it).
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const [toolbarWidth, setToolbarWidth] = useState(0);
+  const [controlsWidth, setControlsWidth] = useState(0);
+  useEffect(() => {
+    const bar = toolbarRef.current;
+    const wrap = reactFlowWrapper.current;
+    if (!bar || !wrap || typeof ResizeObserver === 'undefined') return;
+    const measure = () => {
+      setToolbarWidth(bar.getBoundingClientRect().width);
+      const controls = wrap.querySelector('.react-flow__controls');
+      if (controls) setControlsWidth(controls.getBoundingClientRect().width);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(bar);
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, []);
+
   // Drawn over the canvas's foot: the map only while there is room beside the toolbar.
   const mapRoom = canvasWidth === 0 || canvasWidth >= 520;
   const mapShown = mapRoom && showMiniMap;
-  fitPaddingRef.current = { top: mapShown ? '140px' : '32px', right: '32px', bottom: '88px', left: '64px' };
-  const fitViewOptions = useMemo(() => ({ padding: fitPaddingRef.current, maxZoom: 1 }), [mapShown]); // eslint-disable-line react-hooks/exhaustive-deps
+  // (the palette over the canvas's left edge: the canvas seen beside it)
+  const over = paletteOver && paletteOpen ? PALETTE_WIDTH : 0;
+  overRef.current = over;
+  fitPaddingRef.current = { top: mapShown ? '140px' : '32px', right: '32px', bottom: '88px', left: `${64 + over}px` };
+  const fitViewOptions = useMemo(() => ({ padding: fitPaddingRef.current, maxZoom: 1 }), [mapShown, over]); // eslint-disable-line react-hooks/exhaustive-deps
   const inspectorOpen = propsOpen || logOpen;
   // The toolbar drops its words where, with them (about 530px), it would cover the zoom buttons at the canvas's
   // corner, and where a panel lies over the canvas (the toolbar moves to the side left clear, about 300px of it: with
   // its words it ran off the window).
-  const tightToolbar = (canvasWidth > 0 && canvasWidth < 650) || (narrow && (paletteOpen || inspectorOpen));
+  const tightToolbar = (canvasWidth > 0 && canvasWidth - over < 650) || (narrow && (paletteOpen || inspectorOpen));
+  // Where the toolbar's left edge is (centred on the canvas seen; beside a panel lying over a narrow canvas, at the side
+  // left clear), where the zoom buttons end (15px in from the canvas's corner, or from the palette lying over it), and
+  // whether the two meet: the zoom buttons stand above the toolbar then (only their height changes, so this does not
+  // change with it). At 900px with the palette open the toolbar lay over them.
+  const toolbarLeft = narrow && paletteOpen ? canvasWidth - 10 - toolbarWidth : narrow && inspectorOpen ? 58 : over + (canvasWidth - over - toolbarWidth) / 2;
+  const controlsRight = over + 15 + controlsWidth;
+  const liftControls = canvasWidth > 0 && toolbarWidth > 0 && controlsWidth > 0 && toolbarLeft < controlsRight + 8;
 
   return (
     <div
       ref={builderRef}
-      className={`oaiy-builder${narrow ? ' narrow' : ''}${paletteOpen ? ' left-open' : ''}${propsOpen || logOpen ? ' right-open' : ''}`}
+      className={`oaiy-builder${narrow ? ' narrow' : ''}${paletteOver ? ' palette-over' : ''}${paletteOpen ? ' left-open' : ''}${propsOpen || logOpen ? ' right-open' : ''}`}
       style={{ backgroundColor: 'rgb(var(--bg-primary))' }}
       onKeyDown={onKeyDown}
       tabIndex={0}
@@ -1114,13 +1223,15 @@ export default function OAIYBuilder({
           onAddMacroAtPosition={handleAddMacroAtPosition}
           activePackageId={activePackageId}
           packageNodes={packageNodes}
+          onAddService={onAddService}
+          onOpenWizard={onOpenWizard}
         />
       )}
 
       {/* Center - Canvas */}
       <div
         ref={reactFlowWrapper}
-        className="relative h-full min-w-0 flex-1"
+        className={`relative h-full min-w-0 flex-1${liftControls ? ' lift-controls' : ''}`}
         onClick={handleCanvasClick}
         onContextMenu={(e) => e.preventDefault()}
       >
@@ -1137,7 +1248,7 @@ export default function OAIYBuilder({
         <ReactFlow
           nodes={nodesWithHandlers}
           edges={edgesWithOptions}
-          onNodesChange={onNodesChange}
+          onNodesChange={handleNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           onReconnect={onReconnect}
@@ -1152,8 +1263,8 @@ export default function OAIYBuilder({
                 // Restore the saved viewport (preserves zoom level)
                 instance.setViewport(savedViewportRef.current, { duration: 0 });
               } else if (nodes.length > 0) {
-                // First time: fit view to show all nodes
-                instance.fitView({ padding: fitPaddingRef.current, duration: 0, maxZoom: 1 });
+                // First time: the flow in view, at a size it can be read by (fitOnOpen)
+                fitOnOpen(instance);
               } else {
                 // Fitting empty bounds can zoom to the maximum before the first node exists.
                 instance.setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 0 });
@@ -1221,8 +1332,12 @@ export default function OAIYBuilder({
                 <p>This flow is empty</p>
                 <small>
                   {narrow
-                    ? 'Tap Nodes below to add the first one.'
-                    : 'Add a node from Nodes below: click it, or drag it onto the canvas. Right-click the canvas for more.'}
+                    ? paletteOpen
+                      ? 'Tap a node in the palette to add it.'
+                      : 'Tap Nodes below to add the first one.'
+                    : paletteOpen
+                      ? 'Add a node from the palette on the left: click it, or drag it onto the canvas. Right-click the canvas for more.'
+                      : 'Add a node from Nodes below: click it, or drag it onto the canvas. Right-click the canvas for more.'}
                 </small>
               </div>
             </div>
@@ -1293,7 +1408,7 @@ export default function OAIYBuilder({
         {/* The canvas's toolbar, the same at every width: the palette, the
             properties, Run (or Stop), and the log. A macro's own actions join
             it while one is open. */}
-        <div className={`oaiy-toolbar${tightToolbar ? ' tight' : ''}`} role="toolbar" aria-label="Canvas">
+        <div ref={toolbarRef} className={`oaiy-toolbar${tightToolbar ? ' tight' : ''}`} role="toolbar" aria-label="Canvas">
           <button
             type="button"
             onClick={() => setPalette(!paletteOpen)}
@@ -1388,7 +1503,7 @@ export default function OAIYBuilder({
               onClick={runWorkflow}
               disabled={nodes.length === 0}
               className="btn btn-primary"
-              aria-label={nodes.length === 0 ? 'Run Workflow (disabled — empty flow)' : 'Run Workflow'}
+              aria-label={nodes.length === 0 ? 'Run the flow (it has no nodes yet)' : 'Run the flow'}
               title={nodes.length === 0 ? 'Add at least one node before running' : 'Run the flow'}
             >
               <Play size={13} fill="currentColor" /> Run

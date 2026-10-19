@@ -11,7 +11,7 @@ interface AudioMixerNodeData {
     audioVolume?: number;
     replaceAudio?: boolean;
     filename?: string;
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onVideoVolumeChange?: (value: number) => void;

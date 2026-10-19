@@ -42,3 +42,33 @@ function messageOf(body: unknown): string | null {
   }
   return null;
 }
+
+/** A status said in words, for an error that came with nothing else (the person cannot act on "HTTP 503"). */
+function statusInWords(status: number): string {
+  if (status === 401 || status === 403) return 'the service refused it: a key or a permission is missing';
+  if (status === 404) return 'the service has nothing at that address';
+  if (status === 408 || status === 504) return 'the service took too long to answer';
+  if (status === 413) return 'what was sent is too large for the service';
+  if (status === 429) return 'the service is busy: too many requests at once';
+  if (status === 503) return 'the service is not ready';
+  if (status >= 500) return 'the service failed while doing it';
+  if (status >= 400) return 'the service did not take the request';
+  return 'the service answered with an error';
+}
+
+/**
+ * An error as a toast says it: `readableError`, without the HTTP status a step's error carries ("Image Gen: HTTP 503 —
+ * The picture engine is not running" says "Image Gen: The picture engine is not running"). The status stays in the run's
+ * log, which has the whole message; where it was all the error said, a sentence says what it means.
+ */
+export function toastError(text: string): string {
+  const said = readableError(text);
+  return said
+    // ("… (HTTP 503)" after a sentence: it says the rest already)
+    .replace(/\s*\(HTTP \d{3}\)/g, '')
+    // ("HTTP 503 — words", "HTTP 503: words": the words)
+    .replace(/\bHTTP \d{3}\s*(?:—|–|-|:)\s*(?=\S)/g, '')
+    // ("HTTP 503" with nothing after it: what it means)
+    .replace(/\bHTTP (\d{3})\b\s*$/, (_m, code: string) => statusInWords(Number(code)))
+    .trim();
+}

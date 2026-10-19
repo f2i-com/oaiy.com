@@ -157,7 +157,7 @@ ok('the palette offers Remove Background', paletteText.includes('Remove Backgrou
 
 // Run it (the editor asks to review the flow's inputs first: run them as they are).
 const started = Date.now();
-await page.locator('button[aria-label="Run Workflow"]:visible').first().click();
+await page.locator('button[aria-label="Run the flow"]:visible').first().click();
 const review = page.locator('text=Review and modify inputs before running');
 if (await review.waitFor({ timeout: 5000 }).then(() => true).catch(() => false)) {
   await page.locator('button:has-text("Run")').last().click();

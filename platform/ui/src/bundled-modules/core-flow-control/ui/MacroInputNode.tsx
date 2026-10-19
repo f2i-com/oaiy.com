@@ -7,7 +7,7 @@ interface MacroInputNodeData {
     inputType?: string;
     defaultValue?: string;
     required?: boolean;
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onCollapsedChange?: (value: boolean) => void;

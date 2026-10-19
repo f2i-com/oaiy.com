@@ -41,15 +41,21 @@ export const IMAGE_PROVIDER_CONFIGS: Record<string, { endpoint: string; model: s
  *
  * @param type - The node type
  * @param projectSettings - Optional project settings for defaults
+ * @param options - `service`: the service the node starts on (OAIY's engine, one of the desktop's, the person's own)
  * @returns Default data object for the node type
  */
-export function getDefaultNodeData(type: NodeType, projectSettings?: ProjectSettings): Record<string, unknown> {
+export function getDefaultNodeData(type: NodeType, projectSettings?: ProjectSettings, options: { service?: unknown } = {}): Record<string, unknown> {
   switch (type) {
     case 'input_text':
       return { value: 'Hello, World!' };
     case 'input_file':
       return { fileName: '', fileType: '', fileContent: '', filePath: '' };
     case 'ai_llm': {
+      // A node that starts on a service takes its address, model and key from it: the provider's are not written in
+      // (hidden under the service, Ollama's address and llama3.2 were what the run called, whatever model it showed).
+      if (typeof options.service === 'string' && options.service.trim()) {
+        return { systemPrompt: 'You are a helpful assistant.', contextLength: 0 };
+      }
       // Use project settings defaults if available. Falls back to Ollama
       // (matches `ProjectDefaults.defaultSettings.defaultAIProvider`) so
       // a node restored from a saved flow without explicit provider data
@@ -72,6 +78,8 @@ export function getDefaultNodeData(type: NodeType, projectSettings?: ProjectSett
       // (`operation` is what the run reads: get or set)
       return { operation: 'get', key: 'myValue' };
     case 'image_gen': {
+      // (on a service, as the AI LLM node above: its backend's fields are the service's)
+      if (typeof options.service === 'string' && options.service.trim()) return {};
       // Use project settings defaults if available. Falls back to
       // ComfyUI — the only image backend the web build ships with.
       const imgProvider = projectSettings?.defaultImageProvider || 'comfyui';
@@ -138,6 +146,8 @@ export function getDefaultNodeData(type: NodeType, projectSettings?: ProjectSett
         overlap: 200,
       };
     case 'video_gen': {
+      // (on a service, likewise)
+      if (typeof options.service === 'string' && options.service.trim()) return {};
       // Same local-first stance as image_gen — ComfyUI is the only video
       // backend the browser can reach today.
       const vidProvider = projectSettings?.defaultVideoProvider || 'comfyui';
@@ -169,6 +179,29 @@ export function getDefaultNodeData(type: NodeType, projectSettings?: ProjectSett
     default:
       return {};
   }
+}
+
+/**
+ * The fields an AI LLM node was given from Ollama's defaults (`AI_PROVIDER_CONFIGS.ollama`) when it was added, left
+ * out of one that has a service. Every AI LLM node added from the palette had them written in, a service picked or
+ * not; on a node with a service they are hidden, and they won over the service when the flow ran. A flow saved
+ * before carries them (here and on OAIY Desktop), so a flow that comes in, from this page's storage, the desktop or
+ * a file, has them left out. A field that is not Ollama's default is the person's own and is kept.
+ */
+export function withoutProviderSeeds<T extends { type?: string; data?: Record<string, unknown> }>(nodes: readonly T[]): T[] {
+  const ollama = AI_PROVIDER_CONFIGS.ollama;
+  return nodes.map((node) => {
+    const data = node && typeof node === 'object' ? node.data : undefined;
+    if (node?.type !== 'ai_llm' || !data || typeof data.service !== 'string' || !data.service.trim()) return node;
+    const seeded: Record<string, unknown> = { provider: 'ollama', model: ollama.model, endpoint: ollama.endpoint };
+    const stale = Object.keys(seeded).filter((key) => data[key] === seeded[key]);
+    if (!stale.length) return node;
+    const kept = { ...data };
+    for (const key of stale) delete kept[key];
+    // (written with the provider, and meaning nothing without it)
+    if (stale.includes('provider') && kept.requestFormat === ollama.requestFormat) delete kept.requestFormat;
+    return { ...node, data: kept };
+  });
 }
 
 /**

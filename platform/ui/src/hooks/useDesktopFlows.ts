@@ -25,13 +25,19 @@
  * naming the person's own service, or one of the desktop's, carries what it
  * takes to call it (`withNodeServices`): the CLI has none of the editor's lists.
  * A flow the desktop refuses to keep is said once (`subscribeDesktopFlowUnsaved`),
- * and tried again after the next pull. Outside OAIY this does nothing.
+ * and tried again after the next pull. Where each flow stands with the desktop
+ * (saved there, being saved, not saved) is kept for the header
+ * (`desktopSaveState`), which said "Saved in OAIY" from where the editor was.
+ * An AI LLM node's Ollama fields under its service (utils/NodeDefaults.ts) are
+ * left out of a flow that comes from the desktop, and it goes back without them.
+ * Outside OAIY this does nothing.
  */
 import { useEffect, useRef } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type { Flow, OAIYProject } from 'oaiy-core';
 import { hookFlowId, oaiyDesktop, toolFlowId } from '../lib/oaiyAgentTools';
 import { withNodeServices, withoutNodeServices } from '../bundled-modules/core-service/contract';
+import { withoutProviderSeeds } from '../utils/NodeDefaults';
 
 const PULL_MS = 15_000;
 const SETTLE_MS = 1_200;
@@ -90,12 +96,23 @@ export function macroMetadataOf(nodes: Flow['graph']['nodes']): NonNullable<Flow
   };
 }
 
+/**
+ * Whether a desktop flow's document has AI LLM nodes with Ollama's defaults under their service
+ * (`withoutProviderSeeds`): the flow comes here without them, and goes back without them.
+ */
+export function carriesProviderSeeds(doc: Doc): boolean {
+  if (!Array.isArray(doc.nodes)) return false;
+  const nodes = doc.nodes as Flow['graph']['nodes'];
+  return withoutProviderSeeds(nodes).some((n, i) => n !== nodes[i]);
+}
+
 /** A desktop flow as a flow of the editor's. */
 export function fromDoc(id: string, doc: Doc, now: string): Flow | null {
   if (!Array.isArray(doc.nodes)) return null;
   const tags = Array.isArray(doc.tags) ? doc.tags.filter((t): t is string => typeof t === 'string') : [];
-  // (the services copied in for the desktop are its, not the editor's: the editor reads its own lists)
-  const nodes = withoutNodeServices(doc.nodes as Flow['graph']['nodes']);
+  // (the services copied in for the desktop are its, not the editor's: the editor reads its own lists; and an AI LLM
+  // node's Ollama defaults under its service are left out, utils/NodeDefaults.ts)
+  const nodes = withoutProviderSeeds(withoutNodeServices(doc.nodes as Flow['graph']['nodes']));
   return {
     id,
     name: doc.name || id,
@@ -138,12 +155,61 @@ export function subscribeDesktopFlowUnsaved(fn: (detail: DesktopFlowUnsaved) => 
   return () => window.removeEventListener(UNSAVED_EVENT, listener);
 }
 
-/** What a refused save says: the desktop's own words, else its status. */
+/**
+ * What a refused save says: the desktop's own words, else that it did not take the flow. Its status is for the
+ * developer's console, not the person ("OAIY Desktop answered 500" told them nothing they could act on).
+ */
+export function refusalText(status: number | null, body: unknown): string {
+  if (status === null) return 'OAIY Desktop could not be reached';
+  const error = (body as { error?: unknown } | null)?.error;
+  const said = typeof error === 'string' ? error : typeof (error as { message?: unknown } | undefined)?.message === 'string' ? (error as { message: string }).message : '';
+  return said.trim() ? `OAIY Desktop said: ${said.trim()}` : 'OAIY Desktop did not take it';
+}
+
 async function refusal(resp: Response | null): Promise<string> {
-  if (!resp) return 'OAIY Desktop could not be reached';
-  const body = (await resp.json().catch(() => null)) as { error?: { message?: unknown } } | null;
-  const said = typeof body?.error?.message === 'string' ? body.error.message : '';
-  return said ? `OAIY Desktop said: ${said}` : `OAIY Desktop answered ${resp.status}`;
+  if (resp) console.warn(`[desktop flows] a flow was not saved: HTTP ${resp.status}`);
+  return refusalText(resp ? resp.status : null, resp ? await resp.json().catch(() => null) : null);
+}
+
+/**
+ * Where a flow shared with the desktop stands: there as it is here (`saved`), changed here and not sent yet
+ * (`saving`: a moment after each change, or the desktop not answered yet), or not taken by the desktop the last time
+ * it was sent (`not-saved`, until a save of it works). The header says it, rather than "Saved in OAIY" while a toast
+ * says the flow was not saved.
+ */
+export type DesktopSaveState = 'saved' | 'saving' | 'not-saved';
+
+/** A flow's state from what the two sides last agreed on (`agreedKey`) and whether its last save was refused. */
+export function saveStateOf(flow: Flow, agreedKey: string | undefined, refused: boolean): DesktopSaveState {
+  if (agreedKey === flowKey(flow)) return 'saved';
+  return refused ? 'not-saved' : 'saving';
+}
+
+const SAVE_STATE_EVENT = 'oaiy:desktop-flow-save-state';
+/** Each shared flow's state, absent while saved (OAIYApp's header reads it). */
+const saveStates = new Map<string, DesktopSaveState>();
+
+/** Flow `id`'s state with the desktop now ("saved" for one it has, or one not sent there at all). */
+export function desktopSaveState(id: string | null | undefined): DesktopSaveState {
+  return (id && saveStates.get(id)) || 'saved';
+}
+
+/** Hear of any flow's state changing; returns the way to stop. */
+export function subscribeDesktopSaveState(fn: () => void): () => void {
+  window.addEventListener(SAVE_STATE_EVENT, fn);
+  return () => window.removeEventListener(SAVE_STATE_EVENT, fn);
+}
+
+function setSaveStates(next: Map<string, DesktopSaveState>): void {
+  const same = next.size === saveStates.size && [...next].every(([id, state]) => saveStates.get(id) === state);
+  if (same) return;
+  saveStates.clear();
+  for (const [id, state] of next) saveStates.set(id, state);
+  try {
+    window.dispatchEvent(new Event(SAVE_STATE_EVENT));
+  } catch {
+    // (no window events: nothing listens)
+  }
 }
 
 /** What a pull changes here: flows to add or replace, ids to remove, and the flows as the two sides now agree. */
@@ -301,6 +367,20 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
     unsaved = new Map(synced.current);
   };
 
+  /** The desktop did not answer the last look at its flows: a change here is not saved there, not being saved. */
+  const unreachable = useRef(false);
+  /** Each shared flow's state with the desktop, as the header shows it. */
+  const refreshStates = () => {
+    const next = new Map<string, DesktopSaveState>();
+    for (const f of latest.current.flows.filter(shared)) {
+      const state = saveStateOf(f, synced.current.get(f.id), toldUnsaved.has(f.id) || unreachable.current);
+      if (state !== 'saved') next.set(f.id, state);
+    }
+    setSaveStates(next);
+  };
+  const refreshRef = useRef(refreshStates);
+  refreshRef.current = refreshStates;
+
   /** Send what changed here, and remove what was deleted here: one at a time, again after if asked meanwhile. */
   const push = async (): Promise<void> => {
     if (!desktop) return;
@@ -361,6 +441,7 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
           }
         }
         keep();
+        refreshStates();
       } while (pushAgain.current);
     } finally {
       pushing.current = false;
@@ -374,17 +455,26 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
     let live = true;
     const pull = async () => {
       const resp = await call('GET', '/api/bridge/flows');
-      if (!resp?.ok) return;
+      unreachable.current = !resp?.ok;
+      if (!resp?.ok) {
+        refreshRef.current();
+        return;
+      }
       const list = ((await resp.json().catch(() => ({}))) as { flows?: Array<{ flowId?: string }> }).flows ?? [];
       const ids = list.map((f) => String(f.flowId ?? '')).filter(Boolean);
       there.current = new Set(ids);
       const now = new Date().toISOString();
       const flows = new Map<string, Flow>();
+      /** Flows whose document there still has Ollama's defaults on an AI LLM node with a service: sent back without. */
+      const seeded = new Set<string>();
       // A tool's copy (`tool-…`) is the tool, and a hook's (`hook-…`) the hook, not second flows.
       for (const id of ids.filter((id) => !id.startsWith('tool-') && !id.startsWith('hook-'))) {
         const doc = await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`);
-        const flow = doc?.ok ? fromDoc(id, (await doc.json().catch(() => ({}))) as Doc, now) : null;
-        if (flow) flows.set(id, flow);
+        const body = doc?.ok ? ((await doc.json().catch(() => ({}))) as Doc) : null;
+        const flow = body ? fromDoc(id, body, now) : null;
+        if (!flow || !body) continue;
+        flows.set(id, flow);
+        if (carriesProviderSeeds(body)) seeded.add(id);
       }
       if (!live) return;
       if (forgetAsked) {
@@ -395,9 +485,12 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
       // desktop's, a local-only one of the same id, which a flow there must not come in over)
       const leave = new Set([...deletedHere, ...latest.current.flows.filter((f) => !shared(f)).map((f) => f.id)]);
       const { put, remove, synced: agreed } = reconcile(flows, latest.current.flows.filter(shared), synced.current, leave, there.current);
+      // (not taken for agreed, so the push below sends this side's, without them: the desktop's runs read the document)
+      for (const id of seeded) agreed.delete(id);
       synced.current = agreed;
       keep();
       pulledOnce.current = true;
+      refreshStates();
       if (put.length || remove.length) {
         setProject((prev) => {
           const replaced = new Map(put.map((f) => [f.id, f]));
@@ -429,9 +522,10 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // A moment after the last edit, what changed is sent.
+  // A moment after the last edit, what changed is sent (and until then the header says it is being saved).
   useEffect(() => {
     if (!desktop) return;
+    refreshRef.current();
     const timer = window.setTimeout(() => void pushRef.current(), SETTLE_MS);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -192,6 +192,15 @@ export interface CustomService {
    */
   inUse?: boolean;
   /**
+   * OAIY Desktop services that declare no way to call them (no `node` block in
+   * their template, and no category with a known one): the call is the
+   * editor's guess, the node's input posted as it is to the service's port.
+   * Not offered in the palette, where it looked like a node that works (OAIY
+   * Voice's, which is for Text to Speech and Speech to Text); a flow that uses
+   * one still runs as before.
+   */
+  noContract?: boolean;
+  /**
    * What the call makes. Set, the typed nodes and Service Call run it as a
    * contract (the body rendered with every missing value as null, the answer
    * turned into a file or a picture) — see core-service/contract.ts.

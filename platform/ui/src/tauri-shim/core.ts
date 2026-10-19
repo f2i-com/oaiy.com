@@ -998,8 +998,9 @@ function transformCallback(callback?: (response: unknown) => void): number {
 // ---------------------------------------------------------------------------
 
 const w = window as any;
+// (`__oaiyShim`: these are the stand-ins, with no Tauri events behind them: a listener is not asked for)
 if (!w.__TAURI_INTERNALS__) {
-  w.__TAURI_INTERNALS__ = { invoke, transformCallback, convertFileSrc };
+  w.__TAURI_INTERNALS__ = { invoke, transformCallback, convertFileSrc, __oaiyShim: true };
 }
 if (!w.__TAURI__) {
   w.__TAURI__ = { core: { invoke, convertFileSrc } };

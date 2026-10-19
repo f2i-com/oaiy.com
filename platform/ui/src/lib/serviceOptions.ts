@@ -2,14 +2,20 @@
  * The options of a Service dropdown (`service:list[:<nodeType>]`).
  *
  * Grouped by where the service comes from:
- *   - "OAIY engine" — its models switched on in OAIY → Engines whose files are
- *     here (and OAIY Voice), with "Default <kind> model" first: `engine:<kind>`,
- *     which follows the default set there. A typed node lists every model of
- *     its kind; Service Call, which takes any kind, lists each kind's default
- *     only;
- *   - "Your services" — what OAIY Desktop runs and is in use (running, or
+ *   - "This computer" — OAIY's engine models switched on in OAIY → Engines
+ *     whose files are here (and OAIY Voice), with "Default <kind> model" first:
+ *     `engine:<kind>`, which follows the default set there. A typed node lists
+ *     every model of its kind; Service Call, which takes any kind, lists each
+ *     kind's default only. Each reads "<kind> · <model>" ("language model ·
+ *     qwen3.5-9b"). ("OAIY engine" where the editor reaches an engine on
+ *     another computer, in a browser tab pointed at one.)
+ *   - "<name> (paired computer)" — a paired computer's models (OAIY Network),
+ *     one group for each computer, its default among them where it is the
+ *     default;
+ *   - "OAIY Services" — what OAIY Desktop runs and is in use (running, or
  *     started with OAIY): Python rigs, ComfyUI, …;
- *   - "Custom" — HTTP services defined in this editor (Settings → Services);
+ *   - "Your services" — HTTP services defined in this editor (Settings →
+ *     Services, under the same name);
  * then "Add a service…", which says where more come from and opens the
  * editor's service form for this node.
  *
@@ -21,10 +27,12 @@ import type { CustomService, ServiceNodeTag } from 'oaiy-core/modules/core-servi
 import { filterServicesForNodeType } from 'oaiy-core/modules/core-service/examples';
 import { NODE_ENGINE_KIND, engineDefault } from 'oaiy-core/modules/core-service/contract';
 import { DEFAULT_SERVICE, isListed, type AvailabilityEnv } from './nodeAvailability';
+import { isRemoteEngine } from './engineEndpoint';
 
+export const GROUP_LOCAL = 'This computer';
 export const GROUP_ENGINE = 'OAIY engine';
-export const GROUP_DESKTOP = 'Your services';
-export const GROUP_CUSTOM = 'Custom';
+export const GROUP_DESKTOP = 'OAIY Services';
+export const GROUP_CUSTOM = 'Your services';
 export const GROUP_MORE = 'More';
 export const ADD_SERVICE_VALUE = '__add_service__';
 
@@ -40,15 +48,32 @@ const KIND_NAME: Record<string, string> = {
   upscale: 'upscaler',
 };
 
-export function serviceGroup(s: CustomService): string {
-  if (s.group === 'engine') return GROUP_ENGINE;
+/** A paired computer's group: "Studio PC (paired computer)". */
+function pairedGroup(name: string | undefined): string {
+  return `${name || 'A paired computer'} (paired computer)`;
+}
+
+/** The group of the engine's own models: this computer's, unless a tab reaches an engine on another one. */
+function engineGroup(env: Pick<AvailabilityEnv, 'inOaiy'>): string {
+  return env.inOaiy || !isRemoteEngine() ? GROUP_LOCAL : GROUP_ENGINE;
+}
+
+export function serviceGroup(s: CustomService, env: Pick<AvailabilityEnv, 'inOaiy'> = { inOaiy: true }): string {
+  if (s.group === 'engine') return s.nodeId ? pairedGroup(s.nodeName) : engineGroup(env);
   if (s.group === 'desktop' || s.id.startsWith('companion:')) return GROUP_DESKTOP;
   return GROUP_CUSTOM;
 }
 
-/** The label inside its group: an engine entry without its "OAIY engine · " prefix. */
+/** The label inside its group: an engine model as its kind and its model ("language model · qwen3.5-9b"), a paired
+ * computer's with where it runs as well ("… on Studio PC": a closed dropdown shows the label, not its group), anything
+ * else by its name. */
 function labelFor(s: CustomService): string {
-  const label = s.group === 'engine' ? s.name.replace(/^OAIY engine · /, '') : s.name;
+  const kind = s.kind ? KIND_NAME[s.kind] : undefined;
+  const label = s.group !== 'engine'
+    ? s.name
+    : kind && s.model && /^OAIY engine · /.test(s.name)
+      ? `${kind} · ${s.model}${s.nodeId ? ` on ${s.nodeName || 'a paired computer'}` : ''}`
+      : s.name.replace(/^OAIY engine · /, '');
   // (a paired worker that does not answer now: its model listed, said so)
   return s.nodeId && s.ready === false ? `${label} (offline)` : label;
 }
@@ -72,6 +97,7 @@ export function serviceOptions(
       label: nodeType ? '(none — use the fields below)' : '(none — fill fields inline)',
     });
   }
+  // (in the group of the computer its model is on)
   const defaultOf = (kind: string) => {
     const def = engineDefault(env.desktop, kind);
     if (!def) return;
@@ -79,7 +105,7 @@ export function serviceOptions(
       value: `engine:${kind}`,
       label: `Default ${KIND_NAME[kind] ?? `${kind} model`} (${def.nodeId ? `${def.model} on ${def.nodeName || 'a paired computer'}` : def.model || def.name})${def.nodeId && def.ready === false ? ' (offline)' : ''}`,
       description: 'Follows the default set in OAIY → Engines',
-      group: GROUP_ENGINE,
+      group: serviceGroup(def, env),
     });
   };
   const kind = NODE_ENGINE_KIND[nodeType];
@@ -91,7 +117,7 @@ export function serviceOptions(
     defaultOf(kind);
   }
   for (const s of offered) {
-    const group = serviceGroup(s);
+    const group = serviceGroup(s, env);
     // Service Call offers each kind's default above, not every model.
     const listed = isListed(s) && !(anyKind && s.group === 'engine' && s.id.startsWith('engine:'));
     options.push({

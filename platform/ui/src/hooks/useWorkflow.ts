@@ -20,7 +20,7 @@ import {
   workflowToReactFlow,
   reactFlowToWorkflowGraph,
 } from '../utils/WorkflowIO';
-import { getDefaultNodeData } from '../utils/NodeDefaults';
+import { getDefaultNodeData, withoutProviderSeeds } from '../utils/NodeDefaults';
 import { getService } from '../utils/serviceRegistry';
 import { SERVICE_NODE_TYPES, initialServiceFor, nodeTypeForService } from '../lib/nodeAvailability';
 import { currentAvailabilityEnv } from '../lib/availabilityEnv';
@@ -210,9 +210,10 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       // A node with a service picked (OAIY's engine, one of the desktop's or the person's own) takes its address and
       // model from it: given the project's default endpoint here as well, that endpoint won over the service when the
       // flow compiled, and a flow on `engine:llm` called Ollama on localhost:11434.
+      // (and an AI LLM node saved with Ollama's defaults under its service has them left out: utils/NodeDefaults.ts)
       if ((node.type === 'ai_llm' || node.type === 'image_gen' || node.type === 'video_gen')
         && typeof node.data.service === 'string' && node.data.service.trim()) {
-        return node;
+        return withoutProviderSeeds([node])[0];
       }
       // AI LLM nodes - apply default AI settings if not configured
       if (node.type === 'ai_llm') {
@@ -668,7 +669,7 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       if (initial) extraData = { ...(extraData || {}), service: initial };
     }
     const id = `${type}-${uuidv4().slice(0, 8)}`;
-    const defaultData = getDefaultNodeData(type, projectSettings);
+    const defaultData = getDefaultNodeData(type, projectSettings, { service: extraData?.service });
     const finalData = extraData ? { ...defaultData, ...extraData } : defaultData;
 
     setNodes((nds) => {
@@ -975,7 +976,7 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
   }, [setNodes]);
 
   // Handle node execution status updates (running/completed/error)
-  const handleNodeStatus = useCallback((nodeId: string, status: 'running' | 'completed' | 'error') => {
+  const handleNodeStatus = useCallback((nodeId: string, status: 'running' | 'completed' | 'error' | 'stopped') => {
     setNodes((nds) =>
       nds.map((node) =>
         node.id === nodeId ? { ...node, data: { ...node.data, _status: status } } : node
@@ -1291,7 +1292,7 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       if (isAbort) {
         addLog({
           source: 'System',
-          message: 'Workflow stopped by user',
+          message: 'The flow was stopped',
           type: 'info',
         });
       } else {

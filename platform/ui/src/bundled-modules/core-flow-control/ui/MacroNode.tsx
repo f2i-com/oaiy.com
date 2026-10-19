@@ -40,7 +40,7 @@ interface MacroNodeData {
     _macroOutputs?: MacroPortDefinition[];
     _macroWorkflowId?: string;
     // Standard node data
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onCollapsedChange?: (value: boolean) => void;

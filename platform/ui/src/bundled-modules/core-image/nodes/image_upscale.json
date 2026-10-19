@@ -1,7 +1,7 @@
 {
   "id": "image_upscale",
   "name": "Upscale Image",
-  "description": "Make a picture two or four times larger with its detail restored (PNG). Runs on OAIY's engine (Real-ESRGAN) or a service you add; service engine:upscale is the engine's.",
+  "description": "Make a picture two or four times larger with its detail restored (PNG). Runs on OAIY's engine (Real-ESRGAN) or a service you add.",
   "doc": "Enlarges a picture two or four times, restoring detail rather than blurring it.\n\n**Service** — `OAIY engine` uses the upscaler set up in OAIY's Engines (Real-ESRGAN x4plus; pictures up to about 4 megapixels). You can also pick one of your own services: it is sent the picture as a data: URL in `{{image}}` and the scale in `{{scale}}`, and should answer with the new picture.\n\n**In → out** — any picture in; a PNG data URL out, which Image View and Image Save take.",
   "icon": "maximize",
   "color": "indigo",

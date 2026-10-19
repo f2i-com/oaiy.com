@@ -1,7 +1,12 @@
 import React, { useCallback } from 'react';
+import { describeServiceId } from '../../registry/serviceNames';
 
-/** A stored value not in the list, as a person reads it: a paired worker's model by its name (`engine:<kind>:node.<id>/<model>`), an engine model without its prefix. */
+/** A stored value not in the list, as a person reads it: in the host's words for a service where it has them ("minicpm-v
+ * on Studio PC"), else a paired worker's model by its name (`engine:<kind>:node.<id>/<model>`), an engine model without
+ * its prefix. */
 function readableValue(value: string): string {
+  const described = /^(engine|voice|companion):/.test(value) ? describeServiceId(value) : null;
+  if (described) return described;
   const worker = /^engine:[a-z0-9]+:node\.[A-Za-z0-9]+\/(.+)$/.exec(value);
   if (worker) return `${worker[1]} on a paired computer`;
   return value.replace(/^engine:[a-z0-9]+:/, '');

@@ -93,11 +93,15 @@ function checkAborted(): boolean {
 async function executeMacro(
   workflowId: string,
   inputs: Record<string, unknown>,
-  nodeId: string
+  nodeId: string,
+  name?: string
 ): Promise<Record<string, unknown>> {
+  // (by its name, where the node gives it: the run's log showed the macro's id; what it was given is for a developer,
+  // in the console)
+  const called = name && name !== 'unnamed' ? `“${name}”` : workflowId;
   ctx.onNodeStatus?.(nodeId, 'running');
-  ctx.log('info', `[Macro] Running macro workflow: ${workflowId}`);
-  ctx.log('info', `[Macro] DEBUG: inputs received = ${JSON.stringify(inputs).substring(0, 500)}`);
+  ctx.log('info', `[Macro] Running ${called}`);
+  console.debug(`[Macro] inputs received = ${JSON.stringify(inputs).substring(0, 500)}`);
 
   if (!ctx.runSubflow) {
     ctx.onNodeStatus?.(nodeId, 'error');
@@ -125,7 +129,7 @@ async function executeMacro(
       __macro_inputs__: inputs,
     };
 
-    ctx.log('info', `[Macro] DEBUG: macroContext = ${JSON.stringify(macroContext).substring(0, 500)}`);
+    console.debug(`[Macro] macroContext = ${JSON.stringify(macroContext).substring(0, 500)}`);
 
     // Execute the macro workflow
     const result = await ctx.runSubflow(workflowId, macroContext);
@@ -136,7 +140,7 @@ async function executeMacro(
     const outputs = (result as Record<string, unknown>)?.__macro_outputs__ || result || {};
 
     ctx.onNodeStatus?.(nodeId, 'completed');
-    ctx.log('success', `[Macro] Completed: ${workflowId}`);
+    ctx.log('success', `[Macro] ${called} finished`);
 
     return outputs as Record<string, unknown>;
   } catch (error) {

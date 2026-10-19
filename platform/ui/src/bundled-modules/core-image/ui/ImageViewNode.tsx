@@ -101,10 +101,16 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
     /^https?:\/\//i.test(imageUrl) ||
     imageUrl.startsWith('blob:')
   );
+  // The picture as it is shown: no <img> without one (for the moment a new picture's address is in but not yet read,
+  // an empty `src`, which React warned of and a browser may take for the page's own address).
+  const src = shown || undefined;
+  const showPicture = isValidImage && !hasLoadError && !!src;
 
   // Compact, the picture itself (small), so a run's result reads without opening the card.
-  const collapsedPreview = isValidImage && !hasLoadError ? (
-    <img src={shown} alt={data.label || 'Picture'} className="block max-h-24 max-w-full rounded object-contain" />
+  const collapsedPreview = showPicture ? (
+    <img src={src} alt={data.label || 'Picture'} className="block max-h-24 max-w-full rounded object-contain" />
+  ) : isValidImage && !hasLoadError ? (
+    <span className="italic">Loading the picture…</span>
   ) : (
     <span className="italic">{blocked ? BLOCKED_MEDIA_WORDS : hasImage ? 'This picture cannot be shown' : 'No picture yet'}</span>
   );
@@ -179,14 +185,18 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
               style={{ height: tall ? heights.large : heights.small }}
               data-preview-box
             >
-              {isValidImage && !hasLoadError ? (
+              {showPicture ? (
                 <img
-                  src={shown}
+                  src={src}
                   alt={data.label || 'Image'}
                   className="max-w-full max-h-full object-contain rounded"
                   onError={() => setHasLoadError(true)}
                   onLoad={() => setHasLoadError(false)}
                 />
+              ) : isValidImage && !hasLoadError ? (
+                <div className="text-center p-2">
+                  <span className="text-slate-600 dark:text-slate-400 text-xs italic">Loading the picture…</span>
+                </div>
               ) : blocked ? (
                 <div className="text-center p-2">
                   <span className="text-amber-600 dark:text-amber-400 text-[10px]" data-blocked-media>{BLOCKED_MEDIA_WORDS}</span>

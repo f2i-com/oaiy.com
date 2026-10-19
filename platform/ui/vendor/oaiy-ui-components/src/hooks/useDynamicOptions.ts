@@ -90,6 +90,9 @@ function getInternals(): TauriInternals | null {
   if (typeof window === 'undefined') return null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const i = (window as any).__TAURI_INTERNALS__;
+  // (the web build's stand-in for Tauri, marked `__oaiyShim`, has no events to listen to: asked, it warned in the
+  // console on every page that has a dropdown)
+  if (i?.__oaiyShim) return null;
   return i && typeof i.invoke === 'function' ? (i as TauriInternals) : null;
 }
 

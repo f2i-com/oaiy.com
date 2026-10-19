@@ -2,6 +2,7 @@
 import { OAIYCompiler } from './compiler.js';
 import { extractDeepValue } from './value-utils.js';
 import { AbortError } from './errors.js';
+import { isNodeCompileError, takeNodeMark } from './node-errors.js';
 import type { WorkflowGraph, StreamCallback, LogCallback, ImageCallback, NodeStatusCallback, Flow, DatabaseCallback, WorkflowInputs, LocalNetworkPermissionCallback, ProjectSettings } from './types.js';
 import type { RuntimeModule, RuntimeContext, RuntimeMethod, ModuleRegistry, LoadedModule } from './module-types.js';
 import { MODULE_CLEANUP } from './module-types.js';
@@ -1610,7 +1611,8 @@ export class OAIYRuntime {
     // through THIS job's handlers. The compiled-workflow path already resolves
     // `Browser.foo()` through the per-job getModulesShim → moduleFunctionHandlers,
     // so nothing in the engine depends on the old global.
-    console.log(`[OAIYRuntime] Registered module '${name}' with methods: ${methodNames.join(', ')}`);
+    // (for a developer: every run registers every module, a dozen lines in the console each time)
+    runtimeLogger.debug(`Registered module '${name}' with methods: ${methodNames.join(', ')}`);
   }
 
   /**
@@ -1801,7 +1803,11 @@ export class OAIYRuntime {
         }),
       onStreamToken: this.onToken ? (nodeId, token) => this.onToken?.(nodeId, token) : undefined,
       onImage: this.onImage ? (nodeId, imageUrl) => this.onImage?.(nodeId, imageUrl) : undefined,
-      onNodeStatus: this.onNodeStatus ? (nodeId, status) => this.onNodeStatus?.(nodeId, status) : undefined,
+      // (a step's "error" once the run's signal has fired is where Stop found it, not a failure of its own: every
+      // module's catch says "error", the stop's "Operation aborted" included)
+      onNodeStatus: this.onNodeStatus
+        ? (nodeId, status) => this.onNodeStatus?.(nodeId, status === 'error' && this.abortSignal?.aborted ? 'stopped' : status)
+        : undefined,
       runSubflow: (flowId, inputs) => this.executeSubflow(flowId, inputs),
       useClaudeForAI: this.useClaudeForAI,
       currentJobId: this.currentJobId || undefined,
@@ -2460,9 +2466,17 @@ ${WORKFLOW_TRAMPOLINE}`;
     if (this.moduleRegistry) compiler.setModuleRegistry(this.moduleRegistry);
     compiler.setProjectSettings(this.projectSettings);
 
-    let script = compiler.compile(graph, inputs);
-    // Resolve any deferred (off-realm) node compilations before executing.
-    script = await compiler.resolveDeferred(script);
+    let script: string;
+    try {
+      script = compiler.compile(graph, inputs);
+      // Resolve any deferred (off-realm) node compilations before executing.
+      script = await compiler.resolveDeferred(script);
+    } catch (e) {
+      // A node that does not compile, its module said which (a Logic Block whose code does not parse): marked, as a
+      // step that fails when it runs is.
+      if (isNodeCompileError(e)) this.onNodeStatus?.(e.nodeId, 'error');
+      throw e;
+    }
 
     // Optional debug-only dump of the compiled script for inspection.
     // Disabled by default and never written from production builds.
@@ -2482,19 +2496,28 @@ ${WORKFLOW_TRAMPOLINE}`;
       }
     }
 
-    this.log('info', '--- Starting Workflow Execution ---');
+    this.log('info', '--- The flow started ---');
 
     try {
       const result = await this.executeScript(script);
-      this.log('success', '--- Workflow Completed Successfully ---');
+      this.log('success', '--- The flow finished ---');
       return result;
     } catch (e) {
-      const error = e instanceof Error ? e.message : String(e);
+      let error = e instanceof Error ? e.message : String(e);
+      // A step that names itself as the one that failed (a Logic Block's code throwing, `nodeErrorPrefix`): its node
+      // is marked, and the message goes on without the mark (or what ZIPP adds of where in the script it was, which
+      // is no line of the person's).
+      const marked = takeNodeMark(error);
+      if (marked.nodeId) {
+        this.onNodeStatus?.(marked.nodeId, 'error');
+        error = marked.message.replace(/\s*\(in <script>\)\s*$/, '');
+        e = new Error(error);
+      }
       // (a stop is the run's signal having fired, not an error that says "aborted")
       const isAbort = this.abortSignal?.aborted === true;
       if (!isAbort) {
         // (an error wrapped on its way up says "Error: " once for each wrapping)
-        this.log('error', `Workflow Error: ${error.replace(/^(Error:\s*)+/, '')}`);
+        this.log('error', `The flow failed: ${error.replace(/^(Error:\s*)+/, '')}`);
       }
       throw e;
     }

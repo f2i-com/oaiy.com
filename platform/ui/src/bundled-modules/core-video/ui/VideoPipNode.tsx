@@ -15,7 +15,7 @@ interface VideoPipNodeData {
     mainVolume?: number;
     pipVolume?: number;
     outputValue?: string;
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onCollapsedChange?: (value: boolean) => void;

@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
 import { AlertTriangle, Check, Info, X, XCircle } from 'lucide-react';
-import { readableError } from '../lib/readableError';
+import { toastError } from '../lib/readableError';
 
 export type ToastType = 'success' | 'error' | 'info' | 'warning';
 
@@ -16,11 +16,13 @@ interface Toast {
   type: ToastType;
   duration?: number;
   action?: ToastAction;
+  /** One of a kind: a new toast with the same key takes its place (a run's failure, said again, is not a second toast). */
+  key?: string;
 }
 
 interface ToastContextValue {
   toasts: Toast[];
-  addToast: (message: string, type?: ToastType, duration?: number, action?: ToastAction) => void;
+  addToast: (message: string, type?: ToastType, duration?: number, action?: ToastAction, key?: string) => void;
   removeToast: (id: string) => void;
 }
 
@@ -41,9 +43,9 @@ interface ToastProviderProps {
 export function ToastProvider({ children }: ToastProviderProps) {
   const [toasts, setToasts] = useState<Toast[]>([]);
 
-  const addToast = useCallback((message: string, type: ToastType = 'info', duration: number = 3000, action?: ToastAction) => {
+  const addToast = useCallback((message: string, type: ToastType = 'info', duration: number = 3000, action?: ToastAction, key?: string) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    setToasts(prev => [...prev, { id, message, type, duration, action }]);
+    setToasts(prev => [...(key ? prev.filter((t) => t.key !== key) : prev), { id, message, type, duration, action, key }]);
   }, []);
 
   const removeToast = useCallback((id: string) => {
@@ -127,8 +129,8 @@ function ToastItem({ toast, onRemove }: ToastItemProps) {
       aria-live={toast.type === 'error' ? 'assertive' : 'polite'}
     >
       <Icon size={16} aria-hidden="true" />
-      {/* (an error in words: a service's JSON answer by its message, lib/readableError.ts) */}
-      <span>{toast.type === 'error' ? readableError(toast.message) : toast.message}</span>
+      {/* (an error in words: a service's JSON answer by its message, without its HTTP status, lib/readableError.ts) */}
+      <span>{toast.type === 'error' ? toastError(toast.message) : toast.message}</span>
       {toast.action && (
         <button
           type="button"

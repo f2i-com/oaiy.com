@@ -17,7 +17,10 @@ import {
   useJobImageUpdates,
 } from '../contexts/JobQueueContext';
 import type { WorkflowGraph, LogEntry, OAIYPackageManifest } from 'oaiy-core';
+import { getModuleLoader } from 'oaiy-core';
 import { createLogger } from '../utils/logger';
+import { afterUnfinishedRun, beforeRun, type NodeRunStatus } from '../lib/runResults';
+import { getNodeNotice } from 'oaiy-ui-components';
 
 const logger = createLogger('WorkflowExecution');
 
@@ -30,7 +33,7 @@ export interface UseWorkflowExecutionOptions {
   getWorkflowGraph: () => WorkflowGraph | null;
   setNodes: React.Dispatch<React.SetStateAction<Node[]>>;
   updateNodeData: (nodeId: string, data: Record<string, unknown>) => void;
-  onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, action?: { label: string; onClick: () => void }) => void;
+  onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning', duration?: number, action?: { label: string; onClick: () => void }, key?: string) => void;
   /** Open the log (a failed run's toast offers it). */
   onShowLog?: () => void;
   /** Check if workflow has input nodes that need configuration */
@@ -72,8 +75,8 @@ export interface WorkflowExecutionState {
 }
 
 export interface WorkflowExecutionActions {
-  /** Run the workflow (may show modal if inputs needed) */
-  runWorkflow: () => Promise<void>;
+  /** Run the workflow (may show modal if inputs needed); `true`: even where a step's model is not here */
+  runWorkflow: (anyway?: unknown) => Promise<void>;
   /** Stop the running workflow */
   stopWorkflow: () => void;
   /** Clear all logs */
@@ -188,11 +191,11 @@ export function useWorkflowExecution({
   useJobNodeStatus(
     currentJobId,
     useCallback(
-      (nodeId: string, status: 'running' | 'completed' | 'error') => {
+      (nodeId: string, status: NodeRunStatus) => {
         // A node's "running" arriving after its run was stopped or ended (a step still finishing) would stay on it,
-        // spinning, with nothing running: not shown. Its error is.
+        // spinning, with nothing running: not shown. Its error is, and where it stopped.
         const job = currentJobId ? jobManager.getJob(currentJobId) : undefined;
-        if (status !== 'error' && job && job.status !== 'running') return;
+        if (status !== 'error' && status !== 'stopped' && job && job.status !== 'running') return;
         updateNodeData(nodeId, { _status: status });
       },
       [updateNodeData, currentJobId, jobManager]
@@ -351,25 +354,23 @@ export function useWorkflowExecution({
           });
         });
       } else {
-        // A failed or stopped run: what was still running is not any more, and the node that failed keeps its Error
-        // mark (it shows where the run went wrong).
-        setNodes((nds) =>
-          nds.map((node) => {
-            if (node.data._status === 'running') {
-              return { ...node, data: { ...node.data, _status: undefined } };
-            }
-            return node;
-          })
-        );
+        // A failed or stopped run: what was still running is not any more (stopped where Stop found it), the node
+        // that failed keeps its Error mark (it shows where the run went wrong), and the results show there is none
+        // from this run (`_stale`), rather than nothing changing on the canvas.
+        const stopped = job.status === 'aborted';
+        const failedNodeId = (job as { failedNodeId?: string }).failedNodeId;
+        setNodes((nds) => nds.map((node) => afterUnfinishedRun(node, stopped, failedNodeId)));
         if (job.status === 'failed') {
           const full = String((job as { error?: unknown }).error ?? '').replace(/^(Error:\s*)+/, '').trim();
-          // Its first sentence (the rest, advice that can run to a paragraph, is in the log the toast opens).
+          // Its first sentence (the rest, advice that can run to a paragraph, is in the log the toast opens); one
+          // run's failure in place of the last one's, not one toast more for each run.
           const why = full.match(/^.+?[.!?](?=\s|$)/s)?.[0] ?? full;
           toastRef.current?.(
             why ? `The run failed: ${why.length > 220 ? `${why.slice(0, 220)}…` : why}` : 'The run failed.',
             'error',
             9000,
             showLogRef.current ? { label: 'Show log', onClick: () => showLogRef.current?.() } : undefined,
+            `run-failed:${flowId}`,
           );
         }
       }
@@ -391,7 +392,7 @@ export function useWorkflowExecution({
 
     const graph = getWorkflowGraph();
     if (!graph || graph.nodes.length === 0) {
-      onShowToast?.('Cannot run empty workflow', 'warning');
+      onShowToast?.('There is nothing to run: add a node first.', 'warning');
       return;
     }
 
@@ -421,7 +422,10 @@ export function useWorkflowExecution({
     );
     setManualJobId(jobId);
     setLocalLogs([]); // Clear local logs when starting new job
-  }, [getWorkflowGraph, jobManager, flowId, flowName, onShowToast, packagePermissionContext, isFlowRunning, getJobForFlow]);
+    // The last run's results and marks go as this one starts: a run that fails showed the one before's result, as
+    // though it were this one's.
+    setNodes((nds) => nds.map(beforeRun));
+  }, [getWorkflowGraph, jobManager, flowId, flowName, onShowToast, packagePermissionContext, isFlowRunning, getJobForFlow, setNodes]);
 
   // Proceed with run after inputs are confirmed (handles service check)
   const proceedWithRun = useCallback(async () => {
@@ -520,17 +524,41 @@ export function useWorkflowExecution({
   );
 
   // Run workflow via job queue
-  const runWorkflow = useCallback(async () => {
+  const runWorkflow = useCallback(async (anyway?: unknown) => {
     // Macros cannot be run directly
     if (isMacro) {
-      onShowToast?.('Macros cannot be run directly. Use this macro as a node in another flow.', 'warning');
+      onShowToast?.('A macro does not run by itself: use it as a node in another flow.', 'warning');
       return;
     }
 
     const graph = getWorkflowGraph();
     if (!graph || graph.nodes.length === 0) {
-      onShowToast?.('Cannot run empty workflow', 'warning');
+      onShowToast?.('There is nothing to run: add a node first.', 'warning');
       return;
+    }
+
+    // A step whose model or service is not here (not installed, its computer offline: what its card says) is said
+    // before the run starts, not when the run gets to it, after the steps before it have run (an example's picture
+    // step failed after its language model had written the prompt). (`anyway`: "Run anyway" from that toast; a click
+    // passes its event, which is not that.)
+    if (anyway !== true) {
+      const blocked = nodes
+        .map((node) => ({ node, notice: getNodeNotice(node.type, node.data as Record<string, unknown>) }))
+        .filter((b): b is { node: Node; notice: string } => !!b.notice);
+      if (blocked.length) {
+        const { node, notice } = blocked[0];
+        // (by its name on the canvas, else its kind's: "Image Gen", not "image_gen")
+        const data = node.data as { label?: unknown };
+        const name = (typeof data.label === 'string' && data.label.trim()) || getModuleLoader().getNodeDefinition(String(node.type))?.name || node.type;
+        onShowToast?.(
+          `“${name}” cannot run now: ${notice}${blocked.length > 1 ? ` (and ${blocked.length - 1} more step${blocked.length > 2 ? 's' : ''})` : ''}`,
+          'warning',
+          12000,
+          { label: 'Run anyway', onClick: () => void runRef.current(true) },
+          `run-check:${flowId}`,
+        );
+        return;
+      }
     }
 
     // Show run modal if there are input nodes to configure
@@ -541,7 +569,9 @@ export function useWorkflowExecution({
 
     // No input nodes - proceed directly
     proceedWithRun();
-  }, [getWorkflowGraph, onShowToast, isMacro, nodes, proceedWithRun, hasInputNodes]);
+  }, [getWorkflowGraph, onShowToast, isMacro, nodes, proceedWithRun, hasInputNodes, flowId]);
+  const runRef = useRef(runWorkflow);
+  runRef.current = runWorkflow;
 
   // Stop workflow via job queue
   const stopWorkflow = useCallback(() => {

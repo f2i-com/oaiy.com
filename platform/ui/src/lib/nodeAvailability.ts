@@ -132,8 +132,16 @@ function describeOaiyId(id: string, list: CustomService[]): { kind: string; mode
  * a guess). Covers the service-driven nodes and Service Call.
  */
 export function nodeNotice(nodeType: string, data: Record<string, unknown>, env: AvailabilityEnv): string | null {
+  return nodeNoticeDetail(nodeType, data, env)?.text ?? null;
+}
+
+/**
+ * `nodeNotice`, with the few words a folded card shows beside its warning mark (`short`): the whole notice is on the
+ * mark, on the expanded card and in Properties.
+ */
+export function nodeNoticeDetail(nodeType: string, data: Record<string, unknown>, env: AvailabilityEnv): { text: string; short: string } | null {
   const missing = missingFeature(nodeType, env);
-  if (missing) return `${whyMissing(missing)} Connect it in Settings → Services, or use another node.`;
+  if (missing) return { text: `${whyMissing(missing)} Connect it in Settings → Services, or use another node.`, short: 'Needs OAIY Desktop' };
   if (!SERVICE_NODE_TYPES.has(nodeType) && nodeType !== 'service_call') return null;
   const picked = typeof data.service === 'string' ? data.service.trim() : '';
   const id = picked || DEFAULT_SERVICE[nodeType] || '';
@@ -142,26 +150,30 @@ export function nodeNotice(nodeType: string, data: Record<string, unknown>, env:
   // A paired worker's model is there, but its computer does not answer now (OAIY Network): said, as a run would fail.
   if (found?.nodeId && found.ready === false) {
     const { text, worker } = describeService(found.id, env.desktop);
-    return `“${text.replace(/ on .*$/, '')}” runs on ${worker}, which does not answer now (OAIY Network). Check it in OAIY → Networking, or pick another model.`;
+    return {
+      text: `“${text.replace(/ on .*$/, '')}” runs on ${worker}, which does not answer now (OAIY Network). Check it in OAIY → Networking, or pick another model.`,
+      short: `${worker} is offline`,
+    };
   }
   if (found) return null;
   if (isOaiyServiceId(id)) {
-    if (!env.inOaiy) return 'This uses OAIY\'s own engine, which flows reach in the OAIY app. Open the flow there, or pick another service.';
+    if (!env.inOaiy) return { text: 'This uses OAIY\'s own engine, which flows reach in the OAIY app. Open the flow there, or pick another service.', short: 'Runs in the OAIY app only' };
     if (!env.loaded) return null;
     if (id.startsWith('voice:')) {
-      return 'OAIY Voice is not installed, so nothing here writes out recordings. Install it in OAIY → Services, or pick another service.';
+      return { text: 'OAIY Voice is not installed, so nothing here writes out recordings. Install it in OAIY → Services, or pick another service.', short: 'OAIY Voice is not installed' };
     }
     const { kind, model } = describeOaiyId(id, env.desktop);
     const what = KIND_LABEL[kind] || `${kind} model`;
     return model
-      ? `The ${what} “${model}” is not installed in OAIY's engine (or its files are missing). Add it in OAIY → Engines, or pick another service.`
-      : `OAIY's engine has no ${what} installed. Add one in OAIY → Engines, or pick another service (your own Python rigs are in OAIY → Services).`;
+      ? { text: `The ${what} “${model}” is not installed in OAIY's engine (or its files are missing). Add it in OAIY → Engines, or pick another service.`, short: `“${model}” is not installed` }
+      : { text: `OAIY's engine has no ${what} installed. Add one in OAIY → Engines, or pick another service (your own Python rigs are in OAIY → Services).`, short: `No ${what} installed` };
   }
   if (id.startsWith('companion:')) {
     if (!env.loaded) return null;
-    return `The service “${id.slice('companion:'.length)}” is not installed in OAIY. Install it in OAIY → Services, or pick another service.`;
+    const name = id.slice('companion:'.length);
+    return { text: `The service “${name}” is not installed in OAIY. Install it in OAIY → Services, or pick another service.`, short: `“${name}” is not installed` };
   }
-  return `The service “${id}” is not in this editor's services. Add it in Settings → Services, or pick another service.`;
+  return { text: `The service “${id}” is not in this editor's services. Add it in Settings → Services, or pick another service.`, short: `“${id}” is not in your services` };
 }
 
 /**

@@ -1,11 +1,11 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   ArrowDownAZ,
+  ArrowDownUp,
   ChevronDown,
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
-  Clock,
   Copy,
   FileText,
   Globe,
@@ -408,12 +408,14 @@ export default function FlowsSidebar({
                 setSort(next);
                 remember(SORT_KEY, next);
               }}
-              className="oaiy-icon-btn"
+              className="oaiy-sort-btn"
               aria-label={sort === 'recent' ? 'Sorted by last changed: sort by name' : 'Sorted by name: sort by last changed'}
               title={sort === 'recent' ? 'Last changed first (click for A to Z)' : 'A to Z (click for last changed first)'}
               data-testid="flows-sort"
             >
-              {sort === 'recent' ? <Clock size={15} /> : <ArrowDownAZ size={15} />}
+              {/* (a sort says so in words: a clock alone read as the flows' run history) */}
+              {sort === 'recent' ? <ArrowDownUp size={13} aria-hidden="true" /> : <ArrowDownAZ size={13} aria-hidden="true" />}
+              <span>{sort === 'recent' ? 'Recent' : 'A–Z'}</span>
             </button>
             {/* Collapse on md+; below md the panel is an overlay, so this dismisses it. */}
             <button

@@ -59,6 +59,8 @@ interface OutputNodeData {
   label?: string;
   /** What reached it on the last run (outputValue.ts sorts it). */
   outputValue?: unknown;
+  /** The last run did not finish (it failed, or was stopped): whatever it shows is not that run's result. */
+  _stale?: boolean;
   _collapsed?: boolean;
   onLabelChange?: (value: string) => void;
   onCollapsedChange?: (value: boolean) => void;
@@ -198,7 +200,7 @@ function OutputNode({ data }: OutputNodeProps) {
 
   // Compact: the result itself where it is small (pictures, a player, a video's first frame), else a line saying what it is.
   const collapsedPreview = !hasOutput ? (
-    <span className="italic">No result yet</span>
+    <span className="italic">{data._stale ? 'No result: the last run did not finish' : 'No result yet'}</span>
   ) : kind === 'image' ? (
     // (one row: several pictures side by side, the rest counted, so the card keeps its height)
     <div className="flex items-end gap-1 overflow-hidden">
@@ -287,7 +289,7 @@ function OutputNode({ data }: OutputNodeProps) {
             )}
             {!hasOutput ? (
               <div className={`${frame} flex items-center justify-center p-3 text-center text-xs italic text-slate-500 dark:text-slate-400`} style={{ height: contentHeight }}>
-                Its result shows here after a run
+                {data._stale ? 'No result: the last run did not finish' : 'Its result shows here after a run'}
               </div>
             ) : kind === 'image' ? (
               <div className={`${frame} overflow-hidden`} style={{ height: contentHeight }}>

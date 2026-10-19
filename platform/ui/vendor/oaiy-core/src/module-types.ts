@@ -479,7 +479,7 @@ export interface RuntimeContext {
   // Streaming callbacks for real-time updates
   onStreamToken?: (nodeId: string, token: string) => void;
   onImage?: (nodeId: string, imageUrl: string) => void;
-  onNodeStatus?: (nodeId: string, status: 'running' | 'completed' | 'error') => void;
+  onNodeStatus?: (nodeId: string, status: 'running' | 'completed' | 'error' | 'stopped') => void;
 
   // HTTP fetch with abort support
   fetch: (url: string, options?: RequestInit) => Promise<Response>;

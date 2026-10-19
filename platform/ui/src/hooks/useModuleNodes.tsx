@@ -242,6 +242,9 @@ export function useModuleNodes(options?: UseModuleNodesOptions) {
       if (svc.group === 'engine') continue;
       // Installed but not in use (stopped, not started with OAIY).
       if (!isListed(svc)) continue;
+      // One that declares no way to call it: a Service Call posting the input to its port as a guess is not a node
+      // that works (lib/desktopServices.ts).
+      if (svc.noContract) continue;
       const synthetic: ModuleNodeInfo = {
         definition: {
           id: `service:${svc.id}`,
@@ -267,6 +270,10 @@ export function useModuleNodes(options?: UseModuleNodesOptions) {
       existing.push(synthetic);
       groups.set('AI' as ModuleCategory, existing);
     }
+
+    // The Services category is always there, empty or not: a first-time web editor (no service added, the wizard
+    // skipped) had no AI node and nothing saying where they come from. The palette says it in it (NodePalette).
+    if (!groups.has('AI' as ModuleCategory)) groups.set('AI' as ModuleCategory, []);
 
     // Add package nodes if a package is active
     // All package nodes go into the 'Package' category at the top of the palette

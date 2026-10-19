@@ -22,7 +22,7 @@ interface AILLMNodeData {
   mmprojPath?: string;
   projectConstants?: ProjectConstant[];
   projectSettings?: ProjectSettings;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onModelChange?: (value: string) => void;
   onSystemPromptChange?: (value: string) => void;

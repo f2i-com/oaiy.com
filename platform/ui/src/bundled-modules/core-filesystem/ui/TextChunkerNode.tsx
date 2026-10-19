@@ -9,7 +9,7 @@ interface TextChunkerNodeData {
   overlap?: number;
   csvHasHeader?: boolean;
   indexName?: string;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   _fileName?: string;  // File name from connected input (for auto-detection)
   _sourceFormat?: string;  // Format from File Read node (json, csv, lines, text)

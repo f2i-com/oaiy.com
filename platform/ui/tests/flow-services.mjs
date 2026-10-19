@@ -81,7 +81,7 @@ const bundlePath = path.join(os.tmpdir(), `oaiy-flow-services-${process.pid}.mjs
 await esbuild.build({
   stdin: {
     contents: `export { mapToCustomService, mapEngineService, combineDesktopServices } from './src/lib/desktopServices.ts';
-export { paletteShowsNode, nodeNotice, initialServiceFor, nodeTypeForService, isListed, DESKTOP_NODE_FEATURE } from './src/lib/nodeAvailability.ts';
+export { paletteShowsNode, nodeNotice, nodeNoticeDetail, initialServiceFor, nodeTypeForService, isListed, DESKTOP_NODE_FEATURE } from './src/lib/nodeAvailability.ts';
 export { serviceOptions } from './src/lib/serviceOptions.ts';
 export { resolveService, renderContractBody, nodeContract, engineChatService, remoteModelOf, engineDefault, describeService } from './src/bundled-modules/core-service/contract.ts';
 export { runContract, contractTiming } from './src/bundled-modules/core-service/contractRuntime.ts';
@@ -243,23 +243,26 @@ await check('a flow that has one of them where its feature is off says what it n
   assert.equal(M.nodeNotice('browser_request', {}, off), null);
 });
 
-await check('the Service dropdown is grouped: OAIY engine, your services, custom, then "Add a service…"', () => {
+await check('the Service dropdown is grouped: this computer, OAIY Services, your services, then "Add a service…"', () => {
   let added = null;
   const opts = M.serviceOptions('music_gen', env({ custom: [...CUSTOM, { ...CUSTOM[0], id: 'my-music', name: 'My music', nodeTypes: ['music_gen'] }] }), (t) => { added = t; });
   assert.deepEqual(opts.map((o) => [o.value, o.group ?? '']), [
     ['', ''],
-    ['engine:music', 'OAIY engine'],
-    ['engine:music:song', 'OAIY engine'],
-    ['my-music', 'Custom'],
+    ['engine:music', 'This computer'],
+    ['engine:music:song', 'This computer'],
+    ['my-music', 'Your services'],
     ['__add_service__', 'More'],
   ]);
   assert.match(opts[1].label, /Default music model \(song\)/);
-  assert.equal(opts[2].label, 'Music · song');
+  // (an engine model as its kind and its model: "music model · song", not the desktop's "Music · song")
+  assert.equal(opts[2].label, 'music model · song');
+  assert.equal(M.serviceOptions('ai_llm', env(), () => {}).find((o) => o.value === 'engine:llm:flash').label, 'language model · flash');
   opts.at(-1).action();
   assert.equal(added, 'music_gen');
   const call = M.serviceOptions('', env(), () => {});
   const groups = [...new Set(call.map((o) => o.group).filter(Boolean))];
-  assert.deepEqual(groups, ['OAIY engine', 'Your services', 'Custom', 'More']);
+  // ("Your services" is what Settings → Services calls the person's own, as it is here: it named the desktop's)
+  assert.deepEqual(groups, ['This computer', 'OAIY Services', 'Your services', 'More']);
   assert.ok(!M.serviceOptions('sound_effect', env(), () => {}).some((o) => o.value === ''), 'the new nodes always run on a service');
 });
 
@@ -286,7 +289,7 @@ await check('lists offer only what is in use: a stopped service is left out but 
 await check("Service Call offers each kind's default model, not every model", () => {
   const more = [...desktop, { ...desktop.find((s) => s.id === 'engine:image:qwen'), id: 'engine:image:other', model: 'other', default: false }];
   const call = M.serviceOptions('service_call', env({ desktop: more }), () => {});
-  const engine = call.filter((o) => o.group === 'OAIY engine' && !o.onlyWhenSelected).map((o) => o.value);
+  const engine = call.filter((o) => o.group === 'This computer' && !o.onlyWhenSelected).map((o) => o.value);
   assert.deepEqual(engine, ['engine:llm', 'engine:image', 'engine:music', 'engine:sound', 'engine:background']);
   // Each model stays pickable only where a flow already names it.
   assert.equal(call.find((o) => o.value === 'engine:image:other').onlyWhenSelected, true);
@@ -584,7 +587,9 @@ await check("a paired worker's model (OAIY Network) keeps its node, goes to it, 
   const withDefault = M.serviceOptions('image_gen', env({ desktop: [{ ...local, nodeTypes: ['image_gen'] }, chosen] }), () => {});
   assert.ok(withDefault.some((o) => o.value === 'engine:image' && o.label === 'Default picture model (flux on Rig)'), JSON.stringify(withDefault));
   const options = M.serviceOptions('image_gen', env({ desktop: [mapped, { ...local, nodeTypes: ['image_gen'] }].map((x) => ({ ...x, nodeTypes: ['image_gen'] })) }), () => {});
-  assert.ok(options.some((o) => o.label === 'Image · flux · Rig (offline)'), JSON.stringify(options));
+  // (in a group of its computer's, "Rig (paired computer)", apart from this computer's)
+  assert.ok(options.some((o) => o.label === 'picture model · flux on Rig (offline)' && o.group === 'Rig (paired computer)'), JSON.stringify(options));
+  assert.ok(options.some((o) => o.value === 'engine:image:qwen' && o.group === 'This computer'), JSON.stringify(options));
   // said in words, never the raw id; and an offline worker's model is said to be offline on the node
   assert.equal(M.describeService('engine:image:node.abc123/flux', [mapped]).text, 'flux on Rig');
   assert.equal(M.describeService('engine:image:node.zzz/flux').text, 'flux on a paired computer');
@@ -634,6 +639,96 @@ await check('an id is looked up on the desktop when the flow runs, and a missing
 await check('a contract body sends what the node has and leaves out what it has not', () => {
   assert.equal(M.renderContractBody('{"a": {{a}}, "b": {{b}}, "c": {{c}}, "d": "x{{dRaw}}y"}', { a: 'hi "you"', b: '', d: 'Z' }), '{"a":"hi \\"you\\"","d":"xZy"}');
   assert.equal(M.renderContractBody('{"images": {{images}}}', { images: ['data:a', 'data:b'] }), '{"images":["data:a","data:b"]}');
+});
+
+// ---------------------------------------------------------------------------
+// From the flow editor's review (2026-10-19).
+// ---------------------------------------------------------------------------
+
+await check('an AI LLM node on a service runs on it: the Ollama fields it was given when added are not read', () => {
+  const ollama = { provider: 'ollama', model: 'llama3.2', endpoint: 'http://localhost:11434/v1/chat/completions', requestFormat: 'openai' };
+  const llm = compile(M.AICompiler, 'ai_llm', { service: 'engine:llm:flash', ...ollama, apiKeyConstant: 'OPENAI_API_KEY' }, { input: 'node_in' });
+  assert.ok(llm.includes(`${ORIGIN}/api/ai/providers/oaiy-engine/v1/chat/completions`), "the engine's chat route");
+  assert.ok(!llm.includes('11434') && !llm.includes('llama3.2'), 'not Ollama, not llama3.2');
+  assert.ok(llm.includes('"flash"'), "the service's model");
+  assert.ok(!/OPENAI_API_KEY/.test(llm), "the hidden key field is not sent either");
+  // the default language model: the engine, listed here or not (the CLI has no list)
+  const byDefault = compile(M.AICompiler, 'ai_llm', { service: 'engine:llm', ...ollama }, { input: 'node_in' });
+  assert.ok(byDefault.includes('/api/ai/providers/oaiy-engine/v1/chat/completions') && !byDefault.includes('11434'));
+  const listed = store.get('oaiy.desktopServices');
+  store.delete('oaiy.desktopServices');
+  try {
+    const unlisted = compile(M.AICompiler, 'ai_llm', { service: 'engine:llm', ...ollama }, { input: 'node_in' });
+    assert.ok(unlisted.includes('"/api/ai/providers/oaiy-engine/v1/chat/completions"') && !unlisted.includes('11434'));
+  } finally {
+    store.set('oaiy.desktopServices', listed);
+  }
+  // with no service, the provider's fields are the node's, as they show
+  const own = compile(M.AICompiler, 'ai_llm', { service: '', ...ollama }, { input: 'node_in' });
+  assert.ok(own.includes('http://localhost:11434/v1/chat/completions') && own.includes('"llama3.2"'));
+});
+
+await check('Image Gen and Video Gen on a service of your own run on it, not the ComfyUI address they were given when added', () => {
+  const mine = { id: 'my-pictures', name: 'My pictures', endpoint: 'http://127.0.0.1:7777/v1/images/generations', method: 'POST', headers: '{}', bodyTemplate: '', responseType: 'json', responsePath: 'data.0.url', apiFormat: 'openai', nodeTypes: ['image_gen', 'video_gen'] };
+  const kept = store.get('oaiy.customServices');
+  store.set('oaiy.customServices', JSON.stringify([...CUSTOM, mine]));
+  try {
+    const seeded = { endpoint: 'http://localhost:8188', apiFormat: 'comfyui', model: '' };
+    const img = compile(M.ImageCompiler, 'image_gen', { service: 'my-pictures', ...seeded }, { prompt: 'node_in' });
+    assert.ok(img.includes('127.0.0.1:7777') && !img.includes('8188'), 'the service, not ComfyUI');
+    const vid = compile(M.VideoCompiler, 'video_gen', { service: 'my-pictures', ...seeded }, { prompt: 'node_in' });
+    assert.ok(vid.includes('127.0.0.1:7777') && !vid.includes('8188'));
+    // with no service, the node's own backend fields, as they show
+    assert.ok(compile(M.ImageCompiler, 'image_gen', { service: '', ...seeded }, { prompt: 'node_in' }).includes('localhost:8188'));
+  } finally {
+    store.set('oaiy.customServices', kept);
+  }
+});
+
+await check("a desktop service that says no way to call it is not a palette node, and none has its state in its name", () => {
+  const voice = { id: 'oaiy-voice', name: 'OAIY Voice', description: "OAIY's own voice for calls.", category: 'speech', status: 'running', port: 8783, defaultPort: 8783, docsUrl: null, installed: true, autostart: true };
+  const mapped = M.mapToCustomService(voice, ORIGIN);
+  assert.equal(mapped.name, 'OAIY Voice', 'no "(running)"');
+  assert.equal(mapped.noContract, true, 'a guess at how to call it');
+  // one with a contract, or a category's known way, is not a guess
+  assert.ok(!M.mapToCustomService(SERVICES[2], ORIGIN).noContract);
+  assert.ok(!M.mapToCustomService({ ...voice, category: 'image generation' }, ORIGIN).noContract);
+  assert.equal(M.mapToCustomService({ ...SERVICES[2], status: 'stopped' }, ORIGIN).name, 'Local LLM');
+});
+
+await check('a node whose model is missing or offline says so in a few words too, for its folded card', () => {
+  assert.deepEqual(M.nodeNoticeDetail('music_gen', { service: 'engine:music:gone' }, env()).short, '“gone” is not installed');
+  assert.equal(M.nodeNoticeDetail('model_3d', {}, env()).short, 'No 3D model installed');
+  const remote = { id: 'engine:image:node.abc123/flux', name: 'OAIY engine · Image · flux · Kitchen laptop', kind: 'image', model: 'flux', group: 'engine', endpoint: 'x', nodeId: 'abc123', nodeName: 'Kitchen laptop', ready: false, nodeTypes: ['image_gen'] };
+  const offline = M.nodeNoticeDetail('image_gen', { service: remote.id }, env({ desktop: [...desktop, remote] }));
+  assert.equal(offline.short, 'Kitchen laptop is offline');
+  assert.match(offline.text, /runs on Kitchen laptop, which does not answer now/);
+  assert.equal(M.nodeNotice('image_gen', { service: remote.id }, env({ desktop: [...desktop, remote] })), offline.text, 'nodeNotice is its whole text');
+  assert.equal(M.nodeNoticeDetail('music_gen', { service: 'engine:music:song' }, env()), null);
+});
+
+await check("a job that cannot be cancelled says, when the flow is stopped, that it goes on in OAIY", async () => {
+  const abort = new AbortController();
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST') return reply(200, { id: 'vid_1', status: 'queued' });
+    abort.abort();
+    return reply(200, { id: 'vid_1', status: 'in_progress', progress: 30 });
+  };
+  const video = { id: 'engine:video:ltx', name: 'OAIY engine · Video · ltx', kind: 'video', model: 'ltx', group: 'engine', endpoint: `${ORIGIN}/api/ai/engine/gateway/v1/videos`, method: 'POST', headers: '{}', bodyTemplate: '{"prompt": {{prompt}}}', responseType: 'json', responsePath: '', output: 'video', outputFormat: 'mp4', job: { ...job('/v1/videos', '', false, false), statusUrl: `${ORIGIN}/api/ai/engine/gateway/v1/videos/{id}` } };
+  const ctx = fakeCtx(abort.signal);
+  await assert.rejects(M.runContract(ctx, video, { prompt: 'waves' }, { nodeId: 'n1', label: 'Video Gen' }), /aborted/);
+  assert.ok(ctx.logs.includes('[Video Gen] Stopped here; the video is still being made in OAIY'), ctx.logs.join('\n'));
+  // one that can be cancelled is cancelled, and says nothing of the sort
+  const sound = desktop.find((s) => s.id === 'engine:sound:moss');
+  const again = new AbortController();
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST' && url.endsWith('/sound_effects')) return reply(200, { id: 'sfx_2', status: 'queued' });
+    if (url.endsWith('/sfx_2')) { again.abort(); return reply(200, { id: 'sfx_2', status: 'in_progress' }); }
+    return reply(200, {});
+  };
+  const quiet = fakeCtx(again.signal);
+  await assert.rejects(M.runContract(quiet, sound, { prompt: 'rain' }, { nodeId: 'n1' }), /aborted/);
+  assert.ok(!quiet.logs.some((l) => l.includes('still being made')));
 });
 
 console.log(`\n${pass} passed, ${failures.length} failed`);

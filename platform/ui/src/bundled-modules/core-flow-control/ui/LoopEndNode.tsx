@@ -11,7 +11,7 @@ interface LoopEndNodeData {
   stopValue?: string;
   stopField?: string;
   loopName?: string; // Will be set from connected Loop Start
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onStopConditionChange?: (value: string) => void;
   onStopValueChange?: (value: string) => void;

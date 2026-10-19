@@ -95,8 +95,15 @@ const CoreAICompiler: ModuleCompiler = {
     // (the user's OpenAI key must not be sent to it) and speaks plain OpenAI
     // chat — its body template is for the Service Call node only.
     const isEngine = preset?.group === 'engine';
+    // A service picked on the node is what it runs on: the provider's fields (Provider, Model, Endpoint, the key) are
+    // shown only while Service is blank, and are read only then. Hidden under a service, the ones every node was
+    // given when added (Ollama's address and llama3.2) won over the service, and an AI LLM node on OAIY's engine
+    // called Ollama, whatever model it showed.
+    const own: Record<string, unknown> = String(data.service ?? '').trim() === ''
+      ? data
+      : { ...data, provider: undefined, endpoint: undefined, model: undefined, apiKeyConstant: undefined, apiKey: undefined };
 
-    const provider = String(data.provider || (preset ? 'custom' : 'oaiy-local'));
+    const provider = String(own.provider || (preset ? 'custom' : 'oaiy-local'));
     // HuggingFace LLM defaults to local service endpoint with OpenAI-compatible API
     const hfDefaultEndpoint = 'http://127.0.0.1:8774/v1/chat/completions';
     // OAIY Local (plugin-llm) uses a custom URI scheme that the runtime's
@@ -120,14 +127,14 @@ const CoreAICompiler: ModuleCompiler = {
     // provider literally named "{{nodes.ctx.backgroundProvider}}" — which is
     // how every llm_chat node in a relayed flow failed.
     const endpointRaw = String(
-      data.endpoint
+      own.endpoint
         || preset?.endpoint
         || providerDefaultEndpoint
         || projectSettings?.defaultAIEndpoint
         || ''
     );
     const modelRaw = String(
-      data.model || preset?.model || projectSettings?.defaultAIModel || ''
+      own.model || preset?.model || projectSettings?.defaultAIModel || ''
     );
     const endpointExpr = `String(${resolveRefsExpr(endpointRaw)} ?? '')`;
     const modelExpr = `String(${resolveRefsExpr(modelRaw)} ?? '')`;
@@ -136,8 +143,8 @@ const CoreAICompiler: ModuleCompiler = {
     const defaultApiKey =
       provider === 'huggingface' || provider === 'oaiy-local' ? '' : 'OPENAI_API_KEY';
     const apiKeyConstant = escapeString(String(
-      data.apiKeyConstant
-        || data.apiKey
+      own.apiKeyConstant
+        || own.apiKey
         || preset?.apiKeyConstant
         || (isEngine ? '' : projectSettings?.defaultAIApiKeyConstant || defaultApiKey)
     ));

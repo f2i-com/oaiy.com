@@ -9,7 +9,7 @@ interface FileWriteNodeData {
   contentType?: 'text' | 'base64';
   createDirectories?: boolean;
   _lastWrittenPath?: string;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onTargetPathChange?: (value: string) => void;
   onFilenamePatternChange?: (value: string) => void;

@@ -21,7 +21,7 @@ import type {
   AIYieldCallback,
   PendingAIRequest,
 } from './types';
-import type { WorkflowGraph, WorkflowInputs, LogEntry, Flow, ProjectSettings, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse, DatabaseRequest, DatabaseResult } from '../types';
+import type { WorkflowGraph, WorkflowInputs, LogEntry, Flow, ProjectSettings, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse, DatabaseRequest, DatabaseResult, NodeStatus } from '../types';
 import { createRuntime, OAIYRuntime } from '../runtime';
 import type { UntrustedWorkerFactory } from '../untrusted-executor';
 import type { ScriptExecutor } from '../script-executor';
@@ -370,7 +370,7 @@ export class JobManager {
     // Add log entry
     this.addJobLog(job.id, {
       source: 'System',
-      message: 'Aborting workflow...',
+      message: 'Stopping the flow…',
       type: 'info',
     });
 
@@ -381,7 +381,7 @@ export class JobManager {
       if (this.activeJobs.has(job.id)) {
         this.addJobLog(job.id, {
           source: 'System',
-          message: 'Abort is taking longer than expected. The workflow may be stuck in a long-running operation.',
+          message: 'Stopping is taking longer than expected: a step may be waiting on something slow.',
           type: 'error',
         });
       }
@@ -850,13 +850,13 @@ export class JobManager {
         metrics.increment('jobsAborted');
         this.addJobLog(job.id, {
           source: 'System',
-          message: 'Workflow stopped by user',
+          message: 'The flow was stopped',
           type: 'info',
         });
       } else {
         job.status = 'failed';
         // Said once: an error wrapped on its way up says "Error: " for each wrapping, and one the runtime has just
-        // logged ("Workflow Error: …", its last line) is not logged again. The job's error is the message itself
+        // logged ("The flow failed: …", its last line) is not logged again. The job's error is the message itself
         // too: it is what a run's caller is told (the desktop's run record said "Error: Error: Subflow not found").
         const said = errorStr.replace(/^(Error:\s*)+/, '');
         job.error = said || errorStr;
@@ -1033,7 +1033,11 @@ export class JobManager {
   /**
    * Notify node status subscribers
    */
-  private notifyNodeStatus(jobId: string, nodeId: string, status: 'running' | 'completed' | 'error'): void {
+  private notifyNodeStatus(jobId: string, nodeId: string, status: NodeStatus): void {
+    if (status === 'error') {
+      const job = this.activeJobs.get(jobId)?.job;
+      if (job && !job.failedNodeId) job.failedNodeId = nodeId;
+    }
     for (const callback of this.nodeStatusSubscribers) {
       try {
         callback(jobId, nodeId, status);

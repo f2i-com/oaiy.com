@@ -140,6 +140,49 @@ cases in `cli/test/flow-nodes.ts`), likewise:
 - `oaiy-core/src/zipp-executor.ts` and `oaiy-core/src/untrusted-executor.ts`:
   `__system.finish_part`, as above.
 
+From a hands-on review of the flow editor (2026-10-19; cases in
+`ui/tests/flow-editor-review.mjs`), likewise:
+
+- `oaiy-core/src/node-errors.ts` (new): a step's own failure names its node in
+  the message (`nodeErrorPrefix`, `[oaiy-node:<id>] `; an error leaves a flow's
+  script as text, whatever engine runs it), and a node that does not compile is
+  a `CompilationError` with its id (`nodeCompileError`). Its own file:
+  `oaiy-core/src/errors` is also a folder, which a bundler may take it for.
+- `oaiy-core/src/compiler.ts`: a module's `CompilationError` with a node id
+  (a Logic Block whose code does not parse) is passed on as it is, not wrapped
+  in "Node … failed to compile in module compiler …". A loop's item previews,
+  history lengths, stop-condition checks and results preview are
+  `console.debug` (out of the run's log: a results preview was a picture's
+  base64).
+- `oaiy-core/src/runtime.ts`: `runWorkflow` marks the node a compile error or a
+  marked error names (`onNodeStatus(id, 'error')`) and takes the mark (and
+  ZIPP's " (in <script>)") off the message; its lines say "--- The flow
+  started ---", "--- The flow finished ---" and "The flow failed: …"; a
+  module's `error` status once the run's signal has fired is `stopped`;
+  "Registered module …" is `runtimeLogger.debug`.
+- `oaiy-core/src/types.ts` (`NodeStatus`, with `stopped`; exported from
+  `index.ts`), `oaiy-core/src/module-types.ts`, `oaiy-core/src/queue/types.ts`:
+  a node's run status may be `stopped`; a job keeps `failedNodeId`, the first
+  node marked failed (a canvas that hears of a job after it failed still marks
+  it). `oaiy-core/src/queue/JobManager.ts` sets it, and says "Stopping the
+  flow…" and "The flow was stopped".
+- `oaiy-ui-components/src/components/CollapsibleNodeWrapper.tsx`: a `stopped`
+  status (grey, dashed); what the host says of a node (`useNodeNoticeDetail`)
+  is on every card: a warning mark in its header, its short form on the folded
+  card, the whole of it on the expanded one.
+- `oaiy-ui-components/src/hooks/useNodeNotice.ts`: a notice may come with a
+  short form (`{ text, short }`); `useNodeNoticeDetail`, `getNodeNoticeDetail`.
+- `oaiy-ui-components/src/registry/serviceNames.ts` (new):
+  `registerServiceDescriber` / `describeServiceId`, the host's words for a
+  service id. `nodes/GenericNode.tsx` (the card's summary, "minicpm-v on
+  Studio PC", "the default language model") and `nodes/fields/SelectField.tsx`
+  (a stored value not listed) use it; GenericNode's notice box moved to the
+  wrapper.
+- `oaiy-ui-components/src/hooks/useDynamicOptions.ts`: no Tauri event listener
+  is asked of the web build's stand-in (`__TAURI_INTERNALS__.__oaiyShim`), which
+  warned in the console on every page with a dropdown.
+- `oaiy-ui-components/src/index.ts`: exports the above.
+
 ## Re-syncing from upstream (optional)
 
 If you ever want to pull newer upstream source, re-copy `src/` from the

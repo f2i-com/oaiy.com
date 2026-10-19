@@ -252,12 +252,15 @@ const CoreVideoCompiler: ModuleCompiler = {
   let ${outputVar}_video = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
       }
-      const apiFormat = String(data.apiFormat || preset?.apiFormat || 'comfyui');
+      // A service picked on the node is what it runs on: its own Backend and Endpoint show only while Service is blank,
+      // and are read only then (as on Image Gen).
+      const own: Record<string, unknown> = String(data.service ?? '').trim() === '' ? data : { ...data, endpoint: undefined, apiFormat: undefined };
+      const apiFormat = String(own.apiFormat || preset?.apiFormat || 'comfyui');
 
       // Wan2GP backend - simpler path, no ComfyUI workflow needed
       if (apiFormat === 'wan2gp') {
         // For Wan2GP, use endpoint only if it looks like a Wan2GP URL (not a stale ComfyUI URL)
-        const rawEndpoint = String(data.endpoint || preset?.endpoint || '');
+        const rawEndpoint = String(own.endpoint || preset?.endpoint || '');
         const isComfyEndpoint = rawEndpoint.includes(':8188') || rawEndpoint === projectSettings?.defaultVideoEndpoint;
         const endpoint = escapeString(isComfyEndpoint ? '' : rawEndpoint);
         const wan2gpModel = escapeString(String(data.wan2gpModel || 'ltx2_22B_distilled'));
@@ -313,7 +316,7 @@ const CoreVideoCompiler: ModuleCompiler = {
 
       // For ComfyUI, fall back to service preset, then defaultVideoEndpoint project setting
       const endpoint = escapeString(String(
-        data.endpoint || preset?.endpoint || projectSettings?.defaultVideoEndpoint || ''
+        own.endpoint || preset?.endpoint || projectSettings?.defaultVideoEndpoint || ''
       ));
 
       // ComfyUI workflow configuration

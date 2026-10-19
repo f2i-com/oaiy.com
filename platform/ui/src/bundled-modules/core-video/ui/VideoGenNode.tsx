@@ -53,7 +53,7 @@ interface VideoGenNodeData {
     comfyFrameRateNodeId?: string;
     comfyFrameRate?: number;
 
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
 
     onEndpointChange?: (value: string) => void;

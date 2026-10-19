@@ -4,7 +4,7 @@ import type { NodeDefinition, HandleDefinition } from 'oaiy-core';
 import { BUNDLED_MODULES, getModuleLoader } from 'oaiy-core';
 import CollapsibleNodeWrapper, { type HandleConfig } from '../components/CollapsibleNodeWrapper';
 import { PropertyField, shouldShowProperty } from './fields/PropertyField';
-import { useNodeNotice } from '../hooks/useNodeNotice';
+import { describeServiceId } from '../registry/serviceNames';
 
 // Icon components map - we use simple SVG icons to avoid lucide-react dependency
 const defaultIconSvg = (
@@ -96,7 +96,7 @@ function getColorName(color: string | undefined): NodeColor {
 
 /** What one model of each of the engine's kinds is called (the desktop's words for them, ai/engine_services.rs). */
 const ENGINE_NOUNS: Record<string, string> = {
-  image: 'picture model', video: 'video model', speech: 'speech model', music: 'music model', sound: 'sound-effect model',
+  llm: 'language model', image: 'picture model', video: 'video model', speech: 'speech model', music: 'music model', sound: 'sound-effect model',
   model3d: '3D model', background: 'background-removal model', upscale: 'upscaler',
 };
 
@@ -108,7 +108,9 @@ function summaryOf(data: Record<string, unknown>): string {
   const worker = /^engine:[a-z0-9]+:node\.[A-Za-z0-9]+\/(.+)$/.exec(service);
   // (`engine:<kind>`: whichever model of that kind is the engine's default when the flow runs, as its picker says)
   const kind = /^engine:([a-z0-9]+)$/.exec(service)?.[1];
-  if (service === 'engine:llm') parts.push('the chosen language model');
+  // The host's words for it first ("minicpm-v on Studio PC", from the lists it has), else the id's own.
+  const described = service ? describeServiceId(service) : null;
+  if (described) parts.push(described);
   else if (kind) parts.push(`the default ${ENGINE_NOUNS[kind] ?? `${kind} model`}`);
   // (a paired worker's model by its name, not its node id: engine:<kind>:node.<id>/<model>)
   else if (worker) parts.push(`${worker[1]} on a paired computer`);
@@ -152,9 +154,6 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
     return undefined;
   }, [data.__definition, nodeType]);
 
-  // What the host says about this node (e.g. the service it uses is not
-  // installed). Asked before any early return so the hook order is fixed.
-  const notice = useNodeNotice(nodeType, data);
 
   // If no definition, render a placeholder
   if (!definition) {
@@ -246,14 +245,8 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
       collapsedPreview={summaryOf(data) || undefined}
     >
       <div className="flex flex-col gap-3">
-        {notice && (
-          <div
-            role="status"
-            className="rounded border border-amber-500/60 bg-amber-50 dark:bg-amber-900/30 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:text-amber-100"
-          >
-            {notice}
-          </div>
-        )}
+        {/* (what the host says of the node, a model offline or not installed, is the wrapper's: on the card folded
+            or not) */}
 
         {/* Preview Image */}
         {definition.ui?.showPreview && data.previewImageUrl && (

@@ -20,7 +20,7 @@ interface SubflowNodeData {
   flowName?: string;
   inputMappings?: InputMapping[]; // Array of input handle -> target node mappings
   inputCount?: number; // Number of input handles (default 1)
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   // Callbacks from parent
   onFlowSelect?: (flowId: string) => void;

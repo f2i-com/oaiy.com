@@ -63,7 +63,7 @@ export interface ShellNavItem {
 }
 
 const SECTIONS: Array<{ id: EditorSection; label: string; icon: LucideIcon; hint: string }> = [
-  { id: 'workflows', label: 'Workflows', icon: Workflow, hint: 'Your flows, on the canvas' },
+  { id: 'workflows', label: 'Flows', icon: Workflow, hint: 'Your flows, on the canvas' },
   { id: 'data', label: 'Data', icon: Database, hint: "What the open flow's Database nodes stored" },
   { id: 'queue', label: 'Queue', icon: ListChecks, hint: 'Flows running in this editor, and their results this session' },
   { id: 'packages', label: 'Packages', icon: Package, hint: 'Flow packages (.oaiy): flows, macros and nodes to load' },

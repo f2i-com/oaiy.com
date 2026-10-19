@@ -21,7 +21,8 @@
  *
  * Readers of the list:
  *   - the `service:list` dynamic-options resolver (main.tsx) → every node's
- *     Service dropdown, grouped "OAIY engine" / "Your services" / "Custom";
+ *     Service dropdown, grouped "This computer" (and each paired computer) /
+ *     "OAIY Services" / "Your services" (lib/serviceOptions.ts);
  *   - the palette (hooks/useModuleNodes.tsx + lib/nodeAvailability.ts): in
  *     OAIY's window a media node is shown only when something installed can
  *     run it, and each service is a draggable entry;
@@ -138,7 +139,8 @@ function companionHost(origin: string | undefined): string {
 /**
  * Map one desktop service to a `CustomService`. Running and stopped ones are
  * surfaced (a stopped one auto-starts when a flow using it runs); one that is
- * not installed is not (null). The status is folded into the label.
+ * not installed is not (null). Its name is its own: whether it is running now is not
+ * folded into it (a node kept "(running)" in its name after the service stopped).
  *
  * LLM-category services are assumed OpenAI-compatible on
  * `/v1/chat/completions`. We deliberately leave `bodyTemplate` EMPTY so the
@@ -155,7 +157,6 @@ export function mapToCustomService(s: DesktopServiceSnapshot, origin?: string): 
   const base = `http://${companionHost(origin)}:${port}`;
   const id = `companion:${s.id}`;
   const running = s.status === 'running';
-  const statusTag = running ? 'running' : s.status;
   // Keep the node/palette description to a tidy one-liner — a template's
   // description can be a long paragraph, which overflows the node body.
   const rawDesc = (s.description || `Managed by the OAIY Desktop on port ${port}.`).trim();
@@ -178,7 +179,7 @@ export function mapToCustomService(s: DesktopServiceSnapshot, origin?: string): 
     if (node.apiFormat === 'openai') {
       return {
         ...common,
-        name: `${s.name} (${statusTag})`,
+        name: s.name,
         endpoint: `${base}${node.endpoint || '/v1/chat/completions'}`,
         method: (node.method || 'POST') as CustomService['method'],
         bodyTemplate: node.bodyTemplate ?? '',
@@ -192,7 +193,7 @@ export function mapToCustomService(s: DesktopServiceSnapshot, origin?: string): 
     }
     return {
       ...common,
-      name: `${s.name} (${statusTag})`,
+      name: s.name,
       endpoint: node.endpoint ? `${base}${node.endpoint}` : base,
       method: (node.method || 'POST') as CustomService['method'],
       bodyTemplate: node.bodyTemplate ?? '{{inputRaw}}',
@@ -210,7 +211,7 @@ export function mapToCustomService(s: DesktopServiceSnapshot, origin?: string): 
   if (cat === 'llm') {
     return {
       ...common,
-      name: `${s.name} (${statusTag})`,
+      name: s.name,
       endpoint: `${base}/v1/chat/completions`,
       method: 'POST',
       // Empty → AI node uses the standard OpenAI body, not custom-template.
@@ -232,7 +233,7 @@ export function mapToCustomService(s: DesktopServiceSnapshot, origin?: string): 
   if (isVideo || cat === 'image generation') {
     return {
       ...common,
-      name: `${s.name} (${statusTag})`,
+      name: s.name,
       endpoint: `${base}/generate`,
       method: 'POST',
       bodyTemplate: '{"prompt": {{input}}}',
@@ -243,15 +244,18 @@ export function mapToCustomService(s: DesktopServiceSnapshot, origin?: string): 
     };
   }
 
+  // 3. Nothing says how to call it: the node's input posted as it is to its port, a guess (`noContract`), not offered in
+  // the palette. OAIY Voice is one: its speech is Text to Speech's and Speech to Text's, which call it the way it takes.
   return {
     ...common,
-    name: `${s.name} (${statusTag})`,
+    name: s.name,
     endpoint: base,
     method: 'POST',
     bodyTemplate: '{{inputRaw}}',
     responsePath: '',
     icon: '🧩',
     nodeTypes: ['service_call'],
+    noContract: true,
     installHint: `Managed by the OAIY Desktop (port ${port}).`,
   };
 }

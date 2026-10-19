@@ -25,6 +25,7 @@ import {
   type CustomService,
 } from '../../../utils/serviceRegistry';
 import EngineEndpointCard from './EngineEndpointCard';
+import { inOaiyWindow } from '../../../lib/oaiyWindow';
 import { useToast } from '../../Toast';
 import { useConfirmDialog } from '../../../hooks/useConfirmDialog';
 import Dialog from '../../ui/Dialog';
@@ -268,6 +269,11 @@ export default function ServicesTab({ isOpen }: ServicesTabProps) {
   // Services are purely user-created now; the bundled examples no longer
   // surface (the form's templates carry their preconfigured defaults).
   const mine = services.filter((s) => !s.isBuiltIn);
+  // Where they are kept, in the person's words: in OAIY's window they are the editor's, and a flow that uses one takes
+  // it to OAIY with it (hooks/useDesktopFlows.ts); in a browser, this browser's.
+  const keptWhere = inOaiyWindow()
+    ? 'They are kept in this window, and a flow that uses one takes it to OAIY with it.'
+    : 'They are kept in this browser.';
 
   return (
     <>
@@ -300,15 +306,13 @@ export default function ServicesTab({ isOpen }: ServicesTabProps) {
             </p>
             <EmptyState icon={<Server size={24} />} title="No services yet">
               Add one: its form starts from a template for Ollama, OpenAI, ComfyUI, Whisper and others,
-              with the body and response path filled in. They are kept in this browser
-              (<code className="oaiy-code">oaiy.customServices</code>).
+              with the body and response path filled in. {keptWhere}
             </EmptyState>
           </>
         ) : (
           <>
             <p className="oaiy-card-text border-b border-edge-secondary px-4 py-3">
-              HTTP endpoints your nodes call, kept in this browser
-              (<code className="oaiy-code">oaiy.customServices</code>). Each offers the pins it declares
+              HTTP endpoints your nodes call. {keptWhere} Each offers the pins it declares
               on the Service Call node, and on the nodes it is tagged for.
             </p>
             <ul className="oaiy-rows m-0 list-none p-0">

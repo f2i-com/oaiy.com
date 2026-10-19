@@ -23,7 +23,7 @@ interface SpeechToTextNodeData {
     detectedLanguage?: string;
     duration?: number;
     // Node state
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     // Generic onChange handler (used by OAIYBuilder)

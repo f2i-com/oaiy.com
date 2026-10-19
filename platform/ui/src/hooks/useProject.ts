@@ -21,6 +21,7 @@ import {
   revertMacroOverride,
 } from '../utils/userMacroStorage';
 import { createLogger } from '../utils/logger';
+import { withoutProviderSeeds } from '../utils/NodeDefaults';
 import { forgetDesktopSync, markDeletedHere, projectWritten, useDesktopFlows } from './useDesktopFlows';
 
 const logger = createLogger('Project');
@@ -129,8 +130,10 @@ const loadProjectFromStorage = (): OAIYProject | null => {
         return {
           ...createEmptyProject(),
           ...parsed,
-          // flows from localStorage are user flows only (built-in macros load from disk)
-          flows: parsed.flows,
+          // flows from localStorage are user flows only (built-in macros load from disk); an AI LLM node saved with
+          // Ollama's defaults under its service has them left out (utils/NodeDefaults.ts), and in OAIY's window the
+          // flow goes to the desktop without them
+          flows: (parsed.flows as Flow[]).map((f) => (f?.graph && Array.isArray(f.graph.nodes) ? { ...f, graph: { ...f.graph, nodes: withoutProviderSeeds(f.graph.nodes) } } : f)),
           // Use merged constants to include new defaults
           constants: mergedConstants,
         };
@@ -676,7 +679,7 @@ export function useProject() {
 
     return {
       success: true,
-      message: `Macro saved with ${inputs.length} input(s) and ${outputs.length} output(s)`,
+      message: `Macro saved with ${inputs.length} input${inputs.length === 1 ? '' : 's'} and ${outputs.length} output${outputs.length === 1 ? '' : 's'}`,
     };
   }, [project.flows]);
 

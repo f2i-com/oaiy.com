@@ -15,7 +15,7 @@ interface VideoFrameExtractorNodeData {
   batchSize?: number;  // 0 = extract all at once, >0 = extract in batches
   _videoName?: string;
   _frameCount?: number;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onIntervalSecondsChange?: (value: number) => void;
   onStartTimeChange?: (value: number) => void;

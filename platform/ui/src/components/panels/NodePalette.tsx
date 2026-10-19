@@ -34,6 +34,10 @@ interface NodePaletteProps {
   // Package node support
   activePackageId?: string | null;
   packageNodes?: PackageNodeInfo[];
+  /** Settings → Services, to add a service (the Services category says where AI nodes come from). */
+  onAddService?: () => void;
+  /** The welcome wizard, which sets up a first service. */
+  onOpenWizard?: () => void;
 }
 
 // Global drag state for cross-component communication
@@ -55,7 +59,7 @@ export function clearGlobalDragState() {
   globalDragState = { isDragging: false, nodeType: null, macroData: null };
 }
 
-function NodePalette({ onAddNode, onAddNodeAtPosition, onClose, closeOnAdd = false, macros, onAddMacro, onAddMacroAtPosition, activePackageId, packageNodes }: NodePaletteProps) {
+function NodePalette({ onAddNode, onAddNodeAtPosition, onClose, closeOnAdd = false, macros, onAddMacro, onAddMacroAtPosition, activePackageId, packageNodes, onAddService, onOpenWizard }: NodePaletteProps) {
   const { groupedNodes, isLoading, error, nodes } = useModuleNodes({
     activePackageId,
     packageNodes,
@@ -501,6 +505,31 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, onClose, closeOnAdd = fal
           filteredGroupedNodes.map((group) => {
             const isExpanded = expandedCategories.has(group.category);
             const isPackageCategory = group.category === 'Package' || group.nodes.some(n => n.isPackageNode);
+            // The Services category with nothing in it yet: where AI nodes come from, and the way to get some. With
+            // services in it, the same way to add another, after them.
+            const servicesHint = (isExpanded || group.nodes.length === 0) && group.category === 'AI' && (onAddService || onOpenWizard) ? (
+              <div className={`oaiy-palette-hint${group.nodes.length ? ' after' : ''}`}>
+                {group.nodes.length === 0 && (
+                  <p>
+                    <strong>Add an AI service to get AI nodes</strong>
+                    A service is a model or an engine your nodes call: one on this computer (Ollama, ComfyUI) or one
+                    with a key.
+                  </p>
+                )}
+                <div>
+                  {onAddService && (
+                    <button type="button" className="btn btn-secondary btn-sm" onClick={onAddService}>
+                      {group.nodes.length ? 'Add another service' : 'Add a service'}
+                    </button>
+                  )}
+                  {onOpenWizard && group.nodes.length === 0 && (
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={onOpenWizard}>
+                      Set one up step by step
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : null;
             return (
               <div key={group.category} className={`oaiy-cat${isPackageCategory ? ' pkg' : ''}`}>
                 <button
@@ -515,7 +544,8 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, onClose, closeOnAdd = fal
                   <small>{group.nodes.length}</small>
                 </button>
 
-                {isExpanded && (
+                {group.nodes.length === 0 && servicesHint}
+                {isExpanded && group.nodes.length > 0 && (
                   <ul>
                     {group.nodes.map((node) => {
                       const colors = getNodeColorClasses(node.definition.color);
@@ -559,6 +589,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, onClose, closeOnAdd = fal
                     })}
                   </ul>
                 )}
+                {group.nodes.length > 0 && servicesHint}
               </div>
             );
           })

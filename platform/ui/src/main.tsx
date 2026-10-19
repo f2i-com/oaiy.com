@@ -18,11 +18,12 @@ installConsoleBuffer();
 //   service:list                 — every registered service (Service Call uses this).
 //   service:list:<nodeType>      — only services tagged for the given node type;
 //                                  e.g. `service:list:ai_llm` for the AI LLM dropdown.
-import { invalidateDynamicOptions, registerDynamicOptionsResolver, registerNodeNoticeProvider } from 'oaiy-ui-components';
+import { invalidateDynamicOptions, registerDynamicOptionsResolver, registerNodeNoticeProvider, registerServiceDescriber } from 'oaiy-ui-components';
 import { subscribeCaps } from './lib/caps';
 import { serviceOptions } from './lib/serviceOptions';
-import { nodeNotice } from './lib/nodeAvailability';
+import { nodeNoticeDetail } from './lib/nodeAvailability';
 import { currentAvailabilityEnv } from './lib/availabilityEnv';
+import { describeService } from './bundled-modules/core-service/contract';
 // Every Service dropdown: OAIY's engine models, the desktop's services (Python
 // rigs, ComfyUI …) and the user's own, grouped, with "Add a service…" last.
 registerDynamicOptionsResolver('service:list', (rest: string) =>
@@ -31,7 +32,12 @@ registerDynamicOptionsResolver('service:list', (rest: string) =>
   }),
 );
 // A node in a flow whose service is not installed says so on the node.
-registerNodeNoticeProvider((nodeType, data) => nodeNotice(nodeType, data, currentAvailabilityEnv()));
+registerNodeNoticeProvider((nodeType, data) => nodeNoticeDetail(nodeType, data, currentAvailabilityEnv()));
+// A service id in words on a card and in a Service field ("minicpm-v on Studio PC"), from the lists the editor has.
+registerServiceDescriber((id) => {
+  const env = currentAvailabilityEnv();
+  return describeService(id, [...env.desktop, ...env.custom]).text;
+});
 // What the editor can do here follows the link to OAIY Desktop (lib/caps.ts): the notices on nodes that need it are drawn again when it is made or forgotten.
 subscribeCaps(() => invalidateDynamicOptions());
 

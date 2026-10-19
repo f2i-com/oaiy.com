@@ -12,7 +12,7 @@ interface VideoAppendNodeData {
     outputPath?: string;
     filename?: string;
     format?: 'mp4' | 'webm';
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onFilenameChange?: (value: string) => void;

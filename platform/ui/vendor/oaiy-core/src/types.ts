@@ -121,9 +121,14 @@ export type LogCallback = (entry: Omit<LogEntry, 'id' | 'timestamp'>) => void;
 export type ImageCallback = (nodeId: string, imageUrl: string) => void;
 
 /**
+ * A node's state in a run: running, done, failed, or `stopped` (where the run was stopped: no failure of the node's).
+ */
+export type NodeStatus = 'running' | 'completed' | 'error' | 'stopped';
+
+/**
  * Callback type for node execution status updates
  */
-export type NodeStatusCallback = (nodeId: string, status: 'running' | 'completed' | 'error') => void;
+export type NodeStatusCallback = (nodeId: string, status: NodeStatus) => void;
 
 /**
  * Database operation types

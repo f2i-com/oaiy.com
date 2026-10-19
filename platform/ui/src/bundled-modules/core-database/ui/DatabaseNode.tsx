@@ -8,7 +8,7 @@ interface DatabaseNodeData {
   collection_name?: string;
   /** The card's own name for it before it wrote `collection_name` (kept in step). */
   collectionName?: string;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   showBodyProperties?: boolean;
   onCollectionNameChange?: (value: string) => void;

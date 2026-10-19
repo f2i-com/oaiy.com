@@ -59,7 +59,9 @@ export { hasSavedDesktopLink } from './src/lib/desktopLink.ts';
 export { forgetPageHost } from '@oaiy/shared/capabilities/host';
 export { withNewIds, rewriteFlowRefs } from './src/lib/flowIds.ts';
 export { reachesUntrusted } from './src/lib/flowIds.ts';
-export { UndoHistory, restoreOnto, canvasKey } from './src/lib/undoHistory.ts';`,
+export { UndoHistory, restoreOnto, canvasKey } from './src/lib/undoHistory.ts';
+export { carriesProviderSeeds, refusalText, saveStateOf } from './src/hooks/useDesktopFlows.ts';
+export { savedLabelOf } from './src/lib/savedLabel.ts';`,
     resolveDir: UI,
     loader: 'ts',
   },
@@ -308,7 +310,7 @@ check("in OAIY's window every feature of the desktop's is on: nothing that was t
   for (const id of ['phone', 'calendar', 'flowTools', 'control', 'setup', 'browserNodes', 'askAgent', 'inputFolder', 'packages', 'dock']) assert.ok(id in caps.features, `${id} is a feature the layer knows`);
 });
 
-check("the sections in OAIY's window are Workflows, Data, Queue and Packages, in that order, with the features given or not", () => {
+check("the sections in OAIY's window are Flows, Data, Queue and Packages, in that order, with the features given or not", () => {
   const noop = () => {};
   assert.deepEqual(ids(shellNavItems('workflows', noop)), SECTIONS, 'no features given: as before the editor knew where it was');
   assert.deepEqual(ids(shellNavItems('workflows', noop, {}, currentCaps().features)), SECTIONS, 'the features of this window');
@@ -435,6 +437,49 @@ check('undo goes back over adds, deletes, moves and wires, keeps what a run put 
   assert.equal(h.canRedo, false);
   // a picture dropped on a node is compared by its length and start, not whole
   assert.ok(M.canvasKey([node('p', 0, { fileContent: `data:image/png;base64,${'A'.repeat(100000)}` })], []).length < 400);
+});
+
+// From the flow editor's review (2026-10-19): an AI LLM node saved with Ollama's defaults under its service, and what
+// the header says while a flow is or is not on the desktop.
+const SEEDED = { provider: 'ollama', model: 'llama3.2', endpoint: 'http://localhost:11434/v1/chat/completions', requestFormat: 'openai' };
+
+check("a desktop flow's AI LLM nodes come without the Ollama fields they were given under their service, and say they had them", () => {
+  const doc = { name: 'Lighthouse', nodes: [
+    { id: 'llm', type: 'ai_llm', data: { service: 'engine:llm', ...SEEDED, systemPrompt: 'Be brief.' } },
+    { id: 'own', type: 'ai_llm', data: { service: '', ...SEEDED } },
+    { id: 'mine', type: 'ai_llm', data: { service: 'engine:llm', provider: 'lmstudio', model: 'my-model' } },
+  ], edges: [] };
+  const f = fromDoc('lighthouse', doc, '');
+  assert.deepEqual(f.graph.nodes[0].data, { service: 'engine:llm', systemPrompt: 'Be brief.' });
+  assert.deepEqual(f.graph.nodes[1].data, { service: '', ...SEEDED }, 'with no service they are the node\'s own');
+  assert.deepEqual(f.graph.nodes[2].data, { service: 'engine:llm', provider: 'lmstudio', model: 'my-model' }, 'what is not Ollama\'s default is kept');
+  assert.equal(M.carriesProviderSeeds(doc), true, 'sent back without them');
+  assert.equal(M.carriesProviderSeeds({ nodes: f.graph.nodes }), false);
+  assert.equal(M.carriesProviderSeeds({ name: 'none' }), false);
+});
+
+check('a save the desktop refused says its words, or that it did not take it: never its status', () => {
+  assert.equal(M.refusalText(500, { error: 'disk full' }), 'OAIY Desktop said: disk full');
+  assert.equal(M.refusalText(500, { error: { message: 'no room' } }), 'OAIY Desktop said: no room');
+  assert.equal(M.refusalText(500, null), 'OAIY Desktop did not take it');
+  assert.equal(M.refusalText(403, { other: 1 }), 'OAIY Desktop did not take it');
+  assert.equal(M.refusalText(null, null), 'OAIY Desktop could not be reached');
+  assert.ok(!/\d{3}/.test(M.refusalText(503, {})));
+});
+
+check("the header says where the flow is from the save's result: Saving…, Not saved yet, Saved in OAIY", () => {
+  const f = flow({ graph: { nodes: [{ id: 'a', type: 'input_text', data: {} }], edges: [] } });
+  assert.equal(M.saveStateOf(f, flowKey(f), false), 'saved');
+  assert.equal(M.saveStateOf(f, undefined, false), 'saving', 'changed here, not sent yet');
+  assert.equal(M.saveStateOf(f, 'older', true), 'not-saved', 'the desktop did not take it');
+  assert.equal(M.saveStateOf(f, flowKey(f), true), 'saved', 'it has it now');
+  const label = (o) => M.savedLabelOf({ inOaiy: true, shared: true, storage: 'saved', desktop: 'saved', ...o });
+  assert.deepEqual(label({}), { label: 'Saved in OAIY', problem: false });
+  assert.deepEqual(label({ desktop: 'saving' }), { label: 'Saving…', problem: false });
+  assert.deepEqual(label({ desktop: 'not-saved' }), { label: 'Not saved yet', problem: true });
+  assert.deepEqual(label({ storage: 'not-saved', desktop: 'saved' }), { label: 'Not saved: storage full', problem: true });
+  assert.deepEqual(label({ shared: false, desktop: 'not-saved' }), { label: 'Saved in this window', problem: false }, 'one kept in the window is not the desktop\'s');
+  assert.deepEqual(label({ inOaiy: false }), { label: 'Saved in this browser', problem: false });
 });
 
 console.log(`\n${pass} passed, ${failures.length} failed`);

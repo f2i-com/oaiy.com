@@ -8,7 +8,7 @@ interface MemoryNodeData {
   /** The card's own word for it before it set `operation` (kept in step for flows that have it). */
   mode?: 'read' | 'write';
   key?: string;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onModeChange?: (value: 'read' | 'write') => void;
   onKeyChange?: (value: string) => void;

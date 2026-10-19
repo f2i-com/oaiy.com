@@ -77,6 +77,7 @@ export type {
   StreamCallback,
   LogCallback,
   ImageCallback,
+  NodeStatus,
   NodeStatusCallback,
   WorkflowInputs,
   DatabaseCallback,

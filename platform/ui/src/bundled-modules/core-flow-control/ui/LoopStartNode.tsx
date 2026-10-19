@@ -9,7 +9,7 @@ interface LoopStartNodeData {
   iterations?: number;
   loopMode?: LoopMode;
   loopName?: string;
-  _status?: 'running' | 'completed' | 'error';
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onIterationsChange?: (value: number) => void;
   onLoopModeChange?: (value: string) => void;

@@ -272,16 +272,17 @@ const CoreFlowControlCompiler: ModuleCompiler = {
   }
   workflow_context["__output__"].push(${outputVar});
   workflow_context["__output_type__"] = "${outputType}";
-  console.log("[Output] (${label}): accumulated " + workflow_context["__output__"].length + " results");`;
+  console.debug("[Output] (${label}): accumulated " + workflow_context["__output__"].length + " results");`;
         } else {
-          // Outside loop: normal assignment
+          // Outside loop: normal assignment. (What it got, for a developer: `console.debug`, left out of the run's log,
+          // where "string length 239422" said nothing to the person.)
           code += `
   // Workflow output: ${label}
   ${letOrAssign}${outputVar} = ${valueExpr};
   workflow_context["${node.id}"] = ${outputVar};
   workflow_context["__output__"] = ${outputVar};
   workflow_context["__output_type__"] = "${outputType}";
-  console.log("[Output] (${label}): " + (typeof ${outputVar} === 'string' ? "string length " + ${outputVar}.length : "type " + typeof ${outputVar}));`;
+  console.debug("[Output] (${label}): " + (typeof ${outputVar} === 'string' ? "string length " + ${outputVar}.length : "type " + typeof ${outputVar}));`;
         }
         break;
       }
@@ -348,7 +349,7 @@ const CoreFlowControlCompiler: ModuleCompiler = {
     console.log("[MacroInput] (${inputName}) DEBUG: using default value: ${defaultValue}");` : ''}
     ${outputVar} = "${defaultValue}" || null;
   }
-  console.log("[MacroInput] (${inputName}): " + (typeof ${outputVar} === 'string' ? ${outputVar}.substring(0, 100) : typeof ${outputVar}));
+  console.debug("[MacroInput] (${inputName}): " + (typeof ${outputVar} === 'string' ? ${outputVar}.substring(0, 100) : typeof ${outputVar}));
   workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }
@@ -366,7 +367,7 @@ const CoreFlowControlCompiler: ModuleCompiler = {
     workflow_context["__macro_outputs__"] = {};
   }
   workflow_context["__macro_outputs__"]["${outputName}"] = ${outputVar};
-  console.log("[MacroOutput] (${outputName}): " + (typeof ${outputVar} === 'string' ? ${outputVar}.substring(0, 100) : typeof ${outputVar}));
+  console.debug("[MacroOutput] (${outputName}): " + (typeof ${outputVar} === 'string' ? ${outputVar}.substring(0, 100) : typeof ${outputVar}));
   workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }
@@ -402,8 +403,8 @@ const CoreFlowControlCompiler: ModuleCompiler = {
   // DEBUG: Macro inputs mapping: ${inputDebug.join(', ')}
   // DEBUG: Available inputs map keys: ${Array.from(inputs.keys()).join(', ') || 'NONE'}` : ''}
   let _macro_input_${sanitizedId} = ${inputObj};
-  console.log("[Macro] (${node.id}) Executing macro with inputs: " + JSON.stringify(_macro_input_${sanitizedId}).substring(0, 500));
-  ${letOrAssign}${outputVar} = await Subflow.executeMacro("${macroWorkflowId}", _macro_input_${sanitizedId}, "${node.id}");
+  console.debug("[Macro] (${node.id}) Executing macro with inputs: " + JSON.stringify(_macro_input_${sanitizedId}).substring(0, 500));
+  ${letOrAssign}${outputVar} = await Subflow.executeMacro("${macroWorkflowId}", _macro_input_${sanitizedId}, "${node.id}", "${macroName}");
   if (${outputVar} === "__ABORT__") {
     console.log("[Workflow] aborted");
     return workflow_context;

@@ -11,7 +11,7 @@ interface VideoSaveNodeData {
     format?: 'mp4' | 'webm';
     path?: string;
     outputValue?: string; // Result path from workflow execution
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onFilenameChange?: (value: string) => void;

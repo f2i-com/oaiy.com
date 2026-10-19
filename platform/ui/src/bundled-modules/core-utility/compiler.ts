@@ -6,15 +6,26 @@
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
 import { parse as acornParse } from 'acorn';
+import { nodeCompileError, nodeErrorPrefix } from 'oaiy-core/src/node-errors';
 
 /** What a logic block's source is shaped like, read from its syntax tree. */
 interface BlockShape {
+  ok: true;
   /** A `return` at the block's own level - not one inside a nested function. */
   topLevelReturn: boolean;
   /** The block's final statement, when it is a bare expression. */
   tail: { start: number; end: number; exprStart: number; exprEnd: number } | null;
+  /** The block is that one expression and nothing else. */
+  single: boolean;
   /** The block's own `return`s (none inside a nested function), each with its value's span when it has one. */
   returns: Array<{ start: number; end: number; argStart: number | null; argEnd: number | null }>;
+}
+
+/** A block whose source does not parse: where, and what the parser said (without its position). */
+interface BlockSyntaxError {
+  ok: false;
+  line: number;
+  message: string;
 }
 
 /**
@@ -29,11 +40,11 @@ interface BlockShape {
  * the editor's default snippet (`let result = $input;` then `result`) produced
  * null.
  *
- * `null` when the source does not parse; the caller keeps the old text-based
- * guesses so a block that never compiled still fails the way it used to
- * rather than in a new way.
+ * A source that does not parse is a syntax error with its line: the block
+ * fails to compile saying so, rather than as the whole flow's script (it used
+ * to be guessed at from the text and failed in ZIPP, naming no block).
  */
-function analyseBlock(src: string): BlockShape | null {
+function analyseBlock(src: string): BlockShape | BlockSyntaxError {
   let ast: { body: Array<Record<string, unknown>> };
   try {
     ast = acornParse(src, {
@@ -42,8 +53,10 @@ function analyseBlock(src: string): BlockShape | null {
       allowReturnOutsideFunction: true,
       allowAwaitOutsideFunction: true,
     }) as unknown as typeof ast;
-  } catch {
-    return null;
+  } catch (e) {
+    const loc = (e as { loc?: { line?: unknown } }).loc;
+    const said = e instanceof Error ? e.message.replace(/\s*\(\d+:\d+\)\s*$/, '') : String(e);
+    return { ok: false, line: typeof loc?.line === 'number' ? loc.line : 1, message: said };
   }
 
   // The block's own returns, by the same walk.
@@ -102,7 +115,7 @@ function analyseBlock(src: string): BlockShape | null {
         }
       : null;
 
-  return { topLevelReturn: hasReturn(ast.body), tail, returns };
+  return { ok: true, topLevelReturn: hasReturn(ast.body), tail, single: ast.body.length === 1 && tail !== null, returns };
 }
 
 /**
@@ -342,6 +355,8 @@ const CoreUtilityCompiler: ModuleCompiler = {
         // all this way, which read as empty greetings and unconfigured agents
         // rather than as an error anybody could see.
         let userCode = String(data.code || data.expr || data.script || 'input');
+        // (the lines trimmed off its start, for the line a syntax error is on in the code as the person wrote it)
+        const linesBefore = (/^\s*/.exec(userCode)?.[0].match(/\n/g) ?? []).length;
         userCode = userCode.trim();
 
         // Inlining user code is `code:execute`-equivalent — it runs arbitrary
@@ -417,10 +432,17 @@ const CoreUtilityCompiler: ModuleCompiler = {
         };
 
         const shape = analyseBlock(userCode);
+        // Who the block is, in a message: its name on the canvas where it has one.
+        const label = typeof data.label === 'string' && data.label.trim() ? data.label.trim() : '';
+        const who = label ? `Logic Block '${label}'` : 'Logic Block';
+        // Code that does not parse fails here, saying so of this block and where, not as the whole script ZIPP
+        // could not compile ("Zipp failed to compile the workflow: SyntaxError: unexpected token Semi").
+        if (!shape.ok) {
+          throw nodeCompileError(`${who}: syntax error on line ${shape.line + linesBefore}: ${shape.message}`, node.id, node.type);
+        }
         // A `return` at the block's own level decides whether it runs as a
-        // function. From the syntax tree when the block parses; the old text
-        // guess otherwise.
-        const hasReturn = shape ? shape.topLevelReturn : /\breturn\b/.test(userCode);
+        // function, read from the syntax tree.
+        const hasReturn = shape.topLevelReturn;
         // Check if code uses await - if so, use async IIFE
         const hasAwait = /\bawait\b/.test(userCode);
         // The block's trailing expression IS its output - that is what the node
@@ -428,7 +450,7 @@ const CoreUtilityCompiler: ModuleCompiler = {
         // inline branches, a `return` for the function one) so the value
         // reaches the node instead of being evaluated and dropped.
         const captureTail = (prefix: string): string => {
-          const tail = shape?.tail;
+          const tail = shape.tail;
           if (!tail) return userCode;
           return (
             userCode.slice(0, tail.start) +
@@ -436,58 +458,26 @@ const CoreUtilityCompiler: ModuleCompiler = {
             userCode.slice(tail.end)
           );
         };
-        const asyncPrefix = hasAwait ? 'async ' : '';
-        const awaitPrefix = hasAwait ? 'await ' : '';
 
+        // What each way of running the block puts inside the block that declares its names: `[comment, code]`.
+        let how: [string, string];
         // A block that IS one expression is evaluated as one, whatever returns
         // it contains — they belong to the function inside it.
         if (isParenthesisedExpression(userCode) && !hasAwait) {
-          code += `
-  // Logic block: a single expression, taken at its value
-  ${letOrAssign}${outputVar} = null;
-  {${scopedNames()}
-    ${outputVar} = ${userCode.trim().replace(/;\s*$/, '')};
-  }
-  workflow_context["${node.id}"] = ${outputVar};`;
+          how = ['a single expression, taken at its value', `${outputVar} = ${userCode.trim().replace(/;\s*$/, '')};`];
         } else if (hasReturn && hasAwait) {
-          // Logic block with both return and await: inline the code using do/while(false) + break
+          // Logic block with both return and await: inline the code using a labelled block.
           // Can't use async IIFE because the runtime's await→yield replacement breaks nested functions.
-          // Transform "return X;" into "outputVar = (X); break;" for early-return support.
-          // Process line-by-line to skip comment lines (avoid transforming "return" inside comments).
           //
-          // KNOWN LIMIT, and the reason the no-await branch below does NOT do
-          // this: the rewrite cannot tell which function a `return` belongs to,
-          // so an AWAITING block that also declares a nested function still
-          // fails to compile with "Illegal break statement". Fixing it properly
-          // needs the await→yield transform to survive function boundaries;
-          // until then, awaiting blocks should keep their returns at the top
-          // level.
-          //
-          // When the block parses, each of its own returns is rewritten from the syntax tree instead, to
-          // `{ out = (X); break <label>; }` out of a labelled block: the line rewrite took `if (!x) return "a";`
-          // for a return of `"a"` and an unconditional break after it (the `if` then guarded the assignment
-          // alone), left a loop when a return was inside one, and cut a value at a `;` inside a string.
-          const label = `__lb_${sanitizedId}`;
-          const transformedCode = shape
-            ? rewriteBlock(userCode, shape, outputVar, label)
-            : captureTail(`${outputVar} = `).split('\n').map((ln: string) => {
-                if (ln.trimStart().startsWith('//')) return ln;
-                return ln
-                  .replace(/\breturn\s+([^;\n]+);?/g, `${outputVar} = ($1); break ${label};`)
-                  .replace(/\breturn\s*;?\s*$/, `break ${label};`);
-              }).join('\n');
-
-          // The output is declared OUTSIDE the block so the code inside can
-          // assign it and the rest of the script can read it.
-          code += `
-  // Logic block: inline with await + return (a labelled block left by its returns)
-  ${letOrAssign}${outputVar} = null;
-  {${scopedNames()}
-    ${label}: {
-    ${transformedCode}
-    }
-  }
-  workflow_context["${node.id}"] = ${outputVar};`;
+          // Each of the block's own returns is rewritten from the syntax tree, to `{ out = (X); break <label>; }` out
+          // of a labelled block: a line rewrite took `if (!x) return "a";` for a return of `"a"` and an unconditional
+          // break after it (the `if` then guarded the assignment alone), left a loop when a return was inside one,
+          // and cut a value at a `;` inside a string. (A return inside a nested function is that function's, and is
+          // left as it is.)
+          const blockLabel = `__lb_${sanitizedId}`;
+          how = ['inline with await + return (a labelled block left by its returns)', `${blockLabel}: {
+    ${rewriteBlock(userCode, shape, outputVar, blockLabel)}
+    }`];
         } else if (hasReturn) {
           // Logic block with return and no await: run it as a real FUNCTION, so
           // `return` is `return`.
@@ -504,63 +494,44 @@ const CoreUtilityCompiler: ModuleCompiler = {
           // A function needs no rewriting at all: early returns, nested
           // helpers and returns inside loops all behave as written. The names
           // the block is given stay in scope through the closure.
-          code += `
-  // Logic block: executed as a function so \`return\` means return
-  ${letOrAssign}${outputVar} = null;
-  {${scopedNames()}
-    ${outputVar} = (function () {
+          how = ['executed as a function so `return` means return', `${outputVar} = (function () {
 ${captureTail('return ')}
-    })();
-  }
-  workflow_context["${node.id}"] = ${outputVar};`;
+    })();`];
+        } else if (shape.single && !hasAwait) {
+          // One expression and nothing else (from the syntax tree: a one-line `throw new Error("no")` is a statement,
+          // and as `out = throw …` the whole flow did not compile), taken at its value.
+          how = ['inline JavaScript execution', `${outputVar} = (${userCode.slice(shape.tail!.exprStart, shape.tail!.exprEnd)});`];
         } else {
-          // No return statements - simple inline execution
-          // If it's a single expression, use it directly; otherwise wrap as expression
-          const isSingleExpression = !userCode.includes(';') && !userCode.includes('\n');
-
-          if (isSingleExpression && !hasAwait) {
-            // Simple expression - inline without IIFE (only if no await)
-            // Still need to evaluate inputs at the right point
-            code += `
-  // Logic block: inline JavaScript execution
-  ${letOrAssign}${outputVar} = null;
-  {${scopedNames()}
-    ${outputVar} = ${userCode};
-  }
-  workflow_context["${node.id}"] = ${outputVar};`;
-          } else if (hasAwait) {
-            // Multi-statement code with await but no return - inline directly
-            // Can't use async IIFE because the runtime's await→yield replacement breaks nested functions.
-            //
-            // The block's code sits in a block of its own, inside the one that
-            // declares its names: a declaration of one of those names in the
-            // code (`const picture = input2;`, written before the input had that
-            // name) shadows it instead of being "Identifier 'picture' has
-            // already been declared", which stopped the whole flow compiling.
-            code += `
-  // Logic block: multi-statement with await (inline)
-  ${letOrAssign}${outputVar} = null;
-  {${scopedNames()}
-    {
+          // Statements, with or without await, inline. (No async IIFE for await: the runtime's await→yield
+          // replacement breaks nested functions.)
+          //
+          // The block's code sits in a block of its own, inside the one that
+          // declares its names: a declaration of one of those names in the
+          // code (`const picture = input2;`, written before the input had that
+          // name) shadows it instead of being "Identifier 'picture' has
+          // already been declared", which stopped the whole flow compiling.
+          how = [hasAwait ? 'multi-statement with await (inline)' : 'multi-statement (no return, inline)', `{
     ${captureTail(`${outputVar} = `)};
-    }
-  }
-  workflow_context["${node.id}"] = ${outputVar};`;
-          } else {
-            // Multi-statement code without return or await - inline directly
-            // Avoids IIFE for cleaner generated output and to keep parameter passing simple.
-            // (in a block of its own, as above)
-            code += `
-  // Logic block: multi-statement (no return, inline)
-  ${letOrAssign}${outputVar} = null;
-  {${scopedNames()}
-    {
-    ${captureTail(`${outputVar} = `)};
-    }
-  }
-  workflow_context["${node.id}"] = ${outputVar};`;
-          }
+    }`];
         }
+
+        // What the block throws fails the run as this block's failure: its name and what went wrong, and its node
+        // marked (the runtime reads `nodeErrorPrefix`). A stop (`__ABORT__`) goes on as it is.
+        const caught = `__lb_error_${sanitizedId}`;
+        code += `
+  // Logic block: ${how[0]}
+  ${letOrAssign}${outputVar} = null;
+  try {
+  {${scopedNames()}
+    ${how[1]}
+  }
+  } catch (${caught}) {
+    if (${caught} && ${caught}.message === "__ABORT__") throw ${caught};
+    throw new Error("${escapeString(`${nodeErrorPrefix(node.id)}${who}: `)}" + (${caught} && typeof ${caught} === "object" && "message" in ${caught}
+      ? (${caught}.name && ${caught}.name !== "Error" ? ${caught}.name + ": " : "") + ${caught}.message
+      : String(${caught})));
+  }
+  workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }
 

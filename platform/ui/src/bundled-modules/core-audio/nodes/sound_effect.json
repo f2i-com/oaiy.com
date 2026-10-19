@@ -1,7 +1,7 @@
 {
     "id": "sound_effect",
     "name": "Sound Effect",
-    "description": "Make a sound effect (ambience, creatures, machines, actions) from a description, up to 30 seconds. Runs on OAIY's engine or a service you add; service engine:sound is the engine's.",
+    "description": "Make a sound effect (ambience, creatures, machines, actions) from a description, up to 30 seconds. Runs on OAIY's engine or a service you add.",
     "doc": "Describe the sound — what makes it, where, how it sounds — and get a clip of it.\n\n**Service** — `OAIY engine` uses the sound-effect model set up in OAIY's Engines (MOSS-SoundEffect, 48 kHz). You can also pick one of your own services (a Python rig in OAIY → Services, or a custom HTTP service): it is sent `{{prompt}}`, `{{seconds}}` and `{{seed}}` and should answer with the audio (a file, base64 or a URL).\n\n**Out** — `Audio` plays in the flow and goes to Save Audio, Audio Append or Audio Mixer; `Path` is the file.\n\nPrompt tips: name the source and the space (\"heavy rain on a tin roof, distant thunder\"), and how it moves (\"a door creaks open slowly, then slams\").",
     "icon": "volume-2",
     "color": "teal",

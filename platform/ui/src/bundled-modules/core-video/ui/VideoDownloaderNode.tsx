@@ -13,7 +13,7 @@ interface VideoDownloaderNodeData {
     duration?: number;
     width?: number;
     height?: number;
-    _status?: 'running' | 'completed' | 'error';
+    _status?: 'running' | 'completed' | 'error' | 'stopped';
     _collapsed?: boolean;
     showBodyProperties?: boolean;
     onChange?: (field: string, value: unknown) => void;

@@ -427,7 +427,7 @@ function ZippSandboxToggle() {
             storage, no way to start more workers. Flow code reaches the
             outside world only through the nodes you connect. It also stops a
             runaway loop or allocation by itself instead of tying up your
-            machine.
+            computer.
           </p>
           <p className="oaiy-help faint">
             On by default, for both your own flows and flows from installed

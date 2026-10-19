@@ -5,7 +5,7 @@
  * background workflow execution, configurable concurrency, and robust abort handling.
  */
 
-import type { WorkflowGraph, WorkflowInputs, LogEntry, ProjectSettings, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse, Flow } from '../types';
+import type { WorkflowGraph, WorkflowInputs, LogEntry, ProjectSettings, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse, Flow, NodeStatus } from '../types';
 
 /**
  * Pending AI request for Claude-as-AI pattern
@@ -107,6 +107,12 @@ export interface Job {
   result?: unknown;
   /** Error message if job failed */
   error?: string;
+  /**
+   * The node whose step failed, where the run knows it (the first node marked failed: a Logic Block's code throwing,
+   * a node that did not compile). Kept on the job for an editor that starts listening after the run has ended (a
+   * flow that fails as it compiles fails before a canvas has heard of its job).
+   */
+  failedNodeId?: string;
   /** Node outputs collected during execution */
   nodeOutputs?: Record<string, unknown>;
   /** Label of the currently executing node (for progress display) */
@@ -256,7 +262,7 @@ export type JobLogCallback = (jobId: string, log: LogEntry) => void;
 export type NodeStatusCallback = (
   jobId: string,
   nodeId: string,
-  status: 'running' | 'completed' | 'error'
+  status: NodeStatus
 ) => void;
 
 /**

@@ -1,7 +1,7 @@
 {
     "id": "speech_to_text",
     "name": "Speech to Text",
-    "description": "Transcribe audio or video to text: with OAIY Voice (service voice:transcribe), a service you add, or a WhisperX server at API URL (word timestamps, speakers).",
+    "description": "Write out what is said in a recording or a video: with OAIY Voice, a service you add, or a WhisperX server at an API URL (word timings, speakers).",
     "doc": "Transcribe speech from audio or video files using WhisperX.\n\nFeatures:\n• Word-level timestamps for precise subtitles\n• Speaker diarization (identify who's speaking)\n• Auto language detection or specify language\n• Segment time ranges for partial transcription\n\nOutputs:\n• Full Text - complete transcript as string\n• Segments - array with timestamps & speaker info\n• Language - detected language code\n• Duration - audio length in seconds\n\nRequires: WhisperX API server (default: localhost:8770)\nNote: Speaker diarization requires HuggingFace token.",
     "icon": "file-text",
     "color": "violet",
