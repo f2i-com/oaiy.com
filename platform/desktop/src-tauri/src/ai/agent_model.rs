@@ -320,7 +320,7 @@ async fn put_preferences(State(prefs): State<Prefs>, body: Option<Json<Value>>) 
     // (a worker's language model: one of a worker paired here, never a computer named at random)
     if let Some((node, _)) = choice.model.as_deref().filter(|_| choice.source == Source::Engine).and_then(worker_llm) {
         if crate::network::paired_worker(node).is_none() {
-            return bad(format!("node {node} is not a worker paired with this computer: pair it in Setup, Networking (OAIY Network)"));
+            return bad(format!("node {node} is not a computer this one uses: pair it in Setup → Networking (OAIY Network)"));
         }
     }
     let saving = prefs.store.clone();
@@ -675,7 +675,7 @@ mod tests {
         // A worker's language model is one of a worker paired here (none is, in this test): refused, saying so.
         let put = http.put(&url).json(&json!({ "model": { "source": "engine", "model": "engine:llm:node.abc123/qwen" } })).send().await.unwrap();
         assert_eq!(put.status(), 400);
-        assert!(put.text().await.unwrap().contains("not a worker paired with this computer"));
+        assert!(put.text().await.unwrap().contains("is not a computer this one uses"));
 
         for bad in [
             json!({ "model": { "source": "nope" } }),

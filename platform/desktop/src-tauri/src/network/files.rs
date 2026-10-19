@@ -54,10 +54,10 @@ fn sha_ok(s: &str) -> bool {
 /// Whether this computer lends its model files to `caller` (a computer paired to use it, its person sharing them).
 fn lends_files_to(net: &Network, caller: &Caller) -> Result<Peer, Response> {
     let Some(p) = primary_of(net, caller) else {
-        return Err(refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller"));
+        return Err(super::worker::not_paired(net));
     };
     if !net.settings().shares_models() {
-        return Err(refuse(StatusCode::FORBIDDEN, "not_shared", "this computer does not share its model files (Share model files is off there)"));
+        return Err(refuse(StatusCode::FORBIDDEN, "not_shared", format!("{} does not share its model files (Share its model files is off there)", net.display_name())));
     }
     Ok(p)
 }
@@ -92,7 +92,7 @@ pub(super) async fn have(State(net): State<Network>, Extension(caller): Extensio
     }
     let files: Vec<Wanted> = asked.files.into_iter().take(MAX_ASKED).filter(|f| sha_ok(&f.sha256)).map(|f| Wanted { sha256: f.sha256.to_ascii_lowercase(), size: f.size }).collect();
     let Some(found) = find(&net, &files, false).await else {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "engines_unavailable", "this computer's engines did not answer");
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "engines_unavailable", super::worker::said_here(&net, "this computer's engines did not answer"));
     };
     Json(json!({
         "files": files.iter().zip(found).map(|(f, at)| json!({ "sha256": f.sha256, "size": f.size, "have": at.is_some(), "checked": at.is_some_and(|(_, c)| c) })).collect::<Vec<_>>()

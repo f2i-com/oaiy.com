@@ -292,13 +292,14 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                     "flow": { "type": "object", "description": "The flow's whole new document." }
                 }), &["id", "flow"])),
             def("flow_run", "Run a flow", Change,
-                "Run a stored flow with an optional input (an object, each input by the name flows_list gives). By default waits for it (up to timeoutSeconds, 60) and answers its status and output, and the pictures its answer names as images; with wait false, answers the run at once. With node (OAIY Network), one of the flows that paired worker shares, run there by its own runner and models.",
+                "Run a stored flow with an optional input (an object, each input by the name flows_list gives). By default waits for it (up to timeoutSeconds, 60) and answers its status and output, and the pictures its answer names as images; with wait false, answers the run at once. With node (OAIY Network), one of the flows that paired computer shares, run there by its own runner and models; each such run has a key, and where this computer loses track of it (that computer stops answering for a while), the error gives the key: call flow_run again with the same node, id and key to follow that run rather than start another.",
                 object(json!({
                     "id": flow_id(),
                     "node": node_id(),
                     "input": { "description": "The flow's input." },
                     "wait": { "type": "boolean", "description": "Wait for the result (default true)." },
-                    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600, "description": "How long the run may take (default 60)." }
+                    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600, "description": "How long the run may take (default 60)." },
+                    "key": { "type": "string", "minLength": 1, "maxLength": 200, "description": "With node: the key a flow_run on that computer answered with its error, to follow the same run (never start another)." }
                 }), &["id"])),
             def("flow_delete", "Delete a flow", Remove,
                 "Delete a stored flow.",
@@ -717,7 +718,7 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
                     let model = v.pointer("/model/model").and_then(Value::as_str).unwrap_or("its model");
                     format!("{name} ({model})")
                 }
-                ("engine", Some(m)) => format!("{m} on {} (OAIY Network)", v.get("providerName").and_then(Value::as_str).unwrap_or("a paired worker")),
+                ("engine", Some(m)) => format!("{m} on {} (OAIY Network)", v.get("providerName").and_then(Value::as_str).unwrap_or("a paired computer")),
                 _ => "the engine (the model chosen in Engines)".to_string(),
             };
             done(format!("The Agent now runs on {on}."), v)
@@ -897,7 +898,7 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             d.put_json_body(&format!("/api/bridge/flows/{}", seg(id)), a.value("flow").cloned().unwrap_or_default()).await?;
             done(format!("Saved flow {id}."), json!({ "id": id }))
         }
-        "flow_run" => flow_run(d, a.req("id"), a.str("node"), a.value("input").cloned(), a.bool("wait").unwrap_or(true), a.int("timeoutSeconds").unwrap_or(60) as u64).await,
+        "flow_run" => flow_run(d, a.req("id"), a.str("node"), a.str("key"), a.value("input").cloned(), a.bool("wait").unwrap_or(true), a.int("timeoutSeconds").unwrap_or(60) as u64).await,
         "flow_delete" => {
             let id = a.req("id");
             d.delete(&format!("/api/bridge/flows/{}", seg(id))).await?;
@@ -2239,12 +2240,10 @@ async fn flow_create(d: &Desk, id: Option<&str>, flow: Value) -> Result<Done, St
 /// (`oaiy-agent`), so it is confined.
 pub(crate) const PAIRED_AGENT_PRODUCT: &str = "oaiy-paired-agent";
 
-async fn flow_run(d: &Desk, id: &str, node: Option<&str>, input: Option<Value>, wait: bool, timeout_s: u64) -> Result<Done, String> {
-    // (a paired worker's shared flow, run there: OAIY Network)
+async fn flow_run(d: &Desk, id: &str, node: Option<&str>, key: Option<&str>, input: Option<Value>, wait: bool, timeout_s: u64) -> Result<Done, String> {
+    // (a paired computer's shared flow, run there: OAIY Network)
     if let Some(node) = node {
-        let body = json!({ "input": input, "timeoutMs": timeout_s * 1000, "wait": wait });
-        let r = d.post_within(&format!("/api/network/nodes/{}/flows/{}/runs", seg(node), seg(id)), body, Duration::from_secs(timeout_s + 30)).await?;
-        return run_answer(d, id, &r).await;
+        return flow_run_on(d, id, node, key, input, wait, timeout_s).await;
     }
     if !flow_ids(d).await?.iter().any(|f| f == id) {
         return Err(format!("There is no flow {id:?}: flows_list shows them."));
@@ -2267,6 +2266,29 @@ async fn flow_run(d: &Desk, id: &str, node: Option<&str>, input: Option<Value>, 
     }
     let r = d.post_within("/api/bridge/runs", body, Duration::from_secs(timeout_s + 20)).await?;
     run_answer(d, id, &r).await
+}
+
+/// A paired computer's shared flow run there (OAIY Network), under a key: asked once more with it where that computer
+/// did not answer before a run was started, and the key given with any error, so asking again follows the same run
+/// (the computer keeps a run by its key) rather than running the flow twice.
+async fn flow_run_on(d: &Desk, id: &str, node: &str, key: Option<&str>, input: Option<Value>, wait: bool, timeout_s: u64) -> Result<Done, String> {
+    let key = key.map(str::trim).filter(|k| !k.is_empty() && k.len() <= 200).map(str::to_owned).unwrap_or_else(|| format!("agent-{}", uuid::Uuid::new_v4().simple()));
+    let path = format!("/api/network/nodes/{}/flows/{}/runs", seg(node), seg(id));
+    let body = json!({ "input": input, "timeoutMs": timeout_s * 1000, "wait": wait, "key": key }).to_string();
+    let wait_for = Duration::from_secs(timeout_s + 30);
+    let follow = |why: String| format!("{why} Call flow_run again with node {node}, id {id} and key \"{key}\" to follow that run rather than start another.");
+    let mut reply = d.send(Method::POST, &path, Some(body.clone()), wait_for).await.map_err(&follow)?;
+    // (that computer not answering before a run started there: asked once more, a moment later, with the same key)
+    if reply.status == StatusCode::SERVICE_UNAVAILABLE && reply.body.get("runId").is_none_or(Value::is_null) {
+        tokio::time::sleep(Duration::from_millis(if cfg!(test) { 50 } else { 2000 })).await;
+        reply = d.send(Method::POST, &path, Some(body), wait_for).await.map_err(&follow)?;
+    }
+    if !reply.status.is_success() {
+        let why = explain(&Method::POST, &path, &reply);
+        // (a run that never started, refused there as it was asked: the key would not help)
+        return Err(if reply.body.get("key").is_some() { follow(why) } else { why });
+    }
+    run_answer(d, id, &reply.body).await
 }
 
 /// A run's record as the Agent is told it: its status, output and error, and the pictures it names as images.
@@ -2452,5 +2474,55 @@ pub(crate) fn view_ok(view: &str) -> bool {
             crate::setup::valid_plugin_id(id) && !nav.is_empty() && nav.len() <= 64 && nav.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod flow_run_tests {
+    use super::*;
+
+    /// A fake desktop's route for a flow run on a paired computer: the keys it was asked with, and its answers in turn.
+    fn runs_route(answers: Vec<(StatusCode, Value)>) -> (axum::Router, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let answers = std::sync::Arc::new(std::sync::Mutex::new(answers.into_iter()));
+        let router = axum::Router::new().route(
+            "/api/network/nodes/:node/flows/:flow/runs",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let (seen, answers) = (seen.clone(), answers.clone());
+                async move {
+                    seen.lock().unwrap().push(body["key"].clone());
+                    let (status, answer) = answers.lock().unwrap().next().unwrap();
+                    (status, axum::Json(answer))
+                }
+            }),
+        );
+        (router, asked)
+    }
+
+    /// A run on another computer goes under a key: asked once more with it where that computer did not answer before
+    /// the run started, and given with an error that lost track of the run, to follow that run rather than start another.
+    #[tokio::test]
+    async fn a_run_on_another_computer_keeps_its_key() {
+        let offline = json!({ "error": { "code": "node_offline", "message": "Rig did not answer: could not connect to its address" }, "runId": null, "key": "x" });
+        let done = json!({ "runId": "r1", "status": "succeeded", "output": { "output": { "text": "done" } } });
+        let (router, asked) = runs_route(vec![(StatusCode::SERVICE_UNAVAILABLE, offline), (StatusCode::OK, done)]);
+        let d = Desk { router, paired: None };
+        let answer = flow_run_on(&d, "logo", "w1", None, None, true, 5).await.unwrap();
+        assert_eq!(answer.data["runId"], "r1", "{}", answer.data);
+        let keys = asked.lock().unwrap().clone();
+        assert!(keys.len() == 2 && keys[0] == keys[1] && keys[0].as_str().unwrap().starts_with("agent-"), "asked again with the same key: {keys:?}");
+        // lost track of after it started: the error says the key to follow it with, and that key is the one given
+        let lost = json!({ "error": { "code": "node_offline", "message": "Rig did not answer; run r2 may still be running there" }, "runId": "r2", "key": "k-9" });
+        let (router, asked) = runs_route(vec![(StatusCode::SERVICE_UNAVAILABLE, lost)]);
+        let d = Desk { router, paired: None };
+        let e = flow_run_on(&d, "logo", "w1", Some("k-9"), None, true, 5).await.err().unwrap();
+        assert!(e.contains("run r2 may still be running there") && e.contains("key \"k-9\""), "{e}");
+        assert_eq!(asked.lock().unwrap().clone(), vec![json!("k-9")], "a run started there is not asked for again");
+        // refused there as asked (no run, no key): said as it is
+        let refused = json!({ "error": { "code": "flow_not_shared", "message": "Rig shares no flow logo" } });
+        let (router, _) = runs_route(vec![(StatusCode::NOT_FOUND, refused)]);
+        let e = flow_run_on(&Desk { router, paired: None }, "logo", "w1", None, None, true, 5).await.err().unwrap();
+        assert_eq!(e, "Rig shares no flow logo");
     }
 }

@@ -129,7 +129,7 @@ impl Drop for Counted {
 /// Listen on `bind` (TLS, this computer's certificate), serving the worker's routes until the returned sender says
 /// stop; the task returned ends once the listener is closed (its port free to bind again).
 pub(crate) async fn listen(net: Network, id: &Identity, bind: SocketAddr) -> Result<(SocketAddr, tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>), String> {
-    let listener = tokio::net::TcpListener::bind(bind).await.map_err(|e| format!("the worker could not listen on {bind}: {e}"))?;
+    let listener = tokio::net::TcpListener::bind(bind).await.map_err(|e| format!("this computer could not listen on {bind}: {e}"))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let acceptor = tokio_rustls::TlsAcceptor::from(tls::server_config(id)?);
     let app = routes(net.clone());
@@ -224,6 +224,24 @@ pub(super) fn refuse(status: StatusCode, code: &str, message: impl Into<String>)
     (status, Json(json!({ "error": { "code": code, "message": message.into() } }))).into_response()
 }
 
+/// A caller this computer is not paired with (or no longer lends itself to), refused, saying which computer refused:
+/// the computer asking passes it on to its person, who reads it as about this one.
+pub(super) fn not_paired(net: &Network) -> Response {
+    refuse(StatusCode::FORBIDDEN, "not_paired", format!("{} is not paired with the computer asking (unpaired there, or Lend this computer is off there)", net.display_name()))
+}
+
+/// An error of this computer's engines in words the person at the computer using it reads as this computer's, not
+/// their own: "OAIY's engines are not running" is said "Desktop's engines are not running", another after its name.
+pub(crate) fn said_here(net: &Network, e: &str) -> String {
+    let name = net.display_name();
+    for own in ["OAIY's ", "this computer's ", "the "] {
+        if let Some(rest) = e.strip_prefix(own).filter(|rest| rest.starts_with("engine")) {
+            return format!("{name}'s {rest}");
+        }
+    }
+    format!("{name}: {e}")
+}
+
 /// A computer not paired here: its request's body read whole before any route sees it, within [`STRANGER_BODY`] and
 /// [`STRANGER_BODY_LIMIT`] (the head has its own deadline, `HEAD`).
 async fn stranger_body(req: Request, next: axum::middleware::Next) -> Response {
@@ -240,6 +258,7 @@ pub(super) fn primary_of(net: &Network, caller: &Caller) -> Option<Peer> {
     if !net.settings().lends() {
         return None;
     }
+    drop_unconfirmed(net);
     let fp = caller.fingerprint.as_deref()?;
     net.inner().peers().by_fingerprint(fp, Role::Primary).cloned()
 }
@@ -277,7 +296,7 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
         return refuse(StatusCode::FORBIDDEN, "not_a_worker", "this computer is not taking pairing requests (Lend this computer is off there)");
     }
     let Some(fp) = caller.fingerprint.clone() else {
-        return refuse(StatusCode::UNAUTHORIZED, "no_certificate", "a primary presents its certificate to pair");
+        return refuse(StatusCode::UNAUTHORIZED, "no_certificate", "a computer presents its certificate to pair");
     };
     let node_id = req.node_id.clone();
     let name: String = req.name.chars().filter(|c| !c.is_control()).take(80).collect();
@@ -290,7 +309,7 @@ async fn pair(State(net): State<Network>, Extension(caller): Extension<Caller>, 
         return refuse(StatusCode::CONFLICT, "node_id_taken", super::store::TAKEN);
     }
     let Ok(id) = net.identity() else {
-        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "this worker has no identity");
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "this computer has no identity");
     };
     let Ok(worker_nonce) = nonce() else {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "no random value for the pairing");
@@ -340,7 +359,7 @@ async fn pair_reveal(State(net): State<Network>, Extension(caller): Extension<Ca
         return refuse(StatusCode::BAD_REQUEST, "invalid_request", "a random value of 64 hex digits is needed");
     }
     let Ok(me) = net.identity() else {
-        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "this worker has no identity");
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "this computer has no identity");
     };
     let mut waiting = lock(&net.inner().incoming);
     let Some(r) = waiting.iter_mut().find(|r| r.id == id && Some(&r.fingerprint) == caller.fingerprint.as_ref() && r.at.elapsed() < REQUEST_TTL) else {
@@ -425,12 +444,12 @@ async fn unpair(State(net): State<Network>, Extension(caller): Extension<Caller>
         return if withdrawn {
             StatusCode::NO_CONTENT.into_response()
         } else {
-            refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller")
+            not_paired(&net)
         };
     };
     // (both ways, and what this computer chose of it: unpaired there is unpaired here)
     let _ = net.forget(&p.node_id);
-    log::info!("network: {} unpaired this worker", p.name);
+    log::info!("network: {} unpaired this computer", p.name);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -447,7 +466,7 @@ struct Lends {
 /// port it gives. This computer uses it once Use other computers is on here.
 async fn lends(State(net): State<Network>, Extension(caller): Extension<Caller>, Json(asked): Json<Lends>) -> Response {
     let Some(primary) = primary_of(&net, &caller) else {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     };
     if asked.port == 0 {
         return refuse(StatusCode::BAD_REQUEST, "invalid_request", "the port it listens on is needed");
@@ -522,7 +541,55 @@ fn decide_as(net: &Network, id: &str, approve: bool, by_itself: bool) -> Result<
     };
     net.inner().peers().add(peer.clone())?;
     r.status = Status::Approved;
+    drop(waiting);
+    // (paired on this side, until the primary is heard from: its person still says yes there, and a primary that stops
+    // or restarts first never does, so the approval is undone here in time, even with nothing else coming from it)
+    lock(&net.inner().unconfirmed).insert(peer.fingerprint.clone(), (peer.node_id.clone(), Instant::now()));
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        let inner = Arc::downgrade(&net.inner);
+        rt.spawn(async move {
+            tokio::time::sleep(UNCONFIRMED + Duration::from_secs(1)).await;
+            if let Some(inner) = inner.upgrade() {
+                drop_unconfirmed(&Network { inner });
+            }
+        });
+    }
     Ok(Some(peer))
+}
+
+/// How long a primary approved here has to be heard from (its heartbeat, which starts once its own person says yes)
+/// before the approval is undone: the pairing's five minutes for that person to answer, and a minute more for a
+/// heartbeat missed.
+pub(crate) const UNCONFIRMED: Duration = Duration::from_secs(6 * 60);
+
+/// The primaries approved here but not heard from within [`UNCONFIRMED`], unpaired again (that way alone: a pairing the
+/// other way stands). Their side never paired, so they are told nothing.
+pub(crate) fn drop_unconfirmed(net: &Network) {
+    let lapsed: Vec<(String, String)> = {
+        let mut unconfirmed = lock(&net.inner().unconfirmed);
+        if unconfirmed.is_empty() {
+            return;
+        }
+        let gone: Vec<(String, String)> = unconfirmed.iter().filter(|(_, (_, at))| at.elapsed() >= UNCONFIRMED).map(|(fp, (node, _))| (fp.clone(), node.clone())).collect();
+        for (fp, _) in &gone {
+            unconfirmed.remove(fp);
+        }
+        gone
+    };
+    for (fingerprint, node_id) in lapsed {
+        let Some(peer) = net.inner().peers().get(&node_id, Role::Primary).filter(|p| p.fingerprint == fingerprint).cloned() else { continue };
+        if net.inner().peers().remove_way(&node_id, Role::Primary).is_ok() {
+            log::info!("network: {} was approved here but never paired on its side (it stopped or restarted before its person said yes there): unpaired here again", peer.name);
+        }
+    }
+}
+
+/// The primary `asking` heard from (its heartbeat): paired on its side too, so its approval here stands.
+fn heard_from(net: &Network, asking: &Peer) {
+    let mut unconfirmed = lock(&net.inner().unconfirmed);
+    if !unconfirmed.is_empty() {
+        unconfirmed.remove(&asking.fingerprint);
+    }
 }
 
 /// The pairing requests waiting here, for the Networking page.
@@ -547,11 +614,15 @@ pub(crate) fn waiting(net: &Network) -> Vec<Value> {
         .collect()
 }
 
+/// How long the heartbeat's answer waits for each of this computer's engines' readings, all asked at once: within the
+/// primary's deadline for it (`primary::HEARTBEAT_DEADLINE`), with room for the LAN.
+const ENGINES_WAIT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 5 });
+
 /// `GET /worker/v1/capabilities`: this worker's engines as a primary needs them: their discovery (the models, the
 /// routes) and resources (the GPUs, what is loaded), with nothing of this computer's files or addresses.
 async fn capabilities(State(net): State<Network>, Extension(caller): Extension<Caller>, headers: axum::http::HeaderMap) -> Response {
     let Some(asking) = primary_of(&net, &caller) else {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     };
     // (a primary that lends itself to this computer too: where it listens now, kept for when this one uses it)
     let lends_on = headers.get("x-oaiy-lends-on").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u16>().ok()).filter(|p| *p != 0);
@@ -560,6 +631,7 @@ async fn capabilities(State(net): State<Network>, Extension(caller): Extension<C
             let _ = net.inner().peers().moved(&p.node_id, &SocketAddr::new(caller.addr.ip(), port).to_string());
         }
     }
+    heard_from(&net, &asking);
     let id = net.identity().map(|i| i.node_id).unwrap_or_default();
     let node = json!({
         "nodeId": id,
@@ -569,14 +641,23 @@ async fn capabilities(State(net): State<Network>, Extension(caller): Extension<C
         "arch": std::env::consts::ARCH,
         "protocol": PROTOCOL,
     });
-    let (discovery, engines) = match crate::ai::engine_services::local_engines(&net.inner().ai).await {
-        Ok((_, d)) => (sanitized_discovery(d), Value::Null),
-        Err(e) => (Value::Null, json!(e)),
-    };
-    // (the flows read from disk off this thread: each heartbeat asks)
+    // (its engines asked all at once, each within ENGINES_WAIT: a busy computer answers its heartbeat in time, its
+    // engines said to be slow, rather than shown offline; the flows read from disk off this thread)
     let reading = net.clone();
-    let flows = tokio::task::spawn_blocking(move || shared_flows(&reading)["flows"].clone()).await.unwrap_or_else(|_| json!([]));
-    let (resources, system, media_jobs) = tokio::join!(local_resources(&net), super::machine::engines_get(&net, "/api/system"), super::machine::engines_get(&net, "/api/jobs"));
+    let (engines, flows, resources, system, media_jobs) = tokio::join!(
+        tokio::time::timeout(ENGINES_WAIT, crate::ai::engine_services::local_engines(&net.inner().ai)),
+        tokio::time::timeout(ENGINES_WAIT, tokio::task::spawn_blocking(move || shared_flows(&reading)["flows"].clone())),
+        tokio::time::timeout(ENGINES_WAIT, local_resources(&net)),
+        tokio::time::timeout(ENGINES_WAIT, super::machine::engines_get(&net, "/api/system")),
+        tokio::time::timeout(ENGINES_WAIT, super::machine::engines_get(&net, "/api/jobs")),
+    );
+    let (discovery, engines) = match engines {
+        Ok(Ok((_, d))) => (sanitized_discovery(d), Value::Null),
+        Ok(Err(e)) => (Value::Null, json!(said_here(&net, &e))),
+        Err(_) => (Value::Null, json!(format!("{}'s engines did not answer within {} s", net.display_name(), ENGINES_WAIT.as_secs()))),
+    };
+    let flows = flows.ok().and_then(Result::ok).unwrap_or_else(|| json!([]));
+    let (resources, system, media_jobs) = (resources.unwrap_or(Value::Null), system.unwrap_or(Value::Null), media_jobs.unwrap_or(Value::Null));
     // (its processor's load read off the async threads: a program the system has)
     let machine = tokio::task::spawn_blocking(move || super::machine::machine(&system)).await.unwrap_or(Value::Null);
     Json(json!({
@@ -653,7 +734,7 @@ fn run_caller(primary: &Peer) -> String {
 /// `GET /worker/v1/flows`: the flows this worker shares.
 async fn flows(State(net): State<Network>, Extension(caller): Extension<Caller>) -> Response {
     if primary_of(&net, &caller).is_none() {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     }
     Json(shared_flows(&net)).into_response()
 }
@@ -677,11 +758,11 @@ const RUN_LIMIT_MS: u64 = 60 * 60 * 1000;
 /// runner, its engines) for its primary. Answered at once with the run (`queued`); [`run_status`] follows it.
 async fn run_flow(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(id): Path<String>, req: Request) -> Response {
     let Some(primary) = primary_of(&net, &caller) else {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     };
     let base = rebase_to(&req);
     let Some(bridge) = net.inner().bridge() else {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "flows_unavailable", "this computer runs no flows here");
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "flows_unavailable", format!("{} runs no flows here", net.display_name()));
     };
     let shared = bridge.flows.get(&id).and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|d| crate::bridge::flow_connector::shared(&d));
     if !shared {
@@ -729,7 +810,7 @@ async fn run_flow(State(net): State<Network>, Extension(caller): Extension<Calle
 /// primary's route for this worker).
 async fn run_status(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(id): Path<String>, req: Request) -> Response {
     let Some(primary) = primary_of(&net, &caller) else {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     };
     let base = rebase_to(&req);
     match own_run(&net, &primary, &id) {
@@ -741,7 +822,7 @@ async fn run_status(State(net): State<Network>, Extension(caller): Extension<Cal
 /// `POST /worker/v1/runs/:id/cancel`: a run this primary asked for, stopped.
 async fn cancel_run(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(id): Path<String>) -> Response {
     let Some(primary) = primary_of(&net, &caller) else {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     };
     let (Some(bridge), Some(_)) = (net.inner().bridge(), own_run(&net, &primary, &id)) else {
         return refuse(StatusCode::NOT_FOUND, "not_found", "no such run of this computer's");
@@ -790,6 +871,14 @@ pub(crate) const SHARED_SERVICES: [(&str, &[(&str, &str)]); 1] = [(
     &[("GET", "/v1/models"), ("GET", "/health"), ("GET", "/v1/audio/voices"), ("POST", "/v1/audio/transcriptions"), ("POST", "/v1/audio/speech")],
 )];
 
+/// A service's name as a person reads it (the services a worker lends are known ones).
+pub(crate) fn service_name(id: &str) -> &str {
+    match id {
+        crate::voice::engines::STT_SERVICE => "OAIY Voice",
+        other => other,
+    }
+}
+
 /// The services this worker lends, as the primary shows them: `[{id, name, installed, status}]` (one not added here
 /// is left out).
 pub(crate) fn shared_services(net: &Network) -> Vec<Value> {
@@ -806,7 +895,7 @@ pub(crate) fn shared_services(net: &Network) -> Vec<Value> {
 /// is not running: a call is coming), its answer streamed back as it comes (a line of speech, word by word).
 async fn service(State(net): State<Network>, Extension(caller): Extension<Caller>, Path((service, path)): Path<(String, String)>, req: Request) -> Response {
     if primary_of(&net, &caller).is_none() {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     }
     let path = format!("/{path}");
     let method = req.method().as_str().to_ascii_uppercase();
@@ -816,16 +905,17 @@ async fn service(State(net): State<Network>, Extension(caller): Extension<Caller
     let id = *id;
     let registry = net.inner().ai.registry.clone();
     let port = tokio::task::spawn_blocking(move || -> Result<u16, String> {
-        let mut r = registry.lock().map_err(|_| "the services are unavailable".to_string())?;
-        r.start(id).map_err(|e| format!("{id} did not start: {e}"))?;
-        r.service_port(id).ok_or_else(|| format!("{id} has no port"))
+        let mut r = registry.lock().map_err(|_| "is unavailable (its services could not be read)".to_string())?;
+        r.start(id).map_err(|e| format!("did not start: {e}"))?;
+        r.service_port(id).ok_or_else(|| "has no port".to_string())
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r);
+    let (what, name) = (service_name(id), net.display_name());
     let port = match port {
         Ok(p) => p,
-        Err(e) => return refuse(StatusCode::CONFLICT, "service_unavailable", e),
+        Err(e) => return refuse(StatusCode::CONFLICT, "service_unavailable", format!("{what} on {name} {e}")),
     };
     let content_type = req.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let body = match axum::body::to_bytes(req.into_body(), MEDIA_LIMIT).await {
@@ -850,8 +940,8 @@ async fn service(State(net): State<Network>, Extension(caller): Extension<Caller
     match call.send().await {
         Ok(r) => passthrough(r),
         // (just started, loading its models: asked again until it answers, as this computer's own calls do)
-        Err(e) if e.is_connect() => refuse(StatusCode::SERVICE_UNAVAILABLE, "service_starting", format!("{id} is starting on {}", net.display_name())),
-        Err(e) => refuse(StatusCode::BAD_GATEWAY, "service_unreachable", format!("{id} did not answer: {e}")),
+        Err(e) if e.is_connect() => refuse(StatusCode::SERVICE_UNAVAILABLE, "service_starting", format!("{what} is starting on {name}")),
+        Err(e) => refuse(StatusCode::BAD_GATEWAY, "service_unreachable", format!("{what} on {name} did not answer: {e}")),
     }
 }
 
@@ -901,7 +991,7 @@ pub(crate) fn copied_voice_name(primary_fingerprint: &str, voice: &str) -> Strin
 /// (under a name of its own, `from-<primary>-<name>`) so this computer's speech server speaks in it.
 async fn voice_copy(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(name): Path<String>, Json(copy): Json<VoiceCopy>) -> Response {
     let Some(primary) = primary_of(&net, &caller) else {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     };
     let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, copy.clip.trim()) else {
         return refuse(StatusCode::BAD_REQUEST, "invalid_request", "the clip is not base64");
@@ -940,7 +1030,7 @@ async fn voice_copy(State(net): State<Network>, Extension(caller): Extension<Cal
 /// `GET /worker/v1/resources`: the GPUs and what holds them.
 async fn resources(State(net): State<Network>, Extension(caller): Extension<Caller>) -> Response {
     if primary_of(&net, &caller).is_none() {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     }
     Json(local_resources(&net).await).into_response()
 }
@@ -955,7 +1045,7 @@ pub(crate) fn model_name(s: &str) -> bool {
 /// the language model chosen here). By the model's name alone; the Studio refuses one it cannot keep beside the others.
 async fn pins(State(net): State<Network>, Extension(caller): Extension<Caller>, Json(body): Json<Value>) -> Response {
     if primary_of(&net, &caller).is_none() {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     }
     let model = body.get("model").and_then(Value::as_str).unwrap_or_default();
     if !model_name(model) {
@@ -967,7 +1057,7 @@ async fn pins(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     }
     let pin = body.get("pin").and_then(Value::as_bool).unwrap_or(true);
     let Some(ui) = crate::ai::engine_services::local_engines_ui(&net.inner().ai) else {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "engines_unavailable", "this computer's engines are not running");
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "engines_unavailable", said_here(&net, "this computer's engines are not running"));
     };
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(20)).build() {
         Ok(c) => c,
@@ -986,7 +1076,7 @@ async fn pins(State(net): State<Network>, Extension(caller): Extension<Caller>, 
                 refuse(if status.is_client_error() { status } else { StatusCode::BAD_GATEWAY }, "pin_refused", why)
             }
         }
-        Err(e) => refuse(StatusCode::SERVICE_UNAVAILABLE, "engines_unavailable", format!("this computer's engines did not answer: {e}")),
+        Err(e) => refuse(StatusCode::SERVICE_UNAVAILABLE, "engines_unavailable", said_here(&net, &format!("this computer's engines did not answer: {e}"))),
     }
 }
 
@@ -1037,11 +1127,11 @@ pub(crate) fn sanitized_resources(mut r: Value) -> Value {
 /// streamed back as it comes.
 async fn chat(State(net): State<Network>, Extension(caller): Extension<Caller>, body: axum::body::Bytes) -> Response {
     if primary_of(&net, &caller).is_none() {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     }
     let (gateway, discovery) = match crate::ai::engine_services::local_engines(&net.inner().ai).await {
         Ok(g) => g,
-        Err(e) => return refuse(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
+        Err(e) => return refuse(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", said_here(&net, &e)),
     };
     let path = discovery
         .get("endpoints")
@@ -1051,7 +1141,8 @@ async fn chat(State(net): State<Network>, Extension(caller): Extension<Caller>, 
         .unwrap_or("/v1/chat/completions")
         .to_string();
     // (the engine answers with its chosen model, as the desktop's own engine provider does: one asked for by name that
-    // is not that one any more is refused, rather than answered by another model)
+    // is not that one any more is refused, rather than answered by another model. A primary whose default is this
+    // computer's language model, whichever it runs, names none: `primary::node_chat`)
     let mut request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return refuse(StatusCode::BAD_REQUEST, "invalid_request", format!("the body is not JSON: {e}")),
@@ -1059,10 +1150,13 @@ async fn chat(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     let asked = request.get("model").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned);
     if let (Some(asked), Some(chosen)) = (asked, discovery.pointer("/defaults/llm").and_then(Value::as_str)) {
         if asked != chosen && !asked.ends_with(&format!("/{chosen}")) {
+            let name = net.display_name();
             return refuse(
                 StatusCode::CONFLICT,
                 "model_unavailable",
-                format!("{} runs {chosen} now, not {asked}: choose its language model again", net.display_name()),
+                format!(
+                    "{name} runs {chosen} now, not {asked} (its language model was changed there): choose {name}'s {chosen} instead, or make {name}'s language model this computer's default (Engines, Other computers) to follow whichever it runs"
+                ),
             );
         }
     }
@@ -1075,7 +1169,7 @@ async fn chat(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     };
     let upstream = match client.post(format!("{}{path}", gateway.trim_end_matches('/'))).json(&request).send().await {
         Ok(r) => r,
-        Err(e) => return refuse(StatusCode::BAD_GATEWAY, "engine_unreachable", format!("the engine did not answer: {e}")),
+        Err(e) => return refuse(StatusCode::BAD_GATEWAY, "engine_unreachable", format!("{}'s engine did not answer: {e}", net.display_name())),
     };
     passthrough(upstream)
 }
@@ -1084,7 +1178,7 @@ async fn chat(State(net): State<Network>, Extension(caller): Extension<Caller>, 
 /// forwards them (`crate::ai::engine_services`).
 async fn gateway(State(net): State<Network>, Extension(caller): Extension<Caller>, Path(path): Path<String>, req: Request) -> Response {
     if primary_of(&net, &caller).is_none() {
-        return refuse(StatusCode::FORBIDDEN, "not_paired", "this computer is not paired with the caller");
+        return not_paired(&net);
     }
     // (the primary's own address for this worker's gateway, where its answers name their files: see `rebase`)
     let base = req.headers().get("x-oaiy-base").and_then(|v| v.to_str().ok()).filter(|b| b.starts_with("http://") && b.len() < 512).map(str::to_owned);
@@ -1096,7 +1190,7 @@ async fn gateway(State(net): State<Network>, Extension(caller): Extension<Caller
                 None => answer,
             }
         }
-        Err(e) => refuse(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
+        Err(e) => refuse(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", said_here(&net, &e)),
     }
 }
 

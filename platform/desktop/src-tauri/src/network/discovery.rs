@@ -30,22 +30,25 @@ pub(crate) struct Found {
     pub seen_ms: u64,
 }
 
-/// Advertise this worker on `daemon` (its port, id, name and what it has).
-pub(crate) fn advertise(daemon: &mdns_sd::ServiceDaemon, id: &Identity, name: &str, port: u16, hardware: &str) -> Result<(), String> {
+/// Advertise this computer on `daemon` (its port, id, name and what it has): the advertisement's full name, to
+/// withdraw it by.
+pub(crate) fn advertise(daemon: &mdns_sd::ServiceDaemon, id: &Identity, name: &str, port: u16, hardware: &str) -> Result<String, String> {
     let short: String = id.node_id.chars().take(12).collect();
     let host = format!("oaiy-{short}.local.");
     let instance: String = format!("{} ({short})", name.chars().filter(|c| !c.is_control() && *c != '.').take(48).collect::<String>());
     let protocol = PROTOCOL.to_string();
     let props = [("id", id.node_id.as_str()), ("name", name), ("proto", protocol.as_str()), ("ver", env!("CARGO_PKG_VERSION")), ("hw", hardware)];
     let info = mdns_sd::ServiceInfo::new(SERVICE, &instance, &host, "", port, &props[..]).map_err(|e| e.to_string())?.enable_addr_auto();
-    daemon.register(info).map_err(|e| e.to_string())
+    let full = info.get_fullname().to_string();
+    daemon.register(info).map_err(|e| e.to_string())?;
+    Ok(full)
 }
 
 /// A worker's addresses as found, `ip:port`, the one to pair with first: on the local network, each once, IPv4 first
 /// (the addresses come in no order), with no loopback address (that would be this computer) and no IPv6 link-local
 /// one, which is reached only with its interface named, and that is not kept here.
 pub(crate) fn reachable(ips: impl Iterator<Item = std::net::IpAddr>, port: u16) -> Vec<String> {
-    super::typeable(ips.filter(|ip| tls::local_address(*ip)).collect()).into_iter().map(|ip| std::net::SocketAddr::new(ip, port).to_string()).collect()
+    super::typeable(ips.filter(|ip| tls::local_address(*ip)).collect(), None).into_iter().map(|ip| std::net::SocketAddr::new(ip, port).to_string()).collect()
 }
 
 /// Browse for workers on `daemon`, keeping what is found (and dropping what leaves) in `found`.

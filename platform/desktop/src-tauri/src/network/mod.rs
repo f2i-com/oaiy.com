@@ -97,6 +97,10 @@ pub(crate) struct Inner {
     paired_by_itself: Mutex<Vec<(String, u64, String)>>,
     /// Why this computer is not lending itself although set to (its listener could not start), for the page.
     listen_error: Mutex<Option<String>>,
+    /// The primaries approved here whose own person has not said yes yet, by certificate: the node id and when. One
+    /// not heard from (its heartbeat) within the pairing's time is unpaired again here (`worker::drop_unconfirmed`): it
+    /// stopped or restarted before its person answered, and would otherwise stay paired on this side alone.
+    pub(crate) unconfirmed: Mutex<HashMap<String, (String, std::time::Instant)>>,
     /// Settings applied one change at a time: two at once would each start a listener and an advertisement.
     applying: tokio::sync::Mutex<()>,
     /// mDNS off (tests): advertising and browsing are not started.
@@ -115,9 +119,16 @@ pub(crate) struct Bridge {
 struct Running {
     /// A worker's listener: where it listens, the sender that stops it, and its task (ended: its port is free).
     listener: Option<(std::net::SocketAddr, tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
+    /// The address the listener was asked for (port 0: any): settings saved again with the same one keep it, and the
+    /// computers using this one their streams, calls and runs.
+    asked: Option<std::net::SocketAddr>,
     /// A primary's heartbeat: the sender that stops it.
     heartbeat: Option<tokio::sync::watch::Sender<bool>>,
     mdns: Option<mdns_sd::ServiceDaemon>,
+    /// This computer's advertisement on the LAN: its full name there, and the name it says (renamed: said again).
+    advertised: Option<(String, String)>,
+    /// Looking for computers lending themselves on the LAN (this computer uses others).
+    browsing: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -156,6 +167,7 @@ impl Network {
                 pairing_turn: std::sync::atomic::AtomicU64::new(0),
                 paired_by_itself: Mutex::new(Vec::new()),
                 listen_error: Mutex::new(None),
+                unconfirmed: Mutex::new(HashMap::new()),
                 applying: tokio::sync::Mutex::new(()),
                 mdns,
             }),
@@ -311,73 +323,147 @@ impl Network {
         Ok(())
     }
 
-    /// Start what the settings ask for, stopping what they no longer do.
+    /// Start what the settings ask for, stopping what they no longer do, and nothing else: the listener is started
+    /// again only where it is to listen elsewhere (another port or address) or lending is switched on or off, so a
+    /// computer renamed, or one that starts or stops using others, keeps the connections of the computers using it
+    /// (their streamed chats, calls' speech and flow runs followed).
     pub async fn apply(&self) -> Result<(), String> {
         let _one_at_a_time = self.inner.applying.lock().await;
-        // (the listener stopped and its task ended, so its port is free to listen on again: a worker renamed keeps it)
-        if let Some(ended) = self.stop_running() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ended).await;
-        }
         let settings = self.settings();
         if !settings.uses() && !settings.lends() {
+            // (the listener stopped and its task ended, so its port is free to listen on again)
+            if let Some(ended) = self.stop_running() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ended).await;
+            }
             return Ok(());
         }
         let id = self.identity()?;
-        // (started once what it serves is: nothing is left running, or advertised, by a listener that failed)
-        let daemon = || {
-            if !self.inner.mdns {
-                return None;
-            }
-            mdns_sd::ServiceDaemon::new()
-                .map_err(|e| log::warn!("network: mDNS could not start ({e}); workers are added by their address"))
-                .ok()
-        };
-        let mut started = None;
-        *lock(&self.inner.listen_error) = None;
-        // (a listener that cannot start leaves this computer using others as set: said on the page, not a stop)
-        let listening = if settings.lends() {
-            let started = match bind_address(&settings) {
-                Ok(bind) => worker::listen(self.clone(), &id, bind).await,
-                Err(e) => Err(e),
+        let asked = settings.lends().then(|| bind_address(&settings));
+        // (where it is asked to listen still: the same address, or the port it took where any was asked for before)
+        let keep = {
+            let mut running = lock(&self.inner.running);
+            let at = running.listener.as_ref().map(|(a, _, _)| *a);
+            let same = match (&asked, at, running.asked) {
+                (Some(Ok(bind)), Some(at), Some(was)) => *bind == was || (bind.ip() == was.ip() && bind.port() == at.port()),
+                _ => false,
             };
-            match started {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    log::warn!("network: this computer is not lending itself: {e}");
-                    *lock(&self.inner.listen_error) = Some(e);
-                    None
+            if let (true, Some(Ok(bind))) = (same, &asked) {
+                running.asked = Some(*bind);
+            }
+            same
+        };
+        let mut started_again = false;
+        if !keep {
+            if let Some(ended) = self.stop_listener() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ended).await;
+            }
+            *lock(&self.inner.listen_error) = None;
+            // (a listener that cannot start leaves this computer using others as set: said on the page, not a stop)
+            if let Some(asked) = asked {
+                let started = match asked {
+                    Ok(bind) => worker::listen(self.clone(), &id, bind).await.map(|l| (bind, l)),
+                    Err(e) => Err(e),
+                };
+                match started {
+                    Ok((bind, (addr, stop, task))) => {
+                        log::info!("network: this computer lends itself, listening on {addr}");
+                        let mut running = lock(&self.inner.running);
+                        running.listener = Some((addr, stop, task));
+                        running.asked = Some(bind);
+                        started_again = true;
+                    }
+                    Err(e) => {
+                        log::warn!("network: this computer is not lending itself: {e}");
+                        *lock(&self.inner.listen_error) = Some(e);
+                    }
                 }
             }
-        } else {
-            None
+        }
+        // (the heartbeat to the computers it uses: with Use other computers alone)
+        {
+            let mut running = lock(&self.inner.running);
+            match (settings.uses(), running.heartbeat.is_some()) {
+                (true, false) => running.heartbeat = Some(primary::heartbeat(self.clone())),
+                (false, true) => {
+                    if let Some(stop) = running.heartbeat.take() {
+                        let _ = stop.send(true);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.apply_discovery(&id, &settings, started_again).await;
+        Ok(())
+    }
+
+    /// Advertising this computer and looking for others on the LAN (mDNS) as the settings ask: advertised while it
+    /// lends itself, again where its listener started again or its name changed; looking while it uses others; the
+    /// daemon stopped when neither is wanted.
+    async fn apply_discovery(&self, id: &Identity, settings: &Settings, started_again: bool) {
+        if !self.inner.mdns {
+            return;
+        }
+        let listening = self.listening();
+        if listening.is_none() && !settings.uses() {
+            let mut running = lock(&self.inner.running);
+            if let Some(d) = running.mdns.take() {
+                let _ = d.shutdown();
+            }
+            running.advertised = None;
+            running.browsing = false;
+            drop(running);
+            lock(&self.inner.found).clear();
+            return;
+        }
+        let daemon = {
+            let mut running = lock(&self.inner.running);
+            if running.mdns.is_none() {
+                running.mdns = mdns_sd::ServiceDaemon::new().map_err(|e| log::warn!("network: mDNS could not start ({e}); computers are added by their address")).ok();
+                running.advertised = None;
+                running.browsing = false;
+            }
+            running.mdns.clone()
         };
-        if let Some((addr, stop, task)) = listening {
-            log::info!("network: this computer lends itself, listening on {addr}");
-            started = daemon();
-            if let Some(d) = &started {
+        let Some(d) = daemon else { return };
+        let name = self.display_name();
+        let (advertised, browsing) = {
+            let running = lock(&self.inner.running);
+            (running.advertised.clone(), running.browsing)
+        };
+        match listening {
+            Some(addr) if started_again || advertised.as_ref().is_none_or(|(_, said)| *said != name) => {
+                if let Some((full, _)) = &advertised {
+                    let _ = d.unregister(full);
+                }
                 // (what it has, said with its name: from its engines where they answer within a few seconds)
                 let read = async { tokio::join!(machine::engines_get(self, "/api/system"), machine::engines_get(self, "/api/resources")) };
                 let (system, resources) = tokio::time::timeout(std::time::Duration::from_secs(5), read).await.unwrap_or((Value::Null, Value::Null));
                 let summary = tokio::task::spawn_blocking(move || machine::summary(&system, &resources)).await.unwrap_or_default();
-                if let Err(e) = discovery::advertise(d, &id, &self.display_name(), addr.port(), &summary) {
-                    log::warn!("network: not advertised on the LAN ({e}); another computer adds it by its address");
+                let made = discovery::advertise(&d, id, &name, addr.port(), &summary)
+                    .map_err(|e| log::warn!("network: not advertised on the LAN ({e}); another computer adds it by its address"))
+                    .ok();
+                lock(&self.inner.running).advertised = made.map(|full| (full, name));
+            }
+            Some(_) => {}
+            None => {
+                if let Some((full, _)) = &advertised {
+                    let _ = d.unregister(full);
                 }
+                lock(&self.inner.running).advertised = None;
             }
-            lock(&self.inner.running).listener = Some((addr, stop, task));
         }
-        if settings.uses() {
-            if started.is_none() {
-                started = daemon();
+        match (settings.uses(), browsing) {
+            (true, false) => match discovery::browse(&d, self.inner.found.clone()) {
+                Ok(()) => lock(&self.inner.running).browsing = true,
+                Err(e) => log::warn!("network: computers on the LAN are not looked for ({e}); add them by their address"),
+            },
+            (false, true) => {
+                let _ = d.stop_browse(discovery::SERVICE);
+                lock(&self.inner.running).browsing = false;
+                lock(&self.inner.found).clear();
             }
-            if let Some(d) = &started {
-                if let Err(e) = discovery::browse(d, self.inner.found.clone()) {
-                    log::warn!("network: computers on the LAN are not looked for ({e}); add them by their address");
-                }
-            }
-            lock(&self.inner.running).heartbeat = Some(primary::heartbeat(self.clone()));
+            _ => {}
         }
-        lock(&self.inner.running).mdns = started;
-        Ok(())
     }
 
     /// Stop everything running (Network off, or about to start again).
@@ -387,20 +473,28 @@ impl Network {
 
     /// As [`Network::stop`], answering the listener's task, which ends once its port is free.
     fn stop_running(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let task = self.stop_listener();
         let mut running = lock(&self.inner.running);
-        let mut task = None;
-        if let Some((_, stop, t)) = running.listener.take() {
-            let _ = stop.send(true);
-            task = Some(t);
-        }
         if let Some(stop) = running.heartbeat.take() {
             let _ = stop.send(true);
         }
         if let Some(d) = running.mdns.take() {
             let _ = d.shutdown();
         }
+        running.advertised = None;
+        running.browsing = false;
+        drop(running);
         lock(&self.inner.found).clear();
         task
+    }
+
+    /// The listener stopped (its connections with it), answering its task, which ends once its port is free.
+    fn stop_listener(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let mut running = lock(&self.inner.running);
+        running.asked = None;
+        let (_, stop, task) = running.listener.take()?;
+        let _ = stop.send(true);
+        Some(task)
     }
 
     /// Where a worker listens (none unless it is one, switched on).
@@ -476,23 +570,38 @@ fn bind_address(settings: &Settings) -> Result<std::net::SocketAddr, String> {
         settings.bind.trim().parse().map_err(|_| format!("{} is not an address of this computer", settings.bind.trim()))?
     };
     if !ip.is_unspecified() && !tls::local_address(ip) {
-        return Err(format!("{ip} is not a local network address: a worker listens on the LAN alone"));
+        return Err(format!("{ip} is not a local network address: a computer lends itself on the LAN alone"));
     }
     Ok(std::net::SocketAddr::new(ip, settings.port))
 }
 
-/// This computer's LAN addresses, as `ip:port` (what a primary is told to type where discovery is blocked).
+/// This computer's LAN addresses, as `ip:port` (what a primary is told to type where discovery is blocked): its
+/// adapters that are up (Windows lists those that are down, or not there, with their last address too), the one its
+/// default route leaves by first, where the system says which.
 fn lan_addresses(port: u16) -> Vec<String> {
-    let ips: Vec<std::net::IpAddr> = if_addrs::get_if_addrs().unwrap_or_default().into_iter().map(|i| i.ip()).collect();
-    typeable(ips)
+    let all = if_addrs::get_if_addrs().unwrap_or_default();
+    let up: Vec<std::net::IpAddr> = all.iter().filter(|i| i.is_oper_up()).map(|i| i.ip()).collect();
+    // (none said to be up: a system that does not say, and its addresses as they are)
+    let ips = if up.is_empty() { all.iter().map(|i| i.ip()).collect() } else { up };
+    typeable(ips, default_route_address())
         .into_iter()
         .map(|ip| std::net::SocketAddr::new(ip, port).to_string())
         .collect()
 }
 
-/// The addresses a person can type on another computer, each once, IPv4 first: not loopback, and not an IPv6 link-local
-/// address (one is on every interface, and it needs its interface named to be reached).
-fn typeable(ips: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
+/// The address this computer's default route leaves by, the one other computers on its network most likely reach
+/// (rather than a virtual adapter's, a VM's or a VPN's, which come first in adapter order on Windows): what the system
+/// chooses for a UDP socket aimed past the LAN, at a documentation address. A UDP socket connected sends nothing.
+fn default_route_address() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    socket.local_addr().ok().map(|a| a.ip()).filter(|ip| !ip.is_unspecified())
+}
+
+/// The addresses a person can type on another computer, each once, IPv4 first and `first` (the default route's)
+/// before the rest: not loopback, and not an IPv6 link-local address (one is on every interface, and it needs its
+/// interface named to be reached).
+fn typeable(ips: Vec<std::net::IpAddr>, first: Option<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
     let mut out: Vec<std::net::IpAddr> = Vec::new();
     for ip in ips {
         let link_local_v6 = matches!(ip, std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80);
@@ -501,7 +610,7 @@ fn typeable(ips: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
         }
         out.push(ip);
     }
-    out.sort_by_key(|ip| ip.is_ipv6());
+    out.sort_by_key(|ip| (Some(*ip) != first, ip.is_ipv6()));
     out
 }
 

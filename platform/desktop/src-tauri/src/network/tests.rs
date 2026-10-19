@@ -63,6 +63,7 @@ async fn fake_engines() -> String {
                     "image": [{"id": "tiny-image", "default": true, "files_present": true}, {"id": "gone", "files_present": false, "missing_files": ["/Users/someone/secret/model.gguf"]}],
                 },
                 "defaults": {"llm": "tiny-llm", "image": "tiny-image"},
+                "llm": {"state": "ready", "context_tokens": 32768},
             }))
         }))
         .route("/gw/v1/images/generations", post({
@@ -117,6 +118,13 @@ async fn node(tag: &str, role: Role, engines: Option<String>) -> Network {
     net
 }
 
+/// The primary's heartbeat stopped, so what a test sets of what it heard of its workers stays as set.
+fn quiet(primary: &Network) {
+    if let Some(stop) = lock(&primary.inner().running).heartbeat.take() {
+        let _ = stop.send(true);
+    }
+}
+
 async fn call(app: &Router, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
     let mut req = Request::builder().method(method).uri(path);
     if body.is_some() {
@@ -135,6 +143,11 @@ async fn pair(primary: &Network, worker: &Network) -> String {
 
 /// As [`pair`]; `both_ways`: the primary's person lets the worker use it too.
 async fn pair_with(primary: &Network, worker: &Network, both_ways: bool) -> String {
+    pair_answer(primary, worker, both_ways).await["node"]["nodeId"].as_str().unwrap().to_string()
+}
+
+/// As [`pair_with`], the primary's answer to its person's yes.
+async fn pair_answer(primary: &Network, worker: &Network, both_ways: bool) -> Value {
     let (p, w) = (router(primary.clone()), router(worker.clone()));
     let address = worker.listening().unwrap().to_string();
     let (status, started) = call(&p, "POST", "/api/network/pairings/start", Some(json!({ "address": address }))).await;
@@ -154,7 +167,7 @@ async fn pair_with(primary: &Network, worker: &Network, both_ways: bool) -> Stri
     assert!(nodes["nodes"].as_array().unwrap().iter().all(|n| n["nodeId"] != started["worker"]["nodeId"]), "not paired here before this side says the codes matched");
     let (_, confirmed) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"], "accept": true, "bothWays": both_ways }))).await;
     assert_eq!(confirmed["status"], "approved", "{confirmed}");
-    confirmed["node"]["nodeId"].as_str().unwrap().to_string()
+    confirmed
 }
 
 /// Approved on the worker, the pairing waits for this side's person to say the codes matched; saying they did not,
@@ -690,7 +703,7 @@ class H(http.server.BaseHTTPRequestHandler):
         else: self.whole(404, b"{}")
     def do_POST(self):
         asked = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-        if self.path == "/v1/audio/transcriptions": self.whole(200, json.dumps({"text": "hello from the worker"}).encode())
+        if self.path == "/v1/audio/transcriptions": self.whole(200, json.dumps({"text": "hello from %d" % port}).encode())
         elif self.path == "/v1/audio/speech":
             if asked.get("voice") and not asked["voice"].startswith("from-"): self.whole(400, b'{"error": "no such voice"}')
             else: self.whole(200, b"\x01\x00" * 4800, "audio/pcm", [("X-Sample-Rate", "24000")])
@@ -700,7 +713,8 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 
 /// OAIY Voice set up on a worker, used from the primary in place of its own (Services → Other computers): the primary's
 /// speech-to-text and speech go to the worker's, started there when asked, the primary's voice copied there first; the
-/// worker lends that service's speech routes alone; unpairing gives it back.
+/// worker lends that service's speech routes alone; that computer not answering, this computer's own OAIY Voice answers
+/// a call meanwhile, where it has one; unpairing gives it back.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_primary_uses_oaiy_voice_on_a_worker() {
@@ -710,20 +724,23 @@ async fn a_primary_uses_oaiy_voice_on_a_worker() {
     let script = dir.join("fake-oaiy-voice");
     std::fs::write(&script, FAKE_VOICE).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let template: crate::services::template::ServiceTemplate = serde_json::from_value(json!({
-        "id": "oaiy-voice", "name": "OAIY Voice", "description": "a stand-in", "category": "Speech", "defaultPort": port,
-        "autostart": false, "run": { "command": script.to_string_lossy(), "args": ["${port}"], "env": {} },
-        "health": { "url": "http://127.0.0.1:${port}/v1/models", "timeoutSecs": 20 },
-    }))
-    .unwrap();
-    crate::voice::voices::init(&temp("voices-data"));
-    let worker = node("worker-voice", Role::Worker, Some(fake_engines().await)).await;
-    {
-        let mut registry = worker.inner().ai.registry.lock().unwrap();
+    // (a stand-in on a port of its own, in a computer's services)
+    let set_up = |net: &Network| {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let template: crate::services::template::ServiceTemplate = serde_json::from_value(json!({
+            "id": "oaiy-voice", "name": "OAIY Voice", "description": "a stand-in", "category": "Speech", "defaultPort": port,
+            "autostart": false, "run": { "command": script.to_string_lossy(), "args": ["${port}"], "env": {} },
+            "health": { "url": "http://127.0.0.1:${port}/v1/models", "timeoutSecs": 20 },
+        }))
+        .unwrap();
+        let mut registry = net.inner().ai.registry.lock().unwrap();
         std::fs::create_dir_all(registry.data_dir().join("templates")).unwrap();
         registry.add_template(template).unwrap();
-    }
+        port
+    };
+    crate::voice::voices::init(&temp("voices-data"));
+    let worker = node("worker-voice", Role::Worker, Some(fake_engines().await)).await;
+    let port = set_up(&worker);
     let primary = node("primary-voice", Role::Primary, None).await;
     let node_id = pair(&primary, &worker).await;
     let p = router(primary.clone());
@@ -732,7 +749,7 @@ async fn a_primary_uses_oaiy_voice_on_a_worker() {
     assert_eq!(v["services"]["oaiy-voice"]["nodeName"], "the worker-voice", "{v}");
     let engines = crate::voice::engines::Engines::via(primary::service_target_of(&primary, "oaiy-voice").unwrap());
     let heard = engines.transcribe_wav(vec![0u8; 3200]).await.unwrap();
-    assert_eq!(heard, "hello from the worker");
+    assert_eq!(heard, format!("hello from {port}"), "heard on the worker");
     let voice = crate::voice::voices::chosen().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     engines.speak("Good morning.", Some(&voice), &tx).await.unwrap();
@@ -750,12 +767,27 @@ async fn a_primary_uses_oaiy_voice_on_a_worker() {
         let r = lent.client.get(format!("{}{path}", lent.root)).send().await.unwrap();
         assert_eq!(r.status().as_u16(), code, "{path}");
     }
+    // that computer not answering (the heartbeat found it so, or asked now), this computer's own answers meanwhile
+    let own = set_up(&primary);
+    quiet(&primary);
+    lock(&primary.inner().nodes).get_mut(&node_id).unwrap().online = false;
+    let offline = primary::service_target_of(&primary, "oaiy-voice").unwrap();
+    assert!(offline.offline);
+    let here = crate::voice::engines::Engines::via_or_here(offline, primary.inner().ai.registry.clone());
+    assert_eq!(here.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {own}"), "heard here");
+    lock(&primary.inner().nodes).get_mut(&node_id).unwrap().online = true;
+    let answering = crate::voice::engines::Engines::via_or_here(primary::service_target_of(&primary, "oaiy-voice").unwrap(), primary.inner().ai.registry.clone());
+    assert_eq!(answering.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {port}"), "on the worker again once it answers");
+    worker.stop();
+    assert_eq!(answering.transcribe_wav(vec![0u8; 3200]).await.unwrap(), format!("hello from {own}"), "asked now and not answering: heard here");
     // a service the worker has not set up is not chosen; unpairing gives this computer's own back
     let (status, _) = call(&p, "PUT", "/api/network/settings", Some(json!({ "services": { "oaiy-voice": "nobody" } }))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     call(&p, "DELETE", &format!("/api/network/nodes/{node_id}"), None).await;
     assert!(primary.inner().services().all().is_empty());
-    let _ = worker.inner().ai.registry.lock().unwrap().stop("oaiy-voice");
+    for n in [&worker, &primary] {
+        let _ = n.inner().ai.registry.lock().unwrap().stop("oaiy-voice");
+    }
     for n in [&worker, &primary] {
         n.stop();
     }
@@ -773,7 +805,9 @@ async fn two_computers_can_use_each_other() {
         assert_eq!(n.settings().active_role(), Role::Both);
     }
     assert!(a.listening().is_some() && b.listening().is_some(), "both lend themselves");
-    let b_id = pair_with(&a, &b, true).await;
+    let answer = pair_answer(&a, &b, true).await;
+    assert_eq!((&answer["bothWays"], &answer["bothWaysError"]), (&json!(true), &Value::Null), "{answer}");
+    let b_id = answer["node"]["nodeId"].as_str().unwrap().to_string();
     let a_id = a.identity().unwrap().node_id;
     assert!(a.inner().peers().get(&b_id, Role::Worker).is_some() && a.inner().peers().get(&b_id, Role::Primary).is_some(), "a uses b, and b may use a");
     let a_on_b = b.inner().peers().get(&a_id, Role::Worker).cloned().expect("b keeps a as a computer it uses");
@@ -1000,6 +1034,9 @@ async fn a_primary_pairs_with_a_worker_and_uses_its_engines_through_its_own_rout
     let llm = services.iter().find(|s| s["kind"] == "llm").unwrap();
     assert_eq!(llm["endpoint"], format!("/api/network/nodes/{worker_id}/v1/chat/completions"));
     assert_eq!(llm["id"], format!("engine:llm:node.{worker_id}/tiny-llm"));
+    // (the window its language model runs with there, and whether the computer itself answers)
+    assert_eq!((&llm["contextTokens"], &llm["nodeOnline"]), (&json!(32768), &json!(true)), "{llm}");
+    assert!(image.get("contextTokens").is_none() && image["nodeOnline"] == true, "{image}");
 
     // a picture made on the worker, through the primary
     let resp = p
@@ -1034,7 +1071,17 @@ async fn a_primary_pairs_with_a_worker_and_uses_its_engines_through_its_own_rout
     let (status, _) = call(&p, "GET", &format!("/api/network/nodes/{worker_id}/gateway/api/config"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // stopped there: its models listed still, not ready, the computer itself not answering (`nodeOnline`), and why
+    // said with where it was asked
+    let peer = primary.inner().peers().get(&worker_id, Role::Worker).cloned().unwrap();
+    let port = worker.listening().unwrap().port();
     worker.stop();
+    primary::check(&primary, &peer).await;
+    let llm = primary::remote_services_of(&primary).into_iter().find(|s| s["kind"] == "llm").unwrap();
+    assert_eq!((&llm["ready"], &llm["nodeOnline"]), (&json!(false), &json!(false)), "{llm}");
+    let (status, v) = call(&p, "GET", &format!("/api/network/nodes/{worker_id}/resources"), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains(&format!("the worker did not answer: connection refused at 127.0.0.1:{port}")), "{v}");
     primary.stop();
 }
 
@@ -1184,7 +1231,7 @@ async fn off_nothing_listens_and_a_worker_is_never_reached_off_the_lan() {
 #[test]
 fn the_addresses_shown_are_the_ones_a_person_can_type() {
     let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
-    let got = typeable(vec![
+    let ips = vec![
         ip("fe80::1"),
         ip("fd85:2144:420d::7ebf"),
         ip("192.168.2.147"),
@@ -1193,6 +1240,318 @@ fn the_addresses_shown_are_the_ones_a_person_can_type() {
         ip("192.168.2.147"),
         ip("8.8.8.8"),
         ip("10.0.0.4"),
-    ]);
-    assert_eq!(got, vec![ip("192.168.2.147"), ip("10.0.0.4"), ip("fd85:2144:420d::7ebf")]);
+    ];
+    assert_eq!(typeable(ips.clone(), None), vec![ip("192.168.2.147"), ip("10.0.0.4"), ip("fd85:2144:420d::7ebf")]);
+    // (the address the default route leaves by first: a virtual adapter's, listed before it, after)
+    assert_eq!(typeable(ips.clone(), Some(ip("10.0.0.4"))), vec![ip("10.0.0.4"), ip("192.168.2.147"), ip("fd85:2144:420d::7ebf")]);
+    assert_eq!(typeable(ips, Some(ip("8.8.8.8"))), vec![ip("192.168.2.147"), ip("10.0.0.4"), ip("fd85:2144:420d::7ebf")], "one not typeable is not put first");
+}
+
+/// A connection a paired primary keeps open to a worker (its streamed chat, a call's speech, a run followed): one
+/// request on it, answered whole (`GET` with no body), its status line.
+async fn ask_on<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(conn: &mut S, path: &str) -> std::io::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    conn.write_all(format!("GET {path} HTTP/1.1\r\nhost: worker\r\n\r\n").as_bytes()).await?;
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut chunk)).await.map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        got.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&got).to_string();
+        let Some((head, body)) = text.split_once("\r\n\r\n") else { continue };
+        let length = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+        if body.len() >= length {
+            return Ok(head.lines().next().unwrap_or_default().to_string());
+        }
+    }
+}
+
+/// Saving a lending computer's settings as the Networking page does (its name and port each time) restarts its
+/// listener only where it is to listen elsewhere: renamed, or using other computers too, it keeps the connections of
+/// the computers using it (and says its new name); moved to another port, it listens there instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saving_settings_keeps_the_connections_of_the_computers_using_it() {
+    let worker = node("worker-keeps", Role::Worker, None).await;
+    let primary = node("primary-keeps", Role::Primary, None).await;
+    pair(&primary, &worker).await;
+    let address = worker.listening().unwrap();
+    let w = router(worker.clone());
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls::client_config(&primary.identity().unwrap(), Pin::Fingerprint(worker.identity().unwrap().fingerprint)).unwrap()));
+    let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut conn = connector.connect(rustls::pki_types::ServerName::try_from("oaiy-node.invalid").unwrap(), tcp).await.unwrap();
+    assert!(ask_on(&mut conn, "/worker/v1/health").await.unwrap().contains("200"));
+    for change in [json!({ "name": "the worker renamed", "port": address.port() }), json!({ "uses": true, "name": "the worker renamed", "port": address.port() })] {
+        let (status, v) = call(&w, "PUT", "/api/network/settings", Some(change.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(worker.listening(), Some(address), "{change}");
+        assert!(ask_on(&mut conn, "/worker/v1/health").await.unwrap().contains("200"), "the same connection answers after {change}");
+    }
+    let stranger = tls::client(&super::identity::Identity::generate().unwrap(), Pin::Record(Default::default())).unwrap();
+    let health: Value = stranger.get(format!("https://{address}/worker/v1/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(health["name"], "the worker renamed");
+    // (another port: listened on there, the connection to the old one ended)
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (status, v) = call(&w, "PUT", "/api/network/settings", Some(json!({ "port": free }))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(worker.listening().map(|a| a.port()), Some(free));
+    assert!(ask_on(&mut conn, "/worker/v1/health").await.is_err(), "the old listener's connection ended");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A worker's language model as this computer's default is whichever it runs: a chat naming the one it ran before
+/// (the Agent reads its model once a minute) is answered by the one it runs now. Not the default, the chat is refused,
+/// saying what that computer runs now and how to follow it.
+#[tokio::test]
+async fn a_chat_on_the_default_follows_the_model_the_worker_runs_now() {
+    let worker = node("worker-follows", Role::Worker, Some(fake_engines().await)).await;
+    let primary = node("primary-follows", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let chat = format!("/api/network/nodes/{node_id}/v1/chat/completions");
+    let asked = json!({ "model": "an-older-llm", "stream": true, "messages": [{"role": "user", "content": "hi"}] });
+    let (status, v) = call(&p, "POST", &chat, Some(asked.clone())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    let said = v["error"]["message"].as_str().unwrap();
+    assert!(said.contains("the worker-follows runs tiny-llm now, not an-older-llm") && said.contains("this computer's default"), "{said}");
+    let (status, _) = call(&p, "PUT", "/api/network/settings", Some(json!({ "defaults": { "llm": format!("engine:llm:node.{node_id}/tiny-llm") } }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, v) = call(&p, "POST", &chat, Some(asked)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(v.as_str().unwrap_or_default().contains("Hel"), "answered by the model it runs now: {v}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A default on a worker says whether it is in effect, and why not where it is not: that computer not heard from since
+/// this one started (it was asleep), its engines not answering since, or the model no longer one of its.
+#[tokio::test]
+async fn a_default_on_a_worker_says_whether_it_is_in_effect_and_why_not() {
+    let worker = node("worker-waits", Role::Worker, Some(fake_engines().await)).await;
+    let primary = node("primary-waits", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let (_, v) = call(&p, "PUT", "/api/network/settings", Some(json!({ "defaults": { "image": format!("engine:image:node.{node_id}/tiny-image") } }))).await;
+    assert_eq!((&v["defaults"]["image"]["inEffect"], &v["defaults"]["image"]["waiting"]), (&json!(true), &Value::Null), "{v}");
+    quiet(&primary);
+    let heard = lock(&primary.inner().nodes).get(&node_id).cloned().unwrap();
+    let waiting = || async { call(&p, "GET", "/api/network/status", None).await.1["defaults"]["image"].clone() };
+    // (this computer restarted, that one asleep: nothing heard of it yet)
+    lock(&primary.inner().nodes).clear();
+    let d = waiting().await;
+    assert_eq!((&d["inEffect"], &d["waiting"], &d["nodeName"]), (&json!(false), &json!("not_heard"), &json!("the worker-waits")), "{d}");
+    // (heard, its engines not answering since)
+    let mut down = heard.clone();
+    down.capabilities.as_mut().unwrap()["discovery"] = Value::Null;
+    lock(&primary.inner().nodes).insert(node_id.clone(), down);
+    assert_eq!(waiting().await["waiting"], "engines_down");
+    // (heard, the model gone from it)
+    let mut gone = heard.clone();
+    gone.capabilities.as_mut().unwrap()["discovery"]["models"]["image"] = json!([]);
+    lock(&primary.inner().nodes).insert(node_id.clone(), gone);
+    assert_eq!(waiting().await["waiting"], "model_gone");
+    lock(&primary.inner().nodes).insert(node_id.clone(), heard);
+    assert_eq!(waiting().await["inEffect"], true);
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A service used on a worker (OAIY Voice) stays listed, in the status and with the computer, while that computer has
+/// not been heard from since this one started (`heard: false`), so its page can offer this computer's own again.
+#[tokio::test]
+async fn a_service_in_use_is_listed_while_its_computer_is_not_heard_from() {
+    let worker = node("worker-unheard", Role::Worker, None).await;
+    let primary = node("primary-unheard", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    primary.inner().services().set("oaiy-voice", Some(&node_id)).unwrap();
+    quiet(&primary);
+    let p = router(primary.clone());
+    let (_, status) = call(&p, "GET", "/api/network/status", None).await;
+    assert_eq!((&status["services"]["oaiy-voice"]["heard"], &status["services"]["oaiy-voice"]["online"]), (&json!(true), &json!(true)), "{status}");
+    // (heard of, its OAIY Voice not set up there now: said so)
+    let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
+    assert_eq!(nodes["nodes"][0]["services"], json!([{ "id": "oaiy-voice", "name": "OAIY Voice", "installed": false, "status": null, "heard": true }]), "{nodes}");
+    // this computer restarted, that one asleep
+    lock(&primary.inner().nodes).clear();
+    let (_, status) = call(&p, "GET", "/api/network/status", None).await;
+    assert_eq!((&status["services"]["oaiy-voice"]["nodeName"], &status["services"]["oaiy-voice"]["heard"]), (&json!("the worker-unheard"), &json!(false)), "{status}");
+    let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
+    assert_eq!(nodes["nodes"][0]["services"], json!([{ "id": "oaiy-voice", "name": "OAIY Voice", "installed": true, "status": null, "heard": false }]), "{nodes}");
+    // (and given back, nothing heard)
+    let (status, v) = call(&p, "PUT", "/api/network/settings", Some(json!({ "services": { "oaiy-voice": null } }))).await;
+    assert_eq!((status, &v["services"]), (StatusCode::OK, &json!({})), "{v}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A pairing approved on the worker whose primary never says yes on its side (it restarted first, its pairing gone
+/// with it) is undone there once the pairing's time is up; one whose primary did say yes (its heartbeat came) stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_approval_never_confirmed_by_the_primary_is_undone_on_the_worker() {
+    let worker = node("worker-unconfirmed", Role::Worker, Some(fake_engines().await)).await;
+    let primary = node("primary-unconfirmed", Role::Primary, None).await;
+    let (p, w) = (router(primary.clone()), router(worker.clone()));
+    let (_, started) = call(&p, "POST", "/api/network/pairings/start", Some(json!({ "address": worker.listening().unwrap().to_string() }))).await;
+    let (_, waiting) = call(&w, "GET", "/api/network/requests", None).await;
+    call(&w, "POST", &format!("/api/network/requests/{}/approve", waiting["requests"][0]["id"].as_str().unwrap()), None).await;
+    let (_, there) = call(&p, "POST", "/api/network/pairings/confirm", Some(json!({ "pairingId": started["pairingId"] }))).await;
+    assert_eq!(there["status"], "approved_there");
+    // (the primary restarts: its pairing in progress is gone, and it never asks again)
+    lock(&primary.inner().outgoing).clear();
+    let age = |n: &Network| {
+        for (_, at) in lock(&n.inner().unconfirmed).values_mut() {
+            *at = at.checked_sub(worker::UNCONFIRMED + std::time::Duration::from_secs(1)).unwrap();
+        }
+    };
+    worker::drop_unconfirmed(&worker);
+    assert_eq!(call(&w, "GET", "/api/network/nodes", None).await.1["nodes"].as_array().unwrap().len(), 1, "within its time it stands");
+    age(&worker);
+    worker::drop_unconfirmed(&worker);
+    let (_, nodes) = call(&w, "GET", "/api/network/nodes", None).await;
+    assert!(nodes["nodes"].as_array().unwrap().is_empty(), "undone there: {nodes}");
+    // confirmed on the primary (its heartbeat heard at once): it stands past that time
+    pair(&primary, &worker).await;
+    age(&worker);
+    worker::drop_unconfirmed(&worker);
+    assert_eq!(call(&w, "GET", "/api/network/nodes", None).await.1["nodes"].as_array().unwrap().len(), 1, "a primary heard from stands");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// Paired both ways where this computer does not lend itself after all: paired one way, the answer saying why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_ways_not_done_is_said() {
+    let worker = node("worker-oneway", Role::Worker, None).await;
+    let primary = node("primary-oneway", Role::Primary, None).await;
+    let answer = pair_answer(&primary, &worker, true).await;
+    assert_eq!(answer["bothWays"], false, "{answer}");
+    assert!(answer["bothWaysError"].as_str().unwrap_or_default().contains("not lending itself"), "{answer}");
+    let node_id = answer["node"]["nodeId"].as_str().unwrap();
+    assert!(primary.inner().peers().get(node_id, Role::Worker).is_some() && primary.inner().peers().get(node_id, Role::Primary).is_none());
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// What a worker's engines say reaches the primary as that computer's, by its name, not as the primary's own.
+#[tokio::test]
+async fn a_workers_errors_name_it() {
+    let worker = node("worker-named", Role::Worker, None).await;
+    let primary = node("primary-named", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let (status, v) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/v1/chat/completions"), Some(json!({ "messages": [] }))).await;
+    assert_eq!((status, v["error"]["message"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("the worker-named's engines are not running")), "{v}");
+    let (status, v) = call(&p, "POST", &format!("/api/network/nodes/{node_id}/gateway/v1/images/generations"), Some(json!({}))).await;
+    assert_eq!((status, v["error"]["message"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("the worker-named's engines are not running")), "{v}");
+    let (_, nodes) = call(&p, "GET", "/api/network/nodes", None).await;
+    assert_eq!(nodes["nodes"][0]["enginesError"], "the worker-named's engines are not running", "{nodes}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A computer that never answers is said to be one that could not be connected to, not one that is slow; one that
+/// answers slowly is.
+#[test]
+fn a_computer_not_reached_is_not_called_slow() {
+    let at = Some("192.168.50.20:17975");
+    assert_eq!(primary::failure_words(true, true, "timed out", at), "could not connect to 192.168.50.20:17975 (is that computer on, awake and on this network?)");
+    assert_eq!(primary::failure_words(true, false, "No route to host (os error 65)", at), "could not connect to 192.168.50.20:17975 (is that computer on, awake and on this network?)");
+    assert!(primary::failure_words(true, false, "Connection refused (os error 61)", at).starts_with("connection refused at 192.168.50.20:17975"));
+    assert_eq!(primary::failure_words(false, true, "timed out", at), "it took too long to answer");
+    assert_eq!(primary::failure_words(true, false, "the computer answering is not the one paired (its certificate differs)", at), "the computer answering is not the one paired (its certificate differs)");
+}
+
+/// Engines that take their time to answer (a busy computer): the worker's heartbeat answer waits for them a few
+/// seconds at most, so the primary sees it online, its engines said to be slow, rather than offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_workers_heartbeat_answers_in_time() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().fallback(|| async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        axum::Json(json!({}))
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let worker = node("worker-busy", Role::Worker, Some(slow)).await;
+    let primary = node("primary-busy", Role::Primary, None).await;
+    let started = std::time::Instant::now();
+    let node_id = pair(&primary, &worker).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "answered within its wait: {:?}", started.elapsed());
+    let (_, nodes) = call(&router(primary.clone()), "GET", "/api/network/nodes", None).await;
+    let n = nodes["nodes"].as_array().unwrap().iter().find(|n| n["nodeId"] == json!(node_id)).cloned().unwrap();
+    assert_eq!(n["online"], true, "{n}");
+    assert!(n["enginesError"].as_str().unwrap_or_default().contains("did not answer within"), "{n}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// A run on a worker waited for from here keeps being followed through a few polls that go unanswered (that computer
+/// gone for a moment); given up after more, the error keeps its id and key. Asked again with its key, the same run is
+/// answered, never another started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_waited_for_on_a_worker_is_not_lost_or_run_twice() {
+    let worker = node("worker-runs", Role::Worker, Some(fake_engines().await)).await;
+    let flows = std::sync::Arc::new(crate::bridge::worker::FlowStore::new(temp("flows-runs")));
+    flows.put("logo", &json!({ "name": "Make a logo", "oaiyRemote": true, "nodes": [] }).to_string()).unwrap();
+    let ledger = crate::bridge::ledger::new_handle();
+    worker.set_bridge(ledger.clone(), flows);
+    let primary = node("primary-runs", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let runs = format!("/api/network/nodes/{node_id}/flows/logo/runs");
+    // the same key twice: one run
+    let (_, first) = call(&p, "POST", &runs, Some(json!({ "key": "k-1" }))).await;
+    let (status, again) = call(&p, "POST", &runs, Some(json!({ "key": "k-1" }))).await;
+    assert_eq!((status, &again["runId"]), (StatusCode::OK, &first["runId"]), "{again}");
+    let (_, other) = call(&p, "POST", &runs, Some(json!({}))).await;
+    assert_ne!(other["runId"], first["runId"]);
+    // waited for: that computer goes for a moment, the run finishes there meanwhile, and it is answered once back
+    let port = worker.listening().unwrap().port();
+    let waiting = {
+        let p = p.clone();
+        let runs = runs.clone();
+        tokio::spawn(async move { call(&p, "POST", &runs, Some(json!({ "key": "k-2", "wait": true, "timeoutMs": 60000 }))).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    worker.stop();
+    let run_id = ledger.lock().unwrap().recent(64, &[crate::bridge::ledger::RunStatus::Queued]).iter().find(|r| r.idempotency_key.ends_with(":k-2")).map(|r| r.run_id.clone()).unwrap();
+    {
+        let mut l = ledger.lock().unwrap();
+        l.claim(&run_id, crate::bridge::ledger::Runtime::Desktop, "test");
+        l.finish(&run_id, crate::bridge::ledger::RunStatus::Succeeded, Some(json!({ "output": { "text": "done" } })), None).unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    worker.set(Settings { port, ..worker.settings() }).await.unwrap();
+    let (status, done) = waiting.await.unwrap();
+    assert_eq!((status, &done["status"], &done["runId"]), (StatusCode::OK, &json!("succeeded"), &json!(run_id)), "{done}");
+    // gone for good: given up after a few misses, the error keeping the run's id and its key
+    let waiting = {
+        let p = p.clone();
+        let runs = runs.clone();
+        tokio::spawn(async move { call(&p, "POST", &runs, Some(json!({ "key": "k-3", "wait": true, "timeoutMs": 60000 }))).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    worker.stop();
+    let (status, lost) = waiting.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{lost}");
+    assert!(lost["runId"].is_string() && lost["key"] == "k-3" && lost["run"]["status"] == "queued", "{lost}");
+    assert!(lost["error"]["message"].as_str().unwrap().contains("may still be running there"), "{lost}");
+    // back, and asked again with its key: that run, not another
+    worker.set(Settings { port, ..worker.settings() }).await.unwrap();
+    let (_, joined) = call(&p, "POST", &runs, Some(json!({ "key": "k-3" }))).await;
+    assert_eq!(joined["runId"], lost["runId"], "{joined}");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
 }

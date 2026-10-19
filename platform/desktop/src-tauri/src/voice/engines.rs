@@ -54,6 +54,12 @@ impl Engines {
         Self { registry: None, http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: Some(remote) }
     }
 
+    /// Speech on a paired worker, this computer's own (`registry`'s) answering where the worker does not (tests).
+    #[cfg(test)]
+    pub(crate) fn via_or_here(remote: crate::network::ServiceTarget, registry: RegistryHandle) -> Self {
+        Self { registry: Some(registry), http: reqwest::Client::new(), fixed: None, copied: Default::default(), pinned: Some(remote) }
+    }
+
     /// Speech at fixed addresses (tests, or a voice server run by hand).
     pub fn at(stt: &str, tts: &str) -> Self {
         Self { registry: None, http: reqwest::Client::new(), fixed: Some((stt.to_string(), tts.to_string())), copied: Default::default(), pinned: None }
@@ -61,39 +67,64 @@ impl Engines {
 
     /// Where a speech service answers now: a paired worker's chosen in place of this computer's (OAIY Network, Services
     /// → Other computers), else this computer's own, started if it is not running; either waited on until it answers.
+    /// That computer not answering (the heartbeat found it so, or it does not answer now), a call goes on with this
+    /// computer's own OAIY Voice where it is set up here, and says so in the log; the other is used again once it answers.
     async fn target(&self, id: &'static str) -> Result<Target, String> {
         let remote = match &self.pinned {
             Some(r) => Some(r.clone()),
             None if self.fixed.is_none() && self.registry.is_some() => crate::network::service_target(id),
             None => None,
         };
-        {
-            if let Some(remote) = remote {
-                let started = Instant::now();
-                let mut unreachable = 0;
-                loop {
-                    match remote.client.get(format!("{}/v1/models", remote.base)).timeout(Duration::from_secs(5)).send().await {
-                        Ok(r) if r.status().is_success() => break,
-                        Ok(r) if !matches!(r.status().as_u16(), 503 | 502) => {
-                            return Err(format!("{id} on {}: HTTP {}: {}", remote.node_name, r.status(), r.text().await.unwrap_or_default()));
-                        }
-                        // (the worker itself not answering, not its service starting: said at once, not waited on
-                        // for each line of a call; asked a second time for a moment's dropout)
-                        Err(e) => {
-                            unreachable += 1;
-                            if unreachable >= 2 {
-                                return Err(format!("{} does not answer ({id} is used there): {e}", remote.node_name));
-                            }
-                            tokio::time::sleep(Duration::from_millis(700)).await;
-                        }
-                        _ if started.elapsed() > START_WAIT => return Err(format!("{id} on {} did not answer within {} s", remote.node_name, START_WAIT.as_secs())),
-                        _ => tokio::time::sleep(Duration::from_millis(500)).await,
-                    }
+        if let Some(remote) = remote {
+            let unanswered = if remote.offline && self.installed_here(id) {
+                format!("{} is not answering (its last heartbeat)", remote.node_name)
+            } else {
+                match self.reach(id, &remote).await {
+                    Ok(()) => return Ok(Target { http: remote.client.clone(), base: remote.base.clone(), remote: Some(remote) }),
+                    Err((e, true)) if self.installed_here(id) => e,
+                    Err((e, _)) => return Err(e),
                 }
-                return Ok(Target { http: remote.client.clone(), base: remote.base.clone(), remote: Some(remote) });
+            };
+            // (said once a minute at most: a call asks for each line)
+            static SAID: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+            let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
+            if said.is_none_or(|at| at.elapsed() > Duration::from_secs(60)) {
+                *said = Some(Instant::now());
+                log::warn!("voice: {unanswered}; this computer's own OAIY Voice answers meanwhile");
             }
         }
         Ok(Target { http: self.http.clone(), base: self.base(id).await?, remote: None })
+    }
+
+    /// A worker's speech service, asked until it answers (it starts there when asked): why not, and whether that is
+    /// the worker itself not answering (`true`), not its service.
+    async fn reach(&self, id: &'static str, remote: &crate::network::ServiceTarget) -> Result<(), (String, bool)> {
+        let started = Instant::now();
+        let mut unreachable = 0;
+        loop {
+            match remote.client.get(format!("{}/v1/models", remote.base)).timeout(Duration::from_secs(5)).send().await {
+                Ok(r) if r.status().is_success() => return Ok(()),
+                Ok(r) if !matches!(r.status().as_u16(), 503 | 502) => {
+                    return Err((format!("{id} on {}: HTTP {}: {}", remote.node_name, r.status(), r.text().await.unwrap_or_default()), false));
+                }
+                // (the worker itself not answering, not its service starting: said at once, not waited on for each
+                // line of a call; asked a second time for a moment's dropout)
+                Err(e) => {
+                    unreachable += 1;
+                    if unreachable >= 2 {
+                        return Err((format!("{} does not answer ({id} is used there): {e}", remote.node_name), true));
+                    }
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+                _ if started.elapsed() > START_WAIT => return Err((format!("{id} on {} did not answer within {} s", remote.node_name, START_WAIT.as_secs()), false)),
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    /// Whether this computer has its own of service `id` set up, to answer in a worker's place.
+    fn installed_here(&self, id: &str) -> bool {
+        self.registry.as_ref().and_then(|r| r.lock().ok()).is_some_and(|r| r.snapshot().services.iter().any(|s| s.id == id && s.installed))
     }
 
     /// The voice as `target` knows it: this computer's own name, or on a worker the copy of its clip kept there (copied

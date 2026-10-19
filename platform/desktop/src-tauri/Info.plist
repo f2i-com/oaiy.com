@@ -7,6 +7,12 @@
 	     computer) is the one place the window listens. -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>OAIY uses the microphone when you answer or make a phone call at this computer.</string>
+	<!-- macOS asks before an app reaches other computers on the local network, and shows this sentence when it asks
+	     (an app with none has its local connections refused without a question). OAIY Network is the one part that
+	     does: once switched on in Setup, Networking, it finds, pairs with and uses other OAIY computers on the LAN.
+	     Tauri merges this file into the app's own Info.plist. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>OAIY Network finds and connects to the other OAIY computers on your network that you pair with, to use their models or lend them this one's.</string>
 	<!-- No App Nap: OAIY answers calls, runs its engines' gateway and downloads, and lends itself to the computers on
 	     the network while its window is hidden, and macOS naps an app with no window showing (its threads at the
 	     background priority, its disk reads throttled: a model file's SHA-256 read at a tenth of the speed). -->

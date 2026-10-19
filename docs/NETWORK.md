@@ -69,8 +69,13 @@ to the computers it pairs with) and **Lend this computer** (it is a worker to th
 models while it uses another's OAIY Voice, say.
 
 1. **On the computer that lends** (its GPUs, models, shared flows or OAIY Voice): switch on *Lend this computer*. It
-   listens on port 17975 (change it there), only on LAN addresses, and shows the addresses another computer can type.
-   Allow OAIY through the computer's firewall for that port if it asks.
+   listens on port 17975 (change it there), only on LAN addresses, and shows the addresses another computer can type:
+   those of its adapters that are up, the one its default route leaves by first (Windows lists adapters that are down,
+   and virtual ones, in adapter order). Allow OAIY through the computer's firewall for that port if it asks; a Mac
+   asks once whether OAIY may find and connect to devices on the local network (`NSLocalNetworkUsageDescription` in
+   the app's Info.plist says why): allow it. Saving the page again (a new name, *Use other computers* switched on or
+   off) keeps the listener and the connections of the computers using it; only another port or address, or *Lend this
+   computer* switched off, starts it again. A new name is said again on the LAN.
 2. **On the computer that uses it**: switch on *Use other computers*. Computers lending themselves show under *Add a
    computer to use* (found by mDNS); where computers cannot find each other (Wi-Fi client isolation, VLANs, a
    firewall), type the address the other computer's page shows. Looking for them listens for mDNS on UDP port 5353,
@@ -80,14 +85,20 @@ models while it uses another's OAIY Voice, say.
    it is on) shows the same code under *Asking to use this computer*. Approve it there only if the codes match. This
    computer then asks whether the other showed the same code: *Yes, pair* pairs them; *No* pairs nothing and the
    other forgets this computer. *Stop waiting* withdraws the request. The request expires after five minutes; one
-   approved there that this computer never answered is undone there then too. Where this computer lends itself too,
-   *Let it use this computer too* (ticked) pairs them both ways at once: the other may then use this computer as well
-   (once *Use other computers* is on there), and is told where this computer listens.
+   approved there that this computer never answered is undone there then too, even where this computer stopped or
+   restarted first: the other undoes an approval whose computer it has not heard from (its heartbeat, which starts
+   with its person's yes) within six minutes. Where this computer lends itself too, *Let it use this computer too*
+   (ticked) pairs them both ways at once: the other may then use this computer as well (once *Use other computers* is
+   on there), and is told where this computer listens. Where that cannot be done (this computer not lending itself
+   after all, or the other not told), they are paired one way, and the answer says so (`bothWays: false`, with why as
+   `bothWaysError`).
 4. Each paired computer is one card under *Paired computers*, saying which way it is paired (*This computer uses
    it*, *Uses this computer*, or both). One this computer uses shows its GPUs (memory in use as a meter and how busy
    each is), the job it is running, its models with their state and where each is loaded, the flows it shares and
-   the services it lends. One that does not answer is shown offline with why, and what it last reported dimmed
-   (*Last report … ago*).
+   the services it lends. One that does not answer is shown offline with why (*could not connect to
+   192.168.1.20:17975* for one that is off or gone, never *took too long*), and what it last reported dimmed (*Last
+   report … ago*). What a computer's engines say comes with its name (*Rig's engines are not running*), never as
+   this computer's.
 
 Unpair from either side: both ways are forgotten, the other side refuses it from then on, and a computer that used it
 shows it offline with why.
@@ -133,7 +144,9 @@ page sets it too).
 
 Once paired, a worker's models are in the primary's engine catalogue (`GET /api/ai/engine/services`), each as
 `engine:<kind>:node.<nodeId>/<model>`, named `… · <worker's name>`, never a default, and marked `nodeId`,
-`nodeName`, `locality: "network"`, `ready` (the worker answers now) and `pinned`.
+`nodeName`, `locality: "network"`, `ready` (the worker and its engines answer now), `nodeOnline` (the computer
+answers now, its engines up or not) and `pinned`; a language model also `contextTokens`, the context it runs with
+there (its engines' discovery, `llm.context_tokens`; null before they say), which the Agent plans its window by.
 
 - **Flows**: the model menus of the typed nodes (Image Gen, the AI node, video, speech…) list them beside this
   computer's; a worker that is offline is shown *(offline)*. A flow that names one runs that step on the worker,
@@ -161,25 +174,34 @@ Once paired, a worker's models are in the primary's engine catalogue (`GET /api/
   default on a worker that is offline says so when it is used; one not heard from since this computer started
   leaves this computer's own in place until it is. Set with `PUT /api/network/settings`
   `{"defaults": {"image": "engine:image:node.<id>/<model>"}}` (`null` gives it back), listed in `GET
-  /api/network/status` as `defaults`; the Agent's `model_set_default` takes a worker's model's id too.
+  /api/network/status` as `defaults`, each with `inEffect` (the catalogue marks it its kind's default) and, where it
+  is not, why it waits (`waiting`: `not_heard`, that computer not heard from since this one started; `engines_down`,
+  its engines not answering since; `model_gone`, the model no longer one of its); the Agent's `model_set_default`
+  takes a worker's model's id too.
 - **Any client of this desktop** reaches a worker's media routes at `/api/network/nodes/<id>/gateway/v1/…` and its
   chat at `/api/network/nodes/<id>/v1/chat/completions` (streamed as the worker streams it), with the desktop's own
   credentials (scope `ai.use`).
 
 **What a computer has, and its queue.** Each heartbeat a worker tells the computers that use it its processor
-(name, cores, how busy over the last minute), its memory (in use of all), its GPUs (memory in use of all, VRAM
+(name, as Windows, macOS or Linux names it to a person, cores, how busy: the last minute's load on a Mac or Linux,
+its time not idle since it was last asked on Windows), its memory (in use of all), its GPUs (memory in use of all, VRAM
 where it is the card's own, how busy, how warm) and its **queue**: the media jobs its engines are making and have
 waiting (their kind, model, stage and progress, never what they were asked to make) and the flow runs it is running
 or has waiting (a flow's id and run id for the asking computer's own runs alone), running first. The Networking
 page shows them on each paired computer's card (*Processor*, *Memory (RAM)*, each GPU's *VRAM*, *Queue: 1 running,
-2 waiting*), and the Agent's `network_status` as `cpu`, `ramMb`, `gpus` and `queue`. A worker runs its jobs one
+2 waiting*), and the Agent's `network_status` as `cpu`, `ramMb`, `gpus` and `queue`. A worker answers its heartbeat
+within five seconds whatever its engines do (each reading asked at once, within that), and the primary waits eight:
+a busy worker shows its engines slow (`enginesError`), not itself offline. A worker runs its jobs one
 after another in its own queue; Flows → *On other computers* queues another run of a flow while one runs
 (*Queue another on …*), each followed and stopped on its own.
 
 A model that is offline, or a worker that refuses, answers `503 node_offline` naming the worker and why
-(*connection refused*, *the worker no longer accepts this computer*): nothing falls back to another model. A chat
-naming a language model the worker no longer runs (its person chose another) is `409 model_unavailable`, naming
-the one it runs, rather than answered by that one. A media answer names its files at the primary's route for the
+(*connection refused at …*, *could not connect to …*, *Rig is not paired with the computer asking*): nothing falls
+back to another model. A chat naming a language model the worker no longer runs (its person chose another) is
+answered by the one it runs now where that worker's language model is this computer's default (it is whichever it
+runs: the Agent, which reads its model once a minute, does not fail meanwhile); otherwise it is `409
+model_unavailable`, naming the one it runs and how to follow it (*Rig runs gemma now, not qwen (its language model
+was changed there): choose Rig's gemma instead, or make Rig's language model this computer's default*). A media answer names its files at the primary's route for the
 worker, as the caller reached the primary (`http://<host>/api/network/nodes/<id>/gateway/files/…`).
 
 ## A worker's flows
@@ -193,10 +215,15 @@ models and GPUs:
   is followed as it goes (and can be stopped), and its answer shows when it is done: its pictures, read through the
   primary, and its words.
 - **The Agent**: `flows_list` with `node` lists a worker's shared flows, and `flow_run` with `node` runs one there
-  (waiting for it by default, its pictures handed to the Agent as images).
+  (waiting for it by default, its pictures handed to the Agent as images). Each such run has a key: asked once more
+  with it where the worker did not answer before the run started, and given with an error that lost track of it, so
+  `flow_run` again with that `key` follows the same run rather than running the flow twice.
 - **Routes**: `GET /api/network/nodes/:id/flows`, `POST /api/network/nodes/:id/flows/:flow/runs`
   (`{input?, timeoutMs?, wait?, key?}`: answered at once with the run, or with `wait` once it has finished),
-  `GET /api/network/nodes/:id/runs/:run`, `POST /api/network/nodes/:id/runs/:run/cancel`.
+  `GET /api/network/nodes/:id/runs/:run`, `POST /api/network/nodes/:id/runs/:run/cancel`. The same `key` is the same
+  run (a key is made where none is given). Waiting, the primary asks again through a few polls that go unanswered
+  (a Wi-Fi blip, a busy moment), a little later each time; past four in a row it answers the error with the run's
+  `runId`, its last state (`run`) and its `key`, to follow it or ask again with the key.
 
 A run is kept in the worker's own run ledger (its Run history), under the primary that asked: a primary reads and
 stops its own runs alone. Pictures in a run's input that are this primary's are sent inline (the worker cannot read
@@ -205,14 +232,19 @@ the primary's addresses); the pictures a run makes are named at the primary's ro
 ## A worker's services: OAIY Voice
 
 A worker lends its primary **OAIY Voice** when it is set up there: **Services → On other computers** lists it, and
-*Use it here* makes it this computer's speech in place of its own (*Use this computer's* gives it back). The
+*Use it here* makes it this computer's speech in place of its own (*Use this computer's* gives it back, even while
+that computer is asleep: one in use is listed with it, `heard: false`, until it is heard from again). The
 computer connected to the phone stays the primary: its calls, the transcription route (`/api/voice/transcribe`, the
 flow editor's speech-to-text and the Agent's listening) then send their speech-to-text and speech to the worker,
 which starts its OAIY Voice when asked. A call's voice is copied to the worker the first time it is used there (kept
 there as `from-<primary>-<name>`, beside the worker's own voices, `<primary>` being sixteen hex digits of the primary's
 certificate, which no other computer can take as its own, as it could a node id). A plugin's setup that asks for OAIY Voice counts
 the worker's. Set with `PUT /api/network/settings` `{"services": {"oaiy-voice": "<nodeId>"}}` (`null` gives it back),
-listed in `GET /api/network/status` as `services`.
+listed in `GET /api/network/status` as `services` (each with `heard`, whether that computer has been heard from since
+this one started, and `online`). While that computer does not answer (its heartbeat found it so, or it does not
+answer now, twice), a call, a transcription or the Agent's listening is heard and spoken by this computer's own
+OAIY Voice where it is set up here, said in the log (*voice: Rig is not answering …; this computer's own OAIY Voice
+answers meanwhile*, once a minute at most), and by the worker's again once it answers.
 
 The worker lends that service's speech routes alone (`/worker/v1/services/oaiy-voice/…`: its models and voices,
 `/v1/audio/transcriptions`, `/v1/audio/speech`, streamed as it speaks), and no other service: one a person added
@@ -276,11 +308,11 @@ restricted, as `/api/engines/` are):
 
 | Route | Scope | What |
 | --- | --- | --- |
-| `GET /api/network/status` | auth.read | On or off, the role, this computer's name, fingerprint and addresses |
-| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, agent, shareModels, openPairingMinutes, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before; `agent`, `shareModels`, `openPairingMinutes`, `defaults` or `services` alone restart nothing; a port another program has is refused before anything is kept, and a listener that cannot start leaves this computer using others, said as `listenError`) |
+| `GET /api/network/status` | auth.read | On or off, the role, this computer's name, fingerprint and addresses; `defaults` (with `inEffect`, `waiting`) and `services` (with `heard`, `online`) chosen on other computers |
+| `PUT /api/network/settings` | auth.manage | `{enabled, uses, lends, agent, shareModels, openPairingMinutes, name, port, bind, defaults, services}` (`role`: one of `primary`, `worker`, `both`, as before; the listener is started again only for another `port` or `bind`, or `lends`/`enabled` switched, so `name` and `uses` restart nothing of it, nor `agent`, `shareModels`, `openPairingMinutes`, `defaults` or `services`; a port another program has is refused before anything is kept, and a listener that cannot start leaves this computer using others, said as `listenError`) |
 | `POST /api/network/discover` | auth.manage | The workers found on the LAN |
 | `POST /api/network/pairings/start` | auth.manage | `{address}` or `{nodeId}`: the code to compare (`pending`, or `approved_there` where the worker's window approved it at once; paired only by `confirm`) |
-| `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here (`false`: not, and the worker forgets it, or withdraws the request it has not answered) |
+| `POST /api/network/pairings/confirm` | auth.manage | `{pairingId, accept?, bothWays?}`: `pending`, `approved_there` (the worker approved), then with `accept: true` paired here, answering `bothWays` (paired both ways) and `bothWaysError` (why not, where asked) (`false`: not, and the worker forgets it, or withdraws the request it has not answered) |
 | `GET /api/network/requests` | auth.read | On a worker: primaries asking to pair, each with its code |
 | `POST /api/network/requests/:id/approve`, `…/deny` | auth.manage, auth.revoke | The worker's person decides |
 | `GET /api/network/nodes` | auth.read | The paired computers, online or not, their GPUs and models |
@@ -337,9 +369,12 @@ Mac's own):
 | Pairing, both screens | `approved_there` after the worker's yes, paired only on the primary's yes |
 
 The desktop's tests cover the same with a fake engine (src/network/tests.rs: pairing and use, the committed pairing
-code, a pairing given up or run out, a stranger and an impostor, unpairing from each side and while a worker is
-off, pins, paths that would leave the gateway (dot segments, tabs and newlines, encoded slashes), a worker saved
-again on its port, off and public addresses refused), and the Studio's the pins with a fake picture worker
+code, a pairing given up or run out, an approval never confirmed, a stranger and an impostor, unpairing from each
+side and while a worker is off, pins, paths that would leave the gateway (dot segments, tabs and newlines, encoded
+slashes), a worker saved again on its port and settings saved keeping its connections, a chat on the default
+following the model run there, defaults and services waiting for a computer not heard from, OAIY Voice answered here
+while the worker does not, a busy worker's heartbeat, a run followed through misses and joined by its key, errors
+naming the computer, off and public addresses refused), and the Studio's the pins with a fake picture worker
 (`a_pinned_picture_model_is_loaded_kept_and_never_let_go_by_a_job`) and a fake eGPU card
 (`a_pin_on_the_card_keeps_it_lent_through_a_job_refused_for_it`).
 
@@ -363,6 +398,10 @@ again on its port, off and public addresses refused), and the Studio's the pins 
   itself): that one shows it *no longer lends itself* until its person unpairs it there too.
 - **Credential rotation**: a computer's identity is made once; to replace it, delete `network/` in its data folder
   and pair again.
+- **No route to change a paired computer's address by hand** (one that reconnects only where the computer there has
+  the pinned certificate): a new route needs its place in the desktop's route table (`auth/routes.rs`). A computer
+  that moved is found at its new address by discovery (its heartbeat tries where the LAN last saw it), else paired
+  again at the new address.
 - **Not measured on a second physical computer** yet: the tests above ran both sides on one Mac (loopback), and
   discovery by mDNS was not exercised between two computers.
 - `network/` is left out of backups: a restored computer is a new one to its peers, and pairs again.
