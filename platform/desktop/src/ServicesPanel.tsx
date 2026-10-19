@@ -246,7 +246,7 @@ export default function ServicesPanel() {
         </div>
       )}
       {!snapshot && !error && (
-        <div className="empty-state">Loading services…</div>
+        <div className="empty-state is-loading">Loading services…</div>
       )}
       {grouped.map(([category, svcs]) => (
         <section key={category} className="service-section">
@@ -591,7 +591,7 @@ function AutostartToggle({ serviceId, autostart }: { serviceId: string; autostar
     <div style={CARD_ROW_STYLE}>
       {/* Wrapping the input in the <label> associates the two, so the checkbox
           has an accessible name. */}
-      <label style={{ opacity: 0.8, display: 'flex', alignItems: 'center', gap: 6 }}>
+      <label className="service-autostart">
         <input
           type="checkbox"
           checked={on}
@@ -618,7 +618,7 @@ function AutostartToggle({ serviceId, autostart }: { serviceId: string; autostar
         />
         Start with the app
       </label>
-      <span style={{ opacity: 0.6, fontSize: '0.85em' }}>applies at next launch</span>
+      <span className="form-hint">applies at next launch</span>
       {error && <span className="service-error">⚠ {error}</span>}
     </div>
   );

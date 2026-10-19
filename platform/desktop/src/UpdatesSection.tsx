@@ -144,7 +144,7 @@ export default function UpdatesSection() {
         {readError ? (
           <LoadError error={readError} what="The update status" onRetry={refresh} />
         ) : (
-          <div className="empty-state empty-state-sm">Loading…</div>
+          <div className="empty-state empty-state-sm is-loading">Loading…</div>
         )}
       </section>
     );

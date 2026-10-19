@@ -6,10 +6,17 @@
 /* Five tiles a row at most, each a fifth of the row: a section with fewer keeps its tiles tile-sized (one alone is
    not stretched across the page), and the Overview's sections line their tiles up in the same columns. */
 .overview-grid { gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, max(140px, calc((100% - 48px) / 5))), 1fr)); }
-.overview-tile { padding: 18px 20px; gap: 8px; background: var(--surface-solid); box-shadow: var(--shadow-card); }
-.overview-tile strong { font-size: 26px; line-height: 1.15; }
-.overview-tile small { font-size: 13px; line-height: 1.5; }
+/* A tile: its icon, its figure and a line under it. Every tile's figure the same size, the Today row's and This
+   computer's (26px beside 18px read as two designs); the icon faint until pointed at, as the sidebar's. */
+.overview-tile { padding: 16px 18px; gap: 6px; background: var(--surface-solid); box-shadow: var(--shadow-card); }
+.overview-tile > svg { margin-bottom: 2px; color: var(--faint); transition: color 0.15s; }
+.overview-tile:hover > svg { color: var(--text); }
+.overview-tile-static:hover > svg { color: var(--faint); }
+.overview-tile strong { font-size: clamp(17px, 1.55vw, 21px); font-weight: 650; letter-spacing: -0.015em; line-height: 1.2; }
+.overview-tile small { color: var(--muted); font-size: 12.5px; line-height: 1.45; }
 .service-card { box-shadow: var(--shadow-card); }
+.overview-tile:hover { background: var(--surface-raised); }
+.overview-tile-static:hover { background: var(--surface-solid); }
 .banner { flex-wrap: wrap; line-height: 1.5; }
 .banner > span { min-width: 0; overflow-wrap: anywhere; flex: 1 1 240px; }
 .btn, .icon-button { min-height: 34px; }

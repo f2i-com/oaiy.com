@@ -55,7 +55,6 @@
 .contact-row:hover { background: color-mix(in srgb, var(--primary) 5%, transparent); }
 .contact-row.is-selected { background: var(--primary-soft); }
 .contact-row.is-selected::before { position: absolute; top: 8px; bottom: 8px; left: 0; width: 3px; border-radius: 0 3px 3px 0; background: var(--primary); content: ''; }
-:root:not([data-theme='light']) .contact-row.is-selected::before { box-shadow: 0 0 8px var(--primary); }
 .contact-row:focus-visible { outline-offset: -2px; }
 
 .contact-avatar {
@@ -80,15 +79,18 @@
 .contact-meta { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .contact-meta em {
   display: inline-flex;
+  height: 20px;
   align-items: center;
   gap: 4px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--surface-soft);
   color: var(--muted);
-  padding: 1px 8px;
+  padding: 0 8px;
   font-size: 11px;
   font-style: normal;
+  font-weight: 600;
+  line-height: 1;
   white-space: nowrap;
 }
 
@@ -98,7 +100,7 @@
 /* ---- one person ---------------------------------------------------------------------------- */
 
 /* The panel fits the window below the toolbar, so its buttons are in view without scrolling the page. */
-.contacts-side { max-height: calc(100dvh - 78px - 54px - var(--page-pad-t) - 66px); }
+.contacts-side { max-height: calc(100dvh - 78px - var(--dock-h, 54px) - var(--page-pad-t) - 66px); }
 .contacts-side .cal-side-body { display: flex; flex-direction: column; gap: 10px; }
 /* The body scrolls; what is in it keeps its height. */
 .contacts-side .cal-side-body > * { flex-shrink: 0; }

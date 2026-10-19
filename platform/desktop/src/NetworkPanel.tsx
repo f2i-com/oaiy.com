@@ -167,7 +167,7 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
             <div className="empty-state">This computer’s place on OAIY Network, and the computers paired with it, show here once it can be read.</div>
           </>
         ) : (
-          <div className="empty-state">Loading…</div>
+          <div className="empty-state is-loading">Loading…</div>
         )}
       </div>
     );

@@ -340,7 +340,7 @@ export default function PluginsPanel() {
 
       {!snapshot ? (
         // (not read, and the banner above says why: no "Loading" under it that never ends)
-        !error && <div className="empty-state">Loading plugins…</div>
+        !error && <div className="empty-state is-loading">Loading plugins…</div>
       ) : list.length === 0 ? (
         <PluginCatalog onInstall={(path) => setInstallSource(path)} />
       ) : (

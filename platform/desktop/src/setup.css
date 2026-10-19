@@ -156,7 +156,7 @@
 .setup-rail-item.is-skipped .setup-rail-mark { border-style: dashed; color: var(--faint); }
 .setup-rail-item.is-current .setup-rail-mark {
   border-color: var(--primary);
-  color: var(--primary);
+  color: var(--primary-text);
   box-shadow: 0 0 0 3px var(--primary-soft);
 }
 .setup-rail-text { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
@@ -219,7 +219,7 @@
 .setup-step-titles { min-width: 0; }
 .setup-kicker {
   display: block;
-  color: var(--primary);
+  color: var(--primary-text);
   font-family: var(--font-mono);
   font-size: 10.5px;
   font-weight: 650;
@@ -236,7 +236,6 @@
   font-weight: 660;
   letter-spacing: -0.01em;
 }
-.setup-step-head h2 .badge { font-size: 10.5px; }
 .setup-step-head p {
   max-width: 72ch;
   margin: 6px 0 0;
@@ -386,12 +385,17 @@ details.setup-more-source > summary:hover { color: var(--text); }
 .setup-plugin-meta { color: var(--faint); font-family: var(--font-mono); font-size: 11px; }
 .setup-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 .setup-chip {
+  display: inline-flex;
+  height: 20px;
+  align-items: center;
   border: 1px solid var(--border);
   border-radius: 99px;
   background: var(--surface-solid);
   color: var(--muted);
-  padding: 2px 9px;
-  font-size: 11.5px;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
 }
 .setup-chip.is-need { border-style: dashed; }
 
@@ -511,7 +515,7 @@ details.setup-more-source > summary:hover { color: var(--text); }
 }
 .setup-run-note > svg { flex: none; }
 .setup-run-note > span { display: flex; min-width: 0; flex: 1 1 260px; flex-direction: column; }
-.setup-run-note small { color: var(--danger); font-size: 11.5px; }
+.setup-run-note small { color: var(--danger); font-size: 12px; }
 .setup-screen-step > .setup-run-note { margin: 10px 24px 0; }
 .setup-req-body > p.card-warn { color: var(--amber); }
 
@@ -567,7 +571,7 @@ details.setup-more-source > summary:hover { color: var(--text); }
 }
 .setup-nudge > svg { flex: none; color: var(--primary); }
 .setup-nudge > span { display: flex; min-width: 0; flex: 1 1 200px; flex-direction: column; }
-.setup-nudge > span small { color: var(--muted); font-size: 11.5px; }
+.setup-nudge > span small { color: var(--muted); font-size: 12px; }
 .service-card .setup-nudge { margin-top: 10px; }
 
 /* ---- your AI: on this computer, or ChatGPT (the wizard, and Settings → Agent) --- */

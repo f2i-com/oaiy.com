@@ -80,7 +80,7 @@ export default function HoursPanel({
           onOpenCalendar={onOpenCalendar}
         />
       ) : (
-        !error && <div className="empty-state">Reading the business settings…</div>
+        !error && <div className="empty-state is-loading">Reading the business settings…</div>
       )}
     </div>
   );

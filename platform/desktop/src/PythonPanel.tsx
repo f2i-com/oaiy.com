@@ -141,7 +141,7 @@ export default function PythonPanel() {
         {error ? (
           <LoadError error={error} what="Python on this computer" onRetry={refresh} />
         ) : (
-          <div className="empty-state">Loading…</div>
+          <div className="empty-state is-loading">Loading…</div>
         )}
       </div>
     );

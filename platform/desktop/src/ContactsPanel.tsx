@@ -177,7 +177,7 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
         <div className={`contacts-main${side ? ' has-side' : ''}`}>
           <div className="contacts-board">
             {list === null ? (
-              !error && <div className="empty-state">Reading the contacts…</div>
+              !error && <div className="empty-state is-loading">Reading the contacts…</div>
             ) : list.length === 0 ? (
               <div className="empty-state contacts-empty">
                 <BookUser size={22} aria-hidden />

@@ -943,7 +943,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
   if (record === undefined) {
     return (
       <div className="panel">
-        <div className="empty-state">Loading…</div>
+        <div className="empty-state is-loading">Loading…</div>
       </div>
     );
   }
@@ -996,7 +996,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
       <PluginVoiceControls view={voiceView} session={voiceSession.current} pluginName={record.manifest?.name ?? record.id} />
       {documentRevoked && <div className="banner banner-err" role="alert">This plugin document navigated or closed. Its voice permission and pending deliveries were revoked. Reopen the screen from OAIY to continue; actions already sent may still finish.</div>}
       {doc === null ? (
-        <div className="empty-state" role="status">Loading screen…</div>
+        <div className="empty-state is-loading" role="status">Loading screen…</div>
       ) : (
         <iframe
           key={`${attempt}:${doc.nonce}`}

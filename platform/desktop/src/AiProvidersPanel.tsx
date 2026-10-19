@@ -460,7 +460,7 @@ export default function AiProvidersPanel() {
           </button>
         </div>
       ) : providers === null ? (
-        <div className="empty-state">Loading providers…</div>
+        <div className="empty-state is-loading">Loading providers…</div>
       ) : providers.length === 0 ? (
         <div className="empty-state">
           <Sparkles size={22} aria-hidden />

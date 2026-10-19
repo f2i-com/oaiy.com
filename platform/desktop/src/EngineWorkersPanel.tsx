@@ -70,7 +70,7 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
   };
 
   if (!status) {
-    return <div className="panel">{error ? <LoadError error={error} what="The other computers" onRetry={refresh} /> : <div className="empty-state">Loading…</div>}</div>;
+    return <div className="panel">{error ? <LoadError error={error} what="The other computers" onRetry={refresh} /> : <div className="empty-state is-loading">Loading…</div>}</div>;
   }
 
   if (!status.uses) {

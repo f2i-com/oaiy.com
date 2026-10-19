@@ -372,7 +372,7 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
       <div className={`cal-main${side ? ' has-side' : ''}`}>
         <div className="cal-board">
           {!settings && !error ? (
-            <div className="empty-state">Reading the calendar…</div>
+            <div className="empty-state is-loading">Reading the calendar…</div>
           ) : !settings ? null : mode === 'list' ? (
             <AgendaList
               items={appointments}
