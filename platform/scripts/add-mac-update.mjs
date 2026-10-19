@@ -6,14 +6,15 @@
 //        [--conf platform/desktop/src-tauri/tauri.conf.json]
 //   node platform/scripts/add-mac-update.mjs --plan --version 0.1.9 --assets <the release's file names, one a line> \
 //        [--feed <its latest.json>] [--pending-feed <its latest.pending.json>]
-//   node platform/scripts/add-mac-update.mjs --check --dir <the Mac's files> --version 0.1.9 [--conf <tauri.conf.json>]
+//   node platform/scripts/add-mac-update.mjs --check --dir <the Mac's files> --version 0.1.9 --conf <tauri.conf.json>
 //
 // --plan says what a run of the workflow does to the release as it is now, as lines for $GITHUB_OUTPUT (mode, reuse_app,
 // reuse_sig, swap): `make` the Mac's update, reusing a packed app and its .sig that an earlier run put on the release
 // before it failed (so that a run that failed after uploading them can finish: they cannot be replaced, and a new pack is
 // not the same bytes), or `finish` an earlier run that was cut short while it swapped the new feed and checksums in. It
 // refuses a release whose feed has the Mac already (nothing is replaced), and one in a state no run leaves (a .sig with no
-// packed app beside it). --check holds a packed app and its .sig to the key and to what they were made for, with no feed:
+// packed app beside it). --check holds a packed app and its .sig to the key in tauri.conf.json (--conf, which it needs: a
+// check that did not verify the signature would pass files nobody may trust) and to what they were made for, with no feed:
 // the workflow's check of the two it reuses, before it trusts them.
 //
 // The release job writes the feed (make-latest-json.mjs) before a Mac image exists; the Mac update workflow
@@ -242,7 +243,7 @@ function parseArgs(argv) {
 const usage = () =>
   'usage: add-mac-update.mjs --feed <latest.json> --sums <SHA256SUMS.txt> --dir <the Mac\'s files> --version <N.N.N> --image-sha256 <hex> --out <folder> [--tag <tag>] [--repo <owner/name>] [--conf <tauri.conf.json>]' +
   ' | --plan --version <N.N.N> --assets <names> [--feed <latest.json>] [--pending-feed <latest.pending.json>]' +
-  ' | --check --dir <the Mac\'s files> --version <N.N.N> [--conf <tauri.conf.json>]';
+  ' | --check --dir <the Mac\'s files> --version <N.N.N> --conf <tauri.conf.json>';
 
 const readJson = (file, what) => {
   try {
@@ -273,11 +274,12 @@ function plan(args) {
   console.log(`mode=${mode}\nreuse_app=${reuseApp}\nreuse_sig=${reuseSig}\nswap=${swap.join(' ')}`);
 }
 
-/** --check: the packed app and its .sig an earlier run put on the release, before this one reuses them. */
+/** --check: the packed app and its .sig an earlier run put on the release, before this one reuses them. Only against the key. */
 function check(args) {
+  if (!args.conf) throw new FeedError(`--check needs --conf <tauri.conf.json>: without the key the signature is not checked, and the files are not to be trusted; ${usage()}`);
   requireArgs(args, ['dir', 'version']);
-  checkMacFiles({ dir: path.resolve(args.dir), version: args.version, pubkey: args.conf ? readPubkey(path.resolve(args.conf)) : undefined });
-  console.log(`OK: ${macAsset(args.version).asset} and its .sig in ${args.dir} are the Mac's update of ${args.version}${args.conf ? ', signed with the key in tauri.conf.json' : ''}`);
+  checkMacFiles({ dir: path.resolve(args.dir), version: args.version, pubkey: readPubkey(path.resolve(args.conf)) });
+  console.log(`OK: ${macAsset(args.version).asset} and its .sig in ${args.dir} are the Mac's update of ${args.version}, signed with the key in ${args.conf}`);
 }
 
 function write(args) {

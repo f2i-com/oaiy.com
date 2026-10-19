@@ -3,7 +3,8 @@
 //   node --test platform/scripts/add-mac-update.test.mjs
 //
 // Each test starts from a feed and checksums as the release job publishes them (Windows and Linux), and the Mac's files as
-// the Mac update workflow has them after its `sign` job: the packed app and its .sig.
+// the Mac update workflow has them after its `sign` job: the packed app and its .sig. The last part is the Mac build's
+// (mac-build.yml) version rule, the workflow's own text cut out and run as release-version.test.mjs runs release.yml's.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -15,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { addMacEntry, checkMacFiles, imageName, PENDING, planMacUpdate, updateSums } from './add-mac-update.mjs';
 import { FeedError, macAsset } from './make-latest-json.mjs';
 import { makeKeys, sign } from './minisign.testing.mjs';
+import { parseYaml, workflowSteps } from './workflow-yaml.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const script = path.join(here, 'add-mac-update.mjs');
@@ -317,12 +319,22 @@ describe('as the Mac update workflow runs it', () => {
   });
 
   it('--check passes the files an earlier run uploaded, and refuses ones the key in tauri.conf.json did not sign', () => {
-    const good = run(['--check', '--dir', macDir(), '--version', VERSION]);
+    // A tauri.conf.json that carries the test key, standing in for the repository's.
+    const testConf = path.join(root, `conf-${++counter}.json`);
+    fs.writeFileSync(testConf, JSON.stringify({ plugins: { updater: { pubkey: keys.pubkey } } }));
+    const good = run(['--check', '--dir', macDir(), '--version', VERSION, '--conf', testConf]);
     assert.equal(good.status, 0, good.stderr);
-    assert.match(good.stdout, /^OK: oaiy-desktop-0\.1\.9-macos-arm64\.app\.tar\.gz and its \.sig/);
+    assert.match(good.stdout, /^OK: oaiy-desktop-0\.1\.9-macos-arm64\.app\.tar\.gz and its \.sig .*, signed with the key in /);
     const refused = run(['--check', '--dir', macDir(), '--version', VERSION, '--conf', conf]);
     assert.equal(refused.status, 1);
     assert.match(refused.stderr, /::error::the Mac files on the release are NOT reused: .*does not verify against the public key in tauri\.conf\.json/);
+  });
+
+  it('--check without --conf checks nothing and says so, rather than passing files whose signature it did not verify', () => {
+    const unchecked = run(['--check', '--dir', macDir({ withKeys: makeKeys(9) }), '--version', VERSION]);
+    assert.equal(unchecked.status, 1);
+    assert.equal(unchecked.stdout, '');
+    assert.match(unchecked.stderr, /::error::the Mac files on the release are NOT reused: --check needs --conf <tauri\.conf\.json>: without the key the signature is not checked/);
   });
 
   it('accepts the packed app the Tauri CLI really signed, against the key that signed it (testdata/mac-app.bin)', () => {
@@ -340,5 +352,106 @@ describe('as the Mac update workflow runs it', () => {
     fs.copyFileSync(path.join(dir, asset), path.join(dir, newer));
     fs.copyFileSync(path.join(dir, `${asset}.sig`), path.join(dir, `${newer}.sig`));
     assert.throws(() => addMacEntry({ feed: published('0.2.0'), dir, version: '0.2.0', pubkey }), /OAIY_0\.1\.0_aarch64\.app\.tar\.gz.*not version 0\.2\.0/);
+  });
+});
+
+// A Mac build's version with a suffix is a test build, and an installed OAIY with such a version is offered only a release
+// newer than the one the suffix is on (update::version): one named after an older release than the newest would be
+// replaced by the newest, older code than its own, and one named after a release not out yet would never be offered it.
+describe("mac-build.yml: a test build's version, held to the newest release", () => {
+  const repo = path.resolve(here, '..', '..');
+  const document = parseYaml(fs.readFileSync(path.join(repo, '.github', 'workflows', 'mac-build.yml'), 'utf8'));
+  const steps = workflowSteps(document).filter((s) => s.job === 'dmg');
+  const STEP = 'The version, held to the newest release';
+  const step = steps.find((s) => s.name === STEP);
+  const bash = spawnSync('bash', ['-c', 'true']).status === 0;
+
+  /**
+   * The step's script, run as GitHub runs it, with `version` as the input and a `gh` that answers `newest` as the tag of
+   * releases/latest (null: it fails, as with no release or no network). Returns the run and the calls made to `gh`.
+   */
+  function stamp(version, newest) {
+    const dir = path.join(root, `version-${++counter}`);
+    fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+    const calls = path.join(dir, 'gh-calls.txt');
+    fs.writeFileSync(
+      path.join(dir, 'bin', 'gh'),
+      ['#!/usr/bin/env bash', `printf '%s\\n' "$*" >> '${calls}'`, newest === null ? 'echo "gh: Not Found (HTTP 404)" >&2; exit 1' : `printf '%s\\n' '${newest}'`, ''].join('\n'),
+      { mode: 0o755 },
+    );
+    const env = { ...process.env, PATH: `${path.join(dir, 'bin')}${path.delimiter}${process.env.PATH}`, GH_TOKEN: 'read-only', GITHUB_REPOSITORY: 'f2i-com/oaiy.com', VERSION: version };
+    const run = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', step.run], { encoding: 'utf8', env, cwd: dir });
+    return { ...run, calls: fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n') : [] };
+  }
+
+  it('has no default version, so a run that names none stamps none (and not one named after a release that is no longer the newest)', () => {
+    const input = document.on.workflow_dispatch.inputs.version;
+    assert.equal(input.default, '');
+    assert.notEqual(input.required, 'true', 'a run for the engine or WebKit alone names no version');
+  });
+
+  it('is the first step after the checkout, before any of the project’s code runs, with a token that may only read', () => {
+    assert.ok(step, `the dmg job of mac-build.yml has no step "${STEP}"`);
+    assert.equal(steps.indexOf(step), 1);
+    assert.equal(steps[0].uses?.startsWith('actions/checkout@'), true);
+    assert.deepEqual({ ...step.env }, { GH_TOKEN: '${{ github.token }}', VERSION: '${{ inputs.version }}' }, 'the input reaches the script as data');
+    assert.ok(!step.run.includes('${{'), 'nothing is pasted into the script');
+    assert.deepEqual({ ...document.permissions }, { contents: 'read' });
+    assert.equal(document.jobs.dmg.permissions, undefined, 'the job takes the workflow’s permissions');
+  });
+
+  it('passes a test build named after the newest release, asking GitHub only which release that is', { skip: !bash && 'no bash on this machine' }, () => {
+    for (const version of ['0.1.9-mac.1', '0.1.9-mac.44', '0.1.9-rc.1']) {
+      const r = stamp(version, 'v0.1.9');
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+      assert.match(r.stdout, /is a test build of v0\.1\.9, the newest release/);
+      assert.deepEqual(r.calls, ['api repos/f2i-com/oaiy.com/releases/latest --jq .tag_name']);
+    }
+  });
+
+  it('refuses one named after an older release, which the newest would replace, and says what to use', { skip: !bash && 'no bash on this machine' }, () => {
+    const r = stamp('0.1.8-mac.1', 'v0.1.9');
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /::error::0\.1\.8-mac\.1 is named after 0\.1\.8, and the newest release is v0\.1\.9: it would be offered 0\.1\.9, which is older code than its own, and be replaced by it\. Name a test build after the newest release: 0\.1\.9-mac\.1/);
+    // (numbers, not text: 0.1.9 is older than 0.1.10)
+    assert.match(stamp('0.1.9-mac.2', 'v0.1.10').stdout, /older code than its own.*0\.1\.10-mac\.1/);
+  });
+
+  it('refuses one named after a release that is not out, which would never be offered it', { skip: !bash && 'no bash on this machine' }, () => {
+    for (const [version, newest] of [['0.1.9-rc.1', 'v0.1.8'], ['0.1.10-mac.1', 'v0.1.9'], ['1.0.0-beta.1', 'v0.1.9']]) {
+      const r = stamp(version, newest);
+      assert.equal(r.status, 1, version);
+      assert.match(r.stdout, new RegExp(`::error::${version.replace(/\./g, '\\.')} is named after [0-9.]+, which is not released \\(the newest release is ${newest.replace(/\./g, '\\.')}\\): it would never be offered`));
+      assert.match(r.stdout, new RegExp(`Name a test build after the newest release: ${newest.slice(1).replace(/\./g, '\\.')}-mac\\.1`));
+    }
+  });
+
+  it('leaves a release’s own version to the job that adds the image to its release, and asks GitHub nothing for it', { skip: !bash && 'no bash on this machine' }, () => {
+    for (const newest of ['v0.1.8', null]) {
+      const r = stamp('0.1.9', newest);
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+      assert.deepEqual(r.calls, []);
+    }
+  });
+
+  it('refuses no version at all, naming the newest release to name a test build after', { skip: !bash && 'no bash on this machine' }, () => {
+    const r = stamp('', 'v0.1.9');
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /::error::no version to stamp: .*0\.1\.9-mac\.1, as v0\.1\.9 is the newest/);
+    assert.match(stamp('', null).stdout, /::error::no version to stamp/);
+  });
+
+  it('refuses a test build when the newest release cannot be read, and what is not a version', { skip: !bash && 'no bash on this machine' }, () => {
+    const unread = stamp('0.1.9-mac.1', null);
+    assert.equal(unread.status, 1);
+    assert.match(unread.stdout, /::error::the newest release could not be read, so the test build 0\.1\.9-mac\.1 cannot be held to it/);
+    const marker = path.join(root, 'version-marker');
+    for (const version of ['v0.1.9-mac.1', '0.1.9-', '0.01.9-mac.1', '0.1.9-mac 1', '0.1.9-mac.1+abc', `0.1.9-mac.1$(touch ${marker})`, '0.1.9-mac.1"; exit 0; "']) {
+      const r = stamp(version, 'v0.1.9');
+      assert.equal(r.status, 1, version);
+      assert.match(r.stdout, /is not a version: a release's \(0\.1\.9\), or a test build's \(0\.1\.9-mac\.1\)/, version);
+      assert.deepEqual(r.calls, [], version);
+    }
+    assert.equal(fs.existsSync(marker), false, 'nothing the input said was run');
   });
 });

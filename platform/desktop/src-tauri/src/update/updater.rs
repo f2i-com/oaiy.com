@@ -73,6 +73,23 @@ pub enum AutoUpdate {
     Yes,
     /// It cannot, and why (shown next to the link to the releases page).
     No(String),
+    /// No release of OAIY is built for this kind of computer (an Intel Mac), so it cannot, and the releases page has nothing
+    /// for it either. The status says so as `no_release`, which the window goes by, and gives [`NO_RELEASE`] as the reason.
+    NoRelease,
+}
+
+/// Why a build of a kind of computer no release is built for cannot update itself, in words for a person.
+pub const NO_RELEASE: &str = "There is no release of OAIY for this kind of computer, so it cannot update itself.";
+
+impl AutoUpdate {
+    /// Why this build cannot replace itself, in words for a person (None: it can).
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            AutoUpdate::Yes => None,
+            AutoUpdate::No(why) => Some(why.clone()),
+            AutoUpdate::NoRelease => Some(NO_RELEASE.to_string()),
+        }
+    }
 }
 
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -125,6 +142,10 @@ pub struct Status {
     pub can_auto_update: bool,
     /// When it cannot, why: the window shows it beside the link to the releases page.
     pub manual_reason: Option<String>,
+    /// No release of OAIY is built for this kind of computer (an Intel Mac): it gets no updates, and the releases page has
+    /// nothing for it. The window goes by this and not by the words of `manual_reason`, so it neither calls the copy up to
+    /// date nor sends the person to that page.
+    pub no_release: bool,
     /// What stops an install now (empty: nothing does). Only worked out where an install is possible.
     pub blockers: Vec<Blocker>,
     /// The releases page, for a manual download.
@@ -356,10 +377,8 @@ impl Updater {
             note: inner.note.clone(),
             note_link: inner.note.as_ref().and(inner.note_link),
             can_auto_update,
-            manual_reason: match auto {
-                AutoUpdate::Yes => None,
-                AutoUpdate::No(why) => Some(why),
-            },
+            manual_reason: auto.reason(),
+            no_release: auto == AutoUpdate::NoRelease,
             blockers,
             manual_url: RELEASES_URL,
             auto_check: self.auto_check(),
@@ -490,7 +509,7 @@ impl Updater {
 
     /// Start the download of the release found (moves to `downloading`), or say why not.
     pub fn begin_download(&self) -> Result<Release, DownloadRefusal> {
-        if let AutoUpdate::No(why) = self.platform().auto_update() {
+        if let Some(why) = self.platform().auto_update().reason() {
             return Err(DownloadRefusal::NotPossibleHere(why));
         }
         let mut inner = self.lock();
@@ -541,7 +560,7 @@ impl Updater {
 
     /// Take the verified package to install (moves to `installing`), or say why not. Blockers are looked at here.
     pub fn begin_install(&self, now: Instant) -> Result<VerifiedPackage, InstallRefusal> {
-        if let AutoUpdate::No(why) = self.platform().auto_update() {
+        if let Some(why) = self.platform().auto_update().reason() {
             return Err(InstallRefusal::NotPossibleHere(why));
         }
         let blockers = self.blockers_fresh(now);
@@ -1058,8 +1077,34 @@ pub(crate) mod tests {
         assert_eq!(s.state, State::Available);
         assert!(!s.can_auto_update && s.blockers.is_empty());
         assert!(s.manual_reason.unwrap().contains("never replaces itself"));
+        assert!(!s.no_release, "the headless server is a build that will not, not one with no release");
         assert!(matches!(u.begin_download(), Err(DownloadRefusal::NotPossibleHere(_))));
         assert!(matches!(u.begin_install(now + LONG), Err(InstallRefusal::NotPossibleHere(_))));
+    }
+
+    #[test]
+    fn a_kind_of_computer_no_release_is_built_for_says_so_as_its_own_field_beside_the_reason() {
+        struct Fixed(AutoUpdate);
+        impl Platform for Fixed {
+            fn auto_update(&self) -> AutoUpdate {
+                self.0.clone()
+            }
+            fn prepare<'a>(&'a self, _release: &'a Release) -> BoxFuture<'a, Result<(), String>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let (u, _, now) = available();
+        u.set_platform(Arc::new(Fixed(AutoUpdate::NoRelease)));
+        let s = u.status_at(now);
+        assert!(s.no_release && !s.can_auto_update && s.blockers.is_empty());
+        assert_eq!(s.manual_reason.as_deref(), Some(NO_RELEASE));
+        assert_eq!(u.begin_download(), Err(DownloadRefusal::NotPossibleHere(NO_RELEASE.to_string())));
+        assert!(matches!(u.begin_install(now + LONG), Err(InstallRefusal::NotPossibleHere(why)) if why == NO_RELEASE));
+        // Any other reason a copy cannot update itself is not "no release", whatever its words.
+        for auto in [AutoUpdate::No(NO_RELEASE.to_string()), AutoUpdate::No("This copy of OAIY was installed from the MSI package.".into()), AutoUpdate::Yes] {
+            u.set_platform(Arc::new(Fixed(auto.clone())));
+            assert!(!u.status_at(now).no_release, "{auto:?}");
+        }
     }
 
     #[tokio::test]
@@ -1102,10 +1147,11 @@ pub(crate) mod tests {
     fn the_status_serialises_as_camel_case_names_the_window_reads() {
         let (u, _, now) = available();
         let json = serde_json::to_value(u.status_at(now)).unwrap();
-        for key in ["state", "currentVersion", "channel", "latestVersion", "notes", "publishedAt", "lastCheckedAt", "canAutoUpdate", "blockers", "manualUrl", "autoCheck", "note", "noteLink"] {
+        for key in ["state", "currentVersion", "channel", "latestVersion", "notes", "publishedAt", "lastCheckedAt", "canAutoUpdate", "noRelease", "blockers", "manualUrl", "autoCheck", "note", "noteLink"] {
             assert!(json.get(key).is_some(), "{key} in {json}");
         }
         assert_eq!(json["state"], "available");
+        assert_eq!(json["noRelease"], false);
         for (state, name) in [(State::UpToDate, "upToDate"), (State::Idle, "idle"), (State::Checking, "checking"), (State::Downloading, "downloading"), (State::Ready, "ready"), (State::Installing, "installing"), (State::Failed, "failed")] {
             assert_eq!(serde_json::to_value(state).unwrap(), name);
         }

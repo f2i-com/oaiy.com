@@ -42,10 +42,10 @@ function shortDate(iso: string | null): string {
 
 /**
  * No release of OAIY is built for this kind of computer (an Intel Mac): it gets no updates, and the releases page
- * has nothing for it. Known by the desktop's own words for it, the only sign the status carries.
+ * has nothing for it. The desktop says so as `noRelease`, not only in the words of `manualReason`.
  */
-export function noReleaseHere(s: Pick<UpdateStatus, 'canAutoUpdate' | 'manualReason'>): boolean {
-  return !s.canAutoUpdate && /no release of OAIY for this kind of computer/i.test(s.manualReason ?? '');
+export function noReleaseHere(s: Pick<UpdateStatus, 'canAutoUpdate' | 'noRelease'>): boolean {
+  return !s.canAutoUpdate && s.noRelease === true;
 }
 
 /** What the state means, in a sentence. */

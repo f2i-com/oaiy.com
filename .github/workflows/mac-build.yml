@@ -11,7 +11,8 @@
 #
 # The build signs the app ad hoc (tauri.conf.json, bundle.macOS.signingIdentity "-"): a signature an Apple-silicon
 # Mac will run, with no Apple Developer ID behind it, which macOS asks about before it opens it the first time
-# (docs/MAC.md says what to click). The builds are given no secret.
+# (docs/MAC.md says what to click). The builds are given no secret: the image's job reads which release is the newest
+# with the run's own token, which may only read, in the step after its checkout, before any of the project's code runs.
 #
 # The job `sign` then signs that app with the repository's Developer ID and has Apple notarise it, so that a Mac
 # opens it like any app. It runs only when the repository says it has the identity (the variable MAC_SIGNING is
@@ -28,9 +29,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to stamp: a release's own (0.1.9, with release below), or a test build named after the last release (0.1.8 is out: 0.1.8-mac.1), which updates itself only to a release after 0.1.8"
-        required: true
-        default: '0.1.8-mac.1'
+        description: "Version to stamp: a release's own (0.1.9, with release below), or a test build named after the newest release (0.1.9 is the newest: 0.1.9-mac.1), which updates itself only to a release after it; one named after another release is refused. Not needed for engine or webkit."
+        required: false
+        default: ''
       what:
         description: 'all: the image (and its signing) and the engine asked one question on the GPU. engine: no image, and a long prompt to the engine too (an hour). webkit: only what WebKit isolates a page for.'
         type: choice
@@ -176,6 +177,47 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      # A test build is named after the newest release, the one whose code it is built on (0.1.9-mac.1 while 0.1.9 is the
+      # newest): an installed OAIY whose version has a suffix is offered only a release newer than the one it is named
+      # after (update::version). Named after an older release, it would be offered the newest, which is older code than
+      # its own, and be replaced by it; named after one that is not out (0.1.10-rc.1), it would never be offered that
+      # release. So such a version is held here to the release every installed OAIY reads its feed from (releases/latest),
+      # before anything is built. A version with no suffix is a release's own, which `publish` holds to its release.
+      - name: The version, held to the newest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          release='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          build='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9A-Za-z.]+$'
+          if [[ "$VERSION" =~ $release ]]; then
+            echo "$VERSION is a release's own version"
+            exit 0
+          fi
+          [ -z "$VERSION" ] || [[ "$VERSION" =~ $build ]] || { echo "::error::'$VERSION' is not a version: a release's (0.1.9), or a test build's (0.1.9-mac.1)"; exit 1; }
+          newest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" || newest=""
+          latest="${newest#v}"
+          [[ "$latest" =~ $release ]] || latest=""
+          if [ -z "$VERSION" ]; then
+            like="${latest:-0.1.9}"
+            echo "::error::no version to stamp: type a test build's, named after the newest release ($like-mac.1${latest:+, as $newest is the newest}), or a release's own, with the release ($like with release=v$like)"
+            exit 1
+          fi
+          [ -n "$latest" ] || { echo "::error::the newest release could not be read, so the test build $VERSION cannot be held to it"; exit 1; }
+          base="${VERSION%%-*}"
+          if [ "$base" != "$latest" ]; then
+            IFS=. read -r b1 b2 b3 <<< "$base"
+            IFS=. read -r n1 n2 n3 <<< "$latest"
+            if (( b1 < n1 || (b1 == n1 && (b2 < n2 || (b2 == n2 && b3 < n3))) )); then
+              echo "::error::$VERSION is named after $base, and the newest release is $newest: it would be offered $latest, which is older code than its own, and be replaced by it. Name a test build after the newest release: $latest-mac.1"
+            else
+              echo "::error::$VERSION is named after $base, which is not released (the newest release is $newest): it would never be offered $base. Name a test build after the newest release: $latest-mac.1"
+            fi
+            exit 1
+          fi
+          echo "$VERSION is a test build of $newest, the newest release: it is offered only a release after it"
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:

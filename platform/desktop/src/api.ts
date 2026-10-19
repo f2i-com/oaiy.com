@@ -1326,6 +1326,9 @@ export interface UpdateStatus {
   canAutoUpdate: boolean;
   /** When it cannot, why. */
   manualReason: string | null;
+  /** No release of OAIY is built for this kind of computer (an Intel Mac): it gets no updates, and the releases page has
+   *  nothing for it. `manualReason` says so in words; go by this, not by them. */
+  noRelease?: boolean;
   /** What stops an install now; empty when nothing does. */
   blockers: UpdateBlocker[];
   /** The releases page, for a manual download. */

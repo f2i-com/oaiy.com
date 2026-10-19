@@ -318,8 +318,35 @@ mod tests {
         assert_eq!(status["state"], "available");
         assert_eq!(status["canAutoUpdate"], false);
         assert!(status["manualReason"].as_str().unwrap().contains("headless server"));
+        assert_eq!(status["noRelease"], false);
         assert_eq!(status["blockers"], json!([]));
         assert_eq!(status["manualUrl"], "https://github.com/f2i-com/oaiy.com/releases/latest");
+    }
+
+    #[tokio::test]
+    async fn a_kind_of_computer_no_release_is_built_for_is_said_as_no_release_not_only_in_words() {
+        use crate::update::feed::Release;
+        use crate::update::updater::{AutoUpdate, BoxFuture, Platform};
+        struct NoRelease;
+        impl Platform for NoRelease {
+            fn auto_update(&self) -> AutoUpdate {
+                AutoUpdate::NoRelease
+            }
+            fn prepare<'a>(&'a self, _release: &'a Release) -> BoxFuture<'a, Result<(), String>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let (address, _) = stub(Serve::Body(feed("0.2.0"))).await;
+        let (app, updater) = app_at(&format!("{address}/latest.json"));
+        updater.set_platform(Arc::new(NoRelease));
+        updater.set_platform_key(None);
+        let (_, _, before) = call(&app, Method::GET, "/api/update/status", None).await;
+        let (_, _, after) = call(&app, Method::POST, "/api/update/check", None).await;
+        for status in [before, after] {
+            assert_eq!(status["noRelease"], true, "{status}");
+            assert_eq!(status["canAutoUpdate"], false);
+            assert!(status["manualReason"].as_str().unwrap().contains("no release of OAIY for this kind of computer"), "{status}");
+        }
     }
 
     #[tokio::test]

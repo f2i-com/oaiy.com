@@ -328,6 +328,14 @@ rule (as the environment `release` has them) and run the workflow on the tag.
 The image's engine is built with the feature `tinygpu` as well, so it is the engine an NVIDIA
 card in an enclosure is given ([TINYGPU.md](TINYGPU.md)).
 
+A test build, with no `release`, is named after the newest release, whose code it is built on:
+`-f version=0.1.9-mac.1` while 0.1.9 is the newest. The version has no default, and the run's
+first step reads which release is the newest (`releases/latest`, where every installed OAIY reads
+its feed) and refuses a version with a suffix named after another one, saying what to use: one
+named after an older release would be offered the newest, older code than its own, and be
+replaced by it; one named after a release that is not out (`0.1.10-rc.1`) would never be offered
+that release ([UPDATES.md](UPDATES.md#what-can-update-itself)).
+
 ### A Mac's update
 
 `publish` then starts the Mac update (`.github/workflows/mac-update.yml`) on the release's tag,
@@ -371,11 +379,15 @@ of `pack`), not by which files it has:
   only finishes the swap (nothing is packed or signed). If the rename itself keeps failing, the
   run says the one command that finishes it by hand.
 
-So a run that failed is run again, the same way. A packed app that is wrong (the plan refuses a
-`.sig` or a `.sha256` with no archive beside it, and the checks refuse an archive that is not the
-image's app) is made again by deleting the three Mac files from the release first; a release whose
-feed lists the Mac already needs that feed put back without its `darwin-aarch64` entry too (the
-artifact `mac-update-release` of the run that made it has the one it replaced).
+So a run that failed is run again: start a new run (the command below), or press **Re-run all
+jobs** on its page. Not **Re-run failed jobs**: that runs `publish` again with the plan the failed
+run made before it changed the release, so it cannot finish a swap it was cut short in (it reads a
+feed that is gone, or that lists the Mac already, and fails saying so). A packed app that is wrong
+(the plan refuses a `.sig` or a `.sha256` with no archive beside it, and the checks refuse an
+archive that is not the image's app) is made again by deleting the three Mac files from the
+release first; a release whose feed lists the Mac already needs that feed put back without its
+`darwin-aarch64` entry too (the artifact `mac-update-release` of the run that made it has the one
+it replaced).
 
 If it could not be started (the Mac build's summary says so), or failed, run it by hand once
 the image is on the release:

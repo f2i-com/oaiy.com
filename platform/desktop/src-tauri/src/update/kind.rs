@@ -46,7 +46,7 @@ use super::updater::AutoUpdate;
 pub fn auto_update_for(os: &str, arch: &str, bundle: Option<&str>, exe: Option<&Path>) -> AutoUpdate {
     let manual = |why: &str| AutoUpdate::No(why.to_string());
     if platform_key(os, arch).is_none() {
-        return manual("There is no release of OAIY for this kind of computer, so it cannot update itself. Look on the releases page.");
+        return AutoUpdate::NoRelease;
     }
     match (os, bundle) {
         ("windows", Some("nsis")) | ("linux", Some("appimage")) => AutoUpdate::Yes,
@@ -111,7 +111,7 @@ pub fn mac_app_problem(app: &Path) -> Option<String> {
 }
 
 /// Why an app at a path with a quote, a backslash or a control character in it is not updated (see the module's docs).
-const PATH_WITH_QUOTES: &str = "This copy of OAIY is at a path with a quote, a backslash or a control character in it, which the updater cannot take, so it cannot update itself. Drag OAIY to Applications, open it from there, and check again.";
+const PATH_WITH_QUOTES: &str = "This copy of OAIY is at a path with a quote, a backslash or a control character in it, which the updater cannot take, so it cannot update itself. Rename it, or move it to a folder whose path has no quote, backslash or control character, open it from there, and check again.";
 
 /// Whether the updater plugin's AppleScript can take `path` as it writes it (between `'` inside a `"` string, unescaped):
 /// text with no `'`, `"`, `\` or control character. A path that is not text is refused too (the plugin would write
@@ -181,10 +181,7 @@ mod tests {
     }
 
     fn manual_at(os: &str, arch: &str, bundle: Option<&str>, exe: Option<&str>) -> String {
-        match auto_update_for(os, arch, bundle, exe.map(Path::new)) {
-            AutoUpdate::No(why) => why,
-            AutoUpdate::Yes => panic!("{os} {arch} {bundle:?} {exe:?} should not update itself"),
-        }
+        auto_update_for(os, arch, bundle, exe.map(Path::new)).reason().unwrap_or_else(|| panic!("{os} {arch} {bundle:?} {exe:?} should not update itself"))
     }
 
     #[test]
@@ -264,7 +261,9 @@ mod tests {
             "/Applications/OAIY's.app/Contents/MacOS/oaiy-desktop",
         ] {
             let why = manual_at("macos", "aarch64", Some("app"), Some(exe));
-            assert!(why.contains("a quote, a backslash or a control character") && why.contains("Applications"), "{exe:?}: {why}");
+            assert!(why.contains("a quote, a backslash or a control character") && why.contains("Rename it, or move it to a folder whose path has no quote"), "{exe:?}: {why}");
+            // (an app in Applications already, /Applications/OAIY's.app, is not told to go there)
+            assert!(!why.contains("to Applications"), "{exe:?}: {why}");
         }
         // Spaces, letters of other languages and the shell's other signs are written between the quotes as they are.
         for exe in ["/Users/sam/My Apps (2)/OAIY.app/Contents/MacOS/oaiy-desktop", "/Users/zoë/Programme/OAIY.app/Contents/MacOS/oaiy-desktop", "/Users/sam/$HOME & `x`/OAIY.app/Contents/MacOS/oaiy-desktop"] {
@@ -352,8 +351,14 @@ mod tests {
     #[test]
     fn a_platform_with_no_release_is_manual_whatever_the_install() {
         for (os, arch, bundle) in [("macos", "x86_64", Some("app")), ("windows", "aarch64", Some("nsis")), ("linux", "aarch64", Some("appimage")), ("freebsd", "x86_64", None)] {
-            let why = manual_at(os, arch, bundle, Some("/Applications/OAIY.app/Contents/MacOS/oaiy-desktop"));
+            // Said as a kind of its own (the status's `no_release`), which the window goes by, and in words beside it.
+            assert_eq!(auto_update_for(os, arch, bundle, Some(Path::new(INSTALLED))), AutoUpdate::NoRelease, "{os} {arch}");
+            let why = manual_at(os, arch, bundle, Some(INSTALLED));
             assert!(why.contains("no release of OAIY for this kind of computer"), "{os} {arch}");
+        }
+        // Every other reason a copy cannot update itself is one where a release exists.
+        for (os, arch, bundle, exe) in [("windows", "x86_64", Some("msi"), None), ("linux", "x86_64", Some("deb"), None), ("macos", "aarch64", Some("app"), None), ("macos", "aarch64", Some("app"), Some("/Volumes/OAIY/OAIY.app/Contents/MacOS/oaiy-desktop"))] {
+            assert!(matches!(auto_update_for(os, arch, bundle, exe.map(Path::new)), AutoUpdate::No(_)), "{os} {arch} {bundle:?} {exe:?}");
         }
     }
 

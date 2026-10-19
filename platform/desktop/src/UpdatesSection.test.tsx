@@ -49,6 +49,7 @@ const status = (over: Partial<UpdateStatus> = {}): UpdateStatus => ({
   note: null,
   canAutoUpdate: true,
   manualReason: null,
+  noRelease: false,
   blockers: [],
   manualUrl: RELEASES,
   autoCheck: true,
@@ -339,14 +340,23 @@ describe('About and updates', () => {
   });
 
   it('where there is no release for this kind of computer, claims no “up to date” and offers no page with nothing for it', async () => {
-    const manualReason = 'There is no release of OAIY for this kind of computer, so it cannot update itself. Look on the releases page.';
-    await mount(status({ state: 'upToDate', latestVersion: '0.1.0', lastCheckedAt: '2026-10-01T03:00:00Z', canAutoUpdate: false, manualReason, note: 'A newer version (0.2.0) exists, but there is no release of it for this platform. Look on the releases page.', noteLink: RELEASES }));
+    // (known by the status's own field, whatever the words of its reason)
+    const manualReason = 'Some words the desktop may change. Look on the releases page.';
+    await mount(status({ state: 'upToDate', latestVersion: '0.1.0', lastCheckedAt: '2026-10-01T03:00:00Z', canAutoUpdate: false, manualReason, noRelease: true, note: 'A newer version (0.2.0) exists, but there is no release of it for this platform. Look on the releases page.', noteLink: RELEASES }));
     expect(text()).not.toContain('up to date');
     expect(text()).toContain('There are no updates of OAIY for this kind of computer.');
     expect(text()).not.toContain('Look on the releases page');
     expect(text()).not.toContain('Latest version');
     expect(button('Download manually')).toBeUndefined();
     expect(button('Releases page')).toBeUndefined();
+  });
+
+  it('goes by the field and not the words: the same words with noRelease false are an ordinary manual download', async () => {
+    const manualReason = 'There is no release of OAIY for this kind of computer, so it cannot update itself.';
+    await mount(status({ state: 'upToDate', latestVersion: '0.1.0', lastCheckedAt: '2026-10-01T03:00:00Z', canAutoUpdate: false, manualReason, noRelease: false }));
+    expect(text()).toContain('OAIY is up to date.');
+    expect(text()).toContain(manualReason);
+    expect(button('Download manually')).toBeTruthy();
   });
 
   it('after an install that failed and kept its download, says so and offers “Try again”', async () => {

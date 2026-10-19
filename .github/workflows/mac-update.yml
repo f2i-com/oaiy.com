@@ -37,9 +37,10 @@
 #
 # What the release has decides what a run does (add-mac-update.mjs --plan): its FEED, not its files. A release whose feed
 # lists the Mac already is left alone, and the run fails before anything is made. A run that failed part way is finished
-# by running it again: a packed app and its .sig that it uploaded are reused when they verify against the key (they cannot
-# be replaced, and a new pack is not the same bytes), so the image is checked and the app compared again, and nothing is
-# signed unless the .sig is not there yet; and a swap it was cut short in is completed.
+# by a new run, or by Re-run all jobs on its page: a packed app and its .sig that it uploaded are reused when they verify
+# against the key (they cannot be replaced, and a new pack is not the same bytes), so the image is checked and the app
+# compared again, and nothing is signed unless the .sig is not there yet; and a swap it was cut short in is completed. Not
+# by Re-run failed jobs: that runs `publish` again with the plan the failed run made, from before the release changed.
 #
 # A copy of OAIY 0.1.8 or earlier never reads the Mac's entry (it does not update itself on a Mac at all): a Mac
 # updates itself from the first release made after the one that taught it how, onwards.
@@ -467,8 +468,9 @@ jobs:
           gh release upload "$RELEASE" mac-update/pending/latest.pending.json mac-update/pending/SHA256SUMS.pending.txt --repo "$GITHUB_REPOSITORY"
 
       # Each old one removed and its new one renamed to its name: between the two calls the release has no such file, and
-      # that is the only moment it has none. The rename is tried again a few times; if it still fails, running this
-      # workflow again finishes it (it sees the pending file, and only renames).
+      # that is the only moment it has none. The rename is tried again a few times; if it still fails, a new run of this
+      # workflow (or Re-run all jobs) finishes it: its plan sees the pending file, and it only renames. Re-run failed jobs
+      # does not: it repeats this job with this run's plan, and reads a feed that is gone or that lists the Mac already.
       - name: Swap them in
         env:
           GH_TOKEN: ${{ github.token }}
@@ -492,7 +494,7 @@ jobs:
               sleep "$wait"
               if gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/assets/$new" -f name="$name" > /dev/null; then renamed=yes; break; fi
             done
-            [ "$renamed" = yes ] || { echo "::error::$name is not on the release: its new copy is there as $pending. Run this workflow again on $RELEASE, which renames it, or: gh api -X PATCH repos/$GITHUB_REPOSITORY/releases/assets/$new -f name=$name"; exit 1; }
+            [ "$renamed" = yes ] || { echo "::error::$name is not on the release: its new copy is there as $pending. Start a new run of this workflow on $RELEASE, or Re-run all jobs (not Re-run failed jobs, which cannot finish it), and it renames it; or by hand: gh api -X PATCH repos/$GITHUB_REPOSITORY/releases/assets/$new -f name=$name"; exit 1; }
             echo "$name swapped in"
           done
 
