@@ -221,6 +221,7 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
 /* The model: its name in the data voice, with a spark. */
 .chip:not(.toggle):not(.on-call) { font-family: var(--mono); font-size: 11.5px; font-weight: 500; color: var(--text); }
 .chip:not(.toggle):not(.on-call)::before { content: ''; flex: none; width: 13px; height: 13px; background: var(--accent); -webkit-mask: var(--spark) center / contain no-repeat; mask: var(--spark) center / contain no-repeat; }
+:root { --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E"); }
 :root { --check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E"); --spark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2l2.4 6.6L21 11l-6.6 2.4L12 20l-2.4-6.6L3 11l6.6-2.4z'/%3E%3C/svg%3E"); --gear: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cpath d='M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z'/%3E%3C/svg%3E"); }
 .settings-button { display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; border-color: transparent; background: transparent; color: var(--muted); font-size: 0; border-radius: var(--r-ctl); }
 .settings-button::before { content: ''; width: 17px; height: 17px; background: currentColor; -webkit-mask: var(--gear) center / contain no-repeat; mask: var(--gear) center / contain no-repeat; }
@@ -830,6 +831,8 @@ dialog h2 { margin: 0 0 4px; }
 .form-note { font-size: 12.5px; color: var(--muted); white-space: pre-wrap; }
 /* (a note that warns says so: one that reports what was found or done is not coloured as a warning) */
 .form-note.warn { color: var(--warn); }
+/* Settings, where OAIY runs the Agent on something else (ChatGPT, one of its AI providers): where that is chosen. */
+.agent-elsewhere { margin: 4px 0 8px; padding: 8px 12px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border)); border-radius: var(--r-sm); background: color-mix(in srgb, var(--accent) 7%, var(--panel)); color: var(--text); font-size: 13px; line-height: 1.45; }
 
 /* ---------- any screen: tablets and phones ---------- */
 #app { height: 100dvh; }
@@ -866,7 +869,14 @@ dialog h2 { margin: 0 0 4px; }
   .spacer { display: none; }
   .chip { max-width: 27vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 9px; display: inline-block; line-height: 28px; }
   .chip.toggle::before, .chip.on-call::before { display: inline-block; margin-right: 6px; vertical-align: 0.5px; }
-  button[title='AI provider'] { display: none; }
+  /* The model's chips, the menu and the button alike ("Set up AI…" too): as specific as the 1180px rule above, which
+     otherwise kept them 230px wide on a phone and pushed the settings button off the screen. They give way first; the
+     status pills keep their words. */
+  .chip:not(.toggle):not(.on-call) { max-width: min(230px, 27vw); min-width: 0; flex: 0 1 auto; }
+  .chip:not(.toggle):not(.on-call)::before { display: inline-block; vertical-align: -2px; margin-right: 6px; }
+  /* ("Set up AI…" is what there is to do: it reads whole, and the project's name gives way) */
+  .chip.model[data-source='none'] { max-width: none; flex: none; }
+  .chip.toggle, .chip.on-call { flex: none; }
 
   .workspace { display: block; position: relative; }
   .workspace > *, .center > * { display: none !important; }
@@ -909,7 +919,7 @@ dialog h2 { margin: 0 0 4px; }
 @media (max-width: 520px) {
   /* (a flex box, not a grid: the words, hidden at no size, are not a row of their own that pushed the dot to the top,
      and a button's touch height does not stretch the circle into an oval) */
-  .chip.toggle, .chip.on-call { width: 30px; height: 30px; min-height: 0; padding: 0; font-size: 0; line-height: 0; display: inline-flex; align-items: center; justify-content: center; }
+  .chip.toggle, .chip.on-call { flex: none; width: 30px; height: 30px; min-height: 0; padding: 0; font-size: 0; line-height: 0; display: inline-flex; align-items: center; justify-content: center; }
   .chip.toggle::before, .chip.on-call::before { margin: 0; width: 8px; height: 8px; }
 }
 
@@ -1156,13 +1166,19 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .chip.model[data-state='problem'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background: var(--warn-soft); }
 /* The header's menus (main.ts renderPickers): the engine's model, and the eGPU's, as chips that open a list. */
 .chip[hidden] { display: none; }
-select.chip.pick { appearance: none; -webkit-appearance: none; display: inline-block; max-width: 30vw; padding: 0 26px 0 12px; line-height: 28px; overflow: hidden; text-overflow: ellipsis; cursor: pointer; background: var(--surface-soft) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E") no-repeat right 9px center / 11px; }
+/* (closed, it is as wide as the model chosen, up to about 280px: not as wide as its widest option, a paired computer's) */
+select.chip.pick { appearance: none; -webkit-appearance: none; display: inline-block; max-width: min(280px, 30vw); padding: 0 26px 0 12px; line-height: 28px; overflow: hidden; text-overflow: ellipsis; cursor: pointer; background: var(--surface-soft) var(--chevron) no-repeat right 9px center / 11px; }
 select.chip.pick:disabled { opacity: 0.6; cursor: progress; }
 /* (its display above beat the hidden attribute: the eGPU's menu, with no eGPU to offer, was an empty dropdown) */
 select.chip.pick[hidden] { display: none; }
-select.chip.model.pick[data-state='ready'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
-select.chip.model.pick[data-state='starting'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background-color: var(--warn-soft); }
-select.chip.model.pick[data-state='failed'] { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); background-color: var(--err-soft); }
+/* The model menu leads with a dot that says how its model is, so a menu cut short on a narrow screen still says it:
+   ready, loading, failed, not loaded (a ring), or a paired computer's not answering (muted, not an error). */
+select.chip.model.pick { --dot: var(--accent); padding-left: 24px; background-image: radial-gradient(circle at 13px 50%, var(--dot) 0 3.5px, transparent 4px), var(--chevron); background-repeat: no-repeat; background-position: 0 0, right 9px center; background-size: 100% 100%, 11px; }
+select.chip.model.pick[data-state='ready'] { --dot: var(--ok); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+select.chip.model.pick[data-state='starting'] { --dot: var(--warn); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background-color: var(--warn-soft); }
+select.chip.model.pick[data-state='failed'] { --dot: var(--err); color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); background-color: var(--err-soft); }
+select.chip.model.pick[data-state='stopped'] { --dot: var(--muted); background-image: radial-gradient(circle at 13px 50%, transparent 0 2.2px, var(--dot) 2.6px 3.6px, transparent 4px), var(--chevron); }
+select.chip.model.pick[data-state='offline'] { --dot: var(--muted); color: var(--muted); border-style: dashed; }
 .chip.on-call::before { content: ''; flex: none; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: var(--glow) currentColor; animation: pulse 1.2s ease-in-out infinite; }
 .phone-form { display: flex; flex-direction: column; gap: 10px; }
 .phone-form textarea { width: 100%; min-height: 90px; resize: vertical; }

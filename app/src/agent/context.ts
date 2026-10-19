@@ -119,7 +119,7 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
     attempts.push(async () => {
       const body = (await getJson(`${origin}/v1/discovery`, { headers }, signal)) as { llm?: { context_tokens?: unknown } };
       const tokens = num(body.llm?.context_tokens);
-      if (tokens) return { tokens, how: 'OAIY (/v1/discovery)' };
+      if (tokens) return { tokens, how: "OAIY's engine" };
       // OAIY answers, and says no window: the model is not loaded yet. A guess, so that it is asked again after a reply.
       return { tokens: OAIY_ENGINE_WINDOW, how: 'OAIY, before the model is loaded', guess: true };
     });

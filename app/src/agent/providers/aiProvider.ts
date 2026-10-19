@@ -81,8 +81,10 @@ export class AIProviderError extends Error {
   readonly detail?: string;
   /** A streamed reply that could not be read as a stream: the request is worth sending again without streaming. */
   readonly streamFault?: boolean;
+  /** The error's code, where the provider's answer named one (`{error: {code}}`): OAIY's `model_unavailable`, say. */
+  readonly code?: string;
 
-  constructor(kind: AIFailureKind, message: string, extra: { status?: number; retryAfterMs?: number; detail?: string; streamFault?: boolean } = {}) {
+  constructor(kind: AIFailureKind, message: string, extra: { status?: number; retryAfterMs?: number; detail?: string; streamFault?: boolean; code?: string } = {}) {
     super(message);
     this.name = 'AIProviderError';
     this.kind = kind;
@@ -90,6 +92,7 @@ export class AIProviderError extends Error {
     this.retryAfterMs = extra.retryAfterMs;
     this.detail = extra.detail;
     this.streamFault = extra.streamFault;
+    this.code = extra.code;
   }
 }
 
@@ -427,7 +430,7 @@ async function providerRequest<T>(
       throw new AIProviderError(
         'http',
         describeConnectionError(kindForStatus(resp.status), { type: provider.type, serverKind: provider.serverKind, url, detail }, resp.status),
-        { status: resp.status, detail: detail ?? text },
+        { status: resp.status, detail: detail ?? text, code: providerCode(text) },
       );
     }
     touch();
@@ -445,6 +448,18 @@ async function providerRequest<T>(
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener('abort', onCallerAbort);
+  }
+}
+
+/** The code an error answer names (`{error: {code}}`), if it is JSON and names one. */
+function providerCode(text: string): string | undefined {
+  try {
+    const body: unknown = JSON.parse(text);
+    const error = isRecord(body) ? body.error : undefined;
+    const code = isRecord(error) ? error.code : undefined;
+    return typeof code === 'string' && code.trim() ? code.trim().slice(0, 80) : undefined;
+  } catch {
+    return undefined;
   }
 }
 

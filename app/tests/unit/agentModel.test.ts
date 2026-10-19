@@ -153,6 +153,10 @@ describe('the provider each kind of conversation runs on', () => {
       expect(p.followEngine).toBeUndefined();
     }
     expect(modelChipText(workerProvider(DESK, choice as { source: 'engine'; model: string; name: string }))).toBe('Rig (OAIY Network) · qwen3.5-9b-q4-k-m');
+    // Its window: an OAIY engine's, unless the desktop's catalogue says the one that computer's engine has.
+    expect(providerFor('project', choice, ENGINE_PROVIDER, DESK, null)!.contextTokens).toBe(65_536);
+    expect(providerFor('project', choice, ENGINE_PROVIDER, DESK, null, (id) => (id === choice.model ? 131_072 : undefined))!.contextTokens).toBe(131_072);
+    expect(providerFor('project', choice, ENGINE_PROVIDER, DESK, null, () => 12)!.contextTokens).toBe(65_536);
     // Not the same choice as the engine's own, nor another worker's model.
     expect(sameModel(choice, ENGINE)).toBe(false);
     expect(sameModel(choice, { source: 'engine', model: 'engine:llm:node.other/qwen3.5-9b-q4-k-m' })).toBe(false);
@@ -280,6 +284,35 @@ describe('signed out of ChatGPT (428)', () => {
     expect(fake.urls[0]).toContain('/api/ai/providers/openai-codex-agent/v1/chat/completions');
     // (offered again once signed in: Try again carries on from it)
     expect(events.filter((e) => e.type === 'error')).toEqual([{ type: 'error', message: CHATGPT_SIGN_IN, retry: true }]);
+  });
+});
+
+describe("a paired computer that runs another model now (409 model_unavailable)", () => {
+  it('the run is told what failed, with its code, before it says so with Try again', async () => {
+    const refused = { status: 409, body: JSON.stringify({ error: { code: 'model_unavailable', message: 'Studio Mac runs Gemma-4 now, not Qwen3.8-Flash-Next: choose its language model again' } }) };
+    fakeProvider('openai', [{ error: refused }]);
+    const worker = workerProvider(DESK, { source: 'engine', model: 'engine:llm:node.a1b2c3d4/Qwen3.8-Flash-Next', name: 'Studio Mac', viaDefault: true })!;
+    const failures: unknown[] = [];
+    const events: AgentEvent[] = [];
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => worker, projectSummary: () => '', onFailure: (e) => failures.push(e) });
+    await agent.run('Hello', (e) => events.push(e));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toBeInstanceOf(AIProviderError);
+    expect(failures[0]).toMatchObject({ status: 409, code: 'model_unavailable' });
+    const error = events.find((e) => e.type === 'error');
+    expect(error).toMatchObject({ type: 'error', retry: true });
+    expect((error as { message: string }).message).toContain('runs Gemma-4 now');
+  });
+
+  it('a run with nothing to run on says where to find one, as it is told', async () => {
+    const events: AgentEvent[] = [];
+    const words = "This computer's OAIY has no language model for the Agent, and a paired computer's can run it.";
+    await new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => null, projectSummary: () => '', noProvider: () => words }).run('Hi', (e) => events.push(e));
+    expect(events).toEqual([{ type: 'error', message: words }]);
+    // (told nothing, Settings)
+    const plain: AgentEvent[] = [];
+    await new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => null, projectSummary: () => '', noProvider: () => '' }).run('Hi', (e) => plain.push(e));
+    expect((plain[0] as { message: string }).message).toMatch(/^No AI provider is set up yet/);
   });
 });
 

@@ -18,6 +18,11 @@ import { fileIcon, icon } from './icons';
 import { formatBytes, mediaElement, mediaKind, type Media } from './media';
 import { onTheme, theme } from './theme';
 
+/** The editor's keys as this computer writes them: on a Mac or an iPad (as CodeMirror tells them apart) Mod is ⌘ and Alt is ⌥. */
+const MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+const MOD = MAC ? '⌘' : 'Ctrl';
+const ALT = MAC ? '⌥' : 'Alt';
+
 function languageFor(path: string): Extension[] {
   const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
   switch (ext) {
@@ -143,7 +148,7 @@ export class EditorPane {
       h('span.editor-empty-icon', icon('file-text')),
       h('h2', 'No file open'),
       h('p', 'Open a file from the list, or ask the agent to write one.'),
-      h('ul.editor-keys', key('Ctrl F', 'find in the file'), key('Ctrl /', 'comment a line'), key('Alt ↑ ↓', 'move a line')),
+      h('ul.editor-keys', key(`${MOD} F`, 'find in the file'), key(`${MOD} /`, 'comment a line'), key(`${ALT} ↑ ↓`, 'move a line')),
       h('p.editor-empty-note', 'What you type is saved to the project as you type.'),
     ));
   }

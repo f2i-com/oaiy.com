@@ -28,7 +28,7 @@ export const LOCAL_SERVERS: Record<LocalServerKind, { label: string; baseUrl: st
   oaiy: {
     label: 'OAIY',
     baseUrl: 'http://127.0.0.1:8080',
-    help: 'OAIY serves chat, images and video. Without an API key it answers only the pages in gateway.cors_origins in its config: add this site there (or set an API key and enter it here). Settings → Images and video uses the same server.',
+    help: 'OAIY serves chat, images and video. Without an API key it answers only the pages in gateway.cors_origins in its config: add this site there (or set an API key and enter it here). Settings → Images, video and audio uses the same server.',
   },
   other: {
     label: 'Another server',

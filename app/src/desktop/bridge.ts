@@ -74,6 +74,10 @@ export interface NetworkModel {
   nodeName: string;
   /** It answers now (its computer is online and its engines up). */
   ready: boolean;
+  /** Its computer answers, whether or not its engines are up (a desktop that does not say leaves it out). */
+  nodeOnline?: boolean;
+  /** Its context window, in tokens, as that computer's engine has it (a desktop that does not say leaves it out). */
+  contextTokens?: number;
   /** It is this desktop's engine's language model now, in place of its own. */
   chosen: boolean;
 }
@@ -424,8 +428,9 @@ export class Desktop {
 
   /**
    * The language models of the computers this desktop uses over OAIY Network, as its engine catalogue lists them
-   * (`engine:llm:node.<nodeId>/<model>`, each with its computer's name and whether it answers now). Choosing one with
-   * `chooseEngineModel` makes it the engine's: the Agent, the phone's agents and flows run there.
+   * (`engine:llm:node.<nodeId>/<model>`, each with its computer's name, whether it answers now, and its window where the
+   * desktop says). Choosing one with `chooseEngineModel` makes it the engine's: the Agent, the phone's agents and flows
+   * run there.
    */
   async networkModels(signal?: AbortSignal): Promise<NetworkModel[]> {
     const body = await reply(await fetch(`${this.origin}/api/ai/engine/services`, { headers: this.headers(), signal }));
@@ -433,7 +438,16 @@ export class Desktop {
     return list
       .filter(isRecord)
       .filter((s) => s.kind === 'llm' && typeof s.nodeId === 'string' && typeof s.id === 'string' && typeof s.model === 'string')
-      .map((s) => ({ id: String(s.id), model: String(s.model), node: String(s.nodeId), nodeName: typeof s.nodeName === 'string' && s.nodeName ? s.nodeName : 'another computer', ready: s.ready !== false, chosen: s.default === true }));
+      .map((s) => ({
+        id: String(s.id),
+        model: String(s.model),
+        node: String(s.nodeId),
+        nodeName: typeof s.nodeName === 'string' && s.nodeName ? s.nodeName : 'another computer',
+        ready: s.ready !== false,
+        ...(typeof s.nodeOnline === 'boolean' ? { nodeOnline: s.nodeOnline } : {}),
+        ...(typeof s.contextTokens === 'number' && Number.isFinite(s.contextTokens) && s.contextTokens >= 1024 ? { contextTokens: Math.floor(s.contextTokens) } : {}),
+        chosen: s.default === true,
+      }));
   }
 
   /** The flows stored on the desktop; `macro`: one the editor keeps as a macro (a step other flows use), as the desktop says. */

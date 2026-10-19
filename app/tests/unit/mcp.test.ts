@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import fixture from '../fixtures/control-tools.json';
 import type { SessionTool } from '../../src/agent/agent';
-import { activityText, rememberToolTitles, summarizeCall, toolIcon, toolLabel } from '../../src/ui/chat/tools';
+import { activityText, rememberComputers, rememberToolTitles, summarizeCall, toolIcon, toolLabel } from '../../src/ui/chat/tools';
 import { hasIcon } from '../../src/ui/icons';
 import {
   COVERED,
@@ -308,7 +308,8 @@ describe("the control tools each kind of conversation is given", () => {
     const call = (name: string, input: Record<string, unknown>) => summarizeCall({ id: 'c', name, input });
     expect(toolLabel('network_pin', { model: 'engine:image:node.w1/flux', pin: true })).toBe('Pinned a model');
     expect(toolLabel('network_pin', { model: 'engine:image:node.w1/flux', pin: false })).toBe('Let a pinned model go');
-    expect(call('network_pin', { model: 'engine:image:node.w1/flux', pin: false })).toBe('w1/flux · let go');
+    // (a computer whose name is not known yet: a paired one)
+    expect(call('network_pin', { model: 'engine:image:node.w1/flux', pin: false })).toBe('flux on a paired computer · let go');
     expect(toolLabel('network_setup', { enabled: false })).toBe('Switched off OAIY Network');
     expect(call('network_setup', { lends: true, shareModels: false, name: 'Rig' })).toBe('lends itself · keeps model files · Rig');
     expect(toolLabel('network_approve', { id: 'r1', approve: false })).toBe('Denied a pairing request');
@@ -324,6 +325,16 @@ describe("the control tools each kind of conversation is given", () => {
     expect(call('flow_run', { id: 'logo', node: 'w1' })).toBe('logo on w1');
     expect(call('flow_update', { id: 'logo', flow: {} })).toBe('logo');
     expect(call('agent_model_set', { source: 'provider', provider: 'lmstudio', model: 'qwen' })).toBe('provider · lmstudio · qwen');
+    // A paired computer's model reads as that model on that computer, by its name once the desktop has listed it.
+    expect(call('model_set_default', { group: 'llm', model: 'engine:llm:node.a1b2c3d4/Qwen3.8-Flash-Next' })).toBe('llm → Qwen3.8-Flash-Next on a paired computer');
+    rememberComputers([{ node: 'a1b2c3d4', nodeName: 'Studio Mac' }]);
+    expect(call('model_set_default', { group: 'llm', model: 'engine:llm:node.a1b2c3d4/Qwen3.8-Flash-Next' })).toBe('llm → Qwen3.8-Flash-Next on Studio Mac');
+    expect(call('agent_model_set', { source: 'engine', model: 'engine:llm:node.a1b2c3d4/Qwen3.8-Flash-Next' })).toBe('Qwen3.8-Flash-Next on Studio Mac');
+    expect(call('agent_model_set', { source: 'engine' })).toBe('the engine');
+    expect(call('network_pin', { model: 'engine:image:node.a1b2c3d4/flux', pin: true })).toBe('flux on Studio Mac · kept loaded');
+    expect(call('network_unpair', { node: 'a1b2c3d4' })).toBe('Studio Mac');
+    expect(call('network_use_service', { service: 'oaiy-voice', node: 'a1b2c3d4' })).toBe('oaiy-voice → Studio Mac');
+    expect(call('flow_run', { id: 'logo', node: 'a1b2c3d4' })).toBe('logo on Studio Mac');
     // (an odd input does not stop the chat drawing the call)
     expect(call('softn_interact', { actions: [null, { click: 'Save' }] })).toBe('click "Save"');
     // A tool the chat has no words for reads as the desktop titles it; an activity line reads in words.

@@ -466,7 +466,8 @@ export class ChatPane {
   private placeholder(): string {
     if (this.kind === 'call' || this.kind === 'sms') {
       if (this.live) return 'Tell the receptionist something: it reads it before its next reply…';
-      return (this.to ?? this.kind) === 'sms' ? 'Tell the agent what to text…' : 'Ask about this call, or tell its agent something…';
+      // (the receptionist, as its lines in the conversation are headed)
+      return (this.to ?? this.kind) === 'sms' ? 'Tell the receptionist what to text…' : 'Ask about this call, or tell the receptionist something…';
     }
     return this.runner ? 'Tell the runner what the phone should know…' : this.own === 'setup' ? 'Tell the Agent what OAIY should do…' : 'Ask OAIY…';
   }
@@ -1707,11 +1708,16 @@ export class ChatPane {
     const row = this.system(message, 'error');
     if (!retry || this.kind !== 'own' || !this.handlers.retry) return;
     const again = this.lastSent;
-    row.append(h('button.retry', { type: 'button', title: again ? `Carry on with "${again.length > 60 ? `${again.slice(0, 60)}…` : again}" from where it stopped` : 'Carry on from where it stopped', onclick: (ev: Event) => {
+    row.append(h('button.retry', { type: 'button', 'data-again': '', title: again ? `Carry on with "${again.length > 60 ? `${again.slice(0, 60)}…` : again}" from where it stopped` : 'Carry on from where it stopped', onclick: (ev: Event) => {
       // (taken while the failed run is still ending too: it carries on once that has)
       const button = ev.currentTarget as HTMLElement;
       if (this.handlers.retry?.() !== false) button.remove();
     } }, icon('refresh'), h('span', 'Try again')));
+  }
+
+  /** A new run started: the Try again of a run before it goes (it would carry on from where the new one ends). */
+  dropRetries(): void {
+    for (const button of this.log.querySelectorAll('button.retry[data-again]')) button.remove();
   }
 
   /** The reply being written, drawn whole (a code block it left open is closed): the next words are a new reply. */

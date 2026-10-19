@@ -29,7 +29,7 @@ describe('the context window', () => {
     // the instructions and tools as they are now leave the conversation room
     expect(budgetFor(contextWindow(oaiy).tokens, 11_500).prompt).toBeGreaterThan(1024 * 16);
     // What OAIY says, once it does, and what the person sets, still come first.
-    expect(contextWindow({ ...oaiy, detectedContext: { model: 'qwen3.5-9b', tokens: 65_536, how: 'OAIY (/v1/discovery)', at: 0 } }).tokens).toBe(65_536);
+    expect(contextWindow({ ...oaiy, detectedContext: { model: 'qwen3.5-9b', tokens: 65_536, how: "OAIY's engine", at: 0 } }).tokens).toBe(65_536);
     expect(contextWindow({ ...oaiy, contextTokens: 32_000 })).toEqual({ tokens: 32_000, source: 'yours' });
 
     // Asked before the model is loaded, OAIY's discovery names no window: a guess, to be asked again after a reply.
@@ -39,7 +39,7 @@ describe('the context window', () => {
       return new Response(JSON.stringify(answers.shift()), { status: 200, headers: { 'content-type': 'application/json' } });
     });
     expect(await detectContextWindow(oaiy)).toEqual({ tokens: 65_536, how: 'OAIY, before the model is loaded', guess: true });
-    expect(await detectContextWindow(oaiy)).toEqual({ tokens: 16_384, how: 'OAIY (/v1/discovery)' });
+    expect(await detectContextWindow(oaiy)).toEqual({ tokens: 16_384, how: "OAIY's engine" });
   });
 
   it("reads the window out of servers' overflow errors", () => {

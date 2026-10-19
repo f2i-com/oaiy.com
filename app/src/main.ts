@@ -18,7 +18,7 @@ import { Outreach, tally, type Campaign, type OutreachKind, type OutreachPlan, t
 import { OUTREACH_TOOL_NAMES, outreachTools } from './outreachTools';
 import { confirmOutreach } from './ui/outreach';
 import { personState } from './ui/chat/outreachCard';
-import { rememberToolTitles } from './ui/chat/tools';
+import { rememberComputers, rememberToolTitles } from './ui/chat/tools';
 import type { Turn } from './agent/protocol';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore, type FlowTool } from './desktop/flowTools';
@@ -32,6 +32,7 @@ import { ControlClient, withControlTools } from './desktop/mcp';
 import { ENGINE, codexDefaultModel, modelChipText, providerFor, readAgentModel, sameModel, workerModel, type AgentKind, type AgentModel } from './desktop/agentModel';
 import { SETUP_INSTRUCTIONS, controlNote } from './desktop/setupAgent';
 import { CHATGPT_SIGN_IN } from './agent/providers/chatgpt';
+import { AIProviderError } from './agent/providers/aiProvider';
 import { TOOLS } from './agent/tools';
 import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
@@ -73,19 +74,22 @@ import { watchUpdates } from './pwa/update';
 import { confirmReload, showUpdateNotice } from './ui/updateNotice';
 import { agreedToLeave } from './pwa/leaveGuard';
 
-const WELCOME: Array<[string, string]> = [
+/** The first project's files. Its README says where it is: in OAIY's own window (`inOaiy`), or a tab in a browser. */
+const welcome = (inOaiy: boolean): Array<[string, string]> => [
   [
     'README.md',
     `# Welcome to OAIY
 
-A coding agent that lives entirely in this browser tab.
+${inOaiy ? "A coding agent in OAIY's window, working on this computer." : 'A coding agent that lives entirely in this browser tab.'}
 
-- **Files** are stored in this browser (OPFS). Open a folder from disk, import a .zip, or start here.
+- **Files** are stored ${inOaiy ? "in this window's own storage on this computer" : 'in this browser'} (OPFS). Open a folder from disk, import a .zip, or start here.
 - **Code runs on the Zipp VM** in a Web Worker: JavaScript and Python, with no access to anything
   but this project and what the network gate allows.
 - **The terminal** below is an emulated shell on the same sandbox — try \`ls\`, \`cat data/weather.csv | sort -t, -k2 -n\`,
   \`python hello.py\`, or \`help\`.
-- **The agent** (right) uses any model: a local server such as Ollama or LM Studio, or an API. Set one up in ⚙ Settings.
+${inOaiy
+  ? "- **The agent** (right) runs on the model OAIY's Settings → Agent chooses: on OAIY's engine, the menu at the top chooses the model."
+  : '- **The agent** (right) uses any model: a local server such as Ollama or LM Studio, or an API. Set one up in ⚙ Settings.'}
 - **/internet** controls what the sandbox may reach: \`/internet off\`, \`/internet allow docs.python.org\`, \`/net status\`.
 `,
   ],
@@ -159,6 +163,15 @@ function summarizeProject(meta: ProjectMeta, vfs: Vfs, gate: NetGate): string {
 /** How long the welcome waits for a look at OAIY before it asks the person to set up a provider (a nearby OAIY answers at once; one that does not is not waited for). */
 const WELCOME_WAITS_MS = 1000;
 
+/** How long a model chosen in the menu waits for the desktop to say it (it settles a paired computer's a moment after it answers). */
+const PICK_SETTLES_MS = 30_000;
+
+/**
+ * OAIY's control tools that change what the header's model menu shows: the engine's model, whether it runs, and the
+ * computers paired over OAIY Network (whose models the menu offers, and one of which may run the engine's).
+ */
+const ENGINE_TOOLS = new Set(['model_set_default', 'engine_start', 'engine_stop', 'engine_restart', 'network_setup', 'network_pair', 'network_approve', 'network_unpair', 'network_use_service']);
+
 async function main(): Promise<void> {
   const app = document.getElementById('app')!;
   if (!crossOriginIsolated && (await registerServiceWorker())) {
@@ -216,6 +229,16 @@ async function main(): Promise<void> {
   let lookedAgainAt = 0;
   /** The language models of the computers the desktop uses over OAIY Network, as last read: the model menu offers them too. */
   let networkModels: NetworkModel[] = [];
+  /** The last read of them (the welcome waits for it: with none here, a paired computer's may be the one to use). */
+  let networkRead: Promise<void> = Promise.resolve();
+  /**
+   * A model just chosen in the model menu, as the desktop will say it (and when): the desktop takes a moment to say a
+   * paired computer's choice (it is settled over OAIY Network after it answers), and a read before then is not taken
+   * for a change (the menu snapped back, and the choice was said twice).
+   */
+  let picked: { model: AgentModel; at: number } | null = null;
+  /** This Mac's model, chosen here and loading on the Mac (not on the eGPU): the menu says so until it is loaded. */
+  let macLoading: string | null = null;
   /** OAIY's discovery document as last read: its engine's language models and its eGPU, for the header's pickers. */
   let engineFound: Extract<Discovery, { state: 'found' }> | null = null;
   /** Codex's own default model, once looked up (for a ChatGPT choice that names none). */
@@ -282,19 +305,60 @@ async function main(): Promise<void> {
    * listed (no desktop, or an older one), the tools are exactly as they were.
    */
   const withControl = (kind: AgentKind, own: SessionTool[]): SessionTool[] => withControlTools(own, kind, () => control, builtInToolNames, controlChanged, () => project.vfs);
-  /** A change the Agent made to OAIY that this page follows: the Agent's own model, or the ChatGPT sign-in. */
+  /**
+   * A change the Agent made to OAIY that this page follows: the Agent's own model, or the ChatGPT sign-in; the engine's
+   * model and whether it runs (the header's menu, and how its loading goes); the computers paired over OAIY Network
+   * (the menu offers their models, and the engine's may be one of theirs).
+   */
   const controlChanged = (tool: string): void => {
     if (tool === 'agent_model_set' || tool === 'chatgpt_sign_in' || tool === 'chatgpt_sign_out') {
       codexDefault = null;
       void followAgentModel();
     }
+    if (ENGINE_TOOLS.has(tool)) void followEngineChange(tool !== 'engine_stop');
     // The business's name (or the receptionist's) may have changed with the calendar's settings.
     if (tool === 'calendar_settings_set') void identity.refresh();
   };
-  /** The provider a conversation of `kind` runs on: the engine's (as chosen in Settings, followed as always), or ChatGPT's when the desktop says so. */
-  const agentProvider = (kind: AgentKind): ProviderConfig | null => providerFor(kind, agentModel, activeProvider(), desktop, codexDefault);
+  /**
+   * The provider a conversation of `kind` runs on: the engine's (as chosen in Settings, followed as always), or ChatGPT's
+   * when the desktop says so. A paired computer's model works in the window its engine has, where the desktop says it.
+   */
+  const agentProvider = (kind: AgentKind): ProviderConfig | null => providerFor(kind, agentModel, activeProvider(), desktop, codexDefault, (id) => networkModels.find((m) => m.id === id)?.contextTokens);
+  /**
+   * What a run with nothing to run on says. With computers paired that lend their language models, where to choose
+   * one (this computer's OAIY may have none: its own window's first run, before a model is downloaded); else the
+   * agent's own words, which point to Settings.
+   */
+  const noProvider = (): string =>
+    agentModel.source === 'engine' && desktop && networkModels.length
+      ? "This computer's OAIY has no language model for the Agent, and a paired computer's can run it: choose one in the model menu at the top (or in OAIY's Engines → Other computers). Another AI provider can be set up in ⚙ Settings."
+      : '';
+  /**
+   * A run of a conversation of `kind` failed on its provider's answer. A paired computer asked for a model it does not
+   * run now answers 409 `model_unavailable` (its model was switched there, and this page had not read the change): the
+   * Agent's model and the paired computers' are read again at once, so a Try again goes to the model it runs now.
+   */
+  const followFailure = (kind: () => AgentKind) => (error: unknown): void => {
+    if (!(error instanceof AIProviderError) || error.status !== 409 || error.code !== 'model_unavailable') return;
+    if (!agentProvider(kind())?.id.startsWith('oaiy-worker-')) return;
+    // (what was just chosen in the menu is not waited for: the computer has said what it runs)
+    picked = null;
+    void followAgentModel(5000, true, true);
+  };
   /** What a conversation of `kind` is told besides its own instructions: about OAIY's tools, when it has them. */
   const controlInstructions = (kind: AgentKind): string => (kind === 'setup' ? SETUP_INSTRUCTIONS : control?.listed(kind).length ? controlNote(kind) : '');
+  /**
+   * What a conversation of `kind` runs on, brought up to date before its run. The choice may have changed in OAIY since
+   * it was last read (a call does not wait for this, nor does anything while the desktop is away: the minute's read
+   * catches up). On the engine with nothing to run on, OAIY may have a language model now that it had not when the page
+   * looked (see lookAgainForOaiy): looked for before the run says there is no provider. The project's run does this
+   * before it says the model's window too, so the window said is that of the model that answers.
+   */
+  const catchUp = async (k: AgentKind): Promise<void> => {
+    // (Codex's default, if it is needed, is looked up by the run's preparation after this, once.)
+    if (desktop && !desktopProblem && k !== 'call' && Date.now() - agentModelAt > 15_000) await followAgentModel(2000, false);
+    if (agentModel.source === 'engine' && !activeProvider()) await lookAgainForOaiy();
+  };
   /**
    * Before a run of a conversation of `kind`: on ChatGPT with no model named,
    * Codex's default is looked up (signed out, the run says where to sign in,
@@ -304,14 +368,8 @@ async function main(): Promise<void> {
    */
   const prepareFor = (kind: () => AgentKind) => async (signal?: AbortSignal): Promise<void> => {
     const k = kind();
-    // The choice may have changed in OAIY since it was last read (a call does not wait for this, nor does
-    // anything while the desktop is away: the minute's read catches up).
-    // (Codex's default, if it is needed, is looked up just below, once.)
-    if (desktop && !desktopProblem && k !== 'call' && Date.now() - agentModelAt > 15_000) await followAgentModel(2000, false);
+    await catchUp(k);
     if (agentModel.source === 'chatgpt' && desktop && k !== 'call' && !agentModel.model && !codexDefault) await lookUpCodexDefault(signal);
-    // On the engine with nothing to run on: OAIY may have a language model now that it had not when the page looked
-    // (see lookAgainForOaiy). Looked for before the run says there is no provider.
-    if (agentModel.source === 'engine' && !activeProvider()) await lookAgainForOaiy();
     const c = control;
     if (!c) {
       if (k === 'setup') throw new Error('Setting up OAIY needs OAIY Desktop: pair this page with it (the desktop chip), then ask again.');
@@ -358,11 +416,12 @@ async function main(): Promise<void> {
     stop: () => (viewing ? stopViewed() : controller?.abort()),
     // (a run that failed carries on from where it stopped: its request is not sent again. Asked for while that run is
     // still ending (its save, slow at times), it carries on once it has, rather than the click being lost; not while
-    // another run goes)
+    // another run goes. Only the last run's: one before it is over, its conversation gone on since, so its button just
+    // goes, as every one does when a run starts)
     retry: () => {
       if (viewing) return false;
-      const ending = currentRun && failedRun === runsStarted ? currentRun : null;
-      if (currentRun && !ending) return false;
+      if (failedRun !== runsStarted) return true;
+      const ending = currentRun;
       void (async () => {
         if (ending) await ending;
         if (!viewing && !currentRun) await submit('', [], true, true);
@@ -575,16 +634,33 @@ async function main(): Promise<void> {
     const p = agentProvider('project');
     const chatgpt = p?.id.startsWith('oaiy-chatgpt') ?? false;
     providerChip.textContent = chatgpt ? modelChipText(p, chatgptProblem) : p ? `${p.name}${p.modelId ? ` · ${p.modelId}` : ' · no model'}` : 'Set up AI…';
-    providerChip.dataset.source = chatgpt ? 'chatgpt' : 'engine';
+    providerChip.dataset.source = chatgpt ? 'chatgpt' : p ? (elsewhere() ? 'provider' : 'engine') : 'none';
     if (chatgpt && chatgptProblem) providerChip.dataset.state = 'problem';
     else delete providerChip.dataset.state;
-    providerChip.title = !chatgpt
-      ? 'AI provider'
-      : chatgptProblem
+    // (one of the desktop's AI providers, or a paired computer's model the Agent was set to: chosen in OAIY, not here)
+    const chosenThere = !chatgpt && elsewhere();
+    providerChip.title = chatgpt
+      ? chatgptProblem
         ? `${CHATGPT_SIGN_IN} (Calls use a fast ChatGPT route of their own.)`
-        : "The Agent runs on ChatGPT, through OAIY, as chosen in OAIY's Settings → Agent. Calls use a fast ChatGPT route of their own.";
+        : "The Agent runs on ChatGPT, through OAIY, as chosen in OAIY's Settings → Agent. Calls use a fast ChatGPT route of their own."
+      : chosenThere
+        ? `The Agent runs on ${chosenThere}, as chosen in OAIY's Settings → Agent: change it there.`
+        : 'AI provider';
     renderPickers(chatgpt ? null : p);
   };
+
+  /**
+   * What the Agent runs on where OAIY chose it something other than its engine (ChatGPT, one of the desktop's AI
+   * providers, a paired computer's model set in Settings → Agent), in words; '' where it runs on the engine, as this
+   * page's providers have it (or the engine's default, a paired computer's or not). Settings says it above the providers.
+   */
+  function elsewhere(): string {
+    if (!desktop) return '';
+    if (agentModel.source === 'chatgpt') return `ChatGPT${agentModel.model ?? codexDefault ? ` (${agentModel.model ?? codexDefault})` : ''}`;
+    if (agentModel.source === 'provider') return `${agentModel.name || agentModel.provider} (${agentModel.model})`;
+    const worker = !agentModel.viaDefault && agentModel.model ? workerModel(agentModel.model) : null;
+    return worker ? `${worker.model}${agentModel.name ? ` on ${agentModel.name}` : ''}, over OAIY Network` : '';
+  }
 
   /** The menu's last entry: the AI providers in Settings. */
   const PROVIDERS = '\u0000providers';
@@ -614,14 +690,21 @@ async function main(): Promise<void> {
   type OaiyFound = Extract<Discovery, { state: 'found' }>;
   /** Whether OAIY's engine offers its eGPU and it is switched on (a Mac's card, set up in Engines → Settings → eGPU). */
   const cardOn = (found: OaiyFound | null | undefined): boolean => !!found?.llm.egpu.available && !!found.llm.egpu.enabled;
+  /** How the model menu's chosen model is, as its dot shows it (styles.css): `offline` is a paired computer's not answering. */
+  type ModelState = 'ready' | 'starting' | 'failed' | 'stopped' | 'offline';
 
   /**
    * Where `m` is, said after its name in the model menu, on a Mac whose eGPU is switched on: the eGPU or this Mac (as
    * Engines sets each model), and for the chosen one how its loading goes. With no eGPU, nothing.
    */
-  function modelPlace(found: OaiyFound, m: LlmModel, chosen: boolean): { text: string; state?: 'ready' | 'starting' | 'failed' | 'stopped' } {
+  function modelPlace(found: OaiyFound, m: LlmModel, chosen: boolean): { text: string; state?: ModelState } {
     if (!cardOn(found)) return { text: '' };
-    if (!m.egpu) return chosen ? { text: ` · Mac · ${m.loaded ? 'ready' : 'not loaded'}`, state: m.loaded ? 'ready' : 'stopped' } : { text: ' · Mac' };
+    if (!m.egpu) {
+      if (!chosen) return { text: ' · Mac' };
+      // (the Mac says only whether it holds the model: loading, while one chosen here is watched until it does)
+      if (m.loaded) return { text: ' · Mac · ready', state: 'ready' };
+      return macLoading === m.id ? { text: ' · Mac · loading…', state: 'starting' } : { text: ' · Mac · not loaded', state: 'stopped' };
+    }
     const egpu = found.llm.egpu;
     if (!chosen) return { text: ' · eGPU' };
     if (egpu.model !== m.id) return { text: ' · eGPU · not loaded', state: 'stopped' };
@@ -632,11 +715,25 @@ async function main(): Promise<void> {
   }
 
   /**
+   * How a paired computer's model is, as the menu says it after its name: ready (nothing said), its engines not running
+   * (the computer answers, as a desktop that says `nodeOnline` tells), or offline; one OAIY no longer lists is not
+   * available. Not answering is muted, not an error: it is used once it answers.
+   */
+  function workerState(m: NetworkModel | undefined): { words: string; state: ModelState; why: string } {
+    if (!m) return { words: ' · not available', state: 'failed', why: ' (OAIY does not list it now)' };
+    if (m.ready) return { words: '', state: 'ready', why: '' };
+    return m.nodeOnline
+      ? { words: ' · engines not running', state: 'offline', why: ' (its engines are not running now)' }
+      : { words: ' · offline', state: 'offline', why: ' (it does not answer now)' };
+  }
+
+  /**
    * The header's model menu. It stands in for the provider chip while `p`, the Agent's provider, is the OAIY whose
    * discovery was read: its language models, one chosen. On a Mac whose eGPU is switched on each says where it runs,
    * the eGPU or this Mac, and the chosen one how its loading goes: one menu, one model loaded, never one on the card
    * and another (or the same) in the Mac's memory beside it. Choosing one loads it where it runs, and the other lets go
-   * of what it held.
+   * of what it held. The chosen one leads with a dot that says how it is (styles.css), so a narrow menu cut short still
+   * says it; each reads "<model> · <where>", this computer's or a paired one's alike.
    */
   function renderPickers(p: ProviderConfig | null): void {
     const found = engineFound;
@@ -647,42 +744,60 @@ async function main(): Promise<void> {
     const onWorker = agentModel.source === 'engine' && !!agentModel.viaDefault && !!workerModel(agentModel.model ?? '');
     const own = onWorker ? activeProvider() : p;
     const ownHere = !!own && !!found && own.serverKind === 'oaiy' && originOr(own.baseUrl) === found.origin;
-    const onEngine = !!p && (onWorker || ownHere) && (models.length > 0 || networkModels.length > 0);
+    // (nothing to run on here, on the engine, with computers paired that lend theirs: the menu offers those, so the
+    // Agent can run on one, rather than "Set up AI…" with a model a click away)
+    const lent = !p && agentModel.source === 'engine' && !!desktop && networkModels.length > 0;
+    const onEngine = (!!p && (onWorker || ownHere) && (models.length > 0 || networkModels.length > 0)) || lent;
     providerChip.hidden = onEngine;
     modelPick.hidden = !onEngine;
-    if (!onEngine || !p) return;
+    if (!onEngine) return;
     const chosenHere = !onWorker && own ? own.modelId : '';
-    const options: HTMLElement[] = found && own && ownHere ? models.map((m) => h('option', { value: m.id, selected: m.id === chosenHere }, `${own.name} · ${m.id}${modelPlace(found, m, m.id === chosenHere).text}`)) : [];
-    // A model set by hand that the engine does not have (or none yet), or a computer's not heard from, is shown as it is.
+    const options: HTMLElement[] = found && own && ownHere ? models.map((m) => h('option', { value: m.id, selected: m.id === chosenHere }, `${m.id}${modelPlace(found, m, m.id === chosenHere).text}`)) : [];
+    const named = onWorker ? workerModel(agentModel.model ?? '') : null;
+    const namedOn = agentModel.source === 'engine' ? agentModel.name : undefined;
     const worker = onWorker ? networkModels.find((m) => m.id === agentModel.model) : undefined;
-    if (onWorker ? !worker : !models.some((m) => m.id === chosenHere)) options.unshift(h('option', { value: '', selected: true, disabled: true }, `${p.name} · ${p.modelId || 'no model'}`));
+    const away = onWorker ? workerState(worker) : null;
+    // A model set by hand that the engine does not have (or none yet), or a computer's not heard from, is shown as it
+    // is, in the words its own entry would have; none here at all says so.
+    if (onWorker ? !worker : !models.some((m) => m.id === chosenHere)) {
+      options.unshift(h('option', { value: '', selected: true, disabled: true }, named
+        ? `${named.model} · ${namedOn || 'a paired computer'}${away?.words ?? ''}`
+        : p ? p.modelId || 'no model' : 'No model on this computer'));
+    }
     // The paired computers' language models, each computer's under its name: chosen here, one runs there for all of OAIY.
     const nodes = [...new Set(networkModels.map((m) => m.node))];
     for (const node of nodes) {
       const theirs = networkModels.filter((m) => m.node === node);
-      options.push(h('optgroup', { label: `On ${theirs[0].nodeName} (OAIY Network)` }, ...theirs.map((m) => h('option', { value: m.id, selected: onWorker && m.id === agentModel.model }, `${m.model} · ${m.nodeName}${m.ready ? '' : ' · offline'}`))));
+      options.push(h('optgroup', { label: `On ${theirs[0].nodeName} (OAIY Network)` }, ...theirs.map((m) => h('option', { value: m.id, selected: onWorker && m.id === agentModel.model }, `${m.model} · ${m.nodeName}${workerState(m).words}`))));
     }
     options.push(h('option', { value: PROVIDERS }, 'AI providers…'));
     replaceOptions(modelPick, options);
     const chosen = found ? models.find((m) => m.id === chosenHere) : undefined;
-    const state = onWorker ? (worker?.ready ? 'ready' : 'failed') : found && chosen ? modelPlace(found, chosen, true).state : undefined;
+    const state = away ? away.state : found && chosen ? modelPlace(found, chosen, true).state : lent ? 'stopped' : undefined;
     if (state) modelPick.dataset.state = state;
     else delete modelPick.dataset.state;
     modelPick.title = (onWorker
-      ? `OAIY's engine runs ${worker?.model ?? p.modelId} on ${worker?.nodeName ?? 'a paired computer'}, over OAIY Network${worker && !worker.ready ? ' (it does not answer now)' : ''}: the Agent, the phone's agents and flows use it there. Choosing another here chooses it in Engines.`
-      : own?.followEngine
-        ? "The model OAIY's engine runs, as chosen in Engines: the Agent, the phone's agents and flows use it. Choosing another here chooses it there, and it loads now."
-        : `The model this page asks OAIY for (set in Settings, not following Engines). Choosing one here chooses it in Engines too.`)
+      ? `OAIY's engine runs ${named?.model ?? 'a model'} on ${worker?.nodeName ?? (namedOn || 'a paired computer')}, over OAIY Network${away?.why ?? ''}: the Agent, the phone's agents and flows use it there. Choosing another here chooses it in Engines.`
+      : lent
+        ? "This computer's OAIY has no language model. Choose a paired computer's here (as Engines → Other computers does): it runs there for the Agent, the phone's agents and flows."
+        : own?.followEngine
+          ? "The model OAIY's engine runs, as chosen in Engines: the Agent, the phone's agents and flows use it. Choosing another here chooses it there, and it loads now."
+          : `The model this page asks OAIY for (set in Settings, not following Engines). Choosing one here chooses it in Engines too.`)
       + (found && cardOn(found) ? ' Each of this Mac’s runs on the eGPU or on this Mac, as Engines sets it; one is loaded at a time, and choosing another lets the eGPU, or this Mac, go of the one it held.' : '')
       + (networkModels.length ? " A paired computer's model runs on that computer (Setup → Networking)." : '');
   }
 
   /** The paired computers' language models, read again from the desktop (OAIY Network): the menu offers them. */
-  async function refreshNetworkModels(): Promise<void> {
+  function refreshNetworkModels(): Promise<void> {
+    return (networkRead = readNetworkModels());
+  }
+  async function readNetworkModels(): Promise<void> {
     const d = desktop;
     if (!d) return void (networkModels = []);
     const next = await d.networkModels(AbortSignal.timeout(5000)).catch(() => null);
     if (!next || d !== desktop) return;
+    // (the chat names a computer in an OAIY tool's call by its name, not its id)
+    rememberComputers(next);
     const changed = JSON.stringify(next) !== JSON.stringify(networkModels);
     networkModels = next;
     if (changed) renderChips();
@@ -695,6 +810,25 @@ async function main(): Promise<void> {
     const found = await discoverOaiy(origin, media.apiKey, undefined, 3000).catch(() => null);
     if (found?.state === 'found') followEngine(found);
   }
+
+  /**
+   * A model chosen in the menu, taken as the Agent's at once, as the desktop will answer it: the menu stays on it, and
+   * the desktop's answer, a moment later, is no change to say (see `picked`).
+   */
+  function settle(next: AgentModel): void {
+    picked = { model: next, at: Date.now() };
+    if (!sameModel(next, agentModel)) {
+      agentModel = next;
+      codexDefault = null;
+      chatgptProblem = '';
+    }
+    agentModelKnown = true;
+    agentModelAt = Date.now();
+  }
+
+  /** What a paired computer's model not answering now means for a choice of it: it is used once it answers. */
+  const notNow = (m: NetworkModel): string =>
+    m.ready ? '' : m.nodeOnline ? ` Its engines on ${m.nodeName} are not running now: it is used once they are.` : ` ${m.nodeName} does not answer now: it is used once it does.`;
 
   /**
    * A model chosen in the model menu. With a desktop to ask, it is chosen in Engines, so it is what loads, and the
@@ -715,13 +849,14 @@ async function main(): Promise<void> {
       modelPick.disabled = true;
       try {
         await desktop.chooseEngineModel(model, AbortSignal.timeout(15_000));
-        chat.system(`OAIY's engine now runs ${remote.model} on ${remote.nodeName}, over OAIY Network: the Agent, the phone's agents and flows use it there.${remote.ready ? '' : ` ${remote.nodeName} does not answer now: it is used once it does.`}`);
+        // (as the desktop will say it once it has settled the choice over OAIY Network)
+        settle({ source: 'engine', model, name: remote.nodeName, viaDefault: true });
+        chat.system(`OAIY's engine now runs ${remote.model} on ${remote.nodeName}, over OAIY Network: the Agent, the phone's agents and flows use it there.${notNow(remote)}`);
       } catch (error) {
         chat.system(`Could not choose ${remote.model} on ${remote.nodeName}: ${(error as Error).message}`, 'error');
       } finally {
         modelPick.disabled = false;
       }
-      await followAgentModel(5000, false, false);
       void refreshNetworkModels();
       return renderChips();
     }
@@ -730,6 +865,7 @@ async function main(): Promise<void> {
     if (!own || !model || (!onWorker && model === own.modelId && (own.followEngine || !desktop))) return renderChips();
     const onEgpu = cardOn(engineFound) && (engineFound?.llm.details.find((m) => m.id === model)?.egpu ?? false);
     modelPick.disabled = true;
+    let chose = false;
     try {
       if (desktop) {
         await desktop.chooseEngineModel(model, AbortSignal.timeout(15_000));
@@ -738,6 +874,11 @@ async function main(): Promise<void> {
         own.modelId = model;
         own.followEngine = false;
       }
+      chose = true;
+      // (from a paired computer's: the Agent is on the engine's own again, as the desktop will say; on a Mac whose eGPU
+      // is on, one of the Mac's is said to be loading until the Mac holds it)
+      if (desktop && onWorker) settle(ENGINE);
+      if (desktop && !onEgpu && cardOn(engineFound)) macLoading = model;
       await saveProviders(providers, activeId);
       chat.system(!desktop
         ? `The Agent now asks OAIY for ${model}.`
@@ -751,32 +892,77 @@ async function main(): Promise<void> {
     } finally {
       modelPick.disabled = false;
     }
-    // (from a paired computer's: the Agent is on the engine's own again, as the desktop now says)
-    if (onWorker) await followAgentModel(5000, false, false);
     renderChips();
     await refreshEngine();
-    if (desktop && onEgpu) void watchEgpu(model);
+    if (desktop && chose) void watchLoad(model);
+  }
+
+  /** Whether OAIY's engine holds `model` now, ready where it runs (on the eGPU, or in this Mac's memory). */
+  function loadedNow(model: string): boolean {
+    const found = engineFound;
+    const m = found?.llm.details.find((x) => x.id === model);
+    if (!found || !m) return false;
+    return cardOn(found) && m.egpu ? found.llm.egpu.model === model && found.llm.egpu.state === 'ready' : m.loaded;
+  }
+
+  /** The model a load is being watched for (one watch at a time: another model chosen ends it). */
+  let watching: string | null = null;
+
+  /**
+   * While `model`, just chosen (here, or by the Agent), loads where it runs, the menu is kept up to date and its end is
+   * said, where the menu says where models run (a Mac whose eGPU is switched on). On the eGPU for up to ten minutes:
+   * its load begins beside the choice, so a first look may find the card not yet starting. On this Mac, which says only
+   * whether it holds a model, for up to three: the menu says it is loading meanwhile. Another model chosen ends the watch.
+   */
+  async function watchLoad(model: string): Promise<void> {
+    if (!cardOn(engineFound) || watching === model) return;
+    const onCard = engineFound?.llm.details.find((m) => m.id === model)?.egpu ?? false;
+    watching = model;
+    const begun = Date.now();
+    const until = begun + (onCard ? 600_000 : 180_000);
+    if (!onCard && macLoading !== model) {
+      macLoading = model;
+      renderChips();
+    }
+    try {
+      for (;;) {
+        const chosen = agentProvider('project')?.modelId === model;
+        if (!chosen || watching !== model || Date.now() > until) return;
+        if (onCard) {
+          const egpu = engineFound?.llm.egpu;
+          if (egpu?.model === model && egpu.state === 'ready') return void chat.system(`${model} is loaded on the eGPU.`);
+          if (egpu?.model === model && egpu.state === 'failed') return void chat.system(`${model} did not load on the eGPU: Engines → Logs says why.`, 'error');
+          // (not begun within half a minute: it loads with the next message instead, as the engines' log says)
+          if (egpu?.state !== 'starting' && Date.now() - begun > 30_000) return;
+        } else {
+          if (macLoading !== model) return;
+          if (engineFound?.llm.details.find((m) => m.id === model)?.loaded) return void chat.system(`${model} is loaded on this Mac.`);
+        }
+        await new Promise((r) => setTimeout(r, 3000));
+        await refreshEngine();
+      }
+    } finally {
+      if (watching === model) watching = null;
+      // (loaded, or no longer waited for: the menu says what the Mac says, "ready" or "not loaded")
+      if (macLoading === model) {
+        macLoading = null;
+        renderChips();
+      }
+    }
   }
 
   /**
-   * While `model`, just chosen, loads on the eGPU, the menu is kept up to date, and its end is said (for up to ten
-   * minutes): its load begins beside the choice, so a first look may find the card not yet starting. Another model
-   * chosen meanwhile ends the watch.
+   * The Agent changed the engine (chose its model, started or stopped it) or OAIY Network (paired a computer, unpaired
+   * one, chose where a service runs): the engine is read again, and the Agent's model, quietly (the tool's result says
+   * what changed), with the paired computers' models. A model the engine loads now is watched until it is loaded. A
+   * paired computer's model chosen is settled by the desktop a moment after it answers, so that is read again then.
    */
-  async function watchEgpu(model: string): Promise<void> {
-    const until = Date.now() + 600_000;
-    const begun = Date.now();
-    for (;;) {
-      const egpu = engineFound?.llm.egpu;
-      const chosen = agentProvider('project')?.modelId === model;
-      if (!chosen || Date.now() > until) return;
-      if (egpu?.model === model && egpu.state === 'ready') return void chat.system(`${model} is loaded on the eGPU.`);
-      if (egpu?.model === model && egpu.state === 'failed') return void chat.system(`${model} did not load on the eGPU: Engines → Logs says why.`, 'error');
-      // (not begun within half a minute: it loads with the next message instead, as the engines' log says)
-      if (egpu?.state !== 'starting' && Date.now() - begun > 30_000) return;
-      await new Promise((r) => setTimeout(r, 3000));
-      await refreshEngine();
-    }
+  async function followEngineChange(loading: boolean): Promise<void> {
+    await Promise.all([refreshEngine(), followAgentModel(5000, true, false)]);
+    await networkRead;
+    const model = agentProvider('project')?.modelId;
+    if (loading && desktop && model && engineFound?.llm.details.some((m) => m.id === model) && !loadedNow(model)) void watchLoad(model);
+    setTimeout(() => void followAgentModel(5000, true, false), 8000);
   }
   gate.onChange(() => {
     renderChips();
@@ -909,6 +1095,8 @@ async function main(): Promise<void> {
         // A run that started calls is not pushed on by its plan while they are going on (the place is the one its campaigns are started from).
         waitingOnCall: () => (kind() === 'runner' || kind() === 'project') && !!outreach?.callLiveFor(place().meta.id),
         prepare: prepareFor(kind),
+        noProvider,
+        onFailure: followFailure(kind),
         // "Set up OAIY" is a conversation: the Agent stops to ask, or to let the person do a step on screen,
         // and is not pushed on by an open plan meanwhile.
         conversation: kind() === 'setup',
@@ -1342,7 +1530,7 @@ async function main(): Promise<void> {
   };
 
   const editSettings = async () => {
-    const result = await openSettings({ providers, activeId, agent: agentSettings, media }, { pairedDesktop: given ? null : desktop?.origin ?? null });
+    const result = await openSettings({ providers, activeId, agent: agentSettings, media }, { pairedDesktop: given ? null : desktop?.origin ?? null, agentElsewhere: elsewhere() || undefined });
     if (!result) return;
     providers = result.providers;
     activeId = result.activeId;
@@ -1383,9 +1571,9 @@ async function main(): Promise<void> {
     }
     const w = contextWindow(p);
     const room = budgetFor(w.tokens, 6000).prompt;
-    const from = w.source === 'server' ? `from ${p.detectedContext?.how}` : w.source === 'known' ? 'known for this model' : 'assumed: the server does not say; set it in Settings';
+    const from = w.source === 'server' ? `, from ${p.detectedContext?.how ?? 'the server'}` : w.source === 'known' ? ' (known for this model)' : ' (assumed: the server does not say; set it in Settings)';
     chat.system(
-      `${p.modelId}: ${formatTokens(w.tokens)} tokens of context (${from}). The conversation is compacted at ${Math.round(agentSettings.compactAt * 100)}%.` +
+      `${p.modelId}: ${formatTokens(w.tokens)} tokens of context${from}. The conversation is compacted at ${Math.round(agentSettings.compactAt * 100)}%.` +
         (room < 8000 ? `\nThat leaves little room to work in (about ${formatTokens(room)} tokens after the instructions and tools). A bigger window helps a lot${p.serverKind === 'ollama' ? ': start Ollama with OLLAMA_CONTEXT_LENGTH=32768 (or more), then press Detect in Settings' : ''}.` : ''),
       room < 8000 ? 'error' : 'info',
     );
@@ -1541,6 +1729,8 @@ async function main(): Promise<void> {
     let finish!: () => void;
     currentRun = new Promise<void>((resolve) => (finish = resolve));
     const runNumber = ++runsStarted;
+    // (a Try again of a run before this one would carry on from this one's end, unasked)
+    chat.dropRetries();
     renderSessions();
     // The conversation is saved as it grows, so a closed tab or a crash loses little.
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1571,8 +1761,10 @@ async function main(): Promise<void> {
           return;
         }
       }
-      // The person's words first, then what is said of the model's window.
+      // The person's words first, then what is said of the model's window (of the model that answers: read again first
+      // where it may have changed in OAIY, as the run's preparation would only after this).
       if (!shown) chat.user(text, attachments);
+      await catchUp('project');
       await checkWindow();
       // The first check of a run brings the preview forward, so the person sees the app being built.
       let previewShown = false;
@@ -1799,7 +1991,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   }
 
   // Incognito, on or off: a toggle in the actions, and a chip in the top bar that shows while it is on.
-  const incognitoButton = h('button.incognito-toggle', { 'aria-pressed': 'false', onclick: () => void toggleIncognito() });
+  const incognitoButton = h('button.incognito-toggle', { 'aria-checked': 'false', onclick: () => void toggleIncognito() });
   const incognitoChip = h('span.incognito-chip', { title: 'Incognito is on: nothing of this project is kept unless you export it', hidden: true }, '🕶 INCOGNITO');
   function showIncognito(on: boolean): void {
     incognitoButton.textContent = on ? '🕶 Incognito: ON' : '🕶 Incognito: OFF';
@@ -1807,7 +1999,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
       ? 'Incognito is on: nothing of this project is kept. Click to leave it (the project is deleted; export it first to keep it)'
       : 'Incognito is off. Click for a private project: nothing is kept (no conversation, files or media) unless you export it';
     incognitoButton.classList.toggle('on', on);
-    incognitoButton.setAttribute('aria-pressed', String(on));
+    incognitoButton.setAttribute('aria-checked', String(on));
     incognitoChip.hidden = !on;
     deleteButton.textContent = on ? 'Clear' : 'Delete';
     deleteButton.title = on ? 'Clear this incognito project: delete everything in it and start a fresh one (incognito stays on)' : 'Delete this project from the browser';
@@ -1860,13 +2052,47 @@ A project can hold several apps, each in its own folder (any folder whose manife
     await renderProjects();
   }
 
-  // Project actions: a row of buttons on a wide screen, a ☰ menu on a phone.
-  const closeMenu = () => header.classList.remove('menu-open');
+  // Project actions: a menu under the "⋯" button. The keyboard opens it (focus goes to its first item), moves through it
+  // (the arrows, Home and End) and closes it (Escape, back to the button; Tab, on to what follows).
+  const closeMenu = (refocus = false) => {
+    if (!header.classList.contains('menu-open')) return;
+    header.classList.remove('menu-open');
+    menuToggle.setAttribute('aria-expanded', 'false');
+    if (refocus) menuToggle.focus();
+  };
+  /** The menu's items that can be chosen now (one hidden, as "Install app" is where the browser does not offer it, is not). */
+  const menuItems = (): HTMLButtonElement[] => Array.from(actions.querySelectorAll('button')).filter((b) => !b.disabled && b.getClientRects().length > 0);
+  const openMenu = () => {
+    header.classList.add('menu-open');
+    menuToggle.setAttribute('aria-expanded', 'true');
+    menuItems()[0]?.focus();
+  };
   // "Set up OAIY": the conversation with the Agent about OAIY itself (while there is a desktop to set up).
   const setupButton = h('button.setup-oaiy', { title: 'Chat with the Agent to set OAIY up: your phone, flows, models, plugins and services', hidden: !(desktop && canDo('setup')), onclick: () => void openSetup() }, 'Set up OAIY') as HTMLButtonElement;
   const actions = h(
     'div.actions',
-    { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
+    {
+      id: 'project-menu',
+      role: 'menu',
+      'aria-label': 'Project menu',
+      onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); },
+      onkeydown: (e: KeyboardEvent) => {
+        const items = menuItems();
+        const at = items.indexOf(document.activeElement as HTMLButtonElement);
+        const go = (i: number) => {
+          e.preventDefault();
+          items[(i + items.length) % items.length]?.focus();
+        };
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          closeMenu(true);
+        } else if (e.key === 'ArrowDown') go(at + 1);
+        else if (e.key === 'ArrowUp') go(at < 0 ? -1 : at - 1);
+        else if (e.key === 'Home') go(0);
+        else if (e.key === 'End') go(-1);
+        else if (e.key === 'Tab') closeMenu();
+      },
+    },
     setupButton,
     installButton(install),
     h('button', { title: 'New empty project', onclick: async () => {
@@ -1901,12 +2127,31 @@ A project can hold several apps, each in its own folder (any folder whose manife
     renameButton,
     deleteButton,
   );
+  // (each a menu item; incognito one that is on or off)
+  for (const b of actions.querySelectorAll('button')) b.setAttribute('role', b === incognitoButton ? 'menuitemcheckbox' : 'menuitem');
+  const menuToggle = h('button.menu-toggle', {
+    title: 'Project menu: new, open, import, export, rename…',
+    'aria-label': 'Project menu',
+    'aria-haspopup': 'menu',
+    'aria-controls': 'project-menu',
+    'aria-expanded': 'false',
+    onclick: () => (header.classList.contains('menu-open') ? closeMenu() : openMenu()),
+    onkeydown: (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && header.classList.contains('menu-open')) {
+        e.preventDefault();
+        closeMenu();
+      } else if (e.key === 'ArrowDown' && !header.classList.contains('menu-open')) {
+        e.preventDefault();
+        openMenu();
+      }
+    },
+  }, icon('more')) as HTMLButtonElement;
   const header = h(
     'header.topbar',
     h('div.brand', h('span.logo', '◆'), h('span.brand-name', ' OAIY')),
     incognitoChip,
     new ProjectPicker(projectSelect).element,
-    h('button.menu-toggle', { title: 'Project menu: new, open, import, export, rename…', 'aria-label': 'Project menu', 'aria-haspopup': 'menu', onclick: () => header.classList.toggle('menu-open') }, icon('more')),
+    menuToggle,
     actions,
     h('div.spacer'),
     phoneChip,
@@ -1965,9 +2210,13 @@ A project can hold several apps, each in its own folder (any folder whose manife
   narrow.addEventListener('change', showPreview);
   showPane('editor');
   showView('agent');
-  // A tap anywhere outside the open project menu closes it.
+  // A tap anywhere outside the open project menu closes it, as focus leaving it does.
   document.addEventListener('pointerdown', (e) => {
     if (header.classList.contains('menu-open') && !header.contains(e.target as Node)) closeMenu();
+  });
+  actions.addEventListener('focusout', (e) => {
+    const to = e.relatedTarget as Node | null;
+    if (to && !actions.contains(to) && to !== menuToggle) closeMenu();
   });
   clear(app);
   app.append(header, workspace, tabs);
@@ -2063,7 +2312,15 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     if (first || chatProvider) {
       const can = mediaAbilities(media);
-      chat.system(`Found ${found.service} ${found.version} at ${found.origin}.${can ? ` The agent can make ${can} with it.` : ''}${chatProvider ? ` It is in the AI providers for chat too${activeId === chatProvider.id ? ', and in use' : ''}.` : ''} Change this in Settings → Images, video and audio.`);
+      // What the agent does with them, and where each is changed. In OAIY's own window its engines are this window's,
+      // found at every start: only what they offer the agent is said.
+      const uses = [
+        chatProvider && activeId === chatProvider.id ? 'chats with them (Settings → AI providers)' : '',
+        can ? `can make ${can} with them (Settings → Images, video and audio)` : '',
+      ].filter(Boolean);
+      chat.system(IN_OAIY
+        ? `OAIY's engines are ready here${can ? `: the agent can make ${can} with them` : ''}.`
+        : `Found OAIY's engines at ${found.origin} (version ${found.version}).${uses.length ? ` The agent ${uses.join(' and ')}.` : ''}${chatProvider && activeId !== chatProvider.id ? ' They are in Settings → AI providers for chat too.' : ''}`);
     }
   }
 
@@ -2105,7 +2362,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       }
       if (!p.followEngine || p.modelId === found.llm.default) continue;
       p.modelId = found.llm.default;
-      if (found.llm.contextTokens) p.detectedContext = { model: found.llm.default, tokens: found.llm.contextTokens, how: 'OAIY (/v1/discovery)', at: Date.now() };
+      if (found.llm.contextTokens) p.detectedContext = { model: found.llm.default, tokens: found.llm.contextTokens, how: "OAIY's engine", at: Date.now() };
       changed = true;
     }
     if (changed) void saveProviders(providers, activeId);
@@ -2150,7 +2407,11 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     const next = await readAgentModel(d, AbortSignal.timeout(waitMs));
     if (!next || d !== desktop) return;
+    // (a model just chosen in the menu that the desktop has not settled yet: its answer is from before the choice)
+    if (picked && !sameModel(next, picked.model) && Date.now() - picked.at < PICK_SETTLES_MS) return;
+    picked = null;
     agentModelAt = Date.now();
+    const was = agentModel;
     const changed = !sameModel(next, agentModel);
     const announce = changed && agentModelKnown && say;
     agentModel = next;
@@ -2163,19 +2424,39 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     if (lookUp && next.source === 'chatgpt' && !next.model && !codexDefault) await lookUpCodexDefault(AbortSignal.timeout(10_000)).catch(() => {});
     if (!changed) return;
     renderChips();
-    if (announce)
-      chat.system(
-        next.source === 'chatgpt'
-          ? `The Agent now runs on ChatGPT${next.model ?? codexDefault ? ` (${next.model ?? codexDefault})` : ''}, as chosen in OAIY. Calls use a fast ChatGPT route of their own.`
-          : next.source === 'provider'
-            ? `The Agent now runs on ${next.name || next.provider} (${next.model}), as chosen in OAIY.`
-            : next.model && workerModel(next.model)
-              ? `The Agent now runs on ${workerModel(next.model)!.model}${next.name ? ` on ${next.name}` : ''}, over OAIY Network, as chosen in OAIY.`
-              : "The Agent now runs on OAIY's engine, as chosen in OAIY.",
-      );
+    if (announce) chat.system(movedTo(next, was));
+  }
+
+  /**
+   * The Agent's model changed in OAIY, from `was` to `next`, in words. A choice of the Agent's own (Settings → Agent) is
+   * said as chosen; the engine's default moving (a paired computer's model taking it, as Engines or that computer's own
+   * switch does, or it coming back to this computer) is said as what happened, not as anyone's choice.
+   */
+  function movedTo(next: AgentModel, was: AgentModel): string {
+    if (next.source === 'chatgpt') return `The Agent now runs on ChatGPT${next.model ?? codexDefault ? ` (${next.model ?? codexDefault})` : ''}, as chosen in OAIY. Calls use a fast ChatGPT route of their own.`;
+    if (next.source === 'provider') return `The Agent now runs on ${next.name || next.provider} (${next.model}), as chosen in OAIY.`;
+    const worker = next.model ? workerModel(next.model) : null;
+    const where = worker ? `${worker.model}${next.name ? ` on ${next.name}` : ''}` : '';
+    if (worker && next.viaDefault) return `OAIY's engine default is now ${where}, over OAIY Network: the Agent runs there.`;
+    if (worker) return `The Agent now runs on ${where}, over OAIY Network, as chosen in OAIY.`;
+    if (was.source === 'engine' && was.viaDefault) return "OAIY's engine default is this computer's own model again: the Agent runs on it here.";
+    return "The Agent now runs on OAIY's engine, as chosen in OAIY.";
   }
   // The Agent's model is looked at again every minute (it may be changed in OAIY at any time).
   setInterval(() => void followAgentModel(), 60_000);
+  // And when the window comes back to the front (from OAIY's dashboard, or another app), at most every few seconds: a
+  // computer just paired in Networking is in the model menu then, not at the minute's look, and the engine is as it is.
+  let backAt = 0;
+  const lookOnReturn = () => {
+    if (!desktop || Date.now() - backAt < 5000) return;
+    backAt = Date.now();
+    void followAgentModel();
+    void refreshEngine();
+  };
+  window.addEventListener('focus', lookOnReturn);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') lookOnReturn();
+  });
 
   /** Codex's own default model, for a ChatGPT choice that names none. Signed out, the chip says so, and the error says where to sign in. */
   async function lookUpCodexDefault(signal?: AbortSignal): Promise<void> {
@@ -2538,7 +2819,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       const state = !desktop ? 'off' : desktopProblem ? 'problem' : 'paired';
       phoneChip.dataset.state = state;
       phoneChip.textContent = state === 'off' ? 'desktop: not paired' : state === 'problem' ? 'desktop: offline' : 'desktop: paired';
-      phoneChip.title = state === 'problem' ? `OAIY Desktop: ${desktopProblem}` : 'OAIY Desktop: pair this page with it';
+      phoneChip.title = state === 'problem' ? `OAIY Desktop: ${desktopProblem}` : state === 'paired' ? 'OAIY Desktop: this page is paired with it (click to see the pairing, or forget it)' : 'OAIY Desktop: pair this page with it';
       return;
     }
     phoneChip.hidden = false;
@@ -2945,7 +3226,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   if (!meta) {
     meta = await createProject('Welcome');
     await openProject(meta);
-    for (const [path, text] of WELCOME) project.vfs.writeFile(`/${path}`, text, { parents: true });
+    for (const [path, text] of welcome(IN_OAIY)) project.vfs.writeFile(`/${path}`, text, { parents: true });
     await project.flush();
     editor.open('/README.md');
     tree.select('/README.md');
@@ -3009,8 +3290,12 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     // The phone's calls, its chip and call backs start once the desktop says there is a phone.
     startModules();
   } else applyModules(UNPAIRED);
-  void Promise.all([modelKnown, Promise.race([lookedFor, new Promise<void>((resolve) => setTimeout(resolve, WELCOME_WAITS_MS))])]).then(() => {
-    if (!agentProvider('project')) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
+  // (and the paired computers' models: with none here, one of theirs may be the one to use, from the model menu)
+  void Promise.all([modelKnown.then(() => networkRead), Promise.race([lookedFor, new Promise<void>((resolve) => setTimeout(resolve, WELCOME_WAITS_MS))])]).then(() => {
+    if (agentProvider('project')) return;
+    chat.system(noProvider()
+      ? "Welcome! This computer's OAIY has no language model yet, and a paired computer's can run the Agent: choose one in the model menu at the top (or in OAIY's Engines → Other computers). The editor and terminal work without one."
+      : 'Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
   });
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
   // pagehide and a hidden page come early enough for the writes to start; the

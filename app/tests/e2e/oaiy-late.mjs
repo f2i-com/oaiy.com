@@ -105,7 +105,7 @@ try {
   await check('an OAIY with no language model yet gives the page nothing to chat on', async () => {
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Welcome! Set up an AI provider'), { timeout: 15_000 });
     const text = await log();
-    expect(text.includes('Found oaiy-studio 0.1.0') && !text.includes('in the AI providers for chat'), text.slice(0, 400));
+    expect(text.includes("Found OAIY's engines at") && !text.includes('chats with them'), text.slice(0, 400));
     expect((await chip()) === 'Set up AI…', await chip());
   });
 
@@ -120,7 +120,9 @@ try {
     const text = await log();
     expect(!text.includes('No AI provider is set up yet'), 'the page said there is no AI provider, with a model in OAIY');
     expect(text.includes(REPLY), text.slice(-400));
-    expect(text.includes('in the AI providers for chat too, and in use'), text.slice(0, 600));
+    expect(text.includes('The agent chats with them (Settings → AI providers).'), text.slice(0, 600));
+    // (the window said is that of the model that answers, found before it is said)
+    expect(text.includes(`${MODEL}: 32.8k tokens of context, from OAIY's engine.`), text.slice(0, 900));
     // (A provider that follows Engines names no model in its request: OAIY runs the one chosen there.)
     expect(chats.length >= 1 && chats[0].messages.some((m) => m.role === 'user' && JSON.stringify(m.content).includes('Hello, are you there?')), JSON.stringify(chats).slice(0, 300));
     expect((await chip()) === `OAIY · ${MODEL}`, await chip());

@@ -32,6 +32,9 @@ const script = [
   // "Say hello.": the provider fails once (a server error, not retried by itself), then answers when asked again.
   { fail: 503 },
   { text: 'Hello again: it worked the second time.' },
+  // "Fail once more.": fails; the next message is answered, and the first one's Try again is gone with it.
+  { fail: 503 },
+  { text: 'The next one is answered.' },
 ];
 function sse(step, n) {
   const events = [];
@@ -121,6 +124,14 @@ try {
     });
   });
 
+  await check("with no file open, the editor's keys are written as this computer's (⌘ on a Mac)", async () => {
+    await page.click('button.editor-close');
+    await page.waitForSelector('.editor-keys');
+    const keys = await page.$eval('.editor-keys', (k) => k.textContent);
+    const mac = await page.evaluate(() => /Mac|iPhone|iPad|iPod/.test(navigator.platform));
+    expect(mac ? keys.includes('⌘ F') && keys.includes('⌥ ↑ ↓') && !keys.includes('Ctrl') : keys.includes('Ctrl F'), keys);
+  });
+
   await check('the terminal runs Python on Zipp against the project', async () => {
     const out = await terminal(page, 'python hello.py', 'mean temperature');
     expect(/mean temperature: 19\.8/.test(out), out);
@@ -159,7 +170,7 @@ try {
 
   await check("the model's context window is detected from the server, and a meter shows how full it is", async () => {
     const log = await page.$eval('.chat-log', (e) => e.textContent);
-    expect(log.includes("mock-model: 131k tokens of context (from the server's model list)") && log.includes('compacted at 75%'), log.slice(0, 600));
+    expect(log.includes("mock-model: 131k tokens of context, from the server's model list.") && log.includes('compacted at 75%'), log.slice(0, 600));
     const meter = await page.$eval('.context-meter', (m) => ({ hidden: m.hidden, text: m.textContent }));
     expect(!meter.hidden && / \/ 131k$/.test(meter.text), JSON.stringify(meter));
   });
@@ -192,6 +203,40 @@ try {
     expect(requests.length === before + 2, `requests: ${requests.length - before}`);
     const asked = JSON.stringify(requests.at(-1).messages).split('Say hello.').length - 1;
     expect(asked === 1, `the request was sent ${asked} times in the retried conversation`);
+  });
+
+  await check("a run after a failed one takes the failed one's Try again away: an old one cannot carry on unasked", async () => {
+    const before = requests.length;
+    await page.type('.chat-input', 'Fail once more.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => [...document.querySelectorAll('.chat-log button.retry')].some((b) => b.textContent.includes('Try again')), { timeout: 30_000 });
+    await page.type('.chat-input', 'Next question.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('The next one is answered.'), { timeout: 30_000 });
+    const left = await page.$$eval('.chat-log button.retry', (b) => b.filter((x) => x.textContent.includes('Try again')).length);
+    expect(left === 0, `${left} Try again buttons left from an earlier run`);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(requests.length === before + 2, `requests: ${requests.length - before}`);
+  });
+
+  await check('the project menu works from the keyboard: it opens with focus on its first item, the arrows move, Escape closes it', async () => {
+    await page.focus('button.menu-toggle');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('header.topbar')?.classList.contains('menu-open'));
+    const open = await page.evaluate(() => ({
+      expanded: document.querySelector('button.menu-toggle').getAttribute('aria-expanded'),
+      role: document.querySelector('.actions').getAttribute('role'),
+      items: [...document.querySelectorAll('.actions button')].every((b) => /^menuitem/.test(b.getAttribute('role') ?? '')),
+      focus: document.activeElement?.textContent,
+      inMenu: !!document.activeElement?.closest('.actions'),
+    }));
+    expect(open.expanded === 'true' && open.role === 'menu' && open.items && open.inMenu, JSON.stringify(open));
+    await page.keyboard.press('ArrowDown');
+    const next = await page.evaluate(() => document.activeElement?.textContent);
+    expect(next !== open.focus && (await page.evaluate(() => !!document.activeElement?.closest('.actions'))), `${open.focus} → ${next}`);
+    await page.keyboard.press('Escape');
+    const closed = await page.evaluate(() => ({ open: document.querySelector('header.topbar').classList.contains('menu-open'), expanded: document.querySelector('button.menu-toggle').getAttribute('aria-expanded'), focus: document.activeElement?.className }));
+    expect(!closed.open && closed.expanded === 'false' && closed.focus === 'menu-toggle', JSON.stringify(closed));
   });
 
   await check('the internet chip toggles the gate off and on', async () => {

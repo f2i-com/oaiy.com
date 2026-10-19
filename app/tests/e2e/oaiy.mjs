@@ -228,9 +228,11 @@ try {
   await page.waitForSelector('.tree-row', { timeout: 60_000 });
 
   await check('OAIY is found on its own: images, video and chat are set up from its discovery document', async () => {
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Found oaiy-studio 0.1.0'), { timeout: 15_000 });
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("Found OAIY's engines at"), { timeout: 15_000 });
     const log = await page.$eval('.chat-log', (e) => e.textContent);
-    expect(log.includes('The agent can make images, video, speech, music, sound effects and 3D models with it.') && log.includes('in the AI providers for chat too, and in use'), log.slice(0, 500));
+    // (in plain words: the engines, not their service's name, and where each thing is changed)
+    expect(log.includes(`Found OAIY's engines at ${new URL(oaiyUrl).origin} (version 0.1.0).`) && !log.includes('oaiy-studio'), log.slice(0, 500));
+    expect(log.includes('The agent chats with them (Settings → AI providers) and can make images, video, speech, music, sound effects and 3D models with them (Settings → Images, video and audio).'), log.slice(0, 500));
     expect(!log.includes('Welcome! Set up an AI provider'), 'the welcome still asks for a provider');
     const chip = await page.$eval('button[title="AI provider"]', (b) => b.textContent);
     expect(chip === 'OAIY · qwen3.8-27b', chip);

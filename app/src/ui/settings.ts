@@ -51,7 +51,7 @@ export function oaiyProvider(providers: ProviderConfig[], found: Extract<Discove
     modelId: found.llm.default,
     // The model chosen in OAIY's Engines, whichever that is.
     followEngine: true,
-    ...(found.llm.contextTokens && found.llm.default ? { detectedContext: { model: found.llm.default, tokens: found.llm.contextTokens, how: 'OAIY (/v1/discovery)', at: Date.now() } } : {}),
+    ...(found.llm.contextTokens && found.llm.default ? { detectedContext: { model: found.llm.default, tokens: found.llm.contextTokens, how: "OAIY's engine", at: Date.now() } } : {}),
   };
 }
 
@@ -85,11 +85,15 @@ function kindOf(p: ProviderConfig): string {
   return p.type;
 }
 
+/** What the OAIY kind's help says in OAIY's own window: it reaches OAIY as it is, so nothing about letting a site in. */
+const OAIY_HELP_IN_WINDOW = 'OAIY serves chat, images and video. Settings → Images, video and audio uses the same server.';
+
 /**
  * `pairedDesktop`: the origin of the OAIY Desktop this tab is paired with (null: none). The words about how OAIY is found say what a tab
- * that is paired keeps doing besides.
+ * that is paired keeps doing besides. `agentElsewhere`: what the Agent runs on where OAIY chose something other than its
+ * engine for it (ChatGPT, one of the desktop's AI providers), said above the providers, which then are not what it runs on.
  */
-export function openSettings(initial: SettingsResult, context: { pairedDesktop?: string | null } = {}): Promise<SettingsResult | null> {
+export function openSettings(initial: SettingsResult, context: { pairedDesktop?: string | null; agentElsewhere?: string } = {}): Promise<SettingsResult | null> {
   return new Promise((resolve) => {
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
@@ -263,7 +267,10 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         renderList();
         renderForm();
       } }, 'Remove');
-      const help = p.type === 'local' ? LOCAL_SERVERS[p.serverKind ?? 'other']?.help : p.type === 'anthropic' ? 'Your key is sent only to Anthropic, straight from this browser.' : 'Your key is sent only to this API, straight from this browser.';
+      // (in OAIY's own window OAIY answers this page as it is: its gateway's list of sites is not for it)
+      const help = p.type === 'local'
+        ? p.serverKind === 'oaiy' && pageHost().kind === 'oaiy-window' ? OAIY_HELP_IN_WINDOW : LOCAL_SERVERS[p.serverKind ?? 'other']?.help
+        : p.type === 'anthropic' ? 'Your key is sent only to Anthropic, straight from this browser.' : 'Your key is sent only to this API, straight from this browser.';
       form.append(
         h('label', 'Kind', kind),
         h('label', 'Name', name),
@@ -408,6 +415,9 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     dialog.append(
       h('h2', 'Settings'),
       h('strong.settings-section', 'AI providers'),
+      ...(context.agentElsewhere
+        ? [h('p.agent-elsewhere', `The Agent runs on ${context.agentElsewhere}, as chosen in OAIY's Settings → Agent: change it there. The providers below are this page's own; the Agent uses them when it runs on OAIY's engine.`)]
+        : []),
       h('p.muted', 'Keys are stored encrypted in this browser and sent only to their own provider. Sandboxed code never sees them.'),
       h('div.settings-grid', list, form),
       h(

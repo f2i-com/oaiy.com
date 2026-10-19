@@ -170,10 +170,10 @@ export function desktopProvider(desktop: { origin: string; token: string }, choi
 
 /**
  * A paired worker's language model (OAIY Network), through the desktop's route for that worker: the desktop's token is
- * the key, the worker's address and certificate stay the desktop's. Its engine is OAIY's, so its window is planned as
- * the engine's; one request at a time.
+ * the key, the worker's address and certificate stay the desktop's. Its window is the one its engine has, where the
+ * desktop's catalogue says (`contextTokens`), else planned as an OAIY engine's; one request at a time.
  */
-export function workerProvider(desktop: { origin: string; token: string }, choice: EngineChoice): ProviderConfig | null {
+export function workerProvider(desktop: { origin: string; token: string }, choice: EngineChoice, contextTokens?: number): ProviderConfig | null {
   const worker = workerModel(choice.model ?? '');
   if (!worker) return null;
   return {
@@ -184,14 +184,18 @@ export function workerProvider(desktop: { origin: string; token: string }, choic
     apiKey: desktop.token,
     baseUrl: `${desktop.origin.replace(/\/+$/, '')}/api/network/nodes/${worker.node}/v1`,
     modelId: worker.model,
-    contextTokens: OAIY_ENGINE_WINDOW,
+    contextTokens: contextTokens && contextTokens >= 1024 ? contextTokens : OAIY_ENGINE_WINDOW,
     parallelAgents: 1,
   };
 }
 
-/** The provider a conversation of `kind` runs on: the engine's (the app's own, as chosen in Settings, or a paired worker's), ChatGPT's, or a desktop AI provider's. */
-export function providerFor(kind: AgentKind, choice: AgentModel, engine: ProviderConfig | null, desktop: { origin: string; token: string } | null, codexDefault: string | null): ProviderConfig | null {
-  if (choice.source === 'engine') return (choice.model && desktop ? workerProvider(desktop, choice) : null) ?? engine;
+/**
+ * The provider a conversation of `kind` runs on: the engine's (the app's own, as chosen in Settings, or a paired
+ * worker's), ChatGPT's, or a desktop AI provider's. `workerWindow`: a paired worker's model's window, by its id, where
+ * the desktop's catalogue says it.
+ */
+export function providerFor(kind: AgentKind, choice: AgentModel, engine: ProviderConfig | null, desktop: { origin: string; token: string } | null, codexDefault: string | null, workerWindow?: (id: string) => number | undefined): ProviderConfig | null {
+  if (choice.source === 'engine') return (choice.model && desktop ? workerProvider(desktop, choice, workerWindow?.(choice.model)) : null) ?? engine;
   if (!desktop) return engine;
   if (choice.source === 'provider') return desktopProvider(desktop, choice);
   return chatgptProvider(desktop, kind, choice.model ?? codexDefault);

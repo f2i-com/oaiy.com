@@ -147,6 +147,28 @@ export function rememberToolTitles(tools: Iterable<{ name: string; title?: strin
   for (const t of tools) if (t.title) TITLES.set(t.name, t.title);
 }
 
+/** The names of the computers paired over OAIY Network, by their node id, as the desktop last listed them. */
+const COMPUTERS = new Map<string, string>();
+
+/** Keep the paired computers' names, by node id (from the desktop's list of their models): a call names them so. */
+export function rememberComputers(computers: Iterable<{ node: string; nodeName: string }>): void {
+  for (const c of computers) if (c.nodeName) COMPUTERS.set(c.node, c.nodeName);
+}
+
+/** A paired computer by its node id: its name where it is known, else the id as the call gave it. */
+const computer = (node: string): string => COMPUTERS.get(node) ?? node;
+
+/**
+ * A model as a call names it, in words: a paired computer's (`engine:<group>:node.<id>/<model>`) as "<model> on <its
+ * name>" ("on a paired computer" when its name is not known); any other as it is.
+ */
+function modelWords(id: string): string {
+  const m = /^engine:[\w-]+:node\.([A-Za-z0-9]{1,64})\/(.+)$/.exec(id);
+  if (!m) return id;
+  const name = COMPUTERS.get(m[1]);
+  return `${m[2]} on ${name ?? 'a paired computer'}`;
+}
+
 /**
  * A tool's name in plain words ("Read", "Ran code"); a flow's own tool as its name reads. With the call's `input`,
  * as what it did reads (a pin let go, a request denied).
@@ -233,9 +255,13 @@ export function summarizeCall(call: ToolCall): string {
     case 'flow_get': case 'flow_delete': return s('id');
     case 'plugin_install': return s('source').split(/[\\/]/).filter(Boolean).pop() ?? '';
     case 'models_list': return s('group');
-    case 'model_set_default': return [s('group'), s('model')].filter(Boolean).join(' → ');
+    case 'model_set_default': return [s('group'), modelWords(s('model'))].filter(Boolean).join(' → ');
     case 'model_download': case 'model_download_plan': return s('catalogId');
-    case 'agent_model_set': return [s('source') === 'chatgpt' ? 'ChatGPT' : s('source') === 'engine' ? 'the engine' : s('source'), s('provider'), s('model')].filter(Boolean).join(' · ');
+    case 'agent_model_set': {
+      // (a paired computer's model is the engine's, there: said as that model on that computer)
+      if (s('source') === 'engine' && modelWords(s('model')) !== s('model')) return modelWords(s('model'));
+      return [s('source') === 'chatgpt' ? 'ChatGPT' : s('source') === 'engine' ? 'the engine' : s('source'), s('provider'), s('model')].filter(Boolean).join(' · ');
+    }
     // OAIY Network: which computer, what changed.
     case 'network_setup': {
       const way = (k: string, yes: string, no: string) => (i[k] === true ? yes : i[k] === false ? no : '');
@@ -243,12 +269,12 @@ export function summarizeCall(call: ToolCall): string {
     }
     case 'network_pair': return s('node') || s('address') || (s('pairingId') ? `waiting · ${s('pairingId')}` : '');
     case 'network_approve': return [i.approve === false ? 'denied' : 'approved', s('id')].filter(Boolean).join(' · ');
-    case 'network_unpair': return s('node');
-    case 'network_use_service': return `${s('service') || 'service'} → ${s('node') || 'this computer'}`;
-    case 'network_pin': return [s('model').replace(/^engine:[\w]+:node\./, ''), i.pin === false ? 'let go' : 'kept loaded'].filter(Boolean).join(' · ');
-    case 'flows_list': return s('node') ? `on ${s('node')}` : '';
+    case 'network_unpair': return computer(s('node'));
+    case 'network_use_service': return `${s('service') || 'service'} → ${s('node') ? computer(s('node')) : 'this computer'}`;
+    case 'network_pin': return [modelWords(s('model')), i.pin === false ? 'let go' : 'kept loaded'].filter(Boolean).join(' · ');
+    case 'flows_list': return s('node') ? `on ${computer(s('node'))}` : '';
     case 'flow_create': case 'flow_update': return s('id') || (i.flow && typeof i.flow === 'object' && typeof (i.flow as Record<string, unknown>).name === 'string' ? String((i.flow as Record<string, unknown>).name) : '');
-    case 'flow_run': return [s('id'), s('node') && `on ${s('node')}`].filter(Boolean).join(' ');
+    case 'flow_run': return [s('id'), s('node') && `on ${computer(s('node'))}`].filter(Boolean).join(' ');
     case 'ui_open': return [s('view'), s('contact')].filter(Boolean).join(' · ');
     case 'contacts_list': return s('q');
     case 'contact_get': return s('number');

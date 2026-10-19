@@ -351,6 +351,10 @@ export interface AgentOptions {
    * is said as the run's error, and nothing is sent.
    */
   prepare?: (signal?: AbortSignal) => Promise<void>;
+  /** What a run with no provider to send to says: where one is set up (by default, Settings). */
+  noProvider?: () => string;
+  /** A run failed on its provider's answer (not stopped): the error, to act on besides the run saying it (a model gone from where it was). */
+  onFailure?: (error: unknown) => void;
   /**
    * Whether a call this conversation started is still going on (an outreach's): its result comes here by itself when it
    * ends, so a run that started calls is not pushed on by its plan meanwhile (each push is a request the call's replies
@@ -1795,7 +1799,7 @@ ${this.instructions}` : ''}`;
     }
     const provider = this.options.provider();
     if (!provider) {
-      emit({ type: 'error', message: 'No AI provider is set up yet. Open Settings to connect a local server (Ollama, LM Studio) or an API.' });
+      emit({ type: 'error', message: this.options.noProvider?.() || 'No AI provider is set up yet. Open Settings to connect a local server (Ollama, LM Studio) or an API.' });
       return;
     }
     this.running = true;
@@ -2052,6 +2056,12 @@ ${this.instructions}` : ''}`;
       if (signal?.aborted || (error instanceof AIProviderError && error.kind === 'cancelled')) {
         emit({ type: 'notice', message: 'Stopped.' });
       } else {
+        // (told before it is said: a Try again then goes where the model is now)
+        try {
+          this.options.onFailure?.(error);
+        } catch {
+          /* the run's error is said whatever the hook did */
+        }
         emit({ type: 'error', message: error instanceof Error ? error.message : String(error), retry: true });
       }
       // A turn left waiting for tool results cannot be sent again: keep the results
