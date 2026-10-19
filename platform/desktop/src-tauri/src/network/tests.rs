@@ -808,6 +808,16 @@ async fn a_primary_uses_oaiy_voice_on_a_worker() {
     let worker = node("worker-voice", Role::Worker, Some(fake_engines().await)).await;
     let port = set_up(&worker);
     let primary = node("primary-voice", Role::Primary, None).await;
+    // (the stand-ins stopped however the test ends: one that failed half way left both serving, orphaned, for good)
+    struct StopVoices(Vec<Network>);
+    impl Drop for StopVoices {
+        fn drop(&mut self) {
+            for n in &self.0 {
+                let _ = n.inner().ai.registry.lock().unwrap_or_else(|e| e.into_inner()).stop("oaiy-voice");
+            }
+        }
+    }
+    let _stop_voices = StopVoices(vec![worker.clone(), primary.clone()]);
     let node_id = pair(&primary, &worker).await;
     let p = router(primary.clone());
     let (status, v) = call(&p, "PUT", "/api/network/settings", Some(json!({ "services": { "oaiy-voice": node_id } }))).await;
@@ -866,9 +876,6 @@ async fn a_primary_uses_oaiy_voice_on_a_worker() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     call(&p, "DELETE", &format!("/api/network/nodes/{node_id}"), None).await;
     assert!(primary.inner().services().all().is_empty());
-    for n in [&worker, &primary] {
-        let _ = n.inner().ai.registry.lock().unwrap().stop("oaiy-voice");
-    }
     for n in [&worker, &primary] {
         n.stop();
     }
