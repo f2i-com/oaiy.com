@@ -343,7 +343,7 @@ export class Preview {
       const key = path.replace(/^\/+/, '');
       if (target.kind === 'app') {
         if (target.root && !key.startsWith(`${target.root}/`)) return;
-        if (!/(^|\/)(manifest\.json|permission\.json)$|\.(ui|logic|py|xdb)$|(^|\/)assets\//i.test(key)) return;
+        if (!/(^|\/)(manifest\.json|permission\.json)$|\.(ui|html?|logic|js|py|xdb|css)$|(^|\/)assets\//i.test(key)) return;
       } else if (target.kind === 'model') {
         // A .glb is all there is to it; a .gltf also reads its folder.
         const folder = target.path.includes('/') ? `${target.path.slice(0, target.path.lastIndexOf('/'))}/` : '';
@@ -757,8 +757,8 @@ export class Preview {
   private async renderApp(root: string, generation: number): Promise<void> {
     if (!isSoftnApp(this.vfs, root)) {
       this.setStatus('');
-      this.showMessage(this.target ? `${appLabel(root)} is not a SoftN app any more.` : 'Nothing to show yet. A web page is any .html file of the project; a SoftN app is a folder whose manifest.json has a "main" .ui page (/softn new starts one).');
-      this.settle({ ok: false, errors: [`${appLabel(root)} is not a SoftN app: manifest.json with a "main" .ui page is missing`] });
+      this.showMessage(this.target ? `${appLabel(root)} is not a SoftN app any more.` : 'Nothing to show yet. A web page is any .html file of the project; a SoftN app is a folder whose manifest.json names its main page, such as index.html, as "main" (/softn new starts one).');
+      this.settle({ ok: false, errors: [`${appLabel(root)} is not a SoftN app: a manifest.json whose "main" names its main page (such as index.html) is missing`] });
       return;
     }
     if (!(await softnRuntimeAvailable())) {

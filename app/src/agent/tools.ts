@@ -12,7 +12,7 @@ import { SandboxHost, globRegex, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { FrameReview, ToolCall, ToolResult, ToolSpec, Turn } from './protocol';
-import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp } from '../softn/softn';
+import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp, softnAppOf } from '../softn/softn';
 import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type PreviewResult, type PreviewTarget, type ModelView, type Problem, type Shot, type Viewport, type ViewportInfo } from '../preview/preview';
 import { findPages, resolvePage } from '../preview/page';
 import { findModels, isModelPath, resolveModel } from '../preview/model';
@@ -804,7 +804,8 @@ export const TOOLS: ToolSpec[] = [
     name: 'page_check',
     description:
       'Check a web page (an .html file of the project, with its CSS, images and JavaScript) in the live preview, which switches to show it: it renders the page, runs its scripts and returns script errors and files that did not load. ' +
-      'The page\'s JavaScript runs on the Zipp VM against the page\'s real DOM, so classic browser JavaScript works (DOM, events, timers, canvas, localStorage, fetch of the project\'s own files); ES module import/export, JSX and the internet (CDN scripts, fonts, images) do not. Errors inside async code other than handlers may go unreported. Run it after every change to a page.',
+      'The page\'s JavaScript runs on the Zipp VM against the page\'s real DOM, so classic browser JavaScript works (DOM, events, timers, canvas, localStorage, fetch of the project\'s own files); ES module import/export, JSX and the internet (CDN scripts, fonts, images) do not. Errors inside async code other than handlers may go unreported. Run it after every change to a page. ' +
+      'A SoftN app\'s pages (its index.html, pages/*.html) are the app\'s, not web pages: softn_check checks them.',
     parameters: { type: 'object', properties: { path: { ...str, description: 'The page, e.g. "site/index.html" (a folder means its index.html); optional when the project has one page' } } },
   },
   {
@@ -1338,6 +1339,9 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         const model = resolveModel(vfs, input.path);
         if (!model.ok) throw new Error(model.reason);
         target = { kind: 'model', path: model.path };
+      } else if (typeof input.path === 'string' && input.path.trim() && softnAppOf(vfs, input.path.trim()) !== null) {
+        // A page of a SoftN app (its index.html) is shown as the app draws it.
+        target = { kind: 'app', root: softnAppOf(vfs, input.path.trim())! };
       } else if (typeof input.path === 'string' && input.path.trim()) target = pageTarget(ctx, input.path, false);
       else if (!ctx.preview.target) {
         const pages = findPages(vfs);

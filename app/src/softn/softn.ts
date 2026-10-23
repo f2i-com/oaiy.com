@@ -2,13 +2,18 @@
  * SoftN apps in an OAIY project: finding them, starting one, checking
  * one, importing a .softn, and bundling one as a .softn file.
  *
- * A SoftN app is a folder of text files — manifest.json, ui/*.ui pages,
- * logic/*.logic (JavaScript) or logic/*.py (Python), data/*.xdb seed records,
- * assets/ — and a .softn file is that folder zipped flat, manifest.json at the
- * root. A project may hold several apps, each in its own folder (the project
- * root is a folder too): any folder whose manifest.json has a .ui `main`.
- * Paths inside an app are relative to its folder. The rules here follow
- * softn.com's Studio (exportBundle.ts planBundle, validator.ts), Apache-2.0.
+ * A SoftN app is a folder of text files — manifest.json, its pages, its logic,
+ * xdb/*.xdb seed records, assets/ — and a .softn file is that folder zipped
+ * flat, manifest.json at the root. A new app is written as HTML: `index.html`
+ * (and `pages/*.html`) naming its code with `<script src="main.js">` (or
+ * `main.py`). An app made before has `ui/*.ui` pages and `logic/*.logic` (or
+ * `.py`) files, and runs the same: the runtime finds a page or its logic by
+ * what names it (`main`, `<import from>`, `<script src>`), not by its
+ * extension. A project may hold several apps, each in its own folder (the
+ * project root is a folder too): any folder whose manifest.json's `main` is a
+ * page. Paths inside an app are relative to its folder. The rules here follow
+ * softn.com's Studio (exportBundle.ts planBundle, sourceKinds.ts, validator.ts)
+ * and core's composer (source-composer.ts, module-syntax.ts), Apache-2.0.
  */
 import { zipSync } from 'fflate';
 import { unzipChecked } from '../vfs/transfer';
@@ -33,8 +38,156 @@ export interface Finding {
   message: string;
 }
 
-const TEXT_EXT = /\.(ui|logic|py|xdb|json|md|txt|css|csv|svg)$/i;
+const TEXT_EXT = /\.(ui|html?|logic|js|py|xdb|json|md|txt|css|csv|svg)$/i;
 const CAPABILITIES = ['net', 'camera', 'mic', 'files', 'qr', 'ai', 'gpu', 'sync', 'storage', 'accel'];
+
+/** A new app's main page, where a site's first page is (`ui/main.ui` in an app made before). */
+export const MAIN_PAGE = 'index.html';
+
+/**
+ * A page of an app: `.ui`, or `.html` / `.htm` as a page written the way an HTML page is written, outside `assets/`
+ * (a file there is one the app shows or serves, so `assets/help.html` is no page).
+ */
+export function isAppPagePath(path: string): boolean {
+  return /\.(ui|html?)$/i.test(path) && !/^assets\//i.test(path);
+}
+
+/** A `<script type>` that is the app's code: none, or JavaScript's or Python's (core's scriptLanguage). */
+const CODE_TYPES = new Set(['', 'module', 'javascript', 'text/javascript', 'application/javascript', 'text/ecmascript', 'application/ecmascript', 'python', 'text/python', 'text/x-python', 'application/python', 'application/x-python']);
+
+/** An attribute's value in a tag's attribute text, quoted or not; undefined when it is not written. */
+function attributeValue(attributes: string, name: string): string | undefined {
+  const m = new RegExp(String.raw`(?:^|\s)${name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>\x60]+))`, 'i').exec(attributes);
+  return m ? (m[1] ?? m[2] ?? m[3]) : undefined;
+}
+
+/**
+ * The files of code a page names, as written, in order: `<script src="main.js">`, and `<logic src>` as a page made
+ * before writes it. Passed over: what is in an HTML comment, a script that is data (`type="application/json"`), one
+ * from another site, and the runtime's own loader (`softn.js`).
+ */
+export function pageLogicSources(page: string): string[] {
+  const out: string[] = [];
+  const text = page.replace(/<!--[\s\S]*?(?:-->|$)/g, '');
+  for (const m of text.matchAll(/<(script|logic)(?=[\s/>])((?:[^>"']|"[^"]*"|'[^']*')*)>/gi)) {
+    const src = attributeValue(m[2], 'src')?.trim();
+    if (!src) continue;
+    if (m[1].toLowerCase() === 'script' && (!CODE_TYPES.has((attributeValue(m[2], 'type') ?? '').trim().toLowerCase()) || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(src) || /(?:^|\/)softn\.js$/i.test(src.split(/[?#]/)[0]))) continue;
+    out.push(src);
+  }
+  return out;
+}
+
+/** `relative` from the file at `base`, as a path of the app; null when it would leave the app or names none. */
+function resolveInApp(base: string, relative: string): string | null {
+  const rel = relative.replace(/\\/g, '/');
+  if (rel.startsWith('/') || /^[A-Za-z]:\//.test(rel)) return null;
+  const parts = base.split('/').slice(0, -1);
+  for (const part of rel.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      if (!parts.length) return null;
+      parts.pop();
+    } else parts.push(part);
+  }
+  return parts.length ? parts.join('/') : null;
+}
+
+/**
+ * Logic written as a JavaScript module, read as the script SoftN runs (core's moduleSyntaxAsScript): an app's logic is
+ * one script, so `export` before a declaration is dropped, `export { a }` is nothing, and `import { a } from "./b.js"`
+ * is `import "./b.js"`, which places that file's code. Line for line, so a line is still the author's.
+ */
+export function moduleSyntaxAsScript(code: string): string {
+  if (!/\b(?:export|import)\b/.test(code)) return code;
+  return code
+    .replace(/^([ \t]*)export[ \t]+default[ \t]+(?=(?:async[ \t]+)?function[ \t]*\*?[ \t]*[A-Za-z_$]|class[ \t]+[A-Za-z_$])/gm, '$1')
+    .replace(/^([ \t]*)export[ \t]+(?=(?:async[ \t]+)?function\b|class\b|const\b|let\b|var\b)/gm, '$1')
+    .replace(/^([ \t]*)export[ \t]+default[ \t]+[A-Za-z_$][\w$]*[ \t]*;?[ \t]*$/gm, '$1')
+    .replace(/^([ \t]*)export[ \t]*\{[^}\n]*\}[ \t]*;?[ \t]*$/gm, '$1')
+    .replace(/^([ \t]*)(?:import|export)[ \t]*\{([^}\n]*)\}[ \t]*from[ \t]*(["'])((?:\.{1,2})?\/[^"'\n]+)\3[ \t]*;?[ \t]*$/gm, (line, indent: string, names: string, quote: string, path: string) =>
+      /\bas\b/.test(names) ? line : `${indent}import ${quote}${path}${quote}`,
+    );
+}
+
+/** A whole-file `import "./x.js"` line of logic; group 2 is the path as written. */
+const LOGIC_IMPORT_LINE = /^[ \t]*import[ \t]+(["'])([^"'\r\n]+)\1[ \t]*;?[ \t]*\r?$/gm;
+
+/** The app paths the logic file at `path` imports: from that file for `./` and `../`, from the app's root otherwise. */
+export function logicImportPaths(source: string, path: string): string[] {
+  const out: string[] = [];
+  for (const m of moduleSyntaxAsScript(source).matchAll(LOGIC_IMPORT_LINE)) {
+    const raw = m[2];
+    if (/^https?:\/\//i.test(raw)) continue;
+    const resolved = raw.startsWith('./') || raw.startsWith('../') ? resolveInApp(path, raw) : resolveInApp('x', raw);
+    if (resolved) out.push(resolved);
+  }
+  return out;
+}
+
+/**
+ * The `.js` files that are the app's code: those its pages link with `<script src>` or `<logic src>`, and what those
+ * import, followed. A `.js` nothing links is one the app carries (a library a page loads for itself, a service worker),
+ * not code it runs (Studio's linkedScripts).
+ */
+export function linkedScripts(texts: ReadonlyMap<string, string>): Set<string> {
+  const linked = new Set<string>();
+  const follow = (path: string): void => {
+    if (linked.has(path) || !/\.js$/i.test(path)) return;
+    const text = texts.get(path);
+    if (text === undefined) return;
+    linked.add(path);
+    for (const imported of logicImportPaths(text, path)) follow(imported);
+  };
+  for (const [path, text] of texts) {
+    if (!isAppPagePath(path)) continue;
+    for (const src of pageLogicSources(text)) {
+      const resolved = resolveInApp(path, src);
+      if (resolved) follow(resolved);
+    }
+  }
+  return linked;
+}
+
+/** The app's pages and `.js` files as text, keyed by their path in the app (what linkedScripts reads). */
+function scriptTexts(files: Array<[string, Uint8Array]>): Map<string, string> {
+  const texts = new Map<string, string>();
+  const decoder = new TextDecoder();
+  for (const [path, data] of files) if (isAppPagePath(path) || /\.js$/i.test(path)) texts.set(path, decoder.decode(data));
+  return texts;
+}
+
+/** The manifest's paths under `group`, as strings. */
+function listedIn(manifest: SoftnManifest | null, group: string): string[] {
+  const list = manifest?.files?.[group];
+  return Array.isArray(list) ? list.filter((p): p is string => typeof p === 'string') : [];
+}
+
+type Group = 'ui' | 'logic' | 'server' | 'xdb' | 'assets';
+
+/**
+ * Each file's group in the manifest, as Studio's export files it: a page is `ui` (unless the manifest lists it under
+ * `assets`); `.logic` and `.py` are `logic`, and a `.js` when a page links it, logic imports it or the manifest lists
+ * it there; server logic is `server`; seed records `xdb`; and `assets` is the assets/ folder and what the manifest
+ * lists there. Anything else is in no group.
+ */
+function fileGroups(files: Array<[string, Uint8Array]>, manifest: SoftnManifest | null): Map<string, Group> {
+  const linked = linkedScripts(scriptTexts(files));
+  const listedAssets = new Set(listedIn(manifest, 'assets'));
+  const listedLogic = new Set(listedIn(manifest, 'logic'));
+  const groups = new Map<string, Group>();
+  for (const [path] of files) {
+    const server = path.startsWith('server/');
+    let group: Group | null = null;
+    if (server && /\.(logic|py)$/i.test(path)) group = 'server';
+    else if (isAppPagePath(path) && !listedAssets.has(path)) group = 'ui';
+    else if (!server && (linked.has(path) || (!listedAssets.has(path) && (/\.(logic|py)$/i.test(path) || (/\.js$/i.test(path) && listedLogic.has(path)))))) group = 'logic';
+    else if (/\.xdb$/i.test(path)) group = 'xdb';
+    else if (path.startsWith('assets/') || listedAssets.has(path)) group = 'assets';
+    if (group) groups.set(path, group);
+  }
+  return groups;
+}
 
 /** An app folder as a key: '' is the project root, else `a/b` (no slashes at the ends). */
 export function appKey(folder: string | undefined | null): string {
@@ -59,10 +212,10 @@ export function readManifest(vfs: Vfs, root = ''): SoftnManifest | null {
   }
 }
 
-/** Is this folder a SoftN app? (A manifest.json whose `main` is a .ui page.) */
+/** Is this folder a SoftN app? (A manifest.json whose `main` is a page: `index.html`, or a .ui page made before.) */
 export function isSoftnApp(vfs: Vfs, root = ''): boolean {
   const manifest = readManifest(vfs, root);
-  return !!manifest && typeof manifest.main === 'string' && manifest.main.endsWith('.ui');
+  return !!manifest && typeof manifest.main === 'string' && isAppPagePath(manifest.main);
 }
 
 /** Every SoftN app folder in the project, the root first. */
@@ -81,6 +234,21 @@ export function isSoftnProject(vfs: Vfs): boolean {
   return findApps(vfs).length > 0;
 }
 
+/**
+ * The app whose page the project file at `path` is (no leading slash), or null: an app's `index.html` is a page of the
+ * app, shown as the app, not a web page of the project. The innermost app holding the file is its app, and a file it
+ * keeps out of itself (assets/, builder/, the project's uploads/) is no page of it.
+ */
+export function softnAppOf(vfs: Vfs, path: string, apps = findApps(vfs)): string | null {
+  const file = path.replace(/^\/+/, '');
+  const root = apps.filter((r) => r === '' || file.startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0];
+  if (root === undefined) return null;
+  const rel = root ? file.slice(root.length + 1) : file;
+  const first = rel.split('/')[0];
+  if (first === 'builder' || (root === '' && first === 'uploads')) return null;
+  return isAppPagePath(rel) ? root : null;
+}
+
 /** `text` as a sentence starts: its first letter a capital. */
 const sentence = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
 
@@ -93,10 +261,10 @@ export function resolveApp(vfs: Vfs, requested?: unknown): { ok: true; root: str
   if (typeof requested === 'string' && requested.trim()) {
     const root = appKey(requested.replace(/\/manifest\.json$/i, ''));
     if (isSoftnApp(vfs, root)) return { ok: true, root };
-    return { ok: false, reason: sentence(`${appLabel(root)} is not a SoftN app (it needs a manifest.json whose "main" is a .ui page). Apps here: ${apps.length ? apps.map(appLabel).join(', ') : 'none'}`) };
+    return { ok: false, reason: sentence(`${appLabel(root)} is not a SoftN app (it needs a manifest.json whose "main" is its main page, such as "index.html"). Apps here: ${apps.length ? apps.map(appLabel).join(', ') : 'none'}`) };
   }
   if (apps.length === 1) return { ok: true, root: apps[0] };
-  if (!apps.length) return { ok: false, reason: 'There is no SoftN app in this project yet (a folder whose manifest.json has a "main" .ui page)' };
+  if (!apps.length) return { ok: false, reason: 'There is no SoftN app in this project yet (a folder whose manifest.json names its main page, such as "index.html", as "main")' };
   return { ok: false, reason: `This project has several SoftN apps; say which with \`app\`: ${apps.map(appLabel).join(', ')}` };
 }
 
@@ -129,31 +297,21 @@ export function appFiles(vfs: Vfs, root = ''): Array<[string, Uint8Array]> {
     });
 }
 
-function groupOf(path: string): 'ui' | 'logic' | 'server' | 'xdb' | 'assets' | null {
-  if (path.startsWith('server/') && /\.(logic|py)$/i.test(path)) return 'server';
-  if (/\.ui$/i.test(path)) return 'ui';
-  if (/\.(logic|py)$/i.test(path)) return 'logic';
-  if (/\.xdb$/i.test(path)) return 'xdb';
-  if (path.startsWith('assets/')) return 'assets';
-  return null;
-}
-
 /** The manifest as a bundle carries it: `main`, `version` and `files` made true. */
 export function normalizedManifest(vfs: Vfs, root = ''): SoftnManifest {
-  const manifest: SoftnManifest = { ...(readManifest(vfs, root) ?? {}) };
-  const files = appFiles(vfs, root).map(([p]) => p);
+  const read = readManifest(vfs, root);
+  const manifest: SoftnManifest = { ...(read ?? {}) };
+  const appFileList = appFiles(vfs, root);
+  const files = appFileList.map(([p]) => p);
   if (typeof manifest.main !== 'string' || !manifest.main) {
-    manifest.main = typeof manifest.entry === 'string' && manifest.entry ? manifest.entry : files.includes('ui/main.ui') ? 'ui/main.ui' : files.find((p) => p.endsWith('.ui')) ?? 'ui/main.ui';
+    manifest.main = typeof manifest.entry === 'string' && manifest.entry ? manifest.entry : [MAIN_PAGE, 'ui/main.ui'].find((p) => files.includes(p)) ?? files.find(isAppPagePath) ?? MAIN_PAGE;
   }
   delete manifest.entry;
   if (typeof manifest.version !== 'string' || !manifest.version) manifest.version = '1.0.0';
   if (typeof manifest.name !== 'string' || !manifest.name.trim()) manifest.name = root ? root.split('/').pop()! : 'SoftN app';
   const groups: Record<string, string[]> = { ui: [], logic: [], xdb: [], assets: [] };
-  const listedLogic = Array.isArray(manifest.files?.logic) ? (manifest.files!.logic as unknown[]).filter((p): p is string => typeof p === 'string') : [];
-  for (const path of files) {
-    const group = groupOf(path);
-    if (group) (groups[group] ??= []).push(path);
-  }
+  const listedLogic = listedIn(read, 'logic');
+  for (const [path, group] of fileGroups(appFileList, read)) (groups[group] ??= []).push(path);
   // Logic keeps the order the author gave it (helpers before the entry).
   groups.logic.sort((a, b) => {
     const ia = listedLogic.indexOf(a);
@@ -258,13 +416,16 @@ export function checkProject(vfs: Vfs, root = ''): Finding[] {
       err('manifest.json', `not valid JSON: ${(error as Error).message}`);
     }
   }
-  const present = new Set(appFiles(vfs, root).map(([p]) => p));
+  const files = appFiles(vfs, root);
+  const present = new Set(files.map(([p]) => p));
+  const groups = fileGroups(files, manifest && typeof manifest === 'object' ? manifest : null);
   if (manifest) {
     if (typeof manifest.name !== 'string' || !manifest.name.trim()) err('manifest.json', '`name` must be a non-empty string');
     if (typeof manifest.version !== 'string') warn('manifest.json', '`version` is missing; export will use "1.0.0"');
     if ('entry' in manifest) warn('manifest.json', 'remove `entry`: the runtime reads `main`, never `entry`');
-    if (typeof manifest.main !== 'string') err('manifest.json', '`main` must name the entry .ui page, e.g. "ui/main.ui"');
+    if (typeof manifest.main !== 'string') err('manifest.json', `\`main\` must name the app's main page, e.g. "${MAIN_PAGE}"`);
     else if (!present.has(manifest.main)) err('manifest.json', `\`main\` names ${manifest.main}, which does not exist`);
+    else if (!isAppPagePath(manifest.main)) err('manifest.json', `\`main\` names ${manifest.main}, which is not a page: it names the app's main page, e.g. "${MAIN_PAGE}" (or a .ui page)`);
     const listed = new Set<string>();
     if (manifest.files && typeof manifest.files === 'object') {
       for (const [group, list] of Object.entries(manifest.files)) {
@@ -281,14 +442,14 @@ export function checkProject(vfs: Vfs, root = ''): Finding[] {
     } else {
       err('manifest.json', '`files` must list the app\'s files by group: { "ui": [...], "logic": [...] }');
     }
-    for (const path of present) {
-      const group = groupOf(path);
-      if (group && group !== 'assets' && !listed.has(path)) warn(path, `not listed in manifest.json \`files.${group}\` (export adds it)`);
+    for (const [path, group] of groups) {
+      if (group !== 'assets' && !listed.has(path)) warn(path, `not listed in manifest.json \`files.${group}\` (export adds it)`);
     }
   }
-  const js = [...present].some((p) => /\.logic$/i.test(p) && !p.startsWith('server/'));
-  const py = [...present].some((p) => /\.py$/i.test(p) && !p.startsWith('server/'));
-  if (js && py) err('logic/', 'an app\'s logic is JavaScript (.logic) or Python (.py), never both');
+  const logic = [...groups].filter(([, group]) => group === 'logic').map(([path]) => path);
+  const js = logic.some((p) => /\.(logic|js)$/i.test(p));
+  const py = logic.some((p) => /\.py$/i.test(p));
+  if (js && py) err(logic.find((p) => /\.py$/i.test(p))!, 'an app\'s logic is JavaScript (.js or .logic) or Python (.py), never both');
   for (const path of present) {
     if (/\.(json|xdb)$/i.test(path) && path !== 'manifest.json') {
       try {
@@ -313,7 +474,7 @@ export function checkProject(vfs: Vfs, root = ''): Finding[] {
   return out;
 }
 
-/** An event handler written on a component in a .ui page: `<Text @click={…}>` is Text, click, and its line. */
+/** An event handler written on a component in a page: `<Text @click={…}>` is Text, click, and its line. */
 export interface Handler {
   tag: string;
   event: string;
@@ -321,7 +482,7 @@ export interface Handler {
 }
 
 /**
- * The event handlers a .ui page writes on its components (tags that begin with a
+ * The event handlers a page writes on its components (tags that begin with a
  * capital): each `@name` among an opening tag's attributes, outside its strings and
  * its `{…}` values.
  */
@@ -353,17 +514,23 @@ export function handlersIn(source: string): Handler[] {
 }
 
 /**
- * Syntax errors in the app's JavaScript logic, found by compiling each .logic
- * file on the Zipp sandbox (the same engine the app runs on). The hosted
- * runtime shows such an error inside the preview without reporting it, so
- * this is how the page and the agent learn of it.
+ * Syntax errors in the app's JavaScript logic, found by compiling each logic
+ * file (`.logic`, and each `.js` the app's pages link) on the Zipp sandbox
+ * (the same engine the app runs on). Each is read as the runtime reads it: as a
+ * script, its module syntax as what it means there, and its whole-file imports,
+ * which the runtime replaces with the files they name, left out (each of those
+ * is compiled as a file of its own); line for line, so a line is the author's.
+ * The hosted runtime shows such an error inside the preview without reporting
+ * it, so this is how the page and the agent learn of it.
  */
 export async function checkLogicSyntax(vfs: Vfs, root: string, run: (source: string) => Promise<string | undefined>): Promise<Finding[]> {
   const sources: Record<string, string> = {};
-  for (const [path, data] of appFiles(vfs, root)) {
-    if (!/\.logic$/i.test(path)) continue;
+  const files = appFiles(vfs, root);
+  const linked = linkedScripts(scriptTexts(files));
+  for (const [path, data] of files) {
+    if (!/\.logic$/i.test(path) && !linked.has(path)) continue;
     try {
-      sources[path] = new TextDecoder('utf-8', { fatal: true }).decode(data);
+      sources[path] = moduleSyntaxAsScript(new TextDecoder('utf-8', { fatal: true }).decode(data)).replace(LOGIC_IMPORT_LINE, '');
     } catch {
       /* not text: reported elsewhere */
     }
@@ -398,10 +565,10 @@ export function formatFindings(findings: Finding[]): string {
 
 /** The smallest SoftN app: a page, its logic, and a manifest that lists them. */
 export const SOFTN_BLANK: Array<[string, string]> = [
-  ['manifest.json', `${JSON.stringify({ name: 'App', version: '1.0.0', main: 'ui/main.ui', files: { ui: ['ui/main.ui'], logic: ['logic/main.logic'] } }, null, 2)}\n`],
+  ['manifest.json', `${JSON.stringify({ name: 'App', version: '1.0.0', main: MAIN_PAGE, files: { ui: [MAIN_PAGE], logic: ['main.js'] } }, null, 2)}\n`],
   [
-    'ui/main.ui',
-    `<logic src="../logic/main.logic" />
+    MAIN_PAGE,
+    `<script src="main.js"></script>
 
 <App theme="dark">
   <Container size="md">
@@ -413,14 +580,14 @@ export const SOFTN_BLANK: Array<[string, string]> = [
 </App>
 `,
   ],
-  ['logic/main.logic', 'let title = "Hello"\n'],
+  ['main.js', 'let title = "Hello"\n'],
 ];
 
 export const SOFTN_STARTER: Array<[string, string]> = [
-  ['manifest.json', `${JSON.stringify({ name: 'Tasks', version: '1.0.0', main: 'ui/main.ui', files: { ui: ['ui/main.ui'], logic: ['logic/main.logic'] } }, null, 2)}\n`],
+  ['manifest.json', `${JSON.stringify({ name: 'Tasks', version: '1.0.0', main: MAIN_PAGE, files: { ui: [MAIN_PAGE], logic: ['main.js'] } }, null, 2)}\n`],
   [
-    'ui/main.ui',
-    `<logic src="../logic/main.logic" />
+    MAIN_PAGE,
+    `<script src="main.js"></script>
 
 <App theme="dark">
   <Container size="sm">
@@ -451,7 +618,7 @@ export const SOFTN_STARTER: Array<[string, string]> = [
 `,
   ],
   [
-    'logic/main.logic',
+    'main.js',
     `let tasks = []
 let newTask = ""
 let nextId = 1

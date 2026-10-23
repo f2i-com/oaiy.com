@@ -11,7 +11,7 @@
 import { unzipSync } from 'fflate';
 import type { Vfs } from '../vfs/vfs';
 import { COMPONENT_INDEX, DOC_INDEX } from './knowledge/index.generated';
-import { appFiles, handlersIn, importSoftn, type Finding } from './softn';
+import { appFiles, handlersIn, importSoftn, isAppPagePath, type Finding } from './softn';
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -46,7 +46,7 @@ export async function checkEvents(vfs: Vfs, root = ''): Promise<Finding[]> {
   const events = await componentEvents();
   const out: Finding[] = [];
   for (const [path, data] of appFiles(vfs, root)) {
-    if (!/\.ui$/i.test(path)) continue;
+    if (!isAppPagePath(path)) continue;
     for (const h of handlersIn(new TextDecoder().decode(data))) {
       const takes = events.get(h.tag);
       if (!takes || takes.has(h.event.toLowerCase())) continue;

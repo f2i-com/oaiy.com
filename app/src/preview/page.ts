@@ -3,7 +3,7 @@
  * files one of them gets. The page itself is built in the preview frame
  * (public/webpage/page-host.js), with its JavaScript on the Zipp VM.
  */
-import { findApps } from '../softn/softn';
+import { appLabel, findApps, softnAppOf } from '../softn/softn';
 import type { Vfs } from '../vfs/vfs';
 
 /** Folders whose files are nobody's page. */
@@ -18,16 +18,18 @@ const PAGE_PART = /\.(html?|css|m?js|json|svg|txt|md|csv|xml|woff2?|ttf|otf)$/i;
 
 export const isPagePath = (path: string): boolean => /\.html?$/i.test(path);
 
-/** The .html pages of the project (outside SoftN apps), index pages first. */
+/** The .html pages of the project (outside SoftN apps, and not the pages of an app at the project root), index pages first. */
 export function findPages(vfs: Vfs): string[] {
-  const apps = findApps(vfs).filter(Boolean);
+  const apps = findApps(vfs);
+  const folders = apps.filter(Boolean);
   const pages: string[] = [];
   for (const entry of vfs.walk('/', { limit: 20_000 }).entries) {
     if (entry.type !== 'file' || !isPagePath(entry.path)) continue;
     const path = entry.path.replace(/^\/+/, '');
     const segs = path.split('/');
     if (segs.slice(0, -1).some((s) => IGNORED.has(s) || s.startsWith('.'))) continue;
-    if (apps.some((root) => path.startsWith(`${root}/`))) continue;
+    if (folders.some((root) => path.startsWith(`${root}/`))) continue;
+    if (softnAppOf(vfs, path, apps) !== null) continue;
     pages.push(path);
   }
   const rank = (p: string) => (/(^|\/)index\.html?$/i.test(p) ? 0 : 1);
@@ -44,10 +46,17 @@ export function resolvePage(vfs: Vfs, asked: string | undefined, pages = findPag
     if (index.length === 1) return { ok: true, path: index[0] };
     return { ok: false, reason: `the project has ${pages.length} pages; name one with \`path\`: ${pages.slice(0, 12).join(', ')}` };
   }
-  if (isPagePath(wanted) && vfs.exists(`/${wanted}`)) return { ok: true, path: wanted };
+  const app = (path: string) => softnAppOf(vfs, path);
+  const ofApp = (path: string, root: string) => ({ ok: false as const, reason: `/${path} is a page of the SoftN app in ${appLabel(root)}, not a web page: softn_check, softn_inspect and softn_interact take the app (and preview_screenshot its app or that path)` });
+  if (isPagePath(wanted) && vfs.exists(`/${wanted}`)) {
+    const root = app(wanted);
+    return root === null ? { ok: true, path: wanted } : ofApp(wanted, root);
+  }
   for (const name of ['index.html', 'index.htm']) {
     const inside = wanted ? `${wanted}/${name}` : name;
-    if (vfs.exists(`/${inside}`)) return { ok: true, path: inside };
+    if (!vfs.exists(`/${inside}`)) continue;
+    const root = app(inside);
+    return root === null ? { ok: true, path: inside } : ofApp(inside, root);
   }
   return { ok: false, reason: `/${wanted} is not an .html page of the project${pages.length ? ` (pages: ${pages.slice(0, 12).join(', ')})` : ''}` };
 }

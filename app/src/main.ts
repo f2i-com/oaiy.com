@@ -54,7 +54,7 @@ import { isModelPath } from './preview/model';
 import { exampleBundle, exampleCatalogue, warmKnowledge } from './softn/knowledge';
 import { askText, confirmAction } from './ui/modal';
 import { newAppDialog, type NewAppChoice } from './ui/newApp';
-import { SOFTN_BLANK, SOFTN_STARTER, readManifest, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
+import { MAIN_PAGE, SOFTN_BLANK, SOFTN_STARTER, readManifest, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp, softnAppOf } from './softn/softn';
 import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import type { Attachment } from './agent/protocol';
 import { flagPicture } from './agent/review';
@@ -590,9 +590,12 @@ async function main(): Promise<void> {
   const tree = new FileTree(null as unknown as Vfs, (path) => {
     editor.open(path);
     tree.select(path);
-    // A web page or 3D model opened is the one the preview shows (a preview up stays up, showing it); any other file
-    // comes up in the editor, not behind the preview where nothing seemed to happen.
-    if (isPagePath(path)) preview.setPage(path.replace(/^\/+/, ''));
+    // A web page or 3D model opened is the one the preview shows (a preview up stays up, showing it), and an .html page
+    // of a SoftN app its app; any other file comes up in the editor, not behind the preview where nothing seemed to
+    // happen.
+    const app = isPagePath(path) ? softnAppOf(project.vfs, path) : null;
+    if (app !== null) preview.setApp(app);
+    else if (isPagePath(path)) preview.setPage(path.replace(/^\/+/, ''));
     else if (isModelPath(path)) preview.setModel(path.replace(/^\/+/, ''));
     else showPane('editor');
     if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
@@ -2020,7 +2023,7 @@ async function main(): Promise<void> {
     }
     await project.flush();
     const main = readManifest(project.vfs, root)?.main;
-    tree.select(`/${prefix}${typeof main === 'string' ? main : 'ui/main.ui'}`);
+    tree.select(`/${prefix}${typeof main === 'string' ? main : MAIN_PAGE}`);
     preview.setApp(root);
     showPane('preview');
     const from = choice.start === 'starter' ? 'a small task list to start from' : choice.start === 'blank' ? 'a blank page to start from' : `a copy of the ${choice.start} example`;
@@ -2101,7 +2104,7 @@ async function main(): Promise<void> {
   check          check an app's files and render it
   preview        show an app in the live preview
   apps           list the SoftN apps in this project
-A project can hold several apps, each in its own folder (any folder whose manifest.json has a .ui "main").`);
+A project can hold several apps, each in its own folder (any folder whose manifest.json names its main page, such as index.html, as "main").`);
     }
   }
 

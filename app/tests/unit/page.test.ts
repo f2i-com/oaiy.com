@@ -46,4 +46,21 @@ describe('web pages for the preview', () => {
     expect(root['video.mp4']).toBeUndefined();
     expect(root['big.bin']).toBeDefined();
   });
+
+  it('leaves out the pages of a SoftN app written as HTML at the project root, which are the app\'s', () => {
+    const vfs = new Vfs();
+    vfs.writeFile('/manifest.json', JSON.stringify({ name: 'A', version: '1.0.0', main: 'index.html' }));
+    vfs.writeFile('/index.html', '<script src="main.js"></script>\n<App />');
+    vfs.writeFile('/pages/about.html', '<Text>About</Text>', { parents: true });
+    vfs.writeFile('/assets/help.html', '<h1>Help</h1>', { parents: true });
+    vfs.writeFile('/uploads/page.html', '<h1>Upload</h1>', { parents: true });
+    vfs.writeFile('/main.js', 'let a = 1\n');
+    // assets/ holds what the app shows, and uploads/ the user's files: those are still pages of the project
+    expect(findPages(vfs)).toEqual(['assets/help.html', 'uploads/page.html']);
+    const app = resolvePage(vfs, 'index.html');
+    expect(app.ok).toBe(false);
+    expect(!app.ok && app.reason).toContain('/index.html is a page of the SoftN app in the project root, not a web page');
+    expect(resolvePage(vfs, 'pages/about.html').ok).toBe(false);
+    expect(resolvePage(vfs, 'assets/help.html')).toEqual({ ok: true, path: 'assets/help.html' });
+  });
 });

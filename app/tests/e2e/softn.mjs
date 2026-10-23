@@ -19,8 +19,8 @@ const executablePath = [process.env.CHROME, 'C:/Program Files/Google/Chrome/Appl
 const requests = [];
 const script = [
   { calls: [{ name: 'softn_docs', input: { section: 'mistakes' } }] },
-  { calls: [{ name: 'read_file', input: { path: 'ui/main.ui' } }] },
-  { calls: [{ name: 'edit_file', input: { path: 'ui/main.ui', old_string: '<Heading level={1}>Groceries</Heading>', new_string: '<Heading level={1}>Shopping list</Heading>' } }] },
+  { calls: [{ name: 'read_file', input: { path: 'index.html' } }] },
+  { calls: [{ name: 'edit_file', input: { path: 'index.html', old_string: '<Heading level={1}>Groceries</Heading>', new_string: '<Heading level={1}>Shopping list</Heading>' } }] },
   { calls: [{ name: 'softn_check', input: {} }] },
   { text: 'Renamed the heading and checked the app.' },
   // "Try it": use the app like a person.
@@ -29,11 +29,11 @@ const script = [
   // "Add a clear button": a mistake the automatic check catches, then the fix.
   { calls: [
     { name: 'update_plan', input: { goal: 'Clear finished tasks', items: [{ text: 'Read the logic', status: 'active' }, { text: 'Add clearDone()', status: 'pending' }, { text: 'Check the app', status: 'pending' }] } },
-    { name: 'read_file', input: { path: 'logic/main.logic' } },
+    { name: 'read_file', input: { path: 'main.js' } },
   ] },
-  { calls: [{ name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function remaining() {', new_string: 'function clearDone( {\n  tasks = tasks.filter((t) => !t.done)\n}\n\nfunction remaining() {' } }] },
+  { calls: [{ name: 'edit_file', input: { path: 'main.js', old_string: 'function remaining() {', new_string: 'function clearDone( {\n  tasks = tasks.filter((t) => !t.done)\n}\n\nfunction remaining() {' } }] },
   { calls: [
-    { name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function clearDone( {', new_string: 'function clearDone() {' } },
+    { name: 'edit_file', input: { path: 'main.js', old_string: 'function clearDone( {', new_string: 'function clearDone() {' } },
     { name: 'update_plan', input: { goal: 'Clear finished tasks', items: [{ text: 'Read the logic', status: 'done' }, { text: 'Add clearDone()', status: 'done' }, { text: 'Check the app', status: 'done' }] } },
   ] },
   { text: 'Added clearDone.' },
@@ -156,19 +156,19 @@ try {
   });
 
   await check('an edit from the terminal re-renders the preview', async () => {
-    const status = await afterRender(page, () => terminal(page, 'sed -i "s/>Tasks</>Groceries</" ui/main.ui'), 'after edit');
+    const status = await afterRender(page, () => terminal(page, 'sed -i "s/>Tasks</>Groceries</" index.html'), 'after edit');
     expect(/live/.test(status), status);
     const text = await frameText(page);
     expect(text.includes('Groceries'), text);
   });
 
   await check('a broken app is reported in the preview and by /softn check', async () => {
-    const status = await afterRender(page, () => terminal(page, 'cp logic/main.logic /tmp.bak && echo "function broken( {" >> logic/main.logic'), 'broken logic');
+    const status = await afterRender(page, () => terminal(page, 'cp main.js /tmp.bak && echo "function broken( {" >> main.js'), 'broken logic');
     expect(/error/.test(status), `status: ${status}`);
     await page.type('.chat-input', '/softn check');
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => /Render: (?!ok)/.test(document.querySelector('.chat-log')?.textContent ?? ''), { timeout: 40_000 });
-    const repaired = await afterRender(page, () => terminal(page, 'mv /tmp.bak logic/main.logic'), 'repaired');
+    const repaired = await afterRender(page, () => terminal(page, 'mv /tmp.bak main.js'), 'repaired');
     expect(/live/.test(repaired), repaired);
   });
 
@@ -217,7 +217,7 @@ try {
   await check('a mistake is caught by the automatic check after the step, and the fix is checked too', async () => {
     await ask('Add a way to clear finished tasks.', 'Added clearDone.');
     const broken = JSON.stringify(requests[9].messages.at(-1));
-    expect(broken.includes('[Automatic check of') && /logic\/main\.logic/.test(broken) && broken.includes('Fix these errors'), broken.slice(0, 900));
+    expect(broken.includes('[Automatic check of') && /main\.js: syntax error/.test(broken) && broken.includes('Fix these errors'), broken.slice(0, 900));
     const fixed = JSON.stringify(requests[10].messages.at(-1));
     expect(fixed.includes('[Automatic check of') && fixed.includes('rendered without reported errors'), fixed.slice(-600));
     const plan = await page.$eval('.plan', (el) => ({ hidden: el.hidden, finished: el.classList.contains('finished'), count: el.querySelector('.plan-count').textContent, goal: el.querySelector('.plan-goal').textContent, done: el.querySelectorAll('.plan-item.done').length }));
@@ -235,7 +235,7 @@ try {
   });
 
   await check('an error while the person uses the app shows in the preview, and one click asks the agent to fix it', async () => {
-    const status = await afterRender(page, () => terminal(page, 'sed -i "s/const title = newTask.trim()/throw new Error(\\"boom from addTask\\")/" logic/main.logic'), 'throwing handler');
+    const status = await afterRender(page, () => terminal(page, 'sed -i "s/const title = newTask.trim()/throw new Error(\\"boom from addTask\\")/" main.js'), 'throwing handler');
     expect(/live/.test(status), status);
     await appFrame(page).evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Add').click());
     await page.waitForFunction(() => !document.querySelector('.preview-problem')?.hidden, { timeout: 15_000 });
@@ -245,7 +245,7 @@ try {
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Looking at it.'), { timeout: 60_000 });
     const sent = JSON.stringify(requests[11].messages.at(-1));
     expect(sent.includes('boom from addTask') && sent.includes('fix it'), sent.slice(0, 600));
-    await afterRender(page, () => terminal(page, 'sed -i "s/throw new Error(\\"boom from addTask\\")/const title = newTask.trim()/" logic/main.logic'), 'repaired');
+    await afterRender(page, () => terminal(page, 'sed -i "s/throw new Error(\\"boom from addTask\\")/const title = newTask.trim()/" main.js'), 'repaired');
   });
 
   await check('Export .softn downloads a flat zip with the manifest at its root', async () => {
@@ -258,9 +258,9 @@ try {
     expect(file === 'Tasks.softn', `downloaded: ${readdirSync(downloads)}`);
     const entries = unzipSync(readFileSync(join(downloads, file)));
     const manifest = JSON.parse(new TextDecoder().decode(entries['manifest.json']));
-    expect(manifest.main === 'ui/main.ui' && manifest.files.ui.includes('ui/main.ui') && manifest.files.logic.includes('logic/main.logic'), JSON.stringify(manifest));
+    expect(manifest.main === 'index.html' && manifest.files.ui.includes('index.html') && manifest.files.logic.includes('main.js'), JSON.stringify(manifest));
     expect(Object.keys(entries).every((n) => !n.startsWith('Tasks/')), `entries: ${Object.keys(entries)}`);
-    expect(new TextDecoder().decode(entries['ui/main.ui']).includes('Shopping list'), 'stale ui/main.ui');
+    expect(new TextDecoder().decode(entries['index.html']).includes('Shopping list'), 'stale index.html');
   });
 
   await check('a new app can start from an example, in a folder of this project', async () => {

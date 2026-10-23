@@ -281,6 +281,12 @@ await check('a SoftN app is screenshotted in the same preview', async () => {
   const result = await tool('preview_screenshot', { app: 'tasks', save_to: 'shots/app.png' });
   expect(!result.isError && result.images === 1, JSON.stringify(result));
   writeFileSync(join(shots, 'app.png'), Buffer.from(await page.evaluate(() => Array.from(window.harness.read('shots/app.png')))));
+  // The app is written as HTML: its index.html is a page of the app, shown as the app draws it, never as a web page.
+  const byPath = await tool('preview_screenshot', { path: 'tasks/index.html' });
+  const shown = await page.evaluate(() => window.harness.preview.target);
+  expect(!byPath.isError && byPath.images === 1 && shown?.kind === 'app' && shown.root === 'tasks', `${JSON.stringify(byPath)} ${JSON.stringify(shown)}`);
+  const asPage = await tool('page_check', { path: 'tasks/index.html' });
+  expect(asPage.isError && asPage.content.includes('is a page of the SoftN app in tasks/'), asPage.content);
 });
 
 await check('a SoftN app\'s buttons are clicked, and text that only looks like one is said to be text', async () => {
