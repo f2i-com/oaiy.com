@@ -105,8 +105,8 @@ shell too.
 ```json
 { "version": "0.2.0",
   "protocols": { "run": 1, "script": 1, "profile": 1 },
-  "engine": { "name": "zipp", "release": "v0.0.27", "version": "0.0.27", "revision": "…",
-              "variant": "javascript-python", "bundle": "zipp-0.0.27-javascript-python.wasm",
+  "engine": { "name": "zipp", "release": "v0.0.29", "version": "0.0.29", "revision": "…",
+              "variant": "javascript-python", "bundle": "zipp-0.0.29-javascript-python.wasm",
               "wasmSha256": "…", "glueSha256": "…", "languages": ["javascript", "python"],
               "status": "ready" },
   "run": { "languages": ["javascript"], "defaultInstructionSteps": 50000000, "maxInstructionSteps": 2000000000 },

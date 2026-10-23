@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.27';
+const RELEASE = 'v0.0.29';
 const VERSION = RELEASE.slice(1);
 const VARIANT = 'javascript-python-base';
 const LANGUAGES = ['javascript', 'python'];
@@ -37,7 +37,7 @@ const MODULE = `zipp-${VERSION}-${VARIANT}.wasm`;
 const KIT = `zipp-${VERSION}-wasm-embed-kit`;
 // The digest of the release's top-level SHA256SUMS, so a changed release file
 // cannot slip in under the same tag.
-const SUMS_SHA256 = process.env.ZIPP_SUMS_SHA256 || '5f6b9053ef88660e0153fc731a7ff6e782be1df54b63aec0f8cb3d5c4fb89dd1';
+const SUMS_SHA256 = process.env.ZIPP_SUMS_SHA256 || 'd92c1d763caf703143a52291fee3723f2d486745640adc2db3aa3812f521f4a7';
 /** The installed files. */
 const FILES = ['zipp_wasm.js', 'zipp_wasm_bg.wasm', 'zipp_wasm.d.ts', 'LICENSE-APACHE'];
 /** The kit's files the install takes, by the name they are installed under. */

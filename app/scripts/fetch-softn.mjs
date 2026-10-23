@@ -8,9 +8,9 @@
  *   node scripts/fetch-softn.mjs            install the pinned release
  *   node scripts/fetch-softn.mjs --ensure   install unless it is already there
  *
- * The release zip must match its published SHA-256, pinned here. The ONNX
- * and speech payloads (~87 MB) are left out: apps that use on-device AI
- * models or speech will not have them in the preview.
+ * The release zip must match its published SHA-256, pinned here. Its
+ * hosted-runtime/ folder is installed whole: from v0.0.25 it carries no ONNX
+ * or speech payloads (a SoftN app's local AI runs GGUF models on ZIPP).
  * SOFTN_RELEASE_DIR=<dir> reads the zip from a folder instead of GitHub.
  */
 import { createHash } from 'node:crypto';
@@ -20,11 +20,10 @@ import { fileURLToPath } from 'node:url';
 import { installBridge } from './softn-bridge/install.mjs';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.24';
+const RELEASE = 'v0.0.25';
 const ZIP = `softn-formlogic-runtime-${RELEASE}.zip`;
-const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || 'fa4c0f04e12034c07b48df7dabdffea91519b1c65b7db84f62787e5ad1a4f792';
+const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || '33eaec354a7da489a643d619b5873f7eba87cf1492c0a82e2d78a287bafbc325';
 const PREFIX = 'hosted-runtime/';
-const SKIP = [/ort-wasm/, /\/speech\//];
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const out = join(root, 'public', 'softn');
@@ -51,13 +50,13 @@ async function main() {
     zip = readFileSync(join(process.env.SOFTN_RELEASE_DIR, ZIP));
   } else {
     const url = `https://github.com/f2i-com/softn.com/releases/download/${RELEASE}/${ZIP}`;
-    console.log(`fetching ${url} (about 100 MB) ...`);
+    console.log(`fetching ${url} (about 28 MB) ...`);
     const response = await fetch(url, { redirect: 'follow' });
     if (!response.ok) throw new Error(`GET ${url}: HTTP ${response.status}`);
     zip = new Uint8Array(await response.arrayBuffer());
   }
   if (sha256(zip) !== ZIP_SHA256) throw new Error(`${ZIP} does not match its pinned SHA-256`);
-  const entries = unzipSync(zip, { filter: (f) => f.name.startsWith(PREFIX) && !SKIP.some((re) => re.test(f.name)) });
+  const entries = unzipSync(zip, { filter: (f) => f.name.startsWith(PREFIX) });
   rmSync(out, { recursive: true, force: true });
   let count = 0;
   let bytes = 0;
