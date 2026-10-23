@@ -82,14 +82,16 @@ pub fn bundle_name(bundle: Option<tauri::utils::config::BundleType>, exe: Option
 
 /// The app bundle a Mac program is the program of: `/Applications/OAIY.app` for `/Applications/OAIY.app/Contents/MacOS/oaiy-desktop`,
 /// and None for a program anywhere else (`target/release/oaiy-desktop`). The updater plugin takes the same two folders up
-/// from the program to find what it replaces, so this is what it would replace.
+/// from the program to find what it replaces, so this is what it would replace. A Mac's path is read as a Mac has it on
+/// any computer (the tests run on all three): from the root (`has_root`, which on a Mac is `is_absolute`; on Windows a
+/// path from `/` is not absolute, as it names no drive).
 pub fn app_bundle_of(exe: &Path) -> Option<&Path> {
     let macos = exe.parent()?;
     let contents = macos.parent()?;
     let app = contents.parent()?;
     let named = |dir: &Path, name: &str| dir.file_name().is_some_and(|n| n == name);
     let is_app = app.extension().is_some_and(|e| e == "app") && app.file_stem().is_some_and(|s| !s.is_empty());
-    (exe.is_absolute() && named(macos, "MacOS") && named(contents, "Contents") && is_app).then_some(app)
+    (exe.has_root() && named(macos, "MacOS") && named(contents, "Contents") && is_app).then_some(app)
 }
 
 /// Why the Mac app at `app` cannot be replaced where it is, or None when it can: it is in a folder of the Mac's own disk,

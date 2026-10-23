@@ -98,7 +98,13 @@ mod win {
                 b
             }
         };
-        let now = times()?;
+        let mut now = times()?;
+        // (asked again before the system's times moved on, which they do in steps of about 16 ms: nothing to divide
+        // by, so a quarter of a second more, as the first time)
+        if now.1 == before.1 {
+            std::thread::sleep(Duration::from_millis(250));
+            now = times()?;
+        }
         *last = Some(now);
         let (idle, all) = (now.0.saturating_sub(before.0), now.1.saturating_sub(before.1));
         (all > 0).then(|| (1.0 - idle as f64 / all as f64) * 100.0)
