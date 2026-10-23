@@ -112,6 +112,25 @@ describe('plugin screen runtime status', () => {
     expect(container.querySelector('.setup-run-note')).toBeNull();
   });
 
+  it('loads the screen again from the start on a Refresh, so a message it still showed is gone', async () => {
+    list.mockResolvedValue({ plugins: [plugin('running')] });
+    const frame = await mount();
+    const nonce = (f: HTMLIFrameElement) => f.srcdoc.match(/window\.__oaiyDocumentNonce=("[^"]+")/)![1];
+    const first = nonce(frame);
+    frame.contentDocument!.body.innerHTML = '<p id="stale-error">The radio did not answer.</p>';
+    await act(async () => root.render(<PluginScreenPage pluginId="aokie" navId="calls" reload={1} />));
+    const fresh = container.querySelector('iframe')!;
+    expect(fresh).not.toBe(frame);
+    expect(nonce(fresh)).not.toBe(first);
+    expect(fresh.contentDocument!.getElementById('stale-error')).toBeNull();
+    // (the screen's files read again, as opening it does)
+    expect(assetFetches()).toBe(2);
+    // The same value again is no reload.
+    await act(async () => root.render(<PluginScreenPage pluginId="aokie" navId="calls" reload={1} />));
+    expect(container.querySelector('iframe')).toBe(fresh);
+    expect(assetFetches()).toBe(2);
+  });
+
   it('offers to trust a plugin nobody signed, as the one thing that gets it running', async () => {
     list.mockResolvedValue({ plugins: [{ ...plugin('stopped', 'Not started. Not signed, and you have not trusted it yet.'), trust: { state: 'unsigned', reason: 'Not signed, and you have not trusted it yet.' } }] });
     ask.mockResolvedValue(true);

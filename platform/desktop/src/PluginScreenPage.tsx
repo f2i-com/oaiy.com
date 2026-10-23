@@ -125,6 +125,9 @@ interface Props {
   onNavigate?: (view: PluginNavTarget) => void;
   /** Setup mode: the screen is a step of the plugin's setup wizard. */
   setup?: SetupScreen;
+  /** The top bar's Refresh: a new value loads the screen again from the start (a fresh document, as reopening it
+   *  gives), so a message the screen still shows is cleared. */
+  reload?: number;
 }
 
 interface UiNav {
@@ -521,8 +524,10 @@ function sameRuntime(previous: RuntimeStatus | null | undefined, now: PluginReco
 
 export default function PluginScreenPage(props: Props) {
   // Changing screens discards the old document, pending RPCs and event cursor.
-  // A setup step is a fresh document per step.
-  const key = props.setup ? `${props.pluginId}:setup:${props.setup.step}` : `${props.pluginId}:${props.navId ?? ''}:${props.screenId ?? ''}`;
+  // A setup step is a fresh document per step; a Refresh, a fresh document too.
+  const key = props.setup
+    ? `${props.pluginId}:setup:${props.setup.step}`
+    : `${props.pluginId}:${props.navId ?? ''}:${props.screenId ?? ''}:${props.reload ?? 0}`;
   return <PluginScreenContent key={key} {...props} />;
 }
 

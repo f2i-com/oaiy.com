@@ -20,6 +20,7 @@ import {
   PhoneForwarded,
   Plug,
   Puzzle,
+  RotateCw,
   Server,
   Settings2,
   ShieldCheck,
@@ -594,6 +595,10 @@ export default function App() {
   // A call ringing for the owner (RingDialog showing): a page in a webview is taken away meanwhile, as it would cover it.
   const [ringShowing, setRingShowing] = useState(false);
 
+  // The top bar's Refresh on a plugin's screen: each press loads the screen again, as opening it afresh does (a
+  // message the screen still shows goes with it).
+  const [pluginReloads, setPluginReloads] = useState(0);
+
   // A call going on now: the Agent's nav entry says so (the Agent page shows the call itself).
   // Asked only while there is a phone.
   const [onCall, setOnCall] = useState(false);
@@ -939,6 +944,17 @@ export default function App() {
                 <TriangleAlert size={13} /> API unreachable
               </button>
             )}
+            {pluginView && (
+              <button
+                type="button"
+                className="button secondary top-refresh"
+                aria-label="Refresh this plugin's screen"
+                title="Load this plugin's screen again, as opening it afresh does (a message it still shows is cleared)"
+                onClick={() => setPluginReloads((n) => n + 1)}
+              >
+                <RotateCw size={13} /> <span>Refresh</span>
+              </button>
+            )}
             {/* One button showing the theme you would switch TO, matching the
                 web app. The label is an action rather than a state, so
                 aria-pressed is gone: this does something, it does not report
@@ -1007,7 +1023,7 @@ export default function App() {
               />
             )}
             {pluginView && (
-              <PluginScreenPage pluginId={pluginView[1]} navId={pluginView[2]} onNavigate={(v) => setView(v)} />
+              <PluginScreenPage pluginId={pluginView[1]} navId={pluginView[2]} reload={pluginReloads} onNavigate={(v) => setView(v)} />
             )}
             {view === 'services' && <ServicesPanel />}
             {view === 'network' && <NetworkPanel onNavigate={(v) => setView(v)} />}

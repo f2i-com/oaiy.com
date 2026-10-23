@@ -1888,8 +1888,8 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 }
 
 @media (max-width: 960px) {
-  .top-site > span { display: none; }
-  .top-site { width: 34px; padding: 0; }
+  .top-site > span, .top-refresh > span { display: none; }
+  .top-site, .top-refresh { width: 34px; padding: 0; }
 }
 
 @media (max-width: 760px) {

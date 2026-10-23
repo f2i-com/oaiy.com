@@ -35,7 +35,9 @@ vi.mock('./useSetupState', () => ({
 vi.mock('./EmbeddedPage', () => ({ default: () => null }));
 vi.mock('./PairingPrompt', () => ({ default: () => null }));
 vi.mock('./OverviewPanel', () => ({ default: () => <p>The Overview</p> }));
-vi.mock('./PluginScreenPage', () => ({ default: ({ navId }: { navId: string }) => <p>Plugin screen {navId}</p> }));
+vi.mock('./PluginScreenPage', () => ({
+  default: ({ navId, reload }: { navId: string; reload?: number }) => <p data-reload={reload ?? 0}>Plugin screen {navId}</p>,
+}));
 vi.mock('./api', async (importOriginal) => {
   const real = await importOriginal<typeof import('./api')>();
   return {
@@ -255,6 +257,24 @@ describe('the AI Receptionist’s sub-menu', () => {
     await go('plugin:aokie:receptionist');
     expect(title()).toBe('Phone');
     expect(text()).toContain('Plugin screen receptionist');
+  });
+
+  it('has a Refresh in the top bar on a plugin’s screen only, and each press loads that screen again', async () => {
+    const refresh = () => host.querySelector<HTMLButtonElement>('.top-actions .top-refresh');
+    const reloads = () => host.querySelector('[data-reload]')?.getAttribute('data-reload');
+    await go('calendar');
+    expect(refresh()).toBeNull();
+    await go('plugin:aokie:receptionist');
+    expect(refresh()?.textContent).toContain('Refresh');
+    expect(refresh()?.getAttribute('aria-label')).toBe("Refresh this plugin's screen");
+    expect(reloads()).toBe('0');
+    await act(async () => refresh()!.click());
+    expect(reloads()).toBe('1');
+    await act(async () => refresh()!.click());
+    expect(reloads()).toBe('2');
+    expect(text()).toContain('Plugin screen receptionist');
+    await go('hours');
+    expect(refresh()).toBeNull();
   });
 
   it('points Hours & Services to the phone’s own page for its greeting, by where it is in the sidebar', async () => {
