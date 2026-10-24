@@ -217,7 +217,17 @@ impl WgpuExl3Experts {
             return false;
         }
         let Some((p, s)) = self.free_slot(&placed, layer, None) else { return false };
-        self.pools[p].slots.put(s, record, &self.layouts[layer as usize]);
+        // Written into a scratch slot of its card in place and copied from there by the card: the queue's writes went
+        // through staging memory at some 3 GB/s, where the host's threads write a card's memory at 11 to 22.
+        let (card, tw, layout) = (self.pools[p].card, self.pools[p].tw, &self.layouts[layer as usize]);
+        match self.pools.iter().find(|q| q.scratch && q.card == card && q.tw == tw) {
+            Some(q) => {
+                let _one = q.busy.lock().unwrap_or_else(|e| e.into_inner());
+                q.slots.put_many(0, &[record], layout);
+                q.slots.copy_slot(0, &self.pools[p].slots, s);
+            }
+            None => self.pools[p].slots.put(s, record, layout),
+        }
         placed.keys[p][s] = Some((layer, expert));
         placed.free[p] -= 1;
         placed.at.insert((layer, expert), (p, s));
