@@ -45,31 +45,40 @@ pub(crate) struct Engine {
     drafter: Option<crate::dsv41::dspark::Drafter>,
     /// Its keys of the trunk as they were at the checkpoint.
     drafter_keys: Option<Vec<crate::dsv41::attention::AttnState>>,
-    /// Drafts a pass checks, no more than `draft_max`: those the drafter is `draft_min` sure of all together (the product
-    /// of their confidences, up to each) where that is set, else as many as make the most tokens a second by what
-    /// passes have taken of late ([`Engine::drafts_to_check`]).
+    /// Drafts a pass checks, no more than `draft_max` ([`Engine::drafts_to_check`]): those the drafter is `draft_min` sure
+    /// of all together (the product of their confidences, up to each) where that is set; else as many as make the most
+    /// tokens for the time, a greedy reply's by [`DRAFT_ROW_COST`], another's by what passes have taken of late.
     draft_min: Option<f32>,
     draft_max: usize,
     timing: Timing,
-    /// Passes still to make without drafts ([`DRAFT_PAUSE`]).
+    /// Drafted passes in a row that checked none of their drafts, and passes still to make without drafting
+    /// ([`DRAFT_PAUSE`]).
+    unsure: usize,
     pause: usize,
 }
 
+/// What a check's row past the first is taken to cost, a step (with its draft) being 1, where a greedy reply's pass
+/// picks how many drafts to check ([`Engine::drafts_to_check`]): by the drafter's word and this alone, so a prompt's
+/// reply is the same whenever it is asked (a pass's rows are summed apart from a step's, so how the drafts were checked
+/// can tip a near tie). Measured on the EXL3 checkpoint here: a step 140-270 ms, each row more 80-130 (its experts
+/// that no card holds).
+const DRAFT_ROW_COST: f64 = 0.6;
+/// Drafted passes in a row that check none of their drafts before drafting pauses ([`DRAFT_PAUSE`] passes), and the
+/// pause: the drafter is unsure of what comes, and its own pass is a fifth of a step's.
+const DRAFT_UNSURE: usize = 3;
+const DRAFT_PAUSE: usize = 6;
+
 /// What a decode pass of each number of rows has taken of late, and a draft: averages weighted to the recent, for
-/// [`Engine::drafts_to_check`]; and how drafted passes have paid against steps of late.
+/// [`Engine::drafts_to_check`].
 #[derive(Default)]
 struct Timing {
     /// By rows (from 1): (ms, passes).
     check: Vec<(f64, u32)>,
     draft: (f64, u32),
-    /// A drafted pass's tokens a second over a step's (of one row): under 1, drafting costs more than it saves.
-    pays: (f64, u32),
 }
 
 /// The weight a pass's time has in [`Timing`]'s averages.
 const TIMING_NEW: f64 = 0.1;
-/// Passes made without drafts once drafting has not paid ([`Timing::drafted`]), before it is tried again.
-const DRAFT_PAUSE: usize = 8;
 
 /// `v` (ms) into an average weighted to the recent.
 fn fold(avg: &mut (f64, u32), v: f64) {
@@ -85,19 +94,8 @@ impl Timing {
         fold(&mut self.check[rows], check.as_secs_f64() * 1e3);
     }
 
-    /// A drafted pass: its draft took `draft`, its check `check`, and `kept` tokens came of it. Whether drafting has
-    /// not paid of late (its passes' tokens a second under a step's, over two passes or more since it was last
-    /// paused); then its record starts again.
-    fn drafted(&mut self, draft: std::time::Duration, kept: usize, check: std::time::Duration) -> bool {
-        let draft = draft.as_secs_f64() * 1e3;
-        fold(&mut self.draft, draft);
-        let Some(step) = self.check_ms(1) else { return false };
-        fold(&mut self.pays, kept as f64 / (draft + check.as_secs_f64() * 1e3).max(1e-3) * step);
-        let losing = self.pays.1 >= 2 && self.pays.0 < 1.0;
-        if losing {
-            self.pays = (0.0, 0);
-        }
-        losing
+    fn drafted(&mut self, draft: std::time::Duration) {
+        fold(&mut self.draft, draft.as_secs_f64() * 1e3);
     }
 
     /// A pass of `rows` rows' time: as measured; else (never yet) on the line through those that were (from one alone,
@@ -182,6 +180,7 @@ impl Engine {
             draft_min: None,
             draft_max: 0,
             timing: Timing::default(),
+            unsure: 0,
             pause: 0,
         }
     }
@@ -197,11 +196,11 @@ impl Engine {
 
     /// How many of a draft whose drafts the drafter is `confidence` sure of (each given those before) a pass checks: of
     /// up to `draft_max`, those it is `draft_min` sure of together where that is set; else the number that makes the
-    /// most tokens a second, a pass's tokens expected (the one chosen, and each draft by the product of the
-    /// confidences up to it: DSpark's confidence is its estimate that the model takes it) over its time (a draft's and a
-    /// check of that many rows, as they have taken of late). A check of more rows reads more experts, so what pays
-    /// is the machine's and the subject's.
-    fn drafts_to_check(&self, confidence: &[f32]) -> usize {
+    /// most tokens for the time, a pass's tokens expected (the one chosen, and each draft by the product of the
+    /// confidences up to it: DSpark's confidence is its estimate that the model takes it) over its time: a greedy
+    /// reply's by [`DRAFT_ROW_COST`] a row, another's a draft's and a check of that many rows as they have taken of late
+    /// (a check of more rows reads more experts, so what pays is the machine's and the subject's).
+    fn drafts_to_check(&self, confidence: &[f32], greedy: bool) -> usize {
         let most = confidence.len().min(self.draft_max);
         if let Some(min) = self.draft_min {
             let mut sure = 1.0f32;
@@ -220,9 +219,14 @@ impl Engine {
                 sure *= f64::from(confidence[k - 1]);
                 expected += sure;
             }
-            // (before any pass: all of them, which a pass then measures)
-            let Some(check) = self.timing.check_ms(k + 1) else { return most };
-            let rate = expected / (self.timing.draft.0 + check).max(1e-3);
+            let time = if greedy {
+                1.0 + DRAFT_ROW_COST * k as f64
+            } else {
+                // (before any pass: all of them, which a pass then measures)
+                let Some(check) = self.timing.check_ms(k + 1) else { return most };
+                self.timing.draft.0 + check
+            };
+            let rate = expected / time.max(1e-3);
             if rate > best_rate {
                 (best, best_rate) = (k, rate);
             }
@@ -593,6 +597,8 @@ impl Engine {
         };
         let decode = std::time::Instant::now();
         let (mut passes, mut drafted, mut taken) = (0usize, 0usize, 0usize);
+        // (a reply's drafting as its own tokens have it, whatever the last reply's did)
+        (self.unsure, self.pause) = (0, 0);
         let mut next = choose(&logits);
         let finish = loop {
             if let Some(finish) = give(next, pos) {
@@ -610,7 +616,12 @@ impl Engine {
                         let words: Vec<String> = draft.tokens.iter().map(|&t| String::from_utf8_lossy(self.tok.token_bytes(t)).into_owned()).collect();
                         eprintln!("  draft at {pos} after {:?}: {:?} {:?}", String::from_utf8_lossy(self.tok.token_bytes(next)), words, draft.confidence);
                     }
-                    let k = self.drafts_to_check(&draft.confidence).min(room);
+                    let k = self.drafts_to_check(&draft.confidence, job.sampling.temperature <= 0.0).min(room);
+                    // (unsure of every draft some passes in a row: a few passes without drafting)
+                    self.unsure = if k == 0 { self.unsure + 1 } else { 0 };
+                    if self.unsure >= DRAFT_UNSURE {
+                        (self.unsure, self.pause) = (0, DRAFT_PAUSE);
+                    }
                     draft.tokens[..k].to_vec()
                 }
                 _ => Vec::new(),
@@ -649,12 +660,8 @@ impl Engine {
             }
             self.covered.extend_from_slice(&rows[..kept]);
             pos += kept;
-            // A drafted pass's tokens a second against a step's: drafting paused for some passes where it has not paid
-            // of late (its own time and the check's more than what the drafts taken saved), and tried again after.
             if !paused {
-                if self.timing.drafted(drafted_in, kept, checked_in) {
-                    self.pause = DRAFT_PAUSE;
-                }
+                self.timing.drafted(drafted_in);
                 passes += 1;
                 drafted += drafts.len();
                 taken += kept - 1;

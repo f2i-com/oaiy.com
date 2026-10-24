@@ -30,7 +30,8 @@ pub(crate) use usage::{read_usage, write_usage};
 
 /// DSpark's drafter of the checkpoint at `dir` (whose trunk `model` is), if it has one, ready to draft: its dense
 /// weights on `gpu` beside the trunk's, and an EXL3 checkpoint's 384 experts held on `cards` in slots of their own
-/// (5 GB), read in now; an fp4 checkpoint's run on the CPU from a RAM cache that holds them all (2 GB). To be made
+/// (5 GB), read in now; an fp4 checkpoint's run on the CPU from a RAM cache that may hold them all (7 GB, taken as
+/// they are first read, as the trunk's RAM tier takes its records: what cannot be had is read around). To be made
 /// before the trunk's experts take what the cards have left. With what it took, said.
 pub(crate) fn load_drafter(dir: &std::path::Path, model: &crate::dsv41::model::Model, gpu: &WgpuBackend, cards: &[Arc<WgpuBackend>]) -> oaiy_engine::Result<Option<(crate::dsv41::dspark::Drafter, String)>> {
     let Some(spec) = model.cfg.dspark.clone() else { return Ok(None) };
