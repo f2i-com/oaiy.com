@@ -27,6 +27,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --ram-gb N           host RAM for the expert cache (default: 80% of what is
                        free, so it leaves a fifth for everything else; asked
                        for, up to all that is free but 16 GiB or a tenth)
+  --pin-ram            keep the expert cache resident (Windows): other programs
+                       page instead of it while the server runs (OAIY_PIN_RAM=1)
   --start NAME         which configured model to load at start (default: the one
                        --model names). Only one is resident, and a load costs 10s
                        for a GGUF or 65s for a DeepSeek checkpoint, so naming the
@@ -259,6 +261,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 }
             }
             "--quiet" => a.quiet = true,
+            "--pin-ram" => a.pin_ram = true,
             "--incognito" => a.incognito = true,
             "--backend" => {
                 a.backend = val()?;

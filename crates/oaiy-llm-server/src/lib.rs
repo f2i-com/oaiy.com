@@ -81,6 +81,10 @@ pub struct Options {
     /// Host RAM for the expert cache, in GB. **0 means decide from what is free**:
     /// see [`Options::expert_cache_bytes`].
     pub ram_gb: usize,
+    /// Keep the expert cache resident (`--pin-ram`, or OAIY_PIN_RAM=1): the system takes none of it for other programs
+    /// (Windows: a hard minimum working set), where it took a third of DeepSeek-V4.1's 153 GB tier under another
+    /// program's load and the CPU's experts waited for page faults. Other programs page instead while it runs.
+    pub pin_ram: bool,
     /// Checkpoint directory (required: no default).
     pub model: PathBuf,
     /// The Engram precompute, `engram_meta.safetensors` (default: in the
@@ -255,6 +259,7 @@ impl Default for Options {
             // Decided at load from what the machine actually has free, rather than
             // a number that is right for one machine: see `expert_cache_bytes`.
             ram_gb: 0,
+            pin_ram: false,
             model: PathBuf::new(),
             engram_meta: None,
             usage: None,

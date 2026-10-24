@@ -151,6 +151,42 @@ fn wired_limit() -> Option<u64> {
     None
 }
 
+/// Keep `bytes` of this process's memory resident, as far as the system lets it: on Windows a hard minimum working set
+/// of that many bytes (the memory manager takes no page of the process below it, where it took 50 GB of a 153 GB
+/// expert tier to give to other programs, and each record then came back through page faults); elsewhere nothing
+/// yet. What the system said where it refused (Windows: the error, such as a minimum past what it can give).
+pub fn keep_resident(bytes: usize) -> Result<(), String> {
+    keep_resident_impl(bytes)
+}
+
+#[cfg(windows)]
+fn keep_resident_impl(bytes: usize) -> Result<(), String> {
+    const QUOTA_LIMITS_HARDWS_MIN_ENABLE: u32 = 0x1;
+    const QUOTA_LIMITS_HARDWS_MAX_DISABLE: u32 = 0x8;
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetProcessWorkingSetSizeEx(process: isize, minimum: usize, maximum: usize, flags: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+    // (the maximum a soft one, the physical memory: above the minimum the process grows and shrinks as before)
+    let most = host_memory_impl().map_or(bytes, |(_, total)| total).max(bytes);
+    // SAFETY: the current process's pseudo-handle (always valid, nothing to close) and plain sizes and flags; the call
+    // reads nothing of ours and keeps nothing.
+    let ok = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), bytes, most, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) };
+    if ok != 0 {
+        return Ok(());
+    }
+    // SAFETY: no arguments; it reads this thread's last error, the failed call's.
+    let error = unsafe { GetLastError() };
+    Err(format!("Windows refused a working set of {:.1} GiB (error {error})", bytes as f64 / (1u64 << 30) as f64))
+}
+
+#[cfg(not(windows))]
+fn keep_resident_impl(bytes: usize) -> Result<(), String> {
+    let _ = bytes;
+    Err("keeping memory resident is Windows-only for now".into())
+}
+
 /// `(available, total)` bytes of the computer's memory, for a build without CUDA: what the portable engine sizes its
 /// expert cache from (a streamed MoE model such as GLM-5.3-Flash), as the CUDA build does from
 /// `ggml_rs_cuda::host_memory`. Without it the portable build assumed 32 GB on any computer, so a model of 190 GB read

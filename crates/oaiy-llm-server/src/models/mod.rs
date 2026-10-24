@@ -1048,6 +1048,15 @@ impl Models {
         let opts = crate::dsv41::model::ModelOptions { max_seq, expert_cache_bytes: o.expert_cache_bytes() as usize, direct_io: true };
         self.say(format!("expert host cache: {:.2} GiB", opts.expert_cache_bytes as f64 / (1u64 << 30) as f64));
         let mut model = crate::dsv41::model::Model::load(&spec.path, &engram_meta, &opts)?;
+        // (asked for: the expert cache, and the few GiB the rest of the process keeps touched, resident)
+        #[cfg(feature = "webgpu")]
+        if o.pin_ram || std::env::var("OAIY_PIN_RAM").as_deref() == Ok("1") {
+            let bytes = opts.expert_cache_bytes + (4usize << 30);
+            match ggml_rs_wgpu::keep_resident(bytes) {
+                Ok(()) => self.say(format!("the expert cache kept resident: {:.1} GiB of this process the system does not take for others", bytes as f64 / (1u64 << 30) as f64)),
+                Err(why) => self.say(format!("the expert cache could not be kept resident: {why}")),
+            }
+        }
         // The routed experts on the CPU through this CPU's fastest kernel (the same bits as the portable one).
         model.set_expert_row_kernel(crate::dsv41::simd::row_kernel());
         model.set_expert_tokens_kernel(crate::dsv41::simd::tokens_kernel());
