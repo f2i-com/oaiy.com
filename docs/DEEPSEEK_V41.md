@@ -891,9 +891,10 @@ The held experts cost about 1 ms a layer, where the same call alone took 0.3. No
   device's store with new ones every call, the trunk's own among those it let go.
 - **The lock.** A recording no longer holds the device's lock while it waits for its
   results, only while it submits.
-- **A check's rows.** An expert's few rows in a check go as jobs of a row each, a step's
-  kernel (`apart`), so each row's sums are a step's. They went a prompt's way before, a
-  block of 32 row places for one or two rows.
+
+An expert's few rows in a check were tried as jobs of a row each, a step's kernel, so each
+row's sums would be a step's. A prompt's experts of two to eight rows went that way too,
+which changed its replies and made them slower; with drafting off it is left out.
 
 Now about 0.4 ms a layer.
 
@@ -904,7 +905,7 @@ decoding; every reply the same text as before, to the word:
 |---|---|---|
 | A familiar subject | 6.9 tok/s | 8.8-9.1 tok/s |
 | Code | 5.6 tok/s | 6.6-6.7 tok/s |
-| The same again | 6.7 tok/s | 7.8-8.4 tok/s |
+| The same again | 6.7 tok/s | 7.8-8.7 tok/s |
 | A new subject | 4.4 tok/s | 4.8-5.2 tok/s |
 
 A step of a familiar subject is now about 110 ms: the trunk's calls some 50 ms, the held

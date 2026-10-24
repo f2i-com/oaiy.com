@@ -56,9 +56,8 @@ impl SlotsBegun<'_> {
 }
 
 /// One-row jobs a call's kept vectors take ([`Exl3Slots::step`]): a decode step's or a draft's experts in one set of
-/// slots, most of a layer's six or three, and most of a check's rows' (each row its own job). A call of more goes
-/// through the recording's scratch.
-const STEP_JOBS: usize = 16;
+/// slots, most of a layer's six or three. A call of more goes through the recording's scratch.
+const STEP_JOBS: usize = 8;
 
 /// [`Exl3Slots::record`]'s vectors for up to [`STEP_JOBS`] jobs of one row: the inputs, the two job lists, and each
 /// group's transformed inputs, partial sums and outputs.
