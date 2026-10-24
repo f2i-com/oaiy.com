@@ -65,6 +65,23 @@ pub struct Config {
     pub image_token_id: u32,
     /// The vision tower, when the checkpoint has one.
     pub vision: Option<VisionConfig>,
+    /// DSpark's drafter (`mtp.*`), when the checkpoint has one.
+    pub dspark: Option<DsparkConfig>,
+}
+
+/// DSpark's block drafter (DeepInfer's `DFlash`): `layers` blocks after the trunk (`mtp.0..`), reading the streams
+/// entering the trunk's layers `targets` and drafting `block` tokens a pass from the last chosen one and `block - 1`
+/// noise tokens; its own experts (`n_routed_experts`, `n_activated_experts` a token) and a rank-`markov_rank` correction
+/// of its logits by the token before each.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DsparkConfig {
+    pub layers: usize,
+    pub block: usize,
+    pub noise_token: u32,
+    pub targets: Vec<usize>,
+    pub markov_rank: usize,
+    pub n_routed_experts: usize,
+    pub n_activated_experts: usize,
 }
 
 /// `vision_config`: the ViT, its aligner and how images are sized for it.
@@ -168,6 +185,19 @@ impl Config {
             vision: match root.get("vision_config") {
                 Some(v) if int_or(v, "num_hidden_layers", 0) > 0 => Some(VisionConfig::parse(v)?),
                 _ => None,
+            },
+            dspark: if int_or(t, "num_nextn_predict_layers", 0) > 0 && t.get("dspark_block_size").is_some() {
+                Some(DsparkConfig {
+                    layers: int("num_nextn_predict_layers")?,
+                    block: int("dspark_block_size")?,
+                    noise_token: int("dspark_noise_token_id")? as u32,
+                    targets: list("dspark_target_layer_ids")?,
+                    markov_rank: int("dspark_markov_rank")?,
+                    n_routed_experts: int("dspark_n_routed_experts")?,
+                    n_activated_experts: int("dspark_num_experts_per_tok")?,
+                })
+            } else {
+                None
             },
         };
         cfg.validate()?;

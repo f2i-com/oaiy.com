@@ -121,7 +121,14 @@ impl WgpuExl3Experts {
     /// bitrates by how many layers each has, in pools of what a binding holds. None if `format` is not EXL3's or not
     /// one slot fits.
     pub(crate) fn new(format: &ExpertFormat, cards: &[Arc<WgpuBackend>], per_layer: usize) -> Option<WgpuExl3Experts> {
+        Self::new_within(format, cards, per_layer, None)
+    }
+
+    /// [`Self::new`] with no more than `most` slots for held experts, the first card's room taken first (DSpark's
+    /// drafter's 384 experts, all held, before the trunk's take the rest).
+    pub(crate) fn new_within(format: &ExpertFormat, cards: &[Arc<WgpuBackend>], per_layer: usize, most: Option<usize>) -> Option<WgpuExl3Experts> {
         let ExpertFormat::Exl3 { layers, bytes } = format else { return None };
+        let mut left = most.unwrap_or(usize::MAX);
         let first = layers.first()?;
         let (hidden, ff) = (first[0].k, first[0].n);
         let layouts: Vec<RecordLayout> = layers.iter().map(|l| record_layout(l, *bytes)).collect();
@@ -134,9 +141,11 @@ impl WgpuExl3Experts {
             }
         }
         let mut pools = Vec::new();
+        // (a tier that holds all of its experts puts few through scratch slots: a few of them)
+        let scratch = if most.is_some() { 4 } else { SCRATCH };
         for (c, card) in cards.iter().enumerate() {
             for &(tw, _) in &classes {
-                if let Some(slots) = card.exl3_slots_mapped(SCRATCH, hidden, ff, tw) {
+                if let Some(slots) = card.exl3_slots_mapped(scratch, hidden, ff, tw) {
                     pools.push(Pool { slots, tw, scratch: true, card: c, busy: Mutex::new(()) });
                 }
             }
@@ -146,10 +155,12 @@ impl WgpuExl3Experts {
             let room = budget.saturating_sub(used).saturating_sub(MARGIN);
             for &(tw, n) in &classes {
                 let per = slot_bytes(hidden, ff, tw);
-                let mut want = (room as f64 * n as f64 / layers.len() as f64 / per as f64) as usize;
+                let share = most.map_or(usize::MAX, |most| most * n / layers.len());
+                let mut want = ((room as f64 * n as f64 / layers.len() as f64 / per as f64) as usize).min(share).min(left);
                 while want > 0 {
                     let Some(slots) = card.exl3_slots(want, hidden, ff, tw) else { break };
                     want = want.saturating_sub(slots.slots());
+                    left = left.saturating_sub(slots.slots());
                     pools.push(Pool { slots, tw, scratch: false, card: c, busy: Mutex::new(()) });
                 }
             }

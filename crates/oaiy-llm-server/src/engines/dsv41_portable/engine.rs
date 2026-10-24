@@ -41,6 +41,89 @@ pub(crate) struct Engine {
     /// fitted to the memory free ([`Engine::fit_ram`]).
     ram_gb: usize,
     fitted: Option<std::time::Instant>,
+    /// DSpark's drafter, where the checkpoint has one and it is used: each decode pass checks its drafts.
+    drafter: Option<crate::dsv41::dspark::Drafter>,
+    /// Its keys of the trunk as they were at the checkpoint.
+    drafter_keys: Option<Vec<crate::dsv41::attention::AttnState>>,
+    /// Drafts a pass checks, no more than `draft_max`: those the drafter is `draft_min` sure of all together (the product
+    /// of their confidences, up to each) where that is set, else as many as make the most tokens a second by what
+    /// passes have taken of late ([`Engine::drafts_to_check`]).
+    draft_min: Option<f32>,
+    draft_max: usize,
+    timing: Timing,
+    /// Passes still to make without drafts ([`DRAFT_PAUSE`]).
+    pause: usize,
+}
+
+/// What a decode pass of each number of rows has taken of late, and a draft: averages weighted to the recent, for
+/// [`Engine::drafts_to_check`]; and how drafted passes have paid against steps of late.
+#[derive(Default)]
+struct Timing {
+    /// By rows (from 1): (ms, passes).
+    check: Vec<(f64, u32)>,
+    draft: (f64, u32),
+    /// A drafted pass's tokens a second over a step's (of one row): under 1, drafting costs more than it saves.
+    pays: (f64, u32),
+}
+
+/// The weight a pass's time has in [`Timing`]'s averages.
+const TIMING_NEW: f64 = 0.1;
+/// Passes made without drafts once drafting has not paid ([`Timing::drafted`]), before it is tried again.
+const DRAFT_PAUSE: usize = 8;
+
+/// `v` (ms) into an average weighted to the recent.
+fn fold(avg: &mut (f64, u32), v: f64) {
+    avg.0 = if avg.1 == 0 { v } else { avg.0 + TIMING_NEW * (v - avg.0) };
+    avg.1 += 1;
+}
+
+impl Timing {
+    fn passed(&mut self, rows: usize, check: std::time::Duration) {
+        if self.check.len() <= rows {
+            self.check.resize(rows + 1, (0.0, 0));
+        }
+        fold(&mut self.check[rows], check.as_secs_f64() * 1e3);
+    }
+
+    /// A drafted pass: its draft took `draft`, its check `check`, and `kept` tokens came of it. Whether drafting has
+    /// not paid of late (its passes' tokens a second under a step's, over two passes or more since it was last
+    /// paused); then its record starts again.
+    fn drafted(&mut self, draft: std::time::Duration, kept: usize, check: std::time::Duration) -> bool {
+        let draft = draft.as_secs_f64() * 1e3;
+        fold(&mut self.draft, draft);
+        let Some(step) = self.check_ms(1) else { return false };
+        fold(&mut self.pays, kept as f64 / (draft + check.as_secs_f64() * 1e3).max(1e-3) * step);
+        let losing = self.pays.1 >= 2 && self.pays.0 < 1.0;
+        if losing {
+            self.pays = (0.0, 0);
+        }
+        losing
+    }
+
+    /// A pass of `rows` rows' time: as measured; else (never yet) on the line through those that were (from one alone,
+    /// a tenth more a row), so that what is not tried yet is weighed too; None before any pass.
+    fn check_ms(&self, rows: usize) -> Option<f64> {
+        if let Some(c) = self.check.get(rows).filter(|c| c.1 > 0) {
+            return Some(c.0);
+        }
+        let known: Vec<(f64, f64)> = self.check.iter().enumerate().filter(|(_, c)| c.1 > 0).map(|(r, c)| (r as f64, c.0)).collect();
+        let n = known.len() as f64;
+        let (mr, mt) = (known.iter().map(|k| k.0).sum::<f64>() / n, known.iter().map(|k| k.1).sum::<f64>() / n);
+        let slope = match known.len() {
+            0 => return None,
+            1 => mt / 10.0,
+            _ => {
+                let (sxy, sxx) = known.iter().fold((0.0, 0.0), |(sxy, sxx), &(r, t)| (sxy + (r - mr) * (t - mt), sxx + (r - mr) * (r - mr)));
+                sxy / sxx
+            }
+        };
+        Some((mt + slope * (rows as f64 - mr)).max(0.0))
+    }
+
+    fn line(&self) -> String {
+        let checks: Vec<String> = self.check.iter().enumerate().filter(|(_, c)| c.1 > 0).map(|(r, c)| format!("{r}: {:.0} ms ({})", c.0, c.1)).collect();
+        format!("a draft {:.1} ms, a check of rows {}", self.draft.0, checks.join(", "))
+    }
 }
 
 /// How often an idle server looks at the memory the computer has free ([`Engine::fit_ram`]).
@@ -78,7 +161,73 @@ impl Engine {
         // which reads a record for each expert a card gives up)
         let idle = std::env::var_os("OAIY_DSV41_NO_WARM").is_none();
         let warm = idle.then(|| Warm { cursor: 0, started: None, reading: std::time::Duration::ZERO, bytes_before: model.expert_cache().stats().bytes_read });
-        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm, kernel: None, exl3: None, rebalanced: 0, idle, usage: None, order: None, ram_gb: 0, fitted: None }
+        Engine {
+            model,
+            tok,
+            covered: Vec::new(),
+            checkpoint: None,
+            eos,
+            log,
+            warm,
+            kernel: None,
+            exl3: None,
+            rebalanced: 0,
+            idle,
+            usage: None,
+            order: None,
+            ram_gb: 0,
+            fitted: None,
+            drafter: None,
+            drafter_keys: None,
+            draft_min: None,
+            draft_max: 0,
+            timing: Timing::default(),
+            pause: 0,
+        }
+    }
+
+    /// DSpark's drafter: each decode pass checks up to `max` of its drafts, those it is `min` sure of together where
+    /// that is given, else as many as pay ([`Engine::drafts_to_check`]).
+    pub(crate) fn with_drafter(mut self, drafter: Option<crate::dsv41::dspark::Drafter>, min: Option<f32>, max: usize) -> Engine {
+        self.draft_max = drafter.as_ref().map_or(0, |d| max.min(d.block()));
+        self.drafter = drafter;
+        self.draft_min = min;
+        self
+    }
+
+    /// How many of a draft whose drafts the drafter is `confidence` sure of (each given those before) a pass checks: of
+    /// up to `draft_max`, those it is `draft_min` sure of together where that is set; else the number that makes the
+    /// most tokens a second, a pass's tokens expected (the one chosen, and each draft by the product of the
+    /// confidences up to it: DSpark's confidence is its estimate that the model takes it) over its time (a draft's and a
+    /// check of that many rows, as they have taken of late). A check of more rows reads more experts, so what pays
+    /// is the machine's and the subject's.
+    fn drafts_to_check(&self, confidence: &[f32]) -> usize {
+        let most = confidence.len().min(self.draft_max);
+        if let Some(min) = self.draft_min {
+            let mut sure = 1.0f32;
+            return confidence[..most]
+                .iter()
+                .take_while(|&&c| {
+                    sure *= c;
+                    sure >= min
+                })
+                .count();
+        }
+        let (mut best, mut best_rate) = (0, f64::MIN);
+        let (mut expected, mut sure) = (1.0f64, 1.0f64);
+        for k in 0..=most {
+            if k > 0 {
+                sure *= f64::from(confidence[k - 1]);
+                expected += sure;
+            }
+            // (before any pass: all of them, which a pass then measures)
+            let Some(check) = self.timing.check_ms(k + 1) else { return most };
+            let rate = expected / (self.timing.draft.0 + check).max(1e-3);
+            if rate > best_rate {
+                (best, best_rate) = (k, rate);
+            }
+        }
+        best
     }
 
     /// An EXL3 checkpoint's experts' kernel the model was given: the idle reading fills its slots first (in the
@@ -280,6 +429,17 @@ impl Engine {
         }
     }
 
+    /// `ids` at `pos..` through the model, the last row's logits; the drafter, where there is one, given its keys of
+    /// their rows (it reads the layers `targets` of the trunk).
+    fn read(&mut self, ids: &[u32], pos: usize, targets: &[usize]) -> oaiy_engine::Result<Vec<f32>> {
+        let Some(d) = self.drafter.as_mut() else { return self.model.forward(ids, pos, &mut |_, _| {}) };
+        // (its keys of the last window's rows are all it keeps)
+        let from = ids.len().saturating_sub(d.config().window_size);
+        let (logits, features) = self.model.forward_rows(ids, pos, targets, false, from)?;
+        d.observe(&features, ids.len() - from, pos + from);
+        Ok(logits)
+    }
+
     fn generate(&mut self, job: &crate::engines::job::Job) -> oaiy_engine::Result<()> {
         use crate::engines::job::{sample, Event, Finish};
         use std::sync::atomic::Ordering;
@@ -339,6 +499,9 @@ impl Engine {
             let (tokens, state) = self.checkpoint.as_ref().expect("a checkpoint serves it");
             self.model.restore(state);
             self.covered.clone_from(tokens);
+            if let (Some(d), Some(keys)) = (self.drafter.as_mut(), &self.drafter_keys) {
+                d.set_keys(keys);
+            }
             kept
         } else {
             live
@@ -349,7 +512,9 @@ impl Engine {
         let _ = job.events.send(Event::CacheReuse { cached: start, source: if start > 0 { "memory" } else { "none" }, common });
         let total = prompt.len() - start;
         let _ = job.events.send(Event::Progress { done: 0, total });
-        // All but the last token, then the checkpoint, then the last one (whose logits the reply starts from).
+        // All but the last token, then the checkpoint, then the last one (whose logits the reply starts from). Where there
+        // is a drafter, each pass's rows give it its keys of the trunk.
+        let targets: Vec<usize> = self.drafter.as_ref().map(|d| d.targets().to_vec()).unwrap_or_default();
         let last = prompt.len() - 1;
         let mut pos = start;
         while pos < last {
@@ -358,15 +523,16 @@ impl Engine {
                 return Ok(());
             }
             let take = PREFILL_CHUNK.min(last - pos);
-            self.model.forward(&prompt[pos..pos + take], pos, &mut |_, _| {})?;
+            self.read(&prompt[pos..pos + take], pos, &targets)?;
             self.covered.extend_from_slice(&prompt[pos..pos + take]);
             pos += take;
             let _ = job.events.send(Event::Progress { done: pos - start, total });
         }
         if !job.forget {
             self.checkpoint = Some((self.covered.clone(), self.model.checkpoint()));
+            self.drafter_keys = self.drafter.as_ref().map(|d| d.keys());
         }
-        let mut logits = self.model.forward(&prompt[last..], last, &mut |_, _| {})?;
+        let mut logits = self.read(&prompt[last..], last, &targets)?;
         self.covered.push(prompt[last]);
         pos = prompt.len();
         let _ = job.events.send(Event::Progress { done: total, total });
@@ -381,20 +547,26 @@ impl Engine {
         let mut budget = crate::engines::glm::ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(crate::dsv41::chat::THINK_END), job.think_budget);
         let mut parser = crate::dsv41::chat::StreamParser::new(if budget.thinking { crate::dsv41::chat::Mode::Thinking } else { crate::dsv41::chat::Mode::Chat });
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
-        let (mut pending, mut n) = (Vec::<u8>::new(), 0usize);
-        let decode = std::time::Instant::now();
-        let finish = loop {
+        // (the tokens given out so far, read beside `give`, which counts them)
+        let (mut pending, n) = (Vec::<u8>::new(), std::cell::Cell::new(0usize));
+        // The token chosen after `logits` (the thinking budget's say included).
+        let mut choose = |logits: &[f32]| -> u32 {
             let was_thinking = budget.thinking;
-            let (next, _forced) = budget.pass(sample(&logits, &job.sampling, &mut rng));
+            let (next, _forced) = budget.pass(sample(logits, &job.sampling, &mut rng));
             if was_thinking && (!budget.thinking || budget.used.is_multiple_of(crate::engines::glm::THINKING_EVERY)) {
                 let _ = job.events.send(Event::Thinking { used: budget.used, budget: budget.budget, done: !budget.thinking });
             }
-            if next == self.eos {
-                break Finish::Stop;
+            next
+        };
+        // `next` given out, to be at `pos`: how the reply ends there, if it does.
+        let (tok, eos) = (Arc::clone(&self.tok), self.eos);
+        let mut give = |next: u32, pos: usize| -> Option<Finish> {
+            if next == eos {
+                return Some(Finish::Stop);
             }
-            n += 1;
+            n.set(n.get() + 1);
             // Whole UTF-8 characters only: a token can be part of one.
-            pending.extend_from_slice(self.tok.token_bytes(next));
+            pending.extend_from_slice(tok.token_bytes(next));
             let valid = match std::str::from_utf8(&pending) {
                 Ok(s) => s.len(),
                 Err(e) => e.valid_up_to(),
@@ -404,34 +576,108 @@ impl Engine {
                 pending.drain(..valid);
                 parser.push(&text);
                 if job.events.send(Event::Text(text)).is_err() {
-                    break Finish::Stop; // nobody is listening
+                    return Some(Finish::Stop); // nobody is listening
                 }
             }
             // A complete tool call is the reply: the caller runs it and comes back with its result.
             if parser.tool_calls_ready() {
-                break Finish::Stop;
+                return Some(Finish::Stop);
             }
-            if n >= job.max_tokens || pos + 1 >= max_seq {
-                break Finish::Length;
+            if n.get() >= job.max_tokens || pos + 1 >= max_seq {
+                return Some(Finish::Length);
             }
             if job.cancel.load(Ordering::Relaxed) {
-                break Finish::Stop;
+                return Some(Finish::Stop);
             }
-            logits = self.model.forward(&[next], pos, &mut |_, _| {})?;
-            self.covered.push(next);
-            pos += 1;
+            None
         };
+        let decode = std::time::Instant::now();
+        let (mut passes, mut drafted, mut taken) = (0usize, 0usize, 0usize);
+        let mut next = choose(&logits);
+        let finish = loop {
+            if let Some(finish) = give(next, pos) {
+                break finish;
+            }
+            // Drafts after it, where there is a drafter: as many as it is confident enough of and the reply has room for.
+            let room = (max_seq - pos - 1).min(job.max_tokens.saturating_sub(n.get()));
+            let drafting = std::time::Instant::now();
+            let paused = self.pause > 0;
+            self.pause = self.pause.saturating_sub(1);
+            let drafts = match self.drafter.as_mut() {
+                Some(d) if room > 0 && !paused => {
+                    let draft = d.draft(self.model.embed(), self.model.head(), next, pos)?;
+                    if std::env::var_os("OAIY_DSV41_TRACE_DRAFT").is_some() {
+                        let words: Vec<String> = draft.tokens.iter().map(|&t| String::from_utf8_lossy(self.tok.token_bytes(t)).into_owned()).collect();
+                        eprintln!("  draft at {pos} after {:?}: {:?} {:?}", String::from_utf8_lossy(self.tok.token_bytes(next)), words, draft.confidence);
+                    }
+                    let k = self.drafts_to_check(&draft.confidence).min(room);
+                    draft.tokens[..k].to_vec()
+                }
+                _ => Vec::new(),
+            };
+            let drafted_in = drafting.elapsed();
+            if self.drafter.is_none() {
+                logits = self.model.forward(&[next], pos, &mut |_, _| {})?;
+                self.covered.push(next);
+                pos += 1;
+                next = choose(&logits);
+                continue;
+            }
+            // The token and its drafts in one pass, every row's choice made: the drafts stand up to the first the
+            // model chose otherwise, whose choice is the next token; the caches are rewound past the rest.
+            let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
+            let checking = std::time::Instant::now();
+            let saved = self.model.save(pos, rows.len());
+            let (all, features) = self.model.forward_rows(&rows, pos, &targets, true, 0)?;
+            let checked_in = checking.elapsed();
+            self.timing.passed(rows.len(), checked_in);
+            let vocab = all.len() / rows.len();
+            let mut kept = 1;
+            let mut ended = None;
+            next = choose(&all[..vocab]);
+            while kept <= drafts.len() && next == drafts[kept - 1] {
+                kept += 1;
+                if let Some(finish) = give(next, pos + kept - 1) {
+                    ended = Some(finish);
+                    break;
+                }
+                next = choose(&all[(kept - 1) * vocab..kept * vocab]);
+            }
+            self.model.rewind(&saved, kept);
+            if let Some(d) = self.drafter.as_mut() {
+                d.observe(&features[..kept * features.len() / rows.len()], kept, pos);
+            }
+            self.covered.extend_from_slice(&rows[..kept]);
+            pos += kept;
+            // A drafted pass's tokens a second against a step's: drafting paused for some passes where it has not paid
+            // of late (its own time and the check's more than what the drafts taken saved), and tried again after.
+            if !paused {
+                if self.timing.drafted(drafted_in, kept, checked_in) {
+                    self.pause = DRAFT_PAUSE;
+                }
+                passes += 1;
+                drafted += drafts.len();
+                taken += kept - 1;
+            }
+            if let Some(finish) = ended {
+                break finish;
+            }
+        };
+        if passes > 0 && self.log {
+            eprintln!("  drafts: {taken} of {drafted} taken in {passes} passes ({:.2} tokens a pass); {}", (passes + taken) as f64 / passes as f64, self.timing.line());
+        }
         if !pending.is_empty() {
             let _ = job.events.send(Event::Text(String::from_utf8_lossy(&pending).into_owned()));
         }
         if self.log {
             let decode_s = decode.elapsed().as_secs_f64();
+            let n = n.get();
             eprintln!("  {} prompt tokens ({start} reused) in {prefill_s:.1}s; {n} generated in {decode_s:.1}s ({:.2} tok/s)", prompt.len(), n as f64 / decode_s.max(1e-9));
         }
         if profiling {
             part("the reply", at_reply, read_so_far(&self.model));
         }
-        let _ = job.events.send(Event::Done { finish, completion_tokens: n });
+        let _ = job.events.send(Event::Done { finish, completion_tokens: n.get() });
         Ok(())
     }
 }

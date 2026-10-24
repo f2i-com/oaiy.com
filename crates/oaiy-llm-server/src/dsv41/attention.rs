@@ -51,6 +51,56 @@ pub struct AttnState {
     score_state: Vec<f32>,
     /// Index keys (kv-source layers that index), `[max_seq / ratio][index_head_dim]`.
     index_k: Vec<f32>,
+    /// The compressor's last [`RECENT`] rows (ratio > 1 sources), each at its position's slot: a partial group made
+    /// again from them where a draft's check kept fewer rows than it read ([`AttnState::rewind`]).
+    recent_kv: Vec<f32>,
+    recent_score: Vec<f32>,
+}
+
+/// Rows of a compressing source's projections [`AttnState`] keeps (more than a draft's check reads at once).
+const RECENT: usize = 16;
+
+/// What a pass of rows from `start` writes over in a layer's caches, as it was ([`AttnState::save`]).
+#[derive(Clone)]
+pub struct Saved {
+    start: usize,
+    /// The window slots of the pass's positions (each then holding a position a window before).
+    window: Vec<f32>,
+    kv_state: Vec<f32>,
+    score_state: Vec<f32>,
+}
+
+impl AttnState {
+    /// What a pass of `t` rows from `start` will write over (`hd` the head's width): its positions' window slots and a
+    /// compressing source's partial group. The compressed caches need nothing: an entry is written at its group's
+    /// place and read only once its group is whole, so one made of rows not kept is made again over it.
+    pub fn save(&self, hd: usize, start: usize, t: usize) -> Saved {
+        let win = self.window.len() / hd;
+        let window = (start..start + t.min(win)).flat_map(|p| self.window[p % win * hd..(p % win + 1) * hd].iter().copied()).collect();
+        Saved { start, window, kv_state: self.kv_state.clone(), score_state: self.score_state.clone() }
+    }
+
+    /// Back to the caches as they would be had the saved pass read only its first `keep` rows: the window slots of the
+    /// others as they were, and a compressing source's partial group (of `ratio` rows) made again of the rows it then
+    /// holds, those before the pass from `saved`, those of it from the rows kept since.
+    pub fn rewind(&mut self, hd: usize, saved: &Saved, keep: usize, ratio: usize) {
+        let win = self.window.len() / hd;
+        let saved_rows = saved.window.len() / hd;
+        for i in keep..saved_rows {
+            let s = (saved.start + i) % win;
+            self.window[s * hd..(s + 1) * hd].copy_from_slice(&saved.window[i * hd..(i + 1) * hd]);
+        }
+        if ratio > 1 && !self.kv_state.is_empty() {
+            self.kv_state.copy_from_slice(&saved.kv_state);
+            self.score_state.copy_from_slice(&saved.score_state);
+            let next = saved.start + keep;
+            for p in (next - next % ratio).max(saved.start)..next {
+                let (s, r) = (p % ratio, p % RECENT);
+                self.kv_state[s * hd..(s + 1) * hd].copy_from_slice(&self.recent_kv[r * hd..(r + 1) * hd]);
+                self.score_state[s * hd..(s + 1) * hd].copy_from_slice(&self.recent_score[r * hd..(r + 1) * hd]);
+            }
+        }
+    }
 }
 
 /// What attention layers hand down the stack (reference `SharedAttentionRuntime`).
@@ -119,7 +169,12 @@ impl Attention {
     }
 
     pub fn load(idx: &StIndex, cfg: &Config, layer: usize, rope: Arc<Rope>) -> Result<Attention> {
-        let p = format!("layers.{layer}.attn");
+        Self::load_named(idx, cfg, layer, &format!("layers.{layer}.attn"), rope)
+    }
+
+    /// [`Attention::load`] of the weights named `prefix.*` (DSpark's drafter's `mtp.<i>.attn`), `layer` its place in
+    /// `cfg`'s layers.
+    pub fn load_named(idx: &StIndex, cfg: &Config, layer: usize, p: &str, rope: Arc<Rope>) -> Result<Attention> {
         let ratio = cfg.ratio(layer);
         let is_kv_source = cfg.kv_source_layers.contains(&layer);
         let is_index_source = cfg.index_source_layers.contains(&layer);
@@ -167,21 +222,117 @@ impl Attention {
         })
     }
 
+    /// The window's projection, whose rows [`Attention::store_keys`] takes.
+    pub fn wkv(&self) -> &Weight {
+        &self.wkv
+    }
+
+    /// The window keys of rows at `start_pos..`, from the window's projection of them, `kva` (`[t, head_dim]`, bf16
+    /// values), as [`Attention::forward`] makes and keeps its own: DSpark's drafter's keys of the trunk's rows, which its
+    /// drafts then attend to ([`Attention::forward_draft`]).
+    pub fn store_keys(&self, cfg: &Config, kva: &[f32], start_pos: usize, state: &mut AttnState) {
+        let (hd, rd, win) = (cfg.head_dim, cfg.rope_head_dim, cfg.window_size);
+        let kv = rmsnorm(kva, &self.kv_norm, cfg.norm_eps);
+        for (i, row) in kv.chunks_exact(hd).enumerate() {
+            let p = start_pos + i;
+            let mut row = row.to_vec();
+            self.rope.apply(&mut row[hd - rd..], p, false);
+            fake_quant_fp8_inplace(&mut row);
+            state.window[p % win * hd..(p % win + 1) * hd].copy_from_slice(&row);
+        }
+    }
+
+    /// DSpark's drafter's block (DeepInfer's `DFlashAttention.forward_drafts`): `t` rows `x` (`[t, dim]`, bf16 values)
+    /// at `start_pos..`, each attending to the window's keys of the `win` positions before `start_pos` that there are
+    /// ([`Attention::store_keys`]) and to every row of the block, its own and those after it alike (a block is drafted
+    /// at once). The block's keys are not kept. A window-only layer's.
+    pub fn forward_draft(&self, cfg: &Config, x: &[f32], t: usize, start_pos: usize, state: &AttnState) -> Result<Vec<f32>> {
+        let (hd, nh, rd, win) = (cfg.head_dim, cfg.n_heads, cfg.rope_head_dim, cfg.window_size);
+        if t == 0 || self.ratio != 0 {
+            return Err(Error::Arg(format!("layer {}: a draft of {t} rows on a layer of ratio {}", self.layer, self.ratio)));
+        }
+        let mut made = crate::dsv41::linear::forward_together(&[(&self.wq_a, x, t, 0..self.wq_a.n(), Out::Bf16), (&self.wkv, x, t, 0..self.wkv.n(), Out::Bf16)]).into_iter();
+        let (qa, kva) = (made.next().expect("the queries' projection"), made.next().expect("the window's projection"));
+        let qr = rmsnorm(&qa, &self.q_norm, cfg.norm_eps);
+        let mut q = self.wq_b.forward(&qr, t, Out::Bf16);
+        for i in 0..t {
+            for h in 0..nh {
+                let base = (i * nh + h) * hd;
+                self.rope.apply(&mut q[base + hd - rd..base + hd], start_pos + i, false);
+            }
+        }
+        let mut kv = rmsnorm(&kva, &self.kv_norm, cfg.norm_eps);
+        for i in 0..t {
+            let row = &mut kv[i * hd..(i + 1) * hd];
+            self.rope.apply(&mut row[hd - rd..], start_pos + i, false);
+            fake_quant_fp8_inplace(row);
+        }
+        // The window's positions oldest first, then the block's rows: one list every row attends over.
+        let mut keys: Vec<f32> = Vec::with_capacity((win + t) * hd);
+        for p in start_pos.saturating_sub(win)..start_pos {
+            keys.extend_from_slice(&state.window[p % win * hd..(p % win + 1) * hd]);
+        }
+        keys.extend_from_slice(&kv);
+        // every (row, head) on the workers that stay ([`crate::dsv41::pool::shared`]), a share each: a decode step's
+        // attention's way (threads started for it cost a millisecond a layer)
+        let idxs: Arc<Vec<i32>> = Arc::new((0..(keys.len() / hd) as i32).collect());
+        let scale = (hd as f32).powf(-0.5);
+        let rows = t * nh;
+        let pool = crate::dsv41::pool::shared().lock().unwrap_or_else(|p| p.into_inner());
+        let per = rows.div_ceil(pool.threads().min(rows));
+        let (q, keys) = (Arc::new(q), Arc::new(keys));
+        let (sink, rope) = (Arc::new(self.attn_sink.clone()), Arc::clone(&self.rope));
+        let jobs: Vec<crate::dsv41::pool::Job> = (0..rows)
+            .step_by(per)
+            .enumerate()
+            .map(|(id, b)| {
+                let e = (b + per).min(rows);
+                let (q, keys, idxs, sink, rope) = (Arc::clone(&q), Arc::clone(&keys), Arc::clone(&idxs), Arc::clone(&sink), Arc::clone(&rope));
+                Box::new(move || {
+                    let mut buf = vec![0.0f32; (e - b) * hd];
+                    for r in b..e {
+                        let (i, h) = (r / nh, r % nh);
+                        let out = &mut buf[(r - b) * hd..(r - b + 1) * hd];
+                        sparse_attend(&q[r * hd..(r + 1) * hd], &keys, hd, &idxs, sink[h], scale, out);
+                        rope.apply(&mut out[hd - rd..], start_pos + i, true);
+                    }
+                    (id, buf)
+                }) as crate::dsv41::pool::Job
+            })
+            .collect();
+        let o = pool.run(jobs).concat();
+        drop(pool);
+        let (g, gd, orank) = (cfg.o_groups, nh * hd / cfg.o_groups, cfg.o_lora_rank);
+        let xgs: Vec<Vec<f32>> = (0..g).map(|grp| (0..t).flat_map(|i| o[(i * g + grp) * gd..(i * g + grp + 1) * gd].iter().copied()).collect()).collect();
+        let groups: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> =
+            xgs.iter().enumerate().map(|(grp, xg)| (&self.wo_a, xg.as_slice(), t, grp * orank..(grp + 1) * orank, Out::Bf16)).collect();
+        let mut og = vec![0.0f32; t * g * orank];
+        for (grp, yg) in crate::dsv41::linear::forward_together(&groups).into_iter().enumerate() {
+            for i in 0..t {
+                og[(i * g + grp) * orank..(i * g + grp + 1) * orank].copy_from_slice(&yg[i * orank..(i + 1) * orank]);
+            }
+        }
+        Ok(self.wo_b.forward(&og, t, Out::Bf16))
+    }
+
     /// Fresh caches for this layer, sized for `max_seq` positions.
     pub fn new_state(&self, cfg: &Config, max_seq: usize) -> AttnState {
         let hd = cfg.head_dim;
         let (mut compress_kv, mut kv_state, mut score_state, mut index_k) = (vec![], vec![], vec![], vec![]);
+        let (mut recent_kv, mut recent_score) = (vec![], vec![]);
         if let Some(c) = &self.compressor {
             compress_kv = vec![0.0; max_seq / c.ratio * hd];
             if c.ratio > 1 {
                 kv_state = vec![0.0; c.ratio * hd];
                 score_state = vec![f32::NEG_INFINITY; c.ratio * hd];
+                recent_kv = vec![0.0; RECENT * hd];
+                recent_score = vec![f32::NEG_INFINITY; RECENT * hd];
             }
             if self.indexer.as_ref().is_some_and(|i| i.owns_k) {
                 index_k = vec![0.0; max_seq / c.ratio * cfg.index_head_dim];
             }
         }
-        AttnState { window: vec![0.0; cfg.window_size * hd], compress_kv, kv_state, score_state, index_k }
+        AttnState { window: vec![0.0; cfg.window_size * hd], compress_kv, kv_state, score_state, index_k, recent_kv, recent_score }
     }
 
     /// `x`: `[t, dim]` (bf16 values) at positions `start_pos..start_pos + t`;
@@ -640,6 +791,11 @@ impl Compressor {
         }
         let r = self.ratio;
         let score = score.expect("ratio > 1 has wgate");
+        for i in t.saturating_sub(RECENT)..t {
+            let s = (start_pos + i) % RECENT;
+            st.recent_kv[s * hd..(s + 1) * hd].copy_from_slice(&kv[i * hd..(i + 1) * hd]);
+            st.recent_score[s * hd..(s + 1) * hd].copy_from_slice(&score[i * hd..(i + 1) * hd]);
+        }
         let pooled = if start_pos == 0 {
             let rem = t % r;
             let cutoff = t - rem;
@@ -897,6 +1053,62 @@ mod tests {
             eos_token_id: 1,
             image_token_id: 2,
             vision: None,
+            dspark: None,
+        }
+    }
+
+    /// A draft's check rewound ([`AttnState::save`], [`AttnState::rewind`]) leaves the window and a compressing
+    /// source's partial group as reading only the rows it kept would have: what follows is what follows those rows read
+    /// alone, wherever the kept rows end in a group and however many the check read past them.
+    #[test]
+    fn a_check_rewound_is_the_rows_it_kept_read_alone() {
+        let cfg = selection_cfg();
+        let (hd, win) = (cfg.head_dim, cfg.window_size);
+        let c = Compressor { ratio: 2, wkv: Weight::F32 { w: vec![0.0; hd], n: 1, k: hd }, wgate: None, norm: vec![1.0; hd] };
+        // a row at a position, the token's (salt 0) or a draft's the check does not keep (salt 1)
+        let row = |p: usize, salt: f32| -> Vec<f32> { (0..hd).map(|f| ((p * 7 + f) as f32 * 0.37 + salt).sin()).collect() };
+        let fresh = || AttnState {
+            window: vec![0.0; win * hd],
+            compress_kv: Vec::new(),
+            kv_state: vec![0.0; 2 * hd],
+            score_state: vec![f32::NEG_INFINITY; 2 * hd],
+            index_k: Vec::new(),
+            recent_kv: vec![0.0; RECENT * hd],
+            recent_score: vec![f32::NEG_INFINITY; RECENT * hd],
+        };
+        // rows at `start..` into the window (each at its position's slot, as a pass keeps them) and the compressor:
+        // the latents it completes
+        let pass = |st: &mut AttnState, start: usize, salts: &[f32]| -> Option<Vec<f32>> {
+            let kv: Vec<f32> = salts.iter().enumerate().flat_map(|(i, &s)| row(start + i, s)).collect();
+            let score: Vec<f32> = salts.iter().enumerate().flat_map(|(i, &s)| row(start + i, s + 2.0)).collect();
+            for i in 0..salts.len() {
+                let s = (start + i) % win;
+                st.window[s * hd..(s + 1) * hd].copy_from_slice(&kv[i * hd..(i + 1) * hd]);
+            }
+            c.forward(&cfg, kv, Some(score), salts.len(), start, st)
+        };
+        for (start, read, keep) in [(5, 4, 2), (5, 4, 1), (6, 5, 3), (6, 3, 3), (5, 6, 5), (4, 2, 1)] {
+            let (mut a, mut b) = (fresh(), fresh());
+            pass(&mut a, 0, &[0.0; 4]);
+            pass(&mut b, 0, &[0.0; 4]);
+            if start > 4 {
+                pass(&mut a, 4, &vec![0.0; start - 4]);
+                pass(&mut b, 4, &vec![0.0; start - 4]);
+            }
+            // a: the check's rows, those past `keep` not the token's, then rewound; b: the kept rows alone
+            let saved = a.save(hd, start, read);
+            let salts: Vec<f32> = (0..read).map(|i| if i < keep { 0.0 } else { 1.0 }).collect();
+            pass(&mut a, start, &salts);
+            a.rewind(hd, &saved, keep, 2);
+            pass(&mut b, start, &vec![0.0; keep]);
+            // then the same rows after, one and several at a time
+            let mut at = start + keep;
+            for n in [1, 1, 3, 2] {
+                let salts = vec![0.0; n];
+                assert_eq!(pass(&mut a, at, &salts), pass(&mut b, at, &salts), "a check from {start} of {read} rows keeping {keep}: the latents of {n} rows at {at}");
+                at += n;
+            }
+            assert_eq!((&a.window, &a.kv_state, &a.score_state), (&b.window, &b.kv_state, &b.score_state), "a check from {start} of {read} rows keeping {keep}: the caches");
         }
     }
 

@@ -1061,10 +1061,18 @@ impl Models {
         });
         let devices = self.devices_of(spec);
         let picked = crate::engines::backend::open(o, &devices)?;
-        let (mut kernel, mut exl3_kernel) = (None, None);
+        let (mut kernel, mut exl3_kernel, mut drafter) = (None, None, None);
         match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
             Some(b) => {
                 let (count, bytes) = crate::engines::dsv41_portable::offload(&mut model, b);
+                // DSpark's drafter (OAIY_DSV41_DRAFT=1), before the experts take what the cards have left
+                if std::env::var("OAIY_DSV41_DRAFT").is_ok_and(|v| v == "1") {
+                    let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect();
+                    if let Some((d, said)) = crate::engines::dsv41_portable::load_drafter(&spec.path, &model, b, &cards)? {
+                        self.say(format!("{}: {said}", spec.name));
+                        drafter = Some(d);
+                    }
+                }
                 // A prompt's busy experts there too, through record slots in what the budget has left after the trunk,
                 // and the experts used most kept there in what is left after those (a decode step's computed there while
                 // the CPU reads and computes the rest).
@@ -1118,7 +1126,16 @@ impl Models {
         // Its own placeholder (as the CUDA build): the default, token 0, is DeepSeek's start of sequence.
         cfg.image_token_id = model.cfg.image_token_id;
         let (jobs, rx) = std::sync::mpsc::channel();
-        let e = crate::engines::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent).with_kernel(kernel).with_exl3(exl3_kernel).with_usage(o.usage.clone(), order).with_ram_ceiling(o.ram_gb);
+        // (OAIY_DSV41_DRAFT_MIN: how sure of its drafts together the drafter must be for a pass to check them, where
+        // not as many as pay by what passes take; OAIY_DSV41_DRAFTS: the most a pass checks)
+        let draft_min = std::env::var("OAIY_DSV41_DRAFT_MIN").ok().and_then(|v| v.parse().ok());
+        let draft_max = std::env::var("OAIY_DSV41_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        let e = crate::engines::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent)
+            .with_kernel(kernel)
+            .with_exl3(exl3_kernel)
+            .with_usage(o.usage.clone(), order)
+            .with_ram_ceiling(o.ram_gb)
+            .with_drafter(drafter, draft_min, draft_max);
         let thread = std::thread::Builder::new().name("deepseek-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Deepseek(tok)) })
     }

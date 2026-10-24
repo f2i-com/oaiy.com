@@ -96,12 +96,12 @@ impl ExpertFormat {
 /// the checkpoint, so an expert its writer kept together is one read: a writer that put each projection's `suh`,
 /// `svh`, `mul1` and `trellis` in that order, laid out as `mul1` first, was nine reads (three of them a 4-byte value, each
 /// a block of the drive's own).
-fn exl3_parts(idx: &StIndex, layer: u32) -> Result<(Vec<(String, Dtype, usize)>, [Exl3Proj; 3])> {
+fn exl3_parts(idx: &StIndex, prefix: &str) -> Result<(Vec<(String, Dtype, usize)>, [Exl3Proj; 3])> {
     let mut projs = Vec::new();
     // (which projection, which part, its suffix, dtype and bytes, and where expert 0's lies)
     let mut all = Vec::new();
     for (i, w) in ["w1", "w2", "w3"].into_iter().enumerate() {
-        let name = format!("layers.{layer}.ffn.experts.0.{w}.trellis");
+        let name = format!("{prefix}.experts.0.{w}.trellis");
         let t = idx.info(&name)?;
         let [kt, nt, tw] = t.shape[..] else {
             return Err(Error::Format(format!("{name}: expected [k/16, n/16, words], got {:?}", t.shape)));
@@ -109,7 +109,7 @@ fn exl3_parts(idx: &StIndex, layer: u32) -> Result<(Vec<(String, Dtype, usize)>,
         let (k, n, trellis) = (kt * 16, nt * 16, kt * nt * tw * 2);
         projs.push(Exl3Proj { suh: 0, svh: 0, mul1: 0, trellis: 0, k, n, tile_words: tw });
         for (part, dtype, bytes) in [("mul1", Dtype::I32, 4), ("suh", Dtype::F16, 2 * k), ("svh", Dtype::F16, 2 * n), ("trellis", Dtype::I16, trellis)] {
-            let at = idx.info(&format!("layers.{layer}.ffn.experts.0.{w}.{part}"))?;
+            let at = idx.info(&format!("{prefix}.experts.0.{w}.{part}"))?;
             all.push((i, part, format!("{w}.{part}"), dtype, bytes, (at.shard, at.start)));
         }
     }
@@ -129,7 +129,7 @@ fn exl3_parts(idx: &StIndex, layer: u32) -> Result<(Vec<(String, Dtype, usize)>,
     }
     let [w1, w2, w3] = projs[..] else { unreachable!("three projections") };
     if (w1.k, w1.n) != (DIM, INTER) || (w3.k, w3.n) != (DIM, INTER) || (w2.k, w2.n) != (INTER, DIM) {
-        return Err(Error::Format(format!("layer {layer}: EXL3 experts of {}x{} / {}x{}, expected {DIM}x{INTER}", w1.k, w1.n, w2.k, w2.n)));
+        return Err(Error::Format(format!("{prefix}: EXL3 experts of {}x{} / {}x{}, expected {DIM}x{INTER}", w1.k, w1.n, w2.k, w2.n)));
     }
     Ok((parts, [w1, w3, w2]))
 }
@@ -162,14 +162,20 @@ impl SafetensorsExpertStore {
     /// Index experts `layers.{0..layers}.ffn.experts.{0..experts}` of the
     /// checkpoint. `direct` asks for page-cache-bypassing reads (see `io`).
     pub fn open(idx: &StIndex, layers: u32, experts: u32, direct: bool) -> Result<Self> {
+        Self::open_named(idx, layers, experts, direct, &|l| format!("layers.{l}.ffn"))
+    }
+
+    /// [`Self::open`] of experts `<prefix(l)>.experts.{0..experts}` for `l` in `0..layers` (DSpark's drafter's,
+    /// `mtp.<l>.ffn`).
+    pub fn open_named(idx: &StIndex, layers: u32, experts: u32, direct: bool, prefix: &dyn Fn(u32) -> String) -> Result<Self> {
         let mut runs: Vec<Run> = Vec::new();
         let mut starts = Vec::with_capacity((layers * experts) as usize + 1);
         // An EXL3 checkpoint stores each projection as its trellis and transforms (`ExpertFormat::Exl3`).
-        let exl3 = idx.get("layers.0.ffn.experts.0.w1.trellis").is_some();
+        let exl3 = idx.get(&format!("{}.experts.0.w1.trellis", prefix(0))).is_some();
         let mut layouts = Vec::new();
         for l in 0..layers {
             let parts: Vec<(String, Dtype, usize)> = if exl3 {
-                let (parts, layout) = exl3_parts(idx, l)?;
+                let (parts, layout) = exl3_parts(idx, &prefix(l))?;
                 layouts.push(layout);
                 parts
             } else {
@@ -180,7 +186,7 @@ impl SafetensorsExpertStore {
                 starts.push(first_run as u32);
                 let mut dst_off = 0;
                 for (suffix, dtype, bytes) in parts.iter().map(|(s, d, b)| (s.as_str(), *d, *b)) {
-                    let name = format!("layers.{l}.ffn.experts.{e}.{suffix}");
+                    let name = format!("{}.experts.{e}.{suffix}", prefix(l));
                     let t = idx.info(&name)?;
                     if t.dtype != dtype || t.nbytes as usize != bytes {
                         return Err(Error::Format(format!(

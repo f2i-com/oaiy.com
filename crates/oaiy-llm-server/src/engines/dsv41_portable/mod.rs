@@ -27,3 +27,29 @@ pub(crate) use exl3::WgpuExl3Experts;
 pub(crate) use experts::{WgpuExperts, ALONE};
 pub(crate) use trunk::offload;
 pub(crate) use usage::{read_usage, write_usage};
+
+/// DSpark's drafter of the checkpoint at `dir` (whose trunk `model` is), if it has one, ready to draft: its dense
+/// weights on `gpu` beside the trunk's, and an EXL3 checkpoint's 384 experts held on `cards` in slots of their own
+/// (5 GB), read in now; an fp4 checkpoint's run on the CPU from a RAM cache that holds them all (2 GB). To be made
+/// before the trunk's experts take what the cards have left. With what it took, said.
+pub(crate) fn load_drafter(dir: &std::path::Path, model: &crate::dsv41::model::Model, gpu: &WgpuBackend, cards: &[Arc<WgpuBackend>]) -> oaiy_engine::Result<Option<(crate::dsv41::dspark::Drafter, String)>> {
+    let Some(spec) = model.cfg.dspark.clone() else { return Ok(None) };
+    let idx = crate::dsv41::safetensors::StIndex::open(dir)?;
+    let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
+    let records = if exl3 { 16 } else { spec.layers * spec.n_routed_experts };
+    let Some(mut d) = crate::dsv41::dspark::Drafter::load(&idx, &model.cfg, model.max_seq(), records, true)? else { return Ok(None) };
+    let (count, bytes) = trunk::offload_drafter(&mut d, gpu, exl3);
+    let mut said = format!("DSpark's drafter: {count} dense matrices ({:.1} GB) on the GPU", bytes as f64 / 1e9);
+    if exl3 {
+        match WgpuExl3Experts::new_within(&d.experts.format, cards, spec.n_routed_experts, Some(spec.layers * spec.n_routed_experts)) {
+            Some(k) => {
+                let started = std::time::Instant::now();
+                while k.fill_some(d.experts.store.as_ref(), &d.experts.cache, None, 64) {}
+                said += &format!(", its {} experts held there (read in {:.1} s)", k.tier().1, started.elapsed().as_secs_f64());
+                d.set_experts_kernel(Some(Arc::new(k) as Arc<dyn crate::dsv41::expert::ExpertsKernel>));
+            }
+            None => said += ", its experts on the CPU (no room for them on the GPUs)",
+        }
+    }
+    Ok(Some((d, said)))
+}

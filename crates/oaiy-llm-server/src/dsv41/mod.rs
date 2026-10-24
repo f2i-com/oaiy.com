@@ -18,6 +18,7 @@
 //! - `exl3_experts` — the routed experts of an EXL3 checkpoint on the CPU (the WebGPU build's: its decoder is there)
 //! - [`engram`] — n-gram hash memory
 //! - [`model`] — the backbone forward pass
+//! - [`dspark`] — DSpark's block drafter (`mtp.*`), whose drafts the backbone checks in one pass
 //! - [`vision`] — image preprocessing (bit-exact to the reference's Pillow
 //!   pipeline) and the ViT + aligner on the CPU
 //! - [`simd`] — which of [`cpu_experts`]' row kernels this CPU runs (the AVX-512 one's calls: the crate's one
@@ -28,6 +29,7 @@ pub mod chat;
 pub mod config;
 pub mod cpu_experts;
 pub mod detok;
+pub mod dspark;
 pub mod engram;
 #[cfg(feature = "webgpu")]
 pub mod exl3_experts;

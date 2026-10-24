@@ -2,7 +2,7 @@
 //! 4 hyper-connection copies -> 40 blocks (Engram in front of layers 1 and
 //! 14) -> collapse -> norm -> head. CPU reference path: every trunk weight
 //! resident in RAM in its stored form, routed experts through the expert
-//! cache. MTP/DSpark and vision are not built (docs/DEEPSEEK_V41.md).
+//! cache. DSpark's drafter is `crate::dsv41::dspark`; vision is not built here (docs/DEEPSEEK_V41.md).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -84,7 +84,22 @@ impl Backbone for Model {
         &mut self.cfg
     }
     fn forward_traced(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Trace<'_>) -> Result<Vec<f32>> {
-        self.forward_impl(ids, start_pos, teacher, trace)
+        self.forward_impl(ids, start_pos, teacher, trace, &mut Rows::last())
+    }
+}
+
+/// What a forward hands back of its rows: the last one's logits or every row's, and for a drafter what it reads of the
+/// trunk at the layers `targets`, of the rows from `from` on ([`Model::forward_rows`]).
+struct Rows<'a> {
+    all: bool,
+    targets: &'a [usize],
+    from: usize,
+    features: Vec<f32>,
+}
+
+impl Rows<'_> {
+    fn last() -> Self {
+        Rows { all: false, targets: &[], from: 0, features: Vec::new() }
     }
 }
 
@@ -175,16 +190,27 @@ impl Model {
     /// Run `ids` at positions `start_pos..` (a prefill at 0, then one token at
     /// a time) and return the last position's logits (f32, `[vocab]`).
     pub fn forward(&mut self, ids: &[u32], start_pos: usize, trace: Trace<'_>) -> Result<Vec<f32>> {
-        self.forward_impl(ids, start_pos, None, trace)
+        self.forward_impl(ids, start_pos, None, trace, &mut Rows::last())
+    }
+
+    /// [`forward`](Self::forward) with every row's logits where `all` (`[t, vocab]`: a draft's check, each row's choice
+    /// of the next token), and the rows' from `from` on mean of the four streams entering each of the layers `targets`
+    /// (after their Engram), rounded to bf16 and laid end to end (`[t - from, targets.len() * dim]`: what DSpark's
+    /// drafter reads of the trunk; a long prompt's last rows are all it keeps).
+    pub fn forward_rows(&mut self, ids: &[u32], start_pos: usize, targets: &[usize], all: bool, from: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let from = from.min(ids.len());
+        let mut rows = Rows { all, targets, from, features: vec![0.0; (ids.len() - from) * targets.len() * self.cfg.dim] };
+        let logits = self.forward_impl(ids, start_pos, None, &mut |_, _| {}, &mut rows)?;
+        Ok((logits, rows.features))
     }
 
     /// [`forward`](Self::forward), but every layer after the first starts
     /// from `teacher`'s stream instead of the previous layer's output.
     pub fn forward_teacher(&mut self, ids: &[u32], start_pos: usize, teacher: Teacher<'_>, trace: Trace<'_>) -> Result<Vec<f32>> {
-        self.forward_impl(ids, start_pos, Some(teacher), trace)
+        self.forward_impl(ids, start_pos, Some(teacher), trace, &mut Rows::last())
     }
 
-    fn forward_impl(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Trace<'_>) -> Result<Vec<f32>> {
+    fn forward_impl(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Trace<'_>, rows: &mut Rows<'_>) -> Result<Vec<f32>> {
         let (d, t) = (self.cfg.dim, ids.len());
         if t == 0 || start_pos + t > self.max_seq {
             return Err(Error::Arg(format!("{t} tokens at {start_pos} do not fit max_seq {}", self.max_seq)));
@@ -222,6 +248,17 @@ impl Model {
                 h = eg.forward(&self.cfg, &h, t, &hs)?;
                 crate::dsv41::profile::add(crate::dsv41::profile::Part::Engram, looking_up);
             }
+            if let Some(at) = rows.targets.iter().position(|&target| target == l) {
+                let width = rows.targets.len() * d;
+                for i in rows.from..t {
+                    let streams = &h[i * HC * d..(i + 1) * HC * d];
+                    let r = i - rows.from;
+                    let out = &mut rows.features[r * width + at * d..r * width + (at + 1) * d];
+                    for (f, o) in out.iter_mut().enumerate() {
+                        *o = crate::dsv41::formats::to_bf16((0..HC).map(|s| streams[s * d + f]).sum::<f32>() / HC as f32);
+                    }
+                }
+            }
             let (out, next_pre, _routes) = self.block(l, &h, t, start_pos, &pre_mix, trace)?;
             h = out;
             pre_mix = next_pre;
@@ -237,10 +274,10 @@ impl Model {
         if t == 1 && self.experts.uses.step() {
             self.experts.cache.decay();
         }
-        let last = t - 1;
-        let x = hc::pre(&h[last * HC * d..(last + 1) * HC * d], &pre_mix[last]);
+        let first = if rows.all { 0 } else { t - 1 };
+        let x: Vec<f32> = (first..t).flat_map(|i| hc::pre(&h[i * HC * d..(i + 1) * HC * d], &pre_mix[i])).collect();
         let x = rmsnorm(&x, &self.norm, self.cfg.norm_eps);
-        let logits = self.head.forward(&x, 1, Out::F32);
+        let logits = self.head.forward(&x, t - first, Out::F32);
         trace("logits", &logits);
         Ok(logits)
     }
@@ -338,6 +375,21 @@ impl Model {
         self.hasher.set_cache(&c.history);
     }
 
+    /// What a pass of `t` rows from `start` writes over in every layer's caches ([`Model::rewind`]): a draft's check,
+    /// of which only the rows up to the first the model chose otherwise stand. A few slots a layer, where a
+    /// [`Checkpoint`] is every cache whole. The n-gram history needs nothing: it is held by position.
+    pub fn save(&self, start: usize, t: usize) -> Vec<crate::dsv41::attention::Saved> {
+        self.states.iter().map(|s| s.save(self.cfg.head_dim, start, t)).collect()
+    }
+
+    /// The caches as they would be had the pass `saved` was taken for read only its first `keep` rows: the next
+    /// forward continues from there.
+    pub fn rewind(&mut self, saved: &[crate::dsv41::attention::Saved], keep: usize) {
+        for (l, (state, saved)) in self.states.iter_mut().zip(saved).enumerate() {
+            state.rewind(self.cfg.head_dim, saved, keep, self.cfg.ratio(l));
+        }
+    }
+
     /// Read up to `count` routed experts the RAM cache does not hold into it, from `*cursor` on (every layer's expert
     /// `e` before any layer's `e + 1`: a step uses each layer's alike), while the cache has room: a cold decode step
     /// waits for the drive for every expert it has not met (some 13 ms each from a 1.4 GB/s drive, and a step routes
@@ -398,42 +450,59 @@ impl Model {
     /// weight it returns replaces the one it was given (a [`Weight::Device`]), None leaves it here. The embedding stays
     /// (a prompt reads rows of it). How many were placed, and their bytes as stored.
     pub fn offload(&mut self, mut place: impl FnMut(&str, &Weight) -> Option<Weight>) -> (usize, u64) {
-        let (mut count, mut bytes) = (0usize, 0u64);
-        let mut each = |name: String, w: &mut Weight| {
-            // A stack's parts are placed one by one (an EXL3 checkpoint's `wo_a`, a slice a group), by their own names.
-            let parts: Vec<(String, &mut Weight)> = match w {
-                Weight::Stacked { parts, .. } => parts.iter_mut().enumerate().map(|(i, p)| (format!("{name}.slice.{i}"), p)).collect(),
-                w => vec![(name, w)],
-            };
-            for (name, w) in parts {
-                let size = match w {
-                    Weight::Fp8 { w, s, .. } => (w.len() + s.len()) as u64,
-                    Weight::Bf16 { w, .. } => w.len() as u64 * 2,
-                    Weight::F32 { w, .. } => w.len() as u64 * 4,
-                    Weight::Exl3 { data, .. } => data.words.len() as u64 * 4 + (data.suh.len() + data.svh.len()) as u64 * 2,
-                    Weight::Device { .. } | Weight::Stacked { .. } => continue,
-                };
-                if let Some(new) = place(&name, w) {
-                    *w = new;
-                    count += 1;
-                    bytes += size;
-                }
-            }
-        };
+        let mut named: Vec<(String, &mut Weight)> = Vec::new();
         for (l, layer) in self.layers.iter_mut().enumerate() {
             for (name, w) in layer.attn.weights_mut() {
-                each(format!("layers.{l}.attn.{name}"), w);
+                named.push((format!("layers.{l}.attn.{name}"), w));
             }
             for (name, w) in layer.moe.weights_mut() {
-                each(format!("layers.{l}.ffn.{name}"), w);
+                named.push((format!("layers.{l}.ffn.{name}"), w));
             }
             if let Some(e) = &mut layer.engram {
-                each(format!("layers.{l}.engram.wkv"), e.weight_mut());
+                named.push((format!("layers.{l}.engram.wkv"), e.weight_mut()));
             }
         }
-        each("head".into(), &mut self.head);
-        (count, bytes)
+        named.push(("head".into(), &mut self.head));
+        place_all(named, &mut place)
     }
+
+    /// The embedding (a drafter's rows are made of it too).
+    pub fn embed(&self) -> &Weight {
+        &self.embed
+    }
+
+    /// The output head (a drafter's logits are made by it too).
+    pub fn head(&self) -> &Weight {
+        &self.head
+    }
+}
+
+/// [`Model::offload`]'s placing of `named` weights: each given to `place` with its name, the weight it returns put in its
+/// place. A stack's parts are placed one by one (an EXL3 checkpoint's `wo_a`, a slice a group), by their own names. How
+/// many were placed, and their bytes as stored.
+pub(crate) fn place_all(named: Vec<(String, &mut Weight)>, place: &mut impl FnMut(&str, &Weight) -> Option<Weight>) -> (usize, u64) {
+    let (mut count, mut bytes) = (0usize, 0u64);
+    for (name, w) in named {
+        let parts: Vec<(String, &mut Weight)> = match w {
+            Weight::Stacked { parts, .. } => parts.iter_mut().enumerate().map(|(i, p)| (format!("{name}.slice.{i}"), p)).collect(),
+            w => vec![(name, w)],
+        };
+        for (name, w) in parts {
+            let size = match w {
+                Weight::Fp8 { w, s, .. } => (w.len() + s.len()) as u64,
+                Weight::Bf16 { w, .. } => w.len() as u64 * 2,
+                Weight::F32 { w, .. } => w.len() as u64 * 4,
+                Weight::Exl3 { data, .. } => data.words.len() as u64 * 4 + (data.suh.len() + data.svh.len()) as u64 * 2,
+                Weight::Device { .. } | Weight::Stacked { .. } => continue,
+            };
+            if let Some(new) = place(&name, w) {
+                *w = new;
+                count += 1;
+                bytes += size;
+            }
+        }
+    }
+    (count, bytes)
 }
 
 /// Index of the largest logit (greedy decoding).
