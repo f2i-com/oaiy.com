@@ -204,17 +204,36 @@ impl Attention {
             return Err(Error::Arg(format!("position {} past max_seq {}", start_pos + t, self.rope.max_pos())));
         }
 
-        // the queries' and the window's projections of x, together
-        let [qa, kva]: [Vec<f32>; 2] = crate::dsv41::linear::forward_together(&[
-            (&self.wq_a, x, t, 0..self.wq_a.n(), Out::Bf16),
-            (&self.wkv, x, t, 0..self.wkv.n(), Out::Bf16),
-        ])
-        .try_into()
-        .expect("two projections");
+        // Every projection of x the layer makes, together: the queries' and the window's, the compressor's (its keys,
+        // and their gate past a ratio of 1) and the indexer's weights. A decode step's were a round trip each, four of
+        // a compressing layer's that had an indexer.
+        let compress_len = if self.ratio > 0 { (start_pos + t) / self.ratio } else { 0 };
+        let compressor = self.compressor.as_ref().filter(|_| self.ratio > 0);
+        let indexer = self.indexer.as_ref().filter(|_| self.ratio > 0 && compress_len > 0);
+        let mut of_x: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = vec![(&self.wq_a, x, t, 0..self.wq_a.n(), Out::Bf16), (&self.wkv, x, t, 0..self.wkv.n(), Out::Bf16)];
+        if let Some(c) = compressor {
+            of_x.push((&c.wkv, x, t, 0..c.wkv.n(), if c.ratio == 1 { Out::Bf16 } else { Out::F32 }));
+            if let Some(g) = c.wgate.as_ref().filter(|_| c.ratio > 1) {
+                of_x.push((g, x, t, 0..g.n(), Out::F32));
+            }
+        }
+        if let Some(ix) = indexer {
+            of_x.push((&ix.weights_proj, x, t, 0..ix.weights_proj.n(), Out::Bf16));
+        }
+        let mut made = crate::dsv41::linear::forward_together(&of_x).into_iter();
+        let (qa, kva) = (made.next().expect("the queries' projection"), made.next().expect("the window's projection"));
+        let compressed = compressor.map(|c| (made.next().expect("the compressor's keys"), (c.ratio > 1).then(|| made.next().expect("the compressor's gate"))));
+        let index_weights = indexer.map(|_| made.next().expect("the indexer's weights"));
 
-        // queries
+        // queries (and the indexer's, of the same row, together)
         let qr = rmsnorm(&qa, &self.q_norm, cfg.norm_eps);
-        let mut q = self.wq_b.forward(&qr, t, Out::Bf16);
+        let mut of_qr: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = vec![(&self.wq_b, &qr, t, 0..self.wq_b.n(), Out::Bf16)];
+        if let Some(ix) = indexer {
+            of_qr.push((&ix.wq_b, &qr, t, 0..ix.wq_b.n(), Out::Bf16));
+        }
+        let mut made = crate::dsv41::linear::forward_together(&of_qr).into_iter();
+        let mut q = made.next().expect("the queries");
+        let index_q = indexer.map(|_| made.next().expect("the indexer's queries"));
         for i in 0..t {
             for h in 0..nh {
                 let base = (i * nh + h) * hd;
@@ -293,26 +312,27 @@ impl Attention {
         let mut kv_all = window_kv;
         if self.ratio > 0 {
             let ratio = self.ratio;
-            let compress_len = (start_pos + t) / ratio;
-            let latent = match &self.compressor {
-                Some(c) => {
+            let latent = match (compressor, compressed) {
+                (Some(c), Some((keys, gate))) => {
                     shared.compress_src = Some(self.layer);
                     let compressing = std::time::Instant::now();
-                    let latent = c.forward(cfg, x, t, start_pos, &mut states[self.layer]);
+                    let latent = c.forward(cfg, keys, gate, t, start_pos, &mut states[self.layer]);
                     crate::dsv41::profile::add(crate::dsv41::profile::Part::Compressor, compressing);
                     latent
                 }
-                None => None,
+                _ => None,
             };
             let comp_idxs = match &self.indexer {
                 Some(ix) => {
-                    let got = if compress_len == 0 {
-                        vec![Vec::new(); t]
-                    } else {
-                        let indexing = std::time::Instant::now();
-                        let got = self.indexer_forward(ix, cfg, x, &qr, latent.as_deref(), t, start_pos, offset, states, shared)?;
-                        crate::dsv41::profile::add(crate::dsv41::profile::Part::Indexer, indexing);
-                        got
+                    let got = match (index_q, index_weights) {
+                        (Some(q), Some(weights)) => {
+                            let indexing = std::time::Instant::now();
+                            let got = self.indexer_forward(ix, cfg, q, &weights, latent.as_deref(), t, start_pos, offset, states, shared)?;
+                            crate::dsv41::profile::add(crate::dsv41::profile::Part::Indexer, indexing);
+                            got
+                        }
+                        // (nothing compressed yet)
+                        _ => vec![Vec::new(); t],
                     };
                     shared.topk = got.clone();
                     got
@@ -416,12 +436,15 @@ impl Attention {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The indexer's choice of compressed positions for each token, from its queries (`wq_b` of the queries' row) and
+    /// its weights' projection of x (`weights_proj`, rounded to bf16), made with the layer's other projections.
+    #[allow(clippy::too_many_arguments)]
     fn indexer_forward(
         &self,
         ix: &Indexer,
         cfg: &Config,
-        x: &[f32],
-        qr: &[f32],
+        mut q: Vec<f32>,
+        weights: &[f32],
         latent: Option<&[f32]>,
         t: usize,
         start_pos: usize,
@@ -456,7 +479,6 @@ impl Attention {
             shared.index_k_src = Some(self.layer);
         }
 
-        let mut q = ix.wq_b.forward(qr, t, Out::Bf16);
         for i in 0..t {
             for h in 0..inh {
                 let row = &mut q[(i * inh + h) * ihd..(i * inh + h + 1) * ihd];
@@ -468,7 +490,7 @@ impl Attention {
         let n_t = end_pos / ratio;
         let keys = &states[src].index_k[..n_t * ihd];
         let wscale = (ihd as f32).powf(-0.5) * (inh as f32).powf(-0.5);
-        let weights: Vec<f32> = ix.weights_proj.forward(x, t, Out::Bf16).iter().map(|w| to_bf16(w * wscale)).collect();
+        let weights: Vec<f32> = weights.iter().map(|w| to_bf16(w * wscale)).collect();
 
         let scores = index_scores(&q, keys, &weights, inh, ihd);
         let role = if ix.is_candidate_source {
@@ -608,15 +630,16 @@ pub fn select_compressed(
 
 impl Compressor {
     /// The latent(s) completed by these tokens, pre-RoPE, or `None` while a
-    /// group is still filling up.
-    fn forward(&self, cfg: &Config, x: &[f32], t: usize, start_pos: usize, st: &mut AttnState) -> Option<Vec<f32>> {
+    /// group is still filling up, from its projections of x (made with the
+    /// layer's others): `kv` (`wkv`'s, bf16 at a ratio of 1, else f32) and,
+    /// past a ratio of 1, `score` (`wgate`'s, f32).
+    fn forward(&self, cfg: &Config, kv: Vec<f32>, score: Option<Vec<f32>>, t: usize, start_pos: usize, st: &mut AttnState) -> Option<Vec<f32>> {
         let hd = cfg.head_dim;
         if self.ratio == 1 {
-            return Some(rmsnorm(&self.wkv.forward(x, t, Out::Bf16), &self.norm, cfg.norm_eps));
+            return Some(rmsnorm(&kv, &self.norm, cfg.norm_eps));
         }
         let r = self.ratio;
-        let kv = self.wkv.forward(x, t, Out::F32);
-        let score = self.wgate.as_ref().expect("ratio > 1 has wgate").forward(x, t, Out::F32);
+        let score = score.expect("ratio > 1 has wgate");
         let pooled = if start_pos == 0 {
             let rem = t % r;
             let cutoff = t - rem;
