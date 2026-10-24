@@ -156,7 +156,9 @@ beats the capacity fraction.
 
 *(Measured since: ~29 tok/s warm with 192 GB, see Status. On speculation: with the
 hybrid path most of a token's cost is its own CPU-side experts, which a multi-token
-verify does not share, so DSpark would gain far less here than on a GPU-resident model.)*
+verify does not share, so DSpark would gain far less here than on a GPU-resident model.
+Since built for the EXL3 checkpoint, whose experts are all computed on the cards: 10-45%
+faster where they hold what is used, see "DSpark drafting".)*
 
 **Prefill** is the pain point. A chunk of ≥300 tokens touches ~99% of each layer's
 experts, and 50 tokens touch ~55%. So every chat turn re-reads most SSD-resident
@@ -808,6 +810,58 @@ Measured on two RTX 5090s (one on four PCIe lanes, one on eight), 100 GB of RAM 
 
 What is left is the trunk's projections: some 300 round trips a token, 85 ms of a step.
 Greedy answers match the FP8 checkpoint's on factual prompts word for word.
+
+## DSpark drafting (2026-10-24)
+
+The checkpoint's `mtp.0..2` are DSpark's block drafter, run as DeepInfer runs it
+(`DFlash`; `dsv41::dspark`):
+- **What it reads.** For every row the trunk reads, the mean of the four streams entering
+  layers 37-39, laid end to end, goes through `main_proj` and `main_norm`. Each drafter
+  layer keeps its keys of these rows in a 128-position window. An EXL3 `main_proj` sums in
+  f16, which the first rows' streams overflow (their values run to thousands), so each row
+  is first scaled by a power of two; the norm after makes the scale nothing.
+- **A draft.** One pass of five rows: the token the trunk chose, then four noise tokens, at
+  the positions after it. They go through the drafter's three blocks. Its attention is
+  window-only, and each row attends to the window and to every row of the block. Its
+  experts are 128 a layer, 3 a token. Each row then gets the trunk's head, plus a rank-256
+  correction by the token before it (the chosen token, then each row's draft). A
+  confidence, a sigmoid of the row's state and that token's embedding, says how likely the
+  trunk is to take each draft.
+- **A check.** One trunk pass of the token and the drafts it checks
+  (`Model::forward_rows`, every row's logits). The drafts stand up to the first one the
+  trunk chose otherwise; that choice is the next token. The caches are rewound past the
+  rows not kept (`Model::save`/`rewind`): their window slots are put back, and a
+  compressor's partial group is made again from its last rows (`AttnState::rewind`).
+- **How many drafts.** A pass checks as many as make the most tokens for the time. The
+  expected tokens are the product of the confidences up to each draft. The cost is a step
+  plus three fifths of one for each row past the first. This uses the drafter's
+  confidences alone, so a greedy reply is the same whenever it is asked. After passes in a
+  row that are unsure of every draft, drafting pauses for a few passes.
+- **Experts.** An EXL3 checkpoint's 384 drafter experts are held on the cards in slots of
+  their own (5 GB). A check of up to eight rows sends its experts a decode step's way: held
+  experts are begun first, and read ones are kept as a step's are.
+- **When it runs.** On for an EXL3 checkpoint. `OAIY_DSV41_DRAFT=0` turns it off, and `=1`
+  turns it on for an fp8 checkpoint too.
+
+A pass's rows are summed apart from a step's, so a drafted reply can differ from a
+step-by-step one where two tokens nearly tie (the same prompt gives the same reply either
+way).
+
+Measured on the EXL3 checkpoint, same build, same usage profile, 120-token replies,
+against plain decoding:
+
+| Reply | Plain | Drafted | Tokens per pass |
+|---|---|---|---|
+| A familiar subject | 6.2 tok/s | 7.15 tok/s | 1.8 |
+| The same again | 5.8 tok/s | 6.4 tok/s | 1.8 |
+| Code | 4.9 tok/s | 7.1 tok/s | 3.5 |
+| A new subject | 4.1 tok/s | 4.0 tok/s | 1.6 |
+
+- A draft costs about 25 ms.
+- A check costs 140-270 ms for one row. Each row more costs another 80-130 ms, mostly the
+  uploads of its experts that no card holds.
+- The fp8 checkpoint's checks send their experts to the CPU's workers. A two-row check
+  costs four steps there, so drafting halves its speed, and it is off.
 
 ## Phases
 
