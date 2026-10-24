@@ -182,6 +182,37 @@ fn several_projections_in_one_submit_are_each_the_cpus() {
     assert!(exl3_many(&[(&*lins[3], &x[..]), (&*cpu, &x[..])]).is_none(), "one on the CPU is not taken");
 }
 
+/// What a decode step's call of experts held in slots costs (`--ignored --nocapture`), at DeepSeek-V4.1's shape (5120 to
+/// 2304, 3 bits): three experts of one row in a call of their own, then sixteen such sets in one call (the GPU's share
+/// of a set, the call's own costs spread over them), and one expert alone.
+#[test]
+#[ignore = "a measurement"]
+fn measure_slots_decode_call() {
+    let Some(b) = backend() else { return };
+    let (hidden, ff, tw) = (5120, 2304, 48);
+    let (layout, records, _) = as_records(experts(4, hidden, ff, tw));
+    let slots = b.exl3_slots(4, hidden, ff, [tw, tw]).expect("room for four slots");
+    for s in 0..4 {
+        slots.put(s, &records.0[s], &layout);
+    }
+    let x: Vec<f32> = (0..hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+    let three: Vec<(usize, &[f32])> = (0..3).map(|s| (s, &x[..])).collect();
+    let time = |what: &str, f: &dyn Fn()| {
+        for _ in 0..5 {
+            f();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..50 {
+            f();
+        }
+        eprintln!("{what}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / 50.0);
+    };
+    time("3 experts of a row, a call", &|| drop(slots.forward(&three, 10.0)));
+    time("1 expert of a row, a call", &|| drop(slots.forward(&three[..1], 10.0)));
+    let parts: Vec<(&Exl3Slots, &[(usize, &[f32])])> = (0..16).map(|_| (&slots, &three[..])).collect();
+    time("16 sets of 3 in one call (/16 for a set)", &|| drop(Exl3Slots::forward_many(&parts, 10.0)));
+}
+
 /// Projections in one chained recording ([`exl3_chained`]: the transforms on the device), a step's row, a few rows and
 /// a prompt's (past the few-rows kernel: the tensor cores' blocks where the device has them), are each the CPU's
 /// projection of its rows; one over several buffers is not taken.
