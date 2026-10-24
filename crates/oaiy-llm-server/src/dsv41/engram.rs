@@ -232,28 +232,49 @@ impl Table {
         Ok(Table { readers, dim })
     }
 
-    /// Rows `uniq`, `[len][dim]`, split among the readers.
-    fn read(&self, uniq: &[i64]) -> Result<Vec<f32>> {
-        let mut got = vec![0.0f32; uniq.len() * self.dim];
-        if uniq.is_empty() {
-            return Ok(got);
-        }
+    /// Rows `uniq` asked of the readers, split among them: their values to come ([`Asked::rows`]).
+    fn ask(&self, uniq: &[i64]) -> Result<Asked> {
         let gone = || Error::Io(std::io::Error::other("engram reader thread exited"));
-        let per = uniq.len().div_ceil(READERS);
+        let per = uniq.len().div_ceil(READERS).max(1);
         let (tx, rx) = mpsc::channel();
         let mut parts = 0;
         for (part, (rows, reader)) in uniq.chunks(per).zip(&self.readers).enumerate() {
             reader.send(Job { rows: rows.to_vec(), part, reply: tx.clone() }).map_err(|_| gone())?;
             parts += 1;
         }
-        drop(tx);
-        for _ in 0..parts {
-            let (part, vals) = rx.recv().map_err(|_| gone())?;
+        Ok(Asked { rx, parts, per, len: uniq.len(), dim: self.dim })
+    }
+}
+
+/// Rows asked of a table's readers ([`Table::ask`]).
+struct Asked {
+    rx: mpsc::Receiver<(usize, Result<Vec<f32>>)>,
+    parts: usize,
+    per: usize,
+    len: usize,
+    dim: usize,
+}
+
+impl Asked {
+    /// The rows, `[len][dim]`, once every reader has read its share.
+    fn rows(self) -> Result<Vec<f32>> {
+        let mut got = vec![0.0f32; self.len * self.dim];
+        for _ in 0..self.parts {
+            let (part, vals) = self.rx.recv().map_err(|_| Error::Io(std::io::Error::other("engram reader thread exited")))?;
             let vals = vals?;
-            got[part * per * self.dim..][..vals.len()].copy_from_slice(&vals);
+            got[part * self.per * self.dim..][..vals.len()].copy_from_slice(&vals);
         }
         Ok(got)
     }
+}
+
+/// An Engram layer's rows for a pass, asked of its table before the pass reaches the layer ([`Engram::begin`]): a
+/// token's n-grams are known from its ids alone, and its rows (two small reads each, at random places in a 101 GB
+/// shard) then come while the layers before run, where asked at the layer each step waited for the drive.
+pub struct Begun {
+    hashes: Vec<i64>,
+    uniq: Vec<i64>,
+    asked: Asked,
 }
 
 pub struct Engram {
@@ -285,7 +306,28 @@ impl Engram {
 
     /// `h`: `[t, HC, dim]` (bf16 values); `hashes`: `[t][cols]` for this layer.
     pub fn forward(&self, cfg: &Config, h: &[f32], t: usize, hashes: &[i64]) -> Result<Vec<f32>> {
-        let emb = self.rows(hashes, cfg.engram_head_dim)?;
+        let begun = self.begin(hashes)?;
+        self.forward_begun(cfg, h, t, begun)
+    }
+
+    /// The rows for `hashes` (`[t][cols]` for this layer) asked of the table now, for [`Self::forward_begun`].
+    pub fn begin(&self, hashes: &[i64]) -> Result<Begun> {
+        let mut uniq = hashes.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let asked = self.table.ask(&uniq)?;
+        Ok(Begun { hashes: hashes.to_vec(), uniq, asked })
+    }
+
+    /// [`Self::forward`] of rows asked for already ([`Self::begin`]).
+    pub fn forward_begun(&self, cfg: &Config, h: &[f32], t: usize, begun: Begun) -> Result<Vec<f32>> {
+        let head_dim = cfg.engram_head_dim;
+        if head_dim != self.table.dim {
+            return Err(Error::Arg(format!("engram rows are {} wide, not {head_dim}", self.table.dim)));
+        }
+        let Begun { hashes, uniq, asked } = begun;
+        let got = asked.rows()?;
+        let emb = spread(&hashes, &uniq, &got, head_dim);
         let kv = self.wkv.forward(&emb, t, Out::Bf16);
         Ok(gate(h, &kv, &self.qk, cfg.dim, cfg.norm_eps))
     }
@@ -305,13 +347,8 @@ impl Engram {
         let mut uniq = hashes.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
-        let got = self.table.read(&uniq)?;
-        let mut emb = vec![0.0f32; hashes.len() * head_dim];
-        for (h, dst) in hashes.iter().zip(emb.chunks_exact_mut(head_dim)) {
-            let i = uniq.binary_search(h).expect("every hash has its row");
-            dst.copy_from_slice(&got[i * head_dim..(i + 1) * head_dim]);
-        }
-        Ok(emb)
+        let got = self.table.ask(&uniq)?.rows()?;
+        Ok(spread(hashes, &uniq, &got, head_dim))
     }
 
     pub fn wkv(&self) -> &Weight {
@@ -322,6 +359,16 @@ impl Engram {
     pub fn qk(&self) -> &[f32] {
         &self.qk
     }
+}
+
+/// Each hash's row of `got` (the rows of `uniq`, sorted, `[len][head_dim]`), `[hashes][head_dim]`.
+fn spread(hashes: &[i64], uniq: &[i64], got: &[f32], head_dim: usize) -> Vec<f32> {
+    let mut emb = vec![0.0f32; hashes.len() * head_dim];
+    for (h, dst) in hashes.iter().zip(emb.chunks_exact_mut(head_dim)) {
+        let i = uniq.binary_search(h).expect("every hash has its row");
+        dst.copy_from_slice(&got[i * head_dim..(i + 1) * head_dim]);
+    }
+    emb
 }
 
 /// The Engram gate: per token and residual copy, a signed-sqrt sigmoid of

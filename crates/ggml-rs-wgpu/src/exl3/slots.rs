@@ -1,4 +1,4 @@
-//! EXL3 experts in slots on a GPU, for a model that routes and combines its experts itself (DeepSeek-V4.1's EXL3
+﻿//! EXL3 experts in slots on a GPU, for a model that routes and combines its experts itself (DeepSeek-V4.1's EXL3
 //! checkpoints): each slot an expert's three projections, put in from its record as the file lays it out
 //! ([`RecordLayout`]) whenever the model wants it there, and a call's jobs (a slot and some rows each) run through the
 //! groups' kernels as [`Exl3MoeGrouped`]'s are: gate and up, the SwiGLU as the down projection reads it (clamped at the
@@ -23,6 +23,8 @@ pub struct Exl3Slots {
     /// A step's vectors (jobs of one row each, up to [`STEP_JOBS`]), made at its first call and kept with their bind
     /// groups for every call after; held by the call that uses them.
     step: Mutex<Option<StepScratch>>,
+    /// [`silu_table`]'s for the limit the calls give, on this card: the down projection's SwiGLU looks it up.
+    silu: Mutex<Option<(u32, DeviceVec)>>,
 }
 
 /// A call of sets of slots begun ([`Exl3Slots::begin_many`]): its recording submitted, each set's jobs' outputs to
@@ -37,6 +39,11 @@ pub struct SlotsBegun<'a> {
 }
 
 impl SlotsBegun<'_> {
+    /// Whether the call is done (its outputs there to read).
+    pub fn done(&self) -> bool {
+        self.launched.as_ref().is_none_or(|l| l.done())
+    }
+
     /// Each set's jobs' outputs (`[rows, hidden]` each, unweighted), once the call is done.
     pub fn finish(self) -> Vec<Vec<Vec<f32>>> {
         let SlotsBegun { launched, steps, subs, jobs } = self;
@@ -133,7 +140,7 @@ impl WgpuBackend {
         };
         let gu = group(2 * n, hidden, ff, tw[0]);
         let down = group(n, ff, hidden, tw[1]);
-        Some(Exl3Slots { b: self.clone(), gu, down, slots: n, hidden, ff, nbytes, mapped, step: Mutex::new(None) })
+        Some(Exl3Slots { b: self.clone(), gu, down, slots: n, hidden, ff, nbytes, mapped, step: Mutex::new(None), silu: Mutex::new(None) })
     }
 }
 
@@ -330,6 +337,19 @@ impl Exl3Slots {
         let subs = subs.into_iter().zip(recorded).map(|((i, mine, _), (_, rows))| (i, mine, rows, parts[i].0.hidden)).collect();
         SlotsBegun { launched, steps, subs, jobs }
     }
+    /// [`silu_table`]'s for `limit` on this card, uploaded when first asked for (again for another limit).
+    fn silu(&self, limit: f32) -> DeviceVec {
+        let mut held = self.silu.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, v)) = held.as_ref().filter(|(bits, _)| *bits == limit.to_bits()) {
+            return v.clone();
+        }
+        let table = silu_table(limit);
+        let v = self.b.vec(table.len());
+        DeviceChain::upload(&self.b, &v, &table);
+        *held = Some((limit.to_bits(), v.clone()));
+        v
+    }
+
     /// A step's kept vectors for these slots ([`StepScratch`]).
     fn step_scratch(&self) -> StepScratch {
         let (h, f, n) = (self.hidden, self.ff, STEP_JOBS);
@@ -361,6 +381,7 @@ impl Exl3Slots {
             }
         }
         let one = rows.iter().all(|&n| n == 1);
+        let silu = self.silu(limit);
         let b = &self.b;
         let up = |v: &DeviceVec, data: &[u32]| DeviceChain::upload(b, v, &data.iter().map(|&u| f32::from_bits(u)).collect::<Vec<_>>());
         let (sgu, sd) = if one { (self.gu.splits as usize, self.down.splits as usize) } else { (1, 1) };
@@ -383,8 +404,8 @@ impl Exl3Slots {
         up(&jgu, &jobs_gu);
         up(&jd, &jobs_d);
         if one {
-            group_pass(rec, &self.gu, &x, false, &jgu, 2 * pairs, Order::Jobs, &xh_gu, &part_gu, &out_gu, 0.0);
-            group_pass(rec, &self.down, &out_gu, true, &jd, pairs, Order::Jobs, &xh_d, &part_d, &out_d, limit);
+            group_pass(rec, &self.gu, &x, false, &jgu, 2 * pairs, Order::Jobs, &xh_gu, &part_gu, &out_gu, 0.0, None);
+            group_pass(rec, &self.down, &out_gu, true, &jd, pairs, Order::Jobs, &xh_d, &part_d, &out_d, limit, Some(&silu));
         } else {
             // a prompt's rows: each expert's in blocks, a tile decoded once a block
             let block = many_rows(rec.gpu());
@@ -392,8 +413,8 @@ impl Exl3Slots {
             let (ogv, odv) = (rec.scratch(ogu.len()), rec.scratch(od.len()));
             up(&ogv, &ogu);
             up(&odv, &od);
-            group_pass(rec, &self.gu, &x, false, &jgu, 2 * pairs, Order::Many(&ogv, ogu.len() / block, block), &xh_gu, &part_gu, &out_gu, 0.0);
-            group_pass(rec, &self.down, &out_gu, true, &jd, pairs, Order::Many(&odv, od.len() / block, block), &xh_d, &part_d, &out_d, limit);
+            group_pass(rec, &self.gu, &x, false, &jgu, 2 * pairs, Order::Many(&ogv, ogu.len() / block, block), &xh_gu, &part_gu, &out_gu, 0.0, None);
+            group_pass(rec, &self.down, &out_gu, true, &jd, pairs, Order::Many(&odv, od.len() / block, block), &xh_d, &part_d, &out_d, limit, Some(&silu));
         }
         Some((out_d, rows))
     }

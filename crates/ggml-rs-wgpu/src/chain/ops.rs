@@ -1205,6 +1205,7 @@ impl<'a> Recorder<'a> {
         };
         // (gone to the queue before its staging buffers are mapped: a submission may not copy into a mapped one)
         let index = self.gpu().gone(last);
+        crate::profile::add(&crate::profile::CHAIN_SUBMIT, submitted);
         // (the last read's mapping says when the reads are there)
         let mapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let count = self.reads.len();
@@ -1235,6 +1236,12 @@ impl<'a> Recorder<'a> {
 }
 
 impl Launched<'_> {
+    /// Whether its reads are there already (the device polled once).
+    pub(crate) fn done(&self) -> bool {
+        let _ = self.rec.gpu().device.poll(wgpu::PollType::Poll);
+        self.mapped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// [`ChainRecorder::finish`]'s second half: the reads waited for, each one's values.
     pub(crate) fn wait(self) -> Vec<Vec<f32>> {
         let Launched { mut rec, index, mapped, count, pieces, start, submitted } = self;

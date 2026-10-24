@@ -105,6 +105,63 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 }
 "#;
 
+/// [`G_PRE_SWIGLU`] with the gate's `silu` looked up (`silu`, binding 5: [`silu_table`]'s for the limit, which takes
+/// `min(g, limit)` itself) where the kernel made its own exponential: the host makes a step's expert from the same
+/// table ([`step_expert_host`]), so its output is the card's to the bit. The gate's output is an f16 value (its output
+/// transform rounds there), whose bits index the table.
+const G_PRE_SWIGLU_TABLE: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> suh: array<f32>;
+@group(0) @binding(2) var<storage, read> imap: array<u32>;
+@group(0) @binding(3) var<storage, read> jobs: array<u32>;
+@group(0) @binding(4) var<storage, read> up: array<f32>;
+@group(0) @binding(5) var<storage, read> silu: array<f32>;
+@group(0) @binding(6) var<storage, read_write> xh: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> sh: array<f32, 128>;
+
+// An f16 value's bits (`v` is one), as the host's `half` gives them.
+fn f16_bits(v: f32) -> u32 {
+    let b = bitcast<u32>(v);
+    let sign = (b >> 16u) & 0x8000u;
+    let a = b & 0x7fffffffu;
+    if (a >= 0x7f800000u) { return sign | 0x7c00u | select(0u, 0x200u, a > 0x7f800000u); }
+    if (a >= 0x38800000u) { return sign | (((a >> 23u) - 112u) << 10u) | ((a >> 13u) & 0x3ffu); }
+    // below f16's normals: a multiple of 2^-24
+    return sign | u32(bitcast<f32>(a) * 16777216.0);
+}
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let k = p[0].x;
+    let j = wg.y;
+    let m = jobs[2u * j];
+    let xr = jobs[2u * j + 1u];
+    let i = wg.x * 128u + t;
+    var src = i;
+    if (p[0].y == 0u) { src = imap[m * k + i]; }
+    let g = x[(p[0].z * xr + p[0].w) * k + src];
+    var u = up[(p[1].x * xr + p[1].y) * k + src];
+    let lim = bitcast<f32>(p[1].z);
+    if (lim > 0.0) {
+        u = clamp(u, -lim, lim);
+    }
+    sh[t] = half(silu[f16_bits(g)] * u) * suh[m * k + i];
+    workgroupBarrier();
+    for (var s = 1u; s < 128u; s *= 2u) {
+        if ((t & s) == 0u) {
+            let a = sh[t];
+            let b = sh[t + s];
+            sh[t] = a + b;
+            sh[t + s] = a - b;
+        }
+        workgroupBarrier();
+    }
+    xh[j * k + i] = half(sh[t] * bitcast<f32>(0x3db504f4u));
+}
+"#;
+
 /// The matmul of each job's transformed row (the host's one-row kernel's, [`one_source`]; the matrices a group's:
 /// matrix `m`'s words from `m * p[1].x`): a workgroup a (tile column, job and split), its partial sums to `part[(j *
 /// splits + s) * n..]`, the jobs from `p[1].y` (a pass of a long list: 65535 workgroups an axis). `p[0]`: n, k, tile
@@ -816,10 +873,11 @@ pub(crate) fn one_row_kernel(tile_words: usize) -> (&'static str, &'static str) 
 /// The chain's kernels as WGSL: the input transform (of a SwiGLU's output, "pre-swiglu"), the matmul (a row a job; a
 /// prompt's is [`g_many`]), the output transform and its map; each made once.
 pub(crate) fn chain_shader(which: &str) -> &'static str {
-    static SOURCES: [std::sync::OnceLock<String>; 5] = [const { std::sync::OnceLock::new() }; 5];
+    static SOURCES: [std::sync::OnceLock<String>; 6] = [const { std::sync::OnceLock::new() }; 6];
     let (at, make): (usize, fn() -> String) = match which {
         "pre" => (0, || format!("{HALF}{G_PRE}")),
         "pre-swiglu" => (1, || format!("{HALF}{G_PRE_SWIGLU}")),
+        "pre-swiglu-table" => (5, || format!("{HALF}{G_PRE_SWIGLU_TABLE}")),
         "mm" => (2, g_mm_source),
         "post" => (3, || format!("{HALF}{G_POST}")),
         _ => (4, || G_GATHER.to_string()),

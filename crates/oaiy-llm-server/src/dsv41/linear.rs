@@ -1,4 +1,4 @@
-//! Dense weights and the reference `linear()`.
+﻿//! Dense weights and the reference `linear()`.
 //!
 //! Three storage kinds occur in the trunk:
 //! - **fp8** e4m3 `[n, k]` with one e8m0 scale per 32x32 tile (attention
@@ -95,6 +95,56 @@ pub trait DenseKernel: Send + Sync + std::any::Any {
         let _ = (first, normed, weight, eps, then);
         None
     }
+
+    /// A program of steps ([`Step`]) in one call of this kernel's kind (a GPU's: one recording, one read back), its
+    /// matrices all of that kind: the vectors `reads` names (`(step, first value, values)`), in order. None where it
+    /// cannot (another kind among them), and the caller makes the steps as before.
+    fn run_program(&self, steps: &[Step<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+        let _ = (steps, reads);
+        None
+    }
+}
+
+/// A step of a device program ([`run_program`]): each makes a vector (its number the step's own) or writes one. A
+/// decode step's sublayers, their hyper-connections' mixing and their norms in one call where each was a round trip
+/// of the host's work.
+pub enum Step<'a> {
+    /// The host's values.
+    Input(&'a [f32]),
+    /// A vector of this many values, written by the steps after.
+    Scratch(usize),
+    /// `w`'s sums of `rows` rows of vector `x` (a device's weight, one part of a stack), `[rows, w.n()]`, in f32.
+    Mul { w: &'a Weight, x: usize, rows: usize },
+    /// A stack's parts together (`group`, its [`Weight::Stacked`]'s), each job (`(part, row of x)`) in one pass: each
+    /// job's sums, `[jobs, part's n]`, each part's own projection's to the bit.
+    MulGroup { group: &'a Weight, x: usize, jobs: &'a [(u32, u32)] },
+    /// `width` columns from `src_at` of `rows` rows of `src` (rows `src_stride` apart), each rounded to bf16, into `dst`
+    /// from `dst_at` (rows `dst_stride` apart).
+    CopyColsBf16 { src: usize, src_stride: usize, src_at: usize, dst: usize, dst_stride: usize, dst_at: usize, width: usize, rows: usize },
+    /// [`crate::dsv41::ops::rmsnorm`] of `rows` rows of `x` (`width` each) by `weight`, to the bit.
+    Norm { x: usize, weight: &'a [f32], eps: f32, rows: usize, width: usize },
+    /// [`crate::dsv41::hc::post`] of `out` (`[d]`) into the residual's copies `res` by `mix` ([`crate::dsv41::hc::Mix`]
+    /// laid out by [`crate::dsv41::hc::Mix::flat`]), within roundings of the host's.
+    HcPost { out: usize, res: usize, mix: usize, d: usize },
+    /// [`crate::dsv41::hc::pre`] of the copies `h` by `mix`'s pre, within roundings of the host's.
+    HcPre { h: usize, mix: usize, d: usize },
+    /// A gated unit's activation of its projections `gate` and `up` (`len` each, rounded to bf16 first): the host's
+    /// `bf16(silu(min(g, limit)) * clamp(u, ±limit))` to the bit, `silu` its silu of every bf16 gate by the gate's bits
+    /// ([`crate::dsv41::moe::silu_bf16_table`]).
+    SwigluBf16 { gate: usize, up: usize, len: usize, silu: &'a [f32], limit: f32 },
+}
+
+/// `steps` as one call where a device holds every matrix they multiply and takes them together
+/// ([`DenseKernel::run_program`]): the vectors `reads` names. None where it does not.
+pub fn run_program(steps: &[Step<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+    let first = steps.iter().find_map(|s| match s {
+        Step::Mul { w: Weight::Device { kernel, .. }, .. } | Step::MulGroup { group: Weight::Device { kernel, .. }, .. } => Some(Arc::clone(kernel)),
+        _ => None,
+    })?;
+    let start = std::time::Instant::now();
+    let made = first.run_program(steps, reads)?;
+    crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);
+    Some(made)
 }
 
 /// `first`'s [`Weight::forward_rows`] of their rows (`(weight, x, t, rows, out)`, as [`forward_together`] takes them),
@@ -314,8 +364,10 @@ pub enum Weight {
     /// projection a GPU takes ([`crate::dsv41::model::Model::offload`]) never needs one. It has no host rows.
     Exl3 { data: Arc<Exl3Data>, host: std::sync::OnceLock<Arc<dyn PackedLinear>>, n: usize, k: usize },
     /// Projections stacked by output rows, `rows` each (`wo_a`'s groups, which an EXL3 checkpoint stores a slice each):
-    /// row `r` is part `r / rows`'s row `r % rows`. Each part takes the same `k` inputs.
-    Stacked { parts: Vec<Weight>, rows: usize, k: usize },
+    /// row `r` is part `r / rows`'s row `r % rows`. Each part takes the same `k` inputs. `group`: the parts together on a
+    /// device as well (a [`Weight::Device`]), where it takes them so: a step's row through every part in one pass
+    /// ([`Step::MulGroup`]), where each part's was a pass of its own.
+    Stacked { parts: Vec<Weight>, rows: usize, k: usize, group: Option<Box<Weight>> },
 }
 
 /// A copy of `d` (the type has no `Clone`): the host's decoder takes its own, as a GPU's upload does.
@@ -338,7 +390,7 @@ fn exl3_host(_: &Exl3Data) -> Arc<dyn PackedLinear> {
 /// The multiplier mul1's codebook stores beside each EXL3 projection (`{prefix}.mul1`): the only codebook decoded here.
 const MUL1: i64 = 0x83dc_d12d_u32 as i32 as i64;
 
-/// `{prefix}`'s EXL3 projection (`trellis` `[k/16, n/16, 16·bits]` i16, `suh` `[k]`, `svh` `[n]`, `mul1`), checked.
+/// `{prefix}`'s EXL3 projection (`trellis` `[k/16, n/16, 16Â·bits]` i16, `suh` `[k]`, `svh` `[n]`, `mul1`), checked.
 fn load_exl3(idx: &StIndex, prefix: &str) -> Result<Weight> {
     if cfg!(not(feature = "webgpu")) {
         return Err(Error::Unsupported(format!("{prefix}: an EXL3 checkpoint needs the WebGPU build of the server")));
@@ -437,7 +489,7 @@ impl Weight {
             if parts.iter().any(|p| p.n() != rows || p.k() != k) {
                 return Err(Error::Format(format!("{prefix}: its slices are not all [{rows}, {k}]")));
             }
-            return Ok(Weight::Stacked { parts, rows, k });
+            return Ok(Weight::Stacked { parts, rows, k, group: None });
         }
         Self::load_fp8_as_bf16(idx, prefix)
     }
@@ -505,7 +557,7 @@ impl Weight {
     }
 
     /// [`forward`](Self::forward) restricted to output rows `rows`, giving
-    /// `[t, rows.len()]` — one group of a block-diagonal projection (`wo_a`).
+    /// `[t, rows.len()]` â€” one group of a block-diagonal projection (`wo_a`).
     pub fn forward_rows(&self, x: &[f32], t: usize, rows: std::ops::Range<usize>, out: Out) -> Vec<f32> {
         let k = self.k();
         assert_eq!(x.len(), t * k, "linear: input is not [t, k]");

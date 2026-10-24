@@ -67,6 +67,13 @@ struct Counts {
     scratch: AtomicU64,
     taken: AtomicU64,
     kept: AtomicU64,
+    /// Experts a step made on the host where the cards did not hold them ([`ExpertsKernel::forward_here`]).
+    host: AtomicU64,
+    /// Of `held`, those on a card past the first (the trunk's).
+    held_past_first: AtomicU64,
+    /// Each card's held-experts calls (the first two cards), as the host found them once it had made the rest of the
+    /// layer's experts: the time it then waited for their outputs (ns), how many calls, and how many it found running.
+    held_wait: [[AtomicU64; 3]; 2],
 }
 
 pub(crate) struct WgpuExl3Experts {
@@ -88,7 +95,24 @@ pub(crate) struct WgpuExl3Experts {
     /// Experts let go of to keep others since the caller last asked ([`ExpertsKernel::evicted`]): RAM let them go when
     /// they came here, so it reads them back.
     evicted: Mutex<Vec<(u32, u32)>>,
+    /// Where a step's experts made on the host go to be kept ([`ExpertsKernel::consider`]): a thread of its own
+    /// ([`WgpuExl3Experts::start_promoter`]), so a record's upload is off the steps' path.
+    promoter: Mutex<Option<std::sync::mpsc::Sender<Promotion>>>,
+    /// Promotions handed over and not yet made: past [`PROMOTIONS_PENDING`], more are not handed over.
+    pending: std::sync::atomic::AtomicUsize,
+    /// Experts the promoter kept since the caller last asked ([`ExpertsKernel::taken`]): RAM lets them go.
+    promoted: Mutex<Vec<(u32, u32)>>,
 }
+
+/// What the promoter is handed: a step's expert made on the host, `(layer, expert, record)`.
+type Promotion = (u32, u32, Arc<Vec<u8>>);
+
+/// Promotions queued at most: a reply on a new subject misses more than a card takes in, and those past this wait
+/// for their next use.
+const PROMOTIONS_PENDING: usize = 16;
+
+/// Threads the promoter writes a record into a card's memory on (its own: the host's cores are the steps' experts').
+const PROMOTE_THREADS: usize = 4;
 
 fn record_layout(l: &[Exl3Proj; 3], bytes: usize) -> RecordLayout {
     let at = |p: &Exl3Proj| ProjAt { suh: p.suh, svh: p.svh, mul1: p.mul1, trellis: p.trellis, k: p.k, n: p.n, tile_words: p.tile_words };
@@ -176,7 +200,13 @@ impl WgpuExl3Experts {
         let placed = RwLock::new(Placement { at: HashMap::new(), keys, free });
         let uses = (0..layers.len() * per_layer).map(|_| AtomicU32::new(0)).collect();
         let rates = cards.iter().map(|_| AtomicU64::new(RATE_GUESS.to_bits())).collect();
-        Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, cursor: Mutex::new(0), counts: Counts::default(), kept: Mutex::new(Vec::new()), evicted: Mutex::new(Vec::new()) })
+        Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, cursor: Mutex::new(0), counts: Counts::default(),
+            kept: Mutex::new(Vec::new()),
+            evicted: Mutex::new(Vec::new()),
+            promoter: Mutex::new(None),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            promoted: Mutex::new(Vec::new()),
+        })
     }
 
     /// Start every expert's uses from `counts` (a usage profile's, the model's own counts as an earlier run left
@@ -200,11 +230,28 @@ impl WgpuExl3Experts {
         (total, self.placement().at.len())
     }
 
-    /// Since the model loaded: experts computed from their slots, experts put through the scratch slots, records taken
-    /// into a free slot (from RAM or the drive), experts kept from a scratch slot.
+    /// Since the model loaded: experts computed from their slots, experts the cards did not hold (put through the
+    /// scratch slots, or made on the host), records taken into a free slot (from RAM or the drive), experts kept from
+    /// a scratch slot.
     pub(crate) fn counts(&self) -> (u64, u64, u64, u64) {
         let c = &self.counts;
-        (c.held.load(Ordering::Relaxed), c.scratch.load(Ordering::Relaxed), c.taken.load(Ordering::Relaxed), c.kept.load(Ordering::Relaxed))
+        let missed = c.scratch.load(Ordering::Relaxed) + c.host.load(Ordering::Relaxed);
+        (c.held.load(Ordering::Relaxed), missed, c.taken.load(Ordering::Relaxed), c.kept.load(Ordering::Relaxed))
+    }
+
+    /// Of the experts computed from their slots since the model loaded, those on a card past the first.
+    pub(crate) fn held_past_first(&self) -> u64 {
+        self.counts.held_past_first.load(Ordering::Relaxed)
+    }
+
+    /// The first two cards' held-experts calls since the last ask, as the host found them once it had made the rest of
+    /// a layer's experts: the mean time it then waited for each card's (us), how many calls, and how many still
+    /// running; reset.
+    pub(crate) fn take_held_waits(&self) -> [(f64, u64, u64); 2] {
+        self.counts.held_wait.each_ref().map(|[ns, n, late]| {
+            let (ns, n, late) = (ns.swap(0, Ordering::Relaxed), n.swap(0, Ordering::Relaxed), late.swap(0, Ordering::Relaxed));
+            (ns as f64 / 1e3 / n.max(1) as f64, n, late)
+        })
     }
 
     /// The bitrate of `layer`'s experts.
@@ -296,6 +343,64 @@ impl WgpuExl3Experts {
     /// Whether a free slot is left for `layer`'s bitrate.
     pub(crate) fn has_room(&self, layer: u32) -> bool {
         self.free_slot(&self.placement(), layer, None).is_some()
+    }
+
+    /// Start the thread that keeps on the cards what steps made on the host and use enough ([`ExpertsKernel::
+    /// consider`]): it holds these weakly, and ends when they are dropped (its channel closed with them).
+    pub(crate) fn start_promoter(self: &Arc<Self>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Promotion>();
+        let me = Arc::downgrade(self);
+        let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(PROMOTE_THREADS).thread_name(|i| format!("oaiy-expert-promote-{i}")).build() else { return };
+        let started = std::thread::Builder::new().name("oaiy-expert-promote".into()).spawn(move || {
+            while let Ok((layer, e, record)) = rx.recv() {
+                let Some(k) = me.upgrade() else { break };
+                pool.install(|| k.promote(layer, e, &record));
+                k.pending.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+        if started.is_ok() {
+            *self.promoter.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+        }
+    }
+
+    /// Keep `layer`'s `expert` (`record`, a step made it on the host) on the card it does the most good on: one with a
+    /// free slot of its bitrate, else the one whose least used of another layer's experts is used least, where that
+    /// is used less than this and this [`KEEP_USES`] times or more. Its record written into that card's scratch slot
+    /// and copied from there by the card ([`Self::keep`]), as a step's scratch slots' experts are kept.
+    fn promote(&self, layer: u32, expert: u32, record: &[u8]) {
+        let (uses, tw) = (self.uses_of(layer, expert), self.tw(layer));
+        let card = {
+            let placed = self.placement();
+            if placed.at.contains_key(&(layer, expert)) {
+                return;
+            }
+            match self.free_slot(&placed, layer, None) {
+                Some((p, _)) => self.pools[p].card,
+                None if uses < KEEP_USES => return,
+                None => {
+                    let mut least: Option<(usize, u32)> = None;
+                    for p in (0..self.pools.len()).filter(|&p| !self.pools[p].scratch && self.pools[p].tw == tw) {
+                        for &(l, e) in placed.keys[p].iter().flatten() {
+                            let n = self.uses_of(l, e);
+                            if l != layer && least.is_none_or(|(_, m)| n < m) {
+                                least = Some((self.pools[p].card, n));
+                            }
+                        }
+                    }
+                    match least {
+                        Some((card, n)) if n < uses => card,
+                        _ => return,
+                    }
+                }
+            }
+        };
+        let Some(q) = (0..self.pools.len()).find(|&q| self.pools[q].scratch && self.pools[q].card == card && self.pools[q].tw == tw) else { return };
+        let _one = self.pools[q].busy.lock().unwrap_or_else(|e| e.into_inner());
+        self.pools[q].slots.put_many(0, &[record], &self.layouts[layer as usize]);
+        self.keep(layer, expert, (q, 0));
+        if self.elsewhere(layer, expert) {
+            self.promoted.lock().unwrap_or_else(|p| p.into_inner()).push((layer, expert));
+        }
     }
 
     /// Whether the cards hold `layer`'s `expert`: the idle reading's question, which leaves those out of RAM (an expert
@@ -459,10 +564,11 @@ impl ExpertsKernel for WgpuExl3Experts {
     fn begin_held<'a>(&'a self, layer: u32, jobs: &[(u32, &[f32], &[f32])], swiglu_limit: f32) -> Box<dyn FnOnce() -> Vec<Vec<f32>> + 'a> {
         let beginning = std::time::Instant::now();
         self.counts.held.fetch_add(jobs.len() as u64, Ordering::Relaxed);
-        let places: Vec<(usize, usize)> = {
-            let placed = self.placement();
-            jobs.iter().map(|(e, ..)| *placed.at.get(&(layer, *e)).expect("a held expert")).collect()
-        };
+        // (the placement held until the cards' calls are submitted: a slot the promoter gives another expert is copied
+        // into in the queue's order, so a call submitted before the copy reads the expert it found there)
+        let placed = self.placement();
+        let places: Vec<(usize, usize)> = jobs.iter().map(|(e, ..)| *placed.at.get(&(layer, *e)).expect("a held expert")).collect();
+        self.counts.held_past_first.fetch_add(places.iter().filter(|(p, _)| self.pools[*p].card > 0).count() as u64, Ordering::Relaxed);
         // each card's jobs, by pool: (card, [(pool, [job])])
         let mut by_card: Vec<(usize, Vec<(usize, Vec<usize>)>)> = Vec::new();
         for (i, &(p, _)) in places.iter().enumerate() {
@@ -477,22 +583,32 @@ impl ExpertsKernel for WgpuExl3Experts {
                 None => pools.push((p, vec![i])),
             }
         }
-        let begun: Vec<(Vec<Vec<usize>>, ggml_rs_wgpu::exl3::SlotsBegun<'a>)> = by_card
+        let begun: Vec<(usize, Vec<Vec<usize>>, ggml_rs_wgpu::exl3::SlotsBegun<'a>)> = by_card
             .into_iter()
-            .map(|(_, pools)| {
+            .map(|(card, pools)| {
                 let these: Vec<Vec<(usize, &[f32])>> = pools.iter().map(|(_, list)| list.iter().map(|&i| (places[i].1, jobs[i].1)).collect()).collect();
                 let parts: Vec<(&'a Exl3Slots, &[(usize, &[f32])])> = pools.iter().zip(&these).map(|((p, _), t)| (&self.pools[*p].slots, &t[..])).collect();
                 let call = Exl3Slots::begin_many(&parts, swiglu_limit);
-                (pools.into_iter().map(|(_, list)| list).collect(), call)
+                (card, pools.into_iter().map(|(_, list)| list).collect(), call)
             })
             .collect();
+        drop(placed);
         let weights: Vec<Vec<f32>> = jobs.iter().map(|j| j.2.to_vec()).collect();
         let begun_in = beginning.elapsed();
         Box::new(move || {
             let finishing = std::time::Instant::now();
             let mut out: Vec<Vec<f32>> = vec![Vec::new(); weights.len()];
-            for (lists, call) in begun {
-                for (list, ys) in lists.into_iter().zip(call.finish()) {
+            // (which cards the host waits for, now that it has made the rest: each found running, and the wait from
+            // here to its outputs)
+            let running: Vec<bool> = begun.iter().map(|(_, _, call)| !call.done()).collect();
+            for ((card, lists, call), late) in begun.into_iter().zip(running) {
+                let ys = call.finish();
+                if let Some([ns, n, l]) = self.counts.held_wait.get(card) {
+                    ns.fetch_add(finishing.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    n.fetch_add(1, Ordering::Relaxed);
+                    l.fetch_add(late as u64, Ordering::Relaxed);
+                }
+                for (list, ys) in lists.into_iter().zip(ys) {
                     for (i, y) in list.into_iter().zip(ys) {
                         out[i] = weighed(y, &weights[i]);
                     }
@@ -527,6 +643,46 @@ impl ExpertsKernel for WgpuExl3Experts {
 
     fn evicted(&self) -> Vec<(u32, u32)> {
         std::mem::take(&mut *self.evicted.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// On the host's cores where it has the vectors to make them there quickly (`ggml_rs_wgpu::exl3::step_host_fast`:
+    /// some half a millisecond an expert, where a card took a record in at one to two and a half), as the cards'
+    /// slots make them to the bit (`step_experts_host`), so a reply is the same whichever tier held what.
+    fn forward_here(&self, layer: u32, jobs: &[ExpertJob<'_>], swiglu_limit: f32) -> Option<Vec<Vec<f32>>> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // (OAIY_DSV41_HOST_EXPERTS=0: through the cards' scratch slots, as before)
+        if *OFF.get_or_init(|| std::env::var("OAIY_DSV41_HOST_EXPERTS").as_deref() == Ok("0")) || !ggml_rs_wgpu::exl3::step_host_fast() {
+            return None;
+        }
+        let layout = &self.layouts[layer as usize];
+        let d = crate::dsv41::expert::DIM;
+        if jobs.iter().any(|j| j.x.len() != d || j.weights.len() != 1) {
+            return None;
+        }
+        self.counts.host.fetch_add(jobs.len() as u64, Ordering::Relaxed);
+        let these: Vec<(&[u8], &[f32])> = jobs.iter().map(|j| (j.record, j.x)).collect();
+        let made = ggml_rs_wgpu::exl3::step_experts_host(&these, layout, swiglu_limit, true);
+        Some(made.into_iter().zip(jobs).map(|(y, j)| weighed(y, j.weights)).collect())
+    }
+
+    fn consider(&self, layer: u32, records: &[(u32, Arc<Vec<u8>>)]) {
+        let Some(tx) = self.promoter.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return };
+        for (e, record) in records {
+            if self.pending.load(Ordering::Relaxed) >= PROMOTIONS_PENDING {
+                break;
+            }
+            if self.elsewhere(layer, *e) || (self.uses_of(layer, *e) < KEEP_USES && !self.has_room(layer)) {
+                continue;
+            }
+            self.pending.fetch_add(1, Ordering::Relaxed);
+            if tx.send((layer, *e, Arc::clone(record))).is_err() {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn taken(&self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut *self.promoted.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     fn keeps(&self, layer: u32, expert: u32) -> bool {

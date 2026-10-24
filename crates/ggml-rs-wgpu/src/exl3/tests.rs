@@ -239,6 +239,240 @@ fn measure_slots_decode_call() {
     time("6 experts in 3 pools, a call", &|| drop(Exl3Slots::forward_many(&parts, 10.0)));
 }
 
+/// A decode step's expert made on the host ([`step_expert_host`], and several at once on its cores:
+/// [`step_experts_host`]) is a card's ([`Exl3Slots`]' job of one row) to the bit, at DeepSeek-V4.1's shape (5120 to
+/// 2304) at 3 bits a weight and at 2, on small inputs and large: the transforms, the one-row kernel's sums in its order
+/// (each lane's products added by multiply-adds, as the card's compiler makes them), and the SwiGLU from the table both
+/// read. (It says how many values the sums added by a multiply and an add would differ in.)
+#[test]
+fn a_steps_expert_on_the_host_is_the_cards_to_the_bit() {
+    let Some(b) = backend() else { return };
+    let (hidden, ff, limit) = (5120, 2304, 10.0);
+    let table = silu_table(limit);
+    for tw in [48, 32] {
+        let (layout, records, _) = as_records(experts(2, hidden, ff, tw));
+        let slots = b.exl3_slots(2, hidden, ff, [tw, tw]).expect("room for two slots");
+        slots.put_many(0, &[&records.0[0][..], &records.0[1][..]], &layout);
+        let (mut fused_off, mut plain_off) = (0, 0);
+        for (n, scale) in [0.05f32, 3.0, 0.4, 1.0, 7.0, 0.2, 2.0, 0.7].into_iter().enumerate() {
+            let i = n % 2;
+            let mut s = 0x9e37_79b9u32 ^ (n as u32 * 7919);
+            let x: Vec<f32> = (0..hidden)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    ((s % 20_001) as f32 / 10_000.0 - 1.0) * scale
+                })
+                .collect();
+            let card = slots.forward(&[(i, &x[..])], limit).pop().unwrap();
+            let differ = |v: &[f32]| v.iter().zip(&card).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let fused = step_expert_host(&records.0[i], &layout, &x, limit, &table, true);
+            let plain = step_expert_host(&records.0[i], &layout, &x, limit, &table, false);
+            fused_off += differ(&fused);
+            plain_off += differ(&plain);
+            assert_eq!(differ(&fused), 0, "tw={tw} scale={scale}: the host's step is the card's");
+            if n < 2 {
+                let both = step_experts_host(&[(&records.0[i][..], &x[..]), (&records.0[1 - i][..], &x[..])], &layout, limit, true);
+                assert_eq!(differ(&both[0]), 0, "tw={tw} scale={scale}: on the host's cores, beside another");
+            }
+        }
+        eprintln!("tw={tw}: of 8 inputs' 5120 values, the host's with multiply-adds differs in {fused_off}, with a multiply and an add in {plain_off}");
+    }
+}
+
+/// A group of projections of one shape ([`WgpuBackend::exl3_group`], DeepSeek-V4.1's `wo_a` slices) in a program, each
+/// part on its own row of the input, gives each part's own projection's sums to the bit (as a chained recording makes
+/// them alone), at 3 bits a weight and at 2.
+#[test]
+fn a_groups_parts_in_a_program_are_each_parts_own_projection() {
+    let Some(b) = backend() else { return };
+    let (k, n, parts) = (512usize, 256usize, 4usize);
+    for tw in [48, 32] {
+        let datas: Vec<Exl3Data> = (0..parts).map(|p| random_exl3(k, n, tw, 500 + tw as u32 + p as u32)).collect();
+        let group = b.exl3_group(&datas.iter().collect::<Vec<_>>()).expect("a group");
+        let alone: Vec<Arc<dyn PackedLinear>> = datas.iter().map(|d| b.exl3_with(Exl3Data { words: d.words.clone(), suh: d.suh.clone(), svh: d.svh.clone(), tile_words: d.tile_words, input_map: d.input_map.clone(), output_map: d.output_map.clone() }, None).unwrap()).collect();
+        let x: Vec<f32> = (0..parts * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+        let jobs: Vec<(u32, u32)> = (0..parts as u32).map(|p| (p, p)).collect();
+        let got = run_program(&b, &[ProgramStep::Input(&x), ProgramStep::MulGroup { g: &group, x: 0, jobs: &jobs }], &[(1, 0, parts * n)]).expect("the program runs").pop().unwrap();
+        for p in 0..parts {
+            let want = chained(&b, &[(ChainMat::Exl3(&*alone[p]), &x[p * k..(p + 1) * k])]).expect("alone").pop().unwrap();
+            assert!(got[p * n..(p + 1) * n].iter().zip(&want).all(|(a, e)| a.to_bits() == e.to_bits()), "tw={tw}: part {p} in the group is its own projection");
+        }
+    }
+}
+
+/// A program's hyper-connection steps ([`run_program`]) are their definitions within a rounding: the post (copy `j`
+/// of `bf16(post[j] out + sum_i comb[i][j] res[i])`, `comb[i][j]` at `8 + 4 i + j` of the mix), the pre
+/// (`bf16(sum_i pre[i] h[i])`), and the host's norm of that to the bit; an f32 matrix's sums of the stream beside
+/// them; on random values of the model's width. (The card may fuse a product into a sum, so a value is the
+/// definition's or one bf16 step from it.)
+#[test]
+fn a_programs_hyper_connection_steps_are_their_definitions() {
+    let Some(b) = backend() else { return };
+    let d = 5120;
+    let mut s = 0x9e37_79b9u32;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        (s % 20_001) as f32 / 10_000.0 - 1.0
+    };
+    let bf = |v: f32| f32::from_bits((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) & 0xffff_0000);
+    let out: Vec<f32> = (0..d).map(|_| bf(next() * 3.0)).collect();
+    let h: Vec<f32> = (0..4 * d).map(|_| bf(next() * 2.0)).collect();
+    let mix: Vec<f32> = (0..24).map(|i| if i < 8 { next().abs() + 0.2 } else { next().abs() / 4.0 }).collect();
+    let norm: Vec<f32> = (0..d).map(|i| 0.5 + (i % 9) as f32 / 8.0).collect();
+    let fnw: Vec<f32> = (0..24 * 4 * d).map(|_| next() * 0.01).collect();
+    let fnv = b.vec(fnw.len());
+    DeviceChain::upload(&b, &fnv, &fnw);
+    let steps = [
+        ProgramStep::Input(&out),
+        ProgramStep::Input(&h),
+        ProgramStep::Input(&mix),
+        ProgramStep::HcPost { out: 0, res: 1, mix: 2, d },
+        ProgramStep::HcPre { h: 3, mix: 2, d },
+        ProgramStep::Norm { x: 4, weight: &norm, eps: 1e-20, rows: 1, width: d },
+        ProgramStep::Mul { m: ChainMat::F32 { w: &fnv, n: 24, k: 4 * d }, x: 3, rows: 1 },
+    ];
+    let got = run_program(&b, &steps, &[(3, 0, 4 * d), (4, 0, d), (5, 0, d), (6, 0, 24)]).expect("the program runs");
+    let near = |a: f32, e: f32| a == e || (a - e).abs() <= e.abs() / 128.0;
+    // the post, then the pre of the card's post, then the host's norm of the card's pre
+    for j in 0..4 {
+        for k in 0..d {
+            let r = (0..4).map(|i| mix[8 + 4 * i + j] * h[i * d + k]).sum::<f32>();
+            let want = bf(mix[4 + j] * out[k] + r);
+            assert!(near(got[0][j * d + k], want), "post copy {j} at {k}: {} where {want}", got[0][j * d + k]);
+        }
+    }
+    let h1 = &got[0];
+    for k in 0..d {
+        let want = bf((0..4).map(|i| mix[i] * h1[i * d + k]).sum::<f32>());
+        assert!(near(got[1][k], want), "pre at {k}: {} where {want}", got[1][k]);
+    }
+    let x = &got[1];
+    let var = x.iter().map(|v| v * v).sum::<f32>() / d as f32;
+    let r = 1.0 / (var + 1e-20).sqrt();
+    let want: Vec<f32> = x.iter().zip(&norm).map(|(v, g)| bf(g * (v * r))).collect();
+    assert_eq!(got[2], want, "the norm of the card's pre, to the bit");
+    for (row, &g) in got[3].iter().enumerate() {
+        let want: f64 = fnw[row * 4 * d..(row + 1) * 4 * d].iter().zip(h1.iter()).map(|(w, v)| *w as f64 * *v as f64).sum();
+        assert!((g as f64 - want).abs() <= 1e-3 * (1.0 + want.abs()), "the stream's projection {row}: {g} where {want}");
+    }
+}
+
+/// A program's gated activation is the host's to the bit: its projections rounded to bf16, the gate's silu by the table,
+/// the up clamped (none with no limit), their product rounded to bf16; with the model's limit and with none.
+#[test]
+fn a_programs_gated_activation_is_the_hosts_to_the_bit() {
+    let Some(b) = backend() else { return };
+    let len = 3072;
+    let mut s = 0x2545_f491u32;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        (s % 40_001) as f32 / 1_000.0 - 20.0
+    };
+    let bf = |v: f32| f32::from_bits((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) & 0xffff_0000);
+    let silu = |g: f32| g / (1.0 + (-g).exp());
+    // (sums as a projection leaves them: not yet rounded)
+    let gate: Vec<f32> = (0..len).map(|_| next() * 1.000_123).collect();
+    let up: Vec<f32> = (0..len).map(|_| next() * 0.999_877).collect();
+    for limit in [10.0f32, 0.0] {
+        let table: Vec<f32> = (0..1u32 << 16).map(|bits| f32::from_bits(bits << 16)).map(|g| silu(if limit > 0.0 { g.min(limit) } else { g })).collect();
+        let steps = [ProgramStep::Input(&gate), ProgramStep::Input(&up), ProgramStep::SwigluBf16 { gate: 0, up: 1, len, silu: &table, limit }];
+        let got = run_program(&b, &steps, &[(2, 0, len)]).expect("the program runs");
+        let want: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| {
+                let (g, u) = (bf(g), bf(u));
+                let (g, u) = if limit > 0.0 { (g.min(limit), u.clamp(-limit, limit)) } else { (g, u) };
+                bf(silu(g) * u)
+            })
+            .collect();
+        assert_eq!(got[0], want, "the activation with limit {limit}");
+    }
+}
+
+/// The one-row kernel's sums on a card, before any rounding, are the host's emulation's ([`ProjAt::step_sums`]'s) with
+/// each lane's products added by multiply-adds, as the card's compiler makes them (the rounding to f16 after hides
+/// which in all but a few values, so the raw sums say it), at 3 bits a weight and at 2.
+#[test]
+fn the_one_row_kernels_sums_are_the_hosts_multiply_adds() {
+    let Some(b) = backend() else { return };
+    let (k, n) = (5120, 2304);
+    for tw in [48, 32] {
+        let data = random_exl3(k, n, tw, 900 + tw as u32);
+        let words = data.words.clone();
+        let g = Exl3Gpu::upload(&b, data, None);
+        let mut s = 0x2545_f491u32;
+        let xh: Vec<f32> = (0..k)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                half((s % 20_001) as f32 / 10_000.0 - 1.0)
+            })
+            .collect();
+        let mut enc = g.gpu.device.create_command_encoder(&Default::default());
+        let pass = g.record(&mut enc, &xh, 1);
+        let card = read_back(&g.gpu, enc, &[pass]).pop().unwrap();
+        let off = |v: &[f32]| v.iter().zip(&card).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let differ = |fused: bool| off(&one_row_sums(&words[..], k, n, tw, &xh, step_splits(k, n), 0..n / 16, fused));
+        let (fused, plain) = (differ(true), differ(false));
+        eprintln!("tw={tw}: of {n} sums, the host's with multiply-adds differ in {fused}, with a multiply and an add in {plain}");
+        assert_eq!(fused, 0, "tw={tw}: the card's sums are multiply-adds");
+        // and the host's own (its vectors' where it has them), of every column and of a run of them
+        let record: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ProjAt { suh: 0, svh: 0, mul1: 0, trellis: 0, k, n, tile_words: tw };
+        assert_eq!(off(&p.step_sums(&record, &xh, 0..n / 16, true)), 0, "tw={tw}: the host's step sums");
+        let part = p.step_sums(&record, &xh, 5..13, true);
+        assert!(part.iter().zip(&card[5 * 16..13 * 16]).all(|(a, b)| a.to_bits() == b.to_bits()), "tw={tw}: a run of columns");
+    }
+}
+
+/// What a decode step's experts cost on the host's cores (`--ignored --nocapture`) at DeepSeek-V4.1's shape (5120 to
+/// 2304, 3 bits): one, two and six experts a call, each its own record, records in turn past the caches as a step's are.
+#[test]
+#[ignore = "a measurement"]
+fn measure_step_experts_on_the_host() {
+    let (hidden, ff, tw, limit) = (5120, 2304, 48, 10.0);
+    let (layout, records, _) = as_records(experts(12, hidden, ff, tw));
+    let x: Vec<f32> = (0..hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+    for n in [1usize, 2, 6] {
+        let mut at = 0;
+        let mut call = || {
+            let jobs: Vec<(&[u8], &[f32])> = (0..n).map(|j| (&records.0[(at + j) % 12][..], &x[..])).collect();
+            at += n;
+            drop(step_experts_host(&jobs, &layout, limit, true));
+        };
+        for _ in 0..3 {
+            call();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..60 {
+            call();
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / 60.0;
+        eprintln!("{n} expert(s) a call: {ms:.2} ms ({:.2} ms an expert)", ms / n as f64);
+    }
+    // the same six records every call (in the caches): what the reads from memory cost
+    let jobs: Vec<(&[u8], &[f32])> = (0..6).map(|j| (&records.0[j][..], &x[..])).collect();
+    drop(step_experts_host(&jobs, &layout, limit, true));
+    let t = std::time::Instant::now();
+    for _ in 0..60 {
+        drop(step_experts_host(&jobs, &layout, limit, true));
+    }
+    eprintln!("6 experts a call, the same each time: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / 60.0);
+    let t = std::time::Instant::now();
+    for _ in 0..60 {
+        drop(step_experts_host(&jobs[..1], &layout, limit, true));
+    }
+    eprintln!("1 expert a call, the same each time: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / 60.0);
+}
+
 /// What putting experts into mapped (scratch) slots costs (`--ignored --nocapture`), at DeepSeek-V4.1's shape (13.3 MB a
 /// record): one, two and eight records a call, each then computed; the call and a put alone; a put, then a call of
 /// another slot; a put, a wait, then its call. Measured on an RTX 5090 on four Gen5 lanes: a record 2.8-3.0 ms put and
@@ -456,6 +690,25 @@ fn measure_a_layers_query_call() {
         eprintln!("{what}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / 40.0);
     };
     time("a layer's queries' call", &|| drop(chained_normed(&b, &items, 0, &norm, 1e-20, &thens)));
+    // as a decode step spaces its calls: the card idle between them for the host's work (a busy wait) or a sleep, the
+    // call itself timed
+    for (how, pause_us, sleeps) in [("after 0.5 ms of the host's work", 500u64, false), ("after 2 ms of it", 2000, false), ("after a 2 ms sleep", 2000, true)] {
+        let mut spent = 0.0;
+        for _ in 0..40 {
+            let pause = std::time::Instant::now();
+            if sleeps {
+                std::thread::sleep(std::time::Duration::from_micros(pause_us));
+            } else {
+                while pause.elapsed() < std::time::Duration::from_micros(pause_us) {
+                    std::hint::spin_loop();
+                }
+            }
+            let t = std::time::Instant::now();
+            drop(chained_normed(&b, &items, 0, &norm, 1e-20, &thens));
+            spent += t.elapsed().as_secs_f64();
+        }
+        eprintln!("  the call {how}: {:.3} ms", spent * 1e3 / 40.0);
+    }
     let many: Vec<(ChainMat<'_>, &[f32])> = (0..16).flat_map(|_| items.iter().copied()).collect();
     time("its first stage 16 times in one call (/16)", &|| drop(chained(&b, &many)));
     for (i, item) in items.iter().enumerate() {

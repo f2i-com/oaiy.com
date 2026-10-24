@@ -456,21 +456,24 @@ impl Exl3MoeGrouped {
     /// `pairs`: `x` the gate and up rows of each hidden row (`2 r` and `2 r + 1`), the input their SwiGLU.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, pairs: bool, jobs: &DeviceVec, count: usize, order: Order<'_>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec) {
-        group_pass(rec, g, x, pairs, jobs, count, order, xh, part, y, 0.0);
+        group_pass(rec, g, x, pairs, jobs, count, order, xh, part, y, 0.0, None);
     }
 }
 
 /// [`Exl3MoeGrouped::group_pass`] of any groups ([`Exl3Slots`]' too), with `limit` the SwiGLU's clamp where `pairs` (up
-/// clamped to it either way, gate from above; 0 none).
+/// clamped to it either way, gate from above; 0 none), and `silu` the gate's values looked up there ([`silu_table`]'s
+/// for the limit) where given, else made by the kernel.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn group_pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, pairs: bool, jobs: &DeviceVec, count: usize, order: Order<'_>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec, limit: f32) {
+pub(super) fn group_pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, pairs: bool, jobs: &DeviceVec, count: usize, order: Order<'_>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec, limit: f32, silu: Option<&DeviceVec>) {
     {
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let (xb, jb, xhb, pb, yb) = (buf(x), buf(jobs), buf(xh), buf(part), buf(y));
         let (suh, svh) = (buf(&g.suh), buf(&g.svh));
-        if pairs {
+        if let (true, Some(table)) = (pairs, silu) {
+            rec.dispatch_wide("exl3-pre-swiglu-table", chain_shader("pre-swiglu-table"), [&xb, &suh, &d, &jb, &xb, &buf(table), &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits()], ((g.k / 128) as u32, count as u32, 1));
+        } else if pairs {
             rec.dispatch_wide("exl3-pre-swiglu", chain_shader("pre-swiglu"), [&xb, &suh, &d, &jb, &xb, &d, &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits()], ((g.k / 128) as u32, count as u32, 1));
         } else {
             rec.dispatch_wide("exl3-pre", chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));

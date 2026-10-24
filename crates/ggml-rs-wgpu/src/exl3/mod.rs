@@ -15,16 +15,20 @@ use ggml_rs::{DeviceChain, DeviceVec, Tensor};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod group;
 mod host;
 mod kernels;
 mod moe;
+mod program;
 mod routing;
 mod slots;
 mod source;
+mod step_host;
+mod team;
 mod tiered;
 
 // (what this file gave the crate and its users, and what the files make for each other)
-pub use {host::*, moe::*, slots::*, source::*, tiered::*};
+pub use {group::*, host::*, moe::*, program::*, slots::*, source::*, step_host::*, tiered::*};
 pub(crate) use {kernels::*, routing::*};
 
 /// An EXL3 projection with its packed weights on the GPU, in buffers of whole tile rows below the binding limit.
@@ -247,12 +251,14 @@ pub fn exl3_chained(b: &WgpuBackend, items: &[(&dyn PackedLinear, &[f32])]) -> O
 
 /// A matrix a chained recording ([`chained`]) multiplies: an EXL3 projection on the device, a matrix of f16 values
 /// (`[n, k]`, made by `DeviceChain::vec_f16`: a checkpoint's f16 weights exactly), or one of BF16 values as a
-/// checkpoint's bytes lie (`WgpuBackend::vec_of_bytes`).
+/// checkpoint's bytes lie (`WgpuBackend::vec_of_bytes`), or one of f32 values (a model's hyper-connections' mixing
+/// projections, which it stores so).
 #[derive(Clone, Copy)]
 pub enum ChainMat<'a> {
     Exl3(&'a dyn PackedLinear),
     F16 { w: &'a DeviceVec, n: usize, k: usize },
     Bf16 { w: &'a DeviceVec, n: usize, k: usize },
+    F32 { w: &'a DeviceVec, n: usize, k: usize },
 }
 
 /// [`exl3_chained`] of EXL3 projections and f16 or BF16 matrices alike, all in its recordings (a model whose router and
@@ -263,6 +269,22 @@ pub fn chained(b: &WgpuBackend, items: &[(ChainMat<'_>, &[f32])]) -> Option<Vec<
     // each item's (k, n), its EXL3 projection checked as one this device holds in one buffer
     let shapes: Vec<(usize, usize)> = items.iter().map(|(m, x)| chain_shape(b, m).filter(|&(k, _)| !x.is_empty() && x.len() % k == 0)).collect::<Option<_>>()?;
     let one = shapes.iter().zip(items).all(|(&(k, _), (_, x))| x.len() == k);
+    // a step's row: a program (its vectors kept from its first run, and their bind groups with them), the inputs several
+    // take uploaded once
+    if one {
+        let mut steps: Vec<ProgramStep<'_>> = Vec::with_capacity(2 * items.len());
+        let at: Vec<usize> = items.iter().map(|(_, x)| input_once(&mut steps, x)).collect();
+        let muls: Vec<usize> = items
+            .iter()
+            .zip(&at)
+            .map(|((m, _), &x)| {
+                steps.push(ProgramStep::Mul { m: *m, x, rows: 1 });
+                steps.len() - 1
+            })
+            .collect();
+        let reads: Vec<(usize, usize, usize)> = muls.iter().zip(&shapes).map(|(&s, &(_, n))| (s, 0, n)).collect();
+        return run_program(b, &steps, &reads);
+    }
     // (item, first row, rows) of every piece, a recording's pieces until their partial sums would pass the bound
     let mut recordings: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new()];
     let mut held = 0usize;
@@ -314,35 +336,29 @@ pub fn chained(b: &WgpuBackend, items: &[(ChainMat<'_>, &[f32])]) -> Option<Vec<
 /// back between (DeepSeek-V4.1's grouped `wo_a`, then `wo_b`: a round trip fewer a layer). None as [`chained`] is, or
 /// where the rows laid end to end are not `then`'s input, or the inputs are of other rows' counts or more.
 pub fn chained_after(b: &WgpuBackend, first: &[(ChainMat<'_>, &[f32], std::ops::Range<usize>)], then: ChainMat<'_>) -> Option<Vec<f32>> {
-    use ggml_rs::ChainRecorder;
     let (k, n) = chain_shape(b, &then)?;
     let shapes: Vec<(usize, usize)> = first.iter().map(|(m, x, rows)| chain_shape(b, m).filter(|&(k, n)| !x.is_empty() && x.len() % k == 0 && rows.end <= n && !rows.is_empty())).collect::<Option<_>>()?;
     let t = first.first().map(|(_, x, _)| x.len() / shapes[0].0)?;
     if t > FEW_MAX || first.iter().zip(&shapes).any(|((_, x, _), &(k, _))| x.len() != t * k) || first.iter().map(|(_, _, rows)| rows.len()).sum::<usize>() != k {
         return None;
     }
-    let mut rec = crate::chain::Recorder::new(b);
-    rec.keep_groups(t == 1);
-    // (inputs taken and written before anything is recorded, as `chained` takes them)
-    let xs: Vec<DeviceVec> = first
-        .iter()
-        .map(|(_, x, _)| {
-            let xv = rec.scratch(x.len());
-            DeviceChain::upload(b, &xv, x);
-            xv
-        })
-        .collect();
-    let ys: Vec<DeviceVec> = shapes.iter().map(|&(_, n)| rec.scratch(t * n)).collect();
-    let (rows_in, out) = (rec.scratch(t * k), rec.scratch(t * n));
+    // (a program: its vectors kept from its first run, and their bind groups with them)
+    let mut steps: Vec<ProgramStep<'_>> = Vec::with_capacity(3 * first.len() + 3);
+    for (_, x, _) in first {
+        steps.push(ProgramStep::Input(x));
+    }
+    for (i, (m, _, _)) in first.iter().enumerate() {
+        steps.push(ProgramStep::Mul { m: *m, x: i, rows: t });
+    }
+    let rows_in = steps.len();
+    steps.push(ProgramStep::Scratch(t * k));
     let mut at = 0;
-    for ((((m, _, rows), &kn), xv), yv) in first.iter().zip(&shapes).zip(&xs).zip(&ys) {
-        chain_mul(&mut rec, *m, kn, xv, yv, t);
-        rec.copy_cols_bf16(yv, kn.1, rows.start, &rows_in, k, at, rows.len(), t);
+    for (i, ((_, _, rows), &(_, ni))) in first.iter().zip(&shapes).enumerate() {
+        steps.push(ProgramStep::CopyColsBf16 { src: first.len() + i, src_stride: ni, src_at: rows.start, dst: rows_in, dst_stride: k, dst_at: at, width: rows.len(), rows: t });
         at += rows.len();
     }
-    chain_mul(&mut rec, then, (k, n), &rows_in, &out, t);
-    rec.read_range(&out, 0, t * n);
-    Box::new(rec).finish().pop()
+    steps.push(ProgramStep::Mul { m: then, x: rows_in, rows: t });
+    run_program(b, &steps, &[(steps.len() - 1, 0, t * n)])?.pop()
 }
 
 /// `x` in a scratch vector of `rec`, uploaded once for every item of the recording that takes the same host rows (a
@@ -366,7 +382,7 @@ fn chain_shape(b: &WgpuBackend, m: &ChainMat<'_>) -> Option<(usize, usize)> {
             let g = l.as_any()?.downcast_ref::<Exl3Gpu>()?;
             (g.is_on(&b.gpu) && g.single_chunk().is_some()).then(|| g.kn())
         }
-        ChainMat::F16 { n, k, .. } | ChainMat::Bf16 { n, k, .. } => Some((*k, *n)),
+        ChainMat::F16 { n, k, .. } | ChainMat::Bf16 { n, k, .. } | ChainMat::F32 { n, k, .. } => Some((*k, *n)),
     }
 }
 
@@ -377,6 +393,7 @@ fn chain_mul(rec: &mut crate::chain::Recorder<'_>, m: ChainMat<'_>, (k, n): (usi
         ChainMat::Exl3(l) => rec.exl3_rows_of(l, x, None, y, rows),
         ChainMat::F16 { w, .. } => rec.matmul_f16_rows_f32(w, n, k, x, y, rows),
         ChainMat::Bf16 { w, .. } => rec.matmul_bf16_rows_f32(w, n, k, x, y, rows),
+        ChainMat::F32 { w, .. } => rec.matmul_f32_rows(w, n, k, x, y, rows),
     }
 }
 
@@ -387,7 +404,6 @@ fn chain_mul(rec: &mut crate::chain::Recorder<'_>, m: ChainMat<'_>, (k, n): (usi
 /// (v * scale))`): the host's to the bit. `(first's outputs, then's)`, every row of each. None as [`chained`] is, or
 /// where `then`'s inputs are not that output's width or the rows are more.
 pub fn chained_normed(b: &WgpuBackend, first: &[(ChainMat<'_>, &[f32])], normed: usize, weight: &[f32], eps: f32, then: &[ChainMat<'_>]) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
-    use ggml_rs::ChainRecorder;
     let shapes: Vec<(usize, usize)> = first.iter().map(|(m, x)| chain_shape(b, m).filter(|&(k, _)| !x.is_empty() && x.len() % k == 0)).collect::<Option<_>>()?;
     let (k0, d) = *shapes.get(normed)?;
     let rows = first[normed].1.len() / k0;
@@ -395,31 +411,31 @@ pub fn chained_normed(b: &WgpuBackend, first: &[(ChainMat<'_>, &[f32])], normed:
     if rows > FEW_MAX || weight.len() != d || d > 1 << 20 {
         return None;
     }
-    let mut rec = crate::chain::Recorder::new(b);
-    rec.keep_groups(rows == 1);
-    // (every input taken and written before anything is recorded, as `chained` takes them)
-    let mut uploaded = Vec::new();
-    let xs: Vec<(DeviceVec, DeviceVec)> = first.iter().zip(&shapes).map(|((_, x), &(k, n))| (upload_once(&mut rec, b, &mut uploaded, x), rec.scratch(x.len() / k * n))).collect();
-    let wv = rec.scratch(d);
-    DeviceChain::upload(b, &wv, weight);
-    let row = rec.scratch(rows * d);
-    let outs: Vec<DeviceVec> = thens.iter().map(|&(_, n)| rec.scratch(rows * n)).collect();
-    for (((m, x), &(k, n)), (xv, yv)) in first.iter().zip(&shapes).zip(&xs) {
-        chain_mul(&mut rec, *m, (k, n), xv, yv, x.len() / k);
-    }
-    let (dummy, drw) = (rec.gpu().dummy().clone(), rec.gpu().dummy_rw().clone());
-    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU vector").clone();
-    rec.dispatch_wide("exl3-rmsnorm-host", NORM_AS_HOST, [&buf(&xs[normed].1), &buf(&wv), &dummy, &dummy, &dummy, &dummy, &buf(&row), &drw], &[d as u32, 0, eps.to_bits()], (rows as u32, 1, 1));
-    for ((m, &kn), yv) in then.iter().zip(&thens).zip(&outs) {
-        chain_mul(&mut rec, *m, kn, &row, yv, rows);
-    }
-    for ((_, x), (&(k, n), (_, yv))) in first.iter().zip(shapes.iter().zip(&xs)) {
-        rec.read_range(yv, 0, x.len() / k * n);
-    }
-    for (&(_, n), yv) in thens.iter().zip(&outs) {
-        rec.read_range(yv, 0, rows * n);
-    }
-    let mut all = Box::new(rec).finish();
+    // (a program: its vectors kept from its first run, and their bind groups with them; inputs several take uploaded
+    // once)
+    let mut steps: Vec<ProgramStep<'_>> = Vec::with_capacity(2 * first.len() + then.len() + 1);
+    let at: Vec<usize> = first.iter().map(|(_, x)| input_once(&mut steps, x)).collect();
+    let muls: Vec<usize> = first
+        .iter()
+        .zip(&shapes)
+        .zip(&at)
+        .map(|(((m, x), &(k, _)), &xi)| {
+            steps.push(ProgramStep::Mul { m: *m, x: xi, rows: x.len() / k });
+            steps.len() - 1
+        })
+        .collect();
+    let row = steps.len();
+    steps.push(ProgramStep::Norm { x: muls[normed], weight, eps, rows, width: d });
+    let thens_at: Vec<usize> = then
+        .iter()
+        .map(|m| {
+            steps.push(ProgramStep::Mul { m: *m, x: row, rows });
+            steps.len() - 1
+        })
+        .collect();
+    let mut reads: Vec<(usize, usize, usize)> = muls.iter().zip(first.iter().zip(&shapes)).map(|(&s, ((_, x), &(k, n)))| (s, 0, x.len() / k * n)).collect();
+    reads.extend(thens_at.iter().zip(&thens).map(|(&s, &(_, n))| (s, 0, rows * n)));
+    let mut all = run_program(b, &steps, &reads)?;
     let after = all.split_off(first.len());
     Some((all, after))
 }
@@ -435,7 +451,7 @@ const NORM_AS_HOST: &str = r#"
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-var<workgroup> sq: array<f32, 256>;
+var<workgroup> sq: array<vec4<f32>, 256>;
 var<workgroup> scale: f32;
 
 fn bf16(v: f32) -> f32 {
@@ -547,13 +563,28 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let d = p[0].x;
     let base = wg.x * d;
     var acc = 0.0;
-    for (var c = 0u; c < d; c += 256u) {
-        var v = 0.0;
-        if (c + t < d) { v = bf16(x[base + c + t]); }
-        sq[t] = v * v;
+    // a thousand squares at a time, each thread's four side by side, thread 0 adding them in order four a read (a read
+    // of one at a time waited for the add before it: some 40 us a row)
+    for (var c = 0u; c < d; c += 1024u) {
+        var v = vec4<f32>(0.0);
+        for (var i = 0u; i < 4u; i++) {
+            if (c + 4u * t + i < d) {
+                let e = bf16(x[base + c + 4u * t + i]);
+                v[i] = e * e;
+            }
+        }
+        sq[t] = v;
         workgroupBarrier();
         if (t == 0u) {
-            for (var j = 0u; j < min(256u, d - c); j++) { acc = acc + sq[j]; }
+            let n = min(1024u, d - c);
+            for (var j = 0u; j < n / 4u; j++) {
+                let s = sq[j];
+                acc = acc + s.x;
+                acc = acc + s.y;
+                acc = acc + s.z;
+                acc = acc + s.w;
+            }
+            for (var j = n / 4u * 4u; j < n; j++) { acc = acc + sq[j / 4u][j % 4u]; }
         }
         workgroupBarrier();
     }

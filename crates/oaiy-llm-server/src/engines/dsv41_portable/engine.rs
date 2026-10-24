@@ -459,6 +459,7 @@ impl Engine {
         // OAIY_DSV41_PROFILE: where the prompt's and the reply's time went (`crate::dsv41::profile`), and what each read
         let profiling = self.log && std::env::var_os("OAIY_DSV41_PROFILE").is_some();
         let (kernel, exl3) = (self.kernel.clone(), self.exl3.clone());
+        let exl3_waits = self.exl3.clone();
         // (an EXL3 checkpoint's cards: their experts computed from slots as the first card's tier's hits, those put
         // through the scratch slots as its misses)
         let read_so_far = move |m: &crate::dsv41::model::Model| {
@@ -468,9 +469,10 @@ impl Engine {
                     let (_, hits, misses, admitted) = k.tier();
                     (hits, misses, admitted, k.share_hits())
                 }
+                // (the other cards' share: what was computed from slots on a card past the first)
                 (None, Some(k)) => {
                     let (held, scratch, taken, kept) = k.counts();
-                    (held, scratch, taken + kept, 0)
+                    (held, scratch, taken + kept, k.held_past_first())
                 }
                 (None, None) => (0, 0, 0, 0),
             };
@@ -497,8 +499,19 @@ impl Engine {
                 eprintln!("    {label}'s kernels: {}", kernels.join(", "));
             }
             let (busy, span, pieces) = ggml_rs_wgpu::profile::take_pieces();
+            let chains = ggml_rs_wgpu::profile::take_line();
             if pieces > 0 {
-                eprintln!("    {label}'s pieces: {pieces}, busy {busy:.0} ms of a {span:.0} ms span");
+                eprintln!("    {label}'s pieces: {pieces}, busy {busy:.0} ms of a {span:.0} ms span; {chains}");
+            } else {
+                eprintln!("    {label}'s chains: {chains}");
+            }
+            // (each card's held-experts calls as the host found them once it had made the rest of a layer's experts)
+            if let Some(k) = &exl3_waits {
+                let [a, b] = k.take_held_waits();
+                eprintln!(
+                    "    {label}'s held experts by card, once the host had the rest: the first's {} of {} calls still running, waited for {:.0} us on average; the second's {} of {}, {:.0} us",
+                    a.2, a.1, a.0, b.2, b.1, b.0
+                );
             }
         };
         if profiling {

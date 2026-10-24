@@ -29,7 +29,7 @@ pub struct ProjAt {
 }
 
 impl ProjAt {
-    fn trellis_bytes(&self) -> usize {
+    pub(super) fn trellis_bytes(&self) -> usize {
         self.k / 16 * (self.n / 16) * self.tile_words * 2
     }
 
@@ -195,7 +195,7 @@ fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> s
 const MUL1: [u8; 4] = 0x83dc_d12du32.to_le_bytes();
 
 /// A record's projection's transforms: its scales as f32, the maps the identity.
-fn transform(record: &[u8], p: &ProjAt) -> Transform {
+pub(super) fn transform(record: &[u8], p: &ProjAt) -> Transform {
     assert_eq!(record[p.mul1..p.mul1 + 4], MUL1, "an expert's projection of a codebook other than mul1");
     let halves = |at: usize, len: usize| (0..len).map(|i| half::f16::from_bits(u16::from_le_bytes([record[at + 2 * i], record[at + 2 * i + 1]])).to_f32()).collect();
     Transform { k: p.k, n: p.n, suh: halves(p.suh, p.k), svh: halves(p.svh, p.n), input_map: (0..p.k as u32).collect(), output_map: (0..p.n as u32).collect() }

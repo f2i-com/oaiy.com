@@ -222,14 +222,14 @@ pub(super) fn tiles_matmul<W: Words + ?Sized>(words: &W, k: usize, n: usize, til
 
 /// mul1's value of a code by the byte sum of its product (`decode`'s, which depends on nothing else: 1,021 values,
 /// 4 KB, where every code's table is 256 KB).
-fn by_bytesum() -> &'static [f32; 1024] {
+pub(super) fn by_bytesum() -> &'static [f32; 1024] {
     static TABLE: std::sync::OnceLock<[f32; 1024]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| std::array::from_fn(|sum| half((1024 + sum as u32) as f32 * (1774.0 / 262_144.0) - 10.382_812_5)))
 }
 
 /// The byte sum of a code's product with mul1's multiplier (two bytes at a time, then the halves).
 #[inline(always)]
-fn bytesum(code: u32) -> usize {
+pub(super) fn bytesum(code: u32) -> usize {
     let x = code.wrapping_mul(0x83dc_d12d);
     let pairs = (x & 0x00ff_00ff) + ((x >> 8) & 0x00ff_00ff);
     ((pairs & 0xffff) + (pairs >> 16)) as usize

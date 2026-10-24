@@ -1094,6 +1094,8 @@ impl Models {
                         // (what it keeps is weighed by the profile's counts where there is one)
                         k.seed_uses(&model.expert_uses().counts());
                         let k = Arc::new(k);
+                        // (what steps make on the host and use enough, kept on the cards off their path)
+                        k.start_promoter();
                         model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn crate::dsv41::expert::ExpertsKernel>));
                         let slots = k.tier().0;
                         exl3_kernel = Some(k);

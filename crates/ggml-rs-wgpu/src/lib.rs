@@ -211,6 +211,8 @@ struct Gpu {
     decode_int8: Mutex<HashMap<GgmlType, bool>>,
     /// What a decode step's dense calls share ([`dense::Arena`]), made at the first.
     dense_arena: Mutex<Option<dense::Arena>>,
+    /// The EXL3 programs' vectors kept from their first runs (`exl3::run_program`), by program.
+    programs: Mutex<HashMap<u64, Arc<Mutex<exl3::ProgramArena>>>>,
     /// Whether the device was given subgroups' operations, its subgroups 32 lanes each ([`Gpu::subgroups32`]).
     subgroups32: bool,
     /// For each weight type, whether a prompt's tensor-core matmul takes the kernel whose subgroups decode apart from
@@ -561,7 +563,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), int8_rows: std::sync::OnceLock::new(), decode_int8: Mutex::new(HashMap::new()), dense_arena: Mutex::new(None), subgroups32: !subgroups.is_empty(), coop_split: Mutex::new(HashMap::new()), host_staging: std::sync::OnceLock::new(), host_pieces: Mutex::new(HostPieces::default()), stream_slots: Mutex::new(stream::Slots::default()) }),
+            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), int8_rows: std::sync::OnceLock::new(), decode_int8: Mutex::new(HashMap::new()), dense_arena: Mutex::new(None), programs: Mutex::new(HashMap::new()), subgroups32: !subgroups.is_empty(), coop_split: Mutex::new(HashMap::new()), host_staging: std::sync::OnceLock::new(), host_pieces: Mutex::new(HostPieces::default()), stream_slots: Mutex::new(stream::Slots::default()) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             left: Arc::new(AtomicU64::new(0)),

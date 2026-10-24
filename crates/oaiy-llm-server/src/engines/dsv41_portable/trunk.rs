@@ -1,4 +1,4 @@
-//! The dense trunk on the WebGPU adapter: its weights as the CPU model's kernels, and their placement.
+﻿//! The dense trunk on the WebGPU adapter: its weights as the CPU model's kernels, and their placement.
 
 use super::*;
 
@@ -68,6 +68,9 @@ impl DenseKernel for WgpuDense {
 enum Mat {
     Exl3(Arc<dyn ggml_rs::exl3::PackedLinear>),
     Bf16(ggml_rs_wgpu::chain::WeightVec),
+    F32(ggml_rs_wgpu::chain::WeightVec),
+    /// A stack's parts together, multiplied only by a program's step (`Step::MulGroup`).
+    Group(ggml_rs_wgpu::exl3::Exl3Group),
 }
 
 /// A matrix of a chained recording on the WebGPU adapter, as the CPU model's [`DenseKernel`]: it gives every row of its
@@ -97,6 +100,8 @@ impl WgpuChained {
         match &self.mat {
             Mat::Exl3(lin) => ggml_rs_wgpu::exl3::ChainMat::Exl3(&**lin),
             Mat::Bf16(w) => ggml_rs_wgpu::exl3::ChainMat::Bf16 { w: &w.v, n: self.n, k: self.k },
+            Mat::F32(w) => ggml_rs_wgpu::exl3::ChainMat::F32 { w: &w.v, n: self.n, k: self.k },
+            Mat::Group(_) => panic!("a stack's group is multiplied by a program's step alone"),
         }
     }
 }
@@ -106,7 +111,7 @@ impl DenseKernel for WgpuChained {
         if let Some(all) = ggml_rs_wgpu::exl3::chained(&self.b, &[(self.chain_mat(), x)]).and_then(|mut v| v.pop()) {
             return self.rows_of(&all, t, rows);
         }
-        let Mat::Exl3(lin) = &self.mat else { panic!("a BF16 matrix of {} rows the device would not multiply", t) };
+        let Mat::Exl3(lin) = &self.mat else { panic!("a matrix of floats of {} rows the device would not multiply", t) };
         let all = lin.linear(&ggml_rs::Tensor::from_vec(x.to_vec(), vec![t, self.k])).to_host();
         self.rows_of(all.data(), t, rows)
     }
@@ -118,7 +123,7 @@ impl DenseKernel for WgpuChained {
         let mats: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32])> = mine.iter().zip(items).map(|(w, (_, x, ..))| (w.chain_mat(), *x)).collect();
         let all = ggml_rs_wgpu::exl3::chained(&self.b, &mats).or_else(|| {
             let lins: Vec<(&dyn ggml_rs::exl3::PackedLinear, &[f32])> =
-                mine.iter().zip(items).map(|(w, (_, x, ..))| match &w.mat { Mat::Exl3(l) => Some((&**l, *x)), Mat::Bf16(_) => None }).collect::<Option<_>>()?;
+                mine.iter().zip(items).map(|(w, (_, x, ..))| match &w.mat { Mat::Exl3(l) => Some((&**l, *x)), Mat::Bf16(_) | Mat::F32(_) | Mat::Group(_) => None }).collect::<Option<_>>()?;
             ggml_rs_wgpu::exl3::exl3_many(&lins)
         })?;
         Some(all.iter().zip(&mine).zip(items).map(|((all, w), (_, _, t, rows))| w.rows_of(all, *t, rows.clone())).collect())
@@ -141,6 +146,38 @@ impl DenseKernel for WgpuChained {
         let firsts: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32])> = first.iter().map(|(k, x, _)| chained_of(*k).map(|w| (w.chain_mat(), *x))).collect::<Option<_>>()?;
         let thens: Vec<ggml_rs_wgpu::exl3::ChainMat<'_>> = then.iter().map(|k| chained_of(*k).map(WgpuChained::chain_mat)).collect::<Option<_>>()?;
         ggml_rs_wgpu::exl3::chained_normed(&self.b, &firsts, normed, weight, eps, &thens)
+    }
+
+    /// The program as one chained recording on this adapter (`ggml_rs_wgpu::exl3::run_program`), each matrix one of
+    /// these on it.
+    fn run_program(&self, steps: &[crate::dsv41::linear::Step<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+        use crate::dsv41::linear::Step as S;
+        use ggml_rs_wgpu::exl3::ProgramStep as G;
+        // (the trunk's matrices are all on this adapter; an EXL3 one of another the program refuses)
+        fn on_device(w: &Weight) -> Option<&WgpuChained> {
+            let Weight::Device { kernel, .. } = w else { return None };
+            chained_of(&**kernel)
+        }
+        let steps: Vec<G<'_>> = steps
+            .iter()
+            .map(|s| {
+                Some(match *s {
+                    S::Input(x) => G::Input(x),
+                    S::Scratch(len) => G::Scratch(len),
+                    S::Mul { w, x, rows } => G::Mul { m: on_device(w)?.chain_mat(), x, rows },
+                    S::MulGroup { group, x, jobs } => match &on_device(group)?.mat {
+                        Mat::Group(g) => G::MulGroup { g, x, jobs },
+                        _ => return None,
+                    },
+                    S::CopyColsBf16 { src, src_stride, src_at, dst, dst_stride, dst_at, width, rows } => G::CopyColsBf16 { src, src_stride, src_at, dst, dst_stride, dst_at, width, rows },
+                    S::Norm { x, weight, eps, rows, width } => G::Norm { x, weight, eps, rows, width },
+                    S::HcPost { out, res, mix, d } => G::HcPost { out, res, mix, d },
+                    S::HcPre { h, mix, d } => G::HcPre { h, mix, d },
+                    S::SwigluBf16 { gate, up, len, silu, limit } => G::SwigluBf16 { gate, up, len, silu, limit },
+                })
+            })
+            .collect::<Option<_>>()?;
+        ggml_rs_wgpu::exl3::run_program(&self.b, &steps, reads)
     }
 }
 
@@ -166,6 +203,12 @@ pub(crate) fn offload_drafter(drafter: &mut crate::dsv41::dspark::Drafter, gpu: 
 /// What puts a dense weight on `gpu` ([`offload`]).
 pub(super) fn placer(gpu: &WgpuBackend, exl3: bool) -> impl FnMut(&str, &Weight) -> Option<Weight> + '_ {
     move |_name, w| {
+        // (a stack of EXL3 projections of one shape, an EXL3 checkpoint's `wo_a`: its parts together as well)
+        if let Weight::Stacked { parts, rows, k, .. } = w {
+            let datas: Vec<&ggml_rs::exl3::Exl3Data> = parts.iter().map(|p| if let Weight::Exl3 { data, .. } = p { Some(&**data) } else { None }).collect::<Option<_>>()?;
+            let group = gpu.exl3_group(&datas)?;
+            return Some(Weight::Device { kernel: Arc::new(WgpuChained { mat: Mat::Group(group), n: *rows, k: *k, b: gpu.clone() }), n: *rows, k: *k, fp8: false });
+        }
         if let Weight::Exl3 { data, n, k, .. } = w {
             let lin = gpu.exl3(crate::dsv41::linear::exl3_copy(data)).ok()?;
             return Some(Weight::Device { kernel: Arc::new(WgpuChained { mat: Mat::Exl3(lin), n: *n, k: *k, b: gpu.clone() }), n: *n, k: *k, fp8: false });
@@ -175,6 +218,15 @@ pub(super) fn placer(gpu: &WgpuBackend, exl3: bool) -> impl FnMut(&str, &Weight)
                 let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let m = gpu.weight_of_bytes(&bytes)?;
                 return Some(Weight::Device { kernel: Arc::new(WgpuChained { mat: Mat::Bf16(m), n: *n, k: *k, b: gpu.clone() }), n: *n, k: *k, fp8: false });
+            }
+        }
+        // (and its matrices of f32 values, the hyper-connections' mixing projections among them: a decode step's are made
+        // in the sublayer's own call there, where the host read 157 MB of them a token)
+        if let (true, Weight::F32 { w, n, k }) = (exl3, &*w) {
+            if *k > 0 && *n <= 65535 {
+                let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let m = gpu.weight_of_bytes(&bytes)?;
+                return Some(Weight::Device { kernel: Arc::new(WgpuChained { mat: Mat::F32(m), n: *n, k: *k, b: gpu.clone() }), n: *n, k: *k, fp8: false });
             }
         }
         let (data, n, k, fp8) = match w {

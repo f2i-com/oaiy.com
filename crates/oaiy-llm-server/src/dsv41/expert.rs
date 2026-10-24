@@ -502,8 +502,27 @@ pub trait ExpertsKernel: Send + Sync {
 
     /// The experts it has let go of since it was last asked (each to hold one used more in its place), `(layer,
     /// expert)` each: RAM, which let them go when they came here, may read them back ([`crate::dsv41::moe::Experts::
-    /// refill_evicted`]), so each stays in one tier or the other. By default none.
+    /// settle_tiers`]), so each stays in one tier or the other. By default none.
     fn evicted(&self) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
+
+    /// A decode step's experts it does not hold (`jobs`, one row each) made on the host's cores as it would make them
+    /// itself, to the bit, each output weighted as [`Self::forward`]'s: where the host does it quicker than it takes
+    /// their records in. None where it does not, and the caller sends them to [`Self::forward`].
+    fn forward_here(&self, layer: u32, jobs: &[ExpertJob<'_>], swiglu_limit: f32) -> Option<Vec<Vec<f32>>> {
+        let _ = (layer, jobs, swiglu_limit);
+        None
+    }
+
+    /// Records of experts a step made on the host ([`Self::forward_here`]): it may take some in, used enough, off the
+    /// steps' path (RAM then lets them go: [`Self::taken`]). By default it takes none.
+    fn consider(&self, layer: u32, records: &[(u32, std::sync::Arc<Vec<u8>>)]) {
+        let _ = (layer, records);
+    }
+
+    /// The experts it took in off the steps' path ([`Self::consider`]) since it was last asked: RAM may let them go.
+    fn taken(&self) -> Vec<(u32, u32)> {
         Vec::new()
     }
 

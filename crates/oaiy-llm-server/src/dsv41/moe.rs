@@ -23,7 +23,7 @@ use crate::dsv41::safetensors::StIndex;
 pub struct Experts {
     pub store: Arc<dyn WeightStore>,
     pub cache: Arc<Ecache>,
-    /// What reads the experts a GPU let go of back into `cache` ([`Self::refill_evicted`]).
+    /// What reads the experts a GPU let go of back into `cache` ([`Self::settle_tiers`]).
     pub refill: Refill,
     /// Workers for a decode step's routed experts, all of a token's at once (the same results as one at a time);
     /// none: one after another on the caller's thread.
@@ -43,7 +43,7 @@ pub struct Experts {
     pub format: crate::dsv41::expert::ExpertFormat,
 }
 
-/// The thread [`Experts::refill_evicted`] reads on, started when first needed and ended when its owner is dropped
+/// The thread [`Experts::settle_tiers`] reads on, started when first needed and ended when its owner is dropped
 /// (its channel closed).
 #[derive(Default)]
 pub struct Refill {
@@ -194,14 +194,18 @@ impl Experts {
         });
     }
 
-    /// The experts the GPU's kernel let go of since the last call (each for one used more: [`crate::dsv41::expert::
-    /// ExpertsKernel::evicted`]) read back into the RAM cache on a thread of its own, off the steps' path. RAM let each
-    /// go when the GPU took it (an expert in one place, so the two tiers hold more between them), so one let go there
-    /// was in neither, and its next use waited for the drive (a reply's some 2.5 s of reads where the tiers held every
-    /// expert of the model). One RAM holds already, one the GPU has taken again, and any while RAM is full (reading
-    /// it would push out another) are left.
-    pub fn refill_evicted(&self) {
+    /// The tiers kept apart after a pass: what the GPU's kernel took in off the steps' path since the last call
+    /// ([`crate::dsv41::expert::ExpertsKernel::taken`]) let go of here, and what it let go of (each for one used
+    /// more: [`crate::dsv41::expert::ExpertsKernel::evicted`]) read back into the RAM cache on a thread of its own, off
+    /// the steps' path. RAM let each go when the GPU took it (an expert in one place, so the two tiers hold more
+    /// between them), so one let go there was in neither, and its next use waited for the drive (a reply's some 2.5 s
+    /// of reads where the tiers held every expert of the model). One RAM holds already, one the GPU has taken again,
+    /// and any while RAM is full (reading it would push out another) are left.
+    pub fn settle_tiers(&self) {
         let Some(gpu) = &self.gpu else { return };
+        for (layer, e) in gpu.taken() {
+            self.cache.remove(layer, e);
+        }
         let evicted = gpu.evicted();
         if !evicted.is_empty() {
             self.refill.send(evicted, &self.cache, &self.store, gpu);
@@ -264,6 +268,32 @@ impl Moe {
         let [w1, w2, w3] = &mut self.shared;
         vec![("gate", &mut self.gate), ("shared.w1", w1), ("shared.w2", w2), ("shared.w3", w3)]
     }
+
+    /// The router's weight and the shared expert's gate, up and down projections: what a device program makes of the
+    /// sublayer's input ([`Self::forward_from`] takes the rest).
+    pub(crate) fn router_and_shared(&self) -> [&Weight; 4] {
+        [&self.gate, &self.shared[0], &self.shared[2], &self.shared[1]]
+    }
+}
+
+/// The shared expert's activation of every bf16 gate, by the gate's bits: `silu(min(g, limit))` (no limit where it is
+/// not positive), [`Moe::shared_forward`]'s to the bit, for a device program's
+/// ([`crate::dsv41::linear::Step::SwigluBf16`]). Made once a limit.
+pub(crate) fn silu_bf16_table(limit: f32) -> &'static [f32] {
+    static MADE: Mutex<Vec<(u32, &'static [f32])>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(&(_, t)) = made.iter().find(|(l, _)| *l == limit.to_bits()) {
+        return t;
+    }
+    let table: Vec<f32> = (0..1u32 << 16)
+        .map(|bits| {
+            let g = f32::from_bits(bits << 16);
+            silu(if limit > 0.0 { g.min(limit) } else { g })
+        })
+        .collect();
+    let table: &'static [f32] = Box::leak(table.into_boxed_slice());
+    made.push((limit.to_bits(), table));
+    table
 }
 
 /// `ids`' records, in order: those `there` (in the RAM tier) taken on this thread, the rest read on up to [`READERS`]
@@ -321,6 +351,16 @@ impl Moe {
     pub fn route(&self, cfg: &Config, x: &[f32], t: usize) -> Vec<Route> {
         route(cfg, &self.gate.forward(x, t, Out::F32), &self.bias, t)
     }
+
+    /// One row's experts by the router's `logits` as it ranks them (score and correction bias), the `k` most likely
+    /// first: a foretelling of a step's experts from logits of another row (OAIY_DSV41_FORETELL).
+    pub fn ranked(&self, logits: &[f32], k: usize) -> Vec<u32> {
+        let n = self.bias.len();
+        let score: Vec<f32> = logits[..n].iter().zip(&self.bias).map(|(&v, b)| softplus(v).sqrt() + b).collect();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| score[b].total_cmp(&score[a]).then(a.cmp(&b)));
+        order.into_iter().take(k).map(|e| e as u32).collect()
+    }
 }
 
 /// Routing from the gate's f32 logits (`[t, n_experts]`) and correction bias:
@@ -360,25 +400,59 @@ impl Moe {
 
     /// `x`: `[t, dim]` (bf16 values); returns `[t, dim]` bf16 and the routes taken.
     pub fn forward(&self, cfg: &Config, x: &[f32], t: usize, experts: &Experts) -> Result<(Vec<f32>, Vec<Route>)> {
-        let d = cfg.dim;
+        let (y, routes, _) = self.forward_side(cfg, x, t, experts, None)?;
+        Ok((y, routes))
+    }
+
+    /// [`Self::forward`], and `side`'s projection of its own input (`(weight, input)`: the sublayer's mixing projection
+    /// of the stream, [`crate::dsv41::hc::HcParams::on_device`]) made in the router's call, `[t, side.n()]` in f32.
+    #[allow(clippy::type_complexity)]
+    pub fn forward_side(&self, cfg: &Config, x: &[f32], t: usize, experts: &Experts, side: Option<(&Weight, &[f32])>) -> Result<(Vec<f32>, Vec<Route>, Option<Vec<f32>>)> {
         let [w1, w2, w3] = &self.shared;
         // A decode step's shared expert whole and the router's logits in one call, where a device holds them (its
         // down projection was a round trip of its own, a layer); else the router's and the shared expert's
         // projections of x together, and its down projection after the routed experts.
-        let whole = (t == 1).then(|| crate::dsv41::linear::gated_together(w1, w3, w2, x, cfg.swiglu_limit, &[(&self.gate, x, 0..self.gate.n(), Out::F32)])).flatten();
-        let (logits, shared_parts, shared_whole) = match whole {
-            Some((shared, mut logits)) => (logits.pop().expect("the router's logits"), None, Some(shared)),
+        let mut others: Vec<(&Weight, &[f32], std::ops::Range<usize>, Out)> = vec![(&self.gate, x, 0..self.gate.n(), Out::F32)];
+        if let Some((w, input)) = side {
+            others.push((w, input, 0..w.n(), Out::F32));
+        }
+        let whole = (t == 1).then(|| crate::dsv41::linear::gated_together(w1, w3, w2, x, cfg.swiglu_limit, &others)).flatten();
+        let (logits, shared_parts, shared_whole, side_out) = match whole {
+            Some((shared, mut made)) => {
+                let side_out = side.map(|_| made.pop().expect("the side projection"));
+                (made.pop().expect("the router's logits"), None, Some(shared), side_out)
+            }
             None => {
-                let [logits, gate, up]: [Vec<f32>; 3] = crate::dsv41::linear::forward_together(&[
-                    (&self.gate, x, t, 0..self.gate.n(), Out::F32),
-                    (w1, x, t, 0..w1.n(), Out::Bf16),
-                    (w3, x, t, 0..w3.n(), Out::Bf16),
-                ])
-                .try_into()
-                .expect("three projections");
-                (logits, Some((gate, up)), None)
+                let mut items: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> =
+                    vec![(&self.gate, x, t, 0..self.gate.n(), Out::F32), (w1, x, t, 0..w1.n(), Out::Bf16), (w3, x, t, 0..w3.n(), Out::Bf16)];
+                if let Some((w, input)) = side {
+                    items.push((w, input, t, 0..w.n(), Out::F32));
+                }
+                let mut made = crate::dsv41::linear::forward_together(&items);
+                let side_out = side.map(|_| made.pop().expect("the side projection"));
+                let [logits, gate, up]: [Vec<f32>; 3] = made.try_into().expect("three projections");
+                (logits, Some((gate, up)), None, side_out)
             }
         };
+        let (y, routes) = self.forward_from(cfg, x, t, experts, logits, shared_parts, shared_whole)?;
+        Ok((y, routes, side_out))
+    }
+
+    /// [`Self::forward`] from the router's logits and the shared expert's projections made already (`shared_parts`: its
+    /// gate's and up's rows, bf16; `shared_whole`: its output, where its down projection was made with them): a decode
+    /// step's router made in a device program with the sublayer before it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_from(
+        &self,
+        cfg: &Config,
+        x: &[f32],
+        t: usize,
+        experts: &Experts,
+        logits: Vec<f32>,
+        shared_parts: Option<(Vec<f32>, Vec<f32>)>,
+        shared_whole: Option<Vec<f32>>,
+    ) -> Result<(Vec<f32>, Vec<Route>)> {
+        let d = cfg.dim;
         let routes = route(cfg, &logits, &self.bias, t);
         let mut y = vec![0.0f32; t * d];
         let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
@@ -436,18 +510,35 @@ impl Moe {
                         let leases = read_all(&ids, &|e| experts.cache.probe(self.layer, e), &acquire)?;
                         crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertRead, reading);
                         let computing = std::time::Instant::now();
-                        // what was read through the scratch slots (the cards keep what is used enough, and RAM then
-                        // lets it go: an expert in one place)
+                        // What was read: a step's made on the host's cores where the kernel makes them there as it
+                        // would itself (its upload a millisecond or two of a card's link, the cores' work half of
+                        // one), the cards taking in what is used enough off the step's path; else through the
+                        // scratch slots, the cards keeping what is used enough. RAM then lets it go: an expert in one
+                        // place.
                         let read: Vec<(u32, &[u8])> = ids.iter().zip(&leases).map(|(&e, l)| (e, &**l)).collect();
                         let at = |e: u32| used.iter().position(|&u| u == e).expect("a used expert");
+                        let mut here = false;
                         if !read.is_empty() {
                             let jobs: Vec<crate::dsv41::expert::ExpertJob<'_>> =
                                 read.iter().map(|&(e, record)| crate::dsv41::expert::ExpertJob { expert: e, record, x: &gathered[at(e)].1, weights: &gathered[at(e)].2 }).collect();
-                            for (&(e, _), out) in read.iter().zip(gpu.forward(self.layer, &jobs, cfg.swiglu_limit)) {
+                            let made = match (t == 1).then(|| gpu.forward_here(self.layer, &jobs, cfg.swiglu_limit)).flatten() {
+                                Some(made) => {
+                                    here = true;
+                                    crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertCpu, computing);
+                                    made
+                                }
+                                None => gpu.forward(self.layer, &jobs, cfg.swiglu_limit),
+                            };
+                            for (&(e, _), out) in read.iter().zip(made) {
                                 outs[at(e)] = out;
                             }
                         }
-                        let taken = gpu.offer(self.layer, &read);
+                        let taken = if here {
+                            gpu.consider(self.layer, &ids.iter().zip(&leases).map(|(&e, l)| (e, l.to_arc())).collect::<Vec<_>>());
+                            Vec::new()
+                        } else {
+                            gpu.offer(self.layer, &read)
+                        };
                         if let Some(finish) = cards {
                             for (&j, out) in there.iter().zip(finish()) {
                                 outs[j] = out;

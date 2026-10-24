@@ -8,6 +8,7 @@
 use oaiy_engine::Result;
 
 use crate::dsv41::formats::to_bf16;
+use crate::dsv41::linear::Weight;
 use crate::dsv41::ops::sigmoid;
 use crate::dsv41::safetensors::StIndex;
 
@@ -22,6 +23,9 @@ pub struct HcParams {
     by_k: Vec<f32>,
     base: Vec<f32>,
     scale: Vec<f32>,
+    /// The projection as stored (`[24, 4 * dim]`), for a device to hold ([`crate::dsv41::model::Model::offload`]): a
+    /// decode step's 24 sums are then made there, beside a call the sublayer makes anyway ([`Self::on_device`]).
+    weight: Weight,
 }
 
 impl HcParams {
@@ -42,8 +46,36 @@ impl HcParams {
                 by_k[k * MIX + j] = w;
             }
         }
-        HcParams { by_k, base, scale }
+        HcParams { by_k, base, scale, weight: Weight::F32 { w: fn_, n: MIX, k: n } }
     }
+
+    /// The projection as a weight a device may take ([`crate::dsv41::model::Model::offload`]).
+    pub(crate) fn weight_mut(&mut self) -> &mut Weight {
+        &mut self.weight
+    }
+
+    /// The projection where a device holds it: a decode step's 24 sums made there ([`mixes_of`]), beside the
+    /// sublayer's own call. None where it does not (they are made here, [`mixes`]).
+    pub fn on_device(&self) -> Option<&Weight> {
+        matches!(self.weight, Weight::Device { .. }).then_some(&self.weight)
+    }
+}
+
+/// [`mixes`] of one token's stream `x` (`[HC * dim]`) from its 24 projections made elsewhere (`proj`: a device's,
+/// [`HcParams::on_device`]), its sum of squares here: the device sums in an order of its own, so the coefficients are
+/// within roundings of the host's.
+pub fn mixes_of(proj: &[f32], x: &[f32], p: &HcParams, norm_eps: f32, iters: usize, hc_eps: f32) -> Mix {
+    let proj: [f32; MIX] = proj[..MIX].try_into().expect("24 projections");
+    // (eight running sums: the one chain of 20,480 additions was a quarter of a step's mixing)
+    let mut lanes = [0.0f32; 8];
+    for c in x.chunks_exact(8) {
+        for (s, v) in lanes.iter_mut().zip(c) {
+            *s += v * v;
+        }
+    }
+    let tail: f32 = x.chunks_exact(8).remainder().iter().map(|v| v * v).sum();
+    let sumsq = lanes.iter().sum::<f32>() + tail;
+    mixes_from_projection(&proj, sumsq, x.len(), p, norm_eps, iters, hc_eps)
 }
 
 /// Per-token coefficients.
@@ -53,6 +85,20 @@ pub struct Mix {
     pub post: [f32; HC],
     /// `comb[i][j]`: weight of residual copy `i` in output copy `j`.
     pub comb: [[f32; HC]; HC],
+}
+
+impl Mix {
+    /// The 24 laid end to end as a device program takes them: pre, post, then comb by rows (`comb[i][j]` at `8 + 4 i +
+    /// j`).
+    pub fn flat(&self) -> [f32; MIX] {
+        let mut out = [0.0f32; MIX];
+        out[..HC].copy_from_slice(&self.pre);
+        out[HC..2 * HC].copy_from_slice(&self.post);
+        for (i, row) in self.comb.iter().enumerate() {
+            out[2 * HC + i * HC..2 * HC + (i + 1) * HC].copy_from_slice(row);
+        }
+        out
+    }
 }
 
 /// `hc_mixes` for one token: `x` is its `[HC * dim]` stream (bf16 values).

@@ -1,4 +1,4 @@
-//! The DeepSeek worker's tests: the experts on a GPU against the CPU's, the tiers, and the model against the CPU model.
+﻿//! The DeepSeek worker's tests: the experts on a GPU against the CPU's, the tiers, and the model against the CPU model.
 
 use super::experts::MARGIN;
 use super::trunk::WgpuDense;
@@ -503,7 +503,7 @@ fn an_exl3_layers_merged_calls_are_the_calls_apart() {
     let (wq_a, wkv, wq_b, ix_b) = (exl3(h, q, &mut next), exl3(h, kv, &mut next), exl3(q, heads, &mut next), exl3(q, 256, &mut next));
     let router = super::trunk::placer(&b, true)("gate", &Weight::Bf16 { w: (0..32 * h).map(|_| ((((next() % 2000) as f32 / 1000.0) - 1.0).to_bits() >> 16) as u16).collect(), n: 32, k: h }).expect("on the GPU");
     let q_norm: Vec<f32> = (0..q).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
-    let wo_a = Weight::Stacked { parts: (0..groups).map(|_| exl3(gd, rank, &mut next)).collect(), rows: rank, k: gd };
+    let wo_a = Weight::Stacked { parts: (0..groups).map(|_| exl3(gd, rank, &mut next)).collect(), rows: rank, k: gd, group: None };
     let wo_b = exl3(groups * rank, h, &mut next);
     for t in [1usize, 3] {
         let x: Vec<f32> = (0..t * h).map(|_| ((next() % 2001) as f32 / 1000.0) - 1.0).collect();

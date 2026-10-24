@@ -8,9 +8,13 @@ pub static LINEAR: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 pub static LINEAR_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// The attention (on the CPU: the cache is on the host).
 pub static ATTENTION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// A chain's run: encoding its dispatches (to the submit), and the GPU's part (the submit to its reads mapped).
+/// A chain's run: encoding its dispatches (to the submit), and the GPU's part (the submit to its reads mapped), of
+/// which the submit itself (the host's work in it).
 pub static CHAIN_ENCODE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 pub static CHAIN_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub static CHAIN_SUBMIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// The device's polls while a chain's reads are waited for ([`polls_on`]): their time, and how many.
+pub static CHAIN_POLLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// A dense call ([`crate::dense::forward_batch`]): what it makes before its submit (the inputs' uploads, its
 /// buffers and bind groups, the passes), the submit, and the wait for its read-back; and the bytes of the weights
@@ -36,8 +40,11 @@ pub(crate) fn add(counter: &[AtomicU64; 2], start: Instant) {
 pub fn take_line() -> String {
     let take = |c: &[AtomicU64; 2]| (c[0].swap(0, Ordering::Relaxed) as f64 / 1e9, c[1].swap(0, Ordering::Relaxed));
     let (l, w, a) = (take(&LINEAR), take(&LINEAR_WAIT), take(&ATTENTION));
-    let (e, cw) = (take(&CHAIN_ENCODE), take(&CHAIN_WAIT));
-    format!("projections {:.3} s ({}), of it waiting for the GPU {:.3} s; attention {:.3} s ({}); chains encoding {:.3} s ({}), on the GPU {:.3} s", l.0, l.1, w.0, a.0, a.1, e.0, e.1, cw.0)
+    let (e, cw, cs, cp) = (take(&CHAIN_ENCODE), take(&CHAIN_WAIT), take(&CHAIN_SUBMIT), take(&CHAIN_POLLS));
+    format!(
+        "projections {:.3} s ({}), of it waiting for the GPU {:.3} s; attention {:.3} s ({}); chains encoding {:.3} s ({}), on the GPU {:.3} s (the submits {:.3} s, polls {:.3} s of {})",
+        l.0, l.1, w.0, a.0, a.1, e.0, e.1, cw.0, cs.0, cp.0, cp.1
+    )
 }
 
 /// A chain's kernels timed on the GPU (`OAIY_CHAIN_PROFILE`): each dispatch in a pass of its own between two
@@ -45,6 +52,12 @@ pub fn take_line() -> String {
 pub fn chain_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OAIY_CHAIN_PROFILE").is_some())
+}
+
+/// The device's polls timed while a chain's reads are waited for (`OAIY_CHAIN_POLLS`).
+pub fn polls_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OAIY_CHAIN_POLLS").is_some())
 }
 
 /// A chain's pieces timed on the GPU (`OAIY_PIECE_STAMPS`): each submitted pass between two timestamps, and a

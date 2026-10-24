@@ -105,7 +105,25 @@ pub fn take() -> Vec<(Part, f64, u64)> {
         .collect()
 }
 
-/// [`take`] as one line: the parts that ran, `name s (calls)`.
+/// [`take`] as one line: the parts that ran, `name s (calls)`; and how well a layer's experts were foretold, where they
+/// were ([`foretold`]).
 pub fn take_line() -> String {
-    take().into_iter().filter(|(_, _, c)| *c > 0).map(|(p, s, c)| format!("{} {s:.2} s ({c})", p.name())).collect::<Vec<_>>().join(", ")
+    let mut line = take().into_iter().filter(|(_, _, c)| *c > 0).map(|(p, s, c)| format!("{} {s:.2} s ({c})", p.name())).collect::<Vec<_>>().join(", ");
+    let [routed, in6, in8] = FORETOLD.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+    if routed > 0 {
+        line += &format!(", experts foretold before attention {:.0}% in the top 6, {:.0}% in the top 8 ({routed})", 100.0 * in6 as f64 / routed as f64, 100.0 * in8 as f64 / routed as f64);
+    }
+    line
+}
+
+/// A decode step's experts against a foretelling of them (OAIY_DSV41_FORETELL): routed, and of those, among the
+/// foretold top 6 and top 8.
+static FORETOLD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Count `routed` experts against a foretold ranking (`foretold`, the most likely first).
+pub fn foretold(routed: &[u32], foretold: &[u32]) {
+    let within = |k: usize| routed.iter().filter(|e| foretold[..k.min(foretold.len())].contains(e)).count() as u64;
+    FORETOLD[0].fetch_add(routed.len() as u64, Ordering::Relaxed);
+    FORETOLD[1].fetch_add(within(6), Ordering::Relaxed);
+    FORETOLD[2].fetch_add(within(8), Ordering::Relaxed);
 }

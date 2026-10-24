@@ -1,4 +1,4 @@
-//! DeepSeek-V4.1 attention (reference `Attention`, `Compressor`, `Indexer`,
+﻿//! DeepSeek-V4.1 attention (reference `Attention`, `Compressor`, `Indexer`,
 //! `select_candidate_blocks`, `sparse_attn`).
 //!
 //! Every layer attends over a 128-token sliding window of its own KV. Layers
@@ -22,7 +22,7 @@
 //! and `wo_b`.
 //!
 //! Prefill runs at `start_pos == 0` over the whole prompt; decode is one
-//! token at a time — the same contract as the reference. A chunk of several
+//! token at a time â€” the same contract as the reference. A chunk of several
 //! tokens can also continue a sequence (a conversation's next turn, read in one
 //! pass rather than a token at a time): each of its tokens attends to exactly
 //! what a decode step at its position would, in the same order, so the result
@@ -59,6 +59,18 @@ pub struct AttnState {
 
 /// Rows of a compressing source's projections [`AttnState`] keeps (more than a draft's check reads at once).
 const RECENT: usize = 16;
+
+/// Each group of the output's heads on its own row, a part of `wo_a` each (`(part, row)`): a step's jobs of the stack's
+/// group ([`Attention::output_steps`]).
+const DIAGONAL: [(u32, u32); 16] = {
+    let mut d = [(0u32, 0u32); 16];
+    let mut i = 0;
+    while i < 16 {
+        d[i] = (i as u32, i as u32);
+        i += 1;
+    }
+    d
+};
 
 /// Rows of a pass whose projections go two stages a call where a device takes both (its queries with its projections of
 /// x, `linear::normed_together`; its output's two, `linear::chained_together`): a step's, a draft's, a draft's check's.
@@ -340,6 +352,40 @@ impl Attention {
         states: &mut [AttnState],
         shared: &mut Shared,
     ) -> Result<Vec<f32>> {
+        Ok(self.forward_side(cfg, x, t, start_pos, states, shared, None)?.0)
+    }
+
+    /// [`Self::forward`], and `side`'s projection of its own input (`(weight, input)`: the sublayer's mixing projection
+    /// of the stream, [`crate::dsv41::hc::HcParams::on_device`]) made in the same call as the layer's projections of x,
+    /// `[t, side.n()]` in f32 (a round trip of the host's work fewer).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn forward_side(
+        &self,
+        cfg: &Config,
+        x: &[f32],
+        t: usize,
+        start_pos: usize,
+        states: &mut [AttnState],
+        shared: &mut Shared,
+        side: Option<(&Weight, &[f32])>,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+        let (o, mut sides) = self.forward_core(cfg, x, t, start_pos, states, shared, side.as_slice())?;
+        Ok((self.output(cfg, &o, t), sides.pop()))
+    }
+
+    /// [`Self::forward_side`] up to the heads' outputs (`[t, heads, head_dim]`, the rows the output projection takes:
+    /// [`Self::output_steps`] puts it in a device program).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn forward_core(
+        &self,
+        cfg: &Config,
+        x: &[f32],
+        t: usize,
+        start_pos: usize,
+        states: &mut [AttnState],
+        shared: &mut Shared,
+        sides: &[(&Weight, &[f32])],
+    ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
         let (hd, nh, rd, win) = (cfg.head_dim, cfg.n_heads, cfg.rope_head_dim, cfg.window_size);
         if t == 0 {
             return Err(Error::Arg("no tokens".into()));
@@ -364,8 +410,12 @@ impl Attention {
         if let Some(ix) = indexer {
             of_x.push((&ix.weights_proj, x, t, 0..ix.weights_proj.n(), Out::Bf16));
         }
+        for &(w, input) in sides {
+            of_x.push((w, input, t, 0..w.n(), Out::F32));
+        }
         // and the queries (the indexer's too, of the same row)
-        let (made_x, made_q) = self.queries(cfg, &of_x, indexer.map(|ix| &ix.wq_b), t);
+        let (mut made_x, made_q) = self.queries(cfg, &of_x, indexer.map(|ix| &ix.wq_b), t);
+        let side_out = made_x.split_off(made_x.len() - sides.len());
         let mut made = made_x.into_iter().skip(1);
         let kva = made.next().expect("the window's projection");
         let compressed = compressor.map(|c| (made.next().expect("the compressor's keys"), (c.ratio > 1).then(|| made.next().expect("the compressor's gate"))));
@@ -552,13 +602,59 @@ impl Attention {
         };
         crate::dsv41::profile::add(crate::dsv41::profile::Part::SparseAttention, attending);
 
-        Ok(self.output(cfg, &o, t))
+        Ok((o, side_out))
+    }
+
+    /// One row's output projection of the heads' outputs `o` (`[heads, head_dim]`) as steps of a device program: each
+    /// group's input, `wo_a`'s part of it, the groups' rows rounded to bf16 and laid end to end, `wo_b` of them and its
+    /// sums rounded to bf16 (as [`Self::output`] makes them, to the bit). The step whose vector is the output (`[dim]`),
+    /// or None where `wo_a` is not a stack of a part a group (an EXL3 checkpoint's: the program takes no other).
+    pub(crate) fn output_steps<'a>(&'a self, cfg: &Config, o: &'a [f32], steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> Option<usize> {
+        use crate::dsv41::linear::Step;
+        let Weight::Stacked { parts, rows, group, .. } = &self.wo_a else { return None };
+        let (g, gd, orank, d) = (cfg.o_groups, cfg.n_heads * cfg.head_dim / cfg.o_groups, cfg.o_lora_rank, cfg.dim);
+        if parts.len() != g || *rows != orank || o.len() != g * gd {
+            return None;
+        }
+        let rows_in = match group {
+            // every group's heads a row of `o`, each part on its own row in one pass, their rows rounded at once
+            Some(group) if g <= DIAGONAL.len() => {
+                let input = steps.len();
+                steps.push(Step::Input(o));
+                steps.push(Step::MulGroup { group, x: input, jobs: &DIAGONAL[..g] });
+                let rows_in = steps.len();
+                steps.push(Step::Scratch(g * orank));
+                steps.push(Step::CopyColsBf16 { src: input + 1, src_stride: g * orank, src_at: 0, dst: rows_in, dst_stride: g * orank, dst_at: 0, width: g * orank, rows: 1 });
+                rows_in
+            }
+            _ => {
+                let first = steps.len();
+                for grp in 0..g {
+                    steps.push(Step::Input(&o[grp * gd..(grp + 1) * gd]));
+                }
+                for (grp, part) in parts.iter().enumerate() {
+                    steps.push(Step::Mul { w: part, x: first + grp, rows: 1 });
+                }
+                let rows_in = steps.len();
+                steps.push(Step::Scratch(g * orank));
+                for grp in 0..g {
+                    steps.push(Step::CopyColsBf16 { src: first + g + grp, src_stride: orank, src_at: 0, dst: rows_in, dst_stride: g * orank, dst_at: grp * orank, width: orank, rows: 1 });
+                }
+                rows_in
+            }
+        };
+        let sums = steps.len();
+        steps.push(Step::Mul { w: &self.wo_b, x: rows_in, rows: 1 });
+        let out = steps.len();
+        steps.push(Step::Scratch(d));
+        steps.push(Step::CopyColsBf16 { src: sums, src_stride: d, src_at: 0, dst: out, dst_stride: d, dst_at: 0, width: d, rows: 1 });
+        Some(out)
     }
 
     /// The grouped low-rank output of `t` rows of the attention's output `o` (`wo_a` block-diagonal over the groups,
     /// then `wo_b`): a step's or a check's two projections in one call where a device holds both, the groups' rows
     /// rounded there (the second was a round trip of its own, a layer); else a call each.
-    fn output(&self, cfg: &Config, o: &[f32], t: usize) -> Vec<f32> {
+    pub(crate) fn output(&self, cfg: &Config, o: &[f32], t: usize) -> Vec<f32> {
         let (g, gd, orank) = (cfg.o_groups, cfg.n_heads * cfg.head_dim / cfg.o_groups, cfg.o_lora_rank);
         let xgs: Vec<Vec<f32>> = (0..g).map(|grp| (0..t).flat_map(|i| o[(i * g + grp) * gd..(i * g + grp + 1) * gd].iter().copied()).collect()).collect();
         if t <= CHAINED_ROWS {
@@ -630,7 +726,7 @@ impl Attention {
             // DEVIATION from the reference, deliberately: `Indexer.forward` only
             // publishes `shared_attn.index_k` when a new latent arrived, so on a
             // ratio-2 decode step that completes no group, layers 2/8/14 score
-            // against whatever was published last — layer 20's (ratio-1) keys
+            // against whatever was published last â€” layer 20's (ratio-1) keys
             // from the previous step, sliced to end_pos/2 rows. An owner's own
             // cache is always the right one. Unobservable while end_pos/ratio
             // <= index_topk (every position is kept), which covers the golden

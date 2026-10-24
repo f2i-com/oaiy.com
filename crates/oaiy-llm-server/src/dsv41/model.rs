@@ -56,6 +56,9 @@ pub struct Model {
     shared: Shared,
     experts: Experts,
     max_seq: usize,
+    /// Whether a decode step's mixing is made on the device where it holds the projections (true unless
+    /// OAIY_DSV41_HOST_MIXING=1, or [`Model::set_device_mixing`]): within roundings of the host's.
+    device_mixing: bool,
 }
 
 /// Intermediate-value sink for tests and debugging: `(name, values)`.
@@ -161,8 +164,14 @@ impl Model {
                 format,
             },
             max_seq: opts.max_seq,
+            device_mixing: std::env::var("OAIY_DSV41_HOST_MIXING").as_deref() != Ok("1"),
             cfg,
         })
+    }
+
+    /// Make a decode step's mixing on the device where it holds the projections (`on`), or here.
+    pub fn set_device_mixing(&mut self, on: bool) {
+        self.device_mixing = on;
     }
 
     pub fn max_seq(&self) -> usize {
@@ -232,6 +241,20 @@ impl Model {
 
         let cols = self.hasher.cols();
         let n_eng = self.cfg.engram_layer_ids.len();
+        // Every Engram layer's rows asked of its table now: they come from the drive while the layers before it run
+        // (a fresh subject's step waited some 5 ms for them at the layers, a familiar one's page cache a fraction).
+        let mut begun: Vec<Option<crate::dsv41::engram::Begun>> = Vec::with_capacity(self.layers.len());
+        for ly in &self.layers {
+            begun.push(match &ly.engram {
+                Some(eg) => {
+                    let hs: Vec<i64> = (0..t)
+                        .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
+                        .collect();
+                    Some(eg.begin(&hs)?)
+                }
+                None => None,
+            });
+        }
         for l in 0..self.cfg.n_layers {
             if let (Some(teach), true) = (teacher, l > 0) {
                 let (th, tp) = teach(l)?;
@@ -241,12 +264,9 @@ impl Model {
                 h = th;
                 pre_mix = tp;
             }
-            if let Some(eg) = &self.layers[l].engram {
-                let hs: Vec<i64> = (0..t)
-                    .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
-                    .collect();
+            if let (Some(eg), Some(rows)) = (&self.layers[l].engram, begun[l].take()) {
                 let looking_up = std::time::Instant::now();
-                h = eg.forward(&self.cfg, &h, t, &hs)?;
+                h = eg.forward_begun(&self.cfg, &h, t, rows)?;
                 crate::dsv41::profile::add(crate::dsv41::profile::Part::Engram, looking_up);
             }
             if let Some(at) = rows.targets.iter().position(|&target| target == l) {
@@ -270,7 +290,7 @@ impl Model {
         if let Some(gpu) = &self.experts.gpu {
             gpu.pass_done(t, &self.experts.cache, self.experts.store.as_ref());
         }
-        self.experts.refill_evicted();
+        self.experts.settle_tiers();
         // The experts' counts of uses age as the tokens go by, and the RAM cache's own with them: both then say what
         // has been used of late.
         if t == 1 && self.experts.uses.step() {
@@ -297,7 +317,7 @@ impl Model {
         pre_mix: &[[f32; HC]],
         trace: Trace<'_>,
     ) -> Result<(Vec<f32>, Vec<[f32; HC]>, Vec<Route>)> {
-        let Model { cfg, layers, states, shared, experts, .. } = self;
+        let Model { cfg, layers, states, shared, experts, device_mixing, .. } = self;
         let ly = &layers[l];
         let (d, eps) = (cfg.dim, cfg.norm_eps);
         // token i's [HC, dim] stream inside a [t, HC, dim] buffer
@@ -315,23 +335,99 @@ impl Model {
                 let stop = &stop;
                 scope.spawn(move || experts.prefetch(l as u32, n_experts, stop));
             }
+            // A decode step's mixing projections where a device holds them: made in the sublayer's own call there (the
+            // attention's projections of x, the router's), the host making only their cheap tail; else all of it here.
+            let (side_attn, side_ffn) = if t == 1 && *device_mixing { (ly.hc_attn.on_device(), ly.hc_ffn.on_device()) } else { (None, None) };
             let mixing = std::time::Instant::now();
-            let attn_mix = mixes(h, &ly.hc_attn);
-            let x: Vec<f32> = per_token(t, |i| hc::pre(&h[tok(i)], &pre_mix[i])).concat();
+            let attn_mix_here = side_attn.is_none().then(|| mixes(h, &ly.hc_attn));
+            let collapsed: Vec<f32> = per_token(t, |i| hc::pre(&h[tok(i)], &pre_mix[i])).concat();
             crate::dsv41::profile::add(crate::dsv41::profile::Part::Mixing, mixing);
-            let x = rmsnorm(&x, &ly.attn_norm, eps);
-            let a = ly.attn.forward(cfg, &x, t, start_pos, states, shared);
+            let x = rmsnorm(&collapsed, &ly.attn_norm, eps);
+            // (OAIY_DSV41_FORETELL=1: the layer's router on the attention's input too, in the same call, and how much of
+            // what it then routes to that foretold, counted for the log: what an upload begun before attention could know)
+            static FORETELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let router = ly.moe.router_and_shared()[0];
+            let foretell = t == 1 && matches!(router, crate::dsv41::linear::Weight::Device { .. }) && *FORETELL.get_or_init(|| std::env::var("OAIY_DSV41_FORETELL").as_deref() == Ok("1"));
+            // (the stream as the attention takes it, normed as the FFN norms its own input: the router's way of seeing it)
+            let ffn_seen = foretell.then(|| rmsnorm(&collapsed, &ly.ffn_norm, eps));
+            let mut sides: Vec<(&crate::dsv41::linear::Weight, &[f32])> = side_attn.map(|w| (w, h)).into_iter().collect();
+            if let Some(seen) = &ffn_seen {
+                sides.push((router, &seen[..]));
+            }
+            let o = ly.attn.forward_core(cfg, &x, t, start_pos, states, shared, &sides);
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let a = a?;
-            trace(&format!("layer{l:02}.attn_out"), &a);
+            let (o, mut made_sides) = o?;
+            let foretold = foretell.then(|| made_sides.pop().expect("the foretelling router's logits"));
+            let attn_proj = made_sides.pop();
             let mixing = std::time::Instant::now();
-            let h1: Vec<f32> = per_token(t, |i| hc::post(&a[i * d..(i + 1) * d], &h[tok(i)], &attn_mix[i])).concat();
-
-            let ffn_mix = mixes(&h1, &ly.hc_ffn);
-            let x: Vec<f32> = per_token(t, |i| hc::pre(&h1[tok(i)], &attn_mix[i].pre)).concat();
+            let attn_mix = match (attn_mix_here, attn_proj) {
+                (Some(m), _) => m,
+                (None, proj) => vec![hc::mixes_of(&proj.expect("the attention's mixing projection"), h, &ly.hc_attn, eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)],
+            };
             crate::dsv41::profile::add(crate::dsv41::profile::Part::Mixing, mixing);
-            let x = rmsnorm(&x, &ly.ffn_norm, eps);
-            let (m, routes) = ly.moe.forward(cfg, &x, t, experts)?;
+            // A decode step's output projection, the hyper-connection's spread of it and the FFN's input (its collapse and
+            // norm), and the router's, the shared expert's and the mixing's projections of those, in one program on the
+            // device where it holds them all: the output's call and the router's were a round trip each, and the host's
+            // mixing and norm between them. Else each as before.
+            let program = side_ffn.and_then(|fw| {
+                use crate::dsv41::linear::Step;
+                let flat = attn_mix[0].flat();
+                let mut steps = Vec::new();
+                let a = ly.attn.output_steps(cfg, &o, &mut steps)?;
+                let (hi, mi) = (steps.len(), steps.len() + 1);
+                steps.push(Step::Input(h));
+                steps.push(Step::Input(&flat));
+                let h1 = steps.len();
+                steps.push(Step::HcPost { out: a, res: hi, mix: mi, d });
+                steps.push(Step::HcPre { h: h1, mix: mi, d });
+                let xn = steps.len();
+                steps.push(Step::Norm { x: h1 + 1, weight: &ly.ffn_norm, eps, rows: 1, width: d });
+                let [router, w1, w3, w2] = ly.moe.router_and_shared();
+                let made = steps.len();
+                for w in [router, w1, w3] {
+                    steps.push(Step::Mul { w, x: xn, rows: 1 });
+                }
+                steps.push(Step::Mul { w: fw, x: h1, rows: 1 });
+                // (the shared expert whole: its activation the host's to the bit, its down projection's sums read back)
+                let act = steps.len();
+                let limit = cfg.swiglu_limit;
+                steps.push(Step::SwigluBf16 { gate: made + 1, up: made + 2, len: w1.n(), silu: crate::dsv41::moe::silu_bf16_table(limit), limit });
+                steps.push(Step::Mul { w: w2, x: act, rows: 1 });
+                let reads = [(a, 0, d), (h1, 0, HC * d), (xn, 0, d), (made, 0, router.n()), (made + 3, 0, fw.n()), (act + 1, 0, w2.n())];
+                crate::dsv41::linear::run_program(&steps, &reads)
+            });
+            let (a, h1, x, made) = match program {
+                Some(p) => {
+                    let [a, h1, x, logits, proj, shared]: [Vec<f32>; 6] = p.try_into().expect("six vectors read back");
+                    let shared: Vec<f32> = shared.into_iter().map(crate::dsv41::formats::to_bf16).collect();
+                    (a, h1, x, Some((logits, shared, proj)))
+                }
+                None => {
+                    let a = ly.attn.output(cfg, &o, t);
+                    let mixing = std::time::Instant::now();
+                    let h1: Vec<f32> = per_token(t, |i| hc::post(&a[i * d..(i + 1) * d], &h[tok(i)], &attn_mix[i])).concat();
+                    let x: Vec<f32> = per_token(t, |i| hc::pre(&h1[tok(i)], &attn_mix[i].pre)).concat();
+                    crate::dsv41::profile::add(crate::dsv41::profile::Part::Mixing, mixing);
+                    let x = rmsnorm(&x, &ly.ffn_norm, eps);
+                    (a, h1, x, None)
+                }
+            };
+            trace(&format!("layer{l:02}.attn_out"), &a);
+            let ffn_mix_here = side_ffn.is_none().then(|| mixes(&h1, &ly.hc_ffn));
+            let (m, routes, ffn_proj) = match made {
+                Some((logits, shared, proj)) => {
+                    let (m, routes) = ly.moe.forward_from(cfg, &x, t, experts, logits, None, Some(shared))?;
+                    (m, routes, Some(proj))
+                }
+                None => ly.moe.forward_side(cfg, &x, t, experts, side_ffn.map(|w| (w, &h1[..])))?,
+            };
+            let ffn_mix = match (ffn_mix_here, ffn_proj) {
+                (Some(m), _) => m,
+                (None, proj) => vec![hc::mixes_of(&proj.expect("the router's mixing projection"), &h1, &ly.hc_ffn, eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)],
+            };
+            if let (Some(logits), Some(r)) = (&foretold, routes.first()) {
+                crate::dsv41::profile::foretold(&r.experts, &ly.moe.ranked(logits, 8));
+            }
             trace(&format!("layer{l:02}.moe_out"), &m);
             trace(&format!("layer{l:02}.route_ids"), &routes.iter().flat_map(|r| r.experts.iter().map(|&e| e as f32)).collect::<Vec<_>>());
             trace(&format!("layer{l:02}.route_w"), &routes.iter().flat_map(|r| r.weights.iter().copied()).collect::<Vec<_>>());
@@ -463,9 +559,21 @@ impl Model {
             if let Some(e) = &mut layer.engram {
                 named.push((format!("layers.{l}.engram.wkv"), e.weight_mut()));
             }
+            named.push((format!("layers.{l}.hc_attn_fn"), layer.hc_attn.weight_mut()));
+            named.push((format!("layers.{l}.hc_ffn_fn"), layer.hc_ffn.weight_mut()));
         }
         named.push(("head".into(), &mut self.head));
-        place_all(named, &mut place)
+        let placed = place_all(named, &mut place);
+        // (a mixing projection no device took is made here from the host's own copy: its stored one let go)
+        for layer in &mut self.layers {
+            for w in [layer.hc_attn.weight_mut(), layer.hc_ffn.weight_mut()] {
+                if let Weight::F32 { w, k, .. } = w {
+                    *w = Vec::new();
+                    *k = 0;
+                }
+            }
+        }
+        placed
     }
 
     /// The embedding (a drafter's rows are made of it too).
@@ -480,11 +588,18 @@ impl Model {
 }
 
 /// [`Model::offload`]'s placing of `named` weights: each given to `place` with its name, the weight it returns put in its
-/// place. A stack's parts are placed one by one (an EXL3 checkpoint's `wo_a`, a slice a group), by their own names. How
-/// many were placed, and their bytes as stored.
+/// place. A stack's parts are placed one by one (an EXL3 checkpoint's `wo_a`, a slice a group), by their own names,
+/// after the stack is offered whole (`{name}.group`: a device that takes it so keeps its group, which a step's
+/// program then multiplies in one pass). How many were placed, and their bytes as stored.
 pub(crate) fn place_all(named: Vec<(String, &mut Weight)>, place: &mut impl FnMut(&str, &Weight) -> Option<Weight>) -> (usize, u64) {
     let (mut count, mut bytes) = (0usize, 0u64);
     for (name, w) in named {
+        if matches!(w, Weight::Stacked { group: None, .. }) {
+            let made = place(&format!("{name}.group"), w).map(Box::new);
+            if let Weight::Stacked { group, .. } = w {
+                *group = made;
+            }
+        }
         let parts: Vec<(String, &mut Weight)> = match w {
             Weight::Stacked { parts, .. } => parts.iter_mut().enumerate().map(|(i, p)| (format!("{name}.slice.{i}"), p)).collect(),
             w => vec![(name, w)],

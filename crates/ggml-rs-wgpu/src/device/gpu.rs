@@ -211,11 +211,16 @@ impl Gpu {
     /// OS's wake was most of such a wait).
     pub(crate) fn wait_soon(&self, index: wgpu::SubmissionIndex, mapped: &std::sync::atomic::AtomicBool, spin: std::time::Duration) {
         let began = std::time::Instant::now();
+        let timed = crate::profile::polls_on();
         while !mapped.load(Ordering::Acquire) {
             if began.elapsed() >= spin {
                 return self.wait(Some(index));
             }
+            let polled = timed.then(std::time::Instant::now);
             let _ = self.device.poll(wgpu::PollType::Poll);
+            if let Some(t) = polled {
+                crate::profile::add(&crate::profile::CHAIN_POLLS, t);
+            }
             std::hint::spin_loop();
         }
         if let Some(why) = self.lost.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
