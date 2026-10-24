@@ -60,6 +60,10 @@ pub struct AttnState {
 /// Rows of a compressing source's projections [`AttnState`] keeps (more than a draft's check reads at once).
 const RECENT: usize = 16;
 
+/// Rows of a pass whose projections go two stages a call where a device takes both (its queries with its projections of
+/// x, `linear::normed_together`; its output's two, `linear::chained_together`): a step's, a draft's, a draft's check's.
+const CHAINED_ROWS: usize = 8;
+
 /// What a pass of rows from `start` writes over in a layer's caches, as it was ([`AttnState::save`]).
 #[derive(Clone)]
 pub struct Saved {
@@ -251,10 +255,9 @@ impl Attention {
         if t == 0 || self.ratio != 0 {
             return Err(Error::Arg(format!("layer {}: a draft of {t} rows on a layer of ratio {}", self.layer, self.ratio)));
         }
-        let mut made = crate::dsv41::linear::forward_together(&[(&self.wq_a, x, t, 0..self.wq_a.n(), Out::Bf16), (&self.wkv, x, t, 0..self.wkv.n(), Out::Bf16)]).into_iter();
-        let (qa, kva) = (made.next().expect("the queries' projection"), made.next().expect("the window's projection"));
-        let qr = rmsnorm(&qa, &self.q_norm, cfg.norm_eps);
-        let mut q = self.wq_b.forward(&qr, t, Out::Bf16);
+        let (made_x, made_q) = self.queries(cfg, &[(&self.wq_a, x, t, 0..self.wq_a.n(), Out::Bf16), (&self.wkv, x, t, 0..self.wkv.n(), Out::Bf16)], None, t);
+        let kva = made_x.into_iter().nth(1).expect("the window's projection");
+        let mut q = made_q.into_iter().next().expect("the queries");
         for i in 0..t {
             for h in 0..nh {
                 let base = (i * nh + h) * hd;
@@ -302,17 +305,7 @@ impl Attention {
             .collect();
         let o = pool.run(jobs).concat();
         drop(pool);
-        let (g, gd, orank) = (cfg.o_groups, nh * hd / cfg.o_groups, cfg.o_lora_rank);
-        let xgs: Vec<Vec<f32>> = (0..g).map(|grp| (0..t).flat_map(|i| o[(i * g + grp) * gd..(i * g + grp + 1) * gd].iter().copied()).collect()).collect();
-        let groups: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> =
-            xgs.iter().enumerate().map(|(grp, xg)| (&self.wo_a, xg.as_slice(), t, grp * orank..(grp + 1) * orank, Out::Bf16)).collect();
-        let mut og = vec![0.0f32; t * g * orank];
-        for (grp, yg) in crate::dsv41::linear::forward_together(&groups).into_iter().enumerate() {
-            for i in 0..t {
-                og[(i * g + grp) * orank..(i * g + grp + 1) * orank].copy_from_slice(&yg[i * orank..(i + 1) * orank]);
-            }
-        }
-        Ok(self.wo_b.forward(&og, t, Out::Bf16))
+        Ok(self.output(cfg, &o, t))
     }
 
     /// Fresh caches for this layer, sized for `max_seq` positions.
@@ -371,18 +364,13 @@ impl Attention {
         if let Some(ix) = indexer {
             of_x.push((&ix.weights_proj, x, t, 0..ix.weights_proj.n(), Out::Bf16));
         }
-        let mut made = crate::dsv41::linear::forward_together(&of_x).into_iter();
-        let (qa, kva) = (made.next().expect("the queries' projection"), made.next().expect("the window's projection"));
+        // and the queries (the indexer's too, of the same row)
+        let (made_x, made_q) = self.queries(cfg, &of_x, indexer.map(|ix| &ix.wq_b), t);
+        let mut made = made_x.into_iter().skip(1);
+        let kva = made.next().expect("the window's projection");
         let compressed = compressor.map(|c| (made.next().expect("the compressor's keys"), (c.ratio > 1).then(|| made.next().expect("the compressor's gate"))));
         let index_weights = indexer.map(|_| made.next().expect("the indexer's weights"));
-
-        // queries (and the indexer's, of the same row, together)
-        let qr = rmsnorm(&qa, &self.q_norm, cfg.norm_eps);
-        let mut of_qr: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = vec![(&self.wq_b, &qr, t, 0..self.wq_b.n(), Out::Bf16)];
-        if let Some(ix) = indexer {
-            of_qr.push((&ix.wq_b, &qr, t, 0..ix.wq_b.n(), Out::Bf16));
-        }
-        let mut made = crate::dsv41::linear::forward_together(&of_qr).into_iter();
+        let mut made = made_q.into_iter();
         let mut q = made.next().expect("the queries");
         let index_q = indexer.map(|_| made.next().expect("the indexer's queries"));
         for i in 0..t {
@@ -564,26 +552,46 @@ impl Attention {
         };
         crate::dsv41::profile::add(crate::dsv41::profile::Part::SparseAttention, attending);
 
-        // grouped low-rank output: wo_a is block-diagonal over o_groups
-        let (g, gd, orank) = (cfg.o_groups, nh * hd / cfg.o_groups, cfg.o_lora_rank);
-        let mut og = vec![0.0f32; t * g * orank];
+        Ok(self.output(cfg, &o, t))
+    }
+
+    /// The grouped low-rank output of `t` rows of the attention's output `o` (`wo_a` block-diagonal over the groups,
+    /// then `wo_b`): a step's or a check's two projections in one call where a device holds both, the groups' rows
+    /// rounded there (the second was a round trip of its own, a layer); else a call each.
+    fn output(&self, cfg: &Config, o: &[f32], t: usize) -> Vec<f32> {
+        let (g, gd, orank) = (cfg.o_groups, cfg.n_heads * cfg.head_dim / cfg.o_groups, cfg.o_lora_rank);
         let xgs: Vec<Vec<f32>> = (0..g).map(|grp| (0..t).flat_map(|i| o[(i * g + grp) * gd..(i * g + grp + 1) * gd].iter().copied()).collect()).collect();
-        // A decode step's two projections in one call where a device holds both, the groups' row rounded there (the
-        // second was a round trip of its own, a layer).
-        if t == 1 {
+        if t <= CHAINED_ROWS {
             let first: Vec<(&Weight, &[f32], std::ops::Range<usize>)> = xgs.iter().enumerate().map(|(grp, xg)| (&self.wo_a, xg.as_slice(), grp * orank..(grp + 1) * orank)).collect();
-            if let Some(y) = crate::dsv41::linear::chained_together(&first, &self.wo_b, Out::Bf16) {
-                return Ok(y);
+            if let Some(y) = crate::dsv41::linear::chained_together(&first, &self.wo_b, t, Out::Bf16) {
+                return y;
             }
         }
         let groups: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> =
             xgs.iter().enumerate().map(|(grp, xg)| (&self.wo_a, xg.as_slice(), t, grp * orank..(grp + 1) * orank, Out::Bf16)).collect();
+        let mut og = vec![0.0f32; t * g * orank];
         for (grp, yg) in crate::dsv41::linear::forward_together(&groups).into_iter().enumerate() {
             for i in 0..t {
                 og[(i * g + grp) * orank..(i * g + grp + 1) * orank].copy_from_slice(&yg[i * orank..(i + 1) * orank]);
             }
         }
-        Ok(self.wo_b.forward(&og, t, Out::Bf16))
+        self.wo_b.forward(&og, t, Out::Bf16)
+    }
+
+    /// The queries (`wq_b`, and `also`'s: the indexer's, of the same row) of `t` rows' low-rank row (`wq_a` of x, the
+    /// first of `of_x`, normed), and every projection of x in `of_x`: a step's or a check's in one call where a device
+    /// takes both stages, the norm made there (a round trip fewer a layer); else a call each, the norm here.
+    /// `(of_x's outputs, the queries and also's)`.
+    #[allow(clippy::type_complexity)]
+    fn queries(&self, cfg: &Config, of_x: &[(&Weight, &[f32], usize, std::ops::Range<usize>, Out)], also: Option<&Weight>, t: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let of_qr: Vec<(&Weight, std::ops::Range<usize>, Out)> = std::iter::once(&self.wq_b).chain(also).map(|w| (w, 0..w.n(), Out::Bf16)).collect();
+        if let Some(both) = (t <= CHAINED_ROWS).then(|| crate::dsv41::linear::normed_together(of_x, 0, &self.q_norm, cfg.norm_eps, &of_qr)).flatten() {
+            return both;
+        }
+        let made_x = crate::dsv41::linear::forward_together(of_x);
+        let qr = rmsnorm(&made_x[0], &self.q_norm, cfg.norm_eps);
+        let with: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = of_qr.iter().map(|(w, rows, out)| (*w, &qr[..], t, rows.clone(), *out)).collect();
+        (made_x, crate::dsv41::linear::forward_together(&with))
     }
 
     #[allow(clippy::too_many_arguments)]

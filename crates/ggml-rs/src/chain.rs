@@ -305,6 +305,10 @@ pub trait ChainRecorder {
     }
     /// `dst[dst_at..dst_at + len] = src[src_at..src_at + len]`.
     fn copy(&mut self, src: &DeviceVec, src_at: usize, dst: &DeviceVec, dst_at: usize, len: usize);
+    /// Columns `src_at..src_at + width` of each of `rows` rows of `src` (`src_stride` long) to `dst_at..` of the same
+    /// rows of `dst` (`dst_stride` long), each value rounded to bf16 (to nearest even, as a host's `to_bf16`).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_cols_bf16(&mut self, src: &DeviceVec, src_stride: usize, src_at: usize, dst: &DeviceVec, dst_stride: usize, dst_at: usize, width: usize, rows: usize);
     /// One query's attention over a layer's cache `kv` (row `t`: its K `[n_kv, head_dim]` then its V), positions
     /// `lo..kv_len`, each query head on its KV head (`h / (n_h / n_kv)`): `out[..n_h * head_dim]` the result, the rest
     /// of `out` scratch ([`DeviceChain::attention_out_len`] long, `cap` the cache's rows).

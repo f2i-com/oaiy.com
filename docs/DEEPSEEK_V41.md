@@ -840,8 +840,9 @@ The checkpoint's `mtp.0..2` are DSpark's block drafter, run as DeepInfer runs it
 - **Experts.** An EXL3 checkpoint's 384 drafter experts are held on the cards in slots of
   their own (5 GB). A check of up to eight rows sends its experts a decode step's way: held
   experts are begun first, and read ones are kept as a step's are.
-- **When it runs.** On for an EXL3 checkpoint. `OAIY_DSV41_DRAFT=0` turns it off, and `=1`
-  turns it on for an fp8 checkpoint too.
+- **When it runs.** Where `OAIY_DSV41_DRAFT=1` asks for it. It was on for an EXL3
+  checkpoint until a step's calls were cut (see "Fewer calls a token"); since then it no
+  longer pays there.
 
 A pass's rows are summed apart from a step's, so a drafted reply can differ from a
 step-by-step one where two tokens nearly tie (the same prompt gives the same reply either
@@ -862,6 +863,60 @@ against plain decoding:
   uploads of its experts that no card holds.
 - The fp8 checkpoint's checks send their experts to the CPU's workers. A two-row check
   costs four steps there, so drafting halves its speed, and it is off.
+
+## Fewer calls a token (2026-10-24, night)
+
+An EXL3 checkpoint's step made some 245 calls to its card a token, each a round trip.
+It now makes about 165. Two pairs of a layer's calls are joined, each of two stages on the
+card, to the bit of the calls apart:
+- **The queries with the projections of x** (`exl3::chained_normed`,
+  `linear::normed_together`). The queries' low-rank row is normed on the card as the host
+  norms it. The squares are added in the host's order. The mean, the square root and the
+  reciprocal are made correctly rounded by integer steps: the card's own `1 / sqrt`
+  differed from the host's in a quarter of values.
+- **The output's two projections** (`exl3::chained_after`, `linear::chained_together`).
+  The grouped `wo_a` rows are rounded to bf16 on the card, then `wo_b` takes them.
+
+A step's and a check's rows (up to eight) go these ways; a prompt's go as before. Inputs
+several projections share are uploaded once. Joining the shared expert's down projection
+to the router's call too was tried: it was no faster, since that call runs beside the
+routed experts, and its SwiGLU on the card was not the host's to the bit.
+
+The held experts cost about 1 ms a layer, where the same call alone took 0.3. Now:
+- **No thread.** They are begun on their cards with no thread started
+  (`Exl3Slots::begin_many`, a recording's `launch` and `wait`). Before, one was started for
+  them and one more for each card past the first, every layer.
+- **Kept vectors.** A step's jobs go through each pool's own kept vectors, with their bind
+  groups kept (`StepScratch`). Bind groups kept of the recording's pooled scratch filled the
+  device's store with new ones every call, the trunk's own among those it let go.
+- **The lock.** A recording no longer holds the device's lock while it waits for its
+  results, only while it submits.
+- **A check's rows.** An expert's few rows in a check go as jobs of a row each, a step's
+  kernel (`apart`), so each row's sums are a step's. They went a prompt's way before, a
+  block of 32 row places for one or two rows.
+
+Now about 0.4 ms a layer.
+
+Measured on the EXL3 checkpoint, same usage profile, 120-token greedy replies, plain
+decoding; every reply the same text as before, to the word:
+
+| Reply | Before | Now |
+|---|---|---|
+| A familiar subject | 6.9 tok/s | 8.8-9.1 tok/s |
+| Code | 5.6 tok/s | 6.6-6.7 tok/s |
+| The same again | 6.7 tok/s | 7.8-8.4 tok/s |
+| A new subject | 4.4 tok/s | 4.8-5.2 tok/s |
+
+A step of a familiar subject is now about 110 ms: the trunk's calls some 50 ms, the held
+experts 16, the uploads of the experts no card holds 19 (overlapping them), drive reads 15,
+and the CPU's attention, mixing and Engram some 15.
+
+DSpark's drafting no longer pays: a check's row past the first still costs about three
+quarters of a step, most of it the uploads of the experts that row adds. Drafted replies:
+a familiar subject 8.4-8.8 tok/s, code 6.8, a new subject 4.4. So it is off unless asked
+for, and its 5 GB on the cards holds experts instead. A check's rows are also not yet the
+same bits as steps (the shared expert's and the BF16 matrices' few-row kernels), so a
+drafted reply can still differ from a plain one where two tokens nearly tie.
 
 ## Phases
 

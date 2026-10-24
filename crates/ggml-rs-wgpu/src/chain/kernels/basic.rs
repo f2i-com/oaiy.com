@@ -520,6 +520,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// `y[r * p[1].x + p[0].y + i] = bf16(x[r * p[1].y + p[0].z + i])` for `i < p[0].x` of each of `p[0].w` rows: columns
+/// of each row copied, rounded to bf16 (to nearest even at bit 16, as the host's `to_bf16` of a number).
+pub(in crate::chain) const COPY_COLS_BF16: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let width = p[0].x;
+    let i = id.x + id.y * 16776960u;
+    if (i < width * p[0].w) {
+        let r = i / width;
+        let b = bitcast<u32>(x[r * p[1].y + p[0].z + i % width]);
+        y[r * p[1].x + p[0].y + i % width] = bitcast<f32>((b + 0x7fffu + ((b >> 16u) & 1u)) & 0xffff0000u);
+    }
+}
+"#;
+
 /// `y[r * p[0].x + i] = x[r * p[0].z + p[0].w + i]` for `r < p[0].y` rows of `p[0].x`: columns of each row.
 pub(in crate::chain) const COPY_COLS: &str = r#"
 @compute @workgroup_size(256)

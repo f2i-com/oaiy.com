@@ -261,19 +261,7 @@ pub enum ChainMat<'a> {
 pub fn chained(b: &WgpuBackend, items: &[(ChainMat<'_>, &[f32])]) -> Option<Vec<Vec<f32>>> {
     use ggml_rs::ChainRecorder;
     // each item's (k, n), its EXL3 projection checked as one this device holds in one buffer
-    let shapes: Vec<(usize, usize)> = items
-        .iter()
-        .map(|(m, x)| {
-            let (k, n) = match m {
-                ChainMat::Exl3(l) => {
-                    let g = l.as_any()?.downcast_ref::<Exl3Gpu>()?;
-                    (g.is_on(&b.gpu) && g.single_chunk().is_some()).then(|| g.kn())?
-                }
-                ChainMat::F16 { n, k, .. } | ChainMat::Bf16 { n, k, .. } => (*k, *n),
-            };
-            (!x.is_empty() && x.len() % k == 0).then_some((k, n))
-        })
-        .collect::<Option<_>>()?;
+    let shapes: Vec<(usize, usize)> = items.iter().map(|(m, x)| chain_shape(b, m).filter(|&(k, _)| !x.is_empty() && x.len() % k == 0)).collect::<Option<_>>()?;
     let one = shapes.iter().zip(items).all(|(&(k, _), (_, x))| x.len() == k);
     // (item, first row, rows) of every piece, a recording's pieces until their partial sums would pass the bound
     let mut recordings: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new()];
@@ -300,23 +288,17 @@ pub fn chained(b: &WgpuBackend, items: &[(ChainMat<'_>, &[f32])]) -> Option<Vec<
         // goes back to the recording when it is done with it (an f16 matmul's partial sums), and an input taken after
         // that may be that very buffer, its upload (made before the recording runs) then written over by the matmul
         // that ran first. A router's partial sums over a prompt's 15 rows so made the shared expert's input garbage.
+        let mut uploaded = Vec::new();
         let vecs: Vec<(DeviceVec, DeviceVec)> = pieces
             .iter()
             .map(|&(i, first, rows)| {
                 let (k, n) = shapes[i];
-                let xv = rec.scratch(rows * k);
-                DeviceChain::upload(b, &xv, &items[i].1[first * k..(first + rows) * k]);
-                (xv, rec.scratch(rows * n))
+                (upload_once(&mut rec, b, &mut uploaded, &items[i].1[first * k..(first + rows) * k]), rec.scratch(rows * n))
             })
             .collect();
         for (&(i, _, rows), (xv, yv)) in pieces.iter().zip(&vecs) {
-            let (k, n) = shapes[i];
-            match items[i].0 {
-                ChainMat::Exl3(l) => rec.exl3_rows_of(l, xv, None, yv, rows),
-                ChainMat::F16 { w, .. } => rec.matmul_f16_rows_f32(w, n, k, xv, yv, rows),
-                ChainMat::Bf16 { w, .. } => rec.matmul_bf16_rows_f32(w, n, k, xv, yv, rows),
-            }
-            rec.read_range(yv, 0, rows * n);
+            chain_mul(&mut rec, items[i].0, shapes[i], xv, yv, rows);
+            rec.read_range(yv, 0, rows * shapes[i].1);
         }
         for (&(i, ..), y) in pieces.iter().zip(Box::new(rec).finish()) {
             outs[i].extend_from_slice(&y);
@@ -324,6 +306,267 @@ pub fn chained(b: &WgpuBackend, items: &[(ChainMat<'_>, &[f32])]) -> Option<Vec<
     }
     Some(outs)
 }
+
+/// A step's rows (or a check's few: up to [`FEW_MAX`]) through two matrices in one chained recording on `b`: each of
+/// `first`'s matrices of its own rows (`(matrix, x, rows)`: those of its outputs), each row's taken rounded to bf16 and
+/// laid end to end on the device, then `then` of those rows; its sums, every row. The rounding is the host's to the bit
+/// (to nearest even at bit 16), so the sums are those of the two calls made one after the other with the rows brought
+/// back between (DeepSeek-V4.1's grouped `wo_a`, then `wo_b`: a round trip fewer a layer). None as [`chained`] is, or
+/// where the rows laid end to end are not `then`'s input, or the inputs are of other rows' counts or more.
+pub fn chained_after(b: &WgpuBackend, first: &[(ChainMat<'_>, &[f32], std::ops::Range<usize>)], then: ChainMat<'_>) -> Option<Vec<f32>> {
+    use ggml_rs::ChainRecorder;
+    let (k, n) = chain_shape(b, &then)?;
+    let shapes: Vec<(usize, usize)> = first.iter().map(|(m, x, rows)| chain_shape(b, m).filter(|&(k, n)| !x.is_empty() && x.len() % k == 0 && rows.end <= n && !rows.is_empty())).collect::<Option<_>>()?;
+    let t = first.first().map(|(_, x, _)| x.len() / shapes[0].0)?;
+    if t > FEW_MAX || first.iter().zip(&shapes).any(|((_, x, _), &(k, _))| x.len() != t * k) || first.iter().map(|(_, _, rows)| rows.len()).sum::<usize>() != k {
+        return None;
+    }
+    let mut rec = crate::chain::Recorder::new(b);
+    rec.keep_groups(t == 1);
+    // (inputs taken and written before anything is recorded, as `chained` takes them)
+    let xs: Vec<DeviceVec> = first
+        .iter()
+        .map(|(_, x, _)| {
+            let xv = rec.scratch(x.len());
+            DeviceChain::upload(b, &xv, x);
+            xv
+        })
+        .collect();
+    let ys: Vec<DeviceVec> = shapes.iter().map(|&(_, n)| rec.scratch(t * n)).collect();
+    let (rows_in, out) = (rec.scratch(t * k), rec.scratch(t * n));
+    let mut at = 0;
+    for ((((m, _, rows), &kn), xv), yv) in first.iter().zip(&shapes).zip(&xs).zip(&ys) {
+        chain_mul(&mut rec, *m, kn, xv, yv, t);
+        rec.copy_cols_bf16(yv, kn.1, rows.start, &rows_in, k, at, rows.len(), t);
+        at += rows.len();
+    }
+    chain_mul(&mut rec, then, (k, n), &rows_in, &out, t);
+    rec.read_range(&out, 0, t * n);
+    Box::new(rec).finish().pop()
+}
+
+/// `x` in a scratch vector of `rec`, uploaded once for every item of the recording that takes the same host rows (a
+/// layer's projections of x: each its own upload before).
+fn upload_once(rec: &mut crate::chain::Recorder<'_>, b: &WgpuBackend, uploaded: &mut Vec<((*const f32, usize), DeviceVec)>, x: &[f32]) -> DeviceVec {
+    let key = (x.as_ptr(), x.len());
+    if let Some((_, v)) = uploaded.iter().find(|(k, _)| *k == key) {
+        return v.clone();
+    }
+    let v = rec.scratch(x.len());
+    DeviceChain::upload(b, &v, x);
+    uploaded.push((key, v.clone()));
+    v
+}
+
+/// A chained recording's matrix's `(k, n)` on `b`: an EXL3 projection this device holds in one buffer, or a matrix of
+/// floats; None for another.
+fn chain_shape(b: &WgpuBackend, m: &ChainMat<'_>) -> Option<(usize, usize)> {
+    match m {
+        ChainMat::Exl3(l) => {
+            let g = l.as_any()?.downcast_ref::<Exl3Gpu>()?;
+            (g.is_on(&b.gpu) && g.single_chunk().is_some()).then(|| g.kn())
+        }
+        ChainMat::F16 { n, k, .. } | ChainMat::Bf16 { n, k, .. } => Some((*k, *n)),
+    }
+}
+
+/// `m` (of `(k, n)`) of `rows` rows of `x` into `y`, recorded.
+fn chain_mul(rec: &mut crate::chain::Recorder<'_>, m: ChainMat<'_>, (k, n): (usize, usize), x: &DeviceVec, y: &DeviceVec, rows: usize) {
+    use ggml_rs::ChainRecorder;
+    match m {
+        ChainMat::Exl3(l) => rec.exl3_rows_of(l, x, None, y, rows),
+        ChainMat::F16 { w, .. } => rec.matmul_f16_rows_f32(w, n, k, x, y, rows),
+        ChainMat::Bf16 { w, .. } => rec.matmul_bf16_rows_f32(w, n, k, x, y, rows),
+    }
+}
+
+/// A step's rows (or a check's few: up to [`FEW_MAX`]) through two stages in one chained recording on `b`: `first`'s
+/// matrices of their rows, as [`chained`] makes them, then `then`'s of the rows of `first[normed]`'s output normed as
+/// DeepSeek-V4.1's host model norms its queries' low-rank row (`rmsnorm` of the output rounded to bf16, its sum of
+/// squares in the host's order, the scale's square root and reciprocal correctly rounded, each value `bf16(weight *
+/// (v * scale))`): the host's to the bit. `(first's outputs, then's)`, every row of each. None as [`chained`] is, or
+/// where `then`'s inputs are not that output's width or the rows are more.
+pub fn chained_normed(b: &WgpuBackend, first: &[(ChainMat<'_>, &[f32])], normed: usize, weight: &[f32], eps: f32, then: &[ChainMat<'_>]) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    use ggml_rs::ChainRecorder;
+    let shapes: Vec<(usize, usize)> = first.iter().map(|(m, x)| chain_shape(b, m).filter(|&(k, _)| !x.is_empty() && x.len() % k == 0)).collect::<Option<_>>()?;
+    let (k0, d) = *shapes.get(normed)?;
+    let rows = first[normed].1.len() / k0;
+    let thens: Vec<(usize, usize)> = then.iter().map(|m| chain_shape(b, m).filter(|&(k, _)| k == d)).collect::<Option<_>>()?;
+    if rows > FEW_MAX || weight.len() != d || d > 1 << 20 {
+        return None;
+    }
+    let mut rec = crate::chain::Recorder::new(b);
+    rec.keep_groups(rows == 1);
+    // (every input taken and written before anything is recorded, as `chained` takes them)
+    let mut uploaded = Vec::new();
+    let xs: Vec<(DeviceVec, DeviceVec)> = first.iter().zip(&shapes).map(|((_, x), &(k, n))| (upload_once(&mut rec, b, &mut uploaded, x), rec.scratch(x.len() / k * n))).collect();
+    let wv = rec.scratch(d);
+    DeviceChain::upload(b, &wv, weight);
+    let row = rec.scratch(rows * d);
+    let outs: Vec<DeviceVec> = thens.iter().map(|&(_, n)| rec.scratch(rows * n)).collect();
+    for (((m, x), &(k, n)), (xv, yv)) in first.iter().zip(&shapes).zip(&xs) {
+        chain_mul(&mut rec, *m, (k, n), xv, yv, x.len() / k);
+    }
+    let (dummy, drw) = (rec.gpu().dummy().clone(), rec.gpu().dummy_rw().clone());
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU vector").clone();
+    rec.dispatch_wide("exl3-rmsnorm-host", NORM_AS_HOST, [&buf(&xs[normed].1), &buf(&wv), &dummy, &dummy, &dummy, &dummy, &buf(&row), &drw], &[d as u32, 0, eps.to_bits()], (rows as u32, 1, 1));
+    for ((m, &kn), yv) in then.iter().zip(&thens).zip(&outs) {
+        chain_mul(&mut rec, *m, kn, &row, yv, rows);
+    }
+    for ((_, x), (&(k, n), (_, yv))) in first.iter().zip(shapes.iter().zip(&xs)) {
+        rec.read_range(yv, 0, x.len() / k * n);
+    }
+    for (&(_, n), yv) in thens.iter().zip(&outs) {
+        rec.read_range(yv, 0, rows * n);
+    }
+    let mut all = Box::new(rec).finish();
+    let after = all.split_off(first.len());
+    Some((all, after))
+}
+
+/// [`chained_normed`]'s norm, a workgroup a row: `y = bf16(g * (v * r))` of each `v = bf16(x)` of the row, `r` the
+/// reciprocal of the square root of `sum(v * v) / width + eps` (the row's width `p[0].x`, eps's bits `p[0].z`), the
+/// squares added one after another in the host's order (each rounded as it is stored, so no fused multiply-add takes
+/// them), the quotient, root and reciprocal correctly rounded by integer steps (the device's own are within ulps): the
+/// host's to the bit.
+const NORM_AS_HOST: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> g: array<f32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> sq: array<f32, 256>;
+var<workgroup> scale: f32;
+
+fn bf16(v: f32) -> f32 {
+    let b = bitcast<u32>(v);
+    return bitcast<f32>((b + 0x7fffu + ((b >> 16u) & 1u)) & 0xffff0000u);
+}
+
+// the square root of a positive normal number, to nearest even: its mantissa's (times 2^26) digit by digit, two bits a
+// step, the remainder below twice the root
+fn sqrt_rn(a: f32) -> f32 {
+    let bits = bitcast<u32>(a);
+    var e = i32(bits >> 23u) - 150;
+    var m = (bits & 0x7fffffu) | 0x800000u;
+    if ((e & 1) != 0) {
+        m = m << 1u;
+        e = e - 1;
+    }
+    var rem = 0u;
+    var root = 0u;
+    for (var i = 25; i >= 0; i--) {
+        var pair = 0u;
+        if (i >= 13) { pair = (m >> u32(2 * i - 26)) & 3u; }
+        rem = (rem << 2u) | pair;
+        let trial = (root << 2u) | 1u;
+        root = root << 1u;
+        if (rem >= trial) {
+            rem = rem - trial;
+            root = root | 1u;
+        }
+    }
+    // a root of 25 or 26 bits, kept to 24
+    var shift = 1u;
+    if (root >= 0x2000000u) { shift = 2u; }
+    let guard = (root >> (shift - 1u)) & 1u;
+    let sticky = rem != 0u || (root & ((1u << (shift - 1u)) - 1u)) != 0u;
+    var r = root >> shift;
+    if (guard == 1u && (sticky || (r & 1u) == 1u)) { r = r + 1u; }
+    var be = e / 2 - 13 + i32(shift) + 150;
+    if (r == 0x1000000u) {
+        r = 0x800000u;
+        be = be + 1;
+    }
+    return bitcast<f32>((u32(be) << 23u) | (r & 0x7fffffu));
+}
+
+// a / b of positive normal numbers (a 0 too), to nearest even: the mantissas' quotient to 26 bits by long division, the
+// remainder below b's mantissa, the rest a sticky bit (a quotient past the normal numbers the device's own)
+fn div_rn(a: f32, b: f32) -> f32 {
+    if (a == 0.0) { return 0.0; }
+    let ab = bitcast<u32>(a);
+    let bb = bitcast<u32>(b);
+    let mb = (bb & 0x7fffffu) | 0x800000u;
+    var rem = (ab & 0x7fffffu) | 0x800000u;
+    var q = 0u;
+    for (var i = 0u; i < 26u; i++) {
+        q = q << 1u;
+        if (rem >= mb) {
+            rem = rem - mb;
+            q = q | 1u;
+        }
+        rem = rem << 1u;
+    }
+    var shift = 1u;
+    if (q >= 0x2000000u) { shift = 2u; }
+    let guard = (q >> (shift - 1u)) & 1u;
+    let sticky = rem != 0u || (q & ((1u << (shift - 1u)) - 1u)) != 0u;
+    var r = q >> shift;
+    if (guard == 1u && (sticky || (r & 1u) == 1u)) { r = r + 1u; }
+    var be = i32(shift) - 25 + i32(ab >> 23u) - i32(bb >> 23u) + 150;
+    if (r == 0x1000000u) {
+        r = 0x800000u;
+        be = be + 1;
+    }
+    if (be <= 0 || be >= 255) { return a / b; }
+    return bitcast<f32>((u32(be) << 23u) | (r & 0x7fffffu));
+}
+
+// 1 / s of a positive normal number, to nearest even: 2^48 over its mantissa by long division, the remainder below it
+fn recip_rn(s: f32) -> f32 {
+    let bits = bitcast<u32>(s);
+    let es = i32(bits >> 23u);
+    let m = (bits & 0x7fffffu) | 0x800000u;
+    var rem = 0u;
+    var q = 0u;
+    for (var i = 0u; i < 49u; i++) {
+        rem = rem << 1u;
+        if (i == 0u) { rem = rem | 1u; }
+        q = q << 1u;
+        if (rem >= m) {
+            rem = rem - m;
+            q = q | 1u;
+        }
+    }
+    if (q == 0x2000000u) {
+        return bitcast<f32>(u32(254 - es) << 23u);
+    }
+    var r = q >> 1u;
+    if ((q & 1u) == 1u && (rem != 0u || (r & 1u) == 1u)) { r = r + 1u; }
+    var be = 253 - es;
+    if (r == 0x1000000u) {
+        r = 0x800000u;
+        be = be + 1;
+    }
+    return bitcast<f32>((u32(be) << 23u) | (r & 0x7fffffu));
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let d = p[0].x;
+    let base = wg.x * d;
+    var acc = 0.0;
+    for (var c = 0u; c < d; c += 256u) {
+        var v = 0.0;
+        if (c + t < d) { v = bf16(x[base + c + t]); }
+        sq[t] = v * v;
+        workgroupBarrier();
+        if (t == 0u) {
+            for (var j = 0u; j < min(256u, d - c); j++) { acc = acc + sq[j]; }
+        }
+        workgroupBarrier();
+    }
+    if (t == 0u) {
+        scale = recip_rn(sqrt_rn(div_rn(acc, f32(d)) + bitcast<f32>(p[0].z)));
+    }
+    workgroupBarrier();
+    let r = scale;
+    for (var i = t; i < d; i += 256u) {
+        y[base + i] = bf16(g[i] * (bf16(x[base + i]) * r));
+    }
+}
+"#;
 
 /// [`exl3_many`] of projections on one GPU: every [`ROWS`] rows of each a pass, the passes recorded into one encoder
 /// until their sums come to [`MANY_BYTES`], each encoder one submit and one read back.

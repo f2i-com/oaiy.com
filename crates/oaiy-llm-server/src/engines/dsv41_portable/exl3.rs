@@ -110,6 +110,31 @@ fn weighed(mut y: Vec<f32>, weights: &[f32]) -> Vec<f32> {
     y
 }
 
+/// Rows of an expert's job that go as jobs of a row each ([`apart`]): a draft's check's few.
+const ROWS_APART: usize = 8;
+
+/// `(slot, x)` as the slots' jobs: a job of each row where `x` (rows `width` wide) is a few rows ([`ROWS_APART`] or
+/// fewer), so each row's sums are a decode step's (the kernel of a row, its splits), and a check's experts give what a
+/// step's would; else one job of them all (a prompt's, each tile decoded once for a block of its rows). A few rows went
+/// a prompt's way before: a block of 32 row places for one or two rows, unsplit, its sums another order than a step's.
+fn apart(slot: usize, x: &[f32], width: usize) -> Vec<(usize, &[f32])> {
+    if pieces(x, width) > 1 {
+        x.chunks_exact(width).map(|r| (slot, r)).collect()
+    } else {
+        vec![(slot, x)]
+    }
+}
+
+/// How many jobs [`apart`] makes of `x`.
+fn pieces(x: &[f32], width: usize) -> usize {
+    let rows = x.len() / width;
+    if (2..=ROWS_APART).contains(&rows) {
+        rows
+    } else {
+        1
+    }
+}
+
 /// A layout's projections as the CPU's decoder takes them.
 fn layout_proj(l: &RecordLayout) -> [Exl3Proj; 3] {
     l.proj.map(|p| Exl3Proj { suh: p.suh, svh: p.svh, mul1: p.mul1, trellis: p.trellis, k: p.k, n: p.n, tile_words: p.tile_words })
@@ -366,9 +391,12 @@ impl WgpuExl3Experts {
             // (the card's rate, a fifth from this put)
             let seen = (records.len() * layout.bytes) as f64 / took.max(1.0);
             self.rates[pool.card].store((self.rate(pool.card) * 0.8 + seen * 0.2).to_bits(), Ordering::Relaxed);
-            let these: Vec<(usize, &[f32])> = group.iter().enumerate().map(|(s, &i)| (s, jobs[i].x)).collect();
-            for (y, &i) in pool.slots.forward(&these, limit).into_iter().zip(group) {
-                out.push((i, weighed(y, jobs[i].weights)));
+            let width = layout.proj[0].k;
+            let these: Vec<(usize, &[f32])> = group.iter().enumerate().flat_map(|(s, &i)| apart(s, jobs[i].x, width)).collect();
+            let mut ys = pool.slots.forward(&these, limit).into_iter();
+            for &i in group {
+                let n = pieces(jobs[i].x, width);
+                out.push((i, weighed(ys.by_ref().take(n).flatten().collect(), jobs[i].weights)));
             }
             for (s, &i) in group.iter().enumerate() {
                 self.keep(layer, jobs[i].expert, (p, s));
@@ -443,7 +471,15 @@ impl ExpertsKernel for WgpuExl3Experts {
 
     /// The held experts' jobs: each card's pools in one call (one recording and one read back), the cards at once.
     fn forward_held(&self, layer: u32, jobs: &[(u32, &[f32], &[f32])], swiglu_limit: f32) -> Vec<Vec<f32>> {
-        let computing = std::time::Instant::now();
+        self.begin_held(layer, jobs, swiglu_limit)()
+    }
+
+    /// [`Self::forward_held`] begun: each card's call recorded and submitted here, one after another, and waited for
+    /// by the closure, so the cards and what the caller does meanwhile (the reads of the experts they do not hold, and
+    /// their calls) run at once with no thread started (a thread for the held experts and one for each card past the
+    /// first, a layer).
+    fn begin_held<'a>(&'a self, layer: u32, jobs: &[(u32, &[f32], &[f32])], swiglu_limit: f32) -> Box<dyn FnOnce() -> Vec<Vec<f32>> + 'a> {
+        let beginning = std::time::Instant::now();
         self.counts.held.fetch_add(jobs.len() as u64, Ordering::Relaxed);
         let places: Vec<(usize, usize)> = {
             let placed = self.placement();
@@ -463,31 +499,33 @@ impl ExpertsKernel for WgpuExl3Experts {
                 None => pools.push((p, vec![i])),
             }
         }
-        let places = &places;
-        let run = |pools: &[(usize, Vec<usize>)]| -> Vec<(usize, Vec<f32>)> {
-            let these: Vec<Vec<(usize, &[f32])>> = pools.iter().map(|(_, list)| list.iter().map(|&i| (places[i].1, jobs[i].1)).collect()).collect();
-            let parts: Vec<(&Exl3Slots, &[(usize, &[f32])])> = pools.iter().zip(&these).map(|((p, _), t)| (&self.pools[*p].slots, &t[..])).collect();
-            let ys = Exl3Slots::forward_many(&parts, swiglu_limit);
-            pools.iter().zip(ys).flat_map(|((_, list), ys)| list.iter().zip(ys).map(|(&i, y)| (i, weighed(y, jobs[i].2))).collect::<Vec<_>>()).collect()
-        };
-        let mut out: Vec<Vec<f32>> = vec![Vec::new(); jobs.len()];
-        let made: Vec<(usize, Vec<f32>)> = match by_card.as_slice() {
-            [] => Vec::new(),
-            [(_, pools)] => run(pools),
-            [(_, first), rest @ ..] => std::thread::scope(|scope| {
-                let handles: Vec<_> = rest.iter().map(|(_, pools)| scope.spawn(|| run(pools))).collect();
-                let mut made = run(first);
-                for h in handles {
-                    made.extend(h.join().expect("an EXL3 experts' card panicked"));
+        let width = self.layouts[layer as usize].proj[0].k;
+        let begun: Vec<(Vec<Vec<(usize, usize)>>, ggml_rs_wgpu::exl3::SlotsBegun<'a>)> = by_card
+            .into_iter()
+            .map(|(_, pools)| {
+                let these: Vec<Vec<(usize, &[f32])>> = pools.iter().map(|(_, list)| list.iter().flat_map(|&i| apart(places[i].1, jobs[i].1, width)).collect()).collect();
+                let parts: Vec<(&'a Exl3Slots, &[(usize, &[f32])])> = pools.iter().zip(&these).map(|((p, _), t)| (&self.pools[*p].slots, &t[..])).collect();
+                let call = Exl3Slots::begin_many(&parts, swiglu_limit);
+                // (each pool's jobs, and how many of the call's each became)
+                (pools.into_iter().map(|(_, list)| list.into_iter().map(|i| (i, pieces(jobs[i].1, width))).collect()).collect(), call)
+            })
+            .collect();
+        let weights: Vec<Vec<f32>> = jobs.iter().map(|j| j.2.to_vec()).collect();
+        let begun_in = beginning.elapsed();
+        Box::new(move || {
+            let finishing = std::time::Instant::now();
+            let mut out: Vec<Vec<f32>> = vec![Vec::new(); weights.len()];
+            for (lists, call) in begun {
+                for (list, ys) in lists.into_iter().zip(call.finish()) {
+                    let mut ys = ys.into_iter();
+                    for (i, n) in list {
+                        out[i] = weighed(ys.by_ref().take(n).flatten().collect(), &weights[i]);
+                    }
                 }
-                made
-            }),
-        };
-        for (i, y) in made {
-            out[i] = y;
-        }
-        crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertHeld, computing);
-        out
+            }
+            crate::dsv41::profile::add_spent(crate::dsv41::profile::Part::ExpertHeld, begun_in + finishing.elapsed());
+            out
+        })
     }
 
     fn prefetch_order(&self, layer: u32, experts: u32) -> Vec<u32> {

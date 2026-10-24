@@ -1065,15 +1065,13 @@ impl Models {
         match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
             Some(b) => {
                 let (count, bytes) = crate::engines::dsv41_portable::offload(&mut model, b);
-                // DSpark's drafter, before the experts take what the cards have left: an EXL3 checkpoint's (its checks'
-                // experts go a step's way on the cards: replies 10-45% faster, a new subject's 4% slower, as measured
-                // here), not an fp8 one's (its checks' experts go to the CPU's workers: a check of two rows cost four
-                // steps, its replies half as fast); OAIY_DSV41_DRAFT=1 or 0 asks for it or not either way
-                let draft = match std::env::var("OAIY_DSV41_DRAFT").as_deref() {
-                    Ok("1") => true,
-                    Ok("0") => false,
-                    _ => matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. }),
-                };
+                // DSpark's drafter, before the experts take what the cards have left, where OAIY_DSV41_DRAFT=1 asks for
+                // it. Not by default: once a step's calls were cut, an EXL3 checkpoint's replies were as fast without it
+                // on familiar subjects and code and a sixth faster on a new one (each row a check reads more costs
+                // three quarters of a step, most of it the uploads of experts no card holds; its 5 GB of the cards
+                // hold experts instead), and an fp8 checkpoint's checks send their experts to the CPU's workers (a
+                // check of two rows four steps)
+                let draft = std::env::var("OAIY_DSV41_DRAFT").as_deref() == Ok("1");
                 if draft {
                     let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect();
                     if let Some((d, said)) = crate::engines::dsv41_portable::load_drafter(&spec.path, &model, b, &cards)? {

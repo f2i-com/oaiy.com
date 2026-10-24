@@ -996,6 +996,16 @@ impl ChainRecorder for Recorder<'_> {
         }
     }
 
+    fn copy_cols_bf16(&mut self, src: &DeviceVec, src_stride: usize, src_at: usize, dst: &DeviceVec, dst_stride: usize, dst_at: usize, width: usize, rows: usize) {
+        assert!(
+            rows > 0 && src_at + width <= src_stride && dst_at + width <= dst_stride && src.len >= (rows - 1) * src_stride + src_at + width && dst.len >= (rows - 1) * dst_stride + dst_at + width,
+            "chain: {rows} rows' columns {src_at}..{} of {src_stride} to {dst_at}.. of {dst_stride} as bf16",
+            src_at + width
+        );
+        let pipeline = self.named("chain-copy-cols-bf16", COPY_COLS_BF16);
+        self.dispatch_kept(&pipeline, buffer(src), buffer(src), buffer(dst), &[width as u32, dst_at as u32, src_at as u32, rows as u32, dst_stride as u32, src_stride as u32], grid(((rows * width) as u32).div_ceil(256)));
+    }
+
     fn copy(&mut self, src: &DeviceVec, src_at: usize, dst: &DeviceVec, dst_at: usize, len: usize) {
         assert!(src_at + len <= src.len && dst_at + len <= dst.len, "chain: copying {len} from {src_at} of {} to {dst_at} of {}", src.len, dst.len);
         let pipeline = self.named("chain-copy", COPY);
@@ -1128,14 +1138,34 @@ impl ChainRecorder for Recorder<'_> {
         self.reads.push((buffer(v).clone(), offset, staging, len));
     }
 
-    fn finish(mut self: Box<Self>) -> Vec<Vec<f32>> {
+    fn finish(self: Box<Self>) -> Vec<Vec<f32>> {
+        self.launch().wait()
+    }
+}
+
+/// A recording submitted, its reads not yet waited for ([`Recorder::launch`]): what the caller does before
+/// [`Launched::wait`] runs beside the device's work (a decode step's held experts on two cards and the reads of the
+/// rest, no thread started for either).
+pub(crate) struct Launched<'a> {
+    rec: Box<Recorder<'a>>,
+    index: wgpu::SubmissionIndex,
+    mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    count: usize,
+    pieces: Option<wgpu::Buffer>,
+    start: std::time::Instant,
+    submitted: std::time::Instant,
+}
+
+impl<'a> Recorder<'a> {
+    /// [`ChainRecorder::finish`]'s first half: everything recorded submitted and its reads' mappings asked for.
+    pub(crate) fn launch(mut self: Box<Self>) -> Launched<'a> {
         // (profiled: what is left a piece of its own, timed as the others)
         let profiled = crate::profile::chain_on();
         // (by the feed: what is left a piece of its own too, encoded at its turn as the others)
         if profiled || self.fed() {
             self.submit_piece();
         }
-        let _one = self.backend.serial.lock().unwrap_or_else(|p| p.into_inner());
+        let one = self.backend.serial.lock().unwrap_or_else(|p| p.into_inner());
         let start = std::time::Instant::now();
         let mut enc = self.gpu().device.create_command_encoder(&Default::default());
         if !self.dispatches.is_empty() {
@@ -1196,6 +1226,18 @@ impl ChainRecorder for Recorder<'_> {
         if let Some(staging) = &pieces {
             staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
+        // (the queue let go once this is in it: what another thread records on this device goes in after it, in the
+        // queue's order, and need not wait for this one's round trip as well as its own; and a recording launched and
+        // not yet waited for holds nothing another needs)
+        drop(one);
+        Launched { rec: self, index, mapped, count, pieces, start, submitted }
+    }
+}
+
+impl Launched<'_> {
+    /// [`ChainRecorder::finish`]'s second half: the reads waited for, each one's values.
+    pub(crate) fn wait(self) -> Vec<Vec<f32>> {
+        let Launched { mut rec, index, mapped, count, pieces, start, submitted } = self;
         // this recording's work waited for, not what was submitted after it (the next chunk's, as this one's rows
         // are read). Its reads are polled for 20 ms first (OAIY_CHAIN_SPIN_MS another time, 0 none): a step, a check
         // of drafts, a draft and a host layer's round trip end within that, and parking the thread to be woken cost
@@ -1204,13 +1246,13 @@ impl ChainRecorder for Recorder<'_> {
         // program's is by that runtime's default; a prompt's chunk or a picture's step is waited for after the 20 ms.
         static SPIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let spin = *SPIN.get_or_init(|| std::env::var("OAIY_CHAIN_SPIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20));
-        if spin > 0 && count > 0 && self.timed.is_empty() && pieces.is_none() {
-            self.gpu().wait_soon(index, &mapped, std::time::Duration::from_millis(spin));
+        if spin > 0 && count > 0 && rec.timed.is_empty() && pieces.is_none() {
+            rec.gpu().wait_soon(index, &mapped, std::time::Duration::from_millis(spin));
         } else {
-            self.gpu().wait(Some(index));
+            rec.gpu().wait(Some(index));
         }
         crate::profile::add(&crate::profile::CHAIN_WAIT, submitted);
-        let pooled = std::mem::take(&mut self.pooled);
+        let pooled = std::mem::take(&mut rec.pooled);
         // (OAIY_SCRATCH_LOG: what the recording held of the pool's scratch, by size, where it is 64 MB or more)
         static SCRATCH_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *SCRATCH_LOG.get_or_init(|| std::env::var_os("OAIY_SCRATCH_LOG").is_some()) {
@@ -1225,12 +1267,12 @@ impl ChainRecorder for Recorder<'_> {
                 }
                 sizes.sort_by_key(|(s, n)| std::cmp::Reverse(s * *n as u64));
                 let most: Vec<String> = sizes.iter().take(8).map(|(s, n)| format!("{n} of {} MB", s >> 20)).collect();
-                eprintln!("    a recording's scratch: {} buffers, {:.2} GiB ({}); spare {:.2} GiB", pooled.len(), total as f64 / (1u64 << 30) as f64, most.join(", "), self.spare.iter().map(|(b, _)| b).sum::<u64>() as f64 / (1u64 << 30) as f64);
+                eprintln!("    a recording's scratch: {} buffers, {:.2} GiB ({}); spare {:.2} GiB", pooled.len(), total as f64 / (1u64 << 30) as f64, most.join(", "), rec.spare.iter().map(|(b, _)| b).sum::<u64>() as f64 / (1u64 << 30) as f64);
             }
         }
-        self.gpu().unpool(pooled);
+        rec.gpu().unpool(pooled);
         if let Some(staging) = pieces {
-            let period = self.gpu().queue().get_timestamp_period() as f64;
+            let period = rec.gpu().queue().get_timestamp_period() as f64;
             let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping the pieces' times");
             let ticks: Vec<u64> = view.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
             drop(view);
@@ -1249,8 +1291,8 @@ impl ChainRecorder for Recorder<'_> {
                 eprintln!("    a recording's {} pieces, {:.1} ms busy over {:.1}, on the GPU's clock {:.1}..{:.1}", ticks.len() / 2, busy as f64 * period / 1e6, span as f64 * period / 1e6, at(ticks[0]), at(*ticks.last().expect("a piece")));
             }
         }
-        for (pipelines, staging) in std::mem::take(&mut self.timed) {
-            let period = self.gpu().queue().get_timestamp_period() as f64;
+        for (pipelines, staging) in std::mem::take(&mut rec.timed) {
+            let period = rec.gpu().queue().get_timestamp_period() as f64;
             let view = staging.slice(..).get_mapped_range().expect("webgpu: mapping the profile");
             let ticks: Vec<u64> = view.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
             drop(view);
@@ -1258,7 +1300,7 @@ impl ChainRecorder for Recorder<'_> {
             let mut k = crate::profile::KERNELS.lock().unwrap_or_else(|p| p.into_inner());
             for (i, pipeline) in pipelines.iter().enumerate() {
                 let ns = (ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f64 * period) as u64;
-                let e = k.entry(self.gpu().name_of(pipeline)).or_default();
+                let e = k.entry(rec.gpu().name_of(pipeline)).or_default();
                 e.0 += ns;
                 e.1 += 1;
             }
@@ -1280,22 +1322,22 @@ impl ChainRecorder for Recorder<'_> {
             v
         };
         // (each read from its own staging buffer, or from its place in one it shares)
-        let own: Vec<usize> = (0..count).filter(|&i| self.places[i].is_none()).collect();
+        let own: Vec<usize> = (0..count).filter(|&i| rec.places[i].is_none()).collect();
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); count];
-        let theirs: Vec<Vec<f32>> = if own.iter().map(|&i| self.reads[i].3 * 4).sum::<usize>() >= 8 << 20 && own.len() > 1 {
+        let theirs: Vec<Vec<f32>> = if own.iter().map(|&i| rec.reads[i].3 * 4).sum::<usize>() >= 8 << 20 && own.len() > 1 {
             use rayon::prelude::*;
-            own.par_iter().map(|&i| copied(&self.reads[i].2, self.reads[i].3)).collect()
+            own.par_iter().map(|&i| copied(&rec.reads[i].2, rec.reads[i].3)).collect()
         } else {
-            own.iter().map(|&i| copied(&self.reads[i].2, self.reads[i].3)).collect()
+            own.iter().map(|&i| copied(&rec.reads[i].2, rec.reads[i].3)).collect()
         };
         for (i, v) in own.into_iter().zip(theirs) {
             out[i] = v;
         }
-        for (g, (staging, total)) in self.joined.iter().enumerate() {
+        for (g, (staging, total)) in rec.joined.iter().enumerate() {
             let view = staging.slice(..*total).get_mapped_range().expect("webgpu: mapping a finished buffer");
-            for (i, place) in self.places.iter().enumerate() {
+            for (i, place) in rec.places.iter().enumerate() {
                 if let Some((_, at)) = place.filter(|(pg, _)| *pg == g) {
-                    let len = self.reads[i].3;
+                    let len = rec.reads[i].3;
                     let mut v = vec![0f32; len];
                     bytemuck::cast_slice_mut::<f32, u8>(&mut v).copy_from_slice(&view[at as usize..at as usize + len * 4]);
                     out[i] = v;
@@ -1304,13 +1346,13 @@ impl ChainRecorder for Recorder<'_> {
             drop(view);
             staging.unmap();
         }
-        let mut staged: Vec<(u64, wgpu::Buffer)> = std::mem::take(&mut self.reads).into_iter().map(|(_, _, staging, _)| (staging.size(), staging)).collect();
-        staged.extend(std::mem::take(&mut self.joined).into_iter().map(|(staging, _)| (staging.size(), staging)));
-        self.places.clear();
-        self.gpu().unstage(staged);
+        let mut staged: Vec<(u64, wgpu::Buffer)> = std::mem::take(&mut rec.reads).into_iter().map(|(_, _, staging, _)| (staging.size(), staging)).collect();
+        staged.extend(std::mem::take(&mut rec.joined).into_iter().map(|(staging, _)| (staging.size(), staging)));
+        rec.places.clear();
+        rec.gpu().unstage(staged);
         // (the layers' experts' use, read for what a card holds of them: not the caller's reads; the last first, each
         // from its place)
-        let mut settles = std::mem::take(&mut self.settles);
+        let mut settles = std::mem::take(&mut rec.settles);
         settles.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
         for (cache, at) in settles {
             cache.settle(&out.remove(at));

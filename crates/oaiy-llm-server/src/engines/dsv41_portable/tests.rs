@@ -470,6 +470,60 @@ fn measure_prefill_and_warm_decode_with_the_trunk_on_the_gpu() {
     eprintln!("last {} steps: {:.2} s a token on average", tail.len(), tail.iter().sum::<f64>() / tail.len() as f64);
 }
 
+/// An EXL3 checkpoint's merged calls, against the calls apart, on its weights as the trunk places them
+/// (`trunk::placer`): a layer's projections of x and its queries of the normed low-rank row in one call
+/// ([`crate::dsv41::linear::normed_together`]) and its grouped output then `wo_b` ([`crate::dsv41::linear::chained_together`]),
+/// each to the bit for a step's row and a check's three.
+#[test]
+#[ignore = "needs a WebGPU adapter"]
+fn an_exl3_layers_merged_calls_are_the_calls_apart() {
+    use crate::dsv41::linear::{chained_together, forward_together, normed_together, Out};
+    let b = WgpuBackend::new(Some(1 << 30)).expect("a WebGPU adapter");
+    let mut s = 0x2468_ace0_1357_9bdfu64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut place = super::trunk::placer(&b, true);
+    let mut exl3 = |k: usize, n: usize, next: &mut dyn FnMut() -> u64| -> Weight {
+        let sign = |next: &mut dyn FnMut() -> u64, m: f32| if next() & 1 == 0 { m } else { -m };
+        let data = ggml_rs::exl3::Exl3Data {
+            words: (0..k / 16 * n / 16 * 24).map(|_| next() as u32).collect(),
+            suh: (0..k).map(|_| sign(next, 0.25)).collect(),
+            svh: (0..n).map(|_| sign(next, 0.125)).collect(),
+            tile_words: 48,
+            input_map: (0..k as u32).collect(),
+            output_map: (0..n as u32).collect(),
+        };
+        place("w", &Weight::Exl3 { data: Arc::new(data), host: std::sync::OnceLock::new(), n, k }).expect("on the GPU")
+    };
+    let (h, q, heads, kv, groups, gd, rank) = (512usize, 384usize, 1024usize, 256usize, 4usize, 256usize, 128usize);
+    let (wq_a, wkv, wq_b, ix_b) = (exl3(h, q, &mut next), exl3(h, kv, &mut next), exl3(q, heads, &mut next), exl3(q, 256, &mut next));
+    let router = super::trunk::placer(&b, true)("gate", &Weight::Bf16 { w: (0..32 * h).map(|_| ((((next() % 2000) as f32 / 1000.0) - 1.0).to_bits() >> 16) as u16).collect(), n: 32, k: h }).expect("on the GPU");
+    let q_norm: Vec<f32> = (0..q).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+    let wo_a = Weight::Stacked { parts: (0..groups).map(|_| exl3(gd, rank, &mut next)).collect(), rows: rank, k: gd };
+    let wo_b = exl3(groups * rank, h, &mut next);
+    for t in [1usize, 3] {
+        let x: Vec<f32> = (0..t * h).map(|_| ((next() % 2001) as f32 / 1000.0) - 1.0).collect();
+        let of_x: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = vec![(&wq_a, &x, t, 0..q, Out::Bf16), (&wkv, &x, t, 0..kv, Out::Bf16), (&router, &x, t, 0..32, Out::F32)];
+        let of_qr: Vec<(&Weight, std::ops::Range<usize>, Out)> = vec![(&wq_b, 0..heads, Out::Bf16), (&ix_b, 0..256, Out::Bf16)];
+        let made_x = forward_together(&of_x);
+        let qr = crate::dsv41::ops::rmsnorm(&made_x[0], &q_norm, 1e-20);
+        let made_q = forward_together(&of_qr.iter().map(|(w, rows, out)| (*w, &qr[..], t, rows.clone(), *out)).collect::<Vec<_>>());
+        let (got_x, got_q) = normed_together(&of_x, 0, &q_norm, 1e-20, &of_qr).expect("both stages in one call");
+        assert_eq!((got_x, got_q), (made_x, made_q), "a layer's projections of x and its queries, {t} rows");
+        let o: Vec<Vec<f32>> = (0..groups).map(|_| (0..t * gd).map(|_| ((next() % 2001) as f32 / 1000.0) - 1.0).collect()).collect();
+        let parts: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = o.iter().enumerate().map(|(g, x)| (&wo_a, x.as_slice(), t, g * rank..(g + 1) * rank, Out::Bf16)).collect();
+        let ys = forward_together(&parts);
+        let row: Vec<f32> = (0..t).flat_map(|r| ys.iter().flat_map(move |y| y[r * rank..(r + 1) * rank].to_vec())).collect();
+        let want = wo_b.forward(&row, t, Out::Bf16);
+        let first: Vec<(&Weight, &[f32], std::ops::Range<usize>)> = o.iter().enumerate().map(|(g, x)| (&wo_a, x.as_slice(), g * rank..(g + 1) * rank)).collect();
+        assert_eq!(chained_together(&first, &wo_b, t, Out::Bf16).expect("the output's two in one call"), want, "the output, {t} rows");
+    }
+}
+
 /// A projection of projections in one call ([`crate::dsv41::linear::chained_together`]) is the two calls to the bit:
 /// eight groups of a bf16 weight (a layer's `wo_a`) whose row an fp8 weight (`wo_b`) takes quantized, and a bf16
 /// weight after a bf16 weight (the row rounded and not quantized), each on rows of several sizes of value.
@@ -503,7 +557,7 @@ fn a_chained_projection_is_the_two_calls_to_the_bit() {
             let row: Vec<f32> = forward_together(&two).concat();
             let want = then.forward(&row, 1, Out::Bf16);
             let first: Vec<(&Weight, &[f32], std::ops::Range<usize>)> = xs.iter().enumerate().map(|(g, x)| (&a, x.as_slice(), g * rank..(g + 1) * rank)).collect();
-            let got = chained_together(&first, &then, Out::Bf16).expect("the chain goes through the arena");
+            let got = chained_together(&first, &then, 1, Out::Bf16).expect("the chain goes through the arena");
             assert_eq!(got.len(), n);
             assert!(want.iter().any(|v| *v != 0.0), "{what}: sums that are something");
             let differing = got.iter().zip(&want).filter(|(g, w)| g.to_bits() != w.to_bits()).count();

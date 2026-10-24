@@ -77,22 +77,87 @@ pub trait DenseKernel: Send + Sync + std::any::Any {
     }
 
     /// A projection of projections in one call of this kernel's kind (a GPU's: one submit, one round trip), this
-    /// kernel the last: `first`'s sums of one row each, rounded to bf16 and laid end to end, quantized to fp8 where
-    /// `quantized` (as an fp8 weight takes its activation), against this kernel; its sums. None when it cannot
-    /// (another kind among them, a row that is not whole 32s), and the caller makes each projection on its own.
-    fn forward_after(&self, first: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)], quantized: bool) -> Option<Vec<f32>> {
-        let _ = (first, quantized);
+    /// kernel the last: `first`'s sums of `t` rows each, each row's rounded to bf16 and laid end to end, quantized to
+    /// fp8 where `quantized` (as an fp8 weight takes its activation), against this kernel; its sums. None when it
+    /// cannot (another kind among them, a row that is not whole 32s, more rows than it takes), and the caller makes
+    /// each projection on its own.
+    fn forward_after(&self, first: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)], t: usize, quantized: bool) -> Option<Vec<f32>> {
+        let _ = (first, t, quantized);
+        None
+    }
+
+    /// Two stages in one call of this kernel's kind (a GPU's: one submit, one round trip): `first`'s sums of their
+    /// rows (`(kernel, x, t)`, every row of each output), then `then`'s of the rows of `first[normed]`'s sums normed as
+    /// [`crate::dsv41::ops::rmsnorm`] norms them rounded to bf16 (by `weight`, `eps`), to the bit. `(first's, then's)`,
+    /// or None when it cannot, and the caller makes each stage on its own.
+    #[allow(clippy::type_complexity)]
+    fn forward_normed(&self, first: &[(&dyn DenseKernel, &[f32], usize)], normed: usize, weight: &[f32], eps: f32, then: &[&dyn DenseKernel]) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+        let _ = (first, normed, weight, eps, then);
         None
     }
 }
 
-/// `then`'s [`Weight::forward`] of the row `first` make: each `(weight, x, rows)`'s [`Weight::forward_rows`] of one
-/// row, rounded to bf16, laid end to end. One call where a device holds them all and takes them together
-/// ([`DenseKernel::forward_after`]), the row between them never brought here; None where it does not, and the caller
-/// makes them as before. The roundings between the two are the reference's and are made of the values' bits, there
-/// as here: the result is the same to the bit.
-pub fn chained_together(first: &[(&Weight, &[f32], std::ops::Range<usize>)], then: &Weight, out: Out) -> Option<Vec<f32>> {
+/// `first`'s [`Weight::forward_rows`] of their rows (`(weight, x, t, rows, out)`, as [`forward_together`] takes them),
+/// and `then`'s (`(weight, rows, out)`) of `rmsnorm(first[normed]'s output, weight, eps)`, `first[normed]` rounded to
+/// bf16 (a layer's queries' low-rank row, then its queries and its indexer's): in one call where a device holds them
+/// all and takes them together ([`DenseKernel::forward_normed`]), the norm made there to the host's bit; None where it
+/// does not, and the caller makes them as before.
+#[allow(clippy::type_complexity)]
+pub fn normed_together(
+    first: &[(&Weight, &[f32], usize, std::ops::Range<usize>, Out)],
+    normed: usize,
+    weight: &[f32],
+    eps: f32,
+    then: &[(&Weight, std::ops::Range<usize>, Out)],
+) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let device = |w: &Weight| if let Weight::Device { kernel, fp8: false, .. } = w { Some(Arc::clone(kernel)) } else { None };
+    let firsts: Vec<Arc<dyn DenseKernel>> = first.iter().map(|(w, ..)| device(w)).collect::<Option<_>>()?;
+    let thens: Vec<Arc<dyn DenseKernel>> = then.iter().map(|(w, ..)| device(w)).collect::<Option<_>>()?;
+    if first.get(normed)?.4 != Out::Bf16 {
+        return None;
+    }
+    for (w, x, t, rows, _) in first {
+        assert_eq!(x.len(), t * w.k(), "linear: input is not [t, k]");
+        assert!(rows.end <= w.n(), "linear: row range past the weight");
+    }
+    let with: Vec<(&dyn DenseKernel, &[f32], usize)> = firsts.iter().zip(first).map(|(k, (_, x, t, ..))| (&**k, *x, *t)).collect();
+    let after: Vec<&dyn DenseKernel> = thens.iter().map(|k| &**k).collect();
+    let start = std::time::Instant::now();
+    let (alls, afters) = firsts[0].forward_normed(&with, normed, weight, eps, &after)?;
+    crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);
+    let t = first[normed].2;
+    // each output's rows asked for, of every row of it, rounded as asked
+    let take = |all: &[f32], whole: usize, t: usize, rows: &std::ops::Range<usize>, out: Out| -> Vec<f32> {
+        let mut y = Vec::with_capacity(t * rows.len());
+        for tt in 0..t {
+            y.extend(all[tt * whole + rows.start..tt * whole + rows.end].iter().map(|&v| if out == Out::Bf16 { to_bf16(v) } else { v }));
+        }
+        y
+    };
+    let ys = first.iter().zip(&alls).map(|((w, _, t, rows, out), all)| take(all, w.n(), *t, rows, *out)).collect();
+    let qs = then.iter().zip(&afters).map(|((w, rows, out), all)| take(all, w.n(), t, rows, *out)).collect();
+    Some((ys, qs))
+}
+
+/// `then`'s [`Weight::forward`] of the `t` rows `first` make: each `(weight, x, rows)`'s [`Weight::forward_rows`] of
+/// those rows, each row's rounded to bf16 and laid end to end. One call where a device holds them all and takes them
+/// together ([`DenseKernel::forward_after`]), the rows between them never brought here; None where it does not, and the
+/// caller makes them as before. The roundings between the two are the reference's and are made of the values' bits,
+/// there as here: the result is the same to the bit.
+pub fn chained_together(first: &[(&Weight, &[f32], std::ops::Range<usize>)], then: &Weight, t: usize, out: Out) -> Option<Vec<f32>> {
     let Weight::Device { kernel: last, .. } = then else { return None };
+    // (a stack's rows within one of its parts are that part's, as `forward_together` takes them)
+    let resolved: Vec<(&Weight, &[f32], std::ops::Range<usize>)> = first
+        .iter()
+        .map(|(w, x, rows)| match w {
+            Weight::Stacked { parts, rows: each, .. } if !rows.is_empty() && rows.start / each == (rows.end - 1) / each => {
+                let p = rows.start / each;
+                (&parts[p], *x, rows.start - p * each..rows.end - p * each)
+            }
+            _ => (*w, *x, rows.clone()),
+        })
+        .collect();
+    let first = &resolved[..];
     let kernels: Vec<&dyn DenseKernel> = first.iter().map(|(w, ..)| if let Weight::Device { kernel, .. } = w { Some(&**kernel) } else { None }).collect::<Option<_>>()?;
     let width: usize = first.iter().map(|(_, _, rows)| rows.len()).sum();
     if width != then.k() || width % FP8_BLOCK != 0 {
@@ -101,14 +166,14 @@ pub fn chained_together(first: &[(&Weight, &[f32], std::ops::Range<usize>)], the
     let prepared: Vec<Vec<f32>> = first
         .iter()
         .map(|(w, x, rows)| {
-            assert_eq!(x.len(), w.k(), "linear: input is not [1, k]");
+            assert_eq!(x.len(), t * w.k(), "linear: input is not [t, k]");
             assert!(rows.end <= w.n(), "linear: row range past the weight");
             w.prepare(x, Out::Bf16).0
         })
         .collect();
     let with: Vec<(&dyn DenseKernel, &[f32], std::ops::Range<usize>)> = kernels.iter().zip(first).zip(&prepared).map(|((k, (_, _, rows)), x)| (*k, x.as_slice(), rows.clone())).collect();
     let start = std::time::Instant::now();
-    let mut y = last.forward_after(&with, then.quantizes())?;
+    let mut y = last.forward_after(&with, t, then.quantizes())?;
     crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);
     if out == Out::Bf16 || then.quantizes() {
         for v in y.iter_mut() {

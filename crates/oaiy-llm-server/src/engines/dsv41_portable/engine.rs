@@ -60,9 +60,9 @@ pub(crate) struct Engine {
 /// What a check's row past the first is taken to cost, a step (with its draft) being 1, where a greedy reply's pass
 /// picks how many drafts to check ([`Engine::drafts_to_check`]): by the drafter's word and this alone, so a prompt's
 /// reply is the same whenever it is asked (a pass's rows are summed apart from a step's, so how the drafts were checked
-/// can tip a near tie). Measured on the EXL3 checkpoint here: a step 140-270 ms, each row more 80-130 (its experts
-/// that no card holds).
-const DRAFT_ROW_COST: f64 = 0.6;
+/// can tip a near tie). Measured on the EXL3 checkpoint here: a step 120-220 ms, each row more 70-110, a check of four
+/// some 3.5 steps (its experts that no card holds; three fifths of a step before the step's own calls were cut).
+const DRAFT_ROW_COST: f64 = 0.75;
 /// Drafted passes in a row that check none of their drafts before drafting pauses ([`DRAFT_PAUSE`] passes), and the
 /// pause: the drafter is unsure of what comes, and its own pass is a fifth of a step's.
 const DRAFT_UNSURE: usize = 3;
@@ -490,6 +490,16 @@ impl Engine {
                 crate::dsv41::profile::take_line(),
                 ggml_rs_wgpu::profile::take_dense_line()
             );
+            // (OAIY_CHAIN_PROFILE: the chained recordings' kernels on the GPU, the most first; OAIY_PIECE_STAMPS: their
+            // pieces' busy time against their span)
+            let kernels: Vec<String> = ggml_rs_wgpu::profile::take_kernels().into_iter().take(12).map(|(name, ms, n)| format!("{name} {ms:.0} ms ({n})")).collect();
+            if !kernels.is_empty() {
+                eprintln!("    {label}'s kernels: {}", kernels.join(", "));
+            }
+            let (busy, span, pieces) = ggml_rs_wgpu::profile::take_pieces();
+            if pieces > 0 {
+                eprintln!("    {label}'s pieces: {pieces}, busy {busy:.0} ms of a {span:.0} ms span");
+            }
         };
         if profiling {
             crate::dsv41::profile::take();
@@ -612,10 +622,6 @@ impl Engine {
             let drafts = match self.drafter.as_mut() {
                 Some(d) if room > 0 && !paused => {
                     let draft = d.draft(self.model.embed(), self.model.head(), next, pos)?;
-                    if std::env::var_os("OAIY_DSV41_TRACE_DRAFT").is_some() {
-                        let words: Vec<String> = draft.tokens.iter().map(|&t| String::from_utf8_lossy(self.tok.token_bytes(t)).into_owned()).collect();
-                        eprintln!("  draft at {pos} after {:?}: {:?} {:?}", String::from_utf8_lossy(self.tok.token_bytes(next)), words, draft.confidence);
-                    }
                     let k = self.drafts_to_check(&draft.confidence, job.sampling.temperature <= 0.0).min(room);
                     // (unsure of every draft some passes in a row: a few passes without drafting)
                     self.unsure = if k == 0 { self.unsure + 1 } else { 0 };

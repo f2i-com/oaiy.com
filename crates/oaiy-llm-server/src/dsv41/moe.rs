@@ -373,14 +373,10 @@ impl Moe {
                 Some(gpu) => {
                     let there: Vec<usize> = (0..used.len()).filter(|&j| held[j]).collect();
                     let mut outs: Vec<Vec<f32>> = vec![Vec::new(); used.len()];
+                    // (begun: each card's call submitted here, and waited for once the rest are made)
+                    let jobs: Vec<(u32, &[f32], &[f32])> = there.iter().map(|&j| (used[j], &gathered[j].1[..], &gathered[j].2[..])).collect();
+                    let cards = (!there.is_empty()).then(|| gpu.begin_held(self.layer, &jobs, cfg.swiglu_limit));
                     std::thread::scope(|scope| -> Result<()> {
-                        let cards = (!there.is_empty()).then(|| {
-                            let (there, gathered, used) = (&there, &gathered, &used);
-                            scope.spawn(move || {
-                                let jobs: Vec<(u32, &[f32], &[f32])> = there.iter().map(|&j| (used[j], &gathered[j].1[..], &gathered[j].2[..])).collect();
-                                gpu.forward_held(self.layer, &jobs, cfg.swiglu_limit)
-                            })
-                        });
                         let down = match (&shared, &shared_parts) {
                             (None, Some((gate, up))) => Some(scope.spawn(move || self.shared_forward(cfg, gate, up, t))),
                             _ => None,
@@ -401,8 +397,8 @@ impl Moe {
                             }
                         }
                         let taken = gpu.offer(self.layer, &read);
-                        if let Some(h) = cards {
-                            for (&j, out) in there.iter().zip(h.join().expect("the held experts panicked")) {
+                        if let Some(finish) = cards {
+                            for (&j, out) in there.iter().zip(finish()) {
                                 outs[j] = out;
                             }
                         }

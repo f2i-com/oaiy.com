@@ -20,6 +20,58 @@ pub struct Exl3Slots {
     nbytes: u64,
     /// Whether the host writes the matrices' words in place ([`WgpuBackend::exl3_slots_mapped`]).
     mapped: bool,
+    /// A step's vectors (jobs of one row each, up to [`STEP_JOBS`]), made at its first call and kept with their bind
+    /// groups for every call after; held by the call that uses them.
+    step: Mutex<Option<StepScratch>>,
+}
+
+/// A call of sets of slots begun ([`Exl3Slots::begin_many`]): its recording submitted, each set's jobs' outputs to
+/// come ([`SlotsBegun::finish`]). The sets' kept vectors it used are held until then.
+pub struct SlotsBegun<'a> {
+    launched: Option<crate::chain::Launched<'a>>,
+    steps: Vec<Option<std::sync::MutexGuard<'a, Option<StepScratch>>>>,
+    /// Each part of the recording: its set, its jobs' places in the set's list, each job's rows, the set's width.
+    subs: Vec<(usize, Vec<usize>, Vec<usize>, usize)>,
+    /// Each set's jobs.
+    jobs: Vec<usize>,
+}
+
+impl SlotsBegun<'_> {
+    /// Each set's jobs' outputs (`[rows, hidden]` each, unweighted), once the call is done.
+    pub fn finish(self) -> Vec<Vec<Vec<f32>>> {
+        let SlotsBegun { launched, steps, subs, jobs } = self;
+        let mut outs: Vec<Vec<Vec<f32>>> = jobs.iter().map(|&n| vec![Vec::new(); n]).collect();
+        let Some(launched) = launched else { return outs };
+        let ys = launched.wait();
+        drop(steps);
+        for ((i, mine, rows, hidden), y) in subs.into_iter().zip(ys) {
+            let mut at = 0;
+            for (j, n) in mine.into_iter().zip(rows) {
+                outs[i][j] = y[at..at + n * hidden].to_vec();
+                at += n * hidden;
+            }
+        }
+        outs
+    }
+}
+
+/// One-row jobs a call's kept vectors take ([`Exl3Slots::step`]): a decode step's or a draft's experts in one set of
+/// slots, most of a layer's six or three, and most of a check's rows' (each row its own job). A call of more goes
+/// through the recording's scratch.
+const STEP_JOBS: usize = 16;
+
+/// [`Exl3Slots::record`]'s vectors for up to [`STEP_JOBS`] jobs of one row: the inputs, the two job lists, and each
+/// group's transformed inputs, partial sums and outputs.
+struct StepScratch {
+    x: DeviceVec,
+    jgu: DeviceVec,
+    jd: DeviceVec,
+    xh_gu: DeviceVec,
+    part_gu: DeviceVec,
+    out_gu: DeviceVec,
+    xh_d: DeviceVec,
+    part_d: DeviceVec,
+    out_d: DeviceVec,
 }
 
 impl std::fmt::Debug for Exl3Slots {
@@ -82,7 +134,7 @@ impl WgpuBackend {
         };
         let gu = group(2 * n, hidden, ff, tw[0]);
         let down = group(n, ff, hidden, tw[1]);
-        Some(Exl3Slots { b: self.clone(), gu, down, slots: n, hidden, ff, nbytes, mapped })
+        Some(Exl3Slots { b: self.clone(), gu, down, slots: n, hidden, ff, nbytes, mapped, step: Mutex::new(None) })
     }
 }
 
@@ -225,9 +277,16 @@ impl Exl3Slots {
     /// whichever jobs share its call. (A call's jobs went one way for all of them, as its rows had it, and a prompt's
     /// output then hung on how its experts happened to be grouped.)
     pub fn forward_many(parts: &[(&Exl3Slots, &[(usize, &[f32])])], limit: f32) -> Vec<Vec<Vec<f32>>> {
-        let Some(&(first, _)) = parts.first() else { return Vec::new() };
+        Self::begin_many(parts, limit).finish()
+    }
+
+    /// [`Self::forward_many`] begun: recorded and submitted, its outputs left for [`SlotsBegun::finish`], so what the
+    /// caller does meanwhile runs beside the card's work (a decode step's held experts on two cards and the reads of
+    /// the rest, with no thread started for either: a thread a card a layer before).
+    pub fn begin_many<'a>(parts: &[(&'a Exl3Slots, &[(usize, &[f32])])], limit: f32) -> SlotsBegun<'a> {
+        let jobs: Vec<usize> = parts.iter().map(|(_, jobs)| jobs.len()).collect();
+        let Some(&(first, _)) = parts.first() else { return SlotsBegun { launched: None, steps: Vec::new(), subs: Vec::new(), jobs } };
         assert!(parts.iter().all(|(s, _)| Arc::ptr_eq(&s.b.gpu, &first.b.gpu)), "exl3 slots: sets on more than one GPU in one call");
-        let mut outs: Vec<Vec<Vec<f32>>> = parts.iter().map(|(_, jobs)| vec![Vec::new(); jobs.len()]).collect();
         // (set, its jobs' places in its list, the jobs): each set's jobs of one row, then of more
         let mut subs: Vec<(usize, Vec<usize>, Vec<(usize, &[f32])>)> = Vec::new();
         for (i, (s, jobs)) in parts.iter().enumerate() {
@@ -240,28 +299,50 @@ impl Exl3Slots {
             }
         }
         if subs.is_empty() {
-            return outs;
+            return SlotsBegun { launched: None, steps: Vec::new(), subs: Vec::new(), jobs };
         }
         let mut rec = crate::chain::Recorder::new(&first.b);
-        rec.keep_groups(false);
-        let recorded: Vec<(DeviceVec, Vec<usize>)> = subs.iter().map(|(i, _, these)| parts[*i].0.record(&mut rec, these, limit).expect("jobs with rows")).collect();
+        // A step's jobs (one row each, a few to a set of slots) through each set's kept vectors, their bind groups kept
+        // with them: making them was a quarter of a call of six experts in three sets. Kept for a recording of nothing
+        // else, so the device's kept groups hold the same few call after call (the recording's scratch is whatever the
+        // pool hands out, and groups kept of it filled the device's store with new ones a call, the trunk's own among
+        // what it let go). A prompt's are made anew.
+        let mut steps: Vec<Option<std::sync::MutexGuard<'a, Option<StepScratch>>>> = subs
+            .iter()
+            .map(|(i, _, these)| {
+                let s = parts[*i].0;
+                (these.len() <= STEP_JOBS && these.iter().all(|(_, x)| x.len() == s.hidden)).then(|| s.step.try_lock().ok()).flatten()
+            })
+            .collect();
+        rec.keep_groups(steps.iter().all(Option::is_some));
+        let recorded: Vec<(DeviceVec, Vec<usize>)> = subs
+            .iter()
+            .zip(&mut steps)
+            .map(|((i, _, these), step)| {
+                let s = parts[*i].0;
+                let step = step.as_mut().map(|g| &*g.get_or_insert_with(|| s.step_scratch()));
+                s.record(&mut rec, these, limit, step).expect("jobs with rows")
+            })
+            .collect();
         for (out, _) in &recorded {
             rec.read(out);
         }
-        for (((i, mine, _), (_, rows)), y) in subs.iter().zip(&recorded).zip(Box::new(rec).finish()) {
-            let hidden = parts[*i].0.hidden;
-            let mut at = 0;
-            for (&j, &n) in mine.iter().zip(rows) {
-                outs[*i][j] = y[at..at + n * hidden].to_vec();
-                at += n * hidden;
-            }
-        }
-        outs
+        let launched = Some(Box::new(rec).launch());
+        let subs = subs.into_iter().zip(recorded).map(|((i, mine, _), (_, rows))| (i, mine, rows, parts[i].0.hidden)).collect();
+        SlotsBegun { launched, steps, subs, jobs }
+    }
+    /// A step's kept vectors for these slots ([`StepScratch`]).
+    fn step_scratch(&self) -> StepScratch {
+        let (h, f, n) = (self.hidden, self.ff, STEP_JOBS);
+        let (sgu, sd) = (self.gu.splits as usize, self.down.splits as usize);
+        let v = |len: usize| self.b.vec(len);
+        StepScratch { x: v(n * h), jgu: v(4 * n), jd: v(2 * n), xh_gu: v(2 * n * h), part_gu: v(2 * n * sgu * f), out_gu: v(2 * n * f), xh_d: v(n * f), part_d: v(n * sd * h), out_d: v(n * h) }
     }
 
-    /// `jobs` recorded into `rec` as [`Self::forward`] runs them: the vector their outputs will be in (`[rows, hidden]`
-    /// each, in order) and each job's rows; None where they have no rows.
-    fn record(&self, rec: &mut crate::chain::Recorder, jobs: &[(usize, &[f32])], limit: f32) -> Option<(DeviceVec, Vec<usize>)> {
+    /// `jobs` recorded into `rec` as [`Self::forward`] runs them, through `step`'s vectors where given (jobs of one row
+    /// each, no more than it takes): the vector their outputs will be in (`[rows, hidden]` each, in order) and each
+    /// job's rows; None where they have no rows.
+    fn record(&self, rec: &mut crate::chain::Recorder, jobs: &[(usize, &[f32])], limit: f32, step: Option<&StepScratch>) -> Option<(DeviceVec, Vec<usize>)> {
         let (h, f) = (self.hidden, self.ff);
         let rows: Vec<usize> = jobs.iter().map(|(_, x)| x.len() / h).collect();
         let pairs: usize = rows.iter().sum();
@@ -283,13 +364,25 @@ impl Exl3Slots {
         let one = rows.iter().all(|&n| n == 1);
         let b = &self.b;
         let up = |v: &DeviceVec, data: &[u32]| DeviceChain::upload(b, v, &data.iter().map(|&u| f32::from_bits(u)).collect::<Vec<_>>());
-        let (x, jgu, jd) = (rec.scratch(pairs * h), rec.scratch(4 * pairs), rec.scratch(2 * pairs));
+        let (sgu, sd) = if one { (self.gu.splits as usize, self.down.splits as usize) } else { (1, 1) };
+        let (x, jgu, jd, xh_gu, part_gu, out_gu, xh_d, part_d, out_d) = match step.filter(|_| one && pairs <= STEP_JOBS) {
+            // (the outputs' vector as long as these jobs' rows: what is read back)
+            Some(s) => (s.x.clone(), s.jgu.clone(), s.jd.clone(), s.xh_gu.clone(), s.part_gu.clone(), s.out_gu.clone(), s.xh_d.clone(), s.part_d.clone(), DeviceVec { len: pairs * h, inner: s.out_d.inner.clone() }),
+            None => (
+                rec.scratch(pairs * h),
+                rec.scratch(4 * pairs),
+                rec.scratch(2 * pairs),
+                rec.scratch(2 * pairs * h),
+                rec.scratch(2 * pairs * sgu * f),
+                rec.scratch(2 * pairs * f),
+                rec.scratch(pairs * f),
+                rec.scratch(pairs * sd * h),
+                rec.scratch(pairs * h),
+            ),
+        };
         DeviceChain::upload(b, &x, &xs);
         up(&jgu, &jobs_gu);
         up(&jd, &jobs_d);
-        let (sgu, sd) = if one { (self.gu.splits as usize, self.down.splits as usize) } else { (1, 1) };
-        let (xh_gu, part_gu, out_gu) = (rec.scratch(2 * pairs * h), rec.scratch(2 * pairs * sgu * f), rec.scratch(2 * pairs * f));
-        let (xh_d, part_d, out_d) = (rec.scratch(pairs * f), rec.scratch(pairs * sd * h), rec.scratch(pairs * h));
         if one {
             group_pass(rec, &self.gu, &x, false, &jgu, 2 * pairs, Order::Jobs, &xh_gu, &part_gu, &out_gu, 0.0);
             group_pass(rec, &self.down, &out_gu, true, &jd, pairs, Order::Jobs, &xh_d, &part_d, &out_d, limit);

@@ -18,6 +18,7 @@ pub use device::WeightVec;
 mod kernels;
 pub(crate) mod matmul;
 mod ops;
+pub(crate) use ops::Launched;
 mod packed;
 mod recurrent;
 #[cfg(test)]

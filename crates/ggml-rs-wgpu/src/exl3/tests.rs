@@ -229,6 +229,14 @@ fn measure_slots_decode_call() {
     time("1 expert of a row, a call", &|| drop(slots.forward(&three[..1], 10.0)));
     let parts: Vec<(&Exl3Slots, &[(usize, &[f32])])> = (0..16).map(|_| (&slots, &three[..])).collect();
     time("16 sets of 3 in one call (/16 for a set)", &|| drop(Exl3Slots::forward_many(&parts, 10.0)));
+    // a step's held experts as a card has them: six of a layer in three pools
+    let pools: Vec<Exl3Slots> = (0..3).map(|_| b.exl3_slots(2, hidden, ff, [tw, tw]).expect("room for two slots")).collect();
+    for p in &pools {
+        p.put_many(0, &[&records.0[0][..], &records.0[1][..]], &layout);
+    }
+    let two: Vec<(usize, &[f32])> = (0..2).map(|s| (s, &x[..])).collect();
+    let parts: Vec<(&Exl3Slots, &[(usize, &[f32])])> = pools.iter().map(|p| (p, &two[..])).collect();
+    time("6 experts in 3 pools, a call", &|| drop(Exl3Slots::forward_many(&parts, 10.0)));
 }
 
 /// What putting experts into mapped (scratch) slots costs (`--ignored --nocapture`), at DeepSeek-V4.1's shape (13.3 MB a
@@ -323,6 +331,135 @@ fn several_projections_chained_are_each_the_cpus() {
         close(&got[1], cpus[0].linear(&Tensor::from_vec(xe.clone(), vec![m, shapes[0].0])).data(), &format!("the EXL3 projection beside it, {m} rows"));
         close(&got[2], &want, &format!("the BF16 matrix [{n}, {k}], {m} rows"));
     }
+    }
+}
+
+/// A step's row, and a check's few, through grouped projections and one after them in one recording ([`chained_after`]:
+/// DeepSeek-V4.1's `wo_a` groups then `wo_b`, EXL3 or BF16) is, to the bit, the two calls made apart with the rows
+/// rounded to bf16 on the host between them; rows that do not make the second's input are not taken.
+#[test]
+fn rows_chained_after_grouped_projections_are_the_two_calls_apart() {
+    let Some(b) = backend() else { return };
+    let (k, n) = (256, 128);
+    let groups: Vec<_> = (0..4).map(|g| b.exl3_with(random_exl3(k, n, 32, 40 + g), None).unwrap()).collect();
+    let cols = |g: usize| g * 32..g * 32 + 32;
+    let after_exl3 = b.exl3_with(random_exl3(128, 512, 48, 9), None).unwrap();
+    let w: Vec<f32> = (0..512 * 128).map(|i| ((i * 29 % 61) as f32 - 30.0) / 64.0).collect();
+    let after_bf16 = b.vec_of_bytes(&w.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<u8>>());
+    let bf16 = |v: f32| f32::from_bits((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) & 0xffff_0000);
+    for t in [1usize, 5] {
+        let xs: Vec<Vec<f32>> = (0..4).map(|g| (0..t * k).map(|i| (((i + 5 * g) * 31 % 97) as f32 - 48.0) / 50.0).collect()).collect();
+        let firsts: Vec<(ChainMat<'_>, &[f32])> = groups.iter().zip(&xs).map(|(l, x)| (ChainMat::Exl3(&**l), &x[..])).collect();
+        let apart = chained(&b, &firsts).expect("the groups chained");
+        let rows: Vec<f32> = (0..t).flat_map(|r| (0..4).flat_map(|g| apart[g][r * n..(r + 1) * n][cols(g)].iter().map(|&v| bf16(v)).collect::<Vec<_>>()).collect::<Vec<_>>()).collect();
+        let with: Vec<(ChainMat<'_>, &[f32], std::ops::Range<usize>)> = groups.iter().zip(&xs).enumerate().map(|(g, (l, x))| (ChainMat::Exl3(&**l), &x[..], cols(g))).collect();
+        for then in [ChainMat::Exl3(&*after_exl3), ChainMat::Bf16 { w: &after_bf16, n: 512, k: 128 }] {
+            let want = chained(&b, &[(then, &rows[..])]).expect("the second chained").pop().unwrap();
+            let got = chained_after(&b, &with, then).expect("the two chained");
+            assert_eq!(got, want, "{t} rows chained after the groups");
+        }
+        assert!(chained_after(&b, &with[..3], ChainMat::Exl3(&*after_exl3)).is_none(), "rows short of the second's input");
+    }
+}
+
+/// [`chained_normed`]'s square root and reciprocal are correctly rounded (`1 / sqrt(a)` of a million values over sixty
+/// binades, each the host's to the bit), and the rows it norms between two stages are the host's norm of the first's
+/// output to the bit: the first stage's sums those of [`chained`], the second's those of [`chained`] of the host's norm.
+#[test]
+fn a_norm_between_chained_stages_is_the_hosts() {
+    use ggml_rs::ChainRecorder;
+    let Some(b) = backend() else { return };
+    let mut s = 7u32;
+    let mut next = || {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        s
+    };
+    let a: Vec<f32> = (0..1 << 20).map(|_| f32::from_bits(((100 + next() % 60) << 23) | (next() >> 9))).collect();
+    // 1 / sqrt(a), a / 1280 and a over its neighbour, each of every value
+    let functions = NORM_AS_HOST.split("@compute").next().expect("the functions").to_string();
+    for (name, expr, host) in [
+        ("test-rsqrt-rn", "recip_rn(sqrt_rn(x[i]))", &(|a: &[f32], i: usize| 1.0 / a[i].sqrt()) as &dyn Fn(&[f32], usize) -> f32),
+        ("test-div-rn", "div_rn(x[i], 1280.0)", &|a: &[f32], i: usize| a[i] / 1280.0),
+        ("test-div-rn-any", "div_rn(x[i], x[(i + 1u) % p[0].x])", &|a: &[f32], i: usize| a[i] / a[(i + 1) % a.len()]),
+    ] {
+        let body = format!("{functions}@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) id: vec3<u32>) {{\n    let i = id.x;\n    if (i < p[0].x) {{ y[i] = {expr}; }}\n}}\n");
+        let (av, yv) = (b.vec(a.len()), b.vec(a.len()));
+        DeviceChain::upload(&b, &av, &a);
+        let mut rec = crate::chain::Recorder::new(&b);
+        let (d, drw) = (rec.gpu().dummy().clone(), rec.gpu().dummy_rw().clone());
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().unwrap().clone();
+        rec.dispatch_wide(name, &body, [&buf(&av), &d, &d, &d, &d, &d, &buf(&yv), &drw], &[a.len() as u32], ((a.len() / 256) as u32, 1, 1));
+        rec.read(&yv);
+        let got = Box::new(rec).finish().pop().unwrap();
+        let wrong = (0..a.len()).filter(|&i| host(&a, i).to_bits() != got[i].to_bits()).count();
+        assert_eq!(wrong, 0, "{expr} of {} values, {wrong} not the host's", a.len());
+    }
+    // the norm between two stages, of a width a power of two and of DeepSeek-V4.1's (1280)
+    let bf16 = |v: f32| f32::from_bits((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) & 0xffff_0000);
+    for dn in [512usize, 1280] {
+    let k = 256;
+    let q_a = b.exl3_with(random_exl3(k, dn, 32, 21), None).unwrap();
+    let w: Vec<f32> = (0..64 * k).map(|i| ((i * 29 % 61) as f32 - 30.0) / 64.0).collect();
+    let beside = b.vec_of_bytes(&w.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<u8>>());
+    let q_b = b.exl3_with(random_exl3(dn, 256, 48, 22), None).unwrap();
+    let w2: Vec<f32> = (0..128 * dn).map(|i| ((i * 17 % 53) as f32 - 26.0) / 64.0).collect();
+    let after = b.vec_of_bytes(&w2.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<u8>>());
+    let norm: Vec<f32> = (0..dn).map(|i| bf16(0.5 + (i * 37 % 101) as f32 / 64.0)).collect();
+    let eps = 1e-6f32;
+    for rows in [1usize, 3] {
+        let x: Vec<f32> = (0..rows * k).map(|i| ((i * 31 % 97) as f32 - 48.0) / 20.0).collect();
+        let first = [(ChainMat::Exl3(&*q_a), &x[..]), (ChainMat::Bf16 { w: &beside, n: 64, k }, &x[..])];
+        let then = [ChainMat::Exl3(&*q_b), ChainMat::Bf16 { w: &after, n: 128, k: dn }];
+        let (got_first, got_then) = chained_normed(&b, &first, 0, &norm, eps, &then).expect("both stages chained");
+        let want_first = chained(&b, &first).expect("the first stage alone");
+        assert_eq!(got_first, want_first, "the first stage, {rows} rows");
+        let normed: Vec<f32> = want_first[0]
+            .chunks_exact(dn)
+            .flat_map(|row| {
+                let v: Vec<f32> = row.iter().map(|&a| bf16(a)).collect();
+                let r = 1.0 / (v.iter().map(|v| v * v).sum::<f32>() / dn as f32 + eps).sqrt();
+                v.iter().zip(&norm).map(|(v, g)| bf16(g * (v * r))).collect::<Vec<_>>()
+            })
+            .collect();
+        let want_then = chained(&b, &[(then[0], &normed[..]), (then[1], &normed[..])]).expect("the second stage alone");
+        assert_eq!(got_then, want_then, "the second stage of the host's norm, {rows} rows of {dn}");
+    }
+    }
+}
+
+/// What a decode step's call of a layer's projections of x and its queries costs (`--ignored --nocapture`), at
+/// DeepSeek-V4.1-Flash's shapes (5120 wide, its queries' row 1280, 64 heads of 512, 3 bits): back to back, the call
+/// alone and the GPU's share of it (the same work recorded 16 times in one call), and each projection in a call of
+/// its own.
+#[test]
+#[ignore = "a measurement"]
+fn measure_a_layers_query_call() {
+    let Some(b) = backend() else { return };
+    let h = 5120;
+    let first: Vec<_> = [(h, 1280), (h, 512), (h, 1024), (h, 1024)].iter().enumerate().map(|(i, &(k, n))| b.exl3_with(random_exl3(k, n, 48, 300 + i as u32), None).unwrap()).collect();
+    let then: Vec<_> = [(1280, 32768), (1280, 4096)].iter().enumerate().map(|(i, &(k, n))| b.exl3_with(random_exl3(k, n, 48, 310 + i as u32), None).unwrap()).collect();
+    let w: Vec<f32> = (0..32 * h).map(|i| ((i * 29 % 61) as f32 - 30.0) / 64.0).collect();
+    let router = b.vec_of_bytes(&w.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<u8>>());
+    let x: Vec<f32> = (0..h).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+    let norm = vec![1.0f32; 1280];
+    let mut items: Vec<(ChainMat<'_>, &[f32])> = first.iter().map(|l| (ChainMat::Exl3(&**l), &x[..])).collect();
+    items.push((ChainMat::Bf16 { w: &router, n: 32, k: h }, &x[..]));
+    let thens: Vec<ChainMat<'_>> = then.iter().map(|l| ChainMat::Exl3(&**l)).collect();
+    let time = |what: &str, f: &dyn Fn()| {
+        for _ in 0..5 {
+            f();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..40 {
+            f();
+        }
+        eprintln!("{what}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / 40.0);
+    };
+    time("a layer's queries' call", &|| drop(chained_normed(&b, &items, 0, &norm, 1e-20, &thens)));
+    let many: Vec<(ChainMat<'_>, &[f32])> = (0..16).flat_map(|_| items.iter().copied()).collect();
+    time("its first stage 16 times in one call (/16)", &|| drop(chained(&b, &many)));
+    for (i, item) in items.iter().enumerate() {
+        time(&format!("projection {i} alone"), &|| drop(chained(&b, &[*item])));
     }
 }
 

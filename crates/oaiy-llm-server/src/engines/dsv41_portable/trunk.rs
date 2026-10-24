@@ -46,7 +46,10 @@ impl DenseKernel for WgpuDense {
 
     /// The projections on this adapter in one submit, the row between them made on the device
     /// ([`ggml_rs_wgpu::dense::forward_chained`]).
-    fn forward_after(&self, first: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)], quantized: bool) -> Option<Vec<f32>> {
+    fn forward_after(&self, first: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)], t: usize, quantized: bool) -> Option<Vec<f32>> {
+        if t != 1 {
+            return None;
+        }
         let held: Vec<Arc<DenseGpu>> = first
             .iter()
             .map(|(k, ..)| {
@@ -111,7 +114,7 @@ impl DenseKernel for WgpuChained {
     /// The call's matrices on this adapter in one submit and one read back (`ggml_rs_wgpu::exl3::chained`, else, all
     /// EXL3, `exl3_many`).
     fn forward_many(&self, items: &[(&dyn DenseKernel, &[f32], usize, std::ops::Range<usize>)]) -> Option<Vec<Vec<f32>>> {
-        let mine: Vec<&WgpuChained> = items.iter().map(|(k, ..)| (*k as &dyn std::any::Any).downcast_ref::<WgpuChained>()).collect::<Option<_>>()?;
+        let mine: Vec<&WgpuChained> = items.iter().map(|(k, ..)| chained_of(*k)).collect::<Option<_>>()?;
         let mats: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32])> = mine.iter().zip(items).map(|(w, (_, x, ..))| (w.chain_mat(), *x)).collect();
         let all = ggml_rs_wgpu::exl3::chained(&self.b, &mats).or_else(|| {
             let lins: Vec<(&dyn ggml_rs::exl3::PackedLinear, &[f32])> =
@@ -120,6 +123,30 @@ impl DenseKernel for WgpuChained {
         })?;
         Some(all.iter().zip(&mine).zip(items).map(|((all, w), (_, _, t, rows))| w.rows_of(all, *t, rows.clone())).collect())
     }
+
+    /// The first matrices and this one in one chained recording, the rows between them rounded on the device
+    /// (`ggml_rs_wgpu::exl3::chained_after`): an EXL3 checkpoint's `wo_a` groups then its `wo_b`.
+    fn forward_after(&self, first: &[(&dyn DenseKernel, &[f32], std::ops::Range<usize>)], _t: usize, quantized: bool) -> Option<Vec<f32>> {
+        if quantized {
+            return None;
+        }
+        let mine: Vec<&WgpuChained> = first.iter().map(|(k, ..)| chained_of(*k)).collect::<Option<_>>()?;
+        let with: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32], std::ops::Range<usize>)> = mine.iter().zip(first).map(|(w, (_, x, rows))| (w.chain_mat(), *x, rows.clone())).collect();
+        ggml_rs_wgpu::exl3::chained_after(&self.b, &with, self.chain_mat())
+    }
+
+    /// Both stages in one chained recording, the norm between them on the device to the host's bit
+    /// (`ggml_rs_wgpu::exl3::chained_normed`): a layer's projections of x, then its queries and its indexer's.
+    fn forward_normed(&self, first: &[(&dyn DenseKernel, &[f32], usize)], normed: usize, weight: &[f32], eps: f32, then: &[&dyn DenseKernel]) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+        let firsts: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32])> = first.iter().map(|(k, x, _)| chained_of(*k).map(|w| (w.chain_mat(), *x))).collect::<Option<_>>()?;
+        let thens: Vec<ggml_rs_wgpu::exl3::ChainMat<'_>> = then.iter().map(|k| chained_of(*k).map(WgpuChained::chain_mat)).collect::<Option<_>>()?;
+        ggml_rs_wgpu::exl3::chained_normed(&self.b, &firsts, normed, weight, eps, &thens)
+    }
+}
+
+/// `k` as a matrix of a chained recording, where it is one.
+fn chained_of(k: &dyn DenseKernel) -> Option<&WgpuChained> {
+    (k as &dyn std::any::Any).downcast_ref()
 }
 
 /// Put `model`'s dense trunk on `gpu` while its budget holds it: how many matrices went, and their stored bytes. An EXL3
@@ -137,7 +164,7 @@ pub(crate) fn offload_drafter(drafter: &mut crate::dsv41::dspark::Drafter, gpu: 
 }
 
 /// What puts a dense weight on `gpu` ([`offload`]).
-fn placer(gpu: &WgpuBackend, exl3: bool) -> impl FnMut(&str, &Weight) -> Option<Weight> + '_ {
+pub(super) fn placer(gpu: &WgpuBackend, exl3: bool) -> impl FnMut(&str, &Weight) -> Option<Weight> + '_ {
     move |_name, w| {
         if let Weight::Exl3 { data, n, k, .. } = w {
             let lin = gpu.exl3(crate::dsv41::linear::exl3_copy(data)).ok()?;
