@@ -53,7 +53,7 @@ fn an_expert_on_the_gpu_gives_the_cpus_output_but_for_its_sums_order() {
     let x: Vec<f32> = (0..rows * DIM).map(|_| (((next() % 2001) as f32 / 1000.0) - 1.0) * 0.5).collect();
     let weights: Vec<f32> = (0..rows).map(|i| 0.05 + 0.01 * i as f32).collect();
     let cpu = expert_forward_batch(&record, &x, Some(&weights), 10.0);
-    let gpu = WgpuExperts::new(&b, 0).unwrap().forward(&[ExpertJob { record: &record, x: &x, weights: &weights }], 10.0).pop().unwrap();
+    let gpu = WgpuExperts::new(&b, 0).unwrap().forward(0, &[ExpertJob { expert: 0, record: &record, x: &x, weights: &weights }], 10.0).pop().unwrap();
     assert_eq!(cpu.len(), gpu.len());
     let same = cpu.iter().zip(&gpu).filter(|(a, b)| a == b).count();
     let scale = cpu.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -84,12 +84,12 @@ fn measure_a_group_of_experts_on_the_gpu() {
         .collect();
     let x: Vec<f32> = (0..rows * DIM).map(|_| (((next() % 2001) as f32 / 1000.0) - 1.0) * 0.5).collect();
     let weights: Vec<f32> = (0..rows).map(|i| 0.05 + 0.01 * i as f32).collect();
-    let jobs: Vec<ExpertJob<'_>> = records.iter().map(|r| ExpertJob { record: r, x: &x, weights: &weights }).collect();
+    let jobs: Vec<ExpertJob<'_>> = records.iter().enumerate().map(|(e, r)| ExpertJob { expert: e as u32, record: r, x: &x, weights: &weights }).collect();
     let kernel = WgpuExperts::new(&b, 0).unwrap();
-    kernel.forward(&jobs[..2], 10.0);
+    kernel.forward(0, &jobs[..2], 10.0);
     for round in 0..3 {
         let t = Instant::now();
-        kernel.forward(&jobs, 10.0);
+        kernel.forward(0, &jobs, 10.0);
         eprintln!("round {round}: {n} experts of {rows} rows in {:.3} s", t.elapsed().as_secs_f64());
     }
     drop(kernel);
@@ -275,7 +275,7 @@ fn an_idle_rebalance_gives_the_card_the_most_used_experts_and_ram_the_displaced(
     let held = k.forward_held(0, &[(4, &x[..], &weights[..])], 10.0).pop().unwrap();
     let mut own = vec![0u8; RECORD_BYTES];
     store.fetch(0, 4, &mut own).unwrap();
-    let fresh = k.forward(&[ExpertJob { record: &own, x: &x, weights: &weights }], 10.0).pop().unwrap();
+    let fresh = k.forward(0, &[ExpertJob { expert: 0, record: &own, x: &x, weights: &weights }], 10.0).pop().unwrap();
     assert!(held == fresh && held.iter().any(|v| *v != 0.0), "the slot holds expert 4's record");
     assert_eq!(k.rebalance(&store, &cache, &uses, 8), 0, "and then there is nothing to move");
     assert_eq!(k.moved(), 2);

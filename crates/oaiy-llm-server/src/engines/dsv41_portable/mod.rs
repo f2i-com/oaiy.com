@@ -14,6 +14,7 @@ use ggml_rs_wgpu::dense::{DenseData, DenseGpu, RecordSlots};
 use ggml_rs_wgpu::WgpuBackend;
 
 mod engine;
+mod exl3;
 mod experts;
 mod resident;
 #[cfg(test)]
@@ -22,6 +23,7 @@ mod trunk;
 mod usage;
 
 pub(crate) use engine::Engine;
+pub(crate) use exl3::WgpuExl3Experts;
 pub(crate) use experts::{WgpuExperts, ALONE};
 pub(crate) use trunk::offload;
 pub(crate) use usage::{read_usage, write_usage};

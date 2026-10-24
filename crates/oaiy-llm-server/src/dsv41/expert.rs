@@ -57,6 +57,83 @@ const PARTS: [(&str, Dtype, usize); 6] = [
     ("w3.scale", Dtype::F8E8M0, S),
 ];
 
+/// Where an EXL3 expert's projection lies in its record (byte offsets of its `suh` and `svh`, f16, its `mul1` and its
+/// `trellis`), and its shape, `k -> n` at `tile_words` 16-bit words a 16x16 tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exl3Proj {
+    pub suh: usize,
+    pub svh: usize,
+    pub mul1: usize,
+    pub trellis: usize,
+    pub k: usize,
+    pub n: usize,
+    pub tile_words: usize,
+}
+
+/// How a checkpoint stores its routed experts, and so what a record holds.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExpertFormat {
+    /// The original's: packed e2m1 with e8m0 scales, [`RECORD_BYTES`] a record (the module's notes).
+    Fp4,
+    /// An EXL3 checkpoint's: each projection's `mul1`, `suh`, `svh` and `trellis`, in the order the checkpoint keeps
+    /// them (so a record is one read where the writer kept an expert's tensors together). Each layer its
+    /// own layout, gate (`w1`), up (`w3`) and down (`w2`): a layer's bitrate may be another's (2 bits where 3). A
+    /// record is `bytes`, the largest layer's; a smaller one's bytes past its own are unused.
+    Exl3 { layers: Vec<[Exl3Proj; 3]>, bytes: usize },
+}
+
+impl ExpertFormat {
+    pub fn record_bytes(&self) -> usize {
+        match self {
+            ExpertFormat::Fp4 => RECORD_BYTES,
+            ExpertFormat::Exl3 { bytes, .. } => *bytes,
+        }
+    }
+}
+
+/// An EXL3 checkpoint's record parts for `layer` (each `(suffix, dtype, bytes)`, in record order) and their layout, from
+/// its expert 0 (every expert of the layer is then held to the same). The parts lie in the record as expert 0's lie in
+/// the checkpoint, so an expert its writer kept together is one read: a writer that put each projection's `suh`,
+/// `svh`, `mul1` and `trellis` in that order, laid out as `mul1` first, was nine reads (three of them a 4-byte value, each
+/// a block of the drive's own).
+fn exl3_parts(idx: &StIndex, layer: u32) -> Result<(Vec<(String, Dtype, usize)>, [Exl3Proj; 3])> {
+    let mut projs = Vec::new();
+    // (which projection, which part, its suffix, dtype and bytes, and where expert 0's lies)
+    let mut all = Vec::new();
+    for (i, w) in ["w1", "w2", "w3"].into_iter().enumerate() {
+        let name = format!("layers.{layer}.ffn.experts.0.{w}.trellis");
+        let t = idx.info(&name)?;
+        let [kt, nt, tw] = t.shape[..] else {
+            return Err(Error::Format(format!("{name}: expected [k/16, n/16, words], got {:?}", t.shape)));
+        };
+        let (k, n, trellis) = (kt * 16, nt * 16, kt * nt * tw * 2);
+        projs.push(Exl3Proj { suh: 0, svh: 0, mul1: 0, trellis: 0, k, n, tile_words: tw });
+        for (part, dtype, bytes) in [("mul1", Dtype::I32, 4), ("suh", Dtype::F16, 2 * k), ("svh", Dtype::F16, 2 * n), ("trellis", Dtype::I16, trellis)] {
+            let at = idx.info(&format!("layers.{layer}.ffn.experts.0.{w}.{part}"))?;
+            all.push((i, part, format!("{w}.{part}"), dtype, bytes, (at.shard, at.start)));
+        }
+    }
+    all.sort_by_key(|a| a.5);
+    let mut parts = Vec::new();
+    let mut at = 0usize;
+    for (i, part, suffix, dtype, bytes, _) in all {
+        let p = &mut projs[i];
+        match part {
+            "mul1" => p.mul1 = at,
+            "suh" => p.suh = at,
+            "svh" => p.svh = at,
+            _ => p.trellis = at,
+        }
+        parts.push((suffix, dtype, bytes));
+        at += bytes;
+    }
+    let [w1, w2, w3] = projs[..] else { unreachable!("three projections") };
+    if (w1.k, w1.n) != (DIM, INTER) || (w3.k, w3.n) != (DIM, INTER) || (w2.k, w2.n) != (INTER, DIM) {
+        return Err(Error::Format(format!("layer {layer}: EXL3 experts of {}x{} / {}x{}, expected {DIM}x{INTER}", w1.k, w1.n, w2.k, w2.n)));
+    }
+    Ok((parts, [w1, w3, w2]))
+}
+
 /// One contiguous file range landing at `dst_off` inside the record.
 #[derive(Clone, Copy, Debug)]
 struct Run {
@@ -77,6 +154,8 @@ pub struct SafetensorsExpertStore {
     starts: Vec<u32>,
     /// Scratch for direct reads, one per concurrent fetch (checked out, never shared).
     scratch: Mutex<Vec<AlignedScratch>>,
+    /// What a record holds.
+    format: ExpertFormat,
 }
 
 impl SafetensorsExpertStore {
@@ -85,12 +164,22 @@ impl SafetensorsExpertStore {
     pub fn open(idx: &StIndex, layers: u32, experts: u32, direct: bool) -> Result<Self> {
         let mut runs: Vec<Run> = Vec::new();
         let mut starts = Vec::with_capacity((layers * experts) as usize + 1);
+        // An EXL3 checkpoint stores each projection as its trellis and transforms (`ExpertFormat::Exl3`).
+        let exl3 = idx.get("layers.0.ffn.experts.0.w1.trellis").is_some();
+        let mut layouts = Vec::new();
         for l in 0..layers {
+            let parts: Vec<(String, Dtype, usize)> = if exl3 {
+                let (parts, layout) = exl3_parts(idx, l)?;
+                layouts.push(layout);
+                parts
+            } else {
+                PARTS.iter().map(|&(suffix, dtype, bytes)| (suffix.to_string(), dtype, bytes)).collect()
+            };
             for e in 0..experts {
                 let first_run = runs.len();
                 starts.push(first_run as u32);
                 let mut dst_off = 0;
-                for (suffix, dtype, bytes) in PARTS {
+                for (suffix, dtype, bytes) in parts.iter().map(|(s, d, b)| (s.as_str(), *d, *b)) {
                     let name = format!("layers.{l}.ffn.experts.{e}.{suffix}");
                     let t = idx.info(&name)?;
                     if t.dtype != dtype || t.nbytes as usize != bytes {
@@ -125,6 +214,12 @@ impl SafetensorsExpertStore {
             all_direct &= d;
             files.push(f);
         }
+        let format = if exl3 {
+            let bytes = layouts.iter().map(|[g, u, d]| [g, u, d].iter().map(|p| p.trellis + p.k / 16 * (p.n / 16) * p.tile_words * 2).max().unwrap_or(0)).max().unwrap_or(0);
+            ExpertFormat::Exl3 { layers: layouts, bytes }
+        } else {
+            ExpertFormat::Fp4
+        };
         Ok(SafetensorsExpertStore {
             files,
             direct: all_direct,
@@ -133,7 +228,13 @@ impl SafetensorsExpertStore {
             runs,
             starts,
             scratch: Mutex::new(Vec::new()),
+            format,
         })
+    }
+
+    /// What its records hold.
+    pub fn format(&self) -> &ExpertFormat {
+        &self.format
     }
 
     /// Positioned reads per expert (2 for the DeepSeek-V4.1 checkpoints).
@@ -150,7 +251,7 @@ impl SafetensorsExpertStore {
 
 impl WeightStore for SafetensorsExpertStore {
     fn record_bytes(&self) -> usize {
-        RECORD_BYTES
+        self.format.record_bytes()
     }
 
     fn shape(&self) -> (u32, u32) {
@@ -161,8 +262,9 @@ impl WeightStore for SafetensorsExpertStore {
         if layer >= self.layers || expert >= self.experts {
             return Err(Error::Arg(format!("expert ({layer}, {expert}) out of range")));
         }
-        if dst.len() != RECORD_BYTES {
-            return Err(Error::Arg(format!("record buffer is {} bytes, need {RECORD_BYTES}", dst.len())));
+        let need = self.format.record_bytes();
+        if dst.len() != need {
+            return Err(Error::Arg(format!("record buffer is {} bytes, need {need}", dst.len())));
         }
         let i = (layer * self.experts + expert) as usize;
         let runs = &self.runs[self.starts[i] as usize..self.starts[i + 1] as usize];
@@ -336,9 +438,10 @@ pub fn swiglu(gate: &[f32], up: &[f32], route_weights: Option<&[f32]>, swiglu_li
         .collect()
 }
 
-/// One expert's share of a prompt for an [`ExpertsKernel`]: its record, its tokens' rows (`[rows, DIM]`) and their
-/// routing weights.
+/// One expert's share of a prompt for an [`ExpertsKernel`]: which expert of the layer, its record, its tokens' rows
+/// (`[rows, DIM]`) and their routing weights.
 pub struct ExpertJob<'a> {
+    pub expert: u32,
     pub record: &'a [u8],
     pub x: &'a [f32],
     pub weights: &'a [f32],
@@ -348,7 +451,8 @@ pub struct ExpertJob<'a> {
 /// `[rows, DIM]`, in order. It quantizes the activations and takes the SwiGLU as [`expert_forward_batch`] does (with
 /// `fake_quant_fp8` and [`swiglu`]), so only the sums are made there.
 pub trait ExpertsKernel: Send + Sync {
-    fn forward(&self, jobs: &[ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>>;
+    /// `layer`'s experts `jobs` (an EXL3 checkpoint's records are laid out a layer's way).
+    fn forward(&self, layer: u32, jobs: &[ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>>;
 
     /// Which of a layer's `experts`, each used by `tokens[i]` of a pass's tokens, the device keeps (their records
     /// resident there, so nobody need read them): [`Self::forward_held`] computes those. Every use counts toward what

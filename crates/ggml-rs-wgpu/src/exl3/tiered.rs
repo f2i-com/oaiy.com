@@ -32,6 +32,44 @@ impl ProjAt {
     fn trellis_bytes(&self) -> usize {
         self.k / 16 * (self.n / 16) * self.tile_words * 2
     }
+
+    /// This projection of an expert's `record`, for `m` rows of `x` (`[m, k]`): its transforms and its packed words
+    /// where they lie, every tile column on this thread, as [`Exl3MoeTiered`]'s experts run on the host: `[m, n]`. For a
+    /// model that routes and combines its experts itself (DeepSeek-V4.1's, whose workers run many experts at once).
+    pub fn forward_host(&self, record: &[u8], x: &[f32], m: usize) -> Vec<f32> {
+        let xh = self.prepare(record, x, m);
+        let y = self.columns(record, &xh, m, 0..self.n / 16);
+        self.finish(record, y, m)
+    }
+
+    /// [`Self::forward_host`] in three parts, so its tile columns may be made on several threads (one row's projection
+    /// is too little work for a thread, a layer's few experts too few tasks): `x`'s `m` rows as the matmul takes them
+    /// (`[m, k]`: scaled by `suh`, transformed and rounded).
+    pub fn prepare(&self, record: &[u8], x: &[f32], m: usize) -> Vec<f32> {
+        let t = transform(record, self);
+        let mut xh = vec![0f32; m * self.k];
+        for (row, chunk) in x[..m * self.k].chunks_exact(self.k).zip(xh.chunks_exact_mut(self.k)) {
+            t.pre(row, chunk);
+        }
+        xh
+    }
+
+    /// The matmul's sums of tile columns `cols` (16 outputs each) for [`Self::prepare`]'s rows: `[m, 16 · cols]`.
+    pub fn columns(&self, record: &[u8], xh: &[f32], m: usize, cols: std::ops::Range<usize>) -> Vec<f32> {
+        let words = LeWords(&record[self.trellis..self.trellis + self.trellis_bytes()]);
+        tile_columns(&words, self.k, self.n, self.tile_words, xh, m, cols)
+    }
+
+    /// Every column's sums (`[m, n]`, put together from [`Self::columns`]') as the caller takes them: rounded,
+    /// transformed and scaled by `svh`.
+    pub fn finish(&self, record: &[u8], mut y: Vec<f32>, m: usize) -> Vec<f32> {
+        let t = transform(record, self);
+        let mut out = vec![0f32; m * self.n];
+        for (yr, or) in y.chunks_exact_mut(self.n).zip(out.chunks_exact_mut(self.n)) {
+            t.post(yr, or);
+        }
+        out
+    }
 }
 
 /// An expert's record: its bytes, and where its gate, up and down projections lie in them.

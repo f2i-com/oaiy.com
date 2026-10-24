@@ -1061,7 +1061,7 @@ impl Models {
         });
         let devices = self.devices_of(spec);
         let picked = crate::engines::backend::open(o, &devices)?;
-        let mut kernel = None;
+        let (mut kernel, mut exl3_kernel) = (None, None);
         match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
             Some(b) => {
                 let (count, bytes) = crate::engines::dsv41_portable::offload(&mut model, b);
@@ -1071,7 +1071,22 @@ impl Models {
                 // (a card of tinygrad's is the engine's alone: its experts take half of what the default budget leaves
                 // for other uses of a card; a budget that was asked for is kept to)
                 let more = if o.webgpu_gb.is_none() && b.adapter().pci_bus_id == "tinygpu" { crate::engines::dsv41_portable::ALONE } else { 0 };
-                let experts = match crate::engines::dsv41_portable::WgpuExperts::new(b, more) {
+                // (an EXL3 checkpoint's experts are records the fp4 slots cannot run: slots of their own on every card it
+                // may use, filled while idle and by what decode steps read, the rest through a few scratch slots)
+                let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
+                if exl3 {
+                    let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect();
+                    if let Some(k) = crate::engines::dsv41_portable::WgpuExl3Experts::new(model.expert_format(), &cards, model.cfg.n_routed_experts) {
+                        // (what it keeps is weighed by the profile's counts where there is one)
+                        k.seed_uses(&model.expert_uses().counts());
+                        let k = Arc::new(k);
+                        model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn crate::dsv41::expert::ExpertsKernel>));
+                        let slots = k.tier().0;
+                        exl3_kernel = Some(k);
+                        self.say(format!("{}: slots for {slots} EXL3 experts on {} GPU{} (filled while idle, the most used first where a usage profile says)", spec.name, cards.len(), if cards.len() > 1 { "s" } else { "" }));
+                    }
+                }
+                let experts = match if exl3 { None } else { crate::engines::dsv41_portable::WgpuExperts::new(b, more) } {
                     Some(mut k) => {
                         let (n, kept) = (k.slots(), k.tier().0);
                         // The other GPUs it may use (the rest of its devices; every other discrete one where none is
@@ -1091,6 +1106,8 @@ impl Models {
                         let share = if pinned > 0 { format!(", {pinned} more on the other GPU{} (read while idle)", if others.len() > 1 { "s" } else { "" }) } else { String::new() };
                         format!("a prompt's busy experts ({n} at a time) and {kept} experts kept there between requests{share}; the rest on the CPU")
                     }
+                    None if exl3 && exl3_kernel.is_some() => "its EXL3 experts in slots on the GPUs, and through scratch slots what they do not hold".into(),
+                    None if exl3 => "its EXL3 experts on the CPU".into(),
                     None => "no room left there for experts; they run on the CPU".into(),
                 };
                 self.say(format!("{} runs on {}: {count} dense matrices ({:.1} GB) there, {experts}", spec.name, picked.label, bytes as f64 / 1e9));
@@ -1101,7 +1118,7 @@ impl Models {
         // Its own placeholder (as the CUDA build): the default, token 0, is DeepSeek's start of sequence.
         cfg.image_token_id = model.cfg.image_token_id;
         let (jobs, rx) = std::sync::mpsc::channel();
-        let e = crate::engines::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent).with_kernel(kernel).with_usage(o.usage.clone(), order).with_ram_ceiling(o.ram_gb);
+        let e = crate::engines::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent).with_kernel(kernel).with_exl3(exl3_kernel).with_usage(o.usage.clone(), order).with_ram_ceiling(o.ram_gb);
         let thread = std::thread::Builder::new().name("deepseek-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Deepseek(tok)) })
     }

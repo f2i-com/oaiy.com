@@ -132,6 +132,53 @@ impl crate::Gpu {
         BYTES as f64 / secs.max(1e-9) / 1e9
     }
 
+    /// `parts` of buffers made mappable for writing (MAP_WRITE: the card's memory, through its BAR), each `(buffer,
+    /// offset, len, fill)` (offset a multiple of 8, len of 4), mapped, made in place by `fill` (as [`write_with`]'s,
+    /// from the part's own byte 0) on the host's threads, all the parts' bytes shared among them, and unmapped: there
+    /// for the next submission. Nothing may be using the buffers. One staging copy fewer than the queue's write, whose
+    /// staging in the host's memory the GPU copied at 1.7 to 2.5 GB/s, where the threads write the card's memory at
+    /// 21.7 over eight lanes.
+    pub(crate) fn write_mapped(&self, parts: &[(&wgpu::Buffer, u64, usize, &(dyn Fn(usize, &mut [u8]) + Sync))]) {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // (0 waiting, 1 mapped, 2 refused)
+        let states: Vec<std::sync::Arc<AtomicU8>> = parts
+            .iter()
+            .map(|&(buffer, offset, len, _)| {
+                let state = std::sync::Arc::new(AtomicU8::new(0));
+                let flag = std::sync::Arc::clone(&state);
+                buffer.slice(offset..offset + len as u64).map_async(wgpu::MapMode::Write, move |r| flag.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release));
+                state
+            })
+            .collect();
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        if states.iter().any(|s| s.load(Ordering::Acquire) == 0) {
+            self.wait(None);
+            let _ = self.device.poll(wgpu::PollType::Poll);
+        }
+        assert!(states.iter().all(|s| s.load(Ordering::Acquire) == 1), "webgpu: a slot's buffer was not mapped for writing");
+        {
+            let mut views: Vec<wgpu::BufferViewMut> = parts.iter().map(|&(buffer, offset, len, _)| buffer.slice(offset..offset + len as u64).get_mapped_range_mut().expect("webgpu: a mapped buffer")).collect();
+            let total: usize = parts.iter().map(|p| p.2).sum();
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+            let each = total.div_ceil(threads).div_ceil(4096) * 4096;
+            std::thread::scope(|s| {
+                for (view, &(_, _, len, fill)) in views.iter_mut().zip(parts) {
+                    let mut whole = view.slice(..);
+                    let base = whole.as_raw_ptr().cast::<u8>().as_ptr() as usize;
+                    for at in (0..len).step_by(each.max(4096)) {
+                        let n = each.max(4096).min(len - at);
+                        // SAFETY: each thread is given its own bytes of the part's mapped range, mapped for writing
+                        // until its view (which outlives this scope) is dropped; nothing else reads or writes them
+                        s.spawn(move || fill(at, unsafe { std::slice::from_raw_parts_mut((base + at) as *mut u8, n) }));
+                    }
+                }
+            });
+        }
+        for &(buffer, ..) in parts {
+            buffer.unmap();
+        }
+    }
+
     /// `len` bytes (a multiple of 4) of `buffer` from `offset`, made by `fill` on every core ([`write_with`]'s `fill`)
     /// in a staging buffer in the host's memory a piece at a time, each piece copied to the card by the GPU: a
     /// read-mappable buffer, which wgpu's Vulkan backend puts in the host's cached memory, written through its mapping.

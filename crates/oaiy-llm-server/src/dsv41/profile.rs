@@ -13,6 +13,11 @@ pub enum Part {
     ExpertRead,
     /// Routed experts' matmuls on a GPU (`moe::Experts::gpu`).
     ExpertGpu,
+    /// Routed experts' records put into a GPU's slots as a pass asks for them (an EXL3 checkpoint's, those its cards
+    /// do not hold): the copy into the queue's staging memory.
+    ExpertUpload,
+    /// Routed experts a GPU holds, computed from their slots (an EXL3 checkpoint's: each card's call and read back).
+    ExpertHeld,
     /// Routed experts' matmuls on the CPU: a decode step's; a prompt's, the wait for them once its records are all in.
     ExpertCpu,
     /// A dense weight held on a device (`linear::Weight::Device`): one call.
@@ -33,9 +38,11 @@ pub enum Part {
     Engram,
 }
 
-const PARTS: [Part; 11] = [
+const PARTS: [Part; 13] = [
     Part::ExpertRead,
     Part::ExpertGpu,
+    Part::ExpertUpload,
+    Part::ExpertHeld,
     Part::ExpertCpu,
     Part::DeviceDense,
     Part::HostDense,
@@ -46,8 +53,8 @@ const PARTS: [Part; 11] = [
     Part::Mixing,
     Part::Engram,
 ];
-static NANOS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
-static CALLS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static NANOS: [AtomicU64; PARTS.len()] = [const { AtomicU64::new(0) }; PARTS.len()];
+static CALLS: [AtomicU64; PARTS.len()] = [const { AtomicU64::new(0) }; PARTS.len()];
 
 impl Part {
     fn index(self) -> usize {
@@ -58,6 +65,8 @@ impl Part {
         match self {
             Part::ExpertRead => "expert reads",
             Part::ExpertGpu => "experts on the GPU",
+            Part::ExpertUpload => "experts' uploads",
+            Part::ExpertHeld => "held experts",
             Part::ExpertCpu => "experts on the CPU",
             Part::DeviceDense => "dense on the device",
             Part::HostDense => "dense on the CPU",

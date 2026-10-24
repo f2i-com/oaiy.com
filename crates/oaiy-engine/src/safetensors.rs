@@ -97,7 +97,10 @@ pub struct StIndex {
 }
 
 impl StIndex {
-    /// Index every `*.safetensors` file in `dir`, in name order.
+    /// Index every `*.safetensors` file in `dir`, in name order. A tensor in more than one of them is the one the
+    /// directory's `model.safetensors.index.json` names the file of: a checkpoint may share a shard with another (an
+    /// EXL3 quantization of a model keeps the original's Engram shards, which hold a few small tensors it stores again
+    /// in its own); with no index, or one that names neither, it is an error.
     pub fn open(dir: &Path) -> Result<Self> {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -107,19 +110,31 @@ impl StIndex {
         if paths.is_empty() {
             return Err(Error::Format(format!("no .safetensors files in {}", dir.display())));
         }
-        Self::from_files(paths)
+        let owners: Option<HashMap<String, String>> = match std::fs::read(dir.join("model.safetensors.index.json")) {
+            Ok(src) => {
+                let doc = Json::parse(&src).map_err(|e| Error::Format(format!("model.safetensors.index.json: {e}")))?;
+                doc.get("weight_map").map(|m| m.members().filter_map(|(k, v)| v.as_str().map(|f| (k.to_string(), f.to_string()))).collect())
+            }
+            Err(_) => None,
+        };
+        Self::from_files(paths, owners.as_ref())
     }
 
     /// Index a single safetensors file (golden fixtures, small checkpoints).
     pub fn open_file(path: &Path) -> Result<Self> {
-        Self::from_files(vec![path.to_path_buf()])
+        Self::from_files(vec![path.to_path_buf()], None)
     }
 
-    fn from_files(shards: Vec<PathBuf>) -> Result<Self> {
+    fn from_files(shards: Vec<PathBuf>, owners: Option<&HashMap<String, String>>) -> Result<Self> {
         let (mut tensors, mut metadata) = (HashMap::new(), HashMap::new());
+        let names: Vec<String> = shards.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
         for (i, path) in shards.iter().enumerate() {
-            index_shard(i, path, &mut tensors, &mut metadata)
-                .map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
+            index_shard(i, path, &mut tensors, &mut metadata, &|name, held| {
+                // (which of two shards holding `name` keeps it: the one the index names; None where it names neither)
+                let named = owners?.get(name)?;
+                [held, i].into_iter().find(|&s| &names[s] == named)
+            })
+            .map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
         }
         Ok(StIndex { shards, tensors, metadata })
     }
@@ -234,11 +249,14 @@ impl StIndex {
     }
 }
 
+/// Index `path`'s tensors into `out` as shard `shard`. A tensor `out` holds already (from shard `held`) is kept from the
+/// shard `owner(name, held)` gives, and is an error where it gives none.
 fn index_shard(
     shard: usize,
     path: &Path,
     out: &mut HashMap<String, TensorInfo>,
     metadata: &mut HashMap<String, String>,
+    owner: &dyn Fn(&str, usize) -> Option<usize>,
 ) -> Result<()> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
@@ -292,8 +310,17 @@ fn index_shard(
             return Err(bad(&format!("{nbytes} bytes but shape {shape:?} x {dtype:?} needs {expect:?}")));
         }
         let info = TensorInfo { shard, dtype, shape, start: data_base + a as u64, nbytes };
-        if out.insert(name.to_string(), info).is_some() {
-            return Err(bad("appears in more than one shard"));
+        match out.get(name).map(|held| held.shard) {
+            None => {
+                out.insert(name.to_string(), info);
+            }
+            Some(held) => match owner(name, held) {
+                Some(s) if s == shard => {
+                    out.insert(name.to_string(), info);
+                }
+                Some(_) => {}
+                None => return Err(bad("appears in more than one shard")),
+            },
         }
     }
     Ok(())
@@ -320,5 +347,36 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(one, data);
         assert!(parts == data, "the parts' bytes differ");
+    }
+
+    /// A tensor two shards both hold is the one the directory's index names the shard of, whichever of them is read
+    /// first; where the index names neither, or there is no index, the directory is refused.
+    #[test]
+    fn a_tensor_in_two_shards_is_the_one_the_index_names() {
+        let dir = std::env::temp_dir().join(format!("st-two-shards-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shard = |name: &str, value: u8| {
+            let header = r#"{"both":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},"own":{"dtype":"U8","shape":[1],"data_offsets":[4,5]}}"#.replace("own", &format!("own{value}"));
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header.as_bytes());
+            bytes.extend([value; 5]);
+            std::fs::write(dir.join(name), bytes).unwrap();
+        };
+        shard("a.safetensors", 1);
+        shard("b.safetensors", 2);
+        let index = |owner: &str| std::fs::write(dir.join("model.safetensors.index.json"), format!(r#"{{"weight_map":{{"both":"{owner}"}}}}"#)).unwrap();
+        for (owner, value) in [("a.safetensors", 1u8), ("b.safetensors", 2)] {
+            index(owner);
+            let st = StIndex::open(&dir).unwrap();
+            assert_eq!(st.read("both").unwrap(), vec![value; 4], "the index names {owner}");
+            assert_eq!((st.read("own1").unwrap(), st.read("own2").unwrap()), (vec![1], vec![2]));
+        }
+        index("c.safetensors");
+        let neither = StIndex::open(&dir).err().map(|e| e.to_string());
+        std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
+        let none = StIndex::open(&dir).err().map(|e| e.to_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(neither.is_some_and(|e| e.contains("more than one shard")), "an index naming neither");
+        assert!(none.is_some_and(|e| e.contains("more than one shard")), "no index");
     }
 }

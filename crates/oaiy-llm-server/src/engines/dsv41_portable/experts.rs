@@ -498,7 +498,7 @@ impl crate::dsv41::expert::ExpertsKernel for WgpuExperts {
         })
     }
 
-    fn forward(&self, jobs: &[crate::dsv41::expert::ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>> {
+    fn forward(&self, _layer: u32, jobs: &[crate::dsv41::expert::ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>> {
         let slots = self.group.lock().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::with_capacity(jobs.len());
         for part in jobs.chunks(slots.len()) {

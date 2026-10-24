@@ -37,6 +37,8 @@ pub struct Experts {
     pub tokens: crate::dsv41::cpu_experts::TokensKernel,
     /// Every routed expert's uses of late: what the tiers are ordered by.
     pub uses: Uses,
+    /// What a record holds: the original's fp4, or an EXL3 checkpoint's projections (run by `exl3_experts`).
+    pub format: crate::dsv41::expert::ExpertFormat,
 }
 
 /// Decode steps after which every expert's count of uses halves ([`Uses`], and the RAM cache's own counts with
@@ -179,10 +181,15 @@ impl Experts {
 pub const GPU_MIN_ROWS: usize = 8;
 
 /// [`GPU_MIN_ROWS`], or what OAIY_DSV41_GPU_MIN_ROWS says (a measurement's: where the CPU's workers and a card's
-/// uploads balance on a machine).
-fn gpu_min_rows() -> usize {
-    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| std::env::var("OAIY_DSV41_GPU_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(GPU_MIN_ROWS))
+/// uploads balance on a machine). An EXL3 checkpoint's experts go to a GPU from one token: the CPU decodes their
+/// trellis at milliseconds of every core an expert, slower than its upload.
+fn gpu_min_rows(format: &crate::dsv41::expert::ExpertFormat) -> usize {
+    static ROWS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let asked = *ROWS.get_or_init(|| std::env::var("OAIY_DSV41_GPU_MIN_ROWS").ok().and_then(|v| v.parse().ok()));
+    asked.unwrap_or(match format {
+        crate::dsv41::expert::ExpertFormat::Exl3 { .. } => 1,
+        _ => GPU_MIN_ROWS,
+    })
 }
 /// Experts a GPU takes in one call: their records' upload bounded (about 600 MB), the matmuls a stage's round trip.
 pub const GPU_GROUP: usize = 32;
@@ -323,6 +330,98 @@ impl Moe {
         // Their records, read on several threads at once: an SSD serves a queue of reads several times faster than one
         // at a time (the cache reads a record outside its lock, and the store keeps a scratch buffer a read).
         let acquire = |e: u32| experts.cache.acquire(self.layer, e, experts.store.as_ref());
+        // An EXL3 checkpoint's decode step. With a GPU's kernel, every expert there: those the cards hold from their
+        // slots, the rest read (RAM, else the drive), taken into a free slot while there is one (and let go from RAM),
+        // and what is left through the scratch slots (a record's upload is a fraction of a millisecond, its trellis
+        // decoded on the CPU some milliseconds of every core). Without one, on every core, each projection's columns in
+        // tasks of their own (the pool's workers run the fp4 kernels).
+        #[cfg(feature = "webgpu")]
+        if let (crate::dsv41::expert::ExpertFormat::Exl3 { layers, .. }, 1) = (&experts.format, t) {
+            let r = &routes[0];
+            let weights: Vec<f32> = used.iter().map(|e| r.weights[r.experts.iter().position(|x| x == e).expect("a used expert is routed")]).collect();
+            let gpu = experts.gpu.as_ref();
+            let held = gpu.map_or_else(|| vec![false; used.len()], |g| g.holds(self.layer, &used, &vec![1; used.len()]));
+            let ids: Vec<u32> = (0..used.len()).filter(|&j| !held[j]).map(|j| used[j]).collect();
+            let mut shared = shared_whole;
+            let outs: Vec<Vec<f32>> = match gpu {
+                // the held experts begun on their cards before anything is read, which they need not wait for, and the
+                // shared expert's down projection beside the routed ones (its own round trip after them before)
+                Some(gpu) => {
+                    let w: Vec<[f32; 1]> = weights.iter().map(|&w| [w]).collect();
+                    let there: Vec<usize> = (0..used.len()).filter(|&j| held[j]).collect();
+                    let mut outs: Vec<Vec<f32>> = vec![Vec::new(); used.len()];
+                    std::thread::scope(|scope| -> Result<()> {
+                        let cards = (!there.is_empty()).then(|| {
+                            let (there, w, used) = (&there, &w, &used);
+                            scope.spawn(move || {
+                                let jobs: Vec<(u32, &[f32], &[f32])> = there.iter().map(|&j| (used[j], x, &w[j][..])).collect();
+                                gpu.forward_held(self.layer, &jobs, cfg.swiglu_limit)
+                            })
+                        });
+                        let down = match (&shared, &shared_parts) {
+                            (None, Some((gate, up))) => Some(scope.spawn(move || self.shared_forward(cfg, gate, up, t))),
+                            _ => None,
+                        };
+                        let reading = std::time::Instant::now();
+                        let leases = read_all(&ids, &|e| experts.cache.probe(self.layer, e), &acquire)?;
+                        crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertRead, reading);
+                        let computing = std::time::Instant::now();
+                        // what was read through the scratch slots (the cards keep what is used enough, and RAM then
+                        // lets it go: an expert in one place)
+                        let read: Vec<(u32, &[u8])> = ids.iter().zip(&leases).map(|(&e, l)| (e, &**l)).collect();
+                        let at = |e: u32| used.iter().position(|&u| u == e).expect("a used expert");
+                        if !read.is_empty() {
+                            let jobs: Vec<crate::dsv41::expert::ExpertJob<'_>> = read.iter().map(|&(e, record)| crate::dsv41::expert::ExpertJob { expert: e, record, x, weights: &w[at(e)][..] }).collect();
+                            for (&(e, _), out) in read.iter().zip(gpu.forward(self.layer, &jobs, cfg.swiglu_limit)) {
+                                outs[at(e)] = out;
+                            }
+                        }
+                        let taken = gpu.offer(self.layer, &read);
+                        if let Some(h) = cards {
+                            for (&j, out) in there.iter().zip(h.join().expect("the held experts panicked")) {
+                                outs[j] = out;
+                            }
+                        }
+                        if let Some(h) = down {
+                            shared = Some(h.join().expect("the shared expert panicked"));
+                        }
+                        crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertGpu, computing);
+                        drop(read);
+                        drop(leases);
+                        for e in taken {
+                            experts.cache.remove(self.layer, e);
+                        }
+                        Ok(())
+                    })?;
+                    outs
+                }
+                None => {
+                    let reading = std::time::Instant::now();
+                    let leases = read_all(&ids, &|e| experts.cache.probe(self.layer, e), &acquire)?;
+                    crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertRead, reading);
+                    let computing = std::time::Instant::now();
+                    let records: Vec<&[u8]> = leases.iter().map(|l| &l[..]).collect();
+                    let outs = crate::dsv41::exl3_experts::forward_step(&records, &layers[self.layer as usize], x, &weights, cfg.swiglu_limit)?;
+                    crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertCpu, computing);
+                    outs
+                }
+            };
+            // (the sums in ascending expert order, as the other paths add them)
+            for out in outs {
+                for (acc, v) in y.iter_mut().zip(&out) {
+                    *acc += v;
+                }
+            }
+            let shared = match (shared, shared_parts) {
+                (Some(shared), _) => shared,
+                (None, Some((gate, up))) => self.shared_forward(cfg, &gate, &up, t),
+                (None, None) => unreachable!("the shared expert is made one way or the other"),
+            };
+            for (acc, v) in y.iter_mut().zip(shared) {
+                *acc = to_bf16(*acc + v);
+            }
+            return Ok((y, routes));
+        }
         let outs: Vec<(Vec<usize>, Vec<f32>)> = match (&experts.pool, t) {
             // A decode step: the token's experts the GPU keeps computed there, while the rest are read and computed at
             // once on the CPU's workers; then the GPU may take in what was read.
@@ -467,8 +566,20 @@ impl Moe {
         // its rows and makes their SwiGLU between its calls, and on a core it shared with a worker what the GPU held
         // took 5.8 s of a 276-token prompt where 3.5)
         let all = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let threads = if experts.pool.is_none() { 1 } else if gpu.is_some() { all.saturating_sub(2).max(1) } else { all };
-        let floor = gpu_min_rows();
+        // (an EXL3 checkpoint's experts all on the GPU where there is one: the CPU decodes their trellis at milliseconds
+        // of every core an expert, slower than the upload, and its sums round apart from the GPU's, so a prompt's output
+        // hung on which of them each expert happened to go to)
+        let exl3 = matches!(experts.format, crate::dsv41::expert::ExpertFormat::Exl3 { .. });
+        let threads = if exl3 && gpu.is_some() {
+            0
+        } else if experts.pool.is_none() {
+            1
+        } else if gpu.is_some() {
+            all.saturating_sub(2).max(1)
+        } else {
+            all
+        };
+        let floor = gpu_min_rows(&experts.format);
         let state = Mutex::new(Landed { ready: std::collections::VecDeque::new(), left: order.len(), failed: None });
         let landed = std::sync::Condvar::new();
         let next = AtomicUsize::new(0);
@@ -515,6 +626,19 @@ impl Moe {
                     let Some((j, record)) = job else { break };
                     // (one token: the row kernel, which decodes nothing it does not multiply at once)
                     let (x, w) = (&gathered[j].1, &gathered[j].2);
+                    // An EXL3 checkpoint's expert through its own decoder; a record it refuses fails the pass (its
+                    // output left empty: the pass returns the error before it is used).
+                    #[cfg(feature = "webgpu")]
+                    if let crate::dsv41::expert::ExpertFormat::Exl3 { layers, .. } = &experts.format {
+                        let out = crate::dsv41::exl3_experts::forward_rows(&record, &layers[self.layer as usize], x, Some(w), cfg.swiglu_limit).unwrap_or_else(|e| {
+                            state.lock().unwrap_or_else(|p| p.into_inner()).failed.get_or_insert(e);
+                            Vec::new()
+                        });
+                        if out_tx.send((j, out)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     let out = if w.len() == 1 {
                         crate::dsv41::expert::expert_forward_rows(row_kernel, &record, x, Some(w), cfg.swiglu_limit)
                     } else {
@@ -559,9 +683,9 @@ impl Moe {
                         break;
                     }
                     let jobs: Vec<crate::dsv41::expert::ExpertJob<'_>> =
-                        group.iter().map(|(j, record)| crate::dsv41::expert::ExpertJob { record, x: &gathered[*j].1, weights: &gathered[*j].2 }).collect();
+                        group.iter().map(|(j, record)| crate::dsv41::expert::ExpertJob { expert: used[*j], record, x: &gathered[*j].1, weights: &gathered[*j].2 }).collect();
                     let computing = std::time::Instant::now();
-                    let got = gpu.forward(&jobs, cfg.swiglu_limit);
+                    let got = gpu.forward(self.layer, &jobs, cfg.swiglu_limit);
                     crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertGpu, computing);
                     for ((j, _), out) in group.iter().zip(got) {
                         done[*j] = Some(out);

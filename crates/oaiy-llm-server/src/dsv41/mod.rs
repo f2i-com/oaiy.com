@@ -15,6 +15,7 @@
 //! - [`attention`] — sliding window + compressed sparse attention, compressor, indexer
 //! - [`expert`], [`moe`] — the in-place expert store, routed/shared experts, router
 //! - [`cpu_experts`] — decode-time routed experts on a CPU thread pool (hybrid tier)
+//! - `exl3_experts` — the routed experts of an EXL3 checkpoint on the CPU (the WebGPU build's: its decoder is there)
 //! - [`engram`] — n-gram hash memory
 //! - [`model`] — the backbone forward pass
 //! - [`vision`] — image preprocessing (bit-exact to the reference's Pillow
@@ -28,6 +29,8 @@ pub mod config;
 pub mod cpu_experts;
 pub mod detok;
 pub mod engram;
+#[cfg(feature = "webgpu")]
+pub mod exl3_experts;
 pub mod expert;
 pub mod ternary;
 pub mod golden;

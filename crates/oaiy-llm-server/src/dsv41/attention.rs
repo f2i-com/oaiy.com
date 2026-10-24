@@ -158,7 +158,7 @@ impl Attention {
             wq_b: Weight::load(idx, &format!("{p}.wq_b"))?,
             wkv: Weight::load(idx, &format!("{p}.wkv"))?,
             kv_norm: load_vec(idx, &format!("{p}.kv_norm.weight"))?,
-            wo_a: Weight::load_fp8_as_bf16(idx, &format!("{p}.wo_a"))?,
+            wo_a: Weight::load_groups(idx, &format!("{p}.wo_a"), cfg.o_groups)?,
             wo_b: Weight::load(idx, &format!("{p}.wo_b"))?,
             attn_sink: load_vec(idx, &format!("{p}.attn_sink"))?,
             compressor,

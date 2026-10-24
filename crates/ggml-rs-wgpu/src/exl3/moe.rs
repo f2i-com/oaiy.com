@@ -50,7 +50,7 @@ pub(crate) fn coop_on(gpu: &Gpu) -> bool {
 
 /// Rows a block of a prompt's experts' jobs takes: [`g_coop`]'s 16 (an expert's some 10 rows of a 512-row chunk in
 /// one fragment of the tensor cores), else [`moe_block`]'s.
-fn many_rows(gpu: &Gpu) -> usize {
+pub(super) fn many_rows(gpu: &Gpu) -> usize {
     if coop_on(gpu) { 16 } else { moe_block() }
 }
 
@@ -456,13 +456,22 @@ impl Exl3MoeGrouped {
     /// `pairs`: `x` the gate and up rows of each hidden row (`2 r` and `2 r + 1`), the input their SwiGLU.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn group_pass(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, pairs: bool, jobs: &DeviceVec, count: usize, order: Order<'_>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec) {
+        group_pass(rec, g, x, pairs, jobs, count, order, xh, part, y, 0.0);
+    }
+}
+
+/// [`Exl3MoeGrouped::group_pass`] of any groups ([`Exl3Slots`]' too), with `limit` the SwiGLU's clamp where `pairs` (up
+/// clamped to it either way, gate from above; 0 none).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn group_pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, pairs: bool, jobs: &DeviceVec, count: usize, order: Order<'_>, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec, limit: f32) {
+    {
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let (xb, jb, xhb, pb, yb) = (buf(x), buf(jobs), buf(xh), buf(part), buf(y));
         let (suh, svh) = (buf(&g.suh), buf(&g.svh));
         if pairs {
-            rec.dispatch_wide("exl3-pre-swiglu", chain_shader("pre-swiglu"), [&xb, &suh, &d, &jb, &xb, &d, &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1], ((g.k / 128) as u32, count as u32, 1));
+            rec.dispatch_wide("exl3-pre-swiglu", chain_shader("pre-swiglu"), [&xb, &suh, &d, &jb, &xb, &d, &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits()], ((g.k / 128) as u32, count as u32, 1));
         } else {
             rec.dispatch_wide("exl3-pre", chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
         }
@@ -504,7 +513,9 @@ impl Exl3MoeGrouped {
         }
         rec.dispatch_wide("exl3-post", chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, splits], ((g.n / 128) as u32, count as u32, 1));
     }
+}
 
+impl Exl3MoeGrouped {
     /// A group's low-rank updates added to its jobs' outputs `y`, after its pass ([`LORA_A`], [`LORA_B`]): `x`,
     /// `pairs`, `jobs` and `count` as [`Self::group_pass`] took them. `kept`: a step's or a check's (the vector between
     /// the two kernels the layer's own, kept).

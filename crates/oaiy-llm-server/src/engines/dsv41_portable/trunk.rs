@@ -59,9 +59,48 @@ impl DenseKernel for WgpuDense {
     }
 }
 
+/// An EXL3 projection on the WebGPU adapter (`WgpuBackend::exl3`), as the CPU model's [`DenseKernel`]: it gives every row
+/// of its output, of which the rows asked for are taken. Its activation is taken as it is and its sums are its own
+/// transforms' (f16 where exllamav3 rounds), so it is no fp8 weight.
+pub(super) struct WgpuExl3 {
+    lin: Arc<dyn ggml_rs::exl3::PackedLinear>,
+    n: usize,
+    k: usize,
+}
+
+impl WgpuExl3 {
+    /// `rows` of each of `t` rows of `all` (the projection's whole output).
+    fn rows_of(&self, all: &[f32], t: usize, rows: std::ops::Range<usize>) -> Vec<f32> {
+        let mut y = Vec::with_capacity(t * rows.len());
+        for tt in 0..t {
+            y.extend_from_slice(&all[tt * self.n + rows.start..tt * self.n + rows.end]);
+        }
+        y
+    }
+}
+
+impl DenseKernel for WgpuExl3 {
+    fn forward_rows(&self, x: &[f32], t: usize, rows: std::ops::Range<usize>) -> Vec<f32> {
+        let all = self.lin.linear(&ggml_rs::Tensor::from_vec(x.to_vec(), vec![t, self.k])).to_host();
+        self.rows_of(all.data(), t, rows)
+    }
+
+    /// EXL3 projections on this adapter in one submit and one read back (`ggml_rs_wgpu::exl3::exl3_many`).
+    fn forward_many(&self, items: &[(&dyn DenseKernel, &[f32], usize, std::ops::Range<usize>)]) -> Option<Vec<Vec<f32>>> {
+        let mine: Vec<&WgpuExl3> = items.iter().map(|(k, ..)| (*k as &dyn std::any::Any).downcast_ref::<WgpuExl3>()).collect::<Option<_>>()?;
+        let lins: Vec<(&dyn ggml_rs::exl3::PackedLinear, &[f32])> = mine.iter().zip(items).map(|(w, (_, x, ..))| (&*w.lin, *x)).collect();
+        let all = ggml_rs_wgpu::exl3::exl3_many(&lins)?;
+        Some(all.iter().zip(&mine).zip(items).map(|((all, w), (_, _, t, rows))| w.rows_of(all, *t, rows.clone())).collect())
+    }
+}
+
 /// Put `model`'s dense trunk on `gpu` while its budget holds it: how many matrices went, and their stored bytes.
 pub(crate) fn offload(model: &mut crate::dsv41::model::Model, gpu: &WgpuBackend) -> (usize, u64) {
     model.offload(|_name, w| {
+        if let Weight::Exl3 { data, n, k, .. } = w {
+            let lin = gpu.exl3(crate::dsv41::linear::exl3_copy(data)).ok()?;
+            return Some(Weight::Device { kernel: Arc::new(WgpuExl3 { lin, n: *n, k: *k }), n: *n, k: *k, fp8: false });
+        }
         let (data, n, k, fp8) = match w {
             Weight::Fp8 { w, s, n, k } => {
                 let scales = s.iter().map(|&b| oaiy_engine::formats::e8m0_to_f32(b)).collect();

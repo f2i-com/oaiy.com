@@ -19,11 +19,12 @@ mod host;
 mod kernels;
 mod moe;
 mod routing;
+mod slots;
 mod source;
 mod tiered;
 
 // (what this file gave the crate and its users, and what the files make for each other)
-pub use {host::*, moe::*, source::*, tiered::*};
+pub use {host::*, moe::*, slots::*, source::*, tiered::*};
 pub(crate) use {kernels::*, routing::*};
 
 /// An EXL3 projection with its packed weights on the GPU, in buffers of whole tile rows below the binding limit.
@@ -150,14 +151,6 @@ impl Exl3Gpu {
         }
         Recorded { part: pbuf, size: psize, rows, n, slots }
     }
-
-    /// One pass: `rows` (at most [`ROWS`]) prepared input rows, their matmul sums `[rows, n]`.
-    fn pass(&self, xh: &[f32], rows: usize) -> Vec<f32> {
-        let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
-        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
-        let recorded = self.record(&mut enc, xh, rows);
-        read_back(&self.gpu, enc, &[recorded]).pop().expect("one pass, one result")
-    }
 }
 
 /// A pass recorded into an encoder: its partial sums' buffer, `slots` of `[rows, n]`.
@@ -215,23 +208,78 @@ impl PackedLinear for Exl3Gpu {
         self.nbytes + (self.t.k + self.t.n) * 8
     }
     fn linear(&self, x: &Tensor) -> Tensor {
-        let (k, n) = (self.t.k, self.t.n);
         let mut host = None;
-        let (data, m, shape) = self.t.rows(x, &mut host);
-        let mut out = vec![0f32; m * n];
-        let mut xh = vec![0f32; ROWS * k];
-        for start in (0..m).step_by(ROWS) {
-            let rows = ROWS.min(m - start);
-            for r in 0..rows {
-                self.t.pre(&data[(start + r) * k..(start + r + 1) * k], &mut xh[r * k..(r + 1) * k]);
+        let (data, _, shape) = self.t.rows(x, &mut host);
+        Tensor::from_vec(many(&[self], &[data]).pop().expect("one projection, one output"), shape)
+    }
+}
+
+/// Partial sums one submit of [`exl3_many`] reads back at most: a prompt's passes past that go in more submits.
+const MANY_BYTES: u64 = 256 << 20;
+
+/// Several EXL3 projections on one GPU, `(projection, x)` each (`x` its host rows, `[m, k]`, any `m`), in as few
+/// submits as their partial sums allow (one for a decode step's, [`MANY_BYTES`] of sums a read back): each one's output
+/// `[m, n]`, as its `linear` gives it. None if any is not on the GPU the first is on. A model that runs its projections
+/// one by one made a round trip of each (and of each [`ROWS`] rows of a prompt).
+pub fn exl3_many(items: &[(&dyn PackedLinear, &[f32])]) -> Option<Vec<Vec<f32>>> {
+    let gpus: Vec<&Exl3Gpu> = items.iter().map(|(l, _)| l.as_any()?.downcast_ref::<Exl3Gpu>()).collect::<Option<_>>()?;
+    let first = *gpus.first()?;
+    if !gpus.iter().all(|g| Arc::ptr_eq(&g.gpu, &first.gpu)) {
+        return None;
+    }
+    let xs: Vec<&[f32]> = items.iter().map(|(_, x)| *x).collect();
+    Some(many(&gpus, &xs))
+}
+
+/// [`exl3_many`] of projections on one GPU: every [`ROWS`] rows of each a pass, the passes recorded into one encoder
+/// until their sums come to [`MANY_BYTES`], each encoder one submit and one read back.
+fn many(gpus: &[&Exl3Gpu], xs: &[&[f32]]) -> Vec<Vec<f32>> {
+    let first = gpus[0];
+    // (projection, first row, rows) of every pass
+    let passes: Vec<(usize, usize, usize)> = gpus
+        .iter()
+        .zip(xs)
+        .enumerate()
+        .flat_map(|(i, (g, x))| {
+            let m = x.len() / g.t.k;
+            (0..m).step_by(ROWS).map(move |s| (i, s, ROWS.min(m - s)))
+        })
+        .collect();
+    let mut outs: Vec<Vec<f32>> = gpus.iter().zip(xs).map(|(g, x)| vec![0f32; x.len() / g.t.k * g.t.n]).collect();
+    let mut at = 0;
+    while at < passes.len() {
+        let (mut xhs, mut bytes, mut these) = (Vec::new(), 0u64, Vec::new());
+        while at < passes.len() {
+            let (i, s, rows) = passes[at];
+            let g = gpus[i];
+            let size = g.chunks.iter().map(|c| c.3 as u64).sum::<u64>() * (rows * g.t.n * 4) as u64;
+            if !these.is_empty() && bytes + size > MANY_BYTES {
+                break;
             }
-            let mut y = self.pass(&xh[..rows * k], rows);
+            let k = g.t.k;
+            let mut xh = vec![0f32; rows * k];
             for r in 0..rows {
-                self.t.post(&mut y[r * n..(r + 1) * n], &mut out[(start + r) * n..(start + r + 1) * n]);
+                g.t.pre(&xs[i][(s + r) * k..(s + r + 1) * k], &mut xh[r * k..(r + 1) * k]);
+            }
+            xhs.push(xh);
+            these.push(passes[at]);
+            bytes += size;
+            at += 1;
+        }
+        let ys = {
+            let _one = first.serial.lock().unwrap_or_else(|p| p.into_inner());
+            let mut enc = first.gpu.device.create_command_encoder(&Default::default());
+            let recorded: Vec<Recorded> = these.iter().zip(&xhs).map(|(&(i, _, rows), xh)| gpus[i].record(&mut enc, xh, rows)).collect();
+            read_back(&first.gpu, enc, &recorded)
+        };
+        for ((i, s, rows), mut y) in these.into_iter().zip(ys) {
+            let n = gpus[i].t.n;
+            for r in 0..rows {
+                gpus[i].t.post(&mut y[r * n..(r + 1) * n], &mut outs[i][(s + r) * n..(s + r + 1) * n]);
             }
         }
-        Tensor::from_vec(out, shape)
     }
+    outs
 }
 
 // ---------------------------------------------------------------------------

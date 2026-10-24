@@ -774,6 +774,41 @@ the threads took it to 261 s, the drive's now (the checkpoint here is on a USB S
 1.4 GB/s). Warm decode went from 2.06 to 1.02 s a token, about 110 of a step's 240
 experts computed on the GPU.
 
+## EXL3 checkpoints (2026-10-24)
+
+A DeepSeek-V4.1 checkpoint quantized to EXL3 (exllamav3's mul1 trellis, about 3 bits a
+weight; a few layers' experts at 2) loads in the same engine. Each projection is its
+`trellis`, `suh`, `svh` and `mul1` (`linear::Weight::Exl3`; `wo_a` stored a slice a
+group, `Weight::Stacked`). The router is f16, which loads as bf16 where every value is one.
+The checkpoint may share the original's Engram shards: a tensor two shards both hold is
+the one `model.safetensors.index.json` names (`StIndex::open`). An expert record is its
+three projections' parts in the order the checkpoint keeps them, about 13.3 MB and one
+read from the drive.
+
+On WebGPU (`engines::dsv41_portable::WgpuExl3Experts`), every routed expert is computed
+on the cards:
+- **Held experts.** Slots of each bitrate on every card the model may use (about 3,900 on
+  two 32 GB cards beside the trunk) hold the most used experts. A usage profile fills them
+  while idle.
+- **Scratch.** Every other expert goes through scratch slots on each card. The host's
+  threads write its record into the card's memory in place, through the BAR
+  (`Exl3Slots::put_many`). The cards share these experts by the rate each has shown.
+- **Promotion.** An expert used more than the least used one a card holds takes its slot
+  by a copy of the card's own memory (`Exl3Slots::copy_slot`), and RAM lets it go.
+- **Determinism.** A prompt's experts all go to the GPU. A job's sums are made in one
+  order whatever shares its call, so the same prompt gives the same reply.
+
+The CPU decodes EXL3 experts only without a GPU (`dsv41::exl3_experts`).
+
+Measured on two RTX 5090s (one on four PCIe lanes, one on eight), 100 GB of RAM tier,
+120-token replies:
+- CPU experts: 0.64 tok/s.
+- Cards that hold what the conversation uses: 5.5-5.8 tok/s.
+- A new subject: 3.7-4.4 tok/s, the cards taking it in as it goes.
+
+What is left is the trunk's projections: some 300 round trips a token, 85 ms of a step.
+Greedy answers match the FP8 checkpoint's on factual prompts word for word.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

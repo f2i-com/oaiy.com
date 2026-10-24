@@ -10,6 +10,10 @@
 //!   A plain GEMM; the caller says whether the output is rounded to bf16
 //!   (`F.linear` in bf16) or kept in f32 (the router and the head upcast).
 //! - **f32** (the hyper-connection projections).
+//! - **EXL3** (exllamav3's mul1 trellis, [`Weight::Exl3`]): a checkpoint quantized to EXL3 stores most of the trunk
+//!   this way (`{prefix}.trellis`, `suh`, `svh`, `mul1` where the original has `weight` and `scale`), and keeps the
+//!   rest as it was. Such a projection takes its activation as it is (no fp8 quantization: the trellis has its own
+//!   transforms) and its result is rounded as the caller asks, as a bf16 weight's.
 //!
 //! Weights stay in their stored form in RAM (fp8 is 1 byte/weight) and each
 //! output row is dequantized once per call, then dotted with every token's
@@ -23,6 +27,8 @@ use std::sync::{Arc, Mutex};
 
 use oaiy_engine::backend::parallel_rows;
 use oaiy_engine::{Error, Result};
+
+use ggml_rs::exl3::{Exl3Data, PackedLinear};
 
 use crate::dsv41::formats::{bf16_to_f32, e8m0_to_f32, fake_quant_fp8, fp8_e4m3_to_f32, to_bf16};
 use crate::dsv41::safetensors::{Dtype, StIndex};
@@ -160,8 +166,42 @@ pub fn gated_together(gate: &Weight, up: &Weight, down: &Weight, x: &[f32], limi
 /// as alone. Weights a device holds go in one call when its kernel takes them together: a decode step's dense calls
 /// were each a round trip to the GPU, 667 of them a token, a third of them the eight groups of each layer's `wo_a`.
 pub fn forward_together(items: &[(&Weight, &[f32], usize, std::ops::Range<usize>, Out)]) -> Vec<Vec<f32>> {
+    // A stack's rows within one of its parts are that part's (an EXL3 checkpoint's `wo_a`, asked for a group at a time).
+    let resolved: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = items
+        .iter()
+        .map(|(w, x, t, rows, out)| match w {
+            Weight::Stacked { parts, rows: each, .. } if !rows.is_empty() && rows.start / each == (rows.end - 1) / each => {
+                let p = rows.start / each;
+                (&parts[p], *x, *t, rows.start - p * each..rows.end - p * each, *out)
+            }
+            _ => (*w, *x, *t, rows.clone(), *out),
+        })
+        .collect();
+    let items = &resolved[..];
     let kernels: Option<Vec<&dyn DenseKernel>> =
         items.iter().map(|(w, ..)| if let Weight::Device { kernel, .. } = w { Some(&**kernel) } else { None }).collect();
+    // Kernels of more than one kind (an EXL3 checkpoint's projections beside its fp8 and bf16 ones): each kind's in a
+    // call of its own, a round trip each, rather than one each.
+    if let Some(kernels) = &kernels {
+        let kind = |k: &dyn DenseKernel| (k as &dyn std::any::Any).type_id();
+        if kernels.len() > 2 && kernels.iter().any(|k| kind(*k) != kind(kernels[0])) {
+            let mut kinds: Vec<std::any::TypeId> = Vec::new();
+            for k in kernels {
+                if !kinds.contains(&kind(*k)) {
+                    kinds.push(kind(*k));
+                }
+            }
+            let mut ys: Vec<Vec<f32>> = vec![Vec::new(); items.len()];
+            for of in kinds {
+                let mine: Vec<usize> = (0..items.len()).filter(|&i| kind(kernels[i]) == of).collect();
+                let these: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = mine.iter().map(|&i| items[i].clone()).collect();
+                for (i, y) in mine.into_iter().zip(forward_together(&these)) {
+                    ys[i] = y;
+                }
+            }
+            return ys;
+        }
+    }
     if let Some(kernels) = kernels.filter(|k| k.len() > 1) {
         // Each input as its weights take it, made once for the weights that take it the same way (the queries' and the
         // window's projections both quantize a layer's x, the shared expert's gate and up likewise: quantized for each,
@@ -205,12 +245,73 @@ pub enum Weight {
     /// Held by `kernel` (a GPU's), with what the forward pass still does here: `fp8` says the activation is quantized
     /// and the result rounded to bf16 as for [`Weight::Fp8`]. It has no host rows.
     Device { kernel: Arc<dyn DenseKernel>, n: usize, k: usize, fp8: bool },
+    /// EXL3 as the checkpoint stores it (`[n, k]`), run here by the host's decoder, made when first asked for: a
+    /// projection a GPU takes ([`crate::dsv41::model::Model::offload`]) never needs one. It has no host rows.
+    Exl3 { data: Arc<Exl3Data>, host: std::sync::OnceLock<Arc<dyn PackedLinear>>, n: usize, k: usize },
+    /// Projections stacked by output rows, `rows` each (`wo_a`'s groups, which an EXL3 checkpoint stores a slice each):
+    /// row `r` is part `r / rows`'s row `r % rows`. Each part takes the same `k` inputs.
+    Stacked { parts: Vec<Weight>, rows: usize, k: usize },
+}
+
+/// A copy of `d` (the type has no `Clone`): the host's decoder takes its own, as a GPU's upload does.
+pub(crate) fn exl3_copy(d: &Exl3Data) -> Exl3Data {
+    Exl3Data { words: d.words.clone(), suh: d.suh.clone(), svh: d.svh.clone(), tile_words: d.tile_words, input_map: d.input_map.clone(), output_map: d.output_map.clone() }
+}
+
+/// The host's EXL3 decoder for `d` (the WebGPU build's: [`Weight::load`] refuses an EXL3 weight in any other, so this is
+/// never asked for there). `d` was validated when it was read.
+#[cfg(feature = "webgpu")]
+fn exl3_host(d: &Exl3Data) -> Arc<dyn PackedLinear> {
+    ggml_rs_wgpu::exl3::exl3_cpu(exl3_copy(d)).expect("an EXL3 weight is validated when it is read")
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn exl3_host(_: &Exl3Data) -> Arc<dyn PackedLinear> {
+    unreachable!("an EXL3 weight is refused when read, without the WebGPU build")
+}
+
+/// The multiplier mul1's codebook stores beside each EXL3 projection (`{prefix}.mul1`): the only codebook decoded here.
+const MUL1: i64 = 0x83dc_d12d_u32 as i32 as i64;
+
+/// `{prefix}`'s EXL3 projection (`trellis` `[k/16, n/16, 16·bits]` i16, `suh` `[k]`, `svh` `[n]`, `mul1`), checked.
+fn load_exl3(idx: &StIndex, prefix: &str) -> Result<Weight> {
+    if cfg!(not(feature = "webgpu")) {
+        return Err(Error::Unsupported(format!("{prefix}: an EXL3 checkpoint needs the WebGPU build of the server")));
+    }
+    let name = format!("{prefix}.trellis");
+    let info = idx.info(&name)?;
+    let [kt, nt, tw] = info.shape[..] else {
+        return Err(Error::Format(format!("{name}: expected [k/16, n/16, words], got {:?}", info.shape)));
+    };
+    if info.dtype != Dtype::I16 {
+        return Err(Error::Format(format!("{name}: {:?}, expected I16", info.dtype)));
+    }
+    let mul1 = idx.read_i64(&format!("{prefix}.mul1"))?;
+    if mul1.first() != Some(&MUL1) {
+        return Err(Error::Unsupported(format!("{prefix}: a codebook other than mul1 ({mul1:?})")));
+    }
+    let suh = idx.read_f32(&format!("{prefix}.suh"))?;
+    let svh = idx.read_f32(&format!("{prefix}.svh"))?;
+    let (k, n) = (suh.len(), svh.len());
+    if (kt * 16, nt * 16) != (k, n) {
+        return Err(Error::Format(format!("{prefix}: trellis {:?} does not fit suh {k} and svh {n}", info.shape)));
+    }
+    let bytes = idx.read(&name)?;
+    let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let data = Exl3Data { words, suh, svh, tile_words: tw, input_map: (0..k as u32).collect(), output_map: (0..n as u32).collect() };
+    data.validate().map_err(|e| Error::Format(format!("{prefix}: {e}")))?;
+    Ok(Weight::Exl3 { data: Arc::new(data), host: std::sync::OnceLock::new(), n, k })
 }
 
 impl Weight {
-    /// Load `{prefix}.weight` (and `{prefix}.scale` for fp8) as stored.
+    /// Load `{prefix}.weight` (and `{prefix}.scale` for fp8) as stored; where there is none, the EXL3 projection an
+    /// EXL3 checkpoint stores in its place (`{prefix}.trellis` and its parts). A weight stored both ways (the Engram's
+    /// `wkv`) is taken as its `weight`.
     pub fn load(idx: &StIndex, prefix: &str) -> Result<Weight> {
         let name = format!("{prefix}.weight");
+        if idx.get(&name).is_none() && idx.get(&format!("{prefix}.trellis")).is_some() {
+            return load_exl3(idx, prefix);
+        }
         let info = idx.info(&name)?;
         let [n, k] = info.shape[..] else {
             return Err(Error::Format(format!("{name}: expected 2-D, got {:?}", info.shape)));
@@ -224,6 +325,19 @@ impl Weight {
                 Weight::Fp8 { w: idx.read(&name)?, s, n, k }
             }
             Dtype::BF16 => Weight::Bf16 { w: to_u16(&idx.read(&name)?), n, k },
+            // (f16, as an EXL3 checkpoint keeps its router and the indexer's `weights_proj`: as bf16 where every value
+            // is one (the original's bf16 written as f16, which a GPU then holds as it holds the trunk's: on the CPU
+            // the router was a millisecond a layer), else held as f32, which holds every f16 exactly, where bf16 would
+            // round its mantissa)
+            Dtype::F16 => {
+                let w = idx.read_f32(&name)?;
+                let bf: Vec<u16> = w.iter().map(|&v| (v.to_bits() >> 16) as u16).collect();
+                if w.iter().zip(&bf).all(|(&v, &b)| f32::from_bits((b as u32) << 16) == v) {
+                    Weight::Bf16 { w: bf, n, k }
+                } else {
+                    Weight::F32 { w, n, k }
+                }
+            }
             Dtype::F32 => Weight::F32 { w: idx.read_f32(&name)?, n, k },
             other => return Err(Error::Format(format!("{name}: {other:?} is not a dense weight dtype"))),
         })
@@ -248,15 +362,31 @@ impl Weight {
         }
     }
 
+    /// A block-diagonal projection of `groups` groups (`wo_a`): [`load_fp8_as_bf16`](Self::load_fp8_as_bf16)'s, or
+    /// in an EXL3 checkpoint, which stores each group's rows as a projection of its own (`{prefix}.slice.{g}`), those
+    /// stacked ([`Weight::Stacked`]).
+    pub fn load_groups(idx: &StIndex, prefix: &str, groups: usize) -> Result<Weight> {
+        if idx.get(&format!("{prefix}.weight")).is_none() && idx.get(&format!("{prefix}.slice.0.trellis")).is_some() {
+            let parts: Vec<Weight> = (0..groups).map(|g| load_exl3(idx, &format!("{prefix}.slice.{g}"))).collect::<Result<_>>()?;
+            let (rows, k) = (parts[0].n(), parts[0].k());
+            if parts.iter().any(|p| p.n() != rows || p.k() != k) {
+                return Err(Error::Format(format!("{prefix}: its slices are not all [{rows}, {k}]")));
+            }
+            return Ok(Weight::Stacked { parts, rows, k });
+        }
+        Self::load_fp8_as_bf16(idx, prefix)
+    }
+
     pub fn n(&self) -> usize {
         match self {
-            Weight::Fp8 { n, .. } | Weight::Bf16 { n, .. } | Weight::F32 { n, .. } | Weight::Device { n, .. } => *n,
+            Weight::Fp8 { n, .. } | Weight::Bf16 { n, .. } | Weight::F32 { n, .. } | Weight::Device { n, .. } | Weight::Exl3 { n, .. } => *n,
+            Weight::Stacked { parts, rows, .. } => parts.len() * rows,
         }
     }
 
     pub fn k(&self) -> usize {
         match self {
-            Weight::Fp8 { k, .. } | Weight::Bf16 { k, .. } | Weight::F32 { k, .. } | Weight::Device { k, .. } => *k,
+            Weight::Fp8 { k, .. } | Weight::Bf16 { k, .. } | Weight::F32 { k, .. } | Weight::Device { k, .. } | Weight::Exl3 { k, .. } | Weight::Stacked { k, .. } => *k,
         }
     }
 
@@ -280,6 +410,7 @@ impl Weight {
             }
             Weight::F32 { w, k, .. } => dst.copy_from_slice(&w[r * k..(r + 1) * k]),
             Weight::Device { .. } => panic!("a weight on a device has no host rows (the embedding is never offloaded)"),
+            Weight::Exl3 { .. } | Weight::Stacked { .. } => panic!("an EXL3 weight has no host rows (the embedding is stored bf16)"),
         }
     }
 
@@ -292,7 +423,10 @@ impl Weight {
 
     /// Whether this weight takes its activation quantized to fp8 (and gives its result in bf16): an fp8 weight.
     fn quantizes(&self) -> bool {
-        matches!(self, Weight::Fp8 { .. } | Weight::Device { fp8: true, .. })
+        match self {
+            Weight::Stacked { parts, .. } => parts.first().is_some_and(Weight::quantizes),
+            w => matches!(w, Weight::Fp8 { .. } | Weight::Device { fp8: true, .. }),
+        }
     }
 
     /// The activation as this weight takes it, and the rounding of its result: an fp8 weight's quantized and its
@@ -312,8 +446,36 @@ impl Weight {
         assert_eq!(x.len(), t * k, "linear: input is not [t, k]");
         assert!(rows.end <= self.n(), "linear: row range past the weight");
         let (first, n) = (rows.start, rows.len());
+        // A stack's rows are its parts' (each asked for its own, its activation prepared as it takes it).
+        if let Weight::Stacked { parts, rows: each, .. } = self {
+            let mut y = vec![0.0f32; t * n];
+            let mut r = rows.start;
+            while r < rows.end {
+                let (p, from) = (r / each, r % each);
+                let to = (from + rows.end - r).min(*each);
+                let part = parts[p].forward_rows(x, t, from..to, out);
+                let (w, at) = (to - from, r - rows.start);
+                for tt in 0..t {
+                    y[tt * n + at..tt * n + at + w].copy_from_slice(&part[tt * w..(tt + 1) * w]);
+                }
+                r += w;
+            }
+            return y;
+        }
         let (xin, out) = self.prepare(x, out);
         let start = std::time::Instant::now();
+        if let Weight::Exl3 { data, host, k, .. } = self {
+            // The decoder gives every row; those asked for are taken from them.
+            let lin = host.get_or_init(|| exl3_host(data));
+            let all = lin.linear(&ggml_rs::Tensor::from_vec(xin, vec![t, *k])).to_host();
+            let (all, whole) = (all.data(), self.n());
+            let mut y = Vec::with_capacity(t * n);
+            for tt in 0..t {
+                y.extend(all[tt * whole + first..tt * whole + first + n].iter().map(|&v| if out == Out::Bf16 { to_bf16(v) } else { v }));
+            }
+            crate::dsv41::profile::add(crate::dsv41::profile::Part::HostDense, start);
+            return y;
+        }
         if let Weight::Device { kernel, .. } = self {
             let mut y = kernel.forward_rows(&xin, t, rows);
             crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);

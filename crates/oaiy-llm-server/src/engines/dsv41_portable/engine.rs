@@ -26,6 +26,8 @@ pub(crate) struct Engine {
     warm: Option<Warm>,
     /// The experts' kernel on the GPUs, for what the other cards hold ([`Pinned`]): filled while idle too.
     kernel: Option<Arc<WgpuExperts>>,
+    /// An EXL3 checkpoint's experts' kernel on the GPUs: its slots filled while idle, before RAM is.
+    exl3: Option<Arc<WgpuExl3Experts>>,
     /// Experts the idle rebalance has moved since it last said so.
     rebalanced: usize,
     /// Whether the drive may be read while no request waits (the idle reading, the rebalance).
@@ -76,7 +78,14 @@ impl Engine {
         // which reads a record for each expert a card gives up)
         let idle = std::env::var_os("OAIY_DSV41_NO_WARM").is_none();
         let warm = idle.then(|| Warm { cursor: 0, started: None, reading: std::time::Duration::ZERO, bytes_before: model.expert_cache().stats().bytes_read });
-        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm, kernel: None, rebalanced: 0, idle, usage: None, order: None, ram_gb: 0, fitted: None }
+        Engine { model, tok, covered: Vec::new(), checkpoint: None, eos, log, warm, kernel: None, exl3: None, rebalanced: 0, idle, usage: None, order: None, ram_gb: 0, fitted: None }
+    }
+
+    /// An EXL3 checkpoint's experts' kernel the model was given: the idle reading fills its slots first (in the
+    /// profile's order where there is one), and leaves what they hold out of RAM.
+    pub(crate) fn with_exl3(mut self, exl3: Option<Arc<WgpuExl3Experts>>) -> Engine {
+        self.exl3 = exl3;
+        self
     }
 
     /// The experts' kernel the model was given, when other cards hold a share of them: the idle reading fills those
@@ -164,7 +173,15 @@ impl Engine {
             w.reading += slice.elapsed();
             return;
         }
-        let elsewhere = |l: u32, e: u32| kernel.is_some_and(|k| k.elsewhere(l, e));
+        // (an EXL3 checkpoint's cards filled while idle only in a usage profile's order: by number they would hold a
+        // quarter of what a step asks for by chance, and for good; without one, a decode step's reads fill them)
+        let exl3 = self.exl3.as_deref();
+        let order = self.order.as_deref();
+        if order.is_some() && exl3.is_some_and(|k| k.fill_some(self.model.expert_store().as_ref(), self.model.expert_cache(), order, WARM_SLICE)) {
+            w.reading += slice.elapsed();
+            return;
+        }
+        let elsewhere = |l: u32, e: u32| kernel.is_some_and(|k| k.elsewhere(l, e)) || exl3.is_some_and(|k| k.elsewhere(l, e));
         let more = match &self.order {
             Some(order) => self.model.warm_experts_in(order, &mut w.cursor, WARM_SLICE, &elsewhere),
             None => self.model.warm_experts(&mut w.cursor, WARM_SLICE, &elsewhere),
@@ -174,12 +191,12 @@ impl Engine {
             if self.log {
                 let c = self.model.expert_cache();
                 let read = c.stats().bytes_read.saturating_sub(w.bytes_before);
-                let pinned = kernel.map_or(0, |k| k.pinned());
+                let pinned = kernel.map_or(0, |k| k.pinned()) + exl3.map_or(0, |k| k.tier().1);
                 eprintln!(
                     "  the experts' RAM tier holds {} of its {}{}: {:.1} s of idle reading ({:.1} GB read into RAM since the model loaded)",
                     c.len(),
                     c.n_slots(),
-                    if pinned > 0 { format!(", the other GPUs {pinned} more for good") } else { String::new() },
+                    if pinned > 0 { format!(", the {}GPUs {pinned} more for good", if exl3.is_some() { "" } else { "other " }) } else { String::new() },
                     w.reading.as_secs_f64(),
                     read as f64 / 1e9
                 );
@@ -277,13 +294,22 @@ impl Engine {
         let started = std::time::Instant::now();
         // OAIY_DSV41_PROFILE: where the prompt's and the reply's time went (`crate::dsv41::profile`), and what each read
         let profiling = self.log && std::env::var_os("OAIY_DSV41_PROFILE").is_some();
-        let kernel = self.kernel.clone();
+        let (kernel, exl3) = (self.kernel.clone(), self.exl3.clone());
+        // (an EXL3 checkpoint's cards: their experts computed from slots as the first card's tier's hits, those put
+        // through the scratch slots as its misses)
         let read_so_far = move |m: &crate::dsv41::model::Model| {
             let st = m.expert_cache().stats();
-            let tier = kernel.as_ref().map_or((0, 0, 0, 0), |k| {
-                let (_, hits, misses, admitted) = k.tier();
-                (hits, misses, admitted, k.share_hits())
-            });
+            let tier = match (&kernel, &exl3) {
+                (Some(k), _) => {
+                    let (_, hits, misses, admitted) = k.tier();
+                    (hits, misses, admitted, k.share_hits())
+                }
+                (None, Some(k)) => {
+                    let (held, scratch, taken, kept) = k.counts();
+                    (held, scratch, taken + kept, 0)
+                }
+                (None, None) => (0, 0, 0, 0),
+            };
             (st.bytes_read, st.hits, st.misses, tier)
         };
         type Read = (u64, u64, u64, (u64, u64, u64, u64));

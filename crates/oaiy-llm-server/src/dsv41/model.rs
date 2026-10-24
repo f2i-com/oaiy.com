@@ -13,7 +13,7 @@ use oaiy_engine::{CachePolicy, Error, Result};
 use crate::dsv41::attention::{AttnState, Attention, Shared};
 use crate::dsv41::config::Config;
 use crate::dsv41::engram::{Engram, NgramHasher};
-use crate::dsv41::expert::{SafetensorsExpertStore, RECORD_BYTES};
+use crate::dsv41::expert::SafetensorsExpertStore;
 use crate::dsv41::hc::{self, HcParams, Mix, HC};
 use crate::dsv41::linear::{load_vec, Out, Weight};
 use crate::dsv41::moe::{Experts, Moe, Route};
@@ -123,6 +123,8 @@ impl Model {
         }
         let states = layers.iter().map(|ly| ly.attn.new_state(&cfg, opts.max_seq)).collect();
         let store = SafetensorsExpertStore::open(&idx, cfg.n_layers as u32, cfg.n_routed_experts as u32, opts.direct_io)?;
+        // (an EXL3 checkpoint's records hold its projections as stored, the largest layer's size each)
+        let format = store.format().clone();
         Ok(Model {
             embed: Weight::load(&idx, "embed")?,
             norm: load_vec(&idx, "norm.weight")?,
@@ -138,8 +140,9 @@ impl Model {
                 tokens: crate::dsv41::cpu_experts::fp4_tokens,
                 gpu: None,
                 store: Arc::new(store),
-                cache: Ecache::new(opts.expert_cache_bytes, RECORD_BYTES, CachePolicy::Lfru),
+                cache: Ecache::new(opts.expert_cache_bytes, format.record_bytes(), CachePolicy::Lfru),
                 uses: crate::dsv41::moe::Uses::new(cfg.n_layers, cfg.n_routed_experts),
+                format,
             },
             max_seq: opts.max_seq,
             cfg,
@@ -157,6 +160,11 @@ impl Model {
     /// Where the routed experts' records are read from.
     pub fn expert_store(&self) -> &Arc<dyn oaiy_engine::store::WeightStore> {
         &self.experts.store
+    }
+
+    /// What the routed experts' records hold.
+    pub fn expert_format(&self) -> &crate::dsv41::expert::ExpertFormat {
+        &self.experts.format
     }
 
     /// Every routed expert's uses of late ([`crate::dsv41::moe::Uses`]).
@@ -392,16 +400,24 @@ impl Model {
     pub fn offload(&mut self, mut place: impl FnMut(&str, &Weight) -> Option<Weight>) -> (usize, u64) {
         let (mut count, mut bytes) = (0usize, 0u64);
         let mut each = |name: String, w: &mut Weight| {
-            let size = match w {
-                Weight::Fp8 { w, s, .. } => (w.len() + s.len()) as u64,
-                Weight::Bf16 { w, .. } => w.len() as u64 * 2,
-                Weight::F32 { w, .. } => w.len() as u64 * 4,
-                Weight::Device { .. } => return,
+            // A stack's parts are placed one by one (an EXL3 checkpoint's `wo_a`, a slice a group), by their own names.
+            let parts: Vec<(String, &mut Weight)> = match w {
+                Weight::Stacked { parts, .. } => parts.iter_mut().enumerate().map(|(i, p)| (format!("{name}.slice.{i}"), p)).collect(),
+                w => vec![(name, w)],
             };
-            if let Some(new) = place(&name, w) {
-                *w = new;
-                count += 1;
-                bytes += size;
+            for (name, w) in parts {
+                let size = match w {
+                    Weight::Fp8 { w, s, .. } => (w.len() + s.len()) as u64,
+                    Weight::Bf16 { w, .. } => w.len() as u64 * 2,
+                    Weight::F32 { w, .. } => w.len() as u64 * 4,
+                    Weight::Exl3 { data, .. } => data.words.len() as u64 * 4 + (data.suh.len() + data.svh.len()) as u64 * 2,
+                    Weight::Device { .. } | Weight::Stacked { .. } => continue,
+                };
+                if let Some(new) = place(&name, w) {
+                    *w = new;
+                    count += 1;
+                    bytes += size;
+                }
             }
         };
         for (l, layer) in self.layers.iter_mut().enumerate() {

@@ -160,6 +160,28 @@ fn a_projection_over_several_buffers_and_splits_agrees_with_the_cpu() {
     close(g.data(), c.data(), "gpu vs cpu");
 }
 
+/// Projections of several shapes and bitrates (one over several buffers) in one call, a decode step's row and a prompt's
+/// rows past a pass's, are each the CPU's projection of its rows; one on the CPU is not taken.
+#[test]
+fn several_projections_in_one_submit_are_each_the_cpus() {
+    let Some(b) = backend() else { return };
+    let shapes = [(256, 512, 48), (512, 256, 32), (1024, 512, 64), (256, 128, 24)];
+    let lins: Vec<_> = shapes.iter().enumerate().map(|(i, &(k, n, tw))| b.exl3_with(random_exl3(k, n, tw, 70 + i as u32), (i == 2).then_some(3)).unwrap()).collect();
+    let cpus: Vec<_> = shapes.iter().enumerate().map(|(i, &(k, n, tw))| exl3_cpu(random_exl3(k, n, tw, 70 + i as u32)).unwrap()).collect();
+    for m in [1, 3, ROWS + 5] {
+        let xs: Vec<Vec<f32>> = shapes.iter().enumerate().map(|(i, &(k, ..))| (0..m * k).map(|j| (((j + i) * 29 % 83) as f32 - 41.0) / 43.0).collect()).collect();
+        let items: Vec<(&dyn PackedLinear, &[f32])> = lins.iter().zip(&xs).map(|(l, x)| (&**l, &x[..])).collect();
+        let got = exl3_many(&items).expect("all on one GPU");
+        for (i, ((c, x), y)) in cpus.iter().zip(&xs).zip(&got).enumerate() {
+            let want = c.linear(&Tensor::from_vec(x.clone(), vec![m, shapes[i].0]));
+            close(y, want.data(), &format!("projection {i}, {m} rows"));
+        }
+    }
+    let cpu = exl3_cpu(random_exl3(256, 128, 24, 9)).unwrap();
+    let x = vec![0.5f32; 256];
+    assert!(exl3_many(&[(&*lins[3], &x[..]), (&*cpu, &x[..])]).is_none(), "one on the CPU is not taken");
+}
+
 fn random_exl3(k: usize, n: usize, tw: usize, seed: u32) -> Exl3Data {
     let mut s = seed;
     let mut next = || {
@@ -1402,4 +1424,73 @@ fn a_few_rows_routed_to_slots_with_several_experts_not_held_are_the_definitions_
     }
     let (held, not, _) = moe.rest_counts().unwrap();
     assert!(held > 0 && not > held, "most routings were to experts not held: {held} held, {not} not");
+}
+
+/// An expert of a record as its definition reads, from its projections run on the host ([`ProjAt::forward_host`]): gate
+/// and up of `x`'s `rows`, the SwiGLU with up clamped to `limit` either way and gate from above (0: none), then down.
+fn slot_reference(record: &[u8], layout: &RecordLayout, x: &[f32], rows: usize, limit: f32) -> Vec<f32> {
+    let [g, u, d] = layout.proj;
+    let (gate, up) = (g.forward_host(record, x, rows), u.forward_host(record, x, rows));
+    let hidden: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&g, &u)| {
+            let (g, u) = if limit > 0.0 { (g.min(limit), u.clamp(-limit, limit)) } else { (g, u) };
+            g / (1.0 + (-g).exp()) * u
+        })
+        .collect();
+    d.forward_host(record, &hidden, rows)
+}
+
+/// Experts put into slots from their records ([`Exl3Slots`]) are each the definition's expert on its rows, whatever
+/// slot holds it: a job of one row (a step's) and of several (a prompt's), with no limit and with one that clamps.
+#[test]
+fn experts_in_slots_are_each_the_definitions() {
+    let Some(b) = backend() else { return };
+    let (count, hidden, ff, tw) = (6, 256, 128, 48);
+    let (layout, records, _) = as_records(experts(count, hidden, ff, tw));
+    // slots written through the queue one at a time, and slots the host writes in place several at once (a second
+    // round over the first: what the slots held before is all written over)
+    let queued = b.exl3_slots(4, hidden, ff, [tw, tw]).expect("room for four slots");
+    let mapped = b.exl3_slots_mapped(4, hidden, ff, [tw, tw]).expect("room for four more");
+    assert!(queued.fits(&layout) && queued.slots() == 4 && mapped.slots() == 4);
+    // experts 5, 2 and 0 in slots 0 to 2 (slot 3 left empty)
+    let held = [5usize, 2, 0];
+    for (s, &e) in held.iter().enumerate() {
+        queued.put(s, &records.0[e], &layout);
+    }
+    mapped.put_many(0, &[&records.0[1], &records.0[3], &records.0[4]], &layout);
+    mapped.put_many(0, &held.map(|e| &records.0[e][..]), &layout);
+    for slots in [&queued, &mapped] {
+        for limit in [0.0f32, 0.5] {
+            for rows in [1usize, 3] {
+                let xs: Vec<Vec<f32>> = (0..held.len()).map(|j| (0..rows * hidden).map(|i| (((i + 7 * j) * 37 % 101) as f32 - 50.0) / 40.0).collect()).collect();
+                let jobs: Vec<(usize, &[f32])> = xs.iter().enumerate().map(|(s, x)| (s, &x[..])).collect();
+                let got = slots.forward(&jobs, limit);
+                for (j, &e) in held.iter().enumerate() {
+                    let want = slot_reference(&records.0[e], &layout, &xs[j], rows, limit);
+                    close(&got[j], &want, &format!("{slots:?}: expert {e} in slot {j}, {rows} rows, limit {limit}"));
+                }
+            }
+        }
+    }
+    // two sets of slots in one call: each its own jobs'
+    let x: Vec<f32> = (0..hidden).map(|i| ((i * 13 % 29) as f32 - 14.0) / 15.0).collect();
+    let both = Exl3Slots::forward_many(&[(&queued, &[(1, &x[..])]), (&mapped, &[(2, &x[..]), (0, &x[..])])], 0.0);
+    close(&both[0][0], &slot_reference(&records.0[2], &layout, &x, 1, 0.0), "the first set's slot 1");
+    close(&both[1][0], &slot_reference(&records.0[0], &layout, &x, 1, 0.0), "the second set's slot 2");
+    close(&both[1][1], &slot_reference(&records.0[5], &layout, &x, 1, 0.0), "the second set's slot 0");
+    // a call of jobs of one row and of three: each the same bits as in a call of its own kind
+    let x3: Vec<f32> = (0..3 * hidden).map(|i| ((i * 11 % 31) as f32 - 15.0) / 16.0).collect();
+    let mixed = queued.forward(&[(0, &x[..]), (1, &x3[..]), (2, &x[..])], 0.5);
+    let ones = queued.forward(&[(2, &x[..]), (0, &x[..])], 0.5);
+    let threes = queued.forward(&[(1, &x3[..])], 0.5);
+    assert!(mixed[0] == ones[1] && mixed[2] == ones[0] && mixed[1] == threes[0], "a job's output hangs on the jobs beside it");
+    // a slot copied into the other set (the mapped set's slot 0, expert 5, over the queued set's slot 1, expert 2),
+    // then the mapped set written over: the copy is the expert it was
+    mapped.copy_slot(0, &queued, 1);
+    mapped.put_many(0, &[&records.0[3]], &layout);
+    let got = queued.forward(&[(1, &x[..]), (0, &x[..])], 0.0);
+    close(&got[0], &slot_reference(&records.0[5], &layout, &x, 1, 0.0), "the copied slot");
+    close(&got[1], &slot_reference(&records.0[5], &layout, &x, 1, 0.0), "the slot beside it, as it was");
 }

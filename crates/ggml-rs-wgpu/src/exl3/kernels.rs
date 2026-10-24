@@ -82,8 +82,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let i = wg.x * 128u + t;
     var src = i;
     if (p[0].y == 0u) { src = imap[m * k + i]; }
-    let g = x[(p[0].z * xr + p[0].w) * k + src];
-    let u = up[(p[1].x * xr + p[1].y) * k + src];
+    var g = x[(p[0].z * xr + p[0].w) * k + src];
+    var u = up[(p[1].x * xr + p[1].y) * k + src];
+    // (a model's SwiGLU limit, f32 bits, where it has one: up clamped to it either way, gate from above; 0 none)
+    let lim = bitcast<f32>(p[1].z);
+    if (lim > 0.0) {
+        u = clamp(u, -lim, lim);
+        g = min(g, lim);
+    }
     sh[t] = half((g / (1.0 + exp(-g))) * u) * suh[m * k + i];
     workgroupBarrier();
     for (var s = 1u; s < 128u; s *= 2u) {
