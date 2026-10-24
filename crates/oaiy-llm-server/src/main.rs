@@ -25,7 +25,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        it), 16384 where they have not or do not say; DeepSeek
                        65536; other models 16384; the model's maximum at most
   --ram-gb N           host RAM for the expert cache (default: 80% of what is
-                       free, so it leaves a fifth for everything else)
+                       free, so it leaves a fifth for everything else; asked
+                       for, up to all that is free but 8 GiB)
   --start NAME         which configured model to load at start (default: the one
                        --model names). Only one is resident, and a load costs 10s
                        for a GGUF or 65s for a DeepSeek checkpoint, so naming the
