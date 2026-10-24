@@ -123,6 +123,10 @@ impl Exl3Slots {
         gpu.write(&buf(&self.gu.svh), (2 * slot * self.gu.n * 4) as u64, &[floats(g.svh, g.n), floats(u.svh, u.n)].concat());
         gpu.write(&buf(&self.down.suh), (slot * self.down.k * 4) as u64, &floats(d.suh, d.k));
         gpu.write(&buf(&self.down.svh), (slot * self.down.n * 4) as u64, &floats(d.svh, d.n));
+        // (the writes sent, and their staging let go: slots filled one after another while nothing else is submitted
+        // held every record's staging until the next pass)
+        gpu.queue().submit([]);
+        gpu.wait(None);
     }
 
     /// Slots `first..` made `records`' experts (each as `layout` lays it out), as [`Self::put`] makes one. Mapped slots
