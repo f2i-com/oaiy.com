@@ -384,6 +384,11 @@ impl Exl3Slots {
         self.hidden
     }
 
+    /// Their gates' and ups' words' buffer (what knows them on their device).
+    pub(super) fn words(&self) -> &wgpu::Buffer {
+        &self.gu.words
+    }
+
     /// A fused pass's vectors for `k` jobs ([`Self::record_fused`]), on the device for good (a program's arena's).
     pub(super) fn fused_scratch(&self, k: usize) -> FusedScratch {
         let (h, f) = (self.hidden, self.ff);

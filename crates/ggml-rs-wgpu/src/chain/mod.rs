@@ -228,6 +228,20 @@ pub(crate) struct Recorder<'a> {
 }
 
 impl Recorder<'_> {
+    /// Its dispatches so far, where they are all it holds (nothing submitted or held while recording, none of the
+    /// pool's scratch, no timing): what records the same work again ([`Self::replay`]), its bind groups kept with it.
+    pub(crate) fn recipe(&self) -> Option<Vec<Dispatch>> {
+        let simple = self.flushed.is_none() && self.held.is_empty() && self.lists.is_empty() && self.pooled.is_empty() && self.timed.is_empty() && self.stamps.is_none() && self.reads.is_empty();
+        simple.then(|| self.dispatches.clone())
+    }
+
+    /// `dispatches` (a [`Self::recipe`]) as this recording's, in place of recording them again: its vectors and bind
+    /// groups the ones they were made with, the same work.
+    pub(crate) fn replay(&mut self, dispatches: Vec<Dispatch>) {
+        assert!(self.dispatches.is_empty(), "chain: a recipe replayed into a recording that has its own dispatches");
+        self.dispatches = dispatches;
+    }
+
     /// A dispatch recorded; a piece of [`piece`]'s submitted as soon as it is recorded, so the GPU runs
     /// a run's first ops while the CPU records the rest. A later upload (`Queue::write_buffer`) lands after the pieces
     /// already submitted and before the ones after, as the recording's order has it.

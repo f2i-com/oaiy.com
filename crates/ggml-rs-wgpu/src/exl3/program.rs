@@ -206,6 +206,7 @@ impl ProgramLater<'_> {
 /// experts while the card makes those). With nothing after `split`, one recording.
 pub fn run_program_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize, usize, usize)], split: usize, later: &[(usize, usize, usize)]) -> Option<(Vec<Vec<f32>>, ProgramLater<'a>)> {
     use ggml_rs::ChainRecorder;
+    let entered = std::time::Instant::now();
     // each step's vector's length (0: it makes none), checked against what the steps after it ask of it
     let mut lens: Vec<usize> = Vec::with_capacity(steps.len());
     let mut rows_one = true;
@@ -252,7 +253,9 @@ pub fn run_program_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], read
     // again at every step, some 95 us of the host's work a call, and the kept groups' store started over every few
     // tokens.
     let kept = arena(b, steps, &lens);
-    let arena = kept.lock().unwrap_or_else(|p| p.into_inner());
+    let mut arena = kept.lock().unwrap_or_else(|p| p.into_inner());
+    // (its dispatches as its first run recorded them, where that was all it made: not recorded again)
+    let replay = (!crate::profile::chain_on() && !crate::profile::pieces_on()).then(|| arena.recipe.as_ref().filter(|(s, ..)| *s == split).cloned()).flatten();
     for (step, v) in steps.iter().zip(&arena.vecs) {
         if let (ProgramStep::Input(x), Some(v)) = (step, v) {
             DeviceChain::upload(b, v, x);
@@ -298,19 +301,32 @@ pub fn run_program_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], read
         }
     };
     // (each part a recording of its own, submitted as it is made: the second follows the first on the queue)
-    let part = |range: std::ops::Range<usize>, reads: &[(usize, usize, usize)]| {
+    let part = |range: std::ops::Range<usize>, reads: &[(usize, usize, usize)], recipe: Option<Vec<crate::Dispatch>>| {
         let mut rec = crate::chain::Recorder::new(b);
         rec.keep_groups(rows_one);
-        for i in range {
-            record(&mut rec, i);
+        match recipe {
+            Some(dispatches) => rec.replay(dispatches),
+            None => {
+                for i in range {
+                    record(&mut rec, i);
+                }
+            }
         }
+        let made = rec.recipe();
         for &(s, at, len) in reads {
             rec.read_range(v(s), at, len);
         }
-        Box::new(rec).launch()
+        (Box::new(rec).launch(), made)
     };
-    let first = part(0..split, reads);
-    let then = (split < steps.len()).then(|| part(split..steps.len(), later));
+    let (first, made_first) = part(0..split, reads, replay.as_ref().map(|r| r.1.clone()));
+    crate::profile::add(&crate::profile::PROGRAM_PREP, entered);
+    let (then, made_then) = match (split < steps.len()).then(|| part(split..steps.len(), later, replay.as_ref().map(|r| r.2.clone()))) {
+        Some((launched, made)) => (Some(launched), made),
+        None => (None, Some(Vec::new())),
+    };
+    if let (None, Some(a), Some(c)) = (&replay, made_first, made_then) {
+        arena.recipe = Some((split, a, c));
+    }
     drop(arena);
     let now = first.wait();
     Some((now, ProgramLater { launched: then, _arena: kept }))
@@ -324,6 +340,9 @@ pub(crate) struct ProgramArena {
     groups: Vec<Option<GroupScratch>>,
     tables: Vec<Option<DeviceVec>>,
     fused: Vec<Option<FusedScratch>>,
+    /// Its two parts' dispatches as its first run recorded them, and where it was split: each run's after it the same
+    /// work (its vectors, bind groups and kernels these), not recorded again.
+    recipe: Option<(usize, Vec<crate::Dispatch>, Vec<crate::Dispatch>)>,
 }
 
 /// Arenas a device keeps at most before they start over (a program a layer and kind: some two hundred a model).
@@ -334,9 +353,14 @@ const ARENAS: usize = 4096;
 fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mutex<ProgramArena>> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    // (a matrix, a group or a set of slots known by its buffer's id, which is never another's while it lives or after,
+    // a host's values by where they are and some of them: an arena keeps its recording, bound to those, and an
+    // address freed and taken again by another matrix left a run reading the old one's weights)
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().cloned();
+    let host = |v: &[f32]| (v.as_ptr() as usize, v.len(), [0, v.len() / 2, v.len().saturating_sub(1)].map(|i| v.get(i).map_or(0, |x| x.to_bits())));
     let mat = |m: &ChainMat<'_>, h: &mut std::collections::hash_map::DefaultHasher| match m {
-        ChainMat::Exl3(l) => (0u8, *l as *const dyn PackedLinear as *const () as usize).hash(h),
-        ChainMat::F16 { w, n, k } | ChainMat::Bf16 { w, n, k } | ChainMat::F32 { w, n, k } => (1u8, Arc::as_ptr(&w.inner) as *const () as usize, *n, *k).hash(h),
+        ChainMat::Exl3(l) => (0u8, l.as_any().and_then(|a| a.downcast_ref::<Exl3Gpu>()).and_then(|g| g.single_chunk()).map(|(w, _)| w.clone())).hash(h),
+        ChainMat::F16 { w, n, k } | ChainMat::Bf16 { w, n, k } | ChainMat::F32 { w, n, k } => (1u8, buf(w), *n, *k).hash(h),
     };
     for (step, &len) in steps.iter().zip(lens) {
         len.hash(&mut h);
@@ -347,14 +371,14 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
                 (2u8, *x, *rows).hash(&mut h);
                 mat(m, &mut h);
             }
-            ProgramStep::MulGroup { g, x, jobs } => (3u8, *g as *const Exl3Group as usize, *x, *jobs).hash(&mut h),
+            ProgramStep::MulGroup { g, x, jobs } => (3u8, g.words().clone(), *x, *jobs).hash(&mut h),
             ProgramStep::CopyColsBf16 { src, src_stride, src_at, dst, dst_stride, dst_at, width, rows } => (4u8, [*src, *src_stride, *src_at, *dst, *dst_stride, *dst_at, *width, *rows]).hash(&mut h),
-            ProgramStep::Norm { x, weight, eps, rows, width } => (5u8, *x, weight.as_ptr() as usize, weight.len(), eps.to_bits(), *rows, *width).hash(&mut h),
+            ProgramStep::Norm { x, weight, eps, rows, width } => (5u8, *x, host(weight), eps.to_bits(), *rows, *width).hash(&mut h),
             ProgramStep::HcPost { out, res, mix, d } => (6u8, [*out, *res, *mix, *d]).hash(&mut h),
             ProgramStep::HcPre { h: x, mix, d } => (7u8, [*x, *mix, *d]).hash(&mut h),
-            ProgramStep::SwigluBf16 { gate, up, len, silu, limit } => (8u8, [*gate, *up, *len], silu.as_ptr() as usize, limit.to_bits()).hash(&mut h),
-            ProgramStep::Candidates { logits, bias, table, k } => (9u8, [*logits, bias.as_ptr() as usize, bias.len(), Arc::as_ptr(&table.inner) as *const () as usize, *k]).hash(&mut h),
-            ProgramStep::Held { slots, x, cands, limit } => (10u8, [*slots as *const Exl3Slots as usize, *x, *cands], limit.to_bits()).hash(&mut h),
+            ProgramStep::SwigluBf16 { gate, up, len, silu, limit } => (8u8, [*gate, *up, *len], host(silu), limit.to_bits()).hash(&mut h),
+            ProgramStep::Candidates { logits, bias, table, k } => (9u8, [*logits, *k], host(bias), buf(table)).hash(&mut h),
+            ProgramStep::Held { slots, x, cands, limit } => (10u8, [*x, *cands], slots.words().clone(), limit.to_bits()).hash(&mut h),
         }
     }
     let key = h.finish();
@@ -390,6 +414,7 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
             })
             .collect(),
         fused: steps.iter().zip(lens).map(|(s, &len)| if let ProgramStep::Held { slots, .. } = s { Some(slots.fused_scratch(len / slots.hidden())) } else { None }).collect(),
+        recipe: None,
     };
     let made = Arc::new(Mutex::new(made));
     kept.insert(key, Arc::clone(&made));

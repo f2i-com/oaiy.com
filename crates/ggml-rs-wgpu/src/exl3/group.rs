@@ -36,6 +36,11 @@ impl Exl3Group {
     pub fn count(&self) -> usize {
         self.count
     }
+
+    /// Its parts' words' buffer (what knows it on its device).
+    pub(super) fn words(&self) -> &wgpu::Buffer {
+        &self.g.words
+    }
 }
 
 impl WgpuBackend {

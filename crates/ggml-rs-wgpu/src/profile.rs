@@ -13,6 +13,9 @@ pub static ATTENTION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 pub static CHAIN_ENCODE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 pub static CHAIN_WAIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 pub static CHAIN_SUBMIT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// A program's run on the host up to its first submit ([`crate::exl3::run_program_parts`]: its inputs written, its
+/// steps recorded and encoded), and how many.
+pub static PROGRAM_PREP: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// The device's polls while a chain's reads are waited for ([`polls_on`]): their time, and how many.
 pub static CHAIN_POLLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -40,10 +43,10 @@ pub(crate) fn add(counter: &[AtomicU64; 2], start: Instant) {
 pub fn take_line() -> String {
     let take = |c: &[AtomicU64; 2]| (c[0].swap(0, Ordering::Relaxed) as f64 / 1e9, c[1].swap(0, Ordering::Relaxed));
     let (l, w, a) = (take(&LINEAR), take(&LINEAR_WAIT), take(&ATTENTION));
-    let (e, cw, cs, cp) = (take(&CHAIN_ENCODE), take(&CHAIN_WAIT), take(&CHAIN_SUBMIT), take(&CHAIN_POLLS));
+    let (e, cw, cs, cp, pp) = (take(&CHAIN_ENCODE), take(&CHAIN_WAIT), take(&CHAIN_SUBMIT), take(&CHAIN_POLLS), take(&PROGRAM_PREP));
     format!(
-        "projections {:.3} s ({}), of it waiting for the GPU {:.3} s; attention {:.3} s ({}); chains encoding {:.3} s ({}), on the GPU {:.3} s (the submits {:.3} s, polls {:.3} s of {})",
-        l.0, l.1, w.0, a.0, a.1, e.0, e.1, cw.0, cs.0, cp.0, cp.1
+        "projections {:.3} s ({}), of it waiting for the GPU {:.3} s; attention {:.3} s ({}); chains encoding {:.3} s ({}), on the GPU {:.3} s (the submits {:.3} s, polls {:.3} s of {}); programs made to their submit in {:.3} s ({})",
+        l.0, l.1, w.0, a.0, a.1, e.0, e.1, cw.0, cs.0, cp.0, cp.1, pp.0, pp.1
     )
 }
 
