@@ -103,7 +103,19 @@ pub trait DenseKernel: Send + Sync + std::any::Any {
         let _ = (steps, reads);
         None
     }
+
+    /// [`Self::run_program`] in two parts submitted one after the other, `steps[..split]` then the rest: the first's
+    /// reads (`reads`) once it is done, and what gives the second's (`later`) once it is (the device making them
+    /// meanwhile). None where it cannot.
+    #[allow(clippy::type_complexity)]
+    fn run_program_parts(&self, steps: &[Step<'_>], reads: &[(usize, usize, usize)], split: usize, later: &[(usize, usize, usize)]) -> Option<(Vec<Vec<f32>>, Later<'_>)> {
+        let _ = (steps, reads, split, later);
+        None
+    }
 }
+
+/// The later part of a program run in two ([`run_program_parts`]): its reads, waited for when called.
+pub type Later<'a> = Box<dyn FnOnce() -> Vec<Vec<f32>> + 'a>;
 
 /// A step of a device program ([`run_program`]): each makes a vector (its number the step's own) or writes one. A
 /// decode step's sublayers, their hyper-connections' mixing and their norms in one call where each was a round trip
@@ -132,6 +144,14 @@ pub enum Step<'a> {
     /// `bf16(silu(min(g, limit)) * clamp(u, ±limit))` to the bit, `silu` its silu of every bf16 gate by the gate's bits
     /// ([`crate::dsv41::moe::silu_bf16_table`]).
     SwigluBf16 { gate: usize, up: usize, len: usize, silu: &'a [f32], limit: f32 },
+    /// The `k` routed experts of `layer` the router's `logits` (`bias` its correction bias) likely picks, by the device's
+    /// own scores (a guess: the host routes as before, and takes those of them it picked), `held` the experts' kernel
+    /// ([`crate::dsv41::expert::ExpertsKernel::fused`]): `[4k]`, u32 bits: the held pass's jobs, the experts, their
+    /// slots (`u32::MAX` where not held).
+    Candidates { logits: usize, bias: &'a [f32], held: &'a dyn std::any::Any, layer: u32, k: usize },
+    /// The held experts of `cands` (a `Candidates` step), each on row 0 of `x`, as the kernel makes them alone (to the
+    /// bit): `[k, dim]`, unweighted, the row of one not held whatever it was.
+    Held { held: &'a dyn std::any::Any, layer: u32, x: usize, cands: usize, limit: f32 },
 }
 
 /// `steps` as one call where a device holds every matrix they multiply and takes them together
@@ -143,6 +163,17 @@ pub fn run_program(steps: &[Step<'_>], reads: &[(usize, usize, usize)]) -> Optio
     })?;
     let start = std::time::Instant::now();
     let made = first.run_program(steps, reads)?;
+    crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);
+    Some(made)
+}
+
+/// [`run_program`] in two parts ([`DenseKernel::run_program_parts`]) on the device `on` (one of the program's weights)
+/// is on: the first's reads, and what gives the second's.
+#[allow(clippy::type_complexity)]
+pub fn run_program_parts<'k>(on: &'k Weight, steps: &[Step<'_>], reads: &[(usize, usize, usize)], split: usize, later: &[(usize, usize, usize)]) -> Option<(Vec<Vec<f32>>, Later<'k>)> {
+    let Weight::Device { kernel, .. } = on else { return None };
+    let start = std::time::Instant::now();
+    let made = kernel.run_program_parts(steps, reads, split, later)?;
     crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);
     Some(made)
 }

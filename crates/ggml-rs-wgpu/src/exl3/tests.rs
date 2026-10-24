@@ -239,6 +239,50 @@ fn measure_slots_decode_call() {
     time("6 experts in 3 pools, a call", &|| drop(Exl3Slots::forward_many(&parts, 10.0)));
 }
 
+/// A program's held experts ([`ProgramStep::Candidates`], then [`ProgramStep::Held`]) are the `k` best of the router's
+/// scores, those the table holds made as the slots make them alone (to the bit) and those it does not skipped, the
+/// experts and their slots read back as the table has them; at DeepSeek-V4.1's shape, 3 bits a weight.
+#[test]
+fn a_programs_held_experts_are_the_slots_own() {
+    let Some(b) = backend() else { return };
+    let (hidden, ff, tw, limit, n, k) = (5120, 2304, 48, 10.0f32, 16usize, 4usize);
+    let (layout, records, _) = as_records(experts(3, hidden, ff, tw));
+    let slots = b.exl3_slots(4, hidden, ff, [tw, tw]).expect("room for four slots");
+    // experts 3, 7 and 11 of the layer in slots 2, 0 and 1
+    let held = [(3usize, 2u32), (7, 0), (11, 1)];
+    for (r, &(_, s)) in held.iter().enumerate() {
+        slots.put(s as usize, &records.0[r], &layout);
+    }
+    let mut words = vec![u32::MAX; n];
+    for &(e, s) in &held {
+        words[e] = s;
+    }
+    let table = b.vec_of_bytes(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
+    let x: Vec<f32> = (0..hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+    // logits that put experts 7, 5, 3 and 12 first by score (the bias moving 12 above 11), 11 fifth
+    let mut logits = vec![-3.0f32; n];
+    for (e, v) in [(7, 4.0), (5, 3.0), (3, 2.0), (11, 1.5), (12, 1.0)] {
+        logits[e] = v;
+    }
+    let mut bias = vec![0.0f32; n];
+    bias[12] = 0.2;
+    let steps = [
+        ProgramStep::Input(&logits),
+        ProgramStep::Input(&x),
+        ProgramStep::Candidates { logits: 0, bias: &bias, table: &table, k },
+        ProgramStep::Held { slots: &slots, x: 1, cands: 2, limit },
+    ];
+    let got = run_program(&b, &steps, &[(2, 0, 4 * k), (3, 0, k * hidden)]).expect("the program runs");
+    let bits: Vec<u32> = got[0].iter().map(|v| v.to_bits()).collect();
+    assert_eq!(&bits[2 * k..3 * k], &[7, 5, 3, 12], "the candidates, best first");
+    assert_eq!(&bits[3 * k..], &[0, u32::MAX, 2, u32::MAX], "their slots");
+    for (r, slot) in [(0usize, 0usize), (2, 2)] {
+        let alone = slots.forward(&[(slot, &x[..])], limit).pop().expect("one output");
+        let mine = &got[1][r * hidden..(r + 1) * hidden];
+        assert!(mine.iter().zip(&alone).all(|(a, b)| a.to_bits() == b.to_bits()), "candidate {r}: the slots' own output");
+    }
+}
+
 /// A decode step's expert made on the host ([`step_expert_host`], and several at once on its cores:
 /// [`step_experts_host`]) is a card's ([`Exl3Slots`]' job of one row) to the bit, at DeepSeek-V4.1's shape (5120 to
 /// 2304) at 3 bits a weight and at 2, on small inputs and large: the transforms, the one-row kernel's sums in its order

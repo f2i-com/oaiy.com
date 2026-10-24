@@ -532,6 +532,25 @@ pub trait ExpertsKernel: Send + Sync {
         false
     }
 
+    /// Itself, as a device program's steps take it, where it makes `layer`'s held experts in the router's own call
+    /// ([`crate::dsv41::linear::Step::Candidates`] and `Held`: the layer's experts held in one place beside its
+    /// weights); None where it does not.
+    fn fused(&self, layer: u32) -> Option<&dyn std::any::Any> {
+        let _ = layer;
+        None
+    }
+
+    /// `n` of `layer`'s held experts a step made in the router's call (counted as those it makes itself are).
+    fn took_fused(&self, layer: u32, n: usize) {
+        let _ = (layer, n);
+    }
+
+    /// Whether `layer`'s `expert` is where the router's call makes it ([`Self::fused`]) now.
+    fn in_fused(&self, layer: u32, expert: u32) -> bool {
+        let _ = (layer, expert);
+        false
+    }
+
     /// A forward pass of `tokens` tokens has ended: after a prompt it may take in the experts the prompt used most
     /// (from `cache`, the RAM tier, never from the drive), after a decode step age what it counts.
     fn pass_done(&self, tokens: usize, cache: &oaiy_engine::ecache::Ecache, store: &dyn WeightStore) {

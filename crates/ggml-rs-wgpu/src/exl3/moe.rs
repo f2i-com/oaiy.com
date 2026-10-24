@@ -518,6 +518,35 @@ pub(super) fn group_pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &De
     }
 }
 
+/// [`group_pass`] of one-row jobs (as its `Order::Jobs`, the same kernels and splits, so each job's output is the same
+/// bits), each job whose matrix is `u32::MAX` skipped ([`skipping_shader`]): a fused step's candidates the card does not
+/// hold. `silu` where `pairs` (the down projection's SwiGLU looks its gate up there).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn group_pass_skipping(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, pairs: bool, jobs: &DeviceVec, count: usize, xh: &DeviceVec, part: &DeviceVec, y: &DeviceVec, limit: f32, silu: Option<&DeviceVec>) {
+    assert!(count as u32 * g.splits <= 65535, "moe: a fused pass of {count} jobs");
+    let d = rec.gpu().dummy().clone();
+    let drw = rec.gpu().dummy_rw().clone();
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+    let (xb, jb, xhb, pb, yb) = (buf(x), buf(jobs), buf(xh), buf(part), buf(y));
+    let (suh, svh) = (buf(&g.suh), buf(&g.svh));
+    match (pairs, silu) {
+        (true, Some(table)) => {
+            let (name, src) = skipping_shader("pre-swiglu-table", 0);
+            rec.dispatch_wide(name, src, [&xb, &suh, &d, &jb, &xb, &buf(table), &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits()], ((g.k / 128) as u32, count as u32, 1));
+        }
+        (true, None) => panic!("moe: a fused down pass looks its SwiGLU up in a table"),
+        (false, _) => {
+            let (name, src) = skipping_shader("pre", 0);
+            rec.dispatch_wide(name, src, [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
+        }
+    }
+    let ntiles = (g.n / 16) as u32;
+    let (name, src) = skipping_shader("mm", g.tw);
+    rec.dispatch_wide(name, src, [&g.words, &xhb, &jb, &d, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32, 0], (ntiles.min(65535), ntiles.div_ceil(65535), count as u32 * g.splits));
+    let (name, src) = skipping_shader("post", 0);
+    rec.dispatch_wide(name, src, [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, g.splits], ((g.n / 128) as u32, count as u32, 1));
+}
+
 impl Exl3MoeGrouped {
     /// A group's low-rank updates added to its jobs' outputs `y`, after its pass ([`LORA_A`], [`LORA_B`]): `x`,
     /// `pairs`, `jobs` and `count` as [`Self::group_pass`] took them. `kept`: a step's or a check's (the vector between

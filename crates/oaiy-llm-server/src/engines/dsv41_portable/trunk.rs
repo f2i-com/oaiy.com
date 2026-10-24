@@ -1,4 +1,4 @@
-﻿//! The dense trunk on the WebGPU adapter: its weights as the CPU model's kernels, and their placement.
+//! The dense trunk on the WebGPU adapter: its weights as the CPU model's kernels, and their placement.
 
 use super::*;
 
@@ -119,7 +119,7 @@ impl DenseKernel for WgpuChained {
     /// The call's matrices on this adapter in one submit and one read back (`ggml_rs_wgpu::exl3::chained`, else, all
     /// EXL3, `exl3_many`).
     fn forward_many(&self, items: &[(&dyn DenseKernel, &[f32], usize, std::ops::Range<usize>)]) -> Option<Vec<Vec<f32>>> {
-        let mine: Vec<&WgpuChained> = items.iter().map(|(k, ..)| chained_of(*k)).collect::<Option<_>>()?;
+        let mine: Vec<&WgpuChained> = items.iter().map(|(k, ..)| self.here(*k)).collect::<Option<_>>()?;
         let mats: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32])> = mine.iter().zip(items).map(|(w, (_, x, ..))| (w.chain_mat(), *x)).collect();
         let all = ggml_rs_wgpu::exl3::chained(&self.b, &mats).or_else(|| {
             let lins: Vec<(&dyn ggml_rs::exl3::PackedLinear, &[f32])> =
@@ -135,7 +135,7 @@ impl DenseKernel for WgpuChained {
         if quantized {
             return None;
         }
-        let mine: Vec<&WgpuChained> = first.iter().map(|(k, ..)| chained_of(*k)).collect::<Option<_>>()?;
+        let mine: Vec<&WgpuChained> = first.iter().map(|(k, ..)| self.here(*k)).collect::<Option<_>>()?;
         let with: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32], std::ops::Range<usize>)> = mine.iter().zip(first).map(|(w, (_, x, rows))| (w.chain_mat(), *x, rows.clone())).collect();
         ggml_rs_wgpu::exl3::chained_after(&self.b, &with, self.chain_mat())
     }
@@ -143,29 +143,43 @@ impl DenseKernel for WgpuChained {
     /// Both stages in one chained recording, the norm between them on the device to the host's bit
     /// (`ggml_rs_wgpu::exl3::chained_normed`): a layer's projections of x, then its queries and its indexer's.
     fn forward_normed(&self, first: &[(&dyn DenseKernel, &[f32], usize)], normed: usize, weight: &[f32], eps: f32, then: &[&dyn DenseKernel]) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
-        let firsts: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32])> = first.iter().map(|(k, x, _)| chained_of(*k).map(|w| (w.chain_mat(), *x))).collect::<Option<_>>()?;
-        let thens: Vec<ggml_rs_wgpu::exl3::ChainMat<'_>> = then.iter().map(|k| chained_of(*k).map(WgpuChained::chain_mat)).collect::<Option<_>>()?;
+        let firsts: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32])> = first.iter().map(|(k, x, _)| self.here(*k).map(|w| (w.chain_mat(), *x))).collect::<Option<_>>()?;
+        let thens: Vec<ggml_rs_wgpu::exl3::ChainMat<'_>> = then.iter().map(|k| self.here(*k).map(WgpuChained::chain_mat)).collect::<Option<_>>()?;
         ggml_rs_wgpu::exl3::chained_normed(&self.b, &firsts, normed, weight, eps, &thens)
     }
 
     /// The program as one chained recording on this adapter (`ggml_rs_wgpu::exl3::run_program`), each matrix one of
     /// these on it.
     fn run_program(&self, steps: &[crate::dsv41::linear::Step<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+        ggml_rs_wgpu::exl3::run_program(&self.b, &self.program(steps)?, reads)
+    }
+
+    /// The program as two chained recordings on this adapter, one after the other (`ggml_rs_wgpu::exl3::
+    /// run_program_parts`).
+    fn run_program_parts(&self, steps: &[crate::dsv41::linear::Step<'_>], reads: &[(usize, usize, usize)], split: usize, later: &[(usize, usize, usize)]) -> Option<(Vec<Vec<f32>>, crate::dsv41::linear::Later<'_>)> {
+        let (now, then) = ggml_rs_wgpu::exl3::run_program_parts(&self.b, &self.program(steps)?, reads, split, later)?;
+        Some((now, Box::new(move || then.wait())))
+    }
+}
+
+impl WgpuChained {
+    /// `steps` as this adapter's program's steps, each matrix one of these on it; None where one is not.
+    fn program<'s>(&self, steps: &[crate::dsv41::linear::Step<'s>]) -> Option<Vec<ggml_rs_wgpu::exl3::ProgramStep<'s>>> {
         use crate::dsv41::linear::Step as S;
         use ggml_rs_wgpu::exl3::ProgramStep as G;
-        // (the trunk's matrices are all on this adapter; an EXL3 one of another the program refuses)
-        fn on_device(w: &Weight) -> Option<&WgpuChained> {
+        // (a matrix on another card the program refuses: a split trunk's layers are each on their own)
+        fn on_device<'w>(w: &'w Weight, b: &WgpuBackend) -> Option<&'w WgpuChained> {
             let Weight::Device { kernel, .. } = w else { return None };
-            chained_of(&**kernel)
+            chained_of(&**kernel).filter(|m| m.b.same_device(b))
         }
-        let steps: Vec<G<'_>> = steps
+        steps
             .iter()
             .map(|s| {
                 Some(match *s {
                     S::Input(x) => G::Input(x),
                     S::Scratch(len) => G::Scratch(len),
-                    S::Mul { w, x, rows } => G::Mul { m: on_device(w)?.chain_mat(), x, rows },
-                    S::MulGroup { group, x, jobs } => match &on_device(group)?.mat {
+                    S::Mul { w, x, rows } => G::Mul { m: on_device(w, &self.b)?.chain_mat(), x, rows },
+                    S::MulGroup { group, x, jobs } => match &on_device(group, &self.b)?.mat {
                         Mat::Group(g) => G::MulGroup { g, x, jobs },
                         _ => return None,
                     },
@@ -174,16 +188,24 @@ impl DenseKernel for WgpuChained {
                     S::HcPost { out, res, mix, d } => G::HcPost { out, res, mix, d },
                     S::HcPre { h, mix, d } => G::HcPre { h, mix, d },
                     S::SwigluBf16 { gate, up, len, silu, limit } => G::SwigluBf16 { gate, up, len, silu, limit },
+                    S::Candidates { logits, bias, held, layer, k } => G::Candidates { logits, bias, table: held.downcast_ref::<super::exl3::WgpuExl3Experts>()?.fused_parts(layer)?.1, k },
+                    S::Held { held, layer, x, cands, limit } => G::Held { slots: held.downcast_ref::<super::exl3::WgpuExl3Experts>()?.fused_parts(layer)?.0, x, cands, limit },
                 })
             })
-            .collect::<Option<_>>()?;
-        ggml_rs_wgpu::exl3::run_program(&self.b, &steps, reads)
+            .collect()
     }
 }
 
 /// `k` as a matrix of a chained recording, where it is one.
 fn chained_of(k: &dyn DenseKernel) -> Option<&WgpuChained> {
     (k as &dyn std::any::Any).downcast_ref()
+}
+
+impl WgpuChained {
+    /// `k` as a matrix of a chained recording on this one's card, where it is one.
+    fn here<'a>(&self, k: &'a dyn DenseKernel) -> Option<&'a WgpuChained> {
+        chained_of(k).filter(|m| m.b.same_device(&self.b))
+    }
 }
 
 /// Put `model`'s dense trunk on `gpu` while its budget holds it: how many matrices went, and their stored bytes. An EXL3
@@ -193,6 +215,25 @@ fn chained_of(k: &dyn DenseKernel) -> Option<&WgpuChained> {
 pub(crate) fn offload(model: &mut crate::dsv41::model::Model, gpu: &WgpuBackend) -> (usize, u64) {
     let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
     model.offload(placer(gpu, exl3))
+}
+
+/// [`offload`] over `cards`, a share of the layers each (`home`: each layer's card, [`layer_homes`]), the rest (the
+/// head) on the first: a layer's calls go to the card that holds its weights and its experts, each card's share of a
+/// step's work its own (where the second card held experts alone, its share of a step was a few calls a layer, and
+/// it spent the step in a low power state, its memory clocked at a seventeenth of its rate).
+pub(crate) fn offload_split(model: &mut crate::dsv41::model::Model, cards: &[Arc<WgpuBackend>], home: &[usize]) -> (usize, u64) {
+    let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
+    let mut placers: Vec<_> = cards.iter().map(|c| placer(c, exl3)).collect();
+    model.offload(|name, w| {
+        let layer = name.strip_prefix("layers.").and_then(|r| r.split('.').next()).and_then(|l| l.parse::<usize>().ok());
+        let card = layer.and_then(|l| home.get(l).copied()).unwrap_or(0).min(placers.len() - 1);
+        (placers[card])(name, w)
+    })
+}
+
+/// Each of `layers` layers' card of `cards`: the layers in runs of equal length, the first run the first card's.
+pub(crate) fn layer_homes(layers: usize, cards: usize) -> Vec<usize> {
+    (0..layers).map(|l| l * cards.max(1) / layers.max(1)).collect()
 }
 
 /// DSpark's drafter's dense weights on `gpu`, as [`offload`] puts the trunk's; `exl3`: its checkpoint is EXL3's.

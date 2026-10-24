@@ -80,6 +80,16 @@ struct StepScratch {
     out_d: DeviceVec,
 }
 
+/// [`Exl3Slots::record_fused`]'s vectors beside its inputs and output: each group's transformed inputs and partial sums,
+/// and the gate's and up's outputs.
+pub(super) struct FusedScratch {
+    xh_gu: DeviceVec,
+    part_gu: DeviceVec,
+    out_gu: DeviceVec,
+    xh_d: DeviceVec,
+    part_d: DeviceVec,
+}
+
 impl std::fmt::Debug for Exl3Slots {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Exl3Slots({} slots of {}x{} experts at {}/{} words a tile)", self.slots, self.hidden, self.ff, self.gu.tw, self.down.tw)
@@ -251,6 +261,13 @@ impl Exl3Slots {
     /// later write into these, which waits for it). An expert a pass put into scratch slots is kept that way for a
     /// copy of the card's own memory, where its record written again was the upload it had just had.
     pub fn copy_slot(&self, from: usize, to: &Exl3Slots, at: usize) {
+        self.copy_slot_marked(from, to, at, &[]);
+    }
+
+    /// [`Self::copy_slot`], and `marks` (`(table, value's place, value)` each: the table of where a layer's experts are
+    /// that a device program reads, [`super::ProgramStep::Candidates`]) written in the same submission: a recording
+    /// submitted before it finds the old expert in the slot and the old table, one after it the new in both.
+    pub fn copy_slot_marked(&self, from: usize, to: &Exl3Slots, at: usize, marks: &[(&DeviceVec, usize, u32)]) {
         assert!(Arc::ptr_eq(&self.b.gpu, &to.b.gpu) && from < self.slots && at < to.slots, "exl3 slots: a copy between GPUs, or past the slots");
         assert!((self.hidden, self.ff, self.gu.tw, self.down.tw) == (to.hidden, to.ff, to.gu.tw, to.down.tw), "exl3 slots: a copy between experts of other shapes");
         let gpu = &self.b.gpu;
@@ -262,6 +279,13 @@ impl Exl3Slots {
             let (suh, svh) = ((per * a.k * 4) as u64, (per * a.n * 4) as u64);
             enc.copy_buffer_to_buffer(&buf(&a.suh), from as u64 * suh, &buf(&b.suh), at as u64 * suh, suh);
             enc.copy_buffer_to_buffer(&buf(&a.svh), from as u64 * svh, &buf(&b.svh), at as u64 * svh, svh);
+        }
+        // (the marks' writes go to the queue with the next submission, this one: no other submits between them, as
+        // every recording submits under the same lock)
+        let _one = self.b.serial.lock().unwrap_or_else(|p| p.into_inner());
+        for (table, place, value) in marks {
+            assert!(*place < table.len, "exl3 slots: a mark past its table");
+            gpu.queue().write_buffer(&buf(table), (*place * 4) as u64, &value.to_le_bytes());
         }
         gpu.queue().submit([enc.finish()]);
     }
@@ -348,6 +372,35 @@ impl Exl3Slots {
         DeviceChain::upload(&self.b, &v, &table);
         *held = Some((limit.to_bits(), v.clone()));
         v
+    }
+
+    /// Whether these are on `b`'s device.
+    pub(super) fn on(&self, b: &WgpuBackend) -> bool {
+        self.b.same_device(b)
+    }
+
+    /// The hidden width these experts take and give.
+    pub(super) fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    /// A fused pass's vectors for `k` jobs ([`Self::record_fused`]), on the device for good (a program's arena's).
+    pub(super) fn fused_scratch(&self, k: usize) -> FusedScratch {
+        let (h, f) = (self.hidden, self.ff);
+        let (sgu, sd) = (self.gu.splits as usize, self.down.splits as usize);
+        let v = |len: usize| self.b.vec(len);
+        FusedScratch { xh_gu: v(2 * k * h), part_gu: v(2 * k * sgu * f), out_gu: v(2 * k * f), xh_d: v(k * f), part_d: v(k * sd * h) }
+    }
+
+    /// `k` one-row jobs of row 0 of `x` (`[hidden]`), their gate and up jobs `jgu` (`(2 slot, 0)` and `(2 slot + 1, 0)`
+    /// each) and down jobs `jd` (`(slot, job)`) written on the device (a fused step's candidates, [`super::ProgramStep::
+    /// Held`]), recorded into `rec` through `s` into `out` (`[k, hidden]`): each job's output as [`Self::forward`] makes
+    /// it (the same kernels, splits and order), a job whose slot is `u32::MAX` skipped (its row left as it was).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_fused(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, jgu: &DeviceVec, jd: &DeviceVec, k: usize, s: &FusedScratch, out: &DeviceVec, limit: f32) {
+        let silu = self.silu(limit);
+        group_pass_skipping(rec, &self.gu, x, false, jgu, 2 * k, &s.xh_gu, &s.part_gu, &s.out_gu, 0.0, None);
+        group_pass_skipping(rec, &self.down, &s.out_gu, true, jd, k, &s.xh_d, &s.part_d, out, limit, Some(&silu));
     }
 
     /// A step's kept vectors for these slots ([`StepScratch`]).

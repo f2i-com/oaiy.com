@@ -394,13 +394,30 @@ impl Model {
                 steps.push(Step::SwigluBf16 { gate: made + 1, up: made + 2, len: w1.n(), silu: crate::dsv41::moe::silu_bf16_table(limit), limit });
                 steps.push(Step::Mul { w: w2, x: act, rows: 1 });
                 let reads = [(a, 0, d), (h1, 0, HC * d), (xn, 0, d), (made, 0, router.n()), (made + 3, 0, fw.n()), (act + 1, 0, w2.n())];
-                crate::dsv41::linear::run_program(&steps, &reads)
+                // The layer's held experts the router likely picks, where the experts' kernel holds them beside the layer's
+                // weights: made behind this call, in a recording submitted after it, the host routing and making the rest
+                // meanwhile (the call each layer's held experts had of their own is not made for them).
+                let k = crate::dsv41::moe::FUSED_CANDIDATES;
+                match experts.gpu.as_ref().and_then(|g| g.fused(l as u32)) {
+                    Some(held) => {
+                        let cands = steps.len();
+                        steps.push(Step::Candidates { logits: made, bias: ly.moe.bias(), held, layer: l as u32, k });
+                        steps.push(Step::Held { held, layer: l as u32, x: xn, cands, limit });
+                        let (now, later) = crate::dsv41::linear::run_program_parts(router, &steps, &reads, cands, &[(cands, 2 * k, 2 * k), (cands + 1, 0, k * d)])?;
+                        let later: crate::dsv41::moe::FusedLater<'_> = Box::new(move || {
+                            let r = later();
+                            crate::dsv41::moe::Fused::from_read(&r[0], &r[1], k, d)
+                        });
+                        Some((now, Some(later)))
+                    }
+                    None => crate::dsv41::linear::run_program(&steps, &reads).map(|now| (now, None)),
+                }
             });
             let (a, h1, x, made) = match program {
-                Some(p) => {
+                Some((p, fused)) => {
                     let [a, h1, x, logits, proj, shared]: [Vec<f32>; 6] = p.try_into().expect("six vectors read back");
                     let shared: Vec<f32> = shared.into_iter().map(crate::dsv41::formats::to_bf16).collect();
-                    (a, h1, x, Some((logits, shared, proj)))
+                    (a, h1, x, Some((logits, shared, proj, fused)))
                 }
                 None => {
                     let a = ly.attn.output(cfg, &o, t);
@@ -415,8 +432,8 @@ impl Model {
             trace(&format!("layer{l:02}.attn_out"), &a);
             let ffn_mix_here = side_ffn.is_none().then(|| mixes(&h1, &ly.hc_ffn));
             let (m, routes, ffn_proj) = match made {
-                Some((logits, shared, proj)) => {
-                    let (m, routes) = ly.moe.forward_from(cfg, &x, t, experts, logits, None, Some(shared))?;
+                Some((logits, shared, proj, fused)) => {
+                    let (m, routes) = ly.moe.forward_from(cfg, &x, t, experts, logits, None, Some(shared), fused)?;
                     (m, routes, Some(proj))
                 }
                 None => ly.moe.forward_side(cfg, &x, t, experts, side_ffn.map(|w| (w, &h1[..])))?,

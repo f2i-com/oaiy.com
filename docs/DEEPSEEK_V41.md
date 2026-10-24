@@ -919,6 +919,67 @@ for, and its 5 GB on the cards holds experts instead. A check's rows are also no
 same bits as steps (the shared expert's and the BF16 matrices' few-row kernels), so a
 drafted reply can still differ from a plain one where two tokens nearly tie.
 
+## A layer in two calls (2026-10-25)
+
+A decode step of an EXL3 checkpoint now makes each layer in two calls to its card:
+- **The queries' call:** the projections of x and the queries, with the hyper-connection's
+  mixing projection of the stream.
+- **The router's call** (`exl3::run_program`, a program of steps). It holds:
+  - the attention's output projection, with `wo_a`'s eight groups in one pass of the group kernels;
+  - the hyper-connection's spread of the output, then its collapse into the FFN's input, then its
+    norm (the host's to the bit);
+  - the router and the FFN's mixing projection;
+  - the shared expert whole. Its SwiGLU uses the host's own table of every bf16 gate, so its
+    output is the host's to the bit; its down projection was a call of its own before;
+  - behind it, the routed experts the router likely picks that the first card holds. A small kernel
+    ranks the router's scores as the card makes them, takes the best eight, and looks each up in the
+    layer's slot table. The held ones run, and the jobs of those it does not hold are skipped.
+
+The held experts are a second recording, submitted right after the first, so the card goes
+straight on to them. The host reads the first part, routes as before, and makes the experts no card
+holds on its cores meanwhile. It then takes the second part's outputs for those it routed to. They
+are the slots' own to the bit, so the replies are unchanged. Made in one recording, the held
+experts' time came before the routing and the CPU's experts could no longer run beside it: 3-5%
+slower than the call of their own.
+
+A layer's experts go first to one pool of the first card that the router's call reads (pools
+shared by a few layers). The rest go where there is room, as before, and are made in a call of
+their own. When a slot changes hands, the slot table is written in the same submission as the
+copy, so a call never sees an expert's table entry without its weights.
+
+The mixing projections on the card sum in its own order. A reply's text therefore differs from the
+build before them from the first token where the sums did, and is the same from then on.
+
+Other findings:
+- **The trunk split over the two cards** (`OAIY_DSV41_SPLIT=1`, each layer's experts beside its
+  weights) was no faster. Each card then did half the work and ran in its P3 power state, its
+  memory at half its clock. With the trunk on one card, that card stays in P0. The second card,
+  holding experts alone, spends a reply in P5, its memory at a seventeenth of its clock. The
+  driver's power setting (Prefer maximum performance) would change this; not tried.
+- **The CPU's experts.** They run on three quarters of the cores (`OAIY_STEP_THREADS`). With
+  every core, the step's other threads waited for them: 12.5 and 13.5 tok/s where with twelve of
+  sixteen cores it was 14.2 and 14.9.
+- **A round trip.** A call costs some 70 us to encode and 30 to submit. From submit to its read
+  back is about 345 us, of which the card works about 150. The same call alone, back to back, is
+  0.195 ms, and 0.23 to 0.30 after 2 ms idle.
+- **The CPU's experts beside the cards'** (`OAIY_DSV41_HYBRID=1`: half of a layer's misses sent
+  up to the cards' scratch slots while the cores make the rest) was a little slower. It is off.
+
+Measured on the EXL3 checkpoint, same usage profile, 120-token greedy replies. Each run asks the four
+twice in one session; these are the second round's. Every reply is the same text in each run:
+
+| Reply | Held experts in a call of their own | Trunk split, held experts fused | Held experts behind the router's call |
+|---|---|---|---|
+| A familiar subject | 15.3 tok/s | 14.7 tok/s | 16.1 tok/s |
+| Code | 10.8 tok/s | 10.5 tok/s | 11.0 tok/s |
+| The same again | 14.7 tok/s | 14.5 tok/s | 16.1 tok/s |
+| A new subject | 10.7 tok/s | 10.7 tok/s | 11.6 tok/s |
+
+The commit before (every core's thread an expert's worker, the held experts in a call of their own)
+gave 12.5, 8.9, 13.5 and 7.7 in a first round. The replies vary by
+some 10% from run to run when another program compiles on the machine; the bench waits for a quiet
+machine before each request.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

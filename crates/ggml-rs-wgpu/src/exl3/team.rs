@@ -137,13 +137,15 @@ fn work(s: &Shared) {
     }
 }
 
-/// The team a process's steps share: as many workers as the host has cores beside the caller (logical processors
-/// halved: a second thread on a core shares its vectors), OAIY_STEP_THREADS another number.
+/// The team a process's steps share: three quarters of the host's cores (logical processors halved: a second thread on
+/// a core shares its vectors), the caller one of them, OAIY_STEP_THREADS another number. The rest are the step's other
+/// threads' (its own, the attention's workers, the promoter's): with every core's thread a worker, DeepSeek-V4.1's
+/// replies on 16 cores were 12.5 and 13.5 tok/s where with 12 they were 14.2 and 14.9, the experts as fast.
 pub(super) fn team() -> &'static Team {
     static TEAM: std::sync::OnceLock<Team> = std::sync::OnceLock::new();
     TEAM.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get()).div_ceil(2);
-        let threads = std::env::var("OAIY_STEP_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores);
+        let threads = std::env::var("OAIY_STEP_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or((cores * 3).div_ceil(4));
         Team::new(threads.saturating_sub(1))
     })
 }

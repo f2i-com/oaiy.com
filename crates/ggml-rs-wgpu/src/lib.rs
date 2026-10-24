@@ -669,6 +669,11 @@ impl WgpuBackend {
         )
     }
 
+    /// Whether `other` is this same device (a clone of this backend, or of one that shares its device).
+    pub fn same_device(&self, other: &WgpuBackend) -> bool {
+        Arc::ptr_eq(&self.gpu, &other.gpu)
+    }
+
     /// At most `pieces` of the chains' pieces on this device's queue at once from here on (0: as many as are recorded,
     /// as it is until asked), each encoded just before it is submitted ([`Feed`]): for a loop of short steps, or a
     /// prompt's chunks, that runs the GPU for seconds on end. A recording's pieces otherwise go to the GPU as they are

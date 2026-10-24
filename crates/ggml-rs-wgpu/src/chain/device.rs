@@ -27,6 +27,15 @@ impl WgpuBackend {
         Some(WeightVec { v: self.vec_of_bytes(bytes), used: Arc::clone(&self.used), bytes: n })
     }
 
+    /// `words` written into `v` from its `at`-th value on, in the queue's order: a recording submitted after this reads
+    /// them, one submitted before it does not (a table of where experts are, changed as they are moved).
+    pub fn write_words(&self, v: &DeviceVec, at: usize, words: &[u32]) {
+        assert!(at + words.len() <= v.len, "chain: {} words at {at} of a vector of {}", words.len(), v.len);
+        let buf = v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU vector");
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.gpu.write(buf, (at * 4) as u64, &bytes);
+    }
+
     /// A vector holding `bytes` as they are (a multiple of 4 of them): a checkpoint's weights in a form a kernel
     /// reads as stored (BF16 for [`ChainRecorder::matmul_bf16_rows_f32`]).
     pub fn vec_of_bytes(&self, bytes: &[u8]) -> DeviceVec {

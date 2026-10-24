@@ -25,7 +25,7 @@ mod usage;
 pub(crate) use engine::Engine;
 pub(crate) use exl3::WgpuExl3Experts;
 pub(crate) use experts::{WgpuExperts, ALONE};
-pub(crate) use trunk::offload;
+pub(crate) use trunk::{layer_homes, offload, offload_split};
 pub(crate) use usage::{read_usage, write_usage};
 
 /// DSpark's drafter of the checkpoint at `dir` (whose trunk `model` is), if it has one, ready to draft: its dense
@@ -42,7 +42,7 @@ pub(crate) fn load_drafter(dir: &std::path::Path, model: &crate::dsv41::model::M
     let (count, bytes) = trunk::offload_drafter(&mut d, gpu, exl3);
     let mut said = format!("DSpark's drafter: {count} dense matrices ({:.1} GB) on the GPU", bytes as f64 / 1e9);
     if exl3 {
-        match WgpuExl3Experts::new_within(&d.experts.format, cards, spec.n_routed_experts, Some(spec.layers * spec.n_routed_experts)) {
+        match WgpuExl3Experts::new_within(&d.experts.format, cards, spec.n_routed_experts, Some(spec.layers * spec.n_routed_experts), None) {
             Some(k) => {
                 let started = std::time::Instant::now();
                 while k.fill_some(d.experts.store.as_ref(), &d.experts.cache, None, 64) {}

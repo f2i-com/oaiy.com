@@ -274,6 +274,41 @@ impl Moe {
     pub(crate) fn router_and_shared(&self) -> [&Weight; 4] {
         [&self.gate, &self.shared[0], &self.shared[2], &self.shared[1]]
     }
+
+    /// The router's correction bias (a score's, as [`route`] takes it).
+    pub(crate) fn bias(&self) -> &[f32] {
+        &self.bias
+    }
+}
+
+/// The routed experts a decode step's router call likely picks, that a device program makes beside it where the experts'
+/// kernel holds a layer's experts beside its weights ([`crate::dsv41::linear::Step::Candidates`]).
+pub(crate) const FUSED_CANDIDATES: usize = 8;
+
+/// A layer's held experts a device made in the router's call ([`crate::dsv41::linear::Step::Held`]): the experts it
+/// made and each one's output (`[dim]`, unweighted), as the experts' kernel makes them alone.
+pub(crate) struct Fused {
+    experts: Vec<u32>,
+    outs: Vec<Vec<f32>>,
+}
+
+/// What gives a layer's [`Fused`] experts once the device has made them (behind the router's call: the host routes
+/// and makes the rest meanwhile).
+pub(crate) type FusedLater<'a> = Box<dyn FnOnce() -> Fused + 'a>;
+
+impl Fused {
+    /// From what the call read back: its `k` candidates' experts then their slots (u32 bits, [`u32::MAX`] where not
+    /// held), and their outputs (`[k, d]`).
+    pub(crate) fn from_read(ids: &[f32], outs: &[f32], k: usize, d: usize) -> Fused {
+        let mut f = Fused { experts: Vec::new(), outs: Vec::new() };
+        for r in 0..k {
+            if ids[k + r].to_bits() != u32::MAX {
+                f.experts.push(ids[r].to_bits());
+                f.outs.push(outs[r * d..(r + 1) * d].to_vec());
+            }
+        }
+        f
+    }
 }
 
 /// The shared expert's activation of every bf16 gate, by the gate's bits: `silu(min(g, limit))` (no limit where it is
@@ -434,15 +469,16 @@ impl Moe {
                 (logits, Some((gate, up)), None, side_out)
             }
         };
-        let (y, routes) = self.forward_from(cfg, x, t, experts, logits, shared_parts, shared_whole)?;
+        let (y, routes) = self.forward_from(cfg, x, t, experts, logits, shared_parts, shared_whole, None)?;
         Ok((y, routes, side_out))
     }
 
     /// [`Self::forward`] from the router's logits and the shared expert's projections made already (`shared_parts`: its
-    /// gate's and up's rows, bf16; `shared_whole`: its output, where its down projection was made with them): a decode
-    /// step's router made in a device program with the sublayer before it.
+    /// gate's and up's rows, bf16; `shared_whole`: its output, where its down projection was made with them), and the
+    /// held experts made with them (`fused`): a decode step's router made in a device program with the sublayer before
+    /// it.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_from(
+    pub(crate) fn forward_from(
         &self,
         cfg: &Config,
         x: &[f32],
@@ -451,6 +487,7 @@ impl Moe {
         logits: Vec<f32>,
         shared_parts: Option<(Vec<f32>, Vec<f32>)>,
         shared_whole: Option<Vec<f32>>,
+        fused: Option<FusedLater<'_>>,
     ) -> Result<(Vec<f32>, Vec<Route>)> {
         let d = cfg.dim;
         let routes = route(cfg, &logits, &self.bias, t);
@@ -490,13 +527,19 @@ impl Moe {
                 .collect();
             let gpu = experts.gpu.as_ref();
             let held = gpu.map_or_else(|| vec![false; used.len()], |g| g.holds(self.layer, &used, &gathered.iter().map(|g| g.0.len()).collect::<Vec<_>>()));
+            // (those the router's call is making behind it, where the kernel makes the layer's held experts there: the
+            // ones in its pool now)
+            let by_call: Vec<bool> = match (&fused, gpu) {
+                (Some(_), Some(g)) => used.iter().zip(&held).map(|(&e, &h)| h && g.in_fused(self.layer, e)).collect(),
+                _ => vec![false; used.len()],
+            };
             let ids: Vec<u32> = (0..used.len()).filter(|&j| !held[j]).map(|j| used[j]).collect();
             let mut shared = shared_whole;
             let outs: Vec<Vec<f32>> = match gpu {
                 // the held experts begun on their cards before anything is read, which they need not wait for, and the
                 // shared expert's down projection beside the routed ones (its own round trip after them before)
                 Some(gpu) => {
-                    let there: Vec<usize> = (0..used.len()).filter(|&j| held[j]).collect();
+                    let there: Vec<usize> = (0..used.len()).filter(|&j| held[j] && !by_call[j]).collect();
                     let mut outs: Vec<Vec<f32>> = vec![Vec::new(); used.len()];
                     // (begun: each card's call submitted here, and waited for once the rest are made)
                     let jobs: Vec<(u32, &[f32], &[f32])> = there.iter().map(|&j| (used[j], &gathered[j].1[..], &gathered[j].2[..])).collect();
@@ -539,6 +582,34 @@ impl Moe {
                         } else {
                             gpu.offer(self.layer, &read)
                         };
+                        // The router's call's held experts (made behind it meanwhile), each weighted and rounded as the
+                        // kernel's own outputs are; one it did not make (not among its candidates, or come into its pool
+                        // after it was submitted: rare) read and made here.
+                        if let Some(later) = fused {
+                            let f = later();
+                            let mut lost: Vec<u32> = Vec::new();
+                            let mut n = 0;
+                            for j in (0..used.len()).filter(|&j| by_call[j]) {
+                                match f.experts.iter().position(|&e| e == used[j]) {
+                                    Some(i) => {
+                                        let w = gathered[j].2[0];
+                                        outs[j] = f.outs[i].iter().map(|&v| to_bf16(v * w)).collect();
+                                        n += 1;
+                                    }
+                                    None => lost.push(used[j]),
+                                }
+                            }
+                            gpu.took_fused(self.layer, n);
+                            if !lost.is_empty() {
+                                let records = read_all(&lost, &|e| experts.cache.probe(self.layer, e), &acquire)?;
+                                let jobs: Vec<crate::dsv41::expert::ExpertJob<'_>> =
+                                    lost.iter().zip(&records).map(|(&e, r)| crate::dsv41::expert::ExpertJob { expert: e, record: &r[..], x: &gathered[at(e)].1, weights: &gathered[at(e)].2 }).collect();
+                                let made = gpu.forward_here(self.layer, &jobs, cfg.swiglu_limit).unwrap_or_else(|| gpu.forward(self.layer, &jobs, cfg.swiglu_limit));
+                                for (&e, out) in lost.iter().zip(made) {
+                                    outs[at(e)] = out;
+                                }
+                            }
+                        }
                         if let Some(finish) = cards {
                             for (&j, out) in there.iter().zip(finish()) {
                                 outs[j] = out;

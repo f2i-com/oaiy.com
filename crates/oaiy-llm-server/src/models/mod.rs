@@ -1064,7 +1064,18 @@ impl Models {
         let (mut kernel, mut exl3_kernel, mut drafter) = (None, None, None);
         match picked.backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
             Some(b) => {
-                let (count, bytes) = crate::engines::dsv41_portable::offload(&mut model, b);
+                // An EXL3 checkpoint's trunk on the first card, its experts held on every card it may use; or, with
+                // OAIY_DSV41_SPLIT=1, the trunk split over them, a share of the layers each, each layer's held experts on
+                // its card beside its weights. Split, each card did half the trunk's work and both ran it in a lower power
+                // state (their memory at half its clock), where the first runs it at its full one: replies as fast or
+                // slower for the calls the split saved.
+                let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
+                let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = if exl3 { std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect() } else { Vec::new() };
+                let home = (cards.len() > 1 && std::env::var("OAIY_DSV41_SPLIT").as_deref() == Ok("1")).then(|| crate::engines::dsv41_portable::layer_homes(model.cfg.n_layers, cards.len()));
+                let (count, bytes) = match &home {
+                    Some(home) => crate::engines::dsv41_portable::offload_split(&mut model, &cards, home),
+                    None => crate::engines::dsv41_portable::offload(&mut model, b),
+                };
                 // DSpark's drafter, before the experts take what the cards have left, where OAIY_DSV41_DRAFT=1 asks for
                 // it. Not by default: once a step's calls were cut, an EXL3 checkpoint's replies were as fast without it
                 // on familiar subjects and code and a sixth faster on a new one (each row a check reads more costs
@@ -1073,7 +1084,8 @@ impl Models {
                 // check of two rows four steps)
                 let draft = std::env::var("OAIY_DSV41_DRAFT").as_deref() == Ok("1");
                 if draft {
-                    let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect();
+                    // (the cards the trunk is on, where they are open already: their budgets are the ones the weights count in)
+                    let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = if cards.is_empty() { std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect() } else { cards.clone() };
                     if let Some((d, said)) = crate::engines::dsv41_portable::load_drafter(&spec.path, &model, b, &cards)? {
                         self.say(format!("{}: {said}", spec.name));
                         drafter = Some(d);
@@ -1087,15 +1099,20 @@ impl Models {
                 let more = if o.webgpu_gb.is_none() && b.adapter().pci_bus_id == "tinygpu" { crate::engines::dsv41_portable::ALONE } else { 0 };
                 // (an EXL3 checkpoint's experts are records the fp4 slots cannot run: slots of their own on every card it
                 // may use, filled while idle and by what decode steps read, the rest through a few scratch slots)
-                let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
                 if exl3 {
-                    let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect();
-                    if let Some(k) = crate::engines::dsv41_portable::WgpuExl3Experts::new(model.expert_format(), &cards, model.cfg.n_routed_experts) {
+                    let made = match home {
+                        Some(home) => crate::engines::dsv41_portable::WgpuExl3Experts::new_split(model.expert_format(), &cards, model.cfg.n_routed_experts, home),
+                        None => crate::engines::dsv41_portable::WgpuExl3Experts::new(model.expert_format(), &cards, model.cfg.n_routed_experts),
+                    };
+                    if let Some(k) = made {
                         // (what it keeps is weighed by the profile's counts where there is one)
                         k.seed_uses(&model.expert_uses().counts());
                         let k = Arc::new(k);
-                        // (what steps make on the host and use enough, kept on the cards off their path)
-                        k.start_promoter();
+                        // (what steps make on the host and use enough, kept on the cards off their path; OAIY_DSV41_PROMOTE=0:
+                        // nothing kept so)
+                        if std::env::var("OAIY_DSV41_PROMOTE").as_deref() != Ok("0") {
+                            k.start_promoter();
+                        }
                         model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn crate::dsv41::expert::ExpertsKernel>));
                         let slots = k.tier().0;
                         exl3_kernel = Some(k);
