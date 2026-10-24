@@ -193,6 +193,10 @@ fn gpu_min_rows(format: &crate::dsv41::expert::ExpertFormat) -> usize {
 }
 /// Experts a GPU takes in one call: their records' upload bounded (about 600 MB), the matmuls a stage's round trip.
 pub const GPU_GROUP: usize = 32;
+/// Rows an EXL3 checkpoint's pass may have and its experts still go a decode step's way on a GPU (a draft's check): the
+/// cards' experts begun before any record is read, and what is read kept on them as a step's is. A prompt's way read
+/// with threads started for each layer and kept nothing, so a check's experts went up again pass after pass.
+const FEW_ROWS: usize = 8;
 /// Threads reading a layer's expert records from the drive at once.
 const READERS: usize = 8;
 
@@ -244,7 +248,12 @@ pub struct Route {
 
 impl Moe {
     pub fn load(idx: &StIndex, layer: usize) -> Result<Moe> {
-        let p = format!("layers.{layer}.ffn");
+        Self::load_named(idx, layer, &format!("layers.{layer}.ffn"))
+    }
+
+    /// [`Moe::load`] of the weights named `p.*` (DSpark's drafter's `mtp.<i>.ffn`), `layer` its experts' layer in their
+    /// store.
+    pub fn load_named(idx: &StIndex, layer: usize, p: &str) -> Result<Moe> {
         Ok(Moe {
             layer: layer as u32,
             gate: Weight::load(idx, &format!("{p}.gate"))?,
@@ -335,26 +344,40 @@ impl Moe {
         // and what is left through the scratch slots (a record's upload is a fraction of a millisecond, its trellis
         // decoded on the CPU some milliseconds of every core). Without one, on every core, each projection's columns in
         // tasks of their own (the pool's workers run the fp4 kernels).
+        // (and a pass of a few rows, a draft's check, where a GPU's kernel runs them: each expert on its rows, kept on
+        // the cards as a step's are, where a prompt's are not)
         #[cfg(feature = "webgpu")]
-        if let (crate::dsv41::expert::ExpertFormat::Exl3 { layers, .. }, 1) = (&experts.format, t) {
-            let r = &routes[0];
-            let weights: Vec<f32> = used.iter().map(|e| r.weights[r.experts.iter().position(|x| x == e).expect("a used expert is routed")]).collect();
+        if let (crate::dsv41::expert::ExpertFormat::Exl3 { layers, .. }, true) = (&experts.format, t == 1 || (t <= FEW_ROWS && experts.gpu.is_some())) {
+            // every row routed to each expert, in row order: its rows of x and their weights
+            let gathered: Vec<(Vec<usize>, Vec<f32>, Vec<f32>)> = used
+                .iter()
+                .map(|e| {
+                    let (mut toks, mut xs, mut ws) = (Vec::new(), Vec::new(), Vec::new());
+                    for (i, r) in routes.iter().enumerate() {
+                        if let Some(k) = r.experts.iter().position(|x| x == e) {
+                            toks.push(i);
+                            xs.extend_from_slice(&x[i * d..(i + 1) * d]);
+                            ws.push(r.weights[k]);
+                        }
+                    }
+                    (toks, xs, ws)
+                })
+                .collect();
             let gpu = experts.gpu.as_ref();
-            let held = gpu.map_or_else(|| vec![false; used.len()], |g| g.holds(self.layer, &used, &vec![1; used.len()]));
+            let held = gpu.map_or_else(|| vec![false; used.len()], |g| g.holds(self.layer, &used, &gathered.iter().map(|g| g.0.len()).collect::<Vec<_>>()));
             let ids: Vec<u32> = (0..used.len()).filter(|&j| !held[j]).map(|j| used[j]).collect();
             let mut shared = shared_whole;
             let outs: Vec<Vec<f32>> = match gpu {
                 // the held experts begun on their cards before anything is read, which they need not wait for, and the
                 // shared expert's down projection beside the routed ones (its own round trip after them before)
                 Some(gpu) => {
-                    let w: Vec<[f32; 1]> = weights.iter().map(|&w| [w]).collect();
                     let there: Vec<usize> = (0..used.len()).filter(|&j| held[j]).collect();
                     let mut outs: Vec<Vec<f32>> = vec![Vec::new(); used.len()];
                     std::thread::scope(|scope| -> Result<()> {
                         let cards = (!there.is_empty()).then(|| {
-                            let (there, w, used) = (&there, &w, &used);
+                            let (there, gathered, used) = (&there, &gathered, &used);
                             scope.spawn(move || {
-                                let jobs: Vec<(u32, &[f32], &[f32])> = there.iter().map(|&j| (used[j], x, &w[j][..])).collect();
+                                let jobs: Vec<(u32, &[f32], &[f32])> = there.iter().map(|&j| (used[j], &gathered[j].1[..], &gathered[j].2[..])).collect();
                                 gpu.forward_held(self.layer, &jobs, cfg.swiglu_limit)
                             })
                         });
@@ -371,7 +394,8 @@ impl Moe {
                         let read: Vec<(u32, &[u8])> = ids.iter().zip(&leases).map(|(&e, l)| (e, &**l)).collect();
                         let at = |e: u32| used.iter().position(|&u| u == e).expect("a used expert");
                         if !read.is_empty() {
-                            let jobs: Vec<crate::dsv41::expert::ExpertJob<'_>> = read.iter().map(|&(e, record)| crate::dsv41::expert::ExpertJob { expert: e, record, x, weights: &w[at(e)][..] }).collect();
+                            let jobs: Vec<crate::dsv41::expert::ExpertJob<'_>> =
+                                read.iter().map(|&(e, record)| crate::dsv41::expert::ExpertJob { expert: e, record, x: &gathered[at(e)].1, weights: &gathered[at(e)].2 }).collect();
                             for (&(e, _), out) in read.iter().zip(gpu.forward(self.layer, &jobs, cfg.swiglu_limit)) {
                                 outs[at(e)] = out;
                             }
@@ -395,21 +419,25 @@ impl Moe {
                     })?;
                     outs
                 }
+                // (one row: no GPU takes more)
                 None => {
                     let reading = std::time::Instant::now();
                     let leases = read_all(&ids, &|e| experts.cache.probe(self.layer, e), &acquire)?;
                     crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertRead, reading);
                     let computing = std::time::Instant::now();
                     let records: Vec<&[u8]> = leases.iter().map(|l| &l[..]).collect();
+                    let weights: Vec<f32> = gathered.iter().map(|g| g.2[0]).collect();
                     let outs = crate::dsv41::exl3_experts::forward_step(&records, &layers[self.layer as usize], x, &weights, cfg.swiglu_limit)?;
                     crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertCpu, computing);
                     outs
                 }
             };
-            // (the sums in ascending expert order, as the other paths add them)
-            for out in outs {
-                for (acc, v) in y.iter_mut().zip(&out) {
-                    *acc += v;
+            // (the sums in ascending expert order, as the other paths add them, each row its own)
+            for ((toks, ..), out) in gathered.iter().zip(&outs) {
+                for (k, &i) in toks.iter().enumerate() {
+                    for (acc, v) in y[i * d..(i + 1) * d].iter_mut().zip(&out[k * d..(k + 1) * d]) {
+                        *acc += v;
+                    }
                 }
             }
             let shared = match (shared, shared_parts) {
