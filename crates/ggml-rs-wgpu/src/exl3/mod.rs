@@ -451,7 +451,7 @@ const NORM_AS_HOST: &str = r#"
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-var<workgroup> sq: array<vec4<f32>, 256>;
+var<workgroup> sq: array<vec4<f32>, 2048>;
 var<workgroup> scale: f32;
 
 fn bf16(v: f32) -> f32 {
@@ -563,28 +563,50 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let d = p[0].x;
     let base = wg.x * d;
     var acc = 0.0;
-    // a thousand squares at a time, each thread's four side by side, thread 0 adding them in order four a read (a read
-    // of one at a time waited for the add before it: some 40 us a row)
-    for (var c = 0u; c < d; c += 1024u) {
-        var v = vec4<f32>(0.0);
-        for (var i = 0u; i < 4u; i++) {
-            if (c + 4u * t + i < d) {
-                let e = bf16(x[base + c + 4u * t + i]);
-                v[i] = e * e;
+    // eight thousand squares at a time, each thread's four side by side (zeros past the row), thread 0 adding them in
+    // order, eight reads of four at once ahead of their adds (a read of four at a time waited before its adds: some
+    // 30 us a row of 5,120, the adds' own chain some 8)
+    for (var c = 0u; c < d; c += 8192u) {
+        for (var q = t; q < 2048u; q += 256u) {
+            var v = vec4<f32>(0.0);
+            for (var i = 0u; i < 4u; i++) {
+                if (c + 4u * q + i < d) {
+                    let e = bf16(x[base + c + 4u * q + i]);
+                    v[i] = e * e;
+                }
             }
+            sq[q] = v;
         }
-        sq[t] = v;
         workgroupBarrier();
         if (t == 0u) {
-            let n = min(1024u, d - c);
-            for (var j = 0u; j < n / 4u; j++) {
+            let n = min(8192u, d - c);
+            var j = 0u;
+            for (; j + 8u <= n / 4u; j += 8u) {
+                let s0 = sq[j];
+                let s1 = sq[j + 1u];
+                let s2 = sq[j + 2u];
+                let s3 = sq[j + 3u];
+                let s4 = sq[j + 4u];
+                let s5 = sq[j + 5u];
+                let s6 = sq[j + 6u];
+                let s7 = sq[j + 7u];
+                acc = acc + s0.x; acc = acc + s0.y; acc = acc + s0.z; acc = acc + s0.w;
+                acc = acc + s1.x; acc = acc + s1.y; acc = acc + s1.z; acc = acc + s1.w;
+                acc = acc + s2.x; acc = acc + s2.y; acc = acc + s2.z; acc = acc + s2.w;
+                acc = acc + s3.x; acc = acc + s3.y; acc = acc + s3.z; acc = acc + s3.w;
+                acc = acc + s4.x; acc = acc + s4.y; acc = acc + s4.z; acc = acc + s4.w;
+                acc = acc + s5.x; acc = acc + s5.y; acc = acc + s5.z; acc = acc + s5.w;
+                acc = acc + s6.x; acc = acc + s6.y; acc = acc + s6.z; acc = acc + s6.w;
+                acc = acc + s7.x; acc = acc + s7.y; acc = acc + s7.z; acc = acc + s7.w;
+            }
+            for (; j < n / 4u; j++) {
                 let s = sq[j];
                 acc = acc + s.x;
                 acc = acc + s.y;
                 acc = acc + s.z;
                 acc = acc + s.w;
             }
-            for (var j = n / 4u * 4u; j < n; j++) { acc = acc + sq[j / 4u][j % 4u]; }
+            for (var k = n / 4u * 4u; k < n; k++) { acc = acc + sq[k / 4u][k % 4u]; }
         }
         workgroupBarrier();
     }

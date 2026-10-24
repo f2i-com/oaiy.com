@@ -239,6 +239,27 @@ fn measure_slots_decode_call() {
     time("6 experts in 3 pools, a call", &|| drop(Exl3Slots::forward_many(&parts, 10.0)));
 }
 
+/// A program run again and again (its later runs replayed from its first's recording)
+/// reads each run's own inputs: each run's two parts the definitions of that run's values, the second read after the
+/// first.
+#[test]
+fn a_program_run_again_reads_each_runs_inputs() {
+    let Some(b) = backend() else { return };
+    let d = 1024;
+    let bf = |v: f32| f32::from_bits((v.to_bits() + 0x7fff + ((v.to_bits() >> 16) & 1)) & 0xffff_0000);
+    for run in 0..5u32 {
+        let h: Vec<f32> = (0..4 * d).map(|i| bf(((i as u32 * 37 + run * 101) % 97) as f32 / 48.0 - 1.0)).collect();
+        let mix: Vec<f32> = (0..24).map(|i| ((i as u32 * 7 + run * 3) % 11) as f32 / 16.0 + 0.1).collect();
+        let steps = [ProgramStep::Input(&h), ProgramStep::Input(&mix), ProgramStep::HcPre { h: 0, mix: 1, d }, ProgramStep::HcPre { h: 0, mix: 1, d }];
+        let (now, later) = run_program_parts(&b, &steps, &[(2, 0, d)], 3, &[(3, 0, d)]).expect("the program runs");
+        let later = later.wait();
+        let want: Vec<f32> = (0..d).map(|k| bf(mix[0] * h[k] + mix[1] * h[d + k] + mix[2] * h[2 * d + k] + mix[3] * h[3 * d + k])).collect();
+        let near = |got: &[f32]| got.iter().zip(&want).all(|(a, e)| a == e || (a - e).abs() <= e.abs() / 128.0);
+        assert!(near(&now[0]), "run {run}: the first part's");
+        assert!(near(&later[0]), "run {run}: the second part's");
+    }
+}
+
 /// A program's held experts ([`ProgramStep::Candidates`], then [`ProgramStep::Held`]) are the `k` best of the router's
 /// scores, those the table holds made as the slots make them alone (to the bit) and those it does not skipped, the
 /// experts and their slots read back as the table has them; at DeepSeek-V4.1's shape, 3 bits a weight.
