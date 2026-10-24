@@ -161,15 +161,17 @@ impl crate::Gpu {
             let total: usize = parts.iter().map(|p| p.2).sum();
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
             let each = total.div_ceil(threads).div_ceil(4096) * 4096;
-            std::thread::scope(|s| {
+            // (on rayon's threads, which are there already: a thread started for each share cost some 2.5 ms a call,
+            // most of a record's upload where a pass puts one or two into a card's scratch slots)
+            rayon::scope(|s| {
                 for (view, &(_, _, len, fill)) in views.iter_mut().zip(parts) {
                     let mut whole = view.slice(..);
                     let base = whole.as_raw_ptr().cast::<u8>().as_ptr() as usize;
                     for at in (0..len).step_by(each.max(4096)) {
                         let n = each.max(4096).min(len - at);
-                        // SAFETY: each thread is given its own bytes of the part's mapped range, mapped for writing
+                        // SAFETY: each task is given its own bytes of the part's mapped range, mapped for writing
                         // until its view (which outlives this scope) is dropped; nothing else reads or writes them
-                        s.spawn(move || fill(at, unsafe { std::slice::from_raw_parts_mut((base + at) as *mut u8, n) }));
+                        s.spawn(move |_| fill(at, unsafe { std::slice::from_raw_parts_mut((base + at) as *mut u8, n) }));
                     }
                 }
             });

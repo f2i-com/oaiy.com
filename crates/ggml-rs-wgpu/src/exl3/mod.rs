@@ -241,17 +241,44 @@ const CHAINED_BYTES: usize = 256 << 20;
 /// not on `b` or not in one buffer (a chain takes no other), or has no rows: the caller goes [`exl3_many`]'s way, whose
 /// passes of [`ROWS`] rows each decoded every weight again (a 2,650-token prompt's trunk, 169 s).
 pub fn exl3_chained(b: &WgpuBackend, items: &[(&dyn PackedLinear, &[f32])]) -> Option<Vec<Vec<f32>>> {
+    let mats: Vec<(ChainMat<'_>, &[f32])> = items.iter().map(|&(l, x)| (ChainMat::Exl3(l), x)).collect();
+    chained(b, &mats)
+}
+
+/// A matrix a chained recording ([`chained`]) multiplies: an EXL3 projection on the device, a matrix of f16 values
+/// (`[n, k]`, made by `DeviceChain::vec_f16`: a checkpoint's f16 weights exactly), or one of BF16 values as a
+/// checkpoint's bytes lie (`WgpuBackend::vec_of_bytes`).
+#[derive(Clone, Copy)]
+pub enum ChainMat<'a> {
+    Exl3(&'a dyn PackedLinear),
+    F16 { w: &'a DeviceVec, n: usize, k: usize },
+    Bf16 { w: &'a DeviceVec, n: usize, k: usize },
+}
+
+/// [`exl3_chained`] of EXL3 projections and f16 or BF16 matrices alike, all in its recordings (a model whose router and
+/// some projections are BF16 beside EXL3 ones: a call fewer for each a layer than each kind's own). None as
+/// [`exl3_chained`] is, or where a matrix's input is not whole rows of it.
+pub fn chained(b: &WgpuBackend, items: &[(ChainMat<'_>, &[f32])]) -> Option<Vec<Vec<f32>>> {
     use ggml_rs::ChainRecorder;
-    let gpus: Vec<&Exl3Gpu> = items.iter().map(|(l, _)| l.as_any()?.downcast_ref::<Exl3Gpu>()).collect::<Option<_>>()?;
-    if gpus.iter().zip(items).any(|(g, (_, x))| !g.is_on(&b.gpu) || g.single_chunk().is_none() || x.is_empty() || x.len() % g.t.k != 0) {
-        return None;
-    }
-    let one = gpus.iter().zip(items).all(|(g, (_, x))| x.len() == g.t.k);
+    // each item's (k, n), its EXL3 projection checked as one this device holds in one buffer
+    let shapes: Vec<(usize, usize)> = items
+        .iter()
+        .map(|(m, x)| {
+            let (k, n) = match m {
+                ChainMat::Exl3(l) => {
+                    let g = l.as_any()?.downcast_ref::<Exl3Gpu>()?;
+                    (g.is_on(&b.gpu) && g.single_chunk().is_some()).then(|| g.kn())?
+                }
+                ChainMat::F16 { n, k, .. } | ChainMat::Bf16 { n, k, .. } => (*k, *n),
+            };
+            (!x.is_empty() && x.len() % k == 0).then_some((k, n))
+        })
+        .collect::<Option<_>>()?;
+    let one = shapes.iter().zip(items).all(|(&(k, _), (_, x))| x.len() == k);
     // (item, first row, rows) of every piece, a recording's pieces until their partial sums would pass the bound
     let mut recordings: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new()];
     let mut held = 0usize;
-    for (i, (g, (_, x))) in gpus.iter().zip(items).enumerate() {
-        let (k, n) = g.kn();
+    for (i, (&(k, n), (_, x))) in shapes.iter().zip(items).enumerate() {
         let rows = x.len() / k;
         let per_row = 8 * n * 4;
         let chunk = (CHAINED_BYTES / per_row / 128 * 128).max(128);
@@ -265,17 +292,31 @@ pub fn exl3_chained(b: &WgpuBackend, items: &[(&dyn PackedLinear, &[f32])]) -> O
             held += take * per_row;
         }
     }
-    let mut outs: Vec<Vec<f32>> = gpus.iter().zip(items).map(|(g, (_, x))| Vec::with_capacity(x.len() / g.t.k * g.t.n)).collect();
+    let mut outs: Vec<Vec<f32>> = shapes.iter().zip(items).map(|(&(k, n), (_, x))| Vec::with_capacity(x.len() / k * n)).collect();
     for pieces in recordings {
         let mut rec = crate::chain::Recorder::new(b);
         rec.keep_groups(one);
-        for &(i, first, rows) in &pieces {
-            let (k, n) = gpus[i].kn();
-            let xv = rec.scratch(rows * k);
-            DeviceChain::upload(b, &xv, &items[i].1[first * k..(first + rows) * k]);
-            let yv = rec.scratch(rows * n);
-            rec.exl3_rows_of(items[i].0, &xv, None, &yv, rows);
-            rec.read_range(&yv, 0, rows * n);
+        // Every piece's input and output taken and its input written before anything is recorded: a matmul's own scratch
+        // goes back to the recording when it is done with it (an f16 matmul's partial sums), and an input taken after
+        // that may be that very buffer, its upload (made before the recording runs) then written over by the matmul
+        // that ran first. A router's partial sums over a prompt's 15 rows so made the shared expert's input garbage.
+        let vecs: Vec<(DeviceVec, DeviceVec)> = pieces
+            .iter()
+            .map(|&(i, first, rows)| {
+                let (k, n) = shapes[i];
+                let xv = rec.scratch(rows * k);
+                DeviceChain::upload(b, &xv, &items[i].1[first * k..(first + rows) * k]);
+                (xv, rec.scratch(rows * n))
+            })
+            .collect();
+        for (&(i, _, rows), (xv, yv)) in pieces.iter().zip(&vecs) {
+            let (k, n) = shapes[i];
+            match items[i].0 {
+                ChainMat::Exl3(l) => rec.exl3_rows_of(l, xv, None, yv, rows),
+                ChainMat::F16 { w, .. } => rec.matmul_f16_rows_f32(w, n, k, xv, yv, rows),
+                ChainMat::Bf16 { w, .. } => rec.matmul_bf16_rows_f32(w, n, k, xv, yv, rows),
+            }
+            rec.read_range(yv, 0, rows * n);
         }
         for (&(i, ..), y) in pieces.iter().zip(Box::new(rec).finish()) {
             outs[i].extend_from_slice(&y);

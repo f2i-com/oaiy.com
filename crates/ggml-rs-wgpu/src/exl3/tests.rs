@@ -182,6 +182,24 @@ fn several_projections_in_one_submit_are_each_the_cpus() {
     assert!(exl3_many(&[(&*lins[3], &x[..]), (&*cpu, &x[..])]).is_none(), "one on the CPU is not taken");
 }
 
+/// An f16 matrix's scratch in a chained recording is never a later item's input: DeepSeek-V4.1's router (384 x 5120)
+/// over a prompt's 15 rows, then an EXL3 projection of the same 5120 inputs (its input the size of the router's
+/// partial sums), each the host's sums.
+#[test]
+fn an_f16_matmuls_scratch_is_not_a_later_items_input() {
+    let Some(b) = backend() else { return };
+    let (n, k, rows) = (384, 5120, 15);
+    let w: Vec<f32> = (0..n * k).map(|i| ((i * 29 % 61) as f32 - 30.0) / 64.0).collect();
+    let wv = ggml_rs::DeviceChain::vec_f16(&b, &w).expect("f16 values exactly");
+    let lin = b.exl3_with(random_exl3(k, 256, 32, 5), None).unwrap();
+    let cpu = exl3_cpu(random_exl3(k, 256, 32, 5)).unwrap();
+    let x: Vec<f32> = (0..rows * k).map(|i| ((i * 13 % 37) as f32 - 18.0) / 32.0).collect();
+    let got = chained(&b, &[(ChainMat::F16 { w: &wv, n, k }, &x[..]), (ChainMat::Exl3(&*lin), &x[..])]).expect("both kinds chained");
+    let want: Vec<f32> = (0..rows).flat_map(|r| (0..n).map(|o| (0..k).map(|i| w[o * k + i] * x[r * k + i]).sum::<f32>()).collect::<Vec<_>>()).collect();
+    close(&got[0], &want, "the router's sums");
+    close(&got[1], cpu.linear(&Tensor::from_vec(x.clone(), vec![rows, k])).data(), "the projection after it");
+}
+
 /// What a decode step's call of experts held in slots costs (`--ignored --nocapture`), at DeepSeek-V4.1's shape (5120 to
 /// 2304, 3 bits): three experts of one row in a call of their own, then sixteen such sets in one call (the GPU's share
 /// of a set, the call's own costs spread over them), and one expert alone.
@@ -213,6 +231,60 @@ fn measure_slots_decode_call() {
     time("16 sets of 3 in one call (/16 for a set)", &|| drop(Exl3Slots::forward_many(&parts, 10.0)));
 }
 
+/// What putting experts into mapped (scratch) slots costs (`--ignored --nocapture`), at DeepSeek-V4.1's shape (13.3 MB a
+/// record): one, two and eight records a call, each then computed; the call and a put alone; a put, then a call of
+/// another slot; a put, a wait, then its call. Measured on an RTX 5090 on four Gen5 lanes: a record 2.8-3.0 ms put and
+/// computed, 1.4 the put alone (the host's writes at 11 GB/s), 0.15 the call alone, the call after the put no slower for
+/// another slot or 3 ms later: the card takes the writes some 1.3 ms after the host has made them.
+#[test]
+#[ignore = "a measurement"]
+fn measure_mapped_puts() {
+    let Some(b) = backend() else { return };
+    let (hidden, ff, tw) = (5120, 2304, 48);
+    let (layout, records, _) = as_records(experts(8, hidden, ff, tw));
+    let slots = b.exl3_slots_mapped(8, hidden, ff, [tw, tw]).expect("room for eight mapped slots");
+    let all: Vec<&[u8]> = records.0.iter().map(|r| &r[..]).collect();
+    let x: Vec<f32> = (0..hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+    for n in [1, 2, 8] {
+        for _ in 0..3 {
+            slots.put_many(0, &all[..n], &layout);
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            slots.put_many(0, &all[..n], &layout);
+            // (a call on them after each, as a pass makes: the next put waits for it)
+            drop(slots.forward(&[(0, &x[..])], 10.0));
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+        eprintln!("{n} record(s) a call: {ms:.2} ms ({:.2} GB/s of records)", (n * layout.bytes) as f64 / ms / 1e6);
+    }
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        drop(slots.forward(&[(0, &x[..])], 10.0));
+    }
+    eprintln!("the call alone: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / 20.0);
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        slots.put_many(0, &all[..1], &layout);
+    }
+    eprintln!("a record's put alone: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / 20.0);
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        slots.put_many(0, &all[..1], &layout);
+        drop(slots.forward(&[(1, &x[..])], 10.0));
+    }
+    eprintln!("a put, then a call of another slot: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / 20.0);
+    let mut call = 0.0;
+    for _ in 0..20 {
+        slots.put_many(0, &all[..1], &layout);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let s = std::time::Instant::now();
+        drop(slots.forward(&[(0, &x[..])], 10.0));
+        call += s.elapsed().as_secs_f64() * 1e3 / 20.0;
+    }
+    eprintln!("a put, 3 ms, then its call: the call {call:.2} ms");
+}
+
 /// Projections in one chained recording ([`exl3_chained`]: the transforms on the device), a step's row, a few rows and
 /// a prompt's (past the few-rows kernel: the tensor cores' blocks where the device has them), are each the CPU's
 /// projection of its rows; one over several buffers is not taken.
@@ -234,6 +306,24 @@ fn several_projections_chained_are_each_the_cpus() {
     let split = b.exl3_with(random_exl3(1024, 512, 64, 7), Some(3)).unwrap();
     let x = vec![0.25f32; 1024];
     assert!(exl3_chained(&b, &[(&*split, &x[..])]).is_none(), "a projection over several buffers is not chained");
+    // an f16 matrix (a router's) in the same recording as an EXL3 projection: each the host's sums of its rows, at
+    // DeepSeek-V4.1's shapes too (its router 384 x 5120, its indexer's weights 32 x 5120, its Engram's 4 x 5120)
+    for (n, k) in [(96, 256), (384, 5120), (32, 5120), (4, 5120)] {
+    let w: Vec<f32> = (0..n * k).map(|i| ((i * 29 % 61) as f32 - 30.0) / 64.0).collect();
+    let wv = ggml_rs::DeviceChain::vec_f16(&b, &w).expect("f16 values exactly");
+    for m in [1usize, 3, 40] {
+        let xf: Vec<f32> = (0..m * k).map(|i| ((i * 13 % 37) as f32 - 18.0) / 32.0).collect();
+        let xe: Vec<f32> = (0..m * shapes[0].0).map(|i| ((i * 7 % 23) as f32 - 11.0) / 12.0).collect();
+        // (the same values as BF16, as a checkpoint's bytes lie: each is one)
+        let wb = b.vec_of_bytes(&w.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<u8>>());
+        let got = chained(&b, &[(ChainMat::F16 { w: &wv, n, k }, &xf[..]), (ChainMat::Exl3(&*lins[0]), &xe[..]), (ChainMat::Bf16 { w: &wb, n, k }, &xf[..])]).expect("every kind chained");
+        let (w, xf_) = (&w, &xf);
+        let want: Vec<f32> = (0..m).flat_map(|r| (0..n).map(move |o| (0..k).map(|i| w[o * k + i] * xf_[r * k + i]).sum::<f32>())).collect();
+        close(&got[0], &want, &format!("the f16 matrix [{n}, {k}], {m} rows"));
+        close(&got[1], cpus[0].linear(&Tensor::from_vec(xe.clone(), vec![m, shapes[0].0])).data(), &format!("the EXL3 projection beside it, {m} rows"));
+        close(&got[2], &want, &format!("the BF16 matrix [{n}, {k}], {m} rows"));
+    }
+    }
 }
 
 fn random_exl3(k: usize, n: usize, tw: usize, seed: u32) -> Exl3Data {

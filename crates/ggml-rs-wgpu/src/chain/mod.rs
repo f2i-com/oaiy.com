@@ -14,6 +14,7 @@ use crate::{Gpu, WgpuBackend, WgpuQuant};
 mod attention;
 mod conv;
 mod device;
+pub use device::WeightVec;
 mod kernels;
 pub(crate) mod matmul;
 mod ops;

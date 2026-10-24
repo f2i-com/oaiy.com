@@ -1,7 +1,32 @@
 //! The backend as a chain's device: its vectors, what it holds, and a recording's start.
 use super::*;
 
+/// A weight's vector counted against the weight budget while it lives ([`WgpuBackend::weight_of_bytes`]).
+pub struct WeightVec {
+    pub v: DeviceVec,
+    used: Arc<std::sync::atomic::AtomicU64>,
+    bytes: u64,
+}
+
+impl Drop for WeightVec {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl WgpuBackend {
+    /// [`Self::vec_of_bytes`] counted against the weight budget while it lives, as a model's other weights are (what
+    /// the budget then has left is what slots and caches sized after it take): None where it has no room for them.
+    pub fn weight_of_bytes(&self, bytes: &[u8]) -> Option<WeightVec> {
+        use std::sync::atomic::Ordering;
+        let n = bytes.len() as u64;
+        if self.used.fetch_add(n, Ordering::Relaxed) + n > self.budget {
+            self.used.fetch_sub(n, Ordering::Relaxed);
+            return None;
+        }
+        Some(WeightVec { v: self.vec_of_bytes(bytes), used: Arc::clone(&self.used), bytes: n })
+    }
+
     /// A vector holding `bytes` as they are (a multiple of 4 of them): a checkpoint's weights in a form a kernel
     /// reads as stored (BF16 for [`ChainRecorder::matmul_bf16_rows_f32`]).
     pub fn vec_of_bytes(&self, bytes: &[u8]) -> DeviceVec {
