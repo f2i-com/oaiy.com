@@ -231,6 +231,59 @@ pub fn exl3_many(items: &[(&dyn PackedLinear, &[f32])]) -> Option<Vec<Vec<f32>>>
     Some(many(&gpus, &xs))
 }
 
+/// Partial sums a recording of [`exl3_chained`] holds at most (bytes): a prompt's rows past them go in more recordings.
+const CHAINED_BYTES: usize = 256 << 20;
+
+/// [`exl3_many`] through a chained recording on `b`, the device every projection is on: each projection's transforms on
+/// the device beside its matmul (a step's row through the projection's own kept buffers and bind groups; a prompt's rows
+/// on the tensor cores in blocks of 128 where the device has them), the inputs uploaded and the outputs read back in one
+/// submit. A prompt's rows go in as many recordings as their partial sums need ([`CHAINED_BYTES`]). None where one is
+/// not on `b` or not in one buffer (a chain takes no other), or has no rows: the caller goes [`exl3_many`]'s way, whose
+/// passes of [`ROWS`] rows each decoded every weight again (a 2,650-token prompt's trunk, 169 s).
+pub fn exl3_chained(b: &WgpuBackend, items: &[(&dyn PackedLinear, &[f32])]) -> Option<Vec<Vec<f32>>> {
+    use ggml_rs::ChainRecorder;
+    let gpus: Vec<&Exl3Gpu> = items.iter().map(|(l, _)| l.as_any()?.downcast_ref::<Exl3Gpu>()).collect::<Option<_>>()?;
+    if gpus.iter().zip(items).any(|(g, (_, x))| !g.is_on(&b.gpu) || g.single_chunk().is_none() || x.is_empty() || x.len() % g.t.k != 0) {
+        return None;
+    }
+    let one = gpus.iter().zip(items).all(|(g, (_, x))| x.len() == g.t.k);
+    // (item, first row, rows) of every piece, a recording's pieces until their partial sums would pass the bound
+    let mut recordings: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new()];
+    let mut held = 0usize;
+    for (i, (g, (_, x))) in gpus.iter().zip(items).enumerate() {
+        let (k, n) = g.kn();
+        let rows = x.len() / k;
+        let per_row = 8 * n * 4;
+        let chunk = (CHAINED_BYTES / per_row / 128 * 128).max(128);
+        for first in (0..rows).step_by(chunk) {
+            let take = chunk.min(rows - first);
+            if held > 0 && held + take * per_row > CHAINED_BYTES {
+                recordings.push(Vec::new());
+                held = 0;
+            }
+            recordings.last_mut().expect("a recording").push((i, first, take));
+            held += take * per_row;
+        }
+    }
+    let mut outs: Vec<Vec<f32>> = gpus.iter().zip(items).map(|(g, (_, x))| Vec::with_capacity(x.len() / g.t.k * g.t.n)).collect();
+    for pieces in recordings {
+        let mut rec = crate::chain::Recorder::new(b);
+        rec.keep_groups(one);
+        for &(i, first, rows) in &pieces {
+            let (k, n) = gpus[i].kn();
+            let xv = rec.scratch(rows * k);
+            DeviceChain::upload(b, &xv, &items[i].1[first * k..(first + rows) * k]);
+            let yv = rec.scratch(rows * n);
+            rec.exl3_rows_of(items[i].0, &xv, None, &yv, rows);
+            rec.read_range(&yv, 0, rows * n);
+        }
+        for (&(i, ..), y) in pieces.iter().zip(Box::new(rec).finish()) {
+            outs[i].extend_from_slice(&y);
+        }
+    }
+    Some(outs)
+}
+
 /// [`exl3_many`] of projections on one GPU: every [`ROWS`] rows of each a pass, the passes recorded into one encoder
 /// until their sums come to [`MANY_BYTES`], each encoder one submit and one read back.
 fn many(gpus: &[&Exl3Gpu], xs: &[&[f32]]) -> Vec<Vec<f32>> {

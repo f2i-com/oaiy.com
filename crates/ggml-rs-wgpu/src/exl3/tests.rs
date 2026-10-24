@@ -182,6 +182,29 @@ fn several_projections_in_one_submit_are_each_the_cpus() {
     assert!(exl3_many(&[(&*lins[3], &x[..]), (&*cpu, &x[..])]).is_none(), "one on the CPU is not taken");
 }
 
+/// Projections in one chained recording ([`exl3_chained`]: the transforms on the device), a step's row, a few rows and
+/// a prompt's (past the few-rows kernel: the tensor cores' blocks where the device has them), are each the CPU's
+/// projection of its rows; one over several buffers is not taken.
+#[test]
+fn several_projections_chained_are_each_the_cpus() {
+    let Some(b) = backend() else { return };
+    let shapes = [(256, 512, 48), (512, 256, 32), (256, 128, 24), (1024, 384, 64)];
+    let lins: Vec<_> = shapes.iter().enumerate().map(|(i, &(k, n, tw))| b.exl3_with(random_exl3(k, n, tw, 90 + i as u32), None).unwrap()).collect();
+    let cpus: Vec<_> = shapes.iter().enumerate().map(|(i, &(k, n, tw))| exl3_cpu(random_exl3(k, n, tw, 90 + i as u32)).unwrap()).collect();
+    for m in [1, 3, 200] {
+        let xs: Vec<Vec<f32>> = shapes.iter().enumerate().map(|(i, &(k, ..))| (0..m * k).map(|j| (((j + 3 * i) * 37 % 89) as f32 - 44.0) / 45.0).collect()).collect();
+        let items: Vec<(&dyn PackedLinear, &[f32])> = lins.iter().zip(&xs).map(|(l, x)| (&**l, &x[..])).collect();
+        let got = exl3_chained(&b, &items).expect("all on the device, each in one buffer");
+        for (i, ((c, x), y)) in cpus.iter().zip(&xs).zip(&got).enumerate() {
+            let want = c.linear(&Tensor::from_vec(x.clone(), vec![m, shapes[i].0]));
+            close(y, want.data(), &format!("chained projection {i}, {m} rows"));
+        }
+    }
+    let split = b.exl3_with(random_exl3(1024, 512, 64, 7), Some(3)).unwrap();
+    let x = vec![0.25f32; 1024];
+    assert!(exl3_chained(&b, &[(&*split, &x[..])]).is_none(), "a projection over several buffers is not chained");
+}
+
 fn random_exl3(k: usize, n: usize, tw: usize, seed: u32) -> Exl3Data {
     let mut s = seed;
     let mut next = || {

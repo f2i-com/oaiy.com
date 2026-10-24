@@ -61,11 +61,14 @@ impl DenseKernel for WgpuDense {
 
 /// An EXL3 projection on the WebGPU adapter (`WgpuBackend::exl3`), as the CPU model's [`DenseKernel`]: it gives every row
 /// of its output, of which the rows asked for are taken. Its activation is taken as it is and its sums are its own
-/// transforms' (f16 where exllamav3 rounds), so it is no fp8 weight.
+/// transforms' (f16 where exllamav3 rounds), so it is no fp8 weight. Its calls go through a chained recording on its
+/// adapter (`ggml_rs_wgpu::exl3::exl3_chained`): the transforms on the device, a step's buffers kept, a prompt on the
+/// tensor cores.
 pub(super) struct WgpuExl3 {
     lin: Arc<dyn ggml_rs::exl3::PackedLinear>,
     n: usize,
     k: usize,
+    b: WgpuBackend,
 }
 
 impl WgpuExl3 {
@@ -81,15 +84,19 @@ impl WgpuExl3 {
 
 impl DenseKernel for WgpuExl3 {
     fn forward_rows(&self, x: &[f32], t: usize, rows: std::ops::Range<usize>) -> Vec<f32> {
+        if let Some(all) = ggml_rs_wgpu::exl3::exl3_chained(&self.b, &[(&*self.lin, x)]).and_then(|mut v| v.pop()) {
+            return self.rows_of(&all, t, rows);
+        }
         let all = self.lin.linear(&ggml_rs::Tensor::from_vec(x.to_vec(), vec![t, self.k])).to_host();
         self.rows_of(all.data(), t, rows)
     }
 
-    /// EXL3 projections on this adapter in one submit and one read back (`ggml_rs_wgpu::exl3::exl3_many`).
+    /// EXL3 projections on this adapter in one submit and one read back (`ggml_rs_wgpu::exl3::exl3_chained`, else
+    /// `exl3_many`).
     fn forward_many(&self, items: &[(&dyn DenseKernel, &[f32], usize, std::ops::Range<usize>)]) -> Option<Vec<Vec<f32>>> {
         let mine: Vec<&WgpuExl3> = items.iter().map(|(k, ..)| (*k as &dyn std::any::Any).downcast_ref::<WgpuExl3>()).collect::<Option<_>>()?;
         let lins: Vec<(&dyn ggml_rs::exl3::PackedLinear, &[f32])> = mine.iter().zip(items).map(|(w, (_, x, ..))| (&*w.lin, *x)).collect();
-        let all = ggml_rs_wgpu::exl3::exl3_many(&lins)?;
+        let all = ggml_rs_wgpu::exl3::exl3_chained(&self.b, &lins).or_else(|| ggml_rs_wgpu::exl3::exl3_many(&lins))?;
         Some(all.iter().zip(&mine).zip(items).map(|((all, w), (_, _, t, rows))| w.rows_of(all, *t, rows.clone())).collect())
     }
 }
@@ -99,7 +106,7 @@ pub(crate) fn offload(model: &mut crate::dsv41::model::Model, gpu: &WgpuBackend)
     model.offload(|_name, w| {
         if let Weight::Exl3 { data, n, k, .. } = w {
             let lin = gpu.exl3(crate::dsv41::linear::exl3_copy(data)).ok()?;
-            return Some(Weight::Device { kernel: Arc::new(WgpuExl3 { lin, n: *n, k: *k }), n: *n, k: *k, fp8: false });
+            return Some(Weight::Device { kernel: Arc::new(WgpuExl3 { lin, n: *n, k: *k, b: gpu.clone() }), n: *n, k: *k, fp8: false });
         }
         let (data, n, k, fp8) = match w {
             Weight::Fp8 { w, s, n, k } => {
