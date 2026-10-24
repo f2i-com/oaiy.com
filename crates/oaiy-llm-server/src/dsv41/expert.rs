@@ -500,6 +500,19 @@ pub trait ExpertsKernel: Send + Sync {
         Vec::new()
     }
 
+    /// The experts it has let go of since it was last asked (each to hold one used more in its place), `(layer,
+    /// expert)` each: RAM, which let them go when they came here, may read them back ([`crate::dsv41::moe::Experts::
+    /// refill_evicted`]), so each stays in one tier or the other. By default none.
+    fn evicted(&self) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
+
+    /// Whether it holds `layer`'s `expert` now (not counted as a use, as [`Self::holds`] counts one).
+    fn keeps(&self, layer: u32, expert: u32) -> bool {
+        let _ = (layer, expert);
+        false
+    }
+
     /// A forward pass of `tokens` tokens has ended: after a prompt it may take in the experts the prompt used most
     /// (from `cache`, the RAM tier, never from the drive), after a decode step age what it counts.
     fn pass_done(&self, tokens: usize, cache: &oaiy_engine::ecache::Ecache, store: &dyn WeightStore) {

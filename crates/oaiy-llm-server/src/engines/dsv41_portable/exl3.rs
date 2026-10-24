@@ -85,6 +85,9 @@ pub(crate) struct WgpuExl3Experts {
     counts: Counts,
     /// Experts kept from a scratch slot since the caller last asked ([`ExpertsKernel::offer`]): RAM may let them go.
     kept: Mutex<Vec<(u32, u32)>>,
+    /// Experts let go of to keep others since the caller last asked ([`ExpertsKernel::evicted`]): RAM let them go when
+    /// they came here, so it reads them back.
+    evicted: Mutex<Vec<(u32, u32)>>,
 }
 
 fn record_layout(l: &[Exl3Proj; 3], bytes: usize) -> RecordLayout {
@@ -173,7 +176,7 @@ impl WgpuExl3Experts {
         let placed = RwLock::new(Placement { at: HashMap::new(), keys, free });
         let uses = (0..layers.len() * per_layer).map(|_| AtomicU32::new(0)).collect();
         let rates = cards.iter().map(|_| AtomicU64::new(RATE_GUESS.to_bits())).collect();
-        Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, cursor: Mutex::new(0), counts: Counts::default(), kept: Mutex::new(Vec::new()) })
+        Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, cursor: Mutex::new(0), counts: Counts::default(), kept: Mutex::new(Vec::new()), evicted: Mutex::new(Vec::new()) })
     }
 
     /// Start every expert's uses from `counts` (a usage profile's, the model's own counts as an earlier run left
@@ -279,7 +282,10 @@ impl WgpuExl3Experts {
         };
         self.pools[from.0].slots.copy_slot(from.1, &self.pools[at.0].slots, at.1);
         match placed.keys[at.0][at.1].replace((layer, expert)) {
-            Some(gone) => drop(placed.at.remove(&gone)),
+            Some(gone) => {
+                placed.at.remove(&gone);
+                self.evicted.lock().unwrap_or_else(|p| p.into_inner()).push(gone);
+            }
             None => placed.free[at.0] -= 1,
         }
         placed.at.insert((layer, expert), at);
@@ -517,5 +523,13 @@ impl ExpertsKernel for WgpuExl3Experts {
             kept.clear();
         }
         mine
+    }
+
+    fn evicted(&self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut *self.evicted.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn keeps(&self, layer: u32, expert: u32) -> bool {
+        self.elsewhere(layer, expert)
     }
 }

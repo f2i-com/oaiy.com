@@ -22,7 +22,9 @@ use crate::dsv41::safetensors::StIndex;
 /// Where routed expert records come from: a store behind a bounded cache.
 pub struct Experts {
     pub store: Arc<dyn WeightStore>,
-    pub cache: Ecache,
+    pub cache: Arc<Ecache>,
+    /// What reads the experts a GPU let go of back into `cache` ([`Self::refill_evicted`]).
+    pub refill: Refill,
     /// Workers for a decode step's routed experts, all of a token's at once (the same results as one at a time);
     /// none: one after another on the caller's thread.
     pub pool: Option<crate::dsv41::cpu_experts::CpuExperts>,
@@ -39,6 +41,41 @@ pub struct Experts {
     pub uses: Uses,
     /// What a record holds: the original's fp4, or an EXL3 checkpoint's projections (run by `exl3_experts`).
     pub format: crate::dsv41::expert::ExpertFormat,
+}
+
+/// The thread [`Experts::refill_evicted`] reads on, started when first needed and ended when its owner is dropped
+/// (its channel closed).
+#[derive(Default)]
+pub struct Refill {
+    tx: Mutex<Option<mpsc::Sender<Vec<(u32, u32)>>>>,
+}
+
+impl Refill {
+    fn send(&self, picks: Vec<(u32, u32)>, cache: &Arc<Ecache>, store: &Arc<dyn WeightStore>, gpu: &Arc<dyn crate::dsv41::expert::ExpertsKernel>) {
+        let mut tx = self.tx.lock().unwrap_or_else(|p| p.into_inner());
+        if tx.is_none() {
+            let (sender, rx) = mpsc::channel::<Vec<(u32, u32)>>();
+            let (cache, store, gpu) = (Arc::clone(cache), Arc::clone(store), Arc::clone(gpu));
+            let spawned = std::thread::Builder::new().name("oaiy-expert-refill".into()).spawn(move || {
+                while let Ok(picks) = rx.recv() {
+                    for (layer, e) in picks {
+                        if cache.probe(layer, e) || gpu.keeps(layer, e) || cache.len() >= cache.n_slots() {
+                            continue;
+                        }
+                        // the lease dropped at once: a leased record is never evicted
+                        let _ = cache.acquire(layer, e, store.as_ref());
+                    }
+                }
+            });
+            if spawned.is_err() {
+                return;
+            }
+            *tx = Some(sender);
+        }
+        if let Some(t) = tx.as_ref() {
+            let _ = t.send(picks);
+        }
+    }
 }
 
 /// Decode steps after which every expert's count of uses halves ([`Uses`], and the RAM cache's own counts with
@@ -155,6 +192,20 @@ impl Experts {
                 });
             }
         });
+    }
+
+    /// The experts the GPU's kernel let go of since the last call (each for one used more: [`crate::dsv41::expert::
+    /// ExpertsKernel::evicted`]) read back into the RAM cache on a thread of its own, off the steps' path. RAM let each
+    /// go when the GPU took it (an expert in one place, so the two tiers hold more between them), so one let go there
+    /// was in neither, and its next use waited for the drive (a reply's some 2.5 s of reads where the tiers held every
+    /// expert of the model). One RAM holds already, one the GPU has taken again, and any while RAM is full (reading
+    /// it would push out another) are left.
+    pub fn refill_evicted(&self) {
+        let Some(gpu) = &self.gpu else { return };
+        let evicted = gpu.evicted();
+        if !evicted.is_empty() {
+            self.refill.send(evicted, &self.cache, &self.store, gpu);
+        }
     }
 
     /// Read `picks` (`(layer, expert)` each) into the RAM cache on [`READERS`] threads: the drive read ahead of the

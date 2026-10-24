@@ -155,7 +155,8 @@ impl Model {
                 tokens: crate::dsv41::cpu_experts::fp4_tokens,
                 gpu: None,
                 store: Arc::new(store),
-                cache: Ecache::new(opts.expert_cache_bytes, format.record_bytes(), CachePolicy::Lfru),
+                cache: Arc::new(Ecache::new(opts.expert_cache_bytes, format.record_bytes(), CachePolicy::Lfru)),
+                refill: crate::dsv41::moe::Refill::default(),
                 uses: crate::dsv41::moe::Uses::new(cfg.n_layers, cfg.n_routed_experts),
                 format,
             },
@@ -269,6 +270,7 @@ impl Model {
         if let Some(gpu) = &self.experts.gpu {
             gpu.pass_done(t, &self.experts.cache, self.experts.store.as_ref());
         }
+        self.experts.refill_evicted();
         // The experts' counts of uses age as the tokens go by, and the RAM cache's own with them: both then say what
         // has been used of late.
         if t == 1 && self.experts.uses.step() {
