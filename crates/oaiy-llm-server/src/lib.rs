@@ -553,20 +553,22 @@ fn a_loopback_address_has_the_other_familys() {
     assert_eq!(other_loopback(at("127.0.0.2:8080")), None);
 }
 
-/// The memory an asked-for RAM tier leaves free at the least ([`host_cache_budget`]): the system's and the other
-/// programs' room to move.
-const HOST_RESERVE: u64 = 8 << 30;
+/// The memory an asked-for RAM tier leaves free at the least ([`host_cache_budget`]), or a tenth of what is free where
+/// that is more: the server's own memory past the tier (a prompt cache, the attention's state, its GPUs' drivers') and
+/// the other programs' room to move. 8 GiB was too little: with 144.9 GiB of tier a server ran out of memory while
+/// its idle reading filled it.
+const HOST_RESERVE: u64 = 16 << 30;
 
 /// The expert cache's bytes: 80% of what is free where nothing is asked, else what is asked, up to all that is free but
-/// [`HOST_RESERVE`] (or 80% of it where that is more). An asked-for tier was held to 80% of what was free as well, so a
-/// machine of 190 GB with 160 free gave 128 however much was asked: an owner who allows 153 GB (80% of all of it) was
-/// given 25 fewer, a thousand of DeepSeek-V4.1's experts read from the drive instead.
+/// [`HOST_RESERVE`] or a tenth of it (or 80% of it where that is more). An asked-for tier was held to 80% of what was
+/// free as well, so a machine of 190 GB with 160 free gave 128 however much was asked: an owner who allows 153 GB (80%
+/// of all of it) was given 25 fewer, a thousand of DeepSeek-V4.1's experts read from the drive instead.
 pub(crate) fn host_cache_budget(requested_gib: usize, available: Option<u64>) -> u64 {
     let safe = available.map(|n| n / 5 * 4).unwrap_or(32u64 << 30);
     if requested_gib == 0 {
         return safe;
     }
-    let room = available.map_or(safe, |n| (n / 5 * 4).max(n.saturating_sub(HOST_RESERVE)));
+    let room = available.map_or(safe, |n| (n / 5 * 4).max(n.saturating_sub(HOST_RESERVE.max(n / 10))));
     (requested_gib as u64).saturating_mul(1u64 << 30).min(room)
 }
 #[test]
@@ -575,8 +577,9 @@ fn ram_cache_clamps_to_actual_available_memory() {
     assert_eq!(host_cache_budget(140,Some(10*gib)),8*gib);
     assert_eq!(host_cache_budget(4,Some(10*gib)),4*gib);
     assert_eq!(host_cache_budget(0,Some(10*gib)),8*gib);
-    // an asked-for tier may take what is free but the reserve; unasked, a fifth is left
-    assert_eq!(host_cache_budget(153,Some(160*gib)),152*gib);
+    // an asked-for tier may take what is free but the reserve (or a tenth); unasked, a fifth is left
+    assert_eq!(host_cache_budget(153,Some(160*gib)),144*gib);
+    assert_eq!(host_cache_budget(153,Some(200*gib)),153*gib);
     assert_eq!(host_cache_budget(120,Some(160*gib)),120*gib);
     assert_eq!(host_cache_budget(0,Some(160*gib)),128*gib);
 }

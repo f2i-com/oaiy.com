@@ -126,6 +126,14 @@ impl Entry {
     }
 }
 
+/// A record's buffer of `len` zeros, or None where the memory is not there to have (where `vec!` ends the process).
+fn record_buffer(len: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0);
+    Some(v)
+}
+
 /// Everything the mutex guards.
 struct Book {
     entries: HashMap<Key, Entry>,
@@ -415,8 +423,17 @@ impl Ecache {
             drop(g);
             return self.read_around(layer, expert, store);
         }
+        let Some(mut buf) = g.spare.pop().or_else(|| record_buffer(self.rec_bytes)) else {
+            // Out of memory (the commit limit reached: another program took what the budget counted on): the cache
+            // holds what it has and no more, and this record is read around it. An allocation that failed here ended
+            // the process.
+            let held = g.entries.len();
+            self.capacity.store(held, std::sync::atomic::Ordering::Relaxed);
+            self.budget_bytes.store(held * self.rec_bytes, std::sync::atomic::Ordering::Relaxed);
+            drop(g);
+            return self.read_around(layer, expert, store);
+        };
         g.entries.insert(key, Entry { bytes: None, uses: 1, last: now, slot: usize::MAX });
-        let mut buf = g.spare.pop().unwrap_or_else(|| vec![0; self.rec_bytes]);
         drop(g);
 
         let read = store.fetch(layer, expert, &mut buf);
@@ -443,7 +460,7 @@ impl Ecache {
 
     /// A read that bypasses the cache (already counted as a miss).
     fn read_around(&self, layer: u32, expert: u32, store: &dyn WeightStore) -> Result<HostLease> {
-        let mut buf = vec![0; self.rec_bytes];
+        let mut buf = record_buffer(self.rec_bytes).ok_or_else(|| Error::Io(std::io::Error::new(std::io::ErrorKind::OutOfMemory, format!("no memory for expert ({layer}, {expert})'s record"))))?;
         store.fetch(layer, expert, &mut buf)?;
         Ok(HostLease(Arc::new(buf)))
     }
@@ -690,6 +707,17 @@ mod tests {
         }
         assert_eq!(c.len(), 5);
         assert_eq!(c.stats().evictions, 35);
+    }
+
+    /// A record whose buffer cannot be had (more than any allocation takes, as the commit limit reached refuses one): an
+    /// error, not the end of the process, and the cache holds no more than it did.
+    #[test]
+    fn a_record_with_no_memory_for_it_is_an_error_and_the_cache_stops_growing() {
+        let huge = usize::MAX / 4;
+        let (s, c) = (Store::new(16), Ecache::new(huge / 2 * 3, huge / 2, CachePolicy::Lfru));
+        assert_eq!(c.n_slots(), 3);
+        assert!(c.acquire(0, 1, &s).is_err());
+        assert_eq!((c.n_slots(), c.len()), (0, 0));
     }
 
     #[test]

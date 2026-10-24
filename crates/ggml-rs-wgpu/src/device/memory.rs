@@ -196,7 +196,10 @@ pub(crate) fn host_memory_impl() -> Option<(usize, usize)> {
     // SAFETY: `s` is a fully initialised MEMORYSTATUSEX of the size its own `length` field declares, and the call only
     // writes into it. The pointer is valid for the duration of the call and nothing retains it.
     let ok = unsafe { GlobalMemoryStatusEx(&mut s) };
-    (ok != 0).then_some((s.avail_phys as usize, s.total_phys as usize))
+    // (what a new allocation can have: the physical memory free, and no more than the commit limit's room: Windows
+    // refuses an allocation past the commit limit, the memory and the page file together, however much is free. A RAM
+    // tier sized by the physical memory alone, the file cache in it, ran a process out of commit with 150 GB free)
+    (ok != 0).then_some(((s.avail_phys.min(s.avail_page_file)) as usize, s.total_phys as usize))
 }
 
 #[cfg(target_os = "linux")]
