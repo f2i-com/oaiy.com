@@ -1288,6 +1288,12 @@ its order), as OAIY runs them (its profile, `--webgpu-gb 27`, `--ram-gb 153`), t
 A code reply's misses on the first card 16,445 where 12,568 (EXL3), 8,865 where 6,569 (2-bit). Counts
 divided by 8 fell between (code 12.9).
 
+Tried and left out, on the EXL3 checkpoint as OAIY runs it: more promotions queued (64 where 16) took
+the same 731 into the cards in a code reply (what may take a held expert's place decides, not the
+queue); the cards' counts halved every 128 or 32 steps where 512 took 2,241 and 2,758 in and missed
+fewer (11,732 and 10,146 where 12,568), and the replies were slower for the copies (code 10.2 and 8.6
+tok/s where 13.9, a familiar subject 16.9 and 14.4 where 19.8).
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.
