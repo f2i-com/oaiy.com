@@ -1142,8 +1142,10 @@ impl Models {
                         None => crate::engines::dsv41_portable::WgpuExl3Experts::new(model.expert_format(), &cards, model.cfg.n_routed_experts),
                     };
                     if let Some(k) = made {
-                        // (what it keeps is weighed by the profile's counts where there is one)
-                        k.seed_uses(&model.expert_uses().counts());
+                        // (what it keeps weighed by this run's uses alone, from none: seeded with a profile's counts,
+                        // the experts a reply on another subject used most could not take the place of the profile's,
+                        // code 11.4 tok/s where 13.9 on the EXL3 checkpoint, 15.1 where 17.3 on the 2-bit GGUF; the
+                        // profile still says what fills the cards first)
                         let k = Arc::new(k);
                         // (what steps make on the host and use enough, kept on the cards off their path; OAIY_DSV41_PROMOTE=0:
                         // nothing kept so)

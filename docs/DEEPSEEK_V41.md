@@ -1272,6 +1272,22 @@ card's memory peaked at 30.8 GB of its 32.6, the first's at 30.6. OAIY's studio 
 own making (`--webgpu-gb`, the card's memory less `vram_headroom_gb` and 2 GB), so in OAIY this is not
 yet so.
 
+The cards' experts were weighed by each one's uses, seeded at load from the usage profile's counts
+(the most used 333, a quarter of them 17 or more): an expert another subject used most this run could
+take a card's slot only past those counts, so a code reply kept missing the experts it used most and
+the cards took few of them in. Seeded no more (the profile still says what fills the cards first, by
+its order), as OAIY runs them (its profile, `--webgpu-gb 27`, `--ram-gb 153`), the second rounds:
+
+| Reply | EXL3, seeded | EXL3, not | 2-bit GGUF, seeded | 2-bit GGUF, not |
+|---|---|---|---|---|
+| A familiar subject | 19.1 tok/s | 19.8 tok/s | 25.8 tok/s | 26.7 tok/s |
+| Code | 11.4 tok/s | 13.9 tok/s | 15.1 tok/s | 17.3 tok/s |
+| The same again | 19.1 tok/s | 19.8 tok/s | 25.8 tok/s | 26.9 tok/s |
+| A new subject | 16.0 tok/s | 16.8 tok/s | 21.3 tok/s | 21.5 tok/s |
+
+A code reply's misses on the first card 16,445 where 12,568 (EXL3), 8,865 where 6,569 (2-bit). Counts
+divided by 8 fell between (code 12.9).
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

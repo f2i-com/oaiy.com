@@ -497,17 +497,6 @@ impl WgpuExl3Experts {
         }
     }
 
-    /// Start every expert's uses from `counts` (a usage profile's, the model's own counts as an earlier run left
-    /// them: `layer * per_layer + expert`), so the experts a profile put on the cards are not taken as unused and
-    /// given up to the first that passes twice. Nothing changed if they are not this model's shape.
-    pub(crate) fn seed_uses(&self, counts: &[u32]) {
-        if counts.len() == self.uses.len() {
-            for (n, &c) in self.uses.iter().zip(counts) {
-                n.store(c, Ordering::Relaxed);
-            }
-        }
-    }
-
     fn placement(&self) -> std::sync::RwLockReadGuard<'_, Placement> {
         self.placed.read().unwrap_or_else(|p| p.into_inner())
     }
