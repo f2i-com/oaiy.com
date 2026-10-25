@@ -733,7 +733,24 @@ pub struct Checkpoint {
     history: Vec<i64>,
 }
 
+impl Checkpoint {
+    /// Its layers' caches and the n-gram history: what a state kept on disk is made of ([`Checkpoint::from_parts`]).
+    pub(crate) fn parts(&self) -> (&[AttnState], &[i64]) {
+        (&self.states, &self.history)
+    }
+
+    pub(crate) fn from_parts(states: Vec<AttnState>, history: Vec<i64>) -> Checkpoint {
+        Checkpoint { states, history }
+    }
+}
+
 impl Model {
+    /// Whether `c` is a state of this model's shape: as many layers, each vector as long (a state read from disk,
+    /// before [`Model::restore`] takes it).
+    pub fn fits(&self, c: &Checkpoint) -> bool {
+        c.states.len() == self.states.len() && c.states.iter().zip(&self.states).all(|(a, b)| a.parts().iter().zip(b.parts()).all(|(x, y)| x.0.len() == y.0.len()))
+    }
+
     /// The state as it stands (the caller knows how many tokens it covers).
     pub fn checkpoint(&mut self) -> Checkpoint {
         self.caches_here();

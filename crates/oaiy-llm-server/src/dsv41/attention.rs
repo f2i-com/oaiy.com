@@ -98,6 +98,19 @@ pub struct Saved {
 }
 
 impl AttnState {
+    /// Its vectors in a fixed order, each with the value a fresh state fills it with ([`Attention::new_state`]): what a
+    /// state kept on disk is made of ([`AttnState::from_parts`]).
+    pub(crate) fn parts(&self) -> [(&[f32], f32); 7] {
+        let ninf = f32::NEG_INFINITY;
+        [(&self.window, 0.0), (&self.compress_kv, 0.0), (&self.kv_state, 0.0), (&self.score_state, ninf), (&self.index_k, 0.0), (&self.recent_kv, 0.0), (&self.recent_score, ninf)]
+    }
+
+    /// A state of the vectors [`AttnState::parts`] gives, in its order; None where there are not seven.
+    pub(crate) fn from_parts(parts: Vec<Vec<f32>>) -> Option<AttnState> {
+        let [window, compress_kv, kv_state, score_state, index_k, recent_kv, recent_score]: [Vec<f32>; 7] = parts.try_into().ok()?;
+        Some(AttnState { window, compress_kv, kv_state, score_state, index_k, recent_kv, recent_score })
+    }
+
     /// Whether `other`'s caches are these to the bit (a check of the device's copy, [`DeviceCaches`]).
     pub(crate) fn same_as(&self, other: &AttnState) -> bool {
         let bits = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());

@@ -27,7 +27,10 @@ pub(crate) struct Engine {
     /// The state after the last prompt's tokens but its last one, and those tokens.
     checkpoint: Option<(Vec<u32>, crate::dsv41::model::Checkpoint)>,
     /// The state at the end of a prompt's system turn ([`system_end`]), those tokens, and the drafter's keys then.
-    system: Option<(Vec<u32>, crate::dsv41::model::Checkpoint, Option<Vec<crate::dsv41::attention::AttnState>>)>,
+    system: Option<(Vec<u32>, Arc<crate::dsv41::model::Checkpoint>, Option<Vec<crate::dsv41::attention::AttnState>>)>,
+    /// Prompt states kept on disk (`--prompt-cache`): each system turn's state, so a later process reads on from it
+    /// (none where there is a drafter, whose keys it does not keep).
+    disk: Option<crate::engines::disk::DiskCache<super::saved::SavedState>>,
     /// The tokens that open a user turn (`<｜User｜>`, which ends the system turn) and an assistant's.
     user: Option<u32>,
     assistant: Option<u32>,
@@ -188,6 +191,7 @@ impl Engine {
             covered: Vec::new(),
             checkpoint: None,
             system: None,
+            disk: None,
             user,
             assistant,
             eos,
@@ -279,6 +283,12 @@ impl Engine {
     pub(crate) fn with_usage(mut self, usage: Option<std::path::PathBuf>, order: Option<Vec<(u32, u32)>>) -> Engine {
         self.usage = usage;
         self.order = order;
+        self
+    }
+
+    /// Prompt states kept on disk in `disk` ([`super::saved::SavedState`]).
+    pub(crate) fn with_disk(mut self, disk: Option<crate::engines::disk::DiskCache<super::saved::SavedState>>) -> Engine {
+        self.disk = disk;
         self
     }
 
@@ -557,15 +567,26 @@ impl Engine {
         // of this prompt.
         let live = reusable(&self.covered, prompt);
         let kept = self.checkpoint.as_ref().map_or(0, |(tokens, _)| reusable(tokens, prompt));
+        // (a state on disk that serves more of it than these, a system turn's an earlier process kept: read in as the
+        // system turn's)
+        let mut from_disk = false;
+        if let (Some(disk), None, false) = (self.disk.as_mut(), &self.drafter, job.forget) {
+            let held = live.max(kept).max(self.system.as_ref().map_or(0, |(tokens, ..)| reusable(tokens, prompt)));
+            let keys: Vec<u64> = prompt.iter().map(|&t| u64::from(t)).collect();
+            if let Some((keys, saved)) = disk.load_best(&keys, prompt.len() - 1, held, self.log).filter(|(_, saved)| self.model.fits(&saved.state)) {
+                self.system = Some((keys.iter().map(|&k| k as u32).collect(), saved.state, None));
+                from_disk = true;
+            }
+        }
         let system = self.system.as_ref().map_or(0, |(tokens, ..)| reusable(tokens, prompt));
-        let start = if kept > live && kept >= system {
+        let (start, source) = if kept > live && kept >= system {
             let (tokens, state) = self.checkpoint.as_ref().expect("a checkpoint serves it");
             self.model.restore(state);
             self.covered.clone_from(tokens);
             if let (Some(d), Some(keys)) = (self.drafter.as_mut(), &self.drafter_keys) {
                 d.set_keys(keys);
             }
-            kept
+            (kept, "memory")
         } else if system > live {
             let (tokens, state, keys) = self.system.as_ref().expect("a system turn's state serves it");
             self.model.restore(state);
@@ -573,14 +594,14 @@ impl Engine {
             if let (Some(d), Some(keys)) = (self.drafter.as_mut(), keys) {
                 d.set_keys(keys);
             }
-            system
+            (system, if from_disk { "disk" } else { "memory" })
         } else {
-            live
+            (live, if live > 0 { "memory" } else { "none" })
         };
         if start == 0 {
             self.covered.clear();
         }
-        let _ = job.events.send(Event::CacheReuse { cached: start, source: if start > 0 { "memory" } else { "none" }, common });
+        let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
         let total = prompt.len() - start;
         let _ = job.events.send(Event::Progress { done: 0, total });
         // All but the last token, then the checkpoint, then the last one (whose logits the reply starts from). Where there
@@ -601,7 +622,16 @@ impl Engine {
             pos += take;
             let _ = job.events.send(Event::Progress { done: pos - start, total });
             if system_end == Some(pos) {
-                self.system = Some((self.covered.clone(), self.model.checkpoint(), self.drafter.as_ref().map(|d| d.keys())));
+                let state = Arc::new(self.model.checkpoint());
+                // (and on disk, for a later process: written by the cache's own thread, the state shared)
+                if let (Some(disk), None) = (self.disk.as_mut(), &self.drafter) {
+                    let keys: Vec<u64> = self.covered.iter().map(|&t| u64::from(t)).collect();
+                    let saved = super::saved::SavedState::new(pos, Arc::clone(&state));
+                    if !disk.has(&keys) && disk.takes(crate::engines::disk::PromptState::encoded_len(&saved) as u64) {
+                        disk.save(keys, saved, true);
+                    }
+                }
+                self.system = Some((self.covered.clone(), state, self.drafter.as_ref().map(|d| d.keys())));
             }
         }
         if !job.forget {

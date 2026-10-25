@@ -1216,6 +1216,16 @@ and index keys to the bit, the heads' outputs at most 0.54% off). The 2-bit GGUF
 | A new conversation, the same system turn | 2.87 tok/s | 14.7 tok/s |
 | The first's next step | 2.86 tok/s | 19.4 tok/s |
 
+A system turn's state is kept on disk too (`--prompt-cache`, OAIY's `engines\cache\prompt-states`;
+`engines::dsv41_portable::saved::SavedState` in the prompt cache every engine keeps, known by the
+checkpoint's files and the context), so a later process reads on from it: OAIY started again, or the
+model loaded again after another. Each vector is written up to its last value that is not a fresh
+state's, in bf16 where every value written is one, and read back into a vector of its whole length:
+the Agent's turn of 22,671 tokens is 75 MB. A first process read it in 661 s and kept it; a second,
+started afresh, read it back and gave its first word after 12.8 s, the same reply as the first
+process's own new conversation (its RAM tier not yet filled, the reply itself at 2.3 tok/s). Not
+where a drafter runs (its keys are not kept) or for an incognito request.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

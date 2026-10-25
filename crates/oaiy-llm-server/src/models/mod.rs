@@ -1191,12 +1191,40 @@ impl Models {
         // not as many as pay by what passes take; OAIY_DSV41_DRAFTS: the most a pass checks)
         let draft_min = std::env::var("OAIY_DSV41_DRAFT_MIN").ok().and_then(|v| v.parse().ok());
         let draft_max = std::env::var("OAIY_DSV41_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        // Its prompt states on disk (`--prompt-cache`): a system turn's, so a later start reads on from it. Known by the
+        // checkpoint's files and the context, which sizes every state's caches.
+        let disk = match &o.prompt_cache {
+            Some(dir) => {
+                let mut fp = disk::fnv(b"dsv41-portable-state-v1", 0);
+                fp = disk::fnv(&(max_seq as u64).to_le_bytes(), fp);
+                fp = disk::fnv(spec.path.as_os_str().as_encoded_bytes(), fp);
+                let mut files: Vec<PathBuf> = if spec.path.is_dir() {
+                    std::fs::read_dir(&spec.path)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "safetensors" || x == "json" || x == "gguf")).collect()
+                } else {
+                    vec![spec.path.clone()]
+                };
+                files.sort();
+                for p in files {
+                    fp = disk::fnv(p.as_os_str().as_encoded_bytes(), fp);
+                    fp = disk::fnv(&std::fs::metadata(&p)?.len().to_le_bytes(), fp);
+                }
+                match disk::DiskCache::open(dir, fp, (o.prompt_cache_gb * 1e9) as u64) {
+                    Ok(cache) => Some(cache),
+                    Err(err) => {
+                        self.say(format!("{}: prompt cache unavailable: {err}", spec.name));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         let e = crate::engines::dsv41_portable::Engine::new(model, Arc::clone(&tok), !o.quiet && !o.silent)
             .with_kernel(kernel)
             .with_exl3(exl3_kernel)
             .with_usage(o.usage.clone(), order)
             .with_ram_ceiling(o.ram_gb)
-            .with_drafter(drafter, draft_min, draft_max);
+            .with_drafter(drafter, draft_min, draft_max)
+            .with_disk(disk);
         let thread = std::thread::Builder::new().name("deepseek-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Deepseek(tok)) })
     }
