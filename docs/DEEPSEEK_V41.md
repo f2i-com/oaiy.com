@@ -962,8 +962,9 @@ Other findings:
 - **A round trip.** A call costs some 70 us to encode and 30 to submit. From submit to its read
   back is about 345 us, of which the card works about 150. The same call alone, back to back, is
   0.195 ms, and 0.23 to 0.30 after 2 ms idle.
-- **The CPU's experts beside the cards'** (`OAIY_DSV41_HYBRID=1`: half of a layer's misses sent
-  up to the cards' scratch slots while the cores make the rest) was a little slower. It is off.
+- **The CPU's experts beside the cards'** (half of a layer's misses sent up to the cards' scratch
+  slots while the cores make the rest) was a little slower. Later shared by measured time instead,
+  see the next section.
 
 Measured on the EXL3 checkpoint, same usage profile, 120-token greedy replies. Each run asks the four
 twice in one session; these are the second round's. Every reply is the same text in each run:
@@ -1039,6 +1040,15 @@ Another program compiled on the machine through these runs (the host's figures w
 8.0 tok/s with the attention on the card and 4.6 on the host. Its kernels are made while the model
 loads (`exl3::make_attention_kernels`): made as the first reply needed them, they were some seconds
 of it.
+
+A layer's experts no card holds are now shared between the host's cores and the cards' scratch slots
+by what each has taken of late (`WgpuExl3Experts::share_to_cards`: an expert on the cores, a record's
+put at the fastest card's rate and the call after it): as many go to the cards as end no later than
+the rest on the cores, one at least staying there. On idle cores an expert takes some half a
+millisecond and a card's put and call two, so the cores keep a layer's few misses (the replies were
+as fast either way). With the cores taken (four of them for the experts, `OAIY_STEP_THREADS=4`), code
+went from 5.7 to 6.6 tok/s and a new subject from 4.5 to 5.8, every reply the same text.
+`OAIY_DSV41_HYBRID=0` keeps them all on the cores.
 
 ## Phases
 

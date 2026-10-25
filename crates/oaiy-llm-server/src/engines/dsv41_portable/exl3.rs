@@ -31,6 +31,17 @@ const MARGIN: u64 = 1 << 30;
 /// The rate a card is taken to put records into its scratch slots at before it has (bytes a microsecond: 10 GB/s).
 const RATE_GUESS: f64 = 10_000.0;
 
+/// An expert on the host's cores, and a scratch call after its puts, before either has been timed (us): sixteen idle
+/// cores of AVX-512 make one in some 500 us; a call after a put waited some 1,000 for the card to take the writes in.
+const HOST_US_GUESS: f64 = 600.0;
+const CALL_US_GUESS: f64 = 1_000.0;
+
+/// `v` (f64 bits) a fifth of the way to `x`.
+fn ease(v: &AtomicU64, x: f64) {
+    let old = f64::from_bits(v.load(Ordering::Relaxed));
+    v.store((old * 0.8 + x * 0.2).to_bits(), Ordering::Relaxed);
+}
+
 /// Uses an expert needs before it takes the place of one the cards hold (a free slot takes any): one use is a step's
 /// chance, and swapping on it would trade one passing expert for another.
 const KEEP_USES: u32 = 2;
@@ -87,6 +98,11 @@ pub(crate) struct WgpuExl3Experts {
     calls: AtomicU64,
     /// Each card's rate of putting records into its scratch slots, as measured (bytes a microsecond, f64 bits).
     rates: Vec<AtomicU64>,
+    /// What a step's experts the cards do not hold have taken of late (us, f64 bits): an expert made on the host's
+    /// cores, and a scratch call after its records' puts (the card's taking the writes in among it): how
+    /// [`ExpertsKernel::forward_here`] shares a layer's between the two.
+    host_us: AtomicU64,
+    call_us: AtomicU64,
     /// Where the idle fill ([`WgpuExl3Experts::fill_some`]) is in its order.
     cursor: Mutex<usize>,
     counts: Counts,
@@ -255,7 +271,7 @@ impl WgpuExl3Experts {
         let placed = RwLock::new(Placement { at: HashMap::new(), keys, free });
         let uses = (0..layers.len() * per_layer).map(|_| AtomicU32::new(0)).collect();
         let rates = cards.iter().map(|_| AtomicU64::new(RATE_GUESS.to_bits())).collect();
-        Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, cursor: Mutex::new(0), counts: Counts::default(),
+        Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, host_us: AtomicU64::new(HOST_US_GUESS.to_bits()), call_us: AtomicU64::new(CALL_US_GUESS.to_bits()), cursor: Mutex::new(0), counts: Counts::default(),
             kept: Mutex::new(Vec::new()),
             evicted: Mutex::new(Vec::new()),
             promoter: Mutex::new(None),
@@ -578,6 +594,19 @@ impl WgpuExl3Experts {
         f64::from_bits(self.rates[card].load(Ordering::Relaxed))
     }
 
+    /// How many of `layer`'s `misses` (experts no card holds) a step sends through the cards' scratch slots while the
+    /// host's cores make the rest: the share whose cards' time (a call, and each record's put at the fastest card's
+    /// rate) and the host's (each expert's) end soonest, the fewer to the cards where two end alike, and one at least
+    /// here (so the host's time is known as it changes). 0 where this bitrate has no scratch slots.
+    fn share_to_cards(&self, layer: u32, misses: usize) -> usize {
+        let tw = self.tw(layer);
+        let Some(rate) = self.pools.iter().filter(|p| p.scratch && p.tw == tw).map(|p| self.rate(p.card)).reduce(f64::max) else { return 0 };
+        let (host, call) = (f64::from_bits(self.host_us.load(Ordering::Relaxed)), f64::from_bits(self.call_us.load(Ordering::Relaxed)));
+        let put = self.layouts[layer as usize].bytes as f64 / rate.max(1.0);
+        let ends = |k: usize| ((misses - k) as f64 * host).max(if k > 0 { call + k as f64 * put } else { 0.0 });
+        (0..misses).min_by(|&a, &b| ends(a).total_cmp(&ends(b))).unwrap_or(0)
+    }
+
     /// `jobs` (of `list`) through scratch pool `p`, a group of its slots at a time: each one's output, weighted. Each
     /// expert is then kept on the card where it is used enough ([`Self::keep`]).
     fn through_scratch(&self, layer: u32, p: usize, jobs: &[ExpertJob<'_>], list: &[usize], limit: f32) -> Vec<(usize, Vec<f32>)> {
@@ -594,7 +623,10 @@ impl WgpuExl3Experts {
             let seen = (records.len() * layout.bytes) as f64 / took.max(1.0);
             self.rates[pool.card].store((self.rate(pool.card) * 0.8 + seen * 0.2).to_bits(), Ordering::Relaxed);
             let these: Vec<(usize, &[f32])> = group.iter().enumerate().map(|(s, &i)| (s, jobs[i].x)).collect();
-            for (y, &i) in pool.slots.forward(&these, limit).into_iter().zip(group) {
+            let calling = std::time::Instant::now();
+            let ys = pool.slots.forward(&these, limit);
+            ease(&self.call_us, calling.elapsed().as_secs_f64() * 1e6);
+            for (y, &i) in ys.into_iter().zip(group) {
                 out.push((i, weighed(y, jobs[i].weights)));
             }
             for (s, &i) in group.iter().enumerate() {
@@ -775,17 +807,24 @@ impl ExpertsKernel for WgpuExl3Experts {
         if jobs.iter().any(|j| j.x.len() != d || j.weights.len() != 1) {
             return None;
         }
-        // (OAIY_DSV41_HYBRID=1: a layer's misses past the first shared with the cards' scratch slots, half of them, which
-        // take a record in over their links while the host's cores make the rest; the same bits either way)
+        // Some of a layer's misses through the cards' scratch slots, which take a record in over their links while the
+        // host's cores make the rest: as many as are done no later than those, by what each has taken of late (the
+        // same bits either way). On idle cores an expert here took some half a millisecond and a card's a millisecond
+        // and more, so a few misses stay here; another program on the cores made one here two, and a card's then paid.
+        // (OAIY_DSV41_HYBRID=0: all of them here)
         static HYBRID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let hybrid = *HYBRID.get_or_init(|| std::env::var("OAIY_DSV41_HYBRID").as_deref() == Ok("1"));
-        let to_cards = if hybrid && jobs.len() >= 2 && self.pools.iter().any(|p| p.scratch && p.tw == self.tw(layer)) { jobs.len() / 2 } else { 0 };
+        let hybrid = *HYBRID.get_or_init(|| std::env::var("OAIY_DSV41_HYBRID").as_deref() != Ok("0"));
+        let to_cards = if hybrid { self.share_to_cards(layer, jobs.len()) } else { 0 };
         let (theirs, mine) = jobs.split_at(to_cards);
         self.counts.host.fetch_add(mine.len() as u64, Ordering::Relaxed);
         let these: Vec<(&[u8], &[f32])> = mine.iter().map(|j| (j.record, j.x)).collect();
         let (made_there, made_here) = std::thread::scope(|scope| {
             let there = (!theirs.is_empty()).then(|| scope.spawn(|| self.forward(layer, theirs, swiglu_limit)));
+            let making = std::time::Instant::now();
             let here = ggml_rs_wgpu::exl3::step_experts_host(&these, layout, swiglu_limit, true);
+            if !these.is_empty() {
+                ease(&self.host_us, making.elapsed().as_secs_f64() * 1e6 / these.len() as f64);
+            }
             (there.map(|h| h.join().expect("the cards' share of a step's experts panicked")).unwrap_or_default(), here)
         });
         Some(made_there.into_iter().chain(made_here.into_iter().zip(mine).map(|(y, j)| weighed(y, j.weights))).collect())
