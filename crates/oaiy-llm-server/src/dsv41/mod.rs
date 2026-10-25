@@ -17,6 +17,7 @@
 //! - [`cpu_experts`] — decode-time routed experts on a CPU thread pool (hybrid tier)
 //! - `exl3_experts` — the routed experts of an EXL3 checkpoint on the CPU (the WebGPU build's: its decoder is there)
 //! - [`engram`] — n-gram hash memory
+//! - [`gguf_file`] — the checkpoint from a GGUF (llama.cpp's `deepseek41` layout), served under the safetensors names
 //! - [`model`] — the backbone forward pass
 //! - [`dspark`] — DSpark's block drafter (`mtp.*`), whose drafts the backbone checks in one pass
 //! - [`vision`] — image preprocessing (bit-exact to the reference's Pillow
@@ -35,6 +36,8 @@ pub mod engram;
 pub mod exl3_experts;
 pub mod expert;
 pub mod ternary;
+pub mod gguf_experts;
+pub mod gguf_file;
 pub mod golden;
 pub mod hc;
 pub mod linear;

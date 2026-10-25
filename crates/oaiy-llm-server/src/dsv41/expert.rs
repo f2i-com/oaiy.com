@@ -70,6 +70,33 @@ pub struct Exl3Proj {
     pub tile_words: usize,
 }
 
+/// Where a GGUF expert's projection lies in its record: `n` rows of `k` from `at`, each a whole number of blocks of
+/// GGML type `dtype` (its number).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GgufProj {
+    pub dtype: u32,
+    pub at: usize,
+    pub k: usize,
+    pub n: usize,
+}
+
+impl GgufProj {
+    /// Its GGML type.
+    pub fn ggml(&self) -> ggml_quants::GgmlType {
+        ggml_quants::GgmlType::from_u32(self.dtype).expect("a GGUF expert's type is checked when its store opens")
+    }
+
+    /// Its bytes a row, and in all.
+    pub fn row_bytes(&self) -> usize {
+        let t = self.ggml();
+        self.k / t.block_size() * t.type_size()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.n * self.row_bytes()
+    }
+}
+
 /// How a checkpoint stores its routed experts, and so what a record holds.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExpertFormat {
@@ -80,15 +107,47 @@ pub enum ExpertFormat {
     /// own layout, gate (`w1`), up (`w3`) and down (`w2`): a layer's bitrate may be another's (2 bits where 3). A
     /// record is `bytes`, the largest layer's; a smaller one's bytes past its own are unused.
     Exl3 { layers: Vec<[Exl3Proj; 3]>, bytes: usize },
+    /// A GGUF's (llama.cpp's `deepseek41` layout): each layer's gate (`w1`), up (`w3`) and down (`w2`) one tensor of every
+    /// expert's blocks, a record an expert's slice of each, in that order. A layer's types its own, a projection's
+    /// another's (1-bit beside 2-bit). A record is `bytes`, the largest layer's.
+    Gguf { layers: Vec<[GgufProj; 3]>, bytes: usize },
 }
 
 impl ExpertFormat {
     pub fn record_bytes(&self) -> usize {
         match self {
             ExpertFormat::Fp4 => RECORD_BYTES,
-            ExpertFormat::Exl3 { bytes, .. } => *bytes,
+            ExpertFormat::Exl3 { bytes, .. } | ExpertFormat::Gguf { bytes, .. } => *bytes,
         }
     }
+}
+
+/// A GGUF checkpoint's routed experts for `prefix`'s layer (`{prefix}.experts.{w1,w3,w2}`, each `[experts, n, k]` of
+/// GGML blocks): their record layout, and each projection's tensor (its shard, its start and an expert's bytes).
+fn gguf_parts(idx: &StIndex, prefix: &str, experts: u32) -> Result<([GgufProj; 3], [(usize, u64, usize); 3])> {
+    let mut projs = [GgufProj { dtype: 0, at: 0, k: 0, n: 0 }; 3];
+    let mut where_ = [(0usize, 0u64, 0usize); 3];
+    let mut at = 0;
+    for (i, w) in ["w1", "w3", "w2"].into_iter().enumerate() {
+        let name = format!("{prefix}.experts.{w}");
+        let t = idx.info(&name)?;
+        let (Dtype::Ggml(dtype), &[e, n, k]) = (t.dtype, &t.shape[..]) else {
+            return Err(Error::Format(format!("{name}: expected [experts, n, k] of GGML blocks, got {:?} {:?}", t.dtype, t.shape)));
+        };
+        let p = GgufProj { dtype, at, k, n };
+        let ok = ggml_quants::GgmlType::from_u32(dtype).is_ok_and(|g| k % g.block_size() == 0);
+        if !ok || e != experts as usize || t.nbytes as usize != e * p.bytes() {
+            return Err(Error::Format(format!("{name}: {e} experts of [{n}, {k}] in {} bytes, type {dtype}", t.nbytes)));
+        }
+        projs[i] = p;
+        where_[i] = (t.shard, t.start, p.bytes());
+        at += p.bytes();
+    }
+    let [g, u, d] = projs;
+    if (g.k, g.n) != (DIM, INTER) || (u.k, u.n) != (DIM, INTER) || (d.k, d.n) != (INTER, DIM) {
+        return Err(Error::Format(format!("{prefix}: GGUF experts of {}x{} / {}x{}, expected {DIM}x{INTER}", g.k, g.n, d.k, d.n)));
+    }
+    Ok((projs, where_))
 }
 
 /// An EXL3 checkpoint's record parts for `layer` (each `(suffix, dtype, bytes)`, in record order) and their layout, from
@@ -170,6 +229,23 @@ impl SafetensorsExpertStore {
     pub fn open_named(idx: &StIndex, layers: u32, experts: u32, direct: bool, prefix: &dyn Fn(u32) -> String) -> Result<Self> {
         let mut runs: Vec<Run> = Vec::new();
         let mut starts = Vec::with_capacity((layers * experts) as usize + 1);
+        // A GGUF keeps each layer's experts a tensor a projection (`ExpertFormat::Gguf`): an expert's three slices.
+        if matches!(idx.get(&format!("{}.experts.w1", prefix(0))).map(|t| t.dtype), Some(Dtype::Ggml(_))) {
+            let mut layouts = Vec::with_capacity(layers as usize);
+            for l in 0..layers {
+                let (layout, tensors) = gguf_parts(idx, &prefix(l), experts)?;
+                for e in 0..experts as u64 {
+                    starts.push(runs.len() as u32);
+                    for (p, &(shard, start, each)) in layout.iter().zip(&tensors) {
+                        runs.push(Run { shard: shard as u32, file_off: start + e * each as u64, dst_off: p.at, len: each });
+                    }
+                }
+                layouts.push(layout);
+            }
+            starts.push(runs.len() as u32);
+            let bytes = layouts.iter().map(|ps| ps.iter().map(|p| p.at + p.bytes()).max().unwrap_or(0)).max().unwrap_or(0);
+            return Self::with_runs(idx, layers, experts, direct, runs, starts, ExpertFormat::Gguf { layers: layouts, bytes });
+        }
         // An EXL3 checkpoint stores each projection as its trellis and transforms (`ExpertFormat::Exl3`).
         let exl3 = idx.get(&format!("{}.experts.0.w1.trellis", prefix(0))).is_some();
         let mut layouts = Vec::new();
@@ -212,7 +288,17 @@ impl SafetensorsExpertStore {
             }
         }
         starts.push(runs.len() as u32);
+        let format = if exl3 {
+            let bytes = layouts.iter().map(|[g, u, d]| [g, u, d].iter().map(|p| p.trellis + p.k / 16 * (p.n / 16) * p.tile_words * 2).max().unwrap_or(0)).max().unwrap_or(0);
+            ExpertFormat::Exl3 { layers: layouts, bytes }
+        } else {
+            ExpertFormat::Fp4
+        };
+        Self::with_runs(idx, layers, experts, direct, runs, starts, format)
+    }
 
+    /// The store of `runs` (each expert's, from `starts`) over `idx`'s files, its records as `format` says.
+    fn with_runs(idx: &StIndex, layers: u32, experts: u32, direct: bool, runs: Vec<Run>, starts: Vec<u32>, format: ExpertFormat) -> Result<Self> {
         let mut files = Vec::with_capacity(idx.shard_count());
         let mut all_direct = direct;
         for i in 0..idx.shard_count() {
@@ -220,12 +306,6 @@ impl SafetensorsExpertStore {
             all_direct &= d;
             files.push(f);
         }
-        let format = if exl3 {
-            let bytes = layouts.iter().map(|[g, u, d]| [g, u, d].iter().map(|p| p.trellis + p.k / 16 * (p.n / 16) * p.tile_words * 2).max().unwrap_or(0)).max().unwrap_or(0);
-            ExpertFormat::Exl3 { layers: layouts, bytes }
-        } else {
-            ExpertFormat::Fp4
-        };
         Ok(SafetensorsExpertStore {
             files,
             direct: all_direct,

@@ -40,6 +40,9 @@ pub enum Dtype {
     F8E4M3,
     /// Power-of-two scale: value = 2^(bits - 127).
     F8E8M0,
+    /// A GGML block type (its GGUF type number): a tensor of a GGUF served through an index
+    /// ([`StIndex::from_parts`]), its bytes its blocks as the file holds them.
+    Ggml(u32),
 }
 
 impl Dtype {
@@ -59,10 +62,10 @@ impl Dtype {
         })
     }
 
-    /// Bytes per element.
+    /// Bytes per element (a GGML block type's: 1, its tensors' bytes their own count).
     pub fn size(self) -> usize {
         match self {
-            Self::I8 | Self::U8 | Self::F8E4M3 | Self::F8E8M0 => 1,
+            Self::I8 | Self::U8 | Self::F8E4M3 | Self::F8E8M0 | Self::Ggml(_) => 1,
             Self::F16 | Self::BF16 | Self::I16 => 2,
             Self::F32 | Self::I32 => 4,
             Self::I64 => 8,
@@ -137,6 +140,12 @@ impl StIndex {
             .map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
         }
         Ok(StIndex { shards, tensors, metadata })
+    }
+
+    /// An index of tensors located by the caller (`tensors`' shards indexes into `shards`): another container's, such as
+    /// a GGUF's, served under the names a safetensors loader asks for.
+    pub fn from_parts(shards: Vec<PathBuf>, tensors: Vec<(String, TensorInfo)>, metadata: Vec<(String, String)>) -> Self {
+        StIndex { shards, tensors: tensors.into_iter().collect(), metadata: metadata.into_iter().collect() }
     }
 
     /// A `__metadata__` string value (safetensors allows string pairs only).

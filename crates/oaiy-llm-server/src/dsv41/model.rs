@@ -167,8 +167,14 @@ impl Model {
     /// Load the trunk from `model_dir` (the checkpoint, used in place) and the
     /// Engram precompute from `engram_meta`.
     pub fn load(model_dir: &Path, engram_meta: &Path, opts: &ModelOptions) -> Result<Model> {
-        let cfg = Config::load(model_dir)?;
-        let idx = StIndex::open(model_dir)?;
+        // (a GGUF of the checkpoint: its tensors under the same names, its hyperparameters its metadata's)
+        let (cfg, idx, engram_pad) = match crate::dsv41::gguf_file::backbone(model_dir) {
+            Some(_) => {
+                let opened = crate::dsv41::gguf_file::open(model_dir)?;
+                (opened.config, opened.index, Some(opened.engram_pad))
+            }
+            None => (Config::load(model_dir)?, StIndex::open(model_dir)?, None),
+        };
         if opts.max_seq == 0 || !opts.max_seq.is_multiple_of(2) {
             return Err(Error::Arg("max_seq must be a positive even number".into()));
         }
@@ -204,7 +210,11 @@ impl Model {
             embed: Weight::load(&idx, "embed")?,
             norm: load_vec(&idx, "norm.weight")?,
             head: Weight::load(&idx, "head")?,
-            hasher: NgramHasher::load(engram_meta, &cfg, opts.max_seq)?,
+            // (a GGUF carries its n-gram hashing beside its weights)
+            hasher: match engram_pad {
+                Some(pad) if idx.get("engram.token_map").is_some() => NgramHasher::from_index(&idx, "engram.", pad, &cfg, opts.max_seq)?,
+                _ => NgramHasher::load(engram_meta, &cfg, opts.max_seq)?,
+            },
             layers,
             states,
             shared: Shared::default(),
@@ -874,6 +884,7 @@ pub(crate) fn place_all(named: Vec<(String, &mut Weight)>, place: &mut impl FnMu
                 Weight::Bf16 { w, .. } => w.len() as u64 * 2,
                 Weight::F32 { w, .. } => w.len() as u64 * 4,
                 Weight::Exl3 { data, .. } => data.words.len() as u64 * 4 + (data.suh.len() + data.svh.len()) as u64 * 2,
+                Weight::Ggml { bytes, .. } => bytes.len() as u64,
                 Weight::Device { .. } | Weight::Stacked { .. } => continue,
             };
             if let Some(new) = place(&name, w) {

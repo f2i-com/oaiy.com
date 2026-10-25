@@ -62,6 +62,8 @@ impl Kind {
     pub fn detect(path: &Path) -> Kind {
         if orcasaq_checkpoint(path) { return Kind::OrcaSaq; }
         if flashnext_checkpoint(path) { return Kind::FlashNext; }
+        // (DeepSeek-V4.1 from a GGUF, llama.cpp's `deepseek41`: the DeepSeek engine reads it)
+        if crate::dsv41::gguf_file::backbone(path).is_some() { return Kind::Deepseek; }
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
             return Kind::Gguf;
         }
@@ -1146,7 +1148,9 @@ impl Models {
                         self.say(format!("{}: slots for {slots} EXL3 experts on {} GPU{} (filled while idle, the most used first where a usage profile says)", spec.name, cards.len(), if cards.len() > 1 { "s" } else { "" }));
                     }
                 }
-                let experts = match if exl3 { None } else { crate::engines::dsv41_portable::WgpuExperts::new(b, more) } {
+                // (the fp4 checkpoint's record slots: a GGUF's experts are the CPU's for now)
+                let fp4 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Fp4);
+                let experts = match if !fp4 { None } else { crate::engines::dsv41_portable::WgpuExperts::new(b, more) } {
                     Some(mut k) => {
                         let (n, kept) = (k.slots(), k.tier().0);
                         // The other GPUs it may use (the rest of its devices; every other discrete one where none is
@@ -1168,6 +1172,7 @@ impl Models {
                     }
                     None if exl3 && exl3_kernel.is_some() => "its EXL3 experts in slots on the GPUs, and through scratch slots what they do not hold".into(),
                     None if exl3 => "its EXL3 experts on the CPU".into(),
+                    None if !fp4 => "its GGUF experts on the CPU".into(),
                     None => "no room left there for experts; they run on the CPU".into(),
                 };
                 self.say(format!("{} runs on {}: {count} dense matrices ({:.1} GB) there, {experts}", spec.name, picked.label, bytes as f64 / 1e9));

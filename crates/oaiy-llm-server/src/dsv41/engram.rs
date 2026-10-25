@@ -63,13 +63,20 @@ impl NgramHasher {
     /// Load the precompute written by `oracle.py`.
     pub fn load(meta: &Path, cfg: &Config, max_seq: usize) -> Result<NgramHasher> {
         let m = StIndex::open_file(meta)?;
+        let pad = *m.read_i64("pad_id")?.first().ok_or_else(|| Error::Format("engram_meta: empty pad_id".into()))?;
+        Self::from_index(&m, "", pad, cfg, max_seq)
+    }
+
+    /// The precompute as `m` serves it (`{prefix}token_map`, `{prefix}multipliers`, `{prefix}primes`,
+    /// `{prefix}offsets`), the pad token `pad`: `oracle.py`'s file's, or a GGUF's (which carries it beside the weights).
+    pub fn from_index(m: &StIndex, prefix: &str, pad: i64, cfg: &Config, max_seq: usize) -> Result<NgramHasher> {
         let (n_layers, max_ngram, heads) = (cfg.engram_layer_ids.len(), cfg.engram_max_ngram_size, cfg.engram_n_heads);
         let h = NgramHasher {
-            token_map: m.read_i64("token_map")?,
-            pad: *m.read_i64("pad_id")?.first().ok_or_else(|| Error::Format("engram_meta: empty pad_id".into()))?,
-            multipliers: m.read_i64("multipliers")?,
-            primes: m.read_i64("primes")?,
-            offsets: m.read_i64("offsets")?,
+            token_map: m.read_i64(&format!("{prefix}token_map"))?,
+            pad,
+            multipliers: m.read_i64(&format!("{prefix}multipliers"))?,
+            primes: m.read_i64(&format!("{prefix}primes"))?,
+            offsets: m.read_i64(&format!("{prefix}offsets"))?,
             n_layers,
             max_ngram,
             heads,
@@ -160,19 +167,21 @@ impl NgramHasher {
 /// layer, even when the page cache held every row.
 const READERS: usize = 24;
 
-/// Where one layer's table lies in its shards.
+/// Where one layer's table lies in its shards: fp8 rows and their scales, or (a GGUF's) rows of GGML blocks, `blocks`
+/// their type.
 #[derive(Clone, Copy)]
 struct Layout {
     w_start: u64,
     s_start: u64,
     rows: u64,
     dim: usize,
+    blocks: Option<ggml_quants::GgmlType>,
 }
 
-/// One reader's own handles on a table.
+/// One reader's own handles on a table (a GGUF's has no scales' file).
 struct Reader {
     weight: File,
-    scale: File,
+    scale: Option<File>,
     at: Layout,
 }
 
@@ -181,10 +190,21 @@ impl Reader {
     fn row(&self, r: i64, dst: &mut [f32]) -> Result<()> {
         let at = &self.at;
         let r = u64::try_from(r).ok().filter(|&r| r < at.rows).ok_or_else(|| Error::Format(format!("engram row {r} out of range")))?;
+        if let Some(t) = at.blocks {
+            let each = at.dim / t.block_size() * t.type_size();
+            let mut w = vec![0u8; each];
+            read_exact_at(&self.weight, &mut w, at.w_start + r * each as u64)?;
+            ggml_quants::dequantize(t, &w, dst).map_err(|e| Error::Format(format!("engram row {r}: {e}")))?;
+            for d in dst.iter_mut() {
+                *d = to_bf16(*d);
+            }
+            return Ok(());
+        }
+        let scale = self.scale.as_ref().expect("an fp8 table's scales");
         let mut w = vec![0u8; at.dim];
         let mut s = vec![0u8; at.dim / 32];
         read_exact_at(&self.weight, &mut w, at.w_start + r * at.dim as u64)?;
-        read_exact_at(&self.scale, &mut s, at.s_start + r * (at.dim / 32) as u64)?;
+        read_exact_at(scale, &mut s, at.s_start + r * (at.dim / 32) as u64)?;
         for (j, (d, &q)) in dst.iter_mut().zip(&w).enumerate() {
             *d = to_bf16(fp8_e4m3_to_f32(q) * e8m0_to_f32(s[j / 32]));
         }
@@ -209,14 +229,27 @@ struct Table {
 impl Table {
     fn open(idx: &StIndex, layer: usize, dim: usize) -> Result<Table> {
         let w = idx.info(&format!("layers.{layer}.engram.embed.weight"))?;
-        let s = idx.info(&format!("layers.{layer}.engram.embed.scale"))?;
-        if w.dtype != Dtype::F8E4M3 || s.dtype != Dtype::F8E8M0 || w.shape != [w.shape[0], dim] || s.shape != [w.shape[0], dim / 32] {
-            return Err(Error::Format(format!("layer {layer}: unexpected engram table layout")));
-        }
-        let at = Layout { w_start: w.start, s_start: s.start, rows: w.shape[0] as u64, dim };
+        // (a GGUF's table: rows of GGML blocks, `[rows, dim]`, no scales of their own)
+        let (at, scale_shard) = match w.dtype {
+            Dtype::Ggml(t) => {
+                let t = ggml_quants::GgmlType::from_u32(t).map_err(|e| Error::Format(format!("layer {layer}'s engram table: {e}")))?;
+                if w.shape != [w.shape[0], dim] || dim % t.block_size() != 0 || w.nbytes != (w.shape[0] * (dim / t.block_size() * t.type_size())) as u64 {
+                    return Err(Error::Format(format!("layer {layer}: unexpected engram table layout")));
+                }
+                (Layout { w_start: w.start, s_start: 0, rows: w.shape[0] as u64, dim, blocks: Some(t) }, None)
+            }
+            _ => {
+                let s = idx.info(&format!("layers.{layer}.engram.embed.scale"))?;
+                if w.dtype != Dtype::F8E4M3 || s.dtype != Dtype::F8E8M0 || w.shape != [w.shape[0], dim] || s.shape != [w.shape[0], dim / 32] {
+                    return Err(Error::Format(format!("layer {layer}: unexpected engram table layout")));
+                }
+                (Layout { w_start: w.start, s_start: s.start, rows: w.shape[0] as u64, dim, blocks: None }, Some(s.shard))
+            }
+        };
         let readers = (0..READERS)
             .map(|_| -> Result<mpsc::Sender<Job>> {
-                let reader = Reader { weight: File::open(idx.shard_path(w.shard))?, scale: File::open(idx.shard_path(s.shard))?, at };
+                let scale = scale_shard.map(|s| File::open(idx.shard_path(s))).transpose()?;
+                let reader = Reader { weight: File::open(idx.shard_path(w.shard))?, scale, at };
                 let (tx, rx) = mpsc::channel::<Job>();
                 std::thread::Builder::new().name(format!("engram {layer}")).spawn(move || {
                     for job in rx {

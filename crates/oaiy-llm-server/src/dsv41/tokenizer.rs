@@ -145,9 +145,16 @@ pub fn byte_chars() -> [char; 256] {
 }
 
 impl Tokenizer {
-    /// Load `<model_dir>/tokenizer.json`.
+    /// Load `<model_dir>/tokenizer.json`, or where there is none, the tokenizer of a GGUF of the checkpoint there.
     pub fn load(model_dir: &Path) -> Result<Tokenizer> {
-        Self::parse(&std::fs::read(model_dir.join("tokenizer.json"))?)
+        let json = model_dir.join("tokenizer.json");
+        if !json.exists() {
+            if let Some(first) = crate::dsv41::gguf_file::backbone(model_dir) {
+                let g = gguf::GgufFile::open_streaming(&first).map_err(|e| Error::Format(format!("{}: {e}", first.display())))?;
+                return Self::from_gguf(&g);
+            }
+        }
+        Self::parse(&std::fs::read(json)?)
     }
 
     pub fn parse(src: &[u8]) -> Result<Tokenizer> {
@@ -166,15 +173,9 @@ impl Tokenizer {
             size = size.max(id as usize + 1);
         }
 
-        let chars = byte_chars();
-        let mut byte_id = [0u32; 256];
-        for (b, c) in chars.iter().enumerate() {
-            byte_id[b] = *vocab.get(&c.to_string()).ok_or_else(|| bad("a byte has no token"))?;
-        }
-
         let merges_json = model.get("merges").and_then(Json::as_array).ok_or_else(|| bad("no model.merges"))?;
-        let mut merges = HashMap::with_capacity(merges_json.len());
-        for (rank, m) in merges_json.iter().enumerate() {
+        let mut merges = Vec::with_capacity(merges_json.len());
+        for m in merges_json {
             let (l, r) = match m {
                 Json::Str(s) => s.split_once(' ').ok_or_else(|| bad("merge without a space"))?,
                 Json::Arr(pair) if pair.len() == 2 => (
@@ -183,8 +184,63 @@ impl Tokenizer {
                 ),
                 _ => return Err(bad("bad merge")),
             };
-            let id = |s: &str| vocab.get(s).copied().ok_or_else(|| bad(&format!("merge part {s:?} not in the vocabulary")));
-            let merged = vocab.get(&format!("{l}{r}")).copied().ok_or_else(|| bad("merge result not in the vocabulary"))?;
+            merges.push((l.to_string(), r.to_string()));
+        }
+        let mut added = Vec::new();
+        for a in root.get("added_tokens").and_then(Json::as_array).unwrap_or(&[]) {
+            let content = a.get("content").and_then(Json::as_str).ok_or_else(|| bad("added token without content"))?;
+            let id = a.get("id").and_then(Json::as_i64).and_then(|v| u32::try_from(v).ok()).ok_or_else(|| bad("bad added token id"))?;
+            added.push((content.to_string(), id, a.get("normalized").and_then(Json::as_bool).unwrap_or(true)));
+        }
+        Self::build(vocab, size, &merges, &added).map_err(|e| bad(&e))
+    }
+
+    /// The tokenizer a DeepSeek-V4.1 GGUF carries in its metadata (`tokenizer.ggml.*`: its byte-level BPE vocabulary,
+    /// merges and token types): the one its `tokenizer.json` gives, every control and user-defined token an added
+    /// token matched before normalization (as the checkpoint marks its special tokens).
+    pub fn from_gguf(g: &gguf::GgufFile) -> Result<Tokenizer> {
+        use gguf::{Array, Value};
+        let bad = |m: &str| Error::Format(format!("the GGUF's tokenizer: {m}"));
+        let strings = |key: &str| -> Result<Vec<String>> {
+            match g.get(key) {
+                Ok(Value::Array(Array::String(v))) => Ok(v.clone()),
+                _ => Err(bad(&format!("no {key}"))),
+            }
+        };
+        let tokens = strings("tokenizer.ggml.tokens")?;
+        let types: Vec<i32> = match g.get("tokenizer.ggml.token_type") {
+            Ok(Value::Array(Array::I32(v))) => v.clone(),
+            _ => vec![1; tokens.len()],
+        };
+        let merges: Vec<(String, String)> = strings("tokenizer.ggml.merges")?
+            .into_iter()
+            .map(|m| m.split_once(' ').map(|(l, r)| (l.to_string(), r.to_string())).ok_or_else(|| bad("merge without a space")))
+            .collect::<Result<_>>()?;
+        // (GGUF's token types: 3 control, 4 user-defined: the checkpoint's added tokens)
+        let mut vocab = HashMap::with_capacity(tokens.len());
+        let mut added = Vec::new();
+        for (id, (t, &ty)) in tokens.iter().zip(&types).enumerate() {
+            if matches!(ty, 3 | 4) {
+                added.push((t.clone(), id as u32, false));
+            }
+            vocab.entry(t.clone()).or_insert(id as u32);
+        }
+        Self::build(vocab, tokens.len(), &merges, &added).map_err(|e| bad(&e))
+    }
+
+    /// A tokenizer of `vocab` (byte-level symbol strings by id, `size` ids at least), its `merges` in rank order and its
+    /// `added` tokens (`(content, id, normalized)`).
+    fn build(vocab: HashMap<String, u32>, size: usize, merges_in: &[(String, String)], added: &[(String, u32, bool)]) -> std::result::Result<Tokenizer, String> {
+        let mut size = size;
+        let chars = byte_chars();
+        let mut byte_id = [0u32; 256];
+        for (b, c) in chars.iter().enumerate() {
+            byte_id[b] = *vocab.get(&c.to_string()).ok_or("a byte has no token")?;
+        }
+        let mut merges = HashMap::with_capacity(merges_in.len());
+        for (rank, (l, r)) in merges_in.iter().enumerate() {
+            let id = |s: &str| vocab.get(s).copied().ok_or_else(|| format!("merge part {s:?} not in the vocabulary"));
+            let merged = vocab.get(&format!("{l}{r}")).copied().ok_or("merge result not in the vocabulary")?;
             // the first (lowest-ranked) occurrence of a pair wins
             merges.entry((id(l)?, id(r)?)).or_insert((rank as u32, merged));
         }
@@ -193,13 +249,12 @@ impl Tokenizer {
         let mut normalized_added = Trie::new();
         let mut added_ids = HashMap::new();
         let mut added_bytes = Vec::new();
-        for a in root.get("added_tokens").and_then(Json::as_array).unwrap_or(&[]) {
-            let content = a.get("content").and_then(Json::as_str).ok_or_else(|| bad("added token without content"))?;
-            let id = a.get("id").and_then(Json::as_i64).and_then(|v| u32::try_from(v).ok()).ok_or_else(|| bad("bad added token id"))?;
+        for (content, id, normalized) in added {
+            let id = *id;
             if content.is_empty() {
                 continue;
             }
-            if a.get("normalized").and_then(Json::as_bool).unwrap_or(true) {
+            if *normalized {
                 normalized_added.insert(content, id);
             } else {
                 raw_added.insert(content, id);

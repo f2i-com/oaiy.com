@@ -663,6 +663,21 @@ impl Moe {
             return Ok((y, routes));
         }
         let outs: Vec<(Vec<usize>, Vec<f32>)> = match (&experts.pool, t) {
+            // A GGUF checkpoint's decode step: every expert read (RAM, else the drive), then all of them on the host's
+            // cores at once through their blocks' decoders (the pool's workers run the fp4 kernels alone).
+            (_, 1) if matches!(experts.format, crate::dsv41::expert::ExpertFormat::Gguf { .. }) => {
+                let crate::dsv41::expert::ExpertFormat::Gguf { layers, .. } = &experts.format else { unreachable!("matched as GGUF") };
+                let r = &routes[0];
+                let weights: Vec<f32> = used.iter().map(|e| r.weights[r.experts.iter().position(|x| x == e).expect("a used expert is routed")]).collect();
+                let reading = std::time::Instant::now();
+                let leases = read_all(&used, &|e| experts.cache.probe(self.layer, e), &acquire)?;
+                crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertRead, reading);
+                let computing = std::time::Instant::now();
+                let records: Vec<&[u8]> = leases.iter().map(|l| &l[..]).collect();
+                let outs = crate::dsv41::gguf_experts::forward_step(&records, &layers[self.layer as usize], x, &weights, cfg.swiglu_limit)?;
+                crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertCpu, computing);
+                outs.into_iter().map(|out| (vec![0], out)).collect()
+            }
             // A decode step: the token's experts the GPU keeps computed there, while the rest are read and computed at
             // once on the CPU's workers; then the GPU may take in what was read.
             (Some(pool), 1) => {
@@ -871,6 +886,17 @@ impl Moe {
                     #[cfg(feature = "webgpu")]
                     if let crate::dsv41::expert::ExpertFormat::Exl3 { layers, .. } = &experts.format {
                         let out = crate::dsv41::exl3_experts::forward_rows(&record, &layers[self.layer as usize], x, Some(w), cfg.swiglu_limit).unwrap_or_else(|e| {
+                            state.lock().unwrap_or_else(|p| p.into_inner()).failed.get_or_insert(e);
+                            Vec::new()
+                        });
+                        if out_tx.send((j, out)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    // (a GGUF checkpoint's through its blocks' decoders, a refused record failing the pass alike)
+                    if let crate::dsv41::expert::ExpertFormat::Gguf { layers, .. } = &experts.format {
+                        let out = crate::dsv41::gguf_experts::forward_rows(&record, &layers[self.layer as usize], x, Some(w), cfg.swiglu_limit).unwrap_or_else(|e| {
                             state.lock().unwrap_or_else(|p| p.into_inner()).failed.get_or_insert(e);
                             Vec::new()
                         });

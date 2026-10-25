@@ -380,7 +380,15 @@ fn upload_once(rec: &mut crate::chain::Recorder<'_>, b: &WgpuBackend, uploaded: 
 fn chain_shape(b: &WgpuBackend, m: &ChainMat<'_>) -> Option<(usize, usize)> {
     match m {
         ChainMat::Exl3(l) => {
-            let g = l.as_any()?.downcast_ref::<Exl3Gpu>()?;
+            let any = l.as_any()?;
+            // (a GGUF's matrix, its blocks or its floats as f16, which a recorder's `exl3_rows_of` multiplies too)
+            if let Some(q) = any.downcast_ref::<crate::quant::linear::QuantLinear>() {
+                return q.is_on(&b.gpu).then(|| q.kn());
+            }
+            if let Some(h) = any.downcast_ref::<crate::quant::linear::HalfLinear>() {
+                return h.is_on(&b.gpu).then(|| h.kn());
+            }
+            let g = any.downcast_ref::<Exl3Gpu>()?;
             (g.is_on(&b.gpu) && g.single_chunk().is_some()).then(|| g.kn())
         }
         ChainMat::F16 { n, k, .. } | ChainMat::Bf16 { n, k, .. } | ChainMat::F32 { n, k, .. } => Some((*k, *n)),

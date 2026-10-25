@@ -204,6 +204,98 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The hyperparameters a DeepSeek-V4.1 GGUF's metadata gives (`deepseek41.*`, as llama.cpp names them), `vocab_size`
+    /// its tokenizer's, checked as `config.json`'s are. A GGUF carries no vision tower and no drafter.
+    pub fn from_gguf(g: &gguf::GgufFile, vocab_size: usize) -> Result<Config> {
+        use gguf::{Array, Value};
+        let bad = |m: String| Error::Format(format!("the GGUF's metadata: {m}"));
+        let key = |k: &str| format!("deepseek41.{k}");
+        let int = |k: &str| -> Result<usize> { g.get_u64(&key(k)).map(|v| v as usize).map_err(|e| bad(format!("{k}: {e}"))) };
+        let num = |k: &str| -> Result<f32> { g.get_f32(&key(k)).map_err(|e| bad(format!("{k}: {e}"))) };
+        let list = |k: &str| -> Result<Vec<usize>> {
+            let ints = |v: Vec<i64>| v.into_iter().map(|x| usize::try_from(x).map_err(|_| bad(format!("{k}: a negative count")))).collect::<Result<Vec<_>>>();
+            match g.get(&key(k)) {
+                Ok(Value::Array(Array::U32(v))) => Ok(v.iter().map(|&x| x as usize).collect()),
+                Ok(Value::Array(Array::I32(v))) => ints(v.iter().map(|&x| x as i64).collect()),
+                Ok(Value::Array(Array::U64(v))) => Ok(v.iter().map(|&x| x as usize).collect()),
+                Ok(Value::Array(Array::I64(v))) => ints(v.clone()),
+                _ => Err(bad(format!("{k} is not a list of counts"))),
+            }
+        };
+        let floats = |k: &str| -> Result<Vec<f32>> {
+            match g.get(&key(k)) {
+                Ok(Value::Array(Array::F32(v))) => Ok(v.clone()),
+                _ => Err(bad(format!("{k} is not a list of numbers"))),
+            }
+        };
+        // numerics the forward pass implements, and nothing else
+        if g.get_str(&key("expert_scoring_func")).ok() != Some("sqrtsoftplus") {
+            return Err(Error::Unsupported("the GGUF's experts are scored other than by sqrtsoftplus".into()));
+        }
+        if !g.get_bool(&key("expert_weights_norm")).unwrap_or(false) {
+            return Err(Error::Unsupported("the GGUF's experts' weights are not normalized".into()));
+        }
+        // (one SwiGLU limit, every layer's, routed and shared alike)
+        let limits: Vec<f32> = floats("swiglu_clamp_exp")?.into_iter().chain(floats("swiglu_clamp_shexp")?).collect();
+        let swiglu_limit = limits.first().copied().ok_or_else(|| bad("no SwiGLU limit".into()))?;
+        if limits.iter().any(|&l| l != swiglu_limit) {
+            return Err(Error::Unsupported("the GGUF's layers clamp their SwiGLUs at different limits".into()));
+        }
+        let candidate = g.get_u64(&key("attention.candidate_source_layer_id")).ok().map(|v| v as usize);
+        let token = |k: &str, dflt: u32| g.get_u64(&format!("tokenizer.ggml.{k}")).map_or(dflt, |v| v as u32);
+        let cfg = Config {
+            vocab_size,
+            dim: int("embedding_length")?,
+            moe_inter_dim: int("expert_feed_forward_length")?,
+            n_layers: int("block_count")?,
+            n_heads: int("attention.head_count")?,
+            head_dim: int("attention.key_length")?,
+            rope_head_dim: int("rope.dimension_count")?,
+            q_lora_rank: int("attention.q_lora_rank")?,
+            o_lora_rank: int("attention.output_lora_rank")?,
+            o_groups: int("attention.output_group_count")?,
+            norm_eps: num("attention.layer_norm_rms_epsilon")?,
+            swiglu_limit,
+            rope_theta: num("rope.freq_base")?,
+            compress_rope_theta: num("attention.compress_rope_freq_base")?,
+            rope_factor: num("rope.scaling.factor")?,
+            beta_fast: num("rope.scaling.yarn_beta_fast")?,
+            beta_slow: num("rope.scaling.yarn_beta_slow")?,
+            original_seq_len: int("rope.scaling.original_context_length")?,
+            n_routed_experts: int("expert_count")?,
+            n_activated_experts: int("expert_used_count")?,
+            route_scale: num("expert_weights_scale")?,
+            window_size: int("attention.sliding_window")?,
+            compress_ratios: list("attention.compress_ratios")?,
+            kv_source_layers: list("kv_source_layer_ids")?,
+            index_source_layers: list("index_source_layer_ids")?,
+            index_n_heads: int("attention.indexer.head_count")?,
+            index_head_dim: int("attention.indexer.key_length")?,
+            index_topk: int("attention.indexer.top_k")?,
+            candidate_source_layer: candidate,
+            candidate_topk_blocks: int("attention.candidate_topk_blocks")?,
+            candidate_block_size: int("attention.candidate_block_size")?,
+            hc_mult: int("hyper_connection.count")?,
+            hc_sinkhorn_iters: int("hyper_connection.sinkhorn_iterations")?,
+            hc_eps: num("hyper_connection.epsilon")?,
+            engram_layer_ids: list("engram.layer_ids")?,
+            engram_num_embeddings: list("engram.num_embeddings")?,
+            engram_max_ngram_size: int("engram_max_ngram_size")?,
+            engram_n_heads: int("engram_n_heads")?,
+            engram_head_dim: int("engram_head_dim")?,
+            bos_token_id: token("bos_token_id", 0),
+            eos_token_id: token("eos_token_id", 1),
+            image_token_id: 129264,
+            vision: None,
+            dspark: None,
+        };
+        if int("attention.head_count_kv")? != 1 || int("attention.value_length")? != cfg.head_dim || int("expert_shared_count")? != 1 {
+            return Err(Error::Unsupported("the GGUF's attention or shared experts are not DeepSeek-V4.1's".into()));
+        }
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     fn validate(&self) -> Result<()> {
         let bad = |m: String| Err(Error::Format(format!("config.json: {m}")));
         if !d_ok(self.norm_eps) || !d_ok(self.rope_factor) || !d_ok(self.beta_fast) || !d_ok(self.beta_slow) {

@@ -430,6 +430,29 @@ pub enum Weight {
     /// device as well (a [`Weight::Device`]), where it takes them so: a step's row through every part in one pass
     /// ([`Step::MulGroup`]), where each part's was a pass of its own.
     Stacked { parts: Vec<Weight>, rows: usize, k: usize, group: Option<Box<Weight>> },
+    /// A GGUF's matrix as its blocks lie (`[n, k]`, row after row, a row a whole number of `dtype`'s blocks): a
+    /// projection a GPU takes ([`crate::dsv41::model::Model::offload`]) as a quantized matrix of its own; here each row
+    /// decoded as it is asked for (the embedding's rows; a weight no device holds, at a reference's speed).
+    Ggml { dtype: ggml_quants::GgmlType, bytes: Arc<Vec<u8>>, n: usize, k: usize },
+}
+
+impl Weight {
+    /// A GGUF matrix's bytes a row.
+    fn ggml_row_bytes(dtype: ggml_quants::GgmlType, k: usize) -> usize {
+        k / dtype.block_size() * dtype.type_size()
+    }
+
+    /// `{name}` of a GGUF's (`[rows.., k]` its last dimension `k`) as GGML blocks, checked: `(dtype, bytes, rows, k)`.
+    fn load_ggml(idx: &StIndex, name: &str, t: u32) -> Result<(ggml_quants::GgmlType, Vec<u8>, usize, usize)> {
+        let info = idx.info(name)?;
+        let dtype = ggml_quants::GgmlType::from_u32(t).map_err(|e| Error::Format(format!("{name}: {e}")))?;
+        let k = *info.shape.last().ok_or_else(|| Error::Format(format!("{name}: no dimensions")))?;
+        let rows: usize = info.shape[..info.shape.len() - 1].iter().product();
+        if k % dtype.block_size() != 0 || info.nbytes as usize != rows * Self::ggml_row_bytes(dtype, k) {
+            return Err(Error::Format(format!("{name}: {dtype:?} of {:?} in {} bytes", info.shape, info.nbytes)));
+        }
+        Ok((dtype, idx.read_par(name)?, rows, k))
+    }
 }
 
 /// A copy of `d` (the type has no `Clone`): the host's decoder takes its own, as a GPU's upload does.
@@ -495,6 +518,10 @@ impl Weight {
         let [n, k] = info.shape[..] else {
             return Err(Error::Format(format!("{name}: expected 2-D, got {:?}", info.shape)));
         };
+        if let Dtype::Ggml(t) = info.dtype {
+            let (dtype, bytes, n, k) = Self::load_ggml(idx, &name, t)?;
+            return Ok(Weight::Ggml { dtype, bytes: Arc::new(bytes), n, k });
+        }
         Ok(match info.dtype {
             Dtype::F8E4M3 => {
                 let s = idx.read(&format!("{prefix}.scale"))?;
@@ -553,19 +580,31 @@ impl Weight {
             }
             return Ok(Weight::Stacked { parts, rows, k, group: None });
         }
+        // (a GGUF's: the groups one tensor, `[groups, rows, k]`, a group's rows after another's)
+        if let Some(Dtype::Ggml(t)) = idx.get(&format!("{prefix}.weight")).map(|i| i.dtype) {
+            let name = format!("{prefix}.weight");
+            let (dtype, bytes, all, k) = Self::load_ggml(idx, &name, t)?;
+            if all % groups != 0 {
+                return Err(Error::Format(format!("{name}: {all} rows in {groups} groups")));
+            }
+            let rows = all / groups;
+            let each = rows * Self::ggml_row_bytes(dtype, k);
+            let parts = bytes.chunks_exact(each).map(|b| Weight::Ggml { dtype, bytes: Arc::new(b.to_vec()), n: rows, k }).collect();
+            return Ok(Weight::Stacked { parts, rows, k, group: None });
+        }
         Self::load_fp8_as_bf16(idx, prefix)
     }
 
     pub fn n(&self) -> usize {
         match self {
-            Weight::Fp8 { n, .. } | Weight::Bf16 { n, .. } | Weight::F32 { n, .. } | Weight::Device { n, .. } | Weight::Exl3 { n, .. } => *n,
+            Weight::Fp8 { n, .. } | Weight::Bf16 { n, .. } | Weight::F32 { n, .. } | Weight::Device { n, .. } | Weight::Exl3 { n, .. } | Weight::Ggml { n, .. } => *n,
             Weight::Stacked { parts, rows, .. } => parts.len() * rows,
         }
     }
 
     pub fn k(&self) -> usize {
         match self {
-            Weight::Fp8 { k, .. } | Weight::Bf16 { k, .. } | Weight::F32 { k, .. } | Weight::Device { k, .. } | Weight::Exl3 { k, .. } | Weight::Stacked { k, .. } => *k,
+            Weight::Fp8 { k, .. } | Weight::Bf16 { k, .. } | Weight::F32 { k, .. } | Weight::Device { k, .. } | Weight::Exl3 { k, .. } | Weight::Stacked { k, .. } | Weight::Ggml { k, .. } => *k,
         }
     }
 
@@ -588,6 +627,10 @@ impl Weight {
                 }
             }
             Weight::F32 { w, k, .. } => dst.copy_from_slice(&w[r * k..(r + 1) * k]),
+            Weight::Ggml { dtype, bytes, k, .. } => {
+                let each = Self::ggml_row_bytes(*dtype, *k);
+                ggml_quants::dequantize(*dtype, &bytes[r * each..(r + 1) * each], &mut dst[..*k]).expect("a GGUF matrix's rows are whole blocks, checked when read");
+            }
             Weight::Device { .. } => panic!("a weight on a device has no host rows (the embedding is never offloaded)"),
             Weight::Exl3 { .. } | Weight::Stacked { .. } => panic!("an EXL3 weight has no host rows (the embedding is stored bf16)"),
         }

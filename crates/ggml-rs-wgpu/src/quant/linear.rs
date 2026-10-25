@@ -24,6 +24,10 @@ impl QuantLinear {
     pub(crate) fn kn(&self) -> (usize, usize) {
         (self.shape[1], self.shape[0])
     }
+
+    pub(crate) fn is_on(&self, gpu: &Arc<crate::Gpu>) -> bool {
+        Arc::ptr_eq(&self.backend.gpu, gpu)
+    }
 }
 
 impl PackedLinear for QuantLinear {

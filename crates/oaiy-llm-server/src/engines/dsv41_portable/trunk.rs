@@ -223,7 +223,8 @@ impl WgpuChained {
 /// chained recordings, so every call of its trunk is one round trip whatever kinds it holds; every fp8 checkpoint's
 /// matrices go to the dense kernels.
 pub(crate) fn offload(model: &mut crate::dsv41::model::Model, gpu: &WgpuBackend) -> (usize, u64) {
-    let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
+    // (an EXL3 or a GGUF checkpoint: every matrix a chained recording's)
+    let exl3 = !matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Fp4);
     model.offload(placer(gpu, exl3))
 }
 
@@ -232,7 +233,8 @@ pub(crate) fn offload(model: &mut crate::dsv41::model::Model, gpu: &WgpuBackend)
 /// step's work its own (where the second card held experts alone, its share of a step was a few calls a layer, and
 /// it spent the step in a low power state, its memory clocked at a seventeenth of its rate).
 pub(crate) fn offload_split(model: &mut crate::dsv41::model::Model, cards: &[Arc<WgpuBackend>], home: &[usize]) -> (usize, u64) {
-    let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
+    // (an EXL3 or a GGUF checkpoint: every matrix a chained recording's)
+    let exl3 = !matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Fp4);
     let mut placers: Vec<_> = cards.iter().map(|c| placer(c, exl3)).collect();
     model.offload(|name, w| {
         let layer = name.strip_prefix("layers.").and_then(|r| r.split('.').next()).and_then(|l| l.parse::<usize>().ok());
@@ -262,6 +264,12 @@ pub(super) fn placer(gpu: &WgpuBackend, exl3: bool) -> impl FnMut(&str, &Weight)
         }
         if let Weight::Exl3 { data, n, k, .. } = w {
             let lin = gpu.exl3(crate::dsv41::linear::exl3_copy(data)).ok()?;
+            return Some(Weight::Device { kernel: Arc::new(WgpuChained { mat: Mat::Exl3(lin), n: *n, k: *k, b: gpu.clone() }), n: *n, k: *k, fp8: false });
+        }
+        // (a GGUF's matrix: its blocks as a quantized matrix there, which a chained recording multiplies as it does an
+        // EXL3 projection; a type with no kernel there as f16)
+        if let Weight::Ggml { dtype, bytes, n, k } = w {
+            let lin = gpu.quant_linear(ggml_rs::QuantizedTensor::from_bytes_cpu(bytes.to_vec(), vec![*n, *k], *dtype)).ok()?;
             return Some(Weight::Device { kernel: Arc::new(WgpuChained { mat: Mat::Exl3(lin), n: *n, k: *k, b: gpu.clone() }), n: *n, k: *k, fp8: false });
         }
         if let (true, Weight::Bf16 { w, n, k }) = (exl3, &*w) {

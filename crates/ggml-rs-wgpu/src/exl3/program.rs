@@ -495,7 +495,8 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
     let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().cloned();
     let host = |v: &[f32]| (v.as_ptr() as usize, v.len(), [0, v.len() / 2, v.len().saturating_sub(1)].map(|i| v.get(i).map_or(0, |x| x.to_bits())));
     let mat = |m: &ChainMat<'_>, h: &mut std::collections::hash_map::DefaultHasher| match m {
-        ChainMat::Exl3(l) => (0u8, l.as_any().and_then(|a| a.downcast_ref::<Exl3Gpu>()).and_then(|g| g.single_chunk()).map(|(w, _)| w.clone())).hash(h),
+        // (another packed matrix, a GGUF's, by where it lives: a model's matrices live as long as it)
+        ChainMat::Exl3(l) => (0u8, l.as_any().and_then(|a| a.downcast_ref::<Exl3Gpu>()).and_then(|g| g.single_chunk()).map(|(w, _)| w.clone()), *l as *const dyn ggml_rs::exl3::PackedLinear as *const () as usize).hash(h),
         ChainMat::F16 { w, n, k } | ChainMat::Bf16 { w, n, k } | ChainMat::F32 { w, n, k } => (1u8, buf(w), *n, *k).hash(h),
     };
     for (step, &len) in steps.iter().zip(lens) {

@@ -1056,6 +1056,24 @@ setting for the second); measured again, unpinned then pinned in one session, th
 set fell to 115 GiB unpinned and 102 pinned (Windows did not hold the minimum), the replies 16.7,
 10.9, 15.7, 11.6 tok/s unpinned and 15.7, 11.0, 15.2, 10.3 pinned. It stays off unless asked for.
 
+## GGUF checkpoints (2026-10-25)
+
+A GGUF of llama.cpp's `deepseek41` layout loads as the checkpoint does (`dsv41::gguf_file`): its
+shards, and the Engram tables' own GGUF (`deepseek41-engram`) beside them, served under the
+checkpoint's names. The tokenizer, the configuration and the Engram's n-gram hashing (its token map,
+primes, offsets and multipliers) come from the GGUF's own metadata and tensors, so no
+`tokenizer.json` or `engram_meta.safetensors` is needed. Checked against a checkpoint of the same
+model (`a_ggufs_tokenizer_is_the_checkpoints`, given both): every token id and its bytes, the
+configuration, and the hashing tables the same; its float tensors the checkpoint's to the bit.
+
+The dense matrices go on the card through the quantized matmul (`QuantLinear`: Q8_0, Q5_K, Q6_K,
+and the float ones as f16), in the same device programs as an EXL3 checkpoint's trunk. The routed
+experts are records of each layer's three tensors' blocks (a layer's types its own: 1-bit beside
+2-bit grid types), read into the RAM tier as any checkpoint's, and made on the host's cores
+(`dsv41::gguf_experts`: each row decoded by `ggml_quants` and multiplied in f32): a decode step's
+experts together, every one's rows over the cores; a prompt's one an expert to a worker. A reference's
+speed: the four asks answered sensibly at 1.5 tok/s, the experts some 500 ms of each token.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.
