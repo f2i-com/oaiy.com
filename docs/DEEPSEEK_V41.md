@@ -1050,6 +1050,12 @@ as fast either way). With the cores taken (four of them for the experts, `OAIY_S
 went from 5.7 to 6.6 tok/s and a new subject from 4.5 to 5.8, every reply the same text.
 `OAIY_DSV41_HYBRID=0` keeps them all on the cores.
 
+Keeping the RAM tier resident (`--pin-ram`, `OAIY_PIN_RAM=1`: a hard minimum working set) measured
+no gain. The figures its commit gives compared two pinned runs (the bench kept the first run's
+setting for the second); measured again, unpinned then pinned in one session, the server's working
+set fell to 115 GiB unpinned and 102 pinned (Windows did not hold the minimum), the replies 16.7,
+10.9, 15.7, 11.6 tok/s unpinned and 15.7, 11.0, 15.2, 10.3 pinned. It stays off unless asked for.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.
