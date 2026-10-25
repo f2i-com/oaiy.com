@@ -1138,6 +1138,26 @@ every time). Second rounds, one pair on a quiet machine:
 
 (`OAIY_DSV41_GGUF_GROUP=0`: each part its own matmul.)
 
+A GGUF trunk's programs are replayed now, as an EXL3 checkpoint's are: the int8 rows its quantized
+matmuls read were the recording pool's scratch, a new buffer each run, and a recording that takes
+scratch is none a run can replay, so every program was recorded again at every step (some 165 us of
+the host's work each, 140 now). What is left of it is the encoding: a replayed part of some 20
+dispatches takes 90 us to encode and submit, some 4.5 us a dispatch (a hundred copies of three
+bindings each, 0.6), wgpu tracking every one of a dispatch's nine bound buffers; some 118
+recordings a token, 9 ms of it.
+
+A pass's misses are shared between the cards by each card's best rate of late (the best seen, let go
+of slowly), where it was by their rates of late: the second card, waking from a low power state, put
+a few records in at a sixth of its rate, its rate of late fell below the first card's, every miss
+went to the first after that (895 puts there to 135, 869 to 70) and none raised the second's rate
+again; those two replies came at 24.0 and 24.6 tok/s where 27.5 to 29.3 by the best rates
+(`OAIY_DSV41_SPLIT_BY_PEAK=0`: as before). Second rounds, two runs: 27.5 and 27.6, 20.1 and 19.8,
+29.3 and 28.4, 20.4 and 19.5 tok/s.
+
+Tried and left out: a thread taking two or four output rows of a step's expert matmul (x loaded once
+for them) was no faster; a mapped write polling for its buffer rather than waiting for the device's
+work whole measured the same.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

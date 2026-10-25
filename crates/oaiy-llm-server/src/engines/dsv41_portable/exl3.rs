@@ -258,6 +258,9 @@ pub(crate) struct WgpuExl3Experts {
     calls: AtomicU64,
     /// Each card's rate of putting records into its scratch slots, as measured (bytes a microsecond, f64 bits).
     rates: Vec<AtomicU64>,
+    /// Each card's best such rate of late (f64 bits: the best seen, let go of slowly): what a pass's misses are shared
+    /// by ([`ExpertsKernel::forward`]).
+    peaks: Vec<AtomicU64>,
     /// What a step's experts the cards do not hold have taken of late (us, f64 bits): an expert made on the host's
     /// cores, and a scratch call after its records' puts (the card's taking the writes in among it): how
     /// [`ExpertsKernel::forward_here`] shares a layer's between the two.
@@ -444,7 +447,8 @@ impl WgpuExl3Experts {
         let placed = RwLock::new(Placement { at: HashMap::new(), keys, free });
         let uses = (0..layouts.len() * per_layer).map(|_| AtomicU32::new(0)).collect();
         let rates = cards.iter().map(|_| AtomicU64::new(RATE_GUESS.to_bits())).collect();
-        Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, host_us: AtomicU64::new(HOST_US_GUESS.to_bits()), call_us: AtomicU64::new(CALL_US_GUESS.to_bits()), cursor: Mutex::new(0), counts: Counts::default(),
+        let peaks = cards.iter().map(|_| AtomicU64::new(RATE_GUESS.to_bits())).collect();
+        Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, peaks, host_us: AtomicU64::new(HOST_US_GUESS.to_bits()), call_us: AtomicU64::new(CALL_US_GUESS.to_bits()), cursor: Mutex::new(0), counts: Counts::default(),
             kept: Mutex::new(Vec::new()),
             evicted: Mutex::new(Vec::new()),
             promoter: Mutex::new(None),
@@ -782,6 +786,17 @@ impl WgpuExl3Experts {
         f64::from_bits(self.rates[card].load(Ordering::Relaxed))
     }
 
+    /// `card`'s best rate of late ([`Self::peaks`]): a few slow puts (a card waking from a low power state took them in
+    /// at a sixth of its rate) do not send every miss to the other cards after them, where its rate then stayed low,
+    /// none put there to raise it (OAIY_DSV41_SPLIT_BY_PEAK=0: shared by the rates of late, as before).
+    fn share_rate(&self, card: usize) -> f64 {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("OAIY_DSV41_SPLIT_BY_PEAK").as_deref() == Ok("0")) {
+            return self.rate(card);
+        }
+        f64::from_bits(self.peaks[card].load(Ordering::Relaxed))
+    }
+
     /// How many of `layer`'s `misses` (experts no card holds) a step sends through the cards' scratch slots while the
     /// host's cores make the rest: the share whose cards' time (a call, and each record's put at the fastest card's
     /// rate) and the host's (each expert's) end soonest, the fewer to the cards where two end alike, and one at least
@@ -833,6 +848,9 @@ impl WgpuExl3Experts {
                 // (the card's rate, a fifth from this put)
                 let seen = (puts.len() * layout.bytes()) as f64 / took.max(1.0);
                 self.rates[pool.card].store((self.rate(pool.card) * 0.8 + seen * 0.2).to_bits(), Ordering::Relaxed);
+                // (its best of late: the best seen, a 200th let go of at each put)
+                let peak = f64::from_bits(self.peaks[pool.card].load(Ordering::Relaxed));
+                self.peaks[pool.card].store((peak * 0.995).max(seen).to_bits(), Ordering::Relaxed);
             }
             if let Some([.., reused]) = self.counts.puts.get(pool.card) {
                 reused.fetch_add((group.len() - puts.len()) as u64, Ordering::Relaxed);
@@ -891,7 +909,7 @@ impl ExpertsKernel for WgpuExl3Experts {
             }
             let k = (0..scratch.len())
                 .min_by(|&a, &b| {
-                    let done = |k: usize| (load[k] + layout.bytes() as f64) / self.rate(self.pools[scratch[k]].card);
+                    let done = |k: usize| (load[k] + layout.bytes() as f64) / self.share_rate(self.pools[scratch[k]].card);
                     done(a).total_cmp(&done(b))
                 })
                 .expect("a scratch pool");

@@ -494,7 +494,7 @@ impl Engine {
             );
             // (OAIY_CHAIN_PROFILE: the chained recordings' kernels on the GPU, the most first; OAIY_PIECE_STAMPS: their
             // pieces' busy time against their span)
-            let kernels: Vec<String> = ggml_rs_wgpu::profile::take_kernels().into_iter().take(12).map(|(name, ms, n)| format!("{name} {ms:.0} ms ({n})")).collect();
+            let kernels: Vec<String> = ggml_rs_wgpu::profile::take_kernels().into_iter().take(40).map(|(name, ms, n)| format!("{name} {ms:.0} ms ({n})")).collect();
             if !kernels.is_empty() {
                 eprintln!("    {label}'s kernels: {}", kernels.join(", "));
             }

@@ -555,7 +555,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// not show in this kernel's time: a Flash-Next layer's twenty IQ2_S matrices for a step's row take 18 us whether a
 /// group is seven loads (bytes off words' edges, a grid entry two words) or six with less arithmetic, as now. A lane
 /// taking 32 weights at a turn (their fields read once, their four groups written out one after another) was slower
-/// for every count of lanes tried, 25 us and a check's four rows 86 where 45: the loop's body four times as long.
+/// for every count of lanes tried, 25 us and a check's four rows 86 where 45: the loop's body four times as long. A
+/// thread taking two or four output rows of a step's one row, x loaded once for them, was no faster either:
+/// DeepSeek-V4.1's six experts' gate and up (5120 to 2304, IQ1_M) 46 and 51 us a pass where 45.
 fn few_source_grid(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
     let ids = each(&|i| job_ids(i, rows, skip));

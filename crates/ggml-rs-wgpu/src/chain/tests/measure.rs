@@ -715,6 +715,39 @@ fn measure_dispatch_overhead() {
     }
 }
 
+/// What a replayed recording costs the host before its submission is in the queue (`--ignored --nocapture`): 100
+/// dispatches (copies of 256 values, each into a vector of its own, their bind groups kept), recorded once and
+/// replayed, each run's encoding and submit timed apart from its wait.
+#[test]
+#[ignore = "a measurement"]
+fn measure_a_replays_encoding() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let x = b.vec(256);
+    let many: Vec<DeviceVec> = (0..100).map(|_| b.vec(256)).collect();
+    let mut first = crate::chain::Recorder::new(&b);
+    first.keep_groups(true);
+    for v in &many {
+        first.copy(&x, 0, v, 0, 256);
+    }
+    let recipe = first.recipe().expect("a recording of dispatches alone");
+    Box::new(first).launch().wait();
+    let (mut launching, mut waiting) = (0.0, 0.0);
+    let runs = 200;
+    for _ in 0..runs {
+        let mut rec = crate::chain::Recorder::new(&b);
+        rec.keep_groups(true);
+        rec.replay(recipe.clone());
+        rec.read_range(&many[99], 0, 1);
+        let t = std::time::Instant::now();
+        let launched = Box::new(rec).launch();
+        launching += t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        launched.wait();
+        waiting += t.elapsed().as_secs_f64();
+    }
+    eprintln!("100 dispatches replayed: encoded and submitted in {:.0} us ({:.2} us a dispatch), waited for {:.0} us", launching / runs as f64 * 1e6, launching / runs as f64 * 1e4, waiting / runs as f64 * 1e6);
+}
+
 /// What a matmul's loop reaches on the tensor cores with both its tiles in the workgroup's memory (`--ignored
 /// --nocapture`): a workgroup's tile of rows by tokens, its subgroups' shares of it, the k step, each step's
 /// fragments loaded from the tiles (filled once) and multiplied, a barrier a step; 2 workgroups an SM of 170.

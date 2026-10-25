@@ -106,7 +106,8 @@ impl Recorder<'_> {
         if let Some((.., xq)) = self.q8.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
             return (xq.clone(), xs_at);
         }
-        let xq = self.scratch(len);
+        // (a kept recording's own buffer for them, the same every run, so the recording is replayed; else scratch)
+        let xq = if self.keeps() { DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&xb, m, k, (len * 4) as u64)) } } else { self.scratch(len) };
         let blocks = (m * k / 32) as u32;
         // (a device whose subgroups are 32 lanes: 8 lanes a block, [`crate::quant::shaders::QUANT_Q8_LANES`])
         let (quant, groups) = if self.gpu().subgroups32() {

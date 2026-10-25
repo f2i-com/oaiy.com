@@ -513,6 +513,28 @@ impl Gpu {
 
     /// A named kernel of eight buffers ([`Gpu::wide_layout`]).
     /// A scratch buffer of `bytes` (a power of two) from the pool, or a new one.
+    /// The kept int8 rows (`bytes` long) of `m` rows of `k` of the vector in `x` ([`Gpu::q8_kept`]), made at the first
+    /// ask: a kept recording's quantized rows the same buffer every run, as its own vectors are (a pooled one each run
+    /// made its recording one no run could replay: a GGUF's trunk recorded every program again, some 100 us of the
+    /// host's a call).
+    pub(crate) fn q8_kept(&self, x: &wgpu::Buffer, m: usize, k: usize, bytes: u64) -> wgpu::Buffer {
+        let mut kept = self.q8_kept.lock().unwrap_or_else(|p| p.into_inner());
+        // (a vector the device let go of keeps its rows here until then: some few thousand at most, started over)
+        if kept.len() >= 4096 {
+            kept.clear();
+        }
+        kept.entry((x.clone(), m, k))
+            .or_insert_with(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("oaiy-q8-kept"),
+                    size: bytes.next_power_of_two().max(256),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            })
+            .clone()
+    }
+
     pub(crate) fn pooled(&self, bytes: u64) -> wgpu::Buffer {
         let taken = {
             let mut pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
