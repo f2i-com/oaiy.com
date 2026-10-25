@@ -1706,8 +1706,9 @@ export class ChatPane {
         break;
       case 'prompt':
         this.promptView(e);
-        // The model is asked: the agent is at work from here, before its first words (a local model can take a while).
-        this.setStatus('thinking…');
+        // The model is asked: the agent is at work from here, before its first words (a local model can take a while:
+        // OAIY's engine then says how far it has read the prompt, and its thoughts show as they come).
+        this.setStatus('asking the model…');
         break;
       case 'tool_draft':
         this.doneThinking();

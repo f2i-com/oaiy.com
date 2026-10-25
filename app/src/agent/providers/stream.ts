@@ -32,6 +32,8 @@ export interface StreamSink {
   toolArgs(index: number, delta: string): void;
   /** OAIY: the tool call as the model writes it, raw (`start` begins a new one). */
   draft?(text: string, start: boolean): void;
+  /** OAIY: how far the model has read the prompt (`done` of `total` tokens), `reused` read on from what it kept. */
+  reading?(done: number, total: number, reused: number | null): void;
 }
 
 function parseEvent(event: SSEEvent): Record<string, unknown> | null {
@@ -204,6 +206,11 @@ export class OpenAIStream {
     if (isRecord(payload.oaiy_tool_preview)) {
       const p = payload.oaiy_tool_preview;
       if (typeof p.text === 'string' && p.text) this.sink?.draft?.(p.text, p.start === true);
+    }
+    // OAIY says how far it has read the prompt (a local model's first words can be a minute away).
+    if (isRecord(payload.oaiy_progress)) {
+      const p = payload.oaiy_progress;
+      if (typeof p.prompt_done === 'number' && typeof p.prompt_total === 'number') this.sink?.reading?.(p.prompt_done, p.prompt_total, typeof p.cached_tokens === 'number' ? p.cached_tokens : null);
     }
     // The usage chunk (stream_options.include_usage) has an empty choices list.
     if (isRecord(payload.usage)) this.usage = payload.usage;

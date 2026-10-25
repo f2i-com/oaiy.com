@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, announcesWork, type AgentEvent } from '../../src/agent/agent';
+import { Agent, announcesWork, readingStatus, type AgentEvent } from '../../src/agent/agent';
 import { TOOLS, planAfter, planChanges, readPlan, settlePlan } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
@@ -184,13 +184,13 @@ describe('tool rules', () => {
       ]);
       const events: AgentEvent[] = [];
       await make(vfs).run('hello', (e) => events.push(e));
-      expect(names(fake.bodies[0]).sort()).toEqual(['append_file', 'delete_file', 'edit_file', 'find_tools', 'glob', 'grep', 'guide', 'list_files', 'read_file', 'update_plan', 'use_tool', 'write_file']);
+      expect(names(fake.bodies[0]).sort()).toEqual(['append_file', 'edit_file', 'find_tools', 'grep', 'guide', 'list_files', 'read_file', 'update_plan', 'use_tool', 'write_file']);
       for (const body of fake.bodies.slice(1)) {
         expect(names(body)).toEqual(names(fake.bodies[0]));
         expect(system(body)).toBe(system(fake.bodies[0]));
       }
-      // Its instructions and tools some 2,000 tokens, where all of them were some 20,000.
-      expect(JSON.stringify(fake.bodies[0].tools).length + system(fake.bodies[0]).length).toBeLessThan(9000);
+      // Its instructions and tools some 1,200 tokens, where all of them were some 20,000.
+      expect(JSON.stringify(fake.bodies[0].tools).length + system(fake.bodies[0]).length).toBeLessThan(5000);
       // A tool found: what it does and its parameters, as a result.
       const found = JSON.stringify(fake.bodies[1].messages);
       expect(found).toContain('generate_image:');
@@ -243,6 +243,16 @@ describe('tool rules', () => {
       await make().run('hello', (e) => events.push(e));
       expect(fake.bodies).toHaveLength(2);
       expect(events.at(-1)).toMatchObject({ type: 'done', text: 'told' });
+    });
+
+    it('lists its tools in brief, and find_tools gives one whole by its name', async () => {
+      const fake = fakeProvider('openai', [{ calls: [{ name: 'find_tools', input: { query: 'read_file' } }] }, { text: 'ok' }]);
+      await make().run('hello', () => {});
+      const read = (fake.bodies[0].tools as Array<{ function: { name: string; description: string; parameters: unknown } }>).find((t) => t.function.name === 'read_file')!;
+      expect(read.function.description).not.toContain('char_start');
+      expect(JSON.stringify(read.function.parameters)).toContain('char_start');
+      expect(JSON.stringify(read.function.parameters)).not.toContain('description');
+      expect(JSON.stringify(fake.bodies[1].messages)).toContain('char_start/char_count read raw characters');
     });
 
     it('is off by default', async () => {
@@ -413,6 +423,18 @@ describe('tool rules', () => {
       stream.accept({ event: 'message', data: JSON.stringify(chunk) });
     }
     expect(drafts).toEqual([['<tool_call>\n<function=append_file>', true], ['\n<parameter=content>\n## Scene 1', false]]);
+  });
+
+  it("says how far OAIY has read the prompt, and what it read on from, not that the model is thinking", () => {
+    const read: Array<[number, number, number | null]> = [];
+    const stream = new OpenAIStream({ text: () => {}, toolStart: () => {}, toolArgs: () => {}, reading: (d, t, r) => read.push([d, t, r]) });
+    for (const p of [{ prompt_done: 0, prompt_total: 640, cached_tokens: 2000 }, { prompt_done: 640, prompt_total: 640, cached_tokens: 2000 }, { prompt_done: 0, prompt_total: 2600, cached_tokens: null }]) {
+      stream.accept({ event: 'message', data: JSON.stringify({ choices: [], oaiy_progress: p }) });
+    }
+    expect(read).toEqual([[0, 640, 2000], [640, 640, 2000], [0, 2600, null]]);
+    expect(readingStatus(0, 640, 2000)).toMatch(/^reading the prompt: 0 of 640 new tokens, \S+ read on from before…$/);
+    expect(readingStatus(640, 640, 2000)).toMatch(/the model is answering/);
+    expect(readingStatus(1200, 2600, null)).not.toMatch(/read on/);
   });
 
   it('is asked, once, to start when it only says what it will do', async () => {

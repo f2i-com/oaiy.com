@@ -278,29 +278,64 @@ const GUIDE_MARK = /\[(?:OAIY|bot\.computer)\] The (app|web|video|media|document
  * run (some 2,000 tokens), the rest found with find_tools and run with use_tool (or by name), and a guide comes back
  * as a result.
  */
-const LISTED = new Set(['list_files', 'read_file', 'write_file', 'append_file', 'edit_file', 'delete_file', 'grep', 'glob', 'update_plan', 'guide']);
+const LISTED = new Set(['list_files', 'read_file', 'write_file', 'append_file', 'edit_file', 'grep', 'update_plan', 'guide']);
+
+/**
+ * The listed tools' short forms where the tools are found: a line each, their parameters as they are (OAIY's engine
+ * checks a call against them) without their words, the whole description find_tools' (some 6,700 characters of
+ * tools where 3,000).
+ */
+const SHORT: Record<string, string> = {
+  list_files: 'List files and folders under a path ("/" is the root).',
+  read_file: 'Read a text file, its lines numbered (400 at most a call: page with offset). Read a file before you change it.',
+  write_file: 'Create a file, or replace one you have read in full.',
+  append_file: 'Add text to the end of a file (made if missing): a long document a part a call.',
+  edit_file: 'Replace exact text in a file you have read: old_string once (with lines enough around it to be unique), or every time with replace_all.',
+  grep: 'Search file contents by regular expression (glob narrows the files): path:line: text.',
+  update_plan:
+    'The checklist the user watches: before work of several steps, the goal and 3 to 8 steps (items, each text and status). Mark each step done as you finish it ({"step": N, "status": "done"}); send items again to change the plan.',
+};
+
+/** `spec` as listed where the tools are found: its short form ([`SHORT`]), or as it is. */
+function shortSpec(spec: ToolSpec): ToolSpec {
+  const short = SHORT[spec.name];
+  return short ? { ...spec, description: short, parameters: withoutWords(spec.parameters) as ToolSpec['parameters'] } : spec;
+}
+
+/** A parameters schema without its properties' descriptions (their types, enums and requirements kept). */
+function withoutWords(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(withoutWords);
+  if (!schema || typeof schema !== 'object') return schema;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+    if (key === 'description' && typeof value === 'string') continue;
+    out[key] = key === 'properties' && value && typeof value === 'object' ? Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, withoutWords(v)])) : withoutWords(value);
+  }
+  return out;
+}
 
 const FIND_TOOLS: ToolSpec = {
   name: 'find_tools',
   description:
-    'Find the tools for something your listed tools do not do: say what you need in a few words ("make a picture", "screenshot the preview", "check the app", "fetch a web page", "run code", "text a customer", "change a setting") and get the tools that do it, each with what it does and its parameters. Run one with use_tool. With no words, the names of all of them.',
-  parameters: { type: 'object', properties: { query: { type: 'string', description: 'What you need to do, in a few words' } } },
+    'Find tools for what your listed ones do not do (pictures, video, sound, apps and web pages, screenshots, code, the web, OAIY\'s settings, the phone) in a few words, or a tool\'s whole description by its name: each with its parameters. Run one with use_tool. With no words, all their names.',
+  parameters: { type: 'object', properties: { query: { type: 'string' } } },
 };
 
 const USE_TOOL: ToolSpec = {
   name: 'use_tool',
-  description: 'Run one of the tools find_tools gave you: its name, and its arguments as its parameters say.',
-  parameters: {
-    type: 'object',
-    required: ['name'],
-    properties: { name: { type: 'string', description: "The tool's name" }, arguments: { type: 'object', description: "The tool's parameters" } },
-  },
+  description: 'Run a tool find_tools gave you: its name, and its arguments as its parameters say.',
+  parameters: { type: 'object', required: ['name'], properties: { name: { type: 'string' }, arguments: { type: 'object' } } },
 };
 
-/** What the system prompt says where the tools are found. */
-const DISCOVERY_NOTE = `
+/** The system prompt where the tools are found: [`BASE_PROMPT`] and [`PLAN_GUIDE`] in brief, and where the tools are. */
+const FOUND_PROMPT = `You are OAIY, an agent in the user's project: a virtual filesystem, "/" its root. Do what the request asks, on your own, in small checked steps; ask only when you cannot decide. Read a file before you change it. For work of several steps, plan first with update_plan and mark each step done as you go. Your listed tools are the everyday ones: find the others with find_tools and run them with use_tool. Before a kind of work with a guide (app, web, video, media, document), read it with guide. When done, say briefly what you did and how you checked it.`;
 
-Only your everyday tools are listed. For anything else (pictures, video, voices, music and sound; apps and web pages and their previews; running code; the web; OAIY's own settings, flows and plugins; the phone) find the tools with find_tools, then run them with use_tool. A guide comes back as its tool's result: follow it from then on.`;
+/** The status while the model reads its prompt (OAIY's progress): what is new of it, and what it read on from. */
+export function readingStatus(done: number, total: number, reused: number | null): string {
+  const kept = reused ? `, ${formatTokens(reused)} read on from before` : '';
+  if (done >= total) return total ? `read the prompt (${formatTokens(total)} new tokens${kept}); the model is answering…` : `the prompt was read before${kept}; the model is answering…`;
+  return `reading the prompt: ${formatTokens(done)} of ${formatTokens(total)} new tokens${kept}…`;
+}
 
 /** Words find_tools leaves out of a query. */
 const QUERY_STOP = new Set(['a', 'an', 'the', 'to', 'of', 'for', 'and', 'or', 'in', 'on', 'with', 'my', 'it', 'is', 'do', 'make', 'get', 'use', 'some', 'that', 'this', 'from', 'into', 'at', 'by', 'me', 'i']);
@@ -900,7 +935,7 @@ export class Agent {
   private get listed(): ToolSpec[] {
     const usable = this.usable;
     if (!this.discovering) return usable;
-    return [...usable.filter((t) => LISTED.has(t.name)), FIND_TOOLS, USE_TOOL];
+    return [...usable.filter((t) => LISTED.has(t.name)).map(shortSpec), FIND_TOOLS, USE_TOOL];
   }
 
   /** Every tool this agent may use, listed or found. */
@@ -918,10 +953,13 @@ export class Agent {
     const models = all.some((t) => t.name === 'generate_3d_model') || findModels(this.options.vfs).length > 0;
     const tools = all.filter((t) => (apps || !SOFTN_TOOLS.has(t.name)) && (web || !WEB_TOOLS.has(t.name)) && (apps || web || models || !PREVIEW_TOOLS.has(t.name)));
     const topics = guideTopics(new Set(all.map((t) => t.name)));
-    const stays = this.discovering ? 'its text comes back for you to follow from then on' : 'it stays in your instructions from then on';
+    // (where the tools are found, in brief: its result is the guide)
+    const description = this.discovering
+      ? `Read the guide for a kind of work before you start it (${topics.join(', ')}): it comes back as the result.`
+      : `Read the guide for a kind of work before you start it; it stays in your instructions from then on. The guides: ${topics.map((t) => `"${t}" for ${GUIDE_ABOUT[t]}`).join('; ')}.`;
     return [...tools, ...this.sessionToolList.map((t) => t.spec), {
       name: 'guide',
-      description: `Read the guide for a kind of work before you start it; ${stays}. The guides: ${topics.map((t) => `"${t}" for ${GUIDE_ABOUT[t]}`).join('; ')}.`,
+      description,
       parameters: { type: 'object', required: ['topic'], properties: { topic: { type: 'string', enum: topics } } },
     }];
   }
@@ -932,12 +970,16 @@ export class Agent {
    */
   private findTools(call: ToolCall): ToolResult {
     const listed = new Set(this.listed.map((t) => t.name));
-    const others = this.usable.filter((t) => !listed.has(t.name));
+    const usable = this.usable;
+    const others = usable.filter((t) => !listed.has(t.name));
     const names = others.map((t) => `${t.name} (${firstSentence(t.description)})`).join('; ');
     const query = typeof call.input.query === 'string' ? call.input.query.trim().toLowerCase() : '';
     const words = query.split(/[^a-z0-9]+/).filter((w) => w.length > 1 && !QUERY_STOP.has(w));
     const said = (content: string): ToolResult => ({ id: call.id, name: call.name, content, isError: false });
     if (!words.length) return said(`Your other tools: ${names}.\n\nfind_tools with what you need to do gives a tool's parameters; run it with use_tool.`);
+    // (a tool asked for by its name, a listed one's too: its whole description)
+    const named = usable.find((t) => t.name === query.replace(/\s+/g, '_'));
+    if (named) return said(`${named.name}: ${named.description}\nParameters: ${JSON.stringify(named.parameters)}${listed.has(named.name) ? '' : '\n\nRun it with use_tool: {"name": "…", "arguments": {…}}.'}`);
     const scored = others
       .map((t) => {
         const name = t.name.toLowerCase().replace(/_/g, ' ');
@@ -1064,7 +1106,8 @@ export class Agent {
     // A video follows the request: it stays in view, word for word, however long the work (as a reference, not a step to take).
     const request = read.includes('video') && !this.options.role ? this.requestText() : '';
     const asked = request ? `\n\nThe user's request being worked on, word for word, for reference (the script and everything made follow it; the guide's rules only fill in what it leaves open):\n"""\n${request.length > 4000 ? `${request.slice(0, 4000)} […]` : request}\n"""` : '';
-    return `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}${discovering ? DISCOVERY_NOTE : ''}${guides}${asked}${this.options.role ?? ''}${this.instructions ? `
+    const base = discovering ? FOUND_PROMPT : `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}`;
+    return `${base}${guides}${asked}${this.options.role ?? ''}${this.instructions ? `
 
 ${this.instructions}` : ''}`;
   }
@@ -1608,6 +1651,8 @@ ${this.instructions}` : ''}`;
             toolStart: (index, _id, name) => emit({ type: 'tool_start', index, name }),
             toolArgs: (index, delta) => emit({ type: 'tool_draft', text: delta, start: false, index }),
             draft: (text, start) => emit({ type: 'tool_draft', text, start }),
+            // (a local model reading its prompt: said as that, not as thinking)
+            reading: (done, total, reused) => emit({ type: 'status', message: readingStatus(done, total, reused) }),
           },
         });
         // The provider's own count calibrates the next estimate.
