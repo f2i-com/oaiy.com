@@ -1249,7 +1249,17 @@ asks' second rounds, two runs each in turn (old, new, new, old):
 | A new subject | 14.1, 14.1 tok/s | 16.2, 16.3 tok/s |
 
 Every reply the same text in all four runs. Sending all of a layer's misses to the cards measured
-slower (code 9.8 where 11.5), and all of them on the host within the noise of the share by time.
+slower (code 9.8 where 11.5).
+
+With the host's experts that much faster, the share of a layer's misses sent to the cards
+(`share_to_cards`) cost: priced by a call and each record's put at the fastest card's rate, it sent
+the cards misses the host made sooner, and all of them on the host gave code 14.1 tok/s where 13.2.
+The cards' share is now priced by what it has taken of late, from its handing over to its outputs
+(`cards_us`, an expert's time: its thread, its puts on whichever card took them, its calls, the
+cores' reads they slow among it), as the host's is. On a quiet machine that is all of them here, the
+same as `OAIY_DSV41_HYBRID=0` (20.0, 14.1, 20.0, 17.0 tok/s where 19.9, 14.0, 19.9, 17.0); with the
+host's experts on four threads (`OAIY_STEP_THREADS=4`, cores another program takes) the cards take
+some again: 16.6, 10.8, 16.0, 13.6 where all of them here 16.4, 9.7, 16.1, 13.0.
 
 ## Phases
 
