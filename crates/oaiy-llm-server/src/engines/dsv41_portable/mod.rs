@@ -13,6 +13,8 @@ use crate::dsv41::linear::{DenseKernel, Weight};
 use ggml_rs_wgpu::dense::{DenseData, DenseGpu, RecordSlots};
 use ggml_rs_wgpu::WgpuBackend;
 
+#[cfg(test)]
+mod attend_tests;
 mod engine;
 mod exl3;
 mod experts;

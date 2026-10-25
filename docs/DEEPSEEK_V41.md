@@ -980,6 +980,66 @@ gave 12.5, 8.9, 13.5 and 7.7 in a first round. The replies vary by
 some 10% from run to run when another program compiles on the machine; the bench waits for a quiet
 machine before each request.
 
+## Attention on the card (2026-10-25)
+
+A decode step of an EXL3 checkpoint whose trunk is on one card now makes each layer in one call:
+the attention is made on that card, inside the router's program, where the host made it between the
+queries' call and the router's. `OAIY_DSV41_GPU_ATTENTION=0` makes it on the host as before.
+
+The card keeps its own copy of every layer's caches (`attention::DeviceCaches`, 67 MB at an 8,192
+context): each window, each compressing source's compressed rows, partial group and index keys, the
+index sources' picks, and the rotary tables. A prompt's chunks still attend on the host, so the
+caches go over to whichever side is behind: up to the card before a decode step, back to the host
+before a prompt continues a reply's state or a checkpoint is taken. A step reads its numbers
+(position, window slot, compressed count) from a vector of words the program uploads each run, so
+the recording is the same at every step and replayed.
+
+What the step makes there (`exl3::ProgramStep`'s `Rope` to `HcMix`, kernels in `exl3/attend.rs`):
+- the queries rotated; the window's key normed, rotated, quantized to fp8 and put in its slot;
+- a compressing source's latent (pooled past a ratio of 1), its index key and its compressed row;
+- an index source's scores of the compressed positions and its 512 picks (a radix select on the
+  scores' bf16 bits, ties to the lower position, the picks in order);
+- the heads' attention over the window and the picks, in three kernels: each head's positions in ten
+  workgroups of 64 (scores, then each chunk's softmax and sums), then the chunks together;
+- the attention's mixing coefficients, from the stream's sum of squares the host makes.
+
+Each of them rounds as the host does, to the bit (the rotary products stored to workgroup memory
+before their sums, so no fused multiply-add takes them; quotients and square roots correctly
+rounded by integer steps), but for the exponentials of the softmax, a ratio-2 pool and the mixing,
+which are the card's own, and the attention's sums, added a chunk of 64 positions at a time. So a
+reply is no longer the host's text, but the same text every time. The candidate blocks keep every
+position up to 2,048 blocks of 8 (16,384 positions), so the card has none to pick; a step past that
+attends on the host.
+
+Checked on the real checkpoint with `OAIY_DSV41_GPU_ATTENTION=check` (the host attends as before and
+the card beside it, from the host's caches, each step's differences said), at a 4,152-token prompt
+where the picks are real (more compressed positions than 512): over 48 steps of 40 layers, every
+window row, compressed row and index key the host's to the bit, every pick set the host's, the heads'
+outputs at most 0.36% off their largest value (bf16's own step is 0.39%), the mixing 2.4e-7. On the
+tests' data 99.8% of the heads' outputs are the host's to the bit.
+
+The first kernels were each a thread's long chain of reads: the mixing's sum of squares 400 us a
+call, the attention 160, the index scores 250, and the replies slower than the host's attention.
+Each thread's reads made eight at a time before their adds (the adds in the host's order), a thread
+a key and head for the index scores, the sum of squares from the host and the heads' positions over
+ten workgroups: 28, some 70 over the three kernels, and under 115.
+
+Measured as the sections above, one session, the second round:
+
+| Reply | Attention on the host | On the card |
+|---|---|---|
+| A familiar subject | 14.1 tok/s | 15.8 tok/s |
+| Code | 8.8 tok/s | 10.4 tok/s |
+| The same again | 13.4 tok/s | 15.2 tok/s |
+| A new subject | 9.0 tok/s | 10.7 tok/s |
+
+Another program compiled on the machine through these runs (the host's figures were 16.1, 11.0,
+16.1 and 11.6 on a quiet one). At a 4,153-token prompt the host's attention was some 65 ms a token
+(its sparse attention 36, the index scores and the indexer 30): a 60-token reply after it came at
+8.0 tok/s with the attention on the card and 4.6 on the host. Its kernels are made while the model
+loads (`exl3::make_attention_kernels`): made as the first reply needed them, they were some seconds
+of it.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

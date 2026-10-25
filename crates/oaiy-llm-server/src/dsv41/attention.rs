@@ -1,4 +1,4 @@
-﻿//! DeepSeek-V4.1 attention (reference `Attention`, `Compressor`, `Indexer`,
+//! DeepSeek-V4.1 attention (reference `Attention`, `Compressor`, `Indexer`,
 //! `select_candidate_blocks`, `sparse_attn`).
 //!
 //! Every layer attends over a 128-token sliding window of its own KV. Layers
@@ -87,6 +87,12 @@ pub struct Saved {
 }
 
 impl AttnState {
+    /// Whether `other`'s caches are these to the bit (a check of the device's copy, [`DeviceCaches`]).
+    pub(crate) fn same_as(&self, other: &AttnState) -> bool {
+        let bits = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        bits(&self.window, &other.window) && bits(&self.compress_kv, &other.compress_kv) && bits(&self.kv_state, &other.kv_state) && bits(&self.score_state, &other.score_state) && bits(&self.index_k, &other.index_k)
+    }
+
     /// What a pass of `t` rows from `start` will write over (`hd` the head's width): its positions' window slots and a
     /// compressing source's partial group. The compressed caches need nothing: an entry is written at its group's
     /// place and read only once its group is whole, so one made of rows not kept is made again over it.
@@ -128,6 +134,275 @@ pub struct Shared {
     topk: Vec<Vec<i32>>,
     /// Per query: candidate mask over compressed positions (layer 20 onwards).
     candidates: Vec<Vec<bool>>,
+}
+
+impl Shared {
+    /// The last index source's picks for the first row (positions plus the window's offset, -1 none), as a check reads
+    /// them.
+    pub(crate) fn first_picks(&self) -> Option<&[i32]> {
+        self.topk.first().map(Vec::as_slice)
+    }
+}
+
+/// Which side's attention caches hold steps the other's do not ([`DeviceCaches`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Newer {
+    /// Both alike.
+    Neither,
+    /// The host's: a prompt's chunks were read here, or the caches were restored.
+    Host,
+    /// The device's: decode steps were made there.
+    Device,
+}
+
+/// A step's numbers in the words of a layer's device program ([`DeviceCaches::words`]): its position, its window slot,
+/// the compressed positions there are, the compressed row it completes, that row's position, its row in a partial
+/// group.
+const W_POS: u32 = 0;
+const W_SLOT: u32 = 1;
+const W_COUNT: u32 = 2;
+const W_ROW: u32 = 3;
+const W_CPOS: u32 = 4;
+const W_GROUP: u32 = 5;
+/// The word of the stream's sum of squares, its mixing's ([`crate::dsv41::hc::sumsq`]).
+pub(crate) const W_SUMSQ: u32 = 6;
+
+/// A decode step's attention caches on a device (OAIY_DSV41_GPU_ATTENTION): every layer's window, each compressing
+/// source's compressed rows, partial group and index keys, the index sources' picks and the rotary tables, so the step's
+/// attention is made there, in each layer's one call ([`Attention::device_steps`]). The host's [`AttnState`]s stay a
+/// prompt's: its chunks are attended here, and the caches go over to whichever side is behind
+/// ([`DeviceCaches::upload`], [`DeviceCaches::download`]).
+pub struct DeviceCaches {
+    dev: Arc<dyn ggml_rs::chain::DeviceChain>,
+    layers: Vec<LayerCaches>,
+    /// The latest index source's picks of compressed positions (u32 bits, `[index_topk]`), which the layers after it read.
+    picks: ggml_rs::chain::DeviceVec,
+    /// Each rotary flavour's tables, `(cos, sin)`.
+    rope: Vec<(ggml_rs::chain::DeviceVec, ggml_rs::chain::DeviceVec)>,
+    /// The most positions a step's attention reaches there: up to it the candidate blocks keep every position (so the
+    /// device has no candidates to pick), and a step past it attends on the host.
+    pub reach: usize,
+    /// Which side is ahead, and the positions the caches hold.
+    pub newer: Newer,
+    pub upto: usize,
+}
+
+/// A layer's caches on the device ([`DeviceCaches`]).
+struct LayerCaches {
+    ratio: usize,
+    window: ggml_rs::chain::DeviceVec,
+    /// A compressing source's: its compressed rows (`reach / ratio`), its partial group (past a ratio of 1) and its
+    /// index keys (an indexer's that owns them).
+    compress_kv: Option<ggml_rs::chain::DeviceVec>,
+    kv_state: Option<(ggml_rs::chain::DeviceVec, ggml_rs::chain::DeviceVec)>,
+    index_k: Option<ggml_rs::chain::DeviceVec>,
+    /// Its rotary flavour (in [`DeviceCaches::rope`]), and the layers whose compressed rows and index keys it reads.
+    rope: usize,
+    compress_src: Option<usize>,
+    index_src: Option<usize>,
+}
+
+impl DeviceCaches {
+    /// Caches on `dev` for `layers` (the model's attention, in order), a context of `max_seq`.
+    pub fn new(dev: Arc<dyn ggml_rs::chain::DeviceChain>, cfg: &Config, layers: &[&Attention], max_seq: usize) -> DeviceCaches {
+        let (hd, ihd) = (cfg.head_dim, cfg.index_head_dim);
+        let reach = match cfg.candidate_source_layer {
+            Some(_) => max_seq.min(cfg.candidate_topk_blocks * cfg.candidate_block_size),
+            None => max_seq,
+        };
+        let mut rope: Vec<(ggml_rs::chain::DeviceVec, ggml_rs::chain::DeviceVec)> = Vec::new();
+        let mut tables: Vec<*const Rope> = Vec::new();
+        let up = |v: &[f32]| {
+            let d = dev.vec(v.len());
+            dev.upload(&d, v);
+            d
+        };
+        let (mut compress_src, mut index_src) = (None, None);
+        let layers = layers
+            .iter()
+            .map(|a| {
+                let flavour = match tables.iter().position(|&r| r == Arc::as_ptr(&a.rope)) {
+                    Some(i) => i,
+                    None => {
+                        let (cos, sin) = a.rope.tables();
+                        rope.push((up(cos), up(sin)));
+                        tables.push(Arc::as_ptr(&a.rope));
+                        tables.len() - 1
+                    }
+                };
+                let source = a.compressor.as_ref().filter(|_| a.ratio > 0);
+                if source.is_some() {
+                    compress_src = Some(a.layer);
+                }
+                if a.indexer.as_ref().is_some_and(|ix| ix.owns_k) && source.is_some() {
+                    index_src = Some(a.layer);
+                }
+                let rows = if a.ratio > 0 { reach / a.ratio } else { 0 };
+                LayerCaches {
+                    ratio: a.ratio,
+                    window: dev.vec(cfg.window_size * hd),
+                    compress_kv: source.map(|_| dev.vec(rows * hd)),
+                    kv_state: source.filter(|c| c.ratio > 1).map(|c| (dev.vec(c.ratio * hd), dev.vec(c.ratio * hd))),
+                    index_k: a.indexer.as_ref().filter(|ix| ix.owns_k && source.is_some()).map(|_| dev.vec(rows * ihd)),
+                    rope: flavour,
+                    compress_src: (a.ratio > 0).then_some(compress_src).flatten(),
+                    index_src: (a.ratio > 0).then_some(index_src).flatten(),
+                }
+            })
+            .collect();
+        DeviceCaches { picks: dev.vec(cfg.index_topk.max(1)), dev, layers, rope, reach, newer: Newer::Host, upto: 0 }
+    }
+
+    /// Its bytes on the device.
+    pub fn bytes(&self) -> usize {
+        let v = |d: &ggml_rs::chain::DeviceVec| d.len * 4;
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| v(&l.window) + l.compress_kv.as_ref().map_or(0, v) + l.kv_state.as_ref().map_or(0, |(a, b)| v(a) + v(b)) + l.index_k.as_ref().map_or(0, v))
+            .sum();
+        layers + v(&self.picks) + self.rope.iter().map(|(c, s)| v(c) + v(s)).sum::<usize>()
+    }
+
+    /// Layer `l`'s step at `pos` in its program's words (u32s as f32 bits: an input as any other), `sumsq` its stream's
+    /// sum of squares.
+    pub fn words(&self, cfg: &Config, l: usize, pos: usize, sumsq: f32) -> [f32; 8] {
+        let r = self.layers[l].ratio.max(1);
+        let mut w = [pos, pos % cfg.window_size, (pos + 1) / r, pos / r, pos / r * r, pos % r, 0, 0].map(|v| f32::from_bits(v as u32));
+        w[W_SUMSQ as usize] = sumsq;
+        w
+    }
+
+    /// The host's caches of `positions` positions onto the device.
+    pub fn upload(&self, cfg: &Config, states: &[AttnState], positions: usize) {
+        let (hd, ihd) = (cfg.head_dim, cfg.index_head_dim);
+        for (lc, st) in self.layers.iter().zip(states) {
+            self.dev.upload(&lc.window, &st.window);
+            let rows = if lc.ratio > 0 { positions / lc.ratio } else { 0 };
+            if let Some(v) = lc.compress_kv.as_ref().filter(|_| rows > 0) {
+                self.dev.upload_at(v, 0, &st.compress_kv[..(rows * hd).min(v.len)]);
+            }
+            if let Some((kv, score)) = &lc.kv_state {
+                self.dev.upload(kv, &st.kv_state);
+                self.dev.upload(score, &st.score_state);
+            }
+            if let Some(v) = lc.index_k.as_ref().filter(|_| rows > 0) {
+                self.dev.upload_at(v, 0, &st.index_k[..(rows * ihd).min(v.len)]);
+            }
+        }
+    }
+
+    /// The device's caches of `positions` positions into the host's, in one read back.
+    pub fn download(&self, cfg: &Config, states: &mut [AttnState], positions: usize) {
+        let (hd, ihd) = (cfg.head_dim, cfg.index_head_dim);
+        let mut rec = self.dev.begin();
+        for lc in &self.layers {
+            rec.read(&lc.window);
+            let rows = if lc.ratio > 0 { positions / lc.ratio } else { 0 };
+            if let Some(v) = lc.compress_kv.as_ref().filter(|_| rows > 0) {
+                rec.read_range(v, 0, (rows * hd).min(v.len));
+            }
+            if let Some((kv, score)) = &lc.kv_state {
+                rec.read(kv);
+                rec.read(score);
+            }
+            if let Some(v) = lc.index_k.as_ref().filter(|_| rows > 0) {
+                rec.read_range(v, 0, (rows * ihd).min(v.len));
+            }
+        }
+        let mut got = rec.finish().into_iter();
+        let mut next = || got.next().expect("a cache read back");
+        for (lc, st) in self.layers.iter().zip(states.iter_mut()) {
+            st.window.copy_from_slice(&next());
+            let rows = if lc.ratio > 0 { positions / lc.ratio } else { 0 };
+            if lc.compress_kv.is_some() && rows > 0 {
+                let v = next();
+                st.compress_kv[..v.len()].copy_from_slice(&v);
+            }
+            if lc.kv_state.is_some() {
+                st.kv_state.copy_from_slice(&next());
+                st.score_state.copy_from_slice(&next());
+            }
+            if lc.index_k.is_some() && rows > 0 {
+                let v = next();
+                st.index_k[..v.len()].copy_from_slice(&v);
+            }
+        }
+    }
+
+    /// Layer `l`'s rows a decode step at `pos` wrote on the host (its window slot, its partial group, the compressed row
+    /// and index key it completed) and the picks the host made for the layers after it, `picks` (`[k]`, positions plus
+    /// `offset`, -1 none), onto the device: a check's device then starts each layer's step from the host's caches.
+    pub fn upload_step(&self, cfg: &Config, states: &[AttnState], l: usize, pos: usize, picks: Option<(&[i32], usize)>) {
+        let (hd, ihd, win) = (cfg.head_dim, cfg.index_head_dim, cfg.window_size);
+        let (lc, st) = (&self.layers[l], &states[l]);
+        let slot = pos % win;
+        self.dev.upload_at(&lc.window, slot * hd, &st.window[slot * hd..(slot + 1) * hd]);
+        if let Some((kv, score)) = &lc.kv_state {
+            self.dev.upload(kv, &st.kv_state);
+            self.dev.upload(score, &st.score_state);
+        }
+        if lc.ratio > 0 && (pos + 1).is_multiple_of(lc.ratio) {
+            let row = pos / lc.ratio;
+            if let Some(v) = &lc.compress_kv {
+                self.dev.upload_at(v, row * hd, &st.compress_kv[row * hd..(row + 1) * hd]);
+            }
+            if let Some(v) = &lc.index_k {
+                self.dev.upload_at(v, row * ihd, &st.index_k[row * ihd..(row + 1) * ihd]);
+            }
+        }
+        if let Some((picks, offset)) = picks {
+            let mut words = vec![f32::from_bits(u32::MAX); self.picks.len];
+            for (w, &p) in words.iter_mut().zip(picks) {
+                if p >= 0 {
+                    *w = f32::from_bits((p as usize - offset) as u32);
+                }
+            }
+            self.dev.upload(&self.picks, &words);
+        }
+    }
+
+    /// What a check reads back of layer `l`'s step at `pos` from the device besides its outputs: `(vector, first
+    /// value, values, what)` of its window slot and the compressed row and index key it completed (where it did).
+    pub(crate) fn step_reads(&self, cfg: &Config, l: usize, pos: usize) -> Vec<(&ggml_rs::chain::DeviceVec, usize, usize, &'static str)> {
+        let (hd, ihd) = (cfg.head_dim, cfg.index_head_dim);
+        let lc = &self.layers[l];
+        let mut reads = vec![(&lc.window, pos % cfg.window_size * hd, hd, "window row")];
+        if lc.ratio > 0 && (pos + 1).is_multiple_of(lc.ratio) {
+            let row = pos / lc.ratio;
+            let one = lc.ratio == 1;
+            if let Some(v) = &lc.compress_kv {
+                reads.push((v, row * hd, hd, if one { "compressed row (ratio 1)" } else { "compressed row (pooled)" }));
+            }
+            if let Some(v) = &lc.index_k {
+                reads.push((v, row * ihd, ihd, if one { "index key (ratio 1)" } else { "index key (pooled)" }));
+            }
+        }
+        reads
+    }
+
+    /// The host's rows of layer `l`'s step at `pos`, in [`Self::step_reads`]' order.
+    pub(crate) fn host_rows<'s>(&self, cfg: &Config, states: &'s [AttnState], l: usize, pos: usize) -> Vec<&'s [f32]> {
+        let (hd, ihd) = (cfg.head_dim, cfg.index_head_dim);
+        let (lc, st) = (&self.layers[l], &states[l]);
+        let slot = pos % cfg.window_size;
+        let mut rows = vec![&st.window[slot * hd..(slot + 1) * hd]];
+        if lc.ratio > 0 && (pos + 1).is_multiple_of(lc.ratio) {
+            let row = pos / lc.ratio;
+            if lc.compress_kv.is_some() {
+                rows.push(&st.compress_kv[row * hd..(row + 1) * hd]);
+            }
+            if lc.index_k.is_some() {
+                rows.push(&st.index_k[row * ihd..(row + 1) * ihd]);
+            }
+        }
+        rows
+    }
+
+    /// The index sources' picks, as a check reads them.
+    pub(crate) fn picks(&self) -> &ggml_rs::chain::DeviceVec {
+        &self.picks
+    }
 }
 
 struct Compressor {
@@ -612,20 +887,15 @@ impl Attention {
     pub(crate) fn output_steps<'a>(&'a self, cfg: &Config, o: &'a [f32], steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> Option<usize> {
         use crate::dsv41::linear::Step;
         let Weight::Stacked { parts, rows, group, .. } = &self.wo_a else { return None };
-        let (g, gd, orank, d) = (cfg.o_groups, cfg.n_heads * cfg.head_dim / cfg.o_groups, cfg.o_lora_rank, cfg.dim);
+        let (g, gd, orank) = (cfg.o_groups, cfg.n_heads * cfg.head_dim / cfg.o_groups, cfg.o_lora_rank);
         if parts.len() != g || *rows != orank || o.len() != g * gd {
             return None;
         }
-        let rows_in = match group {
-            // every group's heads a row of `o`, each part on its own row in one pass, their rows rounded at once
-            Some(group) if g <= DIAGONAL.len() => {
+        match group {
+            Some(_) if g <= DIAGONAL.len() => {
                 let input = steps.len();
                 steps.push(Step::Input(o));
-                steps.push(Step::MulGroup { group, x: input, jobs: &DIAGONAL[..g] });
-                let rows_in = steps.len();
-                steps.push(Step::Scratch(g * orank));
-                steps.push(Step::CopyColsBf16 { src: input + 1, src_stride: g * orank, src_at: 0, dst: rows_in, dst_stride: g * orank, dst_at: 0, width: g * orank, rows: 1 });
-                rows_in
+                self.output_steps_from(cfg, input, steps)
             }
             _ => {
                 let first = steps.len();
@@ -640,15 +910,38 @@ impl Attention {
                 for grp in 0..g {
                     steps.push(Step::CopyColsBf16 { src: first + g + grp, src_stride: orank, src_at: 0, dst: rows_in, dst_stride: g * orank, dst_at: grp * orank, width: orank, rows: 1 });
                 }
-                rows_in
+                Some(self.output_tail(cfg, rows_in, steps))
             }
-        };
+        }
+    }
+
+    /// [`Self::output_steps`] of the heads' outputs a program's step `o` makes (`[heads, head_dim]`), where `wo_a` is a
+    /// stack of a part a group the device takes in one pass (an EXL3 checkpoint's): every group's heads a row of it,
+    /// each part on its own row, their rows rounded at once. The step whose vector is the output (`[dim]`), or None.
+    pub(crate) fn output_steps_from<'a>(&'a self, cfg: &Config, o: usize, steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> Option<usize> {
+        use crate::dsv41::linear::Step;
+        let Weight::Stacked { parts, rows, group: Some(group), .. } = &self.wo_a else { return None };
+        let (g, orank) = (cfg.o_groups, cfg.o_lora_rank);
+        if parts.len() != g || *rows != orank || g > DIAGONAL.len() {
+            return None;
+        }
+        steps.push(Step::MulGroup { group, x: o, jobs: &DIAGONAL[..g] });
+        let rows_in = steps.len();
+        steps.push(Step::Scratch(g * orank));
+        steps.push(Step::CopyColsBf16 { src: rows_in - 1, src_stride: g * orank, src_at: 0, dst: rows_in, dst_stride: g * orank, dst_at: 0, width: g * orank, rows: 1 });
+        Some(self.output_tail(cfg, rows_in, steps))
+    }
+
+    /// `wo_b` of the groups' rows `rows_in` and its sums rounded to bf16: the output's step.
+    fn output_tail<'a>(&'a self, cfg: &Config, rows_in: usize, steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> usize {
+        use crate::dsv41::linear::Step;
+        let d = cfg.dim;
         let sums = steps.len();
         steps.push(Step::Mul { w: &self.wo_b, x: rows_in, rows: 1 });
         let out = steps.len();
         steps.push(Step::Scratch(d));
         steps.push(Step::CopyColsBf16 { src: sums, src_stride: d, src_at: 0, dst: out, dst_stride: d, dst_at: 0, width: d, rows: 1 });
-        Some(out)
+        out
     }
 
     /// The grouped low-rank output of `t` rows of the attention's output `o` (`wo_a` block-diagonal over the groups,
@@ -772,6 +1065,108 @@ impl Attention {
             }
         });
         (self.ratio, self.compressor.is_some(), role)
+    }
+
+    /// A decode step's attention of one row at `pos` as steps of a device program, its caches `dc`'s (this layer's at
+    /// `layer`): from the row `x` (a step's vector, the attention's normed input) the projections [`Self::forward_core`]
+    /// makes, the queries rotated, the window's key normed, rotated, quantized and put in its slot, a compressing
+    /// source's partial group and latent (pooled past a ratio of 1), its index key and compressed row where it completes
+    /// one, an index source's scores and picks, and the heads' attention over the window and the picks, rotated back:
+    /// each as the host makes it, to the bit, but for the exponentials of the attention, a ratio-2 pool and the
+    /// mixing. `words` is the step's numbers ([`DeviceCaches::words`]). The step of the heads' outputs (`[heads,
+    /// head_dim]`, as `forward_core` gives them), or None where the caches cannot take the step (past their reach).
+    pub(crate) fn device_steps<'a>(&'a self, cfg: &Config, dc: &'a DeviceCaches, x: usize, words: usize, pos: usize, steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> Option<usize> {
+        use crate::dsv41::linear::Step;
+        let (hd, nh, rd, win, ihd, inh) = (cfg.head_dim, cfg.n_heads, cfg.rope_head_dim, cfg.window_size, cfg.index_head_dim, cfg.index_n_heads);
+        let lc = &dc.layers[self.layer];
+        if pos >= dc.reach || lc.ratio != self.ratio {
+            return None;
+        }
+        let half = rd / 2;
+        let push = |steps: &mut Vec<Step<'a>>, s: Step<'a>| {
+            steps.push(s);
+            steps.len() - 1
+        };
+        let (cos, sin) = (&dc.rope[lc.rope].0, &dc.rope[lc.rope].1);
+        let cos = push(steps, Step::State(cos));
+        let sin = push(steps, Step::State(sin));
+        let rotate = |steps: &mut Vec<Step<'a>>, v: usize, rows: usize, width: usize, word: u32, inverse: bool| {
+            steps.push(Step::Rope { x: v, rows, stride: width, at: width - rd, half, cos, sin, pos: words, word, inverse });
+        };
+        // the projections of x, and the queries' of the normed low-rank row
+        let qa = push(steps, Step::Mul { w: &self.wq_a, x, rows: 1 });
+        let kva = push(steps, Step::Mul { w: &self.wkv, x, rows: 1 });
+        let source = self.compressor.as_ref().filter(|_| self.ratio > 0);
+        let ckv = source.map(|c| push(steps, Step::Mul { w: &c.wkv, x, rows: 1 }));
+        let cgate = source.and_then(|c| c.wgate.as_ref().filter(|_| c.ratio > 1)).map(|g| push(steps, Step::Mul { w: g, x, rows: 1 }));
+        let indexer = self.indexer.as_ref().filter(|_| self.ratio > 0);
+        let iw = indexer.map(|ix| push(steps, Step::Mul { w: &ix.weights_proj, x, rows: 1 }));
+        let qr = push(steps, Step::Norm { x: qa, weight: &self.q_norm, eps: cfg.norm_eps, rows: 1, width: self.wq_a.n() });
+        let qs = push(steps, Step::Mul { w: &self.wq_b, x: qr, rows: 1 });
+        let iqs = indexer.map(|ix| push(steps, Step::Mul { w: &ix.wq_b, x: qr, rows: 1 }));
+        let bf16 = |steps: &mut Vec<Step<'a>>, src: usize, len: usize| {
+            let dst = push(steps, Step::Scratch(len));
+            steps.push(Step::CopyColsBf16 { src, src_stride: len, src_at: 0, dst, dst_stride: len, dst_at: 0, width: len, rows: 1 });
+            dst
+        };
+        let q = bf16(steps, qs, nh * hd);
+        rotate(steps, q, nh, hd, W_POS, false);
+        // the window's key into its slot
+        let kv = push(steps, Step::Norm { x: kva, weight: &self.kv_norm, eps: cfg.norm_eps, rows: 1, width: hd });
+        rotate(steps, kv, 1, hd, W_POS, false);
+        steps.push(Step::Fp8 { x: kv, len: hd });
+        let window = push(steps, Step::State(&lc.window));
+        steps.push(Step::PutRow { src: kv, dst: window, width: hd, pos: words, word: W_SLOT });
+        // a compressing source's latent, where the step completes a group
+        if let (Some(c), Some(ckv)) = (source, ckv) {
+            let latent = match (&lc.kv_state, cgate) {
+                (None, _) => Some(push(steps, Step::Norm { x: ckv, weight: &c.norm, eps: cfg.norm_eps, rows: 1, width: hd })),
+                (Some((kvs, scores)), Some(gate)) => {
+                    let (kvs, scores) = (push(steps, Step::State(kvs)), push(steps, Step::State(scores)));
+                    steps.push(Step::PutRow { src: ckv, dst: kvs, width: hd, pos: words, word: W_GROUP });
+                    steps.push(Step::PutRow { src: gate, dst: scores, width: hd, pos: words, word: W_GROUP });
+                    (pos + 1).is_multiple_of(c.ratio).then(|| {
+                        let pooled = push(steps, Step::Pool { kv: kvs, score: scores, ratio: c.ratio, width: hd });
+                        push(steps, Step::Norm { x: pooled, weight: &c.norm, eps: cfg.norm_eps, rows: 1, width: hd })
+                    })
+                }
+                (Some(_), None) => return None,
+            };
+            if let Some(latent) = latent {
+                if let (Some(ix), Some(keys)) = (indexer.filter(|ix| ix.owns_k), &lc.index_k) {
+                    let k = push(steps, Step::Mul { w: ix.wk.as_ref()?, x: latent, rows: 1 });
+                    let k = push(steps, Step::Norm { x: k, weight: ix.k_norm.as_ref()?, eps: cfg.norm_eps, rows: 1, width: ihd });
+                    rotate(steps, k, 1, ihd, W_CPOS, false);
+                    steps.push(Step::Fp4 { x: k, len: ihd, block: 32, e4m3: false });
+                    let keys = push(steps, Step::State(keys));
+                    steps.push(Step::PutRow { src: k, dst: keys, width: ihd, pos: words, word: W_ROW });
+                }
+                rotate(steps, latent, 1, hd, W_CPOS, false);
+                steps.push(Step::Fp4 { x: latent, len: hd, block: 16, e4m3: true });
+                let rows = push(steps, Step::State(lc.compress_kv.as_ref()?));
+                steps.push(Step::PutRow { src: latent, dst: rows, width: hd, pos: words, word: W_ROW });
+            }
+        }
+        // an index source's scores of the compressed positions and its picks of them
+        let picks = (self.ratio > 0).then(|| push(steps, Step::State(&dc.picks)));
+        if let (Some(_), Some(iw), Some(iqs), Some(picks)) = (indexer, iw, iqs, picks) {
+            let iq = bf16(steps, iqs, inh * ihd);
+            rotate(steps, iq, inh, ihd, W_POS, false);
+            steps.push(Step::Fp4 { x: iq, len: inh * ihd, block: 32, e4m3: false });
+            let weights = bf16(steps, iw, inh);
+            let keys = push(steps, Step::State(dc.layers[lc.index_src?].index_k.as_ref()?));
+            let scale = (ihd as f32).powf(-0.5) * (inh as f32).powf(-0.5);
+            let scores = push(steps, Step::IndexScores { q: iq, keys, weights, heads: inh, dim: ihd, scale, pos: words, word: W_COUNT });
+            steps.push(Step::TopK { scores, dst: picks, k: cfg.index_topk, pos: words, word: W_COUNT });
+        }
+        // the heads over the window and the picks, rotated back
+        let compressed = match picks {
+            Some(picks) => Some((push(steps, Step::State(dc.layers[lc.compress_src?].compress_kv.as_ref()?)), picks, cfg.index_topk)),
+            None => None,
+        };
+        let o = push(steps, Step::Attend { q, heads: nh, dim: hd, window, win, compressed, sink: &self.attn_sink, scale: (hd as f32).powf(-0.5), pos: words, word: W_POS });
+        rotate(steps, o, nh, hd, W_POS, true);
+        Some(o)
     }
 }
 

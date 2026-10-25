@@ -1,4 +1,4 @@
-﻿//! Dense weights and the reference `linear()`.
+//! Dense weights and the reference `linear()`.
 //!
 //! Three storage kinds occur in the trunk:
 //! - **fp8** e4m3 `[n, k]` with one e8m0 scale per 32x32 tile (attention
@@ -152,6 +152,37 @@ pub enum Step<'a> {
     /// The held experts of `cands` (a `Candidates` step), each on row 0 of `x`, as the kernel makes them alone (to the
     /// bit): `[k, dim]`, unweighted, the row of one not held whatever it was.
     Held { held: &'a dyn std::any::Any, layer: u32, x: usize, cands: usize, limit: f32 },
+    /// A vector the device keeps from run to run (a layer's attention caches, the rotary tables: [`crate::dsv41::
+    /// attention::DeviceCaches`]): the step's vector, read and written in place by the steps that name it.
+    State(&'a ggml_rs::chain::DeviceVec),
+    /// [`crate::dsv41::ops::Rope::apply`] in place, to the bit: `rows` rows of `x` (`stride` apart), the `2 * half`
+    /// values from `at` of each, to the position the word `word` of `pos` says (an input of u32 words as f32 bits: the
+    /// step's numbers) or back from it, by the tables `cos`, `sin`.
+    Rope { x: usize, rows: usize, stride: usize, at: usize, half: usize, cos: usize, sin: usize, pos: usize, word: u32, inverse: bool },
+    /// [`crate::dsv41::formats::fake_quant_fp8_inplace`] of `len` values of `x`, to the bit.
+    Fp8 { x: usize, len: usize },
+    /// [`crate::dsv41::formats::fake_quant_fp4_inplace`] of `len` values of `x` in blocks of `block`, an e4m3 scale or a
+    /// power of two, to the bit.
+    Fp4 { x: usize, len: usize, block: usize, e4m3: bool },
+    /// `width` values of `src` into `dst`'s row the word `word` of `pos` says.
+    PutRow { src: usize, dst: usize, width: usize, pos: usize, word: u32 },
+    /// [`crate::dsv41::attention::pool`] of `ratio` rows of `kv` by `score`, rounded to bf16 (its exponentials the
+    /// device's own), `[width]`.
+    Pool { kv: usize, score: usize, ratio: usize, width: usize },
+    /// [`crate::dsv41::attention::index_scores`] of one row's `heads` queries against the first keys of `keys` the word
+    /// `word` of `pos` counts, the weights rounded to bf16 after `scale`, to the bit: `[keys' rows]`.
+    IndexScores { q: usize, keys: usize, weights: usize, heads: usize, dim: usize, scale: f32, pos: usize, word: u32 },
+    /// The `k` best of the first `scores` the word `word` of `pos` counts, by the host's order, their positions in
+    /// order into `dst` (u32 bits, `u32::MAX` past them), as a decode step's `select_compressed` picks them.
+    TopK { scores: usize, dst: usize, k: usize, pos: usize, word: u32 },
+    /// A decode step's [`crate::dsv41::attention::sparse_attend`] of every head of `q` over the window's `win` slots
+    /// and, where `compressed` is `(rows, picks, count)`, the rows of `rows` that `picks` names: `[heads, dim]`, rounded
+    /// to bf16 and not rotated back, its exponentials the device's own.
+    Attend { q: usize, heads: usize, dim: usize, window: usize, win: usize, compressed: Option<(usize, usize, usize)>, sink: &'a [f32], scale: f32, pos: usize, word: u32 },
+    /// [`crate::dsv41::hc::mixes_of`] of a stream (`n` wide) from its 24 projections `proj` and its sum of squares (the
+    /// word `word` of `pos`, [`crate::dsv41::hc::sumsq`]'s), laid out as [`crate::dsv41::hc::Mix::flat`] lays them (its
+    /// exponentials the device's own).
+    HcMix { proj: usize, pos: usize, word: u32, base: &'a [f32], scale: &'a [f32], n: usize, norm_eps: f32, iters: usize, hc_eps: f32 },
 }
 
 /// `steps` as one call where a device holds every matrix they multiply and takes them together

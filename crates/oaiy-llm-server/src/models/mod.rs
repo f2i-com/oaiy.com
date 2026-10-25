@@ -1100,6 +1100,24 @@ impl Models {
                         drafter = Some(d);
                     }
                 }
+                // Each decode step's attention on the first card, in each layer's one call with its output and router: its
+                // caches there, before the experts take the room. An EXL3 checkpoint's trunk on one card and no drafter
+                // (OAIY_DSV41_GPU_ATTENTION=0: on the CPU as before; =check: on the CPU as before and on the card beside
+                // it, from the CPU's caches, each step's differences said).
+                let asked = std::env::var("OAIY_DSV41_GPU_ATTENTION").ok();
+                if let Some(mode) = asked.as_deref().map_or(Some("1"), |m| matches!(m, "1" | "check").then_some(m)) {
+                    if home.is_some() || drafter.is_some() || !exl3 {
+                        if asked.is_some() {
+                            self.say(format!("{}: its attention stays on the CPU (on the GPU it takes an EXL3 checkpoint's trunk on one card and no drafter)", spec.name));
+                        }
+                    } else {
+                        let bytes = model.attend_on(Arc::new(b.clone()), mode == "check");
+                        // (its kernels made while the experts are read in, not in the first reply)
+                        let card = b.clone();
+                        std::thread::spawn(move || ggml_rs_wgpu::exl3::make_attention_kernels(&card));
+                        self.say(format!("{}: each decode step's attention on the first card, its caches {:.0} MB there{}", spec.name, bytes as f64 / 1e6, if mode == "check" { ", checked against the CPU's" } else { "" }));
+                    }
+                }
                 // A prompt's busy experts there too, through record slots in what the budget has left after the trunk,
                 // and the experts used most kept there in what is left after those (a decode step's computed there while
                 // the CPU reads and computes the rest).

@@ -190,6 +190,16 @@ impl WgpuChained {
                     S::SwigluBf16 { gate, up, len, silu, limit } => G::SwigluBf16 { gate, up, len, silu, limit },
                     S::Candidates { logits, bias, held, layer, k } => G::Candidates { logits, bias, table: held.downcast_ref::<super::exl3::WgpuExl3Experts>()?.fused_parts(layer)?.1, k },
                     S::Held { held, layer, x, cands, limit } => G::Held { slots: held.downcast_ref::<super::exl3::WgpuExl3Experts>()?.fused_parts(layer)?.0, x, cands, limit },
+                    S::State(v) => G::State(v),
+                    S::Rope { x, rows, stride, at, half, cos, sin, pos, word, inverse } => G::Rope { x, rows, stride, at, half, cos, sin, pos, word, inverse },
+                    S::Fp8 { x, len } => G::Fp8 { x, len },
+                    S::Fp4 { x, len, block, e4m3 } => G::Fp4 { x, len, block, e4m3 },
+                    S::PutRow { src, dst, width, pos, word } => G::PutRow { src, dst, width, pos, word },
+                    S::Pool { kv, score, ratio, width } => G::Pool { kv, score, ratio, width },
+                    S::IndexScores { q, keys, weights, heads, dim, scale, pos, word } => G::IndexScores { q, keys, weights, heads, dim, scale, pos, word },
+                    S::TopK { scores, dst, k, pos, word } => G::TopK { scores, dst, k, pos, word },
+                    S::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word } => G::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word },
+                    S::HcMix { proj, pos, word, base, scale, n, norm_eps, iters, hc_eps } => G::HcMix { proj, pos, word, base, scale, n, norm_eps, iters, hc_eps },
                 })
             })
             .collect()

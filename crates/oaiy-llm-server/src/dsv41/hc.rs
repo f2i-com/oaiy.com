@@ -59,6 +59,11 @@ impl HcParams {
     pub fn on_device(&self) -> Option<&Weight> {
         matches!(self.weight, Weight::Device { .. }).then_some(&self.weight)
     }
+
+    /// `(base, scale)`, as a device's [`mixes_of`] takes them.
+    pub(crate) fn base_scale(&self) -> (&[f32], &[f32]) {
+        (&self.base, &self.scale)
+    }
 }
 
 /// [`mixes`] of one token's stream `x` (`[HC * dim]`) from its 24 projections made elsewhere (`proj`: a device's,
@@ -66,7 +71,12 @@ impl HcParams {
 /// within roundings of the host's.
 pub fn mixes_of(proj: &[f32], x: &[f32], p: &HcParams, norm_eps: f32, iters: usize, hc_eps: f32) -> Mix {
     let proj: [f32; MIX] = proj[..MIX].try_into().expect("24 projections");
-    // (eight running sums: the one chain of 20,480 additions was a quarter of a step's mixing)
+    mixes_from_projection(&proj, sumsq(x), x.len(), p, norm_eps, iters, hc_eps)
+}
+
+/// The sum of squares of a token's stream [`mixes_of`] scales by, in eight running sums (the one chain of 20,480
+/// additions was a quarter of a step's mixing): a device's mixing takes it from here.
+pub fn sumsq(x: &[f32]) -> f32 {
     let mut lanes = [0.0f32; 8];
     for c in x.chunks_exact(8) {
         for (s, v) in lanes.iter_mut().zip(c) {
@@ -74,8 +84,7 @@ pub fn mixes_of(proj: &[f32], x: &[f32], p: &HcParams, norm_eps: f32, iters: usi
         }
     }
     let tail: f32 = x.chunks_exact(8).remainder().iter().map(|v| v * v).sum();
-    let sumsq = lanes.iter().sum::<f32>() + tail;
-    mixes_from_projection(&proj, sumsq, x.len(), p, norm_eps, iters, hc_eps)
+    lanes.iter().sum::<f32>() + tail
 }
 
 /// Per-token coefficients.

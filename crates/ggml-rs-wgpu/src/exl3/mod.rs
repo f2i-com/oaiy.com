@@ -15,6 +15,7 @@ use ggml_rs::{DeviceChain, DeviceVec, Tensor};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod attend;
 mod group;
 mod host;
 mod kernels;
