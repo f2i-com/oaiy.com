@@ -474,7 +474,8 @@ fn verify_qwen3vl_shapes(
     Ok(())
 }
 
-#[cfg(test)]
+// (its one test takes a WebGPU adapter)
+#[cfg(all(test, feature = "webgpu"))]
 mod tests {
     use super::*;
 

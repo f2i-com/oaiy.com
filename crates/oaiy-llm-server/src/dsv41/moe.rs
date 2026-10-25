@@ -489,6 +489,9 @@ impl Moe {
         shared_whole: Option<Vec<f32>>,
         fused: Option<FusedLater<'_>>,
     ) -> Result<(Vec<f32>, Vec<Route>)> {
+        // (held experts made behind the router's call come from a GPU's kernel alone)
+        #[cfg(not(feature = "webgpu"))]
+        drop(fused);
         let d = cfg.dim;
         let routes = route(cfg, &logits, &self.bias, t);
         let mut y = vec![0.0f32; t * d];
