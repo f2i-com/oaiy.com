@@ -80,7 +80,7 @@ impl WgpuBackend {
             DeviceChain::upload(self, &d, v);
             d
         };
-        let splits = 4096usize.div_ceil(n / 16).next_power_of_two().min(8).min(k / 16).max(1) as u32;
+        let splits = step_splits(k, n) as u32;
         let g = Group { words, suh: up(&suh), svh: up(&svh), k, n, tw, mwords: mw, splits };
         Some(Exl3Group { g, count: parts.len(), used: Arc::clone(&self.used), nbytes })
     }

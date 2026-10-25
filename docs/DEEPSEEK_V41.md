@@ -1310,6 +1310,71 @@ values, each code's place) made once for them, the same bits, was 3-8% faster at
 projections and slower on the small ones at four and eight; left out. What bounds it is the tile
 loop's decode itself.
 
+## Fewer parts, fewer instructions (2026-10-26)
+
+That last line was wrong: with a tile's decode taken out (its table read, or its byte sum), the
+one-row kernel took the same time. What it paid for was its parts. A projection's rows were summed
+in parts aimed at 4,096 workgroups a matrix (at most 8), each part a workgroup's table, its eight
+warps' two or three tiles each and its reduction; and a group of matrices in one call (a layer's
+held experts) has as many workgroups again for each. `splits_for` now aims at some 1,024 a matrix,
+2 to 8 parts, and every one-row projection (the cards' and the host's alike) is split so. At 3
+bits, a call's time (`measure_one_row_splits`):
+
+| Shape | 8 parts | Now |
+|---|---|---|
+| An expert's gate [2304, 5120], one matrix / four | 9.8 / 27.1 us | 9.7 / 25.0 us (4 parts) |
+| An expert's down [5120, 2304], one / four / eight | 10.7 / 34.3 / 67.5 us | 8.8 / 25.1 / 47.1 us (2) |
+| [10240, 2560] (Flash-Next) | 19.0 us | 15.8 us (2) |
+
+(At one part a matrix of 1,024 tile columns went past a wave of the card's workgroups, 27.0 us
+where 22.6 at two, so no fewer than two.) The sums are added in other parts, so replies' words
+differ from before at places (the sky's "because of" is now "due to"), and the states kept on disk
+are known by another name (v2), so the first agent run after it reads its instructions again.
+
+The host's experts found each code by two permutes of the tile's words and three shifts; a lane's
+eight codes lie at fixed steps after its first, so its stream is now made once a tile from the three
+words it lies in, and each code is a shift and a mask of it (with VBMI2's double shifts where the
+CPU has them; `OAIY_EXL3_STEP_NO_VBMI2`): a thread's rate 16.8 weights a ns where 12.9, the same
+bits (the vector-sums test now at 1 to 4 bits a weight). Its records in the caches, six experts a
+call 0.28 ms each where 0.34.
+
+From memory the host's experts are near what this computer's memory gives them. Twelve threads read
+42.5 GB/s each its part as it lies, 42.8 in whole 13.8 KB rows in turn and 34.3 in runs of 3 KB
+14 KB apart (`measure_host_read_rate`; DDR5 at 3,600 MT/s, two channels: four sticks of 48 GB,
+AMD's rate for two a channel), and a task of a split's rows over a part of the columns reads such
+runs: six experts a call from 8 GB of records 0.44 ms each, some 30 GB/s (12 records, 160 MB,
+measured 0.33: they were partly in the L3 as they came round again). Tried and left out: a task of
+some warps of every column (whole rows as they lie, each warp's sums kept for a reduction after):
+0.58 ms an expert, its sums through 8 to 14 MB of memory where a task's stayed in its caches; the
+next tile row's tiles prefetched a row ahead, and one or two tasks a thread where three: the same.
+
+The EXL3 checkpoint as OAIY runs it (its profile, `--webgpu-gb 27`, `--ram-gb 153`), second
+rounds, two runs each in turn:
+
+| Reply | Before | After |
+|---|---|---|
+| A familiar subject | 19.6, 19.6 tok/s | 19.9, 19.9 tok/s |
+| Code | 13.2, 13.3 tok/s | 13.9, 13.8 tok/s |
+| The same again | 19.6, 19.8 tok/s | 20.4, 20.3 tok/s |
+| A new subject | 16.7, 16.8 tok/s | 16.9, 16.9 tok/s |
+
+The code reply's experts on the host 5.2 s where 6.05 (an expert 0.43 ms where 0.48); its time on
+the first card ("dense on the device") the same, 4.9 s. Qwen3.8-Flash-Next (EXL3, 3.05 bits) 69.7
+to 79.6 tok/s where 66.0 to 78.4, OrcaSAQ-2-27B 51.5 to 57.4 where 49.6 to 55.0, the same asks.
+
+What the first card's time is made of, a reply's kernels on the GPU (`OAIY_CHAIN_PROFILE`, each
+dispatch timed alone, a trivial kernel some 2.6 us so): every token reads the whole trunk, 7.2 GB in
+750 matrices, of which `wo_b` and the shared expert's `w2` of layers 10 to 36 are bf16 (84 and 24 MB
+a layer, 2.9 GB a token, read at some 1.5 TB/s). The rest of a layer's chain is short kernels of one
+thread or few: the norms as the host adds them (one thread, 13 us each, three a layer), the
+hyper-connections' mixing (one thread, 28 us), the attention's scores, parts and join (30, 18 and 6
+us at a short context), the candidates (15), the f32 projections of the mixing (24 rows, 11 us
+each, two a layer): some 180 us a layer as timed, 7 ms a token. These are next: each is the host's
+order of adds, so a parallel form needs the host's sums in that order too.
+
+Promoting experts on one thread where four: the same (code 14.0 where 13.7 tok/s, the host's experts
+6.0 s where 6.2).
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

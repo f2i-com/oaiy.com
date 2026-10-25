@@ -504,7 +504,7 @@ fn the_one_row_kernels_sums_are_the_hosts_multiply_adds() {
 #[test]
 fn the_hosts_vector_sums_are_its_emulations() {
     let (k, n) = (5120, 2304);
-    for tw in [32, 48, 64] {
+    for tw in [16, 32, 48, 64] {
         let data = random_exl3(k, n, tw, 300 + tw as u32);
         let record: Vec<u8> = data.words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let mut s = 0x9e37_79b9u32;
@@ -557,17 +557,21 @@ fn the_hosts_step_experts_together_are_each_alone() {
 }
 
 /// What a decode step's experts cost on the host's cores (`--ignored --nocapture`) at DeepSeek-V4.1's shape (5120 to
-/// 2304, 3 bits): one, two and six experts a call, each its own record, records in turn past the caches as a step's are.
+/// 2304, 3 bits): one, two and six experts a call, each its own record, records in turn past the caches as a step's are:
+/// 12 records copied into 600 places (8 GB, as a RAM tier's are many), each met once in a while (the 12 alone, 160 MB,
+/// were partly in a Ryzen 9950X3D's 128 MB of L3 as they came round again: six a call 0.33 ms an expert where 0.43).
 #[test]
 #[ignore = "a measurement"]
 fn measure_step_experts_on_the_host() {
     let (hidden, ff, tw, limit) = (5120, 2304, 48, 10.0);
     let (layout, records, _) = as_records(experts(12, hidden, ff, tw));
+    let pool = 600;
+    let copies: Vec<Vec<u8>> = (0..pool).map(|i| records.0[i % 12].clone()).collect();
     let x: Vec<f32> = (0..hidden).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
     for n in [1usize, 2, 6] {
         let mut at = 0;
         let mut call = || {
-            let jobs: Vec<(&[u8], &[f32])> = (0..n).map(|j| (&records.0[(at + j) % 12][..], &x[..])).collect();
+            let jobs: Vec<(&[u8], &[f32])> = (0..n).map(|j| (&copies[(at * 7 + j * 13) % pool][..], &x[..])).collect();
             at += n;
             drop(step_experts_host(&jobs, &layout, limit, true));
         };
@@ -1131,6 +1135,102 @@ fn measure_chained_projections() {
                 one = each;
             }
             line += &format!(" {rows} rows {:.1} us ({:.2}x, {:.0} GB/s);", each * 1e6, each / one, bytes / each / 1e9);
+        }
+        eprintln!("{line}");
+    }
+}
+
+/// What the host's memory gives its cores (`--ignored --nocapture`): 8, 12 and 16 threads over 4 GB, each its part as
+/// it lies, or in runs of 3 KB 14 KB apart (a task of [`step_experts_host`] reads a tile row's few columns, then the
+/// next row's), or whole rows of 13.8 KB in turn. On a Ryzen 9950X3D with DDR5 at 3,600 MT/s (two channels): 42.5,
+/// 34.3 and 42.8 GB/s at 12.
+#[test]
+#[ignore = "a measurement"]
+fn measure_host_read_rate() {
+    let len = 4usize << 30;
+    let data: Vec<u64> = (0..len / 8).map(|i| i as u64).collect();
+    for threads in [8usize, 12, 16] {
+        for (what, run, stride) in [("contiguous", 0usize, 0usize), ("3 KB runs 14 KB apart", 3072 / 8, 13824 / 8), ("13.8 KB rows in turn", 13824 / 8, 13824 / 8)] {
+            let t = std::time::Instant::now();
+            let total: u64 = std::thread::scope(|s| {
+                let per = data.len() / threads;
+                let hs: Vec<_> = (0..threads)
+                    .map(|i| {
+                        let part = &data[i * per..(i + 1) * per];
+                        s.spawn(move || {
+                            if run == 0 {
+                                return part.iter().fold(0u64, |a, &v| a.wrapping_add(v));
+                            }
+                            // the part read as columns of runs: run `c` of every row, then the next
+                            let rows = part.len() / stride;
+                            let mut acc = 0u64;
+                            for c in 0..(stride / run).max(1) {
+                                for r in 0..rows {
+                                    let at = r * stride + c * run;
+                                    acc = part[at..(at + run).min(part.len())].iter().fold(acc, |a, &v| a.wrapping_add(v));
+                                }
+                            }
+                            acc
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).fold(0, u64::wrapping_add)
+            });
+            let s = t.elapsed().as_secs_f64();
+            eprintln!("{threads} threads, {what}: {:.1} GB/s ({total})", len as f64 / s / 1e9);
+        }
+    }
+}
+
+/// The one-row kernel alone by how many parts it sums a matrix's rows in (`--ignored --nocapture`; [`splits_for`] is
+/// chosen by it): DeepSeek-V4.1's expert shapes at 3 bits, or `MEASURE_SHAPES` (`n:k,..`), one matrix a call or
+/// `MEASURE_JOBS` (`1,2,4,..`) of them one after another in a buffer as a group's are, matrices in turn past the L2.
+#[test]
+#[ignore = "a measurement"]
+fn measure_one_row_splits() {
+    let Some(b) = backend() else { return };
+    let kn: Vec<(usize, usize)> = std::env::var("MEASURE_SHAPES").ok().map_or(vec![(5120, 2304), (2304, 5120), (4096, 1024), (1024, 4096)], |v| {
+        v.split(',').map(|s| s.split_once(':').map(|(n, k)| (k.parse().unwrap(), n.parse().unwrap())).unwrap()).collect()
+    });
+    let shapes: Vec<(usize, usize, usize)> = std::env::var("MEASURE_JOBS").ok().map_or(vec![1], |v| v.split(',').map(|s| s.parse().unwrap()).collect()).into_iter().flat_map(|j| kn.iter().map(move |&(k, n)| (k, n, j))).collect();
+    for (k, n, nj) in shapes {
+        // `nj` matrices a dispatch, one after another in a buffer, as a group's are
+        let count = (160_000_000 / (k / 16 * n / 16 * 96 * nj)).max(2);
+        let ws: Vec<_> = (0..count as u32).map(|i| b.exl3(random_exl3(k, n * nj, 48, 700 + i)).unwrap()).collect();
+        let g: Vec<&Exl3Gpu> = ws.iter().map(|w| w.as_any().unwrap().downcast_ref::<Exl3Gpu>().unwrap()).collect();
+        let (xh, part) = (b.vec(nj * k), b.vec(nj * 32 * n));
+        DeviceChain::upload(&b, &xh, &(0..nj * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0).collect::<Vec<_>>());
+        let jobs = u32_vec(&b, &(0..nj as u32).flat_map(|j| [j, j]).collect::<Vec<_>>());
+        let ntiles = (n / 16) as u32;
+        let reps = 4 * count;
+        let per = (k / 16 * n / 16 * 24) as u32;
+        let bytes = (per as usize * 4 * nj) as f64;
+        let (name, src) = one_row_kernel(48);
+        let mut line = format!("{nj} x [{n}, {k}] ({:.1} MB):", bytes / 1e6);
+        for splits in [1u32, 2, 4, 8, 16, 32] {
+            if splits as usize > k / 16 {
+                continue;
+            }
+            let run = || {
+                use ggml_rs::ChainRecorder;
+                let mut rec = crate::chain::Recorder::new(&b);
+                let d = rec.gpu().dummy().clone();
+                let drw = rec.gpu().dummy_rw().clone();
+                let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().unwrap().clone();
+                for i in 0..reps {
+                    let (words, _) = g[i % count].single_chunk().unwrap();
+                    rec.dispatch_wide(name, src, [words, &buf(&xh), &buf(&jobs), &d, &d, &d, &buf(&part), &drw], &[n as u32, k as u32, 48, splits, per, 0], (ntiles, 1, nj as u32 * splits));
+                }
+                rec.read_range(&part, 0, 1);
+                Box::new(rec).finish();
+            };
+            run();
+            let t = std::time::Instant::now();
+            for _ in 0..5 {
+                run();
+            }
+            let each = t.elapsed().as_secs_f64() / 5.0 / reps as f64;
+            line += &format!(" {splits}: {:.1} us ({:.0} GB/s);", each * 1e6, bytes / each / 1e9);
         }
         eprintln!("{line}");
     }

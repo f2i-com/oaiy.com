@@ -150,8 +150,7 @@ impl WgpuBackend {
                 usage: if mapped { usage | wgpu::BufferUsages::MAP_WRITE } else { usage },
                 mapped_at_creation: false,
             });
-            let ntiles = n / 16;
-            let splits = 4096usize.div_ceil(ntiles).next_power_of_two().min(8).min(k / 16).max(1) as u32;
+            let splits = step_splits(k, n) as u32;
             Group { words, suh: self.vec(matrices * k), svh: self.vec(matrices * n), k, n, tw, mwords: mw, splits }
         };
         let gu = group(2 * n, hidden, ff, tw[0]);

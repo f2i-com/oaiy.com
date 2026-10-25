@@ -77,8 +77,8 @@ impl Exl3Gpu {
             let rows = per.min(ktiles - first);
             let slice = &bytes[first * row_bytes..(first + rows) * row_bytes];
             let (buffer, _, _) = gpu.upload_rows(slice, slice.len(), 1).remove(0);
-            // As the CUDA kernel splits: enough workgroups to fill a large GPU, at most 8 slots of partial sums.
-            let splits = 4096usize.div_ceil(ntiles).next_power_of_two().min(8).min(rows).max(1);
+            // (as every one-row projection splits: `splits_for`)
+            let splits = splits_for(rows, ntiles);
             chunks.push((buffer, first as u32, rows as u32, splits as u32));
             first += rows;
         }

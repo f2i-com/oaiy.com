@@ -8,10 +8,23 @@
 
 use super::*;
 
-/// The splits of a one-row projection's tile rows a card's slots make (`Exl3Slots`' groups: enough workgroups to fill
-/// a large GPU, at most 8): its partial sums are added in this many parts, so the host's must be too.
+/// The splits of a one-row projection's tile rows a card's slots make ([`splits_for`]): its partial sums are added in
+/// this many parts, so the host's must be too.
 pub fn step_splits(k: usize, n: usize) -> usize {
-    4096usize.div_ceil(n / 16).next_power_of_two().min(8).min(k / 16).max(1)
+    splits_for(k / 16, n / 16)
+}
+
+/// How many parts a one-row projection of `ktiles` tile rows and `ntiles` tile columns sums its rows in (a workgroup
+/// a tile column and part): some 1,024 workgroups a matrix, a power of two from 2 to 8 (and no more than its tile
+/// rows). Every one-row kernel's projection is split so, its card's and the host's alike. Aimed at 4,096 workgroups
+/// a matrix (at most 8 parts), an RTX 5090 was slower: a workgroup's table and its sums' reduction are made for every
+/// part, and a part of 8 was two or three tiles a warp; and a group of matrices in one call has as many workgroups
+/// again for each. At 3 bits, the time of a call by parts, one matrix and a group of four (`measure_one_row_splits`):
+/// an expert's gate [2304, 5120] 9.8 and 27.1 us at 8 where 9.7 and 25.0 at 4; its down [5120, 2304] 10.7 and 34.3 at
+/// 8 where 8.8 and 25.1 at 2; [10240, 2560] 19.0 at 8 where 15.8 at 2. At one part, a matrix of 1,024 tile columns
+/// went past a wave of the card's workgroups (27.0 us where 22.6 at 2), so no fewer than 2.
+pub fn splits_for(ktiles: usize, ntiles: usize) -> usize {
+    (1usize << (1024 / ntiles.max(1)).max(1).ilog2()).clamp(2, 8).min(ktiles).max(1)
 }
 
 /// The SwiGLU's `silu(g)` of every value a step's gate output can take (an f16's, by its bits: the output transform
@@ -251,10 +264,12 @@ fn column_sums(lo: &[[[f32; 32]; 8]], hi: &[[[f32; 32]; 8]]) -> Vec<f32> {
 }
 /// [`split_sums`] on AVX-512's vectors (with its byte dot products, VNNI's): a vector a half of a warp's 32 lanes,
 /// each vector lane one GPU lane's, so each sum is that lane's in its order (the products are exact in f32, an f16
-/// input's by an f16 weight's, so a multiply-add is the card's multiply and add); a code's 16 bits found by two
-/// permutes of the tile's words and two shifts by amounts made once for the bitrate, its value in mul1's closed form
-/// (the byte sum a dot product, the one rounding to f16 the conversion's, to nearest even). The warps' and lanes' sums
-/// added as the card adds them. Some ten times the scalar emulation's speed.
+/// input's by an f16 weight's, so a multiply-add is the card's multiply and add); a lane's stream from its first code
+/// on made once a tile from the three words it lies in (by permutes of the tile's words and shifts made once for the
+/// bitrate), each of its eight codes a shift of that (a lane's code `j` starts `j` times the bitrate after its first,
+/// whatever the lane, as the card's kernel finds them), its value in mul1's closed form (the byte sum a dot product,
+/// the one rounding to f16 the conversion's, to nearest even). The warps' and lanes' sums added as the card adds them.
+/// Some ten times the scalar emulation's speed.
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use std::arch::x86_64::*;
@@ -271,12 +286,11 @@ mod avx512 {
         })
     }
 
-    /// Where a bitrate's codes lie for each half `h` of a warp's lanes and code `j`: each vector lane's word (the
-    /// tile's, 0 to 31), the word after it, and how far into the first the code starts.
+    /// Where a bitrate's codes lie for each half `h` of a warp's lanes: each vector lane's first code's word (the
+    /// tile's, 0 to 31) and the two after it (the stream goes round), and how far into the first that code starts.
     struct Plan {
-        first: [[[u32; 16]; 8]; 2],
-        next: [[[u32; 16]; 8]; 2],
-        into: [[[u32; 16]; 8]; 2],
+        words: [[[u32; 16]; 3]; 2],
+        into: [[u32; 16]; 2],
     }
 
     fn plan(tile_words: usize) -> &'static Plan {
@@ -287,16 +301,15 @@ mod avx512 {
                     (tw % 16 == 0 && tw >= 16).then(|| {
                         let (nw, b) = (tw / 2, tw / 16);
                         let bits = nw * 32;
-                        let mut p = Plan { first: [[[0; 16]; 8]; 2], next: [[[0; 16]; 8]; 2], into: [[[0; 16]; 8]; 2] };
+                        let mut p = Plan { words: [[[0; 16]; 3]; 2], into: [[0; 16]; 2] };
                         for h in 0..2 {
-                            for j in 0..8 {
-                                for i in 0..16 {
-                                    let l = 16 * h + i;
-                                    let at = (b * (8 * l + j + 1) + bits - 16) % bits;
-                                    p.first[h][j][i] = (at / 32) as u32;
-                                    p.next[h][j][i] = ((at / 32 + 1) % nw) as u32;
-                                    p.into[h][j][i] = (at % 32) as u32;
+                            for i in 0..16 {
+                                let l = 16 * h + i;
+                                let at = (b * (8 * l + 1) + bits - 16) % bits;
+                                for (w, word) in p.words[h].iter_mut().enumerate() {
+                                    word[i] = ((at / 32 + w) % nw) as u32;
                                 }
+                                p.into[h][i] = (at % 32) as u32;
                             }
                         }
                         p
@@ -306,6 +319,18 @@ mod avx512 {
         })[tile_words]
             .as_ref()
             .expect("a whole number of bits a weight")
+    }
+
+    /// What [`sums_into`] finds a tile's codes by: for each half of a warp's lanes, the words its lanes' streams start
+    /// in and the shifts that make them (`into`, and `back`, 32 less it); and for each code `j`, which of a lane's two
+    /// views it lies in (bits 0 to 32 of its stream, or 16 to 48 where `wide`) and the shift that puts it lowest.
+    struct Codes {
+        words: [[__m512i; 3]; 2],
+        into: [__m512i; 2],
+        back: [__m512i; 2],
+        wide: bool,
+        from_m: [bool; 8],
+        shift: [__m512i; 8],
     }
 
     /// Sixteen f16 values from `bytes` (little-endian) as f32s.
@@ -383,16 +408,22 @@ mod avx512 {
         let (kts, ntiles, nw) = (k / 16, n / 16, tile_words / 2);
         assert!(tile_words % 16 == 0 && (16..=64).contains(&tile_words) && cols.end <= ntiles && rows.end <= kts && xh.len() >= k && trellis.len() >= kts * ntiles * nw * 4);
         let p = plan(tile_words);
-        // the code vectors' word indices and shifts, and the input's four patterns (rows 2 (l % 4) + 0, 1, 8 and 9)
+        // where the lanes' streams start and where in them each code lies (code `j` at `j b` bits on: at most 28, so in
+        // bits 0 to 32 or 16 to 48), and the input's four patterns (rows 2 (l % 4) + 0, 1, 8 and 9)
         let zero = _mm512_setzero_si512();
-        let (mut first, mut next, mut into, mut back) = ([[zero; 8]; 2], [[zero; 8]; 2], [[zero; 8]; 2], [[zero; 8]; 2]);
+        let b = tile_words / 16;
+        let mut codes = Codes { words: [[zero; 3]; 2], into: [zero; 2], back: [zero; 2], wide: 7 * b > 16, from_m: [false; 8], shift: [zero; 8] };
         for h in 0..2 {
-            for j in 0..8 {
-                first[h][j] = ld(&p.first[h][j]);
-                next[h][j] = ld(&p.next[h][j]);
-                into[h][j] = ld(&p.into[h][j]);
-                back[h][j] = _mm512_sub_epi32(_mm512_set1_epi32(32), into[h][j]);
+            for w in 0..3 {
+                codes.words[h][w] = ld(&p.words[h][w]);
             }
+            codes.into[h] = ld(&p.into[h]);
+            codes.back[h] = _mm512_sub_epi32(_mm512_set1_epi32(32), codes.into[h]);
+        }
+        for j in 0..8 {
+            let o = (j * b) as i32;
+            codes.from_m[j] = o > 16;
+            codes.shift[j] = _mm512_set1_epi32(if o > 16 { 32 - o } else { 16 - o });
         }
         let mut xidx = [zero; 4];
         for (m, o) in [0u32, 1, 8, 9].into_iter().enumerate() {
@@ -409,79 +440,132 @@ mod avx512 {
         thread_local! {
             static ACC: std::cell::RefCell<Vec<[[f32; 64]; 8]>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        // (OAIY_EXL3_STEP_NO_VBMI2: the views by shifts where the CPU has VBMI2's double shifts too)
+        static VBMI2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let vbmi2 = *VBMI2.get_or_init(|| is_x86_feature_detected!("avx512vbmi2") && std::env::var_os("OAIY_EXL3_STEP_NO_VBMI2").is_none());
         ACC.with_borrow_mut(|acc| {
             acc.clear();
             acc.resize(cols.len(), [[0f32; 64]; 8]);
-            sums_into(acc, trellis, ntiles, nw, xh, rows, cols, &first, &next, &into, &back, &xidx, rest)
+            if vbmi2 {
+                sums_into_vbmi2(acc, trellis, ntiles, nw, xh, rows, cols.clone(), &codes, &xidx, rest);
+            } else {
+                sums_into(acc, trellis, ntiles, nw, xh, rows, cols.clone(), &codes, &xidx, rest);
+            }
+            // each column's sums as `super::column_sums` adds them: lane l's lo (columns 0..8) or hi, the warps in order
+            let mut out = vec![0f32; cols.len() * 16];
+            for (col, sums) in acc.iter().zip(out.chunks_exact_mut(16)) {
+                for (c, sum) in sums.iter_mut().enumerate() {
+                    let mut total = 0.0f32;
+                    for warp in col {
+                        for q in 0..4 {
+                            let l = (c % 8) * 4 + q;
+                            total += warp[(2 * (l / 16) + c / 8) * 16 + l % 16];
+                        }
+                    }
+                    *sum = total;
+                }
+            }
+            out
         })
     }
 
-    /// [`split_sums`]' tiles into `acc` and the columns' sums of them.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn sums_into(
-        acc: &mut [[[f32; 64]; 8]],
-        trellis: &[u8],
-        ntiles: usize,
-        nw: usize,
-        xh: &[f32],
-        rows: std::ops::Range<usize>,
-        cols: std::ops::Range<usize>,
-        first: &[[__m512i; 8]; 2],
-        next: &[[__m512i; 8]; 2],
-        into: &[[__m512i; 8]; 2],
-        back: &[[__m512i; 8]; 2],
-        xidx: &[__m512i; 4],
-        rest: __mmask16,
-    ) -> Vec<f32> {
-        let (mul, ones, base) = (_mm512_set1_epi32(0x83dc_d12du32 as i32), _mm512_set1_epi32(0x0101_0101), _mm512_set1_epi32(1024));
-        let (scale, shift) = (_mm512_set1_ps(1774.0 / 262_144.0), _mm512_set1_ps(10.382_812_5));
-        for kt in rows.clone() {
-            let w = (kt - rows.start) % 8;
-            let x = _mm512_loadu_ps(xh.as_ptr().add(kt * 16));
-            let xv = [_mm512_permutexvar_ps(xidx[0], x), _mm512_permutexvar_ps(xidx[1], x), _mm512_permutexvar_ps(xidx[2], x), _mm512_permutexvar_ps(xidx[3], x)];
-            for nt in cols.clone() {
-                let at = trellis.as_ptr().add((kt * ntiles + nt) * nw * 4);
-                // (the tile's nw words lie within `trellis`, asserted above; the second load reads only the words past
-                // sixteen, masked)
-                let t0 = _mm512_loadu_si512(at as *const __m512i);
-                let t1 = _mm512_maskz_loadu_epi32(rest, at.add(64) as *const i32);
-                let sums = acc[nt - cols.start][w].as_mut_ptr();
-                let mut a = [_mm512_loadu_ps(sums), _mm512_loadu_ps(sums.add(16)), _mm512_loadu_ps(sums.add(32)), _mm512_loadu_ps(sums.add(48))];
-                for h in 0..2 {
-                    for j in 0..8 {
-                        let wa = _mm512_permutex2var_epi32(t0, first[h][j], t1);
-                        let wb = _mm512_permutex2var_epi32(t0, next[h][j], t1);
-                        let code = _mm512_srli_epi32::<16>(_mm512_or_si512(_mm512_sllv_epi32(wa, into[h][j]), _mm512_srlv_epi32(wb, back[h][j])));
-                        let sum = _mm512_dpbusd_epi32(base, _mm512_mullo_epi32(code, mul), ones);
-                        let v = _mm512_fmsub_ps(_mm512_cvtepi32_ps(sum), scale, shift);
-                        let w16 = _mm512_cvtph_ps(_mm512_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v));
-                        let i = 2 * h + j / 4;
-                        a[i] = _mm512_fmadd_ps(xv[j % 4], w16, a[i]);
-                    }
-                }
-                _mm512_storeu_ps(sums, a[0]);
-                _mm512_storeu_ps(sums.add(16), a[1]);
-                _mm512_storeu_ps(sums.add(32), a[2]);
-                _mm512_storeu_ps(sums.add(48), a[3]);
-            }
-        }
-        // each column's sums as `super::column_sums` adds them: lane l's lo (columns 0..8) or hi, the warps in order
-        let mut out = vec![0f32; cols.len() * 16];
-        for (col, sums) in acc.iter().zip(out.chunks_exact_mut(16)) {
-            for (c, sum) in sums.iter_mut().enumerate() {
-                let mut total = 0.0f32;
-                for warp in col {
-                    for q in 0..4 {
-                        let l = (c % 8) * 4 + q;
-                        total += warp[(2 * (l / 16) + c / 8) * 16 + l % 16];
-                    }
-                }
-                *sum = total;
-            }
-        }
-        out
+    /// The 32 bits of a stream from `into` bits into word `hi` (`lo` the word after it, `back` 32 less `into`).
+    macro_rules! join_shifts {
+        ($hi:expr, $lo:expr, $into:expr, $back:expr) => {
+            _mm512_or_si512(_mm512_sllv_epi32($hi, $into), _mm512_srlv_epi32($lo, $back))
+        };
     }
+    macro_rules! join_vbmi2 {
+        ($hi:expr, $lo:expr, $into:expr, $back:expr) => {{
+            let _ = $back;
+            _mm512_shldv_epi32($hi, $lo, $into)
+        }};
+    }
+    /// Bits 16 to 48 of two words.
+    macro_rules! mid_shifts {
+        ($a0:expr, $a1:expr) => {
+            _mm512_or_si512(_mm512_slli_epi32::<16>($a0), _mm512_srli_epi32::<16>($a1))
+        };
+    }
+    macro_rules! mid_vbmi2 {
+        ($a0:expr, $a1:expr) => {
+            _mm512_shldi_epi32::<16>($a0, $a1)
+        };
+    }
+
+    /// [`split_sums`]' tiles into `acc`, a lane's views made by `$join` and `$mid`.
+    macro_rules! sums_into {
+        ($(#[$doc:meta])* $name:ident, $features:literal, $join:ident, $mid:ident) => {
+            $(#[$doc])*
+            #[target_feature(enable = $features)]
+            #[allow(clippy::too_many_arguments)]
+            unsafe fn $name(
+                acc: &mut [[[f32; 64]; 8]],
+                trellis: &[u8],
+                ntiles: usize,
+                nw: usize,
+                xh: &[f32],
+                rows: std::ops::Range<usize>,
+                cols: std::ops::Range<usize>,
+                codes: &Codes,
+                xidx: &[__m512i; 4],
+                rest: __mmask16,
+            ) {
+                let (mul, ones, base) = (_mm512_set1_epi32(0x83dc_d12du32 as i32), _mm512_set1_epi32(0x0101_0101), _mm512_set1_epi32(1024));
+                let low = _mm512_set1_epi32(0xffff);
+                let (scale, shift) = (_mm512_set1_ps(1774.0 / 262_144.0), _mm512_set1_ps(10.382_812_5));
+                for kt in rows.clone() {
+                    let w = (kt - rows.start) % 8;
+                    let x = _mm512_loadu_ps(xh.as_ptr().add(kt * 16));
+                    let xv = [_mm512_permutexvar_ps(xidx[0], x), _mm512_permutexvar_ps(xidx[1], x), _mm512_permutexvar_ps(xidx[2], x), _mm512_permutexvar_ps(xidx[3], x)];
+                    for nt in cols.clone() {
+                        let at = trellis.as_ptr().add((kt * ntiles + nt) * nw * 4);
+                        // (the tile's nw words lie within `trellis`, asserted above; the second load reads only the
+                        // words past sixteen, masked)
+                        let t0 = _mm512_loadu_si512(at as *const __m512i);
+                        let t1 = _mm512_maskz_loadu_epi32(rest, at.add(64) as *const i32);
+                        let sums = acc[nt - cols.start][w].as_mut_ptr();
+                        let mut a = [_mm512_loadu_ps(sums), _mm512_loadu_ps(sums.add(16)), _mm512_loadu_ps(sums.add(32)), _mm512_loadu_ps(sums.add(48))];
+                        for h in 0..2 {
+                            // each lane's stream from its first code: bits 0 to 32 (`a0`), and 16 to 48 (`m0`) where
+                            // its codes reach past 32 (a shift of 32 is none: `back` 32 shifts a word out whole)
+                            let (into, back) = (codes.into[h], codes.back[h]);
+                            let q0 = _mm512_permutex2var_epi32(t0, codes.words[h][0], t1);
+                            let q1 = _mm512_permutex2var_epi32(t0, codes.words[h][1], t1);
+                            let a0 = $join!(q0, q1, into, back);
+                            let m0 = if codes.wide {
+                                let q2 = _mm512_permutex2var_epi32(t0, codes.words[h][2], t1);
+                                $mid!(a0, $join!(q1, q2, into, back))
+                            } else {
+                                a0
+                            };
+                            for j in 0..8 {
+                                let code = _mm512_and_si512(_mm512_srlv_epi32(if codes.from_m[j] { m0 } else { a0 }, codes.shift[j]), low);
+                                let sum = _mm512_dpbusd_epi32(base, _mm512_mullo_epi32(code, mul), ones);
+                                let v = _mm512_fmsub_ps(_mm512_cvtepi32_ps(sum), scale, shift);
+                                let w16 = _mm512_cvtph_ps(_mm512_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v));
+                                let i = 2 * h + j / 4;
+                                a[i] = _mm512_fmadd_ps(xv[j % 4], w16, a[i]);
+                            }
+                        }
+                        _mm512_storeu_ps(sums, a[0]);
+                        _mm512_storeu_ps(sums.add(16), a[1]);
+                        _mm512_storeu_ps(sums.add(32), a[2]);
+                        _mm512_storeu_ps(sums.add(48), a[3]);
+                    }
+                }
+            }
+        };
+    }
+
+    sums_into!(sums_into, "avx512f,avx512bw,avx512vnni", join_shifts, mid_shifts);
+    sums_into!(
+        /// [`sums_into`] with VBMI2's double shifts making a lane's views (one instruction where three were).
+        sums_into_vbmi2,
+        "avx512f,avx512bw,avx512vnni,avx512vbmi2",
+        join_vbmi2,
+        mid_vbmi2
+    );
 }
 
 /// One decode step's expert of `record` (laid out as `layout` says) on the host's thread, as [`Exl3Slots`] makes a

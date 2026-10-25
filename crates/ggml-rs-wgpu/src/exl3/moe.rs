@@ -290,8 +290,7 @@ impl Exl3MoeGrouped {
                 DeviceChain::upload(b, &d, v);
                 d
             };
-            let ntiles = n / 16;
-            let splits = 4096usize.div_ceil(ntiles).next_power_of_two().min(8).min(k / 16).max(1) as u32;
+            let splits = step_splits(k, n) as u32;
             Group { words, suh: up(&suh), svh: up(&svh), k, n, tw, mwords: mw, splits }
         };
         let gu = group(&[0, 1], hidden, ff, first[0].tile_words);
@@ -340,8 +339,7 @@ impl Exl3MoeGrouped {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            let ntiles = n / 16;
-            let splits = 4096usize.div_ceil(ntiles).next_power_of_two().min(8).min(k / 16).max(1) as u32;
+            let splits = step_splits(k, n) as u32;
             Group { words, suh: b.vec(matrices * k), svh: b.vec(matrices * n), k, n, tw, mwords: mw, splits }
         };
         let gu = group(2 * slots, hidden, ff, tw[0]);

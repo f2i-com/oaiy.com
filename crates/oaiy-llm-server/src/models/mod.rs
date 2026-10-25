@@ -1199,10 +1199,11 @@ impl Models {
         let draft_min = std::env::var("OAIY_DSV41_DRAFT_MIN").ok().and_then(|v| v.parse().ok());
         let draft_max = std::env::var("OAIY_DSV41_DRAFTS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
         // Its prompt states on disk (`--prompt-cache`): a system turn's, so a later start reads on from it. Known by the
-        // checkpoint's files and the context, which sizes every state's caches.
+        // checkpoint's files and the context, which sizes every state's caches, and the engine's arithmetic (v2: the
+        // one-row kernels' sums in other parts, `splits_for`).
         let disk = match &o.prompt_cache {
             Some(dir) => {
-                let mut fp = disk::fnv(b"dsv41-portable-state-v1", 0);
+                let mut fp = disk::fnv(b"dsv41-portable-state-v2", 0);
                 fp = disk::fnv(&(max_seq as u64).to_le_bytes(), fp);
                 fp = disk::fnv(spec.path.as_os_str().as_encoded_bytes(), fp);
                 let mut files: Vec<PathBuf> = if spec.path.is_dir() {
