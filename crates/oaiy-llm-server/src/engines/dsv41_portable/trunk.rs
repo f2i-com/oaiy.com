@@ -162,6 +162,12 @@ impl DenseKernel for WgpuChained {
         let (now, then) = ggml_rs_wgpu::exl3::run_program_parts(&self.b, &self.program(steps)?, reads, split, later)?;
         Some((now, Box::new(move || then.wait())))
     }
+
+    /// The program as one recording on this adapter with vectors of its own for this run (`ggml_rs_wgpu::exl3::
+    /// run_program_once`).
+    fn run_program_once(&self, steps: &[crate::dsv41::linear::Step<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+        ggml_rs_wgpu::exl3::run_program_once(&self.b, &self.program(steps)?, reads)
+    }
 }
 
 impl WgpuChained {
@@ -203,6 +209,8 @@ impl WgpuChained {
                     S::TopK { scores, dst, k, pos, word } => G::TopK { scores, dst, k, pos, word },
                     S::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word } => G::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word },
                     S::HcMix { proj, pos, word, base, scale, n, norm_eps, iters, hc_eps } => G::HcMix { proj, pos, word, base, scale, n, norm_eps, iters, hc_eps },
+                    S::RopeRows { x, rows, stride, at, half, cos, sin, pos, group, inverse } => G::RopeRows { x, rows, stride, at, half, cos, sin, pos, group, inverse },
+                    S::AttendRows { q, kv, idxs, tokens, heads, dim, len, sink, scale } => G::AttendRows { q, kv, idxs, tokens, heads, dim, len, sink, scale },
                 })
             })
             .collect()

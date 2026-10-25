@@ -76,6 +76,15 @@ pub enum ProgramStep<'a> {
     /// `sink` (`[heads]`) in the denominators and `scale` on the scores (to the bit), its exponentials the device's own
     /// and its sums a chunk of 64 positions at a time: `[heads, dim]`, rounded to bf16 and not rotated back.
     Attend { q: usize, heads: usize, dim: usize, window: usize, win: usize, compressed: Option<(usize, usize, usize)>, sink: &'a [f32], scale: f32, pos: usize, word: u32 },
+    /// [`ProgramStep::Rope`] of a prompt's rows: row `r` of `x` at the position `pos`'s word `r / group` says (a token's
+    /// `group` rows: its heads'), the positions an input of u32 words, a token's each.
+    RopeRows { x: usize, rows: usize, stride: usize, at: usize, half: usize, cos: usize, sin: usize, pos: usize, group: usize, inverse: bool },
+    /// A prompt's attention: `tokens` tokens' `heads` queries of `dim` (`q`, rotated), each token over its own positions
+    /// `idxs` (`[tokens, len]`, u32 rows of `kv` (`[.., dim]`) in the host's order, `u32::MAX` none), `sink` (`[heads]`)
+    /// in the denominators and `scale` on the scores: the host's `sparse_attend` of each (token, head), its scores and
+    /// sums in the host's order, its exponentials the device's own: `[tokens, heads, dim]`, rounded to bf16 and not
+    /// rotated back.
+    AttendRows { q: usize, kv: usize, idxs: usize, tokens: usize, heads: usize, dim: usize, len: usize, sink: &'a [f32], scale: f32 },
     /// The host's mixing coefficients of a hyper-connected stream (`n` wide) from its 24 projections `proj` and its sum
     /// of squares, the word `word` of `pos` (the host's: `mixes_of`, by `base` and `scale`: its scale exact, the
     /// coefficients' exponentials and Sinkhorn's divisions the device's own), laid out as a [`ProgramStep::HcPost`]
@@ -321,7 +330,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// Every kernel of a decode step's attention on the device ([`ProgramStep::Rope`] to [`ProgramStep::HcMix`]) made now,
 /// on `b`: made as a model's first reply needed them, they were some seconds of it.
 pub fn make_attention_kernels(b: &WgpuBackend) {
-    let kernels: [(&'static str, &'static str); 12] = [
+    let kernels: [(&'static str, &'static str); 13] = [
         ("ds-rope", attend::DS_ROPE),
         ("ds-fp8", attend::DS_FP8),
         ("ds-fp4", attend::DS_FP4),
@@ -332,6 +341,7 @@ pub fn make_attention_kernels(b: &WgpuBackend) {
         ("ds-attend-scores", attend::DS_ATTEND_SCORES),
         ("ds-attend-parts", attend::DS_ATTEND_PARTS),
         ("ds-attend-join", attend::DS_ATTEND_JOIN),
+        ("ds-attend-rows", attend::DS_ATTEND_ROWS),
         ("ds-hc-mix", attend::DS_HC_MIX),
         ("exl3-rmsnorm-host", NORM_AS_HOST),
     ];
@@ -362,11 +372,25 @@ impl ProgramLater<'_> {
     }
 }
 
+/// [`run_program`] with vectors of its own, made for this run and let go of after it, and recorded afresh: a prompt's
+/// chunk's program (its vectors some hundreds of MB, of a shape a run seldom has again), which an arena kept for each
+/// of a model's layers would hold to the end.
+pub fn run_program_once(b: &WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+    let (now, _) = run_parts(b, steps, reads, steps.len(), &[], false)?;
+    Some(now)
+}
+
 /// [`run_program`] in two recordings submitted one after the other, `steps[..split]` then the rest: the first's reads
 /// (`reads`) returned once it is done, the second's (`later`) left to read when the caller wants them, the card making
 /// them meanwhile (a layer's held experts after its router's call: the host routes and makes the rest of the layer's
 /// experts while the card makes those). With nothing after `split`, one recording.
 pub fn run_program_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize, usize, usize)], split: usize, later: &[(usize, usize, usize)]) -> Option<(Vec<Vec<f32>>, ProgramLater<'a>)> {
+    run_parts(b, steps, reads, split, later, true)
+}
+
+/// [`run_program_parts`]; `keep`: its vectors an arena the device keeps for the program's next run (else its own, let
+/// go of after it, [`run_program_once`]).
+fn run_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize, usize, usize)], split: usize, later: &[(usize, usize, usize)], keep: bool) -> Option<(Vec<Vec<f32>>, ProgramLater<'a>)> {
     use ggml_rs::ChainRecorder;
     let entered = std::time::Instant::now();
     // each step's vector's length (0: it makes none), checked against what the steps after it ask of it
@@ -427,6 +451,15 @@ pub fn run_program_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], read
                 (ok && picks && before(*q)? >= heads * dim && before(*window)? >= win * dim && before(*pos)? > *word as usize).then_some(heads * dim)?
             }
             ProgramStep::HcMix { proj, pos, word, base, scale, n, .. } => (*n > 0 && before(*proj)? >= 24 && before(*pos)? > *word as usize && base.len() >= 24 && scale.len() >= 3).then_some(24)?,
+            ProgramStep::RopeRows { x, rows, stride, at, half, cos, sin, pos, group, .. } => {
+                // (a thread a pair, the workgroups along one axis)
+                let ok = *rows > 0 && *half > 0 && *group > 0 && rows * half <= 65535 * 256 && at + 2 * half <= *stride && before(*x)? >= (rows - 1) * stride + at + 2 * half && before(*cos)? >= *half && before(*sin)? == before(*cos)?;
+                (ok && before(*pos)? >= rows.div_ceil(*group)).then_some(0)?
+            }
+            ProgramStep::AttendRows { q, kv, idxs, tokens, heads, dim, len, sink, .. } => {
+                let ok = *tokens > 0 && *heads > 0 && heads % attend::ATTEND_ROWS_HEADS == 0 && *dim > 0 && dim % 128 == 0 && *dim <= 512 && *len > 0 && *len <= attend::ATTEND_MOST && sink.len() >= *heads;
+                (ok && before(*q)? >= tokens * heads * dim && before(*kv)? >= *dim && before(*idxs)? >= tokens * len).then_some(tokens * heads * dim)?
+            }
         };
         lens.push(len);
     }
@@ -438,10 +471,10 @@ pub fn run_program_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], read
     // once. Taken from the recording's pooled scratch, every dispatch made its bind group (and a parameters' buffer)
     // again at every step, some 95 us of the host's work a call, and the kept groups' store started over every few
     // tokens.
-    let kept = arena(b, steps, &lens);
+    let kept = if keep { arena(b, steps, &lens) } else { Arc::new(Mutex::new(make_arena(b, steps, &lens))) };
     let mut arena = kept.lock().unwrap_or_else(|p| p.into_inner());
     // (its dispatches as its first run recorded them, where that was all it made: not recorded again)
-    let replay = (!crate::profile::chain_on() && !crate::profile::pieces_on()).then(|| arena.recipe.as_ref().filter(|(s, ..)| *s == split).cloned()).flatten();
+    let replay = (keep && !crate::profile::chain_on() && !crate::profile::pieces_on()).then(|| arena.recipe.as_ref().filter(|(s, ..)| *s == split).cloned()).flatten();
     for (step, v) in steps.iter().zip(&arena.vecs) {
         if let (ProgramStep::Input(x), Some(v)) = (step, v) {
             DeviceChain::upload(b, v, x);
@@ -537,6 +570,16 @@ pub fn run_program_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], read
                 let words = [*n as u32, *iters as u32, norm_eps.to_bits(), hc_eps.to_bits(), *word];
                 rec.dispatch_wide("ds-hc-mix", attend::DS_HC_MIX, [&buf(v(*proj)), &dummy, &buf(base), &buf(scale), &buf(v(*pos)), &dummy, &buf(v(i)), &drw], &words, (1, 1, 1));
             }
+            ProgramStep::RopeRows { x, rows, stride, at, half, cos, sin, pos, group, inverse } => {
+                let words = [*rows as u32, *stride as u32, *at as u32, *half as u32, 0, u32::from(*inverse), *group as u32];
+                rec.dispatch_wide("ds-rope", attend::DS_ROPE, [&buf(v(*cos)), &buf(v(*sin)), &buf(v(*pos)), &dummy, &dummy, &dummy, &buf(v(*x)), &drw], &words, (((rows * half) as u32).div_ceil(256), 1, 1));
+            }
+            ProgramStep::AttendRows { q, kv, idxs, tokens, heads, dim, len, scale, .. } => {
+                let sink = norm_weights[i].as_ref().expect("its sink");
+                let words = [*dim as u32, *heads as u32, *len as u32, 0, scale.to_bits()];
+                let grid = ((heads / attend::ATTEND_ROWS_HEADS) as u32, (*tokens as u32).min(65535), (*tokens as u32).div_ceil(65535));
+                rec.dispatch_wide("ds-attend-rows", attend::DS_ATTEND_ROWS, [&buf(v(*q)), &buf(v(*kv)), &buf(v(*idxs)), &dummy, &dummy, &buf(sink), &buf(v(i)), &drw], &words, grid);
+            }
         }
     };
     // (each part a recording of its own, submitted as it is made: the second follows the first on the queue)
@@ -629,6 +672,8 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
             ProgramStep::TopK { scores, dst, k, pos, word } => (18u8, [*scores, *dst, *k, *pos], *word).hash(&mut h),
             ProgramStep::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word } => (19u8, [*q, *heads, *dim, *window, *win, *pos], *compressed, host(sink), scale.to_bits(), *word).hash(&mut h),
             ProgramStep::HcMix { proj, pos, word, base, scale, n, norm_eps, iters, hc_eps } => (20u8, [*proj, *pos, *n, *iters], *word, host(base), host(scale), norm_eps.to_bits(), hc_eps.to_bits()).hash(&mut h),
+            ProgramStep::RopeRows { x, rows, stride, at, half, cos, sin, pos, group, inverse } => (21u8, [*x, *rows, *stride, *at, *half, *cos, *sin, *pos, *group], *inverse).hash(&mut h),
+            ProgramStep::AttendRows { q, kv, idxs, tokens, heads, dim, len, sink, scale } => (22u8, [*q, *kv, *idxs, *tokens, *heads, *dim, *len], host(sink), scale.to_bits()).hash(&mut h),
         }
     }
     let key = h.finish();
@@ -639,12 +684,19 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
     if kept.len() >= ARENAS {
         kept.clear();
     }
+    let made = Arc::new(Mutex::new(make_arena(b, steps, lens)));
+    kept.insert(key, Arc::clone(&made));
+    made
+}
+
+/// `steps`' vectors on `b` (`lens` long), their norms' weights and groups' and passes' scratch, as an arena holds them.
+fn make_arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> ProgramArena {
     let up = |values: &[f32]| {
         let v = b.vec(values.len());
         DeviceChain::upload(b, &v, values);
         v
     };
-    let made = ProgramArena {
+    ProgramArena {
         // (a kept vector is the caller's own)
         vecs: steps.iter().zip(lens).map(|(s, &len)| (len > 0 && !matches!(s, ProgramStep::State(_))).then(|| b.vec(len))).collect(),
         norms: steps
@@ -652,7 +704,7 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
             .map(|s| match s {
                 ProgramStep::Norm { weight, .. } => Some(up(weight)),
                 ProgramStep::Candidates { bias, .. } => Some(up(bias)),
-                ProgramStep::Attend { sink, .. } => Some(up(sink)),
+                ProgramStep::Attend { sink, .. } | ProgramStep::AttendRows { sink, .. } => Some(up(sink)),
                 ProgramStep::HcMix { base, .. } => Some(up(base)),
                 _ => None,
             })
@@ -671,8 +723,5 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
             .collect(),
         fused: steps.iter().zip(lens).map(|(s, &len)| if let ProgramStep::Held { slots, .. } = s { Some(slots.fused_scratch(len / slots.hidden())) } else { None }).collect(),
         recipe: None,
-    };
-    let made = Arc::new(Mutex::new(made));
-    kept.insert(key, Arc::clone(&made));
-    made
+    }
 }

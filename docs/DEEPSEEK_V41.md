@@ -1158,6 +1158,19 @@ Tried and left out: a thread taking two or four output rows of a step's expert m
 for them) was no faster; a mapped write polling for its buffer rather than waiting for the device's
 work whole measured the same.
 
+A prompt's attention runs on the card too now, as a step's does: its queries' projection and rotation
+(`ProgramStep::RopeRows`, each row its own position), the attention over each token's chosen rows
+(`ProgramStep::AttendRows`: eight heads a workgroup, each token's list of rows, its sums in the
+host's order, the exponentials the device's) and the output's grouped projection, in programs of 512
+rows run once (`run_program_once`, an arena of their own). A 4,153-token prompt of the 2-bit GGUF
+read in 92.6 s where 168 to 175 (some 45 tok/s where 25). Checked against the host
+(a_prompts_attention_on_the_device_is_the_hosts_but_for_its_exponentials): the queries' rotation the
+same bits, 99.94% of the outputs the same bits, the worst 0.4% off. The replies are other texts for
+it, the same every time; the conversation test's three turns and its "again" as before.
+(`OAIY_DSV41_PROMPT_ATTENTION=0`: the prompt's attention on the host.) What is left of that prompt's
+time: the experts 27.6 s, the held experts 10.8, their uploads 9.8, the dense matmuls 22.4, the
+host's mixing 12.7, the indexer 8.9 and its scores 6.4.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

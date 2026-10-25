@@ -458,7 +458,8 @@ impl Model {
         let n_experts = cfg.n_routed_experts as u32;
         let stop = std::sync::atomic::AtomicBool::new(false);
         // (the step's attention made on the device: its caches there; with a check, the host's made as before and the
-        // device's beside it from the host's caches)
+        // device's beside it from the host's caches; a prompt's chunk's there too where they are, its own program)
+        let caches = attend.as_ref().filter(|_| t > 1);
         let attend = attend.as_ref().filter(|_| on_device);
         let check = *attend_check;
         std::thread::scope(|scope| {
@@ -518,9 +519,10 @@ impl Model {
                     if let Some(seen) = &ffn_seen {
                         sides.push((router, &seen[..]));
                     }
-                    let o = ly.attn.forward_core(cfg, &x, t, start_pos, states, shared, &sides);
+                    // (a prompt's chunk attending on the card, where the decode steps' caches are: its output made there)
+                    let o = ly.attn.forward_core(cfg, &x, t, start_pos, states, shared, &sides, caches);
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let (o, mut made_sides) = o?;
+                    let (o, mut made_sides, projected) = o?;
                     foretold = foretell.then(|| made_sides.pop().expect("the foretelling router's logits"));
                     let attn_proj = made_sides.pop();
                     let mixing = std::time::Instant::now();
@@ -542,7 +544,7 @@ impl Model {
                     // collapse and norm), and the router's, the shared expert's and the mixing's projections of those, in
                     // one program on the device where it holds them all: the output's call and the router's were a round
                     // trip each, and the host's mixing and norm between them. Else each as before.
-                    let program = side_ffn.and_then(|fw| {
+                    let program = side_ffn.filter(|_| !projected).and_then(|fw| {
                         let flat = attn_mix[0].flat();
                         let mut steps = Vec::new();
                         let a = ly.attn.output_steps(cfg, &o, &mut steps)?;
@@ -554,7 +556,7 @@ impl Model {
                     match program {
                         Some((p, fused)) => taken(p, fused),
                         None => {
-                            let a = ly.attn.output(cfg, &o, t);
+                            let a = if projected { o } else { ly.attn.output(cfg, &o, t) };
                             let mixing = std::time::Instant::now();
                             let h1: Vec<f32> = per_token(t, |i| hc::post(&a[i * d..(i + 1) * d], &h[tok(i)], &attn_mix[i])).concat();
                             let x: Vec<f32> = per_token(t, |i| hc::pre(&h1[tok(i)], &attn_mix[i].pre)).concat();

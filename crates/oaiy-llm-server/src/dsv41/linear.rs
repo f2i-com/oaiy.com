@@ -112,6 +112,13 @@ pub trait DenseKernel: Send + Sync + std::any::Any {
         let _ = (steps, reads, split, later);
         None
     }
+
+    /// [`Self::run_program`] with vectors of its own for this run alone (a prompt's chunk's program, hundreds of MB of
+    /// them). None where it cannot.
+    fn run_program_once(&self, steps: &[Step<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+        let _ = (steps, reads);
+        None
+    }
 }
 
 /// The later part of a program run in two ([`run_program_parts`]): its reads, waited for when called.
@@ -183,6 +190,13 @@ pub enum Step<'a> {
     /// word `word` of `pos`, [`crate::dsv41::hc::sumsq`]'s), laid out as [`crate::dsv41::hc::Mix::flat`] lays them (its
     /// exponentials the device's own).
     HcMix { proj: usize, pos: usize, word: u32, base: &'a [f32], scale: &'a [f32], n: usize, norm_eps: f32, iters: usize, hc_eps: f32 },
+    /// [`Step::Rope`] of a prompt's rows: row `r` of `x` at the position `pos`'s word `r / group` says (an input of a
+    /// token's position each, u32 words as f32 bits; a token's `group` rows: its heads'), to the bit.
+    RopeRows { x: usize, rows: usize, stride: usize, at: usize, half: usize, cos: usize, sin: usize, pos: usize, group: usize, inverse: bool },
+    /// A prompt's [`crate::dsv41::attention::sparse_attend`] of each of `tokens` tokens' `heads` queries of `q` over its
+    /// own positions `idxs` (`[tokens, len]`, u32 rows of `kv` as f32 bits, `u32::MAX` none): `[tokens, heads, dim]`,
+    /// rounded to bf16 and not rotated back, its scores and sums in the host's order, its exponentials the device's own.
+    AttendRows { q: usize, kv: usize, idxs: usize, tokens: usize, heads: usize, dim: usize, len: usize, sink: &'a [f32], scale: f32 },
 }
 
 /// `steps` as one call where a device holds every matrix they multiply and takes them together
@@ -194,6 +208,18 @@ pub fn run_program(steps: &[Step<'_>], reads: &[(usize, usize, usize)]) -> Optio
     })?;
     let start = std::time::Instant::now();
     let made = first.run_program(steps, reads)?;
+    crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);
+    Some(made)
+}
+
+/// [`run_program`] with vectors of its own for this run alone ([`DenseKernel::run_program_once`]): a prompt's chunk's.
+pub fn run_program_once(steps: &[Step<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+    let first = steps.iter().find_map(|s| match s {
+        Step::Mul { w: Weight::Device { kernel, .. }, .. } | Step::MulGroup { group: Weight::Device { kernel, .. }, .. } => Some(Arc::clone(kernel)),
+        _ => None,
+    })?;
+    let start = std::time::Instant::now();
+    let made = first.run_program_once(steps, reads)?;
     crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);
     Some(made)
 }

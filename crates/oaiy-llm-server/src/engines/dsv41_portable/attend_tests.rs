@@ -139,6 +139,58 @@ fn the_indexers_scores_and_picks_on_the_device_are_the_hosts() {
     }
 }
 
+/// A prompt's chunk's attention on the device (`RopeRows`, `AttendRows`, `RopeRows` back) is the host's but for its
+/// exponentials: tokens at their own positions, each over its own positions (window rows and compressed ones laid end
+/// to end, some none, as the host gathers them), the queries rotated to the bit first; nearly every output the host's
+/// bf16 value and none far from it.
+#[test]
+#[ignore = "needs a WebGPU adapter"]
+fn a_prompts_attention_on_the_device_is_the_hosts_but_for_its_exponentials() {
+    let b = gpu();
+    let mut r = Values(0x5851_f42d_4c95_7f2d);
+    let (heads, dim, rd, len, rows) = (64usize, 512usize, 64usize, 640usize, 2000usize);
+    let rope = Rope::new(rd, 8192, 0, 10000.0, 16.0, 32.0, 1.0);
+    let (cos, sin) = rope.tables();
+    let (cos_v, sin_v) = (kept(&b, cos), kept(&b, sin));
+    let mut kv = r.bf16(rows * dim, 2.0);
+    for (i, row) in kv.chunks_mut(dim).enumerate() {
+        if i < 1000 {
+            fake_quant_fp8_inplace(row);
+        } else {
+            fake_quant_fp4_inplace(row, 16, Fp4Scale::E4M3);
+        }
+    }
+    let sink = r.bf16(heads, 2.0);
+    let scale = (dim as f32).powf(-0.5);
+    for (tokens, start) in [(37usize, 0usize), (100, 3000)] {
+        let mut q = r.bf16(tokens * heads * dim / 2, 3.0);
+        q.extend(r.bf16(tokens * heads * dim / 2, 0.02));
+        let idxs: Vec<Vec<i32>> = (0..tokens).map(|_| (0..len).map(|i| if i % 29 == 3 { -1 } else { ((r.next() as usize) % rows) as i32 }).collect()).collect();
+        let mut want = vec![0.0f32; tokens * heads * dim];
+        let mut rotated = q.clone();
+        for i in 0..tokens {
+            for h in 0..heads {
+                let at = (i * heads + h) * dim;
+                rope.apply(&mut rotated[at + dim - rd..at + dim], start + i, false);
+                let out = &mut want[at..at + dim];
+                crate::dsv41::attention::sparse_attend(&rotated[at..at + dim], &kv, dim, &idxs[i], sink[h], scale, out);
+                rope.apply(&mut out[dim - rd..], start + i, true);
+            }
+        }
+        let pos = words(&(start..start + tokens).collect::<Vec<_>>());
+        let picks: Vec<f32> = idxs.iter().flatten().map(|&j| f32::from_bits(if j < 0 { u32::MAX } else { j as u32 })).collect();
+        let rot = |x: usize, inverse: bool| G::RopeRows { x, rows: tokens * heads, stride: dim, at: dim - rd, half: rd / 2, cos: 1, sin: 2, pos: 3, group: heads, inverse };
+        let steps = [G::Input(&q), G::State(&cos_v), G::State(&sin_v), G::Input(&pos), rot(0, false), G::Input(&kv), G::Input(&picks), G::AttendRows { q: 0, kv: 5, idxs: 6, tokens, heads, dim, len, sink: &sink, scale }, rot(7, true)];
+        let got = run_program(&b, &steps, &[(0, 0, q.len()), (7, 0, want.len())]).expect("a program");
+        assert_eq!(bits(&got[0]), bits(&rotated), "{tokens} tokens' queries rotated");
+        let same = got[1].iter().zip(&want).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
+        let rel = |g: &[f32], w: &[f32]| g.iter().zip(w).fold(0.0f32, |m, (a, b)| m.max((a - b).abs())) / w.iter().fold(1e-30f32, |m, v| m.max(v.abs()));
+        let worst = got[1].chunks(dim).zip(want.chunks(dim)).map(|(g, w)| rel(g, w)).fold(0.0f32, f32::max);
+        eprintln!("{tokens} tokens from {start}: {same} of {} outputs the host's to the bit, the farthest {worst:.2e} off", want.len());
+        assert!(same * 2 >= want.len() && worst < 1e-2, "{tokens} tokens: {same} of {} the same, the farthest {worst}", want.len());
+    }
+}
+
 /// A decode step's attention on the device is the host's but for its exponentials: every head over a window ring (the
 /// step early in a sequence, its later slots none, and later) and 512 picked compressed rows (some none), the keys
 /// quantized as the caches hold them; nearly every output the host's bf16 value and none far from it. And a pool and

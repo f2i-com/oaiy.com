@@ -76,6 +76,17 @@ const DIAGONAL: [(u32, u32); 16] = {
 /// x, `linear::normed_together`; its output's two, `linear::chained_together`): a step's, a draft's, a draft's check's.
 const CHAINED_ROWS: usize = 8;
 
+/// A prompt's chunk's tokens a program of its attention on the card takes ([`Attention::attend_on_card`]): its vectors
+/// some 300 MB of the card's memory a program, let go of after it.
+const CARD_ROWS: usize = 512;
+
+/// Whether a prompt's chunks attend on the card where the decode steps' caches are there (OAIY_DSV41_PROMPT_ATTENTION=0:
+/// on the host, as before).
+fn prompt_on_card() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OAIY_DSV41_PROMPT_ATTENTION").as_deref() != Ok("0"))
+}
+
 /// What a pass of rows from `start` writes over in a layer's caches, as it was ([`AttnState::save`]).
 #[derive(Clone)]
 pub struct Saved {
@@ -542,7 +553,7 @@ impl Attention {
         if t == 0 || self.ratio != 0 {
             return Err(Error::Arg(format!("layer {}: a draft of {t} rows on a layer of ratio {}", self.layer, self.ratio)));
         }
-        let (made_x, made_q) = self.queries(cfg, &[(&self.wq_a, x, t, 0..self.wq_a.n(), Out::Bf16), (&self.wkv, x, t, 0..self.wkv.n(), Out::Bf16)], None, t);
+        let (made_x, made_q, _) = self.queries(cfg, &[(&self.wq_a, x, t, 0..self.wq_a.n(), Out::Bf16), (&self.wkv, x, t, 0..self.wkv.n(), Out::Bf16)], None, t, true);
         let kva = made_x.into_iter().nth(1).expect("the window's projection");
         let mut q = made_q.into_iter().next().expect("the queries");
         for i in 0..t {
@@ -644,12 +655,14 @@ impl Attention {
         shared: &mut Shared,
         side: Option<(&Weight, &[f32])>,
     ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
-        let (o, mut sides) = self.forward_core(cfg, x, t, start_pos, states, shared, side.as_slice())?;
+        let (o, mut sides, _) = self.forward_core(cfg, x, t, start_pos, states, shared, side.as_slice(), None)?;
         Ok((self.output(cfg, &o, t), sides.pop()))
     }
 
     /// [`Self::forward_side`] up to the heads' outputs (`[t, heads, head_dim]`, the rows the output projection takes:
-    /// [`Self::output_steps`] puts it in a device program).
+    /// [`Self::output_steps`] puts it in a device program); with `card` (a prompt's chunk where the decode steps' caches
+    /// are on a device), its attention there with its output projection ([`Self::attend_on_card`]): then the output,
+    /// `[t, dim]`, and true.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn forward_core(
         &self,
@@ -660,7 +673,8 @@ impl Attention {
         states: &mut [AttnState],
         shared: &mut Shared,
         sides: &[(&Weight, &[f32])],
-    ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        card: Option<&DeviceCaches>,
+    ) -> Result<(Vec<f32>, Vec<Vec<f32>>, bool)> {
         let (hd, nh, rd, win) = (cfg.head_dim, cfg.n_heads, cfg.rope_head_dim, cfg.window_size);
         if t == 0 {
             return Err(Error::Arg("no tokens".into()));
@@ -688,22 +702,27 @@ impl Attention {
         for &(w, input) in sides {
             of_x.push((w, input, t, 0..w.n(), Out::F32));
         }
-        // and the queries (the indexer's too, of the same row)
-        let (mut made_x, made_q) = self.queries(cfg, &of_x, indexer.map(|ix| &ix.wq_b), t);
+        // and the queries (the indexer's too, of the same row); a prompt's chunk attending on the card makes its own
+        // queries there
+        let card = card.filter(|_| t > CHAINED_ROWS && prompt_on_card());
+        let (mut made_x, made_q, qr) = self.queries(cfg, &of_x, indexer.map(|ix| &ix.wq_b), t, card.is_none());
         let side_out = made_x.split_off(made_x.len() - sides.len());
         let mut made = made_x.into_iter().skip(1);
         let kva = made.next().expect("the window's projection");
         let compressed = compressor.map(|c| (made.next().expect("the compressor's keys"), (c.ratio > 1).then(|| made.next().expect("the compressor's gate"))));
         let index_weights = indexer.map(|_| made.next().expect("the indexer's weights"));
         let mut made = made_q.into_iter();
-        let mut q = made.next().expect("the queries");
-        let index_q = indexer.map(|_| made.next().expect("the indexer's queries"));
-        for i in 0..t {
-            for h in 0..nh {
-                let base = (i * nh + h) * hd;
-                self.rope.apply(&mut q[base + hd - rd..base + hd], start_pos + i, false);
+        let rotated = |mut q: Vec<f32>| {
+            for i in 0..t {
+                for h in 0..nh {
+                    let base = (i * nh + h) * hd;
+                    self.rope.apply(&mut q[base + hd - rd..base + hd], start_pos + i, false);
+                }
             }
-        }
+            q
+        };
+        let q = card.is_none().then(|| rotated(made.next().expect("the queries")));
+        let index_q = indexer.map(|_| made.next().expect("the indexer's queries"));
 
         // sliding-window KV: normalize, rotate, fp8 round trip
         let mut kv = rmsnorm(&kva, &self.kv_norm, cfg.norm_eps);
@@ -823,6 +842,19 @@ impl Attention {
             }
         }
 
+        // A prompt's chunk's attention and output projection on the card; else (or where the device took no such
+        // program) here, its queries made now.
+        let q = match (card, &qr, q) {
+            (_, _, Some(q)) => q,
+            (Some(dc), Some(qr), None) => {
+                if let Some(out) = self.attend_on_card(cfg, dc, qr, &kv_all, &idxs, t, start_pos) {
+                    return Ok((out, side_out, true));
+                }
+                rotated(self.wq_b.forward(qr, t, Out::Bf16))
+            }
+            _ => unreachable!("a chunk attending on the card has its queries' row"),
+        };
+
         // sparse attention with sink, then undo the query rotation: every (token, head) on its own, so spread over the
         // threads (the same sums in the same order whichever thread makes them). Serial, it was most of a prompt's
         // time on the CPU and most of a decode step's attention.
@@ -877,7 +909,7 @@ impl Attention {
         };
         crate::dsv41::profile::add(crate::dsv41::profile::Part::SparseAttention, attending);
 
-        Ok((o, side_out))
+        Ok((o, side_out, false))
     }
 
     /// One row's output projection of the heads' outputs `o` (`[heads, head_dim]`) as steps of a device program: each
@@ -953,14 +985,88 @@ impl Attention {
 
     /// `wo_b` of the groups' rows `rows_in` and its sums rounded to bf16: the output's step.
     fn output_tail<'a>(&'a self, cfg: &Config, rows_in: usize, steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> usize {
+        self.output_tail_rows(cfg, rows_in, 1, steps)
+    }
+
+    /// [`Self::output_tail`] of `rows` rows.
+    fn output_tail_rows<'a>(&'a self, cfg: &Config, rows_in: usize, rows: usize, steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> usize {
         use crate::dsv41::linear::Step;
         let d = cfg.dim;
         let sums = steps.len();
-        steps.push(Step::Mul { w: &self.wo_b, x: rows_in, rows: 1 });
+        steps.push(Step::Mul { w: &self.wo_b, x: rows_in, rows });
         let out = steps.len();
-        steps.push(Step::Scratch(d));
-        steps.push(Step::CopyColsBf16 { src: sums, src_stride: d, src_at: 0, dst: out, dst_stride: d, dst_at: 0, width: d, rows: 1 });
+        steps.push(Step::Scratch(rows * d));
+        steps.push(Step::CopyColsBf16 { src: sums, src_stride: d, src_at: 0, dst: out, dst_stride: d, dst_at: 0, width: d, rows });
         out
+    }
+
+    /// The output projection of `rows` tokens' heads' outputs a program's step `o` makes (`[rows, heads, head_dim]`), as
+    /// [`Self::output`] makes it: each group's heads copied out (bf16's values already) and its part of them, the groups'
+    /// rows rounded to bf16 and laid end to end, then `wo_b` and its sums rounded. The step whose vector is the output
+    /// (`[rows, dim]`), or None where `wo_a` is not a stack of a part a group.
+    fn output_rows_steps<'a>(&'a self, cfg: &Config, o: usize, rows: usize, steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> Option<usize> {
+        use crate::dsv41::linear::Step;
+        let Weight::Stacked { parts, rows: orank, .. } = &self.wo_a else { return None };
+        let (g, gd) = (cfg.o_groups, cfg.n_heads * cfg.head_dim / cfg.o_groups);
+        if parts.len() != g || *orank != cfg.o_lora_rank {
+            return None;
+        }
+        let orank = *orank;
+        let mut made = Vec::with_capacity(g);
+        for (grp, part) in parts.iter().enumerate() {
+            let input = steps.len();
+            steps.push(Step::Scratch(rows * gd));
+            steps.push(Step::CopyColsBf16 { src: o, src_stride: g * gd, src_at: grp * gd, dst: input, dst_stride: gd, dst_at: 0, width: gd, rows });
+            made.push(steps.len());
+            steps.push(Step::Mul { w: part, x: input, rows });
+        }
+        let rows_in = steps.len();
+        steps.push(Step::Scratch(rows * g * orank));
+        for (grp, &m) in made.iter().enumerate() {
+            steps.push(Step::CopyColsBf16 { src: m, src_stride: orank, src_at: 0, dst: rows_in, dst_stride: g * orank, dst_at: grp * orank, width: orank, rows });
+        }
+        Some(self.output_tail_rows(cfg, rows_in, rows, steps))
+    }
+
+    /// A prompt's chunk's attention on the card (`dc`'s rotary tables), from the queries' normed low-rank rows `qr`
+    /// (`[t, q_lora_rank]`), the rows `kv` it attends over (the window's, then the compressed ones, as the host gathers
+    /// them) and each token's positions in them `idxs` (the host's order, -1 none): its queries (`wq_b`, rounded to bf16
+    /// and rotated), each (token, head)'s sparse attention, rotated back, and the output projection, [`CARD_ROWS`]
+    /// tokens a program: `[t, dim]`. Only the output comes back, where the queries and the heads' outputs (half a GB each
+    /// at 4,096 rows) went to the host and back. None where the device takes no such program.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_on_card(&self, cfg: &Config, dc: &DeviceCaches, qr: &[f32], kv: &[f32], idxs: &[Vec<i32>], t: usize, start_pos: usize) -> Option<Vec<f32>> {
+        use crate::dsv41::linear::Step;
+        let (hd, nh, rd) = (cfg.head_dim, cfg.n_heads, cfg.rope_head_dim);
+        let qd = qr.len() / t;
+        let len = idxs.iter().map(Vec::len).max()?.max(1);
+        let (cos, sin) = &dc.rope[dc.layers[self.layer].rope];
+        let scale = (hd as f32).powf(-0.5);
+        let mut out = Vec::with_capacity(t * cfg.dim);
+        for r0 in (0..t).step_by(CARD_ROWS) {
+            let n = CARD_ROWS.min(t - r0);
+            let pos: Vec<f32> = (r0..r0 + n).map(|i| f32::from_bits((start_pos + i) as u32)).collect();
+            let picks: Vec<f32> = idxs[r0..r0 + n].iter().flat_map(|row| (0..len).map(move |e| f32::from_bits(row.get(e).filter(|&&j| j >= 0).map_or(u32::MAX, |&j| j as u32)))).collect();
+            let rotate = |x: usize, inverse: bool| Step::RopeRows { x, rows: n * nh, stride: hd, at: hd - rd, half: rd / 2, cos: 4, sin: 5, pos: 6, group: nh, inverse };
+            let mut steps: Vec<Step<'_>> = vec![
+                Step::Input(&qr[r0 * qd..(r0 + n) * qd]),
+                Step::Mul { w: &self.wq_b, x: 0, rows: n },
+                Step::Scratch(n * nh * hd),
+                Step::CopyColsBf16 { src: 1, src_stride: nh * hd, src_at: 0, dst: 2, dst_stride: nh * hd, dst_at: 0, width: nh * hd, rows: n },
+                Step::State(cos),
+                Step::State(sin),
+                Step::Input(&pos),
+                rotate(2, false),
+                Step::Input(kv),
+                Step::Input(&picks),
+                Step::AttendRows { q: 2, kv: 8, idxs: 9, tokens: n, heads: nh, dim: hd, len, sink: &self.attn_sink, scale },
+                rotate(10, true),
+            ];
+            let a = self.output_rows_steps(cfg, 10, n, &mut steps)?;
+            let got = crate::dsv41::linear::run_program_once(&steps, &[(a, 0, n * cfg.dim)])?;
+            out.extend_from_slice(&got[0]);
+        }
+        Some(out)
     }
 
     /// The grouped low-rank output of `t` rows of the attention's output `o` (`wo_a` block-diagonal over the groups,
@@ -989,17 +1095,19 @@ impl Attention {
     /// The queries (`wq_b`, and `also`'s: the indexer's, of the same row) of `t` rows' low-rank row (`wq_a` of x, the
     /// first of `of_x`, normed), and every projection of x in `of_x`: a step's or a check's in one call where a device
     /// takes both stages, the norm made there (a round trip fewer a layer); else a call each, the norm here.
-    /// `(of_x's outputs, the queries and also's)`.
+    /// `(of_x's outputs, the queries and also's, the normed row where made here)`; without `with_q` (a prompt's chunk
+    /// whose queries its attention's program makes on the device, [`Self::attend_on_card`]) no queries, `also`'s alone.
     #[allow(clippy::type_complexity)]
-    fn queries(&self, cfg: &Config, of_x: &[(&Weight, &[f32], usize, std::ops::Range<usize>, Out)], also: Option<&Weight>, t: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-        let of_qr: Vec<(&Weight, std::ops::Range<usize>, Out)> = std::iter::once(&self.wq_b).chain(also).map(|w| (w, 0..w.n(), Out::Bf16)).collect();
-        if let Some(both) = (t <= CHAINED_ROWS).then(|| crate::dsv41::linear::normed_together(of_x, 0, &self.q_norm, cfg.norm_eps, &of_qr)).flatten() {
-            return both;
+    fn queries(&self, cfg: &Config, of_x: &[(&Weight, &[f32], usize, std::ops::Range<usize>, Out)], also: Option<&Weight>, t: usize, with_q: bool) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Option<Vec<f32>>) {
+        let of_qr: Vec<(&Weight, std::ops::Range<usize>, Out)> = std::iter::once(&self.wq_b).filter(|_| with_q).chain(also).map(|w| (w, 0..w.n(), Out::Bf16)).collect();
+        if let Some((x, q)) = (t <= CHAINED_ROWS && with_q).then(|| crate::dsv41::linear::normed_together(of_x, 0, &self.q_norm, cfg.norm_eps, &of_qr)).flatten() {
+            return (x, q, None);
         }
         let made_x = crate::dsv41::linear::forward_together(of_x);
         let qr = rmsnorm(&made_x[0], &self.q_norm, cfg.norm_eps);
         let with: Vec<(&Weight, &[f32], usize, std::ops::Range<usize>, Out)> = of_qr.iter().map(|(w, rows, out)| (*w, &qr[..], t, rows.clone(), *out)).collect();
-        (made_x, crate::dsv41::linear::forward_together(&with))
+        let made_q = if with.is_empty() { Vec::new() } else { crate::dsv41::linear::forward_together(&with) };
+        (made_x, made_q, Some(qr))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -157,8 +157,9 @@ fn recip_rn(s: f32) -> f32 {
 }
 
 /// `Rope`'s kernel: a thread a pair, `rows * half` of them; `p[0]` = (rows, stride, at, half), `p[1]` = (the position's
-/// word, inverse). Each pair's four products stored to workgroup memory before their sums (so no fused multiply-add
-/// takes them): the host's `bf16(a c - b s)`, `bf16(a s + b c)` to the bit.
+/// word, inverse, rows a position): with `p[1].z` 0 every row at the word's position, else row `r` at word `p[1].x + r /
+/// p[1].z`'s (`RopeRows`: a prompt's tokens, each its heads' rows). Each pair's four products stored to workgroup memory
+/// before their sums (so no fused multiply-add takes them): the host's `bf16(a c - b s)`, `bf16(a s + b c)` to the bit.
 pub(super) const DS_ROPE: &str = concat!(
     exact_fns!(),
     r#"
@@ -181,7 +182,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     if (live) {
         let j = i % half;
         base = (i / half) * stride + p[0].z + 2u * j;
-        let at = words[p[1].x] * half + j;
+        var word = p[1].x;
+        if (p[1].z != 0u) { word = p[1].x + (i / half) / p[1].z; }
+        let at = words[word] * half + j;
         let c = cosv[at];
         var s = sinv[at];
         if (p[1].y != 0u) { s = -s; }
@@ -731,6 +734,144 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         var o = 0.0;
         for (var c = 0u; c < CHUNKS; c++) { o += scratch[parts + c * dim + d]; }
         out[h * dim + d] = bf16(div_signed(o, dn));
+    }
+}
+"#
+);
+
+/// Heads a workgroup of `AttendRows` takes, their queries and scores in its memory.
+pub(super) const ATTEND_ROWS_HEADS: usize = 8;
+
+/// `AttendRows`' kernel, a workgroup a (group of eight heads, token): a prompt's token's own positions (`idxs`, `[tokens,
+/// len]`, rows of `kv`, `u32::MAX` none) gathered in order by a scan of the threads' counts, then each head's
+/// `sparse_attend`: the scores each the host's `dot` (sixteen running sums, a lane each, added as a tree; its products
+/// exact, a kv row read once for the eight heads) times the scale, their largest, the weights `exp(s - max)` (the
+/// device's own) and their sum in order with the sink's, the rows' sum by the weights rounded to bf16 in order, over the
+/// sum correctly rounded and rounded to bf16. `p[0]` = (dim, heads, len), `p[1]` = (the scale's bits). Up to 640
+/// positions a token and 512 a row (the host's window and picks: 128 and 512).
+pub(super) const DS_ATTEND_ROWS: &str = concat!(
+    exact_fns!(),
+    r#"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> kv: array<f32>;
+@group(0) @binding(2) var<storage, read> idxs: array<u32>;
+@group(0) @binding(5) var<storage, read> sink: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const NONE: u32 = 0xffffffffu;
+const HG: u32 = 8u;
+const MOST: u32 = 640u;
+
+var<workgroup> qs: array<f32, 4096>;
+var<workgroup> sc: array<f32, 5120>;
+var<workgroup> rows: array<u32, 640>;
+var<workgroup> cnt: array<u32, 256>;
+var<workgroup> part: array<f32, 256>;
+var<workgroup> stat: array<f32, 16>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let dim = p[0].x;
+    let heads = p[0].y;
+    let len = p[0].z;
+    let g = wg.x;
+    let tok = wg.y + wg.z * 65535u;
+    for (var e = t; e < HG * dim; e += 256u) {
+        qs[e] = q[(tok * heads + g * HG + e / dim) * dim + e % dim];
+    }
+    // the token's positions in order: each thread's run of the list counted, the counts scanned, each written at its place
+    let per = (len + 255u) / 256u;
+    var n = 0u;
+    for (var k = 0u; k < per; k++) {
+        let e = t * per + k;
+        if (e < len && idxs[tok * len + e] != NONE) { n++; }
+    }
+    cnt[t] = n;
+    workgroupBarrier();
+    for (var off = 1u; off < 256u; off = off * 2u) {
+        var v = 0u;
+        if (t >= off) { v = cnt[t - off]; }
+        workgroupBarrier();
+        cnt[t] = cnt[t] + v;
+        workgroupBarrier();
+    }
+    var at = cnt[t] - n;
+    for (var k = 0u; k < per; k++) {
+        let e = t * per + k;
+        if (e < len) {
+            let r = idxs[tok * len + e];
+            if (r != NONE) {
+                rows[at] = r;
+                at++;
+            }
+        }
+    }
+    let total = workgroupUniformLoad(&cnt[255]);
+    // the scores: sixteen lanes a position, sixteen positions a pass, each lane's values eight at a time for every head
+    let lane = t % 16u;
+    let slot = t / 16u;
+    for (var e0 = 0u; e0 < total; e0 += 16u) {
+        let e = e0 + slot;
+        var acc = array<f32, 8>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        if (e < total) {
+            let row = rows[e] * dim;
+            for (var i0 = lane; i0 < dim; i0 += 128u) {
+                var v: array<f32, 8>;
+                for (var j = 0u; j < 8u; j++) { v[j] = kv[row + i0 + 16u * j]; }
+                for (var h = 0u; h < HG; h++) {
+                    for (var j = 0u; j < 8u; j++) { acc[h] += qs[h * dim + i0 + 16u * j] * v[j]; }
+                }
+            }
+        }
+        for (var h = 0u; h < HG; h++) {
+            part[t] = acc[h];
+            workgroupBarrier();
+            if (lane == 0u && e < total) {
+                var l = array<f32, 16>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                for (var i = 0u; i < 16u; i++) { l[i] = part[t + i]; }
+                for (var width = 8u; width > 0u; width = width / 2u) {
+                    for (var i = 0u; i < width; i++) { l[i] += l[i + width]; }
+                }
+                sc[h * MOST + e] = l[0] * bitcast<f32>(p[1].x);
+            }
+            workgroupBarrier();
+        }
+    }
+    // each head's largest score (32 threads a head), its weights, and their sum in order with the sink's
+    let hh = t / 32u;
+    let tl = t % 32u;
+    var m = -1e30;
+    for (var e = tl; e < total; e += 32u) { m = max(m, sc[hh * MOST + e]); }
+    part[t] = m;
+    workgroupBarrier();
+    if (tl == 0u) {
+        var mx = -1e30;
+        for (var i = 0u; i < 32u; i++) { mx = max(mx, part[t + i]); }
+        stat[hh] = mx;
+    }
+    workgroupBarrier();
+    let mx = stat[hh];
+    for (var e = tl; e < total; e += 32u) { sc[hh * MOST + e] = exp(sc[hh * MOST + e] - mx); }
+    workgroupBarrier();
+    if (tl == 0u) {
+        var s = 0.0;
+        for (var e = 0u; e < total; e++) { s += sc[hh * MOST + e]; }
+        stat[8u + hh] = s + exp(sink[g * HG + hh] - mx);
+    }
+    workgroupBarrier();
+    for (var e = tl; e < total; e += 32u) { sc[hh * MOST + e] = bf16(sc[hh * MOST + e]); }
+    workgroupBarrier();
+    // the rows' sums by the weights, in order: a thread an output column of every head
+    for (var d = t; d < dim; d += 256u) {
+        var o = array<f32, 8>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for (var e = 0u; e < total; e++) {
+            let v = kv[rows[e] * dim + d];
+            for (var h = 0u; h < HG; h++) { o[h] += sc[h * MOST + e] * v; }
+        }
+        for (var h = 0u; h < HG; h++) {
+            out[(tok * heads + g * HG + h) * dim + d] = bf16(div_signed(o[h], stat[8u + h]));
+        }
     }
 }
 "#
