@@ -12,12 +12,15 @@
 //! scales, f16, two a word: the GGUF's bytes, no more, each word aligned.
 //!
 //! The grid types the GSQ-RCO IQ2_XS file keeps its experts' gate and up matrices in (IQ2_S, IQ2_XXS, IQ1_M: 256
-//! weights a block, a group of eight an entry of ggml's grid, with its signs and a scale of its own) are held a block
-//! in whole words, its fields each on a word's edge (a 32's four index bytes one word, its signs another: the GGUF's
-//! bytes in another order, and a pad). The grid is a storage buffer of the layer's (binding 4), two bits a weight (a
-//! grid's bytes take four values at most), so a group is one load of it: as WGSL constants such tables are copied at
-//! each call, which once ran a dispatch past Windows' two seconds and reset the driver (`crate::quant::shaders::layout`'s
-//! note).
+//! weights a block, a group of eight an entry of ggml's grid, with its signs and a scale of its own; and IQ2_XS, which
+//! DeepSeek-V4.1's GGUF keeps some layers' experts in) are held a block in whole words, its fields each on a word's
+//! edge (a 32's four index bytes one word, its signs another: the GGUF's bytes in another order, and a pad). The grid
+//! is a storage buffer of the layer's (binding 4), two bits a weight (a grid's bytes take four values at most), so a
+//! group is one load of it: as WGSL constants such tables are copied at each call, which once ran a dispatch past
+//! Windows' two seconds and reset the driver (`crate::quant::shaders::layout`'s note).
+//!
+//! A model that routes and combines its experts itself keeps them in slots ([`QuantSlots`]), as an EXL3 checkpoint's
+//! are kept in [`crate::exl3::Exl3Slots`].
 use crate::exl3::{coop_on, many_order, moe_rows_for, record_route, record_route_sigmoid, Step, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, WSUM_APPLY, WSUM_ROWS};
 use crate::{chunk_limit, Gpu, WgpuBackend};
 use ggml_quants::GgmlType;
@@ -30,9 +33,10 @@ use std::sync::{Arc, Mutex};
 mod cache;
 mod host;
 mod kernels;
+mod slots;
 
 // (what this file gave the crate and its users, and what the files make for each other)
-pub use {cache::*, host::*};
+pub use {cache::*, host::*, slots::*};
 use kernels::*;
 
 /// One kind of a layer's routed experts' projection as a group (their gate and up matrices, or their down ones): their

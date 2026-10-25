@@ -1067,12 +1067,37 @@ model (`a_ggufs_tokenizer_is_the_checkpoints`, given both): every token id and i
 configuration, and the hashing tables the same; its float tensors the checkpoint's to the bit.
 
 The dense matrices go on the card through the quantized matmul (`QuantLinear`: Q8_0, Q5_K, Q6_K,
-and the float ones as f16), in the same device programs as an EXL3 checkpoint's trunk. The routed
-experts are records of each layer's three tensors' blocks (a layer's types its own: 1-bit beside
-2-bit grid types), read into the RAM tier as any checkpoint's, and made on the host's cores
-(`dsv41::gguf_experts`: each row decoded by `ggml_quants` and multiplied in f32): a decode step's
-experts together, every one's rows over the cores; a prompt's one an expert to a worker. A reference's
-speed: the four asks answered sensibly at 1.5 tok/s, the experts some 500 ms of each token.
+and the float ones as f16), in the same device programs as an EXL3 checkpoint's trunk, the
+attention with them (its grouped output's groups each a matrix of its own there: a GGUF has no
+group kernel). The routed experts are records of each layer's three tensors' blocks (a layer's types
+its own: 1-bit beside 2-bit grid types), read into the RAM tier as any checkpoint's.
+
+On the CPU alone (`dsv41::gguf_experts`: each row decoded by `ggml_quants` and multiplied in f32) the
+four asks answered sensibly at 1.5 tok/s, the experts some 500 ms of each token. The trunk's matmuls
+looked slow too, 125 ms a token where each takes 7 to 17 us alone (`measure_deepseek_gguf_matmuls`):
+the card sat in P5 and P8 (its memory at 405 to 810 MHz) while the host made the experts.
+
+So the experts are held on the cards as an EXL3 checkpoint's are (`WgpuExl3Experts`, its slots now
+either kind): `ggml_rs_wgpu::quant::moe::QuantSlots`, a pool for each pair of types the layers have
+(a 2-bit file has eight: its gate's and up's type, its down's), each slot an expert's blocks as the
+quantized MoE kernels read them (IQ2_XS added to them), the misses through scratch slots, and between
+the two passes the model's own SwiGLU (the sums rounded to bf16, clamped, `silu(gate) * up` rounded).
+The misses go through the cards alone, never the host's cores: the host's decoding sums otherwise,
+and which side made an expert would show in the reply. With a 2-bit file's experts some 7.5 MB, the
+cards hold 5,715 and RAM the other 9,645: every expert resident, none read from the drive. The
+router's program does not make a GGUF's held experts (EXL3's fused kernels), nor does a drafter run.
+
+Measured as the sections above (the EXL3 checkpoint's usage profile seeding what the cards take while
+idle, the same model's routing), the second round:
+
+| Reply | 2-bit GGUF | EXL3 2.9 bpw, the same session |
+|---|---|---|
+| A familiar subject | 19.5 tok/s | 17.0 tok/s |
+| Code | 16.8 tok/s | 11.7 tok/s |
+| The same again | 20.9 tok/s | 16.2 tok/s |
+| A new subject | 16.2 tok/s | 11.9 tok/s |
+
+Every reply the same text in both rounds; the EXL3 checkpoint's the same as before.
 
 ## Phases
 

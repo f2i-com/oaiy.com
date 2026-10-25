@@ -27,15 +27,21 @@ pub struct Exl3Slots {
     silu: Mutex<Option<(u32, DeviceVec)>>,
 }
 
-/// A call of sets of slots begun ([`Exl3Slots::begin_many`]): its recording submitted, each set's jobs' outputs to
-/// come ([`SlotsBegun::finish`]). The sets' kept vectors it used are held until then.
+/// What a begun call holds until it is finished: the locks of the kept vectors it used (an [`Exl3Slots`]' or a
+/// [`crate::quant::moe::QuantSlots`]').
+pub(crate) trait Held {}
+impl<T> Held for T {}
+
+/// A call of sets of slots begun ([`Exl3Slots::begin_many`], [`crate::quant::moe::QuantSlots::begin_many`]): its
+/// recording submitted, each set's jobs' outputs to come ([`SlotsBegun::finish`]). The sets' kept vectors it used are
+/// held until then.
 pub struct SlotsBegun<'a> {
-    launched: Option<crate::chain::Launched<'a>>,
-    steps: Vec<Option<std::sync::MutexGuard<'a, Option<StepScratch>>>>,
+    pub(crate) launched: Option<crate::chain::Launched<'a>>,
+    pub(crate) held: Vec<Box<dyn Held + 'a>>,
     /// Each part of the recording: its set, its jobs' places in the set's list, each job's rows, the set's width.
-    subs: Vec<(usize, Vec<usize>, Vec<usize>, usize)>,
+    pub(crate) subs: Vec<(usize, Vec<usize>, Vec<usize>, usize)>,
     /// Each set's jobs.
-    jobs: Vec<usize>,
+    pub(crate) jobs: Vec<usize>,
 }
 
 impl SlotsBegun<'_> {
@@ -46,11 +52,11 @@ impl SlotsBegun<'_> {
 
     /// Each set's jobs' outputs (`[rows, hidden]` each, unweighted), once the call is done.
     pub fn finish(self) -> Vec<Vec<Vec<f32>>> {
-        let SlotsBegun { launched, steps, subs, jobs } = self;
+        let SlotsBegun { launched, held, subs, jobs } = self;
         let mut outs: Vec<Vec<Vec<f32>>> = jobs.iter().map(|&n| vec![Vec::new(); n]).collect();
         let Some(launched) = launched else { return outs };
         let ys = launched.wait();
-        drop(steps);
+        drop(held);
         for ((i, mine, rows, hidden), y) in subs.into_iter().zip(ys) {
             let mut at = 0;
             for (j, n) in mine.into_iter().zip(rows) {
@@ -315,7 +321,7 @@ impl Exl3Slots {
     /// the rest, with no thread started for either: a thread a card a layer before).
     pub fn begin_many<'a>(parts: &[(&'a Exl3Slots, &[(usize, &[f32])])], limit: f32) -> SlotsBegun<'a> {
         let jobs: Vec<usize> = parts.iter().map(|(_, jobs)| jobs.len()).collect();
-        let Some(&(first, _)) = parts.first() else { return SlotsBegun { launched: None, steps: Vec::new(), subs: Vec::new(), jobs } };
+        let Some(&(first, _)) = parts.first() else { return SlotsBegun { launched: None, held: Vec::new(), subs: Vec::new(), jobs } };
         assert!(parts.iter().all(|(s, _)| Arc::ptr_eq(&s.b.gpu, &first.b.gpu)), "exl3 slots: sets on more than one GPU in one call");
         // (set, its jobs' places in its list, the jobs): each set's jobs of one row, then of more
         let mut subs: Vec<(usize, Vec<usize>, Vec<(usize, &[f32])>)> = Vec::new();
@@ -329,7 +335,7 @@ impl Exl3Slots {
             }
         }
         if subs.is_empty() {
-            return SlotsBegun { launched: None, steps: Vec::new(), subs: Vec::new(), jobs };
+            return SlotsBegun { launched: None, held: Vec::new(), subs: Vec::new(), jobs };
         }
         let mut rec = crate::chain::Recorder::new(&first.b);
         // A step's jobs (one row each, a few to a set of slots) through each set's kept vectors, their bind groups kept
@@ -359,7 +365,8 @@ impl Exl3Slots {
         }
         let launched = Some(Box::new(rec).launch());
         let subs = subs.into_iter().zip(recorded).map(|((i, mine, _), (_, rows))| (i, mine, rows, parts[i].0.hidden)).collect();
-        SlotsBegun { launched, steps, subs, jobs }
+        let held = steps.into_iter().flatten().map(|g| Box::new(g) as Box<dyn Held + 'a>).collect();
+        SlotsBegun { launched, held, subs, jobs }
     }
     /// [`silu_table`]'s for `limit` on this card, uploaded when first asked for (again for another limit).
     fn silu(&self, limit: f32) -> DeviceVec {

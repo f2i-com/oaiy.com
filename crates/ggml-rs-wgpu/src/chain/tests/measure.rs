@@ -1,6 +1,51 @@
 //! Timings and probes (ignored; run one with --ignored --nocapture).
 use super::*;
 
+/// A decode step's matmuls at DeepSeek-V4.1's GGUF shapes and types (its trunk's: the queries' low-rank and wide
+/// projections, the grouped output's group and its second projection, the shared expert's, the head), each 28 in a
+/// chain of one row, against its bytes.
+#[test]
+#[ignore = "a timing; run with --nocapture"]
+fn measure_deepseek_gguf_matmuls() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    for (dtype, n, k, block, bytes) in [
+        (GgmlType::Q8_0, 1280usize, 5120usize, 32usize, 34usize),
+        (GgmlType::Q5_K, 32768, 1280, 256, 176),
+        (GgmlType::Q8_0, 512, 5120, 32, 34),
+        (GgmlType::Q5_K, 1024, 4096, 256, 176),
+        (GgmlType::Q6_K, 5120, 8192, 256, 210),
+        (GgmlType::Q5_K, 2304, 5120, 256, 176),
+        (GgmlType::Q8_0, 5120, 2304, 32, 34),
+        (GgmlType::Q5_K, 129280, 5120, 256, 176),
+    ] {
+        let nbytes = n * (k / block) * bytes;
+        let mut next = rng(n as u32);
+        let mut raw = vec![0u8; nbytes];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 100.0) as u8;
+        }
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+        let (x, y) = (b.vec(k), b.vec(n));
+        DeviceChain::upload(&b, &x, &(0..k).map(|_| next()).collect::<Vec<_>>());
+        let reps = if n > 100_000 { 4 } else { 28 };
+        let run = || {
+            let mut rec = b.begin();
+            for _ in 0..reps {
+                rec.matmul_rows(&w, &x, &y, 1);
+            }
+            rec.read_range(&y, 0, 1);
+            rec.finish();
+        };
+        run();
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            run();
+        }
+        let secs = t.elapsed().as_secs_f64() / 5.0 / reps as f64;
+        eprintln!("{dtype:?} [{n}, {k}] ({:.1} MB): {:.1} us a matmul in a chain, {:.0} GB/s", nbytes as f64 / 1e6, secs * 1e6, nbytes as f64 / secs / 1e9);
+    }
+}
+
 /// What a chained one-row matmul costs on the GPU: 28 of one weight in a chain (a layer's worth of dispatches a
 /// model's), at a 3B Llama's shapes, against the weight's bytes; and a chain of small ops alone. (The one-row kernel reads its weights at 170-280 GB/s,
 /// whatever its lanes a row, its loads or its value array: a kernel of wide loads is what would change it.)

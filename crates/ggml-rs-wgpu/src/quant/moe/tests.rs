@@ -314,7 +314,7 @@ fn a_prompts_experts_of_few_rows_are_f32s() {
 /// `i` is `i` with an eighth sign that makes its set bits even (the kernel computes it).
 #[test]
 fn the_grids_are_two_bits_a_weight() {
-    for kind in [Kind::IQ2_S, Kind::IQ2_XXS, Kind::IQ1_M] {
+    for kind in [Kind::IQ2_S, Kind::IQ2_XXS, Kind::IQ2_XS, Kind::IQ1_M] {
         let (grid, signed) = kind.grid().unwrap();
         let (codes, levels) = grid_codes(grid, signed);
         assert_eq!(codes.len(), grid.len());
@@ -330,6 +330,83 @@ fn the_grids_are_two_bits_a_weight() {
     }
 }
 
+/// Experts in slots ([`QuantSlots`]) are the host's, for layers of DeepSeek-V4.1's GGUF's mixed types (its gate's and
+/// up's type, its down's: 1-bit beside 2-bit grid types), slots written by the queue and in place: three experts'
+/// records (each its three matrices' blocks one after another, as a GGUF's expert record holds them) put in, a step's
+/// jobs of one row and a prompt's of 40 rows made, each against the definition (each matrix decoded whole by
+/// `ggml_quants`; the gate's and up's sums rounded to bf16, clamped at the limit, `silu(gate) * up` rounded to bf16,
+/// then down) in f64; a slot copied into another set's gives its expert's outputs to the bit.
+#[test]
+fn experts_in_slots_are_the_hosts() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (hidden, ff, limit) = (512usize, 256usize, 1.5f32);
+    let bf16 = |v: f64| half::bf16::from_f32(v as f32).to_f32() as f64;
+    for (types, mapped) in [([GgmlType::IQ2_XS, GgmlType::IQ1_M], true), ([GgmlType::IQ2_XXS, GgmlType::IQ2_XS], false), ([GgmlType::IQ1_M, GgmlType::IQ2_XXS], true)] {
+        let mut next = rng(5 + types[0] as u64);
+        let experts = 3usize;
+        let bytes = |t: GgmlType, n: usize, k: usize| n * k / 256 * t.type_size();
+        let (gb, db) = (bytes(types[0], ff, hidden), bytes(types[1], hidden, ff));
+        let layout = QuantLayout {
+            bytes: 2 * gb + db,
+            proj: [
+                QuantProj { at: 0, dtype: types[0], k: hidden, n: ff },
+                QuantProj { at: gb, dtype: types[0], k: hidden, n: ff },
+                QuantProj { at: 2 * gb, dtype: types[1], k: ff, n: hidden },
+            ],
+        };
+        let records: Vec<Vec<u8>> = (0..experts).map(|_| [random_grid(&mut next, types[0], 2, ff, hidden), random_grid(&mut next, types[1], 1, hidden, ff)].concat()).collect();
+        let slots = if mapped { b.quant_slots_mapped(4, hidden, ff, types) } else { b.quant_slots(4, hidden, ff, types) }.expect("room for four slots");
+        assert!(slots.fits(&layout));
+        let refs: Vec<&[u8]> = records.iter().map(|r| &r[..]).collect();
+        slots.put_many(1, &refs, &layout);
+        // the definition's outputs of expert `e` (slot e + 1) for rows `x`
+        let want = |e: usize, x: &[f32]| -> Vec<f32> {
+            let whole = |p: &QuantProj| {
+                let mut out = vec![0f32; p.n * p.k];
+                ggml_quants::dequantize(p.dtype, &records[e][p.at..p.at + bytes(p.dtype, p.n, p.k)], &mut out).unwrap();
+                out
+            };
+            let (g, u, d) = (whole(&layout.proj[0]), whole(&layout.proj[1]), whole(&layout.proj[2]));
+            x.chunks_exact(hidden)
+                .flat_map(|row| {
+                    let dot = |m: &[f32], j: usize, v: &[f64]| (0..v.len()).map(|c| m[j * v.len() + c] as f64 * v[c]).sum::<f64>();
+                    let xr: Vec<f64> = row.iter().map(|&v| v as f64).collect();
+                    let act: Vec<f64> = (0..ff)
+                        .map(|j| {
+                            let (gs, us) = (bf16(dot(&g, j, &xr)).min(limit as f64), bf16(dot(&u, j, &xr)).clamp(-limit as f64, limit as f64));
+                            bf16(gs / (1.0 + (-gs).exp()) * us)
+                        })
+                        .collect();
+                    (0..hidden).map(|i| dot(&d, i, &act) as f32).collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let x: Vec<f32> = (0..40 * hidden).map(|_| next()).collect();
+        // a step's: each expert on its own row; a prompt's: one expert on 40 rows, another on one
+        let step: Vec<(usize, &[f32])> = (0..experts).map(|e| (e + 1, &x[e * hidden..(e + 1) * hidden])).collect();
+        let got = slots.forward(&step, limit);
+        for e in 0..experts {
+            let err = worst(&got[e], &want(e, step[e].1));
+            eprintln!("{types:?}{}: a step's expert {e} {err:.2e}", if mapped { ", written in place" } else { "" });
+            assert!(err < 2e-2, "{types:?}: a step's expert {e}: {err}");
+        }
+        let prompt: Vec<(usize, &[f32])> = vec![(2, &x[..]), (3, &x[..hidden])];
+        let got = slots.forward(&prompt, limit);
+        let (e0, e1) = (worst(&got[0], &want(1, &x)), worst(&got[1], &want(2, &x[..hidden])));
+        eprintln!("{types:?}: a prompt's 40 rows {e0:.2e}, its expert of one row {e1:.2e}");
+        assert!(e0 < 3e-2 && e1 < 2e-2, "{types:?}: a prompt's: {e0}, {e1}");
+        // (a step's row the same bits beside a prompt's rows as alone)
+        let alone = slots.forward(&[(3, &x[..hidden])], limit);
+        assert_eq!(got[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), alone[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{types:?}: a row's output hung on its company");
+        // a slot copied into another set's
+        let other = b.quant_slots(2, hidden, ff, types).expect("room for two slots");
+        slots.copy_slot_marked(2, &other, 1, &[]);
+        let copied = other.forward(&[(1, step[1].1)], limit);
+        let here = slots.forward(&[(2, step[1].1)], limit);
+        assert_eq!(copied[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), here[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{types:?}: a copied slot");
+    }
+}
+
 /// The GPU's experts whose gate and up matrices are a grid type's (IQ2_S, IQ2_XXS, IQ1_M; their down ones Q2_0: the
 /// GSQ-RCO IQ2_XS file's layers) are the host's reference: a small layer (hidden 256, 12 experts, 3 a row) for a
 /// step's row, a check's three and a prompt's 40 and 70, routed on the host and on the GPU, in f32 and (where the
@@ -341,7 +418,7 @@ fn the_gpus_grid_experts_are_the_hosts() {
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
     let full = std::env::var_os("OAIY_GRID_EXPERTS_FULL").is_some();
     let shapes: &[(usize, usize, usize, usize)] = if full { &[(256, 128, 12, 3), (2560, 640, 24, 10)] } else { &[(256, 128, 12, 3)] };
-    for gu in [GgmlType::IQ2_S, GgmlType::IQ2_XXS, GgmlType::IQ1_M] {
+    for gu in [GgmlType::IQ2_S, GgmlType::IQ2_XXS, GgmlType::IQ2_XS, GgmlType::IQ1_M] {
         for &(hidden, ff, count, top_k) in shapes {
             let data = experts_of(53 + hidden as u64, hidden, ff, count, true, gu);
             let host = quant_experts_cpu(copy(&data)).unwrap();

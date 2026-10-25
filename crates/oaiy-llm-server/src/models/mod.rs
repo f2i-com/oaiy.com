@@ -1080,8 +1080,10 @@ impl Models {
                 // its card beside its weights. Split, each card did half the trunk's work and both ran it in a lower power
                 // state (their memory at half its clock), where the first runs it at its full one: replies as fast or
                 // slower for the calls the split saved.
+                // (a GGUF's experts held so too, in slots of their own kernels)
                 let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
-                let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = if exl3 { std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect() } else { Vec::new() };
+                let gguf = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Gguf { .. });
+                let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = if exl3 || gguf { std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect() } else { Vec::new() };
                 let home = (cards.len() > 1 && std::env::var("OAIY_DSV41_SPLIT").as_deref() == Ok("1")).then(|| crate::engines::dsv41_portable::layer_homes(model.cfg.n_layers, cards.len()));
                 let (count, bytes) = match &home {
                     Some(home) => crate::engines::dsv41_portable::offload_split(&mut model, &cards, home),
@@ -1103,14 +1105,14 @@ impl Models {
                     }
                 }
                 // Each decode step's attention on the first card, in each layer's one call with its output and router: its
-                // caches there, before the experts take the room. An EXL3 checkpoint's trunk on one card and no drafter
-                // (OAIY_DSV41_GPU_ATTENTION=0: on the CPU as before; =check: on the CPU as before and on the card beside
-                // it, from the CPU's caches, each step's differences said).
+                // caches there, before the experts take the room. An EXL3 checkpoint's or a GGUF's trunk on one card and
+                // no drafter (OAIY_DSV41_GPU_ATTENTION=0: on the CPU as before; =check: on the CPU as before and on the
+                // card beside it, from the CPU's caches, each step's differences said).
                 let asked = std::env::var("OAIY_DSV41_GPU_ATTENTION").ok();
                 if let Some(mode) = asked.as_deref().map_or(Some("1"), |m| matches!(m, "1" | "check").then_some(m)) {
-                    if home.is_some() || drafter.is_some() || !exl3 {
+                    if home.is_some() || drafter.is_some() || !(exl3 || gguf) {
                         if asked.is_some() {
-                            self.say(format!("{}: its attention stays on the CPU (on the GPU it takes an EXL3 checkpoint's trunk on one card and no drafter)", spec.name));
+                            self.say(format!("{}: its attention stays on the CPU (on the GPU it takes an EXL3 checkpoint's or a GGUF's trunk on one card and no drafter)", spec.name));
                         }
                     } else {
                         let bytes = model.attend_on(Arc::new(b.clone()), mode == "check");
@@ -1127,8 +1129,9 @@ impl Models {
                 // for other uses of a card; a budget that was asked for is kept to)
                 let more = if o.webgpu_gb.is_none() && b.adapter().pci_bus_id == "tinygpu" { crate::engines::dsv41_portable::ALONE } else { 0 };
                 // (an EXL3 checkpoint's experts are records the fp4 slots cannot run: slots of their own on every card it
-                // may use, filled while idle and by what decode steps read, the rest through a few scratch slots)
-                if exl3 {
+                // may use, filled while idle and by what decode steps read, the rest through a few scratch slots; a
+                // GGUF's alike)
+                if exl3 || gguf {
                     let made = match home {
                         Some(home) => crate::engines::dsv41_portable::WgpuExl3Experts::new_split(model.expert_format(), &cards, model.cfg.n_routed_experts, home),
                         None => crate::engines::dsv41_portable::WgpuExl3Experts::new(model.expert_format(), &cards, model.cfg.n_routed_experts),
@@ -1145,7 +1148,7 @@ impl Models {
                         model.set_experts_kernel(Some(Arc::clone(&k) as Arc<dyn crate::dsv41::expert::ExpertsKernel>));
                         let slots = k.tier().0;
                         exl3_kernel = Some(k);
-                        self.say(format!("{}: slots for {slots} EXL3 experts on {} GPU{} (filled while idle, the most used first where a usage profile says)", spec.name, cards.len(), if cards.len() > 1 { "s" } else { "" }));
+                        self.say(format!("{}: slots for {slots} {} experts on {} GPU{} (filled while idle, the most used first where a usage profile says)", spec.name, if gguf { "GGUF" } else { "EXL3" }, cards.len(), if cards.len() > 1 { "s" } else { "" }));
                     }
                 }
                 // (the fp4 checkpoint's record slots: a GGUF's experts are the CPU's for now)
@@ -1171,6 +1174,7 @@ impl Models {
                         format!("a prompt's busy experts ({n} at a time) and {kept} experts kept there between requests{share}; the rest on the CPU")
                     }
                     None if exl3 && exl3_kernel.is_some() => "its EXL3 experts in slots on the GPUs, and through scratch slots what they do not hold".into(),
+                    None if gguf && exl3_kernel.is_some() => "its GGUF experts in slots on the GPUs, and through scratch slots what they do not hold".into(),
                     None if exl3 => "its EXL3 experts on the CPU".into(),
                     None if !fp4 => "its GGUF experts on the CPU".into(),
                     None => "no room left there for experts; they run on the CPU".into(),

@@ -916,15 +916,34 @@ impl Attention {
     }
 
     /// [`Self::output_steps`] of the heads' outputs a program's step `o` makes (`[heads, head_dim]`), where `wo_a` is a
-    /// stack of a part a group the device takes in one pass (an EXL3 checkpoint's): every group's heads a row of it,
-    /// each part on its own row, their rows rounded at once. The step whose vector is the output (`[dim]`), or None.
+    /// stack of a part a group: one the device takes in one pass (an EXL3 checkpoint's), every group's heads a row of
+    /// it, each part on its own row, their rows rounded at once; else (a GGUF's) each group's heads copied out (bf16's
+    /// values already, as the attention leaves them: the copy rounds nothing) and its part of them. The step whose
+    /// vector is the output (`[dim]`), or None.
     pub(crate) fn output_steps_from<'a>(&'a self, cfg: &Config, o: usize, steps: &mut Vec<crate::dsv41::linear::Step<'a>>) -> Option<usize> {
         use crate::dsv41::linear::Step;
-        let Weight::Stacked { parts, rows, group: Some(group), .. } = &self.wo_a else { return None };
+        let Weight::Stacked { parts, rows, group, .. } = &self.wo_a else { return None };
         let (g, orank) = (cfg.o_groups, cfg.o_lora_rank);
         if parts.len() != g || *rows != orank || g > DIAGONAL.len() {
             return None;
         }
+        let Some(group) = group else {
+            let gd = cfg.n_heads * cfg.head_dim / g;
+            let mut made = Vec::with_capacity(g);
+            for (grp, part) in parts.iter().enumerate() {
+                let input = steps.len();
+                steps.push(Step::Scratch(gd));
+                steps.push(Step::CopyColsBf16 { src: o, src_stride: g * gd, src_at: grp * gd, dst: input, dst_stride: gd, dst_at: 0, width: gd, rows: 1 });
+                made.push(steps.len());
+                steps.push(Step::Mul { w: part, x: input, rows: 1 });
+            }
+            let rows_in = steps.len();
+            steps.push(Step::Scratch(g * orank));
+            for (grp, &m) in made.iter().enumerate() {
+                steps.push(Step::CopyColsBf16 { src: m, src_stride: orank, src_at: 0, dst: rows_in, dst_stride: g * orank, dst_at: grp * orank, width: orank, rows: 1 });
+            }
+            return Some(self.output_tail(cfg, rows_in, steps));
+        };
         steps.push(Step::MulGroup { group, x: o, jobs: &DIAGONAL[..g] });
         let rows_in = steps.len();
         steps.push(Step::Scratch(g * orank));

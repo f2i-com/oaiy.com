@@ -10,6 +10,7 @@ pub(super) enum Kind {
     Q2_0,
     IQ2_S,
     IQ2_XXS,
+    IQ2_XS,
     IQ1_M,
     Q4_K,
     Q6_K,
@@ -21,6 +22,7 @@ impl Kind {
             GgmlType::Q2_0 => Some(Kind::Q2_0),
             GgmlType::IQ2_S => Some(Kind::IQ2_S),
             GgmlType::IQ2_XXS => Some(Kind::IQ2_XXS),
+            GgmlType::IQ2_XS => Some(Kind::IQ2_XS),
             GgmlType::IQ1_M => Some(Kind::IQ1_M),
             GgmlType::Q4_K => Some(Kind::Q4_K),
             GgmlType::Q6_K => Some(Kind::Q6_K),
@@ -33,6 +35,7 @@ impl Kind {
             Kind::Q2_0 => "q2_0",
             Kind::IQ2_S => "iq2_s",
             Kind::IQ2_XXS => "iq2_xxs",
+            Kind::IQ2_XS => "iq2_xs",
             Kind::IQ1_M => "iq1_m",
             Kind::Q4_K => "q4_k",
             Kind::Q6_K => "q6_k",
@@ -46,6 +49,7 @@ impl Kind {
             Kind::Q2_0 => None,
             Kind::IQ2_S => Some((82, 21)),
             Kind::IQ2_XXS => Some((66, 17)),
+            Kind::IQ2_XS => Some((74, 19)),
             Kind::IQ1_M => Some((56, 14)),
             Kind::Q4_K => Some((144, 36)),
             Kind::Q6_K => Some((210, 53)),
@@ -103,6 +107,15 @@ impl Kind {
                             }
                             out[16] = u16::from_le_bytes([block[0], block[1]]) as u32;
                         }
+                        // the GGUF's: the scale, the 32 groups' u16 (a grid index under a sign pattern), a byte of
+                        // scales a 32; here those words as they lie (a 32's four groups two words), the scales' two
+                        // words, the scale
+                        Kind::IQ2_XS => {
+                            for w in 0..18 {
+                                out[w] = le(&block[2 + 4 * w..]);
+                            }
+                            out[18] = u16::from_le_bytes([block[0], block[1]]) as u32;
+                        }
                         // (IQ1_M's and Q4_K's fields lie on words' edges as they are, and Q6_K's but its scale, the
                         // last two bytes: its bytes, little-endian, the last word padded)
                         _ => {
@@ -125,6 +138,7 @@ impl Kind {
             Kind::Q2_0 | Kind::Q4_K | Kind::Q6_K => None,
             Kind::IQ2_S => Some((&t::IQ2S_GRID, false)),
             Kind::IQ2_XXS => Some((&t::IQ2XXS_GRID, false)),
+            Kind::IQ2_XS => Some((&t::IQ2XS_GRID, false)),
             Kind::IQ1_M => Some((&t::IQ1S_GRID, true)),
         }
     }
@@ -150,6 +164,7 @@ impl Kind {
         match self {
             Kind::IQ2_S => format!("{helpers}{GRID_MAGS}{SUB_IQ2_S}"),
             Kind::IQ2_XXS => format!("{helpers}{GRID_MAGS}{SUB_IQ2_XXS}"),
+            Kind::IQ2_XS => format!("{helpers}{GRID_MAGS}{SUB_IQ2_XS}"),
             _ => format!("{helpers}{SUB_IQ1_M}"),
         }
     }
@@ -251,6 +266,23 @@ fn sub_of(bw: u32, sub: u32) -> Sub {
 fn grp(h: Sub, l: u32) -> array<f32, 8> {
     let s7 = (h.sg >> (7u * l)) & 127u;
     return mags(grid[(h.idx >> (8u * l)) & 255u], s7 | ((countOneBits(s7) & 1u) << 7u), h.s0);
+}
+"#;
+
+const SUB_IQ2_XS: &str = r#"
+// IQ2_XS, a block 19 words here: sixteen words of the 32 groups' u16 (a 9-bit grid index under a 7-bit sign pattern
+// whose eighth sign makes its negatives even; a 32's four groups two words), two words of scales (a byte a 32: a
+// nibble for each half), and the block's f16 scale.
+const BLOCK_WORDS: u32 = 19u;
+fn sub_of(bw: u32, sub: u32) -> Sub {
+    let sc = (words[bw + 16u + sub / 4u] >> (8u * (sub % 4u))) & 255u;
+    let d = unpack2x16float(words[bw + 18u]).x;
+    return Sub(words[bw + 2u * sub], words[bw + 2u * sub + 1u], d * (0.5 + f32(sc & 15u)) * 0.25, d * (0.5 + f32(sc >> 4u)) * 0.25, 0u);
+}
+fn grp(h: Sub, l: u32) -> array<f32, 8> {
+    let q = (select(h.idx, h.sg, l >= 2u) >> (16u * (l % 2u))) & 0xffffu;
+    let s7 = q >> 9u;
+    return mags(grid[q & 511u], s7 | ((countOneBits(s7) & 1u) << 7u), select(h.s0, h.s1, l >= 2u));
 }
 "#;
 

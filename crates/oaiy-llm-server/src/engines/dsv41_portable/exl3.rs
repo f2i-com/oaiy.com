@@ -10,20 +10,30 @@
 //! a scratch slot is kept in a free slot of its card, or in place of the least used expert there when it is used more,
 //! by a copy of the card's own memory (`Exl3Slots::copy_slot`), its upload already made. A usage profile fills the
 //! slots while the server idles, the most used first.
+//!
+//! A GGUF checkpoint's experts are held so too, in `ggml_rs_wgpu::quant::moe::QuantSlots` (a pool for each pair of
+//! types its layers have: a layer's gate's and up's, its down's), each slot an expert's blocks as the quantized
+//! kernels read them. Its misses go through the scratch slots alone: the host's decoding sums otherwise than the
+//! cards', and which side made an expert would show in the reply.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use ggml_rs_wgpu::exl3::{Exl3Slots, ProjAt, RecordLayout};
+use ggml_rs_wgpu::exl3::{Exl3Slots, ProjAt, RecordLayout, SlotsBegun};
+use ggml_rs_wgpu::quant::moe::{QuantLayout, QuantProj, QuantSlots};
 
 use super::*;
-use crate::dsv41::expert::{Exl3Proj, ExpertFormat, ExpertJob, ExpertsKernel};
+use crate::dsv41::expert::{Exl3Proj, ExpertFormat, ExpertJob, ExpertsKernel, GgufProj};
 use crate::dsv41::formats::to_bf16;
 
 /// Scratch slots a bitrate has on each card: a pass's experts not held go through them, a prompt's a group
 /// ([`crate::dsv41::moe::GPU_GROUP`]) at a time.
 const SCRATCH: usize = crate::dsv41::moe::GPU_GROUP;
+
+/// Scratch slots a GGUF's pair of types has on each card: a decode step's misses of a layer (six experts at most) at
+/// once, a prompt's a few at a time. Its layers have several pairs (eight in a 2-bit file), each its own scratch.
+const GGUF_SCRATCH: usize = 8;
 
 /// What the weight budget keeps free on a card beyond the slots: a prompt's passes' own buffers.
 const MARGIN: u64 = 1 << 30;
@@ -50,11 +60,121 @@ const KEEP_USES: u32 = 2;
 /// one at a time.
 const FILL_READERS: usize = 8;
 
-/// Slots of one bitrate on one card.
+/// A pool's slots: an EXL3 checkpoint's experts, or a GGUF's.
+enum Slots {
+    Exl3(Exl3Slots),
+    Quant(QuantSlots),
+}
+
+/// A layer's record layout, as its slots take it.
+enum Layout {
+    Exl3(RecordLayout),
+    Quant(QuantLayout),
+}
+
+impl Layout {
+    /// The bytes of a record its layer's expert takes (a GGUF's: its own three matrices', where a record is the
+    /// largest layer's).
+    fn bytes(&self) -> usize {
+        match self {
+            Layout::Exl3(l) => l.bytes,
+            Layout::Quant(l) => l.bytes,
+        }
+    }
+
+    /// Its experts' `(hidden, ff)`.
+    fn shape(&self) -> (usize, usize) {
+        match self {
+            Layout::Exl3(l) => (l.proj[0].k, l.proj[0].n),
+            Layout::Quant(l) => (l.proj[0].k, l.proj[0].n),
+        }
+    }
+
+    /// Its class: the pools that may hold its experts are of it (an EXL3 layer's words a tile, the gate's and up's
+    /// and the down's; a GGUF layer's types so).
+    fn class(&self) -> [usize; 2] {
+        match self {
+            Layout::Exl3(l) => [l.proj[0].tile_words, l.proj[2].tile_words],
+            Layout::Quant(l) => [l.proj[0].dtype as usize, l.proj[2].dtype as usize],
+        }
+    }
+
+    /// A slot's bytes on a card for its experts.
+    fn slot_bytes(&self) -> u64 {
+        let ((hidden, ff), class) = (self.shape(), self.class());
+        match self {
+            Layout::Exl3(_) => slot_bytes(hidden, ff, class),
+            Layout::Quant(l) => ggml_rs_wgpu::WgpuBackend::quant_slot_bytes(hidden, ff, [l.proj[0].dtype, l.proj[2].dtype]).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Up to `n` slots of its class on `card` (`mapped`: the host writes them in place), as many as there is room for.
+    fn slots_on(&self, card: &WgpuBackend, n: usize, mapped: bool) -> Option<Slots> {
+        let ((hidden, ff), class) = (self.shape(), self.class());
+        match self {
+            Layout::Exl3(_) if mapped => card.exl3_slots_mapped(n, hidden, ff, class).map(Slots::Exl3),
+            Layout::Exl3(_) => card.exl3_slots(n, hidden, ff, class).map(Slots::Exl3),
+            Layout::Quant(l) if mapped => card.quant_slots_mapped(n, hidden, ff, [l.proj[0].dtype, l.proj[2].dtype]).map(Slots::Quant),
+            Layout::Quant(l) => card.quant_slots(n, hidden, ff, [l.proj[0].dtype, l.proj[2].dtype]).map(Slots::Quant),
+        }
+    }
+}
+
+impl Slots {
+    fn slots(&self) -> usize {
+        match self {
+            Slots::Exl3(s) => s.slots(),
+            Slots::Quant(s) => s.slots(),
+        }
+    }
+
+    fn put(&self, slot: usize, record: &[u8], layout: &Layout) {
+        match (self, layout) {
+            (Slots::Exl3(s), Layout::Exl3(l)) => s.put(slot, record, l),
+            (Slots::Quant(s), Layout::Quant(l)) => s.put(slot, record, l),
+            _ => unreachable!("a layer's slots are of its checkpoint's kind"),
+        }
+    }
+
+    fn put_many(&self, first: usize, records: &[&[u8]], layout: &Layout) {
+        match (self, layout) {
+            (Slots::Exl3(s), Layout::Exl3(l)) => s.put_many(first, records, l),
+            (Slots::Quant(s), Layout::Quant(l)) => s.put_many(first, records, l),
+            _ => unreachable!("a layer's slots are of its checkpoint's kind"),
+        }
+    }
+
+    fn copy_slot_marked(&self, from: usize, to: &Slots, at: usize, marks: &[(&ggml_rs::DeviceVec, usize, u32)]) {
+        match (self, to) {
+            (Slots::Exl3(s), Slots::Exl3(t)) => s.copy_slot_marked(from, t, at, marks),
+            (Slots::Quant(s), Slots::Quant(t)) => s.copy_slot_marked(from, t, at, marks),
+            _ => unreachable!("a copy between slots of one kind"),
+        }
+    }
+
+    fn forward(&self, jobs: &[(usize, &[f32])], limit: f32) -> Vec<Vec<f32>> {
+        match self {
+            Slots::Exl3(s) => s.forward(jobs, limit),
+            Slots::Quant(s) => s.forward(jobs, limit),
+        }
+    }
+
+    /// `parts` (sets of slots on one card, all of one kind) begun in one recording.
+    fn begin_many<'a>(parts: &[(&'a Slots, &[(usize, &[f32])])], limit: f32) -> SlotsBegun<'a> {
+        if parts.iter().all(|(s, _)| matches!(s, Slots::Quant(_))) {
+            let these: Vec<(&'a QuantSlots, &[(usize, &[f32])])> = parts.iter().map(|&(s, j)| (if let Slots::Quant(s) = s { s } else { unreachable!("matched") }, j)).collect();
+            return QuantSlots::begin_many(&these, limit);
+        }
+        let these: Vec<(&'a Exl3Slots, &[(usize, &[f32])])> = parts.iter().map(|&(s, j)| (if let Slots::Exl3(s) = s { s } else { unreachable!("a card's slots are of one kind") }, j)).collect();
+        Exl3Slots::begin_many(&these, limit)
+    }
+}
+
+/// Slots of one class (a bitrate, or a GGUF's pair of types) on one card.
 struct Pool {
-    slots: Exl3Slots,
-    /// The bitrate's words a tile: the gate's and up's, the down's.
-    tw: [usize; 2],
+    slots: Slots,
+    /// Its class ([`Layout::class`]).
+    class: [usize; 2],
     /// Scratch (a pass's experts pass through), or held experts.
     scratch: bool,
     /// Which of the cards it is on.
@@ -89,7 +209,7 @@ struct Counts {
 
 pub(crate) struct WgpuExl3Experts {
     /// Each layer's record layout.
-    layouts: Vec<RecordLayout>,
+    layouts: Vec<Layout>,
     pools: Vec<Pool>,
     placed: RwLock<Placement>,
     /// Every expert's uses of late (`layer * per_layer + expert`), and the calls since they were last halved.
@@ -147,6 +267,12 @@ fn record_layout(l: &[Exl3Proj; 3], bytes: usize) -> RecordLayout {
     RecordLayout { bytes, proj: [at(&l[0]), at(&l[1]), at(&l[2])] }
 }
 
+/// A GGUF layer's record layout as its slots take it: its own three matrices' bytes (a record is the largest layer's).
+fn quant_layout(l: &[GgufProj; 3]) -> QuantLayout {
+    let at = |p: &GgufProj| QuantProj { at: p.at, dtype: p.ggml(), k: p.k, n: p.n };
+    QuantLayout { bytes: l.iter().map(|p| p.at + p.bytes()).max().unwrap_or(0), proj: [at(&l[0]), at(&l[1]), at(&l[2])] }
+}
+
 /// A slot's bytes on a card for `hidden -> ff` experts at `tw` words a tile (as `Exl3Slots` counts them).
 fn slot_bytes(hidden: usize, ff: usize, tw: [usize; 2]) -> u64 {
     let mwords = |k: usize, n: usize, tw: usize| k / 16 * n / 16 * (tw / 2);
@@ -170,11 +296,16 @@ fn layout_proj(l: &RecordLayout) -> [Exl3Proj; 3] {
     l.proj.map(|p| Exl3Proj { suh: p.suh, svh: p.svh, mul1: p.mul1, trellis: p.trellis, k: p.k, n: p.n, tile_words: p.tile_words })
 }
 
+/// A GGUF layout's matrices as the CPU's decoders take them.
+fn gguf_proj(l: &QuantLayout) -> [GgufProj; 3] {
+    l.proj.map(|p| GgufProj { dtype: p.dtype as u32, at: p.at, k: p.k, n: p.n })
+}
+
 impl WgpuExl3Experts {
     /// Slots on `cards` (the model's first card first, the trunk on it already) for a model of `per_layer` experts a
     /// layer: scratch slots on each, then on every card what its weight budget has left but [`MARGIN`], shared by the
-    /// bitrates by how many layers each has, in pools of what a binding holds. None if `format` is not EXL3's or not
-    /// one slot fits.
+    /// classes (bitrates, or a GGUF's pairs of types) by how many layers each has, in pools of what a binding holds.
+    /// None if `format` is neither EXL3's nor a GGUF's, or not one slot fits.
     pub(crate) fn new(format: &ExpertFormat, cards: &[Arc<WgpuBackend>], per_layer: usize) -> Option<WgpuExl3Experts> {
         Self::new_within(format, cards, per_layer, None, None)
     }
@@ -189,53 +320,54 @@ impl WgpuExl3Experts {
     /// drafter's 384 experts, all held, before the trunk's take the rest), and each layer's experts on its card of
     /// `home` where given.
     pub(crate) fn new_within(format: &ExpertFormat, cards: &[Arc<WgpuBackend>], per_layer: usize, most: Option<usize>, home: Option<Vec<usize>>) -> Option<WgpuExl3Experts> {
-        let ExpertFormat::Exl3 { layers, bytes } = format else { return None };
+        let (layouts, gguf): (Vec<Layout>, bool) = match format {
+            ExpertFormat::Exl3 { layers, bytes } => (layers.iter().map(|l| Layout::Exl3(record_layout(l, *bytes))).collect(), false),
+            ExpertFormat::Gguf { layers, .. } => (layers.iter().map(|l| Layout::Quant(quant_layout(l))).collect(), true),
+            ExpertFormat::Fp4 => return None,
+        };
         let mut left = most.unwrap_or(usize::MAX);
-        let first = layers.first()?;
-        let (hidden, ff) = (first[0].k, first[0].n);
-        let layouts: Vec<RecordLayout> = layers.iter().map(|l| record_layout(l, *bytes)).collect();
-        // each bitrate's layers (on each card, where the layers have cards)
-        let class_of = |l: &[Exl3Proj; 3]| [l[0].tile_words, l[2].tile_words];
-        let mut classes: Vec<([usize; 2], usize)> = Vec::new();
-        for l in layers {
-            let tw = class_of(l);
-            match classes.iter_mut().find(|(t, _)| *t == tw) {
+        layouts.first()?;
+        // each class's layers (on each card, where the layers have cards), and a layer of it
+        let mut classes: Vec<([usize; 2], usize, usize)> = Vec::new();
+        for (li, l) in layouts.iter().enumerate() {
+            let class = l.class();
+            match classes.iter_mut().find(|(t, ..)| *t == class) {
                 Some(c) => c.1 += 1,
-                None => classes.push((tw, 1)),
+                None => classes.push((class, 1, li)),
             }
         }
-        let on_card = |c: usize, tw: [usize; 2]| -> (usize, usize) {
+        let on_card = |c: usize, class: [usize; 2]| -> (usize, usize) {
             match &home {
-                Some(h) => (layers.iter().zip(h).filter(|(l, &hc)| hc == c && class_of(l) == tw).count(), h.iter().filter(|&&hc| hc == c).count()),
-                None => (classes.iter().find(|(t, _)| *t == tw).map_or(0, |c| c.1), layers.len()),
+                Some(h) => (layouts.iter().zip(h).filter(|(l, &hc)| hc == c && l.class() == class).count(), h.iter().filter(|&&hc| hc == c).count()),
+                None => (classes.iter().find(|(t, ..)| *t == class).map_or(0, |c| c.1), layouts.len()),
             }
         };
         let mut pools = Vec::new();
         // (a tier that holds all of its experts puts few through scratch slots: a few of them)
-        let scratch = if most.is_some() { 4 } else { SCRATCH };
+        let scratch = if most.is_some() { 4 } else if gguf { GGUF_SCRATCH } else { SCRATCH };
         for (c, card) in cards.iter().enumerate() {
-            for &(tw, _) in &classes {
-                if let Some(slots) = card.exl3_slots_mapped(scratch, hidden, ff, tw) {
-                    pools.push(Pool { slots, tw, scratch: true, card: c, busy: Mutex::new(()) });
+            for &(class, _, li) in &classes {
+                if let Some(slots) = layouts[li].slots_on(card, scratch, true) {
+                    pools.push(Pool { slots, class, scratch: true, card: c, busy: Mutex::new(()) });
                 }
             }
         }
         for (c, card) in cards.iter().enumerate() {
             let (used, budget) = card.usage();
             let room = budget.saturating_sub(used).saturating_sub(MARGIN);
-            for &(tw, _) in &classes {
-                let (n, of) = on_card(c, tw);
+            for &(class, _, li) in &classes {
+                let (n, of) = on_card(c, class);
                 if n == 0 {
                     continue;
                 }
-                let per = slot_bytes(hidden, ff, tw);
-                let share = most.map_or(usize::MAX, |most| most * n / layers.len());
+                let per = layouts[li].slot_bytes();
+                let share = most.map_or(usize::MAX, |most| most * n / layouts.len());
                 let mut want = ((room as f64 * n as f64 / of as f64 / per as f64) as usize).min(share).min(left);
                 while want > 0 {
-                    let Some(slots) = card.exl3_slots(want, hidden, ff, tw) else { break };
+                    let Some(slots) = layouts[li].slots_on(card, want, false) else { break };
                     want = want.saturating_sub(slots.slots());
                     left = left.saturating_sub(slots.slots());
-                    pools.push(Pool { slots, tw, scratch: false, card: c, busy: Mutex::new(()) });
+                    pools.push(Pool { slots, class, scratch: false, card: c, busy: Mutex::new(()) });
                 }
             }
         }
@@ -245,19 +377,20 @@ impl WgpuExl3Experts {
         // Each layer given a pool of its trunk's card (its own card where the trunk is split, else the first) to hold its
         // experts in first, the pools of a bitrate on a card shared by its layers in turn, so the router's call makes
         // those there (a pass of the held experts' kernels takes one pool); the rest go where there is room, as before.
-        // (OAIY_DSV41_FUSED=0: none so; a drafter's experts, all held, neither)
+        // (OAIY_DSV41_FUSED=0: none so; a drafter's experts, all held, neither; nor a GGUF's, whose kernels the router's
+        // program does not run)
         let fused: Vec<Option<(usize, ggml_rs::DeviceVec)>> = match &home {
-            _ if std::env::var("OAIY_DSV41_FUSED").as_deref() == Ok("0") || most.is_some() || cards.is_empty() => Vec::new(),
+            _ if std::env::var("OAIY_DSV41_FUSED").as_deref() == Ok("0") || most.is_some() || cards.is_empty() || gguf => Vec::new(),
             h => {
                 let mut turn: HashMap<(usize, [usize; 2]), usize> = HashMap::new();
-                layers
+                layouts
                     .iter()
                     .enumerate()
                     .map(|(li, l)| (l, h.as_ref().map_or(0, |h| h[li])))
                     .map(|(l, c)| {
-                        let tw = class_of(l);
-                        let mine: Vec<usize> = (0..pools.len()).filter(|&p| !pools[p].scratch && pools[p].card == c && pools[p].tw == tw).collect();
-                        let at = turn.entry((c, tw)).or_insert(0);
+                        let class = l.class();
+                        let mine: Vec<usize> = (0..pools.len()).filter(|&p| !pools[p].scratch && pools[p].card == c && pools[p].class == class).collect();
+                        let at = turn.entry((c, class)).or_insert(0);
                         let p = *mine.get(*at % mine.len().max(1))?;
                         *at += 1;
                         let table = cards[c].vec_of_bytes(&vec![0xffu8; per_layer * 4]);
@@ -269,7 +402,7 @@ impl WgpuExl3Experts {
         let keys: Vec<Vec<Option<(u32, u32)>>> = pools.iter().map(|p| if p.scratch { Vec::new() } else { vec![None; p.slots.slots()] }).collect();
         let free = keys.iter().map(Vec::len).collect();
         let placed = RwLock::new(Placement { at: HashMap::new(), keys, free });
-        let uses = (0..layers.len() * per_layer).map(|_| AtomicU32::new(0)).collect();
+        let uses = (0..layouts.len() * per_layer).map(|_| AtomicU32::new(0)).collect();
         let rates = cards.iter().map(|_| AtomicU64::new(RATE_GUESS.to_bits())).collect();
         Some(WgpuExl3Experts { layouts, pools, placed, uses, per_layer, calls: AtomicU64::new(0), rates, host_us: AtomicU64::new(HOST_US_GUESS.to_bits()), call_us: AtomicU64::new(CALL_US_GUESS.to_bits()), cursor: Mutex::new(0), counts: Counts::default(),
             kept: Mutex::new(Vec::new()),
@@ -291,7 +424,7 @@ impl WgpuExl3Experts {
     /// Whether held pool `p` may hold `layer`'s experts: of its bitrate, on its card where it has one.
     fn may_hold(&self, p: usize, layer: u32) -> bool {
         let pool = &self.pools[p];
-        !pool.scratch && pool.tw == self.tw(layer) && self.home_of(layer).is_none_or(|h| pool.card == h)
+        !pool.scratch && pool.class == self.class(layer) && self.home_of(layer).is_none_or(|h| pool.card == h)
     }
 
     /// The pool the router's call makes `layer`'s held experts from, where it has one ([`Self::fused_parts`]): the one
@@ -304,7 +437,10 @@ impl WgpuExl3Experts {
     /// `layer`'s pool and slot table where the router's call makes its held experts ([`ExpertsKernel::fused`]).
     pub(crate) fn fused_parts(&self, layer: u32) -> Option<(&Exl3Slots, &ggml_rs::DeviceVec)> {
         let (p, table) = self.fused.get(layer as usize)?.as_ref()?;
-        Some((&self.pools[*p].slots, table))
+        match &self.pools[*p].slots {
+            Slots::Exl3(s) => Some((s, table)),
+            Slots::Quant(_) => None,
+        }
     }
 
     /// `layer`'s `expert` written into its slot table as in `slot` (or [`NO_SLOT`]), where it has one.
@@ -359,10 +495,9 @@ impl WgpuExl3Experts {
         })
     }
 
-    /// The bitrate of `layer`'s experts.
-    fn tw(&self, layer: u32) -> [usize; 2] {
-        let l = &self.layouts[layer as usize].proj;
-        [l[0].tile_words, l[2].tile_words]
+    /// The class of `layer`'s experts ([`Layout::class`]).
+    fn class(&self, layer: u32) -> [usize; 2] {
+        self.layouts[layer as usize].class()
     }
 
     fn uses_of(&self, layer: u32, expert: u32) -> u32 {
@@ -394,7 +529,7 @@ impl WgpuExl3Experts {
         marks
     }
 
-    /// `layer`'s `expert` into a free slot of its bitrate, if there is one and it is not held already: whether it was.
+    /// `layer`'s `expert` into a free slot of its class, if there is one and it is not held already: whether it was.
     pub(crate) fn take(&self, layer: u32, expert: u32, record: &[u8]) -> bool {
         let mut placed = self.placed.write().unwrap_or_else(|p| p.into_inner());
         if placed.at.contains_key(&(layer, expert)) {
@@ -403,8 +538,8 @@ impl WgpuExl3Experts {
         let Some((p, s)) = self.free_slot(&placed, layer, None) else { return false };
         // Written into a scratch slot of its card in place and copied from there by the card: the queue's writes went
         // through staging memory at some 3 GB/s, where the host's threads write a card's memory at 11 to 22.
-        let (card, tw, layout) = (self.pools[p].card, self.pools[p].tw, &self.layouts[layer as usize]);
-        match self.pools.iter().find(|q| q.scratch && q.card == card && q.tw == tw) {
+        let (card, class, layout) = (self.pools[p].card, self.pools[p].class, &self.layouts[layer as usize]);
+        match self.pools.iter().find(|q| q.scratch && q.card == card && q.class == class) {
             Some(q) => {
                 let _one = q.busy.lock().unwrap_or_else(|e| e.into_inner());
                 q.slots.put_many(0, &[record], layout);
@@ -500,7 +635,7 @@ impl WgpuExl3Experts {
     /// is used less than this and this [`KEEP_USES`] times or more. Its record written into that card's scratch slot
     /// and copied from there by the card ([`Self::keep`]), as a step's scratch slots' experts are kept.
     fn promote(&self, layer: u32, expert: u32, record: &[u8]) {
-        let (uses, tw) = (self.uses_of(layer, expert), self.tw(layer));
+        let (uses, class) = (self.uses_of(layer, expert), self.class(layer));
         let card = {
             let placed = self.placement();
             if placed.at.contains_key(&(layer, expert)) {
@@ -526,7 +661,7 @@ impl WgpuExl3Experts {
                 }
             }
         };
-        let Some(q) = (0..self.pools.len()).find(|&q| self.pools[q].scratch && self.pools[q].card == card && self.pools[q].tw == tw) else { return };
+        let Some(q) = (0..self.pools.len()).find(|&q| self.pools[q].scratch && self.pools[q].card == card && self.pools[q].class == class) else { return };
         let _one = self.pools[q].busy.lock().unwrap_or_else(|e| e.into_inner());
         self.pools[q].slots.put_many(0, &[record], &self.layouts[layer as usize]);
         self.keep(layer, expert, (q, 0));
@@ -599,10 +734,10 @@ impl WgpuExl3Experts {
     /// rate) and the host's (each expert's) end soonest, the fewer to the cards where two end alike, and one at least
     /// here (so the host's time is known as it changes). 0 where this bitrate has no scratch slots.
     fn share_to_cards(&self, layer: u32, misses: usize) -> usize {
-        let tw = self.tw(layer);
-        let Some(rate) = self.pools.iter().filter(|p| p.scratch && p.tw == tw).map(|p| self.rate(p.card)).reduce(f64::max) else { return 0 };
+        let class = self.class(layer);
+        let Some(rate) = self.pools.iter().filter(|p| p.scratch && p.class == class).map(|p| self.rate(p.card)).reduce(f64::max) else { return 0 };
         let (host, call) = (f64::from_bits(self.host_us.load(Ordering::Relaxed)), f64::from_bits(self.call_us.load(Ordering::Relaxed)));
-        let put = self.layouts[layer as usize].bytes as f64 / rate.max(1.0);
+        let put = self.layouts[layer as usize].bytes() as f64 / rate.max(1.0);
         let ends = |k: usize| ((misses - k) as f64 * host).max(if k > 0 { call + k as f64 * put } else { 0.0 });
         (0..misses).min_by(|&a, &b| ends(a).total_cmp(&ends(b))).unwrap_or(0)
     }
@@ -620,7 +755,7 @@ impl WgpuExl3Experts {
             let took = uploading.elapsed().as_secs_f64() * 1e6;
             crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertUpload, uploading);
             // (the card's rate, a fifth from this put)
-            let seen = (records.len() * layout.bytes) as f64 / took.max(1.0);
+            let seen = (records.len() * layout.bytes()) as f64 / took.max(1.0);
             self.rates[pool.card].store((self.rate(pool.card) * 0.8 + seen * 0.2).to_bits(), Ordering::Relaxed);
             let these: Vec<(usize, &[f32])> = group.iter().enumerate().map(|(s, &i)| (s, jobs[i].x)).collect();
             let calling = std::time::Instant::now();
@@ -641,12 +776,21 @@ impl ExpertsKernel for WgpuExl3Experts {
     /// Experts the cards do not hold: their records through the scratch slots of every card, each card given them by
     /// its rate of putting them in (each job to the card that would be done with it first), the cards at once.
     fn forward(&self, layer: u32, jobs: &[ExpertJob<'_>], swiglu_limit: f32) -> Vec<Vec<f32>> {
-        let tw = self.tw(layer);
+        let class = self.class(layer);
         let layout = &self.layouts[layer as usize];
-        let scratch: Vec<usize> = (0..self.pools.len()).filter(|&p| self.pools[p].scratch && self.pools[p].tw == tw).collect();
+        let scratch: Vec<usize> = (0..self.pools.len()).filter(|&p| self.pools[p].scratch && self.pools[p].class == class).collect();
         if scratch.is_empty() {
-            // (no scratch slots of this bitrate: on the CPU)
-            return jobs.iter().map(|j| crate::dsv41::exl3_experts::forward_rows(j.record, &layout_proj(layout), j.x, Some(j.weights), swiglu_limit).unwrap_or_default()).collect();
+            // (no scratch slots of this class: on the CPU)
+            return jobs
+                .iter()
+                .map(|j| {
+                    match layout {
+                        Layout::Exl3(l) => crate::dsv41::exl3_experts::forward_rows(j.record, &layout_proj(l), j.x, Some(j.weights), swiglu_limit),
+                        Layout::Quant(l) => crate::dsv41::gguf_experts::forward_rows(j.record, &gguf_proj(l), j.x, Some(j.weights), swiglu_limit),
+                    }
+                    .unwrap_or_default()
+                })
+                .collect();
         }
         self.counts.scratch.fetch_add(jobs.len() as u64, Ordering::Relaxed);
         let mut lists: Vec<Vec<usize>> = vec![Vec::new(); scratch.len()];
@@ -654,12 +798,12 @@ impl ExpertsKernel for WgpuExl3Experts {
         for i in 0..jobs.len() {
             let k = (0..scratch.len())
                 .min_by(|&a, &b| {
-                    let done = |k: usize| (load[k] + layout.bytes as f64) / self.rate(self.pools[scratch[k]].card);
+                    let done = |k: usize| (load[k] + layout.bytes() as f64) / self.rate(self.pools[scratch[k]].card);
                     done(a).total_cmp(&done(b))
                 })
                 .expect("a scratch pool");
             lists[k].push(i);
-            load[k] += layout.bytes as f64;
+            load[k] += layout.bytes() as f64;
         }
         let busy: Vec<(usize, &Vec<usize>)> = scratch.iter().copied().zip(&lists).filter(|(_, l)| !l.is_empty()).collect();
         let made: Vec<(usize, Vec<f32>)> = match busy.as_slice() {
@@ -731,12 +875,12 @@ impl ExpertsKernel for WgpuExl3Experts {
                 None => pools.push((p, vec![i])),
             }
         }
-        let begun: Vec<(usize, Vec<Vec<usize>>, ggml_rs_wgpu::exl3::SlotsBegun<'a>)> = by_card
+        let begun: Vec<(usize, Vec<Vec<usize>>, SlotsBegun<'a>)> = by_card
             .into_iter()
             .map(|(card, pools)| {
                 let these: Vec<Vec<(usize, &[f32])>> = pools.iter().map(|(_, list)| list.iter().map(|&i| (places[i].1, jobs[i].1)).collect()).collect();
-                let parts: Vec<(&'a Exl3Slots, &[(usize, &[f32])])> = pools.iter().zip(&these).map(|((p, _), t)| (&self.pools[*p].slots, &t[..])).collect();
-                let call = Exl3Slots::begin_many(&parts, swiglu_limit);
+                let parts: Vec<(&'a Slots, &[(usize, &[f32])])> = pools.iter().zip(&these).map(|((p, _), t)| (&self.pools[*p].slots, &t[..])).collect();
+                let call = Slots::begin_many(&parts, swiglu_limit);
                 (card, pools.into_iter().map(|(_, list)| list).collect(), call)
             })
             .collect();
@@ -802,7 +946,8 @@ impl ExpertsKernel for WgpuExl3Experts {
         if *OFF.get_or_init(|| std::env::var("OAIY_DSV41_HOST_EXPERTS").as_deref() == Ok("0")) || !ggml_rs_wgpu::exl3::step_host_fast() {
             return None;
         }
-        let layout = &self.layouts[layer as usize];
+        // (a GGUF's misses through the scratch slots alone: the host's decoding sums otherwise than the cards')
+        let Layout::Exl3(layout) = &self.layouts[layer as usize] else { return None };
         let d = crate::dsv41::expert::DIM;
         if jobs.iter().any(|j| j.x.len() != d || j.weights.len() != 1) {
             return None;

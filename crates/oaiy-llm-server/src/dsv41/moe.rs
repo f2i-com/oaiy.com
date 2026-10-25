@@ -237,13 +237,14 @@ pub const GPU_MIN_ROWS: usize = 8;
 
 /// [`GPU_MIN_ROWS`], or what OAIY_DSV41_GPU_MIN_ROWS says (a measurement's: where the CPU's workers and a card's
 /// uploads balance on a machine). An EXL3 checkpoint's experts go to a GPU from one token: the CPU decodes their
-/// trellis at milliseconds of every core an expert, slower than its upload.
+/// trellis at milliseconds of every core an expert, slower than its upload. A GGUF's too: the host's decoding sums
+/// otherwise than the GPU's.
 fn gpu_min_rows(format: &crate::dsv41::expert::ExpertFormat) -> usize {
     static ROWS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let asked = *ROWS.get_or_init(|| std::env::var("OAIY_DSV41_GPU_MIN_ROWS").ok().and_then(|v| v.parse().ok()));
     asked.unwrap_or(match format {
-        crate::dsv41::expert::ExpertFormat::Exl3 { .. } => 1,
-        _ => GPU_MIN_ROWS,
+        crate::dsv41::expert::ExpertFormat::Exl3 { .. } | crate::dsv41::expert::ExpertFormat::Gguf { .. } => 1,
+        crate::dsv41::expert::ExpertFormat::Fp4 => GPU_MIN_ROWS,
     })
 }
 /// Experts a GPU takes in one call: their records' upload bounded (about 600 MB), the matmuls a stage's round trip.
@@ -511,8 +512,12 @@ impl Moe {
         // tasks of their own (the pool's workers run the fp4 kernels).
         // (and a pass of a few rows, a draft's check, where a GPU's kernel runs them: each expert on its rows, kept on
         // the cards as a step's are, where a prompt's are not)
+        // (a GGUF checkpoint's so too where a GPU's kernel runs them: their misses through its scratch slots)
         #[cfg(feature = "webgpu")]
-        if let (crate::dsv41::expert::ExpertFormat::Exl3 { layers, .. }, true) = (&experts.format, t == 1 || (t <= FEW_ROWS && experts.gpu.is_some())) {
+        if matches!(experts.format, crate::dsv41::expert::ExpertFormat::Exl3 { .. } | crate::dsv41::expert::ExpertFormat::Gguf { .. })
+            && (t == 1 || (t <= FEW_ROWS && experts.gpu.is_some()))
+            && (experts.gpu.is_some() || matches!(experts.format, crate::dsv41::expert::ExpertFormat::Exl3 { .. }))
+        {
             // every row routed to each expert, in row order: its rows of x and their weights
             let gathered: Vec<(Vec<usize>, Vec<f32>, Vec<f32>)> = used
                 .iter()
@@ -631,8 +636,9 @@ impl Moe {
                     })?;
                     outs
                 }
-                // (one row: no GPU takes more)
+                // (one row: no GPU takes more; an EXL3 checkpoint's alone comes here without one)
                 None => {
+                    let crate::dsv41::expert::ExpertFormat::Exl3 { layers, .. } = &experts.format else { unreachable!("a GGUF's step comes here with a GPU") };
                     let reading = std::time::Instant::now();
                     let leases = read_all(&ids, &|e| experts.cache.probe(self.layer, e), &acquire)?;
                     crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertRead, reading);
@@ -823,8 +829,8 @@ impl Moe {
         let all = std::thread::available_parallelism().map_or(1, |n| n.get());
         // (an EXL3 checkpoint's experts all on the GPU where there is one: the CPU decodes their trellis at milliseconds
         // of every core an expert, slower than the upload, and its sums round apart from the GPU's, so a prompt's output
-        // hung on which of them each expert happened to go to)
-        let exl3 = matches!(experts.format, crate::dsv41::expert::ExpertFormat::Exl3 { .. });
+        // hung on which of them each expert happened to go to; a GGUF's alike)
+        let exl3 = !matches!(experts.format, crate::dsv41::expert::ExpertFormat::Fp4);
         let threads = if exl3 && gpu.is_some() {
             0
         } else if experts.pool.is_none() {
