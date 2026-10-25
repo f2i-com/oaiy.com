@@ -1294,6 +1294,12 @@ queue); the cards' counts halved every 128 or 32 steps where 512 took 2,241 and 
 fewer (11,732 and 10,146 where 12,568), and the replies were slower for the copies (code 10.2 and 8.6
 tok/s where 13.9, a familiar subject 16.9 and 14.4 where 19.8).
 
+The one-row EXL3 kernel (a step's trunk and held experts) decodes a 3-bit projection at 300 to 450
+GB/s, its workgroup a tile column's: two to eight tile columns a workgroup, its tables (the codes'
+values, each code's place) made once for them, the same bits, was 3-8% faster at two on the large
+projections and slower on the small ones at four and eight; left out. What bounds it is the tile
+loop's decode itself.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.
