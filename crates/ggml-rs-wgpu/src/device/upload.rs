@@ -141,21 +141,33 @@ impl crate::Gpu {
     pub(crate) fn write_mapped(&self, parts: &[(&wgpu::Buffer, u64, usize, &(dyn Fn(usize, &mut [u8]) + Sync))]) {
         use std::sync::atomic::{AtomicU8, Ordering};
         // (0 waiting, 1 mapped, 2 refused)
-        let states: Vec<std::sync::Arc<AtomicU8>> = parts
-            .iter()
-            .map(|&(buffer, offset, len, _)| {
-                let state = std::sync::Arc::new(AtomicU8::new(0));
-                let flag = std::sync::Arc::clone(&state);
-                buffer.slice(offset..offset + len as u64).map_async(wgpu::MapMode::Write, move |r| flag.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release));
-                state
-            })
-            .collect();
+        let ask = |state: &std::sync::Arc<AtomicU8>, &(buffer, offset, len, _): &(&wgpu::Buffer, u64, usize, &(dyn Fn(usize, &mut [u8]) + Sync))| {
+            state.store(0, Ordering::Release);
+            let flag = std::sync::Arc::clone(state);
+            buffer.slice(offset..offset + len as u64).map_async(wgpu::MapMode::Write, move |r| flag.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release));
+        };
+        let states: Vec<std::sync::Arc<AtomicU8>> = parts.iter().map(|_| std::sync::Arc::new(AtomicU8::new(0))).collect();
+        for (state, part) in states.iter().zip(parts) {
+            ask(state, part);
+        }
+        // Each mapped once the device's use of it is done: polled for until it is, the device waited for between. A
+        // callback comes in whichever thread's poll gets to it (a step's own polls for its round trips, on another
+        // thread), so one poll after the wait could come just before it: an engine's model thread ended there, the
+        // buffers fine. A part refused (another use of its buffer then) asked for again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let _ = self.device.poll(wgpu::PollType::Poll);
-        if states.iter().any(|s| s.load(Ordering::Acquire) == 0) {
+        while !states.iter().all(|s| s.load(Ordering::Acquire) == 1) {
+            assert!(std::time::Instant::now() < deadline, "webgpu: a slot's buffer was not mapped for writing in 10 s");
+            for (state, part) in states.iter().zip(parts).filter(|(s, _)| s.load(Ordering::Acquire) == 2) {
+                ask(state, part);
+            }
             self.wait(None);
             let _ = self.device.poll(wgpu::PollType::Poll);
+            if !states.iter().all(|s| s.load(Ordering::Acquire) == 1) {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+                let _ = self.device.poll(wgpu::PollType::Poll);
+            }
         }
-        assert!(states.iter().all(|s| s.load(Ordering::Acquire) == 1), "webgpu: a slot's buffer was not mapped for writing");
         {
             let mut views: Vec<wgpu::BufferViewMut> = parts.iter().map(|&(buffer, offset, len, _)| buffer.slice(offset..offset + len as u64).get_mapped_range_mut().expect("webgpu: a mapped buffer")).collect();
             let total: usize = parts.iter().map(|p| p.2).sum();

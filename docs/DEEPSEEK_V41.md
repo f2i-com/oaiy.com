@@ -1265,9 +1265,12 @@ A card past the first holds experts alone (their slots and scratch slots, made a
 prompt's attention, no display), so its experts take half the default's 4 GiB of room beside them
 (`ALONE`, as a tinygrad card's; `WgpuBackend::with_budget`), where no `--webgpu-gb` is given and the
 trunk is not split: the EXL3 checkpoint's slots 3,931 where 3,761 (its replies within their noise:
-19.7, 14.2, 20.0, 17.3 tok/s), the 2-bit GGUF's 5,856 where 5,608, an agent's replies at 22,692
-tokens 15.3, 17.3 and 22.0 tok/s where 11.8, 14.7 and 19.4. Through that prompt the second card's
-memory peaked at 30.8 GB of its 32.6, the first's at 30.6.
+19.7, 14.2, 20.0, 17.3 tok/s), the 2-bit GGUF's 5,856 where 5,608 (its replies not yet measured
+against the default's in one session: an agent's at 22,692 tokens came at 15.3, 17.3 and 22.0 tok/s,
+where an earlier run's on another build were 11.8, 14.7 and 19.4). Through that prompt the second
+card's memory peaked at 30.8 GB of its 32.6, the first's at 30.6. OAIY's studio passes a budget of its
+own making (`--webgpu-gb`, the card's memory less `vram_headroom_gb` and 2 GB), so in OAIY this is not
+yet so.
 
 ## Phases
 
