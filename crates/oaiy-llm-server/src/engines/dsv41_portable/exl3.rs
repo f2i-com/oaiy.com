@@ -1091,6 +1091,7 @@ impl ExpertsKernel for WgpuExl3Experts {
             let here = ggml_rs_wgpu::exl3::step_experts_host(&these, layout, swiglu_limit, true);
             if !these.is_empty() {
                 ease(&self.host_us, making.elapsed().as_secs_f64() * 1e6 / these.len() as f64);
+                crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertCpuKernel, making);
             }
             (there.map(|h| h.join().expect("the cards' share of a step's experts panicked")).unwrap_or_default(), here)
         });

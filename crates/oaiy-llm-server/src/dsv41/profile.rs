@@ -20,6 +20,9 @@ pub enum Part {
     ExpertHeld,
     /// Routed experts' matmuls on the CPU: a decode step's; a prompt's, the wait for them once its records are all in.
     ExpertCpu,
+    /// A decode step's experts made on the host's cores by the kernel alone (an EXL3 checkpoint's: `step_experts_host`),
+    /// within [`Part::ExpertCpu`].
+    ExpertCpuKernel,
     /// A dense weight held on a device (`linear::Weight::Device`): one call.
     DeviceDense,
     /// A dense weight on the CPU: one call.
@@ -38,12 +41,13 @@ pub enum Part {
     Engram,
 }
 
-const PARTS: [Part; 13] = [
+const PARTS: [Part; 14] = [
     Part::ExpertRead,
     Part::ExpertGpu,
     Part::ExpertUpload,
     Part::ExpertHeld,
     Part::ExpertCpu,
+    Part::ExpertCpuKernel,
     Part::DeviceDense,
     Part::HostDense,
     Part::SparseAttention,
@@ -68,6 +72,7 @@ impl Part {
             Part::ExpertUpload => "experts' uploads",
             Part::ExpertHeld => "held experts",
             Part::ExpertCpu => "experts on the CPU",
+            Part::ExpertCpuKernel => "of it the kernel",
             Part::DeviceDense => "dense on the device",
             Part::HostDense => "dense on the CPU",
             Part::SparseAttention => "sparse attention",
