@@ -359,7 +359,7 @@ fn a_groups_parts_in_a_program_are_each_parts_own_projection() {
         let alone: Vec<Arc<dyn PackedLinear>> = datas.iter().map(|d| b.exl3_with(Exl3Data { words: d.words.clone(), suh: d.suh.clone(), svh: d.svh.clone(), tile_words: d.tile_words, input_map: d.input_map.clone(), output_map: d.output_map.clone() }, None).unwrap()).collect();
         let x: Vec<f32> = (0..parts * k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
         let jobs: Vec<(u32, u32)> = (0..parts as u32).map(|p| (p, p)).collect();
-        let got = run_program(&b, &[ProgramStep::Input(&x), ProgramStep::MulGroup { g: &group, x: 0, jobs: &jobs }], &[(1, 0, parts * n)]).expect("the program runs").pop().unwrap();
+        let got = run_program(&b, &[ProgramStep::Input(&x), ProgramStep::MulGroup { g: GroupMat::Exl3(&group), x: 0, jobs: &jobs }], &[(1, 0, parts * n)]).expect("the program runs").pop().unwrap();
         for p in 0..parts {
             let want = chained(&b, &[(ChainMat::Exl3(&*alone[p]), &x[p * k..(p + 1) * k])]).expect("alone").pop().unwrap();
             assert!(got[p * n..(p + 1) * n].iter().zip(&want).all(|(a, e)| a.to_bits() == e.to_bits()), "tw={tw}: part {p} in the group is its own projection");

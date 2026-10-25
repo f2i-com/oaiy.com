@@ -187,6 +187,59 @@ fn pack_part(g: &Group, mats: usize, projs: &[QuantProj], records: &[&[u8]], fro
     }
 }
 
+/// What a record's put takes: its rows packed on the host's threads into memory of its own, and the same bytes written
+/// into a card's mapped memory with nothing to pack, at DeepSeek-V4.1's shape.
+#[cfg(test)]
+#[test]
+#[ignore = "a timing; run with --nocapture"]
+fn measure_a_records_packing_and_write() {
+    let Ok(b) = WgpuBackend::new(Some(4 << 30)) else { return };
+    let (hidden, ff) = (5120usize, 2304usize);
+    for types in [[GgmlType::IQ1_M, GgmlType::IQ1_M], [GgmlType::IQ2_XXS, GgmlType::IQ2_XS]] {
+        let gb = ff * hidden / 256 * types[0].type_size();
+        let db = hidden * ff / 256 * types[1].type_size();
+        let layout = QuantLayout {
+            bytes: 2 * gb + db,
+            proj: [QuantProj { at: 0, dtype: types[0], k: hidden, n: ff }, QuantProj { at: gb, dtype: types[0], k: hidden, n: ff }, QuantProj { at: 2 * gb, dtype: types[1], k: ff, n: hidden }],
+        };
+        let record: Vec<u8> = (0..layout.bytes).map(|i| (i * 131 % 251) as u8).collect();
+        let slots = b.quant_slots_mapped(8, hidden, ff, types).expect("room for eight slots");
+        let gw = slots.gu.mwords * 4;
+        let mut packed = vec![0u8; 2 * gw];
+        let reps = 20;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            pack_part(&slots.gu, 2, &[layout.proj[0], layout.proj[1]], &[&record[..]], 0, &mut packed);
+        }
+        let one = t.elapsed().as_secs_f64() / reps as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            packed.par_chunks_mut(gw / 8).enumerate().for_each(|(i, part)| pack_part(&slots.gu, 2, &[layout.proj[0], layout.proj[1]], &[&record[..]], i * (gw / 8), part));
+        }
+        let many = t.elapsed().as_secs_f64() / reps as f64;
+        let copy = |from: usize, part: &mut [u8]| part.copy_from_slice(&packed[from..from + part.len()]);
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            b.gpu.write_mapped(&[(&slots.gu.words, 0, 2 * gw, &copy as &(dyn Fn(usize, &mut [u8]) + Sync))]);
+        }
+        let write = t.elapsed().as_secs_f64() / reps as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            slots.put(0, &record, &layout);
+        }
+        let put = t.elapsed().as_secs_f64() / reps as f64;
+        eprintln!(
+            "{types:?}: a record's gate and up ({:.1} MB) packed in {:.2} ms on one thread, {:.2} ms on eight; written mapped with nothing to pack {:.2} ms ({:.1} GB/s); a whole put {:.2} ms",
+            (2 * gw) as f64 / 1e6,
+            one * 1e3,
+            many * 1e3,
+            write * 1e3,
+            (2 * gw) as f64 / write / 1e9,
+            put * 1e3
+        );
+    }
+}
+
 /// A matrix's row's bytes in its record.
 fn row_bytes_of(p: &QuantProj) -> usize {
     row_bytes(p.dtype, p.k)
@@ -195,7 +248,7 @@ fn row_bytes_of(p: &QuantProj) -> usize {
 /// One group's jobs (`jobs`, `count` of them) on `x`'s rows into `y`'s (job `j`'s row `j`), as [`QuantMoe`]'s pass
 /// runs a layer the card holds whole; `skip`: a job whose matrix is `u32::MAX` skipped, its row left as it was.
 #[allow(clippy::too_many_arguments)]
-fn pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, y: &DeviceVec, slots: usize, skip: bool) {
+pub(super) fn pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, y: &DeviceVec, slots: usize, skip: bool) {
     let d = rec.gpu().dummy().clone();
     let drw = rec.gpu().dummy_rw().clone();
     let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();

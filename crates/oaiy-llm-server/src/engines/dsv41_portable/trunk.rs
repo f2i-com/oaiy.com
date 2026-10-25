@@ -69,8 +69,10 @@ enum Mat {
     Exl3(Arc<dyn ggml_rs::exl3::PackedLinear>),
     Bf16(ggml_rs_wgpu::chain::WeightVec),
     F32(ggml_rs_wgpu::chain::WeightVec),
-    /// A stack's parts together, multiplied only by a program's step (`Step::MulGroup`).
+    /// A stack's parts together, multiplied only by a program's step (`Step::MulGroup`): an EXL3 checkpoint's, or a
+    /// GGUF's.
     Group(ggml_rs_wgpu::exl3::Exl3Group),
+    QuantGroup(ggml_rs_wgpu::quant::moe::QuantGroup),
 }
 
 /// A matrix of a chained recording on the WebGPU adapter, as the CPU model's [`DenseKernel`]: it gives every row of its
@@ -101,7 +103,7 @@ impl WgpuChained {
             Mat::Exl3(lin) => ggml_rs_wgpu::exl3::ChainMat::Exl3(&**lin),
             Mat::Bf16(w) => ggml_rs_wgpu::exl3::ChainMat::Bf16 { w: &w.v, n: self.n, k: self.k },
             Mat::F32(w) => ggml_rs_wgpu::exl3::ChainMat::F32 { w: &w.v, n: self.n, k: self.k },
-            Mat::Group(_) => panic!("a stack's group is multiplied by a program's step alone"),
+            Mat::Group(_) | Mat::QuantGroup(_) => panic!("a stack's group is multiplied by a program's step alone"),
         }
     }
 }
@@ -123,7 +125,7 @@ impl DenseKernel for WgpuChained {
         let mats: Vec<(ggml_rs_wgpu::exl3::ChainMat<'_>, &[f32])> = mine.iter().zip(items).map(|(w, (_, x, ..))| (w.chain_mat(), *x)).collect();
         let all = ggml_rs_wgpu::exl3::chained(&self.b, &mats).or_else(|| {
             let lins: Vec<(&dyn ggml_rs::exl3::PackedLinear, &[f32])> =
-                mine.iter().zip(items).map(|(w, (_, x, ..))| match &w.mat { Mat::Exl3(l) => Some((&**l, *x)), Mat::Bf16(_) | Mat::F32(_) | Mat::Group(_) => None }).collect::<Option<_>>()?;
+                mine.iter().zip(items).map(|(w, (_, x, ..))| match &w.mat { Mat::Exl3(l) => Some((&**l, *x)), Mat::Bf16(_) | Mat::F32(_) | Mat::Group(_) | Mat::QuantGroup(_) => None }).collect::<Option<_>>()?;
             ggml_rs_wgpu::exl3::exl3_many(&lins)
         })?;
         Some(all.iter().zip(&mine).zip(items).map(|((all, w), (_, _, t, rows))| w.rows_of(all, *t, rows.clone())).collect())
@@ -180,7 +182,8 @@ impl WgpuChained {
                     S::Scratch(len) => G::Scratch(len),
                     S::Mul { w, x, rows } => G::Mul { m: on_device(w, &self.b)?.chain_mat(), x, rows },
                     S::MulGroup { group, x, jobs } => match &on_device(group, &self.b)?.mat {
-                        Mat::Group(g) => G::MulGroup { g, x, jobs },
+                        Mat::Group(g) => G::MulGroup { g: ggml_rs_wgpu::exl3::GroupMat::Exl3(g), x, jobs },
+                        Mat::QuantGroup(g) => G::MulGroup { g: ggml_rs_wgpu::exl3::GroupMat::Quant(g), x, jobs },
                         _ => return None,
                     },
                     S::CopyColsBf16 { src, src_stride, src_at, dst, dst_stride, dst_at, width, rows } => G::CopyColsBf16 { src, src_stride, src_at, dst, dst_stride, dst_at, width, rows },
@@ -256,8 +259,17 @@ pub(crate) fn offload_drafter(drafter: &mut crate::dsv41::dspark::Drafter, gpu: 
 /// What puts a dense weight on `gpu` ([`offload`]).
 pub(super) fn placer(gpu: &WgpuBackend, exl3: bool) -> impl FnMut(&str, &Weight) -> Option<Weight> + '_ {
     move |_name, w| {
-        // (a stack of EXL3 projections of one shape, an EXL3 checkpoint's `wo_a`: its parts together as well)
+        // (a stack of EXL3 projections of one shape, an EXL3 checkpoint's `wo_a`: its parts together as well; a GGUF's of
+        // one type and shape alike, through the experts' kernels: OAIY_DSV41_GGUF_GROUP=0, each part its own matmul)
         if let Weight::Stacked { parts, rows, k, .. } = w {
+            if let Some(Weight::Ggml { dtype, n, k: pk, .. }) = parts.first() {
+                if std::env::var("OAIY_DSV41_GGUF_GROUP").as_deref() == Ok("0") {
+                    return None;
+                }
+                let bytes: Vec<&[u8]> = parts.iter().map(|p| if let Weight::Ggml { dtype: t, bytes, n: pn, k: kk } = p { (t == dtype && (pn, kk) == (n, pk)).then_some(&bytes[..]) } else { None }).collect::<Option<_>>()?;
+                let group = gpu.quant_group(*dtype, &bytes, *n, *pk)?;
+                return Some(Weight::Device { kernel: Arc::new(WgpuChained { mat: Mat::QuantGroup(group), n: *rows, k: *k, b: gpu.clone() }), n: *rows, k: *k, fp8: false });
+            }
             let datas: Vec<&ggml_rs::exl3::Exl3Data> = parts.iter().map(|p| if let Weight::Exl3 { data, .. } = p { Some(&**data) } else { None }).collect::<Option<_>>()?;
             let group = gpu.exl3_group(&datas)?;
             return Some(Weight::Device { kernel: Arc::new(WgpuChained { mat: Mat::Group(group), n: *rows, k: *k, b: gpu.clone() }), n: *rows, k: *k, fp8: false });

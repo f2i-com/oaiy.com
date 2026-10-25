@@ -512,6 +512,11 @@ impl Engine {
                     "    {label}'s held experts by card, once the host had the rest: the first's {} of {} calls still running, waited for {:.0} us on average; the second's {} of {}, {:.0} us",
                     a.2, a.1, a.0, b.2, b.1, b.0
                 );
+                let [p, q] = k.take_puts();
+                eprintln!(
+                    "    {label}'s puts into scratch slots by card: the first's {} at {:.0} us each ({:.1} GB/s), {} more held there still; the second's {} at {:.0} us ({:.1} GB/s), {} more",
+                    p.0, p.1, p.2, p.3, q.0, q.1, q.2, q.3
+                );
             }
         };
         if profiling {

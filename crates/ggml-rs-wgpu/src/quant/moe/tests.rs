@@ -44,17 +44,17 @@ fn random_grid(next: &mut impl FnMut() -> f32, t: GgmlType, matrices: usize, row
     bytes
 }
 
-/// `matrices` of `rows` by `cols` in a K-quant (Q4_K or Q6_K): every nibble, high bit and scale at random, each block's
-/// own scales small f16s (Q6_K's sixteen int8 ones, some negative).
+/// `matrices` of `rows` by `cols` in a K-quant (Q4_K, Q5_K or Q6_K): every nibble, high bit and scale at random, each
+/// block's own scales small f16s (Q6_K's sixteen int8 ones, some negative).
 fn random_k(next: &mut impl FnMut() -> f32, t: GgmlType, matrices: usize, rows: usize, cols: usize) -> Vec<u8> {
     let blocks = matrices * rows * cols / 256;
     let mut bytes = Vec::with_capacity(blocks * t.type_size());
     let byte = |next: &mut dyn FnMut() -> f32| ((next() + 1.0) * 127.99) as u8;
     for _ in 0..blocks {
-        if t == GgmlType::Q4_K {
+        if t == GgmlType::Q4_K || t == GgmlType::Q5_K {
             bytes.extend(half::f16::from_f32(0.0004 + 0.0002 * next()).to_bits().to_le_bytes());
             bytes.extend(half::f16::from_f32(0.0004 + 0.0002 * next()).to_bits().to_le_bytes());
-            bytes.extend((0..140).map(|_| byte(&mut *next)));
+            bytes.extend((0..t.type_size() - 4).map(|_| byte(&mut *next)));
         } else {
             bytes.extend((0..208).map(|_| byte(&mut *next)));
             bytes.extend(half::f16::from_f32(0.0004 + 0.0002 * next()).to_bits().to_le_bytes());
@@ -448,6 +448,31 @@ fn measure_experts_in_slots() {
     }
 }
 
+/// A GGUF's matrices kept together ([`QuantGroup`]) give each part's product in one pass of a device program's
+/// [`crate::exl3::ProgramStep::MulGroup`]: DeepSeek-V4.1's `wo_a` shape (eight Q5_K slices of 1024 by 4096, each on its
+/// own row of the heads' outputs) against the definition (each part decoded whole by `ggml_quants`) in f64.
+#[test]
+fn a_quant_groups_parts_are_each_the_definitions() {
+    use crate::exl3::{run_program, GroupMat, ProgramStep};
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (parts, n, k) = (8usize, 1024usize, 4096usize);
+    let mut next = rng(33);
+    let mats: Vec<Vec<u8>> = (0..parts).map(|_| random_k(&mut next, GgmlType::Q5_K, 1, n, k)).collect();
+    let refs: Vec<&[u8]> = mats.iter().map(|m| &m[..]).collect();
+    let group = b.quant_group(GgmlType::Q5_K, &refs, n, k).expect("room for the group");
+    assert_eq!((group.kn(), group.count()), ((k, n), parts));
+    let x: Vec<f32> = (0..parts * k).map(|_| next()).collect();
+    let jobs: Vec<(u32, u32)> = (0..parts as u32).map(|g| (g, g)).collect();
+    let got = run_program(&b, &[ProgramStep::Input(&x), ProgramStep::MulGroup { g: GroupMat::Quant(&group), x: 0, jobs: &jobs }], &[(1, 0, parts * n)]).expect("the program runs").pop().unwrap();
+    for (g, m) in mats.iter().enumerate() {
+        let mut w = vec![0f32; n * k];
+        ggml_quants::dequantize(GgmlType::Q5_K, m, &mut w).unwrap();
+        let want: Vec<f32> = (0..n).map(|r| (0..k).map(|c| w[r * k + c] as f64 * x[g * k + c] as f64).sum::<f64>() as f32).collect();
+        let e = worst(&got[g * n..(g + 1) * n], &want);
+        assert!(e < 5e-5, "part {g}: {e:.2e} of the RMS");
+    }
+}
+
 /// A device program's held experts in slots of a GGUF's ([`crate::exl3::ProgramStep::Candidates`], then `Held` of
 /// [`QuantSlots`]) are the `k` best of the router's scores, those the table holds made as the slots make them alone (to
 /// the bit) and those it does not skipped (their rows as they were).
@@ -558,7 +583,7 @@ fn the_gpus_grid_experts_are_the_hosts() {
 fn the_gpus_k_quant_experts_are_the_hosts() {
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
     let (hidden, ff, count, top_k) = (512, 256, 12, 3);
-    for (gu, down) in [(GgmlType::Q4_K, GgmlType::Q4_K), (GgmlType::Q4_K, GgmlType::Q6_K), (GgmlType::Q6_K, GgmlType::Q6_K)] {
+    for (gu, down) in [(GgmlType::Q4_K, GgmlType::Q4_K), (GgmlType::Q4_K, GgmlType::Q6_K), (GgmlType::Q6_K, GgmlType::Q6_K), (GgmlType::Q5_K, GgmlType::Q5_K)] {
         let data = k_experts(91, hidden, ff, count, gu, down);
         let host = quant_experts_cpu(copy(&data)).unwrap();
         let mut f32s = QuantMoe::try_new(&b, copy(&data), 0).ok().expect("K-quant experts on the GPU");

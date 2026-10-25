@@ -1113,6 +1113,31 @@ the host's routing, a round trip sooner. Two runs each, alternated, the second r
 
 Every reply the same text in all four runs (and as above).
 
+A scratch pool's slots remember what they hold (`Scratch`: each slot's expert and when it was last
+used): an expert a pass finds there still, put by a recent pass, is made from its slot as it is, the
+rest put into the slots used longest ago, and a pass's misses go first to a card whose slots hold them.
+A new subject's reply found a sixth to a quarter of its misses there; the uploads they skipped made
+its replies some 5% faster (second rounds 16.7 and 16.5 tok/s, 15.9 and 15.8 with
+`OAIY_DSV41_SCRATCH_REUSE=0`), the other asks within their noise; the same text either way. The
+profile says each card's puts and their rate: the first card's, on four lanes, 7 to 8 GB/s; the
+second's, on eight, 14 to 15.
+
+A GGUF's grouped output (`wo_a`, eight Q5_K slices of 1024 by 4096) is kept on the card as one group
+too (`ggml_rs_wgpu::quant::moe::QuantGroup`, Q5_K added to the experts' kernels), its eight parts one
+pass of the few-row kernel in the attention's program, where each part was its heads' copy, the
+copy's quantization to int8, its matmul and its rows' copy: some 30 dispatches a layer fewer. Its
+sums are f32's where the parts' were from int8 activations, so the replies are other texts (the same
+every time). Second rounds, one pair on a quiet machine:
+
+| Reply | Each part its own matmul | One group |
+|---|---|---|
+| A familiar subject | 22.2 tok/s | 26.1 tok/s |
+| Code | 17.4 tok/s | 19.0 tok/s |
+| The same again | 21.7 tok/s | 26.7 tok/s |
+| A new subject | 17.1 tok/s | 18.9 tok/s |
+
+(`OAIY_DSV41_GGUF_GROUP=0`: each part its own matmul.)
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

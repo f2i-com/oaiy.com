@@ -16,7 +16,7 @@ pub enum ProgramStep<'a> {
     /// `m` of `rows` rows of vector `x` (`[rows, k]`): its sums, `[rows, n]`.
     Mul { m: ChainMat<'a>, x: usize, rows: usize },
     /// `jobs` of a group (`(part, row of x)` each, x's rows `k` wide) in one pass: each job's sums, `[jobs, n]`.
-    MulGroup { g: &'a Exl3Group, x: usize, jobs: &'a [(u32, u32)] },
+    MulGroup { g: GroupMat<'a>, x: usize, jobs: &'a [(u32, u32)] },
     /// `width` columns from `src_at` of `rows` rows of `src` (rows `src_stride` apart), each rounded to bf16, into
     /// `dst` from `dst_at` (rows `dst_stride` apart).
     CopyColsBf16 { src: usize, src_stride: usize, src_at: usize, dst: usize, dst_stride: usize, dst_at: usize, width: usize, rows: usize },
@@ -81,6 +81,57 @@ pub enum ProgramStep<'a> {
     /// coefficients' exponentials and Sinkhorn's divisions the device's own), laid out as a [`ProgramStep::HcPost`]
     /// takes them: `[24]`.
     HcMix { proj: usize, pos: usize, word: u32, base: &'a [f32], scale: &'a [f32], n: usize, norm_eps: f32, iters: usize, hc_eps: f32 },
+}
+
+/// The parts a [`ProgramStep::MulGroup`] multiplies: an EXL3 checkpoint's, or a GGUF's.
+#[derive(Clone, Copy)]
+pub enum GroupMat<'a> {
+    Exl3(&'a Exl3Group),
+    Quant(&'a crate::quant::moe::QuantGroup),
+}
+
+/// A [`ProgramStep::MulGroup`]'s vectors beside its input and output, as its parts' kind takes them.
+enum GroupMatScratch {
+    Exl3(GroupScratch),
+    Quant(crate::quant::moe::QuantGroupScratch),
+}
+
+impl GroupMat<'_> {
+    fn kn(&self) -> (usize, usize) {
+        match self {
+            GroupMat::Exl3(g) => g.kn(),
+            GroupMat::Quant(g) => g.kn(),
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            GroupMat::Exl3(g) => g.count(),
+            GroupMat::Quant(g) => g.count(),
+        }
+    }
+
+    fn words(&self) -> &wgpu::Buffer {
+        match self {
+            GroupMat::Exl3(g) => g.words(),
+            GroupMat::Quant(g) => g.words(),
+        }
+    }
+
+    fn scratch_kept(&self, b: &WgpuBackend, jobs: &[(u32, u32)]) -> GroupMatScratch {
+        match self {
+            GroupMat::Exl3(g) => GroupMatScratch::Exl3(g.scratch_kept(b, jobs)),
+            GroupMat::Quant(g) => GroupMatScratch::Quant(g.scratch_kept(b, jobs)),
+        }
+    }
+
+    fn record(&self, rec: &mut crate::chain::Recorder<'_>, s: &GroupMatScratch, x: &DeviceVec, y: &DeviceVec) {
+        match (self, s) {
+            (GroupMat::Exl3(g), GroupMatScratch::Exl3(s)) => g.record(rec, s, x, y),
+            (GroupMat::Quant(g), GroupMatScratch::Quant(s)) => g.record(rec, s, x, y),
+            _ => unreachable!("a group's scratch is of its parts' kind"),
+        }
+    }
 }
 
 /// The slots a [`ProgramStep::Held`] makes its experts from: an EXL3 checkpoint's, or a GGUF's.
@@ -525,7 +576,7 @@ pub fn run_program_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], read
 pub(crate) struct ProgramArena {
     vecs: Vec<Option<DeviceVec>>,
     norms: Vec<Option<DeviceVec>>,
-    groups: Vec<Option<GroupScratch>>,
+    groups: Vec<Option<GroupMatScratch>>,
     tables: Vec<Option<DeviceVec>>,
     fused: Vec<Option<HeldScratch>>,
     /// Its two parts' dispatches as its first run recorded them, and where it was split: each run's after it the same

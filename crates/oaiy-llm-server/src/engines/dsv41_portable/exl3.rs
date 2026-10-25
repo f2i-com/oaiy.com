@@ -179,8 +179,45 @@ struct Pool {
     scratch: bool,
     /// Which of the cards it is on.
     card: usize,
-    /// One call in the scratch slots at a time.
-    busy: Mutex<()>,
+    /// One call in the scratch slots at a time, and what they hold.
+    busy: Mutex<Scratch>,
+}
+
+/// What a scratch pool's slots hold: each one's expert (`(layer, expert)`, as its last put left it) and when it was
+/// last used, by the pool's own count of uses. An expert a pass finds there still is used as it is, no put again.
+#[derive(Default)]
+struct Scratch {
+    keys: Vec<Option<(u32, u32)>>,
+    used: Vec<u64>,
+    uses: u64,
+}
+
+impl Scratch {
+    fn new(slots: usize) -> Scratch {
+        Scratch { keys: vec![None; slots], used: vec![0; slots], uses: 0 }
+    }
+
+    /// Slot `s` holds `key` now, used now.
+    fn mark(&mut self, s: usize, key: (u32, u32)) {
+        self.uses += 1;
+        self.keys[s] = Some(key);
+        self.used[s] = self.uses;
+    }
+
+    /// The slot that holds `key`, where one does (and OAIY_DSV41_SCRATCH_REUSE=0 does not say to put every expert
+    /// again).
+    fn find(&self, key: (u32, u32)) -> Option<usize> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("OAIY_DSV41_SCRATCH_REUSE").as_deref() == Ok("0")) {
+            return None;
+        }
+        self.keys.iter().position(|k| *k == Some(key))
+    }
+
+    /// The slot used longest ago.
+    fn oldest(&self) -> usize {
+        (0..self.used.len()).min_by_key(|&s| self.used[s]).expect("a scratch pool has slots")
+    }
 }
 
 /// Where the held experts are: each one's `(pool, slot)`, each pool's slots' experts, and each pool's free slots.
@@ -205,6 +242,9 @@ struct Counts {
     /// Each card's held-experts calls (the first two cards), as the host found them once it had made the rest of the
     /// layer's experts: the time it then waited for their outputs (ns), how many calls, and how many it found running.
     held_wait: [[AtomicU64; 3]; 2],
+    /// Each card's puts into its scratch slots (the first two cards): their time (ns), how many, their bytes, and the
+    /// experts its scratch slots held still (no put).
+    puts: [[AtomicU64; 4]; 2],
 }
 
 pub(crate) struct WgpuExl3Experts {
@@ -348,7 +388,8 @@ impl WgpuExl3Experts {
         for (c, card) in cards.iter().enumerate() {
             for &(class, _, li) in &classes {
                 if let Some(slots) = layouts[li].slots_on(card, scratch, true) {
-                    pools.push(Pool { slots, class, scratch: true, card: c, busy: Mutex::new(()) });
+                    let held = Scratch::new(slots.slots());
+                    pools.push(Pool { slots, class, scratch: true, card: c, busy: Mutex::new(held) });
                 }
             }
         }
@@ -367,7 +408,7 @@ impl WgpuExl3Experts {
                     let Some(slots) = layouts[li].slots_on(card, want, false) else { break };
                     want = want.saturating_sub(slots.slots());
                     left = left.saturating_sub(slots.slots());
-                    pools.push(Pool { slots, class, scratch: false, card: c, busy: Mutex::new(()) });
+                    pools.push(Pool { slots, class, scratch: false, card: c, busy: Mutex::new(Scratch::default()) });
                 }
             }
         }
@@ -487,6 +528,15 @@ impl WgpuExl3Experts {
     /// The first two cards' held-experts calls since the last ask, as the host found them once it had made the rest of
     /// a layer's experts: the mean time it then waited for each card's (us), how many calls, and how many still
     /// running; reset.
+    /// The first two cards' puts into their scratch slots since the last ask: how many, their mean time (us), their
+    /// rate (GB/s), and the experts the slots held still; reset.
+    pub(crate) fn take_puts(&self) -> [(u64, f64, f64, u64); 2] {
+        self.counts.puts.each_ref().map(|[ns, n, bytes, reused]| {
+            let (ns, n, bytes) = (ns.swap(0, Ordering::Relaxed), n.swap(0, Ordering::Relaxed), bytes.swap(0, Ordering::Relaxed));
+            (n, ns as f64 / 1e3 / n.max(1) as f64, bytes as f64 / ns.max(1) as f64, reused.swap(0, Ordering::Relaxed))
+        })
+    }
+
     pub(crate) fn take_held_waits(&self) -> [(f64, u64, u64); 2] {
         self.counts.held_wait.each_ref().map(|[ns, n, late]| {
             let (ns, n, late) = (ns.swap(0, Ordering::Relaxed), n.swap(0, Ordering::Relaxed), late.swap(0, Ordering::Relaxed));
@@ -540,9 +590,11 @@ impl WgpuExl3Experts {
         let (card, class, layout) = (self.pools[p].card, self.pools[p].class, &self.layouts[layer as usize]);
         match self.pools.iter().find(|q| q.scratch && q.card == card && q.class == class) {
             Some(q) => {
-                let _one = q.busy.lock().unwrap_or_else(|e| e.into_inner());
-                q.slots.put_many(0, &[record], layout);
-                q.slots.copy_slot_marked(0, &self.pools[p].slots, s, &self.marks(layer, expert, (p, s), None));
+                let mut held = q.busy.lock().unwrap_or_else(|e| e.into_inner());
+                let at = held.oldest();
+                q.slots.put_many(at, &[record], layout);
+                held.mark(at, (layer, expert));
+                q.slots.copy_slot_marked(at, &self.pools[p].slots, s, &self.marks(layer, expert, (p, s), None));
             }
             None => {
                 self.pools[p].slots.put(s, record, layout);
@@ -661,9 +713,11 @@ impl WgpuExl3Experts {
             }
         };
         let Some(q) = (0..self.pools.len()).find(|&q| self.pools[q].scratch && self.pools[q].card == card && self.pools[q].class == class) else { return };
-        let _one = self.pools[q].busy.lock().unwrap_or_else(|e| e.into_inner());
-        self.pools[q].slots.put_many(0, &[record], &self.layouts[layer as usize]);
-        self.keep(layer, expert, (q, 0));
+        let mut held = self.pools[q].busy.lock().unwrap_or_else(|e| e.into_inner());
+        let at = held.oldest();
+        self.pools[q].slots.put_many(at, &[record], &self.layouts[layer as usize]);
+        held.mark(at, (layer, expert));
+        self.keep(layer, expert, (q, at));
         if self.elsewhere(layer, expert) {
             self.promoted.lock().unwrap_or_else(|p| p.into_inner()).push((layer, expert));
         }
@@ -741,33 +795,68 @@ impl WgpuExl3Experts {
         (0..misses).min_by(|&a, &b| ends(a).total_cmp(&ends(b))).unwrap_or(0)
     }
 
-    /// `jobs` (of `list`) through scratch pool `p`, a group of its slots at a time: each one's output, weighted. Each
-    /// expert is then kept on the card where it is used enough ([`Self::keep`]).
+    /// `jobs` (of `list`) through scratch pool `p`, a group of its slots at a time: each one's output, weighted. An
+    /// expert the pool's slots hold still (a recent pass put it there) is made from its slot as it is, the rest put into
+    /// the slots used longest ago (runs of slots side by side in one put). Each expert is then kept on the card where
+    /// it is used enough ([`Self::keep`]).
     fn through_scratch(&self, layer: u32, p: usize, jobs: &[ExpertJob<'_>], list: &[usize], limit: f32) -> Vec<(usize, Vec<f32>)> {
         let (pool, layout) = (&self.pools[p], &self.layouts[layer as usize]);
-        let _one = pool.busy.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = pool.busy.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(list.len());
         for group in list.chunks(pool.slots.slots()) {
-            let uploading = std::time::Instant::now();
-            let records: Vec<&[u8]> = group.iter().map(|&i| jobs[i].record).collect();
-            pool.slots.put_many(0, &records, layout);
-            let took = uploading.elapsed().as_secs_f64() * 1e6;
-            crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertUpload, uploading);
-            // (the card's rate, a fifth from this put)
-            let seen = (records.len() * layout.bytes()) as f64 / took.max(1.0);
-            self.rates[pool.card].store((self.rate(pool.card) * 0.8 + seen * 0.2).to_bits(), Ordering::Relaxed);
-            let these: Vec<(usize, &[f32])> = group.iter().enumerate().map(|(s, &i)| (s, jobs[i].x)).collect();
+            // each job's slot: the one that holds its expert, else one of the oldest, in slot order
+            let mut at: Vec<Option<usize>> = group.iter().map(|&i| held.find((layer, jobs[i].expert))).collect();
+            let mut free: Vec<usize> = (0..held.keys.len()).filter(|s| !at.contains(&Some(*s))).collect();
+            free.sort_by_key(|&s| held.used[s]);
+            let mut fresh: Vec<usize> = free[..at.iter().filter(|a| a.is_none()).count()].to_vec();
+            fresh.sort_unstable();
+            let mut fresh = fresh.into_iter();
+            for a in at.iter_mut().filter(|a| a.is_none()) {
+                *a = fresh.next();
+            }
+            let at: Vec<usize> = at.into_iter().map(|a| a.expect("a slot for every job: a group is no more than the slots")).collect();
+            let mut puts: Vec<(usize, &[u8])> = group.iter().zip(&at).filter(|&(&i, _)| held.find((layer, jobs[i].expert)).is_none()).map(|(&i, &s)| (s, jobs[i].record)).collect();
+            puts.sort_by_key(|&(s, _)| s);
+            if !puts.is_empty() {
+                let uploading = std::time::Instant::now();
+                for run in puts.chunk_by(|a, b| b.0 == a.0 + 1) {
+                    let records: Vec<&[u8]> = run.iter().map(|&(_, r)| r).collect();
+                    pool.slots.put_many(run[0].0, &records, layout);
+                }
+                let took = uploading.elapsed().as_secs_f64() * 1e6;
+                crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertUpload, uploading);
+                if let Some([ns, n, bytes, _]) = self.counts.puts.get(pool.card) {
+                    ns.fetch_add((took * 1e3) as u64, Ordering::Relaxed);
+                    n.fetch_add(puts.len() as u64, Ordering::Relaxed);
+                    bytes.fetch_add((puts.len() * layout.bytes()) as u64, Ordering::Relaxed);
+                }
+                // (the card's rate, a fifth from this put)
+                let seen = (puts.len() * layout.bytes()) as f64 / took.max(1.0);
+                self.rates[pool.card].store((self.rate(pool.card) * 0.8 + seen * 0.2).to_bits(), Ordering::Relaxed);
+            }
+            if let Some([.., reused]) = self.counts.puts.get(pool.card) {
+                reused.fetch_add((group.len() - puts.len()) as u64, Ordering::Relaxed);
+            }
+            for (&i, &s) in group.iter().zip(&at) {
+                held.mark(s, (layer, jobs[i].expert));
+            }
+            let these: Vec<(usize, &[f32])> = group.iter().zip(&at).map(|(&i, &s)| (s, jobs[i].x)).collect();
             let calling = std::time::Instant::now();
             let ys = pool.slots.forward(&these, limit);
             ease(&self.call_us, calling.elapsed().as_secs_f64() * 1e6);
             for (y, &i) in ys.into_iter().zip(group) {
                 out.push((i, weighed(y, jobs[i].weights)));
             }
-            for (s, &i) in group.iter().enumerate() {
+            for (&i, &s) in group.iter().zip(&at) {
                 self.keep(layer, jobs[i].expert, (p, s));
             }
         }
         out
+    }
+
+    /// Which of `scratch` (scratch pools) holds `layer`'s `expert` in a slot still, where one does.
+    fn scratch_holding(&self, scratch: &[usize], layer: u32, expert: u32) -> Option<usize> {
+        (0..scratch.len()).find(|&k| self.pools[scratch[k]].busy.lock().unwrap_or_else(|e| e.into_inner()).find((layer, expert)).is_some())
     }
 }
 
@@ -794,7 +883,12 @@ impl ExpertsKernel for WgpuExl3Experts {
         self.counts.scratch.fetch_add(jobs.len() as u64, Ordering::Relaxed);
         let mut lists: Vec<Vec<usize>> = vec![Vec::new(); scratch.len()];
         let mut load = vec![0f64; scratch.len()];
+        // (an expert a pool's slots hold still to that pool, no put)
         for i in 0..jobs.len() {
+            if let Some(k) = self.scratch_holding(&scratch, layer, jobs[i].expert) {
+                lists[k].push(i);
+                continue;
+            }
             let k = (0..scratch.len())
                 .min_by(|&a, &b| {
                     let done = |k: usize| (load[k] + layout.bytes() as f64) / self.rate(self.pools[scratch[k]].card);

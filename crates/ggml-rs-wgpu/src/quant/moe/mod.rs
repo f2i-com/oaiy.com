@@ -31,12 +31,13 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 mod cache;
+mod group;
 mod host;
 mod kernels;
 mod slots;
 
 // (what this file gave the crate and its users, and what the files make for each other)
-pub use {cache::*, host::*, slots::*};
+pub use {cache::*, group::*, host::*, slots::*};
 use kernels::*;
 
 /// One kind of a layer's routed experts' projection as a group (their gate and up matrices, or their down ones): their
