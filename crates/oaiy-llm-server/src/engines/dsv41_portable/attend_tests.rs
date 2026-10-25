@@ -139,6 +139,51 @@ fn the_indexers_scores_and_picks_on_the_device_are_the_hosts() {
     }
 }
 
+/// The candidate blocks on the device (`BlockKeep` of the candidate source's scores, `MaskBlocks` of a later source's,
+/// then its `TopK`) are the host's (`candidate_mask`, `select_compressed`'s masking and picks): counts up to the 2,048
+/// blocks of 8 that keep every position, at them and past them, scores of few values so that blocks tie often.
+#[test]
+#[ignore = "needs a WebGPU adapter"]
+fn the_candidate_blocks_on_the_device_are_the_hosts() {
+    let b = gpu();
+    let mut r = Values(0x7fb5_d329_728e_a185);
+    let (blocks_k, bs, k, cap) = (2048usize, 8usize, 512usize, 65536usize);
+    let blocks = DeviceChain::vec(&b, 1 + cap.div_ceil(bs));
+    let picked = DeviceChain::vec(&b, k);
+    for (n, coarse) in [(100usize, false), (16384, false), (16385, true), (16391, false), (40000, true), (65536, false)] {
+        let source = r.bf16(n, 1.0);
+        let mut later = r.bf16(n, 1.0);
+        let source: Vec<f32> = if coarse { source.iter().map(|v| to_bf16((v * 4.0).round() / 4.0)).collect() } else { source };
+        if coarse {
+            later.iter_mut().for_each(|v| *v = to_bf16((*v * 8.0).round() / 8.0));
+        }
+        let mask = crate::dsv41::attention::candidate_mask(&source, n, blocks_k, bs);
+        let masked: Vec<f32> = later.iter().zip(&mask).map(|(&v, &keep)| if keep { v } else { f32::NEG_INFINITY }).collect();
+        let mut picks: Vec<i32> = crate::dsv41::attention::topk_indices(&masked, k).into_iter().map(|p| p as i32).collect();
+        picks.sort_unstable();
+        let wd = words(&[n]);
+        let steps = [
+            G::Input(&source),
+            G::Input(&later),
+            G::Input(&wd),
+            G::State(&blocks),
+            G::BlockKeep { scores: 0, blocks: 3, k: blocks_k, bs, pos: 2, word: 0 },
+            G::MaskBlocks { scores: 1, blocks: 3, bs, pos: 2, word: 0 },
+            G::State(&picked),
+            G::TopK { scores: 1, dst: 6, k, pos: 2, word: 0 },
+        ];
+        let nb = n.div_ceil(bs);
+        let got = run_program(&b, &steps, &[(3, 0, 1 + nb), (1, 0, n), (6, 0, k)]).expect("a program");
+        let flags = bits(&got[0]);
+        assert_eq!(flags[0] as usize, nb, "the blocks of {n}");
+        let kept: Vec<bool> = (0..n).map(|p| flags[1 + p / bs] == 1).collect();
+        assert_eq!(kept, mask, "the blocks kept of {n} (coarse {coarse})");
+        assert_eq!(bits(&got[1]), bits(&masked), "the later source's scores of {n} masked");
+        let device: Vec<i32> = got[2].iter().map(|v| v.to_bits()).filter(|&p| p != u32::MAX).map(|p| p as i32).collect();
+        assert_eq!(device, picks, "the picks of {n} (coarse {coarse})");
+    }
+}
+
 /// A prompt's chunk's attention on the device (`RopeRows`, `AttendRows`, `RopeRows` back) is the host's but for its
 /// exponentials: tokens at their own positions, each over its own positions (window rows and compressed ones laid end
 /// to end, some none, as the host gathers them), the queries rotated to the bit first; nearly every output the host's

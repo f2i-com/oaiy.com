@@ -1196,6 +1196,26 @@ the square of the prompt's length), the mixing 69 s, the experts' uploads 53 s a
 110 ms (the sparse attention 61, the index scores 24, the indexer 25), and the rest slower for it too,
 each layer in two calls and three round trips where one call within the reach.
 
+That reach was the candidate blocks': layer 20 (an index source of ratio 1) keeps the 2,048 best
+blocks of 8 positions, by each block's best score and the newest block always, and the index sources
+after it pick only within them; up to 16,384 positions every block is kept, so the card had none to
+pick. It picks them now (`exl3::ProgramStep::BlockKeep`: each block's best, a `TopK` of the blocks,
+their flags in a vector the step's later layers read; `ProgramStep::MaskBlocks`: a later source's
+scores outside them made -infinity before its own `TopK`), and a decode step attends on the card at
+any position of the context (`OAIY_DSV41_FAR_ON_CARD=0`: up to 16,384, as before). The caches there
+are the context's: 464 MB at 65,536 where 149 at 16,384, the experts' slots as many as before.
+Checked against the host (`the_candidate_blocks_on_the_device_are_the_hosts`: the flags, a later
+source's masked scores and its picks to the bit at counts from 100 to 65,536, scores of few values
+so blocks tie) and on the real checkpoint (`OAIY_DSV41_GPU_ATTENTION=check` over 235 steps at
+17,244 to 17,325 positions: every index source's picks the host's, the window rows, compressed rows
+and index keys to the bit, the heads' outputs at most 0.54% off). The 2-bit GGUF at 22,692 tokens:
+
+| Reply | Past the reach on the host | On the card |
+|---|---|---|
+| A first request | 2.65 tok/s | 11.8 tok/s |
+| A new conversation, the same system turn | 2.87 tok/s | 14.7 tok/s |
+| The first's next step | 2.86 tok/s | 19.4 tok/s |
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

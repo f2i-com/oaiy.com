@@ -182,6 +182,13 @@ pub enum Step<'a> {
     /// The `k` best of the first `scores` the word `word` of `pos` counts, by the host's order, their positions in
     /// order into `dst` (u32 bits, `u32::MAX` past them), as a decode step's `select_compressed` picks them.
     TopK { scores: usize, dst: usize, k: usize, pos: usize, word: u32 },
+    /// A decode step's [`crate::dsv41::attention::candidate_mask`] of the first `scores` the word `word` of `pos` counts:
+    /// the `k` best blocks of `bs` (the newest always) flagged in `blocks` (u32 words: their count, then a flag a block),
+    /// as the host keeps them: `[blocks' most]`, each block's best.
+    BlockKeep { scores: usize, blocks: usize, k: usize, bs: usize, pos: usize, word: u32 },
+    /// The first `scores` the word `word` of `pos` counts outside the blocks `blocks` keeps made -infinity in place, as
+    /// [`crate::dsv41::attention::select_compressed`] masks a later index source's row.
+    MaskBlocks { scores: usize, blocks: usize, bs: usize, pos: usize, word: u32 },
     /// A decode step's [`crate::dsv41::attention::sparse_attend`] of every head of `q` over the window's `win` slots
     /// and, where `compressed` is `(rows, picks, count)`, the rows of `rows` that `picks` names: `[heads, dim]`, rounded
     /// to bf16 and not rotated back, its exponentials the device's own.

@@ -188,10 +188,13 @@ pub struct DeviceCaches {
     layers: Vec<LayerCaches>,
     /// The latest index source's picks of compressed positions (u32 bits, `[index_topk]`), which the layers after it read.
     picks: ggml_rs::chain::DeviceVec,
+    /// The candidate source's blocks of a step (u32 bits: their count, then a flag a block, 1 kept), which the index
+    /// sources after it mask their scores by.
+    blocks: ggml_rs::chain::DeviceVec,
     /// Each rotary flavour's tables, `(cos, sin)`.
     rope: Vec<(ggml_rs::chain::DeviceVec, ggml_rs::chain::DeviceVec)>,
-    /// The most positions a step's attention reaches there: up to it the candidate blocks keep every position (so the
-    /// device has no candidates to pick), and a step past it attends on the host.
+    /// The most positions a step's attention reaches there (the context; with `OAIY_DSV41_FAR_ON_CARD=0` those up to
+    /// which the candidate blocks keep every position, 16,384): a step past it attends on the host.
     pub reach: usize,
     /// Which side is ahead, and the positions the caches hold.
     pub newer: Newer,
@@ -217,9 +220,12 @@ impl DeviceCaches {
     /// Caches on `dev` for `layers` (the model's attention, in order), a context of `max_seq`.
     pub fn new(dev: Arc<dyn ggml_rs::chain::DeviceChain>, cfg: &Config, layers: &[&Attention], max_seq: usize) -> DeviceCaches {
         let (hd, ihd) = (cfg.head_dim, cfg.index_head_dim);
+        // (the candidate blocks picked there too, where they no longer keep every position: OAIY_DSV41_FAR_ON_CARD=0, a
+        // step past them on the host as before)
+        let far = std::env::var("OAIY_DSV41_FAR_ON_CARD").as_deref() != Ok("0");
         let reach = match cfg.candidate_source_layer {
-            Some(_) => max_seq.min(cfg.candidate_topk_blocks * cfg.candidate_block_size),
-            None => max_seq,
+            Some(_) if !far => max_seq.min(cfg.candidate_topk_blocks * cfg.candidate_block_size),
+            _ => max_seq,
         };
         let mut rope: Vec<(ggml_rs::chain::DeviceVec, ggml_rs::chain::DeviceVec)> = Vec::new();
         let mut tables: Vec<*const Rope> = Vec::new();
@@ -261,7 +267,8 @@ impl DeviceCaches {
                 }
             })
             .collect();
-        DeviceCaches { picks: dev.vec(cfg.index_topk.max(1)), dev, layers, rope, reach, newer: Newer::Host, upto: 0 }
+        let blocks = dev.vec(1 + reach.div_ceil(cfg.candidate_block_size.max(1)));
+        DeviceCaches { picks: dev.vec(cfg.index_topk.max(1)), blocks, dev, layers, rope, reach, newer: Newer::Host, upto: 0 }
     }
 
     /// Its bytes on the device.
@@ -272,7 +279,7 @@ impl DeviceCaches {
             .iter()
             .map(|l| v(&l.window) + l.compress_kv.as_ref().map_or(0, v) + l.kv_state.as_ref().map_or(0, |(a, b)| v(a) + v(b)) + l.index_k.as_ref().map_or(0, v))
             .sum();
-        layers + v(&self.picks) + self.rope.iter().map(|(c, s)| v(c) + v(s)).sum::<usize>()
+        layers + v(&self.picks) + v(&self.blocks) + self.rope.iter().map(|(c, s)| v(c) + v(s)).sum::<usize>()
     }
 
     /// Layer `l`'s step at `pos` in its program's words (u32s as f32 bits: an input as any other), `sumsq` its stream's
@@ -1274,9 +1281,10 @@ impl Attention {
                 steps.push(Step::PutRow { src: latent, dst: rows, width: hd, pos: words, word: W_ROW });
             }
         }
-        // an index source's scores of the compressed positions and its picks of them
+        // an index source's scores of the compressed positions and its picks of them: the candidate source's best blocks
+        // flagged (its own picks from all of them), a later source's scores outside those made -infinity first
         let picks = (self.ratio > 0).then(|| push(steps, Step::State(&dc.picks)));
-        if let (Some(_), Some(iw), Some(iqs), Some(picks)) = (indexer, iw, iqs, picks) {
+        if let (Some(ix), Some(iw), Some(iqs), Some(picks)) = (indexer, iw, iqs, picks) {
             let iq = bf16(steps, iqs, inh * ihd);
             rotate(steps, iq, inh, ihd, W_POS, false);
             steps.push(Step::Fp4 { x: iq, len: inh * ihd, block: 32, e4m3: false });
@@ -1284,6 +1292,14 @@ impl Attention {
             let keys = push(steps, Step::State(dc.layers[lc.index_src?].index_k.as_ref()?));
             let scale = (ihd as f32).powf(-0.5) * (inh as f32).powf(-0.5);
             let scores = push(steps, Step::IndexScores { q: iq, keys, weights, heads: inh, dim: ihd, scale, pos: words, word: W_COUNT });
+            let bs = cfg.candidate_block_size;
+            if ix.is_candidate_source {
+                let blocks = push(steps, Step::State(&dc.blocks));
+                push(steps, Step::BlockKeep { scores, blocks, k: cfg.candidate_topk_blocks, bs, pos: words, word: W_COUNT });
+            } else if ix.uses_candidates {
+                let blocks = push(steps, Step::State(&dc.blocks));
+                steps.push(Step::MaskBlocks { scores, blocks, bs, pos: words, word: W_COUNT });
+            }
             steps.push(Step::TopK { scores, dst: picks, k: cfg.index_topk, pos: words, word: W_COUNT });
         }
         // the heads over the window and the picks, rotated back

@@ -522,6 +522,68 @@ fn main(@builtin(local_invocation_index) t: u32) {
 }
 "#;
 
+/// `BlockKeep`'s first kernel, a thread a block: of the first `n` scores (`n` its word's), each block of `bs`'s best
+/// (the host's `candidate_mask`: the largest, from -infinity up), the newest block's +infinity (it is always kept), into
+/// `best`; the blocks' count into `blocks[0]` and each block's flag cleared (`blocks[1 + b]`). `p[0]` = (bs, the count's
+/// word).
+pub(super) const DS_BLOCK_BEST: &str = r#"
+@group(0) @binding(0) var<storage, read> scores: array<f32>;
+@group(0) @binding(3) var<storage, read> words: array<u32>;
+@group(0) @binding(6) var<storage, read_write> best: array<f32>;
+@group(0) @binding(7) var<storage, read_write> blocks: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let bs = p[0].x;
+    let n = words[p[0].y];
+    let nb = (n + bs - 1u) / bs;
+    let b = id.x;
+    if (b == 0u) { blocks[0] = nb; }
+    if (b >= nb) { return; }
+    blocks[1u + b] = 0u;
+    var m = bitcast<f32>(0xff800000u);
+    for (var i = b * bs; i < min((b + 1u) * bs, n); i++) {
+        let v = scores[i];
+        if (v > m) { m = v; }
+    }
+    if (b == nb - 1u) { m = bitcast<f32>(0x7f800000u); }
+    best[b] = m;
+}
+"#;
+
+/// `BlockKeep`'s last kernel, a thread a pick: each block `picks` names (a `TopK` of the blocks' bests, `u32::MAX`
+/// none) flagged kept in `blocks` (`blocks[1 + b]`). `p[0].x` = the picks.
+pub(super) const DS_BLOCK_FLAGS: &str = r#"
+@group(0) @binding(0) var<storage, read> picks: array<u32>;
+@group(0) @binding(6) var<storage, read_write> blocks: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= p[0].x) { return; }
+    let b = picks[id.x];
+    if (b != 0xffffffffu) { blocks[1u + b] = 1u; }
+}
+"#;
+
+/// `MaskBlocks`' kernel, a thread a score: of the first `n` scores (`n` its word's), those of a block `blocks` does not
+/// keep (`blocks[1 + i / bs]` 0) made -infinity in place, as the host masks a later index source's row by the candidate
+/// blocks. `p[0]` = (bs, the count's word).
+pub(super) const DS_MASK_BLOCKS: &str = r#"
+@group(0) @binding(1) var<storage, read> blocks: array<u32>;
+@group(0) @binding(3) var<storage, read> words: array<u32>;
+@group(0) @binding(6) var<storage, read_write> scores: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i >= words[p[0].y]) { return; }
+    if (blocks[1u + i / p[0].x] == 0u) { scores[i] = bitcast<f32>(0xff800000u); }
+}
+"#;
+
 /// The most window and compressed positions a head of `Attend` attends over, and its positions a workgroup (a chunk):
 /// a head's positions spread over [`ATTEND_CHUNKS`] workgroups, so the card has some 640 of them at a step and not 64.
 pub(super) const ATTEND_MOST: usize = 640;

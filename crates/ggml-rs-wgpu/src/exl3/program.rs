@@ -70,6 +70,14 @@ pub enum ProgramStep<'a> {
     /// position), their positions in order into `dst` (u32 bits), `u32::MAX` past them; every one where there are no
     /// more than `k`.
     TopK { scores: usize, dst: usize, k: usize, pos: usize, word: u32 },
+    /// A candidate source's blocks (DeepSeek-V4.1's `candidate_mask` of a decode step): of the first `scores` the word
+    /// `word` of `pos` counts, each block of `bs`'s best, the newest block's taken as the best of all, and the `k` best
+    /// blocks by the host's order (a [`ProgramStep::TopK`] of them) flagged in `blocks` (a [`ProgramStep::State`] of u32
+    /// words: the blocks' count, then a block's flag each, 1 kept): `[blocks' most]`, each block's best.
+    BlockKeep { scores: usize, blocks: usize, k: usize, bs: usize, pos: usize, word: u32 },
+    /// The first `scores` the word `word` of `pos` counts that lie in a block `blocks` does not keep (a
+    /// [`ProgramStep::BlockKeep`]'s, blocks of `bs`) made -infinity in place, as the host masks a later index source's.
+    MaskBlocks { scores: usize, blocks: usize, bs: usize, pos: usize, word: u32 },
     /// A decode step's attention of `heads` queries of `dim` (`q`, rotated) over the window's `win` slots (`window`,
     /// `[win, dim]`: the ring, the position the word `word` of `pos` says) and, where `compressed` is `(rows, picks,
     /// count)`, the `count` rows of `rows` that `picks` names (u32, `u32::MAX` none): the host's `sparse_attend`, with
@@ -330,7 +338,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// Every kernel of a decode step's attention on the device ([`ProgramStep::Rope`] to [`ProgramStep::HcMix`]) made now,
 /// on `b`: made as a model's first reply needed them, they were some seconds of it.
 pub fn make_attention_kernels(b: &WgpuBackend) {
-    let kernels: [(&'static str, &'static str); 13] = [
+    let kernels: [(&'static str, &'static str); 16] = [
         ("ds-rope", attend::DS_ROPE),
         ("ds-fp8", attend::DS_FP8),
         ("ds-fp4", attend::DS_FP4),
@@ -338,6 +346,9 @@ pub fn make_attention_kernels(b: &WgpuBackend) {
         ("ds-pool", attend::DS_POOL),
         ("ds-index-scores", attend::DS_INDEX_SCORES),
         ("ds-topk", attend::DS_TOPK),
+        ("ds-block-best", attend::DS_BLOCK_BEST),
+        ("ds-block-flags", attend::DS_BLOCK_FLAGS),
+        ("ds-mask-blocks", attend::DS_MASK_BLOCKS),
         ("ds-attend-scores", attend::DS_ATTEND_SCORES),
         ("ds-attend-parts", attend::DS_ATTEND_PARTS),
         ("ds-attend-join", attend::DS_ATTEND_JOIN),
@@ -441,6 +452,11 @@ fn run_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize,
                 (ok && before(*keys)? >= *dim).then_some(before(*keys)? / dim)?
             }
             ProgramStep::TopK { scores, dst, k, pos, word } => (*k > 0 && before(*scores)? > 0 && before(*dst)? >= *k && before(*pos)? > *word as usize).then_some(0)?,
+            ProgramStep::BlockKeep { scores, blocks, k, bs, pos, word } => {
+                let most = before(*scores)?.div_ceil((*bs).max(1));
+                (*k > 0 && *bs > 0 && before(*blocks)? > most && before(*pos)? > *word as usize).then_some(most)?
+            }
+            ProgramStep::MaskBlocks { scores, blocks, bs, pos, word } => (*bs > 0 && before(*blocks)? > before(*scores)?.div_ceil(*bs) && before(*pos)? > *word as usize).then_some(0)?,
             ProgramStep::Attend { q, heads, dim, window, win, compressed, sink, pos, word, .. } => {
                 let count = compressed.map_or(0, |(_, _, c)| c);
                 let picks = match compressed {
@@ -548,6 +564,18 @@ fn run_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize,
             }
             ProgramStep::TopK { scores, dst, k, pos, word } => {
                 rec.dispatch_wide("ds-topk", attend::DS_TOPK, [&buf(v(*scores)), &dummy, &dummy, &buf(v(*pos)), &dummy, &dummy, &buf(v(*dst)), &drw], &[*k as u32, *word, 0], (1, 1, 1));
+            }
+            ProgramStep::BlockKeep { scores, blocks, k, bs, pos, word } => {
+                // (each block's best and the count, the best blocks picked by their count, word 0 of `blocks`, then flagged)
+                let picks = buf(tables[i].as_ref().expect("its picks"));
+                let most = lens[i] as u32;
+                rec.dispatch_wide("ds-block-best", attend::DS_BLOCK_BEST, [&buf(v(*scores)), &dummy, &dummy, &buf(v(*pos)), &dummy, &dummy, &buf(v(i)), &buf(v(*blocks))], &[*bs as u32, *word], (most.div_ceil(256), 1, 1));
+                rec.dispatch_wide("ds-topk", attend::DS_TOPK, [&buf(v(i)), &dummy, &dummy, &buf(v(*blocks)), &dummy, &dummy, &picks, &drw], &[*k as u32, 0, 0], (1, 1, 1));
+                rec.dispatch_wide("ds-block-flags", attend::DS_BLOCK_FLAGS, [&picks, &dummy, &dummy, &dummy, &dummy, &dummy, &buf(v(*blocks)), &drw], &[*k as u32], ((*k as u32).div_ceil(256), 1, 1));
+            }
+            ProgramStep::MaskBlocks { scores, blocks, bs, pos, word } => {
+                let n = lens[*scores] as u32;
+                rec.dispatch_wide("ds-mask-blocks", attend::DS_MASK_BLOCKS, [&dummy, &buf(v(*blocks)), &dummy, &buf(v(*pos)), &dummy, &dummy, &buf(v(*scores)), &drw], &[*bs as u32, *word], (n.div_ceil(256), 1, 1));
             }
             ProgramStep::Attend { q, heads, dim, window, win, compressed, scale, pos, word, .. } => {
                 let sink = norm_weights[i].as_ref().expect("its sink");
@@ -670,6 +698,8 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
             ProgramStep::Pool { kv, score, ratio, width } => (16u8, [*kv, *score, *ratio, *width]).hash(&mut h),
             ProgramStep::IndexScores { q, keys, weights, heads, dim, scale, pos, word } => (17u8, [*q, *keys, *weights, *heads, *dim, *pos], scale.to_bits(), *word).hash(&mut h),
             ProgramStep::TopK { scores, dst, k, pos, word } => (18u8, [*scores, *dst, *k, *pos], *word).hash(&mut h),
+            ProgramStep::BlockKeep { scores, blocks, k, bs, pos, word } => (23u8, [*scores, *blocks, *k, *bs, *pos], *word).hash(&mut h),
+            ProgramStep::MaskBlocks { scores, blocks, bs, pos, word } => (24u8, [*scores, *blocks, *bs, *pos], *word).hash(&mut h),
             ProgramStep::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word } => (19u8, [*q, *heads, *dim, *window, *win, *pos], *compressed, host(sink), scale.to_bits(), *word).hash(&mut h),
             ProgramStep::HcMix { proj, pos, word, base, scale, n, norm_eps, iters, hc_eps } => (20u8, [*proj, *pos, *n, *iters], *word, host(base), host(scale), norm_eps.to_bits(), hc_eps.to_bits()).hash(&mut h),
             ProgramStep::RopeRows { x, rows, stride, at, half, cos, sin, pos, group, inverse } => (21u8, [*x, *rows, *stride, *at, *half, *cos, *sin, *pos, *group], *inverse).hash(&mut h),
@@ -718,6 +748,8 @@ fn make_arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Pro
                 ProgramStep::HcMix { scale, .. } => Some(up(scale)),
                 // (an attention's scratch: its heads' scores, chunks' sums and chunks' parts)
                 ProgramStep::Attend { heads, dim, .. } => Some(b.vec(heads * (attend::ATTEND_MOST + attend::ATTEND_CHUNKS + attend::ATTEND_CHUNKS * dim))),
+                // (the best blocks' picks)
+                ProgramStep::BlockKeep { k, .. } => Some(b.vec(*k)),
                 _ => None,
             })
             .collect(),

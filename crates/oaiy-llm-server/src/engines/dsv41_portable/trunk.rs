@@ -207,6 +207,8 @@ impl WgpuChained {
                     S::Pool { kv, score, ratio, width } => G::Pool { kv, score, ratio, width },
                     S::IndexScores { q, keys, weights, heads, dim, scale, pos, word } => G::IndexScores { q, keys, weights, heads, dim, scale, pos, word },
                     S::TopK { scores, dst, k, pos, word } => G::TopK { scores, dst, k, pos, word },
+                    S::BlockKeep { scores, blocks, k, bs, pos, word } => G::BlockKeep { scores, blocks, k, bs, pos, word },
+                    S::MaskBlocks { scores, blocks, bs, pos, word } => G::MaskBlocks { scores, blocks, bs, pos, word },
                     S::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word } => G::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word },
                     S::HcMix { proj, pos, word, base, scale, n, norm_eps, iters, hc_eps } => G::HcMix { proj, pos, word, base, scale, n, norm_eps, iters, hc_eps },
                     S::RopeRows { x, rows, stride, at, half, cos, sin, pos, group, inverse } => G::RopeRows { x, rows, stride, at, half, cos, sin, pos, group, inverse },
