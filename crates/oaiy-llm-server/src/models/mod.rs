@@ -1083,8 +1083,13 @@ impl Models {
                 // (a GGUF's experts held so too, in slots of their own kernels)
                 let exl3 = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Exl3 { .. });
                 let gguf = matches!(model.expert_format(), crate::dsv41::expert::ExpertFormat::Gguf { .. });
-                let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = if exl3 || gguf { std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b)).map(Arc::new).collect() } else { Vec::new() };
-                let home = (cards.len() > 1 && std::env::var("OAIY_DSV41_SPLIT").as_deref() == Ok("1")).then(|| crate::engines::dsv41_portable::layer_homes(model.cfg.n_layers, cards.len()));
+                // (a card past the first holds experts alone, slots and scratch slots made at load: no trunk, no prompt's
+                // attention, no display, so its experts take half the default's room beside them as a tinygrad card's
+                // do (`ALONE`); a budget asked for, or the trunk split, as given)
+                let split = std::env::var("OAIY_DSV41_SPLIT").as_deref() == Ok("1");
+                let alone = |c: ggml_rs_wgpu::WgpuBackend| if o.webgpu_gb.is_none() && !split { let budget = c.usage().1 + crate::engines::dsv41_portable::ALONE; c.with_budget(budget) } else { c };
+                let cards: Vec<Arc<ggml_rs_wgpu::WgpuBackend>> = if exl3 || gguf { std::iter::once(b.clone()).chain(crate::engines::backend::others(o, &devices, b).into_iter().map(alone)).map(Arc::new).collect() } else { Vec::new() };
+                let home = (cards.len() > 1 && split).then(|| crate::engines::dsv41_portable::layer_homes(model.cfg.n_layers, cards.len()));
                 let (count, bytes) = match &home {
                     Some(home) => crate::engines::dsv41_portable::offload_split(&mut model, &cards, home),
                     None => crate::engines::dsv41_portable::offload(&mut model, b),

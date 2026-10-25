@@ -1261,6 +1261,14 @@ same as `OAIY_DSV41_HYBRID=0` (20.0, 14.1, 20.0, 17.0 tok/s where 19.9, 14.0, 19
 host's experts on four threads (`OAIY_STEP_THREADS=4`, cores another program takes) the cards take
 some again: 16.6, 10.8, 16.0, 13.6 where all of them here 16.4, 9.7, 16.1, 13.0.
 
+A card past the first holds experts alone (their slots and scratch slots, made at load: no trunk, no
+prompt's attention, no display), so its experts take half the default's 4 GiB of room beside them
+(`ALONE`, as a tinygrad card's; `WgpuBackend::with_budget`), where no `--webgpu-gb` is given and the
+trunk is not split: the EXL3 checkpoint's slots 3,931 where 3,761 (its replies within their noise:
+19.7, 14.2, 20.0, 17.3 tok/s), the 2-bit GGUF's 5,856 where 5,608, an agent's replies at 22,692
+tokens 15.3, 17.3 and 22.0 tok/s where 11.8, 14.7 and 19.4. Through that prompt the second card's
+memory peaked at 30.8 GB of its 32.6, the first's at 30.6.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

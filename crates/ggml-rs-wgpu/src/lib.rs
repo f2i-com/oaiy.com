@@ -699,6 +699,13 @@ impl WgpuBackend {
         (self.used.load(Ordering::Relaxed), self.budget)
     }
 
+    /// This backend with a budget of `bytes` for weights (before anything is put there): a card a caller knows holds
+    /// one kind of thing alone, whose work buffers the default's 4 GiB of room beside the weights need not cover.
+    pub fn with_budget(mut self, bytes: u64) -> Self {
+        self.budget = bytes;
+        self
+    }
+
     /// Bytes of the weights a model asked this GPU to hold that it had no room for within its budget: they are on the
     /// host, multiplied by the CPU straight from the model's file as it is mapped (so the system reads them from the
     /// drive as they are used, and again where it has no memory to keep them in).
