@@ -216,6 +216,29 @@ describe('tool rules', () => {
       expect(JSON.stringify(fake.bodies[2].messages)).toContain('remember the milk');
     });
 
+    it('gives the app, web and video guides in brief, where a cloud model has them whole', async () => {
+      const given = async (topic: string, discover: boolean) => {
+        const fake = fakeProvider('openai', [{ calls: [{ name: 'guide', input: { topic } }] }, { text: 'ok' }]);
+        const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 65_536 }), projectSummary: () => '', media: () => media, discoverTools: () => discover });
+        await agent.run('hello', () => {});
+        return system(fake.bodies[1]) + JSON.stringify(fake.bodies[1].messages);
+      };
+      const [app, web, video] = [await given('app', true), await given('web', true), await given('video', true)];
+      const [appWhole, webWhole, videoWhole] = [await given('app', false), await given('web', false), await given('video', false)];
+      // The rules kept: where an app's files go, how a page's scripts run, the script's headings the reviewer reads.
+      for (const rule of ['A SoftN app is a folder', 'softn_docs', 'softn_interact', "softn_components gives Scene3D's props"]) expect(app).toContain(rule);
+      for (const rule of ['Zipp VM', 'page_check', 'page_interact', '390×844']) expect(web).toContain(rule);
+      for (const rule of ['## Premise', '## Scene N', '### Shot N', 'Start frame', 'End frame']) expect(video).toContain(rule);
+      // Their words fewer: a 3D model's example, the CDN's libraries, the script's every heading's say.
+      expect(app).not.toContain('unit cube');
+      expect(appWhole).toContain('unit cube');
+      expect(web).not.toContain('three.js');
+      expect(webWhole).toContain('three.js');
+      expect(video).not.toContain('establishing wide shot');
+      expect(videoWhole).toContain('establishing wide shot');
+      expect(video.length).toBeLessThan(videoWhole.length - 5000);
+    });
+
     it("gives a request's guide with the request, and a picture made before it with the guide", async () => {
       const film = fakeProvider('openai', [{ text: 'ok' }]);
       await make().run('Make a sitcom like Seinfeld, about a minute long', () => {});

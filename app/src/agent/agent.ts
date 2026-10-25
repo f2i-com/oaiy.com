@@ -359,10 +359,13 @@ const APP_FILE = /(^|\/)(manifest\.json|[^/]+\.(ui|logic))$/;
 /** A web page: writing one reads the web guide. */
 const WEB_FILE = /\.html?$/i;
 
+/** The app guide's part on 3D models (an app's Scene3D). */
+const APP_3D = `- A 3D model (a .glb, such as generate_3d_model makes) goes in the app's assets/ folder, listed under "assets" in manifest.json's files, and shows in a Scene3D as an object of type "model" whose modelUrl is asset("assets/…"), written in the page's markup (asset() is not available in logic), for example: <Scene3D fill={true} environment="studio" orbitControls={true} camera={{ position: { x: 1.2, y: 0.8, z: 1.6 }, lookAt: { x: 0, y: 0, z: 0 }, fov: 45 }} lights={[{ id: "key", type: "directional", color: "#ffffff", intensity: 2, position: { x: 3, y: 5, z: 4 } }]} objects={[{ id: "lamp", type: "model", modelUrl: asset("assets/models/lamp.glb"), position: { x: 0, y: 0, z: 0 }, scale: 1 }]} @modelState={onModel} />. A model from generate_3d_model fits a unit cube centred on the origin with its front facing +Z: scale and place it for the scene, and keep environment="studio" (its materials are often metallic, which looks dark under lights alone). @modelState reports a model that failed to load; preview_screenshot shows the scene as the app draws it (WebGL included), and with the model's own path, the model alone from four sides.
+`;
+
 const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names its main page as "main". A new app is written as HTML: index.html (with pages/*.html), its logic in main.js (or main.py) named with <script src>. An app made before has ui/*.ui pages and logic/*.logic (or .py) files and works the same: edit whichever an app has, keeping its names. A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, OAIY checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
 - preview_screenshot shows you how the app looks (look at it and fix what looks wrong), and preview_viewport sets the screen size it is shown at (phone, tablet, laptop, desktop or any size) for responsive layouts.
-- A 3D model (a .glb, such as generate_3d_model makes) goes in the app's assets/ folder, listed under "assets" in manifest.json's files, and shows in a Scene3D as an object of type "model" whose modelUrl is asset("assets/…"), written in the page's markup (asset() is not available in logic), for example: <Scene3D fill={true} environment="studio" orbitControls={true} camera={{ position: { x: 1.2, y: 0.8, z: 1.6 }, lookAt: { x: 0, y: 0, z: 0 }, fov: 45 }} lights={[{ id: "key", type: "directional", color: "#ffffff", intensity: 2, position: { x: 3, y: 5, z: 4 } }]} objects={[{ id: "lamp", type: "model", modelUrl: asset("assets/models/lamp.glb"), position: { x: 0, y: 0, z: 0 }, scale: 1 }]} @modelState={onModel} />. A model from generate_3d_model fits a unit cube centred on the origin with its front facing +Z: scale and place it for the scene, and keep environment="studio" (its materials are often metallic, which looks dark under lights alone). @modelState reports a model that failed to load; preview_screenshot shows the scene as the app draws it (WebGL included), and with the model's own path, the model alone from four sides.
-- The app is done when it renders without errors and softn_interact shows it working.
+${APP_3D}- The app is done when it renders without errors and softn_interact shows it working.
 `;
 
 const WEB_GUIDE = `- A web page is an .html file of the project with its CSS, images and JavaScript beside it (say index.html, css/, js/, images/), linked by relative paths. The user watches it in a live preview as you build it; links between pages of the project open there too.
@@ -371,6 +374,22 @@ const WEB_GUIDE = `- A web page is an .html file of the project with its CSS, im
 - A page cannot show 3D: three.js and other WebGL libraries come from a CDN or as ES modules, and neither runs here. 3D scenes and models (.glb) belong in a SoftN app (Scene3D); preview_screenshot shows a .glb by itself.
 - Make pages responsive: preview_viewport sets the screen size (phone 390×844, tablet 820×1180, laptop 1366×768, desktop 1920×1080, or any size); check and screenshot at a phone size and a desktop size at least.
 - The page is done when page_check is clean, page_interact shows it working, and the screenshots at those sizes look right.
+`;
+
+/**
+ * The app and web guides in brief, where the tools are found (`AgentOptions.discoverTools`): a local model's, which reads
+ * each guide's every token where a cloud model's provider caches them; the rules the same, their words fewer.
+ */
+const APP_BRIEF = `- A SoftN app is a folder whose manifest.json names its main page as "main" (keep it true). A new app is HTML: index.html (and pages/*.html), its logic in main.js (or main.py) named with <script src>; an older app's ui/*.ui and logic/*.logic files work the same: edit whichever it has, keeping its names. Each app has its own folder: to rebuild one or base a new one on it (or on a .softn the user attached, unpacked into its own folder; softn_import unpacks any in the project), write the new app in a new folder and leave the original as it is; to change one, edit its folder. Do not guess the language: softn_docs (no arguments: the map; topic "guide": read it before your first app; search: how something is done), softn_components (exact props and events), softn_examples (working apps to read or copy). OAIY checks the app after each change and adds the outcome to the step's result: fix its errors first. softn_inspect shows what the page displays, softn_interact uses the app like a person and reports its errors, preview_screenshot shows how it looks (fix what looks wrong), preview_viewport sets the screen size. The user watches it in a live preview.
+- The app is done when it renders without errors and softn_interact shows it working.
+`;
+
+/** The app guide's part on 3D models in brief, where none is made (no generate_3d_model). */
+const APP_3D_BRIEF = `- A 3D model (.glb) goes in the app's assets/ folder, listed under "assets" in manifest.json's files, and shows in a Scene3D as an object of type "model" whose modelUrl is asset("assets/…"), in the page's markup (asset() is not in logic): softn_components gives Scene3D's props.
+`;
+
+const WEB_BRIEF = `- A web page is an .html file of the project with its CSS, images and JavaScript beside it, linked by relative paths, shown in a live preview. Its scripts run on the Zipp VM against the page's real DOM: plain, classic browser JavaScript (<script src> tags sharing globals in order, the DOM, events, timers, requestAnimationFrame, canvas, localStorage, fetch of the project's own files). Not available: ES module import/export, JSX, build steps, npm packages and the internet (CDN scripts, web fonts, remote images: put what the page needs in the project, system font stacks), nor 3D (a SoftN app's Scene3D shows it).
+- After each change page_check reports script errors and files that did not load: fix them first. page_inspect shows what the page displays, page_interact uses it like a person, preview_screenshot shows how it looks (fix layout, spacing, overflow, contrast, cut-off text), preview_viewport sets the screen size (phone 390×844, desktop 1920×1080, or any). The page is done when page_check is clean, page_interact shows it working, and screenshots at a phone and a desktop size look right.
 `;
 
 const DOCUMENT_GUIDE = `- Long documents (scripts, stories, reports: anything longer than a few pages) are written in parts, never in one call. Write an outline first (the sections, and what happens or is said in each), then the document one section per append_file call, following the outline. When it is all written, read it back in full (paging with offset) and revise it with edit_file until it is complete: every section of the outline is there and fully written, nothing is summarized or skipped ("the scene continues…", "etc."), and names, facts and tone agree from start to end.
@@ -1028,13 +1047,14 @@ export class Agent {
   private guideText(topic: GuideTopic, names: Set<string>): string {
     const has = (name: string) => names.has(name);
     const edit = has('media_compose') ? MEDIA_EDIT_GUIDE : '';
-    if (topic === 'app') return APP_GUIDE;
-    if (topic === 'web') return WEB_GUIDE;
+    if (topic === 'app') return this.discovering ? APP_BRIEF.replace('- The app is done', `${has('generate_3d_model') ? APP_3D : APP_3D_BRIEF}- The app is done`) : APP_GUIDE;
+    if (topic === 'web') return this.discovering ? WEB_BRIEF : WEB_GUIDE;
     if (topic === 'document') return DOCUMENT_GUIDE;
     const make = MEDIA_MAKE_GUIDE + (has('generate_3d_model') ? MODEL3D_GUIDE : '');
     if (topic === 'media') return make + edit;
-    const script = has('media_compose') ? VIDEO_SCRIPT_GUIDE : VIDEO_SCRIPT_BRIEF;
-    return make + script + (script === VIDEO_SCRIPT_GUIDE && this.canDelegate ? VIDEO_DELEGATE_GUIDE : '') + edit;
+    // (where the tools are found, in brief too: a local model reads its every token)
+    const script = has('media_compose') && !this.discovering ? VIDEO_SCRIPT_GUIDE : VIDEO_SCRIPT_BRIEF;
+    return make + script + (has('media_compose') && this.canDelegate ? VIDEO_DELEGATE_GUIDE : '') + edit;
   }
 
   /** The guide tool: the guide joins the instructions (from the next step on). */
