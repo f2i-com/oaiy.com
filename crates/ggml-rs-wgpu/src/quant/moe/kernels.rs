@@ -421,6 +421,14 @@ pub(super) fn few_lanes(kind: Kind, k: usize) -> usize {
     (k / turn / (80 / turn)).next_power_of_two().clamp(8, 32)
 }
 
+/// The few rows' kernels' job `i` of a block of `rows`: its number (`j{i}`, the block's own where the order is the
+/// identity), whether it is one (`on{i}`: and, where `skip`, its matrix is not `u32::MAX`), where its input row starts
+/// (`xb{i}`), its sum (`a{i}`).
+fn job_ids(i: usize, rows: usize, skip: bool) -> String {
+    let on = if skip { format!("j{i} != 0xffffffffu && jobs[2u * select(j{i}, 0u, j{i} == 0xffffffffu)] != 0xffffffffu") } else { format!("j{i} != 0xffffffffu") };
+    format!("    var j{i} = blk;\n    if (!identity) {{ j{i} = order[blk * {rows}u + {i}u]; }}\n    let on{i} = {on};\n    let xb{i} = jobs[2u * select(j{i}, 0u, !on{i}) + 1u] * (k / 4u);\n    var a{i} = 0.0;\n")
+}
+
 /// The matmul of blocks of `rows` (1 to [`FEW_MAX`]) jobs of one matrix, in f32: a workgroup a block's `256 / lanes`
 /// output rows, `lanes` threads a row ([`few_lanes`]), each taking a word (16 weights) in every `lanes` of the row, so
 /// the threads of a row read side by side; a word's weights decoded once for the block's rows as four vectors, x four
@@ -432,18 +440,14 @@ pub(super) fn few_lanes(kind: Kind, k: usize) -> usize {
 /// The first kernel gave an output row to 16 threads by sixteenths of its width, each decoding eight weights at a
 /// call into an array and reading x one at a time: a Flash-Next layer's ten experts for a step's one row took 77 us
 /// (1.3 TFLOPS), and this one 0.049 with 32 lanes for every width.
-fn few_source(kind: Kind, rows: usize, lanes: usize) -> String {
+fn few_source(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
     assert!((1..=FEW_MAX).contains(&rows), "a block of 1 to {FEW_MAX} rows");
     assert!(matches!(lanes, 8 | 16 | 32), "8, 16 or 32 lanes a row");
     if kind != Kind::Q2_0 {
-        return few_source_grid(kind, rows, lanes);
+        return few_source_grid(kind, rows, lanes, skip);
     }
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
-    let ids = each(&|i| {
-        format!(
-            "    var j{i} = blk;\n    if (!identity) {{ j{i} = order[blk * {rows}u + {i}u]; }}\n    let on{i} = j{i} != 0xffffffffu;\n    let xb{i} = jobs[2u * select(j{i}, 0u, !on{i}) + 1u] * (k / 4u);\n    var a{i} = 0.0;\n"
-        )
-    });
+    let ids = each(&|i| job_ids(i, rows, skip));
     let sums = each(&|i| {
         format!("            if (on{i}) {{ a{i} += d * (dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]) + dot(c2, x[xb{i} + at + 2u]) + dot(c3, x[xb{i} + at + 3u])); }}\n")
     });
@@ -505,13 +509,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// group is seven loads (bytes off words' edges, a grid entry two words) or six with less arithmetic, as now. A lane
 /// taking 32 weights at a turn (their fields read once, their four groups written out one after another) was slower
 /// for every count of lanes tried, 25 us and a check's four rows 86 where 45: the loop's body four times as long.
-fn few_source_grid(kind: Kind, rows: usize, lanes: usize) -> String {
+fn few_source_grid(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
-    let ids = each(&|i| {
-        format!(
-            "    var j{i} = blk;\n    if (!identity) {{ j{i} = order[blk * {rows}u + {i}u]; }}\n    let on{i} = j{i} != 0xffffffffu;\n    let xb{i} = jobs[2u * select(j{i}, 0u, !on{i}) + 1u] * (k / 4u);\n    var a{i} = 0.0;\n"
-        )
-    });
+    let ids = each(&|i| job_ids(i, rows, skip));
     let sums = each(&|i| format!("            if (on{i}) {{ a{i} += dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]); }}\n"));
     let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
     // (a row of the block's sum by a lane of its own: lane i adds row i's, the lanes in order)
@@ -702,19 +702,25 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// ([`cached_source`]).
 ///
 /// `lanes`: the few rows' kernel's lanes a row where not [`few_lanes`]'s (0: those).
-pub(super) fn kernel(kind: Kind, coop: bool, rows: usize, k: usize, mats: usize, staged: bool, lanes: usize) -> (&'static str, &'static str) {
-    type Made = ((Kind, bool, usize, usize, usize, bool), (&'static str, &'static str));
+///
+/// `skip`: the few rows' kernel skips a job whose matrix is `u32::MAX` (its output rows left as they were): a device
+/// program's candidates the slots do not hold ([`QuantSlots::record_fused`]).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn kernel(kind: Kind, coop: bool, rows: usize, k: usize, mats: usize, staged: bool, lanes: usize, skip: bool) -> (&'static str, &'static str) {
+    type Made = ((Kind, bool, usize, usize, usize, bool, bool), (&'static str, &'static str));
     static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
     // (the tensor cores' kernel is one for every width; the few-row one is written for its lanes a row)
     let lanes = if coop { 0 } else if lanes > 0 { lanes } else { few_lanes(kind, k) };
-    let key = (kind, coop, rows, lanes, mats, staged);
+    let skip = skip && !coop;
+    let key = (kind, coop, rows, lanes, mats, staged, skip);
     if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
         return *k;
     }
     let part = if mats > 0 { format!("-{}{mats}", if staged { "staged" } else { "part" }) } else { String::new() };
-    let name: &'static str = Box::leak(if coop { format!("quant-moe-{}-coop-{rows}{part}", kind.tag()) } else { format!("quant-moe-{}-few-{rows}-{lanes}{part}", kind.tag()) }.into_boxed_str());
-    let source = if coop { coop_source(kind, rows) } else { few_source(kind, rows, lanes) };
+    let skipping = if skip { "-skipping" } else { "" };
+    let name: &'static str = Box::leak(if coop { format!("quant-moe-{}-coop-{rows}{part}", kind.tag()) } else { format!("quant-moe-{}-few-{rows}-{lanes}{part}{skipping}", kind.tag()) }.into_boxed_str());
+    let source = if coop { coop_source(kind, rows) } else { few_source(kind, rows, lanes, skip) };
     let source: &'static str = Box::leak(if mats > 0 { cached_source(source, mats, staged) } else { source }.into_boxed_str());
     made.push((key, (name, source)));
     (name, source)

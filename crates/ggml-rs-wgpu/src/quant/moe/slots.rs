@@ -193,9 +193,9 @@ fn row_bytes_of(p: &QuantProj) -> usize {
 }
 
 /// One group's jobs (`jobs`, `count` of them) on `x`'s rows into `y`'s (job `j`'s row `j`), as [`QuantMoe`]'s pass
-/// runs a layer the card holds whole.
+/// runs a layer the card holds whole; `skip`: a job whose matrix is `u32::MAX` skipped, its row left as it was.
 #[allow(clippy::too_many_arguments)]
-fn pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, y: &DeviceVec, slots: usize) {
+fn pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &DeviceVec, count: usize, order: Order<'_>, y: &DeviceVec, slots: usize, skip: bool) {
     let d = rec.gpu().dummy().clone();
     let drw = rec.gpu().dummy_rw().clone();
     let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
@@ -208,7 +208,7 @@ fn pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVec, jobs: &D
     };
     let coop = rows > FEW_MAX;
     let lanes = few_lanes(g.kind, g.k);
-    let (name, source) = kernel(g.kind, coop, rows, g.k, 0, false, lanes);
+    let (name, source) = kernel(g.kind, coop, rows, g.k, 0, false, lanes, skip);
     for first in (0..blocks).step_by(65535) {
         let these = 65535.min(blocks - first) as u32;
         let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, first as u32, 0, slots as u32];
@@ -403,17 +403,11 @@ impl QuantSlots {
         DeviceChain::upload(b, &x, &xs);
         up(&jgu, &jobs_gu);
         up(&jd, &jobs_d);
-        let d = rec.gpu().dummy().clone();
-        let drw = rec.gpu().dummy_rw().clone();
-        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
-        let swiglu = |rec: &mut crate::chain::Recorder| {
-            let groups = ((pairs * f) as u32).div_ceil(256);
-            rec.dispatch_wide("quant-slots-swiglu-bf16", SWIGLU_BF16, [&buf(&out_gu), &d, &d, &d, &d, &d, &buf(&act), &drw], &[f as u32, pairs as u32, limit.to_bits()], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
-        };
+        let swiglu = |rec: &mut crate::chain::Recorder| swiglu_pairs(rec, &out_gu, &act, f, pairs, limit);
         if one {
-            pass(rec, &self.gu, &x, &jgu, 2 * pairs, Order::Jobs, &out_gu, self.slots);
+            pass(rec, &self.gu, &x, &jgu, 2 * pairs, Order::Jobs, &out_gu, self.slots, false);
             swiglu(rec);
-            pass(rec, &self.down, &act, &jd, pairs, Order::Jobs, &out_d, self.slots);
+            pass(rec, &self.down, &act, &jd, pairs, Order::Jobs, &out_d, self.slots, false);
         } else {
             // a prompt's rows: each expert's in blocks, its weights decoded once a block (16 rows on the tensor cores)
             let block = if coop_on(&b.gpu) && std::env::var_os("OAIY_QUANT_MOE_NO_COOP").is_none() { 16 } else { FEW_MAX };
@@ -421,10 +415,55 @@ impl QuantSlots {
             let (ogv, odv) = (rec.scratch(ogu.len()), rec.scratch(od.len()));
             up(&ogv, &ogu);
             up(&odv, &od);
-            pass(rec, &self.gu, &x, &jgu, 2 * pairs, Order::Blocks(&ogv, ogu.len() / block, block), &out_gu, self.slots);
+            pass(rec, &self.gu, &x, &jgu, 2 * pairs, Order::Blocks(&ogv, ogu.len() / block, block), &out_gu, self.slots, false);
             swiglu(rec);
-            pass(rec, &self.down, &act, &jd, pairs, Order::Blocks(&odv, od.len() / block, block), &out_d, self.slots);
+            pass(rec, &self.down, &act, &jd, pairs, Order::Blocks(&odv, od.len() / block, block), &out_d, self.slots, false);
         }
         Some((out_d, rows))
     }
+
+    /// Whether these are on `b`'s device.
+    pub(crate) fn on(&self, b: &WgpuBackend) -> bool {
+        self.b.same_device(b)
+    }
+
+    /// The hidden width these experts take and give.
+    pub(crate) fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    /// Their gates' and ups' words' buffer (what knows them on their device).
+    pub(crate) fn words(&self) -> &wgpu::Buffer {
+        &self.gu.words
+    }
+
+    /// A fused pass's vectors for `k` jobs ([`Self::record_fused`]), on the device for good (a program's arena's).
+    pub(crate) fn fused_scratch(&self, k: usize) -> QuantFused {
+        QuantFused { out_gu: self.b.vec(2 * k * self.ff), act: self.b.vec(k * self.ff) }
+    }
+
+    /// `k` one-row jobs of row 0 of `x` (`[hidden]`), their gate and up jobs `jgu` (`(2 slot, 0)` and `(2 slot + 1, 0)`
+    /// each) and down jobs `jd` (`(slot, job)`) written on the device (a fused step's candidates, `exl3::ProgramStep::
+    /// Held`), recorded into `rec` through `s` into `out` (`[k, hidden]`): each job's output as [`Self::forward`] makes
+    /// it (the same kernels and order), a job whose slot is `u32::MAX` skipped (its row left as it was).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_fused(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, jgu: &DeviceVec, jd: &DeviceVec, k: usize, s: &QuantFused, out: &DeviceVec, limit: f32) {
+        pass(rec, &self.gu, x, jgu, 2 * k, Order::Jobs, &s.out_gu, self.slots, true);
+        swiglu_pairs(rec, &s.out_gu, &s.act, self.ff, k, limit);
+        pass(rec, &self.down, &s.act, jd, k, Order::Jobs, out, self.slots, true);
+    }
+}
+
+/// [`QuantSlots::record_fused`]'s vectors beside its inputs and output: the gate's and up's sums, the SwiGLU's.
+pub(crate) struct QuantFused {
+    out_gu: DeviceVec,
+    act: DeviceVec,
+}
+
+/// [`SWIGLU_BF16`] of `pairs` pairs of `ff` (`gu`, as the gate and up pass leaves them) into `act`.
+fn swiglu_pairs(rec: &mut crate::chain::Recorder<'_>, gu: &DeviceVec, act: &DeviceVec, ff: usize, pairs: usize, limit: f32) {
+    let (d, drw) = (rec.gpu().dummy().clone(), rec.gpu().dummy_rw().clone());
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+    let groups = ((pairs * ff) as u32).div_ceil(256);
+    rec.dispatch_wide("quant-slots-swiglu-bf16", SWIGLU_BF16, [&buf(gu), &d, &d, &d, &d, &d, &buf(act), &drw], &[ff as u32, pairs as u32, limit.to_bits()], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
 }

@@ -407,6 +407,99 @@ fn experts_in_slots_are_the_hosts() {
     }
 }
 
+/// What a decode step's experts in slots ([`QuantSlots`]) take at DeepSeek-V4.1's shape (5120 to 2304), each pair of
+/// types its 2-bit GGUF has most: six experts' one-row jobs in one call, against their bytes.
+#[test]
+#[ignore = "a timing; run with --nocapture"]
+fn measure_experts_in_slots() {
+    let Ok(b) = WgpuBackend::new(Some(8 << 30)) else { return };
+    let (hidden, ff, limit) = (5120usize, 2304usize, 10.0f32);
+    for types in [[GgmlType::IQ1_M, GgmlType::IQ1_M], [GgmlType::IQ2_XXS, GgmlType::IQ1_M], [GgmlType::IQ2_XS, GgmlType::IQ1_M], [GgmlType::IQ2_XXS, GgmlType::IQ2_XS]] {
+        let mut next = rng(41);
+        let gb = ff * hidden / 256 * types[0].type_size();
+        let db = hidden * ff / 256 * types[1].type_size();
+        let layout = QuantLayout {
+            bytes: 2 * gb + db,
+            proj: [QuantProj { at: 0, dtype: types[0], k: hidden, n: ff }, QuantProj { at: gb, dtype: types[0], k: hidden, n: ff }, QuantProj { at: 2 * gb, dtype: types[1], k: ff, n: hidden }],
+        };
+        let slots = b.quant_slots_mapped(64, hidden, ff, types).expect("room for 64 slots");
+        let record = [random_grid(&mut next, types[0], 2, ff, hidden), random_grid(&mut next, types[1], 1, hidden, ff)].concat();
+        let records: Vec<&[u8]> = (0..64).map(|_| &record[..]).collect();
+        let putting = std::time::Instant::now();
+        slots.put_many(0, &records, &layout);
+        let put = putting.elapsed().as_secs_f64() / 64.0;
+        let x: Vec<f32> = (0..6 * hidden).map(|_| next()).collect();
+        // six experts in slots far apart (none in another's cache lines)
+        let jobs: Vec<(usize, &[f32])> = (0..6).map(|j| (j * 10, &x[j * hidden..(j + 1) * hidden])).collect();
+        slots.forward(&jobs, limit);
+        let _ = crate::profile::take_kernels();
+        let reps = 50;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            slots.forward(&jobs, limit);
+        }
+        let secs = t.elapsed().as_secs_f64() / reps as f64;
+        let bytes = 6.0 * layout.bytes as f64;
+        eprintln!("{types:?}: six experts' step in {:.0} us a call ({:.0} GB/s of their weights; a record put in at {:.2} ms)", secs * 1e6, bytes / secs / 1e9, put * 1e3);
+        // (OAIY_CHAIN_PROFILE: each kernel's own time on the GPU)
+        for (name, ms, n) in crate::profile::take_kernels() {
+            eprintln!("    {name}: {:.1} us a dispatch", ms * 1e3 / n as f64);
+        }
+    }
+}
+
+/// A device program's held experts in slots of a GGUF's ([`crate::exl3::ProgramStep::Candidates`], then `Held` of
+/// [`QuantSlots`]) are the `k` best of the router's scores, those the table holds made as the slots make them alone (to
+/// the bit) and those it does not skipped (their rows as they were).
+#[test]
+fn a_programs_held_quant_experts_are_the_slots_own() {
+    use crate::exl3::{run_program, HeldSlots, ProgramStep};
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (hidden, ff, limit, n, k) = (512usize, 256usize, 1.5f32, 16usize, 4usize);
+    let types = [GgmlType::IQ2_XXS, GgmlType::IQ1_M];
+    let mut next = rng(21);
+    let gb = ff * hidden / 256 * types[0].type_size();
+    let layout = QuantLayout {
+        bytes: 2 * gb + hidden * ff / 256 * types[1].type_size(),
+        proj: [QuantProj { at: 0, dtype: types[0], k: hidden, n: ff }, QuantProj { at: gb, dtype: types[0], k: hidden, n: ff }, QuantProj { at: 2 * gb, dtype: types[1], k: ff, n: hidden }],
+    };
+    let slots = b.quant_slots(4, hidden, ff, types).expect("room for four slots");
+    // experts 3, 7 and 11 of the layer in slots 2, 0 and 1
+    let held = [(3usize, 2u32), (7, 0), (11, 1)];
+    for &(_, s) in &held {
+        let record = [random_grid(&mut next, types[0], 2, ff, hidden), random_grid(&mut next, types[1], 1, hidden, ff)].concat();
+        slots.put(s as usize, &record, &layout);
+    }
+    let mut words = vec![u32::MAX; n];
+    for &(e, s) in &held {
+        words[e] = s;
+    }
+    let table = b.vec_of_bytes(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
+    let x: Vec<f32> = (0..hidden).map(|_| next()).collect();
+    // logits that put experts 7, 5, 3 and 12 first by score (the bias moving 12 above 11), 11 fifth
+    let mut logits = vec![-3.0f32; n];
+    for (e, v) in [(7, 4.0), (5, 3.0), (3, 2.0), (11, 1.5), (12, 1.0)] {
+        logits[e] = v;
+    }
+    let mut bias = vec![0.0f32; n];
+    bias[12] = 0.2;
+    let steps = [
+        ProgramStep::Input(&logits),
+        ProgramStep::Input(&x),
+        ProgramStep::Candidates { logits: 0, bias: &bias, table: &table, k },
+        ProgramStep::Held { slots: HeldSlots::Quant(&slots), x: 1, cands: 2, limit },
+    ];
+    let got = run_program(&b, &steps, &[(2, 0, 4 * k), (3, 0, k * hidden)]).expect("the program runs");
+    let bits: Vec<u32> = got[0].iter().map(|v| v.to_bits()).collect();
+    assert_eq!(&bits[2 * k..3 * k], &[7, 5, 3, 12], "the candidates, best first");
+    assert_eq!(&bits[3 * k..], &[0, u32::MAX, 2, u32::MAX], "their slots");
+    for (r, slot) in [(0usize, 0usize), (2, 2)] {
+        let alone = slots.forward(&[(slot, &x[..])], limit).pop().expect("one output");
+        let mine = &got[1][r * hidden..(r + 1) * hidden];
+        assert!(mine.iter().zip(&alone).all(|(a, b)| a.to_bits() == b.to_bits()), "candidate {r}: the slots' own output");
+    }
+}
+
 /// The GPU's experts whose gate and up matrices are a grid type's (IQ2_S, IQ2_XXS, IQ1_M; their down ones Q2_0: the
 /// GSQ-RCO IQ2_XS file's layers) are the host's reference: a small layer (hidden 256, 12 experts, 3 a row) for a
 /// step's row, a check's three and a prompt's 40 and 70, routed on the host and on the GPU, in f32 and (where the

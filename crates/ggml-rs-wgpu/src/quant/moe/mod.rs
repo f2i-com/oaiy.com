@@ -328,7 +328,7 @@ impl QuantMoe {
         // (a prompt's experts of few rows: eight lanes a row, 32 output rows a workgroup. Most of that pass's blocks
         // are empty, an expert of more rows or of none, and a workgroup of an empty block still starts)
         let lanes = if matches!(order, Order::At(..)) { 8 } else { few_lanes(g.kind, g.k) };
-        let (name, source) = kernel(g.kind, coop, rows, g.k, if self.cache.is_some() { g.mats } else { 0 }, stage.is_some(), lanes);
+        let (name, source) = kernel(g.kind, coop, rows, g.k, if self.cache.is_some() { g.mats } else { 0 }, stage.is_some(), lanes, false);
         // (a card holding some of the experts: the rest's rows in the host's memory or where this run's were copied,
         // and the layer's state)
         let staged = stage.map(|s| buf(s));

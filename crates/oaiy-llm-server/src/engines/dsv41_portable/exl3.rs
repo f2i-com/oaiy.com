@@ -377,10 +377,9 @@ impl WgpuExl3Experts {
         // Each layer given a pool of its trunk's card (its own card where the trunk is split, else the first) to hold its
         // experts in first, the pools of a bitrate on a card shared by its layers in turn, so the router's call makes
         // those there (a pass of the held experts' kernels takes one pool); the rest go where there is room, as before.
-        // (OAIY_DSV41_FUSED=0: none so; a drafter's experts, all held, neither; nor a GGUF's, whose kernels the router's
-        // program does not run)
+        // (OAIY_DSV41_FUSED=0: none so; a drafter's experts, all held, neither)
         let fused: Vec<Option<(usize, ggml_rs::DeviceVec)>> = match &home {
-            _ if std::env::var("OAIY_DSV41_FUSED").as_deref() == Ok("0") || most.is_some() || cards.is_empty() || gguf => Vec::new(),
+            _ if std::env::var("OAIY_DSV41_FUSED").as_deref() == Ok("0") || most.is_some() || cards.is_empty() => Vec::new(),
             h => {
                 let mut turn: HashMap<(usize, [usize; 2]), usize> = HashMap::new();
                 layouts
@@ -435,11 +434,11 @@ impl WgpuExl3Experts {
     }
 
     /// `layer`'s pool and slot table where the router's call makes its held experts ([`ExpertsKernel::fused`]).
-    pub(crate) fn fused_parts(&self, layer: u32) -> Option<(&Exl3Slots, &ggml_rs::DeviceVec)> {
+    pub(crate) fn fused_parts(&self, layer: u32) -> Option<(ggml_rs_wgpu::exl3::HeldSlots<'_>, &ggml_rs::DeviceVec)> {
         let (p, table) = self.fused.get(layer as usize)?.as_ref()?;
         match &self.pools[*p].slots {
-            Slots::Exl3(s) => Some((s, table)),
-            Slots::Quant(_) => None,
+            Slots::Exl3(s) => Some((ggml_rs_wgpu::exl3::HeldSlots::Exl3(s), table)),
+            Slots::Quant(s) => Some((ggml_rs_wgpu::exl3::HeldSlots::Quant(s), table)),
         }
     }
 

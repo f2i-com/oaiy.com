@@ -41,9 +41,9 @@ pub enum ProgramStep<'a> {
     /// held pass's down jobs (`(slot, job)` each), then the `k` experts, then their slots, `[4k]`.
     Candidates { logits: usize, bias: &'a [f32], table: &'a DeviceVec, k: usize },
     /// The held experts of `cands` (a [`ProgramStep::Candidates`] step) in `slots`, on row 0 of `x` (`[hidden]`): each
-    /// one's output, unweighted, as [`Exl3Slots::forward`] makes it (to the bit), `[k, hidden]`; a candidate the pool
-    /// does not hold skipped (its row whatever it was).
-    Held { slots: &'a Exl3Slots, x: usize, cands: usize, limit: f32 },
+    /// one's output, unweighted, as the slots' `forward` makes it (to the bit), `[k, hidden]`; a candidate the pool does
+    /// not hold skipped (its row whatever it was).
+    Held { slots: HeldSlots<'a>, x: usize, cands: usize, limit: f32 },
     /// A vector the caller keeps on the device from run to run (a layer's caches, the rotary tables): the step's vector
     /// is it, read and written in place by the steps that name it.
     State(&'a DeviceVec),
@@ -81,6 +81,58 @@ pub enum ProgramStep<'a> {
     /// coefficients' exponentials and Sinkhorn's divisions the device's own), laid out as a [`ProgramStep::HcPost`]
     /// takes them: `[24]`.
     HcMix { proj: usize, pos: usize, word: u32, base: &'a [f32], scale: &'a [f32], n: usize, norm_eps: f32, iters: usize, hc_eps: f32 },
+}
+
+/// The slots a [`ProgramStep::Held`] makes its experts from: an EXL3 checkpoint's, or a GGUF's.
+#[derive(Clone, Copy)]
+pub enum HeldSlots<'a> {
+    Exl3(&'a Exl3Slots),
+    Quant(&'a crate::quant::moe::QuantSlots),
+}
+
+/// A [`ProgramStep::Held`]'s vectors beside its inputs and output, as its slots' kind takes them.
+enum HeldScratch {
+    Exl3(FusedScratch),
+    Quant(crate::quant::moe::QuantFused),
+}
+
+impl HeldSlots<'_> {
+    fn on(&self, b: &WgpuBackend) -> bool {
+        match self {
+            HeldSlots::Exl3(s) => s.on(b),
+            HeldSlots::Quant(s) => s.on(b),
+        }
+    }
+
+    fn hidden(&self) -> usize {
+        match self {
+            HeldSlots::Exl3(s) => s.hidden(),
+            HeldSlots::Quant(s) => s.hidden(),
+        }
+    }
+
+    fn words(&self) -> &wgpu::Buffer {
+        match self {
+            HeldSlots::Exl3(s) => s.words(),
+            HeldSlots::Quant(s) => s.words(),
+        }
+    }
+
+    fn fused_scratch(&self, k: usize) -> HeldScratch {
+        match self {
+            HeldSlots::Exl3(s) => HeldScratch::Exl3(s.fused_scratch(k)),
+            HeldSlots::Quant(s) => HeldScratch::Quant(s.fused_scratch(k)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_fused(&self, rec: &mut crate::chain::Recorder<'_>, x: &DeviceVec, jgu: &DeviceVec, jd: &DeviceVec, k: usize, s: &HeldScratch, out: &DeviceVec, limit: f32) {
+        match (self, s) {
+            (HeldSlots::Exl3(slots), HeldScratch::Exl3(s)) => slots.record_fused(rec, x, jgu, jd, k, s, out, limit),
+            (HeldSlots::Quant(slots), HeldScratch::Quant(s)) => slots.record_fused(rec, x, jgu, jd, k, s, out, limit),
+            _ => unreachable!("a held step's scratch is of its slots' kind"),
+        }
+    }
 }
 
 /// [`ProgramStep::Candidates`]' kernel: one workgroup, a thread an expert (up to 512): each one's score, then its rank
@@ -475,7 +527,7 @@ pub(crate) struct ProgramArena {
     norms: Vec<Option<DeviceVec>>,
     groups: Vec<Option<GroupScratch>>,
     tables: Vec<Option<DeviceVec>>,
-    fused: Vec<Option<FusedScratch>>,
+    fused: Vec<Option<HeldScratch>>,
     /// Its two parts' dispatches as its first run recorded them, and where it was split: each run's after it the same
     /// work (its vectors, bind groups and kernels these), not recorded again.
     recipe: Option<(usize, Vec<crate::Dispatch>, Vec<crate::Dispatch>)>,

@@ -291,7 +291,7 @@ fn a_programs_held_experts_are_the_slots_own() {
         ProgramStep::Input(&logits),
         ProgramStep::Input(&x),
         ProgramStep::Candidates { logits: 0, bias: &bias, table: &table, k },
-        ProgramStep::Held { slots: &slots, x: 1, cands: 2, limit },
+        ProgramStep::Held { slots: HeldSlots::Exl3(&slots), x: 1, cands: 2, limit },
     ];
     let got = run_program(&b, &steps, &[(2, 0, 4 * k), (3, 0, k * hidden)]).expect("the program runs");
     let bits: Vec<u32> = got[0].iter().map(|v| v.to_bits()).collect();

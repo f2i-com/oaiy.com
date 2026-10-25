@@ -1084,8 +1084,8 @@ quantized MoE kernels read them (IQ2_XS added to them), the misses through scrat
 the two passes the model's own SwiGLU (the sums rounded to bf16, clamped, `silu(gate) * up` rounded).
 The misses go through the cards alone, never the host's cores: the host's decoding sums otherwise,
 and which side made an expert would show in the reply. With a 2-bit file's experts some 7.5 MB, the
-cards hold 5,715 and RAM the other 9,645: every expert resident, none read from the drive. The
-router's program does not make a GGUF's held experts (EXL3's fused kernels), nor does a drafter run.
+cards hold 5,715 and RAM the other 9,645: every expert resident, none read from the drive. No
+drafter runs with it.
 
 Measured as the sections above (the EXL3 checkpoint's usage profile seeding what the cards take while
 idle, the same model's routing), the second round:
@@ -1098,6 +1098,20 @@ idle, the same model's routing), the second round:
 | A new subject | 16.2 tok/s | 11.9 tok/s |
 
 Every reply the same text in both rounds; the EXL3 checkpoint's the same as before.
+
+The router's program then makes a GGUF's held experts too, as it makes an EXL3 checkpoint's
+(`exl3::ProgramStep::Held` of either kind of slots, `HeldSlots`; `QuantSlots::record_fused`, the
+few-row kernels skipping a candidate the pool does not hold): the same bits as their own call after
+the host's routing, a round trip sooner. Two runs each, alternated, the second rounds:
+
+| Reply | Held experts in their own call | In the router's program |
+|---|---|---|
+| A familiar subject | 20.2, 21.4 tok/s | 22.6, 21.7 tok/s |
+| Code | 16.4, 16.6 tok/s | 17.7, 17.6 tok/s |
+| The same again | 21.1, 19.9 tok/s | 22.9, 23.0 tok/s |
+| A new subject | 16.0, 16.1 tok/s | 16.7, 17.0 tok/s |
+
+Every reply the same text in all four runs (and as above).
 
 ## Phases
 
