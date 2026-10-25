@@ -167,6 +167,92 @@ describe('tool rules', () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'guided' });
   });
 
+  describe('where the tools are found (a local model)', () => {
+    const names = (body: Record<string, unknown>) => (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video', speechModel: 'speech' };
+    const make = (vfs = new Vfs()) =>
+      new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 65_536 }), projectSummary: () => '', media: () => media, discoverTools: () => true });
+
+    it('lists the everyday tools and the two that find and run the rest, the same at every step', async () => {
+      const vfs = new Vfs();
+      vfs.writeFile('/src/app.js', 'let a = 1;\n', { parents: true });
+      const fake = fakeProvider('openai', [
+        { calls: [{ name: 'find_tools', input: { query: 'make a picture' } }] },
+        { calls: [{ name: 'use_tool', input: { name: 'file_info', arguments: { path: 'src/app.js' } } }] },
+        { text: 'done' },
+      ]);
+      const events: AgentEvent[] = [];
+      await make(vfs).run('hello', (e) => events.push(e));
+      expect(names(fake.bodies[0]).sort()).toEqual(['append_file', 'delete_file', 'edit_file', 'find_tools', 'glob', 'grep', 'guide', 'list_files', 'read_file', 'update_plan', 'use_tool', 'write_file']);
+      for (const body of fake.bodies.slice(1)) {
+        expect(names(body)).toEqual(names(fake.bodies[0]));
+        expect(system(body)).toBe(system(fake.bodies[0]));
+      }
+      // Its instructions and tools some 2,000 tokens, where all of them were some 20,000.
+      expect(JSON.stringify(fake.bodies[0].tools).length + system(fake.bodies[0]).length).toBeLessThan(9000);
+      // A tool found: what it does and its parameters, as a result.
+      const found = JSON.stringify(fake.bodies[1].messages);
+      expect(found).toContain('generate_image:');
+      expect(found).toContain('Parameters:');
+      // One run by name: the tool's own call, as the chat shows it.
+      expect(events).toContainEqual(expect.objectContaining({ type: 'tool_call', call: expect.objectContaining({ name: 'file_info' }) }));
+      expect(JSON.stringify(fake.bodies[2].messages)).toContain('app.js');
+    });
+
+    it('gives a guide as its result, the instructions unchanged; arguments as JSON text are read too', async () => {
+      const vfs = new Vfs();
+      vfs.writeFile('/notes.txt', 'remember the milk\n');
+      const fake = fakeProvider('openai', [
+        { calls: [{ name: 'guide', input: { topic: 'app' } }] },
+        { calls: [{ name: 'use_tool', input: { name: 'search_file', arguments: '{"path":"notes.txt","pattern":"milk"}' } }] },
+        { text: 'ok' },
+      ]);
+      await make(vfs).run('hello', () => {});
+      expect(system(fake.bodies[1])).toBe(system(fake.bodies[0]));
+      expect(system(fake.bodies[1])).not.toContain('A SoftN app is a folder');
+      expect(JSON.stringify(fake.bodies[1].messages)).toContain('A SoftN app is a folder');
+      expect(names(fake.bodies[1])).not.toContain('softn_docs');
+      expect(JSON.stringify(fake.bodies[2].messages)).toContain('remember the milk');
+    });
+
+    it("gives a request's guide with the request, and a picture made before it with the guide", async () => {
+      const film = fakeProvider('openai', [{ text: 'ok' }]);
+      await make().run('Make a sitcom like Seinfeld, about a minute long', () => {});
+      expect(system(film.bodies[0])).not.toContain('The video guide');
+      expect(JSON.stringify(film.bodies[0].messages)).toContain('[OAIY] The video guide follows');
+      const vfs = new Vfs();
+      const picture = fakeProvider('openai', [
+        { calls: [{ name: 'use_tool', input: { name: 'generate_image', arguments: { prompt: 'a cat', path: 'cat.png' } } }] },
+        (body) => ({ text: JSON.stringify(body.messages).includes('[OAIY] The media guide follows') ? 'guided' : 'not guided' }),
+      ]);
+      const events: AgentEvent[] = [];
+      await make(vfs).run('hi, surprise me', (e) => events.push(e));
+      expect(vfs.exists('/cat.png')).toBe(false);
+      expect(picture.bodies).toHaveLength(2);
+      expect(events.at(-1)).toMatchObject({ type: 'done', text: 'guided' });
+    });
+
+    it('a found tool called by its name, which the server refuses, is asked for again through use_tool', async () => {
+      const refused = { error: { status: 422, body: JSON.stringify({ error: { message: 'tool_contract_error: unknown tool file_info; no tool from this batch was executed', code: 'tool_contract_error' } }) } };
+      const fake = fakeProvider('openai', [
+        refused,
+        (body) => ({ text: JSON.stringify(body.messages).includes('file_info is not one of your listed tools') ? 'told' : 'not told' }),
+      ]);
+      const events: AgentEvent[] = [];
+      await make().run('hello', (e) => events.push(e));
+      expect(fake.bodies).toHaveLength(2);
+      expect(events.at(-1)).toMatchObject({ type: 'done', text: 'told' });
+    });
+
+    it('is off by default', async () => {
+      const fake = fakeProvider('openai', [{ text: 'hi' }]);
+      await setup({ ...LOCAL, contextTokens: 32_000 }).agent.run('hello', () => {});
+      expect(names(fake.bodies[0])).not.toContain('find_tools');
+      expect(names(fake.bodies[0])).toContain('view_image');
+    });
+  });
+
   it('a request for a 3D model reads the media guide, which says how one is made when the service makes them', async () => {
     const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
     const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', model3dModel: 'pixal3d' };

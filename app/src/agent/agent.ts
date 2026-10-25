@@ -266,7 +266,50 @@ const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
 
 /** The note that a guide was read (in a tool result): from then on it is part of the instructions. */
 const guideLoaded = (topic: GuideTopic) => `[OAIY] The ${topic} guide is now in your instructions`;
-const GUIDE_MARK = /\[(?:OAIY|bot\.computer)\] The (app|web|video|media|document) guide is now in your instructions/g;
+/** The note that a guide's text follows (in a result or the request, where the tools are found: see LISTED). */
+const guideGiven = (topic: GuideTopic) => `[OAIY] The ${topic} guide follows`;
+const GUIDE_MARK = /\[(?:OAIY|bot\.computer)\] The (app|web|video|media|document) guide (?:is now in your instructions|follows)/g;
+
+/**
+ * The tools listed in every request where the others are found (`AgentOptions.discoverTools`): a local model's, whose
+ * engine reads a prompt anew from where it first differs from the last. Every tool listed (some 20,000 tokens with the
+ * media service's, OAIY's own and the plugins') was read before the first word of each new conversation, and a guide or
+ * a set of tools joining mid-run read all of it again. Listed so, the instructions and tools are the same from run to
+ * run (some 2,000 tokens), the rest found with find_tools and run with use_tool (or by name), and a guide comes back
+ * as a result.
+ */
+const LISTED = new Set(['list_files', 'read_file', 'write_file', 'append_file', 'edit_file', 'delete_file', 'grep', 'glob', 'update_plan', 'guide']);
+
+const FIND_TOOLS: ToolSpec = {
+  name: 'find_tools',
+  description:
+    'Find the tools for something your listed tools do not do: say what you need in a few words ("make a picture", "screenshot the preview", "check the app", "fetch a web page", "run code", "text a customer", "change a setting") and get the tools that do it, each with what it does and its parameters. Run one with use_tool. With no words, the names of all of them.',
+  parameters: { type: 'object', properties: { query: { type: 'string', description: 'What you need to do, in a few words' } } },
+};
+
+const USE_TOOL: ToolSpec = {
+  name: 'use_tool',
+  description: 'Run one of the tools find_tools gave you: its name, and its arguments as its parameters say.',
+  parameters: {
+    type: 'object',
+    required: ['name'],
+    properties: { name: { type: 'string', description: "The tool's name" }, arguments: { type: 'object', description: "The tool's parameters" } },
+  },
+};
+
+/** What the system prompt says where the tools are found. */
+const DISCOVERY_NOTE = `
+
+Only your everyday tools are listed. For anything else (pictures, video, voices, music and sound; apps and web pages and their previews; running code; the web; OAIY's own settings, flows and plugins; the phone) find the tools with find_tools, then run them with use_tool. A guide comes back as its tool's result: follow it from then on.`;
+
+/** Words find_tools leaves out of a query. */
+const QUERY_STOP = new Set(['a', 'an', 'the', 'to', 'of', 'for', 'and', 'or', 'in', 'on', 'with', 'my', 'it', 'is', 'do', 'make', 'get', 'use', 'some', 'that', 'this', 'from', 'into', 'at', 'by', 'me', 'i']);
+
+/** A tool's description to its first sentence, for a list of names. */
+function firstSentence(text: string): string {
+  const end = text.search(/[.:;](\s|$)/);
+  return (end > 0 ? text.slice(0, end) : text).slice(0, 140);
+}
 
 /** The app tools: offered once the app guide is read, or when the project has an app. */
 const SOFTN_TOOLS = new Set(['softn_docs', 'softn_components', 'softn_examples', 'softn_check', 'softn_inspect', 'softn_interact', 'softn_import']);
@@ -316,6 +359,12 @@ export interface AgentOptions {
   onWindow?: (tokens: number) => void;
   /** The tools this agent may use (default: all of them). */
   tools?: ToolSpec[];
+  /**
+   * Whether only the everyday tools are listed in each request ([`LISTED`]) and the rest found with find_tools and
+   * run with use_tool, each guide given as a result: a short prompt that stays the same (a local model's). A
+   * sub-agent's too.
+   */
+  discoverTools?: () => boolean;
   /** Added to the system prompt: a sub-agent's instructions. */
   role?: string;
   /** Model requests one run may make (default MAX_STEPS). */
@@ -643,7 +692,7 @@ export class Agent {
 
   /** How to check files like these, with the tools this agent has. */
   private reviewHint(paths: string[]): string {
-    const has = (name: string) => this.tools.some((t) => t.name === name);
+    const has = (name: string) => this.usable.some((t) => t.name === name);
     const media = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|wav|mp3|ogg|flac|glb)$/i;
     const ways: string[] = [];
     // Text is read back; a picture, a clip or a model is looked at, not read.
@@ -842,7 +891,20 @@ export class Agent {
     return this.options.maxContext ? Math.min(window, this.options.maxContext) : window;
   }
 
-  private get tools(): ToolSpec[] {
+  /** Whether this agent's requests list only the everyday tools, the rest found (`AgentOptions.discoverTools`). */
+  private get discovering(): boolean {
+    return !!this.options.discoverTools?.() && !this.options.finish && !this.options.conversation;
+  }
+
+  /** The tools each request lists: every one this agent may use, or where the rest are found, the everyday ones and the two that find and run the rest. */
+  private get listed(): ToolSpec[] {
+    const usable = this.usable;
+    if (!this.discovering) return usable;
+    return [...usable.filter((t) => LISTED.has(t.name)), FIND_TOOLS, USE_TOOL];
+  }
+
+  /** Every tool this agent may use, listed or found. */
+  private get usable(): ToolSpec[] {
     // A sub-agent gets its list from its parent, media tools included (a call, a short list of its own).
     if (this.options.tools) return [...this.options.tools, ...this.sessionToolList.map((t) => t.spec)];
     const provider = this.options.provider();
@@ -856,11 +918,54 @@ export class Agent {
     const models = all.some((t) => t.name === 'generate_3d_model') || findModels(this.options.vfs).length > 0;
     const tools = all.filter((t) => (apps || !SOFTN_TOOLS.has(t.name)) && (web || !WEB_TOOLS.has(t.name)) && (apps || web || models || !PREVIEW_TOOLS.has(t.name)));
     const topics = guideTopics(new Set(all.map((t) => t.name)));
+    const stays = this.discovering ? 'its text comes back for you to follow from then on' : 'it stays in your instructions from then on';
     return [...tools, ...this.sessionToolList.map((t) => t.spec), {
       name: 'guide',
-      description: `Read the guide for a kind of work before you start it; it stays in your instructions from then on. The guides: ${topics.map((t) => `"${t}" for ${GUIDE_ABOUT[t]}`).join('; ')}.`,
+      description: `Read the guide for a kind of work before you start it; ${stays}. The guides: ${topics.map((t) => `"${t}" for ${GUIDE_ABOUT[t]}`).join('; ')}.`,
       parameters: { type: 'object', required: ['topic'], properties: { topic: { type: 'string', enum: topics } } },
     }];
+  }
+
+  /**
+   * find_tools: the tools this agent may use but are not listed, whose names and descriptions hold the query's words
+   * (a name's the most), each with what it does and its parameters; with no words, all their names.
+   */
+  private findTools(call: ToolCall): ToolResult {
+    const listed = new Set(this.listed.map((t) => t.name));
+    const others = this.usable.filter((t) => !listed.has(t.name));
+    const names = others.map((t) => `${t.name} (${firstSentence(t.description)})`).join('; ');
+    const query = typeof call.input.query === 'string' ? call.input.query.trim().toLowerCase() : '';
+    const words = query.split(/[^a-z0-9]+/).filter((w) => w.length > 1 && !QUERY_STOP.has(w));
+    const said = (content: string): ToolResult => ({ id: call.id, name: call.name, content, isError: false });
+    if (!words.length) return said(`Your other tools: ${names}.\n\nfind_tools with what you need to do gives a tool's parameters; run it with use_tool.`);
+    const scored = others
+      .map((t) => {
+        const name = t.name.toLowerCase().replace(/_/g, ' ');
+        const text = t.description.toLowerCase();
+        const score = words.reduce((s, w) => s + (name.includes(w) ? 3 : text.includes(w) ? 1 : 0), 0);
+        return { t, score };
+      })
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 6);
+    if (!scored.length) return said(`No tool matches "${query}". Your other tools: ${names}.`);
+    const found = scored.map(({ t }) => `${t.name}: ${t.description}\nParameters: ${JSON.stringify(t.parameters)}`).join('\n\n');
+    return said(`${found}\n\nRun one with use_tool: {"name": "…", "arguments": {…}}.`);
+  }
+
+  /** A use_tool call as the call of the tool it names (its arguments a JSON text too: some models write them so). */
+  private unwrapped(call: ToolCall): ToolCall {
+    const name = typeof call.input.name === 'string' ? call.input.name.trim() : '';
+    let args: unknown = call.input.arguments;
+    if (typeof args === 'string') {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        /* the tool says what is missing */
+      }
+    }
+    const input = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+    return { ...call, name: name || 'use_tool', input };
   }
 
   /** Guides read so far: the parent's, those read with a request, and those read since (their note in a result). */
@@ -893,11 +998,20 @@ export class Agent {
   /** The guide tool: the guide joins the instructions (from the next step on). */
   private readGuide(call: ToolCall): ToolResult {
     const topic = call.input.topic as GuideTopic;
-    const topics = guideTopics(new Set(this.tools.map((t) => t.name)));
+    const names = new Set(this.usable.map((t) => t.name));
+    const topics = guideTopics(names);
     if (!topics.includes(topic)) return { id: call.id, name: call.name, content: `Error: no guide "${String(topic)}". The guides: ${topics.join(', ')}.`, isError: true };
+    // (where the tools are found, the guide is its result, again when asked again: an early one may be summarized away)
+    if (this.discovering) return { id: call.id, name: call.name, content: this.guideGivenText(topic, names), isError: false };
     if (this.loadedGuides().has(topic)) return { id: call.id, name: call.name, content: `The ${topic} guide is already in your instructions: follow it.`, isError: false };
     const tools = topic === 'app' ? ' The app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, preview_screenshot, preview_viewport) are yours from now on too.' : topic === 'web' ? ' The page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours from now on too.' : '';
     return { id: call.id, name: call.name, content: `${guideLoaded(topic)}: follow it from now on.${tools}`, isError: false };
+  }
+
+  /** A guide given where the tools are found: its mark, its text, and where its tools are. */
+  private guideGivenText(topic: GuideTopic, names: Set<string>): string {
+    const tools = topic === 'app' ? '\n\nThe app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, preview_screenshot, preview_viewport) are yours: find_tools gives their parameters.' : topic === 'web' ? '\n\nThe page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours: find_tools gives their parameters.' : '';
+    return `${guideGiven(topic)} (follow it from now on; read it again with guide if it is out of view):\n${this.guideText(topic, names)}${tools}`;
   }
 
   /**
@@ -906,13 +1020,15 @@ export class Agent {
    * picture), and the call is made again.
    */
   private guideFirst(call: ToolCall): string | null {
-    if (!MAKE_TOOLS.has(call.name) || !this.tools.some((t) => t.name === 'guide')) return null;
+    if (!MAKE_TOOLS.has(call.name) || !this.usable.some((t) => t.name === 'guide')) return null;
     const loaded = this.loadedGuides();
     if (loaded.has('video') || loaded.has('media')) return null;
-    const names = new Set(this.tools.map((t) => t.name));
+    const names = new Set(this.usable.map((t) => t.name));
     const video = names.has('generate_video') && (call.name === 'generate_video' || GUIDE_WORDS[0][1].test(this.requestText()));
     const topic: GuideTopic = video ? 'video' : 'media';
-    return `Not made yet. ${guideLoaded(topic)}: how ${video ? 'a video (its script, pictures, voices and clips) is' : 'pictures and sounds are'} made here. Follow it: ${video ? 'if the script it asks for is not written yet, write it first; then ' : ''}call ${call.name} again as the guide says.`;
+    const how = `how ${video ? 'a video (its script, pictures, voices and clips) is' : 'pictures and sounds are'} made here. Follow it: ${video ? 'if the script it asks for is not written yet, write it first; then ' : ''}call ${call.name} again as the guide says.`;
+    if (this.discovering) return `Not made yet. The ${topic} guide below says ${how}\n\n${this.guideGivenText(topic, names)}`;
+    return `Not made yet. ${guideLoaded(topic)}: ${how}`;
   }
 
   /**
@@ -929,31 +1045,33 @@ export class Agent {
   }
 
   private get canPlan(): boolean {
-    return this.tools.some((t) => t.name === 'update_plan');
+    return this.usable.some((t) => t.name === 'update_plan');
   }
 
   private get canDelegate(): boolean {
-    return this.tools.some((t) => t.name === 'delegate');
+    return this.usable.some((t) => t.name === 'delegate');
   }
 
   private get systemPrompt(): string {
-    const names = new Set(this.tools.map((t) => t.name));
+    const names = new Set(this.usable.map((t) => t.name));
     const topics = guideTopics(names);
     const loaded = this.loadedGuides();
+    // (where the tools are found, the guides are results and the request is in view: the prompt stays the same)
+    const discovering = this.discovering;
     // The video guide holds the media one.
-    const read = (['document', 'app', 'web', 'media', 'video'] as GuideTopic[]).filter((t) => loaded.has(t) && topics.includes(t) && !(t === 'media' && loaded.has('video')));
+    const read = discovering ? [] : (['document', 'app', 'web', 'media', 'video'] as GuideTopic[]).filter((t) => loaded.has(t) && topics.includes(t) && !(t === 'media' && loaded.has('video')));
     const guides = read.map((t) => `\n\nThe ${t} guide:\n${this.guideText(t, names)}`).join('');
     // A video follows the request: it stays in view, word for word, however long the work (as a reference, not a step to take).
     const request = read.includes('video') && !this.options.role ? this.requestText() : '';
     const asked = request ? `\n\nThe user's request being worked on, word for word, for reference (the script and everything made follow it; the guide's rules only fill in what it leaves open):\n"""\n${request.length > 4000 ? `${request.slice(0, 4000)} […]` : request}\n"""` : '';
-    return `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}${guides}${asked}${this.options.role ?? ''}${this.instructions ? `
+    return `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}${discovering ? DISCOVERY_NOTE : ''}${guides}${asked}${this.options.role ?? ''}${this.instructions ? `
 
 ${this.instructions}` : ''}`;
   }
 
   /** The prompt's fixed part: the system prompt and the tool definitions. */
   private fixedChars(): number {
-    return this.systemPrompt.length + JSON.stringify(this.tools).length;
+    return this.systemPrompt.length + JSON.stringify(this.listed).length;
   }
 
   /** Apps checked in the latest run, and whether each passed its last check. */
@@ -1061,7 +1179,7 @@ ${this.instructions}` : ''}`;
         if (path && this.options.vfs.stat(`/${path}`)?.type !== 'dir') files.add(path);
       }),
       provider: () => provider,
-      tools: this.tools.filter((t) => !MAIN_AGENT_ONLY.has(t.name)),
+      tools: this.usable.filter((t) => !MAIN_AGENT_ONLY.has(t.name)),
       guides: [...this.loadedGuides()],
       role: `${SUB_AGENT_ROLE}\n\nYour task: ${task.title}`,
       maxSteps: SUB_AGENT_STEPS,
@@ -1106,7 +1224,7 @@ ${this.instructions}` : ''}`;
    * thinks harder first, for a more complete story.
    */
   private writingScript(): boolean {
-    if (!this.tools.some((t) => t.name === 'generate_video')) return false;
+    if (!this.usable.some((t) => t.name === 'generate_video')) return false;
     const active = this.plan?.items.find((i) => i.status === 'active');
     if (active && /\bscript\b/i.test(active.text)) return true;
     const last = [...this.turns].reverse().find((t) => t.role === 'assistant');
@@ -1262,7 +1380,7 @@ ${this.instructions}` : ''}`;
     const reviewer: Agent = new Agent({
       ...this.options,
       provider: () => provider,
-      tools: [...this.tools.filter((t) => REVIEW_TOOLS.has(t.name)), VERDICT_TOOL],
+      tools: [...this.usable.filter((t) => REVIEW_TOOLS.has(t.name)), VERDICT_TOOL],
       role: REVIEWER_ROLE,
       maxSteps: REVIEW_STEPS,
       keepImages: REVIEW_KEEP_IMAGES,
@@ -1475,7 +1593,7 @@ ${this.instructions}` : ''}`;
       this.streamed = '';
       try {
         const finish = this.options.finish;
-        const tools = finish && this.finishing ? this.tools.filter((t) => t.name === finish.tool) : this.tools;
+        const tools = finish && this.finishing ? this.usable.filter((t) => t.name === finish.tool) : this.listed;
         if (attempt === 0) emit({ type: 'prompt', system: this.systemPrompt, turns: sent, tools: tools.map((t) => t.name) });
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
@@ -1527,6 +1645,11 @@ ${this.instructions}` : ''}`;
         const unreadableCall = /tool_contract_error/.test(said);
         if (unreadableCall && !callRetried) {
           callRetried = true;
+          // (a tool found but called by its name, where the server takes only the listed ones: asked again, through use_tool)
+          const unlisted = this.discovering ? /unknown tool ([A-Za-z0-9_.-]+)/.exec(said)?.[1] : undefined;
+          if (unlisted && this.usable.some((t) => t.name === unlisted)) {
+            this.turns.push({ role: 'user', text: `[OAIY] ${unlisted} is not one of your listed tools, so that call did not run. Run it with use_tool: {"name": "${unlisted}", "arguments": {its parameters}}.`, automatic: true });
+          }
           emit({ type: 'status', message: 'The model wrote a tool call the server could not read; asking again' });
           continue;
         }
@@ -1582,7 +1705,7 @@ ${this.instructions}` : ''}`;
     const read = new AbortController();
     const done = () => read.abort();
     try {
-      await sendTurn(provider, this.systemPrompt, sent, this.tools, {
+      await sendTurn(provider, this.systemPrompt, sent, this.listed, {
         maxOutputTokens: WARM_TOKENS,
         signal: signal ? AbortSignal.any([signal, read.signal]) : read.signal,
         reasoning: this.options.reasoning,
@@ -1714,7 +1837,7 @@ ${this.instructions}` : ''}`;
 
   /** The guides a request plainly calls for, not read yet. */
   private guidesFor(prompt: string): GuideTopic[] {
-    const names = new Set(this.tools.map((t) => t.name));
+    const names = new Set(this.usable.map((t) => t.name));
     if (!names.has('guide')) return [];
     const topics = guideTopics(names);
     const loaded = this.loadedGuides();
@@ -1823,7 +1946,10 @@ ${this.instructions}` : ''}`;
       const first = this.turns.length === 0;
       const text = first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt;
       const guides = this.guidesFor(prompt);
-      this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
+      // (where the tools are found, the request's guides come with it: the instructions stay the same)
+      const names = new Set(this.usable.map((t) => t.name));
+      const given = this.discovering && guides.length ? `\n\n${guides.map((g) => this.guideGivenText(g, names)).join('\n\n')}` : '';
+      this.turns.push({ role: 'user', text: `${text}${given}`, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
       const carry = this.carryOver();
       if (carry) this.turns.push({ role: 'user', text: `[OAIY] ${carry}`, automatic: true });
     }
@@ -1958,9 +2084,11 @@ ${this.instructions}` : ''}`;
         for (const [index, asked] of reply.calls.entries()) {
           signal?.throwIfAborted();
           callIndex = index;
-          emit({ type: 'tool_call', call: asked });
-          let call = asked;
-          const allowed = this.tools.some((t) => t.name === call.name);
+          // (use_tool is the call of the tool it names, from here on as any other: a found tool may be called by name too)
+          let call = asked.name === 'use_tool' && this.discovering ? this.unwrapped(asked) : asked;
+          emit({ type: 'tool_call', call });
+          const finding = call.name === 'find_tools' && this.discovering;
+          const allowed = finding || this.usable.some((t) => t.name === call.name);
           // A flow of the person's before the tool: it may change the call, stop it, or add a note.
           const hooks = allowed ? this.hooksFor(call.name) : {};
           let flowNote = '';
@@ -1978,6 +2106,8 @@ ${this.instructions}` : ''}`;
           const scriptCheck = allowed && !stopped ? this.guideFirst(call) ?? this.writtenAlready(call) ?? this.scriptCheck(call, changedThisRun) : null;
           const result: ToolResult = stopped
             ? stopped
+            : finding
+            ? this.findTools(call)
             : allowed && !scriptCheck && hooks.instead
             ? await this.runInstead(hooks.instead, call, signal)
             : !allowed
@@ -2005,12 +2135,12 @@ ${this.instructions}` : ''}`;
             if (times >= 3) result.content += `\n\n[OAIY] This is the ${times}${times === 3 ? 'rd' : 'th'} time you wrote /${path} in full for this request. Do not write it again: if it is done, mark its plan step done with update_plan and go on to the next step; to change a part of it, use edit_file.`;
           }
           // Writing an app's files reads the app guide (and gives the app tools).
-          if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && APP_FILE.test(call.input.path) && !this.loadedGuides().has('app') && this.tools.some((t) => t.name === 'guide')) {
-            result.content += `\n\n${guideLoaded('app')}: follow it from your next step. The app tools (softn_docs, softn_check, softn_interact, …) are yours now too.`;
+          if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && APP_FILE.test(call.input.path) && !this.loadedGuides().has('app') && this.usable.some((t) => t.name === 'guide')) {
+            result.content += this.discovering ? `\n\n${this.guideGivenText('app', new Set(this.usable.map((t) => t.name)))}` : `\n\n${guideLoaded('app')}: follow it from your next step. The app tools (softn_docs, softn_check, softn_interact, …) are yours now too.`;
           }
           // Writing a web page reads the web guide (and gives the page tools).
-          if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && WEB_FILE.test(call.input.path) && !this.loadedGuides().has('web') && this.tools.some((t) => t.name === 'guide')) {
-            result.content += `\n\n${guideLoaded('web')}: follow it from your next step. The page tools (page_check, page_interact, preview_screenshot, preview_viewport, …) are yours now too.`;
+          if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && WEB_FILE.test(call.input.path) && !this.loadedGuides().has('web') && this.usable.some((t) => t.name === 'guide')) {
+            result.content += this.discovering ? `\n\n${this.guideGivenText('web', new Set(this.usable.map((t) => t.name)))}` : `\n\n${guideLoaded('web')}: follow it from your next step. The page tools (page_check, page_interact, preview_screenshot, preview_viewport, …) are yours now too.`;
           }
           if (call.name === 'view_image' && !result.isError) this.noteLook(call.input);
           if (result.startedCalls) startedCalls = true;

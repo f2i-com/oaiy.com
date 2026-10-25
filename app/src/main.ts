@@ -1177,6 +1177,10 @@ async function main(): Promise<void> {
         gate,
         // The engine's provider as chosen in Settings, or ChatGPT when the desktop says the Agent runs on it.
         provider: () => agentProvider(kind()),
+        // On a local model the person's own conversations list the everyday tools and find the rest, guides as
+        // results: a short prompt that stays the same, which the engine reads once and keeps (a call, a text or a
+        // flow's task keeps its own short list).
+        discoverTools: () => (kind() === 'project' || kind() === 'runner') && agentProvider(kind())?.type === 'local',
         // A run that started calls is not pushed on by its plan while they are going on (the place is the one its campaigns are started from).
         waitingOnCall: () => (kind() === 'runner' || kind() === 'project') && !!outreach?.callLiveFor(place().meta.id),
         prepare: prepareFor(kind),
