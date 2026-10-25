@@ -32,8 +32,10 @@ use crate::dsv41::formats::to_bf16;
 const SCRATCH: usize = crate::dsv41::moe::GPU_GROUP;
 
 /// Scratch slots a GGUF's pair of types has on each card: a decode step's misses of a layer (six experts at most) at
-/// once, a prompt's a few at a time. Its layers have several pairs (eight in a 2-bit file), each its own scratch.
-const GGUF_SCRATCH: usize = 8;
+/// once, a prompt's sixteen at a time. Its layers have several pairs (eight in a 2-bit file), each its own scratch. (An
+/// agent's step of some 470 new tokens at 24,000 of context read in 17.3, 13.5, 12.8, 11.8 s with sixteen where 18.9,
+/// 14.2, 13.1, 13.9 with eight, its uploads' calls half as many; 24: 16.2, 12.2, 12.3, 11.7, the cards' memory twice.)
+const GGUF_SCRATCH: usize = 16;
 
 /// What the weight budget keeps free on a card beyond the slots: a prompt's passes' own buffers.
 const MARGIN: u64 = 1 << 30;
