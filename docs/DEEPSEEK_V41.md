@@ -1171,6 +1171,31 @@ it, the same every time; the conversation test's three turns and its "again" as 
 time: the experts 27.6 s, the held experts 10.8, their uploads 9.8, the dense matmuls 22.4, the
 host's mixing 12.7, the indexer 8.9 and its scores 6.4.
 
+## An agent's long prompts (2026-10-26)
+
+OAIY's Agent sends its instructions and tools before a word of the request: some 19,000 to 21,000
+tokens with the media tools of a computer that has many media models (a run here: 21,310 tokens). The
+2-bit GGUF read them at some 32 tok/s, 664 s before the first word, and its reply came at 2.8 tok/s.
+
+The state a prompt's system turn leaves is kept now (`Engine`'s `system`, the first prompt of a
+conversation whose system turn has 256 tokens or more: its state at the first user turn's token).
+A new conversation that starts with the same turn, as each of the Agent's runs does, reads on from
+there. Before, the one state kept was the last prompt's, which a new conversation does not start
+with, so every run read the whole turn again. A conversation's later prompts keep none: a run that
+reads a guide into its instructions would leave those in place of the ones its next run starts with.
+Measured on the 2-bit GGUF with the Agent's own 33 tools and its instructions grown to 22,692 tokens:
+a first request's first word after 663 s; a new conversation with the same system turn 22,671 of its
+tokens reused, its first word after 3.1 s; the first's conversation one step on (the last prompt's
+state) after 4.3 s. A state is every layer's caches whole, some 1 GB at a 65,536-token context, so
+this one more is kept beside the other.
+
+What that prompt's 662 s went to (the profile, parts overlapping): the dense matrices on the card
+167 s, the experts on the cards 155 s, the indexer on the host 131 s and its scores 114 s (both as
+the square of the prompt's length), the mixing 69 s, the experts' uploads 53 s and the held experts'
+45 s. Its reply's 376 ms a token: the attention on the host past the card's reach (16,384 positions),
+110 ms (the sparse attention 61, the index scores 24, the indexer 25), and the rest slower for it too,
+each layer in two calls and three round trips where one call within the reach.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

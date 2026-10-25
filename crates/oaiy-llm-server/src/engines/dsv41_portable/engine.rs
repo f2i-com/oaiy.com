@@ -3,16 +3,22 @@
 use super::*;
 
 /// The tokens one forward pass reads of a prompt. A pass reads each layer's experts once for all its tokens, so a
-/// prompt is read whole when it fits (an Agent's is 1.5-3k tokens): in pieces it would read them once a piece.
+/// prompt is read whole when it fits: in pieces it would read them once a piece.
 const PREFILL_CHUNK: usize = 4096;
+
+/// The fewest tokens a prompt's system turn has for its state to be kept at its end ([`Engine`]'s `system`): a state
+/// is every layer's caches whole (some 1 GB at a 65,536-token context), and a shorter turn is read again in seconds.
+const SYSTEM_KEPT_FROM: usize = 256;
 
 /// The portable server's DeepSeek worker: jobs in, events out, the contract of the CUDA engine (`crate::engines::job`) and
 /// GLM's (`crate::engines::glm`). A request that extends what the model's state covers reads only the new tail, in one chunk
 /// (`dsv41`'s attention continues a sequence by a chunk as it would token by token). That state has moved on through
 /// the last reply, which the next turn's prompt writes again its own way (its chat template), so the state as the last
 /// prompt left it is kept too, a token short of its end (so the same prompt again can still use it): a conversation's
-/// next turn continues from there. A prompt that shares neither starts again. A reply ends at the end-of-sentence
-/// token, at a complete tool call, or at `max_tokens`.
+/// next turn continues from there. The state at the end of a conversation's first long system turn is kept as well: a
+/// new conversation that starts with the same one (an agent's instructions and tools, some 19-21k tokens, the same at
+/// each of its runs) reads on from there. A prompt that shares none of them starts again. A reply ends at the
+/// end-of-sentence token, at a complete tool call, or at `max_tokens`.
 pub(crate) struct Engine {
     model: crate::dsv41::model::Model,
     tok: Arc<crate::dsv41::tokenizer::Tokenizer>,
@@ -20,6 +26,11 @@ pub(crate) struct Engine {
     covered: Vec<u32>,
     /// The state after the last prompt's tokens but its last one, and those tokens.
     checkpoint: Option<(Vec<u32>, crate::dsv41::model::Checkpoint)>,
+    /// The state at the end of a prompt's system turn ([`system_end`]), those tokens, and the drafter's keys then.
+    system: Option<(Vec<u32>, crate::dsv41::model::Checkpoint, Option<Vec<crate::dsv41::attention::AttnState>>)>,
+    /// The tokens that open a user turn (`<｜User｜>`, which ends the system turn) and an assistant's.
+    user: Option<u32>,
+    assistant: Option<u32>,
     eos: u32,
     log: bool,
     /// Reading the experts into RAM while no request waits ([`Warm`]); None once done, or switched off.
@@ -152,9 +163,21 @@ fn reusable(tokens: &[u32], prompt: &[u32]) -> usize {
     }
 }
 
+/// Where `prompt`'s system turn ends (its first `user` token), when its state is worth keeping there: a conversation's
+/// first prompt (no `assistant` turn but the one its reply opens), a turn of [`SYSTEM_KEPT_FROM`] tokens or more, past
+/// `start` (what a state already serves) and before `last` (the token the reply's logits come from). A conversation's
+/// later prompts keep none: an agent's run that read a guide into its instructions would leave the state of those
+/// instructions in place of the ones its next run starts with.
+fn system_end(prompt: &[u32], user: Option<u32>, assistant: Option<u32>, start: usize, last: usize) -> Option<usize> {
+    let end = prompt.iter().position(|&t| Some(t) == user)?;
+    let first = prompt.iter().filter(|&&t| Some(t) == assistant).count() <= 1;
+    (first && end >= SYSTEM_KEPT_FROM && end > start && end < last).then_some(end)
+}
+
 impl Engine {
     pub(crate) fn new(model: crate::dsv41::model::Model, tok: Arc<crate::dsv41::tokenizer::Tokenizer>, log: bool) -> Engine {
         let eos = model.cfg.eos_token_id;
+        let (user, assistant) = (tok.special(crate::dsv41::chat::USER), tok.special(crate::dsv41::chat::ASSISTANT));
         // (OAIY_DSV41_NO_WARM: leave the drive alone between requests: neither the idle reading nor the rebalance,
         // which reads a record for each expert a card gives up)
         let idle = std::env::var_os("OAIY_DSV41_NO_WARM").is_none();
@@ -164,6 +187,9 @@ impl Engine {
             tok,
             covered: Vec::new(),
             checkpoint: None,
+            system: None,
+            user,
+            assistant,
             eos,
             log,
             warm,
@@ -410,6 +436,7 @@ impl Engine {
             if job.wipe {
                 self.covered.clear();
                 self.checkpoint = None;
+                self.system = None;
                 let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
                 continue;
             }
@@ -419,12 +446,14 @@ impl Engine {
                 // The state's extent is unknown after a failure: start clean.
                 self.covered.clear();
                 self.checkpoint = None;
+                self.system = None;
                 let _ = job.events.send(Event::Error(e.to_string()));
             }
             // Incognito: nothing of it is kept for the next request.
             if job.forget {
                 self.covered.clear();
                 self.checkpoint = None;
+                self.system = None;
             }
             match before {
                 Some(counts) => drop(self.model.expert_uses().seed(&counts)),
@@ -524,10 +553,12 @@ impl Engine {
         }
         let at_start = read_so_far(&self.model);
         let common = self.covered.iter().zip(prompt).take_while(|(a, b)| a == b).count();
-        // The live state, or the last prompt's checkpoint: whichever serves more of this prompt.
+        // The live state, the last prompt's checkpoint or the state at the end of a system turn: whichever serves more
+        // of this prompt.
         let live = reusable(&self.covered, prompt);
         let kept = self.checkpoint.as_ref().map_or(0, |(tokens, _)| reusable(tokens, prompt));
-        let start = if kept > live {
+        let system = self.system.as_ref().map_or(0, |(tokens, ..)| reusable(tokens, prompt));
+        let start = if kept > live && kept >= system {
             let (tokens, state) = self.checkpoint.as_ref().expect("a checkpoint serves it");
             self.model.restore(state);
             self.covered.clone_from(tokens);
@@ -535,6 +566,14 @@ impl Engine {
                 d.set_keys(keys);
             }
             kept
+        } else if system > live {
+            let (tokens, state, keys) = self.system.as_ref().expect("a system turn's state serves it");
+            self.model.restore(state);
+            self.covered.clone_from(tokens);
+            if let (Some(d), Some(keys)) = (self.drafter.as_mut(), keys) {
+                d.set_keys(keys);
+            }
+            system
         } else {
             live
         };
@@ -548,17 +587,22 @@ impl Engine {
         // is a drafter, each pass's rows give it its keys of the trunk.
         let targets: Vec<usize> = self.drafter.as_ref().map(|d| d.targets().to_vec()).unwrap_or_default();
         let last = prompt.len() - 1;
+        // (a conversation's first long system turn read up to its end first, its state kept there: incognito, nothing is)
+        let system_end = system_end(prompt, self.user, self.assistant, start, last).filter(|_| !job.forget);
         let mut pos = start;
         while pos < last {
             if job.cancel.load(Ordering::Relaxed) {
                 let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
                 return Ok(());
             }
-            let take = PREFILL_CHUNK.min(last - pos);
+            let take = PREFILL_CHUNK.min(last - pos).min(system_end.filter(|&end| end > pos).map_or(usize::MAX, |end| end - pos));
             self.read(&prompt[pos..pos + take], pos, &targets)?;
             self.covered.extend_from_slice(&prompt[pos..pos + take]);
             pos += take;
             let _ = job.events.send(Event::Progress { done: pos - start, total });
+            if system_end == Some(pos) {
+                self.system = Some((self.covered.clone(), self.model.checkpoint(), self.drafter.as_ref().map(|d| d.keys())));
+            }
         }
         if !job.forget {
             self.checkpoint = Some((self.covered.clone(), self.model.checkpoint()));
@@ -710,5 +754,62 @@ impl Engine {
         }
         let _ = job.events.send(Event::Done { finish, completion_tokens: n.get() });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const USER: u32 = 9;
+    const ASSISTANT: u32 = 8;
+
+    /// A conversation's first prompt: `system` tokens, then a user turn (`USER`) of `rest`, then the reply's opening
+    /// (`ASSISTANT`).
+    fn prompt(system: usize, rest: usize) -> Vec<u32> {
+        let mut p = vec![1; system];
+        p.push(USER);
+        p.extend(std::iter::repeat_n(2, rest));
+        p.push(ASSISTANT);
+        p
+    }
+
+    fn end(p: &[u32], start: usize) -> Option<usize> {
+        system_end(p, Some(USER), Some(ASSISTANT), start, p.len() - 1)
+    }
+
+    #[test]
+    fn a_long_system_turns_state_is_kept_at_its_end() {
+        let p = prompt(20000, 40);
+        assert_eq!(end(&p, 0), Some(20000), "at the user turn's token");
+        assert_eq!(end(&p, 20000), None, "not where a state already serves it");
+        assert_eq!(end(&p, 20010), None);
+        assert_eq!(end(&prompt(100, 40), 0), None, "a short turn is read again");
+        let mut bare = vec![1; 20000];
+        bare.push(USER);
+        assert_eq!(end(&bare, 0), None, "not the token the reply's logits come from");
+        assert_eq!(system_end(&p, None, Some(ASSISTANT), 0, p.len() - 1), None, "a tokenizer without the token");
+        assert_eq!(end(&[vec![1; 20000], vec![ASSISTANT]].concat(), 0), None, "a prompt with no user turn");
+    }
+
+    #[test]
+    fn a_conversations_later_prompts_keep_no_system_state() {
+        // (its first step's reply and a tool's result, then the next step's opening: and the same with instructions a
+        // guide grew, which must not take the place of the ones a new run starts with)
+        let mut later = prompt(20000, 40);
+        later.extend([5, 5, USER, 2, 2, ASSISTANT]);
+        assert_eq!(end(&later, 0), None);
+        let mut grown = vec![1; 22000];
+        grown.extend_from_slice(&later[20000..]);
+        assert_eq!(end(&grown, 0), None);
+    }
+
+    #[test]
+    fn a_new_conversation_with_the_same_system_turn_reads_on_from_its_state() {
+        let (first, second) = (prompt(20000, 40), prompt(20000, 3));
+        let kept = first[..20000].to_vec();
+        assert_eq!(reusable(&kept, &second), 20000);
+        // (the last prompt's checkpoint, a conversation of its own, serves none of it)
+        assert_eq!(reusable(&first[..first.len() - 1], &second), 0);
     }
 }
