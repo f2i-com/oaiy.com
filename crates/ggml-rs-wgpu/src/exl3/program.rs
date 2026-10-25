@@ -78,6 +78,11 @@ pub enum ProgramStep<'a> {
     /// The first `scores` the word `word` of `pos` counts that lie in a block `blocks` does not keep (a
     /// [`ProgramStep::BlockKeep`]'s, blocks of `bs`) made -infinity in place, as the host masks a later index source's.
     MaskBlocks { scores: usize, blocks: usize, bs: usize, pos: usize, word: u32 },
+    /// [`ProgramStep::IndexScores`] of a prompt's `rows` rows (`q` `[rows, heads, dim]`, `weights` `[rows, heads]` with
+    /// their scale made and rounded to bf16 already) against the first keys of `keys` the word `word` of `pos` counts (no
+    /// more than `n`), every key a row's: the host's `index_scores`, to the bit, `[rows, count]` from the vector's start
+    /// (`[rows, n]` long, so a run of any count is the same program).
+    IndexScoresRows { q: usize, keys: usize, weights: usize, rows: usize, heads: usize, dim: usize, n: usize, pos: usize, word: u32 },
     /// A decode step's attention of `heads` queries of `dim` (`q`, rotated) over the window's `win` slots (`window`,
     /// `[win, dim]`: the ring, the position the word `word` of `pos` says) and, where `compressed` is `(rows, picks,
     /// count)`, the `count` rows of `rows` that `picks` names (u32, `u32::MAX` none): the host's `sparse_attend`, with
@@ -338,13 +343,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// Every kernel of a decode step's attention on the device ([`ProgramStep::Rope`] to [`ProgramStep::HcMix`]) made now,
 /// on `b`: made as a model's first reply needed them, they were some seconds of it.
 pub fn make_attention_kernels(b: &WgpuBackend) {
-    let kernels: [(&'static str, &'static str); 16] = [
+    let kernels: [(&'static str, &'static str); 17] = [
         ("ds-rope", attend::DS_ROPE),
         ("ds-fp8", attend::DS_FP8),
         ("ds-fp4", attend::DS_FP4),
         ("ds-put-row", attend::DS_PUT),
         ("ds-pool", attend::DS_POOL),
         ("ds-index-scores", attend::DS_INDEX_SCORES),
+        ("ds-index-scores-rows", attend::DS_INDEX_SCORES_ROWS),
         ("ds-topk", attend::DS_TOPK),
         ("ds-block-best", attend::DS_BLOCK_BEST),
         ("ds-block-flags", attend::DS_BLOCK_FLAGS),
@@ -452,6 +458,10 @@ fn run_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize,
                 (ok && before(*keys)? >= *dim).then_some(before(*keys)? / dim)?
             }
             ProgramStep::TopK { scores, dst, k, pos, word } => (*k > 0 && before(*scores)? > 0 && before(*dst)? >= *k && before(*pos)? > *word as usize).then_some(0)?,
+            ProgramStep::IndexScoresRows { q, keys, weights, rows, heads, dim, n, pos, word } => {
+                let ok = (1..=65535).contains(rows) && (1..=64).contains(heads) && 256 % heads == 0 && *dim > 0 && dim % 8 == 0 && heads * dim <= 4096 && *n > 0;
+                (ok && before(*q)? >= rows * heads * dim && before(*weights)? >= rows * heads && before(*keys)? >= n * dim && before(*pos)? > *word as usize).then_some(rows * n)?
+            }
             ProgramStep::BlockKeep { scores, blocks, k, bs, pos, word } => {
                 let most = before(*scores)?.div_ceil((*bs).max(1));
                 (*k > 0 && *bs > 0 && before(*blocks)? > most && before(*pos)? > *word as usize).then_some(most)?
@@ -564,6 +574,12 @@ fn run_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize,
             }
             ProgramStep::TopK { scores, dst, k, pos, word } => {
                 rec.dispatch_wide("ds-topk", attend::DS_TOPK, [&buf(v(*scores)), &dummy, &dummy, &buf(v(*pos)), &dummy, &dummy, &buf(v(*dst)), &drw], &[*k as u32, *word, 0], (1, 1, 1));
+            }
+            ProgramStep::IndexScoresRows { q, keys, weights, rows, heads, dim, n, pos, word } => {
+                // (the workgroups over the keys there is room for, `256 / heads` a pass each, up to 256; a row each along y)
+                let groups = (*n as u32).div_ceil((256 / heads) as u32).clamp(1, 256);
+                let words = [*heads as u32, *dim as u32, *word, 0, groups];
+                rec.dispatch_wide("ds-index-scores-rows", attend::DS_INDEX_SCORES_ROWS, [&buf(v(*q)), &buf(v(*keys)), &buf(v(*weights)), &buf(v(*pos)), &dummy, &dummy, &buf(v(i)), &drw], &words, (groups, *rows as u32, 1));
             }
             ProgramStep::BlockKeep { scores, blocks, k, bs, pos, word } => {
                 // (each block's best and the count, the best blocks picked by their count, word 0 of `blocks`, then flagged)
@@ -698,6 +714,7 @@ fn arena(b: &WgpuBackend, steps: &[ProgramStep<'_>], lens: &[usize]) -> Arc<Mute
             ProgramStep::Pool { kv, score, ratio, width } => (16u8, [*kv, *score, *ratio, *width]).hash(&mut h),
             ProgramStep::IndexScores { q, keys, weights, heads, dim, scale, pos, word } => (17u8, [*q, *keys, *weights, *heads, *dim, *pos], scale.to_bits(), *word).hash(&mut h),
             ProgramStep::TopK { scores, dst, k, pos, word } => (18u8, [*scores, *dst, *k, *pos], *word).hash(&mut h),
+            ProgramStep::IndexScoresRows { q, keys, weights, rows, heads, dim, n, pos, word } => (25u8, [*q, *keys, *weights, *rows, *heads, *dim, *n, *pos], *word).hash(&mut h),
             ProgramStep::BlockKeep { scores, blocks, k, bs, pos, word } => (23u8, [*scores, *blocks, *k, *bs, *pos], *word).hash(&mut h),
             ProgramStep::MaskBlocks { scores, blocks, bs, pos, word } => (24u8, [*scores, *blocks, *bs, *pos], *word).hash(&mut h),
             ProgramStep::Attend { q, heads, dim, window, win, compressed, sink, scale, pos, word } => (19u8, [*q, *heads, *dim, *window, *win, *pos], *compressed, host(sink), scale.to_bits(), *word).hash(&mut h),

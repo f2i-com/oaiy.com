@@ -1187,7 +1187,10 @@ impl Attention {
         let wscale = (ihd as f32).powf(-0.5) * (inh as f32).powf(-0.5);
         let weights: Vec<f32> = weights.iter().map(|w| to_bf16(w * wscale)).collect();
 
-        let scores = index_scores(&q, keys, &weights, inh, ihd);
+        let scores = match (t > 1 && t * n_t >= 1 << 18).then(|| self.index_scores_on_card(&q, &states[src].index_k, n_t, &weights, t, inh, ihd)).flatten() {
+            Some(scores) => scores,
+            None => index_scores(&q, keys, &weights, inh, ihd),
+        };
         let role = if ix.is_candidate_source {
             CandidateRole::Source
         } else if ix.uses_candidates {
@@ -1197,6 +1200,51 @@ impl Attention {
         };
         select_compressed(cfg, &scores, t, n_t, start_pos, ratio, offset, role, shared)
             .map_err(|e| Error::Format(format!("layer {}: {e}", self.layer)))
+    }
+
+    /// [`index_scores`] of a prompt's `t` rows against the first `n` of `keys` (the layer's whole cache, `[.., ihd]`) on
+    /// the card the layer's queries' projection is on (`wq_b`'s), in pieces of [`CARD_ROWS`] rows, the same bits: the
+    /// host's took 114 s of a 22,692-token prompt's 662, as the square of its length. Each piece the same program
+    /// whatever the count (the last one padded, the cache whole, the count a word), so the device keeps its vectors
+    /// from one to the next: a new program's at each count left the card's memory to its allocator, which took 2 GB
+    /// more through that prompt and ran out. None where the card does not take it (the host's then;
+    /// OAIY_DSV41_PROMPT_INDEX=0: always the host's).
+    #[allow(clippy::too_many_arguments)]
+    fn index_scores_on_card(&self, q: &[f32], keys: &[f32], n: usize, weights: &[f32], t: usize, inh: usize, ihd: usize) -> Option<Vec<f32>> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("OAIY_DSV41_PROMPT_INDEX").as_deref() != Ok("0")) {
+            return None;
+        }
+        let scoring = std::time::Instant::now();
+        let (cap, count) = (keys.len() / ihd, [f32::from_bits(n as u32)]);
+        let mut out = Vec::with_capacity(t * n);
+        let (mut qp, mut wp) = (Vec::new(), Vec::new());
+        for r0 in (0..t).step_by(CARD_ROWS) {
+            let rows = CARD_ROWS.min(t - r0);
+            let (qs, ws) = (&q[r0 * inh * ihd..(r0 + rows) * inh * ihd], &weights[r0 * inh..(r0 + rows) * inh]);
+            // (a last piece padded to the others' rows: its own count of them was a program of its own)
+            let (qs, ws) = if rows < CARD_ROWS {
+                qp.clear();
+                qp.extend_from_slice(qs);
+                qp.resize(CARD_ROWS * inh * ihd, 0.0);
+                wp.clear();
+                wp.extend_from_slice(ws);
+                wp.resize(CARD_ROWS * inh, 0.0);
+                (&qp[..], &wp[..])
+            } else {
+                (qs, ws)
+            };
+            let steps = [
+                crate::dsv41::linear::Step::Input(qs),
+                crate::dsv41::linear::Step::Input(keys),
+                crate::dsv41::linear::Step::Input(ws),
+                crate::dsv41::linear::Step::Input(&count),
+                crate::dsv41::linear::Step::IndexScoresRows { q: 0, keys: 1, weights: 2, rows: CARD_ROWS, heads: inh, dim: ihd, n: cap, pos: 3, word: 0 },
+            ];
+            out.extend(crate::dsv41::linear::run_program_on(&self.wq_b, &steps, &[(4, 0, rows * n)])?.pop()?);
+        }
+        crate::dsv41::profile::add(crate::dsv41::profile::Part::IndexScores, scoring);
+        Some(out)
     }
 
     /// Whether this layer's attention needs its own compressed-KV / indexer

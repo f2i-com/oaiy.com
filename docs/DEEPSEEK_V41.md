@@ -1226,6 +1226,16 @@ started afresh, read it back and gave its first word after 12.8 s, the same repl
 process's own new conversation (its RAM tier not yet filled, the reply itself at 2.3 tok/s). Not
 where a drafter runs (its keys are not kept) or for an incognito request.
 
+A prompt's index scores are made on the card too (`ProgramStep::IndexScoresRows`, a row a workgroup's
+`y`, each key's score the host's `index_scores`' to the bit; test
+a_prompts_index_scores_on_the_device_are_the_hosts), downloaded, and the host picks from them as
+before: in pieces of 512 rows, each the same program whatever the count (the last padded, the layer's
+whole cache uploaded, the count a word), so the device keeps its vectors from one to the next. Made
+as a new program at each count, the card's memory grew 2 GB through the 22,692-token prompt and ran
+out (`OAIY_DSV41_PROMPT_INDEX=0`: the host's). That prompt read in 570.6 s where 648 to 705, its index
+scores 18.9 s where 114 (the indexer 35.8 where 131), its replies the same text; the first card's
+memory at most 30.8 GB.
+
 ## The host's experts, faster (2026-10-26)
 
 An EXL3 checkpoint's cards hold some 3,760 of its 15,360 experts (a 2-bit GGUF's 5,500), so a reply

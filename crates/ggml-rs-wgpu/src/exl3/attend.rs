@@ -387,6 +387,61 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 "#
 );
 
+/// `IndexScoresRows`' kernel: [`DS_INDEX_SCORES`] of a prompt's rows, a workgroup's `y` its row (`q` and the weights
+/// its own, `[rows, heads, dim]` and `[rows, heads]`, the weights' scale made already), every one of the first `n` keys
+/// (`n` its word's) scored as the host's `index_scores` scores them, to the bit: `[rows, n]` from the vector's start.
+/// `p[0]` = (heads, dim, the count's word), `p[1].x` the grid's workgroups along the keys.
+pub(super) const DS_INDEX_SCORES_ROWS: &str = concat!(
+    exact_fns!(),
+    r#"
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> keys: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> words: array<u32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> qt: array<f32, 4096>;
+var<workgroup> ws: array<f32, 64>;
+var<workgroup> dots: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let heads = p[0].x;
+    let dim = p[0].y;
+    let n = words[p[0].z];
+    let row = wg.y;
+    for (var i = t; i < heads * dim; i += 256u) { qt[(i % dim) * heads + i / dim] = q[row * heads * dim + i]; }
+    if (t < heads) { ws[t] = w[row * heads + t]; }
+    workgroupBarrier();
+    let per = 256u / heads;
+    let h = t % heads;
+    let slot = t / heads;
+    for (var base = wg.x * per; base < n; base += p[1].x * per) {
+        let k = base + slot;
+        var dot = 0.0;
+        if (slot < per && k < n) {
+            let at = k * dim;
+            // (eight of the key's values read before their adds, the adds in order)
+            for (var d0 = 0u; d0 < dim; d0 += 8u) {
+                var kv: array<f32, 8>;
+                for (var j = 0u; j < 8u; j++) { kv[j] = keys[at + d0 + j]; }
+                for (var j = 0u; j < 8u; j++) { dot += qt[(d0 + j) * heads + h] * kv[j]; }
+            }
+        }
+        dots[t] = dot;
+        workgroupBarrier();
+        if (h == 0u && slot < per && k < n) {
+            var acc = 0.0;
+            for (var j = 0u; j < heads; j++) { acc += bf16(max(bf16(dots[slot * heads + j]), 0.0) * ws[j]); }
+            out[row * n + k] = bf16(acc);
+        }
+        workgroupBarrier();
+    }
+}
+"#
+);
+
 /// `TopK`'s kernel, one workgroup: the `k` best of the first `n` scores (`n` its word's), by the host's order (a score's
 /// total order, ties to the lower position: bf16 values, so their upper 16 bits), into `dst` in position order (`+
 /// offset`), `0xffffffff` past them; all of them where there are no more than `k`. The `k`-th best's key by its upper

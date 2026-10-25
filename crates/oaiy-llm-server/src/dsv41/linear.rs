@@ -189,6 +189,10 @@ pub enum Step<'a> {
     /// The first `scores` the word `word` of `pos` counts outside the blocks `blocks` keeps made -infinity in place, as
     /// [`crate::dsv41::attention::select_compressed`] masks a later index source's row.
     MaskBlocks { scores: usize, blocks: usize, bs: usize, pos: usize, word: u32 },
+    /// [`crate::dsv41::attention::index_scores`] of a prompt's `rows` rows (`q` `[rows, heads, dim]`, `weights` `[rows,
+    /// heads]` as the host passes them) against the first keys of `keys` the word `word` of `pos` counts (no more than
+    /// `n`), to the bit: `[rows, count]` from the vector's start, `[rows, n]` long.
+    IndexScoresRows { q: usize, keys: usize, weights: usize, rows: usize, heads: usize, dim: usize, n: usize, pos: usize, word: u32 },
     /// A decode step's [`crate::dsv41::attention::sparse_attend`] of every head of `q` over the window's `win` slots
     /// and, where `compressed` is `(rows, picks, count)`, the rows of `rows` that `picks` names: `[heads, dim]`, rounded
     /// to bf16 and not rotated back, its exponentials the device's own.
@@ -229,6 +233,14 @@ pub fn run_program_once(steps: &[Step<'_>], reads: &[(usize, usize, usize)]) -> 
     let made = first.run_program_once(steps, reads)?;
     crate::dsv41::profile::add(crate::dsv41::profile::Part::DeviceDense, start);
     Some(made)
+}
+
+/// [`run_program`] on the device `on` (a weight of the caller's) is on: a program that multiplies by no matrix (a
+/// prompt's index scores), its vectors the device's to keep for its next run. None where `on` is not on a device or
+/// the device does not take the program.
+pub fn run_program_on(on: &Weight, steps: &[Step<'_>], reads: &[(usize, usize, usize)]) -> Option<Vec<Vec<f32>>> {
+    let Weight::Device { kernel, .. } = on else { return None };
+    kernel.run_program(steps, reads)
 }
 
 /// [`run_program`] in two parts ([`DenseKernel::run_program_parts`]) on the device `on` (one of the program's weights)

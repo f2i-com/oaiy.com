@@ -139,6 +139,37 @@ fn the_indexers_scores_and_picks_on_the_device_are_the_hosts() {
     }
 }
 
+/// A prompt's index scores on the device (`IndexScoresRows`) are the host's (`index_scores` of every row against every
+/// key) to the bit: queries and keys fp4 as the indexer makes them, each row its own weights, keys of few values.
+#[test]
+#[ignore = "needs a WebGPU adapter"]
+fn a_prompts_index_scores_on_the_device_are_the_hosts() {
+    let b = gpu();
+    let mut r = Values(0x94d0_49bb_1331_11eb);
+    let (heads, dim) = (32usize, 128usize);
+    for (rows, n, coarse) in [(37usize, 3000usize, false), (600, 700, true), (5, 9000, false)] {
+        let mut q = r.bf16(rows * heads * dim, 2.0);
+        fake_quant_fp4_inplace(&mut q, 32, Fp4Scale::E8M0);
+        let mut keys = r.bf16(n * dim, if coarse { 0.01 } else { 1.0 });
+        if coarse {
+            for i in 0..n * dim {
+                keys[i] = keys[(i / dim % 5) * dim + i % dim];
+            }
+        }
+        fake_quant_fp4_inplace(&mut keys, 32, Fp4Scale::E8M0);
+        let scale = (dim as f32).powf(-0.5) * (heads as f32).powf(-0.5);
+        let weights: Vec<f32> = r.bf16(rows * heads, 1.0).iter().map(|v| to_bf16(v * scale)).collect();
+        let want = crate::dsv41::attention::index_scores(&q, &keys, &weights, heads, dim);
+        // (a cache with room past the count, as a layer's whole cache is)
+        let mut cache = keys.clone();
+        cache.resize((n + 1000) * dim, 7.0);
+        let wd = words(&[n]);
+        let steps = [G::Input(&q), G::Input(&cache), G::Input(&weights), G::Input(&wd), G::IndexScoresRows { q: 0, keys: 1, weights: 2, rows, heads, dim, n: n + 1000, pos: 3, word: 0 }];
+        let got = run_program(&b, &steps, &[(4, 0, rows * n)]).expect("a program");
+        assert_eq!(bits(&got[0]), bits(&want), "{rows} rows of {n} keys (coarse {coarse})");
+    }
+}
+
 /// The candidate blocks on the device (`BlockKeep` of the candidate source's scores, `MaskBlocks` of a later source's,
 /// then its `TopK`) are the host's (`candidate_mask`, `select_compressed`'s masking and picks): counts up to the 2,048
 /// blocks of 8 that keep every position, at them and past them, scores of few values so that blocks tie often.
