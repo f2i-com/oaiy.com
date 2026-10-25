@@ -923,16 +923,20 @@ impl Moe {
             }
             drop(out_tx);
             if let Some(gpu) = gpu {
+                // What the cards hold, made on a thread of its own while the rest are put through their scratch slots
+                // here: one waited for the other before (an agent's step of 470 tokens: its held experts 2.8 s, then
+                // the others' uploads and calls 4.4 s). The same calls, so the same outputs.
                 let there: Vec<usize> = (0..n).filter(|&j| held[j]).collect();
-                for part in there.chunks(GPU_GROUP) {
-                    let jobs: Vec<(u32, &[f32], &[f32])> = part.iter().map(|&j| (used[j], &gathered[j].1[..], &gathered[j].2[..])).collect();
-                    let computing = std::time::Instant::now();
-                    let got = gpu.forward_held(self.layer, &jobs, cfg.swiglu_limit);
-                    crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertGpu, computing);
-                    for (&j, out) in part.iter().zip(got) {
-                        done[j] = Some(out);
+                let layer = self.layer;
+                let holding = scope.spawn(move || {
+                    let mut made: Vec<(usize, Vec<f32>)> = Vec::with_capacity(there.len());
+                    // (timed by the kernel itself as its held experts, beside this thread's other work)
+                    for part in there.chunks(GPU_GROUP) {
+                        let jobs: Vec<(u32, &[f32], &[f32])> = part.iter().map(|&j| (used[j], &gathered[j].1[..], &gathered[j].2[..])).collect();
+                        made.extend(part.iter().copied().zip(gpu.forward_held(layer, &jobs, cfg.swiglu_limit)));
                     }
-                }
+                    made
+                });
                 // then the most tokens' of what has landed, a group at a time, until nothing of its kind is left
                 loop {
                     let group: Vec<(usize, HostLease)> = {
@@ -963,6 +967,11 @@ impl Moe {
                         done[*j] = Some(out);
                     }
                 }
+                let waiting = std::time::Instant::now();
+                for (j, out) in holding.join().expect("the held experts' thread panicked") {
+                    done[j] = Some(out);
+                }
+                crate::dsv41::profile::add(crate::dsv41::profile::Part::ExpertGpu, waiting);
             }
             let waiting = std::time::Instant::now();
             let mut made = 0usize;
