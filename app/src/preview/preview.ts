@@ -228,8 +228,43 @@ export class Preview {
   /** Set by the page: ask the agent to fix what is shown. Returns false when the agent is busy. */
   onFix: ((target: PreviewTarget, problems: Problem[]) => boolean) | null = null;
 
+  /** Shows the preview over the whole screen (or OAIY's whole window, where the screen cannot be had), and back. */
+  private readonly fullButton = h('button.preview-full', { title: 'Show the app or page over the whole screen (Esc to leave)', onclick: () => this.setFull(!this.full) }, '⛶ Full screen');
+
+  /** Whether the preview fills the screen ([`Preview::setFull`]). */
+  get full(): boolean {
+    return this.element.classList.contains('full');
+  }
+
+  /**
+   * The preview over the whole screen, or back in its pane. The screen's own full-screen mode where the window may
+   * take it; OAIY's whole window otherwise (the class alone does that). Esc leaves either: the screen's by itself,
+   * the window's by the key here (or in the frame, which cannot be heard here: the button then).
+   */
+  setFull(on: boolean): void {
+    if (on === this.full) return;
+    this.element.classList.toggle('full', on);
+    this.fullButton.textContent = on ? '✕ Leave full screen' : '⛶ Full screen';
+    this.fullButton.title = on ? 'Back to the pane (Esc)' : 'Show the app or page over the whole screen (Esc to leave)';
+    if (on) {
+      void this.element.requestFullscreen?.().catch(() => {
+        /* the window stays as it is: the preview fills it */
+      });
+    } else if (document.fullscreenElement === this.element) {
+      void document.exitFullscreen().catch(() => {});
+    }
+    this.layout();
+  }
+
   constructor(private vfs: Vfs, private readonly projectId: () => string) {
     const reload = h('button', { title: 'Render it again', onclick: () => this.render() }, '↻ Reload');
+    // (the screen's full-screen mode left by Esc or otherwise: back in the pane; Esc in OAIY's window leaves its own)
+    document.addEventListener('fullscreenchange', () => {
+      if (!document.fullscreenElement && this.full) this.setFull(false);
+    });
+    window.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && this.full && !document.fullscreenElement) this.setFull(false);
+    });
     this.picker.addEventListener('change', () => {
       const [kind, ...rest] = this.picker.value.split(':');
       const value = rest.join(':');
@@ -270,7 +305,7 @@ export class Preview {
     window.addEventListener('message', (event) => this.fromBridge(event));
     new ResizeObserver(() => this.layout()).observe(this.frameHost);
     this.frameHost.append(this.stage);
-    this.element.append(h('div.pane-title', 'Preview ', this.picker, this.sizePicker, this.sizeCustom, this.sizeNote, this.status, reload), this.banner, this.frameHost);
+    this.element.append(h('div.pane-title', 'Preview ', this.picker, this.sizePicker, this.sizeCustom, this.sizeNote, this.status, reload, this.fullButton), this.banner, this.frameHost);
     this.picker.hidden = true;
     this.sizeCustom.hidden = true;
     this.showMessage('Open a web page (an .html file), a 3D model (a .glb file) or a SoftN app (/softn new) to see it here.');

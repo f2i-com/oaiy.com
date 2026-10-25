@@ -30,6 +30,15 @@
     }
   };
 
+  // --- scrolling ----------------------------------------------------------------
+  // A SoftN app taller than the preview scrolls in it: SoftN's App fills the window with its overflow hidden, so
+  // what lay past the window's bottom was cut off and could not be reached. Its own layout is kept (its height the
+  // window's), only what overflows it scrolls, with SoftN's own scroll bars; an app as it is exported keeps SoftN's.
+  const scrolling = document.createElement('style');
+  scrolling.setAttribute('data-bot-computer-scrolling', '');
+  scrolling.textContent = '.softn-app { overflow: auto !important; }';
+  (document.head || document.documentElement).appendChild(scrolling);
+
   // --- errors -----------------------------------------------------------------
   const format = (value) => {
     if (value instanceof Error) return `${value.name}: ${value.message}${value.stack ? `\n${value.stack.split('\n').slice(1, 4).join('\n')}` : ''}`;

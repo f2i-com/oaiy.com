@@ -155,6 +155,36 @@ try {
     await frame.waitForFunction(() => document.body.innerText.includes('1 remaining') && document.body.innerText.includes('Buy milk'), { timeout: 10_000 });
   });
 
+  await check('an app taller than the preview scrolls in it (SoftN cuts it off at the window)', async () => {
+    const frame = appFrame(page);
+    const scroll = await frame.evaluate(() => {
+      const app = document.querySelector('.softn-app');
+      if (!app) return null;
+      const tall = document.createElement('div');
+      tall.style.height = '3000px';
+      app.appendChild(tall);
+      const overflow = getComputedStyle(app).overflowY;
+      app.scrollTop = 500;
+      const top = app.scrollTop;
+      tall.remove();
+      return { overflow, top };
+    });
+    expect(scroll && scroll.overflow === 'auto' && scroll.top > 0, `the app root: ${JSON.stringify(scroll)}`);
+  });
+
+  await check('the preview goes full screen and back', async () => {
+    await page.click('.preview-full');
+    const full = await page.$eval('.preview', (e) => {
+      const r = e.getBoundingClientRect();
+      return { full: e.classList.contains('full'), width: r.width, height: r.height, w: window.innerWidth, h: window.innerHeight };
+    });
+    expect(full.full && full.width >= full.w - 1 && full.height >= full.h - 1, `full: ${JSON.stringify(full)}`);
+    if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT.replace('.png', '-full-screen.png') });
+    await page.click('.preview-full');
+    const back = await page.$eval('.preview', (e) => ({ full: e.classList.contains('full'), width: e.getBoundingClientRect().width }));
+    expect(!back.full && back.width < full.w - 1, `back: ${JSON.stringify(back)}`);
+  });
+
   await check('an edit from the terminal re-renders the preview', async () => {
     const status = await afterRender(page, () => terminal(page, 'sed -i "s/>Tasks</>Groceries</" index.html'), 'after edit');
     expect(/live/.test(status), status);
