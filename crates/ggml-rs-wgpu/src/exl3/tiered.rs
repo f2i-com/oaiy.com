@@ -192,7 +192,7 @@ fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> s
 }
 
 /// mul1's multiplier, as a checkpoint stores it (an i32's bytes).
-const MUL1: [u8; 4] = 0x83dc_d12du32.to_le_bytes();
+pub(super) const MUL1: [u8; 4] = 0x83dc_d12du32.to_le_bytes();
 
 /// A record's projection's transforms: its scales as f32, the maps the identity.
 pub(super) fn transform(record: &[u8], p: &ProjAt) -> Transform {

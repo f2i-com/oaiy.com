@@ -1226,6 +1226,31 @@ started afresh, read it back and gave its first word after 12.8 s, the same repl
 process's own new conversation (its RAM tier not yet filled, the reply itself at 2.3 tok/s). Not
 where a drafter runs (its keys are not kept) or for an incognito request.
 
+## The host's experts, faster (2026-10-26)
+
+An EXL3 checkpoint's cards hold some 3,760 of its 15,360 experts (a 2-bit GGUF's 5,500), so a reply
+misses more of them, and the host's cores make most of a layer's misses (`step_experts_host`). One
+thread makes an expert's sums at 11.6 billion weights a second, twelve at half that each: a task took
+a block of eight tile columns down every tile row, so it read 768 bytes of each row's 14 KB, the
+team's eighteen tasks at once. A task now takes a split's tile rows (which lie together in the
+record) over a part of the columns, and each block's splits are added in order after, as
+`ProjAt::step_sums` adds them; and the inputs' and outputs' roundings to f16 go sixteen at a time
+(each value's own conversion was most of an input's time). The same bits (tests:
+the_hosts_step_experts_together_are_each_alone, the_hosts_vector_sums_are_its_emulations, both on the
+CPU alone, and a_steps_expert_on_the_host_is_the_cards_to_the_bit). An expert 0.49 ms alone where
+0.68, two 0.39 each where 0.61, six 0.43 where 0.59. The EXL3 checkpoint, no usage profile, the four
+asks' second rounds, two runs each in turn (old, new, new, old):
+
+| Reply | Before | After |
+|---|---|---|
+| A familiar subject | 17.2, 17.2 tok/s | 19.3, 19.4 tok/s |
+| Code | 11.3, 11.2 tok/s | 12.6, 12.6 tok/s |
+| The same again | 17.2, 17.2 tok/s | 19.4, 19.3 tok/s |
+| A new subject | 14.1, 14.1 tok/s | 16.2, 16.3 tok/s |
+
+Every reply the same text in all four runs. Sending all of a layer's misses to the cards measured
+slower (code 9.8 where 11.5), and all of them on the host within the noise of the share by time.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.

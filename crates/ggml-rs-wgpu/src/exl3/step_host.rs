@@ -93,21 +93,73 @@ impl ProjAt {
     /// ([`silu_table`]'s for that limit), their product rounded to f16, then scaled, transformed and rounded as
     /// [`Self::prepare`] does a row.
     pub fn prepare_swiglu(&self, record: &[u8], gate: &[f32], up: &[f32], limit: f32, table: &[f32]) -> Vec<f32> {
-        let t = transform(record, self);
+        let scale = self.input_scales(record);
         let mut out: Vec<f32> = gate
             .iter()
             .zip(up)
-            .zip(&t.suh)
-            .map(|((&g, &u), &s)| {
+            .enumerate()
+            .map(|(i, (&g, &u))| {
                 let u = if limit > 0.0 { u.clamp(-limit, limit) } else { u };
-                half(table[f16_bits(g)] * u) * s
+                half(table[f16_bits(g)] * u) * scale(i)
             })
             .collect();
-        had(&mut out);
-        for v in out.iter_mut() {
-            *v = half(*v * ISQRT128);
-        }
+        transformed(&mut out);
         out
+    }
+
+    /// One row as [`Self::prepare`] makes it of a record (whose input map is the identity), its scales read from the
+    /// record as they are used, its roundings to f16 sixteen at a time where the CPU has AVX-512 (each value's own
+    /// conversion was most of a step's input's time).
+    pub fn prepare_row(&self, record: &[u8], x: &[f32]) -> Vec<f32> {
+        let scale = self.input_scales(record);
+        let mut out = vec![0f32; self.k];
+        scaled_halves(&x[..self.k], &record[self.suh..self.suh + 2 * self.k], &mut out, &scale);
+        transformed(&mut out);
+        out
+    }
+
+    /// The input's scales (`suh`, f16 values in the record), by index; the record's codebook checked first.
+    fn input_scales<'r>(&self, record: &'r [u8]) -> impl Fn(usize) -> f32 + 'r {
+        assert_eq!(record[self.mul1..self.mul1 + 4], MUL1, "an expert's projection of a codebook other than mul1");
+        let at = self.suh;
+        move |i| half::f16::from_bits(u16::from_le_bytes([record[at + 2 * i], record[at + 2 * i + 1]])).to_f32()
+    }
+}
+
+/// A scaled input row transformed and rounded as [`ProjAt::prepare`] makes it: the Hadamard transform of each block of
+/// 128, then each value scaled by 1/sqrt(128) and rounded to f16.
+fn transformed(out: &mut [f32]) {
+    had(out);
+    scaled_by(out, ISQRT128, None);
+}
+
+/// `out[i] = half(x[i]) * scale(i)` (`scales` the same scales as f16 bytes): a row's input as [`ProjAt::prepare`]
+/// scales it, sixteen at a time where the CPU has AVX-512 (the same roundings: a conversion to f16 rounds to nearest,
+/// ties to even, as `half` does).
+fn scaled_halves(x: &[f32], scales: &[u8], out: &mut [f32], scale: &dyn Fn(usize) -> f32) {
+    #[cfg(target_arch = "x86_64")]
+    if avx512::available() {
+        // SAFETY: the CPU has AVX-512 F (checked just above); the lengths are checked inside.
+        return unsafe { avx512::scaled_halves(x, scales, out) };
+    }
+    for (i, (o, &v)) in out.iter_mut().zip(x).enumerate() {
+        *o = half(v) * scale(i);
+    }
+}
+
+/// `v[i] = half(v[i] * by * s[i])`, `s` the f16 scales `scales` holds (none: 1, `half(v[i] * by)`): an output's or an
+/// input's last rounding, sixteen at a time where the CPU has AVX-512, the products in the same order.
+fn scaled_by(v: &mut [f32], by: f32, scales: Option<&[u8]>) {
+    #[cfg(target_arch = "x86_64")]
+    if avx512::available() {
+        // SAFETY: the CPU has AVX-512 F (checked just above); the lengths are checked inside.
+        return unsafe { avx512::scaled_by(v, by, scales) };
+    }
+    for (i, x) in v.iter_mut().enumerate() {
+        *x = match scales {
+            Some(s) => half(*x * by * half::f16::from_bits(u16::from_le_bytes([s[2 * i], s[2 * i + 1]])).to_f32()),
+            None => half(*x * by),
+        };
     }
 }
 
@@ -254,6 +306,62 @@ mod avx512 {
         })[tile_words]
             .as_ref()
             .expect("a whole number of bits a weight")
+    }
+
+    /// Sixteen f16 values from `bytes` (little-endian) as f32s.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn f16s(bytes: *const u8) -> __m512 {
+        _mm512_cvtph_ps(_mm256_loadu_si256(bytes as *const __m256i))
+    }
+
+    /// Sixteen values rounded to f16 (to nearest, ties to even) and back.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    fn round16(v: __m512) -> __m512 {
+        _mm512_cvtph_ps(_mm512_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v))
+    }
+
+    /// [`super::scaled_halves`] on the vectors.
+    ///
+    /// # Safety
+    /// The CPU must have AVX-512 F ([`available`]).
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn scaled_halves(x: &[f32], scales: &[u8], out: &mut [f32]) {
+        let n = out.len();
+        assert!(x.len() >= n && scales.len() >= 2 * n);
+        let whole = n / 16 * 16;
+        for i in (0..whole).step_by(16) {
+            let v = round16(_mm512_loadu_ps(x.as_ptr().add(i)));
+            _mm512_storeu_ps(out.as_mut_ptr().add(i), _mm512_mul_ps(v, f16s(scales.as_ptr().add(2 * i))));
+        }
+        for i in whole..n {
+            out[i] = super::half(x[i]) * half::f16::from_bits(u16::from_le_bytes([scales[2 * i], scales[2 * i + 1]])).to_f32();
+        }
+    }
+
+    /// [`super::scaled_by`] on the vectors.
+    ///
+    /// # Safety
+    /// The CPU must have AVX-512 F ([`available`]).
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn scaled_by(v: &mut [f32], by: f32, scales: Option<&[u8]>) {
+        let n = v.len();
+        assert!(scales.is_none_or(|s| s.len() >= 2 * n));
+        let (whole, b) = (n / 16 * 16, _mm512_set1_ps(by));
+        for i in (0..whole).step_by(16) {
+            let mut x = _mm512_mul_ps(_mm512_loadu_ps(v.as_ptr().add(i)), b);
+            if let Some(s) = scales {
+                x = _mm512_mul_ps(x, f16s(s.as_ptr().add(2 * i)));
+            }
+            _mm512_storeu_ps(v.as_mut_ptr().add(i), round16(x));
+        }
+        for i in whole..n {
+            v[i] = match scales {
+                Some(s) => super::half(v[i] * by * half::f16::from_bits(u16::from_le_bytes([s[2 * i], s[2 * i + 1]])).to_f32()),
+                None => super::half(v[i] * by),
+            };
+        }
     }
 
     #[inline]
@@ -410,23 +518,69 @@ pub fn step_experts_host(jobs: &[(&[u8], &[f32])], layout: &RecordLayout, limit:
         });
         out.into_iter().map(|o| o.into_inner().expect("every task ran")).collect()
     };
-    // each `(projection, job)`'s output, its tasks' blocks laid side by side
+    // each `(projection, job)`'s output: tasks of a split's tile rows over a part of the columns (a split's rows lie
+    // together in the record, so a task reads runs of a tile row's columns as they lie, where a task of one block's
+    // columns down every row read 768 bytes of each row's 14 KB, the team's eighteen at once: half the rate one thread
+    // reads them in order at), then each block's splits' sums added in order and its output transform made
     let pass = |which: &[(&ProjAt, &[Vec<f32>])]| -> Vec<Vec<Vec<f32>>> {
-        let tasks: Vec<(usize, usize, usize)> =
-            which.iter().enumerate().flat_map(|(w, (p, _))| (0..jobs.len()).flat_map(move |j| (0..p.n / 16).step_by(STEP_TASK_COLS).map(move |c| (w, j, c)))).collect();
-        let blocks = each(tasks.len(), &|i| {
-            let (w, j, c) = tasks[i];
+        let splits: Vec<usize> = which.iter().map(|(p, _)| step_splits(p.k, p.n)).collect();
+        let units = splits.iter().sum::<usize>() * jobs.len();
+        // (each projection's columns in parts of whole blocks: enough tasks for the team to share, a few each)
+        let spans: Vec<Vec<std::ops::Range<usize>>> = which
+            .iter()
+            .map(|(p, _)| {
+                let (cols, blocks) = (p.n / 16, (p.n / 16).div_ceil(STEP_TASK_COLS));
+                let per = blocks.div_ceil((3 * team.size()).div_ceil(units.max(1)).clamp(1, blocks)) * STEP_TASK_COLS;
+                (0..cols).step_by(per).map(|c| c..(c + per).min(cols)).collect()
+            })
+            .collect();
+        let (mut tasks, mut base) = (Vec::new(), Vec::new());
+        for w in 0..which.len() {
+            base.push(tasks.len());
+            for j in 0..jobs.len() {
+                for s in 0..splits[w] {
+                    for c in 0..spans[w].len() {
+                        tasks.push((w, j, s, c));
+                    }
+                }
+            }
+        }
+        let partials = each(tasks.len(), &|i| {
+            let (w, j, s, c) = tasks[i];
             let (p, xs) = which[w];
-            let cols = c..(c + STEP_TASK_COLS).min(p.n / 16);
-            p.finish_cols(jobs[j].0, p.step_sums(jobs[j].0, &xs[j], cols.clone(), fused), cols)
+            p.split_sums(jobs[j].0, &xs[j], s, spans[w][c].clone(), fused)
+        });
+        let mut blocks = Vec::new();
+        for (w, (p, _)) in which.iter().enumerate() {
+            for j in 0..jobs.len() {
+                for b in (0..p.n / 16).step_by(STEP_TASK_COLS) {
+                    blocks.push((w, j, b));
+                }
+            }
+        }
+        let made = each(blocks.len(), &|i| {
+            let (w, j, b) = blocks[i];
+            let p = which[w].0;
+            let cols = b..(b + STEP_TASK_COLS).min(p.n / 16);
+            let c = spans[w].iter().position(|r| r.contains(&b)).expect("a part holds every block");
+            let at = (b - spans[w][c].start) * 16;
+            // (as `ProjAt::step_sums` adds them: from 0, the splits in order)
+            let mut sums = vec![0f32; cols.len() * 16];
+            for s in 0..splits[w] {
+                let part = &partials[base[w] + (j * splits[w] + s) * spans[w].len() + c][at..at + sums.len()];
+                for (a, v) in sums.iter_mut().zip(part) {
+                    *a += v;
+                }
+            }
+            p.finish_cols(jobs[j].0, sums, cols)
         });
         let mut out: Vec<Vec<Vec<f32>>> = which.iter().map(|(p, _)| vec![vec![0f32; p.n]; jobs.len()]).collect();
-        for (&(w, j, c), b) in tasks.iter().zip(&blocks) {
-            out[w][j][c * 16..c * 16 + b.len()].copy_from_slice(b);
+        for (&(w, j, b), y) in blocks.iter().zip(&made) {
+            out[w][j][b * 16..b * 16 + y.len()].copy_from_slice(y);
         }
         out
     };
-    let mut xs = each(2 * jobs.len(), &|i| [&g, &u][i % 2].prepare(jobs[i / 2].0, jobs[i / 2].1, 1)).into_iter();
+    let mut xs = each(2 * jobs.len(), &|i| [&g, &u][i % 2].prepare_row(jobs[i / 2].0, jobs[i / 2].1)).into_iter();
     let (mut xg, mut xu) = (Vec::with_capacity(jobs.len()), Vec::with_capacity(jobs.len()));
     while let (Some(a), Some(b)) = (xs.next(), xs.next()) {
         xg.push(a);
@@ -444,15 +598,11 @@ impl ProjAt {
     /// makes them; the scales read from `record` for those columns alone.
     pub fn finish_cols(&self, record: &[u8], mut y: Vec<f32>, cols: std::ops::Range<usize>) -> Vec<f32> {
         assert!(cols.start % 8 == 0 && cols.len() % 8 == 0 && y.len() == cols.len() * 16, "whole blocks of 128 outputs");
-        for v in y.iter_mut() {
-            *v = half(*v);
-        }
+        // (each rounding sixteen at a time where the CPU has AVX-512: `scaled_by`)
+        scaled_by(&mut y, 1.0, None);
         had(&mut y);
         let at = self.svh + 2 * cols.start * 16;
-        for (i, v) in y.iter_mut().enumerate() {
-            let s = half::f16::from_bits(u16::from_le_bytes([record[at + 2 * i], record[at + 2 * i + 1]])).to_f32();
-            *v = half(*v * ISQRT128 * s);
-        }
+        scaled_by(&mut y, ISQRT128, Some(&record[at..at + 2 * cols.len() * 16]));
         y
     }
 }

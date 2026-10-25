@@ -498,6 +498,64 @@ fn the_one_row_kernels_sums_are_the_hosts_multiply_adds() {
     }
 }
 
+/// The host's vector sums of a step's row ([`ProjAt::step_sums`], AVX-512's where the CPU has it) are its emulation's
+/// with multiply-adds ([`one_row_sums`], which the test above holds to a card's) to the bit, at 2, 3 and 4 bits a weight,
+/// of every column and of a run of them: on the CPU alone.
+#[test]
+fn the_hosts_vector_sums_are_its_emulations() {
+    let (k, n) = (5120, 2304);
+    for tw in [32, 48, 64] {
+        let data = random_exl3(k, n, tw, 300 + tw as u32);
+        let record: Vec<u8> = data.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut s = 0x9e37_79b9u32;
+        let xh: Vec<f32> = (0..k)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                half((s % 20_001) as f32 / 10_000.0 - 1.0) * if s >> 28 == 0 { 40.0 } else { 1.0 }
+            })
+            .collect();
+        let want = one_row_sums(&data.words[..], k, n, tw, &xh, step_splits(k, n), 0..n / 16, true);
+        let p = ProjAt { suh: 0, svh: 0, mul1: 0, trellis: 0, k, n, tile_words: tw };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&p.step_sums(&record, &xh, 0..n / 16, true)), bits(&want), "tw={tw}: every column");
+        assert_eq!(bits(&p.step_sums(&record, &xh, 5..13, true)), bits(&want[5 * 16..13 * 16]), "tw={tw}: a run of columns");
+    }
+}
+
+/// A step's experts on the host's cores together ([`step_experts_host`]'s tasks of a split's rows) are each as the host
+/// makes it alone ([`step_expert_host`], which the test above holds to a card's) to the bit: one, two and three a call,
+/// at 3 bits a weight and at 2: on the CPU alone.
+#[test]
+fn the_hosts_step_experts_together_are_each_alone() {
+    let (hidden, ff, limit) = (5120, 2304, 10.0);
+    let table = silu_table(limit);
+    for tw in [48, 32] {
+        let (layout, records, _) = as_records(experts(3, hidden, ff, tw));
+        let xs: Vec<Vec<f32>> = (0..3u32)
+            .map(|e| {
+                let mut s = 0x2545_f491u32 ^ (e * 7919 + tw as u32);
+                (0..hidden)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 17;
+                        s ^= s << 5;
+                        ((s % 20_001) as f32 / 10_000.0 - 1.0) * [0.3f32, 2.0, 7.0][e as usize]
+                    })
+                    .collect()
+            })
+            .collect();
+        let alone: Vec<Vec<u32>> = (0..3).map(|e| step_expert_host(&records.0[e], &layout, &xs[e], limit, &table, true).iter().map(|v| v.to_bits()).collect()).collect();
+        for n in 1..=3 {
+            let jobs: Vec<(&[u8], &[f32])> = (0..n).map(|e| (&records.0[e][..], &xs[e][..])).collect();
+            for (e, y) in step_experts_host(&jobs, &layout, limit, true).iter().enumerate() {
+                assert_eq!(y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), alone[e], "tw={tw}: expert {e} of {n} a call");
+            }
+        }
+    }
+}
+
 /// What a decode step's experts cost on the host's cores (`--ignored --nocapture`) at DeepSeek-V4.1's shape (5120 to
 /// 2304, 3 bits): one, two and six experts a call, each its own record, records in turn past the caches as a step's are.
 #[test]
@@ -536,6 +594,18 @@ fn measure_step_experts_on_the_host() {
         drop(step_experts_host(&jobs[..1], &layout, limit, true));
     }
     eprintln!("1 expert a call, the same each time: {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / 60.0);
+    // one projection's sums on this thread alone (a gate's: 5120 by 2304), its weights a nanosecond
+    let data = random_exl3(hidden, ff, tw, 77);
+    let record: Vec<u8> = data.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ProjAt { suh: 0, svh: 0, mul1: 0, trellis: 0, k: hidden, n: ff, tile_words: tw };
+    let xh: Vec<f32> = (0..hidden).map(|i| half(((i * 37 % 101) as f32 - 50.0) / 60.0)).collect();
+    drop(p.step_sums(&record, &xh, 0..ff / 16, true));
+    let t = std::time::Instant::now();
+    for _ in 0..20 {
+        drop(p.step_sums(&record, &xh, 0..ff / 16, true));
+    }
+    let s = t.elapsed().as_secs_f64() / 20.0;
+    eprintln!("a projection's sums on one thread: {:.2} ms, {:.2} weights a ns", s * 1e3, (hidden * ff) as f64 / s / 1e9);
 }
 
 /// What putting experts into mapped (scratch) slots costs (`--ignored --nocapture`), at DeepSeek-V4.1's shape (13.3 MB a

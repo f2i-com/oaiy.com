@@ -44,6 +44,8 @@ pub(super) struct Team {
     shared: Arc<Shared>,
     /// One call at a time.
     turn: Mutex<()>,
+    /// Its threads, the caller's among them.
+    size: usize,
 }
 
 impl Team {
@@ -62,7 +64,12 @@ impl Team {
             // (a worker that cannot be started leaves its share to the others and the caller)
             let _ = std::thread::Builder::new().name(format!("oaiy-step-expert-{i}")).spawn(move || work(&shared));
         }
-        Team { shared, turn: Mutex::new(()) }
+        Team { shared, turn: Mutex::new(()), size: threads + 1 }
+    }
+
+    /// Its threads, the caller's among them.
+    pub(super) fn size(&self) -> usize {
+        self.size
     }
 
     /// `f(i)` for every `i` below `n`, on the workers and this thread, each once; returns once every one has run.
