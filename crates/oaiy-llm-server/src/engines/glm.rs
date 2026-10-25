@@ -103,8 +103,10 @@ pub struct GlmEngine {
     pub disk: Option<crate::engines::disk::DiskCache<crate::llm::arch::glm5next::forward::StateSnapshot>>,
     /// The request running is incognito: keep no prompt state of it.
     forgetting: bool,
-    /// The incognito session whose prompt state is held (in memory only), if any.
-    private_session: Option<String>,
+    /// The incognito session whose prompt state is held (in memory only), if any (`Some(None)`: an incognito request's
+    /// that named none), and when it was last used: wiped past [`crate::engines::job::INCOGNITO_KEPT`] unused.
+    private_session: Option<Option<String>>,
+    private_at: std::time::Instant,
     pub warn: bool,
     pub log: bool,
     /// Gemma 4's vision tower, where its projector is loaded, and the soft tokens of the last pictures it read (by
@@ -204,6 +206,7 @@ impl GlmEngine {
             disk: None,
             forgetting: false,
             private_session: None,
+            private_at: std::time::Instant::now(),
             warn: log,
             log,
             vision: None,
@@ -327,15 +330,21 @@ impl GlmEngine {
     }
 
     pub fn run(mut self, jobs: Receiver<Job>) {
-        for job in jobs {
+        loop {
+            // (an incognito request's state unused for long enough: wiped, waiting no longer than that)
+            if self.private_session.is_some() && self.private_at.elapsed() >= crate::engines::job::INCOGNITO_KEPT { self.reset(); }
+            let job = match self.private_session.as_ref().map(|_| crate::engines::job::INCOGNITO_KEPT.saturating_sub(self.private_at.elapsed())) {
+                Some(left) => match jobs.recv_timeout(left) { Ok(job) => job, Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue, Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break },
+                None => match jobs.recv() { Ok(job) => job, Err(_) => break },
+            };
             // The end of an incognito session: wipe what is held of it.
             if job.wipe {
-                if self.private_session.is_some() && self.private_session == job.session { self.reset(); }
+                if self.private_session.as_ref().is_some_and(|s| *s == job.session) { self.reset(); }
                 let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
                 continue;
             }
             // A session's private state is reused by that session only.
-            if self.private_session.is_some() && !(job.forget && job.session.is_some() && job.session == self.private_session) {
+            if self.private_session.as_ref().is_some_and(|s| !(job.forget && *s == job.session)) {
                 self.reset();
             }
             self.forgetting = job.forget;
@@ -346,8 +355,10 @@ impl GlmEngine {
                 let _ = job.events.send(Event::Error(e.to_string()));
             }
             if job.forget {
-                // An incognito session keeps its state (in memory only) for its next request.
-                if job.session.is_some() { self.private_session = job.session.clone(); } else { self.reset(); }
+                // An incognito request keeps its state (in memory only) for the next incognito request of its session
+                // (of none, where it named none), wiped past INCOGNITO_KEPT unused.
+                self.private_session = Some(job.session.clone());
+                self.private_at = std::time::Instant::now();
             }
         }
     }

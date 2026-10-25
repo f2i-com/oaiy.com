@@ -69,6 +69,10 @@ pub(crate) struct Engine {
     /// ([`DRAFT_PAUSE`]).
     unsure: usize,
     pause: usize,
+    /// An incognito request's state (`job.forget`), kept in memory alone (never on disk) for the next incognito request of
+    /// its session (or, where it named none, of none): its session, and when it was last used. Wiped when any other
+    /// request comes, when its session ends (`job.wipe`), or when it has gone [`crate::engines::job::INCOGNITO_KEPT`] unused.
+    private: Option<(Option<String>, std::time::Instant)>,
 }
 
 /// What a check's row past the first is taken to cost, a step (with its draft) being 1, where a greedy reply's pass
@@ -212,7 +216,16 @@ impl Engine {
             timing: Timing::default(),
             unsure: 0,
             pause: 0,
+            private: None,
         }
+    }
+
+    /// Nothing kept of the prompts read: the state, the last prompt's checkpoint and the system turn's.
+    fn forget_state(&mut self) {
+        self.covered.clear();
+        self.checkpoint = None;
+        self.system = None;
+        self.private = None;
     }
 
     /// DSpark's drafter: each decode pass checks up to `max` of its drafts, those it is `min` sure of together where
@@ -417,6 +430,10 @@ impl Engine {
         use std::sync::mpsc::TryRecvError;
         loop {
             self.fit_ram();
+            // (an incognito request's state unused for long enough: wiped)
+            if self.private.as_ref().is_some_and(|(_, at)| at.elapsed() >= crate::engines::job::INCOGNITO_KEPT) {
+                self.forget_state();
+            }
             // with nothing asked, the experts' next records are read; a request is taken between slices
             let job = if self.warm.is_some() {
                 match jobs.try_recv() {
@@ -435,35 +452,44 @@ impl Engine {
                         if self.rebalance_some() {
                             continue;
                         }
-                        match jobs.recv() {
-                            Ok(job) => job,
-                            Err(_) => break,
+                        // (waiting no longer than an incognito state is kept: it is wiped on time)
+                        match self.private.as_ref().map(|(_, at)| crate::engines::job::INCOGNITO_KEPT.saturating_sub(at.elapsed())) {
+                            Some(left) => match jobs.recv_timeout(left) {
+                                Ok(job) => job,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            },
+                            None => match jobs.recv() {
+                                Ok(job) => job,
+                                Err(_) => break,
+                            },
                         }
                     }
                     Err(TryRecvError::Disconnected) => break,
                 }
             };
+            // The end of an incognito session: what is kept of it is wiped.
             if job.wipe {
-                self.covered.clear();
-                self.checkpoint = None;
-                self.system = None;
+                if self.private.as_ref().is_some_and(|(session, _)| *session == job.session) {
+                    self.forget_state();
+                }
                 let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
                 continue;
+            }
+            // An incognito request's state is read on from by the next incognito request of its session alone.
+            if self.private.as_ref().is_some_and(|(session, _)| !serves(session, job.forget, &job.session)) {
+                self.forget_state();
             }
             // (an incognito request leaves the experts' counts as it found them: the profile keeps nothing of it)
             let before = job.forget.then(|| self.model.expert_uses().counts());
             if let Err(e) = self.generate(&job) {
                 // The state's extent is unknown after a failure: start clean.
-                self.covered.clear();
-                self.checkpoint = None;
-                self.system = None;
+                self.forget_state();
                 let _ = job.events.send(Event::Error(e.to_string()));
             }
-            // Incognito: nothing of it is kept for the next request.
+            // Incognito: kept in memory alone, for its session's next request ([`crate::engines::job::INCOGNITO_KEPT`] at most unused).
             if job.forget {
-                self.covered.clear();
-                self.checkpoint = None;
-                self.system = None;
+                self.private = Some((job.session.clone(), std::time::Instant::now()));
             }
             match before {
                 Some(counts) => drop(self.model.expert_uses().seed(&counts)),
@@ -608,8 +634,9 @@ impl Engine {
         // is a drafter, each pass's rows give it its keys of the trunk.
         let targets: Vec<usize> = self.drafter.as_ref().map(|d| d.targets().to_vec()).unwrap_or_default();
         let last = prompt.len() - 1;
-        // (a conversation's first long system turn read up to its end first, its state kept there: incognito, nothing is)
-        let system_end = system_end(prompt, self.user, self.assistant, start, last).filter(|_| !job.forget);
+        // (a conversation's first long system turn read up to its end first, its state kept there: incognito, in memory
+        // alone, as its other states are)
+        let system_end = system_end(prompt, self.user, self.assistant, start, last);
         let mut pos = start;
         while pos < last {
             if job.cancel.load(Ordering::Relaxed) {
@@ -623,8 +650,9 @@ impl Engine {
             let _ = job.events.send(Event::Progress { done: pos - start, total });
             if system_end == Some(pos) {
                 let state = Arc::new(self.model.checkpoint());
-                // (and on disk, for a later process: written by the cache's own thread, the state shared)
-                if let (Some(disk), None) = (self.disk.as_mut(), &self.drafter) {
+                // (and on disk, for a later process: written by the cache's own thread, the state shared; never an
+                // incognito request's)
+                if let (Some(disk), None, false) = (self.disk.as_mut(), &self.drafter, job.forget) {
                     let keys: Vec<u64> = self.covered.iter().map(|&t| u64::from(t)).collect();
                     let saved = super::saved::SavedState::new(pos, Arc::clone(&state));
                     if !disk.has(&keys) && disk.takes(crate::engines::disk::PromptState::encoded_len(&saved) as u64) {
@@ -634,10 +662,9 @@ impl Engine {
                 self.system = Some((self.covered.clone(), state, self.drafter.as_ref().map(|d| d.keys())));
             }
         }
-        if !job.forget {
-            self.checkpoint = Some((self.covered.clone(), self.model.checkpoint()));
-            self.drafter_keys = self.drafter.as_ref().map(|d| d.keys());
-        }
+        // (an incognito request's too: in memory alone, wiped as its state is)
+        self.checkpoint = Some((self.covered.clone(), self.model.checkpoint()));
+        self.drafter_keys = self.drafter.as_ref().map(|d| d.keys());
         let mut logits = self.read(&prompt[last..], last, &targets)?;
         self.covered.push(prompt[last]);
         pos = prompt.len();
@@ -787,9 +814,27 @@ impl Engine {
     }
 }
 
+/// Whether the state an incognito request left (`held`: its session, None where it named none) may serve a request
+/// (`forget`: incognito; `session`): the next incognito request of the same session alone.
+fn serves(held: &Option<String>, forget: bool, session: &Option<String>) -> bool {
+    forget && held == session
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_incognito_state_serves_its_own_sessions_next_incognito_request_alone() {
+        let (a, b) = (Some("project-a".to_string()), Some("project-b".to_string()));
+        assert!(serves(&a, true, &a), "the session's next step reads on");
+        assert!(serves(&None, true, &None), "an incognito request that named no session, the next that names none");
+        assert!(!serves(&a, true, &b), "another session's");
+        assert!(!serves(&a, true, &None), "one with no session");
+        assert!(!serves(&None, true, &a));
+        assert!(!serves(&a, false, &a), "a request that is not incognito");
+        assert!(!serves(&None, false, &None));
+    }
 
     const USER: u32 = 9;
     const ASSISTANT: u32 = 8;

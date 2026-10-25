@@ -104,9 +104,12 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        with an API key, off otherwise
   --quiet              no per-request log
   --incognito          keep nothing of any request: no prompt states on disk, no
-                       request log, and each request's state is dropped when it
-                       ends (requests may also send incognito: true, or the
-                       header X-OAIY-Incognito: 1, one at a time)
+                       request log, and each request's state kept in memory alone
+                       for the next incognito request of its session (its
+                       X-OAIY-Session, or none), wiped when another request
+                       comes, the session ends, or 10 minutes pass unused
+                       (requests may also send incognito: true, or the header
+                       X-OAIY-Incognito: 1, one at a time)
   --backend B          auto (default), webgpu or cpu. auto is the first WebGPU
                        adapter, else the CPU
   --webgpu-gb N        weights WebGPU may hold (default: a discrete card's memory

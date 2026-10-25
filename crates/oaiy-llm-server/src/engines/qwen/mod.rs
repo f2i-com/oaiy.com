@@ -743,8 +743,10 @@ pub struct QwenEngine {
     pub disk: Option<crate::engines::disk::DiskCache<Arc<Snapshot>>>,
     /// Only enable when the disk namespace fingerprints the vision pipeline.
     pub image_disk_cache: bool,
-    /// The incognito session whose prompt state is held (in memory only), if any.
-    private_session: Option<String>,
+    /// The incognito session whose prompt state is held (in memory only), if any (`Some(None)`: an incognito request's
+    /// that named none), and when it was last used: wiped past [`crate::engines::job::INCOGNITO_KEPT`] unused.
+    private_session: Option<Option<String>>,
+    private_at: std::time::Instant,
     /// Conversations set aside in host RAM (Flash-Next only; see `park`). Lives and dies
     /// with the engine, so a model reload (the only way its weights or LoRA change) starts it
     /// empty, and `kv` is never rebuilt for another context length.
@@ -800,7 +802,7 @@ impl QwenEngine {
     pub fn new(model: impl Into<Hybrid>, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let model = model.into();
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, parking: Parking::new(0, log), cycles: true, replying: false, unsaved: Vec::new(), building: None, minicpmv: None, calls: Calls::Qwen }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, private_at: std::time::Instant::now(), parking: Parking::new(0, log), cycles: true, replying: false, unsaved: Vec::new(), building: None, minicpmv: None, calls: Calls::Qwen }
     }
     /// A MiniCPM-V 4.7 model: its pictures laid out on their canvases ([`prepare_minicpmv`], [`positions`]).
     pub fn minicpmv(mut self, layout: Option<MiniCpmV>) -> Self {
@@ -829,8 +831,13 @@ impl QwenEngine {
             // (between requests the states for the disk are made, a layer at a time, a request taken between layers:
             // made after a reply, one held the next request back while its rows were copied, 2 s of an agent's step
             // at 26,000 tokens)
+            // (an incognito request's state unused for long enough: wiped, waiting no longer than that)
+            if self.private_session.is_some() && self.private_at.elapsed() >= crate::engines::job::INCOGNITO_KEPT { self.forget_state(); }
             let job = if self.unsaved.is_empty() && self.building.is_none() {
-                match jobs.recv() { Ok(job) => job, Err(_) => break }
+                match self.private_session.as_ref().map(|_| crate::engines::job::INCOGNITO_KEPT.saturating_sub(self.private_at.elapsed())) {
+                    Some(left) => match jobs.recv_timeout(left) { Ok(job) => job, Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue, Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break },
+                    None => match jobs.recv() { Ok(job) => job, Err(_) => break },
+                }
             } else {
                 match jobs.try_recv() {
                     Ok(job) => job,
@@ -841,13 +848,13 @@ impl QwenEngine {
             };
             // The end of an incognito session: wipe what is held of it.
             if job.wipe {
-                if self.private_session.is_some() && self.private_session == job.session { self.forget_state(); }
+                if self.private_session.as_ref().is_some_and(|s| *s == job.session) { self.forget_state(); }
                 let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
                 continue;
             }
             // A session's private state is reused by that session only: anything
             // else wipes it first.
-            if self.private_session.is_some() && !(job.forget && job.session.is_some() && job.session == self.private_session) {
+            if self.private_session.as_ref().is_some_and(|s| !(job.forget && *s == job.session)) {
                 self.forget_state();
             }
             self.replying = false;
@@ -868,10 +875,11 @@ impl QwenEngine {
             let error = match result { Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(_) => Some("native Qwen inference failed".into()) };
             if let Some(e) = error { self.kv.reset(); self.covered.clear(); let _ = job.events.send(Event::Error(e)); }
             if job.forget {
-                // An incognito session keeps its state for its next request, in
-                // memory only (nothing of it goes to disk); otherwise nothing of
-                // this request is reused or kept.
-                if job.session.is_some() { self.private_session = job.session.clone(); } else { self.forget_state(); }
+                // An incognito request keeps its state for the next incognito request of
+                // its session (of none, where it named none), in memory only (nothing of
+                // it goes to disk), wiped past INCOGNITO_KEPT unused.
+                self.private_session = Some(job.session.clone());
+                self.private_at = std::time::Instant::now();
             }
         }
     }

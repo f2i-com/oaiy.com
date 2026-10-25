@@ -80,17 +80,25 @@ pub struct Job {
     /// connection).
     pub cancel: Arc<AtomicBool>,
     pub events: Sender<Event>,
-    /// Incognito: keep nothing of this request. No prompt state goes to disk,
-    /// and when it ends the engine drops its live state and checkpoints, so
-    /// the next request cannot reuse (or reveal) this one's prefix.
+    /// Incognito: keep nothing of this request past [`INCOGNITO_KEPT`]. No prompt
+    /// state goes to disk; its live state stays in memory alone for the next
+    /// incognito request of its session (of none, where it named none), and is
+    /// wiped when any other request comes, its session ends, or it has gone
+    /// [`INCOGNITO_KEPT`] unused.
     pub forget: bool,
     /// An incognito session this request belongs to: its prompt state stays in
     /// memory (never on disk) for the session's next request, and is wiped when a
-    /// request from anywhere else comes, or the session ends.
+    /// request from anywhere else comes, the session ends, or [`INCOGNITO_KEPT`]
+    /// passes unused.
     pub session: Option<String>,
     /// Not a request: wipe the session's state (the end of an incognito session).
     pub wipe: bool,
 }
+
+/// How long an incognito request's state is kept in memory unused before it is wiped: an agent's steps, a minute or
+/// two apart, read on from the step before (wiped after each request, every step read its whole prompt again: a
+/// 2,600-token prompt a minute on DeepSeek-V4.1).
+pub const INCOGNITO_KEPT: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
