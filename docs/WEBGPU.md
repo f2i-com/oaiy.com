@@ -906,6 +906,16 @@ renamed (2,364 tokens), prose (some 400) and a reply after a 22,508-token prompt
 | The group's attention, by lanes | 52.8 | 53.9 | 39.6 |
 | And drafts looked up | 99.9 | 53.9 | 39.5 |
 
+Its cache on the GPU is f16 (a dense model's is, where the device attends such a
+cache for a step, a prompt's rows and a check's few, and no layer keeps a window;
+`OAIY_KV_F32`: f32): half the bytes a step reads of a long cache. At OAIY's sampling
+(0.6, a repeat penalty of 1.1) the reply after the 22,508-token prompt went from
+39.4 to 45.1 tokens a second, the rewrites as they were. And a conversation another
+prompt displaces is set aside whole (its host cache, tokens and checkpoints, nothing
+copied) and comes back when it goes on, its GPU copy made again from the host's: a
+22,559-token conversation going on after another of 2,443 had its first token after
+4.5 s where its prompt was read again (49 s).
+
 Also for the dense models on WebGPU: the CPU's attention runs in one pass (each
 KV head's rows read once for its group of query heads; the default copied the
 cache and took the softmax on one thread), a tied head heads with the GGUF's
