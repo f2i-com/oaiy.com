@@ -621,11 +621,15 @@ impl Hybrid {
             _ => false,
         }
     }
-    /// The most drafts a check takes after its token: a dense Llama's looked-up ones [`LOOKUP_DRAFTS`] (a copied run
-    /// goes on long), the others' [`drafts_most`].
+    /// Whether its drafts are looked up in the conversation ([`lookup`]: a dense Llama's), not its own layer's.
+    fn looks_up(&self) -> bool {
+        matches!(self, Self::Qwen35(Model::Llama(m)) if m.checks())
+    }
+    /// The most drafts a check takes after its token: a dense Llama's looked-up ones [`lookup_most`] (the decode loop
+    /// asks fewer while a copy is not going on), the others' [`drafts_most`].
     fn drafts_most(&self) -> usize {
         match self {
-            Self::Qwen35(Model::Llama(_)) => lookup_drafts(),
+            Self::Qwen35(Model::Llama(_)) => lookup_most(),
             _ => drafts_most(),
         }
     }
@@ -1358,6 +1362,10 @@ impl QwenEngine {
         // its logits are the check's (sampling the model's distribution and taking a draft only where it is the token
         // sampled is that distribution's sampling still); where it picks another, the check's rows from there are undone.
         let drafter = (job.images.is_empty() && hybrid.drafts()).then_some(hybrid);
+        // (drafts looked up in the conversation, a dense Llama's: [`LOOKUP_DRAFTS`] a check, [`lookup_most`] after a
+        // check all of whose drafts were taken (a copy going on), back to the first once one is not)
+        let looks_up = hybrid.looks_up();
+        let (mut lookup_k, mut last_check) = (LOOKUP_DRAFTS.min(lookup_most()), None::<(usize, usize)>);
         let mut pending: std::collections::VecDeque<(u32, Row)> = Default::default();
         let (mut check_rows, mut drafts_checked, mut drafts_taken) = (0usize, 0usize, 0usize);
         // (for the log: the checks made and their rows, the time making drafts, in checks, and undoing rows)
@@ -1450,11 +1458,15 @@ impl QwenEngine {
                 // another token to take than the run's: the model's pick alone has none)
                 let pick = greedy && !(self.cycles && cycles.near(turned, 16));
                 // its drafts, then the token and them in one check; else the token alone
-                let checked = drafter.filter(|m| self.kv.len + 1 + m.drafts_most() <= self.kv.max_len).and_then(|m| {
+                if let Some((at, asked)) = last_check.take().filter(|_| looks_up) {
+                    lookup_k = if drafts_taken - at == asked { lookup_most() } else { LOOKUP_DRAFTS.min(lookup_most()) };
+                }
+                let most = |m: &Hybrid| if looks_up { lookup_k } else { m.drafts_most() };
+                let checked = drafter.filter(|m| self.kv.len + 1 + most(m) <= self.kv.max_len).and_then(|m| {
                     let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(m.draft_window())..].iter().map(|&k| k as u32).chain([next]).collect();
                     // none the layer is sure enough of: a step of the token alone
                     let began = std::time::Instant::now();
-                    let drafts = m.draft(&self.kv, &recent, m.drafts_most()).filter(|d| !d.is_empty());
+                    let drafts = m.draft(&self.kv, &recent, most(m)).filter(|d| !d.is_empty());
                     t_draft += began.elapsed().as_secs_f64();
                     let drafts = drafts?;
                     let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
@@ -1469,6 +1481,7 @@ impl QwenEngine {
                 });
                 match checked {
                     Some((drafts, mut rows)) => {
+                        last_check = Some((drafts_taken, drafts.len()));
                         check_rows = rows.len();
                         checks += 1;
                         rows_checked += check_rows;
@@ -1710,18 +1723,22 @@ fn lookup(recent: &[u32], k: usize) -> Option<Vec<u32>> {
     None
 }
 
-/// The most looked-up drafts a check takes ([`lookup`]; OAIY_LOOKUP_DRAFTS, 1 to 15): three, so a check's four rows
-/// are one workgroup's of the several rows' kernels (`ggml_rs_wgpu::quant::shaders::MULTI_ROWS`), which read each
-/// weight once for them, and a check costs Nanbeige4.3's 33B little more than a step (25 ms where a step took 19, at a
-/// few thousand positions). Seven read the weights twice: a check took 33 ms, and one whose first draft was not taken
-/// more than one step lost. Over Nanbeige4.3's file rewritten with a rename, three a check made 99.9 tokens a second
-/// and seven 105.9, its prose 53.9 and 51.8 (52.8 and 53.9 with none), a reply after 22,500 tokens of prompt 39.5 and
-/// 27.4 (39.6 with none).
+/// The looked-up drafts a check takes ([`lookup`]) but while a copy is going on: three, so a check's four rows are one
+/// workgroup's of the several rows' kernels (`ggml_rs_wgpu::quant::shaders::MULTI_ROWS`), which read each weight once
+/// for them, and a check costs Nanbeige4.3's 33B little more than a step (25 ms where a step took 19, at a few thousand
+/// positions); seven read the weights twice (33 ms), and a check whose first draft was not taken lost more than a step.
+/// After a check all of whose drafts were taken, [`lookup_most`]: a copy goes on, and takes most of seven. At OAIY's
+/// sampling (0.6, a repeat penalty of 1.1), Nanbeige4.3 over two RTX 5090s: its 7.7 KB file written again with a
+/// rename, three a check 98.6 tokens a second and seven 100.3 (53.6 with none); the same after 22,500 tokens of
+/// prompt 93.1 and 113.8 (38.2); prose 54.0 and 53.8 (53.9); a reply after the long prompt 39.4 and 38.3 (40.0).
 const LOOKUP_DRAFTS: usize = 3;
 
-fn lookup_drafts() -> usize {
+/// The most looked-up drafts a check takes, while a copy is going on (OAIY_LOOKUP_DRAFTS, 1 to 15).
+const LOOKUP_DRAFTS_MOST: usize = 7;
+
+fn lookup_most() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("OAIY_LOOKUP_DRAFTS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=15).contains(n)).unwrap_or(LOOKUP_DRAFTS))
+    *MOST.get_or_init(|| std::env::var("OAIY_LOOKUP_DRAFTS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=15).contains(n)).unwrap_or(LOOKUP_DRAFTS_MOST))
 }
 
 fn drafts_most() -> usize {
