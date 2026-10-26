@@ -524,22 +524,12 @@ impl Engine {
     fn generate(&mut self, job: &crate::engines::job::Job) -> oaiy_engine::Result<()> {
         use crate::engines::job::{sample, Event, Finish};
         use std::sync::atomic::Ordering;
-        // A prompt's pictures: each its span of rows from the tower (its ViT and aligner), the same picture's kept from
-        // when it was last read; and the prompt as states know it, its pictures' tokens told apart by their bytes
-        // (`super::vision::keyed`), so a state is read on from only for the same pictures.
-        let spans = match (&mut self.vision, job.images.is_empty()) {
-            (_, true) => Vec::new(),
-            (None, false) => return Err(oaiy_engine::Error::Arg("this DeepSeek-V4.1 reads no pictures here: no vision tower is loaded for it (a GGUF's comes from its checkpoint's folder, --vision-projector NAME=DIR)".into())),
-            (Some(vision), false) => {
-                let encoding = std::time::Instant::now();
-                let spans = job.images.iter().map(|img| Ok(crate::dsv41::model::ImageSpan { start: img.start, rows: vision.span(img.prep.deepseek()?, img.hash) })).collect::<oaiy_engine::Result<Vec<_>>>()?;
-                if self.log {
-                    eprintln!("  {} picture{} through the vision tower in {:.1}s ({} tokens)", spans.len(), if spans.len() == 1 { "" } else { "s" }, encoding.elapsed().as_secs_f64(), job.images.iter().map(|i| i.prep.n_tokens()).sum::<usize>());
-                }
-                spans
-            }
-        };
-        self.model.set_images(spans);
+        // The prompt as states know it: its pictures' tokens told apart by their bytes (`super::vision::keyed`), so a
+        // state is read on from only for the same pictures (their spans made once that is known, below).
+        if !job.images.is_empty() && self.vision.is_none() {
+            return Err(oaiy_engine::Error::Arg("this DeepSeek-V4.1 reads no pictures here: no vision tower is loaded for it (--vision-projector NAME=DIR, its checkpoint's folder or, for a GGUF, the same model's)".into()));
+        }
+        self.model.set_images(Vec::new());
         let keyed = (!job.images.is_empty()).then(|| super::vision::keyed(&job.prompt, &job.images));
         let keys: &[u32] = keyed.as_deref().unwrap_or(&job.prompt);
         let prompt = &job.prompt;
@@ -655,6 +645,17 @@ impl Engine {
             self.covered.clear();
         }
         let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
+        // The pictures the part to read reaches: each its span of rows from the tower (its ViT and aligner), the same
+        // picture's kept from when it was last read; those wholly in what a state serves are not made again.
+        if let Some(vision) = self.vision.as_mut().filter(|_| !job.images.is_empty()) {
+            let encoding = std::time::Instant::now();
+            let reached: Vec<&crate::engines::job::JobImage> = job.images.iter().filter(|img| img.start + img.prep.n_tokens() > start).collect();
+            let spans = reached.iter().map(|img| Ok(crate::dsv41::model::ImageSpan { start: img.start, rows: vision.span(img.prep.deepseek()?, img.hash) })).collect::<oaiy_engine::Result<Vec<_>>>()?;
+            if self.log && !spans.is_empty() {
+                eprintln!("  {} picture{} through the vision tower in {:.1}s ({} tokens)", spans.len(), if spans.len() == 1 { "" } else { "s" }, encoding.elapsed().as_secs_f64(), reached.iter().map(|i| i.prep.n_tokens()).sum::<usize>());
+            }
+            self.model.set_images(spans);
+        }
         let total = prompt.len() - start;
         let _ = job.events.send(Event::Progress { done: 0, total });
         // All but the last token, then the checkpoint, then the last one (whose logits the reply starts from). Where there

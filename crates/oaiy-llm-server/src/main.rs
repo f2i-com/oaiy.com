@@ -91,7 +91,9 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                               folder; for Flash-Next also a llama.cpp .gguf LoRA); repeat
                               it to stack several, each at strength X (default 1)
   --lora-strength NAME=X      strength of NAME's adapters that give none (default 1; -4..4)
-  --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca
+  --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca;
+                       for DeepSeek-V4.1 a safetensors checkpoint's folder (its own, or
+                       for a GGUF the same model's) whose vision tower it takes
   --devices-for NAME=0,1  the GPUs for NAME, instead of --devices (a model too big for one)
   --mtp NAME           NAME (a Qwen3.5 GGUF with a multi-token-prediction layer, or
                        Qwen3.8-Flash-Next, on WebGPU) drafts tokens with that layer

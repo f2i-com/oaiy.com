@@ -632,8 +632,7 @@ impl Models {
         let models = self.specs.iter().map(|s| Json::obj([
             ("model",Json::str(&s.name)),
             ("loaded",Json::Bool(loaded.as_deref()==Some(&s.name))),
-            // (a DeepSeek-V4.1 checkpoint has its own tower; its GGUF none but the one it is given)
-            ("vision_configured",Json::Bool(self.opts.vision && ((s.kind==Kind::Deepseek && crate::dsv41::gguf_file::backbone(&s.path).is_none()) || self.opts.vision_projectors.contains_key(&s.name)))),
+            ("vision_configured",Json::Bool(self.opts.vision && self.opts.vision_projectors.contains_key(&s.name))),
             ("timing",timings.get(&s.name).cloned().unwrap_or(Json::Null)),
         ])).collect();
         Json::obj([("models",Json::Arr(models)),("resident_model_limit",Json::Int(1)),
@@ -1061,21 +1060,29 @@ impl Models {
                 Err(why) => self.say(format!("the expert cache could not be kept resident: {why}")),
             }
         }
-        // Its vision tower and the router's image bias: a checkpoint's own (its `vision_config`), a GGUF's from the folder
-        // of the same model's checkpoint it is given (`--vision-projector`); none with --no-vision.
-        let vision_dir = match (o.vision, o.vision_projectors.get(&spec.name)) {
-            (false, _) => None,
-            (true, Some(dir)) => Some(dir.clone()),
-            (true, None) => model.cfg.vision.is_some().then(|| spec.path.clone()),
-        };
+        // Its vision tower and the router's image bias, where it is given a folder to take them from
+        // (`--vision-projector`): its own checkpoint's, or for a GGUF the same model's safetensors checkpoint. Asked
+        // for, not by default: the tower takes 1.9 GB of a card's room the held experts would have. One that does not
+        // load is said, and the model reads text alone.
+        let vision_dir = o.vision.then(|| o.vision_projectors.get(&spec.name).cloned()).flatten();
         let mut vision = match &vision_dir {
             Some(dir) => {
                 let loading = std::time::Instant::now();
-                let vision = crate::engines::dsv41_portable::vision::Vision::load(dir, &model.cfg)?;
-                model.load_image_bias(&crate::dsv41::safetensors::StIndex::open(dir)?)?;
-                let vc = vision.config(o.image_tokens);
-                self.say(format!("{}: vision tower loaded{} in {:.1}s (up to {} tokens a picture)", spec.name, if dir == &spec.path { String::new() } else { format!(" from {}", dir.display()) }, loading.elapsed().as_secs_f64(), vc.max_tokens));
-                Some(vision)
+                let loaded = crate::engines::dsv41_portable::vision::Vision::load(dir, &model.cfg).and_then(|vision| {
+                    model.load_image_bias(&crate::dsv41::safetensors::StIndex::open(dir)?)?;
+                    Ok(vision)
+                });
+                match loaded {
+                    Ok(vision) => {
+                        let vc = vision.config(o.image_tokens);
+                        self.say(format!("{}: vision tower loaded{} in {:.1}s (up to {} tokens a picture)", spec.name, if dir == &spec.path { String::new() } else { format!(" from {}", dir.display()) }, loading.elapsed().as_secs_f64(), vc.max_tokens));
+                        Some(vision)
+                    }
+                    Err(why) => {
+                        self.say(format!("{}: no vision tower from {} ({why}): it reads text alone", spec.name, dir.display()));
+                        None
+                    }
+                }
             }
             None => None,
         };

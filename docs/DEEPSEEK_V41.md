@@ -764,9 +764,14 @@ The portable engine reads pictures again, as the CUDA one did:
   bytes and its place in the span. A state is read on from only for the same pictures
   in the same places, and the last eight pictures' spans are kept (an incognito
   request's wiped with its state).
-- **A GGUF** carries no tower and no `bias_vl`: `--vision-projector NAME=DIR` gives it
-  the folder of the same model's safetensors checkpoint, whose tower and image bias it
-  takes (its width, vocabulary and image token checked against the GGUF's).
+- **Asked for, not by default:** `--vision-projector NAME=DIR` names the folder the
+  tower and the image bias come from, the checkpoint's own or, for a GGUF (which
+  carries neither), the same model's safetensors checkpoint (its width, vocabulary and
+  image token checked against the model's). The tower takes 1.9 GB of a card's room
+  the held experts would have (5,363 held on the 2-bit GGUF, 5,148 with it). One that
+  does not load is said, and the model reads text alone.
+- **Only what is read:** the pictures wholly inside what a kept state serves are not
+  put through the tower again.
 - **`--image-tokens N`** caps a picture's tokens (at least 184, a 13 x 13 grid; default
   the checkpoint's 1,024). On the 2-bit GGUF a picture's tokens read at roughly the
   prompt's pace, so a 1,000-token picture is some 25 s of a cold prompt.
