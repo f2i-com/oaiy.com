@@ -107,9 +107,11 @@ struct ChainKv {
     halves: bool,
 }
 
-/// `values` (pairs) as f16 halves, two a word, as a cache held as halves keeps them.
-fn to_halves(values: &[f32]) -> Vec<f32> {
-    values.chunks_exact(2).map(|p| f32::from_bits(u32::from(ggml_rs::tensor::f32_to_f16_bits(p[0])) | (u32::from(ggml_rs::tensor::f32_to_f16_bits(p[1])) << 16))).collect()
+/// `values` (pairs) as f16 halves into `words`, two a word, as a cache held as halves keeps them.
+fn halves_into(values: &[f32], words: &mut [f32]) {
+    for (w, p) in words.iter_mut().zip(values.chunks_exact(2)) {
+        *w = f32::from_bits(u32::from(ggml_rs::tensor::f32_to_f16_bits(p[0])) | (u32::from(ggml_rs::tensor::f32_to_f16_bits(p[1])) << 16));
+    }
 }
 
 /// A cache's rows read back as halves (two a word) as f32 values, for the host's cache.
@@ -187,16 +189,24 @@ fn sync(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, kv
             let (kown, vown);
             let kd = if kh.is_device() { kown = kh.to_host(); kown.data() } else { kh.data() };
             let vd = if vh.is_device() { vown = vh.to_host(); vown.data() } else { vh.data() };
-            let mut rows = Vec::with_capacity((past - from) * row);
-            for t in from..past {
-                rows.extend_from_slice(&kd[t * kvd..(t + 1) * kvd]);
-                rows.extend_from_slice(&vd[t * kvd..(t + 1) * kvd]);
-            }
-            if g.halves {
-                chain.upload_at(layer, from * row / 2, &to_halves(&rows));
-            } else {
-                chain.upload_at(layer, from * row, &rows);
-            }
+            // (each row's K then its V, as halves where the copy is so, made on every core: a conversation brought back
+            // whole sends all its rows, 27,000 of them 52 layers of a 33B's)
+            use rayon::prelude::*;
+            let width = if g.halves { row / 2 } else { row };
+            let mut rows = vec![0f32; (past - from) * width];
+            rows.par_chunks_mut(width).enumerate().for_each(|(i, out)| {
+                let t = from + i;
+                let (k, v) = (&kd[t * kvd..(t + 1) * kvd], &vd[t * kvd..(t + 1) * kvd]);
+                if g.halves {
+                    let (ko, vo) = out.split_at_mut(kvd / 2);
+                    halves_into(k, ko);
+                    halves_into(v, vo);
+                } else {
+                    out[..kvd].copy_from_slice(k);
+                    out[kvd..].copy_from_slice(v);
+                }
+            });
+            chain.upload_at(layer, from * width, &rows);
         }
     }
     g.owner = kv.id;

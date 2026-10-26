@@ -31,6 +31,8 @@ pub(crate) struct FakeModel {
     /// A model stuck in a run: whatever it has read, its likeliest next token is the next of these in turn, and its
     /// next likeliest the other one (the end of the reply, or a word after which it goes back to its run).
     pub stuck: Option<(Vec<u32>, u32)>,
+    /// Its conversations set aside whole, as a dense Llama's are, rather than parked.
+    pub aside: bool,
 }
 
 impl FakeModel {
@@ -38,7 +40,7 @@ impl FakeModel {
         let mut tokens = vec!["<pad>".to_string(), "<|im_start|>".into(), "<|im_end|>".into(), "</think>".into()];
         for i in FIRST..FIRST + WORDS { tokens.push(format!("{i}.")); }
         let tok = Tokenizer::from_qwen3_bpe_parts(tokens, vec![], vec![1, 2, 3], END).unwrap();
-        FakeModel { tok, width: 4, panic_on, forwarded, stuck: None }
+        FakeModel { tok, width: 4, panic_on, forwarded, stuck: None, aside: false }
     }
 
     fn mix(t: u32, pos: u32, salt: u32, j: u32) -> f32 {
@@ -120,6 +122,16 @@ impl Engine {
     /// `budget` bytes of stash (0: parking off).
     pub fn start(budget: usize, panic_on: Option<u32>) -> Self {
         Self::start_with(budget, panic_on, None, true)
+    }
+
+    /// An engine whose model sets a displaced conversation aside whole, as a dense Llama's does.
+    pub fn start_aside() -> Self {
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let model = FakeModel { aside: true, ..FakeModel::new(None, forwarded.clone()) };
+        let engine = QwenEngine::new(Hybrid::Fake(Box::new(model)), None, 65536, false);
+        let (tx, rx) = channel();
+        let thread = std::thread::spawn(move || engine.run(rx));
+        Engine { tx: Some(tx), thread: Some(thread), forwarded }
     }
 
     /// An engine whose model is stuck in `run` (its next likeliest token `other`), with the guard on such runs or not.
@@ -288,6 +300,39 @@ mod tests {
         assert!(want.iter().all(|r| r.reuse.unwrap().1 != "ram"));
         // Only what is new is read: the end of the reply, the next message, the header.
         for r in &got[2..] { assert!(r.reuse.unwrap().0 > 1_000, "{r:?}"); }
+    }
+
+    /// A dense Llama's conversation that another displaces is set aside whole and comes back when it goes on (the
+    /// other then set aside in its place), as two conversations taking turns are (an agent and its sub-agent): what
+    /// the engine answers is what it answers reading each again, and only what is new is read.
+    #[test]
+    fn a_conversation_set_aside_whole_comes_back_and_answers_as_it_would_have() {
+        let want = without_parking(&two_conversations);
+        let e = Engine::start_aside();
+        let got = two_conversations(&e);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.words, w.words, "request {i}: what the engine answers must not depend on what it set aside");
+            assert!(g.error.is_none() && g.done);
+        }
+        let sources: Vec<_> = got.iter().map(|r| r.reuse.unwrap().1).collect();
+        assert_eq!(sources, ["none", "none", "aside", "aside", "aside", "aside"], "{got:?}");
+        for r in &got[2..] { assert!(r.reuse.unwrap().0 > 1_000, "{r:?}"); }
+    }
+
+    /// An incognito session's conversation set aside goes with the session: a request of another session, or none,
+    /// finds nothing of it.
+    #[test]
+    fn an_incognito_sessions_conversation_set_aside_goes_with_it() {
+        let e = Engine::start_aside();
+        let (a, b) = (Chat::new(10, 3_000), Chat::new(20, 1_500));
+        e.ask_private(&a.prompt(), Some("s"), 4);
+        e.ask_private(&b.prompt(), Some("s"), 4);
+        // (the session's own: its first conversation comes back)
+        assert_eq!(e.ask_private(&a.prompt(), Some("s"), 4).reuse.unwrap().1, "aside");
+        // another request: the session is wiped, the one it set aside with it
+        let other = e.ask(&b.prompt(), 4);
+        assert_eq!(other.reuse.unwrap().0, 0, "{other:?}");
+        assert_eq!(e.ask(&a.prompt(), 4).reuse.unwrap().0, 0);
     }
 
     #[test]

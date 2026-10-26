@@ -584,7 +584,17 @@ impl Hybrid {
             #[cfg(feature = "webgpu")]
             Self::Flash(_) => true,
             #[cfg(test)]
-            Self::Fake(_) => true,
+            Self::Fake(f) => !f.aside,
+        }
+    }
+    /// Whether a conversation another prompt displaces is kept whole in memory, its cache set aside as it is
+    /// ([`Aside`]): a dense Llama's, whose cache's rows all are the host's (its GPU's copy made again from them).
+    fn sets_aside(&self) -> bool {
+        match self {
+            Self::Qwen35(Model::Llama(_)) => true,
+            #[cfg(test)]
+            Self::Fake(f) => f.aside,
+            _ => false,
         }
     }
     fn new_kv_cache(&self, max_seq: usize) -> KvCache {
@@ -884,6 +894,13 @@ impl Hybrid {
     }
 }
 
+/// A conversation set aside whole ([`QwenEngine::aside_for`]): its cache, the tokens it holds, its checkpoints.
+struct Aside {
+    kv: KvCache,
+    covered: Vec<u64>,
+    checkpoints: Vec<(Vec<u64>, RecurrentSnapshot, bool)>,
+}
+
 pub struct QwenEngine {
     model: Hybrid,
     projector: Option<MmProj>,
@@ -904,6 +921,9 @@ pub struct QwenEngine {
     /// with the engine, so a model reload (the only way its weights or LoRA change) starts it
     /// empty, and `kv` is never rebuilt for another context length.
     parking: Parking,
+    /// A dense Llama's conversation another prompt displaced, kept whole ([`Hybrid::sets_aside`]): wiped with the
+    /// engine's state ([`QwenEngine::forget_state`]), so an incognito session's goes with it.
+    aside: Option<Aside>,
     /// A run that repeats without end is turned from, and stopped where it goes on all the same
     /// (`--repetition-guard`, on unless said): [`crate::guards::repetition::CycleGuard`].
     cycles: bool,
@@ -955,7 +975,7 @@ impl QwenEngine {
     pub fn new(model: impl Into<Hybrid>, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let model = model.into();
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, private_at: std::time::Instant::now(), parking: Parking::new(0, log), cycles: true, replying: false, unsaved: Vec::new(), building: None, minicpmv: None, calls: Calls::Qwen }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None, private_at: std::time::Instant::now(), parking: Parking::new(0, log), aside: None, cycles: true, replying: false, unsaved: Vec::new(), building: None, minicpmv: None, calls: Calls::Qwen }
     }
     /// A MiniCPM-V 4.7 model: its pictures laid out on their canvases ([`prepare_minicpmv`], [`positions`]).
     pub fn minicpmv(mut self, layout: Option<MiniCpmV>) -> Self {
@@ -1108,7 +1128,53 @@ impl QwenEngine {
         self.checkpoints.clear();
         self.vision_cache.clear();
         self.parking.clear();
+        self.aside = None;
         self.private_session = None;
+    }
+
+    /// A dense Llama's conversation set aside or brought back for `keys` ([`Hybrid::sets_aside`]): the one set aside
+    /// comes back where it saves [`park::MIN_TOKENS`] or more and [`park::MIN_GAIN`] more than the live one (which then
+    /// is the one set aside); else the live one is set aside where `keys` share less than half of it and the host has
+    /// room to keep it, its place taken by the one set aside before (its cache let go of, its buffers reused). Nothing
+    /// is copied: the GPU's copy of the cache is made again from the host's at the next run (its owner is another
+    /// cache). An agent's sub-agent, a title or a summary between two of its steps had its 27,000 tokens read again,
+    /// 51 s on Nanbeige4.3's 33B; brought back, they are sent to the GPUs again in about a second.
+    fn aside_for(&mut self, keys: &[u64]) -> &'static str {
+        let reuse = |covered: &[u64], checkpoints: &[(Vec<u64>, RecurrentSnapshot, bool)]| park::reusable(covered, checkpoints.iter().map(|(k, _, _)| k.as_slice()), keys);
+        let live = reuse(&self.covered, &self.checkpoints);
+        if let Some(a) = self.aside.as_mut() {
+            let back = reuse(&a.covered, &a.checkpoints);
+            if back >= park::MIN_TOKENS && back >= live.saturating_add(park::MIN_GAIN) {
+                std::mem::swap(&mut self.kv, &mut a.kv);
+                std::mem::swap(&mut self.covered, &mut a.covered);
+                std::mem::swap(&mut self.checkpoints, &mut a.checkpoints);
+                if self.log { eprintln!("  Qwen aside: the conversation set aside goes on ({} tokens), the live one ({} tokens) set aside", self.covered.len(), a.covered.len()); }
+                return "aside";
+            }
+        }
+        let held = self.covered.len();
+        if held < park::MIN_TOKENS || !park::worth_parking(held, live) || self.kv.len != held {
+            return "";
+        }
+        // (room on the host for it besides what the next conversation grows to: its own bytes and 8 GB more free)
+        let bytes: usize = self.kv.k.iter().chain(&self.kv.v).map(|t| 4 * t.numel()).sum();
+        #[cfg(feature = "webgpu")]
+        if ggml_rs_wgpu::host_memory().is_some_and(|(free, _)| free < bytes + (8 << 30)) {
+            if self.log { eprintln!("  Qwen aside skipped: {held} tokens ({:.1} GB) and too little of the host's memory free", bytes as f64 / 1e9); }
+            return "";
+        }
+        let fresh = match self.aside.take() {
+            Some(a) => {
+                let mut kv = a.kv;
+                kv.reset();
+                kv
+            }
+            None => self.model.new_kv_cache(self.kv.max_len),
+        };
+        let kv = std::mem::replace(&mut self.kv, fresh);
+        self.aside = Some(Aside { kv, covered: std::mem::take(&mut self.covered), checkpoints: std::mem::take(&mut self.checkpoints) });
+        if self.log { eprintln!("  Qwen aside: {held} tokens ({:.1} GB) set aside for this conversation", bytes as f64 / 1e9); }
+        "set aside"
     }
     fn generate(&mut self, job: &Job) -> Result<(), String> {
         if job.prompt.is_empty() { return Err("empty Qwen prompt".into()); }
@@ -1126,6 +1192,7 @@ impl QwenEngine {
         // it as from any live state. A big live state that this prompt shares little with is set
         // aside too, now, while all its checkpoints are there: the logic below drops the ones the
         // prompt does not share. An incognito request neither takes from the RAM nor gives to it.
+        let aside = if self.model.sets_aside() { self.aside_for(&keys) } else { "" };
         let swapped = !job.forget && self.parking.swap_in(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private_session.is_some() }, &keys);
         if !job.forget {
             self.parking.park_displaced(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private_session.is_some() }, &keys);
@@ -1189,6 +1256,7 @@ impl QwenEngine {
         }
         // What came back from RAM is not "memory" or a checkpoint of this process's own making.
         if swapped && start > 0 { source = "ram"; }
+        if aside == "aside" && start > 0 { source = "aside"; }
         if start == 0 { self.kv.reset(); self.covered.clear(); self.checkpoints.clear(); }
         let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
         if self.log { eprintln!("  Qwen cache: {start}/{} tokens from {source} (common {common}) in {:.3}s", keys.len(), cache_clock.elapsed().as_secs_f64()); }
