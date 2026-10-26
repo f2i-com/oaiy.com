@@ -99,6 +99,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --mtp-from NAME=DIR  where NAME takes that layer from when its own file has none: a
                        Qwen3.8-Flash-Next GGUF's from the same model's EXL3 checkpoint
   --no-vision          skip the vision tower (images are refused)
+  --image-tokens N     the most tokens a DeepSeek-V4.1 picture takes (default its
+                       own most, 1,024; at least 184): fewer read sooner, less sharp
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only
                        with an API key, off otherwise
@@ -256,6 +258,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 a.cpu_threads = if n == 0 { None } else { Some(n) };
             }
             "--no-vision" => a.vision = false,
+            "--image-tokens" => a.image_tokens = Some(num(val()?)?),
             "--local-images" => {
                 a.local_images = match val()?.as_str() {
                     "on" => Some(true),

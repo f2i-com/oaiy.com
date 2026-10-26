@@ -73,6 +73,8 @@ pub(crate) struct Engine {
     /// its session (or, where it named none, of none): its session, and when it was last used. Wiped when any other
     /// request comes, when its session ends (`job.wipe`), or when it has gone [`crate::engines::job::INCOGNITO_KEPT`] unused.
     private: Option<(Option<String>, std::time::Instant)>,
+    /// Its vision tower, where it reads pictures ([`super::vision::Vision`]).
+    vision: Option<super::vision::Vision>,
 }
 
 /// What a check's row past the first is taken to cost, a step (with its draft) being 1, where a greedy reply's pass
@@ -217,6 +219,7 @@ impl Engine {
             unsure: 0,
             pause: 0,
             private: None,
+            vision: None,
         }
     }
 
@@ -226,6 +229,15 @@ impl Engine {
         self.checkpoint = None;
         self.system = None;
         self.private = None;
+        if let Some(v) = &mut self.vision {
+            v.forget();
+        }
+    }
+
+    /// Its vision tower: a prompt's pictures read through it ([`super::vision::Vision`]).
+    pub(crate) fn with_vision(mut self, vision: Option<super::vision::Vision>) -> Engine {
+        self.vision = vision;
+        self
     }
 
     /// DSpark's drafter: each decode pass checks up to `max` of its drafts, those it is `min` sure of together where
@@ -512,9 +524,24 @@ impl Engine {
     fn generate(&mut self, job: &crate::engines::job::Job) -> oaiy_engine::Result<()> {
         use crate::engines::job::{sample, Event, Finish};
         use std::sync::atomic::Ordering;
-        if !job.images.is_empty() {
-            return Err(oaiy_engine::Error::Arg("DeepSeek-V4.1 does not take images on WebGPU yet".into()));
-        }
+        // A prompt's pictures: each its span of rows from the tower (its ViT and aligner), the same picture's kept from
+        // when it was last read; and the prompt as states know it, its pictures' tokens told apart by their bytes
+        // (`super::vision::keyed`), so a state is read on from only for the same pictures.
+        let spans = match (&mut self.vision, job.images.is_empty()) {
+            (_, true) => Vec::new(),
+            (None, false) => return Err(oaiy_engine::Error::Arg("this DeepSeek-V4.1 reads no pictures here: no vision tower is loaded for it (a GGUF's comes from its checkpoint's folder, --vision-projector NAME=DIR)".into())),
+            (Some(vision), false) => {
+                let encoding = std::time::Instant::now();
+                let spans = job.images.iter().map(|img| Ok(crate::dsv41::model::ImageSpan { start: img.start, rows: vision.span(img.prep.deepseek()?, img.hash) })).collect::<oaiy_engine::Result<Vec<_>>>()?;
+                if self.log {
+                    eprintln!("  {} picture{} through the vision tower in {:.1}s ({} tokens)", spans.len(), if spans.len() == 1 { "" } else { "s" }, encoding.elapsed().as_secs_f64(), job.images.iter().map(|i| i.prep.n_tokens()).sum::<usize>());
+                }
+                spans
+            }
+        };
+        self.model.set_images(spans);
+        let keyed = (!job.images.is_empty()).then(|| super::vision::keyed(&job.prompt, &job.images));
+        let keys: &[u32] = keyed.as_deref().unwrap_or(&job.prompt);
         let prompt = &job.prompt;
         let max_seq = self.model.max_seq();
         if prompt.is_empty() || prompt.len() >= max_seq {
@@ -588,23 +615,23 @@ impl Engine {
             crate::dsv41::profile::take();
         }
         let at_start = read_so_far(&self.model);
-        let common = self.covered.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        let common = self.covered.iter().zip(keys).take_while(|(a, b)| a == b).count();
         // The live state, the last prompt's checkpoint or the state at the end of a system turn: whichever serves more
         // of this prompt.
-        let live = reusable(&self.covered, prompt);
-        let kept = self.checkpoint.as_ref().map_or(0, |(tokens, _)| reusable(tokens, prompt));
+        let live = reusable(&self.covered, keys);
+        let kept = self.checkpoint.as_ref().map_or(0, |(tokens, _)| reusable(tokens, keys));
         // (a state on disk that serves more of it than these, a system turn's an earlier process kept: read in as the
         // system turn's)
         let mut from_disk = false;
         if let (Some(disk), None, false) = (self.disk.as_mut(), &self.drafter, job.forget) {
-            let held = live.max(kept).max(self.system.as_ref().map_or(0, |(tokens, ..)| reusable(tokens, prompt)));
-            let keys: Vec<u64> = prompt.iter().map(|&t| u64::from(t)).collect();
+            let held = live.max(kept).max(self.system.as_ref().map_or(0, |(tokens, ..)| reusable(tokens, keys)));
+            let keys: Vec<u64> = keys.iter().map(|&t| u64::from(t)).collect();
             if let Some((keys, saved)) = disk.load_best(&keys, prompt.len() - 1, held, self.log).filter(|(_, saved)| self.model.fits(&saved.state)) {
                 self.system = Some((keys.iter().map(|&k| k as u32).collect(), saved.state, None));
                 from_disk = true;
             }
         }
-        let system = self.system.as_ref().map_or(0, |(tokens, ..)| reusable(tokens, prompt));
+        let system = self.system.as_ref().map_or(0, |(tokens, ..)| reusable(tokens, keys));
         let (start, source) = if kept > live && kept >= system {
             let (tokens, state) = self.checkpoint.as_ref().expect("a checkpoint serves it");
             self.model.restore(state);
@@ -645,7 +672,7 @@ impl Engine {
             }
             let take = PREFILL_CHUNK.min(last - pos).min(system_end.filter(|&end| end > pos).map_or(usize::MAX, |end| end - pos));
             self.read(&prompt[pos..pos + take], pos, &targets)?;
-            self.covered.extend_from_slice(&prompt[pos..pos + take]);
+            self.covered.extend_from_slice(&keys[pos..pos + take]);
             pos += take;
             let _ = job.events.send(Event::Progress { done: pos - start, total });
             if system_end == Some(pos) {
@@ -666,7 +693,9 @@ impl Engine {
         self.checkpoint = Some((self.covered.clone(), self.model.checkpoint()));
         self.drafter_keys = self.drafter.as_ref().map(|d| d.keys());
         let mut logits = self.read(&prompt[last..], last, &targets)?;
-        self.covered.push(prompt[last]);
+        self.covered.push(keys[last]);
+        // (the pictures' rows read: none kept for the reply's steps)
+        self.model.set_images(Vec::new());
         pos = prompt.len();
         let _ = job.events.send(Event::Progress { done: total, total });
         let prefill_s = started.elapsed().as_secs_f64();

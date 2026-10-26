@@ -104,7 +104,9 @@ pub struct Options {
     /// asking for another unloads the current one first.
     pub extra_models: Vec<(String, std::path::PathBuf)>,
     /// Vision projectors keyed by model name: GGUF files, or original Qwen
-    /// safetensors directories for OrcaSAQ (tools/orcasaq/download.py --vision).
+    /// safetensors directories for OrcaSAQ (tools/orcasaq/download.py --vision),
+    /// or for a DeepSeek-V4.1 GGUF the folder of the same model's safetensors
+    /// checkpoint (its vision tower and image bias).
     pub vision_projectors: std::collections::BTreeMap<String, PathBuf>,
     /// GPUs for one model, keyed by name, instead of `devices` (a model too big for one).
     pub model_devices: std::collections::BTreeMap<String, Vec<usize>>,
@@ -179,6 +181,8 @@ pub struct Options {
     pub cpu_threads: Option<usize>,
     /// Load the vision tower.
     pub vision: bool,
+    /// The most tokens a DeepSeek-V4.1 picture takes (`None`: the checkpoint's own most, 1,024).
+    pub image_tokens: Option<usize>,
     /// Let requests name image files on this machine (default: when listening
     /// on loopback only and holding a key, see [`Options::local_images_or_default`]).
     pub local_images: Option<bool>,
@@ -297,6 +301,7 @@ impl Default for Options {
             park_gb: 8.0,
             cpu_threads: Some(24),
             vision: true,
+            image_tokens: None,
             local_images: None,
             quiet: false,
             silent: false,

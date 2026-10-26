@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use oaiy_engine::ecache::{Ecache, HostLease};
 use oaiy_engine::store::WeightStore;
-use oaiy_engine::Result;
+use oaiy_engine::{Error, Result};
 
 use crate::dsv41::config::Config;
 use crate::dsv41::formats::to_bf16;
@@ -260,6 +260,9 @@ pub struct Moe {
     layer: u32,
     gate: Weight,
     bias: Vec<f32>,
+    /// The correction bias an image's tokens choose their experts by (the checkpoint's `gate.bias_vl`), where the model
+    /// reads images ([`Self::set_image_bias`]).
+    bias_vl: Option<Vec<f32>>,
     shared: [Weight; 3],
 }
 
@@ -279,6 +282,20 @@ impl Moe {
     /// The router's correction bias (a score's, as [`route`] takes it).
     pub(crate) fn bias(&self) -> &[f32] {
         &self.bias
+    }
+
+    /// The correction bias an image's tokens choose their experts by, where it was read.
+    pub(crate) fn image_bias(&self) -> Option<&[f32]> {
+        self.bias_vl.as_deref()
+    }
+
+    /// The correction bias an image's tokens choose their experts by (`gate.bias_vl`, as long as the text's).
+    pub(crate) fn set_image_bias(&mut self, bias_vl: Vec<f32>) -> Result<()> {
+        if bias_vl.len() != self.bias.len() {
+            return Err(Error::Format(format!("layer {}: an image bias of {} experts, where the router has {}", self.layer, bias_vl.len(), self.bias.len())));
+        }
+        self.bias_vl = Some(bias_vl);
+        Ok(())
     }
 }
 
@@ -375,6 +392,7 @@ impl Moe {
             layer: layer as u32,
             gate: Weight::load(idx, &format!("{p}.gate"))?,
             bias: load_vec(idx, &format!("{p}.gate.bias"))?,
+            bias_vl: None,
             shared: [
                 Weight::load(idx, &format!("{p}.shared_experts.w1"))?,
                 Weight::load(idx, &format!("{p}.shared_experts.w2"))?,
@@ -436,14 +454,15 @@ impl Moe {
 
     /// `x`: `[t, dim]` (bf16 values); returns `[t, dim]` bf16 and the routes taken.
     pub fn forward(&self, cfg: &Config, x: &[f32], t: usize, experts: &Experts) -> Result<(Vec<f32>, Vec<Route>)> {
-        let (y, routes, _) = self.forward_side(cfg, x, t, experts, None)?;
+        let (y, routes, _) = self.forward_side(cfg, x, t, experts, None, None)?;
         Ok((y, routes))
     }
 
     /// [`Self::forward`], and `side`'s projection of its own input (`(weight, input)`: the sublayer's mixing projection
     /// of the stream, [`crate::dsv41::hc::HcParams::on_device`]) made in the router's call, `[t, side.n()]` in f32.
+    /// `image`: which rows are an image's tokens (they choose their experts by the image bias), where any is.
     #[allow(clippy::type_complexity)]
-    pub fn forward_side(&self, cfg: &Config, x: &[f32], t: usize, experts: &Experts, side: Option<(&Weight, &[f32])>) -> Result<(Vec<f32>, Vec<Route>, Option<Vec<f32>>)> {
+    pub fn forward_side(&self, cfg: &Config, x: &[f32], t: usize, experts: &Experts, side: Option<(&Weight, &[f32])>, image: Option<&[bool]>) -> Result<(Vec<f32>, Vec<Route>, Option<Vec<f32>>)> {
         let [w1, w2, w3] = &self.shared;
         // A decode step's shared expert whole and the router's logits in one call, where a device holds them (its
         // down projection was a round trip of its own, a layer); else the router's and the shared expert's
@@ -470,7 +489,7 @@ impl Moe {
                 (logits, Some((gate, up)), None, side_out)
             }
         };
-        let (y, routes) = self.forward_from(cfg, x, t, experts, logits, shared_parts, shared_whole, None)?;
+        let (y, routes) = self.forward_from(cfg, x, t, experts, logits, shared_parts, shared_whole, None, image)?;
         Ok((y, routes, side_out))
     }
 
@@ -489,12 +508,17 @@ impl Moe {
         shared_parts: Option<(Vec<f32>, Vec<f32>)>,
         shared_whole: Option<Vec<f32>>,
         fused: Option<FusedLater<'_>>,
+        image: Option<&[bool]>,
     ) -> Result<(Vec<f32>, Vec<Route>)> {
         // (held experts made behind the router's call come from a GPU's kernel alone)
         #[cfg(not(feature = "webgpu"))]
         drop(fused);
         let d = cfg.dim;
-        let routes = route(cfg, &logits, &self.bias, t);
+        let routes = match (&self.bias_vl, image) {
+            (Some(vl), Some(mask)) => route_mixed(cfg, &logits, &self.bias, Some((vl, mask)), t),
+            (None, Some(_)) => return Err(Error::Arg(format!("layer {}: an image's tokens, and no image bias to route them by", self.layer))),
+            _ => route(cfg, &logits, &self.bias, t),
+        };
         let mut y = vec![0.0f32; t * d];
         let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
         used.sort_unstable();

@@ -340,7 +340,7 @@ impl Engram {
     /// `h`: `[t, HC, dim]` (bf16 values); `hashes`: `[t][cols]` for this layer.
     pub fn forward(&self, cfg: &Config, h: &[f32], t: usize, hashes: &[i64]) -> Result<Vec<f32>> {
         let begun = self.begin(hashes)?;
-        self.forward_begun(cfg, h, t, begun)
+        self.forward_begun(cfg, h, t, begun, None)
     }
 
     /// The rows for `hashes` (`[t][cols]` for this layer) asked of the table now, for [`Self::forward_begun`].
@@ -352,15 +352,23 @@ impl Engram {
         Ok(Begun { hashes: hashes.to_vec(), uniq, asked })
     }
 
-    /// [`Self::forward`] of rows asked for already ([`Self::begin`]).
-    pub fn forward_begun(&self, cfg: &Config, h: &[f32], t: usize, begun: Begun) -> Result<Vec<f32>> {
+    /// [`Self::forward`] of rows asked for already ([`Self::begin`]). The rows `skip` marks (an image's tokens) take
+    /// none: their rows made zero, whose key and value are zero, so the gate adds exactly nothing to their stream (the
+    /// reference shuts their gate).
+    pub fn forward_begun(&self, cfg: &Config, h: &[f32], t: usize, begun: Begun, skip: Option<&[bool]>) -> Result<Vec<f32>> {
         let head_dim = cfg.engram_head_dim;
         if head_dim != self.table.dim {
             return Err(Error::Arg(format!("engram rows are {} wide, not {head_dim}", self.table.dim)));
         }
         let Begun { hashes, uniq, asked } = begun;
         let got = asked.rows()?;
-        let emb = spread(&hashes, &uniq, &got, head_dim);
+        let mut emb = spread(&hashes, &uniq, &got, head_dim);
+        if let Some(skip) = skip {
+            let w = emb.len() / t.max(1);
+            for (row, _) in emb.chunks_exact_mut(w).zip(skip).filter(|(_, &s)| s) {
+                row.fill(0.0);
+            }
+        }
         let kv = self.wkv.forward(&emb, t, Out::Bf16);
         Ok(gate(h, &kv, &self.qk, cfg.dim, cfg.norm_eps))
     }

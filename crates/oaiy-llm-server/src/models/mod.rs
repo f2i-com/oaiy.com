@@ -587,8 +587,8 @@ impl Models {
             }
         }
         for name in opts.vision_projectors.keys() {
-            if !specs.iter().any(|s| &s.name==name && matches!(s.kind,Kind::Gguf | Kind::OrcaSaq | Kind::FlashNext)) {
-                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF, OrcaSAQ or Flash-Next model")));
+            if !specs.iter().any(|s| &s.name==name && matches!(s.kind,Kind::Gguf | Kind::OrcaSaq | Kind::FlashNext | Kind::Deepseek)) {
+                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF, OrcaSAQ, Flash-Next or DeepSeek-V4.1 model")));
             }
         }
         for name in opts.tool_expert_sources.keys().chain(opts.tools_experts.iter().map(|_| &opts.name)) {
@@ -632,7 +632,8 @@ impl Models {
         let models = self.specs.iter().map(|s| Json::obj([
             ("model",Json::str(&s.name)),
             ("loaded",Json::Bool(loaded.as_deref()==Some(&s.name))),
-            ("vision_configured",Json::Bool(self.opts.vision && (s.kind==Kind::Deepseek || self.opts.vision_projectors.contains_key(&s.name)))),
+            // (a DeepSeek-V4.1 checkpoint has its own tower; its GGUF none but the one it is given)
+            ("vision_configured",Json::Bool(self.opts.vision && ((s.kind==Kind::Deepseek && crate::dsv41::gguf_file::backbone(&s.path).is_none()) || self.opts.vision_projectors.contains_key(&s.name)))),
             ("timing",timings.get(&s.name).cloned().unwrap_or(Json::Null)),
         ])).collect();
         Json::obj([("models",Json::Arr(models)),("resident_model_limit",Json::Int(1)),
@@ -1038,8 +1039,9 @@ impl Models {
 
     /// DeepSeek-V4.1 without CUDA: the CPU model (`crate::dsv41::model`, the reference the CUDA path is tested against), its
     /// experts streamed through the host cache from RAM and the drive, and its dense trunk (attention projections,
-    /// shared experts, router, head: about 9.7 GB) on the WebGPU adapter while the budget holds it. No images and no
-    /// observer (both CUDA's); a conversation's next turn continues the state rather than reading it all again.
+    /// shared experts, router, head: about 9.7 GB) on the WebGPU adapter while the budget holds it; its vision tower
+    /// (a GGUF's from the same model's checkpoint) on a card beside its experts. No observer (CUDA's); a conversation's
+    /// next turn continues the state rather than reading it all again.
     #[cfg(feature = "webgpu")]
     fn load_deepseek_portable(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
@@ -1059,6 +1061,24 @@ impl Models {
                 Err(why) => self.say(format!("the expert cache could not be kept resident: {why}")),
             }
         }
+        // Its vision tower and the router's image bias: a checkpoint's own (its `vision_config`), a GGUF's from the folder
+        // of the same model's checkpoint it is given (`--vision-projector`); none with --no-vision.
+        let vision_dir = match (o.vision, o.vision_projectors.get(&spec.name)) {
+            (false, _) => None,
+            (true, Some(dir)) => Some(dir.clone()),
+            (true, None) => model.cfg.vision.is_some().then(|| spec.path.clone()),
+        };
+        let mut vision = match &vision_dir {
+            Some(dir) => {
+                let loading = std::time::Instant::now();
+                let vision = crate::engines::dsv41_portable::vision::Vision::load(dir, &model.cfg)?;
+                model.load_image_bias(&crate::dsv41::safetensors::StIndex::open(dir)?)?;
+                let vc = vision.config(o.image_tokens);
+                self.say(format!("{}: vision tower loaded{} in {:.1}s (up to {} tokens a picture)", spec.name, if dir == &spec.path { String::new() } else { format!(" from {}", dir.display()) }, loading.elapsed().as_secs_f64(), vc.max_tokens));
+                Some(vision)
+            }
+            None => None,
+        };
         // The routed experts on the CPU through this CPU's fastest kernel (the same bits as the portable one).
         model.set_expert_row_kernel(crate::dsv41::simd::row_kernel());
         model.set_expert_tokens_kernel(crate::dsv41::simd::tokens_kernel());
@@ -1133,6 +1153,16 @@ impl Models {
                 // (a card of tinygrad's is the engine's alone: its experts take half of what the default budget leaves
                 // for other uses of a card; a budget that was asked for is kept to)
                 let more = if o.webgpu_gb.is_none() && b.adapter().pci_bus_id == "tinygpu" { crate::engines::dsv41_portable::ALONE } else { 0 };
+                // Its vision tower on the last card it may use (the first holds the trunk), before the experts take
+                // what the cards have left: its matrices and a picture's passes' room (a picture's tower on the host
+                // took minutes).
+                if let Some(v) = &mut vision {
+                    let card = cards.last().cloned().unwrap_or_else(|| Arc::new(b.clone()));
+                    match v.on_card(Arc::clone(&card), o.image_tokens) {
+                        Ok(bytes) => self.say(format!("{}: its vision tower on {} ({:.1} GB with a picture's passes)", spec.name, card.adapter().name, bytes as f64 / 1e9)),
+                        Err(why) => self.say(format!("{}: its vision tower stays on the CPU: {why}", spec.name)),
+                    }
+                }
                 // (an EXL3 checkpoint's experts are records the fp4 slots cannot run: slots of their own on every card it
                 // may use, filled while idle and by what decode steps read, the rest through a few scratch slots; a
                 // GGUF's alike)
@@ -1193,6 +1223,8 @@ impl Models {
         let mut cfg = self.base_cfg(spec, max_seq);
         // Its own placeholder (as the CUDA build): the default, token 0, is DeepSeek's start of sequence.
         cfg.image_token_id = model.cfg.image_token_id;
+        // (its pictures sized for its tower, where it has one: the API refuses them otherwise)
+        cfg.vision = vision.as_ref().map(|v| v.config(o.image_tokens));
         let (jobs, rx) = std::sync::mpsc::channel();
         // (OAIY_DSV41_DRAFT_MIN: how sure of its drafts together the drafter must be for a pass to check them, where
         // not as many as pay by what passes take; OAIY_DSV41_DRAFTS: the most a pass checks)
@@ -1232,7 +1264,8 @@ impl Models {
             .with_usage(o.usage.clone(), order)
             .with_ram_ceiling(o.ram_gb)
             .with_drafter(drafter, draft_min, draft_max)
-            .with_disk(disk);
+            .with_disk(disk)
+            .with_vision(vision);
         let thread = std::thread::Builder::new().name("deepseek-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
         Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Deepseek(tok)) })
     }

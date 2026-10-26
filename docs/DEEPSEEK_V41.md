@@ -13,7 +13,8 @@ checkpoint headers unless marked *estimate*.
 > `backup/cuda-support-2026-10-08`. On main the server runs this model through `dsv41`'s
 > CPU model with its dense trunk and busy experts on a WebGPU adapter
 > ([WEBGPU.md](WEBGPU.md#deepseek-v41)): about a token a second, a long first prompt
-> taking minutes, and no images yet.
+> taking minutes, and no images yet. (Since 2026-10-26 it reads pictures there too:
+> [Vision on WebGPU](#vision-on-webgpu-2026-10-26).)
 
 ## Verdict
 
@@ -738,6 +739,43 @@ whose positions all carry `<｜deepseek_image｜>`.
   server) are decoded and sized on the request thread. The worker encodes only the
   images the uncached part of the prompt reaches, and the prefix cache keys image
   positions by content.
+
+### Vision on WebGPU (2026-10-26)
+
+The portable engine reads pictures again, as the CUDA one did:
+
+- **The tower on a card** (`engines::dsv41_portable::vision`): the ViT and the aligner
+  chained on the last card the model may use, its matrices f16, their inputs f16 once
+  scaled into range (the tensor cores' kernel), full attention through the flash kernel
+  (no score matrix kept, a few milliseconds a block even at 9,216 patches). Its 1.0 GB
+  and room for the largest picture's passes (0.9 GB) are taken from that card's budget
+  before the held experts fill the rest.
+  - Against the CPU tower (the reference's arithmetic): within 0.33% (rel-L2) after
+    one block, 4.8% end to end, which is where torch's exact fp32 run lands from its
+    bf16 one (the same with the matrices bf16 or the inputs f32: the reference's
+    roundings, not ours).
+  - 0.07 s for 1,530 patches where the CPU tower takes 5.1 s; 0.41 s for 8,280
+    patches (962 tokens, the most a picture takes is 1,024).
+- **In the model** (`dsv41::model::Model::set_images`): image tokens take the span's
+  rows as their input, route with each layer's `gate.bias_vl`, enter the n-gram
+  history as DEAD and take zero Engram rows, as on CUDA.
+- **The prompt cache** (`vision::keyed`): a picture's tokens are all the image token,
+  so the engine compares prompts with each one replaced by a key of the picture's
+  bytes and its place in the span. A state is read on from only for the same pictures
+  in the same places, and the last eight pictures' spans are kept (an incognito
+  request's wiped with its state).
+- **A GGUF** carries no tower and no `bias_vl`: `--vision-projector NAME=DIR` gives it
+  the folder of the same model's safetensors checkpoint, whose tower and image bias it
+  takes (its width, vocabulary and image token checked against the GGUF's).
+- **`--image-tokens N`** caps a picture's tokens (at least 184, a 13 x 13 grid; default
+  the checkpoint's 1,024). On the 2-bit GGUF a picture's tokens read at roughly the
+  prompt's pace, so a 1,000-token picture is some 25 s of a cold prompt.
+- **Measured** on the 2-bit GGUF with the fp8 checkpoint's tower (two drawn pictures,
+  greedy): *"The text reads "OAIY TEST 42," and the image contains a red circle on the
+  left and a blue rectangle on the right."* and *"The text "HELLO 7" is written in black
+  at the top, and below it are a green triangle and an orange circle."*: both right.
+  The same picture again: the same reply, 280 of 281 tokens read on from its state,
+  0.2 s.
   - A chart (254 image tokens) read back exactly: title, four values, bar colours.
   - A follow-up turn reused 363 cached tokens, image included (prompt 6.8 s).
   - Image tokens run token by token like other short stretches: 2.7 tok/s cold (the

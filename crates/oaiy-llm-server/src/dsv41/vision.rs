@@ -558,7 +558,41 @@ impl VisionTower {
     pub fn span(&self, img: &Prepared, aligned: &[f32]) -> Vec<f32> {
         span_rows(img, aligned, &self.start, &self.newline, &self.end)
     }
+
+    /// Its weights, for a tower made elsewhere (a GPU's): the patch
+    /// projection, the blocks', the last norm's and the aligner's two.
+    pub fn weights(&self) -> TowerWeights<'_> {
+        TowerWeights {
+            patch: &self.patch_embed,
+            blocks: self.blocks.iter().map(|b| BlockWeights { norm1: &b.norm1, wqkv: &b.wqkv, wo: &b.wo, norm2: &b.norm2, w1: &b.w1, w2: &b.w2 }).collect(),
+            norm: &self.norm,
+            aligner: [&self.aligner[0], &self.aligner[1]],
+        }
+    }
 }
+
+/// [`VisionTower::weights`].
+pub struct TowerWeights<'a> {
+    pub patch: &'a Linear,
+    pub blocks: Vec<BlockWeights<'a>>,
+    pub norm: &'a [f32],
+    pub aligner: [&'a Linear; 2],
+}
+
+/// A ViT block's weights: its norms (RMS, `NORM_EPS`), the fused q, k and v
+/// (with their bias), the output projection (with its), the MLP's fused gate
+/// and up (`[2 inter][dim]`, gate first) and its down.
+pub struct BlockWeights<'a> {
+    pub norm1: &'a [f32],
+    pub wqkv: &'a Linear,
+    pub wo: &'a Linear,
+    pub norm2: &'a [f32],
+    pub w1: &'a Linear,
+    pub w2: &'a Linear,
+}
+
+/// The tower's norms' epsilon, for a tower made elsewhere.
+pub const TOWER_NORM_EPS: f32 = NORM_EPS;
 
 /// [`VisionTower::span`] for rows computed elsewhere (the GPU tower).
 pub fn span_rows(img: &Prepared, aligned: &[f32], start: &[f32], newline: &[f32], end: &[f32]) -> Vec<f32> {

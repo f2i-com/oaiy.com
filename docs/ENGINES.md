@@ -459,8 +459,8 @@ The CUDA engine's gates (`dsv41-cuda`'s `gpu_model`, `gpu_vision` and
   refused every request.
   Verified against the reference oracle up to 247 tokens; longer contexts run the same
   code, but candidate filtering only engages past ~32K tokens and is unverified there.
-- **DeepSeek-V4.1 vision** (the CUDA engine's: on WebGPU the model takes no images
-  yet)**:** PNG and JPEG only (GIF, WebP and BMP are refused with a
+- **DeepSeek-V4.1 vision** (on WebGPU since 2026-10-26: the tower on a card, a GGUF's
+  from the same model's checkpoint with `--vision-projector`, [DEEPSEEK_V41.md](DEEPSEEK_V41.md#vision-on-webgpu-2026-10-26))**:** PNG and JPEG only (GIF, WebP and BMP are refused with a
   clear error), and no `http(s)` image URLs (a std-only build has no TLS; send
   `data:` URLs). An image prompt is numerically touchy: one bf16 rounding step on 1%
   of an image's inputs moves the model's final logits by ~25%. So replies match the

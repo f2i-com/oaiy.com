@@ -64,6 +64,35 @@ pub struct Model {
     attend: Option<DeviceCaches>,
     attend_check: bool,
     attend_found: AttendCheck,
+    /// The images of the prompt being read ([`Model::set_images`]): the rows of their spans' tokens.
+    images: Vec<ImageSpan>,
+    /// The running forward's rows that are an image's tokens (empty: none).
+    image_mask: Vec<bool>,
+}
+
+/// An image in the sequence: from position `start`, `rows.len() / dim` tokens take these rows as their input in place
+/// of their token's embedding (the tower's span, [`crate::dsv41::vision::span_rows`]), choose their experts by the image
+/// bias and take no part in Engram's n-grams. A span may begin before a forward's rows and end after them; each forward
+/// uses the part it covers.
+#[derive(Clone, Debug)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub rows: Arc<Vec<f32>>,
+}
+
+/// Each row's image row for positions `start..start + t`, where it is an image's token.
+fn image_rows(images: &[ImageSpan], start: usize, t: usize, d: usize) -> Result<Vec<Option<&[f32]>>> {
+    let mut rows = vec![None; t];
+    for span in images {
+        if !span.rows.len().is_multiple_of(d) {
+            return Err(Error::Arg("an image span's rows are not whole embeddings".into()));
+        }
+        let n = span.rows.len() / d;
+        for p in span.start.max(start)..(span.start + n).min(start + t) {
+            rows[p - start] = Some(&span.rows[(p - span.start) * d..(p - span.start + 1) * d]);
+        }
+    }
+    Ok(rows)
 }
 
 /// What a check of a decode step's attention on the device found, layer by layer (OAIY_DSV41_GPU_ATTENTION=check): the
@@ -235,6 +264,8 @@ impl Model {
             attend: None,
             attend_check: false,
             attend_found: AttendCheck::default(),
+            images: Vec::new(),
+            image_mask: Vec::new(),
             cfg,
         })
     }
@@ -347,7 +378,10 @@ impl Model {
         }
         let on_device = self.attend_where(t, start_pos);
         self.attend_found = AttendCheck::default();
-        let hashes = self.hasher.forward(ids, start_pos)?;
+        // (an image's tokens take its span's rows in place of their embedding, and no part in the n-grams)
+        let pictured = image_rows(&self.images, start_pos, t, d)?;
+        self.image_mask = if pictured.iter().any(Option::is_some) { pictured.iter().map(Option::is_some).collect() } else { Vec::new() };
+        let hashes = self.hasher.forward_masked(ids, start_pos, (!self.image_mask.is_empty()).then_some(&self.image_mask[..]))?;
         trace("engram_hashes", &hashes.iter().map(|&v| v as f32).collect::<Vec<_>>());
 
         let mut emb = vec![0.0f32; t * d];
@@ -355,8 +389,12 @@ impl Model {
             if id as usize >= self.cfg.vocab_size {
                 return Err(Error::Arg(format!("token {id} outside the vocabulary")));
             }
-            self.embed.row(id as usize, &mut emb[i * d..(i + 1) * d]);
+            match pictured[i] {
+                Some(row) => emb[i * d..(i + 1) * d].copy_from_slice(row),
+                None => self.embed.row(id as usize, &mut emb[i * d..(i + 1) * d]),
+            }
         }
+        drop(pictured);
         trace("embed", &emb);
         let mut h: Vec<f32> = (0..t).flat_map(|i| std::iter::repeat_n(&emb[i * d..(i + 1) * d], HC).flatten().copied()).collect();
         let mut pre_mix: Vec<[f32; HC]> = vec![[1.0, 0.0, 0.0, 0.0]; t];
@@ -388,7 +426,7 @@ impl Model {
             }
             if let (Some(eg), Some(rows)) = (&self.layers[l].engram, begun[l].take()) {
                 let looking_up = std::time::Instant::now();
-                h = eg.forward_begun(&self.cfg, &h, t, rows)?;
+                h = eg.forward_begun(&self.cfg, &h, t, rows, (!self.image_mask.is_empty()).then_some(&self.image_mask[..]))?;
                 crate::dsv41::profile::add(crate::dsv41::profile::Part::Engram, looking_up);
             }
             if let Some(at) = rows.targets.iter().position(|&target| target == l) {
@@ -444,7 +482,8 @@ impl Model {
         trace: Trace<'_>,
     ) -> Result<(Vec<f32>, Vec<[f32; HC]>, Vec<Route>)> {
         use crate::dsv41::linear::Step;
-        let Model { cfg, layers, states, shared, experts, device_mixing, attend, attend_check, attend_found, .. } = self;
+        let Model { cfg, layers, states, shared, experts, device_mixing, attend, attend_check, attend_found, image_mask, .. } = self;
+        let image = (!image_mask.is_empty()).then_some(&image_mask[..]);
         let ly = &layers[l];
         let (d, eps) = (cfg.dim, cfg.norm_eps);
         // token i's [HC, dim] stream inside a [t, HC, dim] buffer
@@ -571,10 +610,10 @@ impl Model {
             let ffn_mix_here = side_ffn.is_none().then(|| mixes(&h1, &ly.hc_ffn));
             let (m, routes, ffn_proj) = match made {
                 Some((logits, shared, proj, fused)) => {
-                    let (m, routes) = ly.moe.forward_from(cfg, &x, t, experts, logits, None, Some(shared), fused)?;
+                    let (m, routes) = ly.moe.forward_from(cfg, &x, t, experts, logits, None, Some(shared), fused, image)?;
                     (m, routes, Some(proj))
                 }
-                None => ly.moe.forward_side(cfg, &x, t, experts, side_ffn.map(|w| (w, &h1[..])))?,
+                None => ly.moe.forward_side(cfg, &x, t, experts, side_ffn.map(|w| (w, &h1[..])), image)?,
             };
             let ffn_mix = match (ffn_mix_here, ffn_proj) {
                 (Some(m), _) => m,
@@ -755,6 +794,26 @@ impl Model {
     pub fn checkpoint(&mut self) -> Checkpoint {
         self.caches_here();
         Checkpoint { states: self.states.clone(), history: self.hasher.history().to_vec() }
+    }
+
+    /// The images of the prompt the next forwards read, each a span of rows from its position (none: text alone).
+    /// They stand until they are set again.
+    pub fn set_images(&mut self, images: Vec<ImageSpan>) {
+        self.images = images;
+    }
+
+    /// Whether the router takes an image's tokens: each layer's image bias read ([`Model::load_image_bias`]).
+    pub fn reads_images(&self) -> bool {
+        self.layers.iter().all(|ly| ly.moe.image_bias().is_some())
+    }
+
+    /// Each layer's correction bias for an image's tokens (`layers.<l>.ffn.gate.bias_vl`) from `idx`: the checkpoint's
+    /// own, or (a GGUF's, which carries none) the folder its vision tower is read from.
+    pub fn load_image_bias(&mut self, idx: &StIndex) -> Result<()> {
+        for (l, ly) in self.layers.iter_mut().enumerate() {
+            ly.moe.set_image_bias(load_vec(idx, &format!("layers.{l}.ffn.gate.bias_vl"))?)?;
+        }
+        Ok(())
     }
 
     /// Back to `c`: the next forward continues from the tokens it covered.

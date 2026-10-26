@@ -24,6 +24,7 @@ mod saved;
 mod tests;
 mod trunk;
 mod usage;
+pub(crate) mod vision;
 
 pub(crate) use engine::Engine;
 pub(crate) use exl3::WgpuExl3Experts;

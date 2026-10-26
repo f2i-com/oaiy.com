@@ -699,6 +699,18 @@ impl WgpuBackend {
         (self.used.load(Ordering::Relaxed), self.budget)
     }
 
+    /// `bytes` of the weight budget taken for good by what is kept beside the weights through the chain, which counts
+    /// none of its vectors (a vision tower's matrices and the buffers of its passes), before the weights that fill
+    /// what is left take it: false, and nothing taken, where the budget does not hold them.
+    pub fn reserve(&self, bytes: u64) -> bool {
+        let prev = self.used.fetch_add(bytes, Ordering::Relaxed);
+        if prev + bytes > self.budget {
+            self.used.fetch_sub(bytes, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
     /// This backend with a budget of `bytes` for weights (before anything is put there): a card a caller knows holds
     /// one kind of thing alone, whose work buffers the default's 4 GiB of room beside the weights need not cover.
     pub fn with_budget(mut self, bytes: u64) -> Self {
